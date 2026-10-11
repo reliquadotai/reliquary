@@ -73,7 +73,7 @@ def test_the_source_serves_prompts_rows_and_resolved_tasks_with_their_options_di
     resolved = asyncio.run(src.resolve(2))
     assert resolved == ResolvedTask(IMAGE, {"memory_bytes": 2 * GIB, "pids": 512},
                                     env_options_sha256=src.options_sha256, prepare_timeout_s=900.0,
-                                    cpu_millis=4000)
+                                    cpu_millis=4000, env_lock_sha256=src.lock_sha256)   # placed under its lock
     assert len(src.options_sha256) == 64
 
 

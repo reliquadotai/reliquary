@@ -25,6 +25,27 @@ from typing import Any
 
 from reliquary.sandbox.tasks import ResolvedTask, SweTaskResolver
 
+# {import module: the identity its files had when this process first built an env from it}. A module stays loaded
+# (``sys.modules``) after its files change on disk: a later build that reads another identity from disk would serve
+# the old code under the new identity, so it is refused until the validator restarts.
+_LOADED_IDENTITIES: dict[str, str] = {}
+_LOADED_GUARD = threading.Lock()
+
+
+def loaded_identity_problem(module_name: str | None, identity: str,
+                            loaded: dict[str, str] | None = None) -> str | None:
+    """None when ``module_name`` was first built at ``identity`` in this process (recorded now if never built);
+    the reason otherwise. ``loaded``: the record (default: this process's)."""
+    if module_name is None:
+        return None
+    record = _LOADED_IDENTITIES if loaded is None else loaded
+    with _LOADED_GUARD:
+        first = record.setdefault(str(module_name), str(identity))
+    if first != identity:
+        return (f"module {module_name} is loaded at {first} in this process and is {identity} on disk: "
+                f"validator restart required")
+    return None
+
 
 def _canonical(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
@@ -75,7 +96,8 @@ class BridgedEpisodeSource:
             from reliquary_sandbox_verifiers.loading import VerifiersEnv
 
             env = VerifiersEnv(config.entry, dict(config.options))
-        if identity is None:
+        from_disk = identity is None
+        if from_disk:
             from reliquary_sandbox_service.episodes import bridged_env_package_of
 
             identity = bridged_env_package_of(env.module)
@@ -90,8 +112,12 @@ class BridgedEpisodeSource:
         self.lock_images = frozenset(env.lock.images.values())     # the distinct images the lock pins
         module = getattr(env, "module", None)
         self.module_name = getattr(module, "__name__", module)     # the import module; None in fakes
+        if from_disk:
+            problem = loaded_identity_problem(self.module_name, identity)
+            if problem is not None:
+                raise ValueError(f"{config.environment}: {problem}")
         self._resolver = SweTaskResolver(config.rl_split, env.sandbox_task, cache_size=cache_size,
-                                         options_sha256=self.options_sha256)
+                                         options_sha256=self.options_sha256, lock_sha256=self.lock_sha256)
         self._guard = threading.Lock()
         self._rows: int | None = None
 
@@ -207,4 +233,4 @@ if __name__ == "__main__":
 
 
 __all__ = ["BridgedEnvConfig", "BridgedEpisodeSource", "bridged_manifest_sha256", "build_environment",
-           "catalogue_spec", "describe", "image_lock_sha256"]
+           "catalogue_spec", "describe", "image_lock_sha256", "loaded_identity_problem"]

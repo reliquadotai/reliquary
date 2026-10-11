@@ -244,6 +244,7 @@ class RlEpisodeEngagements:
             checkpoint=precommit.checkpoint, image=task.image, env_package=policy.env_package,
             budgets=budgets, exclusive=True, still_valid=still_valid, prepare_timeout_s=prepare,
             env_options_sha256=getattr(task, "env_options_sha256", None),
+            env_lock_sha256=getattr(task, "env_lock_sha256", None),
             # the session's agent box on its machine: the task's CPUs (None: the machine's box) and memory budget
             reserve={"cpu_millis": getattr(task, "cpu_millis", None), "memory_bytes": int(budgets["memory_bytes"])})
 

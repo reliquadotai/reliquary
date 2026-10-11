@@ -90,11 +90,11 @@ def test_a_report_of_thousands_of_images_is_indexed_once_per_report(tmp_path):
     assert many[0] not in fleet.images_served(SANDBOX_ENV, ENV_PACKAGE, now=NOW)
 
 
-def admission(services, image=IMAGE, cpu_millis=None, prepare_timeout_s=None):
+def admission(services, image=IMAGE, cpu_millis=None, prepare_timeout_s=None, lock=None):
     view = services.views[EPISODE]
 
     async def resolve(index):
-        return ResolvedTask(image, {}, None, prepare_timeout_s, cpu_millis=cpu_millis)
+        return ResolvedTask(image, {}, None, prepare_timeout_s, cpu_millis=cpu_millis, env_lock_sha256=lock)
 
     services.views[EPISODE] = type(view)(policy=view.policy, resolve_task=resolve)
     return SimpleNamespace(environment=EPISODE, task_index=TASK, window=1)
@@ -276,3 +276,14 @@ def test_the_refusal_statuses():
     # task_unservable is final for this task in this window (the miner moves on); the others are retried
     assert PRECOMMIT_STATUS["task_unservable"] == 409
     assert PRECOMMIT_STATUS["environment_unserved"] == PRECOMMIT_STATUS["fleet_unavailable"] == 503
+
+
+async def test_the_precommit_admission_counts_machines_under_the_tasks_image_lock(tmp_path):
+    services, _ = _services(tmp_path)
+    seen = []
+    services.fleet.serving = lambda *a, **k: ["m"]
+    services.fleet.servable = lambda **k: seen.append(k) or 1
+    assert await services.precommit_admission(admission(services, lock="9" * 64)) is None
+    assert seen[-1]["env_lock_sha256"] == "9" * 64
+    assert await services.precommit_admission(admission(services)) is None
+    assert "env_lock_sha256" not in seen[-1]                       # an unlocked task keeps its exact keywords

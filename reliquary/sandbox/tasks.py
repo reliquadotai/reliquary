@@ -48,6 +48,9 @@ class ResolvedTask:
     cpu_millis: int | None = None
     """The task's declared CPUs x 1000 (``TaskLimits.cpus``, ``task_cpu_millis``); None: the machine's box default.
     An RL session reserves it on its machine, and is never placed on a smaller box."""
+    env_lock_sha256: str | None = None
+    """The image-lock digest the task was resolved under (a bridged env's lock): a machine reporting another lock
+    for the env is not one to place it on. None: not checked."""
 
 
 class SweTaskResolver:
@@ -56,12 +59,13 @@ class SweTaskResolver:
     method, which would hold the resolver alive from a shared cache."""
 
     def __init__(self, split: str, sandbox_task=None, *, cache_size: int = 8192,
-                 options_sha256: str | None = None) -> None:
+                 options_sha256: str | None = None, lock_sha256: str | None = None) -> None:
         if cache_size <= 0:
             raise ValueError("cache_size must be positive")
         self._split = split
         self._sandbox_task = sandbox_task
         self._options_sha256 = options_sha256
+        self._lock_sha256 = lock_sha256
         self._cache_size = cache_size
         self._cache: OrderedDict[int, ResolvedTask] = OrderedDict()
         self._lock = threading.Lock()
@@ -81,7 +85,7 @@ class SweTaskResolver:
         prepare = getattr(task, "prepare_timeout_s", None)
         prepare = float(prepare) if type(prepare) in (int, float) and prepare > 0 else None
         cpu_millis = task_cpu_millis(getattr(limits, "cpus", None)) if limits is not None else None
-        return ResolvedTask(task.image, values, digest, prepare, cpu_millis)
+        return ResolvedTask(task.image, values, digest, prepare, cpu_millis, self._lock_sha256)
 
     def _cached(self, index: int) -> ResolvedTask:
         with self._lock:

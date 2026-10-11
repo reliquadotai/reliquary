@@ -36,7 +36,7 @@ class Quota:
         return self.refusal
 
 
-def build(tmp_path, *, store=None, quota=None, limits=None, precommits=None, on_resolve=None):
+def build(tmp_path, *, store=None, quota=None, limits=None, precommits=None, on_resolve=None, lock=None):
     tmp_path.mkdir(parents=True, exist_ok=True)
     validator, machine = signer(tmp_path, "v", "v1"), signer(tmp_path, "m", "k1")
     policy = SandboxPolicy(max_live_per_hotkey=POLICY.pool_seeds + 1)
@@ -50,7 +50,7 @@ def build(tmp_path, *, store=None, quota=None, limits=None, precommits=None, on_
     async def resolve(index):
         if on_resolve is not None:
             on_resolve(current)
-        return ResolvedTask(IMAGE, dict(limits or {}))
+        return ResolvedTask(IMAGE, dict(limits or {}), **({} if lock is None else {"env_lock_sha256": lock}))
 
     views = {EPISODE: EpisodeEnvironmentView(policy=POLICY, resolve_task=resolve)}
     ids = iter(f"s-{tmp_path.name}-{n}" for n in range(10_000))
@@ -64,7 +64,7 @@ def build(tmp_path, *, store=None, quota=None, limits=None, precommits=None, on_
         engagements={"rl_precommit": engagements}, policy=policy, clock=Clock(),
         new_session_id=lambda: next(ids))
     return SimpleNamespace(issuer=issuer, book=book, precommit=precommit, current=current, recorded=recorded, wall=wall,
-                           validator=validator, machine=machine)
+                           validator=validator, machine=machine, engagements=engagements)
 
 
 def engagement(precommit, seed):
@@ -303,3 +303,14 @@ def test_a_session_longer_than_the_restore_horizon_is_refused_at_open(tmp_path):
     assert refused.reason == "session_too_long" and not env.book._sessions
     env = build(tmp_path / "ok", limits={"wall_s": over})
     assert isinstance(open_(env, 0), Grant)
+
+
+def test_the_terms_carry_the_tasks_image_lock_to_placement(tmp_path):
+    from reliquary.sandbox.sessions import _reserving
+
+    env = build(tmp_path, lock="9" * 64)
+    terms = asyncio.run(env.engagements.terms(HOTKEY, engagement(env.precommit, 5)))
+    assert terms.env_lock_sha256 == "9" * 64 and _reserving(terms)["env_lock_sha256"] == "9" * 64
+    plain = build(tmp_path / "plain")
+    terms = asyncio.run(plain.engagements.terms(HOTKEY, engagement(plain.precommit, 5)))
+    assert terms.env_lock_sha256 is None and "env_lock_sha256" not in _reserving(terms)

@@ -428,6 +428,9 @@ class RlEpisodeServices:
                          validity_s=token_validity_s(self.book.policy.open_window_s, int(budgets["wall_s"]),
                                                      getattr(task, "prepare_timeout_s", None)),
                          env_options_sha256=options, reserve=reserve)
+        lock = getattr(task, "env_lock_sha256", None)
+        if lock is not None:                           # the open path's own lock filter (``_reserving``)
+            placement["env_lock_sha256"] = lock
         group = policy.pool_seeds // 2
         machines = self.fleet.servable(**placement, group_size=group)     # M at once
         if machines >= MIN_SERVING_MACHINES:

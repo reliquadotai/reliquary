@@ -1,38 +1,49 @@
 """The activation checks of an env added to a running run. Pure: the validator calls ``activation_problem`` in a
 worker thread, first when it sees the request (it builds the env then, never at the window boundary) and again
-at the boundary, and refuses the request with the first problem found:
+at the boundary, and refuses the request with the first problem found.
+
+Before anything of the package is imported (``before_import_problem``; the validator's prestage runs it too):
 
 1. the package is on the owner's allowlist (``episode-packages.allow`` in the service folder: one
-   ``name==version`` per line), so a third-party env never runs in the validator process unreviewed;
+   ``name==version`` per line, or the full identity ``name==version+g<hash>.vfb<N>``, which then pins the code
+   and not only the version), so a third-party env never runs in the validator process unreviewed;
 2. its distribution name is plain (letters and digits joined by single ``-`` or ``_``, no ``.``), so its import
-   module (the name with ``-`` -> ``_``, lowercased) is a plain identifier, and pip's normalised name and the
-   module name agree; checked before anything is imported;
+   module (the name with ``-`` -> ``_``, lowercased) is a plain identifier that pip's normalised name maps one to
+   one, and that module is no standard-library module;
 3. every per-env budget it declares is at most the order's: ``max_episode_tokens``, ``max_turns``,
-   ``max_tokens_per_turn`` and each session budget (the values the trainer and the sandbox fleet were sized
-   for); checked before anything is imported;
-4. the operator's attestation is a conformance GATE report of exactly this env (the format the sandbox's
+   ``max_tokens_per_turn`` and each session budget (the values the trainer and the sandbox fleet were sized for);
+4. the installed distributions (name, version, RECORD digest, read from their metadata only) are the ones this
+   validator booted with plus, at most, the added distribution, whose only top-level name is its module, a name
+   no other distribution claims: an install moved no dependency of an active env and shadows nothing.
+
+Then:
+
+5. the operator's attestation is a conformance GATE report of exactly this env (the format the sandbox's
    conformance ``--report`` writes): gate and passed true, no problem, real boxes, a full sample, the same env
    package identity, taskset entry, split and options;
-5. the env is installed on this validator: built through the bridge, its identity, image lock, manifest digest
-   and row count are the entry's, and its import module is its distribution's and no active env's nor any order
-   env's (two distributions shipping one module overwrite each other in one venv);
-6. installing it moved no active bridged env: each one's package on disk still has its pinned identity (the
-   operator installs with ``pip install --no-deps`` and runs ``pip check``; this catches what slipped through);
-7. at least ``MIN_ACTIVATION_MACHINES`` fresh active machines serve it at that identity, with its options and its
-   image lock, with at least ``min(images, ACTIVATION_MIN_IMAGES)`` locked images present, and at least
-   ``min(rows, ACTIVATION_MIN_SERVABLE_TASKS)`` tasks of its RL split are servable (their image is held by a
-   serving machine; at most ``ACTIVATION_SCAN_MAX`` tasks are resolved to count them, once per manifest and set
-   of images served: ``memo``).
+6. the env is installed on this validator: built through the bridge, its identity, image lock, manifest digest
+   and row count are the entry's; its import module is exactly its distribution's and no active env's nor any
+   order env's; and that module was not loaded earlier in this process at another identity (new files under a
+   module already in memory need a validator restart);
+7. installing it moved no active bridged env: each one's package on disk still has its pinned identity;
+8. at least ``MIN_ACTIVATION_MACHINES`` fresh active machines could host its sessions (the open path's own
+   filter, its image aside: identity, options, image lock, tools, caps against its budgets, token validity), with
+   at least ``min(images, ACTIVATION_MIN_IMAGES)`` locked images present, and at least
+   ``min(rows, ACTIVATION_MIN_SERVABLE_TASKS)`` tasks of its RL split are servable (their image is held by such a
+   machine under its lock). Each task's image is read once per manifest (``memo``, at most
+   ``ACTIVATION_SCAN_MAX`` of them) and counted against the images served now.
 
-A shortfall in 7 is final only on a complete fresh fleet view (``Fleet.view_complete``, the precommit route's
-rule): while the directory is stale, no machine was heard, or a machine whose last report serves the env is
-stale or drained, the answer is a ``NotYet`` problem (a ``str``): the request waits, it is not refused."""
+A problem the validator cannot settle now is a ``NotYet`` (a ``str``): the request waits, it is not refused. That
+is a shortfall in 8 on an incomplete or stale fleet view (``Fleet.view_complete``, the precommit route's rule),
+and an I/O error or timeout while building the env or reading an active env's identity."""
 from __future__ import annotations
 
+import hashlib
 import keyword
 import os
 import re
-from collections.abc import Callable, Mapping
+import sys
+from collections.abc import Callable, Mapping, MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -46,16 +57,18 @@ MAX_ALLOW_FILE_BYTES = 64 * 1024
 EPISODE_LIMIT_FIELDS = ("max_episode_tokens", "max_turns", "max_tokens_per_turn")
 _PLAIN_DISTRIBUTION = re.compile(r"[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*\Z")
 _VERIFIERS_TASKSETS = "verifiers.v1.tasksets."
+_LISTED = 8                                 # differences named in one message
+_TRANSIENT = (OSError, TimeoutError)        # an I/O error or a timeout: not a verdict on the env
 
 
 class NotYet(str):
-    """A problem the fleet's current view cannot settle (stale or incomplete): the request waits for a complete
-    fresh view, it is never refused for it."""
+    """A problem the validator cannot settle now (a stale or incomplete fleet view, an I/O error): the request
+    waits and is checked again, it is never refused for it."""
 
 
 def allowed_packages(folder: str | Path) -> frozenset[str]:
-    """The owner-reviewed ``name==version`` packages of ``folder/episode-packages.allow`` (empty when absent,
-    unsafe or too large: then nothing can be added)."""
+    """The owner-reviewed lines of ``folder/episode-packages.allow`` (empty when absent, unsafe or too large:
+    then nothing can be added)."""
     path = Path(folder) / ADDED_PACKAGES_FILE
     try:
         if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_ALLOW_FILE_BYTES:
@@ -69,7 +82,16 @@ def allowed_packages(folder: str | Path) -> frozenset[str]:
 
 
 def package_problem(added: Mapping[str, Any], allowed: frozenset[str]) -> str | None:
+    """The package must be allowed. A line naming a full identity of this ``name==version`` pins it: then only
+    that identity (``episode.env_package``) is allowed."""
     package = added["catalogue"]["package"]
+    identity = added["environment"]["episode"]["env_package"]
+    pinned = {line for line in allowed if line.startswith(package + "+")}
+    if pinned:
+        if identity not in pinned:
+            return (f"{identity} is not the identity the owner's allowlist pins for {package} "
+                    f"({ADDED_PACKAGES_FILE} in the service folder)")
+        return None
     if package not in allowed:
         return f"{package} is not on the owner's allowlist ({ADDED_PACKAGES_FILE} in the service folder)"
     return None
@@ -80,17 +102,23 @@ def _module_of(env_package: str) -> str:
     return str(env_package).split("==", 1)[0].replace("-", "_").lower()
 
 
+def _normal(name: str) -> str:
+    """A distribution name as pip compares it (PEP 503)."""
+    from reliquary.protocol.service_catalogue import distribution_of
+
+    return distribution_of(name)
+
+
 def _normal_module(env_package: str) -> str:
     """The module a package's distribution claims, as pip compares names (PEP 503, then ``-`` -> ``_``): equal for
     two spellings pip would install over each other."""
-    from reliquary.protocol.service_catalogue import distribution_of
-
-    return distribution_of(env_package).replace("-", "_")
+    return _normal(env_package).replace("-", "_")
 
 
 def name_problem(added: Mapping[str, Any]) -> str | None:
     """The added package's distribution name must be plain, so its import module is a plain identifier that pip's
-    normalised name (PEP 503) maps one to one: no ``.`` (a dotted module), no run of separators."""
+    normalised name (PEP 503) maps one to one: no ``.`` (a dotted module), no run of separators; and the module
+    must not be a standard-library module (it would shadow it, or never be imported)."""
     for what, package in (("catalogue.package", added["catalogue"]["package"]),
                           ("episode.env_package", added["environment"]["episode"]["env_package"])):
         name = str(package).split("==", 1)[0]
@@ -99,6 +127,8 @@ def name_problem(added: Mapping[str, Any]) -> str | None:
                 or keyword.iskeyword(module)):
             return (f"its {what} distribution name {name!r} is not plain (letters and digits joined by single "
                     f"'-' or '_', no '.'): its import module must be a plain identifier")
+        if module in sys.stdlib_module_names:
+            return f"its import module {module} is a standard-library module's name: rename the distribution"
     return None
 
 
@@ -126,6 +156,92 @@ def budget_problem(added: Mapping[str, Any], order: Any) -> str | None:
             return (f"episode.budgets.{field} {value!r} is above the order's {limit} (the sandbox fleet was sized "
                     f"for the order)")
     return None
+
+
+# --- installed distributions, from their metadata only ------------------------------------------------------------
+def _top_level(files: Any) -> frozenset[str]:
+    """The importable top-level names a distribution's RECORD installs (``.pth`` files kept by their file name:
+    they run at interpreter start, so they are never a module's name)."""
+    names = set()
+    for path in files or ():
+        parts = getattr(path, "parts", None) or Path(str(path)).parts
+        if not parts or parts[0] in ("..", "__pycache__") or parts[0].endswith((".dist-info", ".data")):
+            continue
+        first = parts[0]
+        if len(parts) == 1:
+            first = first if first.endswith(".pth") else first.split(".", 1)[0]
+        names.add(first)
+    return frozenset(names)
+
+
+def installed_distributions(distributions: Callable[[], Any] | None = None) -> dict[str, frozenset]:
+    """``{PEP 503 name: {(version, RECORD sha256, top-level names)}}`` of every installed distribution, read from
+    their metadata only (nothing imported). The validator takes it at boot; activation compares it again."""
+    if distributions is None:
+        from importlib.metadata import distributions
+    found: dict[str, set] = {}
+    for dist in distributions():
+        try:
+            name = dist.metadata["Name"]
+            record = dist.read_text("RECORD") or ""
+            files = dist.files
+        except Exception as exc:                 # an unreadable distribution is still listed: it differs
+            name, record, files = getattr(dist, "name", None) or "?", f"unreadable {type(exc).__name__}", ()
+        if not name:
+            continue
+        digest = hashlib.sha256(record.encode("utf-8")).hexdigest()
+        found.setdefault(_normal(name), set()).add((str(dist.version), digest, _top_level(files)))
+    return {name: frozenset(entries) for name, entries in found.items()}
+
+
+def install_set_problem(added: Mapping[str, Any], boot: Mapping[str, frozenset],
+                        current: Mapping[str, frozenset]) -> str | None:
+    """The installed distributions must be the boot's plus, at most, the added one (installed once, at the entry's
+    version, its only top-level name its module, a name no other distribution claims)."""
+    package = added["catalogue"]["package"]
+    name, version = _normal(package), package.split("==", 1)[1]
+    moved = sorted(other for other in set(boot) | set(current)
+                   if other != name and boot.get(other) != current.get(other))
+    if moved:
+        listed = ", ".join(f"{other} ({'new' if other not in boot else 'gone' if other not in current else 'changed'})"
+                           for other in moved[:_LISTED])
+        return (f"the installed distributions moved since this validator started: {listed} (install an added env "
+                f"with pip install --no-deps, nothing else)")
+    if name in boot and boot[name] != current.get(name):
+        return f"{name} changed on disk since this validator started (restart the validator)"
+    entries = current.get(name) or frozenset()
+    if len(entries) != 1:
+        return f"{name} is installed {len(entries)} times, need exactly once"
+    installed_version, _digest, top = next(iter(entries))
+    if installed_version != version:
+        return f"{name} {installed_version} is installed, the entry names {version}"
+    expected = _module_of(package)
+    if top != {expected}:
+        return f"{name} installs the top-level names {sorted(top)}, need exactly {expected!r}"
+    claims = sorted(other for other, others in current.items() if other != name
+                    and any(expected in entry[2] for entry in others))
+    if claims:
+        return f"the import module {expected} is also installed by {', '.join(claims[:_LISTED])}"
+    return None
+
+
+def before_import_problem(added: Mapping[str, Any], allowed: frozenset[str], order: Any, *,
+                          boot: Mapping[str, frozenset],
+                          current: Mapping[str, frozenset] | None = None) -> str | None:
+    """Every check that runs before anything of the package is imported: the allowlist, the name, the budgets and
+    the installed distributions (``boot``: ``installed_distributions()`` at the validator's start; ``current``:
+    now, read when not given)."""
+    for check in (lambda: package_problem(added, allowed), lambda: name_problem(added),
+                  lambda: budget_problem(added, order)):
+        problem = check()
+        if problem is not None:
+            return problem
+    if current is None:
+        try:
+            current = installed_distributions()
+        except _TRANSIENT as exc:
+            return NotYet(f"the installed distributions cannot be read now ({type(exc).__name__}: {exc})")
+    return install_set_problem(added, boot, current)
 
 
 def _options_digest(options: Any) -> str | None:
@@ -177,7 +293,7 @@ def install_problem(source: Any, added: Mapping[str, Any]) -> str | None:
 
 
 def _imported_module(source: Any) -> str | None:
-    """The taskset module a bridged source imported (verifiers' own namespace stripped), or None (unknown)."""
+    """The taskset module an ACTIVE bridged source imported (verifiers' own namespace stripped), or None."""
     module = getattr(source, "module_name", None)
     if module is None:
         return None
@@ -186,11 +302,12 @@ def _imported_module(source: Any) -> str | None:
 
 def module_problem(source: Any, added: Mapping[str, Any], active_sources: Mapping[str, Any],
                    order: Any = None) -> str | None:
-    """The added package's import module must be its distribution name with ``-`` -> ``_`` and no active env's
-    (by the module it imported, or the one its distribution names) nor any order env's."""
+    """The added package's import module must be exactly its distribution name with ``-`` -> ``_`` (its own
+    top-level module, never one under another package's namespace) and no active env's (by the module it imported,
+    or the one its distribution names) nor any order env's."""
     expected = _module_of(added["catalogue"]["package"])
-    module = _imported_module(source)
-    if module is not None and module != expected:
+    module = getattr(source, "module_name", None)
+    if module is not None and str(module) != expected:
         return f"its import module {module} is not {expected} (the module is the distribution name)"
     for name, other in sorted(active_sources.items()):
         identity = getattr(other, "identity", None)
@@ -206,42 +323,59 @@ def module_problem(source: Any, added: Mapping[str, Any], active_sources: Mappin
 
 
 def identities_problem(sources: Mapping[str, Any]) -> str | None:
-    """The active bridged envs whose installed package no longer has their pinned identity."""
-    moved = []
+    """The active bridged envs whose installed package no longer has their pinned identity (a ``NotYet`` when an
+    identity only cannot be read now)."""
+    moved, unreadable = [], []
     for name, source in sorted(sources.items()):
         try:
             now = source.installed_identity()
+        except _TRANSIENT as exc:
+            unreadable.append(f"{name} ({type(exc).__name__})")
+            continue
         except Exception as exc:
             now = f"unreadable ({type(exc).__name__})"
         if now != source.identity:
             moved.append(f"{name}: {source.identity} is pinned, {now} is installed")
-        if len(moved) >= 8:
+        if len(moved) >= _LISTED:
             break
-    return None if not moved else "an active environment's install moved: " + "; ".join(moved)
+    if moved:
+        return "an active environment's install moved: " + "; ".join(moved)
+    if unreadable:
+        return NotYet("an active environment's identity cannot be read now: " + ", ".join(unreadable[:_LISTED]))
+    return None
 
 
-def _scan(source: Any, images: frozenset[str], needed: int) -> tuple[int, int]:
-    """(servable tasks found, tasks whose image could not be read), stopping at ``needed``."""
-    servable = unreadable = 0
-    for index in range(min(len(source), ACTIVATION_SCAN_MAX)):
+def _servable(source: Any, images: frozenset[str], needed: int, memo: dict | None) -> tuple[int, int]:
+    """(servable tasks, tasks whose image could not be read), stopping at ``needed``. Each task's image is read
+    once per manifest (``memo["tasks"] = (manifest, images by index)``, one atomic entry) and counted against
+    ``images`` on each call."""
+    manifest = source.manifest_sha256()
+    entry = None if memo is None else memo.get("tasks")
+    known = list(entry[1]) if entry is not None and entry[0] == manifest else []
+    limit = min(len(source), ACTIVATION_SCAN_MAX)
+    servable = sum(1 for image in known if image is not None and image in images)
+    while servable < needed and len(known) < limit:
         try:
-            image = source.task_image(index)
+            image = source.task_image(len(known))
         except Exception:
-            unreadable += 1
-            continue
-        if image in images:
+            image = None
+        known.append(image)
+        if image is not None and image in images:
             servable += 1
-            if servable >= needed:
-                break
-    return servable, unreadable
+    if memo is not None:
+        memo["tasks"] = (manifest, tuple(known))
+    return servable, sum(1 for image in known if image is None)
 
 
-def machines_problem(fleet: Any, added: Mapping[str, Any], *, source: Any, now: float | None = None,
-                     memo: dict | None = None) -> str | None:
-    """The fleet's part of the activation; a ``NotYet`` problem while the fleet's view is incomplete."""
+def machines_problem(fleet: Any, added: Mapping[str, Any], *, source: Any, validity_s: int,
+                     now: float | None = None, memo: dict | None = None) -> str | None:
+    """The fleet's part of the activation; a ``NotYet`` problem while the fleet's view is incomplete.
+    ``validity_s``: the token validity the issuer would give its sessions (machines' caps must allow it)."""
     episode = added["environment"]["episode"]
-    env, package = episode["sandbox_env"], episode["env_package"]
-    complete = fleet.view_complete(env, package, env_options_sha256=source.options_sha256, now=now)
+    env, package, budgets = episode["sandbox_env"], episode["env_package"], dict(episode["budgets"])
+    host = dict(env_options_sha256=source.options_sha256, lock_sha256=source.lock_sha256, budgets=budgets,
+                validity_s=int(validity_s), now=now)
+    complete = fleet.view_complete(env, package, **host)
 
     def answer(problem: str) -> str:
         if complete:
@@ -249,51 +383,53 @@ def machines_problem(fleet: Any, added: Mapping[str, Any], *, source: Any, now: 
         return NotYet(f"{problem} (not yet: the fleet's view is stale or incomplete; checked again later)")
 
     min_present = min(len(source.lock_images), ACTIVATION_MIN_IMAGES)
-    serving = fleet.serving(env, package, env_options_sha256=source.options_sha256, lock_sha256=source.lock_sha256,
-                            min_present=min_present, now=now)
+    serving = fleet.serving(env, package, min_present=min_present, **host)
     if len(serving) < MIN_ACTIVATION_MACHINES:
         reported = ", ".join(fleet.reported_packages(env)) or "nothing"
-        return answer(f"{len(serving)} machine(s) serve {package} for {env} with its options and at least "
-                      f"{min_present} locked images (need {MIN_ACTIVATION_MACHINES}); machines report {reported}")
-    images = fleet.images_served(env, package, env_options_sha256=source.options_sha256, now=now)
+        return answer(f"{len(serving)} machine(s) could host {package} for {env} (its options, image lock, tools, "
+                      f"caps for its budgets and a {int(validity_s)} s token) with at least {min_present} locked "
+                      f"images (need {MIN_ACTIVATION_MACHINES}); machines report {reported}")
+    images = fleet.images_served(env, package, **host)
     needed = min(len(source), ACTIVATION_MIN_SERVABLE_TASKS)
-    key = (source.manifest_sha256(), images)
-    if memo is not None and memo.get("key") == key:
-        servable, unreadable = memo["scan"]             # the same images served: the last scan's count
-    else:
-        servable, unreadable = _scan(source, images, needed)
-        if memo is not None:
-            memo.update(key=key, scan=(servable, unreadable))
+    servable, unreadable = _servable(source, images, needed, memo)
     if servable >= needed:
         return None
     detail = f"; the image of {unreadable} task(s) could not be read" if unreadable else ""
-    return answer(f"only {servable} task(s) of its RL split are servable by the machines serving it (need "
+    return answer(f"only {servable} task(s) of its RL split are servable by the machines that could host it (need "
                   f"{needed}){detail}: pre-pull more of its images")
 
 
 def activation_problem(name: str, added: Mapping[str, Any], attestation: Any, *, build: Callable[[Any], Any],
                        fleet: Any, allowed: frozenset[str], active_sources: Mapping[str, Any], order: Any,
-                       memo: dict | None = None) -> tuple[str | None, Any]:
-    """(the first problem, None), or (None, the built environment). A ``NotYet`` problem is not a refusal."""
-    from reliquary.environment.bridged_episode import BridgedEnvConfig
+                       boot: Mapping[str, frozenset], validity_s: int,
+                       current: Mapping[str, frozenset] | None = None, memo: dict | None = None,
+                       loaded: MutableMapping[str, str] | None = None) -> tuple[str | None, Any]:
+    """(the first problem, None), or (None, the built environment). A ``NotYet`` problem is not a refusal.
+    ``boot``: ``installed_distributions()`` at the validator's start; ``validity_s``: the issuer's token validity
+    for the env's sessions; ``loaded``: the record of modules built in this process (default: the process's)."""
+    from reliquary.environment.bridged_episode import (
+        BridgedEnvConfig,
+        loaded_identity_problem,
+    )
 
-    for check in (lambda: package_problem(added, allowed), lambda: name_problem(added),
-                  lambda: budget_problem(added, order)):
-        problem = check()
-        if problem is not None:                     # refused before anything of the package is imported
-            return problem, None
+    problem = before_import_problem(added, allowed, order, boot=boot, current=current)
+    if problem is not None:                         # refused before anything of the package is imported
+        return problem, None
     problem = attestation_problem(attestation, added)
     if problem is not None:
         return f"the attestation: {problem}", None
     try:
         environment = build(BridgedEnvConfig.from_catalogue(name, added["catalogue"]))
+    except _TRANSIENT as exc:         # a download or a disk read that failed now: tried again later
+        return NotYet(f"cannot be built now ({type(exc).__name__}: {exc})"), None
     except Exception as exc:          # an env that cannot be built here is not installed, whatever the cause
         return f"not installed on this validator ({type(exc).__name__}: {exc})", None
     source = environment.source
     for check in (lambda: install_problem(source, added),
                   lambda: module_problem(source, added, active_sources, order),
+                  lambda: loaded_identity_problem(getattr(source, "module_name", None), source.identity, loaded),
                   lambda: identities_problem(active_sources),
-                  lambda: machines_problem(fleet, added, source=source, memo=memo)):
+                  lambda: machines_problem(fleet, added, source=source, validity_s=validity_s, memo=memo)):
         problem = check()
         if problem is not None:
             return problem, None
@@ -302,5 +438,6 @@ def activation_problem(name: str, added: Mapping[str, Any], attestation: Any, *,
 
 __all__ = ["ACTIVATION_MIN_IMAGES", "ACTIVATION_MIN_SERVABLE_TASKS", "ACTIVATION_SCAN_MAX", "ADDED_PACKAGES_FILE",
            "CONFORMANCE_GATE_SAMPLE", "EPISODE_LIMIT_FIELDS", "MIN_ACTIVATION_MACHINES", "NotYet",
-           "activation_problem", "allowed_packages", "attestation_problem", "budget_problem", "identities_problem",
-           "install_problem", "machines_problem", "module_problem", "name_problem", "package_problem"]
+           "activation_problem", "allowed_packages", "attestation_problem", "before_import_problem", "budget_problem",
+           "identities_problem", "install_problem", "install_set_problem", "installed_distributions",
+           "machines_problem", "module_problem", "name_problem", "package_problem"]

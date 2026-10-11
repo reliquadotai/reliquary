@@ -637,7 +637,7 @@ class Fleet:
     def pick(self, *, image: str, env: str, env_package: str, budgets: Mapping[str, int],
              validity_s: int, now: float,
              env_options_sha256: str | None = None, exclude: Collection[str] = (),
-             reserve: Mapping[str, Any] | None = None) -> Placement | None:
+             reserve: Mapping[str, Any] | None = None, env_lock_sha256: str | None = None) -> Placement | None:
         """The machine a new session goes to (see the module docstring), or None. With
         `env_options_sha256`, a machine is eligible only if its report publishes that
         digest for `env` (the gateway is the authority on the env's options). `exclude`: machines
@@ -654,7 +654,8 @@ class Fleet:
                 continue
             document = self._reports.get(entry.machine_id)
             if not self._fits(entry, document, image=image, env=env, env_package=env_package, budgets=budgets,
-                              validity_s=validity_s, now=now, env_options_sha256=env_options_sha256):
+                              validity_s=validity_s, now=now, env_options_sha256=env_options_sha256,
+                              env_lock_sha256=env_lock_sha256):
                 continue
             free = self._free(entry.machine_id, document)
             if free <= 0:
@@ -675,25 +676,41 @@ class Fleet:
         return document["free"] - issued
 
     def _fits(self, entry, document, *, image: str, env: str, env_package: str, budgets: Mapping[str, int],
-              validity_s: int, now: float, env_options_sha256: str | None) -> bool:
+              validity_s: int, now: float, env_options_sha256: str | None, env_lock_sha256: str | None = None) -> bool:
         """The checks of a machine that do not depend on its free room (shared by ``pick`` and ``could_place``)."""
         if entry.status != "active" or entry.machine_id in self.drained:
             return False
         if document is None or now - document["at"] > HEARTBEAT_MAX_AGE_S:
             return False
         return self._serves(entry, document, image=image, env=env, env_package=env_package, budgets=budgets,
-                            validity_s=validity_s, env_options_sha256=env_options_sha256)
+                            validity_s=validity_s, env_options_sha256=env_options_sha256,
+                            env_lock_sha256=env_lock_sha256)
 
     def _serves(self, entry, document, *, image: str, env: str, env_package: str, budgets: Mapping[str, int],
-                validity_s: int, env_options_sha256: str | None) -> bool:
-        """What the machine's (last) report says it serves: the image, the env, its options, the tools and caps."""
+                validity_s: int, env_options_sha256: str | None, env_lock_sha256: str | None = None) -> bool:
+        """What the machine's (last) report says it serves: the image, then ``_serves_env``."""
         if image not in self._images_of(entry.machine_id, document):
             return False
+        return self._serves_env(entry, document, env=env, env_package=env_package, budgets=budgets,
+                                validity_s=validity_s, env_options_sha256=env_options_sha256,
+                                env_lock_sha256=env_lock_sha256)
+
+    def _serves_env(self, entry, document, *, env: str, env_package: str, budgets: Mapping[str, int],
+                    validity_s: int, env_options_sha256: str | None, env_lock_sha256: str | None = None) -> bool:
+        """What the machine's (last) report says it serves for the env, its images aside: the env at its package,
+        its options, its image lock (``env_lock_sha256``: a machine reporting another lock for the env is
+        refused; one reporting none is not judged here), the tools and the caps against the session's budgets and
+        token validity. The one predicate of the open path (``_serves``) and of an added env's activation
+        (``serving(budgets=, validity_s=)``)."""
         if (document.get("env_packages") or {}).get(env) != env_package:
             return False
         if env_options_sha256 is not None and self._options_differ(
                 entry.machine_id, document, env, env_options_sha256):
             return False
+        if env_lock_sha256 is not None:
+            lock = (document.get("env_image_locks") or {}).get(env)
+            if isinstance(lock, Mapping) and lock.get("sha256") != env_lock_sha256:
+                return False
         if document.get("tools_version") != TOOLS_VERSION:
             return False
         caps = document.get("caps") or {}
@@ -705,7 +722,7 @@ class Fleet:
 
     def could_place(self, *, image: str, env: str, env_package: str, budgets: Mapping[str, int], validity_s: int,
                     now: float, env_options_sha256: str | None = None,
-                    reserve: Mapping[str, Any] | None = None) -> bool | None:
+                    reserve: Mapping[str, Any] | None = None, env_lock_sha256: str | None = None) -> bool | None:
         """Whether some machine could ever take this session, its load aside: True (a fresh active machine
         serves it), False (no active machine serves it, by what every one of them reports) or None when it
         cannot be judged now: the directory is stale, no machine report was accepted yet (a start) or the last
@@ -718,7 +735,7 @@ class Fleet:
             return None
         fresh = unknown = False
         kw = dict(image=image, env=env, env_package=env_package, budgets=budgets, validity_s=validity_s,
-                  env_options_sha256=env_options_sha256)
+                  env_options_sha256=env_options_sha256, env_lock_sha256=env_lock_sha256)
         for entry in self._directory.entries():
             document = self._reports.get(entry.machine_id)
             if entry.status != "active" or document is None:
@@ -739,7 +756,7 @@ class Fleet:
     def servable_machines(self, *, image: str, env: str, env_package: str, budgets: Mapping[str, int],
                           validity_s: int, now: float | None = None, env_options_sha256: str | None = None,
                           reserve: Mapping[str, Any] | None = None,
-                          include_unknown: bool = False) -> tuple[str, ...]:
+                          include_unknown: bool = False, env_lock_sha256: str | None = None) -> tuple[str, ...]:
         """The fresh active machines that could ever take this session, their load aside: exactly the open
         path's own filters (``_fits``; with ``reserve``, ``_could_hold`` on a machine judged by its resources),
         so a machine counted here is one ``could_place`` answers True for. The precommit route counts with it,
@@ -754,7 +771,8 @@ class Fleet:
             document = self._reports.get(entry.machine_id)
             if not include_unknown:
                 if not self._fits(entry, document, image=image, env=env, env_package=env_package, budgets=budgets,
-                                  validity_s=validity_s, now=now, env_options_sha256=env_options_sha256):
+                                  validity_s=validity_s, now=now, env_options_sha256=env_options_sha256,
+                                  env_lock_sha256=env_lock_sha256):
                     continue
                 if self._could_hold(entry.machine_id, document, reserve) is not True:
                     continue
@@ -763,7 +781,8 @@ class Fleet:
             if entry.status != "active" or document is None:
                 continue
             if not self._serves(entry, document, image=image, env=env, env_package=env_package, budgets=budgets,
-                                validity_s=validity_s, env_options_sha256=env_options_sha256):
+                                validity_s=validity_s, env_options_sha256=env_options_sha256,
+                                env_lock_sha256=env_lock_sha256):
                 continue
             if self._could_hold(entry.machine_id, document, reserve) is not False:
                 found.append(entry.machine_id)       # True (fresh or not) or None (resources unreadable)
@@ -845,24 +864,31 @@ class Fleet:
     def servable(self, *, image: str, env: str, env_package: str, budgets: Mapping[str, int], validity_s: int,
                  now: float | None = None, env_options_sha256: str | None = None,
                  reserve: Mapping[str, Any] | None = None, group_size: int = 1,
-                 include_unknown: bool = False) -> int:
+                 include_unknown: bool = False, env_lock_sha256: str | None = None) -> int:
         """How many machines ``servable_machines`` finds; 0 when, together, they could not hold ``group_size``
         sessions at once (a precommit whose machines cannot host its group is never accepted, so a saturation of
         its own group is never the miner's doing). ``include_unknown``: see ``servable_machines``."""
         machines = self.servable_machines(image=image, env=env, env_package=env_package, budgets=budgets,
                                           validity_s=validity_s, now=now, env_options_sha256=env_options_sha256,
-                                          reserve=reserve, include_unknown=include_unknown)
+                                          reserve=reserve, include_unknown=include_unknown,
+                                          env_lock_sha256=env_lock_sha256)
         if int(group_size) > 1 and self.sessions_hostable(machines, reserve) < int(group_size):
             return 0
         return len(machines)
 
     def images_served(self, env: str, env_package: str, *, env_options_sha256: str | None = None,
-                      now: float | None = None) -> frozenset[str]:
-        """The images the machines serving ``env`` at ``env_package`` (and options) hold, together. The union is
-        rebuilt only when one of those machines' reports changed."""
-        machines = self.serving(env, env_package, env_options_sha256=env_options_sha256, now=now)
+                      lock_sha256: str | None = None, budgets: Mapping[str, int] | None = None,
+                      validity_s: int | None = None, now: float | None = None) -> frozenset[str]:
+        """The images the machines serving ``env`` at ``env_package`` (and options) hold, together; with
+        ``lock_sha256``, only the machines under that image lock; with ``budgets``/``validity_s``, only the ones
+        the open path could place such a session on (``serving``'s filters). The union is rebuilt only when one of
+        those machines' reports changed."""
+        machines = self.serving(env, env_package, env_options_sha256=env_options_sha256, lock_sha256=lock_sha256,
+                                min_present=None if lock_sha256 is None else 0, budgets=budgets,
+                                validity_s=validity_s, now=now)
         documents = tuple((m, self._reports[m]) for m in machines)
-        key = (env, env_package, env_options_sha256)
+        key = (env, env_package, env_options_sha256, lock_sha256,
+               None if budgets is None else tuple(sorted(budgets.items())), validity_s)
         cached = self._served_images.get(key)
         if (cached is not None and len(cached[0]) == len(documents)
                 and all(a[0] == b[0] and a[1] is b[1] for a, b in zip(cached[0], documents))):
@@ -886,11 +912,16 @@ class Fleet:
 
     def serving(self, env: str, env_package: str, *, env_options_sha256: str | None = None,
                 lock_sha256: str | None = None, min_present: int | None = None,
+                budgets: Mapping[str, int] | None = None, validity_s: int | None = None,
                 now: float | None = None) -> list[str]:
         """The active, fresh, undrained machines whose report serves ``env`` at exactly ``env_package`` (with a
         valid ``resources`` block when resources are required); with ``env_options_sha256``, under that options
         digest; with ``lock_sha256``, under that image lock with at least ``min_present`` of its locked images
-        present (default: all of them). Memory reads only."""
+        present (default: all of them); with ``budgets`` and ``validity_s`` (both or neither), only the machines
+        the open path could place such a session on, its image aside (``_serves_env``: tools, caps, token
+        validity). Memory reads only."""
+        if (budgets is None) != (validity_s is None):
+            raise ValueError("serving takes budgets and validity_s together")
         now = self._clock() if now is None else now
         if not self.directory_ready(now):
             return []
@@ -916,15 +947,24 @@ class Fleet:
                 wanted = lock["images"] if min_present is None else min(int(min_present), lock["images"])
                 if lock["present"] < wanted:
                     continue
+            if budgets is not None and not self._serves_env(
+                    entry, document, env=env, env_package=env_package, budgets=budgets, validity_s=int(validity_s),
+                    env_options_sha256=env_options_sha256, env_lock_sha256=lock_sha256):
+                continue
             found.append(entry.machine_id)
         return sorted(found)
 
     def view_complete(self, env: str, env_package: str, *, env_options_sha256: str | None = None,
-                      now: float | None = None) -> bool:
+                      lock_sha256: str | None = None, budgets: Mapping[str, int] | None = None,
+                      validity_s: int | None = None, now: float | None = None) -> bool:
         """Whether a shortfall of the machines serving ``env`` at ``env_package`` (and options) is a final answer:
         the directory is young enough, the last poll heard some machine, and no active machine whose last report
         serves it is stale or drained, or judged by resources it cannot report (``could_place``'s "cannot judge
-        now", per env). False: the view is incomplete, and a shortfall is "not yet". Memory reads only."""
+        now", per env). With ``lock_sha256``/``budgets``/``validity_s``, a machine whose last report could never
+        host such a session (``_serves_env``) does not hold the answer. False: the view is incomplete, and a
+        shortfall is "not yet". Memory reads only."""
+        if (budgets is None) != (validity_s is None):
+            raise ValueError("view_complete takes budgets and validity_s together")
         now = self._clock() if now is None else now
         if not self.directory_ready(now) or self._egress_suspect or not self._last_ok:
             return False
@@ -936,6 +976,10 @@ class Fleet:
                 continue
             if (env_options_sha256 is not None
                     and (document.get("env_options_sha256") or {}).get(env) != env_options_sha256):
+                continue
+            if budgets is not None and not self._serves_env(
+                    entry, document, env=env, env_package=env_package, budgets=budgets, validity_s=int(validity_s),
+                    env_options_sha256=env_options_sha256, env_lock_sha256=lock_sha256):
                 continue
             if entry.machine_id in self.drained or now - document["at"] > HEARTBEAT_MAX_AGE_S:
                 return False
@@ -950,7 +994,7 @@ class Fleet:
 
     def nearest(self, *, image: str, env: str, env_package: str, budgets: Mapping[str, int], validity_s: int,
                 now: float, env_options_sha256: str | None = None,
-                reserve: Mapping[str, Any] | None = None) -> str | None:
+                reserve: Mapping[str, Any] | None = None, env_lock_sha256: str | None = None) -> str | None:
         """The fresh machine serving this session that is closest to having room for it (the most free room,
         full or not): the one the open queue holds for a head waiter that keeps missing. With `reserve` (RL), room
         is CPU and memory (see `pick`), and a machine that could never hold the session is not one."""
@@ -958,7 +1002,8 @@ class Fleet:
         for entry in self._directory.entries():
             document = self._reports.get(entry.machine_id)
             if not self._fits(entry, document, image=image, env=env, env_package=env_package, budgets=budgets,
-                              validity_s=validity_s, now=now, env_options_sha256=env_options_sha256):
+                              validity_s=validity_s, now=now, env_options_sha256=env_options_sha256,
+                              env_lock_sha256=env_lock_sha256):
                 continue
             if self._by_resources(document, reserve):
                 margin = self._margin(entry.machine_id, document, reserve)

@@ -203,6 +203,9 @@ class EngagementTerms:
     # The digest of the env options this validator resolved the task with: a machine
     # must publish the same one for the env (`SandboxFleet.pick`). None: not checked.
     env_options_sha256: str | None = None
+    # The image-lock digest the task was resolved under: a machine reporting another lock for the env is not
+    # one to place it on (`SandboxFleet._serves_env`). None: not checked.
+    env_lock_sha256: str | None = None
     prompt_index: int | None = None
     # The prompt's free slots as read (before the issuer lock), reservations not
     # deducted: the issuer re-checks them against its reservations under the lock.
@@ -495,6 +498,7 @@ class CorpusEngagements:
                                env_package=spec.env_package, budgets=budgets,
                                job_id=job.job_id, prompt_index=index,
                                env_options_sha256=getattr(task, "env_options_sha256", None),
+                               env_lock_sha256=getattr(task, "env_lock_sha256", None),
                                slots_remaining=int(remaining), refresh_slots=refresh_slots)
 
 
@@ -843,10 +847,12 @@ def _reserve_of(terms) -> tuple:
 
 
 def _reserving(terms) -> dict:
-    """The ``reserve`` keyword of a placement call: only when the terms carry one (a corpus call keeps its exact
-    keywords)."""
+    """The ``reserve`` and ``env_lock_sha256`` keywords of a placement call: only when the terms carry them (a
+    corpus call keeps its exact keywords)."""
     reserve = getattr(terms, "reserve", None)
-    return {} if reserve is None else {"reserve": reserve}
+    lock = getattr(terms, "env_lock_sha256", None)
+    return {**({} if reserve is None else {"reserve": reserve}),
+            **({} if lock is None else {"env_lock_sha256": lock})}
 
 
 def _placement_class(terms) -> tuple:
