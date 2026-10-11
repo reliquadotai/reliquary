@@ -527,10 +527,29 @@ def test_the_attestation_is_read_safely_a_symlink(tmp_path):
 
 
 def test_the_attestation_is_read_safely_not_a_regular_file(tmp_path):
+    import threading
+
     folder = safe_folder(tmp_path)
-    os.mkfifo(folder / "conformance.json", 0o600)
-    with pytest.raises(ValueError, match="not a regular file"):
-        ScheduleRequestStore(folder).read_attestation("conformance.json")
+    fifo = folder / "conformance.json"
+    os.mkfifo(fifo, 0o600)
+    outcome: dict = {}
+
+    def read():
+        try:
+            outcome["value"] = ScheduleRequestStore(folder).read_attestation("conformance.json")
+        except BaseException as exc:   # noqa: BLE001 - handed to the test's thread
+            outcome["error"] = exc
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    reader.join(5)
+    if reader.is_alive():
+        # The read blocked on the FIFO (a blocking open): a writer that closes at once releases it, then fail fast.
+        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        reader.join(5)
+        pytest.fail("reading the attestation blocked on a FIFO instead of refusing it")
+    assert isinstance(outcome.get("error"), ValueError), outcome
+    assert "not a regular file" in str(outcome["error"])
 
 
 def test_the_attestation_is_read_safely_writable_by_others(tmp_path):

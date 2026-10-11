@@ -164,6 +164,23 @@ class YieldQuota:
         self._alloc_at = -math.inf
         self._dirty = True
 
+    def add_environment(self, group_sizes: Mapping[str, int], env_names: Mapping[str, str]) -> None:
+        """An episode env added to the running run (on the event loop): its M and canonical name by every name it
+        goes by, as at build (``episode_group_sizes``, ``_env_names``). A name already known with another M or
+        another canonical name raises ValueError and changes nothing."""
+        sizes = {str(k): int(v) for k, v in group_sizes.items()}
+        names = {str(k): str(v) for k, v in env_names.items()}
+        for key, size in sizes.items():
+            if self._group_sizes.get(key, size) != size:
+                raise ValueError(f"episode env name {key!r} has two group sizes; the yield quota needs one")
+        for key, name in names.items():
+            if self._env_names.get(key, name) != name:
+                raise ValueError(f"episode env name {key!r} names two envs; the per-env cap needs one")
+        self._group_sizes.update(sizes)
+        self._env_names.update(names)
+        self._env_cache = self._capacity_cache = None    # its machines count at the next read
+        self._dirty, self._alloc_key = True, None
+
     # --- the index (SessionEvents) ---
     def opened(self, record: Any) -> None:
         sha = _precommit_of(record)

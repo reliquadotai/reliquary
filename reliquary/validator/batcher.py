@@ -186,6 +186,17 @@ from reliquary.validator.verifier import (
 logger = logging.getLogger(__name__)
 
 
+def _difficulty_auction_environment(name: str) -> bool:
+    """The profile's envs, and the signed-episode envs registered at run time from a public catalogue (bridged
+    envs declared at launch, and envs added to the running run): a fill-closed service window runs the auction on
+    every env."""
+    if name in DIFFICULTY_AUCTION_ENVIRONMENTS:
+        return True
+    from reliquary.environment.registry import catalogue_environment_names
+
+    return name in catalogue_environment_names()
+
+
 def _auction_operator_tiebreak(
     *,
     seal_randomness: str,
@@ -1099,7 +1110,7 @@ class GrpoWindowBatcher:
             raise ValueError("batch_target must be positive")
         self.difficulty_auction_enabled = bool(
             DIFFICULTY_AUCTION_ENFORCE
-            and getattr(env, "name", "") in DIFFICULTY_AUCTION_ENVIRONMENTS
+            and _difficulty_auction_environment(getattr(env, "name", ""))
         )
         self.model = model
         self._proof_scheduler = proof_scheduler

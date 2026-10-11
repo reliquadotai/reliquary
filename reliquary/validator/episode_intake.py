@@ -186,6 +186,12 @@ class EpisodeGroupIntake:
     def environments(self) -> tuple[str, ...]:
         return tuple(sorted(self._checkers))
 
+    def add_checker(self, environment: str, checker: EpisodeGroupChecker) -> None:
+        """An episode env added to the running run: its groups are checked from now on (on the event loop,
+        between windows). A group still goes through its own window's frozen contract (``admit``): a window
+        frozen before the env was added refuses it (``episode_policy_stale``)."""
+        self._checkers[environment] = checker
+
     def _metric(self, name: str, *args) -> None:
         method = getattr(self._check_metrics, name, None) if self._check_metrics is not None else None
         if method is None:

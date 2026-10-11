@@ -163,6 +163,13 @@ class RlEpisodeServices:
     task_counts: dict = field(default_factory=dict, repr=False)     # env -> its tasks (for seeding the tiers)
     raw_resolvers: dict = field(default_factory=dict, repr=False)   # env -> its source's resolve (unobserved)
     saturation_cache: Any = field(default=None, repr=False)         # the last snapshot, computed off the request
+    # What an env added to the running run is checked and served with (``environment_refusal``, ``add_environment``)
+    renderer_for: Any = field(default=None, repr=False)
+    proof_stop_ids: Any = field(default=None, repr=False)
+    remote_stop_ids: Any = field(default=None, repr=False)
+    chunk_tokens: int = 0
+    pool_seeds: int = 0                  # the seed pool the session policy's caps and the quota are sized for
+    pool_sizes: dict = field(default_factory=dict, repr=False)      # env -> its seed pool (the allocation answer)
     _loop: Any = field(default=None, repr=False)
     _tasks: set = field(default_factory=set, repr=False)
 
@@ -220,13 +227,14 @@ class RlEpisodeServices:
         return jobs
 
     # --- the operator's saturation view and ALERTs ---
-    async def seed_tiers(self) -> None:
+    async def seed_tiers(self, names: Collection[str] | None = None) -> None:
         """Seed each env's per-session reservation from a sample of its own tasks (``SessionTiers.seed``): at
         most ``TIER_SEED_TASKS`` spread evenly over its index range, within ``TIER_SEED_TIMEOUT_S``. An env whose
-        tasks cannot be counted or resolved stays learnt from what is resolved (logged). Never raises."""
+        tasks cannot be counted or resolved stays learnt from what is resolved (logged). Never raises.
+        ``names``: only these envs (an env added to the running run); None: every env."""
         from reliquary.sandbox.rl_capacity import TIER_SEED_TASKS, TIER_SEED_TIMEOUT_S
 
-        for name in sorted(self.policies):
+        for name in sorted(self.policies if names is None else set(names) & set(self.policies)):
             count, resolve = self.task_counts.get(name), self.raw_resolvers.get(name)
             if not count or resolve is None:
                 logger.warning("episode env %s: its task count is unknown; its reservation tier is learnt from the "
@@ -480,6 +488,84 @@ class RlEpisodeServices:
             # ledger's flush lock: close waits for it).
             await asyncio.to_thread(self.ledger.close)
 
+    # --- envs added to the running run ---
+    def _renderer_refusal(self, policy) -> tuple[Any, str | None]:
+        """(the env's turn renderer or None, why these services could not serve an episode env with ``policy``)."""
+        if self.pool_seeds and int(policy.pool_seeds) > self.pool_seeds:
+            return None, (f"its seed pool {policy.pool_seeds} is larger than the {self.pool_seeds} the RL session "
+                          f"policy and the quota were sized for at start")
+        try:
+            episode_group_sizes({**self.policies, policy.environment: policy})
+        except ValueError as exc:
+            return None, str(exc)
+        if self.renderer_for is None:
+            return None, None
+        try:
+            renderer = self.renderer_for(policy)
+        except Exception as exc:
+            return None, f"no renderer for its tools {list(policy.tools)} ({type(exc).__name__}: {exc})"
+        if self.proof_stop_ids is None:
+            return renderer, None
+        return renderer, episode_stop_set_refusal({policy.environment: renderer.stop_ids}, self.proof_stop_ids,
+                                                  self.remote_stop_ids)
+
+    def environment_refusal(self, policy) -> str | None:
+        """Why these services could not serve an episode env with ``policy`` (an env a schedule request adds): a
+        seed pool larger than the one they were sized for, a name the quota already knows with another group
+        size, no renderer for its tools, or its renderer's stops outside the proof's stop set; None when they
+        can."""
+        return self._renderer_refusal(policy)[1]
+
+    def add_environment(self, name: str, environment, policy) -> None:
+        """Serve an env added to the running run, as one of the order's: its policy (the ledger's settlement
+        translation, the reservation tiers, hence the fleet size and the saturation view), its served pin (the
+        degraded and lost-machine checks), its names in the yield quota (M, the per-env cap), its seed pool (the
+        allocation answer), its task source observed by the tiers (seeded from its own tasks), its checker to the
+        intake, and last its view (``views``, read by the engagement book: opens follow). ``policy`` is the
+        schedule's view's (``schedule.contract_view(order).episode_policy(name)``); once the runtime's view names
+        the env, it must be that one. Called on the event loop between windows; idempotent. Raises ValueError,
+        changing nothing, when the services cannot serve it (``environment_refusal``).
+
+        Whether the env takes groups, and in which window, is the runtime's: a precommit needs the env in its
+        window's frozen pools (active, with a share of the schedule), and a group is judged by its own window's
+        frozen contract (a window frozen before the add refuses it)."""
+        known = self.views.get(name)
+        if known is not None:
+            if known.policy != policy:
+                raise ValueError(f"episode env {name} is already served with another policy")
+            return
+        current = getattr(self.runtime, "contract", None) if self.runtime is not None else None
+        if current is not None and name in current.environments and current.episode_policy(name) != policy:
+            raise ValueError(f"episode env {name}: the policy given is not the one of the runtime's schedule")
+        renderer, why = self._renderer_refusal(policy)
+        if why is not None:
+            raise ValueError(f"episode env {name} cannot be served: {why}")
+        if renderer is None:
+            raise ValueError(f"episode env {name} cannot be served: these services have no renderer")
+        source = environment.source
+        checker = EpisodeGroupChecker(policy=policy, renderer=renderer, source=source, chunk_tokens=self.chunk_tokens)
+        resolve = source.resolve if self.tiers is None else _observing(self.tiers, name, source.resolve)
+        view = EpisodeEnvironmentView(policy=policy, resolve_task=resolve)
+        add_names = getattr(self.quota, "add_environment", None)
+        if add_names is not None:
+            add_names(episode_group_sizes({name: policy}), _env_names({name: policy}))
+        self.policies[name] = policy                     # in place: the tiers read this dict
+        self.served[name] = (policy.sandbox_env, policy.env_package, getattr(source, "options_sha256", None))
+        self.pool_sizes[name] = int(policy.pool_seeds)
+        self.resolvers[name] = resolve
+        self.raw_resolvers[name] = source.resolve
+        self.task_counts[name] = _task_count(source)
+        self.intake.add_checker(name, checker)
+        self.views[name] = view
+        self.environments = tuple(sorted({*self.environments, name}))
+        logger.warning("episode env %s added to the rl services (sandbox env %s, %s)", name, policy.sandbox_env,
+                       policy.env_package)
+        if self.tiers is not None and self._loop is not None and not self._loop.is_closed():
+            # Its reservation is learnt (the whole box until a task is resolved) until this sample settles it.
+            task = self._loop.create_task(self.seed_tiers([name]))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
     # --- the batcher's hand-back hook (non-blocking) ---
     def batcher_hook(self, environment: str, window: int) -> Callable[[Any, str], None]:
         """``GrpoWindowBatcher.episode_proof_inconclusive`` of one episode env's batcher of ``window``."""
@@ -717,11 +803,11 @@ def _allocation_of(quota, pool_seeds: Mapping[str, int], *, clock: Callable[[], 
     env, the groups that potential holds in that env's own pool size (at least one). Before the fleet can be sized,
     ``groups`` is None: the miner keeps its own number rather than drop to one group. Each hotkey's answer is a
     snapshot kept ``ttl_s`` (the route never recomputes a potential per call)."""
-    sizes = {str(env): int(p) for env, p in pool_seeds.items()}
     cache: dict[str, tuple[float, dict]] = {}
 
     def allocation_of(hotkey: str) -> dict:
         now = float(clock())
+        sizes = {str(env): int(p) for env, p in pool_seeds.items()}     # read live: an env added later is named
         kept = cache.get(hotkey)
         if kept is not None and now - kept[0] < ttl_s:
             return kept[1]
@@ -903,9 +989,10 @@ def build_rl_episode_services(
                                 window_open=window_open, check_metrics=saturation, **_check_caps(quota, clock))
     logger.info("rl episode services built for %s (validator key %s)", sorted(policies), signer.key_id)
     routers = (sessions_router, precommit_router)
+    pool_sizes = {name: int(p.pool_seeds) for name, p in policies.items()}
     if isinstance(quota, YieldQuota):
         routers += (build_allocation_router(
-            _allocation_of(quota, {name: p.pool_seeds for name, p in policies.items()}, clock=clock),
+            _allocation_of(quota, pool_sizes, clock=clock),
             validator_hotkey=validator_hotkey, policy=policy, prefix=RL_PREFIX, registration=registration,
             clock=clock),)
     if saturation is not None:
@@ -921,7 +1008,11 @@ def build_rl_episode_services(
                                      for name, p in policies.items()},
                              resolvers=resolvers, boot_wait_s=boot_wait_s, views=views, saturation=saturation,
                              tiers=tiers, task_counts={name: _task_count(environments[name].source) for name in policies},
-                             raw_resolvers={name: environments[name].source.resolve for name in policies})
+                             raw_resolvers={name: environments[name].source.resolve for name in policies},
+                             renderer_for=renderer_for,
+                             proof_stop_ids=None if proof_stop_ids is None else frozenset(proof_stop_ids),
+                             remote_stop_ids=None if remote_stop_ids is None else frozenset(remote_stop_ids),
+                             chunk_tokens=int(chunk_tokens), pool_seeds=int(pool_seeds), pool_sizes=pool_sizes)
     engagements.serving_refusal = services.serving_refusal
     built["services"] = services
     return services
