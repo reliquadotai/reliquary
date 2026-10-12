@@ -413,9 +413,10 @@ class SessionRecord:
     # open). A submission or a withdrawal later moves ``closed_at`` (a withdrawal also ``closed_status``) but
     # never this, so the yield weight never counts an unsubmitted tail, and a box that ran is known to have run.
     ended_at: int | None = None
-    # RL only: the status of that machine's signed final (``graded``, ``expired``...), set with ``ended_at``. A
-    # withdrawal rewrites ``closed_status`` to ``withdrawn``, never this: the yield ledger judges by it whether the
-    # session's box ended graded (a group that could not form for capacity keeps its graded sessions neutral).
+    # RL only: the status of that machine's signed final (``graded``, ``expired``...), set with ``ended_at`` when the
+    # session was closed with it (``final``), never when the miner withdrew it live (it refused its own episode). A
+    # later withdrawal rewrites ``closed_status`` to ``withdrawn``, never this: the yield ledger judges by it whether
+    # the session's box ended graded (a group that could not form for capacity keeps its graded sessions neutral).
     ended_status: str | None = None
 
     def to_document(self) -> dict:
@@ -1459,7 +1460,8 @@ class SessionIssuer:
                 settled.fault = fault                    # before the record is persisted
             if settled is not None and self._record_faults and settled.ended_at is None and final is not None:
                 settled.ended_at = now                   # its box's end, never moved by a submission or withdrawal
-                settled.ended_status = str(final.get("status") or status)[:64]
+                if not withdraw:                         # only a session that reached its machine's own close:
+                    settled.ended_status = str(final.get("status") or status)[:64]   # never one the miner refused
         if settled is not None:
             self._event("closed", settled, final)
             self._settled((settled,))

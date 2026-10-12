@@ -241,11 +241,15 @@ class EpisodeGroupMiner:
         return min(bounds, default=None)
 
     async def _play(self, runner, precommit, pool, played: list[EpisodeOutcome], *,
-                    open_until: float | None = None) -> None:
+                    open_until: float | None = None, admissible: Callable[[EpisodeOutcome], bool] | None = None
+                    ) -> None:
         """Every seed of the pool, at once (the runner bounds its live sessions). Each outcome is appended
-        to ``played`` as soon as its episode ends, so the caller can withdraw it whatever happens next.
-        A seed whose final is machine-signed ``aborted`` is played again (ABORT_REPLAYS); the seeds still
-        playing at the cutoff (``_cutoff``) are cancelled."""
+        to ``played`` as soon as its episode ends, so the caller can withdraw it whatever happens next, and,
+        with ``admissible`` (the group's own admission check), the runner is told whether it can be kept
+        (``note_admissible``: it stops asking for seeds beyond M only once M can be). A seed whose final is
+        machine-signed ``aborted`` is played again (ABORT_REPLAYS); the seeds still playing at the cutoff
+        (``_cutoff``) are cancelled."""
+        note = getattr(runner, "note_admissible", None) if admissible is not None else None
         deadline = getattr(runner, "deadline", None)
 
         async def one(seed: int) -> None:
@@ -259,7 +263,14 @@ class EpisodeGroupMiner:
                     logger.info("seed %d of precommit %s aborted by its machine: played again", seed,
                                 precommit.sha256[:12])
                     continue
-                played.append(EpisodeOutcome(seed, result, session))
+                outcome = EpisodeOutcome(seed, result, session)
+                played.append(outcome)
+                if note is not None:
+                    try:
+                        note(seed, bool(admissible(outcome)))
+                    except Exception:
+                        logger.exception("seed %d: its admission check failed", seed)
+                        note(seed, False)
                 return
 
         tasks = [asyncio.ensure_future(one(seed)) for seed in range(pool.pool_seeds)]
@@ -294,7 +305,7 @@ class EpisodeGroupMiner:
         """One group of (``environment``, ``task_index``) in ``window``: its ``GroupVerdict``, or None when
         no group was sent. ``open_until`` is the window's end (wall clock): no open, precommit or group is
         sent past it, and the seeds still playing then are cancelled."""
-        from reliquary.miner.episode_commit import withdraw_inadmissible
+        from reliquary.miner.episode_commit import episode_admissible, withdraw_inadmissible
         from reliquary.protocol.seed_pool import pool_from_service_policy
         from reliquary.protocol.service_catalogue import announced_contract
         from reliquary.protocol.service_episode import EpisodePrecommit
@@ -321,7 +332,9 @@ class EpisodeGroupMiner:
         sent = {"pending": False}              # the validator holds the chosen group, its verdict unknown
         async with runner:
             try:
-                await self._play(runner, precommit, pool, played, open_until=open_until)
+                await self._play(runner, precommit, pool, played, open_until=open_until,
+                                 admissible=lambda outcome: episode_admissible(
+                                     outcome, policy=policy, renderer=renderer, prompt=prompt)[0] is not None)
                 start_refused = getattr(runner, "start_refused", None)
                 if isinstance(start_refused, SessionRefused) and not played:
                     # the group could not start in this env (its per-env share is held): its slot goes elsewhere

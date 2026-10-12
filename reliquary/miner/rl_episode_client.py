@@ -48,11 +48,12 @@ group's slot goes to another env this window rather than wait (``EpisodeGroupMin
 
 RL_OVERGENERATION_REFUSALS = frozenset({"quota_live", "quota_pool"})
 """The quota's answer to a seed beyond M of a group that holds its M sessions (over-generation): no room for one more
-in the hotkey's allocation, its pooled entity or the fleet (a group under M is never refused them). Once M episodes of
-the precommit ended graded and usable, one ends the group's opens: it is played from the seeds it has. Waiting instead
-would hold its graded sessions for room that only its own submission frees: every group at M would wait on the others
-until its window's end. Before that the seed is reopened as any throttle: a session still playing may fail, and the
-quota then admits the group's next seed."""
+in the hotkey's allocation, its pooled entity or the fleet (a group under M is never refused them). While M episodes of
+the precommit passed the group's own admission check (``note_admissible``: graded, usable, admissible by length,
+prompt, shape and stop, with the engine's log), one ends the group's opens: it is played from the seeds it has.
+Waiting instead would hold its graded sessions for room that only its own submission frees: every group at M would
+wait on the others until its window's end. Below M the seed is reopened as any throttle (a session still playing may
+fail, an episode may be inadmissible), and the seeds still waiting are sent again."""
 
 RL_OPENS_SIDE_BY_SIDE = 4
 """Opens of one started group in flight at once (each may wait in the validator's open queue): enough to keep the
@@ -247,9 +248,10 @@ class RlSignedEpisodeRunner(SignedSweEpisodeRunner):
         self._fanning = False                 # a seed was granted and no throttle since: opens go side by side
         self._throttles = 0                   # throttles so far (a grant re-opens side by side only if none since)
         self._started = False                 # a seed of the precommit was granted
-        self._usable = 0                      # episodes of the precommit that ended graded and usable
+        self._admissible: set[int] = set()    # seeds whose episode the group's admission check keeps
         self._side_by_side = asyncio.Semaphore(RL_OPENS_SIDE_BY_SIDE)
         self._task_refused: SessionRefused | None = None
+        self._overgeneration: SessionRefused | None = None    # no room beyond M (ends opens while M are held)
         self.start_refused: SessionRefused | None = None    # the group ended before it started (RL_START_REFUSALS)
 
     def _until(self) -> float:
@@ -277,12 +279,12 @@ class RlSignedEpisodeRunner(SignedSweEpisodeRunner):
                     if self._task_refused is None:
                         self._task_refused = refused
                     raise
-                if refused.reason in RL_OVERGENERATION_REFUSALS and self._usable >= self._policy.pool_seeds // 2:
-                    if self._task_refused is None:
-                        logger.info("precommit %s holds %d usable episodes and the validator has no room for more "
-                                    "(%s): played from the seeds it has", self._precommit.sha256[:12], self._usable,
-                                    refused.reason)
-                        self._task_refused = refused
+                if refused.reason in RL_OVERGENERATION_REFUSALS and self._holds_m():
+                    if self._overgeneration is None:
+                        logger.info("precommit %s holds %d admissible episodes and the validator has no room for "
+                                    "more (%s): played from the seeds it has", self._precommit.sha256[:12],
+                                    len(self._admissible), refused.reason)
+                        self._overgeneration = refused
                     raise
                 reopen = (not slot.keep and refused.reason not in RL_FINAL_REFUSALS
                           and refused.reason != "validator_unavailable"
@@ -293,11 +295,25 @@ class RlSignedEpisodeRunner(SignedSweEpisodeRunner):
                     raise
                 logger.info("seed %d open throttled (%s): reopened in %.0f s", index, refused.reason, wait)
 
+    def note_admissible(self, seed: int, admissible: bool) -> None:
+        """The group's admission check of ``seed``'s episode as it ended (or again, if it changed its mind)."""
+        if admissible:
+            self._admissible.add(int(seed))
+        else:
+            self._admissible.discard(int(seed))
+
+    def _holds_m(self) -> bool:
+        return len(self._admissible) >= self._policy.pool_seeds // 2
+
     def _task_refusal(self) -> SessionRefused | None:
         """What ends every open of the precommit without sending it: a refusal about the precommit, a group that
-        could not start, or the validator stopped serving (the consecutive count reached MAX_UNAVAILABLE)."""
+        could not start, the validator stopped serving (the consecutive count reached MAX_UNAVAILABLE), or no room
+        beyond the M admissible episodes the group holds (only while it holds them)."""
         if self._unavailable >= MAX_UNAVAILABLE:
             return SessionRefused("validator_unavailable", {"consecutive": self._unavailable})
+        overgeneration = self._overgeneration
+        if overgeneration is not None and self._holds_m():
+            return SessionRefused(overgeneration.reason, overgeneration.detail, status=overgeneration.status)
         refused = self._task_refused
         if refused is None:
             return None
@@ -348,12 +364,6 @@ class RlSignedEpisodeRunner(SignedSweEpisodeRunner):
         finally:
             _FANNED.reset(fanned)
             self._side_by_side.release()
-
-    async def _settle(self, index: int, session_id: str, slot, result, final: dict, closing: str):
-        settled = await super()._settle(index, session_id, slot, result, final, closing)
-        if settled.ok:
-            self._usable += 1
-        return settled
 
     def _open_call(self, body: dict):
         return asyncio.get_running_loop().run_in_executor(_open_executor(), self._sessions.open, body)

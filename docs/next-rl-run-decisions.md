@@ -399,10 +399,14 @@ values, to be tuned at qualification (see the last list).
   `RL_OPENS_IN_FLIGHT` (16) opens in flight per process and `RL_OPENS_SIDE_BY_SIDE` (4) per group
   (`reliquary/miner/rl_episode_client.py`), and pauses an environment for `ENV_PAUSE_S` (60 s,
   `reliquary/miner/episode_mining.py`) after a `quota_env` refusal.
-- **Every miner: play from M.** Once a group has M graded, usable episodes, a `quota_live` or `quota_pool`
-  refusal of a further seed means there is no room beyond M: play from those M and stop asking for seeds.
-  Waiting for more keeps the group's graded sessions counted, so groups at M wait on each other until the window
-  ends (the reference miner does this: `RL_OVERGENERATION_REFUSALS`).
+- **Every miner: play from M.** Once a group has M episodes that pass its own admission check (graded, usable,
+  admissible by length, prompt, shape and stop), a `quota_live` or `quota_pool` refusal of a further seed means
+  there is no room beyond M: play from those M and stop asking for seeds. Waiting for more keeps the group's graded
+  sessions counted, so groups at M wait on each other until the window ends (the reference miner does this:
+  `RL_OVERGENERATION_REFUSALS`; an inadmissible episode does not count, and below M it asks again).
+- **Measure at qualification** whether stopping at the first over-generation refusal loses in-zone groups (a group
+  of exactly M leaves no choice of seeds): if it does, keep asking for a short bound (one retry, or a minute) unless
+  the M held are already in zone.
 - **Transcript checks.** At most `MAX_CHECKS_RUNNING` transcript checks run at once for all miners, and a
   hotkey takes at most one less, so one operator's groups wait on its own checks. Size it from the measured
   check time at qualification.

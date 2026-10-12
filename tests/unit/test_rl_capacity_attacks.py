@@ -959,6 +959,22 @@ def test_abandoning_a_group_after_a_key_full_refusal_is_waste(tmp_path):
 
 # --- a graded session the miner withdraws keeps its machine's final for the capacity verdict --------------------
 
+def test_a_graded_episode_the_miner_refused_and_withdrew_live_stays_waste_under_others_saturation(tmp_path):
+    """The miner refused its own graded episode (its transcript would not pass) and withdrew it live, never closed
+    with its machine's final: it carries no machine final for the ledger, so even under others' saturation (a
+    capacity verdict) it is waste."""
+    env, ledger = saturating(tmp_path)
+    grants = [open_(env, seed) for seed in range(3)]
+    for grant in grants:
+        assert close(env, grant, "graded", reason="withdraw")["status"] == "withdrawn"
+        record = env.book.get(grant.session_id)
+        assert record.ended_at is not None and record.ended_status is None
+    others_fill_the_machine(env)
+    refused_open(env, 3)
+    assert ledger._verdicts[env.precommit.sha256][0] == "capacity"
+    assert decided_of(env, ledger) == 3
+
+
 @pytest.mark.parametrize("cause", ["others_saturation", "no_refusal", "self_made_saturation", "key_full"])
 def test_graded_sessions_withdrawn_after_the_group_could_not_form(tmp_path, cause):
     """Three graded sessions (fewer than M), then the miner withdraws them (the reference miner withdraws every

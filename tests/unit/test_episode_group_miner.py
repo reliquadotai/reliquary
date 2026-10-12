@@ -617,3 +617,114 @@ def test_the_single_turn_engine_leaves_signed_episode_environments_out(monkeypat
     init = inspect.getsource(engine_module.MiningEngine.__init__)
     assert init.count("_single_turn_envs(") == 2 and init.index("_single_turn_envs(") < init.index("self._cooldown_per_env")
     assert "_single_turn_mined_spec" not in inspect.getsource(engine_module)
+
+
+# --- over-generation with the real RL runner: only admissible episodes count toward M -------------------------
+
+
+class QuotaRlSessions:
+    """The RL session routes, faked as the validator's quota answers a group: once M seeds of the precommit are
+    granted (each session counts, admissible or not), a further seed is refused ``quota_live`` (over-generation:
+    no room for one more), and granted when asked again (room freed meanwhile). Each grant plays its seed's honest
+    episode (its token for that seed)."""
+
+    prefix, validator_hotkey = "/rl", VALIDATOR.ss58_address
+
+    def __init__(self, keys, rewards, m):
+        self.keys, self.rewards, self.m = keys, rewards, m
+        self.precommit, self.played, self.opened, self.granted, self.refused = None, {}, [], [], []
+        self.closed = []
+
+    def open(self, body):
+        seed = body["engagement"]["precommit"]["seed_index"]
+        self.opened.append(seed)
+        if len(self.granted) >= self.m and seed not in self.refused:
+            self.refused.append(seed)
+            raise SessionRefused("quota_live", {"committed": len(self.granted)}, status=429, retry_after=10.0)
+        validator, machine = self.keys
+        self.played[seed] = play_episode(validator=validator, machine=machine, precommit=self.precommit, seed=seed,
+                                         session_id=f"s-{seed}", reward=self.rewards[seed])
+        self.granted.append(seed)
+        return {"session_id": f"s-{seed}", "token": self.played[seed][2]["token"], "gateway_url": "http://g:1",
+                "expires_at": NOW + 4500}
+
+    def close(self, session_id, body):
+        self.closed.append((session_id, body["reason"]))
+        return {"state": "closed_graded" if body["reason"] == "final" else "closed"}
+
+
+class SeedHarness:
+    """The verifiers harness over the gateway, faked: the seed's signed transcript, ``stops[seed]`` as its raw stop."""
+
+    def __init__(self, sessions, stops):
+        self.sessions, self.stops = sessions, stops
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return None
+
+    async def run(self, *, token, prompt, on_trace=None):
+        seed = int(token["claims"]["engagement"].rsplit(":", 1)[1])
+        trace = SimpleNamespace(id=f"trace-{seed}", stop_condition=self.stops.get(seed, "agent_completed"))
+        on_trace(trace)
+        transcript = self.sessions.played[seed][2]
+        return SimpleNamespace(trace=trace, state=b"", transcript=transcript, refusals=(), error=None,
+                               final={"body": {"status": "graded", "reward": self.sessions.rewards[seed],
+                                               "reason": None}})
+
+
+class SeedEngine:
+    def __init__(self, sessions):
+        self.sessions, self.dropped = sessions, []
+
+    def take_session(self, trace):
+        tokens, spans, _ = self.sessions.played[int(trace.rsplit("-", 1)[1])]
+        return SessionLog(turns=[GeneratedTurn(tuple(tokens[:start]), tuple(tokens[start:end]), ())
+                                 for start, end in spans])
+
+    def drop_session(self, trace):
+        self.dropped.append(trace)
+
+
+def test_an_inadmissible_episode_does_not_count_toward_m_and_the_refused_seed_is_reopened(tmp_path):
+    """M seeds granted, one of whose episodes the group's own check refuses (its stop is not admitted): a further
+    seed refused ``quota_live`` is reopened (the group holds M - 1 admissible episodes), not given up, and the group
+    is sent once M admissible episodes exist, without the inadmissible one."""
+    from reliquary.miner.rl_episode_client import RlSignedEpisodeRunner
+
+    m = M_ROLLOUTS
+    rt = episode_runtime(tmp_path / "rt")
+    keys = episode_signers(tmp_path / "keys")
+    sessions = QuotaRlSessions(keys, alternating(2 * m), m)
+    harness = SeedHarness(sessions, stops={3: "error"})                   # seed 3: inadmissible
+    validator, clock = Validator(("accepted",)), Clock()
+
+    async def sleep(seconds):
+        clock.now += seconds
+        await asyncio.sleep(0)
+
+    def runner_factory(policy, precommit, *, prompt, open_until):
+        sessions.precommit = precommit
+        return RlSignedEpisodeRunner(
+            policy=policy, precommit=precommit, prompt=prompt, hotkey=MINER.ss58_address,
+            sign_binding=lambda b: MINER.sign(b).hex(), sessions=sessions, model_name="m", renderer_model_dir="/m",
+            generate_url="http://127.0.0.1:1", sampling=SimpleNamespace(temperature=1.0, top_p=1.0),
+            runner_factory=lambda url: harness, clock=clock, monotonic=lambda: clock.now, sleep=sleep,
+            open_until=open_until)
+
+    miner = EpisodeGroupMiner(hotkey=MINER.ss58_address, sign_binding=lambda b: MINER.sign(b).hex(),
+                              sessions=Sessions(), runner_factory=runner_factory, engine=SeedEngine(sessions),
+                              draws=Draws(), prove=prove, submit=validator.submit, verdicts=validator.verdict,
+                              renderer_for=lambda policy: FakeRenderer(), task_prompt=lambda env, task: PROMPT_TEXT,
+                              engine_caps=CAPS, sleep=sleep, clock=clock)
+    announcement = rt.announcement(window=1, randomness=WINDOW_BEACON)
+    verdict = asyncio.run(miner.mine_task(announcement=announcement, randomness="cd" * 32, window=1,
+                                          environment=EPISODE, task_index=TASK, open_until=NOW + 3_600))
+    assert verdict is not None and verdict.accepted
+    (request,) = validator.requests
+    assert 3 in sessions.granted and 3 not in request.pool_selection["seeds"]
+    assert len(request.pool_selection["seeds"]) == m
+    reopened = [seed for seed in sessions.refused if sessions.opened.count(seed) > 1]
+    assert reopened and all(seed in sessions.granted for seed in reopened)          # refused, asked again, granted

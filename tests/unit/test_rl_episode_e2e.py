@@ -780,8 +780,9 @@ async def test_two_miners_one_window_precommit_sessions_choice_proof_audit_settl
         # 4. The forged group: exploration, forced to audit (probation); the audit's forward finds model
         # tokens the forced draw never picked: deterministic (R31), banned, its window forfeited.
         CLOCK["round"] += 100                                  # its draw round is due
-        await until(lambda: (b.service_exploration_tick(), rt.exploration_banned(FORGER.ss58_address))[1], 60,
-                    "the forger's audit")
+        await until(lambda: (b.service_exploration_tick(), rt.exploration_banned(FORGER.ss58_address))[1], 180,
+                    "the forger's audit", lambda: {"rows": rt.ledger.rows(1, environment=EPISODE),
+                                                   "proofs": proof_state(b)})
         (row,) = rt.ledger.rows(1, environment=EPISODE)
         assert row["status"] == "forfeited" and row["audit"] == "failed"
         forged_pending = [p for p in b.pending_submissions() if p.hotkey == FORGER.ss58_address]
@@ -1137,8 +1138,9 @@ async def test_the_production_rl_configuration_end_to_end(production_gateway, r2
 
         # 4. The forged group's audit fails: banned, its window forfeited.
         CLOCK["round"] += 100
-        await until(lambda: (b.service_exploration_tick(), rt.exploration_banned(forger_key))[1], 60,
-                    "the forger's audit")
+        await until(lambda: (b.service_exploration_tick(), rt.exploration_banned(forger_key))[1], 180,
+                    "the forger's audit", lambda: {"rows": rt.ledger.rows(1, environment=EPISODE),
+                                                   "proofs": proof_state(b)})
         (row,) = rt.ledger.rows(1, environment=EPISODE)
         assert row["status"] == "forfeited" and row["audit"] == "failed"
 

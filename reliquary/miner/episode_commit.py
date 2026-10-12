@@ -135,29 +135,39 @@ class AdmissibleEpisode:
     stop: AdmittedStop
 
 
+def episode_admissible(outcome, *, policy, renderer, prompt: str,
+                       min_chunk_tokens: int | None = None) -> tuple[AdmissibleEpisode | None, str | None]:
+    """``(its sequence and stop, None)`` when the validator would admit the outcome's episode (``seed_index``,
+    ``result``: ``EpisodeResult``, ``session``: the generate session's log), else ``(None, why)``: a graded,
+    usable episode with the engine's log, its admitted stop, and its length, prompt fidelity and shape."""
+    result, session = outcome.result, outcome.session
+    try:
+        if not getattr(result, "ok", False) or result.transcript is None or session is None:
+            raise ValueError("no graded episode")
+        tokens, spans = episode_sequence(session.turns)
+        stop = episode_stop(result.stop, tokens=tokens, spans=spans, max_turns=policy.max_turns,
+                            max_tokens_per_turn=policy.max_tokens_per_turn,
+                            max_episode_tokens=policy.max_episode_tokens, stop_ids=renderer.stop_ids)
+        why = episode_refusal(policy=policy, renderer=renderer, prompt=prompt, tokens=tokens, spans=spans,
+                              stop=stop, transcript=result.transcript, min_chunk_tokens=min_chunk_tokens)
+    except (ValueError, TypeError, KeyError, IndexError) as error:
+        return None, f"{type(error).__name__}: {error}"
+    return (AdmissibleEpisode(tokens, spans, stop), None) if why is None else (None, why)
+
+
 async def withdraw_inadmissible(outcomes, *, policy, renderer, prompt: str,
                                 min_chunk_tokens: int | None = None) -> list[tuple[Any, AdmissibleEpisode]]:
     """Before ``choose_episodes``: each outcome (``seed_index``, ``result``: ``EpisodeResult``, ``session``:
-    the generate session's log) the validator would admit, with its sequence and stop; every other one is
-    withdrawn at once (``result.release()``: its slot and the hotkey's caps are freed), so no group is ever
-    built of an episode the validator refuses."""
+    the generate session's log) the validator would admit (``episode_admissible``), with its sequence and stop;
+    every other one is withdrawn at once (``result.release()``: its slot and the hotkey's caps are freed), so no
+    group is ever built of an episode the validator refuses."""
     kept: list[tuple[Any, AdmissibleEpisode]] = []
     for outcome in outcomes:
-        result, session = outcome.result, outcome.session
-        why = None
-        try:
-            if not getattr(result, "ok", False) or result.transcript is None or session is None:
-                raise ValueError("no graded episode")
-            tokens, spans = episode_sequence(session.turns)
-            stop = episode_stop(result.stop, tokens=tokens, spans=spans, max_turns=policy.max_turns,
-                                max_tokens_per_turn=policy.max_tokens_per_turn,
-                                max_episode_tokens=policy.max_episode_tokens, stop_ids=renderer.stop_ids)
-            why = episode_refusal(policy=policy, renderer=renderer, prompt=prompt, tokens=tokens, spans=spans,
-                                  stop=stop, transcript=result.transcript, min_chunk_tokens=min_chunk_tokens)
-        except (ValueError, TypeError, KeyError, IndexError) as error:
-            why = f"{type(error).__name__}: {error}"
-        if why is None:
-            kept.append((outcome, AdmissibleEpisode(tokens, spans, stop)))
+        result = outcome.result
+        admitted, why = episode_admissible(outcome, policy=policy, renderer=renderer, prompt=prompt,
+                                           min_chunk_tokens=min_chunk_tokens)
+        if admitted is not None:
+            kept.append((outcome, admitted))
             continue
         logger.info("seed %s withdrawn: the validator would refuse it (%s)", outcome.seed_index, why)
         release = getattr(result, "release", None)
@@ -212,5 +222,5 @@ def build_signed_episode_commit(*, model, verifier, tokens: Sequence[int], spans
             "toploc_proofs": span_proofs_b64(hidden, spans, chunk_tokens=toploc.chunk_tokens, topk=toploc.topk)}
 
 
-__all__ = ["ADMITTED_STOPS", "AdmissibleEpisode", "AdmittedStop", "build_signed_episode_commit", "episode_metadata",
-           "episode_refusal", "episode_sequence", "episode_stop", "withdraw_inadmissible"]
+__all__ = ["ADMITTED_STOPS", "AdmissibleEpisode", "AdmittedStop", "build_signed_episode_commit", "episode_admissible",
+           "episode_metadata", "episode_refusal", "episode_sequence", "episode_stop", "withdraw_inadmissible"]

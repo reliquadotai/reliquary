@@ -413,7 +413,7 @@ def test_a_group_with_m_usable_episodes_ends_its_opens_when_the_quota_has_no_roo
     def answer(seed, nth, total):
         if seed >= m and total <= 200:          # (past that the validator grants: a runner that kept reopening)
             raise refused(reason, 10.0)
-        runner._usable += 1                     # (its episode played and ended graded at once)
+        runner.note_admissible(seed, True)      # (its episode played at once and passed the group's check)
         return grant(seed)
 
     gate = Gate(answer)
@@ -422,6 +422,19 @@ def test_a_group_with_m_usable_episodes_ends_its_opens_when_the_quota_has_no_roo
     assert [r["session_id"] for r in results[:m]] == [f"s-{seed}" for seed in range(m)], results
     assert all(isinstance(r, SessionRefused) and r.reason == reason for r in results[m:]), results[m:]
     assert len([seed for seed in gate.sent if seed >= m]) <= 2 * RL_OPENS_SIDE_BY_SIDE    # not one per retry
+
+
+def test_an_inadmissible_episode_is_not_counted_and_the_seeds_still_waiting_are_sent_again():
+    # M episodes passed the group's check, one is then found inadmissible: below M again, the seeds the
+    # over-generation refusal was holding back are asked for once more.
+    m = POLICY.pool_seeds // 2
+    runner, _ = runner_for(Gate(lambda seed, nth, total: grant(seed)))
+    for seed in range(m):
+        runner.note_admissible(seed, True)
+    runner._overgeneration = refused("quota_live", 10.0)
+    assert runner._task_refusal().reason == "quota_live"
+    runner.note_admissible(3, False)
+    assert runner._task_refusal() is None
 
 
 @pytest.mark.parametrize("reason", sorted(RL_OVERGENERATION_REFUSALS))
