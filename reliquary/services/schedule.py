@@ -49,6 +49,9 @@ _ATTESTATION_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 TRANSIENT_READ_ERRNOS = frozenset({errno.EIO, errno.EMFILE, errno.ENFILE, errno.EAGAIN, errno.EINTR,
                                    errno.ENOMEM, errno.EBUSY})
 MAX_FILE_BYTES = 64 * 1024
+# Request ids the validator records its own schedule revisions under (an added env it cannot serve, switched off):
+# never an operator request's, so that no request applied earlier can hold the id a later switch-off needs.
+VALIDATOR_REQUEST_PREFIX = "auto-"
 FOLDER_ENV = "RELIQUARY_SERVICE_SCHEDULE_FOLDER"
 DB_NAME = "runtime.sqlite3"
 
@@ -267,6 +270,9 @@ def check_request(request, *, contract: ServiceContract, current: ServiceSchedul
         _identifier(request["request_id"], "request_id")
     except ValueError as exc:
         raise ScheduleRefused(str(exc)) from exc
+    if request["request_id"].startswith(VALIDATOR_REQUEST_PREFIX):
+        raise ScheduleRefused(f"request ids beginning {VALIDATOR_REQUEST_PREFIX!r} are the validator's own "
+                              f"(its automatic schedule revisions)")
     if request["order_sha256"] != contract.sha256:
         raise ScheduleRefused("request was written for another order (order hash differs from the running order)")
     revision = request["revision"]

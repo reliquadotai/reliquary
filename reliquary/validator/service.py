@@ -3350,7 +3350,10 @@ class ValidationService:
                 raise ValueError(f"ALERT service environments {names} cannot be served and no other env is active")
             changed = next_schedule(runtime.contract, current, active=remaining,
                                     shares=_renormalised_shares({n: current.share_bps(n) for n in remaining}))
-            runtime.apply_schedule(changed, request_id=f"auto-deactivate-r{changed.revision}", window=at)
+            from reliquary.services.schedule import VALIDATOR_REQUEST_PREFIX
+
+            runtime.apply_schedule(changed, request_id=f"{VALIDATOR_REQUEST_PREFIX}deactivate-r{changed.revision}",
+                                   window=at)
             for name in names:
                 logger.error("ALERT service environment %s switched off by schedule revision %d: this validator "
                              "cannot serve it (%s); switch it on again with `set --active` once it is served",
