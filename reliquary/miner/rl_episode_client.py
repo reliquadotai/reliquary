@@ -46,6 +46,14 @@ RL_START_REFUSALS = frozenset({"quota_env"})
 """Refusals that end a group which has not started (no seed granted): the hotkey holds its share of that env, so the
 group's slot goes to another env this window rather than wait (``EpisodeGroupMiner.mine_task`` raises it)."""
 
+RL_OVERGENERATION_REFUSALS = frozenset({"quota_live", "quota_pool"})
+"""The quota's answer to a seed beyond M of a group that holds its M sessions (over-generation): no room for one more
+in the hotkey's allocation, its pooled entity or the fleet (a group under M is never refused them). Once M episodes of
+the precommit ended graded and usable, one ends the group's opens: it is played from the seeds it has. Waiting instead
+would hold its graded sessions for room that only its own submission frees: every group at M would wait on the others
+until its window's end. Before that the seed is reopened as any throttle: a session still playing may fail, and the
+quota then admits the group's next seed."""
+
 RL_OPENS_SIDE_BY_SIDE = 4
 """Opens of one started group in flight at once (each may wait in the validator's open queue): enough to keep the
 group's seeds queued under saturation, few enough not to burst the validator's open path."""
@@ -239,6 +247,7 @@ class RlSignedEpisodeRunner(SignedSweEpisodeRunner):
         self._fanning = False                 # a seed was granted and no throttle since: opens go side by side
         self._throttles = 0                   # throttles so far (a grant re-opens side by side only if none since)
         self._started = False                 # a seed of the precommit was granted
+        self._usable = 0                      # episodes of the precommit that ended graded and usable
         self._side_by_side = asyncio.Semaphore(RL_OPENS_SIDE_BY_SIDE)
         self._task_refused: SessionRefused | None = None
         self.start_refused: SessionRefused | None = None    # the group ended before it started (RL_START_REFUSALS)
@@ -266,6 +275,13 @@ class RlSignedEpisodeRunner(SignedSweEpisodeRunner):
                 if refused.reason in RL_START_REFUSALS and not self._started:
                     self.start_refused = self.start_refused or refused
                     if self._task_refused is None:
+                        self._task_refused = refused
+                    raise
+                if refused.reason in RL_OVERGENERATION_REFUSALS and self._usable >= self._policy.pool_seeds // 2:
+                    if self._task_refused is None:
+                        logger.info("precommit %s holds %d usable episodes and the validator has no room for more "
+                                    "(%s): played from the seeds it has", self._precommit.sha256[:12], self._usable,
+                                    refused.reason)
                         self._task_refused = refused
                     raise
                 reopen = (not slot.keep and refused.reason not in RL_FINAL_REFUSALS
@@ -333,6 +349,12 @@ class RlSignedEpisodeRunner(SignedSweEpisodeRunner):
             _FANNED.reset(fanned)
             self._side_by_side.release()
 
+    async def _settle(self, index: int, session_id: str, slot, result, final: dict, closing: str):
+        settled = await super()._settle(index, session_id, slot, result, final, closing)
+        if settled.ok:
+            self._usable += 1
+        return settled
+
     def _open_call(self, body: dict):
         return asyncio.get_running_loop().run_in_executor(_open_executor(), self._sessions.open, body)
 
@@ -397,6 +419,7 @@ __all__ = [
     "RL_FINAL_REFUSALS",
     "RL_OPENS_IN_FLIGHT",
     "RL_OPENS_SIDE_BY_SIDE",
+    "RL_OVERGENERATION_REFUSALS",
     "RL_PREFIX",
     "RL_START_REFUSALS",
     "RL_TASK_FINAL_REFUSALS",

@@ -20,7 +20,8 @@ from reliquary.miner.episode_mining import (  # noqa: E402
     EpisodeMinerConfig, EpisodeMiningLoop, allocation_groups, allocation_reader, groups_to_run,
 )
 from reliquary.miner.rl_episode_client import (  # noqa: E402
-    RL_FINAL_REFUSALS, RL_OPENS_SIDE_BY_SIDE, RL_TASK_FINAL_REFUSALS, RL_THROTTLES, RlSignedEpisodeRunner,
+    RL_FINAL_REFUSALS, RL_OPENS_SIDE_BY_SIDE, RL_OVERGENERATION_REFUSALS, RL_TASK_FINAL_REFUSALS, RL_THROTTLES,
+    RlSignedEpisodeRunner,
 )
 from reliquary.miner.signed_episode import MAX_UNAVAILABLE, _Slot  # noqa: E402
 from reliquary.protocol.sandbox_session import SessionRefused  # noqa: E402
@@ -399,6 +400,45 @@ def test_a_half_opened_group_is_never_given_up_for_a_refusal_of_the_validators(r
     results = open_all(runner, range(16))
     assert [r["session_id"] for r in results] == [f"s-{seed}" for seed in range(16)], results
     assert runner._unavailable == 0
+
+
+@pytest.mark.parametrize("reason", sorted(RL_OVERGENERATION_REFUSALS))
+def test_a_group_with_m_usable_episodes_ends_its_opens_when_the_quota_has_no_room_for_more(reason):
+    # Seeds beyond M are over-generation: the quota refuses them only when nothing has room for one more, and only
+    # ever to a group that holds its M. Once M episodes ended usable, reopening them would hold the group's graded
+    # sessions for room only its own submission frees (every group at M waiting on the others): the group plays from
+    # the seeds it has, and its other seeds are not sent.
+    m = POLICY.pool_seeds // 2
+
+    def answer(seed, nth, total):
+        if seed >= m and total <= 200:          # (past that the validator grants: a runner that kept reopening)
+            raise refused(reason, 10.0)
+        runner._usable += 1                     # (its episode played and ended graded at once)
+        return grant(seed)
+
+    gate = Gate(answer)
+    runner, _ = runner_for(gate)
+    results = open_all(runner, range(2 * m))
+    assert [r["session_id"] for r in results[:m]] == [f"s-{seed}" for seed in range(m)], results
+    assert all(isinstance(r, SessionRefused) and r.reason == reason for r in results[m:]), results[m:]
+    assert len([seed for seed in gate.sent if seed >= m]) <= 2 * RL_OPENS_SIDE_BY_SIDE    # not one per retry
+
+
+@pytest.mark.parametrize("reason", sorted(RL_OVERGENERATION_REFUSALS))
+def test_a_group_whose_sessions_still_play_reopens_a_seed_the_quota_refused(reason):
+    # Below M usable episodes a session still playing may fail (its box never starts): the quota then admits the
+    # group's next seed, so the refused seed is reopened, never given up.
+    m = POLICY.pool_seeds // 2
+
+    def answer(seed, nth, total):
+        if seed >= m and nth <= 2:
+            raise refused(reason, 10.0)
+        return grant(seed)
+
+    gate = Gate(answer)
+    runner, _ = runner_for(gate)
+    results = open_all(runner, range(2 * m))
+    assert [r["session_id"] for r in results] == [f"s-{seed}" for seed in range(2 * m)], results
 
 
 def test_every_retryable_refusal_of_the_rl_routes_is_reopened():
