@@ -1,5 +1,6 @@
 """The activation checks of an env added to a running run."""
 import asyncio
+import errno
 import hashlib
 import os
 from pathlib import PurePosixPath
@@ -714,7 +715,7 @@ def test_the_bridged_source_refuses_a_rebuild_at_another_identity(monkeypatch):
 
 
 # --- an I/O error is "not yet" ---------------------------------------------------------------------------------------
-@pytest.mark.parametrize("error", [OSError("disk"), ConnectionError("hub"), TimeoutError()])
+@pytest.mark.parametrize("error", [OSError(errno.EIO, "disk"), ConnectionError("hub"), TimeoutError()])
 def test_a_build_that_fails_on_io_is_not_yet(error):
     def build(config):
         raise error
@@ -728,7 +729,7 @@ def test_a_build_that_fails_on_io_is_not_yet(error):
 def test_an_identity_that_cannot_be_read_now_is_not_yet():
     class Unreadable(Source):
         def installed_identity(self):
-            raise OSError("busy")
+            raise OSError(errno.EBUSY, "busy")
 
     problem = identities_problem({"swe": Unreadable(identity="a==1+g1.vfb2")})
     assert isinstance(problem, NotYet)

@@ -284,7 +284,7 @@ def test_restart_restores_only_a_revision_adopted_in_the_lineage(tmp_path, saved
         _service_activation_version=lambda name: None, _require_service_environments=lambda schedule: None,
         _service_window_pool=lambda schedule, order: {name: 0.25 for name in order},
         # nothing added to the run: no activation check, nothing staged
-        _catalogue_check=None, _stage_added_envs=lambda schedule: None,
+        _catalogue_check=None, _stage_added_envs=lambda schedule, window=None: schedule,
         _all_env_mix=lambda: [(MATH, 16), (CODE, 16)],
     )
     if saved:
@@ -364,7 +364,7 @@ def test_j1_a_restart_with_resume_from_an_ancestor_is_refused_at_the_boundary(tm
         _service_activation_version=lambda name: None, _require_service_environments=lambda schedule: None,
         _service_window_pool=lambda schedule, order: {name: 0.25 for name in order},
         # nothing added to the run: no activation check, nothing staged
-        _catalogue_check=None, _stage_added_envs=lambda schedule: None,
+        _catalogue_check=None, _stage_added_envs=lambda schedule, window=None: schedule,
         _all_env_mix=lambda: [(MATH, 16), (CODE, 16)],
     )
     with pytest.raises(ValueError, match="ancestor of the current lineage head"):
@@ -385,7 +385,7 @@ def test_a_refused_ancestor_leaves_the_operators_schedule_request_unapplied(tmp_
         _service_activation_version=lambda name: None, _require_service_environments=lambda schedule: None,
         _service_window_pool=lambda schedule, order: {name: 0.25 for name in order},
         # nothing added to the run: no activation check, nothing staged
-        _catalogue_check=None, _stage_added_envs=lambda schedule: None,
+        _catalogue_check=None, _stage_added_envs=lambda schedule, window=None: schedule,
         _all_env_mix=lambda: [(MATH, 16), (CODE, 16)],
     )
     with pytest.raises(ValueError, match="ancestor of the current lineage head"):
@@ -427,7 +427,7 @@ def _boundary_service(runtime, installed, receipt_memory=None):
         _service_window_pool=lambda schedule, order: {name: 0.25 for name in order},
         _service_installed_receipt=receipt_memory,
         # nothing added to the run: no activation check, nothing staged
-        _catalogue_check=None, _stage_added_envs=lambda schedule: None,
+        _catalogue_check=None, _stage_added_envs=lambda schedule, window=None: schedule,
         _all_env_mix=lambda: [(MATH, 16), (CODE, 16)],
     )
 

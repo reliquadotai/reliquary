@@ -534,16 +534,19 @@ class RlEpisodeServices:
         seed pool larger than the one they were sized for, one of its names known with another group size or for
         another env, no renderer for its tools, or its renderer's stops outside the proof's stop set; None when
         they can. BLOCKING (it may build the renderer, loading a tokenizer): call it in a worker thread; the
-        renderer it builds is kept for ``add_environment``. An I/O error or a timeout while building the renderer
-        (a tokenizer download) is raised, not answered: it is no verdict on the env."""
+        renderer it builds is kept for ``add_environment``. A transient error while building the renderer (a
+        tokenizer download timing out; ``catalogue_activation.transient_error``) is raised, not answered: it is
+        no verdict on the env."""
         why = self._policy_refusal(policy.environment, policy)
         if why is not None or self.renderer_for is None:
             return why
         try:
             renderer = self._renderer(policy)
-        except (OSError, TimeoutError):
-            raise
         except Exception as exc:
+            from reliquary.validator.catalogue_activation import transient_error
+
+            if transient_error(exc):
+                raise
             return f"no renderer for its tools {list(policy.tools)} ({type(exc).__name__}: {exc})"
         return self._stop_refusal(policy, renderer)
 
@@ -564,6 +567,57 @@ class RlEpisodeServices:
         """Each counted env's seed pool (what the allocation route tells a miner its groups in)."""
         counted = self.counted_envs()
         return {n: p for n, p in self.pool_sizes.items() if counted is None or n in counted}
+
+    def _prepare_add(self, name: str, environment, policy, renderer=None) -> tuple:
+        """Everything ``add_environment`` builds and checks before its first change: ValueError when the
+        services cannot serve the env (nothing changed); an I/O error or a timeout of the source is raised as
+        it is. Memory only, apart from what the source's ``len`` and ``options_sha256`` read."""
+        current = getattr(self.runtime, "contract", None) if self.runtime is not None else None
+        if current is not None and name in current.environments and current.episode_policy(name) != policy:
+            raise ValueError(f"episode env {name}: the policy given is not the one of the runtime's schedule")
+        why = self._policy_refusal(name, policy)
+        if why is not None:
+            raise ValueError(f"episode env {name} cannot be served: {why}")
+        if renderer is None:
+            renderer = self.renderers.get(tuple(policy.tools))
+        if renderer is None:
+            raise ValueError(f"episode env {name}: no renderer was built for its tools {list(policy.tools)} (check "
+                             f"it with environment_refusal off the event loop first, or pass the renderer)")
+        why = self._stop_refusal(policy, renderer)
+        if why is not None:
+            raise ValueError(f"episode env {name} cannot be served: {why}")
+        source = environment.source
+        try:
+            task_count = _task_count(source)
+            pin = (policy.sandbox_env, policy.env_package, getattr(source, "options_sha256", None))
+            checker = EpisodeGroupChecker(policy=policy, renderer=renderer, source=source,
+                                          chunk_tokens=self.chunk_tokens)
+            resolve = source.resolve if self.tiers is None else _observing(self.tiers, name, source.resolve)
+            view = EpisodeEnvironmentView(policy=policy, resolve_task=resolve)
+        except Exception as exc:
+            from reliquary.validator.catalogue_activation import transient_error
+
+            if transient_error(exc):
+                raise
+            raise ValueError(f"episode env {name}: its task source cannot be served ({type(exc).__name__}: "
+                             f"{exc})") from exc
+        return renderer, task_count, pin, checker, resolve, view
+
+    def add_check(self, name: str, environment, policy) -> str | None:
+        """A dry run of ``add_environment`` (worker thread: it may build the env's turn renderer): why these
+        services could not take the env, or None. Nothing changes. An I/O error or a timeout (a tokenizer
+        download, the source's reads) is raised: no verdict on the env."""
+        known = self.views.get(name)
+        if known is not None:
+            return None if known.policy == policy else f"episode env {name} is already served with another policy"
+        why = self.environment_refusal(policy)
+        if why is not None:
+            return why
+        try:
+            self._prepare_add(name, environment, policy)
+        except ValueError as exc:
+            return str(exc)
+        return None
 
     def add_environment(self, name: str, environment, policy, *, renderer=None) -> None:
         """Serve an env added to the running run, as one of the order's: its policy (the ledger's settlement
@@ -587,26 +641,8 @@ class RlEpisodeServices:
             if known.policy != policy:
                 raise ValueError(f"episode env {name} is already served with another policy")
             return
-        current = getattr(self.runtime, "contract", None) if self.runtime is not None else None
-        if current is not None and name in current.environments and current.episode_policy(name) != policy:
-            raise ValueError(f"episode env {name}: the policy given is not the one of the runtime's schedule")
-        why = self._policy_refusal(name, policy)
-        if why is not None:
-            raise ValueError(f"episode env {name} cannot be served: {why}")
-        if renderer is None:
-            renderer = self.renderers.get(tuple(policy.tools))
-        if renderer is None:
-            raise ValueError(f"episode env {name}: no renderer was built for its tools {list(policy.tools)} (check "
-                             f"it with environment_refusal off the event loop first, or pass the renderer)")
-        why = self._stop_refusal(policy, renderer)
-        if why is not None:
-            raise ValueError(f"episode env {name} cannot be served: {why}")
+        renderer, task_count, pin, checker, resolve, view = self._prepare_add(name, environment, policy, renderer)
         source = environment.source
-        task_count = _task_count(source)
-        pin = (policy.sandbox_env, policy.env_package, getattr(source, "options_sha256", None))
-        checker = EpisodeGroupChecker(policy=policy, renderer=renderer, source=source, chunk_tokens=self.chunk_tokens)
-        resolve = source.resolve if self.tiers is None else _observing(self.tiers, name, source.resolve)
-        view = EpisodeEnvironmentView(policy=policy, resolve_task=resolve)
         add_names = getattr(self.quota, "add_environment", None)
         if add_names is not None:
             add_names(episode_group_sizes({name: policy}), _env_names({name: policy}))

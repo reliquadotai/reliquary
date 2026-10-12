@@ -493,14 +493,14 @@ def test_a_source_failing_while_it_is_read_leaves_nothing_half_added(tmp_path):
             raise RuntimeError("the dataset is gone")
 
     environment.source.__class__ = Broken
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError, match="the dataset is gone"):
         services.add_environment(ADDED, environment, policy)
     assert ADDED not in services.policies and ADDED not in services.served and ADDED not in services.pool_sizes
     assert ADDED not in services.quota._env_names
     services.ledger.close()
 
 
-@pytest.mark.parametrize("error", [OSError("tokenizer download failed"), TimeoutError("hub timed out")])
+@pytest.mark.parametrize("error", [ConnectionError("tokenizer download failed"), TimeoutError("hub timed out")])
 def test_a_renderer_that_cannot_be_loaded_now_is_raised_not_answered(tmp_path, error):
     services, rt = _services(tmp_path, proof_stop_ids={TERM, EOT})
 
@@ -510,3 +510,62 @@ def test_a_renderer_that_cannot_be_loaded_now_is_raised_not_answered(tmp_path, e
     services.renderer_for = loading
     with pytest.raises(type(error)):
         services.environment_refusal(added_policy(rt))      # the caller waits on it: no verdict on the env
+
+
+# ---- the dry run (``add_check``): what ``add_environment`` would refuse, refused first, nothing changed ----
+
+def broken_env(**methods):
+    environment = make_test_episode_env()
+    environment.source.__class__ = type("Broken", (type(environment.source),), methods)
+    return environment
+
+
+def raising(error):
+    def method(self, *a):
+        raise error
+    return property(method) if isinstance(error, KeyError) else method
+
+
+@pytest.mark.parametrize("source", ["len", "options", "renderer", "policy", "stops", "names"])
+def test_the_dry_run_refuses_each_thing_the_add_would(tmp_path, source):
+    services, rt = _services(tmp_path, proof_stop_ids={TERM, EOT}, yield_path=tmp_path / "rl-yield.sqlite3")
+    policy, environment = added_policy(rt), make_test_episode_env()
+    if source == "len":
+        environment = broken_env(__len__=raising(RuntimeError("the dataset is gone")))
+    elif source == "options":
+        environment = broken_env(options_sha256=raising(KeyError("options")))
+    elif source == "renderer":
+        services.renderer_for = None                          # no renderer can be built for its tools
+    elif source == "policy":
+        import dataclasses
+
+        add_to_the_run(rt)                                    # the runtime's view names it with its own policy
+        policy = dataclasses.replace(policy, max_turns=policy.max_turns - 1)
+    elif source == "stops":
+        services.remote_stop_ids = frozenset({TERM})
+    else:
+        import dataclasses
+
+        policy = dataclasses.replace(policy, sandbox_env=EPISODE)      # its sandbox env is another env's name
+    why = services.add_check(ADDED, environment, policy)
+    assert why is not None, source
+    with pytest.raises(ValueError):
+        services.add_environment(ADDED, environment, policy)
+    assert ADDED not in services.policies and ADDED not in services.views
+    services.ledger.close()
+
+
+def test_the_dry_run_passes_what_the_add_takes(tmp_path):
+    services, rt = _services(tmp_path, proof_stop_ids={TERM, EOT})
+    policy, environment = added_policy(rt), make_test_episode_env()
+    assert services.add_check(ADDED, environment, policy) is None
+    assert ADDED not in services.views                       # a dry run changes nothing
+    services.add_environment(ADDED, environment, policy)
+    assert services.add_check(ADDED, environment, policy) is None      # served with this policy
+
+
+def test_a_transient_source_error_in_the_dry_run_is_raised(tmp_path):
+    services, rt = _services(tmp_path, proof_stop_ids={TERM, EOT})
+    environment = broken_env(__len__=raising(TimeoutError("the dataset read timed out")))
+    with pytest.raises(TimeoutError):
+        services.add_check(ADDED, environment, added_policy(rt))

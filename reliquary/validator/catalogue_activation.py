@@ -35,9 +35,11 @@ Then:
 
 A problem the validator cannot settle now is a ``NotYet`` (a ``str``): the request waits, it is not refused. That
 is a shortfall in 8 on an incomplete or stale fleet view (``Fleet.view_complete``, the precommit route's rule),
-and an I/O error or timeout while building the env or reading an active env's identity."""
+and a transient error (``transient_error``: a timeout, a network error, an HTTP 429/5xx, an I/O errno) while
+building the env or reading the installs or an active env's identity; any other failure is a verdict."""
 from __future__ import annotations
 
+import errno
 import hashlib
 import keyword
 import os
@@ -58,7 +60,63 @@ EPISODE_LIMIT_FIELDS = ("max_episode_tokens", "max_turns", "max_tokens_per_turn"
 _PLAIN_DISTRIBUTION = re.compile(r"[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*\Z")
 _VERIFIERS_TASKSETS = "verifiers.v1.tasksets."
 _LISTED = 8                                 # differences named in one message
-_TRANSIENT = (OSError, TimeoutError)        # an I/O error or a timeout: not a verdict on the env
+# What tells a failure that may pass by itself (it waits) from a verdict on the env (it is refused at once).
+_PERMANENT_NAMES = frozenset({
+    "FileNotFoundError", "PermissionError", "IsADirectoryError", "NotADirectoryError",
+    "RepositoryNotFoundError", "GatedRepoError", "EntryNotFoundError", "RevisionNotFoundError",
+    "DatasetNotFoundError", "ModuleNotFoundError", "ImportError",
+})
+_TRANSIENT_NAMES = frozenset({
+    "TimeoutError", "ConnectionError", "LocalEntryNotFoundError",       # builtin, requests, the hub offline
+    "Timeout", "ReadTimeout", "ConnectTimeout", "ChunkedEncodingError",  # requests
+    "TimeoutException", "TransportError", "NetworkError", "RemoteProtocolError",   # httpx
+    "ClientError", "ClientPayloadError", "ServerDisconnectedError",       # aiohttp (fsspec streaming)
+})
+_TRANSIENT_ERRNOS = frozenset(getattr(errno, name) for name in (
+    "EIO", "EAGAIN", "EMFILE", "ENFILE", "EINTR", "ENOMEM", "EBUSY", "ETIMEDOUT", "ECONNRESET", "ECONNREFUSED",
+    "ECONNABORTED", "ENETUNREACH", "ENETDOWN", "EHOSTUNREACH", "EPIPE") if hasattr(errno, name))
+
+
+def _http_status(exc: BaseException) -> int | None:
+    response = getattr(exc, "response", None)
+    for value in (getattr(response, "status_code", None), getattr(response, "status", None),
+                  getattr(exc, "status", None), getattr(exc, "status_code", None)):
+        if type(value) is int:
+            return value
+    return None
+
+
+def _verdict(exc: BaseException) -> bool | None:
+    """True: transient; False: permanent; None: this exception alone does not say."""
+    names = {klass.__name__ for klass in type(exc).__mro__}
+    if "LocalEntryNotFoundError" in names:       # a FileNotFoundError the hub raises when it cannot be reached
+        return True
+    status = _http_status(exc)
+    if status is not None:
+        return status == 429 or status >= 500
+    if names & _PERMANENT_NAMES:
+        return False
+    if names & _TRANSIENT_NAMES:
+        return True
+    if isinstance(exc, OSError) and exc.errno in _TRANSIENT_ERRNOS:
+        return True
+    return None
+
+
+def transient_error(exc: BaseException) -> bool:
+    """Whether ``exc`` (a build, a download, a read) may pass by itself, so the add waits instead of being
+    refused: a timeout, a connection or network error (builtin, requests, httpx, aiohttp), an HTTP 429 or 5xx, an
+    I/O errno (EIO, EAGAIN, EMFILE...). A missing file or package, a permission, an HTTP 4xx (not found, gated,
+    unauthorised) and anything else are verdicts. The cause chain is read when an exception alone does not say."""
+    seen = 0
+    current: BaseException | None = exc
+    while current is not None and seen < 6:
+        verdict = _verdict(current)
+        if verdict is not None:
+            return verdict
+        current = current.__cause__ or current.__context__
+        seen += 1
+    return False
 
 
 class NotYet(str):
@@ -239,8 +297,10 @@ def before_import_problem(added: Mapping[str, Any], allowed: frozenset[str], ord
     if current is None:
         try:
             current = installed_distributions()
-        except _TRANSIENT as exc:
-            return NotYet(f"the installed distributions cannot be read now ({type(exc).__name__}: {exc})")
+        except Exception as exc:
+            if transient_error(exc):
+                return NotYet(f"the installed distributions cannot be read now ({type(exc).__name__}: {exc})")
+            return f"the installed distributions cannot be read ({type(exc).__name__}: {exc})"
     return install_set_problem(added, boot, current)
 
 
@@ -329,10 +389,10 @@ def identities_problem(sources: Mapping[str, Any]) -> str | None:
     for name, source in sorted(sources.items()):
         try:
             now = source.installed_identity()
-        except _TRANSIENT as exc:
-            unreadable.append(f"{name} ({type(exc).__name__})")
-            continue
         except Exception as exc:
+            if transient_error(exc):
+                unreadable.append(f"{name} ({type(exc).__name__})")
+                continue
             now = f"unreadable ({type(exc).__name__})"
         if now != source.identity:
             moved.append(f"{name}: {source.identity} is pinned, {now} is installed")
@@ -420,9 +480,9 @@ def activation_problem(name: str, added: Mapping[str, Any], attestation: Any, *,
         return f"the attestation: {problem}", None
     try:
         environment = build(BridgedEnvConfig.from_catalogue(name, added["catalogue"]))
-    except _TRANSIENT as exc:         # a download or a disk read that failed now: tried again later
-        return NotYet(f"cannot be built now ({type(exc).__name__}: {exc})"), None
-    except Exception as exc:          # an env that cannot be built here is not installed, whatever the cause
+    except Exception as exc:
+        if transient_error(exc):      # a download or a disk read that failed now: tried again later
+            return NotYet(f"cannot be built now ({type(exc).__name__}: {exc})"), None
         return f"not installed on this validator ({type(exc).__name__}: {exc})", None
     source = environment.source
     for check in (lambda: install_problem(source, added),
@@ -440,4 +500,4 @@ __all__ = ["ACTIVATION_MIN_IMAGES", "ACTIVATION_MIN_SERVABLE_TASKS", "ACTIVATION
            "CONFORMANCE_GATE_SAMPLE", "EPISODE_LIMIT_FIELDS", "MIN_ACTIVATION_MACHINES", "NotYet",
            "activation_problem", "allowed_packages", "attestation_problem", "before_import_problem", "budget_problem",
            "identities_problem", "install_problem", "install_set_problem", "installed_distributions",
-           "machines_problem", "module_problem", "name_problem", "package_problem"]
+           "machines_problem", "module_problem", "name_problem", "package_problem", "transient_error"]
