@@ -104,6 +104,7 @@ PICKS, SLOTS = protocol_slot_geometry()
 TOPLOC = TOPLOC_DEPLOYED_DEFAULTS
 CAPACITY = 4 * M_ROLLOUTS                  # both pools live at once on the one machine
 CLOCK = {"round": 1_000}
+OPERATORS = {HONEST.ss58_address: "operator-a", FORGER.ss58_address: "operator-b"}
 SHADOW_TOPLOC_PROFILE = dataclasses.replace(
     ACTIVE_PROTOCOL_PROFILE, proofs=(*ACTIVE_PROTOCOL_PROFILE.proofs, dataclasses.replace(TOPLOC, mode="shadow")))
 
@@ -390,19 +391,28 @@ class Validator:
     """This validator in one window: the RL services, the admission worker, the episode batcher and its
     proof plane. ``submit`` is ``/submit``'s worker for one group (the HTTP envelope protocol aside)."""
 
-    def __init__(self, gateway, rt, tmp_path):
-        self.rt, self.opened = rt, time.time()
+    def __init__(self, gateway, rt, tmp_path, *, production: bool = False, yield_path=...):
+        """``production``: the services as the validator builds them for a signed-episode order (the yield ledger,
+        hence the quota, the fair open queue and the allocation route; machines must report their resources; the
+        boot check of the served envs; the settled windows' uses), their routes on the server's app too and their
+        background jobs running. ``yield_path``: the ledger's file (default ``rl-yield.sqlite3``; None: none)."""
+        self.rt, self.opened, self.production, self.jobs = rt, time.time(), production, []
         config = SandboxValidatorConfig(key_file=tmp_path / "unused", key_id=gateway.validator.key_id,
                                         retired_keys={})
         model, tokenizer = Checkpoint(), Tokenizer()        # the validator's own copy of the checkpoint
         from reliquary.shared.modeling import resolve_eos_token_ids
 
+        extra = {}
+        if production:
+            extra = dict(yield_path=tmp_path / "rl-yield.sqlite3" if yield_path is ... else yield_path,
+                         require_resources=True, boot_wait_s=5.0, window_uses=rt.window_uses,
+                         operator_of=OPERATORS.get)
         self.services = build_rl_episode_services(
             config, validator_hotkey=VALIDATOR.ss58_address, runtime=rt,
             environments={EPISODE: make_test_episode_env()}, renderer_for=lambda policy: ScriptRenderer(),
             current_window=lambda: 1, chunk_tokens=TOPLOC.chunk_tokens,
             window_started_at=lambda window: self.opened if window == 1 else None,
-            proof_stop_ids=resolve_eos_token_ids(model, tokenizer), signer=gateway.validator)
+            proof_stop_ids=resolve_eos_token_ids(model, tokenizer), signer=gateway.validator, **extra)
         self.service = ValidationService.__new__(ValidationService)
         self.service._service_runtime = rt
         self.service._proof_models = {"d0": model}
@@ -413,7 +423,7 @@ class Validator:
         b = _make_batcher(window_start=1, env=make_test_episode_env(), model=model, tokenizer=tokenizer,
                           verify_commitment_proofs_fn=cpu_forward, verify_signature_fn=None,
                           proof_scheduler=self.scheduler,
-                          operator_by_hotkey={HONEST.ss58_address: "operator-a", FORGER.ss58_address: "operator-b"})
+                          operator_by_hotkey=OPERATORS)
         b.randomness = RANDOMNESS
         b.service_runtime, b.service_environment = rt, EPISODE
         b.service_policy = rt.announcement(window=1, randomness=WINDOW_BEACON, environment=EPISODE)
@@ -438,12 +448,16 @@ class Validator:
         self.app = FastAPI()
         for router in self.services.routers:
             self.app.include_router(router)
+            if production:                      # as the validator serves them (the allocation route included)
+                self.server.app.include_router(router)
         self.receipts, self.workers, self.requests = [], [], {}
 
     async def start(self):
         await self.services.start()
         await self.services.fleet.refresh_directory()
         await self.services.fleet.poll_once()
+        if self.production:
+            self.jobs = [asyncio.ensure_future(job) for job in self.services.background()]
 
     async def submit(self, url, request, *, client, wallet, randomness):
         """The miner's ``submit_batch_v2`` and the validator's ``/submit`` in one: the envelope is finalized
@@ -498,6 +512,9 @@ class Validator:
 
     async def close(self):
         await asyncio.gather(*self.workers, return_exceptions=True)
+        for job in self.jobs:
+            job.cancel()
+        await asyncio.gather(*self.jobs, return_exceptions=True)
         self.scheduler.close()
         self.server._admission_materialization_pool.shutdown(wait=True)
         await self.services.stop()
@@ -513,6 +530,15 @@ class Miners:
     def __init__(self, validator: Validator, loop):
         self.validator, self.loop = validator, loop
         self.generate_apps, self.cores, self.runners = {}, {}, []
+        self.allocations: list[tuple[str, int, dict | None]] = []     # (hotkey, status, answer) of the route
+
+    def _log_allocation(self, hotkey):
+        async def log(response):
+            if response.request.method == "POST" and response.request.url.path.endswith("/sessions/allocation"):
+                await response.aread()
+                answer = response.json() if response.status_code == 200 else None
+                self.allocations.append((hotkey, response.status_code, answer))
+        return log
 
     def deps(self, keypair, cheat):
         hotkey = keypair.ss58_address
@@ -542,7 +568,8 @@ class Miners:
             load_proof_model=lambda directory: Checkpoint(), release_model=lambda model: None,
             toploc=lambda: TOPLOC, serve=serve, make_runner=make_runner, submit=self.validator.submit,
             sync_http=lambda url: httpx.Client(base_url=url, transport=AppBridge(self.validator.app, self.loop)),
-            async_http=lambda: httpx.AsyncClient(transport=httpx.ASGITransport(app=self.validator.server.app)),
+            async_http=lambda: httpx.AsyncClient(transport=httpx.ASGITransport(app=self.validator.server.app),
+                                                 event_hooks={"response": [self._log_allocation(hotkey)]}),
             package_refusal=lambda policy: None)
 
     def run(self, keypair, cheat, task, *, task_prompts=None):
@@ -836,3 +863,335 @@ async def test_two_miners_one_window_precommit_sessions_choice_proof_audit_settl
     assert trained and trained[0]["candidate"]["seeds"] == honest_seeds
     assert trained[0]["rewards_bps"] == [int(r * 10000) for r in honest_rewards]
     assert any(key.startswith(sandbox_store.RL_SESSION_PREFIX) for key in r2.client.objects)
+
+
+# -- the production configuration ----------------------------------------------------------------------------------
+
+
+AGENT_MEMORY = dict(episode_contract().episode_policy(EPISODE).budgets)["memory_bytes"]
+ONE_POOL = 2 * M_ROLLOUTS                  # the agent boxes the machine's CPU and memory hold at once: one pool
+
+
+@pytest.fixture
+def production_gateway(tmp_path, monkeypatch):
+    """The fake gateway as an RL machine runs: it reserves each episode's CPU (one per box) and memory, for one pool
+    of agent boxes at once, so the second miner's opens wait in the queue until the first one's sessions close; it
+    grades in a pool of its own, lists its live sessions in its reports and signs its open refusals."""
+    monkeypatch.setattr(registry, "_package_of", lambda entry: JOB.episode.sandbox.env_package)
+    with testing.fake_gateway(tmp_path / "gw", envs={"reliquary-swe": testing.FAKE_ENV_ENTRY},
+                              episode_capacity=CAPACITY, episode_nano_cpus=1_000_000_000,
+                              episode_cpu_millis_total=ONE_POOL * 1_000,
+                              episode_memory_bytes_total=ONE_POOL * AGENT_MEMORY,
+                              episode_grading_cpu_millis_total=4_000,
+                              episode_grading_memory_bytes_total=4 * AGENT_MEMORY,
+                              episode_present_window_s=120) as (served, boxes):
+        served.boxes = boxes
+        yield served
+
+
+class ForeignSessions:
+    """Sessions the machine runs that this validator's book does not hold (another validator's on a shared machine,
+    or ones a restart lost): tokens signed with a key the gateway accepts, each holding one agent box's CPU and
+    memory until it is finished. The fleet's size stays the machine's (its totals); only its reports show them."""
+
+    def __init__(self, gateway, services):
+        self.gateway, self.services, self.live = gateway, services, []
+
+    async def open(self, n):
+        from reliquary_sandbox.attest import Budgets, SessionClaims, issue_session_token
+
+        from reliquary.sandbox.rl_engagements import session_budgets
+
+        view = self.services.views[EPISODE]
+        task = await view.resolve_task(TASK)
+        budgets = Budgets(**session_budgets(view.policy, task))
+        for _ in range(n):
+            now = int(time.time())
+            claims = SessionClaims(
+                session_id=os.urandom(16).hex(), hotkey="5ForeignValidatorsMiner", engagement="elsewhere",
+                env=view.policy.sandbox_env, split=view.policy.split, index=TASK, image=task.image,
+                checkpoint=REVISION, machine_id=self.gateway.settings.machine_id, issued_at=now,
+                expires_at=now + 3_600, budgets=budgets)
+            client = EpisodeClient(self.gateway.url)
+            await client.__aenter__()
+            episode = await client.open(issue_session_token(claims, self.gateway.validator))
+            self.live.append((client, episode))
+
+    async def finish(self, n=None):
+        n = len(self.live) if n is None else n
+        done, self.live = self.live[:n], self.live[n:]
+        for client, episode in done:
+            await episode.finish()
+            await client.__aexit__(None, None, None)
+
+
+async def test_the_production_rl_configuration_end_to_end(production_gateway, r2, tmp_path, monkeypatch):  # noqa: F811
+    """The production RL validator end to end, against a gateway that reserves resources, grades in a pool, lists
+    its live sessions and signs its open refusals: booted on the pinned reliquary-sandbox; the yield ledger, the
+    quota (its fleet bound and demand memory), the fair open queue (its tickets for the seeds a started group owes
+    below M), placement by reported resources, the boot check of the served envs, the window's active envs and the
+    signed allocation route the reference miners follow.
+
+    The machine is first held by sessions this validator's book does not hold (``ForeignSessions``): the quota
+    admits both groups (its fleet size is the machine's), the machine has no room, so the miners' opens wait in the
+    queue; a stray open of a waiting miner's precommit is cancelled meanwhile. Freed in two steps, the machine
+    takes the groups' seeds; each group holds its M (the fleet bound: no more fit) and is played from them. One of
+    the forger's boxes fails to start: the gateway's signed receipt, forwarded by the miner's own runner, is verified
+    by the pinned verifier, and that session is nobody's waste."""
+    from reliquary_sandbox import attest
+    from reliquary_sandbox_service.task_runtime import InfraUnavailable
+
+    from reliquary.sandbox import SANDBOX_COMMIT, sandbox_commit_refusal
+    from reliquary.sandbox import fleet as fleet_module
+    from reliquary.sandbox.open_queue import Ticket
+    from reliquary.sandbox.rl_capacity import NEWCOMER, YIELD_MIN_DECIDED
+
+    if not hasattr(attest, "open_refusal_valid"):
+        pytest.skip("the installed reliquary-sandbox signs no open refusals (before the re-pin)")
+    # Booted on the pinned sandbox: the services refuse to build on any other (the RL-start check).
+    assert sandbox_commit_refusal(SANDBOX_COMMIT) is None
+    monkeypatch.setattr(fleet_module, "POLL_SECONDS", 1.0)    # reports list the short-lived sessions of this run
+    register_episode_env(monkeypatch)
+    gateway, boxes = production_gateway, production_gateway.boxes
+    await sandbox_store.register_machine(
+        machine_id=gateway.settings.machine_id, address=gateway.url, provider="local",
+        capacity=CAPACITY, key_id=gateway.machine.key_id, public_key_b64=gateway.machine.public_key_b64,
+        valid_from=0, now=time.time())
+    rt = make_runtime(tmp_path / "rt", catalogue=CATALOGUE)
+    v = Validator(gateway, rt, tmp_path, production=True)
+    miners = Miners(v, asyncio.get_running_loop())
+    b, services, server = v.batcher, v.services, v.server
+    m, two_m, machine = M_ROLLOUTS, 2 * M_ROLLOUTS, gateway.settings.machine_id
+    honest_key, forger_key = HONEST.ss58_address, FORGER.ss58_address
+
+    # -- the spies (observation only) --
+    joins = []                                       # (hotkey, engagement, ticket or refusal) of the open queue
+    if services.queue is not None:
+        real_join = services.queue.join
+
+        def join(hotkey, *, cls, engagement=None):
+            answer = real_join(hotkey, cls=cls, engagement=engagement)
+            joins.append((hotkey, engagement, answer))
+            return answer
+
+        services.queue.join = join
+    first_close = {}                                 # session id -> its ended_at at its first close
+    events = services.issuer._events
+    held_given = {}                                  # session id -> the held seconds the ledger decided it with
+    refusal_checks = []                              # (session id, verdict) of the pinned verifier's checks
+    if services.ledger is not None:                  # (the services without a ledger: no events, no queue)
+        real_closed, real_decide = events.closed, services.ledger.decide
+        real_check = services.issuer._open_refusal_check
+
+        def closed(record, final):
+            first_close.setdefault(record.session_id, record.ended_at)
+            return real_closed(record, final)
+
+        def decide(sha, sessions, **kwargs):
+            sessions = list(sessions)
+            held_given.update((row[0], row[4]) for row in sessions)
+            return real_decide(sha, sessions, **kwargs)
+
+        def check(receipt, record):
+            verdict = real_check(receipt, record)
+            refusal_checks.append((record.session_id, verdict))
+            return verdict
+
+        events.closed, services.ledger.decide, services.issuer._open_refusal_check = closed, decide, check
+    polls = []                       # per accepted report: (sessions it lists, sessions still reserved, held, expected)
+    listed_so_far = set()            # every session a report listed so far
+    real_polled = services.fleet.on_polled
+
+    def polled():
+        fleet = services.fleet
+        document = fleet._reports.get(machine)
+        if document is not None:
+            resources = document["resources"]
+            listed = fleet_module._listed(resources)
+            listed_so_far.update(listed)
+            reserved = fleet._reserved.get(machine, ())
+            # a session is held until a report lists it (or its present window passed with none listing it)
+            pending = [r for r in reserved if r[3] not in listed_so_far and document["at"] <= r[1]]
+            expected = tuple(sum(fleet_module.reservation_need(resources, r[2])[k] for r in pending) for k in (0, 1))
+            polls.append((listed, {r[3] for r in reserved}, fleet._held(machine, document, resources), expected))
+        return real_polled()
+
+    services.fleet.on_polled = polled
+    peak_live = [0]
+    refused_box = {}                                 # the forger's seed whose box fails to start, and its session
+    real_create = boxes.create
+
+    def create(box_id, episode_id, spec):
+        record = services.book.get(episode_id)
+        if (not refused_box and record is not None and record.hotkey == forger_key
+                and parse_rl_engagement(record.engagement)[2] == 3):
+            refused_box.update(seed=3, session_id=episode_id)
+            raise InfraUnavailable("cannot start")      # the gateway signs open_failed for this very token
+        return real_create(box_id, episode_id, spec)
+
+    boxes.create = create
+
+    async def watch():
+        while True:
+            peak_live[0] = max(peak_live[0], sum(1 for r in services.book.records() if r.state == "live"))
+            await asyncio.sleep(0.02)
+
+    await v.start()
+    watcher = asyncio.ensure_future(watch())
+    foreign = ForeignSessions(gateway, services)
+    try:
+        assert services.unserved_envs == set()       # the boot check found the env served
+        # The window opens: only its envs count in the fleet size and the allocation answer.
+        services.set_active_envs(sorted(rt.contract.environments))
+        assert services.counted_envs() == frozenset({EPISODE})
+        assert services.allocation_pool_sizes() == {EPISODE: two_m}
+        assert services.fleet.session_capacity(reservations=services.reservations()) == ONE_POOL
+        await foreign.open(ONE_POOL)                 # the machine is full; the fleet's size is still one pool
+
+
+        async def machine_full():                    # (its report shows it before any miner asks)
+            await services.fleet.poll_once()
+            return services.fleet._reports[machine]["resources"]
+
+        for _ in range(100):
+            resources = await machine_full()
+            if resources["free_cpu_millis"] == 0:
+                break
+            await asyncio.sleep(0.1)
+        assert resources["free_cpu_millis"] == 0 and len(fleet_module._listed(resources)) == ONE_POOL
+        assert services.fleet.session_capacity(reservations=services.reservations()) == ONE_POOL
+        prompts = {key: catalogue_prompts() for key in ("honest", "forger")}
+        forger_stop, forger = miners.run(FORGER, forger_cheat, CATALOGUED_FORGED_TASK, task_prompts=prompts["forger"])
+        honest_stop, honest = miners.run(HONEST, None, TASK, task_prompts=prompts["honest"])
+
+        # 0. Both miners' first opens wait in the queue (the quota admits them, the machine has no room).
+        def waiting(hotkey):
+            return [e for h, e, a in joins if h == hotkey and isinstance(a, Ticket) and a.active and not a.granted]
+
+        await until(lambda: waiting(honest_key) and waiting(forger_key), 60, "both miners waiting in the queue",
+                    lambda: [(h[:6], e, getattr(a, "reason", "ticket")) for h, e, a in joins])
+        assert not [r for r in services.book.records() if r.state == "live"]
+        # A stray open of the honest miner's precommit (a seed it opens later), cancelled while it waits.
+        (queued,) = waiting(honest_key)[:1]
+        precommit_sha, seed = parse_rl_engagement(queued)[1], parse_rl_engagement(queued)[2]
+        stray_seed = seed + 1 if seed + 1 < two_m else seed - 1       # the miner sends it once its probe is granted
+        stray = {"kind": "rl_precommit", "precommit": {"precommit_sha256": precommit_sha, "seed_index": stray_seed}}
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(services.issuer.open(hotkey=honest_key, request_id="stray-" + os.urandom(8).hex(),
+                                                        engagement=stray), 0.2)
+        assert stray_seed not in sessions_of(services, honest_key)
+        assert not [t for t in services.queue._tickets() if t.engagement and t.engagement.endswith(f":{stray_seed}")
+                    and t.key == honest_key and t.engagement != queued]
+        # 1. A quarter of the machine is freed: the groups start, and the seeds they still owe below M wait in the
+        # queue on tickets kept for them; then the rest is freed.
+        await foreign.finish(ONE_POOL // 4)
+        await until(lambda: any(isinstance(a, Ticket) and a.reserved is not None for _, _, a in joins), 60,
+                    "an owed seed's ticket", lambda: [(h[:6], e, getattr(a, "reason", "ticket")) for h, e, a in joins])
+        await foreign.finish()
+
+        await until(lambda: len(v.receipts) >= 2 and all(r.terminal for r in v.receipts[:2]), 300,
+                    "both groups admitted", lambda: (len(v.receipts), peak_live, len(joins)))
+        for receipt in v.receipts[:2]:
+            assert receipt.outcome.accepted and receipt.outcome.reason is RejectReason.ACCEPTED, receipt.outcome
+        (honest_request,) = v.requests[honest_key]
+        (forged_request,) = v.requests[forger_key]
+        honest_seeds = honest_request.pool_selection["seeds"]
+        honest_rewards = [r.reward for r in honest_request.rollouts]
+        assert honest_request.service_binding["purpose"] == "training"
+        assert forged_request.service_binding["purpose"] == "exploration"
+        assert set(forged_request.pool_selection["seeds"]) & miners.cores[forger_key].cheated   # something to find
+        assert 0.0 in honest_rewards and 1.0 in honest_rewards                               # in zone
+        # The fleet bound: never more live sessions than the fleet holds; each group holds its M and was played
+        # from the seeds it got (no more fit, the miner did not wait for more).
+        assert peak_live[0] <= ONE_POOL
+        honest_sessions, forger_sessions = sessions_of(services, honest_key), sessions_of(services, forger_key)
+        assert len(honest_sessions) >= m and len(forger_sessions) >= m + 1          # (its failed open, then one more)
+        assert len(honest_sessions) + len(forger_sessions) - 1 <= ONE_POOL           # both groups within the fleet
+        assert stray_seed in honest_sessions and honest_sessions[stray_seed].request_id[:6] != "stray-"
+        # The gateway's signed refusal of the forger's failed box: forwarded by the miner's runner, verified by the
+        # pinned verifier; the session's fault is ours.
+        failed = services.book.get(refused_box["session_id"])
+        assert failed.closed_status == "open_failed" and failed.fault == "open_refused:open_failed"
+        assert (refused_box["session_id"], True) in refusal_checks
+        # The queue was busy, the stray open left it, every ticket left it.
+        assert waiting(honest_key) == [] and waiting(forger_key) == [] and services.queue.waiting == 0
+        # The fleet: each report listed the sessions it ran; a session it listed is no longer held by the fleet.
+        assert any(listed & reserved for listed, reserved, _, _ in polls)
+        assert all(held == expected for _, _, held, expected in polls), polls
+        listed_ever = set().union(*(listed for listed, _, _, _ in polls))
+        assert listed_ever & set(r.session_id for r in honest_sessions.values())
+        assert listed_ever & set(r.session_id for r in forger_sessions.values())
+        # The reference miners asked the signed allocation route for their own allocation and were answered.
+        for hotkey in (honest_key, forger_key):
+            answers = [a for h, status, a in miners.allocations if h == hotkey and status == 200]
+            assert answers and all(a["hotkey"] == hotkey for a in answers), miners.allocations
+            assert any(a["lane"] == NEWCOMER and a["groups"][EPISODE] >= 1 for a in answers), answers
+            assert all(a["pool_seeds"] == {EPISODE: two_m} for a in answers)
+
+        # 2. The training group is proven on arrival.
+        await until(lambda: (b._reconcile_fill_state_decisions(EPISODE),
+                             len(b._proven_groups.get(EPISODE, [])) == 1)[1], 60, "the training proof",
+                    lambda: proof_state(b))
+        (proven,) = [group.value for group in b._proven_groups[EPISODE]]
+        assert proven.hotkey == honest_key and proven.prompt_idx == TASK
+
+        # 4. The forged group's audit fails: banned, its window forfeited.
+        CLOCK["round"] += 100
+        await until(lambda: (b.service_exploration_tick(), rt.exploration_banned(forger_key))[1], 60,
+                    "the forger's audit")
+        (row,) = rt.ledger.rows(1, environment=EPISODE)
+        assert row["status"] == "forfeited" and row["audit"] == "failed"
+
+        # 5. The seal and the settlement.
+        await v.service._drain_service_exploration([b])
+        paid = [proven]
+        archive = {"window_start": 1, "window_status": "complete", "rewards_by_hotkey": {},
+                   "batch": [{"hotkey": g.hotkey, "env_name": EPISODE, "prompt_idx": g.prompt_idx} for g in paid]}
+        result = await v.service._settle_service_archive(rt, archive)
+        assert set(result["rewards_by_hotkey"]) == {honest_key}
+        v.service._auction_final_verdict_records(b, paid_groups=paid, finalize=True)
+
+        # 6. The miners' verdicts: the honest group submitted, every other episode withdrawn.
+        def settled(hotkey, chosen):
+            return all(r.state == (SUBMITTED if s in chosen else CLOSED)
+                       for s, r in sessions_of(services, hotkey).items() if r.session_id != refused_box["session_id"])
+
+        forged_seeds = forged_request.pool_selection["seeds"]
+        await until(lambda: settled(honest_key, honest_seeds) and settled(forger_key, forged_seeds), 60,
+                    "the withdrawals")
+
+        # 7. The yield ledger decides both precommits from the settlement: the honest one useful (trained), the
+        # forger's wasted (its exploration forfeited) but for its failed box (ours: no verdict).
+        await services.settle_yield()
+        honest_n = len(sessions_of(services, honest_key))
+        forger_n = len(sessions_of(services, forger_key)) - 1
+        stats = {hotkey: services.ledger.stats(hotkey) for hotkey in (honest_key, forger_key)}
+        assert (stats[honest_key].useful, stats[honest_key].decided) == (honest_n, honest_n)
+        assert (stats[forger_key].useful, stats[forger_key].decided) == (0, forger_n)
+        assert max(honest_n, forger_n) < YIELD_MIN_DECIDED        # both still newcomers
+        assert services.quota.lane(honest_key) == services.quota.lane(forger_key) == NEWCOMER
+        # ended_at: each session's box end, set at its first close (with its machine's final) and never moved by
+        # its submission or withdrawal; the held seconds the ledger counted run from issue to it, whether a report
+        # listed the session or not. The failed open has no box end.
+        for hotkey in (honest_key, forger_key):
+            for record in sessions_of(services, hotkey).values():
+                assert record.ended_at == first_close[record.session_id]
+                if record.session_id == refused_box["session_id"]:
+                    assert record.ended_at is None
+                    continue
+                assert record.ended_at is not None and record.closed_at >= record.ended_at
+                assert held_given[record.session_id] == record.ended_at - record.issued_at
+        # The demand memory: each key's demand is remembered at what it held once its group ended.
+        services.quota.allocation()
+        for hotkey in (honest_key, forger_key):
+            assert services.quota._memory[hotkey][0] >= m
+    finally:
+        watcher.cancel()
+        for stop in (locals().get("honest_stop"), locals().get("forger_stop")):
+            if stop is not None:
+                stop.set()
+        for task in (locals().get("honest"), locals().get("forger")):
+            if task is not None:
+                await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 60)
+        await foreign.finish()
+        await v.close()
