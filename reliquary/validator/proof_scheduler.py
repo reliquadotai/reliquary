@@ -414,6 +414,20 @@ class GlobalProofScheduler:
                 )
             )
 
+    def add_environments(self, environments: Sequence[str]) -> tuple[str, ...]:
+        """Accept plans for ``environments`` too (an env added to a running run). Idempotent; returns the
+        names that were new. The round-robin order keeps the known envs first."""
+        with self._condition:
+            new = tuple(dict.fromkeys(str(name) for name in environments if str(name) not in self._environment_set))
+            if not new:
+                return ()
+            self._environments = self._environments + new
+            self._environment_set.update(new)
+            for environment in new:
+                self._active_plan_by_environment[environment] = None
+                self._proof_durations_by_environment[environment] = deque(maxlen=1000)
+            return new
+
     def submit(self, plan: ProofPlan) -> ProofPlanHandle:
         return self.submit_many((plan,))[0]
 

@@ -594,12 +594,13 @@ class ServiceRuntime:
                                bound: float, revision: int) -> bool:
         """Record that ``request_id``'s activation checks could not be settled at this boundary. True while
         it may still wait (status "waiting" with the reason); False once it has waited more than ``bound``
-        seconds since its first wait, for the caller to refuse it. Never records the request id as handled."""
+        seconds since its first wait, for the caller to refuse it. Never records the request id as handled. The
+        status file is written when the wait starts and when its reason changes (not at every boundary)."""
         order = self.order_contract.sha256
         with self._txn():
-            row = self.db.execute("SELECT first_at, first_window, checks FROM service_schedule_waits "
+            row = self.db.execute("SELECT first_at, first_window, checks, detail FROM service_schedule_waits "
                                   "WHERE order_id=? AND request_id=?", (order, request_id)).fetchone()
-            first_at, first_window, checks = row if row is not None else (at, window, 0)
+            first_at, first_window, checks, previous = row if row is not None else (at, window, 0, None)
             elapsed = max(0.0, at - first_at)  # a clock that went back never lengthens the wait
             if elapsed > bound:
                 return False
@@ -608,6 +609,8 @@ class ServiceRuntime:
                             (order, request_id))
             self.db.execute("INSERT OR REPLACE INTO service_schedule_waits VALUES(?,?,?,?,?,?)",
                             (order, request_id, first_at, first_window, checks + 1, reason))
+        if previous == reason:
+            return True         # the status already says why; nothing changed (no rewrite at each boundary)
         left = max(0.0, bound - elapsed)
         store.report(request_id, status="waiting",
                      detail=(f"{reason}; pending since window {first_window} ({checks + 1} boundary check(s)), "

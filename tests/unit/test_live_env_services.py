@@ -498,3 +498,15 @@ def test_a_source_failing_while_it_is_read_leaves_nothing_half_added(tmp_path):
     assert ADDED not in services.policies and ADDED not in services.served and ADDED not in services.pool_sizes
     assert ADDED not in services.quota._env_names
     services.ledger.close()
+
+
+@pytest.mark.parametrize("error", [OSError("tokenizer download failed"), TimeoutError("hub timed out")])
+def test_a_renderer_that_cannot_be_loaded_now_is_raised_not_answered(tmp_path, error):
+    services, rt = _services(tmp_path, proof_stop_ids={TERM, EOT})
+
+    def loading(policy):
+        raise error
+
+    services.renderer_for = loading
+    with pytest.raises(type(error)):
+        services.environment_refusal(added_policy(rt))      # the caller waits on it: no verdict on the env

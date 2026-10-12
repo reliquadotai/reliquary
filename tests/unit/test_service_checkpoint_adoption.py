@@ -283,6 +283,9 @@ def test_restart_restores_only_a_revision_adopted_in_the_lineage(tmp_path, saved
         env_mix=[(MATH, 16), (CODE, 16)], _emission_cap=0.5,
         _service_activation_version=lambda name: None, _require_service_environments=lambda schedule: None,
         _service_window_pool=lambda schedule, order: {name: 0.25 for name in order},
+        # nothing added to the run: no activation check, nothing staged
+        _catalogue_check=None, _stage_added_envs=lambda schedule: None,
+        _all_env_mix=lambda: [(MATH, 16), (CODE, 16)],
     )
     if saved:
         plan = ValidationService._service_window_plan(service, 2)       # NEXT is the head: idempotent
@@ -360,6 +363,9 @@ def test_j1_a_restart_with_resume_from_an_ancestor_is_refused_at_the_boundary(tm
         env_mix=[(MATH, 16), (CODE, 16)], _emission_cap=0.5,
         _service_activation_version=lambda name: None, _require_service_environments=lambda schedule: None,
         _service_window_pool=lambda schedule, order: {name: 0.25 for name in order},
+        # nothing added to the run: no activation check, nothing staged
+        _catalogue_check=None, _stage_added_envs=lambda schedule: None,
+        _all_env_mix=lambda: [(MATH, 16), (CODE, 16)],
     )
     with pytest.raises(ValueError, match="ancestor of the current lineage head"):
         ValidationService._service_window_plan(service, 4)
@@ -378,6 +384,9 @@ def test_a_refused_ancestor_leaves_the_operators_schedule_request_unapplied(tmp_
         env_mix=[(MATH, 16), (CODE, 16)], _emission_cap=0.5,
         _service_activation_version=lambda name: None, _require_service_environments=lambda schedule: None,
         _service_window_pool=lambda schedule, order: {name: 0.25 for name in order},
+        # nothing added to the run: no activation check, nothing staged
+        _catalogue_check=None, _stage_added_envs=lambda schedule: None,
+        _all_env_mix=lambda: [(MATH, 16), (CODE, 16)],
     )
     with pytest.raises(ValueError, match="ancestor of the current lineage head"):
         ValidationService._service_window_plan(service, 4)
@@ -417,6 +426,9 @@ def _boundary_service(runtime, installed, receipt_memory=None):
         _service_activation_version=lambda name: None, _require_service_environments=lambda schedule: None,
         _service_window_pool=lambda schedule, order: {name: 0.25 for name in order},
         _service_installed_receipt=receipt_memory,
+        # nothing added to the run: no activation check, nothing staged
+        _catalogue_check=None, _stage_added_envs=lambda schedule: None,
+        _all_env_mix=lambda: [(MATH, 16), (CODE, 16)],
     )
 
 

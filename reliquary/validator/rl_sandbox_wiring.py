@@ -534,12 +534,15 @@ class RlEpisodeServices:
         seed pool larger than the one they were sized for, one of its names known with another group size or for
         another env, no renderer for its tools, or its renderer's stops outside the proof's stop set; None when
         they can. BLOCKING (it may build the renderer, loading a tokenizer): call it in a worker thread; the
-        renderer it builds is kept for ``add_environment``."""
+        renderer it builds is kept for ``add_environment``. An I/O error or a timeout while building the renderer
+        (a tokenizer download) is raised, not answered: it is no verdict on the env."""
         why = self._policy_refusal(policy.environment, policy)
         if why is not None or self.renderer_for is None:
             return why
         try:
             renderer = self._renderer(policy)
+        except (OSError, TimeoutError):
+            raise
         except Exception as exc:
             return f"no renderer for its tools {list(policy.tools)} ({type(exc).__name__}: {exc})"
         return self._stop_refusal(policy, renderer)

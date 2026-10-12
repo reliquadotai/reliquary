@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -288,6 +289,10 @@ _STARTUP_HASH_REBUILD_CHUNK_WINDOWS = 16
 # seconds-to-a-minute, not a hot loop. Not an operator knob: nothing
 # downstream is sized off it.
 FILL_CLOSED_ROTATION_POLL_SECONDS = 2.0
+# How often the requested envs are built ahead of the boundary, and how long a block whose checks refused it
+# there is left alone before it is tried again (reading the installed distributions takes about a second).
+PRESTAGE_SECONDS = 30.0
+PRESTAGE_RETRY_SECONDS = 300.0
 
 
 def _cooldown_snapshot_key(run_id: str) -> str:
@@ -931,6 +936,16 @@ class ValidationService:
         self._service_runtime = None
         self._service_schedule_store = None
         self._service_folder: Path | None = None
+        # Envs a schedule request adds to the running run: built off the loop when the request is first seen
+        # (``_prebuilt``), checked and staged at the boundary (``_staged_envs``), installed between windows.
+        self._staged_envs: dict = {}
+        self._prebuilt: dict = {}
+        self._activation_memo: dict = {}
+        self._prestage_refused: dict = {}
+        self._prestaging: set = set()
+        self._prestage_guard = threading.Lock()
+        # The installed distributions at start (an added env's install may add its own, nothing else).
+        self._boot_distributions: dict | None = None
         # The next service window as prepared at the boundary (None for every other task).
         self._candidate_service_window: dict[str, Any] | None = None
         self._candidate_service_pools: dict[str, float] | None = None
@@ -976,6 +991,15 @@ class ValidationService:
             # The operator's schedule requests live beside the runtime database
             # (``python -m reliquary.services.schedule --folder <this folder>``).
             self._service_schedule_store = ScheduleRequestStore(folder)
+            if self._service_runtime.order_contract.episode_environments:
+                # Before anything is installed or built: what an added env's install is compared with.
+                from reliquary.validator.catalogue_activation import installed_distributions
+
+                try:
+                    self._boot_distributions = installed_distributions()
+                except Exception as exc:
+                    logger.error("installed distributions unreadable at start (%s: %s): no env can be added to "
+                                 "this run before a restart", type(exc).__name__, exc)
         self.wallet = wallet
         self._signer_client = signer_client
         self._require_publication_signer()
@@ -1087,6 +1111,9 @@ class ValidationService:
             # R7: what must be installed is what the PERSISTED schedule runs now,
             # not only what the order activated at launch.
             # (A refusal closes the runtime: see ``_closing_service_runtime_on_failure``.)
+            # The envs the persisted schedule added to the run, rebuilt before they are checked and before
+            # anything below reads the runtime's contract (cooldowns, proof scheduler, RL services).
+            self._install_added_envs(self._service_runtime.schedule)
             self._require_service_environments(self._service_runtime.schedule)
 
         # Legacy accessor — archive code and tests grew up around single-env.
@@ -2801,6 +2828,9 @@ class ValidationService:
         return environment
 
     def _service_installed_version(self, name: str) -> str | None:
+        staged = getattr(self, "_staged_envs", {}).get(name)
+        if staged is not None:      # an env added to the run, built and checked, not installed yet
+            return staged.source.manifest_sha256()
         from reliquary.services.schedule import default_installed_version
 
         return default_installed_version(name)
@@ -2812,7 +2842,7 @@ class ValidationService:
         declared = self._service_runtime.contract.environments.get(name)
         if declared is None:
             return "is not declared by the order"
-        env = self.envs.get(name)
+        env = self.envs.get(name) or getattr(self, "_staged_envs", {}).get(name)
         if env is None:
             return "is not loaded by this validator"
         if self._service_installed_version(name) != declared["version"]:
@@ -2828,7 +2858,10 @@ class ValidationService:
         if rows != declared["dataset"]["rows"]:
             return "has another dataset size than the order"
         # R9: the group count per pick is the protocol's, whatever the share.
-        if self.env_targets.get(name) != protocol_slot_geometry()[1]:
+        target = self.env_targets.get(name)
+        if target is None and name in getattr(self, "_staged_envs", {}):
+            target = protocol_slot_geometry()[1]          # installed with the protocol's count at the boundary
+        if target != protocol_slot_geometry()[1]:
             return "has a group count per pick that differs from the protocol's"
         return None
 
@@ -2859,6 +2892,285 @@ class ValidationService:
             return self._service_installed_version(name)
         logger.error("service environment %s cannot be activated: it %s", name, problem)
         raise ScheduleRefused(f"cannot activate {name}: the environment {problem}")
+
+    # ----- envs added to the running run (a schedule request's ``add``) -----
+
+    def _added_digest(self, added: dict) -> str:
+        """What recognises a block built ahead: its env entry and its catalogue (not the attestation's name)."""
+        from reliquary.protocol.release_contract import canonical_json_bytes
+
+        return hashlib.sha256(canonical_json_bytes({"environment": added["environment"],
+                                                    "catalogue": added["catalogue"]})).hexdigest()
+
+    def _all_env_mix(self) -> list[tuple[str, int]]:
+        """The env mix with the envs staged for the next window (added to the run, not installed yet)."""
+        from reliquary.services.runtime import protocol_slot_geometry
+
+        known = {name for name, _ in self.env_mix}
+        slots = protocol_slot_geometry()[1]
+        return list(self.env_mix) + [(name, slots) for name in sorted(self._staged_envs) if name not in known]
+
+    def _active_bridged_sources(self) -> dict:
+        """The bridged task sources this validator serves (their installs must not move)."""
+        return {name: env.source for name, env in self.envs.items()
+                if callable(getattr(getattr(env, "source", None), "installed_identity", None))}
+
+    def _activation_validity_s(self, services, added: dict) -> int:
+        """The token validity the issuer would give the added env's sessions (the machines' caps must allow
+        it): its open window and its wall time, the window lengthened for the default task preparation."""
+        from reliquary.sandbox.sessions import DEFAULT_PREPARE_TIMEOUT_S, token_validity_s
+
+        return token_validity_s(int(services.book.policy.open_window_s),
+                                int(added["environment"]["episode"]["budgets"]["wall_s"]), DEFAULT_PREPARE_TIMEOUT_S)
+
+    def _request_settled(self, store, request: dict) -> bool:
+        """The store's status already says this request was applied or refused (its file is still there)."""
+        try:
+            status = store.status()
+        except (ValueError, OSError):
+            return False
+        return (isinstance(status, dict) and status.get("request_id") == request.get("request_id")
+                and status.get("status") in ("applied", "refused"))
+
+    def _prestage_requested_envs(self, now: float | None = None) -> list[str]:
+        """Worker thread, every PRESTAGE_SECONDS: build the envs the pending schedule request adds, once per block,
+        so the window boundary never loads a dataset, and warm their servable scan. The checks that need nothing
+        of the package (the owner's allowlist, the name, the budgets, the installed distributions) run before
+        anything of it is imported. A block those checks or the build refused is tried again only after
+        PRESTAGE_RETRY_SECONDS. Never raises (a malformed request is the boundary's to refuse); returns the
+        names built now."""
+        from reliquary.environment import bridged_episode
+        from reliquary.validator.catalogue_activation import (
+            NotYet, allowed_packages, before_import_problem, machines_problem,
+        )
+
+        now = time.monotonic() if now is None else float(now)
+        store = getattr(self, "_service_schedule_store", None)
+        try:
+            request = store.take() if store is not None else None
+        except (ValueError, OSError):
+            return []
+        add = request.get("add") if isinstance(request, dict) else None
+        if not isinstance(add, dict) or not add or self._request_settled(store, request):
+            return []
+        boot = getattr(self, "_boot_distributions", None)
+        folder = getattr(self, "_service_folder", None)
+        services = getattr(self, "_episode_services", None)
+        order = self._service_runtime.order_contract
+        allowed = None
+        built = []
+        for name, entry in add.items():
+            try:
+                if (not isinstance(name, str) or not isinstance(entry, dict) or name in self.envs
+                        or name in self._staged_envs):
+                    continue
+                added = {"environment": entry["environment"], "catalogue": entry["catalogue"]}
+                digest = self._added_digest(added)
+                if (self._prebuilt.get(name) or (None,))[0] == digest:
+                    continue
+                refused = self._prestage_refused.get(name)
+                if refused is not None and refused[0] == digest and now - refused[1] < PRESTAGE_RETRY_SECONDS:
+                    continue
+                if boot is None:
+                    continue                    # nothing to compare an install with: the boundary refuses it
+                if allowed is None:
+                    allowed = allowed_packages(folder) if folder is not None else frozenset()
+                problem = before_import_problem(added, allowed, order, boot=boot)
+                if problem is not None:         # checked before any import: its code never runs here
+                    logger.error("service environment %s requested for the run: %s", name, problem)
+                    if not isinstance(problem, NotYet):
+                        self._prestage_refused[name] = (digest, now)
+                    continue
+                with self._prestage_guard:
+                    if name in self._prestaging:
+                        continue
+                    self._prestaging.add(name)
+                try:
+                    environment = bridged_episode.build_environment(
+                        bridged_episode.BridgedEnvConfig.from_catalogue(name, added["catalogue"]))
+                    self._prebuilt[name] = (digest, environment)
+                finally:
+                    with self._prestage_guard:
+                        self._prestaging.discard(name)
+                built.append(name)
+                self._prestage_refused.pop(name, None)
+                if services is not None and getattr(services, "fleet", None) is not None:
+                    machines_problem(services.fleet, added, source=environment.source,
+                                     validity_s=self._activation_validity_s(services, added),
+                                     memo=self._activation_memo.setdefault(name, {}))
+            except Exception as exc:
+                logger.error("service environment %s requested for the run cannot be built here (%s: %s)",
+                             name, type(exc).__name__, exc)
+                if not isinstance(exc, (OSError, TimeoutError)) and name not in built:
+                    try:
+                        self._prestage_refused[name] = (self._added_digest(entry), now)
+                    except Exception:
+                        pass                    # a malformed block: the boundary refuses it
+        return built
+
+    async def _prestage_forever(self, every_s: float = PRESTAGE_SECONDS) -> None:
+        while True:
+            try:
+                await asyncio.to_thread(self._prestage_requested_envs)
+            except Exception:
+                logger.exception("prestaging requested environments failed")
+            await asyncio.sleep(every_s)
+
+    def _catalogue_check(self, name: str, added: dict, attestation) -> None:
+        """``check_request``'s activation check of an env a schedule request adds (worker thread). Raises
+        ``ScheduleRefused`` with the reason, or ``ScheduleNotYet`` when it cannot be settled now (the request
+        waits; an I/O error, a timeout, a stale fleet view, the env still being built ahead); on success the
+        built env waits in ``_staged_envs``."""
+        from reliquary.environment import bridged_episode
+        from reliquary.protocol.release_contract import canonical_json_bytes
+        from reliquary.protocol.service_catalogue import CataloguedContract
+        from reliquary.services.schedule import ScheduleRefused, raise_activation_problem
+        from reliquary.validator.catalogue_activation import NotYet, activation_problem, allowed_packages
+
+        services = getattr(self, "_episode_services", None)
+        if services is None:
+            raise ScheduleRefused(f"cannot add {name}: this run launched without a signed-episode environment, "
+                                  "so this validator serves no sandbox sessions (declare one at launch)")
+        order = self._service_runtime.order_contract
+        entry = {**added["environment"], "catalogue": added["catalogue"]}
+        policy = CataloguedContract(order.canonical, canonical_json_bytes({name: entry})).episode_policy(name)
+        try:
+            why = services.environment_refusal(policy)      # builds its renderer here, off the loop
+        except (OSError, TimeoutError) as exc:
+            raise_activation_problem(name, NotYet(f"its turn renderer cannot be built now "
+                                                  f"({type(exc).__name__}: {exc})"))
+        if why is not None:
+            raise ScheduleRefused(f"cannot add {name}: {why}")
+        boot = getattr(self, "_boot_distributions", None)
+        if boot is None:
+            raise ScheduleRefused(f"cannot add {name}: the installed distributions were not read when this "
+                                  f"validator started (restart it)")
+        digest = self._added_digest(added)
+        prebuilt = self._prebuilt.get(name)
+        if prebuilt is None or prebuilt[0] != digest:
+            with self._prestage_guard:
+                building = name in self._prestaging
+            if building:
+                raise_activation_problem(name, NotYet("it is being built ahead of the boundary now"))
+
+        def build(config):
+            if prebuilt is not None and prebuilt[0] == digest:
+                return prebuilt[1]
+            return bridged_episode.build_environment(config)
+
+        folder = getattr(self, "_service_folder", None)
+        try:
+            problem, environment = activation_problem(
+                name, added, attestation, build=build, fleet=services.fleet,
+                allowed=allowed_packages(folder) if folder is not None else frozenset(),
+                active_sources=self._active_bridged_sources(), order=order, boot=boot,
+                validity_s=self._activation_validity_s(services, added),
+                memo=self._activation_memo.setdefault(name, {}))
+        except (OSError, TimeoutError) as exc:      # a check that could not read now: no verdict on the env
+            problem, environment = NotYet(f"its activation checks cannot run now ({type(exc).__name__}: {exc})"), None
+        if problem is not None:
+            logger.error("service environment %s cannot be added to the run%s: %s", name,
+                         " yet" if isinstance(problem, NotYet) else "", problem)
+            raise_activation_problem(name, problem)
+        self._prebuilt[name] = (digest, environment)        # a later boundary reuses it
+        self._staged_envs[name] = environment
+
+    def _stage_added_envs(self, schedule) -> None:
+        """Build every env ``schedule`` added that this process does not serve yet (worker thread). An added
+        env this validator cannot build at its pinned identity raises: a persisted schedule names it, so the
+        window must not open without it (fix the install; never skip a paid env silently). With the RL
+        services, their check runs here too (it builds the env's turn renderer off the loop)."""
+        from reliquary.environment import bridged_episode
+        from reliquary.validator.catalogue_activation import install_problem
+
+        services = getattr(self, "_episode_services", None)
+        for name, added in schedule.added_environments().items():
+            if name in self.envs or name in self._staged_envs:
+                continue
+            prebuilt = self._prebuilt.get(name)
+            if prebuilt is not None and prebuilt[0] == self._added_digest(added):
+                environment = prebuilt[1]
+            else:
+                environment = bridged_episode.build_environment(
+                    bridged_episode.BridgedEnvConfig.from_catalogue(name, added["catalogue"]))
+            problem = install_problem(environment.source, added)
+            if problem is not None:
+                raise ValueError(f"added environment {name}: {problem}")
+            if services is not None:
+                why = services.environment_refusal(self._service_runtime.contract.episode_policy(name))
+                if why is not None:
+                    raise ValueError(f"added environment {name}: the RL services cannot serve it: {why}")
+            self._staged_envs[name] = environment
+
+    def _install_env(self, name: str, environment) -> None:
+        """Make an added env one of this validator's: its spec registered (its version), its group count, its
+        cooldown maps, its proof plans. Raises ValueError, changing nothing, when another spec holds its name."""
+        from reliquary.environment.bridged_episode import catalogue_spec
+        from reliquary.environment.registry import find_environment_spec, register_catalogue_spec
+        from reliquary.services.runtime import protocol_slot_geometry
+
+        spec = catalogue_spec(name, environment.source.manifest_sha256())
+        known = find_environment_spec(name)
+        if known is not None and known != spec:
+            raise ValueError(f"added environment {name}: another environment spec holds its name")
+        register_catalogue_spec(spec)
+        slots = protocol_slot_geometry()[1]
+        self.envs[name] = environment
+        if name not in self.env_targets:
+            self.env_mix.append((name, slots))
+            self.env_targets[name] = slots
+        cooldowns = getattr(self, "_cooldown_per_env", None)
+        if cooldowns is not None and name not in cooldowns:      # installed after start (at start: built below)
+            horizon = self._service_runtime.schedule.cooldown_windows(name)
+            cooldowns[name] = CooldownMap(cooldown_windows=horizon)
+            self._content_cooldown_per_env[name] = ContentCooldownMap(cooldown_windows=horizon)
+            health = getattr(self, "_content_cooldown_health", None)
+            if isinstance(health, dict) and isinstance(health.get("counts_by_environment"), dict):
+                health["counts_by_environment"].setdefault(name, 0)
+        scheduler = getattr(self, "proof_scheduler", None)
+        if scheduler is not None:
+            from reliquary.validator.batcher import audit_scheduler_environment
+
+            scheduler.add_environments((name, audit_scheduler_environment(name)))
+        self._prebuilt.pop(name, None)
+
+    def _install_added_envs(self, schedule) -> None:
+        """At start: every env the persisted schedule added (inactive ones too), built and installed before
+        anything reads the runtime's contract (no RL services yet: they are built later from that contract,
+        which names them)."""
+        if not schedule.added_environments():
+            return
+        self._stage_added_envs(schedule)
+        staged, self._staged_envs = dict(self._staged_envs), {}
+        for name, environment in sorted(staged.items()):
+            self._install_env(name, environment)
+            logger.warning("service environment %s, added to the run, installed at start", name)
+
+    async def _commit_staged_envs(self) -> list[str]:
+        """Between windows, on the event loop: hand the staged envs the schedule now names to the RL services,
+        then install them. A staged env whose request was not applied is dropped (its build stays prebuilt).
+        An env the services refuse stays staged and the boundary fails (retried): it is never installed while
+        the services do not know it."""
+        contract = self._service_runtime.contract
+        services = getattr(self, "_episode_services", None)
+        installed = []
+        for name, environment in sorted(dict(self._staged_envs).items()):
+            if name not in contract.environments:
+                self._staged_envs.pop(name, None)
+                continue
+            if services is not None:
+                try:
+                    services.add_environment(name, environment, contract.episode_policy(name))
+                except Exception as exc:
+                    logger.error("ALERT service environment %s is in the schedule but the RL services refused it "
+                                 "(%s: %s); it stays staged and the next window does not open until it is served",
+                                 name, type(exc).__name__, exc)
+                    raise
+            self._install_env(name, environment)
+            self._staged_envs.pop(name, None)
+            installed.append(name)
+            logger.warning("service environment %s added to the running run", name)
+        return installed
 
     def _service_window_pool(self, schedule, env_order: list[str]) -> dict[str, float]:
         """Each active env's pool: the task cap times its live share, then its price."""
@@ -2908,10 +3220,12 @@ class ValidationService:
             self._service_schedule_store,
             window=target_window,
             installed_version=self._service_activation_version,
+            catalogue_check=self._catalogue_check,
         )
+        self._stage_added_envs(schedule)
         self._require_service_environments(schedule)
         active = set(schedule.active_environments())
-        env_mix = [(name, target) for name, target in self.env_mix if name in active]
+        env_mix = [(name, target) for name, target in self._all_env_mix() if name in active]
         env_order = [name for name, _ in env_mix]
         pools = self._service_window_pool(schedule, env_order)
         picks_target, batch_slots = protocol_slot_geometry()
@@ -3051,6 +3365,8 @@ class ValidationService:
                 target_window, type(exc).__name__, exc, exc_info=exc,
             )
             raise exc
+        # Between windows, on the loop: the envs the boundary staged join the run (the plan may name them).
+        await self._commit_staged_envs()
         self._candidate_service_window = outcome["plan"]
         return True
 
@@ -3076,6 +3392,10 @@ class ValidationService:
         )
         if episodes:
             self._note_episode_window(target_window, resumed=resumed)
+            # Only this window's envs count in the fleet size, the per-env caps and the allocation answer.
+            set_active = getattr(self._episode_services, "set_active_envs", None)
+            if set_active is not None:
+                set_active(sorted(window["pools"]))
         announcements = {
             name: runtime.announcement(
                 environment=name, window=target_window, randomness=randomness,
@@ -8011,7 +8331,10 @@ class ValidationService:
             raise
         self.server._episode_intake = services.intake
         self._episode_services = services
-        self._episode_tasks = [asyncio.create_task(job) for job in services.background()]
+        jobs = [*services.background()]
+        if getattr(self, "_service_schedule_store", None) is not None:
+            jobs.append(self._prestage_forever())        # envs a schedule request adds, built ahead of the boundary
+        self._episode_tasks = [asyncio.create_task(job) for job in jobs]
 
     def _default_episode_renderer(self, policy):
         """The turn renderer of the policy's tokenizer over the env's tools (the signed parse)."""
