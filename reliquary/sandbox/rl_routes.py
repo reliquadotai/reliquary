@@ -31,7 +31,11 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from reliquary.protocol.signatures import verify_episode_precommit_signature, verify_rl_allocation_signature
+from reliquary.protocol.signatures import (
+    hotkey_signature_bytes,
+    verify_episode_precommit_signature,
+    verify_rl_allocation_signature,
+)
 from reliquary.sandbox.routes import (
     MAX_OPEN_BODY_BYTES, _answer, _decode, _read_within, _refuse, _Refused, ss58_address,
 )
@@ -309,7 +313,9 @@ def build_allocation_router(allocation_of: Callable[[str], dict], *, validator_h
                     verified = False
                 if not verified:
                     return _refuse("bad_signature")
-                refused = remember(hotkey, request.signature, now)
+                # keyed on the signature's bytes: the same signature spelt otherwise (case, 0x, blanks) is a replay
+                signature = hotkey_signature_bytes(request.signature)
+                refused = remember(hotkey, request.signature if signature is None else signature.hex(), now)
                 if refused is not None:
                     return refused
             return _answer(allocation_of(hotkey))

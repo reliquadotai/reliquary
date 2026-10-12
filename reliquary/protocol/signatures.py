@@ -867,15 +867,23 @@ def build_sandbox_close_binding(request, *, validator_hotkey: str, path: str) ->
         *_audience(validator_hotkey, path)])
 
 
+def hotkey_signature_bytes(signature_hex: str) -> bytes | None:
+    """The signature bytes ``verify_hotkey_signature`` verifies for this text (it accepts upper case, surrounding
+    blanks and ``0x``), or None when it is not hex: one signature, however spelt, has one value (a replay guard keys
+    on it)."""
+    try:
+        signature = bytes.fromhex((signature_hex or "").strip().replace("0x", "").replace("0X", ""))
+    except ValueError:
+        return None
+    return signature or None
+
+
 def verify_hotkey_signature(hotkey: str, binding: bytes, signature_hex: str) -> bool:
     """False on any failure; fail-closed without bittensor."""
     if bt is None:
         return False
-    try:
-        signature = bytes.fromhex((signature_hex or "").strip().replace("0x", "").replace("0X", ""))
-    except ValueError:
-        return False
-    if not signature:
+    signature = hotkey_signature_bytes(signature_hex)
+    if signature is None:
         return False
     try:
         keypair = bt.Keypair(ss58_address=hotkey)  # type: ignore[union-attr]
