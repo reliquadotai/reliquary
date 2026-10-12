@@ -22,6 +22,18 @@ shows a whole group's demand from its first request.
     grace: bounded, it ends after ``GRACE_SESSIONS`` more decided sessions; ``YieldStats.graduation`` also counts
     graded sessions a capacity verdict made neutral), or
   - in the low-yield entity while its yield is below ``YIELD_FULL`` (a recovering hotkey keeps its one group).
+* THE FLEET BOUND: a new group starts only when the fleet's committed sessions (every hotkey's started groups, each
+  counting at least its M, as ``committed`` does for one hotkey) plus its M fit in C, whatever the hotkey's allocation
+  or its entity's room; a session beyond M of a started group only when one more fits. So the fleet never holds more
+  than C (the pooled entities are within it, never on top of it: the room a pooled entity is allocated and has not
+  filled yet is kept for it, so a MAIN group never takes it); a group under M is still never cut. The count is
+  recomputed with the allocation and only raised by the opens in between (closes and expiries wait for the next
+  recompute): it never under-counts.
+* DEMAND MEMORY: a hotkey's demand in the allocation (and in the potentials) is at least the demand it last showed,
+  decaying linearly to zero over ``DEMAND_MEMORY_S`` from when it was last seen. When every group ends at once (a
+  window's turnover), the demands do not drop to nothing for an instant, so no key is told the idle fleet and the
+  weights, not the first to ask, set the shares again; a key that left frees its share within ``DEMAND_MEMORY_S``.
+  Per hotkey, additive: a hotkey split in parts remembers what the whole would.
   Splitting a hotkey into parts below one group therefore buys at most the pooled entities' rules.
 * Pooled members: at most ``NEWCOMER_MAX_GROUPS`` / ``LOW_YIELD_MAX_GROUPS`` groups each. First opens of groups are
   FIFO by group; in the newcomer entity a hotkey with fewer than ``YIELD_MIN_DECIDED`` decided sessions goes before a
@@ -47,6 +59,7 @@ from reliquary.constants import CODE_ADMISSION_WALL_SECONDS, MATH_ADMISSION_WALL
 from reliquary.sandbox.rl_capacity import (
     ALLOCATION_REFRESH_S,
     ASK_FORGET_S,
+    DEMAND_MEMORY_S,
     DEMAND_TTL_S,
     GRACE_SESSIONS,
     LOW_YIELD,
@@ -162,6 +175,9 @@ class YieldQuota:
         self._potentials: dict[str, int] = {}
         self._alloc_key: tuple | None = None
         self._alloc_at = -math.inf
+        self._memory: dict[str, tuple[float, float]] = {}        # hotkey -> (demand last seen, when)
+        self._fleet_committed = 0                                # every hotkey's committed sessions
+        self._group_n: dict[str, int] = {}                       # started precommit -> its counted sessions
         self._dirty = True
 
     def add_environment(self, group_sizes: Mapping[str, int], env_names: Mapping[str, str]) -> None:
@@ -196,6 +212,10 @@ class YieldQuota:
         for asks in self._asks.values():
             asks.pop(sha, None)                              # its group started: it leaves the line
         self._opens.setdefault(hotkey, deque()).append((int(record.issued_at), record))
+        # the fleet's committed sessions until the next recompute: a new group commits its M, a session beyond M one
+        n, m = self._group_n.get(sha, 0), self._last_m[hotkey]
+        self._fleet_committed += m if n == 0 else max(n + 1, m) - max(n, m)
+        self._group_n[sha] = n + 1
         lane = self.lane(hotkey)
         if lane != MAIN:
             self._lane_opens[lane].append((int(record.issued_at), record))
@@ -348,6 +368,40 @@ class YieldQuota:
                                      "env_sessions": int(c_env), "fleet_sessions": int(capacity), **detail},
                        retry_after=self._retry_after_s)
 
+    def _remembered(self, hotkey: str, demand: float, now: int) -> float:
+        """``demand`` raised to the hotkey's remembered demand (decaying over DEMAND_MEMORY_S); remembers it when it
+        is the larger. Called once per hotkey per recompute."""
+        memory = self._memory.get(hotkey)
+        kept = 0.0 if memory is None else memory[0] * max(0.0, 1.0 - (now - memory[1]) / DEMAND_MEMORY_S)
+        if demand >= kept:
+            if demand > 0:
+                self._memory[hotkey] = (float(demand), float(now))
+            else:
+                self._memory.pop(hotkey, None)
+            return float(demand)
+        if kept < 1.0:
+            self._memory.pop(hotkey, None)
+            return float(demand)
+        return kept
+
+    def _pool_room(self, alloc: Allocation, but: str | None = None) -> int:
+        """The sessions the pooled entities (but ``but``) are allocated and do not hold yet: kept for them."""
+        return sum(max(0, self._entity_sessions(lane, alloc) - self._lane_counted[lane])
+                   for lane in (NEWCOMER, LOW_YIELD) if lane != but)
+
+    def _fleet_room(self, alloc: Allocation, lane: str) -> int:
+        """The sessions a hotkey of ``lane`` may still commit in the fleet: C less every committed session, less
+        the room the other pooled entities are allocated and have not filled."""
+        return int(alloc.capacity) - self._fleet_committed - self._pool_room(alloc, but=lane)
+
+    def _fleet_refusal(self, alloc: Allocation, needed: int, detail: dict) -> Refusal | None:
+        """None when ``needed`` more committed sessions of a MAIN hotkey fit in the fleet's C."""
+        if needed <= self._fleet_room(alloc, MAIN):
+            return None
+        return Refusal("quota_live", {"fleet_committed": self._fleet_committed, "fleet_sessions": int(alloc.capacity),
+                                      "kept_for_pools": self._pool_room(alloc), **detail},
+                       retry_after=self._retry_after_s)
+
     def _stats(self, hotkey: str, snapshot: Mapping[str, YieldStats] | None = None) -> YieldStats:
         snapshot = self._ledger.snapshot() if snapshot is None else snapshot
         return snapshot.get(str(hotkey), YieldStats())
@@ -408,14 +462,24 @@ class YieldQuota:
             snapshot = self._ledger.snapshot()    # one snapshot for the whole recompute
             lanes: dict[str, str] = {}
             counted: dict[str, int] = {}
-            demands: dict[str, int] = {}
+            demands: dict[str, float] = {}
+            raw: dict[str, int] = {}
             main: dict[str, tuple[float, float]] = {}
             kept: list[tuple[str, YieldStats]] = []
-            for hotkey in set(self._index) | set(self._wants):
+            fleet, groups_n = 0, {}
+            for hotkey in set(self._index) | set(self._wants) | set(self._memory):
                 stats = snapshot.get(hotkey, YieldStats())
                 rows = self._counted(hotkey, now)
                 counted[hotkey] = len(rows)
-                demands[hotkey] = self._demand(hotkey, now, rows)
+                raw[hotkey] = self._demand(hotkey, now, rows)
+                demands[hotkey] = self._remembered(hotkey, raw[hotkey], now)
+                per: dict[str | None, list[Any]] = {}
+                for record in rows:
+                    per.setdefault(self._sha.get(record.session_id), []).append(record)
+                for sha, members in per.items():
+                    fleet += max(len(members), self._m(members))
+                    if sha is not None:
+                        groups_n[sha] = len(members)
                 lane = self._stats_lane(stats)
                 if lane == MAIN and self._pool_kept(stats) is not None:
                     kept.append((hotkey, stats))
@@ -441,7 +505,7 @@ class YieldQuota:
                     lane_counted[lane] += counted[hotkey]
                 if lane == NEWCOMER and snapshot.get(hotkey, YieldStats()).graduation < YIELD_MIN_DECIDED:
                     member_max = _LANE_GROUPS[NEWCOMER] * group
-                    genuine_waiting += max(0, min(demands[hotkey], member_max) - counted[hotkey])
+                    genuine_waiting += max(0, min(raw[hotkey], member_max) - counted[hotkey])
             for lane, opens in self._lane_opens.items():
                 _prune(opens, _LANE_PERIOD[lane], now)
             for hotkey in list(self._opens):      # bounded memory: open times over the period only
@@ -457,6 +521,7 @@ class YieldQuota:
             self._snapshot, self._claims, self._entity_demand = snapshot, main, entity
             self._lanes, self._lane_counted, self._potentials = lanes, lane_counted, {}
             self._genuine_waiting = genuine_waiting
+            self._fleet_committed, self._group_n = fleet, groups_n
             self._alloc_key, self._alloc_at, self._dirty = key, now, False
         return self._alloc
 
@@ -528,6 +593,9 @@ class YieldQuota:
             if (starts and committed + m_new > limit) or (not starts and len(counted) >= limit):
                 return Refusal("quota_live", {"live": len(counted), "committed": committed, "max": limit, **detail},
                                retry_after=self._retry_after_s)
+            refused = self._fleet_refusal(alloc, m_new if starts else 1, detail)
+            if refused is not None:
+                return refused
             if starts:
                 return self._env_refusal(hotkey, now, alloc.main.get(hotkey, 0.0), alloc.capacity, groups,
                                          environment, m_new, detail)
@@ -557,6 +625,8 @@ class YieldQuota:
         genuine = lane != NEWCOMER or self._genuine(hotkey)
         first = asks[precommit_sha256][1] if starts and precommit_sha256 in asks else float(now)
         room = entity - self._lane_counted[lane]
+        # the entity is within the fleet's C, never on top of it: its room is at most the fleet's
+        room = min(room, self._fleet_room(alloc, lane))
         if starts and not genuine:
             room -= self._genuine_waiting                        # a graduate in grace leaves the newcomers' share
         if room < (m_new if starts else 1):
@@ -579,10 +649,11 @@ class YieldQuota:
         now = int(now)
         alloc, lane = self.allocation(now), self.lane(hotkey)
         counted = len(self._counted(str(hotkey), now))
+        fleet = self._fleet_room(alloc, lane)
         if lane == MAIN:
-            return max(0, sessions_of(alloc.main.get(str(hotkey), 0.0)) - counted)
+            return max(0, min(fleet, sessions_of(alloc.main.get(str(hotkey), 0.0)) - counted))
         member = _LANE_GROUPS[lane] * self._pool_seeds - counted
-        return max(0, min(member, self._entity_sessions(lane, alloc) - self._lane_counted[lane]))
+        return max(0, min(fleet, member, self._entity_sessions(lane, alloc) - self._lane_counted[lane]))
 
     async def admit_open(self, hotkey: str, *, environment: str, precommit_sha256: str,
                          seed_index: int | None = None) -> Refusal | None:

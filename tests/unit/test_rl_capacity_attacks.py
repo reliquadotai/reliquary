@@ -597,9 +597,7 @@ def test_under_contention_the_allocations_shrink_to_the_shares_and_hold_still(li
         assert abs(tail_mean(rows) - share) <= max(P32, 0.05 * share)
     for hotkey in NEWCOMERS:
         assert tail_mean(trace[hotkey][warm:]) >= 2 * P32 - 4     # newcomers still hold their two groups
-    # the fleet: on average within 4 % of C; at worst 4 groups above it (the never-cut groups of a turnover)
-    assert sum(fleet[warm:]) / len(fleet[warm:]) <= 1.04 * CAPACITY
-    assert max(fleet[warm:]) <= CAPACITY + 4 * P32
+    assert max(fleet) <= CAPACITY                                 # the fleet bound: at every poll, from the start
 
 
 @pytest.mark.parametrize("life_s, window_s, hours", [(600, None, 1.5), (1_800, 1_800, 2.0)])
@@ -620,16 +618,23 @@ def test_under_contention_splitting_a_hotkey_gains_nothing(life_s, window_s, hou
     assert others[1] >= others[0] - P32 / 2                       # and take nothing from the others
 
 
-@pytest.mark.xfail(strict=True, reason="known: when every group lives through its window, each window's "
-                   "turnover is a race: a key's potential is the idle fleet, it starts its ceiling's groups at M each "
-                   "and none is cut, so the ramp, not the weights, sets the shares and the fleet is overcommitted")
-def test_when_every_group_lives_through_its_window_the_ramp_does_not_set_the_shares():
+@pytest.mark.parametrize("life_s", [3_600, 600])
+def test_when_every_group_turns_over_at_once_the_weights_still_set_the_shares(life_s):
+    """Every group of every key ends at the window's close (``life_s`` 3 600: each lives through the window), or
+    all of a key's groups end together (600, no jitter). A turnover is no race: the fleet never holds more than C
+    (a new group starts only within the fleet's room), and the demand each key showed before it is remembered, so
+    no key is told the idle fleet because every group ended at once: each holds its weighted share."""
     keys = {"5A": (600.0, 40), **CONTENDED, **NEWCOMERS}
-    trace, fleet = contended_loop(CAPACITY, keys, 3_600, hours=1.5, jitter=0.0, window_s=1_800)
+    trace, fleet = contended_loop(CAPACITY, keys, life_s, hours=1.5, jitter=0.0, window_s=1_800)
+    assert max(fleet) <= CAPACITY                                 # at every poll, the first window included
     shares = weighted_shares(keys)
-    for hotkey in CONTENDED:                                      # measured: 5B ~960 (share 562), 5C 640 (281)
-        assert tail_mean(trace[hotkey][360:]) <= shares[hotkey] + P32
-    assert max(fleet[360:]) <= CAPACITY + 4 * P32                 # measured: ~2 900 on 2 160
+    for hotkey, share in shares.items():
+        rows = trace[hotkey][361:]        # the second window on (poll 360 reads its told before the turnover)
+        told = [row[0] for row in rows]
+        assert abs(tail_mean(rows) - share) <= max(P32, 0.05 * share)
+        assert max(told) - min(told) <= 2
+    for hotkey in NEWCOMERS:
+        assert tail_mean(trace[hotkey][361:]) >= 2 * P32 - 4
 
 
 # --- the signed allocation route: replay, a foreign hotkey, the rate ---------------------------------------------

@@ -466,3 +466,85 @@ def test_a_graduate_in_grace_starts_a_group_only_in_the_room_newcomers_leave():
     want(alone, "5Main", 216, first=900_000)
     want(alone, "5G", P, first=10)
     assert take(alone, "5G", first=10, groups=1) == P                       # no newcomer waiting: the graduate runs
+
+
+# --- the fleet bound and the demand memory: a turnover is no race --------------------------------------------------
+
+def mutable_quota(stats, capacity, clock):
+    return YieldQuota(ledger=Ledger(stats), pool_seeds=P, group_size=M, capacity=lambda: capacity["c"],
+                      retry_after_s=7, clock=lambda: clock["now"], refresh_s=0.0)
+
+
+def test_a_new_group_starts_only_within_the_fleets_room_and_a_group_under_m_is_never_cut():
+    clock, capacity = {"now": NOW}, {"c": 128}
+    q = mutable_quota({"5A": main_stats(100), "5B": main_stats(100)}, capacity, clock)
+    for n in range(3):
+        for seed in range(P):
+            hold(q, "5A", sha(n), seed)                           # 96 sessions while the fleet had 128
+    for seed in range(4):
+        hold(q, "5A", sha(3), seed)                               # a group started, under M: it commits M
+    capacity["c"] = 64                                            # machines lost: 112 committed on 64
+    q._capacity_cache = None
+    assert q.refusal("5A", NOW, precommit_sha256=sha(3), seed_index=4) is None       # never cut below M
+    refused = q.refusal("5B", NOW, precommit_sha256=sha(50), seed_index=0)          # within its own allocation
+    assert refused.reason == "quota_live" and refused.detail["fleet_committed"] == 112
+    assert q.headroom("5B", NOW) == 0
+
+
+def test_the_room_a_pooled_entity_is_allocated_is_kept_for_it():
+    q = quota({"5A": main_stats(100), "5B": main_stats(100)})
+    for n in range(65):
+        for seed in range(P):
+            hold(q, "5A", sha(n), seed)                           # 2 080 held while 5A was alone
+    want(q, "5N", 2 * P, first=900)                               # a newcomer asks for its two groups
+    want(q, "5B", 4 * P, first=500)
+    for seed in range(M):
+        hold(q, "5B", sha(500), seed)                             # 5B's first group: 2 096 committed
+    q._alloc_key = None
+    kept = q.refusal("5B", NOW, precommit_sha256=sha(501), seed_index=0)
+    assert kept.reason == "quota_live" and kept.detail["kept_for_pools"] == 2 * P    # 2 096 + 16 + 64 > 2 160
+    assert q.refusal("5N", NOW, precommit_sha256=sha(900), seed_index=0) is None     # the newcomer's room
+
+
+def _turnover(keys, clock):
+    q = mutable_quota({h: main_stats(w) for h, w in keys.items()}, {"c": C}, clock)
+    held = []
+    for k, hotkey in enumerate(keys):
+        for n in range(int(32 * keys[hotkey] / 200)):
+            for seed in range(P):
+                held.append(hold(q, hotkey, sha(10_000 * (k + 1) + n), seed))
+    want(q, "5B", P, first=90_000)
+    before = q.potential_sessions("5B")
+    for record in held:                                           # every group ends at once (the window's close)
+        record.state, record.closed_status, record.closed_at = "closed", "expired", NOW
+        q.closed(record, None)
+    want(q, "5B", P, first=90_000)                                # 5B asks for one group first
+    return q, before
+
+
+@pytest.mark.parametrize("keys", [{"5A": 200.0, "5B": 200.0}, {"5A1": 100.0, "5A2": 100.0, "5B": 200.0}])
+def test_after_a_turnover_no_key_is_told_the_idle_fleet_and_a_key_that_left_frees_its_share(keys):
+    clock = {"now": NOW}
+    q, before = _turnover(keys, clock)
+    assert before == C - 1_024 < C                                # the others held 1 024 sessions
+    assert q.potential_sessions("5B") == before                   # remembered: not the idle fleet
+    clock["now"] = NOW + 601                                      # DEMAND_MEMORY_S later, the others never came back
+    want(q, "5B", P, first=90_000, now=NOW + 601)
+    assert q.potential_sessions("5B") >= C - P                    # their share is free again
+
+
+def test_opens_between_two_recomputes_count_in_the_fleet_at_once():
+    q = quota({"5A": main_stats(100), "5B": main_stats(100)}, capacity=64)
+    want(q, "5A", P, first=0)
+    want(q, "5B", P, first=100)
+    q.allocation()
+    with frozen(q):                                               # no recompute while they open (production: 1 s)
+        for seed in range(P):
+            assert q.refusal("5A", NOW, precommit_sha256=sha(0), seed_index=seed) is None
+            hold(q, "5A", sha(0), seed)
+        for seed in range(P):
+            assert q.refusal("5B", NOW, precommit_sha256=sha(100), seed_index=seed) is None
+            hold(q, "5B", sha(100), seed)
+        assert q._fleet_committed == 2 * P                       # counted as they opened, before any recompute
+        hold(q, "5B", sha(102), 0)                                # a new group commits its M at once
+        assert q._fleet_committed == 2 * P + M
