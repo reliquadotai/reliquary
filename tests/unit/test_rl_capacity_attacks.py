@@ -220,6 +220,23 @@ def test_a_junk_group_at_a_stale_directory_does_not_clear_a_refused_precommit(tm
     assert (ledger.stats("5A").useful, ledger.stats("5A").decided) == (0, 2 * POOL)   # both wasted
 
 
+def test_a_refusal_of_ours_after_a_real_refusal_does_not_clear_the_precommit(tmp_path):
+    """A precommit really refused, then another group of it whose persistence we failed (a refusal of ours): the
+    real refusal outranks ours, so the precommit stays wasted (a miner cannot launder a refused precommit by
+    sending a second group until one of our faults hits it)."""
+    ledger, book, quota = stack(tmp_path)
+    now = int(time.time())
+    refused = abandoned("5A", sha(13), POOL, now=now)
+    for record in refused:
+        ledger.note_opened(record)
+    ledger.group_settled(hotkey="5A", precommit_sha256=sha(13), session_ids=(), accepted=False,
+                         stage="episode_transcript")
+    ledger.group_settled(hotkey="5A", precommit_sha256=sha(13), session_ids=(), accepted=False,
+                         stage="episode_persist_failed")
+    settle(ledger, book, quota, sha(13), refused, now=now)
+    assert (ledger.stats("5A").useful, ledger.stats("5A").decided) == (0, POOL)
+
+
 async def test_a_restart_forgets_nothing_the_quota_counts(tmp_path):
     ledger, book, quota = stack(tmp_path)
     now = int(time.time())
