@@ -274,7 +274,7 @@ def test_one_request_counts_a_whole_group_of_demand_and_no_more(tmp_path):
     quota, _tick = _real(env)
     sha = env.precommit.sha256
     quota.refusal(HOTKEY, NOW, precommit_sha256=sha, seed_index=0, environment=EPISODE)
-    assert quota._demand(HOTKEY, NOW) == m
+    assert quota._demand(HOTKEY, NOW) == 2 * m                     # asked, not started: its whole pool
     for seed in range(1, POLICY.pool_seeds):
         quota.refusal(HOTKEY, NOW, precommit_sha256=sha, seed_index=seed, environment=EPISODE)
     assert quota._demand(HOTKEY, NOW) == POLICY.pool_seeds        # the group's own seeds, no more

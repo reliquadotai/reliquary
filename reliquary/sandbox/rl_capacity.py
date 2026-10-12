@@ -51,9 +51,9 @@ DEMAND_TTL_S = 30.0             # an open request (refused or waiting) counts as
 PRESENT_WINDOW_S = 120          # a token no machine report lists within this stops counting (the gateway refuses it later)
 ALLOCATION_REFRESH_S = 1.0      # the allocation is recomputed at most this often when only demand changed
 ASK_FORGET_S = 20.0             # a refused first open of a group waits its turn this long (FIFO by group)
-DEMAND_MEMORY_S = 600.0         # a key's demand is remembered, decaying linearly to zero over this, from when it was
-                                # last seen: a turnover (every group ending at once) never shows an idle fleet, and
-                                # a key that left frees its share within this
+DEMAND_MEMORY_S = 600.0         # what a key HELD (committed sessions) is remembered as demand, decaying linearly to
+                                # zero over this from when it was last held: a turnover (every group ending at once)
+                                # never shows an idle fleet, and a key that left frees its share within this
 
 # --- opens ---
 OPENS_PER_LIVE_PER_HOUR = 12        # turnovers an hour per allocated session: sessions as short as 5 min

@@ -180,6 +180,27 @@ async def test_a_raising_drain_at_stop_still_flushes_and_closes_the_ledger(tmp_p
     assert services.ledger._closed                                   # and the ledger is closed
 
 
+async def test_when_the_drain_and_the_close_both_raise_the_drains_error_wins(tmp_path, caplog):
+    import logging
+
+    services, _ = _services(tmp_path, yield_path=tmp_path / "rl-yield.sqlite3",
+                            window_uses=lambda w: WindowUses(aborted=False, used=frozenset()))
+
+    async def drain(timeout=None):
+        raise RuntimeError("a state write failed while draining")
+
+    def close():
+        raise OSError("the ledger file could not be closed")
+
+    services.issuer.drain = drain
+    real_close, services.ledger.close = services.ledger.close, close
+    with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match="draining"):
+        await services.stop()
+    assert "ledger not closed at shutdown" in caplog.text           # logged, never hiding the drain's error
+    services.ledger.close = real_close
+    services.ledger.close()
+
+
 def test_a_capacity_refusal_of_an_open_reaches_the_ledger(tmp_path):
     services, _ = _services(tmp_path, yield_path=tmp_path / "rl-yield.sqlite3")
     record = _record("s-1", sha=SHA)

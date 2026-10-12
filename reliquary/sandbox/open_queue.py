@@ -144,12 +144,16 @@ class OpenQueue:
                            retry_after=self._retry_after())
         if engagement is not None and any(ticket.engagement == engagement for ticket in tickets):
             return Refusal("open_queued", {"engagement": engagement}, retry_after=self._retry_after())
-        bound = self._max_per_key
+        bound, by = self._max_per_key, "per_key"
         if self._headroom is not None:
-            bound = min(bound, max(0, int(self._headroom(hotkey))))       # no free ticket at zero headroom
+            room = max(0, int(self._headroom(hotkey)))                     # no free ticket at zero headroom
+            if room < bound:
+                bound, by = room, "headroom"
         mine = sum(1 for ticket in tickets if ticket.key == key)
         if mine >= bound:
-            return Refusal("open_queue_key_full", {"waiting": mine, "max": bound}, retry_after=self._retry_after())
+            # ``bound``: what refused it, the key's own ticket maximum or the quota's room for it now
+            return Refusal("open_queue_key_full", {"waiting": mine, "max": bound, "bound": by},
+                           retry_after=self._retry_after())
         now = self._clock()
         self._forget(now)
         self._since.setdefault(key, now)

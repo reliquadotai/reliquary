@@ -161,7 +161,7 @@ def test_a_small_main_key_gets_its_weighted_share_under_contention_and_spare_whe
     assert shares["5Small"] == pytest.approx(shares["5Big"] / 100)          # weights 5 : 500
     alone = quota({"5Small": main_stats(5.0)})
     want(alone, "5Small", 100)                                              # 3 groups of 32 seeds and 4 of a 4th
-    assert alone.allocation().main["5Small"] == 3 * P + M                   # its demand by group, not the fleet
+    assert alone.allocation().main["5Small"] == 4 * P                       # by group (an asked one: its pool)
 
 
 def test_a_dormant_main_key_holds_nothing_and_one_with_no_recent_useful_rejoins_the_newcomers():
@@ -207,11 +207,11 @@ def test_the_allocation_follows_demand_within_its_refresh_and_the_ledger_at_once
                    clock=lambda: clock[0])
     for seed in range(50):
         q.refusal("5A", NOW, precommit_sha256=sha(seed // P), seed_index=seed % P)
-    assert q.allocation(NOW + 1).main["5A"] == 50
+    assert q.allocation(NOW + 1).main["5A"] == 2 * P                        # two groups asked: two pools
     for seed in range(96):
         q.refusal("5A", NOW + 1, precommit_sha256=sha(100 + seed // P), seed_index=seed % P)
-    assert q.allocation(NOW + 1).main["5A"] == 50                           # within the refresh: unchanged
-    assert q.allocation(NOW + 2).main["5A"] == 146
+    assert q.allocation(NOW + 1).main["5A"] == 2 * P                        # within the refresh: unchanged
+    assert q.allocation(NOW + 2).main["5A"] == 5 * P
     ledger.table, ledger.version = {"5A": WASTEFUL}, 1
     assert "5A" not in q.allocation(NOW + 2).main                           # a new snapshot: at once
 
@@ -548,3 +548,97 @@ def test_opens_between_two_recomputes_count_in_the_fleet_at_once():
         assert q._fleet_committed == 2 * P                       # counted as they opened, before any recompute
         hold(q, "5B", sha(102), 0)                                # a new group commits its M at once
         assert q._fleet_committed == 2 * P + M
+
+
+def test_at_a_full_fleet_a_started_groups_next_seed_still_joins_the_queue():
+    """C = 64 held by two keys, each with a full group and one started under M: the seeds those groups owe are in
+    the fleet's count already, so the queue's per-key bound (the quota's headroom) still takes them."""
+    from reliquary.sandbox.open_queue import OpenQueue, Ticket
+
+    q = quota({"5A": main_stats(100), "5B": main_stats(100)}, capacity=64)
+    want(q, "5A", 64, first=0)
+    want(q, "5B", 64, first=100)
+    for hotkey, first in (("5A", 0), ("5B", 100)):
+        for seed in range(M):
+            hold(q, hotkey, sha(first), seed)
+        hold(q, hotkey, sha(first + 1), 0)
+    q._alloc_key = None
+    q.allocation()
+    assert q._fleet_committed == 64
+    assert q.refusal("5A", NOW, precommit_sha256=sha(1), seed_index=1) is None      # never cut below M
+    assert q.headroom("5A", NOW) == M - 1                                           # what its group still owes
+    assert q.refusal("5A", NOW, precommit_sha256=sha(2), seed_index=0) is not None  # no new group: the fleet is full
+    queue = OpenQueue(rank=q.rank, headroom=lambda hotkey: q.headroom(hotkey, NOW))
+    assert isinstance(queue.join("5A", cls=("swe", 1, 1), engagement=f"rl:1:{sha(1)}:1"), Ticket)
+
+
+def test_over_generating_one_group_never_lets_a_key_hold_more_than_its_allocation():
+    """Groups started with one session each reserve their M: filling one to P while the others are short of M
+    cannot carry the key past its limit, and the other key's groups within its own allocation stay possible."""
+    q = quota({"5A": main_stats(100), "5B": main_stats(100)}, capacity=128)
+    want(q, "5A", 128, first=0)
+    want(q, "5B", 128, first=100)
+    limit = sessions_of(q.allocation().main["5A"])
+    assert limit == 64
+    for seed in range(M):
+        hold(q, "5A", sha(0), seed)
+    for g in (1, 2):
+        assert q.refusal("5A", NOW, precommit_sha256=sha(g), seed_index=0) is None
+        hold(q, "5A", sha(g), 0)                                  # started: each commits M (48 committed)
+    q._alloc_key = None
+    seed = M
+    while q.refusal("5A", NOW, precommit_sha256=sha(0), seed_index=seed) is None:
+        hold(q, "5A", sha(0), seed)                               # over-generate G0
+        seed += 1
+        q._alloc_key = None
+    for g in (1, 2):
+        for s in range(1, M):
+            assert q.refusal("5A", NOW, precommit_sha256=sha(g), seed_index=s) is None
+            hold(q, "5A", sha(g), s)                              # never cut below M
+    q._alloc_key = None
+    assert len(q._counted("5A", NOW)) <= limit                    # was 94 when sessions beyond M counted held only
+    for g in range(4):                                            # 5B: its four groups within its allocation of 64
+        assert q.refusal("5B", NOW, precommit_sha256=sha(100 + g), seed_index=0) is None
+        hold(q, "5B", sha(100 + g), 0)
+        q._alloc_key = None
+
+
+def test_a_burst_of_refused_asks_reserves_nothing_beyond_its_ttl():
+    """A key holding nothing asks for 2 000 sessions while another holds the fleet: refused. Its asks are demand
+    for DEMAND_TTL_S only, never remembered: 31 s later the other key's allocation is the whole fleet again."""
+    clock, capacity = {"now": NOW}, {"c": 256}
+    q = mutable_quota({"5A": main_stats(100), "5B": main_stats(100)}, capacity, clock)
+    want(q, "5B", 256, first=100)
+    for n in range(8):
+        for seed in range(P):
+            hold(q, "5B", sha(100 + n), seed)
+    q._alloc_key = None
+    want(q, "5A", 2_000, first=0)
+    assert q.refusal("5A", NOW, precommit_sha256=sha(0), seed_index=0) is not None
+    assert "5A" not in q._memory                                  # it held nothing: nothing to remember
+    clock["now"] = NOW + 31
+    want(q, "5B", 256, first=100, now=NOW + 31)
+    allocation = q.allocation(NOW + 31)
+    assert allocation.main.get("5A", 0.0) == 0.0 and allocation.main["5B"] == pytest.approx(256)
+
+
+def test_a_pooled_group_under_m_is_kept_once():
+    """A newcomer's group of one session commits M in the fleet's count: the pool's room kept from MAIN is its
+    allocation less that M, not less the one session (else M - 1 would be kept twice)."""
+    q = quota({"5A": main_stats(100)})
+    want(q, "5N", 2 * P, first=900)
+    hold(q, "5N", sha(900), 0)
+    q._alloc_key = None
+    alloc = q.allocation()
+    assert q._lane_committed[NEWCOMER] == M and q._fleet_committed == M
+    assert q._pool_room(alloc) == sessions_of(alloc.newcomer) - M
+
+
+def test_a_clock_stepping_back_never_raises_what_is_remembered():
+    clock, capacity = {"now": NOW}, {"c": C}
+    q = mutable_quota({"5A": main_stats(100)}, capacity, clock)
+    for seed in range(P):
+        hold(q, "5A", sha(0), seed)
+    q.allocation()
+    assert q._memory["5A"][0] == P
+    assert q._remembered("5A", 0, 0.0, NOW - 300) == P            # at most what it held, never more

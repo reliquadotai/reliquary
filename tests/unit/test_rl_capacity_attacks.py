@@ -489,7 +489,7 @@ def contended_loop(capacity, keys, life_s, *, hours=1.0, poll_s=5, retry_s=10, j
     """``keys``: {hotkey: (weight or None for a newcomer, ceiling in groups)}. A group lives ``life_s`` from its
     first session, times a fixed factor in ``1 +- jitter`` drawn from its precommit, and ends at the latest when
     its window closes (``window_s``: every group of every key turns over at once there). Returns, per poll from the
-    start, {hotkey: [(told, run, held)]} and the fleet's [held total]."""
+    start, {hotkey: [(told, run, held)]} and the fleet's [committed total] (each counted group at least M)."""
     from reliquary.miner.episode_mining import groups_to_run
     from reliquary.protocol.service_episode import rl_engagement
 
@@ -554,9 +554,12 @@ def contended_loop(capacity, keys, life_s, *, hours=1.0, poll_s=5, retry_s=10, j
                     group["seeds"].remove(seed)
         total = 0
         for h in order:
-            held = len(quota._counted(h, now))
-            total += held
-            trace[h].append((state[h]["told"], state[h]["run"], held))
+            rows = quota._counted(h, now)
+            groups = {}
+            for record in rows:
+                groups[quota._sha.get(record.session_id)] = groups.get(quota._sha.get(record.session_id), 0) + 1
+            total += sum(max(n, P32 // 2) for n in groups.values())   # committed: each group at least M
+            trace[h].append((state[h]["told"], state[h]["run"], len(rows)))
         fleet.append(total)
         clock.now += poll_s
     return trace, fleet

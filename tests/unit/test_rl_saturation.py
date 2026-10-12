@@ -700,8 +700,9 @@ def test_a_main_keys_groups_on_a_scarce_env_stay_within_its_share_of_that_env():
     quota = YieldQuota(ledger=Ledger(), pool_seeds=2, group_size=1, capacity=lambda: 800, clock=clock,
                        env_capacities=lambda: dict(caps), env_names={"x": "env-x", "env-x": "env-x",
                                                                      "y": "env-y", "env-y": "env-y"})
-    for seed in range(400):                                          # it asks for 400 sessions: allocated 400
-        quota.refusal("5Main", NOW, precommit_sha256=f"{seed:064x}", seed_index=0, environment="x")
+    for group in range(200):                                         # it asks for 400 sessions: allocated 400
+        for seed in range(2):                                        # (each group's pool of 2)
+            quota.refusal("5Main", NOW, precommit_sha256=f"{group:064x}", seed_index=seed, environment="x")
     for n in range(8):                                               # 8 groups (M = 1) already on env-x
         record = _record(f"s-{n}", sha=f"{n:064x}", hotkey="5Main", state=LIVE, issued_at=NOW, expires_at=NOW + 600)
         record.env = "env-x"

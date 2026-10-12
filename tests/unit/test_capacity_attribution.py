@@ -225,3 +225,20 @@ def test_a_machines_reported_load_is_its_used_slots_or_listed_sessions(tmp_path,
     asyncio.run(fleet.poll_once())
     assert fleet.reported_load((MACHINE,)) == load
     assert fleet.reported_load(("other",)) == 0
+
+
+@pytest.mark.parametrize("queue_kwargs, entitled, seen", [
+    ({"headroom": lambda hotkey: 0}, 8, ["open_queue_key_full"]),   # the quota's room refused it, within its share
+    ({"headroom": lambda hotkey: 0}, 1, []),                        # its operator holds beyond its allocations
+    ({"max_per_key": 0}, 8, []),                                    # its own tickets at the per-key maximum
+])
+def test_a_key_full_refusal_is_ours_only_when_the_quotas_room_refused_it_within_its_share(
+        tmp_path, queue_kwargs, entitled, seen):
+    env = build(tmp_path)
+    _q, listener = saturating(env, **queue_kwargs)
+    others_hold(env, 2, hotkey=HOTKEY)                   # 2 held: within an allocation of 8, beyond one of 1
+    env.issuer._entitled = lambda hotkey: entitled if hotkey == HOTKEY else 0
+    outcome = refused(env, 0)
+    assert outcome.reason == "open_queue_key_full"
+    assert outcome.detail["bound"] == ("headroom" if "headroom" in queue_kwargs else "per_key")
+    assert listener.seen == seen
