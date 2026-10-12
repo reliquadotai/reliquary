@@ -260,6 +260,49 @@ Needed from the user before the run (not for coding): a public R2 bucket for the
 observation files, an admin token for the internal endpoint, and the GPU
 qualification of forced seeds on Teutonic.
 
+## N. Batch, optimizer steps and learning rate: DECIDED (10-12)
+
+Starting setup for the run, to confirm at GPU qualification. The model gets an SFT stage
+before the RL.
+
+- **More data per checkpoint, fewer checkpoints.** Each published checkpoint carries about
+  8,000 rollouts per env (about 33,000 over four single-turn envs). That is 8 times today's
+  per-step batch: `B_BATCH` × 8, keeping the per-env ratios. M stays 16. Fewer checkpoints
+  means less for miners to download and fewer checkpoint switches to verify.
+- **4 optimizer steps per checkpoint, not 16.** Sixteen comes from DeepSeek-R1 by way of
+  DAPO and was never shown to be the best value. The two published comparisons point lower:
+  Magistral kept one step per generated batch after measuring a sharp loss when the batch
+  was split into more minibatches, and ScaleRL found 8 steps of lag to be the useful
+  maximum. MiniMax-M1 kept 16 and had to change the loss (CISPO) because PPO clipping
+  dropped rare tokens.
+- **Learning rate 2e-6.** Each step sees about 8,000 rollouts instead of about 1,000. Adam
+  scales with the square root of the batch (√8 ≈ 2.8 → about 2.8e-6). Start at 2e-6, linear
+  warm-up over the first 8 steps (2 checkpoints), then constant. Go to 3e-6 only if
+  qualification shows it is stable. Published RL runs stay between 1e-6 and 3e-6.
+- **Optimizer unchanged:** Adam 8-bit with fp32 master weights. A single huge step per
+  batch at a much higher learning rate is only safe with an optimizer that bounds the
+  update per matrix (Muon); it is not planned for this run. Adam β2 = 0.99 instead of
+  0.999 is to be tested at qualification, since the run makes a few hundred steps.
+- **Unchanged:** PPO clip 0.2 / 0.28, dual clip 10, KL 0.
+- **Window length is not chosen:** it follows from the miners' throughput and the
+  trainer's.
+- **Run length:** 50 to 100 checkpoints (200 to 400 steps), stopped when the evals plateau.
+- **Watched at qualification and during the run:**
+  - the share of PPO ratios clipped at the 4th step;
+  - KL between the trained policy and the policy that generated the window;
+  - entropy;
+  - reward slope per checkpoint;
+  - evals every 5 checkpoints.
+
+  If clipping is high at step 4, lower the learning rate or go to 2 steps.
+- **Code:** these are constants and environment settings:
+  - fill-closed picks per window;
+  - target groups per env;
+  - `B_BATCH`;
+  - learning rate and warm-up.
+
+  Check that the window journal's key range takes 4 picks of the larger batch.
+
 ## L. Multi-turn episodes: phase 2
 
 The service stack refuses episodes. Spec to write: one RL group = 16 signed sandbox
