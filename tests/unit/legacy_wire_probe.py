@@ -240,6 +240,74 @@ def single_turn_v2() -> dict:
     }
 
 
+def multi_turn_v2() -> dict:
+    """A multi-turn (signed-episode) order with nothing added to its schedule and no add request: the order and
+    schedule digests, the announcements, the public pool and a precommit, the runtime's events, envelope and
+    reconciled archive, the settlement record, its replay and the weights it pays."""
+    from types import SimpleNamespace
+
+    from reliquary.protocol.release_contract import canonical_json_bytes
+    from reliquary.protocol.service_schedule import initial_schedule
+    from reliquary.services.settlement import settle_window
+    from reliquary.shared.task_registry import MECHANISM_SERVICE_RL
+    from reliquary.validator.weight_only import WeightOnlyValidator
+    from tests.unit import test_service_runtime_v2 as rt_tests
+    from tests.unit.episode_v2_fixtures import EPISODE, episode_contract, episode_pool, episode_precommit
+    from tests.unit.service_v2_fixtures import MATH, contract_v2
+
+    contract = episode_contract()
+    schedule = initial_schedule(contract)
+    with tempfile.TemporaryDirectory() as tmp:
+        rt = rt_tests.build(Path(tmp) / "runtime.sqlite3", contract)
+        rt.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision="d" * 40)
+        rt_tests.open_window(rt, 1, pools={MATH: rt_tests.POOL, EPISODE: rt_tests.POOL})
+        try:
+            announcement = rt.announcement(window=1, randomness=rt_tests.WINDOW_BEACON)
+            per_env = {name: _sha(canonical_json_bytes(rt.announcement(window=1, randomness=rt_tests.WINDOW_BEACON,
+                                                                       environment=name)))
+                       for name in sorted(contract.environments)}
+            explored = rt_tests.explore(rt)
+            trained = rt_tests.train(rt, prompt=9)
+            events = [_without_ids(e) for _, e in rt.events(limit=10_000)]
+            envelope = rt.envelope(1)
+            reconciled = rt.reconcile_archive(rt_tests.archive(batch=[("t", MATH, 9)]), now=10_100.0)
+        finally:
+            rt.close()
+    settled_envelope = {"order_sha256": contract.sha256, "schedule": schedule.to_dict(),
+                        "schedule_sha256": schedule.sha256, "pools": {MATH: 0.25, EPISODE: 0.25}, "picks_target": 2,
+                        "batch_slots": 4, "checkpoint": {"checkpoint_n": 1, "repo": "models/test",
+                                                         "revision": "d" * 40, "sha256": "b" * 64}}
+    archive = {"window_start": 3, "window_status": "complete", "rewards_by_hotkey": {},
+               "batch": [{"hotkey": "a", "env_name": MATH, "prompt_idx": 0},
+                         {"hotkey": "b", "env_name": EPISODE, "prompt_idx": 1}]}
+    record = settle_window(archive=archive, envelope=settled_envelope, contract=contract,
+                           exploration={MATH: {"x": 1}}, aborted=False)
+    record = {**json.loads(json.dumps(record)), "task_id": "next-rl"}
+    declared = {"next-rl": SimpleNamespace(mechanism=MECHANISM_SERVICE_RL, service_contract=contract.to_dict(),
+                                           params={"cap": 0.5})}
+    replayed = WeightOnlyValidator._validated_service_archives([record], declared, geometry=(2, 4))
+    weights = WeightOnlyValidator._replay_ema(replayed, caps={"next-rl": 0.5}, service_tasks=frozenset({"next-rl"}))
+    return {
+        "contract_sha256": contract.sha256,
+        "contract_bytes": _sha(canonical_json_bytes(contract.to_dict())),
+        "schedule_sha256": schedule.sha256,
+        "schedule_bytes": _sha(canonical_json_bytes(schedule.to_dict())),
+        "single_turn_schedule_sha256": initial_schedule(contract_v2()).sha256,
+        "announcement": _sha(canonical_json_bytes(announcement)),
+        "announcement_per_env": per_env,
+        "pool": episode_pool(contract).sha256,
+        "precommit": episode_precommit(contract, hotkey="5Hot").sha256,
+        "explored": _json_sha(_without_ids(explored)),
+        "trained": _json_sha(_without_ids(trained)),
+        "events": _json_sha(events),
+        "envelope": _json_sha(envelope),
+        "reconciled": _json_sha(_without_ids(reconciled)),
+        "settled": _json_sha(record),
+        "replayed": _json_sha(replayed),
+        "weights": _json_sha(weights),
+    }
+
+
 # ------------------------------------------------------------------ registered environments
 
 def environments() -> dict:

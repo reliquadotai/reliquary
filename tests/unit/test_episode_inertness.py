@@ -262,6 +262,19 @@ def test_a_single_turn_v2_order_keeps_its_bytes(episode_wires):
     assert "signed-sandbox-episode/v1" not in now["supported_capabilities"]
 
 
+EPISODE_GOLDEN = Path(__file__).parent / "data" / "episode_wire_c66e21f1.json"
+
+
+@needs_default_profile
+def test_a_multi_turn_order_with_nothing_added_keeps_the_bytes_it_had_before_envs_could_be_added():
+    """Captured at c66e21f1 (before capacity, quotas and envs added to a running run): with no env added and no
+    add request, the order hash, the schedule, the announcements, the pool and precommit digests, the runtime's
+    events, envelope and reconciled archive, the settlement record, its replay and the weights it pays."""
+    from tests.unit import legacy_wire_probe
+
+    assert legacy_wire_probe.multi_turn_v2() == json.loads(EPISODE_GOLDEN.read_text())
+
+
 @needs_default_profile
 def test_a_legacy_proof_request_is_unchanged(legacy_wires):
     from tests.unit import legacy_wire_probe
