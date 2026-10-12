@@ -81,8 +81,18 @@ def validate_added(name: str, added: Any, existing: Mapping[str, Mapping[str, An
             raise ServiceContractError(f"{name}: episode.{field} {episode[field]} is above the order's {limit} "
                                        f"(the trainer is qualified for the order's episodes)")
     for other, entry in existing.items():
-        if other == name or not isinstance(entry, Mapping) or "episode" not in entry:
+        if other == name or not isinstance(entry, Mapping):
             continue
+        # One name space: an env is known by its name and its sandbox env (an open names the one, a session record
+        # stores the other), so an added env's name or sandbox env never equals another env's name or sandbox env.
+        if episode["sandbox_env"] == other:
+            raise ServiceContractError(f"{name}: sandbox env {episode['sandbox_env']} is the name of environment "
+                                       f"{other}; an added environment takes a sandbox env name of its own")
+        if "episode" not in entry:
+            continue
+        if entry["episode"]["sandbox_env"] == name:
+            raise ServiceContractError(f"{name}: the name is the sandbox env of environment {other}; an added "
+                                       f"environment takes a name of its own")
         if entry["episode"]["sandbox_env"] == episode["sandbox_env"]:
             raise ServiceContractError(f"{name}: sandbox env {episode['sandbox_env']} already serves {other}; an "
                                        f"added environment (a new version too) takes a new sandbox env name")

@@ -863,7 +863,8 @@ def find_environment_spec(name: str) -> EnvironmentSpec | None:
 
 
 def catalogue_environment_names() -> frozenset[str]:
-    return frozenset(_CATALOGUE_SPECS)
+    with _CATALOGUE_LOCK:                 # a check or install thread may register one meanwhile
+        return frozenset(_CATALOGUE_SPECS)
 
 
 def environment_catalog() -> Mapping[str, EnvironmentSpec]:

@@ -21,7 +21,7 @@ the whole's total), monotonic (more weight, or more demand, never lowers an enti
 from __future__ import annotations
 
 import math
-from collections.abc import Hashable, Mapping
+from collections.abc import Collection, Hashable, Mapping
 from typing import Any
 from dataclasses import dataclass, field
 
@@ -284,11 +284,13 @@ class SessionTiers:
         memory = max(int(policy.budgets_dict().get("memory_bytes", 0)), self._memory.get(environment, 0))
         return {"cpu_millis": self._cpu.get(environment), "memory_bytes": memory}
 
-    def reservations(self) -> dict[tuple[str, str], dict]:
+    def reservations(self, names: Collection[str] | None = None) -> dict[tuple[str, str], dict]:
         """{(sandbox env, env package): reservation} for ``Fleet.session_room``; two envs on one sandbox env and
-        package keep the larger reservation."""
+        package keep the larger reservation. ``names``: only these envs count (None: every env)."""
         found: dict[tuple[str, str], dict] = {}
         for name, policy in list(self._policies.items()):
+            if names is not None and name not in names:
+                continue
             key, mine = (policy.sandbox_env, policy.env_package), self.reservation(name)
             other = found.get(key)
             if other is not None:
