@@ -145,6 +145,11 @@ class BridgedEpisodeSource:
         """The image of one task (blocking: for activation's servable floor, in a worker thread)."""
         return self._resolver._cached(int(index)).image
 
+    def prepare_timeout_s(self, index: int) -> float | None:
+        """One task's prepare timeout as its gateway reads it (None: the sandbox's default; blocking: for
+        activation's token validity, in a worker thread)."""
+        return self._resolver._cached(int(index)).prepare_timeout_s
+
     def installed_identity(self) -> str:
         """The identity of the package installed NOW (its files on disk): activation checks that adding an env
         did not move an active one's."""

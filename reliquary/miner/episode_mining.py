@@ -5,7 +5,7 @@ Each poll reads the RL validator's ``/miner-state``: the window, its randomness,
 and, per environment, the prompt range, the cooldown and whether it accepts groups. It picks
 (environment, task) among the configured signed-episode environments (never a task in cooldown, nor one
 this miner already took in the window) and runs as many ``EpisodeGroupMiner.mine_task`` at once as the
-validator allocates to its hotkey (``GET /rl/sessions/allocation/{hotkey}``: its potential, in groups), never more
+validator allocates to its hotkey (``POST /rl/sessions/allocation``, signed by that hotkey: its potential, in groups), never more
 than its own ceiling ``groups_in_flight`` and never fewer than one (``groups_to_run``). When the announced checkpoint (revision) or
 order (contract sha) changes, no new group starts, the groups in flight are drained (bounded by
 ``drain_s``, then cancelled), the stack is closed and the process exits with ``EXIT_CHECKPOINT_CHANGED``

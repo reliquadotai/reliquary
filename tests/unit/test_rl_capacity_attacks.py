@@ -299,18 +299,19 @@ def test_an_unsigned_open_failed_is_waste_and_a_signed_one_is_not(tmp_path):
 
 
 def test_a_real_gateway_receipt_is_verified_by_the_fleet(tmp_path):
-    if not hasattr(attest, "open_refusal_valid"):
-        pytest.skip("this reliquary-sandbox does not sign open refusals yet")
-    from reliquary.sandbox.fleet import Fleet  # noqa: F401
+    """The pinned reliquary-sandbox verifies a receipt its gateway signs: a real signature, a real verifier."""
     from tests.unit.test_sandbox_fleet import make
 
     fleet, machine, _served, _clock = make(tmp_path)
     document = {"kind": "open_refusal", "machine_id": MACHINE, "key_id": machine.key_id, "session_id": "s-1",
                 "token_sha256": "a" * 64, "reason": "no_free_resources", "at": int(fleet._clock())}
     receipt = {"document": document, "signature": machine.sign(attest.OPEN_REFUSAL_DOMAIN, document)}
-    record = _record("s-1", sha=sha(7))
+    at = document["at"]
+    record = _record("s-1", sha=sha(7), issued_at=at - 60, expires_at=at + 600)   # signed while the token was valid
     record.machine_id, record.token_sha256 = MACHINE, "a" * 64
     assert fleet.open_refusal_valid(receipt, record)
+    edited = {**receipt, "document": {**document, "reason": "open_failed"}}     # the signature no longer covers it
+    assert not fleet.open_refusal_valid(edited, record)
     record.token_sha256 = "b" * 64
     assert not fleet.open_refusal_valid(receipt, record)
 
@@ -769,6 +770,25 @@ def _attesting_another_env(folder, req):
             "it attests another env package")
 
 
+def _attesting_another_image_lock(folder, req):
+    import hashlib
+    import json
+
+    from reliquary.services.schedule import raise_activation_problem
+    from reliquary.validator.catalogue_activation import attestation_problem
+    from tests.unit.test_schedule_add import ATTESTATION
+
+    pytest.importorskip("reliquary_sandbox_verifiers")
+    forged = json.loads(ATTESTATION)
+    forged["image_lock_sha256"] = "f" * 64                           # a passing gate of this env, under another lock
+    raw = json.dumps(forged, sort_keys=True).encode()
+    (folder / "conformance.json").write_bytes(raw)
+    for entry in req["add"].values():
+        entry["catalogue"]["conformance_sha256"] = hashlib.sha256(raw).hexdigest()   # its digest matches
+    return (lambda name, added, attestation: raise_activation_problem(name, attestation_problem(attestation, added)),
+            "it attests another image lock")
+
+
 def _named_like_a_launch_env(folder, req):
     from tests.unit.episode_v2_fixtures import ADDED, EPISODE
 
@@ -778,7 +798,8 @@ def _named_like_a_launch_env(folder, req):
     return lambda name, added, attestation: None, f"{EPISODE} is already in the schedule"
 
 
-@pytest.mark.parametrize("tamper", [_swapped_after_writing, _attesting_another_env, _named_like_a_launch_env])
+@pytest.mark.parametrize("tamper", [_swapped_after_writing, _attesting_another_env, _attesting_another_image_lock,
+                                    _named_like_a_launch_env])
 def test_a_refused_add_request_leaves_the_announcement_the_order_and_the_schedule_byte_identical(tmp_path, tamper):
     assert _announcement_after(tmp_path / "attacked", tamper) == _announcement_after(tmp_path / "plain", None)
 

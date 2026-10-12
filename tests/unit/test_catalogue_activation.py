@@ -13,6 +13,8 @@ pytest.importorskip("reliquary_sandbox_verifiers")
 from reliquary.protocol.service_contract import EPISODE_BUDGET_FIELDS
 from reliquary.sandbox.fleet import HEARTBEAT_MAX_AGE_S, Fleet
 from reliquary.validator.catalogue_activation import (
+    ACTIVATION_PREPARE_SAMPLE,
+    activation_prepare_timeout_s,
     ADDED_PACKAGES_FILE,
     NotYet,
     activation_problem,
@@ -67,7 +69,8 @@ def attestation(**overrides):
     """Shaped like a sandbox conformance gate report."""
     value = {"gate": True, "passed": True, "problems": [], "fake": False, "sample_size": 32, "repeat": 2,
              "env_package": ADDED_IDENTITY, "entry": f"verifiers:{ADDED_PACKAGE}", "split": "tmax",
-             "options": dict(OPTIONS), "gate_reasons": [], "env": "conformance-env"}
+             "options": dict(OPTIONS), "gate_reasons": [], "env": "conformance-env",
+             "image_lock_sha256": BLOCK["catalogue"]["image_lock_sha256"]}
     value.update(overrides)
     return value
 
@@ -101,6 +104,39 @@ class Source:
         return self._rows
 
 
+class Prepared(Source):
+    """A source whose tasks declare prepare timeouts."""
+
+    def __init__(self, prepare, **overrides):
+        super().__init__(**overrides)
+        self._prepare = prepare
+        self.prepare_reads = 0
+
+    def prepare_timeout_s(self, index):
+        self.prepare_reads += 1
+        return self._prepare(index)
+
+
+def test_the_activation_validity_uses_the_largest_prepare_timeout_of_the_split():
+    from reliquary.sandbox.sessions import DEFAULT_PREPARE_TIMEOUT_S
+
+    rows = BLOCK["environment"]["dataset"]["rows"]
+    late = min(rows, ACTIVATION_PREPARE_SAMPLE) - 1
+    source = Prepared(lambda i: 1500.0 if i == late else 300.0)
+    memo = {}
+    assert activation_prepare_timeout_s(source, memo) == 1500.0
+    reads = source.prepare_reads
+    assert activation_prepare_timeout_s(source, memo) == 1500.0 and source.prepare_reads == reads   # once per manifest
+    assert activation_prepare_timeout_s(Prepared(lambda i: 300.0)) == 300.0                # its own, not the default
+    assert activation_prepare_timeout_s(Prepared(lambda i: None)) == DEFAULT_PREPARE_TIMEOUT_S   # the sandbox default
+
+    def broken(index):
+        raise RuntimeError("unreadable")
+
+    assert activation_prepare_timeout_s(Prepared(broken)) == DEFAULT_PREPARE_TIMEOUT_S
+    assert activation_prepare_timeout_s(Source()) == DEFAULT_PREPARE_TIMEOUT_S             # a source that cannot tell
+
+
 def test_a_gate_report_of_this_exact_env_attests():
     assert attestation_problem(attestation(), BLOCK) is None
 
@@ -110,9 +146,17 @@ def test_a_gate_report_of_this_exact_env_attests():
     ({"fake": True}, "fake"), ({"sample_size": 4}, "sample"), ({"env_package": "x==1+g0.vfb2"}, "env package"),
     ({"entry": "verifiers:reliquary-terminal==0.2.0"}, "taskset"), ({"split": "rl"}, "split"),
     ({"options": {"tools": ["bash", "edit"]}}, "options"),
+    ({"image_lock_sha256": "0" * 64}, "another image lock"), ({"image_lock_sha256": None}, "another image lock"),
 ])
 def test_any_other_report_does_not(change, why):
     assert why in attestation_problem(attestation(**change), BLOCK)
+
+
+def test_a_report_without_its_image_lock_does_not_attest():
+    """A report from a sandbox that did not record the lock it ran under cannot bind the entry's lock."""
+    report = attestation()
+    del report["image_lock_sha256"]
+    assert "names no image lock" in attestation_problem(report, BLOCK)
 
 
 def test_the_attestation_must_be_an_object():

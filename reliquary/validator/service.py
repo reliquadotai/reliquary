@@ -2961,13 +2961,17 @@ class ValidationService:
         return {name: env.source for name, env in self.envs.items()
                 if callable(getattr(getattr(env, "source", None), "installed_identity", None))}
 
-    def _activation_validity_s(self, services, added: dict) -> int:
+    def _activation_validity_s(self, services, added: dict, source=None, memo: dict | None = None) -> int:
         """The token validity the issuer would give the added env's sessions (the machines' caps must allow
-        it): its open window and its wall time, the window lengthened for the default task preparation."""
+        it): its open window and its wall time, the window lengthened for its tasks' preparation (the largest
+        prepare timeout of the split's first tasks, ``activation_prepare_timeout_s``; the default without a
+        source). Blocking on a first read: worker threads only."""
         from reliquary.sandbox.sessions import DEFAULT_PREPARE_TIMEOUT_S, token_validity_s
+        from reliquary.validator.catalogue_activation import activation_prepare_timeout_s
 
+        prepare = DEFAULT_PREPARE_TIMEOUT_S if source is None else activation_prepare_timeout_s(source, memo)
         return token_validity_s(int(services.book.policy.open_window_s),
-                                int(added["environment"]["episode"]["budgets"]["wall_s"]), DEFAULT_PREPARE_TIMEOUT_S)
+                                int(added["environment"]["episode"]["budgets"]["wall_s"]), prepare)
 
     def _request_settled(self, store, request: dict) -> bool:
         """The store's status already says this request was applied or refused (its file is still there)."""
@@ -3051,9 +3055,10 @@ class ValidationService:
             services = getattr(self, "_episode_services", None)
             if why is None and services is not None and getattr(services, "fleet", None) is not None:
                 try:
+                    memo = self._activation_memo.setdefault(name, {})
                     machines_problem(services.fleet, added, source=environment.source,
-                                     validity_s=self._activation_validity_s(services, added),
-                                     memo=self._activation_memo.setdefault(name, {}))
+                                     validity_s=self._activation_validity_s(services, added, environment.source, memo),
+                                     memo=memo)
                 except Exception:
                     pass                    # a warm-up only: the boundary runs the real check
             with self._prestage_guard:
@@ -3273,11 +3278,12 @@ class ValidationService:
             raise_activation_problem(name, activation.NotYet(self._start_build(name, added)))
         policy = self._added_policy(name, added)
         try:
+            memo = self._activation_memo.setdefault(name, {})
             problem, environment = activation.activation_problem(
                 name, added, attestation, build=lambda config: environment, fleet=services.fleet,
                 allowed=allowed, active_sources=self._active_bridged_sources(), order=order, boot=boot,
-                current=current, validity_s=self._activation_validity_s(services, added),
-                memo=self._activation_memo.setdefault(name, {}))
+                current=current, validity_s=self._activation_validity_s(services, added, environment.source, memo),
+                memo=memo)
             if problem is None:
                 problem = self._added_env_problem(name, environment, policy)     # what the commit will do
         except Exception as exc:

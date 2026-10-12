@@ -47,13 +47,13 @@ wandb = [
 # Signed-episode sandboxes (plan 3). reliquary-sandbox is a PRIVATE repository:
 # third parties cannot install these extras until it is published (user decision).
 sandbox = [
-    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@c34575520a8885dd9343a4d1875a85a42df47d83",
+    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@60c2a2e5094d6aaf9d325d92fa843a0205fb9b66",
 ]
 sandbox-miner = [
-    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@c34575520a8885dd9343a4d1875a85a42df47d83",
+    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@60c2a2e5094d6aaf9d325d92fa843a0205fb9b66",
 ]
 sandbox-test = [
-    "reliquary-sandbox[service] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@c34575520a8885dd9343a4d1875a85a42df47d83",
+    "reliquary-sandbox[service] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@60c2a2e5094d6aaf9d325d92fa843a0205fb9b66",
 ]
 
 [project.scripts]

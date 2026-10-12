@@ -86,6 +86,14 @@ def test_the_options_digest_is_the_gateways():
     assert other.options_sha256 != source().options_sha256
 
 
+def test_a_tasks_prepare_timeout_is_the_resolved_one():
+    env = FakeEnv()
+    src = source(env)
+    assert src.prepare_timeout_s(3) == 900.0
+    asyncio.run(src.resolve(3))
+    assert env.sandbox_calls == 1                                  # one resolve serves both
+
+
 def test_a_taskset_without_len_is_counted_once():
     assert len(source(FakeEnv(rows=7, sized=False))) == 7
 
@@ -106,8 +114,7 @@ def test_the_lock_digest_is_the_sandboxs_canonical_one():
                    separators=(",", ":")).encode()).hexdigest()
     assert image_lock_sha256(images) == expected
     image_lock = pytest.importorskip("reliquary_sandbox_verifiers.image_lock")
-    if hasattr(image_lock.ImageLock, "sha256"):          # after the sandbox re-pin
-        assert image_lock.ImageLock(images=images).sha256() == expected
+    assert image_lock.ImageLock(images=images).sha256() == expected
 
 
 def test_the_lock_digest_matches_the_sandboxs_golden_vector():

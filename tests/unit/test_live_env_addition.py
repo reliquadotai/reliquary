@@ -132,6 +132,29 @@ def test_a_passing_activation_stages_the_env_built_ahead(tmp_path, monkeypatch):
     assert len(builds) == 1 and builds[0].startswith("added-env-build")     # in the background builder
 
 
+def test_the_machines_are_checked_for_the_token_the_envs_own_preparation_needs(tmp_path, monkeypatch):
+    """The issuer lengthens a token for its task's prepare timeout: activation asks the machines for that one."""
+    from reliquary.environment.signed_episode import SignedEpisodeEnvironment
+    from reliquary.sandbox.sessions import token_validity_s
+    from tests.unit.test_catalogue_activation import Prepared
+
+    monkeypatch.setattr(bridged_episode, "build_environment",
+                        lambda config: SignedEpisodeEnvironment(ADDED, Prepared(lambda i: 1500.0)))
+    seen = []
+    services = serving_services()
+    fleet = services.fleet
+    services.fleet = SimpleNamespace(**{**fleet.__dict__, "serving": lambda *a, **k: seen.append(k["validity_s"])
+                                        or ["m"]})
+    me, rt = validator(tmp_path, services=services)
+    allow(tmp_path)
+    me._service_schedule_store.write(add_request(rt))
+    prestaged(me)
+    me._catalogue_check(ADDED, BLOCK, attestation())
+    wall = int(BLOCK["environment"]["episode"]["budgets"]["wall_s"])
+    assert seen and set(seen) == {token_validity_s(120, wall, 1500.0)}
+    assert token_validity_s(120, wall, 1500.0) > token_validity_s(120, wall)       # longer than the default's
+
+
 def test_a_package_the_owner_did_not_allow_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(bridged_episode, "build_environment", lambda config: pytest.fail("built"))
     me, _ = validator(tmp_path, services=serving_services())

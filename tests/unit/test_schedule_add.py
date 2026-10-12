@@ -22,7 +22,9 @@ from tests.unit.service_v2_fixtures import MATH
 # A conformance gate report of exactly the added env (the format of the sandbox's conformance --report).
 ATTESTATION = json.dumps({"gate": True, "passed": True, "problems": [], "fake": False, "sample_size": 32,
                           "env_package": ADDED_IDENTITY, "entry": f"verifiers:{ADDED_PACKAGE}", "split": "tmax",
-                          "options": added_block()["catalogue"]["options"]}, sort_keys=True).encode()
+                          "options": added_block()["catalogue"]["options"],
+                          "image_lock_sha256": added_block()["catalogue"]["image_lock_sha256"]},
+                         sort_keys=True).encode()
 SHARES = {MATH: 4000, EPISODE: 3000, ADDED: 3000}
 
 

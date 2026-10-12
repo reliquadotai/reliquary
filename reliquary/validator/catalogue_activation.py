@@ -20,14 +20,16 @@ Then:
 
 5. the operator's attestation is a conformance GATE report of exactly this env (the format the sandbox's
    conformance ``--report`` writes): gate and passed true, no problem, real boxes, a full sample, the same env
-   package identity, taskset entry, split and options;
+   package identity, taskset entry, split and options, and the same image lock (``image_lock_sha256``: the
+   lock's identity is not part of the package's code identity, so a gate run under another lock does not attest);
 6. the env is installed on this validator: built through the bridge, its identity, image lock, manifest digest
    and row count are the entry's; its import module is exactly its distribution's and no active env's nor any
    order env's; and that module was not loaded earlier in this process at another identity (new files under a
    module already in memory need a validator restart);
 7. installing it moved no active bridged env: each one's package on disk still has its pinned identity;
 8. at least ``MIN_ACTIVATION_MACHINES`` fresh active machines could host its sessions (the open path's own
-   filter, its image aside: identity, options, image lock, tools, caps against its budgets, token validity), with
+   filter, its image aside: identity, options, image lock, tools, caps against its budgets, token validity: the
+   one the issuer gives the largest prepare timeout among the split's first tasks), with
    at least ``min(images, ACTIVATION_MIN_IMAGES)`` locked images present, and at least
    ``min(rows, ACTIVATION_MIN_SERVABLE_TASKS)`` tasks of its RL split are servable (their image is held by such a
    machine under its lock). Each task's image is read once per manifest (``memo``, at most
@@ -54,6 +56,7 @@ MIN_ACTIVATION_MACHINES = 1
 ACTIVATION_MIN_IMAGES = 32
 ACTIVATION_MIN_SERVABLE_TASKS = 256
 ACTIVATION_SCAN_MAX = 20_000
+ACTIVATION_PREPARE_SAMPLE = 256             # tasks whose prepare timeout sizes the activation's token validity
 ADDED_PACKAGES_FILE = "episode-packages.allow"
 MAX_ALLOW_FILE_BYTES = 64 * 1024
 EPISODE_LIMIT_FIELDS = ("max_episode_tokens", "max_turns", "max_tokens_per_turn")
@@ -332,6 +335,9 @@ def attestation_problem(attestation: Any, added: Mapping[str, Any]) -> str | Non
         (attestation.get("entry") == f"verifiers:{catalogue['package']}", "it attests another taskset"),
         (attestation.get("split") == catalogue["rl_split"], "it attests another split"),
         (digest is not None and _options_digest(attestation.get("options")) == digest, "it attests other options"),
+        ("image_lock_sha256" in attestation,
+         "it names no image lock (run the conformance suite with the pinned reliquary-sandbox)"),
+        (attestation.get("image_lock_sha256") == catalogue["image_lock_sha256"], "it attests another image lock"),
     )
     for ok, why in checks:
         if not ok:
@@ -427,6 +433,34 @@ def _servable(source: Any, images: frozenset[str], needed: int, memo: dict | Non
     return servable, sum(1 for image in known if image is None)
 
 
+def activation_prepare_timeout_s(source: Any, memo: dict | None = None) -> float:
+    """The prepare timeout that sizes the token validity activation checks the machines against: the largest
+    one among the RL split's first ``ACTIVATION_PREPARE_SAMPLE`` tasks (a task declaring none, or whose
+    resolve fails, counts the sandbox's default), so the machines must take the tokens the issuer will give
+    those tasks. Read once per manifest (``memo["prepare"] = (manifest, value)``, one atomic entry). A source
+    that cannot tell (no ``prepare_timeout_s``) gives the default."""
+    from reliquary.sandbox.sessions import DEFAULT_PREPARE_TIMEOUT_S
+
+    read = getattr(source, "prepare_timeout_s", None)
+    if not callable(read):
+        return float(DEFAULT_PREPARE_TIMEOUT_S)
+    manifest = source.manifest_sha256()
+    entry = None if memo is None else memo.get("prepare")
+    if entry is not None and entry[0] == manifest:
+        return entry[1]
+    largest = 0.0
+    for index in range(min(len(source), ACTIVATION_PREPARE_SAMPLE)):
+        try:
+            value = read(index)
+        except Exception:
+            value = None
+        largest = max(largest, float(DEFAULT_PREPARE_TIMEOUT_S if value is None else value))
+    largest = largest or float(DEFAULT_PREPARE_TIMEOUT_S)
+    if memo is not None:
+        memo["prepare"] = (manifest, largest)
+    return largest
+
+
 def machines_problem(fleet: Any, added: Mapping[str, Any], *, source: Any, validity_s: int,
                      now: float | None = None, memo: dict | None = None) -> str | None:
     """The fleet's part of the activation; a ``NotYet`` problem while the fleet's view is incomplete.
@@ -496,8 +530,9 @@ def activation_problem(name: str, added: Mapping[str, Any], attestation: Any, *,
     return None, environment
 
 
-__all__ = ["ACTIVATION_MIN_IMAGES", "ACTIVATION_MIN_SERVABLE_TASKS", "ACTIVATION_SCAN_MAX", "ADDED_PACKAGES_FILE",
-           "CONFORMANCE_GATE_SAMPLE", "EPISODE_LIMIT_FIELDS", "MIN_ACTIVATION_MACHINES", "NotYet",
-           "activation_problem", "allowed_packages", "attestation_problem", "before_import_problem", "budget_problem",
+__all__ = ["ACTIVATION_MIN_IMAGES", "ACTIVATION_MIN_SERVABLE_TASKS", "ACTIVATION_PREPARE_SAMPLE", "ACTIVATION_SCAN_MAX",
+           "ADDED_PACKAGES_FILE", "CONFORMANCE_GATE_SAMPLE", "EPISODE_LIMIT_FIELDS", "MIN_ACTIVATION_MACHINES",
+           "NotYet", "activation_prepare_timeout_s", "activation_problem", "allowed_packages", "attestation_problem",
+           "before_import_problem", "budget_problem",
            "identities_problem", "install_problem", "install_set_problem", "installed_distributions",
            "machines_problem", "module_problem", "name_problem", "package_problem", "transient_error"]
