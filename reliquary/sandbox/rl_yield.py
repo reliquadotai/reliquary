@@ -98,6 +98,7 @@ NO_VERDICT_STAGES = frozenset({
     "episode_policy_stale", "episode_unserved", "episode_group_in_flight", "episode_checks_in_flight",
     "episode_prompt_source", "admission_drain"})
 GRADED = "graded"
+WITHDRAWN = "withdrawn"           # the session book's closed status of a withdrawal (``sessions.WITHDRAWN``)
 MACHINE_FINALS = frozenset({GRADED, "expired", "box_failed", "budget_exhausted", "aborted", "handed_back"})
 """Closed statuses of a machine-signed final: the session's box ran. Anything else (a lapse with None, an
 ``open_failed``, a withdrawal, a drain) may be a token never presented to a machine."""
@@ -504,6 +505,24 @@ def held_seconds(record: Any, now: float, *, presented: bool | None = None) -> f
     if expires is not None:
         end = min(float(end), float(expires))
     return max(0.0, float(end) - float(getattr(record, "issued_at", end)))
+
+
+def judged_status(record: Any) -> str | None:
+    """The closed status the ledger judges a session by: its machine's signed final (``ended_status``) when the
+    miner withdrew it after that final (a withdrawal rewrites ``closed_status``), else its ``closed_status``. A graded
+    session withdrawn because its group could not form stays graded for the capacity verdict; a withdrawal never
+    makes a session graded that was not, and every other status (a hand-back, a drained machine) is kept."""
+    status = getattr(record, "closed_status", None)
+    ended = getattr(record, "ended_status", None)
+    if status == WITHDRAWN and ended is not None:
+        return str(ended)
+    return status
+
+
+def decision_row(record: Any, now: float, *, presented: bool | None = None) -> tuple:
+    """``decide``'s row of a session: ``(session_id, state, status, fault, held seconds)``."""
+    return (record.session_id, record.state, judged_status(record), getattr(record, "fault", None),
+            held_seconds(record, now, presented=presented))
 
 
 CAPACITY_REASONS = CAPACITY_REFUSALS

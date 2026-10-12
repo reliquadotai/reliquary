@@ -298,8 +298,11 @@ def test_the_box_end_is_the_first_close_with_the_machines_final_and_a_withdrawal
     assert close(env, grant, "graded", reason="withdraw")["status"] == "withdrawn"
     assert record.closed_at == record.issued_at + 900 and record.ended_at == record.issued_at + 300
     assert held_seconds(record, clock.now + 5_000) == 300.0
+    assert record.ended_status == "graded"                            # its machine's final, kept by the withdrawal
+    assert SessionRecord.from_document(record.to_document()) == record
     failed = open_(env, 1)
     close_failed(env, failed)
     failed = env.book.get(failed.session_id)
     assert failed.ended_at is None and held_seconds(failed, clock.now + 5_000) == 0.0
+    assert failed.ended_status is None and "ended_status" not in failed.to_document()
     assert held_seconds(failed, clock.now + 5_000, presented=True) == failed.closed_at - failed.issued_at

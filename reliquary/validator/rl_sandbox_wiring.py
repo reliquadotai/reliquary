@@ -36,7 +36,7 @@ from reliquary.protocol.service_episode import GROUPS_IN_FLIGHT
 from reliquary.sandbox.rl_engagements import (
     EpisodeEnvironmentView, NoOutcomes, OpenQuota, RlEpisodeEngagements, SessionOutcomes, SessionQuota,
 )
-from reliquary.sandbox.rl_yield import held_seconds
+from reliquary.sandbox.rl_yield import decision_row
 from reliquary.sandbox.sessions import FanOutEvents, Refusal, SandboxPolicy, SessionBook, SessionIssuer
 from reliquary.validator.corpus_registration import NOT_REGISTERED
 from reliquary.validator.episode_admission import EpisodeGroupChecker
@@ -809,8 +809,7 @@ class RlEpisodeServices:
                 for sha in ledger.precommits_of(window):
                     if sha in held:
                         continue
-                    rows = [(r.session_id, r.state, r.closed_status, getattr(r, "fault", None),
-                             held_seconds(r, now, presented=_presented(reported, r.session_id)))
+                    rows = [decision_row(r, now, presented=_presented(reported, r.session_id))
                             for r in self.book.of_precommit(sha)]
                     task = ledger.task_of(sha)
                     decided += ledger.decide(sha, rows, used=task in used,

@@ -16,7 +16,7 @@ from reliquary.sandbox.rl_capacity import (  # noqa: E402
     LOW_YIELD, MAIN, NEWCOMER, YieldStats, entity_sizes, sessions_of,
 )
 from reliquary.sandbox.rl_quota import YieldQuota  # noqa: E402
-from reliquary.sandbox.rl_yield import LedgerEvents, SessionYieldLedger, held_seconds  # noqa: E402
+from reliquary.sandbox.rl_yield import LedgerEvents, SessionYieldLedger, decision_row, held_seconds  # noqa: E402
 from reliquary.sandbox.sessions import (  # noqa: E402
     LAPSED, LIVE, SUBMITTED, FanOutEvents, Grant, SandboxPolicy, SessionBook, SessionRecord,
 )
@@ -369,8 +369,9 @@ def refused_open(env, seed):
 
 def decided_of(env, ledger):
     precommit = env.precommit.sha256
-    ledger.decide(precommit, [(r.session_id, r.state, r.closed_status, r.fault) for r in env.book.of_precommit(precommit)],
-                  used=False, aborted=False, now=time.time(), group_size=M)
+    now = time.time()
+    ledger.decide(precommit, [decision_row(r, now) for r in env.book.of_precommit(precommit)],   # (the wiring's rows)
+                  used=False, aborted=False, now=now, group_size=M)
     ledger.flush()
     return ledger.stats(HOTKEY).decided
 
@@ -954,3 +955,49 @@ def test_abandoning_a_group_after_a_key_full_refusal_is_waste(tmp_path):
     assert open_(env, 3).reason == "open_queue_key_full"
     assert env.precommit.sha256 not in ledger._verdicts
     assert decided_of(env, ledger) == 3                            # abandoned under M: waste
+
+
+# --- a graded session the miner withdraws keeps its machine's final for the capacity verdict --------------------
+
+@pytest.mark.parametrize("cause", ["others_saturation", "no_refusal", "self_made_saturation", "key_full"])
+def test_graded_sessions_withdrawn_after_the_group_could_not_form(tmp_path, cause):
+    """Three graded sessions (fewer than M), then the miner withdraws them (the reference miner withdraws every
+    kept episode of a group it cannot send). Its withdrawal rewrites their closed status, never their machine's
+    final: under others' saturation (a capacity verdict) they stay neutral; with no capacity refusal, a saturation
+    of its own making or a key-full refusal, the abandoned group stays waste."""
+    env, ledger = saturating(tmp_path)
+    if cause == "key_full":
+        env.issuer._queue = OpenQueue(rank=lambda hotkey: (hotkey, 1.0, False), headroom=lambda hotkey: 0,
+                                      wait_s=0.05, fair_every=0)
+    grants = [open_(env, seed) for seed in range(3)]
+    for grant in grants:
+        assert close(env, grant, "graded")["state"] == "closed_graded"
+    if cause == "others_saturation":
+        others_fill_the_machine(env)
+        refused_open(env, 3)
+    elif cause == "self_made_saturation":
+        others_fill_the_machine(env, hotkey=HOTKEY, precommit="e" * 64)
+        refused_open(env, 3)
+    elif cause == "key_full":
+        others_fill_the_machine(env)
+        env.issuer._fleet.placement = None
+        assert open_(env, 3).reason == "open_queue_key_full"
+    for grant in grants:
+        assert close(env, grant, "graded", reason="withdraw")["status"] == "withdrawn"
+        record = env.book.get(grant.session_id)
+        assert (record.closed_status, record.ended_status) == ("withdrawn", "graded")
+    assert (env.precommit.sha256 in ledger._verdicts) is (cause == "others_saturation")
+    assert decided_of(env, ledger) == (0 if cause == "others_saturation" else 3)
+
+
+def test_a_withdrawal_never_makes_a_session_graded_that_was_not():
+    from reliquary.sandbox.rl_yield import judged_status
+
+    def record(closed_status, ended_status):
+        return SimpleNamespace(closed_status=closed_status, ended_status=ended_status)
+
+    assert judged_status(record("withdrawn", "graded")) == "graded"
+    assert judged_status(record("withdrawn", "expired")) == "expired"
+    assert judged_status(record("withdrawn", None)) == "withdrawn"          # no machine final (corpus, older records)
+    assert judged_status(record("handed_back", "graded")) == "handed_back"  # every other status is kept
+    assert judged_status(record("graded", "graded")) == "graded"

@@ -380,8 +380,9 @@ _FIELD_CHECKS: dict[str, Callable[[Any], bool]] = {
     "closed_at": lambda v: v is None or _is_int(v),
     "fault": lambda v: v is None or (_is_str(v) and 0 < len(v) <= 64),
     "ended_at": lambda v: v is None or _is_int(v),
+    "ended_status": lambda v: v is None or (_is_str(v) and 0 < len(v) <= 64),
 }
-_OPTIONAL_FIELDS = ("fault", "ended_at")      # absent from a document when None
+_OPTIONAL_FIELDS = ("fault", "ended_at", "ended_status")      # absent from a document when None
 
 
 @dataclass
@@ -412,6 +413,10 @@ class SessionRecord:
     # open). A submission or a withdrawal later moves ``closed_at`` (a withdrawal also ``closed_status``) but
     # never this, so the yield weight never counts an unsubmitted tail, and a box that ran is known to have run.
     ended_at: int | None = None
+    # RL only: the status of that machine's signed final (``graded``, ``expired``...), set with ``ended_at``. A
+    # withdrawal rewrites ``closed_status`` to ``withdrawn``, never this: the yield ledger judges by it whether the
+    # session's box ended graded (a group that could not form for capacity keeps its graded sessions neutral).
+    ended_status: str | None = None
 
     def to_document(self) -> dict:
         document = {"schema": SESSION_SCHEMA, **asdict(self)}
@@ -1454,6 +1459,7 @@ class SessionIssuer:
                 settled.fault = fault                    # before the record is persisted
             if settled is not None and self._record_faults and settled.ended_at is None and final is not None:
                 settled.ended_at = now                   # its box's end, never moved by a submission or withdrawal
+                settled.ended_status = str(final.get("status") or status)[:64]
         if settled is not None:
             self._event("closed", settled, final)
             self._settled((settled,))

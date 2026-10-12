@@ -1177,8 +1177,9 @@ async def test_the_production_rl_configuration_end_to_end(production_gateway, r2
             for record in sessions_of(services, hotkey).values():
                 assert record.ended_at == first_close[record.session_id]
                 if record.session_id == refused_box["session_id"]:
-                    assert record.ended_at is None
+                    assert record.ended_at is None and record.ended_status is None
                     continue
+                assert record.ended_status == "graded"         # its machine's final (a withdrawal never moves it)
                 assert record.ended_at is not None and record.closed_at >= record.ended_at
                 assert held_given[record.session_id] == record.ended_at - record.issued_at
         # The demand memory: each key's demand is remembered at what it held once its group ended.
