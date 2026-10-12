@@ -38,7 +38,7 @@ METHODS = ("_added_digest", "_added_policy", "_catalogue_check", "_prestage_requ
            "_stage_added_envs", "_install_env", "_uninstall_env", "_install_added_envs", "_commit_staged_envs",
            "_all_env_mix", "_activation_validity_s", "_request_settled", "_added_spec_problem", "_added_env_problem",
            "_prebuilt_for", "_build_failure", "_start_build", "_build_job", "_join_builds", "_added_unavailable",
-           "_added_served", "_retry_added_builds", "_evict_unwanted_builds", "_deactivate_added_envs",
+           "_added_served", "_added_failed_attempt", "_added_now", "_supersede_pending_request", "_retry_added_builds", "_evict_unwanted_builds", "_deactivate_added_envs",
            "_replan_without", "_service_installed_version", "_service_environment_problem",
            "_service_activation_version", "_require_service_environments", "_open_service_window")
 WAIT = 10.0
@@ -706,13 +706,64 @@ def test_an_unloaded_added_env_is_retried_with_a_backoff(tmp_path, monkeypatch):
 
     monkeypatch.setattr(bridged_episode, "build_environment", broken)
     me, rt = validator(tmp_path)
+    clock = SimpleNamespace(now=100.0)
+    me._added_clock = lambda: clock.now
     schedule = add_to_schedule(rt, active=False)
-    me._added_unavailable(ADDED, "gone", now=100.0)
-    assert me._retry_added_builds(schedule, now=100.0 + service.ADDED_RETRY_MIN_S - 1) == []
-    assert me._retry_added_builds(schedule, now=100.0 + service.ADDED_RETRY_MIN_S + 1) == [ADDED]
+    me._added_unavailable(ADDED, "not built yet")                   # no attempt yet: a retry is due now
+    me._added_unavailable(ADDED, "not built yet")                   # never moved by a second call
+    assert me._added_retry[ADDED] == (0, 100.0)
+    assert me._retry_added_builds(schedule) == [ADDED]
+    assert me._retry_added_builds(schedule) == []                    # spent: one build per scheduled retry
     assert me._join_builds(WAIT) and builds == [1]
-    me._added_unavailable(ADDED, "gone", now=200.0)
-    assert me._added_retry[ADDED][1] == 200.0 + 2 * service.ADDED_RETRY_MIN_S          # doubled
+    assert me._added_retry[ADDED] == (1, 100.0 + service.ADDED_RETRY_MIN_S)        # the failed build counts
+    me._added_unavailable(ADDED, "gone")                             # a boundary: the retry is not moved
+    assert me._added_retry[ADDED] == (1, 100.0 + service.ADDED_RETRY_MIN_S)
+    clock.now = 100.0 + service.ADDED_RETRY_MIN_S
+    assert me._retry_added_builds(schedule) == [ADDED]
+    assert me._join_builds(WAIT) and builds == [1, 1]
+    assert me._added_retry[ADDED] == (2, clock.now + 2 * service.ADDED_RETRY_MIN_S)  # doubled per failure
+    for _ in range(20):
+        me._added_failed_attempt(ADDED)
+    assert me._added_retry[ADDED][1] == clock.now + service.ADDED_RETRY_MAX_S       # capped
+
+
+def test_after_an_outage_an_unloaded_env_is_built_and_loaded_within_one_backoff(tmp_path, monkeypatch):
+    """Network down 3 h, prestage tick every 30 s, boundary every 300 s, simulated clock over 8 h: the env is
+    loaded within one backoff of the network coming back, and at most one build runs per scheduled retry."""
+    outage, end = 3 * 3600.0, 8 * 3600.0
+    clock = SimpleNamespace(now=0.0)
+    starts = []
+
+    def build(config):
+        starts.append(clock.now)
+        if clock.now < outage:
+            raise ConnectionError("network down")
+        return built()
+
+    monkeypatch.setattr(bridged_episode, "build_environment", build)
+    me, rt = validator(tmp_path)
+    me._added_clock = lambda: clock.now
+    schedule = add_to_schedule(rt, active=False)
+    me._added_unavailable(ADDED, "the boot could not build it")
+    loaded_at, deadlines = None, set()
+    while clock.now <= end and loaded_at is None:
+        due = me._added_retry.get(ADDED, (0, None))[1]
+        if me._retry_added_builds(schedule):                    # the prestage tick
+            deadlines.add(due)
+        assert me._join_builds(WAIT)
+        if int(clock.now) % 300 == 0:                           # a boundary
+            me._stage_added_envs(schedule, window=int(clock.now // 300) + 2)
+            assert me._join_builds(WAIT)
+            for name, environment in list(me._staged_envs.items()):
+                me._install_env(name, environment)
+                me._staged_envs.pop(name)
+                loaded_at = clock.now
+        clock.now += 30.0
+    assert loaded_at is not None and loaded_at <= outage + service.ADDED_RETRY_MAX_S + 300
+    assert len(starts) == len(deadlines)                         # one build per scheduled retry
+    gaps = [b - a for a, b in zip(starts, starts[1:])]
+    assert all(gap >= service.ADDED_RETRY_MIN_S for gap in gaps)  # never rebuilt every 30 s
+    assert len(starts) <= 12 and ADDED in me.envs
 
 
 def test_at_a_boundary_an_unloaded_inactive_env_is_left_and_an_active_one_switched_off(tmp_path, monkeypatch):
@@ -737,6 +788,8 @@ def test_the_boundary_runs_the_services_check_on_an_env_it_stages(tmp_path, monk
     me._episode_services.add_check = lambda name, env, policy: "names two envs"
     me._stage_added_envs(rt.schedule, window=2)
     assert me._staged_envs == {} and ADDED not in me._prebuilt
+    attempts, due = me._added_retry[ADDED]
+    assert attempts == 1 and due < float("inf")                   # a failed attempt: retried after a backoff
 
 
 # ---------------------------------------------------------------- through the runtime (the boundary's path)
@@ -1074,9 +1127,80 @@ def test_an_inactive_added_env_still_building_is_left_alone_at_the_boundary(tmp_
     try:
         me._retry_added_builds(schedule)
         me._stage_added_envs(schedule, window=2)
-        assert me._added_retry == {} and me._added_alerts == {}            # no failure counted
+        assert me._added_retry[ADDED][0] == 0 and me._added_alerts == {}   # no failure counted
     finally:
         release.set()
     assert me._join_builds(WAIT)
     me._stage_added_envs(schedule, window=3)
     assert ADDED in me._staged_envs and len(builds) == 1
+
+
+def test_a_request_whose_revision_an_auto_deactivation_took_is_refused_saying_so(tmp_path, caplog):
+    me, rt = validator(tmp_path)
+    add_to_schedule(rt, active=True)
+    store = me._service_schedule_store
+    pending = build_request(order_sha256=rt.contract.sha256, revision=rt.schedule.revision + 1, cooldowns={MATH: 10})
+    store.write(pending)
+    with caplog.at_level(logging.ERROR):
+        me._deactivate_added_envs({ADDED: "broken"}, 2)
+    status = store.status()
+    assert status["request_id"] == pending["request_id"] and status["status"] == "refused"
+    assert "superseded by auto-deactivate" in status["detail"]
+    assert f"resubmit against revision {rt.schedule.revision + 1}" in status["detail"]
+    assert "superseded by auto-deactivate" in caplog.text
+    rt.apply_pending_schedule_request(store, window=3)                    # recorded: never read again
+    assert store.status()["detail"] == status["detail"]
+
+
+def test_a_request_for_a_later_revision_is_left_alone_by_an_auto_deactivation(tmp_path):
+    me, rt = validator(tmp_path)
+    add_to_schedule(rt, active=True)
+    store = me._service_schedule_store
+    pending = build_request(order_sha256=rt.contract.sha256, revision=rt.schedule.revision + 2, cooldowns={MATH: 10})
+    store.write(pending)
+    me._deactivate_added_envs({ADDED: "broken"}, 2)
+    assert store.status() is None or store.status().get("request_id") != pending["request_id"]
+
+
+async def test_an_added_env_unloaded_at_boot_keeps_its_cooldown_from_the_snapshot(tmp_path, monkeypatch):
+    from reliquary.validator.cooldown import ContentCooldownMap, CooldownMap
+
+    me, rt = validator(tmp_path)
+    add_to_schedule(rt, active=False)
+    me.envs = {MATH: object()}                                      # ADDED could not be loaded at boot
+    me._cooldown_per_env = {MATH: CooldownMap(cooldown_windows=3), ADDED: CooldownMap(cooldown_windows=10)}
+    me._content_cooldown_per_env = {MATH: ContentCooldownMap(cooldown_windows=3),
+                                    ADDED: ContentCooldownMap(cooldown_windows=10)}
+    me._window_n = 5
+    snapshot = cooldown_snapshot(5, [MATH, ADDED])
+    snapshot["envs"][ADDED] = {"4": 3}
+
+    async def no_remote(*a, **k):
+        return None
+
+    me._snapshot_optional_envs = types.MethodType(ValidationService._snapshot_optional_envs, me)
+    me._validate_cooldown_snapshot = ValidationService._validate_cooldown_snapshot
+    monkeypatch.setattr(service, "_read_gzip_json", lambda path: snapshot)
+    monkeypatch.setattr(service.storage, "download_json", no_remote)
+    await ValidationService._rebuild_cooldown_from_history(me)
+    assert me._cooldown_per_env[ADDED].export_state() == {4: 3}
+    kept = me._cooldown_per_env[ADDED]
+    me._install_env(ADDED, built())                                   # loaded later: the map is kept as is
+    assert me._cooldown_per_env[ADDED] is kept
+
+
+def test_the_boot_keeps_cooldown_maps_for_added_envs_it_could_not_load():
+    source = inspect.getsource(ValidationService.__init__)
+    assert "unloaded = [name for name in schedule.added_environments() if name not in self.envs]" in source
+    assert "for name in [*self.envs, *unloaded]:" in source
+
+
+def test_a_build_the_dry_run_refuses_is_a_failed_attempt(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridged_episode, "build_environment", lambda config: built())
+    services = serving_services()
+    services.environment_refusal = lambda policy: "renderer stop ids [9] are outside"
+    me, rt = validator(tmp_path, services=services)
+    schedule = add_to_schedule(rt, active=False)
+    assert me._retry_added_builds(schedule) == [ADDED] and me._join_builds(WAIT)
+    attempts, due = me._added_retry[ADDED]
+    assert attempts == 1 and due < float("inf") and me._retry_added_builds(schedule) == []

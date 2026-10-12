@@ -618,6 +618,27 @@ class ServiceRuntime:
                              f"{left:.0f} s"), revision=revision)
         return True
 
+    def refuse_schedule_request(self, store, request_id: str, detail: str, *, window: int,
+                                now: float | None = None) -> bool:
+        """Record a pending request as refused, with ``detail``, without reading it again: one that can never
+        apply (its revision was taken by a schedule this process appended). False when its id was handled
+        already. Clears its wait and reports the status."""
+        _identifier(request_id, "request_id")
+        _integer(window, "window", 0)
+        order, at = self.order_contract.sha256, _instant(now)
+        with self.lock:
+            with self._txn():
+                known = self.db.execute("SELECT 1 FROM service_schedule_requests WHERE order_id=? AND request_id=?",
+                                        (order, request_id)).fetchone()
+                if known is not None:
+                    return False
+                revision = self._schedule().revision
+                self.db.execute("INSERT INTO service_schedule_requests VALUES(?,?,?,?,?,?,?)",
+                                (order, request_id, "refused", detail, revision, window, at))
+                self.db.execute("DELETE FROM service_schedule_waits WHERE order_id=?", (order,))
+        store.report(request_id, status="refused", detail=detail, revision=revision)
+        return True
+
     def _withdraw_waits(self, store, revision: int) -> None:
         """The request file is gone: a request that was waiting is withdrawn (its wait row goes, its status
         says so). Nothing is written when nothing waited."""

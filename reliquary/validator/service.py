@@ -1233,7 +1233,10 @@ class ValidationService:
             # A service env cools down for what its live schedule says, so the
             # history restored at startup is kept over that horizon.
             schedule = self._service_runtime.schedule
-            for name in self.envs:
+            # An env the schedule added that this boot could not load keeps its cooldown too: restored from
+            # the snapshot, replayed, snapshotted again, and used as it is once the env is installed.
+            unloaded = [name for name in schedule.added_environments() if name not in self.envs]
+            for name in [*self.envs, *unloaded]:
                 if name in self._service_runtime.contract.environments:
                     horizon = schedule.cooldown_windows(name)
                     self._cooldown_per_env[name] = CooldownMap(cooldown_windows=horizon)
@@ -3010,10 +3013,15 @@ class ValidationService:
             failure = self._build_failures.get(name)
         return failure[1:] if failure is not None and failure[0] == digest else None
 
+    def _added_now(self) -> float:
+        """The clock of the added envs' builds and retries (monotonic; a test may set ``_added_clock``)."""
+        clock = getattr(self, "_added_clock", None)
+        return float(clock()) if clock is not None else time.monotonic()
+
     def _start_build(self, name: str, added: dict, *, now: float | None = None) -> str:
         """Build ``added`` in a background thread unless one is building ``name`` already (one claim per env,
         shared by the prestage, the boundary and the boot). Never blocks; returns what the build is doing."""
-        now = time.monotonic() if now is None else float(now)
+        now = self._added_now() if now is None else float(now)
         digest = self._added_digest(added)
         with self._prestage_guard:
             claim = self._builds.get(name)
@@ -3054,6 +3062,7 @@ class ValidationService:
                 elif name not in self.envs:
                     self._prebuilt[name] = (digest, environment)
             if why is not None:
+                self._added_failed_attempt(name)
                 logger.error("service environment %s built for the run cannot be served here: %s", name, why)
         except Exception as exc:
             transient = transient_error(exc)
@@ -3061,6 +3070,7 @@ class ValidationService:
                       else f"not installed on this validator ({type(exc).__name__}: {exc})")
             with self._prestage_guard:
                 self._build_failures[name] = (digest, reason, transient)
+            self._added_failed_attempt(name)
             logger.error("service environment %s for the run: %s", name, reason)
         finally:
             with self._prestage_guard:
@@ -3079,12 +3089,26 @@ class ValidationService:
         with self._prestage_guard:
             return not any(claim[2].is_alive() for claim in self._builds.values())
 
-    def _added_unavailable(self, name: str, reason: str, *, now: float | None = None) -> None:
-        """An added env this validator cannot serve now: an ALERT (once per reason), and its next background
-        build after a backoff (ADDED_RETRY_MIN_S, doubling up to ADDED_RETRY_MAX_S)."""
-        now = time.monotonic() if now is None else float(now)
-        attempts, _ = self._added_retry.get(name, (0, now))
-        self._added_retry[name] = (attempts + 1, now + min(ADDED_RETRY_MAX_S, ADDED_RETRY_MIN_S * 2 ** attempts))
+    def _added_failed_attempt(self, name: str, *, now: float | None = None) -> None:
+        """A build (or the install of a build) of an added env failed: one attempt more, and its next build
+        after ADDED_RETRY_MIN_S doubling per failed attempt, at most ADDED_RETRY_MAX_S."""
+        now = self._added_now() if now is None else float(now)
+        with self._prestage_guard:
+            attempts = self._added_retry.get(name, (0, now))[0] + 1
+            self._added_retry[name] = (attempts, now + min(ADDED_RETRY_MAX_S,
+                                                           ADDED_RETRY_MIN_S * 2 ** min(attempts - 1, 32)))
+
+    def _added_unavailable(self, name: str, reason: str, *, attempt: bool = False,
+                           now: float | None = None) -> None:
+        """An added env this validator cannot serve now: an ALERT (once per reason) and a background retry.
+        ``attempt``: a build of it just failed here (its install or its checks), which counts and backs off;
+        otherwise a retry already scheduled is never moved, and one is scheduled now when there is none."""
+        now = self._added_now() if now is None else float(now)
+        if attempt:
+            self._added_failed_attempt(name, now=now)
+        else:
+            with self._prestage_guard:
+                self._added_retry.setdefault(name, (0, now))
         if self._added_alerts.get(name) != reason:
             self._added_alerts[name] = reason
             logger.error("ALERT service environment %s, added to the run, is not served by this validator: %s "
@@ -3093,14 +3117,16 @@ class ValidationService:
             self._prebuilt.pop(name, None)
 
     def _added_served(self, name: str) -> None:
-        self._added_retry.pop(name, None)
+        with self._prestage_guard:
+            self._added_retry.pop(name, None)
         if self._added_alerts.pop(name, None) is not None:
             logger.warning("service environment %s, added to the run, is served again", name)
 
     def _retry_added_builds(self, schedule=None, *, now: float | None = None) -> list[str]:
         """Start the background build of each env the schedule added that is not loaded, staged, built or
-        building, once its backoff is over. Never blocks."""
-        now = time.monotonic() if now is None else float(now)
+        building, once its scheduled retry is due: one build per scheduled retry (the retry is spent when the
+        build starts; a failed build schedules the next one). Never blocks."""
+        now = self._added_now() if now is None else float(now)
         schedule = self._service_runtime.schedule if schedule is None else schedule
         started = []
         for name, added in sorted(schedule.added_environments().items()):
@@ -3109,8 +3135,10 @@ class ValidationService:
             digest = self._added_digest(added)
             with self._prestage_guard:
                 busy = name in self._builds or (self._prebuilt.get(name) or (None,))[0] == digest
-            if busy or now < self._added_retry.get(name, (0, now))[1]:
-                continue
+                attempts, due = self._added_retry.get(name, (0, now))
+                if busy or now < due:
+                    continue
+                self._added_retry[name] = (attempts, math.inf)        # spent: the build's outcome reschedules
             self._start_build(name, added, now=now)
             started.append(name)
         return started
@@ -3131,7 +3159,7 @@ class ValidationService:
         request is the boundary's to refuse); returns the names whose build started now."""
         from reliquary.validator.catalogue_activation import NotYet, allowed_packages, before_import_problem
 
-        now = time.monotonic() if now is None else float(now)
+        now = self._added_now() if now is None else float(now)
         started: list[str] = []
         wanted: dict[str, str] = {}
         runtime = self._service_runtime
@@ -3292,7 +3320,9 @@ class ValidationService:
                 if problem is None:
                     self._staged_envs[name] = environment
                     continue
-            self._added_unavailable(name, problem)
+            # A build that fails its checks here is a failed attempt; one not built (or whose build failed and
+            # counted already) keeps the retry it has.
+            self._added_unavailable(name, problem, attempt=environment is not None)
             if name in active:
                 failed[name] = problem
         try:
@@ -3325,7 +3355,29 @@ class ValidationService:
                 logger.error("ALERT service environment %s switched off by schedule revision %d: this validator "
                              "cannot serve it (%s); switch it on again with `set --active` once it is served",
                              name, changed.revision, failed[name])
+            self._supersede_pending_request(changed.revision, names, at)
         return runtime.schedule if window is None else runtime.window_schedule(int(window))
+
+    def _supersede_pending_request(self, revision: int, names: list[str], window: int) -> None:
+        """An operator request naming the revision an automatic switch-off just took can never apply: it is
+        refused now, saying so (ALERT). Never raises."""
+        store = getattr(self, "_service_schedule_store", None)
+        try:
+            request = store.take() if store is not None else None
+        except (ValueError, OSError):
+            return
+        if not isinstance(request, dict) or request.get("revision") != revision:
+            return
+        detail = (f"superseded by auto-deactivate: schedule revision {revision} switched off {', '.join(names)} "
+                  f"(this validator cannot serve it); resubmit against revision {revision + 1}")
+        try:
+            refused = self._service_runtime.refuse_schedule_request(store, str(request.get("request_id")), detail,
+                                                                    window=window)
+        except Exception:
+            logger.exception("the schedule request superseded by revision %d could not be marked refused", revision)
+            return
+        if refused:
+            logger.error("ALERT schedule request %s %s", request.get("request_id"), detail)
 
     def _install_env(self, name: str, environment) -> None:
         """Make an added env one of this validator's: its spec registered (its version), its group count, its
@@ -3390,7 +3442,7 @@ class ValidationService:
                 self._install_env(name, environment)
             except Exception as exc:
                 reason = f"{type(exc).__name__}: {exc}"
-                self._added_unavailable(name, reason)
+                self._added_unavailable(name, reason, attempt=True)
                 if name in schedule.active_environments():
                     failed[name] = reason
                 continue
@@ -3422,7 +3474,7 @@ class ValidationService:
             except Exception as exc:
                 self._staged_envs.pop(name, None)
                 reason = f"the RL services or the install refused it ({type(exc).__name__}: {exc})"
-                self._added_unavailable(name, reason)
+                self._added_unavailable(name, reason, attempt=True)
                 if active is not None and name in active:
                     failed[name] = reason
                 continue
@@ -3454,7 +3506,7 @@ class ValidationService:
             except Exception as exc:
                 reason = f"the RL services refused it at start ({type(exc).__name__}: {exc})"
                 self._uninstall_env(name)
-                self._added_unavailable(name, reason)
+                self._added_unavailable(name, reason, attempt=True)
                 if name in runtime.schedule.active_environments():
                     failed[name] = reason
         if failed:
