@@ -408,8 +408,9 @@ class SessionRecord:
     # RL only, set when the issuer records faults: why this session is neither useful nor wasted for its
     # miner's yield. Absent from the document when None (older documents keep their bytes).
     fault: str | None = None
-    # RL only: when the session first closed (its box's end). A submission later moves ``closed_at`` but
-    # never this, so the yield weight never counts an unsubmitted tail.
+    # RL only: when the session first closed with its machine's signed final (its box's end; None for a failed
+    # open). A submission or a withdrawal later moves ``closed_at`` (a withdrawal also ``closed_status``) but
+    # never this, so the yield weight never counts an unsubmitted tail, and a box that ran is known to have run.
     ended_at: int | None = None
 
     def to_document(self) -> dict:
@@ -1451,8 +1452,8 @@ class SessionIssuer:
             self._tokens.pop(session_id, None)
             if settled is not None and fault is not None:
                 settled.fault = fault                    # before the record is persisted
-            if settled is not None and self._record_faults and settled.ended_at is None:
-                settled.ended_at = now                   # its box's end, never moved by a submission
+            if settled is not None and self._record_faults and settled.ended_at is None and final is not None:
+                settled.ended_at = now                   # its box's end, never moved by a submission or withdrawal
         if settled is not None:
             self._event("closed", settled, final)
             self._settled((settled,))

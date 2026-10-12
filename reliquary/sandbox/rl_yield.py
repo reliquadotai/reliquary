@@ -488,13 +488,15 @@ class SessionYieldLedger:
 
 
 def held_seconds(record: Any, now: float, *, presented: bool | None = None) -> float:
-    """How long the session's box held its place: issue to its FIRST close (``ended_at``; ``closed_at`` for a record
-    without it; now while open), capped at the token's expiry: the env-neutral volume of a useful session. A
-    submission delayed to the window's end adds nothing. Only a session whose box ran counts: one closed by a
-    machine-signed final (``MACHINE_FINALS``), or one the caller knows a machine listed (``presented=True``); a
-    token never presented counts nothing, never its time to expiry. The wiring passes it to ``decide`` as each
-    row's fifth element."""
-    ran = getattr(record, "closed_status", None) in MACHINE_FINALS if presented is None else bool(presented)
+    """How long the session's box held its place: issue to its FIRST close with the machine's final (``ended_at``;
+    ``closed_at`` for a record without it; now while open), capped at the token's expiry: the env-neutral volume of
+    a useful session. A submission delayed to the window's end adds nothing. Only a session whose box ran counts:
+    one closed by a machine-signed final (``ended_at`` set, or a ``MACHINE_FINALS`` status: a graded session
+    withdrawn later keeps the first, never the second), or one the caller knows a machine listed
+    (``presented=True``); a token never presented counts nothing, never its time to expiry. The wiring passes it to
+    ``decide`` as each row's fifth element."""
+    ran = (getattr(record, "closed_status", None) in MACHINE_FINALS or getattr(record, "ended_at", None) is not None
+           if presented is None else bool(presented))
     if not ran:
         return 0.0
     end = getattr(record, "ended_at", None) or getattr(record, "closed_at", None) or now

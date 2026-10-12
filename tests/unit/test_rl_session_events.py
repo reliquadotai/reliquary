@@ -279,3 +279,27 @@ def test_the_fleet_verifies_a_receipt_signed_while_its_token_was_valid(monkeypat
         assert fleet.open_refusal_valid(receipt, record) is False
         assert fleet.open_refusal_valid(receipt, record) is False
     assert sum("re-pin" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_the_box_end_is_the_first_close_with_the_machines_final_and_a_withdrawal_keeps_it(tmp_path):
+    # A graded session withdrawn later (its group was not chosen): the withdrawal moves its closed_at and its
+    # closed status, never its box's end, so its held seconds still count, from issue to that end. A failed open
+    # carries no machine final: no box end, and nothing held unless a machine listed it.
+    from reliquary.sandbox.rl_yield import held_seconds
+
+    env = rl(build(tmp_path))
+    clock = env.issuer._clock
+    grant = open_(env, 0)
+    record = env.book.get(grant.session_id)
+    clock.now = record.issued_at + 300
+    assert close(env, grant, "graded")["state"] == "closed_graded"
+    assert record.ended_at == record.issued_at + 300
+    clock.now += 600
+    assert close(env, grant, "graded", reason="withdraw")["status"] == "withdrawn"
+    assert record.closed_at == record.issued_at + 900 and record.ended_at == record.issued_at + 300
+    assert held_seconds(record, clock.now + 5_000) == 300.0
+    failed = open_(env, 1)
+    close_failed(env, failed)
+    failed = env.book.get(failed.session_id)
+    assert failed.ended_at is None and held_seconds(failed, clock.now + 5_000) == 0.0
+    assert held_seconds(failed, clock.now + 5_000, presented=True) == failed.closed_at - failed.issued_at
