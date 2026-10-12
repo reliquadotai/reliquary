@@ -327,6 +327,10 @@ values, to be tuned at qualification (see the last list).
 
 ### Starting the validator
 
+- **Pinned sandbox.** The validator refuses to start signed-episode RL, with an ALERT, when the installed
+  reliquary-sandbox is not the commit this build pins (`SANDBOX_COMMIT` in `reliquary/sandbox/__init__.py`): an
+  older one cannot verify gateway-signed refusals, which would then be charged to miners. Sync the validator's
+  environment from the pinned dependency before starting it.
 - **Degraded start.** At start the validator waits up to `BOOT_FLEET_WAIT_S` (120 s, in
   `reliquary/validator/rl_sandbox_wiring.py`) for a machine serving each episode environment. An environment
   still unserved is started degraded: refused retryably (`environment_unserved`) and logged as an ALERT; the
@@ -349,11 +353,13 @@ values, to be tuned at qualification (see the last list).
   transit). With the default prepare timeout of 600 s, an operator who sets `RELIQUARY_SANDBOX_OPEN_WINDOW_S`
   below 720 s gets tokens longer than that window, corpus tokens included: set it to at least prepare + 120.
 - **Activation uses the environment's own preparation.** When an environment is added, the machines are
-  checked for the token the issuer will give its tasks: the largest prepare timeout among the first 256 tasks
-  of its RL split (`ACTIVATION_PREPARE_SAMPLE` in `reliquary/validator/catalogue_activation.py`; a task that
-  declares none counts the default). A task beyond that sample declaring a longer preparation can still be
-  refused at open by a machine whose token cap is too short: keep the machines' `max_token_validity_s` well
-  above the longest preparation the environment declares.
+  checked for the token the issuer will give its tasks: the largest prepare timeout among 256 tasks spread
+  evenly over its RL split (`ACTIVATION_PREPARE_SAMPLE` in `reliquary/validator/catalogue_activation.py`; a
+  task that declares none counts the default). A sampled task whose prepare timeout cannot be read now makes
+  the request wait. A task outside the sample that declares a longer preparation is never placed on a machine
+  whose `max_token_validity_s` does not cover its token: when no serving machine covers it, its precommits are
+  refused `task_unservable` (409, final) and miners lose those precommits without seeing why. Keep the
+  machines' `max_token_validity_s` well above the longest preparation the environment declares.
 - **Present window.** RL tokens must be presented within 120 s (`episode_present_window_s`): a machine
   unreachable for longer makes its miners' tokens unusable, and those opens count as the miners' waste. Keep
   RL machines reachable, and before maintenance take a machine out of the directory's active machines (it then
@@ -375,7 +381,7 @@ values, to be tuned at qualification (see the last list).
   environments' fleet, so a synchronized turnover of every group cannot overcommit it. What a hotkey held is
   remembered as demand for `DEMAND_MEMORY_S` (600 s), decaying linearly, so a key does not lose its share
   between two groups. A restart empties this memory.
-- **Tiny fleets.** The newcomer and low-yield pools are each at least one group (P sessions). On a fleet of a
+- **Tiny fleets.** The newcomer and low-yield pools are each at least one seed pool (P = 2 M sessions). On a fleet of a
   few hundred sessions they take a large slice before established hotkeys; below one group, low-yield hotkeys
   could take the whole fleet.
 - **Pools while groups wait.** A group that is asked for and not started counts its whole seed pool (2 M) of
@@ -451,7 +457,9 @@ values, to be tuned at qualification (see the last list).
    reason (`show`). It waits at most `RELIQUARY_SCHEDULE_ADD_WAIT_MAX_S` (default 3600 s, counted from its
    first wait and kept across restarts), then is refused; resubmit it once the cause is fixed.
 7. **Miners.** Miners mine a bridged environment from its public catalogue: they install exactly the pinned
-   env package (`pip install --no-deps <wheel>`, the identity the order names) and the sandbox bridge. A miner
+   env package (`pip install --no-deps <wheel>`, the identity the order names) and the sandbox bridge. The env
+   wheels and the bridge must therefore be published before launch: miners cannot install a private
+   `reliquary-sandbox` (see "Make `reliquary-sandbox` public, or vendor ..." under "Also pending"). A miner
    binds its prompts when it starts, so for an environment added during the run it must wait until the
    announcement names it, install the package, add the name to `--episode-envs` and **restart**; nothing
    restarts it automatically.

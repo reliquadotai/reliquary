@@ -29,7 +29,7 @@ Then:
 7. installing it moved no active bridged env: each one's package on disk still has its pinned identity;
 8. at least ``MIN_ACTIVATION_MACHINES`` fresh active machines could host its sessions (the open path's own
    filter, its image aside: identity, options, image lock, tools, caps against its budgets, token validity: the
-   one the issuer gives the largest prepare timeout among the split's first tasks), with
+   one the issuer gives the largest prepare timeout among a sample of the split's tasks), with
    at least ``min(images, ACTIVATION_MIN_IMAGES)`` locked images present, and at least
    ``min(rows, ACTIVATION_MIN_SERVABLE_TASKS)`` tasks of its RL split are servable (their image is held by such a
    machine under its lock). Each task's image is read once per manifest (``memo``, at most
@@ -433,12 +433,14 @@ def _servable(source: Any, images: frozenset[str], needed: int, memo: dict | Non
     return servable, sum(1 for image in known if image is None)
 
 
-def activation_prepare_timeout_s(source: Any, memo: dict | None = None) -> float:
+def activation_prepare_timeout_s(source: Any, memo: dict | None = None) -> float | NotYet:
     """The prepare timeout that sizes the token validity activation checks the machines against: the largest
-    one among the RL split's first ``ACTIVATION_PREPARE_SAMPLE`` tasks (a task declaring none, or whose
-    resolve fails, counts the sandbox's default), so the machines must take the tokens the issuer will give
-    those tasks. Read once per manifest (``memo["prepare"] = (manifest, value)``, one atomic entry). A source
-    that cannot tell (no ``prepare_timeout_s``) gives the default."""
+    one among ``ACTIVATION_PREPARE_SAMPLE`` tasks of the RL split spread evenly over its index range (as the
+    tier seeding samples; a task declaring none counts the sandbox's default), so the machines must take the
+    tokens the issuer will give those tasks. Read once per manifest (``memo["prepare"] = (manifest, value)``,
+    one atomic entry). A read that fails makes it a ``NotYet`` (the check waits), never memoised and never
+    the default: a task whose prepare is unknown could need a longer token. A source that cannot tell (no
+    ``prepare_timeout_s``) gives the default."""
     from reliquary.sandbox.sessions import DEFAULT_PREPARE_TIMEOUT_S
 
     read = getattr(source, "prepare_timeout_s", None)
@@ -448,14 +450,17 @@ def activation_prepare_timeout_s(source: Any, memo: dict | None = None) -> float
     entry = None if memo is None else memo.get("prepare")
     if entry is not None and entry[0] == manifest:
         return entry[1]
-    largest = 0.0
-    for index in range(min(len(source), ACTIVATION_PREPARE_SAMPLE)):
+    count = len(source)
+    indices = (range(count) if count <= ACTIVATION_PREPARE_SAMPLE
+               else sorted({i * count // ACTIVATION_PREPARE_SAMPLE for i in range(ACTIVATION_PREPARE_SAMPLE)}))
+    largest = float(DEFAULT_PREPARE_TIMEOUT_S) if count == 0 else 0.0
+    for index in indices:
         try:
             value = read(index)
-        except Exception:
-            value = None
-        largest = max(largest, float(DEFAULT_PREPARE_TIMEOUT_S if value is None else value))
-    largest = largest or float(DEFAULT_PREPARE_TIMEOUT_S)
+            value = float(DEFAULT_PREPARE_TIMEOUT_S if value is None else value)
+        except Exception as exc:
+            return NotYet(f"the prepare timeout of task {index} cannot be read now ({type(exc).__name__}: {exc})")
+        largest = max(largest, value)
     if memo is not None:
         memo["prepare"] = (manifest, largest)
     return largest

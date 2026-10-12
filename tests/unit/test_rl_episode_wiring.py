@@ -62,6 +62,18 @@ def _services(tmp_path, *, store=None, **kwargs):
     return services, rt
 
 
+def test_rl_refuses_to_start_on_another_installed_sandbox_commit(tmp_path, monkeypatch, caplog):
+    """An older reliquary-sandbox cannot verify gateway-signed refusals: they would be charged to miners."""
+    import reliquary.sandbox as sandbox
+
+    monkeypatch.setattr(sandbox, "_installed_commit", lambda: "0" * 40)
+    with caplog.at_level("ERROR"), pytest.raises(ValueError, match="installed at 0000000"):
+        _services(tmp_path)
+    assert any("ALERT" in r.getMessage() for r in caplog.records)
+    monkeypatch.setattr(sandbox, "_installed_commit", lambda: sandbox.SANDBOX_COMMIT)
+    _services(tmp_path / "pinned")                                     # the pinned commit starts
+
+
 def test_the_services_serve_the_rl_routes_and_one_checker_per_episode_env(tmp_path):
     services, rt = _services(tmp_path)
     app = FastAPI()

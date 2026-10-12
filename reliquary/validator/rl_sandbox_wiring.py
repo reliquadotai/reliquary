@@ -1010,6 +1010,12 @@ def build_rl_episode_services(
     from reliquary.sandbox.routes import build_sandbox_sessions_router
 
     require_sandbox()
+    from reliquary.sandbox import SANDBOX_COMMIT, sandbox_commit_refusal
+
+    refusal = sandbox_commit_refusal(SANDBOX_COMMIT)
+    if refusal is not None:     # an older verifier would charge gateway-signed refusals to miners
+        logger.error("ALERT signed-episode RL cannot start: %s (sync the validator's environment)", refusal)
+        raise ValueError(f"signed episodes cannot start: {refusal}")
     contract = runtime.contract
     policies = {name: contract.episode_policy(name) for name in contract.episode_environments
                 if name in environments}

@@ -110,31 +110,49 @@ class Prepared(Source):
     def __init__(self, prepare, **overrides):
         super().__init__(**overrides)
         self._prepare = prepare
-        self.prepare_reads = 0
+        self.prepare_reads = []
 
     def prepare_timeout_s(self, index):
-        self.prepare_reads += 1
+        self.prepare_reads.append(index)
         return self._prepare(index)
 
 
 def test_the_activation_validity_uses_the_largest_prepare_timeout_of_the_split():
     from reliquary.sandbox.sessions import DEFAULT_PREPARE_TIMEOUT_S
 
-    rows = BLOCK["environment"]["dataset"]["rows"]
-    late = min(rows, ACTIVATION_PREPARE_SAMPLE) - 1
-    source = Prepared(lambda i: 1500.0 if i == late else 300.0)
+    source = Prepared(lambda i: 1500.0 if i == 7 else 300.0, rows=100)
     memo = {}
     assert activation_prepare_timeout_s(source, memo) == 1500.0
-    reads = source.prepare_reads
-    assert activation_prepare_timeout_s(source, memo) == 1500.0 and source.prepare_reads == reads   # once per manifest
+    reads = len(source.prepare_reads)
+    assert activation_prepare_timeout_s(source, memo) == 1500.0 and len(source.prepare_reads) == reads  # memoised
     assert activation_prepare_timeout_s(Prepared(lambda i: 300.0)) == 300.0                # its own, not the default
     assert activation_prepare_timeout_s(Prepared(lambda i: None)) == DEFAULT_PREPARE_TIMEOUT_S   # the sandbox default
-
-    def broken(index):
-        raise RuntimeError("unreadable")
-
-    assert activation_prepare_timeout_s(Prepared(broken)) == DEFAULT_PREPARE_TIMEOUT_S
     assert activation_prepare_timeout_s(Source()) == DEFAULT_PREPARE_TIMEOUT_S             # a source that cannot tell
+
+
+def test_the_prepare_sample_is_spread_over_the_whole_split():
+    rows = 100_000
+    late = (ACTIVATION_PREPARE_SAMPLE - 1) * rows // ACTIVATION_PREPARE_SAMPLE   # the last sampled index
+    source = Prepared(lambda i: 1500.0 if i == late else 300.0, rows=rows)
+    assert activation_prepare_timeout_s(source) == 1500.0           # a task far beyond the first ones
+    assert len(source.prepare_reads) == ACTIVATION_PREPARE_SAMPLE
+    assert source.prepare_reads[0] == 0 and source.prepare_reads[-1] == late
+
+
+def test_a_failed_prepare_read_waits_and_is_never_memoised():
+    failures = [RuntimeError("hub read timed out")]
+
+    def flaky(index):
+        if index == 3 and failures:
+            raise failures.pop()
+        return 1500.0 if index == 3 else 300.0
+
+    source, memo = Prepared(flaky, rows=10), {}
+    first = activation_prepare_timeout_s(source, memo)
+    assert isinstance(first, NotYet) and "task 3" in first and "prepare" not in memo
+    assert activation_prepare_timeout_s(source, memo) == 1500.0     # read again: its own timeout, then memoised
+    assert memo["prepare"][1] == 1500.0
+    assert isinstance(activation_prepare_timeout_s(Prepared(lambda i: "soon", rows=4)), NotYet)   # not a number
 
 
 def test_a_gate_report_of_this_exact_env_attests():

@@ -155,6 +155,26 @@ def test_the_machines_are_checked_for_the_token_the_envs_own_preparation_needs(t
     assert token_validity_s(120, wall, 1500.0) > token_validity_s(120, wall)       # longer than the default's
 
 
+def test_an_unreadable_prepare_timeout_makes_the_activation_wait(tmp_path, monkeypatch):
+    """A task whose prepare timeout cannot be read now could need a longer token: the request waits, it is not
+    checked against the default's."""
+    from reliquary.environment.signed_episode import SignedEpisodeEnvironment
+    from tests.unit.test_catalogue_activation import Prepared
+
+    def unreadable(index):
+        raise TimeoutError("hub read timed out")
+
+    monkeypatch.setattr(bridged_episode, "build_environment",
+                        lambda config: SignedEpisodeEnvironment(ADDED, Prepared(unreadable)))
+    me, rt = validator(tmp_path, services=serving_services())
+    allow(tmp_path)
+    me._service_schedule_store.write(add_request(rt))
+    prestaged(me)
+    with pytest.raises(ScheduleNotYet, match="prepare timeout"):
+        me._catalogue_check(ADDED, BLOCK, attestation())
+    assert ADDED not in me._staged_envs
+
+
 def test_a_package_the_owner_did_not_allow_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(bridged_episode, "build_environment", lambda config: pytest.fail("built"))
     me, _ = validator(tmp_path, services=serving_services())
