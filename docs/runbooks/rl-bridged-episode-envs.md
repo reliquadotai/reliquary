@@ -106,3 +106,11 @@ catalogue. The miner binds its prompts once, when its stack is built, so:
 One miner engine serves only envs whose episode caps (`max_episode_tokens`, `max_tokens_per_turn`) are equal.
 An added env whose caps differ from a launch env's is refused beside it at start: mine it with a miner process
 of its own (`--episode-envs <added env>` alone, on its own `--generate-port`).
+
+## 5. Adding it to a running run
+
+The steps (gateways and pre-pull first, install and allowlist, the conformance gate, `add`, the miners'
+restart, `set --active`), the waiting status and the automatic switch-off are in "Operating multi-turn RL
+capacity (phase 2)" of `docs/next-rl-run-decisions.md`. The conformance report must be a gate of exactly this
+env under the catalogue's image lock: it records `image_lock_sha256`, and the validator refuses a report whose
+lock is not the catalogue's, or that names none.
