@@ -162,6 +162,24 @@ async def test_a_raising_decision_still_flushes_the_journal(tmp_path):
     await services.stop()
 
 
+async def test_a_raising_drain_at_stop_still_flushes_and_closes_the_ledger(tmp_path):
+    services, _ = _services(tmp_path, yield_path=tmp_path / "rl-yield.sqlite3",
+                            window_uses=lambda w: WindowUses(aborted=False, used=frozenset()))
+    record = _record("s-1", sha=SHA, state="lapsed")
+    services.book.add(record)
+    services.ledger.note_opened(record)
+    assert services.ledger._journal                                   # something to flush
+
+    async def drain(timeout=None):
+        raise RuntimeError("a state write failed while draining")
+
+    services.issuer.drain = drain
+    with pytest.raises(RuntimeError, match="draining"):               # the drain's error is not swallowed
+        await services.stop()
+    assert services.ledger._journal == [] and services.ledger.version >= 1   # the final flush ran
+    assert services.ledger._closed                                   # and the ledger is closed
+
+
 def test_a_capacity_refusal_of_an_open_reaches_the_ledger(tmp_path):
     services, _ = _services(tmp_path, yield_path=tmp_path / "rl-yield.sqlite3")
     record = _record("s-1", sha=SHA)

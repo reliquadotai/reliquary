@@ -484,15 +484,19 @@ class RlEpisodeServices:
             if late:
                 await asyncio.gather(*late, return_exceptions=True)
                 logger.error("ALERT %d episode hand-backs cut at shutdown", len(late))
-        await self.issuer.drain(timeout)
-        if self.ledger is not None:
-            try:
-                await self.settle_yield()
-            except Exception:
-                logger.exception("rl session yield not flushed at shutdown")
-            # After the last flush (a cancelled background flush still running in its thread holds the
-            # ledger's flush lock: close waits for it).
-            await asyncio.to_thread(self.ledger.close)
+        try:
+            await self.issuer.drain(timeout)
+        finally:
+            # A drain that raises still leaves the yield journal flushed and the ledger closed (its error is
+            # raised after them).
+            if self.ledger is not None:
+                try:
+                    await self.settle_yield()
+                except Exception:
+                    logger.exception("rl session yield not flushed at shutdown")
+                # After the last flush (a cancelled background flush still running in its thread holds the
+                # ledger's flush lock: close waits for it).
+                await asyncio.to_thread(self.ledger.close)
 
     # --- envs added to the running run ---
     def _policy_refusal(self, name: str, policy) -> str | None:
