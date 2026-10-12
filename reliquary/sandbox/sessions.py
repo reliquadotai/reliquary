@@ -99,6 +99,7 @@ from reliquary.infrastructure import sandbox_store as _store
 from reliquary.infrastructure.sandbox_store import (
     SESSION_TRANSITIONS, SessionStoreConflict, session_transition_allowed,
 )
+from reliquary.sandbox.capacity_refusals import CAPACITY_REFUSALS  # one set with the RL yield ledger
 from reliquary.sandbox.tasks import ResolvedTask
 
 logger = logging.getLogger(__name__)
@@ -827,13 +828,6 @@ _NO_CAPACITY = object()
 """``_issue_locked``'s answer when no machine has room now (or a waiter of the open's class is ahead)."""
 _NEVER = object()
 """``_issue_locked``'s answer when no fresh machine could ever take the open (queued issuers only)."""
-CAPACITY_REFUSALS = frozenset({"sandbox_saturated", "open_queue_full", "open_queue_key_full", "task_unplaceable",
-                               "environment_unserved"})
-"""Open refusals that are the validator's capacity: told to ``SessionEvents.refused``, except a saturation or a full
-queue of the refused miner's own operator's making (``SessionIssuer._self_caused``), and a key's full share of the
-queue unless the quota's room for it (not its own ticket maximum) refused it within its operator's entitlement. A
-gateway's signed refusal of a token (``no_free_slot`` included) is ours whoever filled the machine: our placement
-chose it."""
 
 
 def _tier(value: Any) -> Any:
@@ -1004,12 +998,6 @@ class SessionIssuer:
         * it held at least half of the sessions on the machines that could take this open (beyond the open's own
           group; the total never below the machines' reported load), or, for a full queue, at least half of the
           waiting tickets (beyond its own group's)."""
-        if refusal.reason == "open_queue_key_full":
-            # Its own tickets at the per-key maximum: its doing. The quota's room for it (the fleet bound, the pools
-            # kept): ours while its operator holds no more than its hotkeys' allocations entitle it to.
-            if refusal.detail.get("bound") != "headroom":
-                return True
-            return self._over_entitlement(hotkey, int(self._clock()))
         if refusal.reason not in ("sandbox_saturated", "open_queue_full"):
             return False
         now = int(self._clock())

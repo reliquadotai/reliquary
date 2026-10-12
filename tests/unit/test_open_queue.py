@@ -452,6 +452,7 @@ def test_the_wiring_builds_the_queue_with_the_quota_and_wakes_it_on_each_poll(tm
     assert isinstance(services.queue, OpenQueue) and services.issuer._queue is services.queue
     assert services.fleet.on_polled == services.queue.notify
     assert services.queue._headroom("5Nobody") >= 0            # headroom(h) -> quota.headroom(h, now)
+    assert services.queue._owed("5Nobody", "rl:1:" + "a" * 64 + ":0") is None   # owed(h, e) -> quota.owed(...)
 
 
 def test_without_a_yield_quota_the_wiring_builds_no_queue(tmp_path):

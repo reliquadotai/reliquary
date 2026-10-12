@@ -55,7 +55,8 @@ logger = logging.getLogger(__name__)
 
 
 class Ticket:
-    __slots__ = ("active", "cls", "engagement", "event", "granted", "joined", "key", "pooled", "score", "tried")
+    __slots__ = ("active", "cls", "engagement", "event", "granted", "joined", "key", "pooled", "reserved", "score",
+                 "tried")
 
     def __init__(self, key: str, score: float, cls: Hashable, engagement: str | None, joined: float,
                  pooled: bool = False) -> None:
@@ -66,6 +67,7 @@ class Ticket:
         self.granted = False
         self.active = True
         self.tried = -1
+        self.reserved: Hashable | None = None     # the started group whose owed seed it is (outside the key's bound)
 
 
 class OpenQueue:
@@ -75,8 +77,12 @@ class OpenQueue:
                  aging_forget_s: float = QUEUE_AGING_FORGET_S, fair_every: int = QUEUE_FAIR_EVERY,
                  hold_after_s: float | None = QUEUE_HOLD_AFTER_S,
                  clock: Callable[[], float] = time.monotonic,
-                 on_wait: Callable[[float, Hashable], None] | None = None) -> None:
+                 on_wait: Callable[[float, Hashable], None] | None = None,
+                 owed: Callable[[str, str], tuple[Hashable, int] | None] | None = None) -> None:
         self._rank, self._headroom = rank, headroom
+        # (group, seeds it still owes below M) of an engagement's started group, or None: those seeds always have a
+        # ticket, outside the key's bound, so a group under M is never cut by the queue.
+        self._owed = owed
         # Told how long each ticket waited, and its placement class, when it leaves (placed, refused, timed out or
         # cancelled): the metrics.
         self._on_wait = on_wait
@@ -144,21 +150,30 @@ class OpenQueue:
                            retry_after=self._retry_after())
         if engagement is not None and any(ticket.engagement == engagement for ticket in tickets):
             return Refusal("open_queued", {"engagement": engagement}, retry_after=self._retry_after())
-        bound, by = self._max_per_key, "per_key"
-        if self._headroom is not None:
-            room = max(0, int(self._headroom(hotkey)))                     # no free ticket at zero headroom
-            if room < bound:
-                bound, by = room, "headroom"
-        mine = sum(1 for ticket in tickets if ticket.key == key)
-        if mine >= bound:
-            # ``bound``: what refused it, the key's own ticket maximum or the quota's room for it now
-            return Refusal("open_queue_key_full", {"waiting": mine, "max": bound, "bound": by},
-                           retry_after=self._retry_after())
+        reserved = None
+        if self._owed is not None and engagement is not None:
+            found = self._owed(hotkey, engagement)
+            if found is not None:
+                group, owed = found
+                if sum(1 for ticket in tickets if ticket.reserved == group) < int(owed):
+                    reserved = group
+        if reserved is None:
+            bound, by = self._max_per_key, "per_key"
+            if self._headroom is not None:
+                room = max(0, int(self._headroom(hotkey)))                 # no free ticket at zero headroom
+                if room < bound:
+                    bound, by = room, "headroom"
+            mine = sum(1 for ticket in tickets if ticket.key == key and ticket.reserved is None)
+            if mine >= bound:
+                # ``bound``: what refused it, the key's own ticket maximum or the quota's room for it now
+                return Refusal("open_queue_key_full", {"waiting": mine, "max": bound, "bound": by},
+                               retry_after=self._retry_after())
         now = self._clock()
         self._forget(now)
         self._since.setdefault(key, now)
         self._left.pop(key, None)
         ticket = Ticket(key, score, cls, engagement, now, pooled=pooled)
+        ticket.reserved = reserved
         if any(t.cls == cls and t.tried == self._sweep for t in self._waiting):
             # A waiter of its class already found no room in this sweep: the newcomer waits for the next
             # wake-up too (it would not fit either, and it must not jump the older waiter when room appears).

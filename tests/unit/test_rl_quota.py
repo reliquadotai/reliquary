@@ -566,10 +566,42 @@ def test_at_a_full_fleet_a_started_groups_next_seed_still_joins_the_queue():
     q.allocation()
     assert q._fleet_committed == 64
     assert q.refusal("5A", NOW, precommit_sha256=sha(1), seed_index=1) is None      # never cut below M
-    assert q.headroom("5A", NOW) == M - 1                                           # what its group still owes
+    assert q.headroom("5A", NOW) == 0                                               # no room for anything new
+    assert q.owed("5A", f"rl:1:{sha(1)}:1", NOW) == (sha(1), M - 1)                  # what its group still owes
+    assert q.owed("5A", f"rl:1:{sha(0)}:20", NOW) is None                           # a group at M owes nothing
     assert q.refusal("5A", NOW, precommit_sha256=sha(2), seed_index=0) is not None  # no new group: the fleet is full
-    queue = OpenQueue(rank=q.rank, headroom=lambda hotkey: q.headroom(hotkey, NOW))
+    queue = OpenQueue(rank=q.rank, headroom=lambda hotkey: q.headroom(hotkey, NOW),
+                      owed=lambda hotkey, engagement: q.owed(hotkey, engagement, NOW))
     assert isinstance(queue.join("5A", cls=("swe", 1, 1), engagement=f"rl:1:{sha(1)}:1"), Ticket)
+    assert queue.join("5A", cls=("swe", 1, 1), engagement=f"rl:1:{sha(0)}:20").reason == "open_queue_key_full"
+
+
+def test_a_group_under_m_queues_the_seeds_it_owes_whatever_the_keys_other_tickets():
+    """The key's other tickets at its per-key maximum: the seeds its started group still owes below M join all the
+    same (their own tickets), never more than it owes; a seed beyond them is the key's own overrun."""
+    from reliquary.sandbox.open_queue import OpenQueue, Ticket
+
+    q = quota({"5A": main_stats(100)}, capacity=C)
+    want(q, "5A", 4 * P, first=0)
+    for seed in range(M - 3):
+        hold(q, "5A", sha(0), seed)                               # 3 seeds still owed
+    q._alloc_key = None
+    queue = OpenQueue(rank=q.rank, max_per_key=2, headroom=lambda hotkey: q.headroom(hotkey, NOW),
+                      owed=lambda hotkey, engagement: q.owed(hotkey, engagement, NOW))
+    cls = ("swe", 1, 1)
+    for n in range(2):                                            # its other tickets: at the per-key maximum
+        assert isinstance(queue.join("5A", cls=cls, engagement=f"rl:1:{sha(1 + n)}:0"), Ticket)
+    assert queue.join("5A", cls=cls, engagement=f"rl:1:{sha(3)}:0").reason == "open_queue_key_full"
+    for seed in range(M - 3, M):                                  # every owed seed of the group under M
+        assert isinstance(queue.join("5A", cls=cls, engagement=f"rl:1:{sha(0)}:{seed}"), Ticket)
+    assert queue.join("5A", cls=cls, engagement=f"rl:1:{sha(0)}:{M}").reason == "open_queue_key_full"
+    # the other order: the owed seeds' tickets never take the key's own share of the queue
+    again = OpenQueue(rank=q.rank, max_per_key=2, headroom=lambda hotkey: q.headroom(hotkey, NOW),
+                      owed=lambda hotkey, engagement: q.owed(hotkey, engagement, NOW))
+    for seed in range(M - 3, M):
+        assert isinstance(again.join("5A", cls=cls, engagement=f"rl:1:{sha(0)}:{seed}"), Ticket)
+    for n in range(2):
+        assert isinstance(again.join("5A", cls=cls, engagement=f"rl:1:{sha(1 + n)}:0"), Ticket)
 
 
 def test_over_generating_one_group_never_lets_a_key_hold_more_than_its_allocation():

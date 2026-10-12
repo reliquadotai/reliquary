@@ -915,3 +915,21 @@ def test_a_second_hotkey_of_the_same_operator_cannot_make_its_saturation_someone
     refused_open(env, 3)
     assert (env.precommit.sha256 in ledger._verdicts) is not same_operator
     assert decided_of(env, ledger) == (3 if same_operator else 0)  # its own doing: waste; a stranger's: neutral
+
+
+# --- the open queue's per-key share: a key-full refusal is the key's own overrun --------------------------------
+
+def test_abandoning_a_group_after_a_key_full_refusal_is_waste(tmp_path):
+    """Three graded sessions (fewer than M), then an open refused ``open_queue_key_full`` (its room is used up:
+    the seeds a started group owes have their own tickets, so this one is beyond them). The key drops its tickets
+    and lets the group end under M: wasted, never a capacity verdict."""
+    env, ledger = saturating(tmp_path)
+    env.issuer._queue = OpenQueue(rank=lambda hotkey: (hotkey, 1.0, False), headroom=lambda hotkey: 0,
+                                  wait_s=0.05, fair_every=0)
+    for seed in range(3):
+        close(env, open_(env, seed), "graded")
+    others_fill_the_machine(env)                                   # the machine is full of others' sessions
+    env.issuer._fleet.placement = None
+    assert open_(env, 3).reason == "open_queue_key_full"
+    assert env.precommit.sha256 not in ledger._verdicts
+    assert decided_of(env, ledger) == 3                            # abandoned under M: waste

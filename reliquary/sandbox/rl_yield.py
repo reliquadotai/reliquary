@@ -65,6 +65,7 @@ from pathlib import Path
 from typing import Any
 
 from reliquary.protocol.service_episode import GROUPS_IN_FLIGHT
+from reliquary.sandbox.capacity_refusals import CAPACITY_REFUSALS
 from reliquary.sandbox.rl_capacity import USEFUL_HORIZON_S, YIELD_SESSIONS, YieldStats
 
 logger = logging.getLogger(__name__)
@@ -503,10 +504,10 @@ def held_seconds(record: Any, now: float, *, presented: bool | None = None) -> f
     return max(0.0, float(end) - float(getattr(record, "issued_at", end)))
 
 
-CAPACITY_REASONS = frozenset({"sandbox_saturated", "open_queue_full", "task_unplaceable", "environment_unserved"})
-"""Open refusals that are our capacity: an unused precommit that met one is neither useful nor wasted (for its
-sessions that ran, in a group that could not be formed). The issuer leaves out a saturation or a full queue of the
-refused miner's own operator's making before it tells the ledger."""
+CAPACITY_REASONS = CAPACITY_REFUSALS
+"""The issuer's own set (``capacity_refusals``): an unused precommit that met one is neither useful nor wasted (for
+its sessions that ran, in a group that could not be formed). The issuer leaves out a saturation or a full queue of
+the refused miner's own operator's making before it tells the ledger."""
 
 
 class LedgerEvents:

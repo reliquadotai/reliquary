@@ -227,18 +227,39 @@ def test_a_machines_reported_load_is_its_used_slots_or_listed_sessions(tmp_path,
     assert fleet.reported_load(("other",)) == 0
 
 
-@pytest.mark.parametrize("queue_kwargs, entitled, seen", [
-    ({"headroom": lambda hotkey: 0}, 8, ["open_queue_key_full"]),   # the quota's room refused it, within its share
-    ({"headroom": lambda hotkey: 0}, 1, []),                        # its operator holds beyond its allocations
-    ({"max_per_key": 0}, 8, []),                                    # its own tickets at the per-key maximum
-])
-def test_a_key_full_refusal_is_ours_only_when_the_quotas_room_refused_it_within_its_share(
-        tmp_path, queue_kwargs, entitled, seen):
+def test_the_issuer_and_the_yield_ledger_read_one_set_of_capacity_refusals():
+    from reliquary.sandbox import capacity_refusals, rl_yield, sessions
+
+    assert sessions.CAPACITY_REFUSALS is rl_yield.CAPACITY_REASONS is capacity_refusals.CAPACITY_REFUSALS
+    assert "open_queue_key_full" not in capacity_refusals.CAPACITY_REFUSALS
+
+
+def _ledgered(env, tmp_path, **queue_kwargs):
+    from reliquary.sandbox.rl_yield import LedgerEvents, SessionYieldLedger
+
+    ledger = SessionYieldLedger(tmp_path / "y.sqlite3")
+    queue_kwargs.setdefault("wait_s", 0.05)
+    env.issuer._queue = queue(**queue_kwargs)
+    env.issuer._events = LedgerEvents(ledger)
+    env.issuer._operator_of = {}.get
+    open_(env, 0)                                        # the precommit is known to the ledger
+    return ledger
+
+
+def test_a_saturation_others_caused_reaches_the_yield_ledger_as_a_capacity_verdict(tmp_path):
     env = build(tmp_path)
-    _q, listener = saturating(env, **queue_kwargs)
-    others_hold(env, 2, hotkey=HOTKEY)                   # 2 held: within an allocation of 8, beyond one of 1
-    env.issuer._entitled = lambda hotkey: entitled if hotkey == HOTKEY else 0
-    outcome = refused(env, 0)
+    ledger = _ledgered(env, tmp_path)
+    others_hold(env, 6)
+    assert refused(env, 1).reason == "sandbox_saturated"
+    assert ledger._verdicts[env.precommit.sha256][0] == "capacity"       # the ledger's own verdict, not a listener's
+    ledger.close()
+
+
+def test_a_key_full_refusal_is_never_a_capacity_verdict_in_the_yield_ledger(tmp_path):
+    env = build(tmp_path)
+    ledger = _ledgered(env, tmp_path, headroom=lambda hotkey: 0)          # its room is used up: its own overrun
+    others_hold(env, 6)
+    outcome = refused(env, 1)
     assert outcome.reason == "open_queue_key_full"
-    assert outcome.detail["bound"] == ("headroom" if "headroom" in queue_kwargs else "per_key")
-    assert listener.seen == seen
+    assert env.precommit.sha256 not in ledger._verdicts
+    ledger.close()

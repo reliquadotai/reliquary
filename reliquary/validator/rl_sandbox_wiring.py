@@ -1087,6 +1087,7 @@ def build_rl_episode_services(
 
         saturation = SaturationMonitor(clock=clock)
         queue = OpenQueue(rank=quota.rank, headroom=lambda hotkey: quota.headroom(hotkey, int(clock())),
+                          owed=lambda hotkey, engagement: quota.owed(hotkey, engagement, int(clock())),
                           on_wait=saturation.record_wait)
     resolvers = {name: environments[name].source.resolve for name in policies}
     if tiers is not None:

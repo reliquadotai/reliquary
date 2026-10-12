@@ -55,6 +55,7 @@ from __future__ import annotations
 import math
 import time
 from collections import deque
+from types import SimpleNamespace
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
@@ -658,21 +659,33 @@ class YieldQuota:
         return None
 
     def headroom(self, hotkey: str, now: int) -> int:
-        """How many more sessions the hotkey may hold now (the open queue's bound per key): the seeds its started
-        groups still owe below M, plus the room for more within its allocation (its entity's) and the fleet's."""
+        """How many more sessions the hotkey may open now beyond what its started groups still owe below M (those
+        are in the fleet's count already and have their own tickets: ``owed``): its room within its allocation (its
+        entity's) and the fleet's. The open queue's bound on a key's other tickets."""
         now = int(now)
         alloc, lane = self.allocation(now), self.lane(hotkey)
         groups: dict[str | None, list[Any]] = {}
         for record in self._counted(str(hotkey), now):
             groups.setdefault(self._sha.get(record.session_id), []).append(record)
         committed = sum(max(len(members), self._m(members)) for members in groups.values())
-        # the seeds its started groups still owe below M are in the fleet's count already: never bounded by its room
-        owed = sum(max(0, self._m(members) - len(members)) for members in groups.values())
         fleet = self._fleet_room(alloc, lane)
         if lane == MAIN:
-            return owed + max(0, min(fleet, sessions_of(alloc.main.get(str(hotkey), 0.0)) - committed))
+            return max(0, min(fleet, sessions_of(alloc.main.get(str(hotkey), 0.0)) - committed))
         member = _LANE_GROUPS[lane] * self._pool_seeds - committed
-        return owed + max(0, min(fleet, member, self._entity_sessions(lane, alloc) - self._lane_committed[lane]))
+        return max(0, min(fleet, member, self._entity_sessions(lane, alloc) - self._lane_committed[lane]))
+
+    def owed(self, hotkey: str, engagement: str, now: int) -> tuple[str, int] | None:
+        """(its precommit, the seeds its group still owes below M) when ``engagement`` names a seed of a group the
+        hotkey started and holds fewer than M sessions of; None otherwise. The open queue keeps that many tickets
+        for the group, outside the key's bound."""
+        sha = _precommit_of(SimpleNamespace(engagement=engagement))
+        if sha is None:
+            return None
+        members = [r for r in self._counted(str(hotkey), int(now)) if self._sha.get(r.session_id) == sha]
+        if not members:
+            return None
+        owed = self._m(members) - len(members)
+        return (sha, owed) if owed > 0 else None
 
     async def admit_open(self, hotkey: str, *, environment: str, precommit_sha256: str,
                          seed_index: int | None = None) -> Refusal | None:
