@@ -69,6 +69,14 @@ def test_no_upstream_scenario_is_in_two_ranges() -> None:
     assert len(rl) == len(SELECTION["ranges"]["rl"]["positions"])
     assert len(sft) == len(SELECTION["ranges"]["sft_graded"]["positions"])
     assert not rl & sft
+    # The corpus range restates sft_graded, in order, minus the excluded worlds.
+    corpus = SELECTION["ranges"]["sft_corpus"]["positions"]
+    assert set(corpus) < sft
+    assert corpus == [p for p in SELECTION["ranges"]["sft_graded"]["positions"] if p in set(corpus)]
+    assert SELECTION["ranges"]["sft_corpus"]["excluded_worlds"] == sorted(
+        layout.SFT_CORPUS_EXCLUDED_WORLDS
+    )
+    assert layout.SFT_CORPUS_EXCLUDED_WORLDS < set(SELECTION["world_split"]["sft"])
     # The ungraded range indexes another file entirely.
     assert SELECTION["ranges"]["sft_ungraded"]["file"] == "sft_scen.json"
 
@@ -88,13 +96,18 @@ def test_the_boundaries_are_the_selection() -> None:
 
     assert v2.RL_RANGE == (0, counts["rl"])
     assert v2.SFT_GRADED_RANGE == (counts["rl"], counts["rl"] + counts["sft_graded"])
-    assert v2.SFT_UNGRADED_RANGE == (v2.SFT_GRADED_RANGE[1], v2.LENGTH)
+    assert v2.SFT_UNGRADED_RANGE == (
+        v2.SFT_GRADED_RANGE[1], v2.SFT_GRADED_RANGE[1] + counts["sft_ungraded"]
+    )
+    assert v2.SFT_CORPUS_RANGE == (v2.SFT_UNGRADED_RANGE[1], v2.LENGTH)
+    assert counts["sft_corpus"] == 600
     assert v2.LENGTH == sum(counts.values())
     assert MANIFEST["corpus"]["virtual_length"] == v2.LENGTH
     assert MANIFEST["corpus"]["ranges"] == {
         "rl": list(v2.RL_RANGE),
         "sft_graded": list(v2.SFT_GRADED_RANGE),
         "sft_ungraded": list(v2.SFT_UNGRADED_RANGE),
+        "sft_corpus": list(v2.SFT_CORPUS_RANGE),
     }
 
 
@@ -103,8 +116,9 @@ def test_the_range_guards_restate_the_boundaries() -> None:
     servable = sets.CORPUS_SERVABLE_RANGES[ENVIRONMENT]
 
     assert (reserved.start, reserved.end) == v2.RL_RANGE
-    # The ungraded range is held in reserve: no corpus job takes it yet.
-    assert [(r.start, r.end) for r in servable] == [v2.SFT_GRADED_RANGE]
+    # Only the corpus range: the whole graded SFT range and the ungraded one
+    # are held in reserve.
+    assert [(r.start, r.end) for r in servable] == [v2.SFT_CORPUS_RANGE]
 
 
 @pytest.mark.parametrize(("start", "count"), [
@@ -112,14 +126,16 @@ def test_the_range_guards_restate_the_boundaries() -> None:
     (v2.RL_END - 5, 10),            # straddles RL and SFT
     (v2.SFT_GRADED_END - 5, 10),    # straddles graded and ungraded
     (v2.SFT_UNGRADED_START, 10),    # the reserve
+    (v2.SFT_GRADED_START, 10),      # the graded SFT range, excluded worlds included
+    (v2.SFT_CORPUS_START - 5, 10),  # straddles ungraded and corpus
 ])
-def test_a_corpus_job_outside_the_graded_sft_range_is_refused(start, count) -> None:
+def test_a_corpus_job_outside_the_corpus_range_is_refused(start, count) -> None:
     with pytest.raises(ValueError):
         sets.refuse_held_out_overlap(ENVIRONMENT, start, count)
 
 
-def test_a_corpus_job_inside_the_graded_sft_range_is_accepted() -> None:
-    start, end = v2.SFT_GRADED_RANGE
+def test_a_corpus_job_inside_the_corpus_range_is_accepted() -> None:
+    start, end = v2.SFT_CORPUS_RANGE
     sets.refuse_held_out_overlap(ENVIRONMENT, start, end - start)
 
 
@@ -127,7 +143,7 @@ def test_the_corpus_layout_follows_the_range_order() -> None:
     corpus = fixtures.corpus()
 
     assert dict(corpus.ranges) == {
-        "rl": (0, 2), "sft_graded": (2, 3), "sft_ungraded": (3, 4),
+        "rl": (0, 2), "sft_graded": (2, 3), "sft_ungraded": (3, 4), "sft_corpus": (4, 4),
     }
     assert [s.range for s in corpus.scenarios] == [
         "rl", "rl", "sft_graded", "sft_ungraded",
@@ -238,15 +254,23 @@ def test_every_range_holds_only_its_worlds(real_corpus) -> None:
         "rl": set(split["rl"]),
         "sft_graded": set(split["sft"]),
         "sft_ungraded": {w for w in real_corpus.worlds if w.endswith("_sft")},
+        "sft_corpus": set(split["sft"]) - layout.SFT_CORPUS_EXCLUDED_WORLDS,
     }
     for name in layout.RANGE_ORDER:
         start, end = real_corpus.ranges[name]
         assert (start, end) == {
             "rl": v2.RL_RANGE, "sft_graded": v2.SFT_GRADED_RANGE,
-            "sft_ungraded": v2.SFT_UNGRADED_RANGE,
+            "sft_ungraded": v2.SFT_UNGRADED_RANGE, "sft_corpus": v2.SFT_CORPUS_RANGE,
         }[name]
         held = {s.env_id for s in real_corpus.scenarios[start:end]}
         assert held == worlds[name], name
+    # The corpus range names the scenarios sft_graded names, in its order.
+    graded = real_corpus.scenarios[slice(*v2.SFT_GRADED_RANGE)]
+    corpus = real_corpus.scenarios[slice(*v2.SFT_CORPUS_RANGE)]
+    assert [s.task_id for s in corpus] == [
+        s.task_id for s in graded if s.env_id not in layout.SFT_CORPUS_EXCLUDED_WORLDS
+    ]
+    assert all(s.checks for s in corpus)
 
 
 def test_the_real_corpus_serves_a_chatml_task(real_corpus) -> None:

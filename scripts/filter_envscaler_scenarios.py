@@ -48,11 +48,13 @@ from reliquary.environment.agentic.envs.envscaler_tools_v2.corpus import (  # no
     RANGE_SOURCE,
     SELECTION_PATH,
     SELECTION_SCHEMA,
+    SFT_CORPUS_EXCLUDED_WORLDS,
     build_corpus,
     candidates,
     interleave,
     read_sources,
     scenario_mentions_vendor,
+    sft_corpus_positions,
 )
 from reliquary.environment.agentic.envs.envscaler_tools_v2.environment import (  # noqa: E402
     EnvScalerToolsV2Environment,
@@ -113,8 +115,10 @@ def main(argv: list[str] | None = None) -> int:
 
     sources = read_sources(args.data)
     split, pools = candidates(sources)
+    # The filtered ranges; `sft_corpus` is derived from `sft_graded` after.
+    filtered_ranges = [name for name in RANGE_ORDER if name in pools]
     unfiltered = build_corpus(
-        sources, {name: [p for _w, p in pools[name]] for name in RANGE_ORDER}
+        sources, {name: [p for _w, p in pools[name]] for name in filtered_ranges}
     )
     environment = EnvScalerToolsV2Environment(unfiltered)
 
@@ -126,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     elapsed = time.monotonic() - started
 
     vendor: dict[str, list[int]] = {}
-    for name in RANGE_ORDER:
+    for name in filtered_ranges:
         records = sources[RANGE_SOURCE[name]]
         world_ids = set(split["rl"] if name == "rl" else split["sft"]) if name != "sft_ungraded" else None
         vendor[name] = [
@@ -138,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
     ranges: dict[str, dict] = {}
     dropped: dict[str, dict[str, list[int]]] = {}
     report: dict[str, Counter] = {}
-    for name in RANGE_ORDER:
+    for name in filtered_ranges:
         start, end = unfiltered.ranges[name]
         kept: list[tuple[str, int]] = []
         drops: dict[str, list[int]] = {"vendor_mention": vendor[name]}
@@ -160,6 +164,24 @@ def main(argv: list[str] | None = None) -> int:
         }
         dropped[name] = {reason: sorted(p) for reason, p in sorted(drops.items())}
         report[name] = counts
+
+    # The corpus range: sft_graded's kept positions, in order, minus the
+    # excluded worlds' (corpus.SFT_CORPUS_EXCLUDED_WORLDS).
+    kept_corpus = sft_corpus_positions(
+        sources[RANGE_SOURCE["sft_corpus"]], ranges["sft_graded"]["positions"]
+    )
+    ranges["sft_corpus"] = {
+        "file": RANGE_SOURCE["sft_corpus"],
+        "worlds": ranges["sft_graded"]["worlds"] - len(SFT_CORPUS_EXCLUDED_WORLDS),
+        "positions": kept_corpus,
+        "excluded_worlds": sorted(SFT_CORPUS_EXCLUDED_WORLDS),
+    }
+    dropped["sft_corpus"] = {}
+    report["sft_corpus"] = Counter({
+        "from_sft_graded": len(ranges["sft_graded"]["positions"]),
+        "excluded_world": len(ranges["sft_graded"]["positions"]) - len(kept_corpus),
+        "kept": len(kept_corpus),
+    })
 
     selection = {
         "schema": SELECTION_SCHEMA,

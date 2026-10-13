@@ -99,6 +99,9 @@ TASK_INSTRUCTIONS = (
 #   rl            [0, 1296)     26 worlds, graded   (1300 upstream, 4 vendor)
 #   sft_graded    [1296, 2546)  25 worlds, graded   (1250 upstream)
 #   sft_ungraded  [2546, 7225)  140 worlds, no checks (4684 upstream, 5 vendor)
+#   sft_corpus    [7225, 7825)  12 worlds, graded: sft_graded minus the 13
+#                               worlds of corpus.SFT_CORPUS_EXCLUDED_WORLDS,
+#                               the range a corpus job serves
 # No scenario failed to start, none is won by a no-op agent (every one has a
 # check false at reset), none has an initial state that differs between two
 # processes.
@@ -107,10 +110,13 @@ RL_END = 1296
 SFT_GRADED_START = RL_END
 SFT_GRADED_END = 2546
 SFT_UNGRADED_START = SFT_GRADED_END
-LENGTH = 7225
+SFT_UNGRADED_END = 7225
+SFT_CORPUS_START = SFT_UNGRADED_END
+LENGTH = 7825
 RL_RANGE = (RL_START, RL_END)
 SFT_GRADED_RANGE = (SFT_GRADED_START, SFT_GRADED_END)
-SFT_UNGRADED_RANGE = (SFT_UNGRADED_START, LENGTH)
+SFT_UNGRADED_RANGE = (SFT_UNGRADED_START, SFT_UNGRADED_END)
+SFT_CORPUS_RANGE = (SFT_CORPUS_START, LENGTH)
 
 # The runner's name for a turn it could not read.
 _UNREADABLE = "__invalid_action__"
@@ -394,6 +400,7 @@ __all__ = [
     "MAX_TURNS",
     "REWARD_MODE",
     "RL_RANGE",
+    "SFT_CORPUS_RANGE",
     "SFT_GRADED_RANGE",
     "SFT_UNGRADED_RANGE",
     "TASK_INSTRUCTIONS",

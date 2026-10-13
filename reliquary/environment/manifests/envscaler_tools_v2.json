@@ -29,13 +29,13 @@
     "reliquary/environment/agentic/suite.py",
     "reliquary/environment/agentic/types.py"
   ],
-  "implementation_sha256": "c26fda97c8a3ff710e80d08068e6e1a6e4f4f55e9a06dd21f59fecc1ac05fa95",
+  "implementation_sha256": "0c2cf6b8d99a0b8d06b11cb456dc1235b29d2ebd857b2f27a64c0aa0ec6d826d",
   "source": "EnvScaler (RUC-NLPIR), programmatically synthesised tool worlds",
   "external_data": true,
   "network_required": false,
   "license": "MIT",
   "corpus": {
-    "virtual_length": 7225,
+    "virtual_length": 7825,
     "ranges": {
       "rl": [
         0,
@@ -48,9 +48,13 @@
       "sft_ungraded": [
         2546,
         7225
+      ],
+      "sft_corpus": [
+        7225,
+        7825
       ]
     },
-    "world_split": "the 51 RL-scenario worlds sorted by number, even rank rl (26), odd rank sft (25); the 140 _sft worlds feed sft_ungraded only",
+    "world_split": "the 51 RL-scenario worlds sorted by number, even rank rl (26), odd rank sft (25); the 140 _sft worlds feed sft_ungraded only; sft_corpus is sft_graded minus 13 low-success worlds (corpus.SFT_CORPUS_EXCLUDED_WORLDS)",
     "selection": "reliquary/environment/agentic/envs/envscaler_tools_v2/selection.json",
     "selection_builder": "scripts/filter_envscaler_scenarios.py",
     "builder": "scripts/fetch_envscaler_corpus.py",

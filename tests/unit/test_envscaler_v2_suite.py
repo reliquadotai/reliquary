@@ -48,10 +48,11 @@ PROOF = "A" * 200
 QWEN35_TOKENIZER = Path(os.environ.get(
     "RELIQUARY_TEST_QWEN35_TOKENIZER", "/home/ubuntu/bench-rl-throughput/dryrun/tiny-qwen35"))
 
-# env_170_rl-task_1, in the graded SFT range: switch a patient from
-# Amlodipine to Lisinopril and correct one drug-interaction record. Seven
-# checks, all false at reset; the script below makes every one true.
-SCENARIO_INDEX = 1310
+# env_170_rl-task_1, in the corpus range (and at 1310 in the graded SFT
+# range, which is in reserve): switch a patient from Amlodipine to Lisinopril
+# and correct one drug-interaction record. Seven checks, all false at reset;
+# the script below makes every one true.
+SCENARIO_INDEX = 7231
 SCENARIO_TASK = "env_170_rl-task_1"
 
 
@@ -190,15 +191,16 @@ class _Records:
         return list(self.grades)
 
 
-def test_a_job_is_declared_on_the_graded_sft_range_only(setting) -> None:
-    start, end = v2.SFT_GRADED_RANGE
+def test_a_job_is_declared_on_the_corpus_range_only(setting) -> None:
+    start, end = v2.SFT_CORPUS_RANGE
     manifest, entry = _declare(start, end - start)
     job = parse_job(manifest)
 
     assert job.episode.is_suite
     contract = entry.contract["environments"][ENV]
     assert contract["episode"]["renderer_id"] == CHATML_RENDERER_ID
-    for prompt_start, count in ((0, 10), (start - 1, 2), (end - 1, 2), (v2.SFT_UNGRADED_START, 1)):
+    for prompt_start, count in ((0, 10), (start - 1, 2), (v2.SFT_GRADED_START, 1),
+                                (v2.SFT_UNGRADED_START, 1)):
         with pytest.raises(ValueError, match="corpus ranges"):
             _declare(prompt_start, count)
 

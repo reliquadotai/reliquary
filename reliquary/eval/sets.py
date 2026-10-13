@@ -127,13 +127,14 @@ CORPUS_SERVABLE_RANGES: dict[str, tuple[UsedRange, ...]] = {
             ("safety/thinking", 101_778, 107_165),
         )
     ),
-    # The SFT worlds' graded scenarios, `SFT_GRADED_RANGE`, restated from
-    # `envscaler_tools_v2.environment`. Its ungraded range [2546, 7225)
-    # (EnvScaler-SFT-Scenario, no checks) is held in reserve: no corpus job
-    # takes it until one is decided, and none could filter on its reward.
+    # `SFT_CORPUS_RANGE`, restated from `envscaler_tools_v2.environment`: the
+    # graded scenarios of the 12 SFT worlds kept for the corpus. The whole
+    # graded SFT range [1296, 2546) (25 worlds, 13 of which a 27B policy
+    # almost never wins) and the ungraded range [2546, 7225)
+    # (EnvScaler-SFT-Scenario, no checks) are held in reserve.
     "envscaler_tools_v2": (
-        UsedRange("corpus", "envscaler_tools_v2", "train", 1296, 1250,
-                  "SFT worlds, graded"),
+        UsedRange("corpus", "envscaler_tools_v2", "train", 7225, 600,
+                  "SFT worlds kept for the corpus, graded"),
     ),
 }
 

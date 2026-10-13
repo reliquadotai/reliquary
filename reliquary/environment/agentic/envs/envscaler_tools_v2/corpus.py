@@ -11,14 +11,19 @@ on the SFT corpus has never seen an RL world's tools or rules. Alternating
 rather than hashing gives exact, reviewable counts; the world numbers carry no
 meaning upstream, so alternation is as unbiased as a salt.
 
-**Three ranges, contiguous, in this order** (boundaries in ``environment``):
+**Four ranges, contiguous, in this order** (boundaries in ``environment``):
 
 * ``rl`` — scenarios of the 26 RL worlds, graded;
 * ``sft_graded`` — scenarios of the 25 SFT worlds, graded the same way;
 * ``sft_ungraded`` — EnvScaler-SFT-Scenario over the 140 ``_sft`` worlds,
   which ships tasks and initial states but no checks. Reward is always 0 here;
   the range is held in reserve and no corpus job may take it yet
-  (`reliquary.eval.sets.CORPUS_SERVABLE_RANGES`).
+  (`reliquary.eval.sets.CORPUS_SERVABLE_RANGES`);
+* ``sft_corpus`` — the ``sft_graded`` scenarios again, in the same order,
+  minus those of ``SFT_CORPUS_EXCLUDED_WORLDS``: the range a corpus job
+  serves. Appended rather than carved out of ``sft_graded`` so that every
+  index keeps naming the scenario it named; ``sft_graded`` stays laid out and
+  is held in reserve.
 
 Within a range the order is round-robin over worlds (each world's k-th
 scenario before any world's k+1-th), so any contiguous slice — a corpus job's
@@ -67,13 +72,28 @@ CORPUS_FILES: Mapping[str, str] = MappingProxyType({
     ),
 })
 
-RANGE_ORDER = ("rl", "sft_graded", "sft_ungraded")
-GRADED_RANGES = frozenset({"rl", "sft_graded"})
+RANGE_ORDER = ("rl", "sft_graded", "sft_ungraded", "sft_corpus")
+GRADED_RANGES = frozenset({"rl", "sft_graded", "sft_corpus"})
 # Which file each range's positions index into.
 RANGE_SOURCE: Mapping[str, str] = MappingProxyType({
     "rl": "rl_scen.json",
     "sft_graded": "rl_scen.json",
     "sft_ungraded": "sft_scen.json",
+    "sft_corpus": "rl_scen.json",
+})
+
+# SFT worlds a corpus job does not draw from. Measured in the 2026-10-13 GPU
+# re-trial (Qwen3.8-27B, bf16, 450 episodes over the whole graded SFT range,
+# 9-24 per world): nine won none of their episodes and four at most 2 of 19
+# (env_142 1/19, env_148 1/19, env_152 2/19, env_172 1/15). Their episodes
+# are mostly paid failures: turn_limit and invalid_action dominate, and the
+# winners' scenarios are where the corpus' useful tokens are. The other 12
+# worlds won 43% (paid / useful tokens 2.6). Their scenarios stay in
+# ``sft_graded`` (reserve), so a stronger policy can be measured on them.
+SFT_CORPUS_EXCLUDED_WORLDS = frozenset({
+    "env_142_rl", "env_144_rl", "env_146_rl", "env_148_rl", "env_150_rl",
+    "env_152_rl", "env_162_rl", "env_168_rl", "env_172_rl", "env_176_rl",
+    "env_180_rl", "env_182_rl", "env_190_rl",
 })
 
 # Scenarios that name a vendor's model — in the task, or in the initial state
@@ -265,6 +285,16 @@ def candidates(
     return split, ranges
 
 
+def sft_corpus_positions(
+    rl_records: Sequence[Mapping[str, Any]], sft_graded: Sequence[int],
+) -> list[int]:
+    """``sft_graded``'s positions, in order, minus the excluded worlds'."""
+    return [
+        int(position) for position in sft_graded
+        if rl_records[int(position)]["env_id"] not in SFT_CORPUS_EXCLUDED_WORLDS
+    ]
+
+
 def build_corpus(
     sources: Mapping[str, Sequence[Mapping[str, Any]]],
     positions: Mapping[str, Sequence[int]],
@@ -337,6 +367,7 @@ __all__ = [
     "GRADED_RANGES",
     "RANGE_ORDER",
     "RANGE_SOURCE",
+    "SFT_CORPUS_EXCLUDED_WORLDS",
     "SELECTION_PATH",
     "Scenario",
     "build_corpus",
@@ -348,6 +379,7 @@ __all__ = [
     "read_sources",
     "scenario_mentions_vendor",
     "selected_positions",
+    "sft_corpus_positions",
     "split_worlds",
     "world_source",
     "WORLD_SOURCE_FIXES",
