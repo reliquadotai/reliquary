@@ -61,6 +61,8 @@ SWE episode jobs (`harness: "bash"`, `reliquary-swe`) are unchanged.
     `[1220, 1713)` (`RL_ONLY_RANGES`).
   - `reliquary_telecom_solo_v1` serves no corpus job, because its train split
     still holds the tau2-bench benchmark tickets.
+  - Enforced at `jobs create` and again when a validator builds the job's
+    intake (`build_suite_intake`), so an edited manifest is not served.
 - An environment that no profile declares (telecom v2 today) gets its contract
   body from the registry spec and the job's episode bounds
   (`agentic_source.suite_episode_body`). This body is for corpus contracts
@@ -109,6 +111,14 @@ checks in order:
 3. Vocabulary.
 4. The generic turn checks:
    - spans, short turns and budget
+   - each span is one turn (`suite_episode.suite_span_refusal`, which applies
+     the SWE rule `trajectory_parse.check_span_tokens`): a stop id
+     (`<|im_end|>` or `<|endoftext|>`) only as the span's last token, and no
+     turn markup (`<|im_start|>`, and the tool-response tags where they are
+     single tokens) anywhere in it, nor spelled out as plain text. Without
+     this, one span could hold a call, a made-up tool response and a final
+     answer, all of it accepted by the replay, paid and trained as the
+     model's. Miners precheck with the same function.
    - termination: a turn before the last ends on `<|im_end|>` or exactly at
      the cap, and the last turn may also end on `<|endoftext|>`, so
      `<|endoftext|>` mid-episode is `bad_termination`
@@ -120,14 +130,21 @@ checks in order:
    reads the same result over the submitted tokens. That function is not edited
    because it is in the builtin environments' pinned implementation digest.
    The replay runs in a spawned, CPU-only process pool that holds the
-   checkpoint tokenizer, under a 30 s wall deadline. The route's worker thread
-   waits on it, never the event loop. The intake compares tokens up to the end
-   of the last span (prompt included), the spans (and so the number of
-   actions), and the termination against `stop`.
+   checkpoint tokenizer. The 30 s wall deadline starts when a worker starts
+   the replay, not while it waits in the queue. The route's worker thread
+   waits on the pool, never the event loop. The intake compares tokens up to
+   the end of the last span (prompt included), the spans (and so the number
+   of actions), and the termination against `stop`.
 
-A mismatch is an intake refusal (`bad_observation`, `bad_turns` or
-`bad_stop`). It costs no slot and carries no sanction. The replay's
-`task_id`, `reward` and `success` go into `IntakeFacts`.
+A mismatch, or a replay past its deadline, is an intake refusal
+(`bad_observation`, `bad_turns` or `bad_stop`). It costs no slot and carries
+no sanction. The replay's `task_id`, `reward` and `success` go into
+`IntakeFacts`.
+
+When the pool cannot answer, that is `ReplayUnavailable` and the route answers
+503, never a refusal. This happens when a worker died twice in a row (a broken
+pool is rebuilt and the replay retried once, logged as an error), or when
+there is no answer within 180 s, queue included.
 
 ### Grading
 
@@ -145,6 +162,12 @@ these fields:
 
 A failed audit is graded `audit_failed`. A record that no longer replays is
 graded `unreplayable`, which certifies nothing and sanctions nobody.
+
+A replay past its deadline is not graded and is retried at the next rescan,
+because intake already replayed it within the deadline, so the host was
+starved. After 3 misses it is graded `unreplayable`, so one submission never
+holds every period. `ReplayUnavailable` is retried the same way. The grader
+runs as many grades at once as the pool has workers.
 
 Suite jobs have no grade-executor pin, no replay lease check, no
 `grade_refusal`, and no quarantine hold or regrade (`remote_graded`).
@@ -170,8 +193,13 @@ environment:
   `<|im_end|><|im_end|>\n`. The export drops the observation's copy, which is
   never in the mask. A turn cut at the cap keeps it, because it is that turn's
   only terminator. After a last turn that ends on `<|im_end|>`, the export
-  appends the template's `\n`, unmasked. Span tokens are never changed. The RL
-  renderer is not changed either, because it is consensus.
+  appends the template's `\n`, unmasked. The RL renderer is not changed,
+  because it is consensus.
+- `+final-endoftext-as-im-end-v1` is added to `tokens_transform` only on the
+  rows it applies to. A last turn that stopped on `<|endoftext|>` has that
+  token replaced by `<|im_end|>` (still masked) and then gets the `\n`, so the
+  row is the template's transcript and the model learns to stop on
+  `<|im_end|>`. No other span token is ever changed.
 - `messages`: system (the episode guidance), user (the task), then for each
   turn an assistant message with `reasoning_content`, `content` and
   `tool_calls` (`{type: "function", function: {name, arguments: <object>}}`),

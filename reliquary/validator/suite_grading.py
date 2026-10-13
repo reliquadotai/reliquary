@@ -27,13 +27,20 @@ logger = logging.getLogger(__name__)
 
 # What a grade document says graded it.
 LOCAL_GRADER = "validator-replay"
+# Deadline misses of one submission before it is graded unreplayable.
+DEADLINE_RETRIES = 3
 
 
 class LocalEpisodeGrader(CorpusGrader):
     def __init__(self, *, job, records, replayer, **kwargs) -> None:
+        # As many grades in flight as there are replay workers: more would
+        # only queue in the pool (``GRADE_CONCURRENCY`` is sized for remote
+        # executors), and the intake shares that pool.
+        kwargs.setdefault("concurrency", max(1, int(getattr(replayer, "workers", 2))))
         super().__init__(job=job, records=records, dispatcher=None, renderer=None, source=None,
                          params=None, **kwargs)
         self._replayer = replayer
+        self._deadline_misses: dict[str, int] = {}
 
     def status(self) -> dict:
         return {**super().status(), "grader": LOCAL_GRADER}
@@ -63,6 +70,22 @@ class LocalEpisodeGrader(CorpusGrader):
             tokens=trajectory["tokens"],
             spans=[(turn["start"], turn["end"]) for turn in trajectory["turns"]],
             stop=trajectory["stop"]))
+        # A pool that cannot answer (``ReplayUnavailable``) raises: logged and
+        # retried at the next rescan, as a grade that failed to run.
+        if outcome.deadline:
+            # Past its deadline on a worker's own clock, after intake replayed
+            # it within that deadline: the host was starved, not the
+            # trajectory wrong. Left ungraded (unpaid meanwhile) and retried,
+            # a bounded number of times so one submission never holds every
+            # period: then graded as it is, unreplayable.
+            misses = self._deadline_misses.get(submission_id, 0) + 1
+            self._deadline_misses[submission_id] = misses
+            if misses < DEADLINE_RETRIES:
+                logger.warning("suite replay of %s ran past its deadline (%d/%d); retried at "
+                               "the next rescan", submission_id[:12], misses, DEADLINE_RETRIES)
+                return None
+            logger.error("suite replay of %s ran past its deadline %d times; graded "
+                         "unreplayable", submission_id[:12], misses)
         if outcome.refusal is not None:
             # Intake replayed it already: only another environment or
             # tokenizer than the one that admitted it can land here. Nobody is

@@ -154,7 +154,6 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
 SUITE_EPISODE_ROW_FIELDS = ("job_id", "submission_id", "prompt_index", "task_id", "messages",
                             "tools", "tokens", "assistant_mask", "tokens_transform",
                             "graded_success", "replay_certified", "reward", "turns", "stop")
-SUITE_TOKENS_TRANSFORM = "chatml-single-im-end-v1"
 
 
 class EpisodeUnreplayed(ValueError):
@@ -167,7 +166,7 @@ def suite_episode_row(*, job, submission_id: str, record: Mapping, grade: Mappin
     """The row of one graded suite trajectory. Raises ``EpisodePromptMismatch``
     or ``EpisodeUnreplayed``."""
     from reliquary.corpus.suite_episode import (
-        IM_END, compare_replay, episode_seed, export_tokens, replay_suite, single_id,
+        END_OF_TEXT, IM_END, compare_replay, episode_seed, export_tokens, replay_suite, single_id,
         suite_messages, tools_of,
     )
 
@@ -188,15 +187,20 @@ def suite_episode_row(*, job, submission_id: str, record: Mapping, grade: Mappin
     if refusal is not None:
         raise EpisodeUnreplayed(f"{submission_id}: {refusal}")
     full_spans = [(len(prompt) + s, len(prompt) + e) for s, e in spans]
-    exported, mask = export_tokens(prompt + tokens, full_spans, im_end_id=single_id(encode, IM_END),
-                                   newline_ids=encode("\n"))
+    try:
+        end_of_text = single_id(encode, END_OF_TEXT)
+    except ValueError:
+        end_of_text = None
+    exported, mask, transforms = export_tokens(
+        prompt + tokens, full_spans, im_end_id=single_id(encode, IM_END),
+        newline_ids=encode("\n"), end_of_text_id=end_of_text)
     return {"job_id": job.job_id, "submission_id": submission_id, "prompt_index": index,
             "task_id": str(grade.get("instance_id") or trace.task_id),
             "messages": json.dumps(suite_messages(trace, task=task, decode=decode,
                                                   spans=full_spans), ensure_ascii=False),
             "tools": json.dumps(tools_of(task), ensure_ascii=False),
             "tokens": exported, "assistant_mask": mask,
-            "tokens_transform": SUITE_TOKENS_TRANSFORM,
+            "tokens_transform": "+".join(transforms),
             "graded_success": bool(grade.get("graded_success")),
             "replay_certified": bool(grade.get("replay_certified")),
             "reward": float(trace.reward.reward),

@@ -44,6 +44,12 @@ class IntakeRefusal:
     detail: dict = field(default_factory=dict)
 
 
+class ReplayUnavailable(RuntimeError):
+    """The validator could not replay the trajectory just now (its replay
+    pool is down or saturated): nothing is known against it, so it is never a
+    refusal. The route answers 503 and the miner resubmits; a grader retries."""
+
+
 class EpisodeIntake:
     def __init__(self, *, job, source, renderer, tokenizer, vocab_size: int | None,
                  chunk_tokens: int, min_chunk_tokens: int = MIN_CHUNK_TOKENS) -> None:
@@ -150,5 +156,5 @@ def build_grade_renderer(job, *, checkpoint_dir: str):
     return agentic_swe.load_turn_renderer(checkpoint_dir)
 
 
-__all__ = ["EpisodeIntake", "IntakeFacts", "IntakeRefusal", "build_episode_intake",
+__all__ = ["EpisodeIntake", "IntakeFacts", "IntakeRefusal", "ReplayUnavailable", "build_episode_intake",
            "build_grade_renderer"]

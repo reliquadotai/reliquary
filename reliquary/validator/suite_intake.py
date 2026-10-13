@@ -18,9 +18,9 @@ import multiprocessing
 import os
 import signal
 import threading
-import time
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
 from typing import Any
 
@@ -38,18 +38,21 @@ from reliquary.corpus.suite_episode import (
     TokenizerCodec,
     episode_seed,
     replay_outcome,
+    suite_span_refusal,
     turn_ids,
 )
 from reliquary.protocol.toploc import MIN_CHUNK_TOKENS
-from reliquary.validator.agentic_intake import IntakeFacts, IntakeRefusal
+from reliquary.validator.agentic_intake import IntakeFacts, IntakeRefusal, ReplayUnavailable
 from reliquary.validator.corpus_text import REASON_PROMPT_MISMATCH, REASON_TOKEN_OUT_OF_VOCAB
 
 logger = logging.getLogger(__name__)
 
-# A telecom replay takes milliseconds; this bounds a pathological one.
+# A telecom replay takes milliseconds; this bounds a pathological one. The
+# clock starts when a worker starts the replay, never while it is queued.
 SUITE_REPLAY_DEADLINE_SECONDS = 30.0
-# Past the deadline, how long the waiting thread gives a worker to answer.
-_RESULT_GRACE_SECONDS = 5.0
+# How long a caller waits for a replay, queue included, before giving up on
+# the pool for now (``ReplayUnavailable``: retryable, never a refusal).
+SUITE_REPLAY_WAIT_SECONDS = 180.0
 SUITE_REPLAY_WORKERS = int(os.environ.get("RELIQUARY_CORPUS_SUITE_REPLAY_WORKERS", "2"))
 DEADLINE_REFUSAL = ("bad_observation", {"why": "the replay ran past its deadline"})
 
@@ -77,17 +80,14 @@ def initialize_suite_replay_worker(tokenizer_json: str) -> None:
 
 
 @contextmanager
-def _deadline(deadline_monotonic: float):
-    """Admission's ``_deadline``: SIGALRM in the worker's main thread."""
-    remaining = float(deadline_monotonic) - time.monotonic()
-    if remaining <= 0.0:
-        raise _ReplayTimeout("suite replay deadline exceeded")
-
+def _deadline(seconds: float):
+    """Admission's ``_deadline``: SIGALRM in the worker's main thread, armed
+    when the worker starts the replay."""
     def _raise(_signum, _frame):
         raise _ReplayTimeout("suite replay deadline exceeded")
 
     previous = signal.signal(signal.SIGALRM, _raise)
-    signal.setitimer(signal.ITIMER_REAL, remaining)
+    signal.setitimer(signal.ITIMER_REAL, max(float(seconds), 0.001))
     try:
         yield
     finally:
@@ -102,20 +102,22 @@ def _replay(env_name: str, encode, decode, **kwargs) -> SuiteReplayOutcome:
                           decode=decode, **kwargs)
 
 
-def replay_in_worker(env_name: str, deadline_monotonic: float, **kwargs) -> SuiteReplayOutcome:
+def replay_in_worker(env_name: str, deadline_seconds: float, **kwargs) -> SuiteReplayOutcome:
     """Top-level (picklable): one replay in a spawned worker."""
     if _WORKER_TOKENIZER is None:
         raise RuntimeError("suite replay worker has no tokenizer")
     codec = TokenizerCodec(_WORKER_TOKENIZER)
     try:
-        with _deadline(deadline_monotonic):
+        with _deadline(deadline_seconds):
             return _replay(env_name, codec.encode, codec.decode, **kwargs)
     except _ReplayTimeout:
-        return SuiteReplayOutcome(DEADLINE_REFUSAL)
+        return SuiteReplayOutcome(DEADLINE_REFUSAL, deadline=True)
 
 
 class InlineSuiteReplayer:
     """In this process, with the caller's codec: tests, and the export."""
+
+    workers = 2
 
     def __init__(self, *, encode, decode) -> None:
         self._encode, self._decode = encode, decode
@@ -132,15 +134,29 @@ class InlineSuiteReplayer:
 
 class PoolSuiteReplayer:
     """Replays in spawned workers that hold the checkpoint's tokenizer, one
-    pool for every suite job of the process (built on first use)."""
+    pool for every suite job of the process (built on first use).
+
+    A worker that dies (OOM, a crash in the environment) breaks a
+    ``ProcessPoolExecutor`` for good: every later submit raises
+    ``BrokenProcessPool``. So a broken pool is dropped and rebuilt, and the
+    replay retried once on the new one; a second break, or no answer within
+    ``wait_seconds``, is ``ReplayUnavailable`` (the route answers 503, the
+    grader retries at its next rescan), never a verdict on the trajectory."""
 
     def __init__(self, tokenizer_json: str, *, workers: int = SUITE_REPLAY_WORKERS,
-                 deadline_seconds: float = SUITE_REPLAY_DEADLINE_SECONDS) -> None:
+                 deadline_seconds: float = SUITE_REPLAY_DEADLINE_SECONDS,
+                 wait_seconds: float = SUITE_REPLAY_WAIT_SECONDS) -> None:
         self._tokenizer_json = tokenizer_json
         self._workers = max(1, int(workers))
         self._deadline = float(deadline_seconds)
+        self._wait = float(wait_seconds)
         self._pool: ProcessPoolExecutor | None = None
         self._lock = threading.Lock()
+        self.rebuilds = 0
+
+    @property
+    def workers(self) -> int:
+        return self._workers
 
     @classmethod
     def for_tokenizer(cls, tokenizer, **kwargs) -> "PoolSuiteReplayer":
@@ -157,25 +173,42 @@ class PoolSuiteReplayer:
                     initializer=initialize_suite_replay_worker, initargs=(self._tokenizer_json,))
             return self._pool
 
-    def _submit(self, env_name: str, kwargs):
-        deadline = time.monotonic() + self._deadline
-        return self._executor().submit(replay_in_worker, env_name, deadline, **kwargs)
+    def _drop(self, pool: ProcessPoolExecutor, exc: BaseException) -> None:
+        with self._lock:
+            if self._pool is not pool:
+                return                      # another caller rebuilt it already
+            self._pool = None
+            self.rebuilds += 1
+        logger.error("SUITE REPLAY POOL BROKEN (%s: %s): a worker died; rebuilding it "
+                     "(rebuild %d)", type(exc).__name__, exc, self.rebuilds)
+        pool.shutdown(wait=False, cancel_futures=True)
 
     def replay(self, env_name: str, **kwargs) -> SuiteReplayOutcome:
         """Blocks the calling thread (never call it on the event loop)."""
-        future = self._submit(env_name, kwargs)
-        try:
-            return future.result(timeout=self._deadline + _RESULT_GRACE_SECONDS)
-        except FutureTimeout:
-            future.cancel()
-            return SuiteReplayOutcome(DEADLINE_REFUSAL)
+        for attempt in range(2):
+            pool = self._executor()
+            try:
+                future = pool.submit(replay_in_worker, env_name, self._deadline, **kwargs)
+                return future.result(timeout=self._wait)
+            except BrokenProcessPool as exc:
+                self._drop(pool, exc)
+            except FutureTimeout:
+                future.cancel()
+                raise ReplayUnavailable(f"no replay answer within {self._wait:.0f} s") from None
+        raise ReplayUnavailable("the replay pool broke twice in a row")
 
     async def areplay(self, env_name: str, **kwargs) -> SuiteReplayOutcome:
-        future = asyncio.wrap_future(self._submit(env_name, kwargs))
-        try:
-            return await asyncio.wait_for(future, self._deadline + _RESULT_GRACE_SECONDS)
-        except asyncio.TimeoutError:
-            return SuiteReplayOutcome(DEADLINE_REFUSAL)
+        for attempt in range(2):
+            pool = self._executor()
+            try:
+                future = asyncio.wrap_future(
+                    pool.submit(replay_in_worker, env_name, self._deadline, **kwargs))
+                return await asyncio.wait_for(future, self._wait)
+            except BrokenProcessPool as exc:
+                self._drop(pool, exc)
+            except asyncio.TimeoutError:
+                raise ReplayUnavailable(f"no replay answer within {self._wait:.0f} s") from None
+        raise ReplayUnavailable("the replay pool broke twice in a row")
 
     def close(self) -> None:
         with self._lock:
@@ -253,6 +286,11 @@ class SuiteEpisodeIntake:
         refusal = check_turn_spans(spans, len(tokens), episode.max_turns)
         if not refusal.ok:
             return IntakeRefusal(refusal.reason or "", dict(refusal.detail))
+        # Each span one turn: no stop before its end, no turn markup at all.
+        inside = suite_span_refusal(tokens, spans, encode=self._codec.encode,
+                                    decode=self._codec.decode)
+        if inside is not None:
+            return IntakeRefusal(inside[0], dict(inside[1]))
         # Only after the spans are known sound; cheap ones before the replay.
         checks = (
             lambda: check_short_turns(spans, self._min_chunk),
@@ -288,8 +326,12 @@ def build_suite_intake(job, *, tokenizer, vocab_size: int | None, chunk_tokens: 
     """The intake a validator serves a suite job with; refuses (a ValueError,
     permanent until a restart) an environment this binary cannot serve."""
     from reliquary.corpus.suite_episode import suite_source
+    from reliquary.eval.sets import refuse_held_out_overlap
 
     try:
+        # `jobs create` checks it too, but a manifest can be written without
+        # it: a served job never takes held-out rows or the RL share.
+        refuse_held_out_overlap(job.prompt_source, job.prompt_start, job.prompt_count)
         source = suite_source(job.episode)
     except ValueError as exc:
         raise ValueError(f"job {job.job_id!r}: {exc}") from exc

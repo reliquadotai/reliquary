@@ -130,6 +130,51 @@ def turn_ids(encode: Callable[[str], list[int]]) -> tuple[int, frozenset[int]]:
     return terminator, stops
 
 
+_MARKUP = ("<|im_start|>", "<tool_response>", "</tool_response>")
+
+
+def turn_markup_ids(encode: Callable[[str], list[int]]) -> frozenset[int]:
+    """The turn markup the renderer writes between spans, never inside one:
+    ``<|im_start|>`` and the tool-response tags, where they are single tokens."""
+    ids = set()
+    for text in _MARKUP:
+        try:
+            ids.add(single_id(encode, text))
+        except ValueError:
+            pass
+    return frozenset(ids)
+
+
+def suite_span_refusal(tokens: Sequence[int], spans: Sequence[tuple[int, int]], *,
+                       encode: Callable[[str], list[int]],
+                       decode: Callable[[list[int]], str] | None = None) -> tuple[str, dict] | None:
+    """``(reason, detail)`` when a span is not one assistant turn, else None.
+
+    The SWE rule (``trajectory_parse.check_span_tokens``): a stop id only as
+    the span's last token, no turn markup anywhere. Without it a span can hold
+    ``<|im_end|>``, a made-up ``<|im_start|>user`` tool response and a second
+    turn, and the replay, which reads the span as one action, accepts it.
+    With ``decode``, the same markers spelled out as plain text are refused
+    too. The miner's precheck calls this same function."""
+    from reliquary.corpus.trajectory_parse import TrajectoryRefused, check_span_tokens
+
+    _, stop_ids = turn_ids(encode)
+    try:
+        check_span_tokens(tokens, spans, stop_ids=stop_ids, markup_ids=turn_markup_ids(encode))
+    except TrajectoryRefused as refused:
+        return refused.reason, refused.detail
+    if decode is not None:
+        markers = (*_MARKUP, IM_END, END_OF_TEXT)
+        for k, (start, end) in enumerate(spans):
+            body = list(tokens[start:end])
+            if body and body[-1] in stop_ids:
+                body = body[:-1]
+            text = decode(body)
+            if any(marker in text for marker in markers):
+                return "bad_turns", {"turn": k, "why": "turn markup spelled out inside the span"}
+    return None
+
+
 class SuiteSource:
     """A suite job's rows: the environment's train-split tasks, by index, and
     the renderer the job declares. ``initial_ids`` is what the miner prompts
@@ -254,6 +299,9 @@ class SuiteReplayOutcome:
     success: bool | None = None
     termination_reason: str | None = None
     trace_digest: str | None = None
+    # The replay ran past its wall deadline on the worker: a refusal at
+    # intake (the trajectory costs that much), a retry for the grader.
+    deadline: bool = False
 
 
 def replay_outcome(environment, *, renderer_id: str, task_index: int, seed: int,
@@ -283,21 +331,39 @@ def replay_outcome(environment, *, renderer_id: str, task_index: int, seed: int,
 # -- export ---------------------------------------------------------------------
 
 
-def export_tokens(full: Sequence[int], spans: Sequence[tuple[int, int]], *, im_end_id: int,
-                  newline_ids: Sequence[int]) -> tuple[list[int], list[int]]:
-    """``(tokens, assistant_mask)`` of a trajectory, rewritten into the model's
-    chat template (spans in ``full`` coordinates).
+TRANSFORM_SINGLE_IM_END = "chatml-single-im-end-v1"
+# Recorded only on the rows it applies to.
+TRANSFORM_FINAL_ENDOFTEXT = "final-endoftext-as-im-end-v1"
 
-    The transform. A ChatML turn keeps the ``<|im_end|>`` the model stopped on
-    (it is the token that ends the turn and must be learned), and the
-    renderer's observation text opens with its own ``<|im_end|>\\n`` (the RL
-    renderer is consensus and stays as it is). Where both are present the
-    transcript holds ``<|im_end|><|im_end|>\\n``; the chat template writes one.
-    So the observation's copy, never in the mask, is dropped; a turn cut at
-    the cap keeps it (it is then the turn's only terminator). A last turn
-    ending on ``<|im_end|>`` gets the ``\\n`` the template writes after it,
-    unmasked. Nothing in a span is ever touched."""
+
+def export_tokens(full: Sequence[int], spans: Sequence[tuple[int, int]], *, im_end_id: int,
+                  newline_ids: Sequence[int], end_of_text_id: int | None = None,
+                  ) -> tuple[list[int], list[int], list[str]]:
+    """``(tokens, assistant_mask, transforms)`` of a trajectory, rewritten
+    into the model's chat template (spans in ``full`` coordinates).
+
+    ``chatml-single-im-end-v1``, always. A ChatML turn keeps the
+    ``<|im_end|>`` the model stopped on (it is the token that ends the turn
+    and must be learned), and the renderer's observation text opens with its
+    own ``<|im_end|>\\n`` (the RL renderer is consensus and stays as it is).
+    Where both are present the transcript holds ``<|im_end|><|im_end|>\\n``;
+    the chat template writes one. So the observation's copy, never in the
+    mask, is dropped; a turn cut at the cap keeps it (it is then the turn's
+    only terminator). A last turn ending on ``<|im_end|>`` gets the ``\\n``
+    the template writes after it, unmasked.
+
+    ``final-endoftext-as-im-end-v1``, when it applies. A last turn that
+    stopped on ``<|endoftext|>`` (accepted: the renderer reads the turn the
+    same) has it replaced by ``<|im_end|>``, still in the mask, then the
+    ``\\n``: the template ends an assistant turn on ``<|im_end|>``, and that is
+    what a model trained on these rows should stop on. No other span token is
+    ever touched."""
     full = [int(t) for t in full]
+    transforms = [TRANSFORM_SINGLE_IM_END]
+    if (spans and end_of_text_id is not None and end_of_text_id != im_end_id
+            and full[spans[-1][1] - 1] == end_of_text_id):
+        full[spans[-1][1] - 1] = im_end_id
+        transforms.append(TRANSFORM_FINAL_ENDOFTEXT)
     dropped: set[int] = set()
     for start, end in spans[:-1]:
         if full[end - 1] == im_end_id and end < len(full) and full[end] == im_end_id:
@@ -310,7 +376,7 @@ def export_tokens(full: Sequence[int], spans: Sequence[tuple[int, int]], *, im_e
     if spans and full[spans[-1][1] - 1] == im_end_id:
         tokens += [int(t) for t in newline_ids]
         mask += [0] * len(newline_ids)
-    return tokens, mask
+    return tokens, mask, transforms
 
 
 def tools_of(task) -> list[dict]:
@@ -376,5 +442,6 @@ def suite_messages(trace, *, task, decode, spans: Sequence[tuple[int, int]]) -> 
 
 __all__ = ["SUITE_RENDERERS", "SuiteReplayOutcome", "SuiteSource", "compare_replay",
            "episode_seed", "export_tokens", "replay_outcome", "replay_stop", "replay_suite",
-           "suite_messages", "suite_source", "suite_spec", "suite_spec_refusal", "tools_of",
+           "suite_messages", "suite_source", "suite_span_refusal", "suite_spec", "suite_spec_refusal",
+           "tools_of", "turn_markup_ids",
            "turn_ids"]

@@ -63,7 +63,7 @@ from reliquary.protocol.corpus_submission import (
     CorpusSubmissionResponse,
 )
 from reliquary.infrastructure.corpus_record_store import RECORD_SCHEMA_V2
-from reliquary.validator.agentic_intake import IntakeFacts
+from reliquary.validator.agentic_intake import IntakeFacts, ReplayUnavailable
 from reliquary.validator.corpus_text import (
     Renderer,
     check_prompt_fidelity,
@@ -1831,7 +1831,12 @@ def build_corpus_router(
                 logger.error("corpus job %s is an episode job but has no episode intake", job_id)
                 raise HTTPException(status_code=500, detail="corpus_episode_intake_unconfigured")
             # Every refusal here precedes any slot or cursor consumption.
-            outcome = await asyncio.to_thread(episode_intake.check, request)
+            try:
+                outcome = await asyncio.to_thread(episode_intake.check, request)
+            except ReplayUnavailable as exc:
+                # Ours, not the miner's: a retryable 503, never a refusal.
+                logger.error("corpus job %s: replay unavailable: %s", job_id, exc)
+                raise HTTPException(status_code=503, detail="corpus_replay_unavailable") from exc
             if not isinstance(outcome, IntakeFacts):
                 try:
                     reason = CorpusRejectReason(outcome.reason)
