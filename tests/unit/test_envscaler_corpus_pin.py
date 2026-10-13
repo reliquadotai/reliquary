@@ -94,12 +94,16 @@ def test_every_source_declares_a_normalized_digest() -> None:
         assert len(MODULE.NORMALIZED_SHA256[name]) == 64, name
 
 
-def test_the_loader_reads_the_filenames_this_script_writes() -> None:
-    """The two names are a contract between the script and the environment."""
-    loader = (
-        Path(__file__).parents[2]
-        / "reliquary/environment/agentic/envs/envscaler_tools_v1/environment.py"
-    ).read_text(encoding="utf-8")
+def test_the_loaders_read_the_filenames_this_script_writes() -> None:
+    """The names are a contract between the script and the environments.
 
+    v1 reads the first two; v2 reads all three.
+    """
+    envs = Path(__file__).parents[2] / "reliquary/environment/agentic/envs"
+    v1 = (envs / "envscaler_tools_v1/environment.py").read_text(encoding="utf-8")
+    v2 = (envs / "envscaler_tools_v2/corpus.py").read_text(encoding="utf-8")
+
+    for name in ("env_meta.json", "rl_scen.json"):
+        assert f'"{name}"' in v1, name
     for name in MODULE.SOURCES:
-        assert f'"{name}"' in loader, name
+        assert f'"{name}"' in v2, name
