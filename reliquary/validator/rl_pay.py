@@ -52,7 +52,7 @@ NOTE = (
     "alpha_per_mtoken_paid counts every completion token of the paid groups. Per GPU-hour, "
     "an environment accepts groups only part of the cycle (accepting_fraction_of_cycle is a "
     "lower bound: the time to reach its target) and pays only part of what is sent "
-    "(paid_fraction_of_submitted); estimate.alpha_per_gpu_hour is an upper bound for a miner "
+    "(paid_fraction_of_submitted: low counts every refused precommit as a lost group, high counts none, since refusals are retried); estimate.alpha_per_gpu_hour, a low/high range, is an upper bound for a miner "
     "alone at the stated tokens_per_second, since miners share each environment's demand. "
     "A hotkey under 2 % of the miner total is ramped down, payment goes through Yuma "
     "consensus with the other validators, exploration groups are paid 15 %, and prices move "
@@ -123,7 +123,12 @@ def window_stat(archive: Mapping[str, Any]) -> dict | None:
             "paid_share": share,
             "completion_tokens": completion,
             "prompt_tokens": prompt,
-            "submitted_groups": len(groups) + len(rejected) + refused_precommits,
+            # Uploaded groups (paid or rejected) and precommits refused for
+            # capacity. A refusal is retried (the reference miner retries a
+            # full batch up to 3 times), so refusals overcount lost groups:
+            # the paid fraction is published as a range between the two.
+            "submitted_groups": len(groups) + len(rejected),
+            "refused_precommits": refused_precommits,
             "rejections": dict(reasons),
             "accept_seconds": (
                 (int(ready_round) - open_round) * ROUND_SECONDS
@@ -233,6 +238,7 @@ class RlPayBoard:
                 for s in rows if s["environments"][environment]["paid_groups"]
             ]
             submitted = sum(s["environments"][environment]["submitted_groups"] for s in rows)
+            refused = sum(s["environments"][environment].get("refused_precommits", 0) for s in rows)
             paid_groups = sum(s["environments"][environment]["paid_groups"] for s in rows)
             rejections: collections.Counter = collections.Counter()
             for s in rows:
@@ -249,7 +255,11 @@ class RlPayBoard:
                 "accepting_fraction_of_cycle": _median(
                     min(1.0, s["environments"][environment]["accept_seconds"] / cycle_seconds(s))
                     for s in cyc if s["environments"][environment]["accept_seconds"] is not None),
-                "paid_fraction_of_submitted": (paid_groups / submitted) if submitted else None,
+                "paid_fraction_of_submitted": None if not submitted else {
+                    # Every refused precommit a distinct lost group / none of them.
+                    "low": paid_groups / (submitted + refused),
+                    "high": paid_groups / submitted,
+                },
                 "rejections": dict(rejections),
                 "fill_seconds_median": _median(
                     s["environments"][environment]["accept_seconds"] for s in rows),
@@ -287,9 +297,14 @@ class RlPayBoard:
                 accepting = market["accepting_fraction_of_cycle"]
                 paid_fraction = market["paid_fraction_of_submitted"]
                 demand = market["paid_tokens_per_hour"]
-                estimate[environment] = {"alpha_per_gpu_hour": (
-                    None if None in (rate, accepting, paid_fraction, demand)
-                    else rate / 1e6 * min(tokens_per_second * 3600 * accepting * paid_fraction, demand))}
+                if None in (rate, accepting, paid_fraction, demand):
+                    estimate[environment] = {"alpha_per_gpu_hour": None}
+                else:
+                    estimate[environment] = {"alpha_per_gpu_hour": {
+                        bound: rate / 1e6 * min(
+                            tokens_per_second * 3600 * accepting * paid_fraction[bound], demand)
+                        for bound in ("low", "high")
+                    }}
         result = {
             "generated_at": self._clock(),
             "note": NOTE,

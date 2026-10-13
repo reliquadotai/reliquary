@@ -62,7 +62,8 @@ def test_window_stat_reads_pools_tokens_and_rejections():
     assert math["paid_share"] == pytest.approx(0.02)          # 2 of 2 slots paid
     assert math["completion_tokens"] == 2 * 16 * 400
     assert math["prompt_tokens"] == 2 * 16 * 100
-    assert math["submitted_groups"] == 6                     # 2 paid + 1 rejected + 3 refused precommits
+    assert math["submitted_groups"] == 3                     # 2 paid + 1 rejected upload
+    assert math["refused_precommits"] == 3
     assert math["rejections"] == {"batch_filled": 1, "precommit_hotkey_active_full": 3}
     assert math["accept_seconds"] == pytest.approx(60.0)
     code = stat["environments"]["code"]
@@ -80,7 +81,8 @@ def test_the_pay_board_formulas():
     assert math["market"]["paid_tokens_per_hour"] == pytest.approx(12800 / cycle * 3600)
     assert math["market"]["alpha_per_hour"] == pytest.approx(0.02 * MAPB * 300)
     assert math["market"]["accepting_fraction_of_cycle"] == pytest.approx(60.0 / cycle)
-    assert math["market"]["paid_fraction_of_submitted"] == pytest.approx(4 / 12)
+    assert math["market"]["paid_fraction_of_submitted"] == {
+        "low": pytest.approx(4 / 12), "high": pytest.approx(4 / 6)}
     assert math["now"]["alpha_per_paid_group"] == pytest.approx(0.02 / 2 * e_cycle)
     assert math["now"]["alpha_per_mtoken_paid"] == pytest.approx(0.02 / 2 * e_cycle / 6400 * 1e6)
     assert math["price"] == {"value": 0.05, "regime": "hold"}
@@ -93,16 +95,18 @@ def test_an_unreadable_chain_nulls_only_the_alpha_fields():
     assert math["market"]["alpha_per_mtoken_paid"] is None
     assert math["now"]["alpha_per_paid_group"] is None
     assert math["market"]["paid_tokens_per_hour"] > 0
-    assert math["market"]["paid_fraction_of_submitted"] == pytest.approx(4 / 12)
+    assert math["market"]["paid_fraction_of_submitted"]["high"] == pytest.approx(4 / 6)
 
 
 def test_the_gpu_hour_estimate_is_bounded_by_demand():
     answer = asyncio.run(_board().answer(200.0))
     math = answer["environments"]["math"]
-    produced = 200.0 * 3600 * math["market"]["accepting_fraction_of_cycle"] * math["market"]["paid_fraction_of_submitted"]
-    bounded = min(produced, math["market"]["paid_tokens_per_hour"])
-    assert answer["estimate"]["math"]["alpha_per_gpu_hour"] == pytest.approx(
-        math["now"]["alpha_per_mtoken_paid"] / 1e6 * bounded)
+    for bound in ("low", "high"):
+        produced = (200.0 * 3600 * math["market"]["accepting_fraction_of_cycle"]
+                    * math["market"]["paid_fraction_of_submitted"][bound])
+        bounded = min(produced, math["market"]["paid_tokens_per_hour"])
+        assert answer["estimate"]["math"]["alpha_per_gpu_hour"][bound] == pytest.approx(
+            math["now"]["alpha_per_mtoken_paid"] / 1e6 * bounded)
 
 
 def test_one_recompute_per_minute():
@@ -142,7 +146,7 @@ def test_the_route_serves_the_board_publicly():
     server._rl_pay_board = _board()
     body = client.get("/rl/pay", params={"tokens_per_second": 150}).json()
     assert set(body["environments"]) == {"math", "code"}
-    assert body["estimate"]["math"]["alpha_per_gpu_hour"] > 0
+    assert body["estimate"]["math"]["alpha_per_gpu_hour"]["low"] > 0
     assert client.get("/rl/pay", params={"tokens_per_second": -1}).status_code == 422
 
 
