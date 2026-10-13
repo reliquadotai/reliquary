@@ -19,6 +19,7 @@ def _service(*, gate_open: bool):
     service._fill_trainer_wait_seconds = {}
     service._fill_trainer_wait_last_tick = None
     service._fill_closed_pick_gate_open = lambda batcher, *, next_pick: gate_open
+    service._trainer_consumed_through = lambda batcher, *, pick: gate_open
     return service
 
 
@@ -76,3 +77,13 @@ def test_the_window_price_signal_forwards_the_map():
         trainer_wait_seconds_by_environment={"math": 41.26},
     )
     assert fields["trainer_wait_seconds_by_environment"] == {"math": 41.3}
+
+
+def test_a_trainer_still_busy_on_the_buffered_batch_is_not_waiting():
+    """Pipeline depth 1: the gate for pick k opens when the trainer reached pick
+    k-2, while pick k-1 is still queued. Only a trainer that consumed every
+    emitted pick (cursor at k-1) is idle and waiting on supply (I2)."""
+    service = _service(gate_open=True)
+    service._trainer_consumed_through = lambda batcher, *, pick: False
+    _ticks(service, [_batcher("math", False)], next_pick=4, times=[100.0, 100.5, 101.0])
+    assert service._fill_trainer_wait_seconds == {}

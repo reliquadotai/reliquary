@@ -26,6 +26,14 @@ from tests.unit.test_service_v2 import _build_late_drop_service
 GOLDEN = Path(__file__).parent / "data" / "legacy_fill_closed_archive_adce8966.json"
 ROOT = "d" * 40
 VOLATILE = {"window_opened_wall_ts_by_environment"}                     # the wall clock at activation
+# Keys added on purpose after the golden was cut, each with why. They are checked
+# on their own below and left out of the byte comparison, which keeps proving that
+# everything else is exactly what adce8966 archived.
+ADDED_AFTER_GOLDEN = {
+    # 2026-10-13: each environment's pool, so GET /rl/pay prices a paid group
+    # exactly when per-environment prices differ.
+    "window_pool_by_environment",
+}
 
 
 def _stable(value, key=None):
@@ -88,6 +96,10 @@ async def test_a_legacy_archive_is_what_it_was_before_the_service_wiring(monkeyp
     archive = await _legacy_archive(monkeypatch, tmp_path)
     assert not [key for key in archive if key.startswith("service_")]
     assert archive["rewards_by_hotkey"] and len(archive["batch"]) == 1     # a paid window, not an empty shell
+    pools = archive["window_pool_by_environment"]
+    assert set(pools) == set(archive["environments"])
+    assert sum(pools.values()) == pytest.approx(archive["window_pool"])
+    archive = {key: value for key, value in archive.items() if key not in ADDED_AFTER_GOLDEN}
     stable = json.dumps(_stable(archive), sort_keys=True, indent=1) + "\n"
     target = os.environ.get("RELIQUARY_WRITE_GOLDEN")
     if target:

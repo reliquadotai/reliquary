@@ -48,6 +48,7 @@ def _board(chain=None, *, fail=False, clock=None):
         return chain or {"miner_alpha_per_block": MAPB, "alpha_price_tao": 0.005}
 
     board = RlPayBoard(chain_read=read, clock=clock or (lambda: 1000.0))
+    asyncio.run(board.refresh_chain())
     board.add(window_stat(_archive(1, open_round=0, close_round=150)))
     board.add(window_stat(_archive(2, open_round=250, close_round=400)))  # cycle of w1 = 250 rounds
     return board
@@ -159,3 +160,36 @@ def test_seeding_merges_with_live_windows_and_relinks_cycles():
                 window_stat(_archive(2, open_round=250, close_round=400))])
     windows = [(s["window"], s["next_open_round"]) for s in board._stats]
     assert windows == [(1, 250), (2, 500), (3, None)]
+
+
+def test_estimates_for_many_speeds_do_not_grow_the_cache():
+    """I3: arbitrary tokens_per_second values must not each cache an answer."""
+    board = _board()
+    for tps in range(1, 200):
+        asyncio.run(board.answer(float(tps)))
+    assert len(board._cache) <= 1
+
+
+def test_a_request_never_waits_on_the_chain():
+    """I4: the chain is read behind requests; a slow read never stalls one."""
+    async def slow():
+        await asyncio.sleep(30)
+        return {"miner_alpha_per_block": MAPB}
+
+    async def scenario():
+        board = RlPayBoard(chain_read=slow)
+        board.add(window_stat(_archive(1, open_round=0, close_round=150)))
+        board.add(window_stat(_archive(2, open_round=250, close_round=400)))
+        answer = await asyncio.wait_for(board.answer(None), 1.0)
+        return answer
+    answer = asyncio.run(scenario())
+    assert answer["chain"] is None and answer["environments"]["math"]["market"]["paid_tokens_per_hour"] > 0
+
+
+def test_a_zero_length_cycle_is_skipped_not_a_crash():
+    """M3: next_open == open must not divide by zero on every request."""
+    board = _board()
+    board.add(window_stat(_archive(3, open_round=400, close_round=400)))   # w2's next open == its... 
+    board._stats[1]["next_open_round"] = board._stats[1]["open_round"]     # force a zero cycle
+    answer = asyncio.run(board.answer(None))
+    assert answer["environments"]["math"]["market"]["paid_tokens_per_hour"] > 0

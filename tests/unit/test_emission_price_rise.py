@@ -131,3 +131,14 @@ def test_restoring_from_archives_without_the_map_is_unchanged():
     walk = restore_walk([archive], PRODUCTION_PRICE_PARAMS)
     assert walk.states_by_environment["math"].price == pytest.approx(0.2)
     assert walk.history_by_environment["math"][0].trainer_wait_seconds is None
+
+
+def test_params_built_like_the_registry_carry_the_rise():
+    """task_config builds PriceParams from PRICE_PARAM_FIELDS only; the rise
+    fields are image-versioned like breaker_timeouts, so the defaults ARE the
+    production values (C1: inert defaults left the rise dead in production)."""
+    from reliquary.shared.task_registry import PRICE_PARAM_FIELDS
+
+    params = PriceParams(**{f: getattr(PRODUCTION_PRICE_PARAMS, f) for f in PRICE_PARAM_FIELDS})
+    assert params.rise == pytest.approx(1.10)
+    assert params.rise_wait_fraction == pytest.approx(0.05)

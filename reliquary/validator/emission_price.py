@@ -60,12 +60,13 @@ class PriceParams:
     # escalating: past this, the likelier explanation is that the environment is
     # broken on our side, not that the market is short.
     breaker_timeouts: int = 3
-    # The trainer was ready and waited on this environment's supply for more
+    # The trainer was idle and waited on this environment's supply for more
     # than ``rise_wait_fraction`` of the window: multiply the price by
-    # ``rise``. The defaults keep a params object built before this existed
-    # inert -- no wait can exceed an infinite fraction.
-    rise: float = 1.0
-    rise_wait_fraction: float = math.inf
+    # ``rise``. Image-versioned like ``breaker_timeouts``: the registry does not
+    # carry them (PRICE_PARAM_FIELDS), so these defaults ARE the production
+    # values every registry-built params object gets.
+    rise: float = 1.10
+    rise_wait_fraction: float = 0.05
 
 
 @dataclass(frozen=True, slots=True)

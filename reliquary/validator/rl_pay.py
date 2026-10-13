@@ -154,6 +154,7 @@ class RlPayBoard:
         self._chain_tried: float | None = None
         self._chain_failed = False
         self._cache: dict[Any, tuple[float, dict]] = {}
+        self._chain_task: asyncio.Task | None = None
 
     def add(self, stat: dict | None) -> None:
         """Append a window; it gives its predecessor the cycle's end."""
@@ -174,39 +175,63 @@ class RlPayBoard:
             self.add(stat)
         self._cache.clear()
 
-    async def _chain_value(self) -> dict | None:
+    async def refresh_chain(self) -> None:
+        """One chain read; a failure keeps the last good value until it is stale."""
+        self._chain_tried = self._clock()
+        try:
+            value = dict(await asyncio.wait_for(self._chain_read(), CHAIN_READ_BUDGET_SECONDS))
+            if value.get("miner_alpha_per_block") is None:
+                raise ValueError("chain read without miner_alpha_per_block")
+            self._chain, self._chain_at, self._chain_failed = value, self._clock(), False
+            self._cache.clear()
+        except Exception as exc:  # noqa: BLE001 - a chain fault only nulls the alpha fields
+            self._chain_failed = True
+            logger.warning("rl pay: chain read failed: %r", exc)
+
+    def _kick_chain(self) -> None:
+        """Start a chain read BEHIND the request when one is due; never wait on it."""
         now = self._clock()
         wait = CHAIN_RETRY_SECONDS if self._chain_failed else CHAIN_REFRESH_SECONDS
-        if self._chain_tried is None or now - self._chain_tried >= wait:
-            self._chain_tried = now
-            try:
-                value = dict(await asyncio.wait_for(self._chain_read(), CHAIN_READ_BUDGET_SECONDS))
-                if value.get("miner_alpha_per_block") is None:
-                    raise ValueError("chain read without miner_alpha_per_block")
-                self._chain, self._chain_at, self._chain_failed = value, self._clock(), False
-            except Exception as exc:  # noqa: BLE001 - a chain fault only nulls the alpha fields
-                self._chain_failed = True
-                logger.warning("rl pay: chain read failed: %r", exc)
+        running = self._chain_task is not None and not self._chain_task.done()
+        if running or (self._chain_tried is not None and now - self._chain_tried < wait):
+            return
+        self._chain_tried = now
+        self._chain_task = asyncio.get_running_loop().create_task(self.refresh_chain())
+
+    def _chain_value(self) -> dict | None:
         if self._chain is None or self._clock() - self._chain_at > CHAIN_STALE_SECONDS:
             return None
         return self._chain
 
     async def answer(self, tokens_per_second: float | None) -> dict:
+        """The cached base answer, plus a per-request estimate when asked.
+
+        Only the base is cached (one entry), so arbitrary speeds cannot grow
+        memory; a failed rebuild serves the last good base.
+        """
         if not self._stats:
             return {"status": "loading"}
-        key = None if tokens_per_second is None else round(float(tokens_per_second), 3)
+        self._kick_chain()
         now = self._clock()
-        cached = self._cache.get(key)
-        if cached is not None and now - cached[0] < PAY_CACHE_SECONDS:
-            return cached[1]
-        chain = await self._chain_value()
-        result = self._build(chain, key)
-        self._cache[key] = (now, result)
-        return result
+        cached = self._cache.get(None)
+        if cached is None or now - cached[0] >= PAY_CACHE_SECONDS:
+            try:
+                cached = (now, self._build(self._chain_value()))
+                self._cache[None] = cached
+            except Exception:
+                logger.exception("rl pay: rebuild failed; serving the last good answer")
+                if cached is None:
+                    raise
+        base = cached[1]
+        if tokens_per_second is None:
+            return base
+        return {**base, "tokens_per_second": tokens_per_second,
+                "estimate": _estimate(base, float(tokens_per_second))}
 
-    def _build(self, chain: dict | None, tokens_per_second: float | None) -> dict:
+    def _build(self, chain: dict | None) -> dict:
         stats = list(self._stats)
-        cycled = [s for s in stats if s["next_open_round"] is not None]
+        cycled = [s for s in stats
+                  if s["next_open_round"] is not None and s["next_open_round"] > s["open_round"]]
         mapb = None if chain is None else float(chain["miner_alpha_per_block"])
 
         def cycle_seconds(stat):
@@ -215,7 +240,6 @@ class RlPayBoard:
         cycle_median = _median(cycle_seconds(s) for s in cycled)
         latest = stats[-1]
         environments: dict[str, dict] = {}
-        estimate: dict[str, dict] = {}
         names = list(latest["environments"])
         for environment in names:
             rows = [s for s in stats if environment in s["environments"]]
@@ -292,19 +316,6 @@ class RlPayBoard:
                     for s in cyc[-HISTORY_WINDOWS:]
                 ][::-1],
             }
-            if tokens_per_second is not None:
-                rate = now_block["alpha_per_mtoken_paid"]
-                accepting = market["accepting_fraction_of_cycle"]
-                paid_fraction = market["paid_fraction_of_submitted"]
-                demand = market["paid_tokens_per_hour"]
-                if None in (rate, accepting, paid_fraction, demand):
-                    estimate[environment] = {"alpha_per_gpu_hour": None}
-                else:
-                    estimate[environment] = {"alpha_per_gpu_hour": {
-                        bound: rate / 1e6 * min(
-                            tokens_per_second * 3600 * accepting * paid_fraction[bound], demand)
-                        for bound in ("low", "high")
-                    }}
         result = {
             "generated_at": self._clock(),
             "note": NOTE,
@@ -319,10 +330,28 @@ class RlPayBoard:
             "windows_counted": len(stats),
             "environments": environments,
         }
-        if tokens_per_second is not None:
-            result["tokens_per_second"] = tokens_per_second
-            result["estimate"] = estimate
         return result
+
+
+def _estimate(base: Mapping[str, Any], tokens_per_second: float) -> dict[str, dict]:
+    """Per environment, the bounded alpha per GPU-hour at ``tokens_per_second``:
+    paid tokens a miner alone could land (its speed x the accepting share of
+    the cycle x the paid share, low/high) capped by the environment's demand."""
+    out: dict[str, dict] = {}
+    for name, entry in (base.get("environments") or {}).items():
+        rate = entry["now"]["alpha_per_mtoken_paid"]
+        market = entry["market"]
+        accepting = market["accepting_fraction_of_cycle"]
+        paid_fraction = market["paid_fraction_of_submitted"]
+        demand = market["paid_tokens_per_hour"]
+        if None in (rate, accepting, paid_fraction, demand):
+            out[name] = {"alpha_per_gpu_hour": None}
+            continue
+        out[name] = {"alpha_per_gpu_hour": {
+            bound: rate / 1e6 * min(tokens_per_second * 3600 * accepting * paid_fraction[bound], demand)
+            for bound in ("low", "high")
+        }}
+    return out
 
 
 async def read_subnet_pool() -> dict:

@@ -20,11 +20,11 @@ def _pay(**rates):
         for name, rate in rates.items()}}
 
 
-def test_weights_are_pay_times_the_geometric_mean_paid_fraction():
+def test_weights_are_pay_times_the_middle_of_the_paid_fraction_range():
     assert weights_from_pay(_pay(math=0.6, code=0.2)) == {
-        "math": pytest.approx(0.3), "code": pytest.approx(0.1)}
+        "math": pytest.approx(0.375), "code": pytest.approx(0.125)}
     assert weights_from_pay({"status": "loading"}) is None
-    assert weights_from_pay(_pay(math=None)) is None
+    assert weights_from_pay({"environments": {}}) is None
 
 
 def test_mode_defaults_to_price_and_refuses_typos():
@@ -43,9 +43,9 @@ def test_pay_weights_cache_a_minute_and_fall_back_on_errors():
             raise RuntimeError("down")
         return _pay(math=0.6)
 
-    pay = PayWeights("http://v:8080/", fetch=fetch, clock=lambda: now[0])
-    assert pay.weights() == {"math": pytest.approx(0.3)}
-    assert pay.weights() == {"math": pytest.approx(0.3)} and len(calls) == 1
+    pay = PayWeights("http://v:8080/", fetch=fetch, clock=lambda: now[0], background=False)
+    assert pay.weights() == {"math": pytest.approx(0.375)}
+    assert pay.weights() == {"math": pytest.approx(0.375)} and len(calls) == 1
     now[0] += 61
     assert pay.weights() is None                      # validator down: the mix
     assert calls[0] == "http://v:8080/rl/pay"
@@ -104,3 +104,41 @@ def test_episode_without_weights_is_todays_shuffle():
     kwargs = dict(environments=["math", "code"], sizes={"math": 100, "code": 100}, taken=set())
     assert (pick_episode_task(_view(), rng=random.Random(3), **kwargs)
             == pick_episode_task(_view(), rng=random.Random(3), weights=None, **kwargs))
+
+
+def test_priced_envs_exhausted_falls_back_to_the_mix_instead_of_crashing():
+    """C2: when the only env left has weight 0 under the override, the draw
+    must use the mix, not raise ValueError out of the mining loop."""
+    cooldowns = {"math": set(range(1000))}           # math fully in cooldown
+    env, _ = pick_env_and_prompt(ENVS, MIX, cooldowns, rng=random.Random(0),
+                                 weights_override={"math": 5.0})
+    assert env == "code"
+
+
+def test_unpriced_and_zero_low_envs_still_get_drawn():
+    """I1: a new or starved env (no paid group yet) and an env whose low paid
+    fraction is 0 keep a positive weight, so a rising price can attract miners."""
+    body = _pay(math=0.6)
+    body["environments"]["code"] = {"now": {"alpha_per_mtoken_paid": None},
+                                    "market": {"paid_fraction_of_submitted": None}}
+    body["environments"]["logic"] = {"now": {"alpha_per_mtoken_paid": 0.5},
+                                     "market": {"paid_fraction_of_submitted": {"low": 0.0, "high": 0.8}}}
+    weights = weights_from_pay(body)
+    assert weights["code"] > 0 and weights["logic"] > 0
+
+
+def test_pay_weights_never_block_the_caller_in_background_mode():
+    """I5: the episode loop calls weights() on the event loop; a slow validator
+    must not stall it. Background mode returns the last value immediately."""
+    import threading
+    gate = threading.Event()
+
+    def slow_fetch(url):
+        gate.wait(5)
+        return _pay(math=0.6)
+
+    pay = PayWeights("http://v", fetch=slow_fetch, background=True)
+    assert pay.weights() is None                      # returns at once, fetch runs behind
+    gate.set()
+    pay.join(timeout=5)
+    assert pay.weights() == {"math": pytest.approx(0.375)}

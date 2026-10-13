@@ -86,6 +86,21 @@ async def read_task_registry_with_retry(
     raise last
 
 
+
+def _registry_price_params() -> dict:
+    """The price parameters a registry entry declares: the production values,
+    minus the image-versioned rise fields. The loader never reads those (they
+    are not in PRICE_PARAM_FIELDS), and writing them would change the bytes of
+    every new declaration for nothing."""
+    from dataclasses import asdict
+
+    from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
+
+    params = asdict(PRODUCTION_PRICE_PARAMS)
+    for field in ("rise", "rise_wait_fraction"):
+        params.pop(field, None)
+    return params
+
 def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None, verification=None):
     """One registry entry: shipped controller defaults, then explicit overrides."""
     from dataclasses import asdict
@@ -132,7 +147,7 @@ def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None, ver
             f"--verification must be one of {', '.join(sorted(KNOWN_VERIFICATION))}, "
             f"got {verification!r}; omit it to let each validator derive it from its card"
         )
-    params = asdict(PRODUCTION_PRICE_PARAMS)
+    params = _registry_price_params()
     params.update(overrides)
     params["cap"] = float(cap)
     return TaskEntry(
@@ -222,7 +237,7 @@ def build_contract_task_entry(
             name: declared[name] for name in sorted(environments)
         }
 
-    params = asdict(PRODUCTION_PRICE_PARAMS)
+    params = _registry_price_params()
     params.update(overrides)
     params["cap"] = float(cap)
     return TaskEntry(

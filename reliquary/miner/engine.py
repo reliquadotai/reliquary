@@ -336,6 +336,10 @@ def pick_env_and_prompt(
     available = list(names)
     while available:
         avail_weights = [weights[names.index(n)] for n in available]
+        if not any(w > 0 for w in avail_weights):
+            # The priced envs are exhausted (cooldown, prompt slice) and only
+            # unpriced ones remain: draw them by the mix, never crash the loop.
+            avail_weights = [w for n, w in mix if n in available]
         env_name = rng.choices(available, weights=avail_weights)[0]
         env = envs[env_name]
         prompt_range = (

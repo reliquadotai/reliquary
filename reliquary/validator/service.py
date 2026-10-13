@@ -4648,6 +4648,21 @@ class ValidationService:
         cursor = self._read_trainer_step_cursor()
         return cursor is not None and int(cursor) >= required
 
+    def _trainer_consumed_through(self, batcher, *, pick: int) -> bool:
+        """Whether the trainer has consumed this window's picks 1..``pick``.
+
+        The trainer writes its cursor AFTER moving it: the cursor is the next
+        journal key to consume, so pick ``pick`` (batch index ``pick - 1``) is
+        consumed once the cursor reaches batch index ``pick``.
+        """
+        from reliquary.infrastructure.training_payload_queue import (
+            encoded_window_journal_key,
+        )
+
+        required = encoded_window_journal_key(int(batcher.window_start), max(0, int(pick)))
+        cursor = self._read_trainer_step_cursor()
+        return cursor is not None and int(cursor) >= required
+
     def _reset_fill_trainer_wait(self) -> None:
         """A new fill window starts with nobody having held the trainer back."""
         self._fill_trainer_wait_seconds = {}
@@ -4655,8 +4670,8 @@ class ValidationService:
 
     def _accrue_trainer_wait(self, picking, *, next_pick: int, now: float) -> None:
         """Charge this poll tick to every environment that cannot seat a batch,
-        but only while the trainer is ready for the pick: a closed pacing gate
-        means the trainer is still busy and nobody's supply is holding it back.
+        but only while the trainer is idle (it consumed every emitted pick):
+        a trainer still busy is not held back by anybody's supply.
         Pick 1 is paced by the opening floor, never by the trainer.
 
         The tick is clamped to 5 s, so a stalled loop is not blamed on miners.
@@ -4666,7 +4681,10 @@ class ValidationService:
         self._fill_trainer_wait_last_tick = now
         if last is None or next_pick <= 1:
             return
-        if not self._fill_closed_pick_gate_open(picking[0], next_pick=next_pick):
+        # Idle means the trainer consumed every pick emitted so far. The pacing
+        # gate opens earlier (depth 1: while pick k-1 is still queued), so it
+        # is not the test: a trainer busy on the buffered batch is not waiting.
+        if not self._trainer_consumed_through(picking[0], pick=next_pick - 1):
             return
         tick = min(max(0.0, now - last), 5.0)
         waits = getattr(self, "_fill_trainer_wait_seconds", None)
