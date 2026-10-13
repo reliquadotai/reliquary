@@ -187,14 +187,26 @@ def test_a_jsonl_environment_is_not_a_corpus_suite_source():
     assert "takes only" in suite_spec_refusal(episode)
 
 
-def test_the_turn_limit_is_the_lower_of_the_jobs_and_the_environments(chatml_registry):
+def test_a_job_above_the_environment_turn_limit_is_refused(chatml_registry):
+    from reliquary.validator.corpus_service import CorpusPromptSourceError, prompt_job_for_spec
+
+    assert ENVIRONMENT_SPECS[ENV].create().max_turns == 8
+    job = parse_job(_manifest(episode=_episode(max_turns=9)))
+    with pytest.raises(ValueError, match=r"max_turns 9 is above environment "
+                                         r"'reliquary_stateful_tools_v1''s own max_turns 8"):
+        suite_episode.suite_source(job.episode)
+    # What `jobs create` (build_job_manifest) and a serving validator run.
+    with pytest.raises(CorpusPromptSourceError, match="declare at most 8"):
+        prompt_job_for_spec(job)
+    prompt_job_for_spec(parse_job(_manifest(episode=_episode(max_turns=8))))
+
+
+def test_a_trajectory_at_the_environment_turn_limit_stops_on_max_turns(chatml_registry):
     environment = ENVIRONMENT_SPECS[ENV].create()
-    assert environment.max_turns == 8
     first = _reference_actions(environment, 0)[0]
     rendered, tokens, spans, stop, _ = miner_episode(environment, 0, [first] * 8, CODEC)
     assert stop == "max_turns" and len(spans) == 8
-    job = parse_job(_manifest(episode=_episode(max_turns=64)))
-    facts = _intake(job).check(_request(rendered, tokens, spans, stop))
+    facts = _intake().check(_request(rendered, tokens, spans, stop))
     assert facts.success is False and facts.task_id is not None, facts
 
 

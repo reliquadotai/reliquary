@@ -136,6 +136,13 @@ class SuiteSource:
     with and what the validator compares the trajectory's prompt to."""
 
     def __init__(self, environment, episode: EpisodeSpec, renderer_id: str) -> None:
+        # Refused, not capped: a job declaring more turns than the environment
+        # runs would sell episodes that can never reach its limit.
+        if episode.max_turns > int(environment.max_turns):
+            raise ValueError(
+                f"episode.max_turns {episode.max_turns} is above environment "
+                f"{environment.name!r}'s own max_turns {environment.max_turns}; "
+                f"declare at most {environment.max_turns}")
         self.environment = environment
         self.episode = episode
         self.renderer_id = renderer_id
@@ -188,7 +195,8 @@ def replay_suite(environment, *, renderer_id: str, task_index: int, seed: int,
     for start, end in spans:
         piece = full[offset + int(start):offset + int(end)]
         generated.append(GeneratedAction(text=decode(piece), tokens=tuple(piece)))
-    # The turn limit is the job's and the environment's, whichever is lower (as RL's).
+    # The job's limit (`SuiteSource` refuses one above the environment's);
+    # the min keeps a replay outside a job, as RL's, on the environment's.
     limit = min(int(max_turns), int(environment.max_turns))
     return EpisodeRunner(
         renderer=renderer_for(renderer_id, encode), max_turns=limit,

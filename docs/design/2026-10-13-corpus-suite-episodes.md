@@ -28,7 +28,7 @@ SWE episode jobs (`harness: "bash"`, `reliquary-swe`) are unchanged.
           "version": "<the spec's environment_manifest_sha256, 64 hex>", "split": "train"},
   "harness": "suite",
   "renderer": "reliquary-chatml-tools-v1",
-  "max_turns": 40,                  // 1..64; the turn limit is min(this, env.max_turns), as RL
+  "max_turns": 40,                  // 1..64, and at most the environment's own max_turns
   "max_tokens_per_turn": 4096,
   "max_total_tokens": 60000         // prompt + trajectory, <= 60000
 }
@@ -48,6 +48,10 @@ SWE episode jobs (`harness: "bash"`, `reliquary-swe`) are unchanged.
   `renderer_id` must equal `episode.renderer`, and that renderer must be ChatML
   (`suite_episode.suite_spec_refusal`). Each failure is refused with a message
   that names the field.
+- `episode.max_turns` above the environment's own `max_turns` is refused,
+  never capped (`SuiteSource`, run by `jobs create` and by a serving
+  validator). The turn limit is therefore `episode.max_turns`, which equals
+  `min(episode.max_turns, environment.max_turns)` as in RL.
 - Binaries older than this change refuse the manifest
   (`episode is missing: verifiers, replay_fraction_failed`), so a job with
   this harness fails closed on them.
@@ -59,7 +63,9 @@ SWE episode jobs (`harness: "bash"`, `reliquary-swe`) are unchanged.
     still holds the tau2-bench benchmark tickets.
 - An environment that no profile declares (telecom v2 today) gets its contract
   body from the registry spec and the job's episode bounds
-  (`agentic_source.suite_episode_body`).
+  (`agentic_source.suite_episode_body`). This body is for corpus contracts
+  only: RL on such an environment still needs a reviewed catalog and profile
+  entry.
 
 ## Miner
 
