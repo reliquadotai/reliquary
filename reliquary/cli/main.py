@@ -2679,9 +2679,11 @@ def corpus_mine_agentic(
         16, "--max-num-seqs",
         help="vLLM's concurrent sequences; lower it if turns fail as preempted (unprovable)"),
 ) -> None:
-    """Mine an agentic (episode) corpus job: verifiers + reliquary-swe episodes
-    against a local vLLM with per-turn proofs. Needs Docker and the job's
-    pinned reliquary-swe, verifiers and renderers installed."""
+    """Mine an agentic (episode) corpus job against a local vLLM with per-turn
+    proofs. A SWE job (harness bash) runs verifiers + reliquary-swe episodes and
+    needs Docker and the job's pinned reliquary-swe, verifiers and renderers. A
+    suite job (harness suite) runs a registered episode environment in process
+    and needs only that environment's pinned wheel."""
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
 
     if TASK_CONTRACT_ENV_VAR not in os.environ:
@@ -2692,13 +2694,13 @@ def corpus_mine_agentic(
 
     from reliquary.corpus.encoding import checkpoint_fingerprint
     from reliquary.corpus.job import parse_job
-    from reliquary.environment.agentic_swe import episode_support_refusal
     from reliquary.miner.agentic_miner import Identity, run_agentic_miner
     from reliquary.miner.corpus_miner import (
         CorpusJobSelectionError,
         HttpCorpusClient,
         submits_scoped,
     )
+    from reliquary.miner.suite_episode import is_suite_episode, suite_support_refusal
     from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
     from reliquary.protocol.signatures import sign_corpus_submission
     from reliquary.shared.modeling import load_tokenizer
@@ -2721,15 +2723,23 @@ def corpus_mine_agentic(
         typer.echo(f"error: job {job.job_id!r} is not an episode job; use `corpus mine`", err=True)
         raise typer.Exit(code=2)
     client.scoped_submit = submits_scoped(job)
-    refusal = episode_support_refusal(job.episode, need_verifiers=True)
-    if refusal:
-        typer.echo(f"error: {refusal}", err=True)
-        raise typer.Exit(code=4)
-    from reliquary.miner.agentic_miner import docker_storage_warning
+    if is_suite_episode(job.episode):
+        # No verifiers, Docker or network: only the pinned environment wheel.
+        refusal = suite_support_refusal(job.episode)
+        if refusal:
+            typer.echo(f"error: refusing to mine: {refusal}", err=True)
+            raise typer.Exit(code=4)
+    else:
+        from reliquary.environment.agentic_swe import episode_support_refusal
+        from reliquary.miner.agentic_miner import docker_storage_warning
 
-    warning = docker_storage_warning()
-    if warning:
-        typer.echo(warning, err=True)
+        refusal = episode_support_refusal(job.episode, need_verifiers=True)
+        if refusal:
+            typer.echo(f"error: {refusal}", err=True)
+            raise typer.Exit(code=4)
+        warning = docker_storage_warning()
+        if warning:
+            typer.echo(warning, err=True)
     directory = snapshot_download(job.checkpoint_repo, revision=job.checkpoint_revision)
     if checkpoint_fingerprint(directory) != job.checkpoint_sha256:
         typer.echo("error: the downloaded checkpoint does not match the job's fingerprint", err=True)

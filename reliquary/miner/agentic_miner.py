@@ -225,6 +225,10 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             return
         # Before the forgery hook: the hook tests the validator, the check the honest run.
         refusal = await asyncio.to_thread(precheck, built) if precheck is not None else None
+        # A runner that knows its own validator checks (a suite episode's replay).
+        runner_precheck = getattr(runner, "precheck", None)
+        if refusal is None and runner_precheck is not None:
+            refusal = await asyncio.to_thread(runner_precheck, built, prompt_index)
         if refusal is not None:
             reason, detail = refusal
             counts["precheck_refused"] += 1
@@ -371,6 +375,13 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
     import contextlib
 
     from reliquary.miner import agentic_episode
+    from reliquary.miner.suite_episode import is_suite_episode
+
+    if is_suite_episode(job.episode):
+        return await run_suite_miner(
+            job=job, checkpoint_dir=checkpoint_dir, proof=proof, tokenizer=tokenizer,
+            identities=identities, client=client, concurrency=concurrency,
+            gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs)
 
     refusal = agentic_episode.network_notice_refusal()
     if refusal:
@@ -415,5 +426,36 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
         engine.stop()
 
 
+async def run_suite_miner(*, job, checkpoint_dir: str, proof, tokenizer, identities, client,
+                          concurrency: int = 8, gpu_memory_utilization: float | None = None,
+                          max_num_seqs: int = 16) -> dict[str, Counter]:
+    """A suite episode job: the engine thread and episodes in one process. No
+    endpoint: the runner's policy calls the engine directly, and nothing but
+    the pinned environment wheel runs between turns."""
+    from reliquary.corpus.suite_episode import TokenizerCodec
+    from reliquary.miner.corpus_generate_server import GenerateEngine, VllmTurnCore
+    from reliquary.miner.suite_episode import SuiteEpisodeRunner, suite_stop_ids
+
+    # Coded as the validator's intake, replay and export code.
+    codec = TokenizerCodec(tokenizer)
+    encode, decode = codec.encode, codec.decode
+    core = VllmTurnCore(checkpoint_dir, sampling=job.sampling, proof=proof,
+                        stop_token_ids=suite_stop_ids(encode),
+                        max_total_tokens=job.episode.max_total_tokens, max_num_seqs=max_num_seqs,
+                        gpu_memory_utilization=gpu_memory_utilization)
+    engine = GenerateEngine(core, max_total_tokens=job.episode.max_total_tokens,
+                            max_tokens_per_turn=job.episode.max_tokens_per_turn)
+    engine.start()
+    try:
+        runner = SuiteEpisodeRunner(job=job, engine=engine, encode=encode, decode=decode,
+                                    chunk_tokens=proof.chunk_tokens)
+        return await mine_agentic(
+            job=job, identities=identities, client=client, engine=engine,
+            runners={harness_key(identity.harness_env): runner for identity in identities},
+            decode=decode, concurrency=concurrency)
+    finally:
+        engine.stop()
+
+
 __all__ = ["Identity", "OpenPrompts", "build_trajectory_submission", "harness_key", "mine_agentic",
-           "run_agentic_miner", "serve_loopback", "trajectory_precheck"]
+           "run_agentic_miner", "run_suite_miner", "serve_loopback", "trajectory_precheck"]
