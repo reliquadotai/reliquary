@@ -29,7 +29,7 @@ SWE episode jobs (`harness: "bash"`, `reliquary-swe`) are unchanged.
   "harness": "suite",
   "renderer": "reliquary-chatml-tools-v1",
   "max_turns": 40,                  // 1..64, and at most the environment's own max_turns
-  "max_tokens_per_turn": 4096,
+  "max_tokens_per_turn": 3072,      // <= 3276: 5 bytes a token must fit the 16 KiB action limit
   "max_total_tokens": 60000         // prompt + trajectory, <= 60000
 }
 ```
@@ -165,6 +165,11 @@ retired, its workers are killed and the pool is rebuilt. Each worker runs
 under a 2 GiB `RLIMIT_AS`. Intake checks run on their own bounded threads (8),
 never on the loop's default executor, which the ledger turns use.
 
+The workers never outlive the validator. Its shutdown cleanup kills them
+(`PoolSuiteReplayer.close`), and each worker also watches its parent and exits
+within a second of it going, however it went (SIGKILL, a crash before
+cleanup): the GPU trial found idle workers left behind by a SIGTERM'd validator.
+
 A turn before the last that ends on a stop id other than `<|im_end|>` is
 `bad_termination`, even when it ends exactly at the cap.
 
@@ -230,8 +235,19 @@ environment:
 - `tools`: `[{type: "function", function: <tool>}]`.
 - `reward`, `turns`, `stop`.
 
-For a well-formed episode, `tokens ==
-encode(apply_chat_template(messages, tools=tools))` under the Qwen3.5 template
-(tested).
+`tokens` is the row; `messages` is a readable view of it. Train from
+`tokens` and `assistant_mask`, never by re-rendering `messages`: the two are
+not the same sequence in general.
+
+- Under the Qwen3.5 template, for a well-formed episode, `tokens ==
+  encode(apply_chat_template(messages, tools=tools))` (tested).
+- Under Qwen3.8 (the 2026-10-13 GPU trial, Qwen3.8-27B) it does **not** hold
+  by default: the template injects "Reasoning effort is set to xhigh" into
+  the system message, which the miner's renderer never sent. With
+  `reasoning_effort="medium"` the template matches, except where (a) a tool
+  argument is a boolean or null, which the template prints Python-style
+  (`True`/`False`/`None`) while the model wrote and the tokens hold JSON
+  (`true`/`false`/`null`), and (b) a turn was cut at `max_tokens_per_turn`,
+  whose tokens end mid-turn where the template closes the message.
 
 The Parquet `deliver` path refuses suite jobs.
