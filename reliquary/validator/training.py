@@ -1185,6 +1185,11 @@ def _selected_logprobs_from_hidden(
     getting killed by memory pressure. Checkpointing keeps backward memory at
     one chunk by recomputing the LM-head/logsumexp block as needed.
     """
+    if getattr(lm_head, "fused_selected_logprobs", False):
+        # The FSDP2 head (reliquary.trainer.distributed) runs this same chunk
+        # loop inside ONE module call, so its sharded weight is gathered once
+        # for every chunk and its gradient reduced once.
+        return lm_head(hidden_rows, indices)
     n = hidden_rows.shape[0]
     use_ckpt = hidden_rows.requires_grad
     parts = []
@@ -1900,8 +1905,8 @@ def _microbatch_grad(
                     continue  # param not in this micro-batch's graph -> 0 contribution
                 p.grad = g if p.grad is None else p.grad + g
     else:
-        # Under FSDP2 the reduce-scatter averages over ranks; the loss weights
-        # are already global, so scale by the world size to get the sum.
+        # The loss weights are already global: loss_scale (measured when the
+        # model was sharded) turns FSDP2's gradient reduction into a sum.
         (loss * loss_scale).backward()
 
     _record_kl_stats(
@@ -2040,7 +2045,8 @@ def _accumulate_grouped_grads(
         split = assign_bins(costs, _DIST.world_size)
         padding_passes = max(len(part) for part in split) - len(split[_DIST.rank])
         bins = [bins[k] for k in split[_DIST.rank]]
-        loss_scale = float(_DIST.world_size)
+        # Measured at shard time: world_size when FSDP2 averages, 1 when it sums.
+        loss_scale = float(getattr(model, "reliquary_loss_scale", _DIST.world_size))
     for idxs in bins:
         sp, sk, n = _process_microbatch(
             model, ref_model, [items[i] for i in idxs], device,

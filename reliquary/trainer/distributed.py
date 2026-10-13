@@ -60,6 +60,30 @@ def init_distributed(*, device_type: str = "cuda") -> DistContext:
     return DistContext(rank, world_size, device, control)
 
 
+class FusedLogprobHead(torch.nn.Linear):
+    """The LM head under FSDP2: ``head(hidden, targets)`` runs train_step's
+    whole checkpointed chunk loop inside one module call.
+
+    Called once per chunk instead, FSDP2 (torch 2.7) skips its hooks for the
+    chunk recomputes issued during backward, so those chunks would read the
+    sharded weight and their gradients would never be reduced. One call per
+    micro-batch gathers the weight once for forward, once for backward, and
+    reduces once. ``head(hidden)`` stays a plain projection.
+    """
+
+    fused_selected_logprobs = True
+
+    def forward(self, hidden, targets=None):
+        if targets is None:
+            return super().forward(hidden)
+        from reliquary.validator.training import _selected_logprobs_from_hidden
+
+        weight, bias = self.weight, self.bias
+        return _selected_logprobs_from_hidden(
+            hidden, targets, lambda rows: torch.nn.functional.linear(rows, weight, bias),
+        )
+
+
 def shard_model(model, ctx: DistContext, *, param_dtype=torch.bfloat16):
     """Shard every decoder layer, the LM head and the base, then the root.
 
@@ -71,16 +95,48 @@ def shard_model(model, ctx: DistContext, *, param_dtype=torch.bfloat16):
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
+    base = getattr(model, model.base_model_prefix)
+    if not hasattr(base, "layers"):
+        raise ValueError(
+            f"fsdp2 expects a text-only causal LM, got {type(model).__name__}"
+        )
+    embed = getattr(getattr(base, "embed_tokens", None), "weight", None)
+    if embed is not None and model.lm_head.weight is embed:
+        raise ValueError("fsdp2 needs an untied lm_head (tie_word_embeddings=false)")
+    if type(model.lm_head) is not torch.nn.Linear:
+        raise ValueError(f"fsdp2 expects an nn.Linear lm_head, got {type(model.lm_head).__name__}")
+    model.lm_head.__class__ = FusedLogprobHead
     mesh = init_device_mesh(ctx.device.type, (ctx.world_size,))
     policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=torch.float32)
-    base = getattr(model, model.base_model_prefix)
     for layer in base.layers:
         fully_shard(layer, mesh=mesh, mp_policy=policy)
-    fully_shard(model.lm_head, mesh=mesh, mp_policy=policy, reshard_after_forward=False)
+    fully_shard(model.lm_head, mesh=mesh, mp_policy=policy)
     fully_shard(base, mesh=mesh, mp_policy=policy, reshard_after_forward=False)
     fully_shard(model, mesh=mesh, mp_policy=policy)
     model.to(torch.float32)
+    model.reliquary_loss_scale = _probe_loss_scale(model, ctx)
     return model
+
+
+def _probe_loss_scale(model, ctx: DistContext) -> float:
+    """The factor that turns FSDP2's gradient reduction into a sum.
+
+    train_step's loss weights are already global, so per-rank gradients must
+    be summed. What FSDP2 does differs by version and backend (torch 2.7
+    averages on NCCL but sums on gloo), so it is measured, not assumed: a
+    unit loss on the LM head gives every rank a gradient of exactly 1 per
+    weight, which reduces to 1 under an average and to world_size under a sum.
+    """
+    head = model.lm_head
+    probe = torch.ones(1, head.in_features, device=ctx.device)
+    head(probe).float().sum().backward()
+    reduced = float(head.weight.grad.to_local().float().mean())
+    for parameter in model.parameters():
+        parameter.grad = None
+    scale = ctx.world_size / reduced
+    if abs(scale - round(scale)) > 1e-3 or round(scale) not in (1, ctx.world_size):
+        raise RuntimeError(f"unexpected FSDP2 gradient reduction (probe read {reduced})")
+    return float(round(scale))
 
 
 def gather_full_state_dict(model, ctx: DistContext) -> dict[str, torch.Tensor] | None:

@@ -43,7 +43,7 @@ def _grad_equivalence():
         return lp.sum()
 
     model.train(); ref.train()
-    (loss(model, batches[ctx.rank]) * ctx.world_size).backward()
+    (loss(model, batches[ctx.rank]) * model.reliquary_loss_scale).backward()
     for x in batches:
         loss(ref, x).backward()
     worst = 0.0
@@ -88,3 +88,34 @@ def _reduce_stats():
 def test_all_reduce_stats_sums_and_maxes():
     out = run_ranks(_reduce_stats, 2)
     assert out[0] == out[1] == {"token_count": 30, "max": 1.0, "weighted_ppo": 1.0}
+
+
+def test_fused_head_matches_the_chunk_loop():
+    """head(hidden, targets) == the plain chunked path, values and gradients."""
+    from reliquary.trainer.distributed import FusedLogprobHead
+    from reliquary.validator.training import _selected_logprobs_from_hidden
+
+    torch.manual_seed(0)
+    plain = torch.nn.Linear(16, 50, bias=False)
+    fused = copy.deepcopy(plain)
+    fused.__class__ = FusedLogprobHead
+    hidden = torch.randn(1300, 16, requires_grad=True)
+    targets = torch.randint(0, 50, (1300,))
+    a = _selected_logprobs_from_hidden(hidden, targets, plain, chunk=512)
+    a.sum().backward()
+    ga, gwa = hidden.grad.clone(), plain.weight.grad.clone()
+    hidden.grad = None
+    b = _selected_logprobs_from_hidden(hidden, targets, fused, chunk=512)
+    b.sum().backward()
+    assert torch.equal(a, b)
+    assert torch.equal(ga, hidden.grad) and torch.equal(gwa, fused.weight.grad)
+    assert torch.equal(fused(hidden), plain(hidden))
+
+
+def test_shard_model_refuses_a_tied_head():
+    from reliquary.trainer.distributed import DistContext, shard_model
+
+    model = tiny_qwen35()
+    model.lm_head.weight = model.model.embed_tokens.weight
+    with pytest.raises(ValueError, match="untied"):
+        shard_model(model, DistContext(0, 1, torch.device("cpu"), None))
