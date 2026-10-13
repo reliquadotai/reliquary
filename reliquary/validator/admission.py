@@ -637,7 +637,9 @@ def _termination_reject(
             return RejectReason.BAD_TERMINATION
         if kind == "truncated":
             truncated += 1
-            if truncated > max_truncated:
+            # R21, as in the batcher: on the service path the robust rule prices every
+            # joint assignment of the capped rollouts; the count limit is legacy only.
+            if context.service_policy is None and truncated > max_truncated:
                 return RejectReason.BAD_TERMINATION
     return None
 

@@ -936,3 +936,61 @@ def test_r31_f1_the_agreement_floors_are_off_in_the_classification_pass(signed_r
     first, second, klass = _two_pass(signed_request, monkeypatch, proof={3: {"seed_n_match": 0}})
     assert first[0] == "forced_seed" and first[1] in ("group", "rollout")
     assert second == (None, None) and klass == "statistical"
+
+
+def _cap_rollouts(monkeypatch, capped):
+    """Admission sees the rollouts at ``capped`` positions as cut by the length cap."""
+    import reliquary.validator.admission as admission
+    classify = admission._classify_termination
+
+    def classify_with_caps(rollout, context):
+        if any(10 + index in rollout.commit["tokens"] for index in capped):
+            return "truncated"
+        return classify(rollout, context)
+    monkeypatch.setattr(admission, "_classify_termination", classify_with_caps)
+
+
+def _graded_with_caps(signed_request, monkeypatch, *, correct, capped):
+    _cap_rollouts(monkeypatch, capped)
+    request, announcement, wallet = signed_request(purpose="training")
+    for index, rollout in enumerate(request.rollouts):
+        rollout.reward = float(index < correct)
+    _sign_envelope(request, wallet)
+    parsed, context = _parse(request, announcement)
+    if parsed.reject_reason is not None:
+        return parsed, context
+    texts = [f"Derivation number {i}. \\boxed{{{4 if i < correct else 5}}}" for i in range(M_ROLLOUTS)]
+    materials = AdmissionRuntimeMaterials(canonical_prompt_tokens=[1], problem={"ground_truth": "4"},
+                                          completion_texts=texts)
+    return score_and_finalize_submission(parsed, materials, context, time.monotonic() + 5), context
+
+
+def test_admission_lets_the_robust_rule_judge_several_capped_rollouts_on_the_service_path(
+        signed_request, monkeypatch):
+    """R21 at admission, as in the batcher: no count limit before the robust rule is reached."""
+    from reliquary.constants import MAX_TRUNCATED_PER_SUBMISSION
+    three = (M_ROLLOUTS - 3, M_ROLLOUTS - 2, M_ROLLOUTS - 1)
+    assert len(three) > MAX_TRUNCATED_PER_SUBMISSION
+    robust, _ = _graded_with_caps(signed_request, monkeypatch, correct=M_ROLLOUTS // 2, capped=three)
+    assert robust.reject_reason is None
+    assert robust.truncated_indices == three
+    assert _lane_of(robust).lane == "training"
+    # All right but the three cut: they may all have been right, so never a training group.
+    collapsible, _ = _graded_with_caps(signed_request, monkeypatch, correct=M_ROLLOUTS - 3, capped=three)
+    assert collapsible.reject_reason is None
+    assert _lane_of(collapsible).lane != "training"
+
+
+def test_admission_keeps_the_count_limit_on_the_legacy_path(signed_request, monkeypatch):
+    import reliquary.validator.admission as admission
+    from reliquary.constants import max_truncated_for_environment
+    capped = tuple(range(max_truncated_for_environment(OMI) + 1))
+    _cap_rollouts(monkeypatch, capped)
+    request, announcement, _ = signed_request(purpose="training")
+    _, context = _parse(request, announcement)
+    legacy = replace(context, service_policy=None)
+    assert admission._termination_reject(request, legacy) is RejectReason.BAD_TERMINATION
+    assert admission._termination_reject(request, context) is None
+    monkeypatch.undo()
+    _cap_rollouts(monkeypatch, capped[:-1])
+    assert admission._termination_reject(request, legacy) is None
