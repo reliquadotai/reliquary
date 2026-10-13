@@ -75,7 +75,23 @@ GENERATOR_VERSION = "envscaler-v2"
 CHECKER_VERSION = "envscaler-checker-v2"
 REWARD_MODE = "binary-required-checks-finished-v1"
 # An upper bound; the profile's episode.max_turns is what a run uses.
-MAX_TURNS = 30
+# Measured on Qwen3.8-27B over the graded SFT range (2026-10-13, 119
+# episodes at 30): wins took 5-29 turns, 46 of 48 within 25; the 12 that
+# reached turn 30 all lost (11 turn_limit at 11k trajectory tokens on
+# average, one invalid_action at 26.7k). Past 25 a turn buys almost no win
+# and the longest, costliest failures.
+MAX_TURNS = 25
+
+# The task prompt's last paragraph. The renderer's system message already asks
+# for one call per turn; Qwen3.8 still put 2-11 calls in the first turn of 49
+# episodes in 50, and the renderer reads such a turn as invalid_action, which
+# ends the episode (5.6% won). Said again where the task is, with what it
+# costs, 2 episodes in 119 did it (40% won).
+TASK_INSTRUCTIONS = (
+    "Call one tool per message, then wait for its result before the next call: "
+    "a message with more than one tool call ends the session as a failure. When "
+    "the task is complete, reply with a final message and no tool call."
+)
 
 # Index-space boundaries. Half-open, contiguous, in this order, and what a
 # range guard reads (`reliquary.eval.sets` restates them; a test holds the
@@ -171,6 +187,7 @@ class EnvScalerToolsV2Environment:
             "Rules:\n"
             + "\n".join(f"- {rule}" for rule in world.get("constraints_rules", ()))
             + f"\n\nTask:\n{scenario.task.strip()}"
+            + f"\n\n{TASK_INSTRUCTIONS}"
         )
         return EpisodeTask(
             id=scenario.task_id,
@@ -379,4 +396,5 @@ __all__ = [
     "RL_RANGE",
     "SFT_GRADED_RANGE",
     "SFT_UNGRADED_RANGE",
+    "TASK_INSTRUCTIONS",
 ]

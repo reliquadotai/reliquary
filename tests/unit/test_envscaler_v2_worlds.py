@@ -26,9 +26,12 @@ from reliquary.environment.agentic.envs.envscaler_tools_v2 import (
     worker,
 )
 from reliquary.environment.agentic.envs.envscaler_tools_v2.environment import (
+    MAX_TURNS,
     EnvScalerToolsV2Environment,
+    TASK_INSTRUCTIONS,
 )
 from reliquary.environment.agentic.envs.envscaler_tools_v2.sandbox import WorldProcess
+from tests.unit import envscaler_v2_fixtures as fixtures
 
 _IMPORTS = "\n".join(
     f"import {name}" for name in worker.PRELOADED_MODULES if name != "_strptime"
@@ -99,6 +102,19 @@ def test_the_preloaded_modules_are_the_ones_the_worker_imports() -> None:
         if isinstance(node, ast.Import):
             imported.update(alias.name for alias in node.names)
     assert set(worker.PRELOADED_MODULES) <= imported
+
+
+def test_the_task_prompt_asks_for_one_call_per_message() -> None:
+    # Part of the environment (and of its manifest), not of the shared
+    # renderer: telecom's prompts are unchanged.
+    task = EnvScalerToolsV2Environment(fixtures.corpus()).get_task(0)
+
+    assert task.prompt.endswith("\n\n" + TASK_INSTRUCTIONS)
+    assert "one tool per message" in TASK_INSTRUCTIONS
+
+
+def test_an_episode_is_bounded_at_25_turns() -> None:
+    assert MAX_TURNS == EnvScalerToolsV2Environment.max_turns == 25
 
 
 def test_a_source_fix_must_match_exactly_once(monkeypatch) -> None:

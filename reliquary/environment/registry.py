@@ -682,8 +682,8 @@ _SPEC_VALUES = (
         episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
         renderer_id="reliquary-chatml-tools-v1",
         environment_manifest_sha256=(
-            "9dcf6518e890e69000d699bee679f035"
-            "2372ac170ad994298f877094fe9ec5c3"
+            "e9852f9d1aa4c8b6859481ec347b80a0"
+            "f4e8ed7f0e0f387baeb0fe4216c61159"
         ),
         required_data_env_var="RELIQUARY_ENVSCALER_DATA",
     ),
