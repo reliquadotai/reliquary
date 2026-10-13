@@ -866,6 +866,36 @@ _SPEC_VALUES = (
         external_distribution="reliquary-telecom-solo",
         external_artifact_resource="reliquary_telecom_solo/artifact.json",
     ),
+    EnvironmentSpec(
+        # v1's tickets with the 134 tau2-bench benchmark tickets moved to a
+        # split of their own (`benchmark`, never train), and train laid out
+        # SFT first then RL (environment.toml `[data]`): corpus jobs take
+        # [0, 1220), RL keeps [1220, 1713) (`reliquary.eval.sets`). Wheel
+        # 0.2.0a1 of the same distribution as v1, so one host installs one of
+        # the two. In no profile yet: a corpus source only.
+        name="reliquary_telecom_solo_v2",
+        factory_path="reliquary_telecom_solo:TelecomSoloEnvironment",
+        scorer_path=(
+            "reliquary.environment.agentic.suite:"
+            "episode_score_many_not_supported"
+        ),
+        validator_authoritative_reward=True,
+        admission_resource_class="cpu",
+        termination_policy="eos_or_cap",
+        final_answer_policy="json",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="reliquary/episode-json/v1",
+        interaction_mode="episode",
+        episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
+        renderer_id="reliquary-chatml-tools-v1",
+        environment_manifest_sha256=(
+            "8a84743d1285a674d34ee7bdaf1b6196"
+            "3639861d51c309e5adfb3c6d9efd6dce"
+        ),
+        external_distribution="reliquary-telecom-solo",
+        external_artifact_resource="reliquary_telecom_solo/artifact.json",
+    ),
 )
 
 

@@ -10,6 +10,7 @@ and the actions the replay runs are one and the same thing.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -74,13 +75,33 @@ class ParsedTrajectory:
     actions: tuple[Action, ...]
 
 
+def _check_span_tokens(tokens: Sequence[int], k: int, start: int, end: int, *,
+                       stop_ids: AbstractSet[int], markup_ids: AbstractSet[int]) -> None:
+    for position in range(start, end):
+        token = tokens[position]
+        if token in markup_ids or (token in stop_ids and position != end - 1):
+            raise TrajectoryRefused(REASON_BAD_TURNS, {"turn": k, "why": "turn markup or stop inside the span",
+                                                       "at": position - start})
+
+
+def check_span_tokens(tokens: Sequence[int], spans: Sequence[tuple[int, int]], *,
+                      stop_ids: AbstractSet[int], markup_ids: AbstractSet[int]) -> None:
+    """Each span is ONE assistant turn: a stop id only as its last token, and
+    no turn markup (``<|im_start|>``, tool-response tags) anywhere in it.
+    Otherwise one span could hold a closed turn, a made-up observation and
+    another turn, all of it trained as the model's and paid as one turn.
+    Raises ``TrajectoryRefused`` (``bad_turns``). Spans must be in bounds.
+    Shared by the SWE parse, the suite intake and the miners' prechecks."""
+    for k, (start, end) in enumerate(spans):
+        _check_span_tokens(tokens, k, start, end, stop_ids=stop_ids, markup_ids=markup_ids)
+
+
 def _check_spans(renderer: TurnRenderer, tokens: Sequence[int],
                  spans: Sequence[tuple[int, int]], stop: str) -> None:
     """Spans are ordered and in bounds, and each is one assistant turn: a stop
     token only as its last token, no turn markup inside. The renderer's parser
     cuts at the first stop token while its bridge trims at the last, so a span
     holding either would split what is replayed from what is trained."""
-    forbidden = renderer.turn_markup_ids
     previous = 0
     for k, (start, end) in enumerate(spans):
         if not (previous <= start < end <= len(tokens)):
@@ -88,11 +109,8 @@ def _check_spans(renderer: TurnRenderer, tokens: Sequence[int],
         if k + 1 < len(spans) and end > spans[k + 1][0]:
             raise TrajectoryRefused(REASON_BAD_TURNS, {"turn": k, "why": "spans overlap"})
         previous = end
-        for position in range(start, end):
-            token = tokens[position]
-            if token in forbidden or (token in renderer.stop_ids and position != end - 1):
-                raise TrajectoryRefused(REASON_BAD_TURNS, {"turn": k, "why": "turn markup or stop inside the span",
-                                                           "at": position - start})
+        _check_span_tokens(tokens, k, start, end, stop_ids=renderer.stop_ids,
+                           markup_ids=renderer.turn_markup_ids)
     last_start, last_end = spans[-1]
     if stop == "agent_completed" and tokens[last_end - 1] not in renderer.stop_ids:
         raise TrajectoryRefused(REASON_BAD_TURNS, {"why": "final turn is not closed"})

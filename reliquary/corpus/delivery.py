@@ -144,6 +144,69 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
             "turns": json.dumps([[s, e] for s, e in spans]), "stop": trajectory["stop"]}
 
 
+# Suite episode jobs (design 2026-10-13): one row per certified trajectory,
+# in the form the post-training `kind: episode` reader takes (it trains on
+# `tokens` and `assistant_mask` as they are, and drops a row whose
+# `graded_success` or `replay_certified` is false). `tokens` are the proven
+# ones rewritten into the chat template (`suite_episode.export_tokens`, named
+# in `tokens_transform`); `messages` + `tools` are the same conversation for
+# reading, rebuilt by replaying the trajectory, never from miner text.
+SUITE_EPISODE_ROW_FIELDS = ("job_id", "submission_id", "prompt_index", "task_id", "messages",
+                            "tools", "tokens", "assistant_mask", "tokens_transform",
+                            "graded_success", "replay_certified", "reward", "turns", "stop")
+
+
+class EpisodeUnreplayed(ValueError):
+    """The stored trajectory no longer replays to itself (another environment
+    or tokenizer than the one that admitted it)."""
+
+
+def suite_episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, source,
+                      encode, decode) -> dict:
+    """The row of one graded suite trajectory. Raises ``EpisodePromptMismatch``
+    or ``EpisodeUnreplayed``."""
+    from reliquary.corpus.suite_episode import (
+        END_OF_TEXT, IM_END, compare_replay, episode_seed, export_tokens, replay_suite, single_id,
+        suite_messages, tools_of,
+    )
+
+    trajectory = record["completions"][0]
+    index = int(record["prompt_index"])
+    prompt = [int(t) for t in trajectory["prompt_tokens"]]
+    tokens = [int(t) for t in trajectory["tokens"]]
+    spans = [(int(turn["start"]), int(turn["end"])) for turn in trajectory["turns"]]
+    task = source.task(index)
+    if [int(t) for t in source.renderer(encode).encode_initial(task)] != prompt:
+        raise EpisodePromptMismatch(submission_id)
+    trace = replay_suite(source.environment, renderer_id=job.episode.renderer, task_index=index,
+                         seed=episode_seed(job.job_id, index), prompt_ids=prompt, tokens=tokens,
+                         spans=spans, encode=encode, decode=decode,
+                         max_turns=job.episode.max_turns)
+    refusal = compare_replay(trace, prompt_ids=prompt, tokens=tokens, spans=spans,
+                             stop=trajectory["stop"])
+    if refusal is not None:
+        raise EpisodeUnreplayed(f"{submission_id}: {refusal}")
+    full_spans = [(len(prompt) + s, len(prompt) + e) for s, e in spans]
+    try:
+        end_of_text = single_id(encode, END_OF_TEXT)
+    except ValueError:
+        end_of_text = None
+    exported, mask, transforms = export_tokens(
+        prompt + tokens, full_spans, im_end_id=single_id(encode, IM_END),
+        newline_ids=encode("\n"), end_of_text_id=end_of_text)
+    return {"job_id": job.job_id, "submission_id": submission_id, "prompt_index": index,
+            "task_id": str(grade.get("instance_id") or trace.task_id),
+            "messages": json.dumps(suite_messages(trace, task=task, decode=decode,
+                                                  spans=full_spans), ensure_ascii=False),
+            "tools": json.dumps(tools_of(task), ensure_ascii=False),
+            "tokens": exported, "assistant_mask": mask,
+            "tokens_transform": "+".join(transforms),
+            "graded_success": bool(grade.get("graded_success")),
+            "replay_certified": bool(grade.get("replay_certified")),
+            "reward": float(trace.reward.reward),
+            "turns": json.dumps([[s, e] for s, e in spans]), "stop": trajectory["stop"]}
+
+
 def _lone(deciders) -> str | None:
     deciders = set(deciders or ())
     return next(iter(deciders)) if len(deciders) == 1 else None
@@ -250,14 +313,21 @@ async def delivery_rows(*, job, records, counts: dict, grade=None,
 async def episode_rows(*, job, records, renderer, source, counts: dict, sft_only: bool = False,
                        quarantined: Collection[str] | None,
                        concurrency: int = READ_CONCURRENCY,
-                       window: int = READ_WINDOW) -> AsyncIterator[dict]:
+                       window: int = READ_WINDOW, codec=None) -> AsyncIterator[dict]:
     """One row per passing, not voided, certified trajectory, in verdict-id
     order; ``sft_only`` keeps the certified successes (spec N6's SFT set).
 
     The effective grade is the latest regrade, else the grade. A grade that an
     executor of ``quarantined`` decided alone is held, as the settler holds it;
     the caller names the registry's quarantined grade executors (None refuses:
-    an export blind to quarantines must not run)."""
+    an export blind to quarantines must not run).
+
+    A suite job's rows are ``suite_episode_row``s: ``source`` is its
+    ``SuiteSource``, ``codec`` the checkpoint tokenizer's ``encode``/``decode``
+    (an object with both), and ``renderer`` is unused."""
+    suite = job.episode.is_suite
+    if suite and codec is None:
+        raise ValueError("a suite episode export replays its trajectories: it needs a codec")
     if quarantined is None:
         raise ValueError("an episode export needs the quarantined grade executors "
                          "(the registry's), to hold what they decided alone")
@@ -310,9 +380,14 @@ async def episode_rows(*, job, records, renderer, source, counts: dict, sft_only
                 counts["task_mismatch"] += 1
                 continue
             try:
-                row = await asyncio.to_thread(
-                    episode_row, job=job, submission_id=sid, record=record, grade=document,
-                    renderer=renderer, user_prompt=source.prompt(index))
+                if suite:
+                    row = await asyncio.to_thread(
+                        suite_episode_row, job=job, submission_id=sid, record=record,
+                        grade=document, source=source, encode=codec.encode, decode=codec.decode)
+                else:
+                    row = await asyncio.to_thread(
+                        episode_row, job=job, submission_id=sid, record=record, grade=document,
+                        renderer=renderer, user_prompt=source.prompt(index))
             except EpisodeUnrendered:
                 logger.error("corpus export: %s's messages do not render to its tokens", sid[:12])
                 counts["unrendered"] += 1
@@ -527,6 +602,10 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
     dedupe = dedupe or bool(dedupe_against)
     if episode and dedupe:
         raise ValueError("an episode delivery is not deduplicated by completion")
+    if episode and job.episode.is_suite:
+        # Its rows have their own fields (SUITE_EPISODE_ROW_FIELDS), which the
+        # Parquet schema here does not carry.
+        raise ValueError("a suite episode job is exported with `reliquary jobs export --sft`")
     if episode and (renderer is None or source is None or quarantined is None):
         raise ValueError("an episode job is exported with its pinned renderer, its task source "
                          "and the quarantined grade executors")
@@ -904,6 +983,8 @@ class HTTPDeliverySink:
 __all__ = [
     "DELIVERY_SCHEMA",
     "EPISODE_ROW_FIELDS",
+    "SUITE_EPISODE_ROW_FIELDS",
+    "suite_episode_row",
     "LocalDirectorySink",
     "HTTPDeliverySink",
     "R2DeliverySink",

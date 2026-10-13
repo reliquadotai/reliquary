@@ -220,13 +220,16 @@ def check_turn_termination(tokens: Sequence[int], spans: Sequence[tuple[int, int
                            max_tokens_per_turn: int, max_total_tokens: int) -> CheckResult:
     """Each turn ends where generation stops: on the turn terminator (any
     stop id for the final turn) or exactly at the cap the endpoint applied,
-    ``min(max_tokens_per_turn, max_total_tokens - prompt so far)``."""
+    ``min(max_tokens_per_turn, max_total_tokens - prompt so far)``. A turn
+    before the last never ends on another stop id, even at the cap: the
+    episode went on after it, so it did not stop there."""
     last = len(spans) - 1
     for position, (start, end) in enumerate(spans):
         cap = min(max_tokens_per_turn, max_total_tokens - (prompt_len + start))
         token = tokens[end - 1]
         ended = token in stop_ids if position == last else token == terminator_id
-        if not ended and end - start != cap:
+        other_stop = position != last and token in stop_ids and token != terminator_id
+        if other_stop or (not ended and end - start != cap):
             return CheckResult(ok=False, reason="bad_termination",
                                detail={"turn": position, "tokens": end - start, "cap": cap,
                                        "last_token_id": int(token)})

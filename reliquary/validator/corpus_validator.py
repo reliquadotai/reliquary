@@ -435,6 +435,14 @@ def judge_jobs(w, *, intake_only: bool, settle_every_seconds: float, settle=None
     return jobs
 
 
+def remote_graded(job) -> bool:
+    """An episode job graded by remote grade executors (SWE): not a suite one,
+    which its validator grades by replay (``suite_grading``) and which so has
+    no executor pin, no replay lease and no dispatcher to refuse it."""
+    episode = getattr(job, "episode", None)
+    return episode is not None and not episode.is_suite
+
+
 def grade_refusal(job, dispatcher) -> None:
     """``ValueError`` (permanent until a restart) for an episode job that
     ``dispatcher`` cannot grade: none (the process started without an episode
@@ -476,6 +484,13 @@ def wire_job_grader(w, *, records, judge_records, dispatcher, parse_executor=Non
     the intake's) on ``parse_executor``, and reads drand on ``beacon_executor``:
     in a process serving submit routes, never their default executor."""
     if w.job.episode is None or getattr(w, "grader", None) is not None:
+        return
+    if w.job.episode.is_suite:
+        # Graded by its replay, here: no dispatcher, no executor, no lease.
+        from reliquary.validator.suite_grading import LocalEpisodeGrader
+
+        w.grader = LocalEpisodeGrader(job=w.job, records=judge_records,
+                                      replayer=w.episode_intake.replayer)
         return
     grade_refusal(w.job, dispatcher)
     from reliquary.validator.corpus_grading import CorpusGrader
@@ -1199,7 +1214,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     grade_dispatcher = grade_directory = None
     graders: dict[str, object] = {}
     pins = {(w.job.episode.env.package, w.job.episode.env.version)
-            for w in wiring if w.job.episode is not None}
+            for w in wiring if remote_graded(w.job)}
     if len(pins) > 1:
         raise RuntimeError(f"one validator grades one env pin, these jobs name {sorted(pins)}")
     if pins:
@@ -1210,7 +1225,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
 
         (package, version), = pins
         # Ruling P26: never serve a job whose replays outlive the replay lease.
-        for w in [w for w in wiring if w.job.episode is not None]:
+        for w in [w for w in wiring if remote_graded(w.job)]:
             try:
                 await lease_checked(w.job)
             except Exception as exc:  # noqa: BLE001 - isolated: the others still start
@@ -1229,7 +1244,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         try:
             await grade_directory.refresh()
         except Exception as exc:  # noqa: BLE001 - no grader without the quarantines
-            for w in [w for w in wiring if w.job.episode is not None]:
+            for w in [w for w in wiring if remote_graded(w.job)]:
                 not_served(w.entry, w.job, "reading the grade executor registry", exc,
                            retried=False)
                 wiring.remove(w)
@@ -1253,12 +1268,25 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         served_only=generation_only,
     )
 
+    suite_replayer_box: dict = {}
+
     def episode_intake_for(w):
         # Loads the task set and the renderers: blocking, so a hot-added job
         # builds it off the event loop (`wire_hot`). The grader gets its own
         # renderer: its parses never queue on the intake's renderer lock.
         from reliquary.validator import agentic_intake
 
+        if w.job.episode.is_suite:
+            # Replayed at intake and graded by the same replay, in one
+            # process pool for every suite job here (built at the first).
+            from reliquary.validator import suite_intake
+
+            if suite_replayer_box.get("replayer") is None:
+                suite_replayer_box["replayer"] = suite_intake.PoolSuiteReplayer.for_tokenizer(
+                    tokenizer)
+            return suite_intake.build_suite_intake(
+                w.job, tokenizer=tokenizer, vocab_size=vocab_size,
+                chunk_tokens=proof.chunk_tokens, replayer=suite_replayer_box["replayer"])
         intake = agentic_intake.build_episode_intake(
             w.job, checkpoint_dir=checkpoint_dir, tokenizer=tokenizer,
             vocab_size=vocab_size, chunk_tokens=proof.chunk_tokens)
@@ -1320,7 +1348,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         # The renderer first: a job refused for it leaves its ledger untouched.
         own_profile = _entry_profile(task_entry)
         renderer = build_renderer(job, own_profile)
-        if job.episode is not None:
+        if remote_graded(job):
             # Before its intake (a task set download): a job this process
             # cannot grade is refused for nothing.
             grade_refusal(job, grade_dispatcher)
@@ -1451,6 +1479,9 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
 
     server = uvicorn.Server(uvicorn.Config(app, host=http_host, port=http_port, log_level="info"))
     async def cleanup_threads() -> None:
+        replayer = suite_replayer_box.get("replayer")
+        if replayer is not None:
+            replayer.close()                    # kills the suite replay workers
         await asyncio.to_thread(judge_threads.shutdown, wait=True)
         if grade_parse_threads is not None:
             await asyncio.to_thread(grade_parse_threads.shutdown, wait=True, cancel_futures=True)
@@ -1473,6 +1504,7 @@ __all__ = [
     "settle_forever",
     "startup_refusal",
     "wire_job_front_only",
+    "remote_graded",
     "wire_job_grader",
     "wire_job_judge",
 ]

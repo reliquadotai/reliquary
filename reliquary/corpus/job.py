@@ -69,11 +69,34 @@ SUBMIT_SCOPED = "scoped"
 MAX_EPISODE_TOTAL_TOKENS = 60000
 MAX_EPISODE_TURNS = 64
 EPISODE_STOPS = ("agent_completed", "max_turns", "context_length")
-EPISODE_ENV_PACKAGES = frozenset({"reliquary-swe"})
-EPISODE_HARNESSES = frozenset({"bash"})
+# A suite episode (design 2026-10-13): one task of an episode environment of
+# the registry, replayed by the validator itself, so it has no verifiers pin
+# and no failed-replay draw. `reliquary-suite` is a package name only a binary
+# that knows the harness accepts: an older one refuses the manifest.
+SUITE_PACKAGE = "reliquary-suite"
+SUITE_HARNESS = "suite"
+SUITE_STOPS = ("agent_completed", "max_turns")
+# A suite turn's whole text, reasoning included, is one ``GeneratedAction``,
+# which refuses more than ``MAX_ACTION_BYTES`` (16 KiB,
+# reliquary.environment.agentic.types; not imported: this module loads
+# nothing). A turn that hits its token cap must still fit, or the miner's
+# episode dies on it (the 2026-10-13 GPU trial lost one at 4096 tokens). Five
+# bytes a token is past what Qwen's tokenizer averages on reasoning, JSON and
+# code, so the largest per-turn cap a suite job takes is 3276 tokens.
+SUITE_ACTION_BYTES = 16 * 1024
+SUITE_BYTES_PER_TOKEN = 5
+MAX_SUITE_TOKENS_PER_TURN = SUITE_ACTION_BYTES // SUITE_BYTES_PER_TOKEN
+EPISODE_ENV_PACKAGES = frozenset({"reliquary-swe", SUITE_PACKAGE})
+EPISODE_HARNESSES = frozenset({"bash", SUITE_HARNESS})
+# The package each harness runs: never mixed.
+_HARNESS_PACKAGE = {"bash": "reliquary-swe", SUITE_HARNESS: SUITE_PACKAGE}
 _EPISODE_FIELDS = ("env", "harness", "renderer", "verifiers", "max_turns",
                    "max_tokens_per_turn", "max_total_tokens", "replay_fraction_failed")
 _EPISODE_ENV_FIELDS = ("package", "version", "split", "num_images")
+_SUITE_EPISODE_FIELDS = ("env", "harness", "renderer", "max_turns", "max_tokens_per_turn",
+                         "max_total_tokens")
+_SUITE_ENV_FIELDS = ("package", "name", "version", "split")
+_ENV_NAME_RE = re.compile(r"\A[a-z0-9][a-z0-9_]{0,127}\Z")
 _COMMIT_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 _RENDERER_RE = re.compile(r"\Arenderers:[a-z0-9.]+@\d+\.\d+\.\d+\Z")
 
@@ -112,14 +135,20 @@ class Filter:
 
 @dataclass(frozen=True, slots=True)
 class EpisodeEnv:
-    """The environment package an episode runs in, pinned by commit."""
+    """The environment package an episode runs in, pinned by commit (SWE), or
+    the registry environment it runs, pinned by its manifest sha256 (suite)."""
 
     package: str
     version: str
     split: str
-    num_images: int
+    num_images: int | None
+    # Suite only: the registry environment's name.
+    name: str | None = None
 
     def to_contract(self) -> dict[str, Any]:
+        if self.package == SUITE_PACKAGE:
+            return {"package": self.package, "name": self.name, "version": self.version,
+                    "split": self.split}
         return {"package": self.package, "version": self.version, "split": self.split,
                 "num_images": self.num_images}
 
@@ -132,13 +161,23 @@ class EpisodeSpec:
     env: EpisodeEnv
     harness: str
     renderer: str
-    verifiers: str
+    verifiers: str | None
     max_turns: int
     max_tokens_per_turn: int
     max_total_tokens: int
-    replay_fraction_failed: float
+    # None for a suite episode: the validator replays every one itself.
+    replay_fraction_failed: float | None
+
+    @property
+    def is_suite(self) -> bool:
+        return self.harness == SUITE_HARNESS
 
     def to_contract(self) -> dict[str, Any]:
+        if self.is_suite:
+            return {"env": self.env.to_contract(), "harness": self.harness,
+                    "renderer": self.renderer, "max_turns": self.max_turns,
+                    "max_tokens_per_turn": self.max_tokens_per_turn,
+                    "max_total_tokens": self.max_total_tokens}
         return {"env": self.env.to_contract(), "harness": self.harness,
                 "renderer": self.renderer, "verifiers": self.verifiers,
                 "max_turns": self.max_turns, "max_tokens_per_turn": self.max_tokens_per_turn,
@@ -343,7 +382,40 @@ def _bounded_int(raw: Mapping[str, Any], field: str, low: int, high: int, label:
     return value
 
 
+def _parse_suite_episode(raw: Mapping[str, Any]) -> EpisodeSpec:
+    """A suite episode: which registry environment, at which manifest, and the
+    renderer it declares. That the registry has it, at that manifest and with
+    that renderer, is checked where the job is resolved
+    (`reliquary.corpus.suite_episode.suite_spec_refusal`): this layer is pure."""
+    raw = _fields(raw, _SUITE_EPISODE_FIELDS, "episode")
+    env = _fields(raw["env"], _SUITE_ENV_FIELDS, "episode.env")
+    if env["package"] != SUITE_PACKAGE:
+        raise JobError(f"a suite episode's episode.env.package must be {SUITE_PACKAGE!r}")
+    if not isinstance(env["name"], str) or not _ENV_NAME_RE.match(env["name"]):
+        raise JobError(f"episode.env.name must be a registry environment name, got {env['name']!r}")
+    if not isinstance(env["version"], str) or not _SHA256_RE.match(env["version"]):
+        raise JobError("episode.env.version must be the environment's 64-hex manifest sha256")
+    if env["split"] != "train":
+        raise JobError(f"episode.env.split must be 'train', got {env['split']!r}")
+    renderer = raw["renderer"]
+    if not isinstance(renderer, str) or not renderer or renderer.strip() != renderer:
+        raise JobError(f"episode.renderer must be the environment's renderer id, got {renderer!r}")
+    max_total = _bounded_int(raw, "max_total_tokens", 1, MAX_EPISODE_TOTAL_TOKENS, "episode")
+    return EpisodeSpec(
+        env=EpisodeEnv(package=env["package"], version=env["version"], split=env["split"],
+                       num_images=None, name=env["name"]),
+        harness=SUITE_HARNESS, renderer=renderer, verifiers=None,
+        max_turns=_bounded_int(raw, "max_turns", 1, MAX_EPISODE_TURNS, "episode"),
+        max_tokens_per_turn=_bounded_int(raw, "max_tokens_per_turn", 1,
+                                         min(max_total, MAX_SUITE_TOKENS_PER_TURN), "episode"),
+        max_total_tokens=max_total,
+        replay_fraction_failed=None,
+    )
+
+
 def _parse_episode(raw: Any) -> EpisodeSpec:
+    if isinstance(raw, Mapping) and raw.get("harness") == SUITE_HARNESS:
+        return _parse_suite_episode(raw)
     raw = _fields(raw, _EPISODE_FIELDS, "episode")
     env = _fields(raw["env"], _EPISODE_ENV_FIELDS, "episode.env")
     if env["package"] not in EPISODE_ENV_PACKAGES:
@@ -354,6 +426,9 @@ def _parse_episode(raw: Any) -> EpisodeSpec:
         raise JobError(f"episode.env.split must be 'train', got {env['split']!r}")
     if raw["harness"] not in EPISODE_HARNESSES:
         raise JobError(f"episode.harness must be one of {sorted(EPISODE_HARNESSES)}")
+    if _HARNESS_PACKAGE[raw["harness"]] != env["package"]:
+        raise JobError(f"the {raw['harness']!r} harness runs {_HARNESS_PACKAGE[raw['harness']]!r}, "
+                       f"not {env['package']!r}")
     if not isinstance(raw["renderer"], str) or not _RENDERER_RE.match(raw["renderer"]):
         raise JobError(f"episode.renderer must read renderers:<name>@<version>, got {raw['renderer']!r}")
     if not isinstance(raw["verifiers"], str) or not _COMMIT_RE.match(raw["verifiers"]):
@@ -382,13 +457,17 @@ def _check_episode_job(job: JobSpec) -> None:
     if job.slots_per_prompt < 2:
         raise JobError("an episode job needs slots_per_prompt >= 2 (spec §6)")
     if job.filter is not None:
-        raise JobError("an episode job is graded by its grade executors, not by a filter")
+        raise JobError("an episode job is graded by its grade executors (a suite one by its "
+                       "replay), not by a filter")
     if job.prompt_order != PROMPT_ORDER_FREE:
         raise JobError("an episode job runs episodes concurrently: prompt_order must be 'free'")
     if job.sampling.max_new_tokens != episode.max_tokens_per_turn:
         raise JobError("sampling.max_new_tokens must equal episode.max_tokens_per_turn")
     if job.renderer_id != episode.renderer:
         raise JobError("renderer_id must equal episode.renderer")
+    if episode.is_suite and job.prompt_source != episode.env.name:
+        raise JobError("a suite episode job draws its prompts from its environment: "
+                       f"prompt_source must be {episode.env.name!r}")
 
 
 def parse_job(raw: Mapping[str, Any]) -> JobSpec:

@@ -63,7 +63,7 @@ from reliquary.protocol.corpus_submission import (
     CorpusSubmissionResponse,
 )
 from reliquary.infrastructure.corpus_record_store import RECORD_SCHEMA_V2
-from reliquary.validator.agentic_intake import IntakeFacts
+from reliquary.validator.agentic_intake import IntakeFacts, ReplayUnavailable
 from reliquary.validator.corpus_text import (
     Renderer,
     check_prompt_fidelity,
@@ -430,10 +430,47 @@ class EpisodePromptRenderer:
             "an episode job's prompt is checked by its episode intake, not rendered as text")
 
 
+class SuiteSourceSpec:
+    """What `resolve_prompt_source` returns for a suite episode job: the
+    registry environment it names, buildable into its tasks
+    (`reliquary.corpus.suite_episode.SuiteSource`)."""
+
+    interaction_mode = "agentic"
+
+    def __init__(self, episode: Any) -> None:
+        self.episode = episode
+
+    def create(self):
+        from reliquary.corpus.suite_episode import suite_source
+
+        try:
+            return suite_source(self.episode)
+        except ValueError as exc:
+            raise CorpusPromptSourceError(str(exc)) from exc
+
+
+def _resolve_suite(prompt_source: str, renderer_id: str | None, episode: Any) -> SuiteSourceSpec:
+    from reliquary.corpus.suite_episode import suite_spec_refusal
+
+    if prompt_source != episode.env.name:
+        raise CorpusPromptSourceError(
+            f"a suite episode job draws its prompts from {episode.env.name!r}, "
+            f"not {prompt_source!r}")
+    if renderer_id is not None and renderer_id != episode.renderer:
+        raise CorpusPromptSourceError(
+            f"the job's renderer_id {renderer_id!r} is not its episode.renderer {episode.renderer!r}")
+    refusal = suite_spec_refusal(episode)
+    if refusal:
+        raise CorpusPromptSourceError(refusal)
+    return SuiteSourceSpec(episode)
+
+
 def _resolve_agentic(prompt_source: str, renderer_id: str | None, episode: Any) -> AgenticSourceSpec:
     from reliquary.environment import agentic_swe
     from reliquary.protocol.agentic_source import AGENTIC_SWE_ENVIRONMENT
 
+    if episode is not None and getattr(episode, "is_suite", False):
+        return _resolve_suite(prompt_source, renderer_id, episode)
     if episode is None:
         raise CorpusPromptSourceError(
             f"prompt source {prompt_source!r} serves agentic episodes: a job reading it "
@@ -1794,7 +1831,15 @@ def build_corpus_router(
                 logger.error("corpus job %s is an episode job but has no episode intake", job_id)
                 raise HTTPException(status_code=500, detail="corpus_episode_intake_unconfigured")
             # Every refusal here precedes any slot or cursor consumption.
-            outcome = await asyncio.to_thread(episode_intake.check, request)
+            try:
+                # On the intake's own threads when it has them (a suite one,
+                # which waits on its replay pool), else the default executor.
+                outcome = await asyncio.get_running_loop().run_in_executor(
+                    getattr(episode_intake, "executor", None), episode_intake.check, request)
+            except ReplayUnavailable as exc:
+                # Ours, not the miner's: a retryable 503, never a refusal.
+                logger.error("corpus job %s: replay unavailable: %s", job_id, exc)
+                raise HTTPException(status_code=503, detail="corpus_replay_unavailable") from exc
             if not isinstance(outcome, IntakeFacts):
                 try:
                     reason = CorpusRejectReason(outcome.reason)
