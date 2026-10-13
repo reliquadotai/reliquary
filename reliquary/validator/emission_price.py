@@ -60,6 +60,12 @@ class PriceParams:
     # escalating: past this, the likelier explanation is that the environment is
     # broken on our side, not that the market is short.
     breaker_timeouts: int = 3
+    # The trainer was ready and waited on this environment's supply for more
+    # than ``rise_wait_fraction`` of the window: multiply the price by
+    # ``rise``. The defaults keep a params object built before this existed
+    # inert -- no wait can exceed an infinite fraction.
+    rise: float = 1.0
+    rise_wait_fraction: float = math.inf
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +159,20 @@ def _timed_out(outcome: Any) -> bool:
     return bool(getattr(outcome, "timed_out", False))
 
 
+def _waited_on(outcome: Any, params: PriceParams) -> bool:
+    """The trainer was ready and waited on this environment's supply for more
+    than ``rise_wait_fraction`` of the window: collection slowed training.
+
+    ``r`` cannot say this: its denominator, the training span, grows with the
+    very wait, so it saturates near 1 when collection is the bottleneck.
+    """
+    wait = getattr(outcome, "trainer_wait_seconds", None)
+    if wait is None or _timed_out(outcome):
+        return False
+    window_seconds = outcome.elapsed_rounds * ROUND_SECONDS
+    return window_seconds > 0 and float(wait) > params.rise_wait_fraction * window_seconds
+
+
 def _smoothed_ratio(
     recent: Sequence[WindowOutcome], median_rounds: int
 ) -> float | None:
@@ -216,6 +236,9 @@ def advance(
         # snap that fails to restore supply from parking there forever.
         price = max(price, last_good) * params.snap
         regime = "snap"
+    elif _waited_on(outcome, params):
+        price *= params.rise
+        regime = "rise"
     elif r_smoothed is not None and r_smoothed < params.deadband:
         price *= params.decay ** (outcome.elapsed_rounds / params.rounds_per_step)
         regime = "descend"
@@ -259,6 +282,9 @@ class EnvironmentOutcome:
     # dominant shape (arrivals reached target, proofs did not). Last and
     # defaulted, so every existing construction keeps working.
     timed_out: bool = False
+    # Seconds the picks waited on THIS environment's groups while the trainer
+    # was ready for them. None means not measured: no signal, never a wait.
+    trainer_wait_seconds: float | None = None
 
     @property
     def elapsed_rounds(self) -> int:
@@ -463,6 +489,8 @@ def outcomes_by_environment_from_archive(
     # "timed_out" record (one owner for that rule); every environment reads
     # the same scalar back rather than re-deriving it here.
     timed_out = record.get("window_status") == "timed_out"
+    waits = record.get("trainer_wait_seconds_by_environment")
+    waits = waits if isinstance(waits, Mapping) else {}
     outcomes: dict[str, EnvironmentOutcome] = {}
     for environment, ready in by_environment.items():
         if not isinstance(environment, str):
@@ -496,8 +524,17 @@ def outcomes_by_environment_from_archive(
             ready_round=resolved,
             incompressible_rounds=scalar.incompressible_rounds,
             timed_out=timed_out,
+            trainer_wait_seconds=_wait_seconds(waits.get(environment)),
         )
     return outcomes
+
+
+def _wait_seconds(value: Any) -> float | None:
+    """An archived wait, or None when absent or unreadable (no signal)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) and value >= 0 else None
 
 
 def distinct_prompt_arrival_rounds(
@@ -663,6 +700,7 @@ def price_signal_fields(
     arrivals_by_environment: Mapping[str, Mapping[int, Sequence[int]]] | None,
     targets_by_environment: Mapping[str, int],
     first_pick_round: int | None = None,
+    trainer_wait_seconds_by_environment: Mapping[str, float] | None = None,
 ) -> dict[str, Any] | None:
     """The fields a window contributes to the archive, or None.
 
@@ -703,6 +741,11 @@ def price_signal_fields(
         training_rounds = int(close_round) - int(first_pick_round)
         if training_rounds > 0:
             fields["training_rounds"] = training_rounds
+        if trainer_wait_seconds_by_environment is not None:
+            fields["trainer_wait_seconds_by_environment"] = {
+                str(environment): round(float(seconds), 1)
+                for environment, seconds in trainer_wait_seconds_by_environment.items()
+            }
     return fields
 
 
@@ -713,6 +756,10 @@ def price_signal_fields(
 #
 # None of these numbers is settled. They are a starting point whose whole job
 # is to produce a shadow curve legible enough to calibrate them against.
+# The drand quicknet period. Versioned here rather than read from drand at
+# runtime, so replaying an archive never depends on a live read.
+ROUND_SECONDS = 3.0
+
 PRODUCTION_PRICE_PARAMS = PriceParams(
     # Today's pool, so the first armed window changes nothing.
     start=1.0,
@@ -736,4 +783,10 @@ PRODUCTION_PRICE_PARAMS = PriceParams(
     last_good_fills=50,
     # A starting point, calibrated in shadow like every other number here.
     breaker_timeouts=3,
+    # +10 % per window in which the trainer waited on the environment for more
+    # than 5 % of the window (~22 s of a 450 s window). In normal windows every
+    # environment fills in 80-130 s while the trainer takes ~350 s, so the
+    # trainer never waits on supply (measured, 1,000 windows, 10-13).
+    rise=1.10,
+    rise_wait_fraction=0.05,
 )
