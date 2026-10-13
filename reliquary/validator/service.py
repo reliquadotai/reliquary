@@ -200,6 +200,18 @@ _PRICE_ARCHIVE_FIELDS = (
 )
 
 
+def _pools_by_environment(assembler, names) -> dict[str, float]:
+    """Each named environment's pool from the assembler, skipping any it does
+    not price: an archive field must never cost the window its archive."""
+    pools: dict[str, float] = {}
+    for name in names:
+        try:
+            pools[str(name)] = float(assembler.pool_for(name))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return pools
+
+
 def _window_price_signal(
     first_batcher, batcher_dict, target_for, *, trainer_wait_seconds_by_environment=None,
 ):
@@ -1310,6 +1322,11 @@ class ValidationService:
             emission_cap=self._emission_cap,
         )
         self.server.set_late_drop_callback(self.record_late_drop)
+        from reliquary.validator.rl_pay import RlPayBoard
+
+        # GET /rl/pay: fed one window at a time below, seeded at startup.
+        self._rl_pay = RlPayBoard()
+        self.server._rl_pay_board = self._rl_pay
         # A service run never names a not-yet-opened candidate window or its stage on /health.
         self.server.service_health_redaction = self._service_runtime is not None
         if service_contract is not None:
@@ -6249,6 +6266,38 @@ class ValidationService:
         }
         self._price_shadow_states_by_environment = dict(walk.states_by_environment)
 
+    def _feed_rl_pay(self, archive) -> None:
+        """Give ``GET /rl/pay`` this window; never at the archive's expense."""
+        board = getattr(self, "_rl_pay", None)
+        if board is None:
+            return
+        try:
+            from reliquary.validator.rl_pay import window_stat
+
+            board.add(window_stat(archive))
+        except Exception:
+            logger.warning("rl pay: window not recorded", exc_info=True)
+
+    async def _seed_rl_pay(self) -> None:
+        """The last windows' archives, so ``GET /rl/pay`` answers after a restart."""
+        from reliquary.validator.rl_pay import SEED_WINDOWS, window_stat
+
+        board = getattr(self, "_rl_pay", None)
+        end_window = int(getattr(self, "_window_n", 0) or 0)
+        if board is None or end_window <= 0:
+            return
+        try:
+            archives = await self._load_archive_range(
+                start_window=max(0, end_window - SEED_WINDOWS + 1),
+                end_window=end_window,
+                require_all=False,
+                task_id=TASK_ID,
+            )
+            board.seed(window_stat(archive) for archive in archives)
+            logger.info("rl pay: seeded from %d archived windows", len(archives))
+        except Exception:
+            logger.warning("rl pay: seed from archives failed", exc_info=True)
+
     async def _restore_price_walk(self) -> None:
         """Resume the price walk from the archives, so a restart never resets the price.
 
@@ -7033,6 +7082,14 @@ class ValidationService:
                     if fill_closed_assembler is not None
                     else 1.0
                 ),
+                # Each environment's own pool: with per-environment prices
+                # they differ, and only this lets a reader (``/rl/pay``) price
+                # a paid group exactly. Absent without an assembler.
+                **({
+                    "window_pool_by_environment": _pools_by_environment(
+                        fill_closed_assembler, batcher_dict,
+                    ),
+                } if fill_closed_assembler is not None else {}),
             } if FILL_CLOSED_ENABLED else {}),
             "validator_hotkey": self.wallet.hotkey.ss58_address,  # provenance
             "randomness": first_batcher.randomness,
@@ -7149,6 +7206,7 @@ class ValidationService:
             # received a seal-time snapshot; the live ledger now accumulates
             # the COLLECTING window's drops and must not be wiped.
             self._late_drops.clear()
+        self._feed_rl_pay(archive)
         # Non-blocking archive: enqueue to disk and return immediately.
         # The background ``ArchiveQueue`` worker (started in run()) picks
         # this up and uploads via the same sync-boto3 path used in
@@ -8048,6 +8106,9 @@ class ValidationService:
         await startup_step("content_cooldown", self._restore_content_cooldown())
         await startup_step("hash_history", self._rebuild_hashes_from_history())
         await startup_step("emission_price", self._restore_price_walk())
+        # Behind startup: the pay board only informs miners and must never
+        # delay serving.
+        self._rl_pay_seed_task = asyncio.create_task(self._seed_rl_pay(), name="rl_pay_seed")
         self._log_startup_config_banner()
 
         # Start the background archive-upload worker. It scans the queue

@@ -1382,6 +1382,8 @@ class ValidatorServer:
         self._emission_cap = float(emission_cap)
         # The price block /tasks shows miners; the service publishes it each window.
         self._price_view: dict | None = None
+        # Set by the service: the board behind GET /rl/pay.
+        self._rl_pay_board = None
         self._app_started_at = time.time()
         self._image_revision = runtime_revision()
         self._runtime_fingerprint = collect_runtime_fingerprint()
@@ -6322,6 +6324,20 @@ class ValidatorServer:
                 "revision": cp.revision,
                 "signature": cp.signature,
             }
+
+        @app.get("/rl/pay")
+        async def get_rl_pay(tokens_per_second: float | None = None):
+            """What each RL environment pays per paid token, per hour and per
+            GPU-hour (``tokens_per_second`` adds the bounded estimate)."""
+            board = getattr(self, "_rl_pay_board", None)
+            if tokens_per_second is not None and not (0 < tokens_per_second < 1e7):
+                return JSONResponse(status_code=422, content={"error": "tokens_per_second out of range"})
+            if board is None:
+                return JSONResponse(status_code=503, content={"status": "unavailable"})
+            answer = await board.answer(tokens_per_second)
+            if answer.get("status") == "loading":
+                return JSONResponse(status_code=503, content=answer)
+            return answer
 
         @app.get("/tasks")
         async def get_tasks():

@@ -51,6 +51,21 @@ async def close_subtensor(subtensor) -> None:
         logger.warning("close_subtensor swallowed error: %s", e)
 
 
+async def subnet_pool(subtensor, netuid: int = NETUID) -> dict:
+    """The subnet pool's alpha price in TAO (TAO reserve over alpha reserve)
+    and the miners' alpha per block (``miner_alpha_per_block``), in one read."""
+    info = await asyncio.wait_for(subtensor.subnet(netuid), timeout=CHAIN_READ_TIMEOUT)
+    raw_cut = await asyncio.wait_for(subtensor.query_subtensor("SubnetOwnerCut"),
+                                     timeout=CHAIN_READ_TIMEOUT)
+    cut = int(getattr(raw_cut, "value", raw_cut)) / 65535
+    alpha_out = float(info.alpha_out_emission)
+    tao_in, alpha_in = float(info.tao_in), float(info.alpha_in)
+    return {"alpha_out_per_block": alpha_out, "owner_cut": cut,
+            "miner_alpha_per_block": alpha_out * (1.0 - cut) / 2.0, "netuid": int(netuid),
+            "tao_in": tao_in, "alpha_in": alpha_in,
+            "alpha_price_tao": tao_in / alpha_in if alpha_in > 0 else None}
+
+
 async def get_metagraph(subtensor, netuid: int = NETUID):
     """Get subnet metagraph."""
     return await asyncio.wait_for(subtensor.metagraph(netuid), timeout=CHAIN_READ_TIMEOUT)
