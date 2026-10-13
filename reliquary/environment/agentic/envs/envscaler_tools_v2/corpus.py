@@ -17,7 +17,8 @@ meaning upstream, so alternation is as unbiased as a salt.
 * ``sft_graded`` — scenarios of the 25 SFT worlds, graded the same way;
 * ``sft_ungraded`` — EnvScaler-SFT-Scenario over the 140 ``_sft`` worlds,
   which ships tasks and initial states but no checks. Reward is always 0 here;
-  a corpus job over this range must declare no reward filter.
+  the range is held in reserve and no corpus job may take it yet
+  (`reliquary.eval.sets.CORPUS_SERVABLE_RANGES`).
 
 Within a range the order is round-robin over worlds (each world's k-th
 scenario before any world's k+1-th), so any contiguous slice — a corpus job's

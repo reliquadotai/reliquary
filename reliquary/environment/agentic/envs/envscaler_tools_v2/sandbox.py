@@ -117,7 +117,13 @@ class WorldProcess:
         )
         # Garbage collection kills a world nobody closed.
         self._finalizer = weakref.finalize(self, _kill, self._process)
-        hello = self._read(start_seconds)
+        try:
+            hello = self._read(start_seconds)
+        except WorldProcessError:
+            raise
+        except BaseException:
+            self.close()
+            raise
         if hello.get("protocol") != PROTOCOL:
             self.close()
             raise WorldProcessError(TERMINATED)
@@ -138,10 +144,24 @@ class WorldProcess:
         try:
             self._process.stdin.write(payload)
             self._process.stdin.flush()
+        except TimeoutError:
+            # A caller's deadline (a replay worker's SIGALRM) is the caller's,
+            # never a world failure: TimeoutError is an OSError, so it would
+            # otherwise become one below and the deadline would be swallowed.
+            self.close()
+            raise
         except (BrokenPipeError, OSError, ValueError):
             self.close()
             raise WorldProcessError(TERMINATED) from None
-        return self._read(self._request_seconds)
+        try:
+            return self._read(self._request_seconds)
+        except WorldProcessError:
+            raise
+        except BaseException:
+            # Interrupted mid-reply (a caller's deadline): the pipe may hold
+            # half a line, so this world can never be spoken to again.
+            self.close()
+            raise
 
     def _read(self, seconds: float) -> dict[str, Any]:
         process = self._process

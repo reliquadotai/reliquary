@@ -103,24 +103,23 @@ def test_the_range_guards_restate_the_boundaries() -> None:
     servable = sets.CORPUS_SERVABLE_RANGES[ENVIRONMENT]
 
     assert (reserved.start, reserved.end) == v2.RL_RANGE
-    assert [(r.start, r.end) for r in servable] == [
-        v2.SFT_GRADED_RANGE, v2.SFT_UNGRADED_RANGE,
-    ]
+    # The ungraded range is held in reserve: no corpus job takes it yet.
+    assert [(r.start, r.end) for r in servable] == [v2.SFT_GRADED_RANGE]
 
 
 @pytest.mark.parametrize(("start", "count"), [
     (0, 10),                        # the RL range
     (v2.RL_END - 5, 10),            # straddles RL and SFT
     (v2.SFT_GRADED_END - 5, 10),    # straddles graded and ungraded
+    (v2.SFT_UNGRADED_START, 10),    # the reserve
 ])
-def test_a_corpus_job_outside_one_sft_range_is_refused(start, count) -> None:
+def test_a_corpus_job_outside_the_graded_sft_range_is_refused(start, count) -> None:
     with pytest.raises(ValueError):
         sets.refuse_held_out_overlap(ENVIRONMENT, start, count)
 
 
-@pytest.mark.parametrize("bounds", [v2.SFT_GRADED_RANGE, v2.SFT_UNGRADED_RANGE])
-def test_a_corpus_job_inside_one_sft_range_is_accepted(bounds) -> None:
-    start, end = bounds
+def test_a_corpus_job_inside_the_graded_sft_range_is_accepted() -> None:
+    start, end = v2.SFT_GRADED_RANGE
     sets.refuse_held_out_overlap(ENVIRONMENT, start, end - start)
 
 

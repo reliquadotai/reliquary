@@ -29,7 +29,7 @@
     "reliquary/environment/agentic/suite.py",
     "reliquary/environment/agentic/types.py"
   ],
-  "implementation_sha256": "004548e5aa8881d9ddf6a523f234fe4df1456e9a394405dd020f2f8846e7ad3d",
+  "implementation_sha256": "92e325674ee04721263d464e075bcddf33f6382afc40801b3bcca45acc8aa8fb",
   "source": "EnvScaler (RUC-NLPIR), programmatically synthesised tool worlds",
   "external_data": true,
   "network_required": false,
