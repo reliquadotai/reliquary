@@ -653,6 +653,40 @@ _SPEC_VALUES = (
         ),
         required_data_env_var="RELIQUARY_ENVSCALER_DATA",
     ),
+    # The same worlds, rebuilt for use: rendered in ChatML like telecom, every
+    # world and check executed in a contained subprocess, a binary reward
+    # pinned in code, and an index space split by world into an RL range and
+    # two SFT ranges (boundaries in its `environment` module). Registered and,
+    # like v1, named by no profile and absent from the catalog.
+    EnvironmentSpec(
+        name="envscaler_tools_v2",
+        factory_path=(
+            "reliquary.environment.agentic.envs.envscaler_tools_v2.environment:"
+            "EnvScalerToolsV2Environment"
+        ),
+        scorer_path=(
+            "reliquary.environment.agentic.suite:"
+            "episode_score_many_not_supported"
+        ),
+        validator_authoritative_reward=True,
+        # A lane, not a boundary: containment is the world process. The lane
+        # is the one with the longer admission wall budget, which an episode
+        # that starts an interpreter per rollout needs.
+        admission_resource_class="sandbox",
+        termination_policy="eos_or_cap",
+        final_answer_policy="json",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="envscaler-tools-v2",
+        interaction_mode="episode",
+        episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
+        renderer_id="reliquary-chatml-tools-v1",
+        environment_manifest_sha256=(
+            "69cd351d850b25a58f060ea0c792ac2f"
+            "891c55cdce5fc4c01f1a2d91efc413e2"
+        ),
+        required_data_env_var="RELIQUARY_ENVSCALER_DATA",
+    ),
     EnvironmentSpec(
         # Competition maths, graded on the last boxed integer. Graded by the
         # package: the lattice is binary, so the reward it returns is checked

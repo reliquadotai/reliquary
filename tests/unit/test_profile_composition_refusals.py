@@ -108,6 +108,7 @@ def test_override_for_an_environment_not_selected_is_refused():
     # Installed, but declared by no profile: no reviewed body yet.
     "reliquary_stateful_tools_v2",
     "envscaler_tools_v1",
+    "envscaler_tools_v2",
 ])
 def test_unknown_or_uncatalogued_environment_is_refused(name):
     with pytest.raises(ValueError, match="catalog"):

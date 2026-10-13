@@ -38,6 +38,7 @@ EPISODE_ENVIRONMENTS = {
     # alone. `_rewrite_block` treats a missing profile block as absent
     # rather than as an error only for that reason.
     "envscaler_tools_v1": "envscaler-tools-v1",
+    "envscaler_tools_v2": "envscaler-tools-v2",
 }
 
 _DIGEST = re.compile(

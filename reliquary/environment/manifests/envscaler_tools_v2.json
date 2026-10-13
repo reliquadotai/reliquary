@@ -1,0 +1,85 @@
+{
+  "schema": "reliquary/environment-source/v1",
+  "environment": "envscaler_tools_v2",
+  "contract": "reliquary/episode/v1",
+  "generator": "envscaler-scenario-corpus-v2",
+  "renderer": "reliquary-chatml-tools-v1",
+  "reward": "binary-required-checks-finished-v1",
+  "reward_diagnostics": "boolean-state-checks-over-terminal-state-v1",
+  "execution": "envscaler-world/v1: one subprocess per episode, rlimits, user+net namespace where granted, audit hook",
+  "proof": "grail-v8-assistant-policy-spans",
+  "episode_schema": "reliquary/environment/schemas/episode-v1.schema.json",
+  "episode_schema_sha256": "a9bf6d2a8704440a835f4882b3c9fb37e1e19701cc3c27f4ca017e7ce40ea39a",
+  "implementation_digest_algorithm": "sha256-path-nul-file-sha256-newline-v1",
+  "implementation_files": [
+    "reliquary/environment/agentic/__init__.py",
+    "reliquary/environment/agentic/base.py",
+    "reliquary/environment/agentic/chatml.py",
+    "reliquary/environment/agentic/compat.py",
+    "reliquary/environment/agentic/envs/envscaler_tools_v2/__init__.py",
+    "reliquary/environment/agentic/envs/envscaler_tools_v2/corpus.py",
+    "reliquary/environment/agentic/envs/envscaler_tools_v2/environment.py",
+    "reliquary/environment/agentic/envs/envscaler_tools_v2/sandbox.py",
+    "reliquary/environment/agentic/envs/envscaler_tools_v2/selection.json",
+    "reliquary/environment/agentic/envs/envscaler_tools_v2/worker.py",
+    "reliquary/environment/agentic/renderer.py",
+    "reliquary/environment/agentic/renderers.py",
+    "reliquary/environment/agentic/replay.py",
+    "reliquary/environment/agentic/runner.py",
+    "reliquary/environment/agentic/suite.py",
+    "reliquary/environment/agentic/types.py"
+  ],
+  "implementation_sha256": "004548e5aa8881d9ddf6a523f234fe4df1456e9a394405dd020f2f8846e7ad3d",
+  "source": "EnvScaler (RUC-NLPIR), programmatically synthesised tool worlds",
+  "external_data": true,
+  "network_required": false,
+  "license": "MIT",
+  "corpus": {
+    "virtual_length": 7225,
+    "ranges": {
+      "rl": [
+        0,
+        1296
+      ],
+      "sft_graded": [
+        1296,
+        2546
+      ],
+      "sft_ungraded": [
+        2546,
+        7225
+      ]
+    },
+    "world_split": "the 51 RL-scenario worlds sorted by number, even rank rl (26), odd rank sft (25); the 140 _sft worlds feed sft_ungraded only",
+    "selection": "reliquary/environment/agentic/envs/envscaler_tools_v2/selection.json",
+    "selection_builder": "scripts/filter_envscaler_scenarios.py",
+    "builder": "scripts/fetch_envscaler_corpus.py",
+    "data_env_var": "RELIQUARY_ENVSCALER_DATA",
+    "files": {
+      "env_meta.json": {
+        "repo_id": "XXHStudyHard/EnvScaler-191-Env",
+        "repo_type": "dataset",
+        "revision": "3d30c6ac2446c06b79d727f196b84df90cc9cb69",
+        "filename": "191_env_metadata_processed.json",
+        "upstream_sha256": "600fa6d9613e3a104807edbff863d26ea48aeb1d5d3ef758c0e6f109f04f49bd",
+        "normalized_sha256": "f0e874c28b3592c5820afcdbae28d3c10d7687632d5e1f922a6a68a2d904f81d"
+      },
+      "rl_scen.json": {
+        "repo_id": "XXHStudyHard/EnvScaler-RL-Scenario",
+        "repo_type": "dataset",
+        "revision": "a14061538b0ffd3e84d44edf40fbe67477f83552",
+        "filename": "envscaler_rl_scenario_metadata.json",
+        "upstream_sha256": "99c05a81710da5adc81453a05f166023f2cd3235a03a9eb8b5736ba8c7c2abe8",
+        "normalized_sha256": "a953b969366d0ad0dc6e5262084fc7d46b6cefb992bd02ac5083fec537622e06"
+      },
+      "sft_scen.json": {
+        "repo_id": "XXHStudyHard/EnvScaler-SFT-Scenario",
+        "repo_type": "dataset",
+        "revision": "bf3bf8656541dfc82eae8672b9fcf76f32d4ab05",
+        "filename": "envscaler_sft_scenario_metadata.json",
+        "upstream_sha256": "5295a5c0e79c4c412f022952f6aace2f6e33f0a6d89fe453dfc5f58aa903e13f",
+        "normalized_sha256": "f3af68f6a1f50c6ff7be6fba9d605dcd9dfdf1a80b4d14d61f5a08d4bd484e0e"
+      }
+    }
+  }
+}
