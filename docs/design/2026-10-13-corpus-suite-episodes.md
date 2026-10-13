@@ -136,15 +136,37 @@ checks in order:
    the end of the last span (prompt included), the spans (and so the number
    of actions), and the termination against `stop`.
 
-A mismatch, or a replay past its deadline, is an intake refusal
-(`bad_observation`, `bad_turns` or `bad_stop`). It costs no slot and carries
-no sanction. The replay's `task_id`, `reward` and `success` go into
-`IntakeFacts`.
+   The intake also refuses an observation rendered into the trajectory that
+   contains `<|im_end|>`, `<|im_start|>` or `<|endoftext|>`
+   (`suite_episode.observation_markup`). The renderer writes observation text
+   verbatim, so a marker in it becomes the real token, which would give a turn
+   nobody generated. An environment can echo an argument, and a JSON argument
+   can spell a marker with escapes that no span check sees: telecom's
+   `set_apn_settings` does both. The export runs the same check and never
+   writes such a tool message.
 
-When the pool cannot answer, that is `ReplayUnavailable` and the route answers
-503, never a refusal. This happens when a worker died twice in a row (a broken
-pool is rebuilt and the replay retried once, logged as an error), or when
-there is no answer within 180 s, queue included.
+A mismatch is an intake refusal (`bad_observation`, `bad_turns` or
+`bad_stop`). It costs no slot and carries no sanction. The replay's
+`task_id`, `reward` and `success` go into `IntakeFacts`.
+
+`ReplayUnavailable` means the route answers 503, never a refusal. It is raised
+in three cases:
+- A replay ran past its deadline. A replay is about 30 ms of work, so 30 s
+  means the host is starved.
+- A worker died twice in a row. A broken pool is rebuilt and the replay
+  retried once, which is logged as an error.
+- There was no answer within 180 s, queue included.
+
+The deadline is a flag set by the timer itself. An environment that catches
+every exception (telecom does) cannot turn the deadline into an observation.
+
+After a deadline, or after a started replay that never answers, the pool is
+retired, its workers are killed and the pool is rebuilt. Each worker runs
+under a 2 GiB `RLIMIT_AS`. Intake checks run on their own bounded threads (8),
+never on the loop's default executor, which the ledger turns use.
+
+A turn before the last that ends on a stop id other than `<|im_end|>` is
+`bad_termination`, even when it ends exactly at the cap.
 
 ### Grading
 

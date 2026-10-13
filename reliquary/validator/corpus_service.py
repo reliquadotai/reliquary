@@ -1832,7 +1832,10 @@ def build_corpus_router(
                 raise HTTPException(status_code=500, detail="corpus_episode_intake_unconfigured")
             # Every refusal here precedes any slot or cursor consumption.
             try:
-                outcome = await asyncio.to_thread(episode_intake.check, request)
+                # On the intake's own threads when it has them (a suite one,
+                # which waits on its replay pool), else the default executor.
+                outcome = await asyncio.get_running_loop().run_in_executor(
+                    getattr(episode_intake, "executor", None), episode_intake.check, request)
             except ReplayUnavailable as exc:
                 # Ours, not the miner's: a retryable 503, never a refusal.
                 logger.error("corpus job %s: replay unavailable: %s", job_id, exc)

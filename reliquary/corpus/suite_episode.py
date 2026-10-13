@@ -254,6 +254,31 @@ def replay_stop(trace) -> str:
     return "max_turns" if trace.termination_reason == TURN_LIMIT else "agent_completed"
 
 
+# What no observation the transcript holds may contain: the renderer writes an
+# observation's text verbatim, so a stop or turn marker in it is encoded as the
+# real token, and the trajectory then holds a turn nobody generated. An
+# environment echoes what the model sent (an error quoting an argument), and a
+# JSON argument can spell a marker with escapes no span check sees.
+OBSERVATION_MARKERS = ("<|im_end|>", "<|im_start|>", "<|endoftext|>")
+
+
+def observation_markup(trace, *, turns: int) -> dict | None:
+    """``{"turn", "marker"}`` of the first observation rendered into the
+    trajectory (those after turns ``0 .. turns - 2``) holding a marker of
+    ``OBSERVATION_MARKERS``, else None."""
+    turn = -1
+    for event in trace.events:
+        if event.role == "assistant":
+            turn += 1
+            continue
+        if turn < 0 or turn >= turns - 1:
+            continue                      # the task and reset events, or after the last turn
+        for marker in OBSERVATION_MARKERS:
+            if marker in event.content:
+                return {"turn": turn, "marker": marker}
+    return None
+
+
 def compare_replay(trace, *, prompt_ids: Sequence[int], tokens: Sequence[int],
                    spans: Sequence[tuple[int, int]], stop: str) -> tuple[str, dict] | None:
     """``(reason, detail)`` when the trajectory is not the replay's, else None.
@@ -279,6 +304,9 @@ def compare_replay(trace, *, prompt_ids: Sequence[int], tokens: Sequence[int],
                                    "turn": turn, "token": at - offset}
     if got != expected:
         return "bad_turns", {"why": "the spans are not the replay's"}
+    marked = observation_markup(trace, turns=len(expected))
+    if marked is not None:
+        return "bad_observation", {"why": "an observation carries turn markup", **marked}
     if trace.reward is None:
         return "bad_observation", {"why": "the replay produced no reward"}
     if stop not in SUITE_STOPS:
@@ -432,6 +460,9 @@ def suite_messages(trace, *, task, decode, spans: Sequence[tuple[int, int]]) -> 
         if turn == len(spans) - 1:
             break
         for event in observations[turn]:
+            if any(marker in event.content for marker in OBSERVATION_MARKERS):
+                # compare_replay refuses it first; never a row that holds one.
+                raise ValueError(f"turn {turn}'s observation carries turn markup")
             if event.role == "tool":
                 messages.append({"role": "tool", "name": event.name,
                                  "content": event.content.strip()})
