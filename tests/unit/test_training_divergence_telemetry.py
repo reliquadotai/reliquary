@@ -37,3 +37,18 @@ def test_outside_clip_split_by_pi_old_probability():
     m = training._kl_telemetry_metrics(stats)
     assert m["train/ppo_outside_clip_ratio_p_lt_0_1"] == 0.5
     assert m["train/ppo_outside_clip_ratio_p_ge_0_1"] == 0.5
+
+
+def test_frozen_forwards_do_not_enter_the_logit_histogram():
+    """Reference/behavior forwards run under no_grad: only the policy counts."""
+    training._reset_logit_histogram()
+    with torch.no_grad():
+        training._observe_max_logits(torch.full((4, 3), 30.0))
+    assert training._logit_metrics()["train/max_logit_p50"] == 0.0
+
+
+def test_microbatch_budget_setting(monkeypatch):
+    monkeypatch.delenv("RELIQUARY_TRAINER_MICROBATCH_TOKENS", raising=False)
+    assert training._microbatch_budget() == training.MICROBATCH_MAX_PADDED_TOKENS
+    monkeypatch.setenv("RELIQUARY_TRAINER_MICROBATCH_TOKENS", "8192")
+    assert training._microbatch_budget() == 8192

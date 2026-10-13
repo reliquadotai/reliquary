@@ -241,7 +241,9 @@ def run_train_worker(*, shadow: bool = False) -> None:
     # fsdp2: torchrun starts N processes; rank 0 runs this worker and drives
     # the others, which only load, train and gather on its command.
     dist_ctx = channel = None
-    if trainer_backend() == "fsdp2":
+    backend = trainer_backend()
+    _check_trainer_launch(backend, os.environ)
+    if backend == "fsdp2":
         from reliquary.constants import KL_BETA
 
         if float(KL_BETA) != 0.0:
@@ -565,6 +567,16 @@ def run_train_worker(*, shadow: bool = False) -> None:
         # Followers block on the next command; release them on any exit.
         if channel is not None:
             channel.send("STOP")
+
+
+def _check_trainer_launch(backend: str, env: Mapping[str, str]) -> None:
+    """Several processes only make sense as fsdp2 ranks: under the single
+    backend each would be a full trainer on cuda:0 racing for the lock."""
+    world_size = int(str(env.get("WORLD_SIZE", "1")).strip() or "1")
+    if world_size > 1 and backend != "fsdp2":
+        raise SystemExit(
+            f"WORLD_SIZE={world_size} needs RELIQUARY_TRAINER_BACKEND=fsdp2"
+        )
 
 
 def _run_train_follower(ctx, channel) -> None:

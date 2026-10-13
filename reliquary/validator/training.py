@@ -15,6 +15,7 @@ from __future__ import annotations
 import gc
 import logging
 import math
+import os
 import threading
 import warnings
 from typing import Any, Optional
@@ -147,6 +148,18 @@ _DIST = None
 KL_STAT_MAX_KEYS = frozenset({
     "max", "log_ratio_abs_max", "ppo_log_ratio_abs_max", "pi_old_claim_abs_error_max",
 })
+
+
+def _microbatch_budget() -> int:
+    """Padded tokens per micro-batch; RELIQUARY_TRAINER_MICROBATCH_TOKENS
+    lowers it without a code change (fsdp2 has no OOM halving retry)."""
+    raw = os.environ.get("RELIQUARY_TRAINER_MICROBATCH_TOKENS", "").strip()
+    if not raw:
+        return MICROBATCH_MAX_PADDED_TOKENS
+    value = int(raw, 10)
+    if value < 1:
+        raise ValueError("RELIQUARY_TRAINER_MICROBATCH_TOKENS must be positive")
+    return value
 
 
 def configure_distributed(ctx) -> None:
@@ -1091,12 +1104,20 @@ def _reset_logit_histogram() -> None:
 
 def _observe_max_logits(logits: torch.Tensor) -> None:
     global _logit_hist
-    if _logit_hist is None:
-        _reset_logit_histogram()
+    # The policy forward runs with grad; reference/behavior forwards do not
+    # and stay out. The histogram lives on the logits' device: no host sync
+    # per chunk, read once at the end of the step.
+    if not torch.is_grad_enabled():
+        return
     with torch.no_grad():
         maxima = logits.detach().float().amax(dim=-1)
+        if _logit_hist is None or _logit_hist.device != maxima.device:
+            _logit_hist = (
+                torch.zeros(_LOGIT_HIST_BINS, dtype=torch.float64)
+                if _logit_hist is None else _logit_hist
+            ).to(maxima.device)
         index = (maxima / _LOGIT_HIST_WIDTH).floor().clamp_(0, _LOGIT_HIST_BINS - 1).long()
-        _logit_hist += torch.bincount(index.cpu(), minlength=_LOGIT_HIST_BINS).double()
+        _logit_hist += torch.bincount(index, minlength=_LOGIT_HIST_BINS).double()
 
 
 def _histogram_quantile(hist: torch.Tensor, q: float) -> float:
@@ -1104,7 +1125,9 @@ def _histogram_quantile(hist: torch.Tensor, q: float) -> float:
     if total <= 0:
         return 0.0
     cumulative = torch.cumsum(hist, 0)
-    index = int(torch.searchsorted(cumulative, torch.tensor(q * total, dtype=cumulative.dtype)))
+    index = int(torch.searchsorted(
+        cumulative, torch.tensor(q * total, dtype=cumulative.dtype, device=cumulative.device),
+    ))
     return (index + 1) * _LOGIT_HIST_WIDTH
 
 
@@ -2140,7 +2163,7 @@ def train_step(
     try:
         total_ppo, total_kl, n_processed = _accumulate_grouped_grads(
             model, ref_model, plan, device,
-            budget=MICROBATCH_MAX_PADDED_TOKENS, atomic=False,
+            budget=_microbatch_budget(), atomic=False,
             kl_stats=kl_stats,
             behavior_model=behavior_model,
         )
@@ -2154,7 +2177,7 @@ def train_step(
         kl_stats = _new_kl_stats()
         total_ppo, total_kl, n_processed = _accumulate_grouped_grads(
             model, ref_model, plan, device,
-            budget=max(1, MICROBATCH_MAX_PADDED_TOKENS // 2), atomic=True,
+            budget=max(1, _microbatch_budget() // 2), atomic=True,
             kl_stats=kl_stats,
             behavior_model=behavior_model,
         )

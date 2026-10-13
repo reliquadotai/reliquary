@@ -1,3 +1,4 @@
+import pytest
 import pickle
 import torch
 
@@ -65,3 +66,34 @@ def test_decoded_batches_pickle():
     copy_ = pickle.loads(pickle.dumps(batches))
     tokens = lambda b: [[r.commit["tokens"] for g in groups for r in g.rollouts] for groups in b.values()]
     assert tokens(copy_) == tokens(batches)
+
+
+def test_a_failed_gather_is_fatal_not_retried(tmp_path, monkeypatch):
+    """Rank 0 failing mid-gather must stop the trainer: a retried GATHER would
+    pair its collectives with the followers' unfinished ones."""
+    from reliquary.trainer import distributed
+    from reliquary.trainer.train_runner import TrainerStateUnsafe
+
+    sent = []
+
+    class _Channel:
+        def send(self, command, payload=None):
+            sent.append(command)
+
+    def _boom(model, ctx):
+        raise RuntimeError("host out of memory")
+
+    monkeypatch.setattr(distributed, "gather_full_state_dict", _boom)
+    save = distributed.sharded_save_fn(lambda: object(), _Channel(), object())
+    with pytest.raises(TrainerStateUnsafe):
+        save(None, None, tmp_path)
+    assert sent == ["GATHER"]
+
+
+def test_launch_refuses_several_processes_without_fsdp2():
+    from reliquary.trainer.cli import _check_trainer_launch
+
+    _check_trainer_launch("single", {"WORLD_SIZE": "1"})
+    _check_trainer_launch("fsdp2", {"WORLD_SIZE": "4"})
+    with pytest.raises(SystemExit):
+        _check_trainer_launch("single", {"WORLD_SIZE": "4"})

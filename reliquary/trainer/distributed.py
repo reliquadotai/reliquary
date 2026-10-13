@@ -260,7 +260,18 @@ def sharded_save_fn(model_ref, channel: CommandChannel, ctx: DistContext):
     def save(_model, tokenizer, path) -> None:
         model = model_ref()
         channel.send("GATHER")
-        state = gather_full_state_dict(model, ctx)
+        try:
+            state = gather_full_state_dict(model, ctx)
+        except Exception as exc:
+            # The followers may still sit in a later collective of this
+            # gather: a retried GATHER would pair mismatched parameters
+            # (same-shaped layers gather "successfully"). Stop instead.
+            from reliquary.trainer.train_runner import TrainerStateUnsafe
+
+            raise TrainerStateUnsafe(
+                "publish gather failed on rank 0; ranks are out of step, "
+                "restart from the last published checkpoint"
+            ) from exc
         save_state_dict_hf(model, state, tokenizer, path)
 
     return save
