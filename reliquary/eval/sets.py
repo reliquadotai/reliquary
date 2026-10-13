@@ -82,11 +82,17 @@ TELECOM_SOLO_V2_RL = (1220, 493)
 # declares. reliquary_competitive_code_v1 shares train by problem identity
 # (the package's `layout.use_of`), SFT first then RL, as its environment.toml
 # `[data]` declares: SFT [0, 4181), RL [4181, 6899).
+#
+# envscaler_tools_v2 splits by world: its RL worlds' scenarios are [0, 1296),
+# restated from `envscaler_tools_v2.environment.RL_RANGE` (a test holds the
+# two equal).
 RL_ONLY_RANGES: tuple[UsedRange, ...] = (
     UsedRange("rl", "reliquary_competitive_code_v1", "train", 4181, 2718,
               "competitive-code RL share"),
     UsedRange("rl", "reliquary_telecom_solo_v2", "train", *TELECOM_SOLO_V2_RL,
               "telecom v2 RL share"),
+    UsedRange("rl", "envscaler_tools_v2", "train", 0, 1296,
+              "envscaler RL worlds"),
 )
 
 # Sources a corpus job may take only part of: its range must lie inside ONE of
@@ -120,6 +126,15 @@ CORPUS_SERVABLE_RANGES: dict[str, tuple[UsedRange, ...]] = {
             ("safety/direct", 94_476, 101_778),
             ("safety/thinking", 101_778, 107_165),
         )
+    ),
+    # `SFT_CORPUS_RANGE`, restated from `envscaler_tools_v2.environment`: the
+    # graded scenarios of the 12 SFT worlds kept for the corpus. The whole
+    # graded SFT range [1296, 2546) (25 worlds, 13 of which a 27B policy
+    # almost never wins) and the ungraded range [2546, 7225)
+    # (EnvScaler-SFT-Scenario, no checks) are held in reserve.
+    "envscaler_tools_v2": (
+        UsedRange("corpus", "envscaler_tools_v2", "train", 7225, 600,
+                  "SFT worlds kept for the corpus, graded"),
     ),
 }
 
@@ -206,6 +221,10 @@ SOURCE_LINEAGE: dict[str, tuple[str, str]] = {
     "reliquary_general_v1": (
         "ReliquaryForge/general-prompts-curated@02b3ef7a",
         "reliquary_general_v1"),
+    # One upstream corpus, two index spaces: v1 by upstream position, v2 by
+    # its own split-by-world layout.
+    "envscaler_tools_v1": ("XXHStudyHard/EnvScaler", "envscaler_tools_v1"),
+    "envscaler_tools_v2": ("XXHStudyHard/EnvScaler", "envscaler_tools_v2"),
 }
 
 

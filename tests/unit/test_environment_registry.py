@@ -33,6 +33,8 @@ def test_catalog_is_immutable_and_contains_legacy_environments():
         # Registered so a measurement can address it by name; no profile
         # declares it, so no window can draw it.
         "envscaler_tools_v1",
+        # Its contained, ChatML, split-by-world successor; inert the same way.
+        "envscaler_tools_v2",
         # Packaged environments from reliquary-environments, bound by the
         # artifact digest committed in their source. Inert until a profile
         # names them: no live profile does.
