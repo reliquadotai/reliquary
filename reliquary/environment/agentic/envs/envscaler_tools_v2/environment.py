@@ -50,6 +50,7 @@ from reliquary.environment.agentic.envs.envscaler_tools_v2.corpus import (
     GRADED_RANGES,
     Scenario,
     default_corpus,
+    world_source,
 )
 from reliquary.environment.agentic.envs.envscaler_tools_v2.sandbox import (
     WorldProcess,
@@ -206,7 +207,7 @@ class EnvScalerToolsV2Environment:
             state.process = WorldProcess()
             reply = state.process.request({
                 "op": "init",
-                "source": str(world["env_class_code"]),
+                "source": world_source(scenario.env_id, str(world["env_class_code"])),
                 "class_name": str(world["env_class_name"]),
                 "init_config": dict(scenario.init_config),
             })

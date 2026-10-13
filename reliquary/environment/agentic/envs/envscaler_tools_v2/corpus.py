@@ -85,6 +85,53 @@ _VENDOR = re.compile(r"open\s*ai|chat\s*gpt|\bgpt\b|\bgpt-?\d", re.IGNORECASE)
 _WORLD_NUMBER = re.compile(r"^env_(\d+)_rl$")
 
 
+# Upstream world code that cannot run as written, mended in place. Each of
+# these binds `datetime` twice at module level (`import datetime` and `from
+# datetime import datetime`), so the last binding wins and one tool then
+# reaches the wrong object: upstream, that tool raised AttributeError (or, in
+# env_147, its own except turned it into a constant error), and a scenario
+# that needs it could never be won — env_178's `reserve_bed` is what 48 of
+# its 50 graded SFT scenarios ask for. Mending the line, rather than
+# dropping the world, keeps every index naming the scenario it names. Each
+# replacement must match exactly once in the pinned source, or the corpus is
+# refused. Graded worlds only: the ungraded range is not served yet; seven of
+# its worlds carry the same bug (env_63/84/86/94/103/127/140_sft), to mend
+# the same way before it is.
+WORLD_SOURCE_FIXES: Mapping[str, tuple[tuple[str, str], ...]] = MappingProxyType({
+    # sft_graded. `datetime` is the class: `datetime.datetime` does not exist.
+    "env_178_rl": ((
+        "now_iso = datetime.datetime.utcnow().isoformat()",
+        "now_iso = datetime.utcnow().isoformat()",
+    ),),
+    # rl. `datetime` is the module: it has no `utcnow`, `strptime`, `today`.
+    "env_169_rl": ((
+        'dispute["resolution_date"] = datetime.utcnow().isoformat()',
+        'dispute["resolution_date"] = datetime.datetime.utcnow().isoformat()',
+    ),),
+    "env_147_rl": (
+        (
+            'due_date = datetime.strptime(due_date_str, "%Y-%m-%d").date()',
+            'due_date = datetime.datetime.strptime(due_date_str, "%Y-%m-%d").date()',
+        ),
+        (
+            "today = datetime.today().date()",
+            "today = datetime.datetime.today().date()",
+        ),
+    ),
+})
+
+
+def world_source(world_id: str, source: str) -> str:
+    """A world's code as it runs: upstream's, with its pinned fixes applied."""
+    for old, new in WORLD_SOURCE_FIXES.get(world_id, ()):
+        if source.count(old) != 1:
+            raise RuntimeError(
+                f"{world_id}: a source fix does not match the pinned code exactly once"
+            )
+        source = source.replace(old, new)
+    return source
+
+
 def mentions_vendor(text: str) -> bool:
     return bool(_VENDOR.search(text or ""))
 
@@ -302,4 +349,6 @@ __all__ = [
     "scenario_mentions_vendor",
     "selected_positions",
     "split_worlds",
+    "world_source",
+    "WORLD_SOURCE_FIXES",
 ]

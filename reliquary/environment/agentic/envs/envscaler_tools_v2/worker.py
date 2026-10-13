@@ -75,6 +75,39 @@ import time as _real_time
 import types
 import uuid as _real_uuid
 
+# Every standard-library module the pinned corpus's code imports — world
+# sources and check functions, at module level or inside a method (an AST scan
+# of all 191 worlds and every check) — plus `_strptime`, which `strptime`
+# imports on its first call (381 call sites), loaded here, before the audit
+# hook. The hook refuses directory listing, and the import system lists a
+# package's directory the first time it imports from it: a module nothing had
+# loaded before the hook could be unimportable, and which ones are already
+# loaded at startup depends on the Python version (on 3.12 `typing` needs
+# `collections.abc`, which nothing above loaded, so every world failed to
+# start; on 3.13 they started). Loaded up front, a world imports the same
+# modules from `sys.modules` on every miner and validator whatever their
+# Python. `dateutil` (six check functions) is not standard: under `-S` it is
+# missing everywhere, so those checks are None everywhere.
+import _strptime  # noqa: E402,F401
+import ast  # noqa: E402,F401
+import bisect  # noqa: E402,F401
+import calendar  # noqa: E402,F401
+import collections  # noqa: E402,F401
+import collections.abc  # noqa: E402,F401
+import csv  # noqa: E402,F401
+import io  # noqa: E402,F401
+import itertools  # noqa: E402,F401
+import re  # noqa: E402,F401
+import typing  # noqa: E402,F401
+import urllib.parse  # noqa: E402,F401
+
+# The list above, for the test that holds it equal to the corpus's imports.
+PRELOADED_MODULES = (
+    "_strptime", "ast", "bisect", "calendar", "collections", "collections.abc",
+    "copy", "csv", "datetime", "hashlib", "io", "itertools", "math", "random",
+    "re", "time", "typing", "urllib.parse", "uuid",
+)
+
 PROTOCOL = "envscaler-world/v1"
 
 # Bounds. Generous next to what a world needs — measured, a whole episode of
