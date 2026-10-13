@@ -70,6 +70,14 @@ CORPUS_RANGES: tuple[UsedRange, ...] = (
               "logic-qwen38-27b-v1"),
 )
 
+# reliquary_telecom_solo_v2 0.2.0a1 (reliquary-environments c72f918) lays
+# train out SFT first then RL, as its environment.toml `[data]` declares
+# (train_sft_start/count, train_rl_start/count; the package's
+# `layout.use_range`), as (start, count). Its 134 tau2-bench benchmark tickets
+# are a split of their own, `benchmark`, never train.
+TELECOM_SOLO_V2_SFT = (0, 1220)
+TELECOM_SOLO_V2_RL = (1220, 493)
+
 # Rows a source keeps for RL alone: no corpus job may take them, whatever it
 # declares. reliquary_competitive_code_v1 shares train by problem identity
 # (the package's `layout.use_of`), SFT first then RL, as its environment.toml
@@ -77,6 +85,8 @@ CORPUS_RANGES: tuple[UsedRange, ...] = (
 RL_ONLY_RANGES: tuple[UsedRange, ...] = (
     UsedRange("rl", "reliquary_competitive_code_v1", "train", 4181, 2718,
               "competitive-code RL share"),
+    UsedRange("rl", "reliquary_telecom_solo_v2", "train", *TELECOM_SOLO_V2_RL,
+              "telecom v2 RL share"),
 )
 
 # Sources a corpus job may take only part of: its range must lie inside ONE of
@@ -87,7 +97,16 @@ RL_ONLY_RANGES: tuple[UsedRange, ...] = (
 # task-system rows, clarification and identity wait for stage B, which renders
 # messages and tools. Counts from the package's `segments()` at
 # ReliquaryForge/general-prompts-curated@02b3ef7a.
+#
+# An empty tuple serves no corpus job: reliquary_telecom_solo_v1's train split
+# still holds the benchmark tickets, so telecom is distilled from v2's SFT
+# share only.
 CORPUS_SERVABLE_RANGES: dict[str, tuple[UsedRange, ...]] = {
+    "reliquary_telecom_solo_v1": (),
+    "reliquary_telecom_solo_v2": (
+        UsedRange("corpus", "reliquary_telecom_solo_v2", "train", *TELECOM_SOLO_V2_SFT,
+                  "telecom v2 SFT share"),
+    ),
     "reliquary_general_v1": tuple(
         UsedRange("corpus", "reliquary_general_v1", "train", start, stop - start,
                   f"{segment} single-turn (stage A)")
@@ -225,8 +244,10 @@ def refuse_held_out_overlap(source: str, prompt_start: int, prompt_count: int) -
     if servable is not None and not any(
         allowed.start <= job.start and job.end <= allowed.end for allowed in servable
     ):
+        if not servable:
+            raise ValueError(f"{source!r} serves no corpus job (CORPUS_SERVABLE_RANGES)")
         raise ValueError(
-            f"{source!r} serves corpus jobs only inside its stage A ranges, one "
+            f"{source!r} serves corpus jobs only inside its corpus ranges, one "
             f"segment per job ({', '.join(f'[{r.start}, {r.end}) {r.what}' for r in servable)}); "
             f"this job's [{job.start}, {job.end}) is not inside one"
         )

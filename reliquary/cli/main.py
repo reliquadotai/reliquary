@@ -1101,7 +1101,7 @@ def build_job_manifest(
 def _corpus_base_profile(
     *, task_id, from_profile, model, model_revision, model_architecture,
     prompt_encoding, renderer_id, prompt_source, external_eval=False,
-    agentic=False,
+    agentic=False, suite_episode=None,
 ):
     """The profile a corpus job's contract is built from: the named template, or
     one composed from the model, the ``corpus-v1`` run policy and the catalog."""
@@ -1121,6 +1121,16 @@ def _corpus_base_profile(
         prompt_encoding = (
             "chat_template" if renderer_id in CHAT_TEMPLATE_RENDERERS else "raw"
         )
+    from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
+
+    catalog = ENVIRONMENT_CATALOG
+    if suite_episode is not None and prompt_source not in catalog:
+        # A suite environment no RL profile declares yet (so no catalog
+        # entry): its body is stated from the registry spec and the job's own
+        # episode bounds, and checked against the spec like any catalog body.
+        from reliquary.protocol.agentic_source import suite_episode_body
+
+        catalog = {**catalog, prompt_source: suite_episode_body(prompt_source, suite_episode)}
     # No environment overrides: two jobs on one source must carry one body to merge.
     return compose_profile(
         profile_id=normalise_task_id(task_id),
@@ -1129,6 +1139,7 @@ def _corpus_base_profile(
         environments=[prompt_source],
         external_eval=external_eval,
         agentic=agentic,
+        catalog=catalog,
     )
 
 
@@ -1155,6 +1166,8 @@ def prepare_corpus_job(
         model_revision=model_revision, model_architecture=model_architecture,
         prompt_encoding=prompt_encoding, renderer_id=renderer_id,
         prompt_source=environment, external_eval=is_eval_source(prompt_source), agentic=episode is not None,
+        suite_episode=(episode if isinstance(episode, dict) and episode.get("harness") == "suite"
+                       else None),
     )
     if max_new_tokens is None:
         # The template or catalog budgets each environment; the length stays
@@ -1694,14 +1707,30 @@ def jobs_export(
                     "change; pass --allow-incomplete to export what is final so far")
             quarantined = await _quarantined_grade_executors()
 
-            renderer = await asyncio.to_thread(agentic_swe.load_turn_renderer,
-                                               await asyncio.to_thread(_episode_tokenizer_dir, job))
-            source = await asyncio.to_thread(agentic_swe.load_swe_source,
-                                             job.episode.env.num_images)
+            codec = None
+            if job.episode.is_suite:
+                # Replayed here, with the job's checkpoint tokenizer and the
+                # environment this host has installed (refused if not the pin).
+                from reliquary.corpus.suite_episode import TokenizerCodec, suite_source
+                from reliquary.shared.modeling import load_tokenizer
+
+                renderer = None
+                try:
+                    source = await asyncio.to_thread(suite_source, job.episode)
+                except ValueError as exc:
+                    raise typer.BadParameter(str(exc)) from exc
+                codec = TokenizerCodec(await asyncio.to_thread(
+                    load_tokenizer, await asyncio.to_thread(_episode_tokenizer_dir, job)))
+            else:
+                renderer = await asyncio.to_thread(
+                    agentic_swe.load_turn_renderer,
+                    await asyncio.to_thread(_episode_tokenizer_dir, job))
+                source = await asyncio.to_thread(agentic_swe.load_swe_source,
+                                                 job.episode.env.num_images)
             counts: dict = {}
             rows = episode_rows(job=job, records=BucketRecordStore(), renderer=renderer,
                                 source=source, counts=counts, sft_only=sft,
-                                quarantined=quarantined)
+                                quarantined=quarantined, codec=codec)
         else:
             grade = _job_grader(job) if apply_filter else None
             counts = {}
@@ -1722,7 +1751,8 @@ def jobs_export(
                 async for row in rows:
                     if episode:
                         row = {**row, "messages": json.loads(row["messages"]),
-                               "turns": json.loads(row["turns"])}
+                               "turns": json.loads(row["turns"]),
+                               **({"tools": json.loads(row["tools"])} if "tools" in row else {})}
                     elif only_accepted and not row.get("accepted", True):
                         continue
                     handle.write(json.dumps(row, ensure_ascii=False) + "\n")

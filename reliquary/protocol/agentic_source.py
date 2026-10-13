@@ -39,5 +39,36 @@ AGENTIC_SWE_BODY = EnvironmentProfile(
 AGENTIC_BODIES: Mapping[str, EnvironmentProfile] = MappingProxyType(
     {AGENTIC_SWE_ENVIRONMENT: AGENTIC_SWE_BODY})
 
-__all__ = ["AGENTIC_BODIES", "AGENTIC_SWE_BODY", "AGENTIC_SWE_CONTRACT_ID",
+__all__ = ["AGENTIC_BODIES", "AGENTIC_SWE_BODY", "AGENTIC_SWE_CONTRACT_ID", "suite_episode_body",
            "AGENTIC_SWE_ENVIRONMENT", "AGENTIC_SWE_MANIFEST", "AGENTIC_SWE_MANIFEST_SHA256"]
+
+
+def suite_episode_body(name: str, episode) -> EnvironmentProfile:
+    """The contract body of a suite episode environment no profile declares
+    (design 2026-10-13): what the registry spec pins (contract, manifest,
+    renderer) and the job's own episode bounds. ``episode`` is the manifest's
+    raw ``episode`` object; one that does not parse is refused here as it
+    would be by ``parse_job``."""
+    from reliquary.corpus.job import _parse_episode
+    from reliquary.environment.registry import ENVIRONMENT_SPECS
+    from reliquary.protocol.profiles import EpisodeProfile
+
+    parsed = _parse_episode(episode)
+    spec = ENVIRONMENT_SPECS.get(name)
+    if spec is None or spec.interaction_mode != "episode":
+        raise ValueError(f"{name!r} is not an episode environment of this binary's registry")
+    return EnvironmentProfile(
+        max_new_tokens=parsed.max_tokens_per_turn,
+        bft=None,
+        answer_format="episode_json_action_v1",
+        environment_contract_id=spec.contract_version,
+        environment_manifest_sha256=spec.environment_manifest_sha256,
+        episode=EpisodeProfile(
+            schema="reliquary/episode/v1",
+            renderer_id=parsed.renderer,
+            max_turns=parsed.max_turns,
+            max_action_tokens=parsed.max_tokens_per_turn,
+            max_episode_tokens=parsed.max_total_tokens,
+            max_observation_bytes=65536,
+        ),
+    )

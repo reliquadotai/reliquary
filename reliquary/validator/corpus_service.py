@@ -430,10 +430,47 @@ class EpisodePromptRenderer:
             "an episode job's prompt is checked by its episode intake, not rendered as text")
 
 
+class SuiteSourceSpec:
+    """What `resolve_prompt_source` returns for a suite episode job: the
+    registry environment it names, buildable into its tasks
+    (`reliquary.corpus.suite_episode.SuiteSource`)."""
+
+    interaction_mode = "agentic"
+
+    def __init__(self, episode: Any) -> None:
+        self.episode = episode
+
+    def create(self):
+        from reliquary.corpus.suite_episode import suite_source
+
+        try:
+            return suite_source(self.episode)
+        except ValueError as exc:
+            raise CorpusPromptSourceError(str(exc)) from exc
+
+
+def _resolve_suite(prompt_source: str, renderer_id: str | None, episode: Any) -> SuiteSourceSpec:
+    from reliquary.corpus.suite_episode import suite_spec_refusal
+
+    if prompt_source != episode.env.name:
+        raise CorpusPromptSourceError(
+            f"a suite episode job draws its prompts from {episode.env.name!r}, "
+            f"not {prompt_source!r}")
+    if renderer_id is not None and renderer_id != episode.renderer:
+        raise CorpusPromptSourceError(
+            f"the job's renderer_id {renderer_id!r} is not its episode.renderer {episode.renderer!r}")
+    refusal = suite_spec_refusal(episode)
+    if refusal:
+        raise CorpusPromptSourceError(refusal)
+    return SuiteSourceSpec(episode)
+
+
 def _resolve_agentic(prompt_source: str, renderer_id: str | None, episode: Any) -> AgenticSourceSpec:
     from reliquary.environment import agentic_swe
     from reliquary.protocol.agentic_source import AGENTIC_SWE_ENVIRONMENT
 
+    if episode is not None and getattr(episode, "is_suite", False):
+        return _resolve_suite(prompt_source, renderer_id, episode)
     if episode is None:
         raise CorpusPromptSourceError(
             f"prompt source {prompt_source!r} serves agentic episodes: a job reading it "

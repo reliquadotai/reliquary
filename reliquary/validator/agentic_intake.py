@@ -32,6 +32,10 @@ class IntakeFacts:
     token_count: int
     digest: str
     last_token_id: int
+    # A suite episode only: what the intake's replay concluded.
+    task_id: str | None = None
+    reward: float | None = None
+    success: bool | None = None
 
 
 @dataclass(frozen=True)
