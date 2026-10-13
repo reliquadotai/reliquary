@@ -18,6 +18,7 @@ import multiprocessing
 import os
 import signal
 import threading
+import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from concurrent.futures.process import BrokenProcessPool
@@ -75,12 +76,32 @@ _WORKER_TOKENIZER: Any | None = None
 _DEADLINE_HIT = False
 
 
+PARENT_WATCH_SECONDS = 1.0
+
+
+def _exit_with_parent(parent: int, every: float = PARENT_WATCH_SECONDS) -> threading.Thread:
+    """A worker leaves when the validator that spawned it is gone, however it
+    went. ``close`` kills the workers on a clean shutdown; this covers the
+    rest (a SIGKILL, a crash before cleanup): an idle worker blocks on its
+    call queue forever and would otherwise outlive the validator."""
+    def watch() -> None:
+        while True:
+            time.sleep(every)
+            if os.getppid() != parent:
+                os._exit(0)
+
+    thread = threading.Thread(target=watch, name="suite-replay-parent-watch", daemon=True)
+    thread.start()
+    return thread
+
+
 def initialize_suite_replay_worker(tokenizer_json: str,
                                    memory_bytes: int = SUITE_REPLAY_WORKER_MEMORY_BYTES) -> None:
     """CPU-only, below the control plane and memory-bounded, as
     ``initialize_admission_worker`` (not imported: that module loads torch,
     which a replay never needs)."""
     global _WORKER_TOKENIZER
+    _exit_with_parent(os.getppid())
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ["NVIDIA_VISIBLE_DEVICES"] = "void"
     try:
@@ -203,6 +224,18 @@ class PoolSuiteReplayer:
                     initializer=initialize_suite_replay_worker, initargs=(self._tokenizer_json,))
             return self._pool
 
+    @staticmethod
+    def _kill(pool: ProcessPoolExecutor) -> None:
+        """Kill ``pool``'s workers and shut it down without waiting: a busy
+        or wedged worker would otherwise run on, past the pool and past the
+        validator."""
+        for process in list((getattr(pool, "_processes", None) or {}).values()):
+            try:
+                process.kill()
+            except (OSError, AttributeError):
+                pass
+        pool.shutdown(wait=False, cancel_futures=True)
+
     def _drop(self, pool: ProcessPoolExecutor, why: str) -> None:
         """Retire ``pool`` (once, whoever asks first) and kill its workers: a
         wedged one never frees its slot otherwise. The next call builds anew."""
@@ -213,12 +246,7 @@ class PoolSuiteReplayer:
             self.rebuilds += 1
         logger.error("SUITE REPLAY POOL DROPPED (%s); its workers are killed and the pool "
                      "rebuilt (rebuild %d)", why, self.rebuilds)
-        for process in list((getattr(pool, "_processes", None) or {}).values()):
-            try:
-                process.kill()
-            except (OSError, AttributeError):
-                pass
-        pool.shutdown(wait=False, cancel_futures=True)
+        self._kill(pool)
 
     def _settled(self, pool, outcome: SuiteReplayOutcome) -> SuiteReplayOutcome:
         if outcome.deadline:
@@ -262,10 +290,12 @@ class PoolSuiteReplayer:
         raise ReplayUnavailable("the replay pool broke twice in a row")
 
     def close(self) -> None:
+        """At validator shutdown: the workers are killed, not left to finish
+        (a restart must not leak them)."""
         with self._lock:
-            if self._pool is not None:
-                self._pool.shutdown(wait=False, cancel_futures=True)
-                self._pool = None
+            pool, self._pool = self._pool, None
+        if pool is not None:
+            self._kill(pool)
 
 
 def replay_kwargs(job, *, prompt_index: int, prompt_ids, tokens, spans, stop: str) -> dict:

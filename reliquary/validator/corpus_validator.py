@@ -1479,6 +1479,9 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
 
     server = uvicorn.Server(uvicorn.Config(app, host=http_host, port=http_port, log_level="info"))
     async def cleanup_threads() -> None:
+        replayer = suite_replayer_box.get("replayer")
+        if replayer is not None:
+            replayer.close()                    # kills the suite replay workers
         await asyncio.to_thread(judge_threads.shutdown, wait=True)
         if grade_parse_threads is not None:
             await asyncio.to_thread(grade_parse_threads.shutdown, wait=True, cancel_futures=True)
