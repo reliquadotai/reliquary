@@ -309,8 +309,14 @@ def pick_env_and_prompt(
     max_attempts: int = 1000,
     randomness: str | None = None,
     prompt_ranges: dict[str, tuple[int, int]] | None = None,
+    weights_override: dict[str, float] | None = None,
 ) -> tuple[str, int]:
     """Sample env per `mix` weights, then a prompt within that env.
+
+    ``weights_override`` (the validator's advertised pay, see
+    ``reliquary.miner.rl_pay_client``) replaces the mix weights for the envs
+    it names and zeroes the others; when it gives every env of the mix zero,
+    the mix weights stand.
 
     When ``randomness`` is given, each env's prompt is drawn only from that
     window's slice (``window_prompt_range``), matching the validator. Falls
@@ -322,6 +328,10 @@ def pick_env_and_prompt(
     weights = [w for _, w in mix]
     if not names:
         raise RuntimeError("pick_env_and_prompt: empty mix")
+    if weights_override:
+        priced = [float(weights_override.get(n, 0.0)) for n in names]
+        if any(w > 0 for w in priced):
+            weights = priced
 
     available = list(names)
     while available:
@@ -731,6 +741,12 @@ class MiningEngine:
             metagraph = await chain.get_metagraph(subtensor, chain.NETUID)
             url = discover_validator_url(metagraph)
 
+        from reliquary.miner.rl_pay_client import PayWeights, env_choice_mode
+
+        # Draw environments by the validator's advertised pay (GET /rl/pay),
+        # unless RELIQUARY_MINER_ENV_CHOICE=mix keeps the static mix.
+        pay = PayWeights(url) if env_choice_mode() == "price" else None
+
         # v2.3: randomness is fetched per-window from /state instead of
         # recomputed locally. The validator aligns window OPEN to a drand
         # boundary and binds randomness to the round publishing at that
@@ -1001,6 +1017,9 @@ class MiningEngine:
                     continue
 
                 picked = None
+                pay_weights = (
+                    None if pay is None else await asyncio.to_thread(pay.weights)
+                )
                 for cooldowns in await self._cooldown_options(state, rng):
                     try:
                         picked = pick_env_and_prompt(
@@ -1010,6 +1029,7 @@ class MiningEngine:
                             rng=rng,
                             randomness=randomness,
                             prompt_ranges=prompt_ranges or None,
+                            weights_override=pay_weights,
                         )
                         break
                     except RuntimeError:

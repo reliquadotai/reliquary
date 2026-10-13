@@ -126,11 +126,21 @@ def episode_window(state) -> EpisodeWindow | None:
 
 
 def pick_episode_task(view: EpisodeWindow, *, environments: Sequence[str], sizes: Mapping[str, int],
-                      taken: Collection[tuple[str, int]], rng: random.Random) -> tuple[str, int] | None:
+                      taken: Collection[tuple[str, int]], rng: random.Random,
+                      weights: Mapping[str, float] | None = None) -> tuple[str, int] | None:
     """A random (environment, task) of this window: an environment that accepts groups, a task of its
     announced prompt range (and of its dataset), not in its cooldown and not ``taken``; None if none."""
     names = [name for name in environments if view.accepting.get(name) and name in view.ranges]
-    rng.shuffle(names)
+    if weights and any(float(weights.get(name, 0.0)) > 0 for name in names):
+        # Weighted order without replacement (Efraimidis-Spirakis): an
+        # environment's chance of being tried first is its advertised pay.
+        def key(name: str) -> float:
+            weight = float(weights.get(name, 0.0))
+            return rng.random() ** (1.0 / weight) if weight > 0 else -1.0
+
+        names.sort(key=key, reverse=True)
+    else:
+        rng.shuffle(names)
     for name in names:
         low, high = view.ranges[name]
         high = min(high, int(sizes.get(name, 0)))
@@ -670,7 +680,8 @@ class EpisodeMiningLoop:
                  sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep, poll_s: float = STATE_POLL_S,
                  drain_s: float = DRAIN_S, preflight: Callable[[EpisodeWindow], str | None] | None = None,
                  max_live: int | None = None, seconds_per_wave: float = SECONDS_PER_WAVE,
-                 allocation: Callable[[], Awaitable[int | None]] | None = None) -> None:
+                 allocation: Callable[[], Awaitable[int | None]] | None = None,
+                 pay_weights: Callable[[], Mapping[str, float] | None] | None = None) -> None:
         if int(groups_in_flight) < 1:
             raise ValueError("groups in flight must be at least 1 (the validator's allocation sets it while mining)")
         self._environments = tuple(environments)
@@ -682,6 +693,9 @@ class EpisodeMiningLoop:
         self._allocation = allocation
         self._paused: dict[str, float] = {}   # env -> until when it gets no new group
         self._rng = rng or random.Random()
+        # The validator's advertised pay (GET /rl/pay) orders which environment
+        # gets the next group; None draws them uniformly as before.
+        self._pay_weights = pay_weights
         self._clock = clock
         self._sleep = sleep
         self._poll_s = float(poll_s)
@@ -807,7 +821,8 @@ class EpisodeMiningLoop:
         miner = None
         while len(self._inflight) < self._cap:
             taken = {(env, task) for window, env, task in self._taken if window == view.window}
-            pick = pick_episode_task(view, environments=environments, sizes=sizes, taken=taken, rng=self._rng)
+            pick = pick_episode_task(view, environments=environments, sizes=sizes, taken=taken, rng=self._rng,
+                                     weights=None if self._pay_weights is None else self._pay_weights())
             if pick is None:
                 return
             environment, task_index = pick
@@ -982,8 +997,12 @@ async def run_episode_miner(*, config: EpisodeMinerConfig, wallet, stop: asyncio
                 return str(exc)
             return None
 
+        from reliquary.miner.rl_pay_client import PayWeights, env_choice_mode
+
+        pay = PayWeights(config.validator_url) if env_choice_mode() == "price" else None
         loop_kwargs = {"preflight": preflight, "max_live": config.max_live, "drain_s": config.drain_s,
-                       "seconds_per_wave": config.seconds_per_wave, **loop_kwargs}
+                       "seconds_per_wave": config.seconds_per_wave,
+                       "pay_weights": None if pay is None else pay.weights, **loop_kwargs}
         loop = EpisodeMiningLoop(environments=config.environments, read_state=read_state, build_stack=build,
                                  sizes=prompts.size, groups_in_flight=config.groups_in_flight, **loop_kwargs)
         await loop.run(stop=stop)
