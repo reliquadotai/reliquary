@@ -173,9 +173,13 @@ class SuiteEpisodeRunner:
     def _run(self, index: int, session_id: str, loop: asyncio.AbstractEventLoop):
         from reliquary.environment.agentic.runner import EpisodeRunner
 
+        # No max_episode_tokens: the runner would count the final suffix and
+        # the observation after the last turn, which the trajectory never
+        # holds, and drop episodes the validator accepts. The engine caps each
+        # turn at what is left of max_total_tokens (and refuses a turn with no
+        # room), and the precheck's budget check bounds what is submitted.
         return EpisodeRunner(
             renderer=self._renderer, max_turns=self.max_turns,
-            max_episode_tokens=self._episode.max_total_tokens,
             max_observation_bytes=MAX_OBSERVATION_BYTES,
         ).run(self._environment, self._source.task(index),
               seed=episode_seed(self._job.job_id, index),
@@ -190,8 +194,8 @@ class SuiteEpisodeRunner:
             trace = await asyncio.to_thread(self._run, index, session_id,
                                             asyncio.get_running_loop())
         except (RuntimeError, ValueError) as exc:
-            # A budget overflow (the runner's own bound, or no room left for a
-            # turn), an engine failure or an unprovable turn: nothing to sign.
+            # No room left for a turn under max_total_tokens, an engine
+            # failure or an unprovable turn: nothing to sign.
             return EpisodeResult(session_id, "", None, False, None,
                                  error=f"{type(exc).__name__}: {exc}")
         if not trace.assistant_spans:

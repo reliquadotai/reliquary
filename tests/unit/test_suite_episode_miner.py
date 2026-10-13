@@ -257,7 +257,7 @@ def test_an_episode_over_its_token_budget_is_dropped():
     counts, bodies, _ = _mine([_call("check_status_bar"), _call("done", turn=1)], job=small)
     assert bodies == [] and counts["episode_failed"] == 1, counts
 
-    # The runner's own verdict: its token budget, not anything else.
+    # The verdict: no room left under max_total_tokens for the next turn.
     engine = GenerateEngine(ScriptedCore([_call("check_status_bar")]), max_total_tokens=total,
                             max_tokens_per_turn=4096)
     engine.start()
@@ -266,7 +266,19 @@ def test_an_episode_over_its_token_budget_is_dropped():
                                                 decode=CODEC.decode).run(index))
     finally:
         engine.stop()
-    assert not result.ok and "total token budget" in result.error
+    assert not result.ok and "leaves no room" in result.error, result
+
+
+def test_an_episode_filling_its_budget_exactly_is_submitted():
+    """The budget bounds the trajectory (prompt + tokens to the last turn),
+    not the final suffix the runner renders after it, which is never sent."""
+    _telecom_or_skip()
+    texts = [_call("check_status_bar"), _call("done", turn=1)]
+    _, (body,), runner = _mine(texts)
+    total = len(runner.initial_ids(body["prompt_index"])) + len(body["trajectory"]["tokens"])
+    counts, bodies, _ = _mine(texts, job=_job(episode={"max_total_tokens": total}))
+    assert counts["accepted"] == 1, counts
+    assert bodies[0]["trajectory"]["tokens"] == body["trajectory"]["tokens"]
 
 
 def test_a_turn_ending_on_endoftext_mid_episode_is_dropped():
