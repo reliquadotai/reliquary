@@ -127,3 +127,96 @@ def all_reduce_stats(stats: dict, ctx: DistContext, *, max_keys: frozenset[str])
 def all_reduce_tensor_sum(tensor: torch.Tensor) -> torch.Tensor:
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     return tensor
+
+
+class CommandChannel:
+    """Rank 0 broadcasts (command, payload) on the long-timeout gloo group."""
+
+    def __init__(self, ctx: DistContext) -> None:
+        self.ctx = ctx
+
+    def send(self, command: str, payload: Any = None) -> None:
+        if self.ctx.world_size == 1:
+            return
+        dist.broadcast_object_list([(command, payload)], src=0, group=self.ctx.control_group)
+
+    def receive(self) -> tuple[str, Any]:
+        message: list[Any] = [None]
+        dist.broadcast_object_list(message, src=0, group=self.ctx.control_group)
+        return message[0]
+
+
+def run_follower(channel: CommandChannel, *, load, train, gather) -> None:
+    model = None
+    while True:
+        command, payload = channel.receive()
+        if command == "LOAD":
+            model = load(payload)
+        elif command == "TRAIN":
+            train(model, payload)
+        elif command == "GATHER":
+            gather(model)
+        elif command == "STOP":
+            return
+        else:
+            raise ValueError(f"unknown trainer command {command!r}")
+
+
+def broadcasting_train_step(channel: CommandChannel, train_step_fn):
+    """Rank 0's train_step: the followers run the same call on the same batches."""
+
+    def step(model, batches, **kwargs):
+        channel.send("TRAIN", {"batches": batches, "kwargs": kwargs})
+        return train_step_fn(model, batches, **kwargs)
+
+    return step
+
+
+def save_state_dict_hf(model, state_dict: dict, tokenizer, path) -> None:
+    """Write an HF snapshot from a gathered bf16 state dict.
+
+    The live shards are fp32; the published checkpoint is bf16 like today's,
+    so config.json is written with dtype bfloat16 explicitly.
+    """
+    import copy
+    from pathlib import Path
+
+    from huggingface_hub import save_torch_state_dict
+
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    save_torch_state_dict(state_dict, path, max_shard_size="5GB")
+    config = copy.deepcopy(model.config)
+    config.dtype = torch.bfloat16
+    config.save_pretrained(path)
+    generation_config = getattr(model, "generation_config", None)
+    if generation_config is not None:
+        generation_config.save_pretrained(path)
+    if tokenizer is not None:
+        from reliquary.shared.modeling import save_tokenizer
+
+        save_tokenizer(tokenizer, path)
+
+
+def sharded_save_fn(model_ref, channel: CommandChannel, ctx: DistContext):
+    """TrainerPublisher save_fn for rank 0: gather with every rank, then save."""
+
+    def save(_model, tokenizer, path) -> None:
+        model = model_ref()
+        channel.send("GATHER")
+        state = gather_full_state_dict(model, ctx)
+        save_state_dict_hf(model, state, tokenizer, path)
+
+    return save
+
+
+def load_sharded_model(model_path: str, load_kwargs: dict, ctx: DistContext, *,
+                       attn_implementation: str):
+    from reliquary.shared.modeling import load_text_generation_model
+
+    model = load_text_generation_model(
+        model_path, torch_dtype=torch.bfloat16,
+        attn_implementation=attn_implementation, **load_kwargs,
+    ).to(ctx.device)
+    model.gradient_checkpointing_enable()
+    return shard_model(model, ctx)

@@ -228,6 +228,30 @@ def run_train_worker(*, shadow: bool = False) -> None:
         validate_checkpoint_profile,
     )
     from reliquary.validator.training import reset_training_state
+    from reliquary.trainer.distributed import (
+        CommandChannel,
+        broadcasting_train_step,
+        init_distributed,
+        load_sharded_model,
+        sharded_save_fn,
+        trainer_backend,
+    )
+    from reliquary.validator.training import configure_distributed, train_step
+
+    # fsdp2: torchrun starts N processes; rank 0 runs this worker and drives
+    # the others, which only load, train and gather on its command.
+    dist_ctx = channel = None
+    if trainer_backend() == "fsdp2":
+        from reliquary.constants import KL_BETA
+
+        if float(KL_BETA) != 0.0:
+            raise SystemExit("fsdp2 trainer requires KL_BETA == 0")
+        dist_ctx = init_distributed()
+        channel = CommandChannel(dist_ctx)
+        configure_distributed(dist_ctx)
+        if not dist_ctx.is_main:
+            _run_train_follower(dist_ctx, channel)
+            return
 
     repo_id = os.environ.get("RELIQUARY_HF_REPO_ID", "").strip()
     if not repo_id:
@@ -352,17 +376,28 @@ def run_train_worker(*, shadow: bool = False) -> None:
 
     logger.info("loading model from %s", model_path)
     started = time.monotonic()
-    model = load_text_generation_model(
-        model_path,
-        torch_dtype=torch.bfloat16,
-        attn_implementation=ATTN_IMPLEMENTATION,
-        **load_kwargs,
-    ).to("cuda:0")
-    logger.info("startup_stage=trainer_model_load elapsed_seconds=%.3f", time.monotonic() - started)
-    try:
-        model.gradient_checkpointing_enable()
-    except (AttributeError, NotImplementedError):
-        logger.warning("model does not support gradient checkpointing")
+    if dist_ctx is None:
+        model = load_text_generation_model(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            attn_implementation=ATTN_IMPLEMENTATION,
+            **load_kwargs,
+        ).to("cuda:0")
+        logger.info("startup_stage=trainer_model_load elapsed_seconds=%.3f", time.monotonic() - started)
+        try:
+            model.gradient_checkpointing_enable()
+        except (AttributeError, NotImplementedError):
+            logger.warning("model does not support gradient checkpointing")
+    else:
+        channel.send("LOAD", {"model_path": model_path, "load_kwargs": load_kwargs})
+        model = load_sharded_model(
+            model_path, load_kwargs, dist_ctx,
+            attn_implementation=ATTN_IMPLEMENTATION,
+        )
+        logger.info(
+            "startup_stage=trainer_model_load elapsed_seconds=%.3f world_size=%d",
+            time.monotonic() - started, dist_ctx.world_size,
+        )
     reset_training_state()
 
     runner = TrainRunner(
@@ -370,6 +405,10 @@ def run_train_worker(*, shadow: bool = False) -> None:
         env_targets=dict(ENVIRONMENT_MIX),
         env_order=[name for name, _ in ENVIRONMENT_MIX],
         global_step_hint=lr_schedule_step,
+        train_step_fn=(
+            train_step if channel is None
+            else broadcasting_train_step(channel, train_step)
+        ),
     )
     publisher = TrainerPublisher(
         repo_id=repo_id,
@@ -379,6 +418,10 @@ def run_train_worker(*, shadow: bool = False) -> None:
         bucket=bucket,
         checkpoint_number_floor=checkpoint_n,
         namespace=namespace,
+        save_fn=(
+            None if channel is None
+            else sharded_save_fn(lambda: runner.model, channel, dist_ctx)
+        ),
     )
 
     publish_state = {"checkpoint_n": checkpoint_n}
@@ -487,33 +530,73 @@ def run_train_worker(*, shadow: bool = False) -> None:
         worker.cursor, revision, shadow,
     )
     transient_failures = 0
-    while True:
+    try:
+        while True:
+            try:
+                control_request = control.request()
+                outcome = worker.run_once()
+                control.report(control_request, phase=outcome,
+                               **worker.snapshot(), **runner.snapshot())
+            except (TrainerLockLost, TrainerStateUnsafe, PublicationConflict):
+                control.report(control_request, phase="unsafe", **worker.snapshot())
+                logger.critical("trainer state unsafe; exiting", exc_info=True)
+                raise SystemExit(3)
+            except Exception:
+                # Transient R2/HF error mid-poll or mid-publish: the cursor
+                # never advanced, so retrying is always safe. Backoff, don't
+                # die — a process exit costs the optimizer moments.
+                transient_failures += 1
+                control.report(control_request, phase="blocked", **worker.snapshot())
+                delay = min(60.0, 5.0 * transient_failures)
+                logger.exception(
+                    "worker iteration failed (attempt %d); retrying in %.0fs",
+                    transient_failures, delay,
+                )
+                time.sleep(delay)
+                continue
+            transient_failures = 0
+            if outcome in {"waited", "closed", "drained"}:
+                time.sleep(5.0)
+            elif outcome == "frozen":
+                time.sleep(30.0)
+            elif outcome in {"tombstone", "quarantined", "published"}:
+                logger.info("%s (cursor=%d)", outcome, worker.cursor)
+    finally:
+        # Followers block on the next command; release them on any exit.
+        if channel is not None:
+            channel.send("STOP")
+
+
+def _run_train_follower(ctx, channel) -> None:
+    """A non-zero fsdp2 rank: load, train and gather on rank 0's command."""
+    from reliquary.constants import ATTN_IMPLEMENTATION
+    from reliquary.trainer.distributed import (
+        gather_full_state_dict,
+        load_sharded_model,
+        run_follower,
+    )
+    from reliquary.validator.training import (
+        TrainingStepSkipped,
+        reset_training_state,
+        train_step,
+    )
+
+    def load(payload):
+        reset_training_state()
+        return load_sharded_model(
+            payload["model_path"], payload["load_kwargs"], ctx,
+            attn_implementation=ATTN_IMPLEMENTATION,
+        )
+
+    def train(model, payload):
         try:
-            control_request = control.request()
-            outcome = worker.run_once()
-            control.report(control_request, phase=outcome,
-                           **worker.snapshot(), **runner.snapshot())
-        except (TrainerLockLost, TrainerStateUnsafe, PublicationConflict):
-            control.report(control_request, phase="unsafe", **worker.snapshot())
-            logger.critical("trainer state unsafe; exiting", exc_info=True)
-            raise SystemExit(3)
-        except Exception:
-            # Transient R2/HF error mid-poll or mid-publish: the cursor
-            # never advanced, so retrying is always safe. Backoff, don't
-            # die — a process exit costs the optimizer moments.
-            transient_failures += 1
-            control.report(control_request, phase="blocked", **worker.snapshot())
-            delay = min(60.0, 5.0 * transient_failures)
-            logger.exception(
-                "worker iteration failed (attempt %d); retrying in %.0fs",
-                transient_failures, delay,
-            )
-            time.sleep(delay)
-            continue
-        transient_failures = 0
-        if outcome in {"waited", "closed", "drained"}:
-            time.sleep(5.0)
-        elif outcome == "frozen":
-            time.sleep(30.0)
-        elif outcome in {"tombstone", "quarantined", "published"}:
-            logger.info("%s (cursor=%d)", outcome, worker.cursor)
+            train_step(model, payload["batches"], **payload["kwargs"])
+        except TrainingStepSkipped:
+            pass  # every rank took the same decision; rank 0 handles it
+
+    run_follower(
+        channel,
+        load=load,
+        train=train,
+        gather=lambda model: gather_full_state_dict(model, ctx),
+    )
