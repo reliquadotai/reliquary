@@ -823,9 +823,18 @@ _FILL_CLOSED_REQUESTED = _os.environ.get(
     "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 _FILL_CLOSED_PROFILE_ID = "qwen3-4b-base-dapo-fill-closed-v6"
-_FILL_CLOSED_PROFILE_IDS = {
+# Profiles that cannot run without fill-closed.
+_FILL_CLOSED_REQUIRED_PROFILE_IDS = {
     _FILL_CLOSED_PROFILE_ID,
     "qwen3-4b-base-dapo-reliquary-v1",
+}
+# Profiles that may run with it. The Teutonic suite also serves the corpus
+# tasks, which run timed windows, so it accepts fill-closed without requiring
+# it. Nothing in the fill-closed path reads the model: the window's shape is
+# B_BATCH, the publish interval and the environment list, all set below.
+_FILL_CLOSED_PROFILE_IDS = {
+    *_FILL_CLOSED_REQUIRED_PROFILE_IDS,
+    "teutonic-9b-reliquary-suite-v9-dev1",
 }
 if _os.environ.get("RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED", "0").strip().lower() not in {"", "0", "false", "no", "off"}:
     raise ValueError("RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED is retired; remove it")
@@ -839,11 +848,18 @@ if _FILL_CLOSED_REQUESTED and PROTOCOL_PROFILE_ID not in _FILL_CLOSED_PROFILE_ID
         "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED requires the exact "
         f"fill-closed profiles {sorted(_FILL_CLOSED_PROFILE_IDS)!r}"
     )
-if PROTOCOL_PROFILE_ID in _FILL_CLOSED_PROFILE_IDS and not FILL_CLOSED_ENABLED:
+if PROTOCOL_PROFILE_ID in _FILL_CLOSED_REQUIRED_PROFILE_IDS and not FILL_CLOSED_ENABLED:
     raise ValueError(
         f"the {PROTOCOL_PROFILE_ID!r} profile requires its explicit "
         "experimental fill-closed capability"
     )
+if FILL_CLOSED_ENABLED:
+    # A fill-closed pick takes B_BATCH groups from every environment: the
+    # assembler, the active-window record and its recovery all hold that shape
+    # and refuse any other. An environment's weight in the window is its
+    # emission share, not a smaller group count, so a profile's per-environment
+    # batch_target (sized for the timed auction window) does not apply here.
+    ENVIRONMENT_MIX = [(name, B_BATCH) for name, _ in ENVIRONMENT_MIX]
 
 # The durable key stride cannot change in an existing training run. A smaller
 # operational pick target closes earlier and pads the unused keys with tombstones.

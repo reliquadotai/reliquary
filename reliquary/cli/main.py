@@ -2899,7 +2899,12 @@ def _resolve_cli_environment_mix(value: str, *, service_contract=None) -> list[t
         profile_environments=ACTIVE_PROTOCOL_PROFILE.environments,
         default_batch_target=B_BATCH,
     )) if others else {}
-    return [(name, B_BATCH if name in bridged else resolved[name]) for name in names]
+    from reliquary.constants import FILL_CLOSED_ENABLED
+
+    # Fill-closed takes B_BATCH groups per environment per pick, whatever the
+    # profile sized for the timed window (see ENVIRONMENT_MIX in constants).
+    return [(name, B_BATCH if name in bridged or FILL_CLOSED_ENABLED else resolved[name])
+            for name in names]
 
 
 def _resolve_legacy_miner_mix(value: str) -> list[tuple[str, int]]:

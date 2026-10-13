@@ -328,7 +328,10 @@ design bounded staleness (MiMo: 4) and possibly partial rollouts.
   open sessions).
 - The validator serves its own hotkey to miners (removes `--validator-hotkey`).
 - Catalyst caplog tests silenced by bittensor (pre-existing).
-- The fill-closed profile must accept Teutonic 9B.
+- The fill-closed profile must accept Teutonic 9B: done. Fill-closed accepts the suite profile
+  without requiring it (corpus tasks run it on timed windows). Under fill-closed every environment
+  takes B_BATCH groups per pick (ruling 3), so the profile's smaller targets (8 for the maths and
+  science envs, 4 for telecom) do not apply there: an env's weight is its emission share.
 
 ## Operating multi-turn RL capacity (phase 2)
 
