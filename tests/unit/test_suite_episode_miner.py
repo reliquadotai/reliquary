@@ -83,7 +83,7 @@ def _episode(**overrides):
     episode = {"env": {"package": "reliquary-suite", "name": ENV, "version": MANIFEST_SHA,
                        "split": "train"},
                "harness": "suite", "renderer": RENDERER, "max_turns": 8,
-               "max_tokens_per_turn": 4096, "max_total_tokens": 60000}
+               "max_tokens_per_turn": 3072, "max_total_tokens": 60000}
     episode.update(overrides)
     return episode
 
@@ -95,7 +95,7 @@ def _manifest(**overrides):
            "checkpoint_sha256": "c" * 64, "prompt_source": ENV, "prompt_count": 100,
            "renderer_id": RENDERER, "eos_token_id": 248046,
            "sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_new_tokens": 2,
-                        "max_new_tokens": 4096, "n": 1},
+                        "max_new_tokens": 3072, "n": 1},
            "slots_per_prompt": 2, "filter": None, "prompt_order": "free",
            "deadline_round": None, "episode": _episode(**episode)}
     raw.update(overrides)
@@ -252,14 +252,14 @@ def test_an_episode_over_its_token_budget_is_dropped():
     index = job_walk_index(job, "5Hot", 0)
     # Room for the first turn, not for the observation after it.
     total = len(probe.initial_ids(index)) + len(CODEC.encode(_call("check_status_bar"))) + 5
-    assert total > 4096
+    assert total > 3072
     small = _job(episode={"max_total_tokens": total})
     counts, bodies, _ = _mine([_call("check_status_bar"), _call("done", turn=1)], job=small)
     assert bodies == [] and counts["episode_failed"] == 1, counts
 
     # The verdict: no room left under max_total_tokens for the next turn.
     engine = GenerateEngine(ScriptedCore([_call("check_status_bar")]), max_total_tokens=total,
-                            max_tokens_per_turn=4096)
+                            max_tokens_per_turn=3072)
     engine.start()
     try:
         result = asyncio.run(SuiteEpisodeRunner(job=small, engine=engine, encode=CODEC.encode,
@@ -434,7 +434,7 @@ def test_a_mined_telecom_episode_is_accepted_graded_and_exported(fake_r2):
         job_id="telecom-v2-e2e", task_id=None, model="Org/Model", model_revision="r" * 40,
         model_architecture="qwen3_5", checkpoint_sha256="c" * 64, from_profile=None,
         prompt_encoding=None, prompt_source=ENV, prompt_count=1, prompt_start=GOLDEN_INDEX,
-        renderer_id=RENDERER, eos_token_id=248046, slots_per_prompt=2, max_new_tokens=4096,
+        renderer_id=RENDERER, eos_token_id=248046, slots_per_prompt=2, max_new_tokens=3072,
         cap=0.05, min_incentive_share=0.5, audit_params={},
         episode=copy.deepcopy(_episode(max_turns=40)))
     job = parse_job(manifest)
