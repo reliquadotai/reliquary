@@ -95,7 +95,7 @@ def _episode(**overrides) -> dict:
                        "version": ENVIRONMENT_SPECS[ENV].environment_manifest_sha256,
                        "split": "train"},
                "harness": "suite", "renderer": CHATML_RENDERER_ID, "max_turns": 16,
-               "max_tokens_per_turn": 4096, "max_total_tokens": 60000}
+               "max_tokens_per_turn": 3072, "max_total_tokens": 60000}
     episode.update(overrides)
     return episode
 
@@ -108,7 +108,7 @@ def _declare(prompt_start: int, prompt_count: int):
         model_architecture="qwen3_5", checkpoint_sha256="c" * 64, from_profile=None,
         prompt_encoding=None, prompt_source=ENV, prompt_count=prompt_count,
         prompt_start=prompt_start, renderer_id=CHATML_RENDERER_ID, eos_token_id=248046,
-        slots_per_prompt=2, max_new_tokens=4096, cap=0.05, min_incentive_share=0.5,
+        slots_per_prompt=2, max_new_tokens=3072, cap=0.05, min_incentive_share=0.5,
         audit_params={}, episode=copy.deepcopy(_episode()))
 
 
