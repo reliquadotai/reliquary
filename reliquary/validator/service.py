@@ -200,7 +200,9 @@ _PRICE_ARCHIVE_FIELDS = (
 )
 
 
-def _window_price_signal(first_batcher, batcher_dict, target_for):
+def _window_price_signal(
+    first_batcher, batcher_dict, target_for, *, trainer_wait_seconds_by_environment=None,
+):
     """The window's price signal for the archive, or None if unmeasurable.
 
     Everything it needs already exists at seal: ``window_open_drand_round`` is
@@ -261,6 +263,7 @@ def _window_price_signal(first_batcher, batcher_dict, target_for):
         # The trainer has been working since the FIRST environment picked, so
         # the earliest pick is where the window's training span starts.
         first_pick_round=min(first_pick_rounds) if first_pick_rounds else None,
+        trainer_wait_seconds_by_environment=trainer_wait_seconds_by_environment,
     )
 
 
@@ -3930,6 +3933,7 @@ class ValidationService:
         # proven target -- the window no longer closes on a proven count,
         # it closes at the ``FILL_CLOSED_EMISSIONS_PER_WINDOW``-th pick
         # (``picks_target``), which is window-wide, not per-environment.
+        self._reset_fill_trainer_wait()
         shared_fill_state = (
             FillState(
                 budgets={
@@ -4627,6 +4631,35 @@ class ValidationService:
         cursor = self._read_trainer_step_cursor()
         return cursor is not None and int(cursor) >= required
 
+    def _reset_fill_trainer_wait(self) -> None:
+        """A new fill window starts with nobody having held the trainer back."""
+        self._fill_trainer_wait_seconds = {}
+        self._fill_trainer_wait_last_tick = None
+
+    def _accrue_trainer_wait(self, picking, *, next_pick: int, now: float) -> None:
+        """Charge this poll tick to every environment that cannot seat a batch,
+        but only while the trainer is ready for the pick: a closed pacing gate
+        means the trainer is still busy and nobody's supply is holding it back.
+        Pick 1 is paced by the opening floor, never by the trainer.
+
+        The tick is clamped to 5 s, so a stalled loop is not blamed on miners.
+        The total feeds the price: a wait over 5 % of the window raises it.
+        """
+        last = getattr(self, "_fill_trainer_wait_last_tick", None)
+        self._fill_trainer_wait_last_tick = now
+        if last is None or next_pick <= 1:
+            return
+        if not self._fill_closed_pick_gate_open(picking[0], next_pick=next_pick):
+            return
+        tick = min(max(0.0, now - last), 5.0)
+        waits = getattr(self, "_fill_trainer_wait_seconds", None)
+        if waits is None:
+            waits = self._fill_trainer_wait_seconds = {}
+        for batcher in picking:
+            if not batcher.can_pick():
+                name = str(getattr(getattr(batcher, "env", None), "name", "?"))
+                waits[name] = waits.get(name, 0.0) + tick
+
     def _drive_fill_closed_picks(self, batchers) -> bool:
         """Fire at most ONE window-wide pick event; return whether it did.
 
@@ -4673,7 +4706,9 @@ class ValidationService:
             next_pick = int(fill_state.snapshot()["picks_emitted"]) + 1
         if not all(batcher.can_pick() for batcher in picking):
             self._fill_pick_wait_reason = "candidate_shortfall"
+            self._accrue_trainer_wait(picking, next_pick=next_pick, now=time.monotonic())
             return False
+        self._fill_trainer_wait_last_tick = time.monotonic()
         if not self._fill_closed_pick_gate_open(
             picking[0], next_pick=next_pick
         ):
@@ -6967,7 +7002,11 @@ class ValidationService:
         # readiness read downstream as a SHORTAGE, which snaps the price up
         # without confirmation. See ``_window_price_signal``.
         price_signal = _window_price_signal(
-            first_batcher, batcher_dict, _price_target_for
+            first_batcher, batcher_dict, _price_target_for,
+            trainer_wait_seconds_by_environment=(
+                dict(getattr(self, "_fill_trainer_wait_seconds", None) or {})
+                if FILL_CLOSED_ENABLED else None
+            ),
         )
         price_shadow = self._advance_price_shadow(price_signal, window_status=window_status)
         archive = {
