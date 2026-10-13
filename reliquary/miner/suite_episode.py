@@ -214,7 +214,9 @@ class SuiteEpisodeRunner:
 
     def precheck(self, built: BuiltTrajectory, prompt_index: int) -> tuple[str, dict] | None:
         """What the validator's suite intake would refuse, before anything is
-        signed: its generic checks, the prompt, then its very replay."""
+        signed: its generic checks, the prompt, then its very replay and
+        ``compare_replay``, which also refuses an observation carrying turn
+        markup (an environment echoing a JSON-escaped argument)."""
         from reliquary.validator.suite_intake import replay_kwargs
 
         refusal = trajectory_checks_refusal(
