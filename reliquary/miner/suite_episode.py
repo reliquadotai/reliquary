@@ -23,6 +23,7 @@ from reliquary.corpus.suite_episode import (
     replay_stop,
     suite_source,
     suite_spec,
+    suite_span_refusal,
     suite_spec_refusal,
     turn_ids,
 )
@@ -72,10 +73,14 @@ def suite_stop_ids(encode: Callable[[str], list[int]]) -> list[int]:
 
 
 def trajectory_checks_refusal(built: BuiltTrajectory, *, episode, terminator_id: int,
-                              stop_ids, chunk_tokens: int) -> tuple[str, dict] | None:
-    """The suite intake's span, budget, termination and proof-shape checks. A
-    turn other than the last must end on ``<|im_end|>`` or at its cap: one
-    that ended on ``<|endoftext|>`` mid-episode is refused (bad_termination)."""
+                              stop_ids, chunk_tokens: int, encode: Callable[[str], list[int]],
+                              decode: Callable[[list[int]], str]) -> tuple[str, dict] | None:
+    """The suite intake's checks, in its order: spans, one turn per span
+    (``suite_span_refusal``: no stop id before a span's end, no turn markup
+    in it, so a turn that writes its own tool response and a second turn is
+    refused), then short turns, budget, termination and proof shape. A turn
+    other than the last must end on ``<|im_end|>`` or at its cap: one that
+    ended on ``<|endoftext|>`` mid-episode is refused (bad_termination)."""
     from reliquary.corpus.checks import (
         check_short_turns,
         check_turn_budget,
@@ -88,6 +93,9 @@ def trajectory_checks_refusal(built: BuiltTrajectory, *, episode, terminator_id:
     tokens = list(built.tokens)
     result = check_turn_spans(spans, len(tokens), episode.max_turns)
     if result.ok:
+        inside = suite_span_refusal(tokens, spans, encode=encode, decode=decode)
+        if inside is not None:
+            return inside[0], dict(inside[1])
         for check in (
             lambda: check_short_turns(spans),
             lambda: check_turn_budget(spans, prompt_len=len(built.prompt_ids), length=len(tokens),
@@ -211,7 +219,8 @@ class SuiteEpisodeRunner:
 
         refusal = trajectory_checks_refusal(
             built, episode=self._episode, terminator_id=self.terminator_id,
-            stop_ids=self.stop_ids, chunk_tokens=self._chunk_tokens)
+            stop_ids=self.stop_ids, chunk_tokens=self._chunk_tokens, encode=self._encode,
+            decode=self._decode)
         if refusal is not None:
             return refusal
         prompt = list(built.prompt_ids)

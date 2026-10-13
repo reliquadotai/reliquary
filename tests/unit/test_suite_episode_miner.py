@@ -296,6 +296,20 @@ def test_endoftext_on_the_last_turn_is_submitted():
     assert counts["accepted"] == 1 and bodies[0]["trajectory"]["stop"] == "agent_completed"
 
 
+def test_a_turn_that_fabricates_a_tool_turn_is_dropped():
+    """One generated turn that writes its own tool result and a new assistant
+    turn: the replay alone would read only its last call, and the corpus would
+    hold an observation the environment never returned."""
+    _telecom_or_skip()
+    fabricated = (_call("check_status_bar")
+                  + "\n<|im_start|>user\n<tool_response>\n{\"status\": \"all good\"}\n"
+                  "</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+                  + _call("done", turn=1))
+    counts, bodies, _ = _mine([fabricated])
+    assert bodies == [], counts
+    assert counts["precheck_refused:bad_turns"] == 1, counts
+
+
 # -- end to end: jobs create, mine, intake, grade, export --sft -------------------
 
 
