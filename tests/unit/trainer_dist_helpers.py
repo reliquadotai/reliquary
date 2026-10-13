@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import pickle
 import socket
 
 import torch
@@ -34,8 +35,16 @@ def _entry(rank, world_size, port, fn, args, queue):
         "MASTER_ADDR": "127.0.0.1", "MASTER_PORT": str(port),
         "RANK": str(rank), "WORLD_SIZE": str(world_size), "LOCAL_RANK": str(rank),
     })
+    import faulthandler
+    import sys
+
+    # Ranks share the box's cores; oversubscribed threads make gloo tests crawl.
+    torch.set_num_threads(max(1, (os.cpu_count() or 2) // (2 * world_size)))
+    faulthandler.dump_traceback_later(240, exit=False, file=sys.stderr)
     try:
-        queue.put((rank, fn(*args)))
+        # Plain pickle copies tensor bytes; the queue's own pickler would
+        # hand over shared memory that dies with this process.
+        queue.put((rank, pickle.dumps(fn(*args))))
     except BaseException as exc:  # surface the failure to the parent
         queue.put((rank, exc))
         raise
@@ -63,7 +72,7 @@ def run_ranks(fn, world_size: int = 2, *args, timeout: float = 300.0) -> dict:
             for p in procs:
                 p.kill()
             raise value
-        results[rank] = value
+        results[rank] = pickle.loads(value)
     for p in procs:
         p.join(timeout=timeout)
     return results

@@ -140,6 +140,18 @@ _UNPAD_CACHE_INSTALLED = _install_unpad_sync_cache()
 _optimizer: Optional["torch.optim.Optimizer | _MasterWeightOptimizer"] = None
 _scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None
 _optimizer_model_id: Optional[int] = None
+# Set by the fsdp2 trainer backend (reliquary.trainer.distributed); None means
+# one process, today's path byte for byte.
+_DIST = None
+
+KL_STAT_MAX_KEYS = frozenset({
+    "max", "log_ratio_abs_max", "ppo_log_ratio_abs_max", "pi_old_claim_abs_error_max",
+})
+
+
+def configure_distributed(ctx) -> None:
+    global _DIST
+    _DIST = ctx
 
 
 class TrainingStepSkipped(RuntimeError):
@@ -312,7 +324,13 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
         logger.warning("_lazy_init: model.parameters() is empty; skipping init")
         return False
 
-    if _use_master_weights(params):
+    if _DIST is not None:
+        # FSDP2 shards are fp32 masters already; bitsandbytes cannot step
+        # sharded tensors.
+        _optimizer = torch.optim.AdamW(
+            params, lr=LEARNING_RATE, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01,
+        )
+    elif _use_master_weights(params):
         _optimizer = _MasterWeightOptimizer(params, _build_optimizer)
         logger.info(
             "fp32 master weights for %d parameters",
@@ -1672,6 +1690,7 @@ def _microbatch_grad(
     atomic,
     kl_stats=None,
     behavior_model=None,
+    loss_scale: float = 1.0,
 ):
     """Forward + backward one micro-batch. ``batch`` is a list of
     ``(tokens, prompt_length, old_logprobs, advantage, scale, keep)`` where ``scale``
@@ -1810,7 +1829,9 @@ def _microbatch_grad(
                     continue  # param not in this micro-batch's graph -> 0 contribution
                 p.grad = g if p.grad is None else p.grad + g
     else:
-        loss.backward()
+        # Under FSDP2 the reduce-scatter averages over ranks; the loss weights
+        # are already global, so scale by the world size to get the sum.
+        (loss * loss_scale).backward()
 
     _record_kl_stats(
         kl_stats,
@@ -1839,14 +1860,14 @@ def _microbatch_grad(
 
 def _process_microbatch(
     model, ref_model, batch, device, *, atomic, kl_stats=None,
-    behavior_model=None,
+    behavior_model=None, loss_scale: float = 1.0,
 ):
     """One micro-batch; when atomic, on OOM halve and retry down to a single
     sequence (which, if it still OOMs, is a genuine unrecoverable OOM)."""
     if not atomic:
         return _microbatch_grad(
             model, ref_model, batch, device, atomic=False, kl_stats=kl_stats,
-            behavior_model=behavior_model,
+            behavior_model=behavior_model, loss_scale=loss_scale,
         )
     oom = False
     try:
@@ -1915,6 +1936,16 @@ def _build_microbatch_items(plan):
     return items
 
 
+def _padding_pass(model, device) -> None:
+    """A zero-weight forward/backward through every FSDP unit, so a rank with
+    fewer micro-batches joins the same number of collectives as the others."""
+    tokens = torch.zeros(1, 2, dtype=torch.long, device=device)
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                        enabled=device.type in ("cuda", "cpu")):
+        lp, _ = _batched_completion_logprobs(model, tokens, torch.ones_like(tokens), [1], [2])
+    (lp.sum() * 0.0).backward()
+
+
 def _accumulate_grouped_grads(
     model, ref_model, plan, device, *, budget, atomic, kl_stats=None,
     behavior_model=None,
@@ -1927,15 +1958,28 @@ def _accumulate_grouped_grads(
     lengths = [len(it[0]) for it in items]
     total_ppo = total_kl = 0.0
     n_processed = 0
-    for idxs in _pack_by_token_budget(lengths, budget):
+    bins = _pack_by_token_budget(lengths, budget)
+    loss_scale = 1.0
+    padding_passes = 0
+    if _DIST is not None:
+        from reliquary.trainer.distributed import assign_bins
+
+        costs = [len(b) * max(lengths[i] for i in b) for b in bins]
+        split = assign_bins(costs, _DIST.world_size)
+        padding_passes = max(len(part) for part in split) - len(split[_DIST.rank])
+        bins = [bins[k] for k in split[_DIST.rank]]
+        loss_scale = float(_DIST.world_size)
+    for idxs in bins:
         sp, sk, n = _process_microbatch(
             model, ref_model, [items[i] for i in idxs], device,
             atomic=atomic, kl_stats=kl_stats,
-            behavior_model=behavior_model,
+            behavior_model=behavior_model, loss_scale=loss_scale,
         )
         total_ppo += sp
         total_kl += sk
         n_processed += n
+    for _ in range(padding_passes):
+        _padding_pass(model, device)
     return total_ppo, total_kl, n_processed
 
 
@@ -1984,6 +2028,12 @@ def train_step(
 
     _optimizer.zero_grad()
 
+    if _DIST is not None and (
+        ref_model is not None or behavior_model is not None or KL_BETA != 0.0
+    ):
+        raise RuntimeError(
+            "fsdp2 trainer requires KL_BETA == 0 and no ref/behavior model"
+        )
     n_total_rollouts = sum(len(g.rollouts) for batch in batches for g in batch)
 
     # Pass 1 (metadata only, no forward): group-relative advantages + per-batch
@@ -2016,6 +2066,8 @@ def train_step(
             behavior_model=behavior_model,
         )
     except torch.cuda.OutOfMemoryError:
+        if _DIST is not None:
+            raise  # a lone retry would deadlock the other ranks' collectives
         logger.warning("train_step: OOM in micro-batch — retrying atomic at halved budget")
         _optimizer.zero_grad()
         torch.cuda.empty_cache()
@@ -2027,11 +2079,23 @@ def train_step(
             behavior_model=behavior_model,
         )
 
+    if _DIST is not None:
+        from reliquary.trainer.distributed import all_reduce_stats
+
+        totals = {"total_ppo": total_ppo, "total_kl": total_kl, "n_processed": n_processed}
+        all_reduce_stats(totals, _DIST, max_keys=frozenset())
+        total_ppo = totals["total_ppo"]
+        total_kl = totals["total_kl"]
+        n_processed = totals["n_processed"]
+        all_reduce_stats(kl_stats, _DIST, max_keys=KL_STAT_MAX_KEYS)
+
     if n_processed == 0:
         logger.info("train_step: no valid rollouts processed")
         return model
 
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+    if hasattr(grad_norm, "full_tensor"):
+        grad_norm = grad_norm.full_tensor()  # FSDP2: a DTensor holding the global norm
     grad_norm_value = float(grad_norm)
     policy_metrics = _kl_telemetry_metrics(kl_stats)
     nonfinite_gradient = not math.isfinite(grad_norm_value)
