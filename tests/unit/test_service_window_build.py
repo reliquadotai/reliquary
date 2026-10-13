@@ -286,6 +286,19 @@ async def test_two_active_envs_get_two_batchers_a_constant_group_count_and_cap_t
 
 
 @pytest.mark.asyncio
+async def test_a_service_window_offers_only_the_rl_rows_of_an_env(monkeypatch, tmp_path):
+    """Rows a corpus already distilled (or an eval set holds out) are never offered to RL."""
+    from reliquary.protocol import rl_prompt_ranges
+
+    monkeypatch.setitem(rl_prompt_ranges.RL_PROMPT_RANGES, MATH,
+                        rl_prompt_ranges.RlPromptRange(400, 900, 1000, "test"))
+    svc = _service(monkeypatch, tmp_path, contract_v2(shares={MATH: 6000, CODE: 4000}))
+    batchers = await _open(svc)
+    assert batchers[MATH].prompt_range == (400, 900)
+    assert batchers[CODE].prompt_range == (0, 1000)
+
+
+@pytest.mark.asyncio
 async def test_an_armed_price_scales_a_service_pool_below_cap_times_share(monkeypatch, tmp_path):
     from reliquary.validator.emission_price import PriceState
     svc = _service(monkeypatch, tmp_path, contract_v2(shares={MATH: 6000, CODE: 4000}))

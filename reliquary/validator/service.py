@@ -4048,8 +4048,11 @@ class ValidationService:
             )
             batcher.current_checkpoint_hash = cp_hash
             if runtime is not None:
-                # The order covers the whole ordered dataset; historical profiles retain their slice policy.
-                batcher.prompt_range = (0, len(env))
+                # The order covers the env's RL rows (the whole train split unless rows of it are
+                # reserved, see rl_prompt_ranges); historical profiles retain their slice policy.
+                from reliquary.protocol.rl_prompt_ranges import rl_prompt_range
+
+                batcher.prompt_range = rl_prompt_range(env_name, len(env))
                 batcher._experimental_prompt_range = batcher.prompt_range
                 batcher.service_runtime = runtime
                 batcher.service_environment = env_name

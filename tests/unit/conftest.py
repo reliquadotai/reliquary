@@ -51,3 +51,24 @@ def enforce_envelope(monkeypatch):
     import reliquary.validator.server as server_mod
     monkeypatch.setattr(server_mod, "ENFORCE_ENVELOPE_SIGNATURE", True)
     return None
+
+
+@pytest.fixture(autouse=True)
+def _whole_split_rl_prompt_ranges(request, monkeypatch):
+    """Offer RL every row of every environment unless a test asks otherwise.
+
+    Fake environments here carry real names (``reliquary_code_v1``) with a few
+    rows, and the real table refuses a split of another length than the one
+    its slice was cut against. Tests of the table itself request
+    ``real_rl_prompt_ranges``.
+    """
+    if "real_rl_prompt_ranges" in request.fixturenames:
+        return
+    import reliquary.protocol.rl_prompt_ranges as ranges
+    monkeypatch.setattr(ranges, "RL_PROMPT_RANGES", {})
+
+
+@pytest.fixture
+def real_rl_prompt_ranges():
+    """Keep the production RL prompt ranges for this test."""
+    return None

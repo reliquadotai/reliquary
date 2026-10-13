@@ -62,12 +62,17 @@ class HeldOut:
 # corpus job. `prompt_start`/`prompt_count` as their manifests declare them.
 CORPUS_RANGES: tuple[UsedRange, ...] = (
     UsedRange("corpus", "reliquary_code_v1", "train", 0, 100_000, "code-qwen38-27b-v1"),
+    UsedRange("corpus", "reliquary_code_v1", "train", 100_000, 100_000, "code-qwen38-27b-v2"),
     UsedRange("corpus", "openmathinstruct", "train", 10_000_000, 400_000,
               "math-omi-qwen38-27b-v1"),
     UsedRange("corpus", "reliquary_instruction_following_v1", "train", 0, 20_000,
               "if-qwen38-27b-v1"),
     UsedRange("corpus", "reliquary_logic_v2", "train", 100_000_000, 50_000,
               "logic-qwen38-27b-v1"),
+    UsedRange("corpus", "reliquary_science_v1", "train", 0, 10_871, "science-qwen38-27b-v1"),
+    UsedRange("corpus", "reliquary_science_v1", "train", 0, 10_871, "science-qwen38-27b-v2"),
+    UsedRange("corpus", "reliquary_hard_math_v1", "train", 0, 15_749, "hard-math-qwen38-27b-v1"),
+    UsedRange("corpus", "reliquary_hard_math_v1", "train", 0, 15_749, "hard-math-qwen38-27b-v2"),
 )
 
 _CODE_LENGTH = 2_481_806
@@ -128,7 +133,8 @@ CONTAMINATION_NOTES: dict[str, str] = {
 def rl_ranges() -> list[UsedRange]:
     """RL's prompt universe: the whole train split of every catalog source
     (`window_prompt_range` slices [0, len(env)), and runtime factories build
-    the train split)."""
+    the train split). A service task offers only `rl_prompt_ranges` of it, but
+    a legacy task on the same source still samples the whole split."""
     from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
 
     return [UsedRange("rl", source, RL_SPLIT, 0, None, "RL prompt sampling")
