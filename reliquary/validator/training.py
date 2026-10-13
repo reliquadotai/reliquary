@@ -1076,6 +1076,48 @@ def _bft_training_metrics(plan) -> dict[str, float | int]:
 # bandwidth-bound, which 64 was. 512 clears it and the curve is flat past that.
 _LOGPROB_CHUNK = 512
 
+# Per-row max logit, histogrammed (0.5 wide, 0..128). bf16 rounds logits in
+# steps of 0.125 below 32, 0.25 below 64 and 0.5 above: the trainer-vs-sampler
+# gap grows with this magnitude (measured 10-12), so the run watches it.
+_LOGIT_HIST_WIDTH = 0.5
+_LOGIT_HIST_BINS = 256
+_logit_hist: Optional[torch.Tensor] = None
+
+
+def _reset_logit_histogram() -> None:
+    global _logit_hist
+    _logit_hist = torch.zeros(_LOGIT_HIST_BINS, dtype=torch.float64)
+
+
+def _observe_max_logits(logits: torch.Tensor) -> None:
+    global _logit_hist
+    if _logit_hist is None:
+        _reset_logit_histogram()
+    with torch.no_grad():
+        maxima = logits.detach().float().amax(dim=-1)
+        index = (maxima / _LOGIT_HIST_WIDTH).floor().clamp_(0, _LOGIT_HIST_BINS - 1).long()
+        _logit_hist += torch.bincount(index.cpu(), minlength=_LOGIT_HIST_BINS).double()
+
+
+def _histogram_quantile(hist: torch.Tensor, q: float) -> float:
+    total = float(hist.sum())
+    if total <= 0:
+        return 0.0
+    cumulative = torch.cumsum(hist, 0)
+    index = int(torch.searchsorted(cumulative, torch.tensor(q * total, dtype=cumulative.dtype)))
+    return (index + 1) * _LOGIT_HIST_WIDTH
+
+
+def _logit_metrics() -> dict[str, float]:
+    hist = (
+        _logit_hist if _logit_hist is not None
+        else torch.zeros(_LOGIT_HIST_BINS, dtype=torch.float64)
+    )
+    return {
+        "train/max_logit_p50": _histogram_quantile(hist, 0.5),
+        "train/max_logit_p90": _histogram_quantile(hist, 0.9),
+    }
+
 
 def _logprob_block(logits_slice: torch.Tensor, indices_slice: torch.Tensor) -> torch.Tensor:
     """log p(idx | row) for one chunk, in fp32. Equivalent to
@@ -1122,7 +1164,11 @@ def _hidden_logprob_block(
     indices_slice: torch.Tensor,
     lm_head,
 ) -> torch.Tensor:
-    return _logprob_block(lm_head(hidden_slice), indices_slice)
+    # A checkpoint recompute observes every chunk once more: the quantiles
+    # are unchanged by a uniform duplication.
+    logits = lm_head(hidden_slice)
+    _observe_max_logits(logits)
+    return _logprob_block(logits, indices_slice)
 
 
 def _selected_logprobs_from_hidden(
@@ -1507,6 +1553,10 @@ def _new_kl_stats() -> dict[str, float | int]:
         "pi_old_claim_abs_error_sum": 0.0,
         "pi_old_claim_abs_error_max": 0.0,
         "pi_old_claim_gt_1e_3_count": 0,
+        "ppo_low_p_count": 0,
+        "ppo_low_p_outside_count": 0,
+        "ppo_high_p_count": 0,
+        "ppo_high_p_outside_count": 0,
     }
 
 
@@ -1524,6 +1574,7 @@ def _record_kl_stats(
     behavior_old,
     pi_old_from_validator: bool = False,
     kl_term_computed: bool = True,
+    pi_old=None,
 ) -> None:
     """Accumulate bounded policy-health telemetry after a micro-batch."""
     if stats is None:
@@ -1558,6 +1609,16 @@ def _record_kl_stats(
         stats["ppo_ratio_nonfinite_count"] += int(
             (~torch.isfinite(ppo_ratio)).sum()
         )
+        if pi_old is not None:
+            outside = (
+                (ppo_ratio < 1.0 - PPO_CLIP_EPSILON_LOW)
+                | (ppo_ratio > 1.0 + PPO_CLIP_EPSILON_HIGH)
+            )
+            low = pi_old.detach().float() < math.log(0.1)
+            stats["ppo_low_p_count"] += int(low.sum())
+            stats["ppo_low_p_outside_count"] += int((outside & low).sum())
+            stats["ppo_high_p_count"] += int((~low).sum())
+            stats["ppo_high_p_outside_count"] += int((outside & ~low).sum())
         finite_log_ratio = ppo_log_ratio.detach().float()
         finite_log_ratio = finite_log_ratio[torch.isfinite(finite_log_ratio)]
         if finite_log_ratio.numel():
@@ -1677,6 +1738,16 @@ def _kl_telemetry_metrics(stats: dict[str, float | int]) -> dict[str, float]:
         ),
         "train/pi_old_claim_gt_1e_3_ratio": (
             int(stats["pi_old_claim_gt_1e_3_count"]) / claim_denominator
+        ),
+        # The share outside the clip by pi_old probability: bf16 rounding
+        # pushes mid/low-probability tokens out first (measured 10-12).
+        "train/ppo_outside_clip_ratio_p_lt_0_1": (
+            int(stats["ppo_low_p_outside_count"])
+            / max(1, int(stats["ppo_low_p_count"]))
+        ),
+        "train/ppo_outside_clip_ratio_p_ge_0_1": (
+            int(stats["ppo_high_p_outside_count"])
+            / max(1, int(stats["ppo_high_p_count"]))
         ),
     }
 
@@ -1846,6 +1917,7 @@ def _microbatch_grad(
         behavior_old=behavior_old_cat,
         pi_old_from_validator=use_validator_old,
         kl_term_computed=ref_lp is not None,
+        pi_old=old_cat,
     )
 
     sum_ppo = sum_kl = 0.0
@@ -2027,6 +2099,7 @@ def train_step(
     device = next(model.parameters()).device
 
     _optimizer.zero_grad()
+    _reset_logit_histogram()
 
     if _DIST is not None and (
         ref_model is not None or behavior_model is not None or KL_BETA != 0.0
@@ -2070,6 +2143,7 @@ def train_step(
             raise  # a lone retry would deadlock the other ranks' collectives
         logger.warning("train_step: OOM in micro-batch — retrying atomic at halved budget")
         _optimizer.zero_grad()
+        _reset_logit_histogram()
         torch.cuda.empty_cache()
         kl_stats = _new_kl_stats()
         total_ppo, total_kl, n_processed = _accumulate_grouped_grads(
@@ -2088,6 +2162,12 @@ def train_step(
         total_kl = totals["total_kl"]
         n_processed = totals["n_processed"]
         all_reduce_stats(kl_stats, _DIST, max_keys=KL_STAT_MAX_KEYS)
+        global _logit_hist
+        if _logit_hist is None:
+            _reset_logit_histogram()
+        from reliquary.trainer.distributed import all_reduce_tensor_sum
+
+        _logit_hist = all_reduce_tensor_sum(_logit_hist.to(_DIST.device)).cpu()
 
     if n_processed == 0:
         logger.info("train_step: no valid rollouts processed")
@@ -2161,6 +2241,7 @@ def train_step(
         failure_metrics.update(shaping_metrics)
         failure_metrics.update(overlong_metrics)
         failure_metrics.update(environment_metrics)
+        failure_metrics.update(_logit_metrics())
         telemetry.log_training_step(failure_metrics, step=window_index)
         _optimizer.zero_grad(set_to_none=True)
         raise TrainingStepSkipped(
@@ -2224,6 +2305,7 @@ def train_step(
     metrics.update(shaping_metrics)
     metrics.update(overlong_metrics)
     metrics.update(environment_metrics)
+    metrics.update(_logit_metrics())
     telemetry.log_training_step(metrics, step=window_index)
 
     return model
