@@ -119,3 +119,51 @@ def test_shard_model_refuses_a_tied_head():
     model.lm_head.weight = model.model.embed_tokens.weight
     with pytest.raises(ValueError, match="untied"):
         shard_model(model, DistContext(0, 1, torch.device("cpu"), None))
+
+
+def test_collective_timeout_defaults_to_ten_minutes_and_can_be_raised():
+    import datetime
+
+    from reliquary.trainer.distributed import collective_timeout
+
+    assert collective_timeout({}) == datetime.timedelta(minutes=10)
+    assert collective_timeout(
+        {"RELIQUARY_TRAINER_COLLECTIVE_TIMEOUT_MINUTES": "45"}
+    ) == datetime.timedelta(minutes=45)
+    for bad in ("0", "-3", "ten"):
+        with pytest.raises(ValueError):
+            collective_timeout({"RELIQUARY_TRAINER_COLLECTIVE_TIMEOUT_MINUTES": bad})
+
+
+def _plans(diverge: bool):
+    from reliquary.trainer.distributed import init_distributed
+    from reliquary.validator import training
+
+    ctx = init_distributed(device_type="cpu")
+    training.configure_distributed(ctx)
+    # Rank 1 sees one rollout fewer when the plans diverge, and with a single
+    # rollout on rank 0 the other rank's plan is empty: the case that used to
+    # leave one rank in a collective the other never joins.
+    items = [([1] * 40, 4)] if not diverge or ctx.rank == 0 else []
+    training._build_microbatch_items = lambda plan: list(items)
+    try:
+        if diverge:
+            training._accumulate_grouped_grads(
+                None, None, [], ctx.device, budget=4096, atomic=False,
+            )
+        else:
+            from reliquary.trainer.distributed import check_same_plan
+
+            check_same_plan([len(items), 40, 1], ctx)
+    except RuntimeError as exc:
+        return str(exc)
+    return "agreed"
+
+
+def test_divergent_plans_raise_on_every_rank_instead_of_hanging():
+    out = run_ranks(_plans, 2, True, timeout=120.0)
+    assert all("disagree on the train plan" in message for message in out.values())
+
+
+def test_identical_plans_pass_the_check():
+    assert set(run_ranks(_plans, 2, False, timeout=120.0).values()) == {"agreed"}

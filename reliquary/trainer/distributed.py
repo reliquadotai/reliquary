@@ -20,6 +20,12 @@ _BACKENDS = ("single", "fsdp2")
 # Rank 0 may wait hours for the next window while followers block on the
 # command broadcast; only that group gets a timeout this long.
 _CONTROL_TIMEOUT = datetime.timedelta(days=30)
+COLLECTIVE_TIMEOUT_ENV = "RELIQUARY_TRAINER_COLLECTIVE_TIMEOUT_MINUTES"
+# NCCL's own default. A collective waits only for the slowest rank to reach it,
+# never for the work every rank does before it, so the first step's kernel
+# compilation (4-6 min, run by all ranks at once) costs only the spread between
+# ranks. Waits outside a step (windows, disk writes) are on the control group.
+_DEFAULT_COLLECTIVE_TIMEOUT_MINUTES = 10
 
 
 def trainer_backend(env: Mapping[str, str] = os.environ) -> str:
@@ -27,6 +33,14 @@ def trainer_backend(env: Mapping[str, str] = os.environ) -> str:
     if value not in _BACKENDS:
         raise ValueError(f"{BACKEND_ENV} must be one of {_BACKENDS}, got {value!r}")
     return value
+
+
+def collective_timeout(env: Mapping[str, str] = os.environ) -> datetime.timedelta:
+    raw = str(env.get(COLLECTIVE_TIMEOUT_ENV, "")).strip()
+    minutes = int(raw, 10) if raw else _DEFAULT_COLLECTIVE_TIMEOUT_MINUTES
+    if minutes < 1:
+        raise ValueError(f"{COLLECTIVE_TIMEOUT_ENV} must be a positive number of minutes")
+    return datetime.timedelta(minutes=minutes)
 
 
 @dataclass(frozen=True)
@@ -55,7 +69,12 @@ def init_distributed(*, device_type: str = "cuda") -> DistContext:
     else:
         device, backend = torch.device("cpu"), "gloo"
     if not dist.is_initialized():
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        # Bounded, so a rank that leaves a step early (or never enters it)
+        # crashes torchrun instead of hanging the others. Measured 10-13:
+        # without it, rank 0 sat over 15 min in an all-gather its followers
+        # never joined, with no abort.
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size,
+                                timeout=collective_timeout())
     control = dist.new_group(backend="gloo", timeout=_CONTROL_TIMEOUT)
     return DistContext(rank, world_size, device, control)
 
@@ -178,6 +197,20 @@ def all_reduce_stats(stats: dict, ctx: DistContext, *, max_keys: frozenset[str])
         dist.all_reduce(values, op=op)
         for name, value in zip(names, values.tolist()):
             stats[name] = int(value) if isinstance(stats[name], int) else value
+
+
+def check_same_plan(signature: list[int], ctx: DistContext) -> None:
+    """Fail fast when ranks built different micro-batch plans: their numbers of
+    collectives would differ and the step would hang or mix gradients."""
+    values = torch.tensor(signature, dtype=torch.int64, device=ctx.device)
+    low, high = values.clone(), values.clone()
+    dist.all_reduce(low, op=dist.ReduceOp.MIN)
+    dist.all_reduce(high, op=dist.ReduceOp.MAX)
+    if not torch.equal(low, high):
+        raise RuntimeError(
+            f"fsdp2 ranks disagree on the train plan: rank {ctx.rank} has {signature}, "
+            f"min {low.tolist()} max {high.tolist()}"
+        )
 
 
 def all_reduce_tensor_sum(tensor: torch.Tensor) -> torch.Tensor:

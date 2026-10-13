@@ -2054,6 +2054,10 @@ def _accumulate_grouped_grads(
     gradients. Returns ``(total_ppo, total_kl, n_processed)``."""
     items = _build_microbatch_items(plan)
     if not items:
+        if _DIST is not None:
+            from reliquary.trainer.distributed import check_same_plan
+
+            check_same_plan([0, 0, 0], _DIST)
         return 0.0, 0.0, 0
     lengths = [len(it[0]) for it in items]
     total_ppo = total_kl = 0.0
@@ -2062,8 +2066,9 @@ def _accumulate_grouped_grads(
     loss_scale = 1.0
     padding_passes = 0
     if _DIST is not None:
-        from reliquary.trainer.distributed import assign_bins
+        from reliquary.trainer.distributed import assign_bins, check_same_plan
 
+        check_same_plan([len(items), sum(lengths), len(bins)], _DIST)
         costs = [len(b) * max(lengths[i] for i in b) for b in bins]
         split = assign_bins(costs, _DIST.world_size)
         padding_passes = max(len(part) for part in split) - len(split[_DIST.rank])
