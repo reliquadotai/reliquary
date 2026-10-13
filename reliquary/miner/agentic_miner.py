@@ -432,16 +432,13 @@ async def run_suite_miner(*, job, checkpoint_dir: str, proof, tokenizer, identit
     """A suite episode job: the engine thread and episodes in one process. No
     endpoint: the runner's policy calls the engine directly, and nothing but
     the pinned environment wheel runs between turns."""
+    from reliquary.corpus.suite_episode import TokenizerCodec
     from reliquary.miner.corpus_generate_server import GenerateEngine, VllmTurnCore
     from reliquary.miner.suite_episode import SuiteEpisodeRunner, suite_stop_ids
 
-    def encode(text: str) -> list[int]:
-        encoded = tokenizer.encode(text, add_special_tokens=False)
-        return list(getattr(encoded, "ids", encoded))
-
-    def decode(ids: list[int]) -> str:
-        return tokenizer.decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
-
+    # Coded as the validator's intake, replay and export code.
+    codec = TokenizerCodec(tokenizer)
+    encode, decode = codec.encode, codec.decode
     core = VllmTurnCore(checkpoint_dir, sampling=job.sampling, proof=proof,
                         stop_token_ids=suite_stop_ids(encode),
                         max_total_tokens=job.episode.max_total_tokens, max_num_seqs=max_num_seqs,

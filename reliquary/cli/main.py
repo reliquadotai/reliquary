@@ -2693,20 +2693,16 @@ def corpus_mine_agentic(
     from huggingface_hub import snapshot_download
 
     from reliquary.corpus.encoding import checkpoint_fingerprint
-    from reliquary.corpus.job import JobError
+    from reliquary.corpus.job import parse_job
     from reliquary.miner.agentic_miner import Identity, run_agentic_miner
     from reliquary.miner.corpus_miner import (
         CorpusJobSelectionError,
         HttpCorpusClient,
         submits_scoped,
     )
+    from reliquary.miner.suite_episode import is_suite_episode, suite_support_refusal
     from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
     from reliquary.protocol.signatures import sign_corpus_submission
-    from reliquary.miner.suite_episode import (
-        is_suite_episode,
-        read_episode_job,
-        suite_support_refusal,
-    )
     from reliquary.shared.modeling import load_tokenizer
 
     proof = toploc_proof(ACTIVE_PROTOCOL_PROFILE)
@@ -2719,9 +2715,8 @@ def corpus_mine_agentic(
     wallet = bt.Wallet(**wallet_kwargs)
     client = HttpCorpusClient(httpx.Client(base_url=validator_url, timeout=300.0), job_id=job_id)
     try:
-        # Suite episode manifests included, which `parse_job` does not read yet.
-        job = read_episode_job(client.job())
-    except (CorpusJobSelectionError, JobError) as exc:
+        job = parse_job(client.job())
+    except CorpusJobSelectionError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
     if job.episode is None:

@@ -32,7 +32,7 @@ for process roles and shutdown grace configuration.
 Some episode jobs do not run a SWE task in Docker. Their manifest says
 `episode.harness: "suite"`, and `episode.env.name` names an episode
 environment registered in Reliquary (the first one is
-`reliquary_telecom_solo_v1`). The model calls the environment's tools, one call
+`reliquary_telecom_solo_v2`; v1 serves no corpus job). The model calls the environment's tools, one call
 per turn, until the environment says the episode is over or the turn limit is
 reached. These are the same episodes the RL miner runs.
 
@@ -41,7 +41,7 @@ To mine one:
 1. Install the environment's wheel, at the version the job pins. For telecom:
 
    ```bash
-   pip install "git+https://github.com/reliquadotai/reliquary-environments@0bfffb4#subdirectory=environments/tool_use/reliquary_telecom_solo"
+   pip install "git+https://github.com/reliquadotai/reliquary-environments@c72f918#subdirectory=environments/tool_use/reliquary_telecom_solo"
    ```
 
 2. Run the same command as for any episode job:
@@ -53,7 +53,8 @@ To mine one:
 You do not need Docker, verifiers or renderers, and the miner opens no network
 port. Before it starts, the miner checks that the environment is registered in
 your Reliquary, that its manifest digest is the one the job pins in
-`episode.env.version`, and that the installed wheel matches it. If one of these
+`episode.env.version`, that the job's turn limit is not above the environment's,
+and that the installed wheel matches the pin. If one of these
 fails, it stops and says what to install or update.
 
 What the miner submits, and what it drops:
@@ -62,6 +63,6 @@ What the miner submits, and what it drops:
   one cut by the job's turn limit with stop `max_turns`.
 - An episode that goes past the job's token budget is dropped. So is one where
   a turn other than the last ends on `<|endoftext|>`: the validator refuses it.
-- Before signing, the miner replays the trajectory exactly as the validator
-  will. Only a trajectory whose replay matches is submitted; the others are
+- Before signing, the miner runs the validator's own checks and replay on the
+  trajectory (the same code, `reliquary.corpus.suite_episode`). Only a trajectory whose replay matches is submitted; the others are
   counted as `precheck_refused:<reason>` in the final counts.
