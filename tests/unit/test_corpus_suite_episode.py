@@ -96,7 +96,7 @@ def _episode(**overrides):
     episode = {"env": {"package": "reliquary-suite", "name": ENV, "version": ENV_SHA,
                        "split": "train"},
                "harness": "suite", "renderer": CHATML_RENDERER_ID, "max_turns": 8,
-               "max_tokens_per_turn": 4096, "max_total_tokens": 60000}
+               "max_tokens_per_turn": 3072, "max_total_tokens": 60000}
     episode.update(overrides)
     return episode
 
@@ -107,7 +107,7 @@ def _manifest(**overrides):
            "checkpoint_sha256": "c" * 64, "prompt_source": ENV, "prompt_count": 50,
            "renderer_id": CHATML_RENDERER_ID, "eos_token_id": IM_END,
            "sampling": {"temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_new_tokens": 2,
-                        "max_new_tokens": 4096, "n": 1},
+                        "max_new_tokens": 3072, "n": 1},
            "slots_per_prompt": 2, "filter": None, "prompt_order": "free",
            "deadline_round": None, "episode": _episode()}
     raw.update(overrides)
@@ -185,6 +185,24 @@ def test_a_jsonl_environment_is_not_a_corpus_suite_source():
     episode = parse_job(_manifest(episode=_episode(renderer="reliquary-jsonl-tools-v1"),
                                   renderer_id="reliquary-jsonl-tools-v1")).episode
     assert "takes only" in suite_spec_refusal(episode)
+
+
+def test_a_suite_turn_cap_must_fit_the_action_byte_limit():
+    # The 2026-10-13 GPU trial lost an episode to a 4096-token turn that
+    # decoded to more than 16 KiB: such a cap is refused when the job is read.
+    from reliquary.corpus.job import MAX_SUITE_TOKENS_PER_TURN, SUITE_ACTION_BYTES
+    from reliquary.environment.agentic.types import MAX_ACTION_BYTES
+
+    assert SUITE_ACTION_BYTES == MAX_ACTION_BYTES and MAX_SUITE_TOKENS_PER_TURN == 3276
+    sampling = dict(_manifest()["sampling"])
+    for cap in (4096, MAX_SUITE_TOKENS_PER_TURN + 1):
+        sampling["max_new_tokens"] = cap
+        with pytest.raises(JobError, match=r"max_tokens_per_turn must be a whole number in "
+                                           r"\[1, 3276\]"):
+            parse_job(_manifest(episode=_episode(max_tokens_per_turn=cap), sampling=sampling))
+    sampling["max_new_tokens"] = MAX_SUITE_TOKENS_PER_TURN
+    assert parse_job(_manifest(episode=_episode(max_tokens_per_turn=MAX_SUITE_TOKENS_PER_TURN),
+                               sampling=sampling)).episode.max_tokens_per_turn == 3276
 
 
 def test_a_job_above_the_environment_turn_limit_is_refused(chatml_registry):
@@ -633,7 +651,7 @@ def test_a_telecom_v2_job_can_be_declared_on_its_sft_share_only():
             model_architecture="qwen3_5", checkpoint_sha256="c" * 64, from_profile=None,
             prompt_encoding=None, prompt_source=TELECOM, prompt_count=count, prompt_start=0,
             renderer_id=CHATML_RENDERER_ID, eos_token_id=248046, slots_per_prompt=2,
-            max_new_tokens=4096, cap=0.05, min_incentive_share=0.5, audit_params={},
+            max_new_tokens=3072, cap=0.05, min_incentive_share=0.5, audit_params={},
             episode=episode)
 
     manifest, entry = declare(1220)
@@ -1071,3 +1089,65 @@ def test_a_turn_before_the_last_never_ends_on_another_stop_even_at_the_cap():
     assert check_turn_termination(tokens, [(0, 3), (3, 6)], **common).ok
     tokens[-1] = EOT                                    # the last turn may end on it
     assert check_turn_termination(tokens, [(0, 3), (3, 6)], **common).ok
+
+
+# -- GPU trial 2026-10-13: replay workers die with the validator ------------------
+
+def _word_tokenizer_json() -> str:
+    from tokenizers import Tokenizer, models
+
+    return Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]")).to_str()
+
+
+def _gone(pid: int, seconds: float = 15.0) -> bool:
+    import time
+
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            with open(f"/proc/{pid}/status") as status:
+                if any(line.startswith("State:") and "Z" in line.split()[1] for line in status):
+                    return True                         # dead, waiting to be reaped
+        except (FileNotFoundError, ProcessLookupError):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def test_closing_the_replayer_kills_a_busy_worker():
+    import time
+
+    from reliquary.validator.suite_intake import PoolSuiteReplayer
+
+    replayer = PoolSuiteReplayer(_word_tokenizer_json(), workers=1)
+    pool = replayer._executor()
+    assert pool.submit(os.getpid).result(timeout=60) > 0
+    busy = pool.submit(time.sleep, 120)
+    while not busy.running():
+        time.sleep(0.05)
+    pids = [process.pid for process in pool._processes.values()]
+    replayer.close()
+    assert replayer._pool is None and pids and all(_gone(pid) for pid in pids)
+
+
+_ORPHAN_SCRIPT = """
+import os, signal, sys
+from reliquary.validator.suite_intake import PoolSuiteReplayer
+replayer = PoolSuiteReplayer(sys.argv[1], workers=1)
+pool = replayer._executor()
+pool.submit(os.getpid).result(timeout=60)
+print(" ".join(str(p.pid) for p in pool._processes.values()), flush=True)
+os.kill(os.getpid(), signal.SIGKILL)            # no cleanup runs
+"""
+
+
+def test_replay_workers_exit_when_the_validator_is_killed():
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[2]
+    done = subprocess.run([sys.executable, "-c", _ORPHAN_SCRIPT, _word_tokenizer_json()],
+                          cwd=root, capture_output=True, text=True, timeout=120)
+    pids = [int(pid) for pid in done.stdout.split()]
+    assert len(pids) == 1, done.stderr[-2000:]
+    assert all(_gone(pid) for pid in pids)

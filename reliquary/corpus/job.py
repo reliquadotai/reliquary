@@ -76,6 +76,16 @@ EPISODE_STOPS = ("agent_completed", "max_turns", "context_length")
 SUITE_PACKAGE = "reliquary-suite"
 SUITE_HARNESS = "suite"
 SUITE_STOPS = ("agent_completed", "max_turns")
+# A suite turn's whole text, reasoning included, is one ``GeneratedAction``,
+# which refuses more than ``MAX_ACTION_BYTES`` (16 KiB,
+# reliquary.environment.agentic.types; not imported: this module loads
+# nothing). A turn that hits its token cap must still fit, or the miner's
+# episode dies on it (the 2026-10-13 GPU trial lost one at 4096 tokens). Five
+# bytes a token is past what Qwen's tokenizer averages on reasoning, JSON and
+# code, so the largest per-turn cap a suite job takes is 3276 tokens.
+SUITE_ACTION_BYTES = 16 * 1024
+SUITE_BYTES_PER_TOKEN = 5
+MAX_SUITE_TOKENS_PER_TURN = SUITE_ACTION_BYTES // SUITE_BYTES_PER_TOKEN
 EPISODE_ENV_PACKAGES = frozenset({"reliquary-swe", SUITE_PACKAGE})
 EPISODE_HARNESSES = frozenset({"bash", SUITE_HARNESS})
 # The package each harness runs: never mixed.
@@ -396,7 +406,8 @@ def _parse_suite_episode(raw: Mapping[str, Any]) -> EpisodeSpec:
                        num_images=None, name=env["name"]),
         harness=SUITE_HARNESS, renderer=renderer, verifiers=None,
         max_turns=_bounded_int(raw, "max_turns", 1, MAX_EPISODE_TURNS, "episode"),
-        max_tokens_per_turn=_bounded_int(raw, "max_tokens_per_turn", 1, max_total, "episode"),
+        max_tokens_per_turn=_bounded_int(raw, "max_tokens_per_turn", 1,
+                                         min(max_total, MAX_SUITE_TOKENS_PER_TURN), "episode"),
         max_total_tokens=max_total,
         replay_fraction_failed=None,
     )
