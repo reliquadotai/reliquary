@@ -559,3 +559,8 @@ behave exactly as before. The next run turns them on:
 - `RELIQUARY_EMISSION_PRICE_RISE=1.10` on the controller: an environment the trainer waited on for more
   than 5 % of the window has its price multiplied by 1.10 (`emission_price.PriceParams.rise`). Unset
   or 1.0 means no rise: such a window takes the deadband/decay path as before.
+- Checkpoint mirror marker: a task-scoped checkpoint namespace (`RELIQUARY_TASK_SCOPED_CHECKPOINTS=1`)
+  uses it automatically; on the legacy namespace set `RELIQUARY_CHECKPOINT_MIRROR_MARKER=1` on BOTH the
+  trainer and the controller (the trainer then mirrors weights after the manifest and writes
+  `reliquary_mirror_complete.json` last; the controller and the trainer's resume wait for it). Unset,
+  every file is mirrored before the manifest and no marker is written or required, as before.

@@ -351,7 +351,8 @@ def test_stage_leaves_weights_in_the_mirror_when_told_not_to_fetch_them(tmp_path
     assert seen == [sorted(f.name for f in path.iterdir())]  # validated what was staged
 
 
-def test_stage_waits_for_the_mirror_marker_before_fetching_weights(tmp_path):
+def test_stage_waits_for_the_mirror_marker_before_fetching_weights(tmp_path, monkeypatch):
+    monkeypatch.setenv("RELIQUARY_CHECKPOINT_MIRROR_MARKER", "1")
     """The trainer publishes the manifest before its weights land in the
     mirror; a weight-fetching intake must not stage a half-mirrored snapshot."""
     files = {k: v for k, v in _mirror().items()
@@ -380,3 +381,18 @@ def test_metadata_only_stage_does_not_wait_for_the_weight_mirror(tmp_path):
         validate_fn=lambda p: {"ok": True},
     )
     assert intake.stage(_manifest()) is True
+
+
+def test_a_legacy_mirror_without_a_marker_is_staged_at_once(tmp_path, monkeypatch):
+    """A main-release trainer writes no marker and mirrors every file before its
+    manifest: on the legacy namespace without the flag, the intake adopts it."""
+    monkeypatch.delenv("RELIQUARY_CHECKPOINT_MIRROR_MARKER", raising=False)
+    files = {k: v for k, v in _mirror().items() if not k.endswith(MIRROR_COMPLETE)}
+    r2 = _R2(manifest=_manifest(), files=files)
+    intake = CheckpointIntake(
+        r2_client=r2, bucket="b", staging_dir=str(tmp_path),
+        validate_fn=lambda p: {"ok": True},
+    )
+    assert intake.stage(_manifest()) is True
+    _, path = intake.take_staged()
+    assert (path / "model.safetensors").read_bytes() == b"weights"

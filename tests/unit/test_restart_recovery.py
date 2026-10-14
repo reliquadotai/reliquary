@@ -221,7 +221,8 @@ async def test_content_snapshot_startup_does_not_wait_for_remote_mirror(monkeypa
     upload.assert_not_awaited()
 
 
-def test_trainer_resume_ignores_a_mirror_without_its_completion_marker(tmp_path):
+def test_trainer_resume_ignores_a_mirror_without_its_completion_marker(tmp_path, monkeypatch):
+    monkeypatch.setenv("RELIQUARY_CHECKPOINT_MIRROR_MARKER", "1")
     """Weights are mirrored after the manifest; a mirror whose publisher died
     on a lost host stays incomplete, so resume must fall back to HF."""
     from reliquary.trainer.cli import _download_checkpoint
@@ -246,3 +247,23 @@ def test_trainer_resume_ignores_a_mirror_without_its_completion_marker(tmp_path)
     assert _download_checkpoint(client_for(complete), "bucket", revision, tmp_path)
     assert (tmp_path / "model.safetensors").read_bytes() == b"w"
     assert not (tmp_path / MIRROR_COMPLETE).exists()
+
+
+def test_trainer_resume_reuses_a_legacy_mirror_without_a_marker(tmp_path, monkeypatch):
+    """Legacy namespace, no flag: a main-release mirror (no marker) is reused."""
+    from reliquary.trainer.cli import _download_checkpoint
+
+    monkeypatch.delenv("RELIQUARY_CHECKPOINT_MIRROR_MARKER", raising=False)
+    objects = {"config.json": b"{}", "model.safetensors": b"w"}
+
+    def download(bucket, key, filename, **kwargs):
+        Path(filename).write_bytes(objects[key.rsplit("/", 1)[1]])
+
+    client = SimpleNamespace(
+        list_objects_v2=lambda **kw: {"Contents": [
+            {"Key": kw["Prefix"] + name, "Size": len(value), "ETag": name}
+            for name, value in objects.items()
+        ]}, download_file=download,
+    )
+    assert _download_checkpoint(client, "bucket", "a" * 40, tmp_path)
+    assert (tmp_path / "model.safetensors").read_bytes() == b"w"

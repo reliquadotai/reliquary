@@ -292,10 +292,13 @@ class CheckpointIntake:
             contents = listed.get("Contents", [])
             if not contents:
                 raise RuntimeError(f"R2 mirror has no objects under {prefix}")
-            from reliquary.trainer.publisher import MIRROR_COMPLETE
+            from reliquary.trainer.publisher import MIRROR_COMPLETE, mirror_marker_required
 
             complete_key = prefix + MIRROR_COMPLETE
-            if self._fetch_weights and not any(
+            # Only the new trainer's mirror (scoped namespace or the explicit flag)
+            # defers weights behind the marker; a legacy mirror is whole before its
+            # manifest, as before, and carries no marker.
+            if self._fetch_weights and mirror_marker_required(self.namespace) and not any(
                 obj.get("Key") == complete_key for obj in contents
             ):
                 # Weights land after the manifest; poll() offers it again.

@@ -51,6 +51,19 @@ WEIGHT_PATTERNS = (
 # mirror must see it first.
 MIRROR_DEFERRED_SUFFIXES = (".safetensors", ".bin")
 MIRROR_COMPLETE = "reliquary_mirror_complete.json"
+# The deferred mirror and its marker are the new trainer's protocol: used for a
+# task-scoped namespace, or when this flag is "1". Otherwise (the legacy
+# namespace, the live run) every file is mirrored before the manifest and no
+# marker is written or required, exactly as before, so a controller and a
+# trainer of either release adopt each other's checkpoints.
+MIRROR_MARKER_ENV = "RELIQUARY_CHECKPOINT_MIRROR_MARKER"
+
+
+def mirror_marker_required(namespace: CheckpointNamespace | None = None,
+                           environ: Any = None) -> bool:
+    namespace = namespace or active_checkpoint_namespace()
+    flag = (os.environ if environ is None else environ).get(MIRROR_MARKER_ENV, "").strip()
+    return bool(namespace.scoped) or flag == "1"
 
 
 class PublicationConflict(RuntimeError):
@@ -538,8 +551,9 @@ class TrainerPublisher:
         if await asyncio.to_thread(self._hf_head, self.repo_id) != revision:
             raise PublicationConflict("HF HEAD changed before candidate publication")
         manifest = {**transaction["manifest"], "revision": revision}
-        weights = [name for name in sorted(transaction["files"])
-                   if name.endswith(MIRROR_DEFERRED_SUFFIXES)]
+        deferred = mirror_marker_required(self.namespace)
+        weights = ([name for name in sorted(transaction["files"])
+                    if name.endswith(MIRROR_DEFERRED_SUFFIXES)] if deferred else [])
         metadata = [name for name in sorted(transaction["files"]) if name not in weights]
         current, etag = await asyncio.to_thread(self._read_candidate)
         if current != manifest:
@@ -562,7 +576,7 @@ class TrainerPublisher:
                 Body=json.dumps(manifest, sort_keys=True).encode(),
                 **condition,
             )
-        if transaction["state"] != "committed":
+        if deferred and transaction["state"] != "committed":
             # Idempotent: recovery replays it until the transaction commits.
             await self._mirror_files(snapshot, revision, weights)
             await asyncio.to_thread(

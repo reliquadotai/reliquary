@@ -592,7 +592,8 @@ def _publish(pub):
     )
 
 
-def test_manifest_is_published_before_the_weight_mirror(tmp_path):
+def test_manifest_is_published_before_the_weight_mirror(tmp_path, monkeypatch):
+    monkeypatch.setenv("RELIQUARY_CHECKPOINT_MIRROR_MARKER", "1")
     """The controller needs only metadata; weights mirror off its critical path."""
     from reliquary.trainer.publisher import MIRROR_COMPLETE
 
@@ -613,7 +614,8 @@ def test_manifest_is_published_before_the_weight_mirror(tmp_path):
     assert checkpoint_key(REV_1, MIRROR_COMPLETE) in r2.objects
 
 
-def test_recovery_finishes_a_weight_mirror_interrupted_after_the_manifest(tmp_path):
+def test_recovery_finishes_a_weight_mirror_interrupted_after_the_manifest(tmp_path, monkeypatch):
+    monkeypatch.setenv("RELIQUARY_CHECKPOINT_MIRROR_MARKER", "1")
     from reliquary.trainer.publisher import MIRROR_COMPLETE
 
     r2 = _OrderedR2(fail_on="model.safetensors")
@@ -628,3 +630,31 @@ def test_recovery_finishes_a_weight_mirror_interrupted_after_the_manifest(tmp_pa
     assert checkpoint_key(REV_1, "model.safetensors") in r2.objects
     assert checkpoint_key(REV_1, MIRROR_COMPLETE) in r2.objects
     assert _staging_empty(tmp_path)
+
+
+def test_legacy_namespace_mirrors_every_file_before_the_manifest_and_no_marker(tmp_path, monkeypatch):
+    """Without the flag, on the legacy namespace: main's order, so a controller
+    of either release adopts the checkpoint."""
+    from reliquary.trainer.publisher import MIRROR_COMPLETE
+
+    monkeypatch.delenv("RELIQUARY_CHECKPOINT_MIRROR_MARKER", raising=False)
+    r2 = _OrderedR2()
+    _publish(_publisher(tmp_path, r2, []))
+
+    manifest_at = r2.events.index("candidate-manifest.json")
+    assert r2.events.index("model.safetensors") < manifest_at
+    assert r2.events[-1] == "candidate-manifest.json"
+    assert MIRROR_COMPLETE not in r2.events
+    assert checkpoint_key(REV_1, MIRROR_COMPLETE) not in r2.objects
+
+
+def test_the_marker_is_required_for_a_scoped_namespace_or_the_flag():
+    from types import SimpleNamespace
+
+    from reliquary.trainer.publisher import MIRROR_MARKER_ENV, mirror_marker_required
+
+    legacy, scoped = SimpleNamespace(scoped=False), SimpleNamespace(scoped=True)
+    assert mirror_marker_required(legacy, {}) is False
+    assert mirror_marker_required(legacy, {MIRROR_MARKER_ENV: "0"}) is False
+    assert mirror_marker_required(legacy, {MIRROR_MARKER_ENV: "1"}) is True
+    assert mirror_marker_required(scoped, {}) is True
