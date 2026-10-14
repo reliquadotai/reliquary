@@ -49,7 +49,9 @@ transcript is refused (record 0 `env_package`) or never placed.
 ### Safe deployment order
 
 **The gateways' options are the validators'.** A gateway serves reliquary-swe with
-`EPISODE_ENV_OPTIONS` (tools, splits, per-call timeout); the validator resolves each
+`EPISODE_ENV_OPTIONS` (tools, splits, per-call timeout, `publish_state: true`: the
+graded state comes back with the final record, and the miner submits it as its
+`final_diff`, checked against the final's `state_sha256`); the validator resolves each
 task's image and limits with `reliquary.environment.bridged_swe.GATEWAY_OPTIONS`. Each
 machine's capacity report publishes the digest of the options it serves the env with
 (`env_options_sha256`); a machine whose digest differs, or that publishes none, gets no

@@ -80,3 +80,6 @@ def test_the_bridged_env_is_built_with_the_gateway_options(monkeypatch):
     assert built[0][0] == "verifiers:reliquary-swe==0.3.0"
     assert set(options.splits) == {"train", "r2e", "polyglot"}
     assert options.tools == ("bash", "edit") and options.defaults.per_call_timeout_s == 600
+    # The corpus intake checks the submitted diff against the final's state_sha256: the
+    # gateway must hand the graded state back (the bridge's default does not).
+    assert options.publish_state is True

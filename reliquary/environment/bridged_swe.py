@@ -14,10 +14,13 @@ PACKAGE = "reliquary-swe"
 SERVED_SPLITS = {"train": {"split": "train"}, "r2e": {"split": "r2e"},
                  "polyglot": {"split": "polyglot"}}
 GATEWAY_OPTIONS = {"tools": ["bash", "edit"], "splits": SERVED_SPLITS,
-                   "defaults": {"per_call_timeout_s": 600}}
+                   "defaults": {"per_call_timeout_s": 600}, "publish_state": True}
 """The options this process builds reliquary-swe with, which must be the ones the gateway
 serves it with (`episode_env_options`): the image and limits a session token names are
-computed with them. The gateway is the authority: its capacity report publishes the
+computed with them. `publish_state`: the gateway returns the graded state with the final
+record (the bridge's default is not to), which a corpus miner submits as `final_diff` and
+the intake checks against the final's `state_sha256` (§5.D); without it every graded SWE
+episode would be refused `sandbox_state_mismatch`. The gateway is the authority: its capacity report publishes the
 digest of the options in effect, and no session is placed on a machine whose digest is
 not `options_sha256()` (`SandboxFleet.pick`)."""
 
