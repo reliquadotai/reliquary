@@ -165,6 +165,28 @@ RUNTIME_ONLY = (
 )
 
 
+# Modules of the optional sandbox extras. Without them installed, an entry point under them
+# cannot be imported at all, so a legacy path reaching it would fail on its own: its
+# tripwire is not armed (the CPU suite runs without the extras).
+_OPTIONAL_EXTRA_PACKAGES = ("reliquary_sandbox", "reliquary_sandbox_service",
+                            "reliquary_sandbox_verifiers", "verifiers")
+
+
+def _optional_extra_missing(exc: ImportError) -> bool:
+    name = getattr(exc, "name", None) or ""
+    return name.split(".")[0] in _OPTIONAL_EXTRA_PACKAGES
+
+
+def _resolve_armable(module_name: str, dotted: str):
+    """``_resolve``, or None when the module needs an optional extra that is not installed."""
+    try:
+        return _resolve(module_name, dotted)
+    except ImportError as exc:
+        if _optional_extra_missing(exc):
+            return None
+        raise
+
+
 def _resolve(module_name: str, dotted: str):
     owner = importlib.import_module(module_name)
     *path, attr = dotted.split(".")
@@ -177,7 +199,10 @@ def arm_conditional(monkeypatch, calls: list[str], conditional) -> None:
     """Wrap each ``(module, dotted, predicate)``: the real code runs, and the call is recorded (and refused)
     when the predicate says it took the episode branch. Coroutine functions stay coroutine functions."""
     for module_name, dotted, predicate in conditional:
-        owner, attr = _resolve(module_name, dotted)
+        resolved = _resolve_armable(module_name, dotted)
+        if resolved is None:
+            continue
+        owner, attr = resolved
         real = owner.__dict__.get(attr, getattr(owner, attr))
         is_static = isinstance(real, staticmethod)
         function = real.__func__ if is_static else real
@@ -206,7 +231,10 @@ def arm_conditional(monkeypatch, calls: list[str], conditional) -> None:
 def arm_entry_points(monkeypatch, calls: list[str], armed) -> None:
     """Replace each ``(module, dotted)`` by a wrapper that RAISES and RECORDS the call."""
     for module_name, dotted in armed:
-        owner, attr = _resolve(module_name, dotted)
+        resolved = _resolve_armable(module_name, dotted)
+        if resolved is None:
+            continue
+        owner, attr = resolved
         label = f"{module_name}.{dotted}"
         original = owner.__dict__.get(attr, getattr(owner, attr))
         is_static = isinstance(original, (staticmethod, classmethod))

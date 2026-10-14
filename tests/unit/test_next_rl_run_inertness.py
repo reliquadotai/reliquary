@@ -71,8 +71,14 @@ def test_a_cold_import_of_every_legacy_entry_point_loads_no_service_module():
         "names += ['reliquary.validator.' + os.path.basename(p)[:-3] for p in glob.glob('reliquary/validator/corpus_*.py')]\n"
         "names += ['reliquary.corpus.' + os.path.basename(p)[:-3] for p in glob.glob('reliquary/corpus/*.py')\n"
         "          if not p.endswith('__init__.py')]\n"
+        "extras = ('reliquary_sandbox', 'reliquary_sandbox_service', 'reliquary_sandbox_verifiers', 'verifiers')\n"
         "for name in names:\n"
-        "    importlib.import_module(name)\n"
+        "    try:\n"
+        "        importlib.import_module(name)\n"
+        "    except ModuleNotFoundError as exc:\n"
+        "        # A signed-sandbox module without the optional extra: not a legacy entry point.\n"
+        "        if (exc.name or '').split('.')[0] not in extras:\n"
+        "            raise\n"
         "print(len(names), sorted(m for m in sys.modules if m.startswith('reliquary.services')))\n"
     )
     done = subprocess.run([sys.executable, "-I", "-c", code], cwd=REPO, capture_output=True, text=True, timeout=300)
@@ -131,10 +137,13 @@ def test_the_legacy_and_corpus_suites_pass_with_every_service_entry_point_armed(
 def test_the_tripwires_really_fire_and_record(rl_service_tripwires):
     """Guard of the guard: EVERY armed entry point is refused AND recorded (so a caller that swallows the error
     is still caught), and the runtime-only ones are recorded only on an instance that has a runtime."""
-    from tests.unit.rl_tripwires import _resolve
+    from tests.unit.rl_tripwires import _resolve, _resolve_armable
 
     for module_name, dotted in ARMED:
-        owner, attr = _resolve(module_name, dotted)
+        resolved = _resolve_armable(module_name, dotted)
+        if resolved is None:
+            continue                    # needs an optional sandbox extra this run lacks: never armed
+        owner, attr = resolved
         armed = owner.__dict__[attr]
         function = armed.__func__ if isinstance(armed, (staticmethod, classmethod)) else armed
         before = len(rl_service_tripwires)
