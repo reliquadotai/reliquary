@@ -57,7 +57,8 @@ def test_the_corpus_control_refuses_an_order_task_at_boot(job_id):
     from reliquary.validator.corpus_validator import run_corpus_validator
 
     entry = SimpleNamespace(task_id=job_id, job_id=job_id, status="active",
-                            mechanism="corpus-generation", params={"cap": 0.02}, contract={})
+                            mechanism="corpus-generation",
+                            params={"cap": 0.02, "settlement": "period-ema-v1"}, contract={})
     with pytest.raises(RuntimeError, match="order control"):
         asyncio.run(run_corpus_validator(
             entry=entry, cap=0.02, wallet=None, netuid=0, signer_client=None,
@@ -477,22 +478,12 @@ def test_the_order_archives_take_generation_tasks_it_serves():
     from reliquary.validator.eval_control import EvalArchives, OrderArchives
 
     assert EvalArchives is OrderArchives
-    written = []
-
-    async def upload(window, data, task_id):
-        written.append((task_id, window))
-
-    async def other_max(task_id):
-        return None
-
-    archives = OrderArchives(served=lambda: {"order-gen-1", "order-eval-1", "code-v1"},
-                             upload=upload, other_max=other_max)
-    asyncio.run(archives.write("order-gen-1", 3, {}))
-    asyncio.run(archives.write("order-eval-1", 4, {}))
-    assert written == [("order-gen-1", 3), ("order-eval-1", 4)]
+    guard = OrderArchives(served=lambda: {"order-gen-1", "order-eval-1", "code-v1"})
+    guard.refuse_unserved("order-gen-1")
+    guard.refuse_unserved("order-eval-1")
     for task_id in ("order-gen-2", "code-v1"):
         with pytest.raises(RuntimeError):
-            asyncio.run(archives.write(task_id, 5, {}))
+            guard.refuse_unserved(task_id)
 
 
 def _signed_post(app, path, body):
@@ -525,7 +516,7 @@ def test_one_order_control_serves_a_generation_job_on_a_third_model_next_to_eval
     from reliquary.eval import qualification as qual
     from reliquary.infrastructure.corpus_job_store import BucketJobStore
     from reliquary.infrastructure.corpus_record_store import BucketRecordStore
-    from reliquary.validator import corpus_auditor, corpus_settlement
+    from reliquary.validator import corpus_auditor, corpus_period_settlement
     from reliquary.validator.eval_control import (
         EvalExecutorDirectory,
         PairedAuditDispatcher,
@@ -555,7 +546,7 @@ def test_one_order_control_serves_a_generation_job_on_a_third_model_next_to_eval
         await asyncio.sleep(3600)
 
     monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", idle)
-    monkeypatch.setattr(corpus_settlement.CorpusSettler, "settle_once", lambda self: idle(self))
+    monkeypatch.setattr(corpus_period_settlement.CorpusPeriodSettler, "settle_once", lambda self: idle(self))
 
     async def read_entries():
         return dict(entries["entries"])

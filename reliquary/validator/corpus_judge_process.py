@@ -2,7 +2,7 @@
 
 It judges and pays a group of jobs with exactly the code the single process
 runs (``wire_job_judge``: the scheduled ``CorpusAuditor`` and the fed
-``CorpusSettler``), with its forward on the GPU process and its arrivals from
+``CorpusPeriodSettler``), with its forward on the GPU process and its arrivals from
 the front's feed. Its unix socket takes the feed and answers the front's
 status reads; it serves nothing to miners.
 """
@@ -41,7 +41,13 @@ def build_judge_app(served: Mapping[str, Any], feed) -> FastAPI:
     async def stats(job_id: str) -> dict:
         w = wiring(job_id)
         return {"unsettled": list(w.stats.unsettled()),
-                "settled_count": w.settler.settled_count, "totals": w.settler.totals}
+                "settled_count": w.settler.settled_count, "totals": w.settler.totals,
+                "last_period": getattr(w.settler, "last_period", None),
+                # For the front's pay estimate (`/corpus/pay`).
+                "open_periods": getattr(w.settler, "open_periods", None),
+                "open_periods_at": getattr(w.settler, "open_periods_at", None),
+                "undecided": (w.settler.undecided_since()
+                              if hasattr(w.settler, "undecided_since") else None)}
 
     @app.get("/jobs/{job_id}/miners/{hotkey}")
     async def miner(job_id: str, hotkey: str) -> dict:
@@ -70,6 +76,8 @@ def registry_reader() -> Callable[[], Awaitable[Mapping[str, Any]]]:
 async def refresh_caps(served: Mapping[str, Any], read_entries, every_seconds: float) -> None:
     """The registry's cap of each job judged here, applied to its settler as
     the single process's job set does (the front's copy is for its status)."""
+    from reliquary.validator.corpus_period_settlement import apply_max_price
+
     while True:
         await asyncio.sleep(every_seconds)
         try:
@@ -86,6 +94,7 @@ async def refresh_caps(served: Mapping[str, Any], read_entries, every_seconds: f
                 logger.info("corpus task %s cap %s -> %s", w.entry.task_id, w.cap, cap)
                 w.cap = cap
                 w.settler.set_cap(cap)
+            apply_max_price(w, entry)
 
 
 async def run_corpus_judges(*, served, directory: str, run_dir: str, proof, socket_path: str,
@@ -107,8 +116,11 @@ async def run_corpus_judges(*, served, directory: str, run_dir: str, proof, sock
         JUDGE_POOL_CONNECTIONS, settle_forever, wire_job_judge,
     )
 
+    from reliquary.validator.corpus_validator import period_served
+
     store = BucketJobStore()
     jobs = []
+    served, _ = period_served(served)
     for entry, cap in served:
         job, _ = await store.read_job(str(entry.job_id))
         if job is None:

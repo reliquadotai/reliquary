@@ -372,7 +372,11 @@ def test_an_eval_job_is_declared_byte_identically(admin):
     assert admin("POST", "/admin/v1/jobs", _eval_job()).status_code == 201
     entry = admin.registry["entries"]["order-eval-7"]
     manifest = json.loads(admin.bucket.objects["reliquary/corpus/jobs/order-eval-7.json"][0])
-    document = {"manifest": manifest, "contract": entry.contract, "params": entry.params}
+    # Every corpus task is now paid by period: the settlement is the one
+    # param added since the pin; manifest, contract and the rest are unchanged.
+    assert entry.params["settlement"] == "period-ema-v1"
+    params = {k: v for k, v in entry.params.items() if k != "settlement"}
+    document = {"manifest": manifest, "contract": entry.contract, "params": params}
     digest = hashlib.sha256(json.dumps(document, sort_keys=True,
                                        separators=(",", ":")).encode()).hexdigest()
     assert digest == EVAL_JOB_GOLDEN

@@ -33,6 +33,8 @@ def test_catalog_is_immutable_and_contains_legacy_environments():
         # Registered so a measurement can address it by name; no profile
         # declares it, so no window can draw it.
         "envscaler_tools_v1",
+        # Its contained, ChatML, split-by-world successor; inert the same way.
+        "envscaler_tools_v2",
         # Packaged environments from reliquary-environments, bound by the
         # artifact digest committed in their source. Inert until a profile
         # names them: no live profile does.
@@ -41,7 +43,10 @@ def test_catalog_is_immutable_and_contains_legacy_environments():
         "reliquary_hard_math_v1",
         "reliquary_instruction_following_v1",
         "reliquary_code_v1",
+        "reliquary_competitive_code_v1",
+        "reliquary_general_v1",
         "reliquary_telecom_solo_v1",
+        "reliquary_telecom_solo_v2",
     )
     with pytest.raises(TypeError):
         ENVIRONMENT_SPECS["new"] = ENVIRONMENT_SPECS["openmathinstruct"]

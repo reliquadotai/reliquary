@@ -18,8 +18,10 @@ reversible step.
 from __future__ import annotations
 
 import asyncio
+import base64
 import collections
 import contextlib
+import functools
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
@@ -45,7 +47,7 @@ from reliquary.corpus.admission import (
 )
 from reliquary.corpus.checks import CheckResult, completion_digest
 from reliquary.corpus.job import PROMPT_ORDER_MINER_WALK, JobError, JobSpec
-from reliquary.corpus.slots import SlotLedger
+from reliquary.corpus.slots import OPEN_ENCODING, SlotLedger
 from reliquary.corpus.walk import CursorLedger, job_walk_index
 from reliquary.environment.agentic.types import EpisodeTask
 from reliquary.environment.registry import ENVIRONMENT_SPECS
@@ -62,7 +64,7 @@ from reliquary.protocol.corpus_submission import (
     CorpusSubmissionResponse,
 )
 from reliquary.infrastructure.corpus_record_store import RECORD_SCHEMA_V2
-from reliquary.validator.agentic_intake import IntakeFacts
+from reliquary.validator.agentic_intake import IntakeFacts, ReplayUnavailable
 from reliquary.validator.corpus_text import (
     Renderer,
     check_prompt_fidelity,
@@ -84,6 +86,21 @@ NEXT_PATH = "/corpus/next/{hotkey}"
 NEXT_SCOPED_PATH = "/corpus/jobs/{job_id}/next/{hotkey}"
 SKIP_PATH = "/corpus/skip"
 SKIP_SCOPED_PATH = "/corpus/jobs/{job_id}/skip"
+# Check before starting an episode: which of the job's prompts still have a
+# slot, whatever its prompt order (a free job has no walk for `next` to read).
+OPEN_PATH = "/corpus/open"
+OPEN_SCOPED_PATH = "/corpus/jobs/{job_id}/open"
+# How long one computed open map answers every caller, and what a client or a
+# proxy in front may keep it: a miner acts on it for minutes anyway.
+OPEN_CACHE_SECONDS = 5.0
+# One bit per prompt: 128 KiB of bitmap at this count. A generated source
+# declares up to 1 << 31 prompts; past this the route refuses rather than
+# build (and ship) a map that size.
+OPEN_MAX_PROMPTS = 1 << 20
+
+
+def _open_clock() -> float:
+    return time.monotonic()
 
 # The record's own schema tag, so a reader of the bucket can tell what shape
 # to expect before it parses the rest of the document.
@@ -257,6 +274,16 @@ class SingleTurnPromptJob:
                 f"prompt source {self._job.prompt_source!r} returned no prompt "
                 f"text for row {position}"
             )
+        # A source that shares train between SFT and RL marks each row's use
+        # (by problem identity, so a range typo cannot move it): a corpus job
+        # sells SFT data and is never served an RL row.
+        use = problem.get("use")
+        if use is not None and use != "sft":
+            raise CorpusPromptSourceError(
+                f"row {position} of {self._job.prompt_source!r} is in its "
+                f"{use!r} share, kept for RL; a corpus job is never served it"
+            )
+        _refuse_unless_one_user_turn(self._job, position, problem, prompt)
         # The row's identity here is its index: fidelity compares the prompt
         # text, and carrying the environment's own id would only add a way for
         # a source to hand back something `EpisodeTask` refuses.
@@ -268,6 +295,48 @@ class SingleTurnPromptJob:
         return EpisodeTask(
             id=f"{self._job.prompt_source}#{position}", prompt=prompt, tools=(),
             metadata={"system": system} if isinstance(system, str) and system else {},
+        )
+
+
+def _refuse_unless_one_user_turn(
+    job: JobSpec, position: int, problem: Mapping[str, Any], prompt: str
+) -> None:
+    """Refuse a row this path would serve as a different task.
+
+    A single-turn job renders `prompt` as one user turn and nothing else. A
+    source whose rows can carry more -- a frozen history, a task system
+    message, tools (reliquary_general_v1's metadata says so per row) -- is
+    served here only where the row is that one turn: each mark is checked on
+    its own, so a row cannot get through on a `single_turn` it contradicts.
+    A row that names the renderer it was drawn for (its thinking mode) is
+    served only through that renderer. Sources whose rows carry none of these
+    fields are unaffected.
+    """
+    reasons = []
+    if problem.get("single_turn") is False:
+        reasons.append("it is marked multi-turn")
+    if problem.get("tools"):
+        reasons.append("it carries tools")
+    messages = problem.get("messages")
+    if messages is not None and (
+        not isinstance(messages, (list, tuple))
+        or len(messages) != 1
+        or not isinstance(messages[0], Mapping)
+        or messages[0].get("role") != "user"
+        or messages[0].get("content") != prompt
+    ):
+        reasons.append("its messages are not exactly that user turn")
+    if reasons:
+        raise CorpusPromptSourceError(
+            f"row {position} of {job.prompt_source!r} is not one user turn "
+            f"({'; '.join(reasons)}); a single-turn job renders its prompt alone "
+            "and would serve it as a different task"
+        )
+    renderer = problem.get("renderer")
+    if renderer is not None and renderer != job.renderer_id:
+        raise CorpusPromptSourceError(
+            f"row {position} of {job.prompt_source!r} was drawn for renderer "
+            f"{renderer!r}; job {job.job_id!r} renders through {job.renderer_id!r}"
         )
 
 
@@ -362,10 +431,47 @@ class EpisodePromptRenderer:
             "an episode job's prompt is checked by its episode intake, not rendered as text")
 
 
+class SuiteSourceSpec:
+    """What `resolve_prompt_source` returns for a suite episode job: the
+    registry environment it names, buildable into its tasks
+    (`reliquary.corpus.suite_episode.SuiteSource`)."""
+
+    interaction_mode = "agentic"
+
+    def __init__(self, episode: Any) -> None:
+        self.episode = episode
+
+    def create(self):
+        from reliquary.corpus.suite_episode import suite_source
+
+        try:
+            return suite_source(self.episode)
+        except ValueError as exc:
+            raise CorpusPromptSourceError(str(exc)) from exc
+
+
+def _resolve_suite(prompt_source: str, renderer_id: str | None, episode: Any) -> SuiteSourceSpec:
+    from reliquary.corpus.suite_episode import suite_spec_refusal
+
+    if prompt_source != episode.env.name:
+        raise CorpusPromptSourceError(
+            f"a suite episode job draws its prompts from {episode.env.name!r}, "
+            f"not {prompt_source!r}")
+    if renderer_id is not None and renderer_id != episode.renderer:
+        raise CorpusPromptSourceError(
+            f"the job's renderer_id {renderer_id!r} is not its episode.renderer {episode.renderer!r}")
+    refusal = suite_spec_refusal(episode)
+    if refusal:
+        raise CorpusPromptSourceError(refusal)
+    return SuiteSourceSpec(episode)
+
+
 def _resolve_agentic(prompt_source: str, renderer_id: str | None, episode: Any) -> AgenticSourceSpec:
     from reliquary.environment import agentic_swe
     from reliquary.protocol.agentic_source import AGENTIC_SWE_ENVIRONMENT
 
+    if episode is not None and getattr(episode, "is_suite", False):
+        return _resolve_suite(prompt_source, renderer_id, episode)
     if episode is None:
         raise CorpusPromptSourceError(
             f"prompt source {prompt_source!r} serves agentic episodes: a job reading it "
@@ -1556,6 +1662,9 @@ def build_corpus_router(
         seen_index = SeenIndex(store, job_id)
     # One rebuilt ledger state, keyed by the ETag it was read under (`_read_state`).
     read_cache: dict[str, Any] = {}
+    # The last open map (`corpus_open`): when it was built, from which state.
+    open_cache: dict[str, Any] = {}
+    open_lock = asyncio.Lock()
 
     async def _from_store(call, what: str):
         try:
@@ -1750,9 +1859,17 @@ def build_corpus_router(
                 raise HTTPException(status_code=500, detail="corpus_episode_intake_unconfigured")
             # Every refusal here precedes any slot or cursor consumption. The
             # signed intake's deadline is the time the submission arrived.
-            outcome = await (asyncio.to_thread(episode_intake.check, request, received=received)
-                             if received is not None
-                             else asyncio.to_thread(episode_intake.check, request))
+            check = (functools.partial(episode_intake.check, request, received=received)
+                     if received is not None else functools.partial(episode_intake.check, request))
+            try:
+                # On the intake's own threads when it has them (a suite one,
+                # which waits on its replay pool), else the default executor.
+                outcome = await asyncio.get_running_loop().run_in_executor(
+                    getattr(episode_intake, "executor", None), check)
+            except ReplayUnavailable as exc:
+                # Ours, not the miner's: a retryable 503, never a refusal.
+                logger.error("corpus job %s: replay unavailable: %s", job_id, exc)
+                raise HTTPException(status_code=503, detail="corpus_replay_unavailable") from exc
             if not isinstance(outcome, IntakeFacts):
                 if getattr(outcome, "retry_after", None) is not None:
                     raise _retry_later(outcome)
@@ -2015,6 +2132,56 @@ def build_corpus_router(
             "slots_remaining": state.slots.remaining(prompt_index),
             "skip_to": skip_target(job, hotkey, cursor, state.slots),
         }
+
+    def _open_response(body: dict) -> JSONResponse:
+        return JSONResponse(body, headers={
+            "Cache-Control": f"public, max-age={int(OPEN_CACHE_SECONDS)}"})
+
+    def _open_cached() -> dict | None:
+        if "body" in open_cache and _open_clock() - open_cache["at"] < OPEN_CACHE_SECONDS:
+            return open_cache["body"]
+        return None
+
+    @router.get(OPEN_PATH)
+    async def corpus_open() -> JSONResponse:
+        """Which of the job's prompts still have a slot, for any prompt order:
+        ``open`` is base64 of one bit per SOURCE row from ``prompt_start``
+        (``slots.OPEN_ENCODING``), ``as_of`` the unix time the ledger was read.
+        A read, exposed like the cursor: no signature, no write. One answer
+        serves every caller for ``OPEN_CACHE_SECONDS``, so polling miners cost
+        neither a bucket read nor a second pass over the ledger."""
+        body = _open_cached()
+        if body is not None:
+            return _open_response(body)
+        async with open_lock:
+            # Whoever held the lock may have just built it.
+            body = _open_cached()
+            if body is not None:
+                return _open_response(body)
+            job = await _read_job_checked()
+            if job is None:
+                raise HTTPException(status_code=404, detail="corpus_job_unknown")
+            if job.prompt_count > OPEN_MAX_PROMPTS:
+                raise HTTPException(status_code=409, detail="corpus_job_open_too_large")
+            state = await _read_state(job)
+            as_of = time.time()
+            if open_cache.get("state") is state:
+                # The same ledger version: the map stands, only its age moves.
+                body = {**open_cache["body"], "as_of": as_of}
+            else:
+                # Off the loop: a pass over every consumed prompt.
+                bitmap, opened = await asyncio.to_thread(state.slots.open_bitmap)
+                body = {
+                    "job_id": job.job_id,
+                    "prompt_start": job.prompt_start,
+                    "prompt_count": job.prompt_count,
+                    "open_count": opened,
+                    "as_of": as_of,
+                    "encoding": OPEN_ENCODING,
+                    "open": base64.b64encode(bitmap).decode("ascii"),
+                }
+            open_cache.update(at=_open_clock(), state=state, body=body)
+            return _open_response(body)
 
     @router.post(SKIP_PATH, response_model=CorpusSkipResponse)
     async def skip_corpus(request: CorpusSkipRequest) -> CorpusSkipResponse:
@@ -2424,6 +2591,7 @@ def build_corpus_router(
     router.corpus_cursor = corpus_cursor
     router.submit_corpus = submit_corpus
     router.corpus_next = corpus_next
+    router.corpus_open = corpus_open
     router.skip_corpus = skip_corpus
     router.ledger_lock = ledger_lock
     router.recover_records = recover_records
@@ -2566,6 +2734,13 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
             raise HTTPException(status_code=409, detail="job_paused")
         return _served(job_id)
 
+    def _open_of(job_id: str) -> APIRouter:
+        # A read, so a paused job answers; a retired one admits nothing more,
+        # and its miners stop on the 410 instead of reading a map of slots.
+        if job_id in routes.retired:
+            raise HTTPException(status_code=410, detail=JOB_RETIRED)
+        return _served(job_id)
+
     @router.get(JOBS_PATH)
     async def corpus_jobs() -> dict:
         return {"jobs": routes.open_jobs()}
@@ -2581,6 +2756,10 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
     @router.get(NEXT_SCOPED_PATH)
     async def corpus_next_scoped(job_id: str, hotkey: str) -> dict:
         return await _admitting(job_id).corpus_next(hotkey)
+
+    @router.get(OPEN_SCOPED_PATH)
+    async def corpus_open_scoped(job_id: str) -> JSONResponse:
+        return await _open_of(job_id).corpus_open()
 
     @router.post(SKIP_SCOPED_PATH, response_model=CorpusSkipResponse)
     async def skip_corpus_scoped(job_id: str, request: CorpusSkipRequest) -> CorpusSkipResponse:
@@ -2615,6 +2794,10 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
     @router.get(NEXT_PATH)
     async def corpus_next_legacy(hotkey: str) -> dict:
         return await _admitting(_default()).corpus_next(hotkey)
+
+    @router.get(OPEN_PATH)
+    async def corpus_open_legacy() -> JSONResponse:
+        return await _open_of(_default()).corpus_open()
 
     @router.post(SKIP_PATH, response_model=CorpusSkipResponse)
     async def skip_corpus_legacy(request: CorpusSkipRequest) -> CorpusSkipResponse:
@@ -2656,6 +2839,10 @@ __all__ = [
     "JOBS_PATH",
     "NEXT_PATH",
     "NEXT_SCOPED_PATH",
+    "OPEN_CACHE_SECONDS",
+    "OPEN_MAX_PROMPTS",
+    "OPEN_PATH",
+    "OPEN_SCOPED_PATH",
     "SKIP_PATH",
     "SKIP_SCOPED_PATH",
     "JOB_PATH",

@@ -202,6 +202,30 @@ ENVIRONMENT_CATALOG: Mapping[str, EnvironmentProfile] = MappingProxyType({
             "71e4f23c614b7f321bbb9f6cf74f98b772137442bdf9960e5b6d9b6387f41216"
         ),
     ),
+    "reliquary_competitive_code_v1": EnvironmentProfile(
+        max_new_tokens=16384,
+        bft=None,
+        answer_format="fenced_python",
+        batch_target=8,
+        prompt_template=_EXTERNAL_PROMPT,
+        environment_contract_id="reliquary/stdio-program/v1",
+        environment_manifest_sha256=(
+            "0589dc2f13c21d8ff6a67d24dd2b8c68e54b706f696267a349158bbd891093d9"
+        ),
+        prompt_cooldown_windows=340,
+    ),
+    "reliquary_general_v1": EnvironmentProfile(
+        max_new_tokens=16384,
+        bft=None,
+        answer_format="text",
+        batch_target=16,
+        prompt_template=_EXTERNAL_PROMPT,
+        environment_contract_id="reliquary/checked-answer/v1",
+        environment_manifest_sha256=(
+            "fc874fefc78de44891b94401a77f71d1b6fb4d5048e04d7908b073eb681b84f1"
+        ),
+        prompt_cooldown_windows=7664,
+    ),
     "reliquary_telecom_solo_v1": EnvironmentProfile(
         max_new_tokens=49152,
         bft=None,
@@ -239,6 +263,8 @@ CATALOG_PROVENANCE: Mapping[str, str] = MappingProxyType({
     "reliquary_hard_math_v1": "teutonic-9b-reliquary-suite-v9-dev1",
     "reliquary_instruction_following_v1": "teutonic-9b-reliquary-suite-v9-dev1",
     "reliquary_code_v1": "teutonic-9b-reliquary-suite-v9-dev1",
+    "reliquary_competitive_code_v1": "teutonic-9b-reliquary-suite-v9-dev1",
+    "reliquary_general_v1": "teutonic-9b-reliquary-suite-v9-dev1",
     "reliquary_telecom_solo_v1": "teutonic-9b-reliquary-suite-v9-dev1",
 })
 

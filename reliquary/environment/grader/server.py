@@ -16,6 +16,7 @@ reliquary.environment.grader.worker` is used.
 
 from __future__ import annotations
 
+import base64
 import http.server
 import json
 import logging
@@ -41,7 +42,9 @@ from reliquary.environment.grader import (
     GRADER_SOCKET_PATH,
 )
 from reliquary.environment.grader.executor import (
+    MAX_EXECUTOR_CODE_BYTES,
     MAX_EXECUTOR_RESPONSE_BYTES,
+    MAX_EXECUTOR_TIMEOUT_SECONDS,
     SandboxBatchRequest,
     SandboxBatchResult,
     SandboxCaseResult,
@@ -51,6 +54,12 @@ from reliquary.environment.grader.executor import (
     make_sandbox_batch_request,
     remote_executor_from_env,
     remote_executor_mode_from_env,
+)
+from reliquary.environment.grader.worker import (
+    STDIO_CHUNK_BYTES,
+    STDIO_DRAIN_S,
+    STDIO_WALL_FACTOR,
+    STDIO_WALL_SLACK_S,
 )
 from reliquary.infrastructure.process_health import (
     DEFAULT_GRADER_HEALTH_PATH,
@@ -101,6 +110,15 @@ GRADER_EVAL_WALL_CUSHION_SECONDS = 2.0
 
 # Bytes of a dead worker's stderr kept for the death log.
 GRADER_WORKER_STDERR_TAIL_BYTES = 4096
+
+# Stdio mode (see `_dispatch_stdio`). The worker's own clock constants, so the
+# server's outer deadline can never fire before the worker's verdict.
+STDIO_STATUSES = frozenset({
+    "ok", "output_limit", "runtime_error", "forbidden_import", "timeout",
+    "harness_overload",
+})
+STDIO_MAX_GUEST_BYTES = 256 * 1024
+STDIO_MAX_OUTPUT_CAP = 64 * 1024 * 1024
 
 
 def worker_lifetime_cpu_budget_seconds(
@@ -543,6 +561,9 @@ class GraderServer:
             stderr=stderr_file,
             text=True,
             bufsize=1,
+            # The bundle pins it inside gVisor; a plain worker needs it too,
+            # or a stdio run's set order changes between replays.
+            env={**os.environ, "PYTHONHASHSEED": "0"},
         )
         w = Worker(
             proc=proc,
@@ -583,14 +604,16 @@ class GraderServer:
 
     def _handle_conn(self, conn: socket.socket) -> None:
         try:
-            buf = b""
+            # Joined once: a stdio request carries its whole stdin.
+            chunks: list[bytes] = []
             while True:
-                chunk = conn.recv(8192)
+                chunk = conn.recv(65536)
                 if not chunk:
                     break
-                buf += chunk
-                if b"\n" in buf:
+                chunks.append(chunk)
+                if b"\n" in chunk:
                     break
+            buf = b"".join(chunks)
             if not buf:
                 return
             try:
@@ -636,6 +659,8 @@ class GraderServer:
             self._respawn(w, reason="death")
 
     def _dispatch(self, req: dict) -> dict:
+        if req.get("mode") == "stdio":
+            return self._dispatch_stdio(req)
         cases = req.get("cases")
         req_id = req.get("req_id", "")
         if not isinstance(cases, list) or not cases:
@@ -733,6 +758,132 @@ class GraderServer:
             "total": len(cases),
             "status": "ok",
         }
+
+    def _dispatch_stdio(self, req: dict) -> dict:
+        """One whole program on one stdin, on one worker, in a fresh fork.
+
+        The request carries no expected output: the reply is what the program
+        printed, and the trusted caller compares it with the package's own
+        comparison. Local workers only; the remote executor protocol has no
+        stdio case.
+        """
+        req_id = str(req.get("req_id", ""))
+
+        def error(reason: str) -> dict:
+            self._metrics.inc("grader_stdio_total", {"status": "grader_error"})
+            logger.warning("grader: stdio request refused req_id=%s reason=%s", req_id, reason)
+            return {"req_id": req_id, "status": "grader_error", "reason": reason}
+
+        guest, code, stdin_text = req.get("guest"), req.get("code"), req.get("stdin")
+        output_cap, time_limit_s = req.get("output_cap"), req.get("time_limit_s")
+        if (
+            not isinstance(guest, str) or not guest
+            or len(guest.encode("utf-8")) > STDIO_MAX_GUEST_BYTES
+            or not isinstance(code, str)
+            or len(code.encode("utf-8")) > MAX_EXECUTOR_CODE_BYTES
+            or not isinstance(stdin_text, str)
+            or not isinstance(output_cap, int) or isinstance(output_cap, bool)
+            or not 0 < output_cap <= STDIO_MAX_OUTPUT_CAP
+            or not isinstance(time_limit_s, (int, float)) or isinstance(time_limit_s, bool)
+            or not math.isfinite(time_limit_s)
+            or not 0 < time_limit_s <= MAX_EXECUTOR_TIMEOUT_SECONDS
+        ):
+            return error("bad_request")
+        if self.sandbox_executor is not None:
+            return error("stdio_needs_local_workers")
+        worker = self._acquire_worker(timeout=self.worker_acquire_timeout_s)
+        if worker is None:
+            return error("capacity_unavailable")
+        wall_s = STDIO_WALL_FACTOR * float(time_limit_s) + STDIO_WALL_SLACK_S
+        try:
+            worker.in_use = True
+            response = self._evaluate_stdio_on_worker(worker, {
+                "req_id": req_id, "mode": "stdio", "guest": guest, "code": code,
+                "stdin": stdin_text, "output_cap": output_cap,
+                "time_limit_s": float(time_limit_s),
+                # The worker's own wall clock and drain fire first; this one
+                # only catches a worker that stopped answering.
+                "timeout_s": wall_s + STDIO_DRAIN_S + 1.0,
+            }, output_cap=output_cap)
+        finally:
+            worker.in_use = False
+            self._release_worker(worker)
+        status = response.get("status")
+        if status not in STDIO_STATUSES or "stdout_chunks" not in response:
+            # A reply this server made up (a worker that stopped answering is
+            # a "timeout" here) is never the program's verdict.
+            return error(f"worker_{status}" if isinstance(status, str) else "malformed_worker_result")
+        self._metrics.inc("grader_stdio_total", {"status": status})
+        return {"req_id": req_id, "status": status, "stdout": response["stdout"]}
+
+    def _evaluate_stdio_on_worker(self, w: Worker, req: dict, *, output_cap: int) -> dict:
+        """The header through `_evaluate_on_worker`, then the stdout chunk by
+        chunk, each asked for with ``next`` (see the worker's
+        `_reply_in_chunks`). A broken or oversized reply retires the worker:
+        its protocol position is lost."""
+        header = self._evaluate_on_worker(w, req)
+        count = header.get("stdout_chunks")
+        if "cpu_seconds" not in header or not isinstance(count, int) or isinstance(count, bool):
+            return {"status": header.get("status", "grader_error")}
+        if not 0 <= count <= output_cap // STDIO_CHUNK_BYTES + 1:
+            self._respawn_async(w, reason="malformed_reply")
+            return {"status": "malformed_reply"}
+        deadline = time.time() + float(req["timeout_s"]) + GRADER_EVAL_WALL_CUSHION_SECONDS
+        data = bytearray()
+        for _ in range(count):
+            try:
+                assert w.proc.stdin is not None and w.proc.stdout is not None
+                w.proc.stdin.write("next\n")
+                w.proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                self._respawn_async(w, reason="death")
+                return {"status": "crash"}
+            line = self._readline_before(w, deadline)
+            try:
+                data += base64.b64decode(line.strip(), validate=True)
+            except (TypeError, ValueError):
+                self._respawn_async(w, reason="malformed_reply")
+                return {"status": "malformed_reply"}
+            if len(data) > output_cap or not line:
+                self._respawn_async(w, reason="malformed_reply")
+                return {"status": "malformed_reply"}
+        try:
+            stdout = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return {"status": "malformed_reply"}
+        return {**header, "stdout": stdout}
+
+    @staticmethod
+    def _readline_before(w: Worker, deadline: float) -> str:
+        holder: dict = {}
+
+        def reader():
+            try:
+                holder["line"] = w.proc.stdout.readline()
+            except Exception:
+                holder["line"] = ""
+
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        thread.join(timeout=max(0.1, deadline - time.time()))
+        return "" if thread.is_alive() else holder.get("line", "")
+
+    def _release_worker(self, worker: Worker) -> None:
+        """Back to the pool, or recycled, or retired after a batch."""
+        if (
+            self.retire_worker_after_batch
+            and not worker.retired
+            and worker.proc.poll() is None
+        ):
+            # The remote execution tier treats each batch as one hostile
+            # job. Never hand its interpreter or sandbox to another miner.
+            self._respawn_async(worker, reason="batch_isolation")
+        elif (
+            not worker.retired
+            and worker.proc.poll() is None
+            and not self._needs_recycle(worker)
+        ):
+            self._idle.put(worker)
 
     def execute_sandbox_batch(
         self,
@@ -921,20 +1072,7 @@ class GraderServer:
         finally:
             # If the worker was respawned, its replacement is already idle.
             worker.in_use = False
-            if (
-                self.retire_worker_after_batch
-                and not worker.retired
-                and worker.proc.poll() is None
-            ):
-                # The remote execution tier treats each batch as one hostile
-                # job. Never hand its interpreter or sandbox to another miner.
-                self._respawn_async(worker, reason="batch_isolation")
-            elif (
-                not worker.retired
-                and worker.proc.poll() is None
-                and not self._needs_recycle(worker)
-            ):
-                self._idle.put(worker)
+            self._release_worker(worker)
         return SandboxBatchResult(
             protocol_version=request.protocol_version,
             job_id=request.job_id,

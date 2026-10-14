@@ -1,7 +1,8 @@
 """Settle a period-settled corpus task (``settlement: period-ema-v1``).
 
-Pays each closed period of work its own cap, split by the verified tokens of
-submissions received in it, in one archive per period that enters the weights
+Pays each closed period of work its own cap, or less under a price ceiling
+(min(cap, price x its verified tokens), the rest burns), split by the verified
+tokens of submissions received in it, in one archive per period that enters the weights
 the first period after it is written with room for it (``cp.entry_for``). No RL
 window is read: the clock is drand time.
 
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping
@@ -54,8 +56,8 @@ def oldest_of(*sources: Callable[[], float | None]) -> Callable[[], float | None
 
 
 class CorpusPeriodSettler:
-    """Same surface as ``CorpusSettler`` (observe, settle_once, set_cap,
-    settled_count, totals, on_settled, on_window) on the period clock.
+    """The corpus settler (observe, settle_once, set_cap, settled_count,
+    totals, on_settled, on_window), on the period clock.
 
     ``oldest_pending`` is the auditor's ``oldest_pending_received_at``: it
     returns when the oldest undecided submission was received (None if none) and
@@ -63,7 +65,7 @@ class CorpusPeriodSettler:
     its grader's ``oldest_unready_received_at`` (``oldest_of``), so a period
     closes only once everything received in it is graded (ruling P21).
 
-    ``ready(ids)``, as ``CorpusSettler``'s: which of ``ids`` may be paid now
+    ``ready(ids)``: which of ``ids`` may be paid now
     (an episode job's grader answers the graded ones); the others are left
     for a later call, never paid ungraded. None pays every verdict."""
 
@@ -72,8 +74,11 @@ class CorpusPeriodSettler:
                  genesis: Callable[[], float] = _drand_genesis, clock=time.time,
                  slack_seconds: float = ADMISSION_SLACK_SECONDS, on_settled=None,
                  full_list_every_seconds: float | None = None, executor=None,
-                 ready: Callable[[list[str]], Awaitable[set[str]]] | None = None) -> None:
+                 ready: Callable[[list[str]], Awaitable[set[str]]] | None = None,
+                 max_price: float | None = None) -> None:
         self._ready = ready
+        # Pool share one verified token may pay at most; None: the cap alone.
+        self._max_price = None if max_price is None else float(max_price)
         self._task_id = task_id
         self._job_id = job_id
         self._cap = float(cap)
@@ -90,10 +95,17 @@ class CorpusPeriodSettler:
         self._fed: dict[str, Mapping] = {}
         self.settled_count: int | None = None
         self.totals: dict | None = None
+        # The last period paid: work_period, verified_tokens, paid (pool share).
+        self.last_period: dict | None = None
+        # Unsettled verdicts by the period they were received in (str key):
+        # verdicts, passed, verified_tokens; None before a pass has read them.
+        # What the public pay estimate projects the current period from.
+        self.open_periods: dict[str, dict] | None = None
+        self.open_periods_at: float | None = None
         self.on_settled = on_settled
         self.on_window = None
 
-    # -- the feed, as CorpusSettler ------------------------------------------
+    # -- the feed ---------------------------------------------------------------
 
     def observe(self, submission_id: str, verdict=None) -> None:
         self._unsettled.add(submission_id)
@@ -102,6 +114,37 @@ class CorpusPeriodSettler:
 
     def set_cap(self, cap: float) -> None:
         self._cap = float(cap)
+
+    def set_max_price(self, price: float | None) -> None:
+        self._max_price = None if price is None else float(price)
+
+    def undecided_since(self) -> dict:
+        """When the oldest submission still undecided was received: what holds
+        the close of every period from its own. ``known`` is False while the
+        auditor (or grader) cannot tell, or holds an arrival it cannot read."""
+        try:
+            at = self._oldest_pending()
+        except LookupError:
+            return {"known": False, "at": None}
+        if at is None:
+            return {"known": True, "at": None}
+        if not math.isfinite(float(at)):
+            return {"known": False, "at": None}
+        return {"known": True, "at": float(at)}
+
+    def _count_open(self, ids, verdicts, voided, genesis: float) -> None:
+        counts: dict[str, dict] = {}
+        for sid in ids:
+            verdict = verdicts.get(sid)
+            if verdict is None:
+                continue
+            row = counts.setdefault(str(self._work_period(verdict, genesis)),
+                                    {"verdicts": 0, "passed": 0, "verified_tokens": 0})
+            row["verdicts"] += 1
+            if verdict.get("passed") and sid not in voided:
+                row["passed"] += 1
+                row["verified_tokens"] += int(verdict.get("token_count") or 0)
+        self.open_periods, self.open_periods_at = counts, self._clock()
 
     async def _off(self, func, *args):
         from reliquary.validator.corpus_judge_threads import run_in
@@ -147,6 +190,12 @@ class CorpusPeriodSettler:
     def _report(self, state: dict, ids) -> None:
         self.settled_count = len(state["settled"] or ())
         self.totals = state.get("totals")
+        paid = state.get("period_paid") or {}
+        if paid:
+            last = max(paid, key=int)
+            self.last_period = {
+                "work_period": int(last), "paid": float(paid[last]),
+                "verified_tokens": int((state.get("period_tokens") or {}).get(last, 0))}
         if self.on_settled is not None and ids:
             self.on_settled(list(ids))
 
@@ -159,11 +208,24 @@ class CorpusPeriodSettler:
                 + sum(int(v["token_count"]) for v in passed)}
 
     def _archive(self, pending: dict) -> dict:
-        return {"schema": PERIOD_ARCHIVE_SCHEMA, "task_id": self._task_id,
-                "job_id": self._job_id, "mechanism": "corpus-generation",
-                "work_period": pending["work_period"], "entry_period": pending["entry_period"],
-                "rewards_by_hotkey": dict(pending["rewards"]),
-                "tokens": pending["tokens"], "verdicts": len(pending["ids"])}
+        document = {"schema": PERIOD_ARCHIVE_SCHEMA, "task_id": self._task_id,
+                    "job_id": self._job_id, "mechanism": "corpus-generation",
+                    "work_period": pending["work_period"],
+                    "entry_period": pending["entry_period"],
+                    "rewards_by_hotkey": dict(pending["rewards"]),
+                    "tokens": pending["tokens"], "verdicts": len(pending["ids"])}
+        if "cap" in pending:
+            # The cap this period was paid under: the weight setter pays the
+            # archive up to it whatever the registry's cap is by then, so
+            # lowering the cap never cuts pay already earned. A pending
+            # archive recorded by an older binary has none, and is written
+            # exactly as it would have been.
+            document["cap"] = pending["cap"]
+        if pending.get("max_price") is not None:
+            # Audit only: the weight setter pays the rewards as written.
+            document["max_price_per_token"] = pending["max_price"]
+            document["budget"] = pending["budget"]
+        return document
 
     async def _entry(self, work: int, due: int) -> int:
         """Where a new archive of ``work`` enters: from ``due`` on, beside at
@@ -194,6 +256,10 @@ class CorpusPeriodSettler:
                          str(pending["work_period"]): pending["period_tokens"]}
         final = {**state, "settled": await self._off(_union, state.get("settled"), pending["ids"]),
                  "pending": None, "totals": pending["totals"], "period_tokens": period_tokens}
+        if "period_paid" in pending:
+            # A pending recorded by an older binary has none: left unknown.
+            final["period_paid"] = {**(state.get("period_paid") or {}),
+                                    str(pending["work_period"]): pending["period_paid"]}
         await self._records.write_settlement(self._job_id, final, etag)
         self._report(final, pending["ids"])
         if self.on_window is not None:
@@ -225,6 +291,7 @@ class CorpusPeriodSettler:
         settled = await self._off(set, state["settled"])
         new_ids = await self._verdict_ids(settled)
         if not new_ids:
+            self.open_periods, self.open_periods_at = {}, self._clock()
             return None
         try:
             oldest = self._oldest_pending()
@@ -236,6 +303,7 @@ class CorpusPeriodSettler:
             payable = await self._ready(new_ids)
             new_ids = [sid for sid in new_ids if sid in payable]
             if not new_ids:
+                self.open_periods, self.open_periods_at = {}, self._clock()
                 return None
         genesis = self._genesis()
         now = self._clock()
@@ -248,6 +316,7 @@ class CorpusPeriodSettler:
         verdicts = await self._verdicts(new_ids)
         lister = getattr(self._records, "list_voided_ids", None)
         voided = set(await lister(self._job_id)) if lister is not None else set()
+        self._count_open(new_ids, verdicts, voided, genesis)
         by_period: dict[int, list[str]] = defaultdict(list)
         for sid in new_ids:
             verdict = verdicts.get(sid)
@@ -264,12 +333,14 @@ class CorpusPeriodSettler:
             new_tokens = sum(int(v["token_count"]) for v in batch if v.get("passed"))
             earlier = int((state.get("period_tokens") or {}).get(str(period), 0))
             totals = self._add(state["totals"], batch)
-            if new_tokens <= 0:
-                # Nothing payable (spec: that period's cap burns); never reconsidered.
+            if new_tokens <= 0 or self._cap <= 0:
+                # Nothing payable (spec: that period's cap burns), or a cap of 0:
+                # the task is closed to new pay. Never reconsidered.
                 state = {**state, "settled": await self._off(_union, state["settled"], ids),
                          "totals": totals}
                 etag = await self._records.write_settlement(self._job_id, state, etag)
                 self._report(state, ids)
+                self.open_periods.pop(str(period), None)
                 continue
             if earlier:
                 # A verdict for a period already paid: its close missed it (it
@@ -277,24 +348,68 @@ class CorpusPeriodSettler:
                 # period pays slightly over its cap; loud, never silent.
                 logger.error("corpus task %s: %d late verdict(s) for settled period %d",
                              self._task_id, len(ids), period)
-            share = rewards_for(batch, self._cap * new_tokens / (earlier + new_tokens))
+            paid_before = (state.get("period_paid") or {}).get(str(period))
+            # Unknown earlier pay (an older binary's) is taken as the full cap
+            # it paid then.
+            already = float(paid_before) if paid_before is not None else (
+                self._cap if earlier else 0.0)
+            if self._max_price is None:
+                pool = self._cap * new_tokens / (earlier + new_tokens)
+            else:
+                # The whole period never pays past min(cap, price x its tokens),
+                # whatever was paid for it earlier.
+                budget = cp.period_budget(self._cap, self._max_price, earlier + new_tokens)
+                pool = max(0.0, budget - already)
+            if pool <= 0:
+                logger.error("corpus task %s: period %d already paid its budget; %d late "
+                             "verdict(s) paid nothing", self._task_id, period, len(ids))
+                state = {**state, "settled": await self._off(_union, state["settled"], ids),
+                         "totals": totals}
+                etag = await self._records.write_settlement(self._job_id, state, etag)
+                self._report(state, ids)
+                self.open_periods.pop(str(period), None)
+                continue
+            share = rewards_for(batch, pool)
             # At most CATCHUP_ENTRIES archives per entry period: a backlog settled
             # at once is paid back over a few periods, in full (the weight setter
             # bounds a task at that many caps), instead of queueing one per period
             # ahead of every later period's pay.
             entry = await self._entry(period, cp.period_of(now, genesis) + 1)
             state = {**state, "last_entry": entry, "pending": {
-                "work_period": period, "entry_period": entry,
+                "work_period": period, "entry_period": entry, "cap": self._cap,
                 "ids": ids, "rewards": share, "tokens": new_tokens, "totals": totals,
-                "period_tokens": earlier + new_tokens}}
+                "period_tokens": earlier + new_tokens,
+                "period_paid": already + pool}}
+            if self._max_price is not None:
+                state["pending"].update(max_price=self._max_price, budget=budget)
             etag = await self._records.write_settlement(self._job_id, state, etag)
             last = await self._finish(state, etag)
+            self.open_periods.pop(str(period), None)
             state, etag = await self._records.read_settlement(self._job_id)
         return last
 
 
+def apply_max_price(wiring, entry) -> None:
+    """The registry's price ceiling of ``entry``, applied to its wiring's
+    settler when it changed (``wiring.price`` keeps it for the status)."""
+    view = cp.price_view(entry.params)
+    if not hasattr(wiring, "price"):
+        # Wired with the entry it was read from: its settler holds that price.
+        wiring.price = cp.price_view(getattr(getattr(wiring, "entry", None), "params", None))
+    if view == wiring.price:
+        return
+    logger.info("corpus task %s max price %s -> %s alpha per million tokens", entry.task_id,
+                (wiring.price or {}).get("max_price_alpha_per_mtoken"),
+                (view or {}).get("max_price_alpha_per_mtoken"))
+    wiring.price = view
+    setter = getattr(wiring.settler, "set_max_price", None)
+    if setter is not None:
+        setter(cp.max_price(entry.params))
+
+
 __all__ = [
     "ADMISSION_SLACK_SECONDS",
+    "apply_max_price",
     "CorpusPeriodSettler",
     "PERIOD_ARCHIVE_SCHEMA",
     "PERIOD_SETTLEMENT_SCHEMA",

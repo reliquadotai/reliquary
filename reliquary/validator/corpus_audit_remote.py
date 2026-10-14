@@ -66,6 +66,9 @@ REGISTRY_REFRESH_SECONDS = 30.0
 # Leases one executor may hold at once, and lease expiries in a row that quarantine it.
 MAX_LEASES_PER_EXECUTOR = 2
 LEASE_EXPIRY_STRIKES = 3
+# Leases expired in a row bench their executor this long: no lease, its past
+# results standing. A box that died or fell behind is not a liar (ruling P26).
+EXPIRY_BENCH_SECONDS = 1800.0
 # A batch no executor claimed within this long is scored locally.
 QUEUE_WAIT_SECONDS = 60.0
 # Remote attempts at one batch before the control scores it itself.
@@ -274,6 +277,8 @@ class ExecutorLeases(DurableAttempts):
         self._listeners: list[Callable[[str], Awaitable[Any]]] = []
         self._background: set[asyncio.Task] = set()
         self.quarantined: set[str] = set()
+        # Executor -> until when it is benched for expired leases.
+        self._benched: dict[str, float] = {}
         self.stats = collections.Counter()
 
     def subscribe(self, listener: Callable[[str], Awaitable[Any]]) -> None:
@@ -284,7 +289,7 @@ class ExecutorLeases(DurableAttempts):
         now = self._clock()
         return [eid for eid, seen in self._seen.items()
                 if now - seen <= self._live and self._directory.is_authorized(eid)
-                and eid not in self.quarantined]
+                and eid not in self.quarantined and not self._is_benched(eid)]
 
     def connected(self) -> bool:
         return bool(self._live_executors())
@@ -311,9 +316,23 @@ class ExecutorLeases(DurableAttempts):
         raise NotImplementedError
 
     def _strike(self, executor_id: str) -> bool:
-        """One more strike; True when it reaches the quarantine limit."""
+        """One more strike; True when it reaches the limit."""
         self._strikes[executor_id] += 1
         return self._strikes[executor_id] >= self._strikes_limit
+
+    def _is_benched(self, executor_id: str) -> bool:
+        until = self._benched.get(executor_id)
+        return until is not None and self._clock() < until
+
+    def _bench(self, executor_id: str, reason: str) -> None:
+        """Leases expired in a row: no new lease for ``EXPIRY_BENCH_SECONDS``.
+        Never a quarantine: an expiry says the box died or fell behind, not that
+        anything it returned was wrong, so nothing it computed is redone."""
+        self._strikes[executor_id] = 0
+        self._benched[executor_id] = self._clock() + EXPIRY_BENCH_SECONDS
+        self.stats["benched"] += 1
+        logger.warning("%s %s benched for %.0f s: %s; its past results stand", self.kind,
+                       executor_id, EXPIRY_BENCH_SECONDS, reason)
 
     async def _expire_leases(self) -> None:
         async with self._attempt_lock:
@@ -330,8 +349,8 @@ class ExecutorLeases(DurableAttempts):
                 self._take_back(lease, expired=True)
                 self._attempt_changed(lease.work, "expired", error=[410, "lease_expired"])
                 if self._strike(lease.executor_id):
-                    await self.quarantine(lease.executor_id,
-                                          f"{self._strikes_limit} leases expired in a row")
+                    self._bench(lease.executor_id,
+                                f"{self._strikes_limit} leases expired in a row")
 
     def _on_quarantined(self, executor_id: str) -> None:
         """Called synchronously as an executor is quarantined, before any await:
@@ -501,7 +520,7 @@ class RemoteAuditDispatcher(ExecutorLeases):
     def claim(self, executor_id: str, protocols=(AUDIT_PROTOCOL,)) -> dict | None:
         self._contact(executor_id)
         self._protocols[executor_id] = tuple(protocols)
-        if self._held(executor_id) >= self._max_leases:
+        if self._is_benched(executor_id) or self._held(executor_id) >= self._max_leases:
             return None
         skipped: list[_Work] = []
         lease_doc = None
@@ -701,6 +720,7 @@ def build_audit_executor_router(dispatcher: RemoteAuditDispatcher,
 
 __all__ = [
     "AUDIT_LEASE_SECONDS",
+    "EXPIRY_BENCH_SECONDS",
     "LEASE_EXPIRY_STRIKES",
     "MAX_LEASES_PER_EXECUTOR",
     "RECHECK_EXP_DRIFT",

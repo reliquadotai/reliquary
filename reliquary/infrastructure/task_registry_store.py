@@ -15,6 +15,7 @@ from collections.abc import Mapping
 
 from reliquary.infrastructure.storage import get_s3_client
 from reliquary.shared.task_registry import (
+    KEEP,
     TaskEntry,
     MECHANISM_CORPUS_GENERATION,
     RegistryError,
@@ -245,7 +246,7 @@ async def set_task_admission(task_id: str, admission: str, *, attempts: int = 5,
 
 async def set_task_cap(
     task_id: str,
-    cap: float,
+    cap: float | None,
     *,
     floor: float | None = None,
     min_incentive_share: float | None = None,
@@ -256,6 +257,7 @@ async def set_task_cap(
     audit_ban_after_failures: int | None = None,
     audit_ban_window_seconds: float | None = None,
     audit_ban_seconds: float | None = None,
+    token_price=KEEP,
     attempts: int = 5,
     guard=None,
     **client_kwargs,
@@ -267,6 +269,7 @@ async def set_task_cap(
             e, task_id, cap, floor, min_incentive_share, audit_q,
             audit_probation_submissions, audit_hold_seconds, audit_suspect_seconds,
             audit_ban_after_failures, audit_ban_window_seconds, audit_ban_seconds,
+            token_price=token_price,
         ), guard),
         attempts=attempts,
         **client_kwargs,

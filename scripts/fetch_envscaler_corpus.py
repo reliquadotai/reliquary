@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Rebuild the ``envscaler_tools_v1`` corpus from its pinned upstream release.
+"""Rebuild the EnvScaler corpus from its pinned upstream release.
+
+``envscaler_tools_v1`` reads ``env_meta.json`` and ``rl_scen.json``;
+``envscaler_tools_v2`` reads those and ``sft_scen.json`` (EnvScaler-SFT-Scenario:
+4,684 tasks over the 140 ``_sft`` worlds, no checks), which v1 ignores.
 
 The 2026-09-02 feasibility measurement ran against a loose directory that no
 longer exists, pinned only by the sha256 of its two files. Those bytes are
@@ -26,8 +30,8 @@ import json
 from pathlib import Path
 import sys
 
-# Two datasets, each pinned to the revision the digests below were taken at.
-# Both files were uploaded on 2026-01-09 and never rewritten; the later
+# Three datasets, each pinned to the revision the digests below were taken at.
+# Every file was uploaded on 2026-01-09 and never rewritten; the later
 # upstream commits touch README.md only.
 SOURCES = {
     "env_meta.json": {
@@ -54,6 +58,17 @@ SOURCES = {
         "decode": ("init_config",),
         "expected_length": 2550,
     },
+    "sft_scen.json": {
+        "repo_id": "XXHStudyHard/EnvScaler-SFT-Scenario",
+        "revision": "bf3bf8656541dfc82eae8672b9fcf76f32d4ab05",
+        "filename": "envscaler_sft_scenario_metadata.json",
+        "sha256": (
+            "5295a5c0e79c4c412f022952f6aace2f"
+            "6e33f0a6d89fe453dfc5f58aa903e13f"
+        ),
+        "decode": ("init_config",),
+        "expected_length": 4684,
+    },
 }
 
 # sha256 of what this script writes. Canonical serialisation makes these
@@ -66,6 +81,10 @@ NORMALIZED_SHA256 = {
     "rl_scen.json": (
         "a953b969366d0ad0dc6e5262084fc7d4"
         "6b6cefb992bd02ac5083fec537622e06"
+    ),
+    "sft_scen.json": (
+        "f3af68f6a1f50c6ff7be6fba9d605dcd"
+        "9dfdf1a80b4d14d61f5a08d4bd484e0e"
     ),
 }
 
@@ -144,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--out", type=Path, required=True,
-        help="directory to write env_meta.json and rl_scen.json into",
+        help="directory to write env_meta.json, rl_scen.json and sft_scen.json into",
     )
     parser.add_argument(
         "--allow-digest-drift", action="store_true",

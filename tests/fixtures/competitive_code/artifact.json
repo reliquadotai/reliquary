@@ -1,0 +1,39 @@
+{
+  "schema": "reliquary/environment-artifact/v1",
+  "environment": "reliquary_competitive_code_v1",
+  "contract": "reliquary/stdio-program/v1",
+  "distribution": {
+    "name": "reliquary-competitive-code",
+    "version": "0.1.0a1"
+  },
+  "entrypoints": {
+    "taskset": "reliquary_competitive_code:CompetitiveCodeTaskset",
+    "replay": "reliquary_competitive_code.environment:CompetitiveCodeEnvironment"
+  },
+  "source_manifest_sha256": "85fb98558f14136bc39c2b742f943f2c4f1bcfe48471c36f82e475f9d9ab1644",
+  "files": {
+    "reliquary_competitive_code/__init__.py": "a6021fbf242435a8b0f697eaab26be26908f1e41b3a9b726b5c0f4a70abe1981",
+    "reliquary_competitive_code/build/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reliquary_competitive_code/build/__main__.py": "310f0f562ac90f5d7a7935b929c0a62c690178050683efe7d3cd038b3df6c48c",
+    "reliquary_competitive_code/build/dedup.py": "dddf2923bfacdf0752394954e6dd91f413612aba2018ac20518912aa3daff9f2",
+    "reliquary_competitive_code/build/fetch.py": "a6c97dfb96836e833171a8ca2d3d57dad45e6e012f0aec944e37a5a244b4bdd6",
+    "reliquary_competitive_code/build/filters.py": "9f4f05fb8c4be2bf42b6ec627510d7c12374ecbaf043bc64212be8ee5db394f1",
+    "reliquary_competitive_code/build/io.py": "5be8186330ebd671df724717c088fc713655045de58d56e95bffc17459b57bd3",
+    "reliquary_competitive_code/build/pipeline.py": "d92b7e2749a5e6204fa20aeca57a5e75a3e6c55b96c778913ca233af1e9ae829",
+    "reliquary_competitive_code/build/validate.py": "283212ae291200cf9cfc47feca22b48c7ddb81587431df50be9eea219d0cc12d",
+    "reliquary_competitive_code/corpus.py": "00de2f25d292d5a5b2ca105ec4f6e1f6b14e05a08d2ff6d07ac0e66b8bcd8e2f",
+    "reliquary_competitive_code/environment.py": "afa7dc87568f4540bcef99a764e03e5dd34ae72f339355beb0298e71c65a6664",
+    "reliquary_competitive_code/extraction.py": "5c72b1c6405dddefd3b0f8855520b9da6908fb5e232c197507a8ed0423f12568",
+    "reliquary_competitive_code/goldens/discrimination.jsonl": "0e1b5fa66079faeb51acb590bd0bbacf555291ae7f77dcf7a74aa53a5d2b35d9",
+    "reliquary_competitive_code/goldens/reference.jsonl": "a771a15b03b6f3cdf8059df2cad6fb6b4b15e67a27957974545b01aad0fbfbdf",
+    "reliquary_competitive_code/judge/__init__.py": "184000ea6bd9d5dd76af589a774dc52b7a8246b044304a33a7d017412a517fda",
+    "reliquary_competitive_code/judge/compare.py": "9e25755ac617632d4aa580ae8fd94b46aa1258a0c478731cf17d029b3832b221",
+    "reliquary_competitive_code/judge/guest.py": "d0da66867fe650111396a11c336f0ef58778d48e3c91b64a131d2d4c0416a3fc",
+    "reliquary_competitive_code/judge/runner.py": "11324a4e90a12b99ec484c7bc41a171a53a0df093d4a38608e52857d8c87e901",
+    "reliquary_competitive_code/layout.py": "0d06ede7c0f6217d59a9a00d70b335849f3c48f0658b37d349ad078f08d63179",
+    "reliquary_competitive_code/sources/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "reliquary_competitive_code/sources/common.py": "736a35c3b6f126030e389529a56f488cf949b94baf1e2cc140c3df2b3e5a98dd",
+    "reliquary_competitive_code/sources/deepcoder.py": "e3f138741c2b9bd232815c5d68d38aaf29b185471e4ccb9ea785dc369a7e0d93",
+    "reliquary_competitive_code/taskset.py": "2179f7e85a5042f1d938941aeae04e64d2855a9f1d7bf27a01faa218262a52e7"
+  }
+}

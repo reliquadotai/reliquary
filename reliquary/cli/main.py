@@ -317,6 +317,12 @@ def build_corpus_task_entry(
     # none unless told to.
     if audit_params:
         params.update(audit_params)
+    # Outside the contract: how the task is paid, not how it generates. Every
+    # corpus task is paid by its own drand periods (design 2026-10-03); the
+    # window settlement is gone for corpus work.
+    from reliquary.shared.task_registry import SETTLEMENT_PERIOD_EMA
+
+    params["settlement"] = SETTLEMENT_PERIOD_EMA
     contract = _with_enforced_toploc(entry.contract, toploc_thresholds)
     return replace(
         entry,
@@ -705,10 +711,25 @@ def tasks_list() -> None:
 @tasks_app.command("set-cap")
 def tasks_set_cap(
     task_id: str = typer.Option(..., "--task-id"),
-    cap: float = typer.Option(..., "--cap", help="The task's new share of the pool"),
+    cap: float = typer.Option(
+        None, "--cap", help="The task's new share of the pool; omitted, the cap is kept",
+    ),
     floor: float = typer.Option(
         None, "--floor",
         help="New price floor; omitted, an RL task keeps its floor and a corpus task's follows the cap",
+    ),
+    max_price_alpha_per_mtoken: float = typer.Option(
+        None, "--max-price-alpha-per-mtoken",
+        help="Period corpus task: the most a period pays per million verified tokens, in "
+             "alpha; a period pays min(cap, price x tokens), the rest burns",
+    ),
+    miner_emission_alpha_per_day: float = typer.Option(
+        None, "--miner-emission-alpha-per-day",
+        help="Miner alpha emitted per day, to convert the price to a pool share; "
+             "omitted, read on-chain (alpha out per block, less the owner cut, halved)",
+    ),
+    clear_max_price: bool = typer.Option(
+        False, "--clear-max-price", help="Remove the task's price ceiling: the cap alone",
     ),
     min_incentive_share: float = typer.Option(
         None, "--min-incentive-share",
@@ -743,10 +764,34 @@ def tasks_set_cap(
         help="How long a ban lasts",
     ),
 ) -> None:
-    """Change a live task's cap; its contract and digest are untouched."""
+    """Change a live task's cap or price ceiling; its contract and digest are untouched."""
     from reliquary.infrastructure import task_registry_store as store
     from reliquary.shared.task_registry import RegistryError
 
+    priced = {}
+    if clear_max_price and max_price_alpha_per_mtoken is not None:
+        typer.echo("error: --clear-max-price and --max-price-alpha-per-mtoken conflict", err=True)
+        raise typer.Exit(code=1)
+    if miner_emission_alpha_per_day is not None and max_price_alpha_per_mtoken is None:
+        typer.echo("error: --miner-emission-alpha-per-day converts --max-price-alpha-per-mtoken",
+                   err=True)
+        raise typer.Exit(code=1)
+    if clear_max_price:
+        priced = {"token_price": None}
+    elif max_price_alpha_per_mtoken is not None:
+        try:
+            token_price, source = _token_price(max_price_alpha_per_mtoken,
+                                               miner_emission_alpha_per_day)
+        except ValueError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+        priced = {"token_price": token_price}
+    if cap is None and not priced and all(v is None for v in (
+            floor, min_incentive_share, audit_q, audit_probation_submissions,
+            audit_hold_seconds, audit_suspect_seconds, audit_ban_after_failures,
+            audit_ban_window_seconds, audit_ban_seconds)):
+        typer.echo("error: nothing to change: give --cap or a price option", err=True)
+        raise typer.Exit(code=1)
     try:
         asyncio.run(store.set_task_cap(
             task_id, cap, floor=floor, min_incentive_share=min_incentive_share, audit_q=audit_q,
@@ -756,11 +801,59 @@ def tasks_set_cap(
             audit_ban_after_failures=audit_ban_after_failures,
             audit_ban_window_seconds=audit_ban_window_seconds,
             audit_ban_seconds=audit_ban_seconds,
+            **priced,
         ))
     except (RegistryError, store.RegistryConflict) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
-    typer.echo(f"task {task_id} now has cap {cap}" + (f" and floor {floor}" if floor is not None else ""))
+    if cap is not None:
+        typer.echo(f"task {task_id} now has cap {cap}"
+                   + (f" and floor {floor}" if floor is not None else ""))
+    if clear_max_price:
+        typer.echo(f"task {task_id} has no price ceiling: each period pays its cap")
+    elif priced:
+        typer.echo(_describe_token_price(task_id, priced["token_price"], source))
+
+
+def _token_price(alpha_per_mtoken: float, miner_alpha_per_day: float | None):
+    """The registry params of a price ceiling, and where the miner emission
+    that converts it came from (the flag, or the chain now)."""
+    import time
+
+    from reliquary.validator import corpus_periods as cp
+
+    blocks = cp.PERIOD_SECONDS / 12.0
+    if miner_alpha_per_day is not None:
+        emission = float(miner_alpha_per_day) * cp.PERIOD_SECONDS / 86400.0
+        source = f"{miner_alpha_per_day} miner alpha per day (given)"
+    else:
+        read = asyncio.run(_read_miner_emission())
+        emission = read["miner_alpha_per_block"] * blocks
+        source = (f"on-chain netuid {read['netuid']}: alpha out {read['alpha_out_per_block']:.6f}"
+                  f"/block, owner cut {read['owner_cut']:.4f}")
+    return cp.price_params(alpha_per_mtoken, emission, time.time()), source
+
+
+async def _read_miner_emission() -> dict:
+    from reliquary.infrastructure.chain import close_subtensor, get_subtensor, miner_alpha_per_block
+
+    subtensor = await get_subtensor()
+    try:
+        return await miner_alpha_per_block(subtensor)
+    finally:
+        await close_subtensor(subtensor)
+
+
+def _describe_token_price(task_id: str, params, source: str) -> str:
+    from reliquary.validator import corpus_periods as cp
+
+    price = params[cp.MAX_PRICE_PARAM]
+    emission = params[cp.MAX_PRICE_EMISSION_PARAM]
+    return (f"task {task_id} max price {params[cp.MAX_PRICE_ALPHA_PARAM]} alpha per million "
+            f"verified tokens = {price:.6g} pool share per token "
+            f"({emission:.4f} miner alpha per {cp.PERIOD_SECONDS} s period; {source}); "
+            f"a period pays its whole cap from {0.01 / price / 1e6:.4g} M verified "
+            f"tokens per 0.01 of cap")
 
 
 def _task_admission(task_id: str, admission: str) -> None:
@@ -804,17 +897,18 @@ def tasks_retire(
 def tasks_close(
     task_id: str = typer.Option(..., "--task-id"),
     cut_tail: bool = typer.Option(
-        False, "--cut-tail",
-        help="A task settled by RL window: stop paying its frozen tail now",
+        False, "--cut-tail", hidden=True,
+        help="Accepted and ignored: a window-settled corpus task is no longer paid",
     ),
 ) -> None:
-    """Close a finished corpus task: cap 0 and retired, so it pays nothing more
-    and its share of the pool is free. Refused while its job is not drained, or
-    while a period-settled task still pays what it earned."""
+    """Close a finished corpus task: cap 0 and retired, so it is paid nothing
+    new and its share of the pool is free; what it already earned keeps being
+    paid until its tail runs out. Refused while its job is not drained."""
     from reliquary.validator.corpus_close import TaskNotClosable, close_task
 
+    del cut_tail  # corpus window archives are no longer paid: no tail to cut
     try:
-        message = asyncio.run(close_task(task_id, cut_tail=cut_tail))
+        message = asyncio.run(close_task(task_id))
     except TaskNotClosable as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -1038,7 +1132,7 @@ def build_job_manifest(
 def _corpus_base_profile(
     *, task_id, from_profile, model, model_revision, model_architecture,
     prompt_encoding, renderer_id, prompt_source, external_eval=False,
-    agentic=False,
+    agentic=False, suite_episode=None,
 ):
     """The profile a corpus job's contract is built from: the named template, or
     one composed from the model, the ``corpus-v1`` run policy and the catalog."""
@@ -1058,6 +1152,16 @@ def _corpus_base_profile(
         prompt_encoding = (
             "chat_template" if renderer_id in CHAT_TEMPLATE_RENDERERS else "raw"
         )
+    from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
+
+    catalog = ENVIRONMENT_CATALOG
+    if suite_episode is not None and prompt_source not in catalog:
+        # A suite environment no RL profile declares yet (so no catalog
+        # entry): its body is stated from the registry spec and the job's own
+        # episode bounds, and checked against the spec like any catalog body.
+        from reliquary.protocol.agentic_source import suite_episode_body
+
+        catalog = {**catalog, prompt_source: suite_episode_body(prompt_source, suite_episode)}
     # No environment overrides: two jobs on one source must carry one body to merge.
     return compose_profile(
         profile_id=normalise_task_id(task_id),
@@ -1066,6 +1170,7 @@ def _corpus_base_profile(
         environments=[prompt_source],
         external_eval=external_eval,
         agentic=agentic,
+        catalog=catalog,
     )
 
 
@@ -1092,6 +1197,8 @@ def prepare_corpus_job(
         model_revision=model_revision, model_architecture=model_architecture,
         prompt_encoding=prompt_encoding, renderer_id=renderer_id,
         prompt_source=environment, external_eval=is_eval_source(prompt_source), agentic=episode is not None,
+        suite_episode=(episode if isinstance(episode, dict) and episode.get("harness") == "suite"
+                       else None),
     )
     if max_new_tokens is None:
         # The template or catalog budgets each environment; the length stays
@@ -1337,19 +1444,14 @@ def jobs_create(
     settlement: str = typer.Option(
         "period-ema-v1",
         "--settlement",
-        help="How the task is paid: period-ema-v1 (its own 72-minute drand periods, "
-        "design 2026-10-03) or windows (the RL window index, as tasks declared "
-        "before it). Every validator serving it must know period-ema-v1",
+        help="How the task is paid. Only period-ema-v1 (its own 72-minute drand "
+        "periods, design 2026-10-03): the window settlement was removed for corpus tasks",
     ),
     fleet_knows_period_settlement: bool = typer.Option(
         False,
         "--fleet-knows-period-settlement",
-        help=(
-            "Required with --settlement period-ema-v1 (the default). Confirms that "
-            "the corpus validator serving the job and every weight setter run a "
-            "binary that settles and replays period-ema-v1; an older one settles "
-            "it by window, or does not pay it at all."
-        ),
+        hidden=True,
+        help="Accepted and ignored: every validator now settles period-ema-v1.",
     ),
     fleet_knows_corpus_generation: bool = typer.Option(
         False,
@@ -1370,6 +1472,11 @@ def jobs_create(
         typer.echo(f"error: {task_id or job_id!r} is an order id: only the admin service "
                    "declares order jobs (POST /admin/v1/jobs)", err=True)
         raise typer.Exit(code=2)
+    if settlement != "period-ema-v1":
+        typer.echo(f"error: --settlement {settlement!r} was removed: a corpus task is paid "
+                   "only by period-ema-v1 (its own drand periods); omit --settlement",
+                   err=True)
+        raise typer.Exit(code=1)
     from reliquary.infrastructure import corpus_job_store as job_store
     from reliquary.infrastructure.task_registry_store import (
         RegistryConflict,
@@ -1428,19 +1535,7 @@ def jobs_create(
     except (RegistryError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
-    if settlement not in ("period-ema-v1", "windows"):
-        typer.echo(f"error: --settlement is period-ema-v1 or windows, not {settlement!r}",
-                   err=True)
-        raise typer.Exit(code=1)
-    if settlement == "period-ema-v1" and not fleet_knows_period_settlement:
-        typer.echo("error: a period-ema-v1 job needs every validator to know it: pass "
-                   "--fleet-knows-period-settlement, or --settlement windows", err=True)
-        raise typer.Exit(code=1)
-    if settlement == "period-ema-v1":
-        from dataclasses import replace as _replace
-
-        # Outside the contract: how the task is paid, not how it generates.
-        entry = _replace(entry, params={**entry.params, "settlement": settlement})
+    del fleet_knows_period_settlement  # every validator settles period-ema-v1 now
 
     # Before either write, so a refusal leaves nothing behind. The guard is in
     # `task_registry` and does not know this CLI, so the flag is named here.
@@ -1583,6 +1678,13 @@ def jobs_export(
     allow_incomplete: bool = typer.Option(
         False, "--allow-incomplete",
         help="An episode job: export before the job is drained (the counts file says so)"),
+    dedupe: bool = typer.Option(
+        False, "--dedupe",
+        help="Write a completion once (same token ids), the first copy"),
+    dedupe_against: list[str] = typer.Option(
+        None, "--dedupe-against",
+        help="Repeatable. Leave out a completion already in a passing submission of this "
+             "job (a v1 on the same prompts); implies --dedupe"),
 ) -> None:
     """Write the verified completions of a job as JSON lines.
 
@@ -1592,6 +1694,12 @@ def jobs_export(
     `--allow-incomplete`, and always writes `{out}.counts.json`: drained, what
     was exported and what was left out (ungraded, held, voided, uncertified,
     unparseable...), when, and the quarantined executors it held.
+
+    A single-turn job writes only finished completions (EOS last and, in a
+    thinking render, one `</think>`); `--apply-filter` grades the answer after
+    `</think>` and annotates every row, keeping the wrong ones unless
+    `--only-accepted`. Its counts (left-out completions by reason) go to stderr
+    and `{out}.counts.json` too.
 
     Written to a temporary file beside `--out` and swapped in with
     `os.replace` only once the export completes, so a mid-stream failure (the
@@ -1611,6 +1719,10 @@ def jobs_export(
         episode = job.episode is not None
         if episode and (apply_filter or only_accepted):
             raise typer.BadParameter("an episode job is filtered by its grades: use --sft")
+        if episode and (dedupe or dedupe_against):
+            raise typer.BadParameter("an episode job is not deduplicated by completion")
+        if job_id in (dedupe_against or ()):
+            raise typer.BadParameter("a job cannot be deduplicated against itself")
         if sft and not episode:
             raise typer.BadParameter("--sft is for episode jobs; use --apply-filter")
         if episode:
@@ -1626,24 +1738,49 @@ def jobs_export(
                     "change; pass --allow-incomplete to export what is final so far")
             quarantined = await _quarantined_grade_executors()
 
-            from reliquary.corpus.job import is_signed_sandbox, sandbox_split
+            codec = None
+            if job.episode.is_suite:
+                # Replayed here, with the job's checkpoint tokenizer and the
+                # environment this host has installed (refused if not the pin).
+                from reliquary.corpus.suite_episode import TokenizerCodec, suite_source
+                from reliquary.shared.modeling import load_tokenizer
 
-            signed_job = is_signed_sandbox(job)
-            tokenizer_dir = await asyncio.to_thread(_episode_tokenizer_dir, job)
-            # A replay job renders with the loader's default tools, as it always did.
-            renderer = await asyncio.to_thread(
-                agentic_swe.load_turn_renderer, tokenizer_dir,
-                *((job.episode.sandbox.tools,) if signed_job else ()))
-            source = (agentic_swe.SignedSweSource(sandbox_split(job.episode)) if signed_job
-                      else await asyncio.to_thread(agentic_swe.load_swe_source,
-                                                   job.episode.env.num_images))
+                renderer = None
+                try:
+                    source = await asyncio.to_thread(suite_source, job.episode)
+                except ValueError as exc:
+                    raise typer.BadParameter(str(exc)) from exc
+                codec = TokenizerCodec(await asyncio.to_thread(
+                    load_tokenizer, await asyncio.to_thread(_episode_tokenizer_dir, job)))
+            else:
+                from reliquary.corpus.job import is_signed_sandbox, sandbox_split
+
+                signed_job = is_signed_sandbox(job)
+                tokenizer_dir = await asyncio.to_thread(_episode_tokenizer_dir, job)
+                # A replay job renders with the loader's default tools, as it always did.
+                renderer = await asyncio.to_thread(
+                    agentic_swe.load_turn_renderer, tokenizer_dir,
+                    *((job.episode.sandbox.tools,) if signed_job else ()))
+                source = (agentic_swe.SignedSweSource(sandbox_split(job.episode)) if signed_job
+                          else await asyncio.to_thread(agentic_swe.load_swe_source,
+                                                       job.episode.env.num_images))
             counts: dict = {}
             rows = episode_rows(job=job, records=BucketRecordStore(), renderer=renderer,
                                 source=source, counts=counts, sft_only=sft,
-                                quarantined=quarantined)
+                                quarantined=quarantined, codec=codec)
         else:
             grade = _job_grader(job) if apply_filter else None
-            rows = export_rows(job=job, records=BucketRecordStore(), grade=grade)
+            counts = {}
+            seen = None
+            if dedupe or dedupe_against:
+                from reliquary.corpus.export import job_fingerprints
+
+                for other in dedupe_against or ():
+                    if (await job_store.read_job(other))[0] is None:
+                        raise typer.BadParameter(f"no job {other!r} to dedupe against")
+                seen = await job_fingerprints(BucketRecordStore(), list(dedupe_against or ()))
+            rows = export_rows(job=job, records=BucketRecordStore(), grade=grade, counts=counts,
+                               seen=seen)
         temporary = f"{out}.{os.getpid()}.tmp"
         written = 0
         try:
@@ -1651,7 +1788,8 @@ def jobs_export(
                 async for row in rows:
                     if episode:
                         row = {**row, "messages": json.loads(row["messages"]),
-                               "turns": json.loads(row["turns"])}
+                               "turns": json.loads(row["turns"]),
+                               **({"tools": json.loads(row["tools"])} if "tools" in row else {})}
                     elif only_accepted and not row.get("accepted", True):
                         continue
                     handle.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -1666,6 +1804,17 @@ def jobs_export(
                     "counts": counts, "exported_at": _time.time(),
                     "quarantined_executors": list(quarantined),
                 }
+                side_temporary = f"{out}.counts.json.{os.getpid()}.tmp"
+                with open(side_temporary, "w", encoding="utf-8") as handle:
+                    json.dump(sidecar, handle, sort_keys=True, indent=1)
+                os.replace(side_temporary, f"{out}.counts.json")
+                typer.echo(json.dumps(counts, sort_keys=True), err=True)
+            else:
+                sidecar = {"job_id": job_id, "filter_applied": apply_filter,
+                           "only_accepted": only_accepted, "exported": written,
+                           "dedupe_against": sorted(dedupe_against or ())
+                           if (dedupe or dedupe_against) else None,
+                           "counts": counts, "exported_at": _time.time()}
                 side_temporary = f"{out}.counts.json.{os.getpid()}.tmp"
                 with open(side_temporary, "w", encoding="utf-8") as handle:
                     json.dump(sidecar, handle, sort_keys=True, indent=1)
@@ -2685,11 +2834,13 @@ def corpus_mine_agentic(
         help="Signed-sandbox jobs: live sessions at once for this hotkey on the job (match "
              "the validator's per-job cap, 4 by default)"),
 ) -> None:
-    """Mine an agentic (episode) corpus job: verifiers + reliquary-swe episodes
-    against a local vLLM with per-turn proofs. Replay jobs need Docker and the
-    job's pinned reliquary-swe, verifiers and renderers installed. Signed-sandbox
-    jobs need no Docker: every tool call runs on the validator's sandbox machines
-    (they need `--validator-hotkey` and the reliquary[sandbox-miner] extra)."""
+    """Mine an agentic (episode) corpus job against a local vLLM with per-turn
+    proofs. A SWE replay job (harness bash) runs verifiers + reliquary-swe episodes
+    and needs Docker and the job's pinned reliquary-swe, verifiers and renderers.
+    A signed-sandbox SWE job needs no Docker: every tool call runs on the
+    validator's sandbox machines (it needs `--validator-hotkey` and the
+    reliquary[sandbox-miner] extra). A suite job (harness suite) runs a registered
+    episode environment in process and needs only that environment's pinned wheel."""
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
 
     if TASK_CONTRACT_ENV_VAR not in os.environ:
@@ -2700,13 +2851,13 @@ def corpus_mine_agentic(
 
     from reliquary.corpus.encoding import checkpoint_fingerprint
     from reliquary.corpus.job import parse_job
-    from reliquary.environment.agentic_swe import episode_support_refusal
     from reliquary.miner.agentic_miner import Identity, run_agentic_miner
     from reliquary.miner.corpus_miner import (
         CorpusJobSelectionError,
         HttpCorpusClient,
         submits_scoped,
     )
+    from reliquary.miner.suite_episode import is_suite_episode, suite_support_refusal
     from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
     from reliquary.protocol.signatures import sign_corpus_submission
     from reliquary.shared.modeling import load_tokenizer
@@ -2729,16 +2880,27 @@ def corpus_mine_agentic(
         typer.echo(f"error: job {job.job_id!r} is not an episode job; use `corpus mine`", err=True)
         raise typer.Exit(code=2)
     client.scoped_submit = submits_scoped(job)
-    from reliquary.corpus.job import is_signed_sandbox
-    from reliquary.environment.agentic_swe import sandbox_support_refusal
-
-    signed = is_signed_sandbox(job)
-    refusal = episode_support_refusal(job.episode, need_verifiers=True) or (
-        sandbox_support_refusal(job.episode, need_bridge=True) if signed else None)
-    if refusal:
-        typer.echo(f"error: {refusal}", err=True)
-        raise typer.Exit(code=4)
     sessions = None
+    signed = False
+    if is_suite_episode(job.episode):
+        # No verifiers, Docker or network: only the pinned environment wheel.
+        refusal = suite_support_refusal(job.episode)
+        if refusal:
+            typer.echo(f"error: refusing to mine: {refusal}", err=True)
+            raise typer.Exit(code=4)
+    else:
+        from reliquary.corpus.job import is_signed_sandbox
+        from reliquary.environment.agentic_swe import (
+            episode_support_refusal,
+            sandbox_support_refusal,
+        )
+
+        signed = is_signed_sandbox(job)
+        refusal = episode_support_refusal(job.episode, need_verifiers=True) or (
+            sandbox_support_refusal(job.episode, need_bridge=True) if signed else None)
+        if refusal:
+            typer.echo(f"error: {refusal}", err=True)
+            raise typer.Exit(code=4)
     if signed:
         from reliquary.miner.signed_episode import HttpSandboxSessions
 
@@ -2752,7 +2914,7 @@ def corpus_mine_agentic(
         except ValueError as exc:
             typer.echo(f"error: {exc}", err=True)
             raise typer.Exit(code=2) from exc
-    else:
+    elif not is_suite_episode(job.episode):
         from reliquary.miner.agentic_miner import docker_storage_warning
 
         warning = docker_storage_warning()

@@ -75,6 +75,74 @@ CORPUS_RANGES: tuple[UsedRange, ...] = (
     UsedRange("corpus", "reliquary_hard_math_v1", "train", 0, 15_749, "hard-math-qwen38-27b-v2"),
 )
 
+# reliquary_telecom_solo_v2 0.2.0a1 (reliquary-environments c72f918) lays
+# train out SFT first then RL, as its environment.toml `[data]` declares
+# (train_sft_start/count, train_rl_start/count; the package's
+# `layout.use_range`), as (start, count). Its 134 tau2-bench benchmark tickets
+# are a split of their own, `benchmark`, never train.
+TELECOM_SOLO_V2_SFT = (0, 1220)
+TELECOM_SOLO_V2_RL = (1220, 493)
+
+# Rows a source keeps for RL alone: no corpus job may take them, whatever it
+# declares. reliquary_competitive_code_v1 shares train by problem identity
+# (the package's `layout.use_of`), SFT first then RL, as its environment.toml
+# `[data]` declares: SFT [0, 4181), RL [4181, 6899).
+#
+# envscaler_tools_v2 splits by world: its RL worlds' scenarios are [0, 1296),
+# restated from `envscaler_tools_v2.environment.RL_RANGE` (a test holds the
+# two equal).
+RL_ONLY_RANGES: tuple[UsedRange, ...] = (
+    UsedRange("rl", "reliquary_competitive_code_v1", "train", 4181, 2718,
+              "competitive-code RL share"),
+    UsedRange("rl", "reliquary_telecom_solo_v2", "train", *TELECOM_SOLO_V2_RL,
+              "telecom v2 RL share"),
+    UsedRange("rl", "envscaler_tools_v2", "train", 0, 1296,
+              "envscaler RL worlds"),
+)
+
+# Sources a corpus job may take only part of: its range must lie inside ONE of
+# these. reliquary_general_v1 lays train out as (block, thinking mode)
+# segments, each opening with its single-turn rows (one user message, no
+# tools, no system message). Stage A serves those rows of chat, safety, ifeval
+# and structured, one segment per job (one renderer); multi-turn, tool and
+# task-system rows, clarification and identity wait for stage B, which renders
+# messages and tools. Counts from the package's `segments()` at
+# ReliquaryForge/general-prompts-curated@02b3ef7a.
+#
+# An empty tuple serves no corpus job: reliquary_telecom_solo_v1's train split
+# still holds the benchmark tickets, so telecom is distilled from v2's SFT
+# share only.
+CORPUS_SERVABLE_RANGES: dict[str, tuple[UsedRange, ...]] = {
+    "reliquary_telecom_solo_v1": (),
+    "reliquary_telecom_solo_v2": (
+        UsedRange("corpus", "reliquary_telecom_solo_v2", "train", *TELECOM_SOLO_V2_SFT,
+                  "telecom v2 SFT share"),
+    ),
+    "reliquary_general_v1": tuple(
+        UsedRange("corpus", "reliquary_general_v1", "train", start, stop - start,
+                  f"{segment} single-turn (stage A)")
+        for segment, start, stop in (
+            ("chat/direct", 0, 30_141),
+            ("chat/thinking", 30_141, 51_965),
+            ("ifeval/direct", 66_291, 70_971),
+            ("ifeval/thinking", 71_720, 82_808),
+            ("structured/direct", 84_587, 86_967),
+            ("structured/thinking", 87_540, 93_067),
+            ("safety/direct", 94_476, 101_778),
+            ("safety/thinking", 101_778, 107_165),
+        )
+    ),
+    # `SFT_CORPUS_RANGE`, restated from `envscaler_tools_v2.environment`: the
+    # graded scenarios of the 12 SFT worlds kept for the corpus. The whole
+    # graded SFT range [1296, 2546) (25 worlds, 13 of which a 27B policy
+    # almost never wins) and the ungraded range [2546, 7225)
+    # (EnvScaler-SFT-Scenario, no checks) are held in reserve.
+    "envscaler_tools_v2": (
+        UsedRange("corpus", "envscaler_tools_v2", "train", 7225, 600,
+                  "SFT worlds kept for the corpus, graded"),
+    ),
+}
+
 _CODE_LENGTH = 2_481_806
 _CODE_HELD_OUT = 100_000
 
@@ -153,6 +221,16 @@ SOURCE_LINEAGE: dict[str, tuple[str, str]] = {
     "reliquary_logic_v2": ("reliquary-logic-generator-v2", "reliquary_logic_v2"),
     "reliquary_instruction_following_v1": ("nvidia/Nemotron-Cascade-2-RL-data:IF-RL",
                                            "reliquary_instruction_following_v1"),
+    "reliquary_competitive_code_v1": (
+        "ReliquaryForge/competitive-code-curated@1f6e4f12",
+        "reliquary_competitive_code_v1"),
+    "reliquary_general_v1": (
+        "ReliquaryForge/general-prompts-curated@02b3ef7a",
+        "reliquary_general_v1"),
+    # One upstream corpus, two index spaces: v1 by upstream position, v2 by
+    # its own split-by-world layout.
+    "envscaler_tools_v1": ("XXHStudyHard/EnvScaler", "envscaler_tools_v1"),
+    "envscaler_tools_v2": ("XXHStudyHard/EnvScaler", "envscaler_tools_v2"),
 }
 
 
@@ -186,6 +264,23 @@ def refuse_held_out_overlap(source: str, prompt_start: int, prompt_count: int) -
             raise ValueError(
                 f"rows [{held.start}, {held.region.end}) of {source!r} are held out for the "
                 f"{held.env!r} evaluation set; this job's [{job.start}, {job.end}) reaches them"
+            )
+    servable = CORPUS_SERVABLE_RANGES.get(source)
+    if servable is not None and not any(
+        allowed.start <= job.start and job.end <= allowed.end for allowed in servable
+    ):
+        if not servable:
+            raise ValueError(f"{source!r} serves no corpus job (CORPUS_SERVABLE_RANGES)")
+        raise ValueError(
+            f"{source!r} serves corpus jobs only inside its corpus ranges, one "
+            f"segment per job ({', '.join(f'[{r.start}, {r.end}) {r.what}' for r in servable)}); "
+            f"this job's [{job.start}, {job.end}) is not inside one"
+        )
+    for reserved in RL_ONLY_RANGES:
+        if lineage(source)[1] == lineage(reserved.source)[1] and overlaps(job, reserved):
+            raise ValueError(
+                f"rows [{reserved.start}, {reserved.end}) of {source!r} are the RL share "
+                f"({reserved.what}); this job's [{job.start}, {job.end}) reaches them"
             )
 
 
@@ -471,6 +566,8 @@ __all__ = [
     "open_source",
     "overlaps",
     "prompt_sha256",
+    "CORPUS_SERVABLE_RANGES",
+    "RL_ONLY_RANGES",
     "refuse_held_out_overlap",
     "rl_ranges",
     "validated_set_id",

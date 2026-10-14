@@ -1,35 +1,38 @@
 """The settler learns new verdicts from the auditor's feed and lists the store
 only at boot and every ``SETTLE_FULL_LIST_SECONDS``; listings never parse on
-the event loop; the other tasks' horizon is cached, never listed per settle."""
+the event loop. (The period settler; the window one is gone.)"""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import time
-from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from reliquary.infrastructure import corpus_job_store as job_store
 from reliquary.infrastructure import corpus_record_store as records_mod
 from reliquary.infrastructure.corpus_record_store import BucketRecordStore
-from reliquary.validator.corpus_settlement import (
-    SETTLE_FULL_LIST_SECONDS,
-    CorpusSettler,
-    R2Archives,
-)
+from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler
+from reliquary.validator.corpus_periods import PERIOD_SECONDS
+from reliquary.validator.corpus_settlement import SETTLE_FULL_LIST_SECONDS
 
-STALL = 100.0
 EVERY = 1800.0
+P = PERIOD_SECONDS
+# Settling at CLOSED(p) closes period p (and every one before it).
+CLOSE = 600.0
+
+
+def CLOSED(period: int) -> float:
+    return (period + 1) * P + CLOSE
 
 
 def _id(n: int) -> str:
     return f"{n:064x}"
 
 
-def _v(hk, n, ok=True):
-    return {"hotkey": hk, "token_count": n, "passed": ok}
+def _v(hk, n, ok=True, at=10.0):
+    return {"hotkey": hk, "token_count": n, "passed": ok, "received_at": at}
 
 
 class _Records:
@@ -83,19 +86,26 @@ class _SlowVerdictReads(_Records):
 
 
 class _Archives:
-    def __init__(self, other_max):
-        self.other = other_max
+    """Period archives; ``written`` maps a work period to its archive's bytes."""
+
+    def __init__(self):
+        self.docs: dict[tuple[int, int], dict] = {}
         self.written: dict[int, bytes] = {}
 
-    async def other_max(self, task_id):
-        return self.other
+    async def write(self, task_id, work, entry, document):
+        assert (work, entry) not in self.docs
+        self.docs[(work, entry)] = document
+        self.written[work] = json.dumps(document, sort_keys=True).encode()
 
-    async def write(self, task_id, window, data):
-        self.written[window] = json.dumps(data, sort_keys=True).encode()
+    async def read(self, task_id, work, entry):
+        return self.docs.get((work, entry))
+
+    async def list(self, task_id):
+        return sorted(self.docs)
 
 
 class _Clock:
-    def __init__(self, now=0.0):
+    def __init__(self, now=CLOSED(0)):
         self.now = now
 
     def __call__(self):
@@ -103,9 +113,10 @@ class _Clock:
 
 
 def _settler(records, archives, clock, *, fed=True):
-    return CorpusSettler(task_id="corpus-math", job_id="math-v1", cap=0.1,
-                         records=records, archives=archives, stall_seconds=STALL,
-                         clock=clock, full_list_every_seconds=EVERY if fed else None)
+    return CorpusPeriodSettler(task_id="corpus-math", job_id="math-v1", cap=0.1,
+                               records=records, archives=archives,
+                               oldest_pending=lambda: None, genesis=lambda: 0.0, clock=clock,
+                               full_list_every_seconds=EVERY if fed else None)
 
 
 def test_the_default_safety_net_is_half_an_hour():
@@ -113,48 +124,46 @@ def test_the_default_safety_net_is_half_an_hour():
 
 
 def test_a_fed_settler_lists_at_boot_then_only_every_full_list_period():
-    records, archives, clock = _Records({_id(1): _v("A", 10)}), _Archives(46000), _Clock()
+    records, archives, clock = _Records({_id(1): _v("A", 10)}), _Archives(), _Clock()
     settler = _settler(records, archives, clock)
-    assert asyncio.run(settler.settle_once()) == 46000
+    assert asyncio.run(settler.settle_once()) == 0
     assert records.lists == 1
     for step in range(1, 10):
-        clock.now = step * 60.0
-        archives.other = 46000 + step
-        records.verdicts[_id(100 + step)] = _v("B", 5)
+        clock.now = CLOSED(0) + step * 60.0
+        records.verdicts[_id(100 + step)] = _v("B", 5, at=clock.now)
         settler.observe(_id(100 + step), records.verdicts[_id(100 + step)])
-        assert asyncio.run(settler.settle_once()) == 46000 + step
+        assert asyncio.run(settler.settle_once()) is None  # period 1 is still open
     assert records.lists == 1
-    clock.now = EVERY + 1
-    asyncio.run(settler.settle_once())
+    clock.now = CLOSED(1)
+    assert asyncio.run(settler.settle_once()) == 1
     assert records.lists == 2
 
 
 def test_a_verdict_the_feed_missed_is_paid_at_the_next_full_listing():
-    records, archives, clock = _Records({_id(1): _v("A", 10)}), _Archives(46000), _Clock()
+    records, archives, clock = _Records({_id(1): _v("A", 10)}), _Archives(), _Clock()
     settler = _settler(records, archives, clock)
     asyncio.run(settler.settle_once())
     # Written by another path: never reported to this settler.
-    records.verdicts[_id(2)] = _v("B", 30)
-    archives.other = 46001
-    clock.now = 60.0
+    records.verdicts[_id(2)] = _v("B", 30, at=P + 10)
+    clock.now = CLOSED(1)
+    settler._listed_at = clock.now  # listed just now: the next listing is EVERY away
     assert asyncio.run(settler.settle_once()) is None
     assert _id(2) not in records.state["settled"]
-    archives.other = 46002
-    clock.now = EVERY + 1
-    assert asyncio.run(settler.settle_once()) == 46002
+    clock.now += EVERY + 1
+    assert asyncio.run(settler.settle_once()) == 1
     assert _id(2) in records.state["settled"]
-    assert json.loads(archives.written[46002])["rewards_by_hotkey"] == pytest.approx({"B": 0.1})
+    assert json.loads(archives.written[1])["rewards_by_hotkey"] == pytest.approx({"B": 0.1})
 
 
 def test_a_verdict_written_before_boot_is_paid_by_the_first_settlement():
     records = _Records({_id(1): _v("A", 10), _id(2): _v("B", 10)})
-    archives, clock = _Archives(46000), _Clock()
-    assert asyncio.run(_settler(records, archives, clock).settle_once()) == 46000
+    archives, clock = _Archives(), _Clock()
+    assert asyncio.run(_settler(records, archives, clock).settle_once()) == 0
     assert records.state["settled"] == [_id(1), _id(2)]
 
 
 def test_a_failed_full_listing_is_retried_on_the_next_call():
-    records, archives, clock = _Records({_id(1): _v("A", 10)}), _Archives(46000), _Clock()
+    records, archives, clock = _Records({_id(1): _v("A", 10)}), _Archives(), _Clock()
     real = records.list_verdict_ids
     calls = []
 
@@ -168,65 +177,62 @@ def test_a_failed_full_listing_is_retried_on_the_next_call():
     settler = _settler(records, archives, clock)
     with pytest.raises(ConnectionError):
         asyncio.run(settler.settle_once())
-    clock.now = 60.0
-    assert asyncio.run(settler.settle_once()) == 46000
+    clock.now += 60.0
+    assert asyncio.run(settler.settle_once()) == 0
 
 
 def test_a_fed_id_already_settled_or_fed_twice_is_never_paid_twice():
-    records, archives, clock = _Records({_id(1): _v("A", 10)}), _Archives(46000), _Clock()
+    records, archives, clock = _Records({_id(1): _v("A", 10)}), _Archives(), _Clock()
     settler = _settler(records, archives, clock)
     asyncio.run(settler.settle_once())
     # The auditor reports a standing verdict again (found, not written).
     settler.observe(_id(1), records.verdicts[_id(1)])
     settler.observe(_id(1), records.verdicts[_id(1)])
-    archives.other, clock.now = 46001, 60.0
+    clock.now = CLOSED(3)
     assert asyncio.run(settler.settle_once()) is None
-    assert list(archives.written) == [46000]
+    assert list(archives.written) == [0]
     # A restarted settler (fresh process) with the same feed: still nothing.
     again = _settler(records, archives, clock)
     again.observe(_id(1), records.verdicts[_id(1)])
     assert asyncio.run(again.settle_once()) is None
-    assert list(archives.written) == [46000]
+    assert list(archives.written) == [0]
     assert records.state["settled"] == [_id(1)]
 
 
-def test_a_crash_after_the_archive_finishes_the_same_window_once():
-    records, archives, clock = _Records({_id(1): _v("A", 10)}), _Archives(46000), _Clock()
+def test_a_crash_after_the_archive_finishes_the_same_period_once():
+    records, archives, clock = _Records({_id(1): _v("A", 10)}), _Archives(), _Clock()
     records.fail_state_writes_after = 1  # the pending write lands, the final one crashes
     settler = _settler(records, archives, clock)
     with pytest.raises(OSError):
         asyncio.run(settler.settle_once())
-    first = archives.written[46000]
+    first = archives.written[0]
     records.fail_state_writes_after = None
-    archives.other = 46005
-    clock.now = 60.0
+    clock.now += 60.0
     # The same instance, fed again, and a restarted one: one archive, same bytes.
     settler.observe(_id(1), records.verdicts[_id(1)])
-    assert asyncio.run(settler.settle_once()) == 46000
+    assert asyncio.run(settler.settle_once()) == 0
     assert asyncio.run(_settler(records, archives, clock).settle_once()) is None
-    assert archives.written[46000] == first
+    assert archives.written[0] == first and len(archives.docs) == 1
     assert records.state["settled"] == [_id(1)]
-    assert sum(1 for w in archives.written if json.loads(archives.written[w])["rewards_by_hotkey"]) == 1
 
 
 def _scenario(fed: bool):
-    """One fixed sequence of verdicts, voids, horizon moves and settle calls;
+    """One fixed sequence of verdicts, voids and settle calls over many periods;
     every verdict is reported the moment it is written: with itself when fed,
     by id only otherwise, so that settler reads every verdict back."""
-    records, archives, clock = _SlowVerdictReads(), _Archives(46000), _Clock()
+    records, archives, clock = _SlowVerdictReads(), _Archives(), _Clock(0.0)
     settler = _settler(records, archives, clock, fed=fed)
     n = 0
     for step in range(40):
-        clock.now = step * 60.0
+        clock.now = step * P / 3 + 30.0
         for k in range(step % 4):
             n += 1
-            verdict = _v("ABCDE"[(n * 7) % 5], 10 + (n * 13) % 97, ok=(n % 3 != 0))
+            verdict = _v("ABCDE"[(n * 7) % 5], 10 + (n * 13) % 97, ok=(n % 3 != 0),
+                         at=clock.now - k)
             records.verdicts[_id(n)] = verdict
             settler.observe(_id(n), dict(verdict) if fed else None)
         if step % 9 == 4 and n:
             records.voided.add(_id(n))
-        if step % 5 == 0 or step > 30:
-            archives.other = 46000 + step // 5
         asyncio.run(settler.settle_once())
     assert (records.reads == 0) == fed
     return archives.written, records.state
@@ -238,140 +244,6 @@ def test_a_fed_settler_writes_byte_identical_archives_and_state_to_a_listing_one
     assert len(listed_archives) > 5
     assert fed_archives == listed_archives
     assert json.dumps(fed_state, sort_keys=True) == json.dumps(listed_state, sort_keys=True)
-
-
-# --- the other tasks' horizon: cached, refreshed within a TTL ---
-
-
-def _fake_bucket(windows: dict[str, list[int]]):
-    calls = {"tasks": 0, "windows": 0}
-
-    async def list_task_ids(*, strict=False, **kw):
-        calls["tasks"] += 1
-        return sorted(windows)
-
-    async def list_all_window_keys(*, strict=False, task_id=None, **kw):
-        calls["windows"] += 1
-        return sorted(windows.get(task_id, []))
-
-    return calls, list_task_ids, list_all_window_keys
-
-
-def test_other_max_is_listed_once_per_ttl_and_a_fresh_window_is_seen_within_it():
-    windows = {"default": [46000], "corpus-math": [3], "corpus-code": [7]}
-    calls, tasks, keys = _fake_bucket(windows)
-    clock = _Clock(0.0)
-    archives = R2Archives(ttl_seconds=300.0, clock=clock)
-
-    async def scenario():
-        assert await archives.other_max("corpus-math") == 46000
-        listed = dict(calls)
-        for _ in range(5):
-            assert await archives.other_max("corpus-math") == 46000
-            assert await archives.other_max("corpus-code") == 46000
-        assert calls == listed
-        windows["default"].append(46001)
-        clock.now = 299.0
-        assert await archives.other_max("corpus-math") == 46000
-        clock.now = 301.0
-        assert await archives.other_max("corpus-math") == 46001
-        assert calls["tasks"] == 2
-
-    with patch("reliquary.infrastructure.storage.list_task_ids", AsyncMock(side_effect=tasks)), \
-         patch("reliquary.infrastructure.storage.list_all_window_keys", AsyncMock(side_effect=keys)):
-        asyncio.run(scenario())
-
-
-def test_a_window_this_process_writes_is_seen_by_the_other_jobs_at_once(monkeypatch):
-    windows = {"default": [10], "corpus-math": [3], "corpus-code": [7]}
-    calls, tasks, keys = _fake_bucket(windows)
-    monkeypatch.setenv("RELIQUARY_TASK_ID", "corpus-math,corpus-code")
-    archives = R2Archives(ttl_seconds=300.0, clock=_Clock(0.0))
-
-    async def scenario():
-        assert await archives.other_max("corpus-code") == 10
-        await archives.write("corpus-math", 11, {})
-        assert await archives.other_max("corpus-code") == 11
-        # Its own window is never its own horizon.
-        assert await archives.other_max("corpus-math") == 10
-
-    with patch("reliquary.infrastructure.storage.list_task_ids", AsyncMock(side_effect=tasks)), \
-         patch("reliquary.infrastructure.storage.list_all_window_keys", AsyncMock(side_effect=keys)), \
-         patch("reliquary.infrastructure.storage.upload_window_dataset", AsyncMock()):
-        asyncio.run(scenario())
-
-
-def test_a_failed_refresh_raises_and_is_retried_next_call():
-    windows = {"default": [5]}
-    calls, tasks, keys = _fake_bucket(windows)
-    failing = AsyncMock(side_effect=ConnectionError("down"))
-    archives = R2Archives(ttl_seconds=300.0, clock=_Clock(0.0))
-
-    async def scenario():
-        with patch("reliquary.infrastructure.storage.list_task_ids", failing):
-            with pytest.raises(ConnectionError):
-                await archives.other_max("corpus-math")
-        with patch("reliquary.infrastructure.storage.list_task_ids", AsyncMock(side_effect=tasks)):
-            assert await archives.other_max("corpus-math") == 5
-
-    with patch("reliquary.infrastructure.storage.list_all_window_keys", AsyncMock(side_effect=keys)):
-        asyncio.run(scenario())
-
-
-def test_stall_detection_still_advances_alone_through_the_cache():
-    # RL seals 46000 then stops; the corpus joins it, then advances alone only
-    # once the stall is seen, through the cached R2Archives.
-    windows = {"default": [46000]}
-    calls, tasks, keys = _fake_bucket(windows)
-    clock = _Clock(0.0)
-    records = _Records({_id(1): _v("A", 10)})
-    archives = R2Archives(ttl_seconds=300.0, clock=clock)
-    written = {}
-
-    async def write(task_id, window, data):
-        written[window] = data
-
-    archives.write = write
-    settler = CorpusSettler(task_id="corpus-math", job_id="math-v1", cap=0.1, records=records,
-                            archives=archives, stall_seconds=3 * 960.0,
-                            advance_every_seconds=960.0, clock=clock,
-                            full_list_every_seconds=EVERY)
-
-    async def scenario():
-        assert await settler.settle_once() == 46000
-        n = 1
-        results = []
-        for t in range(60, 3 * 960 + 600, 60):
-            clock.now = float(t)
-            n += 1
-            records.verdicts[_id(n)] = _v("A", 10)
-            settler.observe(_id(n), records.verdicts[_id(n)])
-            results.append((t, await settler.settle_once()))
-        return results
-
-    with patch("reliquary.infrastructure.storage.list_task_ids", AsyncMock(side_effect=tasks)), \
-         patch("reliquary.infrastructure.storage.list_all_window_keys", AsyncMock(side_effect=keys)):
-        results = asyncio.run(scenario())
-    paid = [(t, w) for t, w in results if w is not None]
-    assert paid and paid[0][1] == 46001
-    assert paid[0][0] > 3 * 960  # never before the stall
-
-
-def test_a_revived_other_task_is_seen_within_the_ttl_and_stops_lone_advances():
-    windows = {"default": [46000]}
-    calls, tasks, keys = _fake_bucket(windows)
-    clock = _Clock(0.0)
-    archives = R2Archives(ttl_seconds=300.0, clock=clock)
-
-    async def scenario():
-        assert await archives.other_max("corpus-math") == 46000
-        windows["default"].append(46001)
-        clock.now = 300.5
-        assert await archives.other_max("corpus-math") == 46001
-
-    with patch("reliquary.infrastructure.storage.list_task_ids", AsyncMock(side_effect=tasks)), \
-         patch("reliquary.infrastructure.storage.list_all_window_keys", AsyncMock(side_effect=keys)):
-        asyncio.run(scenario())
 
 
 # --- listings never parse on the event loop ---
@@ -454,28 +326,10 @@ def test_a_large_record_listing_does_not_block_the_event_loop(monkeypatch):
     assert gap < LOOP_GAP_LIMIT, f"event loop blocked {gap * 1000:.0f} ms"
 
 
-def test_the_other_tasks_listing_does_not_block_the_event_loop():
-    async def slow_windows(*, strict=False, task_id=None, **kw):
-        _burn(PARSE_SECONDS * 3)
-        return list(range(47_000))
-
-    async def tasks(*, strict=False, **kw):
-        return ["corpus-math", "default"]
-
-    archives = R2Archives(ttl_seconds=300.0, clock=_Clock(0.0))
-    with patch("reliquary.infrastructure.storage.list_task_ids", AsyncMock(side_effect=tasks)), \
-         patch("reliquary.infrastructure.storage.list_all_window_keys", AsyncMock(side_effect=slow_windows)):
-        gap, best = asyncio.run(_max_gap_while(archives.other_max("corpus-math")))
-    assert best == 46_999
-    # Loose on purpose: a busy CI box stretches the thread hand-off, while the
-    # same listing on the loop blocks it 600+ ms.
-    assert gap < LOOP_GAP_LIMIT, f"event loop blocked {gap * 1000:.0f} ms"
-
-
 def test_the_auditor_hook_feeds_the_settler_before_the_status_hook():
     from reliquary.validator.corpus_settlement import settler_fed
 
-    records, archives, clock = _Records(), _Archives(46000), _Clock()
+    records, archives, clock = _Records(), _Archives(), _Clock()
     settler = _settler(records, archives, clock)
     asyncio.run(settler.settle_once())
 
@@ -483,33 +337,34 @@ def test_the_auditor_hook_feeds_the_settler_before_the_status_hook():
         raise RuntimeError("status hook bug")
 
     report = settler_fed(settler, broken)
-    records.verdicts[_id(1)] = _v("A", 10)
+    records.verdicts[_id(1)] = _v("A", 10, at=P + 10)
     with pytest.raises(RuntimeError):
         report(_id(1), records.verdicts[_id(1)])
-    archives.other, clock.now = 46001, 60.0
-    assert asyncio.run(settler.settle_once()) == 46001
+    clock.now = CLOSED(1)
+    settler._listed_at = clock.now  # no listing: only the feed can tell it
+    assert asyncio.run(settler.settle_once()) == 1
 
 
 def test_a_fed_verdict_is_settled_without_reading_it_back():
     """Math's settlement read each new verdict one at a time and paid one
     window in three hours (2026-10-02): the auditor's report is the verdict."""
-    records, archives, clock = _SlowVerdictReads(), _Archives(46000), _Clock()
+    records, archives, clock = _SlowVerdictReads(), _Archives(), _Clock()
     settler = _settler(records, archives, clock)
     asyncio.run(settler.settle_once())
     for n in range(50):
-        records.verdicts[_id(n)] = _v("A" if n % 2 else "B", 10)
+        records.verdicts[_id(n)] = _v("A" if n % 2 else "B", 10, at=P + 10)
         settler.observe(_id(n), records.verdicts[_id(n)])
-    archives.other, clock.now = 46001, 60.0
-    assert asyncio.run(settler.settle_once()) == 46001
+    clock.now = CLOSED(1)
+    assert asyncio.run(settler.settle_once()) == 1
     assert records.reads == 0
-    assert json.loads(archives.written[46001])["rewards_by_hotkey"] == pytest.approx(
+    assert json.loads(archives.written[1])["rewards_by_hotkey"] == pytest.approx(
         {"A": 0.05, "B": 0.05})
 
 
 def test_unfed_verdicts_are_read_together():
     records = _SlowVerdictReads({_id(n): _v("A", 10) for n in range(40)})
-    archives, clock = _Archives(46000), _Clock()
-    assert asyncio.run(_settler(records, archives, clock).settle_once()) == 46000
+    archives, clock = _Archives(), _Clock()
+    assert asyncio.run(_settler(records, archives, clock).settle_once()) == 0
     assert records.reads == 40 and records.peak > 1
     assert records.state["settled"] == sorted(_id(n) for n in range(40))
 
@@ -522,7 +377,7 @@ def test_a_failed_verdict_read_raises_after_the_others_finish():
             return await super().read_verdict(job_id, sid)
 
     records = _OneFails({_id(n): _v("A", 10) for n in range(20)})
-    settler = _settler(records, _Archives(46000), _Clock())
+    settler = _settler(records, _Archives(), _Clock())
 
     async def settle():
         with pytest.raises(OSError):

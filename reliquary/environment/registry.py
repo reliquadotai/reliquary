@@ -57,6 +57,7 @@ EXTERNAL_SINGLE_TURN_CONTRACTS = frozenset(
         "reliquary/boxed-answer/v1",
         "reliquary/checked-answer/v1",
         "reliquary/python-cases/v1",
+        "reliquary/stdio-program/v1",
     }
 )
 
@@ -79,10 +80,12 @@ def _validate_external_reward_shape(spec: "EnvironmentSpec") -> None:
 
     **Hands over materials.** The wheel supplies the cases; this repository
     executes them and computes the reward, so there is no foreign reward to
-    bound and the lattice is derived here from the case count. It is the shape
-    a code environment needs, and it is the shape that keeps execution inside
-    the sandbox: a package that graded its own Python would be running
-    model-written code behind its own rlimits instead of behind gVisor.
+    bound. The lattice is derived here from the case count, or is binary when
+    the reward is all-or-nothing over the cases (a whole program on stdin
+    tests). It is the shape a code environment needs, and it is the shape that
+    keeps execution inside the sandbox: a package that graded its own Python
+    would be running model-written code behind its own rlimits instead of
+    behind gVisor.
 
     Nothing else is admitted. A wheel that both graded itself and declared a
     fractional lattice would be handing back a number this repository has no
@@ -92,13 +95,12 @@ def _validate_external_reward_shape(spec: "EnvironmentSpec") -> None:
     binary = (
         spec.reward_lattice_policy == "binary-v1"
         and spec.attainable_rewards == (0.0, 1.0)
-        and spec.reward_materializer_method is None
     )
-    if binary:
+    if binary and spec.reward_materializer_method is None:
         return
     materials = (
         spec.reward_materializer_method == EXTERNAL_REWARD_MATERIALIZER
-        and not spec.attainable_rewards
+        and (binary or not spec.attainable_rewards)
     )
     if not materials:
         raise ValueError(
@@ -663,6 +665,40 @@ _SPEC_VALUES = (
         ),
         required_data_env_var="RELIQUARY_ENVSCALER_DATA",
     ),
+    # The same worlds, rebuilt for use: rendered in ChatML like telecom, every
+    # world and check executed in a contained subprocess, a binary reward
+    # pinned in code, and an index space split by world into an RL range and
+    # two SFT ranges (boundaries in its `environment` module). Registered and,
+    # like v1, named by no profile and absent from the catalog.
+    EnvironmentSpec(
+        name="envscaler_tools_v2",
+        factory_path=(
+            "reliquary.environment.agentic.envs.envscaler_tools_v2.environment:"
+            "EnvScalerToolsV2Environment"
+        ),
+        scorer_path=(
+            "reliquary.environment.agentic.suite:"
+            "episode_score_many_not_supported"
+        ),
+        validator_authoritative_reward=True,
+        # A lane, not a boundary: containment is the world process. The lane
+        # is the one with the longer admission wall budget, which an episode
+        # that starts an interpreter per rollout needs.
+        admission_resource_class="sandbox",
+        termination_policy="eos_or_cap",
+        final_answer_policy="json",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="envscaler-tools-v2",
+        interaction_mode="episode",
+        episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
+        renderer_id="reliquary-chatml-tools-v1",
+        environment_manifest_sha256=(
+            "d933a0f97d71e69ef55768f74bf27f96"
+            "876c7e3ce61b9b3649f2ae7bb002c370"
+        ),
+        required_data_env_var="RELIQUARY_ENVSCALER_DATA",
+    ),
     EnvironmentSpec(
         # Competition maths, graded on the last boxed integer. Graded by the
         # package: the lattice is binary, so the reward it returns is checked
@@ -787,6 +823,63 @@ _SPEC_VALUES = (
         external_artifact_resource="reliquary_code/artifact.json",
     ),
     EnvironmentSpec(
+        # Competitive programming: a whole program read from stdin, passing
+        # every hidden test or nothing. The package supplies the statements
+        # and the tests through `admission_reward_cases`; the program runs
+        # here, in the grading service's gVisor workers, through the package's
+        # own `judge.guest.run`, and its output is compared on this side with
+        # the package's `outputs_match`. The package's `grade` is never called
+        # on a validator: it runs the program in a local subprocess.
+        name="reliquary_competitive_code_v1",
+        factory_path=(
+            "reliquary_competitive_code.environment:CompetitiveCodeEnvironment"
+        ),
+        scorer_path="reliquary.environment.stdio_program:score_stdio_program",
+        validator_authoritative_reward=True,
+        admission_resource_class="sandbox",
+        termination_policy="eos_or_cap",
+        final_answer_policy="fenced_python",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="reliquary/stdio-program/v1",
+        reward_materializer_method="admission_reward_cases",
+        environment_manifest_sha256=(
+            "0589dc2f13c21d8ff6a67d24dd2b8c68"
+            "e54b706f696267a349158bbd891093d9"
+        ),
+        external_distribution="reliquary-competitive-code",
+        external_artifact_resource="reliquary_competitive_code/artifact.json",
+    ),
+    EnvironmentSpec(
+        # General and tool-use prompts for distillation, in (block, thinking
+        # mode) segments: ReliquaryForge/general-prompts-curated@02b3ef7a,
+        # fetched by the package at that revision and checked against the
+        # sha256 of every file. Graded by the package where a block has a
+        # grader, all or nothing on the text after the reasoning: IFEvalG
+        # verifiers, a parse and a JSON Schema, identity and clarification
+        # patterns, tool-call matching. None of them runs model output, so the
+        # CPU worker grades. Chat, multi-turn and safety rows have no grader
+        # and their jobs declare no filter. A corpus source for now, and only
+        # its stage-A rows (single-turn, no tools, no system): see
+        # `reliquary.eval.sets.CORPUS_SERVABLE_RANGES`.
+        name="reliquary_general_v1",
+        factory_path="reliquary_general:GeneralPromptsEnvironment",
+        scorer_path="reliquary.environment.agentic.external:score_external_answers",
+        validator_authoritative_reward=True,
+        admission_resource_class="cpu",
+        termination_policy="eos_or_cap",
+        final_answer_policy="text",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="reliquary/checked-answer/v1",
+        environment_manifest_sha256=(
+            "fc874fefc78de44891b94401a77f71d1"
+            "b6fb4d5048e04d7908b073eb681b84f1"
+        ),
+        external_distribution="reliquary-general",
+        external_artifact_resource="reliquary_general/artifact.json",
+    ),
+    EnvironmentSpec(
         # Telecom support tickets in tau2-bench's solo mode, graded on the
         # device and the carrier's records after the last call — nothing the
         # model writes reaches the score, only what it did. Binary: one failed
@@ -815,6 +908,36 @@ _SPEC_VALUES = (
         environment_manifest_sha256=(
             "74d0e7569247eabc3d4fb2d909773f2b"
             "1f1d8430a4ce4f4fd09c6ad6e6794b05"
+        ),
+        external_distribution="reliquary-telecom-solo",
+        external_artifact_resource="reliquary_telecom_solo/artifact.json",
+    ),
+    EnvironmentSpec(
+        # v1's tickets with the 134 tau2-bench benchmark tickets moved to a
+        # split of their own (`benchmark`, never train), and train laid out
+        # SFT first then RL (environment.toml `[data]`): corpus jobs take
+        # [0, 1220), RL keeps [1220, 1713) (`reliquary.eval.sets`). Wheel
+        # 0.2.0a1 of the same distribution as v1, so one host installs one of
+        # the two. In no profile yet: a corpus source only.
+        name="reliquary_telecom_solo_v2",
+        factory_path="reliquary_telecom_solo:TelecomSoloEnvironment",
+        scorer_path=(
+            "reliquary.environment.agentic.suite:"
+            "episode_score_many_not_supported"
+        ),
+        validator_authoritative_reward=True,
+        admission_resource_class="cpu",
+        termination_policy="eos_or_cap",
+        final_answer_policy="json",
+        reward_lattice_policy="binary-v1",
+        attainable_rewards=(0.0, 1.0),
+        contract_version="reliquary/episode-json/v1",
+        interaction_mode="episode",
+        episode_replay_path="reliquary.environment.agentic.suite:replay_submission",
+        renderer_id="reliquary-chatml-tools-v1",
+        environment_manifest_sha256=(
+            "8a84743d1285a674d34ee7bdaf1b6196"
+            "3639861d51c309e5adfb3c6d9efd6dce"
         ),
         external_distribution="reliquary-telecom-solo",
         external_artifact_resource="reliquary_telecom_solo/artifact.json",

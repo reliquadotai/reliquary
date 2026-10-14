@@ -55,7 +55,8 @@ def test_the_spec_crosses_to_a_spawned_child():
     from reliquary.shared.task_registry import TaskEntry
 
     entry = TaskEntry(task_id="corpus-math-omi-v1", profile_id="p", profile_sha256="a" * 64,
-                      mechanism="corpus-generation", params={"cap": 0.1, "audit_q": 0.15},
+                      mechanism="corpus-generation", params={"cap": 0.1, "audit_q": 0.15,
+                                                             "settlement": "period-ema-v1"},
                       status="active", retired_at=None, contract={"environments": {}},
                       job_id="math-omi-qwen38-27b-v1")
     spec = SplitSpec(served=[(entry, 0.1)], directory="/hf/x", fingerprint="f" * 64,

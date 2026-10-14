@@ -212,6 +212,11 @@ class WeightOnlyValidator:
                 (max(w) for w in windows_by_task.values()), default=0
             ) + 1
             for task_id in windows_by_task:
+                if self._is_corpus_task(declared.get(task_id)):
+                    # A corpus task is paid by period only: the window archives
+                    # it wrote before stay in place, unread. They still count in
+                    # the horizon above, so RL reads exactly what it read.
+                    continue
                 from reliquary.shared.task_registry import MECHANISM_SERVICE_RL
                 fields = ("window_start", "window_status", "rewards_by_hotkey")
                 if getattr(declared.get(task_id), "mechanism", None) == MECHANISM_SERVICE_RL:
@@ -289,6 +294,7 @@ class WeightOnlyValidator:
             caps=self._caps_by_task(declared),
             floors=self._floors_by_task(declared),
             periods=periods,
+            period_caps=self._period_caps_by_task(declared),
             service_tasks=frozenset(str(task_id) for task_id, entry in declared.items()
                                     if getattr(entry, "mechanism", None) == MECHANISM_SERVICE_RL),
         )
@@ -426,9 +432,14 @@ class WeightOnlyValidator:
         archives that entered within the replay depth, decayed once per period
         (design 2026-10-03). Window archives never hold these tasks' pay.
 
-        Each archive is held to the task's cap: it is one period's pay, and
-        ``_replay_ema`` bounds the task at ``CATCHUP_ENTRIES`` caps on that
-        ground. An archive moved to an earlier entry (``replaces_entry_period``,
+        Each archive is held to the cap it was settled under, never past the
+        highest cap the registry gave the task (``cp.pay_ceiling``), not to
+        the cap the task has now: the current cap governs the periods still to
+        be worked (the settler pays them under it), so lowering it, to 0 when
+        the job is finished, lets what was earned run out. Each archive is one
+        period's pay, and ``_replay_ema`` bounds the task at
+        ``CATCHUP_ENTRIES`` such caps on that ground. An archive moved to an
+        earlier entry (``replaces_entry_period``,
         scripts/requeue_period_archives.py) hides the one it replaces, should
         that one still be listed."""
         from reliquary.validator import corpus_periods as cp
@@ -445,7 +456,7 @@ class WeightOnlyValidator:
 
             genesis = _drand_genesis()
         current = cp.period_of(time.time() if now is None else now, genesis)
-        caps = WeightOnlyValidator._caps_by_task(declared)
+        ceilings = WeightOnlyValidator._period_caps_by_task(declared)
         weights: dict[str, dict[str, float]] = {}
         for task_id in tasks:
             listed = await archives.list(task_id)
@@ -474,23 +485,32 @@ class WeightOnlyValidator:
                         moved = (await doc_of(work, earlier)).get("replaces_entry_period")
                         if moved is not None and int(moved) == entry:
                             replaced.add((work, entry))
-            cap = caps.get(task_id)
+            ceiling = ceilings.get(task_id)
             docs = []
             for work, entry in keys:
                 if (work, entry) in replaced:
                     continue
+                doc = await doc_of(work, entry)
                 rewards = {str(hk): float(v) for hk, v in
-                           ((await doc_of(work, entry)).get("rewards_by_hotkey") or {}).items()}
+                           (doc.get("rewards_by_hotkey") or {}).items()}
                 paid = sum(rewards.values())
+                cap = cp.archive_bound(doc.get("cap"), ceiling)
                 if cap is not None and paid > cap * (1 + 1e-9):
                     logger.warning("period archive %s %d-%d pays %.4f over its cap %.4f; "
                                    "scaled down", task_id, work, entry, paid, cap)
-                    rewards = {hk: v * cap / paid for hk, v in rewards.items()}
+                    rewards = ({} if cap <= 0 else
+                               {hk: v * cap / paid for hk, v in rewards.items()})
                 docs.append({"entry_period": entry, "rewards_by_hotkey": rewards})
             replayed = cp.replay(docs, current)
             if replayed:
                 weights[task_id] = replayed
         return weights
+
+    @staticmethod
+    def _is_corpus_task(entry) -> bool:
+        from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+
+        return getattr(entry, "mechanism", None) == MECHANISM_CORPUS_GENERATION
 
     @staticmethod
     def _merge_archives(by_task: Mapping[str, list[dict]]) -> list[dict]:
@@ -624,12 +644,31 @@ class WeightOnlyValidator:
         return caps
 
     @staticmethod
+    def _period_caps_by_task(declared: Mapping[str, Any]) -> dict[str, float]:
+        """Each period task's ``cp.pay_ceiling``: what one of its archives may
+        pay, kept after its cap is lowered so the earned tail is not cut."""
+        from reliquary.validator import corpus_periods as cp
+
+        ceilings: dict[str, float] = {}
+        for task_id, entry in (declared or {}).items():
+            if not cp.is_period_task(entry):
+                continue
+            try:
+                ceiling = cp.pay_ceiling(entry.params)
+            except (TypeError, ValueError):
+                continue
+            if ceiling is not None:
+                ceilings[str(task_id)] = ceiling
+        return ceilings
+
+    @staticmethod
     def _replay_ema(
         archives: list[dict],
         *,
         caps: Mapping[str, float] | None = None,
         floors: Mapping[str, tuple[float, float]] | None = None,
         periods: Mapping[str, Mapping[str, float]] | None = None,
+        period_caps: Mapping[str, float] | None = None,
         service_tasks: frozenset[str] = frozenset(),
     ) -> dict[str, float]:
         """Replay the per-window emission distribution into an EMA.
@@ -671,16 +710,20 @@ class WeightOnlyValidator:
         The global clamp at the end stays as a backstop against a
         misconfigured sum of shares exceeding one pool — it is logged, never
         silent, because it rescales every miner's emission.
+
+        A period task (``periods``) is bounded by ``period_caps`` (its
+        ``cp.pay_ceiling``) rather than its current cap when one is given: its
+        current cap only prices work still to come.
         """
         by_task: dict[str, list[dict]] = {}
         for record in archives:
             by_task.setdefault(record.get("task_id", ""), []).append(record)
 
         combined: dict[str, float] = {}
-        # Period-settled tasks arrive already replayed on their own clock, and
-        # are added to whatever window archives the same task still has (a job
-        # settled by window before its validator learnt periods): neither tail
-        # is dropped. The cap and the floor apply to the sum, as to every task.
+        # Period-settled tasks arrive already replayed on their own clock. A
+        # corpus task's window archives are no longer read (``submit_once``),
+        # so for one of them nothing is added here; a caller that passes both
+        # gets their sum. The cap and the floor apply to the sum, as to every task.
         periods = periods or {}
         for task_id in dict.fromkeys((*by_task, *periods)):
             ema = {}
@@ -698,6 +741,8 @@ class WeightOnlyValidator:
             for hk, v in (periods.get(task_id) or {}).items():
                 ema[hk] = ema.get(hk, 0.0) + float(v)
             cap = None if caps is None else caps.get(task_id)
+            if task_id in periods and period_caps is not None and task_id in period_caps:
+                cap = period_caps[task_id]
             if cap is not None and task_id in periods:
                 from reliquary.validator import corpus_periods as cp
 

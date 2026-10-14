@@ -33,6 +33,10 @@ class IntakeFacts:
     token_count: int
     digest: str
     last_token_id: int
+    # A suite episode only: what the intake's replay concluded.
+    task_id: str | None = None
+    reward: float | None = None
+    success: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -42,6 +46,12 @@ class IntakeRefusal:
     # Set on a transient refusal (the route answers 503 with this Retry-After); the
     # replay intake never sets it.
     retry_after: int | None = None
+
+
+class ReplayUnavailable(RuntimeError):
+    """The validator could not replay the trajectory just now (its replay
+    pool is down or saturated): nothing is known against it, so it is never a
+    refusal. The route answers 503 and the miner resubmits; a grader retries."""
 
 
 class EpisodeIntake:
@@ -177,5 +187,5 @@ def build_grade_renderer(job, *, checkpoint_dir: str):
     return agentic_swe.load_turn_renderer(checkpoint_dir)
 
 
-__all__ = ["EpisodeIntake", "IntakeFacts", "IntakeRefusal", "build_episode_intake",
+__all__ = ["EpisodeIntake", "IntakeFacts", "IntakeRefusal", "ReplayUnavailable", "build_episode_intake",
            "build_grade_renderer"]

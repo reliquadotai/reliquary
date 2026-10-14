@@ -242,6 +242,11 @@ reliquary jobs create \
   field, so the contract body, and the merge with other jobs, is unchanged.
 - `--min-new-tokens` at least 16. Never 1: the terminator counts, and 1 pays a
   slot for an empty completion (the parser refuses below 2).
+- Every corpus task is paid by its own 72-minute drand periods
+  (`settlement: period-ema-v1`, design `docs/design/2026-10-03-sft-period-clock-design.md`),
+  written into the entry by `jobs create`. The old settlement by RL window is
+  gone for corpus tasks: `--settlement windows` is refused, and
+  `--fleet-knows-period-settlement` is accepted and ignored.
 - The price is pinned: `floor == cap`, paid per verified token. The carried
   contract gets an enforced toploc proof (the deployed defaults); the corpus
   validator refuses a contract without one.
@@ -363,8 +368,8 @@ One process on one H100 (the GRAIL validator's card is fine: nothing else of
 the RL service runs in it). It loads the job's checkpoint in bf16, refuses to
 start if the contract's model is not the job's checkpoint or the fingerprint
 differs, serves `GET /corpus/job`, `GET /corpus/cursor/{hotkey}`,
-`GET /corpus/next/{hotkey}`, `POST /corpus/skip` (§4.1) and
-`POST /corpus/submit`, audits accepted submissions per the job's `audit_*`
+`GET /corpus/next/{hotkey}`, `POST /corpus/skip` (§4.1), `GET /corpus/open`
+(§4.1.1) and `POST /corpus/submit`, audits accepted submissions per the job's `audit_*`
 parameters (§2.1 — `audit_q = 1.0`, the default, audits every one, as in V0)
 and settles every 60 s.
 
@@ -579,11 +584,13 @@ HTTP: `POST /corpus/submit` is unchanged and routes on the submission's
 `job_id` (a job this validator does not serve is refused `job_not_served`, its
 detail listing the served ids). `GET /corpus/jobs` lists the served jobs;
 `GET /corpus/jobs/<job>/job`, `GET /corpus/jobs/<job>/cursor/<hotkey>`,
-`GET /corpus/jobs/<job>/next/<hotkey>` and `POST /corpus/jobs/<job>/skip`
+`GET /corpus/jobs/<job>/next/<hotkey>`, `GET /corpus/jobs/<job>/open` and
+`POST /corpus/jobs/<job>/skip`
 answer for one of them (404 `corpus_job_not_served` otherwise), and
 `GET /corpus/jobs/<job>/contract` serves that job's own task contract (not
 the merge). The legacy `GET /corpus/job`, `GET /corpus/cursor/<hotkey>` and
-`GET /corpus/contract` and `GET /corpus/next/<hotkey>` answer for the first
+`GET /corpus/contract`, `GET /corpus/next/<hotkey>` and `GET /corpus/open`
+answer for the first
 id in `RELIQUARY_TASK_ID` (with one job, unchanged; the job-scoped routes work
 too); the legacy `POST /corpus/skip` routes on the body's `job_id`, as submit
 does.
@@ -672,6 +679,55 @@ and it generates only for a prompt with a slot left. Its counts gain `skipped` (
 rest of the run. Older miners never call them and see no change: submit, its
 refusals and the cursor route are the same.
 
+#### 4.1.1 Which prompts still have a slot: open
+
+`next` and `skip` need a walk, so they do not exist on a `free` job, and every
+episode job is `free`: without a check an agentic miner runs a whole episode
+(minutes of GPU and sandbox) and only learns `prompt_full` on submit. Late in
+a job that is most episodes.
+
+`GET /corpus/jobs/<job>/open` (legacy `GET /corpus/open`, the default job)
+answers for ANY job, `free` or `miner_walk`:
+
+```json
+{"job_id": "swe-qwen38-27b-v1", "prompt_start": 0, "prompt_count": 9276,
+ "open_count": 1876, "as_of": 1791449000.2,
+ "encoding": "bitmap-msb0-base64", "open": "<base64>"}
+```
+
+- `open` is base64 of `ceil(prompt_count / 8)` bytes, one bit per SOURCE row:
+  row `prompt_start + i` is byte `i >> 3`, mask `0x80 >> (i & 7)`, set while
+  that prompt has at least one slot left (the ledger's `remaining > 0`, so a
+  slot an eval job reopened counts); the last byte is padded with zeros.
+  `open_count` is the number of set bits; 0 means the job is complete. In
+  Python: `bits = base64.b64decode(body["open"])`, then
+  `bits[i >> 3] & (0x80 >> (i & 7))` (`reliquary.corpus.slots.parse_open_map`).
+- The size is fixed by the job, never by how fragmented the open prompts are:
+  1.6 kB of JSON for 9 276 prompts, 17 kB for 100 000. A job of more than
+  2^20 prompts answers 409 `corpus_job_open_too_large` (its map would pass
+  128 KiB); a generated source that large is not walked this way.
+- `as_of` is the unix time the ledger was read. A read, like the cursor: no
+  signature, no write, nothing per hotkey. The validator builds the map at
+  most once per 5 s per job, off its event loop, from the ledger state it
+  already holds, and answers `Cache-Control: public, max-age=5`.
+- 404 `corpus_job_not_served` for a job this validator does not serve, 410
+  `job_retired` for a retired one; a paused job still answers.
+- It is a hint, not a reservation: a slot open in the map can be taken before
+  your episode ends, and submit still answers `prompt_full` then. Nothing in
+  admission changes.
+
+`reliquary corpus mine-agentic` reads it on its own: before starting an
+episode it uses a map at most 30 s old (read again otherwise, one read shared
+by every hotkey of the process), passes over the positions of each hotkey's
+walk whose prompt is full (count `skipped_full`) and starts no more episodes
+once `open_count` is 0 (count `no_open_prompt`). The order of each hotkey's
+walk is unchanged, only filtered, so miners still spread over the prompts
+instead of converging on the same ones. A `free` job's validator does not
+check the submission's `cursor`, so passing positions over needs no signed
+skip. Against a validator without the route (404, 405), or when the read
+fails, it mines exactly as before. `reliquary corpus mine` is unchanged: it
+has `next` and `skip`.
+
 ### 4.2 Your own status: audit state, failures, pay
 
 `GET /corpus/jobs/<job>/miners/<hotkey>` (legacy `GET /corpus/miners/<hotkey>`,
@@ -716,11 +772,12 @@ reliquary corpus status ... --json          # the route's JSON as is
   For scale: one completion per prefill audited about 1.5k completion
   tokens/s against about 470 tokens/s generated per miner (2026-09-24). This
   is a throughput figure, not an admission limit.
-- **Archives**: one per RL window at most, under
-  `reliquary/tasks/corpus-<name>/dataset/window-<N>.json.gz`, where `<N>` is
-  the RL task's latest index, never above it.
+- **Archives**: one per closed period of work, under
+  `reliquary/corpus-periods/corpus-<name>/<work period>-<entry period>.json.gz`;
+  each records the cap it was settled under (`cap`), which is what it pays up
+  to, whatever the task's cap is later.
 - **Settlement state**: `reliquary/corpus/jobs/<job>/settlement.json`
-  (`last_window`, `pending` must return to null).
+  (`last_entry`; `pending` must return to null).
 - **RL untouched**: the RL task's weights are unchanged except for the lowered
   cap.
 - **Refusals**: validator logs `corpus submission refused` reasons; a
@@ -756,39 +813,52 @@ data. The file is written beside `--out` and swapped in only once complete.
 
 ## 7. Stop
 
-Retiring the task (`jobs cancel`) is a boot gate: once the corpus validator
-stops it can never start again on this task. Anything accepted but not yet
-audited, or audited but not yet settled, at that moment is never paid. Drain
-first, with the corpus validator still running:
+**A finished job closes itself.** Once its job is full (every slot taken:
+miners get `job_complete` and stop by themselves) and drained (every
+submission audited, every verdict settled, nothing still admitted, graded or
+replayed, the last period archive written), the corpus validator sets the
+task's cap to 0 in the registry, once, and logs it:
 
-1. **Stop new work.** Either the job completes (every slot filled: miners get
-   `job_complete` and stop by themselves), or, for an early stop, close
-   `<port>` to miners at the firewall while leaving the validator process
-   running (the auditor and the settler do not use the port). Miners then only
-   retry; nothing new is accepted.
-2. **Wait for every submission to be audited:**
+```
+corpus task corpus-<name> closed automatically: job <job> is full (N/N prompts) and drained (...); cap 0.1 -> 0, its earned tail keeps being paid
+```
 
-   ```bash
-   reliquary jobs status <job>     # until unaudited=0
-   ```
+There is no `tasks set-cap --cap 0` to run by hand any more. The cap only
+prices periods still to be worked: the archives already written keep paying,
+each up to the cap it was settled under (the registry keeps the highest cap
+the task had as `tail_cap`), until the tail runs out (99 % within 14 periods,
+about 17 h; nothing after 24 periods past the last entry). Nothing new is paid
+at cap 0. The share is free in the registry rule at once: reassigning it while
+the tail still pays can push the sum of what is paid above the pool for up to
+~29 h, which the weight setter's global clamp absorbs by scaling every miner
+down. Prefer to reassign once the tail has run out.
 
-   At about 1.5k tokens/s a backlog clears at that rate; a count that stops
-   moving means the auditor is failing (check the validator log).
-3. **Wait for the settlement that pays them:**
+- A job whose admission is paused (`tasks pause`) is never closed
+  automatically. Set `RELIQUARY_CORPUS_AUTOCLOSE=0` on the corpus validator to
+  turn the automatic close off.
+- The task is **not retired** automatically: a retired task still named in a
+  corpus validator's `RELIQUARY_TASK_ID` stops that validator from starting.
+  Take it out of `RELIQUARY_TASK_ID` (and `RELIQUARY_CORPUS_SPLIT_JUDGES`, and
+  the merged contract) at the next restart, then retire it:
 
-   ```bash
-   reliquary jobs status <job>     # until unsettled=0 pending=none, i.e. "drained: yes"
-   ```
+  ```bash
+  reliquary jobs status <job>          # drained: yes
+  reliquary tasks close --task-id corpus-<name>
+  ```
 
-   While the RL task is live the settler writes at most one archive per RL
-   window (about 16 min); when every other task is idle it advances at most
-   once per 16 min. Expect up to one RL window of wait after step 2.
-4. **Stop the corpus validator**, then retire the task:
+  `tasks close` sets the cap to 0 (if it is not already) and retires the
+  task; it refuses while the job is not drained, and no longer waits for the
+  tail (`--cut-tail` is accepted and ignored).
+- A corpus task still declared with the old window settlement is left out by
+  the corpus validator with an ERROR (never a crash) and its window archives
+  are no longer paid: close it.
 
-   ```bash
-   reliquary jobs cancel --job-id <job> --retired-at <drand-round>
-   ```
+**An early stop** (before the job is full): close `<port>` to miners at the
+firewall while leaving the validator process running (the auditor and the
+settler do not use the port), or pause admission (`tasks pause`). Wait for
+`reliquary jobs status <job>` to say `drained: yes` (at about 1.5k tokens/s an
+audit backlog clears at that rate; a count that stops moving means the auditor
+is failing), then `tasks close`. Anything accepted but not yet audited, or
+audited but not yet settled, when the task is retired is never paid.
 
-The manifest stays for export, and the task's EMA decays by itself. Raise the
-RL cap back with `tasks set-cap` only once the corpus task's EMA tail has
-decayed (section 1.3).
+The manifest stays for export.

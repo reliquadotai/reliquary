@@ -42,7 +42,7 @@ def _hot_entry(task_id="corpus-b", job_id="job-b", env=None, status="active", ca
                model="org/Frozen", revision="abc123", protocol_version=5):
     return SimpleNamespace(
         task_id=task_id, job_id=job_id, mechanism="corpus-generation", status=status,
-        params={"cap": cap},
+        params={"cap": cap, "settlement": "period-ema-v1"},
         contract={"environments": {"src": env or ENV}, "protocol_version": protocol_version,
                   "model_id": model, "model_revision": revision},
     )
@@ -513,7 +513,7 @@ def test_a_hot_added_job_serves_and_a_retired_job_drains_without_a_restart(
     import reliquary.protocol.profiles as profiles
     import reliquary.shared.modeling as modeling
     from reliquary.protocol.profiles import profile_from_contract
-    from reliquary.validator import corpus_auditor, corpus_settlement
+    from reliquary.validator import corpus_auditor, corpus_period_settlement
     from reliquary.validator.corpus_validator import run_corpus_validator
     from reliquary.validator.task_config import merge_corpus_contracts
     from tests.unit.test_corpus_multi_job_startup import _declare
@@ -536,7 +536,7 @@ def test_a_hot_added_job_serves_and_a_retired_job_drains_without_a_restart(
         settles.append((self._task_id, self._cap))
 
     monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", idle)
-    monkeypatch.setattr(corpus_settlement.CorpusSettler, "settle_once", settle_once)
+    monkeypatch.setattr(corpus_period_settlement.CorpusPeriodSettler, "settle_once", settle_once)
 
     math = _registry_entry(tmp_path, "-a", "corpus-math", "math-v1")
     code = _registry_entry(tmp_path, "-b", "corpus-code", "code-v1")

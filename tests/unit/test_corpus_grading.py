@@ -462,20 +462,17 @@ def test_a_cached_grade_of_a_quarantined_executor_is_dropped():
 
 
 def test_settlement_waits_for_the_grade():
-    from reliquary.validator.corpus_settlement import CorpusSettler
-    from tests.unit.test_corpus_settlement import _Archives
+    from tests.unit.test_corpus_settlement import RECEIVED, _Archives, _settler
     from tests.unit.test_corpus_settlement import _Records as _SettleRecords
 
-    verdict = {"passed": True, "hotkey": "5Hot", "token_count": 10}
+    verdict = {"passed": True, "hotkey": "5Hot", "token_count": 10, "received_at": RECEIVED}
     records = _SettleRecords({SID: verdict, "b" * 64: dict(verdict)})
     graded = {"b" * 64}
 
     async def ready(ids):
         return {s for s in ids if s in graded}
 
-    settler = CorpusSettler(task_id="t", job_id="j", cap=0.1, records=records,
-                            archives=_Archives(other_max=None), ready=ready,
-                            advance_every_seconds=0.0)
+    settler = _settler(records, _Archives(), ready=ready)
     asyncio.run(settler.settle_once())
     assert records.state["settled"] == ["b" * 64]
     graded.add(SID)
@@ -484,23 +481,23 @@ def test_settlement_waits_for_the_grade():
 
 
 def test_a_void_landing_before_payment_is_never_paid():
-    from reliquary.validator.corpus_settlement import CorpusSettler
-    from tests.unit.test_corpus_settlement import _Archives
+    from tests.unit.test_corpus_settlement import RECEIVED, _Archives, _settler
     from tests.unit.test_corpus_settlement import _Records as _SettleRecords
 
     class _Voiding(_SettleRecords):
         async def list_voided_ids(self, job_id):
             return [SID]
 
-    records = _Voiding({SID: {"passed": True, "hotkey": "5Hot", "token_count": 10},
-                        "b" * 64: {"passed": True, "hotkey": "5Other", "token_count": 10}})
+    records = _Voiding({SID: {"passed": True, "hotkey": "5Hot", "token_count": 10,
+                              "received_at": RECEIVED},
+                        "b" * 64: {"passed": True, "hotkey": "5Other", "token_count": 10,
+                                   "received_at": RECEIVED}})
 
     async def ready(ids):
         return set(ids)
 
-    archives = _Archives(other_max=None)
-    settler = CorpusSettler(task_id="t", job_id="j", cap=0.1, records=records,
-                            archives=archives, ready=ready)
+    archives = _Archives()
+    settler = _settler(records, archives, ready=ready)
     asyncio.run(settler.settle_once())
     (archive,) = archives.written.values()
     assert archive["rewards_by_hotkey"] == {"5Other": pytest.approx(0.1)}

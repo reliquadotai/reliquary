@@ -11,7 +11,7 @@ from __future__ import annotations
 import collections
 import logging
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -90,6 +90,27 @@ def job_status(*, job_id: str, job: Any, slots: Any, stats: JobStats, settled: i
         "counts_complete": bool(totals is not None and totals.get("complete", True)),
         **_eval_prompt_counts(job, slots),
     }
+
+
+def pay_status(*, cap: float, price: Mapping | None, last_period: Mapping | None) -> dict:
+    """What a period of work may pay and what the last one paid: the cap (a
+    share of the miners' pool), the price ceiling in alpha per million verified
+    tokens (None: the cap alone), and the last settled period's pay per
+    million tokens, in alpha when the ceiling names the emission it used."""
+    view = dict(price) if price else None
+    pay = {"cap": float(cap),
+           "max_price_alpha_per_mtoken": (view or {}).get("max_price_alpha_per_mtoken"),
+           "price_ceiling": view, "last_period": None}
+    if last_period and int(last_period.get("verified_tokens") or 0) > 0:
+        tokens, paid = int(last_period["verified_tokens"]), float(last_period["paid"])
+        emission = (view or {}).get("miner_alpha_per_period")
+        pay["last_period"] = {
+            "work_period": int(last_period["work_period"]), "verified_tokens": tokens,
+            "paid_pool_share": paid,
+            "paid_pool_share_per_mtoken": paid / tokens * 1e6,
+            "paid_alpha_per_mtoken": (None if emission is None
+                                      else paid / tokens * 1e6 * float(emission))}
+    return pay
 
 
 def _eval_prompt_counts(job: Any, slots: Any) -> dict[str, Any]:

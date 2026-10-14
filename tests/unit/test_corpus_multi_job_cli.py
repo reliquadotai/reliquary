@@ -40,6 +40,7 @@ def _corpus_entry(task_id, job_id, environment, cap, contract=None):
     contract = contract if contract is not None else _narrowed(_process_contract(), environment)
     params = asdict(PRODUCTION_PRICE_PARAMS)
     params["cap"] = params["floor"] = cap
+    params["settlement"] = "period-ema-v1"
     return TaskEntry(
         task_id=task_id, profile_id=PROFILE_ID, profile_sha256=canonical_sha256(contract),
         mechanism=MECHANISM_CORPUS_GENERATION, params=params, status="active",

@@ -161,6 +161,13 @@ class CreateDelivery(BaseModel):
     model_config = ConfigDict(extra="forbid")
     delivery_id: str | None = None
     apply_filter: bool = True
+    # Keep the finished completions the filter rejects (annotated) in the
+    # instruction shards: an SFT without the correctness filter.
+    keep_rejected: bool = False
+    # Deliver a completion once within the job and never one already in a
+    # passing submission of these jobs (a v2 on the prompts of its v1).
+    dedupe: bool = False
+    dedupe_against: list[str] = Field(default_factory=list, max_length=16)
 
 
 class Provenance(BaseModel):
@@ -663,6 +670,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
     @router.get("/task-catalog")
     async def task_catalog() -> dict:
+        from reliquary.environment.agentic.external import verify_external_artifact
         from reliquary.environment.registry import ENVIRONMENT_SPECS
         from reliquary.eval.qualification import order_environment_refusal
         from reliquary.protocol.environment_catalog import (
@@ -674,12 +682,18 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         environments = []
         for name in sorted(set(ENVIRONMENT_CATALOG) & set(ENVIRONMENT_SPECS)):
             spec = ENVIRONMENT_SPECS[name]
+            supported = spec.interaction_mode == "single_turn"
+            if supported and spec.external_distribution is not None:
+                try:
+                    await asyncio.to_thread(verify_external_artifact, spec)
+                except (OSError, TypeError, ValueError):
+                    supported = False
             contract = environment_body_contract(name)
             environments.append({
                 "environment": name, "interaction_mode": spec.interaction_mode,
                 "contract": contract, "contract_sha256": canonical_sha256(contract),
-                "legacy_generation_supported": spec.interaction_mode == "single_turn",
-                "qualified_generation_supported": order_environment_refusal(name) is None,
+                "legacy_generation_supported": supported,
+                "qualified_generation_supported": supported and order_environment_refusal(name) is None,
             })
         return {"schema": "subnet-task-catalog/v1", "task_prefix": task_prefix,
                 "pool_max": float(pool_max), "zero_cap_supported": True,
@@ -917,6 +931,16 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if job is None:
             raise HTTPException(status_code=404, detail="job_unknown")
+        for other in body.dedupe_against:
+            in_scope(other)
+            if other == job_id:
+                raise HTTPException(status_code=422, detail="dedupe_against_itself")
+            try:
+                known, _ = await job_store.read_job(other)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            if known is None:
+                raise HTTPException(status_code=422, detail=f"dedupe_against_unknown: {other}")
         accepts = getattr(deliveries, "accepts_delivery_id", None)
         if accepts is not None and not accepts(delivery_id):
             raise HTTPException(status_code=503, detail="delivery_namespace_not_configured")
@@ -960,13 +984,19 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     grade = await asyncio.to_thread(job_grader, job)
                 except ValueError as exc:
                     note = str(exc)
+            if body.keep_rejected and grade is None:
+                raise HTTPException(status_code=422, detail="keep_rejected needs the job's "
+                                    "filter applied: " + (note or "apply_filter is off or the "
+                                                          "job declares no filter"))
             instruction_source, instruction_note = await asyncio.to_thread(
                 instruction_source_for_job, job)
             # Long: run beside the request; the caller polls with the same id.
             exports[delivery_id] = (job_id, asyncio.ensure_future(export_delivery(
                 job=job, records=records, sink=deliveries, delivery_id=delivery_id,
                 grade=grade, filter_note=note, work_dir=work_dir, clock=clock,
-                instruction_source=instruction_source, instruction_note=instruction_note)))
+                instruction_source=instruction_source, instruction_note=instruction_note,
+                keep_rejected=body.keep_rejected, dedupe=body.dedupe,
+                dedupe_against=body.dedupe_against)))
         response.status_code = 202
         return {"state": "running", "delivery_id": delivery_id}
 
