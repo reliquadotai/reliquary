@@ -350,7 +350,7 @@ def test_spawned_worker_deadline_is_terminal():
             materials,
             _context(),
             time.monotonic() - 1.0,
-        ).result(timeout=5.0)
+        ).result(timeout=60.0)   # bounds the wait only: a spawned worker imports torch first (~5 s)
 
     assert prepared.reject_reason is RejectReason.WORKER_DROPPED
     assert prepared.reject_stage == "admission_timeout"
