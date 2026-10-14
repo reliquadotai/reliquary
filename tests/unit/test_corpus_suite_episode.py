@@ -378,6 +378,15 @@ def test_an_unfaithful_prompt_or_a_diff_is_refused(honest):
         == "malformed_submission"
 
 
+def test_a_sandbox_transcript_is_refused(honest):
+    rendered, tokens, spans, stop, _ = honest
+    request = _request(rendered, tokens, spans, stop)
+    request = request.model_copy(update={"trajectory": request.trajectory.model_copy(
+        update={"transcript": {"token": {}, "records": []}})})
+    refusal = _intake().check(request)
+    assert refusal.reason == "malformed_submission" and "transcript" in refusal.detail
+
+
 def test_endoftext_mid_episode_is_refused_and_ends_the_last_turn(chatml_registry):
     environment = ENVIRONMENT_SPECS[ENV].create()
     actions = _reference_actions(environment, 0)

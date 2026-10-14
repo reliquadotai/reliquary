@@ -363,6 +363,11 @@ class SuiteEpisodeIntake:
             return IntakeRefusal("malformed_submission", {
                 "why": "an episode job takes one trajectory, not completions",
                 "trajectory": trajectory is not None, "completions": len(request.completions)})
+        if getattr(trajectory, "transcript", None) is not None:
+            # Only a signed-sandbox job carries a transcript: a suite record that stored
+            # one would read as signed wherever the record alone decides.
+            return IntakeRefusal("malformed_submission", {
+                "transcript": "a suite job takes no sandbox transcript"})
         if not self._job.owns(request.prompt_index):
             return IntakeRefusal("prompt_mismatch", {"got": request.prompt_index})
         if trajectory.final_diff != "":
