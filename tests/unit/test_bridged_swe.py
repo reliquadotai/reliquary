@@ -45,6 +45,7 @@ def test_the_signed_source_reads_the_bridged_env_by_default(env):
 
 
 def test_the_resolver_reads_the_bridged_sandbox_task(env):
+    pytest.importorskip("reliquary_sandbox_verifiers")
     from reliquary.sandbox.tasks import SweTaskResolver
 
     resolved = asyncio.run(SweTaskResolver("train").resolve(1))
