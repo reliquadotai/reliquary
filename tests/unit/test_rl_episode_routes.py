@@ -6,6 +6,7 @@ import pytest
 from fastapi import FastAPI
 
 bt = pytest.importorskip("bittensor")
+pytest.importorskip("reliquary_sandbox.attest")
 
 from reliquary.protocol.service_episode import EpisodePrecommit  # noqa: E402
 from reliquary.protocol.signatures import build_episode_precommit_binding  # noqa: E402
