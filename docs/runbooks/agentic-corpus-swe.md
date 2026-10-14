@@ -36,9 +36,8 @@ environment step then runs on reliquary-sandbox machines; the validator verifies
 signed transcript at admission (§5.A-D) and grades from its final record. There is no
 grade executor, no replay and no vote.
 
-**Blocker for third parties.** reliquary-sandbox is a private repository: miners and
-validators outside the team cannot install `reliquary[sandbox]` /
-`reliquary[sandbox-miner]` until it is published. That is the user's decision.
+**Third parties.** reliquary-sandbox is public: miners and validators install
+`reliquary[sandbox]` / `reliquary[sandbox-miner]`, which pin it at `SANDBOX_COMMIT`.
 
 **One reliquary-swe wheel everywhere.** reliquary-swe is served through the sandbox's
 verifiers bridge: `env_package` is `name==version+g<sha16>.vfb<bridge version>` and

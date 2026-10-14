@@ -320,7 +320,7 @@ design bounded staleness (MiMo: 4) and possibly partial rollouts.
 
 - SWE prod hotfix: the agent's diff can modify untracked/ignored files (train and
   polyglot).
-- Make `reliquary-sandbox` public, or vendor attest/observation/client/bridge.
+- ~~Make `reliquary-sandbox` public~~: done, public at `be50c768` (pinned in `pyproject.toml`).
 - Image registry for the tmax base.
 - Terminal uid separation (17/64 MiMo rows served).
 - Per-CPU capacity in the fleet: done in phase 2. Sandbox machines reserve each session's agent box in CPU and memory and run grading boxes in a grading pool; RL sessions are placed only on machines that report these resources.
@@ -512,8 +512,8 @@ values, to be tuned at qualification (see the last list).
    first wait and kept across restarts), then is refused; resubmit it once the cause is fixed.
 7. **Miners.** Miners mine a bridged environment from its public catalogue: they install exactly the pinned
    env package (`pip install --no-deps <wheel>`, the identity the order names) and the sandbox bridge. The env
-   wheels and the bridge must therefore be published before launch: miners cannot install a private
-   `reliquary-sandbox` (see "Make `reliquary-sandbox` public, or vendor ..." under "Also pending"). A miner
+   wheels must therefore be published before launch; the bridge ships with the public `reliquary-sandbox`
+   (`pip install "reliquary[sandbox-miner]"`). A miner
    binds its prompts when it starts, so for an environment added during the run it must wait until the
    announcement names it, install the package, add the name to `--episode-envs` and **restart**; nothing
    restarts it automatically.

@@ -3,8 +3,8 @@
 Everything under `reliquary.sandbox` imports `reliquary_sandbox` (attest, observation,
 episode client), which comes from the optional extras `reliquary[sandbox]` (validator)
 and `reliquary[sandbox-miner]` (miner, with the verifiers bridge). Replay jobs never
-import it. reliquary-sandbox is a PRIVATE repository: a third party cannot install the
-extras until it is published, which is a user decision.
+import it. reliquary-sandbox is public (github.com/reliquadotai/reliquary-sandbox),
+installed at exactly `SANDBOX_COMMIT`.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from collections.abc import Mapping
 SANDBOX_DISTRIBUTION = "reliquary-sandbox"
 # The reliquary-sandbox commit this build verifies and drives. A job's contract pins
 # its own (`episode.sandbox.sandbox_commit`); both must agree.
-SANDBOX_COMMIT = "60c2a2e5094d6aaf9d325d92fa843a0205fb9b66"
+SANDBOX_COMMIT = "be50c76824aaccd6506d8f50a84941b4cd548f6f"
 
 
 class SandboxUnavailable(RuntimeError):
@@ -32,7 +32,7 @@ def require_sandbox() -> None:
     except ImportError as exc:
         raise SandboxUnavailable(
             "signed-sandbox jobs need reliquary-sandbox: install reliquary[sandbox] "
-            "(validator) or reliquary[sandbox-miner] (miner); the repository is private"
+            "(validator) or reliquary[sandbox-miner] (miner)"
         ) from exc
 
 
