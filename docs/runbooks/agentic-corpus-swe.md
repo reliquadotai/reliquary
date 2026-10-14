@@ -194,10 +194,11 @@ export read the claims only. Session documents never carry it either.
 At start, before any route serves, the validator reads the directory once. A failure
 there is logged and retried by the fleet, and it never stops the start. It then restores
 the recent sessions from R2 (`reliquary/sandbox/sessions/...`). Each attempt is bounded
-to 60 s, and there are 3 attempts with backoff. **If the restore still fails, the
-validator does not start at all, so the replay jobs it serves stop too.** It would
-otherwise serve opens with empty reservations and caps. Fix R2 access and restart. To
-keep replay jobs running meanwhile, unset the key settings and retire the signed job.
+to 60 s, and there are 3 attempts with backoff. **If the restore still fails, only the
+signed-sandbox jobs are disabled**: an `ALERT` names them, no session route is served, and
+their submissions are refused with a retryable `503 sandbox_unavailable`. Every other job
+(replay, suite, text, eval) is served as usual. Fix R2 access and restart to serve the
+signed jobs again; their declarations are unchanged.
 At shutdown, the session writes still in flight get 10 s.
 
 ### Session route
