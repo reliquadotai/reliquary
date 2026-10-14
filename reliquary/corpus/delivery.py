@@ -137,11 +137,14 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
         parsed = parse_trajectory(renderer, prompt_ids=prompt, tokens=tokens, spans=spans,
                                   stop=trajectory["stop"], max_turns=job.episode.max_turns)
         system_prompt = BASH_SYSTEM_PROMPT
+        final_diff = trajectory["final_diff"]
     else:
         # A signed episode: its observations are the signed records' renderings, compared
         # forward against the tokens, never decoded from them (plan 3 ruling 6).
         try:
             from reliquary.corpus.signed_parse import parse_signed_trajectory, signed_records
+            from reliquary.corpus.signed_state import swe_patch
+            import reliquary_sandbox_service.episodes.state_archive  # noqa: F401
         except ImportError as exc:
             raise EpisodeSandboxUnavailable(submission_id) from exc
         from reliquary.corpus.signed_reasons import REASON_SANDBOX_TRANSCRIPT
@@ -156,6 +159,10 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
                                          calls=found.calls, offered=found.tools,
                                          final=found.final)
         system_prompt = harness_system_prompt(found.tools)
+        # The graded state is the bridge's (header + artifact archive): the row carries
+        # the git patch inside it, the shape of a replay job's final_diff. An unreadable
+        # state is a ValueError (counted unparseable).
+        final_diff = swe_patch(trajectory["final_diff"])
     messages = [{"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}]
     for t, ((start, end), turn) in enumerate(zip(spans, parsed.turns)):
@@ -177,7 +184,7 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
             "prompt_index": int(record["prompt_index"]),
             "task_id": str(grade.get("instance_id") or ""),
             "messages": json.dumps(messages, ensure_ascii=False), "tokens": prompt + tokens,
-            "assistant_mask": mask, "final_diff": trajectory["final_diff"],
+            "assistant_mask": mask, "final_diff": final_diff,
             "graded_success": bool(grade.get("graded_success")),
             "replay_certified": bool(grade.get("replay_certified")),
             "turns": json.dumps([[s, e] for s, e in spans]), "stop": trajectory["stop"]}
