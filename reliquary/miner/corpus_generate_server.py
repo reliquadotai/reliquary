@@ -331,10 +331,15 @@ class VllmTurnCore:
                  if _has_vision_encoder(checkpoint_dir) else {})
         self._forced = bool(forced)
         if self._forced:
-            # Every request carries its forced draw (``forced_draw.DrawBinding.extra_args``).
-            from reliquary.miner.vllm_generation import ForcedSeedVLLMProcessor
+            # Every request carries its forced draw (``forced_draw.DrawBinding.extra_args``),
+            # placed by the runner's own token count so a preempted turn keeps its position.
+            from reliquary.miner.vllm_generation import (
+                RunnerForcedSeedVLLMProcessor,
+                require_runner_forced_draw,
+            )
 
-            extra["logits_processors"] = [ForcedSeedVLLMProcessor]
+            require_runner_forced_draw()
+            extra["logits_processors"] = [RunnerForcedSeedVLLMProcessor]
         self._llm = LLM(model=checkpoint_dir, dtype="bfloat16", enable_prefix_caching=True,
                         seed=secrets.randbelow(2**31 - 1) + 1, max_model_len=max_total_tokens,
                         max_num_seqs=max_num_seqs, **memory, **extra)
