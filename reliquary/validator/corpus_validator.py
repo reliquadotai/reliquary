@@ -1006,6 +1006,11 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     )
     from reliquary.validator.corpus_service import prompt_job_for_spec, renderer_for_job
     from reliquary.validator.corpus_settlement import R2Archives
+    from reliquary.shared.log_levels import unmute_reliquary_loggers
+
+    # bittensor (imported by now) set the loggers of every module imported before it to
+    # CRITICAL: this module's operator ALERTs would never reach the logs.
+    unmute_reliquary_loggers()
 
     served = list(jobs) if jobs is not None else [(entry, cap)]
     if not served and not generation_only:

@@ -3422,6 +3422,10 @@ def setup_logging(level: str = "INFO"):
         format="%(asctime)s | %(threadName)s | %(name)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    # bittensor muted every Reliquary logger imported before it (ALERTs included).
+    from reliquary.shared.log_levels import unmute_reliquary_loggers
+
+    unmute_reliquary_loggers()
 
 
 @app.command()
