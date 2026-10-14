@@ -538,7 +538,12 @@ class _Stop(Exception):
 
 
 def _entry(job_id, status="active"):
-    return SimpleNamespace(task_id=TASKS[job_id], job_id=job_id, params={"cap": 0.1},
+    # Settled by work periods, as every corpus task is (design 2026-10-03): a window-settled
+    # entry is left out at startup and never served.
+    from reliquary.validator.corpus_periods import SETTLEMENT_PERIOD_EMA
+
+    return SimpleNamespace(task_id=TASKS[job_id], job_id=job_id,
+                           params={"cap": 0.1, "settlement": SETTLEMENT_PERIOD_EMA},
                            mechanism="corpus-generation", status=status,
                            retired_at=1 if status == "retired" else None, contract=None)
 
@@ -627,6 +632,9 @@ def validator_process(tmp_path, gateway, r2, fixed_drand_chain, monkeypatch):  #
         scenario = None
 
         async def serve(self, sockets=None):
+            # No websocket routes: "auto" would import websockets.legacy, deprecated
+            # (an error under this suite's filterwarnings), as test_corpus_multi_job_validator.
+            self.config.ws = "none"
             serving = asyncio.create_task(super().serve(sockets))
             try:
                 deadline = time.monotonic() + 60
