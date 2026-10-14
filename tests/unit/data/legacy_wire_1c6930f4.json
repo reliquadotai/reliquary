@@ -7,13 +7,16 @@
   "session_prefix": "reliquary/sandbox/sessions/"
  },
  "environments": {
-  "manifest_sha256": "18432f913c2913fe18db6fe66a74dc30976a3f6b6d0b6c17af80a86e1a80483e",
+  "manifest_sha256": "ff1064ba90430a1be948104f921d993e5950ca475f36c93aa8466fad8768957e",
   "modes": {
    "envscaler_tools_v1": "episode",
+   "envscaler_tools_v2": "episode",
    "opencodeinstruct": "single_turn",
    "openmathinstruct": "single_turn",
    "reliquary_code_v1": "single_turn",
+   "reliquary_competitive_code_v1": "single_turn",
    "reliquary_dapo_math_v1": "single_turn",
+   "reliquary_general_v1": "single_turn",
    "reliquary_hard_math_v1": "single_turn",
    "reliquary_instruction_following_v1": "single_turn",
    "reliquary_logic_v2": "single_turn",
@@ -22,16 +25,20 @@
    "reliquary_stateful_tools_v1": "episode",
    "reliquary_stateful_tools_v2": "episode",
    "reliquary_telecom_solo_v1": "episode",
+   "reliquary_telecom_solo_v2": "episode",
    "reliquary_workspace_tools_v1": "episode",
    "reliquarylogic_v1": "single_turn",
    "reliquaryverifiable_v1": "single_turn"
   },
   "per_env": {
    "envscaler_tools_v1": "44da7ddbd0f6d373f28f2c7a11b105ef2996b630860a2f56a7800adc19307906",
+   "envscaler_tools_v2": "6ddec231a4a234bda3c10b37f55cd058664a733f1e9285763cfbc89fe5ded1f4",
    "opencodeinstruct": "26eff4b0af6941a2667353450ebafccf8a25b0e1c913b7f293f9ac70814ecdc4",
    "openmathinstruct": "5cab5454039b040e0f91352725c3dc138d0891e0cbd073bf431a3ac436e67076",
    "reliquary_code_v1": "e6f2fa79ca5f0170403d09a697e82e06439c7aa0c924abec601296619e85c0ce",
+   "reliquary_competitive_code_v1": "e06fd61fab50d51a53dfef70cddb3449b516a242bae3488875fc08d5e9d7f913",
    "reliquary_dapo_math_v1": "f69391d91ed5d6b61950cd63793bd3c5f5e9060611f53c5210e2d28b054dbcc4",
+   "reliquary_general_v1": "d4fe3fc9b91ca5f7d748f2b0d4d1c9ff2fdc4b715e846d0569c494f3f9f2de02",
    "reliquary_hard_math_v1": "577c6410270599c0d61cd3f6f97e59ef40a432cbc50009f88bda0fde7166719d",
    "reliquary_instruction_following_v1": "7b55db2a06a38926a5237f59abb903cabb60b74ac9e07410c180015e58639214",
    "reliquary_logic_v2": "21dd8d8c754064fea60b33ee8e90d996f9c241c04c79269e27bf141b7a014e8f",
@@ -40,6 +47,7 @@
    "reliquary_stateful_tools_v1": "5e5d9091d989b7b6b51fff57d4e0599152158621573feccd0e6e75e3967a5267",
    "reliquary_stateful_tools_v2": "7427cb4965d385957c5003c2e15f944dd72b7787873c6724f13deea794be45d7",
    "reliquary_telecom_solo_v1": "01abefb72f8609db645b4065f7f211ed5594a7a3c7611436504e6e58b5dbf307",
+   "reliquary_telecom_solo_v2": "901b27b347be7e451db174b1df107c090b89c56ac598a8dc42913de86954837a",
    "reliquary_workspace_tools_v1": "222b65976b8c0689c1e216704ce5c97da44ead17a156ae6469bcfc9b6fb257b4",
    "reliquarylogic_v1": "62b514a44e0f0fcb53c1a08fd086fd38d0aaeb221cfc37601b9df1ca5efca6a1",
    "reliquaryverifiable_v1": "0560554eddf3feb4497385e7052ce379e8c4d67b787ed00f11deabeb42b57ebe"
