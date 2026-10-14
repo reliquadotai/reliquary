@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import importlib.util
 import io
 import json
 import os
@@ -38,6 +39,10 @@ from tests.unit.test_next_rl_run_inertness import LEGACY_AND_CORPUS_SUITES, _chi
 REPO = Path(__file__).parents[2]
 GOLDEN = Path(__file__).parent / "data" / "legacy_wire_1c6930f4.json"
 DEFAULT_PROFILE = os.environ.get("RELIQUARY_PROTOCOL_PROFILE", "default") in ("", "default")
+# The signed-sandbox side needs the optional reliquary-sandbox extra (the CPU suite installs none).
+SANDBOX_INSTALLED = importlib.util.find_spec("reliquary_sandbox") is not None
+needs_sandbox = pytest.mark.skipif(not SANDBOX_INSTALLED, reason="needs the reliquary-sandbox extra")
+OPTIONAL_EXTRAS = ("reliquary_sandbox", "reliquary_sandbox_service", "reliquary_sandbox_verifiers", "verifiers")
 
 # Every module signed-episode added (the precommit wire, the RL session engagements and routes, the admission and intake
 # of a group, the validator wiring, the environment, the miner). ``reliquary.protocol.episode_retry`` is not one of
@@ -101,7 +106,12 @@ def test_a_cold_import_of_the_legacy_single_turn_and_corpus_entry_points_loads_n
         "names += ['reliquary.corpus.' + os.path.basename(p)[:-3] for p in glob.glob('reliquary/corpus/*.py')\n"
         "          if not p.endswith('__init__.py')]\n"
         "for name in names:\n"
-        "    importlib.import_module(name)\n"
+        "    try:\n"
+        "        importlib.import_module(name)\n"
+        "    except ModuleNotFoundError as exc:\n"
+        "        # A signed-sandbox module without the optional extra: it cannot load anything.\n"
+        f"        if (exc.name or '').split('.')[0] not in {OPTIONAL_EXTRAS!r}:\n"
+        "            raise\n"
         f"print(len(names), sorted(m for m in sys.modules if m in {EPISODE_MODULES!r}))\n"
     )
     done = subprocess.run([sys.executable, "-I", "-c", code], cwd=REPO, capture_output=True, text=True, timeout=300)
@@ -178,6 +188,7 @@ def test_a_single_turn_v2_admission_context_carries_no_episode_field(episode_wir
 
 # ------------------------------------------------------------------ the corpus validator
 
+@needs_sandbox
 def test_the_corpus_validator_still_refuses_rl_engagements_and_keeps_its_session_keys(legacy_wires):
     from reliquary.infrastructure import sandbox_store
     from reliquary.sandbox.sessions import EngagementTerms, RlPrecommitEngagements
@@ -192,6 +203,7 @@ def test_the_corpus_validator_still_refuses_rl_engagements_and_keeps_its_session
     assert terms.exclusive is False and terms.still_valid is None
 
 
+@needs_sandbox
 def test_the_corpus_sandbox_wiring_is_the_corpus_one(legacy_wires, tmp_path):
     """The corpus validator's sandbox services, built by its own wiring: corpus and the refusing RL stub as the
     engagement kinds, only the corpus routes, the corpus store prefix, and no RL session index ever filled."""
@@ -209,6 +221,7 @@ def test_the_corpus_sandbox_wiring_is_the_corpus_one(legacy_wires, tmp_path):
     assert services.book._by_precommit == {}
 
 
+@needs_sandbox
 def test_a_corpus_session_never_enters_the_rl_precommit_index(legacy_wires):
     """``SessionBook.add`` parses every record's engagement as an RL one; a corpus engagement is never
     one, so a corpus book's index stays empty and its bookkeeping is the corpus one."""
@@ -242,7 +255,7 @@ needs_default_profile = pytest.mark.skipif(
 
 @needs_default_profile
 @pytest.mark.parametrize("section", ["payload", "submission", "signature_messages", "environments",
-                                     "corpus_sessions"])
+                                     pytest.param("corpus_sessions", marks=needs_sandbox)])
 def test_legacy_and_corpus_bytes_are_the_ones_before_plan_2c(section, legacy_wires):
     """Training payload (header, every array, the decoded legacy and historical Episode v1 payloads), the
     submission wire (and its length cap), the message each legacy commit's signature is checked against, the
@@ -327,6 +340,11 @@ EPISODE_ARMED_SUITES = (
 )
 
 
+# Armed suites that skip whole without the sandbox extra (nothing would pass in them).
+SANDBOX_SUITES = frozenset({"test_sandbox_sessions.py", "test_sandbox_routes.py", "test_signed_grading_and_wiring.py",
+                            "test_signed_intake.py", "test_signed_miner.py"})
+
+
 def test_the_armed_suite_lists_do_not_overlap():
     assert not set(EPISODE_ARMED_SUITES) & set(LEGACY_AND_CORPUS_SUITES)
     assert len(set(EPISODE_ARMED_SUITES)) == len(EPISODE_ARMED_SUITES)
@@ -334,7 +352,8 @@ def test_the_armed_suite_lists_do_not_overlap():
 
 @pytest.mark.skipif(not DEFAULT_PROFILE,
                     reason="the armed suites run once, under the default protocol profile only")
-@pytest.mark.parametrize("suite", EPISODE_ARMED_SUITES)
+@pytest.mark.parametrize("suite", [
+    pytest.param(suite, marks=needs_sandbox) if suite in SANDBOX_SUITES else suite for suite in EPISODE_ARMED_SUITES])
 def test_the_suites_pass_with_every_episode_entry_point_armed(suite):
     assert (Path(__file__).parent / suite).exists()
     done = subprocess.run(
@@ -355,7 +374,10 @@ def test_the_episode_tripwires_really_fire_and_record(episode_wires):
     from tests.unit.service_v2_fixtures import contract_v2
 
     for module_name, dotted in rl_tripwires.EPISODE_ARMED:
-        owner, attr = rl_tripwires._resolve(module_name, dotted)
+        resolved = rl_tripwires._resolve_armable(module_name, dotted)
+        if resolved is None:
+            continue                    # needs an optional sandbox extra this run lacks: never armed
+        owner, attr = resolved
         armed = owner.__dict__[attr]
         function = armed.__func__ if isinstance(armed, (staticmethod, classmethod)) else armed
         before = len(episode_wires)
