@@ -188,6 +188,7 @@ def test_startup_authorizes_anchor_before_bootstrap_adopts_successor(tmp_path, m
     svc._checkpoint_store.current_manifest.return_value = SimpleNamespace(revision="anchor")
     svc.server.start = AsyncMock()
     svc._refresh_registered_hotkeys = AsyncMock()
+    svc._start_episode_services = AsyncMock()      # a legacy task: returns at once
     svc._apply_resume_from = AsyncMock()
 
     async def adopt_successor():
