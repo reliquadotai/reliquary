@@ -957,6 +957,9 @@ def test_a_v2_order_without_episode_envs_never_loads_the_sandbox_package(tmp_pat
         "from tests.unit.test_service_window_build import _open, _service\n"
         "assert 'reliquary_sandbox' not in sys.modules\n"
         "mp = pytest.MonkeyPatch()\n"
+        # The subprocess escapes tests/unit/conftest.py: offer whole splits here too, so the
+        # test never depends on the length of the locally installed datasets.
+        "mp.setattr('reliquary.protocol.rl_prompt_ranges.RL_PROMPT_RANGES', {})\n"
         "svc = _service(mp, pathlib.Path(sys.argv[1]))\n"
         "assert not svc._service_runtime.contract.episode_environments\n"
         "async def main():\n"
