@@ -13,11 +13,23 @@ and no terminal pick refused — level with the batched transformers path it
 replaces (0.970-0.974). Throughput at 256 concurrent rollouts is 6,050 tok/s
 against 507 for a 16-wide transformers batch, because a transformers decode step
 costs ~31 ms whatever the batch, so the win is concurrency, not the engine.
+
+The engine draws with ``RunnerForcedSeedVLLMProcessor``: the position of each
+pick is read from the model runner's input batch at sampling time, keyed by
+request id. ``ForcedSeedVLLMProcessor`` counted its own calls per slot, and
+vLLM's recompute preemption re-adds a request with its output so far, which
+restarted that counter: measured 12-15 % of honest rollouts drawn with the wrong
+u from there on (H100) and 30 % on an RTX 5090. The runner-keyed draw held at 0
+bad positions over millions, with hundreds of preemptions, on 3090/A6000/5090
+(vLLM 0.30.0, async scheduling on; offpolicy-lab tracecheck, 14-10).
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
+import os
+import threading
 from typing import Any
 
 import torch
@@ -36,6 +48,10 @@ except ImportError:  # pragma: no cover - exercised on hosts without vLLM
 
 FORCED_SEED_KEY = "forced_seed"
 
+# The runner internals the forced draw reads were checked on these vLLM series
+# only (see ``require_runner_forced_draw``); a new series must be re-measured.
+SUPPORTED_VLLM_SERIES = ("0.30",)
+
 
 class ForcedSeedVLLMProcessor(LogitsProcessor):  # type: ignore[misc,valid-type]
     """One-hot the forced pick for every running request, in one batched pass.
@@ -43,6 +59,12 @@ class ForcedSeedVLLMProcessor(LogitsProcessor):  # type: ignore[misc,valid-type]
     vLLM addresses requests by their slot in the persistent batch, and reuses a
     slot as soon as a request leaves it, so the per-slot state follows the
     engine's own removed/added/moved order rather than a request id.
+
+    The position is a per-slot call counter. That is exact when each request is
+    sampled once per token and never re-added, which holds for the in-process
+    fakes the tests drive, but not on an engine: a preempted request comes back
+    with its counter at ``base_offset``. Engines use
+    ``RunnerForcedSeedVLLMProcessor``.
     """
 
     def __init__(self, vllm_config: Any = None, device: Any = None,
@@ -64,23 +86,7 @@ class ForcedSeedVLLMProcessor(LogitsProcessor):  # type: ignore[misc,valid-type]
             self._slots.pop(slot, None)
             forced = dict(getattr(params, "extra_args", None) or {}).get(FORCED_SEED_KEY)
             if forced:
-                self._slots[slot] = {
-                    "randomness": str(forced["randomness"]),
-                    "prompt_idx": int(forced["prompt_idx"]),
-                    "checkpoint_hash": str(forced["checkpoint_hash"]),
-                    "rollout_index": int(forced["rollout_index"]),
-                    "offset": int(forced.get("base_offset", 0)),
-                }
-                if "public_pool" in forced:
-                    from reliquary.protocol.seed_pool import SeedPool
-                    pool = SeedPool.from_dict(forced["public_pool"])
-                    seed_index = forced.get("seed_index")
-                    pool.uniform(seed_index, 0)  # refuses a seed outside the pool
-                    if pool.prompt_idx != int(forced["prompt_idx"]) or pool.checkpoint_hash != str(forced["checkpoint_hash"]):
-                        raise ValueError("vLLM request context differs from public pool")
-                    self._slots[slot].update(seed_pool=pool, seed_index=seed_index)
-                elif "seed_index" in forced:
-                    raise ValueError("seed_index requires public pool")
+                self._slots[slot] = _forced_state(forced)
         for moved in getattr(batch_update, "moved", ()):
             source, destination = _slot_index(moved[0]), _slot_index(moved[1])
             swap = "SWAP" in str(moved[2]).upper() if len(moved) > 2 else False
@@ -95,24 +101,62 @@ class ForcedSeedVLLMProcessor(LogitsProcessor):  # type: ignore[misc,valid-type]
         slots = [slot for slot in sorted(self._slots) if slot < logits.shape[0]]
         if not slots:
             return logits
-        draws = [
-            (state["seed_pool"].uniform(state["seed_index"], state["offset"])
-             if "seed_pool" in state else
-             u_at(state["randomness"], state["prompt_idx"], state["checkpoint_hash"],
-                  state["rollout_index"], state["offset"]))
-            for state in (self._slots[slot] for slot in slots)
-        ]
-        rows = torch.tensor(slots, device=logits.device)
-        probs = _warp_batch(logits[rows], t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO)
-        cdf = torch.cumsum(probs, dim=-1)
-        uniforms = torch.tensor(draws, device=cdf.device, dtype=cdf.dtype).unsqueeze(1)
-        picks = torch.searchsorted(cdf, uniforms, right=True).squeeze(1)
-        picks = picks.clamp(max=probs.shape[-1] - 1)
-        forced = torch.full_like(logits, float("-inf"))
-        forced[rows, picks] = 0.0
+        forced = _one_hot_picks(
+            logits, slots,
+            [_uniform(self._slots[slot], self._slots[slot]["offset"]) for slot in slots],
+        )
         for slot in slots:
             self._slots[slot]["offset"] += 1
         return forced
+
+
+def _forced_state(forced: dict[str, Any]) -> dict[str, Any]:
+    """A request's place in the draw, checked once: a public pool must be the
+    request's own and its seed inside the pool."""
+    state = {
+        "randomness": str(forced["randomness"]),
+        "prompt_idx": int(forced["prompt_idx"]),
+        "checkpoint_hash": str(forced["checkpoint_hash"]),
+        "rollout_index": int(forced["rollout_index"]),
+        "offset": int(forced.get("base_offset", 0)),
+    }
+    if "public_pool" in forced:
+        from reliquary.protocol.seed_pool import SeedPool
+        pool = SeedPool.from_dict(forced["public_pool"])
+        seed_index = forced.get("seed_index")
+        pool.uniform(seed_index, 0)  # refuses a seed outside the pool
+        if pool.prompt_idx != state["prompt_idx"] or pool.checkpoint_hash != state["checkpoint_hash"]:
+            raise ValueError("vLLM request context differs from public pool")
+        state.update(seed_pool=pool, seed_index=seed_index)
+    elif "seed_index" in forced:
+        raise ValueError("seed_index requires public pool")
+    return state
+
+
+def _uniform(state: dict[str, Any], position: int) -> float:
+    if "seed_pool" in state:
+        return state["seed_pool"].uniform(state["seed_index"], position)
+    return u_at(state["randomness"], state["prompt_idx"], state["checkpoint_hash"],
+                state["rollout_index"], position)
+
+
+def _one_hot_picks(logits: torch.Tensor, rows: list[int], draws: list[float], *,
+                   keep_other_rows: bool = False) -> torch.Tensor:
+    """Each forced row becomes -inf but for its inverse-CDF pick. The other rows
+    are kept as they are, or blanked as the slot-counter processor always did."""
+    index = torch.tensor(rows, device=logits.device)
+    probs = _warp_batch(logits[index], t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO)
+    cdf = torch.cumsum(probs, dim=-1)
+    uniforms = torch.tensor(draws, device=cdf.device, dtype=cdf.dtype).unsqueeze(1)
+    picks = torch.searchsorted(cdf, uniforms, right=True).squeeze(1)
+    picks = picks.clamp(max=probs.shape[-1] - 1)
+    if keep_other_rows:
+        forced = logits.clone()
+        forced[index] = float("-inf")
+    else:
+        forced = torch.full_like(logits, float("-inf"))
+    forced[index, picks] = 0.0
+    return forced
 
 
 def _slot_index(value: Any) -> int:
@@ -146,6 +190,144 @@ def forced_seed_extra_args(
     return result
 
 
+# ---------------------------------------------------------------- runner-keyed draw
+#
+# vLLM 0.30's V1 GPUModelRunner samples in ``_sample(logits, spec_decode_metadata)``
+# with logits rows in ``input_batch.req_ids`` order (non-speculative). At that
+# moment ``input_batch.num_tokens_no_spec[row]`` counts the request's prompt plus
+# every token sampled for it so far, the async-scheduling placeholder of the step
+# still in flight included, and is reset to prompt + output when a preempted
+# request is re-added. So, per row,
+#
+#     position = num_tokens_no_spec[row] - num_prompt_tokens[row] + base_offset
+#
+# is the completion position the pick lands at, whatever happened to the slot, and
+# a sample vLLM throws away (a partial chunked-prefill step) does not move it. The
+# wrapped ``_sample`` publishes those rows for the step; the processor, which vLLM
+# calls inside the sampler after the raw logprobs are taken, one-hots them.
+
+_STEP = threading.local()  # .rows: [(row, request id, forced args, position)] of the step being sampled
+_PATCH_MARK = "_reliquary_forced_draw"
+
+
+def _runner_class() -> Any:
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner  # local import: optional dependency
+
+    return GPUModelRunner
+
+
+def _step_rows(runner: Any, n_rows: int) -> list[tuple[int, str, dict[str, Any], int]]:
+    batch = runner.input_batch
+    try:
+        req_ids = batch.req_ids
+        token_counts = batch.num_tokens_no_spec
+        prompt_counts = batch.num_prompt_tokens
+    except AttributeError as exc:
+        raise RuntimeError(
+            f"forced draw: the vLLM input batch has no {exc.name}; "
+            f"the runner internals differ from vLLM {SUPPORTED_VLLM_SERIES}"
+        ) from exc
+    rows = []
+    for row in range(min(n_rows, len(req_ids))):
+        req_id = req_ids[row]
+        state = runner.requests.get(req_id) if req_id is not None else None
+        params = getattr(state, "sampling_params", None)
+        forced = dict(getattr(params, "extra_args", None) or {}).get(FORCED_SEED_KEY)
+        if not forced:
+            continue
+        position = int(token_counts[row]) - int(prompt_counts[row])
+        if position < 0:
+            raise RuntimeError(f"forced draw: request {req_id} at completion position {position}")
+        rows.append((row, req_id, forced, position))
+    return rows
+
+
+def install_runner_forced_draw(runner_cls: Any = None) -> None:
+    """Wrap ``runner_cls._sample`` (vLLM's GPUModelRunner by default) so each step
+    publishes its forced rows. Idempotent, and in the process that runs the model:
+    the processor installs it from its constructor, which vLLM calls there. It
+    touches neither ``execute_model`` nor ``_model_forward``, so it composes with
+    ``vllm_hidden_capture.capture_hidden_states``."""
+    if runner_cls is None:
+        runner_cls = _runner_class()
+    if getattr(runner_cls._sample, _PATCH_MARK, False):
+        return
+    original = runner_cls._sample
+
+    def _sample(self, logits, spec_decode_metadata):
+        rows = _step_rows(self, logits.shape[0]) if logits is not None else []
+        if rows and spec_decode_metadata is not None:
+            # The rejection sampler ignores custom logits processors.
+            raise RuntimeError("forced draw does not support speculative decoding")
+        previous = getattr(_STEP, "rows", None)
+        _STEP.rows = rows
+        try:
+            return original(self, logits, spec_decode_metadata)
+        finally:
+            _STEP.rows = previous
+
+    setattr(_sample, _PATCH_MARK, True)
+    runner_cls._sample = _sample
+
+
+def require_runner_forced_draw() -> None:
+    """Refuse, before any weights load, a vLLM whose runner the draw was not
+    checked on: a silent mismatch would draw honest rollouts off the stream."""
+    import vllm  # local import: optional dependency
+
+    version = str(getattr(vllm, "__version__", ""))
+    if ".".join(version.split(".")[:2]) not in SUPPORTED_VLLM_SERIES:
+        raise RuntimeError(
+            f"forced draw: vLLM {version or '?'} is not one of {SUPPORTED_VLLM_SERIES}; "
+            "its runner internals must be re-checked (tracecheck) before mining on it"
+        )
+    sample = getattr(_runner_class(), "_sample", None)
+    params = list(inspect.signature(sample).parameters) if sample is not None else []
+    if params[:3] != ["self", "logits", "spec_decode_metadata"]:
+        raise RuntimeError(
+            f"forced draw: GPUModelRunner._sample{tuple(params[1:])} is not "
+            "(logits, spec_decode_metadata)"
+        )
+
+
+class RunnerForcedSeedVLLMProcessor(ForcedSeedVLLMProcessor):
+    """The forced pick at the position the model runner reports (see above).
+
+    The slot bookkeeping is kept for two things only: refusing a malformed draw
+    when the request is added, and noticing a forced request sampled outside the
+    patched ``_sample``, which would otherwise fall to a greedy argmax.
+    """
+
+    def __init__(self, vllm_config: Any = None, device: Any = None,
+                 is_pin_memory: bool = False) -> None:
+        super().__init__(vllm_config, device, is_pin_memory)
+        if getattr(vllm_config, "speculative_config", None) is not None:
+            raise RuntimeError("forced draw does not support speculative decoding")
+        install_runner_forced_draw()
+        self._states: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+
+    def apply(self, logits: torch.Tensor) -> torch.Tensor:
+        rows = getattr(_STEP, "rows", None)
+        if rows is None:
+            if any(slot < logits.shape[0] for slot in self._slots):
+                raise RuntimeError(
+                    "forced requests sampled outside the patched vLLM runner: "
+                    "the draw position is unknown"
+                )
+            return logits
+        if not rows:
+            return logits
+        states = {}
+        for _, req_id, forced, _ in rows:
+            cached = self._states.get(req_id)
+            states[req_id] = (cached if cached is not None and cached[0] is forced
+                              else (forced, _forced_state(forced)))
+        self._states = states  # requests not sampled this step are parsed again if they return
+        draws = [_uniform(states[req_id][1], states[req_id][1]["offset"] + position)
+                 for _, req_id, _, position in rows]
+        return _one_hot_picks(logits, [row for row, *_ in rows], draws, keep_other_rows=True)
+
+
 class VLLMRolloutGenerator:
     """A group of rollouts for one prompt, generated concurrently on vLLM.
 
@@ -171,11 +353,16 @@ class VLLMRolloutGenerator:
         self._llm = engine if engine is not None else self._build(model_path, revision)
 
     def _build(self, model_path: str, revision: str | None) -> Any:
+        # The forced draw hooks the V1 runner; the V2 runner would bypass it.
+        os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
+        if os.environ["VLLM_USE_V2_MODEL_RUNNER"].strip().lower() not in ("0", "false"):
+            raise RuntimeError("forced draw is hooked on the V1 runner: set VLLM_USE_V2_MODEL_RUNNER=0")
+        require_runner_forced_draw()
         from vllm import LLM  # local import: optional dependency
 
         engine = LLM(
             model=model_path, revision=revision, dtype="bfloat16",
-            logits_processors=[ForcedSeedVLLMProcessor], **self._settings,
+            logits_processors=[RunnerForcedSeedVLLMProcessor], **self._settings,
         )
         logger.info(
             "vLLM generation backend ready (%s%s)", model_path,
