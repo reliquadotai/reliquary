@@ -126,7 +126,16 @@ def admit(
     for check in checks:
         result = check()
         if not result.ok:
-            return Verdict(False, result.reason or "", detail=dict(result.detail))
+            detail = dict(result.detail)
+            if _repeats_itself(job, result.reason, detail, seen):
+                # A prompt the model answers one way only can never take n
+                # distinct completions, so it never fills and no skip may cross
+                # it: holding the cursor here would lock the walk for good. The
+                # miner did answer the prompt its walk named, so it steps on
+                # unpaid, exactly as on a full prompt.
+                _advance(job, cursors, hotkey)
+                detail["within_submission"] = True
+            return Verdict(False, result.reason or "", detail=detail)
 
     # Past this point the miner really did answer the prompt its walk named,
     # so the cursor moves whether or not a slot was still free. This prices a
@@ -259,6 +268,19 @@ def out_of_range_detail(job: JobSpec, prompt_index: int) -> dict[str, int]:
     if job.prompt_start:
         detail = {"prompt_start": job.prompt_start, **detail}
     return detail
+
+
+def _repeats_itself(
+    job: JobSpec, reason: str | None, detail: dict[str, Any], seen: AbstractSet[str]
+) -> bool:
+    """A single-completion walk submission refused only because two of its own
+    completions are the same text, not because it copies earlier work."""
+    return (
+        reason == "hash_duplicate"
+        and job.prompt_order == PROMPT_ORDER_MINER_WALK
+        and job.episode is None
+        and detail.get("digest") not in seen
+    )
 
 
 def _advance(job: JobSpec, cursors: CursorLedger, hotkey: str) -> None:
