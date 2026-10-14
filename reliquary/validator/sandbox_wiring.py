@@ -156,8 +156,9 @@ class SandboxServices:
     async def start(self) -> None:
         """Before serving: the directory read once (a failure is the fleet's to retry,
         on its backoff; it fails closed meanwhile), then the sessions restored. The
-        restore is bounded and retried; when it still fails it raises and the
-        validator must not start: it would serve opens with empty reservations and caps."""
+        restore is bounded and retried; when it still fails it raises, and the caller
+        (`start_sandbox_services`) disables the signed-sandbox jobs: they would serve opens
+        with empty reservations and caps."""
         await self.fleet.refresh_if_due()
         for attempt in range(1, self.restore_attempts + 1):
             try:
@@ -166,7 +167,8 @@ class SandboxServices:
             except Exception as exc:
                 if attempt == self.restore_attempts:
                     logger.error("sandbox sessions not restored after %d attempts (%s): the "
-                                 "validator does not start", attempt, type(exc).__name__)
+                                 "signed-sandbox jobs are not served", attempt,
+                                 type(exc).__name__)
                     raise
                 delay = self.restore_backoff_s * 2 ** (attempt - 1)
                 logger.warning("sandbox session restore failed (%s, attempt %d); retrying in "
