@@ -550,3 +550,12 @@ of its task images) before qualification or any production run that serves SWE.
   `ADDED_RETRY_MAX_S` (1 h).
 - Checks: `MAX_CHECKS_RUNNING`, from the measured transcript check time.
 - Machines: `episode_cpu_overcommit` and the grading pool's size.
+
+### Settings the next run must set (off by default on main)
+
+These are neutral by default so that the live legacy controller and trainer, if redeployed from main,
+behave exactly as before. The next run turns them on:
+
+- `RELIQUARY_EMISSION_PRICE_RISE=1.10` on the controller: an environment the trainer waited on for more
+  than 5 % of the window has its price multiplied by 1.10 (`emission_price.PriceParams.rise`). Unset
+  or 1.0 means no rise: such a window takes the deadband/decay path as before.

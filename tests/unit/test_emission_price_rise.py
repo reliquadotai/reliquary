@@ -11,6 +11,8 @@ from __future__ import annotations
 import pytest
 
 from reliquary.validator.emission_price import (
+    PRICE_RISE,
+    PRICE_RISE_ENV,
     PRODUCTION_PRICE_PARAMS,
     ROUND_SECONDS,
     EnvironmentOutcome,
@@ -19,6 +21,7 @@ from reliquary.validator.emission_price import (
     advance,
     outcomes_by_environment_from_archive,
     price_signal_fields,
+    price_rise_from_env,
     restore_walk,
 )
 
@@ -46,8 +49,10 @@ def _state(price=0.5):
     return PriceState(price=price, last_good=price, recent_fill_prices=(price,))
 
 
-def test_production_params_rise_ten_percent_past_five_percent_of_the_window():
-    assert PRODUCTION_PRICE_PARAMS.rise == pytest.approx(1.10)
+def test_production_params_rise_is_off_by_default_past_five_percent_of_the_window(monkeypatch):
+    monkeypatch.delenv(PRICE_RISE_ENV, raising=False)
+    assert price_rise_from_env() == 1.0
+    assert PRODUCTION_PRICE_PARAMS.rise == pytest.approx(PRICE_RISE)
     assert PRODUCTION_PRICE_PARAMS.rise_wait_fraction == pytest.approx(0.05)
     assert ROUND_SECONDS == 3.0
 
@@ -87,10 +92,14 @@ def test_a_rise_never_lifts_last_good():
 
 
 def test_the_math_shortage_doubles_the_price_in_seven_windows():
+    """At the next run's setting (RELIQUARY_EMISSION_PRICE_RISE=1.10)."""
+    from dataclasses import replace
+
+    params = replace(PRODUCTION_PRICE_PARAMS, rise=1.10)
     state, history = _state(0.084), []
     for _ in range(7):
         history.append(_outcome(wait=400.0, ready=145, training=150.0))
-        decision = advance(state, history, PRODUCTION_PRICE_PARAMS)
+        decision = advance(state, history, params)
         state = decision.state
     assert state.price == pytest.approx(0.084 * 1.1 ** 7, rel=1e-6)
 
@@ -140,5 +149,39 @@ def test_params_built_like_the_registry_carry_the_rise():
     from reliquary.shared.task_registry import PRICE_PARAM_FIELDS
 
     params = PriceParams(**{f: getattr(PRODUCTION_PRICE_PARAMS, f) for f in PRICE_PARAM_FIELDS})
-    assert params.rise == pytest.approx(1.10)
+    assert params.rise == pytest.approx(PRICE_RISE)
     assert params.rise_wait_fraction == pytest.approx(0.05)
+
+
+def test_the_default_does_not_rise_and_walks_as_before():
+    """Rise off (1.0, the default): a window the trainer waited on takes the
+    same decision as the same window with no wait measured (main's walk)."""
+    off = _params(rise=1.0)
+    waited = advance(_state(), [_outcome(wait=60.0)], off)
+    unmeasured = advance(_state(), [_outcome(wait=None)], off)
+    assert waited.regime != "rise"
+    assert waited == unmeasured
+
+
+def test_the_unset_env_gives_no_rise_in_a_fresh_process():
+    import os
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if k != PRICE_RISE_ENV}
+    code = ("from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS as p, "
+            "PriceParams as P; print(p.rise, P.__dataclass_fields__['rise'].default)")
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True,
+                         check=True).stdout.split()
+    assert out == ["1.0", "1.0"]
+
+
+@pytest.mark.parametrize("raw, expected", [("", 1.0), ("1.10", 1.10), (" 1.0 ", 1.0)])
+def test_the_env_flag_sets_the_rise(raw, expected):
+    assert price_rise_from_env({PRICE_RISE_ENV: raw}) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("raw", ["0.9", "nan", "inf", "x"])
+def test_a_bad_env_flag_is_refused(raw):
+    with pytest.raises(ValueError):
+        price_rise_from_env({PRICE_RISE_ENV: raw})

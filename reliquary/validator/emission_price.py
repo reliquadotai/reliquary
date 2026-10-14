@@ -34,9 +34,34 @@ from dataclasses import dataclass
 from typing import Any
 import logging
 import math
+import os
 import statistics
 
 logger = logging.getLogger(__name__)
+
+# The price rise on trainer wait (``PriceParams.rise``) is OFF unless this is set:
+# 1.0 (the default) keeps the controller's price walk exactly as before the rise
+# existed. The next RL run sets it to 1.10 (docs/next-rl-run-decisions.md). Only
+# the controller walks prices; weight-only validators read archived rewards.
+PRICE_RISE_ENV = "RELIQUARY_EMISSION_PRICE_RISE"
+
+
+def price_rise_from_env(environ: Mapping[str, str] | None = None) -> float:
+    """``RELIQUARY_EMISSION_PRICE_RISE`` as a finite factor >= 1.0 (default 1.0:
+    no rise). A bad value refuses the import rather than pricing silently."""
+    raw = (os.environ if environ is None else environ).get(PRICE_RISE_ENV, "").strip()
+    if not raw:
+        return 1.0
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{PRICE_RISE_ENV} must be a number >= 1.0, got {raw!r}") from None
+    if not math.isfinite(value) or value < 1.0:
+        raise ValueError(f"{PRICE_RISE_ENV} must be a finite number >= 1.0, got {raw!r}")
+    return value
+
+
+PRICE_RISE = price_rise_from_env()
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,8 +89,9 @@ class PriceParams:
     # than ``rise_wait_fraction`` of the window: multiply the price by
     # ``rise``. Image-versioned like ``breaker_timeouts``: the registry does not
     # carry them (PRICE_PARAM_FIELDS), so these defaults ARE the production
-    # values every registry-built params object gets.
-    rise: float = 1.10
+    # values every registry-built params object gets. ``rise`` is 1.0 (off)
+    # unless ``RELIQUARY_EMISSION_PRICE_RISE`` sets it.
+    rise: float = PRICE_RISE
     rise_wait_fraction: float = 0.05
 
 
@@ -237,7 +263,8 @@ def advance(
         # snap that fails to restore supply from parking there forever.
         price = max(price, last_good) * params.snap
         regime = "snap"
-    elif _waited_on(outcome, params):
+    elif params.rise > 1.0 and _waited_on(outcome, params):
+        # Off (1.0): the window takes the deadband/decay path, as before the rise.
         price *= params.rise
         regime = "rise"
     elif r_smoothed is not None and r_smoothed < params.deadband:
@@ -788,6 +815,7 @@ PRODUCTION_PRICE_PARAMS = PriceParams(
     # than 5 % of the window (~22 s of a 450 s window). In normal windows every
     # environment fills in 80-130 s while the trainer takes ~350 s, so the
     # trainer never waits on supply (measured, 1,000 windows, 10-13).
-    rise=1.10,
+    # OFF (1.0) unless RELIQUARY_EMISSION_PRICE_RISE is set; the next run sets 1.10.
+    rise=PRICE_RISE,
     rise_wait_fraction=0.05,
 )
