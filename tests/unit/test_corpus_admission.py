@@ -326,3 +326,42 @@ def test_a_started_free_job_accepts_its_own_range(index):
     job = _job(prompt_start=5000, prompt_count=100, prompt_order=PROMPT_ORDER_FREE)
     slots, cursors = _started_state(job)
     assert _call(job, slots, cursors, prompt_index=index).accepted is True
+
+
+def test_a_walk_submission_repeating_itself_steps_on_unpaid():
+    # A prompt the model answers one way only never takes n distinct
+    # completions: the walk must step over it or the hotkey is stuck for good.
+    job = _job()
+    slots, cursors = _state(job)
+    verdict = _call(job, slots, cursors, digests=["d0", "d0"])
+    assert verdict.accepted is False
+    assert verdict.reason == "hash_duplicate"
+    assert verdict.detail["within_submission"] is True
+    assert slots.filled == 0
+    assert cursors.expected("5Gx") == 1
+
+
+def test_a_walk_submission_copying_earlier_work_keeps_its_cursor():
+    job = _job()
+    slots, cursors = _state(job)
+    verdict = _call(job, slots, cursors, digests=["d0", "d0"], seen={"d0"})
+    assert verdict.reason == "hash_duplicate"
+    assert "within_submission" not in verdict.detail
+    assert cursors.expected("5Gx") == 0
+
+
+def test_a_repeating_submission_after_a_failed_cheap_check_keeps_its_cursor():
+    job = _job()
+    slots, cursors = _state(job)
+    verdict = _call(job, slots, cursors, digests=["d0", "d0"], token_counts=[10, 200])
+    assert verdict.reason == "token_budget_exceeded"
+    assert cursors.expected("5Gx") == 0
+
+
+def test_a_free_job_repeating_itself_moves_nothing():
+    job = _job(prompt_order=PROMPT_ORDER_FREE)
+    slots, cursors = _state(job)
+    verdict = _call(job, slots, cursors, cursor=0, prompt_index=3, digests=["d0", "d0"])
+    assert verdict.reason == "hash_duplicate"
+    assert "within_submission" not in verdict.detail
+    assert slots.filled == 0
