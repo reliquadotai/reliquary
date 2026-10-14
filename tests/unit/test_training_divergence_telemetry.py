@@ -11,7 +11,8 @@ def test_histogram_quantile():
     assert training._histogram_quantile(hist, 0.9) == 40.5
 
 
-def test_logit_histogram_observes_max_logit_rows():
+def test_logit_histogram_observes_max_logit_rows(monkeypatch):
+    monkeypatch.setenv(training.LOGIT_HISTOGRAM_ENV, "1")
     training._reset_logit_histogram()
     lm_head = torch.nn.Linear(4, 3, bias=False)
     with torch.no_grad():
@@ -39,8 +40,9 @@ def test_outside_clip_split_by_pi_old_probability():
     assert m["train/ppo_outside_clip_ratio_p_ge_0_1"] == 0.5
 
 
-def test_frozen_forwards_do_not_enter_the_logit_histogram():
+def test_frozen_forwards_do_not_enter_the_logit_histogram(monkeypatch):
     """Reference/behavior forwards run under no_grad: only the policy counts."""
+    monkeypatch.setenv(training.LOGIT_HISTOGRAM_ENV, "1")
     training._reset_logit_histogram()
     with torch.no_grad():
         training._observe_max_logits(torch.full((4, 3), 30.0))
@@ -52,3 +54,14 @@ def test_microbatch_budget_setting(monkeypatch):
     assert training._microbatch_budget() == training.MICROBATCH_MAX_PADDED_TOKENS
     monkeypatch.setenv("RELIQUARY_TRAINER_MICROBATCH_TOKENS", "8192")
     assert training._microbatch_budget() == 8192
+
+
+
+def test_logit_histogram_is_off_by_default(monkeypatch):
+    """Unset: no fp32 copy of the logits is taken and no metric is emitted."""
+    monkeypatch.delenv(training.LOGIT_HISTOGRAM_ENV, raising=False)
+    training._reset_logit_histogram()
+    logits = torch.full((4, 3), 30.0, requires_grad=True)
+    training._observe_max_logits(logits * 1.0)
+    assert float(training._logit_hist.sum()) == 0.0
+    assert training._logit_metrics() == {}

@@ -1095,6 +1095,14 @@ _LOGPROB_CHUNK = 512
 _LOGIT_HIST_WIDTH = 0.5
 _LOGIT_HIST_BINS = 256
 _logit_hist: Optional[torch.Tensor] = None
+# Telemetry only (nothing on the run path reads it), and it costs an fp32 copy of
+# each logits chunk: off unless this is "1". Every rank must see the same value
+# (it gates an all-reduce under fsdp2).
+LOGIT_HISTOGRAM_ENV = "RELIQUARY_TRAINER_LOGIT_HISTOGRAM"
+
+
+def _logit_histogram_enabled() -> bool:
+    return os.environ.get(LOGIT_HISTOGRAM_ENV, "").strip() == "1"
 
 
 def _reset_logit_histogram() -> None:
@@ -1107,7 +1115,7 @@ def _observe_max_logits(logits: torch.Tensor) -> None:
     # The policy forward runs with grad; reference/behavior forwards do not
     # and stay out. The histogram lives on the logits' device: no host sync
     # per chunk, read once at the end of the step.
-    if not torch.is_grad_enabled():
+    if not torch.is_grad_enabled() or not _logit_histogram_enabled():
         return
     with torch.no_grad():
         maxima = logits.detach().float().amax(dim=-1)
@@ -1132,6 +1140,8 @@ def _histogram_quantile(hist: torch.Tensor, q: float) -> float:
 
 
 def _logit_metrics() -> dict[str, float]:
+    if not _logit_histogram_enabled():
+        return {}
     hist = (
         _logit_hist if _logit_hist is not None
         else torch.zeros(_LOGIT_HIST_BINS, dtype=torch.float64)
@@ -2196,12 +2206,13 @@ def train_step(
         total_kl = totals["total_kl"]
         n_processed = totals["n_processed"]
         all_reduce_stats(kl_stats, _DIST, max_keys=KL_STAT_MAX_KEYS)
-        global _logit_hist
-        if _logit_hist is None:
-            _reset_logit_histogram()
-        from reliquary.trainer.distributed import all_reduce_tensor_sum
+        if _logit_histogram_enabled():
+            global _logit_hist
+            if _logit_hist is None:
+                _reset_logit_histogram()
+            from reliquary.trainer.distributed import all_reduce_tensor_sum
 
-        _logit_hist = all_reduce_tensor_sum(_logit_hist.to(_DIST.device)).cpu()
+            _logit_hist = all_reduce_tensor_sum(_logit_hist.to(_DIST.device)).cpu()
 
     if n_processed == 0:
         logger.info("train_step: no valid rollouts processed")

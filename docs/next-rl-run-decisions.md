@@ -564,3 +564,6 @@ behave exactly as before. The next run turns them on:
   trainer and the controller (the trainer then mirrors weights after the manifest and writes
   `reliquary_mirror_complete.json` last; the controller and the trainer's resume wait for it). Unset,
   every file is mirrored before the manifest and no marker is written or required, as before.
+- `RELIQUARY_TRAINER_LOGIT_HISTOGRAM=1` on the trainer (every rank) to log `train/max_logit_p50/p90`
+  (per-row max logit, the bf16 rounding watch). Telemetry only; off by default because it takes an fp32
+  copy of each logits chunk.
