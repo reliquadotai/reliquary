@@ -8871,78 +8871,13 @@ class ValidationService:
             await publisher.close()
 
     async def _serve_axon_on_chain(self, subtensor) -> None:
-        """Publish this validator's axon (ip:port) to the chain metagraph.
+        """Publish this validator's axon (ip:port) to the chain metagraph (``validator.axon``): miners read
+        ``metagraph.axons[uid].ip/port`` via ``discover_validator_url``. Without an external address, skipped
+        with a warning (miners then need ``--validator-url``)."""
+        from reliquary.validator.axon import serve_axon_on_chain
 
-        Miners read `metagraph.axons[uid].ip/port` via `discover_validator_url`
-        to route their submissions. Skipped with a warning when no external
-        address is configured — miners then need `--validator-url` overrides
-        to find this validator.
-        """
-        if not self.external_ip or not self.external_port:
-            logger.warning(
-                "serve_axon skipped: no external_ip/external_port provided. "
-                "Miners won't discover this validator via metagraph; use "
-                "--validator-url on the miner side."
-            )
-            return
-        if self._signer_client is not None:
-            try:
-                accepted = await self._signer_client.serve_axon(
-                    netuid=self.netuid,
-                    ip=self.external_ip,
-                    port=self.external_port,
-                )
-                if not accepted:
-                    logger.error(
-                        "remote signer rejected serve_axon for %s:%d on netuid %d",
-                        self.external_ip,
-                        self.external_port,
-                        self.netuid,
-                    )
-                    return
-                logger.info(
-                    "remote signer published axon: %s:%d on netuid %d",
-                    self.external_ip,
-                    self.external_port,
-                    self.netuid,
-                )
-                return
-            except Exception:
-                logger.exception("remote signer serve_axon operation failed")
-                return
-        try:
-            import bittensor as bt
-
-            axon = bt.Axon(
-                wallet=self.wallet,
-                ip=self.external_ip,
-                port=self.external_port,
-                external_ip=self.external_ip,
-                external_port=self.external_port,
-            )
-            response = await subtensor.serve_axon(
-                netuid=self.netuid,
-                axon=axon,
-                wait_for_inclusion=True,
-                wait_for_finalization=False,
-                raise_error=False,
-            )
-            success = getattr(response, "is_success", None)
-            if success is False:
-                logger.error(
-                    "serve_axon failed: %s:%d not published (response=%s). "
-                    "Likely: hotkey not registered on netuid %d, or chain rejected.",
-                    self.external_ip, self.external_port, response, self.netuid,
-                )
-                return
-            logger.info(
-                "serve_axon published: %s:%d announced on netuid %d",
-                self.external_ip, self.external_port, self.netuid,
-            )
-        except Exception:
-            logger.exception(
-                "serve_axon threw — miners will have to use --validator-url"
-            )
+        await serve_axon_on_chain(subtensor, wallet=self.wallet, netuid=self.netuid, ip=self.external_ip,
+                                  port=self.external_port, signer_client=self._signer_client)
 
     async def _bootstrap_state_from_external(self) -> None:
         """Derive window_n and checkpoint_n from R2 + HF.
