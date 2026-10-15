@@ -364,12 +364,14 @@ class RlSubmissions:
 
     # --- the trainer's report (P4) ------------------------------------------------------------------------
     def report_training(self, lease_id: str, *, rollout_match: Sequence[float], accepted: bool,
-                        failure_class: str | None = None, now: float | None = None) -> None:
+                        failure_class: str | None = None, matched_tokens: Sequence[int] | None = None,
+                        now: float | None = None) -> None:
         """The trainer's forward judged a buffered group: ``rollout_match`` per rollout (match rate against the
         published checkpoint, §4.6), ``accepted`` the group verdict. An accepted group is payable (P5 pays the
         matched tokens of rollouts above the floor); a rejected one is unpaid and, when ``failure_class`` says the
         rejection is evidence (not staleness from waiting in the buffer), sanctioned like a failed audit.
-        LookupError: not a buffered group."""
+        ``matched_tokens``: per rollout, the positions equal to the validator's pick (what P5 pays); without it the
+        ledger uses ``floor(match x completion tokens)``. LookupError: not a buffered group."""
         now = float(self.clock()) if now is None else now
         with self.book.transaction():
             group = self.buffer.get(lease_id)
@@ -378,10 +380,15 @@ class RlSubmissions:
             match = [float(m) for m in rollout_match]
             if len(match) != len(group.completions) or not all(0.0 <= m <= 1.0 for m in match):
                 raise ValueError("one match rate in [0, 1] per rollout")
+            if matched_tokens is not None and (len(matched_tokens) != len(match) or not all(
+                    0 <= int(n) <= len(c) for n, c in zip(matched_tokens, group.completions))):
+                raise ValueError("one matched token count in [0, completion length] per rollout")
             self.book.db.execute("UPDATE rl_groups SET training=? WHERE lease_id=?",
                                  ("accepted" if accepted else REJECTED, lease_id))
             detail = {"rollout_match": match, "completion_tokens": [len(c) for c in group.completions],
                       "checkpoint": group.checkpoint, "environment": group.environment}
+            if matched_tokens is not None:
+                detail["matched_tokens"] = [int(n) for n in matched_tokens]
             if accepted:
                 self._event(lease_id, group.hotkey, TRAINED, now, detail)
                 self._verdict(lease_id, group.hotkey, "training", True, None, False, now)

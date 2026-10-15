@@ -703,3 +703,40 @@ over the module-level `batcher.admission_problem_materials`, shared with P3).
   verdicts count in the recidivism window, never as probation passes; an inconclusive audit forfeits the first-scan
   pay without sanction; a lease that expires while its group is being graded is refused (the arrival time is used,
   but a concurrent sweep can still expire it: grading is short next to the expiry).
+
+## 7. P5 as built (branch `feat/rl-pay`): pay, async prices, `/rl/pay`
+
+New code next to the window path (`emission_price`, `settlement`, `rl_pay`, `weight_only` unchanged).
+
+- `validator/rl_ledger.py`: `RlPayLedger` reads `RlSubmissions.events(since)` (cursor persisted) into `rl_accruals`
+  (same SQLite file). `trained`: flat pay, matched tokens of every rollout with match >= `floor` (0.95; re-checked
+  even though the trainer masks them) x the env's price per token at ingestion. Matched tokens = the trainer's
+  exact counts (`report_training(..., matched_tokens=[...])`, new optional argument, bounded by the completion
+  length), else `floor(match x completion tokens)`. `first_scan`: `fraction` (0.25) x **an in-zone group's pay**,
+  defined as the env's price per token x the mean matched tokens of the env's last 200 trained groups in the ledger
+  (16,384 before any); never the out-of-zone group's own length (a 0/16 group is cheap to make long). P3 already
+  emits it at once when not drawn, at pass when drawn; failed or inconclusive audits emit `first_scan_forfeited`
+  (no money). `ban`: unsettled accruals of the hotkey forfeited, and any payable event dated before the ban's end;
+  settled periods are not clawed back.
+- Epochs = the drand periods of `corpus_periods` (4,320 s = one Bittensor epoch). `settle(now)`: a period closes
+  `slack_s` (120 s) after its end; per hotkey sum, normalised to the task cap (`scale = min(1, cap / total)`, the
+  rest burns); one archive per period (`reliquary/rl-async-period/v1`: `work_period`, `entry_period` by
+  `cp.entry_for`, `rewards_by_hotkey`, plus the nominal accruals, scale and tokens). An accrual landing after its
+  period settled goes to the next open period. `publish(archives)` writes them through an `R2PeriodArchives`-like
+  `write` (an entry period already begun is moved forward first, as the corpus settler does). On chain: the
+  unchanged `weight_only._period_weights` pays these archives (per-period EMA, per-task cap, `CATCHUP_ENTRIES`)
+  once the async RL task is declared with `params.settlement = "period-ema-v1"`; no window archive is needed.
+- `validator/rl_price.py`: `AsyncPriceController` keeps the window controller's `PriceParams` (base =
+  production values with `cap = 4.0`), `PriceState`, `PriceDecision` and walk; ticks on time (`tick_s` 300 s,
+  `due`) or per trainer step (`tick`). Descend (`decay` scaled to the tick) when `TrainingBuffer.depth()[env] >
+  overflow_groups` (64); else rise (x1.10) when the trainer waited on the env > 5 % of the tick (`note_wait`) or
+  its share of the tick's trained tokens (`RlPayLedger.trained_tokens`) is < 0.9 x target; else hold. Clamped to
+  [0.05, 4.0]. Per-token price = multiplier x cap x target share / `planned_tokens_per_period` (at 1, the planned
+  consumption at target mix pays exactly the cap). Snap and breaker dropped (no window to fill). State in
+  `rl_prices` (restart-safe).
+- `GET /rl/pay?hotkey=` (`build_rl_lease_router(pay=ledger)`): per-env multiplier, token price, per-Mtok price,
+  target, regime and last signal; per-hotkey accrued / paid / forfeited / banned_until; the last settled periods.
+  `ValidatorServer.mount_rl_lease_router` now replaces an app route at the same path and method, so mounting it
+  supersedes the window board's `/rl/pay`.
+- Not wired yet (P4/service): a loop that runs `ingest`, `controller.tick(ledger.trained_tokens(...),
+  buffer.depth())` when `due`, `settle` and `publish`; the registry entry of the async task.

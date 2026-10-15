@@ -19,6 +19,8 @@ builds a ``LeaseBook`` and a ``LeaseCollector`` and mounts ``build_rl_lease_rout
   authenticated like a lease request with its own per-minute bound, inflated only after. Graded off the event loop (``RlSubmissions.submit``); the answer is
   the verdict and the validator's rewards. A malformed group is refused before the lease is touched (it stays
   open); a grader outage answers 503 (resend).
+* ``GET {prefix}/pay?hotkey=`` (mounted when ``pay`` is given, an ``rl_ledger.RlPayLedger``): per-env prices and
+  per-hotkey accrued / paid / forfeited (public, like the window board it replaces when mounted on the server).
 """
 from __future__ import annotations
 
@@ -201,7 +203,8 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
                           verify: Callable[..., bool] = verify_rl_lease_signature,
                           registration: Callable[[str], Awaitable[str | None]] | None = None,
                           clock: Callable[[], float] = time.time, submissions=None,
-                          verify_submit: Callable[..., bool] = verify_rl_submit_signature) -> APIRouter:
+                          verify_submit: Callable[..., bool] = verify_rl_submit_signature,
+                          pay=None) -> APIRouter:
     audience = ss58_address(validator_hotkey)
     if audience is None:
         raise ValueError("validator_hotkey must be an ss58 account address")
@@ -326,6 +329,14 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
         if not (since.isascii() and since.isdigit()) or len(since) > 19:
             return _refusal("malformed_request", {"errors": [{"loc": ["since"], "type": "cursor"}]})
         return _answer(await asyncio.to_thread(book.prompt_state, int(since), environment=environment))
+
+    if pay is not None:
+        @router.get(f"{prefix}/pay")
+        async def rl_pay(hotkey: str | None = None) -> JSONResponse:
+            if hotkey is not None and ss58_address(hotkey) is None:
+                return _refusal("malformed_request", {"errors": [{"loc": ["hotkey"], "type": "ss58_address"}]})
+            now = float(clock())
+            return _answer(await asyncio.to_thread(pay.board, now, hotkey))
 
     if submissions is None:
         return router
