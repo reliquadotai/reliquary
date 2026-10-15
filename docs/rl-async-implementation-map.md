@@ -649,11 +649,19 @@ P2 and P1a can run in parallel. P5 can start once P1a fixes the v* format.
 - `reliquary/validator/rl_leases.py`: `LeaseBook` (SQLite, WAL, `synchronous=FULL`, file `0600`; partial unique
   index = one live lease per (env, prompt, k)), `LeaseCollector` (interval batching, `random.SystemRandom` shuffle
   of all (request, prompt) claims), nonce `H(NONCE_DOMAIN, S_k, env, prompt, k)`, commitment
-  `H(COMMIT_DOMAIN, S_k, k)`, reveal when `k < latest - max_lag`. Refusals: taken / cooling / quota / stale.
-  Cooldown: `checkpoint_cooldown(maps)` over the existing `CooldownMap` with k as the unit (C6). A lease due while
-  the validator was down is extended to `now + restart_grace_s` at boot.
+  `H(COMMIT_DOMAIN, S_k, k)`, reveal when `k < latest - max_lag` (`SECRET_REVEAL_LAG = 16`); leases only on a k
+  whose S_k is unrevealed. Refusals: taken / cooling / blacklisted / quota / stale. A lease due while the validator
+  was down is extended to `now + restart_grace_s` at boot.
+- Prompt lifecycle (design §4.5), in the same file: `classify_group(rewards, truncated)` (population sigma >=
+  `SIGMA_MIN_V4` = 0.24, at most `MAX_TRUNCATED_PER_SUBMISSION` truncated, then mean >= 0.5 too easy, else too
+  hard); `LeaseBook.record_outcome(env, prompt, k, rewards, verdict)` (P3 calls it after grading) appends to
+  `rl_prompt_scans` (with `first_scan` for P5) and sets `rl_prompt_state`: too easy = blacklisted for the run, every
+  other verdict = cooldown until `latest + cooldown` checkpoints (per env, default `COOLDOWN_CHECKPOINTS` = 256,
+  PROPOSED; `CooldownMap`'s half-open rule; C6). `prompt_state(since)` is the incremental miner view. The former
+  `checkpoint_cooldown(maps)` predicate is gone: the cooldown now lives in the lease DB.
 - `reliquary/validator/rl_lease_quota.py`: `QuotaController` (AIMD cap with slow start, halving on expiry,
   Little's-law target `headroom x throughput x latency` once steady, persisted in the lease book's file).
 - `reliquary/validator/rl_lease_routes.py`: `POST /rl/lease` (signed, `build_rl_lease_binding` in
-  `protocol/signatures.py`), `GET /rl/quota?hotkey=`, `GET /rl/lease/commitments`; `ValidatorServer
-  .mount_rl_lease_router`. Not mounted by the CLI/service yet (P3), and `LeaseBook.submit` is the hook P3 calls.
+  `protocol/signatures.py`), `GET /rl/quota?hotkey=`, `GET /rl/lease/commitments`, `GET /rl/prompts/state?since=`
+  (public, no hotkey); `ValidatorServer.mount_rl_lease_router`. Not mounted by the CLI/service yet (P3);
+  `LeaseBook.submit` and `LeaseBook.record_outcome` are the hooks P3 calls.

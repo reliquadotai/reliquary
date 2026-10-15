@@ -1,6 +1,6 @@
 """The lease routes: ``POST /rl/lease`` (signed by the miner's hotkey for this validator and route, like the other RL
-requests), ``GET /rl/quota?hotkey=`` (the explainable quota) and ``GET /rl/lease/commitments`` (S_k commitments and
-revealed secrets)."""
+requests), ``GET /rl/quota?hotkey=`` (the explainable quota), ``GET /rl/lease/commitments`` (S_k commitments and
+revealed secrets) and ``GET /rl/prompts/state`` (the prompt lifecycle, incremental)."""
 from __future__ import annotations
 
 import random
@@ -150,6 +150,26 @@ def test_the_commitments_route_lists_no_open_lease(served):
     assert "lease" not in str(content).replace("rl-lease", "")
 
 
+def test_the_prompt_state_route_serves_the_lifecycle_from_a_cursor(served):
+    client = client_for(served)
+    assert client.post("/rl/lease", json=body(prompts=(3,))).status_code == 200
+    served.record_outcome(ENV, 1, 0, [1.0] * 16, "too_easy")
+    served.record_outcome(ENV, 2, 0, [1.0] + [0.0] * 15, "in_zone")
+    answer = client.get("/rl/prompts/state")
+    assert answer.status_code == 200 and answer.headers["cache-control"] == "no-store"
+    content = answer.json()
+    assert [(p["prompt_idx"], p["state"]) for p in content["prompts"]] == [(1, "blacklisted"), (2, "cooldown")]
+    assert [s["verdict"] for s in content["scans"]] == ["too_easy", "in_zone"] and content["latest"] == 0
+    assert MINER.ss58_address not in answer.text
+    later = client.get("/rl/prompts/state", params={"since": content["cursor"]}).json()
+    assert later["scans"] == [] and later["prompts"] == [] and later["cursor"] == content["cursor"]
+    assert client.get("/rl/prompts/state", params={"environment": "code"}).json()["scans"] == []
+    refused = client.post("/rl/lease", json=body(prompts=(1, 2, 4), at=NOW + 1)).json()["refused"]
+    assert refused == [{"prompt_idx": 1, "reason": "blacklisted"}, {"prompt_idx": 2, "reason": "cooling"}]
+    for bad in ("-1", "x", "1" * 20):
+        assert client.get("/rl/prompts/state", params={"since": bad}).status_code == 422
+
+
 def test_the_validator_server_mounts_the_lease_routes(served):
     from reliquary.validator.server import ValidatorServer
 
@@ -158,4 +178,4 @@ def test_the_validator_server_mounts_the_lease_routes(served):
         book=served, collector=LeaseCollector(served, interval_s=0.0), validator_hotkey=VALIDATOR.ss58_address,
         clock=lambda: float(NOW)))
     paths = {getattr(route, "path", "") for route in server.app.routes}
-    assert {"/rl/lease", "/rl/quota", "/rl/lease/commitments"} <= paths
+    assert {"/rl/lease", "/rl/quota", "/rl/lease/commitments", "/rl/prompts/state"} <= paths

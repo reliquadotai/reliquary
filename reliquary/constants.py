@@ -740,7 +740,10 @@ DEFAULT_HF_REPO_ID = "aivolutionedge/reliquary-sn"
 # softens the manufactured-variance surface — deliberate, see the v4 cutover
 # plan; the auction value σ-weighting and forced-seed / distribution layers are
 # the remaining defense. v3 keeps 0.43/0.33 so live economics are byte-identical.
-SIGMA_MIN = 0.24 if PROTOCOL_VERSION >= 4 else 0.43
+# The async RL lifecycle (rl-async-design.md §4.4) is a 16-rollout protocol: it uses the v4 gate whatever the
+# active profile.
+SIGMA_MIN_V4 = 0.24
+SIGMA_MIN = SIGMA_MIN_V4 if PROTOCOL_VERSION >= 4 else 0.43
 BOOTSTRAP_SIGMA_MIN = 0.22 if PROTOCOL_VERSION >= 4 else 0.33
 
 # Number of rollouts per submission (= size of each GRPO group).

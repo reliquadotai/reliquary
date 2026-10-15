@@ -1,7 +1,8 @@
 """The RL lease book (design rl-async-design.md §4.2, P2): exclusive leases per (env, prompt, checkpoint k),
 random resolution of the conflicts collected in one interval, refusals that say only taken / cooling / quota /
 stale, a nonce H(S_k, env, prompt, k) committed when k is adopted and revealed when k retires, fixed expiry per
-env, and restart safety (SQLite, like the service runtime)."""
+env, restart safety (SQLite, like the service runtime), and the prompt lifecycle of §4.5 (verdict, blacklist,
+cooldown, first scan, the miners' incremental view)."""
 from __future__ import annotations
 
 import asyncio
@@ -10,11 +11,11 @@ import random
 
 import pytest
 
-from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.rl_lease_quota import QuotaConfig, QuotaController
 from reliquary.validator.rl_leases import (
-    COOLING, QUOTA, RESTART_GRACE_S, STALE, TAKEN, LeaseBook, LeaseBookConfig, LeaseCollector, LeaseRequest, checkpoint_cooldown,
-    lease_expiry_s, lease_nonce, secret_commitment, verify_reveal,
+    BLACKLISTED, COOLING, IN_ZONE, QUOTA, RESTART_GRACE_S, SECRET_REVEAL_LAG, STALE, TAKEN, TOO_EASY, TOO_HARD,
+    TRUNCATED, LeaseBook, LeaseBookConfig, LeaseCollector, LeaseRequest, classify_group, lease_expiry_s, lease_nonce,
+    secret_commitment, verify_reveal,
 )
 
 ENV, OTHER_ENV = "math", "code"
@@ -29,12 +30,11 @@ class Clock:
         return self.t
 
 
-def book_at(tmp_path, *, clock=None, cooling=None, rng=None, quota=None, name="leases.sqlite3", **config):
+def book_at(tmp_path, *, clock=None, rng=None, quota=None, name="leases.sqlite3", **config):
     clock = clock or Clock()
     cfg = LeaseBookConfig(expiry_s={ENV: 600.0, OTHER_ENV: 1200.0}, **config)
     quota = quota or QuotaController(QuotaConfig(initial=4, ceiling=4096))
-    return LeaseBook(tmp_path / name, cfg, quota=quota, clock=clock, cooling=cooling,
-                     rng=rng or random.Random(7))
+    return LeaseBook(tmp_path / name, cfg, quota=quota, clock=clock, rng=rng or random.Random(7))
 
 
 def ask(hotkey, prompts, k=0, env=ENV):
@@ -220,15 +220,14 @@ def test_leases_on_checkpoints_older_than_the_max_lag_or_unknown_are_stale(tmp_p
     assert book.grant([ask("A", [2], k=7)])[0].refused == {2: STALE}     # not adopted yet
 
 
-def test_a_prompt_trained_recently_is_cooling(tmp_path):
-    maps = {ENV: CooldownMap(3)}
-    book = book_at(tmp_path, cooling=checkpoint_cooldown(maps))
-    book.adopt_checkpoint(10)
-    maps[ENV].record_batched(1, 9)                                       # trained at checkpoint 9
-    (answer,) = book.grant([ask("A", [1, 2], k=10)])
-    assert answer.refused == {1: COOLING} and [x.prompt_idx for x in answer.leases] == [2]
-    book.adopt_checkpoint(12)
-    assert book.grant([ask("A", [1], k=12)])[0].leases                   # 12 - 9 >= 3
+def test_a_checkpoint_whose_secret_is_revealed_is_never_leased(tmp_path):
+    book = book_at(tmp_path)
+    assert book.config.max_lag == SECRET_REVEAL_LAG == 16
+    for k in range(18):
+        book.adopt_checkpoint(k)
+    assert [c["k"] for c in book.commitments()["revealed"]] == [0]       # 0 < 17 - 16
+    assert book.grant([ask("A", [1], k=0)])[0].refused == {1: STALE}
+    assert book.grant([ask("A", [1], k=1)])[0].leases                    # lag 16, secret still unrevealed
 
 
 def test_a_hotkey_never_holds_more_open_leases_than_its_quota(tmp_path):
@@ -336,3 +335,122 @@ def test_the_database_file_is_private(tmp_path):
     book = book_at(tmp_path)
     book.adopt_checkpoint(0)
     assert (tmp_path / "leases.sqlite3").stat().st_mode & 0o077 == 0
+
+
+# --- prompt lifecycle (§4.5) ------------------------------------------------------------------------------------
+
+def binary(correct, n=16):
+    return [1.0] * correct + [0.0] * (n - correct)
+
+
+def test_the_verdict_follows_sigma_mean_and_truncation():
+    clean = [False] * 16
+    assert classify_group(binary(1), clean) == IN_ZONE                   # sigma 0.242
+    assert classify_group(binary(15), clean) == IN_ZONE
+    assert classify_group(binary(16), clean) == TOO_EASY
+    assert classify_group(binary(0), clean) == TOO_HARD
+    one, two = [True] + [False] * 15, [True, True] + [False] * 14
+    assert classify_group(binary(8), one) == IN_ZONE                     # one truncated rollout is allowed
+    assert classify_group(binary(8), two) == TRUNCATED
+    assert classify_group(binary(16), two) == TRUNCATED                  # never blacklisted on a truncated group
+    # continuous rewards with too little variance: mean >= 0.5 is too easy, below too hard
+    assert classify_group([0.5, 0.52] * 8, clean) == TOO_EASY
+    assert classify_group([0.3, 0.32] * 8, clean) == TOO_HARD
+    assert classify_group([0.0, 0.6] * 8, clean) == IN_ZONE
+    for bad in (([], []), (binary(8), [False] * 15), ([float("nan")] * 16, clean)):
+        with pytest.raises(ValueError):
+            classify_group(*bad)
+
+
+def test_too_easy_blacklists_the_prompt_for_the_run(tmp_path):
+    book = book_at(tmp_path)
+    book.adopt_checkpoint(0)
+    book.record_outcome(ENV, 1, 0, binary(16), TOO_EASY)
+    for k in (1, 500):
+        book.adopt_checkpoint(k)
+        assert book.grant([ask("A", [1], k=k)])[0].refused == {1: BLACKLISTED}
+    book.record_outcome(ENV, 1, 0, binary(8), IN_ZONE)                    # a late in-zone group lifts nothing
+    assert book.grant([ask("A", [1], k=500)])[0].refused == {1: BLACKLISTED}
+    assert book.grant([ask("A", [1], k=500, env=OTHER_ENV)])[0].leases   # the same index elsewhere is another prompt
+
+
+@pytest.mark.parametrize("verdict", [IN_ZONE, TOO_HARD, TRUNCATED])
+def test_in_zone_too_hard_and_truncated_cool_down_then_lease_again(tmp_path, verdict):
+    book = book_at(tmp_path, cooldown={ENV: 3})
+    book.adopt_checkpoint(10)
+    book.record_outcome(ENV, 1, 9, binary(8), verdict)                   # leased at 9: counts from the latest, 10
+    (answer,) = book.grant([ask("A", [1, 2], k=10)])
+    assert answer.refused == {1: COOLING} and [x.prompt_idx for x in answer.leases] == [2]
+    book.adopt_checkpoint(12)
+    assert book.grant([ask("A", [1], k=12)])[0].refused == {1: COOLING}
+    book.adopt_checkpoint(13)
+    assert book.grant([ask("A", [1], k=13)])[0].leases                   # 13 = 10 + 3
+    assert book.prompt_state()["prompts"] == [{"environment": ENV, "prompt_idx": 1, "state": "cooldown",
+                                               "until_k": 13}]
+
+
+def test_a_later_outcome_never_shortens_a_cooldown(tmp_path):
+    book = book_at(tmp_path, cooldown={ENV: 10})
+    book.adopt_checkpoint(20)
+    book.record_outcome(ENV, 1, 20, binary(8), IN_ZONE)
+    book.record_outcome(ENV, 1, 5, binary(0), TOO_HARD)
+    assert book.prompt_state()["prompts"][0]["until_k"] == 30
+
+
+def test_only_the_first_scan_of_a_prompt_in_the_run_is_flagged(tmp_path):
+    book = book_at(tmp_path, cooldown={ENV: 1})
+    book.adopt_checkpoint(0)
+    first = book.record_outcome(ENV, 1, 0, binary(0), TOO_HARD)
+    again = book.record_outcome(ENV, 1, 2, binary(0), TOO_HARD)
+    other = book.record_outcome(OTHER_ENV, 1, 0, binary(4), IN_ZONE)
+    assert (first.first_scan, again.first_scan, other.first_scan) == (True, False, True)
+    assert first.rewards == tuple(binary(0)) and first.verdict == TOO_HARD and first.seq < again.seq
+
+
+def test_an_outcome_is_validated(tmp_path):
+    book = book_at(tmp_path)
+    book.adopt_checkpoint(0)
+    for bad in ((ENV, 1, 0, binary(8), "maybe"), ("unknown", 1, 0, binary(8), IN_ZONE), (ENV, -1, 0, binary(8),
+                IN_ZONE), (ENV, 1, 0, [], IN_ZONE), (ENV, 1, 0, [float("inf")], IN_ZONE)):
+        with pytest.raises(ValueError):
+            book.record_outcome(*bad)
+    assert book.prompt_state()["scans"] == []
+
+
+def test_the_prompt_view_is_incremental_and_names_no_hotkey(tmp_path):
+    book = book_at(tmp_path)
+    book.adopt_checkpoint(0)
+    assert book.prompt_state() == {"latest": 0, "cursor": 0, "more": False, "scans": [], "prompts": []}
+    lease = book.grant([ask("hotkey-of-the-miner", [1, 2])])[0].leases[0]
+    book.submit(lease.lease_id, "hotkey-of-the-miner", in_zone=False)
+    book.record_outcome(ENV, 1, 0, binary(16), TOO_EASY)
+    book.record_outcome(ENV, 2, 0, binary(8), IN_ZONE)
+    book.record_outcome(OTHER_ENV, 3, 0, binary(0), TOO_HARD)
+    full = book.prompt_state()
+    assert [s["prompt_idx"] for s in full["scans"]] == [1, 2, 3] and full["cursor"] == full["scans"][-1]["seq"]
+    assert [(p["prompt_idx"], p["state"], p["until_k"]) for p in full["prompts"]] == [
+        (1, "blacklisted", None), (2, "cooldown", 256), (3, "cooldown", 256)]
+    assert full["scans"][0]["rewards"] == binary(16) and full["scans"][0]["first_scan"] is True
+    assert "hotkey-of-the-miner" not in repr(full) and "nonce" not in repr(full)
+    # paging: a cursor returns only what moved after it, and a prompt once per page with its current state
+    page = book.prompt_state(limit=2)
+    assert page["more"] and [s["prompt_idx"] for s in page["scans"]] == [1, 2]
+    book.record_outcome(ENV, 2, 0, binary(16), TOO_EASY)
+    rest = book.prompt_state(page["cursor"])
+    assert not rest["more"] and [s["prompt_idx"] for s in rest["scans"]] == [3, 2]
+    assert [(p["prompt_idx"], p["state"]) for p in rest["prompts"]] == [(3, "cooldown"), (2, "blacklisted")]
+    assert book.prompt_state(rest["cursor"])["scans"] == []
+    only = book.prompt_state(environment=OTHER_ENV)
+    assert [s["prompt_idx"] for s in only["scans"]] == [3] and len(only["prompts"]) == 1
+
+
+def test_the_prompt_lifecycle_survives_a_restart(tmp_path):
+    book = book_at(tmp_path)
+    book.adopt_checkpoint(0)
+    book.record_outcome(ENV, 1, 0, binary(16), TOO_EASY)
+    view = book.prompt_state()
+    book.close()
+    reopened = book_at(tmp_path)
+    assert reopened.prompt_state() == view
+    assert reopened.grant([ask("A", [1])])[0].refused == {1: BLACKLISTED}
+    assert reopened.record_outcome(ENV, 1, 0, binary(16), TOO_EASY).first_scan is False

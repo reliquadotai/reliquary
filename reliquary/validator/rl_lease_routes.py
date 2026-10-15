@@ -8,9 +8,11 @@ builds a ``LeaseBook`` and a ``LeaseCollector`` and mounts ``build_rl_lease_rout
   ``MAX_PREAUTH`` decoded and verified at once (the signature in a worker thread), the registration checked, a
   signature answered once (``request_reused``), the hotkey's minute counted after verification. The request then
   waits for its interval and is resolved with the others (``LeaseCollector``). The answer lists the caller's leases
-  and, per refused prompt, only ``taken`` / ``cooling`` / ``quota`` / ``stale``.
+  and, per refused prompt, only ``taken`` / ``cooling`` / ``blacklisted`` / ``quota`` / ``stale``.
 * ``GET {prefix}/quota?hotkey=``: the hotkey's explainable quota (public, like ``/rl/pay``; it lists no lease).
 * ``GET {prefix}/lease/commitments``: the commitments of the leasable checkpoints and the revealed secrets.
+* ``GET {prefix}/prompts/state?since=&environment=``: the prompt lifecycle (``LeaseBook.prompt_state``): the scans
+  after cursor ``since`` and the state (cooldown until k, blacklisted) of the prompts they moved. Public, no hotkey.
 """
 from __future__ import annotations
 
@@ -255,6 +257,12 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
     @router.get(f"{prefix}/lease/commitments")
     async def commitments() -> JSONResponse:
         return _answer(await asyncio.to_thread(book.commitments))
+
+    @router.get(f"{prefix}/prompts/state")
+    async def prompt_state(since: str = "0", environment: str | None = None) -> JSONResponse:
+        if not (since.isascii() and since.isdigit()) or len(since) > 19:
+            return _refusal("malformed_request", {"errors": [{"loc": ["since"], "type": "cursor"}]})
+        return _answer(await asyncio.to_thread(book.prompt_state, int(since), environment=environment))
 
     return router
 

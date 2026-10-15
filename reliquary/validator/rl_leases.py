@@ -9,13 +9,18 @@ generates them, and every lease ends in a submission or an expiry (there is no r
   and ``LeaseBook.grant`` resolves the whole batch at once: every (request, prompt) claim is shuffled with the
   validator's own randomness (``random.SystemRandom``) and taken in that order, so a contested prompt goes to a
   uniformly random requester that still has quota; arriving first inside the interval buys nothing.
-* **Refusals say only** ``taken`` / ``cooling`` / ``quota`` / ``stale``: never who holds a prompt, when its lease
-  ends, or which leases are open. ``taken`` covers both an open lease of someone else and a key closed by a
-  submission. A resend by the holder answers its own open lease again (a lost response is not a lost lease).
-* **Cooling** (resolution C6): a prompt trained recently is refused. The book asks a ``cooling(env, prompt,
-  latest_k)`` predicate; ``checkpoint_cooldown`` adapts the existing per-env ``CooldownMap`` with checkpoints as
-  its unit (the trainer side records ``record_batched(prompt, k)`` when it trains a prompt, P4).
-* **Stale:** a lease on a k that is not adopted, or older than ``latest - max_lag`` (S = 4), is refused.
+* **Refusals say only** ``taken`` / ``cooling`` / ``blacklisted`` / ``quota`` / ``stale``: never who holds a
+  prompt, when its lease ends, or which leases are open. ``taken`` covers both an open lease of someone else and a key
+  closed by a submission. A resend by the holder answers its own open lease again (a lost response is not a lost lease).
+* **Prompt lifecycle** (§4.5): ``record_outcome`` (called by the submission path, P3, once a group is graded)
+  appends the scan to a public history and moves the prompt: too easy is blacklisted for the run; in zone, too
+  hard and truncated cool down until checkpoint ``latest + cooldown`` (``CooldownMap``'s half-open rule, in
+  checkpoints: leasable again once the latest k reaches it). A never-scanned prompt has no row and is leasable.
+  ``classify_group`` gives the verdict from the rewards and truncation flags. ``prompt_state`` is the miners'
+  incremental view (no hotkey, no token): states and scans after a cursor.
+* **Stale:** a lease on a k that is not adopted, or whose S_k is revealed, is refused (§4.6: leases only on
+  checkpoints whose secret is unrevealed). S_k is revealed once k < ``latest - max_lag``, ``SECRET_REVEAL_LAG``
+  (16) by default: late enough never to bind an honest miner; there is no other lag cap.
 * **Expiry** is fixed per environment (``lease_expiry_s``: the env's max tokens at a slow reference speed, times a
   margin), never derived from the miner. ``expire_due`` sweeps (each ``grant`` and ``submit`` sweeps too) and
   halves the hotkey's quota.
@@ -36,19 +41,26 @@ import contextlib
 import hashlib
 import os
 import random
+import json
+import math
 import secrets as _secrets
 import sqlite3
+import statistics
 import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from reliquary.constants import MAX_TRUNCATED_PER_SUBMISSION, SIGMA_MIN_V4
 from reliquary.validator.rl_lease_quota import QuotaController
 
-TAKEN, COOLING, QUOTA, STALE = "taken", "cooling", "quota", "stale"
-REFUSALS = frozenset({TAKEN, COOLING, QUOTA, STALE})
+TAKEN, COOLING, BLACKLISTED, QUOTA, STALE = "taken", "cooling", "blacklisted", "quota", "stale"
+REFUSALS = frozenset({TAKEN, COOLING, BLACKLISTED, QUOTA, STALE})
 OPEN, SUBMITTED, EXPIRED = "open", "submitted", "expired"
+IN_ZONE, TOO_EASY, TOO_HARD, TRUNCATED = "in_zone", "too_easy", "too_hard", "truncated"
+VERDICTS = frozenset({IN_ZONE, TOO_EASY, TOO_HARD, TRUNCATED})
+COOLDOWN = "cooldown"                    # a prompt's stored state is COOLDOWN (until_k) or BLACKLISTED
 
 NONCE_DOMAIN = b"reliquary/rl-lease-nonce/v1"
 COMMIT_DOMAIN = b"reliquary/rl-lease-secret-commit/v1"
@@ -57,6 +69,9 @@ MAX_REVEALED_LISTED = 64
 MAX_PROMPTS_PER_REQUEST = 1024
 INTERVAL_S = 1.0          # the collection interval inside which arrival order buys nothing
 RESTART_GRACE_S = 120.0   # what a lease that fell due while the validator was down gets at boot
+SECRET_REVEAL_LAG = 16    # S_k is revealed, and k stops being leasable, once k < latest - this
+COOLDOWN_CHECKPOINTS = 256  # PROPOSED until qualification sets it per env (decision E)
+MAX_SCANS_PER_PAGE = 1000
 
 
 def _bound(domain: bytes, parts: list[bytes]) -> bytes:
@@ -96,12 +111,19 @@ def lease_expiry_s(*, max_tokens: int, reference_tokens_per_s: float, margin: fl
     return float(max_tokens) / float(reference_tokens_per_s) * float(margin)
 
 
-def checkpoint_cooldown(maps: Mapping[str, object]) -> Callable[[str, int, int], bool]:
-    """A ``cooling`` predicate over per-env ``CooldownMap``s whose unit is the checkpoint k."""
-    def cooling(environment: str, prompt_idx: int, checkpoint: int) -> bool:
-        cooldown = maps.get(environment)
-        return cooldown is not None and cooldown.is_in_cooldown(prompt_idx, checkpoint)
-    return cooling
+def classify_group(rewards, truncated, *, max_truncated: int = MAX_TRUNCATED_PER_SUBMISSION,
+                   sigma_min: float = SIGMA_MIN_V4) -> str:
+    """A graded group's verdict: ``truncated`` past ``max_truncated``, else ``in_zone`` at population sigma >=
+    ``sigma_min`` (1/16 and 15/16: 0.242), else ``too_easy`` at mean >= 0.5 (16/16), else ``too_hard`` (0/16).
+    Truncation comes first: blacklisting is final, so it needs a clean group."""
+    rewards = [float(r) for r in rewards]
+    if not rewards or len(rewards) != len(truncated) or not all(math.isfinite(r) for r in rewards):
+        raise ValueError("one finite reward and one truncation flag per rollout")
+    if sum(bool(t) for t in truncated) > max_truncated:
+        return TRUNCATED
+    if statistics.pstdev(rewards) >= sigma_min:
+        return IN_ZONE
+    return TOO_EASY if statistics.fmean(rewards) >= 0.5 else TOO_HARD
 
 
 @dataclass(frozen=True)
@@ -131,6 +153,25 @@ class Lease:
                 "expires_at": self.expires_at}
 
 
+@dataclass(frozen=True)
+class Scan:
+    """One graded group of a prompt, as published (no hotkey, no token). ``first_scan``: the prompt had never been
+    scanned in the run (an out-of-zone first scan is paid 25 % after audit, P5)."""
+    seq: int
+    environment: str
+    prompt_idx: int
+    checkpoint: int
+    rewards: tuple[float, ...]
+    verdict: str
+    first_scan: bool
+    at: float
+
+    def to_public(self) -> dict:
+        return {"seq": self.seq, "environment": self.environment, "prompt_idx": self.prompt_idx,
+                "checkpoint": self.checkpoint, "rewards": list(self.rewards), "verdict": self.verdict,
+                "first_scan": self.first_scan, "at": self.at}
+
+
 @dataclass
 class LeaseAnswer:
     leases: list[Lease] = field(default_factory=list)
@@ -144,14 +185,20 @@ class LeaseAnswer:
 @dataclass(frozen=True)
 class LeaseBookConfig:
     expiry_s: Mapping[str, float]                              # per served env: ``lease_expiry_s``
-    max_lag: int = 4
+    max_lag: int = SECRET_REVEAL_LAG
     prompt_range: Mapping[str, tuple[int, int]] | None = None  # per env: ``rl_prompt_ranges.rl_prompt_range``
+    cooldown: Mapping[str, int] | None = None                  # per env, in checkpoints (``COOLDOWN_CHECKPOINTS``)
 
     def __post_init__(self) -> None:
         if not self.expiry_s or any(not (float(v) > 0) for v in self.expiry_s.values()):
             raise ValueError("every served environment needs a positive lease expiry")
         if self.max_lag < 0:
             raise ValueError("max_lag must be non-negative")
+        if any(type(v) is not int or v < 0 for v in (self.cooldown or {}).values()):
+            raise ValueError("cooldowns must be non-negative integers")
+
+    def cooldown_of(self, environment: str) -> int:
+        return (self.cooldown or {}).get(environment, COOLDOWN_CHECKPOINTS)
 
 
 _SCHEMA = """
@@ -165,6 +212,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS rl_leases_live ON rl_leases(environment, promp
     WHERE state IN ('open', 'submitted');
 CREATE INDEX IF NOT EXISTS rl_leases_due ON rl_leases(state, expires_at);
 CREATE INDEX IF NOT EXISTS rl_leases_holder ON rl_leases(hotkey, state);
+CREATE TABLE IF NOT EXISTS rl_prompt_scans(seq INTEGER PRIMARY KEY AUTOINCREMENT, environment TEXT NOT NULL,
+    prompt_idx INTEGER NOT NULL, k INTEGER NOT NULL, rewards TEXT NOT NULL, verdict TEXT NOT NULL,
+    first_scan INTEGER NOT NULL, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS rl_prompt_state(environment TEXT NOT NULL, prompt_idx INTEGER NOT NULL,
+    state TEXT NOT NULL, until_k INTEGER, seq INTEGER NOT NULL, PRIMARY KEY(environment, prompt_idx));
+CREATE INDEX IF NOT EXISTS rl_prompt_state_seq ON rl_prompt_state(seq);
 """
 _COLUMNS = "lease_id, hotkey, environment, prompt_idx, k, nonce, issued_at, expires_at, state"
 
@@ -178,12 +231,10 @@ def _private_file(path: Path) -> None:
 class LeaseBook:
     def __init__(self, path: str | os.PathLike[str], config: LeaseBookConfig, *, quota: QuotaController,
                  clock: Callable[[], float] = time.time,
-                 cooling: Callable[[str, int, int], bool] | None = None,
                  rng: random.Random | None = None) -> None:
         self.config = config
         self.quota = quota
         self.clock = clock
-        self.cooling = cooling
         self._rng = rng or random.SystemRandom()
         self.lock = threading.RLock()
         path = Path(path)
@@ -256,10 +307,6 @@ class LeaseBook:
             row = self.db.execute("SELECT commitment FROM rl_lease_secrets WHERE k=?", (k,)).fetchone()
         return bytes.fromhex(row[0])
 
-    def _active_range(self) -> tuple[int, int] | None:
-        latest = self.latest_checkpoint
-        return None if latest is None else (max(0, latest - self.config.max_lag), latest)
-
     def commitments(self) -> dict:
         """The commitments of the leasable checkpoints and the secrets of the latest retired ones."""
         with self.lock:
@@ -331,13 +378,13 @@ class LeaseBook:
         granted: dict[int, dict[int, Lease]] = {i: {} for i in range(len(requests))}
         with self._txn():
             self._expire(now)
-            active = self._active_range()
+            latest = self.latest_checkpoint
             secrets_by_k = dict(self.db.execute("SELECT k, secret FROM rl_lease_secrets WHERE revealed_at IS NULL"))
             in_use: dict[str, int] = {}
             for i, prompt in claims:
                 request = requests[i]
                 env, k, hotkey = request.environment, request.checkpoint, request.hotkey
-                if active is None or not (active[0] <= k <= active[1]) or k not in secrets_by_k:
+                if k not in secrets_by_k:                             # not adopted, or S_k revealed
                     answers[i].refused[prompt] = STALE
                     continue
                 row = self.db.execute(f"SELECT {_COLUMNS} FROM rl_leases WHERE environment=? AND prompt_idx=? "
@@ -349,7 +396,12 @@ class LeaseBook:
                     else:
                         answers[i].refused[prompt] = TAKEN
                     continue
-                if self.cooling is not None and self.cooling(env, prompt, active[1]):
+                lifecycle = self.db.execute("SELECT state, until_k FROM rl_prompt_state WHERE environment=? "
+                                            "AND prompt_idx=?", (env, prompt)).fetchone()
+                if lifecycle is not None and lifecycle[0] == BLACKLISTED:
+                    answers[i].refused[prompt] = BLACKLISTED
+                    continue
+                if lifecycle is not None and latest < lifecycle[1]:
                     answers[i].refused[prompt] = COOLING
                     continue
                 if hotkey not in in_use:
@@ -398,6 +450,61 @@ class LeaseBook:
         return replace(lease, state=SUBMITTED)
 
 
+    # --- prompt lifecycle (§4.5) -----------------------------------------------------------------------------
+    def record_outcome(self, environment: str, prompt_idx: int, checkpoint: int, rewards, verdict: str,
+                       now: float | None = None) -> Scan:
+        """Record a graded group of (env, prompt) leased at k and move the prompt: ``too_easy`` blacklists it for
+        the run, any other verdict cools it down until ``latest + cooldown`` (never shortening a running cooldown,
+        never lifting a blacklist). The cooldown counts from the latest k, not the lease's: a lagged lease must not
+        shorten it."""
+        if environment not in self.config.expiry_s:
+            raise ValueError("environment not served")
+        if verdict not in VERDICTS:
+            raise ValueError(f"verdict must be one of {sorted(VERDICTS)}")
+        _u64(prompt_idx)
+        _u64(checkpoint)
+        rewards = tuple(float(r) for r in rewards)
+        if not rewards or not all(math.isfinite(r) for r in rewards):
+            raise ValueError("finite rewards required")
+        now = float(self.clock()) if now is None else now
+        with self._txn():
+            prior = self.db.execute("SELECT state, until_k FROM rl_prompt_state WHERE environment=? AND prompt_idx=?",
+                                    (environment, prompt_idx)).fetchone()
+            seq = self.db.execute("INSERT INTO rl_prompt_scans(environment, prompt_idx, k, rewards, verdict, "
+                                  "first_scan, at) VALUES(?,?,?,?,?,?,?)",
+                                  (environment, prompt_idx, checkpoint, json.dumps(rewards), verdict,
+                                   int(prior is None), now)).lastrowid
+            if verdict == TOO_EASY or (prior is not None and prior[0] == BLACKLISTED):
+                state, until = BLACKLISTED, None
+            else:
+                start = max(checkpoint, self.latest_checkpoint or 0)
+                state, until = COOLDOWN, max(start + self.config.cooldown_of(environment), (prior or (0, 0))[1])
+            self.db.execute("INSERT OR REPLACE INTO rl_prompt_state(environment, prompt_idx, state, until_k, seq) "
+                            "VALUES(?,?,?,?,?)", (environment, prompt_idx, state, until, seq))
+        return Scan(int(seq), environment, prompt_idx, checkpoint, rewards, verdict, prior is None, now)
+
+    def prompt_state(self, since: int = 0, *, environment: str | None = None,
+                     limit: int = MAX_SCANS_PER_PAGE) -> dict:
+        """The miners' view after cursor ``since``: up to ``limit`` scans and the current state of the prompts they
+        moved. Poll again with ``cursor`` (``more``: a next page is ready). A cooldown ends once ``latest`` reaches
+        its ``until_k``; a prompt never listed is never scanned."""
+        _u64(since)
+        where, args = ("seq>?", [since]) if environment is None else ("seq>? AND environment=?", [since, environment])
+        with self.lock:
+            rows = self.db.execute(f"SELECT seq, environment, prompt_idx, k, rewards, verdict, first_scan, at FROM "
+                                   f"rl_prompt_scans WHERE {where} ORDER BY seq LIMIT ?", (*args, limit + 1)).fetchall()
+            more, rows = len(rows) > limit, rows[:limit]
+            cursor = rows[-1][0] if rows else since
+            states = self.db.execute(f"SELECT environment, prompt_idx, state, until_k FROM rl_prompt_state WHERE "
+                                     f"{where} AND seq<=? ORDER BY seq", (*args, cursor)).fetchall()
+            latest = self.latest_checkpoint
+        scans = [Scan(seq, env, p, k, tuple(json.loads(r)), v, bool(f), at).to_public()
+                 for seq, env, p, k, r, v, f, at in rows]
+        return {"latest": latest, "cursor": cursor, "more": more, "scans": scans,
+                "prompts": [{"environment": env, "prompt_idx": p, "state": state, "until_k": until}
+                            for env, p, state, until in states]}
+
+
 class LeaseCollector:
     """Batches the requests that arrive within one interval and resolves them together off the event loop."""
 
@@ -433,7 +540,8 @@ class LeaseCollector:
 
 
 __all__ = [
-    "COMMIT_DOMAIN", "COOLING", "EXPIRED", "NONCE_DOMAIN", "OPEN", "QUOTA", "REFUSALS", "STALE", "SUBMITTED",
-    "TAKEN", "Lease", "LeaseAnswer", "LeaseBook", "LeaseBookConfig", "LeaseCollector", "LeaseRequest",
-    "checkpoint_cooldown", "lease_expiry_s", "lease_nonce", "secret_commitment", "verify_reveal",
+    "BLACKLISTED", "COMMIT_DOMAIN", "COOLDOWN", "COOLING", "EXPIRED", "IN_ZONE", "NONCE_DOMAIN", "OPEN", "QUOTA",
+    "REFUSALS", "SECRET_REVEAL_LAG", "STALE", "SUBMITTED", "TAKEN", "TOO_EASY", "TOO_HARD", "TRUNCATED", "VERDICTS",
+    "Lease", "LeaseAnswer", "LeaseBook", "LeaseBookConfig", "LeaseCollector", "LeaseRequest", "Scan",
+    "classify_group", "lease_expiry_s", "lease_nonce", "secret_commitment", "verify_reveal",
 ]
