@@ -66,6 +66,7 @@ COMPOSABLE_PROFILES = [
     "qwen3-4b-reliquary-episode-v7-dev1",
     "qwen3-4b-reliquary-logic-v8-dev1",
     TEUTONIC,
+    "teutonic-9b-reliquary-suite-v10-gumbel-dev1",
 ]
 # Their OMI/OCI bodies predate prompt templates; they stay reachable only
 # through --from-profile.

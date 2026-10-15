@@ -1096,6 +1096,11 @@ T_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.temperature
 TOP_P_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.top_p
 TOP_K_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.top_k
 DO_SAMPLE_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.do_sample
+# Which public pick every forced token must be ("inverse_cdf" or "gumbel_max"), and
+# whether the LM head's logits are fp32 on the miner's engine and the validator's
+# proof forward. Both from the profile; see reliquary.environment.forced_sampling.
+FORCED_DRAW = ACTIVE_PROTOCOL_PROFILE.sampling.draw
+LM_HEAD_FP32 = ACTIVE_PROTOCOL_PROFILE.sampling.lm_head_fp32
 
 # Do not add miner-only logits processors here. A presence/repetition penalty
 # changes the sampling policy; unless the validator also recomputes and verifies
