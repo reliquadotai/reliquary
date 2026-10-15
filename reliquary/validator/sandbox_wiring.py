@@ -86,6 +86,9 @@ class SandboxValidatorConfig:
     close_concurrency: int = CLOSE_CONCURRENCY
     close_body_timeout_s: float = CLOSE_BODY_TIMEOUT_S
     close_preauth_concurrency: int = MAX_PREAUTH_CLOSES
+    # The ss58 address miners sign session requests to, when the process has no wallet to
+    # read it from (the split corpus validator's front): public, never a key.
+    validator_hotkey: str | None = None
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] = os.environ) -> SandboxValidatorConfig | None:
@@ -114,7 +117,8 @@ class SandboxValidatorConfig:
             close_body_timeout_s=_positive(environ, "RELIQUARY_SANDBOX_CLOSE_BODY_TIMEOUT_S",
                                            CLOSE_BODY_TIMEOUT_S),
             close_preauth_concurrency=_positive(
-                environ, "RELIQUARY_SANDBOX_CLOSE_PREAUTH_CONCURRENCY", MAX_PREAUTH_CLOSES, int))
+                environ, "RELIQUARY_SANDBOX_CLOSE_PREAUTH_CONCURRENCY", MAX_PREAUTH_CLOSES, int),
+            validator_hotkey=(environ.get("RELIQUARY_SANDBOX_VALIDATOR_HOTKEY") or "").strip() or None)
 
 
 @dataclass
