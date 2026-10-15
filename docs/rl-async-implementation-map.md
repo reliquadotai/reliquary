@@ -800,6 +800,13 @@ One branch carries the whole async RL work on top of current main.
 - Model files: `DeltaPublisher(model_dir=)` uploads config / tokenizer / chat template with each anchor
   (`anchors[].model_files`, presigned, pruned with the anchor); `CheckpointSync(model_dir=)` keeps the newest set
   (SHA-256 checked); `mine-async` uses `--base-model`, else the initial checkpoint's dir, else the synced files.
+- Audit `ProofForward` (`validator/rl_audit.py`): per rollout, `verifier.proof_forward_rows` (the proof path's
+  batch-1 forward and lazy fp32 head, now shared with `verify_commitment_proofs`) and the verifier's
+  `_gpu_seed_consistency_diagnostics` with `draw_uniforms(i)`, force span excluded. Match = exact / stochastic.
+  Pooled match under `RL_ROLLOUT_MATCH_FLOOR` (0.95 placeholder, also the ledger's floor) -> `statistical`; a
+  rollout on the draw (match >= floor) with more than `RL_AUDIT_FORGERY_MISMATCH_TOLERANCE` (1) hard mismatches at
+  near-deterministic positions -> `deterministic`; no model -> `passed=None`. Hook: `run_rl_audits(model,
+  submissions, limit=8)`, to schedule from the service with its verify model.
 
 ### Remaining wiring
 
@@ -807,11 +814,13 @@ One branch carries the whole async RL work on top of current main.
   `SubmittedGroup.draw_uniforms`, one forward for verification + substitution loss, `report_training(...,
   matched_tokens=)`, `DeltaPublisher.publish` per step (with `model_dir`), `LeaseBook.adopt_checkpoint` per
   published k, price `note_wait` / `tick`.
-- Audit `ProofForward`: the Gumbel verifier over a `SubmittedGroup` against the latest checkpoint (uniforms from
-  `draw_uniforms`), then `run_audits`.
-- Service wiring: build `LeaseBook` / `LeaseCollector` / `RlSubmissions` / `RlPayLedger` / `AsyncPriceController`
-  in the validator service, mount `build_rl_lease_router(submissions=, pay=)` and `/rl/checkpoint`, a loop for
+- Service wiring: schedule `run_rl_audits` (verify model) promptly after submissions; build `LeaseBook` /
+  `LeaseCollector` / `RlSubmissions` / `RlPayLedger` / `AsyncPriceController` in the validator service, mount `build_rl_lease_router(submissions=, pay=)` and `/rl/checkpoint`, a loop for
   `expire_due`, `ingest`, `settle` / `publish`, the async task's registry entry (`settlement = "period-ema-v1"`).
+- Audit follow-ups: calibrate the floor and the forgery tolerance on honest lag-2 rollouts (GPU qualification);
+  the P4 trainer reads `RL_ROLLOUT_MATCH_FLOOR` too; no separate terminal-pick check yet (the last token is judged
+  like any position); a forward that raises (e.g. OOM on one group) stops `run_audits` with that group first in
+  the queue, so a poison group needs a retry cap.
 - Multi-turn envs (P3 grades single-turn only) and a multi-prompt vLLM call in the miner.
 - GPU qualification: the v10 Gumbel profile and fp32 head end to end on vLLM (miner) vs the validator forward,
   the in-place weight push (`collective_rpc`, `VLLM_ALLOW_INSECURE_SERIALIZATION`), FSDP2 trainer with the

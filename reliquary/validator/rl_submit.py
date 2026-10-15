@@ -32,8 +32,8 @@ reported with a class sanctions the same way (``source='training'``: training ve
 recidivism window, never as probation passes; a rejection without a class, e.g. staleness, is no verdict). An
 inconclusive audit (``passed=None``: the validator could not run it) is unpaid and unsanctioned.
 
-Interfaces left to later phases: the proof forward of an audit (``ProofForward``, the Gumbel verifier on another
-branch: per-rollout match against the latest checkpoint with the training floor), the trainer's report
+Interfaces left to later phases: the proof forward of an audit (``ProofForward``, implemented by
+``rl_audit.audit_forward``: per-rollout match against the latest checkpoint with the training floor), the trainer's report
 (``report_training``, P4), the money (``rl_events``: pay eligibility and sanctions, read by the P5 ledger), and
 publication (``rl_prompt_scans`` is the public observation log; TODO: the R2 segment writer of decision D reads
 it by ``seq``; ``rl_groups`` is the private store with hotkeys).

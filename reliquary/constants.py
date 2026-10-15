@@ -1988,6 +1988,14 @@ FORCED_SEED_CDF_BOUNDARY_EPSILON = 0.002
 # shortfall 1 - exp(-(s_win - s_token)) of logit + G (forced_sampling). A candidate
 # for the same telemetry-first rollout as the CDF one; FORCED_SEED_CDF_ENFORCE arms both.
 FORCED_SEED_GUMBEL_BOUNDARY_EPSILON = 0.05
+# Async RL (rl-async-design.md §4.4, §4.6): the per-rollout match floor on stochastic positions under the Gumbel
+# draw, against the latest checkpoint. One value for the trainer's verification, the audit and the pay ledger.
+# PLACEHOLDER: 0.95 with bf16 heads (about 0.96 with fp32 heads), to calibrate at GPU qualification.
+RL_ROLLOUT_MATCH_FLOOR = 0.95
+# An audited rollout that follows the draw (match >= the floor) yet carries more than this many hard mismatches at
+# near-deterministic positions (max p >= FORCED_SEED_STOCHASTIC_MAXPROB, Gumbel shortfall beyond the boundary
+# epsilon) was edited after the draw: deterministic forgery. PLACEHOLDER: calibrate on honest lag-2 rollouts.
+RL_AUDIT_FORGERY_MISMATCH_TOLERANCE = 1
 FORCED_SEED_CDF_ENFORCE = _os.environ.get(
     "FORCED_SEED_CDF_ENFORCE", "false"
 ).strip().lower() in ("1", "true", "yes", "on")

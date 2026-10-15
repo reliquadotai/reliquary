@@ -837,6 +837,46 @@ def verify_commitment_proofs_batch(
     return results
 
 
+def proof_forward_rows(model: Any, tokens: list[int], *, forward: tuple[Any, Any] | None = None,
+                       device: Any = None) -> tuple[torch.Tensor, Any]:
+    """The proof path's forward of one sequence: (hidden [seq_len, hidden], logit rows [seq_len, vocab]).
+
+    Batch 1 on the model's device unless ``forward`` hands this sequence's rows out of a batched pass.
+    The logit rows are projected lazily through ``lm_head`` (in fp32 when the profile's
+    ``sampling.lm_head_fp32`` says so); a model without a separable head returns its materialised logits."""
+    from reliquary.shared.forward import forward_single_layer
+
+    lm_head = getattr(model, "lm_head", None)
+    # Row-wise projection needs a separable head whose width we can read
+    # without projecting; anything else keeps the old materialised block.
+    vocab_size = _lm_head_vocab_size(lm_head)
+    can_project_rows = vocab_size is not None
+    if forward is not None:
+        # This rollout's rows out of a pass that ran for several of them: one traversal of the
+        # model serves the whole batch, which is what makes a streamed replica affordable.
+        hidden_states_gpu, logits_batch = forward
+    else:
+        if device is None:
+            device = next(model.parameters()).device
+        input_ids = torch.tensor([list(tokens)], device=device)
+        with torch.no_grad():
+            hidden_rows, logits_rows = forward_single_layer(
+                model, input_ids, None, LAYER_INDEX,
+                materialize_logits=not can_project_rows,
+            )
+        hidden_states_gpu = hidden_rows[0]
+        logits_batch = None if logits_rows is None else logits_rows[0]
+
+    fp32_head = lm_head_fp32()
+    if logits_batch is None:
+        return hidden_states_gpu, _LazyLogitRows(hidden_states_gpu, lm_head, vocab_size,
+                                                 fp32_head=fp32_head)
+    if fp32_head:
+        raise RuntimeError("fp32 LM head: this model's logits come materialised from its "
+                           "forward, not from a separable lm_head")
+    return hidden_states_gpu, logits_batch  # [seq_len, vocab_size], kept on GPU
+
+
 def verify_commitment_proofs(
     commit: dict,
     model: Any,
@@ -866,7 +906,6 @@ def verify_commitment_proofs(
     clients), ``seed_n_stochastic``/``seed_n_match`` stay at 0 — no-op.
     """
     from reliquary.protocol.grail_verifier import GRAILVerifier
-    from reliquary.shared.forward import forward_single_layer
     from reliquary.shared.hf_compat import resolve_hidden_size
     from reliquary.validator.utility_telemetry import utility_telemetry_enabled
 
@@ -903,35 +942,7 @@ def verify_commitment_proofs(
     expected_challenges = min(CHALLENGE_K, challenge_domain_size)
 
     device = next(model.parameters()).device
-    lm_head = getattr(model, "lm_head", None)
-    # Row-wise projection needs a separable head whose width we can read
-    # without projecting; anything else keeps the old materialised block.
-    vocab_size = _lm_head_vocab_size(lm_head)
-    can_project_rows = vocab_size is not None
-    if forward is not None:
-        # This rollout's rows out of a pass that ran for several of them: one traversal of the
-        # model serves the whole batch, which is what makes a streamed replica affordable.
-        hidden_states_gpu, logits_batch = forward
-    else:
-        input_ids = torch.tensor([tokens], device=device)
-        with torch.no_grad():
-            hidden_rows, logits_rows = forward_single_layer(
-                model, input_ids, None, LAYER_INDEX,
-                materialize_logits=not can_project_rows,
-            )
-        hidden_states_gpu = hidden_rows[0]
-        logits_batch = None if logits_rows is None else logits_rows[0]
-
-    # [seq_len, hidden_dim]
-    fp32_head = lm_head_fp32()
-    if logits_batch is None:
-        logits_gpu: Any = _LazyLogitRows(hidden_states_gpu, lm_head, vocab_size,
-                                         fp32_head=fp32_head)
-    elif fp32_head:
-        raise RuntimeError("fp32 LM head: this model's logits come materialised from its "
-                           "forward, not from a separable lm_head")
-    else:
-        logits_gpu = logits_batch  # [seq_len, vocab_size], kept on GPU
+    hidden_states_gpu, logits_gpu = proof_forward_rows(model, tokens, forward=forward, device=device)
 
     p_stop = _gpu_p_stop(
         logits_gpu, seq_len, _eos_set_from_model(model, tokenizer), device,
