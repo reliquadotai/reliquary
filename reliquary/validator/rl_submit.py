@@ -41,6 +41,7 @@ it by ``seq``; ``rl_groups`` is the private store with hotkeys).
 from __future__ import annotations
 
 import json
+import logging
 import math
 import random
 import time
@@ -63,7 +64,10 @@ from reliquary.services.exploration import AUDIT_FAILURE_CLASSES, AUDIT_FAILURE_
 from reliquary.validator.rl_buffer import SubmittedGroup, TrainingBuffer
 from reliquary.validator.rl_leases import IN_ZONE, LeaseBook, classify_group
 
+logger = logging.getLogger(__name__)
+
 REJECTED = "rejected"
+AUDIT_MAX_ATTEMPTS = 3        # raising audit forwards of one group before it is concluded inconclusive
 NOT_DRAWN, PENDING, PASSED, FAILED, INCONCLUSIVE = "not_drawn", "pending", "passed", "failed", "inconclusive"
 # rl_events kinds: pay eligibility (read by the P5 ledger) and sanctions
 FIRST_SCAN, FIRST_SCAN_FORFEITED, TRAINED, UNTRAINED, BAN = (
@@ -211,6 +215,7 @@ class RlSubmissions:
             book.db.executescript(_SCHEMA)
             book.db.commit()
         self.buffer = buffer or TrainingBuffer(book)
+        self._audit_failures: dict[str, int] = {}
 
     # --- submission ----------------------------------------------------------------------------------------
     def submit(self, lease_id: str, hotkey: str, rollouts: Sequence[Rollout], *,
@@ -384,12 +389,23 @@ class RlSubmissions:
                 else:
                     self._event(lease_id, hotkey, FIRST_SCAN_FORFEITED, now, {"audit": state})
 
-    def run_audits(self, forward: ProofForward, limit: int) -> int:
+    def run_audits(self, forward: ProofForward, limit: int, *, max_attempts: int = AUDIT_MAX_ATTEMPTS) -> int:
         """Drain up to ``limit`` queued audits through ``forward`` (the proof forward, the Gumbel verifier).
-        A forward that raises leaves its audit queued."""
+        A forward that raises leaves its audit queued and the others still run; after ``max_attempts`` raising
+        forwards (counted in this process) the audit is concluded inconclusive (unpaid, unsanctioned), so one
+        poison group (e.g. an OOM) cannot stall the queue."""
         done = 0
         for group in self.audit_jobs(limit):
-            self.report_audit(group.lease_id, forward(group))
+            try:
+                result = forward(group)
+            except Exception:
+                failures = self._audit_failures[group.lease_id] = self._audit_failures.get(group.lease_id, 0) + 1
+                logger.exception("audit forward of %s failed (%d/%d)", group.lease_id[:12], failures, max_attempts)
+                if failures < max_attempts:
+                    continue
+                result = AuditResult(None)
+            self._audit_failures.pop(group.lease_id, None)
+            self.report_audit(group.lease_id, result)
             done += 1
         return done
 
@@ -430,6 +446,6 @@ class RlSubmissions:
 
 
 __all__ = [
-    "BAN", "FIRST_SCAN", "FIRST_SCAN_FORFEITED", "REJECTED", "TRAINED", "UNTRAINED", "AuditResult", "Graded",
+    "AUDIT_MAX_ATTEMPTS", "BAN", "FIRST_SCAN", "FIRST_SCAN_FORFEITED", "REJECTED", "TRAINED", "UNTRAINED", "AuditResult", "Graded",
     "GroupGrader", "ProofForward", "RlSubmissions", "Rollout", "SubmitConfig",
 ]

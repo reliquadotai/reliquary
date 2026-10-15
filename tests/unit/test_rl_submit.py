@@ -284,6 +284,24 @@ def test_audits_run_through_the_proof_forward_past_probation_first(book):
     assert subs.audit_jobs(10) == []
 
 
+def test_a_raising_audit_forward_neither_stalls_the_queue_nor_runs_forever(book):
+    subs = service(book)
+    poison, honest = lease(book, 63), lease(book, 64)
+    subs.submit(poison.lease_id, "A", group(0))
+    subs.submit(honest.lease_id, "A", group(0))
+
+    def forward(g):
+        if g.lease_id == poison.lease_id:
+            raise RuntimeError("CUDA out of memory")
+        return AuditResult(passed=True, rollout_match=(0.99,) * 16)
+
+    assert subs.run_audits(forward, 10, max_attempts=2) == 1                          # the other one still ran
+    assert [g.lease_id for g in subs.audit_jobs(10)] == [poison.lease_id]
+    assert subs.run_audits(forward, 10, max_attempts=2) == 1                          # second failure: concluded
+    assert subs.audit_jobs(10) == [] and subs.group(poison.lease_id)["audit"] == "inconclusive"
+    assert book.banned_until("A") is None
+
+
 def test_the_trainer_reports_match_and_verdict_back_for_pay_and_sanctions(book):
     subs = service(book, probation_groups=0)
     good, stale, forged = (lease(book, p) for p in (70, 71, 72))

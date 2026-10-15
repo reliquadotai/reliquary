@@ -69,8 +69,13 @@ class TrainingBuffer:
         with book.lock:
             book.db.executescript(_SCHEMA)
             book.db.commit()
-        with book.transaction():                              # a trainer that died holding groups: give them back
-            book.db.execute("UPDATE rl_buffer SET state=? WHERE state=?", (QUEUED, TAKEN))
+        self.requeue()                                        # a trainer that died holding groups: give them back
+
+    def requeue(self) -> int:
+        """Every taken group back to the queue: at open, and when the (only) trainer starts or recovers holding
+        nothing. Returns how many."""
+        with self.book.transaction():
+            return self.book.db.execute("UPDATE rl_buffer SET state=? WHERE state=?", (QUEUED, TAKEN)).rowcount
 
     def push(self, group: SubmittedGroup) -> None:
         with self.book.transaction():
