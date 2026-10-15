@@ -746,16 +746,71 @@ New code next to the window path (`emission_price`, `settlement`, `rl_pay`, `wei
 - `reliquary/miner/rl_async.py`, CLI `reliquary mine-async` (the window miner `mine` is untouched).
   - `PromptPlanner`: per env, fed by `GET /rl/prompts/state?since=` (cursor, `more` pages); skips blacklisted
     prompts, cooldowns until `latest >= until_k`, and prompts held, submitted or `taken` until their scan arrives
-    (or 30 min). Default order: never scanned, then by share of in-zone scans; `priority` overrides it.
+    (or one lease lifetime of the env, `lease_expiry_s`; a held lease: its own expiry). Default order: never scanned, then by share of in-zone scans; `priority` overrides it.
   - `AsyncMiner`: open leases <= `min(quota, --max-open)`, waiting leases <= `--queue-groups`, requests of
     <= `--lease-batch` at the held k; refusals: `taken` -> wait for the scan, `cooling`/`blacklisted` -> table,
     `quota` -> quota := open, `stale` -> no lease until newer weights. Earliest expiry generated first; every generated
-    group is submitted with retries until its expiry (`already_submitted` / `lease_submitted` = delivered); open
-    leases journaled for restarts.
+    group is submitted with retries until its expiry (a resend gets the original verdict); open leases journaled
+    for restarts and recovered from `GET /rl/lease/mine` at start.
   - Checkpoints: `CheckpointSync` on a CPU copy in a thread; the copy is handed to the generator between two batches
     and not patched again before (`swap_if_ready`). Submissions carry `k_generated`.
-  - `VllmGroupGenerator`: calls `VLLMRolloutGenerator.generate` per lease (`draw_context`: nonce as randomness,
-    `k<k>` as checkpoint hash); weights pushed with `LLM.collective_rpc` + the model's `load_weights` (needs
+  - `VllmGroupGenerator`: calls `VLLMRolloutGenerator.generate` per lease (`draw_context` =
+    `protocol.rl_draw.lease_draw_context`: nonce as randomness, `k<k>` as checkpoint hash); weights pushed with `LLM.collective_rpc` + the model's `load_weights` (needs
     `VLLM_ALLOW_INSECURE_SERIALIZATION=1`, untested on GPU), fallback `--weight-swap reload` (HF dir + engine rebuild).
-- To align: `POST /rl/submit` body and signature (`encode_submission`, `rl_submit_binding`: DRAFT, `u32le-zlib/1`
-  tokens), the Gumbel profile's nonce keying (`draw_context`), and a multi-prompt vLLM call.
+- Aligned at integration (§9): the submit wire and signature, the draw keying, lease recovery. Still open: a
+  multi-prompt vLLM call.
+
+## 9. Integration (branch `feat/rl-async`, from `origin/main` @ `fde75c0c`)
+
+One branch carries the whole async RL work on top of current main.
+
+### What landed
+
+- Forced draw, rebased from `fa0f3a76` by cherry-pick (no conflict): `feat/forced-seed-runner-fix` (runner-keyed
+  vLLM position, P0), `feat/gumbel-forced-draw` (Gumbel-max draw, `sampling.draw` / `sampling.lm_head_fp32`, v10
+  profile, protocol 10, validator check, miner draw, scripts), `feat/substitution-loss` (substitution loss, v* from
+  the trainer's logits; the batcher carries the verifier's uniforms as `draw_u_flat` / `draw_u_off` float64 arrays).
+- Merged from `b9afcb13` (already in main): `feat/rl-pay` (P2 leases + lifecycle, P3 submission / buffer / audits,
+  P5 ledger / async prices / `/rl/pay`), then `feat/rl-miner-client` (checkpoint deltas, HF backup, reference miner).
+  The shared `feat/rl-leases` commits come in once.
+- Conflicts: only this file (sections 6-7 of `feat/rl-pay` and 6 of `feat/rl-miner-client` kept, the miner
+  renumbered 8) and `docs/rl-async-design.md` (add/add: the latest draft kept).
+
+### Seams fixed
+
+- Merge regression: main made the window price rise opt-in (`RELIQUARY_EMISSION_PRICE_RISE`, default 1.0), which
+  silently removed the async controller's rise. `rl_price.ASYNC_PRICE_RISE = 1.10` pins it.
+- Submission wire: the miner sends the validator's body (`protocol/rl_submit.py`) signed with
+  `build_rl_submit_binding` over `rollouts_digest`; the draft `u32le-zlib/1` encoding and binding are deleted.
+  Generators may return `(tokens, force_span)` per rollout. `k_generated` is optional, unsigned and ignored.
+- Idempotent submit: `RlSubmissions.submit` answers a resend of a graded lease with the stored verdict (200,
+  `resent: true`), also when a concurrent resend closed the lease first; another hotkey still gets 403.
+- Draw keying: `protocol/rl_draw.py` (`lease_draw_context`, `lease_uniforms`): randomness = nonce hex, prompt,
+  `checkpoint_hash = "k<k>"`, t = completion position. The miner's `draw_context` and
+  `SubmittedGroup.draw_uniforms(i)` both call it; `tests/unit/test_rl_lease_draw.py` checks miner (through
+  `forced_seed_extra_args` and the processor's `_uniform`) == validator == trainer for one granted lease, and the
+  Gumbel picks. `SubmittedGroup` stores no uniforms: nonce, prompt, k, rollout index and completion length are the
+  seed, so the trainer recomputes them (to set `rollout._forced_draw_uniforms`).
+- `GET /rl/lease/mine?hotkey=&at=&signature=` (`build_rl_lease_mine_binding`, skew-bounded, signature answered once,
+  30/min): the caller's open leases. The miner calls it at start (`AsyncMiner.recover_leases`).
+- Lease lifetime: lease answers carry `lease_expiry_s` (the env's), `/rl/quota` and `/rl/lease/mine` a map of every
+  env's; the planner waits that long on a `taken` prompt (30 min only while unknown).
+- Model files: `DeltaPublisher(model_dir=)` uploads config / tokenizer / chat template with each anchor
+  (`anchors[].model_files`, presigned, pruned with the anchor); `CheckpointSync(model_dir=)` keeps the newest set
+  (SHA-256 checked); `mine-async` uses `--base-model`, else the initial checkpoint's dir, else the synced files.
+
+### Remaining wiring
+
+- P4 trainer async loop: `TrainingBuffer.take` per env mix, max-lag drop, set `_forced_draw_uniforms` from
+  `SubmittedGroup.draw_uniforms`, one forward for verification + substitution loss, `report_training(...,
+  matched_tokens=)`, `DeltaPublisher.publish` per step (with `model_dir`), `LeaseBook.adopt_checkpoint` per
+  published k, price `note_wait` / `tick`.
+- Audit `ProofForward`: the Gumbel verifier over a `SubmittedGroup` against the latest checkpoint (uniforms from
+  `draw_uniforms`), then `run_audits`.
+- Service wiring: build `LeaseBook` / `LeaseCollector` / `RlSubmissions` / `RlPayLedger` / `AsyncPriceController`
+  in the validator service, mount `build_rl_lease_router(submissions=, pay=)` and `/rl/checkpoint`, a loop for
+  `expire_due`, `ingest`, `settle` / `publish`, the async task's registry entry (`settlement = "period-ema-v1"`).
+- Multi-turn envs (P3 grades single-turn only) and a multi-prompt vLLM call in the miner.
+- GPU qualification: the v10 Gumbel profile and fp32 head end to end on vLLM (miner) vs the validator forward,
+  the in-place weight push (`collective_rpc`, `VLLM_ALLOW_INSECURE_SERIALIZATION`), FSDP2 trainer with the
+  substitution loss, delta publication size and miner sync time on the 9B.
