@@ -93,9 +93,19 @@ CREATE TABLE IF NOT EXISTS rl_events(seq INTEGER PRIMARY KEY AUTOINCREMENT, leas
 
 @dataclass(frozen=True)
 class Rollout:
-    """One submitted rollout: its completion token ids and its BFT force span (completion-relative) or None."""
+    """One submitted rollout: its completion token ids and its BFT force span (completion-relative) or None.
+    An episode's rollout also carries ``episode`` (``{spans, stop, transcript}`` as sent, ``protocol/rl_submit``);
+    ``spans`` (its model spans, completion-relative) is read from it strictly (ValueError)."""
     tokens: tuple[int, ...]
     force_span: tuple[int, int] | None = None
+    episode: Mapping[str, Any] | None = None
+    spans: tuple[tuple[int, int], ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.episode is not None and self.spans is None:
+            from reliquary.protocol.rl_submit import episode_spans
+
+            object.__setattr__(self, "spans", episode_spans(self.episode, len(self.tokens)))
 
 
 @dataclass(frozen=True)
@@ -104,6 +114,7 @@ class Graded:
     rewards: tuple[float, ...] = ()
     truncated: tuple[bool, ...] = ()
     reject: str | None = None
+    spans: tuple[tuple[tuple[int, int], ...], ...] | None = None       # episodes: each rollout's model spans
 
 
 @dataclass(frozen=True)
@@ -140,16 +151,21 @@ class SubmitConfig:
 class GroupGrader:
     """Grades single-turn groups as admission does, from completion tokens only (§4.4). ``environments`` maps an
     env name to its loaded environment (``get_problem`` and its reward materializer); ``tokenizer`` renders,
-    encodes and decodes (the admission worker's)."""
+    encodes and decodes (the admission worker's). ``episodes`` maps each signed-episode env to its
+    ``rl_episode.LeaseEpisodeChecker`` (§4.10): those envs are graded by ``grade_episodes``."""
 
     def __init__(self, environments: Mapping[str, Any], tokenizer: Any, *, eos_token_ids: Sequence[int],
                  think_close_ids: Sequence[int] = (), canonical_force_ids: Sequence[int] = (),
-                 vocab_size: int | None = None) -> None:
+                 vocab_size: int | None = None, episodes: Mapping[str, Any] | None = None) -> None:
         from reliquary.validator.admission import AdmissionContext
 
+        self.episodes = dict(episodes or {})
         for name in environments:
             if get_environment_spec(name).interaction_mode != "single_turn":
-                raise ValueError(f"{name}: only single-turn environments are submitted by lease (P3)")
+                raise ValueError(f"{name}: a single-turn grader only; episode envs go in ``episodes``")
+        for name in self.episodes:
+            if get_environment_spec(name).interaction_mode != "signed_episode":
+                raise ValueError(f"{name}: not a signed-episode environment")
         if not eos_token_ids:
             raise ValueError("the EOS token ids are required to judge termination")
         self.environments = dict(environments)
@@ -161,9 +177,22 @@ class GroupGrader:
             think_close_ids=tuple(think_close_ids), bootstrap=False, enforce_envelope_signature=False,
             enforce_legacy_merkle=False) for name in environments}
 
+    def grade_episodes(self, lease, rollouts: Sequence[Rollout], *, received: float) -> Graded:
+        """A lease's episodes (signed transcripts, model spans): ``LeaseEpisodeChecker.grade``. Tokens are checked
+        against the vocabulary here, as for a single-turn group."""
+        checker = self.episodes.get(lease.environment)
+        if checker is None:
+            return Graded((), reject="episode_schema")
+        if self.vocab_size is not None and any(t >= self.vocab_size for r in rollouts for t in r.tokens):
+            return Graded((), reject="token_out_of_vocab")
+        return checker.grade(lease, rollouts, received=received)
+
     def grade(self, environment: str, prompt_idx: int, rollouts: Sequence[Rollout]) -> Graded:
         from reliquary.validator.admission import _classify_termination, _force_span_valid
         from reliquary.validator.batcher import admission_problem_materials
+
+        if environment in self.episodes or any(r.episode is not None for r in rollouts):
+            return Graded((), reject="episode_schema")          # an episode env's group is all episodes
 
         materials = admission_problem_materials(self.environments[environment], self.tokenizer, prompt_idx)
         encoded = self.tokenizer.encode(materials.rendered_prompt, add_special_tokens=False)
@@ -258,11 +287,15 @@ class RlSubmissions:
 
     def _submit(self, lease_id: str, hotkey: str, rollouts: Sequence[Rollout], arrived_at: float) -> dict:
         lease = self.book.check_submission(lease_id, hotkey, arrived_at)
-        graded = self.grader.grade(lease.environment, lease.prompt_idx, rollouts)
+        if lease.environment in getattr(self.grader, "episodes", {}):
+            graded = self.grader.grade_episodes(lease, rollouts, received=arrived_at)
+        else:
+            graded = self.grader.grade(lease.environment, lease.prompt_idx, rollouts)
         verdict = REJECTED if graded.reject else classify_group(graded.rewards, graded.truncated)
         group = SubmittedGroup(lease_id, hotkey, lease.environment, lease.prompt_idx, lease.checkpoint, lease.nonce,
                                arrived_at, graded.rewards, graded.truncated, graded.prompt_tokens,
-                               tuple(r.tokens for r in rollouts), tuple(r.force_span for r in rollouts))
+                               tuple(r.tokens for r in rollouts), tuple(r.force_span for r in rollouts),
+                               graded.spans)
         db = self.book.db
         with self.book.transaction():
             self.book.submit(lease_id, hotkey, in_zone=verdict == IN_ZONE, delivered=verdict != REJECTED,
@@ -291,7 +324,7 @@ class RlSubmissions:
                         lease.issued_at, arrived_at, verdict, graded.reject,
                         None if scan is None else json.dumps(graded.rewards),
                         None if scan is None else json.dumps(graded.truncated),
-                        sum(len(r.tokens) for r in rollouts), int(bool(scan and scan.first_scan)),
+                        sum(group.model_tokens(i) for i in range(len(rollouts))), int(bool(scan and scan.first_scan)),
                         None if scan is None else scan.seq, audit, training))
         answer = {"lease_id": lease_id, "verdict": verdict, "rewards": list(graded.rewards)}
         if graded.reject:
@@ -427,12 +460,14 @@ class RlSubmissions:
             match = [float(m) for m in rollout_match]
             if len(match) != len(group.completions) or not all(0.0 <= m <= 1.0 for m in match):
                 raise ValueError("one match rate in [0, 1] per rollout")
+            model = [group.model_tokens(i) for i in range(len(match))]
             if matched_tokens is not None and (len(matched_tokens) != len(match) or not all(
-                    0 <= int(n) <= len(c) for n, c in zip(matched_tokens, group.completions))):
-                raise ValueError("one matched token count in [0, completion length] per rollout")
+                    0 <= int(n) <= m for n, m in zip(matched_tokens, model))):
+                raise ValueError("one matched token count in [0, model tokens] per rollout")
             self.book.db.execute("UPDATE rl_groups SET training=? WHERE lease_id=?",
                                  ("accepted" if accepted else REJECTED, lease_id))
-            detail = {"rollout_match": match, "completion_tokens": [len(c) for c in group.completions],
+            # an episode's tool observations are no work of the miner's model: pay counts model tokens only
+            detail = {"rollout_match": match, "completion_tokens": model,
                       "checkpoint": group.checkpoint, "environment": group.environment}
             if matched_tokens is not None:
                 detail["matched_tokens"] = [int(n) for n in matched_tokens]

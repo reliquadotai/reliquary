@@ -5,7 +5,8 @@ rollouts it runs the proof path's forward (``verifier.proof_forward_rows``: batc
 the latest checkpoint, fp32 head when the profile says so) and checks every completion position against the
 forced draw with the verifier's own diagnostics (``verifier._gpu_seed_consistency_diagnostics``: the profile's
 draw, Gumbel-max under v10), the uniforms being the lease's (``SubmittedGroup.draw_uniforms``). A BFT force span is
-excluded, as in the window path.
+excluded, as in the window path. An episode's tool observations are in the forward but never judged: only its
+model positions are, each against the draw of its model-token index (§4.10).
 
 Verdict:
 
@@ -40,16 +41,18 @@ DEFAULT_AUDIT_LIMIT = 8
 
 
 def rollout_draw_diagnostics(model: Any, group: SubmittedGroup, index: int):
-    """The verifier's seed-consistency diagnostics of rollout ``index`` against ``model``."""
+    """The verifier's seed-consistency diagnostics of rollout ``index`` against ``model``. An episode is one
+    forward over its whole sequence (prompt, model turns and tool observations); only its model positions are
+    judged, draw ``t`` being the model-token index across turns (``SubmittedGroup.model_positions``)."""
     prompt, completion = list(group.prompt_tokens), list(group.completions[index])
     span = group.force_spans[index]
     start, end = (int(span[0]), int(span[1])) if span is not None else (0, 0)
     uniforms = group.draw_uniforms(index)
-    offsets = [j for j in range(len(completion)) if not start <= j < end]
+    drawn = [(t, p) for t, p in enumerate(group.model_positions(index)) if not start <= p < end]
     _hidden, logits = verifier.proof_forward_rows(model, prompt + completion)
     return verifier._gpu_seed_consistency_diagnostics(
-        logits, [completion[j] for j in offsets], [uniforms[j] for j in offsets],
-        position_offsets=offsets, logit_positions=[len(prompt) + j - 1 for j in offsets])
+        logits, [completion[p] for _, p in drawn], [uniforms[t] for t, _ in drawn],
+        position_offsets=[t for t, _ in drawn], logit_positions=[len(prompt) + p - 1 for _, p in drawn])
 
 
 def judge(diagnostics, *, floor: float = RL_ROLLOUT_MATCH_FLOOR, group_floor: float = RL_GROUP_MATCH_FLOOR,

@@ -20,7 +20,7 @@
 * ``GET {prefix}/prompts/state?since=&environment=``: the prompt lifecycle (``LeaseBook.prompt_state``): the scans
   after cursor ``since`` and the state (cooldown until k, blacklisted) of the prompts they moved. Public, no hotkey.
 * ``POST {prefix}/submit`` (mounted when ``submissions`` is given) ``{miner_hotkey, at, lease_id, rollouts:
-  [{index, tokens, force_span}], k_generated?, signature}``: a completed lease (``protocol/rl_submit.py``: every
+  [{index, tokens, force_span, episode?}], k_generated?, signature}``: a completed lease (``protocol/rl_submit.py``: every
   index, completion tokens only, compressed), signed over ``rollouts_digest`` of the rollouts as sent
   (``build_rl_submit_binding``), authenticated like a lease request with its own per-minute bound, inflated only
   after. ``k_generated`` (the checkpoint the miner generated on) is informational, unsigned and ignored: the lease's
@@ -40,6 +40,7 @@ import math
 import time
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -101,6 +102,7 @@ class RlSubmitRollout(BaseModel):
     index: int = Field(ge=0, strict=True)
     tokens: str = Field(min_length=1, max_length=MAX_SUBMIT_BODY_BYTES)
     force_span: tuple[int, int] | None = None
+    episode: dict[str, Any] | None = None       # an episode env's rollout: {spans, stop, transcript} (§4.10)
 
 
 class RlSubmitRequestBody(BaseModel):
@@ -127,7 +129,9 @@ def submitted_rollouts(body: RlSubmitRequestBody, *, max_tokens: int, rollouts: 
         span = item.force_span
         if span is not None and not (0 <= span[0] < span[1] <= len(tokens)):
             raise ValueError("force span must lie inside the completion")
-        group.append(Rollout(tokens, span))
+        group.append(Rollout(tokens, span, item.episode))            # an episode's spans are read strictly
+    if len({r.episode is None for r in group}) > 1:
+        raise ValueError("a group is all episodes or none")
     return group
 
 
@@ -403,7 +407,7 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
         if sorted(r.index for r in request.rollouts) != list(range(submissions.config.rollouts)):
             raise _Refused(_refusal("malformed_request", {
                 "why": f"rollout indices must be exactly 0..{submissions.config.rollouts - 1}"}))
-        digest = rollouts_digest([(r.index, r.tokens, r.force_span)
+        digest = rollouts_digest([(r.index, r.tokens, r.force_span, r.episode)
                                   for r in sorted(request.rollouts, key=lambda r: r.index)])
         return verify_submit(hotkey, at=request.at, lease_id=request.lease_id, rollouts_digest=digest,
                              signature=request.signature, validator_hotkey=audience, path=submit_path)

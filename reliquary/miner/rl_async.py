@@ -13,8 +13,10 @@ It runs next to the window miner (``mine``), which stays for the live run. One p
   ``taken`` / ``cooling`` / ``blacklisted`` / ``quota`` / ``stale`` per prompt; each moves the planner or the
   scheduler (``_note_refusal``).
 * **generation**: ``ROLLOUTS`` rollouts per lease, earliest expiry first, through the narrow ``GroupGenerator``
-  interface (the draw itself, Gumbel and runner-keyed, is the profile's: ``VllmGroupGenerator`` calls the existing
-  ``VLLMRolloutGenerator``). New weights are swapped in between two generation batches, never during one; a lease
+  interface (the draw itself, Gumbel and runner-keyed, is the profile's: ``VllmGroupGenerator`` sends a batch's
+  leases x ``ROLLOUTS`` requests in ONE ``VLLMRolloutGenerator.generate_batch`` call, each request keyed by its own
+  lease). Episode envs (multi-turn, signed sandboxes) are played by ``rl_async_episodes.EpisodeLeaseGenerator``
+  (its ``agenerate``), through the window path's episode machinery bound to the lease's draw. New weights are swapped in between two generation batches, never during one; a lease
   taken at k may be generated on a newer checkpoint, and the submission says which (``k_generated``).
 * **checkpoints** (``GET /rl/checkpoint`` + ``CheckpointSync``): deltas are downloaded and applied to a CPU copy of
   the weights off the generation path; the follower waits for the swap before patching that copy again.
@@ -209,16 +211,35 @@ class RequestRefused(Exception):
         self.reason, self.retryable, self.retry_after = reason, retryable, retry_after
 
 
+@dataclass(frozen=True)
+class EpisodeRollout:
+    """One played episode of a lease (§4.10): its completion (everything after the validator's prompt render: model
+    turns and tool observations), its model spans (completion-relative), the stop the validator admits and the
+    gateway-signed transcript."""
+    tokens: tuple[int, ...]
+    spans: tuple[tuple[int, int], ...]
+    stop: str
+    transcript: Mapping[str, Any]
+
+    def wire(self) -> dict:
+        return {"spans": [[int(a), int(b)] for a, b in self.spans], "stop": str(self.stop),
+                "transcript": dict(self.transcript)}
+
+
 def submission_rollouts(rollouts: Sequence[Any]) -> list[dict]:
     """The ``rollouts`` field of ``POST /rl/submit`` (``protocol/rl_submit.py``): every index in order, completion
     token ids as ``encode_tokens``, and the BFT force span (completion-relative) where the generator reports one. A
-    rollout is a token list, or ``(tokens, force_span)``."""
+    rollout is a token list, ``(tokens, force_span)``, or an ``EpisodeRollout`` (its ``episode`` field added)."""
     from reliquary.protocol.rl_submit import encode_tokens
 
     if len(rollouts) != ROLLOUTS:
         raise ValueError(f"a lease is submitted with all {ROLLOUTS} rollouts")
     out = []
     for index, rollout in enumerate(rollouts):
+        if isinstance(rollout, EpisodeRollout):
+            out.append({"index": index, "tokens": encode_tokens([int(t) for t in rollout.tokens]),
+                        "force_span": None, "episode": rollout.wire()})
+            continue
         tokens, span = (rollout if isinstance(rollout, tuple) else (rollout, None))
         out.append({"index": index, "tokens": encode_tokens([int(t) for t in tokens]),
                     "force_span": None if span is None else [int(span[0]), int(span[1])]})
@@ -241,7 +262,7 @@ def submission_digest(payload: Mapping[str, Any]) -> bytes:
 
     rollouts = sorted(payload["rollouts"], key=lambda r: int(r["index"]))
     return rollouts_digest([(int(r["index"]), r["tokens"], None if r.get("force_span") is None
-                             else tuple(r["force_span"])) for r in rollouts])
+                             else tuple(r["force_span"]), r.get("episode")) for r in rollouts])
 
 
 class RlTransport(Protocol):
@@ -626,7 +647,9 @@ class AsyncMiner:
         version = int(self.loaded_version)
         self._wake_lease.set()                                     # the queue has room again
         try:
-            groups = await asyncio.to_thread(self.generator.generate, batch)
+            agenerate = getattr(self.generator, "agenerate", None)       # episodes: played on the event loop
+            groups = (await agenerate(batch) if agenerate is not None
+                      else await asyncio.to_thread(self.generator.generate, batch))
             if len(groups) != len(batch) or any(len(g) != ROLLOUTS for g in groups):
                 raise ValueError(f"the generator must return {ROLLOUTS} rollouts per lease")
         except Exception:
@@ -910,13 +933,17 @@ class VllmGroupGenerator:
     def generate(self, leases: Sequence[HeldLease]) -> list[list[list[int]]]:
         from reliquary.constants import max_new_tokens_for_environment
 
+        from reliquary.protocol.rl_draw import lease_extra_args
+
         if self._engine is None:
             raise RuntimeError("no weights loaded")
-        # One prompt per call: the generator takes one prompt. A multi-prompt call would fill vLLM better.
-        return [self._engine.generate(self._prompt(lease.environment, lease.prompt_idx), rollouts=ROLLOUTS,
-                                      max_new_tokens=max_new_tokens_for_environment(lease.environment),
-                                      eos_ids=self.eos_ids, **draw_context(lease))
-                for lease in leases]
+        # One engine call for the whole batch (leases x ROLLOUTS requests): each request carries its own lease's
+        # draw (nonce, prompt, k, rollout index), read by request id in the runner-keyed processor.
+        return self._engine.generate_batch(
+            [(self._prompt(lease.environment, lease.prompt_idx),
+              [lease_extra_args(lease.nonce, lease.prompt_idx, lease.checkpoint, r) for r in range(ROLLOUTS)],
+              max_new_tokens_for_environment(lease.environment)) for lease in leases],
+            eos_ids=self.eos_ids)
 
     def _reload(self, state: Mapping[str, Any], version: int) -> None:
         from reliquary.miner.vllm_generation import VLLMRolloutGenerator
