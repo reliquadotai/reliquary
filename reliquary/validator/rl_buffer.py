@@ -89,6 +89,16 @@ class TrainingBuffer:
                                      [(TAKEN, lease_id) for lease_id, _ in rows])
         return [SubmittedGroup.unpack(body) for _, body in rows]
 
+    def take_older(self, below_k: int, limit: int) -> list[SubmittedGroup]:
+        """Up to ``limit`` queued groups of any env generated on a checkpoint older than ``below_k``: the trainer's
+        max-lag drop (freshest-first ``take`` would otherwise leave them queued forever)."""
+        with self.book.transaction():
+            rows = self.book.db.execute("SELECT lease_id, body FROM rl_buffer WHERE state=? AND k<? LIMIT ?",
+                                        (QUEUED, int(below_k), int(limit))).fetchall()
+            self.book.db.executemany("UPDATE rl_buffer SET state=? WHERE lease_id=?",
+                                     [(TAKEN, lease_id) for lease_id, _ in rows])
+        return [SubmittedGroup.unpack(body) for _, body in rows]
+
     def release(self, lease_ids) -> None:
         with self.book.transaction():
             self.book.db.executemany("UPDATE rl_buffer SET state=? WHERE lease_id=? AND state=?",

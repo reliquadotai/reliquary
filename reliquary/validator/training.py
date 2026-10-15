@@ -1986,6 +1986,7 @@ def _microbatch_grad(
     kl_stats=None,
     behavior_model=None,
     loss_scale: float = 1.0,
+    gate=None,
 ):
     """Forward + backward one micro-batch. ``batch`` is a list of
     ``(tokens, prompt_length, old_logprobs, advantage, scale, keep)`` where ``scale``
@@ -1997,6 +1998,11 @@ def _microbatch_grad(
     backward fully succeeds, so an OOM mid-backward (gradient-checkpoint
     recompute) leaves already-accumulated ``.grad`` untouched — the failed
     micro-batch contributes nothing and a split-retry stays correct.
+
+    ``gate`` (async trainer only, ``reliquary.trainer.async_trainer``; None in window mode) verifies in
+    this forward: pi_old is the policy itself (ratio 1, one step per checkpoint), and before the backward
+    ``gate.admit(rollouts, tallies)`` gets each rollout's forced-draw tallies and returns which rollouts
+    stay in the loss (None: all).
     """
     B = len(batch)
     T = max(len(it[0]) for it in batch)
@@ -2121,6 +2127,10 @@ def _microbatch_grad(
     keep_seg = [sum(1 for flag in keep if flag) for keep in keeps]
     if draw_rows is not None:
         draw_rows = _DrawRows(*(field[keep_cat] for field in draw_rows))
+    if gate is not None:
+        new_lp, ref_lp, old_cat, claimed_old_cat, behavior_old_cat, adv_cat, scale_cat, draw_rows, keep_seg = (
+            _gate_rows(gate, kl_stats, batch, new_lp, ref_lp, claimed_old_cat, behavior_old_cat, adv_cat,
+                       scale_cat, draw_rows, keep_seg))
     ppo_log_ratio = new_lp - old_cat
     ratio = torch.exp(ppo_log_ratio)
     surr, clip_active = _clipped_surrogate(ratio, adv_cat)
@@ -2152,7 +2162,7 @@ def _microbatch_grad(
         (loss * loss_scale).backward()
 
     _record_kl_stats(
-        kl_stats,
+        kl_stats if new_lp.numel() else None,
         ppo_tok=ppo_tok,
         kl_tok=kl_tok,
         kl_log=kl_log,
@@ -2166,7 +2176,7 @@ def _microbatch_grad(
         kl_term_computed=ref_lp is not None,
         pi_old=old_cat,
     )
-    if draw_rows is not None:
+    if draw_rows is not None and gate is None:
         _record_draw_stats(
             kl_stats, draw_rows, keep_seg, [item[9] if len(item) > 9 else None for item in batch],
         )
@@ -2175,28 +2185,67 @@ def _microbatch_grad(
     off = 0
     with torch.no_grad():
         for n in keep_seg:
+            if n == 0:
+                continue  # a rollout the gate kept out of the loss
             sum_ppo += float(ppo_tok[off:off + n].mean())
             sum_kl += float(kl_tok[off:off + n].mean())
             off += n
     return sum_ppo, sum_kl, B
 
 
+def _rollout_draw_tallies(draw_rows: _DrawRows, keep_seg: list[int]) -> list[tuple[int, int, int, int]]:
+    """Per rollout, over its kept rows: (stochastic, stochastic matches, drawn, drawn matches)."""
+    with torch.no_grad():
+        owner = torch.repeat_interleave(
+            torch.arange(len(keep_seg), device=draw_rows.drawn.device),
+            torch.tensor(keep_seg, device=draw_rows.drawn.device),
+        )
+        stoch = draw_rows.drawn & draw_rows.stochastic
+        cols = torch.stack([stoch, stoch & draw_rows.match, draw_rows.drawn, draw_rows.drawn & draw_rows.match], 1)
+        out = torch.zeros(len(keep_seg), 4, dtype=torch.float64, device=cols.device)
+        out.index_add_(0, owner, cols.double())
+    return [tuple(int(v) for v in row) for row in out.tolist()]
+
+
+def _gate_rows(gate, kl_stats, batch, new_lp, ref_lp, claimed_old, behavior_old, adv_cat, scale_cat,
+               draw_rows, keep_seg):
+    """The async trainer's verification between forward and backward (design 4.7): pi_old := the policy
+    (ratio 1), the draw counters recorded over every forwarded rollout, then the rollouts ``gate`` refuses
+    (under the floor) leave the loss."""
+    if draw_rows is None:
+        raise RuntimeError("the async trainer's gate needs the substitution loss")
+    rollouts = [item[9] if len(item) > 9 else None for item in batch]
+    _record_draw_stats(kl_stats, draw_rows, keep_seg, rollouts)
+    admitted = gate.admit(rollouts, _rollout_draw_tallies(draw_rows, keep_seg))
+    old_cat = new_lp.detach()
+    if admitted is None or all(admitted):
+        return new_lp, ref_lp, old_cat, claimed_old, behavior_old, adv_cat, scale_cat, draw_rows, keep_seg
+    rows = torch.repeat_interleave(
+        torch.tensor([bool(a) for a in admitted], device=new_lp.device),
+        torch.tensor(keep_seg, device=new_lp.device),
+    )
+    pick = lambda t: None if t is None else t[rows]  # noqa: E731
+    return (new_lp[rows], pick(ref_lp), old_cat[rows], claimed_old[rows], pick(behavior_old), adv_cat[rows],
+            scale_cat[rows], _DrawRows(*(field[rows] for field in draw_rows)),
+            [n if a else 0 for n, a in zip(keep_seg, admitted)])
+
+
 def _process_microbatch(
     model, ref_model, batch, device, *, atomic, kl_stats=None,
-    behavior_model=None, loss_scale: float = 1.0,
+    behavior_model=None, loss_scale: float = 1.0, gate=None,
 ):
     """One micro-batch; when atomic, on OOM halve and retry down to a single
     sequence (which, if it still OOMs, is a genuine unrecoverable OOM)."""
     if not atomic:
         return _microbatch_grad(
             model, ref_model, batch, device, atomic=False, kl_stats=kl_stats,
-            behavior_model=behavior_model, loss_scale=loss_scale,
+            behavior_model=behavior_model, loss_scale=loss_scale, gate=gate,
         )
     oom = False
     try:
         return _microbatch_grad(
             model, ref_model, batch, device, atomic=True, kl_stats=kl_stats,
-            behavior_model=behavior_model,
+            behavior_model=behavior_model, gate=gate,
         )
     except torch.cuda.OutOfMemoryError:
         if len(batch) == 1:
@@ -2210,11 +2259,11 @@ def _process_microbatch(
         mid = len(batch) // 2
         a = _process_microbatch(
             model, ref_model, batch[:mid], device,
-            atomic=True, kl_stats=kl_stats, behavior_model=behavior_model,
+            atomic=True, kl_stats=kl_stats, behavior_model=behavior_model, gate=gate,
         )
         b = _process_microbatch(
             model, ref_model, batch[mid:], device,
-            atomic=True, kl_stats=kl_stats, behavior_model=behavior_model,
+            atomic=True, kl_stats=kl_stats, behavior_model=behavior_model, gate=gate,
         )
         return a[0] + b[0], a[1] + b[1], a[2] + b[2]
 
@@ -2283,7 +2332,7 @@ def _padding_pass(model, device) -> None:
 
 def _accumulate_grouped_grads(
     model, ref_model, plan, device, *, budget, atomic, kl_stats=None,
-    behavior_model=None,
+    behavior_model=None, gate=None,
 ):
     """Pack the plan's rollouts into token-budget micro-batches and accumulate
     gradients. Returns ``(total_ppo, total_kl, n_processed)``."""
@@ -2314,7 +2363,7 @@ def _accumulate_grouped_grads(
         sp, sk, n = _process_microbatch(
             model, ref_model, [items[i] for i in idxs], device,
             atomic=atomic, kl_stats=kl_stats,
-            behavior_model=behavior_model, loss_scale=loss_scale,
+            behavior_model=behavior_model, loss_scale=loss_scale, gate=gate,
         )
         total_ppo += sp
         total_kl += sk
@@ -2336,6 +2385,7 @@ def train_step(
     behavior_model=None,
     window_index: int | None = None,
     global_step_hint: int | None = None,
+    gate=None,
 ) -> Any:
     """Run one GRPO step over the union of *batches*.
 
@@ -2353,6 +2403,11 @@ def train_step(
 
     *window_index* is used as the wandb step when telemetry is enabled.
     Safe to omit in tests.
+
+    *gate* (async trainer, ``reliquary.trainer.async_trainer.DrawGate``; None in window mode) makes the
+    training forward the verification: rollouts under the floor leave the loss before their backward,
+    then ``gate.judge`` pools each group's tallies and a failed group's admitted rollouts are backed out
+    by a second pass with negated advantages before the optimizer step (only failed groups pay it).
     """
     if not batches or all(not b for b in batches):
         logger.info("train_step: empty batch, skipping")
@@ -2400,12 +2455,13 @@ def train_step(
     # partial grads and retry the whole pass with the atomic split-retry path at
     # a halved budget (atomic = an OOM mid-backward commits no gradient).
     kl_stats = _new_kl_stats()
+    budget, atomic = _microbatch_budget(), False
     try:
         total_ppo, total_kl, n_processed = _accumulate_grouped_grads(
             model, ref_model, plan, device,
-            budget=_microbatch_budget(), atomic=False,
+            budget=budget, atomic=atomic,
             kl_stats=kl_stats,
-            behavior_model=behavior_model,
+            behavior_model=behavior_model, gate=gate,
         )
     except torch.cuda.OutOfMemoryError:
         if _DIST is not None:
@@ -2415,12 +2471,22 @@ def train_step(
         _reset_logit_histogram()
         torch.cuda.empty_cache()
         kl_stats = _new_kl_stats()
+        if gate is not None:
+            gate.reset()
+        budget, atomic = max(1, _microbatch_budget() // 2), True
         total_ppo, total_kl, n_processed = _accumulate_grouped_grads(
             model, ref_model, plan, device,
-            budget=max(1, _microbatch_budget() // 2), atomic=True,
+            budget=budget, atomic=atomic,
             kl_stats=kl_stats,
-            behavior_model=behavior_model,
+            behavior_model=behavior_model, gate=gate,
         )
+    if gate is not None:
+        undo = gate.judge(plan, _DIST)
+        if undo:
+            _accumulate_grouped_grads(
+                model, ref_model, undo, device, budget=budget, atomic=atomic,
+                behavior_model=behavior_model, gate=gate.replay(),
+            )
 
     if _DIST is not None:
         from reliquary.trainer.distributed import all_reduce_stats
@@ -2512,6 +2578,8 @@ def train_step(
         failure_metrics.update(overlong_metrics)
         failure_metrics.update(environment_metrics)
         failure_metrics.update(_logit_metrics())
+        if gate is not None:
+            failure_metrics.update(gate.metrics())
         telemetry.log_training_step(failure_metrics, step=window_index)
         _optimizer.zero_grad(set_to_none=True)
         raise TrainingStepSkipped(
@@ -2576,6 +2644,8 @@ def train_step(
     metrics.update(overlong_metrics)
     metrics.update(environment_metrics)
     metrics.update(_logit_metrics())
+    if gate is not None:
+        metrics.update(gate.metrics())
     telemetry.log_training_step(metrics, step=window_index)
 
     return model

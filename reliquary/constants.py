@@ -1992,6 +1992,9 @@ FORCED_SEED_GUMBEL_BOUNDARY_EPSILON = 0.05
 # draw, against the latest checkpoint. One value for the trainer's verification, the audit and the pay ledger.
 # PLACEHOLDER: 0.95 with bf16 heads (about 0.96 with fp32 heads), to calibrate at GPU qualification.
 RL_ROLLOUT_MATCH_FLOOR = 0.95
+# The pooled match floor a group must reach (trainer and audit alike). Lower than the rollout floor so that one
+# bad rollout among 16 honest ones (0.986) does not fail its group, while two do. PLACEHOLDER, as above.
+RL_GROUP_MATCH_FLOOR = 0.90
 # An audited rollout that follows the draw (match >= the floor) yet carries more than this many hard mismatches at
 # near-deterministic positions (max p >= FORCED_SEED_STOCHASTIC_MAXPROB, Gumbel shortfall beyond the boundary
 # epsilon) was edited after the draw: deterministic forgery. PLACEHOLDER: calibrate on honest lag-2 rollouts.

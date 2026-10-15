@@ -62,6 +62,7 @@ full vocab), vLLM 0.30.0 miners, HF proof path validators.
 | Quantized miners vs bf16 validator, Gumbel | fp8 KV 0.985 (undetectable), fp8 weights 0.963-0.971, W4A16/NVFP4 ~0.855 |
 | Trusting declared logprobs | not needed; red team: small gain, residual coordinated-Sybil risk |
 | **2B mini-training** (Qwen3.5-2B, GSM8K, 120 steps, 2 seeds; sampler with noisy weights at match 0.90 + lag up to 3) | no correction: sampler-trainer KL 0.022 -> 0.15 (doubles every ~40 steps), entropy 0.40 -> 0.22; substitution and the paper's MIS+SC with the true q: KL flat at 0.022, entropy 0.34, same evals within noise. Uncorrected run scores higher at 120 steps (sharpening on an easy task). 400-step runs and an lr 5e-6 control in progress |
+| **2B long run and lr 5e-6** (same noisy sampler, match 0.90, lag up to 3) | lr 2e-6, 400-step run: no correction collapses at step ~130 (eval 0.78 -> 0.005 by step 200, KL 0.024 -> 9.6); substitution flat KL 0.022 and still improving at step 260 (0.83/0.795). lr 5e-6: no correction collapses to 0 on both seeds; substitution 0.83/0.81; paper MIS+SC (true q) 0.86/0.84 (2 seeds, on H100), reference without mismatch 0.87/0.86. Substitution costs ~0.03 at 4.2 % substituted positions; production rate ~1.4 % |
 | Weight-sync practice (literature) | labs sync every 1-16 optimizer steps and tolerate 4-8 policy versions with an off-policy-aware loss; 0.6-1.1 % of bf16 weights change per step (with fp32 masters), lossless deltas 60-100x smaller; Grail (SN81) ships deltas + an anchor every 50 on R2 |
 
 ## 3. Flow

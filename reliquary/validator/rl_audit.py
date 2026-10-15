@@ -28,6 +28,7 @@ from reliquary.constants import (
     FORCED_SEED_MIN_STOCH_POSITIONS,
     FORCED_SEED_ROLLOUT_MIN_STOCH,
     RL_AUDIT_FORGERY_MISMATCH_TOLERANCE,
+    RL_GROUP_MATCH_FLOOR,
     RL_ROLLOUT_MATCH_FLOOR,
 )
 from reliquary.services.exploration import AUDIT_FAILURE_DETERMINISTIC, AUDIT_FAILURE_STATISTICAL
@@ -51,7 +52,7 @@ def rollout_draw_diagnostics(model: Any, group: SubmittedGroup, index: int):
         position_offsets=offsets, logit_positions=[len(prompt) + j - 1 for j in offsets])
 
 
-def judge(diagnostics, *, floor: float = RL_ROLLOUT_MATCH_FLOOR,
+def judge(diagnostics, *, floor: float = RL_ROLLOUT_MATCH_FLOOR, group_floor: float = RL_GROUP_MATCH_FLOOR,
           tolerance: int = RL_AUDIT_FORGERY_MISMATCH_TOLERANCE) -> AuditResult:
     """The group verdict from its rollouts' diagnostics (see the module doc)."""
     match = tuple(d.n_exact_match / d.n_stochastic if d.n_stochastic else 1.0 for d in diagnostics)
@@ -59,7 +60,7 @@ def judge(diagnostics, *, floor: float = RL_ROLLOUT_MATCH_FLOOR,
            and d.n_deterministic_hard_mismatch > tolerance for d, m in zip(diagnostics, match)):
         return AuditResult(False, AUDIT_FAILURE_DETERMINISTIC, match)
     stochastic = sum(d.n_stochastic for d in diagnostics)
-    if stochastic >= FORCED_SEED_MIN_STOCH_POSITIONS and sum(d.n_exact_match for d in diagnostics) < floor * stochastic:
+    if stochastic >= FORCED_SEED_MIN_STOCH_POSITIONS and sum(d.n_exact_match for d in diagnostics) < group_floor * stochastic:
         return AuditResult(False, AUDIT_FAILURE_STATISTICAL, match)
     return AuditResult(True, None, match)
 

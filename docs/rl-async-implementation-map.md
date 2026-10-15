@@ -816,6 +816,13 @@ One branch carries the whole async RL work on top of current main.
   published k, price `note_wait` / `tick`.
 - Service wiring: schedule `run_rl_audits` (verify model) promptly after submissions; build `LeaseBook` /
   `LeaseCollector` / `RlSubmissions` / `RlPayLedger` / `AsyncPriceController` in the validator service, mount `build_rl_lease_router(submissions=, pay=)` and `/rl/checkpoint`, a loop for
+- P4 trainer async loop: BUILT (branch `feat/rl-async-trainer`), see "P4 as built" below. Left: the service /
+  CLI entry that builds it (model load, `DeltaPublisher(model_dir=)`, `BackgroundHfBackup`, FSDP2
+  `broadcasting_train_step` + rank-0 gather as `state_fn`, resume = load the weights of `book.latest_checkpoint`).
+- Audit `ProofForward`: the Gumbel verifier over a `SubmittedGroup` against the latest checkpoint (uniforms from
+  `draw_uniforms`), then `run_audits`.
+- Service wiring: build `LeaseBook` / `LeaseCollector` / `RlSubmissions` / `RlPayLedger` / `AsyncPriceController`
+  in the validator service, mount `build_rl_lease_router(submissions=, pay=)` and `/rl/checkpoint`, a loop for
   `expire_due`, `ingest`, `settle` / `publish`, the async task's registry entry (`settlement = "period-ema-v1"`).
 - Audit follow-ups: calibrate the floor and the forgery tolerance on honest lag-2 rollouts (GPU qualification);
   the P4 trainer reads `RL_ROLLOUT_MATCH_FLOOR` too; no separate terminal-pick check yet (the last token is judged
@@ -825,3 +832,29 @@ One branch carries the whole async RL work on top of current main.
 - GPU qualification: the v10 Gumbel profile and fp32 head end to end on vLLM (miner) vs the validator forward,
   the in-place weight push (`collective_rpc`, `VLLM_ALLOW_INSECURE_SERIALIZATION`), FSDP2 trainer with the
   substitution loss, delta publication size and miner sync time on the 9B.
+
+### P4 as built (branch `feat/rl-async-trainer`)
+
+- `reliquary/trainer/async_trainer.py` (`AsyncTrainer`, `AsyncTrainerConfig`, `DrawGate`), next to the window
+  trainer (unchanged). `run_once`: drop groups older than `max_lag` (8) checkpoints unpaid without a forward
+  (`TrainingBuffer.take_older`); take `batch_groups` at `env_mix` (largest remainder; freshest first per env); a
+  short env is polled for at most `wait_s`, then the step runs with what is there and `note_wait(env, s)` is
+  reported; `train_step(..., gate=DrawGate)`; `report_training` for every group; a checkpoint every
+  `steps_per_checkpoint` (N, default 1): CPU snapshot on the step path, `DeltaPublisher.publish` +
+  `LeaseBook.adopt_checkpoint(k+1)` in a one-deep publish thread (an error stops the loop at the next
+  publication); `BackgroundHfBackup.submit` every `hf_backup_every` (M) steps; `prices.tick(trained matched tokens,
+  depth)` per step. Health skip: groups reported untrained, unsanctioned. Crash: groups released.
+- Verification in the training forward (`training.py`, `gate=None` keeps the window path as it was): per
+  micro-batch the substitution forward gives v* and per-rollout tallies (stochastic / drawn, matches); pi_old :=
+  the policy (ratio 1); rollouts under `RL_ROLLOUT_MATCH_FLOOR` (constants, 0.95 placeholder; the ledger's floor)
+  leave the loss before the backward. Rollout match = rate on stochastic positions when >= 20 of them, else on
+  every drawn position. After all micro-batches `DrawGate.judge` pools each group (FSDP2: tallies all-reduced) at
+  `ASYNC_GROUP_FLOOR` 0.90 (placeholder: one fully bad rollout of 16 survives, two do not); a failed group's
+  admitted rollouts are backed out by a second pass with negated advantages (exact up to bf16 noise; only failed
+  groups pay it). Accepted: paid matched tokens of admitted rollouts; rejected: `statistical` when lag <=
+  `sanction_max_lag` (2), else unsanctioned. Telemetry: train/* plus `async/` checkpoint, lag, buffer depth,
+  waits, batch groups per env, forwarded / below-floor rollouts, accepted / rejected / undone groups.
+- Known approximations: masked rollouts stay in their env's planned token denominator; with N > 1 the forward
+  verifies against the trainer's in-between weights; the publisher copies the snapshot once more on CPU.
+- GPU qualification still owed: trainer-forward picks vs the proof path on the 9B (FSDP2, fp32 head), the floors,
+  snapshot + delta time per step.
