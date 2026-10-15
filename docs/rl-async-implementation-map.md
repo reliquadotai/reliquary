@@ -780,6 +780,8 @@ One branch carries the whole async RL work on top of current main.
 
 - Merge regression: main made the window price rise opt-in (`RELIQUARY_EMISSION_PRICE_RISE`, default 1.0), which
   silently removed the async controller's rise. `rl_price.ASYNC_PRICE_RISE = 1.10` pins it.
+- Merge drift: main added two envs to v9, so the v10 Gumbel profile (v9 + Gumbel draw) compiles to a new
+  contract; its golden digests are re-pinned.
 - Submission wire: the miner sends the validator's body (`protocol/rl_submit.py`) signed with
   `build_rl_submit_binding` over `rollouts_digest`; the draft `u32le-zlib/1` encoding and binding are deleted.
   Generators may return `(tokens, force_span)` per rollout. `k_generated` is optional, unsigned and ignored.
