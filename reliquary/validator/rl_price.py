@@ -33,7 +33,11 @@ from reliquary.validator.emission_price import (
     PRODUCTION_PRICE_PARAMS, ROUND_SECONDS, PriceDecision, PriceParams, PriceState,
 )
 
-ASYNC_BASE_PARAMS = replace(PRODUCTION_PRICE_PARAMS, cap=4.0)
+# The async controller always rises (x1.10) on a trainer wait or a short share: that is its signal. The window
+# controller's rise is off unless ``RELIQUARY_EMISSION_PRICE_RISE`` is set (main, 10-14); that switch is the window
+# board's and does not reach the async prices.
+ASYNC_PRICE_RISE = 1.10
+ASYNC_BASE_PARAMS = replace(PRODUCTION_PRICE_PARAMS, cap=4.0, rise=ASYNC_PRICE_RISE)
 RISE, DESCEND, HOLD = "rise", "descend", "hold"
 
 _SCHEMA = """
@@ -186,6 +190,6 @@ class AsyncPriceController:
 
 
 __all__ = [
-    "ASYNC_BASE_PARAMS", "DESCEND", "HOLD", "RISE", "AsyncPriceController", "AsyncPriceParams", "EnvSignal",
+    "ASYNC_BASE_PARAMS", "ASYNC_PRICE_RISE", "DESCEND", "HOLD", "RISE", "AsyncPriceController", "AsyncPriceParams", "EnvSignal",
     "advance_async",
 ]
