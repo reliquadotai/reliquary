@@ -14,7 +14,7 @@ import asyncio
 import hashlib
 import logging
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from reliquary.shared.ckpt_index import (
     INDEX_FORMAT,
@@ -37,10 +37,15 @@ def presigner(client: Any, bucket: str, ttl: int = PRESIGN_TTL_SECONDS) -> Calla
     return presign
 
 
-def wallet_index_signer(wallet: Any) -> Callable[[bytes], bytes]:
-    """Sign with the local wallet hotkey. The remote signer (reliquary/signer)
-    only signs checkpoint payloads today; it needs an index operation first."""
-    return lambda payload: bytes(wallet.hotkey.sign(payload))
+def wallet_index_signer(wallet: Any) -> Callable[[Mapping[str, Any]], str]:
+    """Sign with the local wallet hotkey."""
+    return lambda index: sign_index(index, lambda payload: bytes(wallet.hotkey.sign(payload)))
+
+
+def remote_index_signer(client: Any) -> Callable[[Mapping[str, Any]], str]:
+    """Sign through the remote signer's index operation (``RemoteSignerClient.sign_rl_index``):
+    the controller holds no private key."""
+    return lambda index: bytes(client.sign_rl_index(dict(index))).hex()
 
 
 class RlCheckpointBoard:
@@ -48,14 +53,20 @@ class RlCheckpointBoard:
         self,
         *,
         load_index: Callable[[], bytes | None],
-        sign_fn: Callable[[bytes], bytes],
         validator_hotkey: str,
         presign: Callable[[str], str],
         ttl_seconds: int = PRESIGN_TTL_SECONDS,
         refresh_seconds: float = REFRESH_SECONDS,
         clock: Callable[[], float] = time.time,
+        sign_fn: Callable[[bytes], bytes] | None = None,
+        index_signer: Callable[[Mapping[str, Any]], str] | None = None,
     ) -> None:
-        self._load, self._sign, self._presign = load_index, sign_fn, presign
+        """``sign_fn`` signs the index payload bytes; ``index_signer`` signs the index itself
+        (hex signature: the remote signer). Exactly one of them."""
+        if (sign_fn is None) == (index_signer is None):
+            raise ValueError("pass exactly one of sign_fn and index_signer")
+        self._index_signer = index_signer or (lambda index: sign_index(index, sign_fn))
+        self._load, self._presign = load_index, presign
         self.validator_hotkey = validator_hotkey
         self._ttl, self._refresh, self._clock = ttl_seconds, refresh_seconds, clock
         self._loaded_at = float("-inf")
@@ -66,14 +77,18 @@ class RlCheckpointBoard:
         async with self._lock:
             if self._clock() - self._loaded_at >= self._refresh:
                 try:
-                    raw = await asyncio.to_thread(self._load)
-                    self._loaded_at = self._clock()
-                    if raw:
-                        self._accept(strict_json_loads(raw))
+                    # Off the event loop: the read and a remote signature are network calls.
+                    await asyncio.to_thread(self._reload)
                 except Exception:
                     logger.warning("checkpoint index reload failed; serving the last one",
                                    exc_info=True)
             return None if self._signed is None else self._signed[1:]
+
+    def _reload(self) -> None:
+        raw = self._load()
+        self._loaded_at = self._clock()
+        if raw:
+            self._accept(strict_json_loads(raw))
 
     def _accept(self, index: dict) -> None:
         if index.get("format") != INDEX_FORMAT:
@@ -82,7 +97,7 @@ class RlCheckpointBoard:
             raise ValueError("checkpoint index went backwards")
         digest = hashlib.sha256(index_signing_payload(index)).hexdigest()
         if self._signed is None or self._signed[0] != digest:
-            self._signed = (digest, index, sign_index(index, self._sign))
+            self._signed = (digest, index, self._index_signer(index))
 
     async def answer(self) -> dict | None:
         current = await self._current()

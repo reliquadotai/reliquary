@@ -21,8 +21,11 @@ One process on the controller, like the corpus validator: no window, batcher or 
   --rl-async``): the unchanged weight setter pays its period archives. Per-env target shares are the entry's
   ``env_split``; the async parameters are the ``rl_*`` params below.
 
+* **Signing:** the checkpoint index is signed by the remote signer's index operation when ``RELIQUARY_SIGNER_URL``
+  is set (signer-01 needs ``RELIQUARY_SIGNER_RL_RUN`` = the run), else by the local wallet.
+
 Not here (map §9): the R2 segments of the observation log (decision D; ``rl_prompt_scans`` is served by
-``/rl/prompts/state``), the remote signer (the checkpoint index is signed with the local wallet), axon publication.
+``/rl/prompts/state``), axon publication.
 """
 from __future__ import annotations
 
@@ -399,15 +402,23 @@ def _grader_for(names, checkpoint: str, load_kwargs: Mapping[str, Any]):
     return grader, ranges
 
 
-def _checkpoint_board(run: str, wallet, validator_hotkey: str):
+def index_signer_for(wallet, signer_client=None):
+    """The checkpoint index's signer: the remote signer's index operation when ``RELIQUARY_SIGNER_URL`` gave one
+    (the signer's ``RELIQUARY_SIGNER_RL_RUN`` must name this run), else the local wallet."""
+    from reliquary.validator.rl_checkpoint import remote_index_signer, wallet_index_signer
+
+    return remote_index_signer(signer_client) if signer_client is not None else wallet_index_signer(wallet)
+
+
+def _checkpoint_board(run: str, index_signer, validator_hotkey: str):
     from reliquary.infrastructure.storage import public_checkpoint_bucket, public_checkpoint_client
     from reliquary.shared.ckpt_index import index_key
     from reliquary.trainer.ckpt_publisher import R2ObjectStore
-    from reliquary.validator.rl_checkpoint import RlCheckpointBoard, presigner, wallet_index_signer
+    from reliquary.validator.rl_checkpoint import RlCheckpointBoard, presigner
 
     client, bucket = public_checkpoint_client(), public_checkpoint_bucket()
     store = R2ObjectStore(client, bucket)
-    return RlCheckpointBoard(load_index=lambda: store.get_bytes(index_key(run)), sign_fn=wallet_index_signer(wallet),
+    return RlCheckpointBoard(load_index=lambda: store.get_bytes(index_key(run)), index_signer=index_signer,
                              validator_hotkey=validator_hotkey, presign=presigner(client, bucket))
 
 
@@ -438,9 +449,6 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     from reliquary.validator.service import _validator_state_dir
 
     unmute_reliquary_loggers()
-    if signer_client is not None:
-        raise RuntimeError("the async RL validator signs its checkpoint index with the local wallet: the remote "
-                           "signer has no index operation yet (unset RELIQUARY_SIGNER_URL)")
     load_kwargs = dict(load_kwargs or {})
     settings = rl_async_settings(entry, cap)
     validator_hotkey = wallet.hotkey.ss58_address
@@ -448,7 +456,8 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     state_dir = _validator_state_dir()
     state_dir.mkdir(parents=True, exist_ok=True)
     rl = build_rl_async(settings, path=state_dir / DB_NAME, grader=grader, prompt_range=ranges,
-                        board=_checkpoint_board(settings.run, wallet, validator_hotkey))
+                        board=_checkpoint_board(settings.run, index_signer_for(wallet, signer_client),
+                                                validator_hotkey))
     audit_model = None
     device = os.environ.get(AUDIT_DEVICE_ENV, "").strip()
     if device:

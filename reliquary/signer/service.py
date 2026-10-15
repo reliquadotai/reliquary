@@ -18,6 +18,8 @@ from reliquary.signer.journal import (
 from reliquary.signer.protocol import (
     CheckpointSignRequest,
     CheckpointSignResponse,
+    RlIndexSignRequest,
+    RlIndexSignResponse,
     ServeAxonRequest,
     ServeAxonResponse,
     SetWeightsRequest,
@@ -26,6 +28,7 @@ from reliquary.signer.protocol import (
     WeightSubmissionStatus,
     checkpoint_payload,
 )
+from reliquary.shared.ckpt_index import index_signing_payload
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +40,7 @@ class SignerPolicy:
     repo_id: str
     axon_ip: str | None = None
     axon_port: int | None = None
+    rl_run: str | None = None   # the async RL checkpoint index run it signs (None: operation disabled)
 
 
 def _reserve_or_http(journal: SignerJournal, **kwargs):
@@ -133,6 +137,53 @@ def create_signer_app(
             )
             raise HTTPException(
                 status_code=503, detail="checkpoint_signing_failed"
+            ) from exc
+
+    @app.post("/v1/rl/index/sign")
+    async def sign_rl_index(request: RlIndexSignRequest) -> RlIndexSignResponse:
+        enforce_common(request.netuid)
+        if policy.rl_run is None:
+            raise HTTPException(status_code=403, detail="rl_index_operation_disabled")
+        if request.run != policy.rl_run:
+            raise HTTPException(status_code=403, detail="rl_run_denied")
+        # The latest version may repeat (pruning, new cumulative deltas), never go back.
+        reservation = _reserve_or_http(
+            journal,
+            operation_id=request.operation_id,
+            kind="rl-index-sign",
+            payload_digest=request.operation_id,
+            cursor_name="rl_index_version",
+            cursor_value=request.version,
+            cursor_strict=False,
+        )
+        if reservation.cached_response is not None:
+            cached = dict(reservation.cached_response)
+            cached["cached"] = True
+            return RlIndexSignResponse.model_validate(cached)
+        try:
+            signature = await asyncio.to_thread(
+                backend.sign_rl_index, index_signing_payload(request.index)
+            )
+            response = RlIndexSignResponse(
+                operation_id=request.operation_id,
+                signer_hotkey=backend.hotkey_address,
+                signature_hex=signature.hex(),
+            )
+            journal.complete(request.operation_id, response.model_dump())
+            logger.info(
+                "rl index signed operation=%s run=%s version=%d",
+                request.operation_id[:12],
+                request.run,
+                request.version,
+            )
+            return response
+        except Exception as exc:
+            journal.fail_definite(request.operation_id, type(exc).__name__)
+            logger.exception(
+                "rl index signing failed operation=%s", request.operation_id[:12]
+            )
+            raise HTTPException(
+                status_code=503, detail="rl_index_signing_failed"
             ) from exc
 
     @app.post("/v1/weights/set")

@@ -13,6 +13,8 @@ from reliquary.signer.protocol import (
     SIGNER_PROTOCOL_VERSION,
     CheckpointSignRequest,
     CheckpointSignResponse,
+    RlIndexSignRequest,
+    RlIndexSignResponse,
     ServeAxonRequest,
     ServeAxonResponse,
     SetWeightsRequest,
@@ -22,6 +24,7 @@ from reliquary.signer.protocol import (
     axon_operation_id,
     checkpoint_operation_id,
     checkpoint_payload,
+    rl_index_operation_id,
     weights_operation_id,
 )
 
@@ -159,6 +162,37 @@ class RemoteSignerClient:
             signature=signature,
         ):
             raise RuntimeError("remote checkpoint signature verification failed")
+        return signature
+
+    def sign_rl_index(self, index: dict) -> bytes:
+        """The hotkey's signature of the async RL checkpoint index (``shared/ckpt_index``)."""
+        from reliquary.shared.ckpt_index import index_signing_payload
+
+        index = dict(index)
+        operation = rl_index_operation_id(netuid=self.netuid, index=index)
+        request = RlIndexSignRequest(
+            operation_id=operation, netuid=self.netuid, index=index,
+        )
+        with httpx.Client(
+            verify=self._tls_context,
+            timeout=15.0,
+            trust_env=False,
+        ) as client:
+            response = client.post(
+                f"{self.base_url}/v1/rl/index/sign",
+                json=request.model_dump(),
+            )
+            response.raise_for_status()
+        result = RlIndexSignResponse.model_validate(response.json())
+        self._check_hotkey(result.signer_hotkey)
+        if result.operation_id != operation:
+            raise RuntimeError("signer index response is not bound to the request")
+        signature = bytes.fromhex(result.signature_hex)
+        import bittensor as bt
+
+        verifier = bt.Keypair(ss58_address=self.expected_hotkey)
+        if not verifier.verify(data=index_signing_payload(index), signature=signature):
+            raise RuntimeError("remote index signature verification failed")
         return signature
 
     async def last_weight_epoch(self) -> int | None:
