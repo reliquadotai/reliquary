@@ -119,9 +119,20 @@ def segment_entry(run_id: str, s: dict, *, root: str | None = None) -> dict:
             "last_seq": s["last_seq"], "sha256": s["sha256"], "size": s["size"]}
 
 
-def sign_document(body: dict, wallet) -> bytes:
-    """The published bytes of a head or page: canonical JSON of ``body`` + its signature."""
-    signature = bytes(wallet.hotkey.sign(INDEX_DOMAIN + canonical_json_bytes(body))).hex()
+def document_signing_payload(body: dict) -> bytes:
+    """The signed bytes of a head or page body (without ``signature``): the index domain + canonical JSON."""
+    return INDEX_DOMAIN + canonical_json_bytes(body)
+
+
+def wallet_document_signer(wallet):
+    """``body -> hex signature`` with the local wallet hotkey."""
+    return lambda body: bytes(wallet.hotkey.sign(document_signing_payload(body))).hex()
+
+
+def sign_document(body: dict, wallet=None, *, signer=None) -> bytes:
+    """The published bytes of a head or page: canonical JSON of ``body`` + its signature (by ``wallet``, or by
+    ``signer``: ``body -> hex signature``, e.g. the remote signer's observation operation)."""
+    signature = (signer or wallet_document_signer(wallet))(body)
     return canonical_json_bytes({**body, "signature": signature})
 
 
@@ -168,20 +179,31 @@ def verify_index(index_bytes, validator_ss58: str, *, expected_run_id: str, min_
         document = json.loads(index_bytes) if isinstance(index_bytes, (bytes, bytearray, str)) else index_bytes
     except ValueError as exc:
         raise ValueError("observation index is not JSON") from exc
-    kinds = {INDEX_SCHEMA: "head", PAGE_SCHEMA: "page"}
-    if not isinstance(document, dict) or document.get("schema") not in kinds:
+    if not isinstance(document, dict) or document.get("schema") not in (INDEX_SCHEMA, PAGE_SCHEMA):
         raise ValueError("unknown observation index")
-    kind = kinds[document["schema"]]
     body = {k: v for k, v in document.items() if k != "signature"}
     if body.get("validator") != validator_ss58:
         raise ValueError("index names another validator (signature not checked)")
     try:
-        ok = Keypair(ss58_address=validator_ss58).verify(INDEX_DOMAIN + canonical_json_bytes(body),
+        ok = Keypair(ss58_address=validator_ss58).verify(document_signing_payload(body),
                                                          bytes.fromhex(document["signature"]))
     except Exception as exc:
         raise ValueError("bad index signature") from exc
     if not ok:
         raise ValueError("bad index signature")
+    kind = check_index_body(body, expected_run_id=expected_run_id, root=root)
+    if kind == "head" and body["last_number"] < min_last_number:
+        raise ValueError("stale observation index")
+    return {**body, "kind": kind}
+
+
+def check_index_body(body: dict, *, expected_run_id: str, root: str | None = None) -> str:
+    """The structure of a head or page body (signature not involved): ``"head"`` or ``"page"``, ValueError
+    otherwise. Shared by the readers (``verify_index``) and the remote signer's observation operation."""
+    kinds = {INDEX_SCHEMA: "head", PAGE_SCHEMA: "page"}
+    if not isinstance(body, dict) or body.get("schema") not in kinds:
+        raise ValueError("unknown observation index")
+    kind = kinds[body["schema"]]
     if body.get("run_id") != expected_run_id:
         raise ValueError("index belongs to another run")
     entries = body.get("segments")
@@ -212,9 +234,7 @@ def verify_index(index_bytes, validator_ss58: str, *, expected_run_id: str, min_
             raise ValueError("head last_number does not match its segments")
         if entries and entries[0]["number"] != expected_first:
             raise ValueError("head does not continue its pages")
-        if last < min_last_number:
-            raise ValueError("stale observation index")
-    return {**body, "kind": kind}
+    return kind
 
 
 def verify_page_entry(page_bytes: bytes, entry: dict) -> None:
@@ -265,10 +285,14 @@ def r2_get(bucket: str):
 
 class ObservationPublisher:
     def __init__(self, runtime, *, run_id: str, task_id: str, wallet, put, get=None, clock=time.time,
-                 root: str | None = None, project=public_events):
+                 root: str | None = None, project=public_events, signer=None):
         self.runtime, self.run_id, self.task_id, self.wallet, self.put, self.get, self.clock = runtime, run_id, task_id, wallet, put, get, clock
         # ``root``: the key prefix (default ``observations/run-<run_id>``); ``project``: events -> published events.
         self.root, self.project = root, project
+        # ``signer``: ``body -> hex signature`` (default: the wallet's hotkey; the async RL validator passes the
+        # remote signer's observation operation). The documents name the wallet's hotkey either way.
+        self.validator = wallet.hotkey.ss58_address
+        self._signer = signer or wallet_document_signer(wallet)
         self.head_bytes: bytes | None = None     # the last head written (served by the async RL validator)
         # After a restart the last index PUT is unknown: write it once on the first flush.
         self._index_dirty = True
@@ -333,7 +357,7 @@ class ObservationPublisher:
         raw = await self.get(index_key(self.run_id, root=self.root))
         if raw is None:
             return
-        validator = self.wallet.hotkey.ss58_address
+        validator = self.validator
         try:
             remote = verify_index(raw, validator, expected_run_id=self.run_id, root=self.root)
         except ValueError as exc:
@@ -376,8 +400,8 @@ class ObservationPublisher:
 
         def build() -> bytes:
             segments = self.runtime.published_segments(first_number=first, last_number=first + PAGE_SEGMENTS - 1)
-            return sign_document(build_page(run_id=self.run_id, validator=self.wallet.hotkey.ss58_address,
-                                            segments=segments, root=self.root), self.wallet)
+            return sign_document(build_page(run_id=self.run_id, validator=self.validator, segments=segments,
+                                            root=self.root), signer=self._signer)
         return self.runtime.index_page(first, build)
 
     def _closed_page_entries(self, closed: int) -> list[dict]:
@@ -401,9 +425,9 @@ class ObservationPublisher:
         pages = self._closed_page_entries(closed)
         segments = self.runtime.published_segments(first_number=closed * PAGE_SEGMENTS + 1, last_number=last)
         head = build_head(run_id=self.run_id, order_sha256=self.runtime.contract.sha256,
-                          validator=self.wallet.hotkey.ss58_address, segments=segments, pages=pages,
+                          validator=self.validator, segments=segments, pages=pages,
                           last_number=last, generated_at=self.clock(), root=self.root)
-        return sign_document(head, self.wallet), head
+        return sign_document(head, signer=self._signer), head
 
     async def flush(self) -> dict | None:
         """Publish the next segment (if any), the closed pages, then the head. None when nothing was written."""

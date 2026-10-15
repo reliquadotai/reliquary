@@ -11,7 +11,14 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from reliquary.shared.ckpt_index import index_signing_payload, run_prefix
+from reliquary.services.publication import (
+    INDEX_SCHEMA as OBSERVATION_HEAD_SCHEMA,
+    PAGE_SCHEMA as OBSERVATION_PAGE_SCHEMA,
+    PAGE_SEGMENTS,
+    check_index_body,
+    document_signing_payload,
+)
+from reliquary.shared.ckpt_index import index_signing_payload, observations_root, run_prefix
 
 SIGNER_PROTOCOL_VERSION = 1
 _DOMAIN = b"reliquary-signer-v1\x00"
@@ -246,6 +253,123 @@ class RlIndexSignResponse(CheckpointSignResponse):
     pass
 
 
+MAX_OBSERVATION_PAGES = 10_000      # 200 segments a page, a segment per 60 s: ~4.5 years of a run
+
+
+class _ObservationSegment(_StrictModel):
+    number: int = Field(ge=1)
+    key: str = Field(max_length=512)
+    first_seq: int = Field(ge=0)
+    last_seq: int = Field(ge=0)
+    sha256: str = Field(pattern=_SHA256)
+    size: int = Field(ge=0)
+
+
+class _ObservationPageRef(_StrictModel):
+    key: str = Field(max_length=512)
+    first_number: int = Field(ge=1)
+    last_number: int = Field(ge=1)
+    sha256: str = Field(pattern=_SHA256)
+    size: int = Field(ge=0)
+
+
+class _ObservationDocument(_StrictModel):
+    run_id: str = Field(min_length=1, max_length=128)
+    validator: str = Field(min_length=10, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_document(self):
+        if not _RUN.fullmatch(self.run_id) or self.run_id in {".", ".."}:
+            raise ValueError("run_id must be a single path component")
+        # The publication's own structural rules, every key under ``rl/<run>/observations/``.
+        check_index_body(self.model_dump(by_alias=True), expected_run_id=self.run_id,
+                         root=observations_root(self.run_id))
+        return self
+
+
+class RlObservationHead(_ObservationDocument):
+    """The async scan log's head index (``services/publication.build_head`` with the run's observations root)."""
+
+    schema_: Literal[OBSERVATION_HEAD_SCHEMA] = Field(alias="schema")
+    order_sha256: str = Field(pattern=_SHA256)
+    generated_at: float | int = Field(ge=0)
+    last_number: int = Field(ge=1)
+    segments: list[_ObservationSegment] = Field(max_length=PAGE_SEGMENTS - 1)
+    pages: list[_ObservationPageRef] = Field(max_length=MAX_OBSERVATION_PAGES)
+
+    @model_validator(mode="before")
+    @classmethod
+    def finite_time(cls, data):
+        if isinstance(data, dict) and isinstance(data.get("generated_at"), float) and not math.isfinite(
+                data["generated_at"]):
+            raise ValueError("generated_at must be finite")
+        return data
+
+
+class RlObservationPage(_ObservationDocument):
+    """A closed page of the async scan log (``services/publication.build_page``): exactly ``PAGE_SEGMENTS``."""
+
+    schema_: Literal[OBSERVATION_PAGE_SCHEMA] = Field(alias="schema")
+    first_number: int = Field(ge=1)
+    last_number: int = Field(ge=1)
+    segments: list[_ObservationSegment] = Field(min_length=PAGE_SEGMENTS, max_length=PAGE_SEGMENTS)
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> "RlObservationPage":
+        if (self.first_number - 1) % PAGE_SEGMENTS:
+            raise ValueError("a page starts on a page boundary")
+        return self
+
+
+def rl_observation_digest(document: dict) -> str:
+    try:
+        payload = document_signing_payload(document)
+    except TypeError as exc:                 # non-finite floats, non-JSON values: a validation error, not a 500
+        raise ValueError(str(exc)) from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
+class RlObservationSignRequest(_StrictModel):
+    """Sign one head or closed page of the async scan log (served on ``GET /rl/observations``). The payload is
+    the observation index domain and the canonical document JSON (``document_signing_payload``), rebuilt by the
+    signer after validation; a ``signature`` field is refused like any other extra field."""
+
+    protocol_version: Literal[1] = SIGNER_PROTOCOL_VERSION
+    operation_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    netuid: int = Field(ge=0, le=65535)
+    document: dict
+
+    @model_validator(mode="after")
+    def validate_document(self) -> "RlObservationSignRequest":
+        schema = self.document.get("schema")
+        if schema == OBSERVATION_HEAD_SCHEMA:
+            RlObservationHead.model_validate(self.document)
+        elif schema == OBSERVATION_PAGE_SCHEMA:
+            RlObservationPage.model_validate(self.document)
+        else:
+            raise ValueError("not an observation head or page")
+        if self.operation_id != rl_observation_operation_id(netuid=self.netuid, document=self.document):
+            raise ValueError("operation_id does not bind this observation document")
+        return self
+
+    @property
+    def kind(self) -> str:
+        return "head" if self.document["schema"] == OBSERVATION_HEAD_SCHEMA else "page"
+
+    @property
+    def run(self) -> str:
+        return str(self.document["run_id"])
+
+    @property
+    def number(self) -> int:
+        """The cursor: a head's ``last_number``, a page's ``first_number``."""
+        return int(self.document["last_number" if self.kind == "head" else "first_number"])
+
+
+class RlObservationSignResponse(CheckpointSignResponse):
+    pass
+
+
 class SignerHealth(_StrictModel):
     protocol_version: Literal[1] = SIGNER_PROTOCOL_VERSION
     status: Literal["ok"] = "ok"
@@ -301,4 +425,11 @@ def rl_index_operation_id(*, netuid: int, index: dict) -> str:
     return operation_id(
         "rl-index-sign",
         {"index_sha256": rl_index_digest(index), "netuid": int(netuid)},
+    )
+
+
+def rl_observation_operation_id(*, netuid: int, document: dict) -> str:
+    return operation_id(
+        "rl-observation-sign",
+        {"document_sha256": rl_observation_digest(document), "netuid": int(netuid)},
     )

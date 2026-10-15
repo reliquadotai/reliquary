@@ -160,12 +160,21 @@ def bucket_io(client, bucket: str) -> tuple[Callable[..., Awaitable[None]], Call
     return put, get
 
 
-def scan_publisher(book, *, run: str, task_id: str, wallet, put, get=None, clock=time.time):
+def remote_document_signer(client) -> Callable[[dict], str]:
+    """Sign heads and pages through the remote signer's observation operation
+    (``RemoteSignerClient.sign_rl_observation``): the controller holds no private key."""
+    return lambda body: bytes(client.sign_rl_observation(dict(body))).hex()
+
+
+def scan_publisher(book, *, run: str, task_id: str, wallet, put, get=None, clock=time.time, signer_client=None):
+    """The scan log's publisher, signing with the remote signer when ``signer_client`` is given (``wallet`` is then
+    its public identity), else with the local wallet."""
     from reliquary.shared.ckpt_index import observations_root
 
     journal = ScanJournal(book, order_sha256=order_sha256(task_id, run))
+    signer = None if signer_client is None else remote_document_signer(signer_client)
     return pub.ObservationPublisher(journal, run_id=run, task_id=task_id, wallet=wallet, put=put, get=get,
-                                    clock=clock, root=observations_root(run), project=project_scans)
+                                    clock=clock, root=observations_root(run), project=project_scans, signer=signer)
 
 
 # --- serving ------------------------------------------------------------------------------------------------------
@@ -204,4 +213,4 @@ async def rl_observations_response(board: ObservationBoard | None, after: str = 
 
 
 __all__ = ["FLUSH_EVERY_S", "MAX_URLS", "ObservationBoard", "ScanJournal", "bucket_io", "order_sha256",
-           "project_scans", "rl_observations_response", "scan_publisher"]
+           "project_scans", "remote_document_signer", "rl_observations_response", "scan_publisher"]

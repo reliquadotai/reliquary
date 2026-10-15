@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 
 from fastapi import FastAPI, HTTPException
@@ -20,6 +21,8 @@ from reliquary.signer.protocol import (
     CheckpointSignResponse,
     RlIndexSignRequest,
     RlIndexSignResponse,
+    RlObservationSignRequest,
+    RlObservationSignResponse,
     ServeAxonRequest,
     ServeAxonResponse,
     SetWeightsRequest,
@@ -28,6 +31,7 @@ from reliquary.signer.protocol import (
     WeightSubmissionStatus,
     checkpoint_payload,
 )
+from reliquary.services.publication import document_signing_payload
 from reliquary.shared.ckpt_index import index_signing_payload
 
 logger = logging.getLogger(__name__)
@@ -40,7 +44,8 @@ class SignerPolicy:
     repo_id: str
     axon_ip: str | None = None
     axon_port: int | None = None
-    rl_run: str | None = None   # the async RL checkpoint index run it signs (None: operation disabled)
+    # The async RL run whose checkpoint index and scan log it signs (None: both operations disabled).
+    rl_run: str | None = None
 
 
 def _reserve_or_http(journal: SignerJournal, **kwargs):
@@ -56,8 +61,16 @@ def _reserve_or_http(journal: SignerJournal, **kwargs):
         raise HTTPException(status_code=409, detail="operation_conflict") from exc
 
 
+# How far in the future a scan log head may be dated (clock skew): no head is signed ahead of time.
+MAX_OBSERVATION_HEAD_SKEW_S = 300.0
+
+
 def create_signer_app(
-    *, policy: SignerPolicy, backend: SignerBackend, journal: SignerJournal
+    *,
+    policy: SignerPolicy,
+    backend: SignerBackend,
+    journal: SignerJournal,
+    clock=time.time,
 ) -> FastAPI:
     app = FastAPI(
         title="Reliquary semantic signer",
@@ -184,6 +197,64 @@ def create_signer_app(
             )
             raise HTTPException(
                 status_code=503, detail="rl_index_signing_failed"
+            ) from exc
+
+    @app.post("/v1/rl/observations/sign")
+    async def sign_rl_observation(
+        request: RlObservationSignRequest,
+    ) -> RlObservationSignResponse:
+        enforce_common(request.netuid)
+        if policy.rl_run is None:
+            raise HTTPException(status_code=403, detail="rl_observation_operation_disabled")
+        if request.run != policy.rl_run:
+            raise HTTPException(status_code=403, detail="rl_run_denied")
+        if request.document["validator"] != backend.hotkey_address:
+            raise HTTPException(status_code=403, detail="validator_denied")
+        if (
+            request.kind == "head"
+            and float(request.document["generated_at"]) > clock() + MAX_OBSERVATION_HEAD_SKEW_S
+        ):
+            raise HTTPException(status_code=403, detail="head_from_the_future")
+        # Heads: last_number may repeat (a restart rewrites the head), never go back. Pages are
+        # closed in order: first_number may repeat (a lost signature), never go back.
+        reservation = _reserve_or_http(
+            journal,
+            operation_id=request.operation_id,
+            kind="rl-observation-sign",
+            payload_digest=request.operation_id,
+            cursor_name=f"rl_observation_{request.kind}",
+            cursor_value=request.number,
+            cursor_strict=False,
+        )
+        if reservation.cached_response is not None:
+            cached = dict(reservation.cached_response)
+            cached["cached"] = True
+            return RlObservationSignResponse.model_validate(cached)
+        try:
+            signature = await asyncio.to_thread(
+                backend.sign_rl_observation, document_signing_payload(request.document)
+            )
+            response = RlObservationSignResponse(
+                operation_id=request.operation_id,
+                signer_hotkey=backend.hotkey_address,
+                signature_hex=signature.hex(),
+            )
+            journal.complete(request.operation_id, response.model_dump())
+            logger.info(
+                "rl observation %s signed operation=%s run=%s number=%d",
+                request.kind,
+                request.operation_id[:12],
+                request.run,
+                request.number,
+            )
+            return response
+        except Exception as exc:
+            journal.fail_definite(request.operation_id, type(exc).__name__)
+            logger.exception(
+                "rl observation signing failed operation=%s", request.operation_id[:12]
+            )
+            raise HTTPException(
+                status_code=503, detail="rl_observation_signing_failed"
             ) from exc
 
     @app.post("/v1/weights/set")

@@ -67,7 +67,7 @@ class SignerJournal:
             # Chain writes retain pending/uncertain state: they may have landed.
             self._connection.execute(
                 "UPDATE operations SET state='failed', error_type='signer_restart', "
-                "updated_at=? WHERE kind IN ('checkpoint-sign', 'rl-index-sign') "
+                "updated_at=? WHERE kind IN ('checkpoint-sign', 'rl-index-sign', 'rl-observation-sign') "
                 "AND state='pending'",
                 (time.time(),),
             )

@@ -26,10 +26,9 @@ One process on the controller, like the corpus validator: no window, batcher or 
 * **Settlement:** the task must be declared with ``params.settlement = "period-ema-v1"`` (``reliquary tasks create
   --rl-async``): the unchanged weight setter pays its period archives. Per-env target shares are the entry's
   ``env_split``; the async parameters are the ``rl_*`` params below.
-* **Signing:** the checkpoint index is signed by the remote signer's index operation when ``RELIQUARY_SIGNER_URL``
-  is set (signer-01 needs ``RELIQUARY_SIGNER_RL_RUN`` = the run), else by the local wallet.
-
-Not here (map §9): the remote signer's scan log operation (the scan log is signed with the local wallet).
+* **Signing:** the checkpoint index and the scan log's head and pages are signed by the remote signer's narrow
+  operations (``/v1/rl/index/sign``, ``/v1/rl/observations/sign``) when ``RELIQUARY_SIGNER_URL`` is set (signer-01
+  needs ``RELIQUARY_SIGNER_RL_RUN`` = the run), else by the local wallet.
 """
 from __future__ import annotations
 
@@ -466,8 +465,7 @@ def index_signer_for(wallet, signer_client=None):
 
 def _public_boards(rl: RlAsync, wallet, validator_hotkey: str, signer_client=None):
     """The checkpoint board and the scan log (publisher + board), both over the ``reliquary-public`` bucket and
-    signed by the local wallet (the index by the remote signer when ``signer_client`` is given). Returns the
-    publisher."""
+    signed by the remote signer when ``signer_client`` is given, else by the local wallet. Returns the publisher."""
     from reliquary.infrastructure.storage import public_checkpoint_bucket, public_checkpoint_client
     from reliquary.shared.ckpt_index import index_key
     from reliquary.trainer.ckpt_publisher import R2ObjectStore
@@ -481,7 +479,8 @@ def _public_boards(rl: RlAsync, wallet, validator_hotkey: str, signer_client=Non
                                  index_signer=index_signer_for(wallet, signer_client),
                                  validator_hotkey=validator_hotkey, presign=presign)
     put, get = bucket_io(client, bucket)
-    publisher = scan_publisher(rl.book, run=run, task_id=rl.settings.task_id, wallet=wallet, put=put, get=get)
+    publisher = scan_publisher(rl.book, run=run, task_id=rl.settings.task_id, wallet=wallet, put=put, get=get,
+                               signer_client=signer_client)
     rl.observations = ObservationBoard(publisher, presign=presign)
     return publisher
 

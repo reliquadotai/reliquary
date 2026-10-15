@@ -15,6 +15,8 @@ from reliquary.signer.protocol import (
     CheckpointSignResponse,
     RlIndexSignRequest,
     RlIndexSignResponse,
+    RlObservationSignRequest,
+    RlObservationSignResponse,
     ServeAxonRequest,
     ServeAxonResponse,
     SetWeightsRequest,
@@ -25,6 +27,7 @@ from reliquary.signer.protocol import (
     checkpoint_operation_id,
     checkpoint_payload,
     rl_index_operation_id,
+    rl_observation_operation_id,
     weights_operation_id,
 )
 
@@ -193,6 +196,37 @@ class RemoteSignerClient:
         verifier = bt.Keypair(ss58_address=self.expected_hotkey)
         if not verifier.verify(data=index_signing_payload(index), signature=signature):
             raise RuntimeError("remote index signature verification failed")
+        return signature
+
+    def sign_rl_observation(self, document: dict) -> bytes:
+        """The hotkey's signature of a head or closed page of the async scan log (``services/publication``)."""
+        from reliquary.services.publication import document_signing_payload
+
+        document = dict(document)
+        operation = rl_observation_operation_id(netuid=self.netuid, document=document)
+        request = RlObservationSignRequest(
+            operation_id=operation, netuid=self.netuid, document=document,
+        )
+        with httpx.Client(
+            verify=self._tls_context,
+            timeout=15.0,
+            trust_env=False,
+        ) as client:
+            response = client.post(
+                f"{self.base_url}/v1/rl/observations/sign",
+                json=request.model_dump(),
+            )
+            response.raise_for_status()
+        result = RlObservationSignResponse.model_validate(response.json())
+        self._check_hotkey(result.signer_hotkey)
+        if result.operation_id != operation:
+            raise RuntimeError("signer observation response is not bound to the request")
+        signature = bytes.fromhex(result.signature_hex)
+        import bittensor as bt
+
+        verifier = bt.Keypair(ss58_address=self.expected_hotkey)
+        if not verifier.verify(data=document_signing_payload(document), signature=signature):
+            raise RuntimeError("remote observation signature verification failed")
         return signature
 
     async def last_weight_epoch(self) -> int | None:

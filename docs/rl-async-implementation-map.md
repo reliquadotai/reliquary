@@ -825,9 +825,9 @@ Everything below needs a GPU testbed (P8 qualification) unless marked otherwise.
   state) and the audit throughput (probation audits 100 % of a newcomer's out-of-zone groups; one worker forward
   at a time, batch 1). Without either every audit is inconclusive (first scans unpaid).
 - Lease expiry (`rl_lease_reference_tokens_per_s`, margin) and starting quota numbers.
-- Not GPU, still open: the remote signer has no scan log operation (the async validator signs `/rl/checkpoint`
-  through it, the scan log with the local wallet); multi-turn envs (P3 grades single-turn only). Done on
-  `feat/rl-async-publish`: the scan log, discovery, the trainer listener (below).
+- Not GPU, still open: multi-turn envs (P3 grades single-turn only). Done since: the scan log on R2, discovery and
+  the trainer listener (`feat/rl-async-publish`, below); the remote signer's narrow operations for the checkpoint
+  index and the scan log's head and pages ("V1 operation" below).
 
 ### Service wiring as built (branch `feat/rl-async`)
 
@@ -881,7 +881,8 @@ Publication and discovery (branch `feat/rl-async-publish`):
   by the validator hotkey, closed pages of 200 segments) with a `root` (`rl/<run>/observations/` in
   `reliquary-public`, `ckpt_index.observations_root`) and its own projection; `ScanJournal` is its runtime over the
   lease book's file (segment plans and closed pages persisted before upload: a restart rebuilds the same bytes). A
-  flush every 60 s (`rl_async_loops(publisher=)`), local wallet signature.
+  flush every 60 s (`rl_async_loops(publisher=)`), signed like the checkpoint index: the remote signer's
+  observation operation with `RELIQUARY_SIGNER_URL` ("V1 operation" below), else the local wallet.
 - `GET /rl/observations?after=<n>` (`ObservationBoard`): the bucket is private, so the validator serves the head it
   last wrote and presigned GET URLs (15 min) for its pages and for segments `n+1 ..` (512 per answer); 503 before
   the first flush. Miner reader `protocol/rl_scan_log.read_scan_log` (head, pages and segments verified with the
@@ -910,7 +911,8 @@ reliquary mine-async --environments math     # discovered; or --validator-url ht
 
 ### V1 operation (branch `feat/rl-async-v1ops`)
 
-V1's controller holds no key and no GPU; both gaps are closed (the scan log aside, see "Remaining").
+V1's controller holds no key and no GPU; both gaps are closed (the checkpoint index, the scan log and the axon
+are signed by signer-01, the audits run on the proof worker).
 
 - Remote signer, index operation: `POST /v1/rl/index/sign` (`signer/protocol.RlIndexSignRequest`): the index is
   validated field by field (`RlCheckpointIndex`: strict, no extra field, `format` fixed, every key under
@@ -922,6 +924,21 @@ V1's controller holds no key and no GPU; both gaps are closed (the scan log asid
   to a restart may be retried, like checkpoint signatures. Client: `RemoteSignerClient.sign_rl_index` (verifies
   the signature against the expected hotkey). The async validator signs through it when `RELIQUARY_SIGNER_URL` is
   set (`rl_async_service.index_signer_for`); `RlCheckpointBoard` now loads and signs off the event loop.
+- Remote signer, scan log operation: `POST /v1/rl/observations/sign` (`signer/protocol.RlObservationSignRequest`):
+  a head (`RlObservationHead`) or a closed page (`RlObservationPage`) of the scan log, strict field by field (no
+  extra field, so no `signature`; `schema` fixed; bounded lists, a page exactly 200 segments on a page boundary),
+  then the publication's own structural rules (`services/publication.check_index_body`, shared with the readers'
+  `verify_index`): contiguous segments and pages, every key exactly `rl/<run>/observations/...` (so never a
+  window-era `observations/run-<id>/` document, which shares the observation domain). The run is the same
+  `RELIQUARY_SIGNER_RL_RUN` (unset: 403 `rl_observation_operation_disabled`); the document must name the signer's
+  own hotkey (403 `validator_denied`); a head may not be dated more than 300 s ahead (403 `head_from_the_future`).
+  Journal cursors `rl_observation_head` (`last_number`) and `rl_observation_page` (`first_number`) may repeat (a
+  restart rewrites the head; a lost page signature) but never go back (409). signer-01 rebuilds the payload
+  (`document_signing_payload`: `reliquary/observation-index/v1\n` + canonical JSON) itself. Client:
+  `RemoteSignerClient.sign_rl_observation` (verified against the expected hotkey); the validator's publisher signs
+  through it when `RELIQUARY_SIGNER_URL` is set (`rl_observations.scan_publisher(signer_client=)`,
+  `ObservationPublisher(signer=)`), with the signer's public identity as `wallet`. The async validator's axon is
+  served through the signer's serve-axon operation in that case.
 - Remote audits (`validator/remote_rl_audit.py`), on the proof worker's mTLS listener: `POST /v1/rl/checkpoint`
   takes the board's answer (signed index + presigned URLs); the worker checks the signature against
   `RELIQUARY_PROOF_RL_VALIDATOR_HOTKEY` and rebuilds the latest version with `CheckpointSync` into a dedicated
