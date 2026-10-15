@@ -210,7 +210,7 @@ ENVIRONMENT_CATALOG: Mapping[str, EnvironmentProfile] = MappingProxyType({
         prompt_template=_EXTERNAL_PROMPT,
         environment_contract_id="reliquary/stdio-program/v1",
         environment_manifest_sha256=(
-            "0589dc2f13c21d8ff6a67d24dd2b8c68e54b706f696267a349158bbd891093d9"
+            "42a38bda5b3e5910fde5fdfb0ea8537a5f2e53cdd1b2447ef4a8649757beac50"
         ),
         prompt_cooldown_windows=340,
     ),

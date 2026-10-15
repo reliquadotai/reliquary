@@ -844,8 +844,8 @@ _SPEC_VALUES = (
         contract_version="reliquary/stdio-program/v1",
         reward_materializer_method="admission_reward_cases",
         environment_manifest_sha256=(
-            "0589dc2f13c21d8ff6a67d24dd2b8c68"
-            "e54b706f696267a349158bbd891093d9"
+            "42a38bda5b3e5910fde5fdfb0ea8537a"
+            "5f2e53cdd1b2447ef4a8649757beac50"
         ),
         external_distribution="reliquary-competitive-code",
         external_artifact_resource="reliquary_competitive_code/artifact.json",
