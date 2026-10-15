@@ -16,6 +16,8 @@ def test_reserved_rows_are_cut_and_other_envs_are_whole():
     assert rl_prompt_range("reliquary_instruction_following_v1", 29_435) == (20_000, 29_435)
     assert rl_prompt_range("reliquary_code_v1", 2_481_806) == (200_000, 2_381_806)
     assert rl_prompt_range("reliquary_dapo_math_v1", 13_931) == (0, 13_931)
+    # v1.1 appends SFT rows after the RL share: RL keeps [4181, 6899).
+    assert rl_prompt_range("reliquary_competitive_code_v1", 8_792) == (4_181, 6_899)
 
 
 def test_a_split_of_another_length_fails_closed():
