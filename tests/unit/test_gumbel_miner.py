@@ -1,8 +1,7 @@
 """The miner draws what the profile prescribes: the Gumbel-max pick on the runner-keyed vLLM path, the
 slot-counter fakes, the HF processor and the corpus/episode core; an fp32 LM head when asked."""
 
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -22,8 +21,6 @@ from tests.unit.test_vllm_forced_seed import (
     RANDOMNESS,
     VOCAB,
     _Engine,
-    _FakeEngine,
-    _FakeParams,
     _fake_vllm,
     _update,
 )
@@ -31,10 +28,23 @@ from tests.unit.test_vllm_forced_seed import (
 GUMBEL = fs.DRAW_GUMBEL_MAX
 
 
+@pytest.fixture
+def gumbel(monkeypatch):
+    """The v10 profile in this process: the Gumbel draw at T=1 over the full vocabulary."""
+    from reliquary import constants
+    from reliquary.miner import forced_seed_sampler
+
+    monkeypatch.setattr(constants, "FORCED_DRAW", GUMBEL)
+    for module in (vllm_generation, forced_seed_sampler):
+        monkeypatch.setattr(module, "T_PROTO", 1.0)
+        monkeypatch.setattr(module, "TOP_K_PROTO", 0)
+        monkeypatch.setattr(module, "TOP_P_PROTO", 1.0)
+
+
 def _gumbel_params(rollout_index, *, base_offset=0, prompt_idx=7):
     return SimpleNamespace(extra_args=forced_seed_extra_args(
         randomness=RANDOMNESS, prompt_idx=prompt_idx, checkpoint_hash=CHECKPOINT,
-        rollout_index=rollout_index, base_offset=base_offset, draw=GUMBEL,
+        rollout_index=rollout_index, base_offset=base_offset,
     ))
 
 
@@ -43,37 +53,7 @@ def _gumbel_expected(row_logits, rollout_index, position, prompt_idx=7):
     return int(fs.pick_rows(row_logits.reshape(1, -1), [u], draw=GUMBEL)[0])
 
 
-def test_the_inverse_cdf_request_is_unchanged_on_the_wire():
-    args = forced_seed_extra_args(randomness="r", prompt_idx=1, checkpoint_hash="c",
-                                  rollout_index=2, base_offset=3, draw=fs.DRAW_INVERSE_CDF)
-    assert args == {FORCED_SEED_KEY: {"randomness": "r", "prompt_idx": 1, "checkpoint_hash": "c",
-                                      "rollout_index": 2, "base_offset": 3}}
-    gumbel = forced_seed_extra_args(randomness="r", prompt_idx=1, checkpoint_hash="c",
-                                    rollout_index=2, base_offset=3, draw=GUMBEL)
-    assert gumbel[FORCED_SEED_KEY] == {**args[FORCED_SEED_KEY], "draw": GUMBEL}
-
-
-def test_the_request_draw_defaults_to_the_active_profile(monkeypatch):
-    from reliquary import constants
-
-    monkeypatch.setattr(constants, "FORCED_DRAW", GUMBEL)
-    args = forced_seed_extra_args(randomness="r", prompt_idx=1, checkpoint_hash="c", rollout_index=0)
-    assert args[FORCED_SEED_KEY]["draw"] == GUMBEL
-    pool = episode_pool(episode_contract())
-    assert DrawBinding(pool, 5).extra_args(4)[FORCED_SEED_KEY]["draw"] == GUMBEL
-    monkeypatch.setattr(constants, "FORCED_DRAW", fs.DRAW_INVERSE_CDF)
-    assert "draw" not in DrawBinding(pool, 5).extra_args(4)[FORCED_SEED_KEY]
-
-
-def test_an_unknown_draw_is_refused_when_the_request_arrives():
-    params = SimpleNamespace(extra_args={FORCED_SEED_KEY: {
-        "randomness": "r", "prompt_idx": 1, "checkpoint_hash": "c", "rollout_index": 0,
-        "base_offset": 0, "draw": "top1"}})
-    with pytest.raises(ValueError, match="draw"):
-        ForcedSeedVLLMProcessor().update_state(_update(added=[(0, params, [], [])]))
-
-
-def test_the_runner_draw_picks_the_gumbel_pick(monkeypatch):
+def test_the_runner_draw_picks_the_gumbel_pick(monkeypatch, gumbel):
     torch.manual_seed(20)
     engine = _Engine(monkeypatch)
     for row in range(3):
@@ -85,7 +65,7 @@ def test_the_runner_draw_picks_the_gumbel_pick(monkeypatch):
             assert int(picks[row]) == _gumbel_expected(logits[row], row * 3, step)
 
 
-def test_a_preempted_gumbel_request_resumes_at_its_position(monkeypatch):
+def test_a_preempted_gumbel_request_resumes_at_its_position(monkeypatch, gumbel):
     torch.manual_seed(21)
     engine = _Engine(monkeypatch)
     params = _gumbel_params(rollout_index=4, base_offset=10)
@@ -99,23 +79,24 @@ def test_a_preempted_gumbel_request_resumes_at_its_position(monkeypatch):
     assert int(picks[1]) == _gumbel_expected(logits[1], 4, 13)
 
 
-def test_mixed_draws_in_one_batch_keep_their_own_pick(monkeypatch):
-    torch.manual_seed(22)
-    engine = _Engine(monkeypatch)
-    engine.add("g", 0, _gumbel_params(rollout_index=1))
-    cdf = SimpleNamespace(extra_args=forced_seed_extra_args(
-        randomness=RANDOMNESS, prompt_idx=7, checkpoint_hash=CHECKPOINT, rollout_index=1,
-        draw=fs.DRAW_INVERSE_CDF))
-    engine.add("c", 1, cdf)
-    logits = torch.randn(2, VOCAB)
-    picks = engine.step(logits)
-    assert int(picks[0]) == _gumbel_expected(logits[0], 1, 0)
-    u = fs.u_at(RANDOMNESS, 7, CHECKPOINT, 1, 0)
-    from reliquary.constants import T_PROTO, TOP_K_PROTO, TOP_P_PROTO
-    assert int(picks[1]) == fs.pick(fs.warp(logits[1], T_PROTO, TOP_K_PROTO, TOP_P_PROTO), u)
+def test_a_request_is_unchanged_on_the_wire():
+    """The draw is the process's profile, never a request field."""
+    args = forced_seed_extra_args(randomness="r", prompt_idx=1, checkpoint_hash="c",
+                                  rollout_index=2, base_offset=3)
+    assert args == {FORCED_SEED_KEY: {"randomness": "r", "prompt_idx": 1, "checkpoint_hash": "c",
+                                      "rollout_index": 2, "base_offset": 3}}
 
 
-def test_the_slot_counter_processor_draws_gumbel_too():
+def test_a_gumbel_draw_under_a_warped_profile_is_refused(monkeypatch):
+    monkeypatch.setattr("reliquary.constants.FORCED_DRAW", GUMBEL)
+    monkeypatch.setattr(vllm_generation, "T_PROTO", 0.6)
+    processor = ForcedSeedVLLMProcessor()
+    processor.update_state(_update(added=[(0, _gumbel_params(rollout_index=0), [], [])]))
+    with pytest.raises(ValueError, match="gumbel_max"):
+        processor.apply(torch.randn(1, VOCAB))
+
+
+def test_the_slot_counter_processor_draws_gumbel_too(gumbel):
     torch.manual_seed(23)
     processor = ForcedSeedVLLMProcessor()
     processor.update_state(_update(added=[(0, _gumbel_params(rollout_index=2), [], [])]))
@@ -124,7 +105,7 @@ def test_the_slot_counter_processor_draws_gumbel_too():
         assert int(processor.apply(logits.clone()).argmax()) == _gumbel_expected(logits[0], 2, step)
 
 
-def test_what_the_miner_draws_the_validator_accepts(monkeypatch):
+def test_what_the_miner_draws_the_validator_accepts(monkeypatch, gumbel):
     """Miner (runner-keyed processor) and validator (seed diagnostics) on the same logits."""
     torch.manual_seed(24)
     engine = _Engine(monkeypatch)
@@ -140,12 +121,11 @@ def test_what_the_miner_draws_the_validator_accepts(monkeypatch):
     assert d.n_stochastic == 60 and d.n_exact_match == 60 and d.n_hard_mismatch == 0
 
 
-def test_the_public_pool_stream_feeds_the_gumbel_key(monkeypatch):
+def test_the_public_pool_stream_feeds_the_gumbel_key(monkeypatch, gumbel):
     pool = episode_pool(episode_contract())
     torch.manual_seed(25)
     engine = _Engine(monkeypatch)
     binding = DrawBinding(pool, 5)
-    monkeypatch.setattr("reliquary.constants.FORCED_DRAW", GUMBEL)
     engine.add("e", 0, SimpleNamespace(extra_args=binding.extra_args(7)))
     logits = torch.randn(1, VOCAB)
     pick = int(engine.step(logits)[0])
@@ -153,16 +133,6 @@ def test_the_public_pool_stream_feeds_the_gumbel_key(monkeypatch):
 
 
 # ---------------------------------------------------------------- generator and fp32 head
-
-def test_the_generator_asks_for_its_draw():
-    engine = _FakeEngine([[1], [2]])
-    generator = VLLMRolloutGenerator("model", engine=engine, sampling_params_class=_FakeParams,
-                                     draw=GUMBEL)
-    generator.generate([5], randomness=RANDOMNESS, prompt_idx=1, checkpoint_hash=CHECKPOINT,
-                       rollouts=2, max_new_tokens=4, eos_ids=[9])
-    _, sampling = engine.seen
-    assert all(p.extra_args[FORCED_SEED_KEY]["draw"] == GUMBEL for p in sampling)
-
 
 def _built_engine(monkeypatch, **kw):
     vllm = _fake_vllm(monkeypatch)
@@ -198,14 +168,14 @@ def test_the_forced_corpus_core_takes_the_fp32_head(monkeypatch):
     assert "hf_overrides" not in _FakeLLM.kwargs
 
 
-def test_the_hf_processor_draws_gumbel():
+def test_the_hf_processor_draws_gumbel(gumbel):
     from reliquary.miner.forced_seed_sampler import ForcedSeedLogitsProcessor
 
     torch.manual_seed(26)
     processor = ForcedSeedLogitsProcessor(
         randomness=RANDOMNESS, hotkey="h", prompt_idx=7, checkpoint_hash=CHECKPOINT,
         rollout_indices=[0, 3], base_offsets=[0, 5], start_len=4, temperature=1.0, top_k=0,
-        top_p=1.0, draw=GUMBEL)
+        top_p=1.0)
     scores = torch.randn(2, VOCAB)
     out = processor(torch.zeros(2, 6, dtype=torch.long), scores.clone())
     assert int(out[0].argmax()) == _gumbel_expected(scores[0], 0, 2)

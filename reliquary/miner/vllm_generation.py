@@ -36,13 +36,7 @@ from typing import Any
 import torch
 
 from reliquary.constants import T_PROTO, TOP_K_PROTO, TOP_P_PROTO
-from reliquary.environment.forced_sampling import (
-    DRAW_GUMBEL_MAX,
-    DRAW_INVERSE_CDF,
-    DRAWS,
-    pick_rows,
-    u_at,
-)
+from reliquary.environment.forced_sampling import pick_rows, u_at
 from reliquary.shared.modeling import first_eos_index
 
 logger = logging.getLogger(__name__)
@@ -111,7 +105,6 @@ class ForcedSeedVLLMProcessor(LogitsProcessor):  # type: ignore[misc,valid-type]
         forced = _one_hot_picks(
             logits, slots,
             [_uniform(self._slots[slot], self._slots[slot]["offset"]) for slot in slots],
-            [self._slots[slot]["draw"] for slot in slots],
         )
         for slot in slots:
             self._slots[slot]["offset"] += 1
@@ -127,10 +120,7 @@ def _forced_state(forced: dict[str, Any]) -> dict[str, Any]:
         "checkpoint_hash": str(forced["checkpoint_hash"]),
         "rollout_index": int(forced["rollout_index"]),
         "offset": int(forced.get("base_offset", 0)),
-        "draw": forced.get("draw", DRAW_INVERSE_CDF),
     }
-    if state["draw"] not in DRAWS:
-        raise ValueError(f"unknown forced draw {state['draw']!r}; expected one of {DRAWS}")
     if "public_pool" in forced:
         from reliquary.protocol.seed_pool import SeedPool
         pool = SeedPool.from_dict(forced["public_pool"])
@@ -151,24 +141,14 @@ def _uniform(state: dict[str, Any], position: int) -> float:
                 state["rollout_index"], position)
 
 
-def _one_hot_picks(logits: torch.Tensor, rows: list[int], draws: list[float],
-                   kinds: list[str] | None = None, *,
+def _one_hot_picks(logits: torch.Tensor, rows: list[int], draws: list[float], *,
                    keep_other_rows: bool = False) -> torch.Tensor:
-    """Each forced row becomes -inf but for its forced pick (``kinds[i]``: the
-    request's draw, inverse CDF over the protocol warp or Gumbel-max over the raw
-    logits). The other rows are kept as they are, or blanked as the slot-counter
-    processor always did."""
-    kinds = kinds or [DRAW_INVERSE_CDF] * len(rows)
+    """Each forced row becomes -inf but for the profile's forced pick (the shared
+    ``forced_sampling.pick_rows``). The other rows are kept as they are, or
+    blanked as the slot-counter processor always did."""
     index = torch.tensor(rows, device=logits.device)
-    picks = torch.empty(len(rows), dtype=torch.int64, device=logits.device)
-    for kind in sorted(set(kinds)):
-        members = [i for i, k in enumerate(kinds) if k == kind]
-        member_index = torch.tensor(members, device=logits.device)
-        warp = ({"t": T_PROTO, "top_k": TOP_K_PROTO, "top_p": TOP_P_PROTO}
-                if kind == DRAW_INVERSE_CDF else {})
-        picks[member_index] = pick_rows(
-            logits[index[member_index]], [draws[i] for i in members], draw=kind, **warp,
-        )
+    picks = pick_rows(logits[index], draws, draw=default_draw(),
+                      t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO)
     if keep_other_rows:
         forced = logits.clone()
         forced[index] = float("-inf")
@@ -179,7 +159,8 @@ def _one_hot_picks(logits: torch.Tensor, rows: list[int], draws: list[float],
 
 
 def default_draw() -> str:
-    """The active profile's forced draw, read at call time."""
+    """The active profile's forced draw (``sampling.draw``), read at call time. The
+    engine process resolves the same profile as the miner that started it."""
     from reliquary import constants
 
     return constants.FORCED_DRAW
@@ -191,9 +172,8 @@ def default_lm_head_fp32() -> bool:
     return bool(constants.LM_HEAD_FP32)
 
 
-# vLLM >= 0.30 runs the LM head in fp32 with this override: torch.mm(bf16, bf16,
-# out_dtype=fp32), exact products and fp32 accumulation, the validator's
-# fp32(h) @ fp32(W) (offpolicy-lab lab/sampler.py, measured match 0.994).
+# ``sampling.lm_head_fp32``: vLLM >= 0.30 runs the LM head in fp32 with this override,
+# torch.mm(bf16, bf16, out_dtype=fp32), the validator's fp32(h) @ fp32(W).
 FP32_HEAD_OVERRIDES = {"head_dtype": "float32"}
 
 
@@ -204,17 +184,13 @@ def _slot_index(value: Any) -> int:
 def forced_seed_extra_args(
     *, randomness: str, prompt_idx: int, checkpoint_hash: str,
     rollout_index: int, base_offset: int = 0, seed_pool=None,
-    seed_index: int | None = None, draw: str | None = None,
+    seed_index: int | None = None,
 ) -> dict[str, Any]:
     """What one request tells the processor about its place in the draw.
 
     With a public seed pool the draw is the one of ``seed_index`` and does not
-    depend on ``rollout_index``. ``draw`` defaults to the active profile's; it is
-    written only when not the inverse CDF, so those requests are unchanged.
+    depend on ``rollout_index``.
     """
-    draw = default_draw() if draw is None else draw
-    if draw not in DRAWS:
-        raise ValueError(f"unknown forced draw {draw!r}; expected one of {DRAWS}")
     result = {
         FORCED_SEED_KEY: {
             "randomness": randomness,
@@ -224,8 +200,6 @@ def forced_seed_extra_args(
             "base_offset": int(base_offset),
         }
     }
-    if draw != DRAW_INVERSE_CDF:
-        result[FORCED_SEED_KEY]["draw"] = draw
     if seed_pool is not None:
         seed_pool.uniform(seed_index, 0)  # refuses a seed outside the pool
         result[FORCED_SEED_KEY].update(public_pool=seed_pool.to_dict(), seed_index=seed_index)
@@ -369,9 +343,7 @@ class RunnerForcedSeedVLLMProcessor(ForcedSeedVLLMProcessor):
         self._states = states  # requests not sampled this step are parsed again if they return
         draws = [_uniform(states[req_id][1], states[req_id][1]["offset"] + position)
                  for _, req_id, _, position in rows]
-        kinds = [states[req_id][1]["draw"] for _, req_id, _, _ in rows]
-        return _one_hot_picks(logits, [row for row, *_ in rows], draws, kinds,
-                              keep_other_rows=True)
+        return _one_hot_picks(logits, [row for row, *_ in rows], draws, keep_other_rows=True)
 
 
 class VLLMRolloutGenerator:
@@ -386,22 +358,17 @@ class VLLMRolloutGenerator:
         max_model_len: int | None = None, gpu_memory_utilization: float = 0.85,
         max_num_seqs: int = 256, enforce_eager: bool = False,
         engine: Any | None = None, sampling_params_class: Any | None = None,
-        draw: str | None = None, lm_head_fp32: bool | None = None,
+        lm_head_fp32: bool | None = None,
     ) -> None:
         self.model_path = model_path
         self.revision = revision
-        # The profile's draw and head precision unless told otherwise.
-        self.draw = default_draw() if draw is None else draw
-        if self.draw not in DRAWS:
-            raise ValueError(f"unknown forced draw {self.draw!r}; expected one of {DRAWS}")
-        self.lm_head_fp32 = default_lm_head_fp32() if lm_head_fp32 is None else bool(lm_head_fp32)
         self._settings = {
             "max_model_len": max_model_len,
             "gpu_memory_utilization": gpu_memory_utilization,
             "max_num_seqs": max_num_seqs,
             "enforce_eager": enforce_eager,
         }
-        if self.lm_head_fp32:
+        if default_lm_head_fp32() if lm_head_fp32 is None else lm_head_fp32:
             self._settings["hf_overrides"] = dict(FP32_HEAD_OVERRIDES)
         self._sampling_params_class = sampling_params_class
         self._llm = engine if engine is not None else self._build(model_path, revision)
@@ -469,7 +436,6 @@ class VLLMRolloutGenerator:
                     checkpoint_hash=checkpoint_hash, rollout_index=index,
                     seed_pool=seed_pool,
                     seed_index=seeds[index] if seed_pool is not None else None,
-                    draw=self.draw,
                 ),
             )
             for index in range(rollouts)
