@@ -666,3 +666,22 @@ P2 and P1a can run in parallel. P5 can start once P1a fixes the v* format.
   `protocol/signatures.py`), `GET /rl/quota?hotkey=`, `GET /rl/lease/commitments`, `GET /rl/prompts/state?since=`
   (public, no hotkey); `ValidatorServer.mount_rl_lease_router`. Not mounted by the CLI/service yet (P3);
   `LeaseBook.submit` and `LeaseBook.record_outcome` are the hooks P3 calls.
+
+## 6. Reference miner as built (branch `feat/rl-miner-client`)
+
+- `reliquary/miner/rl_async.py`, CLI `reliquary mine-async` (the window miner `mine` is untouched).
+  - `PromptPlanner`: per env, fed by `GET /rl/prompts/state?since=` (cursor, `more` pages); skips blacklisted
+    prompts, cooldowns until `latest >= until_k`, and prompts held, submitted or `taken` until their scan arrives
+    (or 30 min). Default order: never scanned, then by share of in-zone scans; `priority` overrides it.
+  - `AsyncMiner`: open leases <= `min(quota, --max-open)`, waiting leases <= `--queue-groups`, requests of
+    <= `--lease-batch` at the held k; refusals: `taken` -> wait for the scan, `cooling`/`blacklisted` -> table,
+    `quota` -> quota := open, `stale` -> no lease until newer weights. Earliest expiry generated first; every generated
+    group is submitted with retries until its expiry (`already_submitted` / `lease_submitted` = delivered); open
+    leases journaled for restarts.
+  - Checkpoints: `CheckpointSync` on a CPU copy in a thread; the copy is handed to the generator between two batches
+    and not patched again before (`swap_if_ready`). Submissions carry `k_generated`.
+  - `VllmGroupGenerator`: calls `VLLMRolloutGenerator.generate` per lease (`draw_context`: nonce as randomness,
+    `k<k>` as checkpoint hash); weights pushed with `LLM.collective_rpc` + the model's `load_weights` (needs
+    `VLLM_ALLOW_INSECURE_SERIALIZATION=1`, untested on GPU), fallback `--weight-swap reload` (HF dir + engine rebuild).
+- To align: `POST /rl/submit` body and signature (`encode_submission`, `rl_submit_binding`: DRAFT, `u32le-zlib/1`
+  tokens), the Gumbel profile's nonce keying (`draw_context`), and a multi-prompt vLLM call.

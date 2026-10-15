@@ -3569,6 +3569,77 @@ def mine_episodes(
         raise typer.Exit(code=4) from exc
 
 
+@app.command("mine-async")
+def mine_async(
+    environments: str = typer.Option(..., "--environments", help="Comma-separated single-turn RL environments"),
+    validator_url: str = typer.Option("", "--validator-url", help="The RL validator's URL"),
+    validator_hotkey: str = typer.Option(
+        "", "--validator-hotkey", help="The RL validator's ss58 hotkey: leases and submissions are signed for it"),
+    wallet_name: str = typer.Option("default", help="Wallet name"),
+    hotkey: str = typer.Option("default", help="Hotkey name"),
+    wallet_path: str = typer.Option(os.getenv("BT_WALLET_PATH", ""), help="Optional wallet base path"),
+    base_model: str = typer.Option(
+        "", "--base-model", help="Local HF directory of the run's model: its config and tokenizer files"),
+    work_dir: str = typer.Option("rl-async-work", "--work-dir",
+                                 help="Rebuilt weights, checkpoint downloads and the open-lease journal"),
+    initial_checkpoint: str = typer.Option(
+        "", "--initial-checkpoint",
+        help="HF directory of a published checkpoint to start from (else the first sync downloads an anchor)"),
+    initial_version: int = typer.Option(-1, "--initial-version", help="The version of --initial-checkpoint"),
+    weight_swap: str = typer.Option(
+        "push", "--weight-swap",
+        help="push: load new weights into the running vLLM; reload: write an HF directory and rebuild vLLM"),
+    lease_batch: int = typer.Option(8, "--lease-batch", min=1, help="Most prompts asked per lease request"),
+    max_open: int = typer.Option(64, "--max-open", min=1,
+                                 help="Most open leases (your GPU's ceiling); the validator's quota binds first"),
+    queue_groups: int = typer.Option(8, "--queue-groups", min=1,
+                                     help="Most leases waiting for generation (a waiting lease ages to expiry)"),
+    batch_groups: int = typer.Option(4, "--batch-groups", min=1,
+                                     help="Leases per generation batch; new weights are swapped between batches"),
+    gpu_memory_utilization: float = typer.Option(0.85, "--gpu-memory-utilization", help="vLLM's GPU share"),
+    max_num_seqs: int = typer.Option(256, "--max-num-seqs", help="vLLM's concurrent sequences"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="An in-process fake validator: no network, no wallet"),
+    fake_generator: bool = typer.Option(False, "--fake-generator", help="Generate fake tokens on CPU (tests)"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+) -> None:
+    """Mine the asynchronous RL protocol: lease prompts within the measured quota, generate 16 rollouts per lease
+    on the latest checkpoint held (deltas downloaded in the background), and submit every leased group."""
+    from reliquary.miner.rl_async import AsyncMinerConfig, run_async_miner
+
+    setup_logging(log_level)
+    names = tuple(name.strip() for name in environments.split(",") if name.strip())
+    if not dry_run and not (validator_url and validator_hotkey):
+        typer.echo("error: --validator-url and --validator-hotkey are required (or --dry-run)", err=True)
+        raise typer.Exit(code=2)
+    try:
+        config = AsyncMinerConfig(environments=names, lease_batch=lease_batch, max_open=max_open,
+                                  queue_groups=queue_groups, batch_groups=batch_groups,
+                                  state_dir=str(Path(work_dir) / "state"))
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    wallet = None
+    if not dry_run:
+        import bittensor as bt
+
+        wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
+        if wallet_path:
+            wallet_kwargs["path"] = wallet_path
+        wallet = bt.Wallet(**wallet_kwargs)
+    try:
+        asyncio.run(run_async_miner(
+            config, validator_url=validator_url.rstrip("/"), validator_hotkey=validator_hotkey, wallet=wallet,
+            base_model_dir=base_model or None, work_dir=work_dir, initial_dir=initial_checkpoint or None,
+            initial_version=None if initial_version < 0 else initial_version, swap=weight_swap, dry_run=dry_run,
+            fake_generator=fake_generator,
+            engine_kwargs={"gpu_memory_utilization": gpu_memory_utilization, "max_num_seqs": max_num_seqs}))
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=4) from exc
+    except KeyboardInterrupt:
+        pass
+
+
 async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=None):
     """Bind the corpus submission route to the one job this task declares.
 
