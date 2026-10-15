@@ -998,6 +998,28 @@ def verify_rl_lease_signature(hotkey: str, *, at: int, environment: str, checkpo
     return verify_hotkey_signature(hotkey, binding, signature)
 
 
+# A miner's read of its own open RL leases (``GET /rl/lease/mine``, to recover them after losing its journal): only
+# the hotkey can list them (they carry nonces), signed for one validator and route.
+RL_LEASE_MINE_DOMAIN = b"reliquary/rl-lease-mine/v1"
+
+
+def build_rl_lease_mine_binding(*, hotkey: str, at: int, validator_hotkey: str, path: str) -> bytes:
+    if type(at) is not int or at < 0:
+        raise TypeError("at: non-negative integer seconds required")
+    return _bound(RL_LEASE_MINE_DOMAIN, [str(hotkey).encode("utf-8"), at.to_bytes(8, "big", signed=False),
+                                         *_audience(validator_hotkey, path)])
+
+
+def verify_rl_lease_mine_signature(hotkey: str, *, at: int, signature: str, validator_hotkey: str,
+                                   path: str) -> bool:
+    """False on any failure; fail-closed without bittensor."""
+    try:
+        binding = build_rl_lease_mine_binding(hotkey=hotkey, at=at, validator_hotkey=validator_hotkey, path=path)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return verify_hotkey_signature(hotkey, binding, signature)
+
+
 # A miner's async RL submission (rl-async-design.md §4.4), signed for one validator and route: the lease it ends
 # and the digest of its rollouts (``protocol.rl_submit.rollouts_digest``).
 RL_SUBMIT_DOMAIN = b"reliquary/rl-submit/v1"

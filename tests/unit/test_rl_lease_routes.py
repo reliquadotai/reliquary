@@ -234,8 +234,10 @@ def test_a_signed_submission_ends_its_lease_and_answers_the_validators_grades(su
     assert answer.status_code == 200, answer.json()
     assert answer.json() == {"lease_id": lease.lease_id, "verdict": "in_zone", "rewards": [1.0] * 8 + [0.0] * 8}
     assert subs.buffer.depth() == {MATH: 1} and book.lease(lease.lease_id).state == "submitted"
-    again = client.post("/rl/submit", json=submit_body(MINER, lease.lease_id, rollouts, at=NOW + 5))
-    assert again.status_code == 409 and again.json()["reason"] == "lease_closed"
+    again = client.post("/rl/submit", json={**submit_body(MINER, lease.lease_id, rollouts, at=NOW + 5),
+                                            "k_generated": 3})                # informational, unsigned
+    assert again.status_code == 200 and again.json() == {**answer.json(), "resent": True}
+    assert subs.buffer.depth() == {MATH: 1}
     unknown = client.post("/rl/submit", json=submit_body(MINER, "f" * 32, rollouts, at=NOW + 6))
     assert unknown.status_code == 404 and unknown.json()["reason"] == "lease_unknown"
 
@@ -256,3 +258,32 @@ def test_undecodable_tokens_are_refused_before_the_lease_is_touched(submitting):
         validator_hotkey=VALIDATOR.ss58_address, path="/rl/submit")).hex()
     answer = client.post("/rl/submit", json=body)
     assert answer.status_code == 422 and book.lease(lease.lease_id).state == "open"
+
+
+def test_a_miner_lists_only_its_own_open_leases_with_a_signed_read(served):
+    from reliquary.protocol.signatures import build_rl_lease_mine_binding
+
+    client = client_for(served)
+    assert client.post("/rl/lease", json=body()).status_code == 200
+    assert client.post("/rl/lease", json=body(RIVAL, prompts=(5,))).status_code == 200
+
+    def params(keypair=MINER, at=NOW, path="/rl/lease/mine", signer=None):
+        binding = build_rl_lease_mine_binding(hotkey=keypair.ss58_address, at=at,
+                                              validator_hotkey=VALIDATOR.ss58_address, path=path)
+        return {"hotkey": keypair.ss58_address, "at": str(at), "signature": (signer or keypair).sign(binding).hex()}
+
+    mine = client.get("/rl/lease/mine", params=params())
+    assert mine.status_code == 200, mine.json()
+    assert sorted(x["prompt_idx"] for x in mine.json()["leases"]) == [1, 2]
+    assert mine.json()["lease_expiry_s"] == {ENV: 600.0} and mine.json()["in_use"] == 2
+    assert all(x["nonce"] for x in mine.json()["leases"])
+    assert client.get("/rl/lease/mine", params=params(signer=EVE)).status_code == 403          # not the hotkey's
+    assert client.get("/rl/lease/mine", params=params(path="/rl/quota")).status_code == 403    # another route
+    assert client.get("/rl/lease/mine", params=params(at=NOW - 1_000)).status_code == 400      # stale
+    replay = params(at=NOW + 1)
+    assert client.get("/rl/lease/mine", params=replay).status_code == 200
+    assert client.get("/rl/lease/mine", params=replay).json()["reason"] == "request_reused"
+    assert client.get("/rl/lease/mine", params={"hotkey": MINER.ss58_address, "at": str(NOW)}).status_code == 401
+    quota = client.get("/rl/quota", params={"hotkey": MINER.ss58_address}).json()
+    assert quota["lease_expiry_s"] == {ENV: 600.0}
+    assert client.post("/rl/lease", json=body(prompts=(9,), at=NOW + 2)).json()["lease_expiry_s"] == 600.0

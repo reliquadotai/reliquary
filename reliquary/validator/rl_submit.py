@@ -217,10 +217,41 @@ class RlSubmissions:
                arrived_at: float | None = None) -> dict:
         """Grade and record one lease's group. ValueError: not the lease's ``rollouts`` rollouts (lease left
         open); LookupError / PermissionError: as ``LeaseBook.submit``; GraderInfrastructureError: retry later.
-        Returns what the miner is told: verdict, rewards, refusal reason (never the audit draw)."""
+        Returns what the miner is told: verdict, rewards, refusal reason (never the audit draw).
+
+        Idempotent per lease: a resend by the holder of a lease already graded (its answer was lost) gets the
+        original answer again, flagged ``resent``, and nothing is graded or recorded twice. The first group is the
+        one that counts; a resend cannot replace it."""
         if len(rollouts) != self.config.rollouts or any(not r.tokens for r in rollouts):
             raise ValueError(f"a group is exactly {self.config.rollouts} non-empty rollouts")
+        earlier = self.graded_answer(lease_id, hotkey)
+        if earlier is not None:
+            return earlier
         arrived_at = float(self.clock()) if arrived_at is None else float(arrived_at)
+        try:
+            return self._submit(lease_id, hotkey, rollouts, arrived_at)
+        except LookupError:
+            earlier = self.graded_answer(lease_id, hotkey)      # a concurrent resend closed it first
+            if earlier is not None:
+                return earlier
+            raise
+
+    def graded_answer(self, lease_id: str, hotkey: str) -> dict | None:
+        """The answer given for an already graded lease, or None. PermissionError: another hotkey's lease."""
+        with self.book.lock:
+            row = self.book.db.execute("SELECT hotkey, verdict, reason, rewards FROM rl_groups WHERE lease_id=?",
+                                       (lease_id,)).fetchone()
+        if row is None:
+            return None
+        if row[0] != hotkey:
+            raise PermissionError("lease held by another hotkey")
+        answer = {"lease_id": lease_id, "verdict": row[1], "rewards": [] if row[3] is None else json.loads(row[3]),
+                  "resent": True}
+        if row[2]:
+            answer["reason"] = row[2]
+        return answer
+
+    def _submit(self, lease_id: str, hotkey: str, rollouts: Sequence[Rollout], arrived_at: float) -> dict:
         lease = self.book.check_submission(lease_id, hotkey, arrived_at)
         graded = self.grader.grade(lease.environment, lease.prompt_idx, rollouts)
         verdict = REJECTED if graded.reject else classify_group(graded.rewards, graded.truncated)

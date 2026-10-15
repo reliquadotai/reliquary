@@ -365,6 +365,15 @@ class LeaseBook:
             row = self.db.execute(f"SELECT {_COLUMNS} FROM rl_leases WHERE lease_id=?", (lease_id,)).fetchone()
         return None if row is None else self._lease(row)
 
+    def open_leases(self, hotkey: str, now: float | None = None) -> list[Lease]:
+        """The hotkey's open, unexpired leases, earliest expiry first (``GET /rl/lease/mine``: a miner that lost
+        its journal recovers them). Nobody else's lease is ever listed."""
+        now = float(self.clock()) if now is None else now
+        with self.lock:
+            rows = self.db.execute(f"SELECT {_COLUMNS} FROM rl_leases WHERE hotkey=? AND state=? AND expires_at>? "
+                                   "ORDER BY expires_at", (hotkey, OPEN, now)).fetchall()
+        return [self._lease(row) for row in rows]
+
     def in_use(self, hotkey: str) -> int:
         with self.lock:
             return int(self.db.execute("SELECT COUNT(*) FROM rl_leases WHERE hotkey=? AND state=?",

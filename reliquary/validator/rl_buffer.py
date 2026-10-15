@@ -27,8 +27,8 @@ CREATE INDEX IF NOT EXISTS rl_buffer_fresh ON rl_buffer(state, environment, k, a
 class SubmittedGroup:
     """A graded group with its tokens: what the trainer (in zone) or an audit (out of zone) runs its forward on.
     ``nonce`` (hex) and ``checkpoint`` are the lease's: the Gumbel noise is keyed by (nonce, rollout index,
-    position). ``completions[i]`` is rollout i's completion, ``force_spans[i]`` its BFT span (completion-relative)
-    or None."""
+    position) as ``protocol.rl_draw`` defines it, so ``draw_uniforms`` recomputes the uniforms (no array stored).
+    ``completions[i]`` is rollout i's completion, ``force_spans[i]`` its BFT span (completion-relative) or None."""
     lease_id: str
     hotkey: str
     environment: str
@@ -44,6 +44,15 @@ class SubmittedGroup:
 
     def pack(self) -> bytes:
         return zlib.compress(json.dumps(asdict(self), separators=(",", ":")).encode(), 6)
+
+    def draw_uniforms(self, rollout_index: int) -> list[float]:
+        """The forced draw's public uniforms of rollout ``rollout_index``, one per completion position, recomputed
+        from the lease (``protocol.rl_draw``): what the trainer's verification and substitution loss read (the
+        window path's ``_forced_draw_uniforms``). Nothing is stored: the nonce, prompt, k and index are the seed."""
+        from reliquary.protocol.rl_draw import lease_uniforms
+
+        return lease_uniforms(self.nonce, self.prompt_idx, self.checkpoint, rollout_index,
+                              len(self.completions[rollout_index]))
 
     @classmethod
     def unpack(cls, blob: bytes) -> "SubmittedGroup":

@@ -9,16 +9,25 @@ builds a ``LeaseBook`` and a ``LeaseCollector`` and mounts ``build_rl_lease_rout
   signature answered once (``request_reused``), the hotkey's minute counted after verification. The request then
   waits for its interval and is resolved with the others (``LeaseCollector``). The answer lists the caller's leases
   and, per refused prompt, only ``taken`` / ``cooling`` / ``blacklisted`` / ``quota`` / ``stale`` / ``banned``.
-* ``GET {prefix}/quota?hotkey=``: the hotkey's explainable quota (public, like ``/rl/pay``; it lists no lease).
+  The answer also carries ``lease_expiry_s``, the env's fixed lease lifetime: how long a prompt refused as
+  ``taken`` can stay held by a rival before it is scanned or free again.
+* ``GET {prefix}/quota?hotkey=``: the hotkey's explainable quota (public, like ``/rl/pay``; it lists no lease), with
+  every served env's ``lease_expiry_s``.
+* ``GET {prefix}/lease/mine?hotkey=&at=&signature=``: the caller's own open leases (``LeaseBook.open_leases``),
+  signed by the hotkey for this validator and route (``build_rl_lease_mine_binding``) within ``request_skew_s``: a
+  miner that lost its journal recovers them. Nobody else's lease is listed; a signature is answered once.
 * ``GET {prefix}/lease/commitments``: the commitments of the leasable checkpoints and the revealed secrets.
 * ``GET {prefix}/prompts/state?since=&environment=``: the prompt lifecycle (``LeaseBook.prompt_state``): the scans
   after cursor ``since`` and the state (cooldown until k, blacklisted) of the prompts they moved. Public, no hotkey.
 * ``POST {prefix}/submit`` (mounted when ``submissions`` is given) ``{miner_hotkey, at, lease_id, rollouts:
-  [{index, tokens, force_span}], signature}``: a completed lease (``protocol/rl_submit.py``: every index, completion
-  tokens only, compressed), signed over ``rollouts_digest`` of the rollouts as sent (``build_rl_submit_binding``),
-  authenticated like a lease request with its own per-minute bound, inflated only after. Graded off the event loop (``RlSubmissions.submit``); the answer is
-  the verdict and the validator's rewards. A malformed group is refused before the lease is touched (it stays
-  open); a grader outage answers 503 (resend).
+  [{index, tokens, force_span}], k_generated?, signature}``: a completed lease (``protocol/rl_submit.py``: every
+  index, completion tokens only, compressed), signed over ``rollouts_digest`` of the rollouts as sent
+  (``build_rl_submit_binding``), authenticated like a lease request with its own per-minute bound, inflated only
+  after. ``k_generated`` (the checkpoint the miner generated on) is informational, unsigned and ignored: the lease's
+  k is the generation checkpoint. Graded off the event loop (``RlSubmissions.submit``); the answer is the verdict
+  and the validator's rewards. A resend of a lease already graded answers its original verdict again (200,
+  idempotent: the lease id is the key). A malformed group is refused before the lease is touched (it stays open); a
+  grader outage answers 503 (resend).
 * ``GET {prefix}/pay?hotkey=`` (mounted when ``pay`` is given, an ``rl_ledger.RlPayLedger``): per-env prices and
   per-hotkey accrued / paid / forfeited (public, like the window board it replaces when mounted on the server).
 """
@@ -39,7 +48,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from reliquary.environment.grader_client import GraderInfrastructureError
 from reliquary.protocol.rl_submit import GROUP_ROLLOUTS, decode_tokens, rollouts_digest
 from reliquary.protocol.signatures import (
-    hotkey_signature_bytes, verify_rl_lease_signature, verify_rl_submit_signature,
+    hotkey_signature_bytes, verify_rl_lease_mine_signature, verify_rl_lease_signature, verify_rl_submit_signature,
 )
 from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
 from reliquary.validator.corpus_registration import NOT_REGISTERED
@@ -65,6 +74,7 @@ BODY_TIMEOUT_S = 10.0
 MAX_PREAUTH = 8
 MAX_TRACKED_HOTKEYS = 4096
 SUBMIT_MAX_PER_MINUTE = 600          # a submission ends a lease: the quota bounds them, this bounds the verify cost
+MINE_MAX_PER_MINUTE = 30             # a miner reads its own leases at start, not in a loop
 MAX_SUBMIT_BODY_BYTES = 8 * 1024 * 1024
 SUBMIT_BODY_TIMEOUT_S = 30.0
 MAX_GRADING = 4                       # groups graded at once (CPU); the others wait their turn
@@ -100,6 +110,7 @@ class RlSubmitRequestBody(BaseModel):
     at: int = Field(ge=0, strict=True)
     lease_id: str = Field(min_length=1, max_length=64)
     rollouts: list[RlSubmitRollout] = Field(min_length=1, max_length=GROUP_ROLLOUTS)
+    k_generated: int | None = Field(default=None, ge=0, strict=True)   # informational: unsigned, ignored
     signature: str = Field(default="", max_length=256)
 
 
@@ -204,6 +215,7 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
                           registration: Callable[[str], Awaitable[str | None]] | None = None,
                           clock: Callable[[], float] = time.time, submissions=None,
                           verify_submit: Callable[..., bool] = verify_rl_submit_signature,
+                          verify_mine: Callable[..., bool] = verify_rl_lease_mine_signature,
                           pay=None) -> APIRouter:
     audience = ss58_address(validator_hotkey)
     if audience is None:
@@ -215,6 +227,7 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
     preauth = asyncio.Semaphore(MAX_PREAUTH)
     recent: OrderedDict[str, deque] = OrderedDict()
     recent_submits: OrderedDict[str, deque] = OrderedDict()
+    recent_mine: OrderedDict[str, deque] = OrderedDict()
     used: OrderedDict[str, float] = OrderedDict()
     grading = asyncio.Semaphore(MAX_GRADING)
 
@@ -295,7 +308,8 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
             # SQLite reads under the book's lock: off the event loop, like every other book call
             latest, granted, in_use = await asyncio.to_thread(
                 lambda: (book.latest_checkpoint, book.quota.quota(hotkey, now), book.in_use(hotkey)))
-            content.update(latest=latest, quota=granted, in_use=in_use)
+            content.update(latest=latest, quota=granted, in_use=in_use,
+                           lease_expiry_s=float(book.config.expiry_s[request.environment]))
             if answer.leases:
                 logger.info("rl leases: %d to %s on %s k=%d (%d refused)", len(answer.leases), hotkey[:12],
                             request.environment, request.checkpoint, len(answer.refused))
@@ -315,8 +329,51 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
 
         def read() -> dict:
             state = book.quota.state(address, now)
-            state.update(in_use=book.in_use(address), max_lag=book.config.max_lag, latest=book.latest_checkpoint)
+            state.update(in_use=book.in_use(address), max_lag=book.config.max_lag, latest=book.latest_checkpoint,
+                         lease_expiry_s=expiry_map())
             return state
+
+        return _answer(await asyncio.to_thread(read))
+
+    def expiry_map() -> dict[str, float]:
+        return {name: float(seconds) for name, seconds in sorted(book.config.expiry_s.items())}
+
+    mine_path = f"{prefix}/lease/mine"
+
+    @router.get(mine_path)
+    async def my_leases(hotkey: str = "", at: str = "", signature: str = "") -> JSONResponse:
+        address = ss58_address(hotkey)
+        if address is None:
+            return _refusal("malformed_request", {"errors": [{"loc": ["hotkey"], "type": "ss58_address"}]})
+        if not (at.isascii() and at.isdigit()) or len(at) > 19:
+            return _refusal("malformed_request", {"errors": [{"loc": ["at"], "type": "int"}]})
+        if not signature:
+            return _refusal("signature_required", {})
+        if len(signature) > 256:
+            return _refusal("malformed_request", {"errors": [{"loc": ["signature"], "type": "too_long"}]})
+        when, now = int(at), float(clock())
+        if abs(int(now) - when) > skew:
+            return _refusal("stale_request", {"max_skew_s": skew, "now": int(now)})
+        if preauth.locked():
+            return _refusal("lease_busy", {"max_concurrent": MAX_PREAUTH}, retry_s)
+        async with preauth:
+            try:
+                verified = bool(await asyncio.to_thread(verify_mine, address, at=when, signature=signature,
+                                                        validator_hotkey=audience, path=mine_path))
+            except Exception:
+                verified = False
+        if not verified:
+            return _refusal("bad_signature")
+        raw = hotkey_signature_bytes(signature)
+        refused = remember(address, signature if raw is None else raw.hex(), now, minutes=recent_mine,
+                           per_minute=MINE_MAX_PER_MINUTE)
+        if refused is not None:
+            return refused
+
+        def read() -> dict:
+            return {"leases": [lease.to_public() for lease in book.open_leases(address, now)],
+                    "latest": book.latest_checkpoint, "in_use": book.in_use(address),
+                    "lease_expiry_s": expiry_map()}
 
         return _answer(await asyncio.to_thread(read))
 
@@ -379,7 +436,8 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
                     return _refusal(reason, {"why": str(exc)})
                 except ValueError as exc:
                     return _refusal("malformed_request", {"why": str(exc)})
-            logger.info("rl submit: %s from %s: %s", request.lease_id[:12], hotkey[:12], answer["verdict"])
+            logger.info("rl submit: %s from %s: %s%s (k_generated=%s)", request.lease_id[:12], hotkey[:12],
+                        answer["verdict"], " (resend)" if answer.get("resent") else "", request.k_generated)
             return _answer(answer)
         except _Refused as refused:
             return refused.response
@@ -391,6 +449,6 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
 
 
 __all__ = [
-    "LEASE_MAX_PER_MINUTE", "LEASE_STATUS", "SUBMIT_MAX_PER_MINUTE", "RlLeaseRequestBody", "RlSubmitRequestBody",
+    "LEASE_MAX_PER_MINUTE", "LEASE_STATUS", "MINE_MAX_PER_MINUTE", "SUBMIT_MAX_PER_MINUTE", "RlLeaseRequestBody", "RlSubmitRequestBody",
     "build_rl_lease_router", "rl_lease_path", "submitted_rollouts",
 ]

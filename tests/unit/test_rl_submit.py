@@ -126,7 +126,7 @@ def test_out_of_zone_groups_are_stored_audited_in_probation_and_count_as_deliver
     assert subs.audit_jobs(10) == [] and subs.group(held.lease_id)["audit"] == "passed"
 
 
-def test_a_lease_is_submitted_once_by_its_holder_before_expiry_with_every_index(book):
+def test_a_lease_is_submitted_once_by_its_holder_before_expiry_with_every_index_and_resends_are_idempotent(book):
     subs = service(book)
     held = lease(book, 1)
     with pytest.raises(PermissionError):
@@ -136,9 +136,12 @@ def test_a_lease_is_submitted_once_by_its_holder_before_expiry_with_every_index(
     with pytest.raises(LookupError, match="unknown"):
         subs.submit("nope", "A", group(8))
     assert book.lease(held.lease_id).state == "open"
-    subs.submit(held.lease_id, "A", group(8))
-    with pytest.raises(LookupError, match="submitted"):
-        subs.submit(held.lease_id, "A", group(8))
+    first = subs.submit(held.lease_id, "A", group(8))
+    # a resend (lost answer) gets the original verdict back, and nothing is graded or recorded twice
+    assert subs.submit(held.lease_id, "A", group(0)) == {**first, "resent": True}
+    with pytest.raises(PermissionError):
+        subs.submit(held.lease_id, "B", group(8))
+    assert subs.buffer.depth() == {ENV: 1} and len(book.prompt_state()["scans"]) == 1
     late = lease(book, 2)
     with pytest.raises(LookupError, match="expired"):
         subs.submit(late.lease_id, "A", group(8), arrived_at=late.expires_at)

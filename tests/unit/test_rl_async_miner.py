@@ -12,8 +12,9 @@ import pytest
 
 from reliquary.miner.rl_async import (
     ROLLOUTS, AsyncMiner, AsyncMinerConfig, DryRunTransport, FakeGroupGenerator, PromptPlanner, PromptRecord,
-    RequestRefused, decode_tokens, encode_submission, encode_tokens,
+    RequestRefused, encode_submission, submission_digest,
 )
+from reliquary.protocol.rl_submit import decode_tokens
 
 ENV = "math"
 NOW = 1_800_000_000.0
@@ -54,6 +55,48 @@ def miner_for(*, quota=8, lease_batch=8, queue_groups=8, batch_groups=4, max_ope
 
 
 # --- planner ---------------------------------------------------------------------------------------------
+def test_a_prompt_taken_by_a_rival_waits_one_lease_lifetime_of_its_env():
+    clock = Clock()
+    planner = PromptPlanner(ENV, (0, 10), rng=random.Random(0), clock=clock)
+    planner.wait_for_outcome(1)                                   # lifetime unknown: the fallback
+    planner.note_lease_expiry(120.0)
+    planner.wait_for_outcome(2)
+    clock.now += 121
+    assert planner.leasable(2) and not planner.leasable(1)        # the rival's lease has expired by now
+    planner.wait_for_outcome(3, until=clock.now + 10)             # our own lease: until its own expiry
+    clock.now += 11
+    assert planner.leasable(3)
+
+
+async def test_the_lease_answer_sets_the_envs_lease_lifetime_for_taken_prompts():
+    clock = Clock()
+    miner, transport, _, planner = miner_for(quota=50, prompt_range=(0, 4), clock=clock)
+    transport.expiry_s = 90.0
+    transport.refuse = {0: "taken"}
+    await miner.refresh_quota()
+    await miner.lease_more()
+    assert planner.lease_expiry_s == 90.0 and not planner.leasable(0)
+    clock.now += 91
+    assert planner.leasable(0)
+
+
+async def test_open_leases_lost_with_the_journal_are_recovered_from_the_validator(tmp_path):
+    clock = Clock()
+    miner, transport, _, _ = miner_for(quota=3, clock=clock)
+    await miner.refresh_quota()
+    await miner.lease_more()
+    held = set(miner.open)
+    again, _, generator, planner = miner_for(quota=3, clock=clock, transport=transport, state_dir=str(tmp_path))
+    assert again.open == {}                                        # no journal
+    assert await again.recover_leases() == 3 and set(again.open) == held
+    assert await again.recover_leases() == 0                       # idempotent
+    assert all(not planner.leasable(lease.prompt_idx) for lease in again.queue)
+    while again.queue:
+        await again.generate_once()
+    await again.drain()
+    assert {s["lease_id"] for s in transport.submissions} == held and again.stats["recovered"] == 3
+
+
 def test_the_planner_skips_blacklisted_cooling_held_and_out_of_range_prompts():
     planner = PromptPlanner(ENV, (10, 20), rng=random.Random(0))
     planner.apply(page(cursor=3, latest=5, scans=[scan(1, 11, "too_easy"), scan(2, 12, "in_zone"),
@@ -163,8 +206,8 @@ async def test_a_refused_request_backs_off_without_leasing():
 async def test_every_lease_ends_in_a_submission():
     clock = Clock()
     miner, transport, generator, _ = miner_for(quota=6, batch_groups=4, clock=clock)
-    transport.submit_failures = [RequestRefused("internal_error", retryable=True),
-                                 RequestRefused("already_submitted", retryable=False)]
+    transport.submit_failures = [RequestRefused("internal_error", retryable=True)]
+    transport.lost_answers = 1                     # received, answer lost: the resend gets the original verdict
     await miner.refresh_quota()
     await miner.lease_more()
     granted = set(miner.open)
@@ -174,11 +217,12 @@ async def test_every_lease_ends_in_a_submission():
     await miner.drain()
     assert [len(call) for call in generator.calls] == [4, 2]
     submitted = {s["lease_id"] for s in transport.submissions}
-    # one transient failure retried, one "already received" (a lost answer's resend) counted as delivered
-    assert miner.stats["submitted"] == 6 and len(submitted) == 5 and submitted <= granted
-    assert miner.open == {} and miner.stats["submit_failed"] == 0
+    # one transient failure retried, one lost answer resent and answered with the original verdict
+    assert miner.stats["submitted"] == 6 and len(submitted) == 6 == len(transport.submissions) and submitted == granted
+    assert miner.open == {} and miner.stats["submit_failed"] == 0 and miner.stats["verdicts"] == {"received": 6}
     first = transport.submissions[0]
-    assert first["k_generated"] == 0 and len(decode_tokens(first["tokens"])) == ROLLOUTS
+    assert first["k_generated"] == 0 and [r["index"] for r in first["rollouts"]] == list(range(ROLLOUTS))
+    assert len(decode_tokens(first["rollouts"][0]["tokens"], max_tokens=64)) == generator.length
 
 
 async def test_leases_are_generated_earliest_expiry_first_and_dead_ones_dropped():
@@ -247,12 +291,22 @@ async def test_open_leases_survive_a_restart(tmp_path):
     assert json.loads((tmp_path / "rl-open-leases.json").read_text()) == []
 
 
-def test_tokens_round_trip_and_a_group_needs_all_rollouts():
-    rollouts = [[i, i + 70_000, 5] for i in range(ROLLOUTS)]
-    assert decode_tokens(encode_tokens(rollouts)) == rollouts
+def test_the_submission_is_the_validators_wire_and_a_group_needs_all_rollouts():
     from reliquary.miner.rl_async import HeldLease
+    from reliquary.protocol.rl_submit import rollouts_digest
+    from reliquary.validator.rl_lease_routes import RlSubmitRequestBody, submitted_rollouts
 
+    rollouts = [[i, i + 70_000, 5] for i in range(ROLLOUTS)]
+    rollouts[3] = ([7, 8, 9], (1, 3))                           # a BFT force span where the generator has one
     lease = HeldLease("l", ENV, 1, 0, "ab", NOW + 1)
+    payload = encode_submission(lease, rollouts, 2)
+    body = RlSubmitRequestBody.model_validate({"miner_hotkey": "x", "at": 1, **payload, "signature": "s"})
+    group = submitted_rollouts(body, max_tokens=8)
+    assert [list(r.tokens) for r in group] == [list(r[0]) if isinstance(r, tuple) else r for r in rollouts]
+    assert group[3].force_span == (1, 3) and body.k_generated == 2
+    assert submission_digest(payload) == rollouts_digest(
+        [(r.index, r.tokens, r.force_span) for r in body.rollouts])     # what the validator verifies
+    assert "k_generated" not in encode_submission(lease, rollouts)
     with pytest.raises(ValueError):
         encode_submission(lease, rollouts[:-1], 0)
 
@@ -297,7 +351,7 @@ async def test_weights_are_swapped_between_generation_batches_only():
     assert generator.loads == [0, 1] and generator.versions_used == [0, 1]
     await miner.drain()
     by_k = sorted(s["k_generated"] for s in transport.submissions)
-    assert by_k == [0, 0, 1, 1] and {s["checkpoint"] for s in transport.submissions} == {0}
+    assert by_k == [0, 0, 1, 1] and {transport.granted[s["lease_id"]].checkpoint for s in transport.submissions} == {0}
     await miner.lease_more()
     assert transport.lease_calls[-1][1] == 1                        # new leases are asked at the held k
     transport.checkpoints = [index(2)]
@@ -368,3 +422,62 @@ async def test_the_http_transport_leases_from_the_real_routes(tmp_path):
         with pytest.raises(RequestRefused) as refused:
             await transport.lease(ENV, 0, [1_000])
         assert refused.value.reason == "lease_invalid" and not refused.value.retryable
+
+
+async def test_the_http_transport_submits_resends_and_recovers_against_the_real_routes(tmp_path):
+    """The miner's submission wire and signature are the validator's: a signed group is graded, a resend (lost
+    answer) gets the original verdict, and a miner without its journal recovers its open leases (``/rl/lease/mine``)."""
+    bt = pytest.importorskip("bittensor")
+    httpx = pytest.importorskip("httpx")
+    from fastapi import FastAPI
+
+    from reliquary.miner.rl_async import HeldLease, HttpRlTransport
+    from reliquary.validator.rl_lease_quota import QuotaConfig, QuotaController
+    from reliquary.validator.rl_lease_routes import build_rl_lease_router
+    from reliquary.validator.rl_leases import LeaseBook, LeaseBookConfig, LeaseCollector
+    from reliquary.validator.rl_submit import GroupGrader, RlSubmissions
+    from tests.unit.test_rl_submit import ENV as MATH, MathEnv, Tokenizer, group
+
+    miner_key = bt.Keypair.create_from_uri("//Alice")
+    rival_key = bt.Keypair.create_from_uri("//Charlie")
+    validator_key = bt.Keypair.create_from_uri("//Bob")
+    book = LeaseBook(tmp_path / "leases.sqlite3", LeaseBookConfig(expiry_s={MATH: 600.0}, cooldown_of=lambda e: 2),
+                     quota=QuotaController(QuotaConfig(initial=4)))
+    book.adopt_checkpoint(0)
+    subs = RlSubmissions(book, GroupGrader({MATH: MathEnv()}, Tokenizer(), eos_token_ids=(1,)), rng=random.Random(0))
+    app = FastAPI()
+    app.include_router(build_rl_lease_router(book=book, collector=LeaseCollector(book, interval_s=0.0),
+                                             validator_hotkey=validator_key.ss58_address, submissions=subs))
+
+    def transport_for(client, key):
+        return HttpRlTransport(client, base_url="http://v", hotkey=key.ss58_address,
+                               validator_hotkey=validator_key.ss58_address,
+                               sign_binding=lambda binding: key.sign(binding).hex())
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://v") as client:
+        transport = transport_for(client, miner_key)
+        answer = await transport.lease(MATH, 0, [1, 2])
+        assert answer["lease_expiry_s"] == 600.0 and len(answer["leases"]) == 2
+        held = [HeldLease.from_wire(item) for item in answer["leases"]]
+        mine = await transport.my_leases()
+        assert {item["lease_id"] for item in mine["leases"]} == {lease.lease_id for lease in held}
+        assert mine["lease_expiry_s"] == {MATH: 600.0}
+        assert (await transport_for(client, rival_key).my_leases())["leases"] == []    # only the caller's own
+        rollouts = [list(r.tokens) for r in group(8)]
+        payload = encode_submission(held[0], rollouts, 0)
+        first = await transport.submit(payload)
+        assert first["verdict"] == "in_zone" and first["rewards"] == [1.0] * 8 + [0.0] * 8
+        again = await transport.submit(payload)
+        assert again == {**first, "resent": True} and subs.buffer.depth() == {MATH: 1}
+        # the recovered miner (no journal) finds the second lease and submits it through the same wire
+        planner = PromptPlanner(MATH, (0, 50), rng=random.Random(0))
+        generator = FakeGroupGenerator()
+        generator.load_weights({}, 0)
+        generator.generate = lambda leases: [rollouts for _ in leases]
+        miner = AsyncMiner(AsyncMinerConfig(environments=(MATH,), submit_backoff_s=(0.0,)), transport=transport,
+                           generator=generator, planners={MATH: planner}, loaded_version=0)
+        assert await miner.recover_leases() == 1 and set(miner.open) == {held[1].lease_id}
+        assert planner.lease_expiry_s == 600.0
+        await miner.generate_once()
+        await miner.drain()
+        assert miner.stats["verdicts"] == {"in_zone": 1} and book.lease(held[1].lease_id).state == "submitted"
