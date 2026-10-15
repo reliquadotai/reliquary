@@ -92,14 +92,16 @@ class FusedLogprobHead(torch.nn.Linear):
 
     fused_selected_logprobs = True
 
-    def forward(self, hidden, targets=None):
+    def forward(self, hidden, targets=None, draws=None):
         if targets is None:
             return super().forward(hidden)
         from reliquary.validator.training import _selected_logprobs_from_hidden
 
+        # draws: the substitution loss's v* is picked here too, on the gathered weight.
         weight, bias = self.weight, self.bias
         return _selected_logprobs_from_hidden(
             hidden, targets, lambda rows: torch.nn.functional.linear(rows, weight, bias),
+            draws=draws, weight=weight,
         )
 
 

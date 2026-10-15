@@ -1101,6 +1101,16 @@ DO_SAMPLE_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.do_sample
 # proof forward. Both from the profile; see reliquary.environment.forced_sampling.
 FORCED_DRAW = ACTIVE_PROTOCOL_PROFILE.sampling.draw
 LM_HEAD_FP32 = ACTIVE_PROTOCOL_PROFILE.sampling.lm_head_fp32
+# The token the policy term scores (docs/rl-async-design.md 4.7). "current": the miner's
+# token. "substitution": v*, the forced pick recomputed from the trainer's own logits with
+# the rollout's public uniforms, equal to the miner's token wherever they agree. On by
+# default under the Gumbel draw only; RELIQUARY_TRAINING_LOSS is the guard.
+TRAINING_LOSSES = ("current", "substitution")
+TRAINING_LOSS = _os.environ.get("RELIQUARY_TRAINING_LOSS", "").strip().lower() or (
+    "substitution" if FORCED_DRAW == "gumbel_max" else "current"
+)
+if TRAINING_LOSS not in TRAINING_LOSSES:
+    raise ValueError(f"RELIQUARY_TRAINING_LOSS must be one of {TRAINING_LOSSES}, got {TRAINING_LOSS!r}")
 
 # Do not add miner-only logits processors here. A presence/repetition penalty
 # changes the sampling policy; unless the validator also recomputes and verifies

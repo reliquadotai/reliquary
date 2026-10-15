@@ -46,18 +46,37 @@ def _batches(model, *, n_groups=3, outlier_group=None, seed=7):
     return [groups]
 
 
-def _single_step():
+def _use_substitution(batches):
+    """The substitution loss under a Gumbel draw, with public uniforms on every rollout."""
+    from reliquary import constants
+    from reliquary.environment.forced_sampling import DRAW_GUMBEL_MAX, u_at
+    from reliquary.validator import verifier
+
+    constants.TRAINING_LOSS = "substitution"
+    verifier.draw_settings = lambda: verifier.DrawSettings(
+        draw=DRAW_GUMBEL_MAX, t=1.0, top_k=0, top_p=1.0,
+        stochastic_threshold=0.99, boundary_epsilon=0.05,
+    )
+    for group in batches[0]:
+        for index, r in enumerate(group.rollouts):
+            n = len(r.commit["rollout"]["token_logprobs"])
+            r._forced_draw_uniforms = [u_at("cd" * 32, group.prompt_idx, "c", index, j) for j in range(n)]
+
+
+def _single_step(substitution=False):
     from reliquary.validator import training
 
     training.reset_training_state()
     training.KL_BETA = 0.0  # the run trains with KL 0 (decision N)
     model = tiny_qwen35()
     batches = _batches(model)
+    if substitution:
+        _use_substitution(batches)
     training.train_step(model, batches, ref_model=None)
     return {k: v.detach().clone() for k, v in model.state_dict().items()}
 
 
-def _sharded_step(budget):
+def _sharded_step(budget, substitution=False):
     from reliquary.trainer.distributed import init_distributed, shard_model
     from reliquary.validator import training
 
@@ -68,6 +87,8 @@ def _sharded_step(budget):
     training.MICROBATCH_MAX_PADDED_TOKENS = budget
     model = tiny_qwen35()
     batches = _batches(model)
+    if substitution:
+        _use_substitution(batches)
     model = shard_model(model, ctx, param_dtype=torch.float32)
     training.train_step(model, batches, ref_model=None)
     from reliquary.trainer.distributed import gather_full_state_dict
@@ -82,6 +103,20 @@ def test_sharded_step_matches_single_process(budget):
     got = run_ranks(_sharded_step, 2, budget)[0]
     worst = max(float((got[k].float() - want[k].float()).abs().max()) for k in want)
     assert worst < 1e-5
+
+
+def _substituted_single():
+    return _single_step(substitution=True)
+
+
+def test_sharded_substitution_step_matches_single_process():
+    """The fused FSDP2 head picks v* on the gathered weight like the one-process chunk loop."""
+    want = run_ranks(_substituted_single, 1)[0]
+    plain = run_ranks(_single_step, 1)[0]
+    got = run_ranks(_sharded_step, 2, 100, True)[0]
+    worst = max(float((got[k].float() - want[k].float()).abs().max()) for k in want)
+    assert worst < 1e-5
+    assert any(not torch.equal(want[k], plain[k]) for k in want)  # v* moved the step
 
 
 def _unequal(budget):

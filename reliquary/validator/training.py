@@ -18,7 +18,7 @@ import math
 import os
 import threading
 import warnings
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import torch
 import torch.utils.checkpoint
@@ -147,6 +147,7 @@ _DIST = None
 
 KL_STAT_MAX_KEYS = frozenset({
     "max", "log_ratio_abs_max", "ppo_log_ratio_abs_max", "pi_old_claim_abs_error_max",
+    "draw_rollout_mismatch_max",
 })
 
 
@@ -1192,6 +1193,82 @@ def _selected_logprobs(
     return torch.cat(parts, dim=0)
 
 
+def training_loss() -> str:
+    """``constants.TRAINING_LOSS``, read at call time so tests and processes can switch it."""
+    from reliquary import constants
+
+    return constants.TRAINING_LOSS
+
+
+class _DrawRows(NamedTuple):
+    """The forced draw recomputed on the trainer's own logits, one entry per scored row."""
+
+    targets: torch.Tensor     # [N] the scored token: v* where drawn, the miner's elsewhere
+    drawn: torch.Tensor       # [N] bool: the row carried a public uniform
+    match: torch.Tensor       # [N] bool: drawn and v* is the miner's token
+    stochastic: torch.Tensor  # [N] bool: max p under the verifier's stochastic threshold
+    entropy: torch.Tensor     # [N] fp32, nats
+
+
+def _draw_logits(project, weight):
+    """The rows -> logits map the forced draw reads, as the verifier computes it: the
+    profile's fp32 head (bf16 operands, fp32 products, TF32 off) or the head's own
+    projection. The fp32 copy is cast here, per call: the weight moves every step."""
+    from reliquary.validator.verifier import lm_head_fp32
+
+    if not lm_head_fp32():
+        return project
+    if weight is None:
+        raise RuntimeError("fp32 LM head: the forced draw needs the head's weight")
+    w = weight.detach().to(torch.bfloat16).float()
+
+    def fp32(rows):
+        previous = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            # Autocast would hand the matmul bf16 operands again.
+            with torch.autocast(device_type=rows.device.type, enabled=False):
+                return rows.to(torch.bfloat16).float() @ w.T
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = previous
+
+    return fp32
+
+
+@torch.no_grad()
+def _forced_draw_rows(logits_of, rows, targets, draws, chunk: int = _LOGPROB_CHUNK) -> _DrawRows:
+    """v* = the profile's forced pick (``forced_sampling.pick_rows``, the verifier's own) of
+    each row whose public uniform ``draws[i]`` is known (None: keep the miner's token), plus
+    the verifier's stochastic flag and the entropy. ``logits_of`` maps a row chunk to its
+    logits; at most ``chunk`` rows of full-vocab logits live at once, and ``pick_rows``
+    bounds its float64 noise further."""
+    from reliquary.environment.forced_sampling import pick_rows
+    from reliquary.validator.verifier import draw_settings
+
+    settings = draw_settings()
+    n = int(targets.shape[0])
+    picked = targets.clone()
+    stochastic = torch.zeros(n, dtype=torch.bool, device=targets.device)
+    entropy = torch.zeros(n, dtype=torch.float32, device=targets.device)
+    for start in range(0, n, chunk):
+        end = min(n, start + chunk)
+        logits = logits_of(rows[start:end])
+        logp = torch.log_softmax(logits.float(), dim=-1)
+        probs = logp.exp()
+        stochastic[start:end] = probs.max(dim=-1).values < settings.stochastic_threshold
+        entropy[start:end] = -(probs * logp).nan_to_num(0.0).sum(dim=-1)
+        del logp, probs
+        local = [k for k in range(start, end) if draws[k] is not None]
+        if local:
+            index = torch.tensor(local, device=targets.device, dtype=torch.long)
+            picked[index] = pick_rows(
+                logits.index_select(0, index - start), [float(draws[k]) for k in local],
+                draw=settings.draw, t=settings.t, top_k=settings.top_k, top_p=settings.top_p,
+            ).to(picked.device)
+    drawn = torch.tensor([u is not None for u in draws], dtype=torch.bool, device=targets.device)
+    return _DrawRows(picked, drawn, drawn & (picked == targets), stochastic, entropy)
+
+
 def _hidden_logprob_block(
     hidden_slice: torch.Tensor,
     indices_slice: torch.Tensor,
@@ -1209,7 +1286,10 @@ def _selected_logprobs_from_hidden(
     indices: torch.Tensor,
     lm_head,
     chunk: int = _LOGPROB_CHUNK,
-) -> torch.Tensor:
+    *,
+    draws: list | None = None,
+    weight: torch.Tensor | None = None,
+):
     """Compute selected token logprobs from hidden states in row chunks.
 
     This avoids materialising the full ``sequence × vocab`` logits tensor that
@@ -1217,12 +1297,26 @@ def _selected_logprobs_from_hidden(
     full-logits path is the difference between fitting long rollouts and
     getting killed by memory pressure. Checkpointing keeps backward memory at
     one chunk by recomputing the LM-head/logsumexp block as needed.
+
+    With ``draws`` (one public uniform or None per row) the scored token is v*,
+    the forced pick of these rows' own detached logits (``_forced_draw_rows``),
+    and the result is ``(logprobs, _DrawRows)``. ``weight`` is the head's
+    weight, for the profile's fp32 head; it defaults to ``lm_head.weight``.
     """
     if getattr(lm_head, "fused_selected_logprobs", False):
         # The FSDP2 head (reliquary.trainer.distributed) runs this same chunk
         # loop inside ONE module call, so its sharded weight is gathered once
         # for every chunk and its gradient reduced once.
-        return lm_head(hidden_rows, indices)
+        if draws is None:
+            return lm_head(hidden_rows, indices)
+        return lm_head(hidden_rows, indices, draws)
+    draw_rows = None
+    if draws is not None:
+        draw_rows = _forced_draw_rows(
+            _draw_logits(lm_head, weight if weight is not None else getattr(lm_head, "weight", None)),
+            hidden_rows.detach(), indices, draws, chunk,
+        )
+        indices = draw_rows.targets
     n = hidden_rows.shape[0]
     use_ckpt = hidden_rows.requires_grad
     parts = []
@@ -1240,7 +1334,8 @@ def _selected_logprobs_from_hidden(
         else:
             part = _block(hidden_rows[i:end], indices[i:end])
         parts.append(part)
-    return torch.cat(parts, dim=0)
+    logprobs = torch.cat(parts, dim=0)
+    return logprobs if draw_rows is None else (logprobs, draw_rows)
 
 
 def _base_model_and_lm_head(model):
@@ -1528,12 +1623,19 @@ def _batched_completion_logprobs(
     prompt_lengths,
     lengths,
     policy_positions=None,
+    *,
+    draws: list | None = None,
+    targets: torch.Tensor | None = None,
 ):
     """Selected next-token logprobs over every rollout's completion tokens in a
     right-padded batch, concatenated in row order. Same per-token values as
     ``_selected_logprobs_for_tokens`` (each row depends only on its own hidden
     state) — only the completion-predicting rows are gathered. Returns
     ``(logprobs[N], seg)`` where ``seg[i]`` is rollout i's completion-token count.
+
+    ``targets`` [N] scores other tokens than the batch's own (the substituted
+    v* under a reference forward). ``draws`` [N] (public uniform or None) scores
+    v* picked from this forward's logits and returns ``(logprobs, seg, _DrawRows)``.
     """
     device = input_ids.device
     b_rows: list[int] = []
@@ -1551,7 +1653,8 @@ def _batched_completion_logprobs(
             p_rows.append(int(token_position) - 1)
     b_idx = torch.tensor(b_rows, device=device, dtype=torch.long)
     p_idx = torch.tensor(p_rows, device=device, dtype=torch.long)
-    targets = input_ids[b_idx, p_idx + 1]
+    if targets is None:
+        targets = input_ids[b_idx, p_idx + 1]
     base, lm_head = _base_model_and_lm_head(model)
     if base is not None and lm_head is not None:
         try:
@@ -1560,9 +1663,22 @@ def _batched_completion_logprobs(
             out = base(input_ids, use_cache=False)  # doubles without a mask kwarg
         hidden = _last_hidden_state(out)
         if hidden is not None:
-            return _selected_logprobs_from_hidden(hidden[b_idx, p_idx], targets, lm_head), seg
+            if draws is None:
+                return _selected_logprobs_from_hidden(hidden[b_idx, p_idx], targets, lm_head), seg
+            logprobs, draw_rows = _selected_logprobs_from_hidden(
+                hidden[b_idx, p_idx], targets, lm_head, draws=draws,
+            )
+            return logprobs, seg, draw_rows
     logits = model(input_ids, attention_mask=attention_mask, use_cache=False).logits
-    return _selected_logprobs(logits[b_idx, p_idx], targets), seg
+    if draws is None:
+        return _selected_logprobs(logits[b_idx, p_idx], targets), seg
+    from reliquary.validator.verifier import lm_head_fp32
+
+    if lm_head_fp32():
+        raise RuntimeError("fp32 LM head: this model's logits come materialised from its forward")
+    rows = logits[b_idx, p_idx]
+    draw_rows = _forced_draw_rows(lambda chunk: chunk, rows.detach(), targets, draws)
+    return _selected_logprobs(rows, draw_rows.targets), seg, draw_rows
 
 
 def _new_kl_stats() -> dict[str, float | int]:
@@ -1595,6 +1711,22 @@ def _new_kl_stats() -> dict[str, float | int]:
         "ppo_low_p_outside_count": 0,
         "ppo_high_p_count": 0,
         "ppo_high_p_outside_count": 0,
+        # The substitution loss's forced-draw counters, present only under it.
+        **(_new_draw_stats() if training_loss() == "substitution" else {}),
+    }
+
+
+def _new_draw_stats() -> dict[str, float | int]:
+    return {
+        "draw_token_count": 0,
+        "draw_drawn_count": 0,
+        "draw_substituted_count": 0,
+        "draw_stochastic_count": 0,
+        "draw_stochastic_match_count": 0,
+        "draw_entropy_sum": 0.0,
+        "draw_rollout_count": 0,
+        "draw_rollout_below_floor_count": 0,
+        "draw_rollout_mismatch_max": 0.0,
     }
 
 
@@ -1694,6 +1826,60 @@ def _record_kl_stats(
                 )
 
 
+def _record_draw_stats(stats, draw_rows: _DrawRows, keep_seg: list[int], rollouts) -> None:
+    """Accumulate the forced-draw counters over the trained (kept) rows, and leave each
+    rollout its ``_training_draw_counts = (n_stochastic, n_match)``: the verifier's per-rollout
+    statistic, from the training forward (design 4.7, proposed; acceptance does not read it)."""
+    if stats is None or "draw_token_count" not in stats:
+        return
+    from reliquary.constants import FORCED_SEED_ROLLOUT_FLOOR, FORCED_SEED_ROLLOUT_MIN_STOCH
+
+    with torch.no_grad():
+        stoch = draw_rows.drawn & draw_rows.stochastic
+        stats["draw_token_count"] += int(draw_rows.drawn.numel())
+        stats["draw_drawn_count"] += int(draw_rows.drawn.sum())
+        stats["draw_substituted_count"] += int((draw_rows.drawn & ~draw_rows.match).sum())
+        stats["draw_stochastic_count"] += int(stoch.sum())
+        stats["draw_stochastic_match_count"] += int((stoch & draw_rows.match).sum())
+        stats["draw_entropy_sum"] += float(draw_rows.entropy.sum())
+        owner = torch.repeat_interleave(
+            torch.arange(len(keep_seg), device=stoch.device),
+            torch.tensor(keep_seg, device=stoch.device),
+        )
+        per_stoch = torch.bincount(owner, weights=stoch.double(), minlength=len(keep_seg)).tolist()
+        per_match = torch.bincount(
+            owner, weights=(stoch & draw_rows.match).double(), minlength=len(keep_seg),
+        ).tolist()
+    for rollout, n_stoch, n_match in zip(rollouts, per_stoch, per_match):
+        if rollout is not None:
+            rollout._training_draw_counts = (int(n_stoch), int(n_match))
+        if n_stoch >= FORCED_SEED_ROLLOUT_MIN_STOCH:
+            rate = n_match / n_stoch
+            stats["draw_rollout_count"] += 1
+            stats["draw_rollout_below_floor_count"] += int(rate < FORCED_SEED_ROLLOUT_FLOOR)
+            stats["draw_rollout_mismatch_max"] = max(float(stats["draw_rollout_mismatch_max"]), 1.0 - rate)
+
+
+def _draw_telemetry_metrics(stats: dict[str, float | int]) -> dict[str, float]:
+    if "draw_token_count" not in stats:
+        return {}
+    drawn = int(stats["draw_drawn_count"])
+    stochastic = int(stats["draw_stochastic_count"])
+    rollouts = int(stats["draw_rollout_count"])
+    return {
+        # Share of trained tokens scored as v* instead of the miner's token.
+        "train/substitution_rate": int(stats["draw_substituted_count"]) / max(1, drawn),
+        # The verifier's match on stochastic positions (max p < 0.99), from this forward.
+        "train/draw_match_rate": int(stats["draw_stochastic_match_count"]) / max(1, stochastic),
+        "train/draw_stochastic_ratio": stochastic / max(1, drawn),
+        # Below 1.0: trained tokens without public uniforms, scored as the miner's token.
+        "train/draw_coverage_ratio": drawn / max(1, int(stats["draw_token_count"])),
+        "train/entropy": float(stats["draw_entropy_sum"]) / max(1, int(stats["draw_token_count"])),
+        "train/draw_rollout_match_min": 1.0 - float(stats["draw_rollout_mismatch_max"]) if rollouts else 1.0,
+        "train/draw_rollout_below_floor_ratio": int(stats["draw_rollout_below_floor_count"]) / max(1, rollouts),
+    }
+
+
 def _kl_telemetry_metrics(stats: dict[str, float | int]) -> dict[str, float]:
     token_count = int(stats["token_count"])
     denominator = max(1, token_count)
@@ -1787,7 +1973,7 @@ def _kl_telemetry_metrics(stats: dict[str, float | int]) -> dict[str, float]:
             int(stats["ppo_high_p_outside_count"])
             / max(1, int(stats["ppo_high_p_count"]))
         ),
-    }
+    } | _draw_telemetry_metrics(stats)
 
 
 def _microbatch_grad(
@@ -1819,6 +2005,8 @@ def _microbatch_grad(
     plens, lens, olds, advs, scales, keeps, volds, positions = (
         [], [], [], [], [], [], [], []
     )
+    # Substitution loss: one public uniform (or None) per scored row.
+    draws = [] if training_loss() == "substitution" else None
     for j, item in enumerate(batch):
         tokens, p, old, adv, scale, keep, vold = item[:7]
         L = len(tokens)
@@ -1834,6 +2022,9 @@ def _microbatch_grad(
         positions.append(
             list(item[7]) if len(item) > 7 else list(range(p, L))
         )
+        if draws is not None:
+            uniforms = item[8] if len(item) > 8 else None
+            draws.extend(uniforms if uniforms is not None else [None] * len(positions[-1]))
 
     # pi_old from the seal-time verify pass when EVERY row carries it; the
     # no-grad forwards below only run when something still needs them.
@@ -1844,22 +2035,33 @@ def _microbatch_grad(
 
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                         enabled=device.type in ("cuda", "cpu")):
-        new_lp, seg = _batched_completion_logprobs(
-            model, input_ids, attn, plens, lens, positions
-        )
+        draw_rows = scored = None
+        if draws is None:
+            new_lp, seg = _batched_completion_logprobs(
+                model, input_ids, attn, plens, lens, positions
+            )
+        else:
+            # The policy term scores v*, picked from this forward's own logits;
+            # the reference and behavior forwards score the same tokens.
+            new_lp, seg, draw_rows = _batched_completion_logprobs(
+                model, input_ids, attn, plens, lens, positions, draws=draws,
+            )
+            scored = draw_rows.targets
         with torch.no_grad():
             ref_lp = None
             behavior_lp = None
             if need_ref_forward:
                 ref_lp, _ = _batched_completion_logprobs(
-                    ref_model, input_ids, attn, plens, lens, positions
+                    ref_model, input_ids, attn, plens, lens, positions,
+                    targets=scored,
                 )
             if need_pi_forward:
                 if share:
                     behavior_lp = ref_lp
                 else:
                     behavior_lp, behavior_seg = _batched_completion_logprobs(
-                        behavior_model, input_ids, attn, plens, lens, positions
+                        behavior_model, input_ids, attn, plens, lens, positions,
+                        targets=scored,
                     )
                     if behavior_seg != seg:
                         raise ValueError(
@@ -1887,6 +2089,11 @@ def _microbatch_grad(
             raise ValueError("behavior-model completion shape mismatch")
         behavior_old_cat = behavior_lp.detach()
         old_cat = behavior_old_cat
+    if draw_rows is not None and behavior_lp is None:
+        # pi_old (verify pass or claim) scores the miner's token. Where v* differs, its
+        # pi_old is the current policy's own value: the ratio is 1, exact with one step
+        # per checkpoint (design 4.7); the behavior forward above scores v* itself.
+        old_cat = torch.where(draw_rows.match | ~draw_rows.drawn, old_cat, new_lp.detach())
     adv_cat = torch.tensor(
         [advs[k] for k in range(B) for _ in range(seg[k])],
         device=device,
@@ -1912,6 +2119,8 @@ def _microbatch_grad(
     adv_cat = adv_cat[keep_cat]
     scale_cat = scale_cat[keep_cat]
     keep_seg = [sum(1 for flag in keep if flag) for keep in keeps]
+    if draw_rows is not None:
+        draw_rows = _DrawRows(*(field[keep_cat] for field in draw_rows))
     ppo_log_ratio = new_lp - old_cat
     ratio = torch.exp(ppo_log_ratio)
     surr, clip_active = _clipped_surrogate(ratio, adv_cat)
@@ -1957,6 +2166,10 @@ def _microbatch_grad(
         kl_term_computed=ref_lp is not None,
         pi_old=old_cat,
     )
+    if draw_rows is not None:
+        _record_draw_stats(
+            kl_stats, draw_rows, keep_seg, [item[9] if len(item) > 9 else None for item in batch],
+        )
 
     sum_ppo = sum_kl = 0.0
     off = 0
@@ -2008,7 +2221,7 @@ def _process_microbatch(
 
 def _build_microbatch_items(plan):
     """Flatten plan -> list of (tokens, prompt_length, old_logprobs, advantage,
-    scale, keep, validator_old_logprobs), dropping rollouts the per-rollout path would have skipped (missing
+    scale, keep, validator_old_logprobs, positions, draw_uniforms, rollout), dropping rollouts the per-rollout path would have skipped (missing
     prompt_length/token_logprobs, or a miner/model completion-length mismatch).
     ``scale`` is the per-token loss weight w_e/N_e carried from the plan entry."""
     items = []
@@ -2042,8 +2255,20 @@ def _build_microbatch_items(plan):
                 tokens, p, old, adv, scale, keep,
                 _validator_completion_logprobs(rollout, n_completion),
                 positions,
+                _forced_draw_uniforms(rollout, n_completion),
+                rollout,
             ))
     return items
+
+
+def _forced_draw_uniforms(rollout, n_completion: int):
+    """The public uniforms of this rollout's policy positions (``_forced_draw_uniforms``,
+    attached by the batcher from the verifier's own stream), or None when absent or the
+    wrong length: the substitution loss then scores the miner's tokens for this rollout."""
+    values = getattr(rollout, "_forced_draw_uniforms", None)
+    if not isinstance(values, (list, tuple)) or len(values) != n_completion or n_completion == 0:
+        return None
+    return [float(v) for v in values]
 
 
 def _padding_pass(model, device) -> None:
