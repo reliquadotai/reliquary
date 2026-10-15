@@ -996,3 +996,30 @@ def verify_rl_lease_signature(hotkey: str, *, at: int, environment: str, checkpo
     except (TypeError, ValueError, OverflowError):
         return False
     return verify_hotkey_signature(hotkey, binding, signature)
+
+
+# A miner's async RL submission (rl-async-design.md §4.4), signed for one validator and route: the lease it ends
+# and the digest of its rollouts (``protocol.rl_submit.rollouts_digest``).
+RL_SUBMIT_DOMAIN = b"reliquary/rl-submit/v1"
+
+
+def build_rl_submit_binding(*, hotkey: str, at: int, lease_id: str, rollouts_digest: bytes,
+                            validator_hotkey: str, path: str) -> bytes:
+    if type(at) is not int or at < 0:
+        raise TypeError("at: non-negative integer seconds required")
+    if not isinstance(rollouts_digest, (bytes, bytearray)) or len(rollouts_digest) != 32:
+        raise TypeError("rollouts digest: 32 bytes required")
+    return _bound(RL_SUBMIT_DOMAIN, [
+        str(hotkey).encode("utf-8"), at.to_bytes(8, "big", signed=False), str(lease_id).encode("utf-8"),
+        bytes(rollouts_digest), *_audience(validator_hotkey, path)])
+
+
+def verify_rl_submit_signature(hotkey: str, *, at: int, lease_id: str, rollouts_digest: bytes, signature: str,
+                               validator_hotkey: str, path: str) -> bool:
+    """False on any failure; fail-closed without bittensor."""
+    try:
+        binding = build_rl_submit_binding(hotkey=hotkey, at=at, lease_id=lease_id, rollouts_digest=rollouts_digest,
+                                          validator_hotkey=validator_hotkey, path=path)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return verify_hotkey_signature(hotkey, binding, signature)

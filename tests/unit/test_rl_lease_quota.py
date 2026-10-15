@@ -31,7 +31,8 @@ def test_a_new_hotkey_starts_at_the_initial_quota_and_says_why():
     quota = QuotaController(QuotaConfig(initial=4))
     state = quota.state("new")
     assert state["quota"] == 4 and state["phase"] == "slow_start" and "new hotkey" in state["reason"]
-    assert state["counters"] == {"leased": 0, "submitted": 0, "in_zone": 0, "out_of_zone": 0, "expired": 0}
+    assert state["counters"] == {"leased": 0, "submitted": 0, "in_zone": 0, "out_of_zone": 0, "expired": 0,
+                                 "rejected": 0}
 
 
 def test_slow_start_doubles_after_a_full_quota_delivered_on_time():

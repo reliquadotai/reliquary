@@ -666,3 +666,40 @@ P2 and P1a can run in parallel. P5 can start once P1a fixes the v* format.
   `protocol/signatures.py`), `GET /rl/quota?hotkey=`, `GET /rl/lease/commitments`, `GET /rl/prompts/state?since=`
   (public, no hotkey); `ValidatorServer.mount_rl_lease_router`. Not mounted by the CLI/service yet (P3);
   `LeaseBook.submit` and `LeaseBook.record_outcome` are the hooks P3 calls.
+
+## 6. P3 as built (branch `feat/rl-submit`)
+
+New code next to the window path (nothing of it changed; `materialize_admission_problem` is now a thin wrapper
+over the module-level `batcher.admission_problem_materials`, shared with P3).
+
+- Wire (`protocol/rl_submit.py`, `signatures.build_rl_submit_binding`): `POST /rl/submit {miner_hotkey, at,
+  lease_id, rollouts[16]{index, tokens, force_span}, signature}`; `tokens` = base64(zlib(uint32 LE)) of the
+  completion only (the validator renders the prompt, so prompt fidelity holds by construction); the signature
+  covers `rollouts_digest` of the rollouts as sent, so nothing is inflated before it verifies; bounded inflate.
+  No `k_generated`: the lease's k is the generation checkpoint (the nonce binds it). Route in `rl_lease_routes.py`
+  (mounted with `submissions=`), own 600/min bound, grading off the loop (4 at once).
+- `validator/rl_submit.py`: `GroupGrader` (single-turn only; termination by `admission._classify_termination`,
+  force spans by `_force_span_valid`, rewards by `EnvironmentSpec.score_many`, length by the env cap) and
+  `RlSubmissions`: `check_submission` -> grade -> one transaction (lease closed, `record_outcome`, `rl_groups`,
+  buffer or audit draw). Store: `rl_groups` (private, hotkey, verdict, grades, first scan, audit/training state)
+  next to `rl_prompt_scans` (public log). TODO: the decision-D R2 segment writer reads `rl_prompt_scans` by `seq`.
+- `validator/rl_buffer.py`: `TrainingBuffer` (SQLite, same file): `take(env, n)` freshest first (k, then arrival),
+  `release`, `depth`; taken groups requeue at reopen. `SubmittedGroup` carries env, k, nonce, arrival, hotkey,
+  prompt tokens, completions, force spans, rewards.
+- Audit (§C, design §4.4): draw after submission with `SystemRandom`; probation = < 100 passed out-of-zone audits,
+  or < 20 passes since the last failure; deterministic -> `LeaseBook.ban` 24 h (no lease: refusal `banned`, no
+  submission); statistical -> re-probation, ban when > 3 of the last 20 non-forced verdicts failed. Queue order:
+  past-probation hotkeys first, oldest first. `ProofForward(SubmittedGroup) -> AuditResult(passed | None,
+  failure_class, rollout_match)` is the Gumbel verifier's slot; `run_audits` drains.
+- Hooks for P4/P5: `report_training(lease_id, rollout_match, accepted, failure_class=None)` (accepted -> `trained`
+  event with per-rollout match and token counts; rejected with a class -> sanctioned like an audit; without a class,
+  e.g. staleness -> unpaid only). `rl_events` (`first_scan` 25 % payable: at once when not drawn, at pass when
+  drawn; `first_scan_forfeited`; `trained`; `untrained`; `ban`) is the P5 ledger's input (`events(since)`).
+- Quota: in and out of zone are delivered (`record_submission`); a group refused for integrity (bad termination,
+  tampered span, too long, out of vocab, unscorable) closes the lease, records no scan, and halves the quota
+  (`record_expiry(cause="rejected")`). A schema error (indices, decode) is refused before the lease is touched; a
+  grader outage answers 503 with the lease still open.
+- Resolved ambiguities: probation counts PASSED audits (decisions-doc rule in force), not submitted groups; training
+  verdicts count in the recidivism window, never as probation passes; an inconclusive audit forfeits the first-scan
+  pay without sanction; a lease that expires while its group is being graded is refused (the arrival time is used,
+  but a concurrent sweep can still expire it: grading is short next to the expiry).

@@ -9,7 +9,8 @@ generates them, and every lease ends in a submission or an expiry (there is no r
   and ``LeaseBook.grant`` resolves the whole batch at once: every (request, prompt) claim is shuffled with the
   validator's own randomness (``random.SystemRandom``) and taken in that order, so a contested prompt goes to a
   uniformly random requester that still has quota; arriving first inside the interval buys nothing.
-* **Refusals say only** ``taken`` / ``cooling`` / ``blacklisted`` / ``quota`` / ``stale``: never who holds a
+* **Refusals say only** ``taken`` / ``cooling`` / ``blacklisted`` / ``quota`` / ``stale`` / ``banned`` (the
+  caller's own audit ban, ``ban``, set by the submission path): never who holds a
   prompt, when its lease ends, or which leases are open. ``taken`` covers both an open lease of someone else and a key
   closed by a submission. A resend by the holder answers its own open lease again (a lost response is not a lost lease).
 * **Prompt lifecycle** (§4.5): ``record_outcome`` (called by the submission path, P3, once a group is graded)
@@ -56,8 +57,8 @@ from pathlib import Path
 from reliquary.constants import MAX_TRUNCATED_PER_SUBMISSION, SIGMA_MIN_V4, prompt_cooldown_windows_for_environment
 from reliquary.validator.rl_lease_quota import QuotaController
 
-TAKEN, COOLING, BLACKLISTED, QUOTA, STALE = "taken", "cooling", "blacklisted", "quota", "stale"
-REFUSALS = frozenset({TAKEN, COOLING, BLACKLISTED, QUOTA, STALE})
+TAKEN, COOLING, BLACKLISTED, QUOTA, STALE, BANNED = "taken", "cooling", "blacklisted", "quota", "stale", "banned"
+REFUSALS = frozenset({TAKEN, COOLING, BLACKLISTED, QUOTA, STALE, BANNED})
 OPEN, SUBMITTED, EXPIRED = "open", "submitted", "expired"
 IN_ZONE, TOO_EASY, TOO_HARD, TRUNCATED = "in_zone", "too_easy", "too_hard", "truncated"
 VERDICTS = frozenset({IN_ZONE, TOO_EASY, TOO_HARD, TRUNCATED})
@@ -216,6 +217,7 @@ CREATE TABLE IF NOT EXISTS rl_prompt_scans(seq INTEGER PRIMARY KEY AUTOINCREMENT
 CREATE TABLE IF NOT EXISTS rl_prompt_state(environment TEXT NOT NULL, prompt_idx INTEGER NOT NULL,
     state TEXT NOT NULL, until_k INTEGER, seq INTEGER NOT NULL, PRIMARY KEY(environment, prompt_idx));
 CREATE INDEX IF NOT EXISTS rl_prompt_state_seq ON rl_prompt_state(seq);
+CREATE TABLE IF NOT EXISTS rl_hotkey_bans(hotkey TEXT PRIMARY KEY, until REAL NOT NULL);
 """
 _COLUMNS = "lease_id, hotkey, environment, prompt_idx, k, nonce, issued_at, expires_at, state"
 
@@ -235,6 +237,7 @@ class LeaseBook:
         self.clock = clock
         self._rng = rng or random.SystemRandom()
         self.lock = threading.RLock()
+        self._depth = 0
         path = Path(path)
         _private_file(path)
         self.db = sqlite3.connect(path, timeout=30, check_same_thread=False)
@@ -255,10 +258,20 @@ class LeaseBook:
 
     @contextlib.contextmanager
     def _txn(self):
+        """One transaction under the lock. Called inside ``transaction()`` on the same thread, it joins the outer
+        transaction (which commits or rolls back everything)."""
         with self.lock:
+            if self._depth:
+                self._depth += 1
+                try:
+                    yield
+                finally:
+                    self._depth -= 1
+                return
             if self.db.in_transaction:
                 raise RuntimeError("lease book transaction is already open")
             self.db.execute("BEGIN IMMEDIATE")
+            self._depth = 1
             try:
                 yield
             except BaseException:
@@ -266,6 +279,13 @@ class LeaseBook:
                 raise
             else:
                 self.db.commit()
+            finally:
+                self._depth = 0
+
+    def transaction(self):
+        """A transaction the book's own writes join: the submission path closes a lease, records its outcome and
+        stores the group atomically. Other tables of the same file (``rl_submit``) are written inside it."""
+        return self._txn()
 
     def _boot(self) -> None:
         now = float(self.clock())
@@ -379,6 +399,7 @@ class LeaseBook:
             latest = self.latest_checkpoint
             secrets_by_k = dict(self.db.execute("SELECT k, secret FROM rl_lease_secrets WHERE revealed_at IS NULL"))
             in_use: dict[str, int] = {}
+            banned: dict[str, bool] = {}
             for i, prompt in claims:
                 request = requests[i]
                 env, k, hotkey = request.environment, request.checkpoint, request.hotkey
@@ -396,6 +417,11 @@ class LeaseBook:
                     continue
                 lifecycle = self.db.execute("SELECT state, until_k FROM rl_prompt_state WHERE environment=? "
                                             "AND prompt_idx=?", (env, prompt)).fetchone()
+                if hotkey not in banned:
+                    banned[hotkey] = self._banned(hotkey, now)
+                if banned[hotkey]:
+                    answers[i].refused[prompt] = BANNED
+                    continue
                 if lifecycle is not None and lifecycle[0] == BLACKLISTED:
                     answers[i].refused[prompt] = BLACKLISTED
                     continue
@@ -421,32 +447,67 @@ class LeaseBook:
             answers[i].leases = [granted[i][p] for p in request.prompt_ids if p in granted[i]]
         return answers
 
-    def submit(self, lease_id: str, hotkey: str, *, in_zone: bool, now: float | None = None) -> Lease:
-        """End a lease by its submission (P3 calls this once the group is received, whatever its outcome). Closes
-        its (env, prompt, k) and credits the hotkey's quota. LookupError: unknown, already ended or expired;
-        PermissionError: another hotkey's lease."""
+    def _submittable(self, lease_id: str, hotkey: str, now: float) -> tuple[Lease | None, Exception | None]:
+        row = self.db.execute(f"SELECT {_COLUMNS} FROM rl_leases WHERE lease_id=?", (lease_id,)).fetchone()
+        lease = None if row is None else self._lease(row)
+        if lease is None:
+            return None, LookupError("lease unknown")
+        if lease.hotkey != hotkey:
+            return lease, PermissionError("lease held by another hotkey")
+        if lease.state != OPEN:
+            return lease, LookupError(f"lease {lease.state}")
+        if lease.expires_at <= now:
+            self._expire(now)                                         # committed: late is expired
+            return lease, LookupError("lease expired")
+        if self._banned(hotkey, now):
+            return lease, PermissionError("hotkey banned")
+        return lease, None
+
+    def check_submission(self, lease_id: str, hotkey: str, now: float | None = None) -> Lease:
+        """What ``submit`` would refuse, without closing the lease: the submission path checks before it grades
+        (nothing is graded for a lease that cannot be submitted)."""
         now = float(self.clock()) if now is None else now
-        failure: Exception | None = None
         with self._txn():
-            row = self.db.execute(f"SELECT {_COLUMNS} FROM rl_leases WHERE lease_id=?", (lease_id,)).fetchone()
-            lease = None if row is None else self._lease(row)
-            if lease is None:
-                failure = LookupError("lease unknown")
-            elif lease.hotkey != hotkey:
-                failure = PermissionError("lease held by another hotkey")
-            elif lease.state != OPEN:
-                failure = LookupError(f"lease {lease.state}")
-            elif lease.expires_at <= now:
-                self._expire(now)                                     # committed: late is expired
-                failure = LookupError("lease expired")
-            else:
+            lease, failure = self._submittable(lease_id, hotkey, now)
+        if failure is not None:
+            raise failure
+        return lease
+
+    def submit(self, lease_id: str, hotkey: str, *, in_zone: bool, delivered: bool = True,
+               now: float | None = None) -> Lease:
+        """End a lease by its submission (whatever its outcome). Closes its (env, prompt, k) and credits the
+        hotkey's quota; ``delivered=False`` (a group refused for integrity: no work) halves it like an expiry.
+        LookupError: unknown, already ended or expired; PermissionError: another hotkey's lease, or a banned
+        hotkey."""
+        now = float(self.clock()) if now is None else now
+        with self._txn():
+            lease, failure = self._submittable(lease_id, hotkey, now)
+            if failure is None:
                 self.db.execute("UPDATE rl_leases SET state=?, closed_at=? WHERE lease_id=?",
                                 (SUBMITTED, now, lease_id))
-                self.quota.record_submission(hotkey, lease, in_zone=bool(in_zone), now=now)
+                if delivered:
+                    self.quota.record_submission(hotkey, lease, in_zone=bool(in_zone), now=now)
+                else:
+                    self.quota.record_expiry(hotkey, lease, now=now, cause="rejected")
         if failure is not None:
             raise failure
         return replace(lease, state=SUBMITTED)
 
+    # --- bans (set by the audit regime of the submission path) ----------------------------------------------
+    def _banned(self, hotkey: str, now: float) -> bool:
+        row = self.db.execute("SELECT until FROM rl_hotkey_bans WHERE hotkey=?", (hotkey,)).fetchone()
+        return row is not None and now < row[0]
+
+    def ban(self, hotkey: str, until: float) -> None:
+        """No lease and no submission for ``hotkey`` before ``until`` (a running ban is never shortened)."""
+        with self._txn():
+            self.db.execute("INSERT INTO rl_hotkey_bans(hotkey, until) VALUES(?, ?) ON CONFLICT(hotkey) "
+                            "DO UPDATE SET until=MAX(until, excluded.until)", (hotkey, float(until)))
+
+    def banned_until(self, hotkey: str) -> float | None:
+        with self.lock:
+            row = self.db.execute("SELECT until FROM rl_hotkey_bans WHERE hotkey=?", (hotkey,)).fetchone()
+        return None if row is None else float(row[0])
 
     # --- prompt lifecycle (§4.5) -----------------------------------------------------------------------------
     def record_outcome(self, environment: str, prompt_idx: int, checkpoint: int, rewards, verdict: str,
@@ -540,7 +601,7 @@ class LeaseCollector:
 
 
 __all__ = [
-    "BLACKLISTED", "COMMIT_DOMAIN", "COOLDOWN", "COOLING", "EXPIRED", "IN_ZONE", "NONCE_DOMAIN", "OPEN", "QUOTA",
+    "BANNED", "BLACKLISTED", "COMMIT_DOMAIN", "COOLDOWN", "COOLING", "EXPIRED", "IN_ZONE", "NONCE_DOMAIN", "OPEN", "QUOTA",
     "REFUSALS", "SECRET_REVEAL_LAG", "STALE", "SUBMITTED", "TAKEN", "TOO_EASY", "TOO_HARD", "TRUNCATED", "VERDICTS",
     "Lease", "LeaseAnswer", "LeaseBook", "LeaseBookConfig", "LeaseCollector", "LeaseRequest", "Scan",
     "classify_group", "lease_expiry_s", "lease_nonce", "secret_commitment", "verify_reveal",

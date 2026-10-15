@@ -17,7 +17,8 @@ The quota is measured, never declared. Per hotkey:
 
 Out-of-zone submissions are delivered work like in-zone ones (the lease made the miner generate them).
 ``record_submission`` is what the submission path (P3) calls after it closed a lease (``LeaseBook.submit`` does
-it for the caller); ``record_expiry`` is called by the lease book's sweep.
+it for the caller); ``record_expiry`` is called by the lease book's sweep, and by ``LeaseBook.submit`` for a
+submission refused for integrity (``cause="rejected"``: halved like an expiry).
 
 Persistence: ``attach(db, lock)`` stores one JSON row per hotkey in the lease book's SQLite file (the latency
 samples are kept as ``BUCKET_S`` buckets of (count, latency sum), so a row stays small at any rate). Without
@@ -54,7 +55,7 @@ class QuotaConfig:
 
 
 def _counters() -> dict[str, int]:
-    return {"leased": 0, "submitted": 0, "in_zone": 0, "out_of_zone": 0, "expired": 0}
+    return {"leased": 0, "submitted": 0, "in_zone": 0, "out_of_zone": 0, "expired": 0, "rejected": 0}
 
 
 @dataclass
@@ -231,16 +232,19 @@ class QuotaController:
                 self._new_round(entry, now)
             self._save(hotkey, entry)
 
-    def record_expiry(self, hotkey: str, lease, *, now: float) -> None:
-        """A lease ran past its expiry without a submission: halve the quota."""
+    def record_expiry(self, hotkey: str, lease, *, now: float, cause: str = "expired") -> None:
+        """A lease ran past its expiry without a submission (``cause="expired"``), or its submission was refused
+        for integrity (``"rejected"``: malformed or forged work is no delivery): halve the quota."""
+        if cause not in ("expired", "rejected"):
+            raise ValueError("cause must be expired or rejected")
         with self._lock:
             entry = self._entry(hotkey)
             before = self._quota(entry, now)
             entry.in_use = max(0, entry.in_use - 1)
-            entry.counters["expired"] += 1
+            entry.counters[cause] += 1
             entry.cap = self._clamp(before // 2)
             entry.phase = STEADY
-            entry.reason = f"expired lease: quota halved from {before}"
+            entry.reason = f"{cause} lease: quota halved from {before}"
             self._new_round(entry, now)
             self._save(hotkey, entry)
 
