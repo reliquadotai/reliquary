@@ -6537,6 +6537,12 @@ class ValidatorServer:
         app.add_middleware(HttpMetricsMiddleware, metrics=self.http_metrics)
         return app
 
+    def mount_rl_lease_router(self, router: Any) -> None:
+        """Serve the async-RL lease routes (``POST /rl/lease``, ``GET /rl/quota``, ``GET
+        /rl/lease/commitments``) built by ``rl_lease_routes.build_rl_lease_router``. Nothing mounts them in
+        production yet: the submission path (P3) wires the lease book into the service."""
+        self.app.include_router(router)
+
     def mount_corpus_router(
         self,
         entry: Any,

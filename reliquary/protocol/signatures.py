@@ -964,3 +964,35 @@ def verify_rl_allocation_signature(hotkey: str, *, at: int, signature: str, vali
     except (TypeError, ValueError, OverflowError):
         return False
     return verify_hotkey_signature(hotkey, binding, signature)
+
+
+# A miner's RL lease request (rl-async-design.md §4.2), signed for one validator and route. The prompt list is
+# bound in its order as 8-byte integers, so the signed request names exactly the prompts it asks for.
+RL_LEASE_DOMAIN = b"reliquary/rl-lease/v1"
+
+
+def build_rl_lease_binding(*, hotkey: str, at: int, environment: str, checkpoint: int, prompt_ids,
+                           validator_hotkey: str, path: str) -> bytes:
+    if type(at) is not int or at < 0:
+        raise TypeError("at: non-negative integer seconds required")
+    if type(checkpoint) is not int or checkpoint < 0:
+        raise TypeError("checkpoint: non-negative integer required")
+    ids = list(prompt_ids)
+    if any(type(p) is not int or p < 0 for p in ids):
+        raise TypeError("prompt ids: non-negative integers required")
+    prompts = hashlib.sha256(b"".join(p.to_bytes(8, "big", signed=False) for p in ids)).digest()
+    return _bound(RL_LEASE_DOMAIN, [
+        str(hotkey).encode("utf-8"), at.to_bytes(8, "big", signed=False), str(environment).encode("utf-8"),
+        checkpoint.to_bytes(8, "big", signed=False), len(ids).to_bytes(4, "big"), prompts,
+        *_audience(validator_hotkey, path)])
+
+
+def verify_rl_lease_signature(hotkey: str, *, at: int, environment: str, checkpoint: int, prompt_ids,
+                              signature: str, validator_hotkey: str, path: str) -> bool:
+    """False on any failure; fail-closed without bittensor."""
+    try:
+        binding = build_rl_lease_binding(hotkey=hotkey, at=at, environment=environment, checkpoint=checkpoint,
+                                         prompt_ids=prompt_ids, validator_hotkey=validator_hotkey, path=path)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return verify_hotkey_signature(hotkey, binding, signature)
