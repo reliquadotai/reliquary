@@ -740,3 +740,22 @@ New code next to the window path (`emission_price`, `settlement`, `rl_pay`, `wei
   supersedes the window board's `/rl/pay`.
 - Not wired yet (P4/service): a loop that runs `ingest`, `controller.tick(ledger.trained_tokens(...),
   buffer.depth())` when `due`, `settle` and `publish`; the registry entry of the async task.
+
+## 8. Reference miner as built (branch `feat/rl-miner-client`)
+
+- `reliquary/miner/rl_async.py`, CLI `reliquary mine-async` (the window miner `mine` is untouched).
+  - `PromptPlanner`: per env, fed by `GET /rl/prompts/state?since=` (cursor, `more` pages); skips blacklisted
+    prompts, cooldowns until `latest >= until_k`, and prompts held, submitted or `taken` until their scan arrives
+    (or 30 min). Default order: never scanned, then by share of in-zone scans; `priority` overrides it.
+  - `AsyncMiner`: open leases <= `min(quota, --max-open)`, waiting leases <= `--queue-groups`, requests of
+    <= `--lease-batch` at the held k; refusals: `taken` -> wait for the scan, `cooling`/`blacklisted` -> table,
+    `quota` -> quota := open, `stale` -> no lease until newer weights. Earliest expiry generated first; every generated
+    group is submitted with retries until its expiry (`already_submitted` / `lease_submitted` = delivered); open
+    leases journaled for restarts.
+  - Checkpoints: `CheckpointSync` on a CPU copy in a thread; the copy is handed to the generator between two batches
+    and not patched again before (`swap_if_ready`). Submissions carry `k_generated`.
+  - `VllmGroupGenerator`: calls `VLLMRolloutGenerator.generate` per lease (`draw_context`: nonce as randomness,
+    `k<k>` as checkpoint hash); weights pushed with `LLM.collective_rpc` + the model's `load_weights` (needs
+    `VLLM_ALLOW_INSECURE_SERIALIZATION=1`, untested on GPU), fallback `--weight-swap reload` (HF dir + engine rebuild).
+- To align: `POST /rl/submit` body and signature (`encode_submission`, `rl_submit_binding`: DRAFT, `u32le-zlib/1`
+  tokens), the Gumbel profile's nonce keying (`draw_context`), and a multi-prompt vLLM call.

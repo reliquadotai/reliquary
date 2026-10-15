@@ -1,0 +1,931 @@
+"""The reference miner of the asynchronous RL protocol (docs/rl-async-design.md §3, P6/P7 of the implementation map).
+
+It runs next to the window miner (``mine``), which stays for the live run. One process, five loops:
+
+* **prompt state** (``GET /rl/prompts/state?since=``): a local table of every prompt the validator has scanned
+  (``PromptPlanner``), read incrementally from a cursor. Blacklisted prompts are never asked for; a cooldown is
+  dropped once the validator's latest checkpoint reaches its ``until_k``. The default order prefers prompts never
+  scanned, then prompts whose history was in zone; ``priority`` overrides it.
+* **quota** (``GET /rl/quota``): the measured concurrency the validator grants this hotkey. The miner never holds
+  more open leases than ``min(quota, max_open)``, and asks for no more than it can start soon (``queue_groups``):
+  every lease ends in a submission or an expiry, there is no release, and an expiry halves the quota.
+* **leases** (``POST /rl/lease``, signed): batches of prompts at the checkpoint the miner holds. A refusal says only
+  ``taken`` / ``cooling`` / ``blacklisted`` / ``quota`` / ``stale`` per prompt; each moves the planner or the
+  scheduler (``_note_refusal``).
+* **generation**: ``ROLLOUTS`` rollouts per lease, earliest expiry first, through the narrow ``GroupGenerator``
+  interface (the draw itself, Gumbel and runner-keyed, is the profile's: ``VllmGroupGenerator`` calls the existing
+  ``VLLMRolloutGenerator``). New weights are swapped in between two generation batches, never during one; a lease
+  taken at k may be generated on a newer checkpoint, and the submission says which (``k_generated``).
+* **checkpoints** (``GET /rl/checkpoint`` + ``CheckpointSync``): deltas are downloaded and applied to a CPU copy of
+  the weights off the generation path; the follower waits for the swap before patching that copy again.
+
+Every generated group is submitted (``POST /rl/submit``), whatever it looks like, with retries until the lease's
+expiry; a resend of an already received lease counts as delivered (the lease id is the idempotency key). Open leases
+are journaled (``state_dir``) so a restarted miner still generates and submits them before they expire.
+
+The submit body and its signature are a DRAFT (the route is written on another branch): they live in
+``encode_submission`` / ``rl_submit_binding`` and ``HttpRlTransport.submit`` only, to align in one place.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextlib
+import hashlib
+import json
+import logging
+import os
+import random
+import shutil
+import struct
+import time
+import zlib
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Protocol
+
+logger = logging.getLogger(__name__)
+
+ROLLOUTS = 16                       # design §4.4: all 16 rollout indices of a lease, each bound to its nonce
+LEASE_BATCH = 8
+QUEUE_GROUPS = 8                    # leases waiting for generation the miner may hold (beyond the running batch)
+BATCH_GROUPS = 4                    # leases generated per batch; weights are swapped between batches
+STATE_POLL_S = 15.0
+QUOTA_POLL_S = 15.0
+CHECKPOINT_POLL_S = 10.0
+LEASE_POLL_S = 2.0
+SUBMIT_BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 15.0)
+OUTCOME_WAIT_S = 1800.0             # how long a prompt we (or a rival) hold stays out of our picks without a scan
+GENERATION_ATTEMPTS = 2
+UNKNOWN_SAMPLE = 4                  # never-listed prompts drawn per wanted prompt
+
+# The validator's words (``validator/rl_leases.py``), repeated here: the miner does not import the validator.
+TAKEN, COOLING, BLACKLISTED, QUOTA, STALE = "taken", "cooling", "blacklisted", "quota", "stale"
+COOLDOWN, IN_ZONE = "cooldown", "in_zone"
+ALREADY_SUBMITTED = frozenset({"lease_submitted", "already_submitted"})
+TOKENS_ENCODING = "u32le-zlib/1"
+SUBMIT_DOMAIN = b"reliquary/rl-submit/v0-draft"
+
+
+# --------------------------------------------------------------------------------------------------- planner
+@dataclass
+class PromptRecord:
+    """What the validator published about one prompt: its state (None: leasable, ``cooldown`` until
+    ``until_k``, ``blacklisted``) and its scans as (checkpoint, rewards, verdict)."""
+    state: str | None = None
+    until_k: int | None = None
+    scans: list[tuple[int, tuple[float, ...], str]] = field(default_factory=list)
+
+
+def default_priority(record: PromptRecord | None) -> float | None:
+    """Lower is asked first; None never. Never scanned: 0. Scanned: 2 minus its share of in-zone scans (an in-zone
+    prompt that has cooled down is likely in zone again; one that was only too hard comes last)."""
+    if record is None or not record.scans:
+        return 0.0
+    return 2.0 - sum(verdict == IN_ZONE for _, _, verdict in record.scans) / len(record.scans)
+
+
+class PromptPlanner:
+    """One environment's prompt table, fed by ``GET /rl/prompts/state`` pages, and the miner's prompt choice."""
+
+    def __init__(self, environment: str, prompt_range: tuple[int, int], *,
+                 priority: Callable[[PromptRecord | None], float | None] = default_priority,
+                 rng: random.Random | None = None, clock: Callable[[], float] = time.time) -> None:
+        start, end = int(prompt_range[0]), int(prompt_range[1])
+        if not 0 <= start < end:
+            raise ValueError("prompt range must be a non-empty [start, end)")
+        self.environment, self.range = environment, (start, end)
+        self.priority, self._rng, self._clock = priority, rng or random.Random(), clock
+        self.cursor = 0
+        self.latest: int | None = None
+        self.records: dict[int, PromptRecord] = {}
+        self._waiting: dict[int, float] = {}        # prompt -> since: held, submitted or taken, no scan seen yet
+
+    def apply(self, page: Mapping[str, Any]) -> bool:
+        """Fold one page in; True when the validator has a next page ready (``more``)."""
+        if page.get("latest") is not None:
+            self.latest = max(int(page["latest"]), self.latest if self.latest is not None else -1)
+        for scan in page.get("scans", ()):
+            if scan.get("environment", self.environment) != self.environment or int(scan["seq"]) <= self.cursor:
+                continue
+            prompt = int(scan["prompt_idx"])
+            self.records.setdefault(prompt, PromptRecord()).scans.append(
+                (int(scan["checkpoint"]), tuple(float(r) for r in scan["rewards"]), str(scan["verdict"])))
+            self._waiting.pop(prompt, None)
+        for entry in page.get("prompts", ()):
+            if entry.get("environment", self.environment) != self.environment:
+                continue
+            record = self.records.setdefault(int(entry["prompt_idx"]), PromptRecord())
+            record.state = entry.get("state")
+            record.until_k = None if entry.get("until_k") is None else int(entry["until_k"])
+        self.cursor = max(self.cursor, int(page.get("cursor", self.cursor)))
+        return bool(page.get("more"))
+
+    def wait_for_outcome(self, prompt: int) -> None:
+        """Keep ``prompt`` out of the picks until a scan of it arrives (or ``OUTCOME_WAIT_S``): we hold it, we
+        submitted it, or a rival holds it (``taken``)."""
+        self._waiting[int(prompt)] = self._clock()
+
+    def mark(self, prompt: int, state: str) -> None:
+        """A lease refusal the table did not know yet (``cooling`` / ``blacklisted``)."""
+        record = self.records.setdefault(int(prompt), PromptRecord())
+        if state == BLACKLISTED:
+            record.state, record.until_k = BLACKLISTED, None
+        else:
+            self.wait_for_outcome(prompt)
+
+    def leasable(self, prompt: int) -> bool:
+        if not self.range[0] <= prompt < self.range[1]:
+            return False
+        since = self._waiting.get(prompt)
+        if since is not None:
+            if self._clock() - since < OUTCOME_WAIT_S:
+                return False
+            del self._waiting[prompt]
+        record = self.records.get(prompt)
+        if record is None:
+            return True
+        if record.state == BLACKLISTED:
+            return False
+        if record.state == COOLDOWN:
+            if record.until_k is not None and self.latest is not None and self.latest >= record.until_k:
+                record.state, record.until_k = None, None       # the cooldown is over (the validator's rule)
+            else:
+                return False
+        return True
+
+    def pick(self, n: int) -> list[int]:
+        """Up to ``n`` leasable prompts in priority order (ties at random): the known ones, plus a random sample of
+        never-listed prompts of the range."""
+        if n <= 0:
+            return []
+        candidates = {p for p in self.records if self.leasable(p)}
+        start, end = self.range
+        for _ in range(n * UNKNOWN_SAMPLE):
+            prompt = self._rng.randrange(start, end)
+            if prompt not in self.records and self.leasable(prompt):
+                candidates.add(prompt)
+        ranked = []
+        for prompt in candidates:
+            score = self.priority(self.records.get(prompt))
+            if score is not None:
+                ranked.append((float(score), self._rng.random(), prompt))
+        return [prompt for _, _, prompt in sorted(ranked)[:n]]
+
+
+# ------------------------------------------------------------------------------------------------ wire types
+@dataclass(frozen=True)
+class HeldLease:
+    lease_id: str
+    environment: str
+    prompt_idx: int
+    checkpoint: int
+    nonce: str
+    expires_at: float
+    issued_at: float = 0.0
+
+    @classmethod
+    def from_wire(cls, body: Mapping[str, Any]) -> HeldLease:
+        return cls(str(body["lease_id"]), str(body["environment"]), int(body["prompt_idx"]),
+                   int(body["checkpoint"]), str(body["nonce"]), float(body["expires_at"]),
+                   float(body.get("issued_at", 0.0)))
+
+    def to_wire(self) -> dict:
+        return {"lease_id": self.lease_id, "environment": self.environment, "prompt_idx": self.prompt_idx,
+                "checkpoint": self.checkpoint, "nonce": self.nonce, "expires_at": self.expires_at,
+                "issued_at": self.issued_at}
+
+
+class RequestRefused(Exception):
+    """A route answered with a refusal for the whole request. ``retryable``: 429/503/5xx or a transport error."""
+
+    def __init__(self, reason: str, *, retryable: bool, retry_after: float | None = None) -> None:
+        super().__init__(reason)
+        self.reason, self.retryable, self.retry_after = reason, retryable, retry_after
+
+
+def encode_tokens(rollouts: Sequence[Sequence[int]]) -> dict:
+    """Completion token ids of the group, compressed: lengths + zlib of the little-endian u32 concatenation."""
+    flat = [int(t) for rollout in rollouts for t in rollout]
+    raw = struct.pack(f"<{len(flat)}I", *flat)
+    return {"encoding": TOKENS_ENCODING, "lengths": [len(r) for r in rollouts],
+            "data": base64.b64encode(zlib.compress(raw, 6)).decode("ascii")}
+
+
+def decode_tokens(body: Mapping[str, Any]) -> list[list[int]]:
+    if body.get("encoding") != TOKENS_ENCODING:
+        raise ValueError("unknown token encoding")
+    raw = zlib.decompress(base64.b64decode(body["data"]))
+    flat = struct.unpack(f"<{len(raw) // 4}I", raw)
+    out, at = [], 0
+    for length in body["lengths"]:
+        out.append(list(flat[at:at + int(length)]))
+        at += int(length)
+    if at != len(flat):
+        raise ValueError("lengths do not cover the tokens")
+    return out
+
+
+def encode_submission(lease: HeldLease, rollouts: Sequence[Sequence[int]], k_generated: int) -> dict:
+    """The submission payload of one lease (DRAFT until ``POST /rl/submit`` lands): the lease, the checkpoint the
+    group was generated on, and the 16 completions in rollout-index order. Tokens only: no logprob, no proof."""
+    if len(rollouts) != ROLLOUTS:
+        raise ValueError(f"a lease is submitted with all {ROLLOUTS} rollouts")
+    return {"lease_id": lease.lease_id, "environment": lease.environment, "prompt_idx": lease.prompt_idx,
+            "checkpoint": lease.checkpoint, "k_generated": int(k_generated), "tokens": encode_tokens(rollouts)}
+
+
+def rl_submit_binding(*, hotkey: str, at: int, payload: Mapping[str, Any], validator_hotkey: str,
+                      path: str) -> bytes:
+    """DRAFT binding of a submission (to move to ``protocol/signatures.py`` with the route): hotkey, time, the
+    payload's canonical SHA-256 and the audience, length-prefixed like the other RL bindings."""
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).digest()
+    h = hashlib.sha256(SUBMIT_DOMAIN)
+    for part in (hotkey.encode(), int(at).to_bytes(8, "big"), digest, validator_hotkey.encode(), path.encode()):
+        h.update(len(part).to_bytes(4, "big"))
+        h.update(part)
+    return h.digest()
+
+
+class RlTransport(Protocol):
+    async def prompt_state(self, since: int, environment: str) -> dict: ...
+    async def quota(self) -> dict: ...
+    async def lease(self, environment: str, checkpoint: int, prompt_ids: Sequence[int]) -> dict: ...
+    async def submit(self, payload: dict) -> dict: ...
+    async def checkpoint(self) -> dict | None: ...
+
+
+class GroupGenerator(Protocol):
+    """The narrow generation interface. ``generate`` returns, per lease, ``ROLLOUTS`` completions (token ids, stop
+    token kept) drawn with the lease's nonce on the weights loaded last; ``load_weights`` replaces those weights
+    (called between two ``generate`` calls only)."""
+    def generate(self, leases: Sequence[HeldLease]) -> list[list[list[int]]]: ...
+    def load_weights(self, state: Mapping[str, Any], version: int) -> None: ...
+
+
+# ------------------------------------------------------------------------------------------- HTTP transport
+class HttpRlTransport:
+    """The validator's routes over ``httpx.AsyncClient``; lease and submit bodies are signed by the hotkey for the
+    validator and the route."""
+
+    def __init__(self, client, *, base_url: str, hotkey: str, validator_hotkey: str,
+                 sign_binding: Callable[[bytes], str], prefix: str = "/rl",
+                 clock: Callable[[], float] = time.time) -> None:
+        self._client, self._base = client, base_url.rstrip("/")
+        self.hotkey, self.validator_hotkey, self._prefix = hotkey, validator_hotkey, prefix
+        self._sign, self._clock = sign_binding, clock
+
+    async def _call(self, method: str, path: str, **kwargs) -> Any:
+        import httpx
+
+        try:
+            response = await self._client.request(method, self._base + path, **kwargs)
+        except httpx.HTTPError as exc:
+            raise RequestRefused(type(exc).__name__, retryable=True) from exc
+        if response.status_code == 200:
+            return response.json()
+        try:
+            reason = str(response.json().get("reason") or response.status_code)
+        except ValueError:
+            reason = str(response.status_code)
+        retry_after = response.headers.get("Retry-After")
+        raise RequestRefused(reason, retryable=response.status_code in (429, 503) or response.status_code >= 500,
+                             retry_after=float(retry_after) if retry_after and retry_after.isdigit() else None)
+
+    async def prompt_state(self, since: int, environment: str) -> dict:
+        return await self._call("GET", f"{self._prefix}/prompts/state",
+                                params={"since": str(int(since)), "environment": environment})
+
+    async def quota(self) -> dict:
+        return await self._call("GET", f"{self._prefix}/quota", params={"hotkey": self.hotkey})
+
+    async def lease(self, environment: str, checkpoint: int, prompt_ids: Sequence[int]) -> dict:
+        from reliquary.protocol.signatures import build_rl_lease_binding
+
+        path = f"{self._prefix}/lease"
+        at, ids = int(self._clock()), [int(p) for p in prompt_ids]
+        body = {"miner_hotkey": self.hotkey, "at": at, "environment": environment, "checkpoint": int(checkpoint),
+                "prompt_ids": ids}
+        body["signature"] = self._sign(build_rl_lease_binding(
+            hotkey=self.hotkey, at=at, environment=environment, checkpoint=int(checkpoint), prompt_ids=ids,
+            validator_hotkey=self.validator_hotkey, path=path))
+        return await self._call("POST", path, json=body)
+
+    async def submit(self, payload: dict) -> dict:
+        path = f"{self._prefix}/submit"
+        at = int(self._clock())                         # a fresh signature per attempt; the payload is the same
+        body = {"miner_hotkey": self.hotkey, "at": at, **payload}
+        body["signature"] = self._sign(rl_submit_binding(hotkey=self.hotkey, at=at, payload=payload,
+                                                         validator_hotkey=self.validator_hotkey, path=path))
+        return await self._call("POST", path, json=body)
+
+    async def checkpoint(self) -> dict | None:
+        try:
+            return await self._call("GET", f"{self._prefix}/checkpoint")
+        except RequestRefused as exc:
+            if exc.retryable:
+                return None
+            raise
+
+
+class DryRunTransport:
+    """An in-process validator for ``--dry-run`` and tests: grants every asked prompt within its quota (unless told
+    otherwise), derives nonces from (env, prompt, k), records submissions and serves no checkpoint."""
+
+    def __init__(self, *, quota: int = 8, expiry_s: float = 600.0, latest: int = 0,
+                 clock: Callable[[], float] = time.time) -> None:
+        self.quota_value, self.expiry_s, self.latest, self._clock = quota, expiry_s, latest, clock
+        self.open: dict[str, HeldLease] = {}
+        self.submissions: list[dict] = []
+        self.lease_calls: list[tuple[str, int, list[int]]] = []
+        self.refuse: dict[int, str] = {}                # prompt -> refusal reason
+        self.pages: list[dict] = []                     # prompt-state pages served in order, then empty ones
+        self.submit_failures: list[RequestRefused] = [] # raised by the next submits, in order
+        self.checkpoints: list[dict | None] = []
+        self.state_calls: list[int] = []
+
+    async def prompt_state(self, since: int, environment: str) -> dict:
+        self.state_calls.append(int(since))
+        if self.pages:
+            return self.pages.pop(0)
+        return {"latest": self.latest, "cursor": since, "more": False, "scans": [], "prompts": []}
+
+    async def quota(self) -> dict:
+        return {"quota": self.quota_value, "in_use": len(self.open), "latest": self.latest}
+
+    async def lease(self, environment: str, checkpoint: int, prompt_ids: Sequence[int]) -> dict:
+        self.lease_calls.append((environment, int(checkpoint), [int(p) for p in prompt_ids]))
+        now, leases, refused = self._clock(), [], []
+        for prompt in prompt_ids:
+            if prompt in self.refuse:
+                refused.append({"prompt_idx": prompt, "reason": self.refuse[prompt]})
+            elif len(self.open) >= self.quota_value:
+                refused.append({"prompt_idx": prompt, "reason": QUOTA})
+            else:
+                nonce = hashlib.sha256(f"{environment}/{prompt}/{checkpoint}".encode()).hexdigest()
+                lease = HeldLease(f"dry-{len(self.lease_calls)}-{prompt}", environment, int(prompt),
+                                  int(checkpoint), nonce, now + self.expiry_s, now)
+                self.open[lease.lease_id] = lease
+                leases.append(lease.to_wire())
+        return {"leases": leases, "refused": refused, "latest": self.latest, "quota": self.quota_value,
+                "in_use": len(self.open)}
+
+    async def submit(self, payload: dict) -> dict:
+        if self.submit_failures:
+            raise self.submit_failures.pop(0)
+        if payload["lease_id"] not in self.open:
+            raise RequestRefused("lease_unknown", retryable=False)
+        del self.open[payload["lease_id"]]
+        self.submissions.append(payload)
+        return {"verdict": "received"}
+
+    async def checkpoint(self) -> dict | None:
+        return self.checkpoints.pop(0) if self.checkpoints else None
+
+
+# ------------------------------------------------------------------------------------------------ the miner
+@dataclass(frozen=True)
+class AsyncMinerConfig:
+    environments: tuple[str, ...]
+    lease_batch: int = LEASE_BATCH
+    max_open: int = 64                  # the miner's own ceiling on open leases (its GPU); the quota binds first
+    queue_groups: int = QUEUE_GROUPS
+    batch_groups: int = BATCH_GROUPS
+    state_poll_s: float = STATE_POLL_S
+    quota_poll_s: float = QUOTA_POLL_S
+    checkpoint_poll_s: float = CHECKPOINT_POLL_S
+    lease_poll_s: float = LEASE_POLL_S
+    submit_backoff_s: tuple[float, ...] = SUBMIT_BACKOFF_S
+    state_dir: str | None = None        # where open leases are journaled (restart safety)
+
+    def __post_init__(self) -> None:
+        if not self.environments:
+            raise ValueError("at least one environment is needed")
+        if min(self.lease_batch, self.max_open, self.queue_groups, self.batch_groups) < 1:
+            raise ValueError("lease batch, max open, queue and batch sizes must be positive")
+
+
+class AsyncMiner:
+    def __init__(self, config: AsyncMinerConfig, *, transport: RlTransport, generator: GroupGenerator,
+                 planners: Mapping[str, PromptPlanner], checkpoint_sync=None, loaded_version: int | None = None,
+                 state: dict | None = None, rng: random.Random | None = None,
+                 env_weights: Callable[[], Mapping[str, float] | None] | None = None,
+                 clock: Callable[[], float] = time.time) -> None:
+        missing = set(config.environments) - set(planners)
+        if missing:
+            raise ValueError(f"no planner for {sorted(missing)}")
+        self.config, self.transport, self.generator = config, transport, generator
+        self.planners, self._sync = dict(planners), checkpoint_sync
+        self._rng, self._clock = rng or random.Random(), clock
+        self._env_weights = env_weights
+        self.loaded_version = loaded_version            # what the generator holds; leases are asked at it
+        self._state, self._state_version = state, loaded_version   # the CPU copy the follower patches
+        self.open: dict[str, HeldLease] = {}            # granted, not yet submitted nor given up
+        self.queue: list[HeldLease] = []                # open and waiting for generation
+        self.quota: int | None = None
+        self.stats = {"leased": 0, "submitted": 0, "submit_failed": 0, "expired_unsent": 0, "refused": {}}
+        self._attempts: dict[str, int] = {}
+        self._submits: set[asyncio.Task] = set()
+        self._ready = asyncio.Event()                   # the follower holds new weights for the generator
+        self._wake_generation = asyncio.Event()
+        self._wake_lease = asyncio.Event()
+        self._wake_checkpoint = asyncio.Event()
+        self._stale = False                             # a ``stale`` refusal: lease nothing until newer weights
+        self._env_turn = 0
+        self._load_journal()
+
+    # --- prompt state and quota ------------------------------------------------------------------------
+    async def refresh_state(self) -> None:
+        for name, planner in self.planners.items():
+            more = True
+            while more:
+                more = planner.apply(await self.transport.prompt_state(planner.cursor, name))
+
+    async def refresh_quota(self) -> None:
+        answer = await self.transport.quota()
+        self.quota = int(answer["quota"])
+        logger.info("rl miner: k=%s quota=%d open=%d queued=%d %s", self.loaded_version, self.quota,
+                    len(self.open), len(self.queue), self.stats)
+
+    def lease_room(self) -> int:
+        """How many leases to ask for now: within ``min(quota, max_open)`` open, and no more waiting for generation
+        than ``queue_groups`` (a lease waiting long risks its expiry), at most ``lease_batch`` per request."""
+        if self.loaded_version is None or self._stale or self.quota is None:
+            return 0
+        cap = min(self.quota, self.config.max_open) - len(self.open)
+        return max(0, min(cap, self.config.queue_groups - len(self.queue), self.config.lease_batch))
+
+    def _next_environment(self) -> str:
+        names = list(self.config.environments)
+        weights = self._env_weights() if self._env_weights is not None else None
+        if weights and any(float(weights.get(n, 0.0)) > 0 for n in names):
+            return self._rng.choices(names, [max(0.0, float(weights.get(n, 0.0))) for n in names])[0]
+        self._env_turn = (self._env_turn + 1) % len(names)
+        return names[self._env_turn]
+
+    # --- leases --------------------------------------------------------------------------------------
+    async def lease_more(self) -> int:
+        """One lease request if there is room; the number of leases granted."""
+        room = self.lease_room()
+        if room <= 0:
+            return 0
+        environment = self._next_environment()
+        planner = self.planners[environment]
+        prompts = planner.pick(room)
+        if not prompts:
+            return 0
+        k = int(self.loaded_version)
+        try:
+            answer = await self.transport.lease(environment, k, prompts)
+        except RequestRefused as exc:
+            logger.warning("lease request refused: %s", exc.reason)
+            if exc.retryable:
+                wait = self.config.lease_poll_s if exc.retry_after is None else exc.retry_after
+            else:
+                wait = 30.0                           # a refusal the miner must fix (registration, signature)
+            await asyncio.sleep(min(wait, 60.0))
+            return 0
+        if answer.get("quota") is not None:
+            self.quota = int(answer["quota"])
+        granted = [HeldLease.from_wire(item) for item in answer.get("leases", ())]
+        for lease in granted:
+            if lease.lease_id in self.open:
+                continue
+            self.open[lease.lease_id] = lease
+            self.queue.append(lease)
+            planner.wait_for_outcome(lease.prompt_idx)
+        for item in answer.get("refused", ()):
+            self._note_refusal(planner, int(item["prompt_idx"]), str(item["reason"]))
+        self.stats["leased"] += len(granted)
+        if granted:
+            self._journal()
+            self._wake_generation.set()
+            self._wake_lease.set()                    # there may be room for another request
+        return len(granted)
+
+    def _note_refusal(self, planner: PromptPlanner, prompt: int, reason: str) -> None:
+        counts = self.stats["refused"]
+        counts[reason] = counts.get(reason, 0) + 1
+        if reason == TAKEN:
+            planner.wait_for_outcome(prompt)          # a rival holds (prompt, k) or submitted it
+        elif reason in (COOLING, BLACKLISTED):
+            planner.mark(prompt, reason)              # our table is behind: the next state poll catches up
+        elif reason == QUOTA:
+            self.quota = len(self.open)               # the validator counts fewer: wait for its next quota
+        elif reason == STALE:
+            self._stale = True                        # our k is retired or not adopted yet: sync first
+            self._wake_checkpoint.set()
+
+    # --- generation and weights ----------------------------------------------------------------------
+    async def swap_if_ready(self) -> bool:
+        """Push the follower's weights into the generator: called between generation batches only."""
+        if not self._ready.is_set():
+            return False
+        version = int(self._state_version)
+        await asyncio.to_thread(self.generator.load_weights, self._state, version)
+        logger.info("generator now on checkpoint %d (was %s)", version, self.loaded_version)
+        self.loaded_version, self._stale = version, False
+        self._ready.clear()
+        self._wake_lease.set()
+        return True
+
+    def _take_batch(self) -> list[HeldLease]:
+        now = self._clock()
+        self.queue.sort(key=lambda lease: lease.expires_at)        # earliest expiry first
+        batch: list[HeldLease] = []
+        while self.queue and len(batch) < self.config.batch_groups:
+            lease = self.queue.pop(0)
+            if lease.expires_at <= now:
+                logger.warning("lease %s expired before generation", lease.lease_id[:12])
+                self.stats["expired_unsent"] += 1
+                self._close(lease)
+                continue
+            batch.append(lease)
+        return batch
+
+    async def generate_once(self) -> int:
+        """Swap weights if new ones are ready, then generate one batch and hand each group to its submission."""
+        await self.swap_if_ready()
+        if self.loaded_version is None:
+            return 0
+        batch = self._take_batch()
+        if not batch:
+            return 0
+        version = int(self.loaded_version)
+        self._wake_lease.set()                                     # the queue has room again
+        try:
+            groups = await asyncio.to_thread(self.generator.generate, batch)
+            if len(groups) != len(batch) or any(len(g) != ROLLOUTS for g in groups):
+                raise ValueError(f"the generator must return {ROLLOUTS} rollouts per lease")
+        except Exception:
+            logger.exception("generation of %d leases failed", len(batch))
+            for lease in batch:
+                tries = self._attempts[lease.lease_id] = self._attempts.get(lease.lease_id, 0) + 1
+                if tries < GENERATION_ATTEMPTS:
+                    self.queue.append(lease)
+                else:
+                    logger.error("lease %s given up after %d generation failures", lease.lease_id[:12], tries)
+                    self._close(lease)
+            return 0
+        for lease, rollouts in zip(batch, groups):
+            task = asyncio.create_task(self.submit(lease, rollouts, version))
+            self._submits.add(task)
+            task.add_done_callback(self._submits.discard)
+        return len(batch)
+
+    # --- submission ----------------------------------------------------------------------------------
+    async def submit(self, lease: HeldLease, rollouts: Sequence[Sequence[int]], k_generated: int) -> bool:
+        """Submit one group until it is received, refused for good, or its lease has expired. The payload is built
+        once: a resend after a lost answer is the same submission (the lease id is the idempotency key)."""
+        payload = encode_submission(lease, rollouts, k_generated)
+        attempt = 0
+        try:
+            while True:
+                try:
+                    await self.transport.submit(payload)
+                    self.stats["submitted"] += 1
+                    return True
+                except RequestRefused as exc:
+                    if exc.reason in ALREADY_SUBMITTED:
+                        self.stats["submitted"] += 1
+                        return True
+                    if not exc.retryable:
+                        logger.warning("submission of lease %s refused: %s", lease.lease_id[:12], exc.reason)
+                        self.stats["submit_failed"] += 1
+                        return False
+                    delay = exc.retry_after
+                backoff = self.config.submit_backoff_s
+                delay = delay if delay is not None else backoff[min(attempt, len(backoff) - 1)]
+                attempt += 1
+                left = lease.expires_at - self._clock()
+                if left <= 0:
+                    logger.warning("lease %s expired while its submission was retried", lease.lease_id[:12])
+                    self.stats["submit_failed"] += 1
+                    return False
+                await asyncio.sleep(min(delay, max(0.0, left - 0.5)))
+        finally:
+            self._close(lease)
+            self.planners[lease.environment].wait_for_outcome(lease.prompt_idx)
+
+    def _close(self, lease: HeldLease) -> None:
+        self.open.pop(lease.lease_id, None)
+        self._attempts.pop(lease.lease_id, None)
+        self._journal()
+        self._wake_lease.set()
+
+    async def drain(self) -> None:
+        """Wait for every submission in flight."""
+        while self._submits:
+            await asyncio.gather(*list(self._submits), return_exceptions=True)
+
+    # --- checkpoints ---------------------------------------------------------------------------------
+    async def follow_checkpoint_once(self) -> int | None:
+        """One poll of ``GET /rl/checkpoint``: when the index is ahead of our CPU copy, bring the copy there (off the
+        event loop) and offer it to the generator; returns the new version. The copy is not touched again until the
+        generator has taken it (``swap_if_ready``)."""
+        if self._sync is None or self._ready.is_set():
+            return None
+        response = await self.transport.checkpoint()
+        if not response:
+            return None
+        latest = int(response["index"]["latest"]["version"])
+        if self._state_version is not None and latest <= self._state_version:
+            self._stale = False                       # nothing newer to fetch: let the next lease request retry
+            return None
+        state, version, plan = await asyncio.to_thread(self._sync.sync, response, self._state, self._state_version)
+        logger.info("checkpoint %d rebuilt (%s, %d bytes)", version,
+                    "anchor" if plan.anchor is not None else f"{len(plan.deltas)} deltas", plan.bytes)
+        self._state, self._state_version = state, version
+        self._ready.set()
+        self._wake_generation.set()
+        return version
+
+    # --- journal -------------------------------------------------------------------------------------
+    def _journal_path(self) -> Path | None:
+        return None if not self.config.state_dir else Path(self.config.state_dir) / "rl-open-leases.json"
+
+    def _journal(self) -> None:
+        path = self._journal_path()
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps([lease.to_wire() for lease in self.open.values()]))
+        os.replace(tmp, path)
+
+    def _load_journal(self) -> None:
+        path = self._journal_path()
+        if path is None or not path.exists():
+            return
+        now = self._clock()
+        try:
+            leases = [HeldLease.from_wire(item) for item in json.loads(path.read_text())]
+        except (ValueError, KeyError, TypeError):
+            logger.warning("unreadable lease journal %s ignored", path)
+            return
+        for lease in leases:
+            if lease.expires_at > now and lease.environment in self.planners:
+                self.open[lease.lease_id] = lease
+                self.queue.append(lease)
+                self.planners[lease.environment].wait_for_outcome(lease.prompt_idx)
+        if self.queue:
+            logger.info("%d open leases resumed from the journal", len(self.queue))
+
+    # --- loops ---------------------------------------------------------------------------------------
+    async def _every(self, step: Callable[[], Any], period: float, wake: asyncio.Event | None,
+                     stop: asyncio.Event, name: str) -> None:
+        while not stop.is_set():
+            try:
+                await step()
+            except RequestRefused as exc:
+                logger.warning("%s: %s", name, exc.reason)
+            except Exception:
+                logger.exception("%s failed", name)
+            waits = [asyncio.ensure_future(stop.wait())]
+            if wake is not None:
+                waits.append(asyncio.ensure_future(wake.wait()))
+            done, pending = await asyncio.wait(waits, timeout=period, return_when=asyncio.FIRST_COMPLETED)
+            for future in pending:
+                future.cancel()
+            if wake is not None:
+                wake.clear()
+
+    async def _generation_loop(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            if await self.generate_once():
+                continue
+            self._wake_generation.clear()
+            if (self.queue and self.loaded_version is not None) or self._ready.is_set():
+                continue
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._wake_generation.wait(), timeout=self.config.lease_poll_s)
+
+    async def run(self, stop: asyncio.Event | None = None) -> None:
+        stop = stop or asyncio.Event()
+        config = self.config
+        tasks = [
+            asyncio.create_task(self._every(self.refresh_state, config.state_poll_s, None, stop, "prompt state")),
+            asyncio.create_task(self._every(self.refresh_quota, config.quota_poll_s, None, stop, "quota")),
+            asyncio.create_task(self._every(self.follow_checkpoint_once, config.checkpoint_poll_s,
+                                            self._wake_checkpoint, stop, "checkpoint")),
+            asyncio.create_task(self._every(self.lease_more, config.lease_poll_s, self._wake_lease, stop, "lease")),
+            asyncio.create_task(self._generation_loop(stop)),
+        ]
+        try:
+            await stop.wait()
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            # Leases already generated are still submitted: every lease ends in a submission when it can.
+            await self.drain()
+
+
+# ------------------------------------------------------------------------------------ vLLM generation adapter
+def draw_context(lease: HeldLease) -> dict:
+    """What the existing generator's draw is keyed with for one lease. The Gumbel profile
+    (``feat/gumbel-forced-draw``) keeps the ``randomness`` / ``prompt_idx`` / ``checkpoint_hash`` request fields;
+    under leases the nonce is the randomness and the checkpoint is k. To align with the profile's nonce keying."""
+    return {"randomness": lease.nonce, "prompt_idx": lease.prompt_idx, "checkpoint_hash": f"k{lease.checkpoint}"}
+
+
+def write_hf_dir(state: Mapping[str, Any], base_model_dir: str | Path, dest: str | Path) -> Path:
+    """A loadable HF directory: the base model's config and tokenizer files plus ``state`` as safetensors shards."""
+    from reliquary.shared.ckpt_delta import write_anchor_shards
+
+    base, dest = Path(base_model_dir), Path(dest)
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    for item in base.iterdir():
+        if item.is_file() and not item.name.endswith((".safetensors", ".safetensors.index.json", ".bin")):
+            shutil.copy2(item, dest / item.name)
+    write_anchor_shards(state, dest)
+    return dest
+
+
+def _load_weights_from_files(worker, paths: list[str]) -> bool:
+    """Runs inside each vLLM worker (``LLM.collective_rpc``): the model's own ``load_weights`` over the shards."""
+    from safetensors.torch import load_file
+
+    model = worker.model_runner.model
+    for path in paths:
+        model.load_weights(weights=load_file(path).items())
+    return True
+
+
+class VllmGroupGenerator:
+    """``GroupGenerator`` over the existing ``VLLMRolloutGenerator`` (its draw is the active profile's).
+
+    Weights: ``swap="push"`` writes the state to shards in ``scratch_dir`` (``/dev/shm`` by default) and has every
+    worker load them through the model's ``load_weights`` (``LLM.collective_rpc``), then resets the prefix cache;
+    a failure falls back to ``"reload"``, which writes an HF directory and rebuilds the engine (a full model load).
+    """
+
+    def __init__(self, *, base_model_dir: str, work_dir: str, swap: str = "push", scratch_dir: str | None = None,
+                 engine_kwargs: Mapping[str, Any] | None = None) -> None:
+        if swap not in ("push", "reload"):
+            raise ValueError("swap must be push or reload")
+        from transformers import AutoTokenizer, GenerationConfig
+
+        from reliquary.shared.modeling import resolve_eos_token_ids
+
+        self.base, self.work, self.swap = Path(base_model_dir), Path(work_dir), swap
+        self.scratch = Path(scratch_dir or ("/dev/shm" if Path("/dev/shm").is_dir() else work_dir)) / "rl-push"
+        self.tokenizer = AutoTokenizer.from_pretrained(str(self.base))
+        try:
+            generation = GenerationConfig.from_pretrained(str(self.base))
+        except OSError:
+            generation = None
+        model_meta = None if generation is None else type("Meta", (), {"generation_config": generation})()
+        self.eos_ids = sorted(resolve_eos_token_ids(model_meta, self.tokenizer))
+        self._engine_kwargs = dict(engine_kwargs or {})
+        self._engine = None
+        self._dir: Path | None = None
+        self._envs: dict[str, Any] = {}
+        if swap == "push":
+            # collective_rpc ships a function to the workers: allowed before the engine starts them.
+            os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+    def _prompt(self, environment: str, prompt_idx: int) -> list[int]:
+        from reliquary.constants import thinking_for_environment
+        from reliquary.environment import load_environment
+        from reliquary.protocol.tokens import encode_prompt
+
+        env = self._envs.get(environment)
+        if env is None:
+            env = self._envs[environment] = load_environment(environment)
+        problem = env.get_problem(prompt_idx)
+        return encode_prompt(self.tokenizer, problem["prompt"], thinking=thinking_for_environment(environment))
+
+    def generate(self, leases: Sequence[HeldLease]) -> list[list[list[int]]]:
+        from reliquary.constants import max_new_tokens_for_environment
+
+        if self._engine is None:
+            raise RuntimeError("no weights loaded")
+        # One prompt per call: the generator takes one prompt. A multi-prompt call would fill vLLM better.
+        return [self._engine.generate(self._prompt(lease.environment, lease.prompt_idx), rollouts=ROLLOUTS,
+                                      max_new_tokens=max_new_tokens_for_environment(lease.environment),
+                                      eos_ids=self.eos_ids, **draw_context(lease))
+                for lease in leases]
+
+    def _reload(self, state: Mapping[str, Any], version: int) -> None:
+        from reliquary.miner.vllm_generation import VLLMRolloutGenerator
+
+        new_dir = write_hf_dir(state, self.base, self.work / f"weights-{version:08d}")
+        if self._engine is None:
+            self._engine = VLLMRolloutGenerator(str(new_dir), **self._engine_kwargs)
+        else:
+            self._engine.reload(str(new_dir))
+        if self._dir is not None and self._dir != new_dir:
+            shutil.rmtree(self._dir, ignore_errors=True)
+        self._dir = new_dir
+
+    def _push(self, state: Mapping[str, Any]) -> None:
+        from reliquary.shared.ckpt_delta import write_anchor_shards
+
+        shutil.rmtree(self.scratch, ignore_errors=True)
+        try:
+            paths = [str(p) for p in write_anchor_shards(state, self.scratch)]
+            llm = self._engine._llm
+            llm.collective_rpc(_load_weights_from_files, args=(paths,))
+            llm.reset_prefix_cache()
+        finally:
+            shutil.rmtree(self.scratch, ignore_errors=True)
+
+    def load_weights(self, state: Mapping[str, Any], version: int) -> None:
+        if self._engine is None or self.swap == "reload":
+            self._reload(state, version)
+            return
+        try:
+            self._push(state)
+        except Exception:
+            logger.exception("in-place weight push failed; rebuilding the engine on checkpoint %d", version)
+            self._reload(state, version)
+
+
+class FakeGroupGenerator:
+    """A CPU generator for ``--dry-run --fake-generator`` and tests: completions derived from the nonce."""
+
+    def __init__(self, length: int = 8) -> None:
+        self.length = length
+        self.calls: list[tuple[str, ...]] = []
+        self.loads: list[int] = []
+        self.version: int | None = None
+        self.versions_used: list[int | None] = []
+
+    def generate(self, leases: Sequence[HeldLease]) -> list[list[list[int]]]:
+        self.calls.append(tuple(lease.lease_id for lease in leases))
+        self.versions_used.append(self.version)
+        return [[[int(lease.nonce[(r + t) % len(lease.nonce)], 16) for t in range(self.length)]
+                 for r in range(ROLLOUTS)] for lease in leases]
+
+    def load_weights(self, state, version: int) -> None:
+        self.loads.append(int(version))
+        self.version = int(version)
+
+
+# ------------------------------------------------------------------------------------------------ entry point
+async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, validator_hotkey: str, wallet=None,
+                          base_model_dir: str | None = None, work_dir: str, initial_dir: str | None = None,
+                          initial_version: int | None = None, swap: str = "push", dry_run: bool = False,
+                          fake_generator: bool = False, engine_kwargs: Mapping[str, Any] | None = None,
+                          prompt_ranges: Mapping[str, tuple[int, int]] | None = None) -> None:
+    """Build the transport, generator, planners and checkpoint follower, and run until interrupted."""
+    import httpx
+
+    from reliquary.miner.ckpt_sync import CheckpointSync
+    from reliquary.miner.rl_pay_client import PayWeights
+    from reliquary.shared.ckpt_delta import load_anchor_shards
+
+    ranges = dict(prompt_ranges or {})
+    for name in config.environments:
+        if name not in ranges:
+            from reliquary.environment import load_environment
+            from reliquary.protocol.rl_prompt_ranges import rl_prompt_range
+
+            ranges[name] = rl_prompt_range(name, len(load_environment(name)))
+    planners = {name: PromptPlanner(name, ranges[name]) for name in config.environments}
+    if fake_generator:
+        generator: GroupGenerator = FakeGroupGenerator()
+    else:
+        if not base_model_dir:
+            raise ValueError("--base-model is required to generate (config and tokenizer files)")
+        generator = VllmGroupGenerator(base_model_dir=base_model_dir, work_dir=work_dir, swap=swap,
+                                       engine_kwargs=engine_kwargs)
+    state, loaded = None, None
+    if initial_dir is not None:
+        if initial_version is None:
+            raise ValueError("--initial-version is required with --initial-checkpoint")
+        state = load_anchor_shards(sorted(Path(initial_dir).glob("*.safetensors")))
+        generator.load_weights(state, int(initial_version))
+        loaded = int(initial_version)
+    elif dry_run and fake_generator:
+        generator.load_weights({}, 0)
+        loaded = 0
+    elif dry_run:
+        raise ValueError("a dry run generates on --initial-checkpoint (or --fake-generator): it fetches nothing")
+    async with contextlib.AsyncExitStack() as stack:
+        if dry_run:
+            transport: RlTransport = DryRunTransport()
+            sync, weights = None, None
+        else:
+            client = await stack.enter_async_context(httpx.AsyncClient(timeout=60.0))
+            hotkey = wallet.hotkey.ss58_address
+            transport = HttpRlTransport(client, base_url=validator_url, hotkey=hotkey,
+                                        validator_hotkey=validator_hotkey,
+                                        sign_binding=lambda binding: wallet.hotkey.sign(binding).hex())
+            sync = CheckpointSync(validator_hotkey=validator_hotkey, work_dir=Path(work_dir) / "ckpt-download")
+            weights = PayWeights(validator_url).weights
+        miner = AsyncMiner(config, transport=transport, generator=generator, planners=planners,
+                           checkpoint_sync=sync, loaded_version=loaded, state=state, env_weights=weights)
+        await miner.run()
+
+
+__all__ = [
+    "AsyncMiner", "AsyncMinerConfig", "DryRunTransport", "FakeGroupGenerator", "GroupGenerator", "HeldLease",
+    "HttpRlTransport", "PromptPlanner", "PromptRecord", "RequestRefused", "RlTransport", "VllmGroupGenerator",
+    "decode_tokens", "default_priority", "draw_context", "encode_submission", "encode_tokens", "rl_submit_binding",
+    "run_async_miner", "write_hf_dir",
+]
