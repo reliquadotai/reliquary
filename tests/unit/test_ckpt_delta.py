@@ -209,6 +209,61 @@ def test_corrupt_wire_bytes_are_refused():
         decode_delta(blob[: len(blob) - 50])
 
 
+
+def _sparse_pair(seed=0):
+    """bf16 tensors with sparse, dense and empty regions across chunk borders."""
+    g = torch.Generator().manual_seed(seed)
+    a = {"big": torch.randn(37, 101, generator=g).to(torch.bfloat16),
+         "small": torch.randn(9, generator=g).to(torch.bfloat16)}
+    b = clone(a)
+    bits = b["big"].view(-1).view(torch.int16)
+    bits[:400] += 1  # dense: bitmask chunks
+    bits[1000:3000:97] += 1  # sparse: gap chunks; 3000.. untouched: no chunk
+    bits[-1] += 1  # last element of a partial last chunk
+    return a, b
+
+
+@pytest.mark.parametrize("chunk", [1, 7, 64, 100, 3737, 2**24])
+def test_chunked_wire_format_round_trips_and_ignores_worker_count(chunk):
+    a, b = _sparse_pair()
+    delta = build_delta(a, b, from_version=0, to_version=1)
+    blob = encode_delta(delta, chunk_elements=chunk, workers=1)
+    assert encode_delta(delta, chunk_elements=chunk, workers=5) == blob
+    for workers in (1, 3):
+        decoded = decode_delta(blob, workers=workers)
+        for p, q in zip(delta.patches, decoded.patches):
+            np.testing.assert_array_equal(p.indices, q.indices)
+            np.testing.assert_array_equal(p.values, q.values)
+        rebuilt = clone(a)
+        apply_delta(rebuilt, decoded, workers=workers)
+        assert bits_equal(rebuilt, b)
+
+
+def _rewrite_header(blob, edit):
+    import json
+    import struct
+
+    (n,) = struct.unpack("<Q", blob[8:16])
+    header = json.loads(blob[16:16 + n])
+    edit(header)
+    raw = json.dumps(header).encode()
+    return blob[:8] + struct.pack("<Q", len(raw)) + raw + blob[16 + n:]
+
+
+@pytest.mark.parametrize("edit", [
+    lambda h: h.update(format=1),
+    lambda h: h.update(chunk_elements=0),
+    lambda h: h["tensors"][0].update(count=h["tensors"][0]["count"] + 1),
+    lambda h: h["tensors"][0]["chunks"].reverse(),
+    lambda h: h["tensors"][0]["chunks"][0].__setitem__(0, 10**6),
+    lambda h: h["tensors"][0]["chunks"][0].__setitem__(2, "gaps64"),
+])
+def test_corrupt_chunk_tables_are_refused(edit):
+    a, b = _sparse_pair()
+    blob = encode_delta(build_delta(a, b, from_version=0, to_version=1), chunk_elements=500)
+    with pytest.raises(DeltaError):
+        decode_delta(_rewrite_header(blob, edit))
+
 def test_hash_ignores_order_but_sees_names_dtypes_and_shapes():
     s0 = chain(0)[0]
     reordered = dict(reversed(list(s0.items())))
@@ -224,7 +279,7 @@ def test_hash_ignores_order_but_sees_names_dtypes_and_shapes():
 
 
 @pytest.mark.parametrize("numel,count,encoding", [
-    (10_000, 10, "gaps32"), (10_000, 5_000, "bitmask"), (2**33, 3, "gaps64")])
+    (10_000, 10, "gaps32"), (10_000, 1_000, "gaps32"), (10_000, 5_000, "bitmask"), (2**32, 3, "gaps32")])
 def test_index_encodings_round_trip(numel, count, encoding):
     rng = np.random.default_rng(0)
     pool = 10_000 if numel > 10_000 else numel
