@@ -407,7 +407,7 @@ v* must come from the proof. The trainer cannot recompute it: it has no pi_old m
 - Intake: `validator/episode_intake.py`. Sandbox quota stack: `sandbox/*`.
 - TOPLOC span proofs: `miner/episode_commit.py:182-222`.
 
-**Change:** lease-then-open instead of precommit-then-open. Re-key `DrawBinding` by nonce. Submit exactly 16 episodes, with no M-of-2M. Drop TOPLOC. Size ~400.
+**Change:** lease-then-open instead of precommit-then-open. Re-key `DrawBinding` by nonce. Submit exactly 16 episodes, with no M-of-2M. Drop TOPLOC. Size ~400. Built in §9 "Episodes and batched generation" (service wiring still open).
 
 **Keep:** signed sandboxes, sessions, yield ledger and fleet placement.
 
@@ -816,7 +816,7 @@ Everything below needs a GPU testbed (P8 qualification) unless marked otherwise.
   `ASYNC_GROUP_FLOOR` and `RL_AUDIT_FORGERY_MISMATCH_TOLERANCE` on honest lag-0/2 rollouts. No separate
   terminal-pick check yet (the last token is judged like any position).
 - The miner's in-place weight push (`collective_rpc`, `VLLM_ALLOW_INSECURE_SERIALIZATION`) and its sync time on
-  the 9B; a multi-prompt vLLM call per batch.
+  the 9B; the batched call's throughput (one `generate_batch` for `batch_groups` x 16 requests, see below).
 - `train-async` on the 9B: single card and FSDP2 under torchrun (rank-0 gather per step as `state_fn`, the
   followers of `train-worker` reused), snapshot + delta size and time per step, anchor interval, HF backup upload
   and rotation under `ReliquaryForge/`.
@@ -828,8 +828,65 @@ Everything below needs a GPU testbed (P8 qualification) unless marked otherwise.
 - Not GPU, still open: the decision-D R2 segments of `rl_prompt_scans` (the `ObservationPublisher` reads a service
   runtime's window events; the scans are served by `/rl/prompts/state` meanwhile); the remote signer has no index
   operation (the async validator signs `/rl/checkpoint` with the local wallet and refuses `RELIQUARY_SIGNER_URL`);
-  axon publication of the async validator (miners use `--validator-url`); multi-turn envs (P3 grades single-turn
-  only).
+  axon publication of the async validator (miners use `--validator-url`); the episode wiring listed under
+  "Episodes" below.
+
+### Episodes and batched generation as built (branch `feat/rl-async-multiturn`)
+
+Design §4.10: leases, mandatory submission (16 episodes, every index, no M-of-2M), quota and lifecycle unchanged;
+signed sandboxes and the per-turn forced draw kept, the draw keyed by the lease; no TOPLOC.
+
+- Wire (`protocol/rl_submit.py`): an episode rollout adds `episode = {spans, stop, transcript}`; `tokens` is the
+  whole completion after the validator's prompt render (model turns + observations), `spans` the model turns
+  (completion-relative, read strictly by `episode_spans`: ordered, the completion starts and ends on a model
+  turn). `rollouts_digest` adds `0x02 || episode_digest` (canonical JSON) per episode; single-turn digests unchanged.
+  The route (`RlSubmitRollout.episode`) refuses a group mixing episodes and single-turn rollouts.
+- Draw (`protocol/rl_draw.py`): `t` counts model tokens across turns; `lease_extra_args(..., base_offset)` is the
+  turn request's args, `model_positions(len, spans)` the completion positions in draw order.
+  `forced_draw.LeaseDrawBinding` replaces the window seed binding in the forced generate engine (unchanged: it
+  passes the session's model tokens so far as `base_offset`). `SubmittedGroup.spans` (packed, None for
+  single-turn) makes `draw_uniforms(i)` one per model token; miner == validator == trainer is tested per turn.
+- Engagement: `rl-lease:{lease_id}:{index}` (`service_episode.rl_lease_engagement`); sandbox engagement book
+  `sandbox/rl_engagements.RlLeaseEngagements` (kind `rl_lease`): lease open, the caller's, unbanned
+  (`LeaseBook.check_submission`, again under the issuer lock), index < 16, one session per (lease, index)
+  (`exclusive`), checkpoint `k<k>`, task = leased prompt, budgets as the window book.
+- Validator (`validator/rl_episode.LeaseEpisodeChecker`, through `GroupGrader(episodes={env: checker})` and
+  `grade_episodes`): per rollout `episode_admission.verified_transcript` (factored out of the window checker:
+  signatures, chain, graded final, deadline, record 0) against the lease binding, then
+  `episode_shape_refusal` (signed parse: every observation is its signed record's rendering; turn shape, budgets,
+  termination, limit stops) after prompt fidelity; one session twice refused; reward = final record. Any refusal
+  rejects the group (integrity: no observation, quota halved); a stale machine directory raises
+  `GraderInfrastructureError` (lease left open). `rl_groups.completion_tokens`, `report_training`'s bound and the
+  ledger's `completion_tokens` count model tokens only.
+- Trainer (`training_group`): an episode is the window's Episode v1 shape (`rollout.episode.assistant_spans`,
+  `_validated_assistant_spans` absolute): observations get no loss, no substitution and no match; uniforms and the
+  `token_logprobs` placeholder are one per model token. Audit (`rl_audit.rollout_draw_diagnostics`): one forward
+  over the whole sequence, only model positions judged, each against its model-token draw.
+- Miner: `rl_async.EpisodeRollout` encodes into the wire; `miner/rl_async_episodes.EpisodeLeaseGenerator`
+  (`agenerate`, awaited by `AsyncMiner.generate_once`) plays a lease's 16 episodes through the window machinery:
+  `rl_episode_client.LeaseEpisodeRunner` (open body `rl_lease`, lease-bound transcript precheck
+  `lease_transcript_refusal`, opens stop at the lease's expiry), `episode_group_miner.play_bound` (factored out of
+  `_play_seed`) with `LeaseDrawBinding`, `episode_commit.episode_admissible`; a machine-signed abort is replayed
+  once; one unusable episode fails the whole lease (graded sessions withdrawn; never a choice among episodes).
+- Batched generation (task 2): `VLLMRolloutGenerator.generate_batch([(prompt, per-request extra_args, cap)])`
+  sends every request of a batch in ONE `LLM.generate`; `VllmGroupGenerator.generate` builds `batch_groups` x 16
+  requests, each with its own lease's `lease_extra_args`, read by request id in the runner-keyed processor (test:
+  rows shuffled, each request still draws its lease's stream).
+- Tests: `tests/unit/test_rl_async_episodes.py` (15; 6 need `reliquary_sandbox`).
+
+Remaining (episodes):
+
+- Service wiring: `rl_async_service` builds no sandbox side yet. It needs the session issuer + fleet + machine
+  directory of `rl_sandbox_wiring` with `RlLeaseEngagements` in place of the precommit book, the episode policies
+  (sandbox env, split, package, tools, turn and token budgets: from the task registry params, the window takes
+  them from the order contract), one `LeaseEpisodeChecker` per env and the routes under `/rl` (sessions; no
+  precommit route). Session settlement (mark submitted / release on the group's verdict) and the yield ledger are
+  not ported: the engagement makes a transcript single-use, so they are capacity accounting only.
+- `mine-async` wiring of `EpisodeLeaseGenerator` (the window `build_episode_stack` minus precommits and TOPLOC
+  prover) and an in-place weight swap for `VllmTurnCore` (the generator refuses `load_weights` without one: restart).
+- `/rl/submit` reads at most 8 MiB per body: 16 transcripts can exceed it (each may reach `MAX_TRANSCRIPT_BYTES`);
+  raise the bound for episode envs or compress transcripts.
+- Lease expiry for episode envs must cover sandbox time (it counts in latency, §4.10); calibrate per env.
 
 ### Service wiring as built (branch `feat/rl-async`)
 

@@ -202,22 +202,11 @@ class EpisodeGroupChecker:
                             engagement=rl_engagement(precommit.window, precommit.sha256, seed),
                             env=policy.sandbox_env, split=policy.split, index=precommit.task_index,
                             checkpoint=precommit.checkpoint, seen_session_ids=seen, require_graded=True)
-        result = verify_transcript(episode.get("transcript"), directory, token_verifier, expected)
-        if not result.ok:
-            reasons = [reason.value for reason in result.reasons]
-            # A milder reason only when it is the whole story: any other failure is a forged transcript.
-            mapped = {_TRANSCRIPT_REASONS.get(reason) for reason in result.reasons}
-            if len(mapped) == 1 and None not in mapped:
-                wire, stage = mapped.pop()
-                return EpisodeRefusal(wire, stage, {**where, "reasons": reasons})
-            return EpisodeRefusal(RejectReason.REWARD_MISMATCH, "episode_transcript", {**where, "reasons": reasons})
+        result = verified_transcript(policy, episode.get("transcript"), expected, directory=directory,
+                                     token_verifier=token_verifier, received=received, where=where)
+        if isinstance(result, EpisodeRefusal):
+            return result
         claims, opened, final = result.claims, result.open, result.final
-        deadline = claims.expires_at + GRADING_GRACE_S
-        if received > deadline:
-            return EpisodeRefusal(RejectReason.PRECOMMIT_EXPIRED, "episode_deadline", {**where, "deadline": deadline})
-        if (opened.tools_version not in TOOLS_VERSIONS or tuple(opened.tools) != tuple(policy.tools)
-                or opened.env_package != policy.env_package):
-            return EpisodeRefusal(RejectReason.REWARD_MISMATCH, "episode_record0", where)
         return _Verified(commit=commit, stop=episode.get("stop"), tokens=tokens, spans=spans, claims=claims,
                          opened=opened, final=final, calls=tuple(result.calls))
 
@@ -235,6 +224,32 @@ class EpisodeGroupChecker:
         if not isinstance(proofs, list) or len(proofs) != expected_proofs:
             return EpisodeRefusal(RejectReason.BAD_SCHEMA, "episode_proof_shape", {**where, "expected": expected_proofs})
         return None
+
+
+def verified_transcript(policy, transcript, expected, *, directory, token_verifier, received: float,
+                        where: dict | None = None):
+    """Steps 4-6 of one episode (the window admission's and the async lease path's): ``verify_transcript`` with
+    every binding ``expected`` names, the paid-session snapshot and a graded final; the grading deadline on this
+    validator's clock; record 0's tools version, tools and env package. The verification result, or the
+    refusal."""
+    where = dict(where or {})
+    result = verify_transcript(transcript, directory, token_verifier, expected)
+    if not result.ok:
+        reasons = [reason.value for reason in result.reasons]
+        # A milder reason only when it is the whole story: any other failure is a forged transcript.
+        mapped = {_TRANSCRIPT_REASONS.get(reason) for reason in result.reasons}
+        if len(mapped) == 1 and None not in mapped:
+            wire, stage = mapped.pop()
+            return EpisodeRefusal(wire, stage, {**where, "reasons": reasons})
+        return EpisodeRefusal(RejectReason.REWARD_MISMATCH, "episode_transcript", {**where, "reasons": reasons})
+    deadline = result.claims.expires_at + GRADING_GRACE_S
+    if received > deadline:
+        return EpisodeRefusal(RejectReason.PRECOMMIT_EXPIRED, "episode_deadline", {**where, "deadline": deadline})
+    opened = result.open
+    if (opened.tools_version not in TOOLS_VERSIONS or tuple(opened.tools) != tuple(policy.tools)
+            or opened.env_package != policy.env_package):
+        return EpisodeRefusal(RejectReason.REWARD_MISMATCH, "episode_record0", where)
+    return result
 
 
 def episode_shape_refusal(policy, renderer, *, prompt_ids, tokens, spans, stop, calls, opened, final,
@@ -349,4 +364,4 @@ def finish_prepared(prepared, facts: EpisodeGroupFacts, contract) -> None:
 
 
 __all__ = ["EpisodeGroupChecker", "EpisodeGroupFacts", "EpisodeRefusal", "episode_shape_refusal",
-           "finish_prepared"]
+           "finish_prepared", "verified_transcript"]

@@ -164,18 +164,26 @@ class DrawGate:
 def training_group(group: SubmittedGroup, *, slot0: int, index: int) -> SimpleNamespace:
     """A buffered group as the trainer's group object (the window decoder's shape): full token rows, the BFT span
     in absolute positions, the lease's uniforms, and the gate's slot ids. Miners send no logprobs; the
-    ``token_logprobs`` placeholder only carries the completion length (pi_old is the policy under the gate)."""
+    ``token_logprobs`` placeholder only carries the policy-position count (pi_old is the policy under the gate).
+    An episode (§4.10) is the window path's Episode v1 shape: its validated model spans (absolute) are the policy
+    mask (``_validated_assistant_spans``), so tool observations get no loss, no substitution and no match, and
+    its uniforms are one per model token across turns."""
     p = len(group.prompt_tokens)
     rollouts = []
     for i, completion in enumerate(group.completions):
         n = len(completion)
         span = group.force_spans[i]
+        spans = None if group.spans is None else tuple((p + int(s), p + int(e)) for s, e in group.spans[i])
+        meta = {"prompt_length": p, "completion_length": n, "truncated": bool(group.truncated[i]),
+                "forced": span is not None, "token_logprobs": [0.0] * group.model_tokens(i)}
+        if spans is not None:
+            meta["episode"] = {"assistant_spans": [list(s) for s in spans]}
         rollout = SimpleNamespace(
             reward=float(group.rewards[i]), env_name=group.environment,
-            commit={"tokens": list(group.prompt_tokens) + list(completion),
-                    "rollout": {"prompt_length": p, "completion_length": n, "truncated": bool(group.truncated[i]),
-                                "forced": span is not None, "token_logprobs": [0.0] * n}},
+            commit={"tokens": list(group.prompt_tokens) + list(completion), "rollout": meta},
             _forced_draw_uniforms=group.draw_uniforms(i), _async_slot=slot0 + i, _async_group=index)
+        if spans is not None:
+            rollout._validated_assistant_spans = spans
         if span is not None:
             rollout._validated_force_span = (p + int(span[0]), p + int(span[1]))
         rollouts.append(rollout)

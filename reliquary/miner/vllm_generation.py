@@ -414,7 +414,6 @@ class VLLMRolloutGenerator:
         transformers path's, so a stop token appearing mid-batch cannot carry
         padding downstream either way.
         """
-        sampling_params = self._sampling_params_class
         if seed_pool is not None:
             # Rollout ``index`` is drawn from pool seed ``seeds[index]``.
             selection = seed_pool.selection(seeds)
@@ -422,25 +421,46 @@ class VLLMRolloutGenerator:
             seeds = selection.seeds
         elif seeds is not None:
             raise ValueError("seeds require public pool")
+        extra = [
+            forced_seed_extra_args(
+                randomness=randomness, prompt_idx=prompt_idx,
+                checkpoint_hash=checkpoint_hash, rollout_index=index,
+                seed_pool=seed_pool,
+                seed_index=seeds[index] if seed_pool is not None else None,
+            )
+            for index in range(rollouts)
+        ]
+        return self.generate_batch([(list(prompt_tokens), extra, int(max_new_tokens))], eos_ids=eos_ids)[0]
+
+    def generate_batch(
+        self, groups: list[tuple[list[int], list[dict[str, Any]], int]], *, eos_ids: list[int],
+    ) -> list[list[list[int]]]:
+        """Many groups in ONE engine call (the async miner's batch of leases): ``groups`` is
+        ``[(prompt tokens, per-rollout extra_args, max new tokens)]``; the answer is, per group, its
+        rollouts' completions (``generate``'s truncation).
+
+        The draw stays exact per request: each request carries its own ``extra_args``
+        (its lease's randomness, prompt, checkpoint tag and rollout index), which the
+        runner-keyed processor reads by request id at its runner-reported position,
+        whatever else shares the batch. vLLM answers in request order.
+        """
+        sampling_params = self._sampling_params_class
         if sampling_params is None:
             from vllm import SamplingParams as sampling_params
 
         stop_ids = sorted(int(token) for token in eos_ids)
-        requests = [{"prompt_token_ids": list(prompt_tokens)} for _ in range(rollouts)]
-        sampling = [
-            sampling_params(
-                temperature=0.0, max_tokens=int(max_new_tokens), detokenize=False,
-                stop_token_ids=stop_ids or None,
-                extra_args=forced_seed_extra_args(
-                    randomness=randomness, prompt_idx=prompt_idx,
-                    checkpoint_hash=checkpoint_hash, rollout_index=index,
-                    seed_pool=seed_pool,
-                    seed_index=seeds[index] if seed_pool is not None else None,
-                ),
-            )
-            for index in range(rollouts)
-        ]
-        outputs = self._llm.generate(requests, sampling, use_tqdm=False)
+        requests, sampling, sizes = [], [], []
+        for prompt_tokens, extra_args, max_new_tokens in groups:
+            sizes.append(len(extra_args))
+            for extra in extra_args:
+                requests.append({"prompt_token_ids": list(prompt_tokens)})
+                sampling.append(sampling_params(
+                    temperature=0.0, max_tokens=int(max_new_tokens), detokenize=False,
+                    stop_token_ids=stop_ids or None, extra_args=extra,
+                ))
+        outputs = self._llm.generate(requests, sampling, use_tqdm=False) if requests else []
+        if len(outputs) != len(requests):
+            raise RuntimeError(f"vLLM answered {len(outputs)} of {len(requests)} requests")
         completions: list[list[int]] = []
         for output in outputs:
             completion = list(output.outputs[0].token_ids)
@@ -448,4 +468,8 @@ class VLLMRolloutGenerator:
             if end is not None:
                 completion = completion[: end + 1]
             completions.append(completion)
-        return completions
+        answer, start = [], 0
+        for size in sizes:
+            answer.append(completions[start:start + size])
+            start += size
+        return answer

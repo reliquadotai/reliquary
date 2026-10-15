@@ -28,7 +28,11 @@ class SubmittedGroup:
     """A graded group with its tokens: what the trainer (in zone) or an audit (out of zone) runs its forward on.
     ``nonce`` (hex) and ``checkpoint`` are the lease's: the Gumbel noise is keyed by (nonce, rollout index,
     position) as ``protocol.rl_draw`` defines it, so ``draw_uniforms`` recomputes the uniforms (no array stored).
-    ``completions[i]`` is rollout i's completion, ``force_spans[i]`` its BFT span (completion-relative) or None."""
+    ``completions[i]`` is rollout i's completion, ``force_spans[i]`` its BFT span (completion-relative) or None.
+
+    Episodes (§4.10): ``spans[i]`` are rollout i's model spans (completion-relative, validated at submission); the
+    completion then also holds the tool observations, which take no draw position, carry no loss and are never
+    matched. None for a single-turn group (every completion position is a model token)."""
     lease_id: str
     hotkey: str
     environment: str
@@ -41,22 +45,37 @@ class SubmittedGroup:
     prompt_tokens: tuple[int, ...]
     completions: tuple[tuple[int, ...], ...]
     force_spans: tuple[tuple[int, int] | None, ...]
+    spans: tuple[tuple[tuple[int, int], ...], ...] | None = None
+
+    def model_positions(self, rollout_index: int) -> list[int]:
+        """Rollout ``rollout_index``'s model-token positions (completion-relative) in draw order."""
+        from reliquary.protocol.rl_draw import model_positions
+
+        return model_positions(len(self.completions[rollout_index]),
+                               None if self.spans is None else self.spans[rollout_index])
+
+    def model_tokens(self, rollout_index: int) -> int:
+        return len(self.model_positions(rollout_index))
 
     def pack(self) -> bytes:
         return zlib.compress(json.dumps(asdict(self), separators=(",", ":")).encode(), 6)
 
     def draw_uniforms(self, rollout_index: int) -> list[float]:
-        """The forced draw's public uniforms of rollout ``rollout_index``, one per completion position, recomputed
+        """The forced draw's public uniforms of rollout ``rollout_index``, one per model position, recomputed
         from the lease (``protocol.rl_draw``): what the trainer's verification and substitution loss read (the
-        window path's ``_forced_draw_uniforms``). Nothing is stored: the nonce, prompt, k and index are the seed."""
+        window path's ``_forced_draw_uniforms``), one per MODEL token for an episode. Nothing is stored: the nonce,
+        prompt, k and index are the seed."""
         from reliquary.protocol.rl_draw import lease_uniforms
 
         return lease_uniforms(self.nonce, self.prompt_idx, self.checkpoint, rollout_index,
-                              len(self.completions[rollout_index]))
+                              self.model_tokens(rollout_index))
 
     @classmethod
     def unpack(cls, blob: bytes) -> "SubmittedGroup":
         body = json.loads(zlib.decompress(blob))
+        spans = body.get("spans")
+        if spans is not None:
+            body["spans"] = tuple(tuple(tuple(p) for p in rollout) for rollout in spans)
         return cls(**{**body, "rewards": tuple(body["rewards"]), "truncated": tuple(body["truncated"]),
                       "prompt_tokens": tuple(body["prompt_tokens"]),
                       "completions": tuple(tuple(c) for c in body["completions"]),
