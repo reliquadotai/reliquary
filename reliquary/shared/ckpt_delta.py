@@ -11,16 +11,20 @@ every miner that lags behind c by no more than c - a steps.
 Tensors that are not bf16 are stored whole when any byte changed. A tensor added,
 removed or reshaped is refused: that needs a full anchor.
 
-Wire format (one file per delta)::
+Wire format (one file per delta, format 2)::
 
     b"RQCKDLT1" | u64 header length | header JSON | sections
 
-Each tensor has one section (whole tensor) or two (indices, values), each
-compressed with zstd after a byte shuffle (bytes of equal significance grouped,
-which is what makes small index gaps and shared bf16 exponents compress).
-Indices are sorted gaps (u32, or u64 for tensors of 2**32 elements or more), or a
-packed bitmask when that is smaller (more than one position in 32 changed).
-Compression goes through pyarrow, already a dependency.
+A whole tensor has one section. A sparse (bf16) tensor is cut into chunks of
+``chunk_elements`` positions (2**24 by default, in the header); each chunk with a
+change has its own two sections (indices local to the chunk, values), so chunks
+compress and decode in parallel, which is what makes a 9B delta fast to build on
+the trainer and to apply on a miner. Sections are zstd-compressed (through
+pyarrow, already a dependency) after a byte shuffle (bytes of equal significance
+grouped, which is what makes small index gaps and shared bf16 exponents
+compress). Chunk indices are sorted u32 gaps, or a packed bitmask when more than
+one position in five changed. The bytes do not depend on the thread count.
+Format 1 (one index and one value section per tensor) is no longer read.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 import struct
 from pathlib import Path
 from typing import Mapping
@@ -38,10 +43,13 @@ import pyarrow as pa
 import torch
 
 MAGIC = b"RQCKDLT1"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 HASH_DOMAIN = b"reliquary-ckpt-sha256/1\n"
 DEFAULT_ZSTD_LEVEL = 3
 _U32_LIMIT = 2**32
+DEFAULT_CHUNK_ELEMENTS = 2**24
+_APPLY_SLICE = 2**21
+_BITMASK_DENSITY = 5  # bitmask when more than 1 position in 5 changed
 ANCHOR_SHARD_BYTES = 5 * 1024**3
 
 
@@ -82,6 +90,10 @@ class CheckpointDelta:
 
 
 # --------------------------------------------------------------------- hashing
+
+def _workers(workers: int | None) -> int:
+    return max(1, workers if workers is not None else min(32, os.cpu_count() or 1))
+
 
 def _dtype_name(t: torch.Tensor) -> str:
     return str(t.dtype).removeprefix("torch.")
@@ -139,20 +151,25 @@ def _check_same_structure(old: Mapping[str, torch.Tensor], new: Mapping[str, tor
 
 
 def changed_masks(
-    old: Mapping[str, torch.Tensor], new: Mapping[str, torch.Tensor]
+    old: Mapping[str, torch.Tensor],
+    new: Mapping[str, torch.Tensor],
+    *,
+    workers: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Per tensor, which positions changed: a flat bool mask for bf16 tensors,
     a one-element bool for the others (changed at all). Masks OR together, which
     is how a publisher tracks the union of changes since some base version."""
     _check_same_structure(old, new)
-    masks: dict[str, torch.Tensor] = {}
-    for name in sorted(new):
+
+    def one(name: str) -> torch.Tensor:
         a, b = old[name], new[name]
         if b.dtype == torch.bfloat16:
-            masks[name] = (_bits16(a) != _bits16(b)).cpu()
-        else:
-            masks[name] = torch.tensor([not np.array_equal(_raw_bytes(a), _raw_bytes(b))])
-    return masks
+            return (_bits16(a) != _bits16(b)).cpu()
+        return torch.tensor([not np.array_equal(_raw_bytes(a), _raw_bytes(b))])
+
+    names = sorted(new)
+    with ThreadPoolExecutor(max_workers=_workers(workers)) as pool:
+        return dict(zip(names, pool.map(one, names)))
 
 
 def delta_from_masks(
@@ -163,26 +180,30 @@ def delta_from_masks(
     to_version: int,
     base_sha256: str,
     target_sha256: str,
+    workers: int | None = None,
 ) -> CheckpointDelta:
     """The delta that writes ``new``'s values at every masked position."""
     if not to_version > from_version:
         raise DeltaError("a delta must move forward")
-    patches = []
-    for name in sorted(masks):
+    def one(name: str) -> TensorPatch | None:
         mask, t = masks[name], new[name]
         if t.dtype == torch.bfloat16:
             if mask.numel() != t.numel():
                 raise DeltaError(f"{name}: mask does not fit the tensor")
-            idx = torch.nonzero(mask, as_tuple=False).reshape(-1)
+            idx = torch.nonzero(mask.reshape(-1), as_tuple=False).reshape(-1)
             if idx.numel() == 0:
-                continue
+                return None
             vals = _bits16(t).cpu()[idx]
-            patches.append(TensorPatch(name, "bfloat16", tuple(t.shape),
-                                       idx.numpy().astype(np.int64, copy=False),
-                                       vals.numpy().view(np.uint16)))
-        elif bool(mask.any()):
-            patches.append(TensorPatch(name, _dtype_name(t), tuple(t.shape), None,
-                                       _raw_bytes(t).copy()))
+            return TensorPatch(name, "bfloat16", tuple(t.shape),
+                               idx.numpy().astype(np.int64, copy=False),
+                               vals.numpy().view(np.uint16))
+        if bool(mask.any()):
+            return TensorPatch(name, _dtype_name(t), tuple(t.shape), None, _raw_bytes(t).copy())
+        return None
+
+    names = sorted(masks)
+    with ThreadPoolExecutor(max_workers=_workers(workers)) as pool:
+        patches = [p for p in pool.map(one, names) if p is not None]
     return CheckpointDelta(int(from_version), int(to_version), base_sha256, target_sha256,
                            tuple(patches))
 
@@ -208,10 +229,15 @@ def build_delta(
 # ----------------------------------------------------------------------- apply
 
 def apply_delta(
-    state: dict[str, torch.Tensor], delta: CheckpointDelta, *, verify: bool = True
+    state: dict[str, torch.Tensor],
+    delta: CheckpointDelta,
+    *,
+    verify: bool = True,
+    workers: int | None = None,
 ) -> None:
     """Overwrite ``state`` in place (tensors must be contiguous), then check the
     rebuilt checkpoint's SHA-256 unless ``verify`` is False."""
+    jobs = []
     for p in delta.patches:
         t = state.get(p.name)
         if t is None or _dtype_name(t) != p.dtype or tuple(t.shape) != p.shape:
@@ -219,12 +245,19 @@ def apply_delta(
         if not t.is_contiguous():
             raise DeltaError(f"{p.name}: tensor must be contiguous to patch in place")
         if p.whole:
-            src = torch.from_numpy(np.ascontiguousarray(p.values))
-            t.reshape(-1).view(torch.uint8).copy_(src.to(t.device))
-        else:
-            idx = torch.from_numpy(p.indices).to(t.device)
-            vals = torch.from_numpy(p.values.view(np.int16)).to(t.device)
-            t.reshape(-1).view(torch.int16)[idx] = vals
+            jobs.append(lambda t=t, p=p: t.reshape(-1).view(torch.uint8).copy_(
+                torch.from_numpy(np.ascontiguousarray(p.values)).to(t.device)))
+            continue
+        flat = t.reshape(-1).view(torch.int16)
+        idx = torch.from_numpy(p.indices)
+        vals = torch.from_numpy(p.values.view(np.int16))
+        # Positions are distinct, so slices of one tensor patch concurrently.
+        for a in range(0, idx.numel(), _APPLY_SLICE):
+            jobs.append(lambda flat=flat, i=idx[a:a + _APPLY_SLICE], v=vals[a:a + _APPLY_SLICE]:
+                        flat.index_put_((i.to(flat.device),), v.to(flat.device)))
+    with ThreadPoolExecutor(max_workers=_workers(workers)) as pool:
+        for fut in [pool.submit(job) for job in jobs]:
+            fut.result()
     if verify:
         verify_checkpoint(state, delta.target_sha256)
 
@@ -270,71 +303,163 @@ def compose_deltas(first: CheckpointDelta, second: CheckpointDelta) -> Checkpoin
 
 # ------------------------------------------------------------------ wire format
 
-def _shuffle(arr: np.ndarray) -> bytes:
+def _shuffle(arr: np.ndarray) -> np.ndarray:
+    """Byte planes of ``arr`` (all first bytes, then all second bytes, ...)."""
     arr = np.ascontiguousarray(arr)
     width = arr.dtype.itemsize
-    return arr.view(np.uint8).reshape(-1, width).T.tobytes() if width > 1 else arr.tobytes()
+    if width == 1:
+        return arr.view(np.uint8)
+    src = arr.view(np.uint8).reshape(-1, width)
+    out = np.empty(arr.nbytes, dtype=np.uint8)
+    planes = out.reshape(width, -1)
+    for k in range(width):
+        planes[k] = src[:, k]
+    return out
 
 
-def _unshuffle(raw: bytes, dtype) -> np.ndarray:
-    dtype = np.dtype(dtype)
+def _unshuffle_into(raw: bytes, out: np.ndarray) -> None:
+    """Inverse of ``_shuffle``, written into the contiguous array ``out``."""
+    width = out.dtype.itemsize
     planes = np.frombuffer(raw, dtype=np.uint8)
-    if dtype.itemsize == 1:
-        return planes.copy()
-    return planes.reshape(dtype.itemsize, -1).T.copy().view(dtype).reshape(-1)
+    if planes.size != out.nbytes:
+        raise DeltaError("delta section has the wrong size")
+    if width == 1:
+        out.view(np.uint8)[:] = planes
+        return
+    dst = out.view(np.uint8).reshape(-1, width)
+    planes = planes.reshape(width, -1)
+    for k in range(width):
+        dst[:, k] = planes[k]
 
 
 def _numel(shape) -> int:
     return int(np.prod(shape, dtype=np.int64)) if shape else 1
 
 
-def _encode_indices(indices: np.ndarray, numel: int) -> tuple[str, bytes]:
-    if 32 * indices.size > numel:
+def _encode_indices(indices: np.ndarray, numel: int) -> tuple[str, np.ndarray]:
+    """Sorted positions inside one chunk of ``numel`` (<= 2**32) elements.
+
+    Gaps compress smaller and decode faster up to about one position in five
+    (measured on uniform positions); a bitmask wins above that."""
+    if _BITMASK_DENSITY * indices.size > numel:
         mask = np.zeros(numel, dtype=bool)
         mask[indices] = True
-        return "bitmask", np.packbits(mask, bitorder="little").tobytes()
-    gaps = np.diff(indices, prepend=0)
-    if numel <= _U32_LIMIT:
-        return "gaps32", _shuffle(gaps.astype(np.uint32))
-    return "gaps64", _shuffle(gaps.astype(np.uint64))
+        return "bitmask", np.packbits(mask, bitorder="little")
+    gaps = np.empty(indices.size, dtype=np.uint32)
+    if indices.size:
+        gaps[0] = indices[0]
+        np.subtract(indices[1:], indices[:-1], out=gaps[1:], casting="unsafe")
+    return "gaps32", _shuffle(gaps)
+
+
+def _decode_indices_into(encoding: str, raw: bytes, numel: int, out: np.ndarray) -> None:
+    """Positions of one chunk, written into the int64 array ``out`` (its size is
+    the declared count). Checks they are strictly increasing and in range."""
+    count = out.size
+    if encoding == "bitmask":
+        packed = np.frombuffer(raw, dtype=np.uint8)
+        if packed.size != (numel + 7) // 8:
+            raise DeltaError("corrupt index section")
+        tail = numel % 8
+        if tail and packed[-1] >> tail:
+            raise DeltaError("corrupt index section")
+        bits = np.unpackbits(packed, count=numel, bitorder="little").view(bool)
+        idx = np.flatnonzero(bits)
+        if idx.size != count:
+            raise DeltaError("corrupt index section")
+        out[:] = idx
+    elif encoding == "gaps32":
+        if len(raw) != 4 * count:
+            raise DeltaError("corrupt index section")
+        gaps = np.empty(count, dtype=np.uint32)
+        _unshuffle_into(raw, gaps)
+        if count and (np.any(gaps[1:] == 0)):
+            raise DeltaError("corrupt index section")
+        np.cumsum(gaps, dtype=np.int64, out=out)
+        if count and out[-1] >= numel:
+            raise DeltaError("corrupt index section")
+    else:
+        raise DeltaError(f"unknown index encoding {encoding!r}")
 
 
 def _decode_indices(encoding: str, raw: bytes, numel: int, count: int) -> np.ndarray:
-    if encoding == "bitmask":
-        bits = np.unpackbits(np.frombuffer(raw, dtype=np.uint8), count=numel, bitorder="little")
-        idx = np.flatnonzero(bits).astype(np.int64)
-    elif encoding in ("gaps32", "gaps64"):
-        gaps = _unshuffle(raw, np.uint32 if encoding == "gaps32" else np.uint64)
-        idx = np.cumsum(gaps, dtype=np.int64)
-    else:
-        raise DeltaError(f"unknown index encoding {encoding!r}")
-    if idx.size != count or (count and (idx[-1] >= numel or np.any(np.diff(idx) <= 0))):
-        raise DeltaError("corrupt index section")
-    return idx
+    out = np.empty(count, dtype=np.int64)
+    _decode_indices_into(encoding, bytes(raw), numel, out)
+    return out
 
 
-def encode_delta(delta: CheckpointDelta, *, level: int = DEFAULT_ZSTD_LEVEL) -> bytes:
+def encode_delta(
+    delta: CheckpointDelta,
+    *,
+    level: int = DEFAULT_ZSTD_LEVEL,
+    chunk_elements: int = DEFAULT_CHUNK_ELEMENTS,
+    workers: int | None = None,
+) -> bytes:
+    """Wire bytes of ``delta``. Sparse tensors are cut into chunks of
+    ``chunk_elements`` positions, each with its own index and value sections,
+    compressed in parallel; the bytes do not depend on ``workers``."""
+    if not 0 < chunk_elements <= _U32_LIMIT:
+        raise DeltaError("chunk_elements must be in (0, 2**32]")
     codec = pa.Codec("zstd", compression_level=level)
+
+    def compress(raw: np.ndarray) -> tuple[bytes, int]:
+        raw = raw.view(np.uint8)
+        return (codec.compress(raw, asbytes=True) if raw.size else b""), int(raw.size)
+
+    jobs = []  # in output order: one per whole tensor, one per sparse chunk
+
+    def whole_job(p):
+        return lambda: [compress(np.ascontiguousarray(p.values))]
+
+    def chunk_job(p, base, n, a, b):
+        def run():
+            encoding, raw_idx = _encode_indices(p.indices[a:b] - base, n)
+            return [encoding, compress(raw_idx), compress(_shuffle(p.values[a:b]))]
+        return run
+
+    layouts = []
+    for p in delta.patches:
+        if p.whole:
+            layouts.append(None)
+            jobs.append(whole_job(p))
+            continue
+        numel = _numel(p.shape)
+        starts = np.arange(0, numel, chunk_elements, dtype=np.int64)
+        cuts = np.searchsorted(p.indices, np.append(starts, numel))
+        chunks = []
+        for c, base in enumerate(starts.tolist()):
+            a, b = int(cuts[c]), int(cuts[c + 1])
+            if a == b:
+                continue
+            chunks.append((c, b - a))
+            jobs.append(chunk_job(p, base, min(chunk_elements, numel - base), a, b))
+        layouts.append(chunks)
+
+    with ThreadPoolExecutor(max_workers=_workers(workers)) as pool:
+        results = iter(list(pool.map(lambda job: job(), jobs)))
+
     entries, blobs, offset = [], [], 0
 
-    def section(raw: bytes) -> list[int]:
+    def section(packed_and_raw) -> list[int]:
         nonlocal offset
-        packed = codec.compress(raw, asbytes=True) if raw else b""
+        packed, raw_length = packed_and_raw
         blobs.append(packed)
         offset += len(packed)
-        return [offset - len(packed), len(packed), len(raw)]
+        return [offset - len(packed), len(packed), raw_length]
 
-    for p in delta.patches:
+    for p, chunks in zip(delta.patches, layouts):
         entry = {"name": p.name, "dtype": p.dtype, "shape": list(p.shape)}
-        if p.whole:
-            entry.update(kind="whole", sections=[section(p.values.tobytes())])
+        if chunks is None:
+            entry.update(kind="whole", sections=[section(next(results)[0])])
         else:
-            encoding, raw_idx = _encode_indices(p.indices, _numel(p.shape))
-            entry.update(kind="sparse", count=int(p.values.size), index_encoding=encoding,
-                         sections=[section(raw_idx), section(_shuffle(p.values))])
+            rows = []
+            for c, count in chunks:
+                encoding, idx_sec, val_sec = next(results)
+                rows.append([c, count, encoding, section(idx_sec), section(val_sec)])
+            entry.update(kind="sparse", count=int(p.values.size), chunks=rows)
         entries.append(entry)
     header = json.dumps({
-        "format": FORMAT_VERSION, "codec": "zstd",
+        "format": FORMAT_VERSION, "codec": "zstd", "chunk_elements": int(chunk_elements),
         "from_version": delta.from_version, "to_version": delta.to_version,
         "base_sha256": delta.base_sha256, "target_sha256": delta.target_sha256,
         "tensors": entries,
@@ -342,7 +467,8 @@ def encode_delta(delta: CheckpointDelta, *, level: int = DEFAULT_ZSTD_LEVEL) -> 
     return b"".join([MAGIC, struct.pack("<Q", len(header)), header, *blobs])
 
 
-def decode_delta(data: bytes) -> CheckpointDelta:
+def decode_delta(data: bytes, *, workers: int | None = None) -> CheckpointDelta:
+    """Parse wire bytes; chunks are decompressed and decoded in parallel."""
     if data[:8] != MAGIC or len(data) < 16:
         raise DeltaError("not a checkpoint delta")
     (header_len,) = struct.unpack("<Q", data[8:16])
@@ -352,12 +478,15 @@ def decode_delta(data: bytes) -> CheckpointDelta:
         raise DeltaError("corrupt delta header") from exc
     if header.get("format") != FORMAT_VERSION or header.get("codec") != "zstd":
         raise DeltaError("unsupported delta format")
+    chunk_elements = header.get("chunk_elements")
+    if not isinstance(chunk_elements, int) or not 0 < chunk_elements <= _U32_LIMIT:
+        raise DeltaError("corrupt delta header")
     payload = memoryview(data)[16 + header_len:]
     codec = pa.Codec("zstd")
 
     def section(spec) -> bytes:
-        start, length, raw_length = spec
-        if start < 0 or start + length > len(payload):
+        start, length, raw_length = (int(x) for x in spec)
+        if start < 0 or length < 0 or raw_length < 0 or start + length > len(payload):
             raise DeltaError("delta section out of bounds")
         if raw_length == 0:
             return b""
@@ -367,22 +496,56 @@ def decode_delta(data: bytes) -> CheckpointDelta:
             raise DeltaError("delta section has the wrong size")
         return raw
 
-    patches = []
+    def whole_job(out_list, slot, spec):
+        def run():
+            out_list[slot] = np.frombuffer(section(spec), dtype=np.uint8).copy()
+        return run
+
+    def chunk_job(idx, vals, base, n, a, b, encoding, idx_spec, val_spec):
+        def run():
+            _decode_indices_into(encoding, section(idx_spec), n, idx[a:b])
+            if base:
+                idx[a:b] += base
+            _unshuffle_into(section(val_spec), vals[a:b])
+        return run
+
+    built, jobs, wholes = [], [], {}
     for entry in header["tensors"]:
         shape = tuple(int(d) for d in entry["shape"])
         if entry["kind"] == "whole":
-            values = np.frombuffer(section(entry["sections"][0]), dtype=np.uint8).copy()
-            patches.append(TensorPatch(entry["name"], entry["dtype"], shape, None, values))
+            built.append((entry["name"], entry["dtype"], shape, None, len(built)))
+            jobs.append(whole_job(wholes, len(built) - 1, entry["sections"][0]))
         elif entry["kind"] == "sparse" and entry["dtype"] == "bfloat16":
-            count = int(entry["count"])
-            idx = _decode_indices(entry["index_encoding"], section(entry["sections"][0]),
-                                  _numel(shape), count)
-            values = _unshuffle(section(entry["sections"][1]), np.uint16)
-            if values.size != count:
-                raise DeltaError("corrupt value section")
-            patches.append(TensorPatch(entry["name"], "bfloat16", shape, idx, values))
+            numel, count = _numel(shape), int(entry["count"])
+            if not 0 <= count <= numel:
+                raise DeltaError("corrupt delta header")
+            idx = np.empty(count, dtype=np.int64)
+            vals = np.empty(count, dtype=np.uint16)
+            a, last = 0, -1
+            for c, n_c, encoding, idx_spec, val_spec in entry["chunks"]:
+                c, n_c = int(c), int(n_c)
+                base = c * chunk_elements
+                if c <= last or base >= numel or n_c <= 0 or a + n_c > count:
+                    raise DeltaError("corrupt chunk table")
+                last = c
+                jobs.append(chunk_job(idx, vals, base, min(chunk_elements, numel - base),
+                                      a, a + n_c, encoding, idx_spec, val_spec))
+                a += n_c
+            if a != count:
+                raise DeltaError("corrupt chunk table")
+            built.append((entry["name"], "bfloat16", shape, idx, vals))
         else:
             raise DeltaError(f"unknown tensor entry kind {entry.get('kind')!r}")
+
+    with ThreadPoolExecutor(max_workers=_workers(workers)) as pool:
+        for fut in [pool.submit(job) for job in jobs]:
+            fut.result()
+    patches = []
+    for slot, (name, dtype, shape, idx, vals) in enumerate(built):
+        if idx is None:
+            patches.append(TensorPatch(name, dtype, shape, None, wholes[slot]))
+        else:
+            patches.append(TensorPatch(name, dtype, shape, idx, vals))
     return CheckpointDelta(int(header["from_version"]), int(header["to_version"]),
                            str(header["base_sha256"]), str(header["target_sha256"]),
                            tuple(patches))
