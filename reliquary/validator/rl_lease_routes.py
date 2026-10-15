@@ -1,6 +1,6 @@
-"""The RL lease routes (rl-async-design.md §4.2-4.3, P2). Not wired into the service yet (P3 does it): the caller
-builds a ``LeaseBook`` and a ``LeaseCollector`` and mounts ``build_rl_lease_router`` (``ValidatorServer
-.mount_rl_lease_router``).
+"""The RL lease routes (rl-async-design.md §4.2-4.3, P2). The async validator (``rl_async_service.mount_rl_async``,
+``RELIQUARY_RL_MODE=async``) builds a ``LeaseBook`` and a ``LeaseCollector`` and mounts ``build_rl_lease_router``
+(``ValidatorServer.mount_rl_lease_router``).
 
 * ``POST {prefix}/lease`` ``{miner_hotkey, at, environment, checkpoint, prompt_ids, signature}``, signed by the
   hotkey for this validator and route (``build_rl_lease_binding``), within ``request_skew_s`` of now. The

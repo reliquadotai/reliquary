@@ -334,6 +334,26 @@ def build_corpus_task_entry(
     )
 
 
+def with_rl_async_params(entry, *, planned_tokens_per_period, lease_tokens_per_s=None):
+    """An RL entry declared for the async protocol: paid by period (``settlement = period-ema-v1``, the weight
+    setter's period EMA), its ``env_split`` as the trainer's target mix, the ``rl_*`` params of
+    ``rl_async_service.rl_async_params``."""
+    from dataclasses import replace
+
+    from reliquary.shared.task_registry import MECHANISM_RL_DISCOVERED_PRICE
+    from reliquary.validator.rl_async_service import rl_async_params
+
+    if entry.mechanism != MECHANISM_RL_DISCOVERED_PRICE:
+        raise ValueError(f"--rl-async declares an RL task, not {entry.mechanism!r}")
+    if not entry.env_split:
+        raise ValueError("--rl-async needs --env-split: the async trainer's target mix")
+    if planned_tokens_per_period is None:
+        raise ValueError("--rl-async needs --planned-tokens-per-period")
+    extra = {} if lease_tokens_per_s is None else {"lease_tokens_per_s": lease_tokens_per_s}
+    params = rl_async_params(planned_tokens_per_period=planned_tokens_per_period, **extra)
+    return replace(entry, params={**entry.params, **params})
+
+
 def _with_enforced_toploc(contract, thresholds=None):
     """A corpus task is paid only on audited work, and the corpus validator
     refuses a contract without an enforced toploc proof. No compiled template
@@ -563,6 +583,20 @@ def tasks_create(
             "it from its own card."
         ),
     ),
+    rl_async: bool = typer.Option(
+        False, "--rl-async",
+        help="An async RL task (RELIQUARY_RL_MODE=async validators): paid by period (period-ema-v1); "
+        "--env-split is the trainer's target mix; needs --planned-tokens-per-period",
+    ),
+    planned_tokens_per_period: float = typer.Option(
+        None, "--planned-tokens-per-period",
+        help="With --rl-async: matched tokens the trainer consumes per 72-minute period at the target mix "
+        "(at price 1 they pay exactly the cap)",
+    ),
+    lease_tokens_per_s: float = typer.Option(
+        None, "--lease-tokens-per-s",
+        help="With --rl-async: the slow reference decode speed lease expiries are cut against",
+    ),
 ) -> None:
     from reliquary.infrastructure.task_registry_store import create_task
     from reliquary.shared.task_registry import RegistryError
@@ -680,6 +714,11 @@ def tasks_create(
                             params={**entry.params, "min_incentive_share": 0.0, "min_incentive_ramp_start": 0.0})
         elif ack_service_fleet:
             raise ValueError("--ack-service-fleet requires --service-contract")
+        if rl_async:
+            entry = with_rl_async_params(entry, planned_tokens_per_period=planned_tokens_per_period,
+                                         lease_tokens_per_s=lease_tokens_per_s)
+        elif planned_tokens_per_period is not None or lease_tokens_per_s is not None:
+            raise ValueError("--planned-tokens-per-period and --lease-tokens-per-s need --rl-async")
         asyncio.run(create_task(entry))
     except (RegistryError, ValueError) as exc:
         # Declaring the first task is the one CLI command that can stop the
@@ -4128,6 +4167,47 @@ def validate(
                     raise typer.Exit(code=4) from exc
                 return
 
+            from reliquary.validator import corpus_periods as _periods
+            from reliquary.validator.rl_async_service import ASYNC, rl_mode
+
+            try:
+                async_mode = rl_mode() == ASYNC
+            except ValueError as exc:
+                logger.critical("%s", exc)
+                raise typer.Exit(code=2) from exc
+            declared_entry = getattr(task_config, "entry", None)
+            period_task = declared_entry is not None and _periods.is_period_task(declared_entry)
+            if async_mode:
+                # The async RL protocol: leases, submissions, the trainer link and pay by period, in one
+                # process without windows, batchers or a proof plane. Branch before any of them is built.
+                if declared_entry is None:
+                    logger.critical("RELIQUARY_RL_MODE=async needs a declared task (`reliquary tasks create "
+                                    "--rl-async`)")
+                    raise typer.Exit(code=4)
+                from reliquary.validator.rl_async_service import run_rl_async_validator
+                from reliquary.validator.weight_only import WeightOnlyValidator
+
+                threading.Thread(
+                    target=lambda: asyncio.run(WeightOnlyValidator(
+                        wallet=wallet, netuid=netuid, signer_client=signer_client).run()),
+                    name="weight-setter", daemon=True,
+                ).start()
+                try:
+                    await run_rl_async_validator(
+                        wallet=wallet, netuid=netuid, signer_client=signer_client, http_host=http_host,
+                        http_port=http_port, entry=declared_entry, cap=task_config.emission_cap,
+                        checkpoint=checkpoint,
+                        load_kwargs=({"revision": DEFAULT_BASE_MODEL_REVISION}
+                                     if checkpoint == DEFAULT_BASE_MODEL else {}))
+                except (RuntimeError, ValueError) as exc:
+                    logger.critical("%s; fix the declaration or the async settings before starting", exc)
+                    raise typer.Exit(code=4) from exc
+                return
+            if period_task:
+                logger.critical("task %s is paid by period (an async RL task): start it with "
+                                "RELIQUARY_RL_MODE=async", task_config.task_id)
+                raise typer.Exit(code=4)
+
             # A service order's catalogue envs are built from the order at start; a task without a service
             # contract resolves its mix exactly as before.
             service_contract = getattr(task_config, "service_contract", None)
@@ -4518,6 +4598,29 @@ def train_worker(
     from reliquary.trainer.cli import run_train_worker
 
     run_train_worker(shadow=shadow)
+
+
+@app.command("train-async")
+def train_async() -> None:
+    """Detached async trainer: train on the validator's buffer through the trainer link, publish one checkpoint
+    per step as deltas into reliquary-public (rl-async-design.md §4.7-4.8; ``RELIQUARY_RL_MODE=async`` validator).
+
+    Environment: RELIQUARY_RL_TRAINER_URL, RELIQUARY_RL_TRAINER_TOKEN, RELIQUARY_RL_VALIDATOR_HOTKEY, R2_PUBLIC_*;
+    optional RELIQUARY_RL_BATCH_GROUPS, RELIQUARY_RL_STEPS_PER_CHECKPOINT, RELIQUARY_RL_ANCHOR_INTERVAL,
+    RELIQUARY_RL_HF_BACKUP_PREFIX + RELIQUARY_RL_HF_BACKUP_EVERY (+ _KEEP, _MILESTONE_EVERY),
+    RELIQUARY_RL_BASE_MODEL, RELIQUARY_TRAINER_BACKEND=fsdp2 under torchrun.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(threadName)s | %(name)s | %(levelname)s | %(message)s",
+    )
+    from reliquary.trainer.async_cli import run_async_train_worker
+
+    try:
+        run_async_train_worker()
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
 
 
 if __name__ == "__main__":

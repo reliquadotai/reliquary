@@ -738,8 +738,7 @@ New code next to the window path (`emission_price`, `settlement`, `rl_pay`, `wei
   target, regime and last signal; per-hotkey accrued / paid / forfeited / banned_until; the last settled periods.
   `ValidatorServer.mount_rl_lease_router` now replaces an app route at the same path and method, so mounting it
   supersedes the window board's `/rl/pay`.
-- Not wired yet (P4/service): a loop that runs `ingest`, `controller.tick(ledger.trained_tokens(...),
-  buffer.depth())` when `due`, `settle` and `publish`; the registry entry of the async task.
+- Wired since: the service loops and the registry entry (§9 "Service wiring as built").
 
 ## 8. Reference miner as built (branch `feat/rl-miner-client`)
 
@@ -808,30 +807,84 @@ One branch carries the whole async RL work on top of current main.
   near-deterministic positions -> `deterministic`; no model -> `passed=None`. Hook: `run_rl_audits(model,
   submissions, limit=8)`, to schedule from the service with its verify model.
 
-### Remaining wiring
+### Remaining
 
-- P4 trainer async loop: `TrainingBuffer.take` per env mix, max-lag drop, set `_forced_draw_uniforms` from
-  `SubmittedGroup.draw_uniforms`, one forward for verification + substitution loss, `report_training(...,
-  matched_tokens=)`, `DeltaPublisher.publish` per step (with `model_dir`), `LeaseBook.adopt_checkpoint` per
-  published k, price `note_wait` / `tick`.
-- Service wiring: schedule `run_rl_audits` (verify model) promptly after submissions; build `LeaseBook` /
-  `LeaseCollector` / `RlSubmissions` / `RlPayLedger` / `AsyncPriceController` in the validator service, mount `build_rl_lease_router(submissions=, pay=)` and `/rl/checkpoint`, a loop for
-- P4 trainer async loop: BUILT (branch `feat/rl-async-trainer`), see "P4 as built" below. Left: the service /
-  CLI entry that builds it (model load, `DeltaPublisher(model_dir=)`, `BackgroundHfBackup`, FSDP2
-  `broadcasting_train_step` + rank-0 gather as `state_fn`, resume = load the weights of `book.latest_checkpoint`).
-- Audit `ProofForward`: the Gumbel verifier over a `SubmittedGroup` against the latest checkpoint (uniforms from
-  `draw_uniforms`), then `run_audits`.
-- Service wiring: build `LeaseBook` / `LeaseCollector` / `RlSubmissions` / `RlPayLedger` / `AsyncPriceController`
-  in the validator service, mount `build_rl_lease_router(submissions=, pay=)` and `/rl/checkpoint`, a loop for
-  `expire_due`, `ingest`, `settle` / `publish`, the async task's registry entry (`settlement = "period-ema-v1"`).
-- Audit follow-ups: calibrate the floor and the forgery tolerance on honest lag-2 rollouts (GPU qualification);
-  the P4 trainer reads `RL_ROLLOUT_MATCH_FLOOR` too; no separate terminal-pick check yet (the last token is judged
-  like any position); a forward that raises (e.g. OOM on one group) stops `run_audits` with that group first in
-  the queue, so a poison group needs a retry cap.
-- Multi-turn envs (P3 grades single-turn only) and a multi-prompt vLLM call in the miner.
-- GPU qualification: the v10 Gumbel profile and fp32 head end to end on vLLM (miner) vs the validator forward,
-  the in-place weight push (`collective_rpc`, `VLLM_ALLOW_INSECURE_SERIALIZATION`), FSDP2 trainer with the
-  substitution loss, delta publication size and miner sync time on the 9B.
+Everything below needs a GPU testbed (P8 qualification) unless marked otherwise.
+
+- The v10 Gumbel profile and fp32 head end to end: vLLM miner picks vs the validator's proof forward (audits) and vs
+  the trainer's forward (FSDP2, packed, fp32 head) on the 9B; calibrate `RL_ROLLOUT_MATCH_FLOOR`,
+  `ASYNC_GROUP_FLOOR` and `RL_AUDIT_FORGERY_MISMATCH_TOLERANCE` on honest lag-0/2 rollouts. No separate
+  terminal-pick check yet (the last token is judged like any position).
+- The miner's in-place weight push (`collective_rpc`, `VLLM_ALLOW_INSECURE_SERIALIZATION`) and its sync time on
+  the 9B; a multi-prompt vLLM call per batch.
+- `train-async` on the 9B: single card and FSDP2 under torchrun (rank-0 gather per step as `state_fn`, the
+  followers of `train-worker` reused), snapshot + delta size and time per step, anchor interval, HF backup upload
+  and rotation under `ReliquaryForge/`.
+- The validator's audit model (`RELIQUARY_RL_AUDIT_DEVICE`): following the deltas on the controller's card and the
+  audit throughput (probation audits 100 % of a newcomer's out-of-zone groups). Without a device every audit is
+  inconclusive (first scans unpaid). V1's controller is CPU-only: either give it a card or move the audit forward
+  to the proof worker (its protocol has no async audit operation yet).
+- Lease expiry (`rl_lease_reference_tokens_per_s`, margin) and starting quota numbers.
+- Not GPU, still open: the decision-D R2 segments of `rl_prompt_scans` (the `ObservationPublisher` reads a service
+  runtime's window events; the scans are served by `/rl/prompts/state` meanwhile); the remote signer has no index
+  operation (the async validator signs `/rl/checkpoint` with the local wallet and refuses `RELIQUARY_SIGNER_URL`);
+  axon publication of the async validator (miners use `--validator-url`); multi-turn envs (P3 grades single-turn
+  only).
+
+### Service wiring as built (branch `feat/rl-async`)
+
+One switch: `RELIQUARY_RL_MODE=async` (default `window`: `validate` runs the window service exactly as before; a
+task declared for period settlement refuses to start in window mode).
+
+- Registry: `reliquary tasks create --task-id <t> --profile-id <p> --cap <c> --env-split math=0.6,code=0.4
+  --rl-async --planned-tokens-per-period <N> [--lease-tokens-per-s <s>]` (`cli.with_rl_async_params`): mechanism
+  `rl-discovered-price`, `params.settlement = "period-ema-v1"` (the unchanged weight setter pays the period
+  archives), `env_split` = the trainer's target mix, `rl_planned_tokens_per_period`, `rl_lease_reference_tokens_per_s`,
+  `rl_lease_expiry_margin`, optional `rl_price_tick_s` / `rl_buffer_overflow_groups`.
+- Validator (`validator/rl_async_service.py`, `run_rl_async_validator`, branched in `validate` after the corpus
+  branch): one process like the corpus validator; `build_rl_async` puts the lease book, quota, collector,
+  submissions + buffer, price controller and ledger on `<state dir>/rl-async.sqlite3`; `RlCheckpointBoard` over
+  `rl/<run>/index.json` in `reliquary-public` (run = `RELIQUARY_RL_RUN`, default the task id); `mount_rl_async`
+  mounts the lease router (with `/rl/submit`, `/rl/pay`, `/rl/lease/mine`, `/rl/prompts/state`) plus
+  `/rl/checkpoint` and, with `RELIQUARY_RL_TRAINER_TOKEN`, the trainer link, through
+  `ValidatorServer.mount_rl_lease_router`; registration gate as the corpus validator; the weight setter thread as
+  in window mode. Loops (`rl_async_loops`): expiry sweep (5 s), audits (2 s, 8 per pass, `AuditModel` at the latest
+  checkpoint or inconclusive without a device), ledger ingest / settle / publish through `R2PeriodArchives` (30 s),
+  price tick when due (the trainer ticks per step). `RlSubmissions.run_audits` now skips a raising forward and
+  concludes it inconclusive after `AUDIT_MAX_ATTEMPTS` (3).
+- Trainer link (`/rl/trainer/*`, bearer token; client `trainer/rl_link.TrainerLink`, one object for the trainer's
+  `buffer`, `submissions`, `book` and `prices`): config, latest, adopt, take, take_older, release, requeue, depth,
+  report, wait, tick. Matches today's topology: the buffer stays in the controller's SQLite file, the trainer on its
+  GPU box. Calls retry transport errors / 429 / 5xx for 10 min; a resent report the validator no longer holds
+  counts as done; idle, the trainer requeues taken groups (a take whose answer was lost).
+- Trainer (`reliquary train-async`, `trainer/async_cli.py`): `RELIQUARY_RL_TRAINER_URL`, `_TOKEN`,
+  `RELIQUARY_RL_VALIDATOR_HOTKEY`, `R2_PUBLIC_*`; mix and run from `/rl/trainer/config`; fresh book = base model,
+  published and adopted as 0; else resume = the latest index version rebuilt through the signed `/rl/checkpoint`
+  (`CheckpointSync`, an unadopted published version adopted first), written as an HF dir and loaded (optimizer
+  fresh, `global_step_hint = k x steps_per_checkpoint`); `DeltaPublisher(model_dir=)` into `reliquary-public`;
+  `BackgroundHfBackup` (`RELIQUARY_RL_HF_BACKUP_PREFIX` / `_EVERY` / `_KEEP` / `_MILESTONE_EVERY`, repos under
+  `ReliquaryForge/`); FSDP2 = `broadcasting_train_step` + rank-0 `gather_full_state_dict` as `state_fn`, followers
+  of `train-worker`. A failed step is fatal (restart resumes from the last adopted checkpoint).
+- Smoke test `tests/unit/test_rl_async_service.py::test_end_to_end_lease_submit_train_pay_and_sync` (CPU, < 1 s):
+  uvicorn on a socket, `mine-async`'s `AsyncMiner` with `HttpRlTransport` and a fake generator, checkpoint 0 synced
+  from `/rl/checkpoint`, leases -> submissions (in zone and 0/16) -> buffer and probation audits (inconclusive),
+  one `AsyncTrainer` step through the link with a fake step -> reports -> delta 1 to a memory bucket, adopted ->
+  ledger accrual -> `/rl/pay` -> miner and audit model sync 1 -> period settled and published.
+
+Start (async mode):
+
+```
+# validator (controller)
+RELIQUARY_RL_MODE=async RELIQUARY_TASK_ID=<t> RELIQUARY_RL_TRAINER_TOKEN=<secret> \
+  R2_PUBLIC_ENDPOINT=... R2_PUBLIC_ACCESS_KEY_ID=... R2_PUBLIC_SECRET_ACCESS_KEY=... [RELIQUARY_RL_AUDIT_DEVICE=cuda:0] \
+  reliquary validate --checkpoint <base model> --wallet-name ... --hotkey ...
+# trainer (GPU box; torchrun --nproc-per-node N with RELIQUARY_TRAINER_BACKEND=fsdp2)
+RELIQUARY_RL_TRAINER_URL=http://<controller>:<port> RELIQUARY_RL_TRAINER_TOKEN=<secret> \
+  RELIQUARY_RL_VALIDATOR_HOTKEY=<ss58> R2_PUBLIC_...=... [RELIQUARY_RL_HF_BACKUP_PREFIX=<p> RELIQUARY_RL_HF_BACKUP_EVERY=200] \
+  reliquary train-async
+# miner
+reliquary mine-async --environments math --validator-url http://<controller>:<port> --validator-hotkey <ss58>
+```
 
 ### P4 as built (branch `feat/rl-async-trainer`)
 
