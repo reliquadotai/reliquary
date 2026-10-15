@@ -1971,6 +1971,10 @@ FORCED_SEED_ROLLOUT_MIN_STOCH = 20
 # exact gate ships in telemetry mode until live incremental-vs-teacher-forced
 # distance data establishes a consensus-safe epsilon.
 FORCED_SEED_CDF_BOUNDARY_EPSILON = 0.002
+# The same tolerance for the gumbel_max draw, in its miss units: the relative score
+# shortfall 1 - exp(-(s_win - s_token)) of logit + G (forced_sampling). A candidate
+# for the same telemetry-first rollout as the CDF one; FORCED_SEED_CDF_ENFORCE arms both.
+FORCED_SEED_GUMBEL_BOUNDARY_EPSILON = 0.05
 FORCED_SEED_CDF_ENFORCE = _os.environ.get(
     "FORCED_SEED_CDF_ENFORCE", "false"
 ).strip().lower() in ("1", "true", "yes", "on")
