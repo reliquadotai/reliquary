@@ -3,6 +3,37 @@
 The per-position draw is a public deterministic function of window randomness, so
 there is exactly one legal generation per (miner, prompt, rollout, window). A rollout
 not generated from this draw is detectable by teacher-forced consistency.
+
+Two draws, chosen by the profile's ``sampling.draw``; both read the same public uniform
+``u_t`` per completion position (``u_at``, or a public seed pool's ``uniform``), so the
+stream identity, its plumbing and its domain are shared:
+
+* ``inverse_cdf`` (every profile before v10): the first token whose cumulative warped
+  probability, in vocabulary order, exceeds ``u_t``.
+* ``gumbel_max``: ``argmax_v (logit_v + G_v)`` over the raw logits, an exact sample of
+  ``softmax(logits)``. Only the identity warp (T=1, no top-k, no top-p) is allowed. The
+  noise is ``G_v = -log(-log U_v)`` in float64 with
+
+      key_t = int(u_t * 2**64) mod 2**64              (as a two's-complement int64)
+      x     = key_t * 0x9E3779B97F4A7C15 + v * 0xBF58476D1CE4E5B9      (mod 2**64)
+      x     = (x ^ x >> 30) * 0xBF58476D1CE4E5B9;  x = (x ^ x >> 27) * 0x94D049BB133111EB
+      x     = x ^ x >> 31                            (logical shifts, mod 2**64)
+      U_v   = ((x >> 11) + 0.5) / 2**53              (in (0, 1), never 0 or 1)
+
+  ``u_t`` is a float64 with at most 53 significant bits of the sha256 it came from, so
+  ``key_t`` is that value scaled exactly; the key is a function of the public stream
+  only, which is what lets a validator recompute it. ``U_v`` is integer arithmetic and
+  bit-identical on every device (``tests/unit/test_gumbel_draw.py`` pins it to an exact
+  Python reference). The two float64 logs come from the device's math library: CUDA's
+  libdevice gives the same bits on Ampere, Ada, Hopper and Blackwell (offpolicy-lab
+  ``gumbel_check.py``, 2026-10-14, and ``scripts/gumbel_check.py``), while CPU libm may
+  differ from it by an ulp. That moves a pick only when the two best scores tie to
+  ~1e-15, so the validator computes ``G`` where its logits are (on the GPU) and the
+  miner does the same in its engine.
+
+  Unlike the inverse CDF, the pick does not depend on a cumulative sum in vocabulary
+  order: a logit error on token ``a`` can move it only if ``a`` is the winner or the
+  runner-up (measured honest match 0.986 against 0.945 on four card types).
 """
 from __future__ import annotations
 
@@ -80,6 +111,125 @@ def u_at(randomness: str, prompt_idx: int, checkpoint_hash: str,
            + int(rollout_index).to_bytes(4, "big")
            + int(t).to_bytes(4, "big"))
     return int.from_bytes(hashlib.sha256(msg).digest()[:8], "big") / 2.0**64
+
+
+DRAW_INVERSE_CDF = "inverse_cdf"
+DRAW_GUMBEL_MAX = "gumbel_max"
+DRAWS = (DRAW_INVERSE_CDF, DRAW_GUMBEL_MAX)
+
+
+def check_draw(draw: str, *, t: float = 1.0, top_k: int = 0, top_p: float = 1.0) -> None:
+    """Refuse an unknown draw, and a Gumbel draw over a warped distribution: argmax(logit + G)
+    samples softmax(logits), so anything but T=1 over the full vocabulary is not its distribution."""
+    if draw not in DRAWS:
+        raise ValueError(f"unknown forced draw {draw!r}; expected one of {DRAWS}")
+    if draw == DRAW_GUMBEL_MAX and not (
+        float(t) == 1.0 and not (top_k and int(top_k) > 0) and (top_p is None or float(top_p) >= 1.0)
+    ):
+        raise ValueError(
+            f"the gumbel_max draw needs T=1 over the full vocabulary, got T={t} top_k={top_k} top_p={top_p}"
+        )
+
+
+def gumbel_key(u: float) -> int:
+    """The int64 key of a position's Gumbel noise: the public uniform's 64-bit image."""
+    unsigned = int(float(u) * 2.0**64) & _MASK64
+    return unsigned - (1 << 64) if unsigned >= 1 << 63 else unsigned
+
+
+_MASK64 = (1 << 64) - 1
+# splitmix64 constants as int64 (torch has no uint64 arithmetic); products wrap mod 2**64.
+_GOLDEN = 0x9E3779B97F4A7C15 - (1 << 64)
+_MIX1 = 0xBF58476D1CE4E5B9 - (1 << 64)
+_MIX2 = 0x94D049BB133111EB - (1 << 64)
+
+
+def _lsr(x: torch.Tensor, shift: int) -> torch.Tensor:
+    """Logical right shift of int64 (torch's >> is arithmetic)."""
+    return (x >> shift) & ((1 << (64 - shift)) - 1)
+
+
+def gumbel_uniform_bits(keys: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    """[n] keys x [V] token ids -> [n, V] int64 holding the 53-bit integer of U (see module doc)."""
+    x = keys.to(torch.int64)[:, None] * _GOLDEN + ids.to(torch.int64)[None, :] * _MIX1
+    x = (x ^ _lsr(x, 30)) * _MIX1
+    x = (x ^ _lsr(x, 27)) * _MIX2
+    x = x ^ _lsr(x, 31)
+    return _lsr(x, 11)
+
+
+def gumbel_noise(keys: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    """[n, V] float64 standard Gumbel noise for positions ``keys`` and tokens ``ids``."""
+    uniform = (gumbel_uniform_bits(keys, ids).double() + 0.5) / float(1 << 53)
+    return -torch.log(-torch.log(uniform))
+
+
+# float64 [rows, vocab] temporaries of the noise and the scores (~4 live at once).
+_GUMBEL_WORKSPACE_BYTES = 256 * 1024 * 1024
+
+
+def _gumbel_chunk_rows(vocab: int) -> int:
+    return max(1, _GUMBEL_WORKSPACE_BYTES // (max(1, vocab) * 8 * 4))
+
+
+def _gumbel_scores(logits: torch.Tensor, draws: list[float]) -> torch.Tensor:
+    """logit + G in float64 for a chunk of rows, on the logits' device."""
+    keys = torch.tensor([gumbel_key(u) for u in draws], dtype=torch.int64, device=logits.device)
+    ids = torch.arange(logits.shape[-1], dtype=torch.int64, device=logits.device)
+    return logits.double() + gumbel_noise(keys, ids)
+
+
+def pick_rows(logits: torch.Tensor, draws: list[float], *, draw: str = DRAW_INVERSE_CDF,
+              t: float = 1.0, top_k: int = 0, top_p: float = 1.0) -> torch.Tensor:
+    """The forced pick of each row of ``logits`` [n, vocab] for its public uniform ``draws[i]``,
+    as a [n] int64 tensor on the logits' device. The one batched pick the miner's processors
+    and the validator's checks share."""
+    check_draw(draw, t=t, top_k=top_k, top_p=top_p)
+    if len(draws) != int(logits.shape[0]):
+        raise ValueError("one public uniform per logits row is required")
+    if draw == DRAW_GUMBEL_MAX:
+        out = torch.empty(int(logits.shape[0]), dtype=torch.int64, device=logits.device)
+        step = _gumbel_chunk_rows(int(logits.shape[-1]))
+        for start in range(0, int(logits.shape[0]), step):
+            end = min(int(logits.shape[0]), start + step)
+            out[start:end] = _gumbel_scores(logits[start:end], draws[start:end]).argmax(dim=-1)
+        return out
+    probs = _warp_batch(logits, t=t, top_k=top_k, top_p=top_p)
+    cdf = torch.cumsum(probs, dim=-1)
+    uniforms = torch.tensor(draws, device=cdf.device, dtype=cdf.dtype).unsqueeze(1)
+    picks = torch.searchsorted(cdf, uniforms, right=True).squeeze(1)
+    return picks.clamp(max=probs.shape[-1] - 1)
+
+
+def forced_pick_diagnostics(logits: torch.Tensor, token_id: int, u: float, *,
+                            draw: str = DRAW_INVERSE_CDF, t: float = 1.0, top_k: int = 0,
+                            top_p: float = 1.0) -> tuple[bool, float]:
+    """One position: is ``token_id`` the forced pick, and how far is it from being it.
+
+    inverse_cdf: the distance from ``u`` to the token's CDF interval. gumbel_max: the
+    relative score shortfall ``1 - exp(-(s_win - s_token))`` with ``s = logit + G``, in
+    [0, 1), 0 for the pick (telemetry, like the CDF distance)."""
+    check_draw(draw, t=t, top_k=top_k, top_p=top_p)
+    token = int(token_id)
+    if draw == DRAW_GUMBEL_MAX:
+        scores = _gumbel_scores(logits.reshape(1, -1), [u])[0]
+        if int(scores.argmax()) == token:
+            return True, 0.0
+        return False, float(-torch.expm1(-(scores.max() - scores[token])).item())
+    probs = warp(logits.float(), t=t, top_k=top_k, top_p=top_p)
+    if pick(probs, u) == token:
+        return True, 0.0
+    cdf = torch.cumsum(probs, dim=-1)
+    upper = float(cdf[token].item())
+    lower = upper - float(probs[token].item())
+    u_value = float(torch.tensor(float(u), device=probs.device, dtype=probs.dtype).item())
+    if u_value < lower:
+        miss = lower - u_value
+    elif u_value >= upper:
+        miss = u_value - upper
+    else:
+        miss = 0.0
+    return False, max(0.0, float(miss))
 
 
 def _warp_batch(logits: torch.Tensor, t: float, top_k: int, top_p: float) -> torch.Tensor:
@@ -186,6 +336,7 @@ def seed_consistency_diagnostics(
     boundary_epsilon: float,
     position_offsets: list[int] | None = None,
     logit_positions: list[int] | None = None,
+    draw: str = DRAW_INVERSE_CDF,
 ) -> SeedConsistencyDiagnostics:
     """Classify exact picks and numerical CDF-boundary misses on GPU.
 
@@ -194,7 +345,14 @@ def seed_consistency_diagnostics(
     boundary-compatible when the uniform is within ``boundary_epsilon`` of
     that interval. This distinguishes numerical drift near a real decision
     boundary from generic percentage forgiveness for arbitrary branch edits.
+
+    Under ``gumbel_max`` a token is exact when it is ``argmax(logit + G)``, and
+    its miss is the relative score shortfall ``1 - exp(-(s_win - s_token))``
+    (``forced_pick_diagnostics``), classified against ``boundary_epsilon`` in
+    those units; the ``max_cdf_miss`` and ``n_miss_gt_*`` fields then carry it.
+    A position is stochastic by the same max-probability rule for both draws.
     """
+    check_draw(draw, t=t, top_k=top_k, top_p=top_p)
     available_rows = (
         len(logit_positions)
         if logit_positions is not None
@@ -224,6 +382,8 @@ def seed_consistency_diagnostics(
         1,
         min(n, _DIAGNOSTIC_FLOAT_WORKSPACE_BYTES // (vocab_size * 4)),
     )
+    if draw == DRAW_GUMBEL_MAX:
+        chunk_rows = min(chunk_rows, _gumbel_chunk_rows(vocab_size))
     counts = [0] * 8
     max_cdf_miss = 0.0
     first_hard_mismatch_offset: int | None = None
@@ -244,40 +404,17 @@ def seed_consistency_diagnostics(
             device=chunk_logits.device,
             dtype=torch.long,
         )
-        if full_support:
-            max_probs, lower, upper, mass = _interval_stats_dense(
-                chunk_logits, toks, t=t, top_k=top_k, top_p=top_p,
+        if draw == DRAW_GUMBEL_MAX:
+            exact, miss, stochastic = _gumbel_chunk_stats(
+                chunk_logits, toks, [float(x) for x in u_values[start:end]],
+                stochastic_threshold,
             )
-            fallback = torch.zeros_like(mass, dtype=torch.bool)
         else:
-            max_probs, lower, upper, mass = _interval_stats_sparse(
-                chunk_logits, toks, t=t, top_k=top_k, top_p=top_p,
+            exact, miss, stochastic = _cdf_chunk_stats(
+                chunk_logits, toks, [float(x) for x in u_values[start:end]],
+                t=t, top_k=top_k, top_p=top_p, full_support=full_support,
+                stochastic_threshold=stochastic_threshold,
             )
-            fallback = torch.isnan(mass)
-        if bool(fallback.any()):
-            # kth-value ties reached the window edge: recompute those rows on
-            # the full vocab so the sparse path never changes a verdict.
-            d_max, d_lower, d_upper, d_mass = _interval_stats_dense(
-                chunk_logits[fallback], toks[fallback],
-                t=t, top_k=top_k, top_p=top_p,
-            )
-            max_probs = max_probs.masked_scatter(fallback, d_max)
-            lower = lower.masked_scatter(fallback, d_lower)
-            upper = upper.masked_scatter(fallback, d_upper)
-            mass = mass.masked_scatter(fallback, d_mass)
-        stochastic = max_probs < stochastic_threshold
-        u = torch.tensor(
-            [float(x) for x in u_values[start:end]],
-            device=upper.device,
-            dtype=upper.dtype,
-        )
-
-        exact = (u >= lower) & (u < upper)
-        miss = torch.where(
-            u < lower,
-            lower - u,
-            torch.where(u >= upper, u - upper, torch.zeros_like(u)),
-        )
         boundary_match = exact | (miss <= float(boundary_epsilon))
         hard_mismatch = ~boundary_match
         deterministic_hard = hard_mismatch & ~stochastic
@@ -287,7 +424,7 @@ def seed_consistency_diagnostics(
                 if position_offsets is not None
                 else list(range(start, end))
             ),
-            device=upper.device,
+            device=miss.device,
             dtype=torch.long,
         )
         hard_offsets = offsets[hard_mismatch]
@@ -327,3 +464,49 @@ def seed_consistency_diagnostics(
         max_cdf_miss=max_cdf_miss,
         first_hard_mismatch_offset=first_hard_mismatch_offset,
     )
+
+
+def _gumbel_chunk_stats(chunk_logits, toks, draws, stochastic_threshold):
+    """(exact, miss, stochastic) per row under the Gumbel draw."""
+    max_probs = torch.softmax(chunk_logits.float(), dim=-1).max(dim=-1).values
+    scores = _gumbel_scores(chunk_logits, draws)
+    best = scores.max(dim=-1).values
+    token_scores = scores.gather(1, toks.unsqueeze(1)).squeeze(1)
+    exact = scores.argmax(dim=-1) == toks
+    miss = torch.where(exact, torch.zeros_like(best), -torch.expm1(-(best - token_scores)))
+    return exact, miss, max_probs < stochastic_threshold
+
+
+def _cdf_chunk_stats(chunk_logits, toks, draws, *, t, top_k, top_p, full_support,
+                     stochastic_threshold):
+    """(exact, miss, stochastic) per row under the inverse-CDF draw."""
+    if full_support:
+        max_probs, lower, upper, mass = _interval_stats_dense(
+            chunk_logits, toks, t=t, top_k=top_k, top_p=top_p,
+        )
+        fallback = torch.zeros_like(mass, dtype=torch.bool)
+    else:
+        max_probs, lower, upper, mass = _interval_stats_sparse(
+            chunk_logits, toks, t=t, top_k=top_k, top_p=top_p,
+        )
+        fallback = torch.isnan(mass)
+    if bool(fallback.any()):
+        # kth-value ties reached the window edge: recompute those rows on
+        # the full vocab so the sparse path never changes a verdict.
+        d_max, d_lower, d_upper, d_mass = _interval_stats_dense(
+            chunk_logits[fallback], toks[fallback],
+            t=t, top_k=top_k, top_p=top_p,
+        )
+        max_probs = max_probs.masked_scatter(fallback, d_max)
+        lower = lower.masked_scatter(fallback, d_lower)
+        upper = upper.masked_scatter(fallback, d_upper)
+        mass = mass.masked_scatter(fallback, d_mass)
+    stochastic = max_probs < stochastic_threshold
+    u = torch.tensor(draws, device=upper.device, dtype=upper.dtype)
+    exact = (u >= lower) & (u < upper)
+    miss = torch.where(
+        u < lower,
+        lower - u,
+        torch.where(u >= upper, u - upper, torch.zeros_like(u)),
+    )
+    return exact, miss, stochastic
