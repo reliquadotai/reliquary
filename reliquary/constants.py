@@ -1978,6 +1978,9 @@ FORCED_SEED_ROLLOUT_FLOOR = 0.70 if PROTOCOL_VERSION >= 4 else 0.75
 # positions; below it the per-rollout check abstains (never false-reject a
 # short / peaked honest rollout).
 FORCED_SEED_ROLLOUT_MIN_STOCH = 20
+# Async RL (rl-async-design.md §4.6): per-rollout match floor of the trainer's verification and of pay.
+# PLACEHOLDER until GPU qualification (bf16 heads; about 0.96 with fp32 heads).
+RL_ROLLOUT_MATCH_FLOOR = 0.95
 # Candidate tolerance for exact per-position CDF interval verification.
 # A mismatch farther than this from the submitted token's validator-computed
 # interval is a hard mismatch rather than numerical boundary ambiguity. The

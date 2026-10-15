@@ -31,6 +31,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from reliquary.constants import RL_ROLLOUT_MATCH_FLOOR
 from reliquary.validator import corpus_periods as cp
 from reliquary.validator.rl_submit import BAN, FIRST_SCAN, TRAINED
 
@@ -54,7 +55,7 @@ CREATE TABLE IF NOT EXISTS rl_pay_periods(work_period INTEGER PRIMARY KEY, entry
 class LedgerConfig:
     task_id: str
     cap: float                       # the task's emission cap: what one period pays at most
-    floor: float = 0.95              # per-rollout match floor (design §4.6)
+    floor: float = RL_ROLLOUT_MATCH_FLOOR  # per-rollout match floor (design §4.6)
     reference_groups: int = 200
     default_group_tokens: int = 16384
     slack_s: float = 120.0
