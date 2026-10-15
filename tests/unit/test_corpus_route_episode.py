@@ -389,3 +389,14 @@ def test_an_unknown_intake_reason_is_a_server_error(episode_store):
         job_id="swe-agentic-v1", store=episode_store, tokenizer=TOKENIZER, renderer=None,
         verify_signature=lambda r: True, proof_chunk_tokens=32, episode_intake=Broken()))
     assert TestClient(app).post("/corpus/submit", json=_request().model_dump()).status_code == 500
+
+
+def test_a_transcript_on_a_replay_job_is_malformed(episode_store):
+    """C1: a replay job never stores a transcript (its export would read the record as
+    a signed one)."""
+    records, accepted = _Records(), []
+    request = _request(transcript={"token": {"claims": {}}, "records": []})
+    body = _post(_client(episode_store, records, accepted), request)
+    assert (body["accepted"], body["reason"]) == (False, "malformed_submission"), body
+    assert body["detail"]["transcript"]
+    assert records.written == {} and accepted == []

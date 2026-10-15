@@ -22,7 +22,11 @@ dependencies = [
     "pydantic>=2.3,<3.0.0",
     "requests>=2.28.0",
     "httpx>=0.25.0",
-    "huggingface-hub>=0.20.0",
+    # Pinned exact: the proof worker reads the Hub commit list through
+    # huggingface_hub private internals (utils._pagination.paginate,
+    # HfApi._build_hf_headers). 1.30.0 is the version the published image
+    # already runs (docker/logic-runtime-requirements.lock reinstalls it).
+    "huggingface-hub==1.30.0",
     "datasets>=2.14.0",
     "aiobotocore>=2.0.0",
     "boto3>=1.24.0",
@@ -44,6 +48,16 @@ dev = [
 wandb = [
     "wandb>=0.16",
 ]
+# Signed-episode sandboxes (plan 3): reliquary-sandbox, public, pinned by one commit.
+sandbox = [
+    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@be50c76824aaccd6506d8f50a84941b4cd548f6f",
+]
+sandbox-miner = [
+    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@be50c76824aaccd6506d8f50a84941b4cd548f6f",
+]
+sandbox-test = [
+    "reliquary-sandbox[service] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@be50c76824aaccd6506d8f50a84941b4cd548f6f",
+]
 
 [project.scripts]
 reliquary = "reliquary.cli.main:app"
@@ -51,6 +65,9 @@ reliquary = "reliquary.cli.main:app"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

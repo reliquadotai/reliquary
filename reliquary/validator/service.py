@@ -14,7 +14,9 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import threading
 import time
+from types import SimpleNamespace
 from typing import Any, Callable
 
 from reliquary.constants import (
@@ -106,6 +108,7 @@ from reliquary.constants import (
     prompt_cooldown_windows_for_environment,
     thinking_for_environment,
 )
+from reliquary.shared.checkpoint_namespace import active_checkpoint_namespace
 from reliquary.environment import load_environments
 from reliquary.environment.base import Environment
 from reliquary.infrastructure import chain, storage
@@ -197,7 +200,21 @@ _PRICE_ARCHIVE_FIELDS = (
 )
 
 
-def _window_price_signal(first_batcher, batcher_dict, target_for):
+def _pools_by_environment(assembler, names) -> dict[str, float]:
+    """Each named environment's pool from the assembler, skipping any it does
+    not price: an archive field must never cost the window its archive."""
+    pools: dict[str, float] = {}
+    for name in names:
+        try:
+            pools[str(name)] = float(assembler.pool_for(name))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return pools
+
+
+def _window_price_signal(
+    first_batcher, batcher_dict, target_for, *, trainer_wait_seconds_by_environment=None,
+):
     """The window's price signal for the archive, or None if unmeasurable.
 
     Everything it needs already exists at seal: ``window_open_drand_round`` is
@@ -258,10 +275,24 @@ def _window_price_signal(first_batcher, batcher_dict, target_for):
         # The trainer has been working since the FIRST environment picked, so
         # the earliest pick is where the window's training span starts.
         first_pick_round=min(first_pick_rounds) if first_pick_rounds else None,
+        trainer_wait_seconds_by_environment=trainer_wait_seconds_by_environment,
     )
 
 
 logger = logging.getLogger(__name__)
+
+# Published row statuses of the service lanes that are NOT trained (decision B/C, R8, R23).
+_SERVICE_EXPLORATION_STATUSES = frozenset({
+    "exploration_recording", "exploration_pending", "exploration_audit_queued", "exploration_audit_passed",
+    "exploration_forfeited", "exploration_unaudited", "exploration_unpaid", "exploration_banned",
+    "exploration_cap_reached", "exploration_window_closed", "already_scanned",
+    "service_unproven_recording", "service_unproven_published",
+    "exploration_unavailable", "service_record_failed", "service_policy_limit",
+})
+
+# m5: verdict keys that name the prompt of a service observation (``prompt_hash_lead`` is a hash of
+# the index: it names it too). Withheld from its verdict on every route.
+_SERVICE_OBSERVATION_WITHHELD = frozenset({"prompt_idx", "prompt_hash_lead"})
 
 _HF_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _STARTUP_HASH_REBUILD_TIMEOUT_SECONDS = 180.0
@@ -273,29 +304,62 @@ _STARTUP_HASH_REBUILD_CHUNK_WINDOWS = 16
 # seconds-to-a-minute, not a hot loop. Not an operator knob: nothing
 # downstream is sized off it.
 FILL_CLOSED_ROTATION_POLL_SECONDS = 2.0
+# How often the requested envs are built ahead of the boundary, and how long a block whose checks refused it
+# there is left alone before it is tried again (reading the installed distributions takes about a second).
+PRESTAGE_SECONDS = 30.0
+PRESTAGE_RETRY_SECONDS = 300.0
+# A background build of an added env running longer than this is reported stalled (its request keeps waiting,
+# within the runtime's bound); the boot waits at most BOOT_ADDED_BUILD_TIMEOUT_S for them, then starts without.
+ADDED_BUILD_TIMEOUT_S = 900.0
+BOOT_ADDED_BUILD_TIMEOUT_S = 900.0
+# An added env this validator cannot serve is built again after this backoff, doubling up to the maximum.
+ADDED_RETRY_MIN_S = 60.0
+ADDED_RETRY_MAX_S = 3600.0
+
+
+def _renormalised_shares(shares: dict[str, int]) -> dict[str, int]:
+    """``shares`` scaled to sum to 10000 in the same proportions (largest remainders; equal when all are 0)."""
+    names = sorted(shares)
+    weights = [max(0, int(shares[name])) for name in names]
+    total = sum(weights)
+    if total == 0:
+        weights, total = [1] * len(names), len(names)
+    raw = [10000 * weight / total for weight in weights]
+    result = [int(value) for value in raw]
+    for index in sorted(range(len(names)), key=lambda i: (result[i] - raw[i], names[i]))[:10000 - sum(result)]:
+        result[index] += 1
+    return dict(zip(names, result))
 
 
 def _cooldown_snapshot_key(run_id: str) -> str:
     """R2 key for the run-keyed cooldown snapshot."""
+    namespace = active_checkpoint_namespace()
+    if namespace.scoped:
+        return f"{namespace.prefix}/cooldown_snapshots/{run_id}.json"
     return f"cooldown_snapshots/{run_id}.json"
 
 
-def _cooldown_local_path(run_id: str) -> Path:
-    state_dir = Path(
+def _validator_state_dir() -> Path:
+    return active_checkpoint_namespace().local_path(
         os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
     )
+
+
+def _cooldown_local_path(run_id: str) -> Path:
+    state_dir = _validator_state_dir()
     safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
     return state_dir / "cooldown" / f"{safe_run_id}.json.gz"
 
 
 def _content_cooldown_snapshot_key(run_id: str) -> str:
+    namespace = active_checkpoint_namespace()
+    if namespace.scoped:
+        return f"{namespace.prefix}/content_cooldown_snapshots/{run_id}.json.gz"
     return f"content_cooldown_snapshots/{run_id}.json.gz"
 
 
 def _content_cooldown_local_path(run_id: str) -> Path:
-    state_dir = Path(
-        os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
-    )
+    state_dir = _validator_state_dir()
     safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
     return state_dir / "content_cooldown" / f"{safe_run_id}.json.gz"
 
@@ -306,9 +370,7 @@ def _prompt_mismatch_circuit_local_path(
     netuid: int,
     validator_hotkey: str,
 ) -> Path:
-    state_dir = Path(
-        os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
-    )
+    state_dir = _validator_state_dir()
     safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
     validator_tag = hashlib.sha256(
         str(validator_hotkey).encode("utf-8")
@@ -326,9 +388,7 @@ def _no_reveal_circuit_local_path(
     netuid: int,
     validator_hotkey: str,
 ) -> Path:
-    state_dir = Path(
-        os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
-    )
+    state_dir = _validator_state_dir()
     safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id)
     validator_tag = hashlib.sha256(
         str(validator_hotkey).encode("utf-8")
@@ -752,7 +812,124 @@ def _coerce_lr_schedule_step(raw) -> int | None:
     return raw if raw >= 0 else None
 
 
+def _closing_service_runtime_on_failure(init):
+    """A constructor that fails after it opened the service runtime closes it (SQLite handle).
+
+    Nothing happens for a task without a service runtime: the error is re-raised as it is.
+    """
+    @functools.wraps(init)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return init(self, *args, **kwargs)
+        except BaseException:
+            runtime = getattr(self, "_service_runtime", None)
+            if runtime is not None:
+                try:
+                    runtime.close()
+                except Exception:
+                    logger.exception("service runtime could not be closed after a failed start")
+            raise
+    return wrapper
+
+
+def _service_request_folder(folder: Path) -> Path:
+    """The folder of a service task's runtime database and schedule requests.
+
+    Created 0700 when the validator itself creates it (whatever the umask). A folder that is
+    already there is never chmod-ed: if another user owns it or group/others can write it, it is
+    refused as a request channel (the request store refuses every request read from it) and that
+    is logged here, once per boot, with what the operator has to do.
+    """
+    from reliquary.services.schedule import UnsafeLocation, _check_owner_and_mode
+
+    try:
+        folder.mkdir(mode=0o700, parents=True)
+    except FileExistsError:
+        try:
+            _check_owner_and_mode(folder.stat(), f"folder {folder}")
+        except UnsafeLocation as exc:
+            logger.error(
+                "service request folder refused: %s (mode %04o). Schedule requests are "
+                "ignored until the operator fixes it (chmod 700, owned by the validator's "
+                "user) and restarts; the validator does not change an existing folder",
+                exc, folder.stat().st_mode & 0o7777,
+            )
+    else:
+        os.chmod(folder, 0o700)   # mkdir's mode is narrowed by the umask and never widened; be explicit
+    return folder
+
+
+def _discard_unactivated_service_window(runtime, recovery, window: int) -> None:
+    """I3: drop what the runtime froze for a candidate window that was never activated.
+
+    BLOCKING (SQLite). A window with a recovery record WAS activated: it is recovered
+    from its journal, never rebuilt. The runtime itself refuses a window holding an
+    observation, a ledger row or a settlement.
+    """
+    from reliquary.services.runtime import ServicePolicyLimit
+
+    try:
+        frozen = runtime.envelope(window)
+    except ServicePolicyLimit:
+        return
+    if recovery is not None and recovery._path(window).exists():
+        raise RuntimeError(
+            f"service window {window} was activated (it has a recovery record); "
+            "it is recovered from its journal, never rebuilt"
+        )
+    runtime.discard_unactivated_window(window)
+    logger.warning(
+        "service window %d was frozen on checkpoint %s (schedule revision %s) and never "
+        "activated; that envelope and its beacon are discarded, the window is frozen again "
+        "on the current checkpoint and schedule with a fresh beacon",
+        window, frozen["checkpoint"]["revision"][:12], frozen["schedule"].get("revision"),
+    )
+
+
+def _paid_from_archive(archive: dict, batchers: dict) -> dict:
+    """{env: [(batch_index, group-like)]} of a recovered archive's paid rows (identity fields only)."""
+    paid: dict = {name: [] for name in batchers}
+    for row in archive.get("batch") or ():
+        if row.get("env_name") in paid:
+            paid[row["env_name"]].append((row["batch_index"], SimpleNamespace(
+                hotkey=row["hotkey"], prompt_idx=row["prompt_idx"],
+                merkle_root=bytes.fromhex(row["merkle_root"]))))
+    return paid
+
+
+async def _enqueue_aborted_window_off_loop(service, **kwargs) -> None:
+    """The window loop's tombstone call. Legacy RL tasks and corpus jobs (no service runtime): the
+    synchronous ``_enqueue_aborted_window``, exactly as before. A service task: its variant whose
+    blocking steps run in a worker thread (m3)."""
+    if getattr(service, "_service_runtime", None) is None:
+        service._enqueue_aborted_window(**kwargs)
+        return
+    await service._enqueue_aborted_service_window(**kwargs)
+
+
+def _read_publication_receipt(snapshot_dir) -> dict | None:
+    """The trainer publication receipt of a downloaded snapshot, or None (absent, unreadable, not a map).
+    BLOCKING (file read). Service tasks only: it proves an unadopted checkpoint's lineage (I2)."""
+    from reliquary.shared.strict_json import strict_json_loads
+    from reliquary.trainer.publisher import PUBLICATION_RECEIPT
+
+    try:
+        receipt = strict_json_loads((Path(snapshot_dir) / PUBLICATION_RECEIPT).read_bytes())
+    except Exception:
+        return None
+    return receipt if isinstance(receipt, dict) else None
+
+
+def _require_service_checkpoint_lineage(runtime, *, checkpoint_n, repo, revision, digest, receipt) -> None:
+    """I1: the staged checkpoint continues the order's lineage. BLOCKING read (SQLite), no mutation."""
+    runtime.require_adoptable(
+        checkpoint_n=checkpoint_n, repo=repo, revision=revision, sha256=digest,
+        parent_revision=receipt.get("parent_revision"),
+    )
+
+
 class ValidationService:
+    @_closing_service_runtime_on_failure
     def __init__(
         self,
         wallet,
@@ -786,9 +963,85 @@ class ValidationService:
         price_params: Any | None = None,
         proof_worker_pool: Any = None,
         signer_client: Any | None = None,
+        service_contract: Any | None = None,
     ) -> None:
+        from reliquary.constants import DETACHED_TRAINER
+
+        if active_checkpoint_namespace().scoped and not DETACHED_TRAINER:
+            raise ValueError("task-scoped checkpoints require the detached trainer")
+        self._service_runtime = None
+        self._service_schedule_store = None
+        self._service_folder: Path | None = None
+        # Envs a schedule request adds to the running run: built off the loop when the request is first seen
+        # (``_prebuilt``), checked and staged at the boundary (``_staged_envs``), installed between windows.
+        self._staged_envs: dict = {}
+        self._prebuilt: dict = {}
+        self._activation_memo: dict = {}
+        self._prestage_refused: dict = {}
+        self._builds: dict = {}             # env -> (digest, started, thread): one background build per env
+        self._build_failures: dict = {}     # env -> (digest, reason, transient): its last failed build
+        self._added_retry: dict = {}        # env -> (attempts, next build at): an added env not served
+        self._added_alerts: dict = {}       # env -> the reason last ALERTed
+        self._prestage_guard = threading.RLock()
+        # The installed distributions at start (an added env's install may add its own, nothing else).
+        self._boot_distributions: dict | None = None
+        # The next service window as prepared at the boundary (None for every other task).
+        self._candidate_service_window: dict[str, Any] | None = None
+        self._candidate_service_pools: dict[str, float] | None = None
+        # Service windows whose seal reached the archive step (their exploration is
+        # payable even with an empty training batch), and the boundary at which each
+        # window left unarchived was last retried. Empty for every other task.
+        self._service_sealed_windows: set[int] = set()
+        self._service_recovery_attempts: dict[int, int] = {}
+        self._service_recovery_context: dict[int, tuple] = {}
+        # I2: (revision, publication receipt) of the last service checkpoint installed or resumed.
+        self._service_installed_receipt: tuple[str, dict] | None = None
+        if service_contract is not None:
+            from reliquary.constants import FILL_CLOSED_ENABLED, PIPELINED_WINDOWS, ENFORCE_ENVELOPE_SIGNATURE
+            from reliquary.services.runtime import ServiceRuntime
+            from reliquary.services.schedule import ScheduleRequestStore
+            from reliquary.shared.strict_json import strict_json_loads
+            if getattr(service_contract, "version", None) != 2:
+                raise ValueError("RL service tasks need service-contract/v2")
+            if not DETACHED_TRAINER or not FILL_CLOSED_ENABLED or PIPELINED_WINDOWS or not ENFORCE_ENVELOPE_SIGNATURE:
+                raise ValueError("service policies require signed, serial fill-closed detached execution")
+            if not use_drand:
+                # The window's public seed pool and the audit draws are drand beacons.
+                raise ValueError("service policies require drand window randomness")
+            namespace = active_checkpoint_namespace()
+            namespace.require_policy(service_contract.to_dict()["policies"]["checkpoint"])
+            if not namespace.scoped:
+                raise ValueError("service training requires task-scoped checkpoint lineage")
+            source = os.environ.get("RELIQUARY_SERVICE_QUALIFICATION")
+            if not source:
+                raise ValueError("service task requires its operator-approved runtime qualification")
+            source_path = Path(source)
+            if not source_path.is_absolute() or source_path.stat().st_size > 16 * 1024 * 1024:
+                raise ValueError("runtime qualification must be a bounded absolute local file")
+            qualification = strict_json_loads(source_path.read_bytes())
+            from reliquary.shared.training_payload import active_training_identity
+            if service_contract.to_dict()["generation_contract_sha256"] != active_training_identity()["generation_contract_sha256"]:
+                raise ValueError("service generation contract differs from the active runtime")
+            folder = _service_request_folder(
+                Path(os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")) / "service-policies" / namespace.task_id / namespace.run_id
+            )
+            self._service_runtime = ServiceRuntime(folder / "runtime.sqlite3", service_contract, qualification)
+            self._service_folder = folder
+            # The operator's schedule requests live beside the runtime database
+            # (``python -m reliquary.services.schedule --folder <this folder>``).
+            self._service_schedule_store = ScheduleRequestStore(folder)
+            if self._service_runtime.order_contract.episode_environments:
+                # Before anything is installed or built: what an added env's install is compared with.
+                from reliquary.validator.catalogue_activation import installed_distributions
+
+                try:
+                    self._boot_distributions = installed_distributions()
+                except Exception as exc:
+                    logger.error("installed distributions unreadable at start (%s: %s): no env can be added to "
+                                 "this run before a restart", type(exc).__name__, exc)
         self.wallet = wallet
         self._signer_client = signer_client
+        self._require_publication_signer()
         self._network_proof = getattr(proof_worker_pool, "is_remote", False) is True
         if self._network_proof:
             from reliquary.constants import DETACHED_TRAINER
@@ -880,11 +1133,28 @@ class ValidationService:
             if any(int(target) <= 0 for _name, target in self.env_mix):
                 raise ValueError("environment targets must be positive")
             env_names = [n for n, _ in self.env_mix]
-            self.envs = load_environments(env_names)
+            self.envs = self._load_launch_environments(env_names)
+        # The launch envs (never the envs a schedule added): what the prompt circuits are namespaced by.
+        self._launch_envs = dict(self.envs)
 
         self.env_targets = {
             str(name): int(target) for name, target in self.env_mix
         }
+        # The envs of the window being built or running. Only a service task
+        # ever narrows it (to its schedule's active envs).
+        self._window_env_mix: list[tuple[str, int]] = list(self.env_mix)
+        if self._service_runtime is not None:
+            # O1: the proof plane checks every token id against the model's embedding size before the forward
+            # pass; without the size the service cannot tell a crafted id from an honest one.
+            from reliquary.shared.hf_compat import resolve_vocab_size
+            if resolve_vocab_size(getattr(self.verify_model, "config", None)) is None:
+                raise ValueError("service task needs the model's vocab_size (model config missing or without it)")
+            # R7: what must be installed is what the PERSISTED schedule runs now,
+            # not only what the order activated at launch.
+            # (A refusal closes the runtime: see ``_closing_service_runtime_on_failure``.)
+            # The envs the persisted schedule added to the run, rebuilt before they are checked and before
+            # anything below reads the runtime's contract (cooldowns, proof scheduler, RL services).
+            self._require_service_environments(self._install_added_envs(self._service_runtime.schedule))
 
         # Legacy accessor — archive code and tests grew up around single-env.
         # Points to the first env in the mix; consumers needing all envs
@@ -942,9 +1212,16 @@ class ValidationService:
                         f"proof device {device!r} has no model replica"
                     )
                 self._proof_models[device] = candidate
+            scheduler_environments = tuple(self.envs)
+            if self._service_runtime is not None:
+                # One live plan per scheduler environment: the exploration audits (priority 5) get a
+                # pseudo-environment each so they run beside the training plan, behind it.
+                from reliquary.validator.batcher import audit_scheduler_environment
+
+                scheduler_environments += tuple(audit_scheduler_environment(name) for name in self.envs)
             self.proof_scheduler = GlobalProofScheduler(
                 devices=normalized_devices,
-                environments=tuple(self.envs),
+                environments=scheduler_environments,
                 proof_callable=self._execute_scheduled_proof,
             )
 
@@ -967,6 +1244,21 @@ class ValidationService:
             )
             for name in self.envs
         }
+        if self._service_runtime is not None:
+            # A service env cools down for what its live schedule says, so the
+            # history restored at startup is kept over that horizon.
+            schedule = self._service_runtime.schedule
+            # An env the schedule added that this boot could not load keeps its cooldown too: restored from
+            # the snapshot, replayed, snapshotted again, and used as it is once the env is installed.
+            unloaded = [name for name in schedule.added_environments() if name not in self.envs]
+            for name in [*self.envs, *unloaded]:
+                if name in self._service_runtime.contract.environments:
+                    horizon = schedule.cooldown_windows(name)
+                    self._cooldown_per_env[name] = CooldownMap(cooldown_windows=horizon)
+                    self._content_cooldown_per_env[name] = ContentCooldownMap(cooldown_windows=horizon)
+            # An episode precommit on a task in cooldown is refused by the runtime: the
+            # maps are looked up at call time, a new window may have replaced them.
+            self._service_runtime.task_in_cooldown = self._episode_task_in_cooldown
         self._content_cooldown_health: dict[str, Any] = {
             "complete": False,
             "source": "not_restored",
@@ -1010,7 +1302,7 @@ class ValidationService:
             run_id=TRAINING_RUN_ID,
             netuid=self.netuid,
             validator_hotkey=validator_hotkey,
-            environments=self.envs,
+            environments=self._launch_envs,
         )
         self.server = ValidatorServer(
             host=http_host,
@@ -1030,6 +1322,17 @@ class ValidationService:
             emission_cap=self._emission_cap,
         )
         self.server.set_late_drop_callback(self.record_late_drop)
+        from reliquary.validator.rl_pay import RlPayBoard
+
+        # GET /rl/pay: fed one window at a time below, seeded at startup.
+        self._rl_pay = RlPayBoard()
+        self.server._rl_pay_board = self._rl_pay
+        # A service run never names a not-yet-opened candidate window or its stage on /health.
+        self.server.service_health_redaction = self._service_runtime is not None
+        if service_contract is not None:
+            # N3: no verdict of a service process names its prompt, the EARLY one recorded at arrival
+            # included (it would tie a public exploration observation to its hotkey).
+            self.server._verdict_withhold = _SERVICE_OBSERVATION_WITHHELD
         self.server.configure_prompt_source_health(
             self._prompt_source_health_snapshot
         )
@@ -1567,6 +1870,8 @@ class ValidationService:
         intake = self._checkpoint_intake
         manifest, staged_dir = intake.take_staged()
         revision = "<invalid>"
+        service_runtime = getattr(self, "_service_runtime", None)
+        installation_started = False
         try:
             checkpoint_n, repo_id, revision = canonical_checkpoint_identity(
                 manifest.get("checkpoint_n"),
@@ -1580,6 +1885,30 @@ class ValidationService:
                 manifest.get("trained_window_cursor"),
                 field="staged checkpoint trainer cursor",
             )
+            checkpoint_digest = None
+            if service_runtime is not None:
+                from reliquary.protocol.release_contract import canonical_sha256
+                from reliquary.shared.strict_json import strict_json_loads
+                from reliquary.trainer.publisher import PUBLICATION_RECEIPT
+                receipt = strict_json_loads((staged_dir / PUBLICATION_RECEIPT).read_bytes())
+                expected_manifest = {k: v for k, v in manifest.items() if k != "revision"}
+                if (not isinstance(receipt, dict) or receipt.get("manifest") != expected_manifest
+                        or not isinstance(receipt.get("files"), dict) or not receipt["files"]):
+                    raise ValueError("service checkpoint publication receipt mismatch")
+                checkpoint_digest = canonical_sha256(receipt["files"])
+                # One order, one checkpoint lineage: the repository never changes.
+                if service_runtime.contract.to_dict()["checkpoint"]["repo"] != repo_id:
+                    raise ValueError("service checkpoint repository mismatch")
+                # The order pins its root (revision and digest) and every later
+                # checkpoint is a child of the current one. Checked before anything
+                # is recorded, bound or installed.
+                await asyncio.to_thread(
+                    functools.partial(
+                        _require_service_checkpoint_lineage, service_runtime,
+                        checkpoint_n=checkpoint_n, repo=repo_id, revision=revision,
+                        digest=checkpoint_digest, receipt=receipt,
+                    )
+                )
             # Persist the trainer cursor binding before changing the active
             # checkpoint. Readiness also requires the active manifest to equal
             # this candidate, so a failed swap remains closed; a crash after a
@@ -1596,11 +1925,40 @@ class ValidationService:
                 await asyncio.to_thread(
                     self._synchronize_proof_models, revision, str(staged_dir),
                 )
+            installation_started = True
+            if service_runtime is not None:
+                # I2: kept in memory before the install, so a failed adoption is healed at the next
+                # boundary (``ensure_checkpoint`` with this receipt) instead of stalling the order.
+                self._service_installed_receipt = (revision, receipt)
+                # N1: and on disk, in the runtime SQLite, BEFORE the install: a failed adoption ends this
+                # process (FatalProofPlaneError), and the restarted one heals from this row.
+                await asyncio.to_thread(
+                    functools.partial(service_runtime.record_pending_install, revision=revision, receipt=receipt)
+                )
             entry = await asyncio.to_thread(
                 self._checkpoint_store.install_external,
                 checkpoint_n,
                 revision,
             )
+            if service_runtime is not None:
+                # SQLite commits (fsync): off the event loop, like the install above. Adoption FIRST
+                # (I2): the consumption Q is telemetry and never stands between an install and it.
+                await asyncio.to_thread(
+                    functools.partial(
+                        service_runtime.adopt, checkpoint_n=checkpoint_n, repo=repo_id,
+                        revision=revision, sha256=checkpoint_digest,
+                    )
+                )
+                try:
+                    await asyncio.to_thread(
+                        service_runtime.record_consumption, manifest["trained_window_cursor"],
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "service checkpoint %s: trainer consumption not recorded (%s: %s); "
+                        "telemetry only, the checkpoint is adopted",
+                        revision[:12], type(exc).__name__, exc, exc_info=True,
+                    )
             self._checkpoint_n = checkpoint_n
             self.server.set_current_checkpoint(entry)
             intake.mark_installed(revision, staged_dir)
@@ -1614,7 +1972,11 @@ class ValidationService:
             )
         except FatalProofPlaneError:
             raise
-        except Exception:
+        except Exception as exc:
+            if service_runtime is not None and installation_started:
+                raise FatalProofPlaneError(
+                    f"service checkpoint installation/adoption failed for {revision[:12]}; restart before reopening admission"
+                ) from exc
             logger.exception(
                 "staged checkpoint swap failed for %s; staying on the "
                 "current revision", revision[:12],
@@ -1767,16 +2129,14 @@ class ValidationService:
             FillClosedRotationStore,
         )
 
-        state_dir = Path(
-            os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
-        )
+        state_dir = _validator_state_dir()
         recovery = FillClosedRecoveryStore(state_dir)
         queue_dir = getattr(getattr(self, "_training_payload_queue", None), "queue_dir", Path(_default_queue_dir()))
         recovery.quarantine_uncommitted(Path(queue_dir))
         queue = self._training_payload_queue_ref()
         store = FillClosedRotationStore(state_dir)
         for window in recovery.windows():
-            recovery.recover(window, queue=queue, archives=get_archive_queue(), rotation=store)
+            recovery.recover(window, queue=queue, archives=get_archive_queue(), rotation=store, service_runtime=getattr(self, "_service_runtime", None))
         gate = store.load()
         self._fill_closed_recovery_store = recovery
         self._fill_closed_rotation_store = store
@@ -2327,6 +2687,24 @@ class ValidationService:
             resolve_resume_source,
         )
 
+        if active_checkpoint_namespace().scoped:
+            source = parse_resume_source(self._resume_from)
+            if not isinstance(source, ShaSource):
+                raise ValueError("scoped checkpoint resume requires a published immutable SHA")
+            intake = self._detached_intake_ref()
+            candidate = await asyncio.to_thread(intake.poll, include_installed=True)
+            if candidate is None or candidate.get("revision") != source.sha:
+                raise ValueError("scoped resume must match its published candidate")
+            if not await asyncio.to_thread(intake.stage, candidate):
+                raise RuntimeError("scoped resume staging failed: " + str(intake.last_error))
+            await self._swap_staged_checkpoint(self._window_n)
+            installed = self._checkpoint_store.current_manifest()
+            if installed is None or (installed.checkpoint_n, installed.repo_id, installed.revision) != (
+                candidate["checkpoint_n"], candidate["repo_id"], candidate["revision"],
+            ):
+                raise RuntimeError("scoped resume checkpoint was not adopted")
+            return
+
         def _commit_title(repo_id, revision):
             from huggingface_hub import HfApi
             api = HfApi()
@@ -2344,6 +2722,10 @@ class ValidationService:
                     "reliquary_protocol_profile.json", "config.json", "generation_config.json",
                     "tokenizer*", "special_tokens_map.json", "vocab.json", "merges.txt",
                 ]
+                if getattr(self, "_service_runtime", None) is not None:
+                    # I2: the publication receipt proves an unadopted resume target's lineage.
+                    from reliquary.trainer.publisher import PUBLICATION_RECEIPT
+                    options["allow_patterns"].append(PUBLICATION_RECEIPT)
             return snapshot_download(repo_id=repo_id, revision=revision, **options)
 
         source = parse_resume_source(self._resume_from)
@@ -2353,6 +2735,18 @@ class ValidationService:
             download_fn=_download,
             commit_title_fn=_commit_title,
         )
+        runtime = getattr(self, "_service_runtime", None)
+        if runtime is not None and isinstance(source, ShaSource):
+            # An ancestor of the lineage head is refused at start, not at the first window boundary.
+            # I2: a target installed but never adopted (a crash in between) passes with its receipt
+            # when it is the head's child; the first boundary (or the scoped swap) adopts it.
+            receipt = await asyncio.to_thread(_read_publication_receipt, local_path)
+            await asyncio.to_thread(
+                functools.partial(
+                    runtime.require_resumable, checkpoint_n=checkpoint_n,
+                    repo=self._checkpoint_store.repo_id, revision=source.sha, receipt=receipt))
+            if receipt is not None:
+                self._service_installed_receipt = (source.sha, receipt)
         from reliquary.validator.checkpoint_profile import (
             validate_checkpoint_profile,
         )
@@ -2444,6 +2838,1024 @@ class ValidationService:
 
 
 
+    # ----- service-contract/v2 window wiring. Reached only with a service runtime. -----
+
+    def _load_launch_environments(self, env_names: list[str]) -> dict:
+        """The mix's envs: the order's catalogue envs built through the bridge, every other one installed."""
+        bridged = self._launch_bridged_configs()
+        return {name: (self._build_bridged(bridged[name]) if name in bridged
+                       else load_environments([name])[name]) for name in env_names}
+
+    def _launch_bridged_configs(self) -> dict:
+        """The order's episode envs served through the verifiers bridge: those whose entry carries a public
+        ``catalogue``. ``{env: BridgedEnvConfig}``."""
+        from reliquary.environment.bridged_episode import BridgedEnvConfig
+
+        runtime = getattr(self, "_service_runtime", None)
+        if runtime is None:
+            return {}
+        contract = runtime.contract
+        configs = {}
+        for name in contract.episode_environments:
+            catalogue = contract.catalogue_of(name)
+            if catalogue is not None:
+                configs[name] = BridgedEnvConfig.from_catalogue(name, catalogue)
+        return configs
+
+    def _build_bridged(self, config):
+        """A bridged episode env of the order: built, its identity checked against the order's pin, its spec
+        registered (the manifest is its version, which ``_service_environment_problem`` compares)."""
+        from reliquary.environment.bridged_episode import build_environment, catalogue_spec
+        from reliquary.environment.registry import register_catalogue_spec
+
+        environment = build_environment(config)
+        pinned = self._service_runtime.contract.episode_policy(config.environment).env_package
+        if environment.source.identity != pinned:
+            raise ValueError(f"{config.environment}: {environment.source.identity} is installed, the order pins {pinned}")
+        register_catalogue_spec(catalogue_spec(config.environment, environment.source.manifest_sha256()))
+        return environment
+
+    def _service_installed_version(self, name: str) -> str | None:
+        staged = getattr(self, "_staged_envs", {}).get(name)
+        if staged is not None:      # an env added to the run, built and checked, not installed yet
+            return staged.source.manifest_sha256()
+        from reliquary.services.schedule import default_installed_version
+
+        return default_installed_version(name)
+
+    def _service_environment_problem(self, name: str) -> str | None:
+        """Why this validator cannot run service environment ``name`` (None: it can)."""
+        from reliquary.services.runtime import protocol_slot_geometry
+
+        declared = self._service_runtime.contract.environments.get(name)
+        if declared is None:
+            return "is not declared by the order"
+        env = self.envs.get(name) or getattr(self, "_staged_envs", {}).get(name)
+        if env is None:
+            return "is not loaded by this validator"
+        if self._service_installed_version(name) != declared["version"]:
+            return "is installed at another version than the one the order pins"
+        # A rollout's env_name is the name of the env that served the prompt and
+        # graded it: the batcher reads ``env.name``, the archive the mix key.
+        if getattr(env, "name", None) != name:
+            return "is loaded under another name"
+        try:
+            rows = len(env)
+        except Exception:
+            return "has no dataset size"
+        if rows != declared["dataset"]["rows"]:
+            return "has another dataset size than the order"
+        # R9: the group count per pick is the protocol's, whatever the share.
+        target = self.env_targets.get(name)
+        if target is None and name in getattr(self, "_staged_envs", {}):
+            target = protocol_slot_geometry()[1]          # installed with the protocol's count at the boundary
+        if target != protocol_slot_geometry()[1]:
+            return "has a group count per pick that differs from the protocol's"
+        return None
+
+    def _require_service_environments(self, schedule) -> None:
+        """R7: every ACTIVE env of ``schedule`` is loaded, at the pinned version."""
+        problems = [
+            f"{name} {problem}"
+            for name in schedule.active_environments()
+            if (problem := self._service_environment_problem(name)) is not None
+        ]
+        if problems:
+            raise ValueError(
+                "service schedule activates environments this validator cannot "
+                "run: " + "; ".join(problems)
+            )
+
+    def _service_activation_version(self, name: str) -> str | None:
+        """What the runtime's activation check sees as the installed version of ``name``.
+
+        A request can never switch on an env the next window could not build: unless
+        this process can really run it, the request is refused with the actual reason
+        (``ScheduleRefused``, which the runtime records as the request's status).
+        """
+        from reliquary.services.schedule import ScheduleRefused
+
+        problem = self._service_environment_problem(name)
+        if problem is None:
+            return self._service_installed_version(name)
+        logger.error("service environment %s cannot be activated: it %s", name, problem)
+        raise ScheduleRefused(f"cannot activate {name}: the environment {problem}")
+
+    # ----- envs added to the running run (a schedule request's ``add``) -----
+    #
+    # One added env, broken, refused or slow, never stops a window from opening nor the validator from booting:
+    # the run goes on without it, with an ALERT. An add is checked in full (the RL services' dry run included)
+    # before its schedule commits; an env that still cannot be served afterwards stays unloaded and is retried
+    # with a backoff, and an ACTIVE one is switched off by a successor schedule revision. Only background
+    # threads build an env (each build claimed once, bounded by ADDED_BUILD_TIMEOUT_S); the boundary never does.
+
+    def _added_digest(self, added: dict) -> str:
+        """What recognises a block built ahead: its env entry and its catalogue (not the attestation's name)."""
+        from reliquary.protocol.release_contract import canonical_json_bytes
+
+        return hashlib.sha256(canonical_json_bytes({"environment": added["environment"],
+                                                    "catalogue": added["catalogue"]})).hexdigest()
+
+    def _added_policy(self, name: str, added: dict):
+        """The episode policy of an added block (the runtime's view's once the schedule names it)."""
+        from reliquary.protocol.release_contract import canonical_json_bytes
+        from reliquary.protocol.service_catalogue import CataloguedContract
+
+        runtime = self._service_runtime
+        if name in runtime.contract.environments:
+            return runtime.contract.episode_policy(name)
+        entry = {**added["environment"], "catalogue": added["catalogue"]}
+        return CataloguedContract(runtime.order_contract.canonical,
+                                  canonical_json_bytes({name: entry})).episode_policy(name)
+
+    def _all_env_mix(self) -> list[tuple[str, int]]:
+        """The env mix with the envs staged for the next window (added to the run, not installed yet)."""
+        from reliquary.services.runtime import protocol_slot_geometry
+
+        known = {name for name, _ in self.env_mix}
+        slots = protocol_slot_geometry()[1]
+        return list(self.env_mix) + [(name, slots) for name in sorted(self._staged_envs) if name not in known]
+
+    def _active_bridged_sources(self) -> dict:
+        """The bridged task sources this validator serves (their installs must not move)."""
+        return {name: env.source for name, env in self.envs.items()
+                if callable(getattr(getattr(env, "source", None), "installed_identity", None))}
+
+    def _activation_validity_s(self, services, added: dict, source=None, memo: dict | None = None):
+        """The token validity the issuer would give the added env's sessions (the machines' caps must allow
+        it): its open window and its wall time, the window lengthened for its tasks' preparation (the largest
+        prepare timeout of a sample of the split's tasks, ``activation_prepare_timeout_s``; the default without a
+        source). A ``NotYet`` when a task's prepare timeout cannot be read now. Blocking on a first read: worker
+        threads only."""
+        from reliquary.sandbox.sessions import DEFAULT_PREPARE_TIMEOUT_S, token_validity_s
+        from reliquary.validator.catalogue_activation import NotYet, activation_prepare_timeout_s
+
+        prepare = DEFAULT_PREPARE_TIMEOUT_S if source is None else activation_prepare_timeout_s(source, memo)
+        if isinstance(prepare, NotYet):
+            return prepare
+        return token_validity_s(int(services.book.policy.open_window_s),
+                                int(added["environment"]["episode"]["budgets"]["wall_s"]), prepare)
+
+    def _request_settled(self, store, request: dict) -> bool:
+        """The store's status already says this request was applied or refused (its file is still there)."""
+        try:
+            status = store.status()
+        except (ValueError, OSError):
+            return False
+        return (isinstance(status, dict) and status.get("request_id") == request.get("request_id")
+                and status.get("status") in ("applied", "refused"))
+
+    def _added_spec_problem(self, name: str, environment) -> str | None:
+        from reliquary.environment.bridged_episode import catalogue_spec
+        from reliquary.environment.registry import find_environment_spec
+
+        known = find_environment_spec(name)
+        if known is not None and known != catalogue_spec(name, environment.source.manifest_sha256()):
+            return f"another environment spec holds the name {name}"
+        return None
+
+    def _added_env_problem(self, name: str, environment, policy) -> str | None:
+        """A dry run of everything the commit does with a built env (the RL services' ``add_check``, which also
+        builds its turn renderer, and the registry's spec): why it could not be served, or None. Worker thread.
+        A transient error is raised (``catalogue_activation.transient_error``)."""
+        why = self._added_spec_problem(name, environment)
+        if why is not None:
+            return why
+        services = getattr(self, "_episode_services", None)
+        if services is None:
+            return None
+        check = getattr(services, "add_check", None)
+        if check is not None:
+            return check(name, environment, policy)
+        return services.environment_refusal(policy)
+
+    def _prebuilt_for(self, name: str, digest: str):
+        with self._prestage_guard:
+            prebuilt = self._prebuilt.get(name)
+        return prebuilt[1] if prebuilt is not None and prebuilt[0] == digest else None
+
+    def _build_failure(self, name: str, digest: str):
+        """(reason, transient) of the last build of this block that failed, or None."""
+        with self._prestage_guard:
+            failure = self._build_failures.get(name)
+        return failure[1:] if failure is not None and failure[0] == digest else None
+
+    def _added_now(self) -> float:
+        """The clock of the added envs' builds and retries (monotonic; a test may set ``_added_clock``)."""
+        clock = getattr(self, "_added_clock", None)
+        return float(clock()) if clock is not None else time.monotonic()
+
+    def _start_build(self, name: str, added: dict, *, now: float | None = None) -> str:
+        """Build ``added`` in a background thread unless one is building ``name`` already (one claim per env,
+        shared by the prestage, the boundary and the boot). Never blocks; returns what the build is doing."""
+        now = self._added_now() if now is None else float(now)
+        digest = self._added_digest(added)
+        with self._prestage_guard:
+            claim = self._builds.get(name)
+            if claim is not None:
+                age = max(0.0, now - claim[1])
+                if age > ADDED_BUILD_TIMEOUT_S:
+                    return f"its build has stalled for {age:.0f} s (it is retried once it ends)"
+                return f"it is being built ahead of the boundary (for {age:.0f} s)"
+            thread = threading.Thread(target=self._build_job, args=(name, digest, added),
+                                      name=f"added-env-build:{name}", daemon=True)
+            self._builds[name] = (digest, now, thread)
+            self._build_failures.pop(name, None)
+        thread.start()
+        return "it is being built ahead of the boundary (started now)"
+
+    def _build_job(self, name: str, digest: str, added: dict) -> None:
+        """A background build: the env, then the RL services' dry run (it warms the turn renderer, so the
+        boundary never loads a tokenizer) and the servable scan. Its outcome is a prebuilt env or a failure
+        (permanent or transient); never raises."""
+        from reliquary.environment import bridged_episode
+        from reliquary.validator.catalogue_activation import machines_problem, transient_error
+
+        try:
+            environment = bridged_episode.build_environment(
+                bridged_episode.BridgedEnvConfig.from_catalogue(name, added["catalogue"]))
+            why = self._added_env_problem(name, environment, self._added_policy(name, added))
+            services = getattr(self, "_episode_services", None)
+            if why is None and services is not None and getattr(services, "fleet", None) is not None:
+                try:
+                    memo = self._activation_memo.setdefault(name, {})
+                    validity = self._activation_validity_s(services, added, environment.source, memo)
+                    if isinstance(validity, int):
+                        machines_problem(services.fleet, added, source=environment.source, validity_s=validity,
+                                         memo=memo)
+                except Exception:
+                    pass                    # a warm-up only: the boundary runs the real check
+            with self._prestage_guard:
+                if why is not None:
+                    self._build_failures[name] = (digest, why, False)
+                elif name not in self.envs:
+                    self._prebuilt[name] = (digest, environment)
+            if why is not None:
+                self._added_failed_attempt(name)
+                logger.error("service environment %s built for the run cannot be served here: %s", name, why)
+        except Exception as exc:
+            transient = transient_error(exc)
+            reason = (f"cannot be built now ({type(exc).__name__}: {exc})" if transient
+                      else f"not installed on this validator ({type(exc).__name__}: {exc})")
+            with self._prestage_guard:
+                self._build_failures[name] = (digest, reason, transient)
+            self._added_failed_attempt(name)
+            logger.error("service environment %s for the run: %s", name, reason)
+        finally:
+            with self._prestage_guard:
+                claim = self._builds.get(name)
+                if claim is not None and claim[2] is threading.current_thread():
+                    del self._builds[name]
+
+    def _join_builds(self, timeout: float | None = None) -> bool:
+        """Wait for the background builds running now (at most ``timeout`` seconds in all); True when none is
+        left running."""
+        deadline = None if timeout is None else time.monotonic() + float(timeout)
+        with self._prestage_guard:
+            threads = [claim[2] for claim in self._builds.values()]
+        for thread in threads:
+            thread.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
+        with self._prestage_guard:
+            return not any(claim[2].is_alive() for claim in self._builds.values())
+
+    def _added_failed_attempt(self, name: str, *, now: float | None = None) -> None:
+        """A build (or the install of a build) of an added env failed: one attempt more, and its next build
+        after ADDED_RETRY_MIN_S doubling per failed attempt, at most ADDED_RETRY_MAX_S."""
+        now = self._added_now() if now is None else float(now)
+        with self._prestage_guard:
+            attempts = self._added_retry.get(name, (0, now))[0] + 1
+            self._added_retry[name] = (attempts, now + min(ADDED_RETRY_MAX_S,
+                                                           ADDED_RETRY_MIN_S * 2 ** min(attempts - 1, 32)))
+
+    def _added_unavailable(self, name: str, reason: str, *, attempt: bool = False,
+                           now: float | None = None) -> None:
+        """An added env this validator cannot serve now: an ALERT (once per reason) and a background retry.
+        ``attempt``: a build of it just failed here (its install or its checks), which counts and backs off;
+        otherwise a retry already scheduled is never moved, and one is scheduled now when there is none."""
+        now = self._added_now() if now is None else float(now)
+        if attempt:
+            self._added_failed_attempt(name, now=now)
+        else:
+            with self._prestage_guard:
+                self._added_retry.setdefault(name, (0, now))
+        if self._added_alerts.get(name) != reason:
+            self._added_alerts[name] = reason
+            logger.error("ALERT service environment %s, added to the run, is not served by this validator: %s "
+                         "(the run goes on without it; retried in the background)", name, reason)
+        with self._prestage_guard:
+            self._prebuilt.pop(name, None)
+
+    def _added_served(self, name: str) -> None:
+        with self._prestage_guard:
+            self._added_retry.pop(name, None)
+        if self._added_alerts.pop(name, None) is not None:
+            logger.warning("service environment %s, added to the run, is served again", name)
+
+    def _retry_added_builds(self, schedule=None, *, now: float | None = None) -> list[str]:
+        """Start the background build of each env the schedule added that is not loaded, staged, built or
+        building, once its scheduled retry is due: one build per scheduled retry (the retry is spent when the
+        build starts; a failed build schedules the next one). Never blocks."""
+        now = self._added_now() if now is None else float(now)
+        schedule = self._service_runtime.schedule if schedule is None else schedule
+        started = []
+        for name, added in sorted(schedule.added_environments().items()):
+            if name in self.envs or name in self._staged_envs:
+                continue
+            digest = self._added_digest(added)
+            with self._prestage_guard:
+                busy = name in self._builds or (self._prebuilt.get(name) or (None,))[0] == digest
+                attempts, due = self._added_retry.get(name, (0, now))
+                if busy or now < due:
+                    continue
+                self._added_retry[name] = (attempts, math.inf)        # spent: the build's outcome reschedules
+            self._start_build(name, added, now=now)
+            started.append(name)
+        return started
+
+    def _evict_unwanted_builds(self, wanted: dict[str, str]) -> None:
+        """Drop the builds (and failures) of blocks no pending request and no schedule row asks for any more."""
+        with self._prestage_guard:
+            for store in (self._prebuilt, self._build_failures):
+                for name in [n for n, value in store.items() if wanted.get(n) != value[0]]:
+                    del store[name]
+
+    def _prestage_requested_envs(self, now: float | None = None) -> list[str]:
+        """Worker thread, every PRESTAGE_SECONDS: start the background build of the envs the pending schedule
+        request adds, once per block, after the checks that need nothing of the package (the owner's allowlist,
+        the name, the budgets, the installed distributions): its code never runs here before them. A block those
+        checks refused is checked again after PRESTAGE_RETRY_SECONDS. Also: retry the envs the schedule added
+        that are not served (backoff), and drop the builds nothing asks for any more. Never raises (a malformed
+        request is the boundary's to refuse); returns the names whose build started now."""
+        from reliquary.validator.catalogue_activation import NotYet, allowed_packages, before_import_problem
+
+        now = self._added_now() if now is None else float(now)
+        started: list[str] = []
+        wanted: dict[str, str] = {}
+        runtime = self._service_runtime
+        try:
+            for name, added in runtime.schedule.added_environments().items():
+                wanted[name] = self._added_digest(added)
+            started += self._retry_added_builds(now=now)
+        except Exception:
+            logger.exception("retrying the builds of added environments failed")
+        store = getattr(self, "_service_schedule_store", None)
+        try:
+            request = store.take() if store is not None else None
+        except (ValueError, OSError):
+            request = None
+        add = request.get("add") if isinstance(request, dict) else None
+        if not isinstance(add, dict) or not add or self._request_settled(store, request):
+            add = {}
+        boot = getattr(self, "_boot_distributions", None)
+        folder = getattr(self, "_service_folder", None)
+        allowed = None
+        for name, entry in add.items():
+            try:
+                if not isinstance(name, str) or not isinstance(entry, dict):
+                    continue
+                added = {"environment": entry["environment"], "catalogue": entry["catalogue"]}
+                digest = self._added_digest(added)
+                wanted.setdefault(name, digest)
+                if name in self.envs or name in self._staged_envs or self._prebuilt_for(name, digest) is not None:
+                    continue
+                failure = self._build_failure(name, digest)
+                if failure is not None and not failure[1]:
+                    continue                    # refused for good: the boundary says so
+                refused = self._prestage_refused.get(name)
+                if refused is not None and refused[0] == digest and now - refused[1] < PRESTAGE_RETRY_SECONDS:
+                    continue
+                if boot is None:
+                    continue                    # nothing to compare an install with: the boundary refuses it
+                if allowed is None:
+                    allowed = allowed_packages(folder) if folder is not None else frozenset()
+                problem = before_import_problem(added, allowed, runtime.order_contract, boot=boot)
+                if problem is not None:         # checked before any import: its code never runs here
+                    logger.error("service environment %s requested for the run: %s", name, problem)
+                    if not isinstance(problem, NotYet):
+                        self._prestage_refused[name] = (digest, now)
+                    continue
+                self._prestage_refused.pop(name, None)
+                with self._prestage_guard:
+                    busy = name in self._builds
+                if not busy:
+                    self._start_build(name, added, now=now)
+                    started.append(name)
+            except Exception as exc:
+                logger.error("service environment %s requested for the run cannot be built here (%s: %s)",
+                             name, type(exc).__name__, exc)
+        self._evict_unwanted_builds(wanted)
+        return started
+
+    async def _prestage_forever(self, every_s: float = PRESTAGE_SECONDS) -> None:
+        while True:
+            try:
+                await asyncio.to_thread(self._prestage_requested_envs)
+            except Exception:
+                logger.exception("prestaging requested environments failed")
+            await asyncio.sleep(every_s)
+
+    def _catalogue_check(self, name: str, added: dict, attestation) -> None:
+        """``check_request``'s activation check of an env a schedule request adds (worker thread). Raises
+        ``ScheduleRefused`` with the reason, or ``ScheduleNotYet`` when it cannot be settled now (the request
+        waits: a transient error, a stale fleet view, the env not built yet). It never builds: with no build of
+        this block yet, it starts the background one (after the checks that need nothing of the package) and
+        waits. The checks it runs are everything the commit will do, so an env it passes is served (or refused
+        here, before the schedule commits); on success the built env waits in ``_staged_envs``."""
+        from reliquary.services.schedule import ScheduleRefused, raise_activation_problem
+        from reliquary.validator import catalogue_activation as activation
+
+        services = getattr(self, "_episode_services", None)
+        if services is None:
+            raise ScheduleRefused(f"cannot add {name}: this run launched without a signed-episode environment, "
+                                  "so this validator serves no sandbox sessions (declare one at launch)")
+        boot = getattr(self, "_boot_distributions", None)
+        if boot is None:
+            raise ScheduleRefused(f"cannot add {name}: the installed distributions were not read when this "
+                                  f"validator started (restart it)")
+
+        def settle(exc: Exception, what: str) -> None:
+            if activation.transient_error(exc):
+                raise_activation_problem(name, activation.NotYet(f"{what} cannot run now ({type(exc).__name__}: "
+                                                                 f"{exc})"))
+            raise ScheduleRefused(f"cannot add {name}: {what} failed ({type(exc).__name__}: {exc})")
+
+        order = self._service_runtime.order_contract
+        folder = getattr(self, "_service_folder", None)
+        allowed = activation.allowed_packages(folder) if folder is not None else frozenset()
+        try:
+            current = activation.installed_distributions()
+        except Exception as exc:
+            settle(exc, "reading the installed distributions")
+        raise_activation_problem(name, activation.before_import_problem(added, allowed, order, boot=boot,
+                                                                        current=current))
+        problem = activation.attestation_problem(attestation, added)
+        if problem is not None:
+            raise ScheduleRefused(f"cannot add {name}: the attestation: {problem}")
+        digest = self._added_digest(added)
+        environment = self._prebuilt_for(name, digest)
+        if environment is None:
+            failure = self._build_failure(name, digest)
+            if failure is not None and not failure[1]:
+                with self._prestage_guard:
+                    self._build_failures.pop(name, None)      # a later request of this block is built again
+                raise ScheduleRefused(f"cannot add {name}: {failure[0]}")
+            raise_activation_problem(name, activation.NotYet(self._start_build(name, added)))
+        policy = self._added_policy(name, added)
+        try:
+            memo = self._activation_memo.setdefault(name, {})
+            validity = self._activation_validity_s(services, added, environment.source, memo)
+            if isinstance(validity, activation.NotYet):
+                problem = validity                     # a task's prepare timeout cannot be read now: it waits
+            else:
+                problem, environment = activation.activation_problem(
+                    name, added, attestation, build=lambda config: environment, fleet=services.fleet,
+                    allowed=allowed, active_sources=self._active_bridged_sources(), order=order, boot=boot,
+                    current=current, validity_s=validity, memo=memo)
+            if problem is None:
+                problem = self._added_env_problem(name, environment, policy)     # what the commit will do
+        except Exception as exc:
+            settle(exc, "its activation checks")
+        if problem is not None:
+            logger.error("service environment %s cannot be added to the run%s: %s", name,
+                         " yet" if isinstance(problem, activation.NotYet) else "", problem)
+            raise_activation_problem(name, problem)
+        self._staged_envs[name] = environment
+
+    def _stage_added_envs(self, schedule, *, window: int | None = None):
+        """Stage every env ``schedule`` added that this process does not serve yet, from its background build
+        (worker thread; it never builds). One that is not built, or whose build fails its install check or the
+        RL services' dry run, gets an ALERT, stays unloaded and is retried in the background with a backoff; an
+        ACTIVE one is switched off by a successor schedule revision (``_deactivate_added_envs``). Returns the
+        schedule the window runs."""
+        from reliquary.validator.catalogue_activation import install_problem
+
+        active = set(schedule.active_environments())
+        failed: dict[str, str] = {}
+        for name, added in sorted(schedule.added_environments().items()):
+            if name in self.envs or name in self._staged_envs:
+                continue
+            digest = self._added_digest(added)
+            environment = self._prebuilt_for(name, digest)
+            if environment is None:
+                failure = self._build_failure(name, digest)
+                if failure is None and name not in active:
+                    with self._prestage_guard:
+                        building = name in self._builds
+                    if building:
+                        continue                # being built: staged at a later boundary
+                problem = failure[0] if failure is not None else "it is not built on this validator yet"
+            else:
+                try:
+                    problem = (install_problem(environment.source, added)
+                               or self._added_env_problem(name, environment, self._added_policy(name, added)))
+                except Exception as exc:
+                    problem = f"its checks failed ({type(exc).__name__}: {exc})"
+                if problem is None:
+                    self._staged_envs[name] = environment
+                    continue
+            # A build that fails its checks here is a failed attempt; one not built (or whose build failed and
+            # counted already) keeps the retry it has.
+            self._added_unavailable(name, problem, attempt=environment is not None)
+            if name in active:
+                failed[name] = problem
+        try:
+            self._retry_added_builds(schedule)
+        except Exception:
+            logger.exception("retrying the builds of added environments failed")
+        if failed:
+            schedule = self._deactivate_added_envs(failed, window)
+        return schedule
+
+    def _deactivate_added_envs(self, failed: dict[str, str], window: int | None):
+        """Switch off the active added envs ``failed`` names (this validator cannot serve them): a successor
+        schedule revision with the same active envs less those, their shares renormalised to 10000 in the
+        proportions they had (as ``set`` would be asked to), recorded under ``auto-deactivate-r<revision>``.
+        BLOCKING (SQLite). Returns the schedule the window runs. Raises only when no env would stay active."""
+        from reliquary.protocol.service_schedule import next_schedule
+
+        runtime = self._service_runtime
+        current = runtime.schedule
+        names = sorted(name for name in failed if name in current.active_environments())
+        at = int(window if window is not None else max(0, int(getattr(self, "_window_n", 0) or 0)))
+        if names:
+            remaining = [name for name in current.active_environments() if name not in names]
+            if not remaining:
+                raise ValueError(f"ALERT service environments {names} cannot be served and no other env is active")
+            changed = next_schedule(runtime.contract, current, active=remaining,
+                                    shares=_renormalised_shares({n: current.share_bps(n) for n in remaining}))
+            from reliquary.services.schedule import VALIDATOR_REQUEST_PREFIX
+
+            runtime.apply_schedule(changed, request_id=f"{VALIDATOR_REQUEST_PREFIX}deactivate-r{changed.revision}",
+                                   window=at)
+            for name in names:
+                logger.error("ALERT service environment %s switched off by schedule revision %d: this validator "
+                             "cannot serve it (%s); switch it on again with `set --active` once it is served",
+                             name, changed.revision, failed[name])
+            self._supersede_pending_request(changed.revision, names, at)
+        return runtime.schedule if window is None else runtime.window_schedule(int(window))
+
+    def _supersede_pending_request(self, revision: int, names: list[str], window: int) -> None:
+        """An operator request naming the revision an automatic switch-off just took can never apply: it is
+        refused now, saying so (ALERT). Never raises."""
+        store = getattr(self, "_service_schedule_store", None)
+        try:
+            request = store.take() if store is not None else None
+        except (ValueError, OSError):
+            return
+        if not isinstance(request, dict) or request.get("revision") != revision:
+            return
+        detail = (f"superseded by auto-deactivate: schedule revision {revision} switched off {', '.join(names)} "
+                  f"(this validator cannot serve it); resubmit against revision {revision + 1}")
+        try:
+            refused = self._service_runtime.refuse_schedule_request(store, str(request.get("request_id")), detail,
+                                                                    window=window)
+        except Exception:
+            logger.exception("the schedule request superseded by revision %d could not be marked refused", revision)
+            return
+        if refused:
+            logger.error("ALERT schedule request %s %s", request.get("request_id"), detail)
+
+    def _install_env(self, name: str, environment) -> None:
+        """Make an added env one of this validator's: its spec registered (its version), its group count, its
+        cooldown maps, its proof plans. Raises ValueError, changing nothing, when another spec holds its name."""
+        from reliquary.environment.bridged_episode import catalogue_spec
+        from reliquary.environment.registry import register_catalogue_spec
+        from reliquary.services.runtime import protocol_slot_geometry
+
+        why = self._added_spec_problem(name, environment)
+        if why is not None:
+            raise ValueError(f"added environment {name}: {why}")
+        register_catalogue_spec(catalogue_spec(name, environment.source.manifest_sha256()))
+        slots = protocol_slot_geometry()[1]
+        self.envs[name] = environment
+        if name not in self.env_targets:
+            self.env_mix.append((name, slots))
+            self.env_targets[name] = slots
+        cooldowns = getattr(self, "_cooldown_per_env", None)
+        if cooldowns is not None and name not in cooldowns:      # installed after start (at start: built below)
+            horizon = self._service_runtime.schedule.cooldown_windows(name)
+            cooldowns[name] = CooldownMap(cooldown_windows=horizon)
+            self._content_cooldown_per_env[name] = ContentCooldownMap(cooldown_windows=horizon)
+            health = getattr(self, "_content_cooldown_health", None)
+            if isinstance(health, dict) and isinstance(health.get("counts_by_environment"), dict):
+                health["counts_by_environment"].setdefault(name, 0)
+        scheduler = getattr(self, "proof_scheduler", None)
+        if scheduler is not None:
+            from reliquary.validator.batcher import audit_scheduler_environment
+
+            scheduler.add_environments((name, audit_scheduler_environment(name)))
+        with self._prestage_guard:
+            self._prebuilt.pop(name, None)
+        self._added_served(name)
+
+    def _uninstall_env(self, name: str) -> None:
+        """An added env no longer served by this validator (the RL services refused it at start): out of the
+        envs and the mix, so R7 refuses to switch it on; its cooldown maps and proof plans are harmless."""
+        self.envs.pop(name, None)
+        self.env_targets.pop(name, None)
+        self.env_mix[:] = [(n, t) for n, t in self.env_mix if n != name]
+
+    def _install_added_envs(self, schedule):
+        """At start: every env the persisted schedule added (inactive ones too), built (in the background
+        builder, waited for at most BOOT_ADDED_BUILD_TIMEOUT_S) and installed before anything reads the runtime's
+        contract. One that cannot be built or installed never stops the boot: an ALERT, it stays unloaded and is
+        retried in the background; an active one is switched off (``_deactivate_added_envs``). Returns the
+        schedule now in force."""
+        added = schedule.added_environments()
+        if not added:
+            return schedule
+        for name, block in sorted(added.items()):
+            if name not in self.envs:
+                self._start_build(name, block)
+        if not self._join_builds(BOOT_ADDED_BUILD_TIMEOUT_S):
+            logger.error("ALERT added environments still building after %.0f s at start: the validator starts "
+                         "without them", BOOT_ADDED_BUILD_TIMEOUT_S)
+        schedule = self._stage_added_envs(schedule)
+        staged, self._staged_envs = dict(self._staged_envs), {}
+        failed = {}
+        for name, environment in sorted(staged.items()):
+            try:
+                self._install_env(name, environment)
+            except Exception as exc:
+                reason = f"{type(exc).__name__}: {exc}"
+                self._added_unavailable(name, reason, attempt=True)
+                if name in schedule.active_environments():
+                    failed[name] = reason
+                continue
+            logger.warning("service environment %s, added to the run, installed at start", name)
+        if failed:
+            schedule = self._deactivate_added_envs(failed, None)
+        return schedule
+
+    async def _commit_staged_envs(self, active=None) -> tuple[list[str], dict[str, str]]:
+        """Between windows, on the event loop: hand the staged envs the schedule now names to the RL services,
+        then install them (a staged env whose request was not applied is dropped). An env the services or the
+        install refuse is never raised for: an ALERT, it stays unloaded and is retried in the background.
+        Returns (the envs installed, the ones of ``active`` that failed: the caller switches them off)."""
+        contract = self._service_runtime.contract
+        services = getattr(self, "_episode_services", None)
+        installed: list[str] = []
+        failed: dict[str, str] = {}
+        for name, environment in sorted(dict(self._staged_envs).items()):
+            if name not in contract.environments:
+                self._staged_envs.pop(name, None)
+                continue
+            try:
+                why = self._added_spec_problem(name, environment)
+                if why is not None:
+                    raise ValueError(why)
+                if services is not None:
+                    services.add_environment(name, environment, contract.episode_policy(name))
+                self._install_env(name, environment)
+            except Exception as exc:
+                self._staged_envs.pop(name, None)
+                reason = f"the RL services or the install refused it ({type(exc).__name__}: {exc})"
+                self._added_unavailable(name, reason, attempt=True)
+                if active is not None and name in active:
+                    failed[name] = reason
+                continue
+            self._staged_envs.pop(name, None)
+            installed.append(name)
+            # Its cooldown is in the next snapshot, taken at the next seal (a restart restores it from there).
+            self._windows_since_cooldown_snapshot = COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS
+            logger.warning("service environment %s added to the running run", name)
+        return installed, failed
+
+    def _replan_without(self, failed: dict[str, str], target_window: int) -> dict[str, Any]:
+        """BLOCKING: switch off the active added envs the commit could not serve, and plan the window again."""
+        self._deactivate_added_envs(failed, target_window)
+        return self._service_window_plan(target_window)
+
+    async def _serve_added_envs_at_start(self, services) -> None:
+        """At start, after the RL services were built from the launch envs: hand them each added env installed
+        at boot, after the same dry run as a live add. One they refuse is unloaded (ALERT, retried), and switched
+        off when active; the services start either way."""
+        runtime = self._service_runtime
+        failed: dict[str, str] = {}
+        for name in sorted(set(runtime.schedule.added_environments()) & set(self.envs)):
+            environment, policy = self.envs[name], runtime.contract.episode_policy(name)
+            try:
+                why = await asyncio.to_thread(self._added_env_problem, name, environment, policy)
+                if why is not None:
+                    raise ValueError(why)
+                services.add_environment(name, environment, policy)
+            except Exception as exc:
+                reason = f"the RL services refused it at start ({type(exc).__name__}: {exc})"
+                self._uninstall_env(name)
+                self._added_unavailable(name, reason, attempt=True)
+                if name in runtime.schedule.active_environments():
+                    failed[name] = reason
+        if failed:
+            await asyncio.to_thread(self._deactivate_added_envs, failed, None)
+
+    def _service_window_pool(self, schedule, env_order: list[str]) -> dict[str, float]:
+        """Each active env's pool: the task cap times its live share, then its price."""
+        declared = {
+            env: self._emission_cap * schedule.share_bps(env) / 10000
+            for env in env_order
+        }
+        pools = self._window_pool_for(env_order, declared=declared)
+        if not isinstance(pools, dict):
+            return dict(declared)
+        return {env: float(pools[env]) for env in env_order}
+
+    def _service_window_plan(self, target_window: int) -> dict[str, Any]:
+        """The boundary work of one service window. BLOCKING (SQLite commits):
+        ``_prepare_service_window`` runs it in a worker thread.
+
+        Order: an envelope the runtime still holds for this candidate window (a
+        failed open, a restart before activation) is discarded first, so the window
+        is always frozen on what is true NOW: the installed checkpoint, the current
+        schedule, and a fresh beacon at its open. Then the installed
+        checkpoint is selected in the order's lineage, the operator's pending
+        schedule request is applied (it lands on this window), and the window is derived
+        from the schedule it will freeze: active envs, their constant group count
+        per pick, pool = cap x share (x price).
+        A window that was activated is never rebuilt here: it has a recovery record
+        (or observations, or a settlement) and is refused.
+        """
+        from reliquary.services.runtime import protocol_slot_geometry
+
+        runtime = self._service_runtime
+        target_window = int(target_window)
+        cp = self._checkpoint_store.current_manifest()
+        root = runtime.contract.to_dict()["checkpoint"]
+        if cp is None or not cp.revision or cp.repo_id != root["repo"]:
+            raise ValueError("service checkpoint repository mismatch")
+        _discard_unactivated_service_window(
+            runtime, getattr(self, "_fill_closed_recovery_store", None), target_window,
+        )
+        # The checkpoint first: a lineage refusal (an ancestor) must not leave an operator's schedule
+        # request applied for a window that will not open.
+        installed = getattr(self, "_service_installed_receipt", None)
+        runtime.ensure_checkpoint(
+            checkpoint_n=int(cp.checkpoint_n), repo=cp.repo_id, revision=cp.revision,
+            receipt=installed[1] if installed is not None and installed[0] == cp.revision else None,
+        )
+        schedule = runtime.apply_pending_schedule_request(
+            self._service_schedule_store,
+            window=target_window,
+            installed_version=self._service_activation_version,
+            catalogue_check=self._catalogue_check,
+        )
+        schedule = self._stage_added_envs(schedule, window=target_window)
+        self._require_service_environments(schedule)
+        active = set(schedule.active_environments())
+        env_mix = [(name, target) for name, target in self._all_env_mix() if name in active]
+        env_order = [name for name, _ in env_mix]
+        pools = self._service_window_pool(schedule, env_order)
+        picks_target, batch_slots = protocol_slot_geometry()
+        return {
+            "window": target_window,
+            "schedule": schedule,
+            "env_mix": env_mix,
+            "pools": pools,
+            "checkpoint_revision": cp.revision,
+            "picks_target": picks_target,
+            "batch_slots": batch_slots,
+            "opened": False,
+        }
+
+    def _recover_leftover_service_windows(self, target_window: int) -> tuple[list[dict], bool]:
+        """Settle again the windows an earlier failure left unarchived. BLOCKING; never raises.
+
+        A window whose settlement failed at its seal and again in its recovery keeps
+        its recovery record and pays nobody. At the next boundary it gets what a
+        restart would give it (quarantine, then ``recover`` from its journal
+        receipts), ONE attempt per boundary. A window that still cannot be settled
+        stays as it is (logged at error with its number): it is never aborted here,
+        and it does not stop the next window from opening. The start of the process
+        stays fail-closed on such a record.
+        Returns the archives now enqueued and whether any attempt was made.
+        """
+        recovery = getattr(self, "_fill_closed_recovery_store", None)
+        rotation = getattr(self, "_fill_closed_rotation_store", None)
+        if recovery is None or rotation is None:
+            return [], False
+        try:
+            leftovers = [window for window in recovery.windows() if window < target_window]
+        except Exception as exc:
+            logger.error(
+                "service window %d: the records of unarchived windows cannot be read "
+                "(%s: %s); nothing is retried at this boundary",
+                target_window, type(exc).__name__, exc, exc_info=True,
+            )
+            return [], False
+        recovered: list[dict] = []
+        attempted = False
+        for window in leftovers:
+            if self._service_recovery_attempts.get(window) == target_window:
+                continue
+            self._service_recovery_attempts[window] = target_window
+            attempted = True
+            logger.error(
+                "service window %d was left unarchived by an earlier failure; settling "
+                "it again at the boundary of window %d",
+                window, target_window,
+            )
+            try:
+                from reliquary.infrastructure.archive_queue import get_archive_queue
+
+                queue = self._training_payload_queue_ref()
+                recovery.quarantine_uncommitted(Path(queue.queue_dir))
+                archive = recovery.recover(
+                    window, queue=queue, archives=get_archive_queue(), rotation=rotation,
+                    service_runtime=self._service_runtime,
+                    sealed=window in self._service_sealed_windows,
+                )
+            except Exception as exc:
+                logger.error(
+                    "service window %d: still not archived at the boundary of window %d "
+                    "(%s: %s); its record is kept, nobody is paid for it yet, it is "
+                    "retried at the next boundary and never aborted automatically",
+                    window, target_window, type(exc).__name__, exc, exc_info=True,
+                )
+                continue
+            logger.info("service window %d: archived at the boundary of window %d", window, target_window)
+            recovered.append(archive)
+        return recovered, attempted
+
+    def _service_window_boundary(self, target_window: int) -> dict[str, Any]:
+        """Everything the boundary does off the event loop, in ONE worker thread.
+
+        First the windows left unarchived (``_recover_leftover_service_windows``).
+        A recovery attempt (re)writes the durable rotation barrier of the window it
+        recovers, exactly as a restart does; when one is armed afterwards the plan
+        is NOT derived: the loop goes back to the rotation wait, and derives the
+        window once the barrier cleared. Otherwise the plan of ``target_window``.
+        """
+        recovered, attempted = self._recover_leftover_service_windows(target_window)
+        outcome: dict[str, Any] = {"recovered": recovered, "attempted": attempted, "plan": None, "error": None}
+        self._refresh_service_active()
+        if attempted:
+            try:
+                outcome["rotation_gate"] = self._fill_closed_rotation_store.load()
+            except Exception as exc:
+                outcome["error"] = exc
+                return outcome
+            if outcome["rotation_gate"] is not None:
+                return outcome
+        try:
+            outcome["plan"] = self._service_window_plan(target_window)
+        except Exception as exc:
+            outcome["error"] = exc
+        return outcome
+
+    async def _prepare_service_window(self) -> bool:
+        """Window boundary of a service task, before the next window is built.
+
+        True: the window is prepared and can be built. False: recovering a window
+        left unarchived armed its rotation barrier; nothing was prepared and the
+        caller goes back to the rotation wait (the existing rule: the next window
+        never opens before the trainer consumed the previous one and, if it holds
+        payloads, before its successor checkpoint is installed).
+        """
+        if self._candidate_window_n is None:
+            self._candidate_window_n = self._window_n + 1
+        target_window = int(self._candidate_window_n)
+        self._candidate_service_window = None
+        self._candidate_service_pools = None
+        self._set_window_preparation_stage("service_schedule")
+        outcome = await asyncio.to_thread(self._service_window_boundary, target_window)
+        for archive in outcome["recovered"]:
+            # The steps ``_enqueue_aborted_window`` runs once a window is archived.
+            window = int(archive["window_start"])
+            batchers, paid = self._service_recovery_context.get(window, (None, None))
+            if paid is None and batchers:
+                paid = _paid_from_archive(archive, batchers)
+            self._complete_service_recovery(window, archive, batchers, paid)
+        if outcome["attempted"] and outcome.get("rotation_gate") is not None:
+            # The store is the truth after a recovery, as at a restart.
+            self._fill_closed_rotation_gate = outcome["rotation_gate"]
+            logger.warning(
+                "service window %d: the recovery of an unarchived window armed its "
+                "rotation barrier; back to the rotation wait before this window opens",
+                target_window,
+            )
+            return False
+        exc = outcome["error"]
+        if exc is not None:
+            logger.error(
+                "service window %d: boundary preparation failed (%s: %s); the "
+                "window is not opened and is retried",
+                target_window, type(exc).__name__, exc, exc_info=exc,
+            )
+            raise exc
+        # Between windows, on the loop: the envs the boundary staged join the run (the plan may name them). An
+        # active one the commit cannot serve is switched off and the window planned again, in this boundary.
+        plan = outcome["plan"]
+        for _attempt in range(3):
+            _installed, failed = await self._commit_staged_envs(active={name for name, _ in plan["env_mix"]})
+            if not failed:
+                break
+            plan = await asyncio.to_thread(self._replan_without, failed, target_window)
+        else:
+            raise RuntimeError(f"service window {target_window}: added environments still fail to commit")
+        self._candidate_service_window = plan
+        return True
+
+    def _open_service_window(self, target_window: int, randomness: str) -> dict[str, dict]:
+        """Freeze the window in the runtime, then announce it. BLOCKING (SQLite).
+
+        Returns one announcement per active env. Called before any batcher holds
+        its randomness, so before any admission and before the recovery record.
+        """
+        runtime = self._service_runtime
+        window = self._candidate_service_window
+        if window is None or window["window"] != target_window:
+            raise RuntimeError("service window was not prepared at the boundary")
+        episodes = getattr(self, "_episode_services", None) is not None
+        resumed = episodes and self._service_window_frozen(runtime, target_window)
+        runtime.open_window(
+            target_window,
+            pools=dict(window["pools"]),
+            picks_target=window["picks_target"],
+            batch_slots=window["batch_slots"],
+            # The validator's wall clock, the one exploration arrivals are stamped with.
+            now=time.time(),
+        )
+        if episodes:
+            self._note_episode_window(target_window, resumed=resumed)
+            # Only this window's envs count in the fleet size, the per-env caps and the allocation answer.
+            set_active = getattr(self._episode_services, "set_active_envs", None)
+            if set_active is not None:
+                set_active(sorted(window["pools"]))
+        announcements = {
+            name: runtime.announcement(
+                environment=name, window=target_window, randomness=randomness,
+            )
+            for name, _ in window["env_mix"]
+        }
+        # One beacon per window: what miners are told IS what the batchers verify
+        # with. (An older beacon can only belong to an envelope the boundary should
+        # have discarded; the window is not opened and its retry starts clean.)
+        if any(value["pool_randomness"] != randomness for value in announcements.values()):
+            raise RuntimeError(
+                f"service window {target_window} is announced with another beacon than its randomness"
+            )
+        self._refresh_service_active()
+        window["opened"] = True
+        return announcements
+
+    async def _settle_service_archive(self, runtime, archive: dict) -> dict:
+        """The seal's settlement call, off the event loop.
+
+        A failure is logged with its window and re-raised: the caller's handler
+        then archives the window from its durable journal receipts instead
+        (``_enqueue_aborted_window``, told that the window sealed), which settles
+        it again from well-formed rows. Nothing was enqueued for the window at this
+        point: the settlement is the step just before ``finish``.
+        """
+        batchers = [
+            batcher for batcher in list(getattr(self, "_active_batchers", {}).values())
+            if getattr(batcher, "service_runtime", None) is not None
+            and batcher.window_start == archive.get("window_start")
+        ]
+        try:
+            # Normally a no-op (the seal drained and finalized already): never settle with an env's
+            # exploration still open.
+            for batcher in batchers:
+                await asyncio.to_thread(batcher.finalize_service_exploration)
+            result = await asyncio.to_thread(runtime.reconcile_archive, archive)
+        except Exception as exc:
+            logger.error(
+                "service window %s: settlement failed at seal (%s: %s); the window "
+                "is archived from its durable receipts instead",
+                archive.get("window_start"), type(exc).__name__, exc, exc_info=True,
+            )
+            raise
+        # m1: the settlement may still void an entitlement (R17: its prompt is in the batch). The
+        # per-hotkey verdict rows follow the ledger again, so the final verdicts say what is paid.
+        for batcher in batchers:
+            try:
+                await asyncio.to_thread(batcher._refresh_exploration_rows)
+            except Exception:
+                logger.exception("service window %s env %s: exploration rows not refreshed after the "
+                                 "settlement", archive.get("window_start"),
+                                 getattr(batcher, "service_environment", None))
+        return result
+
+    async def _refresh_service_cooldown_advice(self, window: int) -> None:
+        """After a window settled: recompute the cooldown recommendation. Never raises."""
+        runtime = self._service_runtime
+        try:
+            await asyncio.to_thread(
+                functools.partial(
+                    runtime.refresh_cooldown_advice,
+                    window=int(window),
+                    populations={
+                        name: int(spec["dataset"]["rows"])
+                        for name, spec in runtime.contract.environments.items()
+                    },
+                )
+            )
+        except Exception as exc:
+            logger.error(
+                "service window %s: cooldown advice refresh failed (%s: %s); the "
+                "previous recommendation stays",
+                window, type(exc).__name__, exc, exc_info=True,
+            )
+
     def _open_window(self) -> None:
         """Prepare one legacy window without exposing it to HTTP yet."""
         if self._candidate_window_n is None:
@@ -2482,6 +3894,38 @@ class ValidationService:
         )
         cp = self._checkpoint_store.current_manifest()
         cp_hash = cp.revision if cp else ""
+        runtime = getattr(self, "_service_runtime", None)
+        # The envs of THIS window. A service task runs the envs its schedule has
+        # active (R9: each at the profile's constant group count per pick); every
+        # other task runs its whole mix, as it always has.
+        window_env_mix = list(self.env_mix)
+        window_envs = self.envs
+        service_window = None
+        if runtime is not None:
+            # Built from the plan the boundary prepared off the event loop: no
+            # runtime call (SQLite) happens here.
+            service_window = getattr(self, "_candidate_service_window", None)
+            if (
+                service_window is None
+                or service_window["window"] != target_window
+                or service_window["checkpoint_revision"] != cp_hash
+            ):
+                raise RuntimeError("service window was not prepared at the boundary")
+            window_env_mix = list(service_window["env_mix"])
+            window_envs = {name: self.envs[name] for name, _ in window_env_mix}
+            if not window_envs:
+                raise ValueError("service window has no active environment")
+            for env_name in window_envs:
+                # R6: a cooldown change builds a FRESH map for this window; the
+                # map a previous window was built with is never mutated.
+                horizon = service_window["schedule"].cooldown_windows(env_name)
+                for maps in (self._cooldown_per_env, self._content_cooldown_per_env):
+                    current = maps[env_name]
+                    if current.cooldown_windows != horizon:
+                        maps[env_name] = current.with_cooldown_windows(horizon)
+                        if getattr(self, "_cooldown_map", None) is current:
+                            self._cooldown_map = maps[env_name]
+        self._window_env_mix = window_env_mix
         if self.proof_scheduler is not None and not (
             cp_hash
             and self.proof_scheduler.state is SchedulerState.RUNNING
@@ -2506,11 +3950,12 @@ class ValidationService:
         # proven target -- the window no longer closes on a proven count,
         # it closes at the ``FILL_CLOSED_EMISSIONS_PER_WINDOW``-th pick
         # (``picks_target``), which is window-wide, not per-environment.
+        self._reset_fill_trainer_wait()
         shared_fill_state = (
             FillState(
                 budgets={
                     env_name: FILL_CLOSED_ADMISSION_BUDGET_PER_ENV
-                    for env_name in self.envs
+                    for env_name in window_envs
                 },
                 picks_target=FILL_CLOSED_PICKS_PER_WINDOW,
             )
@@ -2530,7 +3975,7 @@ class ValidationService:
         fill_closed_assembler = (
             FillClosedBatchAssembler(
                 window_start=target_window,
-                env_order=[name for name, _ in self.env_mix],
+                env_order=[name for name, _ in window_env_mix],
                 enqueue_fn=self._write_fill_closed_training_payload,
                 tombstone_fn=self._write_fill_closed_training_tombstone,
                 # R20: one window's whole emission budget. The assembler
@@ -2538,15 +3983,14 @@ class ValidationService:
                 # the only place a v6 window's assembled batches are
                 # known, and under v6 there is no auction to pay at seal.
                 # Each environment's cap, scaled by its own price when armed.
-                window_pool=self._window_pool_for(
-                    [name for name, _ in self.env_mix]
-                ),
+                window_pool=(dict(service_window["pools"])
+                             if runtime is not None else self._window_pool_for([name for name, _ in self.env_mix])),
                 commit_fn=self._commit_fill_closed_batch if recovery is not None else None,
             )
             if FILL_CLOSED_ENABLED
             else None
         )
-        for env_name, env in self.envs.items():
+        for env_name, env in window_envs.items():
             open_kwargs = {
                 "window_start": target_window,
                 "env": env,
@@ -2603,9 +4047,35 @@ class ValidationService:
                 **open_kwargs,
             )
             batcher.current_checkpoint_hash = cp_hash
+            if runtime is not None:
+                # The order covers the env's RL rows (the whole train split unless rows of it are
+                # reserved, see rl_prompt_ranges); historical profiles retain their slice policy.
+                from reliquary.protocol.rl_prompt_ranges import rl_prompt_range
+
+                batcher.prompt_range = rl_prompt_range(env_name, len(env))
+                batcher._experimental_prompt_range = batcher.prompt_range
+                batcher.service_runtime = runtime
+                batcher.service_environment = env_name
+                episode_services = getattr(self, "_episode_services", None)
+                if episode_services is not None and env_name in episode_services.environments:
+                    # An inconclusive proof hands the group's sessions back (non-blocking).
+                    batcher.episode_proof_inconclusive = episode_services.batcher_hook(env_name, target_window)
             if shared_fill_state is not None:
                 batcher.fill_state = shared_fill_state
             batchers[env_name] = batcher
+        if runtime is not None:
+            # The envelope the runtime freezes carries what the assembler pays
+            # from, slot for slot: same pools, protocol geometry.
+            if fill_closed_assembler is None:
+                raise RuntimeError("service window requires the fill-closed assembler")
+            if fill_closed_assembler.picks_target != service_window["picks_target"]:
+                raise ValueError("service window pick target differs from the protocol's")
+            pools = {
+                name: fill_closed_assembler.pool_for(name) for name in window_envs
+            }
+            if pools != service_window["pools"]:
+                raise ValueError("service window pools differ from the assembler's")
+            self._candidate_service_pools = pools
         self._candidate_fill_closed_assembler = fill_closed_assembler
         return batchers
 
@@ -2661,6 +4131,19 @@ class ValidationService:
                     remainder,
                 )
             recovery = getattr(self, "_fill_closed_recovery_store", None)
+            if getattr(self, "_service_runtime", None) is not None:
+                # The runtime froze and announced this window before its recovery
+                # record exists and before any batcher is exposed.
+                service_window = getattr(self, "_candidate_service_window", None)
+                if (
+                    service_window is None
+                    or service_window["window"] != candidate_window
+                    or not service_window["opened"]
+                    or recovery is None
+                ):
+                    raise RuntimeError(
+                        "service window was not opened in the runtime before activation"
+                    )
             if recovery is not None:
                 checkpoint = self._checkpoint_store.current_manifest()
                 revision = next(
@@ -2674,7 +4157,12 @@ class ValidationService:
                     candidate_window,
                     checkpoint_n=checkpoint.checkpoint_n,
                     revision=revision,
-                    targets=dict(self.env_mix),
+                    # A service window journals the envs its schedule runs.
+                    targets=dict(
+                        self._window_env_mix
+                        if getattr(self, "_service_runtime", None) is not None
+                        else self.env_mix
+                    ),
                     # The assembler's own declared total, not ``_emission_cap``
                     # re-derived: ``finish()`` compares this against the number
                     # the archive reports with exact float equality, and a map
@@ -3163,6 +4651,53 @@ class ValidationService:
         cursor = self._read_trainer_step_cursor()
         return cursor is not None and int(cursor) >= required
 
+    def _trainer_consumed_through(self, batcher, *, pick: int) -> bool:
+        """Whether the trainer has consumed this window's picks 1..``pick``.
+
+        The trainer writes its cursor AFTER moving it: the cursor is the next
+        journal key to consume, so pick ``pick`` (batch index ``pick - 1``) is
+        consumed once the cursor reaches batch index ``pick``.
+        """
+        from reliquary.infrastructure.training_payload_queue import (
+            encoded_window_journal_key,
+        )
+
+        required = encoded_window_journal_key(int(batcher.window_start), max(0, int(pick)))
+        cursor = self._read_trainer_step_cursor()
+        return cursor is not None and int(cursor) >= required
+
+    def _reset_fill_trainer_wait(self) -> None:
+        """A new fill window starts with nobody having held the trainer back."""
+        self._fill_trainer_wait_seconds = {}
+        self._fill_trainer_wait_last_tick = None
+
+    def _accrue_trainer_wait(self, picking, *, next_pick: int, now: float) -> None:
+        """Charge this poll tick to every environment that cannot seat a batch,
+        but only while the trainer is idle (it consumed every emitted pick):
+        a trainer still busy is not held back by anybody's supply.
+        Pick 1 is paced by the opening floor, never by the trainer.
+
+        The tick is clamped to 5 s, so a stalled loop is not blamed on miners.
+        The total feeds the price: a wait over 5 % of the window raises it.
+        """
+        last = getattr(self, "_fill_trainer_wait_last_tick", None)
+        self._fill_trainer_wait_last_tick = now
+        if last is None or next_pick <= 1:
+            return
+        # Idle means the trainer consumed every pick emitted so far. The pacing
+        # gate opens earlier (depth 1: while pick k-1 is still queued), so it
+        # is not the test: a trainer busy on the buffered batch is not waiting.
+        if not self._trainer_consumed_through(picking[0], pick=next_pick - 1):
+            return
+        tick = min(max(0.0, now - last), 5.0)
+        waits = getattr(self, "_fill_trainer_wait_seconds", None)
+        if waits is None:
+            waits = self._fill_trainer_wait_seconds = {}
+        for batcher in picking:
+            if not batcher.can_pick():
+                name = str(getattr(getattr(batcher, "env", None), "name", "?"))
+                waits[name] = waits.get(name, 0.0) + tick
+
     def _drive_fill_closed_picks(self, batchers) -> bool:
         """Fire at most ONE window-wide pick event; return whether it did.
 
@@ -3209,7 +4744,9 @@ class ValidationService:
             next_pick = int(fill_state.snapshot()["picks_emitted"]) + 1
         if not all(batcher.can_pick() for batcher in picking):
             self._fill_pick_wait_reason = "candidate_shortfall"
+            self._accrue_trainer_wait(picking, next_pick=next_pick, now=time.monotonic())
             return False
+        self._fill_trainer_wait_last_tick = time.monotonic()
         if not self._fill_closed_pick_gate_open(
             picking[0], next_pick=next_pick
         ):
@@ -3242,6 +4779,115 @@ class ValidationService:
                 else "the event is half-taken",
             )
         return len(refused) < len(picking)
+
+    async def _service_exploration_tick(self, batchers) -> None:
+        """One draw / audit-dispatch pass over the service batchers, off the event loop.
+
+        Rate limited (``SERVICE_EXPLORATION_TICK_SECONDS``): the draw fetches drand beacons.
+        """
+        from reliquary.constants import SERVICE_EXPLORATION_TICK_SECONDS
+
+        now = time.monotonic()
+        if now - getattr(self, "_service_exploration_tick_at", float("-inf")) < SERVICE_EXPLORATION_TICK_SECONDS:
+            return
+        self._service_exploration_tick_at = now
+        for batcher in batchers:
+            if getattr(batcher, "service_runtime", None) is None:
+                continue
+            try:
+                await asyncio.to_thread(batcher.service_exploration_tick)
+            except Exception:
+                logger.exception("service window %s: exploration tick failed",
+                                 getattr(batcher, "window_start", "?"))
+
+    async def _drain_service_exploration(self, batchers) -> None:
+        """The seal drain (R15), then the finalize of every env's exploration. Always bounded.
+
+        1. stop admitting exploration and record what was handed over;
+        2. wait at most ``SERVICE_EXPLORATION_DRAW_WAIT_ROUNDS`` drand rounds for pending draws;
+        3. prove EVERY queued audit of a hotkey past probation, waiting at most
+           ``SERVICE_EXPLORATION_DRAIN_SECONDS`` in all (hotkeys still in probation are served
+           first-come only during the first ``SERVICE_EXPLORATION_DRAIN_PROBATION_SECONDS``);
+        4. finalize each env. A drain that hits its bound finalizes anyway: the groups left
+           unaudited are unpaid, a hotkey's later not-drawn rows then follow the per-hotkey audit
+           horizon (R15), and nobody is sanctioned. An env whose audits cannot run (I4) is not waited
+           for; its groups end ``validator_lost`` (R25: unpaid, no horizon). It never waits forever and nothing else waits
+           on it for longer than the bound.
+        """
+        from reliquary.constants import (
+            SERVICE_EXPLORATION_DRAIN_PROBATION_SECONDS,
+            SERVICE_EXPLORATION_DRAIN_SECONDS,
+            SERVICE_EXPLORATION_DRAW_WAIT_ROUNDS,
+        )
+
+        runtime = getattr(self, "_service_runtime", None)
+        service_batchers = [b for b in batchers if getattr(b, "service_runtime", None) is not None]
+        if runtime is None or not service_batchers:
+            return
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        try:
+            from reliquary.infrastructure import drand
+
+            period = float(drand.get_current_chain()["period"])
+        except Exception:
+            period = 3.0
+        draw_deadline = started + SERVICE_EXPLORATION_DRAW_WAIT_ROUNDS * period + 1.0
+        blocked_logged: set = set()
+        # B2b: per batcher, whether audits could run at the drain's first tick, and whether nothing but the
+        # clock stopped them at its last tick. A window sealed at its full length reaches the dispatch
+        # deadline exactly when the drain bound is reached: that is not the validator's loss.
+        first_progress: dict = {}
+        last_untimed: dict = {}
+        try:
+            for batcher in service_batchers:
+                await asyncio.to_thread(batcher.close_service_exploration)
+            while True:
+                for batcher in service_batchers:
+                    await asyncio.to_thread(batcher.service_exploration_tick, drain=True)
+                now = loop.time()
+                waiting_draw = 0
+                waiting_audit = 0
+                waiting_probation = 0
+                for batcher in service_batchers:
+                    state = await asyncio.to_thread(batcher.exploration_drain_state)
+                    waiting_draw += state["pending_draw"]
+                    first_progress.setdefault(batcher, bool(state.get("can_progress", 1)))
+                    last_untimed[batcher] = bool(state.get("can_progress_untimed", state.get("can_progress", 1)))
+                    if not state.get("can_progress", 1):
+                        # I4: audits cannot run for this env (no scheduler, plan unavailable or retired,
+                        # dispatch deadline passed, checkpoint swapped): waiting would only burn the bound.
+                        # What is left ends validator_lost at the finalize (R25).
+                        if (state["past_probation"] or state["probation"]) and batcher not in blocked_logged:
+                            blocked_logged.add(batcher)
+                            logger.error("service window %s env %s: exploration audits cannot run; not waiting "
+                                         "for them (their groups end unaudited, unpaid, not sanctioned)",
+                                         batcher.window_start, getattr(batcher, "service_environment", "?"))
+                        continue
+                    waiting_audit += state["past_probation"]
+                    waiting_probation += state["probation"]
+                draws_settled = waiting_draw == 0 or now >= draw_deadline
+                audits_settled = waiting_audit == 0 and (
+                    waiting_probation == 0 or now >= started + SERVICE_EXPLORATION_DRAIN_PROBATION_SECONDS)
+                if draws_settled and audits_settled:
+                    break
+                if now >= started + SERVICE_EXPLORATION_DRAIN_SECONDS:
+                    logger.error(
+                        "service exploration drain hit its bound (%.0f s) with %d draw(s), %d audit(s) of "
+                        "hotkeys past probation and %d of hotkeys in probation still waiting; finalizing: "
+                        "they end unaudited (unpaid, not sanctioned)",
+                        SERVICE_EXPLORATION_DRAIN_SECONDS, waiting_draw, waiting_audit, waiting_probation)
+                    break
+                await asyncio.sleep(0.5)
+        except Exception:
+            logger.exception("service exploration drain failed; finalizing what is there")
+        finally:
+            for batcher in service_batchers:
+                try:
+                    could_run = (first_progress[batcher] and last_untimed[batcher]) if batcher in first_progress else None
+                    await asyncio.to_thread(batcher.finalize_service_exploration, audits_could_run=could_run)
+                except Exception:
+                    logger.exception("service window %s: exploration finalize failed", batcher.window_start)
 
     async def _publish_committed_pick_verdicts(self, picking) -> None:
         try:
@@ -3289,6 +4935,9 @@ class ValidationService:
             # rather than a tick later. Inert with the gate off.
             if self._drive_fill_closed_picks(batchers):
                 await self._publish_committed_pick_verdicts(batchers)
+            if self._service_runtime is not None:
+                # Audits run as they are drawn, so probation slots free up during the window.
+                await self._service_exploration_tick(batchers)
             for b in batchers:
                 # The hard ceiling ignores GPU readiness; only adaptive close
                 # is gated by it.
@@ -3318,9 +4967,12 @@ class ValidationService:
                 for b in batchers:
                     if not b.is_sealed():
                         b.force_seal("timeout")
+                await self._drain_service_exploration(batchers)
                 return "timeout"
 
             await asyncio.sleep(min(PROOF_ADMISSION_STALL_POLL_SECONDS, remaining))
+
+        await self._drain_service_exploration(batchers)
 
         drain_timeouts = await self._freeze_auction_populations(batchers)
         for env_name, timed_out in drain_timeouts.items():
@@ -3412,8 +5064,26 @@ class ValidationService:
                     activation_nonce=activation_nonce,
                 )
 
+        service_announcements = None
+        if getattr(self, "_service_runtime", None) is not None:
+            # Freeze, then announce, with the drand-bound window randomness and
+            # before any batcher holds it. A failure leaves nothing open.
+            try:
+                service_announcements = await asyncio.to_thread(
+                    self._open_service_window, int(target_window), randomness,
+                )
+            except Exception as exc:
+                logger.error(
+                    "service window %d: the runtime could not open it (%s: %s); "
+                    "the window is not opened and is retried",
+                    int(target_window), type(exc).__name__, exc, exc_info=True,
+                )
+                raise
+
         for batcher in self._active_batchers.values():
             batcher.randomness = randomness
+            if service_announcements is not None:
+                batcher.service_policy = service_announcements[batcher.service_environment]
 
         self._set_window_preparation_stage("prompt_manifest")
         try:
@@ -3501,6 +5171,18 @@ class ValidationService:
         self, batcher: GrpoWindowBatcher, *, paid_groups: list | None = None,
         batch_indices: dict | None = None, finalize: bool = True,
     ) -> None:
+        records = self._auction_final_verdict_records(batcher, paid_groups=paid_groups,
+                                                     batch_indices=batch_indices, finalize=finalize)
+        if records is None:
+            return
+        await asyncio.to_thread(self.server.persist_final_verdicts, records)
+        if finalize:
+            batcher._auction_final_verdicts_published = True
+
+    def _auction_final_verdict_records(
+        self, batcher: GrpoWindowBatcher, *, paid_groups: list | None = None,
+        batch_indices: dict | None = None, finalize: bool = True,
+    ):
         """Publish the final lifecycle state of every auction candidate.
 
         Admission and final selection are deliberately separate in auction mode:
@@ -3539,6 +5221,21 @@ class ValidationService:
                 rewarded = selected
             if not finalize and (not selected or row.get("verdict_selected_published")):
                 continue
+            service_status = row.get("status")
+            service_observation = (
+                getattr(batcher, "service_runtime", None) is not None
+                and service_status in _SERVICE_EXPLORATION_STATUSES
+            )
+            if service_observation:
+                # Paid only if still entitled at the end: not drawn, or audited and passed, and the
+                # window did not abort. The archive's money is the runtime's; this is the miner's view.
+                payable = (
+                    finalize
+                    and service_status in {"exploration_pending", "exploration_audit_passed"}
+                    and float(row.get("exploration_fraction", 0.0)) > 0.0
+                    and not row.get("window_aborted")
+                )
+                rewarded = payable
             proof_reject = pending.reject_response
             accepted = proof_reject is None
             reason = (
@@ -3570,6 +5267,10 @@ class ValidationService:
                 elif selection_reason in {"queued_for_proof", "proof_pending"}:
                     selection_reason = "proof_not_completed_before_window_close"
 
+            if service_observation:
+                # m5: an exploration / unproven verdict says only paid or not (and the amount): its
+                # status and prompt would join the public observation log to this hotkey.
+                selection_reason = "exploration_reward_recorded" if payable else "exploration_unpaid"
             from reliquary.validator.verifier import rewards_std
 
             try:
@@ -3589,6 +5290,10 @@ class ValidationService:
                     sigma=rewards_std(list(pending.rewards or ())),
                     details={
                         "environment": str(getattr(batcher.env, "name", "")),
+                        **({"service_contract_sha256": batcher.service_runtime.contract.sha256,
+                            "service_purpose": pending.request.service_binding["purpose"],
+                            "exploration_fraction": float(row.get("exploration_fraction", 0.0))}
+                           if getattr(batcher, "service_runtime", None) is not None else {}),
                         "prompt_idx": pending.prompt_idx,
                         "checkpoint_revision": str(getattr(batcher, "current_checkpoint_hash", "")),
                         "receipt_id": getattr(pending.request, "_precommit_receipt_id", None),
@@ -3606,6 +5311,7 @@ class ValidationService:
                         "selection_target": FILL_CLOSED_PICKS_PER_WINDOW * B_BATCH if paid_groups is not None else self._batch_target(batcher),
                         "selected_count": len(paid) if paid_groups is not None else sum(bool(r.get("selected")) for r in metadata.values()),
                     },
+                    **({"withhold": _SERVICE_OBSERVATION_WITHHELD} if service_observation else {}),
                 )
                 if isinstance(record, dict):
                     records.append((pending.hotkey, record))
@@ -3642,9 +5348,7 @@ class ValidationService:
                     pending.prompt_idx,
                 )
 
-        await asyncio.to_thread(self.server.persist_final_verdicts, records)
-        if finalize:
-            batcher._auction_final_verdicts_published = True
+        return records
 
     def _lr_global_step_hint(self) -> int:
         """Restored LR-schedule position for a same-run restart.
@@ -3733,7 +5437,8 @@ class ValidationService:
                 "Window %d: dropping seal+train+archive — beacon invalid",
                 window_n,
             )
-            self._enqueue_aborted_window(
+            await _enqueue_aborted_window_off_loop(
+                self,
                 failure_stage="beacon_verification",
                 failure_type="InvalidBeacon",
                 batchers=batchers,
@@ -3755,7 +5460,8 @@ class ValidationService:
                 "rewards, training and checkpoint publication",
                 window_n,
             )
-            self._enqueue_aborted_window(
+            await _enqueue_aborted_window_off_loop(
+                self,
                 failure_stage="admission_drain",
                 failure_type="AdmissionDrainTimeout",
                 batchers=batchers,
@@ -3869,7 +5575,8 @@ class ValidationService:
                 window_n,
                 proof_capacity_aborts,
             )
-            self._enqueue_aborted_window(
+            await _enqueue_aborted_window_off_loop(
+                self,
                 failure_stage="proof_capacity",
                 failure_type="ProofCapacityAbort",
                 batchers=batchers,
@@ -4437,7 +6144,8 @@ class ValidationService:
             )
         except Exception as exc:
             logger.exception("window archive failed")
-            self._enqueue_aborted_window(
+            await _enqueue_aborted_window_off_loop(
+                self,
                 failure_stage="archive_enqueue",
                 failure_type=type(exc).__name__,
                 batchers=batchers,
@@ -4527,16 +6235,18 @@ class ValidationService:
         self._publish_price_view(shadow, price_params)
         return shadow
 
-    def _window_pool_for(self, env_order: list[str]):
+    def _window_pool_for(self, env_order: list[str], *, declared=None):
         """What each environment of a new window may pay: its cap, scaled by its price.
 
         Returns the declared pool object itself while every price is at its cap, so
         an unpriced window is identical to one built before the price was armed.
+        ``declared`` is given only by a service window (its live shares).
         """
         from reliquary.constants import EMISSION_PRICE_ARMED
         from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
 
-        declared = self._env_caps or self._emission_cap
+        if declared is None:
+            declared = self._env_caps or self._emission_cap
         if not EMISSION_PRICE_ARMED or not env_order:
             return declared
         if isinstance(declared, dict) and any(env not in declared for env in env_order):
@@ -4576,6 +6286,38 @@ class ValidationService:
             for environment, trail in walk.history_by_environment.items()
         }
         self._price_shadow_states_by_environment = dict(walk.states_by_environment)
+
+    def _feed_rl_pay(self, archive) -> None:
+        """Give ``GET /rl/pay`` this window; never at the archive's expense."""
+        board = getattr(self, "_rl_pay", None)
+        if board is None:
+            return
+        try:
+            from reliquary.validator.rl_pay import window_stat
+
+            board.add(window_stat(archive))
+        except Exception:
+            logger.warning("rl pay: window not recorded", exc_info=True)
+
+    async def _seed_rl_pay(self) -> None:
+        """The last windows' archives, so ``GET /rl/pay`` answers after a restart."""
+        from reliquary.validator.rl_pay import SEED_WINDOWS, window_stat
+
+        board = getattr(self, "_rl_pay", None)
+        end_window = int(getattr(self, "_window_n", 0) or 0)
+        if board is None or end_window <= 0:
+            return
+        try:
+            archives = await self._load_archive_range(
+                start_window=max(0, end_window - SEED_WINDOWS + 1),
+                end_window=end_window,
+                require_all=False,
+                task_id=TASK_ID,
+            )
+            board.seed(window_stat(archive) for archive in archives)
+            logger.info("rl pay: seeded from %d archived windows", len(archives))
+        except Exception:
+            logger.warning("rl pay: seed from archives failed", exc_info=True)
 
     async def _restore_price_walk(self) -> None:
         """Resume the price walk from the archives, so a restart never resets the price.
@@ -4639,7 +6381,11 @@ class ValidationService:
                     assembler.window_pool if assembler is not None else self._emission_cap
                 ),
                 places_per_window=(
-                    assembler.picks_target * B_BATCH * len(self.env_mix)
+                    assembler.picks_target * B_BATCH * len(
+                        self._window_env_mix
+                        if getattr(self, "_service_runtime", None) is not None
+                        else self.env_mix
+                    )
                     if assembler is not None else None
                 ),
                 # Quicknet's 3 s period until the chain info has been fetched.
@@ -5113,7 +6859,13 @@ class ValidationService:
 
             for paid_batch_index, s in zip(paid_batch_indices, env_batch):
                 try:
-                    problem = env_obj.get_problem(s.prompt_idx)
+                    if getattr(s, "archive_prompt", None) is not None:
+                        problem = {
+                            "prompt": s.archive_prompt,
+                            "ground_truth": s.archive_ground_truth or "",
+                        }
+                    else:
+                        problem = env_obj.get_problem(s.prompt_idx)
                 except Exception:
                     # A lazy-dataset fetch failure must not abort the whole
                     # window's archive — keep the entry (prompt_idx/rewards are
@@ -5320,7 +7072,11 @@ class ValidationService:
         # readiness read downstream as a SHORTAGE, which snaps the price up
         # without confirmation. See ``_window_price_signal``.
         price_signal = _window_price_signal(
-            first_batcher, batcher_dict, _price_target_for
+            first_batcher, batcher_dict, _price_target_for,
+            trainer_wait_seconds_by_environment=(
+                dict(getattr(self, "_fill_trainer_wait_seconds", None) or {})
+                if FILL_CLOSED_ENABLED else None
+            ),
         )
         price_shadow = self._advance_price_shadow(price_signal, window_status=window_status)
         archive = {
@@ -5347,6 +7103,14 @@ class ValidationService:
                     if fill_closed_assembler is not None
                     else 1.0
                 ),
+                # Each environment's own pool: with per-environment prices
+                # they differ, and only this lets a reader (``/rl/pay``) price
+                # a paid group exactly. Absent without an assembler.
+                **({
+                    "window_pool_by_environment": _pools_by_environment(
+                        fill_closed_assembler, batcher_dict,
+                    ),
+                } if fill_closed_assembler is not None else {}),
             } if FILL_CLOSED_ENABLED else {}),
             "validator_hotkey": self.wallet.hotkey.ss58_address,  # provenance
             "randomness": first_batcher.randomness,
@@ -5463,6 +7227,7 @@ class ValidationService:
             # received a seal-time snapshot; the live ledger now accumulates
             # the COLLECTING window's drops and must not be wiped.
             self._late_drops.clear()
+        self._feed_rl_pay(archive)
         # Non-blocking archive: enqueue to disk and return immediately.
         # The background ``ArchiveQueue`` worker (started in run()) picks
         # this up and uploads via the same sync-boto3 path used in
@@ -5472,11 +7237,23 @@ class ValidationService:
         from reliquary.infrastructure.archive_queue import get_archive_queue
         archived_window = int(first_batcher.window_start)
         recovery = getattr(self, "_fill_closed_recovery_store", None)
+        runtime = getattr(self, "_service_runtime", None)
+        if runtime is not None:
+            # The last step before the archive is committed: nothing that can fail
+            # stands between the settlement and ``finish`` but ``finish`` itself.
+            # J2: the window sealed. Persisted BEFORE the settlement so that a restart after a
+            # double fault (settlement and recovery both failed) still recovers it as completed.
+            self._service_sealed_windows.add(archived_window)
+            if FILL_CLOSED_ENABLED and recovery is not None:
+                await asyncio.to_thread(recovery.mark_sealed, archived_window)
+            archive = await self._settle_service_archive(runtime, archive)
         if FILL_CLOSED_ENABLED and recovery is not None:
             recovery.finish(archived_window, archive, get_archive_queue())
         else:
             get_archive_queue().enqueue(archived_window, archive)
         self._archive_enqueued_windows.add(archived_window)
+        if runtime is not None:
+            self._service_sealed_windows.discard(archived_window)
         if FILL_CLOSED_ENABLED and fill_closed_assembler is not None:
             self._fill_closed_assemblers.pop(archived_window, None)
             if getattr(self, "_fill_closed_assembler", None) is fill_closed_assembler:
@@ -5663,6 +7440,13 @@ class ValidationService:
             queue.enqueue_committed_tombstone(key, data, accounting=accounting)
         else:
             queue.enqueue_committed_payload(key, data, accounting=accounting)
+        runtime = getattr(self, "_service_runtime", None)
+        if runtime is not None:
+            try:
+                runtime.record_training_journal(key, data, is_tombstone=is_tombstone, batches=batches, stride=FILL_CLOSED_EMISSIONS_PER_WINDOW)
+            except Exception:
+                # The payload is already committed; its optional throughput projection cannot undo it.
+                logger.exception("service consumption telemetry unavailable; adaptive cooldown falls back")
 
     def _write_fill_closed_training_payload(
         self, key: int, data: bytes,
@@ -5704,6 +7488,118 @@ class ValidationService:
             key, data
         )
 
+    def _complete_service_recovery(self, window: int, archive: dict, batchers: dict | None, paid: dict | None) -> None:
+        """What follows a service window's recovery, whoever ran it (J3).
+
+        Called by the in-process recovery (``_enqueue_aborted_window``) and by the
+        boundary healing (``_prepare_service_window``): the final verdicts of the
+        window's submissions (an aborted window pays no exploration), the verdict
+        window closed, the hash cache kept contiguous, and the per-window memory
+        dropped. ``batchers`` / ``paid`` ({env: [(index, group)]}) are None when
+        the process no longer holds the window (a restart): the verdict records
+        of those submissions are not republished, the rest is identical.
+        """
+        for name, batcher in (batchers or {}).items():
+            if archive.get("window_status") == "aborted":
+                for row in batcher.difficulty_auction_metadata_by_id.values():
+                    if row.get("status") in _SERVICE_EXPLORATION_STATUSES:
+                        row["exploration_fraction"] = 0.0
+                        row["window_aborted"] = True
+            groups = (paid or {}).get(name, [])
+            records = self._auction_final_verdict_records(
+                batcher, paid_groups=[group for _, group in groups],
+                batch_indices={(group.hotkey, group.prompt_idx, bytes(group.merkle_root)): index
+                               for index, group in groups},
+            )
+            if records is not None:
+                self.server.persist_final_verdicts(records)
+                batcher._auction_final_verdicts_published = True
+        self.server.complete_final_verdict_window(window)
+        # Keep the hash recovery cache contiguous; a gap stalls it for good.
+        self._cache_archived_hashes(archive)
+        self._fill_closed_assemblers.pop(window, None)
+        current = getattr(self, "_fill_closed_assembler", None)
+        if current is not None and current.window_start == window:
+            self._fill_closed_assembler = None
+        self._archive_enqueued_windows.add(window)
+        self._cooldown_durable_window = max(getattr(self, "_cooldown_durable_window", 0), window)
+        self._service_sealed_windows.discard(window)
+        self._service_recovery_attempts.pop(window, None)
+        self._service_recovery_context.pop(window, None)
+
+    # --- service part of an aborted window (m3: its blocking steps run off the event loop) ---
+
+    def _begin_service_abort_recovery(self, window_start: int, failure_stage: str) -> None:
+        # A failure of the archive step means the window SEALED: its audits
+        # ran and its exploration is owed even when no training group was
+        # paid. Remembered for every later attempt of this process (the
+        # loop's own handler, the next boundary).
+        if failure_stage == "archive_enqueue":
+            self._service_sealed_windows.add(window_start)
+
+    def _service_abort_recovery(self, window_start: int, batchers: dict) -> dict:
+        """BLOCKING (SQLite, the archive queue): finalize the window's exploration, then recover it."""
+        from reliquary.infrastructure.archive_queue import get_archive_queue
+
+        for batcher in batchers.values():
+            if getattr(batcher, "service_runtime", None) is not None:
+                # No drain here (the window failed): the validator lost the audit inputs, so what is
+                # open ends validator_lost (unpaid, unsanctioned, no horizon: R25).
+                batcher.finalize_service_exploration(audits_could_run=False)
+        return self._fill_closed_recovery_store.recover(
+            window_start, queue=self._training_payload_queue_ref(),
+            archives=get_archive_queue(), rotation=self._fill_closed_rotation_store,
+            service_runtime=self._service_runtime,
+            sealed=window_start in self._service_sealed_windows,
+        )
+
+    def _service_abort_recovery_failed(self, window_start: int, batchers: dict, paid) -> None:
+        # Kept for the boundary healing (``_recover_leftover_service_windows``): the
+        # same post-recovery steps run there with these batchers and paid groups.
+        self._service_recovery_context[window_start] = (dict(batchers), paid)
+        # ``recover`` wrote the window's rotation barrier before it failed.
+        # The store is the truth after a recovery (as below and at a
+        # restart): the next window still waits for the trainer.
+        self._fill_closed_rotation_gate = self._fill_closed_rotation_store.load()
+
+    def _finish_service_abort_recovery(self, window_start: int, archive: dict, batchers: dict, paid) -> None:
+        self._complete_service_recovery(window_start, archive, batchers, paid)
+        self._fill_closed_rotation_gate = self._fill_closed_rotation_store.load()
+
+    async def _enqueue_aborted_service_window(
+        self,
+        *,
+        failure_stage: str,
+        failure_type: str,
+        batchers: dict | None = None,
+        late_drops: dict | None = None,
+    ) -> None:
+        """``_enqueue_aborted_window`` of a service task, with the exploration finalize and the
+        recovery (SQLite commits, fsync) in a worker thread; everything else on the loop, in the
+        same order. Only reached with a service runtime (``_enqueue_aborted_window_off_loop``)."""
+        if batchers is None:
+            batchers = self._active_batchers
+        recovery = getattr(self, "_fill_closed_recovery_store", None)
+        if not batchers or not FILL_CLOSED_ENABLED or recovery is None:
+            self._enqueue_aborted_window(failure_stage=failure_stage, failure_type=failure_type,
+                                         batchers=batchers, late_drops=late_drops)
+            return
+        window_start = int(next(iter(batchers.values())).window_start)
+        if window_start in getattr(self, "_archive_enqueued_windows", set()):
+            return
+        assembler = getattr(self, "_fill_closed_assemblers", {}).get(window_start)
+        if assembler is None:
+            raise RuntimeError(f"window {window_start}: v6 recovery has no assembler")
+        paid = self._close_and_commit_fill_closed_paid_side_effects(batchers, assembler)
+        recovery.quarantine_uncommitted(self._training_payload_queue_ref().queue_dir)
+        self._begin_service_abort_recovery(window_start, failure_stage)
+        try:
+            archive = await asyncio.to_thread(self._service_abort_recovery, window_start, batchers)
+        except Exception:
+            self._service_abort_recovery_failed(window_start, batchers, paid)
+            raise
+        self._finish_service_abort_recovery(window_start, archive, batchers, paid)
+
     def _enqueue_aborted_window(
         self,
         *,
@@ -5741,15 +7637,31 @@ class ValidationService:
                 raise RuntimeError(
                     f"window {window_start}: v6 recovery has no assembler"
                 )
-            self._close_and_commit_fill_closed_paid_side_effects(
+            paid = self._close_and_commit_fill_closed_paid_side_effects(
                 batchers,
                 assembler,
             )
             recovery.quarantine_uncommitted(self._training_payload_queue_ref().queue_dir)
-            archive = recovery.recover(
-                window_start, queue=self._training_payload_queue_ref(),
-                archives=get_archive_queue(), rotation=self._fill_closed_rotation_store,
-            )
+            if getattr(self, "_service_runtime", None) is None:
+                for batcher in batchers.values():
+                    if getattr(batcher, "service_runtime", None) is not None:
+                        # No drain here (the window failed): the validator lost the audit inputs, so what is
+                        # open ends validator_lost (unpaid, unsanctioned, no horizon: R25).
+                        batcher.finalize_service_exploration(audits_could_run=False)
+                archive = recovery.recover(
+                    window_start, queue=self._training_payload_queue_ref(),
+                    archives=get_archive_queue(), rotation=self._fill_closed_rotation_store,
+                    service_runtime=getattr(self, "_service_runtime", None),
+                )
+            else:
+                self._begin_service_abort_recovery(window_start, failure_stage)
+                try:
+                    archive = self._service_abort_recovery(window_start, batchers)
+                except Exception:
+                    self._service_abort_recovery_failed(window_start, batchers, paid)
+                    raise
+                self._finish_service_abort_recovery(window_start, archive, batchers, paid)
+                return
             # Keep the hash recovery cache contiguous; a gap stalls it for good.
             self._cache_archived_hashes(archive)
             self._fill_closed_rotation_gate = self._fill_closed_rotation_store.load()
@@ -6105,13 +8017,54 @@ class ValidationService:
         await asyncio.sleep(2.0)
         return True
 
-    async def _control_heartbeat(self) -> None:
-        while True:
+    def _refresh_service_active(self) -> None:
+        """Publish whether the service order is still active as a plain server attribute.
+
+        BLOCKING (runtime lock + SQLite): only ever called off the event loop or from the
+        window thread, never from a request. A failure keeps the last known value.
+        """
+        runtime = getattr(self, "_service_runtime", None)
+        if runtime is None:
+            return
+        try:
+            self.server.set_service_runtime_active(runtime.active())
+        except Exception:
+            logger.exception("service order activity could not be refreshed; keeping the last value")
+
+    SERVICE_ACTIVE_REFRESH_TIMEOUT_SECONDS = 4.0
+
+    async def _refresh_service_active_bounded(self) -> None:
+        """``_refresh_service_active`` off the event loop, given up on after a few seconds (the
+        thread may still finish; the last published value is kept meanwhile)."""
+        if getattr(self, "_service_refresh_in_flight", False):
+            return  # a worker thread is still stuck on the runtime lock: never stack a second one behind it
+        self._service_refresh_in_flight = True
+
+        def work() -> None:
             try:
-                self._control_store.heartbeat(window=self._window_n)
-            except OSError:
-                logger.exception("control heartbeat could not be persisted")
-            await asyncio.sleep(5)
+                self._refresh_service_active()
+            finally:
+                self._service_refresh_in_flight = False
+
+        try:
+            await asyncio.wait_for(asyncio.to_thread(work), self.SERVICE_ACTIVE_REFRESH_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning("service order activity refresh is slow (runtime busy); keeping the last value")
+
+    async def _control_heartbeat(self) -> None:
+        refresh = None  # its own task: the heartbeat write never waits behind the runtime lock
+        try:
+            while True:
+                try:
+                    self._control_store.heartbeat(window=self._window_n)
+                except OSError:
+                    logger.exception("control heartbeat could not be persisted")
+                if getattr(self, "_service_runtime", None) is not None and (refresh is None or refresh.done()):
+                    refresh = asyncio.ensure_future(self._refresh_service_active_bounded())
+                await asyncio.sleep(5)
+        finally:
+            if refresh is not None and not refresh.done():
+                refresh.cancel()
 
     async def run(self, subtensor) -> None:
         from reliquary.infrastructure.archive_queue import get_archive_queue
@@ -6124,11 +8077,9 @@ class ValidationService:
             finally:
                 logger.info("startup_stage=%s elapsed_seconds=%.3f", name, time.monotonic() - started)
 
-        self.server.configure_final_verdict_store(
-            os.getenv("RELIQUARY_STATE_DIR", "/root/reliquary/state")
-        )
+        self.server.configure_final_verdict_store(str(_validator_state_dir()))
         self._control_store = ControlStore(
-            os.getenv("RELIQUARY_STATE_DIR", "/root/reliquary/state"),
+            _validator_state_dir(),
             start_closed=os.getenv("RELIQUARY_CONTROL_START_CLOSED", "0").lower()
             in {"1", "true", "yes", "on"},
         )
@@ -6141,6 +8092,7 @@ class ValidationService:
         self.server.configure_archive_queue_telemetry(archive_queue.snapshot)
         self.server.configure_registration_gate()
         await startup_step("registration", self._refresh_registered_hotkeys(force=True, reason="startup"))
+        await startup_step("episode_services", self._start_episode_services())
         await self.server.start()
         await startup_step("activation_checkpoint", self._apply_resume_from())
         # Authenticate the pinned activation checkpoint before normal bootstrap
@@ -6175,6 +8127,9 @@ class ValidationService:
         await startup_step("content_cooldown", self._restore_content_cooldown())
         await startup_step("hash_history", self._rebuild_hashes_from_history())
         await startup_step("emission_price", self._restore_price_walk())
+        # Behind startup: the pay board only informs miners and must never
+        # delay serving.
+        self._rl_pay_seed_task = asyncio.create_task(self._seed_rl_pay(), name="rl_pay_seed")
         self._log_startup_config_banner()
 
         # Start the background archive-upload worker. It scans the queue
@@ -6185,6 +8140,7 @@ class ValidationService:
             archive_queue.run_forever(),
             name="archive_queue_worker",
         )
+        self._start_observation_publication()
         from reliquary.constants import WRITE_TRAINING_PAYLOADS
 
         if WRITE_TRAINING_PAYLOADS:
@@ -6240,6 +8196,9 @@ class ValidationService:
                     }:
                         await asyncio.sleep(FILL_CLOSED_ROTATION_POLL_SECONDS)
                         continue
+                    if self._service_runtime is not None:
+                        if not await self._prepare_service_window():
+                            continue
                     self._open_window()
                     self._window_iteration_stage = "admission_pools"
                     self._set_window_preparation_stage("admission_pools")
@@ -6313,7 +8272,8 @@ class ValidationService:
                             # own tombstone first (the handler only sees the
                             # collecting window's routing).
                             try:
-                                self._enqueue_aborted_window(
+                                await _enqueue_aborted_window_off_loop(
+                                    self,
                                     failure_stage="pipelined_train_archive",
                                     failure_type="FatalProofPlaneError",
                                     batchers=stashed_batchers,
@@ -6355,7 +8315,8 @@ class ValidationService:
                                 stashed_n,
                             )
                             try:
-                                self._enqueue_aborted_window(
+                                await _enqueue_aborted_window_off_loop(
+                                    self,
                                     failure_stage="pipelined_train_archive",
                                     failure_type="PipelinedTrainFailure",
                                     batchers=stashed_batchers,
@@ -6470,6 +8431,10 @@ class ValidationService:
                         await self._train_and_publish(
                             window_status=window_status,
                         )
+                        if self._service_runtime is not None:
+                            await self._refresh_service_cooldown_advice(
+                                self._window_n
+                            )
 
                     # Persist the cooldown on a fixed window cadence, independent
                     # of the publish cadence (which can stall): keeps the snapshot
@@ -6495,7 +8460,8 @@ class ValidationService:
                     )
                     try:
                         # Per-window dedup happens inside the helper.
-                        self._enqueue_aborted_window(
+                        await _enqueue_aborted_window_off_loop(
+                            self,
                             failure_stage=self._window_iteration_stage,
                             failure_type="FatalProofPlaneError",
                         )
@@ -6525,7 +8491,8 @@ class ValidationService:
                             "pipelined_train_archive"
                         )
                         try:
-                            self._enqueue_aborted_window(
+                            await _enqueue_aborted_window_off_loop(
+                                self,
                                 failure_stage="pipelined_train_archive",
                                 failure_type="FatalProofPlaneError",
                                 batchers=_fb,
@@ -6542,7 +8509,8 @@ class ValidationService:
                 except Exception as exc:
                     logger.exception("Window iteration failed")
                     try:
-                        self._enqueue_aborted_window(
+                        await _enqueue_aborted_window_off_loop(
+                            self,
                             failure_stage=self._window_iteration_stage,
                             failure_type=type(exc).__name__,
                         )
@@ -6592,7 +8560,8 @@ class ValidationService:
                                 "of window %d; terminating for restart", _sn,
                             )
                             try:
-                                self._enqueue_aborted_window(
+                                await _enqueue_aborted_window_off_loop(
+                                    self,
                                     failure_stage="pipelined_train_archive",
                                     failure_type="FatalProofPlaneError",
                                     batchers=_sb,
@@ -6609,7 +8578,8 @@ class ValidationService:
                                 "Salvage of stashed window %d failed", _sn,
                             )
                             try:
-                                self._enqueue_aborted_window(
+                                await _enqueue_aborted_window_off_loop(
+                                    self,
                                     failure_stage="pipelined_train_archive",
                                     failure_type="PipelinedSalvageFailure",
                                     batchers=_sb,
@@ -6641,9 +8611,264 @@ class ValidationService:
                     await asyncio.wait_for(task, timeout=5)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
+            await self._stop_serving()
+            telemetry.finish()
+
+    async def _stop_serving(self) -> None:
+        """Shutdown order: the proof plane and the server first, then the episode services (a late
+        hand-back from the proof's last verdicts still finds them, and is awaited, bounded, before the
+        issuer and its store close), the runtime last; each step runs even when an earlier one failed."""
+        try:
+            await self._stop_observation_publication()
             await self._close_proof_scheduler()
             await self.server.stop()
-            telemetry.finish()
+        finally:
+            try:
+                await self._stop_episode_services()
+            finally:
+                runtime = getattr(self, "_service_runtime", None)
+                if runtime is not None:
+                    runtime.close()
+
+    def _start_observation_publication(self) -> None:
+        """Signed static publication of the run observation log (decision D). Off unless this is a
+        service run AND ``RELIQUARY_OBSERVATIONS_BUCKET`` names the public bucket."""
+        runtime = getattr(self, "_service_runtime", None)
+        if runtime is None:
+            return
+        bucket = os.environ.get("RELIQUARY_OBSERVATIONS_BUCKET")
+        if not bucket:
+            logger.warning("RELIQUARY_OBSERVATIONS_BUCKET unset: service observations are not published")
+            return
+        if self._signer_client is not None:
+            logger.warning("service observations are not published: the hotkey lives in the remote signer, "
+                           "which does not sign observation indexes")
+            return
+        from reliquary.services.publication import ObservationPublisher, r2_get, r2_put
+
+        namespace = active_checkpoint_namespace()
+        self._observation_stop = asyncio.Event()
+        self._observation_publisher = ObservationPublisher(
+            runtime, run_id=namespace.run_id, task_id=namespace.task_id, wallet=self.wallet,
+            put=r2_put(bucket), get=r2_get(bucket))
+        self._observation_task = asyncio.create_task(
+            self._observation_publisher.run(self._observation_stop), name="service_observation_publisher")
+
+    # --- the RL validator's signed-sandbox side ---
+    def _episode_task_in_cooldown(self, environment: str, task_index: int, window: int) -> bool:
+        """The runtime's precommit cooldown hook (prompt cooldown only): the per-env maps are read at call
+        time, a new window may have replaced them."""
+        maps = self._cooldown_per_env
+        return environment in maps and maps[environment].is_in_cooldown(task_index, window)
+
+    @staticmethod
+    def _service_window_frozen(runtime, window: int) -> bool:
+        """Whether ``window``'s envelope is already frozen (before this open). BLOCKING (SQLite)."""
+        from reliquary.services.runtime import ServicePolicyLimit
+
+        try:
+            runtime.envelope(window)
+        except ServicePolicyLimit:
+            return False
+        return True
+
+    def _note_episode_window(self, window: int, *, resumed: bool) -> None:
+        """Episode intake opens only for a window this process froze; one it found frozen (a restart, or
+        an earlier attempt of this process that failed after the freeze) stays closed to it."""
+        opened = self.__dict__.setdefault("_episode_windows_opened", {})
+        if resumed and window not in opened:
+            logger.warning("service window %d was frozen before this process opened it: no episode "
+                           "precommit, session or group is taken for it", window)
+            return
+        opened.setdefault(int(window), time.time())
+        for old in sorted(opened)[:-4]:
+            del opened[old]
+
+    def _episode_operator_of(self, hotkey: str) -> str | None:
+        """The chain operator (coldkey) of ``hotkey`` from the registration cache: memory only (read on the event
+        loop, only to tell whether a saturation was the refused miner's own doing; the quota is per hotkey)."""
+        return (getattr(getattr(self, "server", None), "_operator_by_hotkey", None) or {}).get(hotkey)
+
+    async def _open_episode_yield_ledger(self):
+        """The RL yield ledger ``rl-yield.sqlite3`` beside ``runtime.sqlite3``, opened in a worker thread; None
+        without a service folder. A corrupted file or one of another schema stops the start (never a fresh
+        ledger in its place: every low-yield hotkey would become a newcomer again)."""
+        folder = getattr(self, "_service_folder", None)
+        if folder is None:
+            return None
+        from reliquary.sandbox.rl_yield import SessionYieldLedger, YieldLedgerUnusable
+
+        path = Path(folder) / "rl-yield.sqlite3"
+        try:
+            return await asyncio.to_thread(SessionYieldLedger, path)
+        except YieldLedgerUnusable as error:
+            logger.error("ALERT the RL yield ledger is unusable, the validator does not start: %s", error)
+            raise
+
+    def _episode_window_started_at(self, window: int) -> float | None:
+        return (getattr(self, "_episode_windows_opened", None) or {}).get(window)
+
+    def _current_service_window(self) -> int | None:
+        """The service window episode admissions are open for: the active batchers' frozen
+        announcement, if this process opened that window; None between windows or for a resumed one.
+        Memory only (it is read on the event loop by the routes)."""
+        server = getattr(self, "server", None)
+        if server is None:
+            return None
+        for batcher in server._active_batcher_values():
+            if isinstance(getattr(batcher, "service_policy", None), dict):
+                window = int(batcher.window_start)
+                return window if self._episode_window_started_at(window) is not None else None
+        return None
+
+    def _episode_stop_sets(self) -> tuple[set[int], set[int] | None]:
+        """(the batcher's stop set, a remote proof worker's or None): what the proof checks a turn's
+        stop against, from the model the batchers prove with."""
+        from reliquary.shared.modeling import resolve_eos_token_ids
+        from reliquary.validator.rl_sandbox_wiring import stop_ids_from_metadata
+
+        pool = getattr(self, "_proof_worker_pool", None)
+        health = getattr(pool, "health", None) if pool is not None else None
+        proxies = list((getattr(self, "_proof_models", None) or {}).values())
+        model = proxies[0] if pool is not None and proxies else getattr(self, "verify_model", None)
+        if pool is not None and proxies and getattr(model, "config", None) is not None:
+            # Episode boot check only: the proxy's flat config read with its nested text_config
+            # as attributes; the legacy batcher keeps resolving its stop set from the proxy as it is.
+            from reliquary.validator.remote_proof import _config_namespace
+
+            model = SimpleNamespace(config=_config_namespace(model.config),
+                                    generation_config=getattr(model, "generation_config", None))
+        proof = {int(t) for t in (resolve_eos_token_ids(model, self.tokenizer) or ())}
+        remote = None
+        if health is not None:
+            remote = stop_ids_from_metadata(health.config, health.generation_config, self.tokenizer)
+        return proof, remote
+
+    def _episode_precommit_retention_s(self) -> float:
+        """At least the longest prompt cooldown horizon of an episode env, in the longest window time."""
+        from reliquary.constants import FILL_CLOSED_MAX_SECONDS
+        from reliquary.validator.rl_sandbox_wiring import MIN_PRECOMMIT_RETENTION_S
+
+        runtime = self._service_runtime
+        horizon = 0
+        for name in runtime.contract.episode_environments:
+            try:
+                horizon = max(horizon, int(runtime.schedule.cooldown_windows(name)))
+            except Exception:
+                continue
+        return max(float(MIN_PRECOMMIT_RETENTION_S), horizon * float(FILL_CLOSED_MAX_SECONDS))
+
+    async def _start_episode_services(self) -> None:
+        """The RL validator's signed-sandbox side, only when the order has signed-episode envs:
+        the /rl routes on this server, the episode intake on its admission path, the RL sessions restored,
+        the fleet, session and precommit-retention loops started. Refuses to start when an env with an
+        episode block is not a registered signed-episode env, without the sandbox key settings, without a
+        TOPLOC proof in the protocol profile (an episode is proven span by span), without the runtime's
+        cooldown hook, or when a renderer stop is outside the proof's stop set."""
+        runtime = getattr(self, "_service_runtime", None)
+        if runtime is None or not runtime.contract.episode_environments:
+            return
+        from reliquary.constants import ACTIVE_PROTOCOL_PROFILE
+        from reliquary.environment.registry import find_environment_spec
+        from reliquary.protocol.profiles import toploc_proof
+
+        added = set(runtime.schedule.added_environments())
+        for name in runtime.contract.episode_environments:
+            if name in added:
+                continue                    # checked when added; one not loaded is retried, never fatal here
+            spec = find_environment_spec(name)
+            if spec is None or spec.interaction_mode != "signed_episode":
+                raise ValueError(f"{name} has an episode block but is not a registered signed-episode environment")
+        from reliquary.validator.rl_sandbox_wiring import (
+            BOOT_FLEET_WAIT_S, build_rl_episode_services, rl_registration,
+        )
+        from reliquary.validator.sandbox_wiring import SandboxValidatorConfig
+
+        toploc = toploc_proof(ACTIVE_PROTOCOL_PROFILE)
+        if toploc is None:
+            raise ValueError("signed episodes are proven by TOPLOC, and the protocol profile names none")
+        if getattr(runtime, "task_in_cooldown", None) is None:
+            raise ValueError("the runtime has no prompt-cooldown hook: episode precommits would ignore it")
+        config = SandboxValidatorConfig.from_env()
+        if config is None:
+            raise ValueError("set RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE and RELIQUARY_SANDBOX_VALIDATOR_KEY_ID "
+                             "to serve signed-episode environments")
+        # The launch envs: an env the schedule added joins them after the start, through the same checks as
+        # a live add (one the services refuse never stops the start).
+        environments = {name: self.envs[name] for name in runtime.contract.episode_environments
+                        if name in self.envs and name not in added}
+        renderer_for = getattr(self, "_episode_renderer_for", None) or self._default_episode_renderer
+        proof_stops, remote_stops = self._episode_stop_sets()
+        ledger = await self._open_episode_yield_ledger()
+        try:
+            services = build_rl_episode_services(
+                config, validator_hotkey=self.wallet.hotkey.ss58_address, runtime=runtime,
+                environments=environments, renderer_for=renderer_for,
+                current_window=self._current_service_window, chunk_tokens=toploc.chunk_tokens,
+                window_started_at=self._episode_window_started_at,
+                proof_stop_ids=proof_stops, remote_stop_ids=remote_stops,
+                precommit_retention_s=self._episode_precommit_retention_s(),
+                registration=rl_registration(self.server), ledger=ledger,
+                operator_of=self._episode_operator_of,
+                window_uses=None if ledger is None else runtime.window_uses, require_resources=True,
+                boot_wait_s=BOOT_FLEET_WAIT_S)
+            for router in services.routers:
+                self.server.app.include_router(router)
+            await services.start()
+        except BaseException:
+            if ledger is not None:
+                await asyncio.to_thread(ledger.close)
+            raise
+        self.server._episode_intake = services.intake
+        self._episode_services = services
+        if added:
+            await self._serve_added_envs_at_start(services)
+        jobs = [*services.background()]
+        if getattr(self, "_service_schedule_store", None) is not None:
+            jobs.append(self._prestage_forever())        # envs a schedule request adds, built ahead of the boundary
+        self._episode_tasks = [asyncio.create_task(job) for job in jobs]
+
+    def _default_episode_renderer(self, policy):
+        """The turn renderer of the policy's tokenizer over the env's tools (the signed parse)."""
+        from reliquary.environment.agentic_swe import load_turn_renderer
+
+        return load_turn_renderer(str(getattr(self.tokenizer, "name_or_path", "")), tools=tuple(policy.tools))
+
+    async def _stop_episode_services(self) -> None:
+        tasks = list(getattr(self, "_episode_tasks", None) or [])
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._episode_tasks = []
+        services = getattr(self, "_episode_services", None)
+        if services is not None:
+            await services.stop()
+            self._episode_services = None
+
+    def _require_publication_signer(self) -> None:
+        """Refuse to boot when observation publication is configured but the hotkey is in a remote
+        signer (which does not sign observation indexes): never run silently without the log."""
+        if (getattr(self, "_service_runtime", None) is not None and os.environ.get("RELIQUARY_OBSERVATIONS_BUCKET")
+                and self._signer_client is not None):
+            raise ValueError(
+                "RELIQUARY_OBSERVATIONS_BUCKET is set but the validator uses a remote signer, which cannot sign "
+                "the observation index. Either run with a local hotkey, or add a signer operation for "
+                "observation indexes; or unset RELIQUARY_OBSERVATIONS_BUCKET to run without publication.")
+
+    async def _stop_observation_publication(self) -> None:
+        task = getattr(self, "_observation_task", None)
+        if task is None:
+            return
+        self._observation_stop.set()
+        try:
+            await asyncio.wait_for(task, timeout=5)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            task.cancel()
+        # The runtime is closed right after: wait for a thread call still running on it.
+        publisher = getattr(self, "_observation_publisher", None)
+        if publisher is not None:
+            await publisher.close()
 
     async def _serve_axon_on_chain(self, subtensor) -> None:
         """Publish this validator's axon (ip:port) to the chain metagraph.
@@ -6751,6 +8976,19 @@ class ValidationService:
         self._cooldown_durable_window = self._window_n
 
         # 2. checkpoint_n + revision from HF commit history.
+        # Scoped trainers resume only their candidate, never another run's
+        # numerically larger checkpoint in the repository's shared history.
+        if active_checkpoint_namespace().scoped:
+            intake = self._detached_intake_ref()
+            candidate = await asyncio.to_thread(intake.poll, include_installed=True)
+            if candidate is None:
+                if intake.last_error:
+                    raise RuntimeError("scoped checkpoint bootstrap failed: " + intake.last_error)
+                return
+            if candidate["checkpoint_n"] > self._checkpoint_n:
+                self._resume_from = f"sha:{candidate['revision']}"
+                await self._apply_resume_from()
+            return
         #
         # Auto-resume to the latest published "checkpoint N" commit. This
         # replaces the previous count-only logic, which left
@@ -6841,8 +9079,11 @@ class ValidationService:
         snapshot: dict[str, Any],
         env_names: set[str],
         current_window: int,
+        optional: frozenset[str] = frozenset(),
     ) -> int:
-        """Validate a complete prompt-cooldown snapshot before mutation."""
+        """Validate a complete prompt-cooldown snapshot before mutation. ``optional``: envs a schedule added to
+        the run, which a snapshot taken before their install lacks (they start empty; the gap replay fills
+        them)."""
         schema_version = snapshot.get("schema_version", 1)
         if (
             not isinstance(schema_version, int)
@@ -6852,6 +9093,7 @@ class ValidationService:
             raise ValueError("unsupported cooldown snapshot schema")
         if schema_version == 2 and snapshot.get("complete") is not True:
             raise ValueError("cooldown snapshot is incomplete")
+        active_checkpoint_namespace().require_identity(snapshot)
         if snapshot.get("run_id") != TRAINING_RUN_ID:
             raise ValueError("cooldown run id mismatch")
         snapshot_window = snapshot.get("snapshot_window")
@@ -6861,9 +9103,9 @@ class ValidationService:
         ):
             raise ValueError("cooldown snapshot window is outside history")
         envs = snapshot.get("envs")
-        if not isinstance(envs, dict) or not env_names.issubset(envs):
+        if not isinstance(envs, dict) or not (set(env_names) - set(optional)).issubset(envs):
             raise ValueError("cooldown snapshot environments are incomplete")
-        for env_name in env_names:
+        for env_name in sorted(set(env_names) & set(envs)):
             state = envs[env_name]
             if not isinstance(state, dict):
                 raise ValueError(
@@ -6878,6 +9120,17 @@ class ValidationService:
                     "cooldown snapshot selection is outside its history"
                 )
         return snapshot_window
+
+    def _snapshot_optional_envs(self) -> frozenset[str]:
+        """The envs a schedule added to the run: a cooldown snapshot may lack them (taken before their
+        install) or hold one this process does not serve now."""
+        runtime = getattr(self, "_service_runtime", None)
+        if runtime is None:
+            return frozenset()
+        try:
+            return frozenset(runtime.schedule.added_environments())
+        except Exception:
+            return frozenset()
 
     async def _rebuild_cooldown_from_history(self) -> None:
         """At startup, restore per-env cooldown from the run-keyed R2 snapshot,
@@ -6895,10 +9148,10 @@ class ValidationService:
         try:
             snapshot = await asyncio.to_thread(_read_gzip_json, _cooldown_local_path(TRAINING_RUN_ID))
             if snapshot is not None and self._validate_cooldown_snapshot(
-                snapshot, set(self._cooldown_per_env), current_window,
+                snapshot, set(self._cooldown_per_env), current_window, self._snapshot_optional_envs(),
             ) == current_window:
                 for name, cooldown_map in self._cooldown_per_env.items():
-                    cooldown_map.import_state(snapshot["envs"][name])
+                    cooldown_map.import_state(snapshot["envs"].get(name, {}))
                 logger.info("Restored cooldown from local durable tip window=%d", current_window)
                 return
         except Exception:
@@ -6936,6 +9189,7 @@ class ValidationService:
                     snapshot,
                     env_names,
                     current_window,
+                    self._snapshot_optional_envs(),
                 )
             except Exception:
                 logger.exception(
@@ -6955,7 +9209,7 @@ class ValidationService:
             )
             envs = snapshot["envs"]
             for env_name, cooldown_map in self._cooldown_per_env.items():
-                cooldown_map.import_state(envs[env_name])
+                cooldown_map.import_state(envs.get(env_name, {}))   # an added env missing: the gap replay
             gap = max(0, current_window - snapshot_window)
             if gap > 0:
                 await self._replay_cooldown_gap(current_window, gap)
@@ -7147,6 +9401,7 @@ class ValidationService:
             def _build() -> dict:
                 return {
                     "schema_version": 2,
+                    **active_checkpoint_namespace().identity,
                     "run_id": TRAINING_RUN_ID,
                     "snapshot_window": window,
                     "complete": True,
@@ -7226,16 +9481,21 @@ class ValidationService:
         snapshot: dict[str, Any],
         env_names: set[str],
         current_window: int,
+        optional: frozenset[str] = frozenset(),
     ) -> int:
+        """``optional``: envs a schedule added to the run, which a snapshot taken before their install lacks, or
+        holds while this process does not serve them."""
         schema_version = snapshot.get("schema_version")
         if type(schema_version) is not int or schema_version != 1:
             raise ValueError("unsupported content cooldown snapshot schema")
+        active_checkpoint_namespace().require_identity(snapshot)
         if snapshot.get("run_id") != TRAINING_RUN_ID:
             raise ValueError("content cooldown run id mismatch")
         if snapshot.get("complete") is not True:
             raise ValueError("content cooldown snapshot is incomplete")
         envs = snapshot.get("envs")
-        if not isinstance(envs, dict) or set(envs) != env_names:
+        required = set(env_names) - set(optional)
+        if not isinstance(envs, dict) or not required <= set(envs) <= set(env_names) | set(optional):
             raise ValueError("content cooldown environments are incomplete")
         snapshot_window = snapshot.get("snapshot_window")
         if (
@@ -7245,7 +9505,7 @@ class ValidationService:
             raise ValueError(
                 "content cooldown snapshot window is outside history"
             )
-        for env_name in env_names:
+        for env_name in sorted(set(env_names) & set(envs)):
             state = envs[env_name]
             if not isinstance(state, dict):
                 raise ValueError(
@@ -7274,7 +9534,9 @@ class ValidationService:
 
         resolved = 0
         for env_name, prompt_map in self._cooldown_per_env.items():
-            env = self.envs[env_name]
+            env = self.envs.get(env_name)
+            if env is None:
+                continue                    # an added env not served now: its content waits for its install
             content_map = self._content_cooldown_per_env[env_name]
             content_state = content_map.export_state()
             for prompt_idx, selected_window in prompt_map.export_state().items():
@@ -7291,6 +9553,10 @@ class ValidationService:
                     )
 
                     rendered = rendered_episode_prompt(env, int(prompt_idx))
+                elif (spec.interaction_mode if spec is not None
+                      else getattr(env, "interaction_mode", None)) == "signed_episode":
+                    # The task source's prompt verbatim, as the batcher digests it.
+                    rendered = str(problem["prompt"])
                 else:
                     rendered = render_canonical_prompt(
                         self.tokenizer,
@@ -7318,10 +9584,10 @@ class ValidationService:
         try:
             snapshot = await asyncio.to_thread(_read_gzip_json, _content_cooldown_local_path(TRAINING_RUN_ID))
             if snapshot is not None and self._validate_content_snapshot(
-                snapshot, env_names, self._window_n,
+                snapshot, env_names, self._window_n, self._snapshot_optional_envs(),
             ) == self._window_n:
                 for name, content_map in self._content_cooldown_per_env.items():
-                    content_map.import_state(snapshot["envs"][name])
+                    content_map.import_state(snapshot["envs"].get(name, {}))
                 self._content_cooldown_health.update(
                     complete=True, source="local", snapshot_window=self._window_n,
                     counts_by_environment={name: len(value) for name, value in self._content_cooldown_per_env.items()},
@@ -7360,6 +9626,7 @@ class ValidationService:
                     candidate,
                     env_names,
                     self._window_n,
+                    self._snapshot_optional_envs(),
                 )
             except Exception:
                 logger.exception(
@@ -7384,10 +9651,11 @@ class ValidationService:
                     snapshot,
                     env_names,
                     self._window_n,
+                    self._snapshot_optional_envs(),
                 )
                 envs = snapshot["envs"]
                 for env_name, content_map in self._content_cooldown_per_env.items():
-                    content_map.import_state(envs[env_name])
+                    content_map.import_state(envs.get(env_name, {}))
             else:
                 for content_map in self._content_cooldown_per_env.values():
                     content_map.import_state({})
@@ -7448,6 +9716,7 @@ class ValidationService:
         def _build() -> dict[str, Any]:
             return {
                 "schema_version": 1,
+                **active_checkpoint_namespace().identity,
                 "run_id": TRAINING_RUN_ID,
                 "snapshot_window": window,
                 "complete": True,
@@ -7519,6 +9788,7 @@ class ValidationService:
 
     def _hash_snapshot_identity(self) -> dict:
         return {"schema_version": 1, "run_id": TRAINING_RUN_ID,
+                **active_checkpoint_namespace().identity,
                 "profile_id": PROTOCOL_PROFILE_ID, "repo_id": self.hf_repo_id,
                 "bucket": os.getenv("R2_BUCKET_ID", "reliquary"),
                 "endpoint": os.getenv("R2_ENDPOINT_URL") or os.getenv("R2_ACCOUNT_ID", ""),

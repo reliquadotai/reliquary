@@ -17,11 +17,14 @@ from pydantic import (
     Field,
     FiniteFloat,
     PrivateAttr,
+    StrictInt,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
 from reliquary.constants import CHALLENGE_K, M_ROLLOUTS, MAX_NEW_TOKENS_PROTOCOL_CAP
+from reliquary.protocol.corpus_submission import MAX_TRAJECTORY_TOKENS
 from reliquary.protocol.toploc_wire import ProofB64, proof_volume_error
 from reliquary.shared.runtime_fingerprint import runtime_profile_hash
 
@@ -254,6 +257,8 @@ class BatchSubmissionRequest(BaseModel):
     # empty sig is rejected as BAD_ENVELOPE_SIGNATURE or silently accepted.
     envelope_signature: str = Field(default="", pattern=r"^[0-9a-fA-F]*$")
     runtime_fingerprint: RuntimeFingerprint | None = None
+    pool_selection: dict[str, Any] | None = None
+    service_binding: dict[str, Any] | None = None
     # Validator-only marker. It is absent from JSON and the public schema, so
     # adding it does not change the miner wire contract.
     _legacy_merkle_verified: bool = PrivateAttr(default=False)
@@ -286,6 +291,35 @@ class BatchSubmissionRequest(BaseModel):
         if not self.nonce.endswith(expected_suffix):
             raise ValueError("runtime_fingerprint must be bound to nonce")
         return self
+
+    @field_validator("pool_selection")
+    @classmethod
+    def _validate_pool_selection(cls, value):
+        if value is not None:
+            from reliquary.protocol.seed_pool import PoolSelection
+            # One seed per rollout out of the 2 x M pool: a longer, shorter or out-of-pool
+            # list never reaches admission.
+            seeds = PoolSelection.from_dict(value).seeds
+            if len(seeds) != M_ROLLOUTS or seeds[-1] >= 2 * M_ROLLOUTS:
+                raise ValueError(f"pool_selection must choose exactly {M_ROLLOUTS} of {2 * M_ROLLOUTS} seeds")
+        return value
+
+    @field_validator("service_binding")
+    @classmethod
+    def _validate_service_binding(cls, value):
+        if value is not None:
+            from reliquary.protocol.service_submission import ServiceBinding
+            ServiceBinding.from_dict(value)
+        return value
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_pool(self, handler):
+        value = handler(self)
+        if self.pool_selection is None:
+            value.pop("pool_selection", None)
+        if self.service_binding is None:
+            value.pop("service_binding", None)
+        return value
 
 
 class BatchSubmissionResponse(BaseModel):
@@ -383,6 +417,48 @@ class FillClosedWindowState(BaseModel):
         return self
 
 
+class ServicePolicyAnnouncement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    contract: dict[str, Any]
+    schedule: dict[str, Any]
+    checkpoint: dict[str, Any]
+    supported_capabilities: list[str] = Field(..., min_length=1, max_length=32)
+    pool_epoch: int = Field(..., ge=0, le=2**53 - 1, strict=True)
+    pool_randomness: str = Field(..., pattern=r"^(?:[0-9a-f]{64})?$", max_length=64)
+
+    @model_validator(mode="after")
+    def _validate_contract_capabilities(self):
+        from reliquary.protocol.service_catalogue import announced_contract
+        from reliquary.protocol.service_schedule import ServiceSchedule
+        contract = announced_contract({"contract": self.contract, "schedule": self.schedule})
+        if contract.version != 2:
+            raise ValueError("RL announcements carry service-contract/v2")
+        if any(not 1 <= len(capability) <= 256 for capability in self.supported_capabilities):
+            raise ValueError("bounded capabilities required")
+        contract.require_capabilities(set(self.supported_capabilities))
+        ServiceSchedule.from_dict(self.schedule, contract)
+        if set(self.checkpoint) != {"checkpoint_n", "repo", "revision", "sha256"}:
+            raise ValueError("announcement checkpoint fields are fixed")
+        import re
+        cp = self.checkpoint
+        if type(cp["checkpoint_n"]) is not int or not 0 <= cp["checkpoint_n"] <= 2**53 - 1:
+            raise ValueError("announcement checkpoint_n must be a non-negative integer")
+        if not isinstance(cp["repo"], str) or not 1 <= len(cp["repo"]) <= 256:
+            raise ValueError("announcement checkpoint repo must be a bounded string")
+        if not isinstance(cp["revision"], str) or not re.fullmatch(r"[0-9a-f]{40}", cp["revision"]):
+            raise ValueError("announcement checkpoint revision must be a 40-hex commit")
+        if not isinstance(cp["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", cp["sha256"]):
+            raise ValueError("announcement checkpoint sha256 must be 64-hex")
+        from reliquary.protocol.service_contract import PUBLIC_SEED_POOL
+        if any(env["sampling"]["kind"] == PUBLIC_SEED_POOL for env in contract.environments.values()) and not self.pool_randomness:
+            raise ValueError("public pool requires its authoritative beacon")
+        for name, env in contract.environments.items():
+            if env["sampling"]["kind"] == PUBLIC_SEED_POOL and env["sampling"]["group_size"] != M_ROLLOUTS:
+                # a miner always submits M_ROLLOUTS rollouts: any other group_size would admit no group at all
+                raise ValueError(f"{name}: a public seed pool group_size must be M_ROLLOUTS")
+        return self
+
+
 class GrpoBatchState(BaseModel):
     """Live window state for miners polling ``/state`` (v2.1)."""
 
@@ -408,6 +484,14 @@ class GrpoBatchState(BaseModel):
     # value rather than recomputing locally, which guarantees byte-for-byte
     # agreement with the validator's verify path.
     randomness: str = ""
+    service_policy: ServicePolicyAnnouncement | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_service_policy(self, handler):
+        value = handler(self)
+        if self.service_policy is None:
+            value.pop("service_policy", None)
+        return value
 
 
 def encode_cooldown_bitmap(
@@ -520,6 +604,14 @@ class MinerState(BaseModel):
     generation_profile_id: str | None = Field(default=None, max_length=64)
     generation_contract: dict[str, Any] | None = None
     randomness: str = ""
+    service_policy: ServicePolicyAnnouncement | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_service_policy(self, handler):
+        value = handler(self)
+        if self.service_policy is None:
+            value.pop("service_policy", None)
+        return value
 
 
 class Verdict(BaseModel):
@@ -562,6 +654,10 @@ class Verdict(BaseModel):
     batch_index: int | None = None
     selection_target: int | None = None
     selected_count: int | None = None
+    # Service runs only (detail fields, absent from every legacy verdict).
+    service_contract_sha256: str | None = None
+    service_purpose: str | None = None
+    exploration_fraction: float | None = None
     # Optional observability fields. Older verdict records omit these; the
     # endpoint excludes nulls so legacy consumers keep seeing the compact shape
     # for entries that lack lifecycle metadata.
@@ -656,7 +752,9 @@ class RolloutMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     prompt_length: int = Field(..., ge=0)
-    completion_length: int = Field(..., gt=0, le=MAX_NEW_TOKENS_PROTOCOL_CAP)
+    # Widened to the corpus trajectory cap for signed episodes only (see _completion_cap); every other
+    # rollout keeps MAX_NEW_TOKENS_PROTOCOL_CAP.
+    completion_length: int = Field(..., gt=0, le=MAX_TRAJECTORY_TOKENS)
     success: bool
     total_reward: FiniteFloat
     advantage: FiniteFloat
@@ -672,7 +770,42 @@ class RolloutMetadata(BaseModel):
 
     # Present only for Reliquary Episode v1. Keeping it nested preserves the
     # historical single-turn metadata fields and outer submission envelope.
-    episode: "EpisodeMetadata | None" = None
+    episode: "EpisodeMetadata | SignedEpisodeMetadata | None" = None
+    seed_pool: dict[str, Any] | None = None
+    service_binding: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _completion_cap(self):
+        if (not isinstance(self.episode, SignedEpisodeMetadata)
+                and self.completion_length > MAX_NEW_TOKENS_PROTOCOL_CAP):
+            raise ValueError(
+                f"completion_length must be less than or equal to {MAX_NEW_TOKENS_PROTOCOL_CAP}")
+        return self
+
+    @field_validator("seed_pool")
+    @classmethod
+    def _validate_seed_pool(cls, value):
+        if value is not None:
+            from reliquary.protocol.seed_pool import parse_rollout_binding
+            parse_rollout_binding(value)
+        return value
+
+    @field_validator("service_binding")
+    @classmethod
+    def _validate_service_binding(cls, value):
+        if value is not None:
+            from reliquary.protocol.service_submission import parse_service_rollout_binding
+            parse_service_rollout_binding(value)
+        return value
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_pool(self, handler):
+        value = handler(self)
+        if self.seed_pool is None:
+            value.pop("seed_pool", None)
+        if self.service_binding is None:
+            value.pop("service_binding", None)
+        return value
 
 
 class EpisodeMetadata(BaseModel):
@@ -721,6 +854,94 @@ class EpisodeMetadata(BaseModel):
         return sum(int(end) - int(start) for start, end in self.assistant_spans)
 
 
+SIGNED_EPISODE_SCHEMA = "reliquary/signed-episode/v1"
+MAX_SIGNED_EPISODE_TURNS = 256
+
+
+def is_signed_episode(meta: Any) -> bool:
+    """Whether rollout metadata carries a signed episode (``rollout.episode`` of schema signed-episode/v1)."""
+    episode = meta.get("episode") if isinstance(meta, dict) else None
+    return isinstance(episode, dict) and episode.get("schema_version") == SIGNED_EPISODE_SCHEMA
+
+
+def episode_without_transcript(meta: dict) -> dict:
+    """A copy of rollout metadata whose signed episode no longer carries its transcript (what the proof
+    worker, the training payload and every log receive)."""
+    out = dict(meta)
+    if is_signed_episode(out):
+        out["episode"] = {key: value for key, value in out["episode"].items() if key != "transcript"}
+    return out
+
+
+class SignedEpisodeMetadata(BaseModel):
+    """A signed-sandbox episode inside a v2 service rollout.
+
+    ``assistant_spans`` are the model's turns as ``[start, end)`` in ``tokens`` (the prompt
+    included), ``stop`` the harness's stop condition, ``transcript`` the gateway's signed
+    transcript. Nothing here is trusted: admission re-derives every binding from the
+    transcript and the precommit, and the proof re-checks every model token. Integers are
+    strict (no bool, float or numeric string), so the signed bytes have one encoding."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["reliquary/signed-episode/v1"]
+    precommit_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    seed_index: int = Field(..., ge=0, le=127, strict=True)
+    assistant_spans: list[list[StrictInt]] = Field(..., min_length=1, max_length=MAX_SIGNED_EPISODE_TURNS)
+    stop: str = Field(..., pattern=r"^[a-z_]{1,32}$")
+    transcript: dict[str, Any]
+
+    @model_validator(mode="after")
+    def _spans_and_transcript_are_bounded(self):
+        import json
+
+        from reliquary.protocol.corpus_submission import MAX_TRANSCRIPT_BYTES
+
+        previous = 1
+        for span in self.assistant_spans:
+            if len(span) != 2:
+                raise ValueError("assistant spans are [start, end] integer pairs")
+            start, end = span
+            if start < previous or end <= start:
+                raise ValueError("assistant spans must be sorted, non-empty and after the prompt")
+            previous = end
+        # The transcript_digest encoding (non-finite floats refused, as the signature binding refuses them).
+        size = len(json.dumps(self.transcript, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+                              allow_nan=False).encode("utf-8"))
+        if size > MAX_TRANSCRIPT_BYTES:
+            raise ValueError(f"the transcript is over {MAX_TRANSCRIPT_BYTES} bytes")
+        return self
+
+    @property
+    def assistant_token_count(self) -> int:
+        return sum(end - start for start, end in self.assistant_spans)
+
+
+def _check_signed_episode_commit(meta: "RolloutMetadata", tokens: list[int], proof_version: Any) -> None:
+    """A signed episode is a service rollout of a public seed pool, drawn from its own seed."""
+    from reliquary.protocol.seed_pool import parse_rollout_binding
+    from reliquary.protocol.service_submission import parse_service_rollout_binding
+
+    episode = meta.episode
+    if meta.seed_pool is None or meta.service_binding is None:
+        raise ValueError("a signed episode is a service rollout of a public seed pool")
+    if proof_version != "public-group-proof/v1":
+        raise ValueError("a signed episode requires the public group proof version")
+    pool = parse_rollout_binding(meta.seed_pool)
+    if pool.rollout_index != parse_service_rollout_binding(meta.service_binding)[1]:
+        raise ValueError("service and pool rollout indices differ")
+    if pool.seed_index != episode.seed_index:
+        raise ValueError("a signed episode is drawn from its own pool seed")
+    if meta.forced or meta.force_span is not None:
+        raise ValueError("a signed episode has no forced span")
+    if episode.assistant_spans[0][0] != meta.prompt_length:
+        raise ValueError("the first assistant span starts right after the prompt")
+    if episode.assistant_spans[-1][1] != len(tokens):
+        raise ValueError("the last assistant span ends the tokens")
+    if len(meta.token_logprobs) not in (len(tokens), episode.assistant_token_count):
+        raise ValueError("episode token_logprobs must be full-sequence or assistant-only")
+
+
 # Resolve the intentional forward declaration while keeping the historical
 # RolloutMetadata field order and serialized shape unchanged.
 RolloutMetadata.model_rebuild()
@@ -738,7 +959,7 @@ class CommitModel(BaseModel):
 
     tokens: list[int] = Field(..., min_length=CHALLENGE_K)
     commitments: list[dict]
-    proof_version: Literal["v7", "v8"]
+    proof_version: Literal["v7", "v8", "public-group-proof/v1", "service-group-proof/v1"]
     model: ModelInfo
     signature: str = Field(..., pattern=r"^[0-9a-fA-F]+$")
     beacon: BeaconInfo
@@ -779,7 +1000,12 @@ class CommitModel(BaseModel):
                 f"completion_length({v.completion_length}) must equal "
                 f"len(tokens)={len(tokens)}"
             )
+        if isinstance(v.episode, SignedEpisodeMetadata):
+            _check_signed_episode_commit(v, tokens, info.data.get("proof_version"))
+            return v
         if v.episode is not None:
+            if v.seed_pool is not None or v.service_binding is not None:
+                raise ValueError("service group proofs do not support episodes")
             proof_version = info.data.get("proof_version")
             if proof_version != "v8":
                 raise ValueError("episode metadata requires GRAIL proof v8")
@@ -793,7 +1019,18 @@ class CommitModel(BaseModel):
                     "episode token_logprobs must be full-sequence or assistant-only"
                 )
             return v
-        if info.data.get("proof_version") != "v7":
+        if v.seed_pool is not None:
+            if info.data.get("proof_version") != "public-group-proof/v1":
+                raise ValueError("public group metadata requires its signed proof version")
+            if v.service_binding is not None:
+                from reliquary.protocol.seed_pool import parse_rollout_binding
+                from reliquary.protocol.service_submission import parse_service_rollout_binding
+                if parse_rollout_binding(v.seed_pool).rollout_index != parse_service_rollout_binding(v.service_binding)[1]:
+                    raise ValueError("service and pool rollout indices differ")
+        elif v.service_binding is not None:
+            if info.data.get("proof_version") != "service-group-proof/v1":
+                raise ValueError("service metadata requires its signed proof version")
+        elif info.data.get("proof_version") != "v7":
             raise ValueError("single-turn metadata requires GRAIL proof v7")
         # Two layouts are accepted, matching ``verify_logprobs_claim`` in
         # ``validator/verifier.py``:

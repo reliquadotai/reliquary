@@ -77,3 +77,26 @@ def test_external_single_turn_requires_reviewed_contract_and_fixed_split():
             replace(spec, **changes)
     with pytest.raises(ValueError, match="unsupported.*split"):
         load_external_backend(spec, split="unbound-prompt-config")
+
+
+def test_answer_adapter_grades_the_answer_without_its_turn_terminator():
+    # Admission and the miner both decode the rollout with its special tokens,
+    # so the EOS that ended the turn is the text's last characters. A checker
+    # that reads the end of the answer ("ends with…", JSON, last word) must
+    # not see it.
+    seen = []
+    backend = AnswerBackend()
+    original = backend.grade
+
+    def grade(index, completion):
+        seen.append(completion)
+        return original(index, completion)
+
+    backend.grade = grade
+    environment = ExternalAnswerEnvironment(backend, get_environment_spec(backend.name))
+    problem = environment.get_problem(1)
+    for text in ("1<|im_end|>", "1<|endoftext|>", "1<|im_end|><|endoftext|>"):
+        assert environment.compute_reward(problem, text) == 1.0
+    assert seen == ["1", "1", "1"]
+    # Only a trailing terminator: one inside the text is the model's to answer for.
+    assert environment.compute_reward(problem, "<|im_end|>1") == 0.0

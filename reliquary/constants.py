@@ -823,9 +823,18 @@ _FILL_CLOSED_REQUESTED = _os.environ.get(
     "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 _FILL_CLOSED_PROFILE_ID = "qwen3-4b-base-dapo-fill-closed-v6"
-_FILL_CLOSED_PROFILE_IDS = {
+# Profiles that cannot run without fill-closed.
+_FILL_CLOSED_REQUIRED_PROFILE_IDS = {
     _FILL_CLOSED_PROFILE_ID,
     "qwen3-4b-base-dapo-reliquary-v1",
+}
+# Profiles that may run with it. The Teutonic suite also serves the corpus
+# tasks, which run timed windows, so it accepts fill-closed without requiring
+# it. Nothing in the fill-closed path reads the model: the window's shape is
+# B_BATCH, the publish interval and the environment list, all set below.
+_FILL_CLOSED_PROFILE_IDS = {
+    *_FILL_CLOSED_REQUIRED_PROFILE_IDS,
+    "teutonic-9b-reliquary-suite-v9-dev1",
 }
 if _os.environ.get("RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED", "0").strip().lower() not in {"", "0", "false", "no", "off"}:
     raise ValueError("RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED is retired; remove it")
@@ -839,11 +848,18 @@ if _FILL_CLOSED_REQUESTED and PROTOCOL_PROFILE_ID not in _FILL_CLOSED_PROFILE_ID
         "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED requires the exact "
         f"fill-closed profiles {sorted(_FILL_CLOSED_PROFILE_IDS)!r}"
     )
-if PROTOCOL_PROFILE_ID in _FILL_CLOSED_PROFILE_IDS and not FILL_CLOSED_ENABLED:
+if PROTOCOL_PROFILE_ID in _FILL_CLOSED_REQUIRED_PROFILE_IDS and not FILL_CLOSED_ENABLED:
     raise ValueError(
         f"the {PROTOCOL_PROFILE_ID!r} profile requires its explicit "
         "experimental fill-closed capability"
     )
+if FILL_CLOSED_ENABLED:
+    # A fill-closed pick takes B_BATCH groups from every environment: the
+    # assembler, the active-window record and its recovery all hold that shape
+    # and refuse any other. An environment's weight in the window is its
+    # emission share, not a smaller group count, so a profile's per-environment
+    # batch_target (sized for the timed auction window) does not apply here.
+    ENVIRONMENT_MIX = [(name, B_BATCH) for name, _ in ENVIRONMENT_MIX]
 
 # The durable key stride cannot change in an existing training run. A smaller
 # operational pick target closes earlier and pads the unused keys with tombstones.
@@ -859,6 +875,52 @@ FILL_CLOSED_TARGET_GROUPS_PER_ENV = int(_os.environ.get(
 if FILL_CLOSED_TARGET_GROUPS_PER_ENV != FILL_CLOSED_PICKS_PER_WINDOW * B_BATCH:
     raise ValueError("fill-closed target must equal picks per window * B_BATCH within the journal range")
 _FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV = FILL_CLOSED_TARGET_GROUPS_PER_ENV
+
+# Next RL run (service-contract/v2). Inert unless a service task is configured.
+SERVICE_EXPLORATION_AUDIT_BUDGET_PER_ENV = int(_os.environ.get(
+    "RELIQUARY_SERVICE_EXPLORATION_AUDIT_BUDGET_PER_ENV", str(FILL_CLOSED_TARGET_GROUPS_PER_ENV)))
+SERVICE_EXPLORATION_AUDIT_PRIORITY = 5
+SERVICE_OBSERVATION_FLUSH_SECONDS = 60
+SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS = 50_000
+# A hotkey still in exploration probation may hold at most this many reserved rows whose audit has not
+# passed, per (window, env): it cannot squat the whole per-env cap with fake groups before its first audit.
+PROBATION_PENDING_LIMIT = 4
+# Graded audit sanction (R31, amended). The class of a failed audit is that of its STRONGEST failure: an
+# audit that fails a statistical gate is re-proven with the statistical gates off, and any failure there
+# makes it deterministic. A DETERMINISTIC forgery (proof/TOPLOC mismatch, token authenticity, forged
+# termination, forced-seed hard CDF mismatch) bans for the order's ``ban_seconds`` and forfeits the window.
+# A STATISTICAL-only failure (threshold checks: forced-seed agreement floors, logprob, distribution, ...)
+# forfeits the window, does NOT ban, and puts the hotkey back in probation (100 % audit) until it has
+# ``SERVICE_REPROBATION_PASSES`` new passed audits counted from its last failure of ANY class (a hotkey
+# whose deterministic ban expired comes back in probation too). Recidivism: the ban applies when more than
+# ``SERVICE_STATISTICAL_FAIL_MAX`` of the hotkey's last ``SERVICE_STATISTICAL_FAIL_WINDOW`` NON-FORCED
+# (drawn at the base rate) concluded audits failed statistically; forced (probation) audits never count, so
+# passing the forced re-probation audits cannot dilute the failures.
+# TO RECALIBRATE at qualification from the measured honest false-reject rate of the statistical stages.
+SERVICE_REPROBATION_PASSES = 20
+SERVICE_STATISTICAL_FAIL_WINDOW = 20
+SERVICE_STATISTICAL_FAIL_MAX = 3
+# Exploration audits (decision C, R15). They run as they are drawn on a plan of their own at
+# ``SERVICE_EXPLORATION_AUDIT_PRIORITY``. At most ``..._INFLIGHT`` are handed to the proof scheduler at a
+# time, so the queue order (past-probation hotkeys first) is decided at the last moment; of every
+# ``..._PROBATION_EVERY`` audits handed over while the window runs, one goes to a hotkey still in
+# probation when one waits, so newcomers see audits every window.
+SERVICE_EXPLORATION_AUDIT_INFLIGHT = 2
+SERVICE_EXPLORATION_PROBATION_EVERY = 4
+SERVICE_EXPLORATION_TICK_SECONDS = 1.0
+# Non-training acceptances (exploration and unproven observations) one hotkey may have in one (window, env)
+# batcher. Beyond it the submission is refused before its payload is retained (R26): the sybil bound on the
+# memory these groups hold for the audit.
+SERVICE_NON_TRAINING_PER_HOTKEY_WINDOW_ENV = 32
+# Seal drain. After the window seals the validator stops admitting exploration, waits at most
+# ``..._DRAW_WAIT_ROUNDS`` drand rounds for pending draws, proves EVERY queued audit of a hotkey past
+# probation (at most ``..._DRAIN_SECONDS`` in all) and lets hotkeys still in probation use only the first
+# ``..._DRAIN_PROBATION_SECONDS`` of that wait. Then it finalizes whatever is left as unaudited (unpaid,
+# never sanctioned), so a stuck proof can delay a window by the bound and never by more.
+SERVICE_EXPLORATION_DRAW_WAIT_ROUNDS = 2
+SERVICE_EXPLORATION_DRAIN_SECONDS = float(_os.environ.get("RELIQUARY_SERVICE_EXPLORATION_DRAIN_SECONDS", "600"))
+SERVICE_EXPLORATION_DRAIN_PROBATION_SECONDS = float(
+    _os.environ.get("RELIQUARY_SERVICE_EXPLORATION_DRAIN_PROBATION_SECONDS", "120"))
 
 # Backstop only. A window normally ends on its fill; this stops stalled
 # candidate supply holding one open forever, and seals whatever is proven.

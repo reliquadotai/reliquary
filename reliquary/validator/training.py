@@ -15,6 +15,7 @@ from __future__ import annotations
 import gc
 import logging
 import math
+import os
 import threading
 import warnings
 from typing import Any, Optional
@@ -140,6 +141,30 @@ _UNPAD_CACHE_INSTALLED = _install_unpad_sync_cache()
 _optimizer: Optional["torch.optim.Optimizer | _MasterWeightOptimizer"] = None
 _scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None
 _optimizer_model_id: Optional[int] = None
+# Set by the fsdp2 trainer backend (reliquary.trainer.distributed); None means
+# one process, today's path byte for byte.
+_DIST = None
+
+KL_STAT_MAX_KEYS = frozenset({
+    "max", "log_ratio_abs_max", "ppo_log_ratio_abs_max", "pi_old_claim_abs_error_max",
+})
+
+
+def _microbatch_budget() -> int:
+    """Padded tokens per micro-batch; RELIQUARY_TRAINER_MICROBATCH_TOKENS
+    lowers it without a code change (fsdp2 has no OOM halving retry)."""
+    raw = os.environ.get("RELIQUARY_TRAINER_MICROBATCH_TOKENS", "").strip()
+    if not raw:
+        return MICROBATCH_MAX_PADDED_TOKENS
+    value = int(raw, 10)
+    if value < 1:
+        raise ValueError("RELIQUARY_TRAINER_MICROBATCH_TOKENS must be positive")
+    return value
+
+
+def configure_distributed(ctx) -> None:
+    global _DIST
+    _DIST = ctx
 
 
 class TrainingStepSkipped(RuntimeError):
@@ -312,7 +337,13 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
         logger.warning("_lazy_init: model.parameters() is empty; skipping init")
         return False
 
-    if _use_master_weights(params):
+    if _DIST is not None:
+        # FSDP2 shards are fp32 masters already; bitsandbytes cannot step
+        # sharded tensors.
+        _optimizer = torch.optim.AdamW(
+            params, lr=LEARNING_RATE, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01,
+        )
+    elif _use_master_weights(params):
         _optimizer = _MasterWeightOptimizer(params, _build_optimizer)
         logger.info(
             "fp32 master weights for %d parameters",
@@ -1058,6 +1089,68 @@ def _bft_training_metrics(plan) -> dict[str, float | int]:
 # bandwidth-bound, which 64 was. 512 clears it and the curve is flat past that.
 _LOGPROB_CHUNK = 512
 
+# Per-row max logit, histogrammed (0.5 wide, 0..128). bf16 rounds logits in
+# steps of 0.125 below 32, 0.25 below 64 and 0.5 above: the trainer-vs-sampler
+# gap grows with this magnitude (measured 10-12), so the run watches it.
+_LOGIT_HIST_WIDTH = 0.5
+_LOGIT_HIST_BINS = 256
+_logit_hist: Optional[torch.Tensor] = None
+# Telemetry only (nothing on the run path reads it), and it costs an fp32 copy of
+# each logits chunk: off unless this is "1". Every rank must see the same value
+# (it gates an all-reduce under fsdp2).
+LOGIT_HISTOGRAM_ENV = "RELIQUARY_TRAINER_LOGIT_HISTOGRAM"
+
+
+def _logit_histogram_enabled() -> bool:
+    return os.environ.get(LOGIT_HISTOGRAM_ENV, "").strip() == "1"
+
+
+def _reset_logit_histogram() -> None:
+    global _logit_hist
+    _logit_hist = torch.zeros(_LOGIT_HIST_BINS, dtype=torch.float64)
+
+
+def _observe_max_logits(logits: torch.Tensor) -> None:
+    global _logit_hist
+    # The policy forward runs with grad; reference/behavior forwards do not
+    # and stay out. The histogram lives on the logits' device: no host sync
+    # per chunk, read once at the end of the step.
+    if not torch.is_grad_enabled() or not _logit_histogram_enabled():
+        return
+    with torch.no_grad():
+        maxima = logits.detach().float().amax(dim=-1)
+        if _logit_hist is None or _logit_hist.device != maxima.device:
+            _logit_hist = (
+                torch.zeros(_LOGIT_HIST_BINS, dtype=torch.float64)
+                if _logit_hist is None else _logit_hist
+            ).to(maxima.device)
+        index = (maxima / _LOGIT_HIST_WIDTH).floor().clamp_(0, _LOGIT_HIST_BINS - 1).long()
+        _logit_hist += torch.bincount(index, minlength=_LOGIT_HIST_BINS).double()
+
+
+def _histogram_quantile(hist: torch.Tensor, q: float) -> float:
+    total = float(hist.sum())
+    if total <= 0:
+        return 0.0
+    cumulative = torch.cumsum(hist, 0)
+    index = int(torch.searchsorted(
+        cumulative, torch.tensor(q * total, dtype=cumulative.dtype, device=cumulative.device),
+    ))
+    return (index + 1) * _LOGIT_HIST_WIDTH
+
+
+def _logit_metrics() -> dict[str, float]:
+    if not _logit_histogram_enabled():
+        return {}
+    hist = (
+        _logit_hist if _logit_hist is not None
+        else torch.zeros(_LOGIT_HIST_BINS, dtype=torch.float64)
+    )
+    return {
+        "train/max_logit_p50": _histogram_quantile(hist, 0.5),
+        "train/max_logit_p90": _histogram_quantile(hist, 0.9),
+    }
+
 
 def _logprob_block(logits_slice: torch.Tensor, indices_slice: torch.Tensor) -> torch.Tensor:
     """log p(idx | row) for one chunk, in fp32. Equivalent to
@@ -1104,7 +1197,11 @@ def _hidden_logprob_block(
     indices_slice: torch.Tensor,
     lm_head,
 ) -> torch.Tensor:
-    return _logprob_block(lm_head(hidden_slice), indices_slice)
+    # A checkpoint recompute observes every chunk once more: the quantiles
+    # are unchanged by a uniform duplication.
+    logits = lm_head(hidden_slice)
+    _observe_max_logits(logits)
+    return _logprob_block(logits, indices_slice)
 
 
 def _selected_logprobs_from_hidden(
@@ -1121,6 +1218,11 @@ def _selected_logprobs_from_hidden(
     getting killed by memory pressure. Checkpointing keeps backward memory at
     one chunk by recomputing the LM-head/logsumexp block as needed.
     """
+    if getattr(lm_head, "fused_selected_logprobs", False):
+        # The FSDP2 head (reliquary.trainer.distributed) runs this same chunk
+        # loop inside ONE module call, so its sharded weight is gathered once
+        # for every chunk and its gradient reduced once.
+        return lm_head(hidden_rows, indices)
     n = hidden_rows.shape[0]
     use_ckpt = hidden_rows.requires_grad
     parts = []
@@ -1489,6 +1591,10 @@ def _new_kl_stats() -> dict[str, float | int]:
         "pi_old_claim_abs_error_sum": 0.0,
         "pi_old_claim_abs_error_max": 0.0,
         "pi_old_claim_gt_1e_3_count": 0,
+        "ppo_low_p_count": 0,
+        "ppo_low_p_outside_count": 0,
+        "ppo_high_p_count": 0,
+        "ppo_high_p_outside_count": 0,
     }
 
 
@@ -1506,6 +1612,7 @@ def _record_kl_stats(
     behavior_old,
     pi_old_from_validator: bool = False,
     kl_term_computed: bool = True,
+    pi_old=None,
 ) -> None:
     """Accumulate bounded policy-health telemetry after a micro-batch."""
     if stats is None:
@@ -1540,6 +1647,16 @@ def _record_kl_stats(
         stats["ppo_ratio_nonfinite_count"] += int(
             (~torch.isfinite(ppo_ratio)).sum()
         )
+        if pi_old is not None:
+            outside = (
+                (ppo_ratio < 1.0 - PPO_CLIP_EPSILON_LOW)
+                | (ppo_ratio > 1.0 + PPO_CLIP_EPSILON_HIGH)
+            )
+            low = pi_old.detach().float() < math.log(0.1)
+            stats["ppo_low_p_count"] += int(low.sum())
+            stats["ppo_low_p_outside_count"] += int((outside & low).sum())
+            stats["ppo_high_p_count"] += int((~low).sum())
+            stats["ppo_high_p_outside_count"] += int((outside & ~low).sum())
         finite_log_ratio = ppo_log_ratio.detach().float()
         finite_log_ratio = finite_log_ratio[torch.isfinite(finite_log_ratio)]
         if finite_log_ratio.numel():
@@ -1660,6 +1777,16 @@ def _kl_telemetry_metrics(stats: dict[str, float | int]) -> dict[str, float]:
         "train/pi_old_claim_gt_1e_3_ratio": (
             int(stats["pi_old_claim_gt_1e_3_count"]) / claim_denominator
         ),
+        # The share outside the clip by pi_old probability: bf16 rounding
+        # pushes mid/low-probability tokens out first (measured 10-12).
+        "train/ppo_outside_clip_ratio_p_lt_0_1": (
+            int(stats["ppo_low_p_outside_count"])
+            / max(1, int(stats["ppo_low_p_count"]))
+        ),
+        "train/ppo_outside_clip_ratio_p_ge_0_1": (
+            int(stats["ppo_high_p_outside_count"])
+            / max(1, int(stats["ppo_high_p_count"]))
+        ),
     }
 
 
@@ -1672,6 +1799,7 @@ def _microbatch_grad(
     atomic,
     kl_stats=None,
     behavior_model=None,
+    loss_scale: float = 1.0,
 ):
     """Forward + backward one micro-batch. ``batch`` is a list of
     ``(tokens, prompt_length, old_logprobs, advantage, scale, keep)`` where ``scale``
@@ -1810,7 +1938,9 @@ def _microbatch_grad(
                     continue  # param not in this micro-batch's graph -> 0 contribution
                 p.grad = g if p.grad is None else p.grad + g
     else:
-        loss.backward()
+        # The loss weights are already global: loss_scale (measured when the
+        # model was sharded) turns FSDP2's gradient reduction into a sum.
+        (loss * loss_scale).backward()
 
     _record_kl_stats(
         kl_stats,
@@ -1825,6 +1955,7 @@ def _microbatch_grad(
         behavior_old=behavior_old_cat,
         pi_old_from_validator=use_validator_old,
         kl_term_computed=ref_lp is not None,
+        pi_old=old_cat,
     )
 
     sum_ppo = sum_kl = 0.0
@@ -1839,14 +1970,14 @@ def _microbatch_grad(
 
 def _process_microbatch(
     model, ref_model, batch, device, *, atomic, kl_stats=None,
-    behavior_model=None,
+    behavior_model=None, loss_scale: float = 1.0,
 ):
     """One micro-batch; when atomic, on OOM halve and retry down to a single
     sequence (which, if it still OOMs, is a genuine unrecoverable OOM)."""
     if not atomic:
         return _microbatch_grad(
             model, ref_model, batch, device, atomic=False, kl_stats=kl_stats,
-            behavior_model=behavior_model,
+            behavior_model=behavior_model, loss_scale=loss_scale,
         )
     oom = False
     try:
@@ -1915,6 +2046,16 @@ def _build_microbatch_items(plan):
     return items
 
 
+def _padding_pass(model, device) -> None:
+    """A zero-weight forward/backward through every FSDP unit, so a rank with
+    fewer micro-batches joins the same number of collectives as the others."""
+    tokens = torch.zeros(1, 2, dtype=torch.long, device=device)
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                        enabled=device.type in ("cuda", "cpu")):
+        lp, _ = _batched_completion_logprobs(model, tokens, torch.ones_like(tokens), [1], [2])
+    (lp.sum() * 0.0).backward()
+
+
 def _accumulate_grouped_grads(
     model, ref_model, plan, device, *, budget, atomic, kl_stats=None,
     behavior_model=None,
@@ -1923,19 +2064,38 @@ def _accumulate_grouped_grads(
     gradients. Returns ``(total_ppo, total_kl, n_processed)``."""
     items = _build_microbatch_items(plan)
     if not items:
+        if _DIST is not None:
+            from reliquary.trainer.distributed import check_same_plan
+
+            check_same_plan([0, 0, 0], _DIST)
         return 0.0, 0.0, 0
     lengths = [len(it[0]) for it in items]
     total_ppo = total_kl = 0.0
     n_processed = 0
-    for idxs in _pack_by_token_budget(lengths, budget):
+    bins = _pack_by_token_budget(lengths, budget)
+    loss_scale = 1.0
+    padding_passes = 0
+    if _DIST is not None:
+        from reliquary.trainer.distributed import assign_bins, check_same_plan
+
+        check_same_plan([len(items), sum(lengths), len(bins)], _DIST)
+        costs = [len(b) * max(lengths[i] for i in b) for b in bins]
+        split = assign_bins(costs, _DIST.world_size)
+        padding_passes = max(len(part) for part in split) - len(split[_DIST.rank])
+        bins = [bins[k] for k in split[_DIST.rank]]
+        # Measured at shard time: world_size when FSDP2 averages, 1 when it sums.
+        loss_scale = float(getattr(model, "reliquary_loss_scale", _DIST.world_size))
+    for idxs in bins:
         sp, sk, n = _process_microbatch(
             model, ref_model, [items[i] for i in idxs], device,
             atomic=atomic, kl_stats=kl_stats,
-            behavior_model=behavior_model,
+            behavior_model=behavior_model, loss_scale=loss_scale,
         )
         total_ppo += sp
         total_kl += sk
         n_processed += n
+    for _ in range(padding_passes):
+        _padding_pass(model, device)
     return total_ppo, total_kl, n_processed
 
 
@@ -1983,7 +2143,14 @@ def train_step(
     device = next(model.parameters()).device
 
     _optimizer.zero_grad()
+    _reset_logit_histogram()
 
+    if _DIST is not None and (
+        ref_model is not None or behavior_model is not None or KL_BETA != 0.0
+    ):
+        raise RuntimeError(
+            "fsdp2 trainer requires KL_BETA == 0 and no ref/behavior model"
+        )
     n_total_rollouts = sum(len(g.rollouts) for batch in batches for g in batch)
 
     # Pass 1 (metadata only, no forward): group-relative advantages + per-batch
@@ -2011,27 +2178,49 @@ def train_step(
     try:
         total_ppo, total_kl, n_processed = _accumulate_grouped_grads(
             model, ref_model, plan, device,
-            budget=MICROBATCH_MAX_PADDED_TOKENS, atomic=False,
+            budget=_microbatch_budget(), atomic=False,
             kl_stats=kl_stats,
             behavior_model=behavior_model,
         )
     except torch.cuda.OutOfMemoryError:
+        if _DIST is not None:
+            raise  # a lone retry would deadlock the other ranks' collectives
         logger.warning("train_step: OOM in micro-batch — retrying atomic at halved budget")
         _optimizer.zero_grad()
+        _reset_logit_histogram()
         torch.cuda.empty_cache()
         kl_stats = _new_kl_stats()
         total_ppo, total_kl, n_processed = _accumulate_grouped_grads(
             model, ref_model, plan, device,
-            budget=max(1, MICROBATCH_MAX_PADDED_TOKENS // 2), atomic=True,
+            budget=max(1, _microbatch_budget() // 2), atomic=True,
             kl_stats=kl_stats,
             behavior_model=behavior_model,
         )
+
+    if _DIST is not None:
+        from reliquary.trainer.distributed import all_reduce_stats
+
+        totals = {"total_ppo": total_ppo, "total_kl": total_kl, "n_processed": n_processed}
+        all_reduce_stats(totals, _DIST, max_keys=frozenset())
+        total_ppo = totals["total_ppo"]
+        total_kl = totals["total_kl"]
+        n_processed = totals["n_processed"]
+        all_reduce_stats(kl_stats, _DIST, max_keys=KL_STAT_MAX_KEYS)
+        if _logit_histogram_enabled():
+            global _logit_hist
+            if _logit_hist is None:
+                _reset_logit_histogram()
+            from reliquary.trainer.distributed import all_reduce_tensor_sum
+
+            _logit_hist = all_reduce_tensor_sum(_logit_hist.to(_DIST.device)).cpu()
 
     if n_processed == 0:
         logger.info("train_step: no valid rollouts processed")
         return model
 
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+    if hasattr(grad_norm, "full_tensor"):
+        grad_norm = grad_norm.full_tensor()  # FSDP2: a DTensor holding the global norm
     grad_norm_value = float(grad_norm)
     policy_metrics = _kl_telemetry_metrics(kl_stats)
     nonfinite_gradient = not math.isfinite(grad_norm_value)
@@ -2097,6 +2286,7 @@ def train_step(
         failure_metrics.update(shaping_metrics)
         failure_metrics.update(overlong_metrics)
         failure_metrics.update(environment_metrics)
+        failure_metrics.update(_logit_metrics())
         telemetry.log_training_step(failure_metrics, step=window_index)
         _optimizer.zero_grad(set_to_none=True)
         raise TrainingStepSkipped(
@@ -2160,6 +2350,7 @@ def train_step(
     metrics.update(shaping_metrics)
     metrics.update(overlong_metrics)
     metrics.update(environment_metrics)
+    metrics.update(_logit_metrics())
     telemetry.log_training_step(metrics, step=window_index)
 
     return model

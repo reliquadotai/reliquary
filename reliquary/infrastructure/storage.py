@@ -177,6 +177,47 @@ async def upload_json(key: str, data: Any, **client_kwargs) -> bool:
     return True
 
 
+async def upload_bytes(key: str, body: bytes, *, content_type: str, cache_control: str,
+                       if_absent: bool = False, **client_kwargs) -> bool:
+    """PUT raw bytes with explicit cache headers (public static files).
+
+    ``if_absent`` makes the PUT conditional (``If-None-Match: *``): an existing key is never
+    replaced. If it already exists its bytes must be identical (an idempotent re-upload after a
+    crash); different bytes raise ``ValueError`` and nothing is written.
+    """
+    from botocore.exceptions import ClientError
+
+    async with get_s3_client(**client_kwargs) as client:
+        bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
+        extra = {"IfNoneMatch": "*"} if if_absent else {}
+        try:
+            await client.put_object(Bucket=bucket, Key=key, Body=body, ContentType=content_type,
+                                    CacheControl=cache_control, **extra)
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if not if_absent or (code not in ("PreconditionFailed", "412") and status != 412):
+                raise
+            existing = await _read_object_body(await client.get_object(Bucket=bucket, Key=key))
+            if existing != body:
+                raise ValueError(f"immutable object {key} already exists with different bytes") from exc
+    return True
+
+
+async def download_bytes(key: str, **client_kwargs) -> bytes | None:
+    """The raw bytes of an object; None only when it does not exist (any other failure raises)."""
+    from botocore.exceptions import ClientError
+
+    try:
+        async with get_s3_client(**client_kwargs) as client:
+            bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
+            return await _read_object_body(await client.get_object(Bucket=bucket, Key=key))
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code", "") in {"NoSuchKey", "404", "NotFound"}:
+            return None
+        raise
+
+
 async def download_json(
     key: str,
     *,
@@ -304,6 +345,44 @@ async def upload_window_dataset(
     return True
 
 
+PROJECTED_KEY_MAX_LENGTH = 256
+PROJECTED_MAP_MAX_ENTRIES = 10_000
+
+
+INVALID_PROJECTION = "invalid"  # marker a consumer refuses (``None`` would read as "absent")
+
+
+def _projectable_value(value) -> bool:
+    # Floats are dropped on purpose: a row key the consumer needs (prompt_idx, hotkey, env_name) is an int or a
+    # string, so a float is either forged or irrelevant, and dropping it makes the consumer refuse the row.
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, int) or (isinstance(value, str) and len(value) <= PROJECTED_KEY_MAX_LENGTH)
+
+
+def _bounded_number_map(value, depth: int = 1) -> bool:
+    """A map of short string keys to numbers (never a bool); ``depth`` 2 is a map of such maps.
+    At most PROJECTED_MAP_MAX_ENTRIES entries in all (leaves)."""
+    budget = [PROJECTED_MAP_MAX_ENTRIES]
+
+    def walk(node, level) -> bool:
+        if not isinstance(node, dict):
+            return False
+        budget[0] -= len(node)
+        if budget[0] < 0:
+            return False
+        for key, item in node.items():
+            if not isinstance(key, str) or len(key) > PROJECTED_KEY_MAX_LENGTH:
+                return False
+            if level > 1:
+                if not walk(item, level - 1):
+                    return False
+            elif isinstance(item, bool) or not isinstance(item, (int, float)):
+                return False
+        return True
+    return walk(value, depth)
+
+
 async def list_recent_datasets(
     current_window: int,
     n: int,
@@ -311,6 +390,9 @@ async def list_recent_datasets(
     strict: bool = False,
     task_id: str | None = None,
     fields: tuple[str, ...] | None = None,
+    row_fields: dict[str, tuple[str, ...]] | None = None,
+    number_map_fields: tuple[str, ...] = (),
+    nested_number_map_fields: tuple[str, ...] = (),
     **client_kwargs,
 ) -> list[dict]:
     """Download last *n* window archives from the flat R2 prefix in ascending order.
@@ -321,6 +403,16 @@ async def list_recent_datasets(
 
     Used by the validator at startup to reconstruct ``CooldownMap`` state
     and replay the EMA.
+
+    ``row_fields`` (only with ``fields``): ``{field: keys}`` projects each row of the list
+    ``field`` to ``keys`` right after decoding, so the rows' bulk is never retained. A non-dict
+    row becomes ``None``; a non-list value becomes the string ``"invalid"`` (NOT ``None``, which a consumer may
+    read as an absent field, e.g. an empty batch); the consumer refuses both; a row value is
+    kept only if it is an int or a string of at most ``PROJECTED_KEY_MAX_LENGTH`` characters.
+    ``number_map_fields`` (only with ``fields``): each such field must be a map of at most
+    ``PROJECTED_MAP_MAX_ENTRIES`` string keys (each at most ``PROJECTED_KEY_MAX_LENGTH`` long) to
+    numbers; anything else becomes ``None``, which the consumer refuses (the archive is dropped).
+    ``nested_number_map_fields`` is the same for a map of such maps (entries counted over all leaves).
     """
     from botocore.exceptions import ClientError
 
@@ -350,11 +442,23 @@ async def list_recent_datasets(
                     raise ValueError(
                         f"archive {key} does not bind window {window_start}"
                     )
-                return (
-                    data if fields is None else {
-                        field: data[field] for field in fields if field in data
-                    }
-                )
+                if fields is None:
+                    return data
+                projected = {field: data[field] for field in fields if field in data}
+                del data
+                for field, keys in (row_fields or {}).items():
+                    if field in projected:
+                        rows = projected[field]
+                        projected[field] = INVALID_PROJECTION if not isinstance(rows, list) else [
+                            {k: row[k] for k in keys if k in row and _projectable_value(row[k])}
+                            if isinstance(row, dict) else None
+                            for row in rows
+                        ]
+                for field in number_map_fields + nested_number_map_fields:
+                    if field in projected and not _bounded_number_map(
+                            projected[field], 2 if field in nested_number_map_fields else 1):
+                        projected[field] = None
+                return projected
             except ClientError as e:
                 code = e.response.get("Error", {}).get("Code", "")
                 if code in ("NoSuchKey", "404"):

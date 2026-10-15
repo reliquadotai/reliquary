@@ -86,6 +86,21 @@ async def read_task_registry_with_retry(
     raise last
 
 
+
+def _registry_price_params() -> dict:
+    """The price parameters a registry entry declares: the production values,
+    minus the image-versioned rise fields. The loader never reads those (they
+    are not in PRICE_PARAM_FIELDS), and writing them would change the bytes of
+    every new declaration for nothing."""
+    from dataclasses import asdict
+
+    from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
+
+    params = asdict(PRODUCTION_PRICE_PARAMS)
+    for field in ("rise", "rise_wait_fraction"):
+        params.pop(field, None)
+    return params
+
 def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None, verification=None):
     """One registry entry: shipped controller defaults, then explicit overrides."""
     from dataclasses import asdict
@@ -132,7 +147,7 @@ def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None, ver
             f"--verification must be one of {', '.join(sorted(KNOWN_VERIFICATION))}, "
             f"got {verification!r}; omit it to let each validator derive it from its card"
         )
-    params = asdict(PRODUCTION_PRICE_PARAMS)
+    params = _registry_price_params()
     params.update(overrides)
     params["cap"] = float(cap)
     return TaskEntry(
@@ -222,7 +237,7 @@ def build_contract_task_entry(
             name: declared[name] for name in sorted(environments)
         }
 
-    params = asdict(PRODUCTION_PRICE_PARAMS)
+    params = _registry_price_params()
     params.update(overrides)
     params["cap"] = float(cap)
     return TaskEntry(
@@ -494,6 +509,8 @@ def _composed_task_entry(
 @tasks_app.command("create")
 def tasks_create(
     task_id: str = typer.Option(..., "--task-id"),
+    service_contract_file: Path = typer.Option(None, "--service-contract", exists=True, dir_okay=False, readable=True),
+    ack_service_fleet: bool = typer.Option(False, "--ack-service-fleet"),
     profile_id: str = typer.Option(
         None, "--profile-id", help="Compiled profile to pin; refused with --model"
     ),
@@ -649,6 +666,20 @@ def tasks_create(
                 env_split=_parse_env_split_option(env_split),
                 verification=verification,
             )
+        if service_contract_file is not None:
+            from dataclasses import replace
+            from reliquary.protocol.service_contract import ServiceContract
+            from reliquary.shared.strict_json import strict_json_loads
+            from reliquary.shared.task_registry import MECHANISM_SERVICE_RL
+            if not ack_service_fleet:
+                raise ValueError("service declaration requires --ack-service-fleet for upgraded registry readers")
+            if service_contract_file.stat().st_size > 65536:
+                raise ValueError("service contract exceeds 64 KiB")
+            contract = ServiceContract.from_dict(strict_json_loads(service_contract_file.read_bytes()))
+            entry = replace(entry, mechanism=MECHANISM_SERVICE_RL, service_contract=contract.to_dict(),
+                            params={**entry.params, "min_incentive_share": 0.0, "min_incentive_ramp_start": 0.0})
+        elif ack_service_fleet:
+            raise ValueError("--ack-service-fleet requires --service-contract")
         asyncio.run(create_task(entry))
     except (RegistryError, ValueError) as exc:
         # Declaring the first task is the one CLI command that can stop the
@@ -1722,11 +1753,17 @@ def jobs_export(
                 codec = TokenizerCodec(await asyncio.to_thread(
                     load_tokenizer, await asyncio.to_thread(_episode_tokenizer_dir, job)))
             else:
+                from reliquary.corpus.job import is_signed_sandbox, sandbox_split
+
+                signed_job = is_signed_sandbox(job)
+                tokenizer_dir = await asyncio.to_thread(_episode_tokenizer_dir, job)
+                # A replay job renders with the loader's default tools, as it always did.
                 renderer = await asyncio.to_thread(
-                    agentic_swe.load_turn_renderer,
-                    await asyncio.to_thread(_episode_tokenizer_dir, job))
-                source = await asyncio.to_thread(agentic_swe.load_swe_source,
-                                                 job.episode.env.num_images)
+                    agentic_swe.load_turn_renderer, tokenizer_dir,
+                    *((job.episode.sandbox.tools,) if signed_job else ()))
+                source = (agentic_swe.SignedSweSource(sandbox_split(job.episode)) if signed_job
+                          else await asyncio.to_thread(agentic_swe.load_swe_source,
+                                                       job.episode.env.num_images))
             counts: dict = {}
             rows = episode_rows(job=job, records=BucketRecordStore(), renderer=renderer,
                                 source=source, counts=counts, sft_only=sft,
@@ -2234,6 +2271,116 @@ def eval_run(
     typer.echo(json.dumps(result) if result is not None else "no evaluation task to claim")
 
 
+sandbox_app = typer.Typer(help="Signed-episode sandboxes (reliquary-sandbox machines)")
+sandbox_machines_app = typer.Typer(help="The machine directory in R2")
+sandbox_app.add_typer(sandbox_machines_app, name="machines")
+app.add_typer(sandbox_app, name="sandbox")
+
+
+def _sandbox_store_call(coroutine):
+    from reliquary.infrastructure.sandbox_store import MachineConflict
+
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    try:
+        return asyncio.run(coroutine)
+    except (ValueError, MachineConflict) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except ClientError as exc:
+        # The error code only: a storage message may echo request details.
+        code = exc.response.get("Error", {}).get("Code", "?")
+        typer.echo(f"error: R2 refused the request ({code})", err=True)
+        raise typer.Exit(code=1) from exc
+    except BotoCoreError as exc:                # credentials, endpoint, connection
+        typer.echo(f"error: R2 is unreachable ({type(exc).__name__})", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+def _echo_machine(document) -> None:
+    import json
+
+    if document is None:
+        typer.echo("error: no such machine", err=True)
+        raise typer.Exit(code=2)
+    typer.echo(json.dumps(document, sort_keys=True))
+
+
+@sandbox_machines_app.command("register")
+def sandbox_machine_register(
+    machine_id: str = typer.Option(..., "--machine-id"),
+    address: str = typer.Option(..., "--address", help="scheme://host[:port] miners reach"),
+    provider: str = typer.Option(..., "--provider"),
+    capacity: int = typer.Option(..., "--capacity", help="Concurrent episodes"),
+    key_id: str = typer.Option(..., "--key-id"),
+    public_key: str = typer.Option(..., "--public-key", help="base64 Ed25519 public key"),
+    valid_from: int = typer.Option(..., "--valid-from", help="unix seconds"),
+) -> None:
+    """Register a machine with its first signing key (create-only)."""
+    from reliquary.infrastructure import sandbox_store
+
+    document, _ = _sandbox_store_call(sandbox_store.register_machine(
+        machine_id=machine_id, address=address, provider=provider, capacity=capacity,
+        key_id=key_id, public_key_b64=public_key, valid_from=valid_from, now=_time.time()))
+    _echo_machine(document)
+
+
+@sandbox_machines_app.command("add-key")
+def sandbox_machine_add_key(machine_id: str = typer.Option(..., "--machine-id"),
+                            key_id: str = typer.Option(..., "--key-id"),
+                            public_key: str = typer.Option(..., "--public-key"),
+                            valid_from: int = typer.Option(..., "--valid-from")) -> None:
+    """Add a rotated key (switch the machine to it when it has no live episode)."""
+    from reliquary.infrastructure import sandbox_store
+
+    _echo_machine(_sandbox_store_call(sandbox_store.add_machine_key(
+        machine_id, key_id=key_id, public_key_b64=public_key, valid_from=valid_from)))
+
+
+@sandbox_machines_app.command("end-key")
+def sandbox_machine_end_key(
+    machine_id: str = typer.Option(..., "--machine-id"),
+    key_id: str = typer.Option(..., "--key-id"),
+    valid_until: int = typer.Option(..., "--valid-until", help=(
+        "unix seconds. Rotation: when the new key starts. COMPROMISE: the earliest time "
+        "the compromise is suspected, even in the past, with --compromise")),
+    compromise: bool = typer.Option(False, "--compromise", help=(
+        "The key is compromised: end it at --valid-until minus the verifier's clock skew "
+        "(CLOCK_SKEW_S, 30 s), since an open may precede its token by that much")),
+) -> None:
+    """End a key's validity; an end only ever moves earlier. On compromise, pass the
+    suspected compromise time with --compromise: the end becomes that time minus
+    CLOCK_SKEW_S, so no forged open stamped up to the skew before it verifies."""
+    from reliquary.infrastructure import sandbox_store
+
+    if compromise:
+        try:
+            valid_until = sandbox_store.compromise_valid_until(valid_until)
+        except ValueError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+    _echo_machine(_sandbox_store_call(sandbox_store.end_machine_key(
+        machine_id, key_id=key_id, valid_until=valid_until)))
+
+
+@sandbox_machines_app.command("status")
+def sandbox_machine_status(machine_id: str = typer.Option(..., "--machine-id"),
+                           status: str = typer.Option(..., "--status",
+                                                      help="active, draining or revoked"),
+                           reason: str = typer.Option(None, "--reason")) -> None:
+    from reliquary.infrastructure import sandbox_store
+
+    _echo_machine(_sandbox_store_call(sandbox_store.set_machine_status(machine_id, status, reason=reason)))
+
+
+@sandbox_machines_app.command("list")
+def sandbox_machine_list() -> None:
+    from reliquary.infrastructure import sandbox_store
+
+    for document in _sandbox_store_call(sandbox_store.list_machines()):
+        _echo_machine(document)
+
+
 corpus_app = typer.Typer(name="corpus", help="Mine a corpus generation task")
 app.add_typer(corpus_app)
 
@@ -2678,12 +2825,22 @@ def corpus_mine_agentic(
     max_num_seqs: int = typer.Option(
         16, "--max-num-seqs",
         help="vLLM's concurrent sequences; lower it if turns fail as preempted (unprovable)"),
+    validator_hotkey: str = typer.Option(
+        None, "--validator-hotkey",
+        help="The validator's ss58 hotkey; signed-sandbox jobs sign their session requests "
+             "for it"),
+    max_live_per_job: int = typer.Option(
+        4, "--max-live-per-job", min=1,
+        help="Signed-sandbox jobs: live sessions at once for this hotkey on the job (match "
+             "the validator's per-job cap, 4 by default)"),
 ) -> None:
     """Mine an agentic (episode) corpus job against a local vLLM with per-turn
-    proofs. A SWE job (harness bash) runs verifiers + reliquary-swe episodes and
-    needs Docker and the job's pinned reliquary-swe, verifiers and renderers. A
-    suite job (harness suite) runs a registered episode environment in process
-    and needs only that environment's pinned wheel."""
+    proofs. A SWE replay job (harness bash) runs verifiers + reliquary-swe episodes
+    and needs Docker and the job's pinned reliquary-swe, verifiers and renderers.
+    A signed-sandbox SWE job needs no Docker: every tool call runs on the
+    validator's sandbox machines (it needs `--validator-hotkey` and the
+    reliquary[sandbox-miner] extra). A suite job (harness suite) runs a registered
+    episode environment in process and needs only that environment's pinned wheel."""
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
 
     if TASK_CONTRACT_ENV_VAR not in os.environ:
@@ -2723,6 +2880,8 @@ def corpus_mine_agentic(
         typer.echo(f"error: job {job.job_id!r} is not an episode job; use `corpus mine`", err=True)
         raise typer.Exit(code=2)
     client.scoped_submit = submits_scoped(job)
+    sessions = None
+    signed = False
     if is_suite_episode(job.episode):
         # No verifiers, Docker or network: only the pinned environment wheel.
         refusal = suite_support_refusal(job.episode)
@@ -2730,13 +2889,34 @@ def corpus_mine_agentic(
             typer.echo(f"error: refusing to mine: {refusal}", err=True)
             raise typer.Exit(code=4)
     else:
-        from reliquary.environment.agentic_swe import episode_support_refusal
-        from reliquary.miner.agentic_miner import docker_storage_warning
+        from reliquary.corpus.job import is_signed_sandbox
+        from reliquary.environment.agentic_swe import (
+            episode_support_refusal,
+            sandbox_support_refusal,
+        )
 
-        refusal = episode_support_refusal(job.episode, need_verifiers=True)
+        signed = is_signed_sandbox(job)
+        refusal = episode_support_refusal(job.episode, need_verifiers=True) or (
+            sandbox_support_refusal(job.episode, need_bridge=True) if signed else None)
         if refusal:
             typer.echo(f"error: {refusal}", err=True)
             raise typer.Exit(code=4)
+    if signed:
+        from reliquary.miner.signed_episode import HttpSandboxSessions
+
+        if not validator_hotkey:
+            typer.echo("error: a signed-sandbox job needs --validator-hotkey (the validator's "
+                       "ss58 hotkey: session requests are signed for it)", err=True)
+            raise typer.Exit(code=2)
+        try:
+            sessions = HttpSandboxSessions(httpx.Client(base_url=validator_url, timeout=60.0),
+                                           validator_hotkey=validator_hotkey)
+        except ValueError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
+    elif not is_suite_episode(job.episode):
+        from reliquary.miner.agentic_miner import docker_storage_warning
+
         warning = docker_storage_warning()
         if warning:
             typer.echo(warning, err=True)
@@ -2746,12 +2926,22 @@ def corpus_mine_agentic(
         raise typer.Exit(code=4)
     identity = Identity(hotkey=wallet.hotkey.ss58_address,
                         sign=lambda body: sign_corpus_submission(wallet, body),
-                        episodes=episodes or None)
+                        episodes=episodes or None,
+                        sign_binding=lambda binding: wallet.hotkey.sign(binding).hex())
     counts = asyncio.run(run_agentic_miner(
         job=job, checkpoint_dir=directory, proof=proof, tokenizer=load_tokenizer(directory),
         identities=[identity], client=client, concurrency=concurrency, port=port,
-        gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs))
+        gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs,
+        sessions=sessions, max_live_per_job=max_live_per_job))
     typer.echo({hotkey_: dict(c) for hotkey_, c in counts.items()})
+    halted = [hotkey_ for hotkey_, c in counts.items()
+              if c.get("halted") or c.get("identity_crashed")]
+    if halted:
+        hint = (" (a bad_signature: is --validator-hotkey this validator's hotkey?)"
+                if any(c.get("session_refused:bad_signature") for c in counts.values()) else "")
+        typer.echo(f"error: mining stopped for {', '.join(h[:8] for h in halted)}{hint}",
+                   err=True)
+        raise typer.Exit(code=3)
 
 
 @corpus_app.command("status")
@@ -2844,13 +3034,57 @@ def watch_verdicts(
         pass
 
 
-def _resolve_cli_environment_mix(value: str) -> list[tuple[str, int]]:
+def _resolve_cli_environment_mix(value: str, *, service_contract=None) -> list[tuple[str, int]]:
+    """The validator's env mix. An episode env of the service order that carries a public catalogue is built
+    from it at start (``ValidationService._build_bridged``, which checks its identity, lock and manifest), so it
+    is neither installed nor in the protocol profile: it is accepted here with the protocol's group count. Every
+    other name goes through the registry and the profile, unchanged."""
+    from reliquary.environment.registry import ENVIRONMENT_SPECS
+
     names = [name.strip() for name in value.split(",")]
-    return resolve_environment_mix(
-        names,
+    if not names or any(not name for name in names):
+        raise ValueError("at least one environment must be selected")
+    if len(set(names)) != len(names):
+        raise ValueError("environment selection contains duplicate names")
+    bridged = set()
+    if service_contract is not None:
+        for name in names:
+            if (name in service_contract.episode_environments
+                    and service_contract.catalogue_of(name) is not None):
+                if name in ENVIRONMENT_SPECS:
+                    raise ValueError(f"environment {name!r} is installed in this image and also carries a "
+                                     f"catalogue in the service order: rename the bridged env")
+                bridged.add(name)
+    others = [name for name in names if name not in bridged]
+    resolved = dict(resolve_environment_mix(
+        others,
         profile_environments=ACTIVE_PROTOCOL_PROFILE.environments,
         default_batch_target=B_BATCH,
-    )
+    )) if others else {}
+    from reliquary.constants import FILL_CLOSED_ENABLED
+
+    # Fill-closed takes B_BATCH groups per environment per pick, whatever the
+    # profile sized for the timed window (see ENVIRONMENT_MIX in constants).
+    return [(name, B_BATCH if name in bridged or FILL_CLOSED_ENABLED else resolved[name])
+            for name in names]
+
+
+def _resolve_legacy_miner_mix(value: str) -> list[tuple[str, int]]:
+    """The legacy miner's env mix: installed envs of the protocol profile only. It never mines a signed-episode
+    env, so an env described by an RL order's public catalogue is never routed here: its name is refused with
+    a pointer to ``mine-episodes``, which builds it from the announcement."""
+    from reliquary.environment.registry import find_environment_spec
+
+    try:
+        return _resolve_cli_environment_mix(value)
+    except ValueError as exc:
+        unknown = [name for name in (part.strip() for part in value.split(",")) if name
+                   and find_environment_spec(name) is None]
+        if not unknown:
+            raise
+        raise ValueError(f"{exc}. {', '.join(unknown)} is not installed: a signed-episode env of an RL order "
+                         f"(described by its catalogue) is mined by `reliquary mine-episodes --episode-envs`, "
+                         f"never by `mine`") from exc
 
 
 def _raise_open_file_limit() -> None:
@@ -3188,6 +3422,10 @@ def setup_logging(level: str = "INFO"):
         format="%(asctime)s | %(threadName)s | %(name)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    # bittensor muted every Reliquary logger imported before it (ALERTs included).
+    from reliquary.shared.log_levels import unmute_reliquary_loggers
+
+    unmute_reliquary_loggers()
 
 
 @app.command()
@@ -3222,7 +3460,7 @@ def mine(
     os.environ["BT_NETWORK"] = network
     os.environ["NETUID"] = str(netuid)
 
-    mix = _resolve_cli_environment_mix(environments)
+    mix = _resolve_legacy_miner_mix(environments)
     env_names = [name for name, _target in mix]
     logger.info(
         "Starting Reliquary miner (network=%s, netuid=%d, envs=%s)",
@@ -3408,6 +3646,93 @@ def mine(
             raise
 
     asyncio.run(_run())
+
+
+@app.command("mine-episodes")
+def mine_episodes(
+    episode_envs: str = typer.Option(
+        ..., "--episode-envs",
+        help="Comma-separated signed-episode environments to mine: registered ones, or envs the order's public "
+             "catalogue describes (built from the announcement; the installed env package must be the order's "
+             "pin). An env added to the running run is mined once the announcement names it: add its name "
+             "after it is announced, and restart the miner (the stack binds its prompts when it is built). One "
+             "miner engine serves envs with equal episode caps only: an env with other caps needs a miner "
+             "process of its own"),
+    validator_url: str = typer.Option(..., "--validator-url", help="The RL validator's URL"),
+    validator_hotkey: str = typer.Option(
+        ..., "--validator-hotkey",
+        help="The RL validator's ss58 hotkey: precommits and session opens are signed for it"),
+    wallet_name: str = typer.Option("default", help="Wallet name"),
+    hotkey: str = typer.Option("default", help="Hotkey name"),
+    wallet_path: str = typer.Option(os.getenv("BT_WALLET_PATH", ""), help="Optional wallet base path"),
+    generate_port: int = typer.Option(8012, "--generate-port", help="Loopback port of the generate endpoint"),
+    checkpoint_dir: str = typer.Option(
+        "", "--checkpoint-dir",
+        help="Where announced checkpoints are downloaded (huggingface_hub's cache by default)"),
+    max_live: int = typer.Option(
+        0, "--max-live", min=0, help="Live sessions per group (0 = every seed of the pool at once)"),
+    groups_in_flight: int = typer.Option(
+        2, "--groups-in-flight", min=1,
+        help="Most episode groups mined at once (your GPU's ceiling); the validator's allocation for your hotkey "
+             "sets how many run, never more than this"),
+    harness_env: list[str] = typer.Option(
+        [], "--harness-env",
+        help="KEY=VALUE passed to the episode harness (repeatable; no secrets here: ps shows them)"),
+    harness_env_file: str = typer.Option(
+        "", "--harness-env-file",
+        help="File of KEY=VALUE lines for the episode harness: where its secrets (API keys) belong"),
+    seconds_per_wave: float = typer.Option(
+        300.0, "--seconds-per-wave",
+        help="Expected time of one wave of live sessions: a collection window shorter than the pool's "
+             "waves at --max-live is warned about at startup"),
+    gpu_memory_utilization: float = typer.Option(
+        0.6, "--gpu-memory-utilization",
+        help="vLLM's share of the GPU; the HF proof model takes the rest of the same GPU"),
+    max_num_seqs: int = typer.Option(16, "--max-num-seqs", help="vLLM's concurrent sequences"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+) -> None:
+    """Mine signed-episode groups on the RL validator: per window, precommit a task, play its public seed
+    pool against a local forced-draw vLLM (sandbox tool calls on the validator's machines), and submit
+    one proved group. Needs the reliquary[sandbox-miner] extra and the order's pinned env package. The
+    legacy `mine` never mines these environments.
+
+    Run it under a supervisor that restarts it (systemd Restart=always, a docker restart policy): on a
+    new checkpoint or order it drains its groups and exits with code 75 to be restarted on it. Exit 2:
+    bad flags; exit 4: refusal to start (an env, its package pin or the engine caps)."""
+    from reliquary.miner.episode_mining import (
+        EpisodeMinerConfig,
+        parse_episode_environments,
+        parse_harness_env,
+    )
+
+    setup_logging(log_level)
+    try:
+        config = EpisodeMinerConfig(
+            environments=parse_episode_environments(episode_envs), validator_url=validator_url.rstrip("/"),
+            validator_hotkey=validator_hotkey, generate_port=generate_port,
+            checkpoint_dir=checkpoint_dir or None, max_live=max_live or None, groups_in_flight=groups_in_flight,
+            harness_env=parse_harness_env(harness_env, env_file=harness_env_file or None) or None,
+            gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs,
+            seconds_per_wave=seconds_per_wave)
+    except (ValueError, OSError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    import bittensor as bt
+
+    from reliquary.miner import episode_mining
+
+    wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
+    if wallet_path:
+        wallet_kwargs["path"] = wallet_path
+    wallet = bt.Wallet(**wallet_kwargs)
+    try:
+        asyncio.run(episode_mining.run_episode_miner(config=config, wallet=wallet))
+    except episode_mining.CheckpointChanged as exc:   # restart me on the new checkpoint (supervisor)
+        typer.echo(f"restart: {exc}", err=True)
+        raise typer.Exit(code=episode_mining.EXIT_CHECKPOINT_CHANGED) from exc
+    except ValueError as exc:   # a refusal to start: an env, its package or the engine caps
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=4) from exc
 
 
 async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=None):
@@ -3731,7 +4056,11 @@ def validate(
                     raise typer.Exit(code=4) from exc
                 return
 
-            mix = _resolve_cli_environment_mix(environments)
+            # A service order's catalogue envs are built from the order at start; a task without a service
+            # contract resolves its mix exactly as before.
+            service_contract = getattr(task_config, "service_contract", None)
+            mix = (_resolve_cli_environment_mix(environments) if service_contract is None
+                   else _resolve_cli_environment_mix(environments, service_contract=service_contract))
             env_names = [name for name, _target in mix]
             if "opencodeinstruct" in env_names:
                 _ensure_grader_running()
@@ -4026,6 +4355,7 @@ def validate(
                 ),
                 emission_cap=task_config.emission_cap,
                 price_params=task_config.price_params,
+                service_contract=task_config.service_contract,
                 env_caps=task_config.env_caps,
                 proof_worker_pool=proof_worker_pool,
                 signer_client=signer_client,

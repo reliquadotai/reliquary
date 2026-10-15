@@ -88,6 +88,11 @@ class AdmissionContext:
     bootstrap: bool
     enforce_envelope_signature: bool
     enforce_legacy_merkle: bool
+    service_policy: dict | None = None
+    # This env's groups are signed episodes (the parent process verifies their transcripts) and
+    # the contract's per-env maximum episode length. The defaults leave every other context unchanged.
+    signed_episode: bool = False
+    episode_max_tokens: int | None = None
 
 
 @dataclass
@@ -166,6 +171,11 @@ class PreparedSubmission:
     # Math completions with no box score zero, but are uncertain for auction
     # eligibility so deleting a box cannot manufacture useful variance.
     unboxed_count: int = 0
+    # Service policy only (empty otherwise): which rollouts the length cap cut,
+    # and which have an untrusted reward (those, plus a missing box where the
+    # contract makes it uncertain).
+    truncated_indices: tuple[int, ...] = ()
+    uncertain_indices: tuple[int, ...] = ()
     attainable_rewards: tuple[float, ...] = ()
     robust_utility: float | None = None
     # Completion-token telemetry used by training, archives and legacy-window
@@ -175,6 +185,9 @@ class PreparedSubmission:
     generator_version: str | None = None
     operation_id: str | None = None
     difficulty: int | None = None
+    # Parsed and authenticated, but its transcripts are still to be verified by the parent
+    # (``validator.episode_intake``); no reward, no lane yet.
+    episode_pending: bool = False
 
 
 class _AdmissionTimeout(TimeoutError):
@@ -336,6 +349,43 @@ def _tokens_valid(
     )
 
 
+def service_length_valid(
+    tokens: list[int],
+    meta: dict[str, Any],
+    environment: str,
+    *,
+    episode_max_tokens: int | None = None,
+) -> bool:
+    """Service path only: the rollout fits the environment's own length bound.
+
+    Completion length is at most ``max_new_tokens_for_environment`` (an episode: the whole episode is at most
+    its profile's ``max_episode_tokens``; a signed episode: its contract's ``episode_max_tokens``,
+    and it is refused without one). Shared by admission and the proof's pre-forward guard, so an oversize
+    payload is refused before it can reach the GPU."""
+    from reliquary.protocol.submission import is_signed_episode
+
+    meta = meta or {}
+    try:
+        prompt_length = int(meta.get("prompt_length", 0))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if prompt_length < 0 or prompt_length > len(tokens):
+        return False
+    episode = meta.get("episode")
+    if is_signed_episode(meta):
+        return episode_max_tokens is not None and 0 < prompt_length < len(tokens) <= episode_max_tokens
+    if isinstance(episode, dict):
+        limits = episode_limits_for_environment(environment)
+        if limits is not None:
+            return len(tokens) <= limits[1]
+    bound = max_new_tokens_for_environment(environment)
+    try:
+        claimed = int(meta.get("completion_length", len(tokens) - prompt_length))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return len(tokens) - prompt_length <= bound and claimed <= bound
+
+
 def _force_span_valid(
     tokens: list[int],
     meta: dict[str, Any],
@@ -418,18 +468,25 @@ def _natural_cap_termination(
 
 
 def submission_interaction_matches(request: BatchSubmissionRequest, environment: str) -> bool:
-    """Bind wire episode metadata to the registered environment before grading."""
+    """Bind wire episode metadata to the registered environment before grading: a single-turn env takes
+    no episode, an Episode v1 env only Episode v1 metadata, a signed-episode env only signed
+    episodes."""
+    from reliquary.protocol.submission import is_signed_episode
+
     try:
-        episode = get_environment_spec(environment).interaction_mode == "episode"
+        mode = get_environment_spec(environment).interaction_mode
     except ValueError:
-        episode = False
+        mode = "single_turn"
     for rollout in request.rollouts:
         meta = rollout.commit.get("rollout") or {}
         value = meta.get("episode") if isinstance(meta, dict) else None
-        if episode:
-            if not isinstance(value, dict):
+        if mode not in ("episode", "signed_episode"):
+            if value is not None:
                 return False
-        elif value is not None:
+            continue
+        if not isinstance(value, dict):
+            return False
+        if is_signed_episode(meta) != (mode == "signed_episode"):
             return False
     return True
 
@@ -580,7 +637,9 @@ def _termination_reject(
             return RejectReason.BAD_TERMINATION
         if kind == "truncated":
             truncated += 1
-            if truncated > max_truncated:
+            # R21, as in the batcher: on the service path the robust rule prices every
+            # joint assignment of the capped rollouts; the count limit is legacy only.
+            if context.service_policy is None and truncated > max_truncated:
                 return RejectReason.BAD_TERMINATION
     return None
 
@@ -623,6 +682,14 @@ def parse_and_validate_submission(
                     body_parse_ms=parse_ms,
                     preparation_started=started,
                 )
+            from reliquary.services.admission_policy import validate_submission_policy
+            try:
+                validate_submission_policy(request, context.service_policy)
+            except (ValueError, TypeError, KeyError):
+                return _reject_parsed(
+                    RejectReason.GENERATION_CONTRACT_MISMATCH, "service_contract",
+                    request=request, body_parse_ms=parse_ms, preparation_started=started,
+                )
             if context.enforce_envelope_signature and not verify_envelope_signature(
                 miner_hotkey=request.miner_hotkey,
                 window_start=request.window_start,
@@ -635,6 +702,8 @@ def parse_and_validate_submission(
                 protocol_version=request.protocol_version,
                 generation_profile_id=request.generation_profile_id,
                 envelope_signature=request.envelope_signature,
+                pool_selection=request.pool_selection,
+                service_binding=request.service_binding,
             ):
                 return _reject_parsed(
                     RejectReason.BAD_ENVELOPE_SIGNATURE,
@@ -694,6 +763,20 @@ def parse_and_validate_submission(
                     return _reject_parsed(
                         RejectReason.BAD_TOKENS,
                         "tokens",
+                        request=request,
+                        body_parse_ms=parse_ms,
+                        preparation_started=started,
+                        legacy_merkle_status=legacy_status,
+                    )
+                if context.service_policy is not None and not service_length_valid(
+                    tokens, (rollout.commit or {}).get("rollout") or {}, context.environment,
+                    episode_max_tokens=context.episode_max_tokens,
+                ):
+                    # O1: a service group (training or exploration) longer than the environment's bound would
+                    # reach the proof plane as an OOM; refuse it before any retention or grading.
+                    return _reject_parsed(
+                        RejectReason.BAD_TOKENS,
+                        "service_length",
                         request=request,
                         body_parse_ms=parse_ms,
                         preparation_started=started,
@@ -1090,16 +1173,32 @@ def score_and_finalize_submission(
 
             rewards = [float(rollout.reward) for rollout in request.rollouts]
             truncated_indices = truncated_rollout_indices(request, context)
+            service_contract = None
+            if context.service_policy is None:
+                missing_box_uncertain = (
+                    environment_spec.final_answer_policy == "boxed"
+                    and MATH_ANSWER_FORMAT == "boxed"
+                )
+            else:
+                from reliquary.protocol.service_contract import ServiceContract
+                from reliquary.services.admission_policy import (
+                    missing_box_is_uncertain,
+                    service_lane,
+                )
+
+                service_contract = ServiceContract.from_dict(
+                    context.service_policy["contract"]
+                )
+                missing_box_uncertain = missing_box_is_uncertain(
+                    context.environment, service_contract
+                )
             unboxed_indices = (
                 tuple(
                     index
                     for index, text in enumerate(materials.completion_texts)
                     if is_missing_final_answer_box(text)
                 )
-                if (
-                    environment_spec.final_answer_policy == "boxed"
-                    and MATH_ANSWER_FORMAT == "boxed"
-                )
+                if missing_box_uncertain
                 else ()
             )
             uncertain_indices = tuple(
@@ -1110,6 +1209,9 @@ def score_and_finalize_submission(
             if (
                 ROBUST_TRUNCATION_UTILITY_ENABLED
                 and uncertain_indices
+                # The service path never ranks on this legacy-threshold utility (its lane is decided
+                # by the contract's threshold, and its order is arrival order).
+                and service_contract is None
             ):
                 from reliquary.validator.difficulty_auction import (
                     fractional_reward_lattice,
@@ -1143,6 +1245,41 @@ def score_and_finalize_submission(
                 if robust_utility is not None
                 else _in_zone(rewards, bootstrap=context.bootstrap)
             )
+            service_uncertainty: dict[str, Any] = {}
+            if service_contract is not None:
+                # The lattice is derived whether or not a rollout is uncertain
+                # yet: the proof may still find a length-capped rollout, and an
+                # environment whose lattice is unknown gets none (the policy
+                # then refuses any group with an uncertain rollout).
+                if environment_spec.attainable_rewards:
+                    attainable_rewards = environment_spec.attainable_rewards
+                elif materials.effective_reward_materials:
+                    from reliquary.validator.difficulty_auction import (
+                        fractional_reward_lattice,
+                    )
+
+                    attainable_rewards = fractional_reward_lattice(
+                        len(materials.effective_reward_materials)
+                    )
+                else:
+                    attainable_rewards = ()
+                # The lane is the validator's call from the vector (the batcher decides it again
+                # from the same inputs); the worker only refuses what is no observation at all.
+                try:
+                    in_zone = service_lane(
+                        request,
+                        service_contract,
+                        rewards,
+                        truncated_indices=truncated_indices,
+                        uncertain_indices=uncertain_indices,
+                        attainable_rewards=attainable_rewards,
+                    ) is not None
+                except ValueError:
+                    in_zone = False
+                service_uncertainty = {
+                    "truncated_indices": tuple(truncated_indices),
+                    "uncertain_indices": tuple(uncertain_indices),
+                }
             if not in_zone:
                 return result(
                     request=request,
@@ -1221,6 +1358,7 @@ def score_and_finalize_submission(
                 unboxed_count=len(unboxed_indices),
                 attainable_rewards=attainable_rewards,
                 robust_utility=robust_utility,
+                **service_uncertainty,
                 eos_tokens=count_eos_completion_tokens(request, context),
                 body_parse_ms=parsed.body_parse_ms,
                 preparation_ms=(
@@ -1292,6 +1430,14 @@ def materialize_and_score_submission(
             ),
             context,
             deadline_monotonic,
+        )
+    if context.signed_episode:
+        # A signed episode's reward is its final record's. The parent process verifies the
+        # transcripts (it holds the machine directory and the session issuer) and decides the lane.
+        return PreparedSubmission(
+            request=request, completion_texts=[], rewards=[], rollout_hashes=parsed.rollout_hashes,
+            selection_digest=parsed.selection_digest, body_parse_ms=parsed.body_parse_ms,
+            preparation_ms=parsed.preparation_ms, episode_pending=True,
         )
     try:
         with _deadline(deadline_monotonic):

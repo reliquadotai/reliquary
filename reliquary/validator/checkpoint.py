@@ -23,6 +23,7 @@ from reliquary.shared.checkpoint_identity import (
     require_immutable_checkpoint_revision,
 )
 from reliquary.validator.checkpoint_profile import write_checkpoint_profile
+from reliquary.shared.checkpoint_namespace import CheckpointNamespace, active_checkpoint_namespace
 
 logger = logging.getLogger(__name__)
 
@@ -94,13 +95,15 @@ class CheckpointStore:
         upload_fn: Callable[..., Awaitable[str]] | None = None,
         save_fn: Callable[[Any, Any, Path], None] | None = None,
         signer: _CheckpointSigner | None = None,
+        namespace: CheckpointNamespace | None = None,
     ) -> None:
         self.validator_hotkey = validator_hotkey
         self.wallet = wallet
         self.repo_id = require_checkpoint_repository(repo_id)
         self.hf_token = hf_token or os.environ.get("HF_TOKEN")
         self.tokenizer = tokenizer
-        self.staging_dir = Path(staging_dir_path)
+        self.namespace = namespace or active_checkpoint_namespace()
+        self.staging_dir = self.namespace.local_path(staging_dir_path)
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         self._upload = upload_fn or _default_upload
         self._save = save_fn or _default_save_hf_format
@@ -154,7 +157,7 @@ class CheckpointStore:
             )
 
         # 1. Save HF-format snapshot locally (dir with safetensors + config + tokenizer).
-        snapshot_dir = self.staging_dir / f"ckpt_{checkpoint_n}"
+        snapshot_dir = self.namespace.child_path(self.staging_dir, f"ckpt_{checkpoint_n}")
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         try:
             # Serialising the model (multi-GB safetensors) is sync and CPU/IO
@@ -163,7 +166,7 @@ class CheckpointStore:
             await asyncio.to_thread(self._save, model, self.tokenizer, snapshot_dir)
             # Bind every published snapshot to the active model/protocol
             # lineage, including snapshots produced by injected save functions.
-            write_checkpoint_profile(snapshot_dir, extra=profile_extra)
+            write_checkpoint_profile(snapshot_dir, extra=profile_extra, namespace=self.namespace)
 
             # 2. Upload the whole folder to HF — one commit per checkpoint.
             revision = await self._upload(

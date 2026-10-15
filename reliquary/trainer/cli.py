@@ -15,6 +15,7 @@ import time
 from typing import Mapping
 
 from reliquary.shared.checkpoint_identity import require_checkpoint_number
+from reliquary.shared.checkpoint_namespace import CheckpointNamespace, active_checkpoint_namespace
 
 logger = logging.getLogger(__name__)
 
@@ -77,18 +78,22 @@ def _r2_client():
     )
 
 
-def _download_checkpoint(client, bucket: str, revision: str, dest: Path) -> bool:
+def _download_checkpoint(client, bucket: str, revision: str, dest: Path,
+                         *, namespace: CheckpointNamespace | None = None) -> bool:
     """Pull or reuse the R2 snapshot; return False for immutable HF fallback
     when the revision is absent or the local directory has extra files."""
     from boto3.s3.transfer import TransferConfig
 
-    from reliquary.trainer.publisher import R2_CHECKPOINT_PREFIX, checkpoint_key, _file_identity
+    from reliquary.trainer.publisher import (
+        MIRROR_COMPLETE, checkpoint_key, _file_identity, mirror_marker_required,
+    )
     from reliquary.shared.checkpoint_identity import require_immutable_checkpoint_revision
     from reliquary.shared.strict_json import strict_json_loads
     from reliquary.validator.control import write_json
 
     revision = require_immutable_checkpoint_revision(revision)
-    prefix = f"{R2_CHECKPOINT_PREFIX}/{revision}/"
+    namespace = namespace or active_checkpoint_namespace()
+    prefix = f"{namespace.checkpoint_prefix}/{revision}/"
     listed = client.list_objects_v2(Bucket=bucket, Prefix=prefix)
     contents = listed.get("Contents", [])
     while listed.get("IsTruncated"):
@@ -97,6 +102,13 @@ def _download_checkpoint(client, bucket: str, revision: str, dest: Path) -> bool
         contents.extend(listed.get("Contents", []))
     if not contents:
         return False
+    # Weights are mirrored after the manifest; only the marker proves they all landed.
+    complete_key = prefix + MIRROR_COMPLETE
+    if mirror_marker_required(namespace) and not any(
+            obj.get("Key") == complete_key for obj in contents):
+        logger.warning("Checkpoint mirror for %s is incomplete; using HF fallback", revision)
+        return False
+    contents = [obj for obj in contents if obj.get("Key") != complete_key]
     config = TransferConfig(
         multipart_threshold=32 * 1024 * 1024,
         multipart_chunksize=32 * 1024 * 1024,
@@ -107,10 +119,12 @@ def _download_checkpoint(client, bucket: str, revision: str, dest: Path) -> bool
     expected = {}
     for obj in contents:
         key = obj["Key"]
+        if not isinstance(key, str) or not key.startswith(prefix):
+            raise ValueError("checkpoint object escaped its namespace")
         filename = key[len(prefix):]
         if not filename:
             continue
-        checkpoint_key(revision, filename)
+        checkpoint_key(revision, filename, namespace=namespace)
         if filename.startswith(".") or (dest / filename).is_symlink():
             raise ValueError("checkpoint mirror contains an unsafe filename")
         expected[filename] = {"etag": obj.get("ETag"), "size": obj.get("Size")}
@@ -119,6 +133,8 @@ def _download_checkpoint(client, bucket: str, revision: str, dest: Path) -> bool
         return False
     identity = {"bucket": bucket, "endpoint": os.getenv("R2_ENDPOINT_URL") or os.getenv("R2_ACCOUNT_ID", ""),
                 "revision": revision, "objects": expected}
+    if namespace.scoped:
+        identity.update(namespace.identity)
     try:
         cached = strict_json_loads(marker.read_bytes())
         if (cached["identity"] == identity and set(cached["files"]) == set(expected)
@@ -215,19 +231,48 @@ def run_train_worker(*, shadow: bool = False) -> None:
         validate_checkpoint_profile,
     )
     from reliquary.validator.training import reset_training_state
+    from reliquary.trainer.distributed import (
+        CommandChannel,
+        broadcasting_train_step,
+        init_distributed,
+        load_sharded_model,
+        sharded_save_fn,
+        trainer_backend,
+    )
+    from reliquary.validator.training import configure_distributed, train_step
+
+    # fsdp2: torchrun starts N processes; rank 0 runs this worker and drives
+    # the others, which only load, train and gather on its command.
+    dist_ctx = channel = None
+    backend = trainer_backend()
+    _check_trainer_launch(backend, os.environ)
+    if backend == "fsdp2":
+        from reliquary.constants import KL_BETA
+
+        if float(KL_BETA) != 0.0:
+            raise SystemExit("fsdp2 trainer requires KL_BETA == 0")
+        dist_ctx = init_distributed()
+        channel = CommandChannel(dist_ctx)
+        configure_distributed(dist_ctx)
+        if not dist_ctx.is_main:
+            _run_train_follower(dist_ctx, channel)
+            return
 
     repo_id = os.environ.get("RELIQUARY_HF_REPO_ID", "").strip()
     if not repo_id:
         raise SystemExit("RELIQUARY_HF_REPO_ID is required")
     bucket = os.getenv("R2_BUCKET_ID", "reliquary")
-    state_dir = Path(os.environ.get(
+    namespace = active_checkpoint_namespace()
+    state_root = Path(os.environ.get(
         "RELIQUARY_TRAINER_STATE_DIR", "/root/reliquary/trainer",
     ))
+    state_dir = namespace.local_path(state_root)
     client = _r2_client()
     fetch = r2_fetch_fn(client, bucket)
     early_publisher = TrainerPublisher(
-        repo_id=repo_id, staging_dir=str(state_dir / "staging"),
+        repo_id=repo_id, staging_dir=str(state_root / "staging"),
         tokenizer=None, r2_client=client, bucket=bucket,
+        namespace=namespace,
     )
     if not shadow:
         asyncio.run(early_publisher.recover_pending())
@@ -235,9 +280,17 @@ def run_train_worker(*, shadow: bool = False) -> None:
     # Journal payloads carry the run identity; only checkpoint manifests carry
     # repo_id. Requiring the manifest header on payloads rejects our own codec.
     payload_identity = active_training_identity() if PROTOCOL_VERSION >= 5 else {}
-    expected_identity = {**payload_identity, "repo_id": repo_id}
+    expected_identity = {**payload_identity, **namespace.identity, "repo_id": repo_id}
+    resume_candidate = None
+    resume_fetch = fetch
+    if namespace.scoped:
+        from reliquary.shared.strict_json import strict_json_loads
+
+        raw_candidate = fetch(namespace.candidate_manifest_key)
+        resume_candidate = strict_json_loads(raw_candidate) if raw_candidate is not None else None
+        resume_fetch = lambda key: (raw_candidate if key == namespace.candidate_manifest_key else fetch(key))
     revision, cursor, checkpoint_n = resolve_resume_point(
-        fetch,
+        resume_fetch,
         env=os.environ,
         expected_identity=expected_identity,
     )
@@ -252,13 +305,26 @@ def run_train_worker(*, shadow: bool = False) -> None:
         load_kwargs = {"revision": DEFAULT_BASE_MODEL_REVISION}
         tokenizer = load_tokenizer(model_path, **load_kwargs)
     else:
-        snapshot_dir = state_dir / "resume" / revision
+        snapshot_dir = namespace.child_path(state_dir, "resume", revision)
         started = time.monotonic()
-        if not _download_checkpoint(client, bucket, revision, snapshot_dir):
+        if not _download_checkpoint(client, bucket, revision, snapshot_dir, namespace=namespace):
             logger.info("R2 snapshot unavailable for %s; falling back to HF", revision)
             snapshot_dir = Path(_hf_download(repo_id, revision))
         logger.info("startup_stage=checkpoint_download elapsed_seconds=%.3f", time.monotonic() - started)
-        profile = validate_checkpoint_profile(snapshot_dir, required=True)
+        if namespace.scoped:
+            from reliquary.shared.strict_json import strict_json_loads
+            from reliquary.trainer.resume import validate_scoped_resume_snapshot
+
+            raw_manifest = fetch(namespace.candidate_manifest_key)
+            candidate = strict_json_loads(raw_manifest) if raw_manifest is not None else None
+            if candidate != resume_candidate:
+                raise PublicationConflict("scoped resume candidate changed during download")
+            profile = validate_scoped_resume_snapshot(
+                snapshot_dir, namespace=namespace, repo_id=repo_id,
+                revision=revision, checkpoint_n=checkpoint_n, candidate=resume_candidate,
+            )
+        else:
+            profile = validate_checkpoint_profile(snapshot_dir, required=True)
         # The PROFILE is authoritative for run state; the manifest cursor
         # was only a hint for which snapshot to fetch.
         profile_cursor = _profile_nonnegative_int(
@@ -315,17 +381,28 @@ def run_train_worker(*, shadow: bool = False) -> None:
 
     logger.info("loading model from %s", model_path)
     started = time.monotonic()
-    model = load_text_generation_model(
-        model_path,
-        torch_dtype=torch.bfloat16,
-        attn_implementation=ATTN_IMPLEMENTATION,
-        **load_kwargs,
-    ).to("cuda:0")
-    logger.info("startup_stage=trainer_model_load elapsed_seconds=%.3f", time.monotonic() - started)
-    try:
-        model.gradient_checkpointing_enable()
-    except (AttributeError, NotImplementedError):
-        logger.warning("model does not support gradient checkpointing")
+    if dist_ctx is None:
+        model = load_text_generation_model(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            attn_implementation=ATTN_IMPLEMENTATION,
+            **load_kwargs,
+        ).to("cuda:0")
+        logger.info("startup_stage=trainer_model_load elapsed_seconds=%.3f", time.monotonic() - started)
+        try:
+            model.gradient_checkpointing_enable()
+        except (AttributeError, NotImplementedError):
+            logger.warning("model does not support gradient checkpointing")
+    else:
+        channel.send("LOAD", {"model_path": model_path, "load_kwargs": load_kwargs})
+        model = load_sharded_model(
+            model_path, load_kwargs, dist_ctx,
+            attn_implementation=ATTN_IMPLEMENTATION,
+        )
+        logger.info(
+            "startup_stage=trainer_model_load elapsed_seconds=%.3f world_size=%d",
+            time.monotonic() - started, dist_ctx.world_size,
+        )
     reset_training_state()
 
     runner = TrainRunner(
@@ -333,14 +410,23 @@ def run_train_worker(*, shadow: bool = False) -> None:
         env_targets=dict(ENVIRONMENT_MIX),
         env_order=[name for name, _ in ENVIRONMENT_MIX],
         global_step_hint=lr_schedule_step,
+        train_step_fn=(
+            train_step if channel is None
+            else broadcasting_train_step(channel, train_step)
+        ),
     )
     publisher = TrainerPublisher(
         repo_id=repo_id,
-        staging_dir=str(state_dir / "staging"),
+        staging_dir=str(state_root / "staging"),
         tokenizer=tokenizer,
         r2_client=client,
         bucket=bucket,
         checkpoint_number_floor=checkpoint_n,
+        namespace=namespace,
+        save_fn=(
+            None if channel is None
+            else sharded_save_fn(lambda: runner.model, channel, dist_ctx)
+        ),
     )
 
     publish_state = {"checkpoint_n": checkpoint_n}
@@ -449,33 +535,83 @@ def run_train_worker(*, shadow: bool = False) -> None:
         worker.cursor, revision, shadow,
     )
     transient_failures = 0
-    while True:
+    try:
+        while True:
+            try:
+                control_request = control.request()
+                outcome = worker.run_once()
+                control.report(control_request, phase=outcome,
+                               **worker.snapshot(), **runner.snapshot())
+            except (TrainerLockLost, TrainerStateUnsafe, PublicationConflict):
+                control.report(control_request, phase="unsafe", **worker.snapshot())
+                logger.critical("trainer state unsafe; exiting", exc_info=True)
+                raise SystemExit(3)
+            except Exception:
+                # Transient R2/HF error mid-poll or mid-publish: the cursor
+                # never advanced, so retrying is always safe. Backoff, don't
+                # die — a process exit costs the optimizer moments.
+                transient_failures += 1
+                control.report(control_request, phase="blocked", **worker.snapshot())
+                delay = min(60.0, 5.0 * transient_failures)
+                logger.exception(
+                    "worker iteration failed (attempt %d); retrying in %.0fs",
+                    transient_failures, delay,
+                )
+                time.sleep(delay)
+                continue
+            transient_failures = 0
+            if outcome in {"waited", "closed", "drained"}:
+                time.sleep(5.0)
+            elif outcome == "frozen":
+                time.sleep(30.0)
+            elif outcome in {"tombstone", "quarantined", "published"}:
+                logger.info("%s (cursor=%d)", outcome, worker.cursor)
+    finally:
+        # Followers block on the next command; release them on any exit.
+        if channel is not None:
+            channel.send("STOP")
+
+
+def _check_trainer_launch(backend: str, env: Mapping[str, str]) -> None:
+    """Several processes only make sense as fsdp2 ranks: under the single
+    backend each would be a full trainer on cuda:0 racing for the lock."""
+    world_size = int(str(env.get("WORLD_SIZE", "1")).strip() or "1")
+    if world_size > 1 and backend != "fsdp2":
+        raise SystemExit(
+            f"WORLD_SIZE={world_size} needs RELIQUARY_TRAINER_BACKEND=fsdp2"
+        )
+
+
+def _run_train_follower(ctx, channel) -> None:
+    """A non-zero fsdp2 rank: load, train and gather on rank 0's command."""
+    from reliquary.constants import ATTN_IMPLEMENTATION
+    from reliquary.trainer.distributed import (
+        gather_full_state_dict,
+        load_sharded_model,
+        run_follower,
+    )
+    from reliquary.validator.training import (
+        TrainingStepSkipped,
+        reset_training_state,
+        train_step,
+    )
+
+    def load(payload):
+        reset_training_state()
+        return load_sharded_model(
+            payload["model_path"], payload["load_kwargs"], ctx,
+            attn_implementation=ATTN_IMPLEMENTATION,
+        )
+
+    def train(model, payload):
         try:
-            control_request = control.request()
-            outcome = worker.run_once()
-            control.report(control_request, phase=outcome,
-                           **worker.snapshot(), **runner.snapshot())
-        except (TrainerLockLost, TrainerStateUnsafe, PublicationConflict):
-            control.report(control_request, phase="unsafe", **worker.snapshot())
-            logger.critical("trainer state unsafe; exiting", exc_info=True)
-            raise SystemExit(3)
-        except Exception:
-            # Transient R2/HF error mid-poll or mid-publish: the cursor
-            # never advanced, so retrying is always safe. Backoff, don't
-            # die — a process exit costs the optimizer moments.
-            transient_failures += 1
-            control.report(control_request, phase="blocked", **worker.snapshot())
-            delay = min(60.0, 5.0 * transient_failures)
-            logger.exception(
-                "worker iteration failed (attempt %d); retrying in %.0fs",
-                transient_failures, delay,
-            )
-            time.sleep(delay)
-            continue
-        transient_failures = 0
-        if outcome in {"waited", "closed", "drained"}:
-            time.sleep(5.0)
-        elif outcome == "frozen":
-            time.sleep(30.0)
-        elif outcome in {"tombstone", "quarantined", "published"}:
-            logger.info("%s (cursor=%d)", outcome, worker.cursor)
+            train_step(model, payload["batches"], **payload["kwargs"])
+        except TrainingStepSkipped:
+            pass  # every rank took the same decision; rank 0 handles it
+
+    run_follower(
+        channel,
+        load=load,
+        train=train,
+        gather=lambda model: gather_full_state_dict(model, ctx),
+    )

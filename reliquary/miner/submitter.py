@@ -327,6 +327,8 @@ async def submit_batch_v2(
             nonce=nonce,
             protocol_version=request.protocol_version,
             generation_profile_id=request.generation_profile_id,
+            pool_selection=request.pool_selection,
+            service_binding=request.service_binding,
         ).hex()
         finalized = request.model_copy(
             update={

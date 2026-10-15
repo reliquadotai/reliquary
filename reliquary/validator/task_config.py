@@ -21,6 +21,7 @@ from reliquary.shared.task_registry import (
     validate_registry,
 )
 from reliquary.validator.emission_price import PriceParams
+from reliquary.protocol.service_contract import ServiceContract
 
 
 class TaskConfigError(RuntimeError):
@@ -37,6 +38,7 @@ class TaskConfig:
     env_caps: dict[str, float]
     # The replica this task's validators verify with, or None to let each derive it.
     verification: str | None = None
+    service_contract: ServiceContract | None = None
 
 
 def resolve_task_config(
@@ -144,6 +146,11 @@ def resolve_task_config(
 
     params = PriceParams(**{f: entry.params[f] for f in PRICE_PARAM_FIELDS})
     cap = float(entry.params["cap"])
+    if entry.service_contract is not None:
+        contract = ServiceContract.from_dict(entry.service_contract)  # parsed once
+        return TaskConfig(task_id=task_id, entry=entry, price_params=params, emission_cap=cap,
+                          env_caps=_service_env_caps(entry, cap=cap, contract=contract), verification=entry.verification,
+                          service_contract=contract)
     if entry.env_split is not None:
         env_caps = {
             environment: cap * float(share)
@@ -161,6 +168,44 @@ def resolve_task_config(
         env_caps=env_caps,
         verification=entry.verification,
     )
+
+
+def _service_env_caps(entry: TaskEntry, *, cap: float, contract: ServiceContract | None = None) -> dict[str, float]:
+    """A service task's initial per-env caps, from its contract's shares (the live
+    schedule re-derives them every window)."""
+    from reliquary.environment.registry import ENVIRONMENT_SPECS
+
+    from reliquary.services.admission_policy import missing_box_problems
+
+    if contract is None:
+        contract = ServiceContract.from_dict(entry.service_contract)
+    problems = missing_box_problems(contract)  # R22
+    if problems:
+        raise TaskConfigError(
+            f"task {entry.task_id!r} sets missing_box away from the by-type default (math: uncertain, "
+            f"every other env: graded): " + "; ".join(problems))
+    caps = {}
+    for name, env in contract.environments.items():
+        if "catalogue" in env and ENVIRONMENT_SPECS.get(name) is not None:
+            raise TaskConfigError(
+                f"task {entry.task_id!r}: environment {name!r} carries a catalogue but is installed in this build; "
+                f"a bridged env needs a name of its own")
+        if env["share_bps"] <= 0:  # declared but inactive at launch (initial_schedule): no check, cap 0
+            caps[name] = 0.0
+            continue
+        if "catalogue" in env:
+            # A bridged episode env is not installed in the registry: the validator builds it from its public
+            # catalogue at start and refuses an order whose version is not the built env's manifest.
+            caps[name] = cap * env["share_bps"] / 10000
+            continue
+        spec = ENVIRONMENT_SPECS.get(name)
+        installed = getattr(spec, "environment_manifest_sha256", None)
+        if installed != env["version"]:
+            raise TaskConfigError(
+                f"task {entry.task_id!r} pins environment version {env['version'][:12]}... for {name!r} "
+                f"but this build installs {str(installed)[:12]}... (environment version mismatch)")
+        caps[name] = cap * env["share_bps"] / 10000
+    return caps
 
 
 def legacy_registry_fallback(

@@ -11,7 +11,7 @@ DETAIL_FIELDS = frozenset({
     "reason_details", "environment", "prompt_idx", "checkpoint_revision", "receipt_id",
     "ordering_policy", "rank_scope", "proof_status", "proof_reason", "body_received_ts",
     "proof_recorded_ts", "proof_duration_seconds", "finalized_ts", "batch_index",
-    "selection_target", "selected_count",
+    "selection_target", "selected_count", "service_contract_sha256", "service_purpose", "exploration_fraction",
 })
 
 
@@ -32,6 +32,9 @@ def lifecycle_fields(*, accepted, selected, selection_reason, reason, now):
         "admitted_pending_selection": "Admitted; selection has not been finalized.",
         "selected_fifo": "Selected into a durable training batch; this is not confirmation of training consumption or an on-chain payout.",
         "selected": "Selected for the training batch.",
+        "exploration_reward_recorded": "Verified exploration entitlement recorded in the durable archive; excluded from training. This is not confirmation of an on-chain payout.",
+        "exploration_verified_no_entitlement": "Exploration proof passed; the freshness or budget policy assigned no entitlement.",
+        "service_policy_limit": "The group passed its proof but exceeds the ordered service policy; no reward or training seat.",
         "proof_not_needed_target_reached": "The proof plan reached its required number of passing groups; this candidate was not needed.",
         "same_prompt_or_content_already_proven": "An earlier-ranked candidate already proved this prompt or content.",
         "proof_failure_debt": "A hotkey or operator proof-failure budget was exhausted for this environment and proof plan.",
@@ -39,6 +42,15 @@ def lifecycle_fields(*, accepted, selected, selection_reason, reason, now):
         "proven_not_selected_before_window_close": "Proof passed, but this group did not receive a training seat before window closure.",
         "proof_not_completed_before_window_close": "The window closed without a completed proof for this candidate.",
         "picked_but_unpaid_incomplete_cross_environment_batch": "Picked locally, but the cross-environment batch was not durably completed.",
+        "already_scanned": "Accepted, but this prompt was already observed earlier in the run; no exploration payment.",
+        "exploration_banned": "Accepted, but this hotkey is barred from exploration payment after a failed audit.",
+        "exploration_cap_reached": "Accepted, but the per-environment exploration cap was reached; no payment.",
+        "exploration_unpaid": "Accepted, but no exploration entitlement applies to this group; no payment.",
+        "exploration_forfeited": "Exploration payment forfeited after a failed audit.",
+        "exploration_unaudited": "Selected for audit but not audited before the window closed; unpaid, no sanction.",
+        "exploration_audit_queued": "Selected for audit but not audited before the window closed; unpaid, no sanction.",
+        "exploration_window_closed": "Exploration observation arrived after the window closed; unpaid.",
+        "service_unproven_published": "In-zone but not robust; recorded as an observation, never trained or paid.",
         "not_selected_status_unavailable": "Not selected; the validator did not retain the detailed cause.",
     }
     return {

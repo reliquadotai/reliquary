@@ -1,0 +1,22 @@
+{
+ "announcement": "1fb374d03cdd3a6bb884fb3ea4da76bbedc0fa6c907ebb3313c65fb4f2f74ddc",
+ "announcement_per_env": {
+  "reliquary_dapo_math_v1": "1fb374d03cdd3a6bb884fb3ea4da76bbedc0fa6c907ebb3313c65fb4f2f74ddc",
+  "reliquary_test_episode_v1": "1fb374d03cdd3a6bb884fb3ea4da76bbedc0fa6c907ebb3313c65fb4f2f74ddc"
+ },
+ "contract_bytes": "948d1bf5b988af622d2bdedec3979a408866038804ab49c29032176322a11a01",
+ "contract_sha256": "948d1bf5b988af622d2bdedec3979a408866038804ab49c29032176322a11a01",
+ "envelope": "e8c8f16ee879a89190263c72c22c39f2546d49ea58bf1a5a1a4313961e8a5351",
+ "events": "9faceb31cb22c78811e8d643d51b0d1560beb9bb2b2545a4e27266bc1c7c9697",
+ "explored": "6d396386cf2114fc71637452d5baaff66f4d6ac5a8ce9d45681bb21af768c024",
+ "pool": "b115a20931e6033a704bbf948bfd479428d4fc85e6581a7f76aef6692d224ce1",
+ "precommit": "43ec85b236e45e0d38c7fde5f81de4c6758761683e9509ca93e3180df15dfc16",
+ "reconciled": "3a7ac3db424eed568cdd140e86ccfcd1900b771c0987e4b4d96aee167adc20ea",
+ "replayed": "091e47421d0bf2be918069a9965be14eebf1450cf9fa3b99af7d702d78c63886",
+ "schedule_bytes": "a0eb338c87f406db896f4bf2f05404a9609813cabe51226e0cb3cea0b74c172f",
+ "schedule_sha256": "a0eb338c87f406db896f4bf2f05404a9609813cabe51226e0cb3cea0b74c172f",
+ "settled": "9c0adafb650df15f122cb26e34921938f4b46fa16d1d9827ecdd3041e28ab948",
+ "single_turn_schedule_sha256": "323a5db158a679cf8ab87010200e0361ce927e597bdd2c80e5a823bb62deb1b9",
+ "trained": "97ef4d875bf1972f47ea960225918640642a2c87d93586d3f86da6791de49728",
+ "weights": "ceb77294cce67ab585d6db9bb10432f29aca5333cef8578da44ba89efd97dae4"
+}

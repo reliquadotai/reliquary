@@ -48,6 +48,8 @@ class Finished:
 
 
 class TurnCore(Protocol):
+    # A forced engine calls ``add(..., draw=extra_args)``: its core takes a ``draw``
+    # keyword; a core without one keeps serving every non-forced engine.
     def add(self, request_id: str, prompt_ids: list[int], max_tokens: int) -> None: ...
 
     def step(self) -> list[Finished]: ...
@@ -75,8 +77,10 @@ def _settle(future: asyncio.Future, done: Finished) -> None:
 
 class GenerateEngine:
     def __init__(self, core: TurnCore, *, max_total_tokens: int, max_tokens_per_turn: int,
-                 session_ttl_seconds: float = 7200.0, clock=time.monotonic) -> None:
+                 session_ttl_seconds: float = 7200.0, clock=time.monotonic, draws=None) -> None:
         self._core = core
+        # ``forced_draw.ForcedDraws`` for an RL episode miner; None keeps free sampling.
+        self._draws = draws
         self.max_total_tokens = int(max_total_tokens)
         self._per_turn = int(max_tokens_per_turn)
         self._ttl = session_ttl_seconds
@@ -86,6 +90,9 @@ class GenerateEngine:
         self._sessions: dict[str, SessionLog] = {}
         self._lock = threading.Lock()
         self._inflight: dict[str, str] = {}  # request id -> session id
+        # Forced sessions with a turn running OR resolved but not logged yet, and those with a logged turn.
+        self._busy: set[str] = set()
+        self._started: set[str] = set()
         self._dropped: OrderedDict[str, None] = OrderedDict()
         self._step_failures = 0
         self.healthy = True
@@ -145,12 +152,15 @@ class GenerateEngine:
             if item[0] == "abort":
                 self._abort(item[1])
             else:
-                _, request_id, prompt_ids, max_tokens = item
+                _, request_id, prompt_ids, max_tokens, *forced = item
                 with self._lock:
                     waited = request_id in self._pending
                 if waited:  # a waiter that already gave up is not worth a prefill
                     try:
-                        self._core.add(request_id, prompt_ids, max_tokens)
+                        if forced:
+                            self._core.add(request_id, prompt_ids, max_tokens, draw=forced[0])
+                        else:
+                            self._core.add(request_id, prompt_ids, max_tokens)
                     except Exception as exc:
                         self._resolve(Finished(request_id, error=f"request refused by the engine: {exc}"))
             try:
@@ -169,49 +179,92 @@ class GenerateEngine:
     # -- the event loop side ---------------------------------------------------
 
     async def generate(self, session_id: str, prompt_ids: list[int], max_tokens: int | None) -> dict:
+        # A forced turn ignores the client's cap: the job's budget alone bounds an RL episode's turn.
         cap = min(self._per_turn, self.max_total_tokens - len(prompt_ids),
-                  max_tokens if max_tokens else self._per_turn)
+                  max_tokens if max_tokens and self._draws is None else self._per_turn)
         if not self.healthy:
             raise RuntimeError("the generate engine is unhealthy (repeated engine step failures)")
         if cap < 1:
             raise ValueError(f"a prompt of {len(prompt_ids)} tokens leaves no room under "
                              f"{self.max_total_tokens}")
+        binding = None
+        if self._draws is not None:
+            binding = self._draws.get(session_id)
+            if binding is None:
+                raise ValueError("this session has no forced draw: an RL episode turn needs its seed")
+            with self._lock:  # before the prompt is noted; checked again where the turn is registered
+                self._refuse_unusable_session(session_id)
         self._note_prompt(session_id, prompt_ids)
         request_id = secrets.token_hex(16)
         loop = asyncio.get_running_loop()
         future = loop.create_future()
+        draw = None
         with self._lock:
+            if binding is not None:
+                self._refuse_unusable_session(session_id)
+                draw = binding.extra_args(self._model_tokens(session_id))
+                self._busy.add(session_id)
             self._pending[request_id] = (loop, future)
             self._inflight[request_id] = session_id
-        self._inbox.put(("add", request_id, list(prompt_ids), cap))
         try:
-            done: Finished = await future
-        except BaseException:  # cancelled (client gone): free the engine slot
+            if draw is None:
+                self._inbox.put(("add", request_id, list(prompt_ids), cap))
+            else:
+                self._inbox.put(("add", request_id, list(prompt_ids), cap, draw))
+            try:
+                done: Finished = await future
+            except BaseException:  # cancelled (client gone): free the engine slot
+                with self._lock:
+                    self._pending.pop(request_id, None)
+                    self._inflight.pop(request_id, None)
+                self._inbox.put(("abort", request_id))
+                raise
+            if done.error is not None:
+                raise RuntimeError(done.error)
             with self._lock:
-                self._pending.pop(request_id, None)
-                self._inflight.pop(request_id, None)
-            self._inbox.put(("abort", request_id))
-            raise
-        if done.error is not None:
-            raise RuntimeError(done.error)
-        with self._lock:
-            if session_id in self._dropped:
-                raise RuntimeError("the session was dropped while the turn ran")
-            log = self._sessions.setdefault(session_id, SessionLog())
-            log.turns.append(GeneratedTurn(tuple(prompt_ids), done.completion_ids, done.proofs))
-            log.touched = self._clock()
+                if session_id in self._dropped:
+                    raise RuntimeError("the session was dropped while the turn ran")
+                log = self._sessions.setdefault(session_id, SessionLog())
+                log.turns.append(GeneratedTurn(tuple(prompt_ids), done.completion_ids, done.proofs))
+                log.touched = self._clock()
+                if binding is not None:
+                    self._started.add(session_id)
+        finally:
+            if binding is not None:  # a forced session is busy until its turn is logged (or has failed)
+                with self._lock:
+                    self._busy.discard(session_id)
         return {"request_id": request_id, "choices": [{
             "index": 0, "token_ids": list(done.completion_ids),
             "logprobs": {"content": [{"token": f"token_id:{t}", "logprob": lp}
                                      for t, lp in zip(done.completion_ids, done.logprobs)]},
             "finish_reason": done.finish_reason}]}
 
+    def _refuse_unusable_session(self, session_id: str) -> None:
+        # Under ``self._lock``. A forced turn's draw starts after the session's model tokens: two turns of one
+        # session in flight (or one not logged yet) would start at the same position, and a session whose log
+        # is gone would restart at 0.
+        if session_id in self._busy:
+            raise ValueError("a turn of this session is already running: the forced draw takes one "
+                             "turn at a time")
+        log = self._sessions.get(session_id)
+        if session_id in self._started and (log is None or not log.turns):
+            raise ValueError("this forced session lost its log: its draw cannot continue")
+
+    def _forget_forced(self, session_id: str) -> None:
+        # Under ``self._lock``: the session is gone, so is its binding.
+        self._started.discard(session_id)
+        if self._draws is not None:
+            self._draws.drop(session_id)
+
     def _note_prompt(self, session_id: str, prompt_ids: list[int]) -> None:
         now = self._clock()
         with self._lock:
             if session_id in self._dropped:
                 raise ValueError("this session was dropped")
-            for stale in [s for s, log in self._sessions.items() if now - log.touched > self._ttl]:
+            for stale in [s for s, log in self._sessions.items()
+                          if now - log.touched > self._ttl and s not in self._busy]:
+                if self._sessions[stale].turns:
+                    self._forget_forced(stale)
                 del self._sessions[stale]
             log = self._sessions.setdefault(session_id, SessionLog(touched=now))
             log.touched = now
@@ -223,11 +276,23 @@ class GenerateEngine:
 
     def take_session(self, session_id: str) -> SessionLog | None:
         with self._lock:
+            self._forget_forced(session_id)
             return self._sessions.pop(session_id, None)
+
+    def model_tokens(self, session_id: str) -> int:
+        """Model tokens this session has generated so far, over its turns (the forced draw's
+        position counts these only)."""
+        with self._lock:
+            return self._model_tokens(session_id)
+
+    def _model_tokens(self, session_id: str) -> int:
+        log = self._sessions.get(session_id)
+        return 0 if log is None else sum(len(turn.completion_ids) for turn in log.turns)
 
     def drop_session(self, session_id: str) -> None:
         with self._lock:
             self._sessions.pop(session_id, None)
+            self._forget_forced(session_id)
             self._dropped[session_id] = None
             while len(self._dropped) > _DROPPED_KEPT:
                 self._dropped.popitem(last=False)
@@ -250,7 +315,7 @@ class VllmTurnCore:
 
     def __init__(self, checkpoint_dir: str, *, sampling, proof, stop_token_ids,
                  max_total_tokens: int, max_num_seqs: int = 16,
-                 gpu_memory_utilization: float | None = None) -> None:
+                 gpu_memory_utilization: float | None = None, forced: bool = False) -> None:
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
         os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
         from vllm import LLM, SamplingParams
@@ -264,6 +329,12 @@ class VllmTurnCore:
                   else {"gpu_memory_utilization": gpu_memory_utilization})
         extra = ({"limit_mm_per_prompt": {"image": 0, "video": 0}}
                  if _has_vision_encoder(checkpoint_dir) else {})
+        self._forced = bool(forced)
+        if self._forced:
+            # Every request carries its forced draw (``forced_draw.DrawBinding.extra_args``).
+            from reliquary.miner.vllm_generation import ForcedSeedVLLMProcessor
+
+            extra["logits_processors"] = [ForcedSeedVLLMProcessor]
         self._llm = LLM(model=checkpoint_dir, dtype="bfloat16", enable_prefix_caching=True,
                         seed=secrets.randbelow(2**31 - 1) + 1, max_model_len=max_total_tokens,
                         max_num_seqs=max_num_seqs, **memory, **extra)
@@ -279,11 +350,20 @@ class VllmTurnCore:
         self._proof = proof
         self._prompt_len: dict[str, int] = {}
 
-    def add(self, request_id: str, prompt_ids: list[int], max_tokens: int) -> None:
+    def add(self, request_id: str, prompt_ids: list[int], max_tokens: int, draw: dict | None = None) -> None:
         from vllm.inputs import TokensPrompt
 
+        sampling = self._sampling
+        if getattr(self, "_forced", False) != (draw is not None):
+            # Without the processor a draw would be lost to a greedy argmax; with it, a request
+            # without a draw would sample freely inside an RL episode.
+            raise ValueError("a forced core takes every request with its draw, a free core none")
+        if draw is not None:
+            from reliquary.miner.forced_draw import forced_sampling_params
+
+            sampling = forced_sampling_params(self._sampling, draw)
         self._engine.add_request(request_id, TokensPrompt(prompt_token_ids=prompt_ids),
-                                 self._params(max_tokens=max_tokens, **self._sampling))
+                                 self._params(max_tokens=max_tokens, **sampling))
         self._prompt_len[request_id] = len(prompt_ids)
 
     def abort(self, request_id: str) -> None:

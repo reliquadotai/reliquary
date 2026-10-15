@@ -14,11 +14,14 @@ services:
     # checks, grader server) — override it entirely: the trainer has no
     # wallet and no grader. TRAIN_WORKER_FLAGS="--shadow" in .env for
     # the pre-cutover phase.
-    entrypoint: ["/bin/bash", "-c", "exec reliquary train-worker ${TRAIN_WORKER_FLAGS:-}"]
+    # RELIQUARY_TRAINER_BACKEND=fsdp2 + RELIQUARY_TRAINER_GPUS=N (both read in
+    # the container, from .env) trains on N cards through torchrun; the default
+    # single backend runs one process exactly as before, without torchrun.
+    entrypoint: ["/bin/bash", "-c", "if [ \"$${RELIQUARY_TRAINER_BACKEND:-single}\" = fsdp2 ]; then exec torchrun --standalone --nproc-per-node=$${RELIQUARY_TRAINER_GPUS:-1} --no-python reliquary train-worker ${TRAIN_WORKER_FLAGS:-}; else exec reliquary train-worker ${TRAIN_WORKER_FLAGS:-}; fi"]
     command: []
     env_file: .env
     environment:
-      # Which GPU the trainer owns on this box.
+      # Which GPUs the trainer owns on this box (a comma list for fsdp2).
       - CUDA_VISIBLE_DEVICES=${TRAIN_WORKER_GPU:-0}
     deploy:
       resources:

@@ -1,0 +1,1024 @@
+{
+ "_note": "Built and fingerprinted by origin/main (fec8f87b): one manifest per live corpus job kind and a registry holding the legacy RL task and corpus period tasks. A validator built from this tree must read them identically.",
+ "expected": {
+  "entry:corpus-code": {
+   "contract_sha": "e8a01778ef720b47cf7adcbeb181725d3db4fbf8a4e2ef4919dbc1a1256f0335",
+   "job_id": "job-code",
+   "mechanism": "corpus-generation",
+   "params_sha": "4f48ba4425cff6aafeb135908a884938a66255e93f6e80681c50715595a4cbf5",
+   "pay_ceiling": 0.05,
+   "period_task": true,
+   "profile_sha256": "e8a01778ef720b47cf7adcbeb181725d3db4fbf8a4e2ef4919dbc1a1256f0335"
+  },
+  "entry:corpus-general": {
+   "contract_sha": "7d9bd75ac63d22a8eccc614efcb482c61001d4bf9095c94379619f09ced56500",
+   "job_id": "job-general",
+   "mechanism": "corpus-generation",
+   "params_sha": "4f48ba4425cff6aafeb135908a884938a66255e93f6e80681c50715595a4cbf5",
+   "pay_ceiling": 0.05,
+   "period_task": true,
+   "profile_sha256": "7d9bd75ac63d22a8eccc614efcb482c61001d4bf9095c94379619f09ced56500"
+  },
+  "entry:corpus-hardmath": {
+   "contract_sha": "d877d54ea948334a463fa3802be97b369a2229b0670222ec9a2bc45d2376ec76",
+   "job_id": "job-hardmath",
+   "mechanism": "corpus-generation",
+   "params_sha": "4f48ba4425cff6aafeb135908a884938a66255e93f6e80681c50715595a4cbf5",
+   "pay_ceiling": 0.05,
+   "period_task": true,
+   "profile_sha256": "d877d54ea948334a463fa3802be97b369a2229b0670222ec9a2bc45d2376ec76"
+  },
+  "entry:corpus-ifeval": {
+   "contract_sha": "0a8c66c2f87e870dd949fff1465cd99b317bbaa20c54ea38e1b312284b21c900",
+   "job_id": "job-ifeval",
+   "mechanism": "corpus-generation",
+   "params_sha": "4f48ba4425cff6aafeb135908a884938a66255e93f6e80681c50715595a4cbf5",
+   "pay_ceiling": 0.05,
+   "period_task": true,
+   "profile_sha256": "0a8c66c2f87e870dd949fff1465cd99b317bbaa20c54ea38e1b312284b21c900"
+  },
+  "entry:corpus-science": {
+   "contract_sha": "63e32a0e485cb4876b07c26f9c2c97afb3b07655dab63359371eea9ab53acde4",
+   "job_id": "job-science",
+   "mechanism": "corpus-generation",
+   "params_sha": "4f48ba4425cff6aafeb135908a884938a66255e93f6e80681c50715595a4cbf5",
+   "pay_ceiling": 0.05,
+   "period_task": true,
+   "profile_sha256": "63e32a0e485cb4876b07c26f9c2c97afb3b07655dab63359371eea9ab53acde4"
+  },
+  "entry:reliquary-rl": {
+   "contract_sha": null,
+   "job_id": null,
+   "mechanism": "rl-discovered-price",
+   "params_sha": "a5cfac2620c8aa83690d2a2d691d918f8836a14fd93e45950cf0ba50159f106a",
+   "pay_ceiling": 0.6,
+   "period_task": false,
+   "profile_sha256": "1696eef2a8ff52284842f2253d6f699b50bc657dc93b20fc61a257db7d449385"
+  },
+  "job:competitive_code": {
+   "contract_sha": "b1dced336efaa8cd738dbb9f890f7b89bfa8722f2d76899ce1f3acc68d991fa7",
+   "reparse_equal": true,
+   "total_slots": 20000
+  },
+  "job:eval_set": {
+   "contract_sha": "755c1bbc97bf3aa84a4d064ad0b02b43893b376b37253eeb15e99abee2c222dd",
+   "reparse_equal": true,
+   "total_slots": 20
+  },
+  "job:general_direct": {
+   "contract_sha": "2253a96140922b286682dea8a76a98d60d2fa1e489a77c31447f8942004de536",
+   "reparse_equal": true,
+   "total_slots": 20000
+  },
+  "job:general_thinking": {
+   "contract_sha": "0e190495c2e4bfcabb867b44134d7e061d75d2e7862b70b1d29e8014139fb7ff",
+   "reparse_equal": true,
+   "total_slots": 20000
+  },
+  "job:hard_math": {
+   "contract_sha": "0235250c65e38853ffa79f292d9e584fe22f02ed6a2fc715791c399d84ead8c6",
+   "reparse_equal": true,
+   "total_slots": 15000
+  },
+  "job:ifeval": {
+   "contract_sha": "90a124d9d6126ef4567d60a8d46a584237869b97bf8edf30bddf95506831c366",
+   "reparse_equal": true,
+   "total_slots": 20000
+  },
+  "job:safety": {
+   "contract_sha": "e4e364999d30bd80412fd4380300233c599bd30d08a0c4a51f3418e5c63031fb",
+   "reparse_equal": true,
+   "total_slots": 20000
+  },
+  "job:science": {
+   "contract_sha": "1a1a498a4d5b4aa007b0710ed979ff7de2b63f310e037507865c73203e1435c9",
+   "reparse_equal": true,
+   "total_slots": 10000
+  },
+  "job:structured": {
+   "contract_sha": "cee09d2e9f93801d55a136d1b164f3fb85daba48e69512819ed1a723c055e819",
+   "reparse_equal": true,
+   "total_slots": 20000
+  },
+  "job:suite_envscaler": {
+   "contract_sha": "488d10a068f3d07cabfcf1237da7a808c21dbee431eeb412b1b950c36f2de401",
+   "reparse_equal": true,
+   "total_slots": 100
+  },
+  "job:suite_telecom": {
+   "contract_sha": "93eaca4d97b6b03c6b30204af712d8ac8bdfbcab10813129e6e45c5cc790ffb4",
+   "reparse_equal": true,
+   "total_slots": 100
+  },
+  "job:swe_replay": {
+   "contract_sha": "af15e7b44a306cd8062fad6ee41ce37a4a3c571e08280cdc70cbeab563b461e6",
+   "reparse_equal": true,
+   "total_slots": 37092
+  },
+  "registry:rerender_sha": "44113cc6bc6e942785817288779ede5f8e9824024d227f28e3885b0069f66f13",
+  "registry:stored_sha": "44113cc6bc6e942785817288779ede5f8e9824024d227f28e3885b0069f66f13"
+ },
+ "expected_legacy_price": {
+  "price_params": {
+   "breaker_timeouts": 3,
+   "cap": 1.0,
+   "deadband": 0.8,
+   "decay": 0.98,
+   "floor": 0.05,
+   "last_good_fills": 50,
+   "median_rounds": 4800,
+   "rounds_per_step": 1000,
+   "snap": 1.2,
+   "start": 1.0
+  },
+  "walk": [
+   {
+    "opencodeinstruct": [
+     0.498487090474,
+     "descend"
+    ],
+    "openmathinstruct": [
+     0.6,
+     "snap"
+    ],
+    "reliquary_logic_v2": [
+     0.498487090474,
+     "descend"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.496978758739,
+     "descend"
+    ],
+    "openmathinstruct": [
+     0.6,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     0.496978758739,
+     "descend"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.495474990942,
+     "descend"
+    ],
+    "openmathinstruct": [
+     0.598184508569,
+     "descend"
+    ],
+    "reliquary_logic_v2": [
+     0.495474990942,
+     "descend"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.493975773275,
+     "descend"
+    ],
+    "openmathinstruct": [
+     0.596374510486,
+     "descend"
+    ],
+    "reliquary_logic_v2": [
+     0.594569989131,
+     "snap"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.59277092793,
+     "snap"
+    ],
+    "openmathinstruct": [
+     0.594569989131,
+     "descend"
+    ],
+    "reliquary_logic_v2": [
+     0.59277092793,
+     "descend"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.590977310363,
+     "descend"
+    ],
+    "openmathinstruct": [
+     0.713483986957,
+     "snap"
+    ],
+    "reliquary_logic_v2": [
+     0.59277092793,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.589189119958,
+     "descend"
+    ],
+    "openmathinstruct": [
+     0.711325113516,
+     "descend"
+    ],
+    "reliquary_logic_v2": [
+     0.59277092793,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.589189119958,
+     "hold"
+    ],
+    "openmathinstruct": [
+     0.711325113516,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     0.59277092793,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.587406340294,
+     "descend"
+    ],
+    "openmathinstruct": [
+     0.711325113516,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     0.711325113516,
+     "snap"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.704887608352,
+     "snap"
+    ],
+    "openmathinstruct": [
+     0.711325113516,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     0.711325113516,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.702754745998,
+     "descend"
+    ],
+    "openmathinstruct": [
+     0.853590136219,
+     "snap"
+    ],
+    "reliquary_logic_v2": [
+     0.709172772435,
+     "descend"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.700628337299,
+     "descend"
+    ],
+    "openmathinstruct": [
+     0.853590136219,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     0.70702694395,
+     "descend"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.698508362727,
+     "descend"
+    ],
+    "openmathinstruct": [
+     0.851007326922,
+     "descend"
+    ],
+    "reliquary_logic_v2": [
+     0.704887608352,
+     "descend"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.696394802816,
+     "descend"
+    ],
+    "openmathinstruct": [
+     0.848432332739,
+     "descend"
+    ],
+    "reliquary_logic_v2": [
+     0.845865130023,
+     "snap"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.835673763379,
+     "snap"
+    ],
+    "openmathinstruct": [
+     0.845865130023,
+     "descend"
+    ],
+    "reliquary_logic_v2": [
+     0.845865130023,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.835673763379,
+     "hold"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "snap"
+    ],
+    "reliquary_logic_v2": [
+     0.845865130023,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.835673763379,
+     "hold"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     0.845865130023,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.835673763379,
+     "hold"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     0.845865130023,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.833145165784,
+     "descend"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     1.0,
+     "snap"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.999774198941,
+     "snap"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     1.0,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.996749063123,
+     "descend"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "snap"
+    ],
+    "reliquary_logic_v2": [
+     0.996974180948,
+     "descend"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.993733080818,
+     "descend"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     0.996974180948,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.990726224329,
+     "descend"
+    ],
+    "openmathinstruct": [
+     0.996974180948,
+     "descend"
+    ],
+    "reliquary_logic_v2": [
+     0.996974180948,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.990726224329,
+     "hold"
+    ],
+    "openmathinstruct": [
+     0.996974180948,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     1.0,
+     "snap"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     1.0,
+     "snap"
+    ],
+    "openmathinstruct": [
+     0.996974180948,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     1.0,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     1.0,
+     "hold"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "snap"
+    ],
+    "reliquary_logic_v2": [
+     1.0,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     1.0,
+     "hold"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     1.0,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     1.0,
+     "hold"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     1.0,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.996974180948,
+     "descend"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     1.0,
+     "snap"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     1.0,
+     "snap"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     1.0,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.996974180948,
+     "descend"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "snap"
+    ],
+    "reliquary_logic_v2": [
+     1.0,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.996974180948,
+     "hold"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     1.0,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.996974180948,
+     "hold"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     1.0,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.996974180948,
+     "hold"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     1.0,
+     "snap"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     1.0,
+     "snap"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     1.0,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     1.0,
+     "hold"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "snap"
+    ],
+    "reliquary_logic_v2": [
+     1.0,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     1.0,
+     "hold"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     1.0,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     1.0,
+     "hold"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     1.0,
+     "hold"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     0.996974180948,
+     "descend"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     1.0,
+     "snap"
+    ]
+   },
+   {
+    "opencodeinstruct": [
+     1.0,
+     "snap"
+    ],
+    "openmathinstruct": [
+     1.0,
+     "hold"
+    ],
+    "reliquary_logic_v2": [
+     1.0,
+     "hold"
+    ]
+   }
+  ]
+ },
+ "stored": {
+  "manifests": {
+   "competitive_code": {
+    "checkpoint_repo": "Org/Teacher",
+    "checkpoint_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "checkpoint_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "deadline_round": null,
+    "eos_token_id": 151645,
+    "filter": null,
+    "job_id": "competitive-code",
+    "prompt_count": 5000,
+    "prompt_order": "free",
+    "prompt_source": "reliquary_competitive_code_v1",
+    "renderer_id": "reliquary-chatml-v1",
+    "sampling": {
+     "max_new_tokens": 4096,
+     "min_new_tokens": 2,
+     "n": 4,
+     "temperature": 1.0,
+     "top_k": 0,
+     "top_p": 1.0
+    },
+    "schema": "reliquary/corpus-job/v1",
+    "slots_per_prompt": 4
+   },
+   "eval_set": {
+    "checkpoint_repo": "Org/Teacher",
+    "checkpoint_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "checkpoint_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "deadline_round": null,
+    "eos_token_id": 151645,
+    "filter": null,
+    "job_id": "eval-1",
+    "prompt_count": 5,
+    "prompt_order": "free",
+    "prompt_source": "eval-set:logic-eval-s1-n8:5:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "renderer_id": "reliquary-chatml-v1",
+    "sampling": {
+     "max_new_tokens": 4096,
+     "min_new_tokens": 2,
+     "n": 1,
+     "temperature": 1.0,
+     "top_k": 0,
+     "top_p": 1.0
+    },
+    "schema": "reliquary/corpus-job/v1",
+    "slots_per_prompt": 4
+   },
+   "general_direct": {
+    "checkpoint_repo": "Org/Teacher",
+    "checkpoint_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "checkpoint_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "deadline_round": null,
+    "eos_token_id": 151645,
+    "filter": null,
+    "job_id": "general-direct",
+    "prompt_count": 5000,
+    "prompt_order": "free",
+    "prompt_source": "reliquary_general_v1",
+    "renderer_id": "reliquary-chatml-v1",
+    "sampling": {
+     "max_new_tokens": 4096,
+     "min_new_tokens": 2,
+     "n": 1,
+     "temperature": 1.0,
+     "top_k": 0,
+     "top_p": 1.0
+    },
+    "schema": "reliquary/corpus-job/v1",
+    "slots_per_prompt": 4
+   },
+   "general_thinking": {
+    "checkpoint_repo": "Org/Teacher",
+    "checkpoint_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "checkpoint_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "deadline_round": null,
+    "eos_token_id": 151645,
+    "filter": null,
+    "job_id": "general-thinking",
+    "prompt_count": 5000,
+    "prompt_order": "free",
+    "prompt_source": "reliquary_general_v1",
+    "renderer_id": "reliquary-chatml-thinking-v1",
+    "sampling": {
+     "max_new_tokens": 4096,
+     "min_new_tokens": 2,
+     "n": 1,
+     "temperature": 1.0,
+     "top_k": 0,
+     "top_p": 1.0
+    },
+    "schema": "reliquary/corpus-job/v1",
+    "slots_per_prompt": 4
+   },
+   "hard_math": {
+    "checkpoint_repo": "Org/Teacher",
+    "checkpoint_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "checkpoint_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "deadline_round": null,
+    "eos_token_id": 151645,
+    "filter": null,
+    "job_id": "hard-math",
+    "prompt_count": 5000,
+    "prompt_order": "free",
+    "prompt_source": "reliquary_hard_math_v1",
+    "renderer_id": "reliquary-chatml-v1",
+    "sampling": {
+     "max_new_tokens": 4096,
+     "min_new_tokens": 2,
+     "n": 4,
+     "temperature": 1.0,
+     "top_k": 0,
+     "top_p": 1.0
+    },
+    "schema": "reliquary/corpus-job/v1",
+    "slots_per_prompt": 3
+   },
+   "ifeval": {
+    "checkpoint_repo": "Org/Teacher",
+    "checkpoint_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "checkpoint_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "deadline_round": null,
+    "eos_token_id": 151645,
+    "filter": {
+     "grader_id": "reliquary_instruction_following_v1",
+     "threshold": 1.0
+    },
+    "job_id": "ifeval",
+    "prompt_count": 5000,
+    "prompt_order": "free",
+    "prompt_source": "reliquary_instruction_following_v1",
+    "renderer_id": "reliquary-chatml-v1",
+    "sampling": {
+     "max_new_tokens": 4096,
+     "min_new_tokens": 2,
+     "n": 1,
+     "temperature": 1.0,
+     "top_k": 0,
+     "top_p": 1.0
+    },
+    "schema": "reliquary/corpus-job/v1",
+    "slots_per_prompt": 4
+   },
+   "safety": {
+    "checkpoint_repo": "Org/Teacher",
+    "checkpoint_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "checkpoint_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "deadline_round": null,
+    "eos_token_id": 151645,
+    "filter": null,
+    "job_id": "safety",
+    "prompt_count": 5000,
+    "prompt_order": "free",
+    "prompt_source": "reliquary_general_v1",
+    "prompt_start": 1000,
+    "renderer_id": "reliquary-chatml-v1",
+    "sampling": {
+     "max_new_tokens": 4096,
+     "min_new_tokens": 2,
+     "n": 1,
+     "temperature": 1.0,
+     "top_k": 0,
+     "top_p": 1.0
+    },
+    "schema": "reliquary/corpus-job/v1",
+    "seed": 7,
+    "slots_per_prompt": 4
+   },
+   "science": {
+    "checkpoint_repo": "Org/Teacher",
+    "checkpoint_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "checkpoint_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "deadline_round": null,
+    "eos_token_id": 151645,
+    "filter": null,
+    "job_id": "science",
+    "prompt_count": 5000,
+    "prompt_order": "free",
+    "prompt_source": "reliquary_science_v1",
+    "renderer_id": "reliquary-chatml-v1",
+    "sampling": {
+     "max_new_tokens": 4096,
+     "min_new_tokens": 2,
+     "n": 4,
+     "temperature": 1.0,
+     "top_k": 0,
+     "top_p": 1.0
+    },
+    "schema": "reliquary/corpus-job/v1",
+    "slots_per_prompt": 2
+   },
+   "structured": {
+    "checkpoint_repo": "Org/Teacher",
+    "checkpoint_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "checkpoint_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "deadline_round": null,
+    "eos_token_id": 151645,
+    "filter": null,
+    "job_id": "structured",
+    "prompt_count": 5000,
+    "prompt_order": "free",
+    "prompt_source": "reliquary_general_v1",
+    "renderer_id": "reliquary-chatml-v1",
+    "sampling": {
+     "max_new_tokens": 4096,
+     "min_new_tokens": 2,
+     "n": 1,
+     "temperature": 1.0,
+     "top_k": 0,
+     "top_p": 1.0
+    },
+    "schema": "reliquary/corpus-job/v1",
+    "slots_per_prompt": 4
+   },
+   "suite_envscaler": {
+    "checkpoint_repo": "Org/Model",
+    "checkpoint_revision": "rev1",
+    "checkpoint_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "deadline_round": null,
+    "eos_token_id": 257,
+    "episode": {
+     "env": {
+      "name": "envscaler_tools_v2",
+      "package": "reliquary-suite",
+      "split": "train",
+      "version": "d933a0f97d71e69ef55768f74bf27f96876c7e3ce61b9b3649f2ae7bb002c370"
+     },
+     "harness": "suite",
+     "max_tokens_per_turn": 3072,
+     "max_total_tokens": 60000,
+     "max_turns": 8,
+     "renderer": "reliquary-chatml-tools-v1"
+    },
+    "filter": null,
+    "job_id": "envscaler-v2",
+    "prompt_count": 50,
+    "prompt_order": "free",
+    "prompt_source": "envscaler_tools_v2",
+    "renderer_id": "reliquary-chatml-tools-v1",
+    "sampling": {
+     "max_new_tokens": 3072,
+     "min_new_tokens": 2,
+     "n": 1,
+     "temperature": 1.0,
+     "top_k": 0,
+     "top_p": 1.0
+    },
+    "schema": "reliquary/corpus-job/v1",
+    "slots_per_prompt": 2
+   },
+   "suite_telecom": {
+    "checkpoint_repo": "Org/Model",
+    "checkpoint_revision": "rev1",
+    "checkpoint_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "deadline_round": null,
+    "eos_token_id": 257,
+    "episode": {
+     "env": {
+      "name": "reliquary_stateful_tools_v1",
+      "package": "reliquary-suite",
+      "split": "train",
+      "version": "0f490881544ba065bf33b974032adbc3f844d2c3978bcd6ca8dbb7089baa8f18"
+     },
+     "harness": "suite",
+     "max_tokens_per_turn": 3072,
+     "max_total_tokens": 60000,
+     "max_turns": 8,
+     "renderer": "reliquary-chatml-tools-v1"
+    },
+    "filter": null,
+    "job_id": "suite-stateful-v1",
+    "prompt_count": 50,
+    "prompt_order": "free",
+    "prompt_source": "reliquary_stateful_tools_v1",
+    "renderer_id": "reliquary-chatml-tools-v1",
+    "sampling": {
+     "max_new_tokens": 3072,
+     "min_new_tokens": 2,
+     "n": 1,
+     "temperature": 1.0,
+     "top_k": 0,
+     "top_p": 1.0
+    },
+    "schema": "reliquary/corpus-job/v1",
+    "slots_per_prompt": 2
+   },
+   "swe_replay": {
+    "checkpoint_repo": "Qwen/Qwen3.8-27B",
+    "checkpoint_revision": "rev1",
+    "checkpoint_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "deadline_round": null,
+    "eos_token_id": 248046,
+    "episode": {
+     "env": {
+      "num_images": 20,
+      "package": "reliquary-swe",
+      "split": "train",
+      "version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     },
+     "harness": "bash",
+     "max_tokens_per_turn": 8192,
+     "max_total_tokens": 60000,
+     "max_turns": 40,
+     "renderer": "renderers:qwen38@0.1.11",
+     "replay_fraction_failed": 0.1,
+     "verifiers": "b2e4e8157783b2c0dffc7821044c87f29f1c3ccf"
+    },
+    "filter": null,
+    "job_id": "swe-agentic-v1",
+    "prompt_count": 18546,
+    "prompt_order": "free",
+    "prompt_source": "reliquary_agentic_swe_v1",
+    "renderer_id": "renderers:qwen38@0.1.11",
+    "sampling": {
+     "max_new_tokens": 8192,
+     "min_new_tokens": 2,
+     "n": 1,
+     "temperature": 1.0,
+     "top_k": 0,
+     "top_p": 1.0
+    },
+    "schema": "reliquary/corpus-job/v1",
+    "slots_per_prompt": 2
+   }
+  },
+  "registry": "{\"registry_version\":1,\"tasks\":{\"corpus-code\":{\"contract\":{\"collection_seconds\":100,\"environments\":{\"reliquary_competitive_code_v1\":{\"answer_format\":\"fenced_python\",\"batch_target\":8,\"bft\":null,\"environment_contract_id\":\"reliquary/stdio-program/v1\",\"environment_manifest_sha256\":\"0589dc2f13c21d8ff6a67d24dd2b8c68e54b706f696267a349158bbd891093d9\",\"max_new_tokens\":16384,\"prompt_cooldown_windows\":340,\"prompt_template\":{\"id\":\"reliquary-external-prompt-v1\",\"renderer\":\"dollar-substitution-v1\",\"sha256\":\"b9884e02699731e7bef78184a43367110454d09dffdf80865e3f8884cdeb4d96\",\"template\":\"$problem\"}}},\"model_architecture\":\"Qwen3ForCausalLM\",\"model_id\":\"Org/Teacher\",\"model_revision\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"profile_id\":\"corpus-code\",\"prompt_encoding\":\"chat_template\",\"proofs\":[{\"chunk_tokens\":32,\"exp_mismatch_threshold\":60,\"mant_mean_threshold\":40.0,\"mant_median_threshold\":40.0,\"min_allowed_failures\":0,\"mode\":\"enforce\",\"ratio_allowed_failures\":0.0,\"scheme\":\"toploc-v1\",\"topk\":128}],\"protocol_version\":9,\"sampling\":{\"do_sample\":false,\"rollouts\":16,\"temperature\":1.0,\"top_k\":0,\"top_p\":1.0},\"throughput_tiebreak\":null,\"upload_grace_seconds\":33},\"env_split\":null,\"incentive\":{\"mechanism\":\"corpus-generation\",\"params\":{\"breaker_timeouts\":3,\"cap\":0.05,\"deadband\":0.8,\"decay\":0.98,\"floor\":0.05,\"last_good_fills\":50,\"max_price_alpha_per_mtoken\":0.9,\"max_price_miner_alpha_per_period\":1000.0,\"max_price_per_token\":9.000000000000001e-10,\"max_price_set_at\":1760000000.0,\"median_rounds\":4800,\"min_incentive_ramp_start\":0.0,\"min_incentive_share\":0.0,\"rounds_per_step\":1000,\"settlement\":\"period-ema-v1\",\"snap\":1.2,\"start\":1.0}},\"job_id\":\"job-code\",\"profile_id\":\"corpus-code\",\"profile_sha256\":\"e8a01778ef720b47cf7adcbeb181725d3db4fbf8a4e2ef4919dbc1a1256f0335\",\"retired_at\":null,\"status\":\"active\",\"verification\":null},\"corpus-general\":{\"contract\":{\"collection_seconds\":100,\"environments\":{\"reliquary_general_v1\":{\"answer_format\":\"text\",\"batch_target\":16,\"bft\":null,\"environment_contract_id\":\"reliquary/checked-answer/v1\",\"environment_manifest_sha256\":\"fc874fefc78de44891b94401a77f71d1b6fb4d5048e04d7908b073eb681b84f1\",\"max_new_tokens\":16384,\"prompt_cooldown_windows\":7664,\"prompt_template\":{\"id\":\"reliquary-external-prompt-v1\",\"renderer\":\"dollar-substitution-v1\",\"sha256\":\"b9884e02699731e7bef78184a43367110454d09dffdf80865e3f8884cdeb4d96\",\"template\":\"$problem\"}}},\"model_architecture\":\"Qwen3ForCausalLM\",\"model_id\":\"Org/Teacher\",\"model_revision\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"profile_id\":\"corpus-general\",\"prompt_encoding\":\"chat_template\",\"proofs\":[{\"chunk_tokens\":32,\"exp_mismatch_threshold\":60,\"mant_mean_threshold\":40.0,\"mant_median_threshold\":40.0,\"min_allowed_failures\":0,\"mode\":\"enforce\",\"ratio_allowed_failures\":0.0,\"scheme\":\"toploc-v1\",\"topk\":128}],\"protocol_version\":9,\"sampling\":{\"do_sample\":false,\"rollouts\":16,\"temperature\":1.0,\"top_k\":0,\"top_p\":1.0},\"throughput_tiebreak\":null,\"upload_grace_seconds\":33},\"env_split\":null,\"incentive\":{\"mechanism\":\"corpus-generation\",\"params\":{\"breaker_timeouts\":3,\"cap\":0.05,\"deadband\":0.8,\"decay\":0.98,\"floor\":0.05,\"last_good_fills\":50,\"max_price_alpha_per_mtoken\":0.9,\"max_price_miner_alpha_per_period\":1000.0,\"max_price_per_token\":9.000000000000001e-10,\"max_price_set_at\":1760000000.0,\"median_rounds\":4800,\"min_incentive_ramp_start\":0.0,\"min_incentive_share\":0.0,\"rounds_per_step\":1000,\"settlement\":\"period-ema-v1\",\"snap\":1.2,\"start\":1.0}},\"job_id\":\"job-general\",\"profile_id\":\"corpus-general\",\"profile_sha256\":\"7d9bd75ac63d22a8eccc614efcb482c61001d4bf9095c94379619f09ced56500\",\"retired_at\":null,\"status\":\"active\",\"verification\":null},\"corpus-hardmath\":{\"contract\":{\"collection_seconds\":100,\"environments\":{\"reliquary_hard_math_v1\":{\"answer_format\":\"boxed\",\"batch_target\":8,\"bft\":null,\"environment_contract_id\":\"reliquary/boxed-answer/v1\",\"environment_manifest_sha256\":\"317ca1d13802c653a7e57fb7214bb5e7e780a97396b3f0e9d094e7ba3f42b478\",\"max_new_tokens\":32768,\"prompt_cooldown_windows\":2904,\"prompt_template\":{\"id\":\"reliquary-external-prompt-v1\",\"renderer\":\"dollar-substitution-v1\",\"sha256\":\"b9884e02699731e7bef78184a43367110454d09dffdf80865e3f8884cdeb4d96\",\"template\":\"$problem\"}}},\"model_architecture\":\"Qwen3ForCausalLM\",\"model_id\":\"Org/Teacher\",\"model_revision\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"profile_id\":\"corpus-hardmath\",\"prompt_encoding\":\"chat_template\",\"proofs\":[{\"chunk_tokens\":32,\"exp_mismatch_threshold\":60,\"mant_mean_threshold\":40.0,\"mant_median_threshold\":40.0,\"min_allowed_failures\":0,\"mode\":\"enforce\",\"ratio_allowed_failures\":0.0,\"scheme\":\"toploc-v1\",\"topk\":128}],\"protocol_version\":9,\"sampling\":{\"do_sample\":false,\"rollouts\":16,\"temperature\":1.0,\"top_k\":0,\"top_p\":1.0},\"throughput_tiebreak\":null,\"upload_grace_seconds\":33},\"env_split\":null,\"incentive\":{\"mechanism\":\"corpus-generation\",\"params\":{\"breaker_timeouts\":3,\"cap\":0.05,\"deadband\":0.8,\"decay\":0.98,\"floor\":0.05,\"last_good_fills\":50,\"max_price_alpha_per_mtoken\":0.9,\"max_price_miner_alpha_per_period\":1000.0,\"max_price_per_token\":9.000000000000001e-10,\"max_price_set_at\":1760000000.0,\"median_rounds\":4800,\"min_incentive_ramp_start\":0.0,\"min_incentive_share\":0.0,\"rounds_per_step\":1000,\"settlement\":\"period-ema-v1\",\"snap\":1.2,\"start\":1.0}},\"job_id\":\"job-hardmath\",\"profile_id\":\"corpus-hardmath\",\"profile_sha256\":\"d877d54ea948334a463fa3802be97b369a2229b0670222ec9a2bc45d2376ec76\",\"retired_at\":null,\"status\":\"active\",\"verification\":null},\"corpus-ifeval\":{\"contract\":{\"collection_seconds\":100,\"environments\":{\"reliquary_instruction_following_v1\":{\"answer_format\":\"text\",\"batch_target\":16,\"bft\":null,\"environment_contract_id\":\"reliquary/checked-answer/v1\",\"environment_manifest_sha256\":\"84b8698446e68e057faea54ea4045cd198c21fb6bd0a7c8fc259a7659c4e483d\",\"max_new_tokens\":8192,\"prompt_cooldown_windows\":1839,\"prompt_template\":{\"id\":\"reliquary-external-prompt-v1\",\"renderer\":\"dollar-substitution-v1\",\"sha256\":\"b9884e02699731e7bef78184a43367110454d09dffdf80865e3f8884cdeb4d96\",\"template\":\"$problem\"},\"thinking\":false}},\"model_architecture\":\"Qwen3ForCausalLM\",\"model_id\":\"Org/Teacher\",\"model_revision\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"profile_id\":\"corpus-ifeval\",\"prompt_encoding\":\"chat_template\",\"proofs\":[{\"chunk_tokens\":32,\"exp_mismatch_threshold\":60,\"mant_mean_threshold\":40.0,\"mant_median_threshold\":40.0,\"min_allowed_failures\":0,\"mode\":\"enforce\",\"ratio_allowed_failures\":0.0,\"scheme\":\"toploc-v1\",\"topk\":128}],\"protocol_version\":9,\"sampling\":{\"do_sample\":false,\"rollouts\":16,\"temperature\":1.0,\"top_k\":0,\"top_p\":1.0},\"throughput_tiebreak\":null,\"upload_grace_seconds\":33},\"env_split\":null,\"incentive\":{\"mechanism\":\"corpus-generation\",\"params\":{\"breaker_timeouts\":3,\"cap\":0.05,\"deadband\":0.8,\"decay\":0.98,\"floor\":0.05,\"last_good_fills\":50,\"max_price_alpha_per_mtoken\":0.9,\"max_price_miner_alpha_per_period\":1000.0,\"max_price_per_token\":9.000000000000001e-10,\"max_price_set_at\":1760000000.0,\"median_rounds\":4800,\"min_incentive_ramp_start\":0.0,\"min_incentive_share\":0.0,\"rounds_per_step\":1000,\"settlement\":\"period-ema-v1\",\"snap\":1.2,\"start\":1.0}},\"job_id\":\"job-ifeval\",\"profile_id\":\"corpus-ifeval\",\"profile_sha256\":\"0a8c66c2f87e870dd949fff1465cd99b317bbaa20c54ea38e1b312284b21c900\",\"retired_at\":null,\"status\":\"active\",\"verification\":null},\"corpus-science\":{\"contract\":{\"collection_seconds\":100,\"environments\":{\"reliquary_science_v1\":{\"answer_format\":\"boxed\",\"batch_target\":8,\"bft\":null,\"environment_contract_id\":\"reliquary/boxed-answer/v1\",\"environment_manifest_sha256\":\"eca7e0cc921202d4eafc640a3538832821839ed912b76f71fe7fe6112f291473\",\"max_new_tokens\":32768,\"prompt_cooldown_windows\":1359,\"prompt_template\":{\"id\":\"reliquary-external-prompt-v1\",\"renderer\":\"dollar-substitution-v1\",\"sha256\":\"b9884e02699731e7bef78184a43367110454d09dffdf80865e3f8884cdeb4d96\",\"template\":\"$problem\"}}},\"model_architecture\":\"Qwen3ForCausalLM\",\"model_id\":\"Org/Teacher\",\"model_revision\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"profile_id\":\"corpus-science\",\"prompt_encoding\":\"chat_template\",\"proofs\":[{\"chunk_tokens\":32,\"exp_mismatch_threshold\":60,\"mant_mean_threshold\":40.0,\"mant_median_threshold\":40.0,\"min_allowed_failures\":0,\"mode\":\"enforce\",\"ratio_allowed_failures\":0.0,\"scheme\":\"toploc-v1\",\"topk\":128}],\"protocol_version\":9,\"sampling\":{\"do_sample\":false,\"rollouts\":16,\"temperature\":1.0,\"top_k\":0,\"top_p\":1.0},\"throughput_tiebreak\":null,\"upload_grace_seconds\":33},\"env_split\":null,\"incentive\":{\"mechanism\":\"corpus-generation\",\"params\":{\"breaker_timeouts\":3,\"cap\":0.05,\"deadband\":0.8,\"decay\":0.98,\"floor\":0.05,\"last_good_fills\":50,\"max_price_alpha_per_mtoken\":0.9,\"max_price_miner_alpha_per_period\":1000.0,\"max_price_per_token\":9.000000000000001e-10,\"max_price_set_at\":1760000000.0,\"median_rounds\":4800,\"min_incentive_ramp_start\":0.0,\"min_incentive_share\":0.0,\"rounds_per_step\":1000,\"settlement\":\"period-ema-v1\",\"snap\":1.2,\"start\":1.0}},\"job_id\":\"job-science\",\"profile_id\":\"corpus-science\",\"profile_sha256\":\"63e32a0e485cb4876b07c26f9c2c97afb3b07655dab63359371eea9ab53acde4\",\"retired_at\":null,\"status\":\"active\",\"verification\":null},\"reliquary-rl\":{\"env_split\":null,\"incentive\":{\"mechanism\":\"rl-discovered-price\",\"params\":{\"breaker_timeouts\":3,\"cap\":0.6,\"deadband\":0.8,\"decay\":0.98,\"floor\":0.05,\"last_good_fills\":50,\"median_rounds\":4800,\"rounds_per_step\":1000,\"snap\":1.2,\"start\":1.0}},\"job_id\":null,\"profile_id\":\"qwen3-4b-base-dapo-fill-closed-v6\",\"profile_sha256\":\"1696eef2a8ff52284842f2253d6f699b50bc657dc93b20fc61a257db7d449385\",\"retired_at\":null,\"status\":\"active\",\"verification\":null}}}"
+ }
+}

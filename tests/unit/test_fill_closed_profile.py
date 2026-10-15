@@ -348,3 +348,46 @@ assert encoded_window_journal_key(43, 0) == 688
 '''
     result = subprocess.run([sys.executable, '-c', script], env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+_TEUTONIC = "teutonic-9b-reliquary-suite-v9-dev1"
+
+
+def _teutonic_constants(fill_closed: bool):
+    base_env = {
+        k: v for k, v in os.environ.items() if not k.startswith("RELIQUARY_")
+    }
+    base_env["RELIQUARY_PROTOCOL_PROFILE"] = _TEUTONIC
+    base_env["RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED"] = "1" if fill_closed else "0"
+    return subprocess.run(
+        [
+            sys.executable, "-c",
+            "from reliquary import constants as c; "
+            "print(c.FILL_CLOSED_ENABLED, c.FILL_CLOSED_TARGET_GROUPS_PER_ENV, "
+            "sorted(set(t for _, t in c.ENVIRONMENT_MIX)), len(c.ENVIRONMENT_MIX))",
+        ],
+        capture_output=True, text=True, env=base_env,
+    )
+
+
+def test_the_teutonic_suite_can_run_fill_closed_with_a_uniform_pick():
+    """The next run's service path needs fill-closed on the 9B suite. A pick
+    takes B_BATCH groups from every environment, which the active-window
+    record and its recovery enforce, so the profile's smaller per-environment
+    targets (sized for the timed window) must not reach that path."""
+    result = _teutonic_constants(fill_closed=True)
+    assert result.returncode == 0, result.stderr
+    enabled, target, targets, count = result.stdout.split()
+    profile = resolve_protocol_profile(_TEUTONIC)
+    assert enabled == "True"
+    assert int(target) == 16 * 16
+    assert targets == "[16]"
+    assert int(count) == len(profile.environments)
+
+
+def test_the_teutonic_suite_still_runs_timed_windows_without_the_flag():
+    """It also carries the corpus tasks, which never arm fill-closed."""
+    result = _teutonic_constants(fill_closed=False)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split()[0] == "False"
+    assert "[4, 8, 16]" in result.stdout

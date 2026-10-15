@@ -182,6 +182,9 @@ class SubmitTelemetry:
     legacy_merkle_computed_lead: str | None = None
     legacy_merkle_would_reject: bool | None = None
     legacy_merkle_enforced: bool | None = None
+    # The batcher's own stage of its last refusal of this submission (in memory only, never exported): the
+    # episode yield tells the validator's doing from the miner's by it.
+    batcher_reject_stage: str | None = None
 
     @classmethod
     def from_request(

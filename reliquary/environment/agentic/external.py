@@ -35,6 +35,27 @@ if TYPE_CHECKING:
 
 ARTIFACT_SCHEMA = "reliquary/environment-artifact/v1"
 
+# The tokens that end an assistant turn. A rollout that stopped on its own ends
+# in one, and both admission and the miner decode with special tokens kept, so
+# it is the last thing in the text a checker reads.
+TURN_TERMINATORS = ("<|im_end|>", "<|endoftext|>")
+
+
+def strip_turn_terminators(text: str) -> str:
+    """The answer without the terminator(s) that closed its turn.
+
+    Only trailing ones: the terminator is how the turn ended, not part of what
+    was answered, and a checker that reads the end of the answer ("ends
+    with...", JSON, last word) fails on it. A terminator inside the text stays.
+    """
+    while True:
+        for terminator in TURN_TERMINATORS:
+            if text.endswith(terminator):
+                text = text[: -len(terminator)]
+                break
+        else:
+            return text
+
 
 def _object(
     value: Any,
@@ -721,7 +742,7 @@ class ExternalAnswerEnvironment:
         if (not isinstance(index, int) or isinstance(index, bool) or index < 0
                 or problem != self.get_problem(index) or not isinstance(completion, str)):
             return 0.0
-        raw = _object(self._backend.grade(index, completion),
+        raw = _object(self._backend.grade(index, strip_turn_terminators(completion)),
                       name="external answer reward",
                       required={"reward", "success", "state_digest"})
         reward = _number(raw["reward"], name="external answer reward")
@@ -773,5 +794,6 @@ __all__ = [
     "load_external_answer_environment",
     "load_external_episode_environment",
     "score_external_answers",
+    "strip_turn_terminators",
     "verify_external_artifact",
 ]

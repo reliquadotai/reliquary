@@ -100,6 +100,30 @@ _ENV_NAME_RE = re.compile(r"\A[a-z0-9][a-z0-9_]{0,127}\Z")
 _COMMIT_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 _RENDERER_RE = re.compile(r"\Arenderers:[a-z0-9.]+@\d+\.\d+\.\d+\Z")
 
+# How an episode's environment steps are trusted. "replay" (the default, never
+# written, so every manifest that predates it hashes byte-identically): the miner
+# runs the box and grade executors replay it. "signed_sandbox": every step runs on
+# our reliquary-sandbox machines and the validator verifies the signed transcript
+# (docs/superpowers/plans/2026-10-06-catalyst-signed-episodes.md).
+EXECUTION_REPLAY = "replay"
+EXECUTION_SIGNED_SANDBOX = "signed_sandbox"
+EXECUTIONS = frozenset({EXECUTION_REPLAY, EXECUTION_SIGNED_SANDBOX})
+_EPISODE_OPTIONAL_FIELDS = ("execution", "sandbox")
+_SANDBOX_FIELDS = ("env", "env_package", "tools", "sandbox_commit", "budgets")
+SANDBOX_BUDGET_FIELDS = ("max_calls", "per_call_timeout_s", "cpu_s", "wall_s",
+                         "memory_bytes", "pids", "disk_bytes")
+# The gateway's default caps (reliquary-sandbox docs/deployment.md, EPISODE_MAX_*):
+# a job above them could never open an episode.
+_SANDBOX_BUDGET_BOUNDS = {"max_calls": 512, "per_call_timeout_s": 600, "cpu_s": 3600,
+                          "wall_s": 14400, "memory_bytes": 8 * 1024**3, "pids": 1024,
+                          "disk_bytes": 10 * 1024**3}
+# verifiers' bash harness always offers bash; edit is optional. Record 0 signs the
+# tools sorted and unique, so these are the only spellings it can carry.
+_SANDBOX_TOOL_SETS = (["bash"], ["bash", "edit"])
+# record 0's env_package for an env served through the verifiers bridge:
+# `<distribution>==<version>+g<first 16 hex of the code digest>.vfb<bridge version>`.
+_ENV_PACKAGE_SUFFIX_RE = re.compile(r"\A[^=+\s]+\+g[0-9a-f]{16}\.vfb[1-9][0-9]*\Z")
+
 
 class JobError(ValueError):
     """The manifest does not describe a job this code can run."""
@@ -154,6 +178,39 @@ class EpisodeEnv:
 
 
 @dataclass(frozen=True, slots=True)
+class SandboxBudgets:
+    """The session budgets a token carries (raised to the task's declared limits)."""
+
+    max_calls: int
+    per_call_timeout_s: int
+    cpu_s: int
+    wall_s: int
+    memory_bytes: int
+    pids: int
+    disk_bytes: int
+
+    def to_contract(self) -> dict[str, int]:
+        return {name: getattr(self, name) for name in SANDBOX_BUDGET_FIELDS}
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxSpec:
+    """What a signed-sandbox episode pins: the env name machines serve, the exact
+    `env_package` record 0 must carry, the offered tools, the reliquary-sandbox
+    commit and the session budgets."""
+
+    env: str
+    env_package: str
+    tools: tuple[str, ...]
+    sandbox_commit: str
+    budgets: SandboxBudgets
+
+    def to_contract(self) -> dict[str, Any]:
+        return {"env": self.env, "env_package": self.env_package, "tools": list(self.tools),
+                "sandbox_commit": self.sandbox_commit, "budgets": self.budgets.to_contract()}
+
+
+@dataclass(frozen=True, slots=True)
 class EpisodeSpec:
     """One agentic episode: the env, the harness and renderer that drive it,
     and its bounds. Only multi-turn jobs carry it."""
@@ -167,6 +224,8 @@ class EpisodeSpec:
     max_total_tokens: int
     # None for a suite episode: the validator replays every one itself.
     replay_fraction_failed: float | None
+    execution: str = EXECUTION_REPLAY
+    sandbox: SandboxSpec | None = None
 
     @property
     def is_suite(self) -> bool:
@@ -178,11 +237,15 @@ class EpisodeSpec:
                     "renderer": self.renderer, "max_turns": self.max_turns,
                     "max_tokens_per_turn": self.max_tokens_per_turn,
                     "max_total_tokens": self.max_total_tokens}
-        return {"env": self.env.to_contract(), "harness": self.harness,
-                "renderer": self.renderer, "verifiers": self.verifiers,
-                "max_turns": self.max_turns, "max_tokens_per_turn": self.max_tokens_per_turn,
-                "max_total_tokens": self.max_total_tokens,
-                "replay_fraction_failed": self.replay_fraction_failed}
+        contract = {"env": self.env.to_contract(), "harness": self.harness,
+                    "renderer": self.renderer, "verifiers": self.verifiers,
+                    "max_turns": self.max_turns, "max_tokens_per_turn": self.max_tokens_per_turn,
+                    "max_total_tokens": self.max_total_tokens,
+                    "replay_fraction_failed": self.replay_fraction_failed}
+        if self.execution != EXECUTION_REPLAY:
+            contract["execution"] = self.execution
+            contract["sandbox"] = self.sandbox.to_contract()
+        return contract
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,10 +426,11 @@ def _parse_filter(raw: Any) -> Filter | None:
     )
 
 
-def _fields(raw: Any, allowed: tuple[str, ...], label: str) -> Mapping[str, Any]:
+def _fields(raw: Any, allowed: tuple[str, ...], label: str,
+            optional: tuple[str, ...] = ()) -> Mapping[str, Any]:
     if not isinstance(raw, Mapping):
         raise JobError(f"{label} must be an object")
-    unknown = set(raw) - set(allowed)
+    unknown = set(raw) - set(allowed) - set(optional)
     if unknown:
         raise JobError(f"{label} has unknown fields: {sorted(unknown)}")
     missing = [f for f in allowed if f not in raw]
@@ -380,6 +444,31 @@ def _bounded_int(raw: Mapping[str, Any], field: str, low: int, high: int, label:
     if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
         raise JobError(f"{label}.{field} must be a whole number in [{low}, {high}], got {value!r}")
     return value
+
+
+def _parse_sandbox(raw: Any, package: str) -> SandboxSpec:
+    raw = _fields(raw, _SANDBOX_FIELDS, "episode.sandbox")
+    if raw["env"] != package:
+        raise JobError(f"episode.sandbox.env must be the episode's package {package!r}")
+    env_package = raw["env_package"]
+    if (not isinstance(env_package, str) or not env_package.startswith(f"{package}==")
+            or not _ENV_PACKAGE_SUFFIX_RE.match(env_package[len(package) + 2:])):
+        raise JobError("episode.sandbox.env_package must read "
+                       "'<package>==<version>+g<16 hex>.vfb<bridge version>', "
+                       "the env_package record 0 carries")
+    tools = raw["tools"]
+    if tools not in _SANDBOX_TOOL_SETS:
+        raise JobError("episode.sandbox.tools must be ['bash'] or ['bash', 'edit']")
+    commit = raw["sandbox_commit"]
+    if not isinstance(commit, str) or not _COMMIT_RE.match(commit):
+        raise JobError("episode.sandbox.sandbox_commit must be a 40-hex commit")
+    budgets_raw = _fields(raw["budgets"], SANDBOX_BUDGET_FIELDS, "episode.sandbox.budgets")
+    budgets = SandboxBudgets(**{
+        name: _bounded_int(budgets_raw, name, 1, _SANDBOX_BUDGET_BOUNDS[name],
+                           "episode.sandbox.budgets")
+        for name in SANDBOX_BUDGET_FIELDS})
+    return SandboxSpec(env=raw["env"], env_package=env_package, tools=tuple(tools),
+                       sandbox_commit=commit, budgets=budgets)
 
 
 def _parse_suite_episode(raw: Mapping[str, Any]) -> EpisodeSpec:
@@ -416,9 +505,9 @@ def _parse_suite_episode(raw: Mapping[str, Any]) -> EpisodeSpec:
 def _parse_episode(raw: Any) -> EpisodeSpec:
     if isinstance(raw, Mapping) and raw.get("harness") == SUITE_HARNESS:
         return _parse_suite_episode(raw)
-    raw = _fields(raw, _EPISODE_FIELDS, "episode")
+    raw = _fields(raw, _EPISODE_FIELDS, "episode", optional=_EPISODE_OPTIONAL_FIELDS)
     env = _fields(raw["env"], _EPISODE_ENV_FIELDS, "episode.env")
-    if env["package"] not in EPISODE_ENV_PACKAGES:
+    if not isinstance(env["package"], str) or env["package"] not in EPISODE_ENV_PACKAGES:
         raise JobError(f"episode.env.package must be one of {sorted(EPISODE_ENV_PACKAGES)}")
     if not isinstance(env["version"], str) or not _COMMIT_RE.match(env["version"]):
         raise JobError("episode.env.version must be the environment repository's 40-hex commit")
@@ -437,6 +526,18 @@ def _parse_episode(raw: Any) -> EpisodeSpec:
     fraction = raw["replay_fraction_failed"]
     if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not 0.0 <= fraction <= 1.0:
         raise JobError(f"episode.replay_fraction_failed must be in [0, 1], got {fraction!r}")
+    if "execution" in raw and raw["execution"] == EXECUTION_REPLAY:
+        raise JobError("episode.execution is written only when it is not 'replay'")
+    execution = raw.get("execution", EXECUTION_REPLAY)
+    if not isinstance(execution, str) or execution not in EXECUTIONS:
+        raise JobError(f"episode.execution must be one of {sorted(EXECUTIONS)}, got {execution!r}")
+    sandbox = None
+    if execution == EXECUTION_SIGNED_SANDBOX:
+        if "sandbox" not in raw:
+            raise JobError("a signed_sandbox episode needs episode.sandbox")
+        sandbox = _parse_sandbox(raw["sandbox"], env["package"])
+    elif "sandbox" in raw:
+        raise JobError("episode.sandbox is only for execution 'signed_sandbox'")
     episode = EpisodeSpec(
         env=EpisodeEnv(package=env["package"], version=env["version"], split=env["split"],
                        num_images=_bounded_int(env, "num_images", 1, 1000, "episode.env")),
@@ -445,6 +546,7 @@ def _parse_episode(raw: Any) -> EpisodeSpec:
         max_tokens_per_turn=_bounded_int(raw, "max_tokens_per_turn", 1, max_total, "episode"),
         max_total_tokens=max_total,
         replay_fraction_failed=float(fraction),
+        execution=execution, sandbox=sandbox,
     )
     return episode
 
@@ -465,6 +567,16 @@ def _check_episode_job(job: JobSpec) -> None:
         raise JobError("sampling.max_new_tokens must equal episode.max_tokens_per_turn")
     if job.renderer_id != episode.renderer:
         raise JobError("renderer_id must equal episode.renderer")
+    if episode.execution == EXECUTION_SIGNED_SANDBOX:
+        if episode.replay_fraction_failed != 0.0:
+            raise JobError("a signed_sandbox episode is never replayed: "
+                           "replay_fraction_failed must be 0")
+        if episode.sandbox.budgets.max_calls < episode.max_turns:
+            raise JobError("episode.sandbox.budgets.max_calls must be at least episode.max_turns")
+        if episode.env.num_images != BRIDGED_SWESMITH_IMAGES:
+            raise JobError(f"a signed_sandbox job serves SWE-smith at the "
+                           f"{BRIDGED_SWESMITH_IMAGES} images the bridge serves: "
+                           f"episode.env.num_images must be {BRIDGED_SWESMITH_IMAGES}")
     if episode.is_suite and job.prompt_source != episode.env.name:
         raise JobError("a suite episode job draws its prompts from its environment: "
                        f"prompt_source must be {episode.env.name!r}")
@@ -527,3 +639,21 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
     if job.episode is not None:
         _check_episode_job(job)
     return job
+
+
+def is_signed_sandbox(job: JobSpec) -> bool:
+    return job.episode is not None and job.episode.execution == EXECUTION_SIGNED_SANDBOX
+
+
+BRIDGED_SWESMITH_IMAGES = 20
+"""SWE-smith's image count in the split a gateway serves through the verifiers bridge
+(reliquary-swe's default)."""
+
+
+def sandbox_split(episode: EpisodeSpec) -> str:
+    """The split a session token names: reliquary-swe's `train` (SWE-smith at its default
+    20 images, the split the bridge serves)."""
+    if episode.env.num_images != BRIDGED_SWESMITH_IMAGES:
+        raise ValueError(f"a signed reliquary-swe job serves SWE-smith at "
+                         f"{BRIDGED_SWESMITH_IMAGES} images, not {episode.env.num_images}")
+    return "train"

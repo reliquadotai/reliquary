@@ -1,0 +1,374 @@
+{
+ "archive_schema_version": 2,
+ "auction_seal_drain_by_environment": {
+  "fake": {}
+ },
+ "batch": [
+  {
+   "accepted_into_pool": true,
+   "admission_commit_ms": 1.5,
+   "all_token_auth_shadow_findings": 5,
+   "all_token_auth_shadow_min_prob": 6e-07,
+   "all_token_auth_shadow_positive_findings": 2,
+   "all_token_auth_shadow_positive_min_prob": 8e-06,
+   "arrival_age_seconds": null,
+   "arrival_drand_round": null,
+   "arrival_ts": null,
+   "batch_filled_reason": null,
+   "batch_index": 0,
+   "body_read_ms": 4100.0,
+   "canonical_rank": null,
+   "claimed_checkpoint_hash": "dddddddddddddddddddddddddddddddddddddddd",
+   "code_semantic_auth_findings": 3,
+   "code_semantic_auth_min_prob": 0.0002,
+   "code_semantic_auth_positive_findings": 1,
+   "code_semantic_auth_positive_min_prob": 0.0004,
+   "decision_ts": null,
+   "difficulty_auction_arrival_drand_round": null,
+   "difficulty_auction_arrival_round_source": null,
+   "difficulty_auction_eligible": null,
+   "difficulty_auction_forensic_passed": null,
+   "difficulty_auction_forensic_sampled": false,
+   "difficulty_auction_mean_reward": null,
+   "difficulty_auction_mode": "observation_only",
+   "difficulty_auction_operator_id": null,
+   "difficulty_auction_operator_tiebreak": null,
+   "difficulty_auction_precommit_arrival_ts": null,
+   "difficulty_auction_proof_attempted": null,
+   "difficulty_auction_proof_device": null,
+   "difficulty_auction_proof_duration_seconds": null,
+   "difficulty_auction_proof_passed": null,
+   "difficulty_auction_rank": null,
+   "difficulty_auction_rank_entropy_source": null,
+   "difficulty_auction_reward_count": null,
+   "difficulty_auction_reward_std": null,
+   "difficulty_auction_selected": null,
+   "difficulty_auction_status": null,
+   "difficulty_auction_throughput_rank": null,
+   "difficulty_auction_tier": null,
+   "difficulty_auction_tier_size": null,
+   "difficulty_auction_value": null,
+   "dist_q10_min": 0.74,
+   "drand_delta": null,
+   "env_name": "fake",
+   "environment_manifest_sha256": null,
+   "eos_tokens": 5,
+   "generator_version": null,
+   "ground_truth": "a",
+   "hotkey": "alice",
+   "lp_dev_max": 0.00037,
+   "merkle_root": "abababababababababababababababababababababababababababababababab",
+   "operation_id": null,
+   "payload_bytes": 450000,
+   "payment_source": "fill_closed_fixed_group",
+   "prompt": "p",
+   "prompt_content_sha256": null,
+   "prompt_hash_lead": null,
+   "prompt_idx": 3,
+   "queue_wait_ms": 125.0,
+   "reject_reason": null,
+   "reject_stage": null,
+   "response_time": null,
+   "reward_grading_ms": 80.0,
+   "reward_shape": {},
+   "reward_vector": "",
+   "rewarded": true,
+   "rollouts": [
+    {
+     "completion_length": 4,
+     "completion_text": "text_0",
+     "eos_terminated": true,
+     "reward": 1.0,
+     "tokens": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      99
+     ]
+    },
+    {
+     "completion_length": 3,
+     "completion_text": "text_1",
+     "eos_terminated": false,
+     "reward": 1.0,
+     "tokens": [
+      1,
+      2,
+      3,
+      4,
+      5
+     ]
+    },
+    {
+     "completion_length": 3,
+     "completion_text": "text_2",
+     "eos_terminated": false,
+     "reward": 1.0,
+     "tokens": [
+      1,
+      2,
+      3,
+      4,
+      5
+     ]
+    },
+    {
+     "completion_length": 3,
+     "completion_text": "text_3",
+     "eos_terminated": false,
+     "reward": 1.0,
+     "tokens": [
+      1,
+      2,
+      3,
+      4,
+      5
+     ]
+    },
+    {
+     "completion_length": 3,
+     "completion_text": "text_4",
+     "eos_terminated": false,
+     "reward": 0.0,
+     "tokens": [
+      1,
+      2,
+      3,
+      4,
+      5
+     ]
+    },
+    {
+     "completion_length": 3,
+     "completion_text": "text_5",
+     "eos_terminated": false,
+     "reward": 0.0,
+     "tokens": [
+      1,
+      2,
+      3,
+      4,
+      5
+     ]
+    },
+    {
+     "completion_length": 3,
+     "completion_text": "text_6",
+     "eos_terminated": false,
+     "reward": 0.0,
+     "tokens": [
+      1,
+      2,
+      3,
+      4,
+      5
+     ]
+    },
+    {
+     "completion_length": 3,
+     "completion_text": "text_7",
+     "eos_terminated": false,
+     "reward": 0.0,
+     "tokens": [
+      1,
+      2,
+      3,
+      4,
+      5
+     ]
+    }
+   ],
+   "seal_trigger_round": null,
+   "selected_for_batch": true,
+   "selection_digest": "abababababababababababababababababababababababababababababababab",
+   "sigma": 0.5,
+   "sketch_diff_max": 412,
+   "submitted_drand_round": 0,
+   "target_content_sha256": "",
+   "task_difficulty": null,
+   "task_family": null,
+   "truncated_count": 0,
+   "unboxed_count": 0,
+   "upload_precommit_status": "valid"
+  }
+ ],
+ "batch_targets": {
+  "fake": 8
+ },
+ "content_selection_by_environment": {
+  "fake": {
+   "content_alignment_ok": true,
+   "content_cooldown_skips": 0,
+   "identified_candidates": 0,
+   "same_content_superseded": 0,
+   "selected_unique_contents": 0
+  }
+ },
+ "difficulty_auction": {
+  "fake": {
+   "mode": "observation_only",
+   "schema_version": 1,
+   "status": "not_computed"
+  }
+ },
+ "difficulty_auction_shadow": {
+  "fake": {
+   "mode": "observation_only",
+   "schema_version": 1,
+   "status": "not_computed"
+  }
+ },
+ "environment": "fake",
+ "environment_manifest_sha256_by_environment": {
+  "fake": null
+ },
+ "environments": [
+  "fake"
+ ],
+ "force_seal_reason": "unit",
+ "force_seal_reason_by_environment": {
+  "fake": "unit"
+ },
+ "grader_failures": {},
+ "grader_failures_by_environment": {
+  "fake": {}
+ },
+ "journal_slots": 4,
+ "late_drops": {},
+ "logical_group_dedup": {
+  "fake": {
+   "duplicate_rejects": 0,
+   "reservations": 0
+  }
+ },
+ "payment_policy": "fixed-selected-group/v1",
+ "picks_target": 4,
+ "proof_scheduler": {
+  "configured_devices": [],
+  "degraded_reasons": [],
+  "profile_id": "qwen35-2b-auction-v2",
+  "required": false,
+  "state": "disabled"
+ },
+ "randomness": "eab5f887bf5add674b25997ab9958646dc593c8c582de36f6c3c9313f5f8af29",
+ "reject_summary": {},
+ "rejected": [],
+ "reward_alignment_by_environment": {
+  "fake": {
+   "paid_unselected_groups": 0,
+   "reward_alignment_ok": true,
+   "rewarded_groups": 0,
+   "selected_groups": 0,
+   "selected_unrewarded_groups": 0
+  }
+ },
+ "rewarded_but_not_selected_by_hotkey": {},
+ "rewards_by_hotkey": {
+  "alice": 0.03125
+ },
+ "runners_up": [],
+ "selection_policy": "fifo-ingress/v1",
+ "server_reject_summary": {},
+ "task_emission_share": 1.0,
+ "task_id": "default",
+ "training_accumulator": {
+  "schema_version": 1,
+  "trained": false
+ },
+ "training_kl_reference": {
+  "behavior_logprobs": "verify_model",
+  "beta": 0.04,
+  "beta_explicit": false,
+  "device": "<MagicMock>",
+  "dtype": "<MagicMock>",
+  "grad_norm_skip_threshold": 100.0,
+  "learning_rate": 5e-06,
+  "loaded": true,
+  "mode": "rolling",
+  "parameter_count": 0,
+  "ppo_ratio_outside_clip_skip_threshold": 1.0,
+  "repo_id": null,
+  "requested_model": null,
+  "requested_revision": null,
+  "resolved_revision": null,
+  "schema_version": 1,
+  "shape_len_frac": 0.5,
+  "shape_penalty": 0.0,
+  "storage_bytes": 0,
+  "train_until_checkpoint_n": 0
+ },
+ "training_quarantine": {
+  "metrics": {},
+  "quarantined": false,
+  "reasons": []
+ },
+ "upload_precommit_conservation_by_environment": {
+  "fake": {
+   "accepted_receipts": 0,
+   "capacity_conserved": true,
+   "capacity_rejections": {},
+   "capacity_reserved": 0,
+   "conserved": true,
+   "early_close": {
+    "challenger_capacity": 32,
+    "eligible_offset_seconds": null,
+    "last_blocker": "minimum_collection",
+    "maximum_collection_seconds": 100.0,
+    "minimum_collection_seconds": 60.0,
+    "mode": "shadow",
+    "pipeline_ready": false,
+    "pipeline_ready_offset_seconds": null,
+    "primary_candidate_target": 64,
+    "quiet_seconds": 3.0,
+    "refusing_precommits": false,
+    "sealed_early": false,
+    "sealed_offset_seconds": null,
+    "strategy": "adaptive_gpu_quiet"
+   },
+   "expired": 0,
+   "fill_closed_burned_eos_tokens": 0,
+   "fill_closed_burned_groups": 0,
+   "fill_state": {
+    "admitted": {
+     "fake": 0
+    },
+    "budgets": {
+     "fake": 64
+    },
+    "closed": false,
+    "in_flight": {
+     "fake": 0
+    },
+    "picks_by_environment": {
+     "fake": 0
+    },
+    "picks_emitted": 0,
+    "picks_target": 4,
+    "proven": {
+     "fake": 0
+    }
+   },
+   "graded_batch_fill_offset_seconds": null,
+   "graded_prefix_fill_offset_seconds": null,
+   "inactive_receipts": 0,
+   "peak_pending": 0,
+   "pending": 0,
+   "pending_limit": null,
+   "productive_capacity_limit": 64,
+   "productive_capacity_used": 0,
+   "revealed": 0,
+   "revealed_terminal": 0,
+   "terminal_decisions": 0,
+   "total_limit": null
+  }
+ },
+ "validator_hotkey": "5FHk",
+ "window_opened_wall_ts_by_environment": {
+  "fake": "float"
+ },
+ "window_pool": 1.0,
+ "window_start": 1,
+ "window_status": "completed"
+}

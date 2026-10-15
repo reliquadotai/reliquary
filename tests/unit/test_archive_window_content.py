@@ -616,3 +616,52 @@ def test_aborted_window_enqueues_a_non_rewarding_tombstone(stage):
     assert archive["batch"] == []
     assert archive["rewards_by_hotkey"] == {}
     assert archive["training_accumulator"]["trained"] is False
+
+
+@pytest.mark.asyncio
+async def test_archive_reuses_problem_text_captured_at_proof_time():
+    """The archive must not re-read the dataset for a group it already graded.
+
+    A lazily-fetched dataset (math's virtual parquet) turns each re-read into
+    a remote row-group fetch on the event loop: one per paid group froze the
+    controller ~150 s per window in production.
+    """
+    from reliquary.validator.service import ValidationService
+
+    class _NoReadEnv(_FakeEnv):
+        def get_problem(self, i):
+            raise AssertionError("archive re-read the dataset")
+
+    fake_tok = MagicMock()
+    fake_tok.eos_token_id = 99
+    svc = ValidationService(
+        wallet=_FakeWallet(), model=MagicMock(), tokenizer=fake_tok,
+        env=_NoReadEnv(), netuid=99,
+    )
+    valid_sub = _valid_submission(prompt_idx=42)
+    valid_sub.archive_prompt = "question 42"
+    valid_sub.archive_ground_truth = "answer 42"
+
+    class _FakeBatcher:
+        window_start = 500
+        randomness = "abcd"
+        window_opened_at = 0.0
+        reject_counts: dict = {}
+        rejected_submissions: list = []
+        def valid_submissions(self): return [valid_sub]
+
+    captured = {}
+
+    class _StubQueue:
+        def enqueue(self, w, a):
+            captured["archive"] = a
+
+    with patch(
+        "reliquary.infrastructure.archive_queue.get_archive_queue",
+        return_value=_StubQueue(),
+    ):
+        await svc._archive_window(_FakeBatcher(), [valid_sub])
+
+    entry = captured["archive"]["batch"][0]
+    assert entry["prompt"] == "question 42"
+    assert entry["ground_truth"] == "answer 42"

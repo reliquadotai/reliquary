@@ -294,6 +294,19 @@ def test_accepted_submission_uses_validator_computed_selection_digest():
     assert accepted.selection_digest_bytes == accepted.selection_digest
 
 
+def test_accepted_submission_carries_problem_text_for_the_archive():
+    """The archive reuses this text instead of re-reading the dataset."""
+    b = _make_batcher()
+    req = _request(rewards=[1.0] * 4 + [0.0] * 4)
+
+    assert b.accept_submission(req).accepted is True
+    b.seal_batch()
+    accepted = b.valid_submissions()[0]
+    problem = b.env.get_problem(req.prompt_idx)
+    assert accepted.archive_prompt == problem["prompt"]
+    assert accepted.archive_ground_truth == problem["ground_truth"]
+
+
 def test_ingestion_resets_miner_supplied_truncated_flag():
     """`truncated` is a validator-set reward-shaping flag. A miner-supplied
     value must be wiped at ingestion so it can't clamp a losing rollout's
@@ -3337,7 +3350,7 @@ def test_accept_in_range_passes_range_gate(monkeypatch):
     assert resp.reason != RejectReason.PROMPT_OUT_OF_RANGE
 
 
-# ---- forced-seed group gate (Task 5) -------------------------------------
+# ---- forced-seed group gate ---------------------------------------------
 
 
 def _grail_with_seed_counts(n_stoch: int, n_match: int):

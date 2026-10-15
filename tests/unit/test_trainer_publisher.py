@@ -504,3 +504,157 @@ def test_storage_guard_freezes_without_mutating_hf_or_r2(tmp_path):
     assert order == ["save", "guard"]
     assert not r2.objects
     assert (tmp_path / "publication.json").is_file()
+
+
+def _count_identity_reads(monkeypatch):
+    import reliquary.trainer.publisher as publisher_module
+
+    reads = {}
+    real = publisher_module._file_identity
+
+    def counting(path):
+        reads[path.name] = reads.get(path.name, 0) + 1
+        return real(path)
+
+    monkeypatch.setattr(publisher_module, "_file_identity", counting)
+    return reads
+
+
+def test_direct_publish_hashes_each_file_once(tmp_path, monkeypatch):
+    """Each identity read is a full pass over 8 GB of weights."""
+    reads = _count_identity_reads(monkeypatch)
+    pub = _publisher(tmp_path, _R2(), [])
+    asyncio.run(
+        pub.publish(
+            object(),
+            parent_revision=FAKE_HEAD["head"],
+            checkpoint_n=5,
+            lr_schedule_step=80,
+            trained_window_cursor=30110,
+            reason="cadence",
+        )
+    )
+    assert reads and set(reads.values()) == {1}
+
+
+def test_recovery_still_detects_a_changed_snapshot(tmp_path):
+    r2 = _R2()
+    pub = _publisher(tmp_path, r2, [], hf_fails=True)
+    with pytest.raises(RuntimeError, match="hf down"):
+        asyncio.run(
+            pub.publish(
+                object(),
+                parent_revision=FAKE_HEAD["head"],
+                checkpoint_n=5,
+                lr_schedule_step=80,
+                trained_window_cursor=30110,
+                reason="cadence",
+            )
+        )
+    weights = next(tmp_path.rglob("model.safetensors"))
+    weights.write_bytes(b"tampered")
+    from reliquary.trainer.publisher import PublicationConflict
+
+    with pytest.raises(PublicationConflict, match="content changed"):
+        asyncio.run(_publisher(tmp_path, r2, []).recover_pending())
+
+
+class _OrderedR2(_R2):
+    """Records every mirror write and the manifest put, in order."""
+
+    def __init__(self, fail_on=None):
+        super().__init__()
+        self.events = []
+        self.fail_on = fail_on
+
+    def upload_file(self, path, bucket, key, Config=None):
+        if self.fail_on and key.endswith(self.fail_on):
+            self.fail_on = None
+            raise OSError("mirror interrupted")
+        super().upload_file(path, bucket, key, Config=Config)
+        self.events.append(key.rsplit("/", 1)[1])
+
+    def put_object(self, Bucket, Key, Body, **kw):
+        super().put_object(Bucket, Key, Body, **kw)
+        self.events.append(Key.rsplit("/", 1)[1])
+
+
+def _publish(pub):
+    return asyncio.run(
+        pub.publish(
+            object(),
+            parent_revision=FAKE_HEAD["head"],
+            checkpoint_n=5,
+            lr_schedule_step=80,
+            trained_window_cursor=30110,
+            reason="cadence",
+        )
+    )
+
+
+def test_manifest_is_published_before_the_weight_mirror(tmp_path, monkeypatch):
+    monkeypatch.setenv("RELIQUARY_CHECKPOINT_MIRROR_MARKER", "1")
+    """The controller needs only metadata; weights mirror off its critical path."""
+    from reliquary.trainer.publisher import MIRROR_COMPLETE
+
+    r2 = _OrderedR2()
+    _publish(_publisher(tmp_path, r2, []))
+
+    manifest_at = r2.events.index("candidate-manifest.json")
+    weights_at = r2.events.index("model.safetensors")
+    assert manifest_at < weights_at
+    assert all(
+        r2.events.index(name) < manifest_at
+        for name in r2.events
+        if name.endswith(".json") and name not in {
+            "candidate-manifest.json", MIRROR_COMPLETE,
+        }
+    )
+    assert r2.events[-1] == MIRROR_COMPLETE
+    assert checkpoint_key(REV_1, MIRROR_COMPLETE) in r2.objects
+
+
+def test_recovery_finishes_a_weight_mirror_interrupted_after_the_manifest(tmp_path, monkeypatch):
+    monkeypatch.setenv("RELIQUARY_CHECKPOINT_MIRROR_MARKER", "1")
+    from reliquary.trainer.publisher import MIRROR_COMPLETE
+
+    r2 = _OrderedR2(fail_on="model.safetensors")
+    with pytest.raises(OSError, match="mirror interrupted"):
+        _publish(_publisher(tmp_path, r2, []))
+    assert CANDIDATE_MANIFEST_KEY in r2.objects
+    assert checkpoint_key(REV_1, MIRROR_COMPLETE) not in r2.objects
+
+    recovered = asyncio.run(_publisher(tmp_path, r2, []).recover_pending())
+
+    assert recovered["revision"] == REV_1
+    assert checkpoint_key(REV_1, "model.safetensors") in r2.objects
+    assert checkpoint_key(REV_1, MIRROR_COMPLETE) in r2.objects
+    assert _staging_empty(tmp_path)
+
+
+def test_legacy_namespace_mirrors_every_file_before_the_manifest_and_no_marker(tmp_path, monkeypatch):
+    """Without the flag, on the legacy namespace: main's order, so a controller
+    of either release adopts the checkpoint."""
+    from reliquary.trainer.publisher import MIRROR_COMPLETE
+
+    monkeypatch.delenv("RELIQUARY_CHECKPOINT_MIRROR_MARKER", raising=False)
+    r2 = _OrderedR2()
+    _publish(_publisher(tmp_path, r2, []))
+
+    manifest_at = r2.events.index("candidate-manifest.json")
+    assert r2.events.index("model.safetensors") < manifest_at
+    assert r2.events[-1] == "candidate-manifest.json"
+    assert MIRROR_COMPLETE not in r2.events
+    assert checkpoint_key(REV_1, MIRROR_COMPLETE) not in r2.objects
+
+
+def test_the_marker_is_required_for_a_scoped_namespace_or_the_flag():
+    from types import SimpleNamespace
+
+    from reliquary.trainer.publisher import MIRROR_MARKER_ENV, mirror_marker_required
+
+    legacy, scoped = SimpleNamespace(scoped=False), SimpleNamespace(scoped=True)
+    assert mirror_marker_required(legacy, {}) is False
+    assert mirror_marker_required(legacy, {MIRROR_MARKER_ENV: "0"}) is False
+    assert mirror_marker_required(legacy, {MIRROR_MARKER_ENV: "1"}) is True
+    assert mirror_marker_required(scoped, {}) is True

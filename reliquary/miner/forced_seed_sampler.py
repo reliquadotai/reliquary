@@ -67,7 +67,8 @@ class ForcedSeedLogitsProcessor(LogitsProcessor):
                  checkpoint_hash: str, rollout_indices: list[int],
                  base_offsets: list[int], start_len: int,
                  temperature: float = T_PROTO, top_k: int = TOP_K_PROTO,
-                 top_p: float = TOP_P_PROTO) -> None:
+                 top_p: float = TOP_P_PROTO, seed_pool=None,
+                 seeds=None) -> None:
         self.randomness = randomness
         self.hotkey = hotkey
         self.prompt_idx = int(prompt_idx)
@@ -78,6 +79,22 @@ class ForcedSeedLogitsProcessor(LogitsProcessor):
         self.temperature = float(temperature)
         self.top_k = int(top_k)
         self.top_p = float(top_p)
+        # Public seed pool: ``seeds[i]`` is the pool seed that rollout ``i`` draws from. The
+        # draw depends on that seed and the position only, never on ``i`` or the hotkey.
+        self.seed_pool = seed_pool
+        self.seeds = None
+        if seed_pool is not None:
+            if seed_pool.prompt_idx != self.prompt_idx or seed_pool.checkpoint_hash != checkpoint_hash:
+                raise ValueError("generation context differs from the public pool")
+            if type(seeds) not in (list, tuple):
+                raise ValueError("public pool generation requires its seed indices")
+            self.seeds = tuple(seeds)
+            for index in self.rollout_indices:
+                if not 0 <= index < len(self.seeds):
+                    raise ValueError("rollout has no seed in the chosen list")
+                seed_pool.uniform(self.seeds[index], 0)  # refuses a seed outside the pool
+        elif seeds is not None:
+            raise ValueError("seeds require a public pool")
 
     def __call__(self, input_ids: torch.LongTensor,
                  scores: torch.FloatTensor) -> torch.FloatTensor:
@@ -85,8 +102,10 @@ class ForcedSeedLogitsProcessor(LogitsProcessor):
         out = torch.full_like(scores, float("-inf"))
         for r in range(scores.shape[0]):
             t = self.base_offsets[r] + s
-            u = u_at(self.randomness, self.prompt_idx,
-                     self.checkpoint_hash, self.rollout_indices[r], t)
+            u = (self.seed_pool.uniform(self.seeds[self.rollout_indices[r]], t)
+                 if self.seed_pool is not None else
+                 u_at(self.randomness, self.prompt_idx,
+                      self.checkpoint_hash, self.rollout_indices[r], t))
             probs = warp(scores[r], t=self.temperature,
                          top_k=self.top_k, top_p=self.top_p)
             out[r, pick(probs, u)] = 0.0
