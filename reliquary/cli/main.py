@@ -334,7 +334,33 @@ def build_corpus_task_entry(
     )
 
 
-def with_rl_async_params(entry, *, planned_tokens_per_period, lease_tokens_per_s=None):
+def _read_episode_envs(path):
+    if path is None:
+        return None
+    from reliquary.shared.strict_json import strict_json_loads
+
+    if path.stat().st_size > 256 * 1024:
+        raise ValueError("--rl-episode-envs exceeds 256 KiB")
+    value = strict_json_loads(path.read_bytes())
+    if not isinstance(value, dict):
+        raise ValueError("--rl-episode-envs must hold a JSON object {env: block}")
+    return value
+
+
+def _parse_lease_expiry(value):
+    if not value:
+        return None
+    out = {}
+    for item in value.split(","):
+        name, sep, seconds = item.partition("=")
+        if not sep or not name.strip():
+            raise ValueError(f"--lease-expiry: env=seconds expected, got {item!r}")
+        out[name.strip()] = float(seconds)
+    return out
+
+
+def with_rl_async_params(entry, *, planned_tokens_per_period, lease_tokens_per_s=None, episode_envs=None,
+                         lease_expiry_s=None):
     """An RL entry declared for the async protocol: paid by period (``settlement = period-ema-v1``, the weight
     setter's period EMA), its ``env_split`` as the trainer's target mix, the ``rl_*`` params of
     ``rl_async_service.rl_async_params``."""
@@ -350,7 +376,13 @@ def with_rl_async_params(entry, *, planned_tokens_per_period, lease_tokens_per_s
     if planned_tokens_per_period is None:
         raise ValueError("--rl-async needs --planned-tokens-per-period")
     extra = {} if lease_tokens_per_s is None else {"lease_tokens_per_s": lease_tokens_per_s}
-    params = rl_async_params(planned_tokens_per_period=planned_tokens_per_period, **extra)
+    params = rl_async_params(planned_tokens_per_period=planned_tokens_per_period, episode_envs=episode_envs,
+                             lease_expiry_s=lease_expiry_s, **extra)
+    for label, names in (("--rl-episode-envs", params.get("rl_episode_envs") or {}),
+                         ("--lease-expiry", params.get("rl_lease_expiry_s") or {})):
+        missing = sorted(set(names) - set(entry.env_split))
+        if missing:
+            raise ValueError(f"{label} names envs outside --env-split: {missing}")
     return replace(entry, params={**entry.params, **params})
 
 
@@ -597,6 +629,15 @@ def tasks_create(
         None, "--lease-tokens-per-s",
         help="With --rl-async: the slow reference decode speed lease expiries are cut against",
     ),
+    rl_episode_envs: Path = typer.Option(
+        None, "--rl-episode-envs",
+        help="With --rl-async: JSON file {env: {episode, catalogue?, version?}}: the signed-episode envs of the "
+        "env split (the order's episode block and public catalogue; rl_async_episodes)",
+    ),
+    lease_expiry: str = typer.Option(
+        None, "--lease-expiry",
+        help="With --rl-async: env=seconds,... lease lifetimes overriding the computed ones",
+    ),
 ) -> None:
     from reliquary.infrastructure.task_registry_store import create_task
     from reliquary.shared.task_registry import RegistryError
@@ -716,9 +757,13 @@ def tasks_create(
             raise ValueError("--ack-service-fleet requires --service-contract")
         if rl_async:
             entry = with_rl_async_params(entry, planned_tokens_per_period=planned_tokens_per_period,
-                                         lease_tokens_per_s=lease_tokens_per_s)
-        elif planned_tokens_per_period is not None or lease_tokens_per_s is not None:
-            raise ValueError("--planned-tokens-per-period and --lease-tokens-per-s need --rl-async")
+                                         lease_tokens_per_s=lease_tokens_per_s,
+                                         episode_envs=_read_episode_envs(rl_episode_envs),
+                                         lease_expiry_s=_parse_lease_expiry(lease_expiry))
+        elif (planned_tokens_per_period is not None or lease_tokens_per_s is not None or rl_episode_envs is not None
+              or lease_expiry is not None):
+            raise ValueError("--planned-tokens-per-period, --lease-tokens-per-s, --rl-episode-envs and "
+                             "--lease-expiry need --rl-async")
         asyncio.run(create_task(entry))
     except (RegistryError, ValueError) as exc:
         # Declaring the first task is the one CLI command that can stop the
@@ -3788,7 +3833,9 @@ async def _discover_rl_validator() -> tuple[str, str | None]:
 
 @app.command("mine-async")
 def mine_async(
-    environments: str = typer.Option(..., "--environments", help="Comma-separated single-turn RL environments"),
+    environments: str = typer.Option(
+        ..., "--environments", help="Comma-separated RL environments: single-turn ones on vLLM, the validator's "
+        "signed-episode ones (GET /rl/episodes) on the forced episode engine and the validator's sandboxes"),
     validator_url: str = typer.Option(
         "", "--validator-url", help="The RL validator's URL (default: the validator's axon on the metagraph)"),
     validator_hotkey: str = typer.Option(
@@ -3820,14 +3867,30 @@ def mine_async(
     max_num_seqs: int = typer.Option(256, "--max-num-seqs", help="vLLM's concurrent sequences"),
     dry_run: bool = typer.Option(False, "--dry-run", help="An in-process fake validator: no network, no wallet"),
     fake_generator: bool = typer.Option(False, "--fake-generator", help="Generate fake tokens on CPU (tests)"),
+    generate_port: int = typer.Option(8013, "--generate-port",
+                                      help="Episode envs: loopback port of the forced generate endpoint"),
+    episode_max_num_seqs: int = typer.Option(64, "--episode-max-num-seqs",
+                                             help="Episode envs: the episode engine's concurrent sequences"),
+    episode_gpu_memory_utilization: float = typer.Option(
+        0.0, "--episode-gpu-memory-utilization",
+        help="Episode envs: the episode engine's GPU share (0: --gpu-memory-utilization; split the GPU when "
+             "single-turn and episode envs are mined by one process)"),
+    harness_env: list[str] = typer.Option(
+        [], "--harness-env", help="Episode envs: KEY=VALUE for the harness (repeatable; no secrets: ps shows them)"),
+    harness_env_file: str = typer.Option(
+        "", "--harness-env-file", help="Episode envs: file of KEY=VALUE lines for the harness (its secrets)"),
     log_level: str = typer.Option("INFO", help="Log level"),
 ) -> None:
     """Mine the asynchronous RL protocol: lease prompts within the measured quota, generate 16 rollouts per lease
     on the latest checkpoint held (deltas downloaded in the background), and submit every leased group."""
+    from reliquary.miner.episode_mining import parse_harness_env
     from reliquary.miner.rl_async import AsyncMinerConfig, run_async_miner
 
     setup_logging(log_level)
     names = tuple(name.strip() for name in environments.split(",") if name.strip())
+    episode_options = {"generate_port": generate_port, "max_num_seqs": episode_max_num_seqs,
+                       "gpu_memory_utilization": episode_gpu_memory_utilization or gpu_memory_utilization,
+                       "harness_env": parse_harness_env(harness_env, env_file=harness_env_file or None) or None}
     if not dry_run and validator_url and not validator_hotkey:
         typer.echo("error: --validator-url needs --validator-hotkey (or give neither: discovery)", err=True)
         raise typer.Exit(code=2)
@@ -3863,7 +3926,7 @@ def mine_async(
             config, validator_url=validator_url.rstrip("/"), validator_hotkey=validator_hotkey, wallet=wallet,
             base_model_dir=base_model or None, work_dir=work_dir, initial_dir=initial_checkpoint or None,
             initial_version=None if initial_version < 0 else initial_version, swap=weight_swap, dry_run=dry_run,
-            fake_generator=fake_generator,
+            fake_generator=fake_generator, episode_options=episode_options,
             engine_kwargs={"gpu_memory_utilization": gpu_memory_utilization, "max_num_seqs": max_num_seqs}))
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)

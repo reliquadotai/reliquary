@@ -47,7 +47,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from reliquary.environment.grader_client import GraderInfrastructureError
-from reliquary.protocol.rl_submit import GROUP_ROLLOUTS, decode_tokens, rollouts_digest
+from reliquary.protocol.rl_submit import (
+    GROUP_ROLLOUTS, GZIP, MAX_EPISODE_SUBMIT_BODY_BYTES, MAX_SUBMIT_BODY_BYTES, decode_tokens, inflate_body,
+    rollouts_digest,
+)
 from reliquary.protocol.signatures import (
     hotkey_signature_bytes, verify_rl_lease_mine_signature, verify_rl_lease_signature, verify_rl_submit_signature,
 )
@@ -76,8 +79,8 @@ MAX_PREAUTH = 8
 MAX_TRACKED_HOTKEYS = 4096
 SUBMIT_MAX_PER_MINUTE = 600          # a submission ends a lease: the quota bounds them, this bounds the verify cost
 MINE_MAX_PER_MINUTE = 30             # a miner reads its own leases at start, not in a loop
-MAX_SUBMIT_BODY_BYTES = 8 * 1024 * 1024
 SUBMIT_BODY_TIMEOUT_S = 30.0
+EPISODE_SUBMIT_BODY_TIMEOUT_S = 120.0  # an episode body (up to MAX_EPISODE_SUBMIT_BODY_BYTES) over a slow link
 MAX_GRADING = 4                       # groups graded at once (CPU); the others wait their turn
 
 
@@ -118,7 +121,9 @@ class RlSubmitRequestBody(BaseModel):
 
 def submitted_rollouts(body: RlSubmitRequestBody, *, max_tokens: int, rollouts: int = GROUP_ROLLOUTS):
     """The group in index order as ``rl_submit.Rollout``; ValueError unless indices are exactly 0..rollouts-1 and
-    every rollout decodes (``decode_tokens``) with a well-formed span inside its completion."""
+    every rollout decodes (``decode_tokens``) with a well-formed span inside its completion, and an episode's
+    transcript is within the gateway's ``MAX_TRANSCRIPT_BYTES``."""
+    from reliquary.protocol.corpus_submission import MAX_TRANSCRIPT_BYTES
     from reliquary.validator.rl_submit import Rollout
 
     if sorted(r.index for r in body.rollouts) != list(range(rollouts)):
@@ -129,6 +134,11 @@ def submitted_rollouts(body: RlSubmitRequestBody, *, max_tokens: int, rollouts: 
         span = item.force_span
         if span is not None and not (0 <= span[0] < span[1] <= len(tokens)):
             raise ValueError("force span must lie inside the completion")
+        if item.episode is not None:
+            transcript = item.episode.get("transcript")
+            size = len(json.dumps(transcript, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+            if size > MAX_TRANSCRIPT_BYTES:
+                raise ValueError(f"rollout {item.index}: a transcript of {size} bytes (at most {MAX_TRANSCRIPT_BYTES})")
         group.append(Rollout(tokens, span, item.episode))            # an episode's spans are read strictly
     if len({r.episode is None for r in group}) > 1:
         raise ValueError("a group is all episodes or none")
@@ -220,7 +230,10 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
                           clock: Callable[[], float] = time.time, submissions=None,
                           verify_submit: Callable[..., bool] = verify_rl_submit_signature,
                           verify_mine: Callable[..., bool] = verify_rl_lease_mine_signature,
-                          pay=None) -> APIRouter:
+                          pay=None, max_episode_body_bytes: int | None = None) -> APIRouter:
+    """``max_episode_body_bytes``: the inflated ``/rl/submit`` body an episode group may send (None: no episode
+    env served; every body within ``MAX_SUBMIT_BODY_BYTES``). A single-turn group stays within
+    ``MAX_SUBMIT_BODY_BYTES`` either way. Bodies may be gzipped (``Content-Encoding: gzip``)."""
     audience = ss58_address(validator_hotkey)
     if audience is None:
         raise ValueError("validator_hotkey must be an ss58 account address")
@@ -412,16 +425,31 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
         return verify_submit(hotkey, at=request.at, lease_id=request.lease_id, rollouts_digest=digest,
                              signature=request.signature, validator_hotkey=audience, path=submit_path)
 
+    body_cap = max(MAX_SUBMIT_BODY_BYTES, int(max_episode_body_bytes or 0))
+    body_timeout = SUBMIT_BODY_TIMEOUT_S if max_episode_body_bytes is None else EPISODE_SUBMIT_BODY_TIMEOUT_S
+
     @router.post(submit_path)
     async def submit(http: Request) -> JSONResponse:
         try:
-            raw = await _read_within(http, MAX_SUBMIT_BODY_BYTES, SUBMIT_BODY_TIMEOUT_S)
+            raw = await _read_within(http, body_cap, body_timeout)
             arrived_at = float(clock())                       # the lease is judged at arrival, not after grading
+            encoding = http.headers.get("content-encoding", "").strip().lower()
+            if encoding == GZIP:
+                try:
+                    raw = await asyncio.to_thread(inflate_body, raw, cap=body_cap)
+                except OverflowError:
+                    return _refusal("body_too_large", {"max_bytes": body_cap})
+                except ValueError as exc:
+                    return _refusal("malformed_request", {"why": str(exc)})
+            elif encoding not in ("", "identity"):
+                return _refusal("malformed_request", {"why": f"unsupported content encoding {encoding!r}"})
             if preauth.locked():
                 return _refusal("lease_busy", {"max_concurrent": MAX_PREAUTH}, retry_s)
             async with preauth:
                 request, hotkey = await authenticate(raw, RlSubmitRequestBody, check_submit, recent_submits,
                                                      SUBMIT_MAX_PER_MINUTE)
+            if len(raw) > MAX_SUBMIT_BODY_BYTES and all(r.episode is None for r in request.rollouts):
+                return _refusal("body_too_large", {"max_bytes": MAX_SUBMIT_BODY_BYTES})   # a single-turn group
             try:
                 group = await asyncio.to_thread(submitted_rollouts, request, max_tokens=MAX_NEW_TOKENS_PROTOCOL_CAP,
                                                 rollouts=submissions.config.rollouts)

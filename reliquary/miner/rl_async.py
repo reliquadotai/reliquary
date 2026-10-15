@@ -340,7 +340,25 @@ class HttpRlTransport:
         body["signature"] = self._sign(build_rl_submit_binding(
             hotkey=self.hotkey, at=at, lease_id=str(payload["lease_id"]), rollouts_digest=submission_digest(payload),
             validator_hotkey=self.validator_hotkey, path=path))
+        if any(r.get("episode") is not None for r in payload.get("rollouts", ())):
+            # 16 signed transcripts: sent gzipped (``protocol/rl_submit``: the validator inflates within its cap).
+            from reliquary.protocol.rl_submit import GZIP, gzip_body
+
+            raw = json.dumps(body, separators=(",", ":")).encode("utf-8")
+            content = await asyncio.to_thread(gzip_body, raw)
+            return await self._call("POST", path, content=content,
+                                    headers={"Content-Type": "application/json", "Content-Encoding": GZIP})
         return await self._call("POST", path, json=body)
+
+    async def episodes(self) -> dict:
+        """``GET /rl/episodes``: the validator's episode envs (their blocks), ``{}`` when it serves none."""
+        try:
+            answer = await self._call("GET", f"{self._prefix}/episodes")
+        except RequestRefused as exc:
+            if exc.reason == "404":
+                return {}
+            raise
+        return dict(answer.get("environments") or {})
 
     async def my_leases(self) -> dict:
         from reliquary.protocol.signatures import build_rl_lease_mine_binding
@@ -1010,7 +1028,8 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
                           base_model_dir: str | None = None, work_dir: str, initial_dir: str | None = None,
                           initial_version: int | None = None, swap: str = "push", dry_run: bool = False,
                           fake_generator: bool = False, engine_kwargs: Mapping[str, Any] | None = None,
-                          prompt_ranges: Mapping[str, tuple[int, int]] | None = None) -> None:
+                          prompt_ranges: Mapping[str, tuple[int, int]] | None = None,
+                          episode_options: Mapping[str, Any] | None = None) -> None:
     """Build the transport, generator, planners and checkpoint follower, and run until interrupted."""
     import httpx
 
@@ -1019,41 +1038,18 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
     from reliquary.shared.ckpt_delta import load_anchor_shards
 
     model_files = Path(work_dir) / "model-files"     # the anchors' HF config and tokenizer (CheckpointSync)
-    ranges = dict(prompt_ranges or {})
-    for name in config.environments:
-        if name not in ranges:
-            from reliquary.environment import load_environment
-            from reliquary.protocol.rl_prompt_ranges import rl_prompt_range
-
-            ranges[name] = rl_prompt_range(name, len(load_environment(name)))
-    planners = {name: PromptPlanner(name, ranges[name]) for name in config.environments}
-    if fake_generator:
-        generator: GroupGenerator = FakeGroupGenerator()
-    else:
-        # The config and tokenizer files: --base-model, else the initial checkpoint's directory, else the ones the
-        # anchors carry (synced on the first checkpoint).
-        if not base_model_dir and initial_dir is not None and (Path(initial_dir) / "config.json").is_file():
-            base_model_dir = initial_dir
-        if not base_model_dir and dry_run:
-            raise ValueError("a dry run needs --base-model or a full --initial-checkpoint (config and tokenizer)")
-        generator = VllmGroupGenerator(base_model_dir=base_model_dir or str(model_files), work_dir=work_dir,
-                                       swap=swap, engine_kwargs=engine_kwargs)
-    state, loaded = None, None
-    if initial_dir is not None:
-        if initial_version is None:
-            raise ValueError("--initial-version is required with --initial-checkpoint")
-        state = load_anchor_shards(sorted(Path(initial_dir).glob("*.safetensors")))
-        generator.load_weights(state, int(initial_version))
-        loaded = int(initial_version)
-    elif dry_run and fake_generator:
-        generator.load_weights({}, 0)
-        loaded = 0
-    elif dry_run:
+    # The config and tokenizer files: --base-model, else the initial checkpoint's directory, else the ones the
+    # anchors carry (synced on the first checkpoint).
+    if not base_model_dir and initial_dir is not None and (Path(initial_dir) / "config.json").is_file():
+        base_model_dir = initial_dir
+    if initial_dir is not None and initial_version is None:
+        raise ValueError("--initial-version is required with --initial-checkpoint")
+    if dry_run and not fake_generator and initial_dir is None:
         raise ValueError("a dry run generates on --initial-checkpoint (or --fake-generator): it fetches nothing")
     async with contextlib.AsyncExitStack() as stack:
         if dry_run:
             transport: RlTransport = DryRunTransport()
-            sync, weights = None, None
+            sync, weights, blocks = None, None, {}
         else:
             client = await stack.enter_async_context(httpx.AsyncClient(timeout=60.0))
             hotkey = wallet.hotkey.ss58_address
@@ -1063,14 +1059,78 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
             sync = CheckpointSync(validator_hotkey=validator_hotkey, work_dir=Path(work_dir) / "ckpt-download",
                                   model_dir=model_files)
             weights = PayWeights(validator_url).weights
+            # The validator's signed-episode envs (their blocks: policy, catalogue); played by the episode stack.
+            blocks = {name: block for name, block in (await transport.episodes()).items()
+                      if name in config.environments}
+        generator = await asyncio.to_thread(
+            miner_generator, config, blocks=blocks, fake_generator=fake_generator, dry_run=dry_run,
+            base_model_dir=base_model_dir or str(model_files), work_dir=work_dir, swap=swap,
+            engine_kwargs=engine_kwargs, validator_url=validator_url, validator_hotkey=validator_hotkey,
+            wallet=wallet, episode_options=episode_options)
+        closer = getattr(getattr(getattr(generator, "episodes", None), "host", None), "close", None)
+        if closer is not None:
+            stack.push_async_callback(closer)
+        ranges = dict(prompt_ranges or {})
+        sources = getattr(getattr(generator, "episodes", None), "sources", None) or {}
+        for name in config.environments:
+            if name in ranges:
+                continue
+            if name in sources:
+                ranges[name] = (0, len(sources[name]))         # an episode env: its whole taskset (the validator's)
+                continue
+            from reliquary.environment import load_environment
+            from reliquary.protocol.rl_prompt_ranges import rl_prompt_range
+
+            ranges[name] = rl_prompt_range(name, len(load_environment(name)))
+        planners = {name: PromptPlanner(name, ranges[name]) for name in config.environments}
+        state, loaded = None, None
+        if initial_dir is not None:
+            state = load_anchor_shards(sorted(Path(initial_dir).glob("*.safetensors")))
+            await asyncio.to_thread(generator.load_weights, state, int(initial_version))
+            loaded = int(initial_version)
+        elif dry_run:
+            generator.load_weights({}, 0)
+            loaded = 0
         miner = AsyncMiner(config, transport=transport, generator=generator, planners=planners,
                            checkpoint_sync=sync, loaded_version=loaded, state=state, env_weights=weights)
         await miner.run()
 
 
+def miner_generator(config: AsyncMinerConfig, *, blocks: Mapping[str, Any], fake_generator: bool = False,
+                    dry_run: bool = False, base_model_dir: str, work_dir: str, swap: str = "push",
+                    engine_kwargs: Mapping[str, Any] | None = None, validator_url: str = "",
+                    validator_hotkey: str = "", wallet=None, episode_options: Mapping[str, Any] | None = None,
+                    build_episodes=None, build_single=None) -> GroupGenerator:
+    """The miner's generator: the vLLM group generator for its single-turn envs, the episode stack
+    (``rl_async_episodes.build_episode_generator``) for the validator's signed-episode envs (``blocks``), both under
+    one ``MixedGenerator`` when the miner mines both (they share the GPU: split ``--gpu-memory-utilization``).
+    Blocking (an episode env loads its package and its taskset)."""
+    if fake_generator:
+        return FakeGroupGenerator()
+    if dry_run and not (Path(base_model_dir) / "config.json").is_file():
+        raise ValueError("a dry run needs --base-model or a full --initial-checkpoint (config and tokenizer)")
+    singles = [name for name in config.environments if name not in blocks]
+    single = None
+    if singles:
+        single = (build_single or VllmGroupGenerator)(base_model_dir=base_model_dir, work_dir=work_dir, swap=swap,
+                                                      engine_kwargs=engine_kwargs)
+        if not blocks:
+            return single
+    from reliquary.miner.rl_async_episodes import MixedGenerator, build_episode_generator
+
+    options = dict(episode_options or {})
+    episodes = (build_episodes or build_episode_generator)(
+        dict(blocks), validator_url=validator_url, validator_hotkey=validator_hotkey,
+        hotkey=wallet.hotkey.ss58_address, sign_binding=lambda binding: wallet.hotkey.sign(binding).hex(),
+        base_model_dir=base_model_dir, work_dir=work_dir, **options)
+    logger.info("episode envs %s played on the forced episode engine%s", sorted(blocks),
+                f"; single-turn envs {singles} on vLLM" if singles else "")
+    return MixedGenerator(episodes=episodes, single=single)
+
+
 __all__ = [
     "AsyncMiner", "AsyncMinerConfig", "DryRunTransport", "FakeGroupGenerator", "GroupGenerator", "HeldLease",
     "HttpRlTransport", "PromptPlanner", "PromptRecord", "RequestRefused", "RlTransport", "VllmGroupGenerator",
-    "default_priority", "draw_context", "encode_submission", "run_async_miner", "submission_digest",
+    "default_priority", "draw_context", "encode_submission", "miner_generator", "run_async_miner", "submission_digest",
     "submission_rollouts", "write_hf_dir",
 ]

@@ -347,6 +347,8 @@ async def list_machines(**client_kwargs) -> list[dict]:
 SESSION_PREFIX = "reliquary/sandbox/sessions/"
 # The RL validator's sessions, apart from the corpus validator's (neither restores the other's).
 RL_SESSION_PREFIX = "reliquary/sandbox/rl-sessions/"
+# The async RL validator's lease sessions (engagement ``rl_lease``): neither window mode nor the corpus restores them.
+RL_LEASE_SESSION_PREFIX = "reliquary/sandbox/rl-lease-sessions/"
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _DAY = 86400
 

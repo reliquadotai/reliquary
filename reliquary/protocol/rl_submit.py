@@ -13,6 +13,13 @@ validator's prompt render (model turns, tool observations and renderer markup), 
 ``transcript`` the gateway-signed session transcript whose token names the engagement
 ``rl-lease:{lease_id}:{index}``. The digest binds the episode by ``episode_digest``; a single-turn rollout's
 digest is unchanged.
+
+Body size (``/rl/submit``). A single-turn group's body is at most ``MAX_SUBMIT_BODY_BYTES`` (8 MiB). An episode
+group carries 16 signed transcripts (each up to the gateway's ``MAX_TRANSCRIPT_BYTES``): its body may reach
+``MAX_EPISODE_SUBMIT_BODY_BYTES`` (64 MiB) once inflated, on a validator serving episode envs. The miner sends an
+episode group gzipped (``Content-Encoding: gzip``, ``gzip_body``; transcripts are JSON and compress well); the
+validator inflates it within the cap (``inflate_body``: no decompression bomb). The signature is over the
+rollouts, never over the encoding.
 """
 from __future__ import annotations
 
@@ -25,6 +32,9 @@ import zlib
 from array import array
 
 GROUP_ROLLOUTS = 16          # design §4.4: 16 draws per lease, all submitted (the new run's profile)
+MAX_SUBMIT_BODY_BYTES = 8 * 1024 * 1024
+MAX_EPISODE_SUBMIT_BODY_BYTES = 64 * 1024 * 1024
+GZIP = "gzip"
 _TOKEN_BYTES = 4
 _DIGEST_DOMAIN = b"reliquary/rl-submit-rollouts/v1"
 _EPISODE_DOMAIN = b"reliquary/rl-submit-episode/v1"
@@ -93,6 +103,26 @@ def episode_spans(episode, completion_length: int) -> tuple[tuple[int, int], ...
     return tuple(spans)
 
 
+def gzip_body(raw: bytes) -> bytes:
+    import gzip
+
+    return gzip.compress(raw, compresslevel=6, mtime=0)
+
+
+def inflate_body(raw: bytes, *, cap: int) -> bytes:
+    """A gzip body inflated, ValueError when it is not one gzip stream or inflates past ``cap`` bytes."""
+    inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        out = inflater.decompress(raw, cap + 1)
+    except zlib.error as exc:
+        raise ValueError("the body is not gzip") from exc
+    if len(out) > cap or inflater.unconsumed_tail:
+        raise OverflowError(f"the body inflates past {cap} bytes")
+    if not inflater.eof or inflater.unused_data:
+        raise ValueError("the body is not exactly one gzip stream")
+    return out
+
+
 def rollouts_digest(rollouts) -> bytes:
     """What the miner signs: ``rollouts`` as sent, (index, encoded tokens, force span or None[, episode or None])
     in index order."""
@@ -111,5 +141,6 @@ def rollouts_digest(rollouts) -> bytes:
     return h.digest()
 
 
-__all__ = ["EPISODE_KEYS", "GROUP_ROLLOUTS", "decode_tokens", "encode_tokens", "episode_digest", "episode_spans",
+__all__ = ["EPISODE_KEYS", "GROUP_ROLLOUTS", "GZIP", "MAX_EPISODE_SUBMIT_BODY_BYTES", "MAX_SUBMIT_BODY_BYTES",
+           "decode_tokens", "encode_tokens", "episode_digest", "episode_spans", "gzip_body", "inflate_body",
            "rollouts_digest"]

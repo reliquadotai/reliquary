@@ -14,6 +14,12 @@ One process on the controller, like the corpus validator: no window, batcher or 
   ``RELIQUARY_RL_TRAINER_BIND`` (``host:port``, default ``127.0.0.1:8889``: reach it over a private interface or
   an SSH tunnel), never on the public port: the detached async trainer (``reliquary train-async``, its own GPU box
   as today) takes groups from the buffer, reports them, adopts the checkpoints it publishes and feeds the prices.
+* **Episodes** (``rl_async_episodes``): the task's ``params.rl_episode_envs`` (the order's episode block and
+  catalogue, per env) make those envs signed-episode envs: the sandbox side (``wire_episode_sandbox``: token key,
+  machine directory and fleet, session issuer over ``RlLeaseEngagements``, ``/rl/sandbox/sessions`` routes) and one
+  ``LeaseEpisodeChecker`` per env in the grader; ``GET /rl/episodes`` serves the blocks to miners; an episode env's
+  lease lifetime includes the session's wall budget; ``/rl/submit`` takes gzipped bodies up to 64 MiB inflated
+  for episode groups (8 MiB for single-turn ones).
 * **Discovery:** with ``--external-ip`` the validator serves its axon at start, as the window validator does, so
   ``mine-async`` finds it on the metagraph (``--validator-url`` stays an override).
 * **Loops** (``rl_async_loops``): the scan log's publication (``rl_observations``, a segment per 60 s into
@@ -85,9 +91,15 @@ def rl_mode(env: Mapping[str, str] = os.environ) -> str:
 
 def rl_async_params(*, planned_tokens_per_period: float, lease_tokens_per_s: float = DEFAULT_LEASE_TOKENS_PER_S,
                     lease_margin: float = DEFAULT_LEASE_MARGIN, tick_s: float | None = None,
-                    overflow_groups: int | None = None) -> dict:
-    """The params an async task adds to its registry entry (pay by period: ``settlement = period-ema-v1``)."""
+                    overflow_groups: int | None = None, episode_envs: Mapping[str, Any] | None = None,
+                    lease_expiry_s: Mapping[str, float] | None = None) -> dict:
+    """The params an async task adds to its registry entry (pay by period: ``settlement = period-ema-v1``).
+    ``episode_envs``: the signed-episode envs' blocks (``rl_async_episodes``: episode, catalogue?, version?);
+    ``lease_expiry_s``: per-env lease lifetimes overriding the computed ones."""
     from reliquary.shared.task_registry import SETTLEMENT_PERIOD_EMA
+    from reliquary.validator.rl_async_episodes import (
+        EPISODE_ENVS_PARAM, LEASE_EXPIRY_PARAM, episode_blocks, expiry_overrides,
+    )
 
     if not (planned_tokens_per_period > 0 and lease_tokens_per_s > 0 and lease_margin >= 1):
         raise ValueError("planned tokens and lease speed must be positive, the margin at least 1")
@@ -98,6 +110,10 @@ def rl_async_params(*, planned_tokens_per_period: float, lease_tokens_per_s: flo
         params[PRICE_TICK_PARAM] = float(tick_s)
     if overflow_groups is not None:
         params[OVERFLOW_PARAM] = int(overflow_groups)
+    if episode_envs:
+        params[EPISODE_ENVS_PARAM] = episode_blocks({EPISODE_ENVS_PARAM: episode_envs})
+    if lease_expiry_s:
+        params[LEASE_EXPIRY_PARAM] = expiry_overrides({LEASE_EXPIRY_PARAM: lease_expiry_s})
     return params
 
 
@@ -110,6 +126,12 @@ class RlAsyncSettings:
     planned_tokens_per_period: float
     lease_expiry_s: Mapping[str, float]
     price: Any = None                           # AsyncPriceParams (None: the defaults)
+    episodes: Mapping[str, Any] = field(default_factory=dict)   # env -> its validated episode block (§4.10)
+
+    def episode_policies(self) -> dict:
+        from reliquary.validator.rl_async_episodes import episode_policies
+
+        return episode_policies(self.episodes)
 
 
 def rl_async_settings(entry, cap: float, *, run: str | None = None,
@@ -117,6 +139,9 @@ def rl_async_settings(entry, cap: float, *, run: str | None = None,
     """An async task's settings from its registry entry. ValueError when the entry was not declared for it."""
     from reliquary.validator import corpus_periods as cp
     from reliquary.validator.rl_price import AsyncPriceParams
+    from reliquary.validator.rl_async_episodes import (
+        episode_blocks, episode_lease_expiry_s, episode_policies, expiry_overrides,
+    )
     from reliquary.validator.rl_leases import lease_expiry_s
 
     params = dict(entry.params)
@@ -132,14 +157,23 @@ def rl_async_settings(entry, cap: float, *, run: str | None = None,
     targets = {str(env): float(share) for env, share in entry.env_split.items() if float(share) > 0}
     speed = float(params.get(LEASE_SPEED_PARAM, DEFAULT_LEASE_TOKENS_PER_S))
     margin = float(params.get(LEASE_MARGIN_PARAM, DEFAULT_LEASE_MARGIN))
-    expiry = {env: lease_expiry_s(max_tokens=int(max_tokens(env)), reference_tokens_per_s=speed, margin=margin)
+    blocks = episode_blocks(params, targets)
+    policies = episode_policies(blocks)
+    expiry = {env: (episode_lease_expiry_s(policies[env], reference_tokens_per_s=speed, margin=margin)
+                    if env in policies else
+                    lease_expiry_s(max_tokens=int(max_tokens(env)), reference_tokens_per_s=speed, margin=margin))
               for env in targets}
+    overrides = expiry_overrides(params)
+    unknown = sorted(set(overrides) - set(targets))
+    if unknown:
+        raise ValueError(f"lease expiry overrides for envs outside the env_split: {unknown}")
+    expiry.update(overrides)
     price = AsyncPriceParams(**{key: cast(params[name]) for key, name, cast in (
         ("tick_s", PRICE_TICK_PARAM, float), ("overflow_groups", OVERFLOW_PARAM, int)) if name in params})
     return RlAsyncSettings(task_id=str(entry.task_id), cap=float(cap),
                            run=run or os.environ.get(RUN_ENV) or str(entry.task_id), targets=targets,
                            planned_tokens_per_period=float(params[PLANNED_TOKENS_PARAM]), lease_expiry_s=expiry,
-                           price=price)
+                           price=price, episodes=blocks)
 
 
 @dataclass
@@ -153,6 +187,7 @@ class RlAsync:
     prices: Any
     board: Any = None
     observations: Any = None                    # rl_observations.ObservationBoard (None: /rl/observations 503s)
+    sandbox: Any = None                         # rl_async_episodes.RlLeaseSandbox (episode envs only)
 
     def close(self) -> None:
         self.book.close()
@@ -302,7 +337,7 @@ def mount_rl_async(server, rl: RlAsync, *, validator_hotkey: str, registration=N
 
     router = build_rl_lease_router(book=rl.book, collector=rl.collector, validator_hotkey=validator_hotkey,
                                    registration=registration, clock=clock, submissions=rl.submissions,
-                                   pay=rl.ledger)
+                                   pay=rl.ledger, max_episode_body_bytes=episode_body_cap(rl.settings))
 
     @router.get("/rl/checkpoint")
     async def rl_checkpoint():
@@ -312,7 +347,33 @@ def mount_rl_async(server, rl: RlAsync, *, validator_hotkey: str, registration=N
     async def rl_observations(after: str = "0"):
         return await rl_observations_response(rl.observations, after)
 
+    if rl.settings.episodes:
+        from fastapi.responses import JSONResponse as _Json
+
+        from reliquary.validator.rl_async_episodes import episodes_answer
+
+        answer = episodes_answer(rl.settings.episodes, rl.settings.lease_expiry_s)
+
+        @router.get("/rl/episodes")
+        async def rl_episodes():
+            """The episode envs' blocks this validator grades with (``rl_async_episodes``): the miner builds its
+            policies and task prompts from them."""
+            return _Json(content=answer, headers={"Cache-Control": "max-age=60"})
+
     server.mount_rl_lease_router(router)
+    if rl.sandbox is not None:
+        for sessions in rl.sandbox.routers:
+            server.mount_rl_lease_router(sessions)
+
+
+def episode_body_cap(settings: RlAsyncSettings) -> int | None:
+    """The inflated ``/rl/submit`` body an episode group may send (None: no episode env, the single-turn cap):
+    16 transcripts at their largest plus the tokens, at most ``MAX_EPISODE_SUBMIT_BODY_BYTES``."""
+    if not settings.episodes:
+        return None
+    from reliquary.validator.rl_lease_routes import MAX_EPISODE_SUBMIT_BODY_BYTES
+
+    return MAX_EPISODE_SUBMIT_BODY_BYTES
 
 
 # --- the verify model at the latest checkpoint -----------------------------------------------------------------
@@ -423,8 +484,10 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
 
 
 # --- the process --------------------------------------------------------------------------------------------------
-def _grader_for(names, checkpoint: str, load_kwargs: Mapping[str, Any]):
-    """The submission grader and the env prompt ranges, from the run's tokenizer and model config."""
+def _grader_for(names, checkpoint: str, load_kwargs: Mapping[str, Any], episodes: Mapping[str, Any] | None = None):
+    """The submission grader and the env prompt ranges, from the run's tokenizer and model config. ``episodes``:
+    the signed-episode envs as loaded (``rl_async_episodes.load_episode_environment``): graded by their checkers
+    (``GroupGrader.add_episodes``, once the sandbox side is built), prompt range = their whole taskset."""
     from types import SimpleNamespace
 
     from transformers import AutoConfig, GenerationConfig
@@ -447,12 +510,51 @@ def _grader_for(names, checkpoint: str, load_kwargs: Mapping[str, Any]):
         canonical, think_close = force_close_token_ids(tokenizer), think_close_token_ids(tokenizer)
     except Exception:
         canonical, think_close = (), ()
-    environments = {name: load_environment(name) for name in names}
+    episodes = dict(episodes or {})
+    environments = {name: load_environment(name) for name in names if name not in episodes}
     vocab = getattr(config, "vocab_size", None) or getattr(getattr(config, "text_config", None), "vocab_size", None)
     grader = GroupGrader(environments, tokenizer, eos_token_ids=sorted(eos), think_close_ids=think_close,
                          canonical_force_ids=canonical, vocab_size=vocab)
     ranges = {name: rl_prompt_range(name, len(env)) for name, env in environments.items()}
+    ranges.update({name: (0, len(env)) for name, env in episodes.items()})
     return grader, ranges
+
+
+def load_episode_environments(settings: RlAsyncSettings, *, build_source=None) -> dict:
+    """Each episode env of ``settings`` as loaded (blocking: packages and tasksets)."""
+    from reliquary.validator.rl_async_episodes import load_episode_environment
+
+    return {name: load_episode_environment(name, block, build_source=build_source)
+            for name, block in settings.episodes.items()}
+
+
+def renderer_for_checkpoint(checkpoint: str) -> Callable[[Any], Any]:
+    """The turn renderer of the run's tokenizer over a policy's tools (the window validator's, one per tool set)."""
+    renderers: dict[tuple, Any] = {}
+
+    def renderer_for(policy):
+        from reliquary.environment.agentic_swe import load_turn_renderer
+
+        tools = tuple(policy.tools)
+        if tools not in renderers:
+            renderers[tools] = load_turn_renderer(str(checkpoint), tools=tools)
+        return renderers[tools]
+
+    return renderer_for
+
+
+def wire_episode_sandbox(rl: RlAsync, config, *, validator_hotkey: str, environments: Mapping[str, Any],
+                         renderer_for: Callable[[Any], Any], registration=None, **kwargs):
+    """The signed-sandbox side of the episode envs (``rl_async_episodes.build_rl_lease_sandbox`` over the lease
+    book) on ``rl``: its checkers grade the episode envs' groups. ``kwargs``: the builder's (tests: fakes)."""
+    from reliquary.validator.rl_async_episodes import build_rl_lease_sandbox
+
+    sandbox = build_rl_lease_sandbox(config, validator_hotkey=validator_hotkey, lease_book=rl.book,
+                                     environments=environments, policies=rl.settings.episode_policies(),
+                                     renderer_for=renderer_for, registration=registration, **kwargs)
+    rl.submissions.grader.add_episodes(sandbox.checkers)
+    rl.sandbox = sandbox
+    return sandbox
 
 
 def index_signer_for(wallet, signer_client=None):
@@ -528,7 +630,17 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     token = os.environ.get(TRAINER_TOKEN_ENV, "").strip()
     bind = trainer_bind() if token else None
     validator_hotkey = wallet.hotkey.ss58_address
-    grader, ranges = await asyncio.to_thread(_grader_for, list(settings.targets), checkpoint, load_kwargs)
+    sandbox_config = None
+    if settings.episodes:
+        from reliquary.validator.sandbox_wiring import SandboxValidatorConfig
+
+        sandbox_config = SandboxValidatorConfig.from_env()
+        if sandbox_config is None:
+            raise ValueError("set RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE and RELIQUARY_SANDBOX_VALIDATOR_KEY_ID to "
+                             f"serve the signed-episode envs {sorted(settings.episodes)}")
+    episode_envs = await asyncio.to_thread(load_episode_environments, settings)
+    grader, ranges = await asyncio.to_thread(_grader_for, list(settings.targets), checkpoint, load_kwargs,
+                                             episode_envs)
     state_dir = _validator_state_dir()
     state_dir.mkdir(parents=True, exist_ok=True)
     rl = build_rl_async(settings, path=state_dir / DB_NAME, grader=grader, prompt_range=ranges)
@@ -555,11 +667,19 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
         registered = RegisteredHotkeys(load=lambda: load_registered_hotkeys(netuid))
         if not await registered.refresh():
             logger.warning("subnet registrations unknown at start; miners get 503 until they load")
+    if settings.episodes:
+        wire_episode_sandbox(rl, sandbox_config, validator_hotkey=validator_hotkey, environments=episode_envs,
+                             renderer_for=renderer_for_checkpoint(checkpoint),
+                             registration=None if registered is None else registered.reason,
+                             require_resources=True)
+        await rl.sandbox.start()
     server = ValidatorServer(http_host, http_port, emission_cap=cap)
     mount_rl_async(server, rl, validator_hotkey=validator_hotkey,
                    registration=None if registered is None else registered.reason)
     archives = R2PeriodArchives(guard=R2Archives(served=lambda: (settings.task_id,), served_only=True))
     background = rl_async_loops(rl, archives=archives, audit_model=audit_model, publisher=publisher)
+    if rl.sandbox is not None:
+        background.extend(rl.sandbox.background())
     if registered is not None:
         background.append(registered.refresh_forever())
     if bind is not None:
@@ -582,6 +702,11 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
                                          access_log=False, timeout_keep_alive=15))
 
     async def cleanup() -> None:
+        if rl.sandbox is not None:
+            try:
+                await rl.sandbox.stop()
+            except Exception:
+                logger.exception("rl lease sessions not drained at shutdown")
         await publisher.close()
         await asyncio.to_thread(rl.close)
 
@@ -593,5 +718,6 @@ __all__ = [
     "PLANNED_TOKENS_PARAM", "PRICE_TICK_PARAM", "RL_MODE_ENV", "RUN_ENV", "RlAsync", "RlAsyncSettings",
     "TRAINER_BIND_ENV", "TRAINER_TOKEN_ENV", "WINDOW", "audit_source", "build_rl_async", "build_rl_trainer_app",
     "build_rl_trainer_router", "index_signer_for", "mount_rl_async", "rl_async_loops", "rl_async_params",
-    "rl_async_settings", "rl_mode", "run_rl_async_validator", "trainer_bind",
+    "episode_body_cap", "load_episode_environments", "renderer_for_checkpoint", "rl_async_settings", "rl_mode",
+    "run_rl_async_validator", "trainer_bind", "wire_episode_sandbox",
 ]

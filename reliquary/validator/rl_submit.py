@@ -177,6 +177,13 @@ class GroupGrader:
             think_close_ids=tuple(think_close_ids), bootstrap=False, enforce_envelope_signature=False,
             enforce_legacy_merkle=False) for name in environments}
 
+    def add_episodes(self, checkers: Mapping[str, Any]) -> None:
+        """The episode envs' checkers, once the sandbox side that verifies their transcripts is built."""
+        for name in checkers:
+            if name in self.environments or get_environment_spec(name).interaction_mode != "signed_episode":
+                raise ValueError(f"{name}: not a signed-episode environment")
+        self.episodes.update(checkers)
+
     def grade_episodes(self, lease, rollouts: Sequence[Rollout], *, received: float) -> Graded:
         """A lease's episodes (signed transcripts, model spans): ``LeaseEpisodeChecker.grade``. Tokens are checked
         against the vocabulary here, as for a single-turn group."""

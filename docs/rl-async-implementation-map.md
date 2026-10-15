@@ -824,15 +824,14 @@ Everything below needs a GPU testbed (P8 qualification) unless marked otherwise.
   below): following the deltas on the card next to the proof replicas (memory: one more bf16 copy plus the CPU
   state) and the audit throughput (probation audits 100 % of a newcomer's out-of-zone groups; one worker forward
   at a time, batch 1). Without either every audit is inconclusive (first scans unpaid).
-- Lease expiry (`rl_lease_reference_tokens_per_s`, margin) and starting quota numbers.
-- Not GPU, still open: multi-turn envs (P3 grades single-turn only). Done since: the scan log on R2, discovery and
-  the trainer listener (`feat/rl-async-publish`, below); the remote signer's narrow operations for the checkpoint
-  index and the scan log's head and pages ("V1 operation" below).
+- Lease expiry (`rl_lease_reference_tokens_per_s`, margin; for episode envs the wall budget and `EPISODE_SESSION_SLACK_S`, or `rl_lease_expiry_s` overrides) and starting quota numbers.
+- Multi-turn envs: done (episodes and their service / miner wiring, below). Done since: the scan log on R2,
+  discovery and the trainer listener (`feat/rl-async-publish`, below); the remote signer's narrow operations for the
+  checkpoint index and the scan log's head and pages ("V1 operation" below).
 - Not GPU, still open: the decision-D R2 segments of `rl_prompt_scans` (the `ObservationPublisher` reads a service
   runtime's window events; the scans are served by `/rl/prompts/state` meanwhile); the remote signer has no index
   operation (the async validator signs `/rl/checkpoint` with the local wallet and refuses `RELIQUARY_SIGNER_URL`);
-  axon publication of the async validator (miners use `--validator-url`); the episode wiring listed under
-  "Episodes" below.
+  axon publication of the async validator (miners use `--validator-url`).
 
 ### Episodes and batched generation as built (branch `feat/rl-async-multiturn`)
 
@@ -877,19 +876,81 @@ signed sandboxes and the per-turn forced draw kept, the draw keyed by the lease;
   rows shuffled, each request still draws its lease's stream).
 - Tests: `tests/unit/test_rl_async_episodes.py` (15; 6 need `reliquary_sandbox`).
 
-Remaining (episodes):
+Episode wiring as built (branch `feat/rl-async`, after the multi-turn merge):
 
-- Service wiring: `rl_async_service` builds no sandbox side yet. It needs the session issuer + fleet + machine
-  directory of `rl_sandbox_wiring` with `RlLeaseEngagements` in place of the precommit book, the episode policies
-  (sandbox env, split, package, tools, turn and token budgets: from the task registry params, the window takes
-  them from the order contract), one `LeaseEpisodeChecker` per env and the routes under `/rl` (sessions; no
-  precommit route). Session settlement (mark submitted / release on the group's verdict) and the yield ledger are
-  not ported: the engagement makes a transcript single-use, so they are capacity accounting only.
-- `mine-async` wiring of `EpisodeLeaseGenerator` (the window `build_episode_stack` minus precommits and TOPLOC
-  prover) and an in-place weight swap for `VllmTurnCore` (the generator refuses `load_weights` without one: restart).
-- `/rl/submit` reads at most 8 MiB per body: 16 transcripts can exceed it (each may reach `MAX_TRANSCRIPT_BYTES`);
-  raise the bound for episode envs or compress transcripts.
-- Lease expiry for episode envs must cover sandbox time (it counts in latency, §4.10); calibrate per env.
+- Policy source (`validator/rl_async_episodes.py`). The window takes an env's episode policy from the order
+  contract; the async path has no order, so the task's registry entry carries the same blocks:
+  `params.rl_episode_envs = {env: {episode, catalogue?, version?}}` (`EPISODE_ENVS_PARAM`), validated with the
+  contract's own rules (`service_contract._validate_episode`, `validate_catalogue`; a sha256 `version`), every env
+  in the entry's `env_split`. The policy's seed pool is 2 x 16 (it only sizes the session policy's caps). A bridged
+  env (a `catalogue`) is built as the window builds it (`BridgedEpisodeSource`; the installed identity must be the
+  block's `env_package`, its manifest the `version` when given) and registered as a catalogue spec; an env without
+  a catalogue must be a registered signed-episode env. Declared with `reliquary tasks create --rl-async
+  --rl-episode-envs <file.json> [--lease-expiry env=s,...]` (`rl_async_params(episode_envs=, lease_expiry_s=)`).
+  Miners read the blocks back from `GET /rl/episodes` (the blocks + each env's lease lifetime; 404 without
+  episode envs): the validator serves exactly what it grades with.
+- Validator (`rl_async_service`): `run_rl_async_validator` loads the episode envs off the loop
+  (`load_episode_environments`), needs `RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE` / `_KEY_ID` (refuses to start
+  without), and `wire_episode_sandbox` builds `rl_async_episodes.build_rl_lease_sandbox`: the window's pieces minus
+  windows: the token key, the machine directory and fleet (resources required in production), a `SessionBook` and
+  `SessionIssuer` whose only engagement book is `RlLeaseEngagements` (kind `rl_lease`, over the lease book),
+  sessions stored under `sandbox_store.RL_LEASE_SESSION_PREFIX` (`reliquary/sandbox/rl-lease-sessions/`, never
+  restored by window mode or the corpus), the session open / close routes under `/rl` (no precommit route), one
+  `LeaseEpisodeChecker` per env added to the grader (`GroupGrader.add_episodes`). The session policy lifts the
+  per-key live and hourly-open caps (`NO_PER_KEY_CAP`: the lease quota bounds a hotkey, 16 sessions per open
+  lease, `exclusive`), keeps the daily abort cap scaled for 16-session groups. Started before serving (directory
+  read, sessions restored with retries, fail closed); background: the fleet poll and `maintain_forever`;
+  drained at shutdown. `SandboxEngagement` (the open body's model) now admits `kind: rl_lease` with its
+  `lease: {lease_id, rollout_index}` (the route refused it before: the multi-turn branch never went through HTTP).
+- Not ported (documented in `rl_async_episodes`): the window's session settlement (sessions marked submitted /
+  handed back on a verdict) and the yield ledger / yield quota. The engagement makes a transcript single-use
+  (one session per (lease, rollout), the lease closes at its first submission) and the lease quota decides how
+  many sessions a hotkey holds; settlement and yield are the window's capacity accounting, which the lease quota
+  replaces. Sessions end by their close (final record) or expiry. Also not ported: the window's boot check that
+  every renderer stop is in the proof's stop set (there is no TOPLOC proof per span on the async path; the
+  trainer's forward and the audits judge every model position) and the degraded-env served watch.
+- `/rl/submit` body: `MAX_SUBMIT_BODY_BYTES` (8 MiB) for a single-turn group, always (also gzipped, also on a
+  validator serving episodes); `MAX_EPISODE_SUBMIT_BODY_BYTES` (64 MiB inflated) for an episode group on a
+  validator serving episode envs (`max_episode_body_bytes`, `rl_async_service.episode_body_cap`), body timeout
+  120 s there. `Content-Encoding: gzip` is read with a bounded inflate (`protocol/rl_submit.inflate_body`: one
+  stream, no bomb); another encoding is 422. Each transcript within `MAX_TRANSCRIPT_BYTES`. The miner gzips any
+  episode group (`HttpRlTransport.submit`; the signature is over the rollouts, never the encoding); single-turn
+  bodies are sent as before.
+- Lease lifetime: an episode env's default is `max_episode_tokens / rl_lease_reference_tokens_per_s x margin`
+  (the single-turn rule on the episode's token budget) `+ budgets.wall_s` (tools may use the whole session) `+
+  EPISODE_SESSION_SLACK_S` (300 s: a queued open, image prepare, transcript upload); one session's budget, not
+  16 (the episodes run side by side). `params.rl_lease_expiry_s = {env: s}` (`LEASE_EXPIRY_PARAM`) overrides
+  any env's lifetime, single-turn ones included; an override outside the split is refused. Example: 4096 tokens at
+  20 tok/s x 2 + 3600 s + 300 s = 4309.6 s.
+- `mine-async` (`miner/rl_async.miner_generator`): the miner asks `GET /rl/episodes`; its `--environments` the
+  validator serves as episode envs go to `rl_async_episodes.build_episode_generator` (the window
+  `build_episode_stack` minus precommits and the TOPLOC prover: one forced engine for all of them, caps checked
+  equal, the task prompts from the validator's own source, `LeaseEpisodeRunner` per lease over `HttpRlEpisodes`,
+  `--generate-port`, `--episode-max-num-seqs`, `--episode-gpu-memory-utilization`, `--harness-env[-file]`), the
+  others keep `VllmGroupGenerator`; both under `MixedGenerator` when one process mines both (they share the GPU).
+  An episode env's prompt range is its whole taskset.
+- Checkpoint swaps for the episode engine: restart, not in place (`EpisodeEngineHost`, `EpisodeWeights`).
+  `VllmTurnCore`'s `LLM` is stepped by the `GenerateEngine` thread with hidden-state capture; a `collective_rpc`
+  push while that thread owns the engine is not supported by vLLM. `AsyncMiner` swaps between batches only (no
+  episode in flight), so `load_weights` writes the state as an HF dir, stops the engine (joins its thread),
+  releases the core and builds a new core + engine on the dir; the loopback generate app is built once over the
+  host and reaches the engine of the moment. Cost: one full model load per checkpoint (`--batch-groups` amortizes
+  it; measure at GPU qualification). The core still computes TOPLOC span proofs (deployed defaults) the async
+  path discards.
+- Tests: `tests/unit/test_rl_async_episode_service.py` (11; 3 need `reliquary_sandbox`): registry blocks and
+  lease lifetimes, the CLI declaration, gzip bounds, the per-kind body cap (single-turn > 8 MiB gzipped: 413; bad
+  gzip and other encodings: 422; no episode env: 413 and no `/rl/episodes`), an end-to-end CPU run through the
+  async validator app (`AsyncMiner` over `HttpRlTransport` -> `/rl/episodes` and the lifetime -> lease -> 16 real
+  opens on `/rl/sandbox/sessions` (issuer, `RlLeaseEngagements`, fleet over a fake directory and capacity report)
+  -> transcripts signed by a fake machine for the issued tokens -> real closes -> gzipped submit ->
+  `LeaseEpisodeChecker` -> in zone, buffered with its spans, model tokens counted -> a reopen refused), refusals
+  (second open of a rollout, rollout 16, another hotkey's lease), the engine restart per checkpoint, the caps
+  check, and the episode / single-turn routing.
+
+Remaining (episodes), GPU only: the forced episode engine on the 9B (vLLM `VllmTurnCore` with the lease draw,
+restart time per checkpoint), a real gateway and harness under `mine-async` against the async validator (the
+CPU e2e fakes the machine and the harness), the episode lease lifetime and slack calibrated on real sessions,
+and the audit / trainer forward on episode groups (model positions only) on the 9B.
 
 ### Service wiring as built (branch `feat/rl-async`)
 
