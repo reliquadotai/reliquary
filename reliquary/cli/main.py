@@ -3745,7 +3745,8 @@ def mine_async(
     hotkey: str = typer.Option("default", help="Hotkey name"),
     wallet_path: str = typer.Option(os.getenv("BT_WALLET_PATH", ""), help="Optional wallet base path"),
     base_model: str = typer.Option(
-        "", "--base-model", help="Local HF directory of the run's model: its config and tokenizer files"),
+        "", "--base-model", help="Local HF directory of the run's model: its config and tokenizer files "
+        "(default: the ones the published anchors carry, synced under the work dir)"),
     work_dir: str = typer.Option("rl-async-work", "--work-dir",
                                  help="Rebuilt weights, checkpoint downloads and the open-lease journal"),
     initial_checkpoint: str = typer.Option(

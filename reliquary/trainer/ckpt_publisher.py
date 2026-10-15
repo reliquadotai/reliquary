@@ -9,7 +9,9 @@ docs/rl-async-design.md §4.8. Per step the publisher writes to the
   miners that lag; a base whose cumulative grows past ``max_cumulative_bytes``
   is dropped, and those miners take the anchor;
 - every ``anchor_interval`` steps (and on the first publication) a full anchor
-  as safetensors shards;
+  as safetensors shards, with the model's non-weight files (``model_dir``: HF
+  config, generation config, tokenizer, chat template) so a miner can load it
+  from the bucket alone;
 - ``index.json`` last, so a reader never sees an entry whose object is missing.
 
 A cumulative base keeps one bit per weight (the union of changed positions),
@@ -44,13 +46,30 @@ from reliquary.shared.ckpt_delta import (
 )
 from reliquary.shared.ckpt_index import (
     INDEX_FORMAT,
+    MAX_MODEL_FILE_BYTES,
     anchor_key,
     delta_key,
     index_key,
+    model_file_key,
+    model_file_name_ok,
 )
 from reliquary.shared.strict_json import strict_json_loads
 
 logger = logging.getLogger(__name__)
+
+def model_files(model_dir: str | Path) -> list[Path]:
+    """The non-weight files of an HF model directory an anchor carries (config, tokenizer, chat template)."""
+    folder = Path(model_dir)
+    if not folder.is_dir():
+        raise ValueError(f"{folder} is not a model directory")
+    files = sorted(p for p in folder.iterdir() if p.is_file() and model_file_name_ok(p.name))
+    if not any(p.name == "config.json" for p in files):
+        raise ValueError(f"{folder} has no config.json")
+    too_big = [p.name for p in files if p.stat().st_size > MAX_MODEL_FILE_BYTES]
+    if too_big:
+        raise ValueError(f"model files over {MAX_MODEL_FILE_BYTES} bytes: {too_big}")
+    return files
+
 
 class R2ObjectStore:
     """The few object operations the publisher needs, over a sync boto3 client."""
@@ -123,6 +142,7 @@ class DeltaPublisher:
         keep_anchors: int = 2,
         anchor_shard_bytes: int = ANCHOR_SHARD_BYTES,
         zstd_level: int = DEFAULT_ZSTD_LEVEL,
+        model_dir: str | Path | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if anchor_interval < 1 or cumulative_stride < 1 or keep_anchors < 1:
@@ -134,6 +154,7 @@ class DeltaPublisher:
         self.max_cumulative_bytes = max_cumulative_bytes
         self.keep_anchors, self._shard_bytes = keep_anchors, anchor_shard_bytes
         self._level, self._clock = zstd_level, clock
+        self._model_files = model_files(model_dir) if model_dir is not None else []
         self._prev: dict[str, torch.Tensor] | None = None
         self._prev_version: int | None = None
         self._prev_sha: str | None = None
@@ -236,7 +257,16 @@ class DeltaPublisher:
                               "sha256": _sha256_file(path)})
         finally:
             shutil.rmtree(folder, ignore_errors=True)
-        self.anchors.append({"version": version, "sha256": sha, "files": files})
+        anchor = {"version": version, "sha256": sha, "files": files}
+        if self._model_files:
+            anchor["model_files"] = []
+            for path in self._model_files:
+                data = path.read_bytes()
+                key = model_file_key(self.run, version, path.name)
+                self._store.put_bytes(key, data)
+                anchor["model_files"].append({"name": path.name, "key": key, "size": len(data),
+                                              "sha256": hashlib.sha256(data).hexdigest()})
+        self.anchors.append(anchor)
         self._last_anchor = version
 
     def _prune(self, version: int) -> None:
@@ -251,7 +281,8 @@ class DeltaPublisher:
             stale_cumulative = d["to"] - d["from"] > 1 and d["to"] < version - 1
             (drop if d["from"] < floor or stale_cumulative else keep).append(d)
         self.deltas = keep
-        for key in [f["key"] for a in drop_anchors for f in a["files"]] + [d["key"] for d in drop]:
+        dropped = [f["key"] for a in drop_anchors for f in [*a["files"], *a.get("model_files", [])]]
+        for key in dropped + [d["key"] for d in drop]:
             try:
                 self._store.delete(key)
             except Exception:

@@ -9,12 +9,18 @@ Index shape::
 
     {"format": "reliquary-ckpt-index/1", "run": str,
      "latest": {"version": int, "sha256": str},
-     "anchors": [{"version", "sha256", "files": [{"key", "size", "sha256"}]}],
+     "anchors": [{"version", "sha256", "files": [{"key", "size", "sha256"}],
+                  "model_files": [{"name", "key", "size", "sha256"}]}],      # optional
      "deltas": [{"from", "to", "key", "size", "sha256", "target_sha256"}]}
 
 A delta from..to is valid from any version in [from, to) (overwrite semantics,
 see ``reliquary.shared.ckpt_delta``), so per-step and cumulative deltas are one
 kind of edge.
+
+An anchor also carries the model's non-weight files (``model_files``: the HF
+config, generation config, tokenizer and chat template), so a miner that starts
+from the bucket alone can load and serve the checkpoint. Their names are plain
+file names (``model_file_name_ok``).
 """
 
 from __future__ import annotations
@@ -48,7 +54,33 @@ def index_key(run: str) -> str:
 
 def index_keys(index: Mapping[str, Any]) -> list[str]:
     keys = [f["key"] for a in index.get("anchors", []) for f in a["files"]]
+    keys += [f["key"] for a in index.get("anchors", []) for f in a.get("model_files", [])]
     return keys + [d["key"] for d in index.get("deltas", [])]
+
+
+# The HF loader's non-weight files an anchor carries: configs, tokenizer, chat template.
+WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".gguf", ".safetensors.index.json", ".bin.index.json")
+MAX_MODEL_FILE_BYTES = 64 * 1024 * 1024
+
+
+def model_file_name_ok(name: str) -> bool:
+    """A plain file name (no directory, not hidden) that is not a weight file."""
+    return (isinstance(name, str) and 0 < len(name) <= 128 and "/" not in name and "\\" not in name
+            and not name.startswith(".") and name not in {".", ".."} and not name.endswith(WEIGHT_SUFFIXES))
+
+
+def model_file_key(run: str, version: int, name: str) -> str:
+    if not model_file_name_ok(name):
+        raise ValueError(f"{name!r} is not a model file name")
+    return f"{run_prefix(run)}/anchors/{int(version):08d}/model/{name}"
+
+
+def latest_model_files(index: Mapping[str, Any]) -> list[dict]:
+    """The model files of the newest anchor that lists some (empty when none does)."""
+    for anchor in sorted(index.get("anchors", []), key=lambda a: int(a["version"]), reverse=True):
+        if anchor.get("model_files"):
+            return list(anchor["model_files"])
+    return []
 
 
 # ------------------------------------------------------------------- signature

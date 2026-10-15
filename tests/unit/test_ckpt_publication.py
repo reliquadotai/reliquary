@@ -285,3 +285,62 @@ def test_cumulatives_past_the_size_cap_are_dropped(tmp_path):
     rebuilt, _, plan = make_sync(store, tmp_path).sync(answer(store), clone(states[2]), 2)
     assert plan.anchor is None and len(plan.deltas) == 4
     assert bits_equal(rebuilt, states[6])
+
+
+def _model_dir(tmp_path):
+    folder = tmp_path / "hf-model"
+    folder.mkdir()
+    (folder / "config.json").write_text('{"model_type": "qwen3"}')
+    (folder / "tokenizer.json").write_text('{"version": "1.0"}')
+    (folder / "chat_template.jinja").write_text("{{ messages }}")
+    (folder / "model.safetensors").write_bytes(b"weights are not model files")
+    (folder / "model.safetensors.index.json").write_text("{}")
+    (folder / ".cache").write_text("hidden")
+    return folder
+
+
+def test_anchors_carry_the_model_files_and_the_miner_keeps_them(tmp_path):
+    states = chain(6)
+    store = MemoryStore()
+    model = _model_dir(tmp_path)
+    pub = DeltaPublisher(run="run1", store=store, staging_dir=tmp_path / "staging", anchor_interval=2,
+                         keep_anchors=2, model_dir=model)
+    for version, state in enumerate(states):
+        index = pub.publish(version, state)
+    names = ["chat_template.jinja", "config.json", "tokenizer.json"]
+    assert [a["version"] for a in index["anchors"]] == [4, 6]
+    for anchor in index["anchors"]:
+        assert [f["name"] for f in anchor["model_files"]] == names
+    # pruned anchors take their model files with them; the board presigns the kept ones
+    assert not any("/anchors/00000000/" in key or "/anchors/00000002/" in key for key in store.objects)
+    response = answer(store)
+    assert {f["key"] for a in index["anchors"] for f in a["model_files"]} <= set(response["urls"])
+    sync = CheckpointSync(validator_hotkey=HOTKEY, work_dir=tmp_path / "work", verify_signature=fake_verify,
+                          download=lambda url, dest: dest.write_bytes(store.objects[url.removeprefix("mem://")]),
+                          model_dir=tmp_path / "miner-model")
+    rebuilt, version, _ = sync.sync(response, None, None)
+    assert version == 6 and bits_equal(rebuilt, states[6])
+    assert sorted(p.name for p in (tmp_path / "miner-model").iterdir()) == names
+    assert (tmp_path / "miner-model" / "config.json").read_text() == '{"model_type": "qwen3"}'
+    assert sync.sync_model_files(response["index"], response["urls"]) == []      # unchanged: nothing fetched
+    (tmp_path / "miner-model" / "tokenizer.json").write_text("stale")
+    assert sync.sync_model_files(response["index"], response["urls"]) == ["tokenizer.json"]
+    key = index["anchors"][-1]["model_files"][1]["key"]
+    store.objects[key] = b"tampered"
+    (tmp_path / "miner-model" / "config.json").unlink()
+    with pytest.raises(ObjectMismatch):
+        sync.sync_model_files(response["index"], response["urls"])
+    assert not (tmp_path / "miner-model" / "config.json").exists()
+
+
+def test_a_model_dir_without_config_or_with_unsafe_names_is_refused(tmp_path):
+    from reliquary.shared.ckpt_index import model_file_name_ok
+    from reliquary.trainer.ckpt_publisher import model_files
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    (empty / "tokenizer.json").write_text("{}")
+    with pytest.raises(ValueError):
+        model_files(empty)
+    assert not any(model_file_name_ok(n) for n in ("../config.json", "a/b", ".hidden", "x.safetensors", ""))
+    assert model_file_name_ok("tokenizer_config.json")
