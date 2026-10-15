@@ -825,11 +825,9 @@ Everything below needs a GPU testbed (P8 qualification) unless marked otherwise.
   inconclusive (first scans unpaid). V1's controller is CPU-only: either give it a card or move the audit forward
   to the proof worker (its protocol has no async audit operation yet).
 - Lease expiry (`rl_lease_reference_tokens_per_s`, margin) and starting quota numbers.
-- Not GPU, still open: the decision-D R2 segments of `rl_prompt_scans` (the `ObservationPublisher` reads a service
-  runtime's window events; the scans are served by `/rl/prompts/state` meanwhile); the remote signer has no index
-  operation (the async validator signs `/rl/checkpoint` with the local wallet and refuses `RELIQUARY_SIGNER_URL`);
-  axon publication of the async validator (miners use `--validator-url`); multi-turn envs (P3 grades single-turn
-  only).
+- Not GPU, still open: the remote signer has no index operation (the async validator signs `/rl/checkpoint` and
+  the scan log with the local wallet and refuses `RELIQUARY_SIGNER_URL`); multi-turn envs (P3 grades single-turn
+  only). Done on `feat/rl-async-publish`: the scan log, discovery, the trainer listener (below).
 
 ### Service wiring as built (branch `feat/rl-async`)
 
@@ -846,15 +844,17 @@ task declared for period settlement refuses to start in window mode).
   submissions + buffer, price controller and ledger on `<state dir>/rl-async.sqlite3`; `RlCheckpointBoard` over
   `rl/<run>/index.json` in `reliquary-public` (run = `RELIQUARY_RL_RUN`, default the task id); `mount_rl_async`
   mounts the lease router (with `/rl/submit`, `/rl/pay`, `/rl/lease/mine`, `/rl/prompts/state`) plus
-  `/rl/checkpoint` and, with `RELIQUARY_RL_TRAINER_TOKEN`, the trainer link, through
-  `ValidatorServer.mount_rl_lease_router`; registration gate as the corpus validator; the weight setter thread as
+  `/rl/checkpoint` and `/rl/observations`, through `ValidatorServer.mount_rl_lease_router` (with
+  `RELIQUARY_RL_TRAINER_TOKEN`, the trainer link on its own listener); registration gate as the corpus validator; the weight setter thread as
   in window mode. Loops (`rl_async_loops`): expiry sweep (5 s), audits (2 s, 8 per pass, `AuditModel` at the latest
   checkpoint or inconclusive without a device), ledger ingest / settle / publish through `R2PeriodArchives` (30 s),
   price tick when due (the trainer ticks per step). `RlSubmissions.run_audits` now skips a raising forward and
   concludes it inconclusive after `AUDIT_MAX_ATTEMPTS` (3).
 - Trainer link (`/rl/trainer/*`, bearer token; client `trainer/rl_link.TrainerLink`, one object for the trainer's
   `buffer`, `submissions`, `book` and `prices`): config, latest, adopt, take, take_older, release, requeue, depth,
-  report, wait, tick. Matches today's topology: the buffer stays in the controller's SQLite file, the trainer on its
+  report, wait, tick, checkpoint (the signed `/rl/checkpoint` answer, for the trainer's resume). Served on its own
+  listener (`build_rl_trainer_app`), never on the public port: `RELIQUARY_RL_TRAINER_BIND=host:port` (default
+  `127.0.0.1:8889`; a private interface such as a WireGuard/Tailscale address, or an SSH tunnel from the GPU box). Matches today's topology: the buffer stays in the controller's SQLite file, the trainer on its
   GPU box. Calls retry transport errors / 429 / 5xx for 10 min; a resent report the validator no longer holds
   counts as done; idle, the trainer requeues taken groups (a take whose answer was lost).
 - Trainer (`reliquary train-async`, `trainer/async_cli.py`): `RELIQUARY_RL_TRAINER_URL`, `_TOKEN`,
@@ -871,19 +871,41 @@ task declared for period settlement refuses to start in window mode).
   one `AsyncTrainer` step through the link with a fake step -> reports -> delta 1 to a memory bucket, adopted ->
   ledger accrual -> `/rl/pay` -> miner and audit model sync 1 -> period settled and published.
 
+Publication and discovery (branch `feat/rl-async-publish`):
+
+- Scan log (decisions §A/§D, design §4.5; `validator/rl_observations.py`): every `rl_prompt_scans` row is one
+  event `{type: scan, id: seq, env, prompt_idx, checkpoint, rewards, verdict, first_scan, state, until_k, ts}` (no
+  hotkey, no token; `state` / `until_k` are what the scan moved the prompt to, new columns of `rl_prompt_scans`,
+  added to an older book at open). The window-era `services/publication.ObservationPublisher` is reused unchanged in
+  format (gzip JSONL segments with immutable cache and conditional PUT, head `index.json` with `max-age=15` signed
+  by the validator hotkey, closed pages of 200 segments) with a `root` (`rl/<run>/observations/` in
+  `reliquary-public`, `ckpt_index.observations_root`) and its own projection; `ScanJournal` is its runtime over the
+  lease book's file (segment plans and closed pages persisted before upload: a restart rebuilds the same bytes). A
+  flush every 60 s (`rl_async_loops(publisher=)`), local wallet signature as the checkpoint index.
+- `GET /rl/observations?after=<n>` (`ObservationBoard`): the bucket is private, so the validator serves the head it
+  last wrote and presigned GET URLs (15 min) for its pages and for segments `n+1 ..` (512 per answer); 503 before
+  the first flush. Miner reader `protocol/rl_scan_log.read_scan_log` (head, pages and segments verified with the
+  publication verifiers); `AsyncMiner.bootstrap_state` folds the log into the planners at start, then
+  `/rl/prompts/state` continues from the last seq (any failure falls back to the route from 0).
+- Discovery: `run_rl_async_validator` serves its axon at start with `--external-ip` / `--external-port`
+  (`validator/axon.serve_axon_on_chain`, shared with the window validator). `mine-async` without `--validator-url`
+  takes the first permitted validator axon and its hotkey from the metagraph (`submitter.discover_validator`);
+  `--validator-url` (+ `--validator-hotkey`) overrides.
+
 Start (async mode):
 
 ```
 # validator (controller)
 RELIQUARY_RL_MODE=async RELIQUARY_TASK_ID=<t> RELIQUARY_RL_TRAINER_TOKEN=<secret> \
   R2_PUBLIC_ENDPOINT=... R2_PUBLIC_ACCESS_KEY_ID=... R2_PUBLIC_SECRET_ACCESS_KEY=... [RELIQUARY_RL_AUDIT_DEVICE=cuda:0] \
-  reliquary validate --checkpoint <base model> --wallet-name ... --hotkey ...
+  [RELIQUARY_RL_TRAINER_BIND=<private ip>:8889] \
+  reliquary validate --checkpoint <base model> --wallet-name ... --hotkey ... --external-ip <public ip>
 # trainer (GPU box; torchrun --nproc-per-node N with RELIQUARY_TRAINER_BACKEND=fsdp2)
-RELIQUARY_RL_TRAINER_URL=http://<controller>:<port> RELIQUARY_RL_TRAINER_TOKEN=<secret> \
+RELIQUARY_RL_TRAINER_URL=http://<controller private ip, or localhost via ssh -L>:8889 RELIQUARY_RL_TRAINER_TOKEN=<secret> \
   RELIQUARY_RL_VALIDATOR_HOTKEY=<ss58> R2_PUBLIC_...=... [RELIQUARY_RL_HF_BACKUP_PREFIX=<p> RELIQUARY_RL_HF_BACKUP_EVERY=200] \
   reliquary train-async
 # miner
-reliquary mine-async --environments math --validator-url http://<controller>:<port> --validator-hotkey <ss58>
+reliquary mine-async --environments math     # discovered; or --validator-url http://<controller>:<port> --validator-hotkey <ss58>
 ```
 
 ### P4 as built (branch `feat/rl-async-trainer`)

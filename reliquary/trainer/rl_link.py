@@ -79,6 +79,11 @@ class TrainerLink:
         """``task_id``, ``run`` (the checkpoint index's), ``targets`` (the env mix) and ``latest``."""
         return self._call("GET", "config")
 
+    def checkpoint(self) -> dict:
+        """The validator's signed checkpoint answer (``/rl/checkpoint``'s body, served on the link: the trainer
+        reaches the trainer listener only)."""
+        return self._call("GET", "checkpoint")
+
     # --- the lease book -------------------------------------------------------------------------------------------
     @property
     def latest_checkpoint(self) -> int | None:

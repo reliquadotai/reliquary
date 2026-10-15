@@ -9,7 +9,7 @@ run come from the validator's task (``/rl/trainer/config``).
 Start: a fresh lease book (no checkpoint adopted) starts from the base model (``DEFAULT_BASE_MODEL``, or
 ``RELIQUARY_RL_BASE_MODEL``), published and adopted as checkpoint 0. Otherwise the trainer resumes from the weights
 of the latest published checkpoint, rebuilt from the bucket through the validator's signed index (``GET
-/rl/checkpoint``, ``CheckpointSync``); a version published but never adopted (a crash between the two) is adopted
+/rl/trainer/checkpoint``, ``CheckpointSync``); a version published but never adopted (a crash between the two) is adopted
 first. The optimizer starts fresh (the bf16 checkpoint is all the bucket holds).
 
 Publication: ``DeltaPublisher`` into ``reliquary-public`` (``R2_PUBLIC_*``), the anchors carrying the model's config
@@ -64,19 +64,14 @@ def async_trainer_settings(env: Mapping[str, str] = os.environ) -> dict[str, Any
     }
 
 
-def resume_weights(link, *, validator_hotkey: str, url: str, work_dir: Path, sync=None, fetch=None):
+def resume_weights(link, *, validator_hotkey: str, work_dir: Path, sync=None, fetch=None):
     """``(state, version, model_files_dir)`` of the latest published checkpoint, or None on a fresh book. A published
     version ahead of the book (published, then the trainer died before adopting it) is adopted here."""
     latest = link.latest_checkpoint
     if latest is None:
         return None
     if fetch is None:
-        import httpx
-
-        def fetch() -> dict:
-            response = httpx.get(f"{url.rstrip('/')}/rl/checkpoint", timeout=60.0)
-            response.raise_for_status()
-            return response.json()
+        fetch = link.checkpoint
     if sync is None:
         from reliquary.miner.ckpt_sync import CheckpointSync
 
@@ -129,8 +124,7 @@ def run_async_train_worker() -> None:
         task = link.config()
         state_dir: Path = settings["state_dir"]
         state_dir.mkdir(parents=True, exist_ok=True)
-        resumed = resume_weights(link, validator_hotkey=settings["validator_hotkey"], url=settings["url"],
-                                 work_dir=state_dir / "resume")
+        resumed = resume_weights(link, validator_hotkey=settings["validator_hotkey"], work_dir=state_dir / "resume")
         if resumed is None:
             from huggingface_hub import snapshot_download
 

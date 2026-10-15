@@ -9,10 +9,15 @@ One process on the controller, like the corpus validator: no window, batcher or 
   over the trainer's index in the ``reliquary-public`` bucket.
 * **Routes** (``mount_rl_async``, through ``ValidatorServer.mount_rl_lease_router``): ``/rl/lease``, ``/rl/quota``,
   ``/rl/lease/mine``, ``/rl/lease/commitments``, ``/rl/prompts/state``, ``/rl/submit``, ``/rl/pay`` (replaces the
-  window board's) and ``/rl/checkpoint``; with ``RELIQUARY_RL_TRAINER_TOKEN`` set, the trainer link
-  (``/rl/trainer/*``, bearer token): the detached async trainer (``reliquary train-async``, its own GPU box as
-  today) takes groups from the buffer, reports them, adopts the checkpoints it publishes and feeds the prices.
-* **Loops** (``rl_async_loops``): the lease expiry sweep; the out-of-zone audits (``run_rl_audits``) against the
+  window board's), ``/rl/checkpoint`` and ``/rl/observations`` (the scan log's signed head + presigned URLs).
+* **Trainer link** (``/rl/trainer/*``, bearer ``RELIQUARY_RL_TRAINER_TOKEN``) on its own listener,
+  ``RELIQUARY_RL_TRAINER_BIND`` (``host:port``, default ``127.0.0.1:8889``: reach it over a private interface or
+  an SSH tunnel), never on the public port: the detached async trainer (``reliquary train-async``, its own GPU box
+  as today) takes groups from the buffer, reports them, adopts the checkpoints it publishes and feeds the prices.
+* **Discovery:** with ``--external-ip`` the validator serves its axon at start, as the window validator does, so
+  ``mine-async`` finds it on the metagraph (``--validator-url`` stays an override).
+* **Loops** (``rl_async_loops``): the scan log's publication (``rl_observations``, a segment per 60 s into
+  ``rl/<run>/observations/``); the lease expiry sweep; the out-of-zone audits (``run_rl_audits``) against the
   verify model held at the latest checkpoint (``RELIQUARY_RL_AUDIT_DEVICE``; without one every audit concludes
   inconclusive: unpaid, unsanctioned), with ``RlSubmissions.run_audits``' retry cap; the ledger (ingest, settle,
   publish the period archives through ``R2PeriodArchives``, as the corpus periods); the price tick when the trainer
@@ -21,13 +26,13 @@ One process on the controller, like the corpus validator: no window, batcher or 
   --rl-async``): the unchanged weight setter pays its period archives. Per-env target shares are the entry's
   ``env_split``; the async parameters are the ``rl_*`` params below.
 
-Not here (map §9): the R2 segments of the observation log (decision D; ``rl_prompt_scans`` is served by
-``/rl/prompts/state``), the remote signer (the checkpoint index is signed with the local wallet), axon publication.
+Not here (map §9): the remote signer (the checkpoint index and the scan log are signed with the local wallet).
 """
 from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hmac
 import logging
 import os
@@ -46,6 +51,8 @@ logger = logging.getLogger(__name__)
 RL_MODE_ENV = "RELIQUARY_RL_MODE"
 WINDOW, ASYNC = "window", "async"
 TRAINER_TOKEN_ENV = "RELIQUARY_RL_TRAINER_TOKEN"
+TRAINER_BIND_ENV = "RELIQUARY_RL_TRAINER_BIND"
+DEFAULT_TRAINER_BIND = "127.0.0.1:8889"
 AUDIT_DEVICE_ENV = "RELIQUARY_RL_AUDIT_DEVICE"
 RUN_ENV = "RELIQUARY_RL_RUN"
 DB_NAME = "rl-async.sqlite3"
@@ -143,6 +150,7 @@ class RlAsync:
     ledger: Any
     prices: Any
     board: Any = None
+    observations: Any = None                    # rl_observations.ObservationBoard (None: /rl/observations 503s)
 
     def close(self) -> None:
         self.book.close()
@@ -192,9 +200,12 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
         return JSONResponse(status_code=status, content={"reason": reason, "detail": detail},
                             headers={"Cache-Control": "no-store"})
 
+    def authorized(request: Request) -> bool:
+        return hmac.compare_digest(request.headers.get("authorization", "").encode(), expected)
+
     def route(method: str, path: str, op: Callable[[dict], Any]) -> None:
         async def handler(request: Request) -> JSONResponse:
-            if not hmac.compare_digest(request.headers.get("authorization", "").encode(), expected):
+            if not authorized(request):
                 return refused(401, "unauthorized")
             try:
                 body = await request.json() if method == "POST" else dict(request.query_params)
@@ -246,14 +257,45 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
     route("POST", "report", report)
     route("POST", "wait", wait)
     route("POST", "tick", tick)
+
+    async def checkpoint(request: Request) -> JSONResponse:
+        """``/rl/checkpoint``'s answer for the trainer's resume (it reaches this listener only)."""
+        if not authorized(request):
+            return refused(401, "unauthorized")
+        answer = None if rl.board is None else await rl.board.answer()
+        if answer is None:
+            return refused(503, "unavailable")
+        return JSONResponse(content=answer, headers={"Cache-Control": "no-store"})
+
+    router.add_api_route(f"{prefix}/checkpoint", checkpoint, methods=["GET"])
     return router
 
 
+def trainer_bind(env: Mapping[str, str] = os.environ) -> tuple[str, int]:
+    """``RELIQUARY_RL_TRAINER_BIND`` as (host, port): the trainer link's own listener."""
+    value = str(env.get(TRAINER_BIND_ENV, "")).strip() or DEFAULT_TRAINER_BIND
+    host, sep, port = value.rpartition(":")
+    if not sep or not host or not port.isdigit() or not 0 < int(port) < 65536:
+        raise ValueError(f"{TRAINER_BIND_ENV} must be host:port, got {value!r}")
+    return host.strip("[]"), int(port)
+
+
+def build_rl_trainer_app(rl: RlAsync, *, token: str):
+    """The trainer link as its own app, served on ``trainer_bind()`` beside the public one."""
+    from fastapi import FastAPI
+
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    app.include_router(build_rl_trainer_router(rl, token=token))
+    return app
+
+
 # --- routes -----------------------------------------------------------------------------------------------------
-def mount_rl_async(server, rl: RlAsync, *, validator_hotkey: str, registration=None, trainer_token: str | None = None,
+def mount_rl_async(server, rl: RlAsync, *, validator_hotkey: str, registration=None,
                    clock: Callable[[], float] = time.time) -> None:
-    """Serve the async routes on ``server`` (a ``ValidatorServer``); each replaces an app route at the same path."""
+    """Serve the public async routes on ``server`` (a ``ValidatorServer``); each replaces an app route at the same
+    path. The trainer link is not among them (``build_rl_trainer_app``, its own listener)."""
     from reliquary.validator.rl_checkpoint import rl_checkpoint_response
+    from reliquary.validator.rl_observations import rl_observations_response
     from reliquary.validator.rl_lease_routes import build_rl_lease_router
 
     router = build_rl_lease_router(book=rl.book, collector=rl.collector, validator_hotkey=validator_hotkey,
@@ -264,8 +306,10 @@ def mount_rl_async(server, rl: RlAsync, *, validator_hotkey: str, registration=N
     async def rl_checkpoint():
         return await rl_checkpoint_response(rl.board)
 
-    if trainer_token:
-        router.include_router(build_rl_trainer_router(rl, token=trainer_token))
+    @router.get("/rl/observations")
+    async def rl_observations(after: str = "0"):
+        return await rl_observations_response(rl.observations, after)
+
     server.mount_rl_lease_router(router)
 
 
@@ -321,10 +365,14 @@ async def _every(step: Callable[[], Any], period: float, name: str) -> None:
 
 
 def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = None, audit_limit: int = AUDIT_LIMIT,
-                   clock: Callable[[], float] = time.time, every: Mapping[str, float] | None = None) -> list:
-    """The background coroutines of the service (run until cancelled)."""
+                   clock: Callable[[], float] = time.time, every: Mapping[str, float] | None = None,
+                   publisher=None) -> list:
+    """The background coroutines of the service (run until cancelled). ``publisher``: the scan log's
+    ``ObservationPublisher`` (``rl_observations.scan_publisher``)."""
+    from reliquary.validator.rl_observations import FLUSH_EVERY_S
+
     periods = {"expire": EXPIRE_EVERY_S, "audit": AUDIT_EVERY_S, "ledger": LEDGER_EVERY_S, "price": PRICE_EVERY_S,
-               "checkpoint": CHECKPOINT_FOLLOW_EVERY_S, **dict(every or {})}
+               "checkpoint": CHECKPOINT_FOLLOW_EVERY_S, "observations": FLUSH_EVERY_S, **dict(every or {})}
 
     async def expire() -> None:
         expired = await asyncio.to_thread(rl.book.expire_due)
@@ -359,10 +407,16 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
     async def follow() -> None:
         await audit_model.follow_once(rl.board)
 
+    async def publish() -> None:
+        while not publisher.disabled and await publisher.flush() is not None:
+            pass
+
     loops = [_every(expire, periods["expire"], "expiry sweep"), _every(audit, periods["audit"], "audits"),
              _every(ledger, periods["ledger"], "ledger"), _every(price, periods["price"], "price tick")]
     if audit_model is not None:
         loops.append(_every(follow, periods["checkpoint"], "audit checkpoint"))
+    if publisher is not None:
+        loops.append(_every(publish, periods["observations"], "scan log publication"))
     return loops
 
 
@@ -399,16 +453,25 @@ def _grader_for(names, checkpoint: str, load_kwargs: Mapping[str, Any]):
     return grader, ranges
 
 
-def _checkpoint_board(run: str, wallet, validator_hotkey: str):
+def _public_boards(rl: RlAsync, wallet, validator_hotkey: str):
+    """The checkpoint board and the scan log (publisher + board), both over the ``reliquary-public`` bucket and
+    signed with the local wallet. Returns the publisher."""
     from reliquary.infrastructure.storage import public_checkpoint_bucket, public_checkpoint_client
     from reliquary.shared.ckpt_index import index_key
     from reliquary.trainer.ckpt_publisher import R2ObjectStore
     from reliquary.validator.rl_checkpoint import RlCheckpointBoard, presigner, wallet_index_signer
+    from reliquary.validator.rl_observations import ObservationBoard, bucket_io, scan_publisher
 
+    run = rl.settings.run
     client, bucket = public_checkpoint_client(), public_checkpoint_bucket()
-    store = R2ObjectStore(client, bucket)
-    return RlCheckpointBoard(load_index=lambda: store.get_bytes(index_key(run)), sign_fn=wallet_index_signer(wallet),
-                             validator_hotkey=validator_hotkey, presign=presigner(client, bucket))
+    store, presign = R2ObjectStore(client, bucket), presigner(client, bucket)
+    rl.board = RlCheckpointBoard(load_index=lambda: store.get_bytes(index_key(run)),
+                                 sign_fn=wallet_index_signer(wallet), validator_hotkey=validator_hotkey,
+                                 presign=presign)
+    put, get = bucket_io(client, bucket)
+    publisher = scan_publisher(rl.book, run=run, task_id=rl.settings.task_id, wallet=wallet, put=put, get=get)
+    rl.observations = ObservationBoard(publisher, presign=presign)
+    return publisher
 
 
 def _audit_model(device: str, checkpoint: str, load_kwargs: Mapping[str, Any], validator_hotkey: str,
@@ -426,7 +489,8 @@ def _audit_model(device: str, checkpoint: str, load_kwargs: Mapping[str, Any], v
 
 async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_host: str, http_port: int, entry,
                                  cap: float, checkpoint: str, load_kwargs: Mapping[str, Any] | None = None,
-                                 registration_gate: bool = True) -> None:
+                                 registration_gate: bool = True, subtensor=None, external_ip: str | None = None,
+                                 external_port: int | None = None) -> None:
     """Serve the async RL task ``entry`` until interrupted (the weight setter runs beside it, as in window mode)."""
     import uvicorn
 
@@ -443,12 +507,14 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
                            "signer has no index operation yet (unset RELIQUARY_SIGNER_URL)")
     load_kwargs = dict(load_kwargs or {})
     settings = rl_async_settings(entry, cap)
+    token = os.environ.get(TRAINER_TOKEN_ENV, "").strip()
+    bind = trainer_bind() if token else None
     validator_hotkey = wallet.hotkey.ss58_address
     grader, ranges = await asyncio.to_thread(_grader_for, list(settings.targets), checkpoint, load_kwargs)
     state_dir = _validator_state_dir()
     state_dir.mkdir(parents=True, exist_ok=True)
-    rl = build_rl_async(settings, path=state_dir / DB_NAME, grader=grader, prompt_range=ranges,
-                        board=_checkpoint_board(settings.run, wallet, validator_hotkey))
+    rl = build_rl_async(settings, path=state_dir / DB_NAME, grader=grader, prompt_range=ranges)
+    publisher = _public_boards(rl, wallet, validator_hotkey)
     audit_model = None
     device = os.environ.get(AUDIT_DEVICE_ENV, "").strip()
     if device:
@@ -457,7 +523,6 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     else:
         logger.warning("%s unset: out-of-zone audits conclude inconclusive (first scans unpaid, no sanction)",
                        AUDIT_DEVICE_ENV)
-    token = os.environ.get(TRAINER_TOKEN_ENV, "").strip()
     if not token:
         logger.warning("%s unset: no trainer link is served; the async trainer cannot connect", TRAINER_TOKEN_ENV)
 
@@ -470,17 +535,31 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
             logger.warning("subnet registrations unknown at start; miners get 503 until they load")
     server = ValidatorServer(http_host, http_port, emission_cap=cap)
     mount_rl_async(server, rl, validator_hotkey=validator_hotkey,
-                   registration=None if registered is None else registered.reason, trainer_token=token or None)
+                   registration=None if registered is None else registered.reason)
     archives = R2PeriodArchives(guard=R2Archives(served=lambda: (settings.task_id,), served_only=True))
-    background = rl_async_loops(rl, archives=archives, audit_model=audit_model)
+    background = rl_async_loops(rl, archives=archives, audit_model=audit_model, publisher=publisher)
     if registered is not None:
         background.append(registered.refresh_forever())
+    if bind is not None:
+        trainer_http = uvicorn.Server(uvicorn.Config(build_rl_trainer_app(rl, token=token), host=bind[0],
+                                                     port=bind[1], log_level="warning", access_log=False))
+        trainer_http.capture_signals = contextlib.nullcontext   # the public server owns the signals
+        background.append(trainer_http.serve())
+        logger.info("trainer link on %s:%d", *bind)
+    if subtensor is not None and external_ip:
+        from reliquary.validator.axon import serve_axon_on_chain
+
+        await serve_axon_on_chain(subtensor, wallet=wallet, netuid=netuid, ip=external_ip,
+                                  port=external_port or http_port)
+    else:
+        logger.warning("no --external-ip: the axon is not served; miners need --validator-url")
     logger.info("async RL validator: task %s (cap %.3f), run %s, envs %s, latest checkpoint %s",
                 settings.task_id, cap, settings.run, dict(settings.targets), rl.book.latest_checkpoint)
     http = uvicorn.Server(uvicorn.Config(server.app, host=http_host, port=http_port, log_level="warning",
                                          access_log=False, timeout_keep_alive=15))
 
     async def cleanup() -> None:
+        await publisher.close()
         await asyncio.to_thread(rl.close)
 
     await _run_corpus_services(http, background, cleanup=cleanup)
@@ -489,6 +568,7 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
 __all__ = [
     "ASYNC", "AUDIT_DEVICE_ENV", "AuditModel", "DB_NAME", "LEASE_MARGIN_PARAM", "LEASE_SPEED_PARAM", "OVERFLOW_PARAM",
     "PLANNED_TOKENS_PARAM", "PRICE_TICK_PARAM", "RL_MODE_ENV", "RUN_ENV", "RlAsync", "RlAsyncSettings",
-    "TRAINER_TOKEN_ENV", "WINDOW", "build_rl_async", "build_rl_trainer_router", "mount_rl_async", "rl_async_loops",
-    "rl_async_params", "rl_async_settings", "rl_mode", "run_rl_async_validator",
+    "TRAINER_BIND_ENV", "TRAINER_TOKEN_ENV", "WINDOW", "build_rl_async", "build_rl_trainer_app",
+    "build_rl_trainer_router", "mount_rl_async", "rl_async_loops", "rl_async_params", "rl_async_settings", "rl_mode",
+    "run_rl_async_validator", "trainer_bind",
 ]
