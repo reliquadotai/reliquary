@@ -13,8 +13,9 @@ One process on the controller, like the corpus validator: no window, batcher or 
   (``/rl/trainer/*``, bearer token): the detached async trainer (``reliquary train-async``, its own GPU box as
   today) takes groups from the buffer, reports them, adopts the checkpoints it publishes and feeds the prices.
 * **Loops** (``rl_async_loops``): the lease expiry sweep; the out-of-zone audits (``run_rl_audits``) against the
-  verify model held at the latest checkpoint (``RELIQUARY_RL_AUDIT_DEVICE``; without one every audit concludes
-  inconclusive: unpaid, unsanctioned), with ``RlSubmissions.run_audits``' retry cap; the ledger (ingest, settle,
+  verify model held at the latest checkpoint (``audit_source``: the remote proof worker's when
+  ``RELIQUARY_PROOF_EXECUTOR_MODE=remote``, ``remote_rl_audit``; else a local ``RELIQUARY_RL_AUDIT_DEVICE``; without
+  either every audit concludes inconclusive: unpaid, unsanctioned), with ``RlSubmissions.run_audits``' retry cap; the ledger (ingest, settle,
   publish the period archives through ``R2PeriodArchives``, as the corpus periods); the price tick when the trainer
   is idle (it ticks per step itself).
 * **Settlement:** the task must be declared with ``params.settlement = "period-ema-v1"`` (``reliquary tasks create
@@ -422,6 +423,16 @@ def _checkpoint_board(run: str, index_signer, validator_hotkey: str):
                              validator_hotkey=validator_hotkey, presign=presigner(client, bucket))
 
 
+def audit_source(env: Mapping[str, str] = os.environ) -> str | None:
+    """Where the audit forward runs: ``remote`` (the proof worker, V1's GPU-less controller), ``local`` (a device of
+    this process) or None (every audit inconclusive). ValueError when both are configured."""
+    remote = str(env.get("RELIQUARY_PROOF_EXECUTOR_MODE", "")).strip().lower() == "remote"
+    local = bool(str(env.get(AUDIT_DEVICE_ENV, "")).strip())
+    if remote and local:
+        raise ValueError(f"{AUDIT_DEVICE_ENV} is set while the proof executor is remote: audits run on one of them")
+    return "remote" if remote else "local" if local else None
+
+
 def _audit_model(device: str, checkpoint: str, load_kwargs: Mapping[str, Any], validator_hotkey: str,
                  work_dir: Path) -> AuditModel:
     import torch
@@ -458,14 +469,18 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     rl = build_rl_async(settings, path=state_dir / DB_NAME, grader=grader, prompt_range=ranges,
                         board=_checkpoint_board(settings.run, index_signer_for(wallet, signer_client),
                                                 validator_hotkey))
-    audit_model = None
-    device = os.environ.get(AUDIT_DEVICE_ENV, "").strip()
-    if device:
-        audit_model = await asyncio.to_thread(_audit_model, device, checkpoint, load_kwargs, validator_hotkey,
-                                              state_dir / "rl-audit-ckpt")
+    audit_model, source = None, audit_source()
+    if source == "remote":
+        from reliquary.validator.remote_rl_audit import RemoteAuditModel
+
+        audit_model = RemoteAuditModel.from_environment()
+        logger.info("out-of-zone audits run on the remote proof worker %s", audit_model.worker_id)
+    elif source == "local":
+        audit_model = await asyncio.to_thread(_audit_model, os.environ[AUDIT_DEVICE_ENV].strip(), checkpoint,
+                                              load_kwargs, validator_hotkey, state_dir / "rl-audit-ckpt")
     else:
-        logger.warning("%s unset: out-of-zone audits conclude inconclusive (first scans unpaid, no sanction)",
-                       AUDIT_DEVICE_ENV)
+        logger.warning("no audit model (%s unset, proof executor not remote): out-of-zone audits conclude "
+                       "inconclusive (first scans unpaid, no sanction)", AUDIT_DEVICE_ENV)
     token = os.environ.get(TRAINER_TOKEN_ENV, "").strip()
     if not token:
         logger.warning("%s unset: no trainer link is served; the async trainer cannot connect", TRAINER_TOKEN_ENV)
@@ -498,6 +513,6 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
 __all__ = [
     "ASYNC", "AUDIT_DEVICE_ENV", "AuditModel", "DB_NAME", "LEASE_MARGIN_PARAM", "LEASE_SPEED_PARAM", "OVERFLOW_PARAM",
     "PLANNED_TOKENS_PARAM", "PRICE_TICK_PARAM", "RL_MODE_ENV", "RUN_ENV", "RlAsync", "RlAsyncSettings",
-    "TRAINER_TOKEN_ENV", "WINDOW", "build_rl_async", "build_rl_trainer_router", "mount_rl_async", "rl_async_loops",
+    "TRAINER_TOKEN_ENV", "WINDOW", "audit_source", "build_rl_async", "build_rl_trainer_router", "mount_rl_async", "rl_async_loops",
     "rl_async_params", "rl_async_settings", "rl_mode", "run_rl_async_validator",
 ]

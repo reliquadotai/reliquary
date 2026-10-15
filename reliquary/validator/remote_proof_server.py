@@ -151,8 +151,10 @@ class ProofBackend:
 def create_proof_app(*, backend, worker_id: str, profile_id: str,
                      generation_contract_sha256: str, training_run_id: str,
                      repo_id: str, software_revision: str, proof_path_hash: str,
-                     environments: tuple[str, ...] | None = None, clock=time.time) -> FastAPI:
-    """App factory for a dedicated mTLS listener (never mount on public HTTP)."""
+                     environments: tuple[str, ...] | None = None, clock=time.time,
+                     rl_audit=None) -> FastAPI:
+    """App factory for a dedicated mTLS listener (never mount on public HTTP). ``rl_audit``
+    (``remote_rl_audit.RlAuditBackend``) also serves the async RL audit routes."""
     session_id = uuid.uuid4().hex
     if environments is None:
         from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV
@@ -450,6 +452,10 @@ def create_proof_app(*, backend, worker_id: str, profile_id: str,
         value = await read(request, ProofBatchRequest, MAX_BATCH_REQUEST_BYTES)
         return await prove_values(value.items, batch=True)
 
+    if rl_audit is not None:
+        from reliquary.validator.remote_rl_audit import mount_rl_audit
+        mount_rl_audit(app, rl_audit, worker_id=worker_id, read=read)
+
     # Responses: httpx already advertises gzip and decodes transparently, so the
     # client needs nothing for that direction. Requests: starlette decodes no
     # Content-Encoding at all, hence InflateRequest. Added last so it wraps
@@ -515,7 +521,13 @@ def main():
         started = time.monotonic()
         pool.start()
         logger.info("startup_stage=proof_model_load elapsed_seconds=%.3f", time.monotonic() - started)
+        from reliquary.validator.remote_rl_audit import rl_audit_backend_from_environment
+        # The async RL audits' own verify model (RELIQUARY_PROOF_RL_AUDIT_DEVICE), synced from the signed
+        # checkpoint index the controller forwards; its weights replace the base model's at the first sync.
+        rl_audit = rl_audit_backend_from_environment(
+            checkpoint=c.DEFAULT_BASE_MODEL, load_kwargs={"revision": c.DEFAULT_BASE_MODEL_REVISION})
         app = create_proof_app(
+            rl_audit=rl_audit,
             backend=ProofBackend(pool), worker_id=worker_id,
             profile_id=c.PROTOCOL_PROFILE_ID,
             generation_contract_sha256=digest(c.PROTOCOL_GENERATION_CONTRACT),

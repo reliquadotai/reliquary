@@ -820,15 +820,13 @@ Everything below needs a GPU testbed (P8 qualification) unless marked otherwise.
 - `train-async` on the 9B: single card and FSDP2 under torchrun (rank-0 gather per step as `state_fn`, the
   followers of `train-worker` reused), snapshot + delta size and time per step, anchor interval, HF backup upload
   and rotation under `ReliquaryForge/`.
-- The validator's audit model (`RELIQUARY_RL_AUDIT_DEVICE`): following the deltas on the controller's card and the
-  audit throughput (probation audits 100 % of a newcomer's out-of-zone groups). Without a device every audit is
-  inconclusive (first scans unpaid). V1's controller is CPU-only: either give it a card or move the audit forward
-  to the proof worker (its protocol has no async audit operation yet).
+- The validator's audit model, local (`RELIQUARY_RL_AUDIT_DEVICE`) or on the proof worker (V1, see "V1 operation"
+  below): following the deltas on the card next to the proof replicas (memory: one more bf16 copy plus the CPU
+  state) and the audit throughput (probation audits 100 % of a newcomer's out-of-zone groups; one worker forward
+  at a time, batch 1). Without either every audit is inconclusive (first scans unpaid).
 - Lease expiry (`rl_lease_reference_tokens_per_s`, margin) and starting quota numbers.
 - Not GPU, still open: the decision-D R2 segments of `rl_prompt_scans` (the `ObservationPublisher` reads a service
-  runtime's window events; the scans are served by `/rl/prompts/state` meanwhile); the remote signer has no index
-  operation (the async validator signs `/rl/checkpoint` with the local wallet and refuses `RELIQUARY_SIGNER_URL`);
-  axon publication of the async validator (miners use `--validator-url`); multi-turn envs (P3 grades single-turn
+  runtime's window events; the scans are served by `/rl/prompts/state` meanwhile); axon publication of the async validator (miners use `--validator-url`); multi-turn envs (P3 grades single-turn
   only).
 
 ### Service wiring as built (branch `feat/rl-async`)
@@ -885,6 +883,49 @@ RELIQUARY_RL_TRAINER_URL=http://<controller>:<port> RELIQUARY_RL_TRAINER_TOKEN=<
 # miner
 reliquary mine-async --environments math --validator-url http://<controller>:<port> --validator-hotkey <ss58>
 ```
+
+### V1 operation (branch `feat/rl-async-v1ops`)
+
+V1's controller holds no key and no GPU; both gaps are closed.
+
+- Remote signer, index operation: `POST /v1/rl/index/sign` (`signer/protocol.RlIndexSignRequest`): the index is
+  validated field by field (`RlCheckpointIndex`: strict, no extra field, `format` fixed, every key under
+  `rl/<run>/`, anchors <= latest, deltas `from < to <= latest`, bounded lists), the operation id binds netuid and
+  the SHA-256 of `index_signing_payload(index)`, and signer-01 rebuilds that payload (domain
+  `reliquary-ckpt-index/1\n` + canonical JSON) itself: no bytes are taken from the client. The run is fixed by
+  `RELIQUARY_SIGNER_RL_RUN` on signer-01 (unset: 403 `rl_index_operation_disabled`); journal cursor
+  `rl_index_version` may repeat (pruned index, new cumulative deltas) but never goes back (409); a signature lost
+  to a restart may be retried, like checkpoint signatures. Client: `RemoteSignerClient.sign_rl_index` (verifies
+  the signature against the expected hotkey). The async validator signs through it when `RELIQUARY_SIGNER_URL` is
+  set (`rl_async_service.index_signer_for`); `RlCheckpointBoard` now loads and signs off the event loop.
+- Remote audits (`validator/remote_rl_audit.py`), on the proof worker's mTLS listener: `POST /v1/rl/checkpoint`
+  takes the board's answer (signed index + presigned URLs); the worker checks the signature against
+  `RELIQUARY_PROOF_RL_VALIDATOR_HOTKEY` and rebuilds the latest version with `CheckpointSync` into a dedicated
+  verify model on `RELIQUARY_PROOF_RL_AUDIT_DEVICE` (base `DEFAULT_BASE_MODEL`, overwritten at the first anchor).
+  `POST /v1/rl/audit` takes a group's tokens, force spans and lease draw params (nonce, prompt, k; never uniforms:
+  the worker recomputes them through `protocol/rl_draw`) plus the expected version, runs `rl_audit.audit_forward`
+  and answers the `AuditResult` bound to the request digest; 409 when it holds another version (a restart), after
+  which the controller re-adopts once and retries. `RemoteAuditModel` is the controller's `AuditModel` over it
+  (`follow_once` / `audit`). The service picks the audit forward with `audit_source`: proof executor remote ->
+  worker; else `RELIQUARY_RL_AUDIT_DEVICE` -> local; else inconclusive; both -> refuses to start.
+  `remote_rl_audit.py` is part of the proof transport hash.
+
+Config to set on V1:
+
+```
+# signer-01
+RELIQUARY_SIGNER_RL_RUN=<run>                      # = the controller's RELIQUARY_RL_RUN (default: the task id)
+# proof worker
+RELIQUARY_PROOF_RL_AUDIT_DEVICE=cuda:0 RELIQUARY_PROOF_RL_VALIDATOR_HOTKEY=<validator ss58> \
+  [RELIQUARY_PROOF_RL_AUDIT_DIR=<scratch dir for anchor/delta downloads>]
+# controller (unchanged proof/signer client config; no RELIQUARY_RL_AUDIT_DEVICE)
+RELIQUARY_RL_MODE=async RELIQUARY_SIGNER_URL=... RELIQUARY_SIGNER_{CA,CERT,KEY,EXPECTED_HOTKEY}=... \
+  RELIQUARY_PROOF_EXECUTOR_MODE=remote RELIQUARY_PROOF_EXECUTOR_URL=https://<worker>:8445 \
+  RELIQUARY_PROOF_TLS_{CA,CERT,KEY}=... RELIQUARY_PROOF_EXPECTED_WORKER_ID=<id>
+```
+
+The worker must reach the `reliquary-public` presigned URLs (HTTPS only). Deploy signer-01 and the worker before
+the controller (both are additive; the transport hash changes with this release on both sides).
 
 ### P4 as built (branch `feat/rl-async-trainer`)
 
