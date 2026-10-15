@@ -338,6 +338,20 @@ class HttpRlTransport:
                 return None
             raise
 
+    async def observations(self, after: int) -> dict | None:
+        """The scan log's signed head and presigned URLs (``GET /rl/observations``); None while unpublished."""
+        try:
+            return await self._call("GET", f"{self._prefix}/observations", params={"after": str(int(after))})
+        except RequestRefused as exc:
+            if exc.retryable:
+                return None
+            raise
+
+    async def fetch(self, url: str) -> bytes:
+        response = await self._client.get(url)
+        response.raise_for_status()
+        return response.content
+
 
 class DryRunTransport:
     """An in-process validator for ``--dry-run`` and tests: grants every asked prompt within its quota (unless told
@@ -462,6 +476,25 @@ class AsyncMiner:
         self._load_journal()
 
     # --- prompt state and quota ------------------------------------------------------------------------
+    async def bootstrap_state(self) -> int:
+        """At start, fold the run's published scan log (``protocol/rl_scan_log``: signed segments in the
+        bucket, one download each) into the planners; ``/rl/prompts/state`` then continues from its last seq.
+        Returns the scans read (0 when the transport or the validator has no log)."""
+        from reliquary.protocol.rl_scan_log import read_scan_log, scans_as_page
+
+        observations = getattr(self.transport, "observations", None)
+        validator_hotkey = getattr(self.transport, "validator_hotkey", None)
+        if observations is None or not validator_hotkey:
+            return 0
+        events, _ = await read_scan_log(observations, self.transport.fetch, validator_hotkey)
+        if events:
+            page = scans_as_page(events)
+            for planner in self.planners.values():
+                if planner.cursor < page["cursor"]:
+                    planner.apply(page)
+            logger.info("prompt table bootstrapped from %d published scans (seq %d)", len(events), page["cursor"])
+        return len(events)
+
     async def refresh_state(self) -> None:
         for name, planner in self.planners.items():
             more = True
@@ -765,6 +798,10 @@ class AsyncMiner:
             await self.recover_leases()
         except RequestRefused as exc:
             logger.warning("open leases not recovered from the validator: %s", exc.reason)
+        try:
+            await self.bootstrap_state()
+        except Exception as exc:          # the incremental route covers everything the log would have
+            logger.warning("scan log not read (%s); paging /rl/prompts/state from the start", exc)
         tasks = [
             asyncio.create_task(self._every(self.refresh_state, config.state_poll_s, None, stop, "prompt state")),
             asyncio.create_task(self._every(self.refresh_quota, config.quota_poll_s, None, stop, "quota")),

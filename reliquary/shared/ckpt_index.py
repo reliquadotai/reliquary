@@ -52,6 +52,11 @@ def index_key(run: str) -> str:
     return f"{run_prefix(run)}/{INDEX_KEY}"
 
 
+def observations_root(run: str) -> str:
+    """The async validator's scan log (``validator/rl_observations``), beside the run's checkpoints."""
+    return f"{run_prefix(run)}/observations"
+
+
 def index_keys(index: Mapping[str, Any]) -> list[str]:
     keys = [f["key"] for a in index.get("anchors", []) for f in a["files"]]
     keys += [f["key"] for a in index.get("anchors", []) for f in a.get("model_files", [])]

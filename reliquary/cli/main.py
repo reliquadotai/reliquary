@@ -3774,12 +3774,26 @@ def mine_episodes(
         raise typer.Exit(code=4) from exc
 
 
+async def _discover_rl_validator() -> tuple[str, str | None]:
+    """The first validator axon on the metagraph (``submitter.discover_validator``): (url, hotkey)."""
+    from reliquary.infrastructure.chain import NETUID, close_subtensor, get_metagraph, get_subtensor
+    from reliquary.miner.submitter import discover_validator
+
+    subtensor = await get_subtensor()
+    try:
+        return discover_validator(await get_metagraph(subtensor, NETUID))
+    finally:
+        await close_subtensor(subtensor)
+
+
 @app.command("mine-async")
 def mine_async(
     environments: str = typer.Option(..., "--environments", help="Comma-separated single-turn RL environments"),
-    validator_url: str = typer.Option("", "--validator-url", help="The RL validator's URL"),
+    validator_url: str = typer.Option(
+        "", "--validator-url", help="The RL validator's URL (default: the validator's axon on the metagraph)"),
     validator_hotkey: str = typer.Option(
-        "", "--validator-hotkey", help="The RL validator's ss58 hotkey: leases and submissions are signed for it"),
+        "", "--validator-hotkey", help="The RL validator's ss58 hotkey: leases and submissions are signed for it "
+        "(default: the discovered validator's)"),
     wallet_name: str = typer.Option("default", help="Wallet name"),
     hotkey: str = typer.Option("default", help="Hotkey name"),
     wallet_path: str = typer.Option(os.getenv("BT_WALLET_PATH", ""), help="Optional wallet base path"),
@@ -3814,9 +3828,21 @@ def mine_async(
 
     setup_logging(log_level)
     names = tuple(name.strip() for name in environments.split(",") if name.strip())
-    if not dry_run and not (validator_url and validator_hotkey):
-        typer.echo("error: --validator-url and --validator-hotkey are required (or --dry-run)", err=True)
+    if not dry_run and validator_url and not validator_hotkey:
+        typer.echo("error: --validator-url needs --validator-hotkey (or give neither: discovery)", err=True)
         raise typer.Exit(code=2)
+    if not dry_run and not validator_url:
+        try:
+            validator_url, discovered = asyncio.run(_discover_rl_validator())
+        except Exception as exc:
+            typer.echo(f"error: no validator discovered on the metagraph ({exc}); pass --validator-url and "
+                       "--validator-hotkey", err=True)
+            raise typer.Exit(code=2) from exc
+        validator_hotkey = validator_hotkey or discovered or ""
+        if not validator_hotkey:
+            typer.echo("error: the discovered validator has no hotkey; pass --validator-hotkey", err=True)
+            raise typer.Exit(code=2)
+        typer.echo(f"validator discovered: {validator_url} ({validator_hotkey})")
     try:
         config = AsyncMinerConfig(environments=names, lease_batch=lease_batch, max_open=max_open,
                                   queue_groups=queue_groups, batch_groups=batch_groups,
@@ -4196,7 +4222,8 @@ def validate(
                     await run_rl_async_validator(
                         wallet=wallet, netuid=netuid, signer_client=signer_client, http_host=http_host,
                         http_port=http_port, entry=declared_entry, cap=task_config.emission_cap,
-                        checkpoint=checkpoint,
+                        checkpoint=checkpoint, subtensor=subtensor, external_ip=external_ip or None,
+                        external_port=external_port or None,
                         load_kwargs=({"revision": DEFAULT_BASE_MODEL_REVISION}
                                      if checkpoint == DEFAULT_BASE_MODEL else {}))
                 except (RuntimeError, ValueError) as exc:
@@ -4605,7 +4632,9 @@ def train_async() -> None:
     """Detached async trainer: train on the validator's buffer through the trainer link, publish one checkpoint
     per step as deltas into reliquary-public (rl-async-design.md §4.7-4.8; ``RELIQUARY_RL_MODE=async`` validator).
 
-    Environment: RELIQUARY_RL_TRAINER_URL, RELIQUARY_RL_TRAINER_TOKEN, RELIQUARY_RL_VALIDATOR_HOTKEY, R2_PUBLIC_*;
+    Environment: RELIQUARY_RL_TRAINER_URL (the validator's trainer listener, RELIQUARY_RL_TRAINER_BIND on its side,
+    default 127.0.0.1:8889: a private address or an SSH tunnel, not the public port), RELIQUARY_RL_TRAINER_TOKEN,
+    RELIQUARY_RL_VALIDATOR_HOTKEY, R2_PUBLIC_*;
     optional RELIQUARY_RL_BATCH_GROUPS, RELIQUARY_RL_STEPS_PER_CHECKPOINT, RELIQUARY_RL_ANCHOR_INTERVAL,
     RELIQUARY_RL_HF_BACKUP_PREFIX + RELIQUARY_RL_HF_BACKUP_EVERY (+ _KEEP, _MILESTONE_EVERY),
     RELIQUARY_RL_BASE_MODEL, RELIQUARY_TRAINER_BACKEND=fsdp2 under torchrun.

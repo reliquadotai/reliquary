@@ -22,8 +22,8 @@ from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from reliquary.validator.rl_async_service import (  # noqa: E402
-    ASYNC, AuditModel, PLANNED_TOKENS_PARAM, WINDOW, RlAsyncSettings, build_rl_async, build_rl_trainer_router, mount_rl_async,
-    rl_async_loops, rl_async_settings, rl_mode,
+    ASYNC, AuditModel, PLANNED_TOKENS_PARAM, WINDOW, RlAsyncSettings, build_rl_async, build_rl_trainer_app,
+    build_rl_trainer_router, mount_rl_async, rl_async_loops, rl_async_settings, rl_mode, trainer_bind,
 )
 from tests.unit.test_rl_submit import CAP, ENV, MathEnv, Tokenizer, group  # noqa: E402
 
@@ -112,6 +112,35 @@ def test_the_trainer_link_needs_its_token_and_round_trips(tmp_path):
     rl.close()
 
 
+def test_the_trainer_link_has_its_own_listener_never_the_public_port(tmp_path):
+    from reliquary.trainer.rl_link import TrainerLink
+    from reliquary.validator.server import ValidatorServer
+
+    assert trainer_bind({}) == ("127.0.0.1", 8889)
+    assert trainer_bind({"RELIQUARY_RL_TRAINER_BIND": "10.0.0.5:7000"}) == ("10.0.0.5", 7000)
+    for bad in ("7000", "host:", "host:99999", ":80"):
+        with pytest.raises(ValueError):
+            trainer_bind({"RELIQUARY_RL_TRAINER_BIND": bad})
+
+    class Board:
+        async def answer(self):
+            return {"index": {"latest": {"version": 3}}, "signature": "s"}
+
+    rl = components(tmp_path, board=Board())
+    server = ValidatorServer()
+    mount_rl_async(server, rl, validator_hotkey=VALIDATOR.ss58_address)
+    public = TestClient(server.app)
+    auth = {"Authorization": f"Bearer {TOKEN}"}
+    assert public.get("/rl/trainer/config", headers=auth).status_code == 404     # not on the public port
+    assert public.get("/rl/checkpoint").json()["signature"] == "s"
+    trainer = TestClient(build_rl_trainer_app(rl, token=TOKEN))
+    assert trainer.get("/rl/trainer/checkpoint").status_code == 401
+    assert trainer.get("/rl/checkpoint").status_code == 404                      # only the link lives here
+    link = TrainerLink("http://testserver", TOKEN, client=trainer, patience_s=0.0)
+    assert link.checkpoint()["index"]["latest"]["version"] == 3 and link.config()["run"] == "smoke"
+    rl.close()
+
+
 def test_a_lost_report_answer_is_resent_and_counts_as_done(tmp_path):
     from reliquary.trainer.rl_link import TrainerLink
 
@@ -163,13 +192,13 @@ def test_the_trainer_resumes_from_the_latest_published_checkpoint(tmp_path):
             return {"w": torch.zeros(1)}, self.version, None
 
     fresh = Link(None)
-    assert resume_weights(fresh, validator_hotkey="v", url="u", work_dir=tmp_path, sync=Sync(0), fetch=dict) is None
+    assert resume_weights(fresh, validator_hotkey="v", work_dir=tmp_path, sync=Sync(0), fetch=dict) is None
     behind = Link(3)
-    state, version, files = resume_weights(behind, validator_hotkey="v", url="u", work_dir=tmp_path, sync=Sync(4),
+    state, version, files = resume_weights(behind, validator_hotkey="v", work_dir=tmp_path, sync=Sync(4),
                                            fetch=dict)
     assert version == 4 and behind.adopted == [4] and files == Sync.model_dir      # published, never adopted
     with pytest.raises(RuntimeError):
-        resume_weights(Link(5), validator_hotkey="v", url="u", work_dir=tmp_path, sync=Sync(4), fetch=dict)
+        resume_weights(Link(5), validator_hotkey="v", work_dir=tmp_path, sync=Sync(4), fetch=dict)
 
 
 # --- end to end ---------------------------------------------------------------------------------------------------
@@ -246,8 +275,8 @@ async def test_end_to_end_lease_submit_train_pay_and_sync(tmp_path):
                               presign=lambda key: f"mem://{key}", refresh_seconds=0)
     rl = components(tmp_path, board=board)
     server = ValidatorServer()
-    mount_rl_async(server, rl, validator_hotkey=VALIDATOR.ss58_address, trainer_token=TOKEN)
-    served = Served(server.app)
+    mount_rl_async(server, rl, validator_hotkey=VALIDATOR.ss58_address)
+    served, trainer_served = Served(server.app), Served(build_rl_trainer_app(rl, token=TOKEN))
     try:
         # --- the trainer: a tiny model, a fresh book -> checkpoint 0 published and adopted through the link
         model_dir = tmp_path / "model"
@@ -265,7 +294,7 @@ async def test_end_to_end_lease_submit_train_pay_and_sync(tmp_path):
                 model.weight[0, :3] += 1.0
             return model
 
-        link = TrainerLink(served.url, TOKEN, patience_s=5.0)
+        link = TrainerLink(trainer_served.url, TOKEN, patience_s=5.0)
         publisher = DeltaPublisher(run="smoke", store=store, staging_dir=tmp_path / "staging", model_dir=model_dir)
         trainer = AsyncTrainer(model, config=AsyncTrainerConfig({ENV: 1.0}, batch_groups=4, wait_s=0.0),
                                buffer=link, submissions=link, book=link, prices=link, publisher=publisher,
@@ -353,5 +382,68 @@ async def test_end_to_end_lease_submit_train_pay_and_sync(tmp_path):
         assert await rl.ledger.publish(archives) == len(settled) and archives.written[0][0] == "rl-async"
     finally:
         served.stop()
+        trainer_served.stop()
         rl.close()
     assert time.monotonic() - started < 60
+
+
+# --- discovery ------------------------------------------------------------------------------------------------------
+async def test_the_async_validator_serves_its_axon_like_the_window_one(monkeypatch):
+    from types import SimpleNamespace
+
+    from reliquary.validator.axon import serve_axon_on_chain
+
+    served = []
+
+    class Subtensor:
+        async def serve_axon(self, **kw):
+            served.append(kw)
+            return SimpleNamespace(is_success=True)
+
+    monkeypatch.setattr(bt, "Axon", lambda **kw: SimpleNamespace(**kw))
+    wallet = SimpleNamespace(hotkey=VALIDATOR)
+    assert await serve_axon_on_chain(Subtensor(), wallet=wallet, netuid=81, ip="1.2.3.4", port=8888)
+    assert served[0]["netuid"] == 81 and (served[0]["axon"].ip, served[0]["axon"].port) == ("1.2.3.4", 8888)
+    assert not await serve_axon_on_chain(Subtensor(), wallet=wallet, netuid=81, ip=None, port=8888)   # no address
+
+    class Signer:
+        async def serve_axon(self, **kw):
+            served.append(("signer", kw))
+            return True
+
+    assert await serve_axon_on_chain(None, wallet=wallet, netuid=81, ip="1.2.3.4", port=9000, signer_client=Signer())
+    assert served[-1] == ("signer", {"netuid": 81, "ip": "1.2.3.4", "port": 9000})
+
+
+def test_mine_async_finds_the_validator_on_the_metagraph(monkeypatch):
+    from types import SimpleNamespace
+
+    from typer.testing import CliRunner
+
+    import reliquary.cli.main as cli
+    from reliquary.miner.submitter import discover_validator
+
+    meta = SimpleNamespace(validator_permit=[False, True], hotkeys=["5Miner", "5Validator"],
+                           axons=[SimpleNamespace(ip="9.9.9.9", port=1), SimpleNamespace(ip="1.2.3.4", port=8888)])
+    assert discover_validator(meta) == ("http://1.2.3.4:8888", "5Validator")
+
+    async def discovered():
+        return discover_validator(meta)
+
+    runs = []
+
+    async def run_async_miner(config, **kw):
+        runs.append(kw)
+
+    monkeypatch.setattr(cli, "_discover_rl_validator", discovered)
+    monkeypatch.setattr("reliquary.miner.rl_async.run_async_miner", run_async_miner)
+    monkeypatch.setattr(bt, "Wallet", lambda **kw: SimpleNamespace(**kw))
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["mine-async", "--environments", ENV])
+    assert result.exit_code == 0, result.output
+    assert (runs[-1]["validator_url"], runs[-1]["validator_hotkey"]) == ("http://1.2.3.4:8888", "5Validator")
+    result = runner.invoke(cli.app, ["mine-async", "--environments", ENV, "--validator-url", "http://x:1/",
+                                     "--validator-hotkey", "5Override"])
+    assert result.exit_code == 0 and (runs[-1]["validator_url"], runs[-1]["validator_hotkey"]) == ("http://x:1",
+                                                                                                    "5Override")
+    assert runner.invoke(cli.app, ["mine-async", "--environments", ENV, "--validator-url", "http://x:1"]).exit_code == 2

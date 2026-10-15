@@ -213,7 +213,7 @@ CREATE INDEX IF NOT EXISTS rl_leases_due ON rl_leases(state, expires_at);
 CREATE INDEX IF NOT EXISTS rl_leases_holder ON rl_leases(hotkey, state);
 CREATE TABLE IF NOT EXISTS rl_prompt_scans(seq INTEGER PRIMARY KEY AUTOINCREMENT, environment TEXT NOT NULL,
     prompt_idx INTEGER NOT NULL, k INTEGER NOT NULL, rewards TEXT NOT NULL, verdict TEXT NOT NULL,
-    first_scan INTEGER NOT NULL, at REAL NOT NULL);
+    first_scan INTEGER NOT NULL, at REAL NOT NULL, state TEXT, until_k INTEGER);
 CREATE TABLE IF NOT EXISTS rl_prompt_state(environment TEXT NOT NULL, prompt_idx INTEGER NOT NULL,
     state TEXT NOT NULL, until_k INTEGER, seq INTEGER NOT NULL, PRIMARY KEY(environment, prompt_idx));
 CREATE INDEX IF NOT EXISTS rl_prompt_state_seq ON rl_prompt_state(seq);
@@ -245,6 +245,10 @@ class LeaseBook:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.execute("PRAGMA synchronous=FULL")
             self.db.executescript(_SCHEMA)
+            columns = {row[1] for row in self.db.execute("PRAGMA table_info(rl_prompt_scans)")}
+            for column, kind in (("state", "TEXT"), ("until_k", "INTEGER")):   # a book from before the scan log
+                if column not in columns:
+                    self.db.execute(f"ALTER TABLE rl_prompt_scans ADD COLUMN {column} {kind}")
             self.db.commit()
             quota.attach(self.db, self.lock)
             self._boot()
@@ -540,15 +544,17 @@ class LeaseBook:
         with self._txn():
             prior = self.db.execute("SELECT state, until_k FROM rl_prompt_state WHERE environment=? AND prompt_idx=?",
                                     (environment, prompt_idx)).fetchone()
-            seq = self.db.execute("INSERT INTO rl_prompt_scans(environment, prompt_idx, k, rewards, verdict, "
-                                  "first_scan, at) VALUES(?,?,?,?,?,?,?)",
-                                  (environment, prompt_idx, checkpoint, json.dumps(rewards), verdict,
-                                   int(prior is None), now)).lastrowid
             if verdict == TOO_EASY or (prior is not None and prior[0] == BLACKLISTED):
                 state, until = BLACKLISTED, None
             else:
                 start = max(checkpoint, self.latest_checkpoint or 0)
                 state, until = COOLDOWN, max(start + cooldown, (prior or (0, 0))[1])
+            # The scan keeps the state it moved the prompt to: the published log (``rl_observations``) rebuilds
+            # every prompt's state from the scans alone.
+            seq = self.db.execute("INSERT INTO rl_prompt_scans(environment, prompt_idx, k, rewards, verdict, "
+                                  "first_scan, at, state, until_k) VALUES(?,?,?,?,?,?,?,?,?)",
+                                  (environment, prompt_idx, checkpoint, json.dumps(rewards), verdict,
+                                   int(prior is None), now, state, until)).lastrowid
             self.db.execute("INSERT OR REPLACE INTO rl_prompt_state(environment, prompt_idx, state, until_k, seq) "
                             "VALUES(?,?,?,?,?)", (environment, prompt_idx, state, until, seq))
         return Scan(int(seq), environment, prompt_idx, checkpoint, rewards, verdict, prior is None, now)
