@@ -650,7 +650,7 @@ def _episode_stop_picks(
     seed_u_values: list[float],
 ) -> tuple[bool | None, int | None, float | None]:
     """Each model turn that ends on a stop token (a natural stop or a tool-call stop) must end
-    on the forced pick ``pick(warp(logits[t - 1]), u_j)``, ``j`` its model-token offset in the episode.
+    on the profile's forced pick for ``u_j`` over ``logits[t - 1]``, ``j`` its model-token offset in the episode.
     A turn cut by its cap ends on no stop: the admission's structural check (exactly the cap) covers it.
     ``(True, None, None)`` when every checked turn passed, ``(False, turn, cdf_miss)`` at the first that did
     not (a stop the u-stream does not reach fails too, with no distance), ``(None, None, None)`` when no turn
@@ -1181,7 +1181,7 @@ def _gpu_terminal_forced_pick_diagnostics(
     """Diagnose whether the final token is the forced inverse-CDF pick.
 
     Recomputes the protocol draw the miner was obliged to make at the position
-    that produced ``tokens[-1]``: ``pick(warp(logits[t-1]), u_j)``. A match means
+    that produced ``tokens[-1]``: the profile's pick for ``u_j`` over ``logits[t-1]``. A match means
     the stop was the one legal token there — the miner cannot steer ``u``, so this
     cannot be manufactured, while a forged EOS (injected where ``u`` selected some
     other token) does not match.

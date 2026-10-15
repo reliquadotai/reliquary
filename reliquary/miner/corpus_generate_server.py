@@ -315,7 +315,8 @@ class VllmTurnCore:
 
     def __init__(self, checkpoint_dir: str, *, sampling, proof, stop_token_ids,
                  max_total_tokens: int, max_num_seqs: int = 16,
-                 gpu_memory_utilization: float | None = None, forced: bool = False) -> None:
+                 gpu_memory_utilization: float | None = None, forced: bool = False,
+                 lm_head_fp32: bool | None = None) -> None:
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
         os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
         from vllm import LLM, SamplingParams
@@ -340,6 +341,11 @@ class VllmTurnCore:
 
             require_runner_forced_draw()
             extra["logits_processors"] = [RunnerForcedSeedVLLMProcessor]
+            from reliquary.miner.vllm_generation import FP32_HEAD_OVERRIDES, default_lm_head_fp32
+
+            # The draw reads the profile's logits: an fp32 head when it says so.
+            if default_lm_head_fp32() if lm_head_fp32 is None else lm_head_fp32:
+                extra["hf_overrides"] = dict(FP32_HEAD_OVERRIDES)
         self._llm = LLM(model=checkpoint_dir, dtype="bfloat16", enable_prefix_caching=True,
                         seed=secrets.randbelow(2**31 - 1) + 1, max_model_len=max_total_tokens,
                         max_num_seqs=max_num_seqs, **memory, **extra)

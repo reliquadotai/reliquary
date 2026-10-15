@@ -19,7 +19,7 @@ import torch
 from transformers import LogitsProcessor, LogitsProcessorList
 
 from reliquary.constants import T_PROTO, TOP_K_PROTO, TOP_P_PROTO
-from reliquary.environment.forced_sampling import pick, u_at, warp
+from reliquary.environment.forced_sampling import DRAW_INVERSE_CDF, pick, pick_rows, u_at, warp
 
 # HF sampling-warper kwargs the forced path must NOT pass: the processor already
 # applies the protocol warp (T_PROTO/top_k/top_p), so leaving these on generate()
@@ -68,7 +68,11 @@ class ForcedSeedLogitsProcessor(LogitsProcessor):
                  base_offsets: list[int], start_len: int,
                  temperature: float = T_PROTO, top_k: int = TOP_K_PROTO,
                  top_p: float = TOP_P_PROTO, seed_pool=None,
-                 seeds=None) -> None:
+                 seeds=None, draw: str | None = None) -> None:
+        from reliquary.miner.vllm_generation import default_draw
+
+        # The profile's draw: inverse CDF over the warp, or Gumbel-max over the raw scores.
+        self.draw = default_draw() if draw is None else draw
         self.randomness = randomness
         self.hotkey = hotkey
         self.prompt_idx = int(prompt_idx)
@@ -106,9 +110,14 @@ class ForcedSeedLogitsProcessor(LogitsProcessor):
                  if self.seed_pool is not None else
                  u_at(self.randomness, self.prompt_idx,
                       self.checkpoint_hash, self.rollout_indices[r], t))
-            probs = warp(scores[r], t=self.temperature,
-                         top_k=self.top_k, top_p=self.top_p)
-            out[r, pick(probs, u)] = 0.0
+            if self.draw == DRAW_INVERSE_CDF:
+                probs = warp(scores[r], t=self.temperature,
+                             top_k=self.top_k, top_p=self.top_p)
+                out[r, pick(probs, u)] = 0.0
+            else:
+                picked = pick_rows(scores[r:r + 1], [u], draw=self.draw, t=self.temperature,
+                                   top_k=self.top_k, top_p=self.top_p)
+                out[r, int(picked[0])] = 0.0
         return out
 
 
