@@ -11,6 +11,7 @@ import random
 
 import pytest
 
+from reliquary.constants import prompt_cooldown_windows_for_environment
 from reliquary.validator.rl_lease_quota import QuotaConfig, QuotaController
 from reliquary.validator.rl_leases import (
     BLACKLISTED, COOLING, IN_ZONE, QUOTA, RESTART_GRACE_S, SECRET_REVEAL_LAG, STALE, TAKEN, TOO_EASY, TOO_HARD,
@@ -376,7 +377,7 @@ def test_too_easy_blacklists_the_prompt_for_the_run(tmp_path):
 
 @pytest.mark.parametrize("verdict", [IN_ZONE, TOO_HARD, TRUNCATED])
 def test_in_zone_too_hard_and_truncated_cool_down_then_lease_again(tmp_path, verdict):
-    book = book_at(tmp_path, cooldown={ENV: 3})
+    book = book_at(tmp_path, cooldown_of={ENV: 3}.__getitem__)
     book.adopt_checkpoint(10)
     book.record_outcome(ENV, 1, 9, binary(8), verdict)                   # leased at 9: counts from the latest, 10
     (answer,) = book.grant([ask("A", [1, 2], k=10)])
@@ -390,15 +391,29 @@ def test_in_zone_too_hard_and_truncated_cool_down_then_lease_again(tmp_path, ver
 
 
 def test_a_later_outcome_never_shortens_a_cooldown(tmp_path):
-    book = book_at(tmp_path, cooldown={ENV: 10})
+    book = book_at(tmp_path, cooldown_of={ENV: 10}.__getitem__)
     book.adopt_checkpoint(20)
     book.record_outcome(ENV, 1, 20, binary(8), IN_ZONE)
     book.record_outcome(ENV, 1, 5, binary(0), TOO_HARD)
     assert book.prompt_state()["prompts"][0]["until_k"] == 30
 
 
+def test_the_cooldown_is_the_profiles_per_env_value_read_at_each_outcome(tmp_path):
+    assert LeaseBookConfig(expiry_s={ENV: 1.0}).cooldown_of is prompt_cooldown_windows_for_environment
+    live = {ENV: 5}
+    book = book_at(tmp_path, cooldown_of=live.__getitem__)
+    book.adopt_checkpoint(0)
+    book.record_outcome(ENV, 1, 0, binary(8), IN_ZONE)
+    live[ENV] = 2                                                         # an operator changes it live
+    book.record_outcome(ENV, 2, 0, binary(8), IN_ZONE)
+    assert [p["until_k"] for p in book.prompt_state()["prompts"]] == [5, 2]   # applies to the next cooldown only
+    live[ENV] = -1
+    with pytest.raises(ValueError):
+        book.record_outcome(ENV, 3, 0, binary(8), IN_ZONE)
+
+
 def test_only_the_first_scan_of_a_prompt_in_the_run_is_flagged(tmp_path):
-    book = book_at(tmp_path, cooldown={ENV: 1})
+    book = book_at(tmp_path, cooldown_of=lambda env: 1)
     book.adopt_checkpoint(0)
     first = book.record_outcome(ENV, 1, 0, binary(0), TOO_HARD)
     again = book.record_outcome(ENV, 1, 2, binary(0), TOO_HARD)
@@ -429,7 +444,8 @@ def test_the_prompt_view_is_incremental_and_names_no_hotkey(tmp_path):
     full = book.prompt_state()
     assert [s["prompt_idx"] for s in full["scans"]] == [1, 2, 3] and full["cursor"] == full["scans"][-1]["seq"]
     assert [(p["prompt_idx"], p["state"], p["until_k"]) for p in full["prompts"]] == [
-        (1, "blacklisted", None), (2, "cooldown", 256), (3, "cooldown", 256)]
+        (1, "blacklisted", None), (2, "cooldown", prompt_cooldown_windows_for_environment(ENV)),
+        (3, "cooldown", prompt_cooldown_windows_for_environment(OTHER_ENV))]
     assert full["scans"][0]["rewards"] == binary(16) and full["scans"][0]["first_scan"] is True
     assert "hotkey-of-the-miner" not in repr(full) and "nonce" not in repr(full)
     # paging: a cursor returns only what moved after it, and a prompt once per page with its current state

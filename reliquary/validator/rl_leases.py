@@ -15,7 +15,8 @@ generates them, and every lease ends in a submission or an expiry (there is no r
 * **Prompt lifecycle** (§4.5): ``record_outcome`` (called by the submission path, P3, once a group is graded)
   appends the scan to a public history and moves the prompt: too easy is blacklisted for the run; in zone, too
   hard and truncated cool down until checkpoint ``latest + cooldown`` (``CooldownMap``'s half-open rule, in
-  checkpoints: leasable again once the latest k reaches it). A never-scanned prompt has no row and is leasable.
+  checkpoints: leasable again once the latest k reaches it; the per-env cooldown is read at each outcome). A
+  never-scanned prompt has no row and is leasable.
   ``classify_group`` gives the verdict from the rewards and truncation flags. ``prompt_state`` is the miners'
   incremental view (no hotkey, no token): states and scans after a cursor.
 * **Stale:** a lease on a k that is not adopted, or whose S_k is revealed, is refused (§4.6: leases only on
@@ -52,7 +53,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from reliquary.constants import MAX_TRUNCATED_PER_SUBMISSION, SIGMA_MIN_V4
+from reliquary.constants import MAX_TRUNCATED_PER_SUBMISSION, SIGMA_MIN_V4, prompt_cooldown_windows_for_environment
 from reliquary.validator.rl_lease_quota import QuotaController
 
 TAKEN, COOLING, BLACKLISTED, QUOTA, STALE = "taken", "cooling", "blacklisted", "quota", "stale"
@@ -70,7 +71,6 @@ MAX_PROMPTS_PER_REQUEST = 1024
 INTERVAL_S = 1.0          # the collection interval inside which arrival order buys nothing
 RESTART_GRACE_S = 120.0   # what a lease that fell due while the validator was down gets at boot
 SECRET_REVEAL_LAG = 16    # S_k is revealed, and k stops being leasable, once k < latest - this
-COOLDOWN_CHECKPOINTS = 256  # PROPOSED until qualification sets it per env (decision E)
 MAX_SCANS_PER_PAGE = 1000
 
 
@@ -187,18 +187,16 @@ class LeaseBookConfig:
     expiry_s: Mapping[str, float]                              # per served env: ``lease_expiry_s``
     max_lag: int = SECRET_REVEAL_LAG
     prompt_range: Mapping[str, tuple[int, int]] | None = None  # per env: ``rl_prompt_ranges.rl_prompt_range``
-    cooldown: Mapping[str, int] | None = None                  # per env, in checkpoints (``COOLDOWN_CHECKPOINTS``)
+    # Decision E: a static per-env cooldown set by an operator, read at each outcome so a live change applies to the
+    # next cooldown. The profile's ``prompt_cooldown_windows`` counts checkpoints in the async protocol; the service
+    # can pass its live schedule instead.
+    cooldown_of: Callable[[str], int] = prompt_cooldown_windows_for_environment
 
     def __post_init__(self) -> None:
         if not self.expiry_s or any(not (float(v) > 0) for v in self.expiry_s.values()):
             raise ValueError("every served environment needs a positive lease expiry")
         if self.max_lag < 0:
             raise ValueError("max_lag must be non-negative")
-        if any(type(v) is not int or v < 0 for v in (self.cooldown or {}).values()):
-            raise ValueError("cooldowns must be non-negative integers")
-
-    def cooldown_of(self, environment: str) -> int:
-        return (self.cooldown or {}).get(environment, COOLDOWN_CHECKPOINTS)
 
 
 _SCHEMA = """
@@ -466,6 +464,8 @@ class LeaseBook:
         rewards = tuple(float(r) for r in rewards)
         if not rewards or not all(math.isfinite(r) for r in rewards):
             raise ValueError("finite rewards required")
+        cooldown = self.config.cooldown_of(environment)
+        _u64(cooldown)
         now = float(self.clock()) if now is None else now
         with self._txn():
             prior = self.db.execute("SELECT state, until_k FROM rl_prompt_state WHERE environment=? AND prompt_idx=?",
@@ -478,7 +478,7 @@ class LeaseBook:
                 state, until = BLACKLISTED, None
             else:
                 start = max(checkpoint, self.latest_checkpoint or 0)
-                state, until = COOLDOWN, max(start + self.config.cooldown_of(environment), (prior or (0, 0))[1])
+                state, until = COOLDOWN, max(start + cooldown, (prior or (0, 0))[1])
             self.db.execute("INSERT OR REPLACE INTO rl_prompt_state(environment, prompt_idx, state, until_k, seq) "
                             "VALUES(?,?,?,?,?)", (environment, prompt_idx, state, until, seq))
         return Scan(int(seq), environment, prompt_idx, checkpoint, rewards, verdict, prior is None, now)

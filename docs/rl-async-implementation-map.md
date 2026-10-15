@@ -656,8 +656,9 @@ P2 and P1a can run in parallel. P5 can start once P1a fixes the v* format.
   `SIGMA_MIN_V4` = 0.24, at most `MAX_TRUNCATED_PER_SUBMISSION` truncated, then mean >= 0.5 too easy, else too
   hard); `LeaseBook.record_outcome(env, prompt, k, rewards, verdict)` (P3 calls it after grading) appends to
   `rl_prompt_scans` (with `first_scan` for P5) and sets `rl_prompt_state`: too easy = blacklisted for the run, every
-  other verdict = cooldown until `latest + cooldown` checkpoints (per env, default `COOLDOWN_CHECKPOINTS` = 256,
-  PROPOSED; `CooldownMap`'s half-open rule; C6). `prompt_state(since)` is the incremental miner view. The former
+  other verdict = cooldown until `latest + cooldown` checkpoints (`LeaseBookConfig.cooldown_of`, default the
+  profile's per-env `prompt_cooldown_windows_for_environment` counted in checkpoints, read at each outcome so a live
+  operator change applies to the next cooldown, decision E; `CooldownMap`'s half-open rule; C6). `prompt_state(since)` is the incremental miner view. The former
   `checkpoint_cooldown(maps)` predicate is gone: the cooldown now lives in the lease DB.
 - `reliquary/validator/rl_lease_quota.py`: `QuotaController` (AIMD cap with slow start, halving on expiry,
   Little's-law target `headroom x throughput x latency` once steady, persisted in the lease book's file).
