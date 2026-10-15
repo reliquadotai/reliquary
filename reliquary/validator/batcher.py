@@ -5180,6 +5180,7 @@ class GrpoWindowBatcher:
             rollout._validated_force_span = None
             rollout._validated_termination_path = None
             rollout._validated_completion_logprobs = None
+            rollout._forced_draw_uniforms = None
             # Per-position forced-seed uniforms for this rollout's teacher-forced
             # consistency check. Read completion_length here (ahead of the
             # ``completion_len`` computed later at the sparse-outputs section)
@@ -5333,6 +5334,12 @@ class GrpoWindowBatcher:
             rollout._validated_completion_logprobs = (
                 _verify_logprobs_for_training(proof, _seed_completion_len)
             )
+            from reliquary.validator.training import training_loss
+
+            if training_loss() == "substitution":
+                # The verifier's uniforms, one per policy position: the trainer
+                # recomputes v* with them (substitution loss).
+                rollout._forced_draw_uniforms = list(seed_u)
             grp_stoch += proof.seed_n_stochastic
             grp_match += proof.seed_n_match
             seed_per_rollout.append((proof.seed_n_stochastic, proof.seed_n_match))
