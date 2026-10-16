@@ -1004,6 +1004,14 @@ task declared for period settlement refuses to start in window mode).
   `BackgroundHfBackup` (`RELIQUARY_RL_HF_BACKUP_PREFIX` / `_EVERY` / `_KEEP` / `_MILESTONE_EVERY`, repos under
   `ReliquaryForge/`); FSDP2 = `broadcasting_train_step` + rank-0 `gather_full_state_dict` as `state_fn`, followers
   of `train-worker`. A failed step is fatal (restart resumes from the last adopted checkpoint).
+- wandb (opt-in, `WANDB_API_KEY`; `WANDB_PROJECT` / `WANDB_ENTITY`): one run per process in the group
+  `{validator hotkey[:8]}-{run}`. `...-trainer`: one row per step at `global_step_hint + steps` (monotonic across
+  resumes) = `train_step`'s metrics + the gate's `async/*` + `async/wait_s`, `train_s`, `step_s`, `snapshot_s`,
+  `publish_wait_s`, completion tokens and tokens/s, peak GPU memory, the last publication (`publish_s`,
+  `delta_bytes`); a skipped step's rows ride on the next one. `...-controller` (`rl_metrics.controller_metrics`,
+  every 60 s): price multiplier and supply / demand / ratio per env, buffer per env and state, leases (open,
+  closed in the minute by state, issued per env), arrived groups per env and verdict, events, audit verdicts and
+  queue, pay accrued per kind, active and banned miners, mean quota cap, trainer speed.
 - Smoke test `tests/unit/test_rl_async_service.py::test_end_to_end_lease_submit_train_pay_and_sync` (CPU, < 1 s):
   uvicorn on a socket, `mine-async`'s `AsyncMiner` with `HttpRlTransport` and a fake generator, checkpoint 0 synced
   from `/rl/checkpoint`, leases -> submissions (in zone and 0/16) -> buffer and probation audits (inconclusive),

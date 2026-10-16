@@ -304,3 +304,28 @@ def test_a_take_whose_answer_was_lost_is_requeued_before_the_next_step():
     trainer, subs, _, _ = loop(model, book, buffer, batch=1)
     assert trainer.run_once() == "trained" and "g" in subs.reports
     trainer.close()
+
+
+def test_one_wandb_row_per_step_with_the_step_timings(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from reliquary.validator import telemetry
+
+    fake_wandb = MagicMock()
+    monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+    monkeypatch.setattr(telemetry, "_enabled", True)
+    monkeypatch.setattr(telemetry, "_held", None)
+    model, book = _Model(), Book(latest=3)
+    buffer = TrainingBuffer(book)
+    buffer.push(submitted(model, "good", arrived=1.0))
+    buffer.push(submitted(model, "other", arrived=0.0))
+    trainer, *_ = loop(model, book, buffer)
+    trainer.global_step_hint = 30
+    assert trainer.run_once() == "trained"
+    trainer.close()
+    fake_wandb.log.assert_called_once()
+    row, step = fake_wandb.log.call_args.args[0], fake_wandb.log.call_args.kwargs["step"]
+    assert step == 31                                    # after a resume the hint keeps the steps increasing
+    assert "train/lr" in row and row["async/groups_accepted"] == 2
+    assert {"async/wait_s", "async/train_s", "async/step_s", "async/snapshot_s", "async/publish_wait_s"} <= set(row)
+    assert row["async/completion_tokens"] == 2 * ROLLOUTS * N_TOK

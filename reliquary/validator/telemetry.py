@@ -20,14 +20,17 @@ logger = logging.getLogger(__name__)
 _run: Any = None
 _enabled: bool = False
 _log_warned: bool = False  # suppress repeated log-path warnings
+_held: dict | None = None  # rows collected between hold() and flush() (one row per async trainer step)
 
 
 def is_active() -> bool:
     return _enabled
 
 
-def init(hotkey_ss58: str, config: dict) -> None:
-    """Initialise wandb if ``WANDB_API_KEY`` is set. No-op otherwise.
+def init(hotkey_ss58: str, config: dict, *, role: str | None = None, version: str | None = None) -> None:
+    """Initialise wandb if ``WANDB_API_KEY`` is set. No-op otherwise. ``role`` (async RL: ``trainer`` /
+    ``controller``) gives each process its own run, ``{hotkey[:8]}-{version}-{role}``, grouped by
+    ``{hotkey[:8]}-{version}``; ``version`` (the async run name) stands in for ``WANDB_TRAINING_VERSION``.
 
     Fail-soft: any exception (ImportError, network, auth) disables
     telemetry for the rest of the session and logs a warning.
@@ -37,10 +40,11 @@ def init(hotkey_ss58: str, config: dict) -> None:
         logger.info("wandb: WANDB_API_KEY not set, telemetry disabled")
         return
 
-    version = os.getenv("RELIQUARY_WANDB_VERSION", WANDB_TRAINING_VERSION)
+    version = os.getenv("RELIQUARY_WANDB_VERSION") or version or WANDB_TRAINING_VERSION
     project = os.getenv("WANDB_PROJECT", WANDB_PROJECT)
     entity = os.getenv("WANDB_ENTITY")
-    run_id = f"{hotkey_ss58[:8]}-{version}"
+    group = f"{hotkey_ss58[:8]}-{version}"
+    run_id = group if role is None else f"{group}-{role}"
 
     try:
         import wandb  # lazy: optional dependency
@@ -48,6 +52,8 @@ def init(hotkey_ss58: str, config: dict) -> None:
             project=project,
             entity=entity,
             id=run_id,
+            group=None if role is None else group,
+            job_type=role,
             resume="allow",
             config=config,
         )
@@ -70,6 +76,9 @@ def log_training_step(metrics: dict, step: int | None) -> None:
     global _log_warned
     if not _enabled:
         return
+    if _held is not None:
+        _held.update(metrics)
+        return
     try:
         import wandb  # already imported successfully in init()
         # ``step=`` disables W&B's implicit commit in some client versions.
@@ -80,6 +89,20 @@ def log_training_step(metrics: dict, step: int | None) -> None:
         if not _log_warned:
             logger.warning("wandb: log failed (%s), suppressing further warnings", e)
             _log_warned = True
+
+
+def hold() -> None:
+    """Collect the next ``log_training_step`` rows instead of sending them, until ``flush``."""
+    global _held
+    if _held is None:           # a skipped step's rows stay held for the next one
+        _held = {}
+
+
+def flush(extra: dict, step: int | None) -> None:
+    """Send what ``hold`` collected and ``extra`` as one row at ``step``."""
+    global _held
+    held, _held = _held or {}, None
+    log_training_step({**held, **extra}, step)
 
 
 def update_config(values: dict) -> None:
@@ -120,7 +143,8 @@ def finish() -> None:
 
 def _reset_for_tests() -> None:
     """Test-only helper: reset module state so each test starts fresh."""
-    global _run, _enabled, _log_warned
+    global _run, _enabled, _log_warned, _held
     _run = None
     _enabled = False
     _log_warned = False
+    _held = None

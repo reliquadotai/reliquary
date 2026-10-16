@@ -454,3 +454,22 @@ def test_mine_async_finds_the_validator_on_the_metagraph(monkeypatch):
     assert result.exit_code == 0 and (runs[-1]["validator_url"], runs[-1]["validator_hotkey"]) == ("http://x:1",
                                                                                                     "5Override")
     assert runner.invoke(cli.app, ["mine-async", "--environments", ENV, "--validator-url", "http://x:1"]).exit_code == 2
+
+
+def test_the_controller_wandb_row_reads_prices_buffer_leases_and_miners(tmp_path):
+    import time
+
+    from reliquary.validator.rl_leases import LeaseRequest
+    from reliquary.validator.rl_metrics import controller_metrics
+
+    rl = components(tmp_path)
+    rl.book.adopt_checkpoint(0)
+    leases = rl.book.grant([LeaseRequest("A", ENV, (3, 4), 0)])[0].leases
+    assert rl.submissions.submit(leases[0].lease_id, "A", group(8))["verdict"] == "in_zone"
+    rl.prices.note_speed(6_000, 3.0)
+    row = controller_metrics(rl, time.time())
+    assert row[f"price/{ENV}/multiplier"] > 0 and row[f"buffer/{ENV}/queued"] == 1
+    assert row["leases/open"] == 1 and row["leases/submitted"] == 1 and row[f"leases_issued/{ENV}"] == 2
+    assert row[f"groups/{ENV}/in_zone"] == 1 and row["miners/active"] == 1 and row["miners/banned"] == 0
+    assert row["trainer/completion_tokens_per_s"] == pytest.approx(2_000)
+    rl.close()

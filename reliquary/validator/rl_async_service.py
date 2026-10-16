@@ -446,10 +446,13 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
                    publisher=None) -> list:
     """The background coroutines of the service (run until cancelled). ``publisher``: the scan log's
     ``ObservationPublisher`` (``rl_observations.scan_publisher``)."""
+    from reliquary.validator import telemetry
+    from reliquary.validator.rl_metrics import METRICS_EVERY_S, controller_metrics
     from reliquary.validator.rl_observations import FLUSH_EVERY_S
 
     periods = {"expire": EXPIRE_EVERY_S, "audit": AUDIT_EVERY_S, "ledger": LEDGER_EVERY_S, "price": PRICE_EVERY_S,
-               "checkpoint": CHECKPOINT_FOLLOW_EVERY_S, "observations": FLUSH_EVERY_S, **dict(every or {})}
+               "checkpoint": CHECKPOINT_FOLLOW_EVERY_S, "observations": FLUSH_EVERY_S, "metrics": METRICS_EVERY_S,
+               **dict(every or {})}
 
     async def expire() -> None:
         expired = await asyncio.to_thread(rl.book.expire_due)
@@ -487,8 +490,14 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
         while not publisher.disabled and await publisher.flush() is not None:
             pass
 
+    async def metrics() -> None:
+        row = await asyncio.to_thread(controller_metrics, rl, float(clock()), periods["metrics"])
+        telemetry.log_training_step(row, step=None)
+
     loops = [_every(expire, periods["expire"], "expiry sweep"), _every(audit, periods["audit"], "audits"),
              _every(ledger, periods["ledger"], "ledger"), _every(price, periods["price"], "price tick")]
+    if telemetry.is_active():
+        loops.append(_every(metrics, periods["metrics"], "wandb metrics"))
     if audit_model is not None:
         loops.append(_every(follow, periods["checkpoint"], "audit checkpoint"))
     if publisher is not None:
@@ -657,6 +666,12 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     state_dir = _validator_state_dir()
     state_dir.mkdir(parents=True, exist_ok=True)
     rl = build_rl_async(settings, path=state_dir / DB_NAME, grader=grader, prompt_range=ranges)
+    from reliquary.validator import telemetry
+
+    telemetry.init(validator_hotkey, {"task_id": settings.task_id, "run": settings.run, "cap": cap,
+                                      "targets": dict(settings.targets),
+                                      "max_pending_groups": settings.max_pending_groups},
+                   role="controller", version=settings.run)
     publisher = _public_boards(rl, wallet, validator_hotkey, signer_client)
     audit_model, source = None, audit_source()
     if source == "remote":
@@ -722,6 +737,7 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
                 logger.exception("rl lease sessions not drained at shutdown")
         await publisher.close()
         await asyncio.to_thread(rl.close)
+        telemetry.finish()
 
     await _run_corpus_services(http, background, cleanup=cleanup)
 

@@ -101,6 +101,7 @@ def run_async_train_worker() -> None:
         trainer_backend,
     )
     from reliquary.trainer.rl_link import TrainerLink
+    from reliquary.validator import telemetry
     from reliquary.validator.training import configure_distributed, reset_training_state, train_step
 
     dist_ctx = channel = None
@@ -122,6 +123,10 @@ def run_async_train_worker() -> None:
         settings = async_trainer_settings()
         link = TrainerLink(settings["url"], settings["token"])
         task = link.config()
+        telemetry.init(settings["validator_hotkey"], {
+            "task_id": task["task_id"], "run": task["run"], "targets": task["targets"], "backend": backend,
+            "batch_groups": settings["batch_groups"], "steps_per_checkpoint": settings["steps_per_checkpoint"],
+            "gpus": dist_ctx.world_size if dist_ctx is not None else 1}, role="trainer", version=str(task["run"]))
         state_dir: Path = settings["state_dir"]
         state_dir.mkdir(parents=True, exist_ok=True)
         resumed = resume_weights(link, validator_hotkey=settings["validator_hotkey"], work_dir=state_dir / "resume")
@@ -198,6 +203,7 @@ def run_async_train_worker() -> None:
             trainer.close()
             if backup is not None:
                 backup.close(timeout=60)
+            telemetry.finish()
     finally:
         # Followers block on the next command; release them on any exit.
         if channel is not None:

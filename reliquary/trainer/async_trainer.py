@@ -57,6 +57,7 @@ from reliquary.constants import (
 )
 from reliquary.protocol.rl_draw import pooled_rate, rollout_rate
 from reliquary.services.exploration import AUDIT_FAILURE_STATISTICAL
+from reliquary.validator import telemetry
 from reliquary.validator.rl_buffer import SubmittedGroup
 from reliquary.validator.rl_leases import SECRET_REVEAL_LAG
 from reliquary.validator.training import TrainingStepSkipped, train_step as _default_train_step
@@ -193,6 +194,23 @@ def training_group(group: SubmittedGroup, *, slot0: int, index: int) -> SimpleNa
                            environment=group.environment)
 
 
+def _reset_peak_memory() -> None:
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
+def _peak_memory() -> dict[str, float]:
+    """This process's peak CUDA memory over the step (rank 0 under FSDP2)."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return {}
+    return {"async/gpu_peak_allocated_gb": torch.cuda.max_memory_allocated() / 2**30,
+            "async/gpu_peak_reserved_gb": torch.cuda.max_memory_reserved() / 2**30}
+
+
 def save_snapshot(snapshot: Mapping[str, Any], folder: Path) -> None:
     from reliquary.shared.ckpt_delta import write_anchor_shards
 
@@ -242,6 +260,8 @@ class AsyncTrainer:
         self.since_checkpoint = 0
         self.published: list[int] = []
         self.last_step: dict = {}
+        self.skipped = 0
+        self.last_publication: dict = {}
         self.version = book.latest_checkpoint
         if self.version is None:
             self.version = 0
@@ -262,7 +282,11 @@ class AsyncTrainer:
             self.publisher.publish(version, snapshot)
         self.book.adopt_checkpoint(version)
         self.published.append(version)
-        logger.info("async checkpoint %d published and adopted in %.1fs", version, time.monotonic() - started)
+        seconds = time.monotonic() - started
+        deltas = [d["size"] for d in getattr(self.publisher, "deltas", []) if d["to"] == version and d["from"] == version - 1]
+        self.last_publication = {"async/published_checkpoint": version, "async/publish_s": seconds,
+                                 **({"async/delta_bytes": deltas[-1]} if deltas else {})}
+        logger.info("async checkpoint %d published and adopted in %.1fs", version, seconds)
 
     def wait_published(self) -> None:
         if self._pending is not None:
@@ -302,10 +326,13 @@ class AsyncTrainer:
 
     # --- step ----------------------------------------------------------------------------------------------
     def run_once(self) -> str:
+        began = self._clock()
+        telemetry.hold()                # train_step's row and this step's timings go to wandb as one row
         self.buffer.requeue()           # between steps the trainer holds nothing: a take whose answer was lost
         dropped = self.drop_stale()
         submitted = self.assemble()
         started = self._clock()
+        _reset_peak_memory()
         batch, slot = [], 0
         for i, group in enumerate(submitted):
             batch.append(training_group(group, slot0=slot, index=i))
@@ -326,26 +353,41 @@ class AsyncTrainer:
         except TrainingStepSkipped as exc:
             logger.warning("async train step skipped (%s): %d groups unpaid", exc.reason, len(submitted))
             self._report_untrained(submitted)
+            self.skipped += 1           # its rows stay held and go out with the next trained step
             self.last_step = {"result": "skipped", "reason": exc.reason, **gate.metrics()}
             return "skipped"
         except BaseException:
             self.buffer.release([g.lease_id for g in submitted])
             raise
+        trained = self._clock()
         self.steps += 1
         self._report(submitted, gate)
         self.since_checkpoint += 1
         snapshot = None
+        timings = {}
         if self.since_checkpoint >= self.config.steps_per_checkpoint:
             self.version += 1
             self.since_checkpoint = 0
+            at = self._clock()
             snapshot = self._snapshot()
+            timings["async/snapshot_s"] = self._clock() - at
+            at = self._clock()
             self._publish(self.version, snapshot)
+            timings["async/publish_wait_s"] = self._clock() - at
         if self.backup is not None and self.config.hf_backup_every and self.steps % self.config.hf_backup_every == 0:
             frozen = snapshot if snapshot is not None else self._snapshot()
             self.backup.submit(self.steps, lambda folder, s=frozen: self._backup_save(s, folder))
+        completion = sum(len(c) for g in submitted for c in g.completions)
+        worked = self._clock() - started
         if self.prices is not None:
-            self.prices.note_speed(sum(len(c) for g in submitted for c in g.completions), self._clock() - started)
+            self.prices.note_speed(completion, worked)
         self.last_step = {"result": "trained", "step": self.steps, "checkpoint": self.version, **gate.metrics()}
+        telemetry.flush({**gate.metrics(), **timings, **self.last_publication,
+                         "async/wait_s": started - began, "async/train_s": trained - started,
+                         "async/step_s": worked, "async/completion_tokens": completion,
+                         "async/completion_tokens_per_s": completion / worked if worked > 0 else 0.0,
+                         "async/steps_skipped_total": self.skipped, **_peak_memory()},
+                        (self.global_step_hint or 0) + self.steps)
         return "trained"
 
     def _report(self, submitted: list[SubmittedGroup], gate: DrawGate) -> dict[str, int]:
