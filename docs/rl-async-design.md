@@ -312,7 +312,7 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
 | P2 | Lease service: endpoints, exclusivity, interval fairness, nonce commit/reveal, expiry, quota, prompt lifecycle and `/rl/prompts/state` (built: `feat/rl-leases`, lifecycle to add) | - |
 | P2b | Checkpoint publication: deltas, anchors, signed index, presigned URLs, HF backup rotation | delta measurement |
 | P3 | Submission path: grade-all, buffer intake, out-of-zone store and sampled audit | P1, P2 |
-| P4 | Async trainer: env-mix batches, one-forward verification + substitution loss, telemetry, loss switch | P1, P3 |
+| P4 | Async trainer: arrival-order full batches, one-forward verification + substitution loss, telemetry, loss switch | P1, P3 |
 | P5 | Payment per matched token, floor, 25 % first-scan pay, async price controller, `/rl/pay` | P3, P4 |
 | P6 | Reference miner: lease client, prompt-state reader, quota-aware scheduler, background delta download, Gumbel generation | P1, P2, P2b |
 | P7 | Qualification on GPUs: end-to-end on a multi-card testbed (honest, fp8, int4, stale, Sybil and squat attempts) | all |
@@ -322,6 +322,11 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
 
 - **vLLM internals:** the runner-keyed position and Gumbel depend on vLLM 0.30 internals;
   pinned, refused otherwise. Upgrades need re-validation.
+- **Cost of the Gumbel draw (2026-10-16, being measured):** one noise value per vocabulary
+  token (~248k) per position. The first implementation builds [rows, vocab] float64
+  temporaries in ~12 torch ops; float64 runs at 1/64 rate on GeForce cards, so it may cost a
+  large share of decode throughput there. Fix in progress: a fused float32 kernel (one read of
+  the logits, noise in registers), with a torch reference as the test oracle.
 - **Validator load:** grading all groups plus audits; with 4.7 the trainer forward replaces
   the in-zone proof forward, so the extra GPU cost is the audits only.
 - **Dynamics over hundreds of steps:** the 2B runs cover 400 steps; the 9B run's telemetry
