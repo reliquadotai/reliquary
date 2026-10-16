@@ -86,7 +86,7 @@ def test_an_in_zone_group_is_graded_by_the_validator_and_buffered_for_the_traine
     answer = subs.submit(held.lease_id, "A", group(8), arrived_at=NOW + 5)
     assert answer == {"lease_id": held.lease_id, "verdict": "in_zone", "rewards": [1.0] * 8 + [0.0] * 8}
     assert book.lease(held.lease_id).state == "submitted"
-    queued = subs.buffer.take(ENV, 10)
+    queued = subs.buffer.take(10)
     assert len(queued) == 1
     g = queued[0]
     assert (g.lease_id, g.hotkey, g.checkpoint, g.nonce, g.arrived_at, g.prompt_idx) == (
@@ -112,7 +112,7 @@ def test_out_of_zone_groups_are_stored_audited_in_probation_and_count_as_deliver
     assert answer["verdict"] == verdict
     stored = subs.group(held.lease_id)
     assert stored["verdict"] == verdict and stored["audit"] == "pending" and stored["first_scan"] == 1
-    assert subs.buffer.take(ENV, 10) == []
+    assert subs.buffer.take(10) == []
     assert book.quota.state("A")["counters"]["out_of_zone"] == 1
     assert book.prompt_state()["prompts"][0]["state"] == state
     if verdict == "truncated":
@@ -146,7 +146,7 @@ def test_a_lease_is_submitted_once_by_its_holder_before_expiry_with_every_index_
     with pytest.raises(LookupError, match="expired"):
         subs.submit(late.lease_id, "A", group(8), arrived_at=late.expires_at)
     assert book.lease(late.lease_id).state == "expired" and book.quota.state("A")["counters"]["expired"] == 1
-    assert subs.group(late.lease_id) is None and len(subs.buffer.take(ENV, 10)) == 1
+    assert subs.group(late.lease_id) is None and len(subs.buffer.take(10)) == 1
 
 
 def test_a_group_refused_for_integrity_closes_the_lease_records_no_scan_and_halves_the_quota(book):
@@ -307,7 +307,7 @@ def test_the_trainer_reports_match_and_verdict_back_for_pay_and_sanctions(book):
     good, stale, forged = (lease(book, p) for p in (70, 71, 72))
     for held in (good, stale, forged):
         subs.submit(held.lease_id, "A", group(8))
-    taken = subs.buffer.take(ENV, 2)
+    taken = subs.buffer.take(2)
     assert {g.lease_id for g in taken} <= {good.lease_id, stale.lease_id, forged.lease_id}
     with pytest.raises(ValueError):
         subs.report_training(good.lease_id, rollout_match=[0.99] * 15, accepted=True)
@@ -323,12 +323,12 @@ def test_the_trainer_reports_match_and_verdict_back_for_pay_and_sanctions(book):
     assert subs.group(good.lease_id)["training"] == "accepted"
     assert subs.group(forged.lease_id)["training"] == "rejected"
     assert subs.in_probation("A")                                     # the statistical failure re-opens it
-    assert subs.buffer.depth() == {} and subs.buffer.take(ENV, 10) == []
+    assert subs.buffer.depth() == {} and subs.buffer.take(10) == []
     with pytest.raises(LookupError):
         subs.report_training(good.lease_id, rollout_match=[0.99] * 16, accepted=True)
 
 
-def test_the_buffer_hands_out_freshest_first_and_survives_a_restart(book, tmp_path):
+def test_the_buffer_hands_out_oldest_first_counts_arrivals_and_survives_a_restart(book, tmp_path):
     subs = service(book)
     old = lease(book, 80)
     subs.submit(old.lease_id, "A", group(8), arrived_at=NOW)
@@ -336,9 +336,11 @@ def test_the_buffer_hands_out_freshest_first_and_survives_a_restart(book, tmp_pa
     new = book.grant([LeaseRequest("A", ENV, (81,), 1)])[0].leases[0]
     subs.submit(new.lease_id, "A", group(8), arrived_at=NOW + 1)
     assert subs.buffer.depth() == {ENV: 2}
-    assert [g.lease_id for g in subs.buffer.take(ENV, 1)] == [new.lease_id]
-    subs.buffer.release([new.lease_id])
-    assert [g.lease_id for g in subs.buffer.take(ENV, 5)] == [new.lease_id, old.lease_id]
+    assert subs.buffer.drain_arrivals() == {ENV: 2 * sum(len(c) for c in subs.buffer.get(old.lease_id).completions)}
+    assert subs.buffer.drain_arrivals() == {}
+    assert [g.lease_id for g in subs.buffer.take(1)] == [old.lease_id]
+    subs.buffer.release([old.lease_id])
+    assert [g.lease_id for g in subs.buffer.take(5)] == [old.lease_id, new.lease_id]
     book.close()
     reopened = LeaseBook(tmp_path / "leases.sqlite3", book.config, quota=QuotaController(), clock=lambda: NOW)
     again = service(reopened)

@@ -141,13 +141,6 @@ class RlPayLedger:
             db.execute("UPDATE rl_pay_cursor SET seq=? WHERE id=0", (events[-1]["seq"],))
         return len(events)
 
-    def trained_tokens(self, since: float, until: float) -> dict[str, int]:
-        """Matched tokens trained per env with ``since < at <= until`` (the price controller's share signal)."""
-        with self.book.lock:
-            rows = self.book.db.execute("SELECT environment, SUM(matched_tokens) FROM rl_accruals WHERE kind=? AND "
-                                        "at>? AND at<=? GROUP BY environment", (TRAINED, since, until)).fetchall()
-        return {env: int(n) for env, n in rows}
-
     # --- settlement ----------------------------------------------------------------------------------------
     def settle(self, now: float | None = None) -> list[dict]:
         """Archive every closed period holding accruals, oldest first (each once); returns the new archives."""

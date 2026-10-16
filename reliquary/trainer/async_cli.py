@@ -180,7 +180,7 @@ def run_async_train_worker() -> None:
                                         delete_backup=repos.delete_backup, keep_last=settings["hf_keep_last"],
                                         milestone_every=settings["hf_milestone_every"],
                                         staging_dir=state_dir / "hf-staging")
-        config = AsyncTrainerConfig(env_mix=dict(task["targets"]), batch_groups=settings["batch_groups"],
+        config = AsyncTrainerConfig(batch_groups=settings["batch_groups"],
                                     steps_per_checkpoint=settings["steps_per_checkpoint"],
                                     hf_backup_every=settings["hf_every"])
         link.requeue()                          # this trainer holds nothing yet
@@ -190,10 +190,10 @@ def run_async_train_worker() -> None:
             train_step_fn=step_fn,
             global_step_hint=None if version is None else version * settings["steps_per_checkpoint"])
         live["trainer"] = trainer
-        logger.info("train-async starting: task %s, run %s, mix %s, checkpoint %d", task["task_id"], task["run"],
-                    task["targets"], trainer.version)
+        logger.info("train-async starting: task %s, run %s, target mix %s (priced, not enforced), checkpoint %d",
+                    task["task_id"], task["run"], task["targets"], trainer.version)
         try:
-            run_forever(trainer, link)
+            run_forever(trainer)
         finally:
             trainer.close()
             if backup is not None:
@@ -204,19 +204,15 @@ def run_async_train_worker() -> None:
             channel.send("STOP")
 
 
-def run_forever(trainer, link, *, idle_s: float = 2.0, sleep=time.sleep, steps: int | None = None) -> None:
-    """Step until stopped. A step that fails is fatal (the process restarts from the last adopted checkpoint): the
-    link already retried the validator, and a half-reported step must not be retried. Idle, the trainer holds no
-    group, so groups whose take answer was lost are given back (``requeue``)."""
+def run_forever(trainer, *, steps: int | None = None) -> None:
+    """Step until stopped (each step waits for a full batch). A step that fails is fatal (the process restarts from
+    the last adopted checkpoint, and the validator requeues what it held): the link already retried the validator,
+    and a half-reported step must not be retried."""
     done = 0
     while steps is None or done < steps:
-        outcome = trainer.run_once()
-        done += 1
-        if outcome == "waited":
-            link.requeue()
-            sleep(idle_s)
-        elif outcome == "trained":
+        if trainer.run_once() == "trained":
             logger.info("async step %s", trainer.last_step)
+        done += 1
 
 
 __all__ = ["async_trainer_settings", "resume_weights", "run_async_train_worker", "run_forever"]

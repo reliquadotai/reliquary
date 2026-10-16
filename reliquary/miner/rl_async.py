@@ -10,7 +10,7 @@ It runs next to the window miner (``mine``), which stays for the live run. One p
   more open leases than ``min(quota, max_open)``, and asks for no more than it can start soon (``queue_groups``):
   every lease ends in a submission or an expiry, there is no release, and an expiry halves the quota.
 * **leases** (``POST /rl/lease``, signed): batches of prompts at the checkpoint the miner holds. A refusal says only
-  ``taken`` / ``cooling`` / ``blacklisted`` / ``quota`` / ``stale`` per prompt; each moves the planner or the
+  ``taken`` / ``cooling`` / ``blacklisted`` / ``quota`` / ``stale`` / ``full`` per prompt; each moves the planner or the
   scheduler (``_note_refusal``).
 * **generation**: ``ROLLOUTS`` rollouts per lease, earliest expiry first, through the narrow ``GroupGenerator``
   interface (the draw itself, Gumbel and runner-keyed, is the profile's: ``VllmGroupGenerator`` sends a batch's
@@ -60,6 +60,7 @@ UNKNOWN_SAMPLE = 4                  # never-listed prompts drawn per wanted prom
 
 # The validator's words (``validator/rl_leases.py``), repeated here: the miner does not import the validator.
 TAKEN, COOLING, BLACKLISTED, QUOTA, STALE = "taken", "cooling", "blacklisted", "quota", "stale"
+FULL = "full"          # the validator's global cap (its trainer is behind): like quota, wait for the next poll
 COOLDOWN, IN_ZONE = "cooldown", "in_zone"
 
 
@@ -621,8 +622,8 @@ class AsyncMiner:
             planner.wait_for_outcome(prompt)          # a rival holds (prompt, k): its scan, or its expiry, comes
         elif reason in (COOLING, BLACKLISTED):
             planner.mark(prompt, reason)              # our table is behind: the next state poll catches up
-        elif reason == QUOTA:
-            self.quota = len(self.open)               # the validator counts fewer: wait for its next quota
+        elif reason in (QUOTA, FULL):
+            self.quota = len(self.open)               # the validator counts fewer, or is full: wait for its next quota
         elif reason == STALE:
             self._stale = True                        # our k is retired or not adopted yet: sync first
             self._wake_checkpoint.set()

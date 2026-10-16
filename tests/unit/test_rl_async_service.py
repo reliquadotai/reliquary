@@ -6,6 +6,7 @@ accrues and ``/rl/pay`` shows it, the miner syncs the new checkpoint, and the pe
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import random
 import socket
@@ -97,16 +98,16 @@ def test_the_trainer_link_needs_its_token_and_round_trips(tmp_path):
     assert link.latest_checkpoint == 0
     lease = rl.book.grant([LeaseRequest("A", ENV, (3,), 0)])[0].leases[0]
     assert rl.submissions.submit(lease.lease_id, "A", group(8))["verdict"] == "in_zone"
-    taken = link.take(ENV, 4)
+    taken = link.take(4)
     assert [g.lease_id for g in taken] == [lease.lease_id] and link.depth() == {}
     assert link.requeue() == 1 and link.depth() == {ENV: 1}
-    assert link.take(ENV, 4)[0].completions == taken[0].completions
+    assert link.take(4)[0].completions == taken[0].completions
     link.report_training(lease.lease_id, rollout_match=[1.0] * 16, accepted=True, matched_tokens=[3] * 16)
     with pytest.raises(TrainerLinkError) as missing:
         link.report_training(lease.lease_id, rollout_match=[1.0] * 16, accepted=True)
     assert missing.value.status == 404                                  # a first attempt: not a resend
-    link.note_wait(ENV, 3.0)
-    assert link.tick({ENV: 48})[ENV]["regime"] in ("rise", "hold")
+    link.note_speed(6_000, 3.0)
+    assert rl.prices.trainer_speed() == pytest.approx(2_000)
     with pytest.raises(TrainerLinkError):
         link.adopt_checkpoint(-1)
     rl.close()
@@ -163,7 +164,7 @@ def test_a_lost_report_answer_is_resent_and_counts_as_done(tmp_path):
     rl.book.adopt_checkpoint(0)
     lease = rl.book.grant([LeaseRequest("A", ENV, (3,), 0)])[0].leases[0]
     rl.submissions.submit(lease.lease_id, "A", group(8))
-    rl.buffer.take(ENV, 1)
+    rl.buffer.take(1)
     flaky = LosesFirstAnswer(TestClient(app))
     link = TrainerLink("http://testserver", TOKEN, client=flaky, sleep=lambda s: None)
     link.report_training(lease.lease_id, rollout_match=[1.0] * 16, accepted=True)
@@ -296,7 +297,7 @@ async def test_end_to_end_lease_submit_train_pay_and_sync(tmp_path):
 
         link = TrainerLink(trainer_served.url, TOKEN, patience_s=5.0)
         publisher = DeltaPublisher(run="smoke", store=store, staging_dir=tmp_path / "staging", model_dir=model_dir)
-        trainer = AsyncTrainer(model, config=AsyncTrainerConfig({ENV: 1.0}, batch_groups=4, wait_s=0.0),
+        trainer = AsyncTrainer(model, config=AsyncTrainerConfig(batch_groups=4),
                                buffer=link, submissions=link, book=link, prices=link, publisher=publisher,
                                train_step_fn=fake_step)
         assert rl.book.latest_checkpoint == 0 and trainer.version == 0
@@ -341,8 +342,9 @@ async def test_end_to_end_lease_submit_train_pay_and_sync(tmp_path):
                     break
             assert rl.submissions.audit_jobs(10) == []                          # every out-of-zone group concluded
 
-            # --- one trainer step through the link: report, publish checkpoint 1, adopt, price tick
-            await asyncio.to_thread(run_forever, trainer, link, steps=1)
+            # --- one trainer step through the link (the batch is what passed): report, publish 1, adopt, speed
+            trainer.config = dataclasses.replace(trainer.config, batch_groups=in_zone)
+            await asyncio.to_thread(run_forever, trainer, steps=1)
             await asyncio.to_thread(trainer.close)
             assert trainer.last_step["result"] == "trained" and trainer.version == 1
             assert rl.book.latest_checkpoint == 1 and rl.buffer.depth() == {}

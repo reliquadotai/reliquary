@@ -58,7 +58,8 @@ from reliquary.constants import MAX_TRUNCATED_PER_SUBMISSION, SIGMA_MIN_V4, prom
 from reliquary.validator.rl_lease_quota import QuotaController
 
 TAKEN, COOLING, BLACKLISTED, QUOTA, STALE, BANNED = "taken", "cooling", "blacklisted", "quota", "stale", "banned"
-REFUSALS = frozenset({TAKEN, COOLING, BLACKLISTED, QUOTA, STALE, BANNED})
+FULL = "full"     # the global cap: open leases + buffered groups reached ``max_pending_groups``
+REFUSALS = frozenset({TAKEN, COOLING, BLACKLISTED, QUOTA, STALE, BANNED, FULL})
 OPEN, SUBMITTED, EXPIRED = "open", "submitted", "expired"
 IN_ZONE, TOO_EASY, TOO_HARD, TRUNCATED = "in_zone", "too_easy", "too_hard", "truncated"
 VERDICTS = frozenset({IN_ZONE, TOO_EASY, TOO_HARD, TRUNCATED})
@@ -192,12 +193,17 @@ class LeaseBookConfig:
     # next cooldown. The profile's ``prompt_cooldown_windows`` counts checkpoints in the async protocol; the service
     # can pass its live schedule instead.
     cooldown_of: Callable[[str], int] = prompt_cooldown_windows_for_environment
+    # The global cap (async trainer throttle, AReaL-style): open leases + buffered groups never exceed it, so a
+    # trainer slower than the miners holds them back instead of dropping their work. None: no cap.
+    max_pending_groups: int | None = None
 
     def __post_init__(self) -> None:
         if not self.expiry_s or any(not (float(v) > 0) for v in self.expiry_s.values()):
             raise ValueError("every served environment needs a positive lease expiry")
         if self.max_lag < 0:
             raise ValueError("max_lag must be non-negative")
+        if self.max_pending_groups is not None and self.max_pending_groups < 1:
+            raise ValueError("max_pending_groups must be positive")
 
 
 _SCHEMA = """
@@ -238,6 +244,7 @@ class LeaseBook:
         self._rng = rng or random.SystemRandom()
         self.lock = threading.RLock()
         self._depth = 0
+        self._full: set[str] = set()              # envs refused for the global cap since the last drain
         path = Path(path)
         _private_file(path)
         self.db = sqlite3.connect(path, timeout=30, check_same_thread=False)
@@ -413,6 +420,7 @@ class LeaseBook:
             secrets_by_k = dict(self.db.execute("SELECT k, secret FROM rl_lease_secrets WHERE revealed_at IS NULL"))
             in_use: dict[str, int] = {}
             banned: dict[str, bool] = {}
+            pending = self._pending() if self.config.max_pending_groups is not None else 0
             for i, prompt in claims:
                 request = requests[i]
                 env, k, hotkey = request.environment, request.checkpoint, request.hotkey
@@ -447,6 +455,10 @@ class LeaseBook:
                 if in_use[hotkey] >= self.quota.quota(hotkey, now):
                     answers[i].refused[prompt] = QUOTA
                     continue
+                if self.config.max_pending_groups is not None and pending >= self.config.max_pending_groups:
+                    answers[i].refused[prompt] = FULL
+                    self._full.add(env)
+                    continue
                 lease = Lease(_secrets.token_hex(16), hotkey, env, prompt, k,
                               lease_nonce(bytes(secrets_by_k[k]), env, prompt, k).hex(), now,
                               now + float(self.config.expiry_s[env]), OPEN)
@@ -454,11 +466,25 @@ class LeaseBook:
                                 (lease.lease_id, hotkey, env, prompt, k, lease.nonce, lease.issued_at,
                                  lease.expires_at, OPEN))
                 in_use[hotkey] += 1
+                pending += 1
                 self.quota.record_lease(hotkey, now=now)
                 granted[i][prompt] = lease
         for i, request in enumerate(requests):
             answers[i].leases = [granted[i][p] for p in request.prompt_ids if p in granted[i]]
         return answers
+
+    def _pending(self) -> int:
+        """Open leases + buffered groups (``rl_buffer``, when a ``TrainingBuffer`` shares the file)."""
+        count = int(self.db.execute("SELECT COUNT(*) FROM rl_leases WHERE state=?", (OPEN,)).fetchone()[0])
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='rl_buffer'").fetchone():
+            count += int(self.db.execute("SELECT COUNT(*) FROM rl_buffer").fetchone()[0])
+        return count
+
+    def drain_full(self) -> set[str]:
+        """Envs refused for the global cap since the last drain (the price controller's oversupply signal)."""
+        with self.lock:
+            full, self._full = self._full, set()
+        return full
 
     def _submittable(self, lease_id: str, hotkey: str, now: float) -> tuple[Lease | None, Exception | None]:
         row = self.db.execute(f"SELECT {_COLUMNS} FROM rl_leases WHERE lease_id=?", (lease_id,)).fetchone()
@@ -616,7 +642,7 @@ class LeaseCollector:
 
 
 __all__ = [
-    "BANNED", "BLACKLISTED", "COMMIT_DOMAIN", "COOLDOWN", "COOLING", "EXPIRED", "IN_ZONE", "NONCE_DOMAIN", "OPEN", "QUOTA",
+    "BANNED", "BLACKLISTED", "COMMIT_DOMAIN", "COOLDOWN", "COOLING", "EXPIRED", "FULL", "IN_ZONE", "NONCE_DOMAIN", "OPEN", "QUOTA",
     "REFUSALS", "SECRET_REVEAL_LAG", "STALE", "SUBMITTED", "TAKEN", "TOO_EASY", "TOO_HARD", "TRUNCATED", "VERDICTS",
     "Lease", "LeaseAnswer", "LeaseBook", "LeaseBookConfig", "LeaseCollector", "LeaseRequest", "Scan",
     "classify_group", "lease_expiry_s", "lease_nonce", "secret_commitment", "verify_reveal",

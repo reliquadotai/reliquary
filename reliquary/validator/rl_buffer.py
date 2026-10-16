@@ -85,6 +85,7 @@ class SubmittedGroup:
 class TrainingBuffer:
     def __init__(self, book) -> None:
         self.book = book
+        self._arrived: dict[str, int] = {}                   # completion tokens queued per env since the last drain
         with book.lock:
             book.db.executescript(_SCHEMA)
             book.db.commit()
@@ -101,21 +102,30 @@ class TrainingBuffer:
             self.book.db.execute("INSERT INTO rl_buffer(lease_id, environment, k, arrived_at, hotkey, state, body) "
                                  "VALUES(?,?,?,?,?,?,?)", (group.lease_id, group.environment, group.checkpoint,
                                                            group.arrived_at, group.hotkey, QUEUED, group.pack()))
+        tokens = sum(len(c) for c in group.completions)
+        with self.book.lock:
+            self._arrived[group.environment] = self._arrived.get(group.environment, 0) + tokens
 
-    def take(self, environment: str, limit: int) -> list[SubmittedGroup]:
-        """Up to ``limit`` queued groups of ``environment``, freshest first; they stay buffered (``taken``) until
-        reported or released."""
+    def drain_arrivals(self) -> dict[str, int]:
+        """Completion tokens queued per env since the last drain (the price controller's supply; memory only: a
+        restart loses at most one tick of it)."""
+        with self.book.lock:
+            arrived, self._arrived = self._arrived, {}
+        return arrived
+
+    def take(self, limit: int) -> list[SubmittedGroup]:
+        """Up to ``limit`` queued groups of any env, in arrival order; they stay buffered (``taken``) until reported
+        or released."""
         with self.book.transaction():
-            rows = self.book.db.execute("SELECT lease_id, body FROM rl_buffer WHERE state=? AND environment=? "
-                                        "ORDER BY k DESC, arrived_at DESC LIMIT ?",
-                                        (QUEUED, environment, int(limit))).fetchall()
+            rows = self.book.db.execute("SELECT lease_id, body FROM rl_buffer WHERE state=? "
+                                        "ORDER BY arrived_at, lease_id LIMIT ?", (QUEUED, int(limit))).fetchall()
             self.book.db.executemany("UPDATE rl_buffer SET state=? WHERE lease_id=?",
                                      [(TAKEN, lease_id) for lease_id, _ in rows])
         return [SubmittedGroup.unpack(body) for _, body in rows]
 
     def take_older(self, below_k: int, limit: int) -> list[SubmittedGroup]:
         """Up to ``limit`` queued groups of any env generated on a checkpoint older than ``below_k``: the trainer's
-        max-lag drop (freshest-first ``take`` would otherwise leave them queued forever)."""
+        max-lag drop."""
         with self.book.transaction():
             rows = self.book.db.execute("SELECT lease_id, body FROM rl_buffer WHERE state=? AND k<? LIMIT ?",
                                         (QUEUED, int(below_k), int(limit))).fetchall()
@@ -138,7 +148,7 @@ class TrainingBuffer:
         return self.book.db.execute("DELETE FROM rl_buffer WHERE lease_id=?", (lease_id,)).rowcount == 1
 
     def depth(self) -> dict[str, int]:
-        """Queued groups per env (what the price controller and the trainer's mix read)."""
+        """Queued groups per env (trainer telemetry)."""
         with self.book.lock:
             return dict(self.book.db.execute("SELECT environment, COUNT(*) FROM rl_buffer WHERE state=? "
                                              "GROUP BY environment", (QUEUED,)).fetchall())

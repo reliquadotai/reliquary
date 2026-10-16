@@ -2,11 +2,11 @@
 
 Next to the window trainer (``worker.py`` / ``train_runner.py``, unchanged), one step of ``AsyncTrainer.run_once``:
 
-1. **Batch at the target mix.** ``config.env_mix`` (the price controller's target shares) splits
-   ``batch_groups`` across envs (largest remainder); each env's quota is taken from the ``TrainingBuffer``
-   freshest first. A short env does not block: the loop polls for at most ``wait_s``, proceeds with what it has
-   and reports the wait to the price controller (``note_wait``), which raises that env's price. Groups generated
-   more than ``max_lag`` checkpoints ago are dropped unpaid without a forward (they would fail the floor anyway).
+1. **Batch in arrival order.** ``batch_groups`` groups of any env are taken from the ``TrainingBuffer`` oldest
+   first; the step waits until the batch is full (as prime-rl, AReaL, PipelineRL, verl, SkyRL). The mix is not the
+   trainer's business: the per-env prices move each env's supply to its target share of the trainer's speed
+   (``rl_price``), and the global lease cap holds the miners back when they outrun the trainer. Groups generated
+   more than ``max_lag`` checkpoints ago are dropped unpaid without a forward (the cap keeps that rare).
 2. **One forward = verification + loss.** Each ``SubmittedGroup`` becomes the trainer's group object; its rollouts
    carry the lease's Gumbel uniforms (``draw_uniforms``). ``train_step(..., gate=DrawGate)`` runs the substitution
    loss: per micro-batch the forward gives v*, each rollout's tallies and the loss; rollouts under
@@ -21,14 +21,15 @@ Next to the window trainer (``worker.py`` / ``train_runner.py``, unchanged), one
    staleness), a checkpoint every ``steps_per_checkpoint`` steps: a CPU snapshot on the step path, then
    ``DeltaPublisher.publish`` and ``LeaseBook.adopt_checkpoint`` in a publish thread (one in flight: the next
    publication waits for it, and its error stops the loop), a Hugging Face backup every ``hf_backup_every`` steps
-   (``BackgroundHfBackup``, never blocking), and one price tick with the step's trained tokens and buffer depth.
+   (``BackgroundHfBackup``, never blocking), and the step's speed for the prices (``note_speed``: completion tokens
+   processed and seconds worked, the wait for the batch excluded).
 
 Floors are PLACEHOLDERS to calibrate at GPU qualification: ``ASYNC_ROLLOUT_FLOOR`` =
 ``constants.RL_ROLLOUT_MATCH_FLOOR`` (the design's 0.95 with bf16 heads, about 0.96 with fp32 heads) and
 ``ASYNC_GROUP_FLOOR`` 0.90 (pooled). A rollout's match is its rate on stochastic positions (max p < 0.99) when it has ``FORCED_SEED_ROLLOUT_MIN_STOCH`` of them, else its rate on every drawn position (a
 peaked honest rollout matches ~1 there; arbitrary tokens do not), so the trainer's mask and the ledger's pay
-re-check (``RlPayLedger``, same floor) read one number. Masked rollouts stay in their env's token-level
-denominator (it is planned before the forward): the env is slightly under-weighted on such steps.
+re-check (``RlPayLedger``, same floor) read one number. The step is one batch: the loss is the global token mean,
+and masked rollouts stay in its denominator (it is planned before the forward).
 """
 from __future__ import annotations
 
@@ -191,17 +192,6 @@ def training_group(group: SubmittedGroup, *, slot0: int, index: int) -> SimpleNa
                            environment=group.environment)
 
 
-def mix_quotas(mix: Mapping[str, float], total: int) -> dict[str, int]:
-    """``total`` groups split by target share (largest remainder, ties by env name)."""
-    weight = sum(mix.values())
-    exact = {env: total * share / weight for env, share in mix.items() if share > 0}
-    quotas = {env: int(v) for env, v in exact.items()}
-    rest = sorted(exact, key=lambda env: (-(exact[env] - quotas[env]), env))
-    for env in rest[: total - sum(quotas.values())]:
-        quotas[env] += 1
-    return quotas
-
-
 def save_snapshot(snapshot: Mapping[str, Any], folder: Path) -> None:
     from reliquary.shared.ckpt_delta import write_anchor_shards
 
@@ -210,20 +200,16 @@ def save_snapshot(snapshot: Mapping[str, Any], folder: Path) -> None:
 
 @dataclass(frozen=True)
 class AsyncTrainerConfig:
-    env_mix: Mapping[str, float]             # target share per env (the price controller's targets)
-    batch_groups: int                        # groups per optimizer step at full supply
+    batch_groups: int                        # groups per optimizer step
     steps_per_checkpoint: int = 1            # N: publish + adopt every N steps (design §4.8: 1)
     hf_backup_every: int | None = None       # M: full HF backup every M steps (None: off)
     rollout_floor: float = ASYNC_ROLLOUT_FLOOR
     group_floor: float = ASYNC_GROUP_FLOOR
     max_lag: int = SECRET_REVEAL_LAG         # no quality cap (the floor decides); bounds the buffer only
     sanction_max_lag: int = 2                # a failed group this fresh is evidence (honest lag <= 2 passes)
-    wait_s: float = 5.0                      # bounded wait on short envs before stepping with what is there
-    poll_s: float = 0.5
+    poll_s: float = 0.5                      # while the batch is not full
 
     def __post_init__(self) -> None:
-        if not self.env_mix or any(v < 0 for v in self.env_mix.values()) or sum(self.env_mix.values()) <= 0:
-            raise ValueError("env_mix: non-negative shares, at least one positive")
         if self.batch_groups < 1 or self.steps_per_checkpoint < 1 or (self.hf_backup_every or 1) < 1:
             raise ValueError("batch_groups, steps_per_checkpoint and hf_backup_every must be positive")
         if not (0 <= self.rollout_floor <= 1 and 0 <= self.group_floor <= 1) or self.max_lag < 0:
@@ -231,8 +217,8 @@ class AsyncTrainerConfig:
 
 
 class AsyncTrainer:
-    """``run_once`` -> "trained" | "skipped" (health gate: groups reported untrained, unsanctioned) | "waited"
-    (no group at all). ``state_fn`` returns the full state dict to publish (FSDP2: the rank-0 gather);
+    """``run_once`` -> "trained" | "skipped" (health gate: groups reported untrained, unsanctioned); it waits for a
+    full batch. ``state_fn`` returns the full state dict to publish (FSDP2: the rank-0 gather);
     ``train_step_fn`` may be ``distributed.broadcasting_train_step``. The model must hold checkpoint
     ``book.latest_checkpoint`` (or, on a fresh book, the initial weights, published and adopted as 0)."""
 
@@ -303,50 +289,35 @@ class AsyncTrainer:
             self._report_untrained(stale)
             dropped += len(stale)
 
-    def assemble(self) -> tuple[dict[str, list[SubmittedGroup]], dict[str, float]]:
-        """Groups per env at the target mix, freshest first; (groups, wait seconds of each short env)."""
-        quotas = mix_quotas(self.config.env_mix, self.config.batch_groups)
-        taken: dict[str, list[SubmittedGroup]] = {env: [] for env in quotas}
-        started = self._clock()
+    def assemble(self) -> list[SubmittedGroup]:
+        """``batch_groups`` groups in arrival order; waits until the batch is full."""
+        taken: list[SubmittedGroup] = []
         while True:
-            for env, quota in quotas.items():
-                if len(taken[env]) < quota:
-                    taken[env] += self.buffer.take(env, quota - len(taken[env]))
-            short = [env for env, quota in quotas.items() if len(taken[env]) < quota]
-            if not short or self._clock() - started >= self.config.wait_s:
-                break
+            taken += self.buffer.take(self.config.batch_groups - len(taken))
+            if len(taken) >= self.config.batch_groups:
+                return taken
             self._sleep(self.config.poll_s)
-        waited = self._clock() - started
-        waits = {env: waited for env in short} if waited > 0 else {}
-        if self.prices is not None:
-            for env, seconds in waits.items():
-                self.prices.note_wait(env, seconds)
-        return taken, waits
 
     # --- step ----------------------------------------------------------------------------------------------
     def run_once(self) -> str:
+        self.buffer.requeue()           # between steps the trainer holds nothing: a take whose answer was lost
         dropped = self.drop_stale()
-        taken, waits = self.assemble()
-        submitted = [g for env in taken for g in taken[env]]
-        if not submitted:
-            return "waited"
-        batches, slot = [], 0
-        for env in taken:
-            batch = []
-            for group in taken[env]:
-                batch.append(training_group(group, slot0=slot, index=len(batch) + sum(len(b) for b in batches)))
-                slot += len(group.completions)
-            batches.append(batch)
-        gate = DrawGate([[r._async_slot for r in g.rollouts] for b in batches for g in b],
+        submitted = self.assemble()
+        started = self._clock()
+        batch, slot = [], 0
+        for i, group in enumerate(submitted):
+            batch.append(training_group(group, slot0=slot, index=i))
+            slot += len(group.completions)
+        gate = DrawGate([[r._async_slot for r in g.rollouts] for g in batch],
                         rollout_floor=self.config.rollout_floor, group_floor=self.config.group_floor)
-        depth = self.buffer.depth()
+        envs: dict[str, int] = {}
+        for group in submitted:
+            envs[group.environment] = envs.get(group.environment, 0) + 1
         gate.extra = {"async/checkpoint": self.version, "async/stale_dropped": dropped,
                       "async/lag_mean": sum(self.version - g.checkpoint for g in submitted) / len(submitted),
-                      **{f"async/buffer_depth/{env}": depth.get(env, 0) for env in self.config.env_mix},
-                      **{f"async/batch_groups/{env}": len(taken[env]) for env in taken},
-                      **{f"async/wait_s/{env}": waits.get(env, 0.0) for env in taken}}
+                      **{f"async/batch_groups/{env}": n for env, n in envs.items()}}
         try:
-            self.model = self._train_step(self.model, batches, ref_model=self.ref_model,
+            self.model = self._train_step(self.model, [batch], ref_model=self.ref_model,
                                           window_index=self.steps + 1, global_step_hint=self.global_step_hint,
                                           gate=gate)
         except TrainingStepSkipped as exc:
@@ -358,7 +329,7 @@ class AsyncTrainer:
             self.buffer.release([g.lease_id for g in submitted])
             raise
         self.steps += 1
-        trained_tokens = self._report(submitted, gate)
+        self._report(submitted, gate)
         self.since_checkpoint += 1
         snapshot = None
         if self.since_checkpoint >= self.config.steps_per_checkpoint:
@@ -370,7 +341,7 @@ class AsyncTrainer:
             frozen = snapshot if snapshot is not None else self._snapshot()
             self.backup.submit(self.steps, lambda folder, s=frozen: self._backup_save(s, folder))
         if self.prices is not None:
-            self.prices.tick(trained_tokens, self.buffer.depth())
+            self.prices.note_speed(sum(len(c) for g in submitted for c in g.completions), self._clock() - started)
         self.last_step = {"result": "trained", "step": self.steps, "checkpoint": self.version, **gate.metrics()}
         return "trained"
 
@@ -396,6 +367,6 @@ class AsyncTrainer:
 
 
 __all__ = [
-    "ASYNC_GROUP_FLOOR", "ASYNC_ROLLOUT_FLOOR", "AsyncTrainer", "AsyncTrainerConfig", "DrawGate", "mix_quotas",
+    "ASYNC_GROUP_FLOOR", "ASYNC_ROLLOUT_FLOOR", "AsyncTrainer", "AsyncTrainerConfig", "DrawGate",
     "rollout_rate", "save_snapshot", "training_group",
 ]

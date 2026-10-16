@@ -8,7 +8,7 @@
   ``MAX_PREAUTH`` decoded and verified at once (the signature in a worker thread), the registration checked, a
   signature answered once (``request_reused``), the hotkey's minute counted after verification. The request then
   waits for its interval and is resolved with the others (``LeaseCollector``). The answer lists the caller's leases
-  and, per refused prompt, only ``taken`` / ``cooling`` / ``blacklisted`` / ``quota`` / ``stale`` / ``banned``.
+  and, per refused prompt, only ``taken`` / ``cooling`` / ``blacklisted`` / ``quota`` / ``stale`` / ``banned`` / ``full``.
   The answer also carries ``lease_expiry_s``, the env's fixed lease lifetime: how long a prompt refused as
   ``taken`` can stay held by a rival before it is scanned or free again.
 * ``GET {prefix}/quota?hotkey=``: the hotkey's explainable quota (public, like ``/rl/pay``; it lists no lease), with

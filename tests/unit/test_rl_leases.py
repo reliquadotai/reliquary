@@ -14,7 +14,7 @@ import pytest
 from reliquary.constants import prompt_cooldown_windows_for_environment
 from reliquary.validator.rl_lease_quota import QuotaConfig, QuotaController
 from reliquary.validator.rl_leases import (
-    BLACKLISTED, COOLING, IN_ZONE, QUOTA, RESTART_GRACE_S, SECRET_REVEAL_LAG, STALE, TAKEN, TOO_EASY, TOO_HARD,
+    BLACKLISTED, COOLING, FULL, IN_ZONE, QUOTA, RESTART_GRACE_S, SECRET_REVEAL_LAG, STALE, TAKEN, TOO_EASY, TOO_HARD,
     TRUNCATED, LeaseBook, LeaseBookConfig, LeaseCollector, LeaseRequest, classify_group, lease_expiry_s, lease_nonce,
     secret_commitment, verify_reveal,
 )
@@ -238,6 +238,23 @@ def test_a_hotkey_never_holds_more_open_leases_than_its_quota(tmp_path):
     assert len(answer.leases) == 4 and set(answer.refused.values()) == {QUOTA} and len(answer.refused) == 6
     assert book.in_use("A") == 4
     assert book.grant([ask("A", [20])])[0].refused == {20: QUOTA}
+
+
+def test_the_global_cap_counts_open_leases_and_buffered_groups_and_names_the_full_envs(tmp_path):
+    book = book_at(tmp_path, max_pending_groups=3)
+    book.adopt_checkpoint(0)
+    assert len(book.grant([ask("A", [1, 2])])[0].leases) == 2
+    answers = book.grant([ask("B", [3, 4]), ask("C", [5], env=OTHER_ENV)])
+    refused = [reason for a in answers for reason in a.refused.values()]
+    assert refused == [FULL, FULL] and sum(len(a.leases) for a in answers) == 1   # 3 pending: the cap
+    assert book.drain_full() <= {ENV, OTHER_ENV} and book.drain_full() == set()
+    with book.transaction():                                             # a group waiting for the trainer counts too
+        book.db.execute("CREATE TABLE rl_buffer(lease_id TEXT PRIMARY KEY)")
+        book.db.execute("INSERT INTO rl_buffer VALUES('g')")
+    book.config = LeaseBookConfig(expiry_s=book.config.expiry_s, max_pending_groups=4)
+    assert book.grant([ask("D", [6])])[0].refused == {6: FULL}
+    with pytest.raises(ValueError):
+        LeaseBookConfig(expiry_s={ENV: 1.0}, max_pending_groups=0)
 
 
 def test_a_contested_prompt_goes_to_a_requester_with_quota_left(tmp_path):

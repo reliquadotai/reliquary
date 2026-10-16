@@ -13,7 +13,7 @@ import torch
 
 from reliquary.environment import forced_sampling as fs
 from reliquary.trainer.async_trainer import (
-    AsyncTrainer, AsyncTrainerConfig, DrawGate, mix_quotas, training_group,
+    AsyncTrainer, AsyncTrainerConfig, DrawGate, training_group,
 )
 from reliquary.validator import training, verifier
 from reliquary.validator.rl_buffer import SubmittedGroup, TrainingBuffer
@@ -64,13 +64,10 @@ class Subs:
 
 class Prices:
     def __init__(self):
-        self.waits, self.ticks = [], []
+        self.speeds = []
 
-    def note_wait(self, env, seconds):
-        self.waits.append((env, seconds))
-
-    def tick(self, trained, depth):
-        self.ticks.append((dict(trained), dict(depth)))
+    def note_speed(self, tokens, seconds):
+        self.speeds.append((tokens, seconds))
 
 
 class Publisher:
@@ -82,14 +79,16 @@ class Publisher:
 
 
 class Clock:
-    def __init__(self):
-        self.t = 0.0
+    def __init__(self, on_sleep=None):
+        self.t, self.on_sleep = 0.0, on_sleep
 
     def __call__(self):
         return self.t
 
     def sleep(self, s):
         self.t += s
+        if self.on_sleep is not None:
+            self.on_sleep()
 
 
 def submitted(model, lease, env="math", k=3, arrived=0.0, forged=(), rewards=None, n=N_TOK, prompt_idx=7):
@@ -130,28 +129,18 @@ def gate_for(groups):
 
 
 # --- batch assembly ----------------------------------------------------------------------------------------------
-def test_quotas_follow_the_mix():
-    assert mix_quotas({"a": 0.5, "b": 0.25, "c": 0.25}, 8) == {"a": 4, "b": 2, "c": 2}
-    assert mix_quotas({"a": 0.5, "b": 0.5, "c": 0.0}, 3) == {"a": 2, "b": 1}
-    assert sum(mix_quotas({"a": 1 / 3, "b": 1 / 3, "c": 1 / 3}, 10).values()) == 10
-
-
-def test_a_short_env_waits_bounded_then_proceeds_freshest_first():
-    model, book, clock = _Model(), Book(), Clock()
+def test_the_batch_is_any_env_in_arrival_order_and_waits_until_full():
+    model, book = _Model(), Book()
     buffer = TrainingBuffer(book)
-    for i in range(6):
-        buffer.push(submitted(model, f"a{i}", "a", k=2 + i % 2, arrived=float(i), n=2))
-    buffer.push(submitted(model, "b0", "b", n=2))
-    prices = Prices()
-    trainer = AsyncTrainer(model, config=AsyncTrainerConfig({"a": 0.5, "b": 0.25, "c": 0.25}, 8, wait_s=2.0,
-                                                            poll_s=0.5),
-                           buffer=buffer, submissions=Subs(buffer), book=book, prices=prices, clock=clock,
-                           sleep=clock.sleep)
-    taken, waits = trainer.assemble()
-    assert [g.lease_id for g in taken["a"]] == ["a5", "a3", "a1", "a4"]      # k=3 first, then latest arrival
-    assert [g.lease_id for g in taken["b"]] == ["b0"] and taken["c"] == []
-    assert waits == {"b": 2.0, "c": 2.0} and prices.waits == [("b", 2.0), ("c", 2.0)]
-    assert buffer.depth() == {"a": 2}
+    buffer.push(submitted(model, "a0", "a", k=3, arrived=2.0, n=2))
+    buffer.push(submitted(model, "b0", "b", k=2, arrived=0.0, n=2))
+    buffer.push(submitted(model, "a1", "a", k=2, arrived=1.0, n=2))
+    late = iter([submitted(model, "c0", "c", arrived=5.0, n=2)])
+    clock = Clock(on_sleep=lambda: [buffer.push(g) for g in late])
+    trainer = AsyncTrainer(model, config=AsyncTrainerConfig(4, poll_s=0.5), buffer=buffer,
+                           submissions=Subs(buffer), book=book, clock=clock, sleep=clock.sleep)
+    assert [g.lease_id for g in trainer.assemble()] == ["b0", "a1", "a0", "c0"]    # oldest first, no mix
+    assert clock.t == 0.5 and buffer.depth() == {}
 
 
 def test_groups_past_the_max_lag_are_dropped_unpaid_without_a_forward():
@@ -160,7 +149,7 @@ def test_groups_past_the_max_lag_are_dropped_unpaid_without_a_forward():
     buffer.push(submitted(model, "old", k=1, n=2))
     buffer.push(submitted(model, "new", k=9, n=2))
     subs = Subs(buffer)
-    trainer = AsyncTrainer(model, config=AsyncTrainerConfig({"math": 1.0}, 4, max_lag=8), buffer=buffer,
+    trainer = AsyncTrainer(model, config=AsyncTrainerConfig(4, max_lag=8), buffer=buffer,
                            submissions=subs, book=book)
     assert trainer.drop_stale() == 1
     assert subs.reports["old"] == {"rollout_match": [0.0] * ROLLOUTS, "accepted": False, "failure_class": None}
@@ -215,10 +204,10 @@ def test_window_mode_is_unchanged_without_a_gate():
 
 
 # --- the loop ----------------------------------------------------------------------------------------------------
-def loop(model, book, buffer, **config):
+def loop(model, book, buffer, batch=2, **config):
     clock = Clock()
     publisher, prices, subs = Publisher(), Prices(), Subs(buffer)
-    trainer = AsyncTrainer(model, config=AsyncTrainerConfig({"math": 1.0}, 2, wait_s=0.0, group_floor=0.7, **config),
+    trainer = AsyncTrainer(model, config=AsyncTrainerConfig(batch, group_floor=0.7, **config),
                            buffer=buffer, submissions=subs, book=book, prices=prices, publisher=publisher,
                            clock=clock, sleep=clock.sleep)
     return trainer, subs, publisher, prices
@@ -239,7 +228,7 @@ def test_one_step_reports_every_group_and_publishes_the_next_checkpoint():
     assert good["rollout_match"][2] < 0.95 <= min(good["rollout_match"][:2])
     assert not bad["accepted"] and bad["failure_class"] == "statistical"          # lag 0: evidence
     assert publisher.versions == [4] and book.adopted == [4] and trainer.version == 4
-    assert prices.ticks == [({"math": 3 * N_TOK}, {})]
+    assert [tokens for tokens, _ in prices.speeds] == [2 * ROLLOUTS * N_TOK]   # every forwarded token, not paid ones
     assert trainer.last_step["async/groups_accepted"] == 1 and trainer.last_step["async/groups_undone"] == 1
     assert buffer.depth() == {}
 
@@ -257,7 +246,7 @@ def test_publication_every_n_steps_and_hf_backup_every_m(monkeypatch):
         gate.judge([])
         return model
 
-    trainer, subs, publisher, prices = loop(model, book, buffer, steps_per_checkpoint=2, hf_backup_every=3)
+    trainer, subs, publisher, prices = loop(model, book, buffer, batch=1, steps_per_checkpoint=2, hf_backup_every=3)
     trainer._train_step, trainer.backup = fake_step, backup
     assert publisher.versions == [0] and book.adopted == [0]                       # fresh book: initial weights
     for step in range(6):
@@ -273,7 +262,7 @@ def test_a_skipped_step_pays_nothing_and_a_crash_requeues():
     model, book = _Model(), Book()
     buffer = TrainingBuffer(book)
     buffer.push(submitted(model, "g", n=2))
-    trainer, subs, publisher, _ = loop(model, book, buffer)
+    trainer, subs, publisher, _ = loop(model, book, buffer, batch=1)
 
     def skipped(*_, **__):
         raise training.TrainingStepSkipped("gradient_spike", 1e9)
@@ -294,8 +283,11 @@ def test_a_skipped_step_pays_nothing_and_a_crash_requeues():
     trainer.close()
 
 
-def test_nothing_buffered_waits():
+def test_a_take_whose_answer_was_lost_is_requeued_before_the_next_step():
     model, book = _Model(), Book()
-    trainer, _, publisher, prices = loop(model, book, TrainingBuffer(book))
-    assert trainer.run_once() == "waited" and publisher.versions == [] and prices.ticks == []
+    buffer = TrainingBuffer(book)
+    buffer.push(submitted(model, "g", n=2))
+    assert [g.lease_id for g in buffer.take(1)] == ["g"]          # taken, answer lost: the trainer never saw it
+    trainer, subs, _, _ = loop(model, book, buffer, batch=1)
+    assert trainer.run_once() == "trained" and "g" in subs.reports
     trainer.close()

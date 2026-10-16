@@ -13,7 +13,7 @@ One process on the controller, like the corpus validator: no window, batcher or 
 * **Trainer link** (``/rl/trainer/*``, bearer ``RELIQUARY_RL_TRAINER_TOKEN``) on its own listener,
   ``RELIQUARY_RL_TRAINER_BIND`` (``host:port``, default ``127.0.0.1:8889``: reach it over a private interface or
   an SSH tunnel), never on the public port: the detached async trainer (``reliquary train-async``, its own GPU box
-  as today) takes groups from the buffer, reports them, adopts the checkpoints it publishes and feeds the prices.
+  as today) takes groups from the buffer, reports them, adopts the checkpoints it publishes and reports its speed.
 * **Episodes** (``rl_async_episodes``): the task's ``params.rl_episode_envs`` (the order's episode block and
   catalogue, per env) make those envs signed-episode envs: the sandbox side (``wire_episode_sandbox``: token key,
   machine directory and fleet, session issuer over ``RlLeaseEngagements``, ``/rl/sandbox/sessions`` routes) and one
@@ -27,8 +27,8 @@ One process on the controller, like the corpus validator: no window, batcher or 
   verify model held at the latest checkpoint (``audit_source``: the remote proof worker's when
   ``RELIQUARY_PROOF_EXECUTOR_MODE=remote``, ``remote_rl_audit``; else a local ``RELIQUARY_RL_AUDIT_DEVICE``; without
   either every audit concludes inconclusive: unpaid, unsanctioned), with ``RlSubmissions.run_audits``' retry cap;
-  the ledger (ingest, settle, publish the period archives through ``R2PeriodArchives``, as the corpus periods); the price tick when the trainer
-  is idle (it ticks per step itself).
+  the ledger (ingest, settle, publish the period archives through ``R2PeriodArchives``, as the corpus periods); the price tick (``rl_price``:
+  each env's queued tokens against its target share of the trainer's speed, which the trainer reports per step).
 * **Settlement:** the task must be declared with ``params.settlement = "period-ema-v1"`` (``reliquary tasks create
   --rl-async``): the unchanged weight setter pays its period archives. Per-env target shares are the entry's
   ``env_split``; the async parameters are the ``rl_*`` params below.
@@ -70,7 +70,8 @@ PLANNED_TOKENS_PARAM = "rl_planned_tokens_per_period"   # matched tokens the tra
 LEASE_SPEED_PARAM = "rl_lease_reference_tokens_per_s"   # a slow reference card's decode speed, per sequence
 LEASE_MARGIN_PARAM = "rl_lease_expiry_margin"
 PRICE_TICK_PARAM = "rl_price_tick_s"
-OVERFLOW_PARAM = "rl_buffer_overflow_groups"
+PENDING_PARAM = "rl_max_pending_groups"         # global cap: open leases + buffered groups
+DEFAULT_MAX_PENDING_GROUPS = 256      # placeholder: 4 batches of 64 (lag <= ~4 steps), set at qualification
 DEFAULT_LEASE_TOKENS_PER_S = 20.0      # placeholder: the design's "3090 at max length", measured at qualification
 DEFAULT_LEASE_MARGIN = 2.0
 
@@ -91,7 +92,7 @@ def rl_mode(env: Mapping[str, str] = os.environ) -> str:
 
 def rl_async_params(*, planned_tokens_per_period: float, lease_tokens_per_s: float = DEFAULT_LEASE_TOKENS_PER_S,
                     lease_margin: float = DEFAULT_LEASE_MARGIN, tick_s: float | None = None,
-                    overflow_groups: int | None = None, episode_envs: Mapping[str, Any] | None = None,
+                    max_pending_groups: int | None = None, episode_envs: Mapping[str, Any] | None = None,
                     lease_expiry_s: Mapping[str, float] | None = None) -> dict:
     """The params an async task adds to its registry entry (pay by period: ``settlement = period-ema-v1``).
     ``episode_envs``: the signed-episode envs' blocks (``rl_async_episodes``: episode, catalogue?, version?);
@@ -108,8 +109,10 @@ def rl_async_params(*, planned_tokens_per_period: float, lease_tokens_per_s: flo
                               LEASE_SPEED_PARAM: float(lease_tokens_per_s), LEASE_MARGIN_PARAM: float(lease_margin)}
     if tick_s is not None:
         params[PRICE_TICK_PARAM] = float(tick_s)
-    if overflow_groups is not None:
-        params[OVERFLOW_PARAM] = int(overflow_groups)
+    if max_pending_groups is not None:
+        if max_pending_groups < 1:
+            raise ValueError("max_pending_groups must be positive")
+        params[PENDING_PARAM] = int(max_pending_groups)
     if episode_envs:
         params[EPISODE_ENVS_PARAM] = episode_blocks({EPISODE_ENVS_PARAM: episode_envs})
     if lease_expiry_s:
@@ -122,10 +125,11 @@ class RlAsyncSettings:
     task_id: str
     cap: float
     run: str                                    # the checkpoint index's run (``rl/<run>/index.json``)
-    targets: Mapping[str, float]                # env -> target share of trained tokens (the trainer's mix)
+    targets: Mapping[str, float]                # env -> target share of the trainer's speed (priced, not enforced)
     planned_tokens_per_period: float
     lease_expiry_s: Mapping[str, float]
     price: Any = None                           # AsyncPriceParams (None: the defaults)
+    max_pending_groups: int = DEFAULT_MAX_PENDING_GROUPS
     episodes: Mapping[str, Any] = field(default_factory=dict)   # env -> its validated episode block (§4.10)
 
     def episode_policies(self) -> dict:
@@ -169,11 +173,12 @@ def rl_async_settings(entry, cap: float, *, run: str | None = None,
         raise ValueError(f"lease expiry overrides for envs outside the env_split: {unknown}")
     expiry.update(overrides)
     price = AsyncPriceParams(**{key: cast(params[name]) for key, name, cast in (
-        ("tick_s", PRICE_TICK_PARAM, float), ("overflow_groups", OVERFLOW_PARAM, int)) if name in params})
+        ("tick_s", PRICE_TICK_PARAM, float),) if name in params})
     return RlAsyncSettings(task_id=str(entry.task_id), cap=float(cap),
                            run=run or os.environ.get(RUN_ENV) or str(entry.task_id), targets=targets,
                            planned_tokens_per_period=float(params[PLANNED_TOKENS_PARAM]), lease_expiry_s=expiry,
-                           price=price, episodes=blocks)
+                           price=price, episodes=blocks,
+                           max_pending_groups=int(params.get(PENDING_PARAM, DEFAULT_MAX_PENDING_GROUPS)))
 
 
 @dataclass
@@ -204,7 +209,8 @@ def build_rl_async(settings: RlAsyncSettings, *, path: str | os.PathLike[str], g
     from reliquary.validator.rl_submit import RlSubmissions
 
     book = LeaseBook(path, LeaseBookConfig(expiry_s=dict(settings.lease_expiry_s),
-                                           prompt_range=None if prompt_range is None else dict(prompt_range)),
+                                           prompt_range=None if prompt_range is None else dict(prompt_range),
+                                           max_pending_groups=settings.max_pending_groups),
                      quota=QuotaController(), clock=clock)
     try:
         collector = (LeaseCollector(book) if collector_interval_s is None
@@ -271,29 +277,22 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
         rl.book.adopt_checkpoint(int(b["k"]))
         return {"latest": rl.book.latest_checkpoint}
 
-    def wait(b: dict) -> dict:
-        rl.prices.note_wait(str(b["environment"]), float(b["seconds"]))
+    def speed(b: dict) -> dict:
+        rl.prices.note_speed(float(b["tokens"]), float(b["seconds"]))
         return {"ok": True}
-
-    def tick(b: dict) -> dict:
-        trained = {str(env): int(n) for env, n in dict(b["trained_tokens"]).items()}
-        decisions = rl.prices.tick(trained, rl.buffer.depth())
-        return {env: {"price": d.price, "regime": d.regime} for env, d in decisions.items()}
 
     route("GET", "config", lambda b: {"task_id": rl.settings.task_id, "run": rl.settings.run,
                                       "targets": dict(rl.settings.targets), "latest": rl.book.latest_checkpoint})
     route("GET", "latest", lambda b: {"latest": rl.book.latest_checkpoint})
     route("POST", "adopt", adopt)
-    route("POST", "take", lambda b: {"groups": [_pack(g) for g in rl.buffer.take(str(b["environment"]),
-                                                                                 int(b["limit"]))]})
+    route("POST", "take", lambda b: {"groups": [_pack(g) for g in rl.buffer.take(int(b["limit"]))]})
     route("POST", "take_older", lambda b: {"groups": [_pack(g) for g in rl.buffer.take_older(int(b["below_k"]),
                                                                                              int(b["limit"]))]})
     route("POST", "release", lambda b: rl.buffer.release([str(i) for i in b["lease_ids"]]) or {"ok": True})
     route("POST", "requeue", lambda b: {"requeued": rl.buffer.requeue()})
     route("GET", "depth", lambda b: {"depth": rl.buffer.depth()})
     route("POST", "report", report)
-    route("POST", "wait", wait)
-    route("POST", "tick", tick)
+    route("POST", "speed", speed)
 
     async def checkpoint(request: Request) -> JSONResponse:
         """``/rl/checkpoint``'s answer for the trainer's resume (it reaches this listener only)."""
@@ -463,9 +462,8 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
     async def price() -> None:
         now = float(clock())
         if not await asyncio.to_thread(rl.prices.due, now):
-            return                   # the trainer ticks per step; this tick covers an idle trainer
-        await asyncio.to_thread(lambda: rl.prices.tick(rl.ledger.trained_tokens(now - rl.prices.params.tick_s, now),
-                                                       rl.buffer.depth(), now))
+            return
+        await asyncio.to_thread(lambda: rl.prices.tick(rl.buffer.drain_arrivals(), rl.book.drain_full(), now))
 
     async def follow() -> None:
         await audit_model.follow_once(rl.board)
@@ -714,7 +712,7 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
 
 
 __all__ = [
-    "ASYNC", "AUDIT_DEVICE_ENV", "AuditModel", "DB_NAME", "LEASE_MARGIN_PARAM", "LEASE_SPEED_PARAM", "OVERFLOW_PARAM",
+    "ASYNC", "AUDIT_DEVICE_ENV", "AuditModel", "DB_NAME", "LEASE_MARGIN_PARAM", "LEASE_SPEED_PARAM", "PENDING_PARAM",
     "PLANNED_TOKENS_PARAM", "PRICE_TICK_PARAM", "RL_MODE_ENV", "RUN_ENV", "RlAsync", "RlAsyncSettings",
     "TRAINER_BIND_ENV", "TRAINER_TOKEN_ENV", "WINDOW", "audit_source", "build_rl_async", "build_rl_trainer_app",
     "build_rl_trainer_router", "index_signer_for", "mount_rl_async", "rl_async_loops", "rl_async_params",

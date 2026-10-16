@@ -270,7 +270,7 @@ Read side:
 - The accumulator core as the env-mix filler.
 - `quarantine.assess_training_batch` (`validator/quarantine.py:81`).
 
-**New:** a buffer of accepted in-zone groups tagged (env, k, arrival), filled freshest-first per env, at the target mix, without blocking, with a max-lag drop (~300).
+**New:** a buffer of accepted in-zone groups tagged (env, k, arrival), taken in arrival order across envs until the batch is full, with a max-lag drop (~300; revised 2026-10-16).
 
 Placement is open:
 - validator-side, emitting sequential batch payloads to R2 (keeps the detached-trainer topology);
@@ -367,7 +367,7 @@ v* must come from the proof. The trainer cannot recompute it: it has no pi_old m
 
 **Reuse:** the per-env walk, clamp, breaker and restore (`service.py:6322-6360`), and the trainer-wait accounting (its signal survives as "trainer waited on env").
 
-**Change:** a per-token price, not a pool factor. Advance on time or steps, not windows. New signals: env share of trained tokens below target, and buffer overflow causes a descend. Remove the snap regime (no window fill). Size ~300.
+**Change:** a per-token price, not a pool factor. Advance on time or steps, not windows. Signal (revised 2026-10-16): each env's queued tokens per second against its target share of the trainer's reported speed. Remove the snap regime (no window fill). Size ~300.
 
 ### 1.13 `/rl/pay` and `/rl/quota`
 
@@ -622,7 +622,7 @@ Main runs the current production RL (fill-closed v6). The window code cannot be 
 | P1b | GPU: staleness under Gumbel (0/1/2/4 steps); per-rollout floor; max lag S | P1a | measurement |
 | P2 | Lease service (SQLite, restart-safe), interval fairness, exclusivity, expiry, `S_k` commit/reveal, AIMD quota, `/rl/lease`, `/rl/quota`, signatures; cooldown at lease time | D0 | ~1,200 |
 | P3 | `/rl/submit`: admission refactor (no early OUT_OF_ZONE return), lane classification, in-zone proof through `proof_scheduler`, out-of-zone audit (exploration ledger decoupled from pay), group store, run log and publication rewired | P1a, P2 | ~1,500 (plus ~1,000 moved out of `batcher.py`) |
-| P4 | Buffer (env mix, freshest-first, max-lag drop), payload schema bump, trainer loop without journal or cursor, accumulator without checkpoint reset, publish cadence, continuous `CheckpointIntake` swap | P3 | ~800 |
+| P4 | Buffer (arrival order, full batch, max-lag drop), payload schema bump, trainer loop without journal or cursor, accumulator without checkpoint reset, publish cadence, continuous `CheckpointIntake` swap | P3 | ~800 |
 | P5 | Substitution, mask and current loss switch; v* threading; telemetry; drift gate | P1a, P4 (payload) | ~250 |
 | P6 | Pay per matched token with floor; settlement period; `weight_only` replay of the new archive; async price controller; `/rl/pay` | P3, P4 | ~900 |
 | P7 | Reference miner: lease client, quota scheduler (from the `episode_mining` skeleton), background download and vLLM rebuild or weight swap, Gumbel generation, GRAIL/TOPLOC/proof model dropped; episode miner leases and stops restarting on revision | P1a, P2 | ~1,200 new, ~1,000 deleted |
@@ -683,8 +683,9 @@ over the module-level `batcher.admission_problem_materials`, shared with P3).
   `RlSubmissions`: `check_submission` -> grade -> one transaction (lease closed, `record_outcome`, `rl_groups`,
   buffer or audit draw). Store: `rl_groups` (private, hotkey, verdict, grades, first scan, audit/training state)
   next to `rl_prompt_scans` (public log). TODO: the decision-D R2 segment writer reads `rl_prompt_scans` by `seq`.
-- `validator/rl_buffer.py`: `TrainingBuffer` (SQLite, same file): `take(env, n)` freshest first (k, then arrival),
-  `release`, `depth`; taken groups requeue at reopen. `SubmittedGroup` carries env, k, nonce, arrival, hotkey,
+- `validator/rl_buffer.py`: `TrainingBuffer` (SQLite, same file): `take(n)` any env in arrival order, `release`,
+  `depth`, `drain_arrivals` (queued completion tokens per env: the prices'
+  supply); taken groups requeue at reopen. `SubmittedGroup` carries env, k, nonce, arrival, hotkey,
   prompt tokens, completions, force spans, rewards.
 - Audit (§C, design §4.4): draw after submission with `SystemRandom`; probation = < 100 passed out-of-zone audits,
   or < 20 passes since the last failure; deterministic -> `LeaseBook.ban` 24 h (no lease: refusal `banned`, no
@@ -727,11 +728,12 @@ New code next to the window path (`emission_price`, `settlement`, `rl_pay`, `wei
   unchanged `weight_only._period_weights` pays these archives (per-period EMA, per-task cap, `CATCHUP_ENTRIES`)
   once the async RL task is declared with `params.settlement = "period-ema-v1"`; no window archive is needed.
 - `validator/rl_price.py`: `AsyncPriceController` keeps the window controller's `PriceParams` (base =
-  production values with `cap = 4.0`), `PriceState`, `PriceDecision` and walk; ticks on time (`tick_s` 300 s,
-  `due`) or per trainer step (`tick`). Descend (`decay` scaled to the tick) when `TrainingBuffer.depth()[env] >
-  overflow_groups` (64); else rise (x1.10) when the trainer waited on the env > 5 % of the tick (`note_wait`) or
-  its share of the tick's trained tokens (`RlPayLedger.trained_tokens`) is < 0.9 x target; else hold. Clamped to
-  [0.05, 4.0]. Per-token price = multiplier x cap x target share / `planned_tokens_per_period` (at 1, the planned
+  production values with `cap = 4.0`), `PriceState`, `PriceDecision` and walk; ticks on the validator's timer
+  (`tick_s` 300 s, `due`). Trainer speed (`note_speed` per step: completion tokens / seconds worked, sums decayed
+  with a one-tick half-life, `rl_trainer_speed`); per env r = queued tokens per second (`drain_arrivals`) /
+  (target share x speed): r < `low` (0.95) rises x1.10, r > `high` (1.15) or refused by the global cap
+  (`LeaseBook.drain_full`) descends (`decay` scaled to the tick), else holds; no speed for `stale_ticks` (3): hold.
+  Clamped to [0.05, 4.0]. Per-token price = multiplier x cap x target share / `planned_tokens_per_period` (at 1, the planned
   consumption at target mix pays exactly the cap). Snap and breaker dropped (no window to fill). State in
   `rl_prices` (restart-safe).
 - `GET /rl/pay?hotkey=` (`build_rl_lease_router(pay=ledger)`): per-env multiplier, token price, per-Mtok price,
@@ -961,7 +963,7 @@ task declared for period settlement refuses to start in window mode).
   --rl-async --planned-tokens-per-period <N> [--lease-tokens-per-s <s>]` (`cli.with_rl_async_params`): mechanism
   `rl-discovered-price`, `params.settlement = "period-ema-v1"` (the unchanged weight setter pays the period
   archives), `env_split` = the trainer's target mix, `rl_planned_tokens_per_period`, `rl_lease_reference_tokens_per_s`,
-  `rl_lease_expiry_margin`, optional `rl_price_tick_s` / `rl_buffer_overflow_groups`.
+  `rl_lease_expiry_margin`, optional `rl_price_tick_s` / `rl_max_pending_groups` (the lease book's global cap, default 256).
 - Validator (`validator/rl_async_service.py`, `run_rl_async_validator`, branched in `validate` after the corpus
   branch): one process like the corpus validator; `build_rl_async` puts the lease book, quota, collector,
   submissions + buffer, price controller and ledger on `<state dir>/rl-async.sqlite3`; `RlCheckpointBoard` over
@@ -1099,13 +1101,13 @@ the controller (both are additive; the transport hash changes with this release 
 
 - `reliquary/trainer/async_trainer.py` (`AsyncTrainer`, `AsyncTrainerConfig`, `DrawGate`), next to the window
   trainer (unchanged). `run_once`: drop groups older than `max_lag` (8) checkpoints unpaid without a forward
-  (`TrainingBuffer.take_older`); take `batch_groups` at `env_mix` (largest remainder; freshest first per env); a
-  short env is polled for at most `wait_s`, then the step runs with what is there and `note_wait(env, s)` is
-  reported; `train_step(..., gate=DrawGate)`; `report_training` for every group; a checkpoint every
+  (`TrainingBuffer.take_older`); take `batch_groups` of any env in arrival order, polling until the batch is full
+  (the groups of a take whose answer was lost are requeued before each step); one batch, global token mean;
+  `train_step(..., gate=DrawGate)`; `report_training` for every group; a checkpoint every
   `steps_per_checkpoint` (N, default 1): CPU snapshot on the step path, `DeltaPublisher.publish` +
   `LeaseBook.adopt_checkpoint(k+1)` in a one-deep publish thread (an error stops the loop at the next
-  publication); `BackgroundHfBackup.submit` every `hf_backup_every` (M) steps; `prices.tick(trained matched tokens,
-  depth)` per step. Health skip: groups reported untrained, unsanctioned. Crash: groups released.
+  publication); `BackgroundHfBackup.submit` every `hf_backup_every` (M) steps; `prices.note_speed(completion tokens, seconds
+  worked)` per step. Health skip: groups reported untrained, unsanctioned. Crash: groups released.
 - Verification in the training forward (`training.py`, `gate=None` keeps the window path as it was): per
   micro-batch the substitution forward gives v* and per-rollout tallies (stochastic / drawn, matches); pi_old :=
   the policy (ratio 1); rollouts under `RL_ROLLOUT_MATCH_FLOOR` (constants, 0.95 placeholder; the ledger's floor)

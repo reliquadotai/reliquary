@@ -40,8 +40,8 @@ Tags: **DECIDED** (user agreed), **PROPOSED** (recommended, awaiting the user),
     measurement), full anchors every N steps, full backups to Hugging Face in the background
     (DECIDED). Miners download through presigned R2 URLs (DECIDED).
 11. **Pay per matched token** of trained groups, with a per-rollout floor so that quantized
-    generators do not out-earn honest bf16 ones. Per-environment prices steer supply to the
-    trainer's target mix.
+    generators do not out-earn honest bf16 ones. Per-environment prices steer each env's supply to
+    its target share of the trainer's speed (DECIDED 2026-10-16).
 
 ## 2. Evidence behind the decisions
 
@@ -180,9 +180,17 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
 ### 4.7 Buffer, trainer and loss
 
 - Accepted in-zone groups enter a buffer tagged with env, checkpoint and arrival time. The
-  trainer steps as soon as it can fill a batch at the target env mix; a short env does not
-  block, its price rises. Within an env, freshest first. Groups that wait too long fail the floor
-  against the newer checkpoint and are dropped unpaid.
+  trainer takes `batch_groups` groups of any env in arrival order and waits until the batch is
+  full (DECIDED 2026-10-16; prime-rl, AReaL, PipelineRL, verl, SkyRL, open-instruct all do this).
+  The batch mix is whatever arrives: each group has its own baseline, so composition adds noise,
+  not bias. The loss is the global token mean of the step.
+- A global cap on open leases + buffered groups (`rl_max_pending_groups`, placeholder 256 = 4
+  batches) holds miners back when they outrun the trainer (refusal `full`), instead of dropping
+  their work: AReaL/SkyRL throttle generation the same way. Groups past `max_lag` are still dropped
+  unpaid, as a safety.
+- Streaming micro-batches as groups arrive (RollPacker) was looked at: it helps synchronous
+  systems where the trainer idles during generation; here the buffer already keeps the trainer
+  busy, so it would only shave one step of lag when supply is short. Not done.
 - **One forward, three outputs** (PROPOSED). The trainer holds exactly the published
   checkpoint k. Its forward over a batch gives, per completion position, the logits, hence
   v* = Gumbel pick with the lease's noise, hence:
@@ -236,9 +244,15 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   out-of-zone work counts for quota either way.
 - Per-rollout floor prevents quantized formats from out-earning bf16 (measured: a 3090 earns
   +65 % paid tokens/s with W4A16 under pay-per-match without a floor).
-- Per-env price controller (async version): rise when the env's share of trained tokens is
-  below target or the trainer waited on it; descend when its buffer overflows. `/rl/pay` and
-  quota published.
+- Per-env price controller (DECIDED 2026-10-16): the target is the trainer's speed. The trainer
+  reports per step the completion tokens it processed and the seconds it worked (waits excluded);
+  an env's demand is its target share (`env_split`, the operator's only knob) x that speed, its
+  supply the completion tokens of its groups queued per second. Per tick (300 s): supply/demand
+  under 0.95 rises x1.10, over 1.15 (or refused by the global cap) descends, else holds
+  (placeholders). No global price: the demands sum to the trainer's speed, so every env at ~1
+  means the miners as a whole match the trainer; a bad batch mix moves the env prices by itself.
+  No speed for 3 ticks (trainer down): hold. `/rl/pay` publishes ratio, supply, demand and price
+  per env.
 
 ### 4.9b Miner formats and pay (DECIDED 2026-10-16: no official format)
 

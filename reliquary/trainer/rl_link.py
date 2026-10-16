@@ -93,8 +93,8 @@ class TrainerLink:
         self._call("POST", "adopt", {"k": int(k)})
 
     # --- the buffer -----------------------------------------------------------------------------------------------
-    def take(self, environment: str, limit: int) -> list[SubmittedGroup]:
-        return self._groups(self._call("POST", "take", {"environment": environment, "limit": int(limit)}))
+    def take(self, limit: int) -> list[SubmittedGroup]:
+        return self._groups(self._call("POST", "take", {"limit": int(limit)}))
 
     def take_older(self, below_k: int, limit: int) -> list[SubmittedGroup]:
         return self._groups(self._call("POST", "take_older", {"below_k": int(below_k), "limit": int(limit)}))
@@ -118,13 +118,9 @@ class TrainerLink:
             "matched_tokens": None if matched_tokens is None else [int(n) for n in matched_tokens]}, resend_ok=True)
 
     # --- the prices -----------------------------------------------------------------------------------------------
-    def note_wait(self, environment: str, seconds: float) -> None:
-        if seconds > 0:
-            self._call("POST", "wait", {"environment": environment, "seconds": float(seconds)})
-
-    def tick(self, trained_tokens: Mapping[str, int], buffer_depth: Mapping[str, int] | None = None) -> dict:
-        """One price tick with the step's trained matched tokens (the validator reads its own buffer depth)."""
-        return self._call("POST", "tick", {"trained_tokens": {str(e): int(n) for e, n in trained_tokens.items()}})
+    def note_speed(self, tokens: float, seconds: float) -> None:
+        """One step's speed: completion tokens processed in ``seconds`` of work (the per-env demand's base)."""
+        self._call("POST", "speed", {"tokens": float(tokens), "seconds": float(seconds)})
 
 
 __all__ = ["TrainerLink", "TrainerLinkError"]
