@@ -1212,27 +1212,16 @@ class _DrawRows(NamedTuple):
 
 def _draw_logits(project, weight):
     """The rows -> logits map the forced draw reads, as the verifier computes it: the
-    profile's fp32 head (bf16 operands, fp32 products, TF32 off) or the head's own
-    projection. The fp32 copy is cast here, per call: the weight moves every step."""
-    from reliquary.validator.verifier import lm_head_fp32
+    profile's fp32 head (``verifier.fp32_head_matmul``) or the head's own projection."""
+    from reliquary.validator.verifier import fp32_head_matmul, lm_head_fp32
 
     if not lm_head_fp32():
         return project
     if weight is None:
         raise RuntimeError("fp32 LM head: the forced draw needs the head's weight")
-    w = weight.detach().to(torch.bfloat16).float()
-
-    def fp32(rows):
-        previous = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = False
-        try:
-            # Autocast would hand the matmul bf16 operands again.
-            with torch.autocast(device_type=rows.device.type, enabled=False):
-                return rows.to(torch.bfloat16).float() @ w.T
-        finally:
-            torch.backends.cuda.matmul.allow_tf32 = previous
-
-    return fp32
+    w = weight.detach().to(torch.bfloat16)
+    return lambda rows: fp32_head_matmul(rows.reshape(-1, rows.shape[-1]).to(torch.bfloat16),
+                                         w).reshape(*rows.shape[:-1], -1)
 
 
 @torch.no_grad()

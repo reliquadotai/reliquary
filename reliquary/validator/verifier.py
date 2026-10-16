@@ -549,29 +549,32 @@ class _LazyLogitRows:
         return self._project(self._hidden[key])
 
 
-# id(weight) -> (weight, its fp32 copy): one copy per resident head (4 GB for a 248k x 4096
-# head), kept while the weight lives. Holding the weight in the value pins the id.
-_FP32_HEAD_WEIGHTS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-
-
-def _fp32_head_logits(rows: torch.Tensor, lm_head: Any) -> torch.Tensor:
-    """``sampling.lm_head_fp32``: fp32(rows) @ fp32(W).T with TF32 off. bf16 x bf16 products are
-    exact in fp32, so this is the product vLLM's ``head_dtype=float32`` computes (bf16 inputs,
-    fp32 accumulation); only the summation order is the kernel's."""
-    if getattr(lm_head, "bias", None) is not None:
-        raise RuntimeError("fp32 LM head: a biased head is not supported")
-    weight = lm_head.weight
-    cached = _FP32_HEAD_WEIGHTS.get(id(weight))
-    if cached is None or cached[0] is not weight:
-        _FP32_HEAD_WEIGHTS.clear()
-        cached = (weight, weight.detach().float())
-        _FP32_HEAD_WEIGHTS[id(weight)] = cached
+def fp32_head_matmul(rows: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``sampling.lm_head_fp32``: rows @ W.T with fp32 products and accumulation, fp32 out. With bf16 operands on
+    CUDA (production) it is the cuBLAS call vLLM's ``head_dtype=float32`` makes (``torch.mm(..., out_dtype=
+    float32)``, tensor cores; 13.7x faster than an fp32 SGEMM at 2048 rows of the 9B on H100, 1 different Gumbel
+    pick in 381k, 2026-10-16); otherwise, or on a torch without ``out_dtype`` (2.7), an fp32 matmul with TF32 off.
+    bf16 x bf16 products are exact in fp32: only the summation order differs (~4e-4 at most on the 9B)."""
+    weight = weight.detach()
+    if rows.is_cuda and rows.dtype == weight.dtype == torch.bfloat16:
+        try:
+            with torch.autocast(device_type="cuda", enabled=False):
+                return torch.mm(rows, weight.T, out_dtype=torch.float32)
+        except TypeError:           # no out_dtype in this torch: the SGEMM below, same products
+            pass
     previous = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
     try:
-        return rows.float() @ cached[1].T
+        with torch.autocast(device_type=rows.device.type, enabled=False):
+            return rows.float() @ weight.float().T
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous
+
+
+def _fp32_head_logits(rows: torch.Tensor, lm_head: Any) -> torch.Tensor:
+    if getattr(lm_head, "bias", None) is not None:
+        raise RuntimeError("fp32 LM head: a biased head is not supported")
+    return fp32_head_matmul(rows.reshape(-1, rows.shape[-1]), lm_head.weight).reshape(*rows.shape[:-1], -1)
 
 
 def _lm_head_vocab_size(lm_head: Any) -> int | None:
