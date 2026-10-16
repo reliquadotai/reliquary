@@ -1497,16 +1497,16 @@ _PROFILE_VALUES = (
 # Measured (offpolicy-lab, 2026-10-14/15, 9B, T=1 full vocab, vLLM 0.30 runner-keyed
 # miners on 3090/A6000/L40/5090, HF proof-path validators): honest stochastic match 0.986
 # on every card (spread 0.0006) against 0.945-0.950 for the inverse CDF, no rollout under
-# 0.95, no honest group rejected; 0.994 with an fp32 LM head on both sides, which a task
-# contract can opt into with ``lm_head_fp32`` (undecided, so off here). The new version
-# moves the forced-seed domain too, so v9 and v10 streams never coincide.
+# 0.95, no honest group rejected; 0.994 with an fp32 LM head on both sides (``lm_head_fp32``,
+# decided 2026-10-15: on). The new version moves the forced-seed domain too, so v9 and v10
+# streams never coincide.
 _TEUTONIC_V9 = next(p for p in _PROFILE_VALUES if p.profile_id == "teutonic-9b-reliquary-suite-v9-dev1")
 _PROFILE_VALUES = _PROFILE_VALUES + (
     replace(
         _TEUTONIC_V9,
         profile_id="teutonic-9b-reliquary-suite-v10-gumbel-dev1",
         protocol_version=10,
-        sampling=replace(_SAMPLING_DAPO, draw=DRAW_GUMBEL_MAX),
+        sampling=replace(_SAMPLING_DAPO, draw=DRAW_GUMBEL_MAX, lm_head_fp32=True),
     ),
 )
 

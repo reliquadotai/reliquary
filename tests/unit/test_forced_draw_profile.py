@@ -33,13 +33,13 @@ def test_earlier_profiles_keep_the_inverse_cdf_and_omit_the_fields(profile_id):
 def test_gumbel_profile_is_v9_with_the_gumbel_draw_and_a_new_version():
     gumbel, v9 = PROFILES[GUMBEL], PROFILES[V9]
     assert gumbel.sampling.draw == "gumbel_max"
-    assert gumbel.sampling.lm_head_fp32 is False
+    assert gumbel.sampling.lm_head_fp32 is True                         # decided 2026-10-15
     assert gumbel.protocol_version == 10
-    assert replace(gumbel.sampling, draw="inverse_cdf") == v9.sampling
+    assert replace(gumbel.sampling, draw="inverse_cdf", lm_head_fp32=False) == v9.sampling
     assert dict(gumbel.environments) == dict(v9.environments)
     assert (gumbel.model_id, gumbel.model_revision) == (v9.model_id, v9.model_revision)
     sampling = gumbel.to_generation_contract()["sampling"]
-    assert sampling["draw"] == "gumbel_max" and "lm_head_fp32" not in sampling
+    assert sampling["draw"] == "gumbel_max" and sampling["lm_head_fp32"] is True
 
 
 def test_gumbel_profile_contract_round_trips():
@@ -48,7 +48,7 @@ def test_gumbel_profile_contract_round_trips():
 
 
 def test_fp32_head_round_trips_through_a_contract():
-    contract = PROFILES[GUMBEL].to_generation_contract()
+    contract = PROFILES[V9].to_generation_contract()
     contract["sampling"]["lm_head_fp32"] = True
     profile = profile_from_contract(contract)
     assert profile.sampling.lm_head_fp32 is True
@@ -99,7 +99,7 @@ def _constants_under(profile_id: str) -> dict:
 
 
 def test_constants_follow_the_active_profile():
-    assert _constants_under(GUMBEL) == {"draw": "gumbel_max", "fp32": False,
+    assert _constants_under(GUMBEL) == {"draw": "gumbel_max", "fp32": True,
                                         "domain": "reliquary-forced-seed-v10"}
     assert _constants_under(V9) == {"draw": "inverse_cdf", "fp32": False,
                                     "domain": "reliquary-forced-seed-v9"}
