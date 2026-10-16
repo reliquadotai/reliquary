@@ -3865,6 +3865,11 @@ def mine_async(
                                      help="Leases per generation batch; new weights are swapped between batches"),
     gpu_memory_utilization: float = typer.Option(0.85, "--gpu-memory-utilization", help="vLLM's GPU share"),
     max_num_seqs: int = typer.Option(256, "--max-num-seqs", help="vLLM's concurrent sequences"),
+    max_model_len: int = typer.Option(
+        0, "--max-model-len", min=0,
+        help="vLLM's context length (0: the model's, 262,144 for the 9B, which a 24 GB card cannot hold; "
+        "prompt + the run's max_new_tokens is enough)"),
+    quantization: str = typer.Option("", "--quantization", help="vLLM weight format, e.g. fp8 (default: bf16)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="An in-process fake validator: no network, no wallet"),
     fake_generator: bool = typer.Option(False, "--fake-generator", help="Generate fake tokens on CPU (tests)"),
     generate_port: int = typer.Option(8013, "--generate-port",
@@ -3927,7 +3932,8 @@ def mine_async(
             base_model_dir=base_model or None, work_dir=work_dir, initial_dir=initial_checkpoint or None,
             initial_version=None if initial_version < 0 else initial_version, swap=weight_swap, dry_run=dry_run,
             fake_generator=fake_generator, episode_options=episode_options,
-            engine_kwargs={"gpu_memory_utilization": gpu_memory_utilization, "max_num_seqs": max_num_seqs}))
+            engine_kwargs={"gpu_memory_utilization": gpu_memory_utilization, "max_num_seqs": max_num_seqs,
+                           "max_model_len": max_model_len or None, "quantization": quantization or None}))
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=4) from exc

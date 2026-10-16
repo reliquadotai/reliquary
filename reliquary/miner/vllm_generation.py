@@ -360,7 +360,7 @@ class VLLMRolloutGenerator:
         max_model_len: int | None = None, gpu_memory_utilization: float = 0.85,
         max_num_seqs: int = 256, enforce_eager: bool = False,
         engine: Any | None = None, sampling_params_class: Any | None = None,
-        lm_head_fp32: bool | None = None,
+        lm_head_fp32: bool | None = None, quantization: str | None = None,
     ) -> None:
         self.model_path = model_path
         self.revision = revision
@@ -370,6 +370,9 @@ class VLLMRolloutGenerator:
             "max_num_seqs": max_num_seqs,
             "enforce_eager": enforce_eager,
         }
+        if quantization:
+            # vLLM's own weight format (e.g. "fp8" on Ada/Hopper): the miner's choice, the draw is unchanged.
+            self._settings["quantization"] = quantization
         if default_lm_head_fp32() if lm_head_fp32 is None else lm_head_fp32:
             self._settings["hf_overrides"] = dict(FP32_HEAD_OVERRIDES)
         self._sampling_params_class = sampling_params_class
