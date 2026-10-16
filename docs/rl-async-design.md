@@ -253,8 +253,11 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   reports per step the completion tokens it processed and the seconds it worked (waits excluded);
   an env's demand is its target share (`env_split`, the operator's only knob) x that speed, its
   supply the completion tokens of its groups queued per second. Per tick (300 s): supply/demand
-  under 0.95 rises x1.10, over 1.15 (or refused by the global cap) descends, else holds
-  (placeholders). No global price: the demands sum to the trainer's speed, so every env at ~1
+  under 0.90 rises x1.05, over 1.10 (or refused by the global cap while the total supply covers
+  the trainer) descends 2 %, else holds; an env with no supply in the tick gives its share to
+  the others (placeholders, from a 72 h simulation with miners reallocating on prices: the
+  first values, x1.10 up and -0.2 % down, ratcheted up and pinned the costliest env at the cap;
+  these converge in 7-9 h with 1-3 % trainer wait). No global price: the demands sum to the trainer's speed, so every env at ~1
   means the miners as a whole match the trainer; a bad batch mix moves the env prices by itself.
   No speed for 3 ticks (trainer down): hold. `/rl/pay` publishes ratio, supply, demand and price
   per env.

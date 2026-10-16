@@ -126,11 +126,11 @@ def test_the_async_price_moves_on_supply_against_its_share_of_the_trainer_speed(
     params = AsyncPriceParams()
     state = PriceState(price=1.0, last_good=1.0)
     short = advance_async(state, EnvSignal(300, supply_tps=400, demand_tps=500), params)          # r = 0.8
-    assert (short.regime, short.price, short.r) == (RISE, pytest.approx(1.1), pytest.approx(0.8))
+    assert (short.regime, short.price, short.r) == (RISE, pytest.approx(1.05), pytest.approx(0.8))
     hold = advance_async(state, EnvSignal(300, 500, 500), params)
     assert hold.regime == HOLD and hold.price == 1.0
     over = advance_async(state, EnvSignal(300, 600, 500), params)                                 # r = 1.2
-    assert over.regime == DESCEND and over.price == pytest.approx(0.98 ** 0.1)
+    assert over.regime == DESCEND and over.price == pytest.approx(0.817 ** 0.1)                  # -2 % per tick
     full = advance_async(state, EnvSignal(300, 500, 500, full=True), params)                      # the cap refused it
     assert full.regime == DESCEND
     short_but_full = advance_async(state, EnvSignal(300, 100, 500, full=True), params)            # the mix still moves
@@ -154,15 +154,23 @@ def test_the_controller_targets_the_trainer_speed_persists_and_prices_per_token(
     prices.note_speed(6_000, 6.0)                                                   # 1,000 tokens/s: 500 per env
     prices.note_speed(0, 0.0)                                                       # ignored
     assert prices.trainer_speed() == pytest.approx(1_000)
-    decisions = prices.tick({ENV: 300 * 700, OTHER: 300 * 100}, {OTHER})           # r = 1.4 and 0.2
+    decisions = prices.tick({ENV: 300 * 1_200, OTHER: 300 * 100}, {OTHER})         # r = 2.4 and 0.2
     assert decisions[ENV].regime == DESCEND and decisions[OTHER].regime == RISE
-    assert prices.token_price(OTHER) == pytest.approx(1.1 * NOMINAL) and not prices.due()
+    assert prices.token_price(OTHER) == pytest.approx(1.05 * NOMINAL) and not prices.due()
     assert prices.tick({}) == {}                                                    # no time elapsed
     again = AsyncPriceController(book, {ENV: 0.5, OTHER: 0.5}, CAP, PLANNED, clock=lambda: clock[0])
-    assert again.multiplier(OTHER) == pytest.approx(1.1)                            # restart-safe
+    assert again.multiplier(OTHER) == pytest.approx(1.05)                           # restart-safe
     signal = again.board()[OTHER]["signal"]
     assert again.board()[OTHER]["regime"] == RISE and signal["full"] is True
     assert signal["demand_tps"] == pytest.approx(500) and signal["ratio"] == pytest.approx(0.2)
+    clock[0] += 300
+    prices.note_speed(6_000, 6.0)
+    decisions = prices.tick({ENV: 300 * 1_000})                                     # OTHER dry: ENV takes all
+    assert decisions[ENV].regime == HOLD and decisions[OTHER].regime == RISE        # r = 1 against 1,000 tok/s
+    clock[0] += 300
+    prices.note_speed(6_000, 6.0)
+    decisions = prices.tick({ENV: 300 * 500, OTHER: 300 * 100}, {ENV})              # total 600 < 1,000 tok/s
+    assert decisions[ENV].regime == HOLD                                            # full ignored: cap too small
     clock[0] += 300 * 3 + 1                                                          # no step for 3 ticks: stale
     assert again.trainer_speed() is None
     with pytest.raises(ValueError):

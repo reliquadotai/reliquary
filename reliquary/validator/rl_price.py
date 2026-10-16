@@ -3,15 +3,16 @@
 The target is the trainer's speed: each env must supply its target share of what the trainer consumes. Per tick
 (``tick_s`` of wall time, the validator's timer):
 
-* **demand** of an env = its target share x the trainer's speed, in completion tokens per second of trainer work
+* **demand** of an env = its target share (renormalised over the envs that supplied anything in the tick: a dry
+  env's share goes to the others, since the trainer takes what arrives) x the trainer's speed, in completion tokens per second of trainer work
   (``note_speed``: per step, the completion tokens the trainer processed and the seconds it worked, waits excluded;
   kept as sums decayed with a half-life of one tick, persisted);
 * **supply** = the completion tokens of the env's groups queued for training during the tick
   (``TrainingBuffer.drain_arrivals``), per second;
 * ``r = supply / demand``: under ``low`` the price rises (x ``rise``), over ``high`` it descends (``decay`` scaled to
   the tick's length), else it holds. An env refused leases for the global cap during the tick
-  (``LeaseBook.drain_full``: the miners would supply more than the trainer takes) descends unless it is under ``low``
-  (then it rises: the cap holds every env back, the mix still has to move).
+  (``LeaseBook.drain_full``) descends unless it is under ``low`` (then it rises: the cap holds every env back, the
+  mix still has to move), and only when the total supply covered the trainer's speed (else the cap is too small).
 * No speed yet, or none for ``stale_ticks`` ticks (trainer down): every price holds.
 
 No global price: the trainer's speed is the sum of the demands, so every env at r ~ 1 means the miners as a whole
@@ -31,8 +32,13 @@ from reliquary.validator.emission_price import (
     PRODUCTION_PRICE_PARAMS, ROUND_SECONDS, PriceDecision, PriceParams, PriceState,
 )
 
-ASYNC_PRICE_RISE = 1.10
-ASYNC_BASE_PARAMS = replace(PRODUCTION_PRICE_PARAMS, cap=4.0, rise=ASYNC_PRICE_RISE)
+# Simulated 2026-10-16 (scratchpad price_sim.py: 3 envs, miners reallocating on last tick's prices, 72 h): the
+# window's walk (x1.10 up, -0.2 % per 300 s tick down, band 0.95-1.15) ratchets up and pins the costliest env at
+# the cap; x1.05 up, -2 % per tick down (decay 0.817 per 1000 rounds) and a band centred on 1 converge in 7-9 h
+# with every env within its target share and 1-3 % trainer wait. Placeholders until the end-to-end run.
+ASYNC_PRICE_RISE = 1.05
+ASYNC_PRICE_DECAY = 0.817
+ASYNC_BASE_PARAMS = replace(PRODUCTION_PRICE_PARAMS, cap=4.0, rise=ASYNC_PRICE_RISE, decay=ASYNC_PRICE_DECAY)
 RISE, DESCEND, HOLD = "rise", "descend", "hold"
 
 _SCHEMA = """
@@ -48,8 +54,8 @@ CREATE TABLE IF NOT EXISTS rl_trainer_speed(id INTEGER PRIMARY KEY CHECK(id=0), 
 class AsyncPriceParams:
     base: PriceParams = ASYNC_BASE_PARAMS
     tick_s: float = 300.0
-    low: float = 0.95            # placeholders: supply/demand band the price holds in (a little over 1: the trainer
-    high: float = 1.15           # should never wait)
+    low: float = 0.90            # placeholders: the supply/demand band the price holds in
+    high: float = 1.10
     stale_ticks: float = 3.0     # no trainer speed for this many ticks: hold every price
 
     def __post_init__(self) -> None:
@@ -183,13 +189,20 @@ class AsyncPriceController:
             seconds = max(now - last, 0.0)
             if seconds <= 0:
                 return {}
+            # An env nobody supplied gives its share to the others (the trainer takes what arrives), and still rises.
+            live = sum(float(v) for env, v in self.targets.items() if arrivals.get(env, 0) > 0) or 1.0
+            # The cap refusing leases while the miners as a whole supply less than the trainer takes says the cap is
+            # too small, not that the miners are too many: ``full`` counts only when the supply covers the speed.
+            oversupplied = speed is not None and sum(int(v) for v in arrivals.values()) / seconds >= speed
             for env in sorted(self.targets):
                 row = db.execute("SELECT price, last_good FROM rl_prices WHERE environment=?", (env,)).fetchone()
                 start = self.params.base.start
                 state = PriceState(price=start, last_good=start) if row is None else PriceState(*row)
                 share = float(self.targets[env])
+                if arrivals.get(env, 0) > 0:
+                    share /= live
                 signal = EnvSignal(seconds, int(arrivals.get(env, 0)) / seconds,
-                                   None if speed is None else share * speed, env in full)
+                                   None if speed is None else share * speed, oversupplied and env in full)
                 decision = advance_async(state, signal, self.params)
                 decisions[env] = decision
                 detail = {"seconds": seconds, "ratio": decision.r, "supply_tps": signal.supply_tps,
