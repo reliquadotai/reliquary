@@ -921,7 +921,8 @@ class VllmGroupGenerator:
         if swap not in ("push", "reload"):
             raise ValueError("swap must be push or reload")
         self.base, self.work, self.swap = Path(base_model_dir), Path(work_dir), swap
-        self.scratch = Path(scratch_dir or ("/dev/shm" if Path("/dev/shm").is_dir() else work_dir)) / "rl-push"
+        # One per process: miners sharing a host swap at the same moment and would clear each other's shards.
+        self.scratch = Path(scratch_dir or ("/dev/shm" if Path("/dev/shm").is_dir() else work_dir)) / f"rl-push-{os.getpid()}"
         self.tokenizer = None
         self.eos_ids: list[int] = []
         if (self.base / "config.json").is_file():
