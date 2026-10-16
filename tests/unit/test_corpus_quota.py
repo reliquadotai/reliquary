@@ -5,6 +5,8 @@ import asyncio
 
 import pytest
 
+pytest.importorskip("reliquary_sandbox")
+
 from reliquary.sandbox.corpus_quota import (
     LOW_YIELD, MAIN, NEWCOMER, CorpusQuota, stats_of, standing,
 )
