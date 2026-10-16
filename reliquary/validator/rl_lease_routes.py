@@ -19,7 +19,9 @@
 * ``GET {prefix}/lease/commitments``: the commitments of the leasable checkpoints and the revealed secrets.
 * ``GET {prefix}/prompts/state?since=&environment=``: the prompt lifecycle (``LeaseBook.prompt_state``): the scans
   after cursor ``since`` and the state (cooldown until k, blacklisted) of the prompts they moved. Public, no hotkey.
-* ``POST {prefix}/submit`` (mounted when ``submissions`` is given) ``{miner_hotkey, at, lease_id, rollouts:
+* ``POST {prefix}/submit`` (mounted when ``submissions`` is given; header ``X-Reliquary-Hotkey``, checked registered
+  before the body is read, at most ``MAX_SUBMIT_READS`` bodies read and inflated at once, 2 per hotkey, then its
+  own preauth pool) ``{miner_hotkey, at, lease_id, rollouts:
   [{index, tokens, force_span, episode?}], k_generated?, signature}``: a completed lease (``protocol/rl_submit.py``: every
   index, completion tokens only, compressed), signed over ``rollouts_digest`` of the rollouts as sent
   (``build_rl_submit_binding``), authenticated like a lease request with its own per-minute bound, inflated only
@@ -27,7 +29,9 @@
   k is the generation checkpoint. Graded off the event loop (``RlSubmissions.submit``); the answer is the verdict
   and the validator's rewards. A resend of a lease already graded answers its original verdict again (200,
   idempotent: the lease id is the key). A malformed group is refused before the lease is touched (it stays open); a
-  grader outage answers 503 (resend).
+  grader outage answers 503 (resend). The lease's ownership and expiry are checked at arrival, before a grading slot
+  (``MAX_GRADING``, ``MAX_GRADING_PER_HOTKEY`` per hotkey) is taken; the lease is then held open
+  (``RlSubmissions.hold``) so the expiry sweep cannot end it while the group waits.
 * ``GET {prefix}/pay?hotkey=`` (mounted when ``pay`` is given, an ``rl_ledger.RlPayLedger``): per-env prices and
   per-hotkey accrued / paid / forfeited (public, like the window board it replaces when mounted on the server).
 """
@@ -48,7 +52,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from reliquary.environment.grader_client import GraderInfrastructureError
 from reliquary.protocol.rl_submit import (
-    GROUP_ROLLOUTS, GZIP, MAX_EPISODE_SUBMIT_BODY_BYTES, MAX_SUBMIT_BODY_BYTES, decode_tokens, inflate_body,
+    GROUP_ROLLOUTS, GZIP, HOTKEY_HEADER, MAX_EPISODE_SUBMIT_BODY_BYTES, MAX_SUBMIT_BODY_BYTES, decode_tokens, inflate_body,
     rollouts_digest,
 )
 from reliquary.protocol.signatures import (
@@ -68,6 +72,7 @@ LEASE_STATUS: dict[str, int] = {
     "lease_invalid": 409, "request_reused": 409, "lease_rate": 429,
     "lease_busy": 503, "registration_unavailable": 503, "internal_error": 500,
     "lease_unknown": 404, "lease_closed": 409, "lease_not_yours": 403, "grading_unavailable": 503,
+    "hotkey_required": 401, "submit_busy": 503,
 }
 REQUEST_SKEW_S = 120
 RETRY_AFTER_S = 10
@@ -82,6 +87,9 @@ MINE_MAX_PER_MINUTE = 30             # a miner reads its own leases at start, no
 SUBMIT_BODY_TIMEOUT_S = 30.0
 EPISODE_SUBMIT_BODY_TIMEOUT_S = 120.0  # an episode body (up to MAX_EPISODE_SUBMIT_BODY_BYTES) over a slow link
 MAX_GRADING = 4                       # groups graded at once (CPU); the others wait their turn
+MAX_GRADING_PER_HOTKEY = 2            # one hotkey's groups in grading at once: its others wait behind them
+MAX_SUBMIT_READS = 8                  # /rl/submit bodies read and inflated at once (registered hotkeys only)
+MAX_SUBMIT_READS_PER_HOTKEY = 2
 
 
 def rl_lease_path(prefix: str = "/rl") -> str:
@@ -247,6 +255,10 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
     recent_mine: OrderedDict[str, deque] = OrderedDict()
     used: OrderedDict[str, float] = OrderedDict()
     grading = asyncio.Semaphore(MAX_GRADING)
+    submit_preauth = asyncio.Semaphore(MAX_PREAUTH)          # /rl/submit's own: a lease request never waits on it
+    reads = asyncio.Semaphore(MAX_SUBMIT_READS)
+    reading: dict[str, int] = {}                             # hotkey -> bodies being read
+    graders: dict[str, list] = {}                            # hotkey -> [its grading semaphore, users]
 
     def remember(hotkey: str, signature: str, now: float, *, minutes: OrderedDict = recent,
                  per_minute: int = LEASE_MAX_PER_MINUTE) -> JSONResponse | None:
@@ -266,6 +278,19 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
             minutes.popitem(last=False)
         return None
 
+    async def registered(hotkey: str) -> None:
+        if registration is None:
+            return
+        try:
+            why = await registration(hotkey)
+        except Exception as exc:
+            logger.warning("lease registration check failed (%s)", type(exc).__name__)
+            why = "unavailable"
+        if why == NOT_REGISTERED:
+            raise _Refused(_refusal("hotkey_not_registered", {"why": why}))
+        if why is not None:
+            raise _Refused(_refusal("registration_unavailable", {"why": str(why)}, retry_s))
+
     async def authenticate(raw: bytes, model: type[BaseModel] = RlLeaseRequestBody,
                            check: Callable[[BaseModel, str], bool] | None = None,
                            minutes: OrderedDict = recent,
@@ -273,16 +298,7 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
         request, hotkey = await asyncio.to_thread(_decode, raw, model)
         if not request.signature:
             raise _Refused(_refusal("signature_required", {}))
-        if registration is not None:
-            try:
-                why = await registration(hotkey)
-            except Exception as exc:
-                logger.warning("lease registration check failed (%s)", type(exc).__name__)
-                why = "unavailable"
-            if why == NOT_REGISTERED:
-                raise _Refused(_refusal("hotkey_not_registered", {"why": why}))
-            if why is not None:
-                raise _Refused(_refusal("registration_unavailable", {"why": str(why)}, retry_s))
+        await registered(hotkey)
         now = float(clock())
         if abs(int(now) - request.at) > skew:
             raise _Refused(_refusal("stale_request", {"max_skew_s": skew, "now": int(now)}))
@@ -431,23 +447,39 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
     @router.post(submit_path)
     async def submit(http: Request) -> JSONResponse:
         try:
-            raw = await _read_within(http, body_cap, body_timeout)
-            arrived_at = float(clock())                       # the lease is judged at arrival, not after grading
-            encoding = http.headers.get("content-encoding", "").strip().lower()
-            if encoding == GZIP:
-                try:
-                    raw = await asyncio.to_thread(inflate_body, raw, cap=body_cap)
-                except OverflowError:
-                    return _refusal("body_too_large", {"max_bytes": body_cap})
-                except ValueError as exc:
-                    return _refusal("malformed_request", {"why": str(exc)})
-            elif encoding not in ("", "identity"):
-                return _refusal("malformed_request", {"why": f"unsupported content encoding {encoding!r}"})
-            if preauth.locked():
+            # the hotkey (header) is checked registered before any byte of the body is read or inflated
+            claimed = ss58_address(http.headers.get(HOTKEY_HEADER, "").strip())
+            if claimed is None:
+                return _refusal("hotkey_required", {"header": HOTKEY_HEADER})
+            await registered(claimed)
+            if reads.locked() or reading.get(claimed, 0) >= MAX_SUBMIT_READS_PER_HOTKEY:
+                return _refusal("submit_busy", {"max_concurrent": MAX_SUBMIT_READS}, retry_s)
+            reading[claimed] = reading.get(claimed, 0) + 1
+            try:
+                async with reads:
+                    raw = await _read_within(http, body_cap, body_timeout)
+                    arrived_at = float(clock())               # the lease is judged at arrival, not after grading
+                    encoding = http.headers.get("content-encoding", "").strip().lower()
+                    if encoding == GZIP:
+                        try:
+                            raw = await asyncio.to_thread(inflate_body, raw, cap=body_cap)
+                        except OverflowError:
+                            return _refusal("body_too_large", {"max_bytes": body_cap})
+                        except ValueError as exc:
+                            return _refusal("malformed_request", {"why": str(exc)})
+                    elif encoding not in ("", "identity"):
+                        return _refusal("malformed_request", {"why": f"unsupported content encoding {encoding!r}"})
+            finally:
+                reading[claimed] -= 1
+                if not reading[claimed]:
+                    del reading[claimed]
+            if submit_preauth.locked():
                 return _refusal("lease_busy", {"max_concurrent": MAX_PREAUTH}, retry_s)
-            async with preauth:
+            async with submit_preauth:
                 request, hotkey = await authenticate(raw, RlSubmitRequestBody, check_submit, recent_submits,
                                                      SUBMIT_MAX_PER_MINUTE)
+            if hotkey != claimed:
+                return _refusal("malformed_request", {"why": f"{HOTKEY_HEADER} is not the body's miner_hotkey"})
             if len(raw) > MAX_SUBMIT_BODY_BYTES and all(r.episode is None for r in request.rollouts):
                 return _refusal("body_too_large", {"max_bytes": MAX_SUBMIT_BODY_BYTES})   # a single-turn group
             try:
@@ -455,19 +487,30 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
                                                 rollouts=submissions.config.rollouts)
             except ValueError as exc:
                 return _refusal("malformed_request", {"why": str(exc)})
-            async with grading:
-                try:
+            held = False
+            entry = graders.setdefault(hotkey, [asyncio.Semaphore(MAX_GRADING_PER_HOTKEY), 0])
+            entry[1] += 1
+            try:
+                # the lease is the caller's and on time at arrival: held open (no sweep expiry) while it waits
+                held = await asyncio.to_thread(submissions.hold, request.lease_id, hotkey, arrived_at)
+                async with entry[0], grading:
                     answer = await asyncio.to_thread(submissions.submit, request.lease_id, hotkey, group,
                                                      arrived_at=arrived_at)
-                except GraderInfrastructureError:
-                    return _refusal("grading_unavailable", {}, retry_s)
-                except PermissionError as exc:
-                    return _refusal("lease_not_yours", {"why": str(exc)})
-                except LookupError as exc:
-                    reason = "lease_unknown" if "unknown" in str(exc) else "lease_closed"
-                    return _refusal(reason, {"why": str(exc)})
-                except ValueError as exc:
-                    return _refusal("malformed_request", {"why": str(exc)})
+            except GraderInfrastructureError:
+                return _refusal("grading_unavailable", {}, retry_s)
+            except PermissionError as exc:
+                return _refusal("lease_not_yours", {"why": str(exc)})
+            except LookupError as exc:
+                reason = "lease_unknown" if "unknown" in str(exc) else "lease_closed"
+                return _refusal(reason, {"why": str(exc)})
+            except ValueError as exc:
+                return _refusal("malformed_request", {"why": str(exc)})
+            finally:
+                if held:
+                    await asyncio.to_thread(submissions.release, request.lease_id)
+                entry[1] -= 1
+                if not entry[1]:
+                    graders.pop(hotkey, None)
             logger.info("rl submit: %s from %s: %s%s (k_generated=%s)", request.lease_id[:12], hotkey[:12],
                         answer["verdict"], " (resend)" if answer.get("resent") else "", request.k_generated)
             return _answer(answer)

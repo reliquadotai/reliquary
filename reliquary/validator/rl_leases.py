@@ -25,7 +25,11 @@ generates them, and every lease ends in a submission or an expiry (there is no r
   (16) by default: late enough never to bind an honest miner; there is no other lag cap.
 * **Expiry** is fixed per environment (``lease_expiry_s``: the env's max tokens at a slow reference speed, times a
   margin), never derived from the miner. ``expire_due`` sweeps (each ``grant`` and ``submit`` sweeps too) and
-  halves the hotkey's quota.
+  halves the hotkey's quota. A submission is judged at its arrival: a lease held by ``hold_submission`` (arrived
+  on time, waiting for or in grading) is never expired by a sweep.
+* **One lease of a prompt at a time** across checkpoints (``taken``): the same prompt cannot be leased at every
+  unrevealed k at once. A request is cut to the hotkey's room (``quota - in_use``, capped by its share of the
+  global cap) before any lookup.
 * **Nonce:** ``nonce = H(NONCE_DOMAIN, S_k, env, prompt, k)`` with ``S_k`` a 32-byte secret drawn when k is
   adopted. ``H(COMMIT_DOMAIN, S_k, k)`` is published from adoption (``commitments()``) and ``S_k`` itself once k
   retires (older than ``latest - max_lag``: no lease on it can be granted any more), so anyone can check that
@@ -58,7 +62,7 @@ from reliquary.constants import MAX_TRUNCATED_PER_SUBMISSION, SIGMA_MIN_V4, prom
 from reliquary.validator.rl_lease_quota import QuotaController
 
 TAKEN, COOLING, BLACKLISTED, QUOTA, STALE, BANNED = "taken", "cooling", "blacklisted", "quota", "stale", "banned"
-FULL = "full"     # the global cap: open leases + buffered groups reached ``max_pending_groups``
+FULL = "full"     # the global cap: buffered groups reached ``max_pending_groups``
 REFUSALS = frozenset({TAKEN, COOLING, BLACKLISTED, QUOTA, STALE, BANNED, FULL})
 OPEN, SUBMITTED, EXPIRED = "open", "submitted", "expired"
 IN_ZONE, TOO_EASY, TOO_HARD, TRUNCATED = "in_zone", "too_easy", "too_hard", "truncated"
@@ -74,6 +78,7 @@ INTERVAL_S = 1.0          # the collection interval inside which arrival order b
 RESTART_GRACE_S = 120.0   # what a lease that fell due while the validator was down gets at boot
 SECRET_REVEAL_LAG = 16    # S_k is revealed, and k stops being leasable, once k < latest - this
 MAX_SCANS_PER_PAGE = 1000
+HOTKEY_PENDING_SHARE = 0.25   # PLACEHOLDER: the most of the global cap one hotkey's open leases may take
 
 
 def _bound(domain: bytes, parts: list[bytes]) -> bytes:
@@ -193,8 +198,10 @@ class LeaseBookConfig:
     # next cooldown. The profile's ``prompt_cooldown_windows`` counts checkpoints in the async protocol; the service
     # can pass its live schedule instead.
     cooldown_of: Callable[[str], int] = prompt_cooldown_windows_for_environment
-    # The global cap (async trainer throttle, AReaL-style): open leases + buffered groups never exceed it, so a
-    # trainer slower than the miners holds them back instead of dropping their work. None: no cap.
+    # The global cap (async trainer throttle, AReaL-style): no lease is granted while the buffered groups (queued or
+    # taken) reach it, so a trainer slower than the miners holds them back instead of dropping their work. Open
+    # leases are not counted (the quota and expiry bound them; a growing buffer is the oversupply signal), but one
+    # hotkey's open leases may take at most ``HOTKEY_PENDING_SHARE`` of it (refused as ``quota``). None: no cap.
     max_pending_groups: int | None = None
 
     def __post_init__(self) -> None:
@@ -245,6 +252,7 @@ class LeaseBook:
         self.lock = threading.RLock()
         self._depth = 0
         self._full: set[str] = set()              # envs refused for the global cap since the last drain
+        self._submitting: dict[str, int] = {}     # leases whose on-time submission is being graded: never expired
         path = Path(path)
         _private_file(path)
         self.db = sqlite3.connect(path, timeout=30, check_same_thread=False)
@@ -391,10 +399,10 @@ class LeaseBook:
                                        (hotkey, OPEN)).fetchone()[0])
 
     def _expire(self, now: float) -> int:
-        due = self.db.execute(f"SELECT {_COLUMNS} FROM rl_leases WHERE state=? AND expires_at<=?",
-                              (OPEN, now)).fetchall()
-        for row in due:
-            lease = self._lease(row)
+        due = [self._lease(row) for row in self.db.execute(
+            f"SELECT {_COLUMNS} FROM rl_leases WHERE state=? AND expires_at<=?", (OPEN, now)).fetchall()]
+        due = [lease for lease in due if lease.lease_id not in self._submitting]
+        for lease in due:
             self.db.execute("UPDATE rl_leases SET state=?, closed_at=? WHERE lease_id=?",
                             (EXPIRED, now, lease.lease_id))
             self.quota.record_expiry(lease.hotkey, lease, now=now)
@@ -406,56 +414,75 @@ class LeaseBook:
             return self._expire(now)
 
     def grant(self, requests: list[LeaseRequest], now: float | None = None) -> list[LeaseAnswer]:
-        """Resolve one interval's requests together. Raises ValueError if any request is malformed."""
+        """Resolve one interval's requests together. Raises ValueError if any request is malformed. A banned hotkey,
+        or one without room (``quota - in_use``, and its share of the global cap), is refused up front; a request is
+        cut to its hotkey's room in its own order (the rest refused as ``quota`` without a lookup)."""
         for request in requests:
             self.check_request(request)
         now = float(self.clock()) if now is None else now
         answers = [LeaseAnswer() for _ in requests]
-        claims = [(i, p) for i, request in enumerate(requests) for p in request.prompt_ids]
-        self._rng.shuffle(claims)
         granted: dict[int, dict[int, Lease]] = {i: {} for i in range(len(requests))}
+        cap = self.config.max_pending_groups
         with self._txn():
             self._expire(now)
             latest = self.latest_checkpoint
             secrets_by_k = dict(self.db.execute("SELECT k, secret FROM rl_lease_secrets WHERE revealed_at IS NULL"))
-            in_use: dict[str, int] = {}
-            banned: dict[str, bool] = {}
-            pending = self._pending() if self.config.max_pending_groups is not None else 0
+            room: dict[str, int] = {}
+            held: dict[tuple, Lease] = {}                 # the requesters' own open leases: a resend needs no room
+            for hotkey in {r.hotkey for r in requests}:
+                if self._banned(hotkey, now):
+                    room[hotkey] = -1
+                    continue
+                rows = self.db.execute(f"SELECT {_COLUMNS} FROM rl_leases WHERE hotkey=? AND state=?",
+                                       (hotkey, OPEN)).fetchall()
+                for lease in map(self._lease, rows):
+                    held[(hotkey, lease.environment, lease.prompt_idx, lease.checkpoint)] = lease
+                limit = self.quota.quota(hotkey, now)
+                if cap is not None:
+                    limit = min(limit, max(1, int(cap * HOTKEY_PENDING_SHARE)))
+                room[hotkey] = max(0, limit - len(rows))
+            claims = []
+            for i, request in enumerate(requests):
+                hotkey, asked = request.hotkey, 0
+                for prompt in request.prompt_ids:
+                    resent = held.get((hotkey, request.environment, prompt, request.checkpoint))
+                    if room[hotkey] < 0:
+                        answers[i].refused[prompt] = BANNED
+                    elif resent is not None:
+                        granted[i][prompt] = resent
+                    elif asked >= room[hotkey]:
+                        answers[i].refused[prompt] = QUOTA
+                    else:
+                        asked += 1
+                        claims.append((i, prompt))
+            self._rng.shuffle(claims)
+            pending = self._pending() if cap is not None else 0
             for i, prompt in claims:
                 request = requests[i]
                 env, k, hotkey = request.environment, request.checkpoint, request.hotkey
                 if k not in secrets_by_k:                             # not adopted, or S_k revealed
                     answers[i].refused[prompt] = STALE
                     continue
+                # one live lease of a prompt at any k (no parallel leases over the unrevealed checkpoints), and
+                # a key closed by a submission at this k
                 row = self.db.execute(f"SELECT {_COLUMNS} FROM rl_leases WHERE environment=? AND prompt_idx=? "
-                                      "AND k=? AND state IN (?, ?)", (env, prompt, k, OPEN, SUBMITTED)).fetchone()
+                                      "AND (state=? OR (k=? AND state=?)) ORDER BY k=? DESC LIMIT 1",
+                                      (env, prompt, OPEN, k, SUBMITTED, k)).fetchone()
                 if row is not None:
-                    held = self._lease(row)
-                    if held.state == OPEN and held.hotkey == hotkey:
-                        granted[i][prompt] = held                     # the holder's resend
-                    else:
-                        answers[i].refused[prompt] = TAKEN
+                    answers[i].refused[prompt] = TAKEN
                     continue
                 lifecycle = self.db.execute("SELECT state, until_k FROM rl_prompt_state WHERE environment=? "
                                             "AND prompt_idx=?", (env, prompt)).fetchone()
-                if hotkey not in banned:
-                    banned[hotkey] = self._banned(hotkey, now)
-                if banned[hotkey]:
-                    answers[i].refused[prompt] = BANNED
-                    continue
                 if lifecycle is not None and lifecycle[0] == BLACKLISTED:
                     answers[i].refused[prompt] = BLACKLISTED
                     continue
                 if lifecycle is not None and latest < lifecycle[1]:
                     answers[i].refused[prompt] = COOLING
                     continue
-                if hotkey not in in_use:
-                    in_use[hotkey] = int(self.db.execute(
-                        "SELECT COUNT(*) FROM rl_leases WHERE hotkey=? AND state=?", (hotkey, OPEN)).fetchone()[0])
-                if in_use[hotkey] >= self.quota.quota(hotkey, now):
+                if room[hotkey] <= 0:
                     answers[i].refused[prompt] = QUOTA
                     continue
-                if self.config.max_pending_groups is not None and pending >= self.config.max_pending_groups:
+                if cap is not None and pending >= cap:
                     answers[i].refused[prompt] = FULL
                     self._full.add(env)
                     continue
@@ -465,8 +492,7 @@ class LeaseBook:
                 self.db.execute(f"INSERT INTO rl_leases({_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?)",
                                 (lease.lease_id, hotkey, env, prompt, k, lease.nonce, lease.issued_at,
                                  lease.expires_at, OPEN))
-                in_use[hotkey] += 1
-                pending += 1
+                room[hotkey] -= 1
                 self.quota.record_lease(hotkey, now=now)
                 granted[i][prompt] = lease
         for i, request in enumerate(requests):
@@ -474,11 +500,11 @@ class LeaseBook:
         return answers
 
     def _pending(self) -> int:
-        """Open leases + buffered groups (``rl_buffer``, when a ``TrainingBuffer`` shares the file)."""
-        count = int(self.db.execute("SELECT COUNT(*) FROM rl_leases WHERE state=?", (OPEN,)).fetchone()[0])
+        """Buffered groups (``rl_buffer``, queued or taken, when a ``TrainingBuffer`` shares the file): the global
+        cap's measure. Open leases are bounded per hotkey (quota, its share of the cap) and by expiry."""
         if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='rl_buffer'").fetchone():
-            count += int(self.db.execute("SELECT COUNT(*) FROM rl_buffer").fetchone()[0])
-        return count
+            return int(self.db.execute("SELECT COUNT(*) FROM rl_buffer").fetchone()[0])
+        return 0
 
     def drain_full(self) -> set[str]:
         """Envs refused for the global cap since the last drain (the price controller's oversupply signal)."""
@@ -511,6 +537,21 @@ class LeaseBook:
         if failure is not None:
             raise failure
         return lease
+
+    def hold_submission(self, lease_id: str, hotkey: str, arrived_at: float) -> Lease:
+        """A submission arrived at ``arrived_at`` for an open lease of ``hotkey`` (``check_submission``'s checks,
+        raised the same way): until ``release_submission``, the sweep does not expire the lease, so an on-time
+        submission still waiting for or going through grading is judged at its arrival."""
+        with self.lock:
+            lease = self.check_submission(lease_id, hotkey, arrived_at)
+            self._submitting[lease_id] = self._submitting.get(lease_id, 0) + 1
+        return lease
+
+    def release_submission(self, lease_id: str) -> None:
+        with self.lock:
+            left = self._submitting.pop(lease_id, 1) - 1
+            if left > 0:
+                self._submitting[lease_id] = left
 
     def submit(self, lease_id: str, hotkey: str, *, in_zone: bool, delivered: bool = True,
                now: float | None = None) -> Lease:

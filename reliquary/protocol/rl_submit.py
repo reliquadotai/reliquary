@@ -20,6 +20,9 @@ group carries 16 signed transcripts (each up to the gateway's ``MAX_TRANSCRIPT_B
 episode group gzipped (``Content-Encoding: gzip``, ``gzip_body``; transcripts are JSON and compress well); the
 validator inflates it within the cap (``inflate_body``: no decompression bomb). The signature is over the
 rollouts, never over the encoding.
+
+Every submission names its hotkey in the ``HOTKEY_HEADER`` header (the body's ``miner_hotkey``): the validator
+checks its registration before it reads or inflates the body, and refuses a body whose hotkey differs.
 """
 from __future__ import annotations
 
@@ -35,6 +38,7 @@ GROUP_ROLLOUTS = 16          # design §4.4: 16 draws per lease, all submitted (
 MAX_SUBMIT_BODY_BYTES = 8 * 1024 * 1024
 MAX_EPISODE_SUBMIT_BODY_BYTES = 64 * 1024 * 1024
 GZIP = "gzip"
+HOTKEY_HEADER = "X-Reliquary-Hotkey"
 _TOKEN_BYTES = 4
 _DIGEST_DOMAIN = b"reliquary/rl-submit-rollouts/v1"
 _EPISODE_DOMAIN = b"reliquary/rl-submit-episode/v1"
@@ -141,6 +145,6 @@ def rollouts_digest(rollouts) -> bytes:
     return h.digest()
 
 
-__all__ = ["EPISODE_KEYS", "GROUP_ROLLOUTS", "GZIP", "MAX_EPISODE_SUBMIT_BODY_BYTES", "MAX_SUBMIT_BODY_BYTES",
+__all__ = ["EPISODE_KEYS", "GROUP_ROLLOUTS", "GZIP", "HOTKEY_HEADER", "MAX_EPISODE_SUBMIT_BODY_BYTES", "MAX_SUBMIT_BODY_BYTES",
            "decode_tokens", "encode_tokens", "episode_digest", "episode_spans", "gzip_body", "inflate_body",
            "rollouts_digest"]

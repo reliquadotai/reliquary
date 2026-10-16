@@ -341,15 +341,16 @@ class HttpRlTransport:
         body["signature"] = self._sign(build_rl_submit_binding(
             hotkey=self.hotkey, at=at, lease_id=str(payload["lease_id"]), rollouts_digest=submission_digest(payload),
             validator_hotkey=self.validator_hotkey, path=path))
+        from reliquary.protocol.rl_submit import GZIP, HOTKEY_HEADER, gzip_body
+
+        headers = {HOTKEY_HEADER: self.hotkey}          # the validator checks it before it reads the body
         if any(r.get("episode") is not None for r in payload.get("rollouts", ())):
             # 16 signed transcripts: sent gzipped (``protocol/rl_submit``: the validator inflates within its cap).
-            from reliquary.protocol.rl_submit import GZIP, gzip_body
-
             raw = json.dumps(body, separators=(",", ":")).encode("utf-8")
             content = await asyncio.to_thread(gzip_body, raw)
             return await self._call("POST", path, content=content,
-                                    headers={"Content-Type": "application/json", "Content-Encoding": GZIP})
-        return await self._call("POST", path, json=body)
+                                    headers={**headers, "Content-Type": "application/json", "Content-Encoding": GZIP})
+        return await self._call("POST", path, json=body, headers=headers)
 
     async def episodes(self) -> dict:
         """``GET /rl/episodes``: the validator's episode envs (their blocks), ``{}`` when it serves none."""

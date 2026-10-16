@@ -156,8 +156,9 @@ def test_the_trainer_masks_observations_and_verifies_model_tokens(monkeypatch):
     training._accumulate_grouped_grads(model, None, plan, torch.device("cpu"), budget=10_000, atomic=False,
                                        kl_stats=training._new_kl_stats(), gate=gate)
     gate.judge(plan)
-    # random observations cost nothing; the forged model turns of rollout 3 leave the loss
-    assert gate.admitted == [1, 1, 1, 0] and gate.accepted == [True]
+    # random observations cost nothing; the forged model turns of rollout 3 leave the loss and, under the forgery
+    # floor, reject the group
+    assert gate.admitted == [1, 1, 1, 0] and gate.accepted == [False] and gate.pooled(0) >= 0.7
     assert [gate.rate(s) for s in range(3)] == [1.0] * 3 and gate.rate(3) < 0.5
     assert [gate.tallies[s][2] for s in range(4)] == [90] * 4 and gate.tallies[0][3] == 90   # model tokens only
     training.reset_training_state()

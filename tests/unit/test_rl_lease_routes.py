@@ -195,8 +195,8 @@ def submit_body(keypair, lease_id, rollouts, *, at=NOW, hotkey=None, path="/rl/s
             "signature": keypair.sign(binding).hex()}
 
 
-@pytest.fixture
-def submitting(tmp_path):
+def submit_app(tmp_path, registration=None, headers=None):
+    from reliquary.protocol.rl_submit import HOTKEY_HEADER
     from tests.unit.test_rl_submit import ENV as MATH, MathEnv, Tokenizer
     from reliquary.validator.rl_submit import GroupGrader, RlSubmissions
 
@@ -208,8 +208,67 @@ def submitting(tmp_path):
     app = FastAPI()
     app.include_router(build_rl_lease_router(book=book, collector=LeaseCollector(book, interval_s=0.0),
                                              validator_hotkey=VALIDATOR.ss58_address, clock=lambda: float(NOW),
-                                             submissions=subs))
-    return book, subs, TestClient(app)
+                                             submissions=subs, registration=registration))
+    return book, subs, TestClient(app, headers={HOTKEY_HEADER: MINER.ss58_address} if headers is None else headers)
+
+
+@pytest.fixture
+def submitting(tmp_path):
+    return submit_app(tmp_path)
+
+
+def test_a_submission_names_a_registered_hotkey_before_its_body_is_read(tmp_path):
+    from reliquary.protocol.rl_submit import HOTKEY_HEADER
+    from reliquary.validator.corpus_registration import NOT_REGISTERED
+    from tests.unit.test_rl_submit import ENV as MATH, group
+    from reliquary.validator.rl_leases import LeaseRequest
+
+    asked = []
+
+    async def registration(hotkey):
+        asked.append(hotkey)
+        return None if hotkey == MINER.ss58_address else NOT_REGISTERED
+
+    book, _, client = submit_app(tmp_path, registration, headers={})
+    junk = {"Content-Encoding": "gzip"}
+    assert client.post("/rl/submit", content=b"x").json()["reason"] == "hotkey_required"
+    stranger = client.post("/rl/submit", content=b"\x1f\x8b not gzip",
+                           headers={**junk, HOTKEY_HEADER: EVE.ss58_address})
+    assert stranger.status_code == 403 and stranger.json()["reason"] == "hotkey_not_registered"   # never inflated
+    assert asked == [EVE.ss58_address]
+    lease = book.grant([LeaseRequest(MINER.ss58_address, MATH, (1,), 0)])[0].leases[0]
+    other = client.post("/rl/submit", json=submit_body(MINER, lease.lease_id, group(8)),
+                        headers={HOTKEY_HEADER: RIVAL.ss58_address})
+    assert other.status_code == 403 and book.lease(lease.lease_id).state == "open"   # RIVAL is not registered
+
+    async def everyone(hotkey):
+        return None
+
+    (tmp_path / "b").mkdir()
+    book2, _, client2 = submit_app(tmp_path / "b", everyone, headers={HOTKEY_HEADER: RIVAL.ss58_address})
+    lease = book2.grant([LeaseRequest(MINER.ss58_address, MATH, (1,), 0)])[0].leases[0]
+    mismatch = client2.post("/rl/submit", json=submit_body(MINER, lease.lease_id, group(8)))
+    assert mismatch.status_code == 422 and book2.lease(lease.lease_id).state == "open"
+
+
+def test_an_on_time_submission_survives_the_expiry_sweep_while_it_is_graded(submitting):
+    from tests.unit.test_rl_submit import ENV as MATH, group
+    from reliquary.validator.rl_leases import LeaseRequest
+
+    book, subs, client = submitting
+    lease = book.grant([LeaseRequest(MINER.ss58_address, MATH, (1,), 0)])[0].leases[0]
+    grade, swept = subs.grader.grade, []
+
+    def slow_grade(*args):                                  # the sweep runs past the expiry while the group grades
+        swept.append(book.expire_due(now=lease.expires_at + 60))
+        return grade(*args)
+
+    subs.grader.grade = slow_grade
+    answer = client.post("/rl/submit", json=submit_body(MINER, lease.lease_id, group(8)))
+    assert answer.status_code == 200 and answer.json()["verdict"] == "in_zone" and swept == [0]
+    assert book.lease(lease.lease_id).state == "submitted" and book._submitting == {}
+    other = book.grant([LeaseRequest(MINER.ss58_address, MATH, (2,), 0)])[0].leases[0]
+    assert book.expire_due(now=other.expires_at) == 1                  # released: expiry applies again
 
 
 def test_a_signed_submission_ends_its_lease_and_answers_the_validators_grades(submitting):

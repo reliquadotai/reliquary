@@ -292,6 +292,18 @@ class RlSubmissions:
                 return earlier
             raise
 
+    def hold(self, lease_id: str, hotkey: str, arrived_at: float) -> bool:
+        """Called at arrival, before the group waits for grading: the lease must be the caller's and submittable
+        (raises as ``submit``), and the sweep will not expire it until ``release`` (``LeaseBook.hold_submission``).
+        False (nothing held) for a lease already graded: ``submit`` answers the resend."""
+        if self.graded_answer(lease_id, hotkey) is not None:
+            return False
+        self.book.hold_submission(lease_id, hotkey, arrived_at)
+        return True
+
+    def release(self, lease_id: str) -> None:
+        self.book.release_submission(lease_id)
+
     def graded_answer(self, lease_id: str, hotkey: str) -> dict | None:
         """The answer given for an already graded lease, or None. PermissionError: another hotkey's lease."""
         with self.book.lock:

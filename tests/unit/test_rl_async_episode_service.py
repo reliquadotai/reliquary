@@ -340,7 +340,7 @@ async def test_the_submit_route_caps_bodies_per_kind_and_reads_gzip(tmp_path, mo
     """A single-turn group stays within 8 MiB (even gzipped, even on a validator serving episodes); a malformed gzip
     body is refused; an unknown encoding is refused."""
     from reliquary.protocol.signatures import build_rl_submit_binding
-    from reliquary.protocol.rl_submit import rollouts_digest
+    from reliquary.protocol.rl_submit import HOTKEY_HEADER, rollouts_digest
     from reliquary.validator.rl_leases import LeaseRequest
 
     world = World(tmp_path, monkeypatch)
@@ -360,12 +360,13 @@ async def test_the_submit_route_caps_bodies_per_kind_and_reads_gzip(tmp_path, mo
         raw = json.dumps(body).encode()
         assert len(raw) > MAX_SUBMIT_BODY_BYTES
         async with world.client() as client:
-            answer = await client.post("/rl/submit", content=gzip_body(raw),
-                                       headers={"Content-Encoding": "gzip", "Content-Type": "application/json"})
+            mine = {HOTKEY_HEADER: MINER.ss58_address}
+            answer = await client.post("/rl/submit", content=gzip_body(raw), headers={
+                **mine, "Content-Encoding": "gzip", "Content-Type": "application/json"})
             assert answer.status_code == 413 and answer.json()["reason"] == "body_too_large"
-            bad = await client.post("/rl/submit", content=b"\x1f\x8b junk", headers={"Content-Encoding": "gzip"})
+            bad = await client.post("/rl/submit", content=b"\x1f\x8b junk", headers={**mine, "Content-Encoding": "gzip"})
             assert bad.status_code == 422
-            odd = await client.post("/rl/submit", content=b"{}", headers={"Content-Encoding": "br"})
+            odd = await client.post("/rl/submit", content=b"{}", headers={**mine, "Content-Encoding": "br"})
             assert odd.status_code == 422 and "encoding" in odd.json()["detail"]["why"]
     finally:
         await world.rl.sandbox.stop()
@@ -385,8 +386,10 @@ def test_a_validator_without_episode_envs_keeps_the_8_mib_cap(tmp_path):
     server = ValidatorServer()
     mount_rl_async(server, rl, validator_hotkey=VALIDATOR.ss58_address)
     client = TestClient(server.app)
+    from reliquary.protocol.rl_submit import HOTKEY_HEADER
+
     big = b"{" + b" " * (MAX_SUBMIT_BODY_BYTES + 10) + b"}"
-    assert client.post("/rl/submit", content=big).status_code == 413
+    assert client.post("/rl/submit", content=big, headers={HOTKEY_HEADER: MINER.ss58_address}).status_code == 413
     assert client.get("/rl/episodes").status_code == 404
     rl.close()
 
