@@ -381,6 +381,9 @@ class VLLMRolloutGenerator:
     def _build(self, model_path: str, revision: str | None) -> Any:
         # The forced draw hooks the V1 runner; the V2 runner would bypass it.
         os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
+        # mine-async's forked engine core died with "Cannot re-initialize CUDA in forked subprocess" (A100,
+        # 2026-10-16, 4 of 4 starts); spawned, it runs.
+        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         if os.environ["VLLM_USE_V2_MODEL_RUNNER"].strip().lower() not in ("0", "false"):
             raise RuntimeError("forced draw is hooked on the V1 runner: set VLLM_USE_V2_MODEL_RUNNER=0")
         require_runner_forced_draw()
