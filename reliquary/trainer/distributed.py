@@ -57,8 +57,11 @@ class DistContext:
 
 def init_distributed(*, device_type: str = "cuda") -> DistContext:
     """Join torchrun's process group (or a one-process group without torchrun)."""
+    # Before the first CUDA allocation. The 9B on 4 x 80 GB sits at 70+ GB per rank; the default allocator
+    # thrashes there: 2.5x slower steps than expandable segments (A100, 2026-10-16).
     for key, default in (("MASTER_ADDR", "127.0.0.1"), ("MASTER_PORT", "29511"),
-                         ("RANK", "0"), ("WORLD_SIZE", "1"), ("LOCAL_RANK", "0")):
+                         ("RANK", "0"), ("WORLD_SIZE", "1"), ("LOCAL_RANK", "0"),
+                         ("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")):
         os.environ.setdefault(key, default)
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
