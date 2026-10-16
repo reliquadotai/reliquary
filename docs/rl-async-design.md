@@ -111,8 +111,9 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
 ### 4.2 Leases
 
 - **Request:** `POST /rl/lease {env, prompt_ids[], checkpoint k}`; batched requests allowed.
-- **Exclusivity:** one open lease per (prompt, k). A prompt submitted at k is closed for k
-  (the draw would be identical anyway).
+- **Exclusivity:** one open lease per prompt, whatever its k (no parallel leases of one prompt
+  over the unrevealed checkpoints). A prompt submitted at k is closed for k (the draw would be
+  identical anyway). A request is cut to the hotkey's room (quota - open leases) before any lookup.
 - **Fairness:** requests are collected in short intervals (~1 s); conflicts inside an interval
   are resolved at random, so network proximity buys nothing. A refused request returns only
   "taken"; open leases are never listed.
@@ -124,7 +125,8 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   Miners select prompts before seeing results, never after.
 - **Expiry:** fixed per environment: twice the time a 3090 needs for 16 rollouts at max length,
   measured at qualification (PROPOSED). An expired lease's draw goes to the next lessee unchanged (accepted; throwaway
-  keys have tiny quotas and expiry earns nothing).
+  keys have tiny quotas and expiry earns nothing). A submission is judged at its arrival: once it
+  arrived on time the sweep cannot expire its lease while it waits for or goes through grading.
 
 ### 4.3 Quota
 
@@ -144,8 +146,12 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   100 % of a hotkey's first 100 out-of-zone groups (probation), then a random fraction drawn
   after submission (15 %, user 2026-10-15), graded sanctions (deterministic forgery bans, statistical
   failure re-opens probation). An audit is a separate forward against the latest checkpoint
-  with the same floor as training (PROPOSED: no old checkpoints kept). Upload carries tokens
-  only, compressed.
+  with the same floor and match as training (PROPOSED: no old checkpoints kept); a failure of a
+  group leased more than 2 checkpoints back (`RL_SANCTION_MAX_LAG`, the trainer's rule) is
+  inconclusive, unsanctioned. An audit that abstains (too few drawn positions) or whose forward
+  keeps failing is no probation pass and re-opens probation. Upload carries tokens only,
+  compressed; `/rl/submit` names its hotkey in a header, checked registered before the body is
+  read.
 - Group integrity: all 16 rollout indices required; the draw is bound to the rollout index.
 
 ### 4.5 Prompt lifecycle and miner data
@@ -159,7 +165,8 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   with too little variance: mean >= 0.5 blacklist, else cooldown. Groups out of zone for
   truncation: cooldown (user, 2026-10-15).
 - **Pay:** an out-of-zone first scan earns 25 % of an in-zone group, after audit (replaces
-  the 15 % of the decisions doc §B). Later rescans of a too-hard prompt are unpaid when out
+  the 15 % of the decisions doc §B), when its rollouts carry at least `RL_FIRST_SCAN_MIN_TOKENS`
+  (placeholder 1024) model tokens. Later rescans of a too-hard prompt are unpaid when out
   of zone.
 - **Data for miners:** every prompt's state (never scanned, cooldown until k, blacklisted)
   and its scan history (16 rewards per scan, checkpoint, verdict; no hotkey, no tokens) live
@@ -175,7 +182,9 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   qualification). Keeps every honest rollout at lag <= 2, rejects all W4A16. fp8 weights sit
   around 0.95: a pricing question, not a floor question.
 - **Rollout-level rule:** a rollout under the floor is excluded and unpaid; the group is
-  judged on its pooled match (one bad rollout must not kill the group: x16 compounding).
+  judged on its pooled match (one noisy rollout must not kill the group: x16 compounding). The
+  floor tolerates honest noise, never forgery: one rollout under `RL_FORGERY_MATCH_FLOOR`
+  (placeholder 0.5) rejects the group as evidence.
 - **No quality lag cap** (user, 2026-10-15): the floor alone rejects rollouts that are too stale.
 - **Leases only on checkpoints whose secret S_k is unrevealed** (DECIDED). Once S_k is public
   anyone can compute every nonce of k, pre-generate and lease only the prompts that land in
@@ -189,9 +198,10 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   full (DECIDED 2026-10-16; prime-rl, AReaL, PipelineRL, verl, SkyRL, open-instruct all do this).
   The batch mix is whatever arrives: each group has its own baseline, so composition adds noise,
   not bias. The loss is the global token mean of the step.
-- A global cap on open leases + buffered groups (`rl_max_pending_groups`, placeholder 256 = 4
-  batches) holds miners back when they outrun the trainer (refusal `full`), instead of dropping
-  their work: AReaL/SkyRL throttle generation the same way. Groups past `max_lag` are still dropped
+- A global cap on buffered groups (`rl_max_pending_groups`, placeholder 256 = 4 batches; open
+  leases are not counted, the quota and expiry bound them, and one hotkey's open leases take at
+  most 1/4 of the cap) holds miners back when they outrun the trainer (refusal `full`), instead of
+  dropping their work: AReaL/SkyRL throttle generation the same way. Groups past `max_lag` are still dropped
   unpaid, as a safety.
 - Streaming micro-batches as groups arrive (RollPacker) was looked at: it helps synchronous
   systems where the trainer idles during generation; here the buffer already keeps the trainer
@@ -207,7 +217,9 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   - Needs: the trainer forward's logits (packed, FSDP2, bf16 compute, fp32 head) must give
     the same picks as the batch-1 proof path; measured cross-hardware spread is < 0.0005,
     to re-measure on the trainer.
-  - A group is accepted, and paid, when it is trained, not when it is submitted.
+  - A group is accepted, and paid, when it is trained, not when it is submitted. It is reported
+    payable before its step's checkpoint is published: pay is for trained work, and if the
+    trainer dies in between the step's weights are lost but the miners did the work (deliberate).
 - **Loss details:** advantages as today (group-normalised, token-level normalisation,
   degenerate groups dropped, soft overlong penalty, no KL). With one step per checkpoint the
   PPO ratio is 1 and the clip is inert; with N > 1 steps per checkpoint the ratio is taken
@@ -221,7 +233,8 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   rebuilt checkpoint. A full anchor every N steps (e.g. 50). Fallback: 2-4 steps per
   checkpoint if deltas are too large or miners cannot keep up.
 - **Lagging miners:** a cumulative delta from their version to the latest (up to a size cap), else the
-  latest anchor plus deltas. A hash mismatch means re-download the anchor.
+  latest anchor plus deltas. A hash mismatch means re-download the anchor. Pruned objects leave
+  the index first and the bucket one presigned-URL lifetime (15 min) later.
 - Training is untouched: the trainer keeps its fp32 master weights (both the single-GPU and
   FSDP2 paths already do) and never reads deltas.
 - **Transport** (DECIDED): bucket `reliquary-public` on R2, separate from the private buckets,

@@ -651,7 +651,9 @@ P2 and P1a can run in parallel. P5 can start once P1a fixes the v* format.
   of all (request, prompt) claims), nonce `H(NONCE_DOMAIN, S_k, env, prompt, k)`, commitment
   `H(COMMIT_DOMAIN, S_k, k)`, reveal when `k < latest - max_lag` (`SECRET_REVEAL_LAG = 16`); leases only on a k
   whose S_k is unrevealed. Refusals: taken / cooling / blacklisted / quota / stale. A lease due while the validator
-  was down is extended to `now + restart_grace_s` at boot.
+  was down is extended to `now + restart_grace_s` at boot. Since the 10-16 review: an open lease of a prompt at any
+  k refuses it at every other k (`taken`); a banned or roomless hotkey is refused up front and a request is cut to
+  `quota - in_use` (and `HOTKEY_PENDING_SHARE` = 1/4 of the global cap) in its own order before any lookup.
 - Prompt lifecycle (design §4.5), in the same file: `classify_group(rewards, truncated)` (population sigma >=
   `SIGMA_MIN_V4` = 0.24, at most `MAX_TRUNCATED_PER_SUBMISSION` truncated, then mean >= 0.5 too easy, else too
   hard); `LeaseBook.record_outcome(env, prompt, k, rewards, verdict)` (P3 calls it after grading) appends to
@@ -702,8 +704,16 @@ over the module-level `batcher.admission_problem_materials`, shared with P3).
   grader outage answers 503 with the lease still open.
 - Resolved ambiguities: probation counts PASSED audits (decisions-doc rule in force), not submitted groups; training
   verdicts count in the recidivism window, never as probation passes; an inconclusive audit forfeits the first-scan
-  pay without sanction; a lease that expires while its group is being graded is refused (the arrival time is used,
-  but a concurrent sweep can still expire it: grading is short next to the expiry).
+  pay without sanction. Since the 10-16 review: `/rl/submit` holds the lease from arrival (`RlSubmissions.hold`,
+  `LeaseBook.hold_submission`): ownership is checked before a grading slot (4 global, 2 per hotkey) and the sweep
+  skips a held lease, so an on-time group is never lost to grading delay. The route reads the hotkey from the
+  `X-Reliquary-Hotkey` header and checks its registration before reading or inflating the body (8 reads, 2 per
+  hotkey), then authenticates in its own preauth pool. Audits: match = `rl_draw.rollout_rate` (the trainer's);
+  under 30 drawn positions the audit abstains as a `suspect` inconclusive; a rollout under `RL_FORGERY_MATCH_FLOOR`
+  (0.5) fails the group; a failure at lag > `RL_SANCTION_MAX_LAG` (2) is inconclusive with its lag in `rl_audits`;
+  suspect inconclusives (abstention, `AUDIT_MAX_ATTEMPTS` raising forwards, counted in `rl_audits.attempts`) are
+  logged as `inconclusive` verdicts that re-open probation; a first scan under `RL_FIRST_SCAN_MIN_TOKENS` (1024)
+  model tokens is forfeited.
 
 ## 7. P5 as built (branch `feat/rl-pay`): pay, async prices, `/rl/pay`
 
@@ -739,7 +749,8 @@ New code next to the window path (`emission_price`, `settlement`, `rl_pay`, `wei
 - `GET /rl/pay?hotkey=` (`build_rl_lease_router(pay=ledger)`): per-env multiplier, token price, per-Mtok price,
   target, regime and last signal; per-hotkey accrued / paid / forfeited / banned_until; the last settled periods.
   `ValidatorServer.mount_rl_lease_router` now replaces an app route at the same path and method, so mounting it
-  supersedes the window board's `/rl/pay`.
+  supersedes the window board's `/rl/pay`. The board is rebuilt at most every `BOARD_CACHE_S` (15 s); `ingest` reads
+  its cursor inside the transaction that moves it.
 - Wired since: the service loops and the registry entry (§9 "Service wiring as built").
 
 ## 8. Reference miner as built (branch `feat/rl-miner-client`)
@@ -799,7 +810,8 @@ One branch carries the whole async RL work on top of current main.
 - Lease lifetime: lease answers carry `lease_expiry_s` (the env's), `/rl/quota` and `/rl/lease/mine` a map of every
   env's; the planner waits that long on a `taken` prompt (30 min only while unknown).
 - Model files: `DeltaPublisher(model_dir=)` uploads config / tokenizer / chat template with each anchor
-  (`anchors[].model_files`, presigned, pruned with the anchor); `CheckpointSync(model_dir=)` keeps the newest set
+  (`anchors[].model_files`, presigned, pruned with the anchor: out of the index first, deleted `PRUNE_GRACE_S`
+  = 900 s later, the presign lifetime); `CheckpointSync(model_dir=)` keeps the newest set
   (SHA-256 checked); `mine-async` uses `--base-model`, else the initial checkpoint's dir, else the synced files.
 - Audit `ProofForward` (`validator/rl_audit.py`): per rollout, `verifier.proof_forward_rows` (the proof path's
   batch-1 forward and lazy fp32 head, now shared with `verify_commitment_proofs`) and the verifier's
@@ -963,7 +975,8 @@ task declared for period settlement refuses to start in window mode).
   --rl-async --planned-tokens-per-period <N> [--lease-tokens-per-s <s>]` (`cli.with_rl_async_params`): mechanism
   `rl-discovered-price`, `params.settlement = "period-ema-v1"` (the unchanged weight setter pays the period
   archives), `env_split` = the trainer's target mix, `rl_planned_tokens_per_period`, `rl_lease_reference_tokens_per_s`,
-  `rl_lease_expiry_margin`, optional `rl_price_tick_s` / `rl_max_pending_groups` (the lease book's global cap, default 256).
+  `rl_lease_expiry_margin`, optional `rl_price_tick_s` / `rl_max_pending_groups` (the lease book's global cap on
+  buffered groups, open leases not counted, default 256).
 - Validator (`validator/rl_async_service.py`, `run_rl_async_validator`, branched in `validate` after the corpus
   branch): one process like the corpus validator; `build_rl_async` puts the lease book, quota, collector,
   submissions + buffer, price controller and ledger on `<state dir>/rl-async.sqlite3`; `RlCheckpointBoard` over
@@ -979,7 +992,8 @@ task declared for period settlement refuses to start in window mode).
   `buffer`, `submissions`, `book` and `prices`): config, latest, adopt, take, take_older, release, requeue, depth,
   report, wait, tick, checkpoint (the signed `/rl/checkpoint` answer, for the trainer's resume). Served on its own
   listener (`build_rl_trainer_app`), never on the public port: `RELIQUARY_RL_TRAINER_BIND=host:port` (default
-  `127.0.0.1:8889`; a private interface such as a WireGuard/Tailscale address, or an SSH tunnel from the GPU box). Matches today's topology: the buffer stays in the controller's SQLite file, the trainer on its
+  `127.0.0.1:8889`; a private interface such as a WireGuard/Tailscale address, or an SSH tunnel from the GPU box).
+  The link is plain HTTP and its token mints pay: a non-loopback bind needs `RELIQUARY_RL_TRAINER_INSECURE_BIND=1`. Matches today's topology: the buffer stays in the controller's SQLite file, the trainer on its
   GPU box. Calls retry transport errors / 429 / 5xx for 10 min; a resent report the validator no longer holds
   counts as done; idle, the trainer requeues taken groups (a take whose answer was lost).
 - Trainer (`reliquary train-async`, `trainer/async_cli.py`): `RELIQUARY_RL_TRAINER_URL`, `_TOKEN`,
@@ -1024,7 +1038,7 @@ Start (async mode):
 # validator (controller)
 RELIQUARY_RL_MODE=async RELIQUARY_TASK_ID=<t> RELIQUARY_RL_TRAINER_TOKEN=<secret> \
   R2_PUBLIC_ENDPOINT=... R2_PUBLIC_ACCESS_KEY_ID=... R2_PUBLIC_SECRET_ACCESS_KEY=... [RELIQUARY_RL_AUDIT_DEVICE=cuda:0] \
-  [RELIQUARY_RL_TRAINER_BIND=<private ip>:8889] \
+  [RELIQUARY_RL_TRAINER_BIND=<private ip>:8889 RELIQUARY_RL_TRAINER_INSECURE_BIND=1] \
   reliquary validate --checkpoint <base model> --wallet-name ... --hotkey ... --external-ip <public ip>
 # trainer (GPU box; torchrun --nproc-per-node N with RELIQUARY_TRAINER_BACKEND=fsdp2)
 RELIQUARY_RL_TRAINER_URL=http://<controller private ip, or localhost via ssh -L>:8889 RELIQUARY_RL_TRAINER_TOKEN=<secret> \
@@ -1089,7 +1103,7 @@ RELIQUARY_PROOF_RL_AUDIT_DEVICE=cuda:0 RELIQUARY_PROOF_RL_VALIDATOR_HOTKEY=<vali
 RELIQUARY_RL_MODE=async RELIQUARY_SIGNER_URL=... RELIQUARY_SIGNER_{CA,CERT,KEY,EXPECTED_HOTKEY}=... \
   RELIQUARY_PROOF_EXECUTOR_MODE=remote RELIQUARY_PROOF_EXECUTOR_URL=https://<worker>:8445 \
   RELIQUARY_PROOF_TLS_{CA,CERT,KEY}=... RELIQUARY_PROOF_EXPECTED_WORKER_ID=<id> \
-  RELIQUARY_RL_TRAINER_TOKEN=<secret> RELIQUARY_RL_TRAINER_BIND=<private ip>:8889 \
+  RELIQUARY_RL_TRAINER_TOKEN=<secret> RELIQUARY_RL_TRAINER_BIND=<private ip>:8889 RELIQUARY_RL_TRAINER_INSECURE_BIND=1 \
   R2_PUBLIC_{ENDPOINT,ACCESS_KEY_ID,SECRET_ACCESS_KEY}=... \
   reliquary validate ... --external-ip <public ip> --external-port <port>
 ```
@@ -1113,11 +1127,13 @@ the controller (both are additive; the transport hash changes with this release 
   the policy (ratio 1); rollouts under `RL_ROLLOUT_MATCH_FLOOR` (constants, 0.95 placeholder; the ledger's floor)
   leave the loss before the backward. Rollout match = rate on stochastic positions when >= 20 of them, else on
   every drawn position. After all micro-batches `DrawGate.judge` pools each group (FSDP2: tallies all-reduced) at
-  `ASYNC_GROUP_FLOOR` 0.90 (placeholder: one fully bad rollout of 16 survives, two do not); a failed group's
+  `ASYNC_GROUP_FLOOR` 0.90 (placeholder: one noisy honest rollout of 16 survives, two bad ones do not; one under
+  `ASYNC_FORGERY_FLOOR` 0.5 rejects the group whatever the pool); a failed group's
   admitted rollouts are backed out by a second pass with negated advantages (exact up to bf16 noise; only failed
   groups pay it). Accepted: paid matched tokens of admitted rollouts; rejected: `statistical` when lag <=
   `sanction_max_lag` (2), else unsanctioned. Telemetry: train/* plus `async/` checkpoint, lag, buffer depth,
-  waits, batch groups per env, forwarded / below-floor rollouts, accepted / rejected / undone groups.
+  waits, batch groups per env, forwarded / below-floor rollouts, accepted / rejected / undone groups. Groups are
+  reported (payable) before their checkpoint is published: a step lost to a crash keeps its pay (deliberate).
 - Known approximations: masked rollouts stay in their env's planned token denominator; with N > 1 the forward
   verifies against the trainer's in-between weights; the publisher copies the snapshot once more on CPU.
 - GPU qualification still owed: trainer-forward picks vs the proof path on the 9B (FSDP2, fp32 head), the floors,
