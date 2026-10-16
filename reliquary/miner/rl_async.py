@@ -883,7 +883,15 @@ def write_hf_dir(state: Mapping[str, Any], base_model_dir: str | Path, dest: str
     for item in base.iterdir():
         if item.is_file() and not item.name.endswith((".safetensors", ".safetensors.index.json", ".bin")):
             shutil.copy2(item, dest / item.name)
-    write_anchor_shards(state, dest)
+    from safetensors import safe_open
+
+    # transformers loads several shards only through their index (vLLM globs them): the trainer's resume and the
+    # Hugging Face backups load this directory with transformers.
+    weight_map = {}
+    for path in write_anchor_shards(state, dest):
+        with safe_open(str(path), framework="pt") as shard:
+            weight_map.update(dict.fromkeys(shard.keys(), path.name))
+    (dest / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": weight_map}))
     return dest
 
 

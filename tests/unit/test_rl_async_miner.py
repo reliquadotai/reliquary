@@ -481,3 +481,24 @@ async def test_the_http_transport_submits_resends_and_recovers_against_the_real_
         await miner.generate_once()
         await miner.drain()
         assert miner.stats["verdicts"] == {"in_zone": 1} and book.lease(held[1].lease_id).state == "submitted"
+
+
+def test_write_hf_dir_reloads_in_transformers_from_several_shards(tmp_path, monkeypatch):
+    import functools
+
+    import torch
+    from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM
+
+    from reliquary.miner.rl_async import write_hf_dir
+    from reliquary.shared import ckpt_delta
+
+    base = tmp_path / "base"
+    LlamaConfig(vocab_size=64, hidden_size=16, intermediate_size=32, num_hidden_layers=2, num_attention_heads=2,
+                num_key_value_heads=2).save_pretrained(base)
+    state = LlamaForCausalLM(LlamaConfig.from_pretrained(base)).state_dict()
+    monkeypatch.setattr(ckpt_delta, "write_anchor_shards",
+                        functools.partial(ckpt_delta.write_anchor_shards, shard_bytes=4096))
+    dest = write_hf_dir(state, base, tmp_path / "hf")
+    assert len(list(dest.glob("*.safetensors"))) > 1
+    loaded = AutoModelForCausalLM.from_pretrained(dest).state_dict()
+    assert all(torch.equal(loaded[k], v) for k, v in state.items() if k in loaded)
