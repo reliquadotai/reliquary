@@ -69,6 +69,7 @@ def book(tmp_path):
 
 def service(book, **config) -> RlSubmissions:
     grader = GroupGrader({ENV: MathEnv()}, Tokenizer(), eos_token_ids=(EOS,))
+    config = {"first_scan_min_tokens": 0, **config}         # the tests' groups are a few tokens long
     return RlSubmissions(book, grader, config=SubmitConfig(**config), clock=lambda: NOW, rng=random.Random(0))
 
 
@@ -366,3 +367,70 @@ def test_the_token_codec_round_trips_and_bounds_what_it_inflates():
             decode_tokens(bad, max_tokens=10)
     one = rollouts_digest([(0, encode_tokens(tokens), None)])
     assert one != rollouts_digest([(0, encode_tokens(tokens), (0, 1))]) != rollouts_digest([(1, encode_tokens(tokens), None)])
+
+
+def test_a_first_scan_of_near_empty_rollouts_is_never_paid(book):
+    subs = service(book, probation_groups=0, audit_rate=0.0, first_scan_min_tokens=16 * len(RIGHT.tokens) + 1)
+    held = lease(book, 80)
+    subs.submit(held.lease_id, "A", group(0))                          # not drawn, but under the minimum
+    assert kinds(subs) == [(held.lease_id, FIRST_SCAN_FORFEITED)]
+    assert subs.events()[-1]["detail"] == {"audit": "not_drawn", "tokens": 16 * len(WRONG.tokens)}
+    audited = service(book, first_scan_min_tokens=16 * len(RIGHT.tokens) + 1)
+    drawn = lease(book, 81)
+    audited.submit(drawn.lease_id, "A", group(0))
+    audited.report_audit(drawn.lease_id, AuditResult(passed=True))     # a pass does not lift the minimum
+    assert kinds(subs)[-1] == (drawn.lease_id, FIRST_SCAN_FORFEITED)
+
+
+def test_a_suspect_inconclusive_is_no_pass_and_keeps_the_hotkey_in_probation(book):
+    subs = service(book, probation_groups=1, reprobation_passes=1, audit_rate=1.0)
+    first, abstained, lost, again = (lease(book, p) for p in (82, 83, 84, 85))
+    subs.submit(first.lease_id, "A", group(0))
+    subs.report_audit(first.lease_id, AuditResult(passed=True))
+    assert not subs.in_probation("A")
+    subs.submit(abstained.lease_id, "A", group(0))
+    subs.report_audit(abstained.lease_id, AuditResult(None, suspect=True))       # abstained on the group
+    assert subs.in_probation("A") and book.banned_until("A") is None
+    assert kinds(subs)[-1] == (abstained.lease_id, FIRST_SCAN_FORFEITED)
+    subs.submit(again.lease_id, "A", group(0))
+    subs.report_audit(again.lease_id, AuditResult(passed=True))
+    assert not subs.in_probation("A")
+    subs.submit(lost.lease_id, "A", group(0))
+    subs.report_audit(lost.lease_id, AuditResult(None))                         # no model: the validator's fault
+    assert not subs.in_probation("A")
+
+
+def test_an_audit_failure_of_a_lagged_lease_is_inconclusive_with_its_lag(book):
+    subs = service(book, audit_rate=1.0)
+    old = lease(book, 86)
+    subs.submit(old.lease_id, "A", group(0))
+    for k in (1, 2, 3):
+        book.adopt_checkpoint(k)
+    statistical = AuditResult(passed=False, failure_class=AUDIT_FAILURE_STATISTICAL)
+    subs.report_audit(old.lease_id, statistical)                                 # leased at 0, latest 3: lag 3
+    assert subs.group(old.lease_id)["audit"] == "inconclusive" and book.banned_until("A") is None
+    with book.lock:
+        lag = book.db.execute("SELECT lag FROM rl_audits WHERE lease_id=?", (old.lease_id,)).fetchone()[0]
+        verdicts = book.db.execute("SELECT COUNT(*) FROM rl_verdicts").fetchone()[0]
+    assert lag == 3 and verdicts == 0
+    book.adopt_checkpoint(4)
+    renewed = book.grant([LeaseRequest("A", ENV, (88,), 2)])[0].leases[0]       # leased at 2, latest 4: lag 2
+    subs.submit(renewed.lease_id, "A", group(0))
+    subs.report_audit(renewed.lease_id, statistical)
+    assert subs.group(renewed.lease_id)["audit"] == "failed"                     # evidence: a verdict
+    with book.lock:
+        assert book.db.execute("SELECT verdict FROM rl_verdicts").fetchall() == [("failed",)]
+
+
+def test_audit_forward_attempts_are_persisted_across_restarts(book):
+    poison = lease(book, 89)
+    service(book).submit(poison.lease_id, "A", group(0))
+
+    def forward(g):
+        raise RuntimeError("CUDA out of memory")
+
+    assert service(book).run_audits(forward, 10, max_attempts=2) == 0
+    restarted = service(book, probation_groups=0)                               # a new process: same file
+    assert restarted.run_audits(forward, 10, max_attempts=2) == 1
+    assert restarted.group(poison.lease_id)["audit"] == "inconclusive" and book.banned_until("A") is None
+    assert restarted.in_probation("A")                                          # suspect: no pass, re-probation

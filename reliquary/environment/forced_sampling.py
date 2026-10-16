@@ -77,6 +77,7 @@ class SeedConsistencyDiagnostics:
     n_miss_gt_0_10: int = 0
     max_cdf_miss: float = 0.0
     first_hard_mismatch_offset: int | None = None
+    n_drawn_exact_match: int = 0      # exact picks over every position (``n_exact_match``: stochastic ones only)
 
 
 def warp(logits: torch.Tensor, t: float, top_k: int, top_p: float) -> torch.Tensor:
@@ -482,7 +483,7 @@ def seed_consistency_diagnostics(
     )
     if draw == DRAW_GUMBEL_MAX:
         chunk_rows = min(chunk_rows, _gumbel_chunk_rows(vocab_size))
-    counts = [0] * 8
+    counts = [0] * 9
     max_cdf_miss = 0.0
     first_hard_mismatch_offset: int | None = None
     for start in range(0, n, chunk_rows):
@@ -537,6 +538,7 @@ def seed_consistency_diagnostics(
                 (miss > 0.01).sum(),
                 (miss > 0.05).sum(),
                 (miss > 0.10).sum(),
+                exact.sum(),
             )
         ).tolist()
         counts = [total + int(value) for total, value in zip(counts, chunk_counts)]
@@ -561,6 +563,7 @@ def seed_consistency_diagnostics(
         n_miss_gt_0_10=int(counts[7]),
         max_cdf_miss=max_cdf_miss,
         first_hard_mismatch_offset=first_hard_mismatch_offset,
+        n_drawn_exact_match=int(counts[8]),
     )
 
 

@@ -20,7 +20,8 @@
    * out of zone: the audit draw, made after submission with the validator's own randomness (``SystemRandom``):
      every group of a hotkey in probation, else ``audit_rate`` (15 %). A drawn group keeps its tokens in
      ``rl_audits`` until ``report_audit``. An out-of-zone FIRST scan is payable (25 %, §4.5) at once when not
-     drawn, after a passed audit when drawn.
+     drawn, after a passed audit when drawn, and only with at least ``first_scan_min_tokens`` model tokens (a
+     group of near-empty rollouts verifies nothing).
 
 Audit regime (decisions doc §C as amended 10-09, the design's §4.4): probation = fewer than
 ``probation_groups`` (100) passed out-of-zone audits, or fewer than ``SERVICE_REPROBATION_PASSES`` (20) passed
@@ -30,7 +31,11 @@ probation and bans only when more than ``SERVICE_STATISTICAL_FAIL_MAX`` (3) of t
 ``SERVICE_STATISTICAL_FAIL_WINDOW`` (20) non-forced verdicts failed statistically. A failed training verification
 reported with a class sanctions the same way (``source='training'``: training verdicts count in the
 recidivism window, never as probation passes; a rejection without a class, e.g. staleness, is no verdict). An
-inconclusive audit (``passed=None``: the validator could not run it) is unpaid and unsanctioned.
+inconclusive audit (``passed=None``) is unpaid and unsanctioned: when the validator could not run it (no model),
+or when the group was leased more than ``sanction_max_lag`` checkpoints before the latest and failed (honest drift
+against the latest checkpoint, the trainer's rule; the lag is kept in ``rl_audits``). A ``suspect`` inconclusive
+(the audit abstained on too few drawn positions, or its forward raised ``AUDIT_MAX_ATTEMPTS`` times, counted in
+``rl_audits``) is logged as an ``inconclusive`` verdict: never a pass, and it re-opens probation like a failure.
 
 Interfaces left to later phases: the proof forward of an audit (``ProofForward``, implemented by
 ``rl_audit.audit_forward``: per-rollout match against the latest checkpoint with the training floor), the trainer's report
@@ -52,6 +57,8 @@ from typing import Any
 
 from reliquary.constants import (
     MAX_NEW_TOKENS_PROTOCOL_CAP,
+    RL_FIRST_SCAN_MIN_TOKENS,
+    RL_SANCTION_MAX_LAG,
     SERVICE_REPROBATION_PASSES,
     SERVICE_STATISTICAL_FAIL_MAX,
     SERVICE_STATISTICAL_FAIL_WINDOW,
@@ -81,7 +88,7 @@ CREATE TABLE IF NOT EXISTS rl_groups(seq INTEGER PRIMARY KEY AUTOINCREMENT, leas
     scan_seq INTEGER, audit TEXT, training TEXT);
 CREATE INDEX IF NOT EXISTS rl_groups_hotkey ON rl_groups(hotkey, seq);
 CREATE TABLE IF NOT EXISTS rl_audits(lease_id TEXT PRIMARY KEY, hotkey TEXT NOT NULL, forced INTEGER NOT NULL,
-    queued_at REAL NOT NULL, body BLOB);
+    queued_at REAL NOT NULL, body BLOB, attempts INTEGER NOT NULL DEFAULT 0, lag INTEGER);
 CREATE TABLE IF NOT EXISTS rl_verdicts(seq INTEGER PRIMARY KEY AUTOINCREMENT, lease_id TEXT NOT NULL,
     hotkey TEXT NOT NULL, source TEXT NOT NULL, verdict TEXT NOT NULL, failure_class TEXT, forced INTEGER NOT NULL,
     at REAL NOT NULL);
@@ -119,10 +126,12 @@ class Graded:
 
 @dataclass(frozen=True)
 class AuditResult:
-    """The proof forward's verdict on one group: ``passed`` None = inconclusive (no verdict, no sanction)."""
+    """The proof forward's verdict on one group: ``passed`` None = inconclusive (no sanction); ``suspect``: the group
+    itself made it inconclusive (no pass, the hotkey stays in probation)."""
     passed: bool | None
     failure_class: str | None = None
     rollout_match: tuple[float, ...] = ()
+    suspect: bool = False
 
 
 ProofForward = Callable[[SubmittedGroup], AuditResult]
@@ -137,12 +146,15 @@ class SubmitConfig:
     statistical_max: int = SERVICE_STATISTICAL_FAIL_MAX
     ban_s: float = 86400.0
     first_scan_fraction: float = 0.25
+    first_scan_min_tokens: int = RL_FIRST_SCAN_MIN_TOKENS
+    sanction_max_lag: int = RL_SANCTION_MAX_LAG
     rollouts: int = GROUP_ROLLOUTS
 
     def __post_init__(self) -> None:
         if not (0.0 <= self.audit_rate <= 1.0 and 0.0 <= self.first_scan_fraction <= 1.0):
             raise ValueError("audit rate and first-scan fraction are fractions")
-        if min(self.probation_groups, self.reprobation_passes, self.statistical_window, self.statistical_max) < 0:
+        if min(self.probation_groups, self.reprobation_passes, self.statistical_window, self.statistical_max,
+               self.first_scan_min_tokens, self.sanction_max_lag) < 0:
             raise ValueError("audit counts must be non-negative")
         if self.rollouts < 2 or not self.ban_s >= 0:
             raise ValueError("a group has at least 2 rollouts; ban_s >= 0")
@@ -249,9 +261,12 @@ class RlSubmissions:
         self._rng = rng or random.SystemRandom()
         with book.lock:
             book.db.executescript(_SCHEMA)
+            columns = {row[1] for row in book.db.execute("PRAGMA table_info(rl_audits)")}
+            for column, kind in (("attempts", "INTEGER NOT NULL DEFAULT 0"), ("lag", "INTEGER")):   # an older file
+                if column not in columns:
+                    book.db.execute(f"ALTER TABLE rl_audits ADD COLUMN {column} {kind}")
             book.db.commit()
         self.buffer = buffer or TrainingBuffer(book)
-        self._audit_failures: dict[str, int] = {}
 
     # --- submission ----------------------------------------------------------------------------------------
     def submit(self, lease_id: str, hotkey: str, rollouts: Sequence[Rollout], *,
@@ -304,6 +319,7 @@ class RlSubmissions:
                                tuple(r.tokens for r in rollouts), tuple(r.force_span for r in rollouts),
                                graded.spans)
         db = self.book.db
+        tokens = sum(group.model_tokens(i) for i in range(len(rollouts)))
         with self.book.transaction():
             self.book.submit(lease_id, hotkey, in_zone=verdict == IN_ZONE, delivered=verdict != REJECTED,
                              now=arrived_at)
@@ -322,8 +338,7 @@ class RlSubmissions:
                 else:
                     audit = NOT_DRAWN
                     if scan.first_scan:
-                        self._event(lease_id, hotkey, FIRST_SCAN, arrived_at,
-                                    {"fraction": self.config.first_scan_fraction, "audited": False})
+                        self._first_scan(lease_id, hotkey, arrived_at, NOT_DRAWN, tokens)
             db.execute("INSERT INTO rl_groups(lease_id, hotkey, environment, prompt_idx, k, nonce, issued_at, "
                        "arrived_at, verdict, reason, rewards, truncated, completion_tokens, first_scan, scan_seq, "
                        "audit, training) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -331,7 +346,7 @@ class RlSubmissions:
                         lease.issued_at, arrived_at, verdict, graded.reject,
                         None if scan is None else json.dumps(graded.rewards),
                         None if scan is None else json.dumps(graded.truncated),
-                        sum(group.model_tokens(i) for i in range(len(rollouts))), int(bool(scan and scan.first_scan)),
+                        tokens, int(bool(scan and scan.first_scan)),
                         None if scan is None else scan.seq, audit, training))
         answer = {"lease_id": lease_id, "verdict": verdict, "rewards": list(graded.rewards)}
         if graded.reject:
@@ -353,6 +368,14 @@ class RlSubmissions:
         return [{"seq": s, "lease_id": l, "hotkey": h, "kind": k, "at": a, "detail": json.loads(d)}
                 for s, l, h, k, a, d in rows]
 
+    def _first_scan(self, lease_id: str, hotkey: str, at: float, audit: str, tokens: int) -> None:
+        """An out-of-zone first scan: payable after ``audit`` (not drawn, or passed) with enough model tokens."""
+        if audit in (NOT_DRAWN, PASSED) and tokens >= self.config.first_scan_min_tokens:
+            self._event(lease_id, hotkey, FIRST_SCAN, at,
+                        {"fraction": self.config.first_scan_fraction, "audited": audit == PASSED})
+        else:
+            self._event(lease_id, hotkey, FIRST_SCAN_FORFEITED, at, {"audit": audit, "tokens": tokens})
+
     def _event(self, lease_id: str, hotkey: str, kind: str, at: float, detail: dict) -> None:
         self.book.db.execute("INSERT INTO rl_events(lease_id, hotkey, kind, at, detail) VALUES(?,?,?,?,?)",
                              (lease_id, hotkey, kind, at, json.dumps(detail, sort_keys=True)))
@@ -366,8 +389,8 @@ class RlSubmissions:
     def _in_probation(self, hotkey: str) -> bool:
         if self._passes(hotkey) < self.config.probation_groups:
             return True
-        last_failure = self.book.db.execute("SELECT MAX(seq) FROM rl_verdicts WHERE hotkey=? AND verdict=?",
-                                            (hotkey, FAILED)).fetchone()[0]
+        last_failure = self.book.db.execute("SELECT MAX(seq) FROM rl_verdicts WHERE hotkey=? AND verdict IN (?, ?)",
+                                            (hotkey, FAILED, INCONCLUSIVE)).fetchone()[0]
         return last_failure is not None and self._passes(hotkey, last_failure) < self.config.reprobation_passes
 
     def in_probation(self, hotkey: str) -> bool:
@@ -388,9 +411,9 @@ class RlSubmissions:
         ban = failure_class == AUDIT_FAILURE_DETERMINISTIC
         if not ban:
             recent = db.execute("SELECT COUNT(*) FROM (SELECT verdict, failure_class FROM rl_verdicts WHERE "
-                                "hotkey=? AND forced=0 ORDER BY seq DESC LIMIT ?) WHERE verdict=? AND "
-                                "failure_class=?", (hotkey, self.config.statistical_window, FAILED,
-                                                    AUDIT_FAILURE_STATISTICAL)).fetchone()[0]
+                                "hotkey=? AND forced=0 AND verdict<>? ORDER BY seq DESC LIMIT ?) WHERE verdict=? "
+                                "AND failure_class=?", (hotkey, INCONCLUSIVE, self.config.statistical_window,
+                                                        FAILED, AUDIT_FAILURE_STATISTICAL)).fetchone()[0]
             ban = recent > self.config.statistical_max
         if ban:
             self.book.ban(hotkey, now + self.config.ban_s)
@@ -407,44 +430,52 @@ class RlSubmissions:
 
     def report_audit(self, lease_id: str, result: AuditResult, now: float | None = None) -> None:
         """Conclude a drawn out-of-zone group (once). Passed: its first scan becomes payable. Failed: forfeited
-        and sanctioned by class. Inconclusive: forfeited, no sanction. LookupError: not a pending audit."""
+        and sanctioned by class, unless the group was leased more than ``sanction_max_lag`` checkpoints before the
+        latest (then inconclusive, the lag recorded). Inconclusive: forfeited, no sanction (a ``suspect`` one is
+        logged and keeps the hotkey in probation). LookupError: not a pending audit."""
         now = float(self.clock()) if now is None else now
         with self.book.transaction():
             db = self.book.db
-            row = db.execute("SELECT a.hotkey, a.forced, g.first_scan FROM rl_audits a JOIN rl_groups g "
-                             "ON g.lease_id=a.lease_id WHERE a.lease_id=? AND a.body IS NOT NULL",
+            row = db.execute("SELECT a.hotkey, a.forced, g.first_scan, g.k, g.completion_tokens FROM rl_audits a "
+                             "JOIN rl_groups g ON g.lease_id=a.lease_id WHERE a.lease_id=? AND a.body IS NOT NULL",
                              (lease_id,)).fetchone()
             if row is None:
                 raise LookupError("no pending audit for this lease")
-            hotkey, forced, first_scan = row[0], bool(row[1]), bool(row[2])
-            state = INCONCLUSIVE if result.passed is None else PASSED if result.passed else FAILED
-            if result.passed is not None:
-                self._verdict(lease_id, hotkey, "audit", result.passed, result.failure_class, forced, now)
-            db.execute("UPDATE rl_audits SET body=NULL WHERE lease_id=?", (lease_id,))
+            hotkey, forced, first_scan, k, tokens = row[0], bool(row[1]), bool(row[2]), int(row[3]), int(row[4])
+            lag = (self.book.latest_checkpoint or 0) - k
+            passed = result.passed
+            if passed is False and lag > self.config.sanction_max_lag:
+                passed = None                             # judged against a checkpoint too far ahead: no evidence
+            state = INCONCLUSIVE if passed is None else PASSED if passed else FAILED
+            if passed is not None:
+                self._verdict(lease_id, hotkey, "audit", passed, result.failure_class, forced, now)
+            elif result.suspect:
+                db.execute("INSERT INTO rl_verdicts(lease_id, hotkey, source, verdict, failure_class, forced, at) "
+                           "VALUES(?,?,?,?,?,?,?)", (lease_id, hotkey, "audit", INCONCLUSIVE, None, int(forced), now))
+            db.execute("UPDATE rl_audits SET body=NULL, lag=? WHERE lease_id=?", (lag, lease_id))
             db.execute("UPDATE rl_groups SET audit=? WHERE lease_id=?", (state, lease_id))
             if first_scan:
-                if state == PASSED:
-                    self._event(lease_id, hotkey, FIRST_SCAN, now,
-                                {"fraction": self.config.first_scan_fraction, "audited": True})
-                else:
-                    self._event(lease_id, hotkey, FIRST_SCAN_FORFEITED, now, {"audit": state})
+                self._first_scan(lease_id, hotkey, now, state, tokens)
 
     def run_audits(self, forward: ProofForward, limit: int, *, max_attempts: int = AUDIT_MAX_ATTEMPTS) -> int:
         """Drain up to ``limit`` queued audits through ``forward`` (the proof forward, the Gumbel verifier).
         A forward that raises leaves its audit queued and the others still run; after ``max_attempts`` raising
-        forwards (counted in this process) the audit is concluded inconclusive (unpaid, unsanctioned), so one
-        poison group (e.g. an OOM) cannot stall the queue."""
+        forwards (counted in ``rl_audits``, across restarts) the audit is concluded a suspect inconclusive
+        (unpaid, unsanctioned, no probation pass), so one poison group (e.g. an OOM) cannot stall the queue."""
         done = 0
         for group in self.audit_jobs(limit):
             try:
                 result = forward(group)
             except Exception:
-                failures = self._audit_failures[group.lease_id] = self._audit_failures.get(group.lease_id, 0) + 1
+                with self.book.transaction():
+                    self.book.db.execute("UPDATE rl_audits SET attempts=attempts+1 WHERE lease_id=?",
+                                         (group.lease_id,))
+                    failures = int(self.book.db.execute("SELECT attempts FROM rl_audits WHERE lease_id=?",
+                                                        (group.lease_id,)).fetchone()[0])
                 logger.exception("audit forward of %s failed (%d/%d)", group.lease_id[:12], failures, max_attempts)
                 if failures < max_attempts:
                     continue
-                result = AuditResult(None)
-            self._audit_failures.pop(group.lease_id, None)
+                result = AuditResult(None, suspect=True)
             self.report_audit(group.lease_id, result)
             done += 1
         return done

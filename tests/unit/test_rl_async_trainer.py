@@ -91,8 +91,9 @@ class Clock:
             self.on_sleep()
 
 
-def submitted(model, lease, env="math", k=3, arrived=0.0, forged=(), rewards=None, n=N_TOK, prompt_idx=7):
-    """A buffered group whose rollouts follow the model's Gumbel pick for the lease's uniforms (forged: random)."""
+def submitted(model, lease, env="math", k=3, arrived=0.0, forged=(), rewards=None, n=N_TOK, prompt_idx=7, noisy=()):
+    """A buffered group whose rollouts follow the model's Gumbel pick for the lease's uniforms (forged: random;
+    noisy: every 4th token random, honest drift at ~0.8)."""
     base = SubmittedGroup(lease_id=lease, hotkey="A", environment=env, prompt_idx=prompt_idx, checkpoint=k,
                           nonce="cd" * 32, arrived_at=arrived, rewards=tuple(rewards or [1.0, 0.0] * (ROLLOUTS // 2)),
                           truncated=(False,) * ROLLOUTS, prompt_tokens=(1, 2, 3),
@@ -102,7 +103,7 @@ def submitted(model, lease, env="math", k=3, arrived=0.0, forged=(), rewards=Non
     for i in range(ROLLOUTS):
         us, tokens = base.draw_uniforms(i), [3]
         for j in range(n):
-            if i in forged:
+            if i in forged or (i in noisy and j % 4 == 3):
                 tokens.append(int(torch.randint(0, _VOCAB, (1,), generator=gen)))
             else:
                 tokens.append(int(fs.pick_rows(_logits_at(model, tokens[-1]), [us[j]], draw=fs.DRAW_GUMBEL_MAX)[0]))
@@ -159,7 +160,7 @@ def test_groups_past_the_max_lag_are_dropped_unpaid_without_a_forward():
 # --- the gate ----------------------------------------------------------------------------------------------------
 def test_a_rollout_under_the_floor_leaves_the_loss_and_the_pay():
     model = _Model()
-    group = training_group(submitted(model, "g", forged={3}), slot0=0, index=0)
+    group = training_group(submitted(model, "g", noisy={3}), slot0=0, index=0)
     advantages = [1.0, -1.0, 1.0, -1.0]
     plan = [(group, advantages, 1.0 / (ROLLOUTS * N_TOK))]
     gate = gate_for([group])
@@ -168,11 +169,23 @@ def test_a_rollout_under_the_floor_leaves_the_loss_and_the_pay():
     honest = SimpleNamespace(rollouts=group.rollouts[:3], prompt_idx=7)
     want = grads_of(model, [(honest, advantages[:3], 1.0 / (ROLLOUTS * N_TOK))], DrawGate([[0, 1, 2]]))
     assert all(torch.allclose(a, b, atol=1e-7) for a, b in zip(got, want))
-    assert gate.rate(3) < 0.5 and gate.rate(0) == 1.0
+    assert gate.forgery_floor <= gate.rate(3) < 0.95 and gate.rate(0) == 1.0
     detail = {"rollout_match": [gate.rate(s) for s in range(4)],
               "completion_tokens": [N_TOK] * 4,
               "matched_tokens": [gate.tallies[s][3] if gate.admitted[s] else 0 for s in range(4)]}
     assert paid_tokens(detail, 0.95) == 3 * N_TOK
+
+
+def test_one_rollout_under_the_forgery_floor_rejects_its_group_whatever_the_pool():
+    """A 16/16 group made in-zone by one forged rollout ([EOS], random tokens): the honest rest pools over the
+    group floor, yet the group is rejected (evidence, unpaid), its admitted rollouts backed out."""
+    model = _Model()
+    group = training_group(submitted(model, "g", forged={3}), slot0=0, index=0)
+    plan = [(group, [1.0, -1.0, 1.0, -1.0], 1.0 / (ROLLOUTS * N_TOK))]
+    gate = DrawGate([[0, 1, 2, 3]], group_floor=0.7)
+    grads_of(model, plan, gate)
+    assert gate.rate(3) < gate.forgery_floor and gate.pooled(0) >= 0.7
+    assert gate.accepted == [False] and gate.undone == 1
 
 
 def test_a_failed_group_is_backed_out_before_the_step():
@@ -216,7 +229,7 @@ def loop(model, book, buffer, batch=2, **config):
 def test_one_step_reports_every_group_and_publishes_the_next_checkpoint():
     model, book = _Model(), Book(latest=3)
     buffer = TrainingBuffer(book)
-    buffer.push(submitted(model, "good", forged={2}, arrived=1.0))
+    buffer.push(submitted(model, "good", noisy={2}, arrived=1.0))
     buffer.push(submitted(model, "bad", forged={0, 1, 2}, arrived=0.0))
     trainer, subs, publisher, prices = loop(model, book, buffer)
     before = [p.detach().clone() for p in model.parameters()]

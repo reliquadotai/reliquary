@@ -109,6 +109,7 @@ class RlAuditResponse(WireModel):
     passed: bool | None
     failure_class: Annotated[str, Field(max_length=64)] | None = None
     rollout_match: list[Probability] = Field(max_length=MAX_AUDIT_ROLLOUTS)
+    suspect: bool = False                 # inconclusive because of the group (``AuditResult.suspect``)
 
 
 class CheckpointMismatch(RuntimeError):
@@ -192,7 +193,7 @@ def mount_rl_audit(app, backend: RlAuditBackend, *, worker_id: str, read) -> Non
         return respond(RlAuditResponse(
             worker_id=worker_id, version=value.version, lease_id=value.lease_id,
             request_sha256=digest(value.model_dump()), passed=result.passed, failure_class=result.failure_class,
-            rollout_match=[float(m) for m in result.rollout_match]))
+            rollout_match=[float(m) for m in result.rollout_match], suspect=bool(result.suspect)))
 
 
 def rl_audit_backend_from_environment(*, checkpoint: str, load_kwargs: dict) -> RlAuditBackend | None:
@@ -300,7 +301,8 @@ class RemoteAuditModel:
             raise RuntimeError("rl audit response is not bound to the request")
         if len(result.rollout_match) not in (0, len(group.completions)):
             raise RuntimeError("rl audit response has the wrong number of rollouts")
-        return AuditResult(result.passed, result.failure_class, tuple(result.rollout_match))
+        return AuditResult(result.passed, result.failure_class, tuple(result.rollout_match),
+                           suspect=result.passed is None and result.suspect)
 
     def audit(self, latest: int | None, submissions, limit: int) -> int | None:
         """Drain audits when the worker holds ``latest``; None (nothing run) while it lags."""

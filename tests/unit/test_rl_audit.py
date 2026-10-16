@@ -118,7 +118,32 @@ def test_a_rollout_under_the_floor_is_excluded_the_group_is_judged_pooled():
     assert result.passed is True and result.rollout_match[0] == 0.90 < rl_audit.RL_ROLLOUT_MATCH_FLOOR
     result = rl_audit.judge([d(100, 80)] * 8 + [d(100, 99)] * 8)        # pooled 0.895 < the group floor
     assert result.passed is False and result.failure_class == AUDIT_FAILURE_STATISTICAL
-    assert rl_audit.judge([d(1, 0)] * 16).passed is True                 # 16 stochastic positions: abstain
+    result = rl_audit.judge([d(1, 0)] * 16)                              # 16 drawn positions: abstain, suspect
+    assert result.passed is None and result.suspect
+
+
+def _drawn(drawn, match, stochastic=0, stochastic_match=0):
+    return fs.SeedConsistencyDiagnostics(n_positions=drawn, n_stochastic=stochastic, n_exact_match=stochastic_match,
+                                         n_drawn_exact_match=match)
+
+
+def test_one_token_rollouts_never_pass_an_audit():
+    """16 one-token rollouts (e.g. just EOS): too few drawn positions to judge, the audit abstains as a suspect
+    inconclusive (no pass, no pay); a few more tokens off the draw fail on the every-position match."""
+    result = rl_audit.judge([_drawn(1, 0)] * 16)
+    assert result == AuditResult(None, None, (0.0,) * 16, suspect=True)
+    result = rl_audit.judge([_drawn(1, 1)] * 16)                         # even when the token is the pick
+    assert result.passed is None and result.suspect
+    result = rl_audit.judge([_drawn(4, 0)] * 16)
+    assert result.passed is False and result.failure_class == AUDIT_FAILURE_STATISTICAL
+    assert rl_audit.judge([_drawn(4, 4)] * 16).passed is True             # a peaked honest short group
+
+
+def test_one_rollout_under_the_forgery_floor_fails_the_group():
+    honest = [_drawn(100, 100, 100, 99)] * 15
+    result = rl_audit.judge(honest + [_drawn(1, 0)])                     # pooled 0.99, one [EOS] off the draw
+    assert result.passed is False and result.failure_class == AUDIT_FAILURE_STATISTICAL
+    assert rl_audit.judge(honest + [_drawn(100, 85, 100, 80)]).passed is True   # honest noise: excluded from pay
 
 
 def test_force_span_positions_are_not_checked():

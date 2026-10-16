@@ -16,9 +16,13 @@ The draw itself is the profile's (``forced_sampling``: ``sampling.draw``, Gumbel
   the trainer read the same stream over the episode's model spans (``model_positions``).
 
 Every lease of one (env, prompt, k) therefore draws the same 16 streams, whoever holds it.
+
+``rollout_rate`` / ``pooled_rate``: how the trainer's forward and the out-of-zone audit read a match from the same
+(stochastic, stochastic matches, drawn, drawn matches) tallies, so the gate, the audit and the ledger use one number.
 """
 from __future__ import annotations
 
+from reliquary.constants import FORCED_SEED_MIN_STOCH_POSITIONS, FORCED_SEED_ROLLOUT_MIN_STOCH
 from reliquary.environment.forced_sampling import u_at
 
 
@@ -67,4 +71,20 @@ def lease_uniforms(nonce: str, prompt_idx: int, checkpoint: int, rollout_index: 
             for t in range(int(positions))]
 
 
-__all__ = ["lease_checkpoint_tag", "lease_draw_context", "lease_extra_args", "lease_uniforms", "model_positions"]
+def rollout_rate(tally, min_stoch: int = FORCED_SEED_ROLLOUT_MIN_STOCH) -> float:
+    """Match of one rollout from its (stochastic, stochastic matches, drawn, drawn matches) tally: the rate on
+    stochastic positions when it has ``min_stoch`` of them, else on every drawn position (a peaked honest rollout
+    matches ~1 there; arbitrary tokens do not); 0 when nothing was drawn (nothing verified)."""
+    n_stoch, m_stoch, n_drawn, m_drawn = tally
+    if n_stoch >= min_stoch:
+        return m_stoch / n_stoch
+    return m_drawn / n_drawn if n_drawn else 0.0
+
+
+def pooled_rate(tallies, min_stoch: int = FORCED_SEED_MIN_STOCH_POSITIONS) -> float:
+    """A group's pooled match over its rollouts' tallies, with the same fallback as ``rollout_rate``."""
+    return rollout_rate([sum(t[i] for t in tallies) for i in range(4)], min_stoch)
+
+
+__all__ = ["lease_checkpoint_tag", "lease_draw_context", "lease_extra_args", "lease_uniforms", "model_positions",
+           "pooled_rate", "rollout_rate"]

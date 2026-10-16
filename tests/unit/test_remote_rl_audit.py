@@ -87,17 +87,19 @@ def test_audits_run_on_the_worker_at_the_latest_checkpoint():
     table = _transitions()
     backend, remote, client = _remote(table)
     honest, foreign = _group(table), _group(table, nonce_for_draw=OTHER_NONCE)
-    submissions = _Submissions([honest, foreign])
+    empty = type(honest)(**{**honest.__dict__, "completions": tuple(c[:1] for c in honest.completions)})
+    submissions = _Submissions([honest, foreign, empty])
     with client:
         assert remote.audit(4, submissions, 8) is None                  # not synced yet: nothing runs
         assert asyncio.run(remote.follow_once(_Board(4))) == 4
         assert asyncio.run(remote.follow_once(_Board(4))) is None       # already there: no second sync
         assert backend.sync.calls == [None] and backend.version == 4
         assert remote.audit(5, submissions, 8) is None                  # lagging the latest: nothing runs
-        assert remote.audit(4, submissions, 8) == 2
-    passed, failed = submissions.results
+        assert remote.audit(4, submissions, 8) == 3
+    passed, failed, abstained = submissions.results
     assert (passed.passed, passed.rollout_match) == (True, (1.0,) * 16)
     assert failed.passed is False and failed.failure_class == AUDIT_FAILURE_STATISTICAL
+    assert abstained.passed is None and abstained.suspect                # 16 drawn positions: the wire keeps it
 
 
 def test_a_restarted_worker_is_readopted_once_then_audits():

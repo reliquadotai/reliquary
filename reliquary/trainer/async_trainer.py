@@ -24,12 +24,19 @@ Next to the window trainer (``worker.py`` / ``train_runner.py``, unchanged), one
    (``BackgroundHfBackup``, never blocking), and the step's speed for the prices (``note_speed``: completion tokens
    processed and seconds worked, the wait for the batch excluded).
 
+Groups are reported (an accepted one becomes payable) before their step's checkpoint is published: pay is for
+work trained into the weights the step computed. If the process dies between the report and the publication,
+that step's weights are lost, but the miners did the work and keep its pay (deliberate, not a race to fix).
+
 Floors are PLACEHOLDERS to calibrate at GPU qualification: ``ASYNC_ROLLOUT_FLOOR`` =
 ``constants.RL_ROLLOUT_MATCH_FLOOR`` (the design's 0.95 with bf16 heads, about 0.96 with fp32 heads) and
-``ASYNC_GROUP_FLOOR`` 0.90 (pooled). A rollout's match is its rate on stochastic positions (max p < 0.99) when it has ``FORCED_SEED_ROLLOUT_MIN_STOCH`` of them, else its rate on every drawn position (a
-peaked honest rollout matches ~1 there; arbitrary tokens do not), so the trainer's mask and the ledger's pay
-re-check (``RlPayLedger``, same floor) read one number. The step is one batch: the loss is the global token mean,
-and masked rollouts stay in its denominator (it is planned before the forward).
+``ASYNC_GROUP_FLOOR`` 0.90 (pooled); a group with a forwarded rollout under ``ASYNC_FORGERY_FLOOR`` (0.5) is
+rejected whatever its pool (one forged rollout must not ride on honest ones). A rollout's match
+(``rl_draw.rollout_rate``) is its rate on stochastic positions (max p < 0.99) when it has
+``FORCED_SEED_ROLLOUT_MIN_STOCH`` of them, else its rate on every drawn position (a peaked honest rollout matches
+~1 there; arbitrary tokens do not), so the trainer's mask, the audit and the ledger's pay re-check
+(``RlPayLedger``, same floor) read one number. The step is one batch: the loss is the global token mean, and
+masked rollouts stay in its denominator (it is planned before the forward).
 """
 from __future__ import annotations
 
@@ -43,11 +50,12 @@ from types import SimpleNamespace
 from typing import Any
 
 from reliquary.constants import (
-    FORCED_SEED_MIN_STOCH_POSITIONS,
-    FORCED_SEED_ROLLOUT_MIN_STOCH,
+    RL_FORGERY_MATCH_FLOOR,
     RL_GROUP_MATCH_FLOOR,
     RL_ROLLOUT_MATCH_FLOOR,
+    RL_SANCTION_MAX_LAG,
 )
+from reliquary.protocol.rl_draw import pooled_rate, rollout_rate
 from reliquary.services.exploration import AUDIT_FAILURE_STATISTICAL
 from reliquary.validator.rl_buffer import SubmittedGroup
 from reliquary.validator.rl_leases import SECRET_REVEAL_LAG
@@ -57,18 +65,11 @@ logger = logging.getLogger(__name__)
 
 ASYNC_ROLLOUT_FLOOR = RL_ROLLOUT_MATCH_FLOOR   # placeholder (design §4.6), the ledger's floor too
 # Placeholder: pooled match (every forwarded rollout) a group needs to be trained and paid. Under the rollout floor
-# so that one bad rollout does not kill its group (§4.6): 15 honest rollouts at 0.986 + 1 at 0 pool to 0.924; two
-# such rollouts (0.863) do. Calibrate with the rollout floor at qualification.
+# so that one noisy honest rollout does not kill its group (§4.6): 15 at 0.986 + 1 at 0.8 pool to 0.974; one under
+# ``ASYNC_FORGERY_FLOOR`` (no honest noise: a forged rollout) rejects the group whatever the pool. Calibrate with the
+# rollout floor at qualification.
 ASYNC_GROUP_FLOOR = RL_GROUP_MATCH_FLOOR
-
-
-def rollout_rate(tally, min_stoch: int = FORCED_SEED_ROLLOUT_MIN_STOCH) -> float:
-    """Match of one rollout from its (stochastic, stochastic matches, drawn, drawn matches) tally; 0 when nothing
-    was drawn (no public uniforms: nothing verified)."""
-    n_stoch, m_stoch, n_drawn, m_drawn = tally
-    if n_stoch >= min_stoch:
-        return m_stoch / n_stoch
-    return m_drawn / n_drawn if n_drawn else 0.0
+ASYNC_FORGERY_FLOOR = RL_FORGERY_MATCH_FLOOR
 
 
 class _Replay:
@@ -84,9 +85,10 @@ class DrawGate:
     ``_async_slot``; ``groups[g]`` lists group g's slots."""
 
     def __init__(self, groups: list[list[int]], *, rollout_floor: float = ASYNC_ROLLOUT_FLOOR,
-                 group_floor: float = ASYNC_GROUP_FLOOR) -> None:
+                 group_floor: float = ASYNC_GROUP_FLOOR, forgery_floor: float = ASYNC_FORGERY_FLOOR) -> None:
         self.groups = [list(g) for g in groups]
         self.rollout_floor, self.group_floor = float(rollout_floor), float(group_floor)
+        self.forgery_floor = float(forgery_floor)
         self.extra: dict[str, float] = {}
         self.reset()
 
@@ -116,12 +118,11 @@ class DrawGate:
         return rollout_rate(self.tallies[slot]) if self.forwarded[slot] else 0.0
 
     def pooled(self, g: int) -> float:
-        slots = [s for s in self.groups[g] if self.forwarded[s]]
-        n_stoch = sum(self.tallies[s][0] for s in slots)
-        if n_stoch >= FORCED_SEED_MIN_STOCH_POSITIONS:
-            return sum(self.tallies[s][1] for s in slots) / n_stoch
-        n_drawn = sum(self.tallies[s][2] for s in slots)
-        return sum(self.tallies[s][3] for s in slots) / n_drawn if n_drawn else 0.0
+        return pooled_rate([self.tallies[s] for s in self.groups[g] if self.forwarded[s]])
+
+    def forged(self, g: int) -> bool:
+        """A forwarded rollout of group g under the forgery floor: no honest noise, the group is rejected."""
+        return any(self.forwarded[s] and self.rate(s) < self.forgery_floor for s in self.groups[g])
 
     def judge(self, plan, dist=None) -> list:
         """Decide every group; return the back-out plan (rejected groups' admitted rollouts, negated advantages,
@@ -138,7 +139,7 @@ class DrawGate:
             self.forwarded = [int(row[4]) for row in rows]
             self.admitted = [int(row[5]) for row in rows]
         self.accepted = [any(self.admitted[s] for s in slots) and self.pooled(g) >= self.group_floor
-                         for g, slots in enumerate(self.groups)]
+                         and not self.forged(g) for g, slots in enumerate(self.groups)]
         undo = []
         for group, advantages, scale in plan:
             g = int(group.rollouts[0]._async_group)
@@ -205,14 +206,15 @@ class AsyncTrainerConfig:
     hf_backup_every: int | None = None       # M: full HF backup every M steps (None: off)
     rollout_floor: float = ASYNC_ROLLOUT_FLOOR
     group_floor: float = ASYNC_GROUP_FLOOR
+    forgery_floor: float = ASYNC_FORGERY_FLOOR
     max_lag: int = SECRET_REVEAL_LAG         # no quality cap (the floor decides); bounds the buffer only
-    sanction_max_lag: int = 2                # a failed group this fresh is evidence (honest lag <= 2 passes)
+    sanction_max_lag: int = RL_SANCTION_MAX_LAG   # a failed group this fresh is evidence (the audit's rule too)
     poll_s: float = 0.5                      # while the batch is not full
 
     def __post_init__(self) -> None:
         if self.batch_groups < 1 or self.steps_per_checkpoint < 1 or (self.hf_backup_every or 1) < 1:
             raise ValueError("batch_groups, steps_per_checkpoint and hf_backup_every must be positive")
-        if not (0 <= self.rollout_floor <= 1 and 0 <= self.group_floor <= 1) or self.max_lag < 0:
+        if not all(0 <= f <= 1 for f in (self.rollout_floor, self.group_floor, self.forgery_floor)) or self.max_lag < 0:
             raise ValueError("floors in [0, 1], max_lag >= 0")
 
 
@@ -309,7 +311,8 @@ class AsyncTrainer:
             batch.append(training_group(group, slot0=slot, index=i))
             slot += len(group.completions)
         gate = DrawGate([[r._async_slot for r in g.rollouts] for g in batch],
-                        rollout_floor=self.config.rollout_floor, group_floor=self.config.group_floor)
+                        rollout_floor=self.config.rollout_floor, group_floor=self.config.group_floor,
+                        forgery_floor=self.config.forgery_floor)
         envs: dict[str, int] = {}
         for group in submitted:
             envs[group.environment] = envs.get(group.environment, 0) + 1
@@ -367,6 +370,6 @@ class AsyncTrainer:
 
 
 __all__ = [
-    "ASYNC_GROUP_FLOOR", "ASYNC_ROLLOUT_FLOOR", "AsyncTrainer", "AsyncTrainerConfig", "DrawGate",
+    "ASYNC_FORGERY_FLOOR", "ASYNC_GROUP_FLOOR", "ASYNC_ROLLOUT_FLOOR", "AsyncTrainer", "AsyncTrainerConfig", "DrawGate",
     "rollout_rate", "save_snapshot", "training_group",
 ]

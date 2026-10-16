@@ -1999,6 +1999,16 @@ RL_GROUP_MATCH_FLOOR = 0.90
 # near-deterministic positions (max p >= FORCED_SEED_STOCHASTIC_MAXPROB, Gumbel shortfall beyond the boundary
 # epsilon) was edited after the draw: deterministic forgery. PLACEHOLDER: calibrate on honest lag-2 rollouts.
 RL_AUDIT_FORGERY_MISMATCH_TOLERANCE = 1
+# A rollout whose match falls this far under the rollout floor is no honest noise (honest single rollouts bottom
+# around 0.8): its whole group is rejected (trainer) or fails (audit) as statistical evidence, so a forged rollout
+# (e.g. one [EOS] that moves a 16/16 group into the zone) cannot ride on 15 honest ones. PLACEHOLDER.
+RL_FORGERY_MATCH_FLOOR = 0.5
+# A failed verification of a group leased more than this many checkpoints before the latest is no evidence (an honest
+# lagged lease drifts): the trainer reports it unsanctioned, the audit concludes inconclusive. PLACEHOLDER.
+RL_SANCTION_MAX_LAG = 2
+# The model tokens (16 x 64) an out-of-zone group needs for its first-scan pay: a group of near-empty rollouts
+# verifies nothing and earns nothing. PLACEHOLDER.
+RL_FIRST_SCAN_MIN_TOKENS = 1024
 FORCED_SEED_CDF_ENFORCE = _os.environ.get(
     "FORCED_SEED_CDF_ENFORCE", "false"
 ).strip().lower() in ("1", "true", "yes", "on")
