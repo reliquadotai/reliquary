@@ -13,6 +13,10 @@ docs/rl-async-design.md §4.8. Per step the publisher writes to the
   config, generation config, tokenizer, chat template) so a miner can load it
   from the bucket alone;
 - ``index.json`` last, so a reader never sees an entry whose object is missing.
+  Pruned objects leave the index first and are deleted ``prune_grace_s`` later
+  (the validator's presigned URL lifetime): a miner that just fetched the old
+  index can still download them. The pending deletions are memory only: a
+  restart leaves them in the bucket.
 
 A cumulative base keeps one bit per weight (the union of changed positions),
 1.1 GB on a 9B model; the values come from the current step. The publisher
@@ -56,6 +60,8 @@ from reliquary.shared.ckpt_index import (
 from reliquary.shared.strict_json import strict_json_loads
 
 logger = logging.getLogger(__name__)
+
+PRUNE_GRACE_S = 900.0   # rl_checkpoint.PRESIGN_TTL_SECONDS: a URL handed out before a prune stays good
 
 def model_files(model_dir: str | Path) -> list[Path]:
     """The non-weight files of an HF model directory an anchor carries (config, tokenizer, chat template)."""
@@ -144,6 +150,7 @@ class DeltaPublisher:
         zstd_level: int = DEFAULT_ZSTD_LEVEL,
         model_dir: str | Path | None = None,
         clock: Callable[[], float] = time.time,
+        prune_grace_s: float = PRUNE_GRACE_S,
     ) -> None:
         if anchor_interval < 1 or cumulative_stride < 1 or keep_anchors < 1:
             raise ValueError("intervals and keep_anchors must be positive")
@@ -154,6 +161,8 @@ class DeltaPublisher:
         self.max_cumulative_bytes = max_cumulative_bytes
         self.keep_anchors, self._shard_bytes = keep_anchors, anchor_shard_bytes
         self._level, self._clock = zstd_level, clock
+        self._prune_grace_s = float(prune_grace_s)
+        self._doomed: list[tuple[float, list[str]]] = []   # (delete after, keys) pruned from the index
         self._model_files = model_files(model_dir) if model_dir is not None else []
         self._prev: dict[str, torch.Tensor] | None = None
         self._prev_version: int | None = None
@@ -195,7 +204,7 @@ class DeltaPublisher:
         elif version % self.cumulative_stride == 0:
             self._bases.append(self._new_base(version, sha, snapshot))
             del self._bases[:-self.max_cumulative_bases]
-        self._prune(version)
+        dropped = self._prune(version)
         index = {
             "format": INDEX_FORMAT, "run": self.run,
             "latest": {"version": version, "sha256": sha},
@@ -204,6 +213,9 @@ class DeltaPublisher:
         }
         self._store.put_bytes(index_key(self.run), json.dumps(index, sort_keys=True).encode())
         self._prev, self._prev_version, self._prev_sha = snapshot, version, sha
+        if dropped:
+            self._doomed.append((float(self._clock()) + self._prune_grace_s, dropped))
+        self._delete_due()
         return index
 
     # ------------------------------------------------------------------ steps
@@ -269,10 +281,11 @@ class DeltaPublisher:
         self.anchors.append(anchor)
         self._last_anchor = version
 
-    def _prune(self, version: int) -> None:
+    def _prune(self, version: int) -> list[str]:
         """Keep ``keep_anchors`` anchors, the deltas starting at or after the
         oldest of them, and cumulatives ending at this step or the one before
-        (a miner may still be downloading those)."""
+        (a miner may still be downloading those). Returns the dropped entries'
+        keys: deleted once the index without them is written, after the grace."""
         drop_anchors = self.anchors[:-self.keep_anchors]
         self.anchors = self.anchors[-self.keep_anchors:]
         floor = self.anchors[0]["version"] if self.anchors else 0
@@ -282,8 +295,13 @@ class DeltaPublisher:
             (drop if d["from"] < floor or stale_cumulative else keep).append(d)
         self.deltas = keep
         dropped = [f["key"] for a in drop_anchors for f in [*a["files"], *a.get("model_files", [])]]
-        for key in dropped + [d["key"] for d in drop]:
-            try:
-                self._store.delete(key)
-            except Exception:
-                logger.warning("could not delete %s; left in the bucket", key, exc_info=True)
+        return dropped + [d["key"] for d in drop]
+
+    def _delete_due(self) -> None:
+        now = float(self._clock())
+        while self._doomed and self._doomed[0][0] <= now:
+            for key in self._doomed.pop(0)[1]:
+                try:
+                    self._store.delete(key)
+                except Exception:
+                    logger.warning("could not delete %s; left in the bucket", key, exc_info=True)

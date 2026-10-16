@@ -70,7 +70,7 @@ def published(tmp_path):
     store = MemoryStore()
     pub = DeltaPublisher(run="run1", store=store, staging_dir=tmp_path / "staging",
                          anchor_interval=4, cumulative_stride=2, max_cumulative_bases=2,
-                         keep_anchors=2)
+                         keep_anchors=2, prune_grace_s=0.0)
     for version, state in enumerate(states):
         index = pub.publish(version, state)
     return states, store, index
@@ -94,6 +94,37 @@ def test_publisher_layout_anchors_deltas_cumulatives_and_pruning(published):
     assert keys | {index_key("run1")} == set(store.objects)
     stored = json.loads(store.objects[index_key("run1")])
     assert stored["latest"]["version"] == 10
+
+
+def test_pruned_objects_leave_the_index_first_and_the_bucket_after_the_grace(tmp_path):
+    class Logged(MemoryStore):
+        def __init__(self):
+            super().__init__()
+            self.log = []
+
+        def put_bytes(self, key, data):
+            self.log.append(("put", key))
+            super().put_bytes(key, data)
+
+        def delete(self, key):
+            self.log.append(("delete", key))
+            super().delete(key)
+
+    store, now = Logged(), [0.0]
+    pub = DeltaPublisher(run="run1", store=store, staging_dir=tmp_path / "staging", anchor_interval=2,
+                         keep_anchors=1, prune_grace_s=900.0, clock=lambda: now[0])
+    states = chain(4)
+    for version in range(3):
+        pub.publish(version, states[version])
+    assert not any(op == "delete" for op, _ in store.log)            # anchor 0 pruned from the index, kept
+    index = json.loads(store.objects[index_key("run1")])
+    assert [a["version"] for a in index["anchors"]] == [2]
+    now[0] = 901.0
+    store.log.clear()
+    pub.publish(3, states[3])
+    ops = [op for op, _ in store.log]
+    assert "delete" in ops and ops.index("delete") > ops.index("put") and store.log[-1][0] == "delete"
+    assert not any("/anchors/00000000/" in key for key in store.objects)
 
 
 def test_publisher_refuses_going_backwards(published, tmp_path):
@@ -304,7 +335,7 @@ def test_anchors_carry_the_model_files_and_the_miner_keeps_them(tmp_path):
     store = MemoryStore()
     model = _model_dir(tmp_path)
     pub = DeltaPublisher(run="run1", store=store, staging_dir=tmp_path / "staging", anchor_interval=2,
-                         keep_anchors=2, model_dir=model)
+                         keep_anchors=2, model_dir=model, prune_grace_s=0.0)
     for version, state in enumerate(states):
         index = pub.publish(version, state)
     names = ["chat_template.jinja", "config.json", "tokenizer.json"]

@@ -11,8 +11,10 @@ One process on the controller, like the corpus validator: no window, batcher or 
   ``/rl/lease/mine``, ``/rl/lease/commitments``, ``/rl/prompts/state``, ``/rl/submit``, ``/rl/pay`` (replaces the
   window board's), ``/rl/checkpoint`` and ``/rl/observations`` (the scan log's signed head + presigned URLs).
 * **Trainer link** (``/rl/trainer/*``, bearer ``RELIQUARY_RL_TRAINER_TOKEN``) on its own listener,
-  ``RELIQUARY_RL_TRAINER_BIND`` (``host:port``, default ``127.0.0.1:8889``: reach it over a private interface or
-  an SSH tunnel), never on the public port: the detached async trainer (``reliquary train-async``, its own GPU box
+  ``RELIQUARY_RL_TRAINER_BIND`` (``host:port``, default ``127.0.0.1:8889``), never on the public port. The link is
+  plain HTTP and its token can mint pay: a non-loopback bind is refused unless
+  ``RELIQUARY_RL_TRAINER_INSECURE_BIND=1`` says the address is on a private network (WireGuard, a private VLAN);
+  otherwise reach it over an SSH tunnel: the detached async trainer (``reliquary train-async``, its own GPU box
   as today) takes groups from the buffer, reports them, adopts the checkpoints it publishes and reports its speed.
 * **Episodes** (``rl_async_episodes``): the task's ``params.rl_episode_envs`` (the order's episode block and
   catalogue, per env) make those envs signed-episode envs: the sandbox side (``wire_episode_sandbox``: token key,
@@ -61,6 +63,7 @@ WINDOW, ASYNC = "window", "async"
 TRAINER_TOKEN_ENV = "RELIQUARY_RL_TRAINER_TOKEN"
 TRAINER_BIND_ENV = "RELIQUARY_RL_TRAINER_BIND"
 DEFAULT_TRAINER_BIND = "127.0.0.1:8889"
+TRAINER_INSECURE_BIND_ENV = "RELIQUARY_RL_TRAINER_INSECURE_BIND"   # "1": a non-loopback bind on a private network
 AUDIT_DEVICE_ENV = "RELIQUARY_RL_AUDIT_DEVICE"
 RUN_ENV = "RELIQUARY_RL_RUN"
 DB_NAME = "rl-async.sqlite3"
@@ -70,7 +73,7 @@ PLANNED_TOKENS_PARAM = "rl_planned_tokens_per_period"   # matched tokens the tra
 LEASE_SPEED_PARAM = "rl_lease_reference_tokens_per_s"   # a slow reference card's decode speed, per sequence
 LEASE_MARGIN_PARAM = "rl_lease_expiry_margin"
 PRICE_TICK_PARAM = "rl_price_tick_s"
-PENDING_PARAM = "rl_max_pending_groups"         # global cap: open leases + buffered groups
+PENDING_PARAM = "rl_max_pending_groups"         # global cap: buffered groups (queued or taken)
 DEFAULT_MAX_PENDING_GROUPS = 256      # placeholder: 4 batches of 64 (lag <= ~4 steps), set at qualification
 DEFAULT_LEASE_TOKENS_PER_S = 20.0      # placeholder: the design's "3090 at max length", measured at qualification
 DEFAULT_LEASE_MARGIN = 2.0
@@ -308,12 +311,24 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
 
 
 def trainer_bind(env: Mapping[str, str] = os.environ) -> tuple[str, int]:
-    """``RELIQUARY_RL_TRAINER_BIND`` as (host, port): the trainer link's own listener."""
+    """``RELIQUARY_RL_TRAINER_BIND`` as (host, port): the trainer link's own listener. ValueError for a host that
+    is not loopback unless ``RELIQUARY_RL_TRAINER_INSECURE_BIND=1`` (plain HTTP: a private network only)."""
+    import ipaddress
+
     value = str(env.get(TRAINER_BIND_ENV, "")).strip() or DEFAULT_TRAINER_BIND
     host, sep, port = value.rpartition(":")
     if not sep or not host or not port.isdigit() or not 0 < int(port) < 65536:
         raise ValueError(f"{TRAINER_BIND_ENV} must be host:port, got {value!r}")
-    return host.strip("[]"), int(port)
+    host = host.strip("[]")
+    try:
+        loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback and str(env.get(TRAINER_INSECURE_BIND_ENV, "")).strip() != "1":
+        raise ValueError(f"{TRAINER_BIND_ENV}={value!r} is not loopback: the trainer link is plain HTTP and its "
+                         f"token mints pay; bind it on a private network and set {TRAINER_INSECURE_BIND_ENV}=1, "
+                         "or keep it on loopback behind an SSH tunnel")
+    return host, int(port)
 
 
 def build_rl_trainer_app(rl: RlAsync, *, token: str):
@@ -714,7 +729,7 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
 __all__ = [
     "ASYNC", "AUDIT_DEVICE_ENV", "AuditModel", "DB_NAME", "LEASE_MARGIN_PARAM", "LEASE_SPEED_PARAM", "PENDING_PARAM",
     "PLANNED_TOKENS_PARAM", "PRICE_TICK_PARAM", "RL_MODE_ENV", "RUN_ENV", "RlAsync", "RlAsyncSettings",
-    "TRAINER_BIND_ENV", "TRAINER_TOKEN_ENV", "WINDOW", "audit_source", "build_rl_async", "build_rl_trainer_app",
+    "TRAINER_BIND_ENV", "TRAINER_INSECURE_BIND_ENV", "TRAINER_TOKEN_ENV", "WINDOW", "audit_source", "build_rl_async", "build_rl_trainer_app",
     "build_rl_trainer_router", "index_signer_for", "mount_rl_async", "rl_async_loops", "rl_async_params",
     "episode_body_cap", "load_episode_environments", "renderer_for_checkpoint", "rl_async_settings", "rl_mode",
     "run_rl_async_validator", "trainer_bind", "wire_episode_sandbox",

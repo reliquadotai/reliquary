@@ -36,6 +36,7 @@ from reliquary.validator import corpus_periods as cp
 from reliquary.validator.rl_submit import BAN, FIRST_SCAN, TRAINED
 
 RL_PERIOD_ARCHIVE_SCHEMA = "reliquary/rl-async-period/v1"
+BOARD_CACHE_S = 15.0       # the public board is rebuilt at most this often (it sums every accrual under the lock)
 ACCRUED, SETTLED, FORFEITED = "accrued", "settled", "forfeited"
 
 _SCHEMA = """
@@ -81,6 +82,7 @@ class RlPayLedger:
                  clock: Callable[[], float] = time.time) -> None:
         """``prices.token_price(env)`` prices a matched token (``AsyncPriceController``)."""
         self.book, self.submissions, self.prices, self.config, self.clock = book, submissions, prices, config, clock
+        self._board: tuple[float, dict] | None = None
         with book.lock:
             book.db.executescript(_SCHEMA)
             book.db.execute("INSERT OR IGNORE INTO rl_pay_cursor(id, seq) VALUES(0, 0)")
@@ -103,14 +105,14 @@ class RlPayLedger:
         return row is not None and at < row[0]
 
     def ingest(self, limit: int = 10_000) -> int:
-        """Consume the events after the cursor; returns how many were read."""
-        with self.book.lock:
-            cursor = self.book.db.execute("SELECT seq FROM rl_pay_cursor WHERE id=0").fetchone()[0]
-        events = self.submissions.events(cursor)[:limit]
-        if not events:
-            return 0
+        """Consume the events after the cursor; returns how many were read. The cursor is read in the transaction
+        that moves it: two concurrent ingests never accrue one event twice."""
         with self.book.transaction():
             db = self.book.db
+            cursor = db.execute("SELECT seq FROM rl_pay_cursor WHERE id=0").fetchone()[0]
+            events = self.submissions.events(cursor)[:limit]
+            if not events:
+                return 0
             for event in events:
                 kind, hotkey, at, detail = event["kind"], event["hotkey"], float(event["at"]), event["detail"]
                 if kind == BAN:
@@ -225,11 +227,19 @@ class RlPayLedger:
         return {h: out[h] for h in sorted(out)}
 
     def board(self, now: float | None = None, hotkey: str | None = None) -> dict:
-        """``GET /rl/pay`` (async): per-env prices and per-hotkey accrued / paid."""
+        """``GET /rl/pay`` (async): per-env prices and per-hotkey accrued / paid, rebuilt at most every
+        ``BOARD_CACHE_S`` (public: one answer serves every caller in between)."""
         now = float(self.clock()) if now is None else now
+        cached = self._board
+        if cached is None or not 0.0 <= now - cached[0] < BOARD_CACHE_S:
+            cached = self._board = (now, self._build_board(now))
+        if hotkey is None:
+            return cached[1]
+        balances = cached[1]["hotkeys"]
+        return {**cached[1], "hotkeys": {hotkey: balances.get(hotkey, {"accrued": 0.0, "paid": 0.0, "forfeited": 0.0})}}
+
+    def _build_board(self, now: float) -> dict:
         balances = self.balances()
-        if hotkey is not None:
-            balances = {hotkey: balances.get(hotkey, {"accrued": 0.0, "paid": 0.0, "forfeited": 0.0})}
         with self.book.lock:
             periods = [(w, e, p) for w, e, p in self.book.db.execute(
                 "SELECT work_period, entry_period, published FROM rl_pay_periods ORDER BY work_period DESC LIMIT 12")]

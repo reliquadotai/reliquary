@@ -118,7 +118,12 @@ def test_the_trainer_link_has_its_own_listener_never_the_public_port(tmp_path):
     from reliquary.validator.server import ValidatorServer
 
     assert trainer_bind({}) == ("127.0.0.1", 8889)
-    assert trainer_bind({"RELIQUARY_RL_TRAINER_BIND": "10.0.0.5:7000"}) == ("10.0.0.5", 7000)
+    with pytest.raises(ValueError, match="not loopback"):                 # plain HTTP, a token that mints pay
+        trainer_bind({"RELIQUARY_RL_TRAINER_BIND": "10.0.0.5:7000"})
+    private = {"RELIQUARY_RL_TRAINER_BIND": "10.0.0.5:7000", "RELIQUARY_RL_TRAINER_INSECURE_BIND": "1"}
+    assert trainer_bind(private) == ("10.0.0.5", 7000)                    # the operator says: a private network
+    assert trainer_bind({"RELIQUARY_RL_TRAINER_BIND": "[::1]:7000"}) == ("::1", 7000)
+    assert trainer_bind({"RELIQUARY_RL_TRAINER_BIND": "localhost:7000"}) == ("localhost", 7000)
     for bad in ("7000", "host:", "host:99999", ":80"):
         with pytest.raises(ValueError):
             trainer_bind({"RELIQUARY_RL_TRAINER_BIND": bad})

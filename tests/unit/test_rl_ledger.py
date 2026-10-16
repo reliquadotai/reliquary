@@ -262,3 +262,17 @@ def test_the_pay_route_publishes_prices_and_balances(book):
         clock=lambda: NOW, pay=ledger))
     assert [r.path for r in server.app.routes if getattr(r, "path", "") == "/rl/pay"] == ["/rl/pay"]
     assert TestClient(server.app).get("/rl/pay").json()["policy"] == "pay-per-matched-token/v1"
+
+
+def test_the_public_board_is_rebuilt_at_most_every_15_seconds(book):
+    from reliquary.validator.rl_ledger import BOARD_CACHE_S
+
+    subs = service(book, probation_groups=0)
+    ledger = ledger_for(book, subs)
+    first = ledger.board(NOW)
+    trained(book, subs, 1)
+    ledger.ingest()
+    assert ledger.board(NOW + BOARD_CACHE_S - 1) is first and first["hotkeys"] == {}     # cached: no recompute
+    fresh = ledger.board(NOW + BOARD_CACHE_S, hotkey="A")
+    assert fresh["hotkeys"]["A"]["accrued"] > 0 and list(fresh["hotkeys"]) == ["A"]
+    assert ledger.board(NOW + BOARD_CACHE_S)["hotkeys"]["A"] == fresh["hotkeys"]["A"]
