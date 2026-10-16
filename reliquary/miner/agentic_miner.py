@@ -475,7 +475,7 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
                             concurrency: int = 8, port: int = 8011,
                             gpu_memory_utilization: float | None = None,
                             max_num_seqs: int = 16, sessions=None,
-                            max_live_per_job: int = 4) -> dict[str, Counter]:
+                            max_live_per_job: int = 64) -> dict[str, Counter]:
     """The whole miner in one process: engine thread, loopback endpoint, episodes.
     A signed-sandbox job needs ``sessions`` (the validator's session client,
     ``signed_episode.HttpSandboxSessions``) and each identity's ``sign_binding``."""

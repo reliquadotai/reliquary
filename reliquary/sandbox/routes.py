@@ -104,7 +104,8 @@ REFUSAL_STATUS: dict[str, int] = {
     # per-hotkey caps
     "live_cap": 429, "prompt_live_cap": 429, "job_live_cap": 429, "open_rate_cap": 429,
     "aborted_cap": 429, "open_refused_rate": 429,
-    # the RL yield quota (rl_quota.py): the miner retries after Retry-After
+    # the RL yield quota (rl_quota.py) and the corpus quota (corpus_quota.py: ``quota_live``, ``quota_pool``, the
+    # miner's ``allowance`` in the detail): the miner retries after Retry-After
     "quota_live": 429, "quota_opens": 429, "quota_pool": 429, "quota_pool_opens": 429, "quota_env": 429,
     # the RL open queue (open_queue.py): saturated, full, or this key / engagement already waiting; and an open
     # no machine could ever take (final for that seed)
@@ -330,8 +331,12 @@ def build_sandbox_sessions_router(
             if refused is not None:
                 return refused
             logger.info("sandbox session %s granted to %s", outcome.session_id, hotkey[:12])
-            return _answer({"session_id": outcome.session_id, "token": outcome.token,
-                            "gateway_url": outcome.gateway_url, "expires_at": outcome.expires_at})
+            answer = {"session_id": outcome.session_id, "token": outcome.token,
+                      "gateway_url": outcome.gateway_url, "expires_at": outcome.expires_at}
+            allowance = getattr(outcome, "allowance", None)
+            if allowance is not None:            # the corpus quota's: the sessions the miner may grow to
+                answer["allowance"] = int(allowance)
+            return _answer(answer)
 
         return await guarded("open", step)
 

@@ -19,7 +19,11 @@ Settings:
   once, before their signature is known (one more is refused `close_busy` at once);
 * `RELIQUARY_SANDBOX_CLOSE_BODY_TIMEOUT_S` (30): the time a close's body has to arrive;
 * `RELIQUARY_SANDBOX_*` policy settings (`sandbox.sessions.SandboxPolicy`), among them
-  `RELIQUARY_SANDBOX_CLAIM_TTL_S` (300).
+  `RELIQUARY_SANDBOX_CLAIM_TTL_S` (300);
+* `RELIQUARY_SANDBOX_CORPUS_QUOTA` (1): the corpus quota (`sandbox.corpus_quota.CorpusQuota`): a hotkey holds
+  as many sessions as it asks for, bounded by the fleet serving the signed jobs and the other miners' fair
+  shares; the fixed live caps become safety ceilings, `RELIQUARY_SANDBOX_QUOTA_MAX_LIVE_PER_HOTKEY` and
+  `RELIQUARY_SANDBOX_QUOTA_MAX_LIVE_PER_HOTKEY_JOB` (0: the fleet's capacity). 0 restores the fixed caps.
 
 This module imports reliquary-sandbox: a validator imports it only when a signed job
 is served or the key settings are present.
@@ -74,6 +78,27 @@ def _positive(environ: Mapping[str, str], name: str, default, kind=float):
     return value
 
 
+def _flag(environ: Mapping[str, str], name: str, default: bool) -> bool:
+    raw = (environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name} must be 0 or 1")
+
+
+def _count(environ: Mapping[str, str], name: str) -> int:
+    raw = (environ.get(name) or "").strip()
+    if not raw:
+        return 0
+    value = int(raw)
+    if value < 0:
+        raise ValueError(f"{name} must be 0 (the fleet's capacity) or a positive integer")
+    return value
+
+
 @dataclass(frozen=True)
 class SandboxValidatorConfig:
     key_file: Path
@@ -89,6 +114,11 @@ class SandboxValidatorConfig:
     # The ss58 address miners sign session requests to, when the process has no wallet to
     # read it from (the split corpus validator's front): public, never a key.
     validator_hotkey: str | None = None
+    # The corpus quota (demand-driven, fleet-bounded, fair): on unless RELIQUARY_SANDBOX_CORPUS_QUOTA=0. Its
+    # safety ceilings per hotkey (0: the fleet's capacity, never below the policy's own caps).
+    quota: bool = True
+    quota_max_live_per_hotkey: int = 0
+    quota_max_live_per_hotkey_job: int = 0
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] = os.environ) -> SandboxValidatorConfig | None:
@@ -118,7 +148,10 @@ class SandboxValidatorConfig:
                                            CLOSE_BODY_TIMEOUT_S),
             close_preauth_concurrency=_positive(
                 environ, "RELIQUARY_SANDBOX_CLOSE_PREAUTH_CONCURRENCY", MAX_PREAUTH_CLOSES, int),
-            validator_hotkey=(environ.get("RELIQUARY_SANDBOX_VALIDATOR_HOTKEY") or "").strip() or None)
+            validator_hotkey=(environ.get("RELIQUARY_SANDBOX_VALIDATOR_HOTKEY") or "").strip() or None,
+            quota=_flag(environ, "RELIQUARY_SANDBOX_CORPUS_QUOTA", True),
+            quota_max_live_per_hotkey=_count(environ, "RELIQUARY_SANDBOX_QUOTA_MAX_LIVE_PER_HOTKEY"),
+            quota_max_live_per_hotkey_job=_count(environ, "RELIQUARY_SANDBOX_QUOTA_MAX_LIVE_PER_HOTKEY_JOB"))
 
 
 @dataclass
@@ -130,6 +163,8 @@ class SandboxServices:
     issuer: SessionIssuer
     router: Any
     jobs: dict[str, SignedJobView] = field(default_factory=dict)
+    # The corpus quota (None: the fixed per-hotkey caps).
+    quota: Any = None
     # The app's CorpusJobRoutes, read at call time (set by `wire_signed_job`).
     routes: Callable[[], Any] | None = None
     restore_attempts: int = RESTORE_ATTEMPTS
@@ -228,12 +263,29 @@ def build_sandbox_services(config: SandboxValidatorConfig, *, validator_hotkey: 
     def view(job_id):
         return None if services is None else services.view(job_id)
 
+    quota = None
+    if config.quota:
+        from reliquary.sandbox.corpus_quota import CorpusQuota
+
+        def served() -> set[tuple[str, str]]:
+            """The (sandbox env, env package) of every signed job served now."""
+            found = set()
+            for job_view in list(jobs.values()):
+                spec = getattr(getattr(job_view.job, "episode", None), "sandbox", None)
+                if spec is not None:
+                    found.add((str(spec.env), str(spec.env_package)))
+            return found
+
+        quota = CorpusQuota(book=book, capacity=lambda: fleet.slots_serving(served()), policy=policy,
+                            max_live_per_hotkey=config.quota_max_live_per_hotkey,
+                            max_live_per_hotkey_job=config.quota_max_live_per_hotkey_job, clock=clock)
+        quota.install()
     issuer = SessionIssuer(
         book=book, store=session_store or sandbox_store.R2SessionStore(**kw), fleet=fleet,
         signer=signer, token_verifier=token_verifier,
         engagements={"corpus": CorpusEngagements(view, book, clock),
                      "rl_precommit": RlPrecommitEngagements()},
-        policy=policy, clock=clock)
+        policy=policy, clock=clock, quota=quota)
     fleet.on_drained = issuer.void_machine
     router = build_sandbox_sessions_router(
         issuer, policy=policy, validator_hotkey=validator_hotkey, prefix="/corpus",
@@ -241,10 +293,10 @@ def build_sandbox_services(config: SandboxValidatorConfig, *, validator_hotkey: 
         max_concurrent_closes=config.close_concurrency,
         close_body_timeout_s=config.close_body_timeout_s,
         max_preauth_closes=config.close_preauth_concurrency)
-    logger.info("sandbox services built: validator key %s, %d retired keys", config.key_id,
-                len(config.retired_keys))
+    logger.info("sandbox services built: validator key %s, %d retired keys, corpus quota %s", config.key_id,
+                len(config.retired_keys), "on" if quota is not None else "off (fixed per-hotkey caps)")
     services = SandboxServices(signer=signer, token_verifier=token_verifier, fleet=fleet,
-                               book=book, issuer=issuer, router=router, jobs=jobs)
+                               book=book, issuer=issuer, router=router, jobs=jobs, quota=quota)
     return services
 
 
