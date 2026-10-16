@@ -99,7 +99,11 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   batch, params keyed by request id (`feat/forced-seed-runner-fix`, validated). vLLM pinned
   to 0.30.x; speculative decoding refused.
 - **fp32 head:** logits kept in fp32 at the LM head output on miner and validator (match 0.986
-  -> 0.994).
+  -> 0.994): bf16 operands, fp32 products and accumulation (`torch.mm(..., out_dtype=float32)`,
+  what vLLM's `head_dtype=float32` runs). Measured 2026-10-16 on H100: ~1 % of miner decode
+  throughput; on the validator 79 -> 5.8 ms per 2048 rows against the former fp32 SGEMM (needs a
+  torch with `out_dtype`; 2.7 falls back to the SGEMM). The 0.994 was measured with the SGEMM
+  validator: re-measure at qualification (1 different pick in 381k between the two).
 - **Verification statistic:** per-rollout match on stochastic positions (max p < 0.99) and
   pooled per-hotkey statistics.
 - Protocol version bump: Gumbel and inverse-CDF are incompatible; validators first.
