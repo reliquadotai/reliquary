@@ -240,22 +240,16 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   below target or the trainer waited on it; descend when its buffer overflows. `/rl/pay` and
   quota published.
 
-### 4.9b Miner formats and pay (PENDING the fp8 replication)
+### 4.9b Miner formats and pay (DECIDED 2026-10-16: no official format)
 
-- Miners pick the format that maximises paid tokens per second. Match on the 9B under Gumbel:
-  bf16 0.986, fp8 KV 0.985, fp8 weights 0.963-0.971, W4A16/NVFP4 ~0.855.
-- fp8 weights lose ~2 % of pay under pay-per-matched-token and generate ~30-60 % faster
-  (estimate, to measure on 2-3 cards): fp8 is the rational choice for every miner.
-- A floor cannot separate fp8 from honest bf16: honest bf16 at lag 4 matches 0.970-0.978, the
-  same as fp8 at lag 0. A pay curve steep enough to cancel a 40 % speed gain (about 30 % of
-  pay for 2 points of match) would also punish honest staleness.
-- So the decision rests on the training value of fp8 data (2B runs with a real vLLM fp8
-  sampler, 3 seeds, in progress):
-  - **fp8 trains as well:** fp8 weights become an official format; the network gets
-    30-60 % more tokens for the same emission.
-  - **fp8 trains worse:** price the measured loss of value into pay per rollout match, and
-    ship the fp32 head (honest 0.994) to widen the gap between bf16 and fp8.
-- W4A16 and below stay under the floor in both cases.
+- No format is official or forbidden: miners pick whatever maximises paid tokens per second,
+  and the match floor is the only rule. Match on the 9B under Gumbel: bf16 0.986, fp8 KV
+  0.985, fp8 weights 0.963-0.971, W4A16/NVFP4 ~0.855 (under the floor).
+- Pay per matched token already prices a format's mismatch; the substitution loss keeps the
+  trainer's gradient unbiased whatever the miner ran.
+- fp8 data on the 2B (real vLLM fp8 sampler) trained as well as bf16 within seed noise; the
+  3-seed comparison against the papers' correction was not finished and is not needed for
+  this decision.
 
 ### 4.10 Multi-turn and sandboxed envs
 
@@ -292,9 +286,8 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
 2. Training forward as verification (4.7): confirm after measuring trainer-forward picks
    against the proof path.
 3. Floor value with fp32 heads (qualification).
-4. fp8 weights as an official format (4.9b, fp8 replication).
-5. Lease expiry and starting quota numbers (qualification).
-6. Learning rate on the 9B (2B: 5e-6 learns faster with substitution; uncorrected collapses).
+4. Lease expiry and starting quota numbers (qualification).
+5. Learning rate on the 9B (2B: 5e-6 learns faster with substitution; uncorrected collapses).
 
 ## 7. Work plan
 
