@@ -87,7 +87,10 @@ Rolling back is the reverse: retire the signed job first, then unset the key set
 3. Set `RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE` and `RELIQUARY_SANDBOX_VALIDATOR_KEY_ID` (neither
    may be blank). After a rotation also set `RELIQUARY_SANDBOX_VALIDATOR_RETIRED_KEYS`, a JSON
    object `{key_id: base64 public key}`. Without both key settings, a signed job is not
-   served: it is logged as unserved, and replay jobs start as before.
+   served: it is logged as unserved, and replay jobs start as before. The split validator's
+   front (`RELIQUARY_CORPUS_SPLIT=1`) runs with no wallet: there also set
+   `RELIQUARY_SANDBOX_VALIDATOR_HOTKEY` to the ss58 address miners sign session requests to
+   (public, the address miners pass as `--validator-hotkey`).
 4. Policy defaults per hotkey:
    - 8 live sessions in total (`RELIQUARY_SANDBOX_MAX_LIVE_PER_HOTKEY`);
    - 4 live sessions per job (`RELIQUARY_SANDBOX_MAX_LIVE_PER_HOTKEY_JOB`);
@@ -142,6 +145,7 @@ number (a bad value refuses the start).
 | `RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE` | unset (signed jobs not served) | the validator's Ed25519 key (0600, owned by the process user) |
 | `RELIQUARY_SANDBOX_VALIDATOR_KEY_ID` | unset (signed jobs not served) | its key id, as the machines know it |
 | `RELIQUARY_SANDBOX_VALIDATOR_RETIRED_KEYS` | `{}` | earlier keys whose tokens may still be in flight |
+| `RELIQUARY_SANDBOX_VALIDATOR_HOTKEY` | the wallet's hotkey (required in the split front) | the ss58 address miners sign session requests to |
 | `RELIQUARY_SANDBOX_MAX_LIVE_PER_HOTKEY` | 8 | live sessions per hotkey |
 | `RELIQUARY_SANDBOX_MAX_LIVE_PER_HOTKEY_JOB` | 4 | live sessions per hotkey and job |
 | `RELIQUARY_SANDBOX_MAX_OPENS_PER_HOUR` | 120 | opens per hotkey per rolling hour (aborted and voided refunded) |
