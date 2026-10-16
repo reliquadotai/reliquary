@@ -36,7 +36,7 @@ from typing import Any
 import torch
 
 from reliquary.constants import T_PROTO, TOP_K_PROTO, TOP_P_PROTO
-from reliquary.environment.forced_sampling import pick_rows, u_at
+from reliquary.environment.forced_sampling import host_to_device, pick_rows, u_at
 from reliquary.shared.modeling import first_eos_index
 
 logger = logging.getLogger(__name__)
@@ -146,15 +146,17 @@ def _one_hot_picks(logits: torch.Tensor, rows: list[int], draws: list[float], *,
     """Each forced row becomes -inf but for the profile's forced pick (the shared
     ``forced_sampling.pick_rows``). The other rows are kept as they are, or
     blanked as the slot-counter processor always did."""
-    index = torch.tensor(rows, device=logits.device)
+    index = host_to_device(rows, torch.int64, logits.device)
     picks = pick_rows(logits[index], draws, draw=default_draw(),
                       t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO)
+    # index_fill_ takes its value as a kernel argument; ``forced[index] = v`` copies v to the GPU
+    # from pageable memory, which blocks the host on the stream every decode step.
     if keep_other_rows:
-        forced = logits.clone()
-        forced[index] = float("-inf")
+        forced = logits.clone(memory_format=torch.contiguous_format)
+        forced.index_fill_(0, index, float("-inf"))
     else:
-        forced = torch.full_like(logits, float("-inf"))
-    forced[index, picks] = 0.0
+        forced = torch.full_like(logits, float("-inf"), memory_format=torch.contiguous_format)
+    forced.view(-1).index_fill_(0, index * forced.shape[-1] + picks, 0.0)
     return forced
 
 
