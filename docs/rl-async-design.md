@@ -91,8 +91,9 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
 ### 4.1 Forced draw (protocol)
 
 - **Gumbel-max:** pick = argmax_v (log p_v + G_v), G_v = -log(-log U_v), U_v from a
-  counter-based PRNG keyed by (nonce, rollout index, position, v). splitmix64 + float64 G is
-  bit-identical on Ampere, Ada, Hopper, Blackwell. It is an exact sample of p; diversity is
+  counter-based PRNG keyed by (nonce, rollout index, position, v). splitmix64 + a float32 G
+  built from IEEE +, -, *, / only (its own logf, no FMA) is bit-identical on every device,
+  CPU included (`forced_sampling` module doc). It is an exact sample of p; diversity is
   unchanged.
 - **Position:** `num_tokens_no_spec - num_prompt_tokens (+ base_offset)` from the vLLM input
   batch, params keyed by request id (`feat/forced-seed-runner-fix`, validated). vLLM pinned
@@ -322,11 +323,16 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
 
 - **vLLM internals:** the runner-keyed position and Gumbel depend on vLLM 0.30 internals;
   pinned, refused otherwise. Upgrades need re-validation.
-- **Cost of the Gumbel draw (2026-10-16, being measured):** one noise value per vocabulary
-  token (~248k) per position. The first implementation builds [rows, vocab] float64
-  temporaries in ~12 torch ops; float64 runs at 1/64 rate on GeForce cards, so it may cost a
-  large share of decode throughput there. Fix in progress: a fused float32 kernel (one read of
-  the logits, noise in registers), with a torch reference as the test oracle.
+- **Cost of the Gumbel draw (measured 2026-10-16, H100):** one noise value per vocabulary
+  token (~248k) per position. The first implementation ([rows, vocab] int64/float64
+  temporaries in ~12 torch ops) cost 2.4 ms at 64 rows and 9.5 ms at 256 rows, against a
+  9B vLLM decode step of ~9.8 / ~20.5 ms (25-45 % of the step; float64 was only ~20 % of
+  it, the unfused int64 temporaries the rest). The fused Triton pass (`gumbel_kernel`, one
+  read of the logits, noise in registers) takes 0.15 / 0.46 ms (0.20 / 0.56 ms for the whole
+  `pick_rows` call; ~2-3 % of the step, cheaper
+  than vLLM's own softmax + exponential sampling at 0.27 / 0.83 ms). Miners need Triton
+  (vLLM ships it); without it `pick_rows` falls back to the torch reference (same bits,
+  ~3x slower than the old path).
 - **Validator load:** grading all groups plus audits; with 4.7 the trainer forward replaces
   the in-zone proof forward, so the extra GPU cost is the audits only.
 - **Dynamics over hundreds of steps:** the 2B runs cover 400 steps; the 9B run's telemetry

@@ -1241,7 +1241,7 @@ def _forced_draw_rows(logits_of, rows, targets, draws, chunk: int = _LOGPROB_CHU
     each row whose public uniform ``draws[i]`` is known (None: keep the miner's token), plus
     the verifier's stochastic flag and the entropy. ``logits_of`` maps a row chunk to its
     logits; at most ``chunk`` rows of full-vocab logits live at once, and ``pick_rows``
-    bounds its float64 noise further."""
+    bounds its own noise workspace (or runs the fused Triton pass)."""
     from reliquary.environment.forced_sampling import pick_rows
     from reliquary.validator.verifier import draw_settings
 

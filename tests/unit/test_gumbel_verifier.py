@@ -101,7 +101,7 @@ def test_gumbel_terminal_pick_is_checked_with_the_gumbel_draw(gumbel):
     us = _u(40)
     # make EOS the Gumbel pick at the last position
     row = logits.shape[0] - 1  # predicts the final token, completion offset row - (prompt - 1)
-    scores = fs._gumbel_scores(logits[row:row + 1], [us[row - (_PROMPT - 1)]])[0]
+    scores = fs._gumbel_scores(logits[row:row + 1], fs._gumbel_keys([us[row - (_PROMPT - 1)]], logits.device))[0]
     logits[row, _EOS] += float(scores.max() - scores[_EOS]) + 1.0
     commit = _commit(logits, us, draw=fs.DRAW_GUMBEL_MAX)
     assert commit["tokens"][-1] == _EOS
@@ -133,7 +133,7 @@ def test_episode_stop_picks_use_the_gumbel_draw(gumbel):
 def test_gumbel_boundary_epsilon_comes_from_the_settings(monkeypatch):
     logits = _logits(1, seed=4)
     us = _u(1)
-    scores = fs._gumbel_scores(logits, us)[0]
+    scores = fs._gumbel_scores(logits, fs._gumbel_keys(us, logits.device))[0]
     runner_up = int(scores.argsort(descending=True)[1])
     gap_miss = float(-torch.expm1(-(scores.max() - scores[runner_up])))
     for eps, hard in ((gap_miss * 1.01, 0), (gap_miss * 0.99, 1)):

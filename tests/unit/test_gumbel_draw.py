@@ -48,7 +48,7 @@ def test_noise_is_a_function_of_key_and_token_only():
     keys = torch.tensor([fs.gumbel_key(fs.u_at("cd" * 16, 1, "c", r, 0)) for r in range(5)])
     ids = torch.arange(1000)
     full = fs.gumbel_noise(keys, ids)
-    assert full.dtype == torch.float64
+    assert full.dtype == torch.float32
     assert torch.equal(full[2:4, 100:300], fs.gumbel_noise(keys[2:4], ids[100:300]))
     assert torch.isfinite(full).all()
 
@@ -72,7 +72,7 @@ def test_gumbel_pick_is_argmax_of_logits_plus_noise():
     logits, us = _honest_rows(40, 300)
     picks = fs.pick_rows(logits, us, draw=fs.DRAW_GUMBEL_MAX)
     keys = torch.tensor([fs.gumbel_key(u) for u in us])
-    ref = (logits.double() + fs.gumbel_noise(keys, torch.arange(300))).argmax(-1)
+    ref = (logits.float() + fs.gumbel_noise(keys, torch.arange(300))).argmax(-1)
     assert torch.equal(picks, ref)
 
 
@@ -150,13 +150,13 @@ def test_gumbel_diagnostics_catch_tokens_drawn_from_another_stream():
 def test_gumbel_miss_is_the_relative_score_shortfall():
     logits, us = _honest_rows(1, 50, scale=1.0)
     keys = torch.tensor([fs.gumbel_key(us[0])])
-    scores = logits.double() + fs.gumbel_noise(keys, torch.arange(50))
+    scores = logits.float() + fs.gumbel_noise(keys, torch.arange(50))
     order = scores[0].argsort(descending=True)
     runner_up = int(order[1])
     gap = float(scores[0, order[0]] - scores[0, runner_up])
     exact, miss = fs.forced_pick_diagnostics(logits[0], runner_up, us[0], draw=fs.DRAW_GUMBEL_MAX)
     assert not exact
-    assert miss == pytest.approx(-math.expm1(-gap), rel=1e-12)
+    assert miss == pytest.approx(-math.expm1(-gap), rel=1e-6)
     exact, miss = fs.forced_pick_diagnostics(logits[0], int(order[0]), us[0], draw=fs.DRAW_GUMBEL_MAX)
     assert exact and miss == 0.0
     # the batched diagnostics report the same distance and classify it against epsilon
@@ -205,10 +205,7 @@ def test_gpu_uniform_bits_are_bit_identical_to_cpu_and_picks_agree():
     cpu_bits = fs.gumbel_uniform_bits(keys, ids)
     gpu_bits = fs.gumbel_uniform_bits(keys.cuda(), ids.cuda()).cpu()
     assert torch.equal(cpu_bits, gpu_bits)
-    cpu_g = fs.gumbel_noise(keys, ids)
-    gpu_g = fs.gumbel_noise(keys.cuda(), ids.cuda()).cpu()
-    # float64 log differs by at most an ulp or two between libm and libdevice
-    assert float(((cpu_g - gpu_g).abs() / cpu_g.abs().clamp_min(1e-300)).max()) < 1e-14
+    assert torch.equal(fs.gumbel_noise(keys, ids), fs.gumbel_noise(keys.cuda(), ids.cuda()).cpu())
     logits, us = _honest_rows(32, 248320)
     assert torch.equal(fs.pick_rows(logits, us, draw=fs.DRAW_GUMBEL_MAX),
                        fs.pick_rows(logits.cuda(), us, draw=fs.DRAW_GUMBEL_MAX).cpu())

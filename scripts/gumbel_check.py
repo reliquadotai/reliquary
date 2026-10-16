@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """Bit-identity of the Gumbel forced draw across devices.
 
-Prints sha256 prefixes of the uniform integers, of G (float64) and of the picks on fixed
-logits over the 9B vocabulary, for one device. Run it on every card type (and on CPU):
-the ``bits`` hash must match everywhere; ``G`` and ``picks`` must match on every GPU (CPU
-libm may differ from CUDA libdevice by an ulp in G, see forced_sampling).
+Prints sha256 prefixes of the uniform integers, of G (float32, torch reference) and of the
+picks on fixed logits over the 9B vocabulary (``pick_rows``: the fused Triton pass on CUDA),
+for one device. Run it on every card type and on CPU: all three hashes must match
+everywhere (G is IEEE +, -, *, / only, see forced_sampling).
 
     python scripts/gumbel_check.py [cuda|cpu]
 """
