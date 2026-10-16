@@ -484,6 +484,9 @@ class AsyncMinerConfig:
             raise ValueError("at least one environment is needed")
         if min(self.lease_batch, self.max_open, self.queue_groups, self.batch_groups) < 1:
             raise ValueError("lease batch, max open, queue and batch sizes must be positive")
+        if self.batch_groups > self.queue_groups:
+            # A batch is taken from the queue: it would silently stay at queue_groups.
+            raise ValueError("batch_groups must not exceed queue_groups (--queue-groups)")
 
 
 class AsyncMiner:

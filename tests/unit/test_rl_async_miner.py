@@ -402,6 +402,11 @@ async def test_a_generator_that_cannot_load_weights_stops_the_miner_instead_of_l
         await asyncio.wait_for(miner.run(asyncio.Event()), 5)
 
 
+def test_a_batch_larger_than_the_queue_is_refused():
+    with pytest.raises(ValueError, match="queue_groups"):
+        AsyncMinerConfig(environments=(ENV,), batch_groups=32, queue_groups=8)
+
+
 # --- wire: the real lease routes -------------------------------------------------------------------------
 async def test_the_http_transport_leases_from_the_real_routes(tmp_path):
     bt = pytest.importorskip("bittensor")
