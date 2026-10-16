@@ -388,6 +388,20 @@ async def test_the_loops_run_and_stop_after_submitting_what_was_generated():
     assert all(s["lease_id"] not in miner.open for s in transport.submissions)
 
 
+async def test_a_generator_that_cannot_load_weights_stops_the_miner_instead_of_leasing_for_it():
+    miner, transport, generator, _ = miner_for(quota=4, batch_groups=2)
+    miner.config = AsyncMinerConfig(environments=(ENV,), lease_poll_s=0.01, state_poll_s=0.01, quota_poll_s=0.01,
+                                    checkpoint_poll_s=0.01, batch_groups=2, submit_backoff_s=(0.0,))
+
+    def broken(state, version):
+        raise RuntimeError("engine core initialization failed")
+    generator.load_weights = broken
+    miner._state, miner._state_version = {}, 1
+    miner._ready.set()                               # a new checkpoint to swap in before the next batch
+    with pytest.raises(RuntimeError, match="engine core"):
+        await asyncio.wait_for(miner.run(asyncio.Event()), 5)
+
+
 # --- wire: the real lease routes -------------------------------------------------------------------------
 async def test_the_http_transport_leases_from_the_real_routes(tmp_path):
     bt = pytest.importorskip("bittensor")

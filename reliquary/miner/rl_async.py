@@ -825,14 +825,21 @@ class AsyncMiner:
                 wake.clear()
 
     async def _generation_loop(self, stop: asyncio.Event) -> None:
-        while not stop.is_set():
-            if await self.generate_once():
-                continue
-            self._wake_generation.clear()
-            if (self.queue and self.loaded_version is not None) or self._ready.is_set():
-                continue
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self._wake_generation.wait(), timeout=self.config.lease_poll_s)
+        try:
+            while not stop.is_set():
+                if await self.generate_once():
+                    continue
+                self._wake_generation.clear()
+                if (self.queue and self.loaded_version is not None) or self._ready.is_set():
+                    continue
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._wake_generation.wait(), timeout=self.config.lease_poll_s)
+        except Exception:
+            # A generator that cannot load weights must not leave the other loops leasing for it: the leases
+            # would expire and halve the quota. Stop the miner (run() re-raises it).
+            logger.exception("generation stopped; the miner stops")
+            stop.set()
+            raise
 
     async def run(self, stop: asyncio.Event | None = None) -> None:
         stop = stop or asyncio.Event()
@@ -861,6 +868,9 @@ class AsyncMiner:
             await asyncio.gather(*tasks, return_exceptions=True)
             # Leases already generated are still submitted: every lease ends in a submission when it can.
             await self.drain()
+        generation = tasks[-1]
+        if not generation.cancelled() and generation.exception() is not None:
+            raise generation.exception()
 
 
 # ------------------------------------------------------------------------------------ vLLM generation adapter
