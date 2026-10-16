@@ -21,6 +21,8 @@ The 9B in bf16 needs >= 24 GB: on a 24 GB card, check the KV cache left at `max_
 ### Q1 Bit-exact noise on every card (minutes per card)
 `scripts/gumbel_check.py` on each card type and on the validator/trainer boxes. Pass: the
 three hashes (bits, G, picks) equal the H100 reference. Decides nothing, gates everything.
+Reference: bits `d34e0008d56bc338`, G `d1c696b1fd17f4b4`, picks `0b427caf7280d994`. Measured 2026-10-16,
+identical on H100, A100-SXM4, RTX 4090 (torch 2.13 cu130) and on CPU (torch 2.11, 2.13).
 
 ### Q2 Honest match: miner vs proof path vs trainer forward (the key test, ~half a day)
 Same leases, same prompts (math, code, logic, 64 x 16 each, max length of the run):
