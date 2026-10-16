@@ -81,10 +81,15 @@ proof-worker images; signer, proof worker, controller in that order).
 |---|---|---|
 | `RL_ROLLOUT_MATCH_FLOOR` | 0.95 | Q2 |
 | `RL_GROUP_MATCH_FLOOR` | 0.90 | Q2 |
+| `RL_FORGERY_MATCH_FLOOR` | 0.5 | Q2 (honest p0.001 on the worst card) |
+| `RL_SANCTION_MAX_LAG` | 2 checkpoints | Q2, Q5 (honest match vs lag) |
+| `RL_FIRST_SCAN_MIN_TOKENS` | 1024 | Q5 |
+| `HOTKEY_PENDING_SHARE` | 0.25 of the cap | Q5 (Sybil, squatter) |
+| `MAX_GRADING_PER_HOTKEY`, submit reads | 2; 8 total, 2 per hotkey | Q5 |
 | lease expiry reference speed | 20 tok/s | Q3, Q5 |
 | starting quota | 4 | Q5 |
-| `rl_max_pending_groups` | 256 | Q5 |
-| price band low/high | 0.95 / 1.15 | price simulation, Q5 |
+| `rl_max_pending_groups` (buffered groups only) | 256 | Q5 |
+| price band low/high | 0.90 / 1.10 (rise 1.05, decay -2 %/tick) | price simulation, Q5 |
 | `batch_groups` | 64 | Q4 |
 | steps per checkpoint | 1 | Q3, Q4 |
 | learning rate | 2e-6 | Q5 |
