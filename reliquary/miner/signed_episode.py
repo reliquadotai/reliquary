@@ -202,10 +202,10 @@ def transcript_refusal(transcript: Any, *, job, hotkey: str, index: int,
     from reliquary_sandbox.attest import Expected, Reason, verify_transcript
     from reliquary_sandbox.observation import TOOLS_VERSIONS
 
-    from reliquary.corpus.job import sandbox_split
     from reliquary.corpus.signed_reasons import (
         REASON_SANDBOX_EXPIRED, REASON_SANDBOX_TRANSCRIPT, corpus_engagement,
     )
+    from reliquary.eval.rows import job_row_map
     from reliquary.protocol.corpus_submission import MAX_TRANSCRIPT_BYTES
 
     if not isinstance(transcript, Mapping):
@@ -213,10 +213,11 @@ def transcript_refusal(transcript: Any, *, job, hotkey: str, index: int,
     size = len(_compact(transcript))
     if size > MAX_TRANSCRIPT_BYTES:
         return "trajectory_too_large", {"transcript_bytes": size}
-    episode = job.episode
-    spec = episode.sandbox
+    spec = job.episode.sandbox
+    # The engagement names the row; the session token names the task it runs.
+    task = job_row_map(job).ref(int(index))
     expected = Expected(hotkey=hotkey, engagement=corpus_engagement(job.job_id, index),
-                        env=spec.env, split=sandbox_split(episode), index=int(index),
+                        env=spec.env, split=task.split, index=task.index,
                         checkpoint=job.checkpoint_sha256, require_graded=True)
     result = verify_transcript(transcript, _NoKeys(), _claims_of, expected)
     reasons = [reason.value for reason in result.reasons if reason is not Reason.UNKNOWN_KEY]
@@ -295,8 +296,7 @@ class SignedSweEpisodeRunner:
                  sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
                  monotonic: Callable[[], float] = time.monotonic,
                  max_live: int = DEFAULT_MAX_LIVE_PER_JOB) -> None:
-        from reliquary.corpus.job import sandbox_split
-        from reliquary.environment.agentic_swe import SignedSweSource
+        from reliquary.environment.agentic_swe import job_signed_source
 
         if ss58_format_42(hotkey) != hotkey:
             raise ValueError("a signed-sandbox miner's hotkey must be an ss58 format-42 address "
@@ -313,7 +313,7 @@ class SignedSweEpisodeRunner:
         self._model_name, self._renderer_dir = model_name, renderer_model_dir
         self._generate_url, self._sampling = generate_url, sampling
         self._harness_env = dict(harness_env or {})
-        self._source = source or SignedSweSource(sandbox_split(job.episode))
+        self._source = source or job_signed_source(job)
         self._runner_factory = runner_factory
         self._clock, self._new_request_id, self._sleep = clock, new_request_id, sleep
         self._monotonic = monotonic

@@ -615,7 +615,7 @@ def validator_process(tmp_path, gateway, r2, fixed_drand_chain, monkeypatch):  #
     monkeypatch.setattr(agentic_swe, "episode_support_refusal", lambda *a, **kw: None)
     monkeypatch.setattr(agentic_swe, "sandbox_support_refusal", lambda *a, **kw: None)
     monkeypatch.setattr(agentic_swe, "load_turn_renderer", lambda directory, **kw: R)
-    monkeypatch.setattr(agentic_swe, "SignedSweSource", lambda split: SOURCE)
+    monkeypatch.setattr(agentic_swe, "job_signed_source", lambda job: SOURCE)
     monkeypatch.setattr(tasks.SweTaskResolver, "_resolve",
                         lambda self, index: ResolvedTask(testing.FAKE_IMAGE, {}))
     # Job B's wiring fails after its session view was registered.

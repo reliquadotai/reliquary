@@ -391,17 +391,31 @@ class SingleTurnPromptRenderer:
 
 class AgenticSourceSpec:
     """What `resolve_prompt_source` returns for the agentic contract
-    environment: the job's `episode`, buildable into its SWE-smith rows."""
+    environment: the job's `episode`, buildable into its SWE-smith rows. With an
+    eval source (a signed job), its rows are the set's references at the episode's
+    split, read through the bridged env (`agentic_swe.SignedSweSource`)."""
 
     interaction_mode = "agentic"
 
-    def __init__(self, episode: Any) -> None:
+    def __init__(self, episode: Any, prompt_source: str | None = None) -> None:
         self.episode = episode
+        self.prompt_source = prompt_source
 
     def create(self):
         from reliquary.environment import agentic_swe
+        from reliquary.eval.prompt_source import is_eval_source, parse_eval_source
+        from reliquary.eval.rows import row_map
 
-        return agentic_swe.load_swe_source(self.episode.env.num_images)
+        if self.prompt_source is None or not is_eval_source(self.prompt_source):
+            return agentic_swe.load_swe_source(self.episode.env.num_images)
+        try:
+            rows = row_map(self.prompt_source, split=self.episode.env.split, start=0,
+                           count=parse_eval_source(self.prompt_source).count)
+            source = agentic_swe.SignedSweSource(rows)
+            source.check()
+            return source
+        except ValueError as exc:
+            raise CorpusPromptSourceError(str(exc)) from exc
 
 
 class AgenticPromptJob:
@@ -497,7 +511,7 @@ def _resolve_agentic(prompt_source: str, renderer_id: str | None, episode: Any) 
     refusal = agentic_swe.episode_support_refusal(episode, need_verifiers=False)
     if refusal:
         raise CorpusPromptSourceError(refusal)
-    return AgenticSourceSpec(episode)
+    return AgenticSourceSpec(episode, prompt_source)
 
 
 def _owned_position(job: JobSpec, prompt_index: int) -> int:

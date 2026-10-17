@@ -93,8 +93,9 @@ from reliquary_sandbox.attest import (
     issue_session_token, token_sha256, verify_transcript,
 )
 
-from reliquary.corpus.job import is_signed_sandbox, sandbox_split
+from reliquary.corpus.job import is_signed_sandbox
 from reliquary.corpus.signed_reasons import corpus_engagement
+from reliquary.eval.rows import job_row_map
 from reliquary.infrastructure import sandbox_store as _store
 from reliquary.infrastructure.sandbox_store import (
     SESSION_TRANSITIONS, SessionStoreConflict, session_transition_allowed,
@@ -500,8 +501,10 @@ class CorpusEngagements:
         for name, value in task.limits.items():
             if name in budgets:
                 budgets[name] = max(budgets[name], int(value))
+        # The engagement and the reservation name the row; the token names its task.
+        ref = job_row_map(job).ref(index)
         return EngagementTerms(engagement=corpus_engagement(job.job_id, index), env=spec.env,
-                               split=sandbox_split(job.episode), index=index,
+                               split=ref.split, index=ref.index,
                                checkpoint=job.checkpoint_sha256, image=task.image,
                                env_package=spec.env_package, budgets=budgets,
                                job_id=job.job_id, prompt_index=index,

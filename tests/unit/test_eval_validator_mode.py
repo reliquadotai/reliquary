@@ -530,11 +530,19 @@ def test_jobs_create_signed_swe_eval_job(bucket, registry, reference_sets, tmp_p
     monkeypatch.setattr(agentic_swe, "episode_support_refusal", lambda *a, **k: None)
     monkeypatch.setattr(agentic_swe, "load_swe_source", lambda *a, **k: [None] * 100)
     import asyncio
+    from types import SimpleNamespace
 
     from typer.testing import CliRunner
 
     from reliquary.cli.main import app
     from reliquary.corpus.job import is_signed_sandbox
+    from reliquary.environment import bridged_swe
+    from reliquary.eval import rows as eval_rows
+
+    # The set's rows are checked against the bridged env (not installed here).
+    monkeypatch.setattr(bridged_swe, "row_of", lambda split, index: (
+        None, SimpleNamespace(instance_id=f"repo__x-{index}")))
+    eval_rows._row_map.cache_clear()
     from reliquary.eval import prompt_source as ps
     from reliquary.infrastructure import corpus_job_store as job_store
     from reliquary.protocol.agentic_source import AGENTIC_SWE_ENVIRONMENT

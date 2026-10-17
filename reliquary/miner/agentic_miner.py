@@ -535,8 +535,7 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
                             renderer_model_dir=checkpoint_dir,
                             generate_url=f"http://127.0.0.1:{port}", sampling=job.sampling,
                             harness_env=identity.harness_env, max_live=max_live_per_job))
-                from reliquary.corpus.job import sandbox_split
-                from reliquary.environment.agentic_swe import SignedSweSource
+                from reliquary.environment.agentic_swe import job_signed_source
 
                 return await mine_agentic(
                     job=job, identities=identities, client=client, engine=engine, runners={},
@@ -546,7 +545,7 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
                     concurrency=concurrency,
                     precheck=signed_trajectory_precheck(
                         renderer, max_turns=job.episode.max_turns, job=job, tokenizer=tokenizer,
-                        source=SignedSweSource(sandbox_split(job.episode)),
+                        source=job_signed_source(job),
                         chunk_tokens=proof.chunk_tokens))
             runners = {}
             for identity in identities:

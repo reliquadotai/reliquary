@@ -205,20 +205,57 @@ def load_swe_source(num_images: int) -> SweSource:
 class SignedSweSource:
     """The prompts of a signed-sandbox job: the bridged task's prompt
     (`bridged_swe.prompt_of(split, index)`) exactly, with no restricted-network notice
-    (the sandbox bridge runs the harness in a subprocess runtime, which adds none)."""
+    (the sandbox bridge runs the harness in a subprocess runtime, which adds none).
 
-    def __init__(self, split: str, *, prompt_of=None, row_of=None) -> None:
-        self.split = split
+    `rows` is the job's `RowMap` (`reliquary.eval.rows.job_row_map`): row `i` reads
+    `(rows.split, rows.index(i))`, and an eval job's references are checked to rebuild
+    into the instances they name on first use. A split name instead reads row `i` of
+    that split as itself (a training job's SWE-smith rows, by index)."""
+
+    def __init__(self, rows, *, prompt_of=None, row_of=None) -> None:
+        if isinstance(rows, str):
+            self.split, self._rows = rows, None
+        else:
+            self.split, self._rows = rows.split, rows
         self._prompt_of = prompt_of
         self._row_of = row_of
+        self._checked = self._rows is None
+        self._check_lock = threading.Lock()
         self._prompts = functools.lru_cache(maxsize=4096)(self._prompt)
         self._instance_ids = functools.lru_cache(maxsize=4096)(self._instance_id)
+
+    def __len__(self) -> int:
+        """The job's rows with a map; the split's rows the bridge serves without one."""
+        if self._rows is not None:
+            return len(self._rows)
+        from reliquary.environment.bridged_swe import split_length
+
+        return split_length(self.split)
+
+    def __bool__(self) -> bool:
+        return True                                   # `source or default`: never a length read
+
+    def check(self) -> None:
+        """That every row's reference rebuilds into the instance it names (ValueError
+        naming the first that does not); once, and nothing to check without a map."""
+        if self._checked:
+            return
+        with self._check_lock:
+            if not self._checked:
+                self._rows.check_instances(self._source_instance_id)
+                self._checked = True
+
+    def _index(self, index: int) -> int:
+        if self._rows is None:
+            return int(index)
+        self.check()
+        return self._rows.index(int(index))
 
     def _prompt(self, index: int) -> str:
         prompt_of = self._prompt_of
         if prompt_of is None:
             from reliquary.environment.bridged_swe import prompt_of
-        return prompt_of(self.split, index)
+        return prompt_of(self.split, self._index(index))
 
     def prompt(self, index: int) -> str:
         return self._prompts(int(index))
@@ -227,13 +264,33 @@ class SignedSweSource:
         return self._instance_ids(int(index))
 
     def _instance_id(self, index: int) -> str:
+        return self._source_instance_id(self.split, self._index(index))
+
+    def _source_instance_id(self, split: str, index: int) -> str:
         row_of = self._row_of
         if row_of is None:
             from reliquary.environment.bridged_swe import row_of
-        return row_of(self.split, int(index))[1].instance_id
+        return row_of(split, int(index))[1].instance_id
 
     def task_for(self, index: int) -> EpisodeTask:
         return EpisodeTask(id=self.instance_id(index), prompt=self.prompt(index), tools=())
+
+
+def job_signed_source(job, *, prompt_of=None, row_of=None) -> SignedSweSource:
+    """The one source of a signed-sandbox job, for its intake, grader, export and miner.
+
+    An eval job (its prompt source names a frozen set of row references) maps row `i`
+    to the set's `i`-th reference at the set's split, and is checked here against the
+    bridged env (ValueError on a stale set). Any other job keeps its split's rows by
+    index, as before."""
+    from reliquary.eval.prompt_source import is_eval_source
+    from reliquary.eval.rows import job_row_map
+
+    if not is_eval_source(job.prompt_source):
+        return SignedSweSource(job.episode.env.split, prompt_of=prompt_of, row_of=row_of)
+    source = SignedSweSource(job_row_map(job), prompt_of=prompt_of, row_of=row_of)
+    source.check()
+    return source
 
 
 def installed_env_package(package: str) -> str:
@@ -248,7 +305,8 @@ def installed_env_package(package: str) -> str:
 
 def sandbox_support_refusal(episode, *, need_bridge: bool = False) -> str | None:
     """Why this process cannot serve a signed-sandbox `episode`, or None:
-    SWE-smith at the 20 images the bridge serves, reliquary-sandbox at the job's commit,
+    SWE-smith at the 20 images the bridge serves (a `train` job; an eval job's split is
+    served at its own count), reliquary-sandbox at the job's commit,
     the env package at the exact version and code digest record 0 will carry, and the
     verifiers bridge (always: every process reads the task through it; `need_bridge` is
     kept for callers), which must load the installed package (an editable install is
@@ -263,7 +321,9 @@ def sandbox_support_refusal(episode, *, need_bridge: bool = False) -> str | None
         return str(exc)
     from reliquary.corpus.job import BRIDGED_SWESMITH_IMAGES
 
-    if getattr(episode.env, "num_images", BRIDGED_SWESMITH_IMAGES) != BRIDGED_SWESMITH_IMAGES:
+    if (getattr(episode.env, "split", "train") == "train"
+            and getattr(episode.env, "num_images", BRIDGED_SWESMITH_IMAGES)
+            != BRIDGED_SWESMITH_IMAGES):
         return (f"a signed reliquary-swe job serves SWE-smith at its default "
                 f"{BRIDGED_SWESMITH_IMAGES} images (the split the bridge serves)")
     refusal = sandbox_support.sandbox_commit_refusal(episode.sandbox.sandbox_commit)

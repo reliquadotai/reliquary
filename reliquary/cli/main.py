@@ -1884,7 +1884,7 @@ def jobs_export(
                 codec = TokenizerCodec(await asyncio.to_thread(
                     load_tokenizer, await asyncio.to_thread(_episode_tokenizer_dir, job)))
             else:
-                from reliquary.corpus.job import is_signed_sandbox, sandbox_split
+                from reliquary.corpus.job import is_signed_sandbox
 
                 signed_job = is_signed_sandbox(job)
                 tokenizer_dir = await asyncio.to_thread(_episode_tokenizer_dir, job)
@@ -1892,9 +1892,16 @@ def jobs_export(
                 renderer = await asyncio.to_thread(
                     agentic_swe.load_turn_renderer, tokenizer_dir,
                     *((job.episode.sandbox.tools,) if signed_job else ()))
-                source = (agentic_swe.SignedSweSource(sandbox_split(job.episode)) if signed_job
-                          else await asyncio.to_thread(agentic_swe.load_swe_source,
-                                                       job.episode.env.num_images))
+                if signed_job:
+                    try:
+                        # A signed eval job's rows through its set, checked against
+                        # the bridged env.
+                        source = await asyncio.to_thread(agentic_swe.job_signed_source, job)
+                    except ValueError as exc:
+                        raise typer.BadParameter(str(exc)) from exc
+                else:
+                    source = await asyncio.to_thread(agentic_swe.load_swe_source,
+                                                     job.episode.env.num_images)
             counts: dict = {}
             rows = episode_rows(job=job, records=BucketRecordStore(), renderer=renderer,
                                 source=source, counts=counts, sft_only=sft,

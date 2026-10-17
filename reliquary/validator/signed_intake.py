@@ -44,13 +44,13 @@ from reliquary_sandbox.attest import GRADING_GRACE_S, Expected, verify_transcrip
 from reliquary_sandbox.observation import TOOLS_VERSIONS
 
 from reliquary.corpus.checks import check_turn_spans
-from reliquary.corpus.job import sandbox_split
 from reliquary.corpus.signed_parse import parse_signed_trajectory
 from reliquary.corpus.signed_reasons import (
     REASON_SANDBOX_EXPIRED, REASON_SANDBOX_SESSION_REUSED, REASON_SANDBOX_STATE_MISMATCH,
     REASON_SANDBOX_TRANSCRIPT, corpus_engagement, session_seen_key, state_matches,
 )
 from reliquary.corpus.trajectory_parse import TrajectoryRefused
+from reliquary.eval.rows import job_row_map
 from reliquary.protocol.toploc import MIN_CHUNK_TOKENS
 from reliquary.validator.agentic_intake import EpisodeIntake, IntakeFacts, IntakeRefusal
 
@@ -144,9 +144,11 @@ class SignedEpisodeIntake(EpisodeIntake):
             return IntakeRefusal("prompt_mismatch", {"got": request.prompt_index})
         episode = self._job.episode
         spec = episode.sandbox
+        # The engagement names the row; the session token names the task it runs.
+        task = job_row_map(self._job).ref(request.prompt_index)
         expected = Expected(hotkey=request.miner_hotkey,
                             engagement=corpus_engagement(self._job.job_id, request.prompt_index),
-                            env=spec.env, split=sandbox_split(episode), index=request.prompt_index,
+                            env=spec.env, split=task.split, index=task.index,
                             checkpoint=self._job.checkpoint_sha256,
                             seen_session_ids=self._seen(), require_graded=True)
         result = verify_transcript(trajectory.transcript, directory, self._tokens, expected)
@@ -222,8 +224,12 @@ def build_signed_episode_intake(job, *, checkpoint_dir: str, tokenizer, vocab_si
                or agentic_swe.sandbox_support_refusal(job.episode))
     if refusal:
         raise ValueError(f"job {job.job_id!r}: {refusal}")
+    try:
+        source = agentic_swe.job_signed_source(job)    # an eval set checked against the bridge
+    except ValueError as exc:
+        raise ValueError(f"job {job.job_id!r}: {exc}") from exc
     return SignedEpisodeIntake(
-        job=job, source=agentic_swe.SignedSweSource(sandbox_split(job.episode)),
+        job=job, source=source,
         renderer=agentic_swe.load_turn_renderer(checkpoint_dir, tools=job.episode.sandbox.tools),
         tokenizer=tokenizer, vocab_size=vocab_size, chunk_tokens=chunk_tokens,
         directory=directory, token_verifier=token_verifier,
