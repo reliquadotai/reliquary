@@ -131,16 +131,16 @@ every episode itself (the suite harness), so there is no grade executor.
 # the set: one source and split, whole or sampled; the card records the environment
 # manifest and its renderer id
 reliquary eval build-set --source reliquary_telecom_solo_v2 --split benchmark \
-  --out sets/telecom-v2-benchmark
+  --set-id telecom-v2-benchmark --out sets/telecom-v2-benchmark
 reliquary eval build-set --source reliquary_telecom_solo_v2 --split eval \
-  --out sets/telecom-v2-eval            # a second set, a second job
+  --set-id telecom-v2-eval --out sets/telecom-v2-eval            # a second set, a second job
 reliquary eval publish-set sets/telecom-v2-benchmark
 ```
 
 The episode file is the manifest's `episode` object for the suite harness
 (`parse_job`, suite branch). `name` is the set's source, `version` the environment's
-64-hex manifest sha256 (from the set card), `split` the set's split, `renderer` the
-environment's renderer id (the card's `renderer_id`); nothing else is accepted:
+64-hex manifest sha256 (`env_manifest` in the set's `set.json`), `split` the set's split, `renderer` the
+environment's renderer id (`renderer_id` in `set.json`); nothing else is accepted:
 
 ```json
 {"env": {"package": "reliquary-suite", "name": "reliquary_telecom_solo_v2",
@@ -180,7 +180,7 @@ reliquary jobs create --fleet-knows-corpus-generation \
   against the RL start checkpoint, evaluated on the same set with the same episode.
 - The headline pass@1 counts missing and ungraded episodes as failures; the
   graded-only figure sits beside it in `report.json`.
-- Stop: `reliquary tasks retire --task-id <job>`, drain and settle, then stop the
+- Stop: `reliquary tasks retire --task-id <job> --retired-at <drand round>`, drain and settle, then stop the
   validator and the Lium card.
 
 ## 8. SWE-bench Verified (signed sandbox)
