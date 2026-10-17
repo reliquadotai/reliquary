@@ -107,3 +107,77 @@ def test_episode_dict_is_not_aliased():
     job = parse_job(copy.deepcopy(raw))
     raw["episode"]["max_turns"] = 1
     assert job.episode.max_turns == 40
+
+
+# -- eval jobs: an episode whose prompt_source names a frozen eval set ------------
+
+EVAL_SOURCE = "eval-set:telecom-bench:50:" + "e" * 64
+SUITE_ENV = "reliquary_stateful_tools_v1"
+
+
+def _suite_manifest(split="train", **overrides):
+    raw = _manifest(with_episode=False, job_id="suite-eval-v1", prompt_source=SUITE_ENV,
+                    prompt_count=50, renderer_id="chatml-v1",
+                    sampling={"temperature": 1.0, "top_p": 1.0, "top_k": 0,
+                              "min_new_tokens": 2, "max_new_tokens": 3072, "n": 1})
+    raw["episode"] = {"env": {"package": "reliquary-suite", "name": SUITE_ENV,
+                              "version": "f" * 64, "split": split},
+                      "harness": "suite", "renderer": "chatml-v1", "max_turns": 8,
+                      "max_tokens_per_turn": 3072, "max_total_tokens": 60000}
+    raw.update(overrides)
+    return raw
+
+
+def _signed(env=None, **overrides):
+    from tests.unit.test_corpus_job_signed_sandbox import signed_episode
+
+    episode = signed_episode(**overrides)
+    if env is not None:
+        episode["env"] = {**episode["env"], **env}
+    return episode
+
+
+def test_suite_eval_job_may_name_any_split():
+    job = parse_job(_suite_manifest(split="benchmark", prompt_source=EVAL_SOURCE))
+    assert job.episode.env.split == "benchmark" and job.prompt_source == EVAL_SOURCE
+    assert parse_job(job.to_contract()) == job
+
+
+def test_suite_non_eval_job_still_train_only():
+    with pytest.raises(JobError, match="split must be 'train'"):
+        parse_job(_suite_manifest(split="eval"))
+    with pytest.raises(JobError, match="prompt_source"):
+        parse_job(_suite_manifest(prompt_source="reliquary_retrieval_tools_v1"))
+
+
+def test_agentic_eval_job_refused():
+    with pytest.raises(JobError, match="an eval job on SWE runs in the signed sandbox"):
+        parse_job(_manifest(prompt_source=EVAL_SOURCE))
+    env = {"package": "reliquary-swe", "version": COMMIT, "split": "benchmark", "num_images": 20}
+    with pytest.raises(JobError, match="an eval job on SWE runs in the signed sandbox"):
+        parse_job(_manifest(prompt_source=EVAL_SOURCE, episode=_episode(env=env)))
+
+
+def test_agentic_non_eval_job_still_train_only():
+    env = {"package": "reliquary-swe", "version": COMMIT, "split": "benchmark", "num_images": 20}
+    with pytest.raises(JobError, match="split must be 'train'"):
+        parse_job(_manifest(episode=_signed(env=env)))
+
+
+def test_signed_eval_job_accepts_eval_source():
+    job = parse_job(_manifest(prompt_source=EVAL_SOURCE, episode=_signed()))
+    assert job.prompt_source == EVAL_SOURCE and job.episode.env.split == "train"
+
+
+def test_signed_eval_job_any_image_count():
+    job = parse_job(_manifest(prompt_source=EVAL_SOURCE,
+                              episode=_signed(env={"split": "eval", "num_images": 500})))
+    assert job.episode.env.split == "eval" and job.episode.env.num_images == 500
+    assert parse_job(job.to_contract()) == job
+
+
+def test_signed_train_job_keeps_twenty_images():
+    with pytest.raises(JobError, match="num_images must be 20"):
+        parse_job(_manifest(episode=_signed(env={"num_images": 19})))
+    with pytest.raises(JobError, match="num_images must be 20"):
+        parse_job(_manifest(prompt_source=EVAL_SOURCE, episode=_signed(env={"num_images": 19})))

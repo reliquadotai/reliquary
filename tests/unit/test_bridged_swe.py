@@ -62,9 +62,13 @@ def test_the_identity_is_the_bridged_one(monkeypatch):
 def test_a_signed_job_names_the_split_the_gateway_serves():
     from reliquary.corpus.job import sandbox_split
 
-    assert sandbox_split(types.SimpleNamespace(env=types.SimpleNamespace(num_images=20))) == "train"
+    def episode(split, num_images):
+        return types.SimpleNamespace(env=types.SimpleNamespace(split=split, num_images=num_images))
+
+    assert sandbox_split(episode("train", 20)) == "train"
     with pytest.raises(ValueError, match="20"):
-        sandbox_split(types.SimpleNamespace(env=types.SimpleNamespace(num_images=10)))
+        sandbox_split(episode("train", 10))
+    assert sandbox_split(episode("benchmark", 500)) == "benchmark"   # an eval job's own split
 
 
 def test_the_bridged_env_is_built_with_the_gateway_options(monkeypatch):
