@@ -2997,7 +2997,7 @@ def corpus_mine_agentic(
         HttpCorpusClient,
         submits_scoped,
     )
-    from reliquary.miner.suite_episode import is_suite_episode, suite_support_refusal
+    from reliquary.miner.suite_episode import is_suite_episode, suite_support
     from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
     from reliquary.protocol.signatures import sign_corpus_submission
     from reliquary.shared.modeling import load_tokenizer
@@ -3033,11 +3033,11 @@ def corpus_mine_agentic(
         except (ValueError, CorpusJobSelectionError) as exc:
             typer.echo(f"error: the eval job's prompts are unusable: {exc}", err=True)
             raise typer.Exit(code=2) from exc
-    sessions = None
+    sessions = source = None
     signed = False
     if is_suite_episode(job.episode):
         # No verifiers, Docker or network: only the pinned environment wheel.
-        refusal = suite_support_refusal(job)
+        refusal, source = suite_support(job)
         if refusal:
             typer.echo(f"error: refusing to mine: {refusal}", err=True)
             raise typer.Exit(code=4)
@@ -3085,7 +3085,7 @@ def corpus_mine_agentic(
         job=job, checkpoint_dir=directory, proof=proof, tokenizer=load_tokenizer(directory),
         identities=[identity], client=client, concurrency=concurrency, port=port,
         gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs,
-        sessions=sessions, max_live_per_job=max_live_per_job))
+        sessions=sessions, max_live_per_job=max_live_per_job, source=source))
     typer.echo({hotkey_: dict(c) for hotkey_, c in counts.items()})
     halted = [hotkey_ for hotkey_, c in counts.items()
               if c.get("halted") or c.get("identity_crashed")]

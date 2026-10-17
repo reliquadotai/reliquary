@@ -18,6 +18,7 @@ import secrets
 from collections.abc import Callable
 
 from reliquary.corpus.suite_episode import (
+    SuiteSource,
     episode_seed,
     job_suite_source,
     replay_outcome,
@@ -43,8 +44,9 @@ def is_suite_episode(episode) -> bool:
     return bool(getattr(episode, "is_suite", False))
 
 
-def suite_support_refusal(job) -> str | None:
-    """Why this miner cannot run the suite ``job``, or None: the validator's
+def suite_support(job) -> tuple[str | None, SuiteSource | None]:
+    """``(refusal, None)`` when this miner cannot run the suite ``job``, else
+    ``(None, source)``: the job's one source, for its runner. The validator's
     own refusals (registry, manifest pin, renderer, turn limit), then the
     installed wheel must be the artifact that manifest pins, and the job's
     source must build (for an eval job: its rows registered, at its split,
@@ -54,19 +56,23 @@ def suite_support_refusal(job) -> str | None:
     episode = job.episode
     refusal = suite_spec_refusal(episode)
     if refusal:
-        return refusal
+        return refusal, None
     spec = suite_spec(episode)
     if spec.external_distribution is not None:
         try:
             verify_external_artifact(spec)
         except (ValueError, TypeError) as exc:
             return (f"{spec.name} needs the {spec.external_distribution} wheel at manifest "
-                    f"{episode.env.version}: {exc}")
+                    f"{episode.env.version}: {exc}"), None
     try:
-        job_suite_source(job)
+        return None, job_suite_source(job)
     except (ValueError, RuntimeError, TypeError) as exc:
-        return str(exc)
-    return None
+        return str(exc), None
+
+
+def suite_support_refusal(job) -> str | None:
+    """Why this miner cannot run the suite ``job``, or None (``suite_support``)."""
+    return suite_support(job)[0]
 
 
 def suite_stop_ids(encode: Callable[[str], list[int]]) -> list[int]:
@@ -232,15 +238,14 @@ class SuiteEpisodeRunner:
         if prompt != self.initial_ids(prompt_index) \
                 or self._decode(prompt) != self._source.initial_text(prompt_index):
             return "prompt_mismatch", {"why": "the first turn's prompt is not the task's"}
+        # This runner's environment is built at the job's split already.
         kwargs = replay_kwargs(self._job, self._source, prompt_index=prompt_index,
                                prompt_ids=prompt, tokens=list(built.tokens),
-                               spans=list(built.spans), stop=built.stop)
-        # This runner's environment is built at that split already.
-        kwargs.pop("split")
+                               spans=list(built.spans), stop=built.stop, with_split=False)
         outcome = replay_outcome(self._environment, encode=self._encode, decode=self._decode,
                                  **kwargs)
         return outcome.refusal
 
 
-__all__ = ["SuiteEpisodeRunner", "is_suite_episode", "suite_stop_ids", "suite_support_refusal",
-           "trajectory_checks_refusal"]
+__all__ = ["SuiteEpisodeRunner", "is_suite_episode", "suite_stop_ids", "suite_support",
+           "suite_support_refusal", "trajectory_checks_refusal"]
