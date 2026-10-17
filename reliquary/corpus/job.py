@@ -587,6 +587,11 @@ def _check_episode_job(job: JobSpec) -> None:
                            "replay_fraction_failed must be 0")
         if episode.sandbox.budgets.max_calls < episode.max_turns:
             raise JobError("episode.sandbox.budgets.max_calls must be at least episode.max_turns")
+        if is_eval_source(job.prompt_source) and episode.env.split == "train":
+            # A release that predates evals checks a signed job's split, not its
+            # prompt_source: on `train` it would mine the identity rows, the wrong tasks.
+            raise JobError("an eval job on the signed sandbox names its set's split, never "
+                           "'train', so a release that predates evals refuses it")
         if episode.env.split == "train" and episode.env.num_images != BRIDGED_SWESMITH_IMAGES:
             raise JobError(f"a signed_sandbox job serves SWE-smith at the "
                            f"{BRIDGED_SWESMITH_IMAGES} images the bridge serves: "

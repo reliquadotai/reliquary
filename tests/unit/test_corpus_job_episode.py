@@ -165,8 +165,16 @@ def test_agentic_non_eval_job_still_train_only():
 
 
 def test_signed_eval_job_accepts_eval_source():
-    job = parse_job(_manifest(prompt_source=EVAL_SOURCE, episode=_signed()))
-    assert job.prompt_source == EVAL_SOURCE and job.episode.env.split == "train"
+    job = parse_job(_manifest(prompt_source=EVAL_SOURCE,
+                              episode=_signed(env={"split": "benchmark"})))
+    assert job.prompt_source == EVAL_SOURCE and job.episode.env.split == "benchmark"
+
+
+def test_signed_eval_job_never_names_train():
+    # A release that predates evals would mine the identity rows of `train`.
+    for env in ({}, {"num_images": 19}):
+        with pytest.raises(JobError, match="never 'train'"):
+            parse_job(_manifest(prompt_source=EVAL_SOURCE, episode=_signed(env=env)))
 
 
 def test_signed_eval_job_any_image_count():
@@ -179,5 +187,3 @@ def test_signed_eval_job_any_image_count():
 def test_signed_train_job_keeps_twenty_images():
     with pytest.raises(JobError, match="num_images must be 20"):
         parse_job(_manifest(episode=_signed(env={"num_images": 19})))
-    with pytest.raises(JobError, match="num_images must be 20"):
-        parse_job(_manifest(prompt_source=EVAL_SOURCE, episode=_signed(env={"num_images": 19})))

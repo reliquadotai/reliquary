@@ -40,11 +40,11 @@ class RowMap:
     ``[start, start + count)`` or a tuple of ``(index, instance_id)``, one per row
     from 0."""
 
-    __slots__ = ("split", "_start", "_count", "_refs")
+    __slots__ = ("_split", "_start", "_count", "_refs")
 
     def __init__(self, split: str, start: int, count: int,
                  refs: tuple[tuple[int, str], ...] | None) -> None:
-        self.split = split
+        self._split = split
         self._start = start
         self._count = count
         self._refs = refs
@@ -69,13 +69,20 @@ class RowMap:
         return cls(splits.pop(), 0, len(refs),
                    tuple((index, instance_id) for _, index, instance_id in refs))
 
+    @property
+    def split(self) -> str:
+        """Read-only: one map is shared by every caller in the process."""
+        return self._split
+
     def __len__(self) -> int:
         return self._count
 
     def ref(self, prompt_index: int) -> TaskRef:
         """The task row ``prompt_index`` runs; IndexError outside the map."""
+        if type(prompt_index) is not int:
+            raise IndexError(f"row {prompt_index!r} is not a row number")
         offset = prompt_index - self._start
-        if type(prompt_index) is not int or not 0 <= offset < self._count:
+        if not 0 <= offset < self._count:
             raise IndexError(f"row {prompt_index!r} is outside the job's rows "
                              f"[{self._start}, {self._start + self._count})")
         if self._refs is None:

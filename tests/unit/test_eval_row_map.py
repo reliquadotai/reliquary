@@ -66,6 +66,12 @@ def test_from_rows_maps_row_to_reference():
         m.ref(3)
     with pytest.raises(IndexError):
         m.ref(-1)
+    with pytest.raises(IndexError):
+        m.ref("1")
+    with pytest.raises(IndexError):
+        m.ref(True)
+    with pytest.raises(AttributeError):
+        m.split = "train"
 
 
 def test_from_rows_refuses_mixed_splits():
