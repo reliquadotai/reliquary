@@ -493,16 +493,48 @@ class RlSubmissions:
         return done
 
     # --- the trainer's report (P4) ------------------------------------------------------------------------
+    def _rewards_hold(self, group, substitutions) -> bool:
+        """The reward re-check: every rollout with suspect mismatches (``substitutions[i]``: (completion position,
+        the trainer's pick), gap over ``RL_SUBSTITUTE_GAP``) is graded again with the picks there; any reward that
+        moves means the tokens were chosen for the reward. Only the first position of a run of consecutive suspects
+        is substituted: the picks after it were drawn under the miner's prefix. Episodes are not re-graded (their
+        reward is the environment's record; the gap test covers them)."""
+        changed = []
+        for i, pairs in enumerate(substitutions or ()):
+            if not pairs or group.spans is not None:
+                continue
+            tokens, previous = list(group.completions[i]), None
+            for position, pick in sorted((int(p), int(t)) for p, t in pairs):
+                if previous != position - 1 and 0 <= position < len(tokens):
+                    tokens[position] = pick
+                previous = position
+            changed.append((i, Rollout(tuple(tokens), group.force_spans[i])))
+        if not changed:
+            return True
+        graded = self.grader.grade(group.environment, group.prompt_idx, [r for _, r in changed])
+        return not graded.reject and all(abs(float(graded.rewards[k]) - float(group.rewards[i])) < 1e-9
+                                         for k, (i, _) in enumerate(changed))
+
     def report_training(self, lease_id: str, *, rollout_match: Sequence[float], accepted: bool,
                         failure_class: str | None = None, matched_tokens: Sequence[int] | None = None,
+                        substitutions: Sequence[Sequence[tuple[int, int]]] | None = None,
                         now: float | None = None) -> None:
         """The trainer's forward judged a buffered group: ``rollout_match`` per rollout (match rate against the
         published checkpoint, §4.6), ``accepted`` the group verdict. An accepted group is payable (P5 pays the
         matched tokens of rollouts above the floor); a rejected one is unpaid and, when ``failure_class`` says the
         rejection is evidence (not staleness from waiting in the buffer), sanctioned like a failed audit.
         ``matched_tokens``: per rollout, the positions equal to the validator's pick (what P5 pays); without it the
-        ledger uses ``floor(match x completion tokens)``. LookupError: not a buffered group."""
+        ledger uses ``floor(match x completion tokens)``. ``substitutions``: per rollout, the suspect mismatches
+        (``_rewards_hold``); an accepted group whose rewards move is reported untrained, unsanctioned
+        (``reward_moved``), so it is not paid. LookupError: not a buffered group."""
         now = float(self.clock()) if now is None else now
+        moved = False
+        if accepted and substitutions:
+            pending = self.buffer.get(lease_id)
+            if pending is not None and len(substitutions) != len(pending.completions):
+                raise ValueError("one substitution list per rollout")
+            moved = pending is not None and not self._rewards_hold(pending, substitutions)
+            accepted = accepted and not moved
         with self.book.transaction():
             group = self.buffer.get(lease_id)
             if group is None or not self.buffer._remove(lease_id):
@@ -521,6 +553,8 @@ class RlSubmissions:
                       "checkpoint": group.checkpoint, "environment": group.environment}
             if matched_tokens is not None:
                 detail["matched_tokens"] = [int(n) for n in matched_tokens]
+            if moved:
+                detail["reward_moved"] = True
             if accepted:
                 self._event(lease_id, group.hotkey, TRAINED, now, detail)
                 self._verdict(lease_id, group.hotkey, "training", True, None, False, now)

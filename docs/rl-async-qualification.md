@@ -85,6 +85,9 @@ proof-worker images; signer, proof worker, controller in that order).
 | `RL_GROUP_MATCH_FLOOR` | 0.90 | Q2 |
 | `RL_FORGERY_MATCH_FLOOR` | 0.5 | Q2 (honest p0.001 on the worst card) |
 | `RL_SANCTION_MAX_LAG` | 2 checkpoints | Q2, Q5 (honest match vs lag) |
+| `RL_GAP_TOLERANCE` | 8.0 (honest gaps grow with lag) | Q5: logged `async/gap_*` at the real lag |
+| `RL_SUBSTITUTE_GAP` | 3.0 (re-grade threshold) | Q5: re-grade rate vs honest moved rewards |
+| `RL_TERMINAL_MIN_P`, `RL_TERMINAL_GAP` | 0.01, 1.0 (final EOS) | Q5: `async/rollouts_bad_termination` at real lag |
 | `RL_FIRST_SCAN_MIN_TOKENS` | 1024 | Q5 |
 | `HOTKEY_MAX_OPEN` | 64 open leases | Q5 (Sybil, squatter) |
 | `MAX_GRADING_PER_HOTKEY`, submit reads | 2; 8 total, 2 per hotkey | Q5 |

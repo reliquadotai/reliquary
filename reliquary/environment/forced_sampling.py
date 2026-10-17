@@ -293,6 +293,16 @@ def gumbel_argmax(logits: torch.Tensor, keys: torch.Tensor) -> tuple[torch.Tenso
     return gumbel_argmax_reference(logits, keys)
 
 
+def gumbel_gaps(logits: torch.Tensor, draws: list[float], tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The Gumbel picks of ``logits`` [n, vocab] and, per row, how far ``tokens`` [n] is from being the pick: the best
+    score minus the token's score (``s = logit + G``), 0 where the token is the pick."""
+    keys = _gumbel_keys(draws, logits.device)
+    picks, best = gumbel_argmax(logits, keys)
+    tokens = tokens.to(logits.device)
+    own = logits.float().gather(1, tokens[:, None])[:, 0] + gumbel_noise_from_bits(_splitmix_bits(keys, tokens))
+    return picks, torch.where(picks == tokens, torch.zeros_like(best), (best - own).clamp_min(0.0))
+
+
 def pick_rows(logits: torch.Tensor, draws: list[float], *, draw: str = DRAW_INVERSE_CDF,
               t: float = 1.0, top_k: int = 0, top_p: float = 1.0) -> torch.Tensor:
     """The forced pick of each row of ``logits`` [n, vocab] for its public uniform ``draws[i]``,

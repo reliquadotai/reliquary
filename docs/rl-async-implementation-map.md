@@ -1135,7 +1135,12 @@ the controller (both are additive; the transport hash changes with this release 
   micro-batch the substitution forward gives v* and per-rollout tallies (stochastic / drawn, matches); pi_old :=
   the policy (ratio 1); rollouts under `RL_ROLLOUT_MATCH_FLOOR` (constants, 0.95 placeholder; the ledger's floor)
   leave the loss before the backward. Rollout match = rate on stochastic positions when >= 20 of them, else on
-  every drawn position. After all micro-batches `DrawGate.judge` pools each group (FSDP2: tallies all-reduced) at
+  every drawn position. The forward also gives each mismatch's Gumbel gap (`forced_sampling.gumbel_gaps`): a
+  rollout with a gap over `gap_tolerance` (`RL_GAP_TOLERANCE`) leaves the loss too, and its mismatches over
+  `substitute_gap` (`RL_SUBSTITUTE_GAP`) go with the report as `substitutions` (FSDP2: all-gathered in `judge`);
+  `RlSubmissions.report_training` re-grades those rollouts with the picks (`_rewards_hold`) and reports a group
+  whose reward moved untrained, unsanctioned (`reward_moved`). Telemetry `async/gap_max`, `rollouts_gap_over_*`,
+  `rollouts_regraded`. After all micro-batches `DrawGate.judge` pools each group (FSDP2: tallies all-reduced) at
   `ASYNC_GROUP_FLOOR` 0.90 (placeholder: one noisy honest rollout of 16 survives, two bad ones do not; one under
   `ASYNC_FORGERY_FLOOR` 0.5 rejects the group whatever the pool); a failed group's
   admitted rollouts are backed out by a second pass with negated advantages (exact up to bf16 noise; only failed

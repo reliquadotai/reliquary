@@ -50,9 +50,13 @@ from typing import Any
 
 from reliquary.constants import (
     RL_FORGERY_MATCH_FLOOR,
+    RL_GAP_TOLERANCE,
     RL_GROUP_MATCH_FLOOR,
     RL_ROLLOUT_MATCH_FLOOR,
     RL_SANCTION_MAX_LAG,
+    RL_SUBSTITUTE_GAP,
+    RL_TERMINAL_GAP,
+    RL_TERMINAL_MIN_P,
 )
 from reliquary.protocol.rl_draw import pooled_rate, rollout_rate
 from reliquary.services.exploration import AUDIT_FAILURE_STATISTICAL
@@ -75,38 +79,60 @@ ASYNC_FORGERY_FLOOR = RL_FORGERY_MATCH_FLOOR
 class _Replay:
     """The gate of the back-out pass: same ratio-1 loss, every rollout admitted, nothing recorded."""
 
-    def admit(self, rollouts, tallies):
+    def admit(self, rollouts, tallies, suspects=None):
         return None
 
 
 class DrawGate:
     """Per-step verification state, carried through ``train_step`` (picklable: the FSDP2 followers get a copy and
     ``judge`` all-reduces the tallies, so every rank decides the same groups). Rollouts are known by
-    ``_async_slot``; ``groups[g]`` lists group g's slots."""
+    ``_async_slot``; ``groups[g]`` lists group g's slots.
+
+    A rollout is admitted when its match reaches ``rollout_floor`` and none of its tokens is further than
+    ``gap_tolerance`` from the pick (``RL_GAP_TOLERANCE``), and, when it ends on one of ``eos_ids`` (not an
+    episode), that EOS has the verifier's probability ``terminal_min_p`` and a gap of at most ``terminal_gap``: a
+    cut-short rollout keeps no trace for the re-grade. Its mismatches over ``substitute_gap`` are kept
+    (``substitutions``): the validator re-grades the rollout with the trainer's picks there."""
 
     def __init__(self, groups: list[list[int]], *, rollout_floor: float = ASYNC_ROLLOUT_FLOOR,
-                 group_floor: float = ASYNC_GROUP_FLOOR, forgery_floor: float = ASYNC_FORGERY_FLOOR) -> None:
+                 group_floor: float = ASYNC_GROUP_FLOOR, forgery_floor: float = ASYNC_FORGERY_FLOOR,
+                 gap_tolerance: float = RL_GAP_TOLERANCE, substitute_gap: float = RL_SUBSTITUTE_GAP,
+                 terminal_min_p: float = RL_TERMINAL_MIN_P, terminal_gap: float = RL_TERMINAL_GAP,
+                 eos_ids=()) -> None:
         self.groups = [list(g) for g in groups]
         self.rollout_floor, self.group_floor = float(rollout_floor), float(group_floor)
         self.forgery_floor = float(forgery_floor)
+        self.gap_tolerance, self.substitute_gap = float(gap_tolerance), float(substitute_gap)
+        self.terminal_min_p, self.terminal_gap = float(terminal_min_p), float(terminal_gap)
+        self.eos_ids = frozenset(int(t) for t in eos_ids)
         self.extra: dict[str, float] = {}
         self.reset()
 
     def reset(self) -> None:
         n = sum(len(g) for g in self.groups)
         self.tallies = [[0, 0, 0, 0] for _ in range(n)]
+        self.max_gap = [0.0] * n
+        self.substitutions: list[list[tuple[int, int]]] = [[] for _ in range(n)]
         self.forwarded = [0] * n
+        self.bad_terminal = [0] * n
         self.admitted = [0] * n
         self.accepted: list[bool] | None = None
         self.undone = 0
 
-    def admit(self, rollouts, tallies) -> list[bool]:
+    def admit(self, rollouts, tallies, suspects=None) -> list[bool]:
         out = []
-        for rollout, tally in zip(rollouts, tallies):
+        for i, (rollout, tally) in enumerate(zip(rollouts, tallies)):
             slot = int(rollout._async_slot)
             self.tallies[slot] = [int(v) for v in tally]
             self.forwarded[slot] = 1
-            ok = rollout_rate(tally) >= self.rollout_floor
+            if suspects is not None:
+                self.max_gap[slot], self.substitutions[slot] = float(suspects[i][0]), list(suspects[i][1])
+                tokens, meta = rollout.commit["tokens"], rollout.commit.get("rollout", {})
+                end = suspects[i][2] if len(suspects[i]) > 2 else None
+                if end is not None and tokens and int(tokens[-1]) in self.eos_ids and "episode" not in meta:
+                    self.bad_terminal[slot] = int(end[1] < self.terminal_min_p or end[0] > self.terminal_gap)
+            ok = (rollout_rate(tally) >= self.rollout_floor and self.max_gap[slot] <= self.gap_tolerance
+                  and not self.bad_terminal[slot])
             self.admitted[slot] = int(ok)
             out.append(ok)
         return out
@@ -132,12 +158,20 @@ class DrawGate:
 
             from reliquary.trainer.distributed import all_reduce_tensor_sum
 
-            flat = torch.tensor([t + [f, a] for t, f, a in zip(self.tallies, self.forwarded, self.admitted)],
+            flat = torch.tensor([t + [f, a, m, b] for t, f, a, m, b in zip(self.tallies, self.forwarded,
+                                                                            self.admitted, self.max_gap,
+                                                                            self.bad_terminal)],
                                 dtype=torch.float64, device=dist.device)
-            rows = all_reduce_tensor_sum(flat).cpu().tolist()
+            rows = all_reduce_tensor_sum(flat).cpu().tolist()      # each slot is forwarded on one rank only
             self.tallies = [[int(v) for v in row[:4]] for row in rows]
             self.forwarded = [int(row[4]) for row in rows]
             self.admitted = [int(row[5]) for row in rows]
+            self.max_gap = [float(row[6]) for row in rows]
+            self.bad_terminal = [int(row[7]) for row in rows]
+            if torch.distributed.is_initialized():
+                every = [None] * torch.distributed.get_world_size()
+                torch.distributed.all_gather_object(every, self.substitutions)
+                self.substitutions = [[pair for rank in every for pair in rank[s]] for s in range(len(self.tallies))]
         self.accepted = [any(self.admitted[s] for s in slots) and self.pooled(g) >= self.group_floor
                          and not self.forged(g) for g, slots in enumerate(self.groups)]
         undo = []
@@ -154,9 +188,16 @@ class DrawGate:
 
     def metrics(self) -> dict[str, float]:
         forwarded = sum(self.forwarded)
+        gaps = [g for g, f in zip(self.max_gap, self.forwarded) if f]
         out = {"async/rollouts_forwarded": forwarded,
                "async/rollouts_below_floor": forwarded - sum(self.admitted),
-               "async/groups_undone": self.undone}
+               "async/groups_undone": self.undone,
+               "async/gap_max": max(gaps, default=0.0),
+               "async/rollouts_over_gap_tolerance": sum(g > self.gap_tolerance for g in gaps),
+               "async/rollouts_bad_termination": sum(self.bad_terminal),
+               "async/rollouts_regraded": sum(bool(s) for s in self.substitutions),
+               "async/substituted_tokens_regraded": sum(len(s) for s in self.substitutions),
+               **{f"async/rollouts_gap_over_{e}": sum(g > e for g in gaps) for e in (1, 2, 4, 8)}}
         if self.accepted is not None:
             out["async/groups_accepted"] = sum(self.accepted)
             out["async/groups_rejected"] = len(self.accepted) - sum(self.accepted)
@@ -224,6 +265,11 @@ class AsyncTrainerConfig:
     rollout_floor: float = ASYNC_ROLLOUT_FLOOR
     group_floor: float = ASYNC_GROUP_FLOOR
     forgery_floor: float = ASYNC_FORGERY_FLOOR
+    gap_tolerance: float = RL_GAP_TOLERANCE         # a token further than this from the pick: rollout refused
+    substitute_gap: float = RL_SUBSTITUTE_GAP       # mismatches beyond this are re-graded with the pick
+    terminal_min_p: float = RL_TERMINAL_MIN_P       # the final EOS's probability under the verifier
+    terminal_gap: float = RL_TERMINAL_GAP           # and its gap
+    eos_ids: tuple[int, ...] = ()                   # the model's stop tokens (the termination test's subject)
     max_lag: int = SECRET_REVEAL_LAG         # no quality cap (the floor decides); bounds the buffer only
     sanction_max_lag: int = RL_SANCTION_MAX_LAG   # a failed group this fresh is evidence (the audit's rule too)
     poll_s: float = 0.5                      # while the batch is not full
@@ -338,7 +384,9 @@ class AsyncTrainer:
             slot += len(group.completions)
         gate = DrawGate([[r._async_slot for r in g.rollouts] for g in batch],
                         rollout_floor=self.config.rollout_floor, group_floor=self.config.group_floor,
-                        forgery_floor=self.config.forgery_floor)
+                        forgery_floor=self.config.forgery_floor, gap_tolerance=self.config.gap_tolerance,
+                        substitute_gap=self.config.substitute_gap, terminal_min_p=self.config.terminal_min_p,
+                        terminal_gap=self.config.terminal_gap, eos_ids=self.config.eos_ids)
         envs: dict[str, int] = {}
         for group in submitted:
             envs[group.environment] = envs.get(group.environment, 0) + 1
@@ -398,7 +446,8 @@ class AsyncTrainer:
             if gate.accepted is not None and gate.accepted[g]:
                 matched = [gate.tallies[s][3] if gate.admitted[s] else 0 for s in slots]
                 self.submissions.report_training(group.lease_id, rollout_match=match, accepted=True,
-                                                 matched_tokens=matched)
+                                                 matched_tokens=matched,
+                                                 substitutions=[gate.substitutions[s] for s in slots])
                 trained[group.environment] = trained.get(group.environment, 0) + sum(matched)
                 continue
             forwarded = any(gate.forwarded[s] for s in slots)

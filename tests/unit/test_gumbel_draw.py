@@ -209,3 +209,17 @@ def test_gpu_uniform_bits_are_bit_identical_to_cpu_and_picks_agree():
     logits, us = _honest_rows(32, 248320)
     assert torch.equal(fs.pick_rows(logits, us, draw=fs.DRAW_GUMBEL_MAX),
                        fs.pick_rows(logits.cuda(), us, draw=fs.DRAW_GUMBEL_MAX).cpu())
+
+
+def test_gumbel_gaps_are_the_score_shortfall_of_the_submitted_token():
+    logits, us = _honest_rows(3, 50, scale=1.0)
+    keys = torch.tensor([fs.gumbel_key(u) for u in us])
+    scores = logits.float() + fs.gumbel_noise(keys, torch.arange(50))
+    best = scores.argmax(-1)
+    runner_up = scores.argsort(-1, descending=True)[:, 1]
+    tokens = torch.stack([best[0], runner_up[1], torch.tensor(7)])
+    picks, gaps = fs.gumbel_gaps(logits, us, tokens)
+    assert picks.tolist() == fs.pick_rows(logits, us, draw=fs.DRAW_GUMBEL_MAX).tolist() == best.tolist()
+    assert gaps[0] == 0.0                                                    # the pick itself
+    assert gaps[1] == pytest.approx(float(scores[1, best[1]] - scores[1, runner_up[1]]), abs=1e-5)
+    assert gaps[2] == pytest.approx(float(scores[2].max() - scores[2, 7]), abs=1e-5)

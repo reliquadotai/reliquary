@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import threading
+import zlib
 from types import SimpleNamespace
 
 import pytest
@@ -90,7 +91,7 @@ def submitted(model, lease, env="math", k=3, arrived=0.0, forged=(), rewards=Non
                           nonce="cd" * 32, arrived_at=arrived, rewards=tuple(rewards or [1.0, 0.0] * (ROLLOUTS // 2)),
                           truncated=(False,) * ROLLOUTS, prompt_tokens=(1, 2, 3),
                           completions=tuple((0,) * n for _ in range(ROLLOUTS)), force_spans=(None,) * ROLLOUTS)
-    gen = torch.Generator().manual_seed(hash(lease) % 1000)
+    gen = torch.Generator().manual_seed(zlib.crc32(lease.encode()) % 1000)
     completions = []
     for i in range(ROLLOUTS):
         us, tokens = base.draw_uniforms(i), [3]
@@ -321,3 +322,46 @@ def test_one_wandb_row_per_step_with_the_step_timings(monkeypatch):
     assert "train/lr" in row and row["async/groups_accepted"] == 2
     assert {"async/wait_s", "async/train_s", "async/step_s", "async/snapshot_s", "async/publish_wait_s"} <= set(row)
     assert row["async/completion_tokens"] == 2 * ROLLOUTS * N_TOK
+
+
+def test_the_gate_refuses_a_token_far_from_the_pick_and_keeps_the_suspects_for_the_regrade():
+    """Every mismatch carries its Gumbel gap: over ``gap_tolerance`` the rollout leaves the loss and the pay; over
+    ``substitute_gap`` the (position, pick) goes to the validator, which grades the rollout again with it."""
+    model = _Model()
+    group = training_group(submitted(model, "g", noisy={3}), slot0=0, index=0)
+    plan = [(group, [1.0, -1.0, 1.0, -1.0], 1.0 / (ROLLOUTS * N_TOK))]
+    lenient = DrawGate([[0, 1, 2, 3]], rollout_floor=0.0, group_floor=0.0, forgery_floor=0.0,
+                       gap_tolerance=float("inf"), substitute_gap=0.0)
+    grads_of(model, plan, lenient)
+    assert lenient.admitted == [1, 1, 1, 1] and lenient.max_gap[:3] == [0.0] * 3 and lenient.max_gap[3] > 0
+    assert lenient.substitutions[:3] == [[], [], []] and lenient.substitutions[3]
+    tokens = group.rollouts[3].commit["tokens"][3:]                          # the completion after the 3 prompt tokens
+    assert all(p % 4 == 3 and pick != tokens[p] for p, pick in lenient.substitutions[3])   # the random tokens only
+    metrics = lenient.metrics()
+    assert metrics["async/rollouts_regraded"] == 1 and metrics["async/gap_max"] == lenient.max_gap[3]
+    strict = DrawGate([[0, 1, 2, 3]], rollout_floor=0.0, group_floor=0.0, forgery_floor=0.0,
+                      gap_tolerance=lenient.max_gap[3] / 2)
+    grads_of(model, plan, strict)
+    assert strict.admitted == [1, 1, 1, 0] and strict.metrics()["async/rollouts_over_gap_tolerance"] == 1
+
+
+
+def test_a_rollout_cut_short_by_an_unlikely_eos_is_refused():
+    """A final EOS is checked on its own (the re-grade cannot see a cut continuation): it needs the verifier's
+    probability ``terminal_min_p`` and a gap of at most ``terminal_gap``. Here every rollout's last token stands
+    for the EOS; the noisy rollout's last token is a random one."""
+    model = _Model()
+    group = training_group(submitted(model, "g", noisy={3}), slot0=0, index=0)
+    plan = [(group, [1.0, -1.0, 1.0, -1.0], 1.0 / (ROLLOUTS * N_TOK))]
+    eos = {r.commit["tokens"][-1] for r in group.rollouts}
+    loose = dict(rollout_floor=0.0, group_floor=0.0, forgery_floor=0.0, gap_tolerance=float("inf"))
+    gate = DrawGate([[0, 1, 2, 3]], **loose, terminal_min_p=0.0, terminal_gap=0.5, eos_ids=eos)
+    grads_of(model, plan, gate)
+    assert gate.bad_terminal == [0, 0, 0, 1] and gate.admitted == [1, 1, 1, 0]
+    assert gate.metrics()["async/rollouts_bad_termination"] == 1
+    strict_p = DrawGate([[0, 1, 2, 3]], **loose, terminal_min_p=1.01, terminal_gap=float("inf"), eos_ids=eos)
+    grads_of(model, plan, strict_p)
+    assert strict_p.bad_terminal == [1, 1, 1, 1]                               # no probability reaches 1.01
+    off = DrawGate([[0, 1, 2, 3]], **loose, terminal_min_p=1.01, terminal_gap=0.0)          # no EOS ids: no rule
+    grads_of(model, plan, off)
+    assert off.bad_terminal == [0, 0, 0, 0]

@@ -2006,6 +2006,16 @@ RL_FORGERY_MATCH_FLOOR = 0.5
 # A failed verification of a group leased more than this many checkpoints before the latest is no evidence (an honest
 # lagged lease drifts): the trainer reports it unsanctioned, the audit concludes inconclusive. PLACEHOLDER.
 RL_SANCTION_MAX_LAG = 2
+# Gumbel gap of a mismatched token: the best score minus the miner's token's score (s = logit + G). Honest gaps grow
+# with the trainer's drift. A rollout with a gap over the tolerance is not trained nor paid; a mismatch over the
+# substitute gap is re-graded with the trainer's pick (the reward must not change).
+# PLACEHOLDERS: calibrate on the logged gaps of a real run.
+RL_GAP_TOLERANCE = 8.0
+RL_SUBSTITUTE_GAP = 3.0
+# A rollout that ends on EOS: the final EOS needs the verifier's probability RL_TERMINAL_MIN_P (the window path's
+# p_stop, MIN_EOS_PROBABILITY) and a gap of at most RL_TERMINAL_GAP. PLACEHOLDERS, as above.
+RL_TERMINAL_MIN_P = 0.01
+RL_TERMINAL_GAP = 1.0
 # The model tokens (16 x 64) an out-of-zone group needs for its first-scan pay: a group of near-empty rollouts
 # verifies nothing and earns nothing. PLACEHOLDER.
 RL_FIRST_SCAN_MIN_TOKENS = 1024

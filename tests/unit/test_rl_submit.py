@@ -329,6 +329,34 @@ def test_the_trainer_reports_match_and_verdict_back_for_pay_and_sanctions(book):
         subs.report_training(good.lease_id, rollout_match=[0.99] * 16, accepted=True)
 
 
+
+def test_a_reward_that_moves_under_the_trainers_picks_is_not_paid(book):
+    """The trainer sends, per rollout, its pick at each mismatch over the substitute gap. A rollout whose reward moves
+    once those picks replace the miner's tokens had its tokens chosen for the reward: the group is unpaid, with no
+    sanction. A run of consecutive suspects is replaced at its first position only (the picks after it were drawn
+    under the miner's prefix)."""
+    subs = service(book, probation_groups=0)
+    forged, honest = lease(book, 80), lease(book, 81)
+    for held in (forged, honest):
+        subs.submit(held.lease_id, "A", group(8))
+    four, five = text("4")[0], text("5")[0]
+    none = [[] for _ in range(16)]
+    # rollout 8 answered 5 (reward 0); the trainer picks 4 at the answer, and garbage right after it
+    moved = none[:8] + [[(7, four), (8, five)]] + none[9:]
+    subs.report_training(forged.lease_id, rollout_match=[0.99] * 16, accepted=True, substitutions=moved)
+    # rollout 0 answered 4; the trainer's pick is the same digit: the reward holds
+    held = [[(7, four)]] + none[1:]
+    subs.report_training(honest.lease_id, rollout_match=[0.99] * 16, accepted=True, substitutions=held)
+    events = {e["lease_id"]: e for e in subs.events()}
+    assert events[forged.lease_id]["kind"] == UNTRAINED and events[forged.lease_id]["detail"]["reward_moved"]
+    assert events[forged.lease_id]["detail"].get("failure_class") is None          # unpaid, not sanctioned
+    assert subs.group(forged.lease_id)["training"] == "rejected"
+    assert events[honest.lease_id]["kind"] == TRAINED and subs.group(honest.lease_id)["training"] == "accepted"
+    with pytest.raises(ValueError):
+        again = lease(book, 82)
+        subs.submit(again.lease_id, "A", group(8))
+        subs.report_training(again.lease_id, rollout_match=[0.99] * 16, accepted=True, substitutions=none[:3])
+
 def test_the_buffer_hands_out_oldest_first_records_the_queue_signal_and_survives_a_restart(book, tmp_path):
     subs = service(book)
     old = lease(book, 80)

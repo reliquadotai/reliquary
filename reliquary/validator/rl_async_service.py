@@ -270,10 +270,12 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
         router.add_api_route(f"{prefix}/{path}", handler, methods=[method])
 
     def report(b: dict) -> dict:
-        matched = b.get("matched_tokens")
+        matched, subs = b.get("matched_tokens"), b.get("substitutions")
         rl.submissions.report_training(str(b["lease_id"]), rollout_match=[float(m) for m in b["rollout_match"]],
                                        accepted=bool(b["accepted"]), failure_class=b.get("failure_class"),
-                                       matched_tokens=None if matched is None else [int(n) for n in matched])
+                                       matched_tokens=None if matched is None else [int(n) for n in matched],
+                                       substitutions=None if subs is None else [[(int(p), int(t)) for p, t in s]
+                                                                                for s in subs])
         return {"ok": True}
 
     def adopt(b: dict) -> dict:

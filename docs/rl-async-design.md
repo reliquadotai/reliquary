@@ -186,6 +186,18 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   floor tolerates honest noise, never forgery: one rollout under `RL_FORGERY_MATCH_FLOOR`
   (placeholder 0.5) rejects the group as evidence.
 - **No quality lag cap** (user, 2026-10-15): the floor alone rejects rollouts that are too stale.
+- **Gap test, re-grading and final EOS** (2026-10-17). Rewards are graded on the miner's tokens,
+  so the tokens that differ from the pick are checked; the match floor becomes a safety net:
+  1. **Gumbel gap** per mismatch: best score minus the miner's token's score (s = logit + G).
+     A rollout with a gap over `RL_GAP_TOLERANCE` is not trained nor paid.
+  2. **Re-grading with the trainer's picks**: the mismatches over `RL_SUBSTITUTE_GAP` go back
+     with the report; the validator grades those rollouts again with the picks there (the first
+     of a run of consecutive mismatches only). A reward that moves: the group is unpaid, no
+     sanction. Episodes are not re-graded.
+  3. **The final EOS** (the window path's `p_stop` rule, ported): its verifier probability must
+     reach `RL_TERMINAL_MIN_P` and its gap stay within `RL_TERMINAL_GAP`.
+  Thresholds are placeholders until the gaps of a real run are logged (`async/gap_*`,
+  `async/rollouts_regraded`, `async/rollouts_bad_termination`).
 - **Leases only on checkpoints whose secret S_k is unrevealed** (DECIDED). Once S_k is public
   anyone can compute every nonce of k, pre-generate and lease only the prompts that land in
   zone. S_k is revealed late (e.g. 16 checkpoints after k), so the rule never binds an honest

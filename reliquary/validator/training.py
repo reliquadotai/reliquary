@@ -1208,6 +1208,8 @@ class _DrawRows(NamedTuple):
     match: torch.Tensor       # [N] bool: drawn and v* is the miner's token
     stochastic: torch.Tensor  # [N] bool: max p under the verifier's stochastic threshold
     entropy: torch.Tensor     # [N] fp32, nats
+    gap: torch.Tensor         # [N] fp32: Gumbel score gap of the miner's token (0: it is v*, or not a Gumbel draw)
+    p_token: torch.Tensor     # [N] fp32: the verifier's probability of the miner's token (p_stop at a final EOS)
 
 
 def _draw_logits(project, weight):
@@ -1231,7 +1233,7 @@ def _forced_draw_rows(logits_of, rows, targets, draws, chunk: int = _LOGPROB_CHU
     the verifier's stochastic flag and the entropy. ``logits_of`` maps a row chunk to its
     logits; at most ``chunk`` rows of full-vocab logits live at once, and ``pick_rows``
     bounds its own noise workspace (or runs the fused Triton pass)."""
-    from reliquary.environment.forced_sampling import pick_rows
+    from reliquary.environment.forced_sampling import DRAW_GUMBEL_MAX, gumbel_gaps, pick_rows
     from reliquary.validator.verifier import draw_settings
 
     settings = draw_settings()
@@ -1239,23 +1241,31 @@ def _forced_draw_rows(logits_of, rows, targets, draws, chunk: int = _LOGPROB_CHU
     picked = targets.clone()
     stochastic = torch.zeros(n, dtype=torch.bool, device=targets.device)
     entropy = torch.zeros(n, dtype=torch.float32, device=targets.device)
+    gap = torch.zeros(n, dtype=torch.float32, device=targets.device)
+    p_token = torch.zeros(n, dtype=torch.float32, device=targets.device)
     for start in range(0, n, chunk):
         end = min(n, start + chunk)
         logits = logits_of(rows[start:end])
         logp = torch.log_softmax(logits.float(), dim=-1)
         probs = logp.exp()
         stochastic[start:end] = probs.max(dim=-1).values < settings.stochastic_threshold
+        p_token[start:end] = probs.gather(1, targets[start:end, None].to(probs.device))[:, 0]
         entropy[start:end] = -(probs * logp).nan_to_num(0.0).sum(dim=-1)
         del logp, probs
         local = [k for k in range(start, end) if draws[k] is not None]
         if local:
             index = torch.tensor(local, device=targets.device, dtype=torch.long)
-            picked[index] = pick_rows(
-                logits.index_select(0, index - start), [float(draws[k]) for k in local],
-                draw=settings.draw, t=settings.t, top_k=settings.top_k, top_p=settings.top_p,
-            ).to(picked.device)
+            rows_logits = logits.index_select(0, index - start)
+            uniforms = [float(draws[k]) for k in local]
+            if settings.draw == DRAW_GUMBEL_MAX:
+                chosen, gaps = gumbel_gaps(rows_logits, uniforms, targets[index])
+                gap[index] = gaps.to(gap.device)
+            else:
+                chosen = pick_rows(rows_logits, uniforms, draw=settings.draw, t=settings.t,
+                                   top_k=settings.top_k, top_p=settings.top_p)
+            picked[index] = chosen.to(picked.device)
     drawn = torch.tensor([u is not None for u in draws], dtype=torch.bool, device=targets.device)
-    return _DrawRows(picked, drawn, drawn & (picked == targets), stochastic, entropy)
+    return _DrawRows(picked, drawn, drawn & (picked == targets), stochastic, entropy, gap, p_token)
 
 
 def _hidden_logprob_block(
@@ -2099,6 +2109,8 @@ def _microbatch_grad(
         device=device,
         dtype=new_lp.dtype,
     )
+    suspects = None if gate is None or draw_rows is None else _draw_suspects(
+        draw_rows, seg, positions, plens, getattr(gate, "substitute_gap", float("inf")))
     keep_cat = torch.tensor(
         [flag for keep in keeps for flag in keep],
         device=device,
@@ -2119,7 +2131,7 @@ def _microbatch_grad(
     if gate is not None:
         new_lp, ref_lp, old_cat, claimed_old_cat, behavior_old_cat, adv_cat, scale_cat, draw_rows, keep_seg = (
             _gate_rows(gate, kl_stats, batch, new_lp, ref_lp, claimed_old_cat, behavior_old_cat, adv_cat,
-                       scale_cat, draw_rows, keep_seg))
+                       scale_cat, draw_rows, keep_seg, suspects))
     ppo_log_ratio = new_lp - old_cat
     ratio = torch.exp(ppo_log_ratio)
     surr, clip_active = _clipped_surrogate(ratio, adv_cat)
@@ -2196,16 +2208,37 @@ def _rollout_draw_tallies(draw_rows: _DrawRows, keep_seg: list[int]) -> list[tup
     return [tuple(int(v) for v in row) for row in out.tolist()]
 
 
+def _draw_suspects(draw_rows: _DrawRows, seg: list[int], positions, plens, substitute_gap: float):
+    """Per rollout, over every scored row (before the keep mask): (largest Gumbel gap, [(completion position, v*)]
+    of the mismatches whose gap exceeds ``substitute_gap``, the last scored row's (gap, probability of the miner's
+    token) or None when it carried no draw): what the gate's gap and termination tests and the re-grading read."""
+    with torch.no_grad():
+        gaps = draw_rows.gap.tolist()
+        picks = draw_rows.targets.tolist()
+        p_token = draw_rows.p_token.tolist()
+        drawn = draw_rows.drawn.tolist()
+    out, offset = [], 0
+    for k, n in enumerate(seg):
+        rows = range(offset, offset + n)
+        offset += n
+        last = rows[-1] if n else None
+        out.append((max((gaps[r] for r in rows), default=0.0),
+                    [(int(positions[k][r - rows.start]) - int(plens[k]), int(picks[r]))
+                     for r in rows if gaps[r] > substitute_gap],
+                    None if last is None or not drawn[last] else (gaps[last], p_token[last])))
+    return out
+
+
 def _gate_rows(gate, kl_stats, batch, new_lp, ref_lp, claimed_old, behavior_old, adv_cat, scale_cat,
-               draw_rows, keep_seg):
+               draw_rows, keep_seg, suspects=None):
     """The async trainer's verification between forward and backward (design 4.7): pi_old := the policy
     (ratio 1), the draw counters recorded over every forwarded rollout, then the rollouts ``gate`` refuses
-    (under the floor) leave the loss."""
+    (under the floor, or a token too far from the pick) leave the loss."""
     if draw_rows is None:
         raise RuntimeError("the async trainer's gate needs the substitution loss")
     rollouts = [item[9] if len(item) > 9 else None for item in batch]
     _record_draw_stats(kl_stats, draw_rows, keep_seg, rollouts)
-    admitted = gate.admit(rollouts, _rollout_draw_tallies(draw_rows, keep_seg))
+    admitted = gate.admit(rollouts, _rollout_draw_tallies(draw_rows, keep_seg), suspects)
     old_cat = new_lp.detach()
     if admitted is None or all(admitted):
         return new_lp, ref_lp, old_cat, claimed_old, behavior_old, adv_cat, scale_cat, draw_rows, keep_seg
