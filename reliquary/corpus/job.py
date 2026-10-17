@@ -677,12 +677,3 @@ BRIDGED_SWESMITH_IMAGES = 20
 (reliquary-swe's default)."""
 
 
-def sandbox_split(episode: EpisodeSpec) -> str:
-    """The split a session token names: the episode's own. A training job's is
-    reliquary-swe's `train` (SWE-smith at its default 20 images, the split the bridge
-    serves); an eval job's is the split its set references, at whatever image count.
-    Callers move to `reliquary.eval.rows.job_row_map`, which also maps the row."""
-    if episode.env.split == "train" and episode.env.num_images != BRIDGED_SWESMITH_IMAGES:
-        raise ValueError(f"a signed reliquary-swe job serves SWE-smith at "
-                         f"{BRIDGED_SWESMITH_IMAGES} images, not {episode.env.num_images}")
-    return episode.env.split

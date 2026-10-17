@@ -302,18 +302,22 @@ class PoolSuiteReplayer:
 
 
 def replay_kwargs(job, source, *, prompt_index: int, prompt_ids, tokens, spans,
-                  stop: str) -> dict:
+                  stop: str, with_split: bool = True) -> dict:
     """What one replay of ``job``'s trajectory needs, besides the codec: the
-    task row ``prompt_index`` plays through ``source``'s row map, and the split
-    the replay builds the environment at. The seed stays the row's
-    (``episode_seed(job_id, prompt_index)``): only the task lookup is mapped."""
+    task row ``prompt_index`` plays through ``source``'s row map, and (unless
+    ``with_split`` is off: a replay on the source's own environment, built at
+    it already) the split the replay builds the environment at. The seed stays
+    the row's (``episode_seed(job_id, prompt_index)``): only the task lookup is
+    mapped."""
     episode = job.episode
-    return {"renderer_id": episode.renderer, "max_turns": episode.max_turns,
-            "task_index": source.rows.index(int(prompt_index)),
-            "seed": episode_seed(job.job_id, prompt_index),
-            "prompt_ids": [int(t) for t in prompt_ids], "tokens": [int(t) for t in tokens],
-            "spans": [(int(s), int(e)) for s, e in spans], "stop": stop,
-            "split": source.rows.split}
+    kwargs = {"renderer_id": episode.renderer, "max_turns": episode.max_turns,
+              "task_index": source.rows.index(int(prompt_index)),
+              "seed": episode_seed(job.job_id, prompt_index),
+              "prompt_ids": [int(t) for t in prompt_ids], "tokens": [int(t) for t in tokens],
+              "spans": [(int(s), int(e)) for s, e in spans], "stop": stop}
+    if with_split:
+        kwargs["split"] = source.rows.split
+    return kwargs
 
 
 _INTAKE_THREADS: ThreadPoolExecutor | None = None
@@ -442,14 +446,15 @@ def build_suite_intake(job, *, tokenizer, vocab_size: int | None, chunk_tokens: 
     """The intake a validator serves a suite job with; refuses (a ValueError,
     permanent until a restart) an environment this binary cannot serve."""
     from reliquary.corpus.suite_episode import job_suite_source
-    from reliquary.eval.prompt_source import is_eval_source
+    from reliquary.eval.rows import job_row_map
     from reliquary.eval.sets import refuse_held_out_overlap
 
     try:
         # `jobs create` checks it too, but a manifest can be written without
         # it: a served job never takes held-out rows or the RL share. An eval
-        # job's rows are its set's references, not a train range.
-        if not is_eval_source(job.prompt_source):
+        # job's rows are its set's references, not a train range. Checked
+        # before the environment is built (the map is the one the source uses).
+        if job_row_map(job).is_identity:
             refuse_held_out_overlap(job.prompt_source, job.prompt_start, job.prompt_count)
         source = job_suite_source(job)
     except ValueError as exc:

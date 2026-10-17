@@ -187,7 +187,9 @@ class SuiteSource:
     never per call. Without ``rows`` the map is the identity over the whole
     environment on ``train``: a training job's ``prompt_index`` is the task's
     index, as it always was, and ``len`` is the environment's (the intake
-    refuses a job owning rows past it)."""
+    refuses a job owning rows past it). Build it once per job and process
+    (``job_suite_source``): the environment is built, and an eval job's
+    references checked, there."""
 
     def __init__(self, environment, episode: EpisodeSpec, renderer_id: str,
                  rows: RowMap | None = None) -> None:
@@ -252,11 +254,10 @@ def job_suite_source(job, *, specs: Mapping[str, Any] | None = None) -> SuiteSou
     environment, not just its ``[prompt_start, prompt_end)``: its
     ``prompt_index`` is a raw environment index, and its intake checks the job
     against the environment's own length."""
-    from reliquary.eval.prompt_source import is_eval_source
     from reliquary.eval.rows import job_row_map
 
-    rows = job_row_map(job) if is_eval_source(job.prompt_source) else None
-    return suite_source(job.episode, rows=rows, specs=specs)
+    rows = job_row_map(job)
+    return suite_source(job.episode, rows=None if rows.is_identity else rows, specs=specs)
 
 
 def replay_suite(environment, *, renderer_id: str, task_index: int, seed: int,

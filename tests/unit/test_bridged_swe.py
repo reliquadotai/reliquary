@@ -39,8 +39,9 @@ def test_the_prompt_and_the_task_id_come_from_the_bridged_task(env):
 
 def test_the_signed_source_reads_the_bridged_env_by_default(env):
     from reliquary.environment.agentic_swe import SignedSweSource
+    from reliquary.eval.rows import RowMap
 
-    source = SignedSweSource("train")
+    source = SignedSweSource(RowMap.identity("train", 0, 100))
     assert source.prompt(2) == "prompt 2" and source.instance_id(2) == "inst-2"
 
 
@@ -57,18 +58,6 @@ def test_the_identity_is_the_bridged_one(monkeypatch):
     episodes = pytest.importorskip("reliquary_sandbox_service.episodes")
     monkeypatch.setattr(episodes, "bridged_env_package_of", lambda name: f"{name}-bridged")
     assert bridged_swe.installed_env_package("reliquary-swe") == "reliquary_swe-bridged"
-
-
-def test_a_signed_job_names_the_split_the_gateway_serves():
-    from reliquary.corpus.job import sandbox_split
-
-    def episode(split, num_images):
-        return types.SimpleNamespace(env=types.SimpleNamespace(split=split, num_images=num_images))
-
-    assert sandbox_split(episode("train", 20)) == "train"
-    with pytest.raises(ValueError, match="20"):
-        sandbox_split(episode("train", 10))
-    assert sandbox_split(episode("benchmark", 500)) == "benchmark"   # an eval job's own split
 
 
 def test_the_bridged_env_is_built_with_the_gateway_options(monkeypatch):

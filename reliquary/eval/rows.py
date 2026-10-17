@@ -74,6 +74,11 @@ class RowMap:
         """Read-only: one map is shared by every caller in the process."""
         return self._split
 
+    @property
+    def is_identity(self) -> bool:
+        """Row ``i`` is source row ``i`` (a training job): nothing to look up or check."""
+        return self._refs is None
+
     def __len__(self) -> int:
         return self._count
 

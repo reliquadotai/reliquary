@@ -207,27 +207,26 @@ class SignedSweSource:
     (`bridged_swe.prompt_of(split, index)`) exactly, with no restricted-network notice
     (the sandbox bridge runs the harness in a subprocess runtime, which adds none).
 
-    `rows` is the job's `RowMap` (`reliquary.eval.rows.job_row_map`): row `i` reads
-    `(rows.split, rows.index(i))`, and an eval job's references are checked to rebuild
-    into the instances they name on first use. A split name instead reads row `i` of
-    that split as itself (a training job's SWE-smith rows, by index)."""
+    `rows` is the job's `RowMap` (`reliquary.eval.rows.job_row_map`). An eval job's
+    references map row `i` to `(rows.split, rows.index(i))`, and are checked to rebuild
+    into the instances they name on first use. The identity reads row `i` of its split
+    as itself, any row of it (a training job's SWE-smith rows, by index, as always: the
+    job's own bounds are its ownership checks', not the source's)."""
 
     def __init__(self, rows, *, prompt_of=None, row_of=None) -> None:
-        if isinstance(rows, str):
-            self.split, self._rows = rows, None
-        else:
-            self.split, self._rows = rows.split, rows
+        self.split, self.rows = rows.split, rows
         self._prompt_of = prompt_of
         self._row_of = row_of
-        self._checked = self._rows is None
+        self._checked = rows.is_identity
         self._check_lock = threading.Lock()
         self._prompts = functools.lru_cache(maxsize=4096)(self._prompt)
         self._instance_ids = functools.lru_cache(maxsize=4096)(self._instance_id)
 
     def __len__(self) -> int:
-        """The job's rows with a map; the split's rows the bridge serves without one."""
-        if self._rows is not None:
-            return len(self._rows)
+        """The job's rows with references; the split's rows the bridge serves for the
+        identity."""
+        if not self.rows.is_identity:
+            return len(self.rows)
         from reliquary.environment.bridged_swe import split_length
 
         return split_length(self.split)
@@ -237,19 +236,26 @@ class SignedSweSource:
 
     def check(self) -> None:
         """That every row's reference rebuilds into the instance it names (ValueError
-        naming the first that does not); once, and nothing to check without a map."""
+        naming the first that does not); once, and nothing to check for the identity."""
         if self._checked:
             return
         with self._check_lock:
             if not self._checked:
-                self._rows.check_instances(self._source_instance_id)
+                self.rows.check_instances(self._source_instance_id)
                 self._checked = True
 
-    def _index(self, index: int) -> int:
-        if self._rows is None:
-            return int(index)
+    def task_ref(self, index: int):
+        """The task row `index` runs (a `reliquary.eval.rows.TaskRef`): the session
+        token's `(split, index)`."""
+        from reliquary.eval.rows import TaskRef
+
+        if self.rows.is_identity:
+            return TaskRef(self.split, int(index), None)
         self.check()
-        return self._rows.index(int(index))
+        return self.rows.ref(int(index))
+
+    def _index(self, index: int) -> int:
+        return self.task_ref(index).index
 
     def _prompt(self, index: int) -> str:
         prompt_of = self._prompt_of
@@ -282,12 +288,9 @@ def job_signed_source(job, *, prompt_of=None, row_of=None) -> SignedSweSource:
     An eval job (its prompt source names a frozen set of row references) maps row `i`
     to the set's `i`-th reference at the set's split, and is checked here against the
     bridged env (ValueError on a stale set). Any other job keeps its split's rows by
-    index, as before."""
-    from reliquary.eval.prompt_source import is_eval_source
+    index, as before. Build it once per job and process: the check reads every row."""
     from reliquary.eval.rows import job_row_map
 
-    if not is_eval_source(job.prompt_source):
-        return SignedSweSource(job.episode.env.split, prompt_of=prompt_of, row_of=row_of)
     source = SignedSweSource(job_row_map(job), prompt_of=prompt_of, row_of=row_of)
     source.check()
     return source

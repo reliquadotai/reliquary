@@ -95,7 +95,7 @@ from reliquary_sandbox.attest import (
 
 from reliquary.corpus.job import is_signed_sandbox
 from reliquary.corpus.signed_reasons import corpus_engagement
-from reliquary.eval.rows import job_row_map
+from reliquary.eval.rows import RowMap, job_row_map
 from reliquary.infrastructure import sandbox_store as _store
 from reliquary.infrastructure.sandbox_store import (
     SESSION_TRANSITIONS, SessionStoreConflict, session_transition_allowed,
@@ -348,12 +348,19 @@ class JobNotReady(Exception):
 
 @dataclass(frozen=True)
 class SignedJobView:
-    """What the corpus engagement book needs of a served signed job."""
+    """What the corpus engagement book needs of a served signed job. ``rows`` is the
+    job's ``RowMap`` (``reliquary.eval.rows.job_row_map``), resolved once, when the
+    view is built, never per request."""
 
     job: Any
     resolve_task: Callable[[int], Awaitable[ResolvedTask]] | None
     slots_remaining: Callable[[int], Awaitable[int | None]] | None
     is_banned: Callable[[str], Awaitable[bool]] | None = None
+    rows: RowMap | None = None
+
+    def __post_init__(self) -> None:
+        if self.rows is None:
+            object.__setattr__(self, "rows", job_row_map(self.job))
 
 
 def engagement_digest(engagement: Mapping[str, Any]) -> str:
@@ -502,7 +509,7 @@ class CorpusEngagements:
             if name in budgets:
                 budgets[name] = max(budgets[name], int(value))
         # The engagement and the reservation name the row; the token names its task.
-        ref = job_row_map(job).ref(index)
+        ref = view.rows.ref(index)
         return EngagementTerms(engagement=corpus_engagement(job.job_id, index), env=spec.env,
                                split=ref.split, index=ref.index,
                                checkpoint=job.checkpoint_sha256, image=task.image,

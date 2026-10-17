@@ -50,7 +50,6 @@ from reliquary.corpus.signed_reasons import (
     REASON_SANDBOX_TRANSCRIPT, corpus_engagement, session_seen_key, state_matches,
 )
 from reliquary.corpus.trajectory_parse import TrajectoryRefused
-from reliquary.eval.rows import job_row_map
 from reliquary.protocol.toploc import MIN_CHUNK_TOKENS
 from reliquary.validator.agentic_intake import EpisodeIntake, IntakeFacts, IntakeRefusal
 
@@ -145,7 +144,7 @@ class SignedEpisodeIntake(EpisodeIntake):
         episode = self._job.episode
         spec = episode.sandbox
         # The engagement names the row; the session token names the task it runs.
-        task = job_row_map(self._job).ref(request.prompt_index)
+        task = self.source.task_ref(request.prompt_index)
         expected = Expected(hotkey=request.miner_hotkey,
                             engagement=corpus_engagement(self._job.job_id, request.prompt_index),
                             env=spec.env, split=task.split, index=task.index,

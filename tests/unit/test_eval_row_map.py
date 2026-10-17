@@ -49,6 +49,7 @@ def test_identity_map_is_prompt_index():
     m = RowMap.identity("train", 100, 5)
     assert m.index(102) == 102 and m.ref(102).instance_id is None
     assert m.ref(100) == TaskRef("train", 100, None) and len(m) == 5 and m.split == "train"
+    assert m.is_identity
 
 
 def test_identity_map_refuses_outside():
@@ -61,7 +62,7 @@ def test_identity_map_refuses_outside():
 def test_from_rows_maps_row_to_reference():
     m = RowMap.from_rows(_rows())
     assert m.ref(1) == TaskRef("benchmark", 42, "t-42") and m.index(2) == 43
-    assert len(m) == 3 and m.split == "benchmark"
+    assert len(m) == 3 and m.split == "benchmark" and not m.is_identity
     with pytest.raises(IndexError):
         m.ref(3)
     with pytest.raises(IndexError):

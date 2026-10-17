@@ -162,10 +162,10 @@ def test_resolve_suite_accepts_eval_source(spec, monkeypatch):
     job = _eval_job(monkeypatch)
     resolved = _resolve_suite(job.prompt_source, CHATML_RENDERER_ID, job.episode)
     assert isinstance(resolved, SuiteSourceSpec)
-    source = resolved.create()
+    source = resolved.create(job)
     assert len(source) == 3 and source.task(1).id == "t-43" and spec.builds == [SPLIT]
     train = parse_job(_manifest())
-    assert len(_resolve_suite(ENV, None, train.episode).create()) == 100
+    assert len(_resolve_suite(ENV, None, train.episode).create(train)) == 100
     with pytest.raises(CorpusPromptSourceError, match="draws its prompts"):
         _resolve_suite("reliquary_retrieval_tools_v1", None, train.episode)
 

@@ -391,29 +391,24 @@ class SingleTurnPromptRenderer:
 
 class AgenticSourceSpec:
     """What `resolve_prompt_source` returns for the agentic contract
-    environment: the job's `episode`, buildable into its SWE-smith rows. With an
-    eval source (a signed job), its rows are the set's references at the episode's
-    split, read through the bridged env (`agentic_swe.SignedSweSource`)."""
+    environment: the job's `episode`, buildable (`create(job)`) into its
+    SWE-smith rows. An eval job's rows (a signed job's: agentic eval jobs are
+    refused) are its set's references, read through the bridged env
+    (`agentic_swe.job_signed_source`)."""
 
     interaction_mode = "agentic"
 
-    def __init__(self, episode: Any, prompt_source: str | None = None) -> None:
+    def __init__(self, episode: Any) -> None:
         self.episode = episode
-        self.prompt_source = prompt_source
 
-    def create(self):
+    def create(self, job: JobSpec):
         from reliquary.environment import agentic_swe
-        from reliquary.eval.prompt_source import is_eval_source, parse_eval_source
-        from reliquary.eval.rows import row_map
+        from reliquary.eval.rows import job_row_map
 
-        if self.prompt_source is None or not is_eval_source(self.prompt_source):
-            return agentic_swe.load_swe_source(self.episode.env.num_images)
         try:
-            rows = row_map(self.prompt_source, split=self.episode.env.split, start=0,
-                           count=parse_eval_source(self.prompt_source).count)
-            source = agentic_swe.SignedSweSource(rows)
-            source.check()
-            return source
+            if job_row_map(job).is_identity:
+                return agentic_swe.load_swe_source(self.episode.env.num_images)
+            return agentic_swe.job_signed_source(job)
         except ValueError as exc:
             raise CorpusPromptSourceError(str(exc)) from exc
 
@@ -447,28 +442,19 @@ class EpisodePromptRenderer:
 
 class SuiteSourceSpec:
     """What `resolve_prompt_source` returns for a suite episode job: the
-    registry environment it names, buildable into its tasks
-    (`reliquary.corpus.suite_episode.SuiteSource`). With an eval source, its
-    rows are the set's references, at the episode's split; otherwise the
-    whole train environment, by index."""
+    registry environment it names, buildable (`create(job)`) into the job's
+    tasks (`reliquary.corpus.suite_episode.job_suite_source`)."""
 
     interaction_mode = "agentic"
 
-    def __init__(self, episode: Any, prompt_source: str) -> None:
+    def __init__(self, episode: Any) -> None:
         self.episode = episode
-        self.prompt_source = prompt_source
 
-    def create(self):
-        from reliquary.corpus.suite_episode import suite_source
-        from reliquary.eval.prompt_source import is_eval_source, parse_eval_source
-        from reliquary.eval.rows import row_map
+    def create(self, job: JobSpec):
+        from reliquary.corpus.suite_episode import job_suite_source
 
         try:
-            rows = None
-            if is_eval_source(self.prompt_source):
-                rows = row_map(self.prompt_source, split=self.episode.env.split, start=0,
-                               count=parse_eval_source(self.prompt_source).count)
-            return suite_source(self.episode, rows=rows)
+            return job_suite_source(job)
         except ValueError as exc:
             raise CorpusPromptSourceError(str(exc)) from exc
 
@@ -487,7 +473,7 @@ def _resolve_suite(prompt_source: str, renderer_id: str | None, episode: Any) ->
     refusal = suite_spec_refusal(episode)
     if refusal:
         raise CorpusPromptSourceError(refusal)
-    return SuiteSourceSpec(episode, prompt_source)
+    return SuiteSourceSpec(episode)
 
 
 def _resolve_agentic(prompt_source: str, renderer_id: str | None, episode: Any) -> AgenticSourceSpec:
@@ -511,7 +497,7 @@ def _resolve_agentic(prompt_source: str, renderer_id: str | None, episode: Any) 
     refusal = agentic_swe.episode_support_refusal(episode, need_verifiers=False)
     if refusal:
         raise CorpusPromptSourceError(refusal)
-    return AgenticSourceSpec(episode, prompt_source)
+    return AgenticSourceSpec(episode)
 
 
 def _owned_position(job: JobSpec, prompt_index: int) -> int:
@@ -706,8 +692,10 @@ def prompt_job_for_spec(
         profile=profile,
         episode=job.episode,
     )
+    agentic = getattr(spec, "interaction_mode", None) == "agentic"
     try:
-        environment = spec.create()
+        # An episode job's source is its own: built from the job's row map.
+        environment = spec.create(job) if agentic else spec.create()
         rows = len(environment)
     except CorpusPromptSourceError:
         raise
@@ -726,7 +714,7 @@ def prompt_job_for_spec(
                if job.prompt_start else "")
             + f" but {job.prompt_source!r} has {rows}"
         )
-    if getattr(spec, "interaction_mode", None) == "agentic":
+    if agentic:
         return AgenticPromptJob(job, environment)
     if getattr(spec, "interaction_mode", None) == "episode":
         return EnvironmentPromptJob(job, environment)

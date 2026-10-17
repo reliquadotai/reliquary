@@ -13,6 +13,7 @@ from reliquary.environment.agentic_swe import (
     BASH_HARNESS_TOOLS, BASH_SENTENCE, BASH_SYSTEM_PROMPT, EDIT_SENTENCE, SignedSweSource,
     harness_system_prompt, harness_tools, pinned_tool_calls,
 )
+from reliquary.eval.rows import RowMap
 from tests.unit.test_corpus_job_episode import _manifest
 from tests.unit.test_corpus_job_signed_sandbox import ENV_PACKAGE, signed_episode
 
@@ -273,7 +274,7 @@ def test_a_signed_source_serves_the_sandbox_prompt_without_the_notice():
         rows_asked.append((split, index))
         return None, rows[index]
 
-    source = SignedSweSource("train", prompt_of=prompt_of, row_of=row_of)
+    source = SignedSweSource(RowMap.identity("train", 0, 100), prompt_of=prompt_of, row_of=row_of)
     assert source.prompt(3) == "task 3" and source.prompt(3) == "task 3"
     assert asked == [("train", 3)]                      # cached
     assert agentic_swe.PINNED_NETWORK_NOTICE not in source.prompt(3)

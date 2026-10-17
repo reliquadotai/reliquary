@@ -38,7 +38,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from reliquary.eval.prompt_source import is_eval_source
 from reliquary.eval.rows import job_row_map
 from reliquary.sandbox.fleet import (
     DIRECTORY_MAX_AGE_SECONDS, DIRECTORY_READ_TIMEOUT_SECONDS, DIRECTORY_REFRESH_SECONDS,
@@ -278,9 +277,9 @@ def wire_signed_job(w, *, services: SandboxServices, routes: Callable[[], Any],
         check = getattr(w, "is_banned", None)
         return False if check is None else bool(await check(hotkey))
 
-    rows = job_row_map(job)
+    rows = job_row_map(job)                   # resolved once: the view keeps it
     resolve_task = resolver_factory(rows.split).resolve
-    if is_eval_source(job.prompt_source):
+    if not rows.is_identity:
         resolve_row = resolve_task
 
         async def resolve_task(index: int):
@@ -289,7 +288,7 @@ def wire_signed_job(w, *, services: SandboxServices, routes: Callable[[], Any],
 
     w.sandbox_view = SignedJobView(
         job=job, resolve_task=resolve_task,
-        slots_remaining=slots_remaining, is_banned=is_banned)
+        slots_remaining=slots_remaining, is_banned=is_banned, rows=rows)
     if publish:
         services.publish(w)
 

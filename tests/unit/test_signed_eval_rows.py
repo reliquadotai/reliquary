@@ -24,7 +24,7 @@ from reliquary.environment.agentic_swe import SignedSweSource, job_signed_source
 from reliquary.eval import prompt_source as ps
 from reliquary.eval import rows as eval_rows
 from reliquary.eval.prompt_source import eval_source_for
-from reliquary.eval.rows import TaskRef, job_row_map
+from reliquary.eval.rows import RowMap, TaskRef, job_row_map
 from tests.unit.test_corpus_job_episode import _manifest, _signed
 
 SPLIT = "eval"
@@ -116,7 +116,7 @@ def test_non_eval_signed_job_unchanged(bridge):
     assert source.prompt(5) == "train prompt 5" and source.instance_id(5) == "train__5"
     assert source.prompt(10_000) == "train prompt 10000"     # any train row, as before
     assert [a for a in bridge if a[0] == "instance"] == []    # no instance check for train
-    old = SignedSweSource("train", prompt_of=_prompt_of, row_of=_row_of)
+    old = SignedSweSource(RowMap.identity("train", 0, 100), prompt_of=_prompt_of, row_of=_row_of)
     assert old.prompt(7) == source.prompt(7) and old.instance_id(7) == source.instance_id(7)
 
 
@@ -139,12 +139,12 @@ def test_corpus_service_builds_the_eval_source(bridge, monkeypatch):
     job = _eval_job(monkeypatch)
     monkeypatch.setattr(agentic_swe, "episode_support_refusal", lambda episode, **kw: None)
     spec = corpus_service._resolve_agentic(job.prompt_source, None, job.episode)
-    source = spec.create()
+    source = spec.create(job)
     assert isinstance(source, SignedSweSource) and source.prompt(0) == "eval prompt 17"
     stale = _eval_job(monkeypatch, instances={9: "gone"})
     eval_rows._row_map.cache_clear()
     with pytest.raises(corpus_service.CorpusPromptSourceError, match="gone"):
-        corpus_service._resolve_agentic(stale.prompt_source, None, stale.episode).create()
+        corpus_service._resolve_agentic(stale.prompt_source, None, stale.episode).create(stale)
 
 
 # -- session issuance ------------------------------------------------------------------
