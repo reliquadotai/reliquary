@@ -49,6 +49,19 @@ def prompt_of(split: str, index: int) -> str:
     return bridged_env().task(split, int(index)).data.prompt
 
 
+def instance_id_of(split: str, index: int) -> str:
+    return str(bridged_env().task(split, int(index)).data.instance_id)
+
+
+def split_length(split: str) -> int:
+    """Rows of ``split`` the bridge serves (a taskset that cannot count is refused)."""
+    return len(bridged_env().taskset(split))
+
+
+def package_version() -> str:
+    return importlib.metadata.version(PACKAGE)
+
+
 def row_of(split: str, index: int) -> tuple[None, Any]:
     return None, bridged_env().task(split, int(index)).data
 
