@@ -60,7 +60,7 @@ tokens on some positions), a squatter (takes leases, never submits), a Sybil set
 on one GPU), a resubmitter.
 Check: leases, expiries and quota (slow start, halving), lifecycle states and
 `/rl/prompts/state`, audits and bans, `full` refusals under the global cap, `/rl/pay` and a
-settled period, price ticks (queue level and mix per env), substitution rate, KL, entropy,
+settled period, price ticks (supply/demand ratio per env, read from the queue), substitution rate, KL, entropy,
 eval on held-out problems every ~20 steps.
 Decides: lease expiry and starting quota, `rl_max_pending_groups`, price band; first look at
 the 9B learning rate (2e-6 vs 5e-6 on two short branches if time allows).
@@ -90,7 +90,7 @@ proof-worker images; signer, proof worker, controller in that order).
 | `MAX_GRADING_PER_HOTKEY`, submit reads | 2; 8 total, 2 per hotkey | Q5 |
 | lease expiry reference speed | 20 tok/s | Q3, Q5 |
 | starting quota | 4 | Q5 |
-| `rl_max_pending_groups` (buffered groups only) | 256 | Q5 |
+| `rl_max_pending_groups` (buffered groups only) | 192 (simulated: the lag knob) | Q5 |
 | price band low/high | 0.90 / 1.10 (rise 1.05, decay -2 %/tick) | price simulation, Q5 |
 | `batch_groups` | 64 | Q4 |
 | steps per checkpoint | 1 | Q3, Q4 |

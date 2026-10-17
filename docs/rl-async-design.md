@@ -40,9 +40,8 @@ Tags: **DECIDED** (user agreed), **PROPOSED** (recommended, awaiting the user),
     measurement), full anchors every N steps, full backups to Hugging Face in the background
     (DECIDED). Miners download through presigned R2 URLs (DECIDED).
 11. **Pay per matched token** of trained groups, with a per-rollout floor so that quantized
-    generators do not out-earn honest bf16 ones. The training queue drives the prices: its depth
-    sets the level (emissions go down when it grows), the arrivals set each env's share
-    (DECIDED 2026-10-17, replacing the trainer-speed target of 2026-10-16).
+    generators do not out-earn honest bf16 ones. Per-environment prices steer each env's supply to
+    its target share of the trainer's speed, read from the training queue (DECIDED 2026-10-17).
 
 ## 2. Evidence behind the decisions
 
@@ -263,22 +262,24 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   out-of-zone work counts for quota either way.
 - Per-rollout floor prevents quantized formats from out-earning bf16 (measured: a 3090 earns
   +65 % paid tokens/s with W4A16 under pay-per-match without a floor).
-- Per-env price controller (DECIDED 2026-10-17): the training queue is the signal. It is the
-  miners' supply minus the trainer's consumption summed over time, so it holds the trainer's speed
-  without measuring it, and its depth is the lag it adds. Per tick (300 s), the level for every
-  env: the trainer waited for groups over 5 % of the tick -> rise x1.05; else the groups left
-  queued after its batches averaged over 32 -> descend 2 % (what is not paid burns); else hold;
-  no batch and no wait (trainer down) -> every price holds. The mix per env: its share of the
-  arrived tokens over its target share (`env_split`, the operator's only knob; renormalised over
-  the envs that supplied): a rise skips the envs over 1.10, a descent the envs under 0.90, a hold
-  raises the short envs and lowers the long ones. `/rl/pay` publishes level, mix and price per env.
-  Simulation (scratchpad `queue_sim.py`, 72 h, miners reallocating on prices): the price sets the
-  average supply over hours, not the depth minute to minute; the global cap bounds the depth. At
-  cap 256 the trainer waits 3-4 %, a group waits 1.8 steps in the queue (p50; p90 2.7), and the
-  spend falls to 15-50 % of the budget when GPUs are plentiful; at cap 128 the trainer starves (a
-  refused lease is only refilled after a generation time, several steps) and prices pin at the
-  cap; at 512 the queue wait doubles for nothing. The backlog target (0-32) barely matters. The
-  generation time, not the queue, is most of the lag (p50 ~5 steps issue -> train).
+- Per-env price controller (DECIDED 2026-10-16, measured from the queue 2026-10-17): one ratio per
+  env, r = its supply / (its target share x the trainer's speed). Everything is read from the
+  training queue, nothing is reported by the trainer: the speed is the completion tokens it took
+  over the seconds it did not wait (sums decayed per tick); an env's supply is the completion
+  tokens of its groups queued per second; its target share (`env_split`, the operator's only
+  knob) is renormalised over the envs that supplied. Per tick (300 s): r under 0.90 rises x1.05,
+  over 1.10 (or refused by the global cap) descends 2 %, else holds. Two global guards from the
+  queue: while the cap refuses leases no price rises, while the trainer waits (over 5 % of the
+  tick) no price descends. The trainer neither took nor waited for 3 ticks (down): hold.
+  `/rl/pay` publishes ratio, supply, demand and price per env.
+  Simulation (scratchpad `queue_sim.py`, 72 h, 7 scenarios, miners reallocating on prices, groups
+  taking several steps to generate): without the guards, miners moving between envs keep some
+  env short at every tick, it rises x1.05 while the long ones descend 2 %, and every price
+  ratchets to the cap with the queue full. With them, prices settle, the mix is within a few
+  points of target, and the spend falls to 18-67 % of the budget when GPUs are plentiful (the rest
+  burns). The cap is then the lag knob: trainer wait 7 / 2 / 1 / <1 % and queue wait p50 0.6 / 0.9
+  / 1.3 / 2.2 steps at cap 128 / 160 / 192 / 256 (192 by default). The generation time, not the
+  queue, is most of the lag (p50 ~5 steps issue -> train).
 
 ### 4.9b Miner formats and pay (DECIDED 2026-10-16: no official format)
 

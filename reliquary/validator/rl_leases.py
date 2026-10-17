@@ -251,6 +251,7 @@ class LeaseBook:
         self._rng = rng or random.SystemRandom()
         self.lock = threading.RLock()
         self._depth = 0
+        self._full: set[str] = set()              # envs refused for the global cap since the last drain
         self._submitting: dict[str, int] = {}     # leases whose on-time submission is being graded: never expired
         path = Path(path)
         _private_file(path)
@@ -483,6 +484,7 @@ class LeaseBook:
                     continue
                 if cap is not None and pending >= cap:
                     answers[i].refused[prompt] = FULL
+                    self._full.add(env)
                     continue
                 lease = Lease(_secrets.token_hex(16), hotkey, env, prompt, k,
                               lease_nonce(bytes(secrets_by_k[k]), env, prompt, k).hex(), now,
@@ -503,6 +505,12 @@ class LeaseBook:
         if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='rl_buffer'").fetchone():
             return int(self.db.execute("SELECT COUNT(*) FROM rl_buffer").fetchone()[0])
         return 0
+
+    def drain_full(self) -> set[str]:
+        """Envs refused for the global cap since the last drain (the price controller's oversupply signal)."""
+        with self.lock:
+            full, self._full = self._full, set()
+        return full
 
     def _submittable(self, lease_id: str, hotkey: str, now: float) -> tuple[Lease | None, Exception | None]:
         row = self.db.execute(f"SELECT {_COLUMNS} FROM rl_leases WHERE lease_id=?", (lease_id,)).fetchone()

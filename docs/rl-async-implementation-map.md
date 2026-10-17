@@ -686,8 +686,8 @@ over the module-level `batcher.admission_problem_materials`, shared with P3).
   buffer or audit draw). Store: `rl_groups` (private, hotkey, verdict, grades, first scan, audit/training state)
   next to `rl_prompt_scans` (public log). TODO: the decision-D R2 segment writer reads `rl_prompt_scans` by `seq`.
 - `validator/rl_buffer.py`: `TrainingBuffer` (SQLite, same file): `take(n)` any env in arrival order, `release`,
-  `depth`, `drain_tick` (the prices' signal: queued completion tokens per env, the trainer's full takes, groups
-  left queued after each, seconds it waited, between takes at most 30 s apart); taken groups requeue at reopen. `SubmittedGroup` carries env, k, nonce, arrival, hotkey,
+  `depth`, `drain_tick` (the prices' signal: queued completion tokens per env, completion tokens the trainer took,
+  seconds it waited, between takes at most 30 s apart); taken groups requeue at reopen. `SubmittedGroup` carries env, k, nonce, arrival, hotkey,
   prompt tokens, completions, force spans, rewards.
 - Audit (§C, design §4.4): draw after submission with `SystemRandom`; probation = < 100 passed out-of-zone audits,
   or < 20 passes since the last failure; deterministic -> `LeaseBook.ban` 24 h (no lease: refusal `banned`, no
@@ -739,11 +739,12 @@ New code next to the window path (`emission_price`, `settlement`, `rl_pay`, `wei
   once the async RL task is declared with `params.settlement = "period-ema-v1"`; no window archive is needed.
 - `validator/rl_price.py`: `AsyncPriceController` keeps the window controller's `PriceParams` (base =
   production values with `cap = 4.0`), `PriceState`, `PriceDecision` and walk; ticks on the validator's timer
-  (`tick_s` 300 s, `due`). `queue_level` from `TrainingBuffer.drain_tick`: waited > `starved` (5 %) of the tick
-  rises x1.05, mean backlog after a batch > `backlog` (32) descends (`decay` scaled to the tick), else holds; no
-  batch and no wait: idle, every price holds. Per env mix = share of arrived tokens / target share (renormalised
-  over the envs that supplied): a rise skips mix > `high` (1.10), a descent mix < `low` (0.90), a hold moves
-  only those two.
+  (`tick_s` 300 s, `due`). From `TrainingBuffer.drain_tick`: trainer speed = tokens taken / seconds not waiting
+  (sums decayed with a one-tick half-life, `rl_trainer_speed`; a waiting trainer keeps its speed); per env r =
+  queued tokens per second / (target share x speed): r < `low` (0.90) rises x1.05, r > `high` (1.10) or refused by
+  the global cap (`LeaseBook.drain_full`, r >= `low`) descends (`decay` scaled to the tick), else holds. Guards:
+  any cap refusal in the tick -> no rise; waited > `starved` (5 %) of the tick -> no descent; neither took nor
+  waited for `stale_ticks` (3): hold.
   Clamped to [0.05, 4.0]. Per-token price = multiplier x cap x target share / `planned_tokens_per_period` (at 1, the planned
   consumption at target mix pays exactly the cap). Snap and breaker dropped (no window to fill). State in
   `rl_prices` (restart-safe).
@@ -1010,7 +1011,7 @@ task declared for period settlement refuses to start in window mode).
   resumes) = `train_step`'s metrics + the gate's `async/*` + `async/wait_s`, `train_s`, `step_s`, `snapshot_s`,
   `publish_wait_s`, completion tokens and tokens/s, peak GPU memory, the last publication (`publish_s`,
   `delta_bytes`); a skipped step's rows ride on the next one. `...-controller` (`rl_metrics.controller_metrics`,
-  every 60 s): price multiplier, mix, supply, backlog and trainer wait per env, buffer per env and state, leases (open,
+  every 60 s): price multiplier, ratio, supply, demand, trainer speed and wait per env, buffer per env and state, leases (open,
   closed in the minute by state, issued per env), arrived groups per env and verdict, events, audit verdicts and
   queue, pay accrued per kind, active and banned miners, mean quota cap.
 - Smoke test `tests/unit/test_rl_async_service.py::test_end_to_end_lease_submit_train_pay_and_sync` (CPU, < 1 s):

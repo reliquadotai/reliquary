@@ -74,7 +74,7 @@ LEASE_SPEED_PARAM = "rl_lease_reference_tokens_per_s"   # a slow reference card'
 LEASE_MARGIN_PARAM = "rl_lease_expiry_margin"
 PRICE_TICK_PARAM = "rl_price_tick_s"
 PENDING_PARAM = "rl_max_pending_groups"         # global cap: buffered groups (queued or taken)
-DEFAULT_MAX_PENDING_GROUPS = 256      # placeholder: 4 batches of 64; under ~1 batch + the miners' generation time it starves the trainer (queue_sim 10-17)
+DEFAULT_MAX_PENDING_GROUPS = 192      # placeholder: 3 batches of 64. queue_sim 10-17: trainer wait 7 % at 128, 2 % at 160, 1 % at 192, <1 % at 256; queue wait p50 0.6 / 0.9 / 1.3 / 2.2 steps
 DEFAULT_LEASE_TOKENS_PER_S = 20.0      # placeholder: the design's "3090 at max length", measured at qualification
 DEFAULT_LEASE_MARGIN = 2.0
 
@@ -476,7 +476,7 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
         now = float(clock())
         if not await asyncio.to_thread(rl.prices.due, now):
             return
-        await asyncio.to_thread(lambda: rl.prices.tick(rl.buffer.drain_tick(), now))
+        await asyncio.to_thread(lambda: rl.prices.tick(rl.buffer.drain_tick(), rl.book.drain_full(), now))
 
     async def follow() -> None:
         await audit_model.follow_once(rl.board)

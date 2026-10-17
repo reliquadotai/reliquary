@@ -88,7 +88,7 @@ class TrainingBuffer:
     def __init__(self, book, clock=time.time) -> None:
         self.book, self.clock = book, clock
         self._arrived: dict[str, int] = {}                   # completion tokens queued per env since the last drain
-        self._batches = self._backlog = 0                    # the trainer's full takes, groups left queued after them
+        self._taken = 0                                      # completion tokens the trainer took since the last drain
         self._starved_s = 0.0
         self._waiting_since: float | None = None             # the trainer's last take came back short
         with book.lock:
@@ -117,8 +117,8 @@ class TrainingBuffer:
         from reliquary.validator.rl_price import QueueTick
 
         with self.book.lock:
-            tick = QueueTick(self._arrived, self._batches, self._backlog, self._starved_s)
-            self._arrived, self._batches, self._backlog, self._starved_s = {}, 0, 0, 0.0
+            tick = QueueTick(self._arrived, self._taken, self._starved_s)
+            self._arrived, self._taken, self._starved_s = {}, 0, 0.0
         return tick
 
     def take(self, limit: int) -> list[SubmittedGroup]:
@@ -130,17 +130,13 @@ class TrainingBuffer:
                                         "ORDER BY arrived_at, lease_id LIMIT ?", (QUEUED, int(limit))).fetchall()
             self.book.db.executemany("UPDATE rl_buffer SET state=? WHERE lease_id=?",
                                      [(TAKEN, lease_id) for lease_id, _ in rows])
-            left = 0 if len(rows) < limit else self.book.db.execute(
-                "SELECT COUNT(*) FROM rl_buffer WHERE state=?", (QUEUED,)).fetchone()[0]
             if self._waiting_since is not None:
                 self._starved_s += min(now - self._waiting_since, MAX_POLL_GAP_S)
-            if len(rows) < limit:
-                self._waiting_since = now
-            else:
-                self._waiting_since = None
-                self._batches += 1
-                self._backlog += int(left)
-        return [SubmittedGroup.unpack(body) for _, body in rows]
+            self._waiting_since = now if len(rows) < limit else None
+        groups = [SubmittedGroup.unpack(body) for _, body in rows]
+        with self.book.lock:
+            self._taken += sum(len(c) for g in groups for c in g.completions)
+        return groups
 
     def take_older(self, below_k: int, limit: int) -> list[SubmittedGroup]:
         """Up to ``limit`` queued groups of any env generated on a checkpoint older than ``below_k``: the trainer's

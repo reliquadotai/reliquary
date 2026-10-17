@@ -233,8 +233,7 @@ def test_one_step_reports_every_group_and_publishes_the_next_checkpoint():
     assert good["rollout_match"][2] < 0.95 <= min(good["rollout_match"][:2])
     assert not bad["accepted"] and bad["failure_class"] == "statistical"          # lag 0: evidence
     assert publisher.versions == [4] and book.adopted == [4] and trainer.version == 4
-    tick = buffer.drain_tick()                                          # the price signal: one full batch, none left
-    assert (tick.batches, tick.backlog, tick.starved_s) == (1, 0, 0.0)
+    assert buffer.drain_tick().taken == 2 * ROLLOUTS * N_TOK              # the prices read the trainer's speed here
     assert trainer.last_step["async/groups_accepted"] == 1 and trainer.last_step["async/groups_undone"] == 1
     assert buffer.depth() == {}
 

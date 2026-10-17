@@ -241,7 +241,7 @@ def test_a_hotkey_never_holds_more_open_leases_than_its_quota(tmp_path):
     assert book.grant([ask("A", [20])])[0].refused == {20: QUOTA}
 
 
-def test_the_global_cap_counts_buffered_groups_only(tmp_path):
+def test_the_global_cap_counts_buffered_groups_only_and_names_the_full_envs(tmp_path):
     book = book_at(tmp_path, max_pending_groups=8)
     book.adopt_checkpoint(0)
     assert len(book.grant([ask("A", [1, 2])])[0].leases) == 2         # open leases do not count against it
@@ -253,6 +253,7 @@ def test_the_global_cap_counts_buffered_groups_only(tmp_path):
         book.db.execute("INSERT INTO rl_buffer VALUES('g7')")
     answers = book.grant([ask("C", [4]), ask("D", [5], env=OTHER_ENV)])
     assert [a.refused for a in answers] == [{4: FULL}, {5: FULL}]
+    assert book.drain_full() == {ENV, OTHER_ENV} and book.drain_full() == set()
     with pytest.raises(ValueError):
         LeaseBookConfig(expiry_s={ENV: 1.0}, max_pending_groups=0)
 

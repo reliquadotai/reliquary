@@ -349,7 +349,7 @@ def test_the_buffer_hands_out_oldest_first_records_the_queue_signal_and_survives
     clock[0] += 3600                                                          # a dead trainer's gap counts 30 s
     assert subs.buffer.take(3) == []
     tick = subs.buffer.drain_tick()
-    assert (tick.batches, tick.backlog, tick.starved_s) == (1, 1, 40.0)
+    assert (tick.taken, tick.starved_s) == (3 * 16 * len(RIGHT.tokens), 40.0)       # 3 groups taken
     book.close()
     reopened = LeaseBook(tmp_path / "leases.sqlite3", book.config, quota=QuotaController(), clock=lambda: NOW)
     again = service(reopened)
