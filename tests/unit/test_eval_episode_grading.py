@@ -358,3 +358,54 @@ def test_single_turn_grade_unchanged(tmp_path, monkeypatch):
 
 async def _aresult(value):
     return value
+
+
+def test_episode_grade_without_the_card_in_the_bucket_takes_the_episode_path(tmp_path,
+                                                                           monkeypatch):
+    """The path is decided from the set's rows (already in hand), never from the
+    card: a card the bucket does not hold is the grading's SetUnknown, not a
+    silent single-turn grading that reads the submission records."""
+    from reliquary.eval.grading import SetUnknown
+
+    job, rows, subnet = _publish(tmp_path, monkeypatch)
+    (tmp_path / "subnet" / subnet_key(rows[0]["set_id"], "set.json")).unlink()
+    records = _GradeRecords(job, submissions_readable=False)
+    records.submit(_sid(0, 0), 0, reward=1.0)
+    with pytest.raises(SetUnknown):
+        _grade_job(tmp_path, job, records, subnet, allow_incomplete=True)
+    assert records.full_reads == []
+
+
+def test_an_upload_against_an_episode_set_is_refused(tmp_path, monkeypatch):
+    """Uploads (orders) grade completions on this host; an episode or SWE set's
+    samples are graded by its job's grader, so its uploads are refused, never
+    graded as grader errors."""
+    from reliquary.eval.grading import GradeRequestError, grade_evaluation
+
+    for interaction in ("episode", "swe"):
+        _, rows, subnet = _publish(tmp_path / interaction, monkeypatch, interaction)
+        set_id = rows[0]["set_id"]
+        platform = LocalDirectorySink(tmp_path / interaction / "platform")
+        with pytest.raises(GradeRequestError, match="grade it from its job"):
+            asyncio.run(grade_evaluation(
+                eval_id="order-e1", set_ids=[set_id],
+                completion_keys=["evaluations/order-e1/completions-00000.jsonl"],
+                problems_per_set={set_id: 2}, samples_per_set={set_id: 1},
+                provenance={}, platform=platform, subnet=subnet,
+                work_dir=tmp_path / "work"))
+
+
+def test_episode_correct_is_the_grade_documents_success(tmp_path, monkeypatch):
+    job, rows, subnet = _publish(tmp_path, monkeypatch)
+    records = _GradeRecords(job, submissions_readable=False)
+    records.submit(_sid(0, 0), 0, reward=1.0)
+    records.grades[_sid(0, 0)]["graded_success"] = False     # the grader's verdict wins
+    records.submit(_sid(1, 0), 1, reward=0.25)
+    records.grades[_sid(1, 0)]["graded_success"] = True
+    records.submit(_sid(1, 1), 1, reward=float("nan"))       # not finite: ungraded
+    _grade_job(tmp_path, job, records, subnet, allow_incomplete=True)
+    table = pq.read_table(tmp_path / "out" / "graded.parquet").to_pylist()
+    assert [(r["sample_index"], r["score"], r["correct"]) for r in table] == [
+        (0, 1.0, False), (0, 0.25, True), (1, None, None)]
+    note = _report(tmp_path)["provenance"]["note"]
+    assert "suite-replay" in note and "TOPLOC proves the completions" not in note

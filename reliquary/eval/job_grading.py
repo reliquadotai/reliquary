@@ -10,7 +10,7 @@ the trust is the validator's, which we run.
 
 from __future__ import annotations
 
-import json
+import asyncio
 import shutil
 import tempfile
 import time
@@ -42,25 +42,6 @@ async def _thresholds(job_id: str, entries: Callable | None) -> tuple[str | None
     return None, None
 
 
-# What graded an episode set's samples, by the set's interaction.
-EPISODE_SCHEMES = {"episode": "suite-replay", "swe": "signed-sandbox"}
-
-
-async def _interaction(subnet, set_id: str) -> str:
-    """The set's card ``interaction`` (a card without one is single-turn); a set
-    the subnet bucket does not hold is single-turn here, and named by the grading."""
-    from reliquary.eval.storage import subnet_key
-
-    try:
-        key = subnet_key(set_id, "set.json")
-    except ValueError:
-        return "single_turn"
-    body = await subnet.get_bytes(key)
-    if body is None:
-        return "single_turn"
-    return json.loads(body).get("interaction") or "single_turn"
-
-
 async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bool = False,
                            records: Any = None, subnet: Any = None,
                            read_job: Callable | None = None,
@@ -74,7 +55,7 @@ async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bo
     from reliquary.eval import grading
     from reliquary.eval.prompt_source import (
         REFERENCE_INTERACTIONS, is_eval_source, is_order_job_id, load_eval_rows,
-        parse_eval_source,
+        parse_eval_source, set_interaction,
     )
     from reliquary.validator.corpus_job_status import stored_job_counts
     from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS, rebuild_ledgers
@@ -104,7 +85,16 @@ async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bo
     if not (await stored_job_counts(records, job_id))["drained"]:
         raise JobNotGradable(f"job {job_id} is not drained: every submission must be audited "
                              "and settled first (reliquary jobs status)")
-    interaction = await _interaction(subnet, source.set_id)
+    # The set's rows (the ones the job ran) say how it is graded; its card in
+    # the bucket is read, and checked against them, by the grading itself.
+    rows = await asyncio.to_thread(load_eval_rows, source)
+    try:
+        interaction = set_interaction(rows)
+    except ValueError as exc:
+        raise JobNotGradable(f"job {job_id}: eval set {source.set_id}: {exc}") from exc
+    if (interaction in REFERENCE_INTERACTIONS) != (job.episode is not None):
+        raise JobNotGradable(f"job {job_id}: eval set {source.set_id} holds {interaction} "
+                             f"rows, but the job is {'an' if job.episode else 'no'} episode job")
     if interaction in REFERENCE_INTERACTIONS:
         # Graded already by the job's grader: its grade documents, never the records.
         job_rows = await grading.EpisodeJobRows.collect(job, records,
@@ -121,10 +111,9 @@ async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bo
         raise JobNotGradable(f"job {job_id} misses samples on some problems: pass "
                              "--allow-incomplete to count them as failures")
     task_id, thresholds = await _thresholds(job_id, entries)
-    rows = load_eval_rows(source)
     # An episode's turns still carry TOPLOC proofs (the thresholds); its score
     # is its grader's, from the grade documents.
-    scheme, origin = ((EPISODE_SCHEMES[interaction], "grade documents")
+    scheme, origin = ((grading.EPISODE_SCHEMES[interaction], "grade documents")
                       if interaction in REFERENCE_INTERACTIONS
                       else ("toploc-v1", "task contract"))
     verification = {"scheme": scheme, "source": origin,

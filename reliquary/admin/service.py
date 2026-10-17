@@ -1234,6 +1234,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     # Refusals the caller can act on are answered now, not polled for.
                     sets = await grading.load_sets(body.set_ids, body.problems_per_set,
                                                    body.samples_per_set, subnet=eval_store)
+                    grading.require_gradable(sets)
                     grading.require_sandboxes(sets, require_sandbox)
                 except grading.SetUnknown as exc:
                     raise HTTPException(status_code=404, detail="set_unknown") from exc

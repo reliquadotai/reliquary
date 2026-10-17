@@ -21,6 +21,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import re
 import shutil
 import tempfile
@@ -31,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from reliquary.eval.metrics import bootstrap_mean_ci, pass_at_k, report_ks
+from reliquary.eval.prompt_source import REFERENCE_INTERACTIONS
 from reliquary.eval.sets import open_source, prompt_sha256, validated_set_id
 from reliquary.eval.storage import subnet_key
 
@@ -129,20 +131,33 @@ async def load_sets(set_ids: Sequence[str], problems_per_set: Mapping[str, int],
     return loaded
 
 
+def require_gradable(sets: Mapping[str, tuple[dict, list[dict]]], *,
+                     pregraded: bool = False) -> None:
+    """Only an episode job's grade documents arrive graded (``pregraded``), and
+    nothing here replays an episode or runs a sandbox: an episode or SWE set is
+    graded from its job (``eval grade``), never from uploads or completions."""
+    for set_id, (card, _) in sets.items():
+        episode = card.get("interaction") in REFERENCE_INTERACTIONS
+        if episode and not pregraded:
+            raise GradeRequestError(f"set {set_id} holds {card['interaction']} tasks: "
+                                    "grade it from its job (eval grade)")
+        if pregraded and not episode:
+            raise GradeRequestError(f"set {set_id} is not an episode set: its job's "
+                                    "completions are graded here")
+
+
 def require_sandboxes(sets: Mapping[str, tuple[dict, list[dict]]], require=None) -> None:
     """Refuse an order with a code set where the grading service is not running."""
     from reliquary.environment.registry import ENVIRONMENT_SPECS
 
     if require is None:
         from reliquary.corpus.export import require_code_sandbox as require
-    from reliquary.eval.prompt_source import REFERENCE_INTERACTIONS
-
     for card, _ in sets.values():
         if card.get("source_kind") == "verifiers":
             # Its code runs, if at all, in the task's own Docker box.
             continue
         if card.get("interaction") in REFERENCE_INTERACTIONS:
-            # Graded by the job's own grader (its replay or its sandbox): nothing runs here.
+            # Graded by the job's own grader (`require_gradable`): nothing runs here.
             continue
         try:
             require(ENVIRONMENT_SPECS[card["source"]])
@@ -542,15 +557,20 @@ class JobRows:
                     sample += 1
 
 
+# What graded an episode set's samples, by the set's interaction.
+EPISODE_SCHEMES = {"episode": "suite-replay", "swe": "signed-sandbox"}
+
+
 def episode_score(document: Mapping) -> float | None:
     """The reward of a grade document that certifies it, else None (ungraded):
     an unreplayable, unparseable or uncertified trajectory scores nothing."""
     if document.get("status") != "ok" or document.get("replay_certified") is not True:
         return None
     try:
-        return float(document["grade"]["reward"])
+        reward = float(document["grade"]["reward"])
     except (KeyError, TypeError, ValueError):
         return None
+    return reward if math.isfinite(reward) else None
 
 
 class EpisodeJobRows:
@@ -703,6 +723,8 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
     if service_contract is not None:
         from reliquary.services.mapping import validate_grading_context
         validate_grading_context(service_contract, sets, dict(provenance))
+    pregraded = isinstance(job_rows, EpisodeJobRows)
+    require_gradable(sets, pregraded=pregraded)
     require_sandboxes(sets, require_sandbox)
     selected: dict[str, tuple[str, dict, dict, int]] = {}
     for set_id, (card, rows) in sets.items():
@@ -750,21 +772,30 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
                 seen.add((problem_id, sample_index))
                 batch.append((row, entry))
                 if len(batch) >= BATCH_ROWS:
-                    await _grade_batch(batch, graders, per_problem, writer, pa)
+                    await _grade_batch(batch, graders, per_problem, writer, pa,
+                                       pregraded=pregraded)
                     batch = []
             if batch:
-                await _grade_batch(batch, graders, per_problem, writer, pa)
+                await _grade_batch(batch, graders, per_problem, writer, pa,
+                                       pregraded=pregraded)
         finally:
             writer.close()
         if job_rows is not None:
+            if pregraded:
+                schemes = sorted({EPISODE_SCHEMES[card["interaction"]]
+                                  for card, _ in sets.values()})
+                note = (f"sampling not verified: the scores are the job's own grades "
+                        f"({', '.join(schemes)}); TOPLOC proves each turn was computed by "
+                        "the model, not that it was sampled as the order asked")
+            else:
+                note = ("sampling not verified: TOPLOC proves the completions were computed "
+                        "by the model, not that they were sampled as the order asked")
             provenance = {
                 **dict(provenance), "generation": "sn81-miners", "job_id": job_rows.job.job_id,
                 "miner_hotkeys": len(job_rows.hotkeys),
                 "audited_fraction": (job_rows.audited / job_rows.verdicts
                                      if job_rows.verdicts else None),
-                "sampling_verified": False,
-                "note": "sampling not verified: TOPLOC proves the completions were computed "
-                        "by the model, not that they were sampled as the order asked",
+                "sampling_verified": False, "note": note,
             }
         by_env: dict[str, list[tuple[str, int]]] = defaultdict(list)
         for problem_id, (_, card, _, samples) in selected.items():
@@ -842,25 +873,30 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
     return manifest
 
 
-async def _grade_batch(batch, graders: _Graders, per_problem, writer, pa) -> None:
+async def _grade_batch(batch, graders: _Graders, per_problem, writer, pa, *,
+                       pregraded: bool = False) -> None:
+    """``pregraded``: the rows are an episode job's (``EpisodeJobRows``), each
+    carrying its grade document's verdict; never an upload's own claim."""
     def run() -> list[dict]:
         out = []
         for row, (set_id, card, grading, _) in batch:
             completion = row.get("completion")
             completion = completion if isinstance(completion, str) else ""
-            if "pregraded" in row:
+            if pregraded:
                 # Graded already, by the job's grader: its grade document's verdict.
-                score, detail = row["pregraded"]
-                detail = detail if isinstance(detail, str) else json.dumps(detail, sort_keys=True)
+                score, verdict = row["pregraded"]
+                correct = None if score is None else verdict.get("graded_success") is True
+                detail = json.dumps(verdict, sort_keys=True)
                 failed_format = False
             else:
                 score, detail, failed_format = graders.grade(grading, completion, card)
+                correct = None if score is None else score >= 1.0
             out.append({
                 "env": card["env"], "set_id": set_id, "problem_id": grading["problem_id"],
                 "sample_index": int(row["sample_index"]), "completion": completion,
                 "tokens": int(row.get("completion_tokens") or 0),
                 "finish_reason": str(row.get("finish_reason") or ""),
-                "correct": None if score is None else score >= 1.0, "score": score,
+                "correct": correct, "score": score,
                 "grader_detail": detail, "format_failure": failed_format,
             })
         return out
@@ -879,6 +915,7 @@ async def _grade_batch(batch, graders: _Graders, per_problem, writer, pa) -> Non
 __all__ = [
     "EVALUATION_PREFIX",
     "GRADED_COLUMNS",
+    "EPISODE_SCHEMES",
     "EpisodeJobRows",
     "JobRows",
     "collect_job_records",
@@ -895,6 +932,7 @@ __all__ = [
     "grade_evaluation",
     "load_sets",
     "request_digest",
+    "require_gradable",
     "require_sandboxes",
     "validated_completion_keys",
 ]
