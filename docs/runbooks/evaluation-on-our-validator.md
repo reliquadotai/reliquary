@@ -117,7 +117,7 @@ reliquary eval compare results/<job-start-checkpoint> results/<job>
 
 ## 6. Stop
 
-Retire the task (`reliquary tasks retire --task-id <job>`), let the process drain and
+Retire the task (`reliquary tasks retire --task-id <job> --retired-at <drand round>`), let the process drain and
 settle, then stop it and free the card.
 
 ## 7. Episode environments (telecom)
