@@ -1245,7 +1245,8 @@ def _corpus_base_profile(
         # episode bounds, and checked against the spec like any catalog body.
         from reliquary.protocol.agentic_source import suite_episode_body
 
-        catalog = {**catalog, prompt_source: suite_episode_body(prompt_source, suite_episode, external_eval)}
+        catalog = {**catalog,
+                   prompt_source: suite_episode_body(prompt_source, suite_episode, external_eval)}
     # No environment overrides: two jobs on one source must carry one body to merge.
     return compose_profile(
         profile_id=normalise_task_id(task_id),
@@ -1280,7 +1281,8 @@ def prepare_corpus_job(
         task_id=task_id or job_id, from_profile=from_profile, model=model,
         model_revision=model_revision, model_architecture=model_architecture,
         prompt_encoding=prompt_encoding, renderer_id=renderer_id,
-        prompt_source=environment, external_eval=is_eval_source(prompt_source), agentic=episode is not None,
+        prompt_source=environment, external_eval=is_eval_source(prompt_source),
+        agentic=episode is not None,
         suite_episode=(episode if isinstance(episode, dict) and episode.get("harness") == "suite"
                        else None),
     )
@@ -3018,21 +3020,22 @@ def corpus_mine_agentic(
         typer.echo(f"error: job {job.job_id!r} is not an episode job; use `corpus mine`", err=True)
         raise typer.Exit(code=2)
     client.scoped_submit = submits_scoped(job)
+    from reliquary.eval.prompt_source import (
+        is_eval_source, parse_eval_source, register_eval_prompts,
+    )
+
+    if is_eval_source(job.prompt_source):
+        # An eval job's rows (suite or signed) come from the validator serving it,
+        # checked against the sha256 its manifest names, before its source is built:
+        # a miner has no sets directory nor eval bucket.
+        try:
+            register_eval_prompts(parse_eval_source(job.prompt_source), client.eval_prompts())
+        except (ValueError, CorpusJobSelectionError) as exc:
+            typer.echo(f"error: the eval job's prompts are unusable: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
     sessions = None
     signed = False
     if is_suite_episode(job.episode):
-        from reliquary.eval.prompt_source import (
-            is_eval_source, parse_eval_source, register_eval_prompts,
-        )
-
-        if is_eval_source(job.prompt_source):
-            # An eval job's rows come from the control serving it, checked
-            # against the sha256 its manifest names, before its source is built.
-            try:
-                register_eval_prompts(parse_eval_source(job.prompt_source), client.eval_prompts())
-            except (ValueError, CorpusJobSelectionError) as exc:
-                typer.echo(f"error: the eval job's prompts are unusable: {exc}", err=True)
-                raise typer.Exit(code=2) from exc
         # No verifiers, Docker or network: only the pinned environment wheel.
         refusal = suite_support_refusal(job)
         if refusal:

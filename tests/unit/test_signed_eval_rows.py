@@ -254,3 +254,56 @@ def test_miner_open_request_mapped_task(bridge, monkeypatch):
     (expected,) = seen
     assert (expected.split, expected.index) == (SPLIT, 9)
     assert expected.engagement == corpus_engagement(job.job_id, 2)
+
+
+# -- the miner CLI ---------------------------------------------------------------------
+
+def _mine_agentic(monkeypatch, job, served_body):
+    """`corpus mine-agentic` up to its support refusal: the validator client serves the
+    job's manifest and `served_body` as its eval prompts; the refusal stops it there."""
+    import bittensor
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+    from reliquary.miner import corpus_miner
+    from reliquary.protocol import profiles
+
+    manifest = _manifest(prompt_source=job.prompt_source, prompt_count=job.prompt_count,
+                         episode=_signed(env={"split": SPLIT, "num_images": 500}))
+
+    class Client:
+        scoped_submit = False
+
+        def __init__(self, http, job_id=None):
+            pass
+
+        def job(self):
+            return manifest
+
+        def eval_prompts(self):
+            return served_body
+
+    monkeypatch.setenv(profiles.TASK_CONTRACT_ENV_VAR, "unused")
+    monkeypatch.setattr(profiles, "toploc_proof", lambda profile: object())
+    monkeypatch.setattr(bittensor, "Wallet", lambda **kw: SimpleNamespace())
+    monkeypatch.setattr(corpus_miner, "HttpCorpusClient", Client)
+    monkeypatch.setattr(agentic_swe, "episode_support_refusal",
+                        lambda episode, need_verifiers: "stop here")
+    return CliRunner().invoke(app, ["corpus", "mine-agentic", "--validator-url", "http://v",
+                                    "--job-id", job.job_id])
+
+
+def test_the_miner_registers_a_signed_eval_jobs_prompts(bridge, monkeypatch):
+    """A miner has no sets directory nor eval bucket: a signed eval job's rows come
+    from the validator, checked against the manifest's sha256, before anything
+    builds its source."""
+    job = _eval_job(monkeypatch)
+    body = b"".join(json.dumps(row, sort_keys=True).encode() + b"\n" for row in _set_rows())
+    monkeypatch.setattr(ps, "FETCHERS", [])                    # nothing local to read
+    result = _mine_agentic(monkeypatch, job, body)
+    assert result.exit_code == 4 and "stop here" in result.output, result.output
+    rows = ps.load_eval_rows(ps.parse_eval_source(job.prompt_source))
+    assert [row["source_index"] for row in rows] == list(INDICES)
+    ps._loaded.clear()
+    tampered = _mine_agentic(monkeypatch, job, body.replace(b"p0", b"pX", 1))
+    assert tampered.exit_code == 2 and "prompts are unusable" in tampered.output
