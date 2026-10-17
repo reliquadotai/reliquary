@@ -1,6 +1,7 @@
 # Evaluations on any environment, run by the subnet
 
 Date: 2026-10-17. Branch: `feat/rl-async-evals` (off `feat/rl-async`).
+Status: implemented on `feat/rl-async-evals` except SWE serving (the pinned sandbox refuses splits containing "eval") and Verified digest pinning (Task 8, deferred).
 
 ## Why
 
