@@ -120,10 +120,10 @@ row of the **train** split over a **contiguous** range `[prompt_start, prompt_st
   comparison quotes them as such, not as the official leaderboard protocol.
 - `build-set --source <env> --split <split> [--start --count --sample --seed]` accepts episode
   and SWE catalog sources. The overlap report (`range_overlaps`) applies as today.
-- New held-out regions, declared beside `HELD_OUT` and refused to corpus jobs:
-  telecom v2 `eval` and `benchmark` (whole splits), `reliquary-swe` `eval` (whole split).
-  These are splits other than `train`, so corpus jobs (train only) cannot reach them today;
-  the declaration is for the card and for the day a corpus job may read another split.
+- No new held-out declaration: the first targets are whole splits other than `train`
+  (telecom v2 `eval`, `benchmark`; `reliquary-swe` `eval`), splits of one source partition it
+  (`overlaps`), and corpus jobs read `train` only, so the card's overlap report already says
+  "disjoint" and nothing can reach them.
 
 ### 2. One row map, in the source
 
@@ -188,8 +188,9 @@ validator refuse a manifest that breaks them):
   which tend to be failures), so the **headline pass@1 counts ungraded rows as failures**
   (never inflated), and the report shows beside it pass@1 over graded rows only and the
   ungraded count. `eval compare` keeps refusing ungraded rows unless `--allow-ungraded`.
-  Audit-failed submissions are not the model's: excluded and their slots re-served, as for
-  single-turn.
+  Audit-failed submissions are not the model's: left out, their sample missing (a failure in
+  the headline, absent from graded-only), as for single-turn on our validator, which does not
+  reopen slots (only the order control does).
 - Same report: pass@1 with bootstrap interval, pass@k, missing/ungraded counts, plus for
   episodes the mean reward, turn count and termination reasons.
 
