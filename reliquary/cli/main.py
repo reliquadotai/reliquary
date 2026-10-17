@@ -1245,7 +1245,7 @@ def _corpus_base_profile(
         # episode bounds, and checked against the spec like any catalog body.
         from reliquary.protocol.agentic_source import suite_episode_body
 
-        catalog = {**catalog, prompt_source: suite_episode_body(prompt_source, suite_episode)}
+        catalog = {**catalog, prompt_source: suite_episode_body(prompt_source, suite_episode, external_eval)}
     # No environment overrides: two jobs on one source must carry one body to merge.
     return compose_profile(
         profile_id=normalise_task_id(task_id),
@@ -1345,11 +1345,14 @@ def prepare_corpus_job(
 
 
 def _eval_job_source(*, job_id, eval_set, prompt_count, prompt_start, renderer_id, audit_q,
-                     grader_id, threshold, from_profile):
+                     grader_id, threshold, from_profile, episode=None):
     """What an evaluation job served by our own validator is declared from: the
     set's first N problems as its prompt source (checked against the lines'
     sha256), the set's environment as its contract's, a seed from its id.
-    Refuses what would make it something else than a measurement."""
+    Refuses what would make it something else than a measurement.
+
+    A set of episode or SWE tasks is references: the job is the episode job
+    (``episode``, from ``--episode-file``) that plays them, at the set's split."""
     import hashlib
 
     from reliquary.eval.prompt_source import eval_source_for, register_eval_prompts
@@ -1357,9 +1360,16 @@ def _eval_job_source(*, job_id, eval_set, prompt_count, prompt_start, renderer_i
     from reliquary.protocol.external_eval import contract_environment_for
     from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS
 
-    if renderer_id not in CHAT_TEMPLATE_RENDERERS:
-        raise ValueError(f"an eval set's rows render only through the model's chat template "
-                         f"({sorted(CHAT_TEMPLATE_RENDERERS)}), not {renderer_id!r}")
+    card, prompts = read_published_set(eval_set)
+    interaction = card.get("interaction", "single_turn")
+    if interaction == "single_turn":
+        if episode is not None:
+            raise ValueError(f"set {eval_set} holds single-turn problems: omit --episode-file")
+        if renderer_id not in CHAT_TEMPLATE_RENDERERS:
+            raise ValueError(f"an eval set's rows render only through the model's chat template "
+                             f"({sorted(CHAT_TEMPLATE_RENDERERS)}), not {renderer_id!r}")
+    else:
+        _refuse_episode_disagreeing_with_set(card, eval_set, episode, renderer_id)
     if prompt_start:
         raise ValueError("an eval job starts at the set's first problem (--prompt-start 0)")
     if audit_q != 1.0:
@@ -1371,14 +1381,48 @@ def _eval_job_source(*, job_id, eval_set, prompt_count, prompt_start, renderer_i
     if from_profile is not None:
         raise ValueError("an eval job's contract is composed from the model and the set's "
                          "environment: omit --from-profile")
-    card, prompts = read_published_set(eval_set)
     count = int(card["count"]) if prompt_count is None else int(prompt_count)
     if not 1 <= count <= int(card["count"]):
         raise ValueError(f"set {eval_set} holds {card['count']} problems, not {count}")
     source = eval_source_for(eval_set, prompts, count)
     register_eval_prompts(source, prompts)
     seed = int(hashlib.sha256(job_id.encode()).hexdigest()[:15], 16)
-    return source.name, count, contract_environment_for(card), seed
+    if interaction == "swe":
+        from reliquary.protocol.agentic_source import AGENTIC_SWE_ENVIRONMENT
+
+        environment = AGENTIC_SWE_ENVIRONMENT   # as for a signed corpus job
+    else:
+        environment = contract_environment_for(card)
+    return source.name, count, environment, seed
+
+
+def _refuse_episode_disagreeing_with_set(card, eval_set, episode, renderer_id):
+    """A set of references is played by an episode job whose environment, split and
+    renderer are the set's own: anything else would grade other tasks than the set names."""
+    interaction = card["interaction"]
+    if interaction not in ("episode", "swe"):
+        raise ValueError(f"set {eval_set} holds {interaction!r} problems: no eval job plays them")
+    if not isinstance(episode, dict):
+        raise ValueError(f"set {eval_set} holds {interaction} tasks: pass the episode that plays "
+                         "them with --episode-file")
+    env = episode.get("env") if isinstance(episode.get("env"), dict) else {}
+    if env.get("split") != card["split"]:
+        raise ValueError(f"the set's split is {card['split']!r}, the episode names "
+                         f"{env.get('split')!r}")
+    if interaction == "swe":
+        if episode.get("execution") != "signed_sandbox":
+            raise ValueError("an eval job on SWE runs in the signed sandbox: the episode's "
+                             f"execution is {episode.get('execution')!r}, not 'signed_sandbox'")
+        return
+    if episode.get("harness") != "suite":
+        raise ValueError(f"set {eval_set} holds suite episode tasks: the episode's harness is "
+                         f"{episode.get('harness')!r}, not 'suite'")
+    if env.get("name") != card["source"]:
+        raise ValueError(f"the set's environment is {card['source']!r}, the episode names "
+                         f"{env.get('name')!r}")
+    if not (renderer_id == episode.get("renderer") == card.get("renderer_id")):
+        raise ValueError(f"the renderer disagrees: --renderer-id {renderer_id!r}, the episode "
+                         f"{episode.get('renderer')!r}, the set {card.get('renderer_id')!r}")
 
 
 @jobs_app.command("create")
@@ -1578,18 +1622,19 @@ def jobs_create(
     try:
         if (prompt_source is None) == (eval_set is None):
             raise ValueError("give exactly one of --prompt-source and --eval-set")
-        if eval_set is not None:
-            prompt_source, prompt_count, contract_environment, seed = _eval_job_source(
-                job_id=job_id, eval_set=eval_set, prompt_count=prompt_count,
-                prompt_start=prompt_start, renderer_id=renderer_id, audit_q=audit_q,
-                grader_id=grader_id, threshold=threshold, from_profile=from_profile)
-        elif prompt_count is None:
-            raise ValueError("--prompt-count is required with --prompt-source")
         if episode_file is not None:
             import json
 
             with open(episode_file, encoding="utf-8") as handle:
                 episode = json.load(handle)
+        if eval_set is not None:
+            prompt_source, prompt_count, contract_environment, seed = _eval_job_source(
+                job_id=job_id, eval_set=eval_set, prompt_count=prompt_count,
+                prompt_start=prompt_start, renderer_id=renderer_id, audit_q=audit_q,
+                grader_id=grader_id, threshold=threshold, from_profile=from_profile,
+                episode=episode)
+        elif prompt_count is None:
+            raise ValueError("--prompt-count is required with --prompt-source")
     except (OSError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc

@@ -478,6 +478,7 @@ def _resolve_suite(prompt_source: str, renderer_id: str | None, episode: Any) ->
 
 def _resolve_agentic(prompt_source: str, renderer_id: str | None, episode: Any) -> AgenticSourceSpec:
     from reliquary.environment import agentic_swe
+    from reliquary.eval.prompt_source import is_eval_source
     from reliquary.protocol.agentic_source import AGENTIC_SWE_ENVIRONMENT
 
     if episode is not None and getattr(episode, "is_suite", False):
@@ -486,10 +487,10 @@ def _resolve_agentic(prompt_source: str, renderer_id: str | None, episode: Any) 
         raise CorpusPromptSourceError(
             f"prompt source {prompt_source!r} serves agentic episodes: a job reading it "
             "must declare `episode`")
-    if prompt_source != AGENTIC_SWE_ENVIRONMENT:
+    if prompt_source != AGENTIC_SWE_ENVIRONMENT and not is_eval_source(prompt_source):
         raise CorpusPromptSourceError(
-            f"a job with `episode` draws its prompts from {AGENTIC_SWE_ENVIRONMENT!r}, "
-            f"not {prompt_source!r}")
+            f"a job with `episode` draws its prompts from {AGENTIC_SWE_ENVIRONMENT!r} "
+            f"or an eval set, not {prompt_source!r}")
     if renderer_id is not None and renderer_id != episode.renderer:
         raise CorpusPromptSourceError(
             f"the job's renderer_id {renderer_id!r} is not its episode.renderer {episode.renderer!r}")
