@@ -434,36 +434,46 @@ class EpisodePromptRenderer:
 class SuiteSourceSpec:
     """What `resolve_prompt_source` returns for a suite episode job: the
     registry environment it names, buildable into its tasks
-    (`reliquary.corpus.suite_episode.SuiteSource`)."""
+    (`reliquary.corpus.suite_episode.SuiteSource`). With an eval source, its
+    rows are the set's references, at the episode's split; otherwise the
+    whole train environment, by index."""
 
     interaction_mode = "agentic"
 
-    def __init__(self, episode: Any) -> None:
+    def __init__(self, episode: Any, prompt_source: str) -> None:
         self.episode = episode
+        self.prompt_source = prompt_source
 
     def create(self):
         from reliquary.corpus.suite_episode import suite_source
+        from reliquary.eval.prompt_source import is_eval_source, parse_eval_source
+        from reliquary.eval.rows import row_map
 
         try:
-            return suite_source(self.episode)
+            rows = None
+            if is_eval_source(self.prompt_source):
+                rows = row_map(self.prompt_source, split=self.episode.env.split, start=0,
+                               count=parse_eval_source(self.prompt_source).count)
+            return suite_source(self.episode, rows=rows)
         except ValueError as exc:
             raise CorpusPromptSourceError(str(exc)) from exc
 
 
 def _resolve_suite(prompt_source: str, renderer_id: str | None, episode: Any) -> SuiteSourceSpec:
     from reliquary.corpus.suite_episode import suite_spec_refusal
+    from reliquary.eval.prompt_source import is_eval_source
 
-    if prompt_source != episode.env.name:
+    if prompt_source != episode.env.name and not is_eval_source(prompt_source):
         raise CorpusPromptSourceError(
-            f"a suite episode job draws its prompts from {episode.env.name!r}, "
-            f"not {prompt_source!r}")
+            f"a suite episode job draws its prompts from {episode.env.name!r} or an eval "
+            f"set, not {prompt_source!r}")
     if renderer_id is not None and renderer_id != episode.renderer:
         raise CorpusPromptSourceError(
             f"the job's renderer_id {renderer_id!r} is not its episode.renderer {episode.renderer!r}")
     refusal = suite_spec_refusal(episode)
     if refusal:
         raise CorpusPromptSourceError(refusal)
-    return SuiteSourceSpec(episode)
+    return SuiteSourceSpec(episode, prompt_source)
 
 
 def _resolve_agentic(prompt_source: str, renderer_id: str | None, episode: Any) -> AgenticSourceSpec:

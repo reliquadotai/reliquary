@@ -19,9 +19,9 @@ from collections.abc import Callable
 
 from reliquary.corpus.suite_episode import (
     episode_seed,
+    job_suite_source,
     replay_outcome,
     replay_stop,
-    suite_source,
     suite_spec,
     suite_span_refusal,
     suite_spec_refusal,
@@ -43,12 +43,15 @@ def is_suite_episode(episode) -> bool:
     return bool(getattr(episode, "is_suite", False))
 
 
-def suite_support_refusal(episode) -> str | None:
-    """Why this miner cannot run the suite ``episode``, or None: the
-    validator's own refusals (registry, manifest pin, renderer, turn limit),
-    then the installed wheel must be the artifact that manifest pins."""
+def suite_support_refusal(job) -> str | None:
+    """Why this miner cannot run the suite ``job``, or None: the validator's
+    own refusals (registry, manifest pin, renderer, turn limit), then the
+    installed wheel must be the artifact that manifest pins, and the job's
+    source must build (for an eval job: its rows registered, at its split,
+    every reference the instance it names)."""
     from reliquary.environment.agentic.external import verify_external_artifact
 
+    episode = job.episode
     refusal = suite_spec_refusal(episode)
     if refusal:
         return refusal
@@ -60,7 +63,7 @@ def suite_support_refusal(episode) -> str | None:
             return (f"{spec.name} needs the {spec.external_distribution} wheel at manifest "
                     f"{episode.env.version}: {exc}")
     try:
-        suite_source(episode)
+        job_suite_source(job)
     except (ValueError, RuntimeError, TypeError) as exc:
         return str(exc)
     return None
@@ -153,7 +156,7 @@ class SuiteEpisodeRunner:
         self._encode = encode
         self._decode = decode
         self._chunk_tokens = int(chunk_tokens or TOPLOC_DEPLOYED_DEFAULTS.chunk_tokens)
-        self._source = source if source is not None else suite_source(self._episode)
+        self._source = source if source is not None else job_suite_source(job)
         self._environment = self._source.environment
         self._renderer = self._source.renderer(encode)
         self.terminator_id, stops = turn_ids(encode)
@@ -229,10 +232,13 @@ class SuiteEpisodeRunner:
         if prompt != self.initial_ids(prompt_index) \
                 or self._decode(prompt) != self._source.initial_text(prompt_index):
             return "prompt_mismatch", {"why": "the first turn's prompt is not the task's"}
-        outcome = replay_outcome(
-            self._environment, encode=self._encode, decode=self._decode,
-            **replay_kwargs(self._job, prompt_index=prompt_index, prompt_ids=prompt,
-                            tokens=list(built.tokens), spans=list(built.spans), stop=built.stop))
+        kwargs = replay_kwargs(self._job, self._source, prompt_index=prompt_index,
+                               prompt_ids=prompt, tokens=list(built.tokens),
+                               spans=list(built.spans), stop=built.stop)
+        # This runner's environment is built at that split already.
+        kwargs.pop("split")
+        outcome = replay_outcome(self._environment, encode=self._encode, decode=self._decode,
+                                 **kwargs)
         return outcome.refusal
 
 

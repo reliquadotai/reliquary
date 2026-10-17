@@ -1826,12 +1826,14 @@ def jobs_export(
             if job.episode.is_suite:
                 # Replayed here, with the job's checkpoint tokenizer and the
                 # environment this host has installed (refused if not the pin).
-                from reliquary.corpus.suite_episode import TokenizerCodec, suite_source
+                from reliquary.corpus.suite_episode import TokenizerCodec, job_suite_source
                 from reliquary.shared.modeling import load_tokenizer
 
                 renderer = None
                 try:
-                    source = await asyncio.to_thread(suite_source, job.episode)
+                    # An eval job's rows through its set (read from the eval
+                    # store), at the set's split.
+                    source = await asyncio.to_thread(job_suite_source, job)
                 except ValueError as exc:
                     raise typer.BadParameter(str(exc)) from exc
                 codec = TokenizerCodec(await asyncio.to_thread(
@@ -2967,8 +2969,20 @@ def corpus_mine_agentic(
     sessions = None
     signed = False
     if is_suite_episode(job.episode):
+        from reliquary.eval.prompt_source import (
+            is_eval_source, parse_eval_source, register_eval_prompts,
+        )
+
+        if is_eval_source(job.prompt_source):
+            # An eval job's rows come from the control serving it, checked
+            # against the sha256 its manifest names, before its source is built.
+            try:
+                register_eval_prompts(parse_eval_source(job.prompt_source), client.eval_prompts())
+            except (ValueError, CorpusJobSelectionError) as exc:
+                typer.echo(f"error: the eval job's prompts are unusable: {exc}", err=True)
+                raise typer.Exit(code=2) from exc
         # No verifiers, Docker or network: only the pinned environment wheel.
-        refusal = suite_support_refusal(job.episode)
+        refusal = suite_support_refusal(job)
         if refusal:
             typer.echo(f"error: refusing to mine: {refusal}", err=True)
             raise typer.Exit(code=4)
