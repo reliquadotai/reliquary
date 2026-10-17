@@ -653,7 +653,7 @@ P2 and P1a can run in parallel. P5 can start once P1a fixes the v* format.
   whose S_k is unrevealed. Refusals: taken / cooling / blacklisted / quota / stale. A lease due while the validator
   was down is extended to `now + restart_grace_s` at boot. Since the 10-16 review: an open lease of a prompt at any
   k refuses it at every other k (`taken`); a banned or roomless hotkey is refused up front and a request is cut to
-  `quota - in_use` (and `HOTKEY_PENDING_SHARE` = 1/4 of the global cap) in its own order before any lookup.
+  `quota - in_use` (and `HOTKEY_MAX_OPEN` = 64 open leases under a global cap) in its own order before any lookup.
 - Prompt lifecycle (design §4.5), in the same file: `classify_group(rewards, truncated)` (population sigma >=
   `SIGMA_MIN_V4` = 0.24, at most `MAX_TRUNCATED_PER_SUBMISSION` truncated, then mean >= 0.5 too easy, else too
   hard); `LeaseBook.record_outcome(env, prompt, k, rewards, verdict)` (P3 calls it after grading) appends to
@@ -686,8 +686,8 @@ over the module-level `batcher.admission_problem_materials`, shared with P3).
   buffer or audit draw). Store: `rl_groups` (private, hotkey, verdict, grades, first scan, audit/training state)
   next to `rl_prompt_scans` (public log). TODO: the decision-D R2 segment writer reads `rl_prompt_scans` by `seq`.
 - `validator/rl_buffer.py`: `TrainingBuffer` (SQLite, same file): `take(n)` any env in arrival order, `release`,
-  `depth`, `drain_arrivals` (queued completion tokens per env: the prices'
-  supply); taken groups requeue at reopen. `SubmittedGroup` carries env, k, nonce, arrival, hotkey,
+  `depth`, `drain_tick` (the prices' signal: queued completion tokens per env, the trainer's full takes, groups
+  left queued after each, seconds it waited, between takes at most 30 s apart); taken groups requeue at reopen. `SubmittedGroup` carries env, k, nonce, arrival, hotkey,
   prompt tokens, completions, force spans, rewards.
 - Audit (§C, design §4.4): draw after submission with `SystemRandom`; probation = < 100 passed out-of-zone audits,
   or < 20 passes since the last failure; deterministic -> `LeaseBook.ban` 24 h (no lease: refusal `banned`, no
@@ -739,10 +739,11 @@ New code next to the window path (`emission_price`, `settlement`, `rl_pay`, `wei
   once the async RL task is declared with `params.settlement = "period-ema-v1"`; no window archive is needed.
 - `validator/rl_price.py`: `AsyncPriceController` keeps the window controller's `PriceParams` (base =
   production values with `cap = 4.0`), `PriceState`, `PriceDecision` and walk; ticks on the validator's timer
-  (`tick_s` 300 s, `due`). Trainer speed (`note_speed` per step: completion tokens / seconds worked, sums decayed
-  with a one-tick half-life, `rl_trainer_speed`); per env r = queued tokens per second (`drain_arrivals`) /
-  (target share x speed): r < `low` (0.95) rises x1.10, r > `high` (1.15) or refused by the global cap
-  (`LeaseBook.drain_full`) descends (`decay` scaled to the tick), else holds; no speed for `stale_ticks` (3): hold.
+  (`tick_s` 300 s, `due`). `queue_level` from `TrainingBuffer.drain_tick`: waited > `starved` (5 %) of the tick
+  rises x1.05, mean backlog after a batch > `backlog` (32) descends (`decay` scaled to the tick), else holds; no
+  batch and no wait: idle, every price holds. Per env mix = share of arrived tokens / target share (renormalised
+  over the envs that supplied): a rise skips mix > `high` (1.10), a descent mix < `low` (0.90), a hold moves
+  only those two.
   Clamped to [0.05, 4.0]. Per-token price = multiplier x cap x target share / `planned_tokens_per_period` (at 1, the planned
   consumption at target mix pays exactly the cap). Snap and breaker dropped (no window to fill). State in
   `rl_prices` (restart-safe).
@@ -1009,9 +1010,9 @@ task declared for period settlement refuses to start in window mode).
   resumes) = `train_step`'s metrics + the gate's `async/*` + `async/wait_s`, `train_s`, `step_s`, `snapshot_s`,
   `publish_wait_s`, completion tokens and tokens/s, peak GPU memory, the last publication (`publish_s`,
   `delta_bytes`); a skipped step's rows ride on the next one. `...-controller` (`rl_metrics.controller_metrics`,
-  every 60 s): price multiplier and supply / demand / ratio per env, buffer per env and state, leases (open,
+  every 60 s): price multiplier, mix, supply, backlog and trainer wait per env, buffer per env and state, leases (open,
   closed in the minute by state, issued per env), arrived groups per env and verdict, events, audit verdicts and
-  queue, pay accrued per kind, active and banned miners, mean quota cap, trainer speed.
+  queue, pay accrued per kind, active and banned miners, mean quota cap.
 - Smoke test `tests/unit/test_rl_async_service.py::test_end_to_end_lease_submit_train_pay_and_sync` (CPU, < 1 s):
   uvicorn on a socket, `mine-async`'s `AsyncMiner` with `HttpRlTransport` and a fake generator, checkpoint 0 synced
   from `/rl/checkpoint`, leases -> submissions (in zone and 0/16) -> buffer and probation audits (inconclusive),
@@ -1128,8 +1129,7 @@ the controller (both are additive; the transport hash changes with this release 
   `train_step(..., gate=DrawGate)`; `report_training` for every group; a checkpoint every
   `steps_per_checkpoint` (N, default 1): CPU snapshot on the step path, `DeltaPublisher.publish` +
   `LeaseBook.adopt_checkpoint(k+1)` in a one-deep publish thread (an error stops the loop at the next
-  publication); `BackgroundHfBackup.submit` every `hf_backup_every` (M) steps; `prices.note_speed(completion tokens, seconds
-  worked)` per step. Health skip: groups reported untrained, unsanctioned. Crash: groups released.
+  publication); `BackgroundHfBackup.submit` every `hf_backup_every` (M) steps. Health skip: groups reported untrained, unsanctioned. Crash: groups released.
 - Verification in the training forward (`training.py`, `gate=None` keeps the window path as it was): per
   micro-batch the substitution forward gives v* and per-rollout tallies (stochastic / drawn, matches); pi_old :=
   the policy (ratio 1); rollouts under `RL_ROLLOUT_MATCH_FLOOR` (constants, 0.95 placeholder; the ledger's floor)

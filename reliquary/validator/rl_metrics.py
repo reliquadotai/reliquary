@@ -1,4 +1,4 @@
-"""The async controller's wandb row (one per ``METRICS_EVERY_S``): prices, supply and demand per env, the buffer,
+"""The async controller's wandb row (one per ``METRICS_EVERY_S``): prices and the queue signal per env, the buffer,
 leases, miners, audits and pay, read from the lease book's SQLite file. The trainer's row is ``AsyncTrainer``'s."""
 from __future__ import annotations
 
@@ -15,12 +15,11 @@ def controller_metrics(rl: Any, now: float, window_s: float = METRICS_EVERY_S) -
     for env, price in rl.prices.board().items():
         out[f"price/{env}/multiplier"] = price["multiplier"]
         out[f"price/{env}/per_million_tokens"] = price["per_million_tokens"]
-        for key in ("ratio", "supply_tps", "demand_tps"):
+        for key in ("mix", "supply_tps", "backlog", "starved_s"):
             if isinstance(price["signal"].get(key), (int, float)):
                 out[f"price/{env}/{key}"] = price["signal"][key]
     db = rl.book.db
     with rl.book.lock:
-        speed = db.execute("SELECT tokens, seconds FROM rl_trainer_speed WHERE id=0").fetchone()
         rows = {
             "buffer": db.execute("SELECT environment, state, COUNT(*) FROM rl_buffer GROUP BY 1, 2").fetchall(),
             "leases": db.execute("SELECT state, COUNT(*) FROM rl_leases WHERE state='open' OR closed_at>=? "
@@ -55,8 +54,6 @@ def controller_metrics(rl: Any, now: float, window_s: float = METRICS_EVERY_S) -
     for kind, amount, tokens in rows["accrued"]:
         out[f"pay/{kind}/amount"] = amount or 0.0
         out[f"pay/{kind}/matched_tokens"] = tokens or 0
-    if speed is not None and speed[1] > 0:
-        out["trainer/completion_tokens_per_s"] = speed[0] / speed[1]
     out.update({"audits/queued": audit_queue, "miners/active": miners, "miners/banned": banned,
                 "miners/quota_cap_mean": sum(caps) / len(caps) if caps else 0.0})
     return out

@@ -62,14 +62,6 @@ class Subs:
         self.reports[lease_id] = kw
 
 
-class Prices:
-    def __init__(self):
-        self.speeds = []
-
-    def note_speed(self, tokens, seconds):
-        self.speeds.append((tokens, seconds))
-
-
 class Publisher:
     def __init__(self):
         self.versions = []
@@ -219,11 +211,11 @@ def test_window_mode_is_unchanged_without_a_gate():
 # --- the loop ----------------------------------------------------------------------------------------------------
 def loop(model, book, buffer, batch=2, **config):
     clock = Clock()
-    publisher, prices, subs = Publisher(), Prices(), Subs(buffer)
+    publisher, subs = Publisher(), Subs(buffer)
     trainer = AsyncTrainer(model, config=AsyncTrainerConfig(batch, group_floor=0.7, **config),
-                           buffer=buffer, submissions=subs, book=book, prices=prices, publisher=publisher,
+                           buffer=buffer, submissions=subs, book=book, publisher=publisher,
                            clock=clock, sleep=clock.sleep)
-    return trainer, subs, publisher, prices
+    return trainer, subs, publisher
 
 
 def test_one_step_reports_every_group_and_publishes_the_next_checkpoint():
@@ -231,7 +223,7 @@ def test_one_step_reports_every_group_and_publishes_the_next_checkpoint():
     buffer = TrainingBuffer(book)
     buffer.push(submitted(model, "good", noisy={2}, arrived=1.0))
     buffer.push(submitted(model, "bad", forged={0, 1, 2}, arrived=0.0))
-    trainer, subs, publisher, prices = loop(model, book, buffer)
+    trainer, subs, publisher = loop(model, book, buffer)
     before = [p.detach().clone() for p in model.parameters()]
     assert trainer.run_once() == "trained"
     trainer.close()
@@ -241,7 +233,8 @@ def test_one_step_reports_every_group_and_publishes_the_next_checkpoint():
     assert good["rollout_match"][2] < 0.95 <= min(good["rollout_match"][:2])
     assert not bad["accepted"] and bad["failure_class"] == "statistical"          # lag 0: evidence
     assert publisher.versions == [4] and book.adopted == [4] and trainer.version == 4
-    assert [tokens for tokens, _ in prices.speeds] == [2 * ROLLOUTS * N_TOK]   # every forwarded token, not paid ones
+    tick = buffer.drain_tick()                                          # the price signal: one full batch, none left
+    assert (tick.batches, tick.backlog, tick.starved_s) == (1, 0, 0.0)
     assert trainer.last_step["async/groups_accepted"] == 1 and trainer.last_step["async/groups_undone"] == 1
     assert buffer.depth() == {}
 
@@ -259,7 +252,7 @@ def test_publication_every_n_steps_and_hf_backup_every_m(monkeypatch):
         gate.judge([])
         return model
 
-    trainer, subs, publisher, prices = loop(model, book, buffer, batch=1, steps_per_checkpoint=2, hf_backup_every=3)
+    trainer, subs, publisher = loop(model, book, buffer, batch=1, steps_per_checkpoint=2, hf_backup_every=3)
     trainer._train_step, trainer.backup = fake_step, backup
     assert publisher.versions == [0] and book.adopted == [0]                       # fresh book: initial weights
     for step in range(6):
@@ -275,7 +268,7 @@ def test_a_skipped_step_pays_nothing_and_a_crash_requeues():
     model, book = _Model(), Book()
     buffer = TrainingBuffer(book)
     buffer.push(submitted(model, "g", n=2))
-    trainer, subs, publisher, _ = loop(model, book, buffer, batch=1)
+    trainer, subs, publisher = loop(model, book, buffer, batch=1)
 
     def skipped(*_, **__):
         raise training.TrainingStepSkipped("gradient_spike", 1e9)
@@ -301,7 +294,7 @@ def test_a_take_whose_answer_was_lost_is_requeued_before_the_next_step():
     buffer = TrainingBuffer(book)
     buffer.push(submitted(model, "g", n=2))
     assert [g.lease_id for g in buffer.take(1)] == ["g"]          # taken, answer lost: the trainer never saw it
-    trainer, subs, _, _ = loop(model, book, buffer, batch=1)
+    trainer, subs, _ = loop(model, book, buffer, batch=1)
     assert trainer.run_once() == "trained" and "g" in subs.reports
     trainer.close()
 

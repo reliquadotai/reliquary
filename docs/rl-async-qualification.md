@@ -60,7 +60,7 @@ tokens on some positions), a squatter (takes leases, never submits), a Sybil set
 on one GPU), a resubmitter.
 Check: leases, expiries and quota (slow start, halving), lifecycle states and
 `/rl/prompts/state`, audits and bans, `full` refusals under the global cap, `/rl/pay` and a
-settled period, price ticks (supply/demand ratio per env), substitution rate, KL, entropy,
+settled period, price ticks (queue level and mix per env), substitution rate, KL, entropy,
 eval on held-out problems every ~20 steps.
 Decides: lease expiry and starting quota, `rl_max_pending_groups`, price band; first look at
 the 9B learning rate (2e-6 vs 5e-6 on two short branches if time allows).
@@ -86,7 +86,7 @@ proof-worker images; signer, proof worker, controller in that order).
 | `RL_FORGERY_MATCH_FLOOR` | 0.5 | Q2 (honest p0.001 on the worst card) |
 | `RL_SANCTION_MAX_LAG` | 2 checkpoints | Q2, Q5 (honest match vs lag) |
 | `RL_FIRST_SCAN_MIN_TOKENS` | 1024 | Q5 |
-| `HOTKEY_PENDING_SHARE` | 0.25 of the cap | Q5 (Sybil, squatter) |
+| `HOTKEY_MAX_OPEN` | 64 open leases | Q5 (Sybil, squatter) |
 | `MAX_GRADING_PER_HOTKEY`, submit reads | 2; 8 total, 2 per hotkey | Q5 |
 | lease expiry reference speed | 20 tok/s | Q3, Q5 |
 | starting quota | 4 | Q5 |

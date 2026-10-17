@@ -11,10 +11,12 @@ taken but never reported (a trainer restart) go back to the queue when the buffe
 from __future__ import annotations
 
 import json
+import time
 import zlib
 from dataclasses import asdict, dataclass
 
 QUEUED, TAKEN = "queued", "taken"
+MAX_POLL_GAP_S = 30.0       # a wait counts between two of the trainer's takes at most this far apart (a dead trainer)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS rl_buffer(lease_id TEXT PRIMARY KEY, environment TEXT NOT NULL, k INTEGER NOT NULL,
@@ -83,9 +85,12 @@ class SubmittedGroup:
 
 
 class TrainingBuffer:
-    def __init__(self, book) -> None:
-        self.book = book
+    def __init__(self, book, clock=time.time) -> None:
+        self.book, self.clock = book, clock
         self._arrived: dict[str, int] = {}                   # completion tokens queued per env since the last drain
+        self._batches = self._backlog = 0                    # the trainer's full takes, groups left queued after them
+        self._starved_s = 0.0
+        self._waiting_since: float | None = None             # the trainer's last take came back short
         with book.lock:
             book.db.executescript(_SCHEMA)
             book.db.commit()
@@ -106,21 +111,35 @@ class TrainingBuffer:
         with self.book.lock:
             self._arrived[group.environment] = self._arrived.get(group.environment, 0) + tokens
 
-    def drain_arrivals(self) -> dict[str, int]:
-        """Completion tokens queued per env since the last drain (the price controller's supply; memory only: a
-        restart loses at most one tick of it)."""
+    def drain_tick(self):
+        """The queue since the last drain (the price controller's signal; memory only: a restart loses at most one
+        tick of it)."""
+        from reliquary.validator.rl_price import QueueTick
+
         with self.book.lock:
-            arrived, self._arrived = self._arrived, {}
-        return arrived
+            tick = QueueTick(self._arrived, self._batches, self._backlog, self._starved_s)
+            self._arrived, self._batches, self._backlog, self._starved_s = {}, 0, 0, 0.0
+        return tick
 
     def take(self, limit: int) -> list[SubmittedGroup]:
         """Up to ``limit`` queued groups of any env, in arrival order; they stay buffered (``taken``) until reported
-        or released."""
+        or released. The trainer asks for what its batch still lacks: a short answer means it waits for groups."""
+        now = float(self.clock())
         with self.book.transaction():
             rows = self.book.db.execute("SELECT lease_id, body FROM rl_buffer WHERE state=? "
                                         "ORDER BY arrived_at, lease_id LIMIT ?", (QUEUED, int(limit))).fetchall()
             self.book.db.executemany("UPDATE rl_buffer SET state=? WHERE lease_id=?",
                                      [(TAKEN, lease_id) for lease_id, _ in rows])
+            left = 0 if len(rows) < limit else self.book.db.execute(
+                "SELECT COUNT(*) FROM rl_buffer WHERE state=?", (QUEUED,)).fetchone()[0]
+            if self._waiting_since is not None:
+                self._starved_s += min(now - self._waiting_since, MAX_POLL_GAP_S)
+            if len(rows) < limit:
+                self._waiting_since = now
+            else:
+                self._waiting_since = None
+                self._batches += 1
+                self._backlog += int(left)
         return [SubmittedGroup.unpack(body) for _, body in rows]
 
     def take_older(self, below_k: int, limit: int) -> list[SubmittedGroup]:

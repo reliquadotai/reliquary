@@ -190,7 +190,7 @@ def run_async_train_worker() -> None:
                                     hf_backup_every=settings["hf_every"])
         link.requeue()                          # this trainer holds nothing yet
         trainer = AsyncTrainer(
-            model, config=config, buffer=link, submissions=link, book=link, prices=link, publisher=publisher,
+            model, config=config, buffer=link, submissions=link, book=link, publisher=publisher,
             state_fn=state_fn, backup=backup, backup_save=lambda s, folder: write_hf_dir(s, model_dir, folder),
             train_step_fn=step_fn,
             global_step_hint=None if version is None else version * settings["steps_per_checkpoint"])

@@ -4,7 +4,7 @@ Next to the window trainer (``worker.py`` / ``train_runner.py``, unchanged), one
 
 1. **Batch in arrival order.** ``batch_groups`` groups of any env are taken from the ``TrainingBuffer`` oldest
    first; the step waits until the batch is full (as prime-rl, AReaL, PipelineRL, verl, SkyRL). The mix is not the
-   trainer's business: the per-env prices move each env's supply to its target share of the trainer's speed
+   trainer's business: the per-env prices, driven by this queue, move each env's supply to its target share
    (``rl_price``), and the global lease cap holds the miners back when they outrun the trainer. Groups generated
    more than ``max_lag`` checkpoints ago are dropped unpaid without a forward (the cap keeps that rare).
 2. **One forward = verification + loss.** Each ``SubmittedGroup`` becomes the trainer's group object; its rollouts
@@ -21,8 +21,7 @@ Next to the window trainer (``worker.py`` / ``train_runner.py``, unchanged), one
    staleness), a checkpoint every ``steps_per_checkpoint`` steps: a CPU snapshot on the step path, then
    ``DeltaPublisher.publish`` and ``LeaseBook.adopt_checkpoint`` in a publish thread (one in flight: the next
    publication waits for it, and its error stops the loop), a Hugging Face backup every ``hf_backup_every`` steps
-   (``BackgroundHfBackup``, never blocking), and the step's speed for the prices (``note_speed``: completion tokens
-   processed and seconds worked, the wait for the batch excluded).
+   (``BackgroundHfBackup``, never blocking).
 
 Groups are reported (an accepted one becomes payable) before their step's checkpoint is published: pay is for
 work trained into the weights the step computed. If the process dies between the report and the publication,
@@ -242,14 +241,14 @@ class AsyncTrainer:
     ``train_step_fn`` may be ``distributed.broadcasting_train_step``. The model must hold checkpoint
     ``book.latest_checkpoint`` (or, on a fresh book, the initial weights, published and adopted as 0)."""
 
-    def __init__(self, model: Any, *, config: AsyncTrainerConfig, buffer, submissions, book, prices=None,
+    def __init__(self, model: Any, *, config: AsyncTrainerConfig, buffer, submissions, book,
                  publisher=None, state_fn: Callable[[], Mapping[str, Any]] | None = None, backup=None,
                  backup_save: Callable[[Mapping[str, Any], Path], None] = save_snapshot,
                  train_step_fn: Callable = _default_train_step, ref_model: Any = None,
                  global_step_hint: int | None = None, clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep) -> None:
         self.model, self.config = model, config
-        self.buffer, self.submissions, self.book, self.prices = buffer, submissions, book, prices
+        self.buffer, self.submissions, self.book = buffer, submissions, book
         self.publisher, self.backup, self._backup_save = publisher, backup, backup_save
         self._state_fn = state_fn or (lambda: self.model.state_dict())
         self._train_step, self.ref_model, self.global_step_hint = train_step_fn, ref_model, global_step_hint
@@ -379,8 +378,6 @@ class AsyncTrainer:
             self.backup.submit(self.steps, lambda folder, s=frozen: self._backup_save(s, folder))
         completion = sum(len(c) for g in submitted for c in g.completions)
         worked = self._clock() - started
-        if self.prices is not None:
-            self.prices.note_speed(completion, worked)
         self.last_step = {"result": "trained", "step": self.steps, "checkpoint": self.version, **gate.metrics()}
         telemetry.flush({**gate.metrics(), **timings, **self.last_publication,
                          "async/wait_s": started - began, "async/train_s": trained - started,

@@ -117,10 +117,5 @@ class TrainerLink:
             "failure_class": failure_class,
             "matched_tokens": None if matched_tokens is None else [int(n) for n in matched_tokens]}, resend_ok=True)
 
-    # --- the prices -----------------------------------------------------------------------------------------------
-    def note_speed(self, tokens: float, seconds: float) -> None:
-        """One step's speed: completion tokens processed in ``seconds`` of work (the per-env demand's base)."""
-        self._call("POST", "speed", {"tokens": float(tokens), "seconds": float(seconds)})
-
 
 __all__ = ["TrainerLink", "TrainerLinkError"]

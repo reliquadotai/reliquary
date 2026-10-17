@@ -74,7 +74,7 @@ LEASE_SPEED_PARAM = "rl_lease_reference_tokens_per_s"   # a slow reference card'
 LEASE_MARGIN_PARAM = "rl_lease_expiry_margin"
 PRICE_TICK_PARAM = "rl_price_tick_s"
 PENDING_PARAM = "rl_max_pending_groups"         # global cap: buffered groups (queued or taken)
-DEFAULT_MAX_PENDING_GROUPS = 256      # placeholder: 4 batches of 64 (lag <= ~4 steps), set at qualification
+DEFAULT_MAX_PENDING_GROUPS = 256      # placeholder: 4 batches of 64; under ~1 batch + the miners' generation time it starves the trainer (queue_sim 10-17)
 DEFAULT_LEASE_TOKENS_PER_S = 20.0      # placeholder: the design's "3090 at max length", measured at qualification
 DEFAULT_LEASE_MARGIN = 2.0
 
@@ -280,10 +280,6 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
         rl.book.adopt_checkpoint(int(b["k"]))
         return {"latest": rl.book.latest_checkpoint}
 
-    def speed(b: dict) -> dict:
-        rl.prices.note_speed(float(b["tokens"]), float(b["seconds"]))
-        return {"ok": True}
-
     route("GET", "config", lambda b: {"task_id": rl.settings.task_id, "run": rl.settings.run,
                                       "targets": dict(rl.settings.targets), "latest": rl.book.latest_checkpoint})
     route("GET", "latest", lambda b: {"latest": rl.book.latest_checkpoint})
@@ -295,7 +291,6 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
     route("POST", "requeue", lambda b: {"requeued": rl.buffer.requeue()})
     route("GET", "depth", lambda b: {"depth": rl.buffer.depth()})
     route("POST", "report", report)
-    route("POST", "speed", speed)
 
     async def checkpoint(request: Request) -> JSONResponse:
         """``/rl/checkpoint``'s answer for the trainer's resume (it reaches this listener only)."""
@@ -481,7 +476,7 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
         now = float(clock())
         if not await asyncio.to_thread(rl.prices.due, now):
             return
-        await asyncio.to_thread(lambda: rl.prices.tick(rl.buffer.drain_arrivals(), rl.book.drain_full(), now))
+        await asyncio.to_thread(lambda: rl.prices.tick(rl.buffer.drain_tick(), now))
 
     async def follow() -> None:
         await audit_model.follow_once(rl.board)

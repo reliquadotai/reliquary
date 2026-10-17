@@ -40,8 +40,9 @@ Tags: **DECIDED** (user agreed), **PROPOSED** (recommended, awaiting the user),
     measurement), full anchors every N steps, full backups to Hugging Face in the background
     (DECIDED). Miners download through presigned R2 URLs (DECIDED).
 11. **Pay per matched token** of trained groups, with a per-rollout floor so that quantized
-    generators do not out-earn honest bf16 ones. Per-environment prices steer each env's supply to
-    its target share of the trainer's speed (DECIDED 2026-10-16).
+    generators do not out-earn honest bf16 ones. The training queue drives the prices: its depth
+    sets the level (emissions go down when it grows), the arrivals set each env's share
+    (DECIDED 2026-10-17, replacing the trainer-speed target of 2026-10-16).
 
 ## 2. Evidence behind the decisions
 
@@ -262,18 +263,22 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   out-of-zone work counts for quota either way.
 - Per-rollout floor prevents quantized formats from out-earning bf16 (measured: a 3090 earns
   +65 % paid tokens/s with W4A16 under pay-per-match without a floor).
-- Per-env price controller (DECIDED 2026-10-16): the target is the trainer's speed. The trainer
-  reports per step the completion tokens it processed and the seconds it worked (waits excluded);
-  an env's demand is its target share (`env_split`, the operator's only knob) x that speed, its
-  supply the completion tokens of its groups queued per second. Per tick (300 s): supply/demand
-  under 0.90 rises x1.05, over 1.10 (or refused by the global cap while the total supply covers
-  the trainer) descends 2 %, else holds; an env with no supply in the tick gives its share to
-  the others (placeholders, from a 72 h simulation with miners reallocating on prices: the
-  first values, x1.10 up and -0.2 % down, ratcheted up and pinned the costliest env at the cap;
-  these converge in 7-9 h with 1-3 % trainer wait). No global price: the demands sum to the trainer's speed, so every env at ~1
-  means the miners as a whole match the trainer; a bad batch mix moves the env prices by itself.
-  No speed for 3 ticks (trainer down): hold. `/rl/pay` publishes ratio, supply, demand and price
-  per env.
+- Per-env price controller (DECIDED 2026-10-17): the training queue is the signal. It is the
+  miners' supply minus the trainer's consumption summed over time, so it holds the trainer's speed
+  without measuring it, and its depth is the lag it adds. Per tick (300 s), the level for every
+  env: the trainer waited for groups over 5 % of the tick -> rise x1.05; else the groups left
+  queued after its batches averaged over 32 -> descend 2 % (what is not paid burns); else hold;
+  no batch and no wait (trainer down) -> every price holds. The mix per env: its share of the
+  arrived tokens over its target share (`env_split`, the operator's only knob; renormalised over
+  the envs that supplied): a rise skips the envs over 1.10, a descent the envs under 0.90, a hold
+  raises the short envs and lowers the long ones. `/rl/pay` publishes level, mix and price per env.
+  Simulation (scratchpad `queue_sim.py`, 72 h, miners reallocating on prices): the price sets the
+  average supply over hours, not the depth minute to minute; the global cap bounds the depth. At
+  cap 256 the trainer waits 3-4 %, a group waits 1.8 steps in the queue (p50; p90 2.7), and the
+  spend falls to 15-50 % of the budget when GPUs are plentiful; at cap 128 the trainer starves (a
+  refused lease is only refilled after a generation time, several steps) and prices pin at the
+  cap; at 512 the queue wait doubles for nothing. The backlog target (0-32) barely matters. The
+  generation time, not the queue, is most of the lag (p50 ~5 steps issue -> train).
 
 ### 4.9b Miner formats and pay (DECIDED 2026-10-16: no official format)
 

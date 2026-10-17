@@ -329,7 +329,7 @@ def test_the_trainer_reports_match_and_verdict_back_for_pay_and_sanctions(book):
         subs.report_training(good.lease_id, rollout_match=[0.99] * 16, accepted=True)
 
 
-def test_the_buffer_hands_out_oldest_first_counts_arrivals_and_survives_a_restart(book, tmp_path):
+def test_the_buffer_hands_out_oldest_first_records_the_queue_signal_and_survives_a_restart(book, tmp_path):
     subs = service(book)
     old = lease(book, 80)
     subs.submit(old.lease_id, "A", group(8), arrived_at=NOW)
@@ -337,11 +337,19 @@ def test_the_buffer_hands_out_oldest_first_counts_arrivals_and_survives_a_restar
     new = book.grant([LeaseRequest("A", ENV, (81,), 1)])[0].leases[0]
     subs.submit(new.lease_id, "A", group(8), arrived_at=NOW + 1)
     assert subs.buffer.depth() == {ENV: 2}
-    assert subs.buffer.drain_arrivals() == {ENV: 2 * sum(len(c) for c in subs.buffer.get(old.lease_id).completions)}
-    assert subs.buffer.drain_arrivals() == {}
-    assert [g.lease_id for g in subs.buffer.take(1)] == [old.lease_id]
+    clock = [NOW]
+    subs.buffer.clock = lambda: clock[0]
+    assert subs.buffer.drain_tick().arrivals == {ENV: 2 * sum(len(c) for c in subs.buffer.get(old.lease_id).completions)}
+    assert subs.buffer.drain_tick().arrivals == {}
+    assert [g.lease_id for g in subs.buffer.take(1)] == [old.lease_id]       # a full batch, one group left
     subs.buffer.release([old.lease_id])
-    assert [g.lease_id for g in subs.buffer.take(5)] == [old.lease_id, new.lease_id]
+    assert [g.lease_id for g in subs.buffer.take(5)] == [old.lease_id, new.lease_id]   # short: the trainer waits
+    clock[0] += 10
+    assert subs.buffer.take(3) == []
+    clock[0] += 3600                                                          # a dead trainer's gap counts 30 s
+    assert subs.buffer.take(3) == []
+    tick = subs.buffer.drain_tick()
+    assert (tick.batches, tick.backlog, tick.starved_s) == (1, 1, 40.0)
     book.close()
     reopened = LeaseBook(tmp_path / "leases.sqlite3", book.config, quota=QuotaController(), clock=lambda: NOW)
     again = service(reopened)
