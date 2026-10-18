@@ -11,8 +11,8 @@ import threading
 import pytest
 
 from reliquary.miner.rl_async import (
-    ROLLOUTS, AsyncMiner, AsyncMinerConfig, DryRunTransport, FakeGroupGenerator, PromptPlanner, PromptRecord,
-    RequestRefused, encode_submission, submission_digest,
+    ROLLOUTS, AsyncMiner, AsyncMinerConfig, DryRunTransport, FakeGroupGenerator, FakeStreamGenerator, PromptPlanner,
+    PromptRecord, RequestRefused, encode_submission, submission_digest,
 )
 from reliquary.protocol.rl_submit import decode_tokens
 
@@ -38,12 +38,12 @@ def scan(seq, prompt, verdict, k=0, rewards=(0.0,) * 16):
 
 
 def miner_for(*, quota=8, lease_batch=8, queue_groups=8, batch_groups=4, max_open=64, prompt_range=(0, 50),
-              loaded_version=0, clock=None, transport=None, sync=None, state_dir=None, priority=None):
+              loaded_version=0, clock=None, transport=None, sync=None, state_dir=None, priority=None, generator=None):
     clock = clock or Clock()
     transport = transport or DryRunTransport(quota=quota, clock=clock)
     planner_kwargs = {} if priority is None else {"priority": priority}
     planner = PromptPlanner(ENV, prompt_range, rng=random.Random(0), clock=clock, **planner_kwargs)
-    generator = FakeGroupGenerator()
+    generator = generator or FakeGroupGenerator()
     if loaded_version is not None:
         generator.load_weights({}, loaded_version)
     config = AsyncMinerConfig(environments=(ENV,), lease_batch=lease_batch, queue_groups=queue_groups,
@@ -521,3 +521,55 @@ def test_write_hf_dir_reloads_in_transformers_from_several_shards(tmp_path, monk
     assert len(list(dest.glob("*.safetensors"))) > 1
     loaded = AutoModelForCausalLM.from_pretrained(dest).state_dict()
     assert all(torch.equal(loaded[k], v) for k, v in state.items() if k in loaded)
+
+
+# --- continuous batching ------------------------------------------------------------------------------------
+def streaming(steps=None, **kwargs):
+    return miner_for(generator=FakeStreamGenerator(steps=steps), **kwargs)
+
+
+async def test_a_long_group_does_not_hold_back_the_others():
+    miner, transport, generator, _ = streaming(quota=8, batch_groups=2, queue_groups=8)
+    await miner.refresh_quota()
+    await miner.lease_more()
+    slow = sorted(miner.queue, key=lambda lease: lease.expires_at)[0]
+    generator.steps = {slow.prompt_idx: 4}                          # its longest rollout takes 4 steps
+    for _ in range(3):
+        await miner.generate_once()
+    await miner.drain()
+    assert list(miner.running) == [slow.lease_id]                   # each fast group starts and ends in one call
+    assert len(transport.submissions) == 3                          # the slot beside it served three leases
+    assert slow.lease_id not in {s["lease_id"] for s in transport.submissions}
+    await miner.generate_once()
+    await miner.drain()
+    assert slow.lease_id in {s["lease_id"] for s in transport.submissions}
+
+
+async def test_new_weights_wait_for_the_running_groups():
+    miner, transport, generator, _ = streaming(quota=8, batch_groups=2)
+    await miner.refresh_quota()
+    await miner.lease_more()
+    generator.steps = {lease.prompt_idx: 2 for lease in miner.queue}
+    await miner.generate_once()                                     # two groups start on k 0
+    miner._state, miner._state_version = {}, 1
+    miner._ready.set()
+    started = len(generator.started)
+    await miner.generate_once()                                     # they finish; nothing new starts
+    assert len(generator.started) == started and not miner.running and generator.loads == [0]
+    await miner.generate_once()                                     # drained: swap, then start on k 1
+    await miner.drain()
+    assert generator.loads == [0, 1] and len(generator.started) == started + 2
+    assert sorted(s["k_generated"] for s in transport.submissions) == [0, 0]
+
+
+async def test_a_failed_engine_step_requeues_the_running_leases():
+    miner, transport, generator, _ = streaming(quota=4, batch_groups=2)
+    await miner.refresh_quota()
+    await miner.lease_more()
+    generator.fail_next = True
+    assert await miner.generate_once() == 0
+    assert not miner.running and not generator.running and len(miner.queue) == 4
+    await miner.generate_once()
+    await miner.drain()
+    assert len(transport.submissions) == 2
+
