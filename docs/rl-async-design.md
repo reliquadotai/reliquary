@@ -178,9 +178,9 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
 
 - Miners generate on any checkpoint they hold; the lease records k; verification is always
   against the latest checkpoint. Staleness costs match, hence pay, and is self-priced.
-- **Floor:** 0.95 per rollout with bf16 heads (about 0.96 with fp32 heads, to calibrate at
-  qualification). Keeps every honest rollout at lag <= 2, rejects all W4A16. fp8 weights sit
-  around 0.95: a pricing question, not a floor question.
+- **Floor:** 0.90 per rollout (to confirm at qualification). Trainer-vs-vLLM bf16 noise leaves a
+  few honest rollouts just under 0.95 even at lag 0; the gap tests judge each mismatch. Still
+  rejects all W4A16.
 - **Rollout-level rule:** a rollout under the floor is excluded and unpaid; the group is
   judged on its pooled match (one noisy rollout must not kill the group: x16 compounding). The
   floor tolerates honest noise, never forgery: one rollout under `RL_FORGERY_MATCH_FLOOR`

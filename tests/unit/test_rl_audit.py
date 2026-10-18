@@ -114,8 +114,8 @@ def test_a_rollout_under_the_floor_is_excluded_the_group_is_judged_pooled():
     def d(stochastic, match):
         return fs.SeedConsistencyDiagnostics(n_positions=stochastic, n_stochastic=stochastic, n_exact_match=match)
 
-    result = rl_audit.judge([d(100, 90)] + [d(100, 99)] * 15)           # pooled 0.984
-    assert result.passed is True and result.rollout_match[0] == 0.90 < rl_audit.RL_ROLLOUT_MATCH_FLOOR
+    result = rl_audit.judge([d(100, 85)] + [d(100, 99)] * 15)           # pooled 0.981
+    assert result.passed is True and result.rollout_match[0] == 0.85 < rl_audit.RL_ROLLOUT_MATCH_FLOOR
     result = rl_audit.judge([d(100, 80)] * 8 + [d(100, 99)] * 8)        # pooled 0.895 < the group floor
     assert result.passed is False and result.failure_class == AUDIT_FAILURE_STATISTICAL
     result = rl_audit.judge([d(1, 0)] * 16)                              # 16 drawn positions: abstain, suspect

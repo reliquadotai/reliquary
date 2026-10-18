@@ -719,7 +719,7 @@ over the module-level `batcher.admission_problem_materials`, shared with P3).
 New code next to the window path (`emission_price`, `settlement`, `rl_pay`, `weight_only` unchanged).
 
 - `validator/rl_ledger.py`: `RlPayLedger` reads `RlSubmissions.events(since)` (cursor persisted) into `rl_accruals`
-  (same SQLite file). `trained`: flat pay, matched tokens of every rollout with match >= `floor` (0.95; re-checked
+  (same SQLite file). `trained`: flat pay, matched tokens of every rollout with match >= `floor` (0.90; re-checked
   even though the trainer masks them) x the env's price per token at ingestion. Matched tokens = the trainer's
   exact counts (`report_training(..., matched_tokens=[...])`, new optional argument, bounded by the completion
   length), else `floor(match x completion tokens)`. `first_scan`: `fraction` (0.25) x **an in-zone group's pay**,
@@ -817,7 +817,7 @@ One branch carries the whole async RL work on top of current main.
 - Audit `ProofForward` (`validator/rl_audit.py`): per rollout, `verifier.proof_forward_rows` (the proof path's
   batch-1 forward and lazy fp32 head, now shared with `verify_commitment_proofs`) and the verifier's
   `_gpu_seed_consistency_diagnostics` with `draw_uniforms(i)`, force span excluded. Match = exact / stochastic.
-  Pooled match under `RL_ROLLOUT_MATCH_FLOOR` (0.95 placeholder, also the ledger's floor) -> `statistical`; a
+  Pooled match under `RL_ROLLOUT_MATCH_FLOOR` (0.90 placeholder, also the ledger's floor) -> `statistical`; a
   rollout on the draw (match >= floor) with more than `RL_AUDIT_FORGERY_MISMATCH_TOLERANCE` (1) hard mismatches at
   near-deterministic positions -> `deterministic`; no model -> `passed=None`. Hook: `run_rl_audits(model,
   submissions, limit=8)`, to schedule from the service with its verify model.

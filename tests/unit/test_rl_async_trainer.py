@@ -162,11 +162,11 @@ def test_a_rollout_under_the_floor_leaves_the_loss_and_the_pay():
     honest = SimpleNamespace(rollouts=group.rollouts[:3], prompt_idx=7)
     want = grads_of(model, [(honest, advantages[:3], 1.0 / (ROLLOUTS * N_TOK))], DrawGate([[0, 1, 2]]))
     assert all(torch.allclose(a, b, atol=1e-7) for a, b in zip(got, want))
-    assert gate.forgery_floor <= gate.rate(3) < 0.95 and gate.rate(0) == 1.0
+    assert gate.forgery_floor <= gate.rate(3) < gate.rollout_floor and gate.rate(0) == 1.0
     detail = {"rollout_match": [gate.rate(s) for s in range(4)],
               "completion_tokens": [N_TOK] * 4,
               "matched_tokens": [gate.tallies[s][3] if gate.admitted[s] else 0 for s in range(4)]}
-    assert paid_tokens(detail, 0.95) == 3 * N_TOK
+    assert paid_tokens(detail, gate.rollout_floor) == 3 * N_TOK
 
 
 def test_one_rollout_under_the_forgery_floor_rejects_its_group_whatever_the_pool():

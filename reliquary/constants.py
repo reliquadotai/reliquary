@@ -1991,10 +1991,11 @@ FORCED_SEED_CDF_BOUNDARY_EPSILON = 0.002
 FORCED_SEED_GUMBEL_BOUNDARY_EPSILON = 0.05
 # Async RL (rl-async-design.md §4.4, §4.6): the per-rollout match floor on stochastic positions under the Gumbel
 # draw, against the latest checkpoint. One value for the trainer's verification, the audit and the pay ledger.
-# PLACEHOLDER: 0.95 with bf16 heads (about 0.96 with fp32 heads), to calibrate at GPU qualification.
-RL_ROLLOUT_MATCH_FLOOR = 0.95
-# The pooled match floor a group must reach (trainer and audit alike). Lower than the rollout floor so that one
-# bad rollout among 16 honest ones (0.986) does not fail its group, while two do. PLACEHOLDER, as above.
+# 0.90: trainer-vs-vLLM bf16 noise leaves a few honest rollouts just under 0.95 even at lag 0, and the gap tests
+# already judge each mismatch. PLACEHOLDER, to confirm on the 9B.
+RL_ROLLOUT_MATCH_FLOOR = 0.90
+# The pooled match floor a group must reach (trainer and audit alike), on 16 rollouts (honest pool 0.986).
+# PLACEHOLDER, as above.
 RL_GROUP_MATCH_FLOOR = 0.90
 # An audited rollout that follows the draw (match >= the floor) yet carries more than this many hard mismatches at
 # near-deterministic positions (max p >= FORCED_SEED_STOCHASTIC_MAXPROB, Gumbel shortfall beyond the boundary

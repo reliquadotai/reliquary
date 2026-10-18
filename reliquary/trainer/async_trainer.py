@@ -27,7 +27,7 @@ work trained into the weights the step computed. If the process dies between the
 that step's weights are lost, but the miners did the work and keep its pay (deliberate, not a race to fix).
 
 Floors are PLACEHOLDERS to calibrate at GPU qualification: ``ASYNC_ROLLOUT_FLOOR`` =
-``constants.RL_ROLLOUT_MATCH_FLOOR`` (the design's 0.95 with bf16 heads, about 0.96 with fp32 heads) and
+``constants.RL_ROLLOUT_MATCH_FLOOR`` (0.90) and
 ``ASYNC_GROUP_FLOOR`` 0.90 (pooled); a group with a forwarded rollout under ``ASYNC_FORGERY_FLOOR`` (0.5) is
 rejected whatever its pool (one forged rollout must not ride on honest ones). A rollout's match
 (``rl_draw.rollout_rate``) is its rate on stochastic positions (max p < 0.99) when it has

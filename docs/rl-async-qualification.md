@@ -81,7 +81,7 @@ proof-worker images; signer, proof worker, controller in that order).
 
 | Parameter | Placeholder | Set by |
 |---|---|---|
-| `RL_ROLLOUT_MATCH_FLOOR` | 0.95 | Q2 |
+| `RL_ROLLOUT_MATCH_FLOOR` | 0.90 | Q2 |
 | `RL_GROUP_MATCH_FLOOR` | 0.90 | Q2 |
 | `RL_FORGERY_MATCH_FLOOR` | 0.5 | Q2 (honest p0.001 on the worst card) |
 | `RL_GAP_TOLERANCE` | 8.0 (honest gaps grow with lag) | Q5: logged `async/gap_*` at the real lag |

@@ -62,7 +62,7 @@ def test_rollouts_under_the_floor_are_never_paid(book):
     subs = service(book, probation_groups=0)
     ledger = ledger_for(book, subs)
     per = len(RIGHT.tokens)
-    trained(book, subs, 1, [0.99] * 10 + [0.949] * 6, matched=[per] * 16)
+    trained(book, subs, 1, [0.99] * 10 + [0.899] * 6, matched=[per] * 16)
     held = lease(book, 2)
     subs.submit(held.lease_id, "A", group(8))
     with pytest.raises(ValueError):                                     # more matched tokens than generated
@@ -250,7 +250,7 @@ def test_the_pay_route_publishes_prices_and_balances(book):
                                              pay=ledger))
     client = TestClient(app)
     body = client.get("/rl/pay").json()
-    assert body["policy"] == "pay-per-matched-token/v1" and body["floor"] == 0.95
+    assert body["policy"] == "pay-per-matched-token/v1" and body["floor"] == 0.90
     assert body["environments"][ENV]["token_price"] == pytest.approx(NOMINAL)
     assert body["hotkeys"][MINER.ss58_address]["accrued"] == pytest.approx(GROUP_TOKENS * NOMINAL)
     one = client.get("/rl/pay", params={"hotkey": VALIDATOR.ss58_address}).json()
