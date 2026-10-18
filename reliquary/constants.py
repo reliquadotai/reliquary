@@ -2001,6 +2001,9 @@ RL_GROUP_MATCH_FLOOR = 0.90
 # near-deterministic positions (max p >= FORCED_SEED_STOCHASTIC_MAXPROB, Gumbel shortfall beyond the boundary
 # epsilon) was edited after the draw: deterministic forgery. PLACEHOLDER: calibrate on honest lag-2 rollouts.
 RL_AUDIT_FORGERY_MISMATCH_TOLERANCE = 1
+# An audit runs against the latest checkpoint; one queued longer than this many checkpoints after its lease's is
+# dropped unjudged (inconclusive: unpaid, no probation effect) instead of judged on drifted weights. PLACEHOLDER.
+RL_AUDIT_MAX_LAG = 4
 # A rollout whose match falls this far under the rollout floor is no honest noise (honest single rollouts bottom
 # around 0.8): its whole group is rejected (trainer) or fails (audit) as statistical evidence, so a forged rollout
 # (e.g. one [EOS] that moves a 16/16 group into the zone) cannot ride on 15 honest ones. PLACEHOLDER.

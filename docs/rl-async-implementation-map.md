@@ -692,7 +692,8 @@ over the module-level `batcher.admission_problem_materials`, shared with P3).
 - Audit (§C, design §4.4): draw after submission with `SystemRandom`; probation = < 100 passed out-of-zone audits,
   or < 20 passes since the last failure; a failure of any class -> unpaid, re-probation, never a ban (10-17);
   `RlSubmissions.blacklist` is the operator's ban (`LeaseBook.ban`: refusal `banned`, no submission). Queue order:
-  past-probation hotkeys first, oldest first. `ProofForward(SubmittedGroup) -> AuditResult(passed | None,
+  past-probation hotkeys first, newest first; `drop_stale_audits` concludes inconclusive (unpaid, no probation
+  effect) every audit more than `audit_max_lag` (`RL_AUDIT_MAX_LAG`, 4) checkpoints behind the latest. `ProofForward(SubmittedGroup) -> AuditResult(passed | None,
   failure_class, rollout_match)` is the Gumbel verifier's slot; `run_audits` drains.
 - Hooks for P4/P5: `report_training(lease_id, rollout_match, accepted, failure_class=None)` (accepted -> `trained`
   event with per-rollout match and token counts; rejected -> unpaid; with a class it is logged as a failed verdict). `rl_events` (`first_scan` 25 % payable: at once when not drawn, at pass when

@@ -28,7 +28,8 @@ Audit regime (decisions doc §C as amended 10-09, the design's §4.4): probation
 audits since the hotkey's last failure of any class. A failure is never sanctioned (user, 2026-10-17): the group
 is unpaid and the hotkey back in probation, nothing more. Honest drift fails groups too, so a verdict cannot tell
 a forger from a lagging miner; a forger gains nothing but burned GPU time. The audit's lag is kept in
-``rl_audits``. An inconclusive audit (``passed=None``: no model) is unpaid. A ``suspect`` inconclusive (the audit
+``rl_audits``. An inconclusive audit (``passed=None``: no model, or queued past ``audit_max_lag`` checkpoints) is
+unpaid. A ``suspect`` inconclusive (the audit
 abstained on too few drawn positions, or its forward raised ``AUDIT_MAX_ATTEMPTS`` times, counted in
 ``rl_audits``) is logged as an ``inconclusive`` verdict: never a pass, and it re-opens probation like a failure.
 ``blacklist`` is the operator's ban (no lease, no submission, unsettled pay forfeited).
@@ -53,6 +54,7 @@ from typing import Any
 
 from reliquary.constants import (
     MAX_NEW_TOKENS_PROTOCOL_CAP,
+    RL_AUDIT_MAX_LAG,
     RL_FIRST_SCAN_MIN_TOKENS,
     SERVICE_REPROBATION_PASSES,
     max_new_tokens_for_environment,
@@ -138,11 +140,12 @@ class SubmitConfig:
     first_scan_fraction: float = 0.25
     first_scan_min_tokens: int = RL_FIRST_SCAN_MIN_TOKENS
     rollouts: int = GROUP_ROLLOUTS
+    audit_max_lag: int = RL_AUDIT_MAX_LAG
 
     def __post_init__(self) -> None:
         if not (0.0 <= self.audit_rate <= 1.0 and 0.0 <= self.first_scan_fraction <= 1.0):
             raise ValueError("audit rate and first-scan fraction are fractions")
-        if min(self.probation_groups, self.reprobation_passes, self.first_scan_min_tokens) < 0:
+        if min(self.probation_groups, self.reprobation_passes, self.first_scan_min_tokens, self.audit_max_lag) < 0:
             raise ValueError("audit counts must be non-negative")
         if self.rollouts < 2:
             raise ValueError("a group has at least 2 rollouts")
@@ -416,11 +419,12 @@ class RlSubmissions:
             self._event("", hotkey, BAN, now, {"reason": str(reason), "until": float(until)})
 
     def audit_jobs(self, limit: int) -> list[SubmittedGroup]:
-        """Queued audits, oldest first, hotkeys past probation before those in probation (decisions doc §C).
-        Audit promptly: the forward runs against the latest checkpoint (§4.4), so a late audit costs match."""
+        """Queued audits, newest first, hotkeys past probation before those in probation (decisions doc §C).
+        The forward runs against the latest checkpoint (§4.4): under a backlog the freshest groups are judged and the
+        stale ones dropped (``drop_stale_audits``)."""
         with self.book.lock:
             rows = self.book.db.execute("SELECT body FROM rl_audits WHERE body IS NOT NULL ORDER BY forced, "
-                                        "queued_at LIMIT ?", (int(limit),)).fetchall()
+                                        "queued_at DESC LIMIT ?", (int(limit),)).fetchall()
         return [SubmittedGroup.unpack(body) for body, in rows]
 
     def report_audit(self, lease_id: str, result: AuditResult, now: float | None = None) -> None:
@@ -449,11 +453,29 @@ class RlSubmissions:
             if first_scan:
                 self._first_scan(lease_id, hotkey, now, state, tokens)
 
+    def drop_stale_audits(self, now: float | None = None) -> int:
+        """Conclude inconclusive (unpaid, no probation effect) every queued audit whose lease is more than
+        ``audit_max_lag`` checkpoints behind the latest: judged on drifted weights, an honest group would fail."""
+        latest = self.book.latest_checkpoint
+        if latest is None:
+            return 0
+        with self.book.lock:
+            stale = [lease for lease, in self.book.db.execute(
+                "SELECT a.lease_id FROM rl_audits a JOIN rl_groups g ON g.lease_id=a.lease_id "
+                "WHERE a.body IS NOT NULL AND g.k < ?", (latest - self.config.audit_max_lag,))]
+        for lease in stale:
+            self.report_audit(lease, AuditResult(None), now)
+        if stale:
+            logger.info("dropped %d audits queued past %d checkpoints", len(stale), self.config.audit_max_lag)
+        return len(stale)
+
     def run_audits(self, forward: ProofForward, limit: int, *, max_attempts: int = AUDIT_MAX_ATTEMPTS) -> int:
         """Drain up to ``limit`` queued audits through ``forward`` (the proof forward, the Gumbel verifier).
         A forward that raises leaves its audit queued and the others still run; after ``max_attempts`` raising
         forwards (counted in ``rl_audits``, across restarts) the audit is concluded a suspect inconclusive
-        (unpaid, unsanctioned, no probation pass), so one poison group (e.g. an OOM) cannot stall the queue."""
+        (unpaid, unsanctioned, no probation pass), so one poison group (e.g. an OOM) cannot stall the queue. Stale
+        audits are dropped first (``drop_stale_audits``, not counted)."""
+        self.drop_stale_audits()
         done = 0
         for group in self.audit_jobs(limit):
             try:

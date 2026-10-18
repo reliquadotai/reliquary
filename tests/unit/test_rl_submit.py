@@ -459,6 +459,29 @@ def test_an_audit_failure_of_a_lagged_lease_is_a_failure_with_its_lag(book):
     assert lag == 3
 
 
+def test_a_backlog_judges_the_freshest_audits_and_drops_the_stale_ones_unjudged(book):
+    subs = service(book, audit_rate=1.0, audit_max_lag=2)
+    stale = lease(book, 87)
+    subs.submit(stale.lease_id, "A", group(0), arrived_at=NOW + 1)
+    for k in (1, 2):
+        book.adopt_checkpoint(k)
+    older, newer = (book.grant([LeaseRequest("A", ENV, (p,), 2)])[0].leases[0] for p in (88, 90))
+    subs.submit(older.lease_id, "A", group(0), arrived_at=NOW + 2)
+    subs.submit(newer.lease_id, "A", group(0), arrived_at=NOW + 3)
+    assert [g.lease_id for g in subs.audit_jobs(10)] == [newer.lease_id, older.lease_id, stale.lease_id]
+    book.adopt_checkpoint(3)                                                       # the first lease is 3 behind
+    seen = []
+
+    def forward(g):
+        seen.append(g.lease_id)
+        return AuditResult(passed=True, rollout_match=(0.99,) * 16)
+
+    assert subs.run_audits(forward, 10) == 2 and seen == [newer.lease_id, older.lease_id]
+    assert subs.group(stale.lease_id)["audit"] == "inconclusive" and (stale.lease_id, FIRST_SCAN_FORFEITED) in kinds(subs)
+    with book.lock:
+        assert book.db.execute("SELECT count(*) FROM rl_verdicts WHERE lease_id=?", (stale.lease_id,)).fetchone() == (0,)
+
+
 def test_audit_forward_attempts_are_persisted_across_restarts(book):
     poison = lease(book, 89)
     service(book).submit(poison.lease_id, "A", group(0))
