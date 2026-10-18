@@ -1603,8 +1603,9 @@ EMISSION_PRICE_ARMED = _os.environ.get(
 # showed 5e-7 produced a sketch delta of ~600 (≈10 % of the 6000 sketch
 # tolerance) over 50 training steps — effectively indistinguishable from the
 # base model, which also means stale-model cheaters pass GRAIL. Matched
-# DAPO / R1-Zero-scale literature (1e-6 to 5e-6) by bumping to 5e-6.
-_PROFILE_LEARNING_RATE = "1e-6" if PROTOCOL_VERSION >= 3 else "5e-6"
+# DAPO / R1-Zero-scale literature (1e-6 to 5e-6) by bumping to 5e-6. The 9B async launch runs 2e-6 (decision N,
+# user 2026-10-17): 5e-6 learns faster but widens the honest drift of lagged miners.
+_PROFILE_LEARNING_RATE = "2e-6" if PROTOCOL_VERSION >= 3 else "5e-6"
 LEARNING_RATE = float(
     _os.environ.get("RELIQUARY_LEARNING_RATE", _PROFILE_LEARNING_RATE)
 )
