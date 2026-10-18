@@ -194,8 +194,12 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
      with the report; the validator grades those rollouts again with the picks there (the first
      of a run of consecutive mismatches only). A reward that moves: the group is unpaid, no
      sanction. Episodes are not re-graded.
-  3. **The final EOS** (the window path's `p_stop` rule, ported): its verifier probability must
-     reach `RL_TERMINAL_MIN_P` and its gap stay within `RL_TERMINAL_GAP`.
+  3. **The final EOS**: its gap must stay within `RL_TERMINAL_GAP` (the re-grade cannot see a cut
+     continuation). No probability floor, unlike the window path's `p_stop`: an honest draw ends on
+     an unlikely EOS too (IF, 2026-10-18: honest final EOS down to p = 7e-7 with gap 0).
+  A rollout with fewer than 20 drawn positions gets no match rate in the trainer (one honest near-tie
+  in 3 tokens is 0.67): the gap and final-EOS tests judge it. The audit, which has neither, still
+  rates it.
   Thresholds are placeholders until the gaps of a real run are logged (`async/gap_*`,
   `async/rollouts_regraded`, `async/rollouts_bad_termination`).
 - **Leases only on checkpoints whose secret S_k is unrevealed** (DECIDED). Once S_k is public

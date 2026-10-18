@@ -1209,7 +1209,6 @@ class _DrawRows(NamedTuple):
     stochastic: torch.Tensor  # [N] bool: max p under the verifier's stochastic threshold
     entropy: torch.Tensor     # [N] fp32, nats
     gap: torch.Tensor         # [N] fp32: Gumbel score gap of the miner's token (0: it is v*, or not a Gumbel draw)
-    p_token: torch.Tensor     # [N] fp32: the verifier's probability of the miner's token (p_stop at a final EOS)
 
 
 def _draw_logits(project, weight):
@@ -1242,14 +1241,12 @@ def _forced_draw_rows(logits_of, rows, targets, draws, chunk: int = _LOGPROB_CHU
     stochastic = torch.zeros(n, dtype=torch.bool, device=targets.device)
     entropy = torch.zeros(n, dtype=torch.float32, device=targets.device)
     gap = torch.zeros(n, dtype=torch.float32, device=targets.device)
-    p_token = torch.zeros(n, dtype=torch.float32, device=targets.device)
     for start in range(0, n, chunk):
         end = min(n, start + chunk)
         logits = logits_of(rows[start:end])
         logp = torch.log_softmax(logits.float(), dim=-1)
         probs = logp.exp()
         stochastic[start:end] = probs.max(dim=-1).values < settings.stochastic_threshold
-        p_token[start:end] = probs.gather(1, targets[start:end, None].to(probs.device))[:, 0]
         entropy[start:end] = -(probs * logp).nan_to_num(0.0).sum(dim=-1)
         del logp, probs
         local = [k for k in range(start, end) if draws[k] is not None]
@@ -1265,7 +1262,7 @@ def _forced_draw_rows(logits_of, rows, targets, draws, chunk: int = _LOGPROB_CHU
                                    top_k=settings.top_k, top_p=settings.top_p)
             picked[index] = chosen.to(picked.device)
     drawn = torch.tensor([u is not None for u in draws], dtype=torch.bool, device=targets.device)
-    return _DrawRows(picked, drawn, drawn & (picked == targets), stochastic, entropy, gap, p_token)
+    return _DrawRows(picked, drawn, drawn & (picked == targets), stochastic, entropy, gap)
 
 
 def _hidden_logprob_block(
@@ -2210,12 +2207,11 @@ def _rollout_draw_tallies(draw_rows: _DrawRows, keep_seg: list[int]) -> list[tup
 
 def _draw_suspects(draw_rows: _DrawRows, seg: list[int], positions, plens, substitute_gap: float):
     """Per rollout, over every scored row (before the keep mask): (largest Gumbel gap, [(completion position, v*)]
-    of the mismatches whose gap exceeds ``substitute_gap``, the last scored row's (gap, probability of the miner's
-    token) or None when it carried no draw): what the gate's gap and termination tests and the re-grading read."""
+    of the mismatches whose gap exceeds ``substitute_gap``, the last scored row's gap or None when it carried no
+    draw): what the gate's gap and termination tests and the re-grading read."""
     with torch.no_grad():
         gaps = draw_rows.gap.tolist()
         picks = draw_rows.targets.tolist()
-        p_token = draw_rows.p_token.tolist()
         drawn = draw_rows.drawn.tolist()
     out, offset = [], 0
     for k, n in enumerate(seg):
@@ -2225,7 +2221,7 @@ def _draw_suspects(draw_rows: _DrawRows, seg: list[int], positions, plens, subst
         out.append((max((gaps[r] for r in rows), default=0.0),
                     [(int(positions[k][r - rows.start]) - int(plens[k]), int(picks[r]))
                      for r in rows if gaps[r] > substitute_gap],
-                    None if last is None or not drawn[last] else (gaps[last], p_token[last])))
+                    None if last is None or not drawn[last] else gaps[last]))
     return out
 
 

@@ -54,7 +54,6 @@ from reliquary.constants import (
     RL_ROLLOUT_MATCH_FLOOR,
     RL_SUBSTITUTE_GAP,
     RL_TERMINAL_GAP,
-    RL_TERMINAL_MIN_P,
 )
 from reliquary.protocol.rl_draw import pooled_rate, rollout_rate
 from reliquary.validator import telemetry
@@ -87,20 +86,18 @@ class DrawGate:
 
     A rollout is admitted when its match reaches ``rollout_floor`` and none of its tokens is further than
     ``gap_tolerance`` from the pick (``RL_GAP_TOLERANCE``), and, when it ends on one of ``eos_ids`` (not an
-    episode), that EOS has the verifier's probability ``terminal_min_p`` and a gap of at most ``terminal_gap``: a
-    cut-short rollout keeps no trace for the re-grade. Its mismatches over ``substitute_gap`` are kept
+    episode), that EOS has a gap of at most ``terminal_gap``: a cut-short rollout keeps no trace for the re-grade. Its mismatches over ``substitute_gap`` are kept
     (``substitutions``): the validator re-grades the rollout with the trainer's picks there."""
 
     def __init__(self, groups: list[list[int]], *, rollout_floor: float = ASYNC_ROLLOUT_FLOOR,
                  group_floor: float = ASYNC_GROUP_FLOOR, forgery_floor: float = ASYNC_FORGERY_FLOOR,
                  gap_tolerance: float = RL_GAP_TOLERANCE, substitute_gap: float = RL_SUBSTITUTE_GAP,
-                 terminal_min_p: float = RL_TERMINAL_MIN_P, terminal_gap: float = RL_TERMINAL_GAP,
-                 eos_ids=()) -> None:
+                 terminal_gap: float = RL_TERMINAL_GAP, eos_ids=()) -> None:
         self.groups = [list(g) for g in groups]
         self.rollout_floor, self.group_floor = float(rollout_floor), float(group_floor)
         self.forgery_floor = float(forgery_floor)
         self.gap_tolerance, self.substitute_gap = float(gap_tolerance), float(substitute_gap)
-        self.terminal_min_p, self.terminal_gap = float(terminal_min_p), float(terminal_gap)
+        self.terminal_gap = float(terminal_gap)
         self.eos_ids = frozenset(int(t) for t in eos_ids)
         self.extra: dict[str, float] = {}
         self.reset()
@@ -127,7 +124,7 @@ class DrawGate:
                 tokens, meta = rollout.commit["tokens"], rollout.commit.get("rollout", {})
                 end = suspects[i][2] if len(suspects[i]) > 2 else None
                 if end is not None and tokens and int(tokens[-1]) in self.eos_ids and "episode" not in meta:
-                    self.bad_terminal[slot] = int(end[1] < self.terminal_min_p or end[0] > self.terminal_gap)
+                    self.bad_terminal[slot] = int(end > self.terminal_gap)
             ok = (rollout_rate(tally) >= self.rollout_floor and self.max_gap[slot] <= self.gap_tolerance
                   and not self.bad_terminal[slot])
             self.admitted[slot] = int(ok)
@@ -264,8 +261,7 @@ class AsyncTrainerConfig:
     forgery_floor: float = ASYNC_FORGERY_FLOOR
     gap_tolerance: float = RL_GAP_TOLERANCE         # a token further than this from the pick: rollout refused
     substitute_gap: float = RL_SUBSTITUTE_GAP       # mismatches beyond this are re-graded with the pick
-    terminal_min_p: float = RL_TERMINAL_MIN_P       # the final EOS's probability under the verifier
-    terminal_gap: float = RL_TERMINAL_GAP           # and its gap
+    terminal_gap: float = RL_TERMINAL_GAP           # the final EOS's gap
     eos_ids: tuple[int, ...] = ()                   # the model's stop tokens (the termination test's subject)
     max_lag: int = SECRET_REVEAL_LAG         # no quality cap (the floor decides); bounds the buffer only
     poll_s: float = 0.5                      # while the batch is not full
@@ -381,8 +377,7 @@ class AsyncTrainer:
         gate = DrawGate([[r._async_slot for r in g.rollouts] for g in batch],
                         rollout_floor=self.config.rollout_floor, group_floor=self.config.group_floor,
                         forgery_floor=self.config.forgery_floor, gap_tolerance=self.config.gap_tolerance,
-                        substitute_gap=self.config.substitute_gap, terminal_min_p=self.config.terminal_min_p,
-                        terminal_gap=self.config.terminal_gap, eos_ids=self.config.eos_ids)
+                        substitute_gap=self.config.substitute_gap, terminal_gap=self.config.terminal_gap, eos_ids=self.config.eos_ids)
         envs: dict[str, int] = {}
         for group in submitted:
             envs[group.environment] = envs.get(group.environment, 0) + 1

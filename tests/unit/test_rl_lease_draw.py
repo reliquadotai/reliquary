@@ -12,7 +12,7 @@ import torch
 from reliquary.environment.forced_sampling import DRAW_GUMBEL_MAX, pick_rows, u_at
 from reliquary.miner.rl_async import HeldLease, draw_context
 from reliquary.miner.vllm_generation import FORCED_SEED_KEY, _forced_state, _uniform, forced_seed_extra_args
-from reliquary.protocol.rl_draw import lease_draw_context, lease_uniforms
+from reliquary.protocol.rl_draw import lease_draw_context, lease_uniforms, pooled_rate, rollout_rate
 from reliquary.validator.rl_buffer import SubmittedGroup
 from reliquary.validator.rl_lease_quota import QuotaConfig, QuotaController
 from reliquary.validator.rl_leases import LeaseBook, LeaseBookConfig, LeaseRequest
@@ -74,3 +74,11 @@ def test_a_malformed_nonce_or_checkpoint_is_refused():
         lease_draw_context("zz", 1, 0)
     with pytest.raises(ValueError):
         lease_draw_context("ab", 1, -1)
+
+
+def test_a_rollout_too_short_for_a_rate_is_left_to_the_gap_tests():
+    """(stochastic, stochastic matches, drawn, drawn matches): one honest near-tie in 3 tokens is no evidence."""
+    assert rollout_rate((3, 2, 3, 2)) == 1.0 and rollout_rate((0, 0, 0, 0)) == 0.0
+    assert rollout_rate((5, 4, 40, 30)) == 0.75                     # long enough: the rate on every drawn position
+    assert rollout_rate((25, 20, 40, 35)) == 0.8                    # enough stochastic positions: their rate
+    assert pooled_rate([(3, 2, 3, 2)] * 4) == 8 / 12                # a group pools every position, short or not

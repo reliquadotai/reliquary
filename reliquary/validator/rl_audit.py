@@ -18,7 +18,8 @@ Verdict (each rollout's tallies read as the trainer reads them, ``rl_draw.rollou
 * fewer than ``FORCED_SEED_MIN_STOCH_POSITIONS`` drawn positions in the whole group: the audit abstains,
   ``passed=None`` with ``suspect`` (nothing verified: unpaid, no probation pass, the hotkey stays in probation);
 * ``statistical`` failure: the pooled match is under the floor (``RL_GROUP_MATCH_FLOOR``, the trainer's), or a
-  rollout is under ``RL_FORGERY_MATCH_FLOOR`` (no honest noise). A rollout between the two floors is excluded from
+  rollout is under ``RL_FORGERY_MATCH_FLOOR`` (no honest noise). Unlike the trainer, the audit rates short rollouts
+  too (``min_drawn=0``): it has no Gumbel gap or final-EOS test to judge them by. A rollout between the two floors is excluded from
   pay (§4.6), it does not fail the group by itself;
 * no model: ``passed=None`` (inconclusive: unpaid, unsanctioned).
 
@@ -65,7 +66,7 @@ def judge(diagnostics, *, floor: float = RL_ROLLOUT_MATCH_FLOOR, group_floor: fl
           forgery_floor: float = RL_FORGERY_MATCH_FLOOR) -> AuditResult:
     """The group verdict from its rollouts' diagnostics (see the module doc)."""
     tallies = [(d.n_stochastic, d.n_exact_match, d.n_positions, d.n_drawn_exact_match) for d in diagnostics]
-    match = tuple(rollout_rate(t) for t in tallies)
+    match = tuple(rollout_rate(t, min_drawn=0) for t in tallies)      # no gap test here: short rollouts get a rate
     if any(d.n_stochastic >= FORCED_SEED_ROLLOUT_MIN_STOCH and m >= floor
            and d.n_deterministic_hard_mismatch > tolerance for d, m in zip(diagnostics, match)):
         return AuditResult(False, AUDIT_FAILURE_DETERMINISTIC, match)

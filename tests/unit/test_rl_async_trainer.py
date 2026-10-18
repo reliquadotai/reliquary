@@ -346,22 +346,19 @@ def test_the_gate_refuses_a_token_far_from_the_pick_and_keeps_the_suspects_for_t
 
 
 
-def test_a_rollout_cut_short_by_an_unlikely_eos_is_refused():
-    """A final EOS is checked on its own (the re-grade cannot see a cut continuation): it needs the verifier's
-    probability ``terminal_min_p`` and a gap of at most ``terminal_gap``. Here every rollout's last token stands
-    for the EOS; the noisy rollout's last token is a random one."""
+def test_a_rollout_cut_short_by_an_eos_far_from_the_pick_is_refused():
+    """A final EOS is checked on its own (the re-grade cannot see a cut continuation): its gap must be at most
+    ``terminal_gap``. Here every rollout's last token stands for the EOS; the noisy rollout's last token is a random
+    one."""
     model = _Model()
     group = training_group(submitted(model, "g", noisy={3}), slot0=0, index=0)
     plan = [(group, [1.0, -1.0, 1.0, -1.0], 1.0 / (ROLLOUTS * N_TOK))]
     eos = {r.commit["tokens"][-1] for r in group.rollouts}
     loose = dict(rollout_floor=0.0, group_floor=0.0, forgery_floor=0.0, gap_tolerance=float("inf"))
-    gate = DrawGate([[0, 1, 2, 3]], **loose, terminal_min_p=0.0, terminal_gap=0.5, eos_ids=eos)
+    gate = DrawGate([[0, 1, 2, 3]], **loose, terminal_gap=0.5, eos_ids=eos)
     grads_of(model, plan, gate)
     assert gate.bad_terminal == [0, 0, 0, 1] and gate.admitted == [1, 1, 1, 0]
     assert gate.metrics()["async/rollouts_bad_termination"] == 1
-    strict_p = DrawGate([[0, 1, 2, 3]], **loose, terminal_min_p=1.01, terminal_gap=float("inf"), eos_ids=eos)
-    grads_of(model, plan, strict_p)
-    assert strict_p.bad_terminal == [1, 1, 1, 1]                               # no probability reaches 1.01
-    off = DrawGate([[0, 1, 2, 3]], **loose, terminal_min_p=1.01, terminal_gap=0.0)          # no EOS ids: no rule
+    off = DrawGate([[0, 1, 2, 3]], **loose, terminal_gap=0.0)                     # no EOS ids: no rule
     grads_of(model, plan, off)
     assert off.bad_terminal == [0, 0, 0, 0]

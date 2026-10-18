@@ -71,19 +71,24 @@ def lease_uniforms(nonce: str, prompt_idx: int, checkpoint: int, rollout_index: 
             for t in range(int(positions))]
 
 
-def rollout_rate(tally, min_stoch: int = FORCED_SEED_ROLLOUT_MIN_STOCH) -> float:
+def rollout_rate(tally, min_stoch: int = FORCED_SEED_ROLLOUT_MIN_STOCH,
+                 min_drawn: int = FORCED_SEED_ROLLOUT_MIN_STOCH) -> float:
     """Match of one rollout from its (stochastic, stochastic matches, drawn, drawn matches) tally: the rate on
     stochastic positions when it has ``min_stoch`` of them, else on every drawn position (a peaked honest rollout
-    matches ~1 there; arbitrary tokens do not); 0 when nothing was drawn (nothing verified)."""
+    matches ~1 there; arbitrary tokens do not); 0 when nothing was drawn (nothing verified). A rollout shorter than
+    ``min_drawn`` drawn positions has no rate worth a floor (one honest near-tie of 3 tokens is 0.67): 1, and the
+    Gumbel gap and final-EOS tests judge it."""
     n_stoch, m_stoch, n_drawn, m_drawn = tally
     if n_stoch >= min_stoch:
         return m_stoch / n_stoch
+    if 0 < n_drawn < min_drawn:
+        return 1.0
     return m_drawn / n_drawn if n_drawn else 0.0
 
 
 def pooled_rate(tallies, min_stoch: int = FORCED_SEED_MIN_STOCH_POSITIONS) -> float:
     """A group's pooled match over its rollouts' tallies, with the same fallback as ``rollout_rate``."""
-    return rollout_rate([sum(t[i] for t in tallies) for i in range(4)], min_stoch)
+    return rollout_rate([sum(t[i] for t in tallies) for i in range(4)], min_stoch, min_drawn=0)
 
 
 __all__ = ["lease_checkpoint_tag", "lease_draw_context", "lease_extra_args", "lease_uniforms", "model_positions",
