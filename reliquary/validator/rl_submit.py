@@ -14,7 +14,7 @@
      cannot grade it): ``rejected``, no observation (decision A), and the quota is halved as for an expiry
      (malformed or forged work is no delivery);
    * otherwise ``classify_group`` gives the verdict, ``LeaseBook.record_outcome`` records the scan and moves the
-     prompt, and the quota counts the delivery (in or out of zone);
+     prompt, and the quota frees the lease's slot (it credits the delivery only once the group is paid);
    * in zone: the group (tokens, lease nonce, k, arrival, hotkey) goes to the ``TrainingBuffer``. It is verified
      in the trainer's forward (§4.7), which reports back through ``report_training``;
    * out of zone: the audit draw, made after submission with the validator's own randomness (``SystemRandom``):
@@ -376,6 +376,7 @@ class RlSubmissions:
         if audit in (NOT_DRAWN, PASSED) and tokens >= self.config.first_scan_min_tokens:
             self._event(lease_id, hotkey, FIRST_SCAN, at,
                         {"fraction": self.config.first_scan_fraction, "audited": audit == PASSED})
+            self.book.credit(lease_id, now=at)
         else:
             self._event(lease_id, hotkey, FIRST_SCAN_FORFEITED, at, {"audit": audit, "tokens": tokens})
 
@@ -559,6 +560,7 @@ class RlSubmissions:
                 detail["reward_moved"] = True
             if accepted:
                 self._event(lease_id, group.hotkey, TRAINED, now, detail)
+                self.book.credit(lease_id, now=now)
                 self._verdict(lease_id, group.hotkey, "training", True, None, False, now)
             else:
                 self._event(lease_id, group.hotkey, UNTRAINED, now, {**detail, "failure_class": failure_class})

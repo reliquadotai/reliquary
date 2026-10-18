@@ -138,9 +138,9 @@ All of these share a known fleet capacity C. None of them does slow start, halvi
 - An AIMD controller per hotkey (~250):
   - start at 4;
   - double while the full quota is used and delivered on time;
-  - halve on each expiry;
+  - cut by x0.9 (at least one lease) on each expiry, halve on an integrity rejection;
   - target = throughput × latency × 1.5 over a sliding window;
-  - out-of-zone submissions count as delivered.
+  - only paid groups (trained, payable first scans; `LeaseBook.credit`) count as delivered.
 - Its persistence.
 - `GET /rl/quota` with reasons (~100).
 - The miner reader (~60).
@@ -550,7 +550,7 @@ v* must come from the proof. The trainer cannot recompute it: it has no pi_old m
 - The notes say "Rejected: option B, exclusive reservation. Squatting with many keys, and the validator's nearest miner wins every race on a popular prompt." (`rl-windows-redesign-notes.md:154-155`), and recommend non-exclusive option A (`:142-153`).
 - The design picks exclusivity with 1 s interval fairness, mandatory submission, a small newcomer quota and the burn (`design:93-118`).
 - This is a reversal, and the design should answer the many-keys squatting argument explicitly.
-- Open point: with a deterministic nonce, a lease that expires leaves the same draw for the next lessee at the same k. The first holder knows that outcome, so expiry acts as a paid "release" whose only cost is quota halving, which falls on throwaway keys.
+- Open point: with a deterministic nonce, a lease that expires leaves the same draw for the next lessee at the same k. The first holder knows that outcome, so expiry acts as a paid "release" whose only cost is a quota cut, which falls on throwaway keys.
 
 **C13. Window-scoped settlement and weights.**
 
@@ -662,8 +662,8 @@ P2 and P1a can run in parallel. P5 can start once P1a fixes the v* format.
   profile's per-env `prompt_cooldown_windows_for_environment` counted in checkpoints, read at each outcome so a live
   operator change applies to the next cooldown, decision E; `CooldownMap`'s half-open rule; C6). `prompt_state(since)` is the incremental miner view. The former
   `checkpoint_cooldown(maps)` predicate is gone: the cooldown now lives in the lease DB.
-- `reliquary/validator/rl_lease_quota.py`: `QuotaController` (AIMD cap with slow start, halving on expiry,
-  Little's-law target `headroom x throughput x latency` once steady, persisted in the lease book's file).
+- `reliquary/validator/rl_lease_quota.py`: `QuotaController` (AIMD cap with slow start, `EXPIRY_BACKOFF` x0.9 on expiry,
+  halving on an integrity rejection, credit only for paid groups via `record_paid`, Little's-law target `headroom x throughput x latency` once steady, persisted in the lease book's file).
 - `reliquary/validator/rl_lease_routes.py`: `POST /rl/lease` (signed, `build_rl_lease_binding` in
   `protocol/signatures.py`), `GET /rl/quota?hotkey=`, `GET /rl/lease/commitments`, `GET /rl/prompts/state?since=`
   (public, no hotkey); `ValidatorServer.mount_rl_lease_router`. Not mounted by the CLI/service yet (P3);

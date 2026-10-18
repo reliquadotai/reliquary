@@ -4,7 +4,7 @@ generates them, and every lease ends in a submission or an expiry (there is no r
 * **Exclusive.** At most one live lease per ``(environment, prompt, checkpoint k)``; once a lease of it is
   submitted, the key is closed for that k (the draw would be identical anyway). A SQLite partial unique index
   enforces it. An expired lease frees its key, and the next lessee gets the same draw (resolution C12: accepted,
-  expiry earns nothing and halves the quota).
+  expiry earns nothing and cuts the quota).
 * **Fair inside an interval.** ``LeaseCollector`` gathers the requests that arrive within ``interval_s`` (~1 s)
   and ``LeaseBook.grant`` resolves the whole batch at once: every (request, prompt) claim is shuffled with the
   validator's own randomness (``random.SystemRandom``) and taken in that order, so a contested prompt goes to a
@@ -25,7 +25,7 @@ generates them, and every lease ends in a submission or an expiry (there is no r
   (16) by default: late enough never to bind an honest miner; there is no other lag cap.
 * **Expiry** is fixed per environment (``lease_expiry_s``: the env's max tokens at a slow reference speed, times a
   margin), never derived from the miner. ``expire_due`` sweeps (each ``grant`` and ``submit`` sweeps too) and
-  halves the hotkey's quota. A submission is judged at its arrival: a lease held by ``hold_submission`` (arrived
+  cuts the hotkey's quota (``EXPIRY_BACKOFF``). A submission is judged at its arrival: a lease held by ``hold_submission`` (arrived
   on time, waiting for or in grading) is never expired by a sweep.
 * **One lease of a prompt at a time** across checkpoints (``taken``): the same prompt cannot be leased at every
   unrevealed k at once. A request is cut to the hotkey's room (``quota - in_use``, capped by its share of the
@@ -555,8 +555,9 @@ class LeaseBook:
 
     def submit(self, lease_id: str, hotkey: str, *, in_zone: bool, delivered: bool = True,
                now: float | None = None) -> Lease:
-        """End a lease by its submission (whatever its outcome). Closes its (env, prompt, k) and credits the
-        hotkey's quota; ``delivered=False`` (a group refused for integrity: no work) halves it like an expiry.
+        """End a lease by its submission (whatever its outcome). Closes its (env, prompt, k) and frees its quota
+        slot (credited only when paid: ``credit``); ``delivered=False`` (a group refused for integrity: no work)
+        halves the quota.
         LookupError: unknown, already ended or expired; PermissionError: another hotkey's lease, or a banned
         hotkey."""
         now = float(self.clock()) if now is None else now
@@ -572,6 +573,16 @@ class LeaseBook:
         if failure is not None:
             raise failure
         return replace(lease, state=SUBMITTED)
+
+    def credit(self, lease_id: str, now: float | None = None) -> None:
+        """A submitted lease's group was paid: one delivery for its hotkey's quota (``QuotaController.record_paid``).
+        A lease that is not (or no longer) on record as submitted is ignored."""
+        now = float(self.clock()) if now is None else now
+        with self._txn():
+            row = self.db.execute("SELECT hotkey, issued_at, closed_at FROM rl_leases WHERE lease_id=? AND state=?",
+                                  (lease_id, SUBMITTED)).fetchone()
+            if row is not None:
+                self.quota.record_paid(row[0], issued_at=float(row[1]), submitted_at=float(row[2]), now=now)
 
     # --- bans (set by the audit regime of the submission path) ----------------------------------------------
     def _banned(self, hotkey: str, now: float) -> bool:

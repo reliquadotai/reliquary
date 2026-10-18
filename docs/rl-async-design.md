@@ -24,7 +24,7 @@ Tags: **DECIDED** (user agreed), **PROPOSED** (recommended, awaiting the user),
    nor re-rolled. Every lease ends in a submission or an expiry; there is no release. The
    public seed pool (choose M of 2xM) is removed.
 5. **Quota measured, not declared** (DECIDED). Concurrent leases per hotkey follow measured
-   throughput and latency (Little's law), with slow start and halving on expiry.
+   paid throughput and latency (Little's law), with slow start and a gentle cut on expiry.
 6. **Validator grades everything; trains on what is in zone** (DECIDED). Out-of-zone groups
    are graded, stored, audited by sampling, and paid 25 % of an in-zone group on a prompt's
    first scan.
@@ -133,8 +133,10 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
 - Target concurrency = measured throughput (groups/min) x measured lease-to-submit latency x
   1.5, per hotkey, over a sliding window.
 - New hotkeys start at 4 concurrent leases (PROPOSED). While a hotkey uses its full quota and
-  delivers on time, the quota doubles (slow start). Every expiry halves it. Out-of-zone
-  submissions count as delivered work.
+  delivers on time, the quota doubles (slow start). Every expiry cuts it by x0.9 (at least
+  one lease); a submission refused for integrity halves it. Only paid groups count as
+  delivered work: a trained group, or a payable out-of-zone first scan. A submission that
+  earns nothing frees its slot without credit.
 - Published per hotkey with the reasons. Registration burn applies.
 
 ### 4.4 Submission and grading

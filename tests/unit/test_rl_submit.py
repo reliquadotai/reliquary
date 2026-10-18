@@ -311,6 +311,25 @@ def test_a_raising_audit_forward_neither_stalls_the_queue_nor_runs_forever(book)
     assert book.banned_until("A") is None
 
 
+def test_only_paid_groups_credit_the_quota(book):
+    subs = service(book, probation_groups=0, audit_rate=0.0)
+    trained, untrained, scan = (lease(book, p) for p in (73, 74, 75))
+    for held in (trained, untrained):
+        subs.submit(held.lease_id, "A", group(8))
+    subs.submit(scan.lease_id, "A", group(0))                                   # first scan, not drawn: paid
+    paid = lambda: book.quota.state("A")["counters"]["paid"]
+    assert paid() == 1 and book.in_use("A") == 0
+    subs.report_training(untrained.lease_id, rollout_match=[0.5] * 16, accepted=False)
+    assert paid() == 1
+    subs.report_training(trained.lease_id, rollout_match=[0.99] * 16, accepted=True)
+    assert paid() == 2
+    for k in (1, 2):
+        book.adopt_checkpoint(k)                                                # the 0/16 cooldown is over
+    repeat = book.grant([LeaseRequest("A", ENV, (75,), 2)])[0].leases[0]
+    subs.submit(repeat.lease_id, "A", group(0))                                 # a repeat scan: no pay, no credit
+    assert paid() == 2 and book.quota.state("A")["counters"]["submitted"] == 4
+
+
 def test_the_trainer_reports_match_and_verdict_back_for_pay_and_sanctions(book):
     subs = service(book, probation_groups=0)
     good, stale, forged = (lease(book, p) for p in (70, 71, 72))

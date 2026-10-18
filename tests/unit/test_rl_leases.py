@@ -334,7 +334,7 @@ def test_the_expiry_is_fixed_per_env_from_its_max_length_at_a_reference_speed():
         lease_expiry_s(max_tokens=0, reference_tokens_per_s=20.0, margin=1.5)
 
 
-def test_an_expired_lease_frees_its_prompt_and_halves_the_quota(tmp_path):
+def test_an_expired_lease_frees_its_prompt_and_cuts_the_quota(tmp_path):
     clock = Clock()
     quota = QuotaController(QuotaConfig(initial=8, floor=1))
     book = book_at(tmp_path, clock=clock, quota=quota)
@@ -345,7 +345,7 @@ def test_an_expired_lease_frees_its_prompt_and_halves_the_quota(tmp_path):
     clock.t = NOW + 601
     assert book.expire_due() == 1
     assert book.lease(lease.lease_id).state == "expired" and book.lease(slow.lease_id).state == "open"
-    assert quota.state("A")["quota"] == 4 and quota.state("A")["counters"]["expired"] == 1
+    assert quota.state("A")["quota"] == 7 and quota.state("A")["counters"]["expired"] == 1
     assert book.grant([ask("B", [1])])[0].leases                         # C12: the next lessee gets it
 
 

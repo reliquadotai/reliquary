@@ -1,6 +1,6 @@
 """The per-hotkey lease quota (rl-async-design.md §4.3): start small, double while the full quota is used and
-delivered on time (slow start), halve on every expiry, settle at measured throughput x latency x headroom
-(Little's law), out-of-zone submissions count as delivered work, and every number is explained."""
+delivered on time (slow start), cut on every expiry (halve on a rejection), settle at measured throughput x
+latency x headroom (Little's law), only paid groups count as delivered work, and every number is explained."""
 from __future__ import annotations
 
 import math
@@ -17,13 +17,19 @@ def lease(issued_at: float, expires_at: float | None = None):
     return SimpleNamespace(issued_at=issued_at, expires_at=expires_at or issued_at + 600)
 
 
+def deliver(quota: QuotaController, hotkey: str, issued_at: float, *, now: float, in_zone: bool = True) -> None:
+    """A submission whose group is paid at once."""
+    quota.record_submission(hotkey, lease(issued_at), in_zone=in_zone, now=now)
+    quota.record_paid(hotkey, issued_at=issued_at, submitted_at=now, now=now)
+
+
 def full_round(quota: QuotaController, hotkey: str, now: float, latency: float = 10.0) -> float:
     """Lease the whole quota, then deliver all of it on time."""
     n = quota.quota(hotkey)
     for _ in range(n):
         quota.record_lease(hotkey, now=now)
     for _ in range(n):
-        quota.record_submission(hotkey, lease(now), in_zone=True, now=now + latency)
+        deliver(quota, hotkey, now, now=now + latency)
     return now + latency
 
 
@@ -31,8 +37,8 @@ def test_a_new_hotkey_starts_at_the_initial_quota_and_says_why():
     quota = QuotaController(QuotaConfig(initial=4))
     state = quota.state("new")
     assert state["quota"] == 4 and state["phase"] == "slow_start" and "new hotkey" in state["reason"]
-    assert state["counters"] == {"leased": 0, "submitted": 0, "in_zone": 0, "out_of_zone": 0, "expired": 0,
-                                 "rejected": 0}
+    assert state["counters"] == {"leased": 0, "submitted": 0, "in_zone": 0, "out_of_zone": 0, "paid": 0,
+                                 "expired": 0, "rejected": 0}
 
 
 def test_slow_start_doubles_after_a_full_quota_delivered_on_time():
@@ -51,17 +57,24 @@ def test_no_doubling_without_using_the_full_quota():
     for i in range(3):                                           # never more than 3 in flight
         quota.record_lease("A", now=T0 + i)
     for i in range(3):
-        quota.record_submission("A", lease(T0), in_zone=True, now=T0 + 10 + i)
+        deliver(quota, "A", T0, now=T0 + 10 + i)
     assert quota.quota("A") == 4
 
 
-def test_every_expiry_halves_the_quota_down_to_the_floor():
+def test_an_expiry_cuts_the_quota_gently_and_a_rejection_halves_it_down_to_the_floor():
     quota = QuotaController(QuotaConfig(initial=32, floor=2))
-    for expected in (16, 8, 4, 2, 2):
+    for expected in (28, 25, 22, 19, 17):                        # x0.9, rounded down
         quota.record_expiry("A", lease(T0), now=T0 + 700)
         assert quota.quota("A") == expected
     state = quota.state("A")
     assert state["counters"]["expired"] == 5 and "expired" in state["reason"] and state["phase"] == "steady"
+    for expected in (8, 4, 2, 2):
+        quota.record_expiry("A", lease(T0), now=T0 + 700, cause="rejected")
+        assert quota.quota("A") == expected
+    small = QuotaController(QuotaConfig(initial=3, floor=1))
+    for expected in (2, 1, 1):                                   # at least one lease, never below the floor
+        small.record_expiry("A", lease(T0), now=T0 + 700)
+        assert small.quota("A") == expected
 
 
 def test_an_expiry_inside_a_round_cancels_its_doubling():
@@ -69,19 +82,26 @@ def test_an_expiry_inside_a_round_cancels_its_doubling():
     for _ in range(8):
         quota.record_lease("A", now=T0)
     for _ in range(7):
-        quota.record_submission("A", lease(T0), in_zone=True, now=T0 + 10)
+        deliver(quota, "A", T0, now=T0 + 10)
     quota.record_expiry("A", lease(T0), now=T0 + 601)
-    assert quota.quota("A") == 4
+    assert quota.quota("A") == 7
 
 
-def test_out_of_zone_submissions_count_as_delivered_work():
+def test_only_paid_groups_count_as_delivered_work_in_or_out_of_zone():
     quota = QuotaController(QuotaConfig(initial=4))
     for _ in range(4):
         quota.record_lease("A", now=T0)
-    for _ in range(4):
+    for _ in range(4):                                           # submitted, never paid: slots freed, no credit
         quota.record_submission("A", lease(T0), in_zone=False, now=T0 + 10)
     state = quota.state("A")
-    assert state["quota"] == 8 and state["counters"]["out_of_zone"] == 4 and state["counters"]["in_zone"] == 0
+    assert state["quota"] == 4 and state["in_use"] == 0 and state["window_samples"] == 0
+    assert state["counters"]["out_of_zone"] == 4 and state["counters"]["paid"] == 0
+    for _ in range(4):
+        quota.record_lease("A", now=T0 + 20)
+    for _ in range(4):                                           # paid out-of-zone first scans
+        deliver(quota, "A", T0 + 20, now=T0 + 30, in_zone=False)
+    state = quota.state("A")
+    assert state["quota"] == 8 and state["counters"]["paid"] == 4 and state["counters"]["in_zone"] == 0
 
 
 def test_littles_law_steady_state_for_a_miner_of_fixed_capacity():
@@ -96,7 +116,7 @@ def test_littles_law_steady_state_for_a_miner_of_fixed_capacity():
             quota.record_lease("A", now=now)
         now += L / c                                          # one completes every L / c seconds
         issued = in_flight.pop(0)
-        quota.record_submission("A", lease(issued), in_zone=True, now=now)
+        deliver(quota, "A", issued, now=now)
     state = quota.state("A")
     assert state["phase"] == "steady"
     assert state["throughput_per_min"] == pytest.approx(c * 60.0 / L, rel=0.1)
@@ -118,7 +138,7 @@ def test_a_steady_miner_that_grows_its_capacity_regains_quota():
                 in_flight.append(now)
                 quota.record_lease("A", now=now)
             now += L / max(1, len(in_flight))
-            quota.record_submission("A", lease(in_flight.pop(0)), in_zone=True, now=now)
+            deliver(quota, "A", in_flight.pop(0), now=now)
 
     run(6, 1500)
     small = quota.quota("A")
