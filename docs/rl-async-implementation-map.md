@@ -690,27 +690,26 @@ over the module-level `batcher.admission_problem_materials`, shared with P3).
   seconds it waited, between takes at most 30 s apart); taken groups requeue at reopen. `SubmittedGroup` carries env, k, nonce, arrival, hotkey,
   prompt tokens, completions, force spans, rewards.
 - Audit (§C, design §4.4): draw after submission with `SystemRandom`; probation = < 100 passed out-of-zone audits,
-  or < 20 passes since the last failure; deterministic -> `LeaseBook.ban` 24 h (no lease: refusal `banned`, no
-  submission); statistical -> re-probation, ban when > 3 of the last 20 non-forced verdicts failed. Queue order:
+  or < 20 passes since the last failure; a failure of any class -> unpaid, re-probation, never a ban (10-17);
+  `RlSubmissions.blacklist` is the operator's ban (`LeaseBook.ban`: refusal `banned`, no submission). Queue order:
   past-probation hotkeys first, oldest first. `ProofForward(SubmittedGroup) -> AuditResult(passed | None,
   failure_class, rollout_match)` is the Gumbel verifier's slot; `run_audits` drains.
 - Hooks for P4/P5: `report_training(lease_id, rollout_match, accepted, failure_class=None)` (accepted -> `trained`
-  event with per-rollout match and token counts; rejected with a class -> sanctioned like an audit; without a class,
-  e.g. staleness -> unpaid only). `rl_events` (`first_scan` 25 % payable: at once when not drawn, at pass when
-  drawn; `first_scan_forfeited`; `trained`; `untrained`; `ban`) is the P5 ledger's input (`events(since)`).
+  event with per-rollout match and token counts; rejected -> unpaid; with a class it is logged as a failed verdict). `rl_events` (`first_scan` 25 % payable: at once when not drawn, at pass when
+  drawn; `first_scan_forfeited`; `trained`; `untrained`; `ban`, the operator's) is the P5 ledger's input (`events(since)`).
 - Quota: in and out of zone are delivered (`record_submission`); a group refused for integrity (bad termination,
   tampered span, too long, out of vocab, unscorable) closes the lease, records no scan, and halves the quota
   (`record_expiry(cause="rejected")`). A schema error (indices, decode) is refused before the lease is touched; a
   grader outage answers 503 with the lease still open.
 - Resolved ambiguities: probation counts PASSED audits (decisions-doc rule in force), not submitted groups; training
-  verdicts count in the recidivism window, never as probation passes; an inconclusive audit forfeits the first-scan
+  verdicts never count as probation passes; an inconclusive audit forfeits the first-scan
   pay without sanction. Since the 10-16 review: `/rl/submit` holds the lease from arrival (`RlSubmissions.hold`,
   `LeaseBook.hold_submission`): ownership is checked before a grading slot (4 global, 2 per hotkey) and the sweep
   skips a held lease, so an on-time group is never lost to grading delay. The route reads the hotkey from the
   `X-Reliquary-Hotkey` header and checks its registration before reading or inflating the body (8 reads, 2 per
   hotkey), then authenticates in its own preauth pool. Audits: match = `rl_draw.rollout_rate` (the trainer's);
   under 30 drawn positions the audit abstains as a `suspect` inconclusive; a rollout under `RL_FORGERY_MATCH_FLOOR`
-  (0.5) fails the group; a failure at lag > `RL_SANCTION_MAX_LAG` (2) is inconclusive with its lag in `rl_audits`;
+  (0.5) fails the group; a failure is unpaid, re-opens probation and never bans (lag kept in `rl_audits`);
   suspect inconclusives (abstention, `AUDIT_MAX_ATTEMPTS` raising forwards, counted in `rl_audits.attempts`) are
   logged as `inconclusive` verdicts that re-open probation; a first scan under `RL_FIRST_SCAN_MIN_TOKENS` (1024)
   model tokens is forfeited.
@@ -1144,8 +1143,7 @@ the controller (both are additive; the transport hash changes with this release 
   `ASYNC_GROUP_FLOOR` 0.90 (placeholder: one noisy honest rollout of 16 survives, two bad ones do not; one under
   `ASYNC_FORGERY_FLOOR` 0.5 rejects the group whatever the pool); a failed group's
   admitted rollouts are backed out by a second pass with negated advantages (exact up to bf16 noise; only failed
-  groups pay it). Accepted: paid matched tokens of admitted rollouts; rejected: `statistical` when lag <=
-  `sanction_max_lag` (2), else unsanctioned. Telemetry: train/* plus `async/` checkpoint, lag, buffer depth,
+  groups pay it). Accepted: paid matched tokens of admitted rollouts; rejected: unpaid, unsanctioned. Telemetry: train/* plus `async/` checkpoint, lag, buffer depth,
   waits, batch groups per env, forwarded / below-floor rollouts, accepted / rejected / undone groups. Groups are
   reported (payable) before their checkpoint is published: a step lost to a crash keeps its pay (deliberate).
 - Known approximations: masked rollouts stay in their env's planned token denominator; with N > 1 the forward

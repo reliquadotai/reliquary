@@ -17,11 +17,10 @@ Next to the window trainer (``worker.py`` / ``train_runner.py``, unchanged), one
    checkpoint (with ``steps_per_checkpoint > 1`` the forward verifies against the trainer's in-between weights, a
    documented approximation of "the published checkpoint").
 3. **After the step.** ``report_training`` for every group (accepted with per-rollout match and matched tokens;
-   rejected with ``statistical`` when the group's lag is at most ``sanction_max_lag``, else unsanctioned
-   staleness), a checkpoint every ``steps_per_checkpoint`` steps: a CPU snapshot on the step path, then
-   ``DeltaPublisher.publish`` and ``LeaseBook.adopt_checkpoint`` in a publish thread (one in flight: the next
-   publication waits for it, and its error stops the loop), a Hugging Face backup every ``hf_backup_every`` steps
-   (``BackgroundHfBackup``, never blocking).
+   rejected, unpaid and unsanctioned: honest drift fails groups too), a checkpoint every ``steps_per_checkpoint``
+   steps: a CPU snapshot on the step path, then ``DeltaPublisher.publish`` and ``LeaseBook.adopt_checkpoint`` in a
+   publish thread (one in flight: the next publication waits for it, and its error stops the loop), a Hugging Face
+   backup every ``hf_backup_every`` steps (``BackgroundHfBackup``, never blocking).
 
 Groups are reported (an accepted one becomes payable) before their step's checkpoint is published: pay is for
 work trained into the weights the step computed. If the process dies between the report and the publication,
@@ -53,13 +52,11 @@ from reliquary.constants import (
     RL_GAP_TOLERANCE,
     RL_GROUP_MATCH_FLOOR,
     RL_ROLLOUT_MATCH_FLOOR,
-    RL_SANCTION_MAX_LAG,
     RL_SUBSTITUTE_GAP,
     RL_TERMINAL_GAP,
     RL_TERMINAL_MIN_P,
 )
 from reliquary.protocol.rl_draw import pooled_rate, rollout_rate
-from reliquary.services.exploration import AUDIT_FAILURE_STATISTICAL
 from reliquary.validator import telemetry
 from reliquary.validator.rl_buffer import SubmittedGroup
 from reliquary.validator.rl_leases import SECRET_REVEAL_LAG
@@ -271,7 +268,6 @@ class AsyncTrainerConfig:
     terminal_gap: float = RL_TERMINAL_GAP           # and its gap
     eos_ids: tuple[int, ...] = ()                   # the model's stop tokens (the termination test's subject)
     max_lag: int = SECRET_REVEAL_LAG         # no quality cap (the floor decides); bounds the buffer only
-    sanction_max_lag: int = RL_SANCTION_MAX_LAG   # a failed group this fresh is evidence (the audit's rule too)
     poll_s: float = 0.5                      # while the batch is not full
 
     def __post_init__(self) -> None:
@@ -450,10 +446,7 @@ class AsyncTrainer:
                                                  substitutions=[gate.substitutions[s] for s in slots])
                 trained[group.environment] = trained.get(group.environment, 0) + sum(matched)
                 continue
-            forwarded = any(gate.forwarded[s] for s in slots)
-            evidence = forwarded and self.version - group.checkpoint <= self.config.sanction_max_lag
-            self.submissions.report_training(group.lease_id, rollout_match=match, accepted=False,
-                                             failure_class=AUDIT_FAILURE_STATISTICAL if evidence else None)
+            self.submissions.report_training(group.lease_id, rollout_match=match, accepted=False)
         return trained
 
 

@@ -7,7 +7,6 @@ import asyncio
 
 import pytest
 
-from reliquary.services.exploration import AUDIT_FAILURE_DETERMINISTIC
 from reliquary.validator import corpus_periods as cp
 from reliquary.validator.emission_price import PriceState
 from reliquary.validator.rl_ledger import FORFEITED, LedgerConfig, RlPayLedger
@@ -110,10 +109,8 @@ def test_a_ban_forfeits_what_is_unsettled_and_what_lands_during_it(book):
     trained(book, subs, 2, hotkey="B")
     pending = lease(book, 3, "A")
     subs.submit(pending.lease_id, "A", group(8))
-    forged = lease(book, 4, "A")
-    subs.submit(forged.lease_id, "A", group(0))
     ledger.ingest()
-    subs.report_audit(forged.lease_id, AuditResult(False, AUDIT_FAILURE_DETERMINISTIC), now=NOW + 10)
+    subs.blacklist("A", NOW + 86410, "manual", now=NOW + 10)
     subs.report_training(pending.lease_id, rollout_match=[1.0] * 16, accepted=True, now=NOW + 20)  # during the ban
     ledger.ingest()
     assert [(h, s) for h, _, _, _, s in amounts(book)] == [("A", FORFEITED), ("B", "accrued"), ("A", FORFEITED)]

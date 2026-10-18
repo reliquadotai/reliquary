@@ -218,17 +218,15 @@ def test_a_rescan_out_of_zone_is_never_payable(book):
     assert kinds(subs) == [(first.lease_id, FIRST_SCAN)]
 
 
-def test_a_deterministic_failure_bans_and_forfeits(book):
+def test_a_failed_audit_forfeits_and_never_bans(book):
     subs = service(book)
     held = lease(book, 30)
     subs.submit(held.lease_id, "A", group(16))
     other = lease(book, 31)
     subs.report_audit(held.lease_id, AuditResult(passed=False, failure_class=AUDIT_FAILURE_DETERMINISTIC))
-    assert kinds(subs) == [(held.lease_id, BAN), (held.lease_id, FIRST_SCAN_FORFEITED)]
-    assert book.banned_until("A") == NOW + 86400
-    assert book.grant([LeaseRequest("A", ENV, (32,), 0)])[0].refused == {32: BANNED}
-    with pytest.raises(PermissionError, match="banned"):
-        subs.submit(other.lease_id, "A", group(8))
+    assert kinds(subs) == [(held.lease_id, FIRST_SCAN_FORFEITED)]
+    assert book.banned_until("A") is None and subs.in_probation("A")
+    subs.submit(other.lease_id, "A", group(8))                                     # still leases and submits
     with pytest.raises(LookupError):
         subs.report_audit(held.lease_id, AuditResult(passed=True))     # concluded once
     classless = lease(book, 33, "B")
@@ -237,8 +235,18 @@ def test_a_deterministic_failure_bans_and_forfeits(book):
         subs.report_audit(classless.lease_id, AuditResult(passed=False))   # a failure needs its class
 
 
-def test_a_statistical_failure_reopens_probation_and_recidivism_bans(book):
-    subs = service(book, probation_groups=1, reprobation_passes=2, audit_rate=1.0, statistical_max=1)
+def test_the_operators_blacklist_bans(book):
+    subs = service(book)
+    held = lease(book, 34)
+    subs.blacklist("A", NOW + 3600, "manual")
+    assert kinds(subs) == [("", BAN)] and book.banned_until("A") == NOW + 3600
+    assert book.grant([LeaseRequest("A", ENV, (35,), 0)])[0].refused == {35: BANNED}
+    with pytest.raises(PermissionError, match="banned"):
+        subs.submit(held.lease_id, "A", group(8))
+
+
+def test_a_statistical_failure_reopens_probation_without_a_ban(book):
+    subs = service(book, probation_groups=1, reprobation_passes=2, audit_rate=1.0)
     leases = [lease(book, p) for p in range(40, 45)]
     subs.submit(leases[0].lease_id, "A", group(0))
     subs.report_audit(leases[0].lease_id, AuditResult(passed=True))                 # probation done
@@ -253,8 +261,8 @@ def test_a_statistical_failure_reopens_probation_and_recidivism_bans(book):
     assert not subs.in_probation("A")
     subs.submit(leases[4].lease_id, "A", group(0))
     subs.report_audit(leases[4].lease_id, AuditResult(passed=False, failure_class=AUDIT_FAILURE_STATISTICAL))
-    assert book.banned_until("A") == NOW + 86400                                     # 2 > 1 in the window
-    assert kinds(subs)[-2][1] == BAN
+    assert subs.in_probation("A") and book.banned_until("A") is None
+    assert BAN not in {kind for _, kind in kinds(subs)}
 
 
 def test_an_inconclusive_audit_is_unpaid_and_unsanctioned(book):
@@ -436,7 +444,7 @@ def test_a_suspect_inconclusive_is_no_pass_and_keeps_the_hotkey_in_probation(boo
     assert not subs.in_probation("A")
 
 
-def test_an_audit_failure_of_a_lagged_lease_is_inconclusive_with_its_lag(book):
+def test_an_audit_failure_of_a_lagged_lease_is_a_failure_with_its_lag(book):
     subs = service(book, audit_rate=1.0)
     old = lease(book, 86)
     subs.submit(old.lease_id, "A", group(0))
@@ -444,18 +452,11 @@ def test_an_audit_failure_of_a_lagged_lease_is_inconclusive_with_its_lag(book):
         book.adopt_checkpoint(k)
     statistical = AuditResult(passed=False, failure_class=AUDIT_FAILURE_STATISTICAL)
     subs.report_audit(old.lease_id, statistical)                                 # leased at 0, latest 3: lag 3
-    assert subs.group(old.lease_id)["audit"] == "inconclusive" and book.banned_until("A") is None
+    assert subs.group(old.lease_id)["audit"] == "failed" and book.banned_until("A") is None
     with book.lock:
         lag = book.db.execute("SELECT lag FROM rl_audits WHERE lease_id=?", (old.lease_id,)).fetchone()[0]
-        verdicts = book.db.execute("SELECT COUNT(*) FROM rl_verdicts").fetchone()[0]
-    assert lag == 3 and verdicts == 0
-    book.adopt_checkpoint(4)
-    renewed = book.grant([LeaseRequest("A", ENV, (88,), 2)])[0].leases[0]       # leased at 2, latest 4: lag 2
-    subs.submit(renewed.lease_id, "A", group(0))
-    subs.report_audit(renewed.lease_id, statistical)
-    assert subs.group(renewed.lease_id)["audit"] == "failed"                     # evidence: a verdict
-    with book.lock:
         assert book.db.execute("SELECT verdict FROM rl_verdicts").fetchall() == [("failed",)]
+    assert lag == 3
 
 
 def test_audit_forward_attempts_are_persisted_across_restarts(book):

@@ -22,8 +22,7 @@ Verdict (each rollout's tallies read as the trainer reads them, ``rl_draw.rollou
   pay (§4.6), it does not fail the group by itself;
 * no model: ``passed=None`` (inconclusive: unpaid, unsanctioned).
 
-The forward runs against the latest checkpoint; ``RlSubmissions.report_audit`` turns a failure of a group leased
-more than ``RL_SANCTION_MAX_LAG`` checkpoints back into an unsanctioned inconclusive (the trainer's lag rule).
+The forward runs against the latest checkpoint; a failure is unpaid, never sanctioned (``RlSubmissions``).
 """
 from __future__ import annotations
 

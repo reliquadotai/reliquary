@@ -232,7 +232,7 @@ def test_one_step_reports_every_group_and_publishes_the_next_checkpoint():
     good, bad = subs.reports["good"], subs.reports["bad"]
     assert good["accepted"] and good["matched_tokens"] == [N_TOK, N_TOK, 0, N_TOK]
     assert good["rollout_match"][2] < 0.95 <= min(good["rollout_match"][:2])
-    assert not bad["accepted"] and bad["failure_class"] == "statistical"          # lag 0: evidence
+    assert not bad["accepted"] and bad.get("failure_class") is None              # unpaid, never sanctioned
     assert publisher.versions == [4] and book.adopted == [4] and trainer.version == 4
     assert buffer.drain_tick().taken == 2 * ROLLOUTS * N_TOK              # the prices read the trainer's speed here
     assert trainer.last_step["async/groups_accepted"] == 1 and trainer.last_step["async/groups_undone"] == 1

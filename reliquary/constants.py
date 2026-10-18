@@ -2003,9 +2003,6 @@ RL_AUDIT_FORGERY_MISMATCH_TOLERANCE = 1
 # around 0.8): its whole group is rejected (trainer) or fails (audit) as statistical evidence, so a forged rollout
 # (e.g. one [EOS] that moves a 16/16 group into the zone) cannot ride on 15 honest ones. PLACEHOLDER.
 RL_FORGERY_MATCH_FLOOR = 0.5
-# A failed verification of a group leased more than this many checkpoints before the latest is no evidence (an honest
-# lagged lease drifts): the trainer reports it unsanctioned, the audit concludes inconclusive. PLACEHOLDER.
-RL_SANCTION_MAX_LAG = 2
 # Gumbel gap of a mismatched token: the best score minus the miner's token's score (s = logit + G). Honest gaps grow
 # with the trainer's drift. A rollout with a gap over the tolerance is not trained nor paid; a mismatch over the
 # substitute gap is re-graded with the trainer's pick (the reward must not change).

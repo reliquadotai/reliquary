@@ -144,11 +144,11 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   `unproven` lane): goes to the buffer; verification happens in the training forward (4.7).
 - **Out of zone:** stored with grades. Audit regime from `next-rl-run-decisions.md` §C:
   100 % of a hotkey's first 100 out-of-zone groups (probation), then a random fraction drawn
-  after submission (15 %, user 2026-10-15), graded sanctions (deterministic forgery bans, statistical
-  failure re-opens probation). An audit is a separate forward against the latest checkpoint
-  with the same floor and match as training (PROPOSED: no old checkpoints kept); a failure of a
-  group leased more than 2 checkpoints back (`RL_SANCTION_MAX_LAG`, the trainer's rule) is
-  inconclusive, unsanctioned. An audit that abstains (too few drawn positions) or whose forward
+  after submission (15 %, user 2026-10-15). No sanction (user, 2026-10-17): a failed audit or
+  training verification is unpaid and re-opens probation, nothing more; honest drift fails groups
+  too, so a verdict cannot tell a forger from a lagging miner. Bans are the operator's
+  (`RlSubmissions.blacklist`). An audit is a separate forward against the latest checkpoint
+  with the same floor and match as training (PROPOSED: no old checkpoints kept). An audit that abstains (too few drawn positions) or whose forward
   keeps failing is no probation pass and re-opens probation. Upload carries tokens only,
   compressed; `/rl/submit` names its hotkey in a header, checked registered before the body is
   read.
