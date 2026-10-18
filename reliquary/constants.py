@@ -2001,6 +2001,9 @@ RL_GROUP_MATCH_FLOOR = 0.90
 # near-deterministic positions (max p >= FORCED_SEED_STOCHASTIC_MAXPROB, Gumbel shortfall beyond the boundary
 # epsilon) was edited after the draw: deterministic forgery. PLACEHOLDER: calibrate on honest lag-2 rollouts.
 RL_AUDIT_FORGERY_MISMATCH_TOLERANCE = 1
+# That allowance is per this many near-deterministic positions of the rollout (rounded up, at least one block):
+# bf16 noise leaves a rare honest hard mismatch, so a long rollout gets proportionally more. PLACEHOLDER.
+RL_AUDIT_FORGERY_MISMATCH_POSITIONS = 4096
 # An audit runs against the latest checkpoint; one queued longer than this many checkpoints after its lease's is
 # dropped unjudged (inconclusive: unpaid, no probation effect) instead of judged on drifted weights. PLACEHOLDER.
 RL_AUDIT_MAX_LAG = 4

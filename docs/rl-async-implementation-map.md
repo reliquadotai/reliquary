@@ -819,8 +819,9 @@ One branch carries the whole async RL work on top of current main.
   batch-1 forward and lazy fp32 head, now shared with `verify_commitment_proofs`) and the verifier's
   `_gpu_seed_consistency_diagnostics` with `draw_uniforms(i)`, force span excluded. Match = exact / stochastic.
   Pooled match under `RL_ROLLOUT_MATCH_FLOOR` (0.90 placeholder, also the ledger's floor) -> `statistical`; a
-  rollout on the draw (match >= floor) with more than `RL_AUDIT_FORGERY_MISMATCH_TOLERANCE` (1) hard mismatches at
-  near-deterministic positions -> `deterministic`; no model -> `passed=None`. Hook: `run_rl_audits(model,
+  rollout on the draw (match >= floor) with more than `RL_AUDIT_FORGERY_MISMATCH_TOLERANCE` (1) hard mismatches
+  at near-deterministic positions per started block of `RL_AUDIT_FORGERY_MISMATCH_POSITIONS` (4096) of them
+  (`mismatch_allowance`) -> `deterministic`; no model -> `passed=None`. Hook: `run_rl_audits(model,
   submissions, limit=8)`, to schedule from the service with its verify model.
 
 ### Remaining
