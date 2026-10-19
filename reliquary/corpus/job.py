@@ -12,6 +12,9 @@ from dataclasses import dataclass
 import re
 from typing import Any
 
+# Pure: a prefix test on the prompt source, loading nothing.
+from reliquary.eval.prompt_source import is_eval_source
+
 JOB_SCHEMA = "reliquary/corpus-job/v1"
 
 # The wire's own bounds, duplicated here the way the reject reasons are, so this
@@ -127,6 +130,19 @@ _ENV_PACKAGE_SUFFIX_RE = re.compile(r"\A[^=+\s]+\+g[0-9a-f]{16}\.vfb[1-9][0-9]*\
 
 class JobError(ValueError):
     """The manifest does not describe a job this code can run."""
+
+
+def _check_split(split: Any, eval_job: bool) -> None:
+    """A training job runs its environment's `train` split; an eval job (its
+    prompt_source names a frozen eval set) runs the split its set references, any
+    one. Which split that is, and that the set's rows name it, is checked where
+    the job is resolved (`reliquary.eval.rows.row_map`): this layer is pure. A
+    release that predates eval jobs refuses every split but `train`, so an old
+    miner fails closed on an eval job's manifest."""
+    if not isinstance(split, str) or not split:
+        raise JobError(f"episode.env.split must be a split name, got {split!r}")
+    if not eval_job and split != "train":
+        raise JobError(f"episode.env.split must be 'train', got {split!r}")
 
 
 def _submit(raw) -> str | None:
@@ -471,7 +487,7 @@ def _parse_sandbox(raw: Any, package: str) -> SandboxSpec:
                        sandbox_commit=commit, budgets=budgets)
 
 
-def _parse_suite_episode(raw: Mapping[str, Any]) -> EpisodeSpec:
+def _parse_suite_episode(raw: Mapping[str, Any], eval_job: bool) -> EpisodeSpec:
     """A suite episode: which registry environment, at which manifest, and the
     renderer it declares. That the registry has it, at that manifest and with
     that renderer, is checked where the job is resolved
@@ -484,8 +500,7 @@ def _parse_suite_episode(raw: Mapping[str, Any]) -> EpisodeSpec:
         raise JobError(f"episode.env.name must be a registry environment name, got {env['name']!r}")
     if not isinstance(env["version"], str) or not _SHA256_RE.match(env["version"]):
         raise JobError("episode.env.version must be the environment's 64-hex manifest sha256")
-    if env["split"] != "train":
-        raise JobError(f"episode.env.split must be 'train', got {env['split']!r}")
+    _check_split(env["split"], eval_job)
     renderer = raw["renderer"]
     if not isinstance(renderer, str) or not renderer or renderer.strip() != renderer:
         raise JobError(f"episode.renderer must be the environment's renderer id, got {renderer!r}")
@@ -502,17 +517,16 @@ def _parse_suite_episode(raw: Mapping[str, Any]) -> EpisodeSpec:
     )
 
 
-def _parse_episode(raw: Any) -> EpisodeSpec:
+def _parse_episode(raw: Any, eval_job: bool = False) -> EpisodeSpec:
     if isinstance(raw, Mapping) and raw.get("harness") == SUITE_HARNESS:
-        return _parse_suite_episode(raw)
+        return _parse_suite_episode(raw, eval_job)
     raw = _fields(raw, _EPISODE_FIELDS, "episode", optional=_EPISODE_OPTIONAL_FIELDS)
     env = _fields(raw["env"], _EPISODE_ENV_FIELDS, "episode.env")
     if not isinstance(env["package"], str) or env["package"] not in EPISODE_ENV_PACKAGES:
         raise JobError(f"episode.env.package must be one of {sorted(EPISODE_ENV_PACKAGES)}")
     if not isinstance(env["version"], str) or not _COMMIT_RE.match(env["version"]):
         raise JobError("episode.env.version must be the environment repository's 40-hex commit")
-    if env["split"] != "train":
-        raise JobError(f"episode.env.split must be 'train', got {env['split']!r}")
+    _check_split(env["split"], eval_job)
     if raw["harness"] not in EPISODE_HARNESSES:
         raise JobError(f"episode.harness must be one of {sorted(EPISODE_HARNESSES)}")
     if _HARNESS_PACKAGE[raw["harness"]] != env["package"]:
@@ -573,13 +587,24 @@ def _check_episode_job(job: JobSpec) -> None:
                            "replay_fraction_failed must be 0")
         if episode.sandbox.budgets.max_calls < episode.max_turns:
             raise JobError("episode.sandbox.budgets.max_calls must be at least episode.max_turns")
-        if episode.env.num_images != BRIDGED_SWESMITH_IMAGES:
+        if is_eval_source(job.prompt_source) and episode.env.split == "train":
+            # A release that predates evals checks a signed job's split, not its
+            # prompt_source: on `train` it would mine the identity rows, the wrong tasks.
+            raise JobError("an eval job on the signed sandbox names its set's split, never "
+                           "'train', so a release that predates evals refuses it")
+        if episode.env.split == "train" and episode.env.num_images != BRIDGED_SWESMITH_IMAGES:
             raise JobError(f"a signed_sandbox job serves SWE-smith at the "
                            f"{BRIDGED_SWESMITH_IMAGES} images the bridge serves: "
                            f"episode.env.num_images must be {BRIDGED_SWESMITH_IMAGES}")
-    if episode.is_suite and job.prompt_source != episode.env.name:
-        raise JobError("a suite episode job draws its prompts from its environment: "
-                       f"prompt_source must be {episode.env.name!r}")
+    elif not episode.is_suite and is_eval_source(job.prompt_source):
+        # A replayed SWE episode trusts the miner's box: an eval of it would be
+        # graded on what the miner says its tests did.
+        raise JobError("an eval job on SWE runs in the signed sandbox")
+    if (episode.is_suite and job.prompt_source != episode.env.name
+            and not is_eval_source(job.prompt_source)):
+        raise JobError("a suite episode job draws its prompts from its environment "
+                       f"or an eval set: prompt_source must be {episode.env.name!r} "
+                       "or an eval source")
 
 
 def parse_job(raw: Mapping[str, Any]) -> JobSpec:
@@ -615,12 +640,13 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
     ):
         raise JobError(f"deadline_round must be a non-negative round or null, got {deadline_round!r}")
 
+    prompt_source = _text(raw, "prompt_source")
     job = JobSpec(
         job_id=job_id,
         checkpoint_repo=_text(raw, "checkpoint_repo"),
         checkpoint_revision=_text(raw, "checkpoint_revision"),
         checkpoint_sha256=checkpoint_sha256,
-        prompt_source=_text(raw, "prompt_source"),
+        prompt_source=prompt_source,
         prompt_count=_positive_int(raw, "prompt_count"),
         renderer_id=_text(raw, "renderer_id"),
         eos_token_id=_non_negative_int(raw, "eos_token_id"),
@@ -634,7 +660,8 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
         ),
         seed=_non_negative_int(raw, "seed") if "seed" in raw else None,
         submit=_submit(raw),
-        episode=_parse_episode(raw["episode"]) if "episode" in raw else None,
+        episode=(_parse_episode(raw["episode"], is_eval_source(prompt_source))
+                 if "episode" in raw else None),
     )
     if job.episode is not None:
         _check_episode_job(job)
@@ -650,10 +677,3 @@ BRIDGED_SWESMITH_IMAGES = 20
 (reliquary-swe's default)."""
 
 
-def sandbox_split(episode: EpisodeSpec) -> str:
-    """The split a session token names: reliquary-swe's `train` (SWE-smith at its default
-    20 images, the split the bridge serves)."""
-    if episode.env.num_images != BRIDGED_SWESMITH_IMAGES:
-        raise ValueError(f"a signed reliquary-swe job serves SWE-smith at "
-                         f"{BRIDGED_SWESMITH_IMAGES} images, not {episode.env.num_images}")
-    return "train"

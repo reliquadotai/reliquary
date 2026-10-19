@@ -224,7 +224,10 @@ def suite_episode_row(*, job, submission_id: str, record: Mapping, grade: Mappin
     task = source.task(index)
     if [int(t) for t in source.renderer(encode).encode_initial(task)] != prompt:
         raise EpisodePromptMismatch(submission_id)
-    trace = replay_suite(source.environment, renderer_id=job.episode.renderer, task_index=index,
+    # The task through the source's row map (its environment is built at the
+    # job's split); the seed is the row's.
+    trace = replay_suite(source.environment, renderer_id=job.episode.renderer,
+                         task_index=source.rows.index(index),
                          seed=episode_seed(job.job_id, index), prompt_ids=prompt, tokens=tokens,
                          spans=spans, encode=encode, decode=decode,
                          max_turns=job.episode.max_turns)

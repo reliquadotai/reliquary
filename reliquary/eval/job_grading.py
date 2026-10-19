@@ -10,6 +10,7 @@ the trust is the validator's, which we run.
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import tempfile
 import time
@@ -53,7 +54,8 @@ async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bo
     from reliquary.corpus.delivery import LocalDirectorySink
     from reliquary.eval import grading
     from reliquary.eval.prompt_source import (
-        is_eval_source, is_order_job_id, load_eval_rows, parse_eval_source,
+        REFERENCE_INTERACTIONS, is_eval_source, is_order_job_id, load_eval_rows,
+        parse_eval_source, set_interaction,
     )
     from reliquary.validator.corpus_job_status import stored_job_counts
     from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS, rebuild_ledgers
@@ -83,7 +85,24 @@ async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bo
     if not (await stored_job_counts(records, job_id))["drained"]:
         raise JobNotGradable(f"job {job_id} is not drained: every submission must be audited "
                              "and settled first (reliquary jobs status)")
-    collected = await grading.collect_job_records(job, records)
+    # The set's rows (the ones the job ran) say how it is graded; its card in
+    # the bucket is read, and checked against them, by the grading itself.
+    rows = await asyncio.to_thread(load_eval_rows, source)
+    try:
+        interaction = set_interaction(rows)
+    except ValueError as exc:
+        raise JobNotGradable(f"job {job_id}: eval set {source.set_id}: {exc}") from exc
+    if (interaction in REFERENCE_INTERACTIONS) != (job.episode is not None):
+        raise JobNotGradable(f"job {job_id}: eval set {source.set_id} holds {interaction} "
+                             f"rows, but the job is {'an' if job.episode else 'no'} episode job")
+    if interaction in REFERENCE_INTERACTIONS:
+        # Graded already by the job's grader: its grade documents, never the records.
+        job_rows = await grading.EpisodeJobRows.collect(job, records,
+                                                        allow_incomplete=allow_incomplete)
+        collected = {"samples_by_prompt": job_rows.samples_by_prompt}
+    else:
+        collected = await grading.collect_job_records(job, records)
+        job_rows = grading.JobRows(job=job, collected=collected)
     snapshot, _ = await read_ledgers(job_id)
     slots = rebuild_ledgers(job, snapshot).slots
     complete = grading.job_complete(job, collected, samples, slots)
@@ -92,7 +111,14 @@ async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bo
         raise JobNotGradable(f"job {job_id} misses samples on some problems: pass "
                              "--allow-incomplete to count them as failures")
     task_id, thresholds = await _thresholds(job_id, entries)
-    rows = load_eval_rows(source)
+    # An episode's turns still carry TOPLOC proofs (the thresholds); its score
+    # is its grader's, from the grade documents.
+    scheme, origin = ((grading.EPISODE_SCHEMES[interaction], "grade documents")
+                      if interaction in REFERENCE_INTERACTIONS
+                      else ("toploc-v1", "task contract"))
+    verification = {"scheme": scheme, "source": origin,
+                    "validator": "our corpus validator, on the job's model",
+                    "task_id": task_id, "thresholds": thresholds, "sampling_verified": False}
     provenance = {
         "model": job.checkpoint_repo, "revision": job.checkpoint_revision,
         "model_sha": job.checkpoint_revision, "checkpoint_sha256": job.checkpoint_sha256,
@@ -101,10 +127,7 @@ async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bo
         "thinking": CHAT_TEMPLATE_RENDERERS.get(job.renderer_id, False),
         "max_new_tokens": job.sampling.max_new_tokens, "seed": job.seed,
         "eos_token_id": job.eos_token_id,
-        "verification": {"scheme": "toploc-v1", "source": "task contract",
-                         "validator": "our corpus validator, on the job's model",
-                         "task_id": task_id, "thresholds": thresholds,
-                         "sampling_verified": False},
+        "verification": verification,
         "job_complete": complete, "prompts_exhausted": len(exhausted),
         "exhausted_problem_ids": [rows[i]["problem_id"] for i in exhausted],
         **({"allow_incomplete": True} if allow_incomplete else {}),
@@ -116,7 +139,7 @@ async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bo
             eval_id=job_id, set_ids=[source.set_id], completion_keys=[],
             problems_per_set={source.set_id: source.count},
             samples_per_set={source.set_id: samples}, provenance=provenance,
-            job_rows=grading.JobRows(job=job, collected=collected), platform=sink,
+            job_rows=job_rows, platform=sink,
             subnet=subnet, require_sandbox=require_sandbox, work_dir=work_dir, clock=clock,
             **extra)
         directory = Path(out)

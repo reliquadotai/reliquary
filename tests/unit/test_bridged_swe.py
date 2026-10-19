@@ -39,8 +39,9 @@ def test_the_prompt_and_the_task_id_come_from_the_bridged_task(env):
 
 def test_the_signed_source_reads_the_bridged_env_by_default(env):
     from reliquary.environment.agentic_swe import SignedSweSource
+    from reliquary.eval.rows import RowMap
 
-    source = SignedSweSource("train")
+    source = SignedSweSource(RowMap.identity("train", 0, 100))
     assert source.prompt(2) == "prompt 2" and source.instance_id(2) == "inst-2"
 
 
@@ -59,14 +60,6 @@ def test_the_identity_is_the_bridged_one(monkeypatch):
     assert bridged_swe.installed_env_package("reliquary-swe") == "reliquary_swe-bridged"
 
 
-def test_a_signed_job_names_the_split_the_gateway_serves():
-    from reliquary.corpus.job import sandbox_split
-
-    assert sandbox_split(types.SimpleNamespace(env=types.SimpleNamespace(num_images=20))) == "train"
-    with pytest.raises(ValueError, match="20"):
-        sandbox_split(types.SimpleNamespace(env=types.SimpleNamespace(num_images=10)))
-
-
 def test_the_bridged_env_is_built_with_the_gateway_options(monkeypatch):
     loading = pytest.importorskip("reliquary_sandbox_verifiers.loading")
     built = []
@@ -79,7 +72,7 @@ def test_the_bridged_env_is_built_with_the_gateway_options(monkeypatch):
         bridged_swe._env.cache_clear()
     options = loading.VerifiersEnvOptions.from_mapping(built[0][1])
     assert built[0][0] == "verifiers:reliquary-swe==0.3.0"
-    assert set(options.splits) == {"train", "r2e", "polyglot"}
+    assert set(options.splits) == {"train", "r2e", "polyglot", "eval"}
     assert options.tools == ("bash", "edit") and options.defaults.per_call_timeout_s == 600
     # The corpus intake checks the submitted diff against the final's state_sha256: the
     # gateway must hand the graded state back (the bridge's default does not).
