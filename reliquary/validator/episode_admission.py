@@ -261,9 +261,10 @@ def episode_shape_refusal(policy, renderer, *, prompt_ids, tokens, spans, stop, 
     index) or None.
 
     ``lease``: an async RL lease's episode. No span proof is made for it (the trainer's forward and the audits
-    judge every model position), so the proof's shape rules (short turns, the model-token minimum) do not apply,
-    and a last turn cut at the per-turn cap is admitted as ``context_length``: a lease takes all its episodes,
-    so a cut the draw led to must not refuse the lease."""
+    judge every model position), so the proof's shape rules (short turns, the model-token minimum) do not apply;
+    it is never exported, so neither do the export rules (``parse_signed_trajectory(canonical=False)``); and a last
+    turn cut at the per-turn cap is admitted as ``context_length``. A lease takes all its episodes, so what the
+    draw led the model to write must not refuse the lease."""
     offset = len(prompt_ids)
     relative = [(start - offset, end - offset) for start, end in spans]
     completion = tokens[offset:]
@@ -274,7 +275,7 @@ def episode_shape_refusal(policy, renderer, *, prompt_ids, tokens, spans, stop, 
     try:
         parse_signed_trajectory(renderer, prompt_ids=prompt_ids, tokens=completion, spans=relative,
                                 stop=stop, max_turns=policy.max_turns, calls=list(calls),
-                                offered=opened.tools, final=final)
+                                offered=opened.tools, final=final, canonical=not lease)
     except TrajectoryRefused as refused:
         return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_parse",
                               {"check": refused.reason, **({"detail": refused.detail} if refused.detail else {})})

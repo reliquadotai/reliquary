@@ -332,6 +332,16 @@ def test_a_last_turn_cut_at_the_per_turn_cap_is_admitted_for_a_lease(world):
     assert world.checker.grade(lease, short, received=world.received).reject is not None
 
 
+def test_a_turn_that_would_not_export_still_trains_for_a_lease(world):
+    """A lease's episode is never exported: a span that does not round-trip through the template (a turn cut in
+    its reasoning, a stray reasoning close) is judged by its calls, records and draw, not refused."""
+    world.checker.renderer.canonical = False
+    world.checker.renderer.unclosed = True
+    lease = _lease()
+    graded = world.checker.grade(lease, world.rollouts(lease), received=world.received)
+    assert graded.reject is None
+
+
 def test_a_stale_directory_is_the_validators_outage(world):
     from reliquary.environment.grader_client import GraderInfrastructureError
 

@@ -89,10 +89,16 @@ def _same_arguments(signed: Any, sent: Mapping[str, Any]) -> bool:
 def parse_signed_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int],
                             tokens: Sequence[int], spans: Sequence[tuple[int, int]], stop: str,
                             max_turns: int | None, calls: Sequence[Any],
-                            offered: Collection[str], final: Any) -> ParsedTrajectory:
+                            offered: Collection[str], final: Any,
+                            canonical: bool = True) -> ParsedTrajectory:
     """The trajectory's turns and actions, or `TrajectoryRefused`. `calls` are the
     verified transcript's call bodies in order; `offered` is record 0's `tools`;
-    `final` is its final body (`signed_records(...).final`)."""
+    `final` is its final body (`signed_records(...).final`).
+
+    `canonical=False` (an async RL lease's episode, never exported) skips the rules that
+    keep a turn exportable as a message: the closed final reasoning and the round trip
+    of each span through the template. The calls still have to be their signed records
+    and each segment the rendering of those records."""
     if stop not in SIGNED_STOPS:
         raise TrajectoryRefused(REASON_BAD_STOP, {"stop": stop})
     if stop == STOP_EPISODE_CLOSED and final.status not in CLOSED_ON_A_CALL:
@@ -130,10 +136,10 @@ def parse_signed_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int]
     for k, (start, end) in enumerate(spans):
         completion = list(tokens[start:end])
         last = k == len(spans) - 1
-        if last and stop == "agent_completed" and renderer.reasoning_unclosed(
+        if canonical and last and stop == "agent_completed" and renderer.reasoning_unclosed(
                 full[:offset + start], completion):
             raise TrajectoryRefused(REASON_BAD_STOP, {"turn": k, "why": "final reasoning is not closed"})
-        if not renderer.span_is_canonical(full[:offset + start], completion):
+        if canonical and not renderer.span_is_canonical(full[:offset + start], completion):
             raise TrajectoryRefused(REASON_BAD_TURNS, {"turn": k, "why": "span does not re-render to itself"})
         pairs = list(renderer.tool_calls(completion))
         plans = [plan_call(name, arguments, offered) for name, arguments in pairs]
