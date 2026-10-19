@@ -239,6 +239,9 @@ class GroupGrader:
         rewards = tuple(float(r) for r in rewards)
         if len(rewards) != len(rollouts) or not all(math.isfinite(r) for r in rewards):
             return Graded(prompt, reject="reward_error")
+        # A rollout cut at the cap gave no answer: it scores 0, whatever an answer-like string in its unfinished
+        # reasoning would grade (the failure reward, never masked: the group trains on it).
+        rewards = tuple(0.0 if cut else r for r, cut in zip(rewards, truncated))
         return Graded(prompt, rewards, tuple(truncated))
 
 
@@ -316,7 +319,10 @@ class RlSubmissions:
             graded = self.grader.grade_episodes(lease, rollouts, received=arrived_at)
         else:
             graded = self.grader.grade(lease.environment, lease.prompt_idx, rollouts)
-        verdict = REJECTED if graded.reject else classify_group(graded.rewards, graded.truncated)
+        # Truncated rollouts count as failures inside the group (no truncation ceiling): the draw, not the miner,
+        # decides where a rollout stops, and a group dropped for its truncations would teach nothing about length.
+        verdict = REJECTED if graded.reject else classify_group(graded.rewards, graded.truncated,
+                                                                 max_truncated=len(graded.rewards))
         group = SubmittedGroup(lease_id, hotkey, lease.environment, lease.prompt_idx, lease.checkpoint, lease.nonce,
                                arrived_at, graded.rewards, graded.truncated, graded.prompt_tokens,
                                tuple(r.tokens for r in rollouts), tuple(r.force_span for r in rollouts),

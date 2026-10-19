@@ -362,9 +362,10 @@ if not _math.isfinite(SHAPE_LEN_FRAC) or not 0.0 < SHAPE_LEN_FRAC <= 1.0:
 # a linear penalty reaching −factor at the cap, correct or not. 0 disables.
 # 0.5 matches DAPO's penalty-to-correctness ratio: they use 1.0 on the 2-wide
 # {−1,+1} reward scale, ours is [0,1].
+# Protocol 10 (async RL): 0.1, a mild zone near the cap on top of the failure reward a truncated rollout gets.
 OVERLONG_PENALTY_FACTOR = float(_os.environ.get(
     "RELIQUARY_OVERLONG_PENALTY_FACTOR",
-    "0.5" if PROTOCOL_VERSION >= 3 else "0",
+    "0.1" if PROTOCOL_VERSION >= 10 else "0.5" if PROTOCOL_VERSION >= 3 else "0",
 ))
 if (
     not _math.isfinite(OVERLONG_PENALTY_FACTOR)

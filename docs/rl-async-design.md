@@ -144,8 +144,10 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
 ### 4.4 Submission and grading
 
 - **Grading:** every group is graded by the validator (rewards never come from the miner).
-- **In zone** (sigma >= 0.24, at most one truncated rollout, current truncation rule and
-  `unproven` lane): goes to the buffer; verification happens in the training forward (4.7).
+- **In zone** (sigma >= 0.24, `unproven` lane): goes to the buffer; verification happens in the training
+  forward (4.7). A rollout cut at the env cap scores 0 (failure reward, never masked) and counts like any failure
+  in its group; there is no truncation ceiling per group. Training adds the soft overlong zone (factor 0.1 over
+  the last 4,096 tokens before the cap, protocol 10).
 - **Out of zone:** stored with grades. Audit regime from `next-rl-run-decisions.md` §C:
   100 % of a hotkey's first 100 out-of-zone groups (probation), then a random fraction drawn
   after submission (15 %, user 2026-10-15). No sanction (user, 2026-10-17): a failed audit or

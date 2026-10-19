@@ -101,10 +101,21 @@ def test_an_in_zone_group_is_graded_by_the_validator_and_buffered_for_the_traine
     assert subs.events() == [] and subs.audit_jobs(10) == []
 
 
+def test_truncated_rollouts_score_zero_and_their_group_still_trains(book):
+    """A rollout cut at the cap is a failure inside its group, never a reason to drop the group."""
+    subs = service(book)
+    held = lease(book, 4)
+    answer = subs.submit(held.lease_id, "A", group(8, cut=6))
+    assert answer["verdict"] == "in_zone" and answer["rewards"] == [1.0] * 8 + [0.0] * 8
+    stored = subs.group(held.lease_id)
+    assert stored["truncated"] == "[" + ", ".join(["false"] * 8 + ["true"] * 6 + ["false"] * 2) + "]"
+    assert [g.lease_id for g in subs.buffer.take(10)] == [held.lease_id]
+
+
 @pytest.mark.parametrize(("rollouts", "verdict", "state"), [
     (group(16), "too_easy", "blacklisted"),
     (group(0), "too_hard", "cooldown"),
-    (group(8, cut=2), "truncated", "cooldown"),
+    (group(0, cut=16), "too_hard", "cooldown"),
 ])
 def test_out_of_zone_groups_are_stored_audited_in_probation_and_count_as_delivered(book, rollouts, verdict, state):
     subs = service(book)
@@ -116,9 +127,6 @@ def test_out_of_zone_groups_are_stored_audited_in_probation_and_count_as_deliver
     assert subs.buffer.take(10) == []
     assert book.quota.state("A")["counters"]["out_of_zone"] == 1
     assert book.prompt_state()["prompts"][0]["state"] == state
-    if verdict == "truncated":
-        assert stored["truncated"] == "[false, false, false, false, false, false, false, false, true, true, " \
-                                      "false, false, false, false, false, false]"
     [job] = subs.audit_jobs(10)
     assert job.lease_id == held.lease_id and job.completions == tuple(r.tokens for r in rollouts)
     assert subs.events() == []                                   # drawn: payable only after the audit
