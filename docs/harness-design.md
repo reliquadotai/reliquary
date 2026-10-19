@@ -63,55 +63,46 @@ Deploy precondition: Catalyst's `pyproject.toml` depends on
 must be pushed to the public repository before any image build. The main image installs
 pyproject. The CPU executor image (code grader) imports no agentic code, so it needs nothing.
 
-## 3. Step 4: the harness in the contract (coordinated release)
+## 3. Step 4: the harness in the contract (DONE on the branches)
 
-**Contract** (PROPOSED). `episode.harness` becomes `{"id", "version", "digest"}` in place of
-`"bash"` (`corpus/job.py:93-121, 505-545`). The digest enters `contract_sha`.
+**Corpus jobs.** `episode.harness_spec = {id, version, digest}` (`corpus/job.py`). It is
+optional, and written only when set, so every existing manifest keeps its contract bytes and
+its `contract_sha`. Present, it enters the contract.
 
-- The `renderer` field is then derived from the spec, and is checked equal when present.
-- So is the `verifiers` field. It stays in the contract only while the legacy replay path
-  exists, because that path runs verifiers.
-- An old job holding `"bash"` keeps parsing as `bash-vf-b2e4e81@1` with no digest check, so
-  existing contracts and their `contract_sha` do not move.
-- A new job must carry the object.
+- The shape is checked at parse, and `job.py` still imports nothing.
+- Whether the binary serves the pin is `agentic_swe.harness_pin_refusal`, first in
+  `episode_support_refusal` and `sandbox_support_refusal`. So the miner refuses to mine and the
+  validator refuses to resolve the job.
+- A corpus job may only pin a harness without variants: it has no validator seed to draw one
+  from.
 
-**RL profiles** (PROPOSED). The `rl_async_episodes` block of a signed episode env
-(`validator/rl_async_episodes.validate_episode_block`, served by `GET /rl/episodes`) carries
-the same triplet. `async_episode_policy` exposes it. `build_episode_generator` checks it
-with `digest_refusal` before loading the env, and so does the validator when it builds the
-env.
+**RL episode envs.** `rl_episode_envs.<env>.episode.harness = {id, version, digest}`
+(`service_contract._validate_episode`, which also serves the window order). It is optional:
+absent means `bash-vf-b2e4e81@1`. `EpisodeEnvPolicy.harness_pin()` carries it.
 
-**Record 0** (PROPOSED, sandbox protocol change).
+- The miner's `build_episode_generator` and the validator's `load_episode_environment` refuse
+  an env whose pin this build does not serve. The env is not loaded: a refusal, never a ban.
+- The window path (`episode_mining._episode_policies`) refuses a pin with variants.
 
-- The open body gets `harness: {id, version, digest, variant}` next to `tools_version`.
-  The gateway takes it from the session token (section 5) and signs it.
-- A gateway that does not hold that digest refuses the open, with a new signed open-refusal
-  reason `harness_unsupported` (a retryable 503 on the miner side, like the full-machine
-  refusal).
-- `transcript_refusal` (miner) and the signed intake/admission (validator) require record 0's
-  triplet to equal the contract's. Otherwise the reason is `sandbox_transcript` with
-  `why: harness`. It is refused, consumes nothing and never bans.
+**Pins.** `agentic_swe.HARNESS_DIGESTS` lists every spec this build serves at the digest it was
+built against: `bash-vf-b2e4e81@1` and `bash-surface@1`. `harness_refusal` checks the installed
+package against them.
 
-**Refusal, never ban** (DECIDED): every mismatch is a "cannot serve":
+**Record 0 is unchanged** (DECIDED in implementation, against the earlier PROPOSED). The harness
+only decides tokens, and the validator renders and compares every token itself. The variant is
+drawn by both sides from the lease (section 5). A miner that plays another harness or variant
+produces other tokens and is refused at admission. So signing the harness in record 0 would add
+no check the validator does not already make. It would only add a sandbox protocol change and a
+coordinated gateway release. The gateway never learns the harness: it runs canonical tools.
 
-| Where | On a digest mismatch |
-|---|---|
-| Miner | Refuses to mine the job (`episode_support_refusal`, already wired). |
-| Validator | Refuses to resolve the job (`corpus_service.py:486-488`, already wired), so no intake. |
-| Gateway | Refuses the open. |
+**Release**: no sandbox release.
 
-**Release**: miner, validator and gateway move together, like `SANDBOX_COMMIT` today. The
-order is: gateway image with the new harness commit, then the validator and miners (Watchtower
-on main after the user's go), then jobs re-issued with the triplet.
+- Miners and validators need a Catalyst build that serves the pinned spec, that is, one with the
+  same reliquary-harness commit.
+- Enabling variants is a registry change by the operator: add `harness` to an env's
+  `rl_episode_envs` block. It is refused by any binary that does not serve that digest.
 
-**Tests**:
-
-- `test_corpus_binding_golden.py` regenerated for the new contract field. An old contract's
-  sha must stay the same.
-- A refusal test per side.
-- The six recorded scenarios still pass.
-
-## 4. Step 5: one observation limit (coordinated release)
+## 4. Step 5: one observation limit (coordinated release, NOT DONE)
 
 What the model sees for a bash output today depends on the path:
 
@@ -155,80 +146,72 @@ reliquary-harness at the same commit, which is a single repository release.
 **Tests**: truncation goldens at the cap, one byte under it and one byte over it, both
 streams; the gateway refusing a lower bound; record 0's signed cap checked by the validator.
 
-## 5. Step 8: surface variants drawn from the validator's seed
+## 5. Step 8: surface variants (DONE on the branches)
 
-**Axes** (PROPOSED). Each axis is a finite list in the spec, so it is part of the digest.
-Adding a value is a new spec version.
+**Spec** (`reliquary_harness.spec`). A spec's axes change what the model is shown, never what
+runs:
 
-- `tool_names`: (surface name, description) per canonical tool. For example `bash` becomes
-  `bash` / `shell` / `run_command`, and `edit` becomes `edit` / `str_replace` /
-  `replace_in_file`. Parameter names stay canonical in a first version: renaming them doubles
-  the parse risk for little gain.
-- `system_prompt`: N phrasings of the two fragments. Start with N = 3: today's, plus two
-  rewordings of the same meaning.
-- `observation`: M renderings of a signed record. M = 2 at first:
-  - today's (`reliquary-observation/1`);
-  - a header form, `exit code: N` followed by the output and the notes. The record already
-    signs `exit_code`, so the validator can render it.
-- `renderer`: not an axis for now. It would change the chat template under a trained policy.
+- `tools`: a surface name and description per canonical tool. The parameters stay canonical.
+- `system_prompt`: one fragment per tool, where `{bash}` and `{edit}` stand for the surface
+  names.
+- `observation`: `plain`, or `exit-code`, which puts the signed exit code on a line before the
+  gateway's rendering. Refused calls are never decorated.
 
-Starting cardinality: 3 × 3 × 2 = 18 variants, but **ship 2 to 4 at first** (PENDING, measure
-`bad_turns` and the valid-call rate per variant). Telecom's 0/38 with unfamiliar markup
-(MEM:project_telecom_chatml_breaks_tools_2026_09_20) is the warning.
+`bash-surface@1` has 2 tool namings (`bash`/`edit`, then `shell`/`str_replace`) × 2 prompt
+phrasings, so 4 variants. Its variant 0 renders `bash-vf-b2e4e81` token for token. The
+observation axis is implemented and tested end to end (`test_harness_variants_e2e`), but it is
+not in `bash-surface@1`: ship few variants first, and measure.
 
-**Draw** (`reliquary_harness.variant`, DONE as a function, PROPOSED as a protocol). The draw
-is `variant_index = sha256(len‖seed ‖ len‖engagement ‖ len‖task_index ‖ len‖digest) mod
-|variants|`, never `hash()`. Its inputs:
+**Draw** (`agentic_swe.lease_variant`). The draw is
+`sha256(len‖nonce ‖ len‖"rl-lease:{lease_id}" ‖ len‖prompt_idx ‖ len‖digest) mod 4`.
 
-- `seed`: the validator's lease draw nonce (RL) or the job's drand round (corpus). The
-  validator knows it before the episode opens, and the miner cannot choose it.
-- `engagement`: `rl-lease:{lease_id}` (RL) or `corpus:{job_id}:{prompt_index}`.
+- The lease's draw nonce derives from the validator's secret, so the miner cannot choose the
+  variant.
+- Both sides compute it alone.
+- All 16 rollouts of a lease share it, so a group's advantages compare policies, not surfaces.
 
-**One variant per group** (PROPOSED). The RL engagement deliberately excludes the rollout
-index, so a lease's 16 rollouts play the same variant. Their advantages then compare policies,
-not surfaces. Groups across leases and prompts cover the variants.
+**Reading back** (`QwenTurnRenderer`).
 
-**Who learns it, and who checks it** (PROPOSED). The variant goes through these hands:
+- The calls read back (`tool_calls`, `calls_of`) carry the canonical names. So `plan_call`, the
+  gateway and the transcript only ever see `bash` and `edit`.
+- The assistant message keeps the written names, because it must re-render to its span (the
+  canonical round trip and export).
+- A canonical name the variant hides reads as `?bash`, a tool nobody offers (`not_offered`). So
+  a hidden name is never executed.
 
-1. The validator computes the index at grant and puts it into the session token claims (a new
-   field, `harness_variant`, signed by the validator).
-2. The gateway reads it at open and signs it in record 0 (section 3).
-3. The miner renders with record 0's variant.
-4. The validator's admission recomputes the index and refuses on a mismatch (`bad_variant`).
-   During a burn-in it is inconclusive and does not count toward probation, as in
-   MEM:project_next_rl_run_branch_2026_10_05.
+**Wiring**:
 
-**Surface to canonical mapping** (PROPOSED).
-
-- `parse(spec, variant, completion)` maps surface tool names to canonical ones before
-  `plan_call`. The gateway only ever sees `bash` and `edit`, so transcripts stay canonical and
-  `verify_transcript` is unchanged.
-- An unknown surface name, including a canonical name the variant does not show, stays a call
-  to an unoffered tool (`not_offered`), as today.
-- `render_observation(body, variant)` picks the rendering. The validator renders the signed
-  record with the same variant and compares tokens, as now.
+| Side | What changed |
+|---|---|
+| Miner | `EpisodeLeaseGenerator.play_lease` draws the variant, then uses its renderer for the admission precheck. `LeaseEpisodeRunner(harness=, variant=)` passes it to `HarnessEpisodeRunner(spec=, variant=)`, which renders with it and decorates observations. |
+| Validator | `LeaseEpisodeChecker` draws the variant per lease and grades with that variant's renderer and prompt (`renderer_of`, one per variant). `signed_parse` and `episode_admission` render signed records in the renderer's observation format. |
 
 **Tests**:
 
-- Golden per (spec version, variant, tokenizer).
-- `parse(render(action)) == action` for every variant, including indentation and an opened
-  `<think>`.
-- Two hosts replaying one transcript give zero token difference.
-- The draw's distribution and its stability across Python versions.
-- An RL smoke with several variants, measuring `bad_turns` per variant.
+- Per variant: prompt and round trip goldens (`harness/tests/goldens/surface-variants.*`).
+- Variant 0 equals vf.
+- The miner plays each variant against the real gateway. The gateway sees canonical tools only.
+  The validator's parse admits the episode under that variant and refuses it under any other
+  that renders differently.
+- `exit-code` is read back only as such.
+- The draw is a function of the lease alone, and all 4 variants are reached.
+
+**To measure before turning it on** (PENDING): `bad_turns` and the valid-call rate per variant on
+an RL smoke. Telecom's 0/38 with unfamiliar markup is the warning. Turning it on means adding
+`harness: {bash-surface, 1, <digest>}` to the SWE/TMax `rl_episode_envs` blocks.
 
 ## 6. Remaining migration
 
-Steps 4, 5 and 8 need a coordinated release. Step 6 needs a manifest regen and step 7 an
+Step 5 needs a coordinated release. Step 6 needs a manifest regen and step 7 an
 executor coordination.
 
 | # | Step | Release | Gate |
 |---|---|---|---|
-| 4 | Contract triplet, record 0 signs it, gateway refusal | **coordinated** (gateway, validator, miner) | binding goldens, refusal tests, the 6 scenarios |
+| 4 | Contract triplet (corpus `harness_spec`, RL `harness`), refusals: **DONE** | Catalyst build only | `test_harness_contract`, the 6 scenarios |
 | 5 | One observation limit, `observation.py` into the harness | **coordinated** | truncation goldens; 64 KiB keeps every token |
 | 6 | Family A (ChatML, EnvScaler, telecom) as specs; `renderers.py` delegates | manifest regen (`scripts/regen_episode_manifests.py`) | `test_chatml_episode_consensus.py`, the EnvScaler golden |
 | 7 | Legacy Docker replay: `TOOL_PROGRAM` onto `format_observation`, then retired; the legacy miner off verifiers | executors | replay tests |
-| 8 | Variants | **coordinated** | section 5 |
+| 8 | Variants: **DONE** (off until a block names `bash-surface@1`) | Catalyst build + registry block | `test_harness_variants_e2e`, an RL smoke per variant |
 
 Rollback for step 3, before any release: reverting the step 3 commit restores verifiers'
 loop (`_context` and `_default_runner`), with the same tokens. Nothing else depends on it.
