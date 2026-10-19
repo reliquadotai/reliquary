@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import shutil
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -161,6 +162,8 @@ class EpisodeEngineHost:
         self.model_dir: str | None = None
         self.restarts = 0
         self._server = self._serving = None
+        # ``push`` ships a function to the workers through collective_rpc: allowed before the engine starts them.
+        os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
     @property
     def generate_url(self) -> str:
@@ -187,6 +190,32 @@ class EpisodeEngineHost:
         engine.start()
         self.core, self.engine, self.model_dir = core, engine, str(model_dir)
         self.restarts += 1
+
+    def push(self, state: Mapping[str, Any], scratch: Path) -> None:
+        """New weights into the running engine, in place: the engine thread stops (no turn in flight), every worker
+        loads the shards through the model's ``load_weights`` (``LLM.collective_rpc``), the prefix cache is reset
+        and a new engine thread starts on the same core. No model load, no second copy of the weights on the GPU."""
+        from reliquary.miner.corpus_generate_server import GenerateEngine
+        from reliquary.miner.rl_async import _load_weights_from_files
+        from reliquary.shared.ckpt_delta import write_anchor_shards
+
+        if self.core is None:
+            raise RuntimeError("no engine to push weights into")
+        if self.engine is not None:
+            self.engine.stop()
+            self.engine = None
+        shutil.rmtree(scratch, ignore_errors=True)
+        try:
+            paths = [str(p) for p in write_anchor_shards(state, scratch)]
+            llm = self.core._llm
+            llm.collective_rpc(_load_weights_from_files, args=(paths,))
+            llm.reset_prefix_cache()
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+        engine = GenerateEngine(self.core, max_total_tokens=self.max_total_tokens,
+                                max_tokens_per_turn=self.max_tokens_per_turn, draws=self.draws)
+        engine.start()
+        self.engine = engine
 
     def close_engine(self) -> None:
         engine, core = self.engine, self.core
@@ -216,8 +245,9 @@ class EpisodeEngineHost:
 
 
 class EpisodeWeights:
-    """``EpisodeLeaseGenerator``'s ``load_weights``: the state as an HF directory under ``work_dir`` (config and
-    tokenizer from ``base_model_dir``), then the engine restarted on it (``EpisodeEngineHost.restart``); the
+    """``EpisodeLeaseGenerator``'s ``load_weights``: pushed into the running engine (``EpisodeEngineHost.push``);
+    on the first load, or when the push fails, the state as an HF directory under ``work_dir`` (config and
+    tokenizer from ``base_model_dir``) and the engine restarted on it (``EpisodeEngineHost.restart``); the
     previous directory is removed."""
 
     def __init__(self, host: EpisodeEngineHost, *, base_model_dir: str, work_dir: str) -> None:
@@ -227,6 +257,15 @@ class EpisodeWeights:
     def __call__(self, state: Mapping[str, Any], version: int) -> None:
         from reliquary.miner.rl_async import write_hf_dir
 
+        if self.host.core is not None:
+            try:
+                self.host.push(state, Path("/dev/shm" if Path("/dev/shm").is_dir() else self.work)
+                               / f"rl-episode-push-{os.getpid()}")
+                logger.info("episode engine on checkpoint %d (weights pushed in place)", version)
+                return
+            except Exception:
+                logger.exception("in-place weight push failed; restarting the episode engine on checkpoint %d",
+                                 version)
         if not (self.base / "config.json").is_file():
             raise RuntimeError(f"no model files (config, tokenizer) in {self.base}")
         new_dir = write_hf_dir(state, self.base, self.work / f"episode-weights-{int(version):08d}")

@@ -395,9 +395,23 @@ def test_a_validator_without_episode_envs_keeps_the_8_mib_cap(tmp_path):
 
 
 # --- mine-async: the episode generator's wiring -------------------------------------------------------------------
+class FakeLLM:
+    def __init__(self):
+        self.pushed, self.resets, self.fail = [], 0, False
+
+    def collective_rpc(self, fn, args=()):
+        if self.fail:
+            raise RuntimeError("push refused")
+        self.pushed.append([Path(p).name for p in args[0]])
+
+    def reset_prefix_cache(self):
+        self.resets += 1
+
+
 class FakeCore:
     def __init__(self, model_dir, **kwargs):
         self.model_dir, self.kwargs = model_dir, kwargs
+        self._llm = FakeLLM()
 
     def has_unfinished(self):
         return False
@@ -440,7 +454,7 @@ def episode_source(name, block):
     return SimpleNamespace(source=FixedSource(rows=40))
 
 
-async def test_the_episode_generator_restarts_its_engine_on_each_checkpoint(tmp_path):
+async def test_the_episode_generator_pushes_each_checkpoint_into_its_engine(tmp_path):
     import torch
 
     from reliquary.miner.rl_async_episodes import EpisodeEngineHost, build_episode_generator
@@ -464,9 +478,14 @@ async def test_the_episode_generator_restarts_its_engine_on_each_checkpoint(tmp_
     assert made[-1].kwargs["max_total_tokens"] == 4096 and made[-1].kwargs["stop_token_ids"]
     await host.ensure_serving()
     assert served[0][1] == 8013 and host.take_session.__self__ is first          # the app reaches the engine
-    # a new checkpoint between batches: the engine stops, the core is released, a new one loads the new weights
+    # a new checkpoint between batches: pushed into the same core, a new engine thread on it, no model load
     await asyncio.to_thread(generator.load_weights, state, 4)
-    assert released == [made[0]] and host.engine is not first and host.restarts == 2
+    assert released == [] and len(made) == 1 and host.restarts == 1 and host.core is made[0]
+    assert host.engine is not first and made[0]._llm.pushed and made[0]._llm.resets == 1
+    # a push that fails falls back to a restart on an HF directory of the new weights
+    made[0]._llm.fail = True
+    await asyncio.to_thread(generator.load_weights, state, 5)
+    assert released == [made[0]] and host.restarts == 2 and made[1].model_dir.endswith("episode-weights-00000005")
     assert not Path(made[0].model_dir).exists() and Path(made[1].model_dir).is_dir()
     lease = HeldLease("L1", EPISODE, 5, 4, "ab" * 32, time.time() + 600)
     runner = generator._factory(generator.policies[EPISODE], lease, "prompt")
