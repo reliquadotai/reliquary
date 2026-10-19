@@ -74,7 +74,7 @@ CODEC = TokenizerCodec(ByteTokenizer())
 def _telecom_or_skip():
     """The wheel at v2's manifest (verified, never imported unverified: the
     loader refuses a module imported behind its back)."""
-    refusal = suite_support_refusal(_job().episode)
+    refusal = suite_support_refusal(_job())
     if refusal:
         pytest.skip(f"reliquary-telecom-solo 0.2.0a1 not usable: {refusal}")
 
@@ -110,17 +110,17 @@ def test_support_refuses_another_manifest_an_unknown_env_and_v1():
     _telecom_or_skip()
     pinned = _job(episode={"env": {"package": "reliquary-suite", "name": ENV,
                                    "version": "f" * 64, "split": "train"}})
-    assert "manifest" in suite_support_refusal(pinned.episode)
+    assert "manifest" in suite_support_refusal(pinned)
     unknown = _job(prompt_source="no_such_env", episode={"env": {
         "package": "reliquary-suite", "name": "no_such_env", "version": MANIFEST_SHA,
         "split": "train"}})
-    assert "no_such_env" in suite_support_refusal(unknown.episode)
+    assert "no_such_env" in suite_support_refusal(unknown)
     # Telecom v1 is a corpus source no more: its pin is not the installed wheel.
     v1 = ENVIRONMENT_SPECS["reliquary_telecom_solo_v1"].environment_manifest_sha256
     old = _job(prompt_source="reliquary_telecom_solo_v1", episode={"env": {
         "package": "reliquary-suite", "name": "reliquary_telecom_solo_v1", "version": v1,
         "split": "train"}})
-    assert suite_support_refusal(old.episode) is not None
+    assert suite_support_refusal(old) is not None
 
 
 def test_the_stop_is_the_replays():
@@ -465,7 +465,7 @@ def test_a_mined_telecom_episode_is_accepted_graded_and_exported(fake_r2):
     (submission_id,) = records.written
 
     # 4. The local grader replays it again and certifies the environment's success.
-    grader = LocalEpisodeGrader(job=job, records=records, replayer=replayer)
+    grader = LocalEpisodeGrader(job=job, records=records, replayer=replayer, source=source)
     grade = asyncio.run(grader.grade_one(submission_id))
     assert grade["status"] == "ok" and grade["graded_success"] is True, grade
     assert grade["replay_certified"] is True and grade["instance_id"] == golden["task_id"]
