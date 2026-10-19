@@ -43,7 +43,8 @@ def episode_sequence(turns: Sequence[Any]) -> tuple[list[int], list[tuple[int, i
 
 
 def episode_stop(raw: Any, *, tokens: Sequence[int], spans: Sequence[tuple[int, int]], max_turns: int,
-                 max_tokens_per_turn: int, max_episode_tokens: int, stop_ids: Collection[int]) -> str | None:
+                 max_tokens_per_turn: int, max_episode_tokens: int, stop_ids: Collection[int],
+                 lease: bool = False) -> str | None:
     """The stop the validator's admission takes for this episode, from the harness's raw stop condition,
     or None when none can be admitted (the episode is then withdrawn, never submitted).
 
@@ -53,16 +54,17 @@ def episode_stop(raw: Any, *, tokens: Sequence[int], spans: Sequence[tuple[int, 
     * A last turn cut at the EPISODE's token cap (its span ends at ``max_episode_tokens``, no stop token)
       is ``context_length``: verifiers labels such a cut ``agent_completed`` (the length-finished reply
       carries no call, so the harness ends) and the validator admits it only as ``context_length``. A
-      last turn cut at the per-turn cap elsewhere is admitted only as the ``max_turns``-th turn.
+      last turn cut at the per-turn cap elsewhere is admitted only as the ``max_turns``-th turn, or, for an async
+      RL lease (``lease``), as ``context_length``.
     * Otherwise (a closed last turn) ``agent_completed`` and ``context_length`` (verifiers' overlong
       NEXT prompt) are kept; the validator checks the rest (calls, closed reasoning, the overflow)."""
     stop = _mapped_stop(raw, tokens=tokens, spans=spans, max_turns=max_turns,
                         max_tokens_per_turn=max_tokens_per_turn, max_episode_tokens=max_episode_tokens,
-                        stop_ids=stop_ids)
+                        stop_ids=stop_ids, lease=lease)
     return None if stop is None else AdmittedStop(stop)
 
 
-def _mapped_stop(raw, *, tokens, spans, max_turns, max_tokens_per_turn, max_episode_tokens, stop_ids):
+def _mapped_stop(raw, *, tokens, spans, max_turns, max_tokens_per_turn, max_episode_tokens, stop_ids, lease=False):
     if not spans or raw not in ADMITTED_STOPS:
         return None
     start, end = spans[-1]
@@ -76,7 +78,9 @@ def _mapped_stop(raw, *, tokens, spans, max_turns, max_tokens_per_turn, max_epis
     if not closed:
         if end == max_episode_tokens:
             return "context_length"
-        return "max_turns" if len(spans) == max_turns else None
+        if len(spans) == max_turns:
+            return "max_turns"
+        return "context_length" if lease else None
     return raw
 
 
@@ -94,7 +98,8 @@ def episode_metadata(*, precommit_sha256: str, seed_index: int, spans, stop: Adm
 
 
 def episode_refusal(*, policy, renderer, prompt: str, tokens: Sequence[int], spans: Sequence[tuple[int, int]],
-                    stop: Any, transcript: Any, min_chunk_tokens: int | None = None) -> str | None:
+                    stop: Any, transcript: Any, min_chunk_tokens: int | None = None,
+                    lease: bool = False) -> str | None:
     """Why the validator's admission would refuse this episode at its token level, or None: the episode
     length, prompt fidelity (``renderer.initial_ids(prompt)``, the validator's own render) and the
     admission's own ``episode_shape_refusal`` (spans, the signed parse, short turns, budgets, termination, a
@@ -122,7 +127,7 @@ def episode_refusal(*, policy, renderer, prompt: str, tokens: Sequence[int], spa
     refused = episode_shape_refusal(
         policy, renderer, prompt_ids=prompt_ids, tokens=tokens, spans=spans, stop=str(stop), calls=found.calls,
         opened=found, final=found.final,
-        min_chunk_tokens=MIN_CHUNK_TOKENS if min_chunk_tokens is None else int(min_chunk_tokens))
+        min_chunk_tokens=MIN_CHUNK_TOKENS if min_chunk_tokens is None else int(min_chunk_tokens), lease=lease)
     return None if refused is None else f"{refused.stage}: {refused.detail}"
 
 
@@ -135,8 +140,8 @@ class AdmissibleEpisode:
     stop: AdmittedStop
 
 
-def episode_admissible(outcome, *, policy, renderer, prompt: str,
-                       min_chunk_tokens: int | None = None) -> tuple[AdmissibleEpisode | None, str | None]:
+def episode_admissible(outcome, *, policy, renderer, prompt: str, min_chunk_tokens: int | None = None,
+                       lease: bool = False) -> tuple[AdmissibleEpisode | None, str | None]:
     """``(its sequence and stop, None)`` when the validator would admit the outcome's episode (``seed_index``,
     ``result``: ``EpisodeResult``, ``session``: the generate session's log), else ``(None, why)``: a graded,
     usable episode with the engine's log, its admitted stop, and its length, prompt fidelity and shape."""
@@ -147,9 +152,10 @@ def episode_admissible(outcome, *, policy, renderer, prompt: str,
         tokens, spans = episode_sequence(session.turns)
         stop = episode_stop(result.stop, tokens=tokens, spans=spans, max_turns=policy.max_turns,
                             max_tokens_per_turn=policy.max_tokens_per_turn,
-                            max_episode_tokens=policy.max_episode_tokens, stop_ids=renderer.stop_ids)
+                            max_episode_tokens=policy.max_episode_tokens, stop_ids=renderer.stop_ids, lease=lease)
         why = episode_refusal(policy=policy, renderer=renderer, prompt=prompt, tokens=tokens, spans=spans,
-                              stop=stop, transcript=result.transcript, min_chunk_tokens=min_chunk_tokens)
+                              stop=stop, transcript=result.transcript, min_chunk_tokens=min_chunk_tokens,
+                              lease=lease)
     except (ValueError, TypeError, KeyError, IndexError) as error:
         return None, f"{type(error).__name__}: {error}"
     return (AdmissibleEpisode(tokens, spans, stop), None) if why is None else (None, why)

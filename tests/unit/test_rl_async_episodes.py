@@ -227,7 +227,7 @@ def _lease(**kw):
 
 
 def play_lease_episode(*, validator, machine, lease, index, reward, session_id=None, engagement=None,
-                       output="ok"):
+                       output="ok", last=None, stop="agent_completed"):
     """One honest two-turn episode (``episode_v2_fixtures.play_episode``'s), its session token naming the lease's
     rollout: ``(rollout, prompt length)``."""
     from reliquary_sandbox.observation import render_observation
@@ -249,10 +249,10 @@ def play_lease_episode(*, validator, machine, lease, index, reward, session_id=N
                         calls=[{"turn": 0, "k": 0, "arguments": {"command": "c0"}, "output": output}])
     observations = [render_observation(body.to_dict()) for body in signed_records(signed).calls[:1]]
     full = renderer.next_prompt(prompt, first, observations)
-    tokens = full + [TEXT] * 9 + [TERM]
+    tokens = full + (list(last) if last is not None else [TEXT] * 9 + [TERM])
     p = len(prompt)
     spans = [[0, len(first)], [len(full) - p, len(tokens) - p]]
-    return Rollout(tuple(tokens[p:]), None, {"spans": spans, "stop": "agent_completed", "transcript": signed}), p
+    return Rollout(tuple(tokens[p:]), None, {"spans": spans, "stop": stop, "transcript": signed}), p
 
 
 @pytest.fixture
@@ -319,6 +319,29 @@ def test_tampered_observations_or_model_tokens_are_refused(world):
     assert late.reject == "episode_deadline"
 
 
+def test_a_last_turn_cut_at_the_per_turn_cap_is_admitted_for_a_lease(world):
+    """A lease takes all its episodes: the draw that ran a turn to the per-turn cap ends the episode there."""
+    from tests.unit.test_trajectory_parse import TEXT
+
+    lease = _lease()
+    cap = world.policy.max_tokens_per_turn
+    rollouts = world.rollouts(lease, last=[TEXT] * cap, stop="context_length")
+    graded = world.checker.grade(lease, rollouts, received=world.received)
+    assert graded.reject is None and graded.rewards == (1.0, 0.0) * 8
+    short = world.rollouts(lease, last=[TEXT] * (cap - 1), stop="context_length")      # no cap reached
+    assert world.checker.grade(lease, short, received=world.received).reject is not None
+
+
+def test_a_turn_that_would_not_export_still_trains_for_a_lease(world):
+    """A lease's episode is never exported: a span that does not round-trip through the template (a turn cut in
+    its reasoning, a stray reasoning close) is judged by its calls, records and draw, not refused."""
+    world.checker.renderer.canonical = False
+    world.checker.renderer.unclosed = True
+    lease = _lease()
+    graded = world.checker.grade(lease, world.rollouts(lease), received=world.received)
+    assert graded.reject is None
+
+
 def test_a_stale_directory_is_the_validators_outage(world):
     from reliquary.environment.grader_client import GraderInfrastructureError
 
@@ -345,7 +368,7 @@ def test_a_lease_of_episodes_is_submitted_buffered_and_reported_on_model_tokens(
     rollouts = world.rollouts(_lease(lease_id=granted.lease_id, nonce=granted.nonce))
     answer = subs.submit(granted.lease_id, "5Hot", rollouts)
     assert answer["verdict"] == "in_zone" and answer["rewards"] == [1.0, 0.0] * 8
-    (buffered,) = subs.buffer.take(EPISODE, 4)
+    (buffered,) = subs.buffer.take(4)
     assert buffered.spans == tuple(r.spans for r in rollouts)
     model = sum(e - s for s, e in rollouts[0].spans)
     assert subs.group(granted.lease_id)["completion_tokens"] == 16 * model < sum(len(r.tokens) for r in rollouts)
@@ -429,8 +452,9 @@ class _Result:
 
 
 class _Runner:
-    def __init__(self, fail=None, abort_once=()):
+    def __init__(self, fail=None, abort_once=(), refused=None):
         self.fail, self.abort_once, self.runs, self.results = fail, set(abort_once), [], []
+        self.refused = dict(refused or {})                  # index -> how many opens a full machine refuses
 
     async def __aenter__(self):
         return self
@@ -444,6 +468,9 @@ class _Runner:
         if index in self.abort_once:
             self.abort_once.discard(index)
             return _Result(index, ok=False, final_status="aborted")
+        if self.refused.get(index):
+            self.refused[index] -= 1
+            return _Result(index, ok=False, final_status="open_refused")
         result = _Result(index)
         self.results.append(result)
         return result
@@ -468,7 +495,8 @@ def test_the_episode_generator_plays_every_rollout_bound_to_the_lease(monkeypatc
 
     prompt = [7, 7, 7]
 
-    def admissible(outcome, *, policy, renderer, prompt):
+    def admissible(outcome, *, policy, renderer, prompt, lease=False):
+        assert lease                                                     # the async lease rules
         if outcome.seed_index == 13 and policy.refuse:
             return None, "episode_parse: bad"
         tokens = [7, 7, 7] + [outcome.seed_index] * 4 + [99] * 2 + [5]
@@ -476,10 +504,13 @@ def test_the_episode_generator_plays_every_rollout_bound_to_the_lease(monkeypatc
             "agent_completed")), None
 
     monkeypatch.setattr(episode_commit, "episode_admissible", admissible)
+    from reliquary.miner import rl_async_episodes
+
+    monkeypatch.setattr(rl_async_episodes, "OPEN_RETRY_S", 0.0)
     runners = []
 
     def factory(policy, held, text):
-        runners.append(_Runner(abort_once={2}))
+        runners.append(_Runner(abort_once={2}, refused={7: 3}))
         return runners[-1]
 
     policy = SimpleNamespace(environment="ep", refuse=False)
@@ -491,13 +522,14 @@ def test_the_episode_generator_plays_every_rollout_bound_to_the_lease(monkeypatc
     assert group[5].tokens == (5, 5, 5, 5, 99, 99, 5) and group[5].spans == ((0, 4), (6, 7))
     assert group[5].transcript == {"token": {"i": 5}}
     assert sorted(runners[0].runs).count(2) == 2                        # a machine-signed abort is played again
+    assert sorted(runners[0].runs).count(7) == 4                        # a refused open is opened again
     assert bound["s3"] == LeaseDrawBinding(NONCE, 4, 2, 3)
     assert all(r.submitted_called for r in runners[0].results)
     payload = encode_submission(lease, group)
     assert payload["rollouts"][5]["episode"]["spans"] == [[0, 4], [6, 7]]
     policy.refuse = True                                                 # one rollout unusable: the lease fails
-    with pytest.raises(EpisodeLeaseFailed):
-        asyncio.run(generator.agenerate([lease]))
+    (failed,) = asyncio.run(generator.agenerate([lease]))
+    assert isinstance(failed, EpisodeLeaseFailed)
     assert all(r.released for r in runners[1].results)
 
 

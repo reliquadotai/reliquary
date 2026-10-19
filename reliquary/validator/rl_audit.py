@@ -13,25 +13,28 @@ Verdict (each rollout's tallies read as the trainer reads them, ``rl_draw.rollou
 * rollout match = exact picks / stochastic positions (max p < ``FORCED_SEED_STOCHASTIC_MAXPROB``) when it has
   ``FORCED_SEED_ROLLOUT_MIN_STOCH`` of them, else exact picks / every drawn position;
 * ``deterministic`` failure: a rollout that follows the draw (enough stochastic positions, match >= the floor) yet
-  carries more than ``RL_AUDIT_FORGERY_MISMATCH_TOLERANCE`` hard mismatches at near-deterministic positions. Its
+  carries more than ``RL_AUDIT_FORGERY_MISMATCH_TOLERANCE`` hard mismatches per started block of
+  ``RL_AUDIT_FORGERY_MISMATCH_POSITIONS`` near-deterministic positions (``mismatch_allowance``). Its
   miner held the model and the noise; tokens no draw produces there were edited afterwards;
 * fewer than ``FORCED_SEED_MIN_STOCH_POSITIONS`` drawn positions in the whole group: the audit abstains,
   ``passed=None`` with ``suspect`` (nothing verified: unpaid, no probation pass, the hotkey stays in probation);
 * ``statistical`` failure: the pooled match is under the floor (``RL_GROUP_MATCH_FLOOR``, the trainer's), or a
-  rollout is under ``RL_FORGERY_MATCH_FLOOR`` (no honest noise). A rollout between the two floors is excluded from
+  rollout is under ``RL_FORGERY_MATCH_FLOOR`` (no honest noise). Unlike the trainer, the audit rates short rollouts
+  too (``min_drawn=0``): it has no Gumbel gap or final-EOS test to judge them by. A rollout between the two floors is excluded from
   pay (§4.6), it does not fail the group by itself;
 * no model: ``passed=None`` (inconclusive: unpaid, unsanctioned).
 
-The forward runs against the latest checkpoint; ``RlSubmissions.report_audit`` turns a failure of a group leased
-more than ``RL_SANCTION_MAX_LAG`` checkpoints back into an unsanctioned inconclusive (the trainer's lag rule).
+The forward runs against the latest checkpoint; a failure is unpaid, never sanctioned (``RlSubmissions``).
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from reliquary.constants import (
     FORCED_SEED_MIN_STOCH_POSITIONS,
     FORCED_SEED_ROLLOUT_MIN_STOCH,
+    RL_AUDIT_FORGERY_MISMATCH_POSITIONS,
     RL_AUDIT_FORGERY_MISMATCH_TOLERANCE,
     RL_FORGERY_MATCH_FLOOR,
     RL_GROUP_MATCH_FLOOR,
@@ -61,14 +64,24 @@ def rollout_draw_diagnostics(model: Any, group: SubmittedGroup, index: int):
         position_offsets=[t for t, _ in drawn], logit_positions=[len(prompt) + p - 1 for _, p in drawn])
 
 
+def mismatch_allowance(diagnostics, tolerance: int = RL_AUDIT_FORGERY_MISMATCH_TOLERANCE,
+                       per_positions: int = RL_AUDIT_FORGERY_MISMATCH_POSITIONS) -> int:
+    """Hard mismatches a rollout may carry at its near-deterministic positions: ``tolerance`` per started block of
+    ``per_positions`` of them (one block at least)."""
+    deterministic = max(0, diagnostics.n_positions - diagnostics.n_stochastic)
+    return tolerance * max(1, math.ceil(deterministic / per_positions))
+
+
 def judge(diagnostics, *, floor: float = RL_ROLLOUT_MATCH_FLOOR, group_floor: float = RL_GROUP_MATCH_FLOOR,
           tolerance: int = RL_AUDIT_FORGERY_MISMATCH_TOLERANCE,
+          per_positions: int = RL_AUDIT_FORGERY_MISMATCH_POSITIONS,
           forgery_floor: float = RL_FORGERY_MATCH_FLOOR) -> AuditResult:
     """The group verdict from its rollouts' diagnostics (see the module doc)."""
     tallies = [(d.n_stochastic, d.n_exact_match, d.n_positions, d.n_drawn_exact_match) for d in diagnostics]
-    match = tuple(rollout_rate(t) for t in tallies)
+    match = tuple(rollout_rate(t, min_drawn=0) for t in tallies)      # no gap test here: short rollouts get a rate
     if any(d.n_stochastic >= FORCED_SEED_ROLLOUT_MIN_STOCH and m >= floor
-           and d.n_deterministic_hard_mismatch > tolerance for d, m in zip(diagnostics, match)):
+           and d.n_deterministic_hard_mismatch > mismatch_allowance(d, tolerance, per_positions)
+           for d, m in zip(diagnostics, match)):
         return AuditResult(False, AUDIT_FAILURE_DETERMINISTIC, match)
     if sum(t[2] for t in tallies) < FORCED_SEED_MIN_STOCH_POSITIONS:
         return AuditResult(None, None, match, suspect=True)
@@ -92,4 +105,4 @@ def run_rl_audits(model: Any, submissions, *, limit: int = DEFAULT_AUDIT_LIMIT) 
     return submissions.run_audits(audit_forward(model), limit)
 
 
-__all__ = ["DEFAULT_AUDIT_LIMIT", "audit_forward", "judge", "rollout_draw_diagnostics", "run_rl_audits"]
+__all__ = ["DEFAULT_AUDIT_LIMIT", "audit_forward", "judge", "mismatch_allowance", "rollout_draw_diagnostics", "run_rl_audits"]

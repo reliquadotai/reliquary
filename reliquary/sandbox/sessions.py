@@ -189,6 +189,9 @@ class Grant:
     token: dict = field(repr=False)          # a bearer secret: never in a repr or a log
     gateway_url: str = ""
     expires_at: int = 0
+    # The sessions the hotkey may hold at once as the corpus quota sees it now (its potential): the miner grows
+    # its live sessions to it. None (no quota): the answer carries no such field.
+    allowance: int | None = None
 
 
 @dataclass(frozen=True)
@@ -566,8 +569,13 @@ class SessionBook:
         # Machine id -> ids of the sessions issued on it (who holds a machine is read from it, no full scan).
         self._by_machine: dict[str, set[str]] = {}
         # How much the per-hotkey abort and refused-open rates scale for a hotkey (the RL quota sets it to
-        # the hotkey's allocation in groups; 1 everywhere else).
+        # the hotkey's allocation in groups, the corpus quota to its allowance over the policy's per-job cap;
+        # 1 everywhere else).
         self.cap_scale: Callable[[str], float] = lambda hotkey: 1.0
+        # The corpus quota's per-hotkey ceilings (``corpus_quota.CorpusQuota.install``): (live sessions in total,
+        # live sessions per job), and opens per rolling hour. None: the policy's fixed caps.
+        self.live_caps: Callable[[str], tuple[int, int]] | None = None
+        self.opens_cap: Callable[[str], int] | None = None
 
     def generation(self, job_id: Any, prompt_index: Any) -> int:
         return self._generations.get((job_id, prompt_index), 0)
@@ -666,6 +674,10 @@ class SessionBook:
         """The hotkeys with a session in the book."""
         return tuple(self._by_hotkey)
 
+    def of_hotkey(self, hotkey: str) -> tuple[SessionRecord, ...]:
+        """The hotkey's sessions in the book (an index, never a scan of the book)."""
+        return tuple(self._sessions[s] for s in self._by_hotkey.get(hotkey, ()) if s in self._sessions)
+
     def held_by(self, hotkeys, now: int) -> int:
         """Held sessions of these hotkeys, fleet-wide (from the per-hotkey index)."""
         return sum(1 for hotkey in set(hotkeys) for s in self._by_hotkey.get(hotkey, ())
@@ -703,15 +715,23 @@ class SessionBook:
         """Whether an exclusive (RL) engagement is consumed. Only a machine-signed ``aborted``
         frees it, and at most ONCE: a ``voided`` session (a drain frees what the miner left ``live``, so
         it would be a selective re-roll) and every other state keep it taken, and so does a second
-        ``aborted`` record of the same engagement. A pool abort caused by other miners never counts."""
+        ``aborted`` record of the same engagement. A pool abort caused by other miners never counts.
+        An RL lease rollout whose open the machine refused with a verified signed receipt (fault
+        ``open_refused:*``: no box ever ran, nothing was seen) is free again, every time: a lease needs all
+        its rollouts, and a full machine must not cost the whole lease."""
         aborted = 0
         sha = _rl_precommit_engagement(engagement)
         if sha is None:
             candidates = self._sessions.values()
         else:                               # an RL engagement: only its precommit's sessions (an index, no scan)
             candidates = [self._sessions[s] for s in self._by_precommit.get(sha, ()) if s in self._sessions]
+        from reliquary.protocol.service_episode import RL_LEASE_ENGAGEMENT_PREFIX
+
+        lease = engagement.startswith(f"{RL_LEASE_ENGAGEMENT_PREFIX}:")
         for r in candidates:
             if r.engagement != engagement:
+                continue
+            if lease and str(r.fault or "").startswith("open_refused:"):
                 continue
             if r.state != ABORTED:
                 return True
@@ -735,15 +755,17 @@ class SessionBook:
         mine = [self._sessions[s] for s in self._by_hotkey.get(hotkey, ()) if s in self._sessions]
         policy = self.policy
         live = sum(1 for r in mine if self._holds(r, now))
-        if live >= policy.max_live_per_hotkey:
-            return Refusal("live_cap", {"live": live, "max": policy.max_live_per_hotkey})
+        max_live = policy.max_live_per_hotkey if self.live_caps is None else int(self.live_caps(hotkey)[0])
+        if live >= max_live:
+            return Refusal("live_cap", {"live": live, "max": max_live})
         # A session handed back still counts: it was opened (only the yield accounting excludes it).
         counted = sorted(r.issued_at for r in mine
                          if r.issued_at > now - HOUR and r.state not in (ABORTED, VOIDED))
         opens = len(counted)
-        if opens >= policy.max_opens_per_hour:     # retry when enough of them leave the hour
-            return Refusal("open_rate_cap", {"opens": opens, "max": policy.max_opens_per_hour},
-                           retry_after=counted[opens - policy.max_opens_per_hour] + HOUR - now)
+        max_opens = policy.max_opens_per_hour if self.opens_cap is None else max(1, int(self.opens_cap(hotkey)))
+        if opens >= max_opens:                     # retry when enough of them leave the hour
+            return Refusal("open_rate_cap", {"opens": opens, "max": max_opens},
+                           retry_after=counted[opens - max_opens] + HOUR - now)
         closed = sorted(r.closed_at or 0 for r in mine
                         if r.state == ABORTED and r.fault != "grading_pool" and (r.closed_at or 0) > now - DAY)
         aborted = len(closed)
@@ -762,9 +784,10 @@ class SessionBook:
                 if r.hotkey == hotkey and r.job_id == job_id and self._holds(r, now)]
         if any(r.prompt_index == prompt_index for r in held):
             return Refusal("prompt_live_cap", {"job_id": job_id, "prompt_index": prompt_index})
-        if len(held) >= self.policy.max_live_per_hotkey_job:
-            return Refusal("job_live_cap", {"job_id": job_id, "live": len(held),
-                                            "max": self.policy.max_live_per_hotkey_job})
+        cap = (self.policy.max_live_per_hotkey_job if self.live_caps is None
+               else int(self.live_caps(hotkey)[1]))
+        if len(held) >= cap:
+            return Refusal("job_live_cap", {"job_id": job_id, "live": len(held), "max": cap})
         return None
 
     def settle(self, session_id: str, state: str, *, now: int,
@@ -893,8 +916,11 @@ class SessionIssuer:
                  events: SessionEvents | None = None, record_faults: bool = False,
                  open_refusal_check: Callable[[Mapping[str, Any], SessionRecord], bool | None] | None = None,
                  queue=None, operator_of: Callable[[str], str | None] | None = None,
-                 entitled: Callable[[str], int] | None = None) -> None:
+                 entitled: Callable[[str], int] | None = None, quota=None) -> None:
         self.book = book
+        # The corpus quota (``corpus_quota.CorpusQuota``): asked under the issuer lock once the book's caps and the
+        # prompt's slots passed, before placement; it also names the allowance a grant carries. None: no quota.
+        self._quota = quota
         self._store, self._fleet, self._signer = store, fleet, signer
         self._token_verifier = token_verifier
         self._engagements = dict(engagements)
@@ -1297,6 +1323,10 @@ class SessionIssuer:
                 return Refusal("prompt_unavailable", {
                     "prompt_index": terms.prompt_index,
                     "slots_remaining": remaining, "reserved": reserved})
+        if self._quota is not None:
+            refusal = self._quota.admit(hotkey, now, engagement=terms.engagement)
+            if refusal is not None:
+                return refusal
         validity = token_validity_s(self._policy.open_window_s, int(terms.budgets["wall_s"]),
                                     terms.prepare_timeout_s)
         placement = None
@@ -1364,7 +1394,13 @@ class SessionIssuer:
                     self._weights = {sid: w for sid, w in self._weights.items() if self.book.get(sid) is not None}
         self._tokens[session_id] = (token, placement.address)
         self._event("opened", record)
-        return _Issued(Grant(session_id, token, placement.address, claims.expires_at),
+        allowance = None
+        if self._quota is not None:
+            try:
+                allowance = int(self._quota.allowance(hotkey))
+            except Exception:
+                logger.exception("the corpus quota could not name the allowance of %s", hotkey[:12])
+        return _Issued(Grant(session_id, token, placement.address, claims.expires_at, allowance=allowance),
                        placement.machine_id, terms.engagement)
 
     def unserved_recovered(self, env: str) -> None:

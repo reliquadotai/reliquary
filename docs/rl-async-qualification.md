@@ -58,9 +58,9 @@ Validator controller + trainer + 3 honest miners (one per card) for >= 100 steps
 stale (holds an old checkpoint), fp8, W4A16 (must fall under the floor), a forger (random
 tokens on some positions), a squatter (takes leases, never submits), a Sybil set (10 hotkeys
 on one GPU), a resubmitter.
-Check: leases, expiries and quota (slow start, halving), lifecycle states and
+Check: leases, expiries and quota (slow start, expiry cut, paid-only credit), lifecycle states and
 `/rl/prompts/state`, audits and bans, `full` refusals under the global cap, `/rl/pay` and a
-settled period, price ticks (supply/demand ratio per env), substitution rate, KL, entropy,
+settled period, price ticks (supply/demand ratio per env, read from the queue), substitution rate, KL, entropy,
 eval on held-out problems every ~20 steps.
 Decides: lease expiry and starting quota, `rl_max_pending_groups`, price band; first look at
 the 9B learning rate (2e-6 vs 5e-6 on two short branches if time allows).
@@ -81,16 +81,21 @@ proof-worker images; signer, proof worker, controller in that order).
 
 | Parameter | Placeholder | Set by |
 |---|---|---|
-| `RL_ROLLOUT_MATCH_FLOOR` | 0.95 | Q2 |
+| `RL_ROLLOUT_MATCH_FLOOR` | 0.90 | Q2 |
 | `RL_GROUP_MATCH_FLOOR` | 0.90 | Q2 |
 | `RL_FORGERY_MATCH_FLOOR` | 0.5 | Q2 (honest p0.001 on the worst card) |
-| `RL_SANCTION_MAX_LAG` | 2 checkpoints | Q2, Q5 (honest match vs lag) |
+| `RL_GAP_TOLERANCE` | 8.0 (honest gaps grow with lag) | Q5: logged `async/gap_*` at the real lag |
+| `RL_SUBSTITUTE_GAP` | 3.0 (re-grade threshold) | Q5: re-grade rate vs honest moved rewards |
+| `RL_TERMINAL_GAP` | 1.0 (final EOS) | Q5: `async/rollouts_bad_termination` at real lag |
+| `RL_AUDIT_FORGERY_MISMATCH_TOLERANCE` / `_POSITIONS` | 1 hard mismatch per 4096 near-deterministic positions | Q5: honest long code rollouts at lag 0-2 |
+| `RL_AUDIT_MAX_LAG` | 4 | Q5: audit lag and dropped audits under the real audit load |
 | `RL_FIRST_SCAN_MIN_TOKENS` | 1024 | Q5 |
-| `HOTKEY_PENDING_SHARE` | 0.25 of the cap | Q5 (Sybil, squatter) |
+| `HOTKEY_MAX_OPEN` | 64 open leases | Q5 (Sybil, squatter) |
 | `MAX_GRADING_PER_HOTKEY`, submit reads | 2; 8 total, 2 per hotkey | Q5 |
 | lease expiry reference speed | 20 tok/s | Q3, Q5 |
 | starting quota | 4 | Q5 |
-| `rl_max_pending_groups` (buffered groups only) | 256 | Q5 |
+| `EXPIRY_BACKOFF` | x0.9 per expiry (at least one lease) | Q5 |
+| `rl_max_pending_groups` (buffered groups only) | 192 (simulated: the lag knob) | Q5 |
 | price band low/high | 0.90 / 1.10 (rise 1.05, decay -2 %/tick) | price simulation, Q5 |
 | `batch_groups` | 64 | Q4 |
 | steps per checkpoint | 1 | Q3, Q4 |

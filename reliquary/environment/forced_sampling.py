@@ -293,6 +293,16 @@ def gumbel_argmax(logits: torch.Tensor, keys: torch.Tensor) -> tuple[torch.Tenso
     return gumbel_argmax_reference(logits, keys)
 
 
+def gumbel_gaps(logits: torch.Tensor, draws: list[float], tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The Gumbel picks of ``logits`` [n, vocab] and, per row, how far ``tokens`` [n] is from being the pick: the best
+    score minus the token's score (``s = logit + G``), 0 where the token is the pick."""
+    keys = _gumbel_keys(draws, logits.device)
+    picks, best = gumbel_argmax(logits, keys)
+    tokens = tokens.to(logits.device)
+    own = logits.float().gather(1, tokens[:, None])[:, 0] + gumbel_noise_from_bits(_splitmix_bits(keys, tokens))
+    return picks, torch.where(picks == tokens, torch.zeros_like(best), (best - own).clamp_min(0.0))
+
+
 def pick_rows(logits: torch.Tensor, draws: list[float], *, draw: str = DRAW_INVERSE_CDF,
               t: float = 1.0, top_k: int = 0, top_p: float = 1.0) -> torch.Tensor:
     """The forced pick of each row of ``logits`` [n, vocab] for its public uniform ``draws[i]``,
@@ -491,11 +501,14 @@ def seed_consistency_diagnostics(
         1,
         min(n, _DIAGNOSTIC_FLOAT_WORKSPACE_BYTES // (vocab_size * 4)),
     )
-    if draw == DRAW_GUMBEL_MAX:
+    if draw == DRAW_GUMBEL_MAX and not (str(logits.device).startswith("cuda") and _triton_argmax()):
+        # The torch reference holds ~6 float64 [rows, V] temporaries; the fused kernel none (an RL audit of 120k
+        # positions at the reference's 21 rows a chunk spent ~70 s in 5,700 chunks, 2026-10-18).
         chunk_rows = min(chunk_rows, _gumbel_chunk_rows(vocab_size))
-    counts = [0] * 9
-    max_cdf_miss = 0.0
-    first_hard_mismatch_offset: int | None = None
+    # Accumulated on the device, read once: a host sync per chunk dominated long rollouts.
+    counts = None
+    max_cdf_miss = None
+    first_hard = None
     for start in range(0, n, chunk_rows):
         end = min(n, start + chunk_rows)
         if selected_positions is None:
@@ -550,17 +563,22 @@ def seed_consistency_diagnostics(
                 (miss > 0.10).sum(),
                 exact.sum(),
             )
-        ).tolist()
-        counts = [total + int(value) for total, value in zip(counts, chunk_counts)]
-        max_cdf_miss = max(max_cdf_miss, float(miss.max().item()))
-        if hard_offsets.numel():
-            chunk_first = int(hard_offsets.min().item())
-            first_hard_mismatch_offset = (
-                chunk_first
-                if first_hard_mismatch_offset is None
-                else min(first_hard_mismatch_offset, chunk_first)
-            )
+        )
+        chunk_max = miss.max().double()
+        chunk_first = (hard_offsets.min() if hard_offsets.numel()
+                       else torch.tensor(-1, device=offsets.device, dtype=torch.long))
+        if counts is None:
+            counts, max_cdf_miss, first_hard = chunk_counts, chunk_max, chunk_first
+        else:
+            counts = counts + chunk_counts
+            max_cdf_miss = torch.maximum(max_cdf_miss, chunk_max)
+            first_hard = torch.where((first_hard < 0) | ((chunk_first >= 0) & (chunk_first < first_hard)),
+                                     chunk_first, first_hard)
 
+    counts = [int(value) for value in counts.tolist()]
+    max_cdf_miss = float(max_cdf_miss.item())
+    first_hard = int(first_hard.item())
+    first_hard_mismatch_offset = None if first_hard < 0 else first_hard
     return SeedConsistencyDiagnostics(
         n_positions=n,
         n_stochastic=int(counts[0]),

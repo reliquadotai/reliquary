@@ -105,6 +105,25 @@ def test_the_config_needs_both_key_settings(tmp_path):
     assert config.policy.max_live_per_hotkey == 3 and config.policy.claim_ttl_s == 600
 
 
+def test_the_session_audience_is_the_configured_hotkey_else_the_wallets(tmp_path):
+    from reliquary.validator.corpus_validator import sandbox_validator_hotkey
+
+    keys = {"RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE": str(tmp_path / "v.pem"),
+            "RELIQUARY_SANDBOX_VALIDATOR_KEY_ID": "v1"}
+    wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="5Wallet"))
+    plain = SandboxValidatorConfig.from_env(keys)
+    assert plain.validator_hotkey is None
+    assert sandbox_validator_hotkey(plain, wallet) == "5Wallet"
+    # The split front has no wallet: without the setting it names the setting.
+    with pytest.raises(ValueError, match="RELIQUARY_SANDBOX_VALIDATOR_HOTKEY"):
+        sandbox_validator_hotkey(plain, None)
+    configured = SandboxValidatorConfig.from_env(
+        {**keys, "RELIQUARY_SANDBOX_VALIDATOR_HOTKEY": f" {VALIDATOR} "})
+    assert configured.validator_hotkey == VALIDATOR
+    assert sandbox_validator_hotkey(configured, None) == VALIDATOR
+    assert sandbox_validator_hotkey(configured, wallet) == VALIDATOR
+
+
 def test_the_config_reads_the_directory_and_close_settings(tmp_path):
     keys = {"RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE": str(tmp_path / "v.pem"),
             "RELIQUARY_SANDBOX_VALIDATOR_KEY_ID": "v1"}

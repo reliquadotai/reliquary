@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import shutil
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -30,6 +31,9 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 ABORT_REPLAYS = 1
+# A rollout whose open a full machine refused (signed receipt: its engagement is free again) is opened again after
+# this wait, doubled up to the cap, until the lease's deadline: a lease takes all 16 of its episodes.
+OPEN_RETRY_S, OPEN_RETRY_MAX_S = 15.0, 120.0
 
 
 class EpisodeLeaseFailed(RuntimeError):
@@ -51,21 +55,54 @@ class EpisodeLeaseGenerator:
         self._renderer_for, self._task_prompt, self._load = renderer_for, task_prompt, load_weights
         self.rollouts = int(rollouts)
         self._renderers: dict[str, Any] = {}
+        self._running: dict[str, asyncio.Task] = {}
 
     def generate(self, leases) -> list:
         raise RuntimeError("episodes are played on the event loop: call agenerate")
 
-    async def agenerate(self, leases: Sequence[Any]) -> list[list[Any]]:
-        """Every lease's ``ROLLOUTS`` episodes (``EpisodeRollout``), leases played side by side. Raises when any
-        lease fails (the miner's generation retry, then the lease is given up)."""
+    async def agenerate(self, leases: Sequence[Any]) -> list[Any]:
+        """Every lease's ``ROLLOUTS`` episodes (``EpisodeRollout``), leases played side by side. A lease that fails
+        comes back as its ``EpisodeLeaseFailed``, the others' episodes are kept: a lease's sessions are single-use,
+        so it cannot be played again and the miner gives it up (``AsyncMiner.generate_once``)."""
         ensure = getattr(self._engine, "ensure_serving", None)
         if ensure is not None:
             await ensure()                    # the loopback generate endpoint, served on this loop once
         results = await asyncio.gather(*(self.play_lease(lease) for lease in leases), return_exceptions=True)
-        for lease, result in zip(leases, results):
-            if isinstance(result, BaseException):
-                raise EpisodeLeaseFailed(f"lease {lease.lease_id[:12]}: {result}") from result
-        return list(results)
+        return [result if not isinstance(result, BaseException)
+                else result if isinstance(result, EpisodeLeaseFailed)
+                else EpisodeLeaseFailed(f"lease {lease.lease_id[:12]}: {result!r}")
+                for lease, result in zip(leases, results)]
+
+    async def aadvance(self, leases: Sequence[Any], budget_s: float) -> list[tuple[str, Any]]:
+        """Continuous play (``AsyncMiner._stream_once``): start ``leases``, each in a task of its own, wait about
+        ``budget_s`` for any running lease to end, return the ended ones as ``(lease id, episodes or its
+        EpisodeLeaseFailed)``. A long lease never holds the others back."""
+        ensure = getattr(self._engine, "ensure_serving", None)
+        if leases and ensure is not None:
+            await ensure()
+
+        async def play(lease):
+            try:
+                return await self.play_lease(lease)
+            except EpisodeLeaseFailed as failed:
+                return failed
+            except Exception as exc:
+                return EpisodeLeaseFailed(f"lease {lease.lease_id[:12]}: {exc!r}")
+
+        for lease in leases:
+            self._running[lease.lease_id] = asyncio.create_task(play(lease))
+        if not self._running:
+            return []
+        await asyncio.wait(list(self._running.values()), timeout=budget_s, return_when=asyncio.FIRST_COMPLETED)
+        done = [(lease_id, task.result()) for lease_id, task in self._running.items() if task.done()]
+        for lease_id, _ in done:
+            del self._running[lease_id]
+        return done
+
+    def abort(self) -> None:
+        for task in self._running.values():
+            task.cancel()
+        self._running.clear()
 
     def load_weights(self, state: Mapping[str, Any], version: int) -> None:
         if self._load is None:
@@ -95,18 +132,25 @@ class EpisodeLeaseGenerator:
 
         async def one(index: int):
             binding = LeaseDrawBinding(lease.nonce, int(lease.prompt_idx), int(lease.checkpoint), index)
-            for replay in range(ABORT_REPLAYS + 1):
+            replays, wait = 0, OPEN_RETRY_S
+            while True:
                 played = await play_bound(runner, self._engine, self._draws, index, binding,
                                           getattr(runner, "deadline", None), label=label)
                 if played is None:
                     return None
                 result, session = played
-                if (not result.ok and getattr(result, "final_status", None) == "aborted"
-                        and replay < ABORT_REPLAYS):
+                status = None if result.ok else getattr(result, "final_status", None)
+                if status == "open_refused":
+                    logger.info("rollout %d of %s: its machine refused the open; opened again in %.0f s",
+                                index, label, wait)
+                    await asyncio.sleep(wait)
+                    wait = min(wait * 2, OPEN_RETRY_MAX_S)
+                    continue
+                if status == "aborted" and replays < ABORT_REPLAYS:
+                    replays += 1
                     logger.info("rollout %d of %s aborted by its machine: played again", index, label)
                     continue
                 return SimpleNamespace(seed_index=index, result=result, session=session)
-            return None
 
         async with runner:
             outcomes = await asyncio.gather(*(one(i) for i in range(self.rollouts)), return_exceptions=True)
@@ -116,11 +160,13 @@ class EpisodeLeaseGenerator:
                     why = why or f"rollout {index}: no episode ({outcome!r})"
                     kept.append(None)
                     continue
-                admitted, refusal = episode_admissible(outcome, policy=policy, renderer=renderer, prompt=prompt)
+                admitted, refusal = episode_admissible(outcome, policy=policy, renderer=renderer, prompt=prompt,
+                                                       lease=True)
                 if admitted is None:
                     why = why or f"rollout {index}: {refusal}"
                 kept.append(admitted)
             if why is not None:
+                logger.warning("%s cannot be submitted: %s", label, why)   # now, not when its batch ends
                 await _release([o for o in outcomes if not isinstance(o, BaseException) and o is not None])
                 raise EpisodeLeaseFailed(why)
             for outcome in outcomes:
@@ -160,6 +206,8 @@ class EpisodeEngineHost:
         self.model_dir: str | None = None
         self.restarts = 0
         self._server = self._serving = None
+        # ``push`` ships a function to the workers through collective_rpc: allowed before the engine starts them.
+        os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
     @property
     def generate_url(self) -> str:
@@ -186,6 +234,32 @@ class EpisodeEngineHost:
         engine.start()
         self.core, self.engine, self.model_dir = core, engine, str(model_dir)
         self.restarts += 1
+
+    def push(self, state: Mapping[str, Any], scratch: Path) -> None:
+        """New weights into the running engine, in place: the engine thread stops (no turn in flight), every worker
+        loads the shards through the model's ``load_weights`` (``LLM.collective_rpc``), the prefix cache is reset
+        and a new engine thread starts on the same core. No model load, no second copy of the weights on the GPU."""
+        from reliquary.miner.corpus_generate_server import GenerateEngine
+        from reliquary.miner.rl_async import _load_weights_from_files
+        from reliquary.shared.ckpt_delta import write_anchor_shards
+
+        if self.core is None:
+            raise RuntimeError("no engine to push weights into")
+        if self.engine is not None:
+            self.engine.stop()
+            self.engine = None
+        shutil.rmtree(scratch, ignore_errors=True)
+        try:
+            paths = [str(p) for p in write_anchor_shards(state, scratch)]
+            llm = self.core._llm
+            llm.collective_rpc(_load_weights_from_files, args=(paths,))
+            llm.reset_prefix_cache()
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+        engine = GenerateEngine(self.core, max_total_tokens=self.max_total_tokens,
+                                max_tokens_per_turn=self.max_tokens_per_turn, draws=self.draws)
+        engine.start()
+        self.engine = engine
 
     def close_engine(self) -> None:
         engine, core = self.engine, self.core
@@ -215,8 +289,9 @@ class EpisodeEngineHost:
 
 
 class EpisodeWeights:
-    """``EpisodeLeaseGenerator``'s ``load_weights``: the state as an HF directory under ``work_dir`` (config and
-    tokenizer from ``base_model_dir``), then the engine restarted on it (``EpisodeEngineHost.restart``); the
+    """``EpisodeLeaseGenerator``'s ``load_weights``: pushed into the running engine (``EpisodeEngineHost.push``);
+    on the first load, or when the push fails, the state as an HF directory under ``work_dir`` (config and
+    tokenizer from ``base_model_dir``) and the engine restarted on it (``EpisodeEngineHost.restart``); the
     previous directory is removed."""
 
     def __init__(self, host: EpisodeEngineHost, *, base_model_dir: str, work_dir: str) -> None:
@@ -226,6 +301,15 @@ class EpisodeWeights:
     def __call__(self, state: Mapping[str, Any], version: int) -> None:
         from reliquary.miner.rl_async import write_hf_dir
 
+        if self.host.core is not None:
+            try:
+                self.host.push(state, Path("/dev/shm" if Path("/dev/shm").is_dir() else self.work)
+                               / f"rl-episode-push-{os.getpid()}")
+                logger.info("episode engine on checkpoint %d (weights pushed in place)", version)
+                return
+            except Exception:
+                logger.exception("in-place weight push failed; restarting the episode engine on checkpoint %d",
+                                 version)
         if not (self.base / "config.json").is_file():
             raise RuntimeError(f"no model files (config, tokenizer) in {self.base}")
         new_dir = write_hf_dir(state, self.base, self.work / f"episode-weights-{int(version):08d}")
@@ -265,6 +349,32 @@ class MixedGenerator:
         for group_leases, groups in zip([x for x in (played, drawn) if x], results):
             by_id.update({lease.lease_id: group for lease, group in zip(group_leases, groups)})
         return [by_id[lease.lease_id] for lease in leases]
+
+    async def aadvance(self, leases: Sequence[Any], budget_s: float) -> list[tuple[str, Any]]:
+        """Continuous play of both kinds: the episode leases through ``EpisodeLeaseGenerator.aadvance``, the others
+        through the single-turn generator's ``advance`` (in a worker thread), side by side."""
+        names = set() if self.episodes is None else set(self.episodes.policies)
+        played = [lease for lease in leases if lease.environment in names]
+        drawn = [lease for lease in leases if lease.environment not in names]
+        done: list[tuple[str, Any]] = []
+        if drawn and (self.single is None or not callable(getattr(self.single, "advance", None))):
+            done += [(lease.lease_id, EpisodeLeaseFailed(f"{lease.environment} cannot be played continuously here"))
+                     for lease in drawn]
+            drawn = []
+        jobs = []
+        if self.episodes is not None:
+            jobs.append(self.episodes.aadvance(played, budget_s))
+        if self.single is not None and callable(getattr(self.single, "advance", None)):
+            jobs.append(asyncio.to_thread(self.single.advance, drawn, budget_s))
+        for result in await asyncio.gather(*jobs):
+            done += list(result)
+        return done
+
+    def abort(self) -> None:
+        if self.episodes is not None:
+            self.episodes.abort()
+        if self.single is not None and callable(getattr(self.single, "abort", None)):
+            self.single.abort()
 
     def load_weights(self, state: Mapping[str, Any], version: int) -> None:
         if self.single is not None:

@@ -21,10 +21,12 @@ Tags: **DECIDED** (user agreed), **PROPOSED** (recommended, awaiting the user),
    LM head in the reference miner and on the validator (DECIDED).
 4. **Leases** (DECIDED). A miner reserves prompts before generating. The draw's nonce depends
    on (validator secret, prompt, checkpoint) alone, so a lease can neither be pre-generated
-   nor re-rolled. Every lease ends in a submission or an expiry; there is no release. The
+   nor re-rolled. Every lease ends in a submission or an expiry; there is no free release. A
+   miner may forfeit an open lease (`POST /rl/lease/forfeit`): it is charged exactly as its
+   expiry and only frees the quota slot sooner, so it is never cheaper than delivering. The
    public seed pool (choose M of 2xM) is removed.
 5. **Quota measured, not declared** (DECIDED). Concurrent leases per hotkey follow measured
-   throughput and latency (Little's law), with slow start and halving on expiry.
+   paid throughput and latency (Little's law), with slow start and a gentle cut on expiry.
 6. **Validator grades everything; trains on what is in zone** (DECIDED). Out-of-zone groups
    are graded, stored, audited by sampling, and paid 25 % of an in-zone group on a prompt's
    first scan.
@@ -41,7 +43,7 @@ Tags: **DECIDED** (user agreed), **PROPOSED** (recommended, awaiting the user),
     (DECIDED). Miners download through presigned R2 URLs (DECIDED).
 11. **Pay per matched token** of trained groups, with a per-rollout floor so that quantized
     generators do not out-earn honest bf16 ones. Per-environment prices steer each env's supply to
-    its target share of the trainer's speed (DECIDED 2026-10-16).
+    its target share of the trainer's speed, read from the training queue (DECIDED 2026-10-17).
 
 ## 2. Evidence behind the decisions
 
@@ -133,8 +135,10 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
 - Target concurrency = measured throughput (groups/min) x measured lease-to-submit latency x
   1.5, per hotkey, over a sliding window.
 - New hotkeys start at 4 concurrent leases (PROPOSED). While a hotkey uses its full quota and
-  delivers on time, the quota doubles (slow start). Every expiry halves it. Out-of-zone
-  submissions count as delivered work.
+  delivers on time, the quota doubles (slow start). Every expiry cuts it by x0.9 (at least
+  one lease); a submission refused for integrity halves it. Only paid groups count as
+  delivered work: a trained group, or a payable out-of-zone first scan. A submission that
+  earns nothing frees its slot without credit.
 - Published per hotkey with the reasons. Registration burn applies.
 
 ### 4.4 Submission and grading
@@ -144,11 +148,13 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   `unproven` lane): goes to the buffer; verification happens in the training forward (4.7).
 - **Out of zone:** stored with grades. Audit regime from `next-rl-run-decisions.md` §C:
   100 % of a hotkey's first 100 out-of-zone groups (probation), then a random fraction drawn
-  after submission (15 %, user 2026-10-15), graded sanctions (deterministic forgery bans, statistical
-  failure re-opens probation). An audit is a separate forward against the latest checkpoint
-  with the same floor and match as training (PROPOSED: no old checkpoints kept); a failure of a
-  group leased more than 2 checkpoints back (`RL_SANCTION_MAX_LAG`, the trainer's rule) is
-  inconclusive, unsanctioned. An audit that abstains (too few drawn positions) or whose forward
+  after submission (15 %, user 2026-10-15). No sanction (user, 2026-10-17): a failed audit or
+  training verification is unpaid and re-opens probation, nothing more; honest drift fails groups
+  too, so a verdict cannot tell a forger from a lagging miner. Bans are the operator's
+  (`RlSubmissions.blacklist`). An audit is a separate forward against the latest checkpoint
+  with the same floor and match as training (PROPOSED: no old checkpoints kept). Audits run newest
+  first; one queued past `RL_AUDIT_MAX_LAG` (4) checkpoints is dropped unjudged (unpaid, no
+  probation effect): drifted weights would fail honest groups. An audit that abstains (too few drawn positions) or whose forward
   keeps failing is no probation pass and re-opens probation. Upload carries tokens only,
   compressed; `/rl/submit` names its hotkey in a header, checked registered before the body is
   read.
@@ -178,14 +184,30 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
 
 - Miners generate on any checkpoint they hold; the lease records k; verification is always
   against the latest checkpoint. Staleness costs match, hence pay, and is self-priced.
-- **Floor:** 0.95 per rollout with bf16 heads (about 0.96 with fp32 heads, to calibrate at
-  qualification). Keeps every honest rollout at lag <= 2, rejects all W4A16. fp8 weights sit
-  around 0.95: a pricing question, not a floor question.
+- **Floor:** 0.90 per rollout (to confirm at qualification). Trainer-vs-vLLM bf16 noise leaves a
+  few honest rollouts just under 0.95 even at lag 0; the gap tests judge each mismatch. Still
+  rejects all W4A16.
 - **Rollout-level rule:** a rollout under the floor is excluded and unpaid; the group is
   judged on its pooled match (one noisy rollout must not kill the group: x16 compounding). The
   floor tolerates honest noise, never forgery: one rollout under `RL_FORGERY_MATCH_FLOOR`
   (placeholder 0.5) rejects the group as evidence.
 - **No quality lag cap** (user, 2026-10-15): the floor alone rejects rollouts that are too stale.
+- **Gap test, re-grading and final EOS** (2026-10-17). Rewards are graded on the miner's tokens,
+  so the tokens that differ from the pick are checked; the match floor becomes a safety net:
+  1. **Gumbel gap** per mismatch: best score minus the miner's token's score (s = logit + G).
+     A rollout with a gap over `RL_GAP_TOLERANCE` is not trained nor paid.
+  2. **Re-grading with the trainer's picks**: the mismatches over `RL_SUBSTITUTE_GAP` go back
+     with the report; the validator grades those rollouts again with the picks there (the first
+     of a run of consecutive mismatches only). A reward that moves: the group is unpaid, no
+     sanction. Episodes are not re-graded.
+  3. **The final EOS**: its gap must stay within `RL_TERMINAL_GAP` (the re-grade cannot see a cut
+     continuation). No probability floor, unlike the window path's `p_stop`: an honest draw ends on
+     an unlikely EOS too (IF, 2026-10-18: honest final EOS down to p = 7e-7 with gap 0).
+  A rollout with fewer than 20 drawn positions gets no match rate in the trainer (one honest near-tie
+  in 3 tokens is 0.67): the gap and final-EOS tests judge it. The audit, which has neither, still
+  rates it.
+  Thresholds are placeholders until the gaps of a real run are logged (`async/gap_*`,
+  `async/rollouts_regraded`, `async/rollouts_bad_termination`).
 - **Leases only on checkpoints whose secret S_k is unrevealed** (DECIDED). Once S_k is public
   anyone can compute every nonce of k, pre-generate and lease only the prompts that land in
   zone. S_k is revealed late (e.g. 16 checkpoints after k), so the rule never binds an honest
@@ -262,18 +284,24 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   out-of-zone work counts for quota either way.
 - Per-rollout floor prevents quantized formats from out-earning bf16 (measured: a 3090 earns
   +65 % paid tokens/s with W4A16 under pay-per-match without a floor).
-- Per-env price controller (DECIDED 2026-10-16): the target is the trainer's speed. The trainer
-  reports per step the completion tokens it processed and the seconds it worked (waits excluded);
-  an env's demand is its target share (`env_split`, the operator's only knob) x that speed, its
-  supply the completion tokens of its groups queued per second. Per tick (300 s): supply/demand
-  under 0.90 rises x1.05, over 1.10 (or refused by the global cap while the total supply covers
-  the trainer) descends 2 %, else holds; an env with no supply in the tick gives its share to
-  the others (placeholders, from a 72 h simulation with miners reallocating on prices: the
-  first values, x1.10 up and -0.2 % down, ratcheted up and pinned the costliest env at the cap;
-  these converge in 7-9 h with 1-3 % trainer wait). No global price: the demands sum to the trainer's speed, so every env at ~1
-  means the miners as a whole match the trainer; a bad batch mix moves the env prices by itself.
-  No speed for 3 ticks (trainer down): hold. `/rl/pay` publishes ratio, supply, demand and price
-  per env.
+- Per-env price controller (DECIDED 2026-10-16, measured from the queue 2026-10-17): one ratio per
+  env, r = its supply / (its target share x the trainer's speed). Everything is read from the
+  training queue, nothing is reported by the trainer: the speed is the completion tokens it took
+  over the seconds it did not wait (sums decayed per tick); an env's supply is the completion
+  tokens of its groups queued per second; its target share (`env_split`, the operator's only
+  knob) is renormalised over the envs that supplied. Per tick (300 s): r under 0.90 rises x1.05,
+  over 1.10 (or refused by the global cap) descends 2 %, else holds. Two global guards from the
+  queue: while the cap refuses leases no price rises, while the trainer waits (over 5 % of the
+  tick) no price descends. The trainer neither took nor waited for 3 ticks (down): hold.
+  `/rl/pay` publishes ratio, supply, demand and price per env.
+  Simulation (scratchpad `queue_sim.py`, 72 h, 7 scenarios, miners reallocating on prices, groups
+  taking several steps to generate): without the guards, miners moving between envs keep some
+  env short at every tick, it rises x1.05 while the long ones descend 2 %, and every price
+  ratchets to the cap with the queue full. With them, prices settle, the mix is within a few
+  points of target, and the spend falls to 18-67 % of the budget when GPUs are plentiful (the rest
+  burns). The cap is then the lag knob: trainer wait 7 / 2 / 1 / <1 % and queue wait p50 0.6 / 0.9
+  / 1.3 / 2.2 steps at cap 128 / 160 / 192 / 256 (192 by default). The generation time, not the
+  queue, is most of the lag (p50 ~5 steps issue -> train).
 
 ### 4.9b Miner formats and pay (DECIDED 2026-10-16: no official format)
 

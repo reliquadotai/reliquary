@@ -31,6 +31,7 @@ import inspect
 import logging
 import os
 import threading
+import time
 from typing import Any
 
 import torch
@@ -376,6 +377,8 @@ class VLLMRolloutGenerator:
         if default_lm_head_fp32() if lm_head_fp32 is None else lm_head_fp32:
             self._settings["hf_overrides"] = dict(FP32_HEAD_OVERRIDES)
         self._sampling_params_class = sampling_params_class
+        self._pending: dict[str, tuple[str, int, set[int]]] = {}    # request id -> (group key, rollout, stop ids)
+        self._groups: dict[str, list[list[int] | None]] = {}        # group key -> its completions so far
         self._llm = engine if engine is not None else self._build(model_path, revision)
 
     def _build(self, model_path: str, revision: str | None) -> Any:
@@ -481,3 +484,54 @@ class VLLMRolloutGenerator:
             answer.append(completions[start:start + size])
             start += size
         return answer
+
+    # --- continuous batching: groups join the running engine, each returns when its last rollout ends -------
+    def add_group(self, key: str, prompt_tokens: list[int], extra_args: list[dict[str, Any]],
+                  max_new_tokens: int, *, eos_ids: list[int]) -> None:
+        """Queue one group's requests in the running engine (``step_groups`` drives it). ``key`` names the group
+        in what ``step_groups`` returns; the draw is per request, as in ``generate_batch``."""
+        sampling_params = self._sampling_params_class
+        if sampling_params is None:
+            from vllm import SamplingParams as sampling_params
+        from vllm.sampling_params import RequestOutputKind
+
+        pending, groups = self._pending, self._groups
+        if key in groups:
+            raise ValueError(f"group {key} is already running")
+        stop_ids = sorted(int(token) for token in eos_ids)
+        groups[key] = [None] * len(extra_args)
+        for index, extra in enumerate(extra_args):
+            params = sampling_params(temperature=0.0, max_tokens=int(max_new_tokens), detokenize=False,
+                                     stop_token_ids=stop_ids or None, extra_args=extra)
+            params.output_kind = RequestOutputKind.FINAL_ONLY
+            request_id = f"rl-{key}-{index}"
+            self._llm.llm_engine.add_request(request_id, {"prompt_token_ids": list(prompt_tokens)}, params)
+            pending[request_id] = (key, index, set(stop_ids))
+
+    def step_groups(self, budget_s: float) -> list[tuple[str, list[list[int]]]]:
+        """Step the engine for about ``budget_s`` seconds, or until a group completes; the completed groups as
+        ``(key, completions)`` (``generate``'s truncation)."""
+        pending, groups = self._pending, self._groups
+        engine, done = self._llm.llm_engine, []
+        deadline = time.monotonic() + float(budget_s)
+        while pending and engine.has_unfinished_requests():
+            for output in engine.step():
+                entry = pending.pop(output.request_id, None) if output.finished else None
+                if entry is None:
+                    continue
+                key, index, stops = entry
+                completion = list(output.outputs[0].token_ids)
+                end = first_eos_index(completion, stops)
+                groups[key][index] = completion if end is None else completion[: end + 1]
+                if all(c is not None for c in groups[key]):
+                    done.append((key, groups.pop(key)))
+            if done or time.monotonic() >= deadline:
+                break
+        return done
+
+    def abort_groups(self) -> None:
+        """Drop every running group (after a failed step)."""
+        if self._pending:
+            self._llm.llm_engine.abort_request(list(self._pending))
+        self._pending.clear()
+        self._groups.clear()

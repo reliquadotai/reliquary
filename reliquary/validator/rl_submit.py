@@ -14,7 +14,7 @@
      cannot grade it): ``rejected``, no observation (decision A), and the quota is halved as for an expiry
      (malformed or forged work is no delivery);
    * otherwise ``classify_group`` gives the verdict, ``LeaseBook.record_outcome`` records the scan and moves the
-     prompt, and the quota counts the delivery (in or out of zone);
+     prompt, and the quota frees the lease's slot (it credits the delivery only once the group is paid);
    * in zone: the group (tokens, lease nonce, k, arrival, hotkey) goes to the ``TrainingBuffer``. It is verified
      in the trainer's forward (§4.7), which reports back through ``report_training``;
    * out of zone: the audit draw, made after submission with the validator's own randomness (``SystemRandom``):
@@ -25,21 +25,18 @@
 
 Audit regime (decisions doc §C as amended 10-09, the design's §4.4): probation = fewer than
 ``probation_groups`` (100) passed out-of-zone audits, or fewer than ``SERVICE_REPROBATION_PASSES`` (20) passed
-audits since the hotkey's last failure of any class. A ``deterministic`` failure (forgery an honest miner cannot
-produce) bans for ``ban_s`` (24 h; ``LeaseBook.ban``: no lease, no submission); a ``statistical`` one re-opens
-probation and bans only when more than ``SERVICE_STATISTICAL_FAIL_MAX`` (3) of the hotkey's last
-``SERVICE_STATISTICAL_FAIL_WINDOW`` (20) non-forced verdicts failed statistically. A failed training verification
-reported with a class sanctions the same way (``source='training'``: training verdicts count in the
-recidivism window, never as probation passes; a rejection without a class, e.g. staleness, is no verdict). An
-inconclusive audit (``passed=None``) is unpaid and unsanctioned: when the validator could not run it (no model),
-or when the group was leased more than ``sanction_max_lag`` checkpoints before the latest and failed (honest drift
-against the latest checkpoint, the trainer's rule; the lag is kept in ``rl_audits``). A ``suspect`` inconclusive
-(the audit abstained on too few drawn positions, or its forward raised ``AUDIT_MAX_ATTEMPTS`` times, counted in
+audits since the hotkey's last failure of any class. A failure is never sanctioned (user, 2026-10-17): the group
+is unpaid and the hotkey back in probation, nothing more. Honest drift fails groups too, so a verdict cannot tell
+a forger from a lagging miner; a forger gains nothing but burned GPU time. The audit's lag is kept in
+``rl_audits``. An inconclusive audit (``passed=None``: no model, or queued past ``audit_max_lag`` checkpoints) is
+unpaid. A ``suspect`` inconclusive (the audit
+abstained on too few drawn positions, or its forward raised ``AUDIT_MAX_ATTEMPTS`` times, counted in
 ``rl_audits``) is logged as an ``inconclusive`` verdict: never a pass, and it re-opens probation like a failure.
+``blacklist`` is the operator's ban (no lease, no submission, unsettled pay forfeited).
 
 Interfaces left to later phases: the proof forward of an audit (``ProofForward``, implemented by
 ``rl_audit.audit_forward``: per-rollout match against the latest checkpoint with the training floor), the trainer's report
-(``report_training``, P4), the money (``rl_events``: pay eligibility and sanctions, read by the P5 ledger), and
+(``report_training``, P4), the money (``rl_events``: pay eligibility and the operator's bans, read by the P5 ledger), and
 publication (``rl_prompt_scans`` is the public observation log; TODO: the R2 segment writer of decision D reads
 it by ``seq``; ``rl_groups`` is the private store with hotkeys).
 """
@@ -57,17 +54,15 @@ from typing import Any
 
 from reliquary.constants import (
     MAX_NEW_TOKENS_PROTOCOL_CAP,
+    RL_AUDIT_MAX_LAG,
     RL_FIRST_SCAN_MIN_TOKENS,
-    RL_SANCTION_MAX_LAG,
     SERVICE_REPROBATION_PASSES,
-    SERVICE_STATISTICAL_FAIL_MAX,
-    SERVICE_STATISTICAL_FAIL_WINDOW,
     max_new_tokens_for_environment,
 )
 from reliquary.environment.grader_client import GraderInfrastructureError
 from reliquary.environment.registry import get_environment_spec
 from reliquary.protocol.rl_submit import GROUP_ROLLOUTS
-from reliquary.services.exploration import AUDIT_FAILURE_CLASSES, AUDIT_FAILURE_DETERMINISTIC, AUDIT_FAILURE_STATISTICAL
+from reliquary.services.exploration import AUDIT_FAILURE_CLASSES
 from reliquary.validator.rl_buffer import SubmittedGroup, TrainingBuffer
 from reliquary.validator.rl_leases import IN_ZONE, LeaseBook, classify_group
 
@@ -76,7 +71,7 @@ logger = logging.getLogger(__name__)
 REJECTED = "rejected"
 AUDIT_MAX_ATTEMPTS = 3        # raising audit forwards of one group before it is concluded inconclusive
 NOT_DRAWN, PENDING, PASSED, FAILED, INCONCLUSIVE = "not_drawn", "pending", "passed", "failed", "inconclusive"
-# rl_events kinds: pay eligibility (read by the P5 ledger) and sanctions
+# rl_events kinds: pay eligibility (read by the P5 ledger) and the operator's bans
 FIRST_SCAN, FIRST_SCAN_FORFEITED, TRAINED, UNTRAINED, BAN = (
     "first_scan", "first_scan_forfeited", "trained", "untrained", "ban")
 
@@ -142,22 +137,18 @@ class SubmitConfig:
     audit_rate: float = 0.15
     probation_groups: int = 100
     reprobation_passes: int = SERVICE_REPROBATION_PASSES
-    statistical_window: int = SERVICE_STATISTICAL_FAIL_WINDOW
-    statistical_max: int = SERVICE_STATISTICAL_FAIL_MAX
-    ban_s: float = 86400.0
     first_scan_fraction: float = 0.25
     first_scan_min_tokens: int = RL_FIRST_SCAN_MIN_TOKENS
-    sanction_max_lag: int = RL_SANCTION_MAX_LAG
     rollouts: int = GROUP_ROLLOUTS
+    audit_max_lag: int = RL_AUDIT_MAX_LAG
 
     def __post_init__(self) -> None:
         if not (0.0 <= self.audit_rate <= 1.0 and 0.0 <= self.first_scan_fraction <= 1.0):
             raise ValueError("audit rate and first-scan fraction are fractions")
-        if min(self.probation_groups, self.reprobation_passes, self.statistical_window, self.statistical_max,
-               self.first_scan_min_tokens, self.sanction_max_lag) < 0:
+        if min(self.probation_groups, self.reprobation_passes, self.first_scan_min_tokens, self.audit_max_lag) < 0:
             raise ValueError("audit counts must be non-negative")
-        if self.rollouts < 2 or not self.ban_s >= 0:
-            raise ValueError("a group has at least 2 rollouts; ban_s >= 0")
+        if self.rollouts < 2:
+            raise ValueError("a group has at least 2 rollouts")
 
 
 class GroupGrader:
@@ -385,6 +376,7 @@ class RlSubmissions:
         if audit in (NOT_DRAWN, PASSED) and tokens >= self.config.first_scan_min_tokens:
             self._event(lease_id, hotkey, FIRST_SCAN, at,
                         {"fraction": self.config.first_scan_fraction, "audited": audit == PASSED})
+            self.book.credit(lease_id, now=at)
         else:
             self._event(lease_id, hotkey, FIRST_SCAN_FORFEITED, at, {"audit": audit, "tokens": tokens})
 
@@ -411,40 +403,35 @@ class RlSubmissions:
 
     def _verdict(self, lease_id: str, hotkey: str, source: str, passed: bool, failure_class: str | None,
                  forced: bool, now: float) -> None:
-        """Log one verdict; a failure sanctions (the class of the strongest failure, decided by the caller)."""
+        """Log one verdict (a failure with the class of the strongest failure, decided by the caller)."""
         if not passed and failure_class not in AUDIT_FAILURE_CLASSES:
             raise ValueError(f"a failure needs its class, one of {AUDIT_FAILURE_CLASSES}")
         db = self.book.db
         db.execute("INSERT INTO rl_verdicts(lease_id, hotkey, source, verdict, failure_class, forced, at) "
                    "VALUES(?,?,?,?,?,?,?)", (lease_id, hotkey, source, PASSED if passed else FAILED,
                                              None if passed else failure_class, int(forced), now))
-        if passed:
-            return
-        ban = failure_class == AUDIT_FAILURE_DETERMINISTIC
-        if not ban:
-            recent = db.execute("SELECT COUNT(*) FROM (SELECT verdict, failure_class FROM rl_verdicts WHERE "
-                                "hotkey=? AND forced=0 AND verdict<>? ORDER BY seq DESC LIMIT ?) WHERE verdict=? "
-                                "AND failure_class=?", (hotkey, INCONCLUSIVE, self.config.statistical_window,
-                                                        FAILED, AUDIT_FAILURE_STATISTICAL)).fetchone()[0]
-            ban = recent > self.config.statistical_max
-        if ban:
-            self.book.ban(hotkey, now + self.config.ban_s)
-            self._event(lease_id, hotkey, BAN, now, {"failure_class": failure_class, "source": source,
-                                                     "until": now + self.config.ban_s})
+
+    def blacklist(self, hotkey: str, until: float, reason: str, now: float | None = None) -> None:
+        """The operator's ban: no lease and no submission until ``until``; the ledger forfeits the hotkey's
+        unsettled pay and what accrues during the ban. Never decided by a verdict."""
+        now = float(self.clock()) if now is None else now
+        with self.book.transaction():
+            self.book.ban(hotkey, float(until))
+            self._event("", hotkey, BAN, now, {"reason": str(reason), "until": float(until)})
 
     def audit_jobs(self, limit: int) -> list[SubmittedGroup]:
-        """Queued audits, oldest first, hotkeys past probation before those in probation (decisions doc §C).
-        Audit promptly: the forward runs against the latest checkpoint (§4.4), so a late audit costs match."""
+        """Queued audits, newest first, hotkeys past probation before those in probation (decisions doc §C).
+        The forward runs against the latest checkpoint (§4.4): under a backlog the freshest groups are judged and the
+        stale ones dropped (``drop_stale_audits``)."""
         with self.book.lock:
             rows = self.book.db.execute("SELECT body FROM rl_audits WHERE body IS NOT NULL ORDER BY forced, "
-                                        "queued_at LIMIT ?", (int(limit),)).fetchall()
+                                        "queued_at DESC LIMIT ?", (int(limit),)).fetchall()
         return [SubmittedGroup.unpack(body) for body, in rows]
 
     def report_audit(self, lease_id: str, result: AuditResult, now: float | None = None) -> None:
-        """Conclude a drawn out-of-zone group (once). Passed: its first scan becomes payable. Failed: forfeited
-        and sanctioned by class, unless the group was leased more than ``sanction_max_lag`` checkpoints before the
-        latest (then inconclusive, the lag recorded). Inconclusive: forfeited, no sanction (a ``suspect`` one is
-        logged and keeps the hotkey in probation). LookupError: not a pending audit."""
+        """Conclude a drawn out-of-zone group (once). Passed: its first scan becomes payable. Failed: forfeited,
+        the hotkey back in probation. Inconclusive: forfeited (a ``suspect`` one is logged and keeps the hotkey in
+        probation). The lag is recorded. LookupError: not a pending audit."""
         now = float(self.clock()) if now is None else now
         with self.book.transaction():
             db = self.book.db
@@ -456,8 +443,6 @@ class RlSubmissions:
             hotkey, forced, first_scan, k, tokens = row[0], bool(row[1]), bool(row[2]), int(row[3]), int(row[4])
             lag = (self.book.latest_checkpoint or 0) - k
             passed = result.passed
-            if passed is False and lag > self.config.sanction_max_lag:
-                passed = None                             # judged against a checkpoint too far ahead: no evidence
             state = INCONCLUSIVE if passed is None else PASSED if passed else FAILED
             if passed is not None:
                 self._verdict(lease_id, hotkey, "audit", passed, result.failure_class, forced, now)
@@ -469,11 +454,29 @@ class RlSubmissions:
             if first_scan:
                 self._first_scan(lease_id, hotkey, now, state, tokens)
 
+    def drop_stale_audits(self, now: float | None = None) -> int:
+        """Conclude inconclusive (unpaid, no probation effect) every queued audit whose lease is more than
+        ``audit_max_lag`` checkpoints behind the latest: judged on drifted weights, an honest group would fail."""
+        latest = self.book.latest_checkpoint
+        if latest is None:
+            return 0
+        with self.book.lock:
+            stale = [lease for lease, in self.book.db.execute(
+                "SELECT a.lease_id FROM rl_audits a JOIN rl_groups g ON g.lease_id=a.lease_id "
+                "WHERE a.body IS NOT NULL AND g.k < ?", (latest - self.config.audit_max_lag,))]
+        for lease in stale:
+            self.report_audit(lease, AuditResult(None), now)
+        if stale:
+            logger.info("dropped %d audits queued past %d checkpoints", len(stale), self.config.audit_max_lag)
+        return len(stale)
+
     def run_audits(self, forward: ProofForward, limit: int, *, max_attempts: int = AUDIT_MAX_ATTEMPTS) -> int:
         """Drain up to ``limit`` queued audits through ``forward`` (the proof forward, the Gumbel verifier).
         A forward that raises leaves its audit queued and the others still run; after ``max_attempts`` raising
         forwards (counted in ``rl_audits``, across restarts) the audit is concluded a suspect inconclusive
-        (unpaid, unsanctioned, no probation pass), so one poison group (e.g. an OOM) cannot stall the queue."""
+        (unpaid, unsanctioned, no probation pass), so one poison group (e.g. an OOM) cannot stall the queue. Stale
+        audits are dropped first (``drop_stale_audits``, not counted)."""
+        self.drop_stale_audits()
         done = 0
         for group in self.audit_jobs(limit):
             try:
@@ -493,16 +496,48 @@ class RlSubmissions:
         return done
 
     # --- the trainer's report (P4) ------------------------------------------------------------------------
+    def _rewards_hold(self, group, substitutions) -> bool:
+        """The reward re-check: every rollout with suspect mismatches (``substitutions[i]``: (completion position,
+        the trainer's pick), gap over ``RL_SUBSTITUTE_GAP``) is graded again with the picks there; any reward that
+        moves means the tokens were chosen for the reward. Only the first position of a run of consecutive suspects
+        is substituted: the picks after it were drawn under the miner's prefix. Episodes are not re-graded (their
+        reward is the environment's record; the gap test covers them)."""
+        changed = []
+        for i, pairs in enumerate(substitutions or ()):
+            if not pairs or group.spans is not None:
+                continue
+            tokens, previous = list(group.completions[i]), None
+            for position, pick in sorted((int(p), int(t)) for p, t in pairs):
+                if previous != position - 1 and 0 <= position < len(tokens):
+                    tokens[position] = pick
+                previous = position
+            changed.append((i, Rollout(tuple(tokens), group.force_spans[i])))
+        if not changed:
+            return True
+        graded = self.grader.grade(group.environment, group.prompt_idx, [r for _, r in changed])
+        return not graded.reject and all(abs(float(graded.rewards[k]) - float(group.rewards[i])) < 1e-9
+                                         for k, (i, _) in enumerate(changed))
+
     def report_training(self, lease_id: str, *, rollout_match: Sequence[float], accepted: bool,
                         failure_class: str | None = None, matched_tokens: Sequence[int] | None = None,
+                        substitutions: Sequence[Sequence[tuple[int, int]]] | None = None,
                         now: float | None = None) -> None:
         """The trainer's forward judged a buffered group: ``rollout_match`` per rollout (match rate against the
         published checkpoint, §4.6), ``accepted`` the group verdict. An accepted group is payable (P5 pays the
-        matched tokens of rollouts above the floor); a rejected one is unpaid and, when ``failure_class`` says the
-        rejection is evidence (not staleness from waiting in the buffer), sanctioned like a failed audit.
+        matched tokens of rollouts above the floor); a rejected one is unpaid, and a ``failure_class`` logs it as a
+        failed verdict (the hotkey back in probation).
         ``matched_tokens``: per rollout, the positions equal to the validator's pick (what P5 pays); without it the
-        ledger uses ``floor(match x completion tokens)``. LookupError: not a buffered group."""
+        ledger uses ``floor(match x completion tokens)``. ``substitutions``: per rollout, the suspect mismatches
+        (``_rewards_hold``); an accepted group whose rewards move is reported untrained, unsanctioned
+        (``reward_moved``), so it is not paid. LookupError: not a buffered group."""
         now = float(self.clock()) if now is None else now
+        moved = False
+        if accepted and substitutions:
+            pending = self.buffer.get(lease_id)
+            if pending is not None and len(substitutions) != len(pending.completions):
+                raise ValueError("one substitution list per rollout")
+            moved = pending is not None and not self._rewards_hold(pending, substitutions)
+            accepted = accepted and not moved
         with self.book.transaction():
             group = self.buffer.get(lease_id)
             if group is None or not self.buffer._remove(lease_id):
@@ -521,8 +556,11 @@ class RlSubmissions:
                       "checkpoint": group.checkpoint, "environment": group.environment}
             if matched_tokens is not None:
                 detail["matched_tokens"] = [int(n) for n in matched_tokens]
+            if moved:
+                detail["reward_moved"] = True
             if accepted:
                 self._event(lease_id, group.hotkey, TRAINED, now, detail)
+                self.book.credit(lease_id, now=now)
                 self._verdict(lease_id, group.hotkey, "training", True, None, False, now)
             else:
                 self._event(lease_id, group.hotkey, UNTRAINED, now, {**detail, "failure_class": failure_class})

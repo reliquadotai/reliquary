@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import threading
+import zlib
 from types import SimpleNamespace
 
 import pytest
@@ -62,14 +63,6 @@ class Subs:
         self.reports[lease_id] = kw
 
 
-class Prices:
-    def __init__(self):
-        self.speeds = []
-
-    def note_speed(self, tokens, seconds):
-        self.speeds.append((tokens, seconds))
-
-
 class Publisher:
     def __init__(self):
         self.versions = []
@@ -98,7 +91,7 @@ def submitted(model, lease, env="math", k=3, arrived=0.0, forged=(), rewards=Non
                           nonce="cd" * 32, arrived_at=arrived, rewards=tuple(rewards or [1.0, 0.0] * (ROLLOUTS // 2)),
                           truncated=(False,) * ROLLOUTS, prompt_tokens=(1, 2, 3),
                           completions=tuple((0,) * n for _ in range(ROLLOUTS)), force_spans=(None,) * ROLLOUTS)
-    gen = torch.Generator().manual_seed(hash(lease) % 1000)
+    gen = torch.Generator().manual_seed(zlib.crc32(lease.encode()) % 1000)
     completions = []
     for i in range(ROLLOUTS):
         us, tokens = base.draw_uniforms(i), [3]
@@ -169,11 +162,11 @@ def test_a_rollout_under_the_floor_leaves_the_loss_and_the_pay():
     honest = SimpleNamespace(rollouts=group.rollouts[:3], prompt_idx=7)
     want = grads_of(model, [(honest, advantages[:3], 1.0 / (ROLLOUTS * N_TOK))], DrawGate([[0, 1, 2]]))
     assert all(torch.allclose(a, b, atol=1e-7) for a, b in zip(got, want))
-    assert gate.forgery_floor <= gate.rate(3) < 0.95 and gate.rate(0) == 1.0
+    assert gate.forgery_floor <= gate.rate(3) < gate.rollout_floor and gate.rate(0) == 1.0
     detail = {"rollout_match": [gate.rate(s) for s in range(4)],
               "completion_tokens": [N_TOK] * 4,
               "matched_tokens": [gate.tallies[s][3] if gate.admitted[s] else 0 for s in range(4)]}
-    assert paid_tokens(detail, 0.95) == 3 * N_TOK
+    assert paid_tokens(detail, gate.rollout_floor) == 3 * N_TOK
 
 
 def test_one_rollout_under_the_forgery_floor_rejects_its_group_whatever_the_pool():
@@ -219,11 +212,11 @@ def test_window_mode_is_unchanged_without_a_gate():
 # --- the loop ----------------------------------------------------------------------------------------------------
 def loop(model, book, buffer, batch=2, **config):
     clock = Clock()
-    publisher, prices, subs = Publisher(), Prices(), Subs(buffer)
+    publisher, subs = Publisher(), Subs(buffer)
     trainer = AsyncTrainer(model, config=AsyncTrainerConfig(batch, group_floor=0.7, **config),
-                           buffer=buffer, submissions=subs, book=book, prices=prices, publisher=publisher,
+                           buffer=buffer, submissions=subs, book=book, publisher=publisher,
                            clock=clock, sleep=clock.sleep)
-    return trainer, subs, publisher, prices
+    return trainer, subs, publisher
 
 
 def test_one_step_reports_every_group_and_publishes_the_next_checkpoint():
@@ -231,7 +224,7 @@ def test_one_step_reports_every_group_and_publishes_the_next_checkpoint():
     buffer = TrainingBuffer(book)
     buffer.push(submitted(model, "good", noisy={2}, arrived=1.0))
     buffer.push(submitted(model, "bad", forged={0, 1, 2}, arrived=0.0))
-    trainer, subs, publisher, prices = loop(model, book, buffer)
+    trainer, subs, publisher = loop(model, book, buffer)
     before = [p.detach().clone() for p in model.parameters()]
     assert trainer.run_once() == "trained"
     trainer.close()
@@ -239,9 +232,9 @@ def test_one_step_reports_every_group_and_publishes_the_next_checkpoint():
     good, bad = subs.reports["good"], subs.reports["bad"]
     assert good["accepted"] and good["matched_tokens"] == [N_TOK, N_TOK, 0, N_TOK]
     assert good["rollout_match"][2] < 0.95 <= min(good["rollout_match"][:2])
-    assert not bad["accepted"] and bad["failure_class"] == "statistical"          # lag 0: evidence
+    assert not bad["accepted"] and bad.get("failure_class") is None              # unpaid, never sanctioned
     assert publisher.versions == [4] and book.adopted == [4] and trainer.version == 4
-    assert [tokens for tokens, _ in prices.speeds] == [2 * ROLLOUTS * N_TOK]   # every forwarded token, not paid ones
+    assert buffer.drain_tick().taken == 2 * ROLLOUTS * N_TOK              # the prices read the trainer's speed here
     assert trainer.last_step["async/groups_accepted"] == 1 and trainer.last_step["async/groups_undone"] == 1
     assert buffer.depth() == {}
 
@@ -259,7 +252,7 @@ def test_publication_every_n_steps_and_hf_backup_every_m(monkeypatch):
         gate.judge([])
         return model
 
-    trainer, subs, publisher, prices = loop(model, book, buffer, batch=1, steps_per_checkpoint=2, hf_backup_every=3)
+    trainer, subs, publisher = loop(model, book, buffer, batch=1, steps_per_checkpoint=2, hf_backup_every=3)
     trainer._train_step, trainer.backup = fake_step, backup
     assert publisher.versions == [0] and book.adopted == [0]                       # fresh book: initial weights
     for step in range(6):
@@ -275,7 +268,7 @@ def test_a_skipped_step_pays_nothing_and_a_crash_requeues():
     model, book = _Model(), Book()
     buffer = TrainingBuffer(book)
     buffer.push(submitted(model, "g", n=2))
-    trainer, subs, publisher, _ = loop(model, book, buffer, batch=1)
+    trainer, subs, publisher = loop(model, book, buffer, batch=1)
 
     def skipped(*_, **__):
         raise training.TrainingStepSkipped("gradient_spike", 1e9)
@@ -301,7 +294,7 @@ def test_a_take_whose_answer_was_lost_is_requeued_before_the_next_step():
     buffer = TrainingBuffer(book)
     buffer.push(submitted(model, "g", n=2))
     assert [g.lease_id for g in buffer.take(1)] == ["g"]          # taken, answer lost: the trainer never saw it
-    trainer, subs, _, _ = loop(model, book, buffer, batch=1)
+    trainer, subs, _ = loop(model, book, buffer, batch=1)
     assert trainer.run_once() == "trained" and "g" in subs.reports
     trainer.close()
 
@@ -329,3 +322,43 @@ def test_one_wandb_row_per_step_with_the_step_timings(monkeypatch):
     assert "train/lr" in row and row["async/groups_accepted"] == 2
     assert {"async/wait_s", "async/train_s", "async/step_s", "async/snapshot_s", "async/publish_wait_s"} <= set(row)
     assert row["async/completion_tokens"] == 2 * ROLLOUTS * N_TOK
+
+
+def test_the_gate_refuses_a_token_far_from_the_pick_and_keeps_the_suspects_for_the_regrade():
+    """Every mismatch carries its Gumbel gap: over ``gap_tolerance`` the rollout leaves the loss and the pay; over
+    ``substitute_gap`` the (position, pick) goes to the validator, which grades the rollout again with it."""
+    model = _Model()
+    group = training_group(submitted(model, "g", noisy={3}), slot0=0, index=0)
+    plan = [(group, [1.0, -1.0, 1.0, -1.0], 1.0 / (ROLLOUTS * N_TOK))]
+    lenient = DrawGate([[0, 1, 2, 3]], rollout_floor=0.0, group_floor=0.0, forgery_floor=0.0,
+                       gap_tolerance=float("inf"), substitute_gap=0.0)
+    grads_of(model, plan, lenient)
+    assert lenient.admitted == [1, 1, 1, 1] and lenient.max_gap[:3] == [0.0] * 3 and lenient.max_gap[3] > 0
+    assert lenient.substitutions[:3] == [[], [], []] and lenient.substitutions[3]
+    tokens = group.rollouts[3].commit["tokens"][3:]                          # the completion after the 3 prompt tokens
+    assert all(p % 4 == 3 and pick != tokens[p] for p, pick in lenient.substitutions[3])   # the random tokens only
+    metrics = lenient.metrics()
+    assert metrics["async/rollouts_regraded"] == 1 and metrics["async/gap_max"] == lenient.max_gap[3]
+    strict = DrawGate([[0, 1, 2, 3]], rollout_floor=0.0, group_floor=0.0, forgery_floor=0.0,
+                      gap_tolerance=lenient.max_gap[3] / 2)
+    grads_of(model, plan, strict)
+    assert strict.admitted == [1, 1, 1, 0] and strict.metrics()["async/rollouts_over_gap_tolerance"] == 1
+
+
+
+def test_a_rollout_cut_short_by_an_eos_far_from_the_pick_is_refused():
+    """A final EOS is checked on its own (the re-grade cannot see a cut continuation): its gap must be at most
+    ``terminal_gap``. Here every rollout's last token stands for the EOS; the noisy rollout's last token is a random
+    one."""
+    model = _Model()
+    group = training_group(submitted(model, "g", noisy={3}), slot0=0, index=0)
+    plan = [(group, [1.0, -1.0, 1.0, -1.0], 1.0 / (ROLLOUTS * N_TOK))]
+    eos = {r.commit["tokens"][-1] for r in group.rollouts}
+    loose = dict(rollout_floor=0.0, group_floor=0.0, forgery_floor=0.0, gap_tolerance=float("inf"))
+    gate = DrawGate([[0, 1, 2, 3]], **loose, terminal_gap=0.5, eos_ids=eos)
+    grads_of(model, plan, gate)
+    assert gate.bad_terminal == [0, 0, 0, 1] and gate.admitted == [1, 1, 1, 0]
+    assert gate.metrics()["async/rollouts_bad_termination"] == 1
+    off = DrawGate([[0, 1, 2, 3]], **loose, terminal_gap=0.0)                     # no EOS ids: no rule
+    grads_of(model, plan, off)
+    assert off.bad_terminal == [0, 0, 0, 0]

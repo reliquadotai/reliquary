@@ -29,6 +29,22 @@ logger = logging.getLogger(__name__)
 HF_BACKUP_NAMESPACE = "ReliquaryForge"
 
 
+def _eos_ids(model_path, load_kwargs) -> tuple[int, ...]:
+    """The model's stop tokens, as the validator's grader resolves them (``rl_async_service._grader_for``)."""
+    from types import SimpleNamespace
+
+    from transformers import AutoConfig, GenerationConfig
+
+    from reliquary.shared.modeling import load_tokenizer, resolve_eos_token_ids
+
+    try:
+        generation = GenerationConfig.from_pretrained(model_path, **load_kwargs)
+    except OSError:
+        generation = None
+    model = SimpleNamespace(config=AutoConfig.from_pretrained(model_path, **load_kwargs), generation_config=generation)
+    return tuple(sorted(resolve_eos_token_ids(model, load_tokenizer(model_path, **load_kwargs))))
+
+
 def _int(env: Mapping[str, str], name: str, default: int | None, *, minimum: int = 1) -> int | None:
     raw = str(env.get(name, "")).strip()
     if not raw:
@@ -187,10 +203,11 @@ def run_async_train_worker() -> None:
                                         staging_dir=state_dir / "hf-staging")
         config = AsyncTrainerConfig(batch_groups=settings["batch_groups"],
                                     steps_per_checkpoint=settings["steps_per_checkpoint"],
-                                    hf_backup_every=settings["hf_every"])
+                                    hf_backup_every=settings["hf_every"],
+                                    eos_ids=_eos_ids(model_path, load_kwargs))
         link.requeue()                          # this trainer holds nothing yet
         trainer = AsyncTrainer(
-            model, config=config, buffer=link, submissions=link, book=link, prices=link, publisher=publisher,
+            model, config=config, buffer=link, submissions=link, book=link, publisher=publisher,
             state_fn=state_fn, backup=backup, backup_save=lambda s, folder: write_hf_dir(s, model_dir, folder),
             train_step_fn=step_fn,
             global_step_hint=None if version is None else version * settings["steps_per_checkpoint"])

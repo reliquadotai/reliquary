@@ -458,6 +458,17 @@ class QwenTurnRenderer:
                 return list(ids[k + 1:])
         return list(ids)
 
+    def _opened(self, prompt_ids, completion_ids) -> list[int]:
+        """The turn as the parser must read it: when the generation prompt already opened ``<think>`` (a
+        thinking template), the span starts inside the reasoning, so the opener is put back in front of it;
+        otherwise the parser would take the reasoning and its ``</think>`` for content."""
+        ids = [int(t) for t in completion_ids]
+        tail = self._tail(prompt_ids)
+        if tail and tail[-1] == self._think or (self._think in tail and self._think_end not in tail):
+            if self._think not in ids:
+                return [self._think, *ids]
+        return ids
+
     @_locked
     def reasoning_unclosed(self, prompt_ids, completion_ids) -> bool:
         ids = list(completion_ids)
@@ -471,7 +482,7 @@ class QwenTurnRenderer:
         assistant turn, and require the span's own tokens, so no text can pose
         as turn structure once the message is re-encoded for export."""
         completion = [int(t) for t in completion_ids]
-        message = self.assistant_message(completion)
+        message = self.assistant_message(self._opened(prompt_ids, completion))
         texts = [message.get("content") or "", message.get("reasoning_content") or ""]
         for call in message.get("tool_calls") or []:
             texts += [call["function"]["name"], call["function"]["arguments"]]

@@ -13,6 +13,7 @@ import pytest
 
 from reliquary.constants import prompt_cooldown_windows_for_environment
 from reliquary.validator.rl_lease_quota import QuotaConfig, QuotaController
+from reliquary.validator import rl_leases
 from reliquary.validator.rl_leases import (
     BLACKLISTED, COOLING, FULL, IN_ZONE, QUOTA, RESTART_GRACE_S, SECRET_REVEAL_LAG, STALE, TAKEN, TOO_EASY, TOO_HARD,
     TRUNCATED, LeaseBook, LeaseBookConfig, LeaseCollector, LeaseRequest, classify_group, lease_expiry_s, lease_nonce,
@@ -257,8 +258,9 @@ def test_the_global_cap_counts_buffered_groups_only_and_names_the_full_envs(tmp_
         LeaseBookConfig(expiry_s={ENV: 1.0}, max_pending_groups=0)
 
 
-def test_one_hotkey_holds_at_most_its_share_of_the_global_cap(tmp_path):
-    book = book_at(tmp_path, max_pending_groups=8)                      # share 1/4: 2 open leases
+def test_one_hotkey_holds_at_most_hotkey_max_open_leases_under_a_global_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(rl_leases, "HOTKEY_MAX_OPEN", 2)
+    book = book_at(tmp_path, max_pending_groups=8)
     book.adopt_checkpoint(0)
     answer = book.grant([ask("A", [1, 2, 3])])[0]
     assert len(answer.leases) == 2 and answer.refused == {3: QUOTA}
@@ -332,7 +334,7 @@ def test_the_expiry_is_fixed_per_env_from_its_max_length_at_a_reference_speed():
         lease_expiry_s(max_tokens=0, reference_tokens_per_s=20.0, margin=1.5)
 
 
-def test_an_expired_lease_frees_its_prompt_and_halves_the_quota(tmp_path):
+def test_an_expired_lease_frees_its_prompt_and_cuts_the_quota(tmp_path):
     clock = Clock()
     quota = QuotaController(QuotaConfig(initial=8, floor=1))
     book = book_at(tmp_path, clock=clock, quota=quota)
@@ -343,7 +345,7 @@ def test_an_expired_lease_frees_its_prompt_and_halves_the_quota(tmp_path):
     clock.t = NOW + 601
     assert book.expire_due() == 1
     assert book.lease(lease.lease_id).state == "expired" and book.lease(slow.lease_id).state == "open"
-    assert quota.state("A")["quota"] == 4 and quota.state("A")["counters"]["expired"] == 1
+    assert quota.state("A")["quota"] == 7 and quota.state("A")["counters"]["expired"] == 1
     assert book.grant([ask("B", [1])])[0].leases                         # C12: the next lessee gets it
 
 

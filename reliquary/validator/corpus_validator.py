@@ -934,6 +934,19 @@ async def _run_corpus_services(server, services, *, cleanup=None) -> None:
                 await cleanup()
 
 
+def sandbox_validator_hotkey(config, wallet) -> str:
+    """The ss58 address miners sign session requests to: the configured one
+    (``RELIQUARY_SANDBOX_VALIDATOR_HOTKEY``), else the wallet's. The split front
+    runs with no wallet, so there it must be configured."""
+    if config.validator_hotkey:
+        return config.validator_hotkey
+    if wallet is None:
+        raise ValueError("this process has no wallet (the split front): set "
+                         "RELIQUARY_SANDBOX_VALIDATOR_HOTKEY to the ss58 address miners "
+                         "sign session requests to")
+    return wallet.hotkey.ss58_address
+
+
 async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http_port,
                                set_weights: bool, entry=None, cap: float | None = None,
                                jobs=None, settle_every_seconds: float = 60.0,
@@ -1295,7 +1308,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                 raise ValueError("set RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE and "
                                  "RELIQUARY_SANDBOX_VALIDATOR_KEY_ID to serve signed-sandbox jobs")
             sandbox_services = build_sandbox_services(
-                sandbox_config, validator_hotkey=wallet.hotkey.ss58_address,
+                sandbox_config, validator_hotkey=sandbox_validator_hotkey(sandbox_config, wallet),
                 registration=registered.reason if registered is not None else None)
         except Exception as exc:  # noqa: BLE001 - isolated: replay jobs still start
             # The key loader's errors name the path and its mode, never the key.

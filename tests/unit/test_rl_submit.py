@@ -218,17 +218,15 @@ def test_a_rescan_out_of_zone_is_never_payable(book):
     assert kinds(subs) == [(first.lease_id, FIRST_SCAN)]
 
 
-def test_a_deterministic_failure_bans_and_forfeits(book):
+def test_a_failed_audit_forfeits_and_never_bans(book):
     subs = service(book)
     held = lease(book, 30)
     subs.submit(held.lease_id, "A", group(16))
     other = lease(book, 31)
     subs.report_audit(held.lease_id, AuditResult(passed=False, failure_class=AUDIT_FAILURE_DETERMINISTIC))
-    assert kinds(subs) == [(held.lease_id, BAN), (held.lease_id, FIRST_SCAN_FORFEITED)]
-    assert book.banned_until("A") == NOW + 86400
-    assert book.grant([LeaseRequest("A", ENV, (32,), 0)])[0].refused == {32: BANNED}
-    with pytest.raises(PermissionError, match="banned"):
-        subs.submit(other.lease_id, "A", group(8))
+    assert kinds(subs) == [(held.lease_id, FIRST_SCAN_FORFEITED)]
+    assert book.banned_until("A") is None and subs.in_probation("A")
+    subs.submit(other.lease_id, "A", group(8))                                     # still leases and submits
     with pytest.raises(LookupError):
         subs.report_audit(held.lease_id, AuditResult(passed=True))     # concluded once
     classless = lease(book, 33, "B")
@@ -237,8 +235,18 @@ def test_a_deterministic_failure_bans_and_forfeits(book):
         subs.report_audit(classless.lease_id, AuditResult(passed=False))   # a failure needs its class
 
 
-def test_a_statistical_failure_reopens_probation_and_recidivism_bans(book):
-    subs = service(book, probation_groups=1, reprobation_passes=2, audit_rate=1.0, statistical_max=1)
+def test_the_operators_blacklist_bans(book):
+    subs = service(book)
+    held = lease(book, 34)
+    subs.blacklist("A", NOW + 3600, "manual")
+    assert kinds(subs) == [("", BAN)] and book.banned_until("A") == NOW + 3600
+    assert book.grant([LeaseRequest("A", ENV, (35,), 0)])[0].refused == {35: BANNED}
+    with pytest.raises(PermissionError, match="banned"):
+        subs.submit(held.lease_id, "A", group(8))
+
+
+def test_a_statistical_failure_reopens_probation_without_a_ban(book):
+    subs = service(book, probation_groups=1, reprobation_passes=2, audit_rate=1.0)
     leases = [lease(book, p) for p in range(40, 45)]
     subs.submit(leases[0].lease_id, "A", group(0))
     subs.report_audit(leases[0].lease_id, AuditResult(passed=True))                 # probation done
@@ -253,8 +261,8 @@ def test_a_statistical_failure_reopens_probation_and_recidivism_bans(book):
     assert not subs.in_probation("A")
     subs.submit(leases[4].lease_id, "A", group(0))
     subs.report_audit(leases[4].lease_id, AuditResult(passed=False, failure_class=AUDIT_FAILURE_STATISTICAL))
-    assert book.banned_until("A") == NOW + 86400                                     # 2 > 1 in the window
-    assert kinds(subs)[-2][1] == BAN
+    assert subs.in_probation("A") and book.banned_until("A") is None
+    assert BAN not in {kind for _, kind in kinds(subs)}
 
 
 def test_an_inconclusive_audit_is_unpaid_and_unsanctioned(book):
@@ -303,6 +311,25 @@ def test_a_raising_audit_forward_neither_stalls_the_queue_nor_runs_forever(book)
     assert book.banned_until("A") is None
 
 
+def test_only_paid_groups_credit_the_quota(book):
+    subs = service(book, probation_groups=0, audit_rate=0.0)
+    trained, untrained, scan = (lease(book, p) for p in (73, 74, 75))
+    for held in (trained, untrained):
+        subs.submit(held.lease_id, "A", group(8))
+    subs.submit(scan.lease_id, "A", group(0))                                   # first scan, not drawn: paid
+    paid = lambda: book.quota.state("A")["counters"]["paid"]
+    assert paid() == 1 and book.in_use("A") == 0
+    subs.report_training(untrained.lease_id, rollout_match=[0.5] * 16, accepted=False)
+    assert paid() == 1
+    subs.report_training(trained.lease_id, rollout_match=[0.99] * 16, accepted=True)
+    assert paid() == 2
+    for k in (1, 2):
+        book.adopt_checkpoint(k)                                                # the 0/16 cooldown is over
+    repeat = book.grant([LeaseRequest("A", ENV, (75,), 2)])[0].leases[0]
+    subs.submit(repeat.lease_id, "A", group(0))                                 # a repeat scan: no pay, no credit
+    assert paid() == 2 and book.quota.state("A")["counters"]["submitted"] == 4
+
+
 def test_the_trainer_reports_match_and_verdict_back_for_pay_and_sanctions(book):
     subs = service(book, probation_groups=0)
     good, stale, forged = (lease(book, p) for p in (70, 71, 72))
@@ -329,7 +356,35 @@ def test_the_trainer_reports_match_and_verdict_back_for_pay_and_sanctions(book):
         subs.report_training(good.lease_id, rollout_match=[0.99] * 16, accepted=True)
 
 
-def test_the_buffer_hands_out_oldest_first_counts_arrivals_and_survives_a_restart(book, tmp_path):
+
+def test_a_reward_that_moves_under_the_trainers_picks_is_not_paid(book):
+    """The trainer sends, per rollout, its pick at each mismatch over the substitute gap. A rollout whose reward moves
+    once those picks replace the miner's tokens had its tokens chosen for the reward: the group is unpaid, with no
+    sanction. A run of consecutive suspects is replaced at its first position only (the picks after it were drawn
+    under the miner's prefix)."""
+    subs = service(book, probation_groups=0)
+    forged, honest = lease(book, 80), lease(book, 81)
+    for held in (forged, honest):
+        subs.submit(held.lease_id, "A", group(8))
+    four, five = text("4")[0], text("5")[0]
+    none = [[] for _ in range(16)]
+    # rollout 8 answered 5 (reward 0); the trainer picks 4 at the answer, and garbage right after it
+    moved = none[:8] + [[(7, four), (8, five)]] + none[9:]
+    subs.report_training(forged.lease_id, rollout_match=[0.99] * 16, accepted=True, substitutions=moved)
+    # rollout 0 answered 4; the trainer's pick is the same digit: the reward holds
+    held = [[(7, four)]] + none[1:]
+    subs.report_training(honest.lease_id, rollout_match=[0.99] * 16, accepted=True, substitutions=held)
+    events = {e["lease_id"]: e for e in subs.events()}
+    assert events[forged.lease_id]["kind"] == UNTRAINED and events[forged.lease_id]["detail"]["reward_moved"]
+    assert events[forged.lease_id]["detail"].get("failure_class") is None          # unpaid, not sanctioned
+    assert subs.group(forged.lease_id)["training"] == "rejected"
+    assert events[honest.lease_id]["kind"] == TRAINED and subs.group(honest.lease_id)["training"] == "accepted"
+    with pytest.raises(ValueError):
+        again = lease(book, 82)
+        subs.submit(again.lease_id, "A", group(8))
+        subs.report_training(again.lease_id, rollout_match=[0.99] * 16, accepted=True, substitutions=none[:3])
+
+def test_the_buffer_hands_out_oldest_first_records_the_queue_signal_and_survives_a_restart(book, tmp_path):
     subs = service(book)
     old = lease(book, 80)
     subs.submit(old.lease_id, "A", group(8), arrived_at=NOW)
@@ -337,11 +392,19 @@ def test_the_buffer_hands_out_oldest_first_counts_arrivals_and_survives_a_restar
     new = book.grant([LeaseRequest("A", ENV, (81,), 1)])[0].leases[0]
     subs.submit(new.lease_id, "A", group(8), arrived_at=NOW + 1)
     assert subs.buffer.depth() == {ENV: 2}
-    assert subs.buffer.drain_arrivals() == {ENV: 2 * sum(len(c) for c in subs.buffer.get(old.lease_id).completions)}
-    assert subs.buffer.drain_arrivals() == {}
-    assert [g.lease_id for g in subs.buffer.take(1)] == [old.lease_id]
+    clock = [NOW]
+    subs.buffer.clock = lambda: clock[0]
+    assert subs.buffer.drain_tick().arrivals == {ENV: 2 * sum(len(c) for c in subs.buffer.get(old.lease_id).completions)}
+    assert subs.buffer.drain_tick().arrivals == {}
+    assert [g.lease_id for g in subs.buffer.take(1)] == [old.lease_id]       # a full batch, one group left
     subs.buffer.release([old.lease_id])
-    assert [g.lease_id for g in subs.buffer.take(5)] == [old.lease_id, new.lease_id]
+    assert [g.lease_id for g in subs.buffer.take(5)] == [old.lease_id, new.lease_id]   # short: the trainer waits
+    clock[0] += 10
+    assert subs.buffer.take(3) == []
+    clock[0] += 3600                                                          # a dead trainer's gap counts 30 s
+    assert subs.buffer.take(3) == []
+    tick = subs.buffer.drain_tick()
+    assert (tick.taken, tick.starved_s) == (3 * 16 * len(RIGHT.tokens), 40.0)       # 3 groups taken
     book.close()
     reopened = LeaseBook(tmp_path / "leases.sqlite3", book.config, quota=QuotaController(), clock=lambda: NOW)
     again = service(reopened)
@@ -400,7 +463,7 @@ def test_a_suspect_inconclusive_is_no_pass_and_keeps_the_hotkey_in_probation(boo
     assert not subs.in_probation("A")
 
 
-def test_an_audit_failure_of_a_lagged_lease_is_inconclusive_with_its_lag(book):
+def test_an_audit_failure_of_a_lagged_lease_is_a_failure_with_its_lag(book):
     subs = service(book, audit_rate=1.0)
     old = lease(book, 86)
     subs.submit(old.lease_id, "A", group(0))
@@ -408,18 +471,34 @@ def test_an_audit_failure_of_a_lagged_lease_is_inconclusive_with_its_lag(book):
         book.adopt_checkpoint(k)
     statistical = AuditResult(passed=False, failure_class=AUDIT_FAILURE_STATISTICAL)
     subs.report_audit(old.lease_id, statistical)                                 # leased at 0, latest 3: lag 3
-    assert subs.group(old.lease_id)["audit"] == "inconclusive" and book.banned_until("A") is None
+    assert subs.group(old.lease_id)["audit"] == "failed" and book.banned_until("A") is None
     with book.lock:
         lag = book.db.execute("SELECT lag FROM rl_audits WHERE lease_id=?", (old.lease_id,)).fetchone()[0]
-        verdicts = book.db.execute("SELECT COUNT(*) FROM rl_verdicts").fetchone()[0]
-    assert lag == 3 and verdicts == 0
-    book.adopt_checkpoint(4)
-    renewed = book.grant([LeaseRequest("A", ENV, (88,), 2)])[0].leases[0]       # leased at 2, latest 4: lag 2
-    subs.submit(renewed.lease_id, "A", group(0))
-    subs.report_audit(renewed.lease_id, statistical)
-    assert subs.group(renewed.lease_id)["audit"] == "failed"                     # evidence: a verdict
-    with book.lock:
         assert book.db.execute("SELECT verdict FROM rl_verdicts").fetchall() == [("failed",)]
+    assert lag == 3
+
+
+def test_a_backlog_judges_the_freshest_audits_and_drops_the_stale_ones_unjudged(book):
+    subs = service(book, audit_rate=1.0, audit_max_lag=2)
+    stale = lease(book, 87)
+    subs.submit(stale.lease_id, "A", group(0), arrived_at=NOW + 1)
+    for k in (1, 2):
+        book.adopt_checkpoint(k)
+    older, newer = (book.grant([LeaseRequest("A", ENV, (p,), 2)])[0].leases[0] for p in (88, 90))
+    subs.submit(older.lease_id, "A", group(0), arrived_at=NOW + 2)
+    subs.submit(newer.lease_id, "A", group(0), arrived_at=NOW + 3)
+    assert [g.lease_id for g in subs.audit_jobs(10)] == [newer.lease_id, older.lease_id, stale.lease_id]
+    book.adopt_checkpoint(3)                                                       # the first lease is 3 behind
+    seen = []
+
+    def forward(g):
+        seen.append(g.lease_id)
+        return AuditResult(passed=True, rollout_match=(0.99,) * 16)
+
+    assert subs.run_audits(forward, 10) == 2 and seen == [newer.lease_id, older.lease_id]
+    assert subs.group(stale.lease_id)["audit"] == "inconclusive" and (stale.lease_id, FIRST_SCAN_FORFEITED) in kinds(subs)
+    with book.lock:
+        assert book.db.execute("SELECT count(*) FROM rl_verdicts WHERE lease_id=?", (stale.lease_id,)).fetchone() == (0,)
 
 
 def test_audit_forward_attempts_are_persisted_across_restarts(book):

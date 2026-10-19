@@ -1,19 +1,22 @@
 """The async per-env price controller (rl-async-design.md §4.9; implementation map §1.12, P5).
 
-The target is the trainer's speed: each env must supply its target share of what the trainer consumes. Per tick
+The target is the trainer's speed: each env must supply its target share of what the trainer consumes. Everything
+is read from the training queue (``TrainingBuffer.drain_tick``), nothing is reported by the trainer. Per tick
 (``tick_s`` of wall time, the validator's timer):
 
+* **trainer speed** = the completion tokens it took from the queue over the seconds it did not wait for groups
+  (kept as sums decayed with a half-life of one tick, persisted);
 * **demand** of an env = its target share (renormalised over the envs that supplied anything in the tick: a dry
-  env's share goes to the others, since the trainer takes what arrives) x the trainer's speed, in completion tokens per second of trainer work
-  (``note_speed``: per step, the completion tokens the trainer processed and the seconds it worked, waits excluded;
-  kept as sums decayed with a half-life of one tick, persisted);
-* **supply** = the completion tokens of the env's groups queued for training during the tick
-  (``TrainingBuffer.drain_arrivals``), per second;
+  env's share goes to the others, since the trainer takes what arrives) x the trainer's speed;
+* **supply** = the completion tokens of the env's groups queued for training during the tick, per second;
 * ``r = supply / demand``: under ``low`` the price rises (x ``rise``), over ``high`` it descends (``decay`` scaled to
   the tick's length), else it holds. An env refused leases for the global cap during the tick
-  (``LeaseBook.drain_full``) descends unless it is under ``low`` (then it rises: the cap holds every env back, the
-  mix still has to move), and only when the total supply covered the trainer's speed (else the cap is too small).
-* No speed yet, or none for ``stale_ticks`` ticks (trainer down): every price holds.
+  (``LeaseBook.drain_full``) and not under ``low`` descends too.
+* Two global guards, the queue's: while the cap refuses leases (the queue is at its most) no price rises, and while
+  the trainer waits for groups (over ``starved`` of the tick) no price descends. Without them, miners moving between
+  envs keep some env short at every tick: it rises x1.05 while the long ones descend 2 %, and the prices ratchet to
+  the cap with the queue full (queue_sim, 2026-10-17).
+* No speed yet, or the trainer neither took nor waited for ``stale_ticks`` ticks (trainer down): every price holds.
 
 No global price: the trainer's speed is the sum of the demands, so every env at r ~ 1 means the miners as a whole
 match the trainer. The price is a multiplier of the env's nominal rate: per matched token an env pays ``multiplier x
@@ -57,22 +60,35 @@ class AsyncPriceParams:
     low: float = 0.90            # placeholders: the supply/demand band the price holds in
     high: float = 1.10
     stale_ticks: float = 3.0     # no trainer speed for this many ticks: hold every price
+    starved: float = 0.05        # placeholder: the trainer waited over this share of the tick: no price descends
 
     def __post_init__(self) -> None:
-        if not (self.tick_s > 0 and 0 < self.low <= self.high and self.stale_ticks > 0):
-            raise ValueError("tick_s > 0, 0 < low <= high, stale_ticks > 0")
+        if not (self.tick_s > 0 and 0 < self.low <= self.high and self.stale_ticks > 0 and 0 <= self.starved < 1):
+            raise ValueError("tick_s > 0, 0 < low <= high, stale_ticks > 0, 0 <= starved < 1")
         if not 0 < self.base.floor <= self.base.start <= self.base.cap:
             raise ValueError("floor <= start <= cap")
 
 
 @dataclass(frozen=True)
+class QueueTick:
+    """The queue over one tick (``TrainingBuffer.drain_tick``): completion tokens queued per env, completion tokens
+    the trainer took, seconds it waited for groups."""
+    arrivals: Mapping[str, int] = field(default_factory=dict)
+    taken: int = 0
+    starved_s: float = 0.0
+
+
+@dataclass(frozen=True)
 class EnvSignal:
     """One env over one tick: ``supply_tps`` its queued completion tokens per second, ``demand_tps`` its target share
-    of the trainer's speed (None: no usable speed), ``full`` refused leases for the global cap."""
+    of the trainer's speed (None: no usable speed), ``full`` refused leases for the global cap. The two global
+    guards: ``capped`` the cap refused some lease (the queue is at its most), ``starved`` the trainer waited."""
     seconds: float
     supply_tps: float
     demand_tps: float | None
     full: bool = False
+    capped: bool = False
+    starved: bool = False
 
     @property
     def ratio(self) -> float | None:
@@ -86,10 +102,10 @@ def advance_async(state: PriceState, signal: EnvSignal, params: AsyncPriceParams
     r = signal.ratio
     if r is None:
         regime = HOLD
-    elif r < params.low:
+    elif r < params.low and not signal.capped:            # a full queue raises no price: the mix waits
         price *= base.rise
         regime = RISE
-    elif r > params.high or signal.full:
+    elif (r > params.high or (signal.full and r >= params.low)) and not signal.starved:   # nor a waiting trainer
         price *= base.decay ** (signal.seconds / (base.rounds_per_step * ROUND_SECONDS))
         regime = DESCEND
     else:
@@ -145,19 +161,19 @@ class AsyncPriceController:
         return out
 
     # --- signals and ticks ---------------------------------------------------------------------------------
-    def note_speed(self, tokens: float, seconds: float, now: float | None = None) -> None:
-        """One trainer step: ``tokens`` completion tokens processed in ``seconds`` of work (its waits excluded)."""
-        if not (tokens >= 0 and seconds > 0):
+    def _note_speed(self, tokens: float, seconds: float, now: float) -> None:
+        """Inside ``tick``'s transaction: ``tokens`` taken in ``seconds`` the trainer did not wait. A trainer that
+        took nothing but waited is alive: its speed is kept, refreshed."""
+        db = self.book.db
+        row = db.execute("SELECT tokens, seconds, at FROM rl_trainer_speed WHERE id=0").fetchone()
+        if tokens <= 0 or seconds <= 0:
+            db.execute("UPDATE rl_trainer_speed SET at=? WHERE id=0", (now,))
             return
-        now = float(self.clock()) if now is None else now
-        with self.book.transaction():
-            row = self.book.db.execute("SELECT tokens, seconds, at FROM rl_trainer_speed WHERE id=0").fetchone()
-            keep = 0.0 if row is None else 0.5 ** (max(now - row[2], 0.0) / self.params.tick_s)
-            total_tokens = float(tokens) + (0.0 if row is None else keep * row[0])
-            total_seconds = float(seconds) + (0.0 if row is None else keep * row[1])
-            self.book.db.execute("INSERT INTO rl_trainer_speed(id, tokens, seconds, at) VALUES(0,?,?,?) ON CONFLICT(id) "
-                                 "DO UPDATE SET tokens=excluded.tokens, seconds=excluded.seconds, at=excluded.at",
-                                 (total_tokens, total_seconds, now))
+        keep = 0.0 if row is None else 0.5 ** (max(now - row[2], 0.0) / self.params.tick_s)
+        db.execute("INSERT INTO rl_trainer_speed(id, tokens, seconds, at) VALUES(0,?,?,?) ON CONFLICT(id) DO UPDATE "
+                   "SET tokens=excluded.tokens, seconds=excluded.seconds, at=excluded.at",
+                   (tokens + (0.0 if row is None else keep * row[0]), seconds + (0.0 if row is None else keep * row[1]),
+                    now))
 
     def trainer_speed(self, now: float | None = None) -> float | None:
         """Completion tokens per second of trainer work; None before any step or after ``stale_ticks`` without."""
@@ -174,13 +190,11 @@ class AsyncPriceController:
             last = self.book.db.execute("SELECT last_tick FROM rl_price_clock WHERE id=0").fetchone()[0]
         return now - last >= self.params.tick_s
 
-    def tick(self, arrivals: Mapping[str, int], full: Iterable[str] = (),
-             now: float | None = None) -> dict[str, PriceDecision]:
-        """Advance every target env over the time since the last tick. ``arrivals``: env -> completion tokens queued
-        since the last tick (``TrainingBuffer.drain_arrivals``); ``full``: envs refused for the global cap
-        (``LeaseBook.drain_full``)."""
+    def tick(self, queue: QueueTick, full: Iterable[str] = (), now: float | None = None) -> dict[str, PriceDecision]:
+        """Advance every target env over the time since the last tick. ``queue``: ``TrainingBuffer.drain_tick``;
+        ``full``: envs refused for the global cap (``LeaseBook.drain_full``)."""
         now = float(self.clock()) if now is None else now
-        speed = self.trainer_speed(now)
+        arrivals = queue.arrivals
         full = set(full)
         decisions: dict[str, PriceDecision] = {}
         with self.book.transaction():
@@ -189,11 +203,12 @@ class AsyncPriceController:
             seconds = max(now - last, 0.0)
             if seconds <= 0:
                 return {}
+            if queue.taken or queue.starved_s:
+                self._note_speed(float(queue.taken), seconds - min(float(queue.starved_s), seconds), now)
+            speed = self.trainer_speed(now)
             # An env nobody supplied gives its share to the others (the trainer takes what arrives), and still rises.
             live = sum(float(v) for env, v in self.targets.items() if arrivals.get(env, 0) > 0) or 1.0
-            # The cap refusing leases while the miners as a whole supply less than the trainer takes says the cap is
-            # too small, not that the miners are too many: ``full`` counts only when the supply covers the speed.
-            oversupplied = speed is not None and sum(int(v) for v in arrivals.values()) / seconds >= speed
+            capped, starved = bool(full), queue.starved_s > self.params.starved * seconds
             for env in sorted(self.targets):
                 row = db.execute("SELECT price, last_good FROM rl_prices WHERE environment=?", (env,)).fetchone()
                 start = self.params.base.start
@@ -202,12 +217,12 @@ class AsyncPriceController:
                 if arrivals.get(env, 0) > 0:
                     share /= live
                 signal = EnvSignal(seconds, int(arrivals.get(env, 0)) / seconds,
-                                   None if speed is None else share * speed, oversupplied and env in full)
+                                   None if speed is None else share * speed, env in full, capped, starved)
                 decision = advance_async(state, signal, self.params)
                 decisions[env] = decision
                 detail = {"seconds": seconds, "ratio": decision.r, "supply_tps": signal.supply_tps,
                           "demand_tps": signal.demand_tps, "trainer_tps": speed, "target_share": share,
-                          "full": signal.full}
+                          "full": signal.full, "starved_s": queue.starved_s}
                 db.execute("INSERT INTO rl_prices(environment, price, last_good, regime, at, signal) "
                            "VALUES(?,?,?,?,?,?) ON CONFLICT(environment) DO UPDATE SET price=excluded.price, "
                            "last_good=excluded.last_good, regime=excluded.regime, at=excluded.at, "
@@ -219,6 +234,6 @@ class AsyncPriceController:
 
 
 __all__ = [
-    "ASYNC_BASE_PARAMS", "ASYNC_PRICE_RISE", "DESCEND", "HOLD", "RISE", "AsyncPriceController", "AsyncPriceParams", "EnvSignal",
+    "ASYNC_BASE_PARAMS", "ASYNC_PRICE_RISE", "DESCEND", "HOLD", "RISE", "AsyncPriceController", "AsyncPriceParams", "EnvSignal", "QueueTick",
     "advance_async",
 ]

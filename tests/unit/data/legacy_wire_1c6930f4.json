@@ -7,7 +7,7 @@
   "session_prefix": "reliquary/sandbox/sessions/"
  },
  "environments": {
-  "manifest_sha256": "ff1064ba90430a1be948104f921d993e5950ca475f36c93aa8466fad8768957e",
+  "manifest_sha256": "2a37162a1ba19703d7ceed58e9d88afe328bbe366cf3beadaee63487a053b5f9",
   "modes": {
    "envscaler_tools_v1": "episode",
    "envscaler_tools_v2": "episode",
@@ -36,7 +36,7 @@
    "opencodeinstruct": "26eff4b0af6941a2667353450ebafccf8a25b0e1c913b7f293f9ac70814ecdc4",
    "openmathinstruct": "5cab5454039b040e0f91352725c3dc138d0891e0cbd073bf431a3ac436e67076",
    "reliquary_code_v1": "e6f2fa79ca5f0170403d09a697e82e06439c7aa0c924abec601296619e85c0ce",
-   "reliquary_competitive_code_v1": "e06fd61fab50d51a53dfef70cddb3449b516a242bae3488875fc08d5e9d7f913",
+   "reliquary_competitive_code_v1": "ca4c4736b9f5edca3525892c493fbbafaebe531fb522df26d6985230bf7f6784",
    "reliquary_dapo_math_v1": "f69391d91ed5d6b61950cd63793bd3c5f5e9060611f53c5210e2d28b054dbcc4",
    "reliquary_general_v1": "d4fe3fc9b91ca5f7d748f2b0d4d1c9ff2fdc4b715e846d0569c494f3f9f2de02",
    "reliquary_hard_math_v1": "577c6410270599c0d61cd3f6f97e59ef40a432cbc50009f88bda0fde7166719d",

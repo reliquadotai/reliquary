@@ -1603,8 +1603,9 @@ EMISSION_PRICE_ARMED = _os.environ.get(
 # showed 5e-7 produced a sketch delta of ~600 (≈10 % of the 6000 sketch
 # tolerance) over 50 training steps — effectively indistinguishable from the
 # base model, which also means stale-model cheaters pass GRAIL. Matched
-# DAPO / R1-Zero-scale literature (1e-6 to 5e-6) by bumping to 5e-6.
-_PROFILE_LEARNING_RATE = "1e-6" if PROTOCOL_VERSION >= 3 else "5e-6"
+# DAPO / R1-Zero-scale literature (1e-6 to 5e-6) by bumping to 5e-6. The 9B async launch (protocol 10) runs 2e-6
+# (decision N, user 2026-10-17): 5e-6 learns faster but widens the honest drift of lagged miners.
+_PROFILE_LEARNING_RATE = "2e-6" if PROTOCOL_VERSION >= 10 else "1e-6" if PROTOCOL_VERSION >= 3 else "5e-6"
 LEARNING_RATE = float(
     _os.environ.get("RELIQUARY_LEARNING_RATE", _PROFILE_LEARNING_RATE)
 )
@@ -1990,22 +1991,35 @@ FORCED_SEED_CDF_BOUNDARY_EPSILON = 0.002
 FORCED_SEED_GUMBEL_BOUNDARY_EPSILON = 0.05
 # Async RL (rl-async-design.md §4.4, §4.6): the per-rollout match floor on stochastic positions under the Gumbel
 # draw, against the latest checkpoint. One value for the trainer's verification, the audit and the pay ledger.
-# PLACEHOLDER: 0.95 with bf16 heads (about 0.96 with fp32 heads), to calibrate at GPU qualification.
-RL_ROLLOUT_MATCH_FLOOR = 0.95
-# The pooled match floor a group must reach (trainer and audit alike). Lower than the rollout floor so that one
-# bad rollout among 16 honest ones (0.986) does not fail its group, while two do. PLACEHOLDER, as above.
+# 0.90: trainer-vs-vLLM bf16 noise leaves a few honest rollouts just under 0.95 even at lag 0, and the gap tests
+# already judge each mismatch. PLACEHOLDER, to confirm on the 9B.
+RL_ROLLOUT_MATCH_FLOOR = 0.90
+# The pooled match floor a group must reach (trainer and audit alike), on 16 rollouts (honest pool 0.986).
+# PLACEHOLDER, as above.
 RL_GROUP_MATCH_FLOOR = 0.90
 # An audited rollout that follows the draw (match >= the floor) yet carries more than this many hard mismatches at
 # near-deterministic positions (max p >= FORCED_SEED_STOCHASTIC_MAXPROB, Gumbel shortfall beyond the boundary
 # epsilon) was edited after the draw: deterministic forgery. PLACEHOLDER: calibrate on honest lag-2 rollouts.
 RL_AUDIT_FORGERY_MISMATCH_TOLERANCE = 1
+# That allowance is per this many near-deterministic positions of the rollout (rounded up, at least one block):
+# bf16 noise leaves a rare honest hard mismatch, so a long rollout gets proportionally more. PLACEHOLDER.
+RL_AUDIT_FORGERY_MISMATCH_POSITIONS = 4096
+# An audit runs against the latest checkpoint; one queued longer than this many checkpoints after its lease's is
+# dropped unjudged (inconclusive: unpaid, no probation effect) instead of judged on drifted weights. PLACEHOLDER.
+RL_AUDIT_MAX_LAG = 4
 # A rollout whose match falls this far under the rollout floor is no honest noise (honest single rollouts bottom
 # around 0.8): its whole group is rejected (trainer) or fails (audit) as statistical evidence, so a forged rollout
 # (e.g. one [EOS] that moves a 16/16 group into the zone) cannot ride on 15 honest ones. PLACEHOLDER.
 RL_FORGERY_MATCH_FLOOR = 0.5
-# A failed verification of a group leased more than this many checkpoints before the latest is no evidence (an honest
-# lagged lease drifts): the trainer reports it unsanctioned, the audit concludes inconclusive. PLACEHOLDER.
-RL_SANCTION_MAX_LAG = 2
+# Gumbel gap of a mismatched token: the best score minus the miner's token's score (s = logit + G). Honest gaps grow
+# with the trainer's drift. A rollout with a gap over the tolerance is not trained nor paid; a mismatch over the
+# substitute gap is re-graded with the trainer's pick (the reward must not change).
+# PLACEHOLDERS: calibrate on the logged gaps of a real run.
+RL_GAP_TOLERANCE = 8.0
+RL_SUBSTITUTE_GAP = 3.0
+# A rollout that ends on EOS: the final EOS needs a gap of at most RL_TERMINAL_GAP. No probability floor: an honest
+# draw ends on an unlikely EOS too. PLACEHOLDER, as above.
+RL_TERMINAL_GAP = 1.0
 # The model tokens (16 x 64) an out-of-zone group needs for its first-scan pay: a group of near-empty rollouts
 # verifies nothing and earns nothing. PLACEHOLDER.
 RL_FIRST_SCAN_MIN_TOKENS = 1024

@@ -74,7 +74,7 @@ LEASE_SPEED_PARAM = "rl_lease_reference_tokens_per_s"   # a slow reference card'
 LEASE_MARGIN_PARAM = "rl_lease_expiry_margin"
 PRICE_TICK_PARAM = "rl_price_tick_s"
 PENDING_PARAM = "rl_max_pending_groups"         # global cap: buffered groups (queued or taken)
-DEFAULT_MAX_PENDING_GROUPS = 256      # placeholder: 4 batches of 64 (lag <= ~4 steps), set at qualification
+DEFAULT_MAX_PENDING_GROUPS = 192      # placeholder: 3 batches of 64. queue_sim 10-17: trainer wait 7 % at 128, 2 % at 160, 1 % at 192, <1 % at 256; queue wait p50 0.6 / 0.9 / 1.3 / 2.2 steps
 DEFAULT_LEASE_TOKENS_PER_S = 20.0      # placeholder: the design's "3090 at max length", measured at qualification
 DEFAULT_LEASE_MARGIN = 2.0
 
@@ -270,19 +270,17 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
         router.add_api_route(f"{prefix}/{path}", handler, methods=[method])
 
     def report(b: dict) -> dict:
-        matched = b.get("matched_tokens")
+        matched, subs = b.get("matched_tokens"), b.get("substitutions")
         rl.submissions.report_training(str(b["lease_id"]), rollout_match=[float(m) for m in b["rollout_match"]],
                                        accepted=bool(b["accepted"]), failure_class=b.get("failure_class"),
-                                       matched_tokens=None if matched is None else [int(n) for n in matched])
+                                       matched_tokens=None if matched is None else [int(n) for n in matched],
+                                       substitutions=None if subs is None else [[(int(p), int(t)) for p, t in s]
+                                                                                for s in subs])
         return {"ok": True}
 
     def adopt(b: dict) -> dict:
         rl.book.adopt_checkpoint(int(b["k"]))
         return {"latest": rl.book.latest_checkpoint}
-
-    def speed(b: dict) -> dict:
-        rl.prices.note_speed(float(b["tokens"]), float(b["seconds"]))
-        return {"ok": True}
 
     route("GET", "config", lambda b: {"task_id": rl.settings.task_id, "run": rl.settings.run,
                                       "targets": dict(rl.settings.targets), "latest": rl.book.latest_checkpoint})
@@ -295,7 +293,6 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
     route("POST", "requeue", lambda b: {"requeued": rl.buffer.requeue()})
     route("GET", "depth", lambda b: {"depth": rl.buffer.depth()})
     route("POST", "report", report)
-    route("POST", "speed", speed)
 
     async def checkpoint(request: Request) -> JSONResponse:
         """``/rl/checkpoint``'s answer for the trainer's resume (it reaches this listener only)."""
@@ -351,7 +348,8 @@ def mount_rl_async(server, rl: RlAsync, *, validator_hotkey: str, registration=N
 
     router = build_rl_lease_router(book=rl.book, collector=rl.collector, validator_hotkey=validator_hotkey,
                                    registration=registration, clock=clock, submissions=rl.submissions,
-                                   pay=rl.ledger, max_episode_body_bytes=episode_body_cap(rl.settings))
+                                   pay=rl.ledger, max_episode_body_bytes=episode_body_cap(rl.settings),
+                                   admit=lambda env, idx: _lease_admission(rl, env, idx))
 
     @router.get("/rl/checkpoint")
     async def rl_checkpoint():
@@ -378,6 +376,15 @@ def mount_rl_async(server, rl: RlAsync, *, validator_hotkey: str, registration=N
     if rl.sandbox is not None:
         for sessions in rl.sandbox.routers:
             server.mount_rl_lease_router(sessions)
+
+
+async def _lease_admission(rl, environment: str, prompt_idx: int) -> tuple[str, dict] | None:
+    """The lease route's ``admit``: an episode env's task needs a fleet that can host its sessions now
+    (``RlLeaseSandbox.lease_refusal``); every other lease is the book's alone."""
+    sandbox = getattr(rl, "sandbox", None)
+    if sandbox is None:
+        return None
+    return await sandbox.lease_refusal(environment, prompt_idx)
 
 
 def episode_body_cap(settings: RlAsyncSettings) -> int | None:
@@ -481,7 +488,7 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
         now = float(clock())
         if not await asyncio.to_thread(rl.prices.due, now):
             return
-        await asyncio.to_thread(lambda: rl.prices.tick(rl.buffer.drain_arrivals(), rl.book.drain_full(), now))
+        await asyncio.to_thread(lambda: rl.prices.tick(rl.buffer.drain_tick(), rl.book.drain_full(), now))
 
     async def follow() -> None:
         await audit_model.follow_once(rl.board)

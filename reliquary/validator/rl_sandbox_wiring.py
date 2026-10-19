@@ -409,10 +409,6 @@ class RlEpisodeServices:
             return "fleet_unavailable", {"environment": str(getattr(value, "environment", ""))}
 
     async def _precommit_admission(self, value) -> tuple[str, dict] | None:
-        from reliquary.sandbox.rl_capacity import MIN_SERVING_MACHINES
-        from reliquary.sandbox.rl_engagements import session_budgets
-        from reliquary.sandbox.sessions import token_validity_s
-
         environment = str(value.environment)
         refusal = self.serving_refusal(environment)
         if refusal is not None:
@@ -423,43 +419,9 @@ class RlEpisodeServices:
         if environment in self.tier_pending:
             # Added to the run, its reservation tier not seeded yet: not counted in the fleet size, no group yet.
             return "fleet_unavailable", {"environment": environment, "why": "tier_unseeded"}
-        try:
-            task = await asyncio.wait_for(view.resolve_task(int(value.task_index)), self.book.policy.io_timeout_s)
-        except TimeoutError:
-            # The source is slow now: never admitted unchecked, never a final answer.
-            return "fleet_unavailable", {"environment": environment, "why": "task_resolve_timeout"}
-        except Exception:
-            return None                                # a task the source has not: the runtime's own checks
-        policy = view.policy
-        options = getattr(task, "env_options_sha256", None)
-        if not self.fleet.serving(policy.sandbox_env, policy.env_package, env_options_sha256=options):
-            # A stale directory or report, or no machine serving the env right now: never a final answer.
-            return "fleet_unavailable", {"environment": environment}
-        budgets = session_budgets(policy, task)
-        reserve = {"cpu_millis": getattr(task, "cpu_millis", None), "memory_bytes": int(budgets["memory_bytes"])}
-        placement = dict(image=task.image, env=policy.sandbox_env, env_package=policy.env_package, budgets=budgets,
-                         # the open path's own token validity (its machines' caps must allow it)
-                         validity_s=token_validity_s(self.book.policy.open_window_s, int(budgets["wall_s"]),
-                                                     getattr(task, "prepare_timeout_s", None)),
-                         env_options_sha256=options, reserve=reserve)
-        lock = getattr(task, "env_lock_sha256", None)
-        if lock is not None:                           # the open path's own lock filter (``_reserving``)
-            placement["env_lock_sha256"] = lock
-        group = policy.pool_seeds // 2
-        machines = self.fleet.servable(**placement, group_size=group)     # M at once
-        if machines >= MIN_SERVING_MACHINES:
-            return None
-        verdict = self.fleet.could_place(**placement, now=self.clock())
-        if verdict is None:
-            # A machine that served it when last heard is stale or drained, or one's resources cannot be read:
-            # the open path itself would answer retryably.
-            return "fleet_unavailable", {"environment": environment}
-        if verdict and self.fleet.servable(**placement, group_size=group, include_unknown=True) >= MIN_SERVING_MACHINES:
-            # Its fresh machines alone cannot host its group, but with the ones missing a heartbeat (or whose
-            # resources cannot be read now) they could: a partial view never gives a final answer.
-            return "fleet_unavailable", {"environment": environment}
-        return "task_unservable", {"environment": environment, "task_index": int(value.task_index),
-                                   "image": task.image, "cpu_millis": reserve["cpu_millis"], "machines": machines}
+        return await placement_refusal(fleet=self.fleet, view=view, session_policy=self.book.policy,
+                                       environment=environment, task_index=int(value.task_index),
+                                       group=view.policy.pool_seeds // 2, clock=self.clock)
 
     async def watch_served_forever(self, every_s: float) -> None:
         """While an env is degraded: re-check every ``every_s``; serve it again once a machine reports it."""
@@ -826,6 +788,55 @@ class RlEpisodeServices:
             except Exception:
                 logger.exception("rl session yield not settled")
             await asyncio.sleep(every_s)
+
+
+async def placement_refusal(*, fleet, view, session_policy, environment: str, task_index: int, group: int,
+                            clock: Callable[[], float]) -> tuple[str, dict] | None:
+    """Whether the fleet can host ``group`` sessions of this episode task at once, on at least
+    ``MIN_SERVING_MACHINES`` machines by the open path's own filter: None (yes, or a task the source has not,
+    left to the runtime's own checks), ``fleet_unavailable`` (retryable: a slow source, a stale or partial view)
+    or ``task_unservable`` (fresh machines serve the env and the open path would refuse this task on all of
+    them). Shared by the window path's precommit admission and the async path's lease grant."""
+    from reliquary.sandbox.rl_capacity import MIN_SERVING_MACHINES
+    from reliquary.sandbox.rl_engagements import session_budgets
+    from reliquary.sandbox.sessions import token_validity_s
+
+    try:
+        task = await asyncio.wait_for(view.resolve_task(int(task_index)), session_policy.io_timeout_s)
+    except TimeoutError:
+        # The source is slow now: never admitted unchecked, never a final answer.
+        return "fleet_unavailable", {"environment": environment, "why": "task_resolve_timeout"}
+    except Exception:
+        return None                                # a task the source has not: the runtime's own checks
+    policy = view.policy
+    options = getattr(task, "env_options_sha256", None)
+    if not fleet.serving(policy.sandbox_env, policy.env_package, env_options_sha256=options):
+        # A stale directory or report, or no machine serving the env right now: never a final answer.
+        return "fleet_unavailable", {"environment": environment}
+    budgets = session_budgets(policy, task)
+    reserve = {"cpu_millis": getattr(task, "cpu_millis", None), "memory_bytes": int(budgets["memory_bytes"])}
+    placement = dict(image=task.image, env=policy.sandbox_env, env_package=policy.env_package, budgets=budgets,
+                     # the open path's own token validity (its machines' caps must allow it)
+                     validity_s=token_validity_s(session_policy.open_window_s, int(budgets["wall_s"]),
+                                                 getattr(task, "prepare_timeout_s", None)),
+                     env_options_sha256=options, reserve=reserve)
+    lock = getattr(task, "env_lock_sha256", None)
+    if lock is not None:                           # the open path's own lock filter (``_reserving``)
+        placement["env_lock_sha256"] = lock
+    machines = fleet.servable(**placement, group_size=group)     # the group at once
+    if machines >= MIN_SERVING_MACHINES:
+        return None
+    verdict = fleet.could_place(**placement, now=clock())
+    if verdict is None:
+        # A machine that served it when last heard is stale or drained, or one's resources cannot be read:
+        # the open path itself would answer retryably.
+        return "fleet_unavailable", {"environment": environment}
+    if verdict and fleet.servable(**placement, group_size=group, include_unknown=True) >= MIN_SERVING_MACHINES:
+        # Its fresh machines alone cannot host its group, but with the ones missing a heartbeat (or whose
+        # resources cannot be read now) they could: a partial view never gives a final answer.
+        return "fleet_unavailable", {"environment": environment}
+    return "task_unservable", {"environment": environment, "task_index": int(task_index),
+                               "image": task.image, "cpu_millis": reserve["cpu_millis"], "machines": machines}
 
 
 def _presented(reported: Callable[[str], bool] | None, session_id: str) -> bool | None:

@@ -2,7 +2,7 @@
 
 Input: the submission path's event stream (``RlSubmissions.events(since)``, in ``seq`` order, cursor persisted).
 
-* ``trained``: pay FLAT per matched token: every rollout whose match is at least ``floor`` (0.95) earns its matched
+* ``trained``: pay FLAT per matched token: every rollout whose match is at least ``floor`` (0.90) earns its matched
   tokens x the env's price per token at ingestion (``AsyncPriceController.token_price``). A rollout under the floor
   is never paid (the trainer masks it; the ledger re-checks). Matched tokens are the trainer's exact per-rollout
   counts when it reports them (``report_training(matched_tokens=...)``), else ``floor(match x completion tokens)``.

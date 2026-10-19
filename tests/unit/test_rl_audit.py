@@ -110,12 +110,24 @@ def test_tampered_tokens_at_near_deterministic_positions_are_forgery():
     assert result.rollout_match[5] >= rl_audit.RL_ROLLOUT_MATCH_FLOOR
 
 
+def test_the_hard_mismatch_allowance_grows_with_the_near_deterministic_positions():
+    def d(positions, hard):
+        return fs.SeedConsistencyDiagnostics(n_positions=positions, n_stochastic=100, n_exact_match=99,
+                                             n_deterministic_hard_mismatch=hard)
+
+    assert [rl_audit.mismatch_allowance(d(n, 0), 1, 4096) for n in (100, 1100, 4196, 4197, 8293)] == [1, 1, 1, 2, 3]
+    long = [d(7800, 2)] + [d(7800, 0)] * 15                             # 2 over 7,700 positions: allowed
+    assert rl_audit.judge(long, per_positions=4096).passed is True
+    short = [d(1100, 2)] + [d(1100, 0)] * 15                            # 2 over 1,000 positions: one too many
+    assert rl_audit.judge(short, per_positions=4096).failure_class == AUDIT_FAILURE_DETERMINISTIC
+
+
 def test_a_rollout_under_the_floor_is_excluded_the_group_is_judged_pooled():
     def d(stochastic, match):
         return fs.SeedConsistencyDiagnostics(n_positions=stochastic, n_stochastic=stochastic, n_exact_match=match)
 
-    result = rl_audit.judge([d(100, 90)] + [d(100, 99)] * 15)           # pooled 0.984
-    assert result.passed is True and result.rollout_match[0] == 0.90 < rl_audit.RL_ROLLOUT_MATCH_FLOOR
+    result = rl_audit.judge([d(100, 85)] + [d(100, 99)] * 15)           # pooled 0.981
+    assert result.passed is True and result.rollout_match[0] == 0.85 < rl_audit.RL_ROLLOUT_MATCH_FLOOR
     result = rl_audit.judge([d(100, 80)] * 8 + [d(100, 99)] * 8)        # pooled 0.895 < the group floor
     assert result.passed is False and result.failure_class == AUDIT_FAILURE_STATISTICAL
     result = rl_audit.judge([d(1, 0)] * 16)                              # 16 drawn positions: abstain, suspect

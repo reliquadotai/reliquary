@@ -2,23 +2,27 @@
 
 The quota is measured, never declared. Per hotkey:
 
+* Only PAID groups count as deliveries: a trained group, or a payable first scan (``record_paid``, called by the
+  submission path when the pay event is written). A submission that earns nothing (a repeat out-of-zone scan, a
+  forfeited first scan, a rejected or untrained group) frees its slot and is counted, but earns no credit.
 * ``cap`` follows AIMD. A new hotkey starts at ``initial`` (4). A *round* is one quota's worth of deliveries
   counted from the last change: when the round ends with the hotkey having held its full quota at some point
-  (``saturated``) and no lease expired, ``cap`` doubles (slow start: 4 -> ~1,600 in ~9 rounds). Every expiry
-  halves the quota (never below ``floor``) and ends slow start.
-* ``target`` is Little's law over a sliding window: measured throughput (deliveries per second over the window,
-  or over the hotkey's life when shorter) x measured mean lease-to-submit latency x ``headroom`` (1.5). It is the
-  concurrency the hotkey actually sustains, plus room to grow.
+  (``saturated``) and no lease expired, ``cap`` doubles (slow start: 4 -> ~1,600 in ~9 rounds). An expiry cuts
+  the quota by ``EXPIRY_BACKOFF`` (x0.9, at least one lease, never below ``floor``) and ends slow start; a
+  submission refused for integrity halves it.
+* ``target`` is Little's law over a sliding window: measured throughput (paid deliveries per second over the
+  window, or over the hotkey's life when shorter) x measured mean lease-to-submit latency of those deliveries x
+  ``headroom`` (1.5). It is the concurrency the hotkey actually sustains, plus room to grow.
 * While in slow start the quota is ``cap``. A round that ends without the hotkey ever using its full quota means
   it found its own pace: it leaves slow start. Once steady, the quota is ``min(cap, target)`` (``cap`` alone until
   ``MIN_SAMPLES`` deliveries are in the window), so an idle or slowed hotkey cannot keep a large quota to block
   prompts with, and a growing one regains quota by about ``headroom`` per window and by doubling ``cap``.
 * Everything is clamped to ``[floor, ceiling]``.
 
-Out-of-zone submissions are delivered work like in-zone ones (the lease made the miner generate them).
 ``record_submission`` is what the submission path (P3) calls after it closed a lease (``LeaseBook.submit`` does
-it for the caller); ``record_expiry`` is called by the lease book's sweep, and by ``LeaseBook.submit`` for a
-submission refused for integrity (``cause="rejected"``: halved like an expiry).
+it for the caller): it frees the slot; ``record_paid`` (``LeaseBook.credit``) credits the delivery once the group
+is paid; ``record_expiry`` is called by the lease book's sweep, and by ``LeaseBook.submit`` for a submission
+refused for integrity (``cause="rejected"``: halved).
 
 Persistence: ``attach(db, lock)`` stores one JSON row per hotkey in the lease book's SQLite file (the latency
 samples are kept as ``BUCKET_S`` buckets of (count, latency sum), so a row stays small at any rate). Without
@@ -35,6 +39,8 @@ SLOW_START = "slow_start"
 STEADY = "steady"
 BUCKET_S = 10.0       # latency samples are kept as (count, sum) per bucket: a row stays small at any rate
 MIN_SAMPLES = 8       # deliveries in the window before Little's law is trusted
+# An expiry's cut: x0.9, at least one lease (an honest network incident must not halve a miner). PLACEHOLDER.
+EXPIRY_BACKOFF = 0.9
 
 
 @dataclass(frozen=True)
@@ -55,7 +61,7 @@ class QuotaConfig:
 
 
 def _counters() -> dict[str, int]:
-    return {"leased": 0, "submitted": 0, "in_zone": 0, "out_of_zone": 0, "expired": 0, "rejected": 0}
+    return {"leased": 0, "submitted": 0, "in_zone": 0, "out_of_zone": 0, "paid": 0, "expired": 0, "rejected": 0}
 
 
 @dataclass
@@ -208,15 +214,23 @@ class QuotaController:
             self._save(hotkey, entry)
 
     def record_submission(self, hotkey: str, lease, *, in_zone: bool, now: float) -> None:
-        """A lease ended by its submission, on time (any outcome: out of zone is delivered work)."""
+        """A lease ended by its submission, on time: its slot is free. No credit until it is paid."""
         with self._lock:
             entry = self._entry(hotkey)
             entry.in_use = max(0, entry.in_use - 1)
             entry.counters["submitted"] += 1
             entry.counters["in_zone" if in_zone else "out_of_zone"] += 1
+            self._save(hotkey, entry)
+
+    def record_paid(self, hotkey: str, *, issued_at: float, submitted_at: float, now: float) -> None:
+        """A submitted lease's group was paid (trained, or a payable first scan): one delivery, its latency the
+        lease's issue-to-submission time."""
+        with self._lock:
+            entry = self._entry(hotkey)
+            entry.counters["paid"] += 1
             bucket = entry.buckets.setdefault(math.floor(now / BUCKET_S), [0.0, 0.0])
             bucket[0] += 1
-            bucket[1] += max(0.0, now - float(lease.issued_at))
+            bucket[1] += max(0.0, float(submitted_at) - float(issued_at))
             oldest = math.floor((now - self.config.window_s) / BUCKET_S)
             for b in [b for b in entry.buckets if b <= oldest]:
                 del entry.buckets[b]
@@ -234,7 +248,8 @@ class QuotaController:
 
     def record_expiry(self, hotkey: str, lease, *, now: float, cause: str = "expired") -> None:
         """A lease ran past its expiry without a submission (``cause="expired"``), or its submission was refused
-        for integrity (``"rejected"``: malformed or forged work is no delivery): halve the quota."""
+        for integrity (``"rejected"``: malformed or forged work is no delivery). An expiry cuts the quota by
+        ``EXPIRY_BACKOFF`` (at least one lease); a rejection halves it."""
         if cause not in ("expired", "rejected"):
             raise ValueError("cause must be expired or rejected")
         with self._lock:
@@ -242,11 +257,14 @@ class QuotaController:
             before = self._quota(entry, now)
             entry.in_use = max(0, entry.in_use - 1)
             entry.counters[cause] += 1
-            entry.cap = self._clamp(before // 2)
+            if cause == "rejected":
+                entry.cap, cut = self._clamp(before // 2), "halved"
+            else:
+                entry.cap, cut = self._clamp(min(before - 1, math.floor(before * EXPIRY_BACKOFF))), "cut"
             entry.phase = STEADY
-            entry.reason = f"{cause} lease: quota halved from {before}"
+            entry.reason = f"{cause} lease: quota {cut} from {before}"
             self._new_round(entry, now)
             self._save(hotkey, entry)
 
 
-__all__ = ["SLOW_START", "STEADY", "QuotaConfig", "QuotaController"]
+__all__ = ["EXPIRY_BACKOFF", "SLOW_START", "STEADY", "QuotaConfig", "QuotaController"]

@@ -76,6 +76,10 @@ CORPUS_RANGES: tuple[UsedRange, ...] = (
     UsedRange("corpus", "reliquary_science_v1", "train", 0, 10_871, "science-qwen38-27b-v2"),
     UsedRange("corpus", "reliquary_hard_math_v1", "train", 0, 15_749, "hard-math-qwen38-27b-v1"),
     UsedRange("corpus", "reliquary_hard_math_v1", "train", 0, 15_749, "hard-math-qwen38-27b-v2"),
+    UsedRange("corpus", "reliquary_competitive_code_v1", "train", 0, 4181,
+              "competitive-code-qwen38-27b-v1"),
+    UsedRange("corpus", "reliquary_competitive_code_v1", "train", 6899, 1893,
+              "competitive-code-v2-qwen38-27b-v1"),
 )
 
 # reliquary_telecom_solo_v2 0.2.0a1 (reliquary-environments c72f918) lays
@@ -89,7 +93,10 @@ TELECOM_SOLO_V2_RL = (1220, 493)
 # Rows a source keeps for RL alone: no corpus job may take them, whatever it
 # declares. reliquary_competitive_code_v1 shares train by problem identity
 # (the package's `layout.use_of`), SFT first then RL, as its environment.toml
-# `[data]` declares: SFT [0, 4181), RL [4181, 6899).
+# `[data]` declares: SFT [0, 4181), RL [4181, 6899). v1.1
+# (ReliquaryForge/competitive-code-curated@4ae52941, reliquary-environments
+# 63f1d02) appends 1,893 problems, all SFT, after the v1 rows: SFT also
+# [6899, 8792). The v1 rows, and so the RL share, are unchanged.
 #
 # envscaler_tools_v2 splits by world: its RL worlds' scenarios are [0, 1296),
 # restated from `envscaler_tools_v2.environment.RL_RANGE` (a test holds the
@@ -225,7 +232,7 @@ SOURCE_LINEAGE: dict[str, tuple[str, str]] = {
     "reliquary_instruction_following_v1": ("nvidia/Nemotron-Cascade-2-RL-data:IF-RL",
                                            "reliquary_instruction_following_v1"),
     "reliquary_competitive_code_v1": (
-        "ReliquaryForge/competitive-code-curated@1f6e4f12",
+        "ReliquaryForge/competitive-code-curated@4ae52941",
         "reliquary_competitive_code_v1"),
     "reliquary_general_v1": (
         "ReliquaryForge/general-prompts-curated@02b3ef7a",

@@ -106,8 +106,6 @@ def test_the_trainer_link_needs_its_token_and_round_trips(tmp_path):
     with pytest.raises(TrainerLinkError) as missing:
         link.report_training(lease.lease_id, rollout_match=[1.0] * 16, accepted=True)
     assert missing.value.status == 404                                  # a first attempt: not a resend
-    link.note_speed(6_000, 3.0)
-    assert rl.prices.trainer_speed() == pytest.approx(2_000)
     with pytest.raises(TrainerLinkError):
         link.adopt_checkpoint(-1)
     rl.close()
@@ -303,7 +301,7 @@ async def test_end_to_end_lease_submit_train_pay_and_sync(tmp_path):
         link = TrainerLink(trainer_served.url, TOKEN, patience_s=5.0)
         publisher = DeltaPublisher(run="smoke", store=store, staging_dir=tmp_path / "staging", model_dir=model_dir)
         trainer = AsyncTrainer(model, config=AsyncTrainerConfig(batch_groups=4),
-                               buffer=link, submissions=link, book=link, prices=link, publisher=publisher,
+                               buffer=link, submissions=link, book=link, publisher=publisher,
                                train_step_fn=fake_step)
         assert rl.book.latest_checkpoint == 0 and trainer.version == 0
 
@@ -466,10 +464,8 @@ def test_the_controller_wandb_row_reads_prices_buffer_leases_and_miners(tmp_path
     rl.book.adopt_checkpoint(0)
     leases = rl.book.grant([LeaseRequest("A", ENV, (3, 4), 0)])[0].leases
     assert rl.submissions.submit(leases[0].lease_id, "A", group(8))["verdict"] == "in_zone"
-    rl.prices.note_speed(6_000, 3.0)
     row = controller_metrics(rl, time.time())
     assert row[f"price/{ENV}/multiplier"] > 0 and row[f"buffer/{ENV}/queued"] == 1
     assert row["leases/open"] == 1 and row["leases/submitted"] == 1 and row[f"leases_issued/{ENV}"] == 2
     assert row[f"groups/{ENV}/in_zone"] == 1 and row["miners/active"] == 1 and row["miners/banned"] == 0
-    assert row["trainer/completion_tokens_per_s"] == pytest.approx(2_000)
     rl.close()

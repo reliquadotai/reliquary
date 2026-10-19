@@ -56,10 +56,14 @@ LEASE_POLL_S = 2.0
 SUBMIT_BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 15.0)
 OUTCOME_WAIT_S = 1800.0             # fallback wait for a held prompt's scan while the env's lease expiry is unknown
 GENERATION_ATTEMPTS = 2
+STREAM_STEP_S = 0.5                 # one continuous-batching call steps the engine this long (or to a finished group)
 UNKNOWN_SAMPLE = 4                  # never-listed prompts drawn per wanted prompt
 
 # The validator's words (``validator/rl_leases.py``), repeated here: the miner does not import the validator.
 TAKEN, COOLING, BLACKLISTED, QUOTA, STALE = "taken", "cooling", "blacklisted", "quota", "stale"
+# An episode task the validator's sandbox fleet cannot host now (retry later) or at all (another task meanwhile).
+FLEET_UNAVAILABLE, TASK_UNSERVABLE = "fleet_unavailable", "task_unservable"
+FLEET_RETRY_S, UNSERVABLE_HOLD_S = 60.0, 3600.0
 FULL = "full"          # the validator's global cap (its trainer is behind): like quota, wait for the next poll
 COOLDOWN, IN_ZONE = "cooldown", "in_zone"
 
@@ -371,6 +375,17 @@ class HttpRlTransport:
                                                            validator_hotkey=self.validator_hotkey, path=path))
         return await self._call("GET", path, params={"hotkey": self.hotkey, "at": str(at), "signature": signature})
 
+    async def forfeit(self, lease_id: str) -> dict:
+        """``POST /rl/lease/forfeit``: give up an open lease (charged as its expiry, its quota slot freed now)."""
+        from reliquary.protocol.signatures import build_rl_lease_forfeit_binding
+
+        path = f"{self._prefix}/lease/forfeit"
+        at = int(self._clock())
+        signature = self._sign(build_rl_lease_forfeit_binding(hotkey=self.hotkey, at=at, lease_id=lease_id,
+                                                              validator_hotkey=self.validator_hotkey, path=path))
+        return await self._call("POST", path, json={"miner_hotkey": self.hotkey, "at": at, "lease_id": lease_id,
+                                                    "signature": signature})
+
     async def checkpoint(self) -> dict | None:
         try:
             return await self._call("GET", f"{self._prefix}/checkpoint")
@@ -426,6 +441,10 @@ class DryRunTransport:
     async def my_leases(self) -> dict:
         return {"leases": [lease.to_wire() for lease in self.open.values()], "latest": self.latest,
                 "lease_expiry_s": {}}
+
+    async def forfeit(self, lease_id: str) -> dict:
+        self.open.pop(lease_id, None)
+        return {"lease_id": lease_id, "state": "expired", "quota": self.quota_value}
 
     async def lease(self, environment: str, checkpoint: int, prompt_ids: Sequence[int]) -> dict:
         self.lease_calls.append((environment, int(checkpoint), [int(p) for p in prompt_ids]))
@@ -506,6 +525,7 @@ class AsyncMiner:
         self._state, self._state_version = state, loaded_version   # the CPU copy the follower patches
         self.open: dict[str, HeldLease] = {}            # granted, not yet submitted nor given up
         self.queue: list[HeldLease] = []                # open and waiting for generation
+        self.running: dict[str, HeldLease] = {}         # in a continuous-batching generator, by lease id
         self.quota: int | None = None
         self.stats = {"leased": 0, "submitted": 0, "submit_failed": 0, "expired_unsent": 0, "recovered": 0,
                       "refused": {}, "verdicts": {}}
@@ -628,6 +648,9 @@ class AsyncMiner:
             planner.mark(prompt, reason)              # our table is behind: the next state poll catches up
         elif reason in (QUOTA, FULL):
             self.quota = len(self.open)               # the validator counts fewer, or is full: wait for its next quota
+        elif reason in (FLEET_UNAVAILABLE, TASK_UNSERVABLE):
+            planner.wait_for_outcome(prompt, self._clock() + (FLEET_RETRY_S if reason == FLEET_UNAVAILABLE
+                                                              else UNSERVABLE_HOLD_S))
         elif reason == STALE:
             self._stale = True                        # our k is retired or not adopted yet: sync first
             self._wake_checkpoint.set()
@@ -645,11 +668,11 @@ class AsyncMiner:
         self._wake_lease.set()
         return True
 
-    def _take_batch(self) -> list[HeldLease]:
+    def _take_batch(self, n: int | None = None) -> list[HeldLease]:
         now = self._clock()
         self.queue.sort(key=lambda lease: lease.expires_at)        # earliest expiry first
         batch: list[HeldLease] = []
-        while self.queue and len(batch) < self.config.batch_groups:
+        while self.queue and len(batch) < (self.config.batch_groups if n is None else n):
             lease = self.queue.pop(0)
             if lease.expires_at <= now:
                 logger.warning("lease %s expired before generation", lease.lease_id[:12])
@@ -659,8 +682,92 @@ class AsyncMiner:
             batch.append(lease)
         return batch
 
+    def _retry(self, leases: Sequence[HeldLease]) -> None:
+        """Leases whose generation failed: back in the queue, or given up after ``GENERATION_ATTEMPTS``."""
+        for lease in leases:
+            tries = self._attempts[lease.lease_id] = self._attempts.get(lease.lease_id, 0) + 1
+            if tries < GENERATION_ATTEMPTS:
+                self.queue.append(lease)
+            else:
+                logger.error("lease %s given up after %d generation failures", lease.lease_id[:12], tries)
+                self._close(lease)
+                self._forfeit(lease)
+
+    def _forfeit(self, lease: HeldLease) -> None:
+        """Tell the validator a given-up lease will not be submitted: charged as its expiry, its quota slot freed
+        now instead of at its end (an episode lease's end is over an hour away)."""
+        call = getattr(self.transport, "forfeit", None)
+        if call is None:
+            return
+
+        async def send() -> None:
+            try:
+                await call(lease.lease_id)
+                self.stats["forfeited"] = self.stats.get("forfeited", 0) + 1
+            except Exception as exc:                     # the lease then expires as before
+                logger.warning("forfeit of lease %s failed (%s)", lease.lease_id[:12], exc)
+
+        task = asyncio.create_task(send())
+        self._submits.add(task)
+        task.add_done_callback(self._submits.discard)
+
+    def _hand_over(self, lease: HeldLease, rollouts, version: int) -> None:
+        task = asyncio.create_task(self.submit(lease, rollouts, version))
+        self._submits.add(task)
+        task.add_done_callback(self._submits.discard)
+
+    async def _stream_once(self) -> int:
+        """Continuous batching (a generator with ``advance``): keep ``batch_groups`` leases running, start a queued
+        one as soon as a group completes and submit that group at once, so no lease waits for a batch's longest
+        rollout. New weights wait until the running groups are done (a rollout is generated on one checkpoint):
+        no lease starts while a swap is pending. Returns the groups completed, or 1 while the engine is busy."""
+        if self._ready.is_set() and not self.running:
+            await self.swap_if_ready()
+        if self.loaded_version is None:
+            return 0
+        new = [] if self._ready.is_set() else self._take_batch(self.config.batch_groups - len(self.running))
+        if not new and not self.running:
+            return 0
+        version = int(self.loaded_version)
+        self.running.update((lease.lease_id, lease) for lease in new)
+        if new:
+            self._wake_lease.set()                                 # the queue has room again
+        try:
+            aadvance = getattr(self.generator, "aadvance", None)          # episodes: played on the event loop
+            done = (await aadvance(new, STREAM_STEP_S) if callable(aadvance)
+                    else await asyncio.to_thread(self.generator.advance, new, STREAM_STEP_S))
+        except Exception:
+            logger.exception("continuous generation of %d running leases failed", len(self.running))
+            failed = list(self.running.values())
+            self.running.clear()
+            with contextlib.suppress(Exception):
+                if callable(aadvance):
+                    self.generator.abort()                 # its tasks live on this loop
+                else:
+                    await asyncio.to_thread(self.generator.abort)
+            self._retry(failed)
+            return 0
+        for lease_id, rollouts in done:
+            lease = self.running.pop(lease_id, None)
+            if lease is None:
+                continue
+            if isinstance(rollouts, BaseException):          # that lease alone failed, for good (e.g. episodes)
+                logger.error("lease %s given up: %s", lease_id[:12], rollouts)
+                self._close(lease)
+                self._forfeit(lease)
+                continue
+            if len(rollouts) != ROLLOUTS:
+                logger.error("lease %s came back with %d rollouts", lease_id[:12], len(rollouts))
+                self._retry([lease])
+                continue
+            self._hand_over(lease, rollouts, version)
+        return max(len(done), 1)
+
     async def generate_once(self) -> int:
-        """Swap weights if new ones are ready, then generate one batch and hand each group to its submission."""
+        """Swap weights if new ones are ready, then generate one batch and hand each group to its submission. A
+        generator with ``advance`` is driven continuously instead (``_stream_once``)."""
+        if callable(getattr(self.generator, "advance", None)) or callable(getattr(self.generator, "aadvance", None)):
+            return await self._stream_once()
         await self.swap_if_ready()
         if self.loaded_version is None:
             return 0
@@ -673,23 +780,23 @@ class AsyncMiner:
             agenerate = getattr(self.generator, "agenerate", None)       # episodes: played on the event loop
             groups = (await agenerate(batch) if agenerate is not None
                       else await asyncio.to_thread(self.generator.generate, batch))
-            if len(groups) != len(batch) or any(len(g) != ROLLOUTS for g in groups):
+            if len(groups) != len(batch) or any(not isinstance(g, BaseException) and len(g) != ROLLOUTS
+                                                for g in groups):
                 raise ValueError(f"the generator must return {ROLLOUTS} rollouts per lease")
         except Exception:
             logger.exception("generation of %d leases failed", len(batch))
-            for lease in batch:
-                tries = self._attempts[lease.lease_id] = self._attempts.get(lease.lease_id, 0) + 1
-                if tries < GENERATION_ATTEMPTS:
-                    self.queue.append(lease)
-                else:
-                    logger.error("lease %s given up after %d generation failures", lease.lease_id[:12], tries)
-                    self._close(lease)
+            self._retry(batch)
             return 0
+        done = 0
         for lease, rollouts in zip(batch, groups):
-            task = asyncio.create_task(self.submit(lease, rollouts, version))
-            self._submits.add(task)
-            task.add_done_callback(self._submits.discard)
-        return len(batch)
+            if isinstance(rollouts, BaseException):          # that lease alone failed, for good (e.g. episodes)
+                logger.error("lease %s given up: %s", lease.lease_id[:12], rollouts)
+                self._close(lease)
+                self._forfeit(lease)
+                continue
+            self._hand_over(lease, rollouts, version)
+            done += 1
+        return done
 
     # --- submission ----------------------------------------------------------------------------------
     async def submit(self, lease: HeldLease, rollouts: Sequence[Sequence[int]], k_generated: int) -> bool:
@@ -987,6 +1094,26 @@ class VllmGroupGenerator:
               max_new_tokens_for_environment(lease.environment)) for lease in leases],
             eos_ids=self.eos_ids)
 
+    def advance(self, leases: Sequence[HeldLease], budget_s: float) -> list[tuple[str, list[list[int]]]]:
+        """Continuous batching: start ``leases`` in the running engine, step it for about ``budget_s``, return the
+        groups that completed as ``(lease id, rollouts)``."""
+        from reliquary.constants import max_new_tokens_for_environment
+
+        from reliquary.protocol.rl_draw import lease_extra_args
+
+        if self._engine is None:
+            raise RuntimeError("no weights loaded")
+        for lease in leases:
+            self._engine.add_group(
+                lease.lease_id, self._prompt(lease.environment, lease.prompt_idx),
+                [lease_extra_args(lease.nonce, lease.prompt_idx, lease.checkpoint, r) for r in range(ROLLOUTS)],
+                max_new_tokens_for_environment(lease.environment), eos_ids=self.eos_ids)
+        return self._engine.step_groups(budget_s)
+
+    def abort(self) -> None:
+        if self._engine is not None:
+            self._engine.abort_groups()
+
     def _reload(self, state: Mapping[str, Any], version: int) -> None:
         from reliquary.miner.vllm_generation import VLLMRolloutGenerator
 
@@ -1047,6 +1174,37 @@ class FakeGroupGenerator:
         self.version = int(version)
 
 
+class FakeStreamGenerator(FakeGroupGenerator):
+    """``FakeGroupGenerator`` with continuous batching: a lease completes ``steps[prompt_idx]`` (default 1)
+    ``advance`` calls after it started."""
+
+    def __init__(self, length: int = 8, steps: Mapping[int, int] | None = None) -> None:
+        super().__init__(length)
+        self.steps = dict(steps or {})
+        self.running: dict[str, tuple[HeldLease, int]] = {}
+        self.started: list[str] = []
+        self.fail_next = False
+
+    def advance(self, leases: Sequence[HeldLease], budget_s: float) -> list[tuple[str, list[list[int]]]]:
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("engine step failed")
+        for lease in leases:
+            self.started.append(lease.lease_id)
+            self.running[lease.lease_id] = (lease, self.steps.get(lease.prompt_idx, 1))
+        done = []
+        for lease_id, (lease, left) in list(self.running.items()):
+            if left <= 1:
+                del self.running[lease_id]
+                done.append((lease_id, self.generate([lease])[0]))
+            else:
+                self.running[lease_id] = (lease, left - 1)
+        return done
+
+    def abort(self) -> None:
+        self.running.clear()
+
+
 # ------------------------------------------------------------------------------------------------ entry point
 async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, validator_hotkey: str, wallet=None,
                           base_model_dir: str | None = None, work_dir: str, initial_dir: str | None = None,
@@ -1083,9 +1241,10 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
             sync = CheckpointSync(validator_hotkey=validator_hotkey, work_dir=Path(work_dir) / "ckpt-download",
                                   model_dir=model_files)
             weights = PayWeights(validator_url).weights
-            # The validator's signed-episode envs (their blocks: policy, catalogue); played by the episode stack.
-            blocks = {name: block for name, block in (await transport.episodes()).items()
-                      if name in config.environments}
+            # The validator's signed-episode envs (their blocks: policy, catalogue); played by the episode stack. The
+            # answer adds each env's lease lifetime, which is no part of the block.
+            blocks = {name: {k: v for k, v in block.items() if k != "lease_expiry_s"}
+                      for name, block in (await transport.episodes()).items() if name in config.environments}
         generator = await asyncio.to_thread(
             miner_generator, config, blocks=blocks, fake_generator=fake_generator, dry_run=dry_run,
             base_model_dir=base_model_dir or str(model_files), work_dir=work_dir, swap=swap,
@@ -1153,8 +1312,8 @@ def miner_generator(config: AsyncMinerConfig, *, blocks: Mapping[str, Any], fake
 
 
 __all__ = [
-    "AsyncMiner", "AsyncMinerConfig", "DryRunTransport", "FakeGroupGenerator", "GroupGenerator", "HeldLease",
-    "HttpRlTransport", "PromptPlanner", "PromptRecord", "RequestRefused", "RlTransport", "VllmGroupGenerator",
-    "default_priority", "draw_context", "encode_submission", "miner_generator", "run_async_miner", "submission_digest",
+    "AsyncMiner", "AsyncMinerConfig", "DryRunTransport", "FakeGroupGenerator", "FakeStreamGenerator", "GroupGenerator",
+    "HeldLease", "HttpRlTransport", "PromptPlanner", "PromptRecord", "RequestRefused", "RlTransport",
+    "VllmGroupGenerator", "default_priority", "draw_context", "encode_submission", "miner_generator", "run_async_miner", "submission_digest",
     "submission_rollouts", "write_hf_dir",
 ]

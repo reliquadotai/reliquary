@@ -39,11 +39,11 @@ def served(tmp_path):
     return book
 
 
-def client_for(book, *, registration=None, clock=lambda: float(NOW)):
+def client_for(book, *, registration=None, clock=lambda: float(NOW), admit=None):
     app = FastAPI()
     app.include_router(build_rl_lease_router(book=book, collector=LeaseCollector(book, interval_s=0.0),
                                              validator_hotkey=VALIDATOR.ss58_address,
-                                             registration=registration, clock=clock))
+                                             registration=registration, clock=clock, admit=admit))
     return TestClient(app)
 
 
@@ -73,6 +73,19 @@ def test_a_signed_request_gets_its_leases_with_their_nonces(served):
     secret = bytes.fromhex(revealed["secret"])
     assert verify_reveal(bytes.fromhex(revealed["commitment"]), 0, secret)
     assert lease_nonce(secret, ENV, 1, 0).hex() == first["nonce"]
+
+
+def test_a_task_the_fleet_cannot_host_is_refused_beside_the_books_leases(served):
+    async def admit(environment, prompt):
+        return {2: ("task_unservable", {}), 3: ("fleet_unavailable", {})}.get(prompt)
+
+    client = client_for(served, admit=admit)
+    content = client.post("/rl/lease", json=body(prompts=(1, 2, 3))).json()
+    assert [x["prompt_idx"] for x in content["leases"]] == [1] and content["in_use"] == 1
+    assert content["refused"] == [{"prompt_idx": 2, "reason": "task_unservable"},
+                                  {"prompt_idx": 3, "reason": "fleet_unavailable"}]
+    nothing = client.post("/rl/lease", json=body(prompts=(2,), at=NOW + 1)).json()
+    assert nothing["leases"] == [] and nothing["refused"] == [{"prompt_idx": 2, "reason": "task_unservable"}]
 
 
 def test_a_rival_learns_only_that_the_prompt_is_taken(served):
@@ -346,3 +359,27 @@ def test_a_miner_lists_only_its_own_open_leases_with_a_signed_read(served):
     quota = client.get("/rl/quota", params={"hotkey": MINER.ss58_address}).json()
     assert quota["lease_expiry_s"] == {ENV: 600.0}
     assert client.post("/rl/lease", json=body(prompts=(9,), at=NOW + 2)).json()["lease_expiry_s"] == 600.0
+
+
+def test_a_miner_forfeits_its_own_open_lease_at_the_price_of_an_expiry(served):
+    from reliquary.protocol.signatures import build_rl_lease_forfeit_binding
+
+    client = client_for(served)
+    leases = client.post("/rl/lease", json=body()).json()["leases"]
+    rival = client.post("/rl/lease", json=body(RIVAL, prompts=(5,))).json()["leases"][0]
+    before = served.quota.quota(MINER.ss58_address, NOW)
+
+    def forfeit(lease_id, keypair=MINER, at=NOW, signer=None):
+        binding = build_rl_lease_forfeit_binding(hotkey=keypair.ss58_address, at=at, lease_id=lease_id,
+                                                 validator_hotkey=VALIDATOR.ss58_address, path="/rl/lease/forfeit")
+        return client.post("/rl/lease/forfeit", json={"miner_hotkey": keypair.ss58_address, "at": at,
+                                                      "lease_id": lease_id,
+                                                      "signature": (signer or keypair).sign(binding).hex()})
+
+    assert forfeit(leases[0]["lease_id"], signer=EVE).status_code == 403                  # not the hotkey's
+    assert forfeit(rival["lease_id"]).status_code == 409                                  # not its lease
+    done = forfeit(leases[0]["lease_id"])
+    assert done.status_code == 200 and done.json()["state"] == "expired"
+    assert served.lease(leases[0]["lease_id"]).state == "expired" and served.in_use(MINER.ss58_address) == 1
+    assert served.quota.quota(MINER.ss58_address, NOW) < before                           # charged as an expiry
+    assert forfeit(leases[0]["lease_id"], at=NOW + 1).status_code == 409                  # once

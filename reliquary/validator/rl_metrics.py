@@ -15,7 +15,7 @@ def controller_metrics(rl: Any, now: float, window_s: float = METRICS_EVERY_S) -
     for env, price in rl.prices.board().items():
         out[f"price/{env}/multiplier"] = price["multiplier"]
         out[f"price/{env}/per_million_tokens"] = price["per_million_tokens"]
-        for key in ("ratio", "supply_tps", "demand_tps"):
+        for key in ("ratio", "supply_tps", "demand_tps", "trainer_tps", "starved_s"):
             if isinstance(price["signal"].get(key), (int, float)):
                 out[f"price/{env}/{key}"] = price["signal"][key]
     db = rl.book.db

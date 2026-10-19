@@ -4,7 +4,7 @@ generates them, and every lease ends in a submission or an expiry (there is no r
 * **Exclusive.** At most one live lease per ``(environment, prompt, checkpoint k)``; once a lease of it is
   submitted, the key is closed for that k (the draw would be identical anyway). A SQLite partial unique index
   enforces it. An expired lease frees its key, and the next lessee gets the same draw (resolution C12: accepted,
-  expiry earns nothing and halves the quota).
+  expiry earns nothing and cuts the quota).
 * **Fair inside an interval.** ``LeaseCollector`` gathers the requests that arrive within ``interval_s`` (~1 s)
   and ``LeaseBook.grant`` resolves the whole batch at once: every (request, prompt) claim is shuffled with the
   validator's own randomness (``random.SystemRandom``) and taken in that order, so a contested prompt goes to a
@@ -25,7 +25,7 @@ generates them, and every lease ends in a submission or an expiry (there is no r
   (16) by default: late enough never to bind an honest miner; there is no other lag cap.
 * **Expiry** is fixed per environment (``lease_expiry_s``: the env's max tokens at a slow reference speed, times a
   margin), never derived from the miner. ``expire_due`` sweeps (each ``grant`` and ``submit`` sweeps too) and
-  halves the hotkey's quota. A submission is judged at its arrival: a lease held by ``hold_submission`` (arrived
+  cuts the hotkey's quota (``EXPIRY_BACKOFF``). A submission is judged at its arrival: a lease held by ``hold_submission`` (arrived
   on time, waiting for or in grading) is never expired by a sweep.
 * **One lease of a prompt at a time** across checkpoints (``taken``): the same prompt cannot be leased at every
   unrevealed k at once. A request is cut to the hotkey's room (``quota - in_use``, capped by its share of the
@@ -78,7 +78,7 @@ INTERVAL_S = 1.0          # the collection interval inside which arrival order b
 RESTART_GRACE_S = 120.0   # what a lease that fell due while the validator was down gets at boot
 SECRET_REVEAL_LAG = 16    # S_k is revealed, and k stops being leasable, once k < latest - this
 MAX_SCANS_PER_PAGE = 1000
-HOTKEY_PENDING_SHARE = 0.25   # PLACEHOLDER: the most of the global cap one hotkey's open leases may take
+HOTKEY_MAX_OPEN = 64          # PLACEHOLDER: the most open leases one hotkey may hold under a global cap
 
 
 def _bound(domain: bytes, parts: list[bytes]) -> bytes:
@@ -201,7 +201,7 @@ class LeaseBookConfig:
     # The global cap (async trainer throttle, AReaL-style): no lease is granted while the buffered groups (queued or
     # taken) reach it, so a trainer slower than the miners holds them back instead of dropping their work. Open
     # leases are not counted (the quota and expiry bound them; a growing buffer is the oversupply signal), but one
-    # hotkey's open leases may take at most ``HOTKEY_PENDING_SHARE`` of it (refused as ``quota``). None: no cap.
+    # hotkey may hold at most ``HOTKEY_MAX_OPEN`` of them (refused as ``quota``). None: no cap.
     max_pending_groups: int | None = None
 
     def __post_init__(self) -> None:
@@ -408,6 +408,23 @@ class LeaseBook:
             self.quota.record_expiry(lease.hotkey, lease, now=now)
         return len(due)
 
+    def forfeit(self, lease_id: str, hotkey: str, now: float | None = None) -> Lease:
+        """The miner gives up its open lease now (e.g. episodes that could not all be played): closed and charged
+        exactly as its expiry (``record_expiry``), so it is never cheaper than delivering, only sooner; the quota
+        slot is freed now rather than at the lease's end. LookupError: no open lease of ``hotkey`` by that id, or
+        one whose submission is being judged."""
+        now = float(self.clock()) if now is None else now
+        with self._txn():
+            row = self.db.execute(f"SELECT {_COLUMNS} FROM rl_leases WHERE lease_id=?", (lease_id,)).fetchone()
+            lease = None if row is None else self._lease(row)
+            if (lease is None or lease.hotkey != hotkey or lease.state != OPEN
+                    or lease.lease_id in self._submitting):
+                raise LookupError("no open lease of this hotkey to forfeit")
+            self.db.execute("UPDATE rl_leases SET state=?, closed_at=? WHERE lease_id=?",
+                            (EXPIRED, now, lease.lease_id))
+            self.quota.record_expiry(lease.hotkey, lease, now=now)
+        return lease
+
     def expire_due(self, now: float | None = None) -> int:
         now = float(self.clock()) if now is None else now
         with self._txn():
@@ -439,7 +456,7 @@ class LeaseBook:
                     held[(hotkey, lease.environment, lease.prompt_idx, lease.checkpoint)] = lease
                 limit = self.quota.quota(hotkey, now)
                 if cap is not None:
-                    limit = min(limit, max(1, int(cap * HOTKEY_PENDING_SHARE)))
+                    limit = min(limit, HOTKEY_MAX_OPEN)
                 room[hotkey] = max(0, limit - len(rows))
             claims = []
             for i, request in enumerate(requests):
@@ -555,8 +572,9 @@ class LeaseBook:
 
     def submit(self, lease_id: str, hotkey: str, *, in_zone: bool, delivered: bool = True,
                now: float | None = None) -> Lease:
-        """End a lease by its submission (whatever its outcome). Closes its (env, prompt, k) and credits the
-        hotkey's quota; ``delivered=False`` (a group refused for integrity: no work) halves it like an expiry.
+        """End a lease by its submission (whatever its outcome). Closes its (env, prompt, k) and frees its quota
+        slot (credited only when paid: ``credit``); ``delivered=False`` (a group refused for integrity: no work)
+        halves the quota.
         LookupError: unknown, already ended or expired; PermissionError: another hotkey's lease, or a banned
         hotkey."""
         now = float(self.clock()) if now is None else now
@@ -572,6 +590,16 @@ class LeaseBook:
         if failure is not None:
             raise failure
         return replace(lease, state=SUBMITTED)
+
+    def credit(self, lease_id: str, now: float | None = None) -> None:
+        """A submitted lease's group was paid: one delivery for its hotkey's quota (``QuotaController.record_paid``).
+        A lease that is not (or no longer) on record as submitted is ignored."""
+        now = float(self.clock()) if now is None else now
+        with self._txn():
+            row = self.db.execute("SELECT hotkey, issued_at, closed_at FROM rl_leases WHERE lease_id=? AND state=?",
+                                  (lease_id, SUBMITTED)).fetchone()
+            if row is not None:
+                self.quota.record_paid(row[0], issued_at=float(row[1]), submitted_at=float(row[2]), now=now)
 
     # --- bans (set by the audit regime of the submission path) ----------------------------------------------
     def _banned(self, hotkey: str, now: float) -> bool:

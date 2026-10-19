@@ -11,8 +11,8 @@ import threading
 import pytest
 
 from reliquary.miner.rl_async import (
-    ROLLOUTS, AsyncMiner, AsyncMinerConfig, DryRunTransport, FakeGroupGenerator, PromptPlanner, PromptRecord,
-    RequestRefused, encode_submission, submission_digest,
+    ROLLOUTS, AsyncMiner, AsyncMinerConfig, DryRunTransport, FakeGroupGenerator, FakeStreamGenerator, PromptPlanner,
+    PromptRecord, RequestRefused, encode_submission, submission_digest,
 )
 from reliquary.protocol.rl_submit import decode_tokens
 
@@ -38,12 +38,12 @@ def scan(seq, prompt, verdict, k=0, rewards=(0.0,) * 16):
 
 
 def miner_for(*, quota=8, lease_batch=8, queue_groups=8, batch_groups=4, max_open=64, prompt_range=(0, 50),
-              loaded_version=0, clock=None, transport=None, sync=None, state_dir=None, priority=None):
+              loaded_version=0, clock=None, transport=None, sync=None, state_dir=None, priority=None, generator=None):
     clock = clock or Clock()
     transport = transport or DryRunTransport(quota=quota, clock=clock)
     planner_kwargs = {} if priority is None else {"priority": priority}
     planner = PromptPlanner(ENV, prompt_range, rng=random.Random(0), clock=clock, **planner_kwargs)
-    generator = FakeGroupGenerator()
+    generator = generator or FakeGroupGenerator()
     if loaded_version is not None:
         generator.load_weights({}, loaded_version)
     config = AsyncMinerConfig(environments=(ENV,), lease_batch=lease_batch, queue_groups=queue_groups,
@@ -191,6 +191,18 @@ async def test_refusals_move_the_planner_and_the_scheduler():
     assert miner._stale and miner.lease_room() == 0               # sync first; the swap lifts it
 
 
+async def test_an_episode_task_the_fleet_cannot_host_is_held_back_for_a_while():
+    clock = Clock()
+    miner, transport, _, planner = miner_for(quota=50, prompt_range=(0, 6), clock=clock)
+    transport.refuse = {0: "fleet_unavailable", 1: "task_unservable"}
+    await miner.refresh_quota()
+    await miner.lease_more()
+    assert miner.stats["refused"] == {"fleet_unavailable": 1, "task_unservable": 1}
+    assert not planner.leasable(0) and not planner.leasable(1)
+    clock.now += 61
+    assert planner.leasable(0) and not planner.leasable(1)        # a full fleet is asked again soon
+
+
 async def test_a_refused_request_backs_off_without_leasing():
     miner, transport, _, _ = miner_for()
 
@@ -260,7 +272,7 @@ async def test_a_submission_stops_retrying_at_the_lease_expiry():
 
 
 async def test_a_failed_generation_is_retried_once_then_given_up():
-    miner, _, generator, _ = miner_for(quota=1)
+    miner, transport, generator, _ = miner_for(quota=1)
     calls = []
 
     def broken(leases):
@@ -274,6 +286,26 @@ async def test_a_failed_generation_is_retried_once_then_given_up():
     assert len(miner.queue) == 1
     await miner.generate_once()
     assert calls == [1, 1] and miner.queue == [] and miner.open == {}
+    await miner.drain()
+    assert miner.stats["forfeited"] == 1 and transport.open == {}          # the validator frees its slot now
+
+
+async def test_a_lease_that_failed_alone_is_given_up_and_its_batch_mates_are_submitted():
+    """Episodes: a lease's sessions are single-use, so a failed lease comes back as its exception, is given up at
+    once (no replay) and the other leases of the batch keep their groups."""
+    miner, transport, generator, _ = miner_for(quota=2)
+    plain = generator.generate
+
+    async def agenerate(leases):
+        groups = plain(leases)
+        return [RuntimeError("rollout 3: unusable") if i == 0 else g for i, g in enumerate(groups)]
+
+    generator.agenerate = agenerate
+    await miner.refresh_quota()
+    await miner.lease_more()
+    assert await miner.generate_once() == 1 and miner.queue == []
+    await miner.drain()
+    assert miner.stats["forfeited"] == 1 and miner.stats["submitted"] == 1 and transport.open == {}
 
 
 async def test_open_leases_survive_a_restart(tmp_path):
@@ -521,3 +553,86 @@ def test_write_hf_dir_reloads_in_transformers_from_several_shards(tmp_path, monk
     assert len(list(dest.glob("*.safetensors"))) > 1
     loaded = AutoModelForCausalLM.from_pretrained(dest).state_dict()
     assert all(torch.equal(loaded[k], v) for k, v in state.items() if k in loaded)
+
+
+# --- continuous batching ------------------------------------------------------------------------------------
+def streaming(steps=None, **kwargs):
+    return miner_for(generator=FakeStreamGenerator(steps=steps), **kwargs)
+
+
+async def test_a_long_group_does_not_hold_back_the_others():
+    miner, transport, generator, _ = streaming(quota=8, batch_groups=2, queue_groups=8)
+    await miner.refresh_quota()
+    await miner.lease_more()
+    slow = sorted(miner.queue, key=lambda lease: lease.expires_at)[0]
+    generator.steps = {slow.prompt_idx: 4}                          # its longest rollout takes 4 steps
+    for _ in range(3):
+        await miner.generate_once()
+    await miner.drain()
+    assert list(miner.running) == [slow.lease_id]                   # each fast group starts and ends in one call
+    assert len(transport.submissions) == 3                          # the slot beside it served three leases
+    assert slow.lease_id not in {s["lease_id"] for s in transport.submissions}
+    await miner.generate_once()
+    await miner.drain()
+    assert slow.lease_id in {s["lease_id"] for s in transport.submissions}
+
+
+class FakeEpisodeStream(FakeStreamGenerator):
+    """``aadvance`` on the event loop, as the episode generator plays leases; ``fail`` names leases that end
+    as their exception."""
+
+    def __init__(self, steps=None, fail=()):
+        super().__init__(steps=steps)
+        self.fail = set(fail)
+
+    async def aadvance(self, leases, budget_s):
+        done = self.advance(leases, budget_s)
+        return [(lease_id, RuntimeError("unusable") if lease_id in self.fail else group) for lease_id, group in done]
+
+    def abort(self):
+        self.running.clear()
+
+
+async def test_episode_leases_are_played_continuously_and_a_failed_one_alone_is_given_up():
+    miner, transport, generator, _ = miner_for(generator=FakeEpisodeStream(), quota=4, batch_groups=2,
+                                               queue_groups=8)
+    await miner.refresh_quota()
+    await miner.lease_more()
+    ordered = sorted(miner.queue, key=lambda lease: lease.expires_at)
+    generator.steps = {ordered[0].prompt_idx: 5}                    # a long lease
+    generator.fail = {ordered[1].lease_id}
+    for _ in range(3):
+        await miner.generate_once()
+    await miner.drain()
+    assert ordered[0].lease_id in miner.running                     # still playing, the slot beside it went on
+    assert miner.stats["forfeited"] == 1 and len(transport.submissions) == 2
+
+
+async def test_new_weights_wait_for_the_running_groups():
+    miner, transport, generator, _ = streaming(quota=8, batch_groups=2)
+    await miner.refresh_quota()
+    await miner.lease_more()
+    generator.steps = {lease.prompt_idx: 2 for lease in miner.queue}
+    await miner.generate_once()                                     # two groups start on k 0
+    miner._state, miner._state_version = {}, 1
+    miner._ready.set()
+    started = len(generator.started)
+    await miner.generate_once()                                     # they finish; nothing new starts
+    assert len(generator.started) == started and not miner.running and generator.loads == [0]
+    await miner.generate_once()                                     # drained: swap, then start on k 1
+    await miner.drain()
+    assert generator.loads == [0, 1] and len(generator.started) == started + 2
+    assert sorted(s["k_generated"] for s in transport.submissions) == [0, 0]
+
+
+async def test_a_failed_engine_step_requeues_the_running_leases():
+    miner, transport, generator, _ = streaming(quota=4, batch_groups=2)
+    await miner.refresh_quota()
+    await miner.lease_more()
+    generator.fail_next = True
+    assert await miner.generate_once() == 0
+    assert not miner.running and not generator.running and len(miner.queue) == 4
+    await miner.generate_once()
+    await miner.drain()
+    assert len(transport.submissions) == 2
+

@@ -138,9 +138,9 @@ All of these share a known fleet capacity C. None of them does slow start, halvi
 - An AIMD controller per hotkey (~250):
   - start at 4;
   - double while the full quota is used and delivered on time;
-  - halve on each expiry;
+  - cut by x0.9 (at least one lease) on each expiry, halve on an integrity rejection;
   - target = throughput × latency × 1.5 over a sliding window;
-  - out-of-zone submissions count as delivered.
+  - only paid groups (trained, payable first scans; `LeaseBook.credit`) count as delivered.
 - Its persistence.
 - `GET /rl/quota` with reasons (~100).
 - The miner reader (~60).
@@ -550,7 +550,7 @@ v* must come from the proof. The trainer cannot recompute it: it has no pi_old m
 - The notes say "Rejected: option B, exclusive reservation. Squatting with many keys, and the validator's nearest miner wins every race on a popular prompt." (`rl-windows-redesign-notes.md:154-155`), and recommend non-exclusive option A (`:142-153`).
 - The design picks exclusivity with 1 s interval fairness, mandatory submission, a small newcomer quota and the burn (`design:93-118`).
 - This is a reversal, and the design should answer the many-keys squatting argument explicitly.
-- Open point: with a deterministic nonce, a lease that expires leaves the same draw for the next lessee at the same k. The first holder knows that outcome, so expiry acts as a paid "release" whose only cost is quota halving, which falls on throwaway keys.
+- Open point: with a deterministic nonce, a lease that expires leaves the same draw for the next lessee at the same k. The first holder knows that outcome, so expiry acts as a paid "release" whose only cost is a quota cut, which falls on throwaway keys.
 
 **C13. Window-scoped settlement and weights.**
 
@@ -653,7 +653,7 @@ P2 and P1a can run in parallel. P5 can start once P1a fixes the v* format.
   whose S_k is unrevealed. Refusals: taken / cooling / blacklisted / quota / stale. A lease due while the validator
   was down is extended to `now + restart_grace_s` at boot. Since the 10-16 review: an open lease of a prompt at any
   k refuses it at every other k (`taken`); a banned or roomless hotkey is refused up front and a request is cut to
-  `quota - in_use` (and `HOTKEY_PENDING_SHARE` = 1/4 of the global cap) in its own order before any lookup.
+  `quota - in_use` (and `HOTKEY_MAX_OPEN` = 64 open leases under a global cap) in its own order before any lookup.
 - Prompt lifecycle (design §4.5), in the same file: `classify_group(rewards, truncated)` (population sigma >=
   `SIGMA_MIN_V4` = 0.24, at most `MAX_TRUNCATED_PER_SUBMISSION` truncated, then mean >= 0.5 too easy, else too
   hard); `LeaseBook.record_outcome(env, prompt, k, rewards, verdict)` (P3 calls it after grading) appends to
@@ -662,8 +662,8 @@ P2 and P1a can run in parallel. P5 can start once P1a fixes the v* format.
   profile's per-env `prompt_cooldown_windows_for_environment` counted in checkpoints, read at each outcome so a live
   operator change applies to the next cooldown, decision E; `CooldownMap`'s half-open rule; C6). `prompt_state(since)` is the incremental miner view. The former
   `checkpoint_cooldown(maps)` predicate is gone: the cooldown now lives in the lease DB.
-- `reliquary/validator/rl_lease_quota.py`: `QuotaController` (AIMD cap with slow start, halving on expiry,
-  Little's-law target `headroom x throughput x latency` once steady, persisted in the lease book's file).
+- `reliquary/validator/rl_lease_quota.py`: `QuotaController` (AIMD cap with slow start, `EXPIRY_BACKOFF` x0.9 on expiry,
+  halving on an integrity rejection, credit only for paid groups via `record_paid`, Little's-law target `headroom x throughput x latency` once steady, persisted in the lease book's file).
 - `reliquary/validator/rl_lease_routes.py`: `POST /rl/lease` (signed, `build_rl_lease_binding` in
   `protocol/signatures.py`), `GET /rl/quota?hotkey=`, `GET /rl/lease/commitments`, `GET /rl/prompts/state?since=`
   (public, no hotkey); `ValidatorServer.mount_rl_lease_router`. Not mounted by the CLI/service yet (P3);
@@ -686,31 +686,31 @@ over the module-level `batcher.admission_problem_materials`, shared with P3).
   buffer or audit draw). Store: `rl_groups` (private, hotkey, verdict, grades, first scan, audit/training state)
   next to `rl_prompt_scans` (public log). TODO: the decision-D R2 segment writer reads `rl_prompt_scans` by `seq`.
 - `validator/rl_buffer.py`: `TrainingBuffer` (SQLite, same file): `take(n)` any env in arrival order, `release`,
-  `depth`, `drain_arrivals` (queued completion tokens per env: the prices'
-  supply); taken groups requeue at reopen. `SubmittedGroup` carries env, k, nonce, arrival, hotkey,
+  `depth`, `drain_tick` (the prices' signal: queued completion tokens per env, completion tokens the trainer took,
+  seconds it waited, between takes at most 30 s apart); taken groups requeue at reopen. `SubmittedGroup` carries env, k, nonce, arrival, hotkey,
   prompt tokens, completions, force spans, rewards.
 - Audit (§C, design §4.4): draw after submission with `SystemRandom`; probation = < 100 passed out-of-zone audits,
-  or < 20 passes since the last failure; deterministic -> `LeaseBook.ban` 24 h (no lease: refusal `banned`, no
-  submission); statistical -> re-probation, ban when > 3 of the last 20 non-forced verdicts failed. Queue order:
-  past-probation hotkeys first, oldest first. `ProofForward(SubmittedGroup) -> AuditResult(passed | None,
+  or < 20 passes since the last failure; a failure of any class -> unpaid, re-probation, never a ban (10-17);
+  `RlSubmissions.blacklist` is the operator's ban (`LeaseBook.ban`: refusal `banned`, no submission). Queue order:
+  past-probation hotkeys first, newest first; `drop_stale_audits` concludes inconclusive (unpaid, no probation
+  effect) every audit more than `audit_max_lag` (`RL_AUDIT_MAX_LAG`, 4) checkpoints behind the latest. `ProofForward(SubmittedGroup) -> AuditResult(passed | None,
   failure_class, rollout_match)` is the Gumbel verifier's slot; `run_audits` drains.
 - Hooks for P4/P5: `report_training(lease_id, rollout_match, accepted, failure_class=None)` (accepted -> `trained`
-  event with per-rollout match and token counts; rejected with a class -> sanctioned like an audit; without a class,
-  e.g. staleness -> unpaid only). `rl_events` (`first_scan` 25 % payable: at once when not drawn, at pass when
-  drawn; `first_scan_forfeited`; `trained`; `untrained`; `ban`) is the P5 ledger's input (`events(since)`).
+  event with per-rollout match and token counts; rejected -> unpaid; with a class it is logged as a failed verdict). `rl_events` (`first_scan` 25 % payable: at once when not drawn, at pass when
+  drawn; `first_scan_forfeited`; `trained`; `untrained`; `ban`, the operator's) is the P5 ledger's input (`events(since)`).
 - Quota: in and out of zone are delivered (`record_submission`); a group refused for integrity (bad termination,
   tampered span, too long, out of vocab, unscorable) closes the lease, records no scan, and halves the quota
   (`record_expiry(cause="rejected")`). A schema error (indices, decode) is refused before the lease is touched; a
   grader outage answers 503 with the lease still open.
 - Resolved ambiguities: probation counts PASSED audits (decisions-doc rule in force), not submitted groups; training
-  verdicts count in the recidivism window, never as probation passes; an inconclusive audit forfeits the first-scan
+  verdicts never count as probation passes; an inconclusive audit forfeits the first-scan
   pay without sanction. Since the 10-16 review: `/rl/submit` holds the lease from arrival (`RlSubmissions.hold`,
   `LeaseBook.hold_submission`): ownership is checked before a grading slot (4 global, 2 per hotkey) and the sweep
   skips a held lease, so an on-time group is never lost to grading delay. The route reads the hotkey from the
   `X-Reliquary-Hotkey` header and checks its registration before reading or inflating the body (8 reads, 2 per
   hotkey), then authenticates in its own preauth pool. Audits: match = `rl_draw.rollout_rate` (the trainer's);
   under 30 drawn positions the audit abstains as a `suspect` inconclusive; a rollout under `RL_FORGERY_MATCH_FLOOR`
-  (0.5) fails the group; a failure at lag > `RL_SANCTION_MAX_LAG` (2) is inconclusive with its lag in `rl_audits`;
+  (0.5) fails the group; a failure is unpaid, re-opens probation and never bans (lag kept in `rl_audits`);
   suspect inconclusives (abstention, `AUDIT_MAX_ATTEMPTS` raising forwards, counted in `rl_audits.attempts`) are
   logged as `inconclusive` verdicts that re-open probation; a first scan under `RL_FIRST_SCAN_MIN_TOKENS` (1024)
   model tokens is forfeited.
@@ -720,7 +720,7 @@ over the module-level `batcher.admission_problem_materials`, shared with P3).
 New code next to the window path (`emission_price`, `settlement`, `rl_pay`, `weight_only` unchanged).
 
 - `validator/rl_ledger.py`: `RlPayLedger` reads `RlSubmissions.events(since)` (cursor persisted) into `rl_accruals`
-  (same SQLite file). `trained`: flat pay, matched tokens of every rollout with match >= `floor` (0.95; re-checked
+  (same SQLite file). `trained`: flat pay, matched tokens of every rollout with match >= `floor` (0.90; re-checked
   even though the trainer masks them) x the env's price per token at ingestion. Matched tokens = the trainer's
   exact counts (`report_training(..., matched_tokens=[...])`, new optional argument, bounded by the completion
   length), else `floor(match x completion tokens)`. `first_scan`: `fraction` (0.25) x **an in-zone group's pay**,
@@ -739,10 +739,12 @@ New code next to the window path (`emission_price`, `settlement`, `rl_pay`, `wei
   once the async RL task is declared with `params.settlement = "period-ema-v1"`; no window archive is needed.
 - `validator/rl_price.py`: `AsyncPriceController` keeps the window controller's `PriceParams` (base =
   production values with `cap = 4.0`), `PriceState`, `PriceDecision` and walk; ticks on the validator's timer
-  (`tick_s` 300 s, `due`). Trainer speed (`note_speed` per step: completion tokens / seconds worked, sums decayed
-  with a one-tick half-life, `rl_trainer_speed`); per env r = queued tokens per second (`drain_arrivals`) /
-  (target share x speed): r < `low` (0.95) rises x1.10, r > `high` (1.15) or refused by the global cap
-  (`LeaseBook.drain_full`) descends (`decay` scaled to the tick), else holds; no speed for `stale_ticks` (3): hold.
+  (`tick_s` 300 s, `due`). From `TrainingBuffer.drain_tick`: trainer speed = tokens taken / seconds not waiting
+  (sums decayed with a one-tick half-life, `rl_trainer_speed`; a waiting trainer keeps its speed); per env r =
+  queued tokens per second / (target share x speed): r < `low` (0.90) rises x1.05, r > `high` (1.10) or refused by
+  the global cap (`LeaseBook.drain_full`, r >= `low`) descends (`decay` scaled to the tick), else holds. Guards:
+  any cap refusal in the tick -> no rise; waited > `starved` (5 %) of the tick -> no descent; neither took nor
+  waited for `stale_ticks` (3): hold.
   Clamped to [0.05, 4.0]. Per-token price = multiplier x cap x target share / `planned_tokens_per_period` (at 1, the planned
   consumption at target mix pays exactly the cap). Snap and breaker dropped (no window to fill). State in
   `rl_prices` (restart-safe).
@@ -816,9 +818,10 @@ One branch carries the whole async RL work on top of current main.
 - Audit `ProofForward` (`validator/rl_audit.py`): per rollout, `verifier.proof_forward_rows` (the proof path's
   batch-1 forward and lazy fp32 head, now shared with `verify_commitment_proofs`) and the verifier's
   `_gpu_seed_consistency_diagnostics` with `draw_uniforms(i)`, force span excluded. Match = exact / stochastic.
-  Pooled match under `RL_ROLLOUT_MATCH_FLOOR` (0.95 placeholder, also the ledger's floor) -> `statistical`; a
-  rollout on the draw (match >= floor) with more than `RL_AUDIT_FORGERY_MISMATCH_TOLERANCE` (1) hard mismatches at
-  near-deterministic positions -> `deterministic`; no model -> `passed=None`. Hook: `run_rl_audits(model,
+  Pooled match under `RL_ROLLOUT_MATCH_FLOOR` (0.90 placeholder, also the ledger's floor) -> `statistical`; a
+  rollout on the draw (match >= floor) with more than `RL_AUDIT_FORGERY_MISMATCH_TOLERANCE` (1) hard mismatches
+  at near-deterministic positions per started block of `RL_AUDIT_FORGERY_MISMATCH_POSITIONS` (4096) of them
+  (`mismatch_allowance`) -> `deterministic`; no model -> `passed=None`. Hook: `run_rl_audits(model,
   submissions, limit=8)`, to schedule from the service with its verify model.
 
 ### Remaining
@@ -1009,9 +1012,9 @@ task declared for period settlement refuses to start in window mode).
   resumes) = `train_step`'s metrics + the gate's `async/*` + `async/wait_s`, `train_s`, `step_s`, `snapshot_s`,
   `publish_wait_s`, completion tokens and tokens/s, peak GPU memory, the last publication (`publish_s`,
   `delta_bytes`); a skipped step's rows ride on the next one. `...-controller` (`rl_metrics.controller_metrics`,
-  every 60 s): price multiplier and supply / demand / ratio per env, buffer per env and state, leases (open,
+  every 60 s): price multiplier, ratio, supply, demand, trainer speed and wait per env, buffer per env and state, leases (open,
   closed in the minute by state, issued per env), arrived groups per env and verdict, events, audit verdicts and
-  queue, pay accrued per kind, active and banned miners, mean quota cap, trainer speed.
+  queue, pay accrued per kind, active and banned miners, mean quota cap.
 - Smoke test `tests/unit/test_rl_async_service.py::test_end_to_end_lease_submit_train_pay_and_sync` (CPU, < 1 s):
   uvicorn on a socket, `mine-async`'s `AsyncMiner` with `HttpRlTransport` and a fake generator, checkpoint 0 synced
   from `/rl/checkpoint`, leases -> submissions (in zone and 0/16) -> buffer and probation audits (inconclusive),
@@ -1128,18 +1131,21 @@ the controller (both are additive; the transport hash changes with this release 
   `train_step(..., gate=DrawGate)`; `report_training` for every group; a checkpoint every
   `steps_per_checkpoint` (N, default 1): CPU snapshot on the step path, `DeltaPublisher.publish` +
   `LeaseBook.adopt_checkpoint(k+1)` in a one-deep publish thread (an error stops the loop at the next
-  publication); `BackgroundHfBackup.submit` every `hf_backup_every` (M) steps; `prices.note_speed(completion tokens, seconds
-  worked)` per step. Health skip: groups reported untrained, unsanctioned. Crash: groups released.
+  publication); `BackgroundHfBackup.submit` every `hf_backup_every` (M) steps. Health skip: groups reported untrained, unsanctioned. Crash: groups released.
 - Verification in the training forward (`training.py`, `gate=None` keeps the window path as it was): per
   micro-batch the substitution forward gives v* and per-rollout tallies (stochastic / drawn, matches); pi_old :=
   the policy (ratio 1); rollouts under `RL_ROLLOUT_MATCH_FLOOR` (constants, 0.95 placeholder; the ledger's floor)
   leave the loss before the backward. Rollout match = rate on stochastic positions when >= 20 of them, else on
-  every drawn position. After all micro-batches `DrawGate.judge` pools each group (FSDP2: tallies all-reduced) at
+  every drawn position. The forward also gives each mismatch's Gumbel gap (`forced_sampling.gumbel_gaps`): a
+  rollout with a gap over `gap_tolerance` (`RL_GAP_TOLERANCE`) leaves the loss too, and its mismatches over
+  `substitute_gap` (`RL_SUBSTITUTE_GAP`) go with the report as `substitutions` (FSDP2: all-gathered in `judge`);
+  `RlSubmissions.report_training` re-grades those rollouts with the picks (`_rewards_hold`) and reports a group
+  whose reward moved untrained, unsanctioned (`reward_moved`). Telemetry `async/gap_max`, `rollouts_gap_over_*`,
+  `rollouts_regraded`. After all micro-batches `DrawGate.judge` pools each group (FSDP2: tallies all-reduced) at
   `ASYNC_GROUP_FLOOR` 0.90 (placeholder: one noisy honest rollout of 16 survives, two bad ones do not; one under
   `ASYNC_FORGERY_FLOOR` 0.5 rejects the group whatever the pool); a failed group's
   admitted rollouts are backed out by a second pass with negated advantages (exact up to bf16 noise; only failed
-  groups pay it). Accepted: paid matched tokens of admitted rollouts; rejected: `statistical` when lag <=
-  `sanction_max_lag` (2), else unsanctioned. Telemetry: train/* plus `async/` checkpoint, lag, buffer depth,
+  groups pay it). Accepted: paid matched tokens of admitted rollouts; rejected: unpaid, unsanctioned. Telemetry: train/* plus `async/` checkpoint, lag, buffer depth,
   waits, batch groups per env, forwarded / below-floor rollouts, accepted / rejected / undone groups. Groups are
   reported (payable) before their checkpoint is published: a step lost to a crash keeps its pay (deliberate).
 - Known approximations: masked rollouts stay in their env's planned token denominator; with N > 1 the forward
