@@ -31,6 +31,9 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 ABORT_REPLAYS = 1
+# A rollout whose open a full machine refused (signed receipt: its engagement is free again) is opened again after
+# this wait, doubled up to the cap, until the lease's deadline: a lease takes all 16 of its episodes.
+OPEN_RETRY_S, OPEN_RETRY_MAX_S = 15.0, 120.0
 
 
 class EpisodeLeaseFailed(RuntimeError):
@@ -129,18 +132,25 @@ class EpisodeLeaseGenerator:
 
         async def one(index: int):
             binding = LeaseDrawBinding(lease.nonce, int(lease.prompt_idx), int(lease.checkpoint), index)
-            for replay in range(ABORT_REPLAYS + 1):
+            replays, wait = 0, OPEN_RETRY_S
+            while True:
                 played = await play_bound(runner, self._engine, self._draws, index, binding,
                                           getattr(runner, "deadline", None), label=label)
                 if played is None:
                     return None
                 result, session = played
-                if (not result.ok and getattr(result, "final_status", None) == "aborted"
-                        and replay < ABORT_REPLAYS):
+                status = None if result.ok else getattr(result, "final_status", None)
+                if status == "open_refused":
+                    logger.info("rollout %d of %s: its machine refused the open; opened again in %.0f s",
+                                index, label, wait)
+                    await asyncio.sleep(wait)
+                    wait = min(wait * 2, OPEN_RETRY_MAX_S)
+                    continue
+                if status == "aborted" and replays < ABORT_REPLAYS:
+                    replays += 1
                     logger.info("rollout %d of %s aborted by its machine: played again", index, label)
                     continue
                 return SimpleNamespace(seed_index=index, result=result, session=session)
-            return None
 
         async with runner:
             outcomes = await asyncio.gather(*(one(i) for i in range(self.rollouts)), return_exceptions=True)

@@ -452,8 +452,9 @@ class _Result:
 
 
 class _Runner:
-    def __init__(self, fail=None, abort_once=()):
+    def __init__(self, fail=None, abort_once=(), refused=None):
         self.fail, self.abort_once, self.runs, self.results = fail, set(abort_once), [], []
+        self.refused = dict(refused or {})                  # index -> how many opens a full machine refuses
 
     async def __aenter__(self):
         return self
@@ -467,6 +468,9 @@ class _Runner:
         if index in self.abort_once:
             self.abort_once.discard(index)
             return _Result(index, ok=False, final_status="aborted")
+        if self.refused.get(index):
+            self.refused[index] -= 1
+            return _Result(index, ok=False, final_status="open_refused")
         result = _Result(index)
         self.results.append(result)
         return result
@@ -500,10 +504,13 @@ def test_the_episode_generator_plays_every_rollout_bound_to_the_lease(monkeypatc
             "agent_completed")), None
 
     monkeypatch.setattr(episode_commit, "episode_admissible", admissible)
+    from reliquary.miner import rl_async_episodes
+
+    monkeypatch.setattr(rl_async_episodes, "OPEN_RETRY_S", 0.0)
     runners = []
 
     def factory(policy, held, text):
-        runners.append(_Runner(abort_once={2}))
+        runners.append(_Runner(abort_once={2}, refused={7: 3}))
         return runners[-1]
 
     policy = SimpleNamespace(environment="ep", refuse=False)
@@ -515,6 +522,7 @@ def test_the_episode_generator_plays_every_rollout_bound_to_the_lease(monkeypatc
     assert group[5].tokens == (5, 5, 5, 5, 99, 99, 5) and group[5].spans == ((0, 4), (6, 7))
     assert group[5].transcript == {"token": {"i": 5}}
     assert sorted(runners[0].runs).count(2) == 2                        # a machine-signed abort is played again
+    assert sorted(runners[0].runs).count(7) == 4                        # a refused open is opened again
     assert bound["s3"] == LeaseDrawBinding(NONCE, 4, 2, 3)
     assert all(r.submitted_called for r in runners[0].results)
     payload = encode_submission(lease, group)

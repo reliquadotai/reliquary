@@ -570,9 +570,10 @@ class SignedSweEpisodeRunner:
             result = await runner.run(token=grant["token"], prompt=self._source.prompt(index),
                                       on_trace=on_trace)
         except Exception as exc:  # no episode result, no transcript
-            await self._end(session_id, slot, "open_failed", None,
-                            open_refusal=open_refusal_of(exc) if self.forwards_open_refusal else None)
-            return EpisodeResult(None, "", None, False, None, error=_describe(exc))
+            receipt = open_refusal_of(exc) if self.forwards_open_refusal else None
+            await self._end(session_id, slot, "open_failed", None, open_refusal=receipt)
+            return EpisodeResult(None, "", None, False, None, error=_describe(exc),
+                                 final_status="open_refused" if receipt is not None else None)
         except BaseException:
             # Cancelled (the episode's deadline, the miner stopping): report it, briefly.
             await self._end(session_id, slot, "open_failed", None, bounded=True)
