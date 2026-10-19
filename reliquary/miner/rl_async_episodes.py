@@ -52,6 +52,7 @@ class EpisodeLeaseGenerator:
         self._renderer_for, self._task_prompt, self._load = renderer_for, task_prompt, load_weights
         self.rollouts = int(rollouts)
         self._renderers: dict[str, Any] = {}
+        self._running: dict[str, asyncio.Task] = {}
 
     def generate(self, leases) -> list:
         raise RuntimeError("episodes are played on the event loop: call agenerate")
@@ -68,6 +69,37 @@ class EpisodeLeaseGenerator:
                 else result if isinstance(result, EpisodeLeaseFailed)
                 else EpisodeLeaseFailed(f"lease {lease.lease_id[:12]}: {result!r}")
                 for lease, result in zip(leases, results)]
+
+    async def aadvance(self, leases: Sequence[Any], budget_s: float) -> list[tuple[str, Any]]:
+        """Continuous play (``AsyncMiner._stream_once``): start ``leases``, each in a task of its own, wait about
+        ``budget_s`` for any running lease to end, return the ended ones as ``(lease id, episodes or its
+        EpisodeLeaseFailed)``. A long lease never holds the others back."""
+        ensure = getattr(self._engine, "ensure_serving", None)
+        if leases and ensure is not None:
+            await ensure()
+
+        async def play(lease):
+            try:
+                return await self.play_lease(lease)
+            except EpisodeLeaseFailed as failed:
+                return failed
+            except Exception as exc:
+                return EpisodeLeaseFailed(f"lease {lease.lease_id[:12]}: {exc!r}")
+
+        for lease in leases:
+            self._running[lease.lease_id] = asyncio.create_task(play(lease))
+        if not self._running:
+            return []
+        await asyncio.wait(list(self._running.values()), timeout=budget_s, return_when=asyncio.FIRST_COMPLETED)
+        done = [(lease_id, task.result()) for lease_id, task in self._running.items() if task.done()]
+        for lease_id, _ in done:
+            del self._running[lease_id]
+        return done
+
+    def abort(self) -> None:
+        for task in self._running.values():
+            task.cancel()
+        self._running.clear()
 
     def load_weights(self, state: Mapping[str, Any], version: int) -> None:
         if self._load is None:
@@ -307,6 +339,32 @@ class MixedGenerator:
         for group_leases, groups in zip([x for x in (played, drawn) if x], results):
             by_id.update({lease.lease_id: group for lease, group in zip(group_leases, groups)})
         return [by_id[lease.lease_id] for lease in leases]
+
+    async def aadvance(self, leases: Sequence[Any], budget_s: float) -> list[tuple[str, Any]]:
+        """Continuous play of both kinds: the episode leases through ``EpisodeLeaseGenerator.aadvance``, the others
+        through the single-turn generator's ``advance`` (in a worker thread), side by side."""
+        names = set() if self.episodes is None else set(self.episodes.policies)
+        played = [lease for lease in leases if lease.environment in names]
+        drawn = [lease for lease in leases if lease.environment not in names]
+        done: list[tuple[str, Any]] = []
+        if drawn and (self.single is None or not callable(getattr(self.single, "advance", None))):
+            done += [(lease.lease_id, EpisodeLeaseFailed(f"{lease.environment} cannot be played continuously here"))
+                     for lease in drawn]
+            drawn = []
+        jobs = []
+        if self.episodes is not None:
+            jobs.append(self.episodes.aadvance(played, budget_s))
+        if self.single is not None and callable(getattr(self.single, "advance", None)):
+            jobs.append(asyncio.to_thread(self.single.advance, drawn, budget_s))
+        for result in await asyncio.gather(*jobs):
+            done += list(result)
+        return done
+
+    def abort(self) -> None:
+        if self.episodes is not None:
+            self.episodes.abort()
+        if self.single is not None and callable(getattr(self.single, "abort", None)):
+            self.single.abort()
 
     def load_weights(self, state: Mapping[str, Any], version: int) -> None:
         if self.single is not None:

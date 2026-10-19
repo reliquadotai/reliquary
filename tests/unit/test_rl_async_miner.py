@@ -565,6 +565,37 @@ async def test_a_long_group_does_not_hold_back_the_others():
     assert slow.lease_id in {s["lease_id"] for s in transport.submissions}
 
 
+class FakeEpisodeStream(FakeStreamGenerator):
+    """``aadvance`` on the event loop, as the episode generator plays leases; ``fail`` names leases that end
+    as their exception."""
+
+    def __init__(self, steps=None, fail=()):
+        super().__init__(steps=steps)
+        self.fail = set(fail)
+
+    async def aadvance(self, leases, budget_s):
+        done = self.advance(leases, budget_s)
+        return [(lease_id, RuntimeError("unusable") if lease_id in self.fail else group) for lease_id, group in done]
+
+    def abort(self):
+        self.running.clear()
+
+
+async def test_episode_leases_are_played_continuously_and_a_failed_one_alone_is_given_up():
+    miner, transport, generator, _ = miner_for(generator=FakeEpisodeStream(), quota=4, batch_groups=2,
+                                               queue_groups=8)
+    await miner.refresh_quota()
+    await miner.lease_more()
+    ordered = sorted(miner.queue, key=lambda lease: lease.expires_at)
+    generator.steps = {ordered[0].prompt_idx: 5}                    # a long lease
+    generator.fail = {ordered[1].lease_id}
+    for _ in range(3):
+        await miner.generate_once()
+    await miner.drain()
+    assert ordered[0].lease_id in miner.running                     # still playing, the slot beside it went on
+    assert miner.stats["forfeited"] == 1 and len(transport.submissions) == 2
+
+
 async def test_new_weights_wait_for_the_running_groups():
     miner, transport, generator, _ = streaming(quota=8, batch_groups=2)
     await miner.refresh_quota()

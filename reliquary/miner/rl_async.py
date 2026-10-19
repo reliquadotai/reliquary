@@ -727,18 +727,28 @@ class AsyncMiner:
         if new:
             self._wake_lease.set()                                 # the queue has room again
         try:
-            done = await asyncio.to_thread(self.generator.advance, new, STREAM_STEP_S)
+            aadvance = getattr(self.generator, "aadvance", None)          # episodes: played on the event loop
+            done = (await aadvance(new, STREAM_STEP_S) if callable(aadvance)
+                    else await asyncio.to_thread(self.generator.advance, new, STREAM_STEP_S))
         except Exception:
             logger.exception("continuous generation of %d running leases failed", len(self.running))
             failed = list(self.running.values())
             self.running.clear()
             with contextlib.suppress(Exception):
-                await asyncio.to_thread(self.generator.abort)
+                if callable(aadvance):
+                    self.generator.abort()                 # its tasks live on this loop
+                else:
+                    await asyncio.to_thread(self.generator.abort)
             self._retry(failed)
             return 0
         for lease_id, rollouts in done:
             lease = self.running.pop(lease_id, None)
             if lease is None:
+                continue
+            if isinstance(rollouts, BaseException):          # that lease alone failed, for good (e.g. episodes)
+                logger.error("lease %s given up: %s", lease_id[:12], rollouts)
+                self._close(lease)
+                self._forfeit(lease)
                 continue
             if len(rollouts) != ROLLOUTS:
                 logger.error("lease %s came back with %d rollouts", lease_id[:12], len(rollouts))
@@ -750,7 +760,7 @@ class AsyncMiner:
     async def generate_once(self) -> int:
         """Swap weights if new ones are ready, then generate one batch and hand each group to its submission. A
         generator with ``advance`` is driven continuously instead (``_stream_once``)."""
-        if callable(getattr(self.generator, "advance", None)):
+        if callable(getattr(self.generator, "advance", None)) or callable(getattr(self.generator, "aadvance", None)):
             return await self._stream_once()
         await self.swap_if_ready()
         if self.loaded_version is None:
