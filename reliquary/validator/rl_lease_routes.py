@@ -252,7 +252,8 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
                           verify_mine: Callable[..., bool] = verify_rl_lease_mine_signature,
                           verify_forfeit: Callable[..., bool] = verify_rl_lease_forfeit_signature,
                           pay=None, max_episode_body_bytes: int | None = None,
-                          admit: Callable[[str, int], Awaitable[tuple[str, dict] | None]] | None = None) -> APIRouter:
+                          admit: Callable[[str, int], Awaitable[tuple[str, dict] | None]] | None = None,
+                          gpu_registry=None) -> APIRouter:
     """``max_episode_body_bytes``: the inflated ``/rl/submit`` body an episode group may send (None: no episode
     env served; every body within ``MAX_SUBMIT_BODY_BYTES``). A single-turn group stays within
     ``MAX_SUBMIT_BODY_BYTES`` either way. Bodies may be gzipped (``Content-Encoding: gzip``). ``admit(env,
@@ -346,6 +347,15 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
                 return _refusal("lease_busy", {"max_concurrent": MAX_PREAUTH}, retry_s)
             async with preauth:
                 request, hotkey = await authenticate(raw)
+            gpu_admission = None
+            if gpu_registry is not None:
+                from reliquary.validator.gpu_registry import AdmissionError
+
+                try:
+                    gpu_admission = await asyncio.to_thread(gpu_registry.require_admission, hotkey)
+                except AdmissionError as exc:
+                    return JSONResponse({"reason": exc.reason}, status_code=exc.status,
+                                        headers={"Cache-Control": "no-store"})
             prompts, unplaced = tuple(request.prompt_ids), {}
             if admit is not None and prompts:
                 verdicts = await asyncio.gather(*(admit(request.environment, int(p)) for p in prompts))
@@ -360,6 +370,9 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
             answer.refused.update(unplaced)
             now = float(clock())
             content = answer.to_dict()
+            if gpu_registry is not None:
+                await asyncio.to_thread(gpu_registry.bind_leases, hotkey, answer.leases, gpu_admission)
+                content["gpu_admission"] = gpu_admission
             # SQLite reads under the book's lock: off the event loop, like every other book call
             latest, granted, in_use = await asyncio.to_thread(
                 lambda: (book.latest_checkpoint, book.quota.quota(hotkey, now), book.in_use(hotkey)))
@@ -386,6 +399,11 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
             state = book.quota.state(address, now)
             state.update(in_use=book.in_use(address), max_lag=book.config.max_lag, latest=book.latest_checkpoint,
                          lease_expiry_s=expiry_map())
+            if gpu_registry is not None:
+                # Public quota stays aggregate; hardware details require a signed /gpu/status.
+                gpu = gpu_registry.status(address)
+                state["gpu_admission"] = {k: gpu[k] for k in
+                                          ("mode", "attested", "admission_allowed", "execution_attested")}
             return state
 
         return _answer(await asyncio.to_thread(read))

@@ -190,9 +190,13 @@ def test_the_validator_server_mounts_the_lease_routes(served):
     server.mount_rl_lease_router(build_rl_lease_router(
         book=served, collector=LeaseCollector(served, interval_s=0.0), validator_hotkey=VALIDATOR.ss58_address,
         clock=lambda: float(NOW)))
-    paths = {getattr(route, "path", "") for route in server.app.routes}
-    assert {"/rl/lease", "/rl/quota", "/rl/lease/commitments", "/rl/prompts/state"} <= paths
-    assert "/rl/submit" not in paths                                  # mounted only with a submission path
+    # FastAPI may include routers lazily: verify HTTP behaviour, not its private route layout.
+    client = TestClient(server.app)
+    assert client.post("/rl/lease", json=body()).status_code == 200
+    assert client.get("/rl/quota", params={"hotkey": MINER.ss58_address}).status_code == 200
+    assert client.get("/rl/lease/commitments").status_code == 200
+    assert client.get("/rl/prompts/state").status_code == 200
+    assert client.post("/rl/submit", json={}).status_code == 404       # mounted only with a submission path
 
 
 def submit_body(keypair, lease_id, rollouts, *, at=NOW, hotkey=None, path="/rl/submit"):

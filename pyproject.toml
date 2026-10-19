@@ -41,6 +41,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gpu-attestation = [
+    # Used on CPU validators only when RELIQUARY_RL_GPU_ADMISSION is enabled.
+    "PyJWT[crypto]==2.15.1",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",

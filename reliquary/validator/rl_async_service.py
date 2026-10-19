@@ -196,8 +196,11 @@ class RlAsync:
     board: Any = None
     observations: Any = None                    # rl_observations.ObservationBoard (None: /rl/observations 503s)
     sandbox: Any = None                         # rl_async_episodes.RlLeaseSandbox (episode envs only)
+    gpu_registry: Any = None                    # optional NVIDIA hardware admission, not execution attestation
 
     def close(self) -> None:
+        if self.gpu_registry is not None:
+            self.gpu_registry.close()
         self.book.close()
 
 
@@ -349,7 +352,11 @@ def mount_rl_async(server, rl: RlAsync, *, validator_hotkey: str, registration=N
     router = build_rl_lease_router(book=rl.book, collector=rl.collector, validator_hotkey=validator_hotkey,
                                    registration=registration, clock=clock, submissions=rl.submissions,
                                    pay=rl.ledger, max_episode_body_bytes=episode_body_cap(rl.settings),
-                                   admit=lambda env, idx: _lease_admission(rl, env, idx))
+                                   admit=lambda env, idx: _lease_admission(rl, env, idx), gpu_registry=rl.gpu_registry)
+    if rl.gpu_registry is not None:
+        from reliquary.validator.rl_gpu_routes import build_gpu_router
+
+        router.include_router(build_gpu_router(rl.gpu_registry, registration=registration))
 
     @router.get("/rl/checkpoint")
     async def rl_checkpoint():
@@ -673,6 +680,14 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     state_dir = _validator_state_dir()
     state_dir.mkdir(parents=True, exist_ok=True)
     rl = build_rl_async(settings, path=state_dir / DB_NAME, grader=grader, prompt_range=ranges)
+    from reliquary.validator.gpu_registry import registry_from_env
+
+    try:
+        rl.gpu_registry = registry_from_env(state_dir / "rl-gpu-admission.sqlite3", validator=validator_hotkey,
+                                            run=settings.run)
+    except BaseException:
+        rl.close()
+        raise
     from reliquary.validator import telemetry
 
     telemetry.init(validator_hotkey, {"task_id": settings.task_id, "run": settings.run, "cap": cap,
