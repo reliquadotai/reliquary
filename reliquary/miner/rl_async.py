@@ -764,15 +764,23 @@ class AsyncMiner:
             agenerate = getattr(self.generator, "agenerate", None)       # episodes: played on the event loop
             groups = (await agenerate(batch) if agenerate is not None
                       else await asyncio.to_thread(self.generator.generate, batch))
-            if len(groups) != len(batch) or any(len(g) != ROLLOUTS for g in groups):
+            if len(groups) != len(batch) or any(not isinstance(g, BaseException) and len(g) != ROLLOUTS
+                                                for g in groups):
                 raise ValueError(f"the generator must return {ROLLOUTS} rollouts per lease")
         except Exception:
             logger.exception("generation of %d leases failed", len(batch))
             self._retry(batch)
             return 0
+        done = 0
         for lease, rollouts in zip(batch, groups):
+            if isinstance(rollouts, BaseException):          # that lease alone failed, for good (e.g. episodes)
+                logger.error("lease %s given up: %s", lease.lease_id[:12], rollouts)
+                self._close(lease)
+                self._forfeit(lease)
+                continue
             self._hand_over(lease, rollouts, version)
-        return len(batch)
+            done += 1
+        return done
 
     # --- submission ----------------------------------------------------------------------------------
     async def submit(self, lease: HeldLease, rollouts: Sequence[Sequence[int]], k_generated: int) -> bool:

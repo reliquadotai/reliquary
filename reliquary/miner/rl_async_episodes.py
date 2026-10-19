@@ -56,17 +56,18 @@ class EpisodeLeaseGenerator:
     def generate(self, leases) -> list:
         raise RuntimeError("episodes are played on the event loop: call agenerate")
 
-    async def agenerate(self, leases: Sequence[Any]) -> list[list[Any]]:
-        """Every lease's ``ROLLOUTS`` episodes (``EpisodeRollout``), leases played side by side. Raises when any
-        lease fails (the miner's generation retry, then the lease is given up)."""
+    async def agenerate(self, leases: Sequence[Any]) -> list[Any]:
+        """Every lease's ``ROLLOUTS`` episodes (``EpisodeRollout``), leases played side by side. A lease that fails
+        comes back as its ``EpisodeLeaseFailed``, the others' episodes are kept: a lease's sessions are single-use,
+        so it cannot be played again and the miner gives it up (``AsyncMiner.generate_once``)."""
         ensure = getattr(self._engine, "ensure_serving", None)
         if ensure is not None:
             await ensure()                    # the loopback generate endpoint, served on this loop once
         results = await asyncio.gather(*(self.play_lease(lease) for lease in leases), return_exceptions=True)
-        for lease, result in zip(leases, results):
-            if isinstance(result, BaseException):
-                raise EpisodeLeaseFailed(f"lease {lease.lease_id[:12]}: {result}") from result
-        return list(results)
+        return [result if not isinstance(result, BaseException)
+                else result if isinstance(result, EpisodeLeaseFailed)
+                else EpisodeLeaseFailed(f"lease {lease.lease_id[:12]}: {result!r}")
+                for lease, result in zip(leases, results)]
 
     def load_weights(self, state: Mapping[str, Any], version: int) -> None:
         if self._load is None:

@@ -496,8 +496,8 @@ def test_the_episode_generator_plays_every_rollout_bound_to_the_lease(monkeypatc
     payload = encode_submission(lease, group)
     assert payload["rollouts"][5]["episode"]["spans"] == [[0, 4], [6, 7]]
     policy.refuse = True                                                 # one rollout unusable: the lease fails
-    with pytest.raises(EpisodeLeaseFailed):
-        asyncio.run(generator.agenerate([lease]))
+    (failed,) = asyncio.run(generator.agenerate([lease]))
+    assert isinstance(failed, EpisodeLeaseFailed)
     assert all(r.released for r in runners[1].results)
 
 

@@ -278,6 +278,24 @@ async def test_a_failed_generation_is_retried_once_then_given_up():
     assert miner.stats["forfeited"] == 1 and transport.open == {}          # the validator frees its slot now
 
 
+async def test_a_lease_that_failed_alone_is_given_up_and_its_batch_mates_are_submitted():
+    """Episodes: a lease's sessions are single-use, so a failed lease comes back as its exception, is given up at
+    once (no replay) and the other leases of the batch keep their groups."""
+    miner, transport, generator, _ = miner_for(quota=2)
+    plain = generator.generate
+
+    async def agenerate(leases):
+        groups = plain(leases)
+        return [RuntimeError("rollout 3: unusable") if i == 0 else g for i, g in enumerate(groups)]
+
+    generator.agenerate = agenerate
+    await miner.refresh_quota()
+    await miner.lease_more()
+    assert await miner.generate_once() == 1 and miner.queue == []
+    await miner.drain()
+    assert miner.stats["forfeited"] == 1 and miner.stats["submitted"] == 1 and transport.open == {}
+
+
 async def test_open_leases_survive_a_restart(tmp_path):
     clock = Clock()
     miner, transport, _, _ = miner_for(quota=2, clock=clock, state_dir=str(tmp_path))
