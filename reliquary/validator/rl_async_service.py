@@ -558,16 +558,19 @@ def load_episode_environments(settings: RlAsyncSettings, *, build_source=None) -
 
 
 def renderer_for_checkpoint(checkpoint: str) -> Callable[[Any], Any]:
-    """The turn renderer of the run's tokenizer over a policy's tools (the window validator's, one per tool set)."""
+    """The turn renderer of the run's tokenizer over a policy's harness, tools and surface variant (one per
+    combination; variant 0 and no harness: the window validator's)."""
     renderers: dict[tuple, Any] = {}
 
-    def renderer_for(policy):
-        from reliquary.environment.agentic_swe import load_turn_renderer
+    def renderer_for(policy, variant: int = 0):
+        from reliquary.environment.agentic_swe import harness_of, load_turn_renderer, policy_harness_pin
 
-        tools = tuple(policy.tools)
-        if tools not in renderers:
-            renderers[tools] = load_turn_renderer(str(checkpoint), tools=tools)
-        return renderers[tools]
+        tools, pin = tuple(policy.tools), policy_harness_pin(policy)
+        key = (tools, None if pin is None else (pin["id"], pin["version"]), int(variant))
+        if key not in renderers:
+            renderers[key] = load_turn_renderer(str(checkpoint), tools=tools, spec=harness_of(pin),
+                                                variant=int(variant))
+        return renderers[key]
 
     return renderer_for
 

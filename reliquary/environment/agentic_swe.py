@@ -18,14 +18,22 @@ import threading
 from collections.abc import Sequence
 
 from reliquary_harness import qwen as _harness_qwen
+from reliquary_harness.spec import BASH_SURFACE_V1, VERIFIERS_COMMIT, get_spec
 from reliquary_harness.spec import BASH_VF_B2E4E81 as HARNESS
-from reliquary_harness.spec import VERIFIERS_COMMIT
+from reliquary_harness.variant import variant_count, variant_index
 
 from reliquary.environment.agentic.types import EpisodeTask
 
-HARNESS_DIGEST = "2ee2f8c4c7b81ba70c97544ea86508c8212d5dc83c743ab8d3c973735dbb1a23"
+HARNESS_DIGEST = "18e24ae04528c3953469e3a82db41f3de8db36fce4864eecb16bf2503961e307"
 """The bash harness this build renders, checks and mines with (`HARNESS.digest`): an
 installed reliquary-harness with another digest is not this build's harness."""
+HARNESS_DIGESTS = {
+    HARNESS.key: HARNESS_DIGEST,
+    BASH_SURFACE_V1.key: "40d92dcf334950ff2216970216637435cf5331c93c240308f36dc20620c6d0eb",
+}
+"""Every harness spec this build serves, by `id@version`, at the digest it was built against.
+A job or an RL episode env names one with `{id, version, digest}`; one naming none is
+`bash-vf-b2e4e81@1`."""
 SUPPORTED_RENDERER = HARNESS.renderer
 RENDERERS_VERSION = SUPPORTED_RENDERER.rsplit("@", 1)[1]
 SUPPORTED_VERIFIERS = VERIFIERS_COMMIT
@@ -62,10 +70,53 @@ def with_network_notice(content: str) -> str:
 
 def harness_refusal() -> str | None:
     """Why the installed reliquary-harness is not this build's harness, or None."""
-    if HARNESS.digest != HARNESS_DIGEST:
-        return (f"reliquary-harness {HARNESS.key} is installed with digest {HARNESS.digest}, "
-                f"this build needs {HARNESS_DIGEST}")
+    for key, pinned in HARNESS_DIGESTS.items():
+        installed = get_spec(*key.split("@", 1)).digest
+        if installed != pinned:
+            return (f"reliquary-harness {key} is installed with digest {installed}, "
+                    f"this build needs {pinned}")
     return None
+
+
+def harness_pin_refusal(pin, *, variants: bool) -> str | None:
+    """Why this build cannot serve a contract naming harness `pin` (`{id, version, digest}`,
+    or None for the compatibility harness), or None. `variants`: whether the caller draws a
+    surface variant per episode (an RL lease does; a corpus job has no validator seed, so it
+    plays the compatibility harness only). A refusal to serve, never a judgment."""
+    refusal = harness_refusal()
+    if refusal or pin is None:
+        return refusal
+    key = f"{pin['id']}@{pin['version']}"
+    if key not in HARNESS_DIGESTS:
+        return f"harness {key} is not one this build serves ({sorted(HARNESS_DIGESTS)})"
+    if pin["digest"] != HARNESS_DIGESTS[key]:
+        return f"the contract pins harness {key} at {pin['digest']}, this build serves {HARNESS_DIGESTS[key]}"
+    if not variants and variant_count(get_spec(pin["id"], pin["version"])) != 1:
+        return f"harness {key} draws surface variants per episode: an RL lease's, not a corpus job's"
+    return None
+
+
+def harness_of(pin):
+    """The spec a contract names (`{id, version, digest}`; None: the compatibility harness).
+    Callers checked it first (`harness_pin_refusal`)."""
+    return HARNESS if pin is None else get_spec(pin["id"], pin["version"])
+
+
+def policy_harness_pin(policy):
+    """An episode env policy's harness pin (`EpisodeEnvPolicy.harness_pin`), None when it names none."""
+    pin = getattr(policy, "harness_pin", None)
+    return pin() if callable(pin) else None
+
+
+def lease_variant(spec, lease) -> int:
+    """The surface variant every episode of an RL lease plays: drawn from the lease's draw
+    nonce (the validator's secret-derived, the miner cannot choose it), the lease and its
+    prompt, so the 16 rollouts of a group share it and both sides compute it alone. A spec
+    without axes has variant 0 only."""
+    if variant_count(spec) == 1:
+        return 0
+    return variant_index(spec, seed=str(lease.nonce), engagement=f"rl-lease:{lease.lease_id}",
+                         task_index=int(lease.prompt_idx))
 
 
 def _dist_commit(name: str) -> str | None:
@@ -117,7 +168,7 @@ def _renderers_version() -> str | None:
 def episode_support_refusal(episode, *, need_verifiers: bool) -> str | None:
     """Why this binary cannot serve `episode`, or None. ``need_verifiers`` for
     the processes that run episodes (miner, grade executor)."""
-    refusal = harness_refusal()
+    refusal = harness_pin_refusal(getattr(episode, "harness_spec", None), variants=False)
     if refusal:
         return refusal
     if episode.renderer != SUPPORTED_RENDERER:
@@ -290,7 +341,7 @@ def sandbox_support_refusal(episode, *, need_bridge: bool = False) -> str | None
 
     if getattr(episode, "sandbox", None) is None:
         return "the episode is not a signed_sandbox one"
-    refusal = harness_refusal()
+    refusal = harness_pin_refusal(getattr(episode, "harness_spec", None), variants=False)
     if refusal:
         return refusal
     try:
@@ -352,15 +403,19 @@ def _refused_span(exc: BaseException) -> BaseException:
 
 class QwenTurnRenderer(_harness_qwen.QwenTurnRenderer):
     """`trajectory_parse.TurnRenderer` over the pinned `renderers` Qwen3.8
-    renderer and the bash harness spec: reliquary-harness's renderer, refusing a span
-    the parser raises on with `TrajectoryRefused` (`bad_turns`)."""
+    renderer and a bash harness spec (default the compatibility one) in one of its surface
+    variants: reliquary-harness's renderer, refusing a span the parser raises on with
+    `TrajectoryRefused` (`bad_turns`)."""
 
-    def __init__(self, renderer, tools=("bash", "edit")) -> None:
-        super().__init__(renderer, tools, spec=HARNESS, refuse=_refused_span)
+    def __init__(self, renderer, tools=("bash", "edit"), *, spec=HARNESS, variant: int = 0) -> None:
+        super().__init__(renderer, tools, spec=spec, variant=variant, refuse=_refused_span)
 
 
-def load_turn_renderer(checkpoint_dir: str, tools=("bash", "edit")) -> QwenTurnRenderer:
+def load_turn_renderer(checkpoint_dir: str, tools=("bash", "edit"), *, spec=None,
+                       variant: int = 0) -> QwenTurnRenderer:
     """The renderer the train client builds for this checkpoint
     (`create_renderer(load_tokenizer(model), Qwen38RendererConfig())`), over the
-    job's tools."""
-    return QwenTurnRenderer(_harness_qwen.build_renderer(checkpoint_dir, HARNESS), tools=tools)
+    job's tools, in `spec`'s surface `variant` (default: the compatibility harness)."""
+    spec = spec or HARNESS
+    return QwenTurnRenderer(_harness_qwen.build_renderer(checkpoint_dir, spec), tools=tools, spec=spec,
+                            variant=variant)

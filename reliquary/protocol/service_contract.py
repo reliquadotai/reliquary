@@ -187,7 +187,18 @@ _ENV_PACKAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}==[A-Za-z0-9][A-Za-z
 
 def _validate_episode(name: str, env: dict) -> None:
     """The ``episode`` block of one v2 env: what record 0 must name, the limits, the session budgets."""
-    episode = _object(env["episode"], set(_EPISODE_FIELDS), f"{name}.episode")
+    raw = env["episode"]
+    fields = set(_EPISODE_FIELDS) | ({"harness"} if isinstance(raw, dict) and "harness" in raw else set())
+    episode = _object(raw, fields, f"{name}.episode")
+    if "harness" in episode:
+        # The reliquary-harness spec the episodes render with (absent: bash-vf-b2e4e81@1); whether a
+        # binary serves it is its own check (`agentic_swe.harness_pin_refusal`), refused, never judged.
+        from reliquary.corpus.job import parse_harness_spec
+
+        try:
+            parse_harness_spec(episode["harness"], f"{name}.episode.harness")
+        except ValueError as exc:
+            raise ServiceContractError(str(exc)) from None
     if episode["kind"] != EPISODE_CAPABILITY:
         raise ServiceContractError(f"{name}.episode.kind must be {EPISODE_CAPABILITY}")
     for field_name in ("sandbox_env", "split"):
@@ -231,9 +242,19 @@ class EpisodeEnvPolicy:
     max_episode_tokens: int
     budgets: tuple[tuple[str, int], ...]
     pool_seeds: int
+    harness: tuple[tuple[str, str], ...] | None = None
+    """The block's `harness` ({id, version, digest}) as sorted pairs; None: bash-vf-b2e4e81@1."""
 
     def budgets_dict(self) -> dict[str, int]:
         return dict(self.budgets)
+
+    def harness_pin(self) -> dict[str, str] | None:
+        return None if self.harness is None else dict(self.harness)
+
+
+def harness_pairs(episode: Mapping[str, Any]) -> tuple[tuple[str, str], ...] | None:
+    pin = episode.get("harness")
+    return None if pin is None else tuple(sorted((str(k), str(v)) for k, v in pin.items()))
 
 
 
@@ -481,7 +502,7 @@ class ServiceContract:
             max_turns=episode["max_turns"], max_tokens_per_turn=episode["max_tokens_per_turn"],
             max_episode_tokens=episode["max_episode_tokens"],
             budgets=tuple((field_name, episode["budgets"][field_name]) for field_name in EPISODE_BUDGET_FIELDS),
-            pool_seeds=env["sampling"]["pool_seeds"])
+            pool_seeds=env["sampling"]["pool_seeds"], harness=harness_pairs(episode))
 
     @property
     def episode_environments(self) -> tuple[str, ...]:

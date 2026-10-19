@@ -349,7 +349,7 @@ class SignedSweEpisodeRunner:
                  new_request_id: Callable[[], str] = lambda: uuid.uuid4().hex,
                  sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
                  monotonic: Callable[[], float] = time.monotonic,
-                 max_live: int = DEFAULT_MAX_LIVE_PER_JOB) -> None:
+                 max_live: int = DEFAULT_MAX_LIVE_PER_JOB, harness=None, variant: int = 0) -> None:
         from reliquary.environment.agentic_swe import job_signed_source
 
         if ss58_format_42(hotkey) != hotkey:
@@ -371,6 +371,9 @@ class SignedSweEpisodeRunner:
         self._runner_factory = runner_factory
         self._clock, self._new_request_id, self._sleep = clock, new_request_id, sleep
         self._monotonic = monotonic
+        # The harness spec and surface variant every episode of this runner plays (an RL lease's;
+        # None: the compatibility harness).
+        self._harness, self._variant = harness, int(variant)
         self._runners: dict[str, object] = {}
         self._runners_lock = asyncio.Lock()
         self._stack = AsyncExitStack()
@@ -411,7 +414,8 @@ class SignedSweEpisodeRunner:
                                     renderer_dir=self._renderer_dir, generate_url=self._generate_url,
                                     sampling=self._sampling,
                                     max_tokens=self._job.episode.max_tokens_per_turn,
-                                    max_turns=self._job.episode.max_turns)
+                                    max_turns=self._job.episode.max_turns,
+                                    spec=getattr(self, "_harness", None), variant=getattr(self, "_variant", 0))
 
     async def _runner(self, url: str):
         async with self._runners_lock:

@@ -86,6 +86,15 @@ def _same_arguments(signed: Any, sent: Mapping[str, Any]) -> bool:
         return False
 
 
+def _observation(renderer, body) -> str:
+    """The model's text for a signed call record: its rendering, in the renderer's surface variant's
+    observation format (a harness variant may show the signed exit code first)."""
+    text = render_observation(body)
+    if getattr(renderer, "observation_format", "plain") == "plain":
+        return text
+    return renderer.observation(body, text)
+
+
 def parse_signed_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int],
                             tokens: Sequence[int], spans: Sequence[tuple[int, int]], stop: str,
                             max_turns: int | None, calls: Sequence[Any],
@@ -169,7 +178,7 @@ def parse_signed_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int]
         if not pairs:
             raise TrajectoryRefused(REASON_BAD_OBSERVATION, {"turn": k, "why": "no tool call"})
         observations = [plan.observation if isinstance(plan, Refuse)
-                        else render_observation(take(k, position, plan).to_dict())
+                        else _observation(renderer, take(k, position, plan).to_dict())
                         for plan, position in zip(plans, positions)]
         expected = renderer.next_prompt(full[:offset + start], completion, observations)
         if expected is None or expected != full[:offset + spans[k + 1][0]]:

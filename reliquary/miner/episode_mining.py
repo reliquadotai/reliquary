@@ -558,6 +558,12 @@ def _episode_policies(contract, environments: Sequence[str], package_refusal) ->
         refusal = package_refusal(policy)
         if refusal:
             raise ValueError(f"{name}: {refusal}")
+        from reliquary.environment.agentic_swe import harness_pin_refusal, policy_harness_pin
+
+        # A window draws no surface variant: the order's harness must have one.
+        refusal = harness_pin_refusal(policy_harness_pin(policy), variants=False)
+        if refusal:
+            raise ValueError(f"{name}: {refusal}")
         policies[name] = policy
     return policies
 

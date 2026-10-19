@@ -58,7 +58,8 @@ class HarnessEpisodeRunner:
     `max_tokens` is the job's per-turn cap."""
 
     def __init__(self, *, gateway_url: str, model: str, renderer_dir: str, generate_url: str,
-                 sampling, max_tokens: int, max_turns: int, load_renderer=None, client=None) -> None:
+                 sampling, max_tokens: int, max_turns: int, load_renderer=None, client=None,
+                 spec=None, variant: int = 0) -> None:
         self._url = gateway_url
         self._model = model
         self._renderer_dir = renderer_dir
@@ -67,6 +68,8 @@ class HarnessEpisodeRunner:
                           "max_tokens": int(max_tokens)}
         self._max_turns = int(max_turns)
         self._load_renderer = load_renderer
+        # The harness spec (None: the compatibility one) and the surface variant played.
+        self._spec, self._variant = spec, int(variant)
         self._client = client
         self._renderers: dict[tuple[str, ...], Any] = {}
         self._renderers_lock = asyncio.Lock()
@@ -94,7 +97,11 @@ class HarnessEpisodeRunner:
                 load = self._load_renderer
                 if load is None:
                     from reliquary.environment.agentic_swe import load_turn_renderer as load
-                self._renderers[key] = await asyncio.to_thread(load, self._renderer_dir, tools=key)
+                if self._spec is None and self._variant == 0:
+                    self._renderers[key] = await asyncio.to_thread(load, self._renderer_dir, tools=key)
+                else:
+                    self._renderers[key] = await asyncio.to_thread(load, self._renderer_dir, tools=key,
+                                                                   spec=self._spec, variant=self._variant)
             return self._renderers[key]
 
     async def run(self, *, token: dict[str, Any], prompt: str, on_trace=None) -> HarnessEpisodeResult:
@@ -129,9 +136,18 @@ class HarnessEpisodeRunner:
                 async def generate(prompt_ids, bridged_from):
                     return await engine.turn(prompt_ids, session_id=trace.id, bridged_from=bridged_from)
 
+                async def answer(turn, calls, call_id):
+                    # The gateway's rendering of the signed record, in the variant's observation format;
+                    # a refused call (no record) is answered with its fixed text as is.
+                    before = len(router.records)
+                    text = await router.answer(turn, calls, call_id)
+                    if len(router.records) > before and getattr(renderer, "observation_format", "plain") != "plain":
+                        text = renderer.observation(router.records[-1]["body"], text)
+                    return text
+
                 async with asyncio.timeout_at(deadline):
                     outcome = await play(renderer=renderer, prompt=prompt, max_turns=self._max_turns,
-                                         generate=generate, answer=router.answer,
+                                         generate=generate, answer=answer,
                                          closed=lambda: router.final is not None)
                 trace.stop_condition = outcome.stop
             except TimeoutError:
