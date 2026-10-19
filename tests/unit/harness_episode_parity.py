@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import json
 import os
 import sys
 import uuid
@@ -146,6 +145,20 @@ async def verifiers_runner(*, gateway_url: str, engine_url: str, tokenizer_dir: 
                                                 renderer_model_name=tokenizer_dir),
                        sampling=Sampling(temperature=TEMPERATURE, top_p=TOP_P, max_tokens=MAX_TOKENS))
     async with SandboxEpisodeRunner(ctx=ctx, gateway_url=gateway_url, max_turns=max_turns) as runner:
+        yield runner
+
+
+@asynccontextmanager
+async def harness_runner(*, gateway_url: str, engine_url: str, tokenizer_dir: str, max_turns: int):
+    """The miner's own loop (reliquary-harness), as `SignedSweEpisodeRunner` builds it."""
+    from types import SimpleNamespace
+
+    from reliquary.miner.harness_episode import HarnessEpisodeRunner
+
+    async with HarnessEpisodeRunner(gateway_url=gateway_url, model=MODEL, renderer_dir=tokenizer_dir,
+                                    generate_url=engine_url,
+                                    sampling=SimpleNamespace(temperature=TEMPERATURE, top_p=TOP_P),
+                                    max_tokens=MAX_TOKENS, max_turns=max_turns) as runner:
         yield runner
 
 
