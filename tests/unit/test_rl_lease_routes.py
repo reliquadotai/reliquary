@@ -39,11 +39,11 @@ def served(tmp_path):
     return book
 
 
-def client_for(book, *, registration=None, clock=lambda: float(NOW)):
+def client_for(book, *, registration=None, clock=lambda: float(NOW), admit=None):
     app = FastAPI()
     app.include_router(build_rl_lease_router(book=book, collector=LeaseCollector(book, interval_s=0.0),
                                              validator_hotkey=VALIDATOR.ss58_address,
-                                             registration=registration, clock=clock))
+                                             registration=registration, clock=clock, admit=admit))
     return TestClient(app)
 
 
@@ -73,6 +73,19 @@ def test_a_signed_request_gets_its_leases_with_their_nonces(served):
     secret = bytes.fromhex(revealed["secret"])
     assert verify_reveal(bytes.fromhex(revealed["commitment"]), 0, secret)
     assert lease_nonce(secret, ENV, 1, 0).hex() == first["nonce"]
+
+
+def test_a_task_the_fleet_cannot_host_is_refused_beside_the_books_leases(served):
+    async def admit(environment, prompt):
+        return {2: ("task_unservable", {}), 3: ("fleet_unavailable", {})}.get(prompt)
+
+    client = client_for(served, admit=admit)
+    content = client.post("/rl/lease", json=body(prompts=(1, 2, 3))).json()
+    assert [x["prompt_idx"] for x in content["leases"]] == [1] and content["in_use"] == 1
+    assert content["refused"] == [{"prompt_idx": 2, "reason": "task_unservable"},
+                                  {"prompt_idx": 3, "reason": "fleet_unavailable"}]
+    nothing = client.post("/rl/lease", json=body(prompts=(2,), at=NOW + 1)).json()
+    assert nothing["leases"] == [] and nothing["refused"] == [{"prompt_idx": 2, "reason": "task_unservable"}]
 
 
 def test_a_rival_learns_only_that_the_prompt_is_taken(served):

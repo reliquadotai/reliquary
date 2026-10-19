@@ -61,6 +61,9 @@ UNKNOWN_SAMPLE = 4                  # never-listed prompts drawn per wanted prom
 
 # The validator's words (``validator/rl_leases.py``), repeated here: the miner does not import the validator.
 TAKEN, COOLING, BLACKLISTED, QUOTA, STALE = "taken", "cooling", "blacklisted", "quota", "stale"
+# An episode task the validator's sandbox fleet cannot host now (retry later) or at all (another task meanwhile).
+FLEET_UNAVAILABLE, TASK_UNSERVABLE = "fleet_unavailable", "task_unservable"
+FLEET_RETRY_S, UNSERVABLE_HOLD_S = 60.0, 3600.0
 FULL = "full"          # the validator's global cap (its trainer is behind): like quota, wait for the next poll
 COOLDOWN, IN_ZONE = "cooldown", "in_zone"
 
@@ -645,6 +648,9 @@ class AsyncMiner:
             planner.mark(prompt, reason)              # our table is behind: the next state poll catches up
         elif reason in (QUOTA, FULL):
             self.quota = len(self.open)               # the validator counts fewer, or is full: wait for its next quota
+        elif reason in (FLEET_UNAVAILABLE, TASK_UNSERVABLE):
+            planner.wait_for_outcome(prompt, self._clock() + (FLEET_RETRY_S if reason == FLEET_UNAVAILABLE
+                                                              else UNSERVABLE_HOLD_S))
         elif reason == STALE:
             self._stale = True                        # our k is retired or not adopted yet: sync first
             self._wake_checkpoint.set()

@@ -61,7 +61,9 @@ from reliquary.protocol.signatures import (
 )
 from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
 from reliquary.validator.corpus_registration import NOT_REGISTERED
-from reliquary.validator.rl_leases import MAX_PROMPTS_PER_REQUEST, LeaseBook, LeaseCollector, LeaseRequest
+from reliquary.validator.rl_leases import (
+    MAX_PROMPTS_PER_REQUEST, LeaseAnswer, LeaseBook, LeaseCollector, LeaseRequest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -249,10 +251,13 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
                           verify_submit: Callable[..., bool] = verify_rl_submit_signature,
                           verify_mine: Callable[..., bool] = verify_rl_lease_mine_signature,
                           verify_forfeit: Callable[..., bool] = verify_rl_lease_forfeit_signature,
-                          pay=None, max_episode_body_bytes: int | None = None) -> APIRouter:
+                          pay=None, max_episode_body_bytes: int | None = None,
+                          admit: Callable[[str, int], Awaitable[tuple[str, dict] | None]] | None = None) -> APIRouter:
     """``max_episode_body_bytes``: the inflated ``/rl/submit`` body an episode group may send (None: no episode
     env served; every body within ``MAX_SUBMIT_BODY_BYTES``). A single-turn group stays within
-    ``MAX_SUBMIT_BODY_BYTES`` either way. Bodies may be gzipped (``Content-Encoding: gzip``)."""
+    ``MAX_SUBMIT_BODY_BYTES`` either way. Bodies may be gzipped (``Content-Encoding: gzip``). ``admit(env,
+    prompt_idx)``: why a prompt is not leasable now beyond the book's rules (an episode task the sandbox fleet
+    cannot host), or None; its refusals are answered beside the book's, the other prompts go to the book."""
     audience = ss58_address(validator_hotkey)
     if audience is None:
         raise ValueError("validator_hotkey must be an ss58 account address")
@@ -341,12 +346,18 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
                 return _refusal("lease_busy", {"max_concurrent": MAX_PREAUTH}, retry_s)
             async with preauth:
                 request, hotkey = await authenticate(raw)
+            prompts, unplaced = tuple(request.prompt_ids), {}
+            if admit is not None and prompts:
+                verdicts = await asyncio.gather(*(admit(request.environment, int(p)) for p in prompts))
+                unplaced = {int(p): v[0] for p, v in zip(prompts, verdicts) if v is not None}
+                prompts = tuple(p for p in prompts if int(p) not in unplaced)
             asked = LeaseRequest(hotkey=hotkey, environment=request.environment,
-                                 prompt_ids=tuple(request.prompt_ids), checkpoint=request.checkpoint)
+                                 prompt_ids=prompts, checkpoint=request.checkpoint)
             try:
-                answer = await collector.request(asked)
+                answer = await collector.request(asked) if prompts else LeaseAnswer()
             except ValueError as exc:
                 return _refusal("lease_invalid", {"why": str(exc)})
+            answer.refused.update(unplaced)
             now = float(clock())
             content = answer.to_dict()
             # SQLite reads under the book's lock: off the event loop, like every other book call

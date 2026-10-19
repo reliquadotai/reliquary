@@ -348,7 +348,8 @@ def mount_rl_async(server, rl: RlAsync, *, validator_hotkey: str, registration=N
 
     router = build_rl_lease_router(book=rl.book, collector=rl.collector, validator_hotkey=validator_hotkey,
                                    registration=registration, clock=clock, submissions=rl.submissions,
-                                   pay=rl.ledger, max_episode_body_bytes=episode_body_cap(rl.settings))
+                                   pay=rl.ledger, max_episode_body_bytes=episode_body_cap(rl.settings),
+                                   admit=lambda env, idx: _lease_admission(rl, env, idx))
 
     @router.get("/rl/checkpoint")
     async def rl_checkpoint():
@@ -375,6 +376,15 @@ def mount_rl_async(server, rl: RlAsync, *, validator_hotkey: str, registration=N
     if rl.sandbox is not None:
         for sessions in rl.sandbox.routers:
             server.mount_rl_lease_router(sessions)
+
+
+async def _lease_admission(rl, environment: str, prompt_idx: int) -> tuple[str, dict] | None:
+    """The lease route's ``admit``: an episode env's task needs a fleet that can host its sessions now
+    (``RlLeaseSandbox.lease_refusal``); every other lease is the book's alone."""
+    sandbox = getattr(rl, "sandbox", None)
+    if sandbox is None:
+        return None
+    return await sandbox.lease_refusal(environment, prompt_idx)
 
 
 def episode_body_cap(settings: RlAsyncSettings) -> int | None:

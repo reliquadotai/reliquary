@@ -191,6 +191,18 @@ async def test_refusals_move_the_planner_and_the_scheduler():
     assert miner._stale and miner.lease_room() == 0               # sync first; the swap lifts it
 
 
+async def test_an_episode_task_the_fleet_cannot_host_is_held_back_for_a_while():
+    clock = Clock()
+    miner, transport, _, planner = miner_for(quota=50, prompt_range=(0, 6), clock=clock)
+    transport.refuse = {0: "fleet_unavailable", 1: "task_unservable"}
+    await miner.refresh_quota()
+    await miner.lease_more()
+    assert miner.stats["refused"] == {"fleet_unavailable": 1, "task_unservable": 1}
+    assert not planner.leasable(0) and not planner.leasable(1)
+    clock.now += 61
+    assert planner.leasable(0) and not planner.leasable(1)        # a full fleet is asked again soon
+
+
 async def test_a_refused_request_backs_off_without_leasing():
     miner, transport, _, _ = miner_for()
 

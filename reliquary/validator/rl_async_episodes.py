@@ -201,9 +201,28 @@ class RlLeaseSandbox:
     routers: tuple
     checkers: dict
     environments: tuple[str, ...] = ()
+    views: dict = field(default_factory=dict)        # env -> EpisodeEnvironmentView (its policy, its task resolver)
+    rollouts: int = 16
     restore_attempts: int = RESTORE_ATTEMPTS
     restore_timeout_s: float = RESTORE_TIMEOUT_S
     restore_backoff_s: float = RESTORE_BACKOFF_S
+
+    async def lease_refusal(self, environment: str, prompt_idx: int) -> tuple[str, dict] | None:
+        """Why a lease on this episode task is not granted now, or None: the fleet must host its ``rollouts``
+        sessions at once (``rl_sandbox_wiring.placement_refusal``: ``fleet_unavailable`` retryable,
+        ``task_unservable`` for that task). Not an episode env here: None."""
+        from reliquary.validator.rl_sandbox_wiring import placement_refusal
+
+        view = self.views.get(environment)
+        if view is None:
+            return None
+        try:
+            return await placement_refusal(fleet=self.fleet, view=view, session_policy=self.book.policy,
+                                           environment=environment, task_index=int(prompt_idx),
+                                           group=self.rollouts, clock=time.time)
+        except Exception as exc:
+            logger.warning("episode lease admission failed (%s): refused retryably", type(exc).__name__)
+            return "fleet_unavailable", {"environment": environment}
 
     async def start(self) -> None:
         """Before serving: the directory read once, then the lease sessions restored (bounded, retried; a restore
@@ -302,7 +321,8 @@ def build_rl_lease_sandbox(
                 for name, p in policies.items()}
     logger.info("rl lease sandbox built for %s (validator key %s)", sorted(policies), signer.key_id)
     return RlLeaseSandbox(signer=signer, token_verifier=token_verifier, fleet=fleet, book=book, issuer=issuer,
-                          routers=(router,), checkers=checkers, environments=tuple(sorted(policies)))
+                          routers=(router,), checkers=checkers, environments=tuple(sorted(policies)), views=views,
+                          rollouts=rollouts)
 
 
 __all__ = [
