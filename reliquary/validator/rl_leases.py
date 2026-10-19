@@ -408,6 +408,23 @@ class LeaseBook:
             self.quota.record_expiry(lease.hotkey, lease, now=now)
         return len(due)
 
+    def forfeit(self, lease_id: str, hotkey: str, now: float | None = None) -> Lease:
+        """The miner gives up its open lease now (e.g. episodes that could not all be played): closed and charged
+        exactly as its expiry (``record_expiry``), so it is never cheaper than delivering, only sooner; the quota
+        slot is freed now rather than at the lease's end. LookupError: no open lease of ``hotkey`` by that id, or
+        one whose submission is being judged."""
+        now = float(self.clock()) if now is None else now
+        with self._txn():
+            row = self.db.execute(f"SELECT {_COLUMNS} FROM rl_leases WHERE lease_id=?", (lease_id,)).fetchone()
+            lease = None if row is None else self._lease(row)
+            if (lease is None or lease.hotkey != hotkey or lease.state != OPEN
+                    or lease.lease_id in self._submitting):
+                raise LookupError("no open lease of this hotkey to forfeit")
+            self.db.execute("UPDATE rl_leases SET state=?, closed_at=? WHERE lease_id=?",
+                            (EXPIRED, now, lease.lease_id))
+            self.quota.record_expiry(lease.hotkey, lease, now=now)
+        return lease
+
     def expire_due(self, now: float | None = None) -> int:
         now = float(self.clock()) if now is None else now
         with self._txn():

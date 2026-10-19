@@ -372,6 +372,17 @@ class HttpRlTransport:
                                                            validator_hotkey=self.validator_hotkey, path=path))
         return await self._call("GET", path, params={"hotkey": self.hotkey, "at": str(at), "signature": signature})
 
+    async def forfeit(self, lease_id: str) -> dict:
+        """``POST /rl/lease/forfeit``: give up an open lease (charged as its expiry, its quota slot freed now)."""
+        from reliquary.protocol.signatures import build_rl_lease_forfeit_binding
+
+        path = f"{self._prefix}/lease/forfeit"
+        at = int(self._clock())
+        signature = self._sign(build_rl_lease_forfeit_binding(hotkey=self.hotkey, at=at, lease_id=lease_id,
+                                                              validator_hotkey=self.validator_hotkey, path=path))
+        return await self._call("POST", path, json={"miner_hotkey": self.hotkey, "at": at, "lease_id": lease_id,
+                                                    "signature": signature})
+
     async def checkpoint(self) -> dict | None:
         try:
             return await self._call("GET", f"{self._prefix}/checkpoint")
@@ -427,6 +438,10 @@ class DryRunTransport:
     async def my_leases(self) -> dict:
         return {"leases": [lease.to_wire() for lease in self.open.values()], "latest": self.latest,
                 "lease_expiry_s": {}}
+
+    async def forfeit(self, lease_id: str) -> dict:
+        self.open.pop(lease_id, None)
+        return {"lease_id": lease_id, "state": "expired", "quota": self.quota_value}
 
     async def lease(self, environment: str, checkpoint: int, prompt_ids: Sequence[int]) -> dict:
         self.lease_calls.append((environment, int(checkpoint), [int(p) for p in prompt_ids]))
@@ -670,6 +685,25 @@ class AsyncMiner:
             else:
                 logger.error("lease %s given up after %d generation failures", lease.lease_id[:12], tries)
                 self._close(lease)
+                self._forfeit(lease)
+
+    def _forfeit(self, lease: HeldLease) -> None:
+        """Tell the validator a given-up lease will not be submitted: charged as its expiry, its quota slot freed
+        now instead of at its end (an episode lease's end is over an hour away)."""
+        call = getattr(self.transport, "forfeit", None)
+        if call is None:
+            return
+
+        async def send() -> None:
+            try:
+                await call(lease.lease_id)
+                self.stats["forfeited"] = self.stats.get("forfeited", 0) + 1
+            except Exception as exc:                     # the lease then expires as before
+                logger.warning("forfeit of lease %s failed (%s)", lease.lease_id[:12], exc)
+
+        task = asyncio.create_task(send())
+        self._submits.add(task)
+        task.add_done_callback(self._submits.discard)
 
     def _hand_over(self, lease: HeldLease, rollouts, version: int) -> None:
         task = asyncio.create_task(self.submit(lease, rollouts, version))
@@ -1183,9 +1217,10 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
             sync = CheckpointSync(validator_hotkey=validator_hotkey, work_dir=Path(work_dir) / "ckpt-download",
                                   model_dir=model_files)
             weights = PayWeights(validator_url).weights
-            # The validator's signed-episode envs (their blocks: policy, catalogue); played by the episode stack.
-            blocks = {name: block for name, block in (await transport.episodes()).items()
-                      if name in config.environments}
+            # The validator's signed-episode envs (their blocks: policy, catalogue); played by the episode stack. The
+            # answer adds each env's lease lifetime, which is no part of the block.
+            blocks = {name: {k: v for k, v in block.items() if k != "lease_expiry_s"}
+                      for name, block in (await transport.episodes()).items() if name in config.environments}
         generator = await asyncio.to_thread(
             miner_generator, config, blocks=blocks, fake_generator=fake_generator, dry_run=dry_run,
             base_model_dir=base_model_dir or str(model_files), work_dir=work_dir, swap=swap,

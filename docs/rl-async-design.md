@@ -21,7 +21,9 @@ Tags: **DECIDED** (user agreed), **PROPOSED** (recommended, awaiting the user),
    LM head in the reference miner and on the validator (DECIDED).
 4. **Leases** (DECIDED). A miner reserves prompts before generating. The draw's nonce depends
    on (validator secret, prompt, checkpoint) alone, so a lease can neither be pre-generated
-   nor re-rolled. Every lease ends in a submission or an expiry; there is no release. The
+   nor re-rolled. Every lease ends in a submission or an expiry; there is no free release. A
+   miner may forfeit an open lease (`POST /rl/lease/forfeit`): it is charged exactly as its
+   expiry and only frees the quota slot sooner, so it is never cheaper than delivering. The
    public seed pool (choose M of 2xM) is removed.
 5. **Quota measured, not declared** (DECIDED). Concurrent leases per hotkey follow measured
    paid throughput and latency (Little's law), with slow start and a gentle cut on expiry.

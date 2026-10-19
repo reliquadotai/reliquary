@@ -346,3 +346,27 @@ def test_a_miner_lists_only_its_own_open_leases_with_a_signed_read(served):
     quota = client.get("/rl/quota", params={"hotkey": MINER.ss58_address}).json()
     assert quota["lease_expiry_s"] == {ENV: 600.0}
     assert client.post("/rl/lease", json=body(prompts=(9,), at=NOW + 2)).json()["lease_expiry_s"] == 600.0
+
+
+def test_a_miner_forfeits_its_own_open_lease_at_the_price_of_an_expiry(served):
+    from reliquary.protocol.signatures import build_rl_lease_forfeit_binding
+
+    client = client_for(served)
+    leases = client.post("/rl/lease", json=body()).json()["leases"]
+    rival = client.post("/rl/lease", json=body(RIVAL, prompts=(5,))).json()["leases"][0]
+    before = served.quota.quota(MINER.ss58_address, NOW)
+
+    def forfeit(lease_id, keypair=MINER, at=NOW, signer=None):
+        binding = build_rl_lease_forfeit_binding(hotkey=keypair.ss58_address, at=at, lease_id=lease_id,
+                                                 validator_hotkey=VALIDATOR.ss58_address, path="/rl/lease/forfeit")
+        return client.post("/rl/lease/forfeit", json={"miner_hotkey": keypair.ss58_address, "at": at,
+                                                      "lease_id": lease_id,
+                                                      "signature": (signer or keypair).sign(binding).hex()})
+
+    assert forfeit(leases[0]["lease_id"], signer=EVE).status_code == 403                  # not the hotkey's
+    assert forfeit(rival["lease_id"]).status_code == 409                                  # not its lease
+    done = forfeit(leases[0]["lease_id"])
+    assert done.status_code == 200 and done.json()["state"] == "expired"
+    assert served.lease(leases[0]["lease_id"]).state == "expired" and served.in_use(MINER.ss58_address) == 1
+    assert served.quota.quota(MINER.ss58_address, NOW) < before                           # charged as an expiry
+    assert forfeit(leases[0]["lease_id"], at=NOW + 1).status_code == 409                  # once

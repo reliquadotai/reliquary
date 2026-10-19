@@ -260,7 +260,7 @@ async def test_a_submission_stops_retrying_at_the_lease_expiry():
 
 
 async def test_a_failed_generation_is_retried_once_then_given_up():
-    miner, _, generator, _ = miner_for(quota=1)
+    miner, transport, generator, _ = miner_for(quota=1)
     calls = []
 
     def broken(leases):
@@ -274,6 +274,8 @@ async def test_a_failed_generation_is_retried_once_then_given_up():
     assert len(miner.queue) == 1
     await miner.generate_once()
     assert calls == [1, 1] and miner.queue == [] and miner.open == {}
+    await miner.drain()
+    assert miner.stats["forfeited"] == 1 and transport.open == {}          # the validator frees its slot now
 
 
 async def test_open_leases_survive_a_restart(tmp_path):

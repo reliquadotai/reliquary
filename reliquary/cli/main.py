@@ -101,8 +101,9 @@ def _registry_price_params() -> dict:
         params.pop(field, None)
     return params
 
-def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None, verification=None):
-    """One registry entry: shipped controller defaults, then explicit overrides."""
+def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None, verification=None, episode_envs=()):
+    """One registry entry: shipped controller defaults, then explicit overrides. ``episode_envs``: names of an async
+    task's signed-episode envs (``--rl-episode-envs``), which the split may name besides the profile's."""
     from dataclasses import asdict
 
     from reliquary.environment.abi import canonical_sha256
@@ -124,7 +125,7 @@ def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None, ver
     if env_split is not None:
         # Fail fast here; `resolve_task_config` is the runtime authority.
         declared = set(profile.environments)
-        named = set(env_split)
+        named = set(env_split) - set(episode_envs)
         unknown = named - declared
         if unknown:
             raise ValueError(
@@ -740,6 +741,7 @@ def tasks_create(
                 overrides=overrides,
                 env_split=_parse_env_split_option(env_split),
                 verification=verification,
+                episode_envs=tuple(_read_episode_envs(rl_episode_envs) or ()) if rl_async else (),
             )
         if service_contract_file is not None:
             from dataclasses import replace
@@ -3922,6 +3924,9 @@ def mine_async(
     if not dry_run:
         import bittensor as bt
 
+        from reliquary.shared.log_levels import unmute_reliquary_loggers
+
+        unmute_reliquary_loggers()          # bittensor, imported after setup_logging, muted the miner's loggers
         wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
         if wallet_path:
             wallet_kwargs["path"] = wallet_path

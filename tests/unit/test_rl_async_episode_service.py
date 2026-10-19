@@ -294,7 +294,7 @@ async def test_an_episode_lease_end_to_end_through_the_async_validator_app(tmp_p
             await miner.drain()
             assert miner.stats["verdicts"] == {"in_zone": 1}, miner.stats
             assert sent and sent[-1][0] == "gzip"                               # the 16 transcripts, gzipped
-            (buffered,) = world.rl.buffer.take(EPISODE, 4)
+            (buffered,) = world.rl.buffer.take(4)
             assert buffered.spans is not None and len(buffered.spans) == 16
             group = world.rl.submissions.group(lease.lease_id)
             model = sum(e - s for s, e in buffered.spans[0])
@@ -528,3 +528,17 @@ async def test_mine_async_routes_episode_envs_to_the_episode_engine_and_the_rest
     assert groups[0][0] == ("episode", "L0") and groups[1][0] == [1, 2] and groups[2][0] == ("episode", "L2")
     mixed.load_weights({}, 7)
     assert mixed.single.loads == [7] and mixed.episodes.loads == [7]
+
+
+def test_the_cli_entry_splits_onto_the_episode_envs():
+    from reliquary.cli.main import build_task_entry
+    from reliquary.constants import PROTOCOL_PROFILE_ID
+    from reliquary.protocol.profiles import resolve_protocol_profile
+
+    envs = resolve_protocol_profile(PROTOCOL_PROFILE_ID).environments
+    split = {**{env: 0.0 for env in envs}, EPISODE: 1.0}
+    entry = build_task_entry(task_id="rl-ep", profile_id=PROTOCOL_PROFILE_ID, cap=1.0, overrides={},
+                             env_split=split, episode_envs=(EPISODE,))
+    assert entry.env_split[EPISODE] == 1.0
+    with pytest.raises(ValueError, match="does not declare"):
+        build_task_entry(task_id="rl-ep", profile_id=PROTOCOL_PROFILE_ID, cap=1.0, overrides={}, env_split=split)

@@ -121,6 +121,7 @@ class EpisodeLeaseGenerator:
                     why = why or f"rollout {index}: {refusal}"
                 kept.append(admitted)
             if why is not None:
+                logger.warning("%s cannot be submitted: %s", label, why)   # now, not when its batch ends
                 await _release([o for o in outcomes if not isinstance(o, BaseException) and o is not None])
                 raise EpisodeLeaseFailed(why)
             for outcome in outcomes:

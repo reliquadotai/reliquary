@@ -345,7 +345,7 @@ def test_a_lease_of_episodes_is_submitted_buffered_and_reported_on_model_tokens(
     rollouts = world.rollouts(_lease(lease_id=granted.lease_id, nonce=granted.nonce))
     answer = subs.submit(granted.lease_id, "5Hot", rollouts)
     assert answer["verdict"] == "in_zone" and answer["rewards"] == [1.0, 0.0] * 8
-    (buffered,) = subs.buffer.take(EPISODE, 4)
+    (buffered,) = subs.buffer.take(4)
     assert buffered.spans == tuple(r.spans for r in rollouts)
     model = sum(e - s for s, e in rollouts[0].spans)
     assert subs.group(granted.lease_id)["completion_tokens"] == 16 * model < sum(len(r.tokens) for r in rollouts)

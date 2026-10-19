@@ -56,7 +56,8 @@ from reliquary.protocol.rl_submit import (
     rollouts_digest,
 )
 from reliquary.protocol.signatures import (
-    hotkey_signature_bytes, verify_rl_lease_mine_signature, verify_rl_lease_signature, verify_rl_submit_signature,
+    hotkey_signature_bytes, verify_rl_lease_forfeit_signature, verify_rl_lease_mine_signature, verify_rl_lease_signature,
+    verify_rl_submit_signature,
 )
 from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
 from reliquary.validator.corpus_registration import NOT_REGISTERED
@@ -104,6 +105,15 @@ class RlLeaseRequestBody(BaseModel):
     environment: str = Field(min_length=1, max_length=128)
     checkpoint: int = Field(ge=0, strict=True)
     prompt_ids: list[int] = Field(min_length=1, max_length=MAX_PROMPTS_PER_REQUEST)
+    signature: str = Field(default="", max_length=256)
+
+
+class RlLeaseForfeitBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    miner_hotkey: str = Field(min_length=1, max_length=64)
+    at: int = Field(ge=0, strict=True)
+    lease_id: str = Field(min_length=1, max_length=64)
     signature: str = Field(default="", max_length=256)
 
 
@@ -238,6 +248,7 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
                           clock: Callable[[], float] = time.time, submissions=None,
                           verify_submit: Callable[..., bool] = verify_rl_submit_signature,
                           verify_mine: Callable[..., bool] = verify_rl_lease_mine_signature,
+                          verify_forfeit: Callable[..., bool] = verify_rl_lease_forfeit_signature,
                           pay=None, max_episode_body_bytes: int | None = None) -> APIRouter:
     """``max_episode_body_bytes``: the inflated ``/rl/submit`` body an episode group may send (None: no episode
     env served; every body within ``MAX_SUBMIT_BODY_BYTES``). A single-turn group stays within
@@ -409,6 +420,34 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
                     "lease_expiry_s": expiry_map()}
 
         return _answer(await asyncio.to_thread(read))
+
+    forfeit_path = f"{prefix}/lease/forfeit"
+
+    def check_forfeit(request: RlLeaseForfeitBody, hotkey: str) -> bool:
+        return verify_forfeit(hotkey, at=request.at, lease_id=request.lease_id, signature=request.signature,
+                              validator_hotkey=audience, path=forfeit_path)
+
+    @router.post(forfeit_path)
+    async def forfeit(http: Request) -> JSONResponse:
+        """A miner gives up an open lease of its own: charged as its expiry (``LeaseBook.forfeit``)."""
+        try:
+            raw = await _read_within(http, MAX_BODY_BYTES, BODY_TIMEOUT_S)
+            if preauth.locked():
+                return _refusal("lease_busy", {"max_concurrent": MAX_PREAUTH}, retry_s)
+            async with preauth:
+                request, hotkey = await authenticate(raw, RlLeaseForfeitBody, check_forfeit)
+            try:
+                lease = await asyncio.to_thread(book.forfeit, request.lease_id, hotkey)
+            except LookupError:
+                return _refusal("lease_closed", {"lease_id": request.lease_id})
+            logger.info("rl lease %s forfeited by %s", lease.lease_id[:12], hotkey[:12])
+            quota = await asyncio.to_thread(book.quota.quota, hotkey, float(clock()))
+            return _answer({"lease_id": lease.lease_id, "state": "expired", "quota": quota})
+        except _Refused as refused:
+            return refused.response
+        except Exception as exc:
+            logger.error("rl lease forfeit failed (%s)", type(exc).__name__)
+            return _refusal("internal_error")
 
     @router.get(f"{prefix}/lease/commitments")
     async def commitments() -> JSONResponse:
