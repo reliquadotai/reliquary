@@ -437,3 +437,21 @@ def test_an_install_the_bridge_cannot_serve_is_refused(monkeypatch):
     refusal = agentic_swe.sandbox_support_refusal(job.episode)
     assert refusal == ("the bridge cannot serve the installed reliquary-swe "
                        "(ValueError: reliquary-swe is unpackaged)")
+
+
+@pytest.mark.skipif(not TOKENIZER, reason="RELIQUARY_QWEN38_TOKENIZER unset")
+def test_a_turn_reasoning_after_a_think_the_prompt_opened_is_canonical():
+    """A thinking template (Teutonic's) opens <think> in the generation prompt: the turn starts inside the
+    reasoning. Its honest spans re-render to themselves; markup spelled inside the reasoning still does not."""
+    pytest.importorskip("renderers")
+    r = agentic_swe.load_turn_renderer(TOKENIZER, tools=("bash",))
+    prompt = r.initial_ids("Fix it.")
+    opened = "<think>" in r._tokenizer.decode(prompt[-4:], skip_special_tokens=False)
+    head = "" if opened else "<think>\n"
+
+    def canonical(text):
+        return r.span_is_canonical(prompt, r._tokenizer.encode(head + text, add_special_tokens=False))
+
+    assert canonical("Look first.\n</think>\n\n" + _call("bash", [("command", "ls")]) + "<|im_end|>")
+    assert canonical("Done thinking.\n</think>\n\nFixed.<|im_end|>")
+    assert not canonical("I spell </think> here.\n</think>\n\nFixed.<|im_end|>")
