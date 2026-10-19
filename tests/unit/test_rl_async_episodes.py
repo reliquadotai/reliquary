@@ -227,7 +227,7 @@ def _lease(**kw):
 
 
 def play_lease_episode(*, validator, machine, lease, index, reward, session_id=None, engagement=None,
-                       output="ok"):
+                       output="ok", last=None, stop="agent_completed"):
     """One honest two-turn episode (``episode_v2_fixtures.play_episode``'s), its session token naming the lease's
     rollout: ``(rollout, prompt length)``."""
     from reliquary_sandbox.observation import render_observation
@@ -249,10 +249,10 @@ def play_lease_episode(*, validator, machine, lease, index, reward, session_id=N
                         calls=[{"turn": 0, "k": 0, "arguments": {"command": "c0"}, "output": output}])
     observations = [render_observation(body.to_dict()) for body in signed_records(signed).calls[:1]]
     full = renderer.next_prompt(prompt, first, observations)
-    tokens = full + [TEXT] * 9 + [TERM]
+    tokens = full + (list(last) if last is not None else [TEXT] * 9 + [TERM])
     p = len(prompt)
     spans = [[0, len(first)], [len(full) - p, len(tokens) - p]]
-    return Rollout(tuple(tokens[p:]), None, {"spans": spans, "stop": "agent_completed", "transcript": signed}), p
+    return Rollout(tuple(tokens[p:]), None, {"spans": spans, "stop": stop, "transcript": signed}), p
 
 
 @pytest.fixture
@@ -317,6 +317,19 @@ def test_tampered_observations_or_model_tokens_are_refused(world):
     assert graded.reject in ("episode_parse", "episode_termination")     # a limit stop the harness never hit
     late = world.checker.grade(lease, rollouts, received=world.received + 10**6)
     assert late.reject == "episode_deadline"
+
+
+def test_a_last_turn_cut_at_the_per_turn_cap_is_admitted_for_a_lease(world):
+    """A lease takes all its episodes: the draw that ran a turn to the per-turn cap ends the episode there."""
+    from tests.unit.test_trajectory_parse import TEXT
+
+    lease = _lease()
+    cap = world.policy.max_tokens_per_turn
+    rollouts = world.rollouts(lease, last=[TEXT] * cap, stop="context_length")
+    graded = world.checker.grade(lease, rollouts, received=world.received)
+    assert graded.reject is None and graded.rewards == (1.0, 0.0) * 8
+    short = world.rollouts(lease, last=[TEXT] * (cap - 1), stop="context_length")      # no cap reached
+    assert world.checker.grade(lease, short, received=world.received).reject is not None
 
 
 def test_a_stale_directory_is_the_validators_outage(world):
@@ -468,7 +481,8 @@ def test_the_episode_generator_plays_every_rollout_bound_to_the_lease(monkeypatc
 
     prompt = [7, 7, 7]
 
-    def admissible(outcome, *, policy, renderer, prompt):
+    def admissible(outcome, *, policy, renderer, prompt, lease=False):
+        assert lease                                                     # the async lease rules
         if outcome.seed_index == 13 and policy.refuse:
             return None, "episode_parse: bad"
         tokens = [7, 7, 7] + [outcome.seed_index] * 4 + [99] * 2 + [5]

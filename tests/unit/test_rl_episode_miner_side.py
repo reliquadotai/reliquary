@@ -241,9 +241,9 @@ def test_the_sequence_of_a_session_log_is_its_prompt_turns_and_observations():
 STOPS = frozenset({2, 3})
 
 
-def _stop(raw, tokens, spans, *, turns=4, per_turn=8, total=100):
+def _stop(raw, tokens, spans, *, turns=4, per_turn=8, total=100, lease=False):
     return episode_stop(raw, tokens=tokens, spans=spans, max_turns=turns, max_tokens_per_turn=per_turn,
-                        max_episode_tokens=total, stop_ids=STOPS)
+                        max_episode_tokens=total, stop_ids=STOPS, lease=lease)
 
 
 def test_the_stop_is_the_one_the_validator_admits():
@@ -267,6 +267,10 @@ def test_the_stop_is_the_one_the_validator_admits():
     assert _stop("max_turns", cut, spans, turns=2) is None
     assert _stop("agent_completed", cut, spans, total=11) is None          # longer than the episode cap
     assert _stop("agent_completed", cut + [1], spans, total=13) is None    # trailing tokens
+    # An async lease takes all its episodes: a cut at the per-turn cap is context_length there, still only at a cap.
+    assert _stop("agent_completed", cut, spans, per_turn=2, lease=True) == "context_length"
+    assert _stop("agent_completed", cut, spans, per_turn=2, turns=2, lease=True) == "max_turns"
+    assert _stop("agent_completed", cut, spans, lease=True) is None
 
 
 def test_the_mapped_stop_passes_the_validators_admission(tmp_path):

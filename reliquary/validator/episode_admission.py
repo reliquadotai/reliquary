@@ -253,12 +253,17 @@ def verified_transcript(policy, transcript, expected, *, directory, token_verifi
 
 
 def episode_shape_refusal(policy, renderer, *, prompt_ids, tokens, spans, stop, calls, opened, final,
-                          min_chunk_tokens: int = MIN_CHUNK_TOKENS) -> EpisodeRefusal | None:
+                          min_chunk_tokens: int = MIN_CHUNK_TOKENS, lease: bool = False) -> EpisodeRefusal | None:
     """Steps 7-9 of one episode, pure and GPU-free: the validator's admission and the miner (before it
     submits) run this one definition. ``tokens`` start with ``prompt_ids`` (the validator's own render);
     ``spans`` are absolute; ``calls``, ``opened`` and ``final`` are the verified transcript's call bodies,
     record 0 and final body (``verify_transcript``). Returns the refusal (its detail without the rollout
-    index) or None."""
+    index) or None.
+
+    ``lease``: an async RL lease's episode. No span proof is made for it (the trainer's forward and the audits
+    judge every model position), so the proof's shape rules (short turns, the model-token minimum) do not apply,
+    and a last turn cut at the per-turn cap is admitted as ``context_length``: a lease takes all its episodes,
+    so a cut the draw led to must not refuse the lease."""
     offset = len(prompt_ids)
     relative = [(start - offset, end - offset) for start, end in spans]
     completion = tokens[offset:]
@@ -271,13 +276,14 @@ def episode_shape_refusal(policy, renderer, *, prompt_ids, tokens, spans, stop, 
                                 stop=stop, max_turns=policy.max_turns, calls=list(calls),
                                 offered=opened.tools, final=final)
     except TrajectoryRefused as refused:
-        return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_parse", {"check": refused.reason})
+        return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_parse",
+                              {"check": refused.reason, **({"detail": refused.detail} if refused.detail else {})})
     except (ValueError, TypeError, KeyError, IndexError) as error:
         # The renderer on miner-chosen tokens: a refusal, never an exception out of admission.
         return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_parse", {"check": type(error).__name__})
-    checks = (
+    checks = (() if lease else (
         (RejectReason.BAD_TOKENS, "episode_turns",
-         lambda: check_short_turns(relative, min_chunk_tokens)),
+         lambda: check_short_turns(relative, min_chunk_tokens)),)) + (
         (RejectReason.BAD_TOKENS, "episode_length",
          lambda: check_turn_budget(relative, prompt_len=offset, length=len(completion),
                                    max_tokens_per_turn=policy.max_tokens_per_turn,
@@ -294,7 +300,7 @@ def episode_shape_refusal(policy, renderer, *, prompt_ids, tokens, spans, stop, 
             return EpisodeRefusal(wire, stage, {"check": outcome.reason, "detail": dict(outcome.detail)})
     try:
         why = _limit_not_reached(policy, renderer, tokens=tokens, spans=spans, stop=stop, calls=tuple(calls),
-                                 opened=opened)
+                                 opened=opened, lease=lease)
     except (ValueError, TypeError, KeyError, IndexError) as error:
         return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_parse", {"check": type(error).__name__})
     if why is not None:
@@ -302,16 +308,16 @@ def episode_shape_refusal(policy, renderer, *, prompt_ids, tokens, spans, stop, 
                               {"check": "bad_stop", "stop": stop, "why": why})
     # Away from temperature 1 the proof's log-prob check is required, and it needs CHALLENGE_K model tokens.
     model_tokens = sum(end - start for start, end in relative)
-    if T_PROTO != 1.0 and model_tokens < CHALLENGE_K:
+    if not lease and T_PROTO != 1.0 and model_tokens < CHALLENGE_K:
         return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_length",
                               {"check": "too_few_model_tokens", "model_tokens": model_tokens, "min": CHALLENGE_K})
     return None
 
 
-def _limit_not_reached(policy, renderer, *, tokens, spans, stop, calls, opened) -> str | None:
+def _limit_not_reached(policy, renderer, *, tokens, spans, stop, calls, opened, lease: bool = False) -> str | None:
     """Why a ``context_length`` / ``max_turns`` stop is not a limit the harness really hit, or None.
     Runs after ``parse_signed_trajectory`` (the last turn's sent calls are the transcript's last call
-    records, in order) and the termination check."""
+    records, in order) and the termination check. ``lease``: a last turn cut at the per-turn cap is a limit."""
     if stop == "max_turns":
         return None if len(spans) == policy.max_turns else "fewer model turns than max_turns"
     if stop != "context_length":
@@ -320,6 +326,9 @@ def _limit_not_reached(policy, renderer, *, tokens, spans, stop, calls, opened) 
     if end == policy.max_episode_tokens:                # span length == max_episode_tokens - start (absolute)
         return None                                     # (a) the turn ran to the EPISODE cap, not a per-turn cap
     last = tokens[start:end]
+    if (lease and last and last[-1] not in renderer.stop_ids
+            and end - start == min(policy.max_tokens_per_turn, policy.max_episode_tokens - start)):
+        return None                                     # (c) a lease's turn ran to the per-turn cap
     if not last or last[-1] != renderer.terminator_id:
         return "the last turn neither reached the episode cap nor ended on the turn terminator"
     pairs = list(renderer.tool_calls(last))

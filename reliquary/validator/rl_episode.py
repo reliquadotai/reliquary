@@ -94,7 +94,7 @@ class LeaseEpisodeChecker:
             refusal = episode_shape_refusal(
                 policy, self.renderer, prompt_ids=list(prompt), tokens=[*prompt, *rollout.tokens], spans=spans,
                 stop=rollout.episode["stop"], calls=tuple(result.calls), opened=result.open, final=result.final,
-                min_chunk_tokens=self.min_chunk_tokens)
+                min_chunk_tokens=self.min_chunk_tokens, lease=True)
             if refusal is not None:
                 return Graded(prompt, reject=refusal.stage)
         rewards = tuple(float(result.final.reward) for result in verified)

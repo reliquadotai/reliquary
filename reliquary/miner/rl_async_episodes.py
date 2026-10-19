@@ -118,7 +118,8 @@ class EpisodeLeaseGenerator:
                     why = why or f"rollout {index}: no episode ({outcome!r})"
                     kept.append(None)
                     continue
-                admitted, refusal = episode_admissible(outcome, policy=policy, renderer=renderer, prompt=prompt)
+                admitted, refusal = episode_admissible(outcome, policy=policy, renderer=renderer, prompt=prompt,
+                                                       lease=True)
                 if admitted is None:
                     why = why or f"rollout {index}: {refusal}"
                 kept.append(admitted)
