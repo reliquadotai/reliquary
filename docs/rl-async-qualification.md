@@ -101,3 +101,24 @@ proof-worker images; signer, proof worker, controller in that order).
 | steps per checkpoint | 1 | Q3, Q4 |
 | learning rate | 2e-6 | Q5 |
 | per-env cooldown (math, code) | global default | operator, before launch |
+
+## Math budget probe (2026-10-19)
+
+Question: does a rollout cut at the math cap fail, or would it have been right with more budget? Model: the SFT
+starting candidate (teutonic-sft-full-v2-e1 final), 100 DAPO-Math-17k and 100 hard-math RL prompts, 4 rollouts each,
+RL sampling (T=1, top_p=1, no top_k), every rollout cut at 32k continued to 64k from the same prefix.
+
+| | DAPO | hard math |
+|---|---|---|
+| cut at 32k | 25 % | 42 % |
+| finished rollouts correct (32k) | 92 % | 88 % |
+| cut rollouts still reasoning / looping | 98 % / 0 % | 99 % / 1 % |
+| cut at 32k, correct by 64k | 45 % | 46 % |
+| accuracy at cap 32k / 48k / 64k | 0.69 / 0.78 / 0.80 | 0.51 / 0.64 / 0.70 |
+| cut share at 64k | 12 % | 18 % |
+
+A forced answer at the 32k point is right about half the time, but also about a third of the time for rollouts
+that never finish even at 64k: a noisy proxy, given no credit. At 32k a cut is often good reasoning short of room;
+at 64k it is a much cleaner failure. Proposed for the run: math cap 64k, a cut scores 0 and its group trains (no
+masking), soft overlong zone 0.1 over the last 4,096 tokens, cut share watched and the cap raised again if it stays
+high. To check in the rehearsal: 64k sequences in the FSDP2 trainer.
