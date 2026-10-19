@@ -185,19 +185,21 @@ reliquary jobs create --fleet-knows-corpus-generation \
 
 ## 8. SWE-bench Verified (signed sandbox)
 
-**Status: cannot run yet.** The code path is in place: the set's row map, `jobs create`
+**Status: not run yet.** The code path is in place: the set's row map, `jobs create`
 over a `swe` set with a `signed_sandbox` episode, the validator's sandbox verdicts and
-`eval grade`. But the pinned `reliquary-sandbox` refuses to serve any split whose name
-contains `eval` ("eval is never served"), and Verified is `reliquary-swe` split
-`eval`. The gateway options were not changed. Serving Verified waits for a decision:
-change the sandbox guard, or serve Verified under a split name without `eval`.
+`eval grade`. reliquary-sandbox `fc2fa643` serves an eval split when its served name
+says `eval` (before, "eval is never served"), and `bridged_swe.GATEWAY_OPTIONS` now
+serves `eval` (Verified is `reliquary-swe` split `eval`).
 
-Once decided, the run needs, in order:
+Before the first run, in order:
 
-1. Gateway options updated (`bridged_swe.GATEWAY_OPTIONS`), which changes
-   `options_sha256()`: **every gateway at once**, or no session is placed.
+1. The new sandbox commit and gateway options rolled out together. The options change
+   `options_sha256()` and the commit changes `SANDBOX_COMMIT`: **every gateway, miner
+   and validator at once**, or no session is placed. A build at this commit refuses a
+   job pinned to the previous one (`be50c768`): the signed SWE corpus job must be
+   relaunched on the new commit, or closed, at the same time.
 2. Verified image digests pinned (design Task 8, deferred): the images are tagged
-   `latest`.
+   `latest`, and the bridge refuses a task whose image its lock does not pin.
 3. The sampled images pre-pulled on the sandbox machines, from the set's instance ids
    (`reliquary_swe/images.py --split eval`). Start with a 50-100 instance sample.
 4. `reliquary-swe` installed where `jobs create` runs: it checks the instance ids.

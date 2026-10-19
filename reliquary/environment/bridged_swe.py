@@ -12,7 +12,7 @@ from typing import Any
 
 PACKAGE = "reliquary-swe"
 SERVED_SPLITS = {"train": {"split": "train"}, "r2e": {"split": "r2e"},
-                 "polyglot": {"split": "polyglot"}}
+                 "polyglot": {"split": "polyglot"}, "eval": {"split": "eval"}}
 GATEWAY_OPTIONS = {"tools": ["bash", "edit"], "splits": SERVED_SPLITS,
                    "defaults": {"per_call_timeout_s": 600}, "publish_state": True}
 """The options this process builds reliquary-swe with, which must be the ones the gateway
