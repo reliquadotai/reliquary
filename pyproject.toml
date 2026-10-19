@@ -38,6 +38,10 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.52,<0.53",
     "bitsandbytes>=0.43.0",
+    # The agentic harness miners and validators share (render, parse, loop): one commit
+    # of reliquary-sandbox's harness/ distribution. `agentic_swe.HARNESS_DIGEST` pins
+    # the spec it must install; another digest refuses SWE and signed jobs.
+    "reliquary-harness @ git+https://github.com/reliquadotai/reliquary-sandbox.git@753b208aeec4b1cbc4f8afe956dc01d6f37a27eb#subdirectory=harness",
 ]
 
 [project.optional-dependencies]
