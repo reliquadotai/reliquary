@@ -183,17 +183,19 @@ def entity_sizes(capacity: int, *, pool_seeds: int) -> tuple[int, int]:
 
 
 def allocate(capacity: int, *, pool_seeds: int, main: Mapping[str, tuple[float, float]], newcomer_demand: float,
-             low_yield_demand: float, takes_spare: bool = NEWCOMER_TAKES_SPARE) -> Allocation:
+             low_yield_demand: float, takes_spare: bool = NEWCOMER_TAKES_SPARE,
+             newcomer_weight: float = NEWCOMER_WEIGHT) -> Allocation:
     """The allocation of ``capacity`` sessions: the low-yield entity's ``min(L, demand)`` (hard cap), the newcomer
     entity's guaranteed ``min(N, demand)``, then weighted water-filling of the rest among the MAIN hotkeys
-    (``main`` = {hotkey: (w, current demand)}) and, when ``takes_spare``, the newcomer entity's unmet demand."""
+    (``main`` = {hotkey: (w, current demand)}) and, when ``takes_spare``, the newcomer entity's unmet demand (with
+    weight ``newcomer_weight``: RL's ``NEWCOMER_WEIGHT`` by default; the corpus quota passes its own)."""
     capacity = max(0, int(capacity))
     newcomer_n, low_l = entity_sizes(capacity, pool_seeds=pool_seeds)
     low = min(float(low_l), max(0.0, float(low_yield_demand)), float(capacity))
     new = min(float(newcomer_n), max(0.0, float(newcomer_demand)), capacity - low)
     claims: dict[Hashable, tuple[float, float]] = {key: (float(w), float(d)) for key, (w, d) in main.items()}
     if takes_spare and newcomer_demand > new:
-        claims[NEWCOMER_ENTITY] = (NEWCOMER_WEIGHT, float(newcomer_demand) - new)
+        claims[NEWCOMER_ENTITY] = (float(newcomer_weight), float(newcomer_demand) - new)
     filled = water_fill(capacity - low - new, claims)
     new += filled.pop(NEWCOMER_ENTITY, 0.0)
     return Allocation(capacity=capacity, newcomer_guarantee=newcomer_n, low_yield_cap=low_l, newcomer=new,
@@ -202,14 +204,15 @@ def allocate(capacity: int, *, pool_seeds: int, main: Mapping[str, tuple[float, 
 
 def potential(capacity: int, *, pool_seeds: int, main: Mapping[str, tuple[float, float]], hotkey: str,
               weight_h: float, newcomer_demand: float, low_yield_demand: float,
-              takes_spare: bool = NEWCOMER_TAKES_SPARE) -> float:
+              takes_spare: bool = NEWCOMER_TAKES_SPARE, newcomer_weight: float = NEWCOMER_WEIGHT) -> float:
     """What MAIN ``hotkey`` would get if it asked for everything, the others' demands as measured: the number the
     miner is told (an allocation capped by the miner's own requests would pin it to what it holds).
     Admission still uses ``allocate`` (its current demand), so the potential is advice, never a grant."""
     claims = {key: value for key, value in main.items() if key != hotkey}
     claims[hotkey] = (float(weight_h), float(max(0, int(capacity))))
     return allocate(capacity, pool_seeds=pool_seeds, main=claims, newcomer_demand=newcomer_demand,
-                    low_yield_demand=low_yield_demand, takes_spare=takes_spare).main[hotkey]
+                    low_yield_demand=low_yield_demand, takes_spare=takes_spare,
+                    newcomer_weight=newcomer_weight).main[hotkey]
 
 
 def sessions_of(allocation: float) -> int:

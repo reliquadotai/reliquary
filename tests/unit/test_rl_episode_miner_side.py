@@ -133,7 +133,7 @@ def test_the_rl_runner_opens_its_seed_and_checks_with_the_rl_binding():
     assert verify_sandbox_open_signature(body, validator_hotkey=VALIDATOR.ss58_address, path="/rl/sandbox/sessions")
     assert runner.requires_text_state is False
     assert runner._source.prompt(13) == "Write 42."
-    assert runner._live._value == POLICY.pool_seeds
+    assert runner.live_limit == POLICY.pool_seeds
     assert runner.deadline(0) > POLICY.budgets_dict()["wall_s"]
     with pytest.raises(ValueError):
         RlSignedEpisodeRunner(

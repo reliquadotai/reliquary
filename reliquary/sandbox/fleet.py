@@ -568,6 +568,21 @@ class Fleet:
         """The fleet size the RL yield quota shares (``session_room``'s first figure). Memory only."""
         return self.session_room(now, reservations=reservations)[0]
 
+    def slots_serving(self, served: Collection[tuple[str, str]], now: float | None = None) -> int:
+        """The session slots of the fresh, active, undrained machines serving at least one of ``served`` =
+        {(sandbox env, env package)} (holding some of its images): the fleet size the corpus quota shares. A
+        machine serving two of them counts once. Memory only."""
+        now = self._clock() if now is None else now
+        wanted = {(str(env), str(package)) for env, package in served}
+        if not wanted:
+            return 0
+        slots = 0
+        for _machine_id, document in self._fresh_documents(now):
+            packages = document.get("env_packages") or {}
+            if any(packages.get(env) == package and self._holds_images(document, env) for env, package in wanted):
+                slots += max(0, int(document.get("capacity") or 0))
+        return slots
+
     def image_set_images(self, env: str, lock_sha256: str, now: float | None = None) -> frozenset[str]:
         """The images the fresh machines reporting image lock ``lock_sha256`` for ``env`` hold, together (which
         refused opens an image set's saturation counts). Memory reads only."""

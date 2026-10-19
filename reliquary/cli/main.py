@@ -2916,9 +2916,11 @@ def corpus_mine_agentic(
         help="The validator's ss58 hotkey; signed-sandbox jobs sign their session requests "
              "for it"),
     max_live_per_job: int = typer.Option(
-        4, "--max-live-per-job", min=1,
-        help="Signed-sandbox jobs: live sessions at once for this hotkey on the job (match "
-             "the validator's per-job cap, 4 by default)"),
+        64, "--max-live-per-job", min=1,
+        help="Signed-sandbox jobs: this miner's upper bound on live sessions at once for a hotkey "
+             "on the job (its batch). The validator names each hotkey's allowance (its fair share "
+             "of the sandbox fleet) and the miner grows to min(this, allowance); a validator that "
+             "names none keeps it at 4. Episodes also run at most --concurrency at once"),
 ) -> None:
     """Mine an agentic (episode) corpus job against a local vLLM with per-turn
     proofs. A SWE replay job (harness bash) runs verifiers + reliquary-swe episodes

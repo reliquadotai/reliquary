@@ -37,6 +37,11 @@ RL_PROMPT_RANGES: dict[str, RlPromptRange] = {
         200_000, 2_381_806, 2_481_806,
         "Rows [0, 200000) are the two code corpus jobs' prompts, and the last 100,000 "
         "rows are the code evaluation set (reliquary.eval.sets.HELD_OUT)."),
+    "reliquary_competitive_code_v1": RlPromptRange(
+        4_181, 6_899, 8_792,
+        "Train is SFT [0, 4181), RL [4181, 6899), then the v1.1 problems [6899, 8792), "
+        "all SFT (the package's layout.use_ranges); the SFT rows are the competitive-code "
+        "corpus jobs' prompts."),
 }
 
 

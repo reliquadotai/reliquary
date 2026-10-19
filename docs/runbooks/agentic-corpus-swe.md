@@ -87,7 +87,10 @@ Rolling back is the reverse: retire the signed job first, then unset the key set
 3. Set `RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE` and `RELIQUARY_SANDBOX_VALIDATOR_KEY_ID` (neither
    may be blank). After a rotation also set `RELIQUARY_SANDBOX_VALIDATOR_RETIRED_KEYS`, a JSON
    object `{key_id: base64 public key}`. Without both key settings, a signed job is not
-   served: it is logged as unserved, and replay jobs start as before.
+   served: it is logged as unserved, and replay jobs start as before. The split validator's
+   front (`RELIQUARY_CORPUS_SPLIT=1`) runs with no wallet: there also set
+   `RELIQUARY_SANDBOX_VALIDATOR_HOTKEY` to the ss58 address miners sign session requests to
+   (public, the address miners pass as `--validator-hotkey`).
 4. Policy defaults per hotkey:
    - 8 live sessions in total (`RELIQUARY_SANDBOX_MAX_LIVE_PER_HOTKEY`);
    - 4 live sessions per job (`RELIQUARY_SANDBOX_MAX_LIVE_PER_HOTKEY_JOB`);
@@ -96,7 +99,41 @@ Rolling back is the reverse: retire the signed job first, then unset the key set
    - 20 aborted sessions per 24 h (`RELIQUARY_SANDBOX_MAX_ABORTED_PER_DAY`);
    - a 300 s claim ttl (`RELIQUARY_SANDBOX_CLAIM_TTL_S`).
 
-   A prompt never has more live sessions than free slots.
+   A prompt never has more live sessions than free slots. The two live caps and the hourly
+   opens above are the fixed caps of a validator WITHOUT the corpus quota (next item).
+4b. The corpus quota (`reliquary/sandbox/corpus_quota.py`), ON by default
+   (`RELIQUARY_SANDBOX_CORPUS_QUOTA=1`; `0` restores the fixed caps above). A hotkey holds as
+   many sessions as it asks for, bounded only by the fleet and the other miners' fair shares,
+   with the RL quota's arithmetic (`rl_capacity`: weighted water-filling, a session is its own
+   group):
+   - the fleet size `C` is the slots of the fresh, active, undrained machines serving a served
+     signed job's env at its package (a machine counts once);
+   - a hotkey's demand is its held sessions plus its admissible opens of the last 30 s, never
+     below what it held in the last 10 min (decaying);
+   - its standing comes from its own sessions in the book (the last 24 h; the book is restored
+     from R2 at start, so a restart keeps it): submitted = useful; closed unpaid (expired, box
+     failed, budget exhausted, failed open, withdrawn) or lapsed = wasted; aborted or voided =
+     neutral. Under 24 decided sessions it is a NEWCOMER (the newcomers share at least 10 % of
+     `C` and take spare capacity with weight 4, a legacy miner's 4 live sessions); at or
+     below a 15 % yield it is LOW_YIELD (all of them share at most 3 % of `C`, at least one
+     session); otherwise MAIN with weight =
+     useful held session-seconds per second of its window x the yield multiplier (0 at 15 %,
+     1 at 50 %). Splitting a hotkey never buys more: the weight is linear in the volume, and
+     the pooled entities are bounded as a whole;
+   - a refused open is `429 quota_live` (its allocation, or the fleet full) or `429 quota_pool`
+     (its pooled entity full) with `Retry-After` (`RELIQUARY_SANDBOX_RETRY_AFTER_S`) and its
+     `allowance` in the detail; every grant carries `allowance` too: the sessions it could hold
+     if it asked for the whole fleet. Miners from this release grow to
+     `min(--max-live-per-job, allowance)` (default `--max-live-per-job 64`; `--concurrency` also
+     bounds the episodes run at once); older miners stay at 4;
+   - with the quota on, the fixed live caps become safety ceilings,
+     `RELIQUARY_SANDBOX_QUOTA_MAX_LIVE_PER_HOTKEY` and
+     `RELIQUARY_SANDBOX_QUOTA_MAX_LIVE_PER_HOTKEY_JOB` (0, the default: the fleet's `C`, never
+     below the fixed caps); the hourly opens become `max(fixed, 12 x max(allowance, held))`, and
+     the aborted and refused-open rates scale by `max(1, allowance / the per-job cap)`.
+
+   Nothing else changes: the job manifests, contracts and the session records keep their bytes;
+   one live session per (hotkey, prompt) and each prompt's slots still hold.
 5. The machine directory:
    - it is re-read every `RELIQUARY_SANDBOX_DIRECTORY_REFRESH_S` (30 s);
    - each read is bounded by `RELIQUARY_SANDBOX_DIRECTORY_READ_TIMEOUT_S` (15 s);
@@ -135,13 +172,15 @@ Rolling back is the reverse: retire the signed job first, then unset the key set
 ### Every setting
 
 All are validator environment variables; each numeric one must be a positive, finite
-number (a bad value refuses the start).
+number (a bad value refuses the start), except the quota ceilings, where 0 means the fleet's
+capacity.
 
 | Setting | Default | What it bounds |
 | --- | --- | --- |
 | `RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE` | unset (signed jobs not served) | the validator's Ed25519 key (0600, owned by the process user) |
 | `RELIQUARY_SANDBOX_VALIDATOR_KEY_ID` | unset (signed jobs not served) | its key id, as the machines know it |
 | `RELIQUARY_SANDBOX_VALIDATOR_RETIRED_KEYS` | `{}` | earlier keys whose tokens may still be in flight |
+| `RELIQUARY_SANDBOX_VALIDATOR_HOTKEY` | the wallet's hotkey (required in the split front) | the ss58 address miners sign session requests to |
 | `RELIQUARY_SANDBOX_MAX_LIVE_PER_HOTKEY` | 8 | live sessions per hotkey |
 | `RELIQUARY_SANDBOX_MAX_LIVE_PER_HOTKEY_JOB` | 4 | live sessions per hotkey and job |
 | `RELIQUARY_SANDBOX_MAX_OPENS_PER_HOUR` | 120 | opens per hotkey per rolling hour (aborted and voided refunded) |
@@ -159,6 +198,9 @@ number (a bad value refuses the start).
 | `RELIQUARY_SANDBOX_CLOSE_PREAUTH_CONCURRENCY` | 8 | closes read and authenticated at once; one more gets `503 close_busy` at once, before its body is read |
 | `RELIQUARY_SANDBOX_CLOSE_CONCURRENCY` | 4 | authenticated closes whose transcript is verified at once (a wait past the io timeout gets `503 close_busy`) |
 | `RELIQUARY_SANDBOX_CLOSE_BODY_TIMEOUT_S` | 30 | the time a close's body has to arrive, else `408 body_timeout` |
+| `RELIQUARY_SANDBOX_CORPUS_QUOTA` | 1 | the corpus quota (step 4b): sessions per hotkey follow its demand within its fair share of the fleet; 0 = the fixed live caps |
+| `RELIQUARY_SANDBOX_QUOTA_MAX_LIVE_PER_HOTKEY` | 0 (the fleet's capacity) | with the quota: the safety ceiling of a hotkey's live sessions (0 or a positive integer) |
+| `RELIQUARY_SANDBOX_QUOTA_MAX_LIVE_PER_HOTKEY_JOB` | 0 (the fleet's capacity) | with the quota: the safety ceiling of a hotkey's live sessions on one job (0 or a positive integer) |
 
 Fixed (not settings): one live session per (hotkey, prompt); a machine silent 60 s is
 drained; heartbeat summaries are written to R2 at most once a minute, each write bounded

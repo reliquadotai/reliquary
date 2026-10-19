@@ -27,7 +27,12 @@ the episode unsubmitted). A graded transcript that is not submitted is closed
 is closed `final`; a session with no transcript (the run raised, or was cancelled) is
 closed `open_failed`. A resent open answered `request_reused` for a session still
 `live` (the validator restarted and lost the token) closes that session `open_failed`. Tokens and signed open bodies are bearer secrets: nothing here logs them, and
-errors carry exception types and statuses, never a request body."""
+errors carry exception types and statuses, never a request body.
+
+Live sessions. A validator running the corpus quota names the hotkey's `allowance` (the sessions it may hold at
+once: its fair share of the fleet) on every grant and in its quota refusals; the runner then holds up to
+`min(max_live, allowance)` sessions at once (at least one), growing and shrinking with it. A validator that names
+none keeps the runner at `LEGACY_ALLOWANCE` (its fixed per-job cap)."""
 
 from __future__ import annotations
 
@@ -65,8 +70,11 @@ CLOSE_RETRIED = THROTTLED | {408}
 MAX_CLOSE_WAIT_S = 60.0
 CANCELLED_CLOSE_S = 30.0
 """How long a cancelled episode spends reporting its session before it propagates."""
-DEFAULT_MAX_LIVE_PER_JOB = 4
-"""The validator's default per-hotkey live sessions on one job (`job_live_cap`)."""
+LEGACY_ALLOWANCE = 4
+"""Live sessions per job until the validator names an allowance: a validator without the corpus quota caps a
+hotkey at its fixed per-job cap (`job_live_cap`, 4 by default)."""
+DEFAULT_MAX_LIVE_PER_JOB = 64
+"""The miner's own upper bound on its live sessions per job (its batch); the validator's allowance binds below."""
 MAX_BACKOFF_S = 60.0
 MAX_UNAVAILABLE = 10
 """Consecutive "not serving" open refusals (404, unnamed 5xx, unreachable) before the
@@ -246,10 +254,51 @@ def _describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {str(exc)[:MAX_ERROR_CHARS]}"
 
 
+class _LiveLimit:
+    """A semaphore whose size moves: at most `limit` holders; a lower limit lets the holders above it finish (no
+    new one enters until they are below it), a higher one admits waiters at once."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit, self.held = max(1, int(limit)), 0
+        self._waiters: list[asyncio.Future] = []
+
+    async def acquire(self) -> None:
+        while self.held >= self.limit:
+            waiter = asyncio.get_running_loop().create_future()
+            self._waiters.append(waiter)
+            try:
+                await waiter
+            except asyncio.CancelledError:
+                if waiter.done() and not waiter.cancelled():
+                    self._wake()             # the turn it was given passes on
+                raise
+            finally:
+                if waiter in self._waiters:
+                    self._waiters.remove(waiter)
+        self.held += 1
+
+    def release(self) -> None:
+        self.held = max(0, self.held - 1)
+        self._wake()
+
+    def set_limit(self, limit: int) -> None:
+        self.limit = max(1, int(limit))
+        self._wake()
+
+    def _wake(self) -> None:
+        free = self.limit - self.held
+        for waiter in list(self._waiters):
+            if free <= 0:
+                break
+            if not waiter.done():
+                waiter.set_result(None)
+                free -= 1
+
+
 class _Slot:
     """One of the hotkey's live sessions on this job (`max_live`); freed once."""
 
-    def __init__(self, semaphore: asyncio.Semaphore) -> None:
+    def __init__(self, semaphore) -> None:
         self._semaphore, self._held = semaphore, True
         self.keep = False               # handed to an unconfirmed open
 
@@ -280,12 +329,15 @@ class SignedSweEpisodeRunner:
     exponentially (1 s to 60 s, reset by a grant). Refusals that say the validator
     is not serving (404, 5xx other than its named throttles, unreachable) count
     consecutively; the tenth stops the hotkey (`validator_unavailable`). At most
-    `max_live` sessions of this hotkey on this job are live at once (the validator's
-    own cap)."""
+    `min(max_live, the validator's allowance)` sessions of this hotkey on this job are live
+    at once (`LEGACY_ALLOWANCE` until the validator names one; `follows_allowance`)."""
 
     forwards_open_refusal = False
     """Whether a failed open's close carries the gateway's signed receipt. The corpus validators' close
     request forbids unknown fields, so only the RL runner does."""
+    follows_allowance = True
+    """Whether the live sessions follow the validator's announced `allowance` (the corpus quota). The RL runner
+    holds its own `max_live` (its group's seeds)."""
 
     def __init__(self, *, job, hotkey: str, sign_binding: Callable[[bytes], str], sessions,
                  model_name: str, renderer_model_dir: str, generate_url: str, sampling,
@@ -321,7 +373,10 @@ class SignedSweEpisodeRunner:
         self._runners: dict[str, object] = {}
         self._runners_lock = asyncio.Lock()
         self._stack = AsyncExitStack()
-        self._live = asyncio.Semaphore(max_live)
+        self._max_live = int(max_live)
+        self.allowance: int | None = None      # the validator's last announced allowance (None: never named)
+        self._live = _LiveLimit(min(self._max_live, LEGACY_ALLOWANCE) if self.follows_allowance
+                                else self._max_live)
         self._open_lock = asyncio.Lock()
         self._not_before = 0.0          # monotonic time before which no open is sent
         self._backoff = 0               # refusals without Retry-After since the last grant
@@ -397,8 +452,26 @@ class SignedSweEpisodeRunner:
                                    validator_hotkey=self._validator,
                                    path=sandbox_open_path(self._prefix))
 
+    def _note_allowance(self, value: Any) -> None:
+        """The validator named the sessions this hotkey may hold at once: the live limit follows it (within
+        `max_live`, at least one)."""
+        if not self.follows_allowance or isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return
+        if value != self.allowance:
+            logger.info("the validator allows %s %d live sessions on job %s (this miner: at most %d)",
+                        self._hotkey[:12], value, getattr(self._job, "job_id", "?"), self._max_live)
+        self.allowance = value
+        self._live.set_limit(min(self._max_live, max(1, value)))
+
+    @property
+    def live_limit(self) -> int:
+        return self._live.limit
+
     def _note_refusal(self, refused: SessionRefused) -> SessionRefused:
         """Move the gate and the unavailability count; return what to raise."""
+        detail = refused.detail if isinstance(refused.detail, Mapping) else {}
+        if "allowance" in detail:
+            self._note_allowance(detail.get("allowance"))
         if refused.retry_after:
             self._hold_opens(refused.retry_after)
         else:
@@ -482,6 +555,8 @@ class SignedSweEpisodeRunner:
                     await self._sleep(2.0 ** attempt)
                 continue
             self._backoff = self._unavailable = 0
+            if isinstance(grant, Mapping) and "allowance" in grant:
+                self._note_allowance(grant.get("allowance"))
             return grant
         slot.keep = True
         self._unconfirmed.append(_Unconfirmed(
@@ -720,6 +795,6 @@ def signed_trajectory_precheck(renderer, *, max_turns: int, job=None, tokenizer=
     return precheck
 
 
-__all__ = ["DEFAULT_MAX_LIVE_PER_JOB", "HttpSandboxSessions", "SignedSweEpisodeRunner",
+__all__ = ["DEFAULT_MAX_LIVE_PER_JOB", "HttpSandboxSessions", "LEGACY_ALLOWANCE", "SignedSweEpisodeRunner",
            "open_refusal_of", "signed_close_request", "signed_open_request", "signed_trajectory_precheck",
            "ss58_format_42", "transcript_refusal"]
