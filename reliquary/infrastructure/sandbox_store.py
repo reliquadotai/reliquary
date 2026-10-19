@@ -79,17 +79,21 @@ def _code(exc) -> str:
 async def _get(key: str, **client_kwargs) -> tuple[Any, str | None]:
     """The decoded JSON at `key` (any JSON value) and its ETag; (None, None) when absent.
     Raises ValueError when the object is not JSON."""
-    from botocore.exceptions import ClientError
-
     bucket = _bucket(client_kwargs)
     async with get_s3_client(**client_kwargs) as client:
-        try:
-            response = await client.get_object(Bucket=bucket, Key=key)
-        except ClientError as exc:
-            if _code(exc) in _ABSENT:
-                return None, None
-            raise
-        return json.loads(await response["Body"].read()), response.get("ETag")
+        return await _get_with(client, bucket, key)
+
+
+async def _get_with(client, bucket: str, key: str) -> tuple[Any, str | None]:
+    from botocore.exceptions import ClientError
+
+    try:
+        response = await client.get_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        if _code(exc) in _ABSENT:
+            return None, None
+        raise
+    return json.loads(await response["Body"].read()), response.get("ETag")
 
 
 async def _put(key: str, document: Mapping, etag: str | None, **client_kwargs) -> bool:
@@ -129,17 +133,23 @@ async def _read_all(keys, **client_kwargs) -> list[tuple[str, Any]]:
     """(key, decoded JSON) for every key that still exists. An object that is not JSON
     is logged and left out: one bad object never hides the others."""
     gate = asyncio.Semaphore(READ_CONCURRENCY)
+    kw = dict(client_kwargs)
+    bucket = _bucket(kw)
+    if not keys:
+        return []
+    # One client for every read: a client per object costs about half a second of the event loop each, so a
+    # restart reading a few thousand sessions would outlast the restore timeout.
+    async with get_s3_client(**{"max_pool_connections": READ_CONCURRENCY, **kw}) as client:
+        async def one(key: str):
+            async with gate:
+                try:
+                    document, etag = await _get_with(client, bucket, key)
+                except ValueError:                       # JSONDecodeError, UnicodeDecodeError
+                    logger.error("sandbox object %s is not JSON; skipped", key)
+                    return key, None, False
+                return key, document, etag is not None   # a JSON null still exists
 
-    async def one(key: str):
-        async with gate:
-            try:
-                document, etag = await _get(key, **dict(client_kwargs))
-            except ValueError:                       # JSONDecodeError, UnicodeDecodeError
-                logger.error("sandbox object %s is not JSON; skipped", key)
-                return key, None, False
-            return key, document, etag is not None   # a JSON null still exists
-
-    return [(k, d) for k, d, exists in await asyncio.gather(*(one(k) for k in keys)) if exists]
+        return [(k, d) for k, d, exists in await asyncio.gather(*(one(k) for k in keys)) if exists]
 
 
 def validated_machine_id(machine_id: Any) -> str:

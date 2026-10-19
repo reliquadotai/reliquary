@@ -693,15 +693,23 @@ class SessionBook:
         """Whether an exclusive (RL) engagement is consumed. Only a machine-signed ``aborted``
         frees it, and at most ONCE: a ``voided`` session (a drain frees what the miner left ``live``, so
         it would be a selective re-roll) and every other state keep it taken, and so does a second
-        ``aborted`` record of the same engagement. A pool abort caused by other miners never counts."""
+        ``aborted`` record of the same engagement. A pool abort caused by other miners never counts.
+        An RL lease rollout whose open the machine refused with a verified signed receipt (fault
+        ``open_refused:*``: no box ever ran, nothing was seen) is free again, every time: a lease needs all
+        its rollouts, and a full machine must not cost the whole lease."""
         aborted = 0
         sha = _rl_precommit_engagement(engagement)
         if sha is None:
             candidates = self._sessions.values()
         else:                               # an RL engagement: only its precommit's sessions (an index, no scan)
             candidates = [self._sessions[s] for s in self._by_precommit.get(sha, ()) if s in self._sessions]
+        from reliquary.protocol.service_episode import RL_LEASE_ENGAGEMENT_PREFIX
+
+        lease = engagement.startswith(f"{RL_LEASE_ENGAGEMENT_PREFIX}:")
         for r in candidates:
             if r.engagement != engagement:
+                continue
+            if lease and str(r.fault or "").startswith("open_refused:"):
                 continue
             if r.state != ABORTED:
                 return True

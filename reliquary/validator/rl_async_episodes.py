@@ -288,7 +288,9 @@ def build_rl_lease_sandbox(
         book=book, store=session_store or sandbox_store.R2SessionStore(prefix=sandbox_store.RL_LEASE_SESSION_PREFIX,
                                                                        **kw),
         fleet=fleet, signer=signer, token_verifier=token_verifier, engagements={"rl_lease": engagements},
-        policy=policy, clock=clock)
+        policy=policy, clock=clock,
+        # a failed open's signed receipt is checked and recorded: it frees the rollout (``engagement_held``)
+        record_faults=True, open_refusal_check=fleet.open_refusal_valid)
     fleet.on_drained = issuer.void_machine
     router = build_sandbox_sessions_router(
         issuer, policy=policy, validator_hotkey=validator_hotkey, prefix=RL_PREFIX, registration=registration,
