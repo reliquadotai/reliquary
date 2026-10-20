@@ -182,20 +182,23 @@ class RlPayLedger:
                 "SELECT doc FROM rl_pay_periods WHERE published=0 ORDER BY work_period").fetchall()]
 
     async def publish(self, archives, now: float | None = None) -> int:
-        """Write the unpublished period archives (``R2PeriodArchives``-like ``write``). An archive whose entry period
-        has begun is moved to the next free one first, so no weight set misses part of it (as the corpus settler)."""
+        """Reconcile unpublished archives before moving an unwritten stale entry to the next free period."""
         written = 0
         for doc in self.unpublished():
-            now_ = float(self.clock()) if now is None else now
-            due = cp.period_of(now_, self.config.genesis) + 1
-            if doc["entry_period"] < due:
-                with self.book.transaction():
-                    entered = [e for e, in self.book.db.execute(
-                        "SELECT entry_period FROM rl_pay_periods WHERE work_period<>?", (doc["work_period"],))]
-                    doc = {**doc, "entry_period": cp.entry_for(due, entered)}
-                    self.book.db.execute("UPDATE rl_pay_periods SET entry_period=?, doc=? WHERE work_period=?",
-                                         (doc["entry_period"], json.dumps(doc, sort_keys=True), doc["work_period"]))
-            await archives.write(self.config.task_id, doc["work_period"], doc["entry_period"], doc)
+            existing = await archives.read(self.config.task_id, doc["work_period"], doc["entry_period"])
+            if existing is not None and existing != doc:
+                raise RuntimeError("period archive already holds another document")
+            if existing is None:
+                now_ = float(self.clock()) if now is None else now
+                due = cp.period_of(now_, self.config.genesis) + 1
+                if doc["entry_period"] < due:
+                    with self.book.transaction():
+                        entered = [e for e, in self.book.db.execute(
+                            "SELECT entry_period FROM rl_pay_periods WHERE work_period<>?", (doc["work_period"],))]
+                        doc = {**doc, "entry_period": cp.entry_for(due, entered)}
+                        self.book.db.execute("UPDATE rl_pay_periods SET entry_period=?, doc=? WHERE work_period=?",
+                                             (doc["entry_period"], json.dumps(doc, sort_keys=True), doc["work_period"]))
+                await archives.write(self.config.task_id, doc["work_period"], doc["entry_period"], doc)
             with self.book.transaction():
                 self.book.db.execute("UPDATE rl_pay_periods SET published=1 WHERE work_period=?",
                                      (doc["work_period"],))
