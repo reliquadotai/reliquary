@@ -240,7 +240,11 @@ class GroupGrader:
             if kind not in ("ok", "truncated"):
                 return Graded(prompt, reject=kind)
             truncated.append(kind == "truncated")
-        texts = [str(self.tokenizer.decode(list(r.tokens), skip_special_tokens=False)) for r in rollouts]
+        # The answer is graded without its terminator: an extractor that closes a fenced block on a line of its
+        # own, or an "ends with" instruction, must not see "<|im_end|>" glued to the last line.
+        eos = {int(t) for t in self._contexts[environment].eos_token_ids}
+        texts = [str(self.tokenizer.decode(list(r.tokens[:-1] if r.tokens and int(r.tokens[-1]) in eos
+                                                else r.tokens), skip_special_tokens=False)) for r in rollouts]
         try:
             rewards = self.scorer(environment, materials.problem, texts, materials.effective_reward_materials)
         except GraderInfrastructureError:

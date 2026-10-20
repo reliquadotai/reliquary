@@ -661,8 +661,16 @@ class AsyncMiner:
         if not self._ready.is_set():
             return False
         version = int(self._state_version)
+        # A rollout is generated on one checkpoint: the swap waited for the running leases (the longest episode)
+        # with no new lease started; that wait is the swap's cost in generation time.
+        since = getattr(self, "_ready_since", None)
+        waited = 0.0 if since is None else max(0.0, self._clock() - since)
         await asyncio.to_thread(self.generator.load_weights, self._state, version)
-        logger.info("generator now on checkpoint %d (was %s)", version, self.loaded_version)
+        self.stats["swaps"] = self.stats.get("swaps", 0) + 1
+        self.stats["swap_wait_s"] = round(self.stats.get("swap_wait_s", 0.0) + waited, 1)
+        self.stats["swap_wait_max_s"] = round(max(self.stats.get("swap_wait_max_s", 0.0), waited), 1)
+        logger.info("generator now on checkpoint %d (was %s) after %.0f s waiting for running leases", version,
+                    self.loaded_version, waited)
         self.loaded_version, self._stale = version, False
         self._ready.clear()
         self._wake_lease.set()
@@ -860,6 +868,7 @@ class AsyncMiner:
         logger.info("checkpoint %d rebuilt (%s, %d bytes)", version,
                     "anchor" if plan.anchor is not None else f"{len(plan.deltas)} deltas", plan.bytes)
         self._state, self._state_version = state, version
+        self._ready_since = self._clock()
         self._ready.set()
         self._wake_generation.set()
         return version

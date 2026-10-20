@@ -392,10 +392,15 @@ class VLLMRolloutGenerator:
         require_runner_forced_draw()
         from vllm import LLM  # local import: optional dependency
 
+        from reliquary.miner.engine_reaper import child_pids, reap_engine_children_on_exit
+
+        before = set(child_pids())
         engine = LLM(
             model=model_path, revision=revision, dtype="bfloat16",
             logits_processors=[RunnerForcedSeedVLLMProcessor], **self._settings,
         )
+        # The spawned engine core holds the GPU: it must not outlive a miner killed with SIGKILL.
+        reap_engine_children_on_exit(before)
         logger.info(
             "vLLM generation backend ready (%s%s)", model_path,
             f"@{revision}" if revision else "",
