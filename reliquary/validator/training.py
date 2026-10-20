@@ -1243,7 +1243,13 @@ def _forced_draw_rows(logits_of, rows, targets, draws, chunk: int = _LOGPROB_CHU
     gap = torch.zeros(n, dtype=torch.float32, device=targets.device)
     for start in range(0, n, chunk):
         end = min(n, start + chunk)
-        logits = logits_of(rows[start:end])
+        # A no-grad cast must not seed the checkpointed projection's weight cache.
+        cache_enabled = torch.is_autocast_cache_enabled()
+        try:
+            torch.set_autocast_cache_enabled(False)
+            logits = logits_of(rows[start:end])
+        finally:
+            torch.set_autocast_cache_enabled(cache_enabled)
         logp = torch.log_softmax(logits.float(), dim=-1)
         probs = logp.exp()
         stochastic[start:end] = probs.max(dim=-1).values < settings.stochastic_threshold
@@ -1303,9 +1309,7 @@ def _selected_logprobs_from_hidden(
         # The FSDP2 head (reliquary.trainer.distributed) runs this same chunk
         # loop inside ONE module call, so its sharded weight is gathered once
         # for every chunk and its gradient reduced once.
-        if draws is None:
-            return lm_head(hidden_rows, indices)
-        return lm_head(hidden_rows, indices, draws)
+        return lm_head(hidden_rows, indices, draws, chunk=chunk)
     draw_rows = None
     if draws is not None:
         draw_rows = _forced_draw_rows(

@@ -48,7 +48,7 @@ import threading
 import time
 import zlib
 
-from reliquary.services import SERVICE_OBSERVATION_FLUSH_SECONDS, SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS
+from reliquary.shared import SERVICE_OBSERVATION_FLUSH_SECONDS, SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS
 from reliquary.protocol.release_contract import canonical_json_bytes
 
 logger = logging.getLogger(__name__)

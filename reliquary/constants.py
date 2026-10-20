@@ -14,7 +14,7 @@ from reliquary.environment.grader import (
     GRADER_SOCKET_PATH as GRADER_SOCKET_PATH,
 )
 from reliquary.shared.task_id import parse_task_ids
-from reliquary.services import (
+from reliquary.shared import (
     SERVICE_OBSERVATION_FLUSH_SECONDS as SERVICE_OBSERVATION_FLUSH_SECONDS,
     SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS as SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS,
 )
