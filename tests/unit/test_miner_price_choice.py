@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections
 import random
+import statistics
 from types import SimpleNamespace
 
 import pytest
@@ -25,6 +26,23 @@ def test_weights_are_pay_times_the_middle_of_the_paid_fraction_range():
         "math": pytest.approx(0.375), "code": pytest.approx(0.125)}
     assert weights_from_pay({"status": "loading"}) is None
     assert weights_from_pay({"environments": {}}) is None
+
+
+def _async(**envs):
+    return {"policy": "pay-per-matched-token/v1", "environments": {
+        name: {"token_price": price, "per_million_tokens": 1e6 * price,
+               "recent": {"groups": groups, "trained_share": trained, "first_scan_share": first}}
+        for name, (price, groups, trained, first) in envs.items()}}
+
+
+def test_the_async_board_weighs_price_by_what_recent_groups_were_paid():
+    weights = weights_from_pay(_async(math=(2.0, 100, 0.25, 0.4), code=(1.0, 50, 0.5, 0.0),
+                                      fresh=(5.0, 0, None, None), dead=(1.0, 80, 0.0, 0.0)))
+    assert weights["math"] == pytest.approx(2.0 * (0.25 + 0.25 * 0.4))            # trained + a quarter per first scan
+    assert weights["code"] == pytest.approx(0.5)
+    assert weights["fresh"] == pytest.approx(statistics.median([0.7, 0.5]))      # no history yet: the median
+    assert 0 < weights["dead"] < weights["code"]                                  # paid nothing lately: still drawn
+    assert weights_from_pay(_async(math=(1.0, 0, None, None))) is None            # nothing to steer by: the mix
 
 
 def test_mode_defaults_to_price_and_refuses_typos():

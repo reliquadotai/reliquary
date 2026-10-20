@@ -2,11 +2,16 @@
 
 A price only steers supply if miners look at it. The reference miner draws
 its next environment with probability proportional to what the validator
-advertises an environment pays per generated token: alpha per million paid
-tokens times the share of generated groups that get paid (the middle of
-the published low/high range); an environment not priced yet gets the median
-weight. The draw stays random, so miners spread
-instead of all piling onto the single best environment.
+advertises an environment pays per generated token; an environment not priced
+yet gets the median weight. The draw stays random, so miners spread instead of
+all piling onto the single best environment.
+
+Two board formats: the async validator's (``rl_ledger.RlPayLedger.board``:
+per env ``token_price`` and ``recent``, the share of its recent groups trained
+and the share that were paid first scans; a group pays about ``token_price``
+per token when trained and a quarter of that as a first scan) and the window
+validator's (alpha per million paid tokens times the middle of the paid
+fraction's low/high range).
 
 ``RELIQUARY_MINER_ENV_CHOICE=mix`` keeps today's draw by the static mix.
 """
@@ -27,6 +32,8 @@ logger = logging.getLogger(__name__)
 ENV_CHOICE_VARIABLE = "RELIQUARY_MINER_ENV_CHOICE"
 _MODES = ("price", "mix")
 CACHE_SECONDS = 60.0
+FIRST_SCAN_FRACTION = 0.25        # a first scan pays a quarter of a trained group (rl_ledger)
+UNPAID_EXPLORATION = 0.05         # weight of an env whose recent groups paid nothing, relative to the median
 FETCH_TIMEOUT_SECONDS = 5.0
 
 
@@ -50,17 +57,27 @@ def weights_from_pay(body: Any) -> dict[str, float] | None:
         return None
     weights: dict[str, float] = {}
     unpriced: list[str] = []
+    unpaid: list[str] = []          # async: priced, but its recent groups paid nothing
     for name, entry in environments.items():
         try:
-            rate = float(entry["now"]["alpha_per_mtoken_paid"])
-            paid = entry["market"]["paid_fraction_of_submitted"]
-            fraction = (float(paid["low"]) + float(paid["high"])) / 2.0
+            if isinstance(entry, Mapping) and "token_price" in entry:     # the async board
+                recent = entry.get("recent") or {}
+                if not recent.get("groups"):
+                    raise KeyError("no recent group")
+                rate = float(entry["token_price"])
+                fraction = float(recent["trained_share"]) + FIRST_SCAN_FRACTION * float(recent["first_scan_share"])
+            else:
+                rate = float(entry["now"]["alpha_per_mtoken_paid"])
+                paid = entry["market"]["paid_fraction_of_submitted"]
+                fraction = (float(paid["low"]) + float(paid["high"])) / 2.0
         except (KeyError, TypeError, ValueError):
             unpriced.append(str(name))
             continue
         weight = rate * fraction
         if math.isfinite(weight) and weight > 0:
             weights[str(name)] = weight
+        elif isinstance(entry, Mapping) and "token_price" in entry and math.isfinite(weight):
+            unpaid.append(str(name))
         else:
             unpriced.append(str(name))
     if not weights:
@@ -68,6 +85,8 @@ def weights_from_pay(body: Any) -> dict[str, float] | None:
     middle = statistics.median(weights.values())
     for name in unpriced:
         weights[name] = middle
+    for name in unpaid:
+        weights[name] = UNPAID_EXPLORATION * middle    # still sampled now and then: its pay can come back
     return weights
 
 
