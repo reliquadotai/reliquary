@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  cpu-suite:
+  cpu-tests:
     runs-on: ubuntu-24.04
     # Allow setup and authenticity checks beside the full CPU suite.
     timeout-minutes: 45
@@ -36,6 +36,102 @@ jobs:
         run: |
           pytest -q tests/unit/test_grpo_window_batcher.py \
             -k 'all_token_auth or forced_seed_group_gate or forced_seed_gate_abstains or forced_seed_cdf_gate or forged or tamper'
+
+  cpu-suite:
+    runs-on: ubuntu-24.04
+    needs: [cpu-tests, signed-sandbox-cpu]
+    if: always()
+    steps:
+      - name: Require all CPU suites
+        env:
+          CPU_RESULT: ${{ needs.cpu-tests.result }}
+          SANDBOX_RESULT: ${{ needs.signed-sandbox-cpu.result }}
+        run: test "$CPU_RESULT" = success && test "$SANDBOX_RESULT" = success
+
+  signed-sandbox-cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      SIGNED_SANDBOX_MODULES: >-
+        test_signed_parse test_signed_state test_signed_intake test_signed_miner
+        test_signed_grading_and_wiring test_signed_episode_e2e
+        test_sandbox_sessions test_sandbox_fleet test_sandbox_routes test_sandbox_dependency
+        test_rl_episode_e2e test_rl_episode_wiring
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install pinned sandbox test runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[dev,sandbox-test,sandbox-miner]"
+      - name: Require the signed sandbox dependencies
+        run: |
+          python - <<'PY'
+          import reliquary_sandbox.attest
+          import reliquary_sandbox_service.episodes.testing
+          import reliquary_sandbox_verifiers.runner
+          PY
+      - name: Run signed sandbox CPU tests
+        id: signed_tests
+        run: |
+          paths=()
+          for module in $SIGNED_SANDBOX_MODULES; do
+            paths+=("tests/unit/$module.py")
+          done
+          pytest -q "${paths[@]}" \
+            --junitxml="$RUNNER_TEMP/signed-sandbox.xml" \
+            -o junit_logging=no -o junit_log_passing_tests=false
+      - name: Check every required module ran and write a safe summary
+        if: always()
+        env:
+          TEST_OUTCOME: ${{ steps.signed_tests.outcome }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          report = Path(os.environ["RUNNER_TEMP"]) / "signed-sandbox.xml"
+          try:
+              cases = list(ET.parse(report).iter("testcase"))
+          except (FileNotFoundError, ET.ParseError):
+              cases = []
+          required = {f"tests.unit.{name}" for name in os.environ["SIGNED_SANDBOX_MODULES"].split()}
+          exercised = {case.get("classname") for case in cases if case.find("skipped") is None}
+          missing = required - exercised
+          failed = sum(case.find("failure") is not None for case in cases)
+          errors = sum(case.find("error") is not None for case in cases)
+          skipped = sum(case.find("skipped") is not None for case in cases)
+          passed = sum(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped"))
+                       for case in cases)
+          succeeded = os.environ["TEST_OUTCOME"] == "success"
+          summary = {
+              "status": "passed" if succeeded and not (missing or failed or errors) else "failed",
+              "revision": os.environ["GITHUB_SHA"],
+              "tests": len(cases), "passed": passed,
+              "failed": failed, "errors": errors, "skipped": skipped,
+              "modules_expected": len(required), "modules_exercised": len(required & exercised),
+          }
+          target = Path("test-results/signed-sandbox-summary.json")
+          target.parent.mkdir(exist_ok=True)
+          target.write_text(json.dumps(summary, sort_keys=True) + "\n")
+          assert not missing, "A required signed-sandbox module ran no tests"
+          assert failed == errors == 0, "Signed-sandbox tests failed"
+          assert succeeded, "Signed-sandbox test execution did not succeed"
+          PY
+      - name: Upload signed sandbox test counts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-sandbox-test-summary
+          path: test-results/signed-sandbox-summary.json
+          if-no-files-found: error
+          retention-days: 7
 
   # The suite above runs at DEFAULT_PROFILE_ID, which is still v2, so it
   # exercises the fill-closed code with B_BATCH=8 and M_ROLLOUTS=8. This job

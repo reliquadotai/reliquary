@@ -1756,8 +1756,7 @@ PI_OLD_FROM_VERIFY_LOGPROBS = _os.environ.get(
     "RELIQUARY_PI_OLD_FROM_VERIFY_LOGPROBS", "true"
 ).strip().lower() in ("1", "true", "yes", "on")
 
-# Pipelined window collection (design: docs/superpowers/specs/
-# 2026-08-19-pipelined-window-collection-design.md). When on, the next
+# Pipelined window collection. When on, the next
 # window's collection opens BEFORE the previous window's GPU half (proofs +
 # train) runs, hiding the collection deadline entirely under GPU work:
 # cycle -> max(GPU, collection) ~= P+T. Nothing is proven before its own
