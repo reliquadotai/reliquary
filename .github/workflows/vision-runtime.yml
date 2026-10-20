@@ -33,7 +33,8 @@ jobs:
           python-version: "3.12"
       - run: pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cpu
       - run: pip install pytest pytest-asyncio Pillow==12.3.0 transformers==5.10.4 peft==0.21.2 accelerate==1.15.0 num2words==0.5.14
-      - run: python -m pytest tests/unit/test_vision* -q
+      # This worker does not import validator/server dependencies or fixtures.
+      - run: python -m pytest --noconftest tests/unit/test_vision* -q
         env:
           HF_HUB_OFFLINE: "1"
           TRANSFORMERS_OFFLINE: "1"
