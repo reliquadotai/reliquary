@@ -83,7 +83,7 @@ class Clock:
 
 
 def build(tmp_path, *, remaining=2, policy=SandboxPolicy(), store=None, limits=None, clock=None,
-          jobs=None, options_sha256=None):
+          jobs=None, options_sha256=None, prepare_timeout_s=None):
     tmp_path.mkdir(parents=True, exist_ok=True)
     validator, machine = signer(tmp_path, "v", "v1"), signer(tmp_path, "m", "k1")
     clock = clock or Clock()
@@ -93,7 +93,7 @@ def build(tmp_path, *, remaining=2, policy=SandboxPolicy(), store=None, limits=N
     left = {"n": remaining}
 
     async def resolve(index):
-        return ResolvedTask(IMAGE, dict(limits or {}), options_sha256)
+        return ResolvedTask(IMAGE, dict(limits or {}), options_sha256, prepare_timeout_s)
 
     async def slots(index):
         return left["n"]
@@ -146,6 +146,20 @@ def test_the_options_the_task_was_resolved_with_go_to_placement(tmp_path):
     env = build(tmp_path / "none")
     open_(env)
     assert env.fleet.picked[-1]["env_options_sha256"] is None
+
+
+@pytest.mark.parametrize("prepare_timeout_s,open_window_s", [
+    (None, 900), (30, 900), (1800.25, 1921),
+])
+def test_a_corpus_token_covers_declared_preparation_and_the_full_episode(
+        tmp_path, prepare_timeout_s, open_window_s):
+    env = build(tmp_path, prepare_timeout_s=prepare_timeout_s)
+    grant = open_(env)
+    claims = attest.verify_session_token(grant.token, {"v1": attest.public_key_from_b64(
+        env.validator.public_key_b64)})
+    expected_validity = open_window_s + JOB.episode.sandbox.budgets.wall_s
+    assert claims.expires_at == NOW + expected_validity
+    assert env.fleet.picked[-1]["validity_s"] == expected_validity
 
 
 def test_the_default_resolver_carries_the_bridged_env_options_digest(monkeypatch):
