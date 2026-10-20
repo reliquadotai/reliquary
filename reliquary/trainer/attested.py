@@ -11,7 +11,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-TEE_RUNTIME_COMMIT = "489b802af63e7ad2374d9bc14b638411cb1a3841"
+TEE_RUNTIME_COMMIT = "6606c12c6292050999c2513c760554185dfa1e80"
 TEE_RUNTIME_VERSION = "0.3.0rc1"
 TEE_RUNTIME_URL = "https://github.com/reliquadotai/reliquary-TEE.git"
 

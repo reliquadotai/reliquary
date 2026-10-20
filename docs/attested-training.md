@@ -23,7 +23,7 @@ dependencies again. The `gpu` extra includes the CUDA dependencies on Linux;
 the optional sandbox package is not selected.
 
 ```sh
-TEE_RUNTIME_REVISION=489b802af63e7ad2374d9bc14b638411cb1a3841
+TEE_RUNTIME_REVISION=6606c12c6292050999c2513c760554185dfa1e80
 git clone --no-checkout https://github.com/reliquadotai/reliquary-TEE.git \
   /opt/reliquary-attested-source
 git -C /opt/reliquary-attested-source checkout --detach "$TEE_RUNTIME_REVISION"
@@ -49,7 +49,7 @@ administrator. Use an operator-controlled environment and state directory.
 
 Prepare the authority, worker certificate, TLS pins, immutable model assets,
 signed assignments, verified grades and local queue using the pinned runtime's
-[async RL runbook](https://github.com/reliquadotai/reliquary-TEE/blob/489b802af63e7ad2374d9bc14b638411cb1a3841/docs/async-rl.md).
+[async RL runbook](https://github.com/reliquadotai/reliquary-TEE/blob/6606c12c6292050999c2513c760554185dfa1e80/docs/async-rl.md).
 Review the runtime's [release notes](https://github.com/reliquadotai/reliquary-TEE/releases)
 for its qualification status. Installing or selecting this mode does not
 activate a worker fleet or a core protocol profile.
@@ -110,7 +110,7 @@ GRPO groups, bounded lag and the full-support sampling contract are required.
 
 New checkpoint assets and `current-policy.json` are published locally. The
 pinned runtime also provides an opt-in
-[checkpoint rotation path](https://github.com/reliquadotai/reliquary-TEE/blob/489b802af63e7ad2374d9bc14b638411cb1a3841/docs/checkpoint-rotation.md):
+[checkpoint rotation path](https://github.com/reliquadotai/reliquary-TEE/blob/6606c12c6292050999c2513c760554185dfa1e80/docs/checkpoint-rotation.md):
 the trainer records a publication event atomically with its applied step; a
 separate publisher validates and signs that checkpoint. An approved measured
 supervisor obtains fresh challenge-bound authorization and CPU/GPU attestation
@@ -119,7 +119,7 @@ assignments and selects the current release for new prompt jobs.
 
 Prepare the publisher, fleet service, worker supervisor and dispatcher as
 separate supervised processes using that runbook and its
-[service templates](https://github.com/reliquadotai/reliquary-TEE/blob/489b802af63e7ad2374d9bc14b638411cb1a3841/deploy/async-rl/README.md).
+[service templates](https://github.com/reliquadotai/reliquary-TEE/blob/6606c12c6292050999c2513c760554185dfa1e80/deploy/async-rl/README.md).
 They share the configured local queue and registry with this trainer. The
 publisher consumes finalized steps, including explicit checkpoint recovery;
 it does not infer finality from the current-policy file alone. Prompt files
