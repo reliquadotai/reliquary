@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  cpu-suite:
+  validator-suite:
     runs-on: ubuntu-24.04
     # Allow setup and authenticity checks beside the full CPU suite.
     timeout-minutes: 45
@@ -86,6 +86,20 @@ jobs:
             tests/unit/test_corpus_settlement.py \
             tests/unit/test_corpus_multi_job_contract.py \
             tests/unit/test_tasks_create_composed.py
+
+  cpu-suite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [validator-suite, sandbox-integration]
+    if: always()
+    steps:
+      - name: Require both CPU suites
+        env:
+          VALIDATOR_RESULT: ${{ needs.validator-suite.result }}
+          SANDBOX_RESULT: ${{ needs.sandbox-integration.result }}
+        run: |
+          test "$VALIDATOR_RESULT" = success
+          test "$SANDBOX_RESULT" = success
 
   # The suite above runs at DEFAULT_PROFILE_ID, which is still v2, so it
   # exercises the fill-closed code with B_BATCH=8 and M_ROLLOUTS=8. This job
