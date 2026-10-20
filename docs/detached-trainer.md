@@ -1,8 +1,5 @@
 # Detached Trainer — Operator Runbook
 
-Design: `docs/superpowers/specs/2026-08-21-detached-trainer-r2-design.md`.
-Plan: `docs/superpowers/plans/2026-08-21-detached-trainer-r2.md`.
-
 The validator writes one training payload (or tombstone) per sealed
 window to R2 under `reliquary/training/`; a standalone
 `reliquary train-worker` process consumes them strictly in order, runs

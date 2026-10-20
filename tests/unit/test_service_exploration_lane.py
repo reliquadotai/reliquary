@@ -29,7 +29,7 @@ from reliquary.validator.proof_scheduler import (
     GlobalProofScheduler, ProofDecision, ProofDecisionStatus, ProofPlan, RankedProof,
 )
 from tests.unit.service_v2_fixtures import CODE, MATH, contract_v2, contract_v2_dict, qualification_v2
-from tests.unit.test_grpo_window_batcher import FakeEnv, _make_batcher
+from tests.unit.test_grpo_window_batcher import FakeEnv, _make_batcher, _request
 
 PICKS, SLOTS = protocol_slot_geometry()
 POOL = 0.25
@@ -637,10 +637,25 @@ def test_a_forged_termination_stays_a_failed_audit_on_the_service_path(tmp_path)
     assert rt.exploration_banned("forger")
 
 
-def test_the_legacy_cap_count_limit_does_not_apply_to_the_service_path_but_does_to_legacy(monkeypatch):
-    import inspect
-    source = inspect.getsource(GrpoWindowBatcher._verify_expensive)
-    assert "service_contract is None\n                        and truncated_count > max_truncated_per_submission" in source
+@pytest.mark.parametrize("service_task", [False, True])
+def test_the_truncation_count_limit_applies_only_to_legacy_tasks(monkeypatch, service_task):
+    from reliquary.validator.verifier import ProofResult
+
+    b, request = _make_batcher(), _request()
+    assert b.accept_submission(request).accepted
+    pending = b.pending_submissions()[-1]
+    monkeypatch.setattr(b, "_service_submission_contract", lambda request: contract_v2() if service_task else None)
+    monkeypatch.setattr(b, "_verify_commitment", lambda *args, **kwargs: ProofResult(
+        all_passed=True, passed=1, checked=1, has_sparse_outputs=True))
+    monkeypatch.setattr(batcher_module, "max_truncated_for_environment", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(batcher_module, "has_eos_padding", lambda *args, **kwargs: False)
+    monkeypatch.setattr(batcher_module, "verify_termination", lambda *args, **kwargs: True)
+    monkeypatch.setattr(batcher_module, "is_cap_truncation", lambda *args, **kwargs: True)
+    # The next gate refuses: reaching it proves the service path passed the zero truncation budget.
+    monkeypatch.setattr(batcher_module, "validate_force_span", lambda *args, **kwargs: (False, set()))
+
+    assert b._verify_expensive(pending) is None
+    assert pending.proof_reject_stage == ("force_span" if service_task else "termination")
 
 
 def test_an_audit_verdict_that_is_not_applied_is_retried_while_the_row_waits_and_acted_on(tmp_path, monkeypatch):
@@ -1910,8 +1925,6 @@ def test_r31_every_stage_an_audit_can_reject_at_is_in_the_classification_table()
     assert {"grail", "toploc", "logprob", "forced_seed", "termination"} <= stages      # the regex sees them
     no_verdict = set(GrpoWindowBatcher._AUDIT_INCONCLUSIVE_STAGES) | {"service_length", "service_signal"}
     assert stages - no_verdict <= set(AUDIT_FAILURE_CLASS_BY_STAGE), stages - no_verdict - set(AUDIT_FAILURE_CLASS_BY_STAGE)
-    # the forced-seed scope reaches the classification on the service path only
-    assert "if service_contract is not None:\n                # R31" in source
     assert "pending.proof_reject_scope = scope" in source
 
 

@@ -642,9 +642,7 @@ def open_grpo_window(
     picked B_BATCH chunk every time that environment takes a pick, from
     whichever thread called ``pick_training_batch`` (see
     ``GrpoWindowBatcher.pick_training_batch``). ``None`` here -- no
-    caller wires a detached-trainer writer into it yet; see
-    ``docs/superpowers/plans/2026-08-28-fill-closed-window-v6.md``,
-    Component 4.
+    caller wires a detached-trainer writer into it yet.
     """
     def _completion_text(rollout: RolloutSubmission) -> str:
         prompt_len = rollout.commit.get("rollout", {}).get("prompt_length", 0)
@@ -1072,7 +1070,7 @@ class ValidationService:
             },
         )
         import copy
-        # Two-model architecture (see docs/superpowers/plans/2026-05-13-...).
+        # Two-model architecture.
         # train_model: trainable, mutated by train_step every window.
         # verify_model: frozen snapshot of the last published checkpoint. It
         # verifies commitment proofs and can independently supply PPO's old
