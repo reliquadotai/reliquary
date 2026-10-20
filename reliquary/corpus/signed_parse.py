@@ -95,6 +95,14 @@ def _observation(renderer, body) -> str:
     return renderer.observation(body, text)
 
 
+def _refusal(renderer, pair, plan) -> str:
+    """The model's text for a call answered without a record: the harness's own (mini's format
+    errors), else the refusal's fixed text."""
+    local = getattr(renderer, "refusal_observation", None)
+    own = local(*pair) if local is not None else None
+    return plan.observation if own is None else own
+
+
 def parse_signed_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int],
                             tokens: Sequence[int], spans: Sequence[tuple[int, int]], stop: str,
                             max_turns: int | None, calls: Sequence[Any],
@@ -177,9 +185,9 @@ def parse_signed_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int]
             continue
         if not pairs:
             raise TrajectoryRefused(REASON_BAD_OBSERVATION, {"turn": k, "why": "no tool call"})
-        observations = [plan.observation if isinstance(plan, Refuse)
+        observations = [_refusal(renderer, pair, plan) if isinstance(plan, Refuse)
                         else _observation(renderer, take(k, position, plan).to_dict())
-                        for plan, position in zip(plans, positions)]
+                        for pair, plan, position in zip(pairs, plans, positions)]
         expected = renderer.next_prompt(full[:offset + start], completion, observations)
         if expected is None or expected != full[:offset + spans[k + 1][0]]:
             raise TrajectoryRefused(REASON_BAD_OBSERVATION, {

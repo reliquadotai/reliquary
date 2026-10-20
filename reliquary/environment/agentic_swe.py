@@ -18,18 +18,19 @@ import threading
 from collections.abc import Sequence
 
 from reliquary_harness import qwen as _harness_qwen
-from reliquary_harness.spec import BASH_SURFACE_V1, VERIFIERS_COMMIT, get_spec
+from reliquary_harness.spec import BASH_SURFACE_V1, MINI_SWE_V1, VERIFIERS_COMMIT, get_spec
 from reliquary_harness.spec import BASH_VF_B2E4E81 as HARNESS
 from reliquary_harness.variant import variant_count, variant_index
 
 from reliquary.environment.agentic.types import EpisodeTask
 
-HARNESS_DIGEST = "18e24ae04528c3953469e3a82db41f3de8db36fce4864eecb16bf2503961e307"
+HARNESS_DIGEST = "5e215c4cfa4a6a459d26a60ce4bd0f8091ec793d66649f1a58f919cf458731a8"
 """The bash harness this build renders, checks and mines with (`HARNESS.digest`): an
 installed reliquary-harness with another digest is not this build's harness."""
 HARNESS_DIGESTS = {
     HARNESS.key: HARNESS_DIGEST,
-    BASH_SURFACE_V1.key: "40d92dcf334950ff2216970216637435cf5331c93c240308f36dc20620c6d0eb",
+    BASH_SURFACE_V1.key: "fd83b4d90ba034b7012db0e29ed1932bdb04e5db549ca007b812f4e18d6d208f",
+    MINI_SWE_V1.key: "ee77cb30c04e55b949b262ce38fceefe4b702e9ca9c10f2860d1bf51356ddcfe",
 }
 """Every harness spec this build serves, by `id@version`, at the digest it was built against.
 A job or an RL episode env names one with `{id, version, digest}`; one naming none is
@@ -93,6 +94,9 @@ def harness_pin_refusal(pin, *, variants: bool) -> str | None:
         return f"the contract pins harness {key} at {pin['digest']}, this build serves {HARNESS_DIGESTS[key]}"
     if not variants and variant_count(get_spec(pin["id"], pin["version"])) != 1:
         return f"harness {key} draws surface variants per episode: an RL lease's, not a corpus job's"
+    if not variants and key != HARNESS.key:
+        # The corpus paths (intake, export, the replay miner) render with the compatibility harness only.
+        return f"a corpus job plays {HARNESS.key} only in this build, not {key}"
     return None
 
 

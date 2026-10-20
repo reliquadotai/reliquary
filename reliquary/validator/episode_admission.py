@@ -338,10 +338,11 @@ def _limit_not_reached(policy, renderer, *, tokens, spans, stop, calls, opened, 
     plans = [plan_call(name, arguments, opened.tools) for name, arguments in pairs]
     sends = sum(1 for position in sent_positions(plans) if position is not None)
     records = iter(calls[len(calls) - sends:] if sends else ())
-    from reliquary.corpus.signed_parse import _observation
+    from reliquary.corpus.signed_parse import _observation, _refusal
 
-    observations = [plan.observation if isinstance(plan, Refuse) else _observation(renderer, next(records).to_dict())
-                     for plan in plans]
+    observations = [_refusal(renderer, pair, plan) if isinstance(plan, Refuse)
+                    else _observation(renderer, next(records).to_dict())
+                    for pair, plan in zip(pairs, plans)]
     following = renderer.next_prompt(tokens[:start], last, observations)
     if following is not None and len(following) > policy.max_episode_tokens:
         return None                                     # (b) the observations overflow the episode

@@ -141,9 +141,15 @@ class HarnessEpisodeRunner:
                     # a refused call (no record) is answered with its fixed text as is.
                     before = len(router.records)
                     text = await router.answer(turn, calls, call_id)
-                    if len(router.records) > before and getattr(renderer, "observation_format", "plain") != "plain":
-                        text = renderer.observation(router.records[-1]["body"], text)
-                    return text
+                    if len(router.records) > before:
+                        if getattr(renderer, "observation_format", "plain") != "plain":
+                            text = renderer.observation(router.records[-1]["body"], text)
+                        return text
+                    # A call answered locally: the harness may have its own text for it (mini's format errors).
+                    _, name, arguments = next(call for call in calls if call[0] == call_id)
+                    local = getattr(renderer, "refusal_observation", None)
+                    own = local(name, arguments) if local is not None else None
+                    return text if own is None else own
 
                 async with asyncio.timeout_at(deadline):
                     outcome = await play(renderer=renderer, prompt=prompt, max_turns=self._max_turns,
