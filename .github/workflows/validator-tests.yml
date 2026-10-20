@@ -37,6 +37,56 @@ jobs:
           pytest -q tests/unit/test_grpo_window_batcher.py \
             -k 'all_token_auth or forced_seed_group_gate or forced_seed_gate_abstains or forced_seed_cdf_gate or forged or tamper'
 
+  sandbox-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      OMP_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.15"
+          cache: pip
+      - name: Install the pinned sandbox integration runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[dev,sandbox,sandbox-test]"
+      - name: Require the signed sandbox dependencies and exact source pin
+        run: |
+          python - <<'PY'
+          import importlib
+          from reliquary.sandbox import SANDBOX_COMMIT, sandbox_commit_refusal
+          for module in (
+              "bittensor", "renderers", "verifiers.v1.clients.train",
+              "verifiers.v1.harnesses.bash.harness", "reliquary_sandbox.attest",
+              "reliquary_sandbox.observation", "reliquary_sandbox_verifiers.task",
+              "reliquary_sandbox_service.episodes.testing",
+              "reliquary_sandbox_service.episodes.state_archive",
+          ):
+              importlib.import_module(module)
+          refusal = sandbox_commit_refusal(SANDBOX_COMMIT)
+          assert refusal is None, refusal
+          print("Installed sandbox source:", SANDBOX_COMMIT)
+          PY
+      - name: Check signed tasks, recovery, admission, grading, and settlement
+        run: |
+          pytest -q -rs \
+            tests/unit/test_sandbox*.py \
+            tests/unit/test_signed*.py \
+            tests/unit/test_rl_*.py \
+            tests/unit/test_bridged*.py \
+            tests/unit/test_agentic_swe_signed.py \
+            tests/unit/test_corpus_quota.py \
+            tests/unit/test_corpus_job_signed_sandbox.py \
+            tests/unit/test_corpus_export_signed.py \
+            tests/unit/test_corpus_period_settlement.py \
+            tests/unit/test_corpus_settlement.py \
+            tests/unit/test_corpus_multi_job_contract.py \
+            tests/unit/test_tasks_create_composed.py
+
   # The suite above runs at DEFAULT_PROFILE_ID, which is still v2, so it
   # exercises the fill-closed code with B_BATCH=8 and M_ROLLOUTS=8. This job
   # runs the same fill-closed tests at the shape production will actually
