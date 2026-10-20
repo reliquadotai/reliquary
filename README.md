@@ -228,6 +228,7 @@ running an operator workload.
 | [Concepts](docs/concepts.md) | Current mechanism, incentives, verification, and economics |
 | [Mining](docs/mining.md) | Reference miner, submission lifecycle, hardware, and troubleshooting |
 | [Validating](docs/validating.md) | Weight-only and trainer deployment |
+| [Authenticated async training](docs/attested-training.md) | Explicit isolated rollout consumer and its qualification boundaries |
 | [Validator observability](docs/validator_observability.md) | Health, verdict, archive, and runtime evidence |
 | [Historical auction-v2 design](docs/superpowers/specs/2026-07-15-difficulty-auction-v2-design.md) | Origin of the fixed-window selector and payout mechanism; superseded values are non-normative |
 | [Utility foundation](docs/auction-v3-utility-foundation.md) | Observation-only research surface and activation gates |

@@ -4435,11 +4435,26 @@ def train_worker(
             "pre-cutover comparison against the in-process trainer."
         ),
     ),
+    attested_job: Path | None = typer.Option(
+        None,
+        "--attested-job",
+        help="Explicit operator job for the separately installed authenticated async trainer.",
+    ),
 ) -> None:
-    """Detached trainer: consume R2 training payloads, publish checkpoints.
+    """Detached trainer, or an explicitly selected authenticated rollout consumer.
 
     See docs/superpowers/specs/2026-08-21-detached-trainer-r2-design.md.
     """
+    if attested_job is not None:
+        if shadow:
+            raise typer.BadParameter("--shadow cannot be combined with --attested-job")
+        from reliquary.trainer.attested import run_attested_worker
+
+        try:
+            run_attested_worker(attested_job)
+        except (ValueError, OSError) as exc:
+            raise typer.BadParameter(str(exc), param_hint="--attested-job") from None
+        return
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(threadName)s | %(name)s | "
