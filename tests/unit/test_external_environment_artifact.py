@@ -202,3 +202,20 @@ def test_wheel_download_rejects_wrong_bytes_without_clobbering_files(tmp_path, m
         qualification.download_pinned_wheel(tmp_path)
     assert list(tmp_path.iterdir()) == [preserved]
     assert preserved.read_bytes() == b"user file"
+
+
+def test_load_external_backend_allows_benchmark(monkeypatch):
+    from reliquary.environment.agentic import external
+
+    class Backend:
+        def __init__(self, split="train"):
+            self.split = split
+
+    module = type("M", (), {"Backend": Backend})
+    monkeypatch.setattr(
+        external, "_import_verified",
+        lambda spec, names: ({"entrypoints": {"replay": "m:Backend"}}, (module,)))
+    for split in ("train", "eval", "qualification", "benchmark"):
+        assert external.load_external_backend(None, split=split).split == split
+    with pytest.raises(ValueError, match="unsupported external environment split"):
+        external.load_external_backend(None, split="test")

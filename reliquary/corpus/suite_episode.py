@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from reliquary.corpus.job import SUITE_PACKAGE, SUITE_STOPS, EpisodeSpec
+from reliquary.eval.rows import RowMap
 
 # The renderers a suite job may declare: the ones whose turns end on a single
 # terminator token, which the corpus termination check and the export's chat
@@ -176,11 +177,22 @@ def suite_span_refusal(tokens: Sequence[int], spans: Sequence[tuple[int, int]], 
 
 
 class SuiteSource:
-    """A suite job's rows: the environment's train-split tasks, by index, and
-    the renderer the job declares. ``initial_ids`` is what the miner prompts
-    with and what the validator compares the trajectory's prompt to."""
+    """A suite job's rows: the environment's tasks, through the job's
+    ``RowMap``, and the renderer the job declares. ``initial_ids`` is what the
+    miner prompts with and what the validator compares the trajectory's prompt
+    to.
 
-    def __init__(self, environment, episode: EpisodeSpec, renderer_id: str) -> None:
+    Row ``i`` plays task ``rows.index(i)`` of the environment, which is built
+    once, at ``rows.split``, by whoever builds the source (``suite_source``),
+    never per call. Without ``rows`` the map is the identity over the whole
+    environment on ``train``: a training job's ``prompt_index`` is the task's
+    index, as it always was, and ``len`` is the environment's (the intake
+    refuses a job owning rows past it). Build it once per job and process
+    (``job_suite_source``): the environment is built, and an eval job's
+    references checked, there."""
+
+    def __init__(self, environment, episode: EpisodeSpec, renderer_id: str,
+                 rows: RowMap | None = None) -> None:
         # Refused, not capped: a job declaring more turns than the environment
         # runs would sell episodes that can never reach its limit.
         if episode.max_turns > int(environment.max_turns):
@@ -188,15 +200,18 @@ class SuiteSource:
                 f"episode.max_turns {episode.max_turns} is above environment "
                 f"{environment.name!r}'s own max_turns {environment.max_turns}; "
                 f"declare at most {environment.max_turns}")
+        if rows is None:
+            rows = RowMap.identity("train", 0, len(environment))
         self.environment = environment
         self.episode = episode
         self.renderer_id = renderer_id
+        self.rows = rows
 
     def __len__(self) -> int:
-        return len(self.environment)
+        return len(self.rows)
 
     def task(self, prompt_index: int):
-        return self.environment.get_task(int(prompt_index))
+        return self.environment.get_task(self.rows.index(int(prompt_index)))
 
     task_for = task
 
@@ -214,9 +229,35 @@ class SuiteSource:
     prompt = initial_text
 
 
-def suite_source(episode: EpisodeSpec, *, specs: Mapping[str, Any] | None = None) -> SuiteSource:
+def suite_source(episode: EpisodeSpec, *, rows: RowMap | None = None,
+                 specs: Mapping[str, Any] | None = None) -> SuiteSource:
+    """The source of a suite episode: its environment, built once at
+    ``rows.split`` (``train`` without ``rows``: the identity over the whole
+    environment, a training job's source). With ``rows``, every reference must
+    rebuild into the instance it names, or a ``ValueError`` names the first
+    row that does not: a set frozen against another build of the environment
+    would otherwise play other tasks than the ones it was frozen on."""
     spec = suite_spec(episode, specs=specs)
-    return SuiteSource(spec.create(), episode, spec.renderer_id)
+    if rows is None:
+        return SuiteSource(spec.create(), episode, spec.renderer_id)
+    environment = spec.create(split=rows.split)
+    rows.check_instances(lambda split, index: str(environment.get_task(index).id))
+    return SuiteSource(environment, episode, spec.renderer_id, rows)
+
+
+def job_suite_source(job, *, specs: Mapping[str, Any] | None = None) -> SuiteSource:
+    """The one source of a suite job, for its intake, grader, export and miner.
+
+    An eval job (its prompt source names a frozen set of row references) maps
+    row ``i`` to the set's ``i``-th reference (``reliquary.eval.rows.job_row_map``),
+    at the set's split. Any other job keeps the identity over the whole train
+    environment, not just its ``[prompt_start, prompt_end)``: its
+    ``prompt_index`` is a raw environment index, and its intake checks the job
+    against the environment's own length."""
+    from reliquary.eval.rows import job_row_map
+
+    rows = job_row_map(job)
+    return suite_source(job.episode, rows=None if rows.is_identity else rows, specs=specs)
 
 
 def replay_suite(environment, *, renderer_id: str, task_index: int, seed: int,
@@ -472,7 +513,8 @@ def suite_messages(trace, *, task, decode, spans: Sequence[tuple[int, int]]) -> 
 
 
 __all__ = ["SUITE_RENDERERS", "SuiteReplayOutcome", "SuiteSource", "compare_replay",
-           "episode_seed", "export_tokens", "replay_outcome", "replay_stop", "replay_suite",
+           "episode_seed", "export_tokens", "job_suite_source", "replay_outcome", "replay_stop",
+           "replay_suite",
            "suite_messages", "suite_source", "suite_span_refusal", "suite_spec", "suite_spec_refusal",
            "tools_of", "turn_markup_ids",
            "turn_ids"]

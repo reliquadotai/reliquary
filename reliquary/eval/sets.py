@@ -20,8 +20,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from reliquary.eval.prompt_source import REFERENCE_INTERACTIONS
+
 SET_SCHEMA = "reliquary/eval-set/v1"
 RL_SPLIT = "train"
+SWE_SOURCE = "reliquary-swe"
 _SET_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 
 
@@ -238,6 +241,8 @@ SOURCE_LINEAGE: dict[str, tuple[str, str]] = {
     # its own split-by-world layout.
     "envscaler_tools_v1": ("XXHStudyHard/EnvScaler", "envscaler_tools_v1"),
     "envscaler_tools_v2": ("XXHStudyHard/EnvScaler", "envscaler_tools_v2"),
+    # Not a catalog environment: a set source of `build_source_set` only.
+    SWE_SOURCE: ("princeton-nlp/SWE-bench_Verified+SWE-smith", "reliquary-swe"),
 }
 
 
@@ -317,10 +322,13 @@ def _disjointness(held: HeldOut) -> dict:
 
 def open_source(source: str, split: str):
     """The catalog environment at ``split``: the runtime factory for train, the
-    package's own split otherwise (an external answer environment)."""
+    package's own split otherwise (an external answer environment). An episode
+    environment is built at any of its splits through ``spec.create(split=...)``."""
     from reliquary.environment.registry import ENVIRONMENT_SPECS
 
     spec = ENVIRONMENT_SPECS[source]
+    if spec.interaction_mode == "episode":
+        return spec.create(split=split)
     if split == RL_SPLIT:
         return spec.create()
     if spec.external_distribution is None or spec.interaction_mode != "single_turn":
@@ -412,6 +420,7 @@ def build_set(env: str, *, count: int, seed: int, out: str | Path,
 
 
 INTERACTION = "single_turn"
+INTERACTIONS = (INTERACTION, *sorted(REFERENCE_INTERACTIONS))
 
 
 def select_indices(low: int, high: int, *, sample: int | None,
@@ -448,12 +457,16 @@ def _catalog_spec(source: str):
     from reliquary.environment.registry import ENVIRONMENT_SPECS
     from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
 
-    if source not in ENVIRONMENT_CATALOG or source not in ENVIRONMENT_SPECS:
+    if source not in ENVIRONMENT_SPECS:
         raise ValueError(f"{source!r} is not a catalog environment")
     spec = ENVIRONMENT_SPECS[source]
-    if getattr(spec, "interaction_mode", None) != INTERACTION:
+    if getattr(spec, "interaction_mode", None) not in (INTERACTION, "episode"):
         raise ValueError(f"{source!r} is {spec.interaction_mode!r}: a set holds "
-                         "single-turn problems only")
+                         "single-turn or episode problems only")
+    # An episode environment needs no profile (telecom v2 has none): it is a
+    # registry spec, run through the episode path.
+    if source not in ENVIRONMENT_CATALOG and spec.interaction_mode != "episode":
+        raise ValueError(f"{source!r} is not a catalog environment")
     return spec
 
 
@@ -508,11 +521,21 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
         raise ValueError("taskset args belong to a Verifiers source")
     from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
 
-    _catalog_spec(source)
+    if source == SWE_SOURCE:
+        from reliquary.environment import bridged_swe
+
+        spec, profile, interaction, environment = None, None, "swe", None
+        length_of = bridged_swe.split_length
+    else:
+        spec = _catalog_spec(source)
+        profile = ENVIRONMENT_CATALOG.get(source)
+        interaction = "episode" if spec.interaction_mode == "episode" else INTERACTION
+        environment, length_of = None, None
     split = split or RL_SPLIT
     directory = _empty_directory(out)
-    environment = open_environment(source, split)
-    length = len(environment)
+    if environment is None and length_of is None:
+        environment = open_environment(source, split)
+    length = len(environment) if length_of is None else length_of(split)
     high = length if count is None else start + count
     if high > length:
         raise ValueError(f"[{start}, {high}) runs past {source!r}:{split} ({length} rows)")
@@ -523,24 +546,35 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
                                                        sample, seed))
     prompts, grading = [], []
     for ordinal, index in enumerate(indices):
-        problem = environment.get_problem(index)
-        prompt = problem.get("prompt") if isinstance(problem, dict) else None
-        if not isinstance(prompt, str) or not prompt:
-            raise ValueError(f"{source!r} row {index} has no prompt")
         problem_id = f"{set_id}-{ordinal:06d}"
-        prompts.append({"problem_id": problem_id, "env": source, "set_id": set_id,
-                        "interaction": INTERACTION,
-                        "messages": [{"role": "user", "content": prompt}]})
-        grading.append({"problem_id": problem_id, "source": source, "split": split,
-                        "source_index": index, "prompt_sha256": prompt_sha256(prompt)})
+        if interaction == INTERACTION:
+            problem = environment.get_problem(index)
+            prompt = problem.get("prompt") if isinstance(problem, dict) else None
+            if not isinstance(prompt, str) or not prompt:
+                raise ValueError(f"{source!r} row {index} has no prompt")
+            prompts.append({"problem_id": problem_id, "env": source, "set_id": set_id,
+                            "interaction": INTERACTION,
+                            "messages": [{"role": "user", "content": prompt}]})
+            grading.append({"problem_id": problem_id, "source": source, "split": split,
+                            "source_index": index, "prompt_sha256": prompt_sha256(prompt)})
+            continue
+        # A reference: the task is rebuilt from (split, index) by whoever runs it, and
+        # must carry this id. `grading.jsonl` holds the same row.
+        instance_id = (bridged_swe.instance_id_of(split, index) if interaction == "swe"
+                       else str(environment.get_task(index).id))
+        if not instance_id:
+            raise ValueError(f"{source!r}:{split} row {index} has no instance id")
+        row = {"problem_id": problem_id, "interaction": interaction, "split": split,
+               "source_index": index, "instance_id": instance_id}
+        prompts.append({**row, "env": source, "set_id": set_id})
+        grading.append(row)
     overlap = range_overlaps(source, split, start, high)
     overlap["note"] = (None if overlap["disjoint"] else
                        "rows of this set were eligible for training (see rl and corpus): "
                        "scores of models Reliquary trained on them may be inflated")
-    profile = ENVIRONMENT_CATALOG[source]
     card = {
         "schema": SET_SCHEMA, "set_id": set_id, "env": source, "source": source,
-        "source_kind": "catalog", "interaction": INTERACTION, "split": split,
+        "source_kind": "catalog", "interaction": interaction, "split": split,
         "index_range": [start, high], "source_length": length, "count": len(indices),
         "seed": seed, "selection": {"start": start, "count": count, "sample": sample,
                                     "seed": seed},
@@ -548,11 +582,16 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
                   "random.Random(seed).sample(index_range, sample); an order of N "
                   "problems takes the first N"),
         "created_at": clock(),
-        "prompt_template_id": getattr(profile.prompt_template, "template_id", None),
-        "default_max_new_tokens": profile.max_new_tokens,
+        "prompt_template_id": getattr(getattr(profile, "prompt_template", None),
+                                      "template_id", None),
+        "default_max_new_tokens": getattr(profile, "max_new_tokens", None),
         "environment_manifest_sha256": getattr(profile, "environment_manifest_sha256", None),
         "disjointness": overlap,
     }
+    if interaction != INTERACTION:
+        card["renderer_id"] = getattr(spec, "renderer_id", None)
+        card["env_manifest"] = (bridged_swe.package_version() if interaction == "swe"
+                                else getattr(spec, "environment_manifest_sha256", None))
     return _write_set(directory, prompts, grading, card)
 
 
@@ -560,6 +599,8 @@ __all__ = [
     "CORPUS_RANGES",
     "HELD_OUT",
     "HeldOut",
+    "INTERACTIONS",
+    "SWE_SOURCE",
     "CONTAMINATION_NOTES",
     "RL_OVERLAP_RULED",
     "SOURCE_LINEAGE",

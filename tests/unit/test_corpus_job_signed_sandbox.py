@@ -7,7 +7,7 @@ import pytest
 from pathlib import Path
 
 from reliquary.corpus.job import (
-    EXECUTION_REPLAY, JobError, is_signed_sandbox, parse_job, sandbox_split,
+    EXECUTION_REPLAY, JobError, is_signed_sandbox, parse_job,
 )
 from tests.unit.test_corpus_job_episode import _episode, _manifest
 
@@ -122,7 +122,9 @@ def test_the_bash_only_tool_set_is_allowed():
 
 
 def test_the_sandbox_split_is_the_one_the_bridge_serves():
-    assert sandbox_split(parse_job(_manifest(episode=signed_episode())).episode) == "train"
+    from reliquary.eval.rows import job_row_map
+
+    assert job_row_map(parse_job(_manifest(episode=signed_episode()))).split == "train"
 
 
 def test_a_signed_job_at_another_image_count_than_the_bridge_serves_is_never_parsed():

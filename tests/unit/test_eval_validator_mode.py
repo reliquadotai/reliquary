@@ -345,3 +345,228 @@ def test_an_rl_task_naming_the_external_environment_never_boots():
     with pytest.raises(TaskConfigError, match=EXTERNAL_EVAL_ENVIRONMENT):
         resolve_task_config({"glm-run": _entry(profile, contract=contract)}, "glm-run",
                             profile_id=profile.profile_id, generation_contract=contract)
+
+
+# --------------------------------------------------------------------------
+# jobs create --eval-set over episode and SWE sets
+# --------------------------------------------------------------------------
+
+TELECOM = "reliquary_telecom_solo_v2"
+CHATML_TOOLS = "reliquary-chatml-tools-v1"
+SWE_SET_ID = "swe-bench-r0-n4"
+
+
+def _write_reference_set(directory, set_id, rows, card_fields):
+    import hashlib
+    import json
+
+    directory.mkdir()
+    body = b"".join(json.dumps({**row, "set_id": set_id}, sort_keys=True).encode() + b"\n"
+                    for row in rows)
+    (directory / "prompts.jsonl").write_bytes(body)
+    card = {"set_id": set_id, "count": len(rows), "prompts_sha256": hashlib.sha256(body).hexdigest(),
+            **card_fields}
+    (directory / "set.json").write_text(json.dumps(card))
+
+
+@pytest.fixture
+def reference_sets(tmp_path, monkeypatch):
+    """A telecom episode set and a SWE set in the sets directory."""
+    from reliquary.environment import registry
+    from reliquary.eval import prompt_source as ps
+
+    real = registry.ENVIRONMENT_SPECS[TELECOM]
+    monkeypatch.setattr(ps, "_loaded", {})
+    monkeypatch.setattr(ps, "FETCHERS", [ps._from_directory])
+    monkeypatch.setenv(ps.SETS_DIR_ENV, str(tmp_path))
+    rows = [{"problem_id": f"p{i}", "env": TELECOM, "interaction": "episode",
+             "split": "benchmark", "source_index": i, "instance_id": f"t-{i}"} for i in range(4)]
+    _write_reference_set(tmp_path / "telecom-bench-r0-n4", "telecom-bench-r0-n4", rows, {
+        "interaction": "episode", "source": TELECOM, "env": TELECOM, "split": "benchmark",
+        "renderer_id": real.renderer_id})
+    rows = [{"problem_id": f"p{i}", "env": "reliquary-swe", "interaction": "swe",
+             "split": "benchmark", "source_index": i, "instance_id": f"repo__x-{i}"}
+            for i in range(4)]
+    _write_reference_set(tmp_path / SWE_SET_ID, SWE_SET_ID, rows, {
+        "interaction": "swe", "source": "reliquary-swe", "env": "reliquary-swe",
+        "split": "benchmark", "renderer_id": None})
+    return real
+
+
+def _suite_episode(real, **over):
+    episode = {"env": {"package": "reliquary-suite", "name": TELECOM,
+                       "version": real.environment_manifest_sha256, "split": "benchmark"},
+               "harness": "suite", "renderer": real.renderer_id, "max_turns": 8,
+               "max_tokens_per_turn": 1024, "max_total_tokens": 60000}
+    episode.update(over)
+    return episode
+
+
+def _signed_swe_episode(**over):
+    from tests.unit.test_corpus_job_signed_sandbox import signed_episode
+
+    episode = signed_episode()
+    episode["env"] = {**episode["env"], "split": "benchmark"}
+    episode["max_tokens_per_turn"] = 1024
+    episode.update(over)
+    return episode
+
+
+def _episode_args(tmp_path, episode, **overrides):
+    import json
+
+    path = tmp_path / "episode.json"
+    path.write_text(json.dumps(episode))
+    options = {"--eval-set": "telecom-bench-r0-n4", "--episode-file": str(path),
+               "--renderer-id": CHATML_TOOLS, "--eos-token-id": "151645"}
+    options.update(overrides)
+    return _eval_args(**options)
+
+
+@pytest.fixture
+def telecom_registry(reference_sets, monkeypatch):
+    """The telecom spec as this binary's registry has it, minus the wheel that is not installed here."""
+    from types import SimpleNamespace
+
+    from reliquary.corpus import suite_episode
+
+    class _Env:
+        name, split, max_turns = TELECOM, "benchmark", 8
+
+        def __len__(self):
+            return 100
+
+        def get_task(self, index):
+            return SimpleNamespace(id=f"t-{index}")
+
+    real = reference_sets
+    spec = SimpleNamespace(
+        name=TELECOM, interaction_mode="episode", renderer_id=real.renderer_id,
+        environment_manifest_sha256=real.environment_manifest_sha256,
+        create=lambda split="train": _Env())
+    monkeypatch.setattr(suite_episode, "_registry", lambda given: given or {TELECOM: spec})
+
+
+def test_jobs_create_suite_eval_job(bucket, registry, reference_sets, telecom_registry, tmp_path):
+    import asyncio
+
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+    from reliquary.eval import prompt_source as ps
+    from reliquary.infrastructure import corpus_job_store as job_store
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    result = CliRunner().invoke(app, _episode_args(tmp_path, _suite_episode(reference_sets)))
+    assert result.exit_code == 0, result.output
+    job, _ = asyncio.run(job_store.read_job("eval-teutonic-aime26"))
+    source = ps.parse_eval_source(job.prompt_source)
+    assert (source.set_id, source.count) == ("telecom-bench-r0-n4", 4)
+    assert job.prompt_count == 4 and job.episode.env.split == "benchmark"
+    assert job.episode.is_suite and job.seed is not None
+    entry = registry["entries"]["eval-teutonic-aime26"]
+    assert TELECOM in entry.contract["environments"]
+    assert entry.params["audit_q"] == 1.0
+
+
+def test_jobs_create_reference_set_needs_episode_file(bucket, registry, reference_sets):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    result = CliRunner().invoke(app, _eval_args(**{"--eval-set": "telecom-bench-r0-n4",
+                                                   "--renderer-id": CHATML_TOOLS}))
+    assert result.exit_code != 0 and "--episode-file" in result.output, result.output
+    assert "eval-teutonic-aime26" not in registry["entries"]
+
+
+def test_jobs_create_refuses_split_mismatch(bucket, registry, reference_sets, tmp_path):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    episode = _suite_episode(reference_sets)
+    episode["env"]["split"] = "train"
+    result = CliRunner().invoke(app, _episode_args(tmp_path, episode))
+    assert result.exit_code != 0, result.output
+    assert "set's split is 'benchmark', the episode names 'train'" in result.output
+    assert "eval-teutonic-aime26" not in registry["entries"]
+
+
+def test_jobs_create_refuses_renderer_mismatch(bucket, registry, reference_sets, tmp_path):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    result = CliRunner().invoke(app, _episode_args(
+        tmp_path, _suite_episode(reference_sets, renderer="other-renderer-v1")))
+    assert result.exit_code != 0 and "renderer disagrees" in result.output, result.output
+    result = CliRunner().invoke(app, _episode_args(
+        tmp_path, _suite_episode(reference_sets), **{"--renderer-id": "chat-template-thinking-v1"}))
+    assert result.exit_code != 0 and "renderer disagrees" in result.output, result.output
+    assert "eval-teutonic-aime26" not in registry["entries"]
+
+
+def test_jobs_create_refuses_an_episode_for_another_environment(
+        bucket, registry, reference_sets, tmp_path):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    episode = _suite_episode(reference_sets)
+    episode["env"]["name"] = "reliquary_other_v1"
+    result = CliRunner().invoke(app, _episode_args(tmp_path, episode))
+    assert result.exit_code != 0 and "the set's environment is" in result.output, result.output
+
+
+def test_jobs_create_signed_swe_eval_job(bucket, registry, reference_sets, tmp_path, monkeypatch):
+    from reliquary.environment import agentic_swe
+
+    # The renderers wheel and the SWE dataset are not installed where the tests run.
+    monkeypatch.setattr(agentic_swe, "episode_support_refusal", lambda *a, **k: None)
+    monkeypatch.setattr(agentic_swe, "load_swe_source", lambda *a, **k: [None] * 100)
+    import asyncio
+    from types import SimpleNamespace
+
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+    from reliquary.corpus.job import is_signed_sandbox
+    from reliquary.environment import bridged_swe
+    from reliquary.eval import rows as eval_rows
+
+    # The set's rows are checked against the bridged env (not installed here).
+    monkeypatch.setattr(bridged_swe, "row_of", lambda split, index: (
+        None, SimpleNamespace(instance_id=f"repo__x-{index}")))
+    eval_rows._row_map.cache_clear()
+    from reliquary.eval import prompt_source as ps
+    from reliquary.infrastructure import corpus_job_store as job_store
+    from reliquary.protocol.agentic_source import AGENTIC_SWE_ENVIRONMENT
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    result = CliRunner().invoke(app, _episode_args(
+        tmp_path, _signed_swe_episode(), **{"--eval-set": SWE_SET_ID, "--prompt-count": "3",
+                                            "--renderer-id": _signed_swe_episode()["renderer"]}))
+    assert result.exit_code == 0, result.output
+    job, _ = asyncio.run(job_store.read_job("eval-teutonic-aime26"))
+    assert is_signed_sandbox(job) and job.prompt_count == 3
+    assert ps.parse_eval_source(job.prompt_source).count == 3
+    entry = registry["entries"]["eval-teutonic-aime26"]
+    assert list(entry.contract["environments"]) == [AGENTIC_SWE_ENVIRONMENT]
+
+
+def test_jobs_create_swe_set_needs_a_signed_sandbox_episode(
+        bucket, registry, reference_sets, tmp_path):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    episode = _signed_swe_episode()
+    del episode["execution"], episode["sandbox"]
+    result = CliRunner().invoke(app, _episode_args(tmp_path, episode, **{"--eval-set": SWE_SET_ID}))
+    assert result.exit_code != 0 and "signed sandbox" in result.output, result.output

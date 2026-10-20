@@ -472,9 +472,11 @@ def _grader(records):
     from reliquary.validator.suite_grading import LocalEpisodeGrader
     from reliquary.validator.suite_intake import InlineSuiteReplayer
 
-    return LocalEpisodeGrader(job=parse_job(_manifest()), records=records,
+    job = parse_job(_manifest())
+    return LocalEpisodeGrader(job=job, records=records,
                               replayer=InlineSuiteReplayer(encode=CODEC.encode,
-                                                           decode=CODEC.decode))
+                                                           decode=CODEC.decode),
+                              source=suite_episode.suite_source(job.episode))
 
 
 def test_the_local_grader_writes_a_certified_grade(honest):
@@ -792,7 +794,9 @@ def test_a_grader_deadline_is_retried_before_it_is_final(honest):
     records = _GradeRecords({"s1": _record(_request(rendered, tokens, spans, stop),
                                            _intake().initial_ids(0))})
     replayer = _DeadlineReplayer()
-    grader = LocalEpisodeGrader(job=parse_job(_manifest()), records=records, replayer=replayer)
+    job = parse_job(_manifest())
+    grader = LocalEpisodeGrader(job=job, records=records, replayer=replayer,
+                                source=suite_episode.suite_source(job.episode))
     assert grader._concurrency == 2                    # the pool's workers, not 64
     for _ in range(DEADLINE_RETRIES - 1):
         assert asyncio.run(grader.grade_one("s1")) is None and "s1" not in records.grades
@@ -876,8 +880,8 @@ def test_a_killed_worker_is_replaced_and_the_replay_retried(chatml_registry):
     _, tokens, spans, stop, trace = miner_episode(environment, 0,
                                                   _reference_actions(environment, 0), codec)
     prompt = ChatMLEpisodeRenderer(codec.encode).encode_initial(environment.get_task(0))
-    kwargs = replay_kwargs(job, prompt_index=0, prompt_ids=prompt, tokens=tokens, spans=spans,
-                           stop=stop)
+    kwargs = replay_kwargs(job, suite_episode.suite_source(job.episode), prompt_index=0,
+                           prompt_ids=prompt, tokens=tokens, spans=spans, stop=stop)
     replayer = PoolSuiteReplayer.for_tokenizer(tokenizer, workers=1)
     try:
         assert replayer.replay(ENV, **kwargs).success is True
@@ -924,7 +928,8 @@ class _EnvReplayer:
     def __init__(self, environment):
         self._environment = environment
 
-    def replay(self, env_name, **kwargs):
+    def replay(self, env_name, *, split="train", **kwargs):
+        # The environment is given already built (at the job's split).
         return suite_episode.replay_outcome(self._environment, encode=CODEC.encode,
                                             decode=CODEC.decode, **kwargs)
 

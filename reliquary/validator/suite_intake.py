@@ -141,10 +141,13 @@ def _deadline(seconds: float):
         signal.signal(signal.SIGALRM, previous)
 
 
-def _replay(env_name: str, encode, decode, **kwargs) -> SuiteReplayOutcome:
+def _replay(env_name: str, encode, decode, *, split: str = "train",
+            **kwargs) -> SuiteReplayOutcome:
+    """One replay on ``env_name`` built at ``split`` (``replay_kwargs`` names
+    the job's; a caller that names none replays on ``train``, as before)."""
     from reliquary.environment.registry import get_environment_spec
 
-    return replay_outcome(get_environment_spec(env_name).create(), encode=encode,
+    return replay_outcome(get_environment_spec(env_name).create(split=split), encode=encode,
                           decode=decode, **kwargs)
 
 
@@ -298,13 +301,23 @@ class PoolSuiteReplayer:
             self._kill(pool)
 
 
-def replay_kwargs(job, *, prompt_index: int, prompt_ids, tokens, spans, stop: str) -> dict:
-    """What one replay of ``job``'s trajectory needs, besides the codec."""
+def replay_kwargs(job, source, *, prompt_index: int, prompt_ids, tokens, spans,
+                  stop: str, with_split: bool = True) -> dict:
+    """What one replay of ``job``'s trajectory needs, besides the codec: the
+    task row ``prompt_index`` plays through ``source``'s row map, and (unless
+    ``with_split`` is off: a replay on the source's own environment, built at
+    it already) the split the replay builds the environment at. The seed stays
+    the row's (``episode_seed(job_id, prompt_index)``): only the task lookup is
+    mapped."""
     episode = job.episode
-    return {"renderer_id": episode.renderer, "max_turns": episode.max_turns,
-            "task_index": int(prompt_index), "seed": episode_seed(job.job_id, prompt_index),
-            "prompt_ids": [int(t) for t in prompt_ids], "tokens": [int(t) for t in tokens],
-            "spans": [(int(s), int(e)) for s, e in spans], "stop": stop}
+    kwargs = {"renderer_id": episode.renderer, "max_turns": episode.max_turns,
+              "task_index": source.rows.index(int(prompt_index)),
+              "seed": episode_seed(job.job_id, prompt_index),
+              "prompt_ids": [int(t) for t in prompt_ids], "tokens": [int(t) for t in tokens],
+              "spans": [(int(s), int(e)) for s, e in spans], "stop": stop}
+    if with_split:
+        kwargs["split"] = source.rows.split
+    return kwargs
 
 
 _INTAKE_THREADS: ThreadPoolExecutor | None = None
@@ -413,8 +426,8 @@ class SuiteEpisodeIntake:
             if not result.ok:
                 return IntakeRefusal(result.reason or "", dict(result.detail))
         outcome = self._replayer.replay(episode.env.name, **replay_kwargs(
-            self._job, prompt_index=request.prompt_index, prompt_ids=prompt_ids, tokens=tokens,
-            spans=spans, stop=trajectory.stop))
+            self._job, self._source, prompt_index=request.prompt_index, prompt_ids=prompt_ids,
+            tokens=tokens, spans=spans, stop=trajectory.stop))
         if outcome.deadline:
             # ~30 ms of work past 30 s on a worker's own clock: the host is
             # starved, nothing is known against the trajectory (a 503).
@@ -432,14 +445,18 @@ def build_suite_intake(job, *, tokenizer, vocab_size: int | None, chunk_tokens: 
                        replayer) -> SuiteEpisodeIntake:
     """The intake a validator serves a suite job with; refuses (a ValueError,
     permanent until a restart) an environment this binary cannot serve."""
-    from reliquary.corpus.suite_episode import suite_source
+    from reliquary.corpus.suite_episode import job_suite_source
+    from reliquary.eval.rows import job_row_map
     from reliquary.eval.sets import refuse_held_out_overlap
 
     try:
         # `jobs create` checks it too, but a manifest can be written without
-        # it: a served job never takes held-out rows or the RL share.
-        refuse_held_out_overlap(job.prompt_source, job.prompt_start, job.prompt_count)
-        source = suite_source(job.episode)
+        # it: a served job never takes held-out rows or the RL share. An eval
+        # job's rows are its set's references, not a train range. Checked
+        # before the environment is built (the map is the one the source uses).
+        if job_row_map(job).is_identity:
+            refuse_held_out_overlap(job.prompt_source, job.prompt_start, job.prompt_count)
+        source = job_suite_source(job)
     except ValueError as exc:
         raise ValueError(f"job {job.job_id!r}: {exc}") from exc
     if len(source) < job.prompt_end:

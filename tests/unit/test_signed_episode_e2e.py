@@ -34,6 +34,7 @@ from reliquary.corpus.delivery import episode_rows  # noqa: E402
 from reliquary.corpus.job import parse_job  # noqa: E402
 from reliquary.corpus.signed_reasons import session_seen_key  # noqa: E402
 from reliquary.environment.agentic_swe import SignedSweSource  # noqa: E402
+from reliquary.eval.rows import RowMap  # noqa: E402
 from reliquary.infrastructure import corpus_job_store as job_store  # noqa: E402
 from reliquary.infrastructure import corpus_record_store, sandbox_store  # noqa: E402
 from reliquary.infrastructure.corpus_record_store import BucketRecordStore  # noqa: E402
@@ -67,7 +68,7 @@ CMD_OPEN, CMD_CLOSE = 8, 9
 MANIFEST = _manifest(prompt_count=3, episode=signed_episode())
 JOB = parse_job(MANIFEST)
 PROMPT_TEXT = "Write 42 to /work/answer.txt."
-SOURCE = SignedSweSource("train", prompt_of=lambda split, index: PROMPT_TEXT,
+SOURCE = SignedSweSource(RowMap.identity("train", 0, 100), prompt_of=lambda split, index: PROMPT_TEXT,
                          row_of=lambda split, index: (None, SimpleNamespace(instance_id=f"fake-{index}")))
 TOKENIZER = _Tokenizer()
 PROOF = "A" * 200
@@ -615,7 +616,7 @@ def validator_process(tmp_path, gateway, r2, fixed_drand_chain, monkeypatch):  #
     monkeypatch.setattr(agentic_swe, "episode_support_refusal", lambda *a, **kw: None)
     monkeypatch.setattr(agentic_swe, "sandbox_support_refusal", lambda *a, **kw: None)
     monkeypatch.setattr(agentic_swe, "load_turn_renderer", lambda directory, **kw: R)
-    monkeypatch.setattr(agentic_swe, "SignedSweSource", lambda split: SOURCE)
+    monkeypatch.setattr(agentic_swe, "job_signed_source", lambda job: SOURCE)
     monkeypatch.setattr(tasks.SweTaskResolver, "_resolve",
                         lambda self, index: ResolvedTask(testing.FAKE_IMAGE, {}))
     # Job B's wiring fails after its session view was registered.
