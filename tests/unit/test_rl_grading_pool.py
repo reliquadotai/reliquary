@@ -64,3 +64,32 @@ def test_the_async_validator_starts_the_grader_service_only_for_code_envs():
     assert _envs_need_grader(["openmathinstruct", "opencodeinstruct"])
     assert not _envs_need_grader(["openmathinstruct"])
     assert not _envs_need_grader(["swe_v1"])                  # a bridged episode env: scored by its sandbox
+
+
+RECYCLING = r"""
+import bittensor  # noqa: F401  the parent imports it too, as the validator does
+from reliquary.validator.rl_submit import PooledScorer
+
+def score(environment, problem, texts, materials):
+    import bittensor  # a grader that imports bittensor starts its logging listener in the worker
+    return [0.0] * len(texts)
+
+if __name__ == "__main__":
+    scorer = PooledScorer(["env"], workers=1, max_tasks=1, function=score, wall_seconds=lambda env: 60.0)
+    for _ in range(4):                                     # every call on a fresh worker: three retirements
+        assert scorer("env", "p", ["a"], None) == [0.0]
+    scorer.close()
+    print("ok", flush=True)
+"""
+
+
+def test_retired_grading_workers_take_their_logging_listener_down_cleanly(tmp_path):
+    import subprocess
+    import sys
+
+    script = tmp_path / "recycle.py"
+    script.write_text(RECYCLING)
+    done = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=180,
+                          cwd=os.getcwd(), env={**os.environ, "PYTHONPATH": os.getcwd()})
+    assert done.returncode == 0 and "ok" in done.stdout, done.stderr[-2000:]
+    assert "EOFError" not in done.stderr and "Exception in thread" not in done.stderr, done.stderr[-2000:]
