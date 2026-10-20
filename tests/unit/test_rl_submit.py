@@ -419,8 +419,8 @@ def test_the_buffer_hands_out_oldest_first_records_the_queue_signal_and_survives
     assert subs.buffer.drain_tick().arrivals == {}
     assert [g.lease_id for g in subs.buffer.take(1)] == [old.lease_id]       # a full batch, one group left
     subs.buffer.release([old.lease_id])
-    # short: the trainer waits; a group handed out before comes after the fresh ones
-    assert [g.lease_id for g in subs.buffer.take(5)] == [new.lease_id, old.lease_id]
+    # short: the trainer waits; a group handed out once and back is served like a fresh one, in arrival order
+    assert [g.lease_id for g in subs.buffer.take(5)] == [old.lease_id, new.lease_id]
     clock[0] += 10
     assert subs.buffer.take(3) == []
     clock[0] += 3600                                                          # a dead trainer's gap counts 30 s

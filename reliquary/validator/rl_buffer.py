@@ -20,6 +20,7 @@ import zlib
 from dataclasses import asdict, dataclass
 
 QUEUED, TAKEN = "queued", "taken"
+SUSPECT_ATTEMPTS = 2        # hand-outs after which a group not yet trained is served at most one per batch
 MAX_POLL_GAP_S = 30.0       # a wait counts between two of the trainer's takes at most this far apart (a dead trainer)
 
 _SCHEMA = """
@@ -129,19 +130,23 @@ class TrainingBuffer:
         return tick
 
     def take(self, limit: int) -> list[SubmittedGroup]:
-        """Up to ``limit`` queued groups of any env, in arrival order, groups already handed out after the fresh ones
-        and only while no other such group is taken (one per batch: the trainer holds one batch at a time); they stay
+        """Up to ``limit`` queued groups of any env, in arrival order; a group handed out ``SUSPECT_ATTEMPTS`` times
+        already comes after the fresh ones and only while no other such group is taken (one per batch: the trainer
+        holds one batch at a time); they stay
         buffered (``taken``) until reported or released. The trainer asks for what its batch still lacks: a short
         answer means it waits for groups."""
         now = float(self.clock())
         with self.book.transaction():
-            fresh = self.book.db.execute("SELECT lease_id, body FROM rl_buffer WHERE state=? AND attempts=0 "
-                                         "ORDER BY arrived_at, lease_id LIMIT ?", (QUEUED, int(limit))).fetchall()
-            held = self.book.db.execute("SELECT 1 FROM rl_buffer WHERE state=? AND attempts>1 LIMIT 1",
-                                        (TAKEN,)).fetchone()
+            # A group handed out once and back (a restart, a lost answer, one failed step) is served like a fresh one;
+            # from its second return on it is a suspect: at most one per batch, so it cannot sink the others again.
+            fresh = self.book.db.execute("SELECT lease_id, body FROM rl_buffer WHERE state=? AND attempts<? "
+                                         "ORDER BY arrived_at, lease_id LIMIT ?",
+                                         (QUEUED, SUSPECT_ATTEMPTS, int(limit))).fetchall()
+            held = self.book.db.execute("SELECT 1 FROM rl_buffer WHERE state=? AND attempts>? LIMIT 1",
+                                        (TAKEN, SUSPECT_ATTEMPTS)).fetchone()
             retried = [] if len(fresh) >= limit or held else self.book.db.execute(
-                "SELECT lease_id, body FROM rl_buffer WHERE state=? AND attempts>0 ORDER BY attempts, arrived_at, "
-                "lease_id LIMIT 1", (QUEUED,)).fetchall()
+                "SELECT lease_id, body FROM rl_buffer WHERE state=? AND attempts>=? ORDER BY attempts, arrived_at, "
+                "lease_id LIMIT 1", (QUEUED, SUSPECT_ATTEMPTS)).fetchall()
             rows = fresh + retried
             self.book.db.executemany("UPDATE rl_buffer SET state=?, attempts=attempts+1 WHERE lease_id=?",
                                      [(TAKEN, lease_id) for lease_id, _ in rows])

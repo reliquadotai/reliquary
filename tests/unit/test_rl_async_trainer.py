@@ -306,8 +306,9 @@ def test_more_than_one_step_per_checkpoint_is_refused():
 
 
 def test_a_group_that_breaks_every_step_is_dropped_and_the_others_train():
-    """A step that raises reports nothing; its groups come back behind the fresh ones, one retried group per batch,
-    and a group handed out ``max_attempts`` times without a report leaves untrained: no crash loop."""
+    """A step that raises reports nothing; its groups come back (a first return is served like a fresh group: a restart
+    is no failure), from their second return on one per batch, and a group handed out ``max_attempts`` times without
+    a report leaves untrained: no crash loop."""
     model, book = _Model(), Book()
     buffer = TrainingBuffer(book)
     fresh = iter(range(100))
@@ -339,9 +340,9 @@ def test_a_group_that_breaks_every_step_is_dropped_and_the_others_train():
     trainer.close()
     assert len(crashes) == 3 and subs.reports["p"]["accepted"] is False
     assert subs.reports["p"].get("failure_class") is None                    # unpaid, never sanctioned
-    assert crashes[0] == ["p", "a"]
-    assert all(len(batch) == 2 and batch[0] == "p" and batch[1].startswith("f") for batch in crashes[1:])
-    assert all(subs.reports[lease]["accepted"] for lease in ("a", "b", "c"))  # a shared one crash, then trained
+    assert crashes[0] == crashes[1] == ["p", "a"]                            # back once: served like fresh groups
+    assert "p" in crashes[2] and "a" not in crashes[2]                        # suspects: one per batch
+    assert all(subs.reports[lease]["accepted"] for lease in ("a", "b", "c"))  # a shared two crashes, then trained
     assert trainer.last_step.get("async/exhausted_dropped", 0) in (0, 1)
 
 
