@@ -1,6 +1,6 @@
 # One harness definition for miners, validators and gateways, then surface variants: design
 
-Status: DRAFT (2026-10-19). Audit behind it: `~/cc-data/harness-audit/REPORT.md` (inventory,
+Status: FOR VALIDATION (2026-10-20). Audit behind it: `~/cc-data/harness-audit/REPORT.md` (inventory,
 incidents, options). Branches: Catalyst `feat/harness-single-source` (from feat/rl-async
 a5df544f + origin/feat/rl-async 0af18807), reliquary-sandbox `feat/reliquary-harness` (from
 fc2fa64, the commit Catalyst pins).
@@ -15,7 +15,8 @@ Tags: **DECIDED** (the user agreed), **DONE** (on the branches, tested), **PROPO
    compatibility harness `bash-vf-b2e4e81`, whose spec reproduces today's bytes.
 2. **One package, `reliquary-harness`** (DECIDED), in the reliquary-sandbox repository as its
    own distribution (`harness/`, module `reliquary_harness`), pure code, no dependency
-   (`renderers==0.1.11` for the Qwen renderer, imported inside functions). It is a separate
+   (`renderers==0.1.11` for the Qwen renderer, extra `qwen`, imported inside functions; the
+   loader refuses any other `renderers` release, see section 6). It is a separate
    distribution so that installing a new harness commit does not move `SANDBOX_COMMIT`.
 3. **Pinned by digest in the contract** (DECIDED, step 4). A process whose installed digest
    differs refuses to serve or to mine. It never bans.
@@ -59,8 +60,8 @@ Not yet done in step 3: the legacy Docker replay corpus miner (`miner/agentic_ep
 verifiers with a restricted runtime) still runs verifiers. It is legacy, and goes in step 7.
 
 Deploy precondition: Catalyst's `pyproject.toml` depends on
-`reliquary-harness @ git+…reliquary-sandbox.git@753b208…#subdirectory=harness`. That commit
-must be pushed to the public repository before any image build. The main image installs
+`reliquary-harness[qwen] @ git+…reliquary-sandbox.git@39b21cf…#subdirectory=harness` (pushed to
+the public repository). The pinned commit must be on the public repository before any image build. The main image installs
 pyproject. The CPU executor image (code grader) imports no agentic code, so it needs nothing.
 
 ## 3. Step 4: the harness in the contract (DONE on the branches)
@@ -85,7 +86,7 @@ absent means `bash-vf-b2e4e81@1`. `EpisodeEnvPolicy.harness_pin()` carries it.
 - The window path (`episode_mining._episode_policies`) refuses a pin with variants.
 
 **Pins.** `agentic_swe.HARNESS_DIGESTS` lists every spec this build serves at the digest it was
-built against: `bash-vf-b2e4e81@1` and `bash-surface@1`. `harness_refusal` checks the installed
+built against: `bash-vf-b2e4e81@1`, `bash-surface@1` and `mini-swe@1`. `harness_refusal` checks the installed
 package against them.
 
 **Record 0 is unchanged** (DECIDED in implementation, against the earlier PROPOSED). The harness
@@ -200,7 +201,44 @@ not in `bash-surface@1`: ship few variants first, and measure.
 an RL smoke. Telecom's 0/38 with unfamiliar markup is the warning. Turning it on means adding
 `harness: {bash-surface, 1, <digest>}` to the SWE/TMax `rl_episode_envs` blocks.
 
-## 6. Remaining migration
+## 6. Choosing the harness, and `mini-swe@1` (DONE on the branches)
+
+**At task creation.** `reliquary tasks create --rl-async … --rl-episode-envs envs.json --harness
+swe_v1=mini-swe@1,tmax_v1=bash-surface@1` writes `{id, version, digest}` into each named env's
+`episode.harness` (`cli.main.with_episode_harnesses`). The digest is the one this build serves,
+so a typo or a stale build fails at creation. An env not named keeps the compatibility harness.
+One harness per env; a weighted mix per env is open (section 9).
+
+**`mini-swe@1`** (`reliquary_harness.mini`, texts from mini-swe-agent 04d809ce, MIT): no tool
+schema in the prompt; the model writes one command in a ```` ```mswea_bash_command ```` block.
+
+- Exactly one block is one canonical `bash` call. The gateway runs it as any other call.
+- `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` ends the episode without running (the gateway
+  grades the box; there is no output to read a marker from).
+- Zero or several blocks: a local call to `?format` (or `?length` for a turn cut by its token
+  cap), answered with mini's error text; the episode goes on. These are tools nobody offers,
+  so the gateway never runs them, and the validator reads them back the same way.
+- The observation is mini's `<returncode>…</returncode>\n<output>…</output>` as a user
+  message, head and tail past 10000 characters; a timed-out or cut command shows the gateway's
+  flags in `<exception>`, not a Python exception.
+- A corpus job cannot pin it: corpus jobs play `bash-vf-b2e4e81@1` only.
+
+**Smoke lessons** (2026-10-20, Qwen3.5-2B on one H100, forced draw, real gateway):
+
+- **The renderer release is part of the harness.** A fresh install took `renderers` 0.1.12
+  (Catalyst depended on reliquary-harness without its `qwen` extra, so only verifiers'
+  `renderers>=0.1.10` chose it). 0.1.12 refuses to bridge a turn closed inside its reasoning,
+  which mini answers with a format error and goes on: every SWE lease was given up with
+  `BridgeFailed`. Fix: Catalyst depends on `reliquary-harness[qwen]`, and `build_renderer`
+  refuses any release other than 0.1.11. The digest covers our sources only, so without that
+  check another release changes tokens silently. Production images already locked 0.1.11.
+- **A foreign format costs whole leases.** A lease is 16 forced rollouts and one refused rollout
+  gives it up. The 2B model, unused to mini's format, sometimes writes a fake output and opens
+  its own next turn (`<|im_start|>` inside the span): `bad_turns`, exactly what that check is
+  for. Measure the refused-rollout rate per harness before opening a harness to miners; a model
+  trained on the format makes it rare.
+
+## 7. Remaining migration
 
 Step 5 needs a coordinated release. Step 6 needs a manifest regen and step 7 an
 executor coordination.
@@ -212,11 +250,55 @@ executor coordination.
 | 6 | Family A (ChatML, EnvScaler, telecom) as specs; `renderers.py` delegates | manifest regen (`scripts/regen_episode_manifests.py`) | `test_chatml_episode_consensus.py`, the EnvScaler golden |
 | 7 | Legacy Docker replay: `TOOL_PROGRAM` onto `format_observation`, then retired; the legacy miner off verifiers | executors | replay tests |
 | 8 | Variants: **DONE** (off until a block names `bash-surface@1`) | Catalyst build + registry block | `test_harness_variants_e2e`, an RL smoke per variant |
+| 9 | Weighted harness mix per env (draw per lease, as variants), metrics per harness | Catalyst build + registry block | to design |
 
 Rollback for step 3, before any release: reverting the step 3 commit restores verifiers'
 loop (`_context` and `_default_runner`), with the same tokens. Nothing else depends on it.
 
-## 7. Open points
+## 8. Validation evidence
+
+**Without a GPU** (VPS, one file at a time, `RELIQUARY_HARNESS_TOKENIZERS` set to both
+tokenizers):
+
+- reliquary-harness: `test_spec`, `test_qwen_goldens`, `test_upstream_parity` (never skipped),
+  `test_variants`, `test_loop`, `test_mini` (with the reasoning-closed turn and the renderers
+  release refusal): green.
+- Catalyst: `test_harness_goldens` (13), `test_harness_episode_parity` (13, plus 12 that replay
+  verifiers when `RUN_VERIFIERS_BRIDGE=1`), `test_harness_episode`, `test_harness_pin`,
+  `test_harness_contract` (12), `test_harness_variants_e2e` (5), `test_harness_mini_e2e`,
+  `test_rl_async_episodes` (17), `test_episode_inertness`, `test_episode_protocol`,
+  `test_episode_group_miner`, `test_rl_episode_miner_side`, `test_service_episode_wire`:
+  green. The goldens frozen from the old code are unchanged byte for byte.
+
+**RL smokes** (Qwen3.5-2B, async RL, forced draw, real signed gateway over runc, local S3,
+one miner, one validator, one trainer; 2026-10-20):
+
+| Run | Harness | Leases submitted | Admitted by the validator | Audits (forced redraw) |
+|---|---|---|---|---|
+| A (H100 PCIe) | `bash-vf-b2e4e81@1`, SWE + TMax | 8 | 8 | all passed, min match ≥ 0.978 |
+| hBC (same box) | TMax `bash-surface@1` | 5 | 5 (variants 1, 2, 3) | 4 passed, ~0.99 |
+| hBC | SWE `mini-swe@1` | 0 | — | all given up: `BridgeFailed`, renderers 0.1.12 (section 6) |
+| hC (2× H100 SXM, 6a8096d7 + 39b21cf) | TMax `bash-surface@1` | 15 | 15 (all 4 variants; 4 in zone) | 11 passed, 0 failed, min match 0.979 |
+| hC | SWE `mini-swe@1` | 12 | 11 (3 in zone), 1 refused (below) | 8 passed, 0 failed, min match 0.981 |
+
+In hC the trainer took one step on 64 rollouts (4 in-zone groups, one of them a mini-swe SWE
+group). On the miner, 2 rollouts out of the roughly 460 played (29 leases) failed the shared
+admission check, and each gave up its lease. One was a mini-swe rollout refused for
+`bad_turns`: the 2B model wrote a fake output, then `<|im_start|>assistant` inside its span.
+The other was `bad_termination`. Both are the checks working, not a harness defect.
+
+The one refused SWE lease (`episode_transcript`) was the smoke's storage, not the harness.
+Under a load average near 100, a client aborted its PUT mid-body ("unexpected EOF"). The
+local S3 (SeaweedFS) then committed an empty object, here the machine record. The validator
+lost the machine's public key, 76 s before that lease's check. After that, the controller's
+heartbeat, which reads before it writes, could not repair the record. R2 refuses an upload
+shorter than its declared length, so production does not see this. The smoke re-registered
+the machine by hand.
+
+Not yet measured: `bad_turns` per variant on a model trained in the format, and any harness
+on the production 27B/Teutonic models.
+
+## 9. Open points
 
 - **The digest covers source bytes**, so a comment edit in `qwen.py` is a new digest, hence a
   new contract (as `implementation_sha256` does in `registry.py`). Alternative: hash the
@@ -226,5 +308,14 @@ loop (`_context` and `_default_runner`), with the same tokens. Nothing else depe
 - **renderers 0.1.11's parameter whitespace stripping** is still worked around by
   `span_is_canonical`. Vendoring the Qwen3.8 renderer into the package would freeze it; that
   is a new spec version, not this one.
+- **A weighted mix of harnesses per env.** Same draw as variants (lease nonce), over
+  `[(pin, weight)]`; validator and miner compute it alone. With it, metrics per harness
+  (admission, `bad_turns`, reward) in the controller's logs.
+- **A refused episode's reasons are not logged by the RL lease checker.** `LeaseEpisodeChecker`
+  logs only the stage (`episode_transcript`), and for variant 0 an admitted lease logs nothing.
+  Log the refusal's detail and the harness on every lease.
+- **A machine record that is not JSON stays broken**: `_update` raises before writing. Only a
+  store that commits truncated bodies produces one, but a heartbeat could rewrite it from its
+  registration.
 - **The sandbox bridge still imports verifiers to load tasksets.** Moving taskset loading off
   verifiers is a separate change.
