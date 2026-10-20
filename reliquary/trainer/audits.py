@@ -8,6 +8,11 @@ then the profile's head (fp32 when ``sampling.lm_head_fp32``) on the rows the dr
 projected inside one module call (``audit=``), where its weight is gathered, and every rank runs the same forward
 (``broadcasting_audit``: rank 0 sends ``AUDIT`` with the group, the followers run it and drop the result).
 
+``group_diagnostics`` computes a whole group as the training forward does: the rollouts packed into right-padded
+micro-batches under the trainer's token budget (``_pack_by_token_budget``), one base forward per micro-batch and one
+head call per micro-batch (one weight gather under FSDP2) projecting only the rows the draw reads; each rollout's
+diagnostics come from its own rows. ``rollout_diagnostics`` (one rollout, its own forward) is the reference it matches.
+
 ``TrainerAudits`` is the trainer's side of the loop: take up to ``limit`` jobs, judge them within ``budget_s``,
 report each verdict; counters feed the step's metrics.
 """
@@ -70,10 +75,8 @@ def rollout_diagnostics(model: Any, group, index: int):
     if base is None:
         return rollout_draw_diagnostics(model, group, index)          # no separable head: the proof path's forward
     prompt, completion = list(group.prompt_tokens), list(group.completions[index])
-    span = group.force_spans[index]
-    start, end = (int(span[0]), int(span[1])) if span is not None else (0, 0)
     uniforms = group.draw_uniforms(index)
-    drawn = [(t, p) for t, p in enumerate(group.model_positions(index)) if not start <= p < end]
+    drawn = _drawn(group, index)
     device = next(model.parameters()).device
     input_ids = torch.tensor([prompt + completion], device=device)
     with torch.no_grad():
@@ -93,6 +96,72 @@ def rollout_diagnostics(model: Any, group, index: int):
     return diagnose(head_projection(lm_head.weight, getattr(lm_head, "bias", None)))
 
 
+def _drawn(group, index: int) -> list[tuple[int, int]]:
+    """(draw offset, completion position) of every position the draw reads, the force span excluded."""
+    span = group.force_spans[index]
+    start, end = (int(span[0]), int(span[1])) if span is not None else (0, 0)
+    return [(t, p) for t, p in enumerate(group.model_positions(index)) if not start <= p < end]
+
+
+def group_diagnostics(model: Any, group, *, token_budget: int | None = None) -> list:
+    """Every rollout's diagnostics of ``group`` through the trainer's model, packed like a training micro-batch:
+    the same values as ``rollout_diagnostics`` one rollout at a time, in a few forwards and head calls."""
+    from reliquary.validator import verifier
+    from reliquary.validator.rl_audit import rollout_draw_diagnostics
+    from reliquary.validator.training import (
+        _base_model_and_lm_head, _last_hidden_state, _microbatch_budget, _pack_by_token_budget,
+    )
+
+    n = len(group.completions)
+    base, lm_head = _base_model_and_lm_head(model)
+    if base is None:
+        return [rollout_draw_diagnostics(model, group, i) for i in range(n)]
+    prompt = [int(t) for t in group.prompt_tokens]
+    sequences = [prompt + [int(t) for t in group.completions[i]] for i in range(n)]
+    drawn = [_drawn(group, i) for i in range(n)]
+    device = next(model.parameters()).device
+    vocab = int(getattr(lm_head, "out_features", 0) or lm_head.weight.shape[0])
+    budget = int(token_budget) if token_budget is not None else _microbatch_budget()
+    out: list = [None] * n
+    for batch in _pack_by_token_budget([len(s) for s in sequences], budget):
+        width = max(len(sequences[i]) for i in batch)
+        input_ids = torch.zeros(len(batch), width, dtype=torch.long, device=device)
+        mask = torch.zeros(len(batch), width, dtype=torch.long, device=device)
+        for row, i in enumerate(batch):
+            input_ids[row, :len(sequences[i])] = torch.tensor(sequences[i], device=device)
+            mask[row, :len(sequences[i])] = 1
+        padded = any(len(sequences[i]) < width for i in batch)
+        with torch.no_grad():
+            outputs = (base(input_ids, attention_mask=mask, use_cache=False) if padded
+                       else base(input_ids, use_cache=False))
+            hidden = _last_hidden_state(outputs)
+            pieces = [hidden[row].index_select(0, torch.tensor([len(prompt) + p - 1 for _, p in drawn[i]],
+                                                                device=device, dtype=torch.long))
+                      for row, i in enumerate(batch)]
+        sizes = [len(drawn[i]) for i in batch]
+        rows = torch.cat(pieces) if pieces else hidden.new_zeros((0, hidden.shape[-1]))
+
+        def diagnose(project, batch=batch, rows=rows, sizes=sizes):
+            found, start = [], 0
+            for i, size in zip(batch, sizes):
+                completion, uniforms = group.completions[i], group.draw_uniforms(i)
+                found.append(verifier._gpu_seed_consistency_diagnostics(
+                    _ProjectedRows(rows[start:start + size], project, vocab),
+                    [int(completion[p]) for _, p in drawn[i]], [uniforms[t] for t, _ in drawn[i]],
+                    position_offsets=[t for t, _ in drawn[i]]))
+                start += size
+            return found
+
+        if getattr(lm_head, "fused_selected_logprobs", False):
+            with torch.no_grad():
+                found = lm_head(rows, audit=diagnose)                  # FSDP2: one gather per micro-batch
+        else:
+            found = diagnose(head_projection(lm_head.weight, getattr(lm_head, "bias", None)))
+        for i, diagnostics in zip(batch, found):
+            out[i] = diagnostics
+    return out
+
+
 def audit_group(model: Any, group):
     """The group's ``AuditResult`` (``rl_audit.judge``) against the trainer's current weights."""
     from reliquary.validator.rl_audit import judge
@@ -101,7 +170,7 @@ def audit_group(model: Any, group):
     if model_was_training:
         model.eval()
     try:
-        return judge([rollout_diagnostics(model, group, i) for i in range(len(group.completions))])
+        return judge(group_diagnostics(model, group))
     finally:
         if model_was_training:
             model.train()
@@ -158,4 +227,5 @@ class TrainerAudits:
         return out
 
 
-__all__ = ["TrainerAudits", "audit_group", "broadcasting_audit", "head_projection", "rollout_diagnostics"]
+__all__ = ["TrainerAudits", "audit_group", "broadcasting_audit", "group_diagnostics", "head_projection",
+           "rollout_diagnostics"]
