@@ -226,6 +226,20 @@ class RlPayLedger:
             entry(hotkey)["banned_until"] = until
         return {h: out[h] for h in sorted(out)}
 
+    def _recent(self, environment: str) -> dict:
+        """What the env's last ``reference_groups`` graded groups (every hotkey) turned into: the share trained or
+        waiting for the trainer (in zone, not refused) and the share that were out-of-zone first scans. A miner
+        reads expected pay per generated token as ``token_price x (trained_share + 0.25 x first_scan_share)``."""
+        with self.book.lock:
+            rows = self.book.db.execute(
+                "SELECT verdict, training, first_scan FROM rl_groups WHERE environment=? AND verdict!='rejected' "
+                "ORDER BY seq DESC LIMIT ?", (environment, self.config.reference_groups)).fetchall()
+        n = len(rows)
+        trained = sum(1 for verdict, training, _ in rows if verdict == "in_zone" and training != "rejected")
+        first = sum(1 for verdict, _, first_scan in rows if verdict != "in_zone" and first_scan)
+        return {"groups": n, "trained_share": trained / n if n else None,
+                "first_scan_share": first / n if n else None}
+
     def board(self, now: float | None = None, hotkey: str | None = None) -> dict:
         """``GET /rl/pay`` (async): per-env prices and per-hotkey accrued / paid, rebuilt at most every
         ``BOARD_CACHE_S`` (public: one answer serves every caller in between)."""
@@ -243,9 +257,12 @@ class RlPayLedger:
         with self.book.lock:
             periods = [(w, e, p) for w, e, p in self.book.db.execute(
                 "SELECT work_period, entry_period, published FROM rl_pay_periods ORDER BY work_period DESC LIMIT 12")]
+        environments = self.prices.board()
+        for name, entry in environments.items():
+            entry["recent"] = self._recent(name)
         return {"policy": "pay-per-matched-token/v1", "floor": self.config.floor, "cap": self.config.cap,
                 "period": cp.period_of(now, self.config.genesis), "period_seconds": cp.PERIOD_SECONDS,
-                "environments": self.prices.board(), "hotkeys": balances,
+                "environments": environments, "hotkeys": balances,
                 "settled_periods": [{"work_period": w, "entry_period": e, "published": bool(p)}
                                     for w, e, p in periods],
                 "note": ("Units are fractions of the task's emission cap. A trained rollout at or above the floor "

@@ -278,4 +278,6 @@ def test_the_public_board_is_rebuilt_at_most_every_15_seconds(book):
     assert ledger.board(NOW + BOARD_CACHE_S - 1) is first and first["hotkeys"] == {}     # cached: no recompute
     fresh = ledger.board(NOW + BOARD_CACHE_S, hotkey="A")
     assert fresh["hotkeys"]["A"]["accrued"] > 0 and list(fresh["hotkeys"]) == ["A"]
+    assert fresh["environments"][ENV]["recent"] == {"groups": 1, "trained_share": 1.0, "first_scan_share": 0.0}
+    assert first["environments"][ENV]["recent"] == {"groups": 0, "trained_share": None, "first_scan_share": None}
     assert ledger.board(NOW + BOARD_CACHE_S)["hotkeys"]["A"] == fresh["hotkeys"]["A"]
