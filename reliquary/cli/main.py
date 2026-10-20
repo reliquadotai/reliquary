@@ -3420,6 +3420,21 @@ def _miner_requires_grader(env_names: list[str]) -> bool:
     return False
 
 
+def _envs_need_grader(env_names) -> bool:
+    """Whether a served env scores through the grader service: a sandboxed (code-executing) single-turn env.
+    Names the registry does not know (bridged episode envs, scored by their sandboxes) need none."""
+    from reliquary.environment.registry import get_environment_spec
+
+    for name in env_names:
+        try:
+            spec = get_environment_spec(str(name))
+        except Exception:
+            continue
+        if getattr(spec, "admission_resource_class", None) == "sandbox":
+            return True
+    return False
+
+
 def _grader_bundle_python() -> Path:
     bundle = os.environ.get(
         "GRADER_BUNDLE_PATH",
@@ -4357,6 +4372,9 @@ def validate(
                     raise typer.Exit(code=4)
                 from reliquary.validator.rl_async_service import run_rl_async_validator
                 from reliquary.validator.weight_only import WeightOnlyValidator
+
+                if _envs_need_grader(declared_entry.env_split or ()):
+                    _ensure_grader_running()        # code envs score through the sandboxed grader service
 
                 threading.Thread(
                     target=lambda: asyncio.run(WeightOnlyValidator(

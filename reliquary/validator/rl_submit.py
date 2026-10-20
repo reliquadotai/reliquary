@@ -7,7 +7,10 @@
 2. ``GroupGrader.grade``: the validator renders the prompt, checks every rollout's tokens, length and termination
    (``admission._classify_termination``, the window path's predicate) and grades the completions with the
    environment's own scorer (``EnvironmentSpec.score_many``). Rewards never come from the miner. A grader outage
-   (``GraderInfrastructureError``) raises and leaves the lease open: the miner resends.
+   (``GraderInfrastructureError``) raises and leaves the lease open: the miner resends. In the service the scorer
+   runs in a per-env process pool under the window path's wall budget (``PooledScorer``): a group that overruns
+   it, or a worker that dies, is that outage (the window path's ``worker_dropped``: resendable, never the
+   miner's fault), and the pool is replaced.
 3. One transaction on the lease book's file: the lease closes (whatever the outcome; there is no release), the
    group is stored in ``rl_groups`` and:
    * refused for integrity (bad termination, tampered force span, out-of-vocab or over-long tokens, a scorer that
@@ -45,9 +48,14 @@ from __future__ import annotations
 import json
 import logging
 import math
+import multiprocessing
 import random
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -159,7 +167,8 @@ class GroupGrader:
 
     def __init__(self, environments: Mapping[str, Any], tokenizer: Any, *, eos_token_ids: Sequence[int],
                  think_close_ids: Sequence[int] = (), canonical_force_ids: Sequence[int] = (),
-                 vocab_size: int | None = None, episodes: Mapping[str, Any] | None = None) -> None:
+                 vocab_size: int | None = None, episodes: Mapping[str, Any] | None = None,
+                 scorer: Callable[[str, Any, Sequence[str], Any], Sequence[float]] | None = None) -> None:
         from reliquary.validator.admission import AdmissionContext
 
         self.episodes = dict(episodes or {})
@@ -175,6 +184,8 @@ class GroupGrader:
         self.environments = dict(environments)
         self.tokenizer = tokenizer
         self.vocab_size = vocab_size
+        # (env, problem, texts, materials) -> rewards; in process unless the service gives a ``PooledScorer``
+        self.scorer = scorer or score_group
         self._contexts = {name: AdmissionContext(
             randomness="", environment=name, vocab_size=vocab_size, max_sequence_length=MAX_NEW_TOKENS_PROTOCOL_CAP,
             eos_token_ids=tuple(sorted(eos_token_ids)), canonical_force_ids=tuple(canonical_force_ids),
@@ -231,8 +242,7 @@ class GroupGrader:
             truncated.append(kind == "truncated")
         texts = [str(self.tokenizer.decode(list(r.tokens), skip_special_tokens=False)) for r in rollouts]
         try:
-            rewards = get_environment_spec(environment).score_many(materials.problem, texts,
-                                                                  materials.effective_reward_materials)
+            rewards = self.scorer(environment, materials.problem, texts, materials.effective_reward_materials)
         except GraderInfrastructureError:
             raise
         except Exception:
@@ -244,6 +254,80 @@ class GroupGrader:
         # reasoning would grade (the failure reward, never masked: the group trains on it).
         rewards = tuple(0.0 if cut else r for r, cut in zip(rewards, truncated))
         return Graded(prompt, rewards, tuple(truncated))
+
+
+def score_group(environment: str, problem: Any, texts: Sequence[str], materials: Any) -> list[float]:
+    """One group's rewards by its environment's own scorer (module level: it runs in a pool worker too)."""
+    return [float(r) for r in get_environment_spec(environment).score_many(problem, list(texts), materials)]
+
+
+class PooledScorer:
+    """``GroupGrader``'s scorer in the service: each env scores in its own process pool (spawned, workers recycled
+    after ``max_tasks`` groups), and a group gets the window path's wall budget for its resource class
+    (``CODE_ADMISSION_WALL_SECONDS`` for sandboxed code, ``MATH_ADMISSION_WALL_SECONDS`` otherwise). A group that
+    overruns it, or a pool whose worker died, raises ``GraderInfrastructureError`` (the submission is resent, as
+    the window path's ``worker_dropped``) and the env's pool is replaced, so one group never holds a worker."""
+
+    def __init__(self, environments: Sequence[str], *, workers: int = 2, max_tasks: int | None = None,
+                 wall_seconds: Callable[[str], float] | None = None, function: Callable[..., Any] = score_group,
+                 mp_context: str = "spawn") -> None:
+        from reliquary.constants import ADMISSION_PROCESS_MAX_TASKS
+
+        self.environments = tuple(environments)
+        self.workers = int(workers)
+        self.max_tasks = ADMISSION_PROCESS_MAX_TASKS if max_tasks is None else int(max_tasks)
+        self.wall_seconds = wall_seconds or _wall_seconds
+        self.function = function
+        self._context = multiprocessing.get_context(mp_context)
+        self._pools: dict[str, ProcessPoolExecutor] = {}
+        self._lock = threading.Lock()
+        self.timeouts: dict[str, int] = {}
+        self.restarts: dict[str, int] = {}
+
+    def _pool(self, environment: str) -> ProcessPoolExecutor:
+        with self._lock:
+            pool = self._pools.get(environment)
+            if pool is None:
+                pool = self._pools[environment] = ProcessPoolExecutor(
+                    max_workers=self.workers, mp_context=self._context, max_tasks_per_child=self.max_tasks)
+            return pool
+
+    def _replace(self, environment: str, pool: ProcessPoolExecutor) -> None:
+        with self._lock:
+            if self._pools.get(environment) is pool:
+                del self._pools[environment]
+                self.restarts[environment] = self.restarts.get(environment, 0) + 1
+        for process in tuple((getattr(pool, "_processes", None) or {}).values()):
+            if process.is_alive():
+                process.kill()
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    def __call__(self, environment: str, problem: Any, texts: Sequence[str], materials: Any) -> list[float]:
+        pool = self._pool(environment)
+        wall = float(self.wall_seconds(environment))
+        try:
+            return list(pool.submit(self.function, environment, problem, list(texts), materials).result(
+                timeout=max(1.0, wall)))
+        except FutureTimeout as exc:
+            self.timeouts[environment] = self.timeouts.get(environment, 0) + 1
+            self._replace(environment, pool)
+            raise GraderInfrastructureError(f"{environment} grading overran {wall:.0f} s") from exc
+        except BrokenProcessPool as exc:
+            self._replace(environment, pool)
+            raise GraderInfrastructureError(f"{environment} grading worker died") from exc
+
+    def close(self) -> None:
+        with self._lock:
+            pools, self._pools = list(self._pools.items()), {}
+        for _, pool in pools:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _wall_seconds(environment: str) -> float:
+    from reliquary.constants import CODE_ADMISSION_WALL_SECONDS, MATH_ADMISSION_WALL_SECONDS
+
+    sandboxed = getattr(get_environment_spec(environment), "admission_resource_class", "cpu") == "sandbox"
+    return CODE_ADMISSION_WALL_SECONDS if sandboxed else MATH_ADMISSION_WALL_SECONDS
 
 
 class RlSubmissions:
@@ -582,5 +666,5 @@ class RlSubmissions:
 
 __all__ = [
     "AUDIT_MAX_ATTEMPTS", "BAN", "FIRST_SCAN", "FIRST_SCAN_FORFEITED", "REJECTED", "TRAINED", "UNTRAINED", "AuditResult", "Graded",
-    "GroupGrader", "ProofForward", "RlSubmissions", "Rollout", "SubmitConfig",
+    "GroupGrader", "PooledScorer", "ProofForward", "RlSubmissions", "Rollout", "SubmitConfig", "score_group",
 ]

@@ -542,8 +542,11 @@ def _grader_for(names, checkpoint: str, load_kwargs: Mapping[str, Any], episodes
     episodes = dict(episodes or {})
     environments = {name: load_environment(name) for name in names if name not in episodes}
     vocab = getattr(config, "vocab_size", None) or getattr(getattr(config, "text_config", None), "vocab_size", None)
+    from reliquary.validator.rl_submit import PooledScorer
+
+    # Scoring isolated per env, under the window path's wall budget (``PooledScorer``).
     grader = GroupGrader(environments, tokenizer, eos_token_ids=sorted(eos), think_close_ids=think_close,
-                         canonical_force_ids=canonical, vocab_size=vocab)
+                         canonical_force_ids=canonical, vocab_size=vocab, scorer=PooledScorer(list(environments)))
     ranges = {name: rl_prompt_range(name, len(env)) for name, env in environments.items()}
     ranges.update({name: (0, len(env)) for name, env in episodes.items()})
     return grader, ranges
@@ -743,6 +746,9 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
             except Exception:
                 logger.exception("rl lease sessions not drained at shutdown")
         await publisher.close()
+        close_scorer = getattr(getattr(rl.submissions.grader, "scorer", None), "close", None)
+        if callable(close_scorer):
+            close_scorer()
         await asyncio.to_thread(rl.close)
         telemetry.finish()
 
