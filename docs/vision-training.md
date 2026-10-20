@@ -21,9 +21,16 @@ Supported architecture mappings are SmolVLM, Qwen2.5-VL and Qwen3-VL. A mapping
 does not qualify a particular model, accelerator, context length or runtime image.
 `trust_remote_code` is disabled and execution loads local safetensors only.
 
-`docker/Dockerfile.vision-training` defines the image build. Resolve and record
-the built image digest, then qualify that exact image on the intended host.
-The image definition alone is not a published or approved runtime.
+`docker/Dockerfile.vision-training` defines the image build. After a relevant
+merge to `main`, the vision workflow publishes a CUDA candidate at
+`ghcr.io/reliquadotai/vision-training:sha-<full source commit>`. Publication waits
+for the CPU contract and training smoke tests, then checks the CUDA-wheel
+imports offline on a CPU runner before pushing the tested image. The job
+summary records its immutable `sha256` image reference.
+
+Use that digest, rather than the source tag, in a runtime profile. Publication
+does not qualify CUDA execution, GPU memory, throughput, isolation or a model.
+Qualify that exact image and profile on the intended host before activation.
 
 ## Dataset
 

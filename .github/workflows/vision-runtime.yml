@@ -14,10 +14,12 @@ on:
     branches: [main]
     paths:
       - "reliquary/vision/**"
+      - "scripts/vision-training-runtime.py"
       - "docker/Dockerfile.vision-training"
       - "tests/vision/**"
       - "tests/unit/test_vision*"
       - "pyproject.toml"
+      - ".github/workflows/vision-runtime.yml"
 
 permissions:
   contents: read
@@ -77,3 +79,62 @@ jobs:
             -v "$PWD/tests/vision:/tests:ro" \
             -e VISION_TEST_MODEL_DIR=/test-model -e VISION_TEST_OUTPUT_DIR=/test-output \
             --entrypoint python vision-runtime:test /tests/pretrained_smoke.py
+
+  publish-candidate:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [contracts, container-smoke]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+    env:
+      IMAGE: ghcr.io/reliquadotai/vision-training
+    steps:
+      - name: Free disk space for CUDA dependencies
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+      - uses: actions/checkout@v4
+      - name: Build the CUDA candidate on a CPU runner
+        run: |
+          docker build -f docker/Dockerfile.vision-training \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            -t "$IMAGE:sha-$GITHUB_SHA" .
+      - name: Check CUDA wheels offline without a GPU
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 512 --memory 4g --cpus 2 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+            --entrypoint python "$IMAGE:sha-$GITHUB_SHA" -c \
+            'import torch, torchvision, transformers, peft; from reliquary.vision import runner, runtime; assert torch.version.cuda == "12.8"; assert not torch.cuda.is_available(); print("CUDA-wheel imports passed; GPU execution remains unqualified.")'
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the tested candidate and record its digest
+        id: publish
+        run: |
+          docker push "$IMAGE:sha-$GITHUB_SHA"
+          reference="$(docker image inspect "$IMAGE:sha-$GITHUB_SHA" --format '{{index .RepoDigests 0}}')"
+          test "${reference%@*}" = "$IMAGE"
+          digest="${reference#*@}"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          {
+            printf 'Candidate: `%s`\n\n' "$reference"
+            printf 'Source revision: `%s`\n\n' "$GITHUB_SHA"
+            printf 'CPU contracts, CPU training and offline CUDA-wheel imports passed. '
+            printf 'This candidate still requires exact GPU/profile qualification before activation.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
