@@ -392,6 +392,19 @@ def test_a_reward_that_moves_under_the_trainers_picks_is_not_paid(book):
         subs.submit(again.lease_id, "A", group(8))
         subs.report_training(again.lease_id, rollout_match=[0.99] * 16, accepted=True, substitutions=none[:3])
 
+def test_a_rollout_that_went_on_where_the_draw_ended_it_is_graded_as_ended_there(book):
+    """The trainer lists a pick that ends the rollout whatever its gap; the re-grade ends the rollout at that pick."""
+    subs = service(book, probation_groups=0)
+    held = lease(book, 83)
+    longer = Rollout(text("\\boxed{4} \\boxed{5}") + (EOS,))
+    subs.submit(held.lease_id, "A", [RIGHT] * 8 + [longer] * 8)
+    none = [[] for _ in range(16)]
+    ended = none[:8] + [[(len(text("\\boxed{4}")), EOS)]] + none[9:]
+    subs.report_training(held.lease_id, rollout_match=[0.99] * 16, accepted=True, substitutions=ended)
+    event = {e["lease_id"]: e for e in subs.events()}[held.lease_id]
+    assert event["kind"] == UNTRAINED and event["detail"]["reward_moved"]
+
+
 def test_the_buffer_hands_out_oldest_first_records_the_queue_signal_and_survives_a_restart(book, tmp_path):
     subs = service(book)
     old = lease(book, 80)

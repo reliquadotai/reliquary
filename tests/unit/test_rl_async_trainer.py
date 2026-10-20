@@ -346,6 +346,20 @@ def test_the_gate_refuses_a_token_far_from_the_pick_and_keeps_the_suspects_for_t
 
 
 
+def test_a_pick_that_ends_the_rollout_goes_to_the_regrade_whatever_its_gap():
+    import torch
+
+    from reliquary.validator.training import _DrawRows, _draw_suspects
+
+    eos = 7
+    rows = _DrawRows(targets=torch.tensor([5, eos, 9, eos]), drawn=torch.tensor([True, True, True, True]),
+                     match=torch.tensor([True, False, False, True]), stochastic=torch.tensor([True] * 4),
+                     entropy=torch.zeros(4), gap=torch.tensor([0.0, 0.2, 0.3, 0.0]))
+    (gap, pairs, last), = _draw_suspects(rows, [4], [[10, 11, 12, 13]], [10], substitute_gap=3.0,
+                                         stop_ids=frozenset({eos}))
+    assert pairs == [(1, eos)] and gap == pytest.approx(0.3)                 # small gaps: only the skipped end
+
+
 def test_a_rollout_cut_short_by_an_eos_far_from_the_pick_is_refused():
     """A final EOS is checked on its own (the re-grade cannot see a cut continuation): its gap must be at most
     ``terminal_gap``. Here every rollout's last token stands for the EOS; the noisy rollout's last token is a random

@@ -171,6 +171,7 @@ class GroupGrader:
                 raise ValueError(f"{name}: not a signed-episode environment")
         if not eos_token_ids:
             raise ValueError("the EOS token ids are required to judge termination")
+        self.eos_token_ids = frozenset(int(t) for t in eos_token_ids)
         self.environments = dict(environments)
         self.tokenizer = tokenizer
         self.vocab_size = vocab_size
@@ -506,8 +507,10 @@ class RlSubmissions:
         """The reward re-check: every rollout with suspect mismatches (``substitutions[i]``: (completion position,
         the trainer's pick), gap over ``RL_SUBSTITUTE_GAP``) is graded again with the picks there; any reward that
         moves means the tokens were chosen for the reward. Only the first position of a run of consecutive suspects
-        is substituted: the picks after it were drawn under the miner's prefix. Episodes are not re-graded (their
+        is substituted: the picks after it were drawn under the miner's prefix. A pick that ends the rollout (an EOS
+        the trainer lists whatever its gap) ends the re-graded rollout there. Episodes are not re-graded (their
         reward is the environment's record; the gap test covers them)."""
+        stops = getattr(self.grader, "eos_token_ids", frozenset())
         changed = []
         for i, pairs in enumerate(substitutions or ()):
             if not pairs or group.spans is not None:
@@ -516,6 +519,9 @@ class RlSubmissions:
             for position, pick in sorted((int(p), int(t)) for p, t in pairs):
                 if previous != position - 1 and 0 <= position < len(tokens):
                     tokens[position] = pick
+                    if pick in stops:
+                        tokens = tokens[:position + 1]
+                        break
                 previous = position
             changed.append((i, Rollout(tuple(tokens), group.force_spans[i])))
         if not changed:

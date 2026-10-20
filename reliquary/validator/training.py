@@ -2107,7 +2107,8 @@ def _microbatch_grad(
         dtype=new_lp.dtype,
     )
     suspects = None if gate is None or draw_rows is None else _draw_suspects(
-        draw_rows, seg, positions, plens, getattr(gate, "substitute_gap", float("inf")))
+        draw_rows, seg, positions, plens, getattr(gate, "substitute_gap", float("inf")),
+        getattr(gate, "eos_ids", frozenset()))
     keep_cat = torch.tensor(
         [flag for keep in keeps for flag in keep],
         device=device,
@@ -2205,14 +2206,17 @@ def _rollout_draw_tallies(draw_rows: _DrawRows, keep_seg: list[int]) -> list[tup
     return [tuple(int(v) for v in row) for row in out.tolist()]
 
 
-def _draw_suspects(draw_rows: _DrawRows, seg: list[int], positions, plens, substitute_gap: float):
+def _draw_suspects(draw_rows: _DrawRows, seg: list[int], positions, plens, substitute_gap: float,
+                   stop_ids=frozenset()):
     """Per rollout, over every scored row (before the keep mask): (largest Gumbel gap, [(completion position, v*)]
-    of the mismatches whose gap exceeds ``substitute_gap``, the last scored row's gap or None when it carried no
-    draw): what the gate's gap and termination tests and the re-grading read."""
+    of the mismatches whose gap exceeds ``substitute_gap``, or whose pick is one of ``stop_ids`` (the draw ended the
+    rollout there, whatever the gap), the last scored row's gap or None when it carried no draw): what the gate's
+    gap and termination tests and the re-grading read."""
     with torch.no_grad():
         gaps = draw_rows.gap.tolist()
         picks = draw_rows.targets.tolist()
         drawn = draw_rows.drawn.tolist()
+        matched = draw_rows.match.tolist()
     out, offset = [], 0
     for k, n in enumerate(seg):
         rows = range(offset, offset + n)
@@ -2220,7 +2224,8 @@ def _draw_suspects(draw_rows: _DrawRows, seg: list[int], positions, plens, subst
         last = rows[-1] if n else None
         out.append((max((gaps[r] for r in rows), default=0.0),
                     [(int(positions[k][r - rows.start]) - int(plens[k]), int(picks[r]))
-                     for r in rows if gaps[r] > substitute_gap],
+                     for r in rows if gaps[r] > substitute_gap
+                     or (drawn[r] and not matched[r] and int(picks[r]) in stop_ids)],
                     None if last is None or not drawn[last] else gaps[last]))
     return out
 
