@@ -16,15 +16,31 @@ policy lag and assignment age before an optimizer update.
 
 ## Install the isolated runtime
 
-Install the checked-in Git pin using a Python 3.12 virtual environment. This
-keeps its Torch/Transformers versions separate from the core's dependencies:
+The Git requirement pins the runtime source, not its transitive dependencies.
+Export the same revision's `uv.lock` and install its hashed dependency set in
+a fresh Python 3.12 environment, then install the Git package without resolving
+dependencies again. The `gpu` extra includes the CUDA dependencies on Linux;
+the optional sandbox package is not selected.
 
 ```sh
+TEE_RUNTIME_REVISION=2131490288189896127521c57af31f41fa63f432
+git clone --no-checkout https://github.com/reliquadotai/reliquary-TEE.git \
+  /opt/reliquary-attested-source
+git -C /opt/reliquary-attested-source checkout --detach "$TEE_RUNTIME_REVISION"
 uv venv --python 3.12 /opt/reliquary-attested
+uv export --project /opt/reliquary-attested-source \
+  --frozen --extra gpu --no-dev --no-emit-project \
+  --output-file /opt/reliquary-attested/runtime-dependencies.txt > /dev/null
 uv pip install --python /opt/reliquary-attested/bin/python \
-  -r requirements/attested-trainer.txt
+  --require-hashes --only-binary :all: \
+  -r /opt/reliquary-attested/runtime-dependencies.txt
+uv pip install --python /opt/reliquary-attested/bin/python \
+  --no-deps -r requirements/attested-trainer.txt
+uv pip check --python /opt/reliquary-attested/bin/python
 ```
 
+Run these commands from the core checkout. Retain the generated dependency
+export with the deployment; no second lockfile is maintained in this repository.
 The launcher requires the installed distribution's version and PEP 610 Git
 provenance to match the code's exact pin. Editable checkouts and installations
 without that provenance are refused. This checks installation identity; it
