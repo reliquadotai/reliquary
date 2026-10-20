@@ -1500,13 +1500,21 @@ _PROFILE_VALUES = (
 # 0.95, no honest group rejected; 0.994 with an fp32 LM head on both sides (``lm_head_fp32``,
 # decided 2026-10-15: on). The new version moves the forced-seed domain too, so v9 and v10
 # streams never coincide.
+# The math envs get a 64k cap (2026-10-19 budget probe of the SFT starting model, docs/rl-async-qualification.md):
+# at 32k about half the rollouts cut were correct once given room, so a cut there scored good reasoning 0.
 _TEUTONIC_V9 = next(p for p in _PROFILE_VALUES if p.profile_id == "teutonic-9b-reliquary-suite-v9-dev1")
+_V10_MATH_MAX_NEW_TOKENS = 65536
 _PROFILE_VALUES = _PROFILE_VALUES + (
     replace(
         _TEUTONIC_V9,
         profile_id="teutonic-9b-reliquary-suite-v10-gumbel-dev1",
         protocol_version=10,
         sampling=replace(_SAMPLING_DAPO, draw=DRAW_GUMBEL_MAX, lm_head_fp32=True),
+        environments={
+            name: (replace(env, max_new_tokens=_V10_MATH_MAX_NEW_TOKENS)
+                   if name in ("reliquary_dapo_math_v1", "reliquary_hard_math_v1") else env)
+            for name, env in _TEUTONIC_V9.environments.items()
+        },
     ),
 )
 

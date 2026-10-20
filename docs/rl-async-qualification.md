@@ -122,3 +122,12 @@ that never finish even at 64k: a noisy proxy, given no credit. At 32k a cut is o
 at 64k it is a much cleaner failure. Proposed for the run: math cap 64k, a cut scores 0 and its group trains (no
 masking), soft overlong zone 0.1 over the last 4,096 tokens, cut share watched and the cap raised again if it stays
 high. To check in the rehearsal: 64k sequences in the FSDP2 trainer.
+
+## Must test in the rehearsal (2026-10-20)
+
+- A rollout that goes on where the draw ended it (an EOS pick, any gap) is re-graded ended at that pick; a reward
+  that moves leaves its group unpaid. Run an adversarial miner that replaces end picks with the runner-up and check
+  that its groups go unpaid while honest groups at lag 0-4 keep their pay (re-grade rate, moved-reward rate).
+- Math at the 64k cap: FSDP2 trainer memory and step time on 64k sequences, lease lifetimes, cut share per env
+  (watch it during the run; raise the cap if it stays high).
+- Cut rollouts score 0 and their groups train: in-zone share and length trend of the math envs over the first steps.
