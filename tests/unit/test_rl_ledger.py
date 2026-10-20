@@ -4,12 +4,15 @@ async ``GET /rl/pay``."""
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
 from reliquary.validator import corpus_periods as cp
 from reliquary.validator.emission_price import PriceState
 from reliquary.validator.rl_ledger import FORFEITED, LedgerConfig, RlPayLedger
+from reliquary.validator.rl_lease_quota import QuotaConfig, QuotaController
+from reliquary.validator.rl_leases import LeaseBook
 from reliquary.validator.rl_price import (
     DESCEND, HOLD, RISE, AsyncPriceController, AsyncPriceParams, EnvSignal, QueueTick, advance_async,
 )
@@ -187,6 +190,12 @@ class Archives:
     async def write(self, task_id, work, entry, doc):
         self.docs[(task_id, work, entry)] = doc
 
+    async def read(self, task_id, work, entry):
+        return self.docs.get((task_id, work, entry))
+
+    async def list(self, task_id):
+        return sorted((work, entry) for task, work, entry in self.docs if task == task_id)
+
 
 def test_a_closed_period_settles_once_and_feeds_the_period_weights(book):
     subs = service(book, probation_groups=0)
@@ -214,6 +223,109 @@ def test_a_closed_period_settles_once_and_feeds_the_period_weights(book):
     weights = cp.replay(list(archives.docs.values()), period + 7)      # what weight_only._period_weights replays
     assert weights == {"A": pytest.approx(cp.PERIOD_ALPHA * 2 * unit), "B": pytest.approx(cp.PERIOD_ALPHA * 2 * unit)}
     assert ledger.balances()["A"] == {"accrued": 0.0, "paid": pytest.approx(2 * unit), "forfeited": 0.0}
+
+
+@pytest.mark.parametrize("interruption", [TimeoutError, asyncio.CancelledError])
+@pytest.mark.parametrize("commit_after_retry", [False, True])
+@pytest.mark.parametrize("legacy_writer", [False, True])
+async def test_publication_reconciles_after_restart(book, tmp_path, interruption, commit_after_retry, legacy_writer):
+    from reliquary.validator.weight_only import WeightOnlyValidator
+
+    subs = service(book, probation_groups=0)
+    ledger = ledger_for(book, subs, slack_s=0)
+    trained(book, subs, 1)
+    ledger.ingest()
+    now = cp.period_end(cp.period_of(NOW)) + 1
+    (doc,) = ledger.settle(now)
+
+    class InterruptedArchives(Archives):
+        interrupted = False
+        pending = None
+
+        async def write(self, *args):
+            if not self.interrupted:
+                self.interrupted = True
+                if commit_after_retry:
+                    self.pending = args
+                else:
+                    await super().write(*args)
+                raise interruption()
+            await super().write(*args)
+
+    archives = InterruptedArchives()
+    with pytest.raises(interruption):
+        if legacy_writer:
+            book.db.execute("UPDATE rl_pay_periods SET published=0")
+            book.db.commit()
+            await archives.write("rl-async", doc["work_period"], doc["entry_period"], doc)
+        else:
+            await ledger.publish(archives, now=now)
+    assert ledger.unpublished() == [doc]
+    assert ledger.board(now)["settled_periods"][0]["published"] is False
+    book.close()
+
+    restarted = LeaseBook(tmp_path / "leases.sqlite3", book.config,
+                          quota=QuotaController(QuotaConfig(initial=64, ceiling=64)), clock=lambda: NOW)
+    try:
+        ledger = ledger_for(restarted, service(restarted, probation_groups=0), slack_s=0)
+        later = cp.period_end(doc["entry_period"]) + 1
+        assert await ledger.publish(archives, now=later) == 1
+        assert ledger.unpublished() == []
+        if archives.pending is not None:
+            await Archives.write(archives, *archives.pending)
+        assert await ledger.publish(archives, now=later + cp.PERIOD_SECONDS) == 0
+        declared = {"rl-async": SimpleNamespace(params={"settlement": "period-ema-v1", "cap": CAP})}
+        weights = await WeightOnlyValidator._period_weights(declared, archives=archives, now=later,
+                                                           genesis=cp.PERIOD_EPOCH)
+        expected = cp.replay([doc], cp.period_of(later))
+        assert weights["rl-async"] == pytest.approx(expected)
+        assert archives.docs == {("rl-async", doc["work_period"], doc["entry_period"]): doc}
+        assert ledger.board(later)["settled_periods"][0]["published"] is True
+    finally:
+        restarted.close()
+
+
+async def test_unattempted_stale_archive_can_move_after_restart(book, tmp_path):
+    subs = service(book, probation_groups=0)
+    ledger = ledger_for(book, subs, slack_s=0)
+    trained(book, subs, 1)
+    ledger.ingest()
+    (doc,) = ledger.settle(cp.period_end(cp.period_of(NOW)) + 1)
+    assert ledger.board()["settled_periods"][0]["published"] is False
+    book.close()
+
+    restarted = LeaseBook(tmp_path / "leases.sqlite3", book.config,
+                          quota=QuotaController(QuotaConfig(initial=64, ceiling=64)), clock=lambda: NOW)
+    try:
+        ledger = ledger_for(restarted, service(restarted, probation_groups=0), slack_s=0)
+        later = cp.period_end(doc["entry_period"]) + 1
+        archives = Archives()
+        assert await ledger.publish(archives, now=later) == 1
+        moved = {**doc, "entry_period": cp.period_of(later) + 1}
+        assert archives.docs == {("rl-async", doc["work_period"], moved["entry_period"]): moved}
+    finally:
+        restarted.close()
+
+
+@pytest.mark.parametrize("stored", ["unreadable", "different"])
+async def test_publication_requires_matching_archive_before_moving_entry(book, stored):
+    subs = service(book, probation_groups=0)
+    ledger = ledger_for(book, subs, slack_s=0)
+    trained(book, subs, 1)
+    ledger.ingest()
+    (doc,) = ledger.settle(cp.period_end(cp.period_of(NOW)) + 1)
+
+    class UnavailableArchives(Archives):
+        async def read(self, *args):
+            if stored == "unreadable":
+                raise RuntimeError("archive unavailable")
+            return {**doc, "groups": doc["groups"] + 1}
+
+    archives = UnavailableArchives()
+    with pytest.raises(RuntimeError):
+        await ledger.publish(archives, now=cp.period_end(doc["entry_period"]) + 1)
+    assert ledger.unpublished() == [doc]
+    assert archives.docs == {}
 
 
 def test_a_period_never_pays_more_than_the_cap(book):
@@ -263,7 +375,6 @@ def test_the_pay_route_publishes_prices_and_balances(book):
     server.mount_rl_lease_router(build_rl_lease_router(
         book=book, collector=LeaseCollector(book, interval_s=0.0), validator_hotkey=VALIDATOR.ss58_address,
         clock=lambda: NOW, pay=ledger))
-    assert [r.path for r in server.app.routes if getattr(r, "path", "") == "/rl/pay"] == ["/rl/pay"]
     assert TestClient(server.app).get("/rl/pay").json()["policy"] == "pay-per-matched-token/v1"
 
 

@@ -278,6 +278,10 @@ class Archives:
     def __init__(self):
         self.written = []
 
+    async def read(self, task_id, work_period, entry_period):
+        return next((doc for task, work, entry, doc in self.written
+                     if (task, work, entry) == (task_id, work_period, entry_period)), None)
+
     async def write(self, task_id, work_period, entry_period, doc):
         self.written.append((task_id, work_period, entry_period, doc))
 

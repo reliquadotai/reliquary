@@ -38,6 +38,9 @@ from reliquary.validator.rl_submit import BAN, FIRST_SCAN, TRAINED
 RL_PERIOD_ARCHIVE_SCHEMA = "reliquary/rl-async-period/v1"
 BOARD_CACHE_S = 15.0       # the public board is rebuilt at most this often (it sums every accrual under the lock)
 ACCRUED, SETTLED, FORFEITED = "accrued", "settled", "forfeited"
+# Legacy 0 is unconfirmed and must keep its identity; 1 is confirmed.
+# Only new state 2 proves no publication has been attempted.
+_UNATTEMPTED = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS rl_pay_cursor(id INTEGER PRIMARY KEY CHECK(id=0), seq INTEGER NOT NULL);
@@ -170,8 +173,8 @@ class RlPayLedger:
                        "accrued_by_hotkey": {h: accrued[h] for h in sorted(accrued)}, "accrued_total": total,
                        "scale": scale, "cap": self.config.cap, "groups": len(rows),
                        "matched_tokens": sum(r[2] for r in rows)}
-                db.execute("INSERT INTO rl_pay_periods(work_period, entry_period, doc, published) VALUES(?,?,?,0)",
-                           (period, entry, json.dumps(doc, sort_keys=True)))
+                db.execute("INSERT INTO rl_pay_periods(work_period, entry_period, doc, published) VALUES(?,?,?,?)",
+                           (period, entry, json.dumps(doc, sort_keys=True), _UNATTEMPTED))
                 db.execute("UPDATE rl_accruals SET status=? WHERE status=? AND period=?", (SETTLED, ACCRUED, period))
                 out.append(doc)
         return out
@@ -179,23 +182,35 @@ class RlPayLedger:
     def unpublished(self) -> list[dict]:
         with self.book.lock:
             return [json.loads(d) for d, in self.book.db.execute(
-                "SELECT doc FROM rl_pay_periods WHERE published=0 ORDER BY work_period").fetchall()]
+                "SELECT doc FROM rl_pay_periods WHERE published<>1 ORDER BY work_period").fetchall()]
 
     async def publish(self, archives, now: float | None = None) -> int:
-        """Write the unpublished period archives (``R2PeriodArchives``-like ``write``). An archive whose entry period
-        has begun is moved to the next free one first, so no weight set misses part of it (as the corpus settler)."""
+        """Reconcile unconfirmed archives; only never-attempted entries may move."""
         written = 0
         for doc in self.unpublished():
-            now_ = float(self.clock()) if now is None else now
-            due = cp.period_of(now_, self.config.genesis) + 1
-            if doc["entry_period"] < due:
+            existing = await archives.read(self.config.task_id, doc["work_period"], doc["entry_period"])
+            if existing is not None and existing != doc:
+                raise RuntimeError("period archive already holds another document")
+            if existing is None:
+                now_ = float(self.clock()) if now is None else now
+                due = cp.period_of(now_, self.config.genesis) + 1
                 with self.book.transaction():
-                    entered = [e for e, in self.book.db.execute(
-                        "SELECT entry_period FROM rl_pay_periods WHERE work_period<>?", (doc["work_period"],))]
-                    doc = {**doc, "entry_period": cp.entry_for(due, entered)}
-                    self.book.db.execute("UPDATE rl_pay_periods SET entry_period=?, doc=? WHERE work_period=?",
-                                         (doc["entry_period"], json.dumps(doc, sort_keys=True), doc["work_period"]))
-            await archives.write(self.config.task_id, doc["work_period"], doc["entry_period"], doc)
+                    state, stored = self.book.db.execute(
+                        "SELECT published, doc FROM rl_pay_periods WHERE work_period=?",
+                        (doc["work_period"],)).fetchone()
+                    if state == 1:
+                        continue
+                    doc = json.loads(stored)
+                    if state == _UNATTEMPTED and doc["entry_period"] < due:
+                        entered = [e for e, in self.book.db.execute(
+                            "SELECT entry_period FROM rl_pay_periods WHERE work_period<>?", (doc["work_period"],))]
+                        doc = {**doc, "entry_period": cp.entry_for(due, entered)}
+                        self.book.db.execute("UPDATE rl_pay_periods SET entry_period=?, doc=? WHERE work_period=?",
+                                             (doc["entry_period"], json.dumps(doc, sort_keys=True), doc["work_period"]))
+                    # Commit the identity before I/O; an interrupted PUT can finish later.
+                    self.book.db.execute("UPDATE rl_pay_periods SET published=0 WHERE work_period=?",
+                                         (doc["work_period"],))
+                await archives.write(self.config.task_id, doc["work_period"], doc["entry_period"], doc)
             with self.book.transaction():
                 self.book.db.execute("UPDATE rl_pay_periods SET published=1 WHERE work_period=?",
                                      (doc["work_period"],))
@@ -263,7 +278,7 @@ class RlPayLedger:
         return {"policy": "pay-per-matched-token/v1", "floor": self.config.floor, "cap": self.config.cap,
                 "period": cp.period_of(now, self.config.genesis), "period_seconds": cp.PERIOD_SECONDS,
                 "environments": environments, "hotkeys": balances,
-                "settled_periods": [{"work_period": w, "entry_period": e, "published": bool(p)}
+                "settled_periods": [{"work_period": w, "entry_period": e, "published": p == 1}
                                     for w, e, p in periods],
                 "note": ("Units are fractions of the task's emission cap. A trained rollout at or above the floor "
                          "earns its matched tokens x the env's token_price; an out-of-zone first scan earns 25 % of "
