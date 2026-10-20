@@ -23,7 +23,7 @@ dependencies again. The `gpu` extra includes the CUDA dependencies on Linux;
 the optional sandbox package is not selected.
 
 ```sh
-TEE_RUNTIME_REVISION=2131490288189896127521c57af31f41fa63f432
+TEE_RUNTIME_REVISION=489b802af63e7ad2374d9bc14b638411cb1a3841
 git clone --no-checkout https://github.com/reliquadotai/reliquary-TEE.git \
   /opt/reliquary-attested-source
 git -C /opt/reliquary-attested-source checkout --detach "$TEE_RUNTIME_REVISION"
@@ -49,7 +49,7 @@ administrator. Use an operator-controlled environment and state directory.
 
 Prepare the authority, worker certificate, TLS pins, immutable model assets,
 signed assignments, verified grades and local queue using the pinned runtime's
-[async RL runbook](https://github.com/reliquadotai/reliquary-TEE/blob/2131490288189896127521c57af31f41fa63f432/docs/async-rl.md).
+[async RL runbook](https://github.com/reliquadotai/reliquary-TEE/blob/489b802af63e7ad2374d9bc14b638411cb1a3841/docs/async-rl.md).
 Review the runtime's [release notes](https://github.com/reliquadotai/reliquary-TEE/releases)
 for its qualification status. Installing or selecting this mode does not
 activate a worker fleet or a core protocol profile.
@@ -108,10 +108,29 @@ CPU-only sandbox certificate cannot substitute for them. The current
 gradient-bearing `p` forward is used for the update after validation. Complete
 GRPO groups, bounded lag and the full-support sampling contract are required.
 
-New checkpoint assets and `current-policy.json` are published locally. Worker
-workload approval and worker restart for that checkpoint remain explicit
-operator actions. Existing core task routing, payments and publication require
-their own rollout and review; selecting this launcher does not change them.
+New checkpoint assets and `current-policy.json` are published locally. The
+pinned runtime also provides an opt-in
+[checkpoint rotation path](https://github.com/reliquadotai/reliquary-TEE/blob/489b802af63e7ad2374d9bc14b638411cb1a3841/docs/checkpoint-rotation.md):
+the trainer records a publication event atomically with its applied step; a
+separate publisher validates and signs that checkpoint. An approved measured
+supervisor obtains fresh challenge-bound authorization and CPU/GPU attestation
+before serving the next workload. A durable dispatcher resumes exact signed
+assignments and selects the current release for new prompt jobs.
+
+Prepare the publisher, fleet service, worker supervisor and dispatcher as
+separate supervised processes using that runbook and its
+[service templates](https://github.com/reliquadotai/reliquary-TEE/blob/489b802af63e7ad2374d9bc14b638411cb1a3841/deploy/async-rl/README.md).
+They share the configured local queue and registry with this trainer. The
+publisher consumes finalized steps, including explicit checkpoint recovery;
+it does not infer finality from the current-policy file alone. Prompt files
+contain bounded one-time jobs and must be replenished explicitly. Grades still
+arrive through the operator-verified reward handoff; no default reward is
+generated.
+
+Selecting this launcher starts only the trainer. Managed-profile approval,
+measured guest provisioning and those companion services require explicit
+operator setup. Existing core task routing, payments and legacy R2 publication
+retain their own rollout and review.
 CPU integration tests verify dispatch and refusal boundaries. They do not
 qualify confidential hardware, CUDA performance, throughput or training
 convergence.

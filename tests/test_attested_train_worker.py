@@ -153,10 +153,10 @@ def isolated_runtime(tmp_path):
         "    print(json.dumps(sys.argv))\n"
         "    raise SystemExit(7)\n"
     )
-    metadata = site / "reliquary_tee-0.2.0rc1.dist-info"
+    metadata = site / f"reliquary_tee-{attested.TEE_RUNTIME_VERSION}.dist-info"
     metadata.mkdir()
     (metadata / "METADATA").write_text(
-        "Metadata-Version: 2.1\nName: reliquary-tee\nVersion: 0.2.0rc1\n"
+        f"Metadata-Version: 2.1\nName: reliquary-tee\nVersion: {attested.TEE_RUNTIME_VERSION}\n"
     )
     direct_url = metadata / "direct_url.json"
     source = {
