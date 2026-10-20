@@ -397,7 +397,6 @@ def build_episode_generator(blocks: Mapping[str, Mapping[str, Any]], *, validato
     from reliquary.miner.episode_mining import EpisodeStackDeps
     from reliquary.miner.forced_draw import ForcedDraws
     from reliquary.miner.rl_episode_client import RL_PREFIX, HttpRlEpisodes, LeaseEpisodeRunner, check_engine_caps
-    from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS
     from reliquary.validator.rl_async_episodes import async_episode_policy, validate_episode_block
 
     if load_environment is None:
@@ -433,7 +432,7 @@ def build_episode_generator(blocks: Mapping[str, Mapping[str, Any]], *, validato
     host = EpisodeEngineHost(make_core=deps.make_core, release_core=deps.release_core, serve=deps.serve, draws=draws,
                              model_name=str(base_model_dir), port=generate_port, max_total_tokens=total,
                              max_tokens_per_turn=per_turn, stop_ids=lambda: renderer_for(first).stop_ids,
-                             sampling=sampling, proof=TOPLOC_DEPLOYED_DEFAULTS,
+                             sampling=sampling, proof=None,          # no span proof on the async path
                              core_kwargs={"max_num_seqs": max_num_seqs,
                                           "gpu_memory_utilization": gpu_memory_utilization})
     sessions = HttpRlEpisodes(deps.sync_http(validator_url), validator_hotkey=validator_hotkey, prefix=RL_PREFIX)

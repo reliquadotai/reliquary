@@ -184,6 +184,33 @@ def test_orphan_capture_rows_are_swept_and_counted():
     assert core.pending_capture_count() == 0 and core._engine.aborted == ["live"]
 
 
+def test_a_proof_free_core_serves_a_recomputed_turn():
+    # The async RL engine sends no span proof: a turn vLLM preempted and recomputed
+    # has more rows than scheduled, which only the proof path has to refuse.
+    core = _core(_Engine([_output("a-1", (7, 7, 1))]), None, {"a": 3})
+    core._proof = None
+    (done,) = core.step()
+    assert done.error is None and done.completion_ids == (7, 7, 1) and done.proofs == ()
+    assert done.finish_reason == "stop" and core.pending_capture_count() == 0
+
+
+def test_running_requests_are_capped_to_what_the_kv_cache_holds():
+    from reliquary.miner.corpus_generate_server import cap_running_to_kv_cache
+
+    def llm(blocks):
+        scheduler = SimpleNamespace(max_num_running_reqs=64)
+        engine = SimpleNamespace(vllm_config=SimpleNamespace(cache_config=SimpleNamespace(
+            num_gpu_blocks=blocks, block_size=16)), engine_core=SimpleNamespace(engine_core=SimpleNamespace(
+                scheduler=scheduler)))
+        return SimpleNamespace(llm_engine=engine), scheduler
+
+    small, scheduler = llm(blocks=40_000)            # 640k tokens: 11 episodes of 57,344
+    assert cap_running_to_kv_cache(small, 64, 57_344) == 11 and scheduler.max_num_running_reqs == 11
+    big, scheduler = llm(blocks=400_000)
+    assert cap_running_to_kv_cache(big, 64, 57_344) == 64 and scheduler.max_num_running_reqs == 64
+    assert cap_running_to_kv_cache(SimpleNamespace(), 64, 57_344) == 64
+
+
 def test_a_refused_add_leaves_no_prompt_length():
     class Refusing(_Engine):
         def add_request(self, *a, **k):
