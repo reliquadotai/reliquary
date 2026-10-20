@@ -111,7 +111,13 @@ _RENDERER_RE = re.compile(r"\Arenderers:[a-z0-9.]+@\d+\.\d+\.\d+\Z")
 EXECUTION_REPLAY = "replay"
 EXECUTION_SIGNED_SANDBOX = "signed_sandbox"
 EXECUTIONS = frozenset({EXECUTION_REPLAY, EXECUTION_SIGNED_SANDBOX})
-_EPISODE_OPTIONAL_FIELDS = ("execution", "sandbox")
+_EPISODE_OPTIONAL_FIELDS = ("execution", "sandbox", "harness_spec")
+# `harness_spec` (written only when set, so every manifest that predates it hashes
+# byte-identically): the reliquary-harness spec the bash harness renders with, pinned by
+# digest. Absent, the compatibility harness bash-vf-b2e4e81@1. The binaries check it
+# against what they serve (`agentic_swe.harness_pin_refusal`); this module loads nothing.
+_HARNESS_SPEC_FIELDS = ("id", "version", "digest")
+_HARNESS_NAME_RE = re.compile(r"\A[a-z0-9][a-z0-9.-]{0,63}\Z")
 _SANDBOX_FIELDS = ("env", "env_package", "tools", "sandbox_commit", "budgets")
 SANDBOX_BUDGET_FIELDS = ("max_calls", "per_call_timeout_s", "cpu_s", "wall_s",
                          "memory_bytes", "pids", "disk_bytes")
@@ -242,6 +248,8 @@ class EpisodeSpec:
     replay_fraction_failed: float | None
     execution: str = EXECUTION_REPLAY
     sandbox: SandboxSpec | None = None
+    # {"id", "version", "digest"} of the reliquary-harness spec; None: the compatibility one.
+    harness_spec: Mapping[str, str] | None = None
 
     @property
     def is_suite(self) -> bool:
@@ -261,6 +269,8 @@ class EpisodeSpec:
         if self.execution != EXECUTION_REPLAY:
             contract["execution"] = self.execution
             contract["sandbox"] = self.sandbox.to_contract()
+        if self.harness_spec is not None:
+            contract["harness_spec"] = dict(self.harness_spec)
         return contract
 
 
@@ -552,6 +562,9 @@ def _parse_episode(raw: Any, eval_job: bool = False) -> EpisodeSpec:
         sandbox = _parse_sandbox(raw["sandbox"], env["package"])
     elif "sandbox" in raw:
         raise JobError("episode.sandbox is only for execution 'signed_sandbox'")
+    harness_spec = None
+    if "harness_spec" in raw:
+        harness_spec = _parse_harness_spec(raw["harness_spec"], "episode.harness_spec")
     episode = EpisodeSpec(
         env=EpisodeEnv(package=env["package"], version=env["version"], split=env["split"],
                        num_images=_bounded_int(env, "num_images", 1, 1000, "episode.env")),
@@ -560,9 +573,29 @@ def _parse_episode(raw: Any, eval_job: bool = False) -> EpisodeSpec:
         max_tokens_per_turn=_bounded_int(raw, "max_tokens_per_turn", 1, max_total, "episode"),
         max_total_tokens=max_total,
         replay_fraction_failed=float(fraction),
-        execution=execution, sandbox=sandbox,
+        execution=execution, sandbox=sandbox, harness_spec=harness_spec,
     )
     return episode
+
+
+def parse_harness_spec(raw: Any, where: str) -> dict[str, str]:
+    """`{id, version, digest}` of a reliquary-harness spec, by shape (ValueError otherwise):
+    whether this binary serves it is `agentic_swe.harness_pin_refusal`'s."""
+    if not isinstance(raw, Mapping) or set(raw) != set(_HARNESS_SPEC_FIELDS):
+        raise ValueError(f"{where} must be {{id, version, digest}}")
+    for name in ("id", "version"):
+        if not isinstance(raw[name], str) or not _HARNESS_NAME_RE.match(raw[name]):
+            raise ValueError(f"{where}.{name} must be a harness name (lowercase, digits, '.' and '-')")
+    if not isinstance(raw["digest"], str) or not _SHA256_RE.match(raw["digest"]):
+        raise ValueError(f"{where}.digest must be a 64-hex sha256")
+    return {name: raw[name] for name in _HARNESS_SPEC_FIELDS}
+
+
+def _parse_harness_spec(raw: Any, where: str) -> dict[str, str]:
+    try:
+        return parse_harness_spec(raw, where)
+    except ValueError as exc:
+        raise JobError(str(exc)) from None
 
 
 def _check_episode_job(job: JobSpec) -> None:

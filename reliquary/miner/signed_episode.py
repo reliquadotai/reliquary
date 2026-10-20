@@ -1,14 +1,16 @@
 """The agentic miner's signed-sandbox mode (plan 3). No Docker on the miner: per episode,
 ask the validator for a session token (a request signed by the hotkey for this
-validator and route), open the episode on the machine the validator named, run
-verifiers' bash harness through `reliquary_sandbox_verifiers.SandboxEpisodeRunner`
-against the local generate endpoint (tokens and proofs come from the engine's session
-log, as in replay mode), and return what to submit: the gateway's transcript and the
-graded state as the final diff.
+validator and route), open the episode on the machine the validator named, play it with
+the miner's own loop (`harness_episode.HarnessEpisodeRunner`: reliquary-harness's bash
+harness spec, the turns verifiers b2e4e81's bash harness sent) against the local generate
+endpoint (tokens and proofs come from the engine's session log, as in replay mode), and
+return what to submit: the gateway's transcript and the graded state as the final diff.
+`harness_env` was the verifiers harness program's environment; no local program runs now,
+so it is unused (tools run on the gateway either way).
 
 The miner never submits what it already knows the validator refuses. An episode whose
 final is not `graded`, whose run errored (a gateway close raised as `EpisodeClosed`
-ends as a verifiers `TaskError` trace), whose state is not UTF-8, or whose transcript
+ends the run with an error), whose state is not UTF-8, or whose transcript
 fails the validator's own checks (`transcript_refusal`: `verify_transcript` with every
 `Expected` field, record 0's tools and env package, the grading deadline) is reported
 at once (`close`), so its reservation and the hotkey's caps are released. The built
@@ -347,7 +349,7 @@ class SignedSweEpisodeRunner:
                  new_request_id: Callable[[], str] = lambda: uuid.uuid4().hex,
                  sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
                  monotonic: Callable[[], float] = time.monotonic,
-                 max_live: int = DEFAULT_MAX_LIVE_PER_JOB) -> None:
+                 max_live: int = DEFAULT_MAX_LIVE_PER_JOB, harness=None, variant: int = 0) -> None:
         from reliquary.environment.agentic_swe import job_signed_source
 
         if ss58_format_42(hotkey) != hotkey:
@@ -369,7 +371,9 @@ class SignedSweEpisodeRunner:
         self._runner_factory = runner_factory
         self._clock, self._new_request_id, self._sleep = clock, new_request_id, sleep
         self._monotonic = monotonic
-        self._ctx = None
+        # The harness spec and surface variant every episode of this runner plays (an RL lease's;
+        # None: the compatibility harness).
+        self._harness, self._variant = harness, int(variant)
         self._runners: dict[str, object] = {}
         self._runners_lock = asyncio.Lock()
         self._stack = AsyncExitStack()
@@ -403,30 +407,15 @@ class SignedSweEpisodeRunner:
         return float(OPEN_WINDOW_S + self._job.episode.sandbox.budgets.wall_s
                      + GRADING_GRACE_S + SUBMIT_MARGIN_S)
 
-    def _context(self):
-        if self._ctx is None:
-            from renderers.configs import Qwen38RendererConfig
-            from verifiers.v1.clients import ModelContext
-            from verifiers.v1.configs.client import TrainClientConfig
-            from verifiers.v1.types import Sampling
-
-            self._ctx = ModelContext(
-                model=self._model_name,
-                client=TrainClientConfig(base_url=f"{self._generate_url.rstrip('/')}/v1",
-                                         api_key_var="RELIQUARY_GENERATE_KEY",
-                                         renderer=Qwen38RendererConfig(),
-                                         renderer_model_name=self._renderer_dir),
-                sampling=Sampling(temperature=self._sampling.temperature,
-                                  top_p=self._sampling.top_p,
-                                  max_tokens=self._job.episode.max_tokens_per_turn))
-        return self._ctx
-
     def _default_runner(self, url: str):
-        from reliquary_sandbox_verifiers import SandboxEpisodeRunner
+        from reliquary.miner.harness_episode import HarnessEpisodeRunner
 
-        return SandboxEpisodeRunner(ctx=self._context(), gateway_url=url,
+        return HarnessEpisodeRunner(gateway_url=url, model=self._model_name,
+                                    renderer_dir=self._renderer_dir, generate_url=self._generate_url,
+                                    sampling=self._sampling,
+                                    max_tokens=self._job.episode.max_tokens_per_turn,
                                     max_turns=self._job.episode.max_turns,
-                                    harness_env=self._harness_env)
+                                    spec=getattr(self, "_harness", None), variant=getattr(self, "_variant", 0))
 
     async def _runner(self, url: str):
         async with self._runners_lock:
@@ -684,7 +673,7 @@ class SignedSweEpisodeRunner:
 
         if result.error or status != "graded":
             # Unpaid: not graded, or the run did not complete (a gateway close raised
-            # as EpisodeClosed is a TaskError trace).
+            # as EpisodeClosed is a run error).
             return await unusable(result.error or (
                 f"the sandbox episode ended {status} ({final.get('reason')})"))
         if self.requires_text_state:

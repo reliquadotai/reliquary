@@ -360,6 +360,39 @@ def _parse_lease_expiry(value):
     return out
 
 
+def with_episode_harnesses(episode_envs, value):
+    """``--harness env=id@version,...``: each named episode env's block pins that reliquary-harness spec at the
+    digest this install serves (refused when it does not serve it). One harness per env."""
+    import copy
+
+    from reliquary.environment.agentic_swe import harness_of, harness_pin_refusal
+
+    if not value:
+        return episode_envs
+    envs = copy.deepcopy(dict(episode_envs or {}))
+    named = set()
+    for item in value.split(","):
+        name, sep, key = item.strip().partition("=")
+        harness_id, at, version = key.partition("@")
+        if not sep or not name or not at or not harness_id or not version:
+            raise ValueError(f"--harness: env=id@version expected, got {item!r}")
+        if name in named:
+            raise ValueError(f"--harness names {name} twice: one harness per env")
+        if name not in envs:
+            raise ValueError(f"--harness names {name}, which is not an --rl-episode-envs env")
+        named.add(name)
+        pin = {"id": harness_id, "version": version, "digest": ""}
+        try:
+            pin["digest"] = harness_of(pin).digest
+        except ValueError as exc:
+            raise ValueError(f"--harness {name}: {exc}") from None
+        refusal = harness_pin_refusal(pin, variants=True)
+        if refusal:
+            raise ValueError(f"--harness {name}: {refusal}")
+        envs[name]["episode"] = {**envs[name]["episode"], "harness": pin}
+    return envs
+
+
 def with_rl_async_params(entry, *, planned_tokens_per_period, lease_tokens_per_s=None, episode_envs=None,
                          lease_expiry_s=None):
     """An RL entry declared for the async protocol: paid by period (``settlement = period-ema-v1``, the weight
@@ -639,6 +672,11 @@ def tasks_create(
         None, "--lease-expiry",
         help="With --rl-async: env=seconds,... lease lifetimes overriding the computed ones",
     ),
+    harness: str = typer.Option(
+        None, "--harness",
+        help="With --rl-async: env=id@version,... the reliquary-harness spec each --rl-episode-envs env plays "
+        "(e.g. swe_v1=mini-swe@1, tmax_v1=bash-surface@1); unnamed envs play bash-vf-b2e4e81@1",
+    ),
 ) -> None:
     from reliquary.infrastructure.task_registry_store import create_task
     from reliquary.shared.task_registry import RegistryError
@@ -760,12 +798,13 @@ def tasks_create(
         if rl_async:
             entry = with_rl_async_params(entry, planned_tokens_per_period=planned_tokens_per_period,
                                          lease_tokens_per_s=lease_tokens_per_s,
-                                         episode_envs=_read_episode_envs(rl_episode_envs),
+                                         episode_envs=with_episode_harnesses(_read_episode_envs(rl_episode_envs),
+                                                                             harness),
                                          lease_expiry_s=_parse_lease_expiry(lease_expiry))
         elif (planned_tokens_per_period is not None or lease_tokens_per_s is not None or rl_episode_envs is not None
-              or lease_expiry is not None):
-            raise ValueError("--planned-tokens-per-period, --lease-tokens-per-s, --rl-episode-envs and "
-                             "--lease-expiry need --rl-async")
+              or lease_expiry is not None or harness is not None):
+            raise ValueError("--planned-tokens-per-period, --lease-tokens-per-s, --rl-episode-envs, "
+                             "--lease-expiry and --harness need --rl-async")
         asyncio.run(create_task(entry))
     except (RegistryError, ValueError) as exc:
         # Declaring the first task is the one CLI command that can stop the

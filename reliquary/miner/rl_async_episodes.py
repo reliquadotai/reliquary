@@ -109,11 +109,12 @@ class EpisodeLeaseGenerator:
             raise RuntimeError("this episode engine takes no new weights in place: restart the miner")
         self._load(state, version)
 
-    def _renderer(self, policy):
-        name = policy.environment
-        if name not in self._renderers:
-            self._renderers[name] = self._renderer_for(policy)
-        return self._renderers[name]
+    def _renderer(self, policy, variant: int = 0):
+        key = (policy.environment, int(variant))
+        if key not in self._renderers:
+            self._renderers[key] = (self._renderer_for(policy) if variant == 0
+                                    else self._renderer_for(policy, variant=variant))
+        return self._renderers[key]
 
     async def play_lease(self, lease) -> list[Any]:
         from reliquary.miner.episode_commit import episode_admissible
@@ -124,11 +125,18 @@ class EpisodeLeaseGenerator:
         policy = self.policies.get(lease.environment)
         if policy is None:
             raise EpisodeLeaseFailed(f"{lease.environment} is not an episode environment of this miner")
-        renderer = self._renderer(policy)
+        from reliquary.environment.agentic_swe import harness_of, lease_variant, policy_harness_pin
+
+        variant = lease_variant(harness_of(policy_harness_pin(policy)), lease)
+        renderer = self._renderer(policy, variant)
         prompt = self._task_prompt(lease.environment, int(lease.prompt_idx))
         prompt_len = len(renderer.initial_ids(prompt))
-        runner = self._factory(policy, lease, prompt)
+        # The lease's surface variant (0 for a harness without axes): its 16 episodes all play it.
+        runner = self._factory(policy, lease, prompt) if variant == 0 else self._factory(policy, lease, prompt,
+                                                                                         variant=variant)
         label = f"lease {lease.lease_id[:12]}"
+        if variant:
+            logger.info("%s plays surface variant %d of %s", label, variant, lease.environment)
 
         async def one(index: int):
             binding = LeaseDrawBinding(lease.nonce, int(lease.prompt_idx), int(lease.checkpoint), index)
@@ -415,18 +423,24 @@ def build_episode_generator(blocks: Mapping[str, Mapping[str, Any]], *, validato
         except ValueError as exc:
             raise ValueError(f"{name}: {exc}; one miner engine serves only envs with the same caps: mine {name} "
                              f"with a miner process of its own") from exc
+    from reliquary.environment.agentic_swe import harness_of, harness_pin_refusal, policy_harness_pin
+
     for name, policy in policies.items():
-        refusal = deps.package_refusal(policy)
+        refusal = deps.package_refusal(policy) or harness_pin_refusal(policy_harness_pin(policy), variants=True)
         if refusal:
             raise ValueError(f"{name}: {refusal}")
     sources = {name: load_environment(name, block).source for name, block in blocks.items()}
     renderers: dict[tuple, Any] = {}
 
-    def renderer_for(policy):
-        tools = tuple(policy.tools)
-        if tools not in renderers:
-            renderers[tools] = deps.load_renderer(str(base_model_dir), tools=tools)
-        return renderers[tools]
+    def renderer_for(policy, variant: int = 0):
+        """The validator's turn renderer of ``policy``'s harness, tools and surface ``variant``."""
+        tools, pin = tuple(policy.tools), policy_harness_pin(policy)
+        key = (tools, None if pin is None else (pin["id"], pin["version"]), int(variant))
+        if key not in renderers:
+            renderers[key] = (deps.load_renderer(str(base_model_dir), tools=tools) if pin is None and variant == 0
+                              else deps.load_renderer(str(base_model_dir), tools=tools, spec=harness_of(pin),
+                                                      variant=int(variant)))
+        return renderers[key]
 
     draws = ForcedDraws()
     sampling = deps.sampling()
@@ -438,11 +452,12 @@ def build_episode_generator(blocks: Mapping[str, Mapping[str, Any]], *, validato
                                           "gpu_memory_utilization": gpu_memory_utilization})
     sessions = HttpRlEpisodes(deps.sync_http(validator_url), validator_hotkey=validator_hotkey, prefix=RL_PREFIX)
 
-    def runner_factory(policy, lease, prompt):
+    def runner_factory(policy, lease, prompt, variant: int = 0):
         return LeaseEpisodeRunner(policy=policy, lease=lease, hotkey=hotkey, prompt=prompt,
                                   sign_binding=sign_binding, sessions=sessions, model_name=host.model_name,
                                   renderer_model_dir=str(base_model_dir), generate_url=host.generate_url,
-                                  sampling=sampling, harness_env=dict(harness_env or {}) or None)
+                                  sampling=sampling, harness_env=dict(harness_env or {}) or None,
+                                  harness=harness_of(policy_harness_pin(policy)), variant=variant)
 
     generator = EpisodeLeaseGenerator(
         policies=policies, runner_factory=runner_factory, engine=host, draws=draws, renderer_for=renderer_for,
