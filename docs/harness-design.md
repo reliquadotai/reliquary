@@ -317,5 +317,10 @@ on the production 27B/Teutonic models.
 - **A machine record that is not JSON stays broken**: `_update` raises before writing. Only a
   store that commits truncated bodies produces one, but a heartbeat could rewrite it from its
   registration.
+- **The RL checker logs a lease only when it is rejected or plays a variant other than 0**, and
+  without the transcript's reasons. A `mini-swe@1` admission is invisible in the controller's log,
+  and the smoke's one rejection had to be diagnosed from timing. PROPOSED: log every lease with
+  its harness, variant and verdict, and the reasons of a refusal (the per-harness metrics above
+  start there).
 - **The sandbox bridge still imports verifiers to load tasksets.** Moving taskset loading off
   verifiers is a separate change.
