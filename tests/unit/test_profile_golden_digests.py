@@ -67,8 +67,8 @@ GOLDEN = {
         "6cbd6c869ac46db5c84529b900c36fc9aa0aa33a6f213a1a91d4ebf42084f6fa",
     ),
     "teutonic-9b-reliquary-suite-v10-gumbel-dev1": (
-        "437df582d4bdc40f1a75e821652d3a110116f9b86373baaa33408bb8ac0007ff",
-        "2b19908779e2ff95365105bf929f106fc5782484f0e35078a55e78d15d3ed932",
+        "df7615d58b5fe3053b68e9bba0afa48bb2df5866e17f7c233ae4dc9df396569f",
+        "2f31e74a41aa03db6bb71509ef7be642c22eaead2516e84aef4bc79367fe9101",
     ),
 }
 CORPUS_CODE_V1_SHA256 = (

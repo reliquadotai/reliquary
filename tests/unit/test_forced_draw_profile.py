@@ -36,11 +36,12 @@ def test_gumbel_profile_is_v9_with_the_gumbel_draw_and_a_new_version():
     assert gumbel.sampling.lm_head_fp32 is True                         # decided 2026-10-15
     assert gumbel.protocol_version == 10
     assert replace(gumbel.sampling, draw="inverse_cdf", lm_head_fp32=False) == v9.sampling
-    math = {"reliquary_dapo_math_v1", "reliquary_hard_math_v1"}                # 64k there (2026-10-19 probe)
-    assert {n: e for n, e in gumbel.environments.items() if n not in math} == {
-        n: e for n, e in v9.environments.items() if n not in math}
+    long = {"reliquary_dapo_math_v1", "reliquary_hard_math_v1",                 # 64k there (2026-10-19/20 probes)
+            "reliquary_competitive_code_v1"}
+    assert {n: e for n, e in gumbel.environments.items() if n not in long} == {
+        n: e for n, e in v9.environments.items() if n not in long}
     assert all(replace(gumbel.environments[n], max_new_tokens=v9.environments[n].max_new_tokens)
-               == v9.environments[n] and gumbel.environments[n].max_new_tokens == 65536 for n in math)
+               == v9.environments[n] and gumbel.environments[n].max_new_tokens == 65536 for n in long)
     assert (gumbel.model_id, gumbel.model_revision) == (v9.model_id, v9.model_revision)
     sampling = gumbel.to_generation_contract()["sampling"]
     assert sampling["draw"] == "gumbel_max" and sampling["lm_head_fp32"] is True

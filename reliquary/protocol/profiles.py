@@ -1502,8 +1502,10 @@ _PROFILE_VALUES = (
 # streams never coincide.
 # The math envs get a 64k cap (2026-10-19 budget probe of the SFT starting model, docs/rl-async-qualification.md):
 # at 32k about half the rollouts cut were correct once given room, so a cut there scored good reasoning 0.
+# Competitive code too (2026-10-20 probe of the same model): at 16k about half its rollouts were cut, at 64k a sixth.
 _TEUTONIC_V9 = next(p for p in _PROFILE_VALUES if p.profile_id == "teutonic-9b-reliquary-suite-v9-dev1")
-_V10_MATH_MAX_NEW_TOKENS = 65536
+_V10_LONG_MAX_NEW_TOKENS = 65536
+_V10_LONG_ENVS = ("reliquary_dapo_math_v1", "reliquary_hard_math_v1", "reliquary_competitive_code_v1")
 _PROFILE_VALUES = _PROFILE_VALUES + (
     replace(
         _TEUTONIC_V9,
@@ -1511,8 +1513,7 @@ _PROFILE_VALUES = _PROFILE_VALUES + (
         protocol_version=10,
         sampling=replace(_SAMPLING_DAPO, draw=DRAW_GUMBEL_MAX, lm_head_fp32=True),
         environments={
-            name: (replace(env, max_new_tokens=_V10_MATH_MAX_NEW_TOKENS)
-                   if name in ("reliquary_dapo_math_v1", "reliquary_hard_math_v1") else env)
+            name: (replace(env, max_new_tokens=_V10_LONG_MAX_NEW_TOKENS) if name in _V10_LONG_ENVS else env)
             for name, env in _TEUTONIC_V9.environments.items()
         },
     ),
