@@ -50,6 +50,14 @@ def controller_metrics(rl: Any, now: float, window_s: float = METRICS_EVERY_S) -
         out[f"groups/{env}/{verdict}"] = n
     for kind, n in rows["events"]:
         out[f"events/{kind}"] = n
+    cooldown = getattr(getattr(rl.book, "config", None), "cooldown_of", None)
+    snapshot = getattr(cooldown, "snapshot", None)
+    if snapshot is not None:
+        with rl.book.lock:
+            out.update(snapshot(sorted(rl.prices.board())))
+        with rl.book.lock:
+            for env, state, n in db.execute("SELECT environment, state, COUNT(*) FROM rl_prompt_state GROUP BY 1, 2"):
+                out[f"prompts/{env}/{state}"] = n
     for source, verdict, n in rows["verdicts"]:
         out[f"verdicts/{source}/{verdict}"] = n
     for kind, amount, tokens in rows["accrued"]:

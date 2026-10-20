@@ -113,7 +113,7 @@ def test_truncated_rollouts_score_zero_and_their_group_still_trains(book):
 
 
 @pytest.mark.parametrize(("rollouts", "verdict", "state"), [
-    (group(16), "too_easy", "blacklisted"),
+    (group(16), "too_easy", "cooldown"),
     (group(0), "too_hard", "cooldown"),
     (group(0, cut=16), "too_hard", "cooldown"),
 ])

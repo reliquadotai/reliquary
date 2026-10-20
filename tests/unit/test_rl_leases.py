@@ -420,9 +420,11 @@ def test_the_verdict_follows_sigma_mean_and_truncation():
             classify_group(*bad)
 
 
-def test_too_easy_blacklists_the_prompt_for_the_run(tmp_path):
+def test_a_prompt_too_easy_twice_is_blacklisted_for_the_run(tmp_path):
     book = book_at(tmp_path)
     book.adopt_checkpoint(0)
+    book.record_outcome(ENV, 1, 0, binary(16), TOO_EASY)
+    assert book.grant([ask("A", [1])])[0].refused == {1: COOLING}        # once: no proof yet, it cools down
     book.record_outcome(ENV, 1, 0, binary(16), TOO_EASY)
     for k in (1, 500):
         book.adopt_checkpoint(k)
@@ -501,7 +503,8 @@ def test_the_prompt_view_is_incremental_and_names_no_hotkey(tmp_path):
     full = book.prompt_state()
     assert [s["prompt_idx"] for s in full["scans"]] == [1, 2, 3] and full["cursor"] == full["scans"][-1]["seq"]
     assert [(p["prompt_idx"], p["state"], p["until_k"]) for p in full["prompts"]] == [
-        (1, "blacklisted", None), (2, "cooldown", prompt_cooldown_windows_for_environment(ENV)),
+        (1, "cooldown", prompt_cooldown_windows_for_environment(ENV)),
+        (2, "cooldown", prompt_cooldown_windows_for_environment(ENV)),
         (3, "cooldown", prompt_cooldown_windows_for_environment(OTHER_ENV))]
     assert full["scans"][0]["rewards"] == binary(16) and full["scans"][0]["first_scan"] is True
     assert "hotkey-of-the-miner" not in repr(full) and "nonce" not in repr(full)
@@ -511,7 +514,7 @@ def test_the_prompt_view_is_incremental_and_names_no_hotkey(tmp_path):
     book.record_outcome(ENV, 2, 0, binary(16), TOO_EASY)
     rest = book.prompt_state(page["cursor"])
     assert not rest["more"] and [s["prompt_idx"] for s in rest["scans"]] == [3, 2]
-    assert [(p["prompt_idx"], p["state"]) for p in rest["prompts"]] == [(3, "cooldown"), (2, "blacklisted")]
+    assert [(p["prompt_idx"], p["state"]) for p in rest["prompts"]] == [(3, "cooldown"), (2, "cooldown")]
     assert book.prompt_state(rest["cursor"])["scans"] == []
     only = book.prompt_state(environment=OTHER_ENV)
     assert [s["prompt_idx"] for s in only["scans"]] == [3] and len(only["prompts"]) == 1
@@ -520,6 +523,7 @@ def test_the_prompt_view_is_incremental_and_names_no_hotkey(tmp_path):
 def test_the_prompt_lifecycle_survives_a_restart(tmp_path):
     book = book_at(tmp_path)
     book.adopt_checkpoint(0)
+    book.record_outcome(ENV, 1, 0, binary(16), TOO_EASY)
     book.record_outcome(ENV, 1, 0, binary(16), TOO_EASY)
     view = book.prompt_state()
     book.close()

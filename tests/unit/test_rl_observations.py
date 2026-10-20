@@ -111,7 +111,7 @@ async def test_every_scan_is_published_signed_and_read_back(tmp_path):
     page = scans_as_page(events)
     assert page["cursor"] == 3
     assert {(p["prompt_idx"], p["state"], p["until_k"]) for p in page["prompts"]} == {
-        (3, "cooldown", 3), (4, "blacklisted", None)}                   # each prompt's state after its last scan
+        (3, "cooldown", 3), (4, "cooldown", 2)}                           # each prompt's state after its last scan
     by_prompt = sorted(page["prompts"], key=lambda p: p["prompt_idx"])
     assert sorted(book.prompt_state()["prompts"], key=lambda p: p["prompt_idx"]) == by_prompt   # = the route's
     book.close()
@@ -165,7 +165,7 @@ async def test_a_lease_book_from_before_the_scan_log_gains_its_columns(tmp_path)
     publisher = publisher_for(book, bucket)
     await drain(publisher)
     events = [json.loads(line) for line in gzip.decompress(bucket.objects[f"{ROOT}/seg-000001.jsonl.gz"]).splitlines()]
-    assert [(e["prompt_idx"], e["state"]) for e in events] == [(1, None), (2, "blacklisted")]
+    assert [(e["prompt_idx"], e["state"]) for e in events] == [(1, None), (2, "cooldown")]
     book.close()
 
 

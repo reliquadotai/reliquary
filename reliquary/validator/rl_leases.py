@@ -14,8 +14,9 @@ generates them, and every lease ends in a submission or an expiry (there is no r
   prompt, when its lease ends, or which leases are open. ``taken`` covers both an open lease of someone else and a key
   closed by a submission. A resend by the holder answers its own open lease again (a lost response is not a lost lease).
 * **Prompt lifecycle** (§4.5): ``record_outcome`` (called by the submission path, P3, once a group is graded)
-  appends the scan to a public history and moves the prompt: too easy is blacklisted for the run; in zone, too
-  hard and truncated cool down until checkpoint ``latest + cooldown`` (``CooldownMap``'s half-open rule, in
+  appends the scan to a public history and moves the prompt: too easy a second time is blacklisted for the run (a
+  first too-easy scan is not yet proof: it cools down like the others); in zone, too hard and truncated cool down
+  until checkpoint ``latest + cooldown`` (``CooldownMap``'s half-open rule, in
   checkpoints: leasable again once the latest k reaches it; the per-env cooldown is read at each outcome). A
   never-scanned prompt has no row and is leasable.
   ``classify_group`` gives the verdict from the rewards and truncation flags. ``prompt_state`` is the miners'
@@ -620,10 +621,10 @@ class LeaseBook:
     # --- prompt lifecycle (§4.5) -----------------------------------------------------------------------------
     def record_outcome(self, environment: str, prompt_idx: int, checkpoint: int, rewards, verdict: str,
                        now: float | None = None) -> Scan:
-        """Record a graded group of (env, prompt) leased at k and move the prompt: ``too_easy`` blacklists it for
-        the run, any other verdict cools it down until ``latest + cooldown`` (never shortening a running cooldown,
-        never lifting a blacklist). The cooldown counts from the latest k, not the lease's: a lagged lease must not
-        shorten it."""
+        """Record a graded group of (env, prompt) leased at k and move the prompt: a second ``too_easy`` scan
+        blacklists it for the run (one group is not proof enough to retire a prompt for good); any other scan cools
+        it down until ``latest + cooldown`` (never shortening a running cooldown, never lifting a blacklist). The
+        cooldown counts from the latest k, not the lease's: a lagged lease must not shorten it."""
         if environment not in self.config.expiry_s:
             raise ValueError("environment not served")
         if verdict not in VERDICTS:
@@ -639,7 +640,10 @@ class LeaseBook:
         with self._txn():
             prior = self.db.execute("SELECT state, until_k FROM rl_prompt_state WHERE environment=? AND prompt_idx=?",
                                     (environment, prompt_idx)).fetchone()
-            if verdict == TOO_EASY or (prior is not None and prior[0] == BLACKLISTED):
+            easy_before = verdict == TOO_EASY and self.db.execute(
+                "SELECT 1 FROM rl_prompt_scans WHERE environment=? AND prompt_idx=? AND verdict=? LIMIT 1",
+                (environment, prompt_idx, TOO_EASY)).fetchone() is not None
+            if easy_before or (prior is not None and prior[0] == BLACKLISTED):
                 state, until = BLACKLISTED, None
             else:
                 start = max(checkpoint, self.latest_checkpoint or 0)
