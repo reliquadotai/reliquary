@@ -14,6 +14,10 @@ from reliquary.environment.grader import (
     GRADER_SOCKET_PATH as GRADER_SOCKET_PATH,
 )
 from reliquary.shared.task_id import parse_task_ids
+from reliquary.services import (
+    SERVICE_OBSERVATION_FLUSH_SECONDS as SERVICE_OBSERVATION_FLUSH_SECONDS,
+    SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS as SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS,
+)
 
 # ────────────────  GRAIL PROOF VERSION  ────────────────
 
@@ -884,8 +888,6 @@ _FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV = FILL_CLOSED_TARGET_GROUPS_PER_ENV
 SERVICE_EXPLORATION_AUDIT_BUDGET_PER_ENV = int(_os.environ.get(
     "RELIQUARY_SERVICE_EXPLORATION_AUDIT_BUDGET_PER_ENV", str(FILL_CLOSED_TARGET_GROUPS_PER_ENV)))
 SERVICE_EXPLORATION_AUDIT_PRIORITY = 5
-SERVICE_OBSERVATION_FLUSH_SECONDS = 60
-SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS = 50_000
 # A hotkey still in exploration probation may hold at most this many reserved rows whose audit has not
 # passed, per (window, env): it cannot squat the whole per-env cap with fake groups before its first audit.
 PROBATION_PENDING_LIMIT = 4
