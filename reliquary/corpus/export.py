@@ -70,8 +70,21 @@ def completion_fingerprint(completion) -> bytes:
     return hashlib.sha256(body.encode()).digest()
 
 
+async def voided_submission_ids(records, job_id) -> set[str]:
+    lister = getattr(records, "list_voided_ids", None)
+    return set(await lister(job_id)) if lister is not None else set()
+
+
+async def submission_voided(records, job_id, submission_id, voided: set[str]) -> bool:
+    if submission_id in voided:
+        return True
+    # A void can become visible after the listing or the submission read.
+    reader = getattr(records, "read_voided", None)
+    return reader is not None and await reader(job_id, submission_id) is not None
+
+
 async def job_fingerprints(records, job_ids, *, concurrency: int = 16) -> set[bytes]:
-    """The fingerprints of every completion of the passing submissions of
+    """The fingerprints of every completion of the passing, not voided submissions of
     ``job_ids``: what their deliveries could hold, for a later job on the same
     prompts to leave out."""
     gate = asyncio.Semaphore(concurrency)
@@ -83,11 +96,17 @@ async def job_fingerprints(records, job_ids, *, concurrency: int = 16) -> set[by
     seen: set[bytes] = set()
     for job_id in job_ids:
         ids = list(await records.list_verdict_ids(job_id))
+        voided = await voided_submission_ids(records, job_id)
         verdicts = await asyncio.gather(*(read(records.read_verdict(job_id, s)) for s in ids))
-        passing = [s for s, v in zip(ids, verdicts) if v and v.get("passed")]
+        passing = [s for s, v in zip(ids, verdicts)
+                   if v and v.get("passed") and s not in voided]
         found = await asyncio.gather(*(read(records.read_submission(job_id, s))
                                        for s in passing))
-        for record in found:
+        invalidated = await asyncio.gather(*(read(submission_voided(records, job_id, s, voided))
+                                             for s in passing))
+        for record, is_voided in zip(found, invalidated):
+            if is_voided:
+                continue
             for completion in (record or {}).get("completions") or ():
                 seen.add(completion_fingerprint(completion))
     return seen
@@ -107,20 +126,29 @@ def is_duplicate(completion, seen: set[bytes] | None) -> bool:
 
 async def export_rows(*, job, records, grade=None, counts: dict | None = None,
                       seen: set[bytes] | None = None):
-    """One row per finished completion of every passing submission. ``counts``,
+    """One row per finished completion of every passing, not voided submission. ``counts``,
     when given, is filled in as the rows go. ``seen`` (``is_duplicate``)
     dedupes: a completion already in it is left out."""
     thinking = thinking_render(job)
     if counts is None:
         counts = {}
-    counts.update(completions=0, rows=0, rows_accepted=0 if grade is not None else None,
+    counts.update(completions=0, rows=0, voided=0,
+                  rows_accepted=0 if grade is not None else None,
                   unfinished=new_unfinished_counts(),
                   duplicate_completion=0 if seen is not None else None)
-    for submission_id in await records.list_verdict_ids(job.job_id):
+    ids = await records.list_verdict_ids(job.job_id)
+    voided = await voided_submission_ids(records, job.job_id)
+    for submission_id in ids:
         verdict = await records.read_verdict(job.job_id, submission_id)
         if not verdict or not verdict.get("passed"):
             continue
+        if submission_id in voided:
+            counts["voided"] += 1
+            continue
         record = await records.read_submission(job.job_id, submission_id)
+        if await submission_voided(records, job.job_id, submission_id, voided):
+            counts["voided"] += 1
+            continue
         if record is None:
             # R2 is not transactional: a verdict can be visible before its
             # submission object is (or the object can be gone). Export pays

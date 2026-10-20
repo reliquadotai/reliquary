@@ -207,7 +207,7 @@ def test_export_rows_skips_unfinished_and_counts_them():
 
     rows, counts = asyncio.run(go())
     assert [(r["prompt_index"], r["accepted"]) for r in rows] == [(0, True), (1, False)]
-    assert counts == {"completions": 5, "rows": 2, "rows_accepted": 1,
+    assert counts == {"completions": 5, "rows": 2, "rows_accepted": 1, "voided": 0,
                       "duplicate_completion": None,
                       "unfinished": {"unfinished_no_eos": 1, "unclosed_think": 1,
                                      "multiple_think_close": 1}}

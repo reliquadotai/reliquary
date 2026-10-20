@@ -86,6 +86,7 @@ class _FakeRecords:
     def __init__(self):
         self.subs: dict = {}
         self.verdicts: dict = {}
+        self.voided: set = set()
 
     async def list_verdict_ids(self, job_id):
         return sorted(self.verdicts)
@@ -95,6 +96,12 @@ class _FakeRecords:
 
     async def read_submission(self, job_id, sid):
         return self.subs[sid]
+
+    async def list_voided_ids(self, job_id):
+        return sorted(self.voided)
+
+    async def read_voided(self, job_id, sid):
+        return {} if sid in self.voided else None
 
 
 class _FakeEnvironment:
@@ -216,6 +223,41 @@ def test_jobs_export_writes_one_row_per_completion_of_passed_submissions(
         ("q3", "yes", "A"), ("q3", "no", "A")
     ]
     assert "accepted" not in rows[0]
+
+
+@pytest.mark.parametrize("invalidate_after_read", [False, True])
+def test_jobs_export_excludes_invalidated_submissions_before_deduplication(
+    jobs, records, tmp_path, monkeypatch, invalidate_after_read,
+):
+    jobs["math-v1"] = _job_spec()
+    for index in (1, 2):
+        sid = str(index) * 64
+        records.verdicts[sid] = {"passed": True}
+        records.subs[sid] = {
+            "hotkey": "fixture", "prompt_index": index, "rendered_prompt": f"q{index}",
+            "completions": [{"text": "answer", "tokens": [1, 151645]}],
+        }
+    if invalidate_after_read:
+        read_submission = records.read_submission
+
+        async def read(job_id, sid):
+            record = await read_submission(job_id, sid)
+            if sid == "1" * 64:
+                records.voided.add(sid)
+            return record
+
+        monkeypatch.setattr(records, "read_submission", read)
+    else:
+        records.voided.add("1" * 64)
+    out = tmp_path / "dataset.jsonl"
+
+    result = CliRunner().invoke(app, ["jobs", "export", "math-v1", "--out", str(out),
+                                    "--dedupe"])
+
+    assert result.exit_code == 0, result.output
+    assert [row["submission_id"] for row in _read_lines(out)] == ["2" * 64]
+    counts = json.loads((tmp_path / "dataset.jsonl.counts.json").read_text())["counts"]
+    assert counts["voided"] == 1 and counts["duplicate_completion"] == 0
 
 
 def test_jobs_export_with_apply_filter_annotates_every_row(jobs, records, env_specs, tmp_path):
