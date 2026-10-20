@@ -4,6 +4,7 @@ finished episode (spec §5 N1, N2)."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import logging
 import time
@@ -461,7 +462,17 @@ async def serve_loopback(app, port: int):
     returns the uvicorn server and its serving task once it accepts requests."""
     import uvicorn
 
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    class _Server(uvicorn.Server):
+        # uvicorn takes SIGINT/SIGTERM for itself while it serves: the endpoint would stop and the miner hosting
+        # it would go on. The miner's own handling (the default: the process ends) is kept.
+        @contextlib.contextmanager
+        def capture_signals(self):
+            yield
+
+        def install_signal_handlers(self) -> None:      # uvicorn < 0.29
+            pass
+
+    server = _Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     serving = asyncio.create_task(server.serve())
     while not server.started:
         if serving.done():
