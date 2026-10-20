@@ -104,9 +104,10 @@ PROTOCOL_GENERATION_CONTRACT = (
 
 # Model architectures this image can actually run, drawn from the HF configs
 # behind the nine compiled profiles in reliquary/protocol/profiles.py: dense
-# Qwen3 (Qwen/Qwen3-4B-Base, seven profiles) and Qwen3.5's conditional
+# Qwen3 (Qwen/Qwen3-4B-Base, seven profiles), Qwen3.5's conditional
 # generation class (Qwen/Qwen3.5-2B and -4B, including the default profile;
-# see reliquary/shared/modeling.py's `_is_qwen35_conditional_config`). No
+# see reliquary/shared/modeling.py's `_is_qwen35_conditional_config`) and its
+# text-only class (the Teutonic profile's checkpoint). No
 # profile names an MoE checkpoint, so that architecture is deliberately absent
 # rather than pre-approved on spec. A task contract naming anything else is
 # refused at startup rather than at the first forward pass.
@@ -136,6 +137,13 @@ SUPPORTED_ARCHITECTURES: dict[str, tuple[str, ...]] = {
         "tests/unit/test_corpus_audit_batched.py::measured\non Qwen3.8-27B",
         "tests/fixtures/corpus_code_v1_contract.json::\"model_architecture\":\"Qwen3_5ForConditionalGeneration\"",
         "tests/fixtures/live_registry_2026_09_30.json::Qwen3_5ForConditionalGeneration",
+    ),
+    # Qwen3.5's text-only class (Teutonic-I with Qwen3.5 attention grafted, and
+    # its SFT checkpoints): the 2026-09-25 H100 rehearsal measured vLLM capture
+    # + HF verification on teutonic-i-graft-sft-cot-v2, every check passed.
+    "Qwen3_5ForCausalLM": (
+        "tests/unit/test_modeling_helpers.py::test_qwen35_text_config_uses_causal_lm_auto_class",
+        "docs/runbooks/corpus-task-launch.md::(`teutonic-i-graft-sft-cot-v2@d5256c5`) against Qwen3.5-4B",
     ),
 }
 SUPPORTED_MODEL_ARCHITECTURES = frozenset(SUPPORTED_ARCHITECTURES)
