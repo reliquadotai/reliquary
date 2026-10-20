@@ -151,6 +151,13 @@ class GenerateEngine:
         while item is not None:
             if item[0] == "abort":
                 self._abort(item[1])
+            elif item[0] == "call":
+                _, fn, box, done = item
+                try:
+                    box.append((True, fn()))
+                except BaseException as exc:          # handed to the caller, never kills the engine thread
+                    box.append((False, exc))
+                done.set()
             else:
                 _, request_id, prompt_ids, max_tokens, *forced = item
                 with self._lock:
@@ -167,6 +174,21 @@ class GenerateEngine:
                 item = self._inbox.get_nowait()
             except queue.Empty:
                 return
+
+    def between_steps(self, fn, *, timeout: float = 600.0):
+        """``fn()`` run by the engine thread between two engine steps (the core is never stepped meanwhile), its
+        result returned, its exception raised. Blocking: call it from a worker thread, never the event loop."""
+        if self._thread is None or not self._thread.is_alive():
+            raise RuntimeError("the generate engine is not running")
+        box: list = []
+        done = threading.Event()
+        self._inbox.put(("call", fn, box, done))
+        if not done.wait(timeout):
+            raise TimeoutError("the generate engine did not run the call")
+        ok, value = box[0]
+        if not ok:
+            raise value
+        return value
 
     def _resolve(self, done: Finished) -> None:
         with self._lock:

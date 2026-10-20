@@ -534,6 +534,9 @@ class VLLMRolloutGenerator:
                 break
         return done
 
+    def has_running_groups(self) -> bool:
+        return bool(self._pending)
+
     def abort_groups(self) -> None:
         """Drop every running group (after a failed step)."""
         if self._pending:

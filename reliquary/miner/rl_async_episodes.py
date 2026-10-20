@@ -57,6 +57,11 @@ class EpisodeLeaseGenerator:
         self._renderers: dict[str, Any] = {}
         self._running: dict[str, asyncio.Task] = {}
 
+    @property
+    def swaps_running(self) -> bool:
+        """New weights go into the episode engine with episodes in flight (``EpisodeEngineHost.push``)."""
+        return self._load is not None
+
     def generate(self, leases) -> list:
         raise RuntimeError("episodes are played on the event loop: call agenerate")
 
@@ -184,12 +189,9 @@ class EpisodeEngineHost:
     request by the runner-keyed processor) under a ``GenerateEngine`` bound to ``draws``, served on loopback by one
     generate app that outlives the engines (the app holds this host, which hands every call to the current engine).
 
-    Checkpoint swaps restart the engine, never in place: ``VllmTurnCore``'s ``LLM`` is stepped by the engine's own
-    thread and captures hidden states per request, and a ``collective_rpc`` weight push while that thread owns the
-    engine is not something vLLM supports. ``AsyncMiner`` swaps between batches only, when no episode is in flight,
-    so ``load_weights`` (in a worker thread) writes the state as an HF directory, stops the engine (joins its
-    thread), releases the core (GPU memory freed) and builds a new core and engine on the directory: a full model
-    load per checkpoint (measured at GPU qualification; ``--batch-groups`` amortizes it).
+    The first checkpoint (or one whose in-place push failed with no turn in flight) starts the engine on an HF
+    directory (``restart``); later ones are pushed in place by the engine's own thread between two steps, the
+    turns in flight preempted and resumed on the new weights (``push``), so a swap never waits for an episode.
 
     ``make_core(model_dir, **kwargs)``, ``release_core(core)``, ``serve(app, port) -> (server, task)``: the
     window stack's (``episode_mining``), replaceable in tests. ``stop_ids()``: the renderer's turn stops."""
@@ -236,30 +238,32 @@ class EpisodeEngineHost:
         self.restarts += 1
 
     def push(self, state: Mapping[str, Any], scratch: Path) -> None:
-        """New weights into the running engine, in place: the engine thread stops (no turn in flight), every worker
-        loads the shards through the model's ``load_weights`` (``LLM.collective_rpc``), the prefix cache is reset
-        and a new engine thread starts on the same core. No model load, no second copy of the weights on the GPU."""
-        from reliquary.miner.corpus_generate_server import GenerateEngine
+        """New weights into the running engine, in place and with turns in flight: between two engine steps (the
+        engine thread runs it), every worker loads the shards through the model's ``load_weights``
+        (``LLM.collective_rpc``) and the prefix cache is reset with the running turns preempted, so they resume on
+        the new weights (their KV recomputed, their draw placed by the runner's own token count). The engine, its
+        sessions and their waiters stay: no episode is interrupted, no model load, no second copy on the GPU."""
         from reliquary.miner.rl_async import _load_weights_from_files
         from reliquary.shared.ckpt_delta import write_anchor_shards
 
-        if self.core is None:
+        if self.core is None or self.engine is None:
             raise RuntimeError("no engine to push weights into")
-        if self.engine is not None:
-            self.engine.stop()
-            self.engine = None
         shutil.rmtree(scratch, ignore_errors=True)
         try:
             paths = [str(p) for p in write_anchor_shards(state, scratch)]
             llm = self.core._llm
-            llm.collective_rpc(_load_weights_from_files, args=(paths,))
-            llm.reset_prefix_cache()
+
+            def load() -> None:
+                llm.collective_rpc(_load_weights_from_files, args=(paths,))
+                llm.reset_prefix_cache(reset_running_requests=True)
+
+            self.engine.between_steps(load)
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
-        engine = GenerateEngine(self.core, max_total_tokens=self.max_total_tokens,
-                                max_tokens_per_turn=self.max_tokens_per_turn, draws=self.draws)
-        engine.start()
-        self.engine = engine
+
+    def has_turns_in_flight(self) -> bool:
+        core = self.core
+        return core is not None and bool(core.has_unfinished())
 
     def close_engine(self) -> None:
         engine, core = self.engine, self.core
@@ -308,6 +312,8 @@ class EpisodeWeights:
                 logger.info("episode engine on checkpoint %d (weights pushed in place)", version)
                 return
             except Exception:
+                if self.host.has_turns_in_flight():
+                    raise                     # a restart would end the episodes in flight: the miner drains first
                 logger.exception("in-place weight push failed; restarting the episode engine on checkpoint %d",
                                  version)
         if not (self.base / "config.json").is_file():
@@ -375,6 +381,11 @@ class MixedGenerator:
             self.episodes.abort()
         if self.single is not None and callable(getattr(self.single, "abort", None)):
             self.single.abort()
+
+    @property
+    def swaps_running(self) -> bool:
+        return all(bool(getattr(side, "swaps_running", False)) for side in (self.episodes, self.single)
+                   if side is not None)
 
     def load_weights(self, state: Mapping[str, Any], version: int) -> None:
         if self.single is not None:
