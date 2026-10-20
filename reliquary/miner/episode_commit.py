@@ -148,7 +148,8 @@ def episode_admissible(outcome, *, policy, renderer, prompt: str, min_chunk_toke
     result, session = outcome.result, outcome.session
     try:
         if not getattr(result, "ok", False) or result.transcript is None or session is None:
-            raise ValueError("no graded episode")
+            why = getattr(result, "error", None) or ("no engine session" if session is None else "no transcript")
+            raise ValueError(f"no graded episode: {why}")
         tokens, spans = episode_sequence(session.turns)
         stop = episode_stop(result.stop, tokens=tokens, spans=spans, max_turns=policy.max_turns,
                             max_tokens_per_turn=policy.max_tokens_per_turn,
