@@ -468,6 +468,7 @@ async def test_the_http_transport_leases_from_the_real_routes(tmp_path):
         assert await miner.lease_more() == 4
         assert book.in_use(miner_key.ss58_address) == 4
         book.record_outcome(ENV, 7, 0, [1.0] * 16, "too_easy")
+        book.record_outcome(ENV, 7, 0, [1.0] * 16, "too_easy")              # too easy twice: blacklisted
         await miner.refresh_state()
         assert miner.planners[ENV].records[7].state == "blacklisted"
         with pytest.raises(RequestRefused) as refused:
