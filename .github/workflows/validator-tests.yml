@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: validator-tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   validator-suite:
     runs-on: ubuntu-24.04
