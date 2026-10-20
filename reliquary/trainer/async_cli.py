@@ -71,7 +71,7 @@ def async_trainer_settings(env: Mapping[str, str] = os.environ) -> dict[str, Any
         "url": url, "token": token, "validator_hotkey": hotkey,
         "state_dir": Path(env.get("RELIQUARY_TRAINER_STATE_DIR", "/root/reliquary/trainer")) / "async",
         "base_model": str(env.get("RELIQUARY_RL_BASE_MODEL", "")).strip() or None,
-        "batch_groups": _int(env, "RELIQUARY_RL_BATCH_GROUPS", 64),
+        "batch_groups": _int(env, "RELIQUARY_RL_BATCH_GROUPS", 512),
         "steps_per_checkpoint": _int(env, "RELIQUARY_RL_STEPS_PER_CHECKPOINT", 1),
         "anchor_interval": _int(env, "RELIQUARY_RL_ANCHOR_INTERVAL", 50),
         "hf_prefix": prefix or None, "hf_every": every,

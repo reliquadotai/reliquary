@@ -95,11 +95,11 @@ proof-worker images; signer, proof worker, controller in that order).
 | lease expiry reference speed | 20 tok/s | Q3, Q5 |
 | starting quota | 4 | Q5 |
 | `EXPIRY_BACKOFF` | x0.9 per expiry (at least one lease) | Q5 |
-| `rl_max_pending_groups` (buffered groups only) | 192 (simulated: the lag knob) | Q5 |
+| `rl_max_pending_groups` (buffered groups only) | 1024 (two batches of 512) | Q5 |
 | price band low/high | 0.90 / 1.10 (rise 1.05, decay -2 %/tick) | price simulation, Q5 |
-| `batch_groups` | 64 | Q4 |
+| `batch_groups` | 512 (~8k rollouts, one optimizer step per checkpoint; decision N, 2026-10-20) | Q4 |
 | steps per checkpoint | 1 | Q3, Q4 |
-| learning rate | 2e-6 | Q5 |
+| learning rate | 2e-6, linear warm-up 8 steps, then constant (decision N) | Q5 |
 | per-env cooldown (math, code) | global default | operator, before launch |
 
 ## Math budget probe (2026-10-19)

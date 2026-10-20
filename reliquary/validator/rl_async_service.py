@@ -74,7 +74,9 @@ LEASE_SPEED_PARAM = "rl_lease_reference_tokens_per_s"   # a slow reference card'
 LEASE_MARGIN_PARAM = "rl_lease_expiry_margin"
 PRICE_TICK_PARAM = "rl_price_tick_s"
 PENDING_PARAM = "rl_max_pending_groups"         # global cap: buffered groups (queued or taken)
-DEFAULT_MAX_PENDING_GROUPS = 192      # placeholder: 3 batches of 64. queue_sim 10-17: trainer wait 7 % at 128, 2 % at 160, 1 % at 192, <1 % at 256; queue wait p50 0.6 / 0.9 / 1.3 / 2.2 steps
+# Two batches of 512 groups (decision N, 2026-10-20: ~8k rollouts per optimizer step, one step per checkpoint).
+# queue_sim 10-17 at 64 per batch: trainer wait 7 % at 2 batches, 1 % at 3, <1 % at 4.
+DEFAULT_MAX_PENDING_GROUPS = 1024
 DEFAULT_LEASE_TOKENS_PER_S = 20.0      # placeholder: the design's "3090 at max length", measured at qualification
 DEFAULT_LEASE_MARGIN = 2.0
 
