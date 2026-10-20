@@ -24,13 +24,13 @@ from reliquary_harness.variant import variant_count, variant_index
 
 from reliquary.environment.agentic.types import EpisodeTask
 
-HARNESS_DIGEST = "5e215c4cfa4a6a459d26a60ce4bd0f8091ec793d66649f1a58f919cf458731a8"
+HARNESS_DIGEST = "d58014498cfedd1662df1c47ba1862f7d2ced81cf7db189e3b8083bb18018382"
 """The bash harness this build renders, checks and mines with (`HARNESS.digest`): an
 installed reliquary-harness with another digest is not this build's harness."""
 HARNESS_DIGESTS = {
     HARNESS.key: HARNESS_DIGEST,
-    BASH_SURFACE_V1.key: "fd83b4d90ba034b7012db0e29ed1932bdb04e5db549ca007b812f4e18d6d208f",
-    MINI_SWE_V1.key: "ee77cb30c04e55b949b262ce38fceefe4b702e9ca9c10f2860d1bf51356ddcfe",
+    BASH_SURFACE_V1.key: "a48a59f9c5e13b61e8fd8f59fca15a9cc3ea929627dd841bb353fec599b8ddf4",
+    MINI_SWE_V1.key: "acfe09704fd8eb67ac7db8a38326f013faba54cc0af24ee71debd4dd8f226816",
 }
 """Every harness spec this build serves, by `id@version`, at the digest it was built against.
 A job or an RL episode env names one with `{id, version, digest}`; one naming none is
