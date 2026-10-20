@@ -226,7 +226,9 @@ def test_a_closed_period_settles_once_and_feeds_the_period_weights(book):
 
 
 @pytest.mark.parametrize("interruption", [TimeoutError, asyncio.CancelledError])
-async def test_publication_reconciles_after_restart(book, tmp_path, interruption):
+@pytest.mark.parametrize("commit_after_retry", [False, True])
+@pytest.mark.parametrize("legacy_writer", [False, True])
+async def test_publication_reconciles_after_restart(book, tmp_path, interruption, commit_after_retry, legacy_writer):
     from reliquary.validator.weight_only import WeightOnlyValidator
 
     subs = service(book, probation_groups=0)
@@ -238,17 +240,28 @@ async def test_publication_reconciles_after_restart(book, tmp_path, interruption
 
     class InterruptedArchives(Archives):
         interrupted = False
+        pending = None
 
         async def write(self, *args):
-            await super().write(*args)
             if not self.interrupted:
                 self.interrupted = True
+                if commit_after_retry:
+                    self.pending = args
+                else:
+                    await super().write(*args)
                 raise interruption()
+            await super().write(*args)
 
     archives = InterruptedArchives()
     with pytest.raises(interruption):
-        await ledger.publish(archives, now=now)
+        if legacy_writer:
+            book.db.execute("UPDATE rl_pay_periods SET published=0")
+            book.db.commit()
+            await archives.write("rl-async", doc["work_period"], doc["entry_period"], doc)
+        else:
+            await ledger.publish(archives, now=now)
     assert ledger.unpublished() == [doc]
+    assert ledger.board(now)["settled_periods"][0]["published"] is False
     book.close()
 
     restarted = LeaseBook(tmp_path / "leases.sqlite3", book.config,
@@ -258,13 +271,38 @@ async def test_publication_reconciles_after_restart(book, tmp_path, interruption
         later = cp.period_end(doc["entry_period"]) + 1
         assert await ledger.publish(archives, now=later) == 1
         assert ledger.unpublished() == []
-        assert archives.docs == {("rl-async", doc["work_period"], doc["entry_period"]): doc}
+        if archives.pending is not None:
+            await Archives.write(archives, *archives.pending)
         assert await ledger.publish(archives, now=later + cp.PERIOD_SECONDS) == 0
         declared = {"rl-async": SimpleNamespace(params={"settlement": "period-ema-v1", "cap": CAP})}
         weights = await WeightOnlyValidator._period_weights(declared, archives=archives, now=later,
                                                            genesis=cp.PERIOD_EPOCH)
         expected = cp.replay([doc], cp.period_of(later))
         assert weights["rl-async"] == pytest.approx(expected)
+        assert archives.docs == {("rl-async", doc["work_period"], doc["entry_period"]): doc}
+        assert ledger.board(later)["settled_periods"][0]["published"] is True
+    finally:
+        restarted.close()
+
+
+async def test_unattempted_stale_archive_can_move_after_restart(book, tmp_path):
+    subs = service(book, probation_groups=0)
+    ledger = ledger_for(book, subs, slack_s=0)
+    trained(book, subs, 1)
+    ledger.ingest()
+    (doc,) = ledger.settle(cp.period_end(cp.period_of(NOW)) + 1)
+    assert ledger.board()["settled_periods"][0]["published"] is False
+    book.close()
+
+    restarted = LeaseBook(tmp_path / "leases.sqlite3", book.config,
+                          quota=QuotaController(QuotaConfig(initial=64, ceiling=64)), clock=lambda: NOW)
+    try:
+        ledger = ledger_for(restarted, service(restarted, probation_groups=0), slack_s=0)
+        later = cp.period_end(doc["entry_period"]) + 1
+        archives = Archives()
+        assert await ledger.publish(archives, now=later) == 1
+        moved = {**doc, "entry_period": cp.period_of(later) + 1}
+        assert archives.docs == {("rl-async", doc["work_period"], moved["entry_period"]): moved}
     finally:
         restarted.close()
 
