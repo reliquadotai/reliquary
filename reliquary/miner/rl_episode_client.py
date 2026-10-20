@@ -171,13 +171,19 @@ def lease_transcript_refusal(transcript: Any, *, policy, lease, rollout_index: i
     from reliquary.protocol.rl_draw import lease_checkpoint_tag
     from reliquary.protocol.service_episode import rl_lease_engagement
 
-    return _transcript_refusal(transcript, policy=policy, now=now, expected=lambda: Expected(
+    return _transcript_refusal(transcript, policy=policy, now=now, finals=LEASE_FINAL_STATUSES, expected=lambda: Expected(
         hotkey=hotkey, engagement=rl_lease_engagement(lease.lease_id, int(rollout_index)), env=policy.sandbox_env,
         split=policy.split, index=int(lease.prompt_idx), checkpoint=lease_checkpoint_tag(int(lease.checkpoint)),
-        require_graded=True))
+        require_graded=False))
 
 
-def _transcript_refusal(transcript: Any, *, policy, now: float, expected) -> tuple[str, dict] | None:
+LEASE_FINAL_STATUSES = frozenset({"graded", "budget_exhausted"})
+"""The finals a lease's episode may end on: graded, or closed by the machine on its budget (a rollout scored 0;
+``rl_episode.LeaseEpisodeChecker``)."""
+
+
+def _transcript_refusal(transcript: Any, *, policy, now: float, expected,
+                        finals: frozenset[str] | None = None) -> tuple[str, dict] | None:
     from reliquary_sandbox.attest import Reason, verify_transcript
     from reliquary_sandbox.observation import TOOLS_VERSIONS
 
@@ -192,6 +198,8 @@ def _transcript_refusal(transcript: Any, *, policy, now: float, expected) -> tup
     reasons = [reason.value for reason in result.reasons if reason is not Reason.UNKNOWN_KEY]
     if reasons:
         return "episode_transcript", {"reasons": reasons}
+    if finals is not None and (result.final is None or result.final.status not in finals):
+        return "episode_transcript", {"reasons": ["not_graded"]}
     deadline = result.claims.expires_at + GRADING_GRACE_S
     if now > deadline:
         return "episode_deadline", {"now": int(now), "deadline": deadline}
@@ -472,6 +480,7 @@ class LeaseEpisodeRunner(RlSignedEpisodeRunner):
                                 sha256=hashlib.sha256(f"rl-lease:{lease.lease_id}".encode()).hexdigest(),
                                 checkpoint=f"k{int(lease.checkpoint)}", window=0)
         kwargs.setdefault("open_until", float(lease.expires_at))
+        self.takes_budget_exhausted = True       # every episode of a lease is a rollout: an exhausted one scores 0
         kwargs.setdefault("max_live", 16)
         super().__init__(policy=policy, precommit=label, prompt=prompt, hotkey=hotkey, **kwargs)
         self._lease = lease

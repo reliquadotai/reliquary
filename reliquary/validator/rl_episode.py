@@ -13,6 +13,11 @@ Leases, mandatory submission, quota and lifecycle apply unchanged: a lease of an
   signed call record, token for token; turn shape, budgets, termination, limit stops), after the prompt fidelity
   check (the prompt is the validator's own render);
 * one session twice in the group is refused; the reward is the final record's (validator authoritative).
+* an episode the machine closed on its budget (final ``budget_exhausted``, stop ``episode_closed``: the parse checks
+  the closing call) is a finished rollout scored 0, like a single-turn rollout cut at its cap: it stays in its group
+  and trains, so an honest episode that spends its budget never costs the lease. Every token of it is still drawn
+  and recorded like a graded one's, and a 0 only lowers its group (all zeros is too hard; in zone needs real
+  successes). Any other ungraded final (expired, aborted, box failed) refuses the group.
 
 No TOPLOC proof per span (dropped with the windows): the episode's model tokens are verified like any rollout's,
 by the forced draw (audits and the trainer's forward) over the model positions, keyed per model-token position
@@ -55,7 +60,9 @@ class LeaseEpisodeChecker:
 
     def grade(self, lease, rollouts: Sequence[Any], *, received: float):
         """``rl_submit.Graded`` of a lease's episodes (``Rollout`` with ``episode``)."""
-        from reliquary_sandbox.attest import Expected
+        from reliquary_sandbox.attest import STATUS_BUDGET_EXHAUSTED, STATUS_GRADED, Expected
+
+        from reliquary.corpus.signed_parse import STOP_EPISODE_CLOSED
 
         from reliquary.protocol.rl_draw import lease_checkpoint_tag
         from reliquary.protocol.service_episode import rl_lease_engagement
@@ -78,12 +85,16 @@ class LeaseEpisodeChecker:
             expected = Expected(hotkey=lease.hotkey, engagement=rl_lease_engagement(lease.lease_id, index),
                                 env=policy.sandbox_env, split=policy.split, index=int(lease.prompt_idx),
                                 checkpoint=lease_checkpoint_tag(int(lease.checkpoint)), seen_session_ids=seen,
-                                require_graded=True)
+                                require_graded=False)
             result = verified_transcript(policy, episode["transcript"], expected, directory=directory,
                                          token_verifier=self.token_verifier, received=received,
                                          where={"rollout": index})
             if isinstance(result, EpisodeRefusal):
                 return Graded(prompt, reject=result.stage)
+            status = result.final.status
+            if status not in (STATUS_GRADED, STATUS_BUDGET_EXHAUSTED) or (
+                    (status == STATUS_BUDGET_EXHAUSTED) != (episode.get("stop") == STOP_EPISODE_CLOSED)):
+                return Graded(prompt, reject="episode_transcript")
             verified.append(result)
         sessions = [result.claims.session_id for result in verified]
         if len(set(sessions)) != len(sessions):
@@ -97,8 +108,9 @@ class LeaseEpisodeChecker:
                 min_chunk_tokens=self.min_chunk_tokens, lease=True)
             if refusal is not None:
                 return Graded(prompt, reject=refusal.stage)
-        rewards = tuple(float(result.final.reward) for result in verified)
-        return Graded(prompt, rewards, (False,) * len(rollouts), spans=tuple(r.spans for r in rollouts))
+        exhausted = tuple(result.final.status == STATUS_BUDGET_EXHAUSTED for result in verified)
+        rewards = tuple(0.0 if cut else float(result.final.reward) for result, cut in zip(verified, exhausted))
+        return Graded(prompt, rewards, exhausted, spans=tuple(r.spans for r in rollouts))
 
 
 __all__ = ["LeaseEpisodeChecker"]

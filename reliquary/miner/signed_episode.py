@@ -385,6 +385,9 @@ class SignedSweEpisodeRunner:
 
     # A corpus episode submits its graded state as a text diff; an RL episode submits none.
     requires_text_state = True
+    # An episode the machine closed on its budget (signed final ``budget_exhausted``, stop ``episode_closed``) is a
+    # finished rollout scored 0 for a runner that sets this (an async RL lease); otherwise it is unusable.
+    takes_budget_exhausted = False
     # The named 503s that say the validator is serving, only busy (a subclass adds its routes' own).
     validator_throttles = VALIDATOR_THROTTLES
 
@@ -682,7 +685,9 @@ class SignedSweEpisodeRunner:
             return EpisodeResult(trace_id, "", stop, False, None, error=error,
                                  final_status=status if status != "graded" else None)
 
-        if result.error or status != "graded":
+        exhausted = (self.takes_budget_exhausted and status == "budget_exhausted" and not result.error
+                     and stop == "episode_closed")
+        if result.error or (status != "graded" and not exhausted):
             # Unpaid: not graded, or the run did not complete (a gateway close raised
             # as EpisodeClosed is a TaskError trace).
             return await unusable(result.error or (
@@ -703,6 +708,11 @@ class SignedSweEpisodeRunner:
         # Closed `final` first: `closed_graded` keeps the slot and no drain voids it.
         answer = await self._close(session_id, "final", transcript)
         state = answer.get("state") if answer is not None else None
+        # The validator records an exhausted session as ``closed`` (an unpaid final): its slot is already free.
+        if exhausted and state == "closed":
+            slot.free()
+            return EpisodeResult(trace_id, final_diff, stop, True, 0.0, transcript=transcript,
+                                 submit_by=float(expires_at + GRADING_GRACE_S - SUBMIT_TRANSIT_S))
         if state is not None and state not in PAYABLE_STATES:
             slot.free()                     # the validator already ended it
             return EpisodeResult(trace_id, "", stop, False, None,
