@@ -823,6 +823,17 @@ One branch carries the whole async RL work on top of current main.
   at near-deterministic positions per started block of `RL_AUDIT_FORGERY_MISMATCH_POSITIONS` (4096) of them
   (`mismatch_allowance`) -> `deterministic`; no model -> `passed=None`. Hook: `run_rl_audits(model,
   submissions, limit=8)`, to schedule from the service with its verify model.
+- Audits on the trainer (default, `rl_async_service.audit_source` = `trainer`; `RELIQUARY_RL_AUDIT_SOURCE=none`
+  restores "inconclusive", a `RELIQUARY_RL_AUDIT_DEVICE` or a remote proof worker keeps the validator's forward):
+  `RlSubmissions.take_audits(limit)` (stale ones dropped, then `audit_jobs`) behind `POST /rl/trainer/audits`
+  (limit 1-32) and `POST /rl/trainer/audit` (an `AuditResult`; 404 once concluded); the validator's audit loop only
+  drops stale audits. `trainer/audits.py`: `audit_group(model, group)` = `rl_audit.judge` over diagnostics from
+  the trainer's base model and head (`seed_consistency_diagnostics` on the drawn rows; the FSDP2
+  `FusedLogprobHead(rows, audit=fn)` projects inside one module call, weight gathered once);
+  `broadcasting_audit` sends `AUDIT` so every rank runs the same forward. `AsyncTrainer` runs one round
+  (`audits_per_step`, 8; `audit_budget_s`, 120 s) before each step and more while a batch fills; metrics
+  `async/audits`, `async/audit_s`. Env: `RELIQUARY_RL_TRAINER_AUDITS` (0 off), `_AUDITS_PER_STEP`,
+  `_AUDIT_BUDGET_S`.
 
 ### Remaining
 

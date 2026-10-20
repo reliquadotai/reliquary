@@ -10,7 +10,7 @@ decides and its pass criterion. Results go to `~/offpolicy-lab/results/qualif-20
 | Role | Need | Why |
 |---|---|---|
 | Trainer | 1 box, >= 4 x 80 GB (H100/A100), NVLink preferred | 9B FSDP2 with fp32 masters and Adam (~150 GB) |
-| Validator GPU (audits, proof path) | 1 x H100 (`noble-fox-be`) | audits and the proof-path reference |
+| Validator GPU (audits, proof path) | none by default: the trainer runs the audits (`trainer.audits`); 1 x H100 only for the `RELIQUARY_RL_AUDIT_DEVICE` fallback | proof-path reference |
 | Miners | 3 card types: one 24-32 GB GeForce (4090/5090/3090), one 48 GB (L40S/A6000), one H100 | honest match per card, fp8 gain, sync time |
 | Validator controller | CPU box (local VPS is enough for the test) | leases, buffer, ledger, prices |
 
@@ -135,7 +135,7 @@ miners (single-turn and episodes), the gVisor sandbox host.
 | 3 | Cut rollouts score 0 and their groups train: in-zone share, length trend | the cut rule |
 | 4 | Cooldown (shortened): prompts coming back, leasable pool per env | prompt rotation |
 | 5 | Real lag; gap and match floors on the 9B | validated on the 2B only |
-| 6 | Audit capacity against the out-of-zone volume (every miner starts in probation) | audit backlog |
+| 6 | Audit capacity against the out-of-zone volume (every miner starts in probation), audits on the trainer: `async/audits`, `async/audit_s` per step, FSDP2 ranks in step | audit backlog |
 | 7 | An 18 GB checkpoint published and swapped in by the miners (single-turn and episodes) | swap on the 9B |
 | 8 | SWE and TMax episode throughput; sandbox sessions needed | prod sizing |
 | 9 | Kill and resume the validator, the trainer and a miner | robustness |

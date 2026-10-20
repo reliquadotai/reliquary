@@ -124,4 +124,16 @@ class TrainerLink:
                                                                  for s in substitutions]}, resend_ok=True)
 
 
+    # --- the audits (trainer.audits) ------------------------------------------------------------------------------
+    def take_audits(self, limit: int) -> list[SubmittedGroup]:
+        """Up to ``limit`` queued out-of-zone audits (the validator drops the stale ones first)."""
+        return self._groups(self._call("POST", "audits", {"limit": int(limit)}))
+
+    def report_audit(self, lease_id: str, result) -> None:
+        self._call("POST", "audit", {
+            "lease_id": lease_id, "passed": result.passed, "failure_class": result.failure_class,
+            "rollout_match": [float(m) for m in result.rollout_match], "suspect": bool(result.suspect)},
+            resend_ok=True)
+
+
 __all__ = ["TrainerLink", "TrainerLinkError"]

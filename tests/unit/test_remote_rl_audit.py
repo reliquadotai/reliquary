@@ -128,10 +128,15 @@ def test_the_worker_refuses_another_identity_and_plain_http_objects():
     assert backend.version is None and backend.sync.calls == []
 
 
-def test_the_service_runs_audits_remote_local_or_not_at_all():
+def test_the_service_runs_audits_on_the_trainer_remote_local_or_not_at_all():
+    from reliquary.validator.rl_async_service import AUDIT_SOURCE_ENV
+
     assert audit_source({"RELIQUARY_PROOF_EXECUTOR_MODE": "remote"}) == "remote"
     assert audit_source({AUDIT_DEVICE_ENV: "cuda:0"}) == "local"
-    assert audit_source({"RELIQUARY_PROOF_EXECUTOR_MODE": "shadow"}) is None
-    assert audit_source({}) is None
+    assert audit_source({"RELIQUARY_PROOF_EXECUTOR_MODE": "shadow"}) == "trainer"
+    assert audit_source({}) == "trainer"                                 # the default: no model on the validator
+    assert audit_source({AUDIT_SOURCE_ENV: "none"}) is None
+    with pytest.raises(ValueError):
+        audit_source({AUDIT_SOURCE_ENV: "gpu"})
     with pytest.raises(ValueError):
         audit_source({"RELIQUARY_PROOF_EXECUTOR_MODE": "remote", AUDIT_DEVICE_ENV: "cuda:0"})

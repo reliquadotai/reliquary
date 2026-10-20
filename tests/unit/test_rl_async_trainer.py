@@ -433,3 +433,38 @@ def test_a_rollout_cut_short_by_an_eos_far_from_the_pick_is_refused():
     off = DrawGate([[0, 1, 2, 3]], **loose, terminal_gap=0.0)                     # no EOS ids: no rule
     grads_of(model, plan, off)
     assert off.bad_terminal == [0, 0, 0, 0]
+
+
+def test_audits_are_judged_before_each_step_and_while_the_batch_fills():
+    """The trainer judges the validator's out-of-zone audits on its own weights: one bounded round before each step,
+    more while it waits for a full batch."""
+    model, book = _Model(), Book()
+    buffer = TrainingBuffer(book)
+    rounds = []
+
+    class Audits:
+        def run(self, m, *, limit, budget_s):
+            rounds.append((m is trainer.model, limit, budget_s))
+            return 1 if len(rounds) < 3 else 0           # two rounds with work, then the queue is empty
+
+        def metrics(self):
+            return {"async/audits": float(len(rounds)), "async/audit_s": 0.0}
+
+    clock = Clock(on_sleep=lambda: buffer.push(submitted(model, f"g{int(clock.t)}", n=2)))
+    subs = Subs(buffer)
+    trainer = AsyncTrainer(model, config=AsyncTrainerConfig(1, audits_per_step=4, audit_budget_s=30.0),
+                           buffer=buffer, submissions=subs, book=book, publisher=Publisher(), clock=clock,
+                           sleep=clock.sleep, audits=Audits())
+
+    def step(model, batches, *, gate, **_):
+        for g in (g for b in batches for g in b):
+            gate.admit(g.rollouts, [(30, 30, N_TOK, N_TOK)] * len(g.rollouts))
+        gate.judge([])
+        return model
+
+    trainer._train_step = step
+    assert trainer.run_once() == "trained"
+    trainer.close()
+    assert rounds[0] == (True, 4, 30.0) and len(rounds) == 3        # before the step, then while waiting
+    with pytest.raises(ValueError):
+        AsyncTrainerConfig(1, audits_per_step=-1)

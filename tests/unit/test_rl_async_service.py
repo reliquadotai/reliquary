@@ -111,6 +111,34 @@ def test_the_trainer_link_needs_its_token_and_round_trips(tmp_path):
     rl.close()
 
 
+def test_the_trainer_takes_the_audits_and_reports_their_verdicts_through_its_link(tmp_path):
+    from reliquary.trainer.rl_link import TrainerLink, TrainerLinkError
+    from reliquary.validator.rl_leases import LeaseRequest
+    from reliquary.validator.rl_submit import AuditResult
+
+    rl = components(tmp_path)
+    app = FastAPI()
+    app.include_router(build_rl_trainer_router(rl, token=TOKEN))
+    client = TestClient(app)
+    assert client.post("/rl/trainer/audits", json={"limit": 1}).status_code == 401
+    link = TrainerLink("http://testserver", TOKEN, client=client, patience_s=0.0)
+    link.adopt_checkpoint(0)
+    lease = rl.book.grant([LeaseRequest("A", ENV, (4,), 0)])[0].leases[0]
+    assert rl.submissions.submit(lease.lease_id, "A", group(0))["verdict"] == "too_hard"   # probation: drawn
+    [job] = link.take_audits(8)
+    assert job.lease_id == lease.lease_id and link.take_audits(8)[0].lease_id == lease.lease_id   # until reported
+    for bad in (0, 33):
+        with pytest.raises(TrainerLinkError) as refused:
+            link.take_audits(bad)
+        assert refused.value.status == 422
+    link.report_audit(lease.lease_id, AuditResult(True, None, (0.99,) * 16))
+    assert rl.submissions.group(lease.lease_id)["audit"] == "passed" and link.take_audits(8) == []
+    with pytest.raises(TrainerLinkError) as missing:
+        link.report_audit(lease.lease_id, AuditResult(True, None, (0.99,) * 16))
+    assert missing.value.status == 404
+    rl.close()
+
+
 def test_the_trainer_link_has_its_own_listener_never_the_public_port(tmp_path):
     from reliquary.trainer.rl_link import TrainerLink
     from reliquary.validator.server import ValidatorServer
@@ -468,4 +496,21 @@ def test_the_controller_wandb_row_reads_prices_buffer_leases_and_miners(tmp_path
     assert row[f"price/{ENV}/multiplier"] > 0 and row[f"buffer/{ENV}/queued"] == 1
     assert row["leases/open"] == 1 and row["leases/submitted"] == 1 and row[f"leases_issued/{ENV}"] == 2
     assert row[f"groups/{ENV}/in_zone"] == 1 and row["miners/active"] == 1 and row["miners/banned"] == 0
+    rl.close()
+
+
+async def test_with_audits_on_the_trainer_the_validator_loop_never_concludes_them_itself(tmp_path):
+    from reliquary.validator.rl_leases import LeaseRequest
+
+    rl = components(tmp_path)
+    rl.book.adopt_checkpoint(0)
+    lease = rl.book.grant([LeaseRequest("A", ENV, (5,), 0)])[0].leases[0]
+    rl.submissions.submit(lease.lease_id, "A", group(0))
+    loops = [asyncio.create_task(c) for c in rl_async_loops(
+        rl, archives=Archives(), trainer_audits=True, every={"expire": 9, "audit": 0.01, "ledger": 9, "price": 9})]
+    await asyncio.sleep(0.2)
+    for task in loops:
+        task.cancel()
+    await asyncio.gather(*loops, return_exceptions=True)
+    assert [g.lease_id for g in rl.submissions.audit_jobs(10)] == [lease.lease_id]   # left to the trainer
     rl.close()

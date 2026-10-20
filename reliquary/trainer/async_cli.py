@@ -77,6 +77,10 @@ def async_trainer_settings(env: Mapping[str, str] = os.environ) -> dict[str, Any
         "hf_prefix": prefix or None, "hf_every": every,
         "hf_keep_last": _int(env, "RELIQUARY_RL_HF_BACKUP_KEEP", 3),
         "hf_milestone_every": _int(env, "RELIQUARY_RL_HF_BACKUP_MILESTONE_EVERY", None),
+        # the out-of-zone audits on this trainer's weights (the validator's default audit source)
+        "audits": str(env.get("RELIQUARY_RL_TRAINER_AUDITS", "1")).strip() != "0",
+        "audits_per_step": _int(env, "RELIQUARY_RL_TRAINER_AUDITS_PER_STEP", 8),
+        "audit_budget_s": float(env.get("RELIQUARY_RL_TRAINER_AUDIT_BUDGET_S", "120")),
     }
 
 
@@ -185,6 +189,11 @@ def run_async_train_worker() -> None:
                 return gather_full_state_dict(current(), dist_ctx)
 
             step_fn = broadcasting_train_step(channel, train_step)
+        audits = None
+        if settings["audits"]:
+            from reliquary.trainer.audits import TrainerAudits, audit_group, broadcasting_audit
+
+            audits = TrainerAudits(link, audit_fn=audit_group if dist_ctx is None else broadcasting_audit(channel))
         logger.info("startup_stage=trainer_model_load elapsed_seconds=%.3f", time.monotonic() - started)
         reset_training_state()
 
@@ -204,12 +213,14 @@ def run_async_train_worker() -> None:
         config = AsyncTrainerConfig(batch_groups=settings["batch_groups"],
                                     steps_per_checkpoint=settings["steps_per_checkpoint"],
                                     hf_backup_every=settings["hf_every"],
-                                    eos_ids=_eos_ids(model_path, load_kwargs))
+                                    eos_ids=_eos_ids(model_path, load_kwargs),
+                                    audits_per_step=settings["audits_per_step"],
+                                    audit_budget_s=settings["audit_budget_s"])
         link.requeue()                          # this trainer holds nothing yet
         trainer = AsyncTrainer(
             model, config=config, buffer=link, submissions=link, book=link, publisher=publisher,
             state_fn=state_fn, backup=backup, backup_save=lambda s, folder: write_hf_dir(s, model_dir, folder),
-            train_step_fn=step_fn,
+            train_step_fn=step_fn, audits=audits,
             global_step_hint=None if version is None else version * settings["steps_per_checkpoint"])
         live["trainer"] = trainer
         logger.info("train-async starting: task %s, run %s, target mix %s (priced, not enforced), checkpoint %d",

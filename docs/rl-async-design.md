@@ -154,7 +154,10 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   training verification is unpaid and re-opens probation, nothing more; honest drift fails groups
   too, so a verdict cannot tell a forger from a lagging miner. Bans are the operator's
   (`RlSubmissions.blacklist`). An audit is a separate forward against the latest checkpoint
-  with the same floor and match as training (PROPOSED: no old checkpoints kept). Audits run newest
+  with the same floor and match as training (PROPOSED: no old checkpoints kept). The trainer runs
+  it (`trainer.audits`), on the weights it holds: the validator keeps the queue and the verdicts
+  and loads no model; the trainer takes audit jobs over its link before each step and while a
+  batch fills (bounded per round), and reports each verdict. Audits run newest
   first; one queued past `RL_AUDIT_MAX_LAG` (4) checkpoints is dropped unjudged (unpaid, no
   probation effect): drifted weights would fail honest groups. An audit that abstains (too few drawn positions) or whose forward
   keeps failing is no probation pass and re-opens probation. Upload carries tokens only,

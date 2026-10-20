@@ -90,12 +90,17 @@ class FusedLogprobHead(torch.nn.Linear):
     chunk recomputes issued during backward, so those chunks would read the
     sharded weight and their gradients would never be reduced. One call per
     micro-batch gathers the weight once for forward, once for backward, and
-    reduces once. ``head(hidden)`` stays a plain projection.
+    reduces once. ``head(hidden)`` stays a plain projection. ``head(rows, audit=fn)`` hands ``fn`` the draw's
+    projection over the gathered weight (``trainer.audits``: an out-of-zone audit's diagnostics, no gradient).
     """
 
     fused_selected_logprobs = True
 
-    def forward(self, hidden, targets=None, draws=None):
+    def forward(self, hidden, targets=None, draws=None, audit=None):
+        if audit is not None:
+            from reliquary.trainer.audits import head_projection
+
+            return audit(head_projection(self.weight, self.bias))
         if targets is None:
             return super().forward(hidden)
         from reliquary.validator.training import _selected_logprobs_from_hidden
@@ -241,7 +246,7 @@ class CommandChannel:
         return message[0]
 
 
-def run_follower(channel: CommandChannel, *, load, train, gather) -> None:
+def run_follower(channel: CommandChannel, *, load, train, gather, audit=None) -> None:
     model = None
     while True:
         command, payload = channel.receive()
@@ -251,6 +256,8 @@ def run_follower(channel: CommandChannel, *, load, train, gather) -> None:
             train(model, payload)
         elif command == "GATHER":
             gather(model)
+        elif command == "AUDIT" and audit is not None:
+            audit(model, payload)               # the same forward as rank 0's; only rank 0 reports
         elif command == "STOP":
             return
         else:

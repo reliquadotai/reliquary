@@ -65,6 +65,7 @@ TRAINER_BIND_ENV = "RELIQUARY_RL_TRAINER_BIND"
 DEFAULT_TRAINER_BIND = "127.0.0.1:8889"
 TRAINER_INSECURE_BIND_ENV = "RELIQUARY_RL_TRAINER_INSECURE_BIND"   # "1": a non-loopback bind on a private network
 AUDIT_DEVICE_ENV = "RELIQUARY_RL_AUDIT_DEVICE"
+AUDIT_SOURCE_ENV = "RELIQUARY_RL_AUDIT_SOURCE"    # trainer (default) | none; a device or a remote worker wins
 RUN_ENV = "RELIQUARY_RL_RUN"
 DB_NAME = "rl-async.sqlite3"
 
@@ -83,6 +84,7 @@ DEFAULT_LEASE_MARGIN = 2.0
 EXPIRE_EVERY_S = 5.0
 AUDIT_EVERY_S = 2.0
 AUDIT_LIMIT = 8
+MAX_TRAINER_AUDITS = 32           # audit jobs one trainer-link take may ask for
 LEDGER_EVERY_S = 30.0
 PRICE_EVERY_S = 30.0
 CHECKPOINT_FOLLOW_EVERY_S = 10.0
@@ -294,6 +296,24 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
         rl.book.adopt_checkpoint(int(b["k"]))
         return {"latest": rl.book.latest_checkpoint}
 
+    def take_audits(b: dict) -> dict:
+        limit = int(b["limit"])
+        if not 0 < limit <= MAX_TRAINER_AUDITS:
+            raise ValueError(f"limit must be in [1, {MAX_TRAINER_AUDITS}]")
+        return {"groups": [_pack(g) for g in rl.submissions.take_audits(limit)]}
+
+    def report_audit(b: dict) -> dict:
+        from reliquary.validator.rl_submit import AuditResult
+
+        passed = b.get("passed")
+        if passed is not None and not isinstance(passed, bool):
+            raise ValueError("passed is true, false or null")
+        failure = b.get("failure_class")
+        rl.submissions.report_audit(str(b["lease_id"]), AuditResult(
+            passed, None if failure is None else str(failure),
+            tuple(float(m) for m in b.get("rollout_match") or ()), bool(b.get("suspect", False))))
+        return {"ok": True}
+
     route("GET", "config", lambda b: {"task_id": rl.settings.task_id, "run": rl.settings.run,
                                       "targets": dict(rl.settings.targets), "latest": rl.book.latest_checkpoint})
     route("GET", "latest", lambda b: {"latest": rl.book.latest_checkpoint})
@@ -307,6 +327,8 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
     route("POST", "requeue", lambda b: {"requeued": rl.buffer.requeue()})
     route("GET", "depth", lambda b: {"depth": rl.buffer.depth()})
     route("POST", "report", report)
+    route("POST", "audits", take_audits)
+    route("POST", "audit", report_audit)
 
     async def checkpoint(request: Request) -> JSONResponse:
         """``/rl/checkpoint``'s answer for the trainer's resume (it reaches this listener only)."""
@@ -464,9 +486,10 @@ async def _every(step: Callable[[], Any], period: float, name: str) -> None:
 
 def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = None, audit_limit: int = AUDIT_LIMIT,
                    clock: Callable[[], float] = time.time, every: Mapping[str, float] | None = None,
-                   publisher=None) -> list:
+                   publisher=None, trainer_audits: bool = False) -> list:
     """The background coroutines of the service (run until cancelled). ``publisher``: the scan log's
-    ``ObservationPublisher`` (``rl_observations.scan_publisher``)."""
+    ``ObservationPublisher`` (``rl_observations.scan_publisher``). ``trainer_audits``: the trainer judges the audits
+    (``RlSubmissions.take_audits``); the loop here only drops the stale ones."""
     from reliquary.validator import telemetry
     from reliquary.validator.rl_metrics import METRICS_EVERY_S, controller_metrics
     from reliquary.validator.rl_observations import FLUSH_EVERY_S
@@ -483,6 +506,9 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
     async def audit() -> None:
         from reliquary.validator.rl_audit import run_rl_audits
 
+        if trainer_audits:
+            await asyncio.to_thread(rl.submissions.drop_stale_audits)
+            return
         if audit_model is None:     # no verify model: inconclusive (unpaid, unsanctioned), never a stale verdict
             await asyncio.to_thread(run_rl_audits, None, rl.submissions, limit=audit_limit)
             return
@@ -634,13 +660,20 @@ def _public_boards(rl: RlAsync, wallet, validator_hotkey: str, signer_client=Non
 
 
 def audit_source(env: Mapping[str, str] = os.environ) -> str | None:
-    """Where the audit forward runs: ``remote`` (the proof worker, V1's GPU-less controller), ``local`` (a device of
-    this process) or None (every audit inconclusive). ValueError when both are configured."""
+    """Where the audit forward runs: ``trainer`` (default: the async trainer judges them on its own weights through
+    the trainer link; the validator loads no model), ``remote`` (the proof worker), ``local`` (a device of this
+    process) or None (``RELIQUARY_RL_AUDIT_SOURCE=none``: every audit inconclusive). ValueError when both remote and
+    local are configured."""
     remote = str(env.get("RELIQUARY_PROOF_EXECUTOR_MODE", "")).strip().lower() == "remote"
     local = bool(str(env.get(AUDIT_DEVICE_ENV, "")).strip())
     if remote and local:
         raise ValueError(f"{AUDIT_DEVICE_ENV} is set while the proof executor is remote: audits run on one of them")
-    return "remote" if remote else "local" if local else None
+    if remote or local:
+        return "remote" if remote else "local"
+    chosen = str(env.get(AUDIT_SOURCE_ENV, "")).strip().lower() or "trainer"
+    if chosen not in ("trainer", "none"):
+        raise ValueError(f"{AUDIT_SOURCE_ENV} must be trainer or none, got {chosen!r}")
+    return None if chosen == "none" else "trainer"
 
 
 def _audit_model(device: str, checkpoint: str, load_kwargs: Mapping[str, Any], validator_hotkey: str,
@@ -706,6 +739,8 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     elif source == "local":
         audit_model = await asyncio.to_thread(_audit_model, os.environ[AUDIT_DEVICE_ENV].strip(), checkpoint,
                                               load_kwargs, validator_hotkey, state_dir / "rl-audit-ckpt")
+    elif source == "trainer":
+        logger.info("out-of-zone audits run on the async trainer (its weights, through the trainer link)")
     else:
         logger.warning("no audit model (%s unset, proof executor not remote): out-of-zone audits conclude "
                        "inconclusive (first scans unpaid, no sanction)", AUDIT_DEVICE_ENV)
@@ -729,7 +764,8 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     mount_rl_async(server, rl, validator_hotkey=validator_hotkey,
                    registration=None if registered is None else registered.reason)
     archives = R2PeriodArchives(guard=R2Archives(served=lambda: (settings.task_id,), served_only=True))
-    background = rl_async_loops(rl, archives=archives, audit_model=audit_model, publisher=publisher)
+    background = rl_async_loops(rl, archives=archives, audit_model=audit_model, publisher=publisher,
+                                trainer_audits=source == "trainer")
     if rl.sandbox is not None:
         background.extend(rl.sandbox.background())
     if registered is not None:
@@ -770,7 +806,7 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
 
 
 __all__ = [
-    "ASYNC", "AUDIT_DEVICE_ENV", "AuditModel", "DB_NAME", "LEASE_MARGIN_PARAM", "LEASE_SPEED_PARAM", "PENDING_PARAM",
+    "ASYNC", "AUDIT_DEVICE_ENV", "AUDIT_SOURCE_ENV", "AuditModel", "MAX_TRAINER_AUDITS", "DB_NAME", "LEASE_MARGIN_PARAM", "LEASE_SPEED_PARAM", "PENDING_PARAM",
     "PLANNED_TOKENS_PARAM", "PRICE_TICK_PARAM", "RL_MODE_ENV", "RUN_ENV", "RlAsync", "RlAsyncSettings",
     "TRAINER_BIND_ENV", "TRAINER_INSECURE_BIND_ENV", "TRAINER_TOKEN_ENV", "WINDOW", "audit_source", "build_rl_async", "build_rl_trainer_app",
     "build_rl_trainer_router", "index_signer_for", "mount_rl_async", "rl_async_loops", "rl_async_params",

@@ -269,10 +269,14 @@ class AsyncTrainerConfig:
     max_lag: int = SECRET_REVEAL_LAG         # no quality cap (the floor decides); bounds the buffer only
     max_attempts: int = 3                    # hand-outs of a group without a report before it is dropped untrained
     poll_s: float = 0.5                      # while the batch is not full
+    audits_per_step: int = 8                 # out-of-zone audits judged before each step (``trainer.audits``)
+    audit_budget_s: float = 120.0            # their time budget per round; waiting for a batch runs more rounds
 
     def __post_init__(self) -> None:
         if self.batch_groups < 1 or (self.hf_backup_every or 1) < 1 or self.max_attempts < 1:
             raise ValueError("batch_groups, hf_backup_every and max_attempts must be positive")
+        if self.audits_per_step < 0 or self.audit_budget_s < 0:
+            raise ValueError("audits_per_step and audit_budget_s must be non-negative")
         if self.steps_per_checkpoint != 1:
             # pi_old is the policy under the gate: a second step before publishing trains with ratio 1 (no clip,
             # no dual clip, no drift breaker) and verifies miners against weights they never saw.
@@ -291,7 +295,7 @@ class AsyncTrainer:
                  publisher=None, state_fn: Callable[[], Mapping[str, Any]] | None = None, backup=None,
                  backup_save: Callable[[Mapping[str, Any], Path], None] = save_snapshot,
                  train_step_fn: Callable = _default_train_step, ref_model: Any = None,
-                 global_step_hint: int | None = None, clock: Callable[[], float] = time.monotonic,
+                 global_step_hint: int | None = None, audits=None, clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep) -> None:
         self.model, self.config = model, config
         self.buffer, self.submissions, self.book = buffer, submissions, book
@@ -299,6 +303,7 @@ class AsyncTrainer:
         self._state_fn = state_fn or (lambda: self.model.state_dict())
         self._train_step, self.ref_model, self.global_step_hint = train_step_fn, ref_model, global_step_hint
         self._clock, self._sleep = clock, sleep
+        self.audits = audits                    # trainer.audits.TrainerAudits: out-of-zone audits on this model
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ckpt-publish")
         self._pending: Future | None = None
         self.steps = 0
@@ -376,13 +381,20 @@ class AsyncTrainer:
             dropped += len(exhausted)
 
     def assemble(self) -> list[SubmittedGroup]:
-        """``batch_groups`` groups in arrival order; waits until the batch is full."""
+        """``batch_groups`` groups in arrival order; waits until the batch is full, judging queued audits meanwhile."""
         taken: list[SubmittedGroup] = []
         while True:
             taken += self.buffer.take(self.config.batch_groups - len(taken))
             if len(taken) >= self.config.batch_groups:
                 return taken
-            self._sleep(self.config.poll_s)
+            if not self.run_audits():
+                self._sleep(self.config.poll_s)
+
+    def run_audits(self) -> int:
+        """One round of out-of-zone audits on the current weights (none without ``audits``)."""
+        if self.audits is None:
+            return 0
+        return self.audits.run(self.model, limit=self.config.audits_per_step, budget_s=self.config.audit_budget_s)
 
     # --- step ----------------------------------------------------------------------------------------------
     def run_once(self) -> str:
@@ -391,6 +403,7 @@ class AsyncTrainer:
         self.buffer.requeue()           # between steps the trainer holds nothing: a take whose answer was lost
         dropped = self.drop_stale()
         exhausted = self.drop_exhausted()
+        self.run_audits()                       # bounded: audits progress even when batches are always full
         submitted = self.assemble()
         started = self._clock()
         _reset_peak_memory()
@@ -445,7 +458,8 @@ class AsyncTrainer:
         completion = sum(len(c) for g in submitted for c in g.completions)
         worked = self._clock() - started
         self.last_step = {"result": "trained", "step": self.steps, "checkpoint": self.version, **gate.metrics()}
-        telemetry.flush({**gate.metrics(), **timings, **self.last_publication,
+        audit_metrics = self.audits.metrics() if self.audits is not None else {}
+        telemetry.flush({**gate.metrics(), **timings, **self.last_publication, **audit_metrics,
                          "async/wait_s": started - began, "async/train_s": trained - started,
                          "async/step_s": worked, "async/completion_tokens": completion,
                          "async/completion_tokens_per_s": completion / worked if worked > 0 else 0.0,

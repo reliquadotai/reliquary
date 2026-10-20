@@ -561,6 +561,12 @@ class RlSubmissions:
             logger.info("dropped %d audits queued past %d checkpoints", len(stale), self.config.audit_max_lag)
         return len(stale)
 
+    def take_audits(self, limit: int) -> list[SubmittedGroup]:
+        """The trainer's side of the audits (``trainer.audits``): stale ones dropped, then up to ``limit`` queued
+        audits (``audit_jobs``' order); each comes back through ``report_audit``."""
+        self.drop_stale_audits()
+        return self.audit_jobs(limit)
+
     def run_audits(self, forward: ProofForward, limit: int, *, max_attempts: int = AUDIT_MAX_ATTEMPTS) -> int:
         """Drain up to ``limit`` queued audits through ``forward`` (the proof forward, the Gumbel verifier).
         A forward that raises leaves its audit queued and the others still run; after ``max_attempts`` raising
