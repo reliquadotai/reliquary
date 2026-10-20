@@ -123,6 +123,24 @@ at 64k it is a much cleaner failure. Proposed for the run: math cap 64k, a cut s
 masking), soft overlong zone 0.1 over the last 4,096 tokens, cut share watched and the cap raised again if it stays
 high. To check in the rehearsal: 64k sequences in the FSDP2 trainer.
 
+## Rehearsal plan (8 GPUs, 2026-10-21)
+
+Teutonic SFT starting model (teutonic-i-sft-full-v2), trainer FSDP2 on 4 GPUs, validator + audits on 1, two or three
+miners (single-turn and episodes), the gVisor sandbox host.
+
+| # | Check | Why |
+|---|---|---|
+| 1 | Math at the 64k cap: trainer memory and step time | never run |
+| 2 | An adversarial miner that replaces end picks: its groups unpaid, honest groups paid | the skipped-end rule |
+| 3 | Cut rollouts score 0 and their groups train: in-zone share, length trend | the cut rule |
+| 4 | Cooldown (shortened): prompts coming back, leasable pool per env | prompt rotation |
+| 5 | Real lag; gap and match floors on the 9B | validated on the 2B only |
+| 6 | Audit capacity against the out-of-zone volume (every miner starts in probation) | audit backlog |
+| 7 | An 18 GB checkpoint published and swapped in by the miners (single-turn and episodes) | swap on the 9B |
+| 8 | SWE and TMax episode throughput; sandbox sessions needed | prod sizing |
+| 9 | Kill and resume the validator, the trainer and a miner | robustness |
+| 10 | Pay, prices and quota over time, including a miner joining late | economics |
+
 ## Must test in the rehearsal (2026-10-20)
 
 - A rollout that goes on where the draw ended it (an EOS pick, any gap) is re-graded ended at that pick; a reward
