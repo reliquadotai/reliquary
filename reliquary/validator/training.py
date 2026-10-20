@@ -25,7 +25,7 @@ import torch.utils.checkpoint
 
 from reliquary.validator import telemetry
 from reliquary.constants import (
-    GRAD_CLIP_NORM, GRAD_NORM_SKIP_THRESHOLD, KL_BETA, LEARNING_RATE,
+    ADAM_BETA2, GRAD_CLIP_NORM, GRAD_NORM_SKIP_THRESHOLD, KL_BETA, LEARNING_RATE,
     LR_WARMUP_WINDOWS,
     MICROBATCH_MAX_PADDED_TOKENS, PPO_CLIP_EPSILON_HIGH, PPO_CLIP_EPSILON_LOW,
     PPO_DUAL_CLIP_C,
@@ -229,7 +229,7 @@ def _build_optimizer(params) -> torch.optim.Optimizer:
             return cls(
                 params,
                 lr=LEARNING_RATE,
-                betas=(0.9, 0.999),
+                betas=(0.9, ADAM_BETA2),
                 eps=1e-8,
                 weight_decay=0.01,
             )
@@ -241,7 +241,7 @@ def _build_optimizer(params) -> torch.optim.Optimizer:
     return torch.optim.AdamW(
         params,
         lr=LEARNING_RATE,
-        betas=(0.9, 0.999),
+        betas=(0.9, ADAM_BETA2),
         eps=1e-8,
         weight_decay=0.01,
     )
@@ -342,7 +342,7 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
         # FSDP2 shards are fp32 masters already; bitsandbytes cannot step
         # sharded tensors.
         _optimizer = torch.optim.AdamW(
-            params, lr=LEARNING_RATE, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01,
+            params, lr=LEARNING_RATE, betas=(0.9, ADAM_BETA2), eps=1e-8, weight_decay=0.01,
         )
     elif _use_master_weights(params):
         _optimizer = _MasterWeightOptimizer(params, _build_optimizer)
@@ -1822,10 +1822,11 @@ def _record_kl_stats(
                 )
 
 
-def _record_draw_stats(stats, draw_rows: _DrawRows, keep_seg: list[int], rollouts) -> None:
+def _record_draw_stats(stats, draw_rows: _DrawRows, keep_seg: list[int], rollouts, floor: float | None = None) -> None:
     """Accumulate the forced-draw counters over the trained (kept) rows, and leave each
     rollout its ``_training_draw_counts = (n_stochastic, n_match)``: the verifier's per-rollout
-    statistic, from the training forward (design 4.7, proposed; acceptance does not read it)."""
+    statistic, from the training forward (design 4.7, proposed; acceptance does not read it). ``floor``: the rollout
+    floor the below-floor count reads (the async gate's; default the window path's forced-seed floor)."""
     if stats is None or "draw_token_count" not in stats:
         return
     from reliquary.constants import FORCED_SEED_ROLLOUT_FLOOR, FORCED_SEED_ROLLOUT_MIN_STOCH
@@ -1852,7 +1853,8 @@ def _record_draw_stats(stats, draw_rows: _DrawRows, keep_seg: list[int], rollout
         if n_stoch >= FORCED_SEED_ROLLOUT_MIN_STOCH:
             rate = n_match / n_stoch
             stats["draw_rollout_count"] += 1
-            stats["draw_rollout_below_floor_count"] += int(rate < FORCED_SEED_ROLLOUT_FLOOR)
+            stats["draw_rollout_below_floor_count"] += int(rate < (FORCED_SEED_ROLLOUT_FLOOR if floor is None
+                                                                   else floor))
             stats["draw_rollout_mismatch_max"] = max(float(stats["draw_rollout_mismatch_max"]), 1.0 - rate)
 
 
@@ -2238,7 +2240,7 @@ def _gate_rows(gate, kl_stats, batch, new_lp, ref_lp, claimed_old, behavior_old,
     if draw_rows is None:
         raise RuntimeError("the async trainer's gate needs the substitution loss")
     rollouts = [item[9] if len(item) > 9 else None for item in batch]
-    _record_draw_stats(kl_stats, draw_rows, keep_seg, rollouts)
+    _record_draw_stats(kl_stats, draw_rows, keep_seg, rollouts, getattr(gate, "rollout_floor", None))
     admitted = gate.admit(rollouts, _rollout_draw_tallies(draw_rows, keep_seg), suspects)
     old_cat = new_lp.detach()
     if admitted is None or all(admitted):
