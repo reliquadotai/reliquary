@@ -27,10 +27,13 @@ A stale machine directory raises ``GraderInfrastructureError`` (retry later, the
 from __future__ import annotations
 
 import functools
+import logging
 from collections.abc import Callable, Collection, Sequence
 from typing import Any
 
 from reliquary.environment.grader_client import GraderInfrastructureError
+
+logger = logging.getLogger(__name__)
 
 
 class LeaseEpisodeChecker:
@@ -75,6 +78,14 @@ class LeaseEpisodeChecker:
 
     def grade(self, lease, rollouts: Sequence[Any], *, received: float):
         """``rl_submit.Graded`` of a lease's episodes (``Rollout`` with ``episode``)."""
+        graded = self._grade(lease, rollouts, received=received)
+        variant = self.lease_variant(lease)
+        if variant or getattr(graded, "reject", None):
+            logger.info("episode lease %s (%s, surface variant %d): %s", lease.lease_id[:12], self.policy.environment,
+                        variant, f"rejected {graded.reject}" if getattr(graded, "reject", None) else "admitted")
+        return graded
+
+    def _grade(self, lease, rollouts: Sequence[Any], *, received: float):
         from reliquary_sandbox.attest import Expected
 
         from reliquary.protocol.rl_draw import lease_checkpoint_tag

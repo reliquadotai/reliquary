@@ -135,6 +135,8 @@ class EpisodeLeaseGenerator:
         runner = self._factory(policy, lease, prompt) if variant == 0 else self._factory(policy, lease, prompt,
                                                                                          variant=variant)
         label = f"lease {lease.lease_id[:12]}"
+        if variant:
+            logger.info("%s plays surface variant %d of %s", label, variant, lease.environment)
 
         async def one(index: int):
             binding = LeaseDrawBinding(lease.nonce, int(lease.prompt_idx), int(lease.checkpoint), index)
