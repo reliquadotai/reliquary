@@ -239,7 +239,7 @@ def test_one_step_reports_every_group_and_publishes_the_next_checkpoint():
     assert buffer.depth() == {}
 
 
-def test_publication_every_n_steps_and_hf_backup_every_m(monkeypatch):
+def test_publication_every_step_and_hf_backup_every_m(monkeypatch):
     model, book = _Model(), Book(latest=None)
     buffer = TrainingBuffer(book)
     backups = []
@@ -252,14 +252,14 @@ def test_publication_every_n_steps_and_hf_backup_every_m(monkeypatch):
         gate.judge([])
         return model
 
-    trainer, subs, publisher = loop(model, book, buffer, batch=1, steps_per_checkpoint=2, hf_backup_every=3)
+    trainer, subs, publisher = loop(model, book, buffer, batch=1, hf_backup_every=3)
     trainer._train_step, trainer.backup = fake_step, backup
     assert publisher.versions == [0] and book.adopted == [0]                       # fresh book: initial weights
     for step in range(6):
         buffer.push(submitted(model, f"g{step}", k=trainer.version, n=2))
         assert trainer.run_once() == "trained"
     trainer.close()
-    assert publisher.versions == [0, 1, 2, 3] and book.adopted == [0, 1, 2, 3]
+    assert publisher.versions == list(range(7)) and book.adopted == list(range(7))
     assert backups == [3, 6]
     assert all(r["accepted"] for r in subs.reports.values())
 
@@ -287,6 +287,62 @@ def test_a_skipped_step_pays_nothing_and_a_crash_requeues():
     assert buffer.depth() == {"math": 1} and publisher.versions == []
     assert trainer.version == 3
     trainer.close()
+
+
+def test_a_buffer_file_from_before_the_attempt_count_opens_and_serves():
+    model, book = _Model(), Book()
+    book.db.execute("CREATE TABLE rl_buffer(lease_id TEXT PRIMARY KEY, environment TEXT NOT NULL, k INTEGER NOT NULL, "
+                    "arrived_at REAL NOT NULL, hotkey TEXT NOT NULL, state TEXT NOT NULL, body BLOB NOT NULL)")
+    buffer = TrainingBuffer(book)
+    buffer.push(submitted(model, "g", n=2))
+    assert [g.lease_id for g in buffer.take(1)] == ["g"] and buffer.take_exhausted(1, 10) == []
+    buffer.release(["g"])
+    assert [g.lease_id for g in buffer.take_exhausted(1, 10)] == ["g"]
+
+
+def test_more_than_one_step_per_checkpoint_is_refused():
+    with pytest.raises(ValueError, match="steps_per_checkpoint must be 1"):
+        AsyncTrainerConfig(4, steps_per_checkpoint=2)
+
+
+def test_a_group_that_breaks_every_step_is_dropped_and_the_others_train():
+    """A step that raises reports nothing; its groups come back behind the fresh ones, one retried group per batch,
+    and a group handed out ``max_attempts`` times without a report leaves untrained: no crash loop."""
+    model, book = _Model(), Book()
+    buffer = TrainingBuffer(book)
+    fresh = iter(range(100))
+    clock = Clock(on_sleep=lambda: buffer.push(submitted(model, f"f{next(fresh)}", n=2, arrived=100.0)))
+    for i, lease in enumerate(["p", "a", "b", "c"]):
+        buffer.push(submitted(model, lease, n=2, arrived=float(i)))
+    subs, crashes = Subs(buffer), []
+    trainer = AsyncTrainer(model, config=AsyncTrainerConfig(2, max_attempts=3), buffer=buffer, submissions=subs,
+                           book=book, publisher=Publisher(), clock=clock, sleep=clock.sleep)
+
+    def step(model, batches, *, gate, **_):
+        groups = [g for b in batches for g in b]
+        if any(g.lease_id == "p" for g in groups):
+            crashes.append([g.lease_id for g in groups])
+            raise RuntimeError("CUDA out of memory")
+        for g in groups:
+            gate.admit(g.rollouts, [(30, 30, N_TOK, N_TOK)] * len(g.rollouts))
+        gate.judge([])
+        return model
+
+    trainer._train_step = step
+    for _ in range(20):
+        if "p" in subs.reports:
+            break
+        try:
+            trainer.run_once()
+        except RuntimeError:
+            pass
+    trainer.close()
+    assert len(crashes) == 3 and subs.reports["p"]["accepted"] is False
+    assert subs.reports["p"].get("failure_class") is None                    # unpaid, never sanctioned
+    assert crashes[0] == ["p", "a"]
+    assert all(len(batch) == 2 and batch[0] == "p" and batch[1].startswith("f") for batch in crashes[1:])
+    assert all(subs.reports[lease]["accepted"] for lease in ("a", "b", "c"))  # a shared one crash, then trained
+    assert trainer.last_step.get("async/exhausted_dropped", 0) in (0, 1)
 
 
 def test_a_take_whose_answer_was_lost_is_requeued_before_the_next_step():

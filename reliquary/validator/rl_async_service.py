@@ -289,6 +289,8 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
     route("POST", "take", lambda b: {"groups": [_pack(g) for g in rl.buffer.take(int(b["limit"]))]})
     route("POST", "take_older", lambda b: {"groups": [_pack(g) for g in rl.buffer.take_older(int(b["below_k"]),
                                                                                              int(b["limit"]))]})
+    route("POST", "take_exhausted", lambda b: {"groups": [_pack(g) for g in rl.buffer.take_exhausted(
+        int(b["max_attempts"]), int(b["limit"]))]})
     route("POST", "release", lambda b: rl.buffer.release([str(i) for i in b["lease_ids"]]) or {"ok": True})
     route("POST", "requeue", lambda b: {"requeued": rl.buffer.requeue()})
     route("GET", "depth", lambda b: {"depth": rl.buffer.depth()})
