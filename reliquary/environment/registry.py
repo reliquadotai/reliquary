@@ -763,8 +763,8 @@ _SPEC_VALUES = (
         attainable_rewards=(0.0, 1.0),
         contract_version="reliquary/boxed-answer/v1",
         environment_manifest_sha256=(
-            "317ca1d13802c653a7e57fb7214bb5e7"
-            "e780a97396b3f0e9d094e7ba3f42b478"
+            "cda025161a6c551abed72a96b7cbbefdac"
+            "5cf5eab217df37831d947b2e55a6df"
         ),
         external_distribution="reliquary-hard-math",
         external_artifact_resource="reliquary_hard_math/artifact.json",
