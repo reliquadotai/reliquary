@@ -245,17 +245,19 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
     payable before its step's checkpoint is published: pay is for trained work, and if the
     trainer dies in between the step's weights are lost but the miners did the work (deliberate).
 - **Loss details:** advantages as today (group-normalised, token-level normalisation,
-  degenerate groups dropped, soft overlong penalty, no KL). With one step per checkpoint the
-  PPO ratio is 1 and the clip is inert; with N > 1 steps per checkpoint the ratio is taken
-  against the published checkpoint, which the validator knows exactly.
+  degenerate groups dropped, soft overlong penalty, no KL). One step per checkpoint, always:
+  pi_old is the policy itself, so the PPO ratio is 1 and the clip is inert. A second step before
+  publishing would train with no clip and verify miners against weights they never saw; the
+  trainer refuses it (`steps_per_checkpoint` must be 1).
 - Loss switchable by config (substitution / current) as a guard.
 
 ### 4.8 Checkpoint publication
 
 - **Cadence** (PROPOSED, PENDING measurement): one checkpoint per optimizer step, shipped as
   a lossless sparse delta (new bf16 values at the changed positions) plus the SHA-256 of the
-  rebuilt checkpoint. A full anchor every N steps (e.g. 50). Fallback: 2-4 steps per
-  checkpoint if deltas are too large or miners cannot keep up.
+  rebuilt checkpoint. A full anchor every N steps (e.g. 50). If deltas are too large or miners
+  cannot keep up, the lever is a larger batch per step, never several steps per checkpoint
+  (see 4.7).
 - **Lagging miners:** a cumulative delta from their version to the latest (up to a size cap), else the
   latest anchor plus deltas. A hash mismatch means re-download the anchor. Pruned objects leave
   the index first and the bucket one presigned-URL lifetime (15 min) later.
@@ -346,8 +348,8 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
 
 ## 6. Open decisions
 
-1. Checkpoint cadence: 1 step per checkpoint with deltas vs 2-4 steps (after the delta
-   measurement).
+1. Checkpoint cadence: DECIDED, one step per checkpoint (several would need a ratio against the
+   published checkpoint, which the trainer does not compute); a larger batch is the lever.
 2. Training forward as verification (4.7): confirm after measuring trainer-forward picks
    against the proof path.
 3. Floor value with fp32 heads (qualification).

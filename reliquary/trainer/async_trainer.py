@@ -13,14 +13,17 @@ Next to the window trainer (``worker.py`` / ``train_runner.py``, unchanged), one
    ``rollout_floor`` leave the loss before the backward. Once every micro-batch ran, ``DrawGate.judge`` pools each
    group's tallies (§4.6: one bad rollout does not kill its group); a group under ``group_floor`` is rejected and
    its admitted rollouts are backed out by a second pass with negated advantages before the optimizer step (only
-   failed groups pay it, honest groups never do). pi_old is the policy itself: ratio 1, exact with one step per
-   checkpoint (with ``steps_per_checkpoint > 1`` the forward verifies against the trainer's in-between weights, a
-   documented approximation of "the published checkpoint").
+   failed groups pay it, honest groups never do). pi_old is the policy itself: ratio 1, exact because every step is
+   published as a checkpoint (``steps_per_checkpoint`` must be 1: a second step would train with no clip and verify
+   miners against weights never published).
 3. **After the step.** ``report_training`` for every group (accepted with per-rollout match and matched tokens;
-   rejected, unpaid and unsanctioned: honest drift fails groups too), a checkpoint every ``steps_per_checkpoint``
-   steps: a CPU snapshot on the step path, then ``DeltaPublisher.publish`` and ``LeaseBook.adopt_checkpoint`` in a
+   rejected, unpaid and unsanctioned: honest drift fails groups too), a checkpoint every step: a CPU snapshot on the step path, then ``DeltaPublisher.publish`` and ``LeaseBook.adopt_checkpoint`` in a
    publish thread (one in flight: the next publication waits for it, and its error stops the loop), a Hugging Face
    backup every ``hf_backup_every`` steps (``BackgroundHfBackup``, never blocking).
+
+A step that raises (e.g. out of GPU memory) reports nothing: its groups go back to the buffer, behind the fresh ones
+and one per batch, and a group handed out ``max_attempts`` times without a report is reported untrained (unpaid,
+unsanctioned), so one group that breaks every step cannot stall training.
 
 Groups are reported (an accepted one becomes payable) before their step's checkpoint is published: pay is for
 work trained into the weights the step computed. If the process dies between the report and the publication,
@@ -254,7 +257,7 @@ def save_snapshot(snapshot: Mapping[str, Any], folder: Path) -> None:
 @dataclass(frozen=True)
 class AsyncTrainerConfig:
     batch_groups: int                        # groups per optimizer step
-    steps_per_checkpoint: int = 1            # N: publish + adopt every N steps (design §4.8: 1)
+    steps_per_checkpoint: int = 1            # publish + adopt every step: the only safe value (pi_old = the policy)
     hf_backup_every: int | None = None       # M: full HF backup every M steps (None: off)
     rollout_floor: float = ASYNC_ROLLOUT_FLOOR
     group_floor: float = ASYNC_GROUP_FLOOR
@@ -264,11 +267,16 @@ class AsyncTrainerConfig:
     terminal_gap: float = RL_TERMINAL_GAP           # the final EOS's gap
     eos_ids: tuple[int, ...] = ()                   # the model's stop tokens (the termination test's subject)
     max_lag: int = SECRET_REVEAL_LAG         # no quality cap (the floor decides); bounds the buffer only
+    max_attempts: int = 3                    # hand-outs of a group without a report before it is dropped untrained
     poll_s: float = 0.5                      # while the batch is not full
 
     def __post_init__(self) -> None:
-        if self.batch_groups < 1 or self.steps_per_checkpoint < 1 or (self.hf_backup_every or 1) < 1:
-            raise ValueError("batch_groups, steps_per_checkpoint and hf_backup_every must be positive")
+        if self.batch_groups < 1 or (self.hf_backup_every or 1) < 1 or self.max_attempts < 1:
+            raise ValueError("batch_groups, hf_backup_every and max_attempts must be positive")
+        if self.steps_per_checkpoint != 1:
+            # pi_old is the policy under the gate: a second step before publishing trains with ratio 1 (no clip,
+            # no dual clip, no drift breaker) and verifies miners against weights they never saw.
+            raise ValueError("the async trainer publishes every step: steps_per_checkpoint must be 1")
         if not all(0 <= f <= 1 for f in (self.rollout_floor, self.group_floor, self.forgery_floor)) or self.max_lag < 0:
             raise ValueError("floors in [0, 1], max_lag >= 0")
 
@@ -352,6 +360,21 @@ class AsyncTrainer:
             self._report_untrained(stale)
             dropped += len(stale)
 
+    def drop_exhausted(self) -> int:
+        """Groups handed out ``max_attempts`` times without a report (their steps raised): reported untrained."""
+        take = getattr(self.buffer, "take_exhausted", None)
+        if take is None:
+            return 0
+        dropped = 0
+        while True:
+            exhausted = take(self.config.max_attempts, 256)
+            if not exhausted:
+                return dropped
+            logger.error("%d groups dropped untrained after %d failed steps: %s", len(exhausted),
+                         self.config.max_attempts, ", ".join(g.lease_id[:12] for g in exhausted))
+            self._report_untrained(exhausted)
+            dropped += len(exhausted)
+
     def assemble(self) -> list[SubmittedGroup]:
         """``batch_groups`` groups in arrival order; waits until the batch is full."""
         taken: list[SubmittedGroup] = []
@@ -367,6 +390,7 @@ class AsyncTrainer:
         telemetry.hold()                # train_step's row and this step's timings go to wandb as one row
         self.buffer.requeue()           # between steps the trainer holds nothing: a take whose answer was lost
         dropped = self.drop_stale()
+        exhausted = self.drop_exhausted()
         submitted = self.assemble()
         started = self._clock()
         _reset_peak_memory()
@@ -382,6 +406,7 @@ class AsyncTrainer:
         for group in submitted:
             envs[group.environment] = envs.get(group.environment, 0) + 1
         gate.extra = {"async/checkpoint": self.version, "async/stale_dropped": dropped,
+                      "async/exhausted_dropped": exhausted,
                       "async/lag_mean": sum(self.version - g.checkpoint for g in submitted) / len(submitted),
                       **{f"async/batch_groups/{env}": n for env, n in envs.items()}}
         try:
@@ -395,6 +420,8 @@ class AsyncTrainer:
             self.last_step = {"result": "skipped", "reason": exc.reason, **gate.metrics()}
             return "skipped"
         except BaseException:
+            # Nothing reported: the groups go back (each hand-out counted), behind the fresh ones and one per batch.
+            logger.exception("async train step raised; %d groups back to the buffer", len(submitted))
             self.buffer.release([g.lease_id for g in submitted])
             raise
         trained = self._clock()

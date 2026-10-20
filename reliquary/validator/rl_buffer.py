@@ -7,6 +7,10 @@ env: highest k, then latest arrival), runs its forward against the published che
 lease ``nonce``), and reports each group back through ``RlSubmissions.report_training`` (which removes it). Groups
 taken but never reported (a trainer restart) go back to the queue when the buffer is opened again, or by
 ``release``. Env mix, max-lag drop and batch assembly are P4's.
+
+Each hand-out counts (``attempts``): a group taken again after a step that never reported it (the step raised, the
+trainer died) goes after the fresh ones, at most one such group per take, so a group that breaks every step it is
+in cannot stall the queue; past the trainer's limit it leaves through ``take_exhausted`` (reported untrained).
 """
 from __future__ import annotations
 
@@ -20,7 +24,8 @@ MAX_POLL_GAP_S = 30.0       # a wait counts between two of the trainer's takes a
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS rl_buffer(lease_id TEXT PRIMARY KEY, environment TEXT NOT NULL, k INTEGER NOT NULL,
-    arrived_at REAL NOT NULL, hotkey TEXT NOT NULL, state TEXT NOT NULL, body BLOB NOT NULL);
+    arrived_at REAL NOT NULL, hotkey TEXT NOT NULL, state TEXT NOT NULL, body BLOB NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS rl_buffer_fresh ON rl_buffer(state, environment, k, arrived_at);
 """
 
@@ -93,6 +98,8 @@ class TrainingBuffer:
         self._waiting_since: float | None = None             # the trainer's last take came back short
         with book.lock:
             book.db.executescript(_SCHEMA)
+            if "attempts" not in {row[1] for row in book.db.execute("PRAGMA table_info(rl_buffer)")}:
+                book.db.execute("ALTER TABLE rl_buffer ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")   # an older file
             book.db.commit()
         self.requeue()                                        # a trainer that died holding groups: give them back
 
@@ -122,13 +129,21 @@ class TrainingBuffer:
         return tick
 
     def take(self, limit: int) -> list[SubmittedGroup]:
-        """Up to ``limit`` queued groups of any env, in arrival order; they stay buffered (``taken``) until reported
-        or released. The trainer asks for what its batch still lacks: a short answer means it waits for groups."""
+        """Up to ``limit`` queued groups of any env, in arrival order, groups already handed out after the fresh ones
+        and only while no other such group is taken (one per batch: the trainer holds one batch at a time); they stay
+        buffered (``taken``) until reported or released. The trainer asks for what its batch still lacks: a short
+        answer means it waits for groups."""
         now = float(self.clock())
         with self.book.transaction():
-            rows = self.book.db.execute("SELECT lease_id, body FROM rl_buffer WHERE state=? "
-                                        "ORDER BY arrived_at, lease_id LIMIT ?", (QUEUED, int(limit))).fetchall()
-            self.book.db.executemany("UPDATE rl_buffer SET state=? WHERE lease_id=?",
+            fresh = self.book.db.execute("SELECT lease_id, body FROM rl_buffer WHERE state=? AND attempts=0 "
+                                         "ORDER BY arrived_at, lease_id LIMIT ?", (QUEUED, int(limit))).fetchall()
+            held = self.book.db.execute("SELECT 1 FROM rl_buffer WHERE state=? AND attempts>1 LIMIT 1",
+                                        (TAKEN,)).fetchone()
+            retried = [] if len(fresh) >= limit or held else self.book.db.execute(
+                "SELECT lease_id, body FROM rl_buffer WHERE state=? AND attempts>0 ORDER BY attempts, arrived_at, "
+                "lease_id LIMIT 1", (QUEUED,)).fetchall()
+            rows = fresh + retried
+            self.book.db.executemany("UPDATE rl_buffer SET state=?, attempts=attempts+1 WHERE lease_id=?",
                                      [(TAKEN, lease_id) for lease_id, _ in rows])
             if self._waiting_since is not None:
                 self._starved_s += min(now - self._waiting_since, MAX_POLL_GAP_S)
@@ -144,6 +159,16 @@ class TrainingBuffer:
         with self.book.transaction():
             rows = self.book.db.execute("SELECT lease_id, body FROM rl_buffer WHERE state=? AND k<? LIMIT ?",
                                         (QUEUED, int(below_k), int(limit))).fetchall()
+            self.book.db.executemany("UPDATE rl_buffer SET state=? WHERE lease_id=?",
+                                     [(TAKEN, lease_id) for lease_id, _ in rows])
+        return [SubmittedGroup.unpack(body) for _, body in rows]
+
+    def take_exhausted(self, max_attempts: int, limit: int) -> list[SubmittedGroup]:
+        """Up to ``limit`` queued groups already handed out ``max_attempts`` times without a report: the trainer
+        reports them untrained (unpaid, no sanction) instead of trying them again."""
+        with self.book.transaction():
+            rows = self.book.db.execute("SELECT lease_id, body FROM rl_buffer WHERE state=? AND attempts>=? LIMIT ?",
+                                        (QUEUED, int(max_attempts), int(limit))).fetchall()
             self.book.db.executemany("UPDATE rl_buffer SET state=? WHERE lease_id=?",
                                      [(TAKEN, lease_id) for lease_id, _ in rows])
         return [SubmittedGroup.unpack(body) for _, body in rows]

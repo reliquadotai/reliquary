@@ -1826,7 +1826,13 @@ MICROBATCH_MAX_PADDED_TOKENS = 32768
 # After it the schedule is FLAT, per DAPO §4.1 (AdamW, constant LR + linear
 # warmup). The 10k-window cosine that used to follow reached factor 0.49 in
 # 5.5 days at the live cadence — a run decaying to a halt nobody had chosen.
-LR_WARMUP_WINDOWS = 10
+LR_WARMUP_WINDOWS = int(_os.environ.get("RELIQUARY_LR_WARMUP_STEPS", "10"))
+if LR_WARMUP_WINDOWS < 1:
+    raise ValueError("RELIQUARY_LR_WARMUP_STEPS must be at least 1")
+# AdamW's second-moment decay (every optimizer the trainer builds). A run of a few hundred steps may want 0.99.
+ADAM_BETA2 = float(_os.environ.get("RELIQUARY_ADAM_BETA2", "0.999"))
+if not _math.isfinite(ADAM_BETA2) or not 0.0 < ADAM_BETA2 < 1.0:
+    raise ValueError("RELIQUARY_ADAM_BETA2 must be in (0, 1)")
 
 # Short LR re-ramp applied after a process restart WITHIN the same training
 # run: the schedule position is reconstructed from the published checkpoint

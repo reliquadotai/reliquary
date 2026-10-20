@@ -99,6 +99,10 @@ class TrainerLink:
     def take_older(self, below_k: int, limit: int) -> list[SubmittedGroup]:
         return self._groups(self._call("POST", "take_older", {"below_k": int(below_k), "limit": int(limit)}))
 
+    def take_exhausted(self, max_attempts: int, limit: int) -> list[SubmittedGroup]:
+        return self._groups(self._call("POST", "take_exhausted", {"max_attempts": int(max_attempts),
+                                                                  "limit": int(limit)}))
+
     def release(self, lease_ids) -> None:
         self._call("POST", "release", {"lease_ids": [str(i) for i in lease_ids]})
 
