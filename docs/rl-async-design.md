@@ -31,7 +31,7 @@ Tags: **DECIDED** (user agreed), **PROPOSED** (recommended, awaiting the user),
    are graded, stored, audited by sampling, and paid 25 % of an in-zone group on a prompt's
    first scan.
 7. **Prompt lifecycle** (DECIDED): never scanned = leasable; in zone = trained, then cooldown;
-   too easy = blacklisted for the run; too hard (e.g. 0/16) = cooldown, then leasable again.
+   too easy twice = blacklisted for the run (once: cooldown); too hard (e.g. 0/16) = cooldown, then leasable again.
    All of it readable by miners.
 8. **Loss: substitution** (DECIDED). At each completion position the trainer scores the
    validator's pick v* (the miner's token where they agree). Drift is exactly zero for any
@@ -166,8 +166,12 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
 
 - **Never scanned:** leasable by anyone.
 - **In zone:** trained and paid in full; the prompt enters the training cooldown, counted
-  in checkpoints.
-- **Out of zone, too easy:** blacklisted for the rest of the run, never leased again.
+  in checkpoints. The cooldown is sized from the run (`rl_cooldown.AdaptiveCooldown`): per env
+  `N x p / Q x margin` (N the env's prompts, p the in-zone share of its recent first scans, Q its
+  in-zone groups per checkpoint, margin 0.5), bounded to [20, 1000] checkpoints, 100 until measured;
+  `params.rl_cooldown_k` fixes an env's value.
+- **Out of zone, too easy:** a first too-easy scan cools the prompt down like the others; a second one blacklists
+  it for the rest of the run (one group is not proof enough to retire a prompt for good).
 - **Out of zone, too hard** (e.g. 0/16): same cooldown as in-zone prompts, then leasable again.
 - Binary rewards: out of zone means 16/16 (blacklist) or 0/16 (cooldown). Continuous rewards
   with too little variance: mean >= 0.5 blacklist, else cooldown. Groups out of zone for

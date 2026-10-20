@@ -134,6 +134,7 @@ class RlAsyncSettings:
     price: Any = None                           # AsyncPriceParams (None: the defaults)
     max_pending_groups: int = DEFAULT_MAX_PENDING_GROUPS
     episodes: Mapping[str, Any] = field(default_factory=dict)   # env -> its validated episode block (§4.10)
+    cooldown_k: Mapping[str, int] = field(default_factory=dict)  # env -> operator's fixed cooldown (rl_cooldown)
 
     def episode_policies(self) -> dict:
         from reliquary.validator.rl_async_episodes import episode_policies
@@ -175,12 +176,18 @@ def rl_async_settings(entry, cap: float, *, run: str | None = None,
     if unknown:
         raise ValueError(f"lease expiry overrides for envs outside the env_split: {unknown}")
     expiry.update(overrides)
+    from reliquary.validator.rl_cooldown import cooldown_overrides
+
+    cooldowns = cooldown_overrides(params)
+    unknown = sorted(set(cooldowns) - set(targets))
+    if unknown:
+        raise ValueError(f"cooldown overrides for envs outside the env_split: {unknown}")
     price = AsyncPriceParams(**{key: cast(params[name]) for key, name, cast in (
         ("tick_s", PRICE_TICK_PARAM, float),) if name in params})
     return RlAsyncSettings(task_id=str(entry.task_id), cap=float(cap),
                            run=run or os.environ.get(RUN_ENV) or str(entry.task_id), targets=targets,
                            planned_tokens_per_period=float(params[PLANNED_TOKENS_PARAM]), lease_expiry_s=expiry,
-                           price=price, episodes=blocks,
+                           price=price, episodes=blocks, cooldown_k=cooldowns,
                            max_pending_groups=int(params.get(PENDING_PARAM, DEFAULT_MAX_PENDING_GROUPS)))
 
 
@@ -209,12 +216,15 @@ def build_rl_async(settings: RlAsyncSettings, *, path: str | os.PathLike[str], g
     from reliquary.validator.rl_leases import LeaseBook, LeaseBookConfig, LeaseCollector
     from reliquary.validator.rl_ledger import LedgerConfig, RlPayLedger
     from reliquary.validator.rl_price import AsyncPriceController, AsyncPriceParams
+    from reliquary.validator.rl_cooldown import AdaptiveCooldown
     from reliquary.validator.rl_submit import RlSubmissions
 
+    cooldown = AdaptiveCooldown(prompt_range=prompt_range, overrides=settings.cooldown_k)
     book = LeaseBook(path, LeaseBookConfig(expiry_s=dict(settings.lease_expiry_s),
                                            prompt_range=None if prompt_range is None else dict(prompt_range),
-                                           max_pending_groups=settings.max_pending_groups),
+                                           max_pending_groups=settings.max_pending_groups, cooldown_of=cooldown),
                      quota=QuotaController(), clock=clock)
+    cooldown.attach(book)
     try:
         collector = (LeaseCollector(book) if collector_interval_s is None
                      else LeaseCollector(book, interval_s=collector_interval_s))

@@ -167,12 +167,13 @@ def test_the_prompt_state_route_serves_the_lifecycle_from_a_cursor(served):
     client = client_for(served)
     assert client.post("/rl/lease", json=body(prompts=(3,))).status_code == 200
     served.record_outcome(ENV, 1, 0, [1.0] * 16, "too_easy")
+    served.record_outcome(ENV, 1, 0, [1.0] * 16, "too_easy")                 # too easy twice: blacklisted
     served.record_outcome(ENV, 2, 0, [1.0] + [0.0] * 15, "in_zone")
     answer = client.get("/rl/prompts/state")
     assert answer.status_code == 200 and answer.headers["cache-control"] == "no-store"
     content = answer.json()
     assert [(p["prompt_idx"], p["state"]) for p in content["prompts"]] == [(1, "blacklisted"), (2, "cooldown")]
-    assert [s["verdict"] for s in content["scans"]] == ["too_easy", "in_zone"] and content["latest"] == 0
+    assert [s["verdict"] for s in content["scans"]] == ["too_easy", "too_easy", "in_zone"] and content["latest"] == 0
     assert MINER.ss58_address not in answer.text
     later = client.get("/rl/prompts/state", params={"since": content["cursor"]}).json()
     assert later["scans"] == [] and later["prompts"] == [] and later["cursor"] == content["cursor"]
