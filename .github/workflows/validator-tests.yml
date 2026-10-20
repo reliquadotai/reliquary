@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: validator-tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   cpu-tests:
     runs-on: ubuntu-24.04
@@ -50,30 +54,53 @@ jobs:
 
   signed-sandbox-cpu:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
+      OMP_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
       SIGNED_SANDBOX_MODULES: >-
-        test_signed_parse test_signed_state test_signed_intake test_signed_miner
-        test_signed_grading_and_wiring test_signed_episode_e2e
-        test_sandbox_sessions test_sandbox_fleet test_sandbox_routes test_sandbox_dependency
-        test_rl_episode_e2e test_rl_episode_wiring
+        test_agentic_swe_signed test_bridged_episode test_bridged_swe
+        test_corpus_export_signed test_corpus_job_signed_sandbox test_corpus_multi_job_contract
+        test_corpus_period_settlement test_corpus_quota test_corpus_settlement
+        test_rl_capacity test_rl_capacity_attacks test_rl_check_cap
+        test_rl_engagements test_rl_episode_e2e test_rl_episode_miner_side
+        test_rl_episode_routes test_rl_episode_wiring test_rl_options_and_boot
+        test_rl_pay test_rl_prompt_ranges test_rl_quota
+        test_rl_quota_wiring test_rl_saturation test_rl_session_events
+        test_rl_yield test_rl_yield_wiring test_sandbox_dependency
+        test_sandbox_directory test_sandbox_fleet test_sandbox_routes
+        test_sandbox_sessions test_signed_episode_e2e test_signed_episode_environment
+        test_signed_grading_and_wiring test_signed_intake test_signed_miner
+        test_signed_parse test_signed_state test_signed_wire
+        test_tasks_create_composed
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.12.15"
           cache: pip
       - name: Install pinned sandbox test runtime
         run: |
           python -m pip install --upgrade pip
           python -m pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -e ".[dev,sandbox-test,sandbox-miner]"
-      - name: Require the signed sandbox dependencies
+      - name: Require the signed sandbox dependencies and exact source pin
         run: |
           python - <<'PY'
-          import reliquary_sandbox.attest
-          import reliquary_sandbox_service.episodes.testing
-          import reliquary_sandbox_verifiers.runner
+          import importlib
+          from reliquary.sandbox import SANDBOX_COMMIT, sandbox_commit_refusal
+          for module in (
+              "bittensor", "renderers", "verifiers.v1.clients.train",
+              "verifiers.v1.harnesses.bash.harness", "reliquary_sandbox.attest",
+              "reliquary_sandbox.observation", "reliquary_sandbox_verifiers.task",
+              "reliquary_sandbox_verifiers.runner",
+              "reliquary_sandbox_service.episodes.testing",
+              "reliquary_sandbox_service.episodes.state_archive",
+          ):
+              importlib.import_module(module)
+          refusal = sandbox_commit_refusal(SANDBOX_COMMIT)
+          assert refusal is None, refusal
+          print("Installed sandbox source:", SANDBOX_COMMIT)
           PY
       - name: Run signed sandbox CPU tests
         id: signed_tests
