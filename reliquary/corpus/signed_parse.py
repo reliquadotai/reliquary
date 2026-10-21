@@ -48,15 +48,15 @@ from reliquary.corpus.checks import REASON_BAD_TURNS
 from reliquary.corpus.replay_compare import Action
 from reliquary.corpus.signed_reasons import REASON_SANDBOX_CALL_MISMATCH
 from reliquary.corpus.trajectory_parse import (
-    REASON_BAD_OBSERVATION, REASON_BAD_STOP, STOPS, ParsedTrajectory, ParsedTurn,
-    TrajectoryRefused, TurnRenderer, check_span_structure,
+    REASON_BAD_OBSERVATION, REASON_BAD_STOP, STOP_FORMAT_ERROR, STOPS, ParsedTrajectory, ParsedTurn,
+    TrajectoryRefused, TurnRenderer, check_span_structure, turn_format_violation,
 )
 
 STOP_EPISODE_CLOSED = "episode_closed"
 """The bridge's stop when the gateway closed the episode mid-turn
 (`reliquary_sandbox_verifiers.task.SandboxEpisodeTask.episode_closed`). Signed episodes
 only: the replay parser's `STOPS` do not hold it."""
-SIGNED_STOPS = STOPS | {STOP_EPISODE_CLOSED}
+SIGNED_STOPS = STOPS | {STOP_EPISODE_CLOSED, STOP_FORMAT_ERROR}
 CLOSED_ON_A_CALL = frozenset({STATUS_EXPIRED, STATUS_BUDGET_EXHAUSTED})
 """The final statuses a gateway sends on a call (deadline, budget, transcript cap)."""
 _UNOBSERVED_LAST_TURN = ("context_length", "max_turns")
@@ -116,7 +116,8 @@ def parse_signed_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int]
     keep a turn exportable as a message: the closed final reasoning and the round trip
     of each span through the template. The calls still have to be their signed records
     and each segment the rendering of those records."""
-    if stop not in SIGNED_STOPS:
+    if stop not in SIGNED_STOPS or (stop == STOP_FORMAT_ERROR and canonical):
+        # A format_error stop is an async RL lease's only (never exported: canonical=False).
         raise TrajectoryRefused(REASON_BAD_STOP, {"stop": stop})
     if stop == STOP_EPISODE_CLOSED and final.status not in CLOSED_ON_A_CALL:
         raise TrajectoryRefused(REASON_BAD_STOP, {
@@ -153,6 +154,14 @@ def parse_signed_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int]
     for k, (start, end) in enumerate(spans):
         completion = list(tokens[start:end])
         last = k == len(spans) - 1
+        if last and stop == STOP_FORMAT_ERROR:
+            # The model's first malformed turn ends the episode: none of its calls was sent, it is not read.
+            if end != len(tokens):
+                raise TrajectoryRefused(REASON_BAD_TURNS, {"trailing_tokens": len(tokens) - end})
+            if turn_format_violation(renderer, completion) is None:
+                raise TrajectoryRefused(REASON_BAD_STOP, {"turn": k, "stop": stop, "why": "the last turn is well formed"})
+            turns.append(ParsedTurn((), ()))
+            continue
         if canonical and last and stop == "agent_completed" and renderer.reasoning_unclosed(
                 full[:offset + start], completion):
             raise TrajectoryRefused(REASON_BAD_STOP, {"turn": k, "why": "final reasoning is not closed"})

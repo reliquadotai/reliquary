@@ -13,7 +13,9 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 UNOBSERVED_STOPS = ("max_turns", "context_length")
-ADMITTED_STOPS = ("agent_completed", *UNOBSERVED_STOPS)
+FORMAT_ERROR = "format_error"
+"""An async RL lease's episode the model's first malformed turn ended (``trajectory_parse.STOP_FORMAT_ERROR``)."""
+ADMITTED_STOPS = ("agent_completed", *UNOBSERVED_STOPS, FORMAT_ERROR)
 
 
 class AdmittedStop(str):
@@ -57,7 +59,8 @@ def episode_stop(raw: Any, *, tokens: Sequence[int], spans: Sequence[tuple[int, 
       last turn cut at the per-turn cap elsewhere is admitted only as the ``max_turns``-th turn, or, for an async
       RL lease (``lease``), as ``context_length``.
     * Otherwise (a closed last turn) ``agent_completed`` and ``context_length`` (verifiers' overlong
-      NEXT prompt) are kept; the validator checks the rest (calls, closed reasoning, the overflow)."""
+      NEXT prompt) are kept; the validator checks the rest (calls, closed reasoning, the overflow).
+    * ``format_error`` (the harness ended the episode at the model's first malformed turn) is a lease's only."""
     stop = _mapped_stop(raw, tokens=tokens, spans=spans, max_turns=max_turns,
                         max_tokens_per_turn=max_tokens_per_turn, max_episode_tokens=max_episode_tokens,
                         stop_ids=stop_ids, lease=lease)
@@ -70,6 +73,9 @@ def _mapped_stop(raw, *, tokens, spans, max_turns, max_tokens_per_turn, max_epis
     start, end = spans[-1]
     if end != len(tokens) or end > max_episode_tokens:
         return None
+    if raw == FORMAT_ERROR:
+        # A lease's only: the malformed last turn ends how the model ended it (the validator checks it is malformed).
+        return raw if lease else None
     closed = tokens[end - 1] in stop_ids
     if not closed and end - start != min(max_tokens_per_turn, max_episode_tokens - start):
         return None

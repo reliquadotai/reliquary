@@ -37,6 +37,10 @@ the cancellation propagates; the gateway's own deadline closes the episode other
 API_KEY_VAR = "RELIQUARY_GENERATE_KEY"
 
 
+class _FormatError(Exception):
+    """The model's turn is malformed (`turn_format_violation`): the episode ends on it."""
+
+
 @dataclass(frozen=True)
 class HarnessEpisodeResult:
     """One episode's outcome. `final`, `state` and `transcript` are the gateway's; `trace`
@@ -59,7 +63,7 @@ class HarnessEpisodeRunner:
 
     def __init__(self, *, gateway_url: str, model: str, renderer_dir: str, generate_url: str,
                  sampling, max_tokens: int, max_turns: int, load_renderer=None, client=None,
-                 spec=None, variant: int = 0) -> None:
+                 spec=None, variant: int = 0, format_stop: bool = False) -> None:
         self._url = gateway_url
         self._model = model
         self._renderer_dir = renderer_dir
@@ -70,6 +74,9 @@ class HarnessEpisodeRunner:
         self._load_renderer = load_renderer
         # The harness spec (None: the compatibility one) and the surface variant played.
         self._spec, self._variant = spec, int(variant)
+        # An async RL lease's episode ends at the model's first malformed turn (`format_error`, scored 0) instead
+        # of going on to a trajectory the validator refuses (a corpus or window episode keeps going).
+        self._format_stop = bool(format_stop)
         self._client = client
         self._renderers: dict[tuple[str, ...], Any] = {}
         self._renderers_lock = asyncio.Lock()
@@ -109,6 +116,8 @@ class HarnessEpisodeRunner:
         for both the renderer's tool list and the router's refusals."""
         from reliquary_harness.engine import GenerateEngine
         from reliquary_harness.loop import play
+
+        from reliquary.corpus.trajectory_parse import STOP_FORMAT_ERROR, turn_format_violation
         from reliquary_sandbox.episode_client import EpisodeClient
         from reliquary_sandbox.observation import require_tools_version
         from reliquary_sandbox.tool_routing import ToolRouter
@@ -134,7 +143,10 @@ class HarnessEpisodeRunner:
                     on_trace(trace)
 
                 async def generate(prompt_ids, bridged_from):
-                    return await engine.turn(prompt_ids, session_id=trace.id, bridged_from=bridged_from)
+                    turn = await engine.turn(prompt_ids, session_id=trace.id, bridged_from=bridged_from)
+                    if self._format_stop and turn_format_violation(renderer, turn.completion_ids):
+                        raise _FormatError                     # logged by the engine: the episode's last turn
+                    return turn
 
                 async def answer(turn, calls, call_id):
                     # The gateway's rendering of the signed record, in the variant's observation format;
@@ -156,6 +168,8 @@ class HarnessEpisodeRunner:
                                          generate=generate, answer=answer,
                                          closed=lambda: router.final is not None)
                 trace.stop_condition = outcome.stop
+            except _FormatError:
+                trace.stop_condition = STOP_FORMAT_ERROR
             except TimeoutError:
                 error = "stopped before the episode's wall budget ran out"
             except Exception as failure:  # the episode is still finished below

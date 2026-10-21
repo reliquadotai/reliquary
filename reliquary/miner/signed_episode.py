@@ -390,6 +390,8 @@ class SignedSweEpisodeRunner:
 
     # A corpus episode submits its graded state as a text diff; an RL episode submits none.
     requires_text_state = True
+    # Whether an episode ends at the model's first malformed turn (`format_error`): an async RL lease's only.
+    format_stop = False
     # The named 503s that say the validator is serving, only busy (a subclass adds its routes' own).
     validator_throttles = VALIDATOR_THROTTLES
 
@@ -416,7 +418,8 @@ class SignedSweEpisodeRunner:
                                     sampling=self._sampling,
                                     max_tokens=self._job.episode.max_tokens_per_turn,
                                     max_turns=self._job.episode.max_turns,
-                                    spec=getattr(self, "_harness", None), variant=getattr(self, "_variant", 0))
+                                    spec=getattr(self, "_harness", None), variant=getattr(self, "_variant", 0),
+                                    format_stop=self.format_stop)
 
     async def _runner(self, url: str):
         async with self._runners_lock:

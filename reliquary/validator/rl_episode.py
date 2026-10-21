@@ -14,7 +14,9 @@ Leases, mandatory submission, quota and lifecycle apply unchanged: a lease of an
   check (the prompt is the validator's own render), all in the lease's surface variant
   (``agentic_swe.lease_variant``, drawn here from the lease's nonce: a miner that played another variant has
   other tokens, and is refused);
-* one session twice in the group is refused; the reward is the final record's (validator authoritative).
+* one session twice in the group is refused; the reward is the final record's (validator authoritative), 0 for an
+  episode the model's first malformed turn ended (``format_error``: the turn markup it wrote, or a turn with calls
+  ended on the end-of-text token), which stays in the group instead of refusing the lease.
 
 No TOPLOC proof per span (dropped with the windows): the episode's model tokens are verified like any rollout's,
 by the forced draw (audits and the trainer's forward) over the model positions, keyed per model-token position
@@ -154,7 +156,12 @@ class LeaseEpisodeChecker:
                 min_chunk_tokens=self.min_chunk_tokens, lease=True)
             if refusal is not None:
                 return Graded(prompt, reject=refusal.stage), refusal.detail
-        rewards = tuple(float(result.final.reward) for result in verified)
+        from reliquary.corpus.trajectory_parse import STOP_FORMAT_ERROR
+
+        # A format_error episode (the model's first malformed turn ended it) scores 0, whatever the box's grade: it
+        # stays in the group, so the lease and its other episodes count.
+        rewards = tuple(0.0 if rollout.episode["stop"] == STOP_FORMAT_ERROR else float(result.final.reward)
+                        for rollout, result in zip(rollouts, verified))
         return Graded(prompt, rewards, (False,) * len(rollouts), spans=tuple(r.spans for r in rollouts)), None
 
 

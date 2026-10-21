@@ -102,12 +102,42 @@ def check_span_tokens(tokens: Sequence[int], spans: Sequence[tuple[int, int]], *
         _check_span_tokens(tokens, k, start, end, stop_ids=stop_ids, markup_ids=markup_ids)
 
 
+STOP_FORMAT_ERROR = "format_error"
+"""An async RL lease's episode ended at the model's first malformed turn (``turn_format_violation``): that turn
+is the last, none of its calls was sent, and it scores 0. Never a corpus or window stop."""
+
+
+def turn_format_violation(renderer: TurnRenderer, completion_ids: Sequence[int]) -> str | None:
+    """Why one model turn is malformed, or None: turn markup or a stop id before its last token (the model
+    wrote its own observation or next turn), or a turn with calls that ended on a stop id other than the turn
+    terminator (the end-of-text token: the episode cannot go on after it). The miner ends a lease's episode at
+    the first such turn and the validator admits it there only if this says so: one definition for both."""
+    tokens = list(completion_ids)
+    if not tokens:
+        return None
+    for position, token in enumerate(tokens[:-1]):
+        if token in renderer.turn_markup_ids or token in renderer.stop_ids:
+            return "turn markup or stop inside the turn"
+    if tokens[-1] in renderer.turn_markup_ids:
+        return "turn markup ends the turn"
+    if tokens[-1] in renderer.stop_ids and tokens[-1] != renderer.terminator_id:
+        try:
+            calls = renderer.tool_calls(tokens)
+        except (ValueError, TypeError, KeyError, IndexError):
+            calls = []
+        if calls:
+            return "a turn with calls ended on another stop than the turn terminator"
+    return None
+
+
 def _check_spans(renderer: TurnRenderer, tokens: Sequence[int],
                  spans: Sequence[tuple[int, int]], stop: str) -> None:
     """Spans are ordered and in bounds, and each is one assistant turn: a stop
     token only as its last token, no turn markup inside. The renderer's parser
     cuts at the first stop token while its bridge trims at the last, so a span
-    holding either would split what is replayed from what is trained."""
+    holding either would split what is replayed from what is trained. A
+    ``format_error`` episode's last turn is the malformed one: nothing is
+    replayed after it, so its tokens are checked by ``turn_format_violation``."""
     previous = 0
     for k, (start, end) in enumerate(spans):
         if not (previous <= start < end <= len(tokens)):
@@ -115,6 +145,8 @@ def _check_spans(renderer: TurnRenderer, tokens: Sequence[int],
         if k + 1 < len(spans) and end > spans[k + 1][0]:
             raise TrajectoryRefused(REASON_BAD_TURNS, {"turn": k, "why": "spans overlap"})
         previous = end
+        if stop == STOP_FORMAT_ERROR and k == len(spans) - 1:
+            continue
         _check_span_tokens(tokens, k, start, end, stop_ids=renderer.stop_ids,
                            markup_ids=renderer.turn_markup_ids)
     last_start, last_end = spans[-1]
