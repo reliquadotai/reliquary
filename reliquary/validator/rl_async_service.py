@@ -214,7 +214,7 @@ class RlAsync:
 
 
 def build_rl_async(settings: RlAsyncSettings, *, path: str | os.PathLike[str], grader, board=None,
-                   prompt_range: Mapping[str, tuple[int, int]] | None = None, submit_config=None,
+                   prompt_range: Mapping[str, Any] | None = None, submit_config=None,
                    collector_interval_s: float | None = None, clock: Callable[[], float] = time.time) -> RlAsync:
     """Every async component on one SQLite file at ``path`` (restart-safe: open leases, buffer, ledger, prices)."""
     from reliquary.validator.rl_lease_quota import QuotaController
@@ -568,10 +568,12 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
 
 
 # --- the process --------------------------------------------------------------------------------------------------
-def _grader_for(names, checkpoint: str, load_kwargs: Mapping[str, Any], episodes: Mapping[str, Any] | None = None):
+def _grader_for(names, checkpoint: str, load_kwargs: Mapping[str, Any], episodes: Mapping[str, Any] | None = None,
+                blocks: Mapping[str, Any] | None = None):
     """The submission grader and the env prompt ranges, from the run's tokenizer and model config. ``episodes``:
     the signed-episode envs as loaded (``rl_async_episodes.load_episode_environment``): graded by their checkers
-    (``GroupGrader.add_episodes``, once the sandbox side is built), prompt range = their whole taskset. The
+    (``GroupGrader.add_episodes``, once the sandbox side is built), prompt range = their block's ``rows``
+    (``blocks``; without one, the whole taskset). The
     replayed episode envs of ``names`` (``rl_suite_episodes``) get their checkers here, prompt range = their RL
     range."""
     from types import SimpleNamespace
@@ -611,7 +613,10 @@ def _grader_for(names, checkpoint: str, load_kwargs: Mapping[str, Any], episodes
                          canonical_force_ids=canonical, vocab_size=vocab, scorer=PooledScorer(list(environments)),
                          episodes=suites)
     ranges = {name: rl_prompt_range(name, len(env)) for name, env in environments.items()}
-    ranges.update({name: (0, len(env)) for name, env in episodes.items()})
+    from reliquary.validator.rl_async_episodes import episode_prompt_rows
+
+    ranges.update({name: episode_prompt_rows(name, (blocks or {}).get(name, {}), len(env))
+                   for name, env in episodes.items()})
     ranges.update({name: rl_prompt_range(name, len(checker.environment)) for name, checker in suites.items()})
     return grader, ranges
 
@@ -748,7 +753,7 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
                              f"serve the signed-episode envs {sorted(settings.episodes)}")
     episode_envs = await asyncio.to_thread(load_episode_environments, settings)
     grader, ranges = await asyncio.to_thread(_grader_for, list(settings.targets), checkpoint, load_kwargs,
-                                             episode_envs)
+                                             episode_envs, settings.episodes)
     state_dir = _validator_state_dir()
     state_dir.mkdir(parents=True, exist_ok=True)
     rl = build_rl_async(settings, path=state_dir / DB_NAME, grader=grader, prompt_range=ranges)
