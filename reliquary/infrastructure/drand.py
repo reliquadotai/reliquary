@@ -17,6 +17,8 @@ import json
 import re
 import logging
 import os
+import subprocess
+import sys
 import threading
 from threading import Lock
 from typing import Any
@@ -106,6 +108,46 @@ _BEACON_COUNTER = 0
 
 # ─────────────────────────  BEACON SIGNATURE VERIFICATION  ──────────────────
 
+_SIGNATURE_FETCH_TIMEOUT_SECONDS = 30.0
+_SIGNATURE_FETCH_CODE = """
+import re
+import sys
+from bittensor_drand import get_signature_for_round
+
+signature = get_signature_for_round(int(sys.stdin.read()))
+if not isinstance(signature, str) or re.fullmatch(r"[0-9a-fA-F]{96}", signature) is None:
+    raise ValueError("invalid independent signature")
+sys.stdout.write(signature)
+"""
+
+
+def _fetch_independent_signature(round_number: int) -> str:
+    # This binding can hold the GIL during network IO. A fresh interpreter
+    # isolates that wait without forking the running model into a worker pool.
+    environment = {
+        name: os.environ[name]
+        for name in (
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+            "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+            "SSL_CERT_FILE", "SSL_CERT_DIR",
+        )
+        if name in os.environ
+    }
+    environment.update(CUDA_VISIBLE_DEVICES="", NVIDIA_VISIBLE_DEVICES="void")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-I", "-B", "-c", _SIGNATURE_FETCH_CODE],
+            input=str(int(round_number)), stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, encoding="ascii", check=True,
+            timeout=_SIGNATURE_FETCH_TIMEOUT_SECONDS, env=environment,
+        )
+    except (subprocess.SubprocessError, OSError, UnicodeError) as exc:
+        raise RuntimeError("independent signature fetch failed") from exc
+    if re.fullmatch(r"[0-9a-fA-F]{96}", result.stdout) is None:
+        raise ValueError("invalid independent signature response")
+    return result.stdout
+
+
 def verify_beacon_signature(
     chain_hash: str,
     round_number: int,
@@ -163,15 +205,7 @@ def verify_beacon_signature(
         # relay fetch. Delegates BLS verification to the Rust binding's
         # internal flow (drand quicknet, G1 sigs, BLS12381G1).
         try:
-            import bittensor_drand
-        except ImportError:
-            logger.error(
-                "[Drand] bittensor_drand not installed — cannot cross-check"
-            )
-            return False
-
-        try:
-            canonical = bittensor_drand.get_signature_for_round(int(round_number))
+            canonical = _fetch_independent_signature(int(round_number))
         except Exception as exc:
             logger.error(
                 "[Drand] bittensor-drand failed to fetch round %d: %s",

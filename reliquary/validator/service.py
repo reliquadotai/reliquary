@@ -9943,7 +9943,7 @@ class ValidationService:
         )
         self._set_window_preparation_stage("drand_boundary")
         from reliquary.infrastructure.drand import get_current_chain
-        ci = get_current_chain()
+        ci = await asyncio.to_thread(get_current_chain)
         delay = chain.seconds_until_next_drand_boundary(
             time.time(), ci["genesis_time"], ci["period"],
         )
