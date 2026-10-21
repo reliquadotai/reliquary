@@ -189,6 +189,25 @@ def test_the_fleet_takes_the_directory_settings(tmp_path):
     assert (fleet._refresh_s, fleet._max_age_s, fleet.directory_read_timeout_s) == (10.0, 45.0, 5.0)
 
 
+def test_machine_scope_configuration_is_optional_and_reaches_the_corpus_fleet(tmp_path):
+    keys = {"RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE": str(tmp_path / "v.pem"),
+            "RELIQUARY_SANDBOX_VALIDATOR_KEY_ID": "v1"}
+    assert SandboxValidatorConfig.from_env(keys).machine_ids is None
+    assert SandboxValidatorConfig.from_env({**keys, "RELIQUARY_SANDBOX_MACHINE_IDS": "[]"}).machine_ids == frozenset()
+    config = SandboxValidatorConfig.from_env({**keys, "RELIQUARY_SANDBOX_MACHINE_IDS": '["machine-b"]'})
+    _, services = _services(tmp_path, machine_ids=config.machine_ids)
+    assert services.fleet._machine_ids == frozenset({"machine-b"})
+
+
+@pytest.mark.parametrize("value", ["", " ", "null", '"machine-b"', "{}", "[1]", '[""]',
+                                    '["../machine-b"]', '["machine-b", "machine-b"]', "[bad]"])
+def test_malformed_machine_scope_is_refused_instead_of_using_all_machines(tmp_path, value):
+    keys = {"RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE": str(tmp_path / "v.pem"),
+            "RELIQUARY_SANDBOX_VALIDATOR_KEY_ID": "v1", "RELIQUARY_SANDBOX_MACHINE_IDS": value}
+    with pytest.raises(ValueError):
+        SandboxValidatorConfig.from_env(keys)
+
+
 def test_a_failed_restore_aborts_the_start(tmp_path):
     _, services = _services(tmp_path)
 

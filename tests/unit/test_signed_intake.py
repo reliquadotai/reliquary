@@ -190,6 +190,28 @@ def test_an_honest_signed_episode_is_accepted_once(world):
     assert remaining(world) == JOB.slots_per_prompt - 1
 
 
+def test_existing_signed_submission_from_excluded_machine_is_accepted_once(world):
+    from reliquary.sandbox.fleet import Fleet as LiveFleet
+    from tests.unit.sandbox_fixtures import machine_document
+
+    async def documents():
+        return [machine_document(world.machine)]
+
+    async def forbidden_fetch(address):
+        pytest.fail("an excluded machine must not be contacted")
+
+    fleet = LiveFleet(read_documents=documents, fetch_report=forbidden_fetch,
+                      clock=world.clock, machine_ids=set())
+    asyncio.run(fleet.refresh_directory())
+    asyncio.run(fleet.poll_once())
+    world.intake._directory = fleet.directory_if_ready
+    world.issuer._fleet = fleet
+    assert submit(world)["reason"] == "accepted"
+    assert world.book.get("s-1").state == SUBMITTED
+    assert submit(world)["reason"] != "accepted"
+    assert remaining(world) == JOB.slots_per_prompt - 1
+
+
 def test_the_session_key_is_written_in_the_same_compare_and_swap_as_the_slot(world):
     before = world.store.ledger_write_attempts
     assert submit(world)["reason"] == "accepted"
