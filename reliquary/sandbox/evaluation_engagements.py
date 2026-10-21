@@ -322,12 +322,13 @@ def from_environment(*, subnet, environ=os.environ, clock=time.time):
     verifier = Ed25519TokenVerifier({**config.retired_keys, config.key_id: signer.public_key_b64})
 
     async def documents():
-        return [doc for doc in await sandbox_store.list_machines() if doc.get("machine_id") in allowed]
+        return await sandbox_store.list_machines()
 
     fleet = Fleet(read_documents=documents, fetch_report=http_fetch_report, clock=clock,
                   directory_refresh_s=config.directory_refresh_s,
                   directory_max_age_s=config.directory_max_age_s,
-                  directory_read_timeout_s=config.directory_read_timeout_s)
+                  directory_read_timeout_s=config.directory_read_timeout_s,
+                  machine_ids=allowed, additional_machine_scope=config.machine_ids)
     fleet.resources_required = True
     service = EvaluationSessions(issuer=None, fleet=fleet, subnet=subnet, clock=clock)
     service.issuer = SessionIssuer(book=SessionBook(policy), store=sandbox_store.R2SessionStore(

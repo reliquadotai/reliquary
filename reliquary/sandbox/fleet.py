@@ -184,12 +184,17 @@ class Fleet:
                  directory_refresh_s: float = DIRECTORY_REFRESH_SECONDS,
                  directory_max_age_s: float = DIRECTORY_MAX_AGE_SECONDS,
                  directory_read_timeout_s: float = DIRECTORY_READ_TIMEOUT_SECONDS,
-                 machine_ids: Collection[str] | None = None) -> None:
+                 machine_ids: Collection[str] | None = None,
+                 additional_machine_scope: Collection[str] | None = None) -> None:
         if isinstance(machine_ids, (str, bytes)):
             raise ValueError("machine_ids must be a collection of machine names")
         self._machine_ids = (None if machine_ids is None else
                              frozenset(validated_machine_id(m) for m in machine_ids))
-        self._scope_ready = machine_ids is None
+        if isinstance(additional_machine_scope, (str, bytes)):
+            raise ValueError("additional_machine_scope must be a collection of machine names")
+        self._additional_machine_scope = (None if additional_machine_scope is None else
+                                          frozenset(validated_machine_id(m) for m in additional_machine_scope))
+        self._scope_ready = machine_ids is None and additional_machine_scope is None
         if not directory_refresh_s > 0 or not directory_max_age_s > directory_refresh_s:
             raise ValueError("the directory needs 0 < refresh period < max age, got "
                              f"{directory_refresh_s} and {directory_max_age_s}")
@@ -267,7 +272,8 @@ class Fleet:
         return self._directory
 
     def _in_scope(self, machine_id: str) -> bool:
-        return self._scope_ready and (self._machine_ids is None or machine_id in self._machine_ids)
+        return (self._scope_ready and (self._machine_ids is None or machine_id in self._machine_ids)
+                and (self._additional_machine_scope is None or machine_id in self._additional_machine_scope))
 
     def _operated_entries(self):
         # Placement and polling share the scope; signature verification keeps the full directory.
@@ -309,8 +315,8 @@ class Fleet:
         finally:
             self._read_attempted = True
         snapshot = snapshot_from_documents(documents)
-        self._scope_ready = (self._machine_ids is None or
-                             all(snapshot.entry(m) is not None for m in self._machine_ids))
+        self._scope_ready = all(scope is None or all(snapshot.entry(m) is not None for m in scope)
+                                for scope in (self._machine_ids, self._additional_machine_scope))
         if not self._scope_ready:
             logger.error("sandbox machine scope contains unknown machines; no machine is polled or placed")
         now = self._clock()

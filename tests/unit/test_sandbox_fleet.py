@@ -50,9 +50,14 @@ def test_a_fresh_signed_heartbeat_makes_a_machine_eligible(tmp_path):
     assert fleet.pick(now=NOW, **PICK) == Placement(MACHINE, ADDRESS)
 
 
-@pytest.mark.parametrize("scope,expected", [(None, ("m-a", "m-b")), ({"m-b"}, ("m-b",)),
-                                           (set(), ()), ({"unknown"}, ()), ({"m-b", "unknown"}, ())])
-def test_machine_scope_limits_polling_heartbeat_writes_and_all_admission_capacity(tmp_path, scope, expected):
+@pytest.mark.parametrize("scope,additional,expected", [
+    (None, None, ("m-a", "m-b")), ({"m-b"}, None, ("m-b",)),
+    (set(), None, ()), ({"unknown"}, None, ()), ({"m-b", "unknown"}, None, ()),
+    (None, {"m-b"}, ("m-b",)), ({"m-a", "m-b"}, {"m-b"}, ("m-b",)),
+    ({"m-a"}, {"m-b"}, ()), ({"m-b"}, set(), ()),
+    ({"m-b"}, {"m-b", "unknown"}, ()), ({"m-b", "unknown"}, {"m-b"}, ()),
+])
+def test_machine_scope_limits_polling_heartbeat_writes_and_all_admission_capacity(tmp_path, scope, additional, expected):
     one, two = signer(tmp_path, "a", "ka"), signer(tmp_path, "b", "kb")
     documents = [machine_document(one, machine_id="m-a", address="http://a:1"),
                  machine_document(two, machine_id="m-b", address="http://b:1")]
@@ -71,7 +76,8 @@ def test_machine_scope_limits_polling_heartbeat_writes_and_all_admission_capacit
         recorded.append(machine_id)
 
     fleet = Fleet(read_documents=read, fetch_report=fetch, record_heartbeat=record,
-                  on_drained=drained.append, clock=Clock(), machine_ids=scope)
+                  on_drained=drained.append, clock=Clock(), machine_ids=scope,
+                  additional_machine_scope=additional)
     asyncio.run(fleet.refresh_directory())
     asyncio.run(fleet.poll_once())
     assert fetched == [f"http://{m[-1]}:1" for m in expected]
@@ -120,6 +126,33 @@ def test_unknown_scope_after_refresh_closes_cached_capacity_without_voiding_old_
     asyncio.run(fleet.refresh_directory())
     asyncio.run(fleet.poll_once())
     assert fleet.pick(now=NOW, **PICK) is not None
+
+
+def test_missing_additional_scope_id_outside_intersection_closes_cached_capacity(tmp_path):
+    fleet, machine, served, _ = make(tmp_path, machine_ids={MACHINE},
+                                   additional_machine_scope={MACHINE, "m-b"})
+    other = machine_document(signer(tmp_path, "b", "kb"), machine_id="m-b", address="http://b:1")
+    documents = asyncio.run(fleet._read_documents())
+    documents.append(other)
+    served[ADDRESS] = capacity_report(machine, at=NOW)
+    asyncio.run(fleet.refresh_directory())
+    asyncio.run(fleet.poll_once())
+    assert fleet.pick(now=NOW, **PICK) is not None
+    documents.remove(other)
+    asyncio.run(fleet.refresh_directory())
+    asyncio.run(fleet.poll_once())
+    assert fleet.pick(now=NOW, **PICK) is None and fleet.session_room() == (0, 0)
+    assert fleet.directory_if_ready().public_key(MACHINE, machine.key_id, NOW) is not None
+    documents.append(other)
+    asyncio.run(fleet.refresh_directory())
+    asyncio.run(fleet.poll_once())
+    assert fleet.pick(now=NOW, **PICK) is not None
+
+
+@pytest.mark.parametrize("scope", ["m-b", b"m-b", {"../m-b"}])
+def test_additional_machine_scope_rejects_invalid_collections_and_names(tmp_path, scope):
+    with pytest.raises(ValueError):
+        make(tmp_path, additional_machine_scope=scope)
 
 
 def test_existing_session_on_excluded_machine_can_close_with_its_signed_receipt(tmp_path):
