@@ -191,12 +191,11 @@ def _validate_episode(name: str, env: dict) -> None:
     fields = set(_EPISODE_FIELDS) | ({"harness"} if isinstance(raw, dict) and "harness" in raw else set())
     episode = _object(raw, fields, f"{name}.episode")
     if "harness" in episode:
-        # The reliquary-harness spec the episodes render with (absent: bash-vf-b2e4e81@1); whether a
-        # binary serves it is its own check (`agentic_swe.harness_pin_refusal`), refused, never judged.
-        from reliquary.corpus.job import parse_harness_spec
-
+        # The reliquary-harness spec the episodes render with (absent: bash-vf-b2e4e81@1), or a weighted mix
+        # of them drawn per lease; whether a binary serves it is its own check
+        # (`agentic_swe.harness_value_refusal`), refused, never judged.
         try:
-            parse_harness_spec(episode["harness"], f"{name}.episode.harness")
+            parse_harness_value(episode["harness"], f"{name}.episode.harness")
         except ValueError as exc:
             raise ServiceContractError(str(exc)) from None
     if episode["kind"] != EPISODE_CAPABILITY:
@@ -243,18 +242,65 @@ class EpisodeEnvPolicy:
     budgets: tuple[tuple[str, int], ...]
     pool_seeds: int
     harness: tuple[tuple[str, str], ...] | None = None
-    """The block's `harness` ({id, version, digest}) as sorted pairs; None: bash-vf-b2e4e81@1."""
+    """The block's `harness` ({id, version, digest}) as sorted pairs; None: bash-vf-b2e4e81@1 (or a mix)."""
+    harness_mix: tuple[tuple[tuple[tuple[str, str], ...], int], ...] | None = None
+    """A block whose `harness` is a weighted mix: (pin as sorted pairs, weight) in the block's order."""
 
     def budgets_dict(self) -> dict[str, int]:
         return dict(self.budgets)
 
     def harness_pin(self) -> dict[str, str] | None:
+        if self.harness_mix is not None:
+            raise ValueError(f"{self.environment} plays a harness mix drawn per lease: an RL lease's, "
+                             f"not a window's or a corpus job's")
         return None if self.harness is None else dict(self.harness)
+
+    def harness_choices(self) -> tuple[tuple[dict[str, str] | None, int], ...]:
+        """((pin, weight), ...): the mix in its order, else the one harness (None: bash-vf-b2e4e81@1) at 1."""
+        if self.harness_mix is None:
+            return ((self.harness_pin(), 1),)
+        return tuple((dict(pairs), int(weight)) for pairs, weight in self.harness_mix)
+
+
+MAX_HARNESS_MIX = 8
+MAX_HARNESS_WEIGHT = 1000
+
+
+def parse_harness_value(raw: Any, where: str):
+    """An episode block's `harness`, by shape (ValueError otherwise): one `{id, version, digest}`, or a mix of
+    2 to MAX_HARNESS_MIX distinct `{id, version, digest, weight}` (weight an integer, 1 to MAX_HARNESS_WEIGHT)."""
+    from reliquary.corpus.job import parse_harness_spec
+
+    if not isinstance(raw, list):
+        return parse_harness_spec(raw, where)
+    if not 2 <= len(raw) <= MAX_HARNESS_MIX:
+        raise ValueError(f"{where}: a harness mix names 2 to {MAX_HARNESS_MIX} harnesses")
+    seen, mix = set(), []
+    for k, entry in enumerate(raw):
+        if not isinstance(entry, Mapping) or "weight" not in entry:
+            raise ValueError(f"{where}[{k}] must be {{id, version, digest, weight}}")
+        weight = entry["weight"]
+        if type(weight) is not int or not 1 <= weight <= MAX_HARNESS_WEIGHT:
+            raise ValueError(f"{where}[{k}].weight must be an integer from 1 to {MAX_HARNESS_WEIGHT}")
+        pin = parse_harness_spec({f: v for f, v in entry.items() if f != "weight"}, f"{where}[{k}]")
+        if (pin["id"], pin["version"]) in seen:
+            raise ValueError(f"{where} names {pin['id']}@{pin['version']} twice")
+        seen.add((pin["id"], pin["version"]))
+        mix.append((pin, weight))
+    return mix
 
 
 def harness_pairs(episode: Mapping[str, Any]) -> tuple[tuple[str, str], ...] | None:
     pin = episode.get("harness")
-    return None if pin is None else tuple(sorted((str(k), str(v)) for k, v in pin.items()))
+    return None if pin is None or isinstance(pin, list) else tuple(sorted((str(k), str(v)) for k, v in pin.items()))
+
+
+def harness_mix_pairs(episode: Mapping[str, Any]):
+    mix = episode.get("harness")
+    if not isinstance(mix, list):
+        return None
+    return tuple((tuple(sorted((str(k), str(v)) for k, v in entry.items() if k != "weight")), int(entry["weight"]))
+                 for entry in mix)
 
 
 
@@ -502,7 +548,8 @@ class ServiceContract:
             max_turns=episode["max_turns"], max_tokens_per_turn=episode["max_tokens_per_turn"],
             max_episode_tokens=episode["max_episode_tokens"],
             budgets=tuple((field_name, episode["budgets"][field_name]) for field_name in EPISODE_BUDGET_FIELDS),
-            pool_seeds=env["sampling"]["pool_seeds"], harness=harness_pairs(episode))
+            pool_seeds=env["sampling"]["pool_seeds"], harness=harness_pairs(episode),
+            harness_mix=harness_mix_pairs(episode))
 
     @property
     def episode_environments(self) -> tuple[str, ...]:
