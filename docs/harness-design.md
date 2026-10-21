@@ -60,7 +60,7 @@ Not yet done in step 3: the legacy Docker replay corpus miner (`miner/agentic_ep
 verifiers with a restricted runtime) still runs verifiers. It is legacy, and goes in step 7.
 
 Deploy precondition: Catalyst's `pyproject.toml` depends on
-`reliquary-harness[qwen] @ git+…reliquary-sandbox.git@39b21cf…#subdirectory=harness` (pushed to
+`reliquary-harness[qwen] @ git+…reliquary-sandbox.git@5ac0354…#subdirectory=harness` (pushed to
 the public repository). The pinned commit must be on the public repository before any image build. The main image installs
 pyproject. The CPU executor image (code grader) imports no agentic code, so it needs nothing.
 
@@ -300,6 +300,48 @@ Now, on an async RL lease only (`format_stop`):
   the miner's loop against the real gateway with a made-up observation and an end-of-text
   turn, checks the shared admission check (lease admitted, window refused), checks that a
   well-formed turn cannot claim `format_error`, and checks the checker's zero reward.
+
+## 6e. Three harnesses from real agents: `openhands-xml@1`, `claude-code@1`, `codex@1` (2026-10-21)
+
+Chosen from the multi-harness research (`reports/RL multi harnais SWE.md`): the format of the open SWE
+corpora (OpenHands/SWE-smith/R2E-Gym), and the two deployment harnesses where open models fall the
+most.
+
+**Translated harnesses** (`HarnessSpec.actions.mode = "translated"`, one module of reliquary-harness
+each). The model calls the harness's own tools. Each call is translated, deterministically and on both
+sides, into one canonical call the gateway runs (`bash`), and the signed record is rendered back in the
+harness's own result format.
+
+- **Simple calls** (`execute_bash`, `Bash`, `exec_command`) run their command as is.
+- **File tools** run as a bash command that executes a small Python program in the box, with its
+  arguments in base64. This covers OpenHands' `str_replace_editor`, Claude Code's `Read`/`Edit`/`Write`
+  and Codex's `apply_patch`. The command's first line names the tool (`# openhands:...`,
+  `# claude-code:...`, `# codex:...`), so the observation is rendered as that tool's. The command
+  and its output are signed like any other.
+- **Safety.** Translation is total: invalid arguments are answered locally with the harness's error,
+  and an unknown name is read as `?<name>`, a tool nobody offers. So a call never refuses the episode,
+  and a hidden canonical name is never run.
+- These files are now in `IMPLEMENTATION_FILES`, so the digests of every spec changed.
+
+| | `openhands-xml@1` | `claude-code@1` | `codex@1` |
+|---|---|---|---|
+| Source | OpenHands 0.59.0 d39f7ae (MIT): prompts, tool texts, fn_call_converter, editor messages | published tool types of Claude Code 2.1.306 (names and parameters only; prompt and texts our own) | Codex CLI c7234c1 (Apache-2.0): tools, prompt (no model identity), unified exec result, apply_patch engine ported to Python |
+| Calls | text: one `<function=…><parameter=…>` per turn (a `<tool_call>`-wrapped one too) | template tool calls, several per turn | template tool calls |
+| Tools | execute_bash, think, finish, str_replace_editor (view/create/str_replace/insert) | Bash, Read, Edit, Write | exec_command, apply_patch (`input`), update_plan |
+| Results | user message `EXECUTION RESULT of [tool]:`, middle cut at 30000 chars, `[Command finished with exit code N]` | tool message: output, `Exit code N` when it failed, `<tool_use_error>` | tool message: `Process exited with code N`, `Original token count`, `Output:`, 10000-token middle cut |
+| End | `finish` | a turn without a call | a turn without a call |
+| No call | OpenHands' evaluation reply (`Please continue working…`), the episode goes on | the end | the end |
+
+Not reproduced (documented in each module): persistent shells (is_input, PTY sessions, write_stdin),
+per-call timeouts, `undo_edit`, Claude Code's read-before-edit rule, wall times and session ids (unsigned).
+The file programs need `python3` in the box (every SWE image has it).
+
+Tests: `harness/tests/test_{openhands,claude_code,codex_patch,codex}.py`, covering parse, translation,
+the programs really run on files with every error text, observations, and frozen goldens. On the
+Catalyst side, `test_harness_translated_e2e` plays each harness with the miner's loop against the real
+gateway, the file programs really running. It checks that the gateway ran canonical bash only and that
+the model was shown the harness's results, and that the validator admits the episode under the
+harness and refuses it under bash-vf.
 
 **Smoke lessons** (2026-10-20, Qwen3.5-2B on one H100, forced draw, real gateway):
 
