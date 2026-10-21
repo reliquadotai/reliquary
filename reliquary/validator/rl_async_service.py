@@ -605,14 +605,14 @@ def renderer_for_checkpoint(checkpoint: str) -> Callable[[Any], Any]:
     combination; variant 0 and no harness: the window validator's)."""
     renderers: dict[tuple, Any] = {}
 
-    def renderer_for(policy, variant: int = 0):
-        from reliquary.environment.agentic_swe import harness_of, load_turn_renderer, policy_harness_pin
+    def renderer_for(policy, variant: int = 0, spec=None):
+        """``spec``: one harness of the policy's mix (default: its first, the only one without a mix)."""
+        from reliquary.environment.agentic_swe import load_turn_renderer, policy_default_harness
 
-        tools, pin = tuple(policy.tools), policy_harness_pin(policy)
-        key = (tools, None if pin is None else (pin["id"], pin["version"]), int(variant))
+        tools, spec = tuple(policy.tools), spec or policy_default_harness(policy)
+        key = (tools, spec.key, int(variant))
         if key not in renderers:
-            renderers[key] = load_turn_renderer(str(checkpoint), tools=tools, spec=harness_of(pin),
-                                                variant=int(variant))
+            renderers[key] = load_turn_renderer(str(checkpoint), tools=tools, spec=spec, variant=int(variant))
         return renderers[key]
 
     return renderer_for

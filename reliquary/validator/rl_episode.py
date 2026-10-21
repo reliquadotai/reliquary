@@ -26,6 +26,7 @@ A stale machine directory raises ``GraderInfrastructureError`` (retry later, the
 """
 from __future__ import annotations
 
+import collections
 import functools
 import logging
 from collections.abc import Callable, Collection, Sequence
@@ -45,47 +46,69 @@ class LeaseEpisodeChecker:
 
     def __init__(self, *, policy, renderer, source, directory: Callable[[float], Any | None], token_verifier,
                  seen: Callable[[], Collection[str]] = frozenset, min_chunk_tokens: int | None = None,
-                 renderer_of: Callable[[int], Any] | None = None) -> None:
+                 renderer_of: Callable[..., Any] | None = None) -> None:
+        from reliquary.environment.agentic_swe import policy_default_harness, policy_harness_choices
         from reliquary.protocol.toploc import MIN_CHUNK_TOKENS
 
         self.policy, self.renderer, self.source = policy, renderer, source
-        # The renderer of a surface variant other than 0 (a harness with axes): the lease's, computed here.
+        # The renderer of another surface than the default (a variant other than 0 of a harness with axes:
+        # ``renderer_of(variant)``; another harness of a mix: ``renderer_of(variant, spec=spec)``): the lease's,
+        # computed here.
         self.renderer_of = renderer_of
-        self._variants: dict[int, Any] = {0: renderer}
+        self._mixed = len(policy_harness_choices(policy)) > 1
+        self._default = policy_default_harness(policy)
+        self._surfaces: dict[tuple[str, int], Any] = {(self._default.key, 0): renderer}
         self.directory, self.token_verifier, self.seen = directory, token_verifier, seen
         self.min_chunk_tokens = MIN_CHUNK_TOKENS if min_chunk_tokens is None else int(min_chunk_tokens)
         self._prompt = functools.lru_cache(maxsize=256)(self._render)
+        # Leases graded, per (harness, verdict): admitted, or the refusal's stage.
+        self.outcomes: collections.Counter = collections.Counter()
 
-    def _render(self, prompt_idx: int, variant: int = 0) -> tuple[int, ...]:
-        renderer = self.variant_renderer(variant)
+    def _render(self, prompt_idx: int, variant: int, key: str) -> tuple[int, ...]:
+        renderer = self._surfaces[key, variant]
         return tuple(int(t) for t in renderer.initial_ids(self.source.prompt(int(prompt_idx))))
 
-    def prompt_ids(self, prompt_idx: int, variant: int = 0) -> tuple[int, ...]:
-        return self._prompt(int(prompt_idx), int(variant))
+    def prompt_ids(self, prompt_idx: int, variant: int = 0, spec=None) -> tuple[int, ...]:
+        self.surface_renderer(spec, variant)               # built (and cached) before the prompt cache keys it
+        return self._prompt(int(prompt_idx), int(variant), (spec or self._default).key)
 
     def variant_renderer(self, variant: int):
-        if variant not in self._variants:
+        return self.surface_renderer(None, variant)
+
+    def surface_renderer(self, spec, variant: int):
+        """The renderer of harness ``spec`` (None: the default one) in surface ``variant``."""
+        spec = spec or self._default
+        key = (spec.key, int(variant))
+        if key not in self._surfaces:
             if self.renderer_of is None:
-                raise ValueError(f"no renderer for surface variant {variant}")
-            self._variants[variant] = self.renderer_of(int(variant))
-        return self._variants[variant]
+                raise ValueError(f"no renderer for {spec.key} surface variant {variant}")
+            self._surfaces[key] = (self.renderer_of(int(variant)) if spec is self._default
+                                   else self.renderer_of(int(variant), spec=spec))
+        return self._surfaces[key]
+
+    def lease_surface(self, lease):
+        """(spec, variant) the lease's episodes must have played (the validator's own draw)."""
+        from reliquary.environment.agentic_swe import lease_surface
+
+        return lease_surface(self.policy, lease)
 
     def lease_variant(self, lease) -> int:
         """The surface variant the lease's episodes must have played (the validator's own draw)."""
-        from reliquary.environment.agentic_swe import harness_of, lease_variant, policy_harness_pin
-
-        return lease_variant(harness_of(policy_harness_pin(self.policy)), lease)
+        return self.lease_surface(lease)[1]
 
     def grade(self, lease, rollouts: Sequence[Any], *, received: float):
-        """``rl_submit.Graded`` of a lease's episodes (``Rollout`` with ``episode``)."""
-        graded = self._grade(lease, rollouts, received=received)
-        variant = self.lease_variant(lease)
-        if variant or getattr(graded, "reject", None):
-            logger.info("episode lease %s (%s, surface variant %d): %s", lease.lease_id[:12], self.policy.environment,
-                        variant, f"rejected {graded.reject}" if getattr(graded, "reject", None) else "admitted")
+        """``rl_submit.Graded`` of a lease's episodes (``Rollout`` with ``episode``). Every lease is logged with
+        its harness, surface variant and verdict (a refusal with its detail) and counted in ``outcomes``."""
+        spec, variant = self.lease_surface(lease)
+        graded, detail = self._grade(lease, rollouts, received=received, surface=(spec, variant))
+        reject = getattr(graded, "reject", None)
+        self.outcomes[spec.key, reject or "admitted"] += 1
+        logger.info("episode lease %s (%s, %s, surface variant %d): %s", lease.lease_id[:12],
+                    self.policy.environment, spec.key, variant,
+                    f"rejected {reject} {detail}" if reject else "admitted")
         return graded
 
-    def _grade(self, lease, rollouts: Sequence[Any], *, received: float):
+    def _grade(self, lease, rollouts: Sequence[Any], *, received: float, surface):
         from reliquary_sandbox.attest import Expected
 
         from reliquary.protocol.rl_draw import lease_checkpoint_tag
@@ -94,9 +117,10 @@ class LeaseEpisodeChecker:
         from reliquary.validator.rl_submit import Graded
 
         policy = self.policy
-        variant = self.lease_variant(lease)
-        renderer = self.variant_renderer(variant)
-        prompt = self.prompt_ids(lease.prompt_idx, variant)
+        spec, variant = surface
+        spec = None if spec is self._default else spec
+        renderer = self.surface_renderer(spec, variant)
+        prompt = self.prompt_ids(lease.prompt_idx, variant, spec)
         directory = self.directory(received)
         if directory is None:
             raise GraderInfrastructureError("the machine directory is stale")
@@ -105,9 +129,9 @@ class LeaseEpisodeChecker:
         for index, rollout in enumerate(rollouts):
             episode = rollout.episode
             if episode is None or rollout.force_span is not None:
-                return Graded(prompt, reject="episode_schema")
+                return Graded(prompt, reject="episode_schema"), {"rollout": index}
             if len(prompt) + len(rollout.tokens) > policy.max_episode_tokens:
-                return Graded(prompt, reject="episode_length")
+                return Graded(prompt, reject="episode_length"), {"rollout": index}
             expected = Expected(hotkey=lease.hotkey, engagement=rl_lease_engagement(lease.lease_id, index),
                                 env=policy.sandbox_env, split=policy.split, index=int(lease.prompt_idx),
                                 checkpoint=lease_checkpoint_tag(int(lease.checkpoint)), seen_session_ids=seen,
@@ -116,11 +140,11 @@ class LeaseEpisodeChecker:
                                          token_verifier=self.token_verifier, received=received,
                                          where={"rollout": index})
             if isinstance(result, EpisodeRefusal):
-                return Graded(prompt, reject=result.stage)
+                return Graded(prompt, reject=result.stage), result.detail
             verified.append(result)
         sessions = [result.claims.session_id for result in verified]
         if len(set(sessions)) != len(sessions):
-            return Graded(prompt, reject="episode_session_reused")
+            return Graded(prompt, reject="episode_session_reused"), {}
         offset = len(prompt)
         for rollout, result in zip(rollouts, verified):
             spans = [(offset + start, offset + end) for start, end in rollout.spans]
@@ -129,9 +153,9 @@ class LeaseEpisodeChecker:
                 stop=rollout.episode["stop"], calls=tuple(result.calls), opened=result.open, final=result.final,
                 min_chunk_tokens=self.min_chunk_tokens, lease=True)
             if refusal is not None:
-                return Graded(prompt, reject=refusal.stage)
+                return Graded(prompt, reject=refusal.stage), refusal.detail
         rewards = tuple(float(result.final.reward) for result in verified)
-        return Graded(prompt, rewards, (False,) * len(rollouts), spans=tuple(r.spans for r in rollouts))
+        return Graded(prompt, rewards, (False,) * len(rollouts), spans=tuple(r.spans for r in rollouts)), None
 
 
 __all__ = ["LeaseEpisodeChecker"]

@@ -362,25 +362,41 @@ def _parse_lease_expiry(value):
 
 def with_episode_harnesses(episode_envs, value):
     """``--harness env=id@version,...``: each named episode env's block pins that reliquary-harness spec at the
-    digest this install serves (refused when it does not serve it). One harness per env."""
+    digest this install serves (refused when it does not serve it). ``env=a@1:2+b@1:1`` is a weighted mix,
+    drawn per lease (weights are integers, 1 by default): the env's block names the list."""
     import copy
+
+    from reliquary.protocol.service_contract import parse_harness_value
 
     if not value:
         return episode_envs
     envs = copy.deepcopy(dict(episode_envs or {}))
     named = set()
     for item in value.split(","):
-        name, sep, key = item.strip().partition("=")
-        harness_id, at, version = key.partition("@")
-        if not sep or not name or not at or not harness_id or not version:
+        name, sep, keys = item.strip().partition("=")
+        if not sep or not name or not keys:
             raise ValueError(f"--harness: env=id@version expected, got {item!r}")
         if name in named:
-            raise ValueError(f"--harness names {name} twice: one harness per env")
+            raise ValueError(f"--harness names {name} twice: one harness, or one mix, per env")
         if name not in envs:
             raise ValueError(f"--harness names {name}, which is not an --rl-episode-envs env")
         named.add(name)
-        envs[name]["episode"] = {**envs[name]["episode"],
-                                 "harness": _harness_pin(harness_id, version, f"--harness {name}", variants=True)}
+        entries = []
+        for key in keys.split("+"):
+            key, colon, weight = key.strip().partition(":")
+            harness_id, at, version = key.partition("@")
+            if not at or not harness_id or not version or (colon and not weight.isdigit()):
+                raise ValueError(f"--harness {name}: id@version[:weight] expected, got {key!r}")
+            pin = _harness_pin(harness_id, version, f"--harness {name}", variants=True)
+            entries.append({**pin, "weight": int(weight)} if colon else pin)
+        if len(entries) == 1:
+            if "weight" in entries[0]:
+                raise ValueError(f"--harness {name}: a weight needs a mix of at least two harnesses")
+            harness = entries[0]
+        else:
+            harness = [entry if "weight" in entry else {**entry, "weight": 1} for entry in entries]
+            parse_harness_value(harness, f"--harness {name}")
+        envs[name]["episode"] = {**envs[name]["episode"], "harness": harness}
     return envs
 
 
@@ -696,7 +712,8 @@ def tasks_create(
     harness: str = typer.Option(
         None, "--harness",
         help="With --rl-async: env=id@version,... the reliquary-harness spec each --rl-episode-envs env plays "
-        "(e.g. swe_v1=mini-swe@1, tmax_v1=bash-surface@1); unnamed envs play bash-vf-b2e4e81@1",
+        "(e.g. swe_v1=mini-swe@1, tmax_v1=bash-surface@1), or a weighted mix drawn per lease "
+        "(swe_v1=mini-swe@1:1+bash-surface@1:1); unnamed envs play bash-vf-b2e4e81@1",
     ),
 ) -> None:
     from reliquary.infrastructure.task_registry_store import create_task
