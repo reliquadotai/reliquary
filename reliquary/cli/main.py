@@ -2489,6 +2489,67 @@ def eval_feed(
     typer.echo(json.dumps(summary, indent=1))
 
 
+@eval_app.command("schedule")
+def eval_schedule(
+    run_id: str = typer.Option(..., "--run-id", help="The trainer's wandb run id (the feed's run_id)"),
+    run_tag: str = typer.Option(..., "--run-tag", help="Short lowercase tag in the job ids: eval-<tag>-s<step>-.."),
+    suite: str = typer.Option(..., "--suite", help="JSON list of {set_id, short, slots_per_prompt, cap, "
+                                                   "max_new_tokens[, prompt_count]}"),
+    every: int = typer.Option(..., "--every", min=1, help="Evaluate checkpoints whose step is a multiple of this "
+                                                          "(a multiple of RELIQUARY_RL_HF_BACKUP_MILESTONE_EVERY)"),
+    hf_prefix: str = typer.Option(..., "--hf-prefix", help="RELIQUARY_RL_HF_BACKUP_PREFIX of the trainer"),
+    hf_namespace: str = typer.Option("ReliquaryForge", "--hf-namespace"),
+    model_architecture: str = typer.Option(..., "--model-architecture"),
+    eos_token_id: int = typer.Option(..., "--eos-token-id"),
+    renderer_id: str = typer.Option("chat-template-thinking-v1", "--renderer-id"),
+    temperature: float = typer.Option(0.6, "--temperature"),
+    top_p: float = typer.Option(0.95, "--top-p"),
+    baseline_model: str | None = typer.Option(None, "--baseline-model", help="The run's start checkpoint repo"),
+    baseline_revision: str | None = typer.Option(None, "--baseline-revision"),
+    results_dir: str = typer.Option(..., "--results-dir", help="Gradings, logs and benchmarks.json go here"),
+    state: str | None = typer.Option(None, "--state", help="Default: <results-dir>/schedule-state.json"),
+    start_cmd: str | None = typer.Option(None, "--start-cmd", help="Shell template starting the validator "
+                                         "({job} {jobs} {contract} {model} {revision} {wallet} {hotkey} {port})"),
+    wallet: str = typer.Option("", "--wallet-name"),
+    hotkey: str = typer.Option("", "--hotkey"),
+    port: str = typer.Option("", "--http-port"),
+    max_wait_hours: float = typer.Option(6.0, "--max-wait-hours", help="Then missing samples count as failures"),
+    publish: bool = typer.Option(False, "--publish", help="Publish the feed after each graded checkpoint"),
+    upload: bool = typer.Option(False, "--upload", help="Upload each grading to the subnet bucket"),
+    execute: bool = typer.Option(False, "--execute", help="Act (default: a dry run printing what it would do)"),
+    loop_seconds: float = typer.Option(0.0, "--loop-seconds", help="Tick again every N seconds (0: once)"),
+) -> None:
+    """Evaluate an RL run's milestone checkpoints one at a time on this host's GPU and keep its feed current."""
+    from reliquary.eval import rl_schedule
+
+    try:
+        if baseline_model and not baseline_revision:
+            raise ValueError("--baseline-revision is required with --baseline-model")
+        values = {"wallet": wallet, "hotkey": hotkey, "port": port}
+        if start_cmd is None and execute and not all(values.values()):
+            raise ValueError("the default validator command needs --wallet-name, --hotkey and --http-port")
+        settings = rl_schedule.Settings(
+            run_id=run_id, run_tag=run_tag, suite=rl_schedule.load_suite(suite), every=every,
+            hf_namespace=hf_namespace, hf_prefix=hf_prefix, model_architecture=model_architecture,
+            eos_token_id=eos_token_id, renderer_id=renderer_id, temperature=temperature, top_p=top_p,
+            baseline_model=baseline_model, baseline_revision=baseline_revision, results_dir=Path(results_dir),
+            state_path=Path(state) if state else Path(results_dir) / "schedule-state.json",
+            start_cmd=start_cmd or rl_schedule.DEFAULT_START, start_values=values,
+            max_wait_s=max_wait_hours * 3600, publish=publish, upload=upload)
+        for entry in settings.suite:
+            rl_schedule.job_id(run_tag, 99999, entry.short)
+        scheduler = rl_schedule.Scheduler(settings, rl_schedule.live_ports(settings))
+        while True:
+            for line in scheduler.tick(execute=execute):
+                typer.echo(line if execute else f"[dry run] {line}")
+            if not loop_seconds:
+                break
+            _time.sleep(loop_seconds)
+    except (ValueError, OSError, subprocess.CalledProcessError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
 @eval_app.command("compare")
 def eval_compare(
     a: str = typer.Argument(..., help="A graded directory (eval grade --out)"),

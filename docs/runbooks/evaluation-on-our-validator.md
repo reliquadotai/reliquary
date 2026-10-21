@@ -120,6 +120,69 @@ reliquary eval compare results/<job-start-checkpoint> results/<job>
 Retire the task (`reliquary tasks retire --task-id <job> --retired-at <drand round>`), let the process drain and
 settle, then stop it and free the card.
 
+## 6b. During an RL run
+
+Held-out evaluations of the run's milestone checkpoints, on one card beside the
+run (the trainer never waits for them), shown on the platform's run monitor.
+
+Trainer side: `RELIQUARY_RL_HF_BACKUP_PREFIX=<prefix>`,
+`RELIQUARY_RL_HF_BACKUP_EVERY=<M>` and `RELIQUARY_RL_HF_BACKUP_MILESTONE_EVERY=<K>`.
+Milestones (`ReliquaryForge/<prefix>-step-<n:08d>`, `n` a multiple of `K`) are
+never rotated away; the step survives trainer restarts (it resumes from the
+published checkpoint), so a name is never reused.
+
+The suite, one entry per set (`short` goes in the job ids):
+
+```json
+[{"set_id": "verifiers-aime25-r0-n30", "short": "aime", "slots_per_prompt": 8, "cap": 0.02, "max_new_tokens": 32768},
+ {"set_id": "verifiers-gpqa-diamond", "short": "gpqa", "slots_per_prompt": 4, "cap": 0.02, "max_new_tokens": 32768}]
+```
+
+On the eval host (GPU, subnet bucket `R2_*`, HF token, the wallet of section 3;
+`R2_PUBLIC_*` for `--publish`):
+
+```bash
+reliquary eval schedule --run-id <wandb-run-id> --run-tag <tag> --suite suite.json \
+  --every <N> --hf-prefix <prefix> --model-architecture <arch> --eos-token-id <eos-id> \
+  --baseline-model <start-repo> --baseline-revision <rev> --results-dir results/<tag> \
+  --wallet-name <wallet> --hotkey <hotkey> --http-port <port>          # dry run: prints the plan
+# then the same with --execute --publish --upload --loop-seconds 300
+```
+
+- `<wandb-run-id>` is the trainer's wandb run, `{hotkey[:8]}-{run}-trainer`: the
+  id the platform's run catalog holds. `<N>` must be a multiple of `K`.
+- One checkpoint at a time (one model per process): the start checkpoint first,
+  then the newest milestone. Its jobs `eval-<tag>-s<step:05d>-<short>` (base:
+  `eval-<tag>-base-<short>`) are declared with its fingerprint, one validator is
+  started for that model (`--start-cmd` overrides the command), the other jobs
+  join it as hot jobs. Miners must mine those job ids.
+- Once drained, each job is graded with `--rl-run-id`/`--rl-step` into
+  `results/<tag>/<job>/`; a job missing samples after `--max-wait-hours` is graded
+  with them as failures, one never drained is abandoned. Then the validator is
+  stopped, `results/<tag>/benchmarks.json` rebuilt and published.
+- Evaluations behind training: the milestones between the last one evaluated and
+  the newest are marked skipped, never queued. To backfill one, grade it by hand
+  (`eval grade --rl-run-id ... --rl-step ...`) and pass it to `eval feed --jobs`.
+- State: `results/<tag>/schedule-state.json`; the command is idempotent, rerun it
+  after a crash. A validator found dead is restarted.
+
+The feed by hand, from local gradings or `evaluations/<job>/report.json`
+(`eval grade --upload`):
+
+```bash
+reliquary eval feed --run-id <wandb-run-id> --job-prefix eval-<tag>-s \
+  --baseline-job eval-<tag>-base-aime,eval-<tag>-base-gpqa \
+  [--reports-dir results/<tag>] [--label verifiers-aime25-r0-n30="AIME 2025"] \
+  --out benchmarks.json [--publish]
+```
+
+It is checked against the platform's validator (`shared/run-benchmarks.ts`)
+before it is written. `--publish` puts it at `rl-runs/<wandb-run-id>/benchmarks.json`
+in `reliquary-public`; that bucket is private, so the RL validator serves it at
+`GET /rl/benchmarks?run_id=<wandb-run-id>`. On the platform:
+`RELIQUARY_RUN_BENCHMARKS_URL=https://<rl-validator-public-host>/rl/benchmarks`
+(the collector adds `run_id`).
+
 ## 7. Episode environments (telecom)
 
 A suite episode environment (telecom v2: splits `eval` and `benchmark`) is evaluated
