@@ -11,6 +11,7 @@ the trust is the validator's, which we run.
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 import tempfile
 import time
@@ -21,6 +22,30 @@ from typing import Any
 
 class JobNotGradable(RuntimeError):
     """The job is not an eval job, is not drained, or misses samples."""
+
+
+# HF backups of the async trainer: <namespace>/<prefix>-step-<n:08d> (trainer/hf_backup.py).
+_BACKUP_STEP = re.compile(r"-step-(\d+)$")
+_RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def rl_provenance(model: str | None, *, run_id: str | None = None, step: int | None = None,
+                  checkpoint_version: int | None = None) -> dict:
+    """The RL identity a report carries: ``rl_run_id`` (the trainer's wandb run id), ``rl_step`` and
+    ``rl_checkpoint_version``. Explicit values win; the step (and the version, one step per checkpoint) is read
+    from an HF backup's repo name. Empty when nothing is known: the report is unchanged."""
+    if step is None and model:
+        found = _BACKUP_STEP.search(model)
+        if found:
+            step = int(found.group(1))
+            checkpoint_version = step if checkpoint_version is None else checkpoint_version
+    if run_id is not None and not _RUN_ID.fullmatch(run_id):
+        raise ValueError(f"rl run id {run_id!r}: letters, digits, '.', '_' or '-', at most 128")
+    for name, value in (("rl step", step), ("rl checkpoint version", checkpoint_version)):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            raise ValueError(f"{name} must be a non-negative integer")
+    named = {"rl_run_id": run_id, "rl_step": step, "rl_checkpoint_version": checkpoint_version}
+    return {k: v for k, v in named.items() if v is not None}
 
 
 async def _thresholds(job_id: str, entries: Callable | None) -> tuple[str | None, dict | None]:
@@ -49,8 +74,10 @@ async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bo
                            entries: Callable | None = None,
                            open_taskset: Callable | None = None,
                            require_sandbox=None, work_dir: str | Path | None = None,
+                           rl: dict | None = None,
                            clock: Callable[[], float] = time.time) -> dict:
-    """Grade a drained eval job our validator served; the manifest, its files in ``out``."""
+    """Grade a drained eval job our validator served; the manifest, its files in ``out``.
+    ``rl``: ``rl_provenance`` keywords (run_id, step, checkpoint_version)."""
     from reliquary.corpus.delivery import LocalDirectorySink
     from reliquary.eval import grading
     from reliquary.eval.prompt_source import (
@@ -110,6 +137,10 @@ async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bo
     if not complete and not allow_incomplete:
         raise JobNotGradable(f"job {job_id} misses samples on some problems: pass "
                              "--allow-incomplete to count them as failures")
+    try:
+        rl_identity = rl_provenance(job.checkpoint_repo, **(rl or {}))
+    except ValueError as exc:
+        raise JobNotGradable(f"job {job_id}: {exc}") from exc
     task_id, thresholds = await _thresholds(job_id, entries)
     # An episode's turns still carry TOPLOC proofs (the thresholds); its score
     # is its grader's, from the grade documents.
@@ -131,6 +162,7 @@ async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bo
         "job_complete": complete, "prompts_exhausted": len(exhausted),
         "exhausted_problem_ids": [rows[i]["problem_id"] for i in exhausted],
         **({"allow_incomplete": True} if allow_incomplete else {}),
+        **rl_identity,
     }
     extra = {} if open_taskset is None else {"open_taskset": open_taskset}
     with tempfile.TemporaryDirectory() as scratch:
@@ -150,4 +182,4 @@ async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bo
     return manifest
 
 
-__all__ = ["JobNotGradable", "grade_served_job"]
+__all__ = ["JobNotGradable", "grade_served_job", "rl_provenance"]

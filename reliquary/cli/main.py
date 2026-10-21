@@ -2383,6 +2383,12 @@ def eval_grade(
     allow_incomplete: bool = typer.Option(False, "--allow-incomplete",
                                           help="Grade a drained job missing samples"),
     poll_seconds: float = typer.Option(10.0, "--poll-seconds"),
+    rl_run_id: str | None = typer.Option(None, "--rl-run-id",
+                                         help="The RL trainer's wandb run id this checkpoint belongs to"),
+    rl_step: int | None = typer.Option(None, "--rl-step", min=0,
+                                       help="Its trainer step (default: from a '-step-<n>' backup repo)"),
+    rl_checkpoint_version: int | None = typer.Option(None, "--rl-checkpoint-version", min=0,
+                                                     help="Its published checkpoint (default: the step)"),
     admin_url: str = _ADMIN_URL,
 ) -> None:
     """Grade a drained eval job and write its report, manifest and graded rows.
@@ -2400,9 +2406,13 @@ def eval_grade(
         if not is_order_job_id(job_id):
             if out is None:
                 raise ValueError("--out is required: the grading is written here")
-            answer = asyncio.run(grade_served_job(job_id, out=out,
-                                                  allow_incomplete=allow_incomplete))
+            rl = {k: v for k, v in (("run_id", rl_run_id), ("step", rl_step),
+                                    ("checkpoint_version", rl_checkpoint_version)) if v is not None}
+            answer = asyncio.run(grade_served_job(job_id, out=out, allow_incomplete=allow_incomplete,
+                                                  **({"rl": rl} if rl else {})))
         else:
+            if rl_run_id is not None or rl_step is not None or rl_checkpoint_version is not None:
+                raise ValueError("--rl-* options apply to a job our validator served, not an order job")
             answer = operator.grade_job(_admin_client(admin_url), job_id, out=out,
                                         eval_id=eval_id, allow_incomplete=allow_incomplete,
                                         poll_seconds=poll_seconds)

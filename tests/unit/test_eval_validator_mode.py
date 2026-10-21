@@ -236,10 +236,10 @@ def test_a_served_eval_job_is_graded_on_cpu_from_its_audited_records(
     async def entries():
         return registry["entries"].values()
 
-    def grade(**kw):
+    def grade(out="out", **kw):
         return asyncio.run(grade_served_job(
-            "eval-teutonic-aime26", out=tmp_path / "out", records=records, subnet=subnet,
-            entries=entries, open_taskset=lambda name, args: handle, **kw))
+            "eval-teutonic-aime26", out=tmp_path / out, records=records, subnet=subnet,
+            entries=entries, open_taskset=lambda name, args: handle, clock=lambda: 1.0, **kw))
 
     # Nothing audited yet: an empty job is not complete.
     with pytest.raises(JobNotGradable, match="misses samples"):
@@ -264,6 +264,35 @@ def test_a_served_eval_job_is_graded_on_cpu_from_its_audited_records(
     assert provenance["verification"]["thresholds"]["exp_mismatch_threshold"] is not None
     assert provenance["generation"] == "sn81-miners" and provenance["miner_hotkeys"] == 3
     assert pq.read_table(tmp_path / "out" / "graded.parquet").num_rows == 12
+    assert not any(key.startswith("rl_") for key in provenance)       # no RL identity: nothing added
+    grade(out="again")
+    assert (tmp_path / "again" / "report.json").read_bytes() == (tmp_path / "out" / "report.json").read_bytes()
+    # The RL identity, when given, is the only change.
+    grade(out="rl", rl={"run_id": "5F3sa2TJ-r7-trainer", "step": 40})
+    tagged = json.loads((tmp_path / "rl" / "report.json").read_text())
+    added = {"rl_run_id": "5F3sa2TJ-r7-trainer", "rl_step": 40}
+    assert tagged["provenance"] == {**provenance, **added}
+    assert {k: v for k, v in tagged.items() if k != "provenance"} == {
+        k: v for k, v in report.items() if k != "provenance"}
+    with pytest.raises(JobNotGradable, match="rl run id"):
+        grade(out="bad", rl={"run_id": "no spaces"})
+
+
+def test_the_rl_identity_is_read_from_a_backup_name_or_given():
+    from reliquary.eval.job_grading import rl_provenance
+
+    assert rl_provenance("org/Teutonic") == {}
+    assert rl_provenance("ReliquaryForge/teutonic-rl-step-00000050") == {
+        "rl_step": 50, "rl_checkpoint_version": 50}
+    assert rl_provenance("ReliquaryForge/teutonic-rl-step-00000050", run_id="abc-r1-trainer",
+                         step=51, checkpoint_version=49) == {
+        "rl_run_id": "abc-r1-trainer", "rl_step": 51, "rl_checkpoint_version": 49}
+    assert rl_provenance("org/base", run_id="abc-r1-trainer", step=0) == {
+        "rl_run_id": "abc-r1-trainer", "rl_step": 0}
+    for bad in ({"step": -1}, {"step": True}, {"checkpoint_version": "3"}, {"run_id": ""},
+                {"run_id": "a" * 129}, {"run_id": "a/b"}):
+        with pytest.raises(ValueError):
+            rl_provenance("org/base", **bad)
 
 
 def test_an_order_job_or_a_catalog_job_is_not_graded_here(tmp_path):
@@ -309,6 +338,18 @@ def test_eval_grade_grades_a_served_job_here(monkeypatch, tmp_path):
                     "allow_incomplete": True}
     missing = CliRunner().invoke(app, ["eval", "grade", "--job", "eval-x"])
     assert missing.exit_code == 1 and "--out is required" in missing.output
+
+    async def grade_rl(job_id, *, out, allow_incomplete, rl):
+        seen.update(rl=rl)
+        return {"complete": True}
+
+    monkeypatch.setattr(job_grading, "grade_served_job", grade_rl)
+    tagged = CliRunner().invoke(app, ["eval", "grade", "--job", "eval-x", "--out", str(tmp_path / "o"),
+                                      "--rl-run-id", "abc-r1-trainer", "--rl-step", "40"])
+    assert tagged.exit_code == 0, tagged.output
+    assert seen["rl"] == {"run_id": "abc-r1-trainer", "step": 40}
+    order = CliRunner().invoke(app, ["eval", "grade", "--job", "order-eval-1", "--rl-step", "4"])
+    assert order.exit_code == 1 and "order job" in order.output
 
 
 # --------------------------------------------------------------------------
