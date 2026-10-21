@@ -50,8 +50,8 @@ administrator. Use an operator-controlled environment and state directory.
 Prepare the authority, worker certificate, TLS pins, immutable model assets,
 signed assignments, verified grades and local queue using the pinned runtime's
 [async RL runbook](https://github.com/reliquadotai/reliquary-TEE/blob/51452c8d877987d8a6735aeaf3fa872d27773e59/docs/async-rl.md).
-Review the runtime's [release notes](https://github.com/reliquadotai/reliquary-TEE/releases)
-for its qualification status. Installing or selecting this mode does not
+Review the [qualification scope](https://github.com/reliquadotai/reliquary-TEE/blob/02b2be84897681b9c4f6db7e7021e512a6f343f2/docs/qualification.md)
+for the bounded hardware results and remaining measurements. Installing or selecting this mode does not
 activate a worker fleet or a core protocol profile.
 For `Standard_NCC40ads_H100_v5` workers, use a separate deployment-tooling
 checkout pinned to `9e0595801523a2b4b21f8f612cbebcef894b4386` and follow its
