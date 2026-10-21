@@ -79,6 +79,7 @@ jobs:
           from transformers.models.auto.configuration_auto import CONFIG_MAPPING
           from reliquary.eval import runner, signed_agentic
           from reliquary.environment.agentic_swe import harness_refusal
+          from reliquary.sandbox import SANDBOX_COMMIT
           from reliquary_sandbox import attest
 
           assert os.geteuid() == 10001
@@ -93,7 +94,7 @@ jobs:
           assert "Qwen3_5ForCausalLM" in ModelRegistry.get_supported_archs()
           assert "qwen3_5_text" in CONFIG_MAPPING
           for name, commit in {
-              "reliquary-sandbox": "fc2fa643e8b80ce51fec6c6acf162a306e803684",
+              "reliquary-sandbox": SANDBOX_COMMIT,
               "reliquary-harness": "7d559fd16564ac16af52486fe6552084c685bca6",
               "verifiers": "b2e4e8157783b2c0dffc7821044c87f29f1c3ccf",
           }.items():
