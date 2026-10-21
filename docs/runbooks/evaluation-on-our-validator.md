@@ -132,6 +132,8 @@ bounded inference call. The parent maintains the lease heartbeat and kills and
 joins its owned model process group on timeout or lease loss. Model boot/download
 has a separate one-hour bound. These software checks do not qualify a GPU's
 capacity or a model's performance.
+The main-thread executor also handles SIGTERM through the same cleanup path and
+restores its previous signal handler before returning.
 
 Public checkpoint downloads explicitly disable HF credentials. A lease declaring
 `model_access=private` reads its credential through the current fenced model-credential

@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import signal
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -615,10 +616,18 @@ def run_evaluation(*, platform: str, executor_id: str, work_dir: str,
 
     client = PlatformClient(platform, os.environ.get(TOKEN_ENV, "").strip(),
                             executor_id=executor_id)
+    previous = (signal.getsignal(signal.SIGTERM)
+                if threading.current_thread() is threading.main_thread() else None)
+    def stopping(signum, frame):
+        raise LeaseLost("evaluation executor stopping")
+    if previous is not None:
+        signal.signal(signal.SIGTERM, stopping)
     try:
         return EvalRunner(client, VLLMGenerator(), work_dir=work_dir,
                           chunk_problems=chunk_problems).run()
     finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
         client.close()
 
 

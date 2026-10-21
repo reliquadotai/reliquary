@@ -491,6 +491,75 @@ def test_crashed_model_leader_does_not_orphan_its_descendants():
             os.killpg(group, signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+
+def test_executor_sigterm_joins_its_model_group_and_restores_handler(tmp_path):
+    import os
+    import signal
+    import subprocess
+    from pathlib import Path
+
+    ready, finished = tmp_path / "ready.json", tmp_path / "finished.json"
+    script = tmp_path / "stop_executor.py"
+    script.write_text(f'''
+import json, os, signal
+from pathlib import Path
+from reliquary.eval import runner
+from reliquary.eval.model_process import ModelProcess
+from reliquary.eval.platform_client import LeaseLost
+from tests.unit.test_eval_protocol import HungModel
+class Client:
+    closed = False
+    def close(self): self.closed = True
+class Executor:
+    def __init__(self, *args, **kwargs): pass
+    def run(self):
+        model = ModelProcess(HungModel, timeout_seconds=60)
+        try:
+            model.load(revision='a' * 40)
+            Path({str(ready)!r}).write_text(json.dumps({{'worker': model._process.pid}}))
+            model.generate([], samples=[], seeds=[], sampling={{}}, max_new_tokens=1)
+        finally:
+            model.close()
+if __name__ == '__main__':
+    client = Client()
+    runner.PlatformClient = lambda *args, **kwargs: client
+    runner.EvalRunner = Executor
+    previous = signal.getsignal(signal.SIGTERM)
+    try:
+        runner.run_evaluation(platform='http://fixture', executor_id='fixture', work_dir='unused')
+    except LeaseLost:
+        Path({str(finished)!r}).write_text(json.dumps({{'closed': client.closed,
+            'restored': signal.getsignal(signal.SIGTERM) == previous}}))
+''')
+    process, worker = None, None
+    with (tmp_path / "executor.log").open("wb") as log:
+        try:
+            root = str(Path(__file__).parents[2])
+            process = subprocess.Popen([sys.executable, "-B", str(script)], cwd=root,
+                env={**os.environ, "PYTHONPATH": root}, stdout=log, stderr=subprocess.STDOUT)
+            until = time.monotonic() + 60
+            while not ready.exists() and process.poll() is None and time.monotonic() < until:
+                time.sleep(0.02)
+            assert ready.exists(), (tmp_path / "executor.log").read_text()
+            worker = json.loads(ready.read_text())["worker"]
+            assert os.getpgid(worker) == worker
+            process.send_signal(signal.SIGTERM)
+            assert process.wait(timeout=15) == 0
+            assert json.loads(finished.read_text()) == {"closed": True, "restored": True}
+            with pytest.raises(ProcessLookupError):
+                os.kill(worker, 0)
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            if worker is not None:
+                try:
+                    os.killpg(worker, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
 def test_shared_worker_protocol_bytes_fixture():
     from pathlib import Path
     path = Path(__file__).parents[1] / "fixtures/evaluation_protocol.json"
