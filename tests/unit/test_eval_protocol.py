@@ -507,27 +507,28 @@ from pathlib import Path
 from reliquary.eval import runner
 from reliquary.eval.model_process import ModelProcess
 from reliquary.eval.platform_client import LeaseLost
-from tests.unit.test_eval_protocol import HungModel
-class Client:
-    closed = False
-    def close(self): self.closed = True
-class Executor:
-    def __init__(self, *args, **kwargs): pass
-    def run(self):
-        model = ModelProcess(HungModel, timeout_seconds=60)
-        try:
-            model.load(revision='a' * 40)
-            Path({str(ready)!r}).write_text(json.dumps({{'worker': model._process.pid}}))
-            model.generate([], samples=[], seeds=[], sampling={{}}, max_new_tokens=1)
-        finally:
-            model.close()
+from tests.unit.test_eval_platform_client import FakePlatform, _task
+class Model:
+    def load(self, **kwargs):
+        return {{'model_sha': kwargs['revision'], 'vllm_version': 'fixture', 'gpu': 'CPU fixture'}}
+    def render(self, row, **kwargs): return 'fixture'
+    def generate(self, **kwargs):
+        import time
+        Path({str(ready)!r}).write_text(json.dumps({{'worker': os.getpid()}}))
+        time.sleep(60)
 if __name__ == '__main__':
-    client = Client()
+    client = FakePlatform(tasks=[_task()], prompts=[{{'problem_id': 'p', 'samples': 1}}]).client()
+    client.closed = False
+    close = client.close
+    def closing():
+        client.closed = True
+        close()
+    client.close = closing
     runner.PlatformClient = lambda *args, **kwargs: client
-    runner.EvalRunner = Executor
+    runner.VLLMGenerator = lambda: ModelProcess(Model, timeout_seconds=60)
     previous = signal.getsignal(signal.SIGTERM)
     try:
-        runner.run_evaluation(platform='http://fixture', executor_id='fixture', work_dir='unused')
+        runner.run_evaluation(platform='http://fixture', executor_id='fixture', work_dir={str(tmp_path / 'work')!r})
     except LeaseLost:
         Path({str(finished)!r}).write_text(json.dumps({{'closed': client.closed,
             'restored': signal.getsignal(signal.SIGTERM) == previous}}))
