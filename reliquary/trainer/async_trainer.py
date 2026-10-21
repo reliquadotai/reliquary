@@ -306,7 +306,6 @@ class AsyncTrainer:
         self.audits = audits                    # trainer.audits.TrainerAudits: out-of-zone audits on this model
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ckpt-publish")
         self._pending: Future | None = None
-        self.steps = 0
         self.since_checkpoint = 0
         self.published: list[int] = []
         self.last_step: dict = {}
@@ -317,6 +316,10 @@ class AsyncTrainer:
             self.version = 0
             self._publish(0, self._snapshot())
             self.wait_published()
+        # One step per checkpoint: the book's latest checkpoint is the number of steps trained, so the step resumes
+        # from it (HF backup names, wandb steps), unique and increasing across restarts. A step lost before its
+        # publication is lost with its weights.
+        self.steps = self.version * config.steps_per_checkpoint
 
     # --- checkpoints ---------------------------------------------------------------------------------------
     def _snapshot(self) -> dict:
@@ -464,7 +467,7 @@ class AsyncTrainer:
                          "async/step_s": worked, "async/completion_tokens": completion,
                          "async/completion_tokens_per_s": completion / worked if worked > 0 else 0.0,
                          "async/steps_skipped_total": self.skipped, **_peak_memory()},
-                        (self.global_step_hint or 0) + self.steps)
+                        self.steps)
         return "trained"
 
     def _report(self, submitted: list[SubmittedGroup], gate: DrawGate) -> dict[str, int]:

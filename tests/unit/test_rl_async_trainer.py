@@ -264,6 +264,33 @@ def test_publication_every_step_and_hf_backup_every_m(monkeypatch):
     assert all(r["accepted"] for r in subs.reports.values())
 
 
+def test_the_step_survives_a_restart_so_backup_names_never_repeat():
+    model, book = _Model(), Book(latest=None)
+    buffer = TrainingBuffer(book)
+    backups = []
+    backup = SimpleNamespace(submit=lambda step, save: backups.append(step))
+
+    def fake_step(model, batches, *, gate, **_):
+        for g in (g for b in batches for g in b):
+            gate.admit(g.rollouts, [(30, 30, N_TOK, N_TOK)] * len(g.rollouts))
+        gate.judge([])
+        return model
+
+    steps = []
+    for life in range(3):                                # the trainer restarts twice on the same book
+        trainer, *_ = loop(model, book, buffer, batch=1, hf_backup_every=2)
+        trainer._train_step, trainer.backup = fake_step, backup
+        assert trainer.steps == trainer.version == 3 * life
+        for i in range(3):
+            buffer.push(submitted(model, f"g{life}-{i}", k=trainer.version, n=2))
+            assert trainer.run_once() == "trained"
+            steps.append(trainer.last_step["step"])
+            assert trainer.last_step["step"] == trainer.version
+        trainer.close()
+    assert steps == list(range(1, 10))
+    assert backups == [2, 4, 6, 8]
+
+
 def test_a_skipped_step_pays_nothing_and_a_crash_requeues():
     model, book = _Model(), Book()
     buffer = TrainingBuffer(book)
@@ -370,12 +397,12 @@ def test_one_wandb_row_per_step_with_the_step_timings(monkeypatch):
     buffer.push(submitted(model, "good", arrived=1.0))
     buffer.push(submitted(model, "other", arrived=0.0))
     trainer, *_ = loop(model, book, buffer)
-    trainer.global_step_hint = 30
+    trainer.global_step_hint = 3                         # the LR schedule position; the wandb step is the step
     assert trainer.run_once() == "trained"
     trainer.close()
     fake_wandb.log.assert_called_once()
     row, step = fake_wandb.log.call_args.args[0], fake_wandb.log.call_args.kwargs["step"]
-    assert step == 31                                    # after a resume the hint keeps the steps increasing
+    assert step == 4                                     # resumed at checkpoint 3: the 4th step
     assert "train/lr" in row and row["async/groups_accepted"] == 2
     assert {"async/wait_s", "async/train_s", "async/step_s", "async/snapshot_s", "async/publish_wait_s"} <= set(row)
     assert row["async/completion_tokens"] == 2 * ROLLOUTS * N_TOK
