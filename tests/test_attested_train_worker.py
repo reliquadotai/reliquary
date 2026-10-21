@@ -206,6 +206,34 @@ def test_installed_runtime_pin_and_exit_status(isolated_runtime, tmp_path):
     assert json.loads(result.stdout) == ["reliquary-tee", "trainer", "--max-steps", "2"]
 
 
+@pytest.mark.parametrize(
+    ("commit", "returncode"),
+    [
+        ("51452c8d877987d8a6735aeaf3fa872d27773e59", 1),
+        ("2aa9dd968c1b58b611b37c56d3fbdd6389857315", 7),
+    ],
+    ids=["previous-runtime-refused", "clock-wait-runtime-accepted"],
+)
+def test_runtime_revision_upgrade_keeps_exact_pin(isolated_runtime, commit, returncode):
+    python, path, source = isolated_runtime
+    source["vcs_info"].update(commit_id=commit, requested_revision=commit)
+    path.write_text(json.dumps(source))
+
+    result = bootstrap(python, "trainer", "--max-steps", "1")
+
+    assert result.returncode == returncode, result.stderr
+    if returncode == 7:
+        assert json.loads(result.stdout) == [
+            "reliquary-tee",
+            "trainer",
+            "--max-steps",
+            "1",
+        ]
+    else:
+        assert "does not match the pinned Git revision" in result.stderr
+        assert result.stdout == ""
+
+
 @pytest.mark.parametrize("change", ["commit", "url", "editable", "missing"])
 def test_runtime_refuses_unpinned_installation(isolated_runtime, change):
     python, path, source = isolated_runtime
