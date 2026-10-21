@@ -35,6 +35,7 @@ from reliquary.eval.metrics import bootstrap_mean_ci, pass_at_k, report_ks
 from reliquary.eval.prompt_source import REFERENCE_INTERACTIONS
 from reliquary.eval.sets import open_source, prompt_sha256, validated_set_id
 from reliquary.eval.storage import subnet_key
+from reliquary.eval.protocol import digest, public_taskset, validate_request, validate_set
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,8 @@ MAX_SAMPLES = 1024
 _KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/=-]{0,511}$")
 _FENCE_RE = re.compile(r"(?s)(```|~~~)[^\n]*\n.*?\1")
 GRADED_COLUMNS = ("env", "set_id", "problem_id", "sample_index", "completion", "tokens",
-                  "finish_reason", "correct", "score", "grader_detail")
+                  "finish_reason", "correct", "score", "grader_detail", "turns", "tool_calls", "transcript_tokens",
+                  "episode_stop_reason")
 
 
 class SetUnknown(LookupError):
@@ -120,6 +122,10 @@ async def load_sets(set_ids: Sequence[str], problems_per_set: Mapping[str, int],
         if card_body is None or grading_body is None:
             raise SetUnknown(set_id)
         card = json.loads(card_body)
+        try:
+            validate_set(card, current_grader=True)
+        except ValueError as exc:
+            raise GradeRequestError(str(exc)) from exc
         if hashlib.sha256(grading_body).hexdigest() != card.get("grading_sha256"):
             raise RuntimeError(f"set {set_id}: grading.jsonl does not match its card")
         wanted = _count(problems_per_set[set_id], low=1, high=int(card["count"]),
@@ -133,11 +139,20 @@ async def load_sets(set_ids: Sequence[str], problems_per_set: Mapping[str, int],
 
 def require_gradable(sets: Mapping[str, tuple[dict, list[dict]]], *,
                      pregraded: bool = False) -> None:
-    """Only an episode job's grade documents arrive graded (``pregraded``), and
-    nothing here replays an episode or runs a sandbox: an episode or SWE set is
-    graded from its job (``eval grade``), never from uploads or completions."""
+    """Reference-only jobs supply their own grades; pinned episodes are replayed."""
     for set_id, (card, _) in sets.items():
+        if card.get("interaction") == "signed_episode" and any(
+                card.get(key) is None for key in ("protocol", "protocol_json", "protocol_sha256")):
+            raise GradeRequestError(f"set {set_id} requires a frozen signed episode protocol")
         episode = card.get("interaction") in REFERENCE_INTERACTIONS
+        if card.get("protocol") is not None and card.get("interaction") in {
+                "episode", "signed_episode"}:
+            validate_set(card)
+            expected = {"episode": "telecom-episode-v1", "signed_episode": "signed-bash-v1"}
+            if (card.get("source_kind") != card["interaction"]
+                    or card["protocol"]["harness"].get("id") != expected[card["interaction"]]):
+                raise GradeRequestError(f"set {set_id} has no supported pinned episode grader")
+            episode = False
         if episode and not pregraded:
             raise GradeRequestError(f"set {set_id} holds {card['interaction']} tasks: "
                                     "grade it from its job (eval grade)")
@@ -153,7 +168,7 @@ def require_sandboxes(sets: Mapping[str, tuple[dict, list[dict]]], require=None)
     if require is None:
         from reliquary.corpus.export import require_code_sandbox as require
     for card, _ in sets.values():
-        if card.get("source_kind") == "verifiers":
+        if card.get("source_kind") in {"verifiers", "signed_episode"}:
             # Its code runs, if at all, in the task's own Docker box.
             continue
         if card.get("interaction") in REFERENCE_INTERACTIONS:
@@ -239,6 +254,9 @@ class _Graders:
             return self._grade_verifiers(grading, completion, card or {})
         source, split = grading["source"], grading["split"]
         spec = self.spec(source)
+        if card and card.get("protocol") and (
+                card.get("environment_manifest_sha256") != spec.environment_manifest_sha256):
+            return None, "grader_drift: the installed environment manifest changed", False
         answer = answer_text(spec.final_answer_policy, completion, thinking=self._thinking)
         failed_format = format_failed(spec.final_answer_policy, answer)
         try:
@@ -251,6 +269,8 @@ class _Graders:
             if prompt_sha256(problem["prompt"]) != grading["prompt_sha256"]:
                 return None, "source_drift: the source row is not the frozen prompt", \
                     failed_format
+            if grading.get("reference_sha256") is not None and digest(problem) != grading["reference_sha256"]:
+                return None, "source_drift: the source reference changed", failed_format
             value = float(score(problem, answer))
         except Exception as exc:
             return None, f"grader_error: {type(exc).__name__}: {exc}"[:500], failed_format
@@ -277,15 +297,20 @@ class _Graders:
                     self._child = verifiers_source.ChildScorer()
                 if cache not in self.taskset_versions:
                     self.taskset_versions[cache] = self._child.provenance(name, args)
+                if card.get("protocol") and self.taskset_versions[cache] != taskset:
+                    return None, "grader_drift: the taskset artifact changed", failed_format
                 value = float(self._child.score(name, args, grading["task_key"],
-                                                grading["prompt_sha256"], answer))
+                                                grading["prompt_sha256"], answer,
+                                                grading.get("reference_sha256")))
             else:
                 if cache not in self._tasksets:
                     self._tasksets[cache] = self._open_taskset(name, args)
                     self.taskset_versions[cache] = self._tasksets[cache].provenance()
+                if card.get("protocol") and self.taskset_versions[cache] != taskset:
+                    return None, "grader_drift: the taskset artifact changed", failed_format
                 value = float(verifiers_source.score_answer(
                     self._tasksets[cache], grading["task_key"], grading["prompt_sha256"],
-                    answer))
+                    answer, grading.get("reference_sha256")))
         except LookupError as exc:
             if str(exc).strip("'\"") == "source_drift":
                 return None, "source_drift: the task is not the frozen prompt", failed_format
@@ -297,13 +322,14 @@ class _Graders:
 
 def _taskset_grading(card: Mapping, graders: "_Graders") -> dict:
     """The taskset a Verifiers set was built from and the one that scored it
-    here. A reward can change between versions while every prompt still
-    matches, so a difference is reported, never silently absorbed."""
+    here. Pinned sets refuse artifact drift before scoring; legacy sets retain
+    their original readable version diagnostics."""
     built = dict(card.get("taskset") or {})
     cache = json.dumps([built.get("id"), dict(built.get("args") or {})], sort_keys=True)
     graded = graders.taskset_versions.get(cache)
     keys = ("package_version", "verifiers_version")
-    return {"taskset": built, "taskset_at_grading": graded,
+    return {"taskset": public_taskset(built) if card.get("protocol") else built,
+            "taskset_at_grading": public_taskset(graded) if card.get("protocol") else graded,
             "grader_version_drift": None if graded is None else any(
                 built.get(k) != graded.get(k) for k in keys)}
 
@@ -316,6 +342,8 @@ def _graded_schema():
         ("sample_index", pa.int32()), ("completion", pa.string()), ("tokens", pa.int32()),
         ("finish_reason", pa.string()), ("correct", pa.bool_()), ("score", pa.float64()),
         ("grader_detail", pa.string()),
+        ("turns", pa.int32()), ("tool_calls", pa.int32()), ("transcript_tokens", pa.int32()),
+        ("episode_stop_reason", pa.string()),
     ])
 
 
@@ -380,12 +408,24 @@ def _env_report(problems: list[tuple[str, int]], per_problem: Mapping[str, list[
         **headline,
         "excluding_ungraded_and_missing": excluded,
         "mean_score": sum(scores) / len(scores) if scores else None,
+        "requested_samples": expected,
+        "attempted_samples": None,
+        "completed_samples": len(all_rows),
+        "graded_samples": graded_rows,
+        "mean_turns": (sum(r["turns"] for r in all_rows) / len(all_rows)
+                       if all_rows and all(r.get("turns") is not None for r in all_rows) else None),
+        "tool_calls_total": (sum(r["tool_calls"] for r in all_rows)
+                             if all_rows and all(r.get("tool_calls") is not None for r in all_rows) else None),
+        "stop_reasons": (dict(Counter(r.get("episode_stop_reason") if r.get("turns") is not None
+                                      else r["finish_reason"] for r in all_rows))
+                         if all_rows and all(r.get("episode_stop_reason") if r.get("turns") is not None
+                                             else r["finish_reason"] for r in all_rows) else None),
         "truncation_rate": (sum(1 for r in all_rows if r["finish_reason"] == "length")
                             / len(all_rows)) if all_rows else None,
         "format_failure_rate": (sum(1 for r in all_rows if r["format_failure"])
                                 / len(all_rows)) if all_rows else None,
         "mean_completion_tokens": (sum(r["tokens"] for r in all_rows) / len(all_rows))
-        if all_rows else None,
+        if all_rows and all(r["tokens"] is not None for r in all_rows) else None,
     }
     report["complete"] = report["missing_rows"] == 0 and report["ungraded_rows"] == 0
     return report
@@ -704,7 +744,7 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
                            work_dir: str | Path | None = None,
                            clock: Callable[[], float] = time.time,
                            bootstrap_seed: int = BOOTSTRAP_SEED,
-                           service_contract=None) -> dict:
+                           service_contract=None, verify_signed=None) -> dict:
     """Grade every completion and write the evaluation; the manifest. A grading
     whose manifest exists is returned as stored. The completions are the pod's
     uploads (``completion_keys``) or an eval job's passing records (``job_rows``)."""
@@ -715,11 +755,30 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
     manifest_key = f"{prefix}/manifest.json"
     stored = await platform.get_json(manifest_key)
     if stored is not None:
+        if provenance.get("protocol_sha256") is not None and (
+                stored.get("protocol_sha256") != provenance["protocol_sha256"]
+                or stored.get("protocol_bindings") != provenance.get("protocol_bindings")):
+            raise GradeRequestError("grading exists under another evaluation protocol")
         if service_contract is not None and stored.get("service_contract_sha256") != service_contract.sha256:
             raise GradeRequestError("grading exists under another service contract")
         return stored
     keys = validated_completion_keys(completion_keys) if job_rows is None else []
     sets = await load_sets(set_ids, problems_per_set, samples_per_set, subnet=subnet)
+    bindings = {set_id: card.get("protocol_sha256") for set_id, (card, _) in sets.items()}
+    try:
+        validate_request(dict(provenance), bindings=bindings)
+        if provenance.get("protocol"):
+            from reliquary.eval.runner import validate_model
+
+            validate_model(provenance.get("model"), provenance.get("revision"))
+            if provenance.get("model_sha") != provenance["revision"]:
+                raise ValueError("graded model does not match the frozen checkpoint")
+        if provenance.get("protocol") and provenance["protocol"].get("sets") != [
+                {"set_id": set_id, "env": card["env"], "problems": problems_per_set[set_id],
+                 "samples": samples_per_set[set_id]} for set_id, (card, _) in sets.items()]:
+            raise ValueError("request protocol selected sets changed")
+    except ValueError as exc:
+        raise GradeRequestError(str(exc)) from exc
     if service_contract is not None:
         from reliquary.services.mapping import validate_grading_context
         validate_grading_context(service_contract, sets, dict(provenance))
@@ -729,6 +788,8 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
     selected: dict[str, tuple[str, dict, dict, int]] = {}
     for set_id, (card, rows) in sets.items():
         for row in rows:
+            if row["problem_id"] in selected:
+                raise GradeRequestError("selected sets contain a repeated problem identity")
             selected[row["problem_id"]] = (set_id, card, row, int(samples_per_set[set_id]))
     # The order's thinking mode, from the job (or the pod's provenance): it
     # decides whether a completion with no closing tag holds an answer at all.
@@ -773,11 +834,11 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
                 batch.append((row, entry))
                 if len(batch) >= BATCH_ROWS:
                     await _grade_batch(batch, graders, per_problem, writer, pa,
-                                       pregraded=pregraded)
+                                       verify_signed=verify_signed, provenance=provenance, eval_id=eval_id, pregraded=pregraded)
                     batch = []
             if batch:
                 await _grade_batch(batch, graders, per_problem, writer, pa,
-                                       pregraded=pregraded)
+                                   verify_signed=verify_signed, provenance=provenance, eval_id=eval_id, pregraded=pregraded)
         finally:
             writer.close()
         if job_rows is not None:
@@ -808,6 +869,10 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
             "complete": all(r["complete"] for r in envs.values())
             and not counts["malformed_rows"],
             "envs": envs, "macro": _macro(envs),
+            "protocol": provenance.get("protocol"),
+            "protocol_json": provenance.get("protocol_json"),
+            "protocol_sha256": provenance.get("protocol_sha256"),
+            "protocol_bindings": bindings,
             "counts": {"unexpected_rows": counts["unexpected_rows"],
                        "malformed_rows": counts["malformed_rows"]},
             "headline": "missing and ungraded samples count as failures; "
@@ -820,6 +885,9 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
                           "samples": samples_per_set[set_id],
                           "prompts_sha256": card["prompts_sha256"],
                           "grading_sha256": card["grading_sha256"],
+                          "protocol_sha256": card.get("protocol_sha256"),
+                          **({"training_overlap": card["protocol"]["disjointness"]}
+                             if card.get("protocol") else {}),
                           "environment_manifest_sha256":
                               card.get("environment_manifest_sha256"),
                           "rl_disjointness": card.get("disjointness", {}).get("rl"),
@@ -864,6 +932,8 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
             job_id=None if job_rows is None else job_rows.job.job_id,
             service_contract_sha256=None if service_contract is None else service_contract.sha256),
         "complete": report["complete"],
+        "protocol_sha256": report["protocol_sha256"],
+        "protocol_bindings": bindings,
         "rows": sum(len(v) for v in per_problem.values()), "files": files,
         "keys": [f["key"] for f in files] + [manifest_key],
         **({"service_contract_sha256": service_contract.sha256} if service_contract is not None else {}),
@@ -874,30 +944,104 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
 
 
 async def _grade_batch(batch, graders: _Graders, per_problem, writer, pa, *,
-                       pregraded: bool = False) -> None:
-    """``pregraded``: the rows are an episode job's (``EpisodeJobRows``), each
-    carrying its grade document's verdict; never an upload's own claim."""
+                       verify_signed=None, provenance=None, eval_id=None, pregraded: bool = False) -> None:
+    """Only EpisodeJobRows enables pregraded documents; uploads never do."""
+    import base64
+    import math
+
+    signed = {}
+    for row, (_, card, grading, _) in batch:
+        if pregraded or card.get("interaction") != "signed_episode":
+            continue
+        key = (card["set_id"], row["problem_id"], row["sample_index"])
+        try:
+            if verify_signed is None:
+                raise ValueError("signed receipt verification is unavailable")
+            episode = row["episode"]
+            binding = episode["binding"]
+            expected = {"eval_id": eval_id, "task_id": provenance["task_id"],
+                "model": {"repo": provenance["model"], "revision": provenance["revision"]},
+                "set_id": card["set_id"], "problem_id": row["problem_id"],
+                "sample_index": row["sample_index"], "protocol_sha256": provenance["protocol_sha256"],
+                "worker_id": provenance["worker_id"], "lease_fence": provenance["lease_fence"]}
+            if any(binding.get(name) != value for name, value in expected.items()):
+                raise ValueError("signed result differs from the accepted worker lease")
+            encoded = episode["state_base64"]
+            if not isinstance(encoded, str) or len(encoded) > 128 * 1024**2:
+                raise ValueError("signed final state exceeds its bounded envelope")
+            state = base64.b64decode(encoded, validate=True)
+            score = await verify_signed(binding, episode["transcript"], card=card, row=grading,
+                                        final_state=state)
+            if type(score) not in (int, float) or not math.isfinite(score) or not 0 <= score <= 1:
+                raise ValueError("signed reward is invalid")
+            signed[key] = (float(score), "", False)
+        except Exception as exc:
+            signed[key] = (None, "signed_receipt_error: " + type(exc).__name__, False)
+
     def run() -> list[dict]:
         out = []
         for row, (set_id, card, grading, _) in batch:
             completion = row.get("completion")
             completion = completion if isinstance(completion, str) else ""
+            episode_metrics = None
+            tokens = int(row.get("completion_tokens") or 0)
             if pregraded:
-                # Graded already, by the job's grader: its grade document's verdict.
                 score, verdict = row["pregraded"]
                 correct = None if score is None else verdict.get("graded_success") is True
                 detail = json.dumps(verdict, sort_keys=True)
                 failed_format = False
+            elif card.get("interaction") == "signed_episode":
+                score, detail, failed_format = signed[(card["set_id"], row["problem_id"], row["sample_index"])]
+            elif card.get("interaction") == "episode":
+                try:
+                    from reliquary.eval.agentic import load_telecom_benchmark, grade_telecom_episode
+                    source = load_telecom_benchmark(card["environment_manifest_sha256"])
+                    task = source.environment.get_task(grading["source_index"])
+                    if digest(__import__("dataclasses").asdict(task)) != grading["reference_sha256"]:
+                        raise ValueError("frozen episode task changed")
+                    bounds = provenance["protocol"]
+                    from reliquary.eval.runner import normalized_sampling, problem_seed
+                    seed = (problem_seed(normalized_sampling(provenance["sampling"])["seed"],
+                                         row["problem_id"]) + row["sample_index"]) % 2**31
+                    if row["episode"]["seed"] != seed:
+                        raise ValueError("episode seed differs from the frozen sampling")
+                    reward = grade_telecom_episode(source, task=task, seed=seed,
+                        episode_wire=row["episode"]["trace"], max_turns=bounds["max_turns"],
+                        max_new_tokens=bounds["max_new_tokens"], max_episode_tokens=bounds["max_episode_tokens"],
+                        episode_timeout_seconds=bounds["episode_timeout_seconds"])
+                    trace = row["episode"]["trace"]
+                    # Accounting comes from the replayed trajectory, not pod summaries.
+                    episode_metrics = {"turns": len(trace["actions"]),
+                        "tool_calls": sum("tool" in action for action in trace["actions"]),
+                        "transcript_tokens": len(trace["tokens"]),
+                        "stop_reason": trace["termination_reason"]}
+                    tokens = sum(end - start for start, end in trace["assistant_spans"])
+                    score, detail, failed_format = float(reward.reward), "", False
+                except Exception as exc:
+                    score, detail, failed_format = None, "episode_replay_error: " + type(exc).__name__, False
             else:
                 score, detail, failed_format = graders.grade(grading, completion, card)
+            if not pregraded and card.get("interaction") == "episode":
+                accounting = episode_metrics or {}
+                if episode_metrics is None:
+                    tokens = None
+            else:
+                accounting = {} if pregraded else row.get("episode") or {}
+            if not pregraded:
                 correct = None if score is None else score >= 1.0
             out.append({
                 "env": card["env"], "set_id": set_id, "problem_id": grading["problem_id"],
                 "sample_index": int(row["sample_index"]), "completion": completion,
-                "tokens": int(row.get("completion_tokens") or 0),
+                "tokens": tokens,
                 "finish_reason": str(row.get("finish_reason") or ""),
                 "correct": correct, "score": score,
                 "grader_detail": detail, "format_failure": failed_format,
+                "episode_stop_reason": (accounting.get("stop_reason")
+                                        if isinstance(accounting.get("stop_reason"), str)
+                                        else None),
+                **{key: (accounting.get(key) if type(accounting.get(key)) is int
+                         and accounting[key] >= 0 else None)
+                   for key in ("turns", "tool_calls", "transcript_tokens")},
             })
         return out
 
@@ -906,7 +1050,7 @@ async def _grade_batch(batch, graders: _Graders, per_problem, writer, pa, *,
     for row in rows:
         per_problem[row["problem_id"]].append(
             {k: row[k] for k in ("score", "correct", "finish_reason", "tokens",
-                                 "format_failure")})
+                                 "format_failure", "turns", "tool_calls", "episode_stop_reason")})
     table = pa.Table.from_pylist([{k: r[k] for k in GRADED_COLUMNS} for r in rows],
                                  schema=_graded_schema())
     await asyncio.to_thread(writer.write_table, table)

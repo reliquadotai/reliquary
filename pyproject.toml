@@ -82,6 +82,10 @@ build-backend = "hatchling.build"
 [tool.hatch.metadata]
 allow-direct-references = true
 
+[tool.hatch.build.targets.wheel.force-include]
+# The historical manifest binds this exact path relative to the installed package root.
+"tests/fixtures/reliquarylogic_v1.jsonl" = "tests/fixtures/reliquarylogic_v1.jsonl"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
