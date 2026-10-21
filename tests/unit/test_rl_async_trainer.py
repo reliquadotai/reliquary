@@ -291,6 +291,30 @@ def test_the_step_survives_a_restart_so_backup_names_never_repeat():
     assert backups == [2, 4, 6, 8]
 
 
+def test_hf_backup_freezes_the_actual_scheduler_step_with_the_weights(tmp_path):
+    model, book = _Model(), Book(latest=3)
+    buffer = TrainingBuffer(book)
+    queued, saved = [], []
+    trainer, *_ = loop(model, book, buffer, batch=1, hf_backup_every=1)
+    trainer.global_step_hint = 120
+    trainer.backup = SimpleNamespace(submit=lambda step, save: queued.append((step, save)))
+    trainer._backup_save = lambda state, folder, *, lr_schedule_step: saved.append((state, lr_schedule_step))
+    try:
+        buffer.push(submitted(model, "first", k=trainer.version))
+        assert trainer.run_once() == "trained"
+        first_state = {key: value.detach().clone() for key, value in trainer.model.state_dict().items()}
+        buffer.push(submitted(model, "second", k=trainer.version))
+        assert trainer.run_once() == "trained"
+        assert training.current_lr_schedule_step() == 122
+        assert [step for step, _ in queued] == [4, 5]
+        queued[0][1](tmp_path)
+        assert saved[0][1] == 121  # neither checkpoint number 4 nor the later scheduler position 122
+        for key, value in first_state.items():
+            assert torch.equal(saved[0][0][key], value)
+    finally:
+        trainer.close()
+
+
 def test_a_skipped_step_pays_nothing_and_a_crash_requeues():
     model, book = _Model(), Book()
     buffer = TrainingBuffer(book)

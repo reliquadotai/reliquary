@@ -14,13 +14,31 @@ any step waiting behind it (only the newest waits).
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+import hashlib
 import logging
 from pathlib import Path
 import shutil
 import tempfile
 import threading
+import uuid
+
+from reliquary.shared.checkpoint_identity import (
+    require_checkpoint_number, require_immutable_checkpoint_revision,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def write_backup_profile(folder: Path, *, lr_schedule_step: int | None,
+                         checkpoint_run: str, task_id: str) -> Path:
+    from reliquary.validator.checkpoint_profile import write_checkpoint_profile
+
+    step = require_checkpoint_number(lr_schedule_step, field="backup optimizer step")
+    if not all(isinstance(value, str) and value.strip() == value and value
+               for value in (checkpoint_run, task_id)):
+        raise ValueError("backup requires its actual async run and task identity")
+    return write_checkpoint_profile(folder, extra={"lr_schedule_step": step,
+        "async_checkpoint_run": checkpoint_run, "async_task_id": task_id})
 
 
 def plan_backup_rotation(
@@ -110,22 +128,76 @@ class BackgroundHfBackup:
 
 class HfRepoPerBackup:
     """Upload/list/delete callables for BackgroundHfBackup, one private repo per
-    backup under ``namespace`` (e.g. ReliquaryForge)."""
+    backup under ``namespace``. Uploads require a private local receipt directory;
+    listing remains usable without one."""
 
-    def __init__(self, namespace: str, prefix: str, api=None) -> None:
+    def __init__(self, namespace: str, prefix: str, api=None,
+                 *, receipt_dir: str | Path | None = None) -> None:
         from huggingface_hub import HfApi
 
         self.namespace, self.prefix = namespace, prefix
         self._api = api or HfApi()
+        self._receipts = Path(receipt_dir) if receipt_dir is not None else None
 
     def repo_id(self, step: int) -> str:
         return f"{self.namespace}/{self.prefix}-step-{int(step):08d}"
 
-    def upload(self, step: int, folder: Path) -> None:
+    def upload(self, step: int, folder: Path) -> dict:
+        from huggingface_hub.utils import RevisionNotFoundError
+        from reliquary.trainer.publisher import (
+            PUBLICATION_RECEIPT, PublicationConflict, _file_identity, _verify_weight_file_set,
+        )
+        from reliquary.validator.checkpoint_profile import validate_checkpoint_profile, CHECKPOINT_PROFILE_NAME
+        from reliquary.validator.control import write_json
+
+        step = require_checkpoint_number(step)
+        if self._receipts is None:
+            raise ValueError("HF uploads require a durable local publication receipt directory")
+        receipt_path = self._receipts / f"step-{step:08d}.private.json"
+        if receipt_path.exists():
+            raise ValueError("checkpoint already has a publication receipt; do not republish it")
+        profile = validate_checkpoint_profile(folder, required=True)
+        require_checkpoint_number(profile.get("lr_schedule_step"), field="backup optimizer step")
+        if not all(isinstance(profile.get(key), str) and profile[key].strip() == profile[key] and profile[key]
+                   for key in ("training_run_id", "async_checkpoint_run", "async_task_id")):
+            raise ValueError("backup profile requires its training, async run and task identity")
         repo = self.repo_id(step)
         self._api.create_repo(repo, private=True, exist_ok=True)
-        self._api.upload_folder(repo_id=repo, folder_path=str(folder),
-                                commit_message=f"backup step {step}")
+        try:
+            parent = self._api.model_info(repo).sha
+        except RevisionNotFoundError:
+            parent = None
+        if parent is not None:
+            parent = require_immutable_checkpoint_revision(parent)
+            if PUBLICATION_RECEIPT in self._api.list_repo_files(repo, revision=parent):
+                raise PublicationConflict("backup repository already contains a publication; review its receipt")
+            _verify_weight_file_set(self._api, repo, parent, [])
+        files = {path.name: _file_identity(path) for path in sorted(folder.iterdir())
+                 if path.name != PUBLICATION_RECEIPT}
+        publication = {"publication_id": uuid.uuid4().hex, "parent_revision": parent,
+            "manifest": {"publication_kind": "async_hf_backup", "repo_id": repo, "checkpoint_n": step,
+                         **{key: profile[key] for key in
+                            ("training_run_id", "async_checkpoint_run", "async_task_id")}},
+            "files": files}
+        write_json(folder / PUBLICATION_RECEIPT, publication)
+        commit = self._api.upload_folder(repo_id=repo, folder_path=str(folder), parent_commit=parent,
+                                        commit_message=f"backup step {step}")
+        revision = require_immutable_checkpoint_revision(commit.oid, field="HF backup commit")
+        if revision == parent:
+            raise ValueError("HF backup did not create a new immutable commit")
+        _verify_weight_file_set(self._api, repo, revision, [*files, PUBLICATION_RECEIPT])
+        publication_raw = (folder / PUBLICATION_RECEIPT).read_text()
+        profile_raw = (folder / CHECKPOINT_PROFILE_NAME).read_text()
+        base = f"https://huggingface.co/{repo}/resolve/{revision}/"
+        receipt = {"schema_version": 1, "repo_id": repo, "revision": revision,
+                   "publication_source": base + PUBLICATION_RECEIPT,
+                   "profile_source": base + CHECKPOINT_PROFILE_NAME,
+                   "publication_json": publication_raw, "profile_json": profile_raw,
+                   "publication_sha256": hashlib.sha256(publication_raw.encode()).hexdigest(),
+                   "profile_sha256": files[CHECKPOINT_PROFILE_NAME]["sha256"]}
+        self._receipts.mkdir(parents=True, mode=0o700, exist_ok=True)
+        write_json(receipt_path, receipt)
+        return receipt
 
     def list_backups(self) -> list[int]:
         head = f"{self.namespace}/{self.prefix}-step-"

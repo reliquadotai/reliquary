@@ -213,7 +213,8 @@ def run_async_train_worker() -> None:
         if settings["hf_prefix"]:
             from reliquary.trainer.hf_backup import BackgroundHfBackup, HfRepoPerBackup
 
-            repos = HfRepoPerBackup(HF_BACKUP_NAMESPACE, settings["hf_prefix"])
+            repos = HfRepoPerBackup(HF_BACKUP_NAMESPACE, settings["hf_prefix"],
+                                   receipt_dir=state_dir / "hf-publications")
             backup = BackgroundHfBackup(upload=repos.upload, list_backups=repos.list_backups,
                                         delete_backup=repos.delete_backup, keep_last=settings["hf_keep_last"],
                                         milestone_every=settings["hf_milestone_every"],
@@ -225,9 +226,17 @@ def run_async_train_worker() -> None:
                                     audits_per_step=settings["audits_per_step"],
                                     audit_budget_s=settings["audit_budget_s"])
         link.requeue()                          # this trainer holds nothing yet
+
+        def backup_save(state, folder, *, lr_schedule_step):
+            from reliquary.trainer.hf_backup import write_backup_profile
+
+            write_hf_dir(state, model_dir, folder)
+            write_backup_profile(folder, lr_schedule_step=lr_schedule_step,
+                                 checkpoint_run=str(task["run"]), task_id=str(task["task_id"]))
+
         trainer = AsyncTrainer(
             model, config=config, buffer=link, submissions=link, book=link, publisher=publisher,
-            state_fn=state_fn, backup=backup, backup_save=lambda s, folder: write_hf_dir(s, model_dir, folder),
+            state_fn=state_fn, backup=backup, backup_save=backup_save,
             train_step_fn=step_fn, audits=audits,
             global_step_hint=None if version is None else version * settings["steps_per_checkpoint"])
         live["trainer"] = trainer

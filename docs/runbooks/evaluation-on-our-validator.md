@@ -179,6 +179,20 @@ Milestones (`ReliquaryForge/<prefix>-step-<n:08d>`, `n` a multiple of `K`) are
 never rotated away; the step survives trainer restarts (it resumes from the
 published checkpoint), so a name is never reused.
 
+Async HF backups embed a fresh profile with the actual `lr_schedule_step`
+captured alongside the frozen weights, plus the async run and task identity.
+`reliquary_publication.json` binds the saved files and their hashes; the exact
+upload commit and source bytes are retained in the trainer state's
+`async/hf-publications/step-<n:08d>.private.json`. Keep that state outside the source
+checkout. An empty HF repository has `parent_revision: null`, rather than an
+invented parent. Existing published backups are not automatically overwritten,
+and unexpected remote weight files prevent a successful receipt.
+
+A remote upload can succeed before its local receipt is durable. A failed backup
+must therefore be reconciled against its immutable HF publication before reuse;
+this is not an exactly-once upload guarantee. These artifacts record publication
+provenance only: they do not place evaluation orders or activate a campaign.
+
 The suite, one entry per set (`short` goes in the job ids):
 
 ```json

@@ -248,7 +248,7 @@ def _peak_memory() -> dict[str, float]:
             "async/gpu_peak_reserved_gb": torch.cuda.max_memory_reserved() / 2**30}
 
 
-def save_snapshot(snapshot: Mapping[str, Any], folder: Path) -> None:
+def save_snapshot(snapshot: Mapping[str, Any], folder: Path, *, lr_schedule_step: int | None) -> None:
     from reliquary.shared.ckpt_delta import write_anchor_shards
 
     write_anchor_shards(snapshot, Path(folder))
@@ -293,7 +293,7 @@ class AsyncTrainer:
 
     def __init__(self, model: Any, *, config: AsyncTrainerConfig, buffer, submissions, book,
                  publisher=None, state_fn: Callable[[], Mapping[str, Any]] | None = None, backup=None,
-                 backup_save: Callable[[Mapping[str, Any], Path], None] = save_snapshot,
+                 backup_save: Callable[..., None] = save_snapshot,
                  train_step_fn: Callable = _default_train_step, ref_model: Any = None,
                  global_step_hint: int | None = None, audits=None, clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep) -> None:
@@ -456,8 +456,12 @@ class AsyncTrainer:
             self._publish(self.version, snapshot)
             timings["async/publish_wait_s"] = self._clock() - at
         if self.backup is not None and self.config.hf_backup_every and self.steps % self.config.hf_backup_every == 0:
+            from reliquary.validator.training import current_lr_schedule_step
+
             frozen = snapshot if snapshot is not None else self._snapshot()
-            self.backup.submit(self.steps, lambda folder, s=frozen: self._backup_save(s, folder))
+            lr_step = current_lr_schedule_step()
+            self.backup.submit(self.steps, lambda folder, s=frozen, lr=lr_step:
+                               self._backup_save(s, folder, lr_schedule_step=lr))
         completion = sum(len(c) for g in submitted for c in g.completions)
         worked = self._clock() - started
         self.last_step = {"result": "trained", "step": self.steps, "checkpoint": self.version, **gate.metrics()}
