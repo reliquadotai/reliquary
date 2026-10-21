@@ -265,9 +265,14 @@ def episode_shape_refusal(policy, renderer, *, prompt_ids, tokens, spans, stop, 
     it is never exported, so neither do the export rules (``parse_signed_trajectory(canonical=False)``); and a last
     turn cut at the per-turn cap is admitted as ``context_length``. A lease takes all its episodes, so what the
     draw led the model to write must not refuse the lease."""
+    from reliquary.corpus.trajectory_parse import STOP_FORMAT_ERROR
+
     offset = len(prompt_ids)
     relative = [(start - offset, end - offset) for start, end in spans]
     completion = tokens[offset:]
+    if stop == STOP_FORMAT_ERROR and not lease:
+        return EpisodeRefusal(RejectReason.BAD_TERMINATION, "episode_termination",
+                              {"check": "bad_stop", "stop": stop, "why": "a format_error stop is a lease's only"})
     structure = check_turn_spans(relative, len(completion), policy.max_turns)
     if not structure.ok:
         return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_turns",
@@ -297,6 +302,11 @@ def episode_shape_refusal(policy, renderer, *, prompt_ids, tokens, spans, stop, 
     )
     for wire, stage, run in checks:
         outcome = run()
+        if (not outcome.ok and stop == STOP_FORMAT_ERROR and outcome.reason == "bad_termination"
+                and outcome.detail.get("turn") == len(relative) - 1):
+            # The malformed last turn of a format_error episode ends how the model ended it (the turns before it
+            # were checked first and passed); the parse checked it is malformed.
+            continue
         if not outcome.ok:
             return EpisodeRefusal(wire, stage, {"check": outcome.reason, "detail": dict(outcome.detail)})
     try:

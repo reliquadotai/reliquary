@@ -273,6 +273,34 @@ swe_v1=mini-swe@1:3+bash-surface@1:1` (weight 1 by default).
 surface variant <n>): admitted | rejected <stage> <detail>`, and counts them in
 `LeaseEpisodeChecker.outcomes[(harness, verdict)]`.
 
+## 6d. A malformed model turn ends its episode, not the lease (DONE on the branches, 2026-10-21)
+
+Before: one rollout the shared admission check refused gave up the whole lease, 16 rollouts. With
+p malformed rollouts, 1 − (1 − p)^16 of the leases were lost (39 % at 3 %), so a new harness was
+trained on far less than its weight. No lab voids a group for one rollout.
+
+Now, on an async RL lease only (`format_stop`):
+
+- **Malformed** (`trajectory_parse.turn_format_violation`, one definition for miner and
+  validator): turn markup or a stop id before the turn's end (the model wrote its own
+  observation or next turn), or a turn with calls that ends on the end-of-text token.
+- **Miner.** `HarnessEpisodeRunner` ends the episode at the first malformed turn: none of
+  its calls is sent, the stop is `format_error`, and the box is graded as usual.
+- **Validator.** `parse_signed_trajectory` admits a `format_error` episode only if its last
+  turn is malformed, and checks every turn before it as usual. That includes their
+  observations against the signed records and their termination. The lease checker scores it
+  0, whatever the box's grade. The other 15 episodes and the lease count.
+- **Honesty is unchanged.** The tokens are the forced draw's, so the miner cannot write a
+  malformed turn itself. A transcript, observation, prompt or session that is not honest still
+  refuses the lease. A well-formed last turn that claims `format_error` is refused. Ending
+  early earns only a 0.
+- **Corpus jobs and RL windows keep refusing** such an episode: it would be exported, or
+  proven per span.
+- Tests: `test_format_error_stop` covers the predicate and the miner's stop mapping. It plays
+  the miner's loop against the real gateway with a made-up observation and an end-of-text
+  turn, checks the shared admission check (lease admitted, window refused), checks that a
+  well-formed turn cannot claim `format_error`, and checks the checker's zero reward.
+
 **Smoke lessons** (2026-10-20, Qwen3.5-2B on one H100, forced draw, real gateway):
 
 - **The renderer release is part of the harness.** A fresh install took `renderers` 0.1.12
