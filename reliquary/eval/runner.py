@@ -361,11 +361,13 @@ class EvalRunner:
                                task.get("task_id"), exc_info=True)
             raise
         finally:
-            heartbeat.stop()
-            from reliquary.eval.model_process import ModelProcess
+            try:
+                heartbeat.stop()
+            finally:
+                from reliquary.eval.model_process import ModelProcess
 
-            if isinstance(self._generator, ModelProcess):
-                self._generator.close()
+                if isinstance(self._generator, ModelProcess):
+                    self._generator.close()
 
     def _check(self, heartbeat: _Heartbeat) -> None:
         if heartbeat.lost is not None:
