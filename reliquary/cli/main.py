@@ -2319,6 +2319,10 @@ def eval_build_set(
     bridge_file: str | None = typer.Option(None, "--bridge-file",
         help="A bridged eval env's source (e.g. reliquary-terminal): JSON {options, "
              "image_lock_sha256}, as its gateway serves it"),
+    exclude_file: str | None = typer.Option(
+        None, "--exclude-file",
+        help="Episode and SWE sets: a JSON object {instance id: reason}; those rows leave "
+        "the range before it is sampled, and the card lists them"),
 ) -> None:
     """Freeze problems into a set: prompts.jsonl, grading.jsonl, set.json.
 
@@ -2338,7 +2342,7 @@ def eval_build_set(
             raise ValueError("give exactly one of --preset and --source")
         if interaction != "single_turn":
             if preset is not None or source is None or count is None or seed is None \
-                    or sample is not None or start or split or taskset_args:
+                    or sample is not None or start or split or taskset_args or exclude_file:
                 raise ValueError("an episode takes --source, --count and --seed with reviewed source configuration")
             config = json.loads(Path(episode_config).read_text()) if episode_config else None
             if config is not None and not isinstance(config, dict):
@@ -2351,7 +2355,7 @@ def eval_build_set(
             raise ValueError("--bridge-file goes with --source")
         elif preset is not None:
             if count is None or seed is None or sample is not None or start or split \
-                    or taskset_args:
+                    or taskset_args or exclude_file:
                 raise ValueError("a --preset takes --count and --seed only")
             card = sets.build_set(preset, count=count, seed=seed, out=out, set_id=set_id,
                                   open_environment=sets.open_source, protocol=reviewed)
@@ -2362,9 +2366,15 @@ def eval_build_set(
             bridge = json.loads(Path(bridge_file).read_text()) if bridge_file else None
             if bridge is not None and not isinstance(bridge, dict):
                 raise ValueError("--bridge-file must hold a JSON object")
+            exclude = None
+            if exclude_file:
+                exclude = json.loads(Path(exclude_file).read_text(encoding="utf-8"))
+                if not isinstance(exclude, dict):
+                    raise ValueError("--exclude-file must hold a JSON object {instance id: reason}")
             card = sets.build_source_set(source, out=out, split=split, start=start,
                                          count=count, sample=sample, seed=seed,
                                          set_id=set_id, taskset_args=args, bridge=bridge,
+                                         exclude=exclude,
                                          open_environment=sets.open_source, protocol=reviewed)
     except (ValueError, OSError, KeyError) as exc:
         typer.echo(f"error: {exc}", err=True)

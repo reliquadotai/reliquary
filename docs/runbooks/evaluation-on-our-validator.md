@@ -337,6 +337,10 @@ Before the first run, in order:
    miner would mine the wrong rows), `jobs create --eval-set ... --episode-file ...`,
    miners with `mine-agentic --validator-hotkey <validator-ss58>`, validator on a
    card, `eval grade`, `eval compare`, retire, stop.
+   Rows no box can pass (tests that need the internet: our boxes have none) leave the
+   sample with `build-set --exclude-file <{instance id: reason}.json>`: they are dropped
+   before sampling and listed on the card (`selection.exclude`).
+
 
 ## 9. Other bridged envs: TMax `tmax_sft` (signed sandbox)
 
