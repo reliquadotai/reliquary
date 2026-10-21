@@ -21,6 +21,13 @@ DIGEST = "1" * 64
 LOCK = "2" * 64
 
 
+@pytest.fixture(autouse=True)
+def _sandbox_alerts_reach_caplog(caplog):
+    # Bittensor changes existing logger levels during import; keep alert assertions independent of test order.
+    for name in ("reliquary.sandbox.fleet", "reliquary.sandbox.sessions", "reliquary.validator.rl_sandbox_wiring"):
+        caplog.set_level(logging.ERROR, logger=name)
+
+
 def test_the_rl_open_places_with_the_tasks_options_digest(tmp_path):
     env = build(tmp_path)
     view = env.issuer._engagements["rl_precommit"]._environments(EPISODE)

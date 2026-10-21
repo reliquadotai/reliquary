@@ -50,7 +50,8 @@ def _services(tmp_path, *, store=None, **kwargs):
     validator, _machine = episode_signers(tmp_path / "keys")
     rt = kwargs.pop("runtime", None) or episode_runtime(tmp_path / "rt")
     current_window = kwargs.pop("current_window", lambda: 1)
-    config = SandboxValidatorConfig(key_file=Path("unused"), key_id=validator.key_id, retired_keys={})
+    config = SandboxValidatorConfig(key_file=Path("unused"), key_id=validator.key_id, retired_keys={},
+                                    machine_ids=kwargs.pop("machine_ids", None))
 
     async def no_machines():
         return []
@@ -60,6 +61,11 @@ def _services(tmp_path, *, store=None, **kwargs):
         renderer_for=lambda policy: FakeRenderer(), current_window=current_window, chunk_tokens=32, signer=validator,
         session_store=store if store is not None else MemorySessionStore(), read_documents=no_machines, **kwargs)
     return services, rt
+
+
+def test_machine_scope_reaches_the_rl_fleet(tmp_path):
+    services, _ = _services(tmp_path, machine_ids=frozenset({"machine-b"}))
+    assert services.fleet._machine_ids == frozenset({"machine-b"})
 
 
 def test_rl_refuses_to_start_on_another_installed_sandbox_commit(tmp_path, monkeypatch, caplog):

@@ -1060,7 +1060,8 @@ def build_rl_episode_services(
                   clock=clock, record_heartbeat=record if read_documents is None else None,
                   directory_refresh_s=config.directory_refresh_s,
                   directory_max_age_s=config.directory_max_age_s,
-                  directory_read_timeout_s=config.directory_read_timeout_s)
+                  directory_read_timeout_s=config.directory_read_timeout_s,
+                  machine_ids=config.machine_ids)
     fleet.resources_required = bool(require_resources)
     if yield_path is not None and ledger is not None:
         raise ValueError("pass the yield ledger's path or the ledger, not both")

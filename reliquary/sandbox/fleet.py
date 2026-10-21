@@ -69,6 +69,7 @@ from typing import Any
 
 from reliquary_sandbox.attest import heartbeat_valid
 
+from reliquary.infrastructure.sandbox_store import validated_machine_id
 from reliquary.sandbox import transcript_cap_refusal
 from reliquary.sandbox.machines import DirectorySnapshot, snapshot_from_documents
 
@@ -182,7 +183,13 @@ class Fleet:
                  on_drained: Callable[[str], None] | None = None,
                  directory_refresh_s: float = DIRECTORY_REFRESH_SECONDS,
                  directory_max_age_s: float = DIRECTORY_MAX_AGE_SECONDS,
-                 directory_read_timeout_s: float = DIRECTORY_READ_TIMEOUT_SECONDS) -> None:
+                 directory_read_timeout_s: float = DIRECTORY_READ_TIMEOUT_SECONDS,
+                 machine_ids: Collection[str] | None = None) -> None:
+        if isinstance(machine_ids, (str, bytes)):
+            raise ValueError("machine_ids must be a collection of machine names")
+        self._machine_ids = (None if machine_ids is None else
+                             frozenset(validated_machine_id(m) for m in machine_ids))
+        self._scope_ready = machine_ids is None
         if not directory_refresh_s > 0 or not directory_max_age_s > directory_refresh_s:
             raise ValueError("the directory needs 0 < refresh period < max age, got "
                              f"{directory_refresh_s} and {directory_max_age_s}")
@@ -259,6 +266,13 @@ class Fleet:
             return _EMPTY_DIRECTORY
         return self._directory
 
+    def _in_scope(self, machine_id: str) -> bool:
+        return self._scope_ready and (self._machine_ids is None or machine_id in self._machine_ids)
+
+    def _operated_entries(self):
+        # Placement and polling share the scope; signature verification keeps the full directory.
+        return tuple(e for e in self._directory.entries() if self._in_scope(e.machine_id))
+
     def directory_if_ready(self, now: float | None = None) -> DirectorySnapshot | None:
         """The snapshot, or None when it is not young enough: one call for a readiness
         check and the verify that follows it, so they cannot see two directories. The
@@ -295,6 +309,10 @@ class Fleet:
         finally:
             self._read_attempted = True
         snapshot = snapshot_from_documents(documents)
+        self._scope_ready = (self._machine_ids is None or
+                             all(snapshot.entry(m) is not None for m in self._machine_ids))
+        if not self._scope_ready:
+            logger.error("sandbox machine scope contains unknown machines; no machine is polled or placed")
         now = self._clock()
         for entry in snapshot.entries():
             self._first_seen.setdefault(entry.machine_id, now)
@@ -305,6 +323,8 @@ class Fleet:
         self._directory, self._directory_at, self._stale_alerted = snapshot, now, False
 
     def accept_report(self, machine_id: str, report: Any, now: float) -> bool:
+        if not self._in_scope(machine_id):
+            return False
         if not self.directory_ready(now):
             self._alert_stale(now)
             return False
@@ -355,7 +375,7 @@ class Fleet:
             # Nothing can be verified; and a machine is not drained for our own outage.
             self._alert_stale(now)
             return
-        entries = [e for e in self._directory.entries() if e.status != "revoked"]
+        entries = [e for e in self._operated_entries() if e.status != "revoked"]
         reports = await asyncio.gather(*(self._bounded_fetch(e.address) for e in entries),
                                        return_exceptions=True)
         heard = 0
@@ -496,7 +516,7 @@ class Fleet:
         """(machine id, report) of the fresh, active, undrained machines (none while the directory is stale)."""
         if not self.directory_ready(now):
             return
-        for entry in self._directory.entries():
+        for entry in self._operated_entries():
             if entry.status != "active" or entry.machine_id in self.drained:
                 continue
             document = self._reports.get(entry.machine_id)
@@ -664,7 +684,7 @@ class Fleet:
             return None
         best: tuple[float, str] | None = None
         chosen: Placement | None = None
-        for entry in self._directory.entries():
+        for entry in self._operated_entries():
             if entry.machine_id in exclude:
                 continue
             document = self._reports.get(entry.machine_id)
@@ -746,12 +766,13 @@ class Fleet:
         `reserve` (RL), a machine judged by its `resources` (see `pick`) serves the session only if its box is at
         least the task's CPUs and its totals hold the session's CPU and memory. It answers True exactly when
         ``servable_machines`` finds a machine (the same filters), unless the last poll heard no machine."""
-        if not self.directory_ready(now) or self._egress_suspect or not self._last_ok:
+        if (not self.directory_ready(now) or self._egress_suspect or not self._last_ok
+                or not self._scope_ready):
             return None
         fresh = unknown = False
         kw = dict(image=image, env=env, env_package=env_package, budgets=budgets, validity_s=validity_s,
                   env_options_sha256=env_options_sha256, env_lock_sha256=env_lock_sha256)
-        for entry in self._directory.entries():
+        for entry in self._operated_entries():
             document = self._reports.get(entry.machine_id)
             if entry.status != "active" or document is None:
                 continue
@@ -782,7 +803,7 @@ class Fleet:
         if not self.directory_ready(now):
             return ()
         found = []
-        for entry in self._directory.entries():
+        for entry in self._operated_entries():
             document = self._reports.get(entry.machine_id)
             if not include_unknown:
                 if not self._fits(entry, document, image=image, env=env, env_package=env_package, budgets=budgets,
@@ -809,6 +830,8 @@ class Fleet:
         ``resources`` block lists, whichever is larger. Memory reads only."""
         total = 0
         for machine_id in set(machine_ids):
+            if not self._in_scope(machine_id):
+                continue
             document = self._reports.get(machine_id)
             if not document:
                 continue
@@ -823,7 +846,7 @@ class Fleet:
         """The share of the machine one session takes: on a machine placed by its resources, the larger of its
         reservation's CPU and memory shares of the totals (``reserve`` None: one slot's share of them, as for a
         session issued elsewhere); one slot (``1 / capacity``) otherwise. None when the machine has no report."""
-        document = self._reports.get(machine_id)
+        document = self._reports.get(machine_id) if self._in_scope(machine_id) else None
         if not document:
             return None
         slots = max(1, int(document.get("capacity") or 0))
@@ -841,6 +864,8 @@ class Fleet:
         shares of its totals). Memory reads only."""
         total = 0.0
         for machine_id in set(machine_ids):
+            if not self._in_scope(machine_id):
+                continue
             document = self._reports.get(machine_id)
             if not document:
                 continue
@@ -864,6 +889,8 @@ class Fleet:
         alone when its resources cannot be read: the most it could hold)."""
         total = 0
         for machine_id in machine_ids:
+            if not self._in_scope(machine_id):
+                continue
             document = self._reports.get(machine_id) or {}
             hosts = int(document.get("capacity") or 0)
             if self._by_resources(document, reserve) and _valid_resources(document.get("resources")):
@@ -941,7 +968,7 @@ class Fleet:
         if not self.directory_ready(now):
             return []
         found = []
-        for entry in self._directory.entries():
+        for entry in self._operated_entries():
             if entry.status != "active" or entry.machine_id in self.drained:
                 continue
             document = self._reports.get(entry.machine_id)
@@ -981,9 +1008,10 @@ class Fleet:
         if (budgets is None) != (validity_s is None):
             raise ValueError("view_complete takes budgets and validity_s together")
         now = self._clock() if now is None else now
-        if not self.directory_ready(now) or self._egress_suspect or not self._last_ok:
+        if (not self.directory_ready(now) or self._egress_suspect or not self._last_ok
+                or not self._scope_ready):
             return False
-        for entry in self._directory.entries():
+        for entry in self._operated_entries():
             document = self._reports.get(entry.machine_id)
             if entry.status != "active" or document is None:
                 continue
@@ -1004,8 +1032,9 @@ class Fleet:
 
     def reported_packages(self, env: str) -> list[str]:
         """Every ``env_package`` the accepted reports name for ``env`` (for an operator's error message)."""
-        return sorted({str(package) for document in list(self._reports.values())
-                       if (package := (document.get("env_packages") or {}).get(env)) is not None})
+        return sorted({str(package) for machine_id, document in list(self._reports.items())
+                       if self._in_scope(machine_id)
+                       and (package := (document.get("env_packages") or {}).get(env)) is not None})
 
     def nearest(self, *, image: str, env: str, env_package: str, budgets: Mapping[str, int], validity_s: int,
                 now: float, env_options_sha256: str | None = None,
@@ -1014,7 +1043,7 @@ class Fleet:
         full or not): the one the open queue holds for a head waiter that keeps missing. With `reserve` (RL), room
         is CPU and memory (see `pick`), and a machine that could never hold the session is not one."""
         best: tuple[float, str] | None = None
-        for entry in self._directory.entries():
+        for entry in self._operated_entries():
             document = self._reports.get(entry.machine_id)
             if not self._fits(entry, document, image=image, env=env, env_package=env_package, budgets=budgets,
                               validity_s=validity_s, now=now, env_options_sha256=env_options_sha256,

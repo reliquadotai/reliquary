@@ -334,7 +334,8 @@ def build_rl_lease_sandbox(
     fleet = Fleet(read_documents=read_documents or documents, fetch_report=fetch_report or http_fetch_report,
                   clock=clock, record_heartbeat=record if read_documents is None else None,
                   directory_refresh_s=config.directory_refresh_s, directory_max_age_s=config.directory_max_age_s,
-                  directory_read_timeout_s=config.directory_read_timeout_s)
+                  directory_read_timeout_s=config.directory_read_timeout_s,
+                  machine_ids=config.machine_ids)
     fleet.resources_required = bool(require_resources)
     book = SessionBook(policy)
     views = {name: EpisodeEnvironmentView(policy=p, resolve_task=environments[name].source.resolve)
