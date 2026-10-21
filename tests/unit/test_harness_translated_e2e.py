@@ -7,7 +7,6 @@ renderer only."""
 from __future__ import annotations
 
 import asyncio
-import json
 import subprocess
 from types import SimpleNamespace
 
