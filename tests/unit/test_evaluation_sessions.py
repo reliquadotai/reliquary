@@ -187,7 +187,8 @@ def test_signed_receipt_checks_state_signatures_identity_and_durable_settlement(
         asyncio.run(verify(binding, forged, card=env.card, row=env.rows[0], final_state=b"final\x00archive"))
 
 
-def test_constructed_service_filters_assigned_machines_and_uses_its_own_persistence(tmp_path, monkeypatch):
+def configured_service(tmp_path, monkeypatch, documents, *, evaluation_ids="evaluation-machine",
+                       global_ids=None, reports=None, clock=lambda: NOW):
     from reliquary.infrastructure import sandbox_store
 
     key = tmp_path / "evaluation-key.pem"
@@ -195,20 +196,106 @@ def test_constructed_service_filters_assigned_machines_and_uses_its_own_persiste
     key.chmod(0o600)
 
     async def machines():
-        return [{"machine_id": "evaluation-machine"}, {"machine_id": "active-rl-machine"}]
+        return documents
+
+    fetched = []
+
+    async def fetch(address):
+        fetched.append(address)
+        return (reports or {}).get(address)
 
     monkeypatch.setattr(sandbox_store, "list_machines", machines)
-    service = from_environment(subnet=object(), environ={
-        "RELIQUARY_EVAL_SANDBOX_MACHINE_IDS": "evaluation-machine",
+    monkeypatch.setattr("reliquary.sandbox.fleet.http_fetch_report", fetch)
+    environ = {
+        "RELIQUARY_EVAL_SANDBOX_MACHINE_IDS": evaluation_ids,
         "RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE": str(key),
         "RELIQUARY_SANDBOX_VALIDATOR_KEY_ID": "evaluation-key",
-        "RELIQUARY_SANDBOX_CORPUS_QUOTA": "1"})
-    assert asyncio.run(service.fleet._read_documents()) == [{"machine_id": "evaluation-machine"}]
+        "RELIQUARY_SANDBOX_CORPUS_QUOTA": "1"}
+    if global_ids is not None:
+        environ["RELIQUARY_SANDBOX_MACHINE_IDS"] = json.dumps(global_ids)
+    return from_environment(subnet=object(), environ=environ, clock=clock), fetched
+
+
+def test_constructed_service_keeps_history_and_uses_its_own_persistence(tmp_path, monkeypatch):
+    from reliquary.infrastructure import sandbox_store
+
+    documents = [{"machine_id": "evaluation-machine"}, {"machine_id": "active-rl-machine"}]
+    service, _ = configured_service(tmp_path, monkeypatch, documents)
+    assert asyncio.run(service.fleet._read_documents()) == documents
     assert service.fleet.resources_required
     assert service.issuer._quota is None
     assert set(service.issuer._engagements) == {"evaluation"}
     assert service.issuer._store._prefix == EVALUATION_SESSION_PREFIX
     assert EVALUATION_SESSION_PREFIX not in (sandbox_store.SESSION_PREFIX, sandbox_store.RL_SESSION_PREFIX)
+
+
+@pytest.mark.parametrize("evaluation_ids,global_ids,expected", [
+    ("m-a", None, ("m-a",)), ("m-a", [], ()),
+    ("m-a,m-b", ["m-b"], ("m-b",)), ("m-a", ["m-b"], ()),
+    ("m-a", ["m-a", "unknown"], ()), ("m-a,unknown", ["m-a"], ()),
+])
+def test_evaluation_machine_assignment_intersects_global_scope(tmp_path, monkeypatch,
+                                                               evaluation_ids, global_ids, expected):
+    from tests.unit.sandbox_fixtures import capacity_report, machine_document
+
+    one, two = signer(tmp_path, "a", "ka"), signer(tmp_path, "b", "kb")
+    documents = [machine_document(one, machine_id="m-a", address="http://a:1"),
+                 machine_document(two, machine_id="m-b", address="http://b:1")]
+    reports = {"http://a:1": capacity_report(one, at=NOW, machine_id="m-a", address="http://a:1"),
+               "http://b:1": capacity_report(two, at=NOW, machine_id="m-b", address="http://b:1")}
+    service, fetched = configured_service(tmp_path, monkeypatch, documents, evaluation_ids=evaluation_ids,
+                                          global_ids=global_ids, reports=reports)
+    asyncio.run(service.fleet.refresh_directory())
+    asyncio.run(service.fleet.poll_once())
+    assert fetched == [f"http://{m[-1]}:1" for m in expected]
+    assert service.fleet.session_capacity() == 4 * len(expected)
+    assert service.fleet.directory_if_ready().public_key("m-a", "ka", NOW) is not None
+    assert service.fleet.directory_if_ready().public_key("m-b", "kb", NOW) is not None
+
+
+def test_previous_machine_receipt_verifies_after_evaluation_assignment_changes(tmp_path, monkeypatch):
+    from reliquary.sandbox.sessions import LAPSED
+    from reliquary_sandbox.attest import GRADING_GRACE_S
+    from tests.unit.sandbox_fixtures import machine_document
+
+    env = build(tmp_path)
+    grant = open_(env)
+    receipt = signed_receipt(env, grant)
+    session_id = grant["grant"]["session_id"]
+    env.clock.now = grant["grant"]["expires_at"] + GRADING_GRACE_S + 3600
+    asyncio.run(env.sessions.issuer.maintain())
+    assert env.sessions.issuer.book.get(session_id).state == LAPSED
+    other = signer(tmp_path, "next", "next-key")
+    documents = [machine_document(env.machine),
+                 machine_document(other, machine_id="evaluation-machine", address="http://next:1")]
+    current, fetched = configured_service(tmp_path, monkeypatch, documents, global_ids=["evaluation-machine"],
+                                         clock=env.clock)
+    asyncio.run(current.fleet.refresh_directory())
+    asyncio.run(current.fleet.poll_once())
+    env.sessions.fleet = current.fleet
+    # Frozen receipts remain verifiable even after the executable harness changes.
+    monkeypatch.setattr("reliquary.eval.protocol.harness_sha256", lambda harness: "0" * 64)
+    assert asyncio.run(env.sessions.verify_result(grant["binding"], receipt, card=env.card,
+        row=env.rows[0], final_state=b"final\x00archive")) == 1
+    assert env.sessions.issuer.book.get(session_id).state == LAPSED
+    assert fetched == ["http://next:1"]
+
+
+def test_old_frozen_execution_hash_is_refused_and_new_seal_matches_current_harness(tmp_path, monkeypatch):
+    from reliquary.eval.protocol import validate_execution
+
+    env = build(tmp_path)
+    old = {key: env.card[key] for key in ("protocol", "protocol_json", "protocol_sha256")}
+    bindings = {env.card["set_id"]: env.card["protocol_sha256"]}
+    validate_execution({env.card["set_id"]: old}, bindings)
+    monkeypatch.setattr("reliquary.eval.protocol.harness_sha256", lambda harness: "0" * 64)
+    with pytest.raises(ValueError, match="harness drift"):
+        validate_execution({env.card["set_id"]: old}, bindings)
+    policy_sha = SIGNED_SOURCE_POLICIES[("reliquary-terminal==0.3.1", "tmax")]
+    new = seal_set(env.card, reviewed={"data": {"environment.toml": policy_sha}})
+    assert new["protocol_sha256"] != old["protocol_sha256"]
+    validate_execution({new["set_id"]: {key: new[key] for key in old}},
+                       {new["set_id"]: new["protocol_sha256"]})
 
 
 def test_receipt_is_not_accepted_when_durable_settlement_fails(tmp_path, monkeypatch):
