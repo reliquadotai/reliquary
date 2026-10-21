@@ -9,7 +9,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from reliquary_harness.spec import BASH_SURFACE_V1, BASH_VF_B2E4E81, MINI_SWE_V1
+from reliquary_harness.spec import BASH_SURFACE_V1, BASH_VF_B2E4E81, MINI_SWE_V2
 
 from reliquary.corpus.job import parse_job
 from reliquary.environment import agentic_swe
@@ -23,34 +23,34 @@ def _pin(spec):
 
 
 MINI_MANIFEST = _manifest(job_id="swe-agentic-mini-v1", prompt_count=3,
-                          episode=signed_episode(harness_spec=_pin(MINI_SWE_V1)))
+                          episode=signed_episode(harness_spec=_pin(MINI_SWE_V2)))
 MINI_JOB = parse_job(MINI_MANIFEST)
 
 
 def test_a_corpus_or_eval_job_plays_any_harness_without_variants():
-    assert agentic_swe.harness_pin_refusal(_pin(MINI_SWE_V1), variants=False) is None
-    assert agentic_swe.job_harness(MINI_JOB) is MINI_SWE_V1
+    assert agentic_swe.harness_pin_refusal(_pin(MINI_SWE_V2), variants=False) is None
+    assert agentic_swe.job_harness(MINI_JOB) is MINI_SWE_V2
     assert agentic_swe.job_harness(parse_job(_manifest(episode=signed_episode()))) is BASH_VF_B2E4E81
     surface = agentic_swe.harness_pin_refusal(_pin(BASH_SURFACE_V1), variants=False)
     assert "an RL lease's, not a corpus job's" in surface
 
 
 def test_a_replay_job_plays_the_compatibility_harness_only():
-    replay = parse_job(_manifest(episode=_episode(harness_spec=_pin(MINI_SWE_V1))))
+    replay = parse_job(_manifest(episode=_episode(harness_spec=_pin(MINI_SWE_V2))))
     refusal = agentic_swe.episode_support_refusal(replay.episode, need_verifiers=False)
-    assert refusal == "a replay (non signed_sandbox) job plays bash-vf-b2e4e81@1 only, not mini-swe@1"
+    assert refusal == "a replay (non signed_sandbox) job plays bash-vf-b2e4e81@1 only, not mini-swe@2"
 
 
 def test_jobs_create_pins_the_harness_its_signed_episode_plays():
     from reliquary.cli.main import with_job_harness
 
     episode = signed_episode()
-    pinned = with_job_harness(episode, "mini-swe@1")
-    assert pinned["harness_spec"] == _pin(MINI_SWE_V1) and "harness_spec" not in episode
-    assert parse_job(_manifest(episode=pinned)).episode.harness_spec == _pin(MINI_SWE_V1)
+    pinned = with_job_harness(episode, "mini-swe@2")
+    assert pinned["harness_spec"] == _pin(MINI_SWE_V2) and "harness_spec" not in episode
+    assert parse_job(_manifest(episode=pinned)).episode.harness_spec == _pin(MINI_SWE_V2)
     assert with_job_harness(episode, None) is episode
     for bad, value, why in [(episode, "mini-swe", "id@version"), (episode, "bash-surface@1", "RL lease"),
-                            (episode, "openhands@1", "unknown harness"), (_episode(), "mini-swe@1", "signed_sandbox")]:
+                            (episode, "openhands@1", "unknown harness"), (_episode(), "mini-swe@2", "signed_sandbox")]:
         with pytest.raises(ValueError, match=why):
             with_job_harness(bad, value)
 
@@ -64,7 +64,7 @@ def test_an_rl_window_plays_any_harness_without_variants():
     from reliquary.miner.episode_mining import _episode_policies
     from reliquary.validator.service import ValidationService
 
-    for spec, served in [(None, True), (MINI_SWE_V1, True), (BASH_SURFACE_V1, False)]:
+    for spec, served in [(None, True), (MINI_SWE_V2, True), (BASH_SURFACE_V1, False)]:
         contract = SimpleNamespace(episode_policy=lambda name, spec=spec: _policy(spec))
         if served:
             assert _episode_policies(contract, ["swe_v1"], lambda policy: None)["swe_v1"].harness_pin() == \
@@ -85,8 +85,8 @@ def test_the_window_validator_renders_in_the_orders_harness():
 
     tokenizer = SimpleNamespace(name_or_path=next(iter(TOKENIZERS.values())))
     renderer = ValidationService._default_episode_renderer(SimpleNamespace(tokenizer=tokenizer),
-                                                           _policy(MINI_SWE_V1))
-    assert renderer.spec is MINI_SWE_V1 and not renderer.tools
+                                                           _policy(MINI_SWE_V2))
+    assert renderer.spec is MINI_SWE_V2 and [t["function"]["name"] for t in renderer.tools] == ["bash"]
 
 
 # -- a mini-swe eval/corpus job end to end ----------------------------------------------------------------
@@ -108,26 +108,22 @@ gateway, r2 = e2e.gateway, e2e.r2      # the signed e2e's fixtures  # noqa: F811
 _r2_client, fake_r2 = e2e._r2_client, e2e.fake_r2  # noqa: F811
 
 
-def _block(command):
-    return f"```mswea_bash_command\n{command}\n```"
-
-
 SCRIPT = [
-    "Write it.\n</think>\n\nTHOUGHT: write the answer.\n\n" + _block("write /work/answer.txt 42") + "<|im_end|>",
-    "Two.\n</think>\n\n" + _block("echo a") + "\n" + _block("echo b") + "<|im_end|>",
-    "Done.\n</think>\n\nTHOUGHT: submit.\n\n" + _block(mini.SUBMIT) + "<|im_end|>",
+    parity._turn("Write it.", parity._call("bash", command="write /work/answer.txt 42"), content="THOUGHT: write the answer."),
+    parity._turn("Hmm.", content="I think it is written."),
+    parity._turn("Done.", parity._call("bash", command=mini.SUBMIT + " && cat patch.txt"), content="THOUGHT: submit."),
 ]
 
 
 @needs_tokenizer
 async def test_a_mini_swe_job_is_mined_admitted_graded_and_exported_in_mini(gateway, r2):  # noqa: F811
-    """The job pins mini-swe@1. The miner's loop plays it against the real gateway (through the
+    """The job pins mini-swe@2. The miner's loop plays it against the real gateway (through the
     validator's session route); the validator's corpus intake renders it in mini and accepts it once;
     the grader grades it; the export rebuilds mini's conversation from the proven tokens."""
     await job_store.write_job(MINI_MANIFEST, None, **r2.kwargs)
     directory = next(iter(TOKENIZERS.values()))
     renderer = agentic_swe.job_turn_renderer(MINI_JOB, directory)
-    assert renderer.spec is MINI_SWE_V1
+    assert renderer.spec is MINI_SWE_V2
     tokenizer = renderer._tokenizer
     chunk = 4096
     await e2e.register(gateway)
@@ -175,9 +171,10 @@ async def test_a_mini_swe_job_is_mined_admitted_graded_and_exported_in_mini(gate
     assert counts["rows"] == 1, counts
     messages = json.loads(rows[0]["messages"])
     assert messages[0] == {"role": "system", "content": mini.SYSTEM}
-    assert messages[1]["role"] == "user" and messages[1]["content"].startswith("Please solve this issue: ")
-    assert [m["role"] for m in messages[2:]] == ["assistant", "user", "assistant", "user", "assistant"]
+    assert messages[1]["role"] == "user" and messages[1]["content"].startswith("<pr_description>\nConsider the following")
+    # mini's results are tool messages, its format error a user message.
+    assert [m["role"] for m in messages[2:]] == ["assistant", "tool", "assistant", "user", "assistant"]
     assert messages[3]["content"].startswith("<returncode>0</returncode>")
-    assert "found 2 actions" in messages[5]["content"]
-    assert not any("tool_calls" in m for m in messages)
+    assert messages[5]["content"].startswith("Tool call error:")
+    assert [c["function"]["name"] for c in messages[2]["tool_calls"]] == ["bash"]
     assert rows[0]["tokens"] == prompt + tokens

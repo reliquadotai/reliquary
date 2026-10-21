@@ -573,7 +573,7 @@ def test_jobs_create_refuses_an_episode_for_another_environment(
     assert result.exit_code != 0 and "the set's environment is" in result.output, result.output
 
 
-@pytest.mark.parametrize("harness", [None, "mini-swe@1"])
+@pytest.mark.parametrize("harness", [None, "mini-swe@2"])
 def test_jobs_create_signed_swe_eval_job(bucket, registry, reference_sets, tmp_path, monkeypatch, harness):
     from reliquary.environment import agentic_swe
 

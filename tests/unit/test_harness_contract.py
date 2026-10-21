@@ -102,16 +102,16 @@ def test_the_validator_grades_a_lease_in_the_variant_it_draws_for_it():
 
 def test_tasks_create_pins_the_harness_each_episode_env_plays():
     from reliquary.cli.main import with_episode_harnesses
-    from reliquary_harness.spec import MINI_SWE_V1
+    from reliquary_harness.spec import MINI_SWE_V2
 
     envs = {"swe_v1": {"episode": episode_block()}, "tmax_v1": {"episode": episode_block()}}
-    pinned = with_episode_harnesses(envs, "swe_v1=mini-swe@1, tmax_v1=bash-surface@1")
-    assert pinned["swe_v1"]["episode"]["harness"] == _pin(MINI_SWE_V1)
+    pinned = with_episode_harnesses(envs, "swe_v1=mini-swe@2, tmax_v1=bash-surface@1")
+    assert pinned["swe_v1"]["episode"]["harness"] == _pin(MINI_SWE_V2)
     assert pinned["tmax_v1"]["episode"]["harness"] == _pin(BASH_SURFACE_V1)
     assert "harness" not in envs["swe_v1"]["episode"]                  # the file's blocks are not edited
     assert with_episode_harnesses(envs, None) is envs
-    for bad, why in [("swe_v1", "env=id@version"), ("other=mini-swe@1", "not an --rl-episode-envs env"),
-                     ("swe_v1=mini-swe@1,swe_v1=bash-surface@1", "twice"), ("swe_v1=openhands@1", "unknown harness")]:
+    for bad, why in [("swe_v1", "env=id@version"), ("other=mini-swe@2", "not an --rl-episode-envs env"),
+                     ("swe_v1=mini-swe@2,swe_v1=bash-surface@1", "twice"), ("swe_v1=openhands@1", "unknown harness")]:
         with pytest.raises(ValueError, match=why):
             with_episode_harnesses(envs, bad)
     for name, block in pinned.items():
