@@ -53,8 +53,12 @@ signed assignments, verified grades and local queue using the pinned runtime's
 Review the runtime's [release notes](https://github.com/reliquadotai/reliquary-TEE/releases)
 for its qualification status. Installing or selecting this mode does not
 activate a worker fleet or a core protocol profile.
-For `Standard_NCC40ads_H100_v5` workers, follow the pinned runtime's
-[Azure deployment and qualification guide](https://github.com/reliquadotai/reliquary-TEE/blob/51452c8d877987d8a6735aeaf3fa872d27773e59/docs/azure.md).
+For `Standard_NCC40ads_H100_v5` workers, use a separate deployment-tooling
+checkout pinned to `9e0595801523a2b4b21f8f612cbebcef894b4386` and follow its
+[Azure deployment and qualification guide](https://github.com/reliquadotai/reliquary-TEE/blob/9e0595801523a2b4b21f8f612cbebcef894b4386/docs/azure.md).
+This tooling revision includes large-UKI signing, Azure network fixes and
+NVIDIA device initialization for diskless guests;
+the installed trainer runtime remains pinned to `51452c8d877987d8a6735aeaf3fa872d27773e59`.
 The Azure worker uses the same authenticated queue and trainer interface;
 its approved CPU/GPU profile and real hardware qualification remain required.
 The controller and this trainer use the same SQLite queue on a local
