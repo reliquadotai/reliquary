@@ -1,12 +1,15 @@
 """Window-boundary metadata fetches leave the serving loop available."""
 
 import asyncio
+import builtins
+import importlib.util
 import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
+import requests
 
 from reliquary.infrastructure import drand
 from reliquary.validator import service
@@ -21,6 +24,52 @@ def candidate():
         _window_n=41,
         _set_window_preparation_stage=stages.append,
     ), stages
+
+
+@pytest.mark.asyncio
+async def test_cold_chain_import_keeps_health_endpoints_responsive(monkeypatch):
+    svc, stages = candidate()
+    started, release = threading.Event(), threading.Event()
+    loop_thread = threading.get_ident()
+    import_threads, served_during_bootstrap = [], []
+    original_import = builtins.__import__
+
+    def cold_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "reliquary.infrastructure.drand":
+            import_threads.append(threading.get_ident())
+            spec = importlib.util.spec_from_file_location("cold_drand_metadata", drand.__file__)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+        return original_import(name, globals, locals, fromlist, level)
+
+    def get(session, url, **kwargs):
+        started.set()
+        served_during_bootstrap.append(release.wait(1))
+        return SimpleNamespace(status_code=200, json=lambda: {"genesis_time": 10, "period": 3})
+
+    monkeypatch.setattr(builtins, "__import__", cold_import)
+    monkeypatch.setattr(requests.Session, "get", get)
+    monkeypatch.setattr(service.chain, "seconds_until_next_drand_boundary", lambda *args: 0)
+    server = ValidatorServer()
+
+    async def probe():
+        while not started.is_set():
+            await asyncio.sleep(0)
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=server.app), base_url="http://test"
+            ) as client:
+                assert (await client.get("/livez")).status_code == 200
+                assert (await client.get("/health")).status_code == 200
+        finally:
+            release.set()
+
+    await asyncio.gather(service.ValidationService._wait_for_next_drand_boundary(svc), probe())
+    assert len(import_threads) == 1
+    assert import_threads[0] != loop_thread
+    assert served_during_bootstrap and all(served_during_bootstrap)
+    assert stages == ["drand_boundary"]
 
 
 @pytest.mark.asyncio
