@@ -93,11 +93,13 @@ class PromptPlanner:
 
     def __init__(self, environment: str, prompt_range: tuple[int, int], *,
                  priority: Callable[[PromptRecord | None], float | None] = default_priority,
-                 rng: random.Random | None = None, clock: Callable[[], float] = time.time) -> None:
+                 rng: random.Random | None = None, clock: Callable[[], float] = time.time,
+                 excluded: frozenset[int] = frozenset()) -> None:
         start, end = int(prompt_range[0]), int(prompt_range[1])
         if not 0 <= start < end:
             raise ValueError("prompt range must be a non-empty [start, end)")
         self.environment, self.range = environment, (start, end)
+        self.excluded = frozenset(int(p) for p in excluded)    # rows of the range the validator refuses to lease
         self.priority, self._rng, self._clock = priority, rng or random.Random(), clock
         self.cursor = 0
         self.latest: int | None = None
@@ -149,7 +151,7 @@ class PromptPlanner:
             self.wait_for_outcome(prompt)
 
     def leasable(self, prompt: int) -> bool:
-        if not self.range[0] <= prompt < self.range[1]:
+        if not self.range[0] <= prompt < self.range[1] or prompt in self.excluded:
             return False
         until = self._waiting.get(prompt)
         if until is not None:
@@ -1285,6 +1287,7 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
         if closer is not None:
             stack.push_async_callback(closer)
         ranges = dict(prompt_ranges or {})
+        excluded: dict[str, frozenset[int]] = {}
         sources = getattr(getattr(generator, "episodes", None), "sources", None) or {}
         for name in config.environments:
             if name in ranges:
@@ -1293,10 +1296,13 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
                 ranges[name] = (0, len(sources[name]))         # an episode env: its whole taskset (the validator's)
                 continue
             from reliquary.environment import load_environment
-            from reliquary.protocol.rl_prompt_ranges import rl_prompt_range
+            from reliquary.protocol.rl_prompt_ranges import rl_excluded_prompts, rl_prompt_range
 
-            ranges[name] = rl_prompt_range(name, len(load_environment(name)))
-        planners = {name: PromptPlanner(name, ranges[name]) for name in config.environments}
+            env = load_environment(name)
+            ranges[name] = rl_prompt_range(name, len(env))
+            excluded[name] = rl_excluded_prompts(name, env)     # the validator's: it refuses a lease of these
+        planners = {name: PromptPlanner(name, ranges[name], excluded=excluded.get(name, frozenset()))
+                    for name in config.environments}
         state, loaded = None, None
         if initial_dir is not None:
             state = load_anchor_shards(sorted(Path(initial_dir).glob("*.safetensors")))

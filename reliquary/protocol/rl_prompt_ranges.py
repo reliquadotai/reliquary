@@ -14,6 +14,7 @@ closed instead of offering a shifted slice.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -76,4 +77,32 @@ def rl_prompt_range(environment: str, universe_n: int) -> tuple[int, int]:
     return (entry.start, end)
 
 
-__all__ = ["RL_PROMPT_RANGES", "RL_REUSES_CORPUS_ROWS", "RlPromptRange", "rl_prompt_range"]
+# Worlds of a world-split environment whose RL rows RL never draws, each with why. The rows stay in the RL range
+# (every index keeps naming its scenario); ``rl_excluded_prompts`` lists them from the loaded environment, so the
+# miner skips them and the validator refuses a lease of one. A stronger policy can be measured on them later.
+RL_EXCLUDED_WORLDS: dict[str, tuple[frozenset[str], str]] = {
+    "envscaler_tools_v2": (
+        frozenset({"env_147_rl", "env_153_rl", "env_161_rl", "env_163_rl",
+                   "env_169_rl", "env_173_rl", "env_181_rl", "env_187_rl"}),
+        "Measured on 2026-10-21 on the RL starting policy (teutonic-i-sft-v3, RL sampling, ~8 scenarios x 8 "
+        "rollouts per world, 1,741 episodes): these eight RL worlds won none of their episodes, so every group of "
+        "theirs is too hard and only costs leases."),
+}
+
+
+def rl_excluded_prompts(environment: str, env: Any) -> frozenset[int]:
+    """Rows of ``environment``'s RL range RL never draws: those whose scenario (``env.scenario(row).env_id``) is a
+    world of ``RL_EXCLUDED_WORLDS``; empty for an environment without an entry."""
+    entry = RL_EXCLUDED_WORLDS.get(environment)
+    if entry is None:
+        return frozenset()
+    worlds = entry[0]
+    start, end = rl_prompt_range(environment, len(env))
+    excluded = frozenset(row for row in range(start, end) if env.scenario(row).env_id in worlds)
+    if len(excluded) >= end - start:
+        raise ValueError(f"{environment}: every row of the RL range is excluded")
+    return excluded
+
+
+__all__ = ["RL_PROMPT_RANGES", "RL_REUSES_CORPUS_ROWS", "RL_EXCLUDED_WORLDS", "RlPromptRange", "rl_excluded_prompts",
+           "rl_prompt_range"]

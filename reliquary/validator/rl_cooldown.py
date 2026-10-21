@@ -63,8 +63,10 @@ class AdaptiveCooldown:
 
     def __init__(self, *, prompt_range: Mapping[str, tuple[int, int]] | None = None,
                  overrides: Mapping[str, int] | None = None, params: CooldownParams | None = None,
+                 excluded: Mapping[str, int] | None = None,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self.prompt_range = dict(prompt_range or {})
+        self.excluded = dict(excluded or {})        # per env: rows of the range RL never draws (out of N)
         self.overrides = dict(overrides or {})
         self.params = params or CooldownParams()
         self.clock = clock
@@ -105,7 +107,7 @@ class AdaptiveCooldown:
     def _measure(self, environment: str) -> dict:
         p = self.params
         span = self.prompt_range.get(environment)
-        n = None if span is None else max(0, int(span[1]) - int(span[0]))
+        n = None if span is None else max(0, int(span[1]) - int(span[0]) - self.excluded.get(environment, 0))
         initial = {"cooldown": p.initial, "source": "initial", "n": n}
         if self.book is None or not n:
             return initial
