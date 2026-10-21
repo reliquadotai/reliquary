@@ -37,7 +37,9 @@ def test_gumbel_profile_is_v9_with_the_gumbel_draw_and_a_new_version():
     assert gumbel.protocol_version == 10
     assert replace(gumbel.sampling, draw="inverse_cdf", lm_head_fp32=False) == v9.sampling
     math = {"reliquary_dapo_math_v1", "reliquary_hard_math_v1"}                # 64k there (2026-10-19 probe)
-    assert {n: e for n, e in gumbel.environments.items() if n not in math} == {
+    added = {"envscaler_tools_v2"}                      # a replayed tool world on the lease path (2026-10-21)
+    assert added.isdisjoint(v9.environments) and added <= set(gumbel.environments)
+    assert {n: e for n, e in gumbel.environments.items() if n not in math | added} == {
         n: e for n, e in v9.environments.items() if n not in math}
     assert all(replace(gumbel.environments[n], max_new_tokens=v9.environments[n].max_new_tokens)
                == v9.environments[n] and gumbel.environments[n].max_new_tokens == 65536 for n in math)

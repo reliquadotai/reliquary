@@ -77,6 +77,8 @@ from reliquary.validator.rl_leases import IN_ZONE, LeaseBook, classify_group
 logger = logging.getLogger(__name__)
 
 REJECTED = "rejected"
+# Episode envs a lease takes: signed by the sandbox (``rl_episode``) or replayed by the validator (``rl_suite_episodes``).
+EPISODE_MODES = frozenset({"signed_episode", "episode"})
 AUDIT_MAX_ATTEMPTS = 3        # raising audit forwards of one group before it is concluded inconclusive
 NOT_DRAWN, PENDING, PASSED, FAILED, INCONCLUSIVE = "not_drawn", "pending", "passed", "failed", "inconclusive"
 # rl_events kinds: pay eligibility (read by the P5 ledger) and the operator's bans
@@ -162,8 +164,9 @@ class SubmitConfig:
 class GroupGrader:
     """Grades single-turn groups as admission does, from completion tokens only (§4.4). ``environments`` maps an
     env name to its loaded environment (``get_problem`` and its reward materializer); ``tokenizer`` renders,
-    encodes and decodes (the admission worker's). ``episodes`` maps each signed-episode env to its
-    ``rl_episode.LeaseEpisodeChecker`` (§4.10): those envs are graded by ``grade_episodes``."""
+    encodes and decodes (the admission worker's). ``episodes`` maps each episode env to its checker, graded by
+    ``grade_episodes``: a signed-episode env's ``rl_episode.LeaseEpisodeChecker`` (§4.10), a replayed env's
+    ``rl_suite_episodes.LeaseSuiteChecker``."""
 
     def __init__(self, environments: Mapping[str, Any], tokenizer: Any, *, eos_token_ids: Sequence[int],
                  think_close_ids: Sequence[int] = (), canonical_force_ids: Sequence[int] = (),
@@ -176,8 +179,8 @@ class GroupGrader:
             if get_environment_spec(name).interaction_mode != "single_turn":
                 raise ValueError(f"{name}: a single-turn grader only; episode envs go in ``episodes``")
         for name in self.episodes:
-            if get_environment_spec(name).interaction_mode != "signed_episode":
-                raise ValueError(f"{name}: not a signed-episode environment")
+            if get_environment_spec(name).interaction_mode not in EPISODE_MODES:
+                raise ValueError(f"{name}: not an episode environment")
         if not eos_token_ids:
             raise ValueError("the EOS token ids are required to judge termination")
         self.eos_token_ids = frozenset(int(t) for t in eos_token_ids)
@@ -195,13 +198,13 @@ class GroupGrader:
     def add_episodes(self, checkers: Mapping[str, Any]) -> None:
         """The episode envs' checkers, once the sandbox side that verifies their transcripts is built."""
         for name in checkers:
-            if name in self.environments or get_environment_spec(name).interaction_mode != "signed_episode":
-                raise ValueError(f"{name}: not a signed-episode environment")
+            if name in self.environments or get_environment_spec(name).interaction_mode not in EPISODE_MODES:
+                raise ValueError(f"{name}: not an episode environment")
         self.episodes.update(checkers)
 
     def grade_episodes(self, lease, rollouts: Sequence[Rollout], *, received: float) -> Graded:
-        """A lease's episodes (signed transcripts, model spans): ``LeaseEpisodeChecker.grade``. Tokens are checked
-        against the vocabulary here, as for a single-turn group."""
+        """A lease's episodes (model spans; signed transcripts or replayed worlds): its env checker's ``grade``.
+        Tokens are checked against the vocabulary here, as for a single-turn group."""
         checker = self.episodes.get(lease.environment)
         if checker is None:
             return Graded((), reject="episode_schema")

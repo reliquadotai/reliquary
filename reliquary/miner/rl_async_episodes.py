@@ -50,12 +50,19 @@ class EpisodeLeaseGenerator:
     def __init__(self, *, policies: Mapping[str, Any], runner_factory: Callable[..., Any], engine, draws,
                  renderer_for: Callable[[Any], Any], task_prompt: Callable[[str, int], str],
                  load_weights: Callable[[Mapping[str, Any], int], None] | None = None,
-                 rollouts: int = 16) -> None:
+                 rollouts: int = 16, suites: Mapping[str, Any] | None = None) -> None:
         self.policies, self._factory, self._engine, self._draws = dict(policies), runner_factory, engine, draws
+        # Replayed envs (``rl_suite_episodes.SuiteLeasePlayer``): played on the same engine, no sandbox.
+        self.suites = dict(suites or {})
         self._renderer_for, self._task_prompt, self._load = renderer_for, task_prompt, load_weights
         self.rollouts = int(rollouts)
         self._renderers: dict[str, Any] = {}
         self._running: dict[str, asyncio.Task] = {}
+
+    @property
+    def environments(self) -> frozenset[str]:
+        """Every env this generator plays: the signed-episode ones and the replayed ones."""
+        return frozenset(self.policies) | frozenset(self.suites)
 
     def generate(self, leases) -> list:
         raise RuntimeError("episodes are played on the event loop: call agenerate")
@@ -122,6 +129,9 @@ class EpisodeLeaseGenerator:
         from reliquary.miner.forced_draw import LeaseDrawBinding
         from reliquary.miner.rl_async import EpisodeRollout
 
+        player = self.suites.get(lease.environment)
+        if player is not None:
+            return await player.play(lease)
         policy = self.policies.get(lease.environment)
         if policy is None:
             raise EpisodeLeaseFailed(f"{lease.environment} is not an episode environment of this miner")
@@ -338,11 +348,16 @@ class MixedGenerator:
             raise ValueError("no generator")
         self.episodes, self.single = episodes, single
 
+    def _episode_names(self) -> set[str]:
+        if self.episodes is None:
+            return set()
+        return set(getattr(self.episodes, "environments", None) or self.episodes.policies)
+
     def generate(self, leases) -> list:
         raise RuntimeError("episodes are played on the event loop: call agenerate")
 
     async def agenerate(self, leases: Sequence[Any]) -> list[list[Any]]:
-        names = set() if self.episodes is None else set(self.episodes.policies)
+        names = self._episode_names()
         played = [lease for lease in leases if lease.environment in names]
         drawn = [lease for lease in leases if lease.environment not in names]
         if drawn and self.single is None:
@@ -361,7 +376,7 @@ class MixedGenerator:
     async def aadvance(self, leases: Sequence[Any], budget_s: float) -> list[tuple[str, Any]]:
         """Continuous play of both kinds: the episode leases through ``EpisodeLeaseGenerator.aadvance``, the others
         through the single-turn generator's ``advance`` (in a worker thread), side by side."""
-        names = set() if self.episodes is None else set(self.episodes.policies)
+        names = self._episode_names()
         played = [lease for lease in leases if lease.environment in names]
         drawn = [lease for lease in leases if lease.environment not in names]
         done: list[tuple[str, Any]] = []
@@ -395,13 +410,17 @@ def build_episode_generator(blocks: Mapping[str, Mapping[str, Any]], *, validato
                             hotkey: str, sign_binding: Callable[[bytes], str], base_model_dir: str, work_dir: str,
                             generate_port: int = 8013, harness_env: Mapping[str, str] | None = None,
                             max_num_seqs: int = 64, gpu_memory_utilization: float | None = None,
-                            deps=None, load_environment=None) -> EpisodeLeaseGenerator:
+                            deps=None, load_environment=None, suites: Sequence[str] = (),
+                            load_tokenizer=None, suite_environments=None) -> EpisodeLeaseGenerator:
     """The episode side of ``mine-async`` (the window ``build_episode_stack`` minus precommits and the TOPLOC
     prover): ``blocks``: the validator's ``GET /rl/episodes`` envs (``rl_async_episodes`` blocks, validated here
     again); one forced engine for every env (their caps must be equal: ``check_engine_caps``), started at the
     first ``load_weights``; one ``LeaseEpisodeRunner`` per lease over ``HttpRlEpisodes``; the task prompts are the
     validator's own source (``load_episode_environment``: the catalogue's bridged source, the installed identity
-    checked against the block's pin). ``deps``: ``episode_mining.EpisodeStackDeps`` (tests: fakes)."""
+    checked against the block's pin). ``suites``: the miner's replayed envs (``rl_suite_episodes``), played on the
+    same engine (their caps must be the engine's too), their worlds built here (``suite_environments``: tests).
+    ``deps``: ``episode_mining.EpisodeStackDeps`` (tests: fakes); ``load_tokenizer``: the replayed envs' tokenizer
+    (tests)."""
     from reliquary.miner.episode_mining import EpisodeStackDeps
     from reliquary.miner.forced_draw import ForcedDraws
     from reliquary.miner.rl_episode_client import RL_PREFIX, HttpRlEpisodes, LeaseEpisodeRunner, check_engine_caps
@@ -410,14 +429,18 @@ def build_episode_generator(blocks: Mapping[str, Mapping[str, Any]], *, validato
 
     if load_environment is None:
         from reliquary.validator.rl_async_episodes import load_episode_environment as load_environment
+    from reliquary.validator.rl_suite_episodes import suite_lease_policy
+
     deps = deps or EpisodeStackDeps()
     blocks = {name: validate_episode_block(name, block) for name, block in blocks.items()}
-    if not blocks:
+    suites = tuple(suites or ())
+    if not blocks and not suites:
         raise ValueError("no episode environment")
     policies = {name: async_episode_policy(name, block) for name, block in blocks.items()}
-    first = policies[sorted(policies)[0]]
+    capped = {**policies, **{name: suite_lease_policy(name) for name in suites}}
+    first = capped[sorted(capped)[0]]
     total, per_turn = int(first.max_episode_tokens), int(first.max_tokens_per_turn)
-    for name, policy in policies.items():
+    for name, policy in capped.items():
         try:
             check_engine_caps(policy, max_total_tokens=total, max_tokens_per_turn=per_turn, max_model_len=total)
         except ValueError as exc:
@@ -430,6 +453,15 @@ def build_episode_generator(blocks: Mapping[str, Mapping[str, Any]], *, validato
         if refusal:
             raise ValueError(f"{name}: {refusal}")
     sources = {name: load_environment(name, block).source for name, block in blocks.items()}
+    codec = None
+    if suites:
+        from reliquary.corpus.suite_episode import TokenizerCodec
+        from reliquary.miner.suite_episode import suite_stop_ids
+
+        if load_tokenizer is None:
+            from reliquary.shared.modeling import load_tokenizer
+        tokenizer = load_tokenizer(str(base_model_dir))
+        codec = TokenizerCodec(tokenizer)
     renderers: dict[tuple, Any] = {}
 
     def renderer_for(policy, variant: int = 0):
@@ -442,11 +474,21 @@ def build_episode_generator(blocks: Mapping[str, Mapping[str, Any]], *, validato
                                                       variant=int(variant)))
         return renderers[key]
 
+    def stop_ids():
+        """The engine's turn stops: the signed envs' renderer's, the replayed envs' (ChatML) otherwise; one engine
+        serves both kinds only when they are the same."""
+        signed = None if not policies else set(renderer_for(policies[sorted(policies)[0]]).stop_ids)
+        replayed = None if codec is None else set(suite_stop_ids(codec.encode))
+        if signed is not None and replayed is not None and signed != replayed:
+            raise ValueError(f"the signed episodes stop on {sorted(signed)}, the replayed ones on {sorted(replayed)}: "
+                             "mine them with a miner process each")
+        return signed if signed is not None else replayed
+
     draws = ForcedDraws()
     sampling = deps.sampling()
     host = EpisodeEngineHost(make_core=deps.make_core, release_core=deps.release_core, serve=deps.serve, draws=draws,
                              model_name=str(base_model_dir), port=generate_port, max_total_tokens=total,
-                             max_tokens_per_turn=per_turn, stop_ids=lambda: renderer_for(first).stop_ids,
+                             max_tokens_per_turn=per_turn, stop_ids=stop_ids,
                              sampling=sampling, proof=TOPLOC_DEPLOYED_DEFAULTS,
                              core_kwargs={"max_num_seqs": max_num_seqs,
                                           "gpu_memory_utilization": gpu_memory_utilization})
@@ -459,10 +501,19 @@ def build_episode_generator(blocks: Mapping[str, Mapping[str, Any]], *, validato
                                   sampling=sampling, harness_env=dict(harness_env or {}) or None,
                                   harness=harness_of(policy_harness_pin(policy)), variant=variant)
 
+    players = {}
+    if suites:
+        from reliquary.miner.rl_suite_episodes import SuiteLeasePlayer
+        from reliquary.environment import load_episode_environment
+
+        for name in suites:
+            world = (suite_environments or {}).get(name) or load_episode_environment(name)
+            players[name] = SuiteLeasePlayer(policy=suite_lease_policy(name, environment=world), environment=world,
+                                             codec=codec, engine=host, draws=draws)
     generator = EpisodeLeaseGenerator(
         policies=policies, runner_factory=runner_factory, engine=host, draws=draws, renderer_for=renderer_for,
         task_prompt=lambda env, idx: sources[env].prompt(int(idx)),
-        load_weights=EpisodeWeights(host, base_model_dir=base_model_dir, work_dir=work_dir))
+        load_weights=EpisodeWeights(host, base_model_dir=base_model_dir, work_dir=work_dir), suites=players)
     generator.host, generator.sources, generator.blocks = host, sources, blocks
     return generator
 

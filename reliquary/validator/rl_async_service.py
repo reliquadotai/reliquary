@@ -571,7 +571,9 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
 def _grader_for(names, checkpoint: str, load_kwargs: Mapping[str, Any], episodes: Mapping[str, Any] | None = None):
     """The submission grader and the env prompt ranges, from the run's tokenizer and model config. ``episodes``:
     the signed-episode envs as loaded (``rl_async_episodes.load_episode_environment``): graded by their checkers
-    (``GroupGrader.add_episodes``, once the sandbox side is built), prompt range = their whole taskset."""
+    (``GroupGrader.add_episodes``, once the sandbox side is built), prompt range = their whole taskset. The
+    replayed episode envs of ``names`` (``rl_suite_episodes``) get their checkers here, prompt range = their RL
+    range."""
     from types import SimpleNamespace
 
     from transformers import AutoConfig, GenerationConfig
@@ -594,16 +596,23 @@ def _grader_for(names, checkpoint: str, load_kwargs: Mapping[str, Any], episodes
         canonical, think_close = force_close_token_ids(tokenizer), think_close_token_ids(tokenizer)
     except Exception:
         canonical, think_close = (), ()
+    from reliquary.validator.rl_suite_episodes import build_suite_checkers, is_replayed_env
+
     episodes = dict(episodes or {})
-    environments = {name: load_environment(name) for name in names if name not in episodes}
+    replayed = [name for name in names if name not in episodes and is_replayed_env(name)]
+    environments = {name: load_environment(name) for name in names if name not in episodes and name not in replayed}
     vocab = getattr(config, "vocab_size", None) or getattr(getattr(config, "text_config", None), "vocab_size", None)
     from reliquary.validator.rl_submit import PooledScorer
 
+    # Replayed episode envs: the validator replays their worlds (``rl_suite_episodes``, a CPU process pool).
+    suites = build_suite_checkers(replayed, tokenizer)
     # Scoring isolated per env, under the window path's wall budget (``PooledScorer``).
     grader = GroupGrader(environments, tokenizer, eos_token_ids=sorted(eos), think_close_ids=think_close,
-                         canonical_force_ids=canonical, vocab_size=vocab, scorer=PooledScorer(list(environments)))
+                         canonical_force_ids=canonical, vocab_size=vocab, scorer=PooledScorer(list(environments)),
+                         episodes=suites)
     ranges = {name: rl_prompt_range(name, len(env)) for name, env in environments.items()}
     ranges.update({name: (0, len(env)) for name, env in episodes.items()})
+    ranges.update({name: rl_prompt_range(name, len(checker.environment)) for name, checker in suites.items()})
     return grader, ranges
 
 

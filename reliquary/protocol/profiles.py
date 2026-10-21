@@ -1504,6 +1504,29 @@ _PROFILE_VALUES = (
 # at 32k about half the rollouts cut were correct once given room, so a cut there scored good reasoning 0.
 _TEUTONIC_V9 = next(p for p in _PROFILE_VALUES if p.profile_id == "teutonic-9b-reliquary-suite-v9-dev1")
 _V10_MATH_MAX_NEW_TOKENS = 65536
+# EnvScaler tool worlds (2026-10-21): a replayed episode env on the lease path (validator/rl_suite_episodes.py), the
+# run's native function-calling env. RL range [0, 1296) (26 worlds no SFT row comes from). Caps as the signed
+# episodes': 8,192 a turn, 65,536 an episode (one miner engine serves both kinds), the world's own 25 turns.
+# TODO(GPU): measure the policy's success per RL world and narrow the range off the worlds it never solves.
+_V10_ENVSCALER = EnvironmentProfile(
+    # For an episode this is the whole transcript, as `max_episode_tokens`.
+    max_new_tokens=65536,
+    bft=None,
+    answer_format="episode_json_action_v1",
+    batch_target=16,
+    environment_contract_id="envscaler-tools-v2",
+    environment_manifest_sha256=(
+        "d933a0f97d71e69ef55768f74bf27f96876c7e3ce61b9b3649f2ae7bb002c370"
+    ),
+    episode=EpisodeProfile(
+        schema="reliquary/episode/v1",
+        renderer_id="reliquary-chatml-tools-v1",
+        max_turns=25,
+        max_action_tokens=8192,
+        max_episode_tokens=65536,
+        max_observation_bytes=65536,
+    ),
+)
 _PROFILE_VALUES = _PROFILE_VALUES + (
     replace(
         _TEUTONIC_V9,
@@ -1511,9 +1534,10 @@ _PROFILE_VALUES = _PROFILE_VALUES + (
         protocol_version=10,
         sampling=replace(_SAMPLING_DAPO, draw=DRAW_GUMBEL_MAX, lm_head_fp32=True),
         environments={
-            name: (replace(env, max_new_tokens=_V10_MATH_MAX_NEW_TOKENS)
-                   if name in ("reliquary_dapo_math_v1", "reliquary_hard_math_v1") else env)
-            for name, env in _TEUTONIC_V9.environments.items()
+            **{name: (replace(env, max_new_tokens=_V10_MATH_MAX_NEW_TOKENS)
+                      if name in ("reliquary_dapo_math_v1", "reliquary_hard_math_v1") else env)
+               for name, env in _TEUTONIC_V9.environments.items()},
+            "envscaler_tools_v2": _V10_ENVSCALER,
         },
     ),
 )

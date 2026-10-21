@@ -42,6 +42,10 @@ RL_PROMPT_RANGES: dict[str, RlPromptRange] = {
         "Train is SFT [0, 4181), RL [4181, 6899), then the v1.1 problems [6899, 8792), "
         "all SFT (the package's layout.use_ranges); the SFT rows are the competitive-code "
         "corpus jobs' prompts."),
+    "envscaler_tools_v2": RlPromptRange(
+        0, 1_296, 7_825,
+        "The scenarios are split by world (the package's corpus layout): RL [0, 1296), 26 "
+        "worlds no SFT row comes from; the rest are the SFT ranges and the corpus jobs' prompts."),
 }
 
 

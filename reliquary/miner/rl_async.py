@@ -1285,28 +1285,35 @@ def miner_generator(config: AsyncMinerConfig, *, blocks: Mapping[str, Any], fake
                     validator_hotkey: str = "", wallet=None, episode_options: Mapping[str, Any] | None = None,
                     build_episodes=None, build_single=None) -> GroupGenerator:
     """The miner's generator: the vLLM group generator for its single-turn envs, the episode stack
-    (``rl_async_episodes.build_episode_generator``) for the validator's signed-episode envs (``blocks``), both under
+    (``rl_async_episodes.build_episode_generator``) for the validator's signed-episode envs (``blocks``) and the
+    replayed ones (``rl_suite_episodes``: registry episode envs, no block), both under
     one ``MixedGenerator`` when the miner mines both (they share the GPU: split ``--gpu-memory-utilization``).
     Blocking (an episode env loads its package and its taskset)."""
     if fake_generator:
         return FakeGroupGenerator()
     if dry_run and not (Path(base_model_dir) / "config.json").is_file():
         raise ValueError("a dry run needs --base-model or a full --initial-checkpoint (config and tokenizer)")
-    singles = [name for name in config.environments if name not in blocks]
+    from reliquary.validator.rl_suite_episodes import is_replayed_env
+
+    # Replayed episode envs (deterministic tool worlds): played in this process on the episode engine.
+    suites = [name for name in config.environments if name not in blocks and is_replayed_env(name)]
+    singles = [name for name in config.environments if name not in blocks and name not in suites]
     single = None
     if singles:
         single = (build_single or VllmGroupGenerator)(base_model_dir=base_model_dir, work_dir=work_dir, swap=swap,
                                                       engine_kwargs=engine_kwargs)
-        if not blocks:
+        if not blocks and not suites:
             return single
     from reliquary.miner.rl_async_episodes import MixedGenerator, build_episode_generator
 
     options = dict(episode_options or {})
+    if suites:
+        options["suites"] = tuple(suites)
     episodes = (build_episodes or build_episode_generator)(
         dict(blocks), validator_url=validator_url, validator_hotkey=validator_hotkey,
         hotkey=wallet.hotkey.ss58_address, sign_binding=lambda binding: wallet.hotkey.sign(binding).hex(),
         base_model_dir=base_model_dir, work_dir=work_dir, **options)
-    logger.info("episode envs %s played on the forced episode engine%s", sorted(blocks),
+    logger.info("episode envs %s played on the forced episode engine%s", sorted([*blocks, *suites]),
                 f"; single-turn envs {singles} on vLLM" if singles else "")
     return MixedGenerator(episodes=episodes, single=single)
 

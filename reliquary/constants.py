@@ -794,6 +794,10 @@ def _require_environment_corpora() -> None:
             spec = get_environment_spec(name)
         except (KeyError, ValueError):
             continue  # unknown names are the environment list's business
+        if spec.interaction_mode == "episode" and int(ACTIVE_PROTOCOL_PROFILE.protocol_version) >= 10:
+            # A replayed env of an async profile is loaded at startup by the processes that serve it (the
+            # validator's checkers, a miner mining it), and only by them: the others never need its corpus.
+            continue
         variable = spec.required_data_env_var
         if variable and not _os.environ.get(variable):
             raise ValueError(
