@@ -99,6 +99,11 @@ def suite_lease_policy(name: str, *, profile=None, environment=None) -> SuiteLea
     if episode.renderer_id != spec.renderer_id:
         raise ValueError(f"{name}: the profile renders with {episode.renderer_id!r}, the env with "
                          f"{spec.renderer_id!r}")
+    from reliquary.corpus.job import MAX_SUITE_TOKENS_PER_TURN
+
+    if int(episode.max_action_tokens) > MAX_SUITE_TOKENS_PER_TURN:
+        raise ValueError(f"{name}: {episode.max_action_tokens} tokens a turn, a suite turn takes at most "
+                         f"{MAX_SUITE_TOKENS_PER_TURN} (its text is one action, at most 16 KiB)")
     turns = int(episode.max_turns)
     if environment is not None:
         turns = min(turns, int(environment.max_turns))

@@ -101,7 +101,7 @@ def test_envscaler_is_a_replayed_env_of_the_v10_profile(real_rl_prompt_ranges):
 
     assert is_replayed_env(ENV) and not is_replayed_env("reliquary_dapo_math_v1")
     policy = suite_lease_policy(ENV, profile=V10)
-    assert (policy.max_turns, policy.max_tokens_per_turn, policy.max_episode_tokens) == (25, 8192, 65536)
+    assert (policy.max_turns, policy.max_tokens_per_turn, policy.max_episode_tokens) == (25, 3276, 65536)
     assert policy.renderer_id == "reliquary-chatml-tools-v1"
     assert rl_prompt_range(ENV, 7825) == (0, 1296)
     with pytest.raises(ValueError):
@@ -303,7 +303,7 @@ def test_the_episode_stack_plays_replayed_envs_on_its_engine(tmp_path, monkeypat
     assert isinstance(player, SuiteLeasePlayer) and player.policy.max_turns == 25
     host = generator.host
     assert isinstance(host, EpisodeEngineHost)
-    assert (host.max_total_tokens, host.max_tokens_per_turn) == (65536, 8192)
+    assert (host.max_total_tokens, host.max_tokens_per_turn) == (65536, 3276)
     assert set(host._stop_ids()) == {IM_END, IM_END + 1}           # <|im_end|>, <|endoftext|>
 
 
@@ -369,3 +369,18 @@ def test_a_lease_plays_its_episodes_side_by_side_past_the_loops_default_threads(
 
     played = asyncio.run(run())
     assert len(played) == 16 and len(engine.started) == 16
+
+
+def test_a_replayed_env_takes_at_most_a_suite_turn():
+    # A turn's whole text is one GeneratedAction (16 KiB at most): at 8,192 tokens a turn the H200 probe lost 4 %
+    # of its EnvScaler episodes on it, and a lease of 16 with any of them.
+    from dataclasses import replace as replaced
+
+    from reliquary.corpus.job import MAX_SUITE_TOKENS_PER_TURN
+
+    assert suite_lease_policy(ENV, profile=V10).max_tokens_per_turn <= MAX_SUITE_TOKENS_PER_TURN
+    entry = V10.environments[ENV]
+    wide = replaced(V10, environments={**V10.environments,
+                                       ENV: replaced(entry, episode=replaced(entry.episode, max_action_tokens=8192))})
+    with pytest.raises(ValueError, match="suite turn"):
+        suite_lease_policy(ENV, profile=wide)

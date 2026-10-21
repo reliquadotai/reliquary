@@ -1507,8 +1507,11 @@ _TEUTONIC_V9 = next(p for p in _PROFILE_VALUES if p.profile_id == "teutonic-9b-r
 _V10_LONG_MAX_NEW_TOKENS = 65536
 _V10_LONG_ENVS = ("reliquary_dapo_math_v1", "reliquary_hard_math_v1", "reliquary_competitive_code_v1")
 # EnvScaler tool worlds (2026-10-21): a replayed episode env on the lease path (validator/rl_suite_episodes.py), the
-# run's native function-calling env. RL range [0, 1296) (26 worlds no SFT row comes from). Caps as the signed
-# episodes': 8,192 a turn, 65,536 an episode (one miner engine serves both kinds), the world's own 25 turns.
+# run's native function-calling env. RL range [0, 1296) (26 worlds no SFT row comes from). 65,536 an episode, the
+# world's own 25 turns, and a suite turn's cap (corpus.job.MAX_SUITE_TOKENS_PER_TURN, 3,276): a turn's whole text is
+# one GeneratedAction, refused past 16 KiB; at 8,192 a turn 4 % of the episodes on the 2026-10-21 H200 probe
+# overran it, and a lease of 16 dies with one of them. The signed episodes' engine (8,192 a turn) cannot serve it:
+# a miner mines it with a process of its own.
 # TODO(GPU): measure the policy's success per RL world and narrow the range off the worlds it never solves.
 _V10_ENVSCALER = EnvironmentProfile(
     # For an episode this is the whole transcript, as `max_episode_tokens`.
@@ -1524,7 +1527,7 @@ _V10_ENVSCALER = EnvironmentProfile(
         schema="reliquary/episode/v1",
         renderer_id="reliquary-chatml-tools-v1",
         max_turns=25,
-        max_action_tokens=8192,
+        max_action_tokens=3276,
         max_episode_tokens=65536,
         max_observation_bytes=65536,
     ),
