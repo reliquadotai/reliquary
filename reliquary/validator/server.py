@@ -3895,7 +3895,9 @@ class ValidatorServer:
         self,
         batchers: dict[str, GrpoWindowBatcher],
     ) -> None:
-        """Prewarm auction workers before a candidate window becomes OPEN."""
+        """Prepare prompt metadata and auction workers before a candidate becomes OPEN."""
+        for batcher in batchers.values():
+            await asyncio.to_thread(len, batcher.env)
         if not self._auction_admission_enabled:
             return
         for environment, batcher in batchers.items():

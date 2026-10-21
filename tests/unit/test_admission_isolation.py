@@ -157,7 +157,7 @@ def test_new_admission_pool_prewarms_every_worker(monkeypatch):
 @pytest.mark.asyncio
 async def test_prepare_admission_pools_runs_outside_event_loop(monkeypatch):
     environment = "openmathinstruct"
-    batcher = SimpleNamespace(difficulty_auction_enabled=True)
+    batcher = SimpleNamespace(difficulty_auction_enabled=True, env=range(1000))
     server = ValidatorServer()
     server._auction_admission_enabled = True
     event_loop_thread = threading.get_ident()
