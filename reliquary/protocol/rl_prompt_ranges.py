@@ -9,11 +9,21 @@ repeat: rows a distillation corpus already consumed (the policy was trained on
 their answers), or rows an evaluation set holds out. Each one records the split
 length it was cut against, so a repinned environment of another length fails
 closed instead of offering a shifted slice.
+
+A signed-episode env of an async task declares its rows in its own block instead
+(``rl_async_episodes``: ``rows = {start, end, exclude}``): ``PromptRows``, a slice
+minus excluded rows and intervals, which the validator enforces at lease time and
+the miner draws from.
 """
 
 from __future__ import annotations
 
+import bisect
+import itertools
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -76,4 +86,77 @@ def rl_prompt_range(environment: str, universe_n: int) -> tuple[int, int]:
     return (entry.start, end)
 
 
-__all__ = ["RL_PROMPT_RANGES", "RL_REUSES_CORPUS_ROWS", "RlPromptRange", "rl_prompt_range"]
+MAX_EXCLUDED_ENTRIES = 4096
+
+
+@dataclass(frozen=True)
+class PromptRows:
+    """The rows RL may draw from: ``[start, end)`` minus ``exclude`` (sorted, disjoint ``[a, b)`` inside it)."""
+    start: int
+    end: int
+    exclude: tuple[tuple[int, int], ...] = ()
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.start < self.end:
+            raise ValueError("prompt rows must be a non-empty [start, end)")
+        floor = self.start
+        for a, b in self.exclude:
+            if not floor <= a < b <= self.end:
+                raise ValueError("excluded rows must be sorted, disjoint intervals inside [start, end)")
+            floor = b
+        if len(self) == 0:
+            raise ValueError("every row of [start, end) is excluded")
+
+    @classmethod
+    def of(cls, value: PromptRows | tuple[int, int]) -> PromptRows:
+        """A ``PromptRows``, or a plain ``(start, end)`` slice."""
+        return value if isinstance(value, PromptRows) else cls(int(value[0]), int(value[1]))
+
+    def __contains__(self, row: object) -> bool:
+        if type(row) is not int or not self.start <= row < self.end:
+            return False
+        i = bisect.bisect_right(self.exclude, (row, math.inf)) - 1
+        return i < 0 or not self.exclude[i][0] <= row < self.exclude[i][1]
+
+    def __len__(self) -> int:
+        return self.end - self.start - sum(b - a for a, b in self.exclude)
+
+
+def parse_prompt_rows(value: Any, where: str) -> PromptRows:
+    """``{"start", "end", "exclude"?}``: ``exclude`` lists rows (an int) and ``[a, b)`` intervals, which may come in
+    any order but never overlap. ValueError otherwise."""
+    def integer(v: Any, label: str) -> int:
+        if type(v) is not int or v < 0:
+            raise ValueError(f"{where}.{label} must be a non-negative integer")
+        return v
+
+    if not isinstance(value, Mapping) or not {"start", "end"} <= set(value) <= {"start", "end", "exclude"}:
+        raise ValueError(f"{where} is {{start, end, exclude?}}")
+    start, end = integer(value["start"], "start"), integer(value["end"], "end")
+    raw = value.get("exclude", [])
+    if not isinstance(raw, list) or len(raw) > MAX_EXCLUDED_ENTRIES:
+        raise ValueError(f"{where}.exclude must be a list of at most {MAX_EXCLUDED_ENTRIES} rows or [a, b) intervals")
+    spans = []
+    for item in raw:
+        if isinstance(item, list):
+            if len(item) != 2:
+                raise ValueError(f"{where}.exclude: an interval is [a, b)")
+            a, b = integer(item[0], "exclude"), integer(item[1], "exclude")
+        else:
+            a = integer(item, "exclude")
+            b = a + 1
+        if not start <= a < b <= end:
+            raise ValueError(f"{where}.exclude: {item} is empty or outside [{start}, {end})")
+        spans.append((a, b))
+    spans.sort()
+    for (_, b), (a, _) in itertools.pairwise(spans):
+        if a < b:
+            raise ValueError(f"{where}.exclude: overlapping entries at row {a}")
+    try:
+        return PromptRows(start, end, tuple(spans))
+    except ValueError as exc:
+        raise ValueError(f"{where}: {exc}") from None
+
+
+__all__ = ["MAX_EXCLUDED_ENTRIES", "RL_PROMPT_RANGES", "RL_REUSES_CORPUS_ROWS", "PromptRows", "RlPromptRange",
+           "parse_prompt_rows", "rl_prompt_range"]

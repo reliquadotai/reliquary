@@ -531,3 +531,14 @@ def test_the_prompt_lifecycle_survives_a_restart(tmp_path):
     assert reopened.prompt_state() == view
     assert reopened.grant([ask("A", [1])])[0].refused == {1: BLACKLISTED}
     assert reopened.record_outcome(ENV, 1, 0, binary(16), TOO_EASY).first_scan is False
+
+
+def test_an_excluded_row_is_outside_the_range(tmp_path):
+    from reliquary.protocol.rl_prompt_ranges import PromptRows
+
+    book = book_at(tmp_path, prompt_range={ENV: PromptRows(0, 100, ((10, 20), (50, 51)))})
+    book.adopt_checkpoint(0)
+    for bad in ([10], [19], [5, 50]):
+        with pytest.raises(ValueError, match="RL range"):
+            book.check_request(ask("A", bad))
+    book.check_request(ask("A", [9, 20, 51]))

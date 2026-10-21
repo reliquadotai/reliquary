@@ -91,13 +91,17 @@ def default_priority(record: PromptRecord | None) -> float | None:
 class PromptPlanner:
     """One environment's prompt table, fed by ``GET /rl/prompts/state`` pages, and the miner's prompt choice."""
 
-    def __init__(self, environment: str, prompt_range: tuple[int, int], *,
+    def __init__(self, environment: str, prompt_range, *,
                  priority: Callable[[PromptRecord | None], float | None] = default_priority,
                  rng: random.Random | None = None, clock: Callable[[], float] = time.time) -> None:
-        start, end = int(prompt_range[0]), int(prompt_range[1])
-        if not 0 <= start < end:
-            raise ValueError("prompt range must be a non-empty [start, end)")
-        self.environment, self.range = environment, (start, end)
+        """``prompt_range``: ``(start, end)`` or a ``PromptRows`` (an episode env's rows, exclusions included)."""
+        from reliquary.protocol.rl_prompt_ranges import PromptRows
+
+        try:
+            self.rows = PromptRows.of(prompt_range)
+        except ValueError:
+            raise ValueError("prompt range must be a non-empty [start, end)") from None
+        self.environment, self.range = environment, (self.rows.start, self.rows.end)
         self.priority, self._rng, self._clock = priority, rng or random.Random(), clock
         self.cursor = 0
         self.latest: int | None = None
@@ -149,7 +153,7 @@ class PromptPlanner:
             self.wait_for_outcome(prompt)
 
     def leasable(self, prompt: int) -> bool:
-        if not self.range[0] <= prompt < self.range[1]:
+        if prompt not in self.rows:
             return False
         until = self._waiting.get(prompt)
         if until is not None:
@@ -1241,7 +1245,7 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
                           base_model_dir: str | None = None, work_dir: str, initial_dir: str | None = None,
                           initial_version: int | None = None, swap: str = "push", dry_run: bool = False,
                           fake_generator: bool = False, engine_kwargs: Mapping[str, Any] | None = None,
-                          prompt_ranges: Mapping[str, tuple[int, int]] | None = None,
+                          prompt_ranges: Mapping[str, Any] | None = None,
                           episode_options: Mapping[str, Any] | None = None) -> None:
     """Build the transport, generator, planners and checkpoint follower, and run until interrupted."""
     import httpx
@@ -1284,18 +1288,8 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
         closer = getattr(getattr(getattr(generator, "episodes", None), "host", None), "close", None)
         if closer is not None:
             stack.push_async_callback(closer)
-        ranges = dict(prompt_ranges or {})
         sources = getattr(getattr(generator, "episodes", None), "sources", None) or {}
-        for name in config.environments:
-            if name in ranges:
-                continue
-            if name in sources:
-                ranges[name] = (0, len(sources[name]))         # an episode env: its whole taskset (the validator's)
-                continue
-            from reliquary.environment import load_environment
-            from reliquary.protocol.rl_prompt_ranges import rl_prompt_range
-
-            ranges[name] = rl_prompt_range(name, len(load_environment(name)))
+        ranges = planner_ranges(config.environments, sources=sources, blocks=blocks, prompt_ranges=prompt_ranges)
         planners = {name: PromptPlanner(name, ranges[name]) for name in config.environments}
         state, loaded = None, None
         if initial_dir is not None:
@@ -1308,6 +1302,26 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
         miner = AsyncMiner(config, transport=transport, generator=generator, planners=planners,
                            checkpoint_sync=sync, loaded_version=loaded, state=state, env_weights=weights)
         await miner.run()
+
+
+def planner_ranges(environments, *, sources: Mapping[str, Any], blocks: Mapping[str, Any],
+                   prompt_ranges: Mapping[str, Any] | None = None, load_environment=None) -> dict:
+    """Each env's rows to draw from, as the validator's lease check reads them: ``prompt_ranges`` first (tests), an
+    episode env's block ``rows`` over its taskset (``sources``), a single-turn env's ``rl_prompt_range``."""
+    from reliquary.protocol.rl_prompt_ranges import rl_prompt_range
+    from reliquary.validator.rl_async_episodes import episode_prompt_rows
+
+    ranges = dict(prompt_ranges or {})
+    for name in environments:
+        if name in ranges:
+            continue
+        if name in sources:
+            ranges[name] = episode_prompt_rows(name, blocks.get(name, {}), len(sources[name]))
+            continue
+        if load_environment is None:
+            from reliquary.environment import load_environment
+        ranges[name] = rl_prompt_range(name, len(load_environment(name)))
+    return ranges
 
 
 def miner_generator(config: AsyncMinerConfig, *, blocks: Mapping[str, Any], fake_generator: bool = False,
@@ -1352,6 +1366,6 @@ def miner_generator(config: AsyncMinerConfig, *, blocks: Mapping[str, Any], fake
 __all__ = [
     "AsyncMiner", "AsyncMinerConfig", "DryRunTransport", "FakeGroupGenerator", "FakeStreamGenerator", "GroupGenerator",
     "HeldLease", "HttpRlTransport", "PromptPlanner", "PromptRecord", "RequestRefused", "RlTransport",
-    "VllmGroupGenerator", "default_priority", "draw_context", "encode_submission", "miner_generator", "run_async_miner", "submission_digest",
-    "submission_rollouts", "write_hf_dir",
+    "VllmGroupGenerator", "default_priority", "draw_context", "encode_submission", "miner_generator", "planner_ranges",
+    "run_async_miner", "submission_digest", "submission_rollouts", "write_hf_dir",
 ]

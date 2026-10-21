@@ -64,6 +64,40 @@ def test_episode_blocks_are_checked_with_the_orders_rules():
         episode_blocks({EPISODE_ENVS_PARAM: {EPISODE: {"episode": episode_block()}}}, envs=(ENV,))
 
 
+def test_an_episode_env_declares_its_rows_and_bad_rows_are_refused(tmp_path, monkeypatch):
+    from reliquary.cli.main import _read_episode_envs, with_rl_async_params
+    from reliquary.protocol.rl_prompt_ranges import PromptRows
+    from reliquary.validator.rl_async_episodes import episode_prompt_rows, load_episode_environment
+
+    rows = {"start": 100, "end": 900, "exclude": [[200, 300], 450]}
+    block = validate_episode_block(EPISODE, {"episode": episode_block(), "rows": rows})
+    assert block["rows"] == rows
+    assert episode_prompt_rows(EPISODE, block, 1000) == PromptRows(100, 900, ((200, 300), (450, 451)))
+    assert episode_prompt_rows(EPISODE, {"episode": episode_block()}, 1000) == PromptRows(0, 1000)
+    with pytest.raises(ValueError, match="past the installed taskset"):
+        episode_prompt_rows(EPISODE, block, 899)
+    # a 1000-row registered env: rows past it fail the load (validator and miner alike)
+    from tests.unit.episode_v2_fixtures import make_test_episode_env
+
+    monkeypatch.setattr("reliquary.environment.registry.find_environment_spec",
+                        lambda name: SimpleNamespace(interaction_mode="signed_episode"))
+    monkeypatch.setattr("reliquary.environment.load_environment", lambda name: make_test_episode_env())
+    assert len(load_episode_environment(EPISODE, block)) == 1000
+    with pytest.raises(ValueError, match="past the installed taskset"):
+        load_episode_environment(EPISODE, {**block, "rows": {"start": 0, "end": 1001}})
+    # refused when the task is declared
+    path = tmp_path / "eps.json"
+    base = SimpleNamespace(mechanism="rl-discovered-price", env_split={ENV: 0.5, EPISODE: 0.5}, params={})
+    monkeypatch.setattr("dataclasses.replace", lambda obj, **kw: SimpleNamespace(**{**vars(obj), **kw}))
+    for bad in ({"start": 0}, {"start": 0, "end": 10, "exclude": [[2, 5], 4]}, {"start": 0, "end": 1, "exclude": [0]}):
+        path.write_text(json.dumps({EPISODE: {"episode": episode_block(), "rows": bad}}))
+        with pytest.raises(ValueError, match="rows"):
+            with_rl_async_params(base, planned_tokens_per_period=1e6, episode_envs=_read_episode_envs(path))
+    path.write_text(json.dumps({EPISODE: {"episode": episode_block(), "rows": rows}}))
+    declared = with_rl_async_params(base, planned_tokens_per_period=1e6, episode_envs=_read_episode_envs(path))
+    assert declared.params[EPISODE_ENVS_PARAM][EPISODE]["rows"] == rows
+
+
 def test_an_rl_episode_is_bounded_by_the_rl_cap_not_the_corpus_one():
     from reliquary.protocol.service_contract import MAX_EPISODE_TOKENS, MAX_RL_EPISODE_TOKENS
 
