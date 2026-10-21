@@ -134,6 +134,71 @@ def lease_variant(spec, lease) -> int:
                          task_index=int(lease.prompt_idx))
 
 
+def policy_harness_choices(policy) -> tuple:
+    """((pin, weight), ...) an episode env policy plays: a weighted mix in its block's order, else its one
+    harness (None: the compatibility harness) at weight 1."""
+    choices = getattr(policy, "harness_choices", None)
+    return tuple(choices()) if callable(choices) else ((policy_harness_pin(policy), 1),)
+
+
+def policy_default_harness(policy):
+    """The spec of a policy's first harness: its only one, or its mix's first (the renderer a check builds
+    before any lease; every harness of one tokenizer stops on the same ids)."""
+    return harness_of(policy_harness_choices(policy)[0][0])
+
+
+def harness_mix_index(choices, lease) -> int:
+    """Which harness of a weighted mix an RL lease plays: `H(nonce ‖ engagement ‖ prompt ‖ mix) mod Σ
+    weights`, each part length-prefixed, the mix being its (key, digest, weight) list. Drawn from the lease's
+    draw nonce (the validator's secret-derived), so the miner cannot choose it, both sides compute it alone,
+    and the 16 rollouts of a group share it. One harness: 0."""
+    import hashlib
+
+    if len(choices) == 1:
+        return 0
+    mix = json.dumps([[harness_of(pin).key, harness_of(pin).digest, int(weight)] for pin, weight in choices],
+                     separators=(",", ":")).encode()
+    digest = hashlib.sha256()
+    for part in (str(lease.nonce).encode(), f"rl-lease:{lease.lease_id}".encode(),
+                 str(int(lease.prompt_idx)).encode(), b"harness-mix", mix):
+        digest.update(len(part).to_bytes(8, "big") + part)
+    point = int.from_bytes(digest.digest(), "big") % sum(int(weight) for _, weight in choices)
+    for index, (_, weight) in enumerate(choices):
+        if point < int(weight):
+            return index
+        point -= int(weight)
+    raise AssertionError("unreachable: the point is below the weights' sum")
+
+
+def lease_surface(policy, lease):
+    """(spec, variant) every episode of an RL lease plays: the mix's harness drawn for the lease (its only
+    one without a mix), then that harness's surface variant (`lease_variant`)."""
+    choices = policy_harness_choices(policy)
+    spec = harness_of(choices[harness_mix_index(choices, lease)][0])
+    return spec, lease_variant(spec, lease)
+
+
+def harness_value_refusal(value) -> str | None:
+    """Why this build cannot serve an RL episode block's `harness`: one pin (None: the compatibility
+    harness), or a weighted mix whose every harness it must serve; or None."""
+    if not isinstance(value, list):
+        return harness_pin_refusal(value, variants=True)
+    for entry in value:
+        refusal = harness_pin_refusal({k: v for k, v in entry.items() if k != "weight"}, variants=True)
+        if refusal:
+            return refusal
+    return None
+
+
+def policy_harness_refusal(policy) -> str | None:
+    """`harness_value_refusal` of a typed policy (every harness it may draw)."""
+    for pin, _ in policy_harness_choices(policy):
+        refusal = harness_pin_refusal(pin, variants=True)
+        if refusal:
+            return refusal
+    return None
+
+
 def _dist_commit(name: str) -> str | None:
     """The commit a distribution was installed from: its VCS pin, or the HEAD
     of the checkout an editable install points at. None when unknowable."""

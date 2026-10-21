@@ -473,6 +473,9 @@ class LeaseEpisodeRunner(RlSignedEpisodeRunner):
     lease binding. Opens, throttles and reopens are the window runner's; the lease's own refusals
     (``lease_closed``, ``lease_not_yours``) end every rollout. Opens stop at the lease's expiry."""
 
+    # A lease takes all its episodes: the model's first malformed turn ends one (scored 0), never the lease.
+    format_stop = True
+
     def __init__(self, *, policy, lease, hotkey: str, prompt: str, **kwargs) -> None:
         import hashlib
 

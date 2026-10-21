@@ -116,7 +116,9 @@ def episode_blocks(params: Mapping[str, Any], envs=None) -> dict[str, dict]:
 
 def async_episode_policy(name: str, block: Mapping[str, Any], *, rollouts: int | None = None):
     """The ``EpisodeEnvPolicy`` of a validated block on the async path (its pool: 2 x the lease's rollouts)."""
-    from reliquary.protocol.service_contract import EPISODE_BUDGET_FIELDS, EpisodeEnvPolicy, harness_pairs
+    from reliquary.protocol.service_contract import (
+        EPISODE_BUDGET_FIELDS, EpisodeEnvPolicy, harness_mix_pairs, harness_pairs,
+    )
 
     episode = block["episode"]
     return EpisodeEnvPolicy(
@@ -124,7 +126,8 @@ def async_episode_policy(name: str, block: Mapping[str, Any], *, rollouts: int |
         env_package=episode["env_package"], tools=tuple(episode["tools"]), max_turns=episode["max_turns"],
         max_tokens_per_turn=episode["max_tokens_per_turn"], max_episode_tokens=episode["max_episode_tokens"],
         budgets=tuple((f, episode["budgets"][f]) for f in EPISODE_BUDGET_FIELDS),
-        pool_seeds=2 * int(rollouts or _rollouts()), harness=harness_pairs(episode))
+        pool_seeds=2 * int(rollouts or _rollouts()), harness=harness_pairs(episode),
+        harness_mix=harness_mix_pairs(episode))
 
 
 def episode_policies(blocks: Mapping[str, Mapping[str, Any]]) -> dict:
@@ -157,12 +160,13 @@ def expiry_overrides(params: Mapping[str, Any]) -> dict[str, float]:
 def load_episode_environment(name: str, block: Mapping[str, Any], *, build_source=None):
     """The env's ``SignedEpisodeEnvironment`` (its ``source`` is the task source). Blocking: a bridged env loads
     its package and its taskset. ValueError when the install is not the block's."""
-    from reliquary.environment.agentic_swe import harness_pin_refusal
+    from reliquary.environment.agentic_swe import harness_value_refusal
     from reliquary.environment.registry import find_environment_spec
     from reliquary.environment.signed_episode import SignedEpisodeEnvironment
 
-    # The harness the block names must be one this build serves at that digest (refused, never judged).
-    refusal = harness_pin_refusal(block["episode"].get("harness"), variants=True)
+    # The harness (or every harness of the mix) the block names must be one this build serves at that digest
+    # (refused, never judged).
+    refusal = harness_value_refusal(block["episode"].get("harness"))
     if refusal:
         raise ValueError(f"{name}: {refusal}")
     catalogue = block.get("catalogue")
@@ -325,7 +329,8 @@ def build_rl_lease_sandbox(
         open_body_timeout_s=BODY_TIMEOUT_S, max_preauth_opens=MAX_PREAUTH)
     checkers = {name: LeaseEpisodeChecker(policy=p, renderer=renderer_for(p), source=environments[name].source,
                                           directory=fleet.directory_if_ready, token_verifier=token_verifier,
-                                          renderer_of=lambda variant, p=p: renderer_for(p, variant=variant))
+                                          renderer_of=lambda variant, p=p, **kw: renderer_for(p, variant=variant,
+                                                                                               **kw))
                 for name, p in policies.items()}
     logger.info("rl lease sandbox built for %s (validator key %s)", sorted(policies), signer.key_id)
     return RlLeaseSandbox(signer=signer, token_verifier=token_verifier, fleet=fleet, book=book, issuer=issuer,

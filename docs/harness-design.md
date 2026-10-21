@@ -207,7 +207,7 @@ an RL smoke. Telecom's 0/38 with unfamiliar markup is the warning. Turning it on
 swe_v1=mini-swe@1,tmax_v1=bash-surface@1` writes `{id, version, digest}` into each named env's
 `episode.harness` (`cli.main.with_episode_harnesses`). The digest is the one this build serves,
 so a typo or a stale build fails at creation. An env not named keeps the compatibility harness.
-One harness per env; a weighted mix per env is open (section 9).
+One harness per env, or a weighted mix drawn per lease (section 6c).
 
 **`mini-swe@1`** (`reliquary_harness.mini`, texts from mini-swe-agent 04d809ce, MIT): no tool
 schema in the prompt; the model writes one command in a ```` ```mswea_bash_command ```` block.
@@ -246,6 +246,61 @@ A harness is chosen when the task is created, and every path plays it:
   gateway, admitted once by the corpus intake, graded, and exported as mini's conversation;
   the window paths; `jobs create --harness`; the replay refusal).
 
+## 6c. A weighted mix of harnesses per RL env (DONE on the branches, 2026-10-21)
+
+**Contract.** An RL episode block's `harness` is one `{id, version, digest}` (unchanged), or a list
+of 2 to 8 distinct `{id, version, digest, weight}`, weights integers from 1 to 1000
+(`service_contract.parse_harness_value`). `EpisodeEnvPolicy.harness_choices()` gives
+`((pin, weight), ...)`; `harness_pin()` refuses a mix, so a window and a corpus job, which
+have no validator seed, refuse it.
+
+**Draw** (`agentic_swe.lease_surface`): the harness is
+`H(len‖nonce ‖ len‖"rl-lease:{id}" ‖ len‖prompt_idx ‖ len‖"harness-mix" ‖ len‖mix) mod Σ weights`,
+the mix being its `[key, digest, weight]` list, then that harness's surface variant, drawn as
+before. The nonce derives from the validator's secret, so the miner cannot choose; both sides
+compute it alone; the 16 rollouts of a lease share it, so a group's advantages compare
+policies, never harnesses. One harness keeps its draw exactly.
+
+**Wiring.** The miner (`EpisodeLeaseGenerator.play_lease`) renders, prechecks and plays the
+drawn harness. The validator (`LeaseEpisodeChecker`) grades each lease in the harness and
+variant it draws, with one renderer per (harness, variant). Every binary must serve every
+harness of the mix, or it refuses the env.
+
+**Choosing it**: `reliquary tasks create --rl-async … --harness
+swe_v1=mini-swe@1:3+bash-surface@1:1` (weight 1 by default).
+
+**Outcomes per harness.** The checker logs every lease, `episode lease <id> (<env>, <harness>,
+surface variant <n>): admitted | rejected <stage> <detail>`, and counts them in
+`LeaseEpisodeChecker.outcomes[(harness, verdict)]`.
+
+## 6d. A malformed model turn ends its episode, not the lease (DONE on the branches, 2026-10-21)
+
+Before: one rollout the shared admission check refused gave up the whole lease, 16 rollouts. With
+p malformed rollouts, 1 − (1 − p)^16 of the leases were lost (39 % at 3 %), so a new harness was
+trained on far less than its weight. No lab voids a group for one rollout.
+
+Now, on an async RL lease only (`format_stop`):
+
+- **Malformed** (`trajectory_parse.turn_format_violation`, one definition for miner and
+  validator): turn markup or a stop id before the turn's end (the model wrote its own
+  observation or next turn), or a turn with calls that ends on the end-of-text token.
+- **Miner.** `HarnessEpisodeRunner` ends the episode at the first malformed turn: none of
+  its calls is sent, the stop is `format_error`, and the box is graded as usual.
+- **Validator.** `parse_signed_trajectory` admits a `format_error` episode only if its last
+  turn is malformed, and checks every turn before it as usual. That includes their
+  observations against the signed records and their termination. The lease checker scores it
+  0, whatever the box's grade. The other 15 episodes and the lease count.
+- **Honesty is unchanged.** The tokens are the forced draw's, so the miner cannot write a
+  malformed turn itself. A transcript, observation, prompt or session that is not honest still
+  refuses the lease. A well-formed last turn that claims `format_error` is refused. Ending
+  early earns only a 0.
+- **Corpus jobs and RL windows keep refusing** such an episode: it would be exported, or
+  proven per span.
+- Tests: `test_format_error_stop` covers the predicate and the miner's stop mapping. It plays
+  the miner's loop against the real gateway with a made-up observation and an end-of-text
+  turn, checks the shared admission check (lease admitted, window refused), checks that a
+  well-formed turn cannot claim `format_error`, and checks the checker's zero reward.
+
 **Smoke lessons** (2026-10-20, Qwen3.5-2B on one H100, forced draw, real gateway):
 
 - **The renderer release is part of the harness.** A fresh install took `renderers` 0.1.12
@@ -273,7 +328,7 @@ executor coordination.
 | 6 | Family A (ChatML, EnvScaler, telecom) as specs; `renderers.py` delegates | manifest regen (`scripts/regen_episode_manifests.py`) | `test_chatml_episode_consensus.py`, the EnvScaler golden |
 | 7 | Legacy Docker replay: `TOOL_PROGRAM` onto `format_observation`, then retired; the legacy miner off verifiers | executors | replay tests |
 | 8 | Variants: **DONE** (off until a block names `bash-surface@1`) | Catalyst build + registry block | `test_harness_variants_e2e`, an RL smoke per variant |
-| 9 | Weighted harness mix per env (draw per lease, as variants), metrics per harness | Catalyst build + registry block | to design |
+| 9 | Weighted harness mix per env (draw per lease, as variants), outcomes per harness: **DONE** | Catalyst build + registry block | `test_harness_mix`, an RL smoke with a mix |
 
 Rollback for step 3, before any release: reverting the step 3 commit restores verifiers'
 loop (`_context` and `_default_runner`), with the same tokens. Nothing else depends on it.
@@ -331,12 +386,12 @@ on the production 27B/Teutonic models.
 - **renderers 0.1.11's parameter whitespace stripping** is still worked around by
   `span_is_canonical`. Vendoring the Qwen3.8 renderer into the package would freeze it; that
   is a new spec version, not this one.
-- **A weighted mix of harnesses per env.** Same draw as variants (lease nonce), over
-  `[(pin, weight)]`; validator and miner compute it alone. With it, metrics per harness
-  (admission, `bad_turns`, reward) in the controller's logs.
-- **A refused episode's reasons are not logged by the RL lease checker.** `LeaseEpisodeChecker`
-  logs only the stage (`episode_transcript`), and for variant 0 an admitted lease logs nothing.
-  Log the refusal's detail and the harness on every lease.
+- **Per-harness metrics in the trainer.** The controller logs and counts every lease by harness
+  (section 6c); the trainer's reward and loss are not yet split by harness (the rollouts it is
+  forwarded do not carry it).
+- **Selective forfeits.** A miner cannot choose a lease's harness, but it can give up the
+  leases of one it plays badly (each costs it quota). Watch the forfeit rate per harness: a
+  harness forfeited more is trained on less than its weight.
 - **A machine record that is not JSON stays broken**: `_update` raises before writing. Only a
   store that commits truncated bodies produces one, but a heartbeat could rewrite it from its
   registration.

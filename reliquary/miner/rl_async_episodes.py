@@ -121,11 +121,13 @@ class EpisodeLeaseGenerator:
             raise RuntimeError("this episode engine takes no new weights in place: restart the miner")
         self._load(state, version)
 
-    def _renderer(self, policy, variant: int = 0):
-        key = (policy.environment, int(variant))
+    def _renderer(self, policy, variant: int = 0, spec=None):
+        """The validator's renderer of the lease's surface: ``spec`` is named only for a harness mix."""
+        key = (policy.environment, None if spec is None else spec.key, int(variant))
         if key not in self._renderers:
-            self._renderers[key] = (self._renderer_for(policy) if variant == 0
-                                    else self._renderer_for(policy, variant=variant))
+            kwargs = {"spec": spec} if spec is not None else {}
+            self._renderers[key] = (self._renderer_for(policy, **kwargs) if variant == 0
+                                    else self._renderer_for(policy, variant=variant, **kwargs))
         return self._renderers[key]
 
     async def play_lease(self, lease) -> list[Any]:
@@ -140,18 +142,20 @@ class EpisodeLeaseGenerator:
         policy = self.policies.get(lease.environment)
         if policy is None:
             raise EpisodeLeaseFailed(f"{lease.environment} is not an episode environment of this miner")
-        from reliquary.environment.agentic_swe import harness_of, lease_variant, policy_harness_pin
+        from reliquary.environment.agentic_swe import lease_surface, policy_harness_choices
 
-        variant = lease_variant(harness_of(policy_harness_pin(policy)), lease)
-        renderer = self._renderer(policy, variant)
+        # The lease's harness (drawn from a mix, else the env's one) and its surface variant (0 for a harness
+        # without axes): its 16 episodes all play them.
+        spec, variant = lease_surface(policy, lease)
+        mixed = len(policy_harness_choices(policy)) > 1
+        renderer = self._renderer(policy, variant, spec if mixed else None)
         prompt = self._task_prompt(lease.environment, int(lease.prompt_idx))
         prompt_len = len(renderer.initial_ids(prompt))
-        # The lease's surface variant (0 for a harness without axes): its 16 episodes all play it.
-        runner = self._factory(policy, lease, prompt) if variant == 0 else self._factory(policy, lease, prompt,
-                                                                                         variant=variant)
+        kwargs = {**({"variant": variant} if variant else {}), **({"harness": spec} if mixed else {})}
+        runner = self._factory(policy, lease, prompt, **kwargs)
         label = f"lease {lease.lease_id[:12]}"
-        if variant:
-            logger.info("%s plays surface variant %d of %s", label, variant, lease.environment)
+        if variant or mixed:
+            logger.info("%s plays %s surface variant %d of %s", label, spec.key, variant, lease.environment)
 
         async def one(index: int):
             binding = LeaseDrawBinding(lease.nonce, int(lease.prompt_idx), int(lease.checkpoint), index)
@@ -456,10 +460,12 @@ def build_episode_generator(blocks: Mapping[str, Mapping[str, Any]], *, validato
         except ValueError as exc:
             raise ValueError(f"{name}: {exc}; one miner engine serves only envs with the same caps: mine {name} "
                              f"with a miner process of its own") from exc
-    from reliquary.environment.agentic_swe import harness_of, harness_pin_refusal, policy_harness_pin
+    from reliquary.environment.agentic_swe import (
+        HARNESS, policy_default_harness, policy_harness_refusal,
+    )
 
     for name, policy in policies.items():
-        refusal = deps.package_refusal(policy) or harness_pin_refusal(policy_harness_pin(policy), variants=True)
+        refusal = deps.package_refusal(policy) or policy_harness_refusal(policy)
         if refusal:
             raise ValueError(f"{name}: {refusal}")
     sources = {name: load_environment(name, block).source for name, block in blocks.items()}
@@ -474,13 +480,14 @@ def build_episode_generator(blocks: Mapping[str, Mapping[str, Any]], *, validato
         codec = TokenizerCodec(tokenizer)
     renderers: dict[tuple, Any] = {}
 
-    def renderer_for(policy, variant: int = 0):
-        """The validator's turn renderer of ``policy``'s harness, tools and surface ``variant``."""
-        tools, pin = tuple(policy.tools), policy_harness_pin(policy)
-        key = (tools, None if pin is None else (pin["id"], pin["version"]), int(variant))
+    def renderer_for(policy, variant: int = 0, spec=None):
+        """The validator's turn renderer of ``policy``'s tools in harness ``spec`` (default: its first, the only
+        one without a mix) and surface ``variant``."""
+        tools, spec = tuple(policy.tools), spec or policy_default_harness(policy)
+        key = (tools, spec.key, int(variant))
         if key not in renderers:
-            renderers[key] = (deps.load_renderer(str(base_model_dir), tools=tools) if pin is None and variant == 0
-                              else deps.load_renderer(str(base_model_dir), tools=tools, spec=harness_of(pin),
+            renderers[key] = (deps.load_renderer(str(base_model_dir), tools=tools) if spec is HARNESS and variant == 0
+                              else deps.load_renderer(str(base_model_dir), tools=tools, spec=spec,
                                                       variant=int(variant)))
         return renderers[key]
 
@@ -504,12 +511,12 @@ def build_episode_generator(blocks: Mapping[str, Mapping[str, Any]], *, validato
                                           "gpu_memory_utilization": gpu_memory_utilization})
     sessions = HttpRlEpisodes(deps.sync_http(validator_url), validator_hotkey=validator_hotkey, prefix=RL_PREFIX)
 
-    def runner_factory(policy, lease, prompt, variant: int = 0):
+    def runner_factory(policy, lease, prompt, variant: int = 0, harness=None):
         return LeaseEpisodeRunner(policy=policy, lease=lease, hotkey=hotkey, prompt=prompt,
                                   sign_binding=sign_binding, sessions=sessions, model_name=host.model_name,
                                   renderer_model_dir=str(base_model_dir), generate_url=host.generate_url,
                                   sampling=sampling, harness_env=dict(harness_env or {}) or None,
-                                  harness=harness_of(policy_harness_pin(policy)), variant=variant)
+                                  harness=harness or policy_default_harness(policy), variant=variant)
 
     players = {}
     if suites:
