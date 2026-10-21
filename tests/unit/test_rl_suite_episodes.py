@@ -331,3 +331,41 @@ async def test_mine_async_routes_a_replayed_env_to_the_episode_stack(tmp_path):
     blocks, kw = built["episodes"]
     assert blocks == {} and kw["suites"] == (ENV,)
     assert generator._episode_names() == {ENV}
+
+
+class GatedEngine(ScriptedEngine):
+    """Every first turn waits until all the lease's episodes are in flight: episodes run side by side or not at
+    all."""
+
+    def __init__(self, draws, scripts, *, rollouts, **kw):
+        super().__init__(draws, scripts, **kw)
+        self.rollouts, self.started = rollouts, set()
+        self.all_in = asyncio.Event()
+
+    async def generate(self, session_id, prompt_ids, max_tokens):
+        if session_id not in self.started:
+            self.started.add(session_id)
+            if len(self.started) == self.rollouts:
+                self.all_in.set()
+            await self.all_in.wait()
+        return await super().generate(session_id, prompt_ids, max_tokens)
+
+
+def test_a_lease_plays_its_episodes_side_by_side_past_the_loops_default_threads():
+    # An episode holds a thread for its whole run: on the loop's default executor (a few threads), the episodes
+    # past it waited for the first ones, which waited for them: the lease never finished.
+    import concurrent.futures
+
+    environment = _environment()
+    policy = suite_lease_policy(ENV, profile=V10, environment=environment)
+    draws = ForcedDraws()
+    engine = GatedEngine(draws, _solves, rollouts=16, per_turn=policy.max_tokens_per_turn,
+                         total=policy.max_episode_tokens)
+    player = SuiteLeasePlayer(policy=policy, environment=environment, codec=CODEC, engine=engine, draws=draws)
+
+    async def run():
+        asyncio.get_running_loop().set_default_executor(concurrent.futures.ThreadPoolExecutor(2))
+        return await asyncio.wait_for(player.play(_lease()), timeout=60)
+
+    played = asyncio.run(run())
+    assert len(played) == 16 and len(engine.started) == 16

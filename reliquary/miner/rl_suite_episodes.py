@@ -16,12 +16,16 @@ check the validator runs refuses it) the whole lease fails (``EpisodeLeaseFailed
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
+import os
 import secrets
 from collections.abc import Callable, Sequence
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+EPISODE_THREADS = int(os.environ.get("RELIQUARY_RL_SUITE_EPISODE_THREADS", "512"))
 
 
 class _NoRoom(Exception):
@@ -59,12 +63,18 @@ class SuiteLeasePlayer:
     validator's replay workers code), ``engine`` (the forced generate engine host) and ``draws`` (its
     ``ForcedDraws``)."""
 
-    def __init__(self, *, policy, environment, codec, engine, draws, rollouts: int = 16) -> None:
+    def __init__(self, *, policy, environment, codec, engine, draws, rollouts: int = 16,
+                 threads: int = EPISODE_THREADS) -> None:
         from reliquary.environment.agentic.renderers import renderer_for
 
         self.policy, self.environment, self.codec = policy, environment, codec
         self._engine, self._draws, self.rollouts = engine, draws, int(rollouts)
         self.renderer = renderer_for(policy.renderer_id, codec.encode)
+        # An episode holds a thread from its first turn to its last (the runner waits on each turn): the loop's
+        # default executor (min(32, cpus + 4) threads) would cap the episodes in flight below the engine's
+        # sequences and queue every other to_thread call of the miner behind them.
+        self._threads = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(threads)),
+                                                              thread_name_prefix="rl-suite-episode")
 
     def prompt_ids(self, prompt_idx: int) -> list[int]:
         return [int(t) for t in self.renderer.encode_initial(self.environment.get_task(int(prompt_idx)))]
@@ -93,7 +103,8 @@ class SuiteLeasePlayer:
         try:
             task = self.environment.get_task(int(lease.prompt_idx))
             try:
-                trace = await asyncio.to_thread(self._run, task, lease_episode_seed(lease), policy)
+                trace = await asyncio.get_running_loop().run_in_executor(
+                    self._threads, self._run, task, lease_episode_seed(lease), policy)
             except _NoRoom:
                 trace = None
         finally:
