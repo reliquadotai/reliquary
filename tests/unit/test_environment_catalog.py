@@ -73,7 +73,7 @@ NOT_REPRODUCIBLE = [
     "qwen35-2b-auction-v2",
     "qwen35-4b-auction-v3",
     "qwen3-4b-base-dapo-v4",
-    # Its math envs run at a 64k cap, the catalog's at 32k.
+    # Its math and competitive-code envs run at a 64k cap, the catalog's lower.
     "teutonic-9b-reliquary-suite-v10-gumbel-dev1",
 ]
 

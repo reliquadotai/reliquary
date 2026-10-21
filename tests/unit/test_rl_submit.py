@@ -535,3 +535,25 @@ def test_audit_forward_attempts_are_persisted_across_restarts(book):
     assert restarted.run_audits(forward, 10, max_attempts=2) == 1
     assert restarted.group(poison.lease_id)["audit"] == "inconclusive" and book.banned_until("A") is None
     assert restarted.in_probation("A")                                          # suspect: no pass, re-probation
+
+
+def test_an_answer_is_graded_without_its_terminator(book):
+    """A fence closed on a line of its own stays closed: the terminator is not glued to the graded text."""
+    class SpecialTokenizer(Tokenizer):
+        def decode(self, ids, skip_special_tokens=False):
+            return "".join("<|im_end|>" if i == EOS else chr(i - 10) for i in ids)
+
+    seen = []
+
+    def scorer(environment, problem, texts, materials):
+        seen.extend(texts)
+        return [1.0 if t.endswith("```") else 0.0 for t in texts]
+
+    grader = GroupGrader({ENV: MathEnv()}, SpecialTokenizer(), eos_token_ids=(EOS,), scorer=scorer)
+    subs = RlSubmissions(book, grader, config=SubmitConfig(first_scan_min_tokens=0), clock=lambda: NOW,
+                         rng=random.Random(0))
+    held = lease(book, 3)
+    fenced = Rollout(text("```py\nx\n```") + (EOS,))
+    answer = subs.submit(held.lease_id, "A", [fenced] * 8 + [Rollout(text("```py\nx") + (EOS,))] * 8)
+    assert answer["rewards"] == [1.0] * 8 + [0.0] * 8
+    assert not any("<|im_end|>" in t for t in seen)

@@ -123,6 +123,20 @@ at 64k it is a much cleaner failure. Proposed for the run: math cap 64k, a cut s
 masking), soft overlong zone 0.1 over the last 4,096 tokens, cut share watched and the cap raised again if it stays
 high. To check in the rehearsal: 64k sequences in the FSDP2 trainer.
 
+## Launch caps (2026-10-20)
+
+Single-turn caps on the v10 profile: DAPO-Math, hard math and competitive code 64k, instruction following 8k.
+Competitive code from a 2026-10-20 probe of the SFT model (terminator stripped before grading): at 16k 52 % of
+rollouts were cut, at 64k 16 %; pass 0.39 at 16k, 0.48 at 64k.
+
+SWE and TMax limits live in each env's episode block (the operator's `*-episode.json`, see
+docs/runbooks/rl-bridged-episode-envs.md), not in the profile. For the launch: `max_turns` 48 (32 stopped 45 % of the
+rehearsal's episodes), `max_tokens_per_turn` 8192, `max_episode_tokens` 65536, and budgets that let 48 turns run:
+`max_calls` 192 (at 64 an honest episode closed on the budget after 23 turns), `wall_s` 7200, `cpu_s` 3600 (its
+ceiling). The miner's `--max-model-len` must cover the episode (69632 covers 65536). Both envs keep equal caps, so
+one episode engine serves them. An RL episode block is bounded by `MAX_RL_EPISODE_TOKENS` (65536,
+`protocol/service_contract.py`); an order's episode keeps the corpus trajectory cap (`MAX_EPISODE_TOKENS`, 60000).
+
 ## Rehearsal plan (8 GPUs, 2026-10-21)
 
 Teutonic SFT starting model (teutonic-i-sft-full-v2), trainer FSDP2 on 4 GPUs, validator + audits on 1, two or three

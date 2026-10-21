@@ -106,8 +106,16 @@ def resume_weights(link, *, validator_hotkey: str, work_dir: Path, sync=None, fe
     return state, version, sync.model_dir
 
 
+def disable_cudnn_attention(torch) -> None:
+    """The trainer's sdpa never takes the cuDNN backend: its fused attention graph fails on long sequences
+    (``mha_graph.execute``) and kills the rank. Flash and memory-efficient kernels serve the same calls."""
+    torch.backends.cuda.enable_cudnn_sdp(False)
+
+
 def run_async_train_worker() -> None:
     import torch
+
+    disable_cudnn_attention(torch)              # every rank, before any model is built
 
     from reliquary.constants import ATTN_IMPLEMENTATION, DEFAULT_BASE_MODEL, DEFAULT_BASE_MODEL_REVISION
     from reliquary.infrastructure.storage import public_checkpoint_bucket, public_checkpoint_client

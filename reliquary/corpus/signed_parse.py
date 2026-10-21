@@ -17,6 +17,9 @@ record 0's offered tools. Then:
   cannot skip its last turn's calls and `/finish` a graded episode. The last span's
   records match a non-empty prefix of its sent calls (the closing call returned its
   record with the final; the calls after it were never sent) and no observation follows.
+  A `budget_exhausted` final of reason `max_calls` closes on a call the machine refused
+  to run (the call budget was spent before it): that call has no record, so the prefix
+  may be empty;
   What this parser checks is that no call record is left after that prefix; that the
   final record is the next record in the chain is §5.A's (`verify_transcript`);
 * observations are never decoded or searched for: every other span's segment must be
@@ -177,7 +180,9 @@ def parse_signed_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int]
                     if used == len(records):
                         break                       # the rest were never sent
                     take(k, position, plan)
-                if used == before:
+                refused_call = (final.status == STATUS_BUDGET_EXHAUSTED and final.reason == "max_calls"
+                                and bool(sends))
+                if used == before and not refused_call:
                     raise TrajectoryRefused(REASON_BAD_STOP, {
                         "turn": k, "why": "the episode closed on no recorded call of this turn"})
             actions += [Action(name, arguments, None) for name, arguments in pairs]

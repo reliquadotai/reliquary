@@ -64,6 +64,18 @@ def test_episode_blocks_are_checked_with_the_orders_rules():
         episode_blocks({EPISODE_ENVS_PARAM: {EPISODE: {"episode": episode_block()}}}, envs=(ENV,))
 
 
+def test_an_rl_episode_is_bounded_by_the_rl_cap_not_the_corpus_one():
+    from reliquary.protocol.service_contract import MAX_EPISODE_TOKENS, MAX_RL_EPISODE_TOKENS
+
+    assert MAX_EPISODE_TOKENS == 60000 and MAX_RL_EPISODE_TOKENS == 65536
+    block = validate_episode_block(EPISODE, {"episode": episode_block(max_tokens_per_turn=8192,
+                                                                      max_episode_tokens=65536)})
+    assert async_episode_policy(EPISODE, block).max_episode_tokens == 65536
+    for bad in (episode_block(max_episode_tokens=65537), episode_block(max_tokens_per_turn=65537)):
+        with pytest.raises(ValueError, match="max_"):
+            validate_episode_block(EPISODE, {"episode": bad})
+
+
 def test_the_settings_carry_the_episode_policies_and_a_lease_lifetime_with_sandbox_time():
     params = rl_async_params(planned_tokens_per_period=1e6, lease_tokens_per_s=20.0, lease_margin=2.0,
                              episode_envs={EPISODE: {"episode": episode_block()}})
@@ -404,8 +416,9 @@ class FakeLLM:
             raise RuntimeError("push refused")
         self.pushed.append([Path(p).name for p in args[0]])
 
-    def reset_prefix_cache(self):
+    def reset_prefix_cache(self, reset_running_requests=False):
         self.resets += 1
+        self.reset_running = reset_running_requests
 
 
 class FakeCore:
@@ -478,10 +491,10 @@ async def test_the_episode_generator_pushes_each_checkpoint_into_its_engine(tmp_
     assert made[-1].kwargs["max_total_tokens"] == 4096 and made[-1].kwargs["stop_token_ids"]
     await host.ensure_serving()
     assert served[0][1] == 8013 and host.take_session.__self__ is first          # the app reaches the engine
-    # a new checkpoint between batches: pushed into the same core, a new engine thread on it, no model load
+    # a new checkpoint: pushed into the same core by the same engine, turns in flight resumed, no model load
     await asyncio.to_thread(generator.load_weights, state, 4)
     assert released == [] and len(made) == 1 and host.restarts == 1 and host.core is made[0]
-    assert host.engine is not first and made[0]._llm.pushed and made[0]._llm.resets == 1
+    assert host.engine is first and made[0]._llm.pushed and made[0]._llm.resets == 1 and made[0]._llm.reset_running
     # a push that fails falls back to a restart on an HF directory of the new weights
     made[0]._llm.fail = True
     await asyncio.to_thread(generator.load_weights, state, 5)

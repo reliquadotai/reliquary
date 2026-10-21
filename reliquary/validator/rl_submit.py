@@ -49,7 +49,10 @@ import json
 import logging
 import math
 import multiprocessing
+import multiprocessing.util
+import os
 import random
+import sys
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -243,7 +246,11 @@ class GroupGrader:
             if kind not in ("ok", "truncated"):
                 return Graded(prompt, reject=kind)
             truncated.append(kind == "truncated")
-        texts = [str(self.tokenizer.decode(list(r.tokens), skip_special_tokens=False)) for r in rollouts]
+        # The answer is graded without its terminator: an extractor that closes a fenced block on a line of its
+        # own, or an "ends with" instruction, must not see "<|im_end|>" glued to the last line.
+        eos = {int(t) for t in self._contexts[environment].eos_token_ids}
+        texts = [str(self.tokenizer.decode(list(r.tokens[:-1] if r.tokens and int(r.tokens[-1]) in eos
+                                                else r.tokens), skip_special_tokens=False)) for r in rollouts]
         try:
             rewards = self.scorer(environment, materials.problem, texts, materials.effective_reward_materials)
         except GraderInfrastructureError:
@@ -262,6 +269,55 @@ class GroupGrader:
 def score_group(environment: str, problem: Any, texts: Sequence[str], materials: Any) -> list[float]:
     """One group's rewards by its environment's own scorer (module level: it runs in a pool worker too)."""
     return [float(r) for r in get_environment_spec(environment).score_many(problem, list(texts), materials)]
+
+
+def initialize_grading_worker() -> None:
+    """A grading worker as the window path's admission child: CPU only, below the control plane's priority."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    try:
+        os.nice(5)
+    except OSError:
+        pass
+
+
+def _score_in_worker(function: Callable[..., Any], *args: Any) -> Any:
+    """``function(*args)`` in a grading worker. A grader that imported bittensor started bittensor's logging
+    listener in the worker, blocked on its queue: when the pool retires the worker (``max_tasks``), the queue closes
+    under it and its thread dies on EOFError. Once it exists, the listener is stopped (its sentinel, its thread
+    joined) at the worker's exit, before the queue closes. Importing bittensor up front would put seconds of
+    start-up into a group's wall budget."""
+    try:
+        return function(*args)
+    finally:
+        if "bittensor" in sys.modules:
+            _stop_bittensor_listener_at_exit()
+
+
+def _stop_bittensor_listener_at_exit() -> None:
+    global _LISTENER_FINALIZED
+    if _LISTENER_FINALIZED:
+        return
+    try:
+        listener = getattr(getattr(sys.modules["bittensor"], "logging", None), "_listener", None)
+        if listener is None or getattr(listener, "_thread", None) is None:
+            return
+
+        def drain() -> None:
+            # QueueListener.stop without clearing ``_thread``: bittensor's own atexit stop runs later and joins it
+            # again (a finished thread joins at once; a cleared one raises).
+            thread = listener._thread
+            if thread is not None and thread.is_alive():
+                listener.enqueue_sentinel()
+                thread.join(timeout=5.0)
+
+        # multiprocessing runs its finalizers by priority at a worker's exit, the queue's own (closing) after.
+        multiprocessing.util.Finalize(listener, drain, exitpriority=100)
+        _LISTENER_FINALIZED = True
+    except Exception:                       # logging cleanup never fails a group
+        logger.debug("bittensor's logging listener could not be finalized", exc_info=True)
+
+
+_LISTENER_FINALIZED = False
 
 
 class PooledScorer:
@@ -292,7 +348,8 @@ class PooledScorer:
             pool = self._pools.get(environment)
             if pool is None:
                 pool = self._pools[environment] = ProcessPoolExecutor(
-                    max_workers=self.workers, mp_context=self._context, max_tasks_per_child=self.max_tasks)
+                    max_workers=self.workers, mp_context=self._context, max_tasks_per_child=self.max_tasks,
+                    initializer=initialize_grading_worker)
             return pool
 
     def _replace(self, environment: str, pool: ProcessPoolExecutor) -> None:
@@ -309,7 +366,8 @@ class PooledScorer:
         pool = self._pool(environment)
         wall = float(self.wall_seconds(environment))
         try:
-            return list(pool.submit(self.function, environment, problem, list(texts), materials).result(
+            return list(pool.submit(_score_in_worker, self.function, environment, problem, list(texts),
+                                    materials).result(
                 timeout=max(1.0, wall)))
         except FutureTimeout as exc:
             self.timeouts[environment] = self.timeouts.get(environment, 0) + 1

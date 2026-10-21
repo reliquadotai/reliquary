@@ -55,8 +55,23 @@ class DistContext:
         return self.rank == 0
 
 
+def per_rank_triton_cache() -> str | None:
+    """Under torchrun, give each local rank a Triton cache of its own (``TRITON_CACHE_DIR`` + ``-rank<N>``, the
+    default ``~/.triton/cache`` otherwise): ranks compiling the same kernel into one cache race on its files.
+    Idempotent; call it before the first kernel compiles. Returns the directory set, None outside torchrun."""
+    rank = os.environ.get("LOCAL_RANK")
+    if rank is None or int(os.environ.get("LOCAL_WORLD_SIZE", os.environ.get("WORLD_SIZE", "1"))) <= 1:
+        return None
+    suffix = f"-rank{int(rank)}"
+    base = os.environ.get("TRITON_CACHE_DIR") or os.path.join(os.path.expanduser("~"), ".triton", "cache")
+    if not base.endswith(suffix):
+        os.environ["TRITON_CACHE_DIR"] = base + suffix
+    return os.environ["TRITON_CACHE_DIR"]
+
+
 def init_distributed(*, device_type: str = "cuda") -> DistContext:
     """Join torchrun's process group (or a one-process group without torchrun)."""
+    per_rank_triton_cache()
     # Before the first CUDA allocation. The 9B on 4 x 80 GB sits at 70+ GB per rank; the default allocator
     # thrashes there: 2.5x slower steps than expandable segments (A100, 2026-10-16).
     for key, default in (("MASTER_ADDR", "127.0.0.1"), ("MASTER_PORT", "29511"),

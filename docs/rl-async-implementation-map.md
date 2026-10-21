@@ -828,8 +828,11 @@ One branch carries the whole async RL work on top of current main.
   `RlSubmissions.take_audits(limit)` (stale ones dropped, then `audit_jobs`) behind `POST /rl/trainer/audits`
   (limit 1-32) and `POST /rl/trainer/audit` (an `AuditResult`; 404 once concluded); the validator's audit loop only
   drops stale audits. `trainer/audits.py`: `audit_group(model, group)` = `rl_audit.judge` over diagnostics from
-  the trainer's base model and head (`seed_consistency_diagnostics` on the drawn rows; the FSDP2
-  `FusedLogprobHead(rows, audit=fn)` projects inside one module call, weight gathered once);
+  the trainer's base model and head (`group_diagnostics`: the group's rollouts packed into right-padded
+  micro-batches under the trainer's token budget, one base forward and one head call per micro-batch,
+  `seed_consistency_diagnostics` on each rollout's drawn rows; the FSDP2 `FusedLogprobHead(rows, audit=fn)`
+  projects inside one module call, weight gathered once per micro-batch; `scripts/bench_trainer_audit.py` times it
+  against the rollout-by-rollout reference `rollout_diagnostics`);
   `broadcasting_audit` sends `AUDIT` so every rank runs the same forward. `AsyncTrainer` runs one round
   (`audits_per_step`, 8; `audit_budget_s`, 120 s) before each step and more while a batch fills; metrics
   `async/audits`, `async/audit_s`. Env: `RELIQUARY_RL_TRAINER_AUDITS` (0 off), `_AUDITS_PER_STEP`,

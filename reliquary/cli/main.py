@@ -5014,6 +5014,9 @@ def train_async() -> None:
         level=logging.INFO,
         format="%(asctime)s | %(threadName)s | %(name)s | %(levelname)s | %(message)s",
     )
+    from reliquary.trainer.distributed import per_rank_triton_cache
+
+    per_rank_triton_cache()                 # before any kernel compiles
     from reliquary.trainer.async_cli import run_async_train_worker
 
     try:
