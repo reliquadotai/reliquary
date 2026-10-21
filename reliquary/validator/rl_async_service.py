@@ -207,6 +207,7 @@ class RlAsync:
     board: Any = None
     observations: Any = None                    # rl_observations.ObservationBoard (None: /rl/observations 503s)
     sandbox: Any = None                         # rl_async_episodes.RlLeaseSandbox (episode envs only)
+    benchmarks: Any = None                      # run_id -> the run's benchmark feed bytes or None (/rl/benchmarks)
 
     def close(self) -> None:
         self.book.close()
@@ -394,6 +395,20 @@ def mount_rl_async(server, rl: RlAsync, *, validator_hotkey: str, registration=N
     @router.get("/rl/observations")
     async def rl_observations(after: str = "0"):
         return await rl_observations_response(rl.observations, after)
+
+    @router.get("/rl/benchmarks")
+    async def rl_benchmarks(run_id: str = ""):
+        """The run monitor's held-out feed (``eval feed --publish``): the bucket is private, this is its URL."""
+        from fastapi.responses import JSONResponse, Response
+
+        from reliquary.eval.run_feed import RUN_ID
+
+        if not RUN_ID.fullmatch(run_id):
+            return JSONResponse(status_code=422, content={"reason": "malformed_request"})
+        body = None if rl.benchmarks is None else await asyncio.to_thread(rl.benchmarks, run_id)
+        if body is None:
+            return JSONResponse(status_code=404, content={"reason": "no_feed"})
+        return Response(content=body, media_type="application/json", headers={"Cache-Control": "max-age=60"})
 
     if rl.settings.episodes:
         from fastapi.responses import JSONResponse as _Json
@@ -647,6 +662,7 @@ def _public_boards(rl: RlAsync, wallet, validator_hotkey: str, signer_client=Non
     from reliquary.shared.ckpt_index import index_key
     from reliquary.trainer.ckpt_publisher import R2ObjectStore
     from reliquary.validator.rl_checkpoint import RlCheckpointBoard, presigner
+    from reliquary.eval.run_feed import feed_key
     from reliquary.validator.rl_observations import ObservationBoard, bucket_io, scan_publisher
 
     run = rl.settings.run
@@ -659,6 +675,7 @@ def _public_boards(rl: RlAsync, wallet, validator_hotkey: str, signer_client=Non
     publisher = scan_publisher(rl.book, run=run, task_id=rl.settings.task_id, wallet=wallet, put=put, get=get,
                                signer_client=signer_client)
     rl.observations = ObservationBoard(publisher, presign=presign)
+    rl.benchmarks = lambda run_id: store.get_bytes(feed_key(run_id))
     return publisher
 
 

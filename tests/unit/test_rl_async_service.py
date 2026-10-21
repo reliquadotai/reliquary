@@ -82,6 +82,24 @@ def components(tmp_path, board=None):
                           prompt_range={ENV: (0, 50)}, collector_interval_s=0.0)
 
 
+def test_the_run_benchmark_feed_is_served_from_the_private_bucket(tmp_path):
+    from reliquary.validator.server import ValidatorServer
+
+    rl = components(tmp_path)
+    server = ValidatorServer()
+    mount_rl_async(server, rl, validator_hotkey=VALIDATOR.ss58_address)
+    public = TestClient(server.app)
+    assert public.get("/rl/benchmarks", params={"run_id": "abc-r1-trainer"}).status_code == 404   # none yet
+    feeds = {"abc-r1-trainer": b'{"schema":"reliquary.run-benchmarks.v1"}'}
+    rl.benchmarks = feeds.get
+    served = public.get("/rl/benchmarks", params={"run_id": "abc-r1-trainer"})
+    assert served.status_code == 200 and served.content == feeds["abc-r1-trainer"]
+    assert served.headers["content-type"] == "application/json"
+    assert public.get("/rl/benchmarks", params={"run_id": "other"}).status_code == 404
+    for bad in ("", "../x", "a/b", "a" * 129):
+        assert public.get("/rl/benchmarks", params={"run_id": bad}).status_code == 422
+
+
 def test_the_trainer_link_needs_its_token_and_round_trips(tmp_path):
     from reliquary.trainer.rl_link import TrainerLink, TrainerLinkError
     from reliquary.validator.rl_leases import LeaseRequest

@@ -182,4 +182,24 @@ async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bo
     return manifest
 
 
-__all__ = ["JobNotGradable", "grade_served_job", "rl_provenance"]
+GRADING_FILES = ("report.json", "manifest.json", "graded.parquet")
+
+
+async def upload_grading(job_id: str, directory: str | Path, *, subnet: Any = None) -> list[str]:
+    """Put a served job's grading files under ``evaluations/<job>/`` in the subnet bucket, create-only (the same
+    bytes again are a no-op, other bytes are refused: a grading is not rewritten in place)."""
+    from reliquary.eval.grading import evaluation_prefix
+
+    if subnet is None:
+        from reliquary.eval.storage import SubnetEvalStore
+
+        subnet = SubnetEvalStore()
+    keys = []
+    for name in GRADING_FILES:
+        key = f"{evaluation_prefix(job_id)}/{name}"
+        await subnet.put_bytes(key, (Path(directory) / name).read_bytes())
+        keys.append(key)
+    return keys
+
+
+__all__ = ["GRADING_FILES", "JobNotGradable", "grade_served_job", "rl_provenance", "upload_grading"]

@@ -2389,6 +2389,8 @@ def eval_grade(
                                        help="Its trainer step (default: from a '-step-<n>' backup repo)"),
     rl_checkpoint_version: int | None = typer.Option(None, "--rl-checkpoint-version", min=0,
                                                      help="Its published checkpoint (default: the step)"),
+    upload: bool = typer.Option(False, "--upload", help="Also put the files under evaluations/<job>/ in the "
+                                                        "subnet bucket (create-only), where eval feed reads them"),
     admin_url: str = _ADMIN_URL,
 ) -> None:
     """Grade a drained eval job and write its report, manifest and graded rows.
@@ -2410,7 +2412,14 @@ def eval_grade(
                                     ("checkpoint_version", rl_checkpoint_version)) if v is not None}
             answer = asyncio.run(grade_served_job(job_id, out=out, allow_incomplete=allow_incomplete,
                                                   **({"rl": rl} if rl else {})))
+            if upload:
+                from reliquary.eval.job_grading import upload_grading
+
+                answer = {**answer, "uploaded": asyncio.run(upload_grading(job_id, out))}
         else:
+            if upload:
+                raise ValueError("--upload applies to a job our validator served: the admin service "
+                                 "stores an order's grading")
             if rl_run_id is not None or rl_step is not None or rl_checkpoint_version is not None:
                 raise ValueError("--rl-* options apply to a job our validator served, not an order job")
             answer = operator.grade_job(_admin_client(admin_url), job_id, out=out,
@@ -2420,6 +2429,64 @@ def eval_grade(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(json.dumps(answer, indent=1))
+
+
+@eval_app.command("feed")
+def eval_feed(
+    run_id: str = typer.Option(..., "--run-id", help="The trainer's wandb run id, as the platform's catalog has it"),
+    jobs: str = typer.Option("", "--jobs", help="Comma-separated checkpoint eval jobs"),
+    job_prefix: str = typer.Option("", "--job-prefix", help="And every graded job under this prefix"),
+    baseline_jobs: str = typer.Option("", "--baseline-job",
+                                      help="Comma-separated eval jobs of the start checkpoint (one per set)"),
+    reports_dir: str | None = typer.Option(None, "--reports-dir",
+                                           help="Read <dir>/<job>/report.json (default: the subnet bucket's "
+                                                "evaluations/<job>/report.json)"),
+    label: list[str] = typer.Option([], "--label", help="<set-id>=<label>, repeatable"),
+    max_checkpoints: int = typer.Option(120, "--max-checkpoints", min=1, max=120,
+                                        help="Newest points kept per set"),
+    out: str | None = typer.Option(None, "--out", help="Write the feed here"),
+    publish: bool = typer.Option(False, "--publish", help="Upload it to the public bucket (R2_PUBLIC_*) at "
+                                                          "rl-runs/<run-id>/benchmarks.json"),
+) -> None:
+    """Build the run monitor's held-out benchmark feed (reliquary.run-benchmarks.v1) from graded reports."""
+    import json
+    import os
+    import time
+
+    from reliquary.eval import run_feed
+
+    def names(text):
+        return [n.strip() for n in text.split(",") if n.strip()]
+
+    try:
+        labels = {}
+        for item in label:
+            set_id, sep, text = item.partition("=")
+            if not sep or not set_id or not text:
+                raise ValueError(f"--label {item!r}: <set-id>=<label>")
+            labels[set_id] = text
+        if not (names(jobs) or job_prefix):
+            raise ValueError("name the checkpoint jobs: --jobs and/or --job-prefix")
+        reports = (run_feed.LocalReports(reports_dir) if reports_dir is not None
+                   else run_feed.BucketReports())
+        checkpoints, baselines, missing = asyncio.run(run_feed.collect(
+            reports, jobs=names(jobs), prefix=job_prefix or None, baseline_jobs=names(baseline_jobs)))
+        feed = run_feed.build_feed(run_id, checkpoints, baselines, observed_at_ms=int(time.time() * 1000),
+                                   labels=labels, max_checkpoints=max_checkpoints)
+        body = run_feed.encode_feed(feed)
+        if out is not None:
+            Path(out).write_bytes(body)
+        summary = {"run_id": run_id, "benchmarks": len(feed["benchmarks"]),
+                   "points": sum(len(b["checkpoints"]) for b in feed["benchmarks"]),
+                   "baselines": sum(b["baseline"] is not None for b in feed["benchmarks"]),
+                   "not_graded": missing, "bytes": len(body)}
+        if publish:
+            summary["published"] = run_feed.publish_feed(
+                feed, base_url=os.environ.get("RELIQUARY_RUN_BENCHMARKS_BASE_URL", "").strip() or None)
+    except (ValueError, OSError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(summary, indent=1))
 
 
 @eval_app.command("compare")

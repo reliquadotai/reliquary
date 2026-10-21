@@ -276,6 +276,15 @@ def test_a_served_eval_job_is_graded_on_cpu_from_its_audited_records(
         k: v for k, v in report.items() if k != "provenance"}
     with pytest.raises(JobNotGradable, match="rl run id"):
         grade(out="bad", rl={"run_id": "no spaces"})
+    # The two gradings make a run monitor feed: the untagged one as the baseline.
+    from reliquary.eval.run_feed import build_feed
+
+    feed = build_feed("5F3sa2TJ-r7-trainer", [("rl", tagged)], [("base", report)], observed_at_ms=10_000)
+    (series,) = feed["benchmarks"]
+    assert series["id"] == "verifiers-fake-r0-n5" and series["protocol"]["attempts"] == 4
+    assert series["checkpoints"][0]["step"] == 40 and series["checkpoints"][0]["samples"] == 3
+    assert series["checkpoints"][0]["score"] == pytest.approx(env["pass@1"]["value"])
+    assert series["baseline"]["step"] == 0 and series["checkpoints"][0]["at"] == 1000
 
 
 def test_the_rl_identity_is_read_from_a_backup_name_or_given():
