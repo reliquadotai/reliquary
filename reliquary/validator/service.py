@@ -9942,8 +9942,14 @@ class ValidationService:
             else self._window_n
         )
         self._set_window_preparation_stage("drand_boundary")
-        from reliquary.infrastructure.drand import get_current_chain
-        ci = await asyncio.to_thread(get_current_chain)
+
+        # Importing the module also refreshes network metadata.
+        def fetch_chain():
+            from reliquary.infrastructure.drand import get_current_chain
+
+            return get_current_chain()
+
+        ci = await asyncio.to_thread(fetch_chain)
         delay = chain.seconds_until_next_drand_boundary(
             time.time(), ci["genesis_time"], ci["period"],
         )
