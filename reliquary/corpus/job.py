@@ -106,8 +106,7 @@ _RENDERER_RE = re.compile(r"\Arenderers:[a-z0-9.]+@\d+\.\d+\.\d+\Z")
 # How an episode's environment steps are trusted. "replay" (the default, never
 # written, so every manifest that predates it hashes byte-identically): the miner
 # runs the box and grade executors replay it. "signed_sandbox": every step runs on
-# our reliquary-sandbox machines and the validator verifies the signed transcript
-# (docs/superpowers/plans/2026-10-06-catalyst-signed-episodes.md).
+# our reliquary-sandbox machines and the validator verifies the signed transcript.
 EXECUTION_REPLAY = "replay"
 EXECUTION_SIGNED_SANDBOX = "signed_sandbox"
 EXECUTIONS = frozenset({EXECUTION_REPLAY, EXECUTION_SIGNED_SANDBOX})

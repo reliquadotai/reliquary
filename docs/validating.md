@@ -11,8 +11,9 @@ Operational guide for running a validator on subnet 81. Both modes deploy via Do
 
 While the network is bootstrapping there is exactly **one** trainer and the
 core team runs it. Every other operator runs the weight-only mode, which
-mirrors the on-chain weight signal from the trainer and earns validator
-emission without any of the GPU cost or coordination overhead.
+independently computes its weight vector from the shared task registry and
+window and period archives in R2. Compatible releases reading the same inputs
+apply the same replay rules, including each task's payment cap, without a GPU.
 
 ---
 
@@ -22,7 +23,15 @@ You need:
 
 - A Linux host with Docker 24+ and the Compose plugin.
 - A Bittensor wallet registered on netuid 81 (only the hotkey reaches this box — coldkey stays offline).
-- R2 read credentials (the trainer publishes window archives to R2; you read them).
+- R2 read credentials for the shared registry and all tasks' payment archives.
+
+The credentials must support object reads of `reliquary/tasks/registry.json`
+and `reliquary/tasks/admission.json` (the corpus admission overlay), listing
+`reliquary/tasks/` to discover task namespaces, and listing and reading archives
+under `reliquary/dataset/window-`,
+`reliquary/tasks/<task_id>/dataset/window-`, and
+`reliquary/corpus-periods/<task_id>/`. Access to only the legacy window prefix
+cannot replay the complete shared task set. No R2 write access is required.
 
 ```bash
 git clone https://github.com/reliquadotai/reliquary.git
@@ -70,6 +79,10 @@ kubectl -n <namespace> logs deployment/<deployment> -c <validator-container> --s
 A successful submission logs both `set_weights OK` and `Submitted weights:`.
 After startup, submission waits only for chain eligibility before joining the
 normal epoch cadence. A startup message alone does not prove weights were sent.
+Submission success does not establish the consensus weight or miner emission:
+archive entry, the next eligible submission, commit-reveal where enabled, and
+native subnet epoch settlement are separate stages. Verify finalized chain
+state after those stages; restarting does not advance their timing.
 If restarts continue, inspect the container's previous termination reason and
 logs; a restart alone does not establish an out-of-memory failure.
 
@@ -105,6 +118,14 @@ is still the host-side credential source. `BT_WALLET_PATH` is optional and
 only changes the in-container mount target for custom deployments.
 
 ### Verify it's running
+
+1. Check the running image's build revision with the command above against the
+   intended release; a downloaded image does not establish the running revision.
+2. Confirm R2 listing and object reads cover every prefix above, then inspect
+   replay logs for unreadable registry or archive errors before expecting a
+   complete weight vector.
+3. Check successful submission separately from finalized revealed weights and
+   actual miner emission after the normal chain settlement stages.
 
 ```bash
 # Validator container is up and submitting weights

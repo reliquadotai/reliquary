@@ -520,6 +520,7 @@ class CorpusEngagements:
                                job_id=job.job_id, prompt_index=index,
                                env_options_sha256=getattr(task, "env_options_sha256", None),
                                env_lock_sha256=getattr(task, "env_lock_sha256", None),
+                               prepare_timeout_s=getattr(task, "prepare_timeout_s", None),
                                slots_remaining=int(remaining), refresh_slots=refresh_slots)
 
 

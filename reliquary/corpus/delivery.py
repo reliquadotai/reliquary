@@ -300,7 +300,7 @@ async def delivery_rows(*, job, records, counts: dict, grade=None,
                         seen: set[bytes] | None = None,
                         concurrency: int = READ_CONCURRENCY,
                         window: int = READ_WINDOW) -> AsyncIterator[dict]:
-    """One row per finished completion of every passing submission, in
+    """One row per finished completion of every passing, not voided submission, in
     verdict-id order.
 
     No hotkey: the delivery is the work, not who did it. An unfinished
@@ -313,12 +313,15 @@ async def delivery_rows(*, job, records, counts: dict, grade=None,
     the rows go.
     """
     from reliquary.corpus.export import (
-        is_duplicate, new_unfinished_counts, thinking_render, unfinished_reason,
+        is_duplicate, new_unfinished_counts, submission_voided, thinking_render,
+        unfinished_reason, voided_submission_ids,
     )
 
     thinking = thinking_render(job)
     ids = list(await records.list_verdict_ids(job.job_id))
-    counts.update(verdicts=len(ids), passing_submissions=0, missing_records=0, completions=0,
+    voided = await voided_submission_ids(records, job.job_id)
+    counts.update(verdicts=len(ids), passing_submissions=0, voided=0,
+                  missing_records=0, completions=0,
                   unfinished=new_unfinished_counts(),
                   duplicate_completion=0 if seen is not None else None, rows=0,
                   rows_accepted=0 if grade is not None else None)
@@ -327,9 +330,16 @@ async def delivery_rows(*, job, records, counts: dict, grade=None,
         chunk = ids[start:start + window]
         verdicts = await _bounded((records.read_verdict(job.job_id, s) for s in chunk), gate)
         passing = [sid for sid, v in zip(chunk, verdicts) if v and v.get("passed")]
-        found = await _bounded((records.read_submission(job.job_id, s) for s in passing), gate)
+        kept = [sid for sid in passing if sid not in voided]
+        counts["voided"] += len(passing) - len(kept)
+        found = await _bounded((records.read_submission(job.job_id, s) for s in kept), gate)
+        invalidated = await _bounded((submission_voided(records, job.job_id, s, voided)
+                                      for s in kept), gate)
         rows = []
-        for sid, record in zip(passing, found):
+        for sid, record, is_voided in zip(kept, found, invalidated):
+            if is_voided:
+                counts["voided"] += 1
+                continue
             if record is None:
                 # A verdict can be visible before its record (R2 is not transactional).
                 logger.warning("corpus delivery: submission %s passed but has no record", sid[:12])

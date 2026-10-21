@@ -1,0 +1,140 @@
+name: Vision runtime contracts
+
+on:
+  pull_request:
+    paths:
+      - "reliquary/vision/**"
+      - "scripts/vision-training-runtime.py"
+      - "docker/Dockerfile.vision-training"
+      - "tests/vision/**"
+      - "tests/unit/test_vision*"
+      - "pyproject.toml"
+      - ".github/workflows/vision-runtime.yml"
+  push:
+    branches: [main]
+    paths:
+      - "reliquary/vision/**"
+      - "scripts/vision-training-runtime.py"
+      - "docker/Dockerfile.vision-training"
+      - "tests/vision/**"
+      - "tests/unit/test_vision*"
+      - "pyproject.toml"
+      - ".github/workflows/vision-runtime.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install pytest pytest-asyncio Pillow==12.3.0 transformers==5.10.4 peft==0.21.2 accelerate==1.15.0 num2words==0.5.14
+      # This worker does not import validator/server dependencies or fixtures.
+      - run: python -m pytest --noconftest tests/unit/test_vision* -q
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+
+  container-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download the immutable public test model
+        run: |
+          pip install huggingface-hub==1.30.0
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+          from pathlib import Path
+          import shutil
+          snapshot = snapshot_download(
+              "HuggingFaceTB/SmolVLM2-256M-Video-Instruct",
+              revision="067788b187b95ebe7b2e040b3e4299e342e5b8fd",
+              allow_patterns=["*.json", "*.txt", "*.jinja", "*.model", "*.safetensors"],
+          )
+          shutil.copytree(snapshot, "/tmp/vision-model", symlinks=False)
+          Path("/tmp/vision-smoke-output").mkdir(mode=0o777)
+          Path("/tmp/vision-smoke-output").chmod(0o777)
+          PY
+      - name: Build the CPU test image
+        run: |
+          docker build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu \
+            -f docker/Dockerfile.vision-training -t vision-runtime:test .
+      - name: Test offline training and continuation in the unprivileged image
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 512 --memory 8g --cpus 2 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+            -v /tmp/vision-model:/test-model:ro \
+            -v /tmp/vision-smoke-output:/test-output:rw \
+            -v "$PWD/tests/vision:/tests:ro" \
+            -e VISION_TEST_MODEL_DIR=/test-model -e VISION_TEST_OUTPUT_DIR=/test-output \
+            --entrypoint python vision-runtime:test /tests/pretrained_smoke.py
+
+  publish-candidate:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [contracts, container-smoke]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+    env:
+      IMAGE: ghcr.io/reliquadotai/vision-training
+    steps:
+      - name: Free disk space for CUDA dependencies
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+      - uses: actions/checkout@v4
+      - name: Build the CUDA candidate on a CPU runner
+        run: |
+          docker build -f docker/Dockerfile.vision-training \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            -t "$IMAGE:sha-$GITHUB_SHA" .
+      - name: Check CUDA wheels offline without a GPU
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 512 --memory 4g --cpus 2 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+            --entrypoint python "$IMAGE:sha-$GITHUB_SHA" -c \
+            'import torch, torchvision, transformers, peft; from reliquary.vision import runner, runtime; assert torch.version.cuda == "12.8"; assert not torch.cuda.is_available(); print("CUDA-wheel imports passed; GPU execution remains unqualified.")'
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the tested candidate and record its digest
+        id: publish
+        run: |
+          docker push "$IMAGE:sha-$GITHUB_SHA"
+          reference="$(docker image inspect "$IMAGE:sha-$GITHUB_SHA" --format '{{index .RepoDigests 0}}')"
+          test "${reference%@*}" = "$IMAGE"
+          digest="${reference#*@}"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          {
+            printf 'Candidate: `%s`\n\n' "$reference"
+            printf 'Source revision: `%s`\n\n' "$GITHUB_SHA"
+            printf 'CPU contracts, CPU training and offline CUDA-wheel imports passed. '
+            printf 'This candidate still requires exact GPU/profile qualification before activation.\n'
+          } >> "$GITHUB_STEP_SUMMARY"

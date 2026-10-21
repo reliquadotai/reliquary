@@ -174,7 +174,7 @@ ENVIRONMENT_CATALOG: Mapping[str, EnvironmentProfile] = MappingProxyType({
         prompt_template=_EXTERNAL_PROMPT,
         environment_contract_id="reliquary/boxed-answer/v1",
         environment_manifest_sha256=(
-            "317ca1d13802c653a7e57fb7214bb5e7e780a97396b3f0e9d094e7ba3f42b478"
+            "cda025161a6c551abed72a96b7cbbefdac5cf5eab217df37831d947b2e55a6df"
         ),
         prompt_cooldown_windows=2904,
     ),

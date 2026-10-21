@@ -5003,7 +5003,7 @@ def train_worker(
 ) -> None:
     """Detached trainer: consume R2 training payloads, publish checkpoints.
 
-    See docs/superpowers/specs/2026-08-21-detached-trainer-r2-design.md.
+    See docs/detached-trainer.md.
     """
     logging.basicConfig(
         level=logging.INFO,

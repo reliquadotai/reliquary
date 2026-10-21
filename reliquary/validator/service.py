@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextvars
 import functools
 import gzip
 import hashlib
@@ -642,9 +643,7 @@ def open_grpo_window(
     picked B_BATCH chunk every time that environment takes a pick, from
     whichever thread called ``pick_training_batch`` (see
     ``GrpoWindowBatcher.pick_training_batch``). ``None`` here -- no
-    caller wires a detached-trainer writer into it yet; see
-    ``docs/superpowers/plans/2026-08-28-fill-closed-window-v6.md``,
-    Component 4.
+    caller wires a detached-trainer writer into it yet.
     """
     def _completion_text(rollout: RolloutSubmission) -> str:
         prompt_len = rollout.commit.get("rollout", {}).get("prompt_length", 0)
@@ -928,6 +927,26 @@ def _require_service_checkpoint_lineage(runtime, *, checkpoint_n, repo, revision
     )
 
 
+async def _complete_archive_commit(operation, *, completed=None):
+    """Finish durable work before cancellation can hand its state to recovery."""
+    context = contextvars.copy_context()
+    future = asyncio.get_running_loop().run_in_executor(None, context.run, operation)
+    cancellation = None
+    while True:
+        try:
+            result = await asyncio.shield(future)
+            break
+        except asyncio.CancelledError as exc:
+            if future.cancelled():
+                raise
+            cancellation = exc
+    if completed is not None:
+        completed(result)
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 class ValidationService:
     @_closing_service_runtime_on_failure
     def __init__(
@@ -1072,7 +1091,7 @@ class ValidationService:
             },
         )
         import copy
-        # Two-model architecture (see docs/superpowers/plans/2026-05-13-...).
+        # Two-model architecture.
         # train_model: trainable, mutated by train_step every window.
         # verify_model: frozen snapshot of the last published checkpoint. It
         # verifies commitment proofs and can independently supply PPO's old
@@ -6481,6 +6500,15 @@ class ValidationService:
             batcher.commit_seal_side_effects()
         return paid
 
+    def _commit_fill_closed_seal(self, window_status):
+        self._arm_fill_closed_rotation_gate(reserve_full_range=True)
+        self._close_and_commit_fill_closed_paid_side_effects(
+            self._active_batchers,
+            self._fill_closed_assembler,
+            train_partial_remainder=(window_status != WINDOW_STATUS_TIMED_OUT),
+        )
+        self._arm_fill_closed_rotation_gate()
+
     async def _archive_window(
         self, batchers, sealed, late_drops=None, server_reject_counts=None,
         window_status: str = WINDOW_STATUS_COMPLETED,
@@ -6802,15 +6830,12 @@ class ValidationService:
             # remainder=False`` only matters the first time close() runs
             # -- a timed-out window must not force its last partial cycle
             # through as a trained batch; it is still paid.
-            fill_closed_batches = (
-                self._close_and_commit_fill_closed_paid_side_effects(
-                    batcher_dict,
-                    fill_closed_assembler,
-                    train_partial_remainder=(
-                        window_status != WINDOW_STATUS_TIMED_OUT
-                    ),
-                )
-            )
+            fill_closed_batches = await _complete_archive_commit(functools.partial(
+                self._close_and_commit_fill_closed_paid_side_effects,
+                batcher_dict,
+                fill_closed_assembler,
+                train_partial_remainder=(window_status != WINDOW_STATUS_TIMED_OUT),
+            ))
 
         # Build the combined batch entries and runners_up from all envs.
         batch_entries = []
@@ -6865,7 +6890,7 @@ class ValidationService:
                             "ground_truth": s.archive_ground_truth or "",
                         }
                     else:
-                        problem = env_obj.get_problem(s.prompt_idx)
+                        problem = await asyncio.to_thread(env_obj.get_problem, s.prompt_idx)
                 except Exception:
                     # A lazy-dataset fetch failure must not abort the whole
                     # window's archive — keep the entry (prompt_idx/rewards are
@@ -7228,13 +7253,12 @@ class ValidationService:
             # the COLLECTING window's drops and must not be wiped.
             self._late_drops.clear()
         self._feed_rl_pay(archive)
-        # Non-blocking archive: enqueue to disk and return immediately.
+        # Commit the local archive off the serving loop before returning.
         # The background ``ArchiveQueue`` worker (started in run()) picks
         # this up and uploads via the same sync-boto3 path used in
         # storage.upload_window_dataset, with persistent retry-on-failure.
         # Main-loop window iteration is unblocked even if R2 is down for
         # hours, and queued payloads survive process restarts.
-        from reliquary.infrastructure.archive_queue import get_archive_queue
         archived_window = int(first_batcher.window_start)
         recovery = getattr(self, "_fill_closed_recovery_store", None)
         runtime = getattr(self, "_service_runtime", None)
@@ -7247,17 +7271,7 @@ class ValidationService:
             if FILL_CLOSED_ENABLED and recovery is not None:
                 await asyncio.to_thread(recovery.mark_sealed, archived_window)
             archive = await self._settle_service_archive(runtime, archive)
-        if FILL_CLOSED_ENABLED and recovery is not None:
-            recovery.finish(archived_window, archive, get_archive_queue())
-        else:
-            get_archive_queue().enqueue(archived_window, archive)
-        self._archive_enqueued_windows.add(archived_window)
-        if runtime is not None:
-            self._service_sealed_windows.discard(archived_window)
-        if FILL_CLOSED_ENABLED and fill_closed_assembler is not None:
-            self._fill_closed_assemblers.pop(archived_window, None)
-            if getattr(self, "_fill_closed_assembler", None) is fill_closed_assembler:
-                self._fill_closed_assembler = None
+        await self._enqueue_window_archive(archived_window, archive, fill_closed_assembler)
         if FILL_CLOSED_ENABLED and fill_closed_assembler is not None:
             for env_name, batcher in batcher_dict.items():
                 await self._record_auction_final_verdicts(
@@ -7276,6 +7290,27 @@ class ValidationService:
             archived_window,
         )
         await asyncio.to_thread(self._cache_archived_hashes, archive)
+
+    async def _enqueue_window_archive(self, window, archive, assembler):
+        from reliquary.infrastructure.archive_queue import get_archive_queue
+
+        queue = get_archive_queue()
+        recovery = getattr(self, "_fill_closed_recovery_store", None)
+        if FILL_CLOSED_ENABLED and recovery is not None:
+            operation = functools.partial(recovery.finish, window, archive, queue)
+        else:
+            operation = functools.partial(queue.enqueue, window, archive)
+
+        def committed(_result):
+            self._archive_enqueued_windows.add(window)
+            if getattr(self, "_service_runtime", None) is not None:
+                self._service_sealed_windows.discard(window)
+            if FILL_CLOSED_ENABLED and assembler is not None:
+                self._fill_closed_assemblers.pop(window, None)
+                if getattr(self, "_fill_closed_assembler", None) is assembler:
+                    self._fill_closed_assembler = None
+
+        await _complete_archive_commit(operation, completed=committed)
 
     def _write_training_payload(
         self,
@@ -8371,17 +8406,9 @@ class ValidationService:
                         # the final real-payload count.  This also makes the
                         # remainder/padding visible to the trainer before any
                         # next-window decision.
-                        self._arm_fill_closed_rotation_gate(
-                            reserve_full_range=True
-                        )
-                        self._close_and_commit_fill_closed_paid_side_effects(
-                            self._active_batchers,
-                            self._fill_closed_assembler,
-                            train_partial_remainder=(
-                                window_status != WINDOW_STATUS_TIMED_OUT
-                            ),
-                        )
-                        self._arm_fill_closed_rotation_gate()
+                        await _complete_archive_commit(functools.partial(
+                            self._commit_fill_closed_seal, window_status,
+                        ))
 
                     from reliquary.constants import PIPELINED_WINDOWS
 
@@ -9859,8 +9886,14 @@ class ValidationService:
             else self._window_n
         )
         self._set_window_preparation_stage("drand_boundary")
-        from reliquary.infrastructure.drand import get_current_chain
-        ci = get_current_chain()
+
+        # Importing the module also refreshes network metadata.
+        def fetch_chain():
+            from reliquary.infrastructure.drand import get_current_chain
+
+            return get_current_chain()
+
+        ci = await asyncio.to_thread(fetch_chain)
         delay = chain.seconds_until_next_drand_boundary(
             time.time(), ci["genesis_time"], ci["period"],
         )
