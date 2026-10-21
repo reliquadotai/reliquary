@@ -151,6 +151,13 @@ class GenerateEngine:
         while item is not None:
             if item[0] == "abort":
                 self._abort(item[1])
+            elif item[0] == "call":
+                _, fn, box, done = item
+                try:
+                    box.append((True, fn()))
+                except BaseException as exc:          # handed to the caller, never kills the engine thread
+                    box.append((False, exc))
+                done.set()
             else:
                 _, request_id, prompt_ids, max_tokens, *forced = item
                 with self._lock:
@@ -167,6 +174,21 @@ class GenerateEngine:
                 item = self._inbox.get_nowait()
             except queue.Empty:
                 return
+
+    def between_steps(self, fn, *, timeout: float = 600.0):
+        """``fn()`` run by the engine thread between two engine steps (the core is never stepped meanwhile), its
+        result returned, its exception raised. Blocking: call it from a worker thread, never the event loop."""
+        if self._thread is None or not self._thread.is_alive():
+            raise RuntimeError("the generate engine is not running")
+        box: list = []
+        done = threading.Event()
+        self._inbox.put(("call", fn, box, done))
+        if not done.wait(timeout):
+            raise TimeoutError("the generate engine did not run the call")
+        ok, value = box[0]
+        if not ok:
+            raise value
+        return value
 
     def _resolve(self, done: Finished) -> None:
         with self._lock:
@@ -302,6 +324,28 @@ class GenerateEngine:
             self._inbox.put(("abort", request_id))
 
 
+def cap_running_to_kv_cache(llm: Any, max_num_seqs: int, max_total_tokens: int) -> int:
+    """Lower the engine's running-request cap to what its KV cache holds at full length (every running turn may
+    reach ``max_total_tokens``), so vLLM never has to preempt one: a preempted turn is recomputed, which the span
+    proof path refuses and which costs the recompute. Returns the cap in force; best effort on vLLM internals."""
+    try:
+        cache = llm.llm_engine.vllm_config.cache_config
+        capacity = int(cache.num_gpu_blocks) * int(cache.block_size)
+        scheduler = llm.llm_engine.engine_core.engine_core.scheduler
+    except Exception:
+        logger.warning("the KV cache size is not readable: running requests stay capped at %d", max_num_seqs)
+        return int(max_num_seqs)
+    safe = max(1, capacity // max(1, int(max_total_tokens)))
+    if safe < int(max_num_seqs):
+        scheduler.max_num_running_reqs = safe
+        logger.warning("KV cache holds %d tokens: %d running requests of up to %d tokens, not %d (no preemption)",
+                       capacity, safe, max_total_tokens, max_num_seqs)
+        return safe
+    logger.info("KV cache holds %d tokens: up to %d running requests of %d tokens", capacity, max_num_seqs,
+                max_total_tokens)
+    return int(max_num_seqs)
+
+
 def _logprob(entry: Any, token: int) -> float:
     value = getattr((entry or {}).get(token), "logprob", None)
     if value is None or not math.isfinite(value):
@@ -311,11 +355,15 @@ def _logprob(entry: Any, token: int) -> float:
 
 class VllmTurnCore:
     """vLLM's in-process V1 engine with prefix caching and hidden-state
-    capture: each finished turn comes back with its span proofs."""
+    capture: each finished turn comes back with its span proofs. ``proof=None``
+    (the async RL miner: the trainer's forward and the audits judge every model
+    token, no span proof is sent) captures nothing and builds no proof, so a turn
+    vLLM preempted and recomputed is served like any other."""
 
     def __init__(self, checkpoint_dir: str, *, sampling, proof, stop_token_ids,
                  max_total_tokens: int, max_num_seqs: int = 16,
-                 gpu_memory_utilization: float | None = None, forced: bool = False) -> None:
+                 gpu_memory_utilization: float | None = None, forced: bool = False,
+                 lm_head_fp32: bool | None = None) -> None:
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
         os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
         from vllm import LLM, SamplingParams
@@ -323,22 +371,36 @@ class VllmTurnCore:
         from reliquary.miner.corpus_miner import _has_vision_encoder
         from reliquary.miner.vllm_hidden_capture import capture_hidden_states
 
-        self._capture_cm = capture_hidden_states()
-        self._capture = self._capture_cm.__enter__()
+        self._capture_cm = None if proof is None else capture_hidden_states()
+        self._capture = None if self._capture_cm is None else self._capture_cm.__enter__()
         memory = ({} if gpu_memory_utilization is None
                   else {"gpu_memory_utilization": gpu_memory_utilization})
         extra = ({"limit_mm_per_prompt": {"image": 0, "video": 0}}
                  if _has_vision_encoder(checkpoint_dir) else {})
         self._forced = bool(forced)
         if self._forced:
-            # Every request carries its forced draw (``forced_draw.DrawBinding.extra_args``).
-            from reliquary.miner.vllm_generation import ForcedSeedVLLMProcessor
+            # Every request carries its forced draw (``forced_draw.DrawBinding.extra_args``),
+            # placed by the runner's own token count so a preempted turn keeps its position.
+            from reliquary.miner.vllm_generation import (
+                RunnerForcedSeedVLLMProcessor,
+                require_runner_forced_draw,
+            )
 
-            extra["logits_processors"] = [ForcedSeedVLLMProcessor]
+            require_runner_forced_draw()
+            extra["logits_processors"] = [RunnerForcedSeedVLLMProcessor]
+            from reliquary.miner.vllm_generation import FP32_HEAD_OVERRIDES, default_lm_head_fp32
+
+            # The draw reads the profile's logits: an fp32 head when it says so.
+            if default_lm_head_fp32() if lm_head_fp32 is None else lm_head_fp32:
+                extra["hf_overrides"] = dict(FP32_HEAD_OVERRIDES)
         self._llm = LLM(model=checkpoint_dir, dtype="bfloat16", enable_prefix_caching=True,
                         seed=secrets.randbelow(2**31 - 1) + 1, max_model_len=max_total_tokens,
                         max_num_seqs=max_num_seqs, **memory, **extra)
         self._engine = self._llm.llm_engine
+        # A proven turn must not be preempted (its rows would be recomputed); a proof-free turn may be, and
+        # vLLM's own scheduling serves more turns than a worst-case cap would.
+        self.max_running = (cap_running_to_kv_cache(self._llm, max_num_seqs, max_total_tokens)
+                            if proof is not None else int(max_num_seqs))
         self._params = SamplingParams
         # The job's sampling; only the stop ids end a turn (ignore_eos turns off
         # the checkpoint's own generation_config terminators).
@@ -375,11 +437,13 @@ class VllmTurnCore:
 
     def pending_capture_count(self) -> int:
         """Captured requests still held: 0 once every batch has drained."""
-        return len(self._capture.ids())
+        return 0 if self._capture is None else len(self._capture.ids())
 
     def _sweep_capture(self) -> None:
         # Rows of requests nobody will pop: the async surplus row recorded
         # after a pop, or a request aborted / failed by an engine-step error.
+        if self._capture is None:
+            return
         for captured in self._capture.ids():
             if self._own_id(captured) is None:
                 self._capture.discard(captured)
@@ -416,6 +480,13 @@ class VllmTurnCore:
         prompt_len = self._prompt_len.pop(request_id, None)
         completion = output.outputs[0]
         tokens = tuple(int(t) for t in completion.token_ids)
+        if self._capture is None:
+            if prompt_len is None or not tokens:
+                return Finished(request_id, error="an unknown request or an empty completion")
+            entries = list(completion.logprobs or [])
+            logprobs = tuple(_logprob(entries[i] if i < len(entries) else None, t)
+                             for i, t in enumerate(tokens))
+            return Finished(request_id, tokens, logprobs, "stop" if tokens[-1] in self._stops else "length")
         try:
             rows = self._capture.pop(request_id)
             if prompt_len is None or not tokens:

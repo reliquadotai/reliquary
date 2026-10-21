@@ -16,6 +16,7 @@ from reliquary.corpus.checks import completion_digest  # noqa: E402
 from reliquary.corpus.job import parse_job  # noqa: E402
 from reliquary.corpus.signed_reasons import corpus_engagement, session_seen_key  # noqa: E402
 from reliquary.environment.agentic_swe import SignedSweSource  # noqa: E402
+from reliquary.eval.rows import RowMap  # noqa: E402
 from reliquary.infrastructure import corpus_job_store as job_store  # noqa: E402
 from reliquary.infrastructure.sandbox_store import MemorySessionStore  # noqa: E402
 from reliquary.protocol.corpus_submission import CorpusSubmissionRequest  # noqa: E402
@@ -42,7 +43,7 @@ JOB = parse_job(MANIFEST)
 TOKENIZER = _Tokenizer()
 PROOF = "A" * 200
 DIFF = "diff --git a/x b/x\n"
-SOURCE = SignedSweSource("train", prompt_of=lambda split, index: f"Fix task {index}.")
+SOURCE = SignedSweSource(RowMap.identity("train", 0, 100), prompt_of=lambda split, index: f"Fix task {index}.")
 CALL_ZERO = {"turn": 0, "k": 0, "arguments": {"command": "c0"}, "output": "a.py\n"}
 
 

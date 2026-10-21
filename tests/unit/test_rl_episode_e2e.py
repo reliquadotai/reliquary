@@ -563,7 +563,7 @@ class Miners:
 
         return em.EpisodeStackDeps(
             download=lambda repo, revision, cache_dir: f"/checkpoints/{revision[:8]}",
-            load_renderer=lambda directory, tools: ScriptRenderer(), make_core=make_core,
+            load_renderer=lambda directory, tools, spec=None: ScriptRenderer(), make_core=make_core,
             max_model_len=lambda core, default: default, release_core=lambda core: None,
             load_proof_model=lambda directory: Checkpoint(), release_model=lambda model: None,
             toploc=lambda: TOPLOC, serve=serve, make_runner=make_runner, submit=self.validator.submit,

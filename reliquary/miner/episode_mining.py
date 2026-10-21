@@ -558,6 +558,12 @@ def _episode_policies(contract, environments: Sequence[str], package_refusal) ->
         refusal = package_refusal(policy)
         if refusal:
             raise ValueError(f"{name}: {refusal}")
+        from reliquary.environment.agentic_swe import harness_pin_refusal, policy_harness_pin
+
+        # A window draws no surface variant: the order's harness must have one.
+        refusal = harness_pin_refusal(policy_harness_pin(policy), variants=False)
+        if refusal:
+            raise ValueError(f"{name}: {refusal}")
         policies[name] = policy
     return policies
 
@@ -592,16 +598,18 @@ async def build_episode_stack(view: EpisodeWindow, *, config: EpisodeMinerConfig
         # order's pin refuses to start).
         await asyncio.to_thread(bind, view.announcement)
 
+    from reliquary.environment.agentic_swe import harness_of, policy_harness_pin
+
     closers: list = []
     try:
         checkpoint_dir = await asyncio.to_thread(deps.download, view.repo, view.revision, config.checkpoint_dir)
         renderers: dict[tuple, Any] = {}
 
         def renderer_for(policy):
-            tools = tuple(policy.tools)
-            if tools not in renderers:
-                renderers[tools] = deps.load_renderer(checkpoint_dir, tools=tools)
-            return renderers[tools]
+            tools, spec = tuple(policy.tools), harness_of(policy_harness_pin(policy))
+            if (tools, spec.key) not in renderers:
+                renderers[tools, spec.key] = deps.load_renderer(checkpoint_dir, tools=tools, spec=spec)
+            return renderers[tools, spec.key]
 
         renderer = renderer_for(first)
         sampling, proof = deps.sampling(), deps.toploc()
@@ -641,7 +649,7 @@ async def build_episode_stack(view: EpisodeWindow, *, config: EpisodeMinerConfig
                                     sign_binding=sign_binding, sessions=sessions, model_name=view.repo,
                                     renderer_model_dir=checkpoint_dir, generate_url=generate_url, sampling=sampling,
                                     harness_env=config.harness_env, open_until=open_until,
-                                    max_live=config.max_live)
+                                    max_live=config.max_live, harness=harness_of(policy_harness_pin(policy)))
 
         def make_miner(window: EpisodeWindow):
             def submit(request):

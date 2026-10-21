@@ -8856,10 +8856,19 @@ class ValidationService:
         self._episode_tasks = [asyncio.create_task(job) for job in jobs]
 
     def _default_episode_renderer(self, policy):
-        """The turn renderer of the policy's tokenizer over the env's tools (the signed parse)."""
-        from reliquary.environment.agentic_swe import load_turn_renderer
+        """The turn renderer of the policy's tokenizer over the env's tools, in the order's harness (the
+        signed parse). A harness this build does not serve, or one with variants (a window draws none), is
+        refused before anything is served."""
+        from reliquary.environment.agentic_swe import (
+            harness_of, harness_pin_refusal, load_turn_renderer, policy_harness_pin,
+        )
 
-        return load_turn_renderer(str(getattr(self.tokenizer, "name_or_path", "")), tools=tuple(policy.tools))
+        pin = policy_harness_pin(policy)
+        refusal = harness_pin_refusal(pin, variants=False)
+        if refusal:
+            raise ValueError(f"{policy.environment}: {refusal}")
+        return load_turn_renderer(str(getattr(self.tokenizer, "name_or_path", "")), tools=tuple(policy.tools),
+                                  spec=harness_of(pin))
 
     async def _stop_episode_services(self) -> None:
         tasks = list(getattr(self, "_episode_tasks", None) or [])
@@ -8898,78 +8907,13 @@ class ValidationService:
             await publisher.close()
 
     async def _serve_axon_on_chain(self, subtensor) -> None:
-        """Publish this validator's axon (ip:port) to the chain metagraph.
+        """Publish this validator's axon (ip:port) to the chain metagraph (``validator.axon``): miners read
+        ``metagraph.axons[uid].ip/port`` via ``discover_validator_url``. Without an external address, skipped
+        with a warning (miners then need ``--validator-url``)."""
+        from reliquary.validator.axon import serve_axon_on_chain
 
-        Miners read `metagraph.axons[uid].ip/port` via `discover_validator_url`
-        to route their submissions. Skipped with a warning when no external
-        address is configured — miners then need `--validator-url` overrides
-        to find this validator.
-        """
-        if not self.external_ip or not self.external_port:
-            logger.warning(
-                "serve_axon skipped: no external_ip/external_port provided. "
-                "Miners won't discover this validator via metagraph; use "
-                "--validator-url on the miner side."
-            )
-            return
-        if self._signer_client is not None:
-            try:
-                accepted = await self._signer_client.serve_axon(
-                    netuid=self.netuid,
-                    ip=self.external_ip,
-                    port=self.external_port,
-                )
-                if not accepted:
-                    logger.error(
-                        "remote signer rejected serve_axon for %s:%d on netuid %d",
-                        self.external_ip,
-                        self.external_port,
-                        self.netuid,
-                    )
-                    return
-                logger.info(
-                    "remote signer published axon: %s:%d on netuid %d",
-                    self.external_ip,
-                    self.external_port,
-                    self.netuid,
-                )
-                return
-            except Exception:
-                logger.exception("remote signer serve_axon operation failed")
-                return
-        try:
-            import bittensor as bt
-
-            axon = bt.Axon(
-                wallet=self.wallet,
-                ip=self.external_ip,
-                port=self.external_port,
-                external_ip=self.external_ip,
-                external_port=self.external_port,
-            )
-            response = await subtensor.serve_axon(
-                netuid=self.netuid,
-                axon=axon,
-                wait_for_inclusion=True,
-                wait_for_finalization=False,
-                raise_error=False,
-            )
-            success = getattr(response, "is_success", None)
-            if success is False:
-                logger.error(
-                    "serve_axon failed: %s:%d not published (response=%s). "
-                    "Likely: hotkey not registered on netuid %d, or chain rejected.",
-                    self.external_ip, self.external_port, response, self.netuid,
-                )
-                return
-            logger.info(
-                "serve_axon published: %s:%d announced on netuid %d",
-                self.external_ip, self.external_port, self.netuid,
-            )
-        except Exception:
-            logger.exception(
-                "serve_axon threw — miners will have to use --validator-url"
-            )
+        await serve_axon_on_chain(subtensor, wallet=self.wallet, netuid=self.netuid, ip=self.external_ip,
+                                  port=self.external_port, signer_client=self._signer_client)
 
     async def _bootstrap_state_from_external(self) -> None:
         """Derive window_n and checkpoint_n from R2 + HF.

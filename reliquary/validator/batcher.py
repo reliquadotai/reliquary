@@ -367,6 +367,45 @@ def _render_environment_prompt(env: Any, tokenizer: Any, prompt_idx: int) -> str
     )
 
 
+def admission_problem_materials(env: Any, tokenizer: Any, prompt_idx: int):
+    """The trusted problem data admission grades against: the problem, its rendered prompt and its reward
+    materials. Shared by the window batcher and the async submission path (``rl_submit``)."""
+    from reliquary.validator.admission import AdmissionProblemMaterials
+
+    problem = env.get_problem(prompt_idx)
+    rendered_prompt = _render_environment_prompt(env, tokenizer, prompt_idx)
+    code_cases = None
+    reward_materials = None
+    try:
+        from reliquary.environment.registry import get_environment_spec
+
+        spec = get_environment_spec(getattr(env, "name", ""))
+    except ValueError:
+        spec = None
+    materializer_name = (
+        spec.reward_materializer_method if spec is not None else None
+    )
+    cases_loader = (
+        getattr(env, materializer_name, None)
+        if materializer_name
+        else None
+    )
+    if callable(cases_loader):
+        reward_materials = cases_loader(problem)
+        # `code_cases` is the older, narrower channel; what fills it is the
+        # environment asking for the sandbox, not its name. The name test
+        # this replaces would never have matched a packaged code
+        # environment, which is the same environment under another name.
+        if spec is not None and spec.admission_resource_class == "sandbox":
+            code_cases = list(reward_materials)
+    return AdmissionProblemMaterials(
+        problem=dict(problem),
+        rendered_prompt=rendered_prompt,
+        code_cases=code_cases,
+        reward_materials=reward_materials,
+    )
+
+
 def _reward_matches_claim(actual: float, claimed: float, *, tolerance: float = 1e-6) -> bool:
     actual_f = float(actual)
     claimed_f = float(claimed)
@@ -3964,42 +4003,7 @@ class GrpoWindowBatcher:
         prompt_idx: int,
     ):
         """Fetch trusted problem data without parsing or decoding miner input."""
-        from reliquary.validator.admission import AdmissionProblemMaterials
-
-        problem = self.env.get_problem(prompt_idx)
-        rendered_prompt = _render_environment_prompt(
-            self.env, self.tokenizer, prompt_idx
-        )
-        code_cases = None
-        reward_materials = None
-        try:
-            from reliquary.environment.registry import get_environment_spec
-
-            spec = get_environment_spec(getattr(self.env, "name", ""))
-        except ValueError:
-            spec = None
-        materializer_name = (
-            spec.reward_materializer_method if spec is not None else None
-        )
-        cases_loader = (
-            getattr(self.env, materializer_name, None)
-            if materializer_name
-            else None
-        )
-        if callable(cases_loader):
-            reward_materials = cases_loader(problem)
-            # `code_cases` is the older, narrower channel; what fills it is the
-            # environment asking for the sandbox, not its name. The name test
-            # this replaces would never have matched a packaged code
-            # environment, which is the same environment under another name.
-            if spec is not None and spec.admission_resource_class == "sandbox":
-                code_cases = list(reward_materials)
-        return AdmissionProblemMaterials(
-            problem=dict(problem),
-            rendered_prompt=rendered_prompt,
-            code_cases=code_cases,
-            reward_materials=reward_materials,
-        )
+        return admission_problem_materials(self.env, self.tokenizer, prompt_idx)
 
     def reserve_prepared_identity(
         self,
@@ -5180,6 +5184,7 @@ class GrpoWindowBatcher:
             rollout._validated_force_span = None
             rollout._validated_termination_path = None
             rollout._validated_completion_logprobs = None
+            rollout._forced_draw_uniforms = None
             # Per-position forced-seed uniforms for this rollout's teacher-forced
             # consistency check. Read completion_length here (ahead of the
             # ``completion_len`` computed later at the sparse-outputs section)
@@ -5333,6 +5338,12 @@ class GrpoWindowBatcher:
             rollout._validated_completion_logprobs = (
                 _verify_logprobs_for_training(proof, _seed_completion_len)
             )
+            from reliquary.validator.training import training_loss
+
+            if training_loss() == "substitution":
+                # The verifier's uniforms, one per policy position: the trainer
+                # recomputes v* with them (substitution loss).
+                rollout._forced_draw_uniforms = list(seed_u)
             grp_stoch += proof.seed_n_stochastic
             grp_match += proof.seed_n_match
             seed_per_rollout.append((proof.seed_n_stochastic, proof.seed_n_match))

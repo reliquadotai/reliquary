@@ -127,7 +127,8 @@ def transport_hash() -> str:
                    for name in ("remote_proof_protocol.py", "remote_proof.py",
                                 "remote_proof_server.py", "proof_worker.py",
                                 "proof_measurements.py", "batcher.py", "service.py",
-                                "proof_stress.py", "proof_capacity_combined.py")})
+                                "proof_stress.py", "proof_capacity_combined.py",
+                                "remote_rl_audit.py")})
 
 
 class WireModel(BaseModel):

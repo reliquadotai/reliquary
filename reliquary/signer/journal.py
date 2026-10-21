@@ -63,11 +63,12 @@ class SignerJournal:
                 );
                 """
             )
-            # Only this pure operation may be retried after process loss.
+            # Only these pure operations may be retried after process loss.
             # Chain writes retain pending/uncertain state: they may have landed.
             self._connection.execute(
                 "UPDATE operations SET state='failed', error_type='signer_restart', "
-                "updated_at=? WHERE kind='checkpoint-sign' AND state='pending'",
+                "updated_at=? WHERE kind IN ('checkpoint-sign', 'rl-index-sign', 'rl-observation-sign') "
+                "AND state='pending'",
                 (time.time(),),
             )
 
@@ -91,7 +92,9 @@ class SignerJournal:
         payload_digest: str,
         cursor_name: str | None = None,
         cursor_value: int | None = None,
+        cursor_strict: bool = True,
     ) -> Reservation:
+        """``cursor_strict=False``: the cursor may repeat its value (never go back)."""
         now = time.time()
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
@@ -131,9 +134,12 @@ class SignerJournal:
                     cursor = self._connection.execute(
                         "SELECT value FROM cursors WHERE name=?", (cursor_name,)
                     ).fetchone()
-                    if cursor is not None and int(cursor_value) <= int(cursor[0]):
+                    if cursor is not None and (
+                        int(cursor_value) < int(cursor[0])
+                        or (cursor_strict and int(cursor_value) == int(cursor[0]))
+                    ):
                         raise JournalReplay(
-                            f"{cursor_name} must increase beyond {int(cursor[0])}"
+                            f"{cursor_name} must not go back from {int(cursor[0])}"
                         )
                     self._connection.execute(
                         "INSERT INTO cursors(name, value) VALUES(?, ?) "

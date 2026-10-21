@@ -125,7 +125,10 @@ def resolve_task_config(
 
     environments = list(generation_contract.get("environments") or ())
     if entry.env_split is not None:
-        unknown = set(entry.env_split) - set(environments)
+        # An async task's signed-episode envs (params.rl_episode_envs, bridged from their catalogue) are no
+        # profile environment: the split may name them.
+        episode_envs = set((entry.params or {}).get("rl_episode_envs") or ())
+        unknown = set(entry.env_split) - set(environments) - episode_envs
         if unknown:
             raise TaskConfigError(
                 f"task {task_id!r} declares env_split for "

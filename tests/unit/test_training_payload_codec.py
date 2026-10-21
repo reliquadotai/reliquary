@@ -210,6 +210,23 @@ def test_pi_old_fp32_exact_and_absent_when_missing(monkeypatch):
                     assert v1 == [float(np.float32(x)) for x in v0]
 
 
+def test_forced_draw_uniforms_round_trip_in_float64_and_only_when_present():
+    """The substitution loss's public uniforms reach the trainer bit for bit (gumbel_key reads all
+    53 bits); a payload without them keeps its arrays, hence its bytes."""
+    from reliquary.environment.forced_sampling import u_at
+
+    batches = _window_batches()
+    rollouts = [r for groups in batches.values() for g in groups for r in g.rollouts]
+    rollouts[0]._forced_draw_uniforms = [u_at("ab" * 32, 11, "rev", 0, j) for j in range(4)]
+    rollouts[2]._forced_draw_uniforms = [u_at("ab" * 32, 22, "rev", 0, j) for j in range(5)]
+    rollouts[3]._forced_draw_uniforms = [0.5]  # wrong length: dropped
+    decoded = _encode_decode(batches).batches()
+    got = [getattr(r, "_forced_draw_uniforms", None) for groups in decoded.values() for g in groups for r in g.rollouts]
+    assert got == [rollouts[0]._forced_draw_uniforms, None, rollouts[2]._forced_draw_uniforms, None]
+    with np.load(io.BytesIO(_payload_bytes()), allow_pickle=False) as npz:
+        assert "draw_u_flat" not in npz.files and "draw_u_off" not in npz.files
+
+
 def test_plan_from_batches_equivalence():
     original = _window_batches()
     decoded = _encode_decode(original).batches()

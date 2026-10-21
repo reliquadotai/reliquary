@@ -17,6 +17,9 @@ record 0's offered tools. Then:
   cannot skip its last turn's calls and `/finish` a graded episode. The last span's
   records match a non-empty prefix of its sent calls (the closing call returned its
   record with the final; the calls after it were never sent) and no observation follows.
+  A `budget_exhausted` final of reason `max_calls` closes on a call the machine refused
+  to run (the call budget was spent before it): that call has no record, so the prefix
+  may be empty;
   What this parser checks is that no call record is left after that prefix; that the
   final record is the next record in the chain is §5.A's (`verify_transcript`);
 * observations are never decoded or searched for: every other span's segment must be
@@ -48,15 +51,15 @@ from reliquary.corpus.checks import REASON_BAD_TURNS
 from reliquary.corpus.replay_compare import Action
 from reliquary.corpus.signed_reasons import REASON_SANDBOX_CALL_MISMATCH
 from reliquary.corpus.trajectory_parse import (
-    REASON_BAD_OBSERVATION, REASON_BAD_STOP, STOPS, ParsedTrajectory, ParsedTurn,
-    TrajectoryRefused, TurnRenderer, check_span_structure,
+    REASON_BAD_OBSERVATION, REASON_BAD_STOP, STOP_FORMAT_ERROR, STOPS, ParsedTrajectory, ParsedTurn,
+    TrajectoryRefused, TurnRenderer, check_span_structure, turn_format_violation,
 )
 
 STOP_EPISODE_CLOSED = "episode_closed"
 """The bridge's stop when the gateway closed the episode mid-turn
 (`reliquary_sandbox_verifiers.task.SandboxEpisodeTask.episode_closed`). Signed episodes
 only: the replay parser's `STOPS` do not hold it."""
-SIGNED_STOPS = STOPS | {STOP_EPISODE_CLOSED}
+SIGNED_STOPS = STOPS | {STOP_EPISODE_CLOSED, STOP_FORMAT_ERROR}
 CLOSED_ON_A_CALL = frozenset({STATUS_EXPIRED, STATUS_BUDGET_EXHAUSTED})
 """The final statuses a gateway sends on a call (deadline, budget, transcript cap)."""
 _UNOBSERVED_LAST_TURN = ("context_length", "max_turns")
@@ -86,14 +89,38 @@ def _same_arguments(signed: Any, sent: Mapping[str, Any]) -> bool:
         return False
 
 
+def _observation(renderer, body) -> str:
+    """The model's text for a signed call record: its rendering, in the renderer's surface variant's
+    observation format (a harness variant may show the signed exit code first)."""
+    text = render_observation(body)
+    if getattr(renderer, "observation_format", "plain") == "plain":
+        return text
+    return renderer.observation(body, text)
+
+
+def _refusal(renderer, pair, plan) -> str:
+    """The model's text for a call answered without a record: the harness's own (mini's format
+    errors), else the refusal's fixed text."""
+    local = getattr(renderer, "refusal_observation", None)
+    own = local(*pair) if local is not None else None
+    return plan.observation if own is None else own
+
+
 def parse_signed_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int],
                             tokens: Sequence[int], spans: Sequence[tuple[int, int]], stop: str,
                             max_turns: int | None, calls: Sequence[Any],
-                            offered: Collection[str], final: Any) -> ParsedTrajectory:
+                            offered: Collection[str], final: Any,
+                            canonical: bool = True) -> ParsedTrajectory:
     """The trajectory's turns and actions, or `TrajectoryRefused`. `calls` are the
     verified transcript's call bodies in order; `offered` is record 0's `tools`;
-    `final` is its final body (`signed_records(...).final`)."""
-    if stop not in SIGNED_STOPS:
+    `final` is its final body (`signed_records(...).final`).
+
+    `canonical=False` (an async RL lease's episode, never exported) skips the rules that
+    keep a turn exportable as a message: the closed final reasoning and the round trip
+    of each span through the template. The calls still have to be their signed records
+    and each segment the rendering of those records."""
+    if stop not in SIGNED_STOPS or (stop == STOP_FORMAT_ERROR and canonical):
+        # A format_error stop is an async RL lease's only (never exported: canonical=False).
         raise TrajectoryRefused(REASON_BAD_STOP, {"stop": stop})
     if stop == STOP_EPISODE_CLOSED and final.status not in CLOSED_ON_A_CALL:
         raise TrajectoryRefused(REASON_BAD_STOP, {
@@ -130,10 +157,18 @@ def parse_signed_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int]
     for k, (start, end) in enumerate(spans):
         completion = list(tokens[start:end])
         last = k == len(spans) - 1
-        if last and stop == "agent_completed" and renderer.reasoning_unclosed(
+        if last and stop == STOP_FORMAT_ERROR:
+            # The model's first malformed turn ends the episode: none of its calls was sent, it is not read.
+            if end != len(tokens):
+                raise TrajectoryRefused(REASON_BAD_TURNS, {"trailing_tokens": len(tokens) - end})
+            if turn_format_violation(renderer, completion) is None:
+                raise TrajectoryRefused(REASON_BAD_STOP, {"turn": k, "stop": stop, "why": "the last turn is well formed"})
+            turns.append(ParsedTurn((), ()))
+            continue
+        if canonical and last and stop == "agent_completed" and renderer.reasoning_unclosed(
                 full[:offset + start], completion):
             raise TrajectoryRefused(REASON_BAD_STOP, {"turn": k, "why": "final reasoning is not closed"})
-        if not renderer.span_is_canonical(full[:offset + start], completion):
+        if canonical and not renderer.span_is_canonical(full[:offset + start], completion):
             raise TrajectoryRefused(REASON_BAD_TURNS, {"turn": k, "why": "span does not re-render to itself"})
         pairs = list(renderer.tool_calls(completion))
         plans = [plan_call(name, arguments, offered) for name, arguments in pairs]
@@ -154,7 +189,9 @@ def parse_signed_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int]
                     if used == len(records):
                         break                       # the rest were never sent
                     take(k, position, plan)
-                if used == before:
+                refused_call = (final.status == STATUS_BUDGET_EXHAUSTED and final.reason == "max_calls"
+                                and bool(sends))
+                if used == before and not refused_call:
                     raise TrajectoryRefused(REASON_BAD_STOP, {
                         "turn": k, "why": "the episode closed on no recorded call of this turn"})
             actions += [Action(name, arguments, None) for name, arguments in pairs]
@@ -162,9 +199,9 @@ def parse_signed_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int]
             continue
         if not pairs:
             raise TrajectoryRefused(REASON_BAD_OBSERVATION, {"turn": k, "why": "no tool call"})
-        observations = [plan.observation if isinstance(plan, Refuse)
-                        else render_observation(take(k, position, plan).to_dict())
-                        for plan, position in zip(plans, positions)]
+        observations = [_refusal(renderer, pair, plan) if isinstance(plan, Refuse)
+                        else _observation(renderer, take(k, position, plan).to_dict())
+                        for pair, plan, position in zip(pairs, plans, positions)]
         expected = renderer.next_prompt(full[:offset + start], completion, observations)
         if expected is None or expected != full[:offset + spans[k + 1][0]]:
             raise TrajectoryRefused(REASON_BAD_OBSERVATION, {

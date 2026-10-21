@@ -6539,6 +6539,18 @@ class ValidatorServer:
         app.add_middleware(HttpMetricsMiddleware, metrics=self.http_metrics)
         return app
 
+    def mount_rl_lease_router(self, router: Any) -> None:
+        """Serve the async-RL lease routes (``POST /rl/lease``, ``GET /rl/quota``, ``GET
+        /rl/lease/commitments``, ``GET /rl/prompts/state``) built by ``rl_lease_routes.build_rl_lease_router``.
+        The async validator mounts them (``rl_async_service.mount_rl_async``, ``RELIQUARY_RL_MODE=async``).
+        A route the router serves replaces the app's own at the same path and method (the async ``GET /rl/pay``
+        replaces the window board's)."""
+        served = {(getattr(r, "path", None), m) for r in router.routes for m in (getattr(r, "methods", None) or ())}
+        self.app.router.routes[:] = [
+            r for r in self.app.router.routes
+            if not any((getattr(r, "path", None), m) in served for m in (getattr(r, "methods", None) or ()))]
+        self.app.include_router(router)
+
     def mount_corpus_router(
         self,
         entry: Any,
