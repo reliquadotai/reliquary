@@ -10,8 +10,9 @@ carries the same blocks, under ``params["rl_episode_envs"]`` (``EPISODE_ENVS_PAR
                "version": "<manifest sha256>"}}                   # optional: the bridged install's manifest
 
 The blocks are validated with the contract's own rules (``service_contract._validate_episode``,
-``validate_catalogue``), so a block that an order would refuse is refused here too. The env name must be in
-the entry's ``env_split`` (the trainer's mix). The registry is the one document validators, miners and the
+``validate_catalogue``), so a block that an order would refuse is refused here too, except the token
+ceiling: an RL episode is bounded by ``MAX_RL_EPISODE_TOKENS`` (the RL rollout cap), not the corpus trajectory
+cap. The env name must be in the entry's ``env_split`` (the trainer's mix). The registry is the one document validators, miners and the
 trainer already read, signed off by the operator who declared the task: no second source of truth. Miners read
 it back from the validator (``GET /rl/episodes``, ``episodes_answer``), which serves exactly the blocks it grades
 with. The seed pool of an async policy is ``2 x GROUP_ROLLOUTS`` (a lease has 16 rollouts, its sessions are
@@ -76,7 +77,8 @@ def _rollouts() -> int:
 def validate_episode_block(name: str, block: Any) -> dict:
     """One ``rl_episode_envs`` entry, checked with the order's rules; a canonical copy. ValueError otherwise."""
     from reliquary.protocol.service_contract import (
-        _ENV_ID, PUBLIC_SEED_POOL, ServiceContractError, _validate_episode, validate_catalogue,
+        _ENV_ID, MAX_RL_EPISODE_TOKENS, PUBLIC_SEED_POOL, ServiceContractError, _validate_episode,
+        validate_catalogue,
     )
 
     if not isinstance(name, str) or not _ENV_ID.fullmatch(name):
@@ -86,7 +88,7 @@ def validate_episode_block(name: str, block: Any) -> dict:
     copy = json.loads(json.dumps(dict(block)))
     env = {"episode": copy["episode"], "sampling": {"kind": PUBLIC_SEED_POOL}, "missing_box": "graded"}
     try:
-        _validate_episode(name, env)
+        _validate_episode(name, env, max_episode_tokens=MAX_RL_EPISODE_TOKENS)
         if "catalogue" in copy:
             validate_catalogue(name, copy["catalogue"], copy["episode"])
     except ServiceContractError as exc:

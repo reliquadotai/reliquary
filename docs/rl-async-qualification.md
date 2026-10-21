@@ -134,7 +134,8 @@ docs/runbooks/rl-bridged-episode-envs.md), not in the profile. For the launch: `
 rehearsal's episodes), `max_tokens_per_turn` 8192, `max_episode_tokens` 65536, and budgets that let 48 turns run:
 `max_calls` 192 (at 64 an honest episode closed on the budget after 23 turns), `wall_s` 7200, `cpu_s` 3600 (its
 ceiling). The miner's `--max-model-len` must cover the episode (69632 covers 65536). Both envs keep equal caps, so
-one episode engine serves them.
+one episode engine serves them. An RL episode block is bounded by `MAX_RL_EPISODE_TOKENS` (65536,
+`protocol/service_contract.py`); an order's episode keeps the corpus trajectory cap (`MAX_EPISODE_TOKENS`, 60000).
 
 ## Rehearsal plan (8 GPUs, 2026-10-21)
 
