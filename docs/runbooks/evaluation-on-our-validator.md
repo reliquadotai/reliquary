@@ -35,6 +35,14 @@ The card (`set.json`) records the source, the selection and the overlap of the
 rows with RL and the prod corpus jobs. Nothing is refused for overlapping: the
 report carries it beside the score.
 
+New cards also seal the actual prompt/reference files, grader implementation and
+single-turn harness into `protocol`, `protocol_json` and `protocol_sha256`.
+`build-set --protocol reviewed.json` adds reviewed `data` artifact digests,
+`licenses` entries (`id`, exact license-body `sha256`) and `disjointness`
+(`disjoint`, `evidence_sha256`). Missing evidence stays unknown; importing a
+Verifiers taskset does not establish that it was held out. Publication uses
+conditional creation and never overwrites another publisher's frozen bytes.
+
 ## 2. Declare the job
 
 ```bash
@@ -113,7 +121,43 @@ reliquary eval compare results/<job-start-checkpoint> results/<job>
   the task contract, the training overlap. `graded.parquet`: one row per
   completion.
 - `eval compare` needs the same sets, samples, sampling, budget, reasoning mode
-  and grader versions; it refuses ungraded rows unless `--allow-ungraded`.
+  and grader/protocol identities; it refuses ungraded rows unless `--allow-ungraded`.
+  Legacy reports remain readable and comparisons label them `legacy-unpinned`.
+
+## Pinned pod evaluations
+
+`eval run` retains its single-turn default. A protocol-bearing lease uses one
+spawned model process per order, an explicit total-transcript token cap and a
+bounded inference call. The parent maintains the lease heartbeat and kills and
+joins its owned model process group on timeout or lease loss. Model boot/download
+has a separate one-hour bound. These software checks do not qualify a GPU's
+capacity or a model's performance.
+
+Public checkpoint downloads explicitly disable HF credentials. A lease declaring
+`model_access=private` reads its credential through the current fenced model-credential
+route. A trusted local loader caller may supply its credential directly. The token stays
+in memory; no login, token file or secret command argument is created. The loader
+checks the exact repository and 40-hex revision and disables remote model code.
+The existing operator/subnet qualification commands are separate paths.
+
+Reports retain actual completion/truncation/format metrics and per-problem
+`mean_score` with `n_problems_graded`. Attempt counts and episode turn/tool metrics
+remain null when not measured. The current executor does not advertise signed
+agentic evaluation support.
+
+Episode software uses the same runner: `telecom-episode-v1` replays the frozen
+deterministic tools, and `signed-bash-v1` requires the pinned signed sandbox,
+exact renderer, issued session and accepted worker lease. The declared SWE and
+TMax policy is at most 40 turns; it is provisional, not measured capacity.
+TMax splits are training corpus parts and acquire no held-out claim by default.
+Public `--publish-reviewed` publication requires explicit source/rights/overlap
+evidence and emits a `withdrawn` registration template for separate qualification.
+Receipts that exceed the existing row allowance fail without truncating state.
+
+The evaluation runtime uses its new exact sandbox commit in a separate process
+or build. This is not a hot upgrade of active corpus/RL jobs pinned to an older
+commit; those workers stay on their existing pin until a separately reviewed
+rollover. Software tests do not establish available sandbox or GPU capacity.
 
 ## 6. Stop
 

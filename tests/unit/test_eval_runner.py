@@ -201,7 +201,8 @@ def test_sampling_defaults_fill_absent_and_null_fields():
 def test_the_model_sha_is_the_commit_hugging_face_served():
     sha = "ab" * 20
     assert resolved_revision(f"/cache/models--o--m/snapshots/{sha}", sha) == sha
-    assert resolved_revision(f"/cache/snapshots/{sha}", "abab") == sha
+    with pytest.raises(RuntimeError, match="asked for revision"):
+        resolved_revision(f"/cache/snapshots/{sha}", "abab")
     with pytest.raises(RuntimeError, match="served"):
         resolved_revision(f"/cache/snapshots/{sha}", "cd" * 20)
     with pytest.raises(RuntimeError):

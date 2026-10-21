@@ -2051,6 +2051,12 @@ def eval_build_set(
         None, "--taskset-args",
         help="Verifiers only: the taskset config as JSON, frozen into the set"),
     set_id: str | None = typer.Option(None, "--set-id"),
+    protocol: str | None = typer.Option(
+        None, "--protocol", help="Reviewed JSON file with data/license digests and disjointness evidence"),
+    interaction: str = typer.Option("single_turn", "--interaction",
+        help="single_turn, episode (telecom benchmark), or signed_episode (reviewed sandbox source)"),
+    episode_config: str | None = typer.Option(None, "--episode-config",
+        help="Reviewed episode source configuration JSON file; no secret command arguments"),
 ) -> None:
     """Freeze problems into a set: prompts.jsonl, grading.jsonl, set.json.
 
@@ -2058,18 +2064,33 @@ def eval_build_set(
     over [START, START+COUNT), whole or --sample'd. Overlap with training is
     written on the card, never refused."""
     import json
+    from pathlib import Path
 
     from reliquary.eval import sets
 
     try:
+        reviewed = json.loads(Path(protocol).read_text()) if protocol else None
+        if reviewed is not None and not isinstance(reviewed, dict):
+            raise ValueError("--protocol must hold a JSON object")
         if (preset is None) == (source is None):
             raise ValueError("give exactly one of --preset and --source")
-        if preset is not None:
+        if interaction != "single_turn":
+            if preset is not None or source is None or count is None or seed is None \
+                    or sample is not None or start or split or taskset_args:
+                raise ValueError("an episode takes --source, --count and --seed with reviewed source configuration")
+            config = json.loads(Path(episode_config).read_text()) if episode_config else None
+            if config is not None and not isinstance(config, dict):
+                raise ValueError("--episode-config must hold a JSON object")
+            card = sets.build_episode_set(source, out=out, interaction=interaction, count=count,
+                seed=seed, episode_config=config, set_id=set_id, protocol=reviewed)
+        elif episode_config is not None:
+            raise ValueError("--episode-config requires an episode interaction")
+        elif preset is not None:
             if count is None or seed is None or sample is not None or start or split \
                     or taskset_args:
                 raise ValueError("a --preset takes --count and --seed only")
             card = sets.build_set(preset, count=count, seed=seed, out=out, set_id=set_id,
-                                  open_environment=sets.open_source)
+                                  open_environment=sets.open_source, protocol=reviewed)
         else:
             args = json.loads(taskset_args) if taskset_args else None
             if args is not None and not isinstance(args, dict):
@@ -2077,13 +2098,17 @@ def eval_build_set(
             card = sets.build_source_set(source, out=out, split=split, start=start,
                                          count=count, sample=sample, seed=seed,
                                          set_id=set_id, taskset_args=args,
-                                         open_environment=sets.open_source)
-    except (ValueError, FileExistsError, KeyError) as exc:
+                                         open_environment=sets.open_source, protocol=reviewed)
+    except (ValueError, OSError, KeyError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     keys = ("set_id", "env", "source", "split", "count", "index_range", "prompts_sha256",
-            "grading_sha256", "disjointness", "taskset", "needs_runtime")
-    typer.echo(json.dumps({k: card[k] for k in keys if k in card}, indent=1))
+            "grading_sha256", "disjointness", "taskset", "needs_runtime", "protocol", "protocol_sha256")
+    public = {k: card[k] for k in keys if k in card}
+    if card.get("protocol") and card.get("taskset"):
+        from reliquary.eval.protocol import public_taskset
+        public["taskset"] = public_taskset(card["taskset"])
+    typer.echo(json.dumps(public, indent=1))
 
 
 def _admin_client(admin_url: str):
@@ -2221,24 +2246,29 @@ def eval_compare(
 
 
 @eval_app.command("publish-set")
-def eval_publish_set(directory: str = typer.Argument(..., help="A directory build-set wrote")) -> None:
+def eval_publish_set(
+    directory: str = typer.Argument(..., help="A directory build-set wrote"),
+    publish_reviewed: bool = typer.Option(False, "--publish-reviewed",
+        help="Publish frozen public metadata and emit a withdrawn registration template"),
+) -> None:
     """Upload a set: its three files to the subnet bucket (R2_*); a platform
     preset's prompts.jsonl and set.json to the platform bucket too
-    (RELIQUARY_PLATFORM_*), which makes it orderable. An operator's set
-    (build-set --source) never goes there."""
+    (RELIQUARY_PLATFORM_*). Operator sets remain private by default.
+    --publish-reviewed emits public metadata and a withdrawn registration
+    template; it does not qualify or register the set."""
     import json
     from pathlib import Path
 
-    from reliquary.corpus.delivery import R2DeliverySink
     from reliquary.eval.storage import (
-        SetConflict, SubnetEvalStore, is_operator_set, publish_set,
+        PlatformEvalStore, SetConflict, SubnetEvalStore, is_operator_set, publish_set,
     )
 
     try:
         card = json.loads((Path(directory) / "set.json").read_text())
-        platform = None if is_operator_set(card) else R2DeliverySink.from_environment()
+        platform = (PlatformEvalStore.from_environment()
+                    if publish_reviewed or not is_operator_set(card) else None)
         answer = asyncio.run(publish_set(directory, platform=platform,
-                                         subnet=SubnetEvalStore()))
+                                         subnet=SubnetEvalStore(), publish_reviewed=publish_reviewed))
     except (ValueError, OSError, RuntimeError, SetConflict) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc

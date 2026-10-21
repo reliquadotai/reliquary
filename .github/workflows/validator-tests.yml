@@ -72,7 +72,8 @@ jobs:
         test_sandbox_sessions test_signed_episode_e2e test_signed_episode_environment
         test_signed_grading_and_wiring test_signed_intake test_signed_miner
         test_signed_parse test_signed_state test_signed_wire
-        test_tasks_create_composed
+        test_tasks_create_composed test_admin_eval_sandbox test_evaluation_sessions
+        test_eval_signed_agentic
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

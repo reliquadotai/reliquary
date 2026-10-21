@@ -72,11 +72,13 @@ def test_build_a_whole_taskset(tmp_path):
     assert card["split"] is None and card["count"] == 5
     assert card["taskset"] == {"id": "fake", "args": {}, "package": "fake-pkg",
                                "package_version": "1.0", "verifiers_version": "0.3.1"}
-    assert card["disjointness"]["external_benchmark"] is True
+    assert card["disjointness"]["external_benchmark"] is None
+    assert card["disjointness"]["disjoint"] is None
     prompts, grading = rows(tmp_path / "s", "prompts.jsonl"), rows(tmp_path / "s", "grading.jsonl")
     assert prompts[2]["messages"] == [{"role": "user", "content": "question 2"}]
     assert grading[2] == {"problem_id": "verifiers-fake-r0-n5-000002", "source": "verifiers:fake",
                           "source_index": 2, "task_key": "key002",
+                          "reference_sha256": vs.reference_sha256(tasks[2]),
                           "prompt_sha256": vs.prompt_digest(None, "question 2")}
 
 

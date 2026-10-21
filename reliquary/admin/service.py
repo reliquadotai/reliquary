@@ -16,6 +16,7 @@ import math
 import re
 import time
 from collections.abc import Callable, Mapping
+from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
@@ -27,6 +28,8 @@ from reliquary.admin.auth import (
     TIMESTAMP_HEADER,
     HmacVerifier,
 )
+
+from reliquary.sandbox.evaluation_engagements import EvaluationSessionRequest
 
 logger = logging.getLogger(__name__)
 
@@ -280,7 +283,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      task_prefix: str = DEFAULT_TASK_PREFIX, eval_store=None,
                      open_environment=None, grade_scorer=None,
                      require_sandbox=None, qualifications=None, eval_jobs=None,
-                     model_facts=None) -> FastAPI:
+                     model_facts=None, evaluation_sessions=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
     ``eval_store`` the subnet bucket holding the eval sets' grading files."""
@@ -330,6 +333,10 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
             # The model's own config and tokenizer files, on CPU (no weights).
             return await asyncio.to_thread(read_facts, repo, revision)
+    if evaluation_sessions is None:
+        from reliquary.sandbox.evaluation_engagements import from_environment
+
+        evaluation_sessions = from_environment(subnet=eval_store, clock=clock)
     # Rows of each order source, counted once (building one reads its package).
     source_rows: dict[str, int] = {}
 
@@ -1180,6 +1187,36 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                       **({"allow_incomplete": True} if body.allow_incomplete else {})}
         return JobRows(job=job, collected=collected), provenance
 
+    @router.post("/evaluations/{eval_id}/sandbox-session")
+    async def evaluation_sandbox_session(eval_id: str, body: EvaluationSessionRequest,
+                                         response: Response) -> dict:
+        from reliquary.eval.prompt_source import eval_job_prefix
+
+        in_scope(eval_id)
+        if eval_id != eval_job_prefix(task_prefix) + body.task_id:
+            raise HTTPException(status_code=409, detail="evaluation_identity_changed")
+        response.headers["Cache-Control"] = "no-store"
+        if eval_id != body.eval_id:
+            raise HTTPException(status_code=409, detail="evaluation_identity_changed")
+        if evaluation_sessions is None:
+            raise HTTPException(status_code=503, detail="evaluation_sandboxes_not_configured")
+        try:
+            result = await asyncio.wait_for(evaluation_sessions.open(body), 60)
+        except ValueError as exc:
+            logger.warning("evaluation sandbox refused (%s)", type(exc).__name__)
+            raise HTTPException(status_code=409, detail="evaluation_contract_refused") from exc
+        except Exception as exc:
+            logger.warning("evaluation sandbox unavailable (%s)", type(exc).__name__)
+            raise HTTPException(status_code=503, detail="evaluation_sandbox_unavailable") from exc
+        if "refusal" in result:
+            from reliquary.sandbox.routes import REFUSAL_STATUS
+
+            refusal = result["refusal"]
+            response.status_code = REFUSAL_STATUS.get(refusal["reason"], 409)
+            if response.status_code in (429, 503):
+                response.headers["Retry-After"] = str(max(1, math.ceil(refusal["retry_after"] or 5)))
+        return result
+
     @router.post("/evaluations/{eval_id}/grade")
     async def grade_evaluation(eval_id: str, body: GradeEvaluation, response: Response) -> dict:
         from reliquary.corpus.delivery import validated_delivery_id
@@ -1254,6 +1291,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     except ValueError as exc:
                         raise HTTPException(status_code=422, detail=str(exc)) from exc
                 extra = {} if grade_scorer is None else {"scorer_for": grade_scorer}
+                if evaluation_sessions is not None:
+                    extra["verify_signed"] = evaluation_sessions.verify_result
                 gradings[eval_id] = (digest, asyncio.ensure_future(grading.grade_evaluation(
                     eval_id=eval_id, set_ids=body.set_ids, completion_keys=keys,
                     problems_per_set=body.problems_per_set,
@@ -1295,7 +1334,17 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         media = "application/json" if name.endswith(".json") else "application/octet-stream"
         return Response(content=content, media_type=media)
 
-    app = FastAPI()
+    @asynccontextmanager
+    async def lifespan(app):
+        if evaluation_sessions is not None:
+            await evaluation_sessions.start()
+        try:
+            yield
+        finally:
+            if evaluation_sessions is not None:
+                await evaluation_sessions.stop()
+
+    app = FastAPI(lifespan=lifespan)
     app.include_router(router)
     app.state.exports = exports
     app.state.gradings = gradings

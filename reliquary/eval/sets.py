@@ -350,6 +350,7 @@ def validated_set_id(set_id: Any) -> str:
 
 def build_set(env: str, *, count: int, seed: int, out: str | Path,
               set_id: str | None = None,
+              protocol: dict | None = None,
               open_environment: Callable[[str, str], Any] = open_source,
               clock: Callable[[], float] = time.time) -> dict:
     """Freeze ``count`` problems of ``env``'s held-out region into ``out``."""
@@ -386,8 +387,11 @@ def build_set(env: str, *, count: int, seed: int, out: str | Path,
         problem_id = f"{set_id}-{ordinal:06d}"
         prompts.append({"problem_id": problem_id, "env": env, "set_id": set_id,
                         "messages": [{"role": "user", "content": prompt}]})
+        from reliquary.eval.protocol import digest
+
         grading.append({"problem_id": problem_id, "source": held.source, "split": held.split,
-                        "source_index": index, "prompt_sha256": prompt_sha256(prompt)})
+                        "source_index": index, "prompt_sha256": prompt_sha256(prompt),
+                        "reference_sha256": digest(problem)})
     prompts_body, grading_body = _jsonl(prompts), _jsonl(grading)
     profile = ENVIRONMENT_CATALOG[held.source]
     card = {
@@ -404,11 +408,7 @@ def build_set(env: str, *, count: int, seed: int, out: str | Path,
         "environment_manifest_sha256": getattr(profile, "environment_manifest_sha256", None),
         "disjointness": disjointness,
     }
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "prompts.jsonl").write_bytes(prompts_body)
-    (directory / "grading.jsonl").write_bytes(grading_body)
-    (directory / "set.json").write_text(json.dumps(card, sort_keys=True, indent=1))
-    return card
+    return _write_set(directory, prompts, grading, card, protocol=protocol)
 
 
 INTERACTION = "single_turn"
@@ -463,10 +463,14 @@ def _source_set_id(source: str, split: str, low: int, count: int,
     return base if sample is None else f"{base}-k{sample}-s{seed}"
 
 
-def _write_set(directory: Path, prompts: list[dict], grading: list[dict], card: dict) -> dict:
+def _write_set(directory: Path, prompts: list[dict], grading: list[dict], card: dict,
+               *, protocol: dict | None = None) -> dict:
+    from reliquary.eval.protocol import seal_set
+
     prompts_body, grading_body = _jsonl(prompts), _jsonl(grading)
     card = {**card, "prompts_sha256": hashlib.sha256(prompts_body).hexdigest(),
             "grading_sha256": hashlib.sha256(grading_body).hexdigest()}
+    card = seal_set(card, reviewed=protocol)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "prompts.jsonl").write_bytes(prompts_body)
     (directory / "grading.jsonl").write_bytes(grading_body)
@@ -485,6 +489,7 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
                      start: int = 0, count: int | None = None, sample: int | None = None,
                      seed: int | None = None, set_id: str | None = None,
                      taskset_args: dict | None = None,
+                     protocol: dict | None = None,
                      open_environment: Callable[[str, str], Any] = open_source,
                      open_taskset: Callable[..., Any] | None = None,
                      clock: Callable[[], float] = time.time) -> dict:
@@ -503,7 +508,8 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
         return verifiers_source.build_set(
             source, out=out, start=start, count=count, sample=sample, seed=seed,
             set_id=set_id, taskset_args=dict(taskset_args or {}),
-            open_taskset=open_taskset or verifiers_source.open_taskset, clock=clock)
+            open_taskset=open_taskset or verifiers_source.open_taskset, clock=clock,
+            protocol=protocol)
     if taskset_args:
         raise ValueError("taskset args belong to a Verifiers source")
     from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
@@ -531,8 +537,11 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
         prompts.append({"problem_id": problem_id, "env": source, "set_id": set_id,
                         "interaction": INTERACTION,
                         "messages": [{"role": "user", "content": prompt}]})
+        from reliquary.eval.protocol import digest
+
         grading.append({"problem_id": problem_id, "source": source, "split": split,
-                        "source_index": index, "prompt_sha256": prompt_sha256(prompt)})
+                        "source_index": index, "prompt_sha256": prompt_sha256(prompt),
+                        "reference_sha256": digest(problem)})
     overlap = range_overlaps(source, split, start, high)
     overlap["note"] = (None if overlap["disjoint"] else
                        "rows of this set were eligible for training (see rl and corpus): "
@@ -553,7 +562,101 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
         "environment_manifest_sha256": getattr(profile, "environment_manifest_sha256", None),
         "disjointness": overlap,
     }
-    return _write_set(directory, prompts, grading, card)
+    return _write_set(directory, prompts, grading, card, protocol=protocol)
+
+
+def build_episode_set(source: str, *, out: str | Path, interaction: str, count: int,
+                      seed: int, episode_config: dict | None = None, set_id: str | None = None,
+                      protocol: dict | None = None, open_episode=None) -> dict:
+    """Freeze supported episode tasks without opening a sandbox or loading a model."""
+    import asyncio
+    from dataclasses import asdict
+    from reliquary.eval.protocol import digest, telecom_renderer_sha256
+    from reliquary.eval import agentic
+    from reliquary.environment.agentic.chatml import CHATML_RENDERER_ID
+
+    if count <= 0:
+        raise ValueError("episode count must be positive")
+    config = dict(episode_config or {})
+    if interaction == "episode" and source == agentic.TELECOM_ENVIRONMENT:
+        from reliquary.environment.registry import get_environment_spec
+        manifest = get_environment_spec(source).environment_manifest_sha256
+        benchmark = (open_episode(source, config) if open_episode else
+                     agentic.load_telecom_benchmark(manifest))
+        environment, split = benchmark.environment, "benchmark"
+        renderer_id = CHATML_RENDERER_ID
+        renderer_sha = telecom_renderer_sha256()
+        def resolved(index):
+            task = environment.get_task(index)
+            public = task.to_public_wire()
+            return task.prompt, {"source_index": index, "task_id": task.id,
+                "reference_sha256": digest(asdict(task))}, public, None
+        length = len(environment)
+        extra = {}
+    elif interaction == "signed_episode":
+        from reliquary.environment.bridged_episode import BridgedEnvConfig, BridgedEpisodeSource
+        from reliquary.eval.signed_agentic import resolve_task
+        from reliquary.eval.protocol import renderer_sha256, SIGNED_SOURCE_POLICIES
+        from reliquary.environment.agentic_swe import harness_tools
+        required = {"package", "split", "options", "image_lock_sha256", "renderer_sha256",
+                    "tools_version", "tools", "max_turns", "source_policy_sha256"}
+        if set(config) != required:
+            raise ValueError("signed source requires the reviewed package/split/options/lock/renderer/tools")
+        policy = SIGNED_SOURCE_POLICIES.get((config["package"], config["split"]))
+        if (policy is None or config["source_policy_sha256"] != policy
+                or (protocol or {}).get("data", {}).get("environment.toml") != policy):
+            raise ValueError("signed source requires its reviewed declared turn policy")
+        bridge = BridgedEnvConfig(source, config["package"], config["split"],
+                                  config["options"], config["image_lock_sha256"])
+        environment = open_episode(source, config) if open_episode else BridgedEpisodeSource(bridge)
+        if (type(config["max_turns"]) is not int
+                or not 1 <= config["max_turns"] <= 40):
+            raise ValueError("signed source turn bound is unsupported")
+        manifest, split = environment.manifest_sha256(), config["split"]
+        renderer_id, renderer_sha = "renderers:qwen38@0.1.11", config["renderer_sha256"]
+        if renderer_sha != renderer_sha256():
+            raise ValueError("reviewed renderer differs from the installed source")
+        def resolved(index):
+            result = asyncio.run(resolve_task(environment, index))
+            return environment.prompt(index), result, None, result["task"]["image"]
+        length = len(environment)
+        extra = {"harness_max_turns": config["max_turns"], "signed_episode": {"package": config["package"], "options": config["options"],
+                 "image_lock_sha256": environment.lock_sha256, "env_package": environment.identity,
+                 "env_options_sha256": environment.options_sha256, "tools_version": config["tools_version"],
+                 "tools": config["tools"], "renderer_id": renderer_id,
+                 "source_policy_sha256": policy}}
+    else:
+        raise ValueError("unsupported episode source; no split or harness fallback")
+    if count > length:
+        raise ValueError("episode count exceeds the actual source")
+    set_id = validated_set_id(set_id or f"{source.replace('_', '-')}-{split}-s{seed}-n{count}")
+    prompts, grading, images, tools = [], [], set(), None
+    for ordinal, index in enumerate(random.Random(seed).sample(range(length), count)):
+        prompt, reference, public, image = resolved(index)
+        problem_id = f"{set_id}-{ordinal:06d}"
+        task_tools = public["tools"] if public is not None else list(harness_tools(config["tools"]))
+        if tools is not None and tools != task_tools:
+            raise ValueError("one frozen episode set must use one exact tool schema")
+        tools = task_tools
+        if image is not None:
+            image_pin = re.search(r"(?:^|@)sha256:([0-9a-f]{64})\Z", image)
+            if image_pin is None:
+                raise ValueError("episode runtime image requires an exact digest")
+            images.add(image_pin[1])
+        prompts.append({"problem_id": problem_id, "env": source, "set_id": set_id,
+            "interaction": interaction, "messages": [{"role": "user", "content": prompt}],
+            "source_index": index, **({"episode_task": public} if public is not None else {})})
+        grading.append({"problem_id": problem_id, "source": source, "split": split,
+            "prompt_sha256": prompt_sha256(prompt), **reference})
+    card = {"schema": SET_SCHEMA, "set_id": set_id, "env": source, "source": source,
+        "source_kind": interaction, "interaction": interaction, "split": split, "count": count,
+        "seed": seed, "created_at": time.time(), "source_length": length,
+        "default_max_new_tokens": 4096,
+        "environment_manifest_sha256": manifest, "disjointness": {"disjoint": None},
+        "episode": {"renderer_id": renderer_id, "renderer_sha256": renderer_sha,
+            "tools_sha256": digest(tools), "runtime_image_sha256": next(iter(images)) if len(images) == 1 else None},
+        **extra}
+    return _write_set(_empty_directory(out), prompts, grading, card, protocol=protocol)
 
 
 __all__ = [
@@ -568,6 +671,7 @@ __all__ = [
     "UsedRange",
     "build_set",
     "build_source_set",
+    "build_episode_set",
     "range_overlaps",
     "select_indices",
     "open_source",
