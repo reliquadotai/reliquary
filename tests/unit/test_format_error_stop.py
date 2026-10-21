@@ -36,14 +36,15 @@ def test_the_miner_maps_a_format_error_for_a_lease_only():
     assert episode_stop(STOP_FORMAT_ERROR, lease=False, **kwargs) is None
 
 
-def test_the_lease_checker_scores_a_format_error_episode_0_and_keeps_the_lease(monkeypatch):
+def _checker(monkeypatch, exhausted=()):
     from reliquary.validator import episode_admission
     from reliquary.validator.rl_episode import LeaseEpisodeChecker
 
     def verified(policy, transcript, expected, **kwargs):
         index = int(expected.engagement.rsplit(":", 1)[1])
-        return SimpleNamespace(claims=SimpleNamespace(session_id=f"s{index}"), final=SimpleNamespace(reward=1.0),
-                               calls=(), open=None)
+        status = "budget_exhausted" if index in exhausted else "graded"
+        return SimpleNamespace(claims=SimpleNamespace(session_id=f"s{index}"),
+                               final=SimpleNamespace(reward=1.0, status=status), calls=(), open=None)
 
     monkeypatch.setattr(episode_admission, "verified_transcript", verified)
     monkeypatch.setattr(episode_admission, "episode_shape_refusal", lambda *a, **k: None)
@@ -53,12 +54,33 @@ def test_the_lease_checker_scores_a_format_error_episode_0_and_keeps_the_lease(m
     checker = LeaseEpisodeChecker(policy=policy, renderer=renderer, source=SimpleNamespace(prompt=lambda i: "p"),
                                   directory=lambda now: object(), token_verifier=None)
     lease = SimpleNamespace(nonce="ab" * 32, lease_id="L1", prompt_idx=0, hotkey="h", checkpoint=1)
-    rollouts = [SimpleNamespace(force_span=None, tokens=[TEXT, TERM], spans=((0, 2),),
-                                episode={"transcript": {}, "stop": STOP_FORMAT_ERROR if i in (3, 9) else "agent_completed"})
-                for i in range(16)]
-    graded = checker.grade(lease, rollouts, received=0.0)
+    return checker, lease
+
+
+def _rollouts(stops):
+    return [SimpleNamespace(force_span=None, tokens=[TEXT, TERM], spans=((0, 2),),
+                            episode={"transcript": {}, "stop": stops.get(i, "agent_completed")}) for i in range(16)]
+
+
+def test_the_lease_checker_scores_a_format_error_episode_0_and_keeps_the_lease(monkeypatch):
+    checker, lease = _checker(monkeypatch)
+    graded = checker.grade(lease, _rollouts({3: STOP_FORMAT_ERROR, 9: STOP_FORMAT_ERROR}), received=0.0)
     assert getattr(graded, "reject", None) is None
     assert [graded.rewards[i] for i in range(16)] == [0.0 if i in (3, 9) else 1.0 for i in range(16)]
+
+
+def test_a_format_error_and_a_budget_close_in_one_lease_both_score_0(monkeypatch):
+    checker, lease = _checker(monkeypatch, exhausted=(5,))
+    graded = checker.grade(lease, _rollouts({3: STOP_FORMAT_ERROR, 5: "episode_closed"}), received=0.0)
+    assert getattr(graded, "reject", None) is None
+    assert [graded.rewards[i] for i in range(16)] == [0.0 if i in (3, 5) else 1.0 for i in range(16)]
+    assert [i for i, cut in enumerate(graded.truncated) if cut] == [5]       # only the budget close counts as cut
+
+
+def test_a_budget_close_must_be_what_the_episode_says_it_stopped_on(monkeypatch):
+    checker, lease = _checker(monkeypatch, exhausted=(5,))
+    graded = checker.grade(lease, _rollouts({5: STOP_FORMAT_ERROR}), received=0.0)
+    assert graded.reject == "episode_transcript"
 
 
 # -- end to end: the miner's loop against the real gateway, the validator's shared checks -----------------------
