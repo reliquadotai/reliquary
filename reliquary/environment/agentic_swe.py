@@ -18,19 +18,24 @@ import threading
 from collections.abc import Sequence
 
 from reliquary_harness import qwen as _harness_qwen
-from reliquary_harness.spec import BASH_SURFACE_V1, MINI_SWE_V1, VERIFIERS_COMMIT, get_spec
+from reliquary_harness.spec import (
+    BASH_SURFACE_V1, CLAUDE_CODE_V1, CODEX_V1, MINI_SWE_V1, OPENHANDS_XML_V1, VERIFIERS_COMMIT, get_spec,
+)
 from reliquary_harness.spec import BASH_VF_B2E4E81 as HARNESS
 from reliquary_harness.variant import variant_count, variant_index
 
 from reliquary.environment.agentic.types import EpisodeTask
 
-HARNESS_DIGEST = "d58014498cfedd1662df1c47ba1862f7d2ced81cf7db189e3b8083bb18018382"
+HARNESS_DIGEST = "14651439bf25cc307d9042a5164f9ba04aebceb07fea22c4b16c11f21c10a601"
 """The bash harness this build renders, checks and mines with (`HARNESS.digest`): an
 installed reliquary-harness with another digest is not this build's harness."""
 HARNESS_DIGESTS = {
     HARNESS.key: HARNESS_DIGEST,
-    BASH_SURFACE_V1.key: "a48a59f9c5e13b61e8fd8f59fca15a9cc3ea929627dd841bb353fec599b8ddf4",
-    MINI_SWE_V1.key: "acfe09704fd8eb67ac7db8a38326f013faba54cc0af24ee71debd4dd8f226816",
+    BASH_SURFACE_V1.key: "bb81bb9d68b797baadbe320c93a2493e2080f0eeef6395d44e658892b09a457c",
+    MINI_SWE_V1.key: "4d4065b3fad68f365c6705dfac080b5300f4d9992f318d69ccc4d46a3f1b7cea",
+    OPENHANDS_XML_V1.key: "89409c27271b1ddf857146b66a80844091babded668267c883ad05cf087421ab",
+    CLAUDE_CODE_V1.key: "e9bc695e9eaf03a670d3568fb36b5faeb62ea50ace13b10048ff3377e469788c",
+    CODEX_V1.key: "9dd244185f2cd3e1c5ba7ea97f6c9f22f84cd9d2d42458c04df123c80a39a138",
 }
 """Every harness spec this build serves, by `id@version`, at the digest it was built against.
 A job or an RL episode env names one with `{id, version, digest}`; one naming none is
