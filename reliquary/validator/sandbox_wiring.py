@@ -10,6 +10,9 @@ Settings:
 * `RELIQUARY_SANDBOX_VALIDATOR_KEY_ID`: its key id;
 * `RELIQUARY_SANDBOX_VALIDATOR_RETIRED_KEYS`: JSON `{key_id: base64 public key}` of
   earlier keys whose tokens may still be in flight after a rotation;
+* `RELIQUARY_SANDBOX_MACHINE_IDS`: optional JSON array of machine names to poll and
+  place new sessions on. Unset uses every machine; an empty array or any unknown
+  name closes placement and polling. Historical signatures still use the full directory;
 * `RELIQUARY_SANDBOX_DIRECTORY_REFRESH_S` (30), `RELIQUARY_SANDBOX_DIRECTORY_MAX_AGE_S`
   (120), `RELIQUARY_SANDBOX_DIRECTORY_READ_TIMEOUT_S` (15): the machine directory's
   re-read period, the age past which the fleet fails closed, and each read's bound
@@ -43,6 +46,7 @@ from pathlib import Path
 from typing import Any
 
 from reliquary.eval.rows import job_row_map
+from reliquary.infrastructure.sandbox_store import validated_machine_id
 from reliquary.sandbox.fleet import (
     DIRECTORY_MAX_AGE_SECONDS, DIRECTORY_READ_TIMEOUT_SECONDS, DIRECTORY_REFRESH_SECONDS,
 )
@@ -99,6 +103,19 @@ def _count(environ: Mapping[str, str], name: str) -> int:
     return value
 
 
+def _machine_ids(environ: Mapping[str, str]) -> frozenset[str] | None:
+    name = "RELIQUARY_SANDBOX_MACHINE_IDS"
+    if name not in environ:
+        return None
+    ids = json.loads(environ[name])
+    if not isinstance(ids, list):
+        raise ValueError(f"{name} must be a JSON array of machine names")
+    result = frozenset(validated_machine_id(m) for m in ids)
+    if len(result) != len(ids):
+        raise ValueError(f"{name} must not repeat a machine name")
+    return result
+
+
 @dataclass(frozen=True)
 class SandboxValidatorConfig:
     key_file: Path
@@ -119,6 +136,7 @@ class SandboxValidatorConfig:
     quota: bool = True
     quota_max_live_per_hotkey: int = 0
     quota_max_live_per_hotkey_job: int = 0
+    machine_ids: frozenset[str] | None = None
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] = os.environ) -> SandboxValidatorConfig | None:
@@ -151,7 +169,8 @@ class SandboxValidatorConfig:
             validator_hotkey=(environ.get("RELIQUARY_SANDBOX_VALIDATOR_HOTKEY") or "").strip() or None,
             quota=_flag(environ, "RELIQUARY_SANDBOX_CORPUS_QUOTA", True),
             quota_max_live_per_hotkey=_count(environ, "RELIQUARY_SANDBOX_QUOTA_MAX_LIVE_PER_HOTKEY"),
-            quota_max_live_per_hotkey_job=_count(environ, "RELIQUARY_SANDBOX_QUOTA_MAX_LIVE_PER_HOTKEY_JOB"))
+            quota_max_live_per_hotkey_job=_count(environ, "RELIQUARY_SANDBOX_QUOTA_MAX_LIVE_PER_HOTKEY_JOB"),
+            machine_ids=_machine_ids(environ))
 
 
 @dataclass
@@ -255,7 +274,8 @@ def build_sandbox_services(config: SandboxValidatorConfig, *, validator_hotkey: 
                   record_heartbeat=record if read_documents is None else None,
                   directory_refresh_s=config.directory_refresh_s,
                   directory_max_age_s=config.directory_max_age_s,
-                  directory_read_timeout_s=config.directory_read_timeout_s)
+                  directory_read_timeout_s=config.directory_read_timeout_s,
+                  machine_ids=config.machine_ids)
     book = SessionBook(policy)
     jobs: dict[str, SignedJobView] = {}
     services: SandboxServices | None = None

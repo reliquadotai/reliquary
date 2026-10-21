@@ -191,7 +191,7 @@ class ImageSource:
 class World:
     """The async validator (lease book, submissions, the sandbox side over a fake machine) and its ASGI app."""
 
-    def __init__(self, tmp_path, monkeypatch):
+    def __init__(self, tmp_path, monkeypatch, *, machine_ids=None):
         attest = pytest.importorskip("reliquary_sandbox.attest")
         from reliquary.environment.signed_episode import SignedEpisodeEnvironment
         from reliquary.infrastructure.sandbox_store import MemorySessionStore
@@ -212,15 +212,18 @@ class World:
                                  prompt_range={ENV: (0, 50), EPISODE: (0, 1000)}, collector_interval_s=0.0)
         self.rl.book.adopt_checkpoint(0)
         machine = self.machine
+        self.fetched = []
 
         async def read_documents():
             return [machine_document(machine, capacity=32)]
 
         async def fetch_report(address):
+            self.fetched.append(address)
             return capacity_report(machine, at=int(time.time()), capacity=32, free=32, images=(IMAGE,),
                                    env_packages={SANDBOX_ENV: ENV_PACKAGE})
 
-        config = SandboxValidatorConfig(key_file=Path("unused"), key_id=self.validator.key_id, retired_keys={})
+        config = SandboxValidatorConfig(key_file=Path("unused"), key_id=self.validator.key_id, retired_keys={},
+                                        machine_ids=machine_ids)
         self.store = MemorySessionStore()
         wire_episode_sandbox(self.rl, config, validator_hotkey=VALIDATOR.ss58_address,
                              environments={EPISODE: SignedEpisodeEnvironment(EPISODE, ImageSource(image=IMAGE))},
@@ -236,6 +239,16 @@ class World:
 
     def client(self):
         return httpx.AsyncClient(transport=httpx.ASGITransport(app=self.server.app), base_url="http://validator")
+
+
+@pytest.mark.parametrize("scope,capacity", [(None, 32), ({"machine-1"}, 32), (set(), 0), ({"unknown"}, 0)])
+async def test_machine_scope_reaches_async_lease_polling_and_capacity(tmp_path, monkeypatch, scope, capacity):
+    world = World(tmp_path, monkeypatch, machine_ids=scope)
+    await world.start()
+    fleet = world.rl.sandbox.fleet
+    assert fleet.session_capacity() == capacity
+    assert len(world.fetched) == (1 if capacity else 0)
+    assert fleet.directory_if_ready().public_key("machine-1", world.machine.key_id, int(time.time())) is not None
 
 
 def sign(binding: bytes) -> str:

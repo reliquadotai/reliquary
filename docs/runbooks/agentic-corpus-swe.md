@@ -139,7 +139,13 @@ Rolling back is the reverse: retire the signed job first, then unset the key set
    - each read is bounded by `RELIQUARY_SANDBOX_DIRECTORY_READ_TIMEOUT_S` (15 s);
    - past `RELIQUARY_SANDBOX_DIRECTORY_MAX_AGE_S` (120 s) without a good read, the
      validator fails closed: no session is placed, no signed transcript is admitted,
-     and miners get retryable refusals.
+     and miners get retryable refusals;
+   - optionally set `RELIQUARY_SANDBOX_MACHINE_IDS` to a JSON array of machine names
+     to restrict polling, heartbeat-summary writes, new placement and admission capacity.
+     Unset keeps the whole fleet. `[]` disables new placement and polling; any unknown
+     name does the same until every configured machine is in the directory. Malformed
+     arrays refuse startup. Existing sessions and signed receipts still verify against
+     the full directory, including machines outside this scope.
 6. Closes:
    - a close's body has `RELIQUARY_SANDBOX_CLOSE_BODY_TIMEOUT_S` (30 s) to arrive, else
      `408 body_timeout`;
@@ -195,6 +201,7 @@ capacity.
 | `RELIQUARY_SANDBOX_DIRECTORY_REFRESH_S` | 30 | the machine directory's re-read period |
 | `RELIQUARY_SANDBOX_DIRECTORY_MAX_AGE_S` | 120 | the directory age past which the validator fails closed |
 | `RELIQUARY_SANDBOX_DIRECTORY_READ_TIMEOUT_S` | 15 | each directory read |
+| `RELIQUARY_SANDBOX_MACHINE_IDS` | unset | optional JSON array of machines to poll and place new sessions on; historical verification keeps all keys |
 | `RELIQUARY_SANDBOX_CLOSE_PREAUTH_CONCURRENCY` | 8 | closes read and authenticated at once; one more gets `503 close_busy` at once, before its body is read |
 | `RELIQUARY_SANDBOX_CLOSE_CONCURRENCY` | 4 | authenticated closes whose transcript is verified at once (a wait past the io timeout gets `503 close_busy`) |
 | `RELIQUARY_SANDBOX_CLOSE_BODY_TIMEOUT_S` | 30 | the time a close's body has to arrive, else `408 body_timeout` |
