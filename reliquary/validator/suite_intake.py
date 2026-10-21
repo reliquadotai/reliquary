@@ -95,6 +95,18 @@ def _exit_with_parent(parent: int, every: float = PARENT_WATCH_SECONDS) -> threa
     return thread
 
 
+def address_space_limit(memory_bytes: int) -> int:
+    """The worker's RLIMIT_AS: what it has mapped already plus ``memory_bytes``. Its imports are mapped before the
+    initializer runs (spawn unpickles it from this module), and numpy's BLAS reserves buffers per core: 2.6 GB of
+    address space on a 128-core host, so an absolute bound under that fails every later mapping."""
+    try:
+        with open("/proc/self/status") as status:
+            mapped = next(int(line.split()[1]) * 1024 for line in status if line.startswith("VmSize:"))
+    except (OSError, StopIteration, ValueError):
+        mapped = 0
+    return mapped + int(memory_bytes)
+
+
 def initialize_suite_replay_worker(tokenizer_json: str,
                                    memory_bytes: int = SUITE_REPLAY_WORKER_MEMORY_BYTES) -> None:
     """CPU-only, below the control plane and memory-bounded, as
@@ -111,8 +123,9 @@ def initialize_suite_replay_worker(tokenizer_json: str,
     if memory_bytes > 0:
         import resource
 
+        limit = address_space_limit(memory_bytes)
         try:
-            resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
+            resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
         except (OSError, ValueError):
             logger.warning("suite replay worker: RLIMIT_AS not set", exc_info=True)
     from tokenizers import Tokenizer

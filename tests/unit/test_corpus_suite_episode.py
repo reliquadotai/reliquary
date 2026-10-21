@@ -1165,3 +1165,31 @@ def test_replay_workers_exit_when_the_validator_is_killed():
     pids = [int(pid) for pid in done.stdout.split()]
     assert len(pids) == 1, done.stderr[-2000:]
     assert all(_gone(pid) for pid in pids)
+
+
+_MAPPED_SCRIPT = """
+import resource, sys
+import numpy  # noqa: F401  (a BLAS reserving per-core buffers maps them here, before any limit)
+from reliquary.validator import suite_intake
+mapped = suite_intake.address_space_limit(0)
+suite_intake.initialize_suite_replay_worker(sys.argv[1], memory_bytes=64 << 20)
+limit = resource.getrlimit(resource.RLIMIT_AS)[0]
+print(mapped, limit)
+"""
+
+
+def test_a_replay_workers_memory_bound_counts_from_what_it_has_mapped():
+    # An absolute RLIMIT_AS under what the worker's imports already map (numpy's BLAS: 2.6 GB on a 128-core host)
+    # failed every later mapping, the tokenizer's first: the pool never started.
+    import subprocess
+    import sys
+
+    from reliquary.validator.suite_intake import address_space_limit
+
+    assert address_space_limit(1 << 20) > 1 << 20
+    root = Path(__file__).resolve().parents[2]
+    done = subprocess.run([sys.executable, "-c", _MAPPED_SCRIPT, _word_tokenizer_json()],
+                          cwd=root, capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr[-2000:]
+    mapped, limit = (int(v) for v in done.stdout.split())
+    assert mapped > 0 and limit >= mapped + (64 << 20)
