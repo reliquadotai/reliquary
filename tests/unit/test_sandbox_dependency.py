@@ -48,6 +48,16 @@ def test_another_sandbox_commit_is_refused(monkeypatch):
     assert "job pins" in sandbox.sandbox_commit_refusal("1" * 40)
 
 
+@pytest.mark.parametrize("historical_pin", [
+    "be50c76824aaccd6506d8f50a84941b4cd548f6f",
+    "fc2fa643e8b80ce51fec6c6acf162a306e803684",
+])
+def test_historical_job_pins_are_not_served_as_the_new_build(monkeypatch, historical_pin):
+    monkeypatch.setattr(sandbox, "_installed_commit", lambda: sandbox.SANDBOX_COMMIT)
+    refusal = sandbox.sandbox_commit_refusal(historical_pin)
+    assert historical_pin in refusal and "job pins" in refusal
+
+
 def test_a_machine_advertising_a_transcript_cap_over_the_wire_cap_is_refused():
     """A machine whose signed transcripts may exceed the submission body's transcript
     cap would sign honest episodes no miner can submit: it is not placed."""
