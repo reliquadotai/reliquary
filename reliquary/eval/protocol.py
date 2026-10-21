@@ -282,4 +282,6 @@ def validate_request(document: dict, *, bindings: dict | None = None) -> str | N
         raise ValueError("unsupported evaluation interaction or harness")
     if type(body.get("max_new_tokens")) is not int or not 1 <= body["max_new_tokens"] < body["max_episode_tokens"]:
         raise ValueError("a model turn must leave room for its frozen transcript")
+    if body["harness"] == "telecom-episode-v1" and body["thinking"] is not True:
+        raise ValueError("the telecom harness requires its thinking renderer")
     return sha

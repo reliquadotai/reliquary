@@ -50,6 +50,14 @@ def test_request_hash_uses_exact_producer_json_not_python_number_spelling():
         ep.validate_request(envelope(body, raw.replace('1e0', 'NaN')))
 
 
+def test_telecom_request_cannot_disable_its_fixed_thinking_renderer():
+    body = {**request_protocol(), "harness": "telecom-episode-v1", "interaction": "episode", "max_turns": 40}
+    with pytest.raises(ValueError, match="thinking renderer"):
+        ep.validate_request(envelope(body))
+    assert ep.validate_request(envelope({**body, "thinking": True}))
+    assert ep.validate_request(envelope(request_protocol()))
+
+
 def test_set_seals_actual_files_and_reviewed_rights_once(tmp_path):
     reviewed = {"data": {"dataset.json": "1" * 64}, "licenses": [{"id": "MIT", "sha256": "2" * 64}],
                 "disjointness": {"disjoint": True, "evidence_sha256": "3" * 64}}

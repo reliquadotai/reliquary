@@ -149,6 +149,8 @@ Episode software uses the same runner: `telecom-episode-v1` replays the frozen
 deterministic tools, and `signed-bash-v1` requires the pinned signed sandbox,
 exact renderer, issued session and accepted worker lease. The declared SWE and
 TMax policy is at most 40 turns; it is provisional, not measured capacity.
+The current telecom renderer requires `thinking=true`; requests that disable it
+are refused. Single-turn and signed renderers keep their explicit thinking toggle.
 TMax splits are training corpus parts and acquire no held-out claim by default.
 Public `--publish-reviewed` publication requires explicit source/rights/overlap
 evidence and emits a `withdrawn` registration template for separate qualification.
