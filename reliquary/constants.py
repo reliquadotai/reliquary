@@ -14,6 +14,10 @@ from reliquary.environment.grader import (
     GRADER_SOCKET_PATH as GRADER_SOCKET_PATH,
 )
 from reliquary.shared.task_id import parse_task_ids
+from reliquary.shared import (
+    SERVICE_OBSERVATION_FLUSH_SECONDS as SERVICE_OBSERVATION_FLUSH_SECONDS,
+    SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS as SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS,
+)
 
 # ────────────────  GRAIL PROOF VERSION  ────────────────
 
@@ -370,9 +374,10 @@ if not _math.isfinite(SHAPE_LEN_FRAC) or not 0.0 < SHAPE_LEN_FRAC <= 1.0:
 # a linear penalty reaching −factor at the cap, correct or not. 0 disables.
 # 0.5 matches DAPO's penalty-to-correctness ratio: they use 1.0 on the 2-wide
 # {−1,+1} reward scale, ours is [0,1].
+# Protocol 10 (async RL): 0.1, a mild zone near the cap on top of the failure reward a truncated rollout gets.
 OVERLONG_PENALTY_FACTOR = float(_os.environ.get(
     "RELIQUARY_OVERLONG_PENALTY_FACTOR",
-    "0.5" if PROTOCOL_VERSION >= 3 else "0",
+    "0.1" if PROTOCOL_VERSION >= 10 else "0.5" if PROTOCOL_VERSION >= 3 else "0",
 ))
 if (
     not _math.isfinite(OVERLONG_PENALTY_FACTOR)
@@ -748,7 +753,10 @@ DEFAULT_HF_REPO_ID = "aivolutionedge/reliquary-sn"
 # softens the manufactured-variance surface — deliberate, see the v4 cutover
 # plan; the auction value σ-weighting and forced-seed / distribution layers are
 # the remaining defense. v3 keeps 0.43/0.33 so live economics are byte-identical.
-SIGMA_MIN = 0.24 if PROTOCOL_VERSION >= 4 else 0.43
+# The async RL lifecycle (rl-async-design.md §4.4) is a 16-rollout protocol: it uses the v4 gate whatever the
+# active profile.
+SIGMA_MIN_V4 = 0.24
+SIGMA_MIN = SIGMA_MIN_V4 if PROTOCOL_VERSION >= 4 else 0.43
 BOOTSTRAP_SIGMA_MIN = 0.22 if PROTOCOL_VERSION >= 4 else 0.33
 
 # Number of rollouts per submission (= size of each GRPO group).
@@ -794,6 +802,10 @@ def _require_environment_corpora() -> None:
             spec = get_environment_spec(name)
         except (KeyError, ValueError):
             continue  # unknown names are the environment list's business
+        if spec.interaction_mode == "episode" and int(ACTIVE_PROTOCOL_PROFILE.protocol_version) >= 10:
+            # A replayed env of an async profile is loaded at startup by the processes that serve it (the
+            # validator's checkers, a miner mining it), and only by them: the others never need its corpus.
+            continue
         variable = spec.required_data_env_var
         if variable and not _os.environ.get(variable):
             raise ValueError(
@@ -888,8 +900,6 @@ _FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV = FILL_CLOSED_TARGET_GROUPS_PER_ENV
 SERVICE_EXPLORATION_AUDIT_BUDGET_PER_ENV = int(_os.environ.get(
     "RELIQUARY_SERVICE_EXPLORATION_AUDIT_BUDGET_PER_ENV", str(FILL_CLOSED_TARGET_GROUPS_PER_ENV)))
 SERVICE_EXPLORATION_AUDIT_PRIORITY = 5
-SERVICE_OBSERVATION_FLUSH_SECONDS = 60
-SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS = 50_000
 # A hotkey still in exploration probation may hold at most this many reserved rows whose audit has not
 # passed, per (window, env): it cannot squat the whole per-env cap with fake groups before its first audit.
 PROBATION_PENDING_LIMIT = 4
@@ -1104,6 +1114,21 @@ T_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.temperature
 TOP_P_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.top_p
 TOP_K_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.top_k
 DO_SAMPLE_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.do_sample
+# Which public pick every forced token must be ("inverse_cdf" or "gumbel_max"), and
+# whether the LM head's logits are fp32 on the miner's engine and the validator's
+# proof forward. Both from the profile; see reliquary.environment.forced_sampling.
+FORCED_DRAW = ACTIVE_PROTOCOL_PROFILE.sampling.draw
+LM_HEAD_FP32 = ACTIVE_PROTOCOL_PROFILE.sampling.lm_head_fp32
+# The token the policy term scores (docs/rl-async-design.md 4.7). "current": the miner's
+# token. "substitution": v*, the forced pick recomputed from the trainer's own logits with
+# the rollout's public uniforms, equal to the miner's token wherever they agree. On by
+# default under the Gumbel draw only; RELIQUARY_TRAINING_LOSS is the guard.
+TRAINING_LOSSES = ("current", "substitution")
+TRAINING_LOSS = _os.environ.get("RELIQUARY_TRAINING_LOSS", "").strip().lower() or (
+    "substitution" if FORCED_DRAW == "gumbel_max" else "current"
+)
+if TRAINING_LOSS not in TRAINING_LOSSES:
+    raise ValueError(f"RELIQUARY_TRAINING_LOSS must be one of {TRAINING_LOSSES}, got {TRAINING_LOSS!r}")
 
 # Do not add miner-only logits processors here. A presence/repetition penalty
 # changes the sampling policy; unless the validator also recomputes and verifies
@@ -1593,8 +1618,9 @@ EMISSION_PRICE_ARMED = _os.environ.get(
 # showed 5e-7 produced a sketch delta of ~600 (≈10 % of the 6000 sketch
 # tolerance) over 50 training steps — effectively indistinguishable from the
 # base model, which also means stale-model cheaters pass GRAIL. Matched
-# DAPO / R1-Zero-scale literature (1e-6 to 5e-6) by bumping to 5e-6.
-_PROFILE_LEARNING_RATE = "1e-6" if PROTOCOL_VERSION >= 3 else "5e-6"
+# DAPO / R1-Zero-scale literature (1e-6 to 5e-6) by bumping to 5e-6. The 9B async launch (protocol 10) runs 2e-6
+# (decision N, user 2026-10-17): 5e-6 learns faster but widens the honest drift of lagged miners.
+_PROFILE_LEARNING_RATE = "2e-6" if PROTOCOL_VERSION >= 10 else "1e-6" if PROTOCOL_VERSION >= 3 else "5e-6"
 LEARNING_RATE = float(
     _os.environ.get("RELIQUARY_LEARNING_RATE", _PROFILE_LEARNING_RATE)
 )
@@ -1813,7 +1839,14 @@ MICROBATCH_MAX_PADDED_TOKENS = 32768
 # After it the schedule is FLAT, per DAPO §4.1 (AdamW, constant LR + linear
 # warmup). The 10k-window cosine that used to follow reached factor 0.49 in
 # 5.5 days at the live cadence — a run decaying to a halt nobody had chosen.
-LR_WARMUP_WINDOWS = 10
+# Protocol 10 (async, one step per checkpoint on ~8k rollouts): 8 steps (decision N).
+LR_WARMUP_WINDOWS = int(_os.environ.get("RELIQUARY_LR_WARMUP_STEPS", "8" if PROTOCOL_VERSION >= 10 else "10"))
+if LR_WARMUP_WINDOWS < 1:
+    raise ValueError("RELIQUARY_LR_WARMUP_STEPS must be at least 1")
+# AdamW's second-moment decay (every optimizer the trainer builds). A run of a few hundred steps may want 0.99.
+ADAM_BETA2 = float(_os.environ.get("RELIQUARY_ADAM_BETA2", "0.999"))
+if not _math.isfinite(ADAM_BETA2) or not 0.0 < ADAM_BETA2 < 1.0:
+    raise ValueError("RELIQUARY_ADAM_BETA2 must be in (0, 1)")
 
 # Short LR re-ramp applied after a process restart WITHIN the same training
 # run: the schedule position is reconstructed from the published checkpoint
@@ -1973,6 +2006,44 @@ FORCED_SEED_ROLLOUT_MIN_STOCH = 20
 # exact gate ships in telemetry mode until live incremental-vs-teacher-forced
 # distance data establishes a consensus-safe epsilon.
 FORCED_SEED_CDF_BOUNDARY_EPSILON = 0.002
+# The same tolerance for the gumbel_max draw, in its miss units: the relative score
+# shortfall 1 - exp(-(s_win - s_token)) of logit + G (forced_sampling). A candidate
+# for the same telemetry-first rollout as the CDF one; FORCED_SEED_CDF_ENFORCE arms both.
+FORCED_SEED_GUMBEL_BOUNDARY_EPSILON = 0.05
+# Async RL (rl-async-design.md §4.4, §4.6): the per-rollout match floor on stochastic positions under the Gumbel
+# draw, against the latest checkpoint. One value for the trainer's verification, the audit and the pay ledger.
+# 0.90: trainer-vs-vLLM bf16 noise leaves a few honest rollouts just under 0.95 even at lag 0, and the gap tests
+# already judge each mismatch. PLACEHOLDER, to confirm on the 9B.
+RL_ROLLOUT_MATCH_FLOOR = 0.90
+# The pooled match floor a group must reach (trainer and audit alike), on 16 rollouts (honest pool 0.986).
+# PLACEHOLDER, as above.
+RL_GROUP_MATCH_FLOOR = 0.90
+# An audited rollout that follows the draw (match >= the floor) yet carries more than this many hard mismatches at
+# near-deterministic positions (max p >= FORCED_SEED_STOCHASTIC_MAXPROB, Gumbel shortfall beyond the boundary
+# epsilon) was edited after the draw: deterministic forgery. PLACEHOLDER: calibrate on honest lag-2 rollouts.
+RL_AUDIT_FORGERY_MISMATCH_TOLERANCE = 1
+# That allowance is per this many near-deterministic positions of the rollout (rounded up, at least one block):
+# bf16 noise leaves a rare honest hard mismatch, so a long rollout gets proportionally more. PLACEHOLDER.
+RL_AUDIT_FORGERY_MISMATCH_POSITIONS = 4096
+# An audit runs against the latest checkpoint; one queued longer than this many checkpoints after its lease's is
+# dropped unjudged (inconclusive: unpaid, no probation effect) instead of judged on drifted weights. PLACEHOLDER.
+RL_AUDIT_MAX_LAG = 4
+# A rollout whose match falls this far under the rollout floor is no honest noise (honest single rollouts bottom
+# around 0.8): its whole group is rejected (trainer) or fails (audit) as statistical evidence, so a forged rollout
+# (e.g. one [EOS] that moves a 16/16 group into the zone) cannot ride on 15 honest ones. PLACEHOLDER.
+RL_FORGERY_MATCH_FLOOR = 0.5
+# Gumbel gap of a mismatched token: the best score minus the miner's token's score (s = logit + G). Honest gaps grow
+# with the trainer's drift. A rollout with a gap over the tolerance is not trained nor paid; a mismatch over the
+# substitute gap is re-graded with the trainer's pick (the reward must not change).
+# PLACEHOLDERS: calibrate on the logged gaps of a real run.
+RL_GAP_TOLERANCE = 8.0
+RL_SUBSTITUTE_GAP = 3.0
+# A rollout that ends on EOS: the final EOS needs a gap of at most RL_TERMINAL_GAP. No probability floor: an honest
+# draw ends on an unlikely EOS too. PLACEHOLDER, as above.
+RL_TERMINAL_GAP = 1.0
+# The model tokens (16 x 64) an out-of-zone group needs for its first-scan pay: a group of near-empty rollouts
+# verifies nothing and earns nothing. PLACEHOLDER.
+RL_FIRST_SCAN_MIN_TOKENS = 1024
 FORCED_SEED_CDF_ENFORCE = _os.environ.get(
     "FORCED_SEED_CDF_ENFORCE", "false"
 ).strip().lower() in ("1", "true", "yes", "on")

@@ -43,17 +43,17 @@ __all__ = ["AGENTIC_BODIES", "AGENTIC_SWE_BODY", "AGENTIC_SWE_CONTRACT_ID", "sui
            "AGENTIC_SWE_ENVIRONMENT", "AGENTIC_SWE_MANIFEST", "AGENTIC_SWE_MANIFEST_SHA256"]
 
 
-def suite_episode_body(name: str, episode) -> EnvironmentProfile:
+def suite_episode_body(name: str, episode, eval_job: bool = False) -> EnvironmentProfile:
     """The contract body of a suite episode environment no profile declares
     (design 2026-10-13): what the registry spec pins (contract, manifest,
     renderer) and the job's own episode bounds. ``episode`` is the manifest's
     raw ``episode`` object; one that does not parse is refused here as it
-    would be by ``parse_job``."""
+    would be by ``parse_job``; ``eval_job`` says the job plays an eval set (any split)."""
     from reliquary.corpus.job import _parse_episode
     from reliquary.environment.registry import ENVIRONMENT_SPECS
     from reliquary.protocol.profiles import EpisodeProfile
 
-    parsed = _parse_episode(episode)
+    parsed = _parse_episode(episode, eval_job)
     spec = ENVIRONMENT_SPECS.get(name)
     if spec is None or spec.interaction_mode != "episode":
         raise ValueError(f"{name!r} is not an episode environment of this binary's registry")

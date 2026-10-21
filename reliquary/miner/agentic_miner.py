@@ -4,6 +4,7 @@ finished episode (spec §5 N1, N2)."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import logging
 import time
@@ -461,7 +462,17 @@ async def serve_loopback(app, port: int):
     returns the uvicorn server and its serving task once it accepts requests."""
     import uvicorn
 
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    class _Server(uvicorn.Server):
+        # uvicorn takes SIGINT/SIGTERM for itself while it serves: the endpoint would stop and the miner hosting
+        # it would go on. The miner's own handling (the default: the process ends) is kept.
+        @contextlib.contextmanager
+        def capture_signals(self):
+            yield
+
+        def install_signal_handlers(self) -> None:      # uvicorn < 0.29
+            pass
+
+    server = _Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     serving = asyncio.create_task(server.serve())
     while not server.started:
         if serving.done():
@@ -475,10 +486,12 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
                             concurrency: int = 8, port: int = 8011,
                             gpu_memory_utilization: float | None = None,
                             max_num_seqs: int = 16, sessions=None,
-                            max_live_per_job: int = 64) -> dict[str, Counter]:
+                            max_live_per_job: int = 64, source=None) -> dict[str, Counter]:
     """The whole miner in one process: engine thread, loopback endpoint, episodes.
     A signed-sandbox job needs ``sessions`` (the validator's session client,
-    ``signed_episode.HttpSandboxSessions``) and each identity's ``sign_binding``."""
+    ``signed_episode.HttpSandboxSessions``) and each identity's ``sign_binding``.
+    ``source`` is the job's one source (``suite_support``'s, or the signed job's),
+    built here when not given: every runner and check of the process shares it."""
     import contextlib
 
     from reliquary.corpus.job import is_signed_sandbox
@@ -489,7 +502,8 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
         return await run_suite_miner(
             job=job, checkpoint_dir=checkpoint_dir, proof=proof, tokenizer=tokenizer,
             identities=identities, client=client, concurrency=concurrency,
-            gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs)
+            gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs,
+            source=source)
 
     signed = is_signed_sandbox(job)
     if signed:
@@ -501,14 +515,14 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
         refusal = agentic_episode.network_notice_refusal()
         if refusal:
             raise RuntimeError(f"refusing to mine: {refusal}")
-    from reliquary.environment.agentic_swe import load_turn_renderer
+    from reliquary.environment.agentic_swe import job_turn_renderer, load_turn_renderer
     from reliquary.miner.agentic_episode import SweEpisodeRunner
     from reliquary.miner.corpus_generate_server import (
         GenerateEngine, VllmTurnCore, build_generate_app,
     )
 
-    renderer = load_turn_renderer(checkpoint_dir, tools=job.episode.sandbox.tools if signed
-                                  else ("bash", "edit"))
+    renderer = (job_turn_renderer(job, checkpoint_dir) if signed
+                else load_turn_renderer(checkpoint_dir, tools=("bash", "edit")))
     stop_ids = sorted(renderer.stop_ids)
     core = VllmTurnCore(checkpoint_dir, sampling=job.sampling, proof=proof, stop_token_ids=stop_ids,
                         max_total_tokens=job.episode.max_total_tokens, max_num_seqs=max_num_seqs,
@@ -522,10 +536,13 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
             build_generate_app(engine, model_name=job.checkpoint_repo), port)
         async with contextlib.AsyncExitStack() as stack:
             if signed:
+                from reliquary.environment.agentic_swe import job_signed_source
                 from reliquary.miner.signed_episode import (
                     SignedSweEpisodeRunner, signed_trajectory_precheck,
                 )
 
+                if source is None:
+                    source = job_signed_source(job)
                 per_identity = {}
                 for identity in identities:
                     per_identity[identity.hotkey] = await stack.enter_async_context(
@@ -534,10 +551,8 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
                             sessions=sessions, model_name=job.checkpoint_repo,
                             renderer_model_dir=checkpoint_dir,
                             generate_url=f"http://127.0.0.1:{port}", sampling=job.sampling,
-                            harness_env=identity.harness_env, max_live=max_live_per_job))
-                from reliquary.corpus.job import sandbox_split
-                from reliquary.environment.agentic_swe import SignedSweSource
-
+                            harness_env=identity.harness_env, max_live=max_live_per_job,
+                            source=source))
                 return await mine_agentic(
                     job=job, identities=identities, client=client, engine=engine, runners={},
                     runner_for=lambda identity: per_identity[identity.hotkey],
@@ -546,8 +561,7 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
                     concurrency=concurrency,
                     precheck=signed_trajectory_precheck(
                         renderer, max_turns=job.episode.max_turns, job=job, tokenizer=tokenizer,
-                        source=SignedSweSource(sandbox_split(job.episode)),
-                        chunk_tokens=proof.chunk_tokens))
+                        source=source, chunk_tokens=proof.chunk_tokens))
             runners = {}
             for identity in identities:
                 key = harness_key(identity.harness_env)
@@ -571,7 +585,7 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
 
 async def run_suite_miner(*, job, checkpoint_dir: str, proof, tokenizer, identities, client,
                           concurrency: int = 8, gpu_memory_utilization: float | None = None,
-                          max_num_seqs: int = 16) -> dict[str, Counter]:
+                          max_num_seqs: int = 16, source=None) -> dict[str, Counter]:
     """A suite episode job: the engine thread and episodes in one process. No
     endpoint: the runner's policy calls the engine directly, and nothing but
     the pinned environment wheel runs between turns."""
@@ -591,7 +605,7 @@ async def run_suite_miner(*, job, checkpoint_dir: str, proof, tokenizer, identit
     engine.start()
     try:
         runner = SuiteEpisodeRunner(job=job, engine=engine, encode=encode, decode=decode,
-                                    chunk_tokens=proof.chunk_tokens)
+                                    chunk_tokens=proof.chunk_tokens, source=source)
         return await mine_agentic(
             job=job, identities=identities, client=client, engine=engine,
             runners={harness_key(identity.harness_env): runner for identity in identities},

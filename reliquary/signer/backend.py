@@ -44,6 +44,10 @@ class SignerBackend(Protocol):
 
     def sign_checkpoint(self, payload: bytes) -> bytes: ...
 
+    def sign_rl_index(self, payload: bytes) -> bytes: ...
+
+    def sign_rl_observation(self, payload: bytes) -> bytes: ...
+
     async def set_weights(
         self, *, netuid: int, uids: list[int], weights: list[float]
     ) -> ChainResult: ...
@@ -88,6 +92,14 @@ class BittensorSignerBackend:
                 "signer produced a checkpoint signature it cannot verify"
             )
         return signature
+
+    def sign_rl_index(self, payload: bytes) -> bytes:
+        """The service hands only a validated index's ``index_signing_payload``."""
+        return self.sign_checkpoint(payload)
+
+    def sign_rl_observation(self, payload: bytes) -> bytes:
+        """The service hands only a validated head's or page's ``document_signing_payload``."""
+        return self.sign_checkpoint(payload)
 
     async def _subtensor(self):
         subtensor = self._bt.AsyncSubtensor(network=self.network)

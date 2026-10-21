@@ -60,6 +60,7 @@ def test_episode_uses_existing_runner_upload_and_authoritative_grader(tmp_path, 
         uploaded = platform.objects[key]
         if tampered_accounting:
             row = json.loads(uploaded)
+            row["pregraded"] = [0.0, {"graded_success": False}]
             row["completion_tokens"] = 999999
             row["episode"].update(turns=999, tool_calls=999, transcript_tokens=999, stop_reason="invented")
             uploaded = (json.dumps(row) + "\n").encode()

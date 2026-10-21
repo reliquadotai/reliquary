@@ -78,6 +78,7 @@ jobs:
           from vllm.model_executor.models import ModelRegistry
           from transformers.models.auto.configuration_auto import CONFIG_MAPPING
           from reliquary.eval import runner, signed_agentic
+          from reliquary.environment.agentic_swe import harness_refusal
           from reliquary_sandbox import attest
 
           assert os.geteuid() == 10001
@@ -88,10 +89,12 @@ jobs:
           assert version("transformers") == "5.10.4"
           assert version("huggingface-hub") == "1.30.0"
           assert version("renderers") == "0.1.11"
+          assert harness_refusal() is None
           assert "Qwen3_5ForCausalLM" in ModelRegistry.get_supported_archs()
           assert "qwen3_5_text" in CONFIG_MAPPING
           for name, commit in {
               "reliquary-sandbox": "fc2fa643e8b80ce51fec6c6acf162a306e803684",
+              "reliquary-harness": "7d559fd16564ac16af52486fe6552084c685bca6",
               "verifiers": "b2e4e8157783b2c0dffc7821044c87f29f1c3ccf",
           }.items():
               direct = json.loads(distribution(name).read_text("direct_url.json"))

@@ -12,6 +12,7 @@ attest = pytest.importorskip("reliquary_sandbox.attest")
 
 from reliquary.corpus.job import parse_job  # noqa: E402
 from reliquary.environment.agentic_swe import SignedSweSource  # noqa: E402
+from reliquary.eval.rows import RowMap  # noqa: E402
 from reliquary.infrastructure.corpus_record_store import RECORD_SCHEMA_V2  # noqa: E402
 from reliquary.infrastructure.sandbox_store import MemorySessionStore  # noqa: E402
 from reliquary.validator.sandbox_wiring import (  # noqa: E402
@@ -23,7 +24,7 @@ from tests.unit.test_corpus_job_episode import _manifest  # noqa: E402
 from tests.unit.test_corpus_job_signed_sandbox import signed_episode  # noqa: E402
 
 JOB = parse_job(_manifest(prompt_count=3, episode=signed_episode()))
-SOURCE = SignedSweSource("train", prompt_of=lambda s, i: "p",
+SOURCE = SignedSweSource(RowMap.identity("train", 0, 100), prompt_of=lambda s, i: "p",
                          row_of=lambda s, i: (None, SimpleNamespace(instance_id=f"repo__{i}")))
 VALIDATOR = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"      # //Bob, ss58 format 42
 
@@ -306,7 +307,7 @@ def test_a_signed_grade_round_trips_through_the_export(tmp_path):
             return self.grades.get(sid)
 
     records = Exported({"sub-1": stored}, verdicts={"sub-1": {"passed": True}})
-    source = SignedSweSource("train", prompt_of=lambda s, i: "Fix task 0.",
+    source = SignedSweSource(RowMap.identity("train", 0, 100), prompt_of=lambda s, i: "Fix task 0.",
                              row_of=lambda s, i: (None, SimpleNamespace(instance_id=f"repo__{i}")))
     grader = SignedEpisodeGrader(job=JOB, records=records, source=source, clock=lambda: NOW + 60)
     assert asyncio.run(grader.grade_one("sub-1"))["status"] == "ok"

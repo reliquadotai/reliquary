@@ -55,10 +55,28 @@ class DistContext:
         return self.rank == 0
 
 
+def per_rank_triton_cache() -> str | None:
+    """Under torchrun, give each local rank a Triton cache of its own (``TRITON_CACHE_DIR`` + ``-rank<N>``, the
+    default ``~/.triton/cache`` otherwise): ranks compiling the same kernel into one cache race on its files.
+    Idempotent; call it before the first kernel compiles. Returns the directory set, None outside torchrun."""
+    rank = os.environ.get("LOCAL_RANK")
+    if rank is None or int(os.environ.get("LOCAL_WORLD_SIZE", os.environ.get("WORLD_SIZE", "1"))) <= 1:
+        return None
+    suffix = f"-rank{int(rank)}"
+    base = os.environ.get("TRITON_CACHE_DIR") or os.path.join(os.path.expanduser("~"), ".triton", "cache")
+    if not base.endswith(suffix):
+        os.environ["TRITON_CACHE_DIR"] = base + suffix
+    return os.environ["TRITON_CACHE_DIR"]
+
+
 def init_distributed(*, device_type: str = "cuda") -> DistContext:
     """Join torchrun's process group (or a one-process group without torchrun)."""
+    per_rank_triton_cache()
+    # Before the first CUDA allocation. The 9B on 4 x 80 GB sits at 70+ GB per rank; the default allocator
+    # thrashes there: 2.5x slower steps than expandable segments (A100, 2026-10-16).
     for key, default in (("MASTER_ADDR", "127.0.0.1"), ("MASTER_PORT", "29511"),
-                         ("RANK", "0"), ("WORLD_SIZE", "1"), ("LOCAL_RANK", "0")):
+                         ("RANK", "0"), ("WORLD_SIZE", "1"), ("LOCAL_RANK", "0"),
+                         ("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")):
         os.environ.setdefault(key, default)
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -87,19 +105,26 @@ class FusedLogprobHead(torch.nn.Linear):
     chunk recomputes issued during backward, so those chunks would read the
     sharded weight and their gradients would never be reduced. One call per
     micro-batch gathers the weight once for forward, once for backward, and
-    reduces once. ``head(hidden)`` stays a plain projection.
+    reduces once. ``head(hidden)`` stays a plain projection. ``head(rows, audit=fn)`` hands ``fn`` the draw's
+    projection over the gathered weight (``trainer.audits``: an out-of-zone audit's diagnostics, no gradient).
     """
 
     fused_selected_logprobs = True
 
-    def forward(self, hidden, targets=None):
+    def forward(self, hidden, targets=None, draws=None, audit=None, *, chunk=None):
+        if audit is not None:
+            from reliquary.trainer.audits import head_projection
+
+            return audit(head_projection(self.weight, self.bias))
         if targets is None:
             return super().forward(hidden)
-        from reliquary.validator.training import _selected_logprobs_from_hidden
+        from reliquary.validator.training import _LOGPROB_CHUNK, _selected_logprobs_from_hidden
 
+        # draws: the substitution loss's v* is picked here too, on the gathered weight.
         weight, bias = self.weight, self.bias
         return _selected_logprobs_from_hidden(
             hidden, targets, lambda rows: torch.nn.functional.linear(rows, weight, bias),
+            chunk=_LOGPROB_CHUNK if chunk is None else chunk, draws=draws, weight=weight,
         )
 
 
@@ -159,15 +184,16 @@ def _probe_loss_scale(model, ctx: DistContext) -> float:
 
 
 def gather_full_state_dict(model, ctx: DistContext) -> dict[str, torch.Tensor] | None:
-    """Collective: every rank must call it. Rank 0 gets bf16 CPU tensors."""
-    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+    """Collective: every rank must call it. Rank 0 gets bf16 CPU tensors.
 
-    state = get_model_state_dict(
-        model, options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-    )
-    if not ctx.is_main:
-        return None
-    return {name: tensor.to(torch.bfloat16) for name, tensor in state.items()}
+    Each shard is gathered and cast to bf16 on the GPU before the copy to host: 15 s instead of 50 s
+    (fp32 offload, then a CPU cast) for the 9B on 4 A100s, same bytes."""
+    state = {}
+    for name, tensor in model.state_dict().items():
+        full = (tensor.full_tensor() if hasattr(tensor, "full_tensor") else tensor).to(torch.bfloat16)
+        if ctx.is_main:
+            state[name] = full.cpu()
+    return state if ctx.is_main else None
 
 
 def assign_bins(costs: list[int], world_size: int) -> list[list[int]]:
@@ -235,7 +261,7 @@ class CommandChannel:
         return message[0]
 
 
-def run_follower(channel: CommandChannel, *, load, train, gather) -> None:
+def run_follower(channel: CommandChannel, *, load, train, gather, audit=None) -> None:
     model = None
     while True:
         command, payload = channel.receive()
@@ -245,6 +271,8 @@ def run_follower(channel: CommandChannel, *, load, train, gather) -> None:
             train(model, payload)
         elif command == "GATHER":
             gather(model)
+        elif command == "AUDIT" and audit is not None:
+            audit(model, payload)               # the same forward as rank 0's; only rank 0 reports
         elif command == "STOP":
             return
         else:

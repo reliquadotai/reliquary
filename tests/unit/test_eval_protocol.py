@@ -146,6 +146,21 @@ def test_public_taskset_identity_never_exports_private_configuration():
     assert "fixture-sensitive-option" not in json.dumps(_taskset_grading(card, graders))
 
 
+def test_signed_protocol_binds_the_shared_harness_implementation(monkeypatch):
+    from reliquary.eval import verifiers_source
+
+    artifacts = {"reliquary-sandbox": "a" * 64, "reliquary-harness": "b" * 64}
+    monkeypatch.setattr(verifiers_source, "installed_artifacts", lambda name: artifacts[name])
+    first = ep.harness_sha256("signed-bash-v1")
+    single = ep.harness_sha256("single-turn")
+    artifacts["reliquary-harness"] = "c" * 64
+    assert ep.harness_sha256("signed-bash-v1") != first
+    assert ep.harness_sha256("single-turn") == single
+    del artifacts["reliquary-harness"]
+    with pytest.raises(KeyError):
+        ep.harness_sha256("signed-bash-v1")
+
+
 def test_frozen_package_hashes_real_wheel_code_and_refuses_editable_metadata(tmp_path, monkeypatch):
     from importlib.metadata import PathDistribution
     from reliquary.eval.verifiers_source import installed_artifacts

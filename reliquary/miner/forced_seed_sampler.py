@@ -3,12 +3,12 @@ per-position draw instead of a local RNG.
 
 The validator verifies the same draw by teacher-forcing (see
 ``reliquary.validator.verifier``); both sides call the identical
-``warp`` + ``pick`` primitives in ``reliquary.environment.forced_sampling`` so an
+``pick_rows`` in ``reliquary.environment.forced_sampling`` so an
 honest miner running this processor scores ~1.0 on the seed-consistency gate.
 
 A ``LogitsProcessor`` is the only clean hook: it keeps the batched, fast
 ``model.generate`` path (a Python decode loop over M rollouts would be far
-slower) and merely replaces the per-step sample with the forced inverse-CDF pick.
+slower) and merely replaces the per-step sample with the forced pick.
 Drive it with ``do_sample=False`` and NO temperature/top_k/top_p in
 ``generate`` — this processor does the full protocol warp itself, so HF's own
 warpers must not run.
@@ -19,7 +19,8 @@ import torch
 from transformers import LogitsProcessor, LogitsProcessorList
 
 from reliquary.constants import T_PROTO, TOP_K_PROTO, TOP_P_PROTO
-from reliquary.environment.forced_sampling import pick, u_at, warp
+from reliquary.miner.vllm_generation import default_draw
+from reliquary.environment.forced_sampling import pick_rows, u_at
 
 # HF sampling-warper kwargs the forced path must NOT pass: the processor already
 # applies the protocol warp (T_PROTO/top_k/top_p), so leaving these on generate()
@@ -53,7 +54,7 @@ _NEUTRAL_PROCESSOR_KWARGS = {
 
 
 class ForcedSeedLogitsProcessor(LogitsProcessor):
-    """Replace each row's sampled token with the forced inverse-CDF pick.
+    """Replace each row's sampled token with the profile's forced pick.
 
     Batch row ``r`` is completion of rollout ``rollout_indices[r]``; its first
     sampled token (step s=0) sits at completion offset ``base_offsets[r]`` and
@@ -106,9 +107,9 @@ class ForcedSeedLogitsProcessor(LogitsProcessor):
                  if self.seed_pool is not None else
                  u_at(self.randomness, self.prompt_idx,
                       self.checkpoint_hash, self.rollout_indices[r], t))
-            probs = warp(scores[r], t=self.temperature,
-                         top_k=self.top_k, top_p=self.top_p)
-            out[r, pick(probs, u)] = 0.0
+            picked = pick_rows(scores[r:r + 1], [u], draw=default_draw(), t=self.temperature,
+                               top_k=self.top_k, top_p=self.top_p)
+            out[r, int(picked[0])] = 0.0
         return out
 
 

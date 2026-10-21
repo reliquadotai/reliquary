@@ -31,6 +31,27 @@ class DrawBinding:
                                       seed_index=self.seed_index)
 
 
+@dataclass(frozen=True)
+class LeaseDrawBinding:
+    """An async RL lease's rollout (design §4.10): the same model-token stream as a window seed, keyed by the
+    lease (``protocol.rl_draw``: nonce, prompt, ``k<k>``, rollout index); a turn's draw starts at the model tokens
+    the session has generated so far."""
+    nonce: str
+    prompt_idx: int
+    checkpoint: int
+    rollout_index: int
+
+    def __post_init__(self) -> None:
+        from reliquary.protocol.rl_draw import lease_draw_context
+
+        lease_draw_context(self.nonce, self.prompt_idx, self.checkpoint)     # refuses a malformed nonce or k
+
+    def extra_args(self, base_offset: int) -> dict:
+        from reliquary.protocol.rl_draw import lease_extra_args
+
+        return lease_extra_args(self.nonce, self.prompt_idx, self.checkpoint, self.rollout_index, base_offset)
+
+
 class ForcedDraws:
     """Session id -> binding; thread-safe (the generate endpoint reads it from its request handlers)."""
 
@@ -62,4 +83,4 @@ def forced_sampling_params(base: dict, draw: dict) -> dict:
     return params
 
 
-__all__ = ["DrawBinding", "ForcedDraws", "forced_sampling_params"]
+__all__ = ["DrawBinding", "ForcedDraws", "LeaseDrawBinding", "forced_sampling_params"]

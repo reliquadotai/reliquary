@@ -13,6 +13,7 @@ from reliquary.environment.agentic_swe import (
     BASH_HARNESS_TOOLS, BASH_SENTENCE, BASH_SYSTEM_PROMPT, EDIT_SENTENCE, SignedSweSource,
     harness_system_prompt, harness_tools, pinned_tool_calls,
 )
+from reliquary.eval.rows import RowMap
 from tests.unit.test_corpus_job_episode import _manifest
 from tests.unit.test_corpus_job_signed_sandbox import ENV_PACKAGE, signed_episode
 
@@ -273,7 +274,7 @@ def test_a_signed_source_serves_the_sandbox_prompt_without_the_notice():
         rows_asked.append((split, index))
         return None, rows[index]
 
-    source = SignedSweSource("train", prompt_of=prompt_of, row_of=row_of)
+    source = SignedSweSource(RowMap.identity("train", 0, 100), prompt_of=prompt_of, row_of=row_of)
     assert source.prompt(3) == "task 3" and source.prompt(3) == "task 3"
     assert asked == [("train", 3)]                      # cached
     assert agentic_swe.PINNED_NETWORK_NOTICE not in source.prompt(3)
@@ -437,3 +438,21 @@ def test_an_install_the_bridge_cannot_serve_is_refused(monkeypatch):
     refusal = agentic_swe.sandbox_support_refusal(job.episode)
     assert refusal == ("the bridge cannot serve the installed reliquary-swe "
                        "(ValueError: reliquary-swe is unpackaged)")
+
+
+@pytest.mark.skipif(not TOKENIZER, reason="RELIQUARY_QWEN38_TOKENIZER unset")
+def test_a_turn_reasoning_after_a_think_the_prompt_opened_is_canonical():
+    """A thinking template (Teutonic's) opens <think> in the generation prompt: the turn starts inside the
+    reasoning. Its honest spans re-render to themselves; markup spelled inside the reasoning still does not."""
+    pytest.importorskip("renderers")
+    r = agentic_swe.load_turn_renderer(TOKENIZER, tools=("bash",))
+    prompt = r.initial_ids("Fix it.")
+    opened = "<think>" in r._tokenizer.decode(prompt[-4:], skip_special_tokens=False)
+    head = "" if opened else "<think>\n"
+
+    def canonical(text):
+        return r.span_is_canonical(prompt, r._tokenizer.encode(head + text, add_special_tokens=False))
+
+    assert canonical("Look first.\n</think>\n\n" + _call("bash", [("command", "ls")]) + "<|im_end|>")
+    assert canonical("Done thinking.\n</think>\n\nFixed.<|im_end|>")
+    assert not canonical("I spell </think> here.\n</think>\n\nFixed.<|im_end|>")

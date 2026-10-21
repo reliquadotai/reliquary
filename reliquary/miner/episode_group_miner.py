@@ -107,6 +107,48 @@ def hf_prover(*, model, wallet, toploc) -> Callable[[dict, str], dict]:
     return prove
 
 
+async def play_bound(runner, engine, draws, index: int, binding, deadline, *, label: str):
+    """One episode of rollout ``index`` with its forced draw ``binding`` (a window seed's ``DrawBinding`` or a
+    lease's ``LeaseDrawBinding``): ``(result, session)``, or None (no session, crash, deadline). The draw is bound
+    to every generate session of the episode before its first turn and dropped at its end."""
+    bound: list[str] = []
+    taken: str | None = None
+
+    def on_session(session_id: str) -> None:
+        # Before the trace's first generate request: the forced engine refuses an unbound session.
+        draws.bind(session_id, binding)
+        bound.append(session_id)
+
+    try:
+        try:
+            async with asyncio.timeout(deadline(index) if deadline is not None else None):
+                result = await runner.run(index, on_session=on_session)
+        except SessionRefused as refused:
+            logger.info("seed %d of %s: no session (%s)", index, label, refused.reason)
+            return None
+        except TimeoutError:
+            logger.warning("seed %d of %s passed its deadline", index, label)
+            return None
+        except Exception:
+            logger.exception("seed %d of %s crashed", index, label)
+            return None
+        # The log is taken only now, at the episode's end (taking it also ends its binding).
+        taken = result.session_id
+        try:
+            session = engine.take_session(taken) if taken else None
+        except Exception:
+            logger.exception("seed %d: taking its generate session failed", index)
+            session = None
+        return result, session
+    finally:
+        for session_id in dict.fromkeys(bound):
+            draws.drop(session_id)
+            if session_id != taken:
+                drop = getattr(engine, "drop_session", None)
+                if drop is not None:
+                    drop(session_id)
+
+
 class EpisodeGroupMiner:
     def __init__(self, *, hotkey: str, sign_binding: Callable[[bytes], str], sessions,
                  runner_factory: Callable[..., Any], engine, draws, prove: Callable[[dict, str], dict],
@@ -194,43 +236,8 @@ class EpisodeGroupMiner:
         """One episode of ``seed``: ``(result, session)``, or None (no session, crash, deadline)."""
         from reliquary.miner.forced_draw import DrawBinding
 
-        bound: list[str] = []
-        taken: str | None = None
-
-        def on_session(session_id: str) -> None:
-            # Before the trace's first generate request: the forced engine refuses an unbound session.
-            self._draws.bind(session_id, DrawBinding(pool, seed))
-            bound.append(session_id)
-
-        try:
-            try:
-                async with asyncio.timeout(deadline(seed) if deadline is not None else None):
-                    result = await runner.run(seed, on_session=on_session)
-            except SessionRefused as refused:
-                logger.info("seed %d of precommit %s: no session (%s)", seed, precommit.sha256[:12],
-                            refused.reason)
-                return None
-            except TimeoutError:
-                logger.warning("seed %d of precommit %s passed its deadline", seed, precommit.sha256[:12])
-                return None
-            except Exception:
-                logger.exception("seed %d of precommit %s crashed", seed, precommit.sha256[:12])
-                return None
-            # The log is taken only now, at the episode's end (taking it also ends its binding).
-            taken = result.session_id
-            try:
-                session = self._engine.take_session(taken) if taken else None
-            except Exception:
-                logger.exception("seed %d: taking its generate session failed", seed)
-                session = None
-            return result, session
-        finally:
-            for session_id in dict.fromkeys(bound):
-                self._draws.drop(session_id)
-                if session_id != taken:
-                    drop = getattr(self._engine, "drop_session", None)
-                    if drop is not None:
-                        drop(session_id)
+        return await play_bound(runner, self._engine, self._draws, seed, DrawBinding(pool, seed), deadline,
+                                label=f"precommit {precommit.sha256[:12]}")
 
     def _cutoff(self, open_until: float | None, played: list[EpisodeOutcome]) -> float | None:
         """When the seeds still playing are cut: the window's end, or earlier, the proof budget before the
@@ -508,4 +515,4 @@ class EpisodeGroupMiner:
         return outcome
 
 
-__all__ = ["EpisodeGroupMiner", "EpisodeOutcome", "GroupVerdict", "hf_prover", "http_verdicts"]
+__all__ = ["EpisodeGroupMiner", "EpisodeOutcome", "GroupVerdict", "hf_prover", "http_verdicts", "play_bound"]

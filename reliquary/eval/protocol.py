@@ -81,12 +81,14 @@ def harness_sha256(harness: str = "single-turn") -> str:
     root = Path(__file__).parent
     extra = {"single-turn": (), "telecom-episode-v1": ("agentic.py", "../environment/agentic/runner.py",
                                                      "../environment/agentic/types.py"),
-             "signed-bash-v1": ("signed_agentic.py", "../sandbox/evaluation_engagements.py")}[harness]
+             "signed-bash-v1": ("signed_agentic.py", "../sandbox/evaluation_engagements.py",
+                                "../environment/agentic_swe.py")}[harness]
     files = {name: hashlib.sha256((root / name).read_bytes()).hexdigest()
              for name in ("runner.py", "model_process.py", "platform_client.py", "protocol.py", *extra)}
     if harness == "signed-bash-v1":
         from reliquary.eval.verifiers_source import installed_artifacts
         files["signed_sandbox_and_verifiers"] = installed_artifacts("reliquary-sandbox")
+        files["shared_agentic_harness"] = installed_artifacts("reliquary-harness")
     return digest(files)
 
 

@@ -12,7 +12,7 @@ from typing import Any
 
 PACKAGE = "reliquary-swe"
 SERVED_SPLITS = {"train": {"split": "train"}, "r2e": {"split": "r2e"},
-                 "polyglot": {"split": "polyglot"}}
+                 "polyglot": {"split": "polyglot"}, "eval": {"split": "eval"}}
 GATEWAY_OPTIONS = {"tools": ["bash", "edit"], "splits": SERVED_SPLITS,
                    "defaults": {"per_call_timeout_s": 600}, "publish_state": True}
 """The options this process builds reliquary-swe with, which must be the ones the gateway
@@ -47,6 +47,19 @@ def bridged_env() -> Any:
 
 def prompt_of(split: str, index: int) -> str:
     return bridged_env().task(split, int(index)).data.prompt
+
+
+def instance_id_of(split: str, index: int) -> str:
+    return str(bridged_env().task(split, int(index)).data.instance_id)
+
+
+def split_length(split: str) -> int:
+    """Rows of ``split`` the bridge serves (a taskset that cannot count is refused)."""
+    return len(bridged_env().taskset(split))
+
+
+def package_version() -> str:
+    return importlib.metadata.version(PACKAGE)
 
 
 def row_of(split: str, index: int) -> tuple[None, Any]:

@@ -548,7 +548,8 @@ def wire_job_grader(w, *, records, judge_records, dispatcher, parse_executor=Non
         from reliquary.validator.suite_grading import LocalEpisodeGrader
 
         w.grader = LocalEpisodeGrader(job=w.job, records=judge_records,
-                                      replayer=w.episode_intake.replayer)
+                                      replayer=w.episode_intake.replayer,
+                                      source=w.episode_intake.source)
         return
     grade_refusal(w.job, dispatcher)
     from reliquary.validator.corpus_grading import CorpusGrader

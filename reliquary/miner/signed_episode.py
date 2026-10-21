@@ -1,14 +1,16 @@
 """The agentic miner's signed-sandbox mode (plan 3). No Docker on the miner: per episode,
 ask the validator for a session token (a request signed by the hotkey for this
-validator and route), open the episode on the machine the validator named, run
-verifiers' bash harness through `reliquary_sandbox_verifiers.SandboxEpisodeRunner`
-against the local generate endpoint (tokens and proofs come from the engine's session
-log, as in replay mode), and return what to submit: the gateway's transcript and the
-graded state as the final diff.
+validator and route), open the episode on the machine the validator named, play it with
+the miner's own loop (`harness_episode.HarnessEpisodeRunner`: reliquary-harness's bash
+harness spec, the turns verifiers b2e4e81's bash harness sent) against the local generate
+endpoint (tokens and proofs come from the engine's session log, as in replay mode), and
+return what to submit: the gateway's transcript and the graded state as the final diff.
+`harness_env` was the verifiers harness program's environment; no local program runs now,
+so it is unused (tools run on the gateway either way).
 
 The miner never submits what it already knows the validator refuses. An episode whose
 final is not `graded`, whose run errored (a gateway close raised as `EpisodeClosed`
-ends as a verifiers `TaskError` trace), whose state is not UTF-8, or whose transcript
+ends the run with an error), whose state is not UTF-8, or whose transcript
 fails the validator's own checks (`transcript_refusal`: `verify_transcript` with every
 `Expected` field, record 0's tools and env package, the grading deadline) is reported
 at once (`close`), so its reservation and the hotkey's caps are released. The built
@@ -210,10 +212,10 @@ def transcript_refusal(transcript: Any, *, job, hotkey: str, index: int,
     from reliquary_sandbox.attest import Expected, Reason, verify_transcript
     from reliquary_sandbox.observation import TOOLS_VERSIONS
 
-    from reliquary.corpus.job import sandbox_split
     from reliquary.corpus.signed_reasons import (
         REASON_SANDBOX_EXPIRED, REASON_SANDBOX_TRANSCRIPT, corpus_engagement,
     )
+    from reliquary.eval.rows import job_row_map
     from reliquary.protocol.corpus_submission import MAX_TRANSCRIPT_BYTES
 
     if not isinstance(transcript, Mapping):
@@ -221,10 +223,11 @@ def transcript_refusal(transcript: Any, *, job, hotkey: str, index: int,
     size = len(_compact(transcript))
     if size > MAX_TRANSCRIPT_BYTES:
         return "trajectory_too_large", {"transcript_bytes": size}
-    episode = job.episode
-    spec = episode.sandbox
+    spec = job.episode.sandbox
+    # The engagement names the row; the session token names the task it runs.
+    task = job_row_map(job).ref(int(index))
     expected = Expected(hotkey=hotkey, engagement=corpus_engagement(job.job_id, index),
-                        env=spec.env, split=sandbox_split(episode), index=int(index),
+                        env=spec.env, split=task.split, index=task.index,
                         checkpoint=job.checkpoint_sha256, require_graded=True)
     result = verify_transcript(transcript, _NoKeys(), _claims_of, expected)
     reasons = [reason.value for reason in result.reasons if reason is not Reason.UNKNOWN_KEY]
@@ -346,9 +349,8 @@ class SignedSweEpisodeRunner:
                  new_request_id: Callable[[], str] = lambda: uuid.uuid4().hex,
                  sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
                  monotonic: Callable[[], float] = time.monotonic,
-                 max_live: int = DEFAULT_MAX_LIVE_PER_JOB) -> None:
-        from reliquary.corpus.job import sandbox_split
-        from reliquary.environment.agentic_swe import SignedSweSource
+                 max_live: int = DEFAULT_MAX_LIVE_PER_JOB, harness=None, variant: int = 0) -> None:
+        from reliquary.environment.agentic_swe import job_harness, job_signed_source
 
         if ss58_format_42(hotkey) != hotkey:
             raise ValueError("a signed-sandbox miner's hotkey must be an ss58 format-42 address "
@@ -365,11 +367,14 @@ class SignedSweEpisodeRunner:
         self._model_name, self._renderer_dir = model_name, renderer_model_dir
         self._generate_url, self._sampling = generate_url, sampling
         self._harness_env = dict(harness_env or {})
-        self._source = source or SignedSweSource(sandbox_split(job.episode))
+        self._source = source or job_signed_source(job)
         self._runner_factory = runner_factory
         self._clock, self._new_request_id, self._sleep = clock, new_request_id, sleep
         self._monotonic = monotonic
-        self._ctx = None
+        # The harness spec and surface variant every episode of this runner plays: an RL lease's,
+        # else the job's own (`episode.harness_spec`; none: the compatibility harness).
+        self._harness = harness if harness is not None else job_harness(job)
+        self._variant = int(variant)
         self._runners: dict[str, object] = {}
         self._runners_lock = asyncio.Lock()
         self._stack = AsyncExitStack()
@@ -385,6 +390,11 @@ class SignedSweEpisodeRunner:
 
     # A corpus episode submits its graded state as a text diff; an RL episode submits none.
     requires_text_state = True
+    # An episode the machine closed on its budget (signed final ``budget_exhausted``, stop ``episode_closed``) is a
+    # finished rollout scored 0 for a runner that sets this (an async RL lease); otherwise it is unusable.
+    takes_budget_exhausted = False
+    # Whether an episode ends at the model's first malformed turn (`format_error`): an async RL lease's only.
+    format_stop = False
     # The named 503s that say the validator is serving, only busy (a subclass adds its routes' own).
     validator_throttles = VALIDATOR_THROTTLES
 
@@ -403,30 +413,16 @@ class SignedSweEpisodeRunner:
         return float(OPEN_WINDOW_S + self._job.episode.sandbox.budgets.wall_s
                      + GRADING_GRACE_S + SUBMIT_MARGIN_S)
 
-    def _context(self):
-        if self._ctx is None:
-            from renderers.configs import Qwen38RendererConfig
-            from verifiers.v1.clients import ModelContext
-            from verifiers.v1.configs.client import TrainClientConfig
-            from verifiers.v1.types import Sampling
-
-            self._ctx = ModelContext(
-                model=self._model_name,
-                client=TrainClientConfig(base_url=f"{self._generate_url.rstrip('/')}/v1",
-                                         api_key_var="RELIQUARY_GENERATE_KEY",
-                                         renderer=Qwen38RendererConfig(),
-                                         renderer_model_name=self._renderer_dir),
-                sampling=Sampling(temperature=self._sampling.temperature,
-                                  top_p=self._sampling.top_p,
-                                  max_tokens=self._job.episode.max_tokens_per_turn))
-        return self._ctx
-
     def _default_runner(self, url: str):
-        from reliquary_sandbox_verifiers import SandboxEpisodeRunner
+        from reliquary.miner.harness_episode import HarnessEpisodeRunner
 
-        return SandboxEpisodeRunner(ctx=self._context(), gateway_url=url,
+        return HarnessEpisodeRunner(gateway_url=url, model=self._model_name,
+                                    renderer_dir=self._renderer_dir, generate_url=self._generate_url,
+                                    sampling=self._sampling,
+                                    max_tokens=self._job.episode.max_tokens_per_turn,
                                     max_turns=self._job.episode.max_turns,
-                                    harness_env=self._harness_env)
+                                    spec=getattr(self, "_harness", None), variant=getattr(self, "_variant", 0),
+                                    format_stop=self.format_stop)
 
     async def _runner(self, url: str):
         async with self._runners_lock:
@@ -645,9 +641,10 @@ class SignedSweEpisodeRunner:
             result = await runner.run(token=grant["token"], prompt=self._source.prompt(index),
                                       on_trace=on_trace)
         except Exception as exc:  # no episode result, no transcript
-            await self._end(session_id, slot, "open_failed", None,
-                            open_refusal=open_refusal_of(exc) if self.forwards_open_refusal else None)
-            return EpisodeResult(None, "", None, False, None, error=_describe(exc))
+            receipt = open_refusal_of(exc) if self.forwards_open_refusal else None
+            await self._end(session_id, slot, "open_failed", None, open_refusal=receipt)
+            return EpisodeResult(None, "", None, False, None, error=_describe(exc),
+                                 final_status="open_refused" if receipt is not None else None)
         except BaseException:
             # Cancelled (the episode's deadline, the miner stopping): report it, briefly.
             await self._end(session_id, slot, "open_failed", None, bounded=True)
@@ -681,9 +678,11 @@ class SignedSweEpisodeRunner:
             return EpisodeResult(trace_id, "", stop, False, None, error=error,
                                  final_status=status if status != "graded" else None)
 
-        if result.error or status != "graded":
+        exhausted = (self.takes_budget_exhausted and status == "budget_exhausted" and not result.error
+                     and stop == "episode_closed")
+        if result.error or (status != "graded" and not exhausted):
             # Unpaid: not graded, or the run did not complete (a gateway close raised
-            # as EpisodeClosed is a TaskError trace).
+            # as EpisodeClosed is a run error).
             return await unusable(result.error or (
                 f"the sandbox episode ended {status} ({final.get('reason')})"))
         if self.requires_text_state:
@@ -702,6 +701,11 @@ class SignedSweEpisodeRunner:
         # Closed `final` first: `closed_graded` keeps the slot and no drain voids it.
         answer = await self._close(session_id, "final", transcript)
         state = answer.get("state") if answer is not None else None
+        # The validator records an exhausted session as ``closed`` (an unpaid final): its slot is already free.
+        if exhausted and state == "closed":
+            slot.free()
+            return EpisodeResult(trace_id, final_diff, stop, True, 0.0, transcript=transcript,
+                                 submit_by=float(expires_at + GRADING_GRACE_S - SUBMIT_TRANSIT_S))
         if state is not None and state not in PAYABLE_STATES:
             slot.free()                     # the validator already ended it
             return EpisodeResult(trace_id, "", stop, False, None,

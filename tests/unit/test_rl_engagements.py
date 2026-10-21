@@ -314,3 +314,25 @@ def test_the_terms_carry_the_tasks_image_lock_to_placement(tmp_path):
     plain = build(tmp_path / "plain")
     terms = asyncio.run(plain.engagements.terms(HOTKEY, engagement(plain.precommit, 5)))
     assert terms.env_lock_sha256 is None and "env_lock_sha256" not in _reserving(terms)
+
+
+def test_a_signed_open_refusal_frees_a_lease_rollout_only():
+    from reliquary.protocol.service_episode import rl_lease_engagement
+    from reliquary.sandbox.sessions import CLOSED, SandboxPolicy, SessionBook, SessionRecord
+
+    def record(n, engagement, fault):
+        return SessionRecord(session_id=f"s{n}", hotkey=HOTKEY, request_id=f"r{n}", engagement_sha256="0" * 64,
+                             kind="rl_lease", engagement=engagement, env="e", split="rl", index=0, checkpoint="k0",
+                             job_id=None, prompt_index=None, machine_id=MACHINE, issued_at=NOW, expires_at=NOW + 60,
+                             token_sha256=f"{n:064d}", state=CLOSED, closed_status="open_failed", fault=fault)
+
+    book = SessionBook(SandboxPolicy())
+    lease = rl_lease_engagement("a" * 32, 3)
+    for n in range(3):                                  # a full machine, again and again: never the miner's
+        book.add(record(n, lease, "open_refused:no_capacity"))
+    assert not book.engagement_held(lease)
+    book.add(record(9, lease, None))                    # a failed open without a verified receipt keeps it
+    assert book.engagement_held(lease)
+    other = rl_engagement(1, "b" * 64, 0)               # the window path keeps its rule
+    book.add(record(10, other, "open_refused:no_capacity"))
+    assert book.engagement_held(other)

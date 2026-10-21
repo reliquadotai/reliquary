@@ -193,7 +193,7 @@ class World:
         self.events = []
         self.max_model_len = max_model_len
         self.deps = em.EpisodeStackDeps(
-            download=self.download, load_renderer=lambda directory, tools: FakeRenderer(),
+            download=self.download, load_renderer=lambda directory, tools, spec: FakeRenderer(),
             make_core=self.make_core, max_model_len=lambda core, default: self.max_model_len,
             release_core=self.release_core, load_proof_model=self.load_model, release_model=self.release_model,
             make_prover=lambda **kwargs: prove, toploc=lambda: SimpleNamespace(chunk_tokens=32, topk=128),

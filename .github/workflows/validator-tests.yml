@@ -16,7 +16,7 @@ jobs:
   cpu-tests:
     runs-on: ubuntu-24.04
     # Allow setup and authenticity checks beside the full CPU suite.
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

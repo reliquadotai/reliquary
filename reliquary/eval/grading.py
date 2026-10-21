@@ -21,6 +21,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import re
 import shutil
 import tempfile
@@ -31,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from reliquary.eval.metrics import bootstrap_mean_ci, pass_at_k, report_ks
+from reliquary.eval.prompt_source import REFERENCE_INTERACTIONS
 from reliquary.eval.sets import open_source, prompt_sha256, validated_set_id
 from reliquary.eval.storage import subnet_key
 from reliquary.eval.protocol import digest, public_taskset, validate_request, validate_set
@@ -135,6 +137,30 @@ async def load_sets(set_ids: Sequence[str], problems_per_set: Mapping[str, int],
     return loaded
 
 
+def require_gradable(sets: Mapping[str, tuple[dict, list[dict]]], *,
+                     pregraded: bool = False) -> None:
+    """Reference-only jobs supply their own grades; pinned episodes are replayed."""
+    for set_id, (card, _) in sets.items():
+        if card.get("interaction") == "signed_episode" and any(
+                card.get(key) is None for key in ("protocol", "protocol_json", "protocol_sha256")):
+            raise GradeRequestError(f"set {set_id} requires a frozen signed episode protocol")
+        episode = card.get("interaction") in REFERENCE_INTERACTIONS
+        if card.get("protocol") is not None and card.get("interaction") in {
+                "episode", "signed_episode"}:
+            validate_set(card)
+            expected = {"episode": "telecom-episode-v1", "signed_episode": "signed-bash-v1"}
+            if (card.get("source_kind") != card["interaction"]
+                    or card["protocol"]["harness"].get("id") != expected[card["interaction"]]):
+                raise GradeRequestError(f"set {set_id} has no supported pinned episode grader")
+            episode = False
+        if episode and not pregraded:
+            raise GradeRequestError(f"set {set_id} holds {card['interaction']} tasks: "
+                                    "grade it from its job (eval grade)")
+        if pregraded and not episode:
+            raise GradeRequestError(f"set {set_id} is not an episode set: its job's "
+                                    "completions are graded here")
+
+
 def require_sandboxes(sets: Mapping[str, tuple[dict, list[dict]]], require=None) -> None:
     """Refuse an order with a code set where the grading service is not running."""
     from reliquary.environment.registry import ENVIRONMENT_SPECS
@@ -144,6 +170,9 @@ def require_sandboxes(sets: Mapping[str, tuple[dict, list[dict]]], require=None)
     for card, _ in sets.values():
         if card.get("source_kind") in {"verifiers", "signed_episode"}:
             # Its code runs, if at all, in the task's own Docker box.
+            continue
+        if card.get("interaction") in REFERENCE_INTERACTIONS:
+            # Graded by the job's own grader (`require_gradable`): nothing runs here.
             continue
         try:
             require(ENVIRONMENT_SPECS[card["source"]])
@@ -480,25 +509,30 @@ async def collect_job_records(job, records, *, concurrency: int = READ_CONCURREN
               "audited": sum(1 for v in verdicts if v.get("audited")),
               "samples_by_prompt": dict(samples)}
     if include_generation_status:
-        # A verdict with no ``audited`` key predates sampled audits: it counts as audited.
-        def audited(v):
-            return v.get("audited", True) is True
-
-        passed = [v for _, v, record in read if record is not None]
-        contributing = {v.get("hotkey") for v in passed}
-        tainted = {v.get("hotkey") for _, v, _ in read
-                   if v and ((not v.get("passed") and audited(v)) or v.get("reason") == "banned")}
-        if passed and all(audited(v) for v in passed):
-            status = "verified"
-        elif passed and not (contributing & tainted):
-            status = "sampled"
-        else:
-            status = "unverified"
-        # R11: only fully audited records prove generation. "sampled" (passing, not all audited,
-        # no contributing hotkey failed) is reported but does NOT count as verified.
-        result["generation_status"] = status
-        result["generation_verified"] = status == "verified"
+        result.update(_generation_status(
+            [v for _, v, record in read if record is not None], [v for _, v, _ in read if v]))
     return result
+
+
+def _generation_status(passed: list[dict], verdicts: list[dict]) -> dict:
+    """``generation_status`` and ``generation_verified`` of a job whose
+    contributing (passing, kept) verdicts are ``passed`` among ``verdicts``."""
+    # A verdict with no ``audited`` key predates sampled audits: it counts as audited.
+    def audited(v):
+        return v.get("audited", True) is True
+
+    contributing = {v.get("hotkey") for v in passed}
+    tainted = {v.get("hotkey") for v in verdicts
+               if (not v.get("passed") and audited(v)) or v.get("reason") == "banned"}
+    if passed and all(audited(v) for v in passed):
+        status = "verified"
+    elif passed and not (contributing & tainted):
+        status = "sampled"
+    else:
+        status = "unverified"
+    # R11: only fully audited records prove generation. "sampled" (passing, not all audited,
+    # no contributing hotkey failed) is reported but does NOT count as verified.
+    return {"generation_status": status, "generation_verified": status == "verified"}
 
 
 def job_complete(job, collected: dict, samples: int, slots=None) -> bool:
@@ -563,12 +597,146 @@ class JobRows:
                     sample += 1
 
 
+# What graded an episode set's samples, by the set's interaction.
+EPISODE_SCHEMES = {"episode": "suite-replay", "swe": "signed-sandbox"}
+
+
+def episode_score(document: Mapping) -> float | None:
+    """The reward of a grade document that certifies it, else None (ungraded):
+    an unreplayable, unparseable or uncertified trajectory scores nothing."""
+    if document.get("status") != "ok" or document.get("replay_certified") is not True:
+        return None
+    try:
+        reward = float(document["grade"]["reward"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return reward if math.isfinite(reward) else None
+
+
+class EpisodeJobRows:
+    """The passing submissions of an episode (suite) or signed-SWE eval job,
+    pre-graded from the grade documents the job's grader wrote: the latest
+    regrade, else the grade. The submission records are never read, except
+    the tail of a passing one that has no grade (``read_submission_meta``),
+    to learn its row; a store without that reader reads the whole record of
+    those only. Same interface as ``JobRows``: ``prompt_index`` maps to
+    ``problem_id`` through the set's order, and within a problem the passing
+    submissions in submission-id order are samples 0, 1, ... A voided pass,
+    like a failed one, is left out (a missing sample).
+    """
+
+    def __init__(self, *, job, passing: list[tuple[str, int, dict | None, dict]],
+                 verdicts: list[dict], ungraded: int) -> None:
+        self.job = job
+        # (submission_id, prompt_index, grade document or None, verdict)
+        self._passing = passing
+        self.hotkeys: set[str] = {(d or {}).get("hotkey") or v.get("hotkey")
+                                  for _, _, d, v in passing}
+        self.verdicts = len(verdicts)
+        self.audited = sum(1 for v in verdicts if v.get("audited"))
+        status = _generation_status([v for _, _, _, v in passing], verdicts)
+        self.generation_verified = status["generation_verified"]
+        self.generation_status = status["generation_status"]
+        self.ungraded = ungraded
+        samples: Counter = Counter(index for _, index, _, _ in passing)
+        self.samples_by_prompt = dict(samples)
+
+    @classmethod
+    async def collect(cls, job, records, *, allow_incomplete: bool,
+                      concurrency: int = READ_CONCURRENCY) -> "EpisodeJobRows":
+        """Read the verdicts, the voided ids and, for each passing submission,
+        its regrade else its grade. ``JobNotGradable`` when a passing
+        submission has no grade, unless ``allow_incomplete`` (then it is an
+        ungraded sample of its row)."""
+        from reliquary.eval.job_grading import JobNotGradable
+
+        job_id = job.job_id
+        ids = list(await records.list_verdict_ids(job_id))
+        lister = getattr(records, "list_voided_ids", None)
+        voided = set(await lister(job_id)) if lister is not None else set()
+        read_regrade = getattr(records, "read_regrade", None)
+        gate = asyncio.Semaphore(concurrency)
+
+        async def one(submission_id):
+            async with gate:
+                verdict = await records.read_verdict(job_id, submission_id)
+                if not verdict or not verdict.get("passed") or submission_id in voided:
+                    return submission_id, verdict, False, None
+                document = (await read_regrade(job_id, submission_id)
+                            if read_regrade is not None else None)
+                if document is None:
+                    document = await records.read_grade(job_id, submission_id)
+                return submission_id, verdict, True, document
+
+        read = await asyncio.gather(*(one(sid) for sid in ids))
+        missing = [sid for sid, _, kept, document in read if kept and document is None]
+        if missing and not allow_incomplete:
+            raise JobNotGradable(
+                f"job {job_id} has {len(missing)} passing submissions still ungraded "
+                f"(e.g. {missing[0][:12]}): wait for its grader, or pass --allow-incomplete "
+                "to count them as failures")
+        reader = getattr(records, "read_submission_meta", None)
+
+        async def place(submission_id):
+            # Only the row of an ungraded pass is unknown: the tail says it.
+            async with gate:
+                if reader is not None:
+                    meta = await reader(job_id, submission_id)
+                    if meta is None or "prompt_index" in meta:
+                        return meta
+                return await records.read_submission(job_id, submission_id)
+
+        placed = dict(zip(missing, await asyncio.gather(*(place(sid) for sid in missing))))
+        passing = []
+        for sid, verdict, kept, document in read:
+            if not kept:
+                continue
+            source = document if document is not None else placed.get(sid)
+            if source is None or source.get("prompt_index") is None:
+                logger.warning("eval grade: passing submission %s of %s names no row; "
+                               "counted missing", sid[:12], job_id)
+                continue
+            passing.append((sid, int(source["prompt_index"]), document, verdict))
+        return cls(job=job, passing=passing, verdicts=[v for _, v, _, _ in read if v],
+                   ungraded=len(missing))
+
+    async def __aiter__(self):
+        from reliquary.eval.prompt_source import load_eval_rows, parse_eval_source
+
+        rows = await asyncio.to_thread(load_eval_rows, parse_eval_source(self.job.prompt_source))
+        by_prompt: dict[int, list[tuple[str, dict | None, dict]]] = defaultdict(list)
+        for submission_id, prompt_index, document, verdict in self._passing:
+            by_prompt[prompt_index].append((submission_id, document, verdict))
+        for prompt_index in sorted(by_prompt):
+            if not 0 <= prompt_index < len(rows):
+                yield MALFORMED
+                continue
+            ordered = sorted(by_prompt[prompt_index], key=lambda entry: entry[0])
+            row = rows[prompt_index]
+            for sample, (_, document, verdict) in enumerate(ordered):
+                document = document or {}
+                replay = document.get("replay")
+                score, status = episode_score(document), document.get("status", "ungraded")
+                named = document.get("instance_id")
+                if named is not None and row.get("instance_id") not in (None, named):
+                    # Graded on another task than the set's row: it scores nothing here.
+                    score, status = None, "task_mismatch"
+                yield {"problem_id": row["problem_id"], "sample_index": sample,
+                       "completion": "",
+                       "completion_tokens": int(verdict.get("token_count") or 0),
+                       "finish_reason": str((replay.get("termination_reason") or "")
+                                            if isinstance(replay, Mapping) else ""),
+                       "pregraded": (score, {"status": status,
+                                             "graded_success": document.get("graded_success"),
+                                             "instance_id": named})}
+
+
 async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
                            completion_keys: Sequence[str],
                            problems_per_set: Mapping[str, int],
                            samples_per_set: Mapping[str, int], platform, subnet,
                            provenance: Mapping[str, Any],
-                           job_rows: "JobRows | None" = None,
+                           job_rows: "JobRows | EpisodeJobRows | None" = None,
                            open_environment: Callable[[str, str], Any] = open_source,
                            scorer_for: Callable = _default_scorer,
                            require_sandbox=None,
@@ -614,6 +782,8 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
     if service_contract is not None:
         from reliquary.services.mapping import validate_grading_context
         validate_grading_context(service_contract, sets, dict(provenance))
+    pregraded = isinstance(job_rows, EpisodeJobRows)
+    require_gradable(sets, pregraded=pregraded)
     require_sandboxes(sets, require_sandbox)
     selected: dict[str, tuple[str, dict, dict, int]] = {}
     for set_id, (card, rows) in sets.items():
@@ -664,22 +834,29 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
                 batch.append((row, entry))
                 if len(batch) >= BATCH_ROWS:
                     await _grade_batch(batch, graders, per_problem, writer, pa,
-                                       verify_signed=verify_signed, provenance=provenance, eval_id=eval_id)
+                                       verify_signed=verify_signed, provenance=provenance, eval_id=eval_id, pregraded=pregraded)
                     batch = []
             if batch:
                 await _grade_batch(batch, graders, per_problem, writer, pa,
-                                   verify_signed=verify_signed, provenance=provenance, eval_id=eval_id)
+                                   verify_signed=verify_signed, provenance=provenance, eval_id=eval_id, pregraded=pregraded)
         finally:
             writer.close()
         if job_rows is not None:
+            if pregraded:
+                schemes = sorted({EPISODE_SCHEMES[card["interaction"]]
+                                  for card, _ in sets.values()})
+                note = (f"sampling not verified: the scores are the job's own grades "
+                        f"({', '.join(schemes)}); TOPLOC proves each turn was computed by "
+                        "the model, not that it was sampled as the order asked")
+            else:
+                note = ("sampling not verified: TOPLOC proves the completions were computed "
+                        "by the model, not that they were sampled as the order asked")
             provenance = {
                 **dict(provenance), "generation": "sn81-miners", "job_id": job_rows.job.job_id,
                 "miner_hotkeys": len(job_rows.hotkeys),
                 "audited_fraction": (job_rows.audited / job_rows.verdicts
                                      if job_rows.verdicts else None),
-                "sampling_verified": False,
-                "note": "sampling not verified: TOPLOC proves the completions were computed "
-                        "by the model, not that they were sampled as the order asked",
+                "sampling_verified": False, "note": note,
             }
         by_env: dict[str, list[tuple[str, int]]] = defaultdict(list)
         for problem_id, (_, card, _, samples) in selected.items():
@@ -767,13 +944,14 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
 
 
 async def _grade_batch(batch, graders: _Graders, per_problem, writer, pa, *,
-                       verify_signed=None, provenance=None, eval_id=None) -> None:
+                       verify_signed=None, provenance=None, eval_id=None, pregraded: bool = False) -> None:
+    """Only EpisodeJobRows enables pregraded documents; uploads never do."""
     import base64
     import math
 
     signed = {}
     for row, (_, card, grading, _) in batch:
-        if card.get("interaction") != "signed_episode":
+        if pregraded or card.get("interaction") != "signed_episode":
             continue
         key = (card["set_id"], row["problem_id"], row["sample_index"])
         try:
@@ -807,7 +985,12 @@ async def _grade_batch(batch, graders: _Graders, per_problem, writer, pa, *,
             completion = completion if isinstance(completion, str) else ""
             episode_metrics = None
             tokens = int(row.get("completion_tokens") or 0)
-            if card.get("interaction") == "signed_episode":
+            if pregraded:
+                score, verdict = row["pregraded"]
+                correct = None if score is None else verdict.get("graded_success") is True
+                detail = json.dumps(verdict, sort_keys=True)
+                failed_format = False
+            elif card.get("interaction") == "signed_episode":
                 score, detail, failed_format = signed[(card["set_id"], row["problem_id"], row["sample_index"])]
             elif card.get("interaction") == "episode":
                 try:
@@ -838,18 +1021,20 @@ async def _grade_batch(batch, graders: _Graders, per_problem, writer, pa, *,
                     score, detail, failed_format = None, "episode_replay_error: " + type(exc).__name__, False
             else:
                 score, detail, failed_format = graders.grade(grading, completion, card)
-            if card.get("interaction") == "episode":
+            if not pregraded and card.get("interaction") == "episode":
                 accounting = episode_metrics or {}
                 if episode_metrics is None:
                     tokens = None
             else:
-                accounting = row.get("episode") or {}
+                accounting = {} if pregraded else row.get("episode") or {}
+            if not pregraded:
+                correct = None if score is None else score >= 1.0
             out.append({
                 "env": card["env"], "set_id": set_id, "problem_id": grading["problem_id"],
                 "sample_index": int(row["sample_index"]), "completion": completion,
                 "tokens": tokens,
                 "finish_reason": str(row.get("finish_reason") or ""),
-                "correct": None if score is None else score >= 1.0, "score": score,
+                "correct": correct, "score": score,
                 "grader_detail": detail, "format_failure": failed_format,
                 "episode_stop_reason": (accounting.get("stop_reason")
                                         if isinstance(accounting.get("stop_reason"), str)
@@ -874,8 +1059,11 @@ async def _grade_batch(batch, graders: _Graders, per_problem, writer, pa, *,
 __all__ = [
     "EVALUATION_PREFIX",
     "GRADED_COLUMNS",
+    "EPISODE_SCHEMES",
+    "EpisodeJobRows",
     "JobRows",
     "collect_job_records",
+    "episode_score",
     "exhausted_prompts",
     "job_complete",
     "GradeRequestError",
@@ -888,6 +1076,7 @@ __all__ = [
     "grade_evaluation",
     "load_sets",
     "request_digest",
+    "require_gradable",
     "require_sandboxes",
     "validated_completion_keys",
 ]

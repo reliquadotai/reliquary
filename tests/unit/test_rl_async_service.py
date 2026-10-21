@@ -1,0 +1,538 @@
+"""The async RL service wiring (``validator/rl_async_service.py``, ``trainer/rl_link.py``, ``trainer/async_cli.py``):
+the mode switch, the registry declaration, the trainer link, and one CPU end-to-end run over real HTTP: the
+reference miner leases, generates (fake) and submits against the mounted routes, the async trainer takes the
+buffered groups through the link, steps (fake step), reports and publishes a delta to a fake bucket, the ledger
+accrues and ``/rl/pay`` shows it, the miner syncs the new checkpoint, and the period settles."""
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import json
+import random
+import socket
+import threading
+import time
+
+import pytest
+import torch
+
+bt = pytest.importorskip("bittensor")
+httpx = pytest.importorskip("httpx")
+
+from fastapi import FastAPI  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+from reliquary.validator.rl_async_service import (  # noqa: E402
+    ASYNC, AuditModel, PLANNED_TOKENS_PARAM, WINDOW, RlAsyncSettings, build_rl_async, build_rl_trainer_app,
+    build_rl_trainer_router, mount_rl_async, rl_async_loops, rl_async_settings, rl_mode, trainer_bind,
+)
+from tests.unit.test_rl_submit import CAP, ENV, MathEnv, Tokenizer, group  # noqa: E402
+
+MINER = bt.Keypair.create_from_uri("//Alice")
+VALIDATOR = bt.Keypair.create_from_uri("//Bob")
+TOKEN = "t" * 32
+
+
+@pytest.fixture(autouse=True)
+def small_cap(monkeypatch):
+    monkeypatch.setattr("reliquary.validator.admission.max_new_tokens_for_environment", lambda env: CAP)
+    monkeypatch.setattr("reliquary.validator.rl_submit.max_new_tokens_for_environment", lambda env: CAP)
+
+
+def test_the_mode_switch_defaults_to_windows():
+    assert rl_mode({}) == WINDOW and rl_mode({"RELIQUARY_RL_MODE": " Async "}) == ASYNC
+    with pytest.raises(ValueError):
+        rl_mode({"RELIQUARY_RL_MODE": "both"})
+
+
+def test_an_async_task_is_declared_paid_by_period_with_its_mix():
+    from reliquary.cli.main import build_task_entry, with_rl_async_params
+    from reliquary.constants import PROTOCOL_PROFILE_ID
+    from reliquary.protocol.profiles import resolve_protocol_profile
+    from reliquary.shared.task_registry import parse_registry, render_registry, validate_entry
+    from reliquary.validator import corpus_periods as cp
+
+    envs = sorted(resolve_protocol_profile(PROTOCOL_PROFILE_ID).environments)
+    split = {env: (1.0 if i == 0 else 0.0) for i, env in enumerate(envs)}
+    entry = build_task_entry(task_id="rl-async", profile_id=PROTOCOL_PROFILE_ID, cap=0.4, overrides={},
+                             env_split=split)
+    with pytest.raises(ValueError, match="settled by period"):
+        rl_async_settings(entry, 0.4)                                   # a window task is not an async one
+    declared = with_rl_async_params(entry, planned_tokens_per_period=2e8, lease_tokens_per_s=10.0)
+    validate_entry(declared)
+    assert cp.is_period_task(declared) and declared.params[PLANNED_TOKENS_PARAM] == 2e8
+    assert parse_registry(render_registry({"rl-async": declared}))["rl-async"] == declared
+    settings = rl_async_settings(declared, 0.4, run="r1", max_tokens=lambda env: 4000)
+    assert settings.targets == {envs[0]: 1.0} and settings.run == "r1" and settings.cap == 0.4
+    assert settings.lease_expiry_s == {envs[0]: 4000 / 10.0 * 2.0}
+    with pytest.raises(ValueError):
+        with_rl_async_params(entry, planned_tokens_per_period=None)
+
+
+def settings_for(**kw) -> RlAsyncSettings:
+    return RlAsyncSettings(**{"task_id": "rl-async", "cap": 0.5, "run": "smoke", "targets": {ENV: 1.0},
+                              "planned_tokens_per_period": 1e6, "lease_expiry_s": {ENV: 600.0}, **kw})
+
+
+def components(tmp_path, board=None):
+    from reliquary.validator.rl_submit import GroupGrader
+
+    grader = GroupGrader({ENV: MathEnv()}, Tokenizer(), eos_token_ids=(1,))
+    return build_rl_async(settings_for(), path=tmp_path / "rl-async.sqlite3", grader=grader, board=board,
+                          prompt_range={ENV: (0, 50)}, collector_interval_s=0.0)
+
+
+def test_the_run_benchmark_feed_is_served_from_the_private_bucket(tmp_path):
+    from reliquary.validator.server import ValidatorServer
+
+    rl = components(tmp_path)
+    server = ValidatorServer()
+    mount_rl_async(server, rl, validator_hotkey=VALIDATOR.ss58_address)
+    public = TestClient(server.app)
+    assert public.get("/rl/benchmarks", params={"run_id": "abc-r1-trainer"}).status_code == 404   # none yet
+    feeds = {"abc-r1-trainer": b'{"schema":"reliquary.run-benchmarks.v1"}'}
+    rl.benchmarks = feeds.get
+    served = public.get("/rl/benchmarks", params={"run_id": "abc-r1-trainer"})
+    assert served.status_code == 200 and served.content == feeds["abc-r1-trainer"]
+    assert served.headers["content-type"] == "application/json"
+    assert public.get("/rl/benchmarks", params={"run_id": "other"}).status_code == 404
+    for bad in ("", "../x", "a/b", "a" * 129):
+        assert public.get("/rl/benchmarks", params={"run_id": bad}).status_code == 422
+
+
+def test_the_trainer_link_needs_its_token_and_round_trips(tmp_path):
+    from reliquary.trainer.rl_link import TrainerLink, TrainerLinkError
+    from reliquary.validator.rl_leases import LeaseRequest
+
+    rl = components(tmp_path)
+    app = FastAPI()
+    app.include_router(build_rl_trainer_router(rl, token=TOKEN))
+    client = TestClient(app)
+    assert client.get("/rl/trainer/config").status_code == 401
+    assert client.get("/rl/trainer/config", headers={"Authorization": "Bearer " + "x" * 32}).status_code == 401
+    link = TrainerLink("http://testserver", TOKEN, client=client, patience_s=0.0)
+    assert link.config() == {"task_id": "rl-async", "run": "smoke", "targets": {ENV: 1.0}, "latest": None}
+    link.adopt_checkpoint(0)
+    assert link.latest_checkpoint == 0
+    lease = rl.book.grant([LeaseRequest("A", ENV, (3,), 0)])[0].leases[0]
+    assert rl.submissions.submit(lease.lease_id, "A", group(8))["verdict"] == "in_zone"
+    taken = link.take(4)
+    assert [g.lease_id for g in taken] == [lease.lease_id] and link.depth() == {}
+    assert link.requeue() == 1 and link.depth() == {ENV: 1}
+    assert link.take(4)[0].completions == taken[0].completions
+    link.report_training(lease.lease_id, rollout_match=[1.0] * 16, accepted=True, matched_tokens=[3] * 16)
+    with pytest.raises(TrainerLinkError) as missing:
+        link.report_training(lease.lease_id, rollout_match=[1.0] * 16, accepted=True)
+    assert missing.value.status == 404                                  # a first attempt: not a resend
+    with pytest.raises(TrainerLinkError):
+        link.adopt_checkpoint(-1)
+    rl.close()
+
+
+def test_the_trainer_takes_the_audits_and_reports_their_verdicts_through_its_link(tmp_path):
+    from reliquary.trainer.rl_link import TrainerLink, TrainerLinkError
+    from reliquary.validator.rl_leases import LeaseRequest
+    from reliquary.validator.rl_submit import AuditResult
+
+    rl = components(tmp_path)
+    app = FastAPI()
+    app.include_router(build_rl_trainer_router(rl, token=TOKEN))
+    client = TestClient(app)
+    assert client.post("/rl/trainer/audits", json={"limit": 1}).status_code == 401
+    link = TrainerLink("http://testserver", TOKEN, client=client, patience_s=0.0)
+    link.adopt_checkpoint(0)
+    lease = rl.book.grant([LeaseRequest("A", ENV, (4,), 0)])[0].leases[0]
+    assert rl.submissions.submit(lease.lease_id, "A", group(0))["verdict"] == "too_hard"   # probation: drawn
+    [job] = link.take_audits(8)
+    assert job.lease_id == lease.lease_id and link.take_audits(8)[0].lease_id == lease.lease_id   # until reported
+    for bad in (0, 33):
+        with pytest.raises(TrainerLinkError) as refused:
+            link.take_audits(bad)
+        assert refused.value.status == 422
+    link.report_audit(lease.lease_id, AuditResult(True, None, (0.99,) * 16))
+    assert rl.submissions.group(lease.lease_id)["audit"] == "passed" and link.take_audits(8) == []
+    with pytest.raises(TrainerLinkError) as missing:
+        link.report_audit(lease.lease_id, AuditResult(True, None, (0.99,) * 16))
+    assert missing.value.status == 404
+    rl.close()
+
+
+def test_the_trainer_link_has_its_own_listener_never_the_public_port(tmp_path):
+    from reliquary.trainer.rl_link import TrainerLink
+    from reliquary.validator.server import ValidatorServer
+
+    assert trainer_bind({}) == ("127.0.0.1", 8889)
+    with pytest.raises(ValueError, match="not loopback"):                 # plain HTTP, a token that mints pay
+        trainer_bind({"RELIQUARY_RL_TRAINER_BIND": "10.0.0.5:7000"})
+    private = {"RELIQUARY_RL_TRAINER_BIND": "10.0.0.5:7000", "RELIQUARY_RL_TRAINER_INSECURE_BIND": "1"}
+    assert trainer_bind(private) == ("10.0.0.5", 7000)                    # the operator says: a private network
+    assert trainer_bind({"RELIQUARY_RL_TRAINER_BIND": "[::1]:7000"}) == ("::1", 7000)
+    assert trainer_bind({"RELIQUARY_RL_TRAINER_BIND": "localhost:7000"}) == ("localhost", 7000)
+    for bad in ("7000", "host:", "host:99999", ":80"):
+        with pytest.raises(ValueError):
+            trainer_bind({"RELIQUARY_RL_TRAINER_BIND": bad})
+
+    class Board:
+        async def answer(self):
+            return {"index": {"latest": {"version": 3}}, "signature": "s"}
+
+    rl = components(tmp_path, board=Board())
+    server = ValidatorServer()
+    mount_rl_async(server, rl, validator_hotkey=VALIDATOR.ss58_address)
+    public = TestClient(server.app)
+    auth = {"Authorization": f"Bearer {TOKEN}"}
+    assert public.get("/rl/trainer/config", headers=auth).status_code == 404     # not on the public port
+    assert public.get("/rl/checkpoint").json()["signature"] == "s"
+    trainer = TestClient(build_rl_trainer_app(rl, token=TOKEN))
+    assert trainer.get("/rl/trainer/checkpoint").status_code == 401
+    assert trainer.get("/rl/checkpoint").status_code == 404                      # only the link lives here
+    link = TrainerLink("http://testserver", TOKEN, client=trainer, patience_s=0.0)
+    assert link.checkpoint()["index"]["latest"]["version"] == 3 and link.config()["run"] == "smoke"
+    rl.close()
+
+
+def test_a_lost_report_answer_is_resent_and_counts_as_done(tmp_path):
+    from reliquary.trainer.rl_link import TrainerLink
+
+    class LosesFirstAnswer:
+        def __init__(self, inner):
+            self.inner, self.calls = inner, 0
+
+        def request(self, *args, **kwargs):
+            self.calls += 1
+            answer = self.inner.request(*args, **kwargs)
+            if self.calls == 1:
+                raise httpx.ReadTimeout("lost")
+            return answer
+
+    rl = components(tmp_path)
+    app = FastAPI()
+    app.include_router(build_rl_trainer_router(rl, token=TOKEN))
+    from reliquary.validator.rl_leases import LeaseRequest
+
+    rl.book.adopt_checkpoint(0)
+    lease = rl.book.grant([LeaseRequest("A", ENV, (3,), 0)])[0].leases[0]
+    rl.submissions.submit(lease.lease_id, "A", group(8))
+    rl.buffer.take(1)
+    flaky = LosesFirstAnswer(TestClient(app))
+    link = TrainerLink("http://testserver", TOKEN, client=flaky, sleep=lambda s: None)
+    link.report_training(lease.lease_id, rollout_match=[1.0] * 16, accepted=True)
+    assert flaky.calls == 2 and [e["kind"] for e in rl.submissions.events()] == ["trained"]
+    rl.close()
+
+
+def test_the_trainer_resumes_from_the_latest_published_checkpoint(tmp_path):
+    from reliquary.trainer.async_cli import resume_weights
+
+    class Link:
+        def __init__(self, latest):
+            self.latest_checkpoint, self.adopted = latest, []
+
+        def adopt_checkpoint(self, k):
+            self.adopted.append(k)
+
+    class Sync:
+        model_dir = tmp_path / "files"
+
+        def __init__(self, version):
+            self.version = version
+
+        def sync(self, response, state, version):
+            assert state is None and version is None                      # always rebuilt from an anchor
+            return {"w": torch.zeros(1)}, self.version, None
+
+    fresh = Link(None)
+    assert resume_weights(fresh, validator_hotkey="v", work_dir=tmp_path, sync=Sync(0), fetch=dict) is None
+    behind = Link(3)
+    state, version, files = resume_weights(behind, validator_hotkey="v", work_dir=tmp_path, sync=Sync(4),
+                                           fetch=dict)
+    assert version == 4 and behind.adopted == [4] and files == Sync.model_dir      # published, never adopted
+    with pytest.raises(RuntimeError):
+        resume_weights(Link(5), validator_hotkey="v", work_dir=tmp_path, sync=Sync(4), fetch=dict)
+
+
+# --- end to end ---------------------------------------------------------------------------------------------------
+class MemoryStore:
+    def __init__(self):
+        self.objects: dict[str, bytes] = {}
+
+    def put_bytes(self, key, data):
+        self.objects[key] = bytes(data)
+
+    def put_file(self, key, path):
+        self.objects[key] = open(path, "rb").read()
+
+    def get_bytes(self, key):
+        return self.objects.get(key)
+
+    def delete(self, key):
+        self.objects.pop(key, None)
+
+
+class Served:
+    """The app on a real socket (uvicorn in a thread)."""
+
+    def __init__(self, app):
+        import uvicorn
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        self.url = f"http://127.0.0.1:{sock.getsockname()[1]}"
+        self.server = uvicorn.Server(uvicorn.Config(app, log_level="warning", ws="none", lifespan="off"))
+        self.thread = threading.Thread(target=self.server.run, kwargs={"sockets": [sock]}, daemon=True)
+        self.thread.start()
+        for _ in range(500):
+            if self.server.started:
+                return
+            time.sleep(0.01)
+        raise RuntimeError("server did not start")
+
+    def stop(self):
+        self.server.should_exit = True
+        self.thread.join(10)
+
+
+class Archives:
+    def __init__(self):
+        self.written = []
+
+    async def read(self, task_id, work_period, entry_period):
+        return next((doc for task, work, entry, doc in self.written
+                     if (task, work, entry) == (task_id, work_period, entry_period)), None)
+
+    async def write(self, task_id, work_period, entry_period, doc):
+        self.written.append((task_id, work_period, entry_period, doc))
+
+
+def in_zone_or_hard(leases):
+    """A generator stand-in: an even prompt gets an in-zone group (8/16 right), an odd one 0/16 (too hard)."""
+    return [[list(r.tokens) for r in group(8 if lease.prompt_idx % 2 == 0 else 0)] for lease in leases]
+
+
+async def test_end_to_end_lease_submit_train_pay_and_sync(tmp_path):
+    from reliquary.miner.ckpt_sync import CheckpointSync
+    from reliquary.miner.rl_async import (
+        AsyncMiner, AsyncMinerConfig, FakeGroupGenerator, HttpRlTransport, PromptPlanner,
+    )
+    from reliquary.shared.ckpt_index import index_key
+    from reliquary.trainer.async_cli import run_forever
+    from reliquary.trainer.async_trainer import AsyncTrainer, AsyncTrainerConfig
+    from reliquary.trainer.ckpt_publisher import DeltaPublisher
+    from reliquary.trainer.rl_link import TrainerLink
+    from reliquary.validator.rl_checkpoint import RlCheckpointBoard
+    from reliquary.validator.server import ValidatorServer
+
+    started = time.monotonic()
+    store = MemoryStore()
+    board = RlCheckpointBoard(load_index=lambda: store.get_bytes(index_key("smoke")),
+                              sign_fn=lambda payload: VALIDATOR.sign(payload), validator_hotkey=VALIDATOR.ss58_address,
+                              presign=lambda key: f"mem://{key}", refresh_seconds=0)
+    rl = components(tmp_path, board=board)
+    server = ValidatorServer()
+    mount_rl_async(server, rl, validator_hotkey=VALIDATOR.ss58_address)
+    served, trainer_served = Served(server.app), Served(build_rl_trainer_app(rl, token=TOKEN))
+    try:
+        # --- the trainer: a tiny model, a fresh book -> checkpoint 0 published and adopted through the link
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "tiny"}))
+        (model_dir / "tokenizer.json").write_text("{}")
+        model = torch.nn.Linear(8, 8).to(torch.bfloat16)
+
+        def fake_step(model, batches, *, gate, **_):
+            for g in (g for b in batches for g in b):
+                n = len(g.rollouts[0].commit["tokens"]) - g.rollouts[0].commit["rollout"]["prompt_length"]
+                gate.admit(g.rollouts, [(30, 30, n, n)] * len(g.rollouts))
+            gate.judge([])
+            with torch.no_grad():
+                model.weight[0, :3] += 1.0
+            return model
+
+        link = TrainerLink(trainer_served.url, TOKEN, patience_s=5.0)
+        publisher = DeltaPublisher(run="smoke", store=store, staging_dir=tmp_path / "staging", model_dir=model_dir)
+        trainer = AsyncTrainer(model, config=AsyncTrainerConfig(batch_groups=4),
+                               buffer=link, submissions=link, book=link, publisher=publisher,
+                               train_step_fn=fake_step)
+        assert rl.book.latest_checkpoint == 0 and trainer.version == 0
+
+        # --- the miner over HTTP: syncs checkpoint 0 from /rl/checkpoint, leases, generates, submits
+        def download(url, dest):
+            dest.write_bytes(store.objects[url.removeprefix("mem://")])
+
+        sync = CheckpointSync(validator_hotkey=VALIDATOR.ss58_address, work_dir=tmp_path / "miner-dl",
+                              download=download, model_dir=tmp_path / "miner-model")
+        generator = FakeGroupGenerator()
+        generator.generate = in_zone_or_hard
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            transport = HttpRlTransport(client, base_url=served.url, hotkey=MINER.ss58_address,
+                                        validator_hotkey=VALIDATOR.ss58_address,
+                                        sign_binding=lambda binding: MINER.sign(binding).hex())
+            miner = AsyncMiner(AsyncMinerConfig(environments=(ENV,), batch_groups=4, submit_backoff_s=(0.0,)),
+                               transport=transport, generator=generator,
+                               planners={ENV: PromptPlanner(ENV, (0, 50), rng=random.Random(0))},
+                               checkpoint_sync=sync, rng=random.Random(0))
+            assert await miner.follow_checkpoint_once() == 0
+            assert (tmp_path / "miner-model" / "config.json").is_file()        # the anchor's model files
+            assert await miner.swap_if_ready() and miner.loaded_version == 0
+            await miner.refresh_quota()
+            await miner.refresh_state()
+            assert await miner.lease_more() == 4                              # the starting quota
+            assert await miner.generate_once() == 4
+            await miner.drain()
+            assert generator.loads == [0] and miner.stats["submitted"] == 4
+            verdicts = miner.stats["verdicts"]
+            assert sum(verdicts.values()) == 4 and verdicts.get("in_zone", 0) >= 1 and verdicts.get("too_hard", 0) >= 1
+            in_zone = verdicts["in_zone"]
+            assert rl.buffer.depth() == {ENV: in_zone}
+
+            # --- the background loops: expiry, audits (no verify model: inconclusive), ledger, prices
+            archives = Archives()
+            loops = [asyncio.create_task(c) for c in rl_async_loops(
+                rl, archives=archives, every={"expire": 0.01, "audit": 0.01, "ledger": 0.01, "price": 0.01})]
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                if not rl.submissions.audit_jobs(10):
+                    break
+            assert rl.submissions.audit_jobs(10) == []                          # every out-of-zone group concluded
+
+            # --- one trainer step through the link (the batch is what passed): report, publish 1, adopt, speed
+            trainer.config = dataclasses.replace(trainer.config, batch_groups=in_zone)
+            await asyncio.to_thread(run_forever, trainer, steps=1)
+            await asyncio.to_thread(trainer.close)
+            assert trainer.last_step["result"] == "trained" and trainer.version == 1
+            assert rl.book.latest_checkpoint == 1 and rl.buffer.depth() == {}
+            kinds = [e["kind"] for e in rl.submissions.events()]
+            assert kinds.count("trained") == in_zone
+            assert kinds.count("first_scan_forfeited") == verdicts["too_hard"]  # probation audits, inconclusive
+
+            # --- pay: the ledger accrues the trained groups, /rl/pay shows them
+            await asyncio.to_thread(rl.ledger.ingest)
+            pay = (await client.get(f"{served.url}/rl/pay", params={"hotkey": MINER.ss58_address})).json()
+            assert pay["hotkeys"][MINER.ss58_address]["accrued"] > 0
+            assert pay["environments"][ENV]["target_share"] == 1.0
+
+            # --- the miner syncs checkpoint 1 (a delta) and swaps it in before its next batch
+            assert await miner.follow_checkpoint_once() == 1
+            assert torch.equal(miner._state["weight"].view(torch.int16),
+                               trainer.model.state_dict()["weight"].view(torch.int16))
+            await miner.lease_more()
+            await miner.generate_once()
+            await miner.drain()
+            assert generator.loads == [0, 1]
+
+            # --- the validator's verify model follows the checkpoints; audits wait while it lags
+            audit_sync = CheckpointSync(validator_hotkey=VALIDATOR.ss58_address, work_dir=tmp_path / "audit-dl",
+                                        download=download)
+            audit = AuditModel(torch.nn.Linear(8, 8).to(torch.bfloat16), audit_sync)
+            assert audit.audit(1, rl.submissions, 8) is None
+            assert await audit.follow_once(board) == 1 and await audit.follow_once(board) is None
+            assert torch.equal(audit.model.weight, trainer.model.weight)
+            for task in loops:
+                task.cancel()
+            await asyncio.gather(*loops, return_exceptions=True)
+
+        # --- settlement: the period closes, its archive pays the miner under the cap
+        settled = rl.ledger.settle(now=time.time() + 3 * 4320)
+        assert settled and settled[0]["rewards_by_hotkey"][MINER.ss58_address] > 0
+        assert await rl.ledger.publish(archives) == len(settled) and archives.written[0][0] == "rl-async"
+    finally:
+        served.stop()
+        trainer_served.stop()
+        rl.close()
+    assert time.monotonic() - started < 60
+
+
+# --- discovery ------------------------------------------------------------------------------------------------------
+async def test_the_async_validator_serves_its_axon_like_the_window_one(monkeypatch):
+    from types import SimpleNamespace
+
+    from reliquary.validator.axon import serve_axon_on_chain
+
+    served = []
+
+    class Subtensor:
+        async def serve_axon(self, **kw):
+            served.append(kw)
+            return SimpleNamespace(is_success=True)
+
+    monkeypatch.setattr(bt, "Axon", lambda **kw: SimpleNamespace(**kw))
+    wallet = SimpleNamespace(hotkey=VALIDATOR)
+    assert await serve_axon_on_chain(Subtensor(), wallet=wallet, netuid=81, ip="1.2.3.4", port=8888)
+    assert served[0]["netuid"] == 81 and (served[0]["axon"].ip, served[0]["axon"].port) == ("1.2.3.4", 8888)
+    assert not await serve_axon_on_chain(Subtensor(), wallet=wallet, netuid=81, ip=None, port=8888)   # no address
+
+    class Signer:
+        async def serve_axon(self, **kw):
+            served.append(("signer", kw))
+            return True
+
+    assert await serve_axon_on_chain(None, wallet=wallet, netuid=81, ip="1.2.3.4", port=9000, signer_client=Signer())
+    assert served[-1] == ("signer", {"netuid": 81, "ip": "1.2.3.4", "port": 9000})
+
+
+def test_mine_async_finds_the_validator_on_the_metagraph(monkeypatch):
+    from types import SimpleNamespace
+
+    from typer.testing import CliRunner
+
+    import reliquary.cli.main as cli
+    from reliquary.miner.submitter import discover_validator
+
+    meta = SimpleNamespace(validator_permit=[False, True], hotkeys=["5Miner", "5Validator"],
+                           axons=[SimpleNamespace(ip="9.9.9.9", port=1), SimpleNamespace(ip="1.2.3.4", port=8888)])
+    assert discover_validator(meta) == ("http://1.2.3.4:8888", "5Validator")
+
+    async def discovered():
+        return discover_validator(meta)
+
+    runs = []
+
+    async def run_async_miner(config, **kw):
+        runs.append(kw)
+
+    monkeypatch.setattr(cli, "_discover_rl_validator", discovered)
+    monkeypatch.setattr("reliquary.miner.rl_async.run_async_miner", run_async_miner)
+    monkeypatch.setattr(bt, "Wallet", lambda **kw: SimpleNamespace(**kw))
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["mine-async", "--environments", ENV])
+    assert result.exit_code == 0, result.output
+    assert (runs[-1]["validator_url"], runs[-1]["validator_hotkey"]) == ("http://1.2.3.4:8888", "5Validator")
+    result = runner.invoke(cli.app, ["mine-async", "--environments", ENV, "--validator-url", "http://x:1/",
+                                     "--validator-hotkey", "5Override"])
+    assert result.exit_code == 0 and (runs[-1]["validator_url"], runs[-1]["validator_hotkey"]) == ("http://x:1",
+                                                                                                    "5Override")
+    assert runner.invoke(cli.app, ["mine-async", "--environments", ENV, "--validator-url", "http://x:1"]).exit_code == 2
+
+
+def test_the_controller_wandb_row_reads_prices_buffer_leases_and_miners(tmp_path):
+    import time
+
+    from reliquary.validator.rl_leases import LeaseRequest
+    from reliquary.validator.rl_metrics import controller_metrics
+
+    rl = components(tmp_path)
+    rl.book.adopt_checkpoint(0)
+    leases = rl.book.grant([LeaseRequest("A", ENV, (3, 4), 0)])[0].leases
+    assert rl.submissions.submit(leases[0].lease_id, "A", group(8))["verdict"] == "in_zone"
+    row = controller_metrics(rl, time.time())
+    assert row[f"price/{ENV}/multiplier"] > 0 and row[f"buffer/{ENV}/queued"] == 1
+    assert row["leases/open"] == 1 and row["leases/submitted"] == 1 and row[f"leases_issued/{ENV}"] == 2
+    assert row[f"groups/{ENV}/in_zone"] == 1 and row["miners/active"] == 1 and row["miners/banned"] == 0
+    rl.close()
+
+
+async def test_with_audits_on_the_trainer_the_validator_loop_never_concludes_them_itself(tmp_path):
+    from reliquary.validator.rl_leases import LeaseRequest
+
+    rl = components(tmp_path)
+    rl.book.adopt_checkpoint(0)
+    lease = rl.book.grant([LeaseRequest("A", ENV, (5,), 0)])[0].leases[0]
+    rl.submissions.submit(lease.lease_id, "A", group(0))
+    loops = [asyncio.create_task(c) for c in rl_async_loops(
+        rl, archives=Archives(), trainer_audits=True, every={"expire": 9, "audit": 0.01, "ledger": 9, "price": 9})]
+    await asyncio.sleep(0.2)
+    for task in loops:
+        task.cancel()
+    await asyncio.gather(*loops, return_exceptions=True)
+    assert [g.lease_id for g in rl.submissions.audit_jobs(10)] == [lease.lease_id]   # left to the trainer
+    rl.close()
