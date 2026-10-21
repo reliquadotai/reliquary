@@ -86,7 +86,7 @@ absent means `bash-vf-b2e4e81@1`. `EpisodeEnvPolicy.harness_pin()` carries it.
 - The window path (`episode_mining._episode_policies`) refuses a pin with variants.
 
 **Pins.** `agentic_swe.HARNESS_DIGESTS` lists every spec this build serves at the digest it was
-built against: `bash-vf-b2e4e81@1`, `bash-surface@1` and `mini-swe@1`. `harness_refusal` checks the installed
+built against: `bash-vf-b2e4e81@1`, `bash-surface@1`, `mini-swe@2`, `openhands-xml@1`, `claude-code@1`, `codex@1`. `harness_refusal` checks the installed
 package against them.
 
 **Record 0 is unchanged** (DECIDED in implementation, against the earlier PROPOSED). The harness
@@ -201,27 +201,33 @@ not in `bash-surface@1`: ship few variants first, and measure.
 an RL smoke. Telecom's 0/38 with unfamiliar markup is the warning. Turning it on means adding
 `harness: {bash-surface, 1, <digest>}` to the SWE/TMax `rl_episode_envs` blocks.
 
-## 6. Choosing the harness, and `mini-swe@1` (DONE on the branches)
+## 6. Choosing the harness, and `mini-swe@2` (DONE on the branches)
 
 **At task creation.** `reliquary tasks create --rl-async … --rl-episode-envs envs.json --harness
-swe_v1=mini-swe@1,tmax_v1=bash-surface@1` writes `{id, version, digest}` into each named env's
+swe_v1=mini-swe@2,tmax_v1=bash-surface@1` writes `{id, version, digest}` into each named env's
 `episode.harness` (`cli.main.with_episode_harnesses`). The digest is the one this build serves,
 so a typo or a stale build fails at creation. An env not named keeps the compatibility harness.
 One harness per env, or a weighted mix drawn per lease (section 6c).
 
-**`mini-swe@1`** (`reliquary_harness.mini`, texts from mini-swe-agent 04d809ce, MIT): no tool
-schema in the prompt; the model writes one command in a ```` ```mswea_bash_command ```` block.
+**`mini-swe@2`** (`reliquary_harness.mini`, reliquary-harness 7d559fd): mini-swe-agent's official SWE-bench
+harness, `config/benchmarks/swebench.yaml` at 04d809ce (MIT), the configuration the SWE-bench bash-only
+leaderboard runs. Its texts are the upstream Jinja templates rendered (vendored with a parity test).
 
-- Exactly one block is one canonical `bash` call. The gateway runs it as any other call.
-- `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` ends the episode without running (the gateway
-  grades the box; there is no output to read a marker from).
-- Zero or several blocks: a local call to `?format` (or `?length` for a turn cut by its token
-  cap), answered with mini's error text; the episode goes on. These are tools nobody offers,
-  so the gateway never runs them, and the validator reads them back the same way.
-- The observation is mini's `<returncode>…</returncode>\n<output>…</output>` as a user
-  message, head and tail past 10000 characters; a timed-out or cut command shows the gateway's
-  flags in `<exception>`, not a Python exception.
+- One tool, mini's `bash` (`{"command"}`), through the template's tool calls; several calls a turn, each a
+  canonical `bash` call, each result a tool message (`<returncode>…</returncode>\n<output>…</output>`, the output
+  as is, head and tail with a warning from 10000 characters). `edit` is never shown.
+- A turn with no call, or with any call that is not a bash call with a command, is mini's format error for the
+  whole turn (`parse_toolcall_actions`): a local `?format` (`?length` for a turn cut at its token cap), sent back
+  as a user message; none of the turn's calls run and the episode goes on.
+- The submit command (`echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat patch.txt`) ends the episode without
+  running (the gateway grades the box). Mini's stop after 3 consecutive format errors is not reproduced: the
+  episode runs to its limits.
+- A timed-out or cut command shows the gateway's flags in `<exception>`, not a Python exception.
 - Any task can pin it: a corpus or eval job, an RL window, an RL lease (section 6b).
+
+`mini-swe@1`, the text-based form (`config/mini_textbased.yaml`: one ```` ```mswea_bash_command ```` block a
+turn), is no longer served: the leaderboard does not run it, and the launch checkpoint missed its format on
+82-97 % of turns (2026-10-21).
 
 ## 6b. Any harness on any task (DONE on the branches, 2026-10-21)
 
@@ -229,7 +235,7 @@ A harness is chosen when the task is created, and every path plays it:
 
 | Task | Where the pin lives | Chosen with | Miner | Validator | Export |
 |---|---|---|---|---|---|
-| Corpus (SFT) or eval job, signed | `episode.harness_spec` | `jobs create --harness mini-swe@1` | `agentic_miner` renders with `job_turn_renderer`; `SignedSweEpisodeRunner` plays `job_harness(job)` | `signed_intake` renders with `job_turn_renderer` | `jobs export` rebuilds the conversation in the spec (system prompt, first user message, observation messages) |
+| Corpus (SFT) or eval job, signed | `episode.harness_spec` | `jobs create --harness mini-swe@2` | `agentic_miner` renders with `job_turn_renderer`; `SignedSweEpisodeRunner` plays `job_harness(job)` | `signed_intake` renders with `job_turn_renderer` | `jobs export` rebuilds the conversation in the spec (system prompt, first user message, observation messages) |
 | RL window | `rl_episode_envs.<env>.episode.harness` | the registry block | `episode_mining` renders and plays the pin | `_default_episode_renderer` renders in the pin | none (RL) |
 | RL lease | same | `tasks create --harness env=id@version` | section 5 | section 5 | none (RL) |
 
@@ -267,7 +273,7 @@ variant it draws, with one renderer per (harness, variant). Every binary must se
 harness of the mix, or it refuses the env.
 
 **Choosing it**: `reliquary tasks create --rl-async … --harness
-swe_v1=mini-swe@1:3+bash-surface@1:1` (weight 1 by default).
+swe_v1=mini-swe@2:3+bash-surface@1:1` (weight 1 by default).
 
 **Outcomes per harness.** The checker logs every lease, `episode lease <id> (<env>, <harness>,
 surface variant <n>): admitted | rejected <stage> <detail>`, and counts them in

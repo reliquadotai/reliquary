@@ -712,8 +712,8 @@ def tasks_create(
     harness: str = typer.Option(
         None, "--harness",
         help="With --rl-async: env=id@version,... the reliquary-harness spec each --rl-episode-envs env plays "
-        "(e.g. swe_v1=mini-swe@1, tmax_v1=bash-surface@1), or a weighted mix drawn per lease "
-        "(swe_v1=mini-swe@1:1+bash-surface@1:1); unnamed envs play bash-vf-b2e4e81@1",
+        "(e.g. swe_v1=mini-swe@2, tmax_v1=bash-surface@1), or a weighted mix drawn per lease "
+        "(swe_v1=mini-swe@2:1+bash-surface@1:1); unnamed envs play bash-vf-b2e4e81@1",
     ),
 ) -> None:
     from reliquary.infrastructure.task_registry_store import create_task
@@ -1654,7 +1654,7 @@ def jobs_create(
         None,
         "--harness",
         help="The reliquary-harness spec the job's signed episodes play, as id@version (e.g. "
-        "mini-swe@1), pinned at the digest this install serves. Omit for the compatibility "
+        "mini-swe@2), pinned at the digest this install serves. Omit for the compatibility "
         "harness bash-vf-b2e4e81@1. A harness with surface variants is an RL lease's only",
     ),
     settlement: str = typer.Option(
