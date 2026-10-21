@@ -19,23 +19,23 @@ from collections.abc import Sequence
 
 from reliquary_harness import qwen as _harness_qwen
 from reliquary_harness.spec import (
-    BASH_SURFACE_V1, CLAUDE_CODE_V1, CODEX_V1, MINI_SWE_V1, OPENHANDS_XML_V1, VERIFIERS_COMMIT, get_spec,
+    BASH_SURFACE_V1, CLAUDE_CODE_V1, CODEX_V1, MINI_SWE_V2, OPENHANDS_XML_V1, VERIFIERS_COMMIT, get_spec,
 )
 from reliquary_harness.spec import BASH_VF_B2E4E81 as HARNESS
 from reliquary_harness.variant import variant_count, variant_index
 
 from reliquary.environment.agentic.types import EpisodeTask
 
-HARNESS_DIGEST = "14651439bf25cc307d9042a5164f9ba04aebceb07fea22c4b16c11f21c10a601"
+HARNESS_DIGEST = "9a6b27dd764cffee512f77f430747c40c220fd6492b30696b8c89e2fb20f9fca"
 """The bash harness this build renders, checks and mines with (`HARNESS.digest`): an
 installed reliquary-harness with another digest is not this build's harness."""
 HARNESS_DIGESTS = {
     HARNESS.key: HARNESS_DIGEST,
-    BASH_SURFACE_V1.key: "bb81bb9d68b797baadbe320c93a2493e2080f0eeef6395d44e658892b09a457c",
-    MINI_SWE_V1.key: "4d4065b3fad68f365c6705dfac080b5300f4d9992f318d69ccc4d46a3f1b7cea",
-    OPENHANDS_XML_V1.key: "89409c27271b1ddf857146b66a80844091babded668267c883ad05cf087421ab",
-    CLAUDE_CODE_V1.key: "e9bc695e9eaf03a670d3568fb36b5faeb62ea50ace13b10048ff3377e469788c",
-    CODEX_V1.key: "9dd244185f2cd3e1c5ba7ea97f6c9f22f84cd9d2d42458c04df123c80a39a138",
+    BASH_SURFACE_V1.key: "4943b1efec1c88691a727f819538b00ef321e6eb8c274e79d2d1ddca3306c4be",
+    MINI_SWE_V2.key: "cecffb2631c01e2dd415a4e9cb76d79717d1a0b67bd0187422a658ef9173f15d",
+    OPENHANDS_XML_V1.key: "0b1a9b92ccb3b43e8954a15afa5ab6c5f14e57190a734118f817ce7da848ff4d",
+    CLAUDE_CODE_V1.key: "2763bcd5c36ac027e9d5e24cad80c9c606fbbb26e07bcb2f192ecb9ba464e40d",
+    CODEX_V1.key: "00d2979c6a783bb71ffb0c553881155cb61f8868ea20d61f7cc0cd75fd99a61b",
 }
 """Every harness spec this build serves, by `id@version`, at the digest it was built against.
 A job or an RL episode env names one with `{id, version, digest}`; one naming none is
