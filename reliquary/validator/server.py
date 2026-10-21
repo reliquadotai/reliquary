@@ -6184,7 +6184,7 @@ class ValidatorServer:
                     prompt_range = window_prompt_range(
                         batcher.randomness,
                         getattr(batcher.env, "name", environment),
-                        len(batcher.env),
+                        await asyncio.to_thread(len, batcher.env),
                         PROMPT_RANGE_SIZE,
                     )
                 if prompt_range is None:
