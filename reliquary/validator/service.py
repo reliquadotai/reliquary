@@ -8829,10 +8829,19 @@ class ValidationService:
         self._episode_tasks = [asyncio.create_task(job) for job in jobs]
 
     def _default_episode_renderer(self, policy):
-        """The turn renderer of the policy's tokenizer over the env's tools (the signed parse)."""
-        from reliquary.environment.agentic_swe import load_turn_renderer
+        """The turn renderer of the policy's tokenizer over the env's tools, in the order's harness (the
+        signed parse). A harness this build does not serve, or one with variants (a window draws none), is
+        refused before anything is served."""
+        from reliquary.environment.agentic_swe import (
+            harness_of, harness_pin_refusal, load_turn_renderer, policy_harness_pin,
+        )
 
-        return load_turn_renderer(str(getattr(self.tokenizer, "name_or_path", "")), tools=tuple(policy.tools))
+        pin = policy_harness_pin(policy)
+        refusal = harness_pin_refusal(pin, variants=False)
+        if refusal:
+            raise ValueError(f"{policy.environment}: {refusal}")
+        return load_turn_renderer(str(getattr(self.tokenizer, "name_or_path", "")), tools=tuple(policy.tools),
+                                  spec=harness_of(pin))
 
     async def _stop_episode_services(self) -> None:
         tasks = list(getattr(self, "_episode_tasks", None) or [])

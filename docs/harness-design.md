@@ -221,7 +221,30 @@ schema in the prompt; the model writes one command in a ```` ```mswea_bash_comma
 - The observation is mini's `<returncode>…</returncode>\n<output>…</output>` as a user
   message, head and tail past 10000 characters; a timed-out or cut command shows the gateway's
   flags in `<exception>`, not a Python exception.
-- A corpus job cannot pin it: corpus jobs play `bash-vf-b2e4e81@1` only.
+- Any task can pin it: a corpus or eval job, an RL window, an RL lease (section 6b).
+
+## 6b. Any harness on any task (DONE on the branches, 2026-10-21)
+
+A harness is chosen when the task is created, and every path plays it:
+
+| Task | Where the pin lives | Chosen with | Miner | Validator | Export |
+|---|---|---|---|---|---|
+| Corpus (SFT) or eval job, signed | `episode.harness_spec` | `jobs create --harness mini-swe@1` | `agentic_miner` renders with `job_turn_renderer`; `SignedSweEpisodeRunner` plays `job_harness(job)` | `signed_intake` renders with `job_turn_renderer` | `jobs export` rebuilds the conversation in the spec (system prompt, first user message, observation messages) |
+| RL window | `rl_episode_envs.<env>.episode.harness` | the registry block | `episode_mining` renders and plays the pin | `_default_episode_renderer` renders in the pin | none (RL) |
+| RL lease | same | `tasks create --harness env=id@version` | section 5 | section 5 | none (RL) |
+
+- `agentic_swe.job_turn_renderer(job, dir)` is the one renderer of a signed job: the miner, the
+  intake and the export all build it, so they cannot disagree.
+- Only a harness with surface variants stays an RL lease's: a corpus job, an eval job and an RL
+  window have no validator seed to draw a variant from (`harness_pin_refusal(variants=False)`).
+- The legacy Docker replay (unsigned corpus jobs) runs verifiers' own bash harness: it plays
+  the compatibility harness only, and refuses any other pin (`episode_support_refusal`). It
+  goes in step 7.
+- No pin, no change: every existing manifest and registry block keeps its bytes and plays
+  `bash-vf-b2e4e81@1`.
+- Tests: `test_harness_any_task` (a mini-swe job mined by the miner's loop against the real
+  gateway, admitted once by the corpus intake, graded, and exported as mini's conversation;
+  the window paths; `jobs create --harness`; the replay refusal).
 
 **Smoke lessons** (2026-10-20, Qwen3.5-2B on one H100, forced draw, real gateway):
 

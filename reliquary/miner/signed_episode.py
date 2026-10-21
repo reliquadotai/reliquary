@@ -350,7 +350,7 @@ class SignedSweEpisodeRunner:
                  sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
                  monotonic: Callable[[], float] = time.monotonic,
                  max_live: int = DEFAULT_MAX_LIVE_PER_JOB, harness=None, variant: int = 0) -> None:
-        from reliquary.environment.agentic_swe import job_signed_source
+        from reliquary.environment.agentic_swe import job_harness, job_signed_source
 
         if ss58_format_42(hotkey) != hotkey:
             raise ValueError("a signed-sandbox miner's hotkey must be an ss58 format-42 address "
@@ -371,9 +371,10 @@ class SignedSweEpisodeRunner:
         self._runner_factory = runner_factory
         self._clock, self._new_request_id, self._sleep = clock, new_request_id, sleep
         self._monotonic = monotonic
-        # The harness spec and surface variant every episode of this runner plays (an RL lease's;
-        # None: the compatibility harness).
-        self._harness, self._variant = harness, int(variant)
+        # The harness spec and surface variant every episode of this runner plays: an RL lease's,
+        # else the job's own (`episode.harness_spec`; none: the compatibility harness).
+        self._harness = harness if harness is not None else job_harness(job)
+        self._variant = int(variant)
         self._runners: dict[str, object] = {}
         self._runners_lock = asyncio.Lock()
         self._stack = AsyncExitStack()

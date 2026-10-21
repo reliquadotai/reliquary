@@ -504,14 +504,14 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
         refusal = agentic_episode.network_notice_refusal()
         if refusal:
             raise RuntimeError(f"refusing to mine: {refusal}")
-    from reliquary.environment.agentic_swe import load_turn_renderer
+    from reliquary.environment.agentic_swe import job_turn_renderer, load_turn_renderer
     from reliquary.miner.agentic_episode import SweEpisodeRunner
     from reliquary.miner.corpus_generate_server import (
         GenerateEngine, VllmTurnCore, build_generate_app,
     )
 
-    renderer = load_turn_renderer(checkpoint_dir, tools=job.episode.sandbox.tools if signed
-                                  else ("bash", "edit"))
+    renderer = (job_turn_renderer(job, checkpoint_dir) if signed
+                else load_turn_renderer(checkpoint_dir, tools=("bash", "edit")))
     stop_ids = sorted(renderer.stop_ids)
     core = VllmTurnCore(checkpoint_dir, sampling=job.sampling, proof=proof, stop_token_ids=stop_ids,
                         max_total_tokens=job.episode.max_total_tokens, max_num_seqs=max_num_seqs,
