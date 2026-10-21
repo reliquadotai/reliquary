@@ -58,8 +58,10 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 from reliquary.constants import MAX_TRUNCATED_PER_SUBMISSION, SIGMA_MIN_V4, prompt_cooldown_windows_for_environment
+from reliquary.protocol.rl_prompt_ranges import PromptRows
 from reliquary.validator.rl_lease_quota import QuotaController
 
 TAKEN, COOLING, BLACKLISTED, QUOTA, STALE, BANNED = "taken", "cooling", "blacklisted", "quota", "stale", "banned"
@@ -194,9 +196,8 @@ class LeaseAnswer:
 class LeaseBookConfig:
     expiry_s: Mapping[str, float]                              # per served env: ``lease_expiry_s``
     max_lag: int = SECRET_REVEAL_LAG
-    prompt_range: Mapping[str, tuple[int, int]] | None = None  # per env: ``rl_prompt_ranges.rl_prompt_range``
-    # per env: rows of its range RL never draws (``rl_prompt_ranges.rl_excluded_prompts``)
-    prompt_excluded: Mapping[str, frozenset[int]] | None = None
+    # per env: ``(start, end)`` (``rl_prompt_ranges.rl_prompt_range``) or ``PromptRows`` (an episode env's rows)
+    prompt_range: Mapping[str, Any] | None = None
     # Decision E: a static per-env cooldown set by an operator, read at each outcome so a live change applies to the
     # next cooldown. The profile's ``prompt_cooldown_windows`` counts checkpoints in the async protocol; the service
     # can pass its live schedule instead.
@@ -374,11 +375,8 @@ class LeaseBook:
         if any(type(p) is not int or p < 0 for p in ids) or len(set(ids)) != len(ids):
             raise ValueError("prompt ids must be distinct non-negative integers")
         bounds = (self.config.prompt_range or {}).get(request.environment)
-        if bounds is not None and any(not (bounds[0] <= p < bounds[1]) for p in ids):
+        if bounds is not None and any(p not in PromptRows.of(bounds) for p in ids):
             raise ValueError("prompt outside the environment's RL range")
-        excluded = (self.config.prompt_excluded or {}).get(request.environment)
-        if excluded and any(p in excluded for p in ids):
-            raise ValueError("prompt excluded from the environment's RL draw")
 
     @staticmethod
     def _lease(row) -> Lease:

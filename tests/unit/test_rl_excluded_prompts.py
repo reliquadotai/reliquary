@@ -12,7 +12,9 @@ import pytest
 from reliquary.environment.agentic.envs.envscaler_tools_v2 import corpus as layout
 from reliquary.environment.agentic.envs.envscaler_tools_v2.environment import EnvScalerToolsV2Environment
 from reliquary.miner.rl_async import PromptPlanner
-from reliquary.protocol.rl_prompt_ranges import RL_EXCLUDED_WORLDS, rl_excluded_prompts
+from reliquary.protocol.rl_prompt_ranges import (
+    RL_EXCLUDED_WORLDS, PromptRows, rl_excluded_prompts, rl_prompt_rows,
+)
 from reliquary.validator.rl_cooldown import AdaptiveCooldown
 from reliquary.validator.rl_lease_quota import QuotaConfig, QuotaController
 from reliquary.validator.rl_leases import LeaseBook, LeaseBookConfig, LeaseRequest
@@ -50,35 +52,44 @@ def test_an_env_without_an_entry_excludes_nothing():
     assert rl_excluded_prompts("reliquary_hard_math_v1", _Env(lambda row: WORLDS[0], length=23_227)) == frozenset()
 
 
+def test_the_rows_are_the_rl_range_minus_the_excluded_rows_merged_into_intervals():
+    env = _Env(lambda row: WORLDS[0] if row in (0, 1, 2, 7, 1295, 1296) else "env_141_rl")
+    rows = rl_prompt_rows(ENV, env)
+    assert rows == PromptRows(0, 1296, ((0, 3), (7, 8), (1295, 1296)))
+    assert len(rows) == 1296 - 5 and 3 in rows and 7 not in rows
+    # An env without excluded worlds keeps its plain slice.
+    assert rl_prompt_rows("reliquary_hard_math_v1", _Env(lambda row: WORLDS[0], length=23_227)) == (15_749, 23_227)
+
+
 def test_the_exclusion_fails_closed():
-    with pytest.raises(ValueError, match="every row"):
-        rl_excluded_prompts(ENV, _Env(lambda row: WORLDS[0]))
+    with pytest.raises(ValueError, match="excluded"):
+        rl_prompt_rows(ENV, _Env(lambda row: WORLDS[0]))
     with pytest.raises(ValueError, match="cut against"):
-        rl_excluded_prompts(ENV, _Env(lambda row: "env_141_rl", length=LENGTH + 1))
+        rl_prompt_rows(ENV, _Env(lambda row: "env_141_rl", length=LENGTH + 1))
 
 
 def test_the_validator_refuses_a_lease_of_an_excluded_row(tmp_path):
     book = LeaseBook(tmp_path / "leases.sqlite3",
-                     LeaseBookConfig(expiry_s={ENV: 600.0}, prompt_range={ENV: (0, 1296)},
-                                     prompt_excluded={ENV: frozenset({3})}),
+                     LeaseBookConfig(expiry_s={ENV: 600.0}, prompt_range={ENV: PromptRows(0, 1296, ((3, 4),))}),
                      quota=QuotaController(QuotaConfig(initial=4)), clock=lambda: 1.8e9, rng=random.Random(7))
     book.adopt_checkpoint(0)
-    with pytest.raises(ValueError, match="excluded"):
+    with pytest.raises(ValueError):
         book.check_request(LeaseRequest(hotkey="A", environment=ENV, prompt_ids=(2, 3), checkpoint=0))
     book.check_request(LeaseRequest(hotkey="A", environment=ENV, prompt_ids=(2, 4), checkpoint=0))
 
 
 def test_the_miner_never_picks_an_excluded_row():
-    excluded = frozenset(range(0, 20, 2))
-    planner = PromptPlanner(ENV, (0, 20), rng=random.Random(0), excluded=excluded)
+    rows = PromptRows(0, 20, tuple((p, p + 1) for p in range(0, 20, 2)))
+    planner = PromptPlanner(ENV, rows, rng=random.Random(0))
     picks = {p for _ in range(50) for p in planner.pick(8)}
-    assert picks and not picks & excluded
+    assert picks and all(p % 2 for p in picks)
     assert not planner.leasable(4) and planner.leasable(5)
 
 
 def test_the_cooldown_counts_only_the_rows_rl_draws():
-    cooldown = AdaptiveCooldown(prompt_range={ENV: (0, 1296)}, excluded={ENV: 396})
-    assert cooldown.state(ENV)["n"] == 900
+    rows = PromptRows(0, 1296, tuple((p, p + 1) for p in range(0, 1296, 4)))
+    cooldown = AdaptiveCooldown(prompt_range={ENV: rows})
+    assert cooldown.state(ENV)["n"] == 972
 
 
 @pytest.fixture(scope="module")
@@ -91,6 +102,7 @@ def real_corpus():
 def test_the_real_corpus_excludes_the_eight_worlds_and_keeps_eighteen(real_corpus):
     env = EnvScalerToolsV2Environment(corpus=real_corpus)
     rows = rl_excluded_prompts(ENV, env)
+    assert len(rl_prompt_rows(ENV, env)) == 1296 - 396
     worlds = Counter(real_corpus.scenarios[row].env_id for row in rows)
     assert set(worlds) == set(WORLDS) and len(rows) == 396
     kept = {real_corpus.scenarios[row].env_id for row in range(1296) if row not in rows}

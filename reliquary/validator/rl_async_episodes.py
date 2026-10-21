@@ -7,7 +7,8 @@ carries the same blocks, under ``params["rl_episode_envs"]`` (``EPISODE_ENVS_PAR
     {"<env>": {"episode": {kind, sandbox_env, split, env_package, tools, max_turns, max_tokens_per_turn,
                            max_episode_tokens, budgets},          # the order's episode block, validated as such
                "catalogue": {package, options, rl_split, image_lock_sha256},   # optional: a bridged env
-               "version": "<manifest sha256>"}}                   # optional: the bridged install's manifest
+               "version": "<manifest sha256>",                   # optional: the bridged install's manifest
+               "rows": {start, end, exclude?}}}                  # optional: the taskset rows RL draws from
 
 The blocks are validated with the contract's own rules (``service_contract._validate_episode``,
 ``validate_catalogue``), so a block that an order would refuse is refused here too, except the token
@@ -17,6 +18,11 @@ trainer already read, signed off by the operator who declared the task: no secon
 it back from the validator (``GET /rl/episodes``, ``episodes_answer``), which serves exactly the blocks it grades
 with. The seed pool of an async policy is ``2 x GROUP_ROLLOUTS`` (a lease has 16 rollouts, its sessions are
 numbered 0..15; ``pool_seeds`` only sizes the session policy's per-key caps).
+
+Rows (``rows``, ``rl_prompt_ranges.PromptRows``): ``[start, end)`` of the taskset minus ``exclude`` (rows and
+``[a, b)`` intervals: tasks the RL run must not draw, e.g. a corpus's rows or tasks whose grading is broken).
+Without it the whole taskset. Checked against the installed taskset's length when the env loads; the validator
+refuses a lease outside it and the miner draws inside it, both from this block (``episode_prompt_rows``).
 
 The task source: a bridged env (a ``catalogue``) is built from it (``bridged_episode``: the same
 ``BridgedEpisodeSource`` the window validator and miners build) and registered as a catalogue spec; its
@@ -65,7 +71,7 @@ RESTORE_ATTEMPTS = 3
 RESTORE_TIMEOUT_S = 60.0
 RESTORE_BACKOFF_S = 5.0
 STOP_TIMEOUT_S = 10.0
-_BLOCK_FIELDS = frozenset({"episode", "catalogue", "version"})
+_BLOCK_FIELDS = frozenset({"episode", "catalogue", "version", "rows"})
 
 
 def _rollouts() -> int:
@@ -84,7 +90,7 @@ def validate_episode_block(name: str, block: Any) -> dict:
     if not isinstance(name, str) or not _ENV_ID.fullmatch(name):
         raise ValueError(f"invalid episode environment id {name!r}")
     if not isinstance(block, Mapping) or "episode" not in block or not set(block) <= _BLOCK_FIELDS:
-        raise ValueError(f"{name}: an episode env entry is {{episode, catalogue?, version?}}")
+        raise ValueError(f"{name}: an episode env entry is {{episode, catalogue?, version?, rows?}}")
     copy = json.loads(json.dumps(dict(block)))
     env = {"episode": copy["episode"], "sampling": {"kind": PUBLIC_SEED_POOL}, "missing_box": "graded"}
     try:
@@ -97,7 +103,25 @@ def validate_episode_block(name: str, block: Any) -> dict:
     if version is not None and (not isinstance(version, str) or len(version) != 64
                                 or any(c not in "0123456789abcdef" for c in version)):
         raise ValueError(f"{name}.version must be a sha256 hex digest")
+    if "rows" in copy:
+        from reliquary.protocol.rl_prompt_ranges import parse_prompt_rows
+
+        parse_prompt_rows(copy["rows"], f"{name}.rows")
     return copy
+
+
+def episode_prompt_rows(name: str, block: Mapping[str, Any], taskset_rows: int):
+    """The ``PromptRows`` a validated block offers of a taskset of ``taskset_rows`` rows (no ``rows``: all of
+    them). ValueError when the declared rows run past the taskset."""
+    from reliquary.protocol.rl_prompt_ranges import PromptRows, parse_prompt_rows
+
+    taskset_rows = int(taskset_rows)
+    if "rows" not in block:
+        return PromptRows(0, taskset_rows)
+    rows = parse_prompt_rows(block["rows"], f"{name}.rows")
+    if rows.end > taskset_rows:
+        raise ValueError(f"{name}.rows ends at {rows.end}, past the installed taskset's {taskset_rows} rows")
+    return rows
 
 
 def episode_blocks(params: Mapping[str, Any], envs=None) -> dict[str, dict]:
@@ -176,7 +200,9 @@ def load_episode_environment(name: str, block: Mapping[str, Any], *, build_sourc
         spec = find_environment_spec(name)
         if spec is None or spec.interaction_mode != "signed_episode":
             raise ValueError(f"{name}: no catalogue and not a registered signed-episode environment")
-        return load_environment(name)
+        environment = load_environment(name)
+        episode_prompt_rows(name, block, len(environment))
+        return environment
     from reliquary.environment.bridged_episode import (
         BridgedEnvConfig, BridgedEpisodeSource, catalogue_spec,
     )
@@ -191,6 +217,7 @@ def load_episode_environment(name: str, block: Mapping[str, Any], *, build_sourc
     if block.get("version") is not None and manifest != block["version"]:
         raise ValueError(f"{name}: the installed taskset's manifest {manifest[:16]} is not the task's "
                          f"{str(block['version'])[:16]}")
+    episode_prompt_rows(name, block, len(source))
     register_catalogue_spec(catalogue_spec(name, manifest))
     return SignedEpisodeEnvironment(name, source)
 
@@ -340,6 +367,6 @@ def build_rl_lease_sandbox(
 
 __all__ = [
     "EPISODE_ENVS_PARAM", "EPISODE_SESSION_SLACK_S", "LEASE_EXPIRY_PARAM", "RlLeaseSandbox", "async_episode_policy",
-    "build_rl_lease_sandbox", "episode_blocks", "episode_lease_expiry_s", "episode_policies", "episodes_answer",
-    "expiry_overrides", "load_episode_environment", "validate_episode_block",
+    "build_rl_lease_sandbox", "episode_blocks", "episode_lease_expiry_s", "episode_policies", "episode_prompt_rows",
+    "episodes_answer", "expiry_overrides", "load_episode_environment", "validate_episode_block",
 ]

@@ -681,3 +681,30 @@ async def test_a_failed_engine_step_requeues_the_running_leases():
     await miner.drain()
     assert len(transport.submissions) == 2
 
+
+
+# --- an episode env's declared rows --------------------------------------------------------------------------------
+def test_the_planner_never_picks_an_excluded_row():
+    from reliquary.protocol.rl_prompt_ranges import PromptRows
+
+    rows = PromptRows(10, 40, ((12, 30), (35, 36)))
+    planner = PromptPlanner(ENV, rows, rng=random.Random(0))
+    assert planner.range == (10, 40)
+    picked = set()
+    for _ in range(50):
+        picked.update(planner.pick(8))
+    assert picked and all(p in rows for p in picked) and picked.isdisjoint({*range(12, 30), 35})
+    assert not planner.leasable(20) and planner.leasable(11)
+
+
+def test_the_miner_draws_an_episode_env_from_its_blocks_rows():
+    from reliquary.miner.rl_async import planner_ranges
+    from reliquary.protocol.rl_prompt_ranges import PromptRows
+
+    blocks = {"swe": {"episode": {}, "rows": {"start": 5, "end": 50, "exclude": [[10, 20], 30]}},
+              "tmax": {"episode": {}}}
+    ranges = planner_ranges(("swe", "tmax", ENV), sources={"swe": [None] * 60, "tmax": [None] * 7}, blocks=blocks,
+                            load_environment=lambda name: [None] * 9)
+    assert ranges == {"swe": PromptRows(5, 50, ((10, 20), (30, 31))), "tmax": PromptRows(0, 7), ENV: (0, 9)}
+    with pytest.raises(ValueError, match="past the installed taskset"):
+        planner_ranges(("swe",), sources={"swe": [None] * 49}, blocks=blocks)

@@ -9,10 +9,19 @@ repeat: rows a distillation corpus already consumed (the policy was trained on
 their answers), or rows an evaluation set holds out. Each one records the split
 length it was cut against, so a repinned environment of another length fails
 closed instead of offering a shifted slice.
+
+A signed-episode env of an async task declares its rows in its own block instead
+(``rl_async_episodes``: ``rows = {start, end, exclude}``): ``PromptRows``, a slice
+minus excluded rows and intervals, which the validator enforces at lease time and
+the miner draws from.
 """
 
 from __future__ import annotations
 
+import bisect
+import itertools
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -77,8 +86,80 @@ def rl_prompt_range(environment: str, universe_n: int) -> tuple[int, int]:
     return (entry.start, end)
 
 
+MAX_EXCLUDED_ENTRIES = 4096
+
+
+@dataclass(frozen=True)
+class PromptRows:
+    """The rows RL may draw from: ``[start, end)`` minus ``exclude`` (sorted, disjoint ``[a, b)`` inside it)."""
+    start: int
+    end: int
+    exclude: tuple[tuple[int, int], ...] = ()
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.start < self.end:
+            raise ValueError("prompt rows must be a non-empty [start, end)")
+        floor = self.start
+        for a, b in self.exclude:
+            if not floor <= a < b <= self.end:
+                raise ValueError("excluded rows must be sorted, disjoint intervals inside [start, end)")
+            floor = b
+        if len(self) == 0:
+            raise ValueError("every row of [start, end) is excluded")
+
+    @classmethod
+    def of(cls, value: PromptRows | tuple[int, int]) -> PromptRows:
+        """A ``PromptRows``, or a plain ``(start, end)`` slice."""
+        return value if isinstance(value, PromptRows) else cls(int(value[0]), int(value[1]))
+
+    def __contains__(self, row: object) -> bool:
+        if type(row) is not int or not self.start <= row < self.end:
+            return False
+        i = bisect.bisect_right(self.exclude, (row, math.inf)) - 1
+        return i < 0 or not self.exclude[i][0] <= row < self.exclude[i][1]
+
+    def __len__(self) -> int:
+        return self.end - self.start - sum(b - a for a, b in self.exclude)
+
+
+def parse_prompt_rows(value: Any, where: str) -> PromptRows:
+    """``{"start", "end", "exclude"?}``: ``exclude`` lists rows (an int) and ``[a, b)`` intervals, which may come in
+    any order but never overlap. ValueError otherwise."""
+    def integer(v: Any, label: str) -> int:
+        if type(v) is not int or v < 0:
+            raise ValueError(f"{where}.{label} must be a non-negative integer")
+        return v
+
+    if not isinstance(value, Mapping) or not {"start", "end"} <= set(value) <= {"start", "end", "exclude"}:
+        raise ValueError(f"{where} is {{start, end, exclude?}}")
+    start, end = integer(value["start"], "start"), integer(value["end"], "end")
+    raw = value.get("exclude", [])
+    if not isinstance(raw, list) or len(raw) > MAX_EXCLUDED_ENTRIES:
+        raise ValueError(f"{where}.exclude must be a list of at most {MAX_EXCLUDED_ENTRIES} rows or [a, b) intervals")
+    spans = []
+    for item in raw:
+        if isinstance(item, list):
+            if len(item) != 2:
+                raise ValueError(f"{where}.exclude: an interval is [a, b)")
+            a, b = integer(item[0], "exclude"), integer(item[1], "exclude")
+        else:
+            a = integer(item, "exclude")
+            b = a + 1
+        if not start <= a < b <= end:
+            raise ValueError(f"{where}.exclude: {item} is empty or outside [{start}, {end})")
+        spans.append((a, b))
+    spans.sort()
+    for (_, b), (a, _) in itertools.pairwise(spans):
+        if a < b:
+            raise ValueError(f"{where}.exclude: overlapping entries at row {a}")
+    try:
+        return PromptRows(start, end, tuple(spans))
+    except ValueError as exc:
+        raise ValueError(f"{where}: {exc}") from None
+
+
 # Worlds of a world-split environment whose RL rows RL never draws, each with why. The rows stay in the RL range
-# (every index keeps naming its scenario); ``rl_excluded_prompts`` lists them from the loaded environment, so the
+# (every index keeps naming its scenario); ``rl_prompt_rows`` excludes them from the loaded environment, so the
 # miner skips them and the validator refuses a lease of one. A stronger policy can be measured on them later.
 RL_EXCLUDED_WORLDS: dict[str, tuple[frozenset[str], str]] = {
     "envscaler_tools_v2": (
@@ -96,13 +177,24 @@ def rl_excluded_prompts(environment: str, env: Any) -> frozenset[int]:
     entry = RL_EXCLUDED_WORLDS.get(environment)
     if entry is None:
         return frozenset()
-    worlds = entry[0]
     start, end = rl_prompt_range(environment, len(env))
-    excluded = frozenset(row for row in range(start, end) if env.scenario(row).env_id in worlds)
-    if len(excluded) >= end - start:
-        raise ValueError(f"{environment}: every row of the RL range is excluded")
-    return excluded
+    return frozenset(row for row in range(start, end) if env.scenario(row).env_id in entry[0])
 
 
-__all__ = ["RL_PROMPT_RANGES", "RL_REUSES_CORPUS_ROWS", "RL_EXCLUDED_WORLDS", "RlPromptRange", "rl_excluded_prompts",
-           "rl_prompt_range"]
+def rl_prompt_rows(environment: str, env: Any) -> tuple[int, int] | PromptRows:
+    """``rl_prompt_range`` of the loaded ``env``, as ``PromptRows`` minus ``rl_excluded_prompts`` when it has any."""
+    start, end = rl_prompt_range(environment, len(env))
+    excluded = sorted(rl_excluded_prompts(environment, env))
+    if not excluded:
+        return (start, end)
+    spans: list[tuple[int, int]] = []
+    for row in excluded:
+        if spans and spans[-1][1] == row:
+            spans[-1] = (spans[-1][0], row + 1)
+        else:
+            spans.append((row, row + 1))
+    return PromptRows(start, end, tuple(spans))
+
+
+__all__ = ["MAX_EXCLUDED_ENTRIES", "RL_EXCLUDED_WORLDS", "RL_PROMPT_RANGES", "RL_REUSES_CORPUS_ROWS", "PromptRows",
+           "RlPromptRange", "parse_prompt_rows", "rl_excluded_prompts", "rl_prompt_range", "rl_prompt_rows"]

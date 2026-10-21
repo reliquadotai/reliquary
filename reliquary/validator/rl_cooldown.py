@@ -19,6 +19,9 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from typing import Any
+
+from reliquary.protocol.rl_prompt_ranges import PromptRows
 
 logger = logging.getLogger(__name__)
 
@@ -61,12 +64,10 @@ def cooldown_overrides(params: Mapping) -> dict[str, int]:
 class AdaptiveCooldown:
     """``LeaseBookConfig.cooldown_of``; ``attach(book)`` once the book exists (it reads the book's scan log)."""
 
-    def __init__(self, *, prompt_range: Mapping[str, tuple[int, int]] | None = None,
+    def __init__(self, *, prompt_range: Mapping[str, Any] | None = None,
                  overrides: Mapping[str, int] | None = None, params: CooldownParams | None = None,
-                 excluded: Mapping[str, int] | None = None,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self.prompt_range = dict(prompt_range or {})
-        self.excluded = dict(excluded or {})        # per env: rows of the range RL never draws (out of N)
         self.overrides = dict(overrides or {})
         self.params = params or CooldownParams()
         self.clock = clock
@@ -107,7 +108,7 @@ class AdaptiveCooldown:
     def _measure(self, environment: str) -> dict:
         p = self.params
         span = self.prompt_range.get(environment)
-        n = None if span is None else max(0, int(span[1]) - int(span[0]) - self.excluded.get(environment, 0))
+        n = None if span is None else len(PromptRows.of(span))
         initial = {"cooldown": p.initial, "source": "initial", "n": n}
         if self.book is None or not n:
             return initial

@@ -61,3 +61,10 @@ def test_the_cooldown_is_bounded_and_an_operator_value_wins(tmp_path):
             cooldown_overrides({"rl_cooldown_k": bad})
     with pytest.raises(ValueError):
         CooldownParams(floor=200, initial=100)
+
+
+def test_the_cooldown_counts_the_rows_left_after_exclusions():
+    from reliquary.protocol.rl_prompt_ranges import PromptRows
+
+    cooldown = AdaptiveCooldown(prompt_range={ENV: PromptRows(0, 1000, ((100, 400),))}, params=PARAMS)
+    assert cooldown.state(ENV)["n"] == 700
