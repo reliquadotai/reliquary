@@ -16,8 +16,10 @@ It runs next to the window miner (``mine``), which stays for the live run. One p
   interface (the draw itself, Gumbel and runner-keyed, is the profile's: ``VllmGroupGenerator`` sends a batch's
   leases x ``ROLLOUTS`` requests in ONE ``VLLMRolloutGenerator.generate_batch`` call, each request keyed by its own
   lease). Episode envs (multi-turn, signed sandboxes) are played by ``rl_async_episodes.EpisodeLeaseGenerator``
-  (its ``agenerate``), through the window path's episode machinery bound to the lease's draw. New weights are swapped in between two generation batches, never during one; a lease
-  taken at k may be generated on a newer checkpoint, and the submission says which (``k_generated``).
+  (its ``agenerate``), through the window path's episode machinery bound to the lease's draw. New weights are swapped in between two generation batches; a continuous generator that
+  ``swaps_running`` (single-turn vLLM, in-place push) takes them at once, its running rollouts resumed on them. A
+  lease taken at k may be generated on a newer checkpoint, in part or whole, and the submission says which
+  (``k_generated``): the draw is keyed by the lease, and the trainer judges every token on its own weights.
 * **checkpoints** (``GET /rl/checkpoint`` + ``CheckpointSync``): deltas are downloaded and applied to a CPU copy of
   the weights off the generation path; the follower waits for the swap before patching that copy again.
 
@@ -656,13 +658,26 @@ class AsyncMiner:
             self._wake_checkpoint.set()
 
     # --- generation and weights ----------------------------------------------------------------------
+    def _swaps_running(self) -> bool:
+        """The generator takes new weights while groups run (a rollout may then span two checkpoints: its draw is
+        keyed by the lease, and the trainer judges every token against its own latest weights)."""
+        return bool(getattr(self.generator, "swaps_running", False)) and not getattr(self, "_no_running_swap", False)
+
     async def swap_if_ready(self) -> bool:
         """Push the follower's weights into the generator: called between generation batches only."""
         if not self._ready.is_set():
             return False
         version = int(self._state_version)
+        # A rollout is generated on one checkpoint: the swap waited for the running leases (the longest episode)
+        # with no new lease started; that wait is the swap's cost in generation time.
+        since = getattr(self, "_ready_since", None)
+        waited = 0.0 if since is None else max(0.0, self._clock() - since)
         await asyncio.to_thread(self.generator.load_weights, self._state, version)
-        logger.info("generator now on checkpoint %d (was %s)", version, self.loaded_version)
+        self.stats["swaps"] = self.stats.get("swaps", 0) + 1
+        self.stats["swap_wait_s"] = round(self.stats.get("swap_wait_s", 0.0) + waited, 1)
+        self.stats["swap_wait_max_s"] = round(max(self.stats.get("swap_wait_max_s", 0.0), waited), 1)
+        logger.info("generator now on checkpoint %d (was %s) after %.0f s waiting for running leases", version,
+                    self.loaded_version, waited)
         self.loaded_version, self._stale = version, False
         self._ready.clear()
         self._wake_lease.set()
@@ -719,13 +734,19 @@ class AsyncMiner:
     async def _stream_once(self) -> int:
         """Continuous batching (a generator with ``advance``): keep ``batch_groups`` leases running, start a queued
         one as soon as a group completes and submit that group at once, so no lease waits for a batch's longest
-        rollout. New weights wait until the running groups are done (a rollout is generated on one checkpoint):
-        no lease starts while a swap is pending. Returns the groups completed, or 1 while the engine is busy."""
-        if self._ready.is_set() and not self.running:
-            await self.swap_if_ready()
+        rollout. A generator that ``swaps_running`` takes new weights at once, its running groups resumed on them;
+        otherwise new weights wait until the running groups are done and no lease starts while a swap is pending. Returns the groups completed, or 1 while the engine is busy."""
+        if self._ready.is_set() and (not self.running or self._swaps_running()):
+            try:
+                await self.swap_if_ready()
+            except Exception:
+                logger.exception("weight swap with %d leases running failed; draining before the next try",
+                                 len(self.running))
+                self._no_running_swap = True
         if self.loaded_version is None:
             return 0
-        new = [] if self._ready.is_set() else self._take_batch(self.config.batch_groups - len(self.running))
+        new = [] if self._ready.is_set() and not self._swaps_running() else self._take_batch(
+            self.config.batch_groups - len(self.running))
         if not new and not self.running:
             return 0
         version = int(self.loaded_version)
@@ -860,6 +881,7 @@ class AsyncMiner:
         logger.info("checkpoint %d rebuilt (%s, %d bytes)", version,
                     "anchor" if plan.anchor is not None else f"{len(plan.deltas)} deltas", plan.bytes)
         self._state, self._state_version = state, version
+        self._ready_since = self._clock()
         self._ready.set()
         self._wake_generation.set()
         return version
@@ -1134,9 +1156,16 @@ class VllmGroupGenerator:
             paths = [str(p) for p in write_anchor_shards(state, self.scratch)]
             llm = self._engine._llm
             llm.collective_rpc(_load_weights_from_files, args=(paths,))
-            llm.reset_prefix_cache()
+            # Running requests are preempted and resumed on the new weights (their KV recomputed, their draw
+            # placed by the runner's own token count): a swap never waits for the longest rollout.
+            llm.reset_prefix_cache(reset_running_requests=True)
         finally:
             shutil.rmtree(self.scratch, ignore_errors=True)
+
+    @property
+    def swaps_running(self) -> bool:
+        """New weights go in while groups are generating (``swap="push"``): the miner never drains for a swap."""
+        return self.swap == "push"
 
     def load_weights(self, state: Mapping[str, Any], version: int) -> None:
         if self.tokenizer is None:
@@ -1149,6 +1178,8 @@ class VllmGroupGenerator:
         try:
             self._push(state)
         except Exception:
+            if self._engine.has_running_groups():
+                raise                         # a rebuild would drop the running groups: the miner drains first
             logger.exception("in-place weight push failed; rebuilding the engine on checkpoint %d", version)
             self._reload(state, version)
 

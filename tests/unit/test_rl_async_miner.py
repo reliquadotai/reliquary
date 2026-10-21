@@ -626,6 +626,50 @@ async def test_new_weights_wait_for_the_running_groups():
     assert sorted(s["k_generated"] for s in transport.submissions) == [0, 0]
 
 
+async def test_a_generator_that_swaps_running_takes_new_weights_at_once():
+    """No drain: the running groups go on with the new weights, and new leases keep starting."""
+    miner, transport, generator, _ = streaming(quota=8, batch_groups=2)
+    generator.swaps_running = True
+    await miner.refresh_quota()
+    await miner.lease_more()
+    generator.steps = {lease.prompt_idx: 3 for lease in miner.queue}
+    await miner.generate_once()                                     # two groups start on k 0
+    miner._state, miner._state_version = {}, 1
+    miner._ready.set()
+    running = set(miner.running)
+    await miner.generate_once()                                     # swapped with both still running
+    assert generator.loads == [0, 1] and set(miner.running) == running and not miner._ready.is_set()
+    assert miner.stats["swap_wait_max_s"] < 1.0
+    await miner.generate_once()
+    await miner.drain()
+    assert {s["lease_id"] for s in transport.submissions} == running   # the groups that spanned the swap
+    assert sorted(s["k_generated"] for s in transport.submissions) == [1, 1]
+
+
+async def test_a_failed_running_swap_falls_back_to_draining():
+    miner, transport, generator, _ = streaming(quota=8, batch_groups=2)
+    generator.swaps_running = True
+    await miner.refresh_quota()
+    await miner.lease_more()
+    generator.steps = {lease.prompt_idx: 3 for lease in miner.queue}
+    await miner.generate_once()
+    loads = generator.load_weights
+
+    def refuse(state, version):
+        raise RuntimeError("push failed")
+
+    generator.load_weights = refuse
+    miner._state, miner._state_version = {}, 1
+    miner._ready.set()
+    await miner.generate_once()                                     # the swap fails: the miner drains instead
+    assert miner._ready.is_set() and not miner._swaps_running()
+    generator.load_weights = loads
+    for _ in range(4):
+        await miner.generate_once()
+    await miner.drain()
+    assert generator.loads[-1] == 1 and len(transport.submissions) >= 2
+
+
 async def test_a_failed_engine_step_requeues_the_running_leases():
     miner, transport, generator, _ = streaming(quota=4, batch_groups=2)
     await miner.refresh_quota()

@@ -227,9 +227,11 @@ def _lease(**kw):
 
 
 def play_lease_episode(*, validator, machine, lease, index, reward, session_id=None, engagement=None,
-                       output="ok", last=None, stop="agent_completed"):
+                       output="ok", last=None, stop="agent_completed", status="graded", reason=None,
+                       last_calls=()):
     """One honest two-turn episode (``episode_v2_fixtures.play_episode``'s), its session token naming the lease's
-    rollout: ``(rollout, prompt length)``."""
+    rollout: ``(rollout, prompt length)``. ``last_calls``: the last turn's recorded calls (an episode the machine
+    closed on one of them: ``status``/``reason`` of its final)."""
     from reliquary_sandbox.observation import render_observation
 
     from reliquary.corpus.signed_parse import signed_records
@@ -245,8 +247,9 @@ def play_lease_episode(*, validator, machine, lease, index, reward, session_id=N
                      engagement=engagement or rl_lease_engagement(lease.lease_id, index), split=SPLIT,
                      index=lease.prompt_idx, checkpoint=f"k{lease.checkpoint}", issued_at=NOW,
                      expires_at=NOW + 4500)
-    signed = transcript(validator, machine, session, status="graded", reward=float(reward), env_package=ENV_PACKAGE,
-                        calls=[{"turn": 0, "k": 0, "arguments": {"command": "c0"}, "output": output}])
+    signed = transcript(validator, machine, session, status=status, reward=float(reward), env_package=ENV_PACKAGE,
+                        reason=reason, calls=[{"turn": 0, "k": 0, "arguments": {"command": "c0"}, "output": output},
+                                              *last_calls])
     observations = [render_observation(body.to_dict()) for body in signed_records(signed).calls[:1]]
     full = renderer.next_prompt(prompt, first, observations)
     tokens = full + (list(last) if last is not None else [TEXT] * 9 + [TERM])
@@ -340,6 +343,46 @@ def test_a_turn_that_would_not_export_still_trains_for_a_lease(world):
     lease = _lease()
     graded = world.checker.grade(lease, world.rollouts(lease), received=world.received)
     assert graded.reject is None
+
+
+def _exhausted(world, lease, index, *, recorded=True, reason="cpu_s", stop="episode_closed", status="budget_exhausted"):
+    """Rollout ``index`` closed by its machine on its last turn's call: recorded (cpu or transcript cap, the
+    record comes back with the final) or refused unrun (``max_calls``)."""
+    from tests.unit.test_trajectory_parse import CALL, TERM, TEXT
+
+    calls = [{"turn": 1, "k": 0, "arguments": {"command": "c0"}, "output": "ok"}] if recorded else []
+    return play_lease_episode(validator=world.validator, machine=world.machine, lease=lease, index=index,
+                              reward=0.0, last=[TEXT] * 5 + [CALL, TERM], stop=stop, status=status, reason=reason,
+                              last_calls=calls)[0]
+
+
+@pytest.mark.parametrize(("recorded", "reason"), [(True, "cpu_s"), (True, "transcript_bytes"), (False, "max_calls")])
+def test_an_episode_that_spends_its_budget_is_a_rollout_scored_zero(world, recorded, reason):
+    """A machine's budget close is a cut, like a single-turn rollout at its cap: reward 0, kept and trained in its
+    group, never the end of the lease."""
+    lease = _lease()
+    rollouts = world.rollouts(lease)
+    rollouts[2] = _exhausted(world, lease, 2, recorded=recorded, reason=reason)
+    graded = world.checker.grade(lease, rollouts, received=world.received)
+    assert graded.reject is None
+    assert graded.rewards == tuple(0.0 if i == 2 else 1.0 - i % 2 for i in range(16))   # rollout 2 had won
+    assert graded.truncated == tuple(i == 2 for i in range(16))
+
+
+def test_a_budget_close_is_only_admitted_as_what_the_machine_signed(world):
+    lease = _lease()
+    rollouts = world.rollouts(lease)
+    for bad in (dict(stop="agent_completed"),                         # the close hidden behind another stop
+                dict(status="expired", reason="deadline passed"),      # not a budget: the lease's own lateness
+                dict(status="aborted", reason="sandbox failure"),
+                dict(recorded=False, reason="cpu_s")):                 # an unrun call closes only on max_calls
+        exhausted = _exhausted(world, lease, 2, **bad)
+        graded = world.checker.grade(lease, [*rollouts[:2], exhausted, *rollouts[3:]], received=world.received)
+        assert graded.reject is not None, bad
+    closed = play_lease_episode(validator=world.validator, machine=world.machine, lease=lease, index=2, reward=1.0,
+                                stop="episode_closed")[0]             # a graded episode cannot claim a close
+    assert world.checker.grade(lease, [*rollouts[:2], closed, *rollouts[3:]],
+                               received=world.received).reject is not None
 
 
 def test_a_stale_directory_is_the_validators_outage(world):

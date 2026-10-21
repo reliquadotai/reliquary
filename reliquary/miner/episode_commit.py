@@ -65,6 +65,14 @@ def episode_stop(raw: Any, *, tokens: Sequence[int], spans: Sequence[tuple[int, 
 
 
 def _mapped_stop(raw, *, tokens, spans, max_turns, max_tokens_per_turn, max_episode_tokens, stop_ids, lease=False):
+    from reliquary.corpus.signed_parse import STOP_EPISODE_CLOSED
+
+    if raw == STOP_EPISODE_CLOSED:
+        # A lease's episode the machine closed on a call of its last turn (budget): that turn ends on its stop
+        # token; whether the final allows it is the transcript's (``parse_signed_trajectory``).
+        if not lease or not spans or spans[-1][1] != len(tokens) or tokens[spans[-1][1] - 1] not in stop_ids:
+            return None
+        return raw
     if not spans or raw not in ADMITTED_STOPS:
         return None
     start, end = spans[-1]
@@ -148,8 +156,9 @@ def episode_admissible(outcome, *, policy, renderer, prompt: str, min_chunk_toke
     result, session = outcome.result, outcome.session
     try:
         if not getattr(result, "ok", False) or result.transcript is None or session is None:
-            why = getattr(result, "error", None) or getattr(result, "final_status", None)
-            raise ValueError("no graded episode" + (f" ({why})" if why else ""))
+            why = (getattr(result, "error", None) or getattr(result, "final_status", None)
+                   or ("no engine session" if session is None else "no transcript"))
+            raise ValueError(f"no graded episode: {why}")
         tokens, spans = episode_sequence(session.turns)
         stop = episode_stop(result.stop, tokens=tokens, spans=spans, max_turns=policy.max_turns,
                             max_tokens_per_turn=policy.max_tokens_per_turn,

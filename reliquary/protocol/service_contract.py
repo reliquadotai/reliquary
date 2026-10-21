@@ -171,6 +171,8 @@ EPISODE_BUDGET_FIELDS = ("max_calls", "per_call_timeout_s", "cpu_s", "wall_s", "
 EPISODE_TOOLS = frozenset({"bash", "edit"})
 # One episode is one corpus trajectory: its tokens stay under the corpus trajectory cap.
 MAX_EPISODE_TOKENS = MAX_TRAJECTORY_TOKENS
+# An async RL episode is never a corpus trajectory: its cap is the RL rollout cap (the v10 math cap).
+MAX_RL_EPISODE_TOKENS = 65536
 # Ceilings of each session budget: the smaller of our own bound and the sandbox service's own
 # maximum (reliquary_sandbox_service/settings.py: episode_max_calls le 100_000, episode_max_call_timeout_s
 # le 24 h, episode_max_pids le 65536, and the defaults of episode_max_cpu_s 3600, episode_max_wall_s 4 h,
@@ -185,8 +187,9 @@ _SANDBOX_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,63}\Z")
 _ENV_PACKAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}==[A-Za-z0-9][A-Za-z0-9.+_!-]{0,127}\Z")
 
 
-def _validate_episode(name: str, env: dict) -> None:
-    """The ``episode`` block of one v2 env: what record 0 must name, the limits, the session budgets."""
+def _validate_episode(name: str, env: dict, *, max_episode_tokens: int = MAX_EPISODE_TOKENS) -> None:
+    """The ``episode`` block of one v2 env: what record 0 must name, the limits, the session budgets.
+    ``max_episode_tokens``: the token ceiling (an order's: the corpus trajectory cap)."""
     raw = env["episode"]
     fields = set(_EPISODE_FIELDS) | ({"harness"} if isinstance(raw, dict) and "harness" in raw else set())
     episode = _object(raw, fields, f"{name}.episode")
@@ -214,8 +217,8 @@ def _validate_episode(name: str, env: dict) -> None:
     from reliquary.protocol.submission import MAX_SIGNED_EPISODE_TURNS
 
     _integer(episode["max_turns"], f"{name}.episode.max_turns", 1, MAX_SIGNED_EPISODE_TURNS)
-    _integer(episode["max_tokens_per_turn"], f"{name}.episode.max_tokens_per_turn", 1, MAX_EPISODE_TOKENS)
-    _integer(episode["max_episode_tokens"], f"{name}.episode.max_episode_tokens", 2, MAX_EPISODE_TOKENS)
+    _integer(episode["max_tokens_per_turn"], f"{name}.episode.max_tokens_per_turn", 1, max_episode_tokens)
+    _integer(episode["max_episode_tokens"], f"{name}.episode.max_episode_tokens", 2, max_episode_tokens)
     if episode["max_tokens_per_turn"] >= episode["max_episode_tokens"]:
         raise ServiceContractError(f"{name}.episode: a turn must fit inside the episode")
     budgets = _object(episode["budgets"], set(EPISODE_BUDGET_FIELDS), f"{name}.episode.budgets")

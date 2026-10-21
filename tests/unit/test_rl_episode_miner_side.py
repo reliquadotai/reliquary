@@ -271,6 +271,11 @@ def test_the_stop_is_the_one_the_validator_admits():
     assert _stop("agent_completed", cut, spans, per_turn=2, lease=True) == "context_length"
     assert _stop("agent_completed", cut, spans, per_turn=2, turns=2, lease=True) == "max_turns"
     assert _stop("agent_completed", cut, spans, lease=True) is None
+    # A machine's close on the last turn's call (episode_closed): a lease's rollout, its turn ended on its stop.
+    assert _stop("episode_closed", closed, spans, lease=True) == "episode_closed"
+    assert _stop("episode_closed", closed, spans) is None                   # a window episode is never closed
+    assert _stop("episode_closed", cut, spans, lease=True) is None          # a cut turn sent no call
+    assert _stop("episode_closed", closed + [9], spans, lease=True) is None
 
 
 def test_the_mapped_stop_passes_the_validators_admission(tmp_path):
@@ -735,3 +740,54 @@ def test_reopening_is_bounded_by_the_window(tmp_path):
 
     assert asyncio.run(go()).reason == "open_busy"
     assert len(sessions.opened) == 3 and now[0] == 200.0
+
+
+def _lease_play(tmp_path, *, status, stop, reason="cpu_s"):
+    """A LeaseEpisodeRunner over one rollout whose machine ended it with ``status``."""
+    from reliquary.miner.rl_episode_client import LeaseEpisodeRunner
+    from tests.unit.test_rl_async_episodes import _lease, play_lease_episode
+    from tests.unit.test_trajectory_parse import CALL, TERM, TEXT
+
+    validator, machine = episode_signers(tmp_path)
+    lease = _lease(hotkey=MINER.ss58_address)
+    calls = [{"turn": 1, "k": 0, "arguments": {"command": "c0"}, "output": "ok"}]
+    rollout, _ = play_lease_episode(validator=validator, machine=machine, lease=lease, index=0, reward=0.0,
+                                    last=[TEXT] * 5 + [CALL, TERM], stop=stop, status=status, reason=reason,
+                                    last_calls=calls if status != "graded" else ())
+    transcript = rollout.episode["transcript"]
+
+    class Closing(RlSessions):
+        def close(self, session_id, body):
+            self.closed.append((session_id, body))
+            return {"state": "closed"}                 # an unpaid final frees the slot at once
+
+    sessions = Closing({"session_id": f"s-{lease.lease_id}-0", "token": transcript["token"],
+                        "gateway_url": "http://g:1", "expires_at": NOW + 4500})
+
+    class Closed(Harness):
+        async def run(self, *, token, prompt, on_trace=None):
+            trace = SimpleNamespace(id="t-1", stop_condition=stop)
+            return SimpleNamespace(trace=trace, state=None, transcript=self.transcript, refusals=(), error=None,
+                                   final={"body": {"status": status, "reward": None, "reason": reason}})
+
+    harness = Closed(transcript, None, status)
+    runner = LeaseEpisodeRunner(policy=POLICY, lease=lease, hotkey=MINER.ss58_address, prompt="Write 42.",
+                                sign_binding=sign, sessions=sessions, model_name="m", renderer_model_dir="/m",
+                                generate_url="http://127.0.0.1:1", sampling=SimpleNamespace(temperature=1.0, top_p=1.0),
+                                runner_factory=lambda url: harness, clock=lambda: NOW + 10,
+                                new_request_id=lambda: "c" * 32)
+
+    async def go():
+        async with runner:
+            return await runner.run(0)
+
+    return asyncio.run(go()), sessions
+
+
+def test_a_lease_keeps_an_episode_its_machine_closed_on_the_budget_as_a_zero(tmp_path):
+    pytest.importorskip("reliquary_sandbox.attest")
+    result, sessions = _lease_play(tmp_path, status="budget_exhausted", stop="episode_closed")
+    assert result.ok and result.error is None and result.reward == 0.0 and result.stop == "episode_closed"
+    assert [body["reason"] for _, body in sessions.closed] == ["final"]
+    expired, _ = _lease_play(tmp_path / "expired", status="expired", stop="episode_closed", reason="deadline passed")
+    assert not expired.ok                                   # the deadline is not a budget: still unusable

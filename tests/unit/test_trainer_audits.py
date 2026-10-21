@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import pytest
 
-from reliquary.trainer.audits import TrainerAudits, audit_group, rollout_diagnostics
+import dataclasses
+
+from reliquary.trainer.audits import TrainerAudits, audit_group, group_diagnostics, rollout_diagnostics
 from reliquary.validator import rl_audit
 from reliquary.validator.rl_submit import AuditResult
 from tests.unit.test_rl_audit import TinyLM, _group, _transitions, gumbel  # noqa: F401  (gumbel: autouse fixture)
@@ -45,7 +47,7 @@ def test_the_fused_head_projects_the_audit_rows_inside_its_own_call():
         assert audit_group(model, group) == plain
     finally:
         FusedLogprobHead.forward = original
-    assert calls == [True] * len(group.completions)      # one head call per rollout: one gather under FSDP2
+    assert calls == [True]                               # one head call for the packed group: one gather under FSDP2
 
 
 class Source:
@@ -84,3 +86,23 @@ def test_the_trainer_loop_takes_judges_and_reports_within_its_budget():
     assert audits.metrics() == {"async/audits": 3.0, "async/audit_s": 30.0}
     assert audits.metrics() == {"async/audits": 0.0, "async/audit_s": 0.0}
     assert audits.run(object(), limit=0, budget_s=25.0) == 0 and source.asked == [4]
+
+
+def _ragged(group, lengths):
+    """The group with rollout i cut to ``lengths[i]`` tokens (mixed lengths: padded micro-batches)."""
+    completions = tuple(c[:n] for c, n in zip(group.completions, lengths))
+    return dataclasses.replace(group, completions=completions)
+
+
+@pytest.mark.parametrize("make", [_group, _forged, lambda t: _group(t, nonce_for_draw="cd" * 32)])
+@pytest.mark.parametrize("budget", [10_000, 120, 40])
+def test_the_packed_group_forward_gives_each_rollouts_own_diagnostics(make, budget):
+    """Packed into right-padded micro-batches under any token budget (one rollout over it bins alone), every rollout
+    keeps exactly the diagnostics of its own forward, and the verdict is the proof forward's."""
+    table = _transitions()
+    full = make(table)
+    group = _ragged(full, [len(full.completions[0]) - (i * 5) % 23 for i in range(16)])
+    model = TinyLM(table)
+    assert group_diagnostics(model, group, token_budget=budget) == [
+        rollout_diagnostics(model, group, i) for i in range(16)]
+    assert audit_group(model, group) == rl_audit.audit_forward(model)(group)
