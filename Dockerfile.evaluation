@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git \
 WORKDIR /opt/evaluation-source
 COPY pyproject.toml README.md ./
 COPY reliquary ./reliquary
+COPY tests/fixtures/reliquarylogic_v1.jsonl ./tests/fixtures/reliquarylogic_v1.jsonl
 # Resolve the real package dependencies; never bypass incompatible metadata.
 RUN python3 -c "from importlib.metadata import version; import torch; assert version('torch').split('+')[0] == '2.13.0'; assert torch.version.cuda == '12.9'; print('torch==' + version('torch'))" \
         > /tmp/evaluation-constraints.txt \

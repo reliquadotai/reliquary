@@ -5,12 +5,17 @@ on:
   pull_request:
     paths:
       - "Dockerfile.evaluation"
+      - ".dockerignore"
       - ".github/workflows/evaluation-image.yml"
       - "pyproject.toml"
       - "reliquary/eval/**"
       - "reliquary/sandbox/evaluation_engagements.py"
       - "reliquary/environment/agentic_swe.py"
       - "reliquary/cli/main.py"
+      - "reliquary/environment/registry.py"
+      - "reliquary/environment/manifests/**"
+      - "tests/fixtures/reliquarylogic_v1.jsonl"
+      - "scripts/test_evaluation_package.py"
 
 permissions:
   contents: read
@@ -93,6 +98,10 @@ jobs:
               assert direct["vcs_info"]["commit_id"] == commit
           print("Offline imports and source pins passed; GPU execution is unqualified.")
           PY
+          docker run --rm -i --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 512 --memory 4g --cpus 2 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+            "$IMAGE:sha-$SOURCE_SHA" python3 - < scripts/test_evaluation_package.py
           docker run --rm --network none --read-only --cap-drop ALL \
             --security-opt no-new-privileges --pids-limit 512 --memory 4g --cpus 2 \
             --tmpfs /tmp:rw,nosuid,nodev,size=1g \
