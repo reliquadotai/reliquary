@@ -468,3 +468,16 @@ def test_audits_are_judged_before_each_step_and_while_the_batch_fills():
     assert rounds[0] == (True, 4, 30.0) and len(rounds) == 3        # before the step, then while waiting
     with pytest.raises(ValueError):
         AsyncTrainerConfig(1, audits_per_step=-1)
+
+
+def test_the_trainer_never_takes_the_cudnn_attention_backend():
+    import torch
+
+    from reliquary.trainer.async_cli import disable_cudnn_attention
+
+    before = torch.backends.cuda.cudnn_sdp_enabled()
+    try:
+        disable_cudnn_attention(torch)
+        assert torch.backends.cuda.cudnn_sdp_enabled() is False
+    finally:
+        torch.backends.cuda.enable_cudnn_sdp(before)
