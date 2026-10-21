@@ -523,7 +523,8 @@ def test_jobs_create_refuses_an_episode_for_another_environment(
     assert result.exit_code != 0 and "the set's environment is" in result.output, result.output
 
 
-def test_jobs_create_signed_swe_eval_job(bucket, registry, reference_sets, tmp_path, monkeypatch):
+@pytest.mark.parametrize("harness", [None, "mini-swe@1"])
+def test_jobs_create_signed_swe_eval_job(bucket, registry, reference_sets, tmp_path, monkeypatch, harness):
     from reliquary.environment import agentic_swe
 
     # The renderers wheel and the SWE dataset are not installed where the tests run.
@@ -550,10 +551,13 @@ def test_jobs_create_signed_swe_eval_job(bucket, registry, reference_sets, tmp_p
     registry["entries"] = {"default": _rl_entry("default", 0.5)}
     result = CliRunner().invoke(app, _episode_args(
         tmp_path, _signed_swe_episode(), **{"--eval-set": SWE_SET_ID, "--prompt-count": "3",
-                                            "--renderer-id": _signed_swe_episode()["renderer"]}))
+                                            "--renderer-id": _signed_swe_episode()["renderer"],
+                                            **({"--harness": harness} if harness else {})}))
     assert result.exit_code == 0, result.output
     job, _ = asyncio.run(job_store.read_job("eval-teutonic-aime26"))
     assert is_signed_sandbox(job) and job.prompt_count == 3
+    # The eval plays the harness it was created with (none: the compatibility harness).
+    assert agentic_swe.job_harness(job).key == (harness or "bash-vf-b2e4e81@1")
     assert ps.parse_eval_source(job.prompt_source).count == 3
     entry = registry["entries"]["eval-teutonic-aime26"]
     assert list(entry.contract["environments"]) == [AGENTIC_SWE_ENVIRONMENT]

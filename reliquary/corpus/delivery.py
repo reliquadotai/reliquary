@@ -148,7 +148,6 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
         except ImportError as exc:
             raise EpisodeSandboxUnavailable(submission_id) from exc
         from reliquary.corpus.signed_reasons import REASON_SANDBOX_TRANSCRIPT
-        from reliquary.environment.agentic_swe import harness_system_prompt
 
         try:
             found = signed_records(signed)
@@ -158,7 +157,9 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
                                          stop=trajectory["stop"], max_turns=job.episode.max_turns,
                                          calls=found.calls, offered=found.tools,
                                          final=found.final)
-        system_prompt = harness_system_prompt(found.tools)
+        # The job's harness, as the renderer shows it (the compatibility harness: verifiers' prompt).
+        system_prompt = renderer.spec.system_prompt_for(found.tools)
+        user_prompt = renderer.spec.user_prompt(user_prompt)
         # The graded state is the bridge's (header + artifact archive): the row carries
         # the git patch inside it, the shape of a replay job's final_diff. An unreadable
         # state is a ValueError (counted unparseable).
@@ -170,8 +171,11 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
         for k, call in enumerate(message.get("tool_calls") or ()):
             call["id"] = f"call_{t}_{k}"         # unique in the conversation, not per turn
         messages.append(message)
-        messages += [{"role": "tool", "tool_call_id": f"call_{t}_{k}", "content": text}
-                     for k, text in enumerate(turn.observations)]
+        for k, observation in enumerate(renderer.tool_messages(turn.observations)
+                                        if signed_job else _tool_messages(turn.observations)):
+            if "tool_call_id" in observation:
+                observation["tool_call_id"] = f"call_{t}_{k}"
+            messages.append(observation)
     # The proof the messages are the tokens (see EPISODE_ROW_FIELDS for why
     # whitespace is erased first).
     if renderer.whitespace_free(renderer.render_messages(messages)) \
@@ -188,6 +192,11 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
             "graded_success": bool(grade.get("graded_success")),
             "replay_certified": bool(grade.get("replay_certified")),
             "turns": json.dumps([[s, e] for s, e in spans]), "stop": trajectory["stop"]}
+
+
+def _tool_messages(observations) -> list[dict]:
+    """A replay job's observations, as verifiers' bash harness bridges them."""
+    return [{"role": "tool", "tool_call_id": f"call_{k}", "content": text} for k, text in enumerate(observations)]
 
 
 # Suite episode jobs (design 2026-10-13): one row per certified trajectory,

@@ -229,7 +229,7 @@ def build_signed_episode_intake(job, *, checkpoint_dir: str, tokenizer, vocab_si
         raise ValueError(f"job {job.job_id!r}: {exc}") from exc
     return SignedEpisodeIntake(
         job=job, source=source,
-        renderer=agentic_swe.load_turn_renderer(checkpoint_dir, tools=job.episode.sandbox.tools),
+        renderer=agentic_swe.job_turn_renderer(job, checkpoint_dir),
         tokenizer=tokenizer, vocab_size=vocab_size, chunk_tokens=chunk_tokens,
         directory=directory, token_verifier=token_verifier,
         sessions=sessions, seen=seen, retry_after_s=retry_after_s)

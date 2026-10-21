@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from reliquary.corpus.checks import REASON_BAD_TURNS
 from reliquary.corpus.replay_compare import Action
@@ -48,8 +48,14 @@ class TurnRenderer(Protocol):
 
     def assistant_message(self, completion_ids: Sequence[int]) -> dict: ...
 
-    # Export only (``delivery.episode_row``): the whole conversation rendered
-    # back to ids, and ids compared with whitespace erased.
+    # Export only (``delivery.episode_row``): the harness spec the conversation is
+    # rebuilt in (system prompt, first user message), a turn's observations as the
+    # messages it bridges them as, the whole conversation rendered back to ids, and
+    # ids compared with whitespace erased.
+    spec: Any
+
+    def tool_messages(self, observations: Sequence[str]) -> list[dict]: ...
+
     def render_messages(self, messages: Sequence[dict]) -> list[int]: ...
 
     def whitespace_free(self, ids: Sequence[int]) -> object: ...

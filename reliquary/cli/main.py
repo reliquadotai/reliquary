@@ -365,8 +365,6 @@ def with_episode_harnesses(episode_envs, value):
     digest this install serves (refused when it does not serve it). One harness per env."""
     import copy
 
-    from reliquary.environment.agentic_swe import harness_of, harness_pin_refusal
-
     if not value:
         return episode_envs
     envs = copy.deepcopy(dict(episode_envs or {}))
@@ -381,16 +379,39 @@ def with_episode_harnesses(episode_envs, value):
         if name not in envs:
             raise ValueError(f"--harness names {name}, which is not an --rl-episode-envs env")
         named.add(name)
-        pin = {"id": harness_id, "version": version, "digest": ""}
-        try:
-            pin["digest"] = harness_of(pin).digest
-        except ValueError as exc:
-            raise ValueError(f"--harness {name}: {exc}") from None
-        refusal = harness_pin_refusal(pin, variants=True)
-        if refusal:
-            raise ValueError(f"--harness {name}: {refusal}")
-        envs[name]["episode"] = {**envs[name]["episode"], "harness": pin}
+        envs[name]["episode"] = {**envs[name]["episode"],
+                                 "harness": _harness_pin(harness_id, version, f"--harness {name}", variants=True)}
     return envs
+
+
+def _harness_pin(harness_id: str, version: str, where: str, *, variants: bool) -> dict:
+    """``{id, version, digest}`` of a reliquary-harness spec at the digest this install serves (refused when
+    it does not serve it, or, without ``variants``, when the spec draws surface variants)."""
+    from reliquary.environment.agentic_swe import harness_of, harness_pin_refusal
+
+    pin = {"id": harness_id, "version": version, "digest": ""}
+    try:
+        pin["digest"] = harness_of(pin).digest
+    except ValueError as exc:
+        raise ValueError(f"{where}: {exc}") from None
+    refusal = harness_pin_refusal(pin, variants=variants)
+    if refusal:
+        raise ValueError(f"{where}: {refusal}")
+    return pin
+
+
+def with_job_harness(episode, value):
+    """``jobs create --harness id@version``: the signed episode a corpus or eval job plays pins that
+    reliquary-harness spec (``episode.harness_spec``). None: the episode as given."""
+    if not value:
+        return episode
+    harness_id, at, version = value.strip().partition("@")
+    if not at or not harness_id or not version:
+        raise ValueError(f"--harness: id@version expected, got {value!r}")
+    if not isinstance(episode, dict) or episode.get("sandbox") is None:
+        raise ValueError("--harness needs a signed_sandbox --episode-file (a replay job plays "
+                         "the compatibility harness only)")
+    return {**episode, "harness_spec": _harness_pin(harness_id, version, "--harness", variants=False)}
 
 
 def with_rl_async_params(entry, *, planned_tokens_per_period, lease_tokens_per_s=None, episode_envs=None,
@@ -1612,6 +1633,13 @@ def jobs_create(
         help="An agentic job: a JSON file holding the manifest's `episode` object "
         "(spec section 6). Its prompt source is reliquary_agentic_swe_v1",
     ),
+    harness: str = typer.Option(
+        None,
+        "--harness",
+        help="The reliquary-harness spec the job's signed episodes play, as id@version (e.g. "
+        "mini-swe@1), pinned at the digest this install serves. Omit for the compatibility "
+        "harness bash-vf-b2e4e81@1. A harness with surface variants is an RL lease's only",
+    ),
     settlement: str = typer.Option(
         "period-ema-v1",
         "--settlement",
@@ -1670,6 +1698,8 @@ def jobs_create(
 
             with open(episode_file, encoding="utf-8") as handle:
                 episode = json.load(handle)
+        if harness is not None:
+            episode = with_job_harness(episode, harness)
         if eval_set is not None:
             prompt_source, prompt_count, contract_environment, seed = _eval_job_source(
                 job_id=job_id, eval_set=eval_set, prompt_count=prompt_count,
@@ -1931,10 +1961,11 @@ def jobs_export(
 
                 signed_job = is_signed_sandbox(job)
                 tokenizer_dir = await asyncio.to_thread(_episode_tokenizer_dir, job)
-                # A replay job renders with the loader's default tools, as it always did.
+                # A replay job renders with the loader's default tools, as it always did; a signed
+                # one with its tools, in its harness.
                 renderer = await asyncio.to_thread(
-                    agentic_swe.load_turn_renderer, tokenizer_dir,
-                    *((job.episode.sandbox.tools,) if signed_job else ()))
+                    *((agentic_swe.job_turn_renderer, job, tokenizer_dir) if signed_job
+                      else (agentic_swe.load_turn_renderer, tokenizer_dir)))
                 if signed_job:
                     try:
                         # A signed eval job's rows through its set, checked against

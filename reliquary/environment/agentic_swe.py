@@ -81,9 +81,11 @@ def harness_refusal() -> str | None:
 
 def harness_pin_refusal(pin, *, variants: bool) -> str | None:
     """Why this build cannot serve a contract naming harness `pin` (`{id, version, digest}`,
-    or None for the compatibility harness), or None. `variants`: whether the caller draws a
-    surface variant per episode (an RL lease does; a corpus job has no validator seed, so it
-    plays the compatibility harness only). A refusal to serve, never a judgment."""
+    or None for the compatibility harness), or None. Any harness this build serves plays on
+    any task (corpus, eval, RL window or lease). `variants`: whether the caller draws a
+    surface variant per episode from a validator seed (an RL lease does; a corpus job or an
+    RL window has none, so a harness with variants is refused there). A refusal to serve,
+    never a judgment."""
     refusal = harness_refusal()
     if refusal or pin is None:
         return refusal
@@ -94,9 +96,6 @@ def harness_pin_refusal(pin, *, variants: bool) -> str | None:
         return f"the contract pins harness {key} at {pin['digest']}, this build serves {HARNESS_DIGESTS[key]}"
     if not variants and variant_count(get_spec(pin["id"], pin["version"])) != 1:
         return f"harness {key} draws surface variants per episode: an RL lease's, not a corpus job's"
-    if not variants and key != HARNESS.key:
-        # The corpus paths (intake, export, the replay miner) render with the compatibility harness only.
-        return f"a corpus job plays {HARNESS.key} only in this build, not {key}"
     return None
 
 
@@ -104,6 +103,18 @@ def harness_of(pin):
     """The spec a contract names (`{id, version, digest}`; None: the compatibility harness).
     Callers checked it first (`harness_pin_refusal`)."""
     return HARNESS if pin is None else get_spec(pin["id"], pin["version"])
+
+
+def job_harness(job):
+    """The spec a corpus or eval job's episodes play (`episode.harness_spec`; none: the
+    compatibility harness)."""
+    return harness_of(getattr(getattr(job, "episode", None), "harness_spec", None))
+
+
+def job_turn_renderer(job, checkpoint_dir: str) -> QwenTurnRenderer:
+    """The turn renderer of a signed job: its tools, in its harness. The miner, the intake
+    and the export all build this one."""
+    return load_turn_renderer(checkpoint_dir, tools=job.episode.sandbox.tools, spec=job_harness(job))
 
 
 def policy_harness_pin(policy):
@@ -172,9 +183,13 @@ def _renderers_version() -> str | None:
 def episode_support_refusal(episode, *, need_verifiers: bool) -> str | None:
     """Why this binary cannot serve `episode`, or None. ``need_verifiers`` for
     the processes that run episodes (miner, grade executor)."""
-    refusal = harness_pin_refusal(getattr(episode, "harness_spec", None), variants=False)
+    pin = getattr(episode, "harness_spec", None)
+    refusal = harness_pin_refusal(pin, variants=False)
     if refusal:
         return refusal
+    if getattr(episode, "sandbox", None) is None and harness_of(pin) is not HARNESS:
+        # The legacy Docker replay runs verifiers' own bash harness (step 7 retires it).
+        return f"a replay (non signed_sandbox) job plays {HARNESS.key} only, not {harness_of(pin).key}"
     if episode.renderer != SUPPORTED_RENDERER:
         return f"episode.renderer {episode.renderer!r} is not {SUPPORTED_RENDERER!r}"
     if episode.verifiers != SUPPORTED_VERIFIERS:

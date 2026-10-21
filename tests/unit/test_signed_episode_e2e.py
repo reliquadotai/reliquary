@@ -168,7 +168,7 @@ def session_documents(r2) -> list[dict]:
 
 
 def build_validator(gateway, r2, *, clock=None, policy=None, renderer=R, tokenizer=TOKENIZER,
-                    chunk=CHUNK):
+                    chunk=CHUNK, job=JOB):
     """The validator's signed side, wired by hand over the shared fake bucket: a fresh
     process each call (a restart is a second call)."""
     clock = clock or Clock()
@@ -186,23 +186,23 @@ def build_validator(gateway, r2, *, clock=None, policy=None, renderer=R, tokeniz
                            engagements={"corpus": CorpusEngagements(views.get, book, clock)},
                            policy=policy, clock=clock)
     fleet.on_drained = issuer.void_machine
-    intake = SignedEpisodeIntake(job=JOB, source=SOURCE, renderer=renderer, tokenizer=tokenizer,
+    intake = SignedEpisodeIntake(job=job, source=SOURCE, renderer=renderer, tokenizer=tokenizer,
                                  vocab_size=None, chunk_tokens=chunk,
                                  directory=fleet.directory_if_ready, token_verifier=tokens,
                                  sessions=issuer, seen=book.submitted_ids, clock=clock,
                                  retry_after_s=policy.retry_after_s)
     records = BucketRecordStore()
     accepted = []
-    corpus = build_corpus_router(job_id=JOB.job_id, store=_CountingStore(r2.kwargs),
+    corpus = build_corpus_router(job_id=job.job_id, store=_CountingStore(r2.kwargs),
                                  tokenizer=tokenizer, renderer=None, records=records,
                                  verify_signature=verify_corpus_signature,
                                  on_accepted=accepted.append, proof_chunk_tokens=chunk,
-                                 episode_intake=intake, job=JOB)
+                                 episode_intake=intake, job=job)
 
     async def resolve(index):
         return ResolvedTask(testing.FAKE_IMAGE, {})
 
-    views[JOB.job_id] = SignedJobView(job=JOB, resolve_task=resolve,
+    views[job.job_id] = SignedJobView(job=job, resolve_task=resolve,
                                       slots_remaining=corpus.slots_remaining)
     app = FastAPI()
     app.include_router(corpus)
@@ -303,8 +303,9 @@ def submission(played: Played, *, last=None, transcript=None, full=None, chunk=C
     return request.model_dump()
 
 
-async def grant_for(validator, world, request_id: str) -> dict:
-    answer = await validator.post("/corpus/sandbox/sessions", json=open_body(request_id, now=world.clock()))
+async def grant_for(validator, world, request_id: str, job_id: str = JOB.job_id) -> dict:
+    answer = await validator.post("/corpus/sandbox/sessions",
+                                  json=open_body(request_id, now=world.clock(), job_id=job_id))
     grant = answer.json()
     assert answer.status_code == 200 and "token" in grant, grant
     return grant

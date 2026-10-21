@@ -74,7 +74,7 @@ def test_a_mini_episode_runs_graded_and_is_admitted_under_mini_only(tmp_path):
         _parse(_renderer(BASH_VF_B2E4E81, 0), result, engine)
 
 
-def test_a_corpus_job_cannot_play_mini():
+def test_any_task_can_play_mini():
     pin = {"id": MINI_SWE_V1.id, "version": MINI_SWE_V1.version, "digest": MINI_SWE_V1.digest}
-    assert "plays bash-vf-b2e4e81@1 only" in agentic_swe.harness_pin_refusal(pin, variants=False)
-    assert agentic_swe.harness_pin_refusal(pin, variants=True) is None
+    assert agentic_swe.harness_pin_refusal(pin, variants=False) is None     # corpus, eval, RL window
+    assert agentic_swe.harness_pin_refusal(pin, variants=True) is None      # RL lease
