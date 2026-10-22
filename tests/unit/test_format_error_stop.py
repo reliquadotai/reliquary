@@ -96,7 +96,7 @@ from reliquary.corpus.signed_parse import signed_records  # noqa: E402
 from reliquary.miner.harness_episode import HarnessEpisodeRunner  # noqa: E402
 from reliquary.validator.episode_admission import episode_shape_refusal  # noqa: E402
 from tests.unit import harness_episode_parity as parity  # noqa: E402
-from tests.unit.test_harness_goldens import TOKENIZERS  # noqa: E402
+from tests.unit.harness_tokenizers import TOKENIZERS  # noqa: E402
 from tests.unit.test_harness_variants_e2e import _renderer, _trajectory  # noqa: E402
 
 needs_tokenizer = pytest.mark.skipif(not TOKENIZERS, reason="set RELIQUARY_QWEN38_TOKENIZER")

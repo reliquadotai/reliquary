@@ -1,5 +1,5 @@
 """`HarnessEpisodeRunner`: how the signed miner builds it, and how a run that fails still
-finishes its episode. (What it plays is `test_harness_episode_parity`.)"""
+finishes its episode."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from reliquary_sandbox_service.episodes.local_gateway import serve_app  # noqa: 
 from reliquary.miner.harness_episode import HarnessEpisodeRunner  # noqa: E402
 from reliquary.miner.signed_episode import SignedSweEpisodeRunner  # noqa: E402
 from tests.unit import harness_episode_parity as parity  # noqa: E402
-from tests.unit.test_harness_goldens import TOKENIZERS  # noqa: E402
+from tests.unit.harness_tokenizers import TOKENIZERS  # noqa: E402
 
 needs_tokenizer = pytest.mark.skipif(not TOKENIZERS, reason="set RELIQUARY_QWEN38_TOKENIZER")
 

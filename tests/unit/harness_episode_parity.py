@@ -5,23 +5,12 @@ Qwen tokenizer) served by a fake `/inference/v1/generate` engine, played against
 reliquary-sandbox's real gateway over FakeBoxes. What a scenario records is everything
 the validator and the engine's session log can see of the loop: each generate request
 (prompt ids, sampling params, model), whether every turn named one session, the stop,
-the gateway's call records, the final status and the router's refusals.
-
-`tests/fixtures/harness_goldens/miner-loop.<tokenizer>.json` holds what verifiers b2e4e81's
-bash harness (reliquary_sandbox_verifiers.SandboxEpisodeRunner under verifiers' train
-client, as `SignedSweEpisodeRunner` built it on feat/rl-async a5df544f) produced for
-every scenario. Written with
-
-    RUN_VERIFIERS_BRIDGE=1 python -m tests.unit.harness_episode_parity --write TOKENIZER_DIR
-
-(needs verifiers and uv with network: verifiers prepares its program with uv)."""
+the gateway's call records, the final status and the router's refusals."""
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import os
-import sys
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -29,7 +18,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 
-from tests.unit.harness_goldens import FIXTURES, dump, tokenizer_digest
+from tests.unit.harness_tokenizers import tokenizer_digest
 
 MODEL = "policy"
 MAX_TOKENS = 512
@@ -219,33 +208,3 @@ async def play(name: str, tokenizer_dir: str, workdir: Path, runner_factory=veri
                   if body["kind"] == "call"],
         "refusals": [list(refusal) for refusal in result.refusals],
     }
-
-
-def fixture_path(tokenizer: str) -> Path:
-    return FIXTURES / f"miner-loop.{tokenizer}.json"
-
-
-def record(tokenizer_dir: str, workdir: Path, runner_factory=verifiers_runner) -> dict:
-    async def all_scenarios():
-        return {name: await play(name, tokenizer_dir, workdir / name, runner_factory) for name in SCENARIOS}
-
-    return asyncio.run(all_scenarios())
-
-
-def main(argv: list[str]) -> int:
-    import tempfile
-
-    if len(argv) < 2 or argv[0] != "--write":
-        print(__doc__)
-        return 2
-    for directory in argv[1:]:
-        with tempfile.TemporaryDirectory() as workdir:
-            recorded = record(directory, Path(workdir))
-        path = fixture_path(tokenizer_digest(directory))
-        path.write_text(dump(recorded), encoding="utf-8")
-        print(path, {name: (row["stop"], row["final"], len(row["requests"])) for name, row in recorded.items()})
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))

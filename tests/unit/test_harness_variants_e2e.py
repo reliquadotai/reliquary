@@ -23,7 +23,7 @@ from reliquary.corpus.trajectory_parse import TrajectoryRefused  # noqa: E402
 from reliquary.environment.agentic_swe import load_turn_renderer  # noqa: E402
 from reliquary.miner.harness_episode import HarnessEpisodeRunner  # noqa: E402
 from tests.unit import harness_episode_parity as parity  # noqa: E402
-from tests.unit.test_harness_goldens import TOKENIZERS  # noqa: E402
+from tests.unit.harness_tokenizers import TOKENIZERS  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not TOKENIZERS, reason="set RELIQUARY_QWEN38_TOKENIZER")
 EXIT_CODES = dataclasses.replace(BASH_SURFACE_V1, version="test-exit-codes",
