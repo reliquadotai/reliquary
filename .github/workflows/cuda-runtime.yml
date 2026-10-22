@@ -50,4 +50,5 @@ jobs:
           docker run --rm --network none --read-only --cap-drop ALL \
             --security-opt no-new-privileges --pids-limit 512 --memory 8g --cpus 2 \
             --tmpfs /tmp:rw,nosuid,nodev,size=1g \
-            --entrypoint python validator-runtime:test scripts/check_cuda_runtime.py
+            --entrypoint sh validator-runtime:test -c \
+            'python -m pip check && python scripts/check_cuda_runtime.py'
