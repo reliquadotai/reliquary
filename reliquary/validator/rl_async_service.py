@@ -858,6 +858,7 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
         await asyncio.to_thread(rl.close)
         telemetry.finish()
 
+    background.append(server._monitor_process_health())
     await _run_corpus_services(http, background, cleanup=cleanup)
 
 
