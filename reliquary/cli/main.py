@@ -4144,6 +4144,40 @@ async def _discover_rl_validator() -> tuple[str, str | None]:
         await close_subtensor(subtensor)
 
 
+@app.command("miner-setups")
+def miner_setups(
+    state_dir: str = typer.Option("", "--state-dir", help="The validator's state dir (default: the active one)"),
+    hours: float = typer.Option(24.0, "--hours", help="Only instances heard from within this many hours"),
+    as_json: bool = typer.Option(False, "--json", help="Print the summary as JSON"),
+) -> None:
+    """The hardware opted-in miners declared (``mine-async --share-setup``): one line per hotkey."""
+    import json as _json
+
+    from reliquary.validator.miner_setup import DB_NAME, MinerSetupStore, summarize
+
+    if state_dir:
+        directory = Path(state_dir)
+    else:
+        from reliquary.validator.service import _validator_state_dir
+
+        directory = _validator_state_dir()
+    path = directory / DB_NAME
+    if not path.is_file():
+        typer.echo(f"no declarations yet ({path} missing)", err=True)
+        raise typer.Exit(code=1)
+    lines = summarize(MinerSetupStore(path).rows(), active_window_s=hours * 3600)
+    if as_json:
+        typer.echo(_json.dumps(lines, indent=2))
+        return
+    total = 0
+    for line in lines:
+        total += line["gpu_count"]
+        gpus = ", ".join(f"{n}x {name}" for name, n in sorted(line["gpus"].items())) or "no GPU"
+        note = f"  ({'; '.join(line['notes'])})" if line["notes"] else ""
+        typer.echo(f"{line['hotkey']}  {line['instances']} process(es)  {gpus}{note}")
+    typer.echo(f"{len(lines)} hotkey(s), {total} GPU(s)")
+
+
 @app.command("mine-async")
 def mine_async(
     environments: str = typer.Option(
@@ -4197,6 +4231,10 @@ def mine_async(
         [], "--harness-env", help="Episode envs: KEY=VALUE for the harness (repeatable; no secrets: ps shows them)"),
     harness_env_file: str = typer.Option(
         "", "--harness-env-file", help="Episode envs: file of KEY=VALUE lines for the harness (its secrets)"),
+    share_setup: bool = typer.Option(
+        False, "--share-setup", help="Opt in: send this process's GPUs (model, memory), CPU and RAM to the "
+        "validator at start and every 6 h. Informational only, never scored"),
+    setup_note: str = typer.Option("", "--setup-note", help="With --share-setup: a free note, e.g. '2 boxes 8xH100'"),
     log_level: str = typer.Option("INFO", help="Log level"),
 ) -> None:
     """Mine the asynchronous RL protocol: lease prompts within the measured quota, generate 16 rollouts per lease
@@ -4248,6 +4286,7 @@ def mine_async(
             base_model_dir=base_model or None, work_dir=work_dir, initial_dir=initial_checkpoint or None,
             initial_version=None if initial_version < 0 else initial_version, swap=weight_swap, dry_run=dry_run,
             fake_generator=fake_generator, episode_options=episode_options,
+            share_setup=setup_note if share_setup else None,
             engine_kwargs={"gpu_memory_utilization": gpu_memory_utilization, "max_num_seqs": max_num_seqs,
                            "max_model_len": max_model_len or None, "quantization": quantization or None}))
     except ValueError as exc:

@@ -797,6 +797,11 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     server = ValidatorServer(http_host, http_port, emission_cap=cap)
     mount_rl_async(server, rl, validator_hotkey=validator_hotkey,
                    registration=None if registered is None else registered.reason)
+    from reliquary.validator.miner_setup import DB_NAME as SETUP_DB, MinerSetupStore, build_miner_setup_router
+
+    server.mount_rl_lease_router(build_miner_setup_router(
+        MinerSetupStore(state_dir / SETUP_DB), validator_hotkey=validator_hotkey,
+        registration=None if registered is None else registered.reason))
     archives = R2PeriodArchives(guard=R2Archives(served=lambda: (settings.task_id,), served_only=True))
     background = rl_async_loops(rl, archives=archives, audit_model=audit_model, publisher=publisher,
                                 trainer_audits=source == "trainer")

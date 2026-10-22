@@ -1246,8 +1246,10 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
                           initial_version: int | None = None, swap: str = "push", dry_run: bool = False,
                           fake_generator: bool = False, engine_kwargs: Mapping[str, Any] | None = None,
                           prompt_ranges: Mapping[str, Any] | None = None,
-                          episode_options: Mapping[str, Any] | None = None) -> None:
-    """Build the transport, generator, planners and checkpoint follower, and run until interrupted."""
+                          episode_options: Mapping[str, Any] | None = None,
+                          share_setup: str | None = None) -> None:
+    """Build the transport, generator, planners and checkpoint follower, and run until interrupted.
+    ``share_setup`` (the miner's note, may be empty) opts in to declaring the hardware (``miner_setup``)."""
     import httpx
 
     from reliquary.miner.ckpt_sync import CheckpointSync
@@ -1276,6 +1278,13 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
             sync = CheckpointSync(validator_hotkey=validator_hotkey, work_dir=Path(work_dir) / "ckpt-download",
                                   model_dir=model_files)
             weights = PayWeights(validator_url).weights
+            if share_setup is not None:
+                from reliquary.miner.miner_setup import share_setup_forever
+
+                sharing = asyncio.create_task(share_setup_forever(
+                    client, validator_url=validator_url, validator_hotkey=validator_hotkey, wallet=wallet,
+                    work_dir=work_dir, note=share_setup))
+                stack.callback(sharing.cancel)
             # The validator's signed-episode envs (their blocks: policy, catalogue); played by the episode stack. The
             # answer adds each env's lease lifetime, which is no part of the block.
             blocks = {name: {k: v for k, v in block.items() if k != "lease_expiry_s"}
