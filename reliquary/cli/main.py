@@ -2490,6 +2490,13 @@ def eval_feed(
     out: str | None = typer.Option(None, "--out", help="Write the feed here"),
     publish: bool = typer.Option(False, "--publish", help="Upload it to the public bucket (R2_PUBLIC_*) at "
                                                           "rl-runs/<run-id>/benchmarks.json"),
+    wandb_run_id: str | None = typer.Option(None, "--wandb-run-id",
+                                            help="Write it into this W&B evaluation run's summary "
+                                                 "(reliquary_run_benchmarks), the platform's "
+                                                 "WANDB_RL_BENCHMARK_RUN_ID; never the trainer's run (WANDB_API_KEY)"),
+    wandb_project: str | None = typer.Option(None, "--wandb-project", help="Default: WANDB_PROJECT, then "
+                                                                           "reliquary-validator (the trainer's)"),
+    wandb_entity: str | None = typer.Option(None, "--wandb-entity", help="Default: WANDB_ENTITY"),
 ) -> None:
     """Build the run monitor's held-out benchmark feed (reliquary.run-benchmarks.v1) from graded reports."""
     import json
@@ -2508,8 +2515,12 @@ def eval_feed(
             if not sep or not set_id or not text:
                 raise ValueError(f"--label {item!r}: <set-id>=<label>")
             labels[set_id] = text
-        if not (names(jobs) or job_prefix):
-            raise ValueError("name the checkpoint jobs: --jobs and/or --job-prefix")
+        if not (names(jobs) or job_prefix or names(baseline_jobs)):
+            raise ValueError("name the jobs: --jobs, --job-prefix and/or --baseline-job")
+        if wandb_run_id is not None:
+            from reliquary.eval import wandb_feed
+
+            wandb_feed.target(run_id, run_id=wandb_run_id)
         reports = (run_feed.LocalReports(reports_dir) if reports_dir is not None
                    else run_feed.BucketReports())
         checkpoints, baselines, missing = asyncio.run(run_feed.collect(
@@ -2526,6 +2537,9 @@ def eval_feed(
         if publish:
             summary["published"] = run_feed.publish_feed(
                 feed, base_url=os.environ.get("RELIQUARY_RUN_BENCHMARKS_BASE_URL", "").strip() or None)
+        if wandb_run_id is not None:
+            summary["wandb"] = wandb_feed.publish_summary(feed, run_id=wandb_run_id, project=wandb_project,
+                                                          entity=wandb_entity)
     except (ValueError, OSError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -2559,8 +2573,14 @@ def eval_schedule(
     max_wait_hours: float = typer.Option(6.0, "--max-wait-hours", help="Then missing samples count as failures"),
     publish: bool = typer.Option(False, "--publish", help="Publish the feed after each graded checkpoint"),
     upload: bool = typer.Option(False, "--upload", help="Upload each grading to the subnet bucket"),
-    wandb: bool = typer.Option(False, "--wandb", help="Also log the scores to wandb, run <trainer group>-evals "
-                                                      "(WANDB_API_KEY, WANDB_PROJECT)"),
+    wandb: bool = typer.Option(False, "--wandb", help="After each feed rebuild, write it into a W&B evaluation run "
+                                                      "(summary reliquary_run_benchmarks + score history; "
+                                                      "WANDB_API_KEY)"),
+    wandb_run_id: str | None = typer.Option(None, "--wandb-run-id", help="That run (implies --wandb; default "
+                                            "<trainer group>-evals): the platform's WANDB_RL_BENCHMARK_RUN_ID"),
+    wandb_project: str | None = typer.Option(None, "--wandb-project", help="Default: WANDB_PROJECT, then "
+                                                                           "reliquary-validator (the trainer's)"),
+    wandb_entity: str | None = typer.Option(None, "--wandb-entity", help="Default: WANDB_ENTITY"),
     execute: bool = typer.Option(False, "--execute", help="Act (default: a dry run printing what it would do)"),
     loop_seconds: float = typer.Option(0.0, "--loop-seconds", help="Tick again every N seconds (0: once)"),
 ) -> None:
@@ -2580,7 +2600,12 @@ def eval_schedule(
             baseline_model=baseline_model, baseline_revision=baseline_revision, results_dir=Path(results_dir),
             state_path=Path(state) if state else Path(results_dir) / "schedule-state.json",
             start_cmd=start_cmd or rl_schedule.DEFAULT_START, start_values=values,
-            max_wait_s=max_wait_hours * 3600, publish=publish, upload=upload, wandb=wandb)
+            max_wait_s=max_wait_hours * 3600, publish=publish, upload=upload, wandb=wandb or bool(wandb_run_id),
+            wandb_run_id=wandb_run_id, wandb_project=wandb_project, wandb_entity=wandb_entity)
+        if settings.wandb:
+            from reliquary.eval.wandb_feed import target
+
+            target(run_id, run_id=wandb_run_id)
         for entry in settings.suite:
             rl_schedule.job_id(run_tag, 99999, entry.short)
         scheduler = rl_schedule.Scheduler(settings, rl_schedule.live_ports(settings))

@@ -4,12 +4,15 @@
 ``rl_run_id``, see ``job_grading.rl_provenance``) into a ``reliquary.run-benchmarks.v1`` document, the contract of
 reliquary-platform ``shared/run-benchmarks.ts``; ``parse_feed`` is that file's validator, ported, and every built
 feed passes it. One benchmark per eval set (its id is the set id): the baseline is the start checkpoint's report,
-the points the run's checkpoints by step. The score is the report's headline pass@1 (missing and ungraded samples
+the points the run's checkpoints by step. The baseline's ``step`` is null: it is the declared start checkpoint (the
+SFT model before RL), not an optimizer step of the run. The score is the report's headline pass@1 (missing and ungraded samples
 count as failures), ``samples`` the problems it is over. ``cost_usd`` / ``gpu_hours`` are cumulative TRAINING
 resource use in the contract, which a report does not know: null.
 
 The feed lives at ``rl-runs/<run_id>/benchmarks.json`` in the ``reliquary-public`` bucket; the bucket is private,
-so the RL validator serves it at ``GET /rl/benchmarks?run_id=<run_id>`` (``RELIQUARY_RUN_BENCHMARKS_URL``).
+so the RL validator serves it at ``GET /rl/benchmarks?run_id=<run_id>`` (``RELIQUARY_RUN_BENCHMARKS_URL``). The other
+transport is the summary of a dedicated W&B evaluation run (``wandb_feed.publish_summary``,
+``WANDB_RL_BENCHMARK_RUN_ID``).
 """
 
 from __future__ import annotations
@@ -99,7 +102,7 @@ def _label(protocol: Mapping[str, Any]) -> str:
     return f"{protocol['source']} ({protocol['problems']} problems, {protocol['samples']} samples)"[:160]
 
 
-def _point(entry: Mapping[str, Any], *, step: int, checkpoint: str, at: int) -> dict:
+def _point(entry: Mapping[str, Any], *, step: int | None, checkpoint: str, at: int) -> dict:
     return {"checkpoint": checkpoint[:160], "step": step, "at": at, "score": entry["score"],
             "samples": entry["samples"], "cost_usd": None, "gpu_hours": None}
 
@@ -156,7 +159,7 @@ def build_feed(run_id: str, checkpoints: Iterable[tuple[str, Mapping[str, Any]]]
             points.append(_point(entry, step=step, checkpoint=entry["model"] or f"step-{step}", at=at))
         base = found["baseline"]
         baseline = None if base is None else _point(
-            base, step=base["rl_step"] if isinstance(base["rl_step"], int) else 0,
+            base, step=None,
             checkpoint=f"{base['model']}@{(base['revision'] or '')[:12]}", at=min(base["at"], observed_at_ms))
         benchmarks.append({"id": _benchmark_id(set_id), "label": labels.get(set_id) or _label(found["protocol"]),
                            "metric": "pass@1", "protocol": _protocol_block(found["protocol"]),
@@ -207,9 +210,11 @@ def parse_feed(raw: Any, run_id: str, now_ms: float) -> dict:
         raise FeedRejected("Invalid benchmark feed")
     at = _number(v.get("observed_at"), now_ms + 5000)
 
-    def point(raw_point):
+    def point(raw_point, *, baseline=False):
         p = _record(raw_point)
-        return {"checkpoint": _text(p.get("checkpoint")), "step": _integer(p.get("step")),
+        # A baseline may say `"step": null`; a missing step is refused all the same.
+        step = None if baseline and "step" in p and p["step"] is None else _integer(p.get("step"))
+        return {"checkpoint": _text(p.get("checkpoint")), "step": step,
                 "at": _number(p.get("at"), at),
                 "score": None if "score" in p and p["score"] is None else _number(p.get("score"), 1),
                 "samples": _integer(p.get("samples")),
@@ -228,7 +233,7 @@ def parse_feed(raw: Any, run_id: str, now_ms: float) -> dict:
                 for i, p in enumerate(checkpoints))
                 or len({p["checkpoint"] for p in checkpoints}) != len(checkpoints)):
             raise FeedRejected("Unordered benchmark checkpoints")
-        baseline = None if b.get("baseline") is None else point(b["baseline"])
+        baseline = None if b.get("baseline") is None else point(b["baseline"], baseline=True)
         if any(p["score"] is not None and p["samples"] < 1 for p in checkpoints + ([baseline] if baseline else [])):
             raise FeedRejected("Unmeasured benchmark score")
         benchmarks.append({

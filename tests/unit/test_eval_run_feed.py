@@ -63,7 +63,7 @@ def test_one_benchmark_per_set_with_its_baseline_and_steps_in_order():
     assert all(p["samples"] == 30 and p["cost_usd"] is None and p["gpu_hours"] is None
                for p in aime["checkpoints"])
     assert aime["baseline"] == {"checkpoint": "ReliquaryForge/Teutonic-I-Reliquary-SFT@18dfb97df4d7",
-                                "step": 0, "at": 1_799_000_000_000, "score": 0.5, "samples": 30,
+                                "step": None, "at": 1_799_000_000_000, "score": 0.5, "samples": 30,
                                 "cost_usd": None, "gpu_hours": None}
     assert gpqa_series["baseline"]["score"] == 0.38 and len(gpqa_series["checkpoints"]) == 1
     assert aime["protocol"]["id"] != gpqa_series["protocol"]["id"]
@@ -140,6 +140,8 @@ def _bench(feed):
     lambda f: _bench(f)["checkpoints"][0].update(checkpoint=""),
     lambda f: _bench(f)["checkpoints"][0].update(checkpoint="x" * 161),
     lambda f: _bench(f)["baseline"].update(samples=0),
+    lambda f: _bench(f)["baseline"].pop("step"),                      # null, not missing
+    lambda f: _bench(f)["checkpoints"][0].update(step=None),          # null only for the baseline
     lambda f: _bench(f).update(id="x" * 97),
     lambda f: _bench(f).update(label="two\nlines"),
     lambda f: _bench(f)["protocol"].update(attempts=0),
@@ -164,6 +166,14 @@ def test_the_ported_validator_accepts_gaps_and_measured_resources():
     assert parsed["benchmarks"][0]["checkpoints"][0]["score"] is None
     _bench(feed)["checkpoints"][0].pop("cost_usd")                   # undefined optional numbers read as null
     assert parse_feed(feed, RUN, NOW)["benchmarks"][0]["checkpoints"][0]["cost_usd"] is None
+
+
+def test_the_baseline_step_is_an_explicit_null_or_an_integer():
+    feed = _valid()
+    assert _bench(feed)["baseline"]["step"] is None
+    assert parse_feed(feed, RUN, NOW)["benchmarks"][0]["baseline"]["step"] is None
+    _bench(feed)["baseline"]["step"] = 0
+    assert parse_feed(feed, RUN, NOW)["benchmarks"][0]["baseline"]["step"] == 0
 
 
 # --- where the reports are, publication, CLI --------------------------------------------------------------------
