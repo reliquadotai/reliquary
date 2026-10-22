@@ -14,7 +14,7 @@ from collections.abc import Mapping
 SANDBOX_DISTRIBUTION = "reliquary-sandbox"
 # The reliquary-sandbox commit this build verifies and drives. A job's contract pins
 # its own (`episode.sandbox.sandbox_commit`); both must agree.
-SANDBOX_COMMIT = "867e521d8b10fd594319ba86bbf3350f7ce94d29"
+SANDBOX_COMMIT = "791f05686c53976b0cfb88b46e85f46f74583cbc"
 
 
 class SandboxUnavailable(RuntimeError):

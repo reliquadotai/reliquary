@@ -103,12 +103,13 @@ def test_new_bounds_require_the_separate_exact_terminal_policy(tmp_path):
             build(tmp_path, name="missing-" + key, config=config, reviewed=changed)
     with pytest.raises(ValueError):
         ep.signed_evaluation_policy("reliquary-swe==0.3.0", "eval", harness="signed-bash-v2")
+    card = build(tmp_path)
     for identity in ("signed-codex-cli-v1", "signed-claude-code-cli-v1"):
         with pytest.raises(ValueError):
             ep.signed_evaluation_policy(config["package"], config["split"], harness=identity)
         request = {**request_protocol(), "harness": identity, "interaction": "signed_episode", "max_turns": 48}
         with pytest.raises(ValueError):
-            ep.validate_request(envelope(request))
+            ep.validate_execution({card["set_id"]: card}, {card["set_id"]: card["protocol_sha256"]}, request=request)
 
 
 def test_historical_bash_and_telecom_remain_40_with_the_original_harness_shape(tmp_path):

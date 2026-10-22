@@ -33,7 +33,7 @@ def approved(monkeypatch):
         runner_argv=("/opt/signed-cli/runtime/bin/python", "/opt/signed-cli/acp-runner.py"),
         runner_sha256="c" * 64, initial_template_sha256="d" * 64,
         date_recipe=cli.CLI_DATE_RECIPE)
-    monkeypatch.setitem(cli._QUALIFIED, ep.CLAUDE_CLI_HARNESS, cap)
+    monkeypatch.setattr(cli, "_QUALIFIED", {ep.CLAUDE_CLI_HARNESS: cap})
     monkeypatch.setattr("reliquary.eval.verifiers_source.installed_artifacts", lambda _: "9" * 64)
     monkeypatch.setattr(ep, "renderer_sha256", lambda: "2" * 64)
     return cap
@@ -87,6 +87,16 @@ def test_registry_empty_and_other_harnesses_remain_unavailable(monkeypatch):
         with pytest.raises(ValueError):
             ep.validate_request(envelope({**request_protocol(), "harness": harness,
                 "interaction": "signed_episode", "max_turns": 48, "max_episode_tokens": 65536}))
+
+
+def test_installed_cpu_identity_binds_only_the_reviewed_cli_policy():
+    cap, identity, sha = ep.signed_cli_capability()
+    assert sha == "748cb39764e33d9bb35842bfc441a64c53c631822026da53ac7e1a9cf075757b"
+    assert ep.digest(identity) == sha and cap.protocol_id == ep.CLAUDE_CLI_HARNESS
+    policy = ep.signed_evaluation_policy("reliquary-swe==0.3.0", "eval", harness=ep.CLAUDE_CLI_HARNESS)
+    assert policy["cli_capability_sha256"] == sha
+    with pytest.raises(cli.CLIUnavailable):
+        cli.qualified_capability("signed-codex-cli-v1")
 
 
 def test_cli_source_binds_capability_and_exact_swe_only_policy(tmp_path, approved):
