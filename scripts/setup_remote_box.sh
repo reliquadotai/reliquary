@@ -43,7 +43,7 @@ fi
 
 echo "[setup] pip install reliquary"
 .venv/bin/pip install --upgrade pip setuptools wheel
-.venv/bin/pip install 'torch==2.13.0' \
+.venv/bin/pip install 'torch==2.13.0+cu130' \
     --index-url https://download.pytorch.org/whl/cu130
 .venv/bin/pip install -e .
 
