@@ -514,11 +514,11 @@ async def _every(step: Callable[[], Any], period: float, name: str) -> None:
 
 def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = None, audit_limit: int = AUDIT_LIMIT,
                    clock: Callable[[], float] = time.time, every: Mapping[str, float] | None = None,
-                   publisher=None, trainer_audits: bool = False, setups=None) -> list:
+                   publisher=None, trainer_audits: bool = False, cards=None) -> list:
     """The background coroutines of the service (run until cancelled). ``publisher``: the scan log's
     ``ObservationPublisher`` (``rl_observations.scan_publisher``). ``trainer_audits``: the trainer judges the audits
-    (``RlSubmissions.take_audits``); the loop here only drops the stale ones. ``setups``: the declared hardware
-    (``MinerSetupStore``), broken down per card in the metrics row."""
+    (``RlSubmissions.take_audits``); the loop here only drops the stale ones. ``cards``: the declared hardware
+    broken down per card in the metrics row (``rl_metrics.CardFeed``)."""
     from reliquary.validator import telemetry
     from reliquary.validator.rl_metrics import METRICS_EVERY_S, controller_metrics
     from reliquary.validator.rl_observations import FLUSH_EVERY_S
@@ -567,7 +567,7 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
             pass
 
     async def metrics() -> None:
-        row = await asyncio.to_thread(controller_metrics, rl, float(clock()), periods["metrics"], setups)
+        row = await asyncio.to_thread(controller_metrics, rl, float(clock()), periods["metrics"], cards)
         telemetry.log_training_step(row, step=None)
 
     loops = [_every(expire, periods["expire"], "expiry sweep"), _every(audit, periods["audit"], "audits"),
@@ -812,6 +812,7 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     mount_rl_async(server, rl, validator_hotkey=validator_hotkey,
                    registration=None if registered is None else registered.reason)
     from reliquary.validator.miner_setup import DB_NAME as SETUP_DB, MinerSetupStore, build_miner_setup_router
+    from reliquary.validator.rl_metrics import CardFeed
 
     setups = MinerSetupStore(state_dir / SETUP_DB)
     server.mount_rl_lease_router(build_miner_setup_router(
@@ -819,7 +820,8 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
         registration=None if registered is None else registered.reason))
     archives = R2PeriodArchives(guard=R2Archives(served=lambda: (settings.task_id,), served_only=True))
     background = rl_async_loops(rl, archives=archives, audit_model=audit_model, publisher=publisher,
-                                trainer_audits=source == "trainer", setups=setups)
+                                trainer_audits=source == "trainer",
+                                cards=CardFeed(setups, state_dir / "rl-card-models.json"))
     if rl.sandbox is not None:
         background.extend(rl.sandbox.background())
     if registered is not None:

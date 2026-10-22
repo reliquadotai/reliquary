@@ -3,12 +3,19 @@ leases, miners, audits and pay, read from the lease book's SQLite file. The trai
 from __future__ import annotations
 
 import json
+import logging
 import re
+from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 METRICS_EVERY_S = 60.0
 ACTIVE_MINER_S = 600.0          # a hotkey issued a lease this recently counts as an active miner
-MAX_CARD_CLASSES = 12           # declared names are miner-chosen: the rest is folded into "other"
+MAX_NAMED_CARDS = 9             # declared names are miner-chosen: past these, "other" (12 models with the 3 buckets)
+BUCKETS = ("mixed", "undeclared", "other")
+CARD_WINDOW_MAX_S = 240.0       # the dashboard drops a card window longer than 300 s
+SHARE_WINDOW_S = 600.0          # trained-token shares: trailing, so a row between two trainer steps still has them
 
 
 def card_class(name: str) -> str:
@@ -17,9 +24,48 @@ def card_class(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", s).strip("-")[:40] or "unknown"
 
 
-def card_metrics(rl: Any, summary: list[dict], now: float, window_s: float = METRICS_EVERY_S) -> dict[str, float]:
-    """Per declared card model (``miner_setup.summarize``): the active fleet and how the trainer judged its groups
-    over the window. A hotkey whose cards differ is ``mixed``, one that declared nothing ``undeclared``."""
+class CardFeed:
+    """The controller row's ``cards/*`` (read by the platform run monitor, ``shared/rl-card-fleet.ts``).
+
+    Every card model once published stays in every later row (zeros when idle), so the dashboard's model set (the
+    run summary) always has a full same-row vector; it is persisted at ``path`` across restarts of a resumed run.
+    Verdict counts cover the disjoint window ``[cards/window_start, _timestamp)``; the previous row's end is the
+    next one's start."""
+
+    def __init__(self, setups: Any, path: str | Path | None = None) -> None:
+        self.setups = setups
+        self.path = None if path is None else Path(path)
+        self.named: list[str] = []
+        if self.path is not None and self.path.exists():
+            try:
+                self.named = [str(c) for c in json.loads(self.path.read_text())][:MAX_NAMED_CARDS]
+            except (OSError, ValueError, TypeError):
+                logger.warning("card models at %s unreadable; starting over", self.path)
+        self.since: float | None = None
+
+    def _admit(self, classes: list[str]) -> None:
+        new = [c for c in classes if c not in self.named and c not in BUCKETS][:MAX_NAMED_CARDS - len(self.named)]
+        if not new:
+            return
+        self.named.extend(new)
+        if self.path is not None:
+            try:
+                self.path.write_text(json.dumps(self.named))
+            except OSError:
+                logger.warning("card models not saved to %s", self.path)
+
+    def row(self, rl: Any, now: float, window_s: float = METRICS_EVERY_S) -> dict[str, float]:
+        from reliquary.validator.miner_setup import summarize
+
+        start = max(now - window_s if self.since is None else self.since, now - CARD_WINDOW_MAX_S)
+        out = card_metrics(rl, summarize(self.setups.rows(), now=now), now, start, self)
+        self.since = now
+        return out
+
+
+def card_metrics(rl: Any, summary: list[dict], now: float, start: float, feed: CardFeed) -> dict[str, float]:
+    """Per declared card model (``miner_setup.summarize``): the active fleet now, and how the trainer judged its
+    groups in ``[start, now)``. A hotkey whose cards differ is ``mixed``, one that declared nothing ``undeclared``."""
     cards = {}
     for line in summary:
         classes = {card_class(n) for n in line["gpus"]}
@@ -29,53 +75,64 @@ def card_metrics(rl: Any, summary: list[dict], now: float, window_s: float = MET
     with rl.book.lock:
         active = [h for (h,) in db.execute("SELECT DISTINCT hotkey FROM rl_leases WHERE issued_at>=?",
                                            (now - ACTIVE_MINER_S,))]
-        events = db.execute("SELECT hotkey, kind, detail FROM rl_events WHERE at>=? AND kind IN (?, ?)",
-                            (now - window_s, "trained", "untrained")).fetchall()
+        events = db.execute("SELECT at, hotkey, kind, detail FROM rl_events WHERE at>=? AND at<? AND kind IN (?, ?)",
+                            (min(start, now - SHARE_WINDOW_S), now, "trained", "untrained")).fetchall()
     fleet: dict[str, list[int]] = {}
     for hotkey in active:
         cls, gpus = cards.get(hotkey, ("undeclared", 0))
         miners_gpus = fleet.setdefault(cls, [0, 0])
         miners_gpus[0] += 1
         miners_gpus[1] += gpus
-    kept = {c for c, _ in sorted(fleet.items(), key=lambda kv: (-kv[1][1], -kv[1][0], kv[0]))[:MAX_CARD_CLASSES]}
+    feed._admit([c for c, _ in sorted(fleet.items(), key=lambda kv: (-kv[1][1], -kv[1][0], kv[0]))])
 
     def bucket(cls: str) -> str:
-        return cls if cls in kept or cls in ("mixed", "undeclared") else "other"
+        return cls if cls in feed.named or cls in BUCKETS else "other"
 
-    out: dict[str, float] = {}
+    models = [*feed.named, *BUCKETS]
+    zero = {"miners": 0, "gpus": 0, "groups": 0, "groups_trained": 0, "groups_rejected": 0, "rollouts": 0,
+            "match_sum": 0.0, "match_min": 1.0, "trained_tokens": 0, "share_tokens": 0}
+    t = {m: dict(zero) for m in models}
     for cls, (miners, gpus) in fleet.items():
-        key = bucket(cls)
-        out[f"cards/{key}/miners"] = out.get(f"cards/{key}/miners", 0) + miners
-        out[f"cards/{key}/gpus"] = out.get(f"cards/{key}/gpus", 0) + gpus
-    judged: dict[str, dict[str, float]] = {}
-    for hotkey, kind, raw in events:
+        t[bucket(cls)]["miners"] += miners
+        t[bucket(cls)]["gpus"] += gpus
+    for at, hotkey, kind, raw in events:
         detail = json.loads(raw)
         match = detail.get("rollout_match") or []
         if not any(m > 0 for m in match):       # skipped step, stale or exhausted: the trainer never judged it
             continue
-        t = judged.setdefault(bucket(cards.get(hotkey, ("undeclared", 0))[0]),
-                              {"trained": 0, "rejected": 0, "match_sum": 0.0, "rollouts": 0, "match_min": 1.0,
-                               "tokens": 0})
-        t["trained" if kind == "trained" else "rejected"] += 1
-        t["match_sum"] += sum(match)
-        t["rollouts"] += len(match)
-        t["match_min"] = min(t["match_min"], min(match))
-        if kind == "trained":
-            t["tokens"] += sum(detail.get("matched_tokens") or detail.get("completion_tokens") or [])
-    total = sum(t["tokens"] for t in judged.values())
-    for key, t in judged.items():
-        out[f"cards/{key}/groups_trained"] = t["trained"]
-        out[f"cards/{key}/groups_rejected"] = t["rejected"]
-        out[f"cards/{key}/rejected_ratio"] = t["rejected"] / (t["trained"] + t["rejected"])
-        out[f"cards/{key}/rollout_match_mean"] = t["match_sum"] / t["rollouts"]
-        out[f"cards/{key}/rollout_match_min"] = t["match_min"]
-        out[f"cards/{key}/trained_tokens"] = t["tokens"]
-        out[f"cards/{key}/trained_token_share"] = t["tokens"] / total if total else 0.0
+        c = t[bucket(cards.get(hotkey, ("undeclared", 0))[0])]
+        tokens = int(sum(detail.get("matched_tokens") or detail.get("completion_tokens") or [])) \
+            if kind == "trained" else 0
+        c["share_tokens"] += tokens
+        if at < start:                          # only in the trailing share window
+            continue
+        c["groups"] += 1
+        c["groups_trained" if kind == "trained" else "groups_rejected"] += 1
+        c["rollouts"] += len(match)
+        c["match_sum"] += sum(match)
+        c["match_min"] = min(c["match_min"], min(match))
+        c["trained_tokens"] += tokens
+    share_total = sum(c["share_tokens"] for c in t.values())
+    out: dict[str, float] = {"cards/window_start": start}
+    for m, c in t.items():
+        p = f"cards/{m}/"
+        for key in ("miners", "gpus", "groups", "groups_trained", "groups_rejected", "trained_tokens"):
+            out[p + key] = c[key]
+        out[p + "match_weight"] = c["rollouts"]           # denominator of rollout_match_mean: judged rollouts
+        out[p + "rejection_weight"] = c["groups"]         # denominator of rejected_ratio: judged groups
+        if c["groups"]:
+            out[p + "rejected_ratio"] = c["groups_rejected"] / c["groups"]
+            mean = c["match_sum"] / c["rollouts"]
+            out[p + "rollout_match_mean"] = mean
+            out[p + "rollout_match_min"] = min(c["match_min"], mean)   # float sums: the reader drops min > mean
+        if share_total:
+            out[p + "trained_token_share"] = c["share_tokens"] / share_total
     return out
 
 
 def controller_metrics(rl: Any, now: float, window_s: float = METRICS_EVERY_S,
-                       setups: Any = None) -> dict[str, float]:
+                       cards: CardFeed | None = None) -> dict[str, float]:
+    """``_timestamp`` is ``now``: the end of the card window, exact rather than stamped later by wandb."""
     since = now - window_s
     out: dict[str, float] = {}
     for env, price in rl.prices.board().items():
@@ -133,11 +190,10 @@ def controller_metrics(rl: Any, now: float, window_s: float = METRICS_EVERY_S,
         out["trainer/completion_tokens_per_s"] = speed[0] / speed[1]
     out.update({"audits/queued": audit_queue, "miners/active": miners, "miners/banned": banned,
                 "miners/quota_cap_mean": sum(caps) / len(caps) if caps else 0.0})
-    if setups is not None:
-        from reliquary.validator.miner_setup import summarize
-
-        out.update(card_metrics(rl, summarize(setups.rows(), now=now), now, window_s))
+    if cards is not None:
+        out.update(cards.row(rl, now, window_s))
+    out["_timestamp"] = now
     return out
 
 
-__all__ = ["METRICS_EVERY_S", "card_class", "card_metrics", "controller_metrics"]
+__all__ = ["METRICS_EVERY_S", "CardFeed", "card_class", "card_metrics", "controller_metrics"]
