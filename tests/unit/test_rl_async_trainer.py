@@ -146,7 +146,8 @@ def test_groups_past_the_max_lag_are_dropped_unpaid_without_a_forward():
     trainer = AsyncTrainer(model, config=AsyncTrainerConfig(4, max_lag=8), buffer=buffer,
                            submissions=subs, book=book)
     assert trainer.drop_stale() == 1
-    assert subs.reports["old"] == {"rollout_match": [0.0] * ROLLOUTS, "accepted": False, "failure_class": None}
+    assert subs.reports["old"] == {"rollout_match": [0.0] * ROLLOUTS, "accepted": False,
+                                   "failure_class": None, "judged": False}
     assert buffer.depth() == {"math": 1}
 
 
@@ -327,6 +328,7 @@ def test_a_skipped_step_pays_nothing_and_a_crash_requeues():
     trainer._train_step = skipped
     assert trainer.run_once() == "skipped"
     assert subs.reports["g"]["accepted"] is False and subs.reports["g"]["failure_class"] is None
+    assert subs.reports["g"]["judged"] is False
     buffer.push(submitted(model, "h", n=2))
 
     def crash(*_, **__):
@@ -532,3 +534,25 @@ def test_the_trainer_never_takes_the_cudnn_attention_backend():
         assert torch.backends.cuda.cudnn_sdp_enabled() is False
     finally:
         torch.backends.cuda.enable_cudnn_sdp(before)
+
+
+@pytest.mark.parametrize("forwarded", [True, False])
+def test_a_forwarded_zero_match_group_is_reported_as_judged(forwarded):
+    model, book = _Model(), Book()
+    buffer = TrainingBuffer(book)
+    buffer.push(submitted(model, "zero-match"))
+    trainer, subs, _ = loop(model, book, buffer, batch=1)
+
+    def step(model, batches, *, gate, **_):
+        if forwarded:
+            for g in (g for b in batches for g in b):
+                gate.admit(g.rollouts, [(64, 0, 64, 0)] * len(g.rollouts))
+        gate.judge([])
+        return model
+
+    trainer._train_step = step
+    assert trainer.run_once() == "trained"
+    trainer.close()
+    report = subs.reports["zero-match"]
+    assert report["accepted"] is False and report["rollout_match"] == [0.0] * ROLLOUTS
+    assert report["judged"] is forwarded and report.get("failure_class") is None

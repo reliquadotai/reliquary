@@ -584,6 +584,94 @@ def test_the_controller_wandb_row_reads_prices_buffer_leases_and_miners(tmp_path
     rl.close()
 
 
+
+def test_card_class_turns_declared_names_into_short_keys():
+    from reliquary.validator.rl_metrics import card_class
+
+    assert card_class("NVIDIA GeForce RTX 4090") == "rtx-4090"
+    assert card_class("NVIDIA H100 80GB HBM3") == "h100-80gb-hbm3"
+    assert card_class("  ") == "unknown"
+
+
+def test_the_controller_row_breaks_the_trainer_verdicts_down_per_declared_card(tmp_path):
+    import json
+    import time
+
+    from reliquary.validator.miner_setup import MinerSetupStore
+    from reliquary.validator.rl_leases import LeaseRequest
+    from reliquary.validator.rl_metrics import CardFeed, controller_metrics
+
+    now = time.time()
+    setups = MinerSetupStore(tmp_path / "setups.sqlite3")
+    h100 = {"name": "NVIDIA H100 80GB HBM3", "memory_mib": 81559}
+    setups.put("A", "a" * 16, int(now), now, {"gpus": [{**h100, "id_hash": "1" * 16}, {**h100, "id_hash": "2" * 16}]})
+    setups.put("B", "b" * 16, int(now), now, {"gpus": [{"name": "NVIDIA GeForce RTX 4090", "id_hash": "3" * 16}]})
+    rl = components(tmp_path)
+    rl.book.adopt_checkpoint(0)
+    feed = CardFeed(setups, tmp_path / "cards.json")
+    first_start = feed.since
+    leases = {}
+    for hotkey, idx in (("A", 3), ("B", 4), ("C", 5)):
+        [lease] = rl.book.grant([LeaseRequest(hotkey, ENV, (idx,), 0)])[0].leases
+        assert rl.submissions.submit(lease.lease_id, hotkey, group(8))["verdict"] == "in_zone"
+        leases[hotkey] = lease.lease_id
+    rl.submissions.report_training(leases["A"], rollout_match=[0.99] * 16, accepted=True,
+                                   matched_tokens=[1] * 16)
+    rl.submissions.report_training(leases["B"], rollout_match=[0.5] * 15 + [0.25], accepted=False)
+    rl.submissions.report_training(leases["C"], rollout_match=[0.0] * 16, accepted=False)   # never judged
+    at = time.time() + 1
+    row = controller_metrics(rl, at, cards=feed)
+    h, r, u = "cards/h100-80gb-hbm3/", "cards/rtx-4090/", "cards/undeclared/"
+    # The platform's shared/rl-card-fleet.ts: a same-row vector for every model, window start in Unix seconds.
+    assert row["_timestamp"] == at and row["cards/window_start"] == first_start
+    models = {k.split("/")[1] for k in row if k.startswith("cards/") and k.count("/") == 2}
+    assert models == {"h100-80gb-hbm3", "rtx-4090", "mixed", "undeclared", "other"}
+    for m in models:
+        for key in ("gpus", "miners", "groups", "groups_rejected", "match_weight", "rejection_weight",
+                    "trained_tokens", "trained_token_share"):
+            assert isinstance(row[f"cards/{m}/{key}"], (int, float)), (m, key)
+    assert sum(row[f"cards/{m}/trained_token_share"] for m in models) == pytest.approx(1.0)
+    assert row[h + "gpus"] == 2 and row[h + "miners"] == 1 and row[r + "gpus"] == 1 and row[u + "miners"] == 1
+    assert row[h + "groups"] == 1 and row[h + "groups_trained"] == 1 and row[h + "rejected_ratio"] == 0
+    assert row[h + "rollout_match_mean"] == pytest.approx(0.99) and row[h + "match_weight"] == 16
+    assert row[h + "trained_tokens"] == 16 and row[h + "trained_token_share"] == 1.0
+    assert row[r + "rejected_ratio"] == 1.0 and row[r + "rejection_weight"] == 1
+    assert row[r + "rollout_match_min"] == 0.25 and row[r + "rollout_match_mean"] == pytest.approx(0.484375)
+    # The skipped group says nothing about the card: zero weight, no ratio.
+    assert row[u + "groups"] == 0 and row[u + "match_weight"] == 0 and u + "rejected_ratio" not in row
+    assert json.loads((tmp_path / "cards.json").read_text()) == ["h100-80gb-hbm3", "rtx-4090"]
+    # Next row: disjoint window starting at the previous end, nothing new judged, same models, shares kept.
+    later = controller_metrics(rl, at + 61, cards=feed)
+    assert later["cards/window_start"] == at and later[h + "groups"] == 0 and h + "rollout_match_mean" not in later
+    assert later[h + "trained_token_share"] == 1.0 and later[h + "gpus"] == 2
+    # A stall never yields a window the dashboard drops (> 300 s).
+    assert controller_metrics(rl, at + 1000, cards=feed)["cards/window_start"] == at + 1000 - 240
+    # A restarted controller keeps publishing the same models (the resumed run's summary keeps them).
+    assert CardFeed(setups, tmp_path / "cards.json").named == ["h100-80gb-hbm3", "rtx-4090"]
+    assert not any(k.startswith("cards/") for k in controller_metrics(rl, time.time()))
+    rl.close()
+
+
+def test_past_nine_named_cards_the_rest_is_other(tmp_path):
+    import time
+
+    from reliquary.validator.miner_setup import MinerSetupStore
+    from reliquary.validator.rl_leases import LeaseRequest
+    from reliquary.validator.rl_metrics import CardFeed, controller_metrics
+
+    now = time.time()
+    setups = MinerSetupStore(tmp_path / "setups.sqlite3")
+    rl = components(tmp_path)
+    rl.book.adopt_checkpoint(0)
+    for i in range(11):
+        setups.put(f"H{i}", "x" * 16, int(now), now, {"gpus": [{"name": f"Card {i}", "id_hash": f"{i:016d}"}]})
+        rl.book.grant([LeaseRequest(f"H{i}", ENV, (i,), 0)])
+    row = controller_metrics(rl, time.time() + 1, cards=CardFeed(setups))
+    models = {k.split("/")[1] for k in row if k.startswith("cards/") and k.endswith("/gpus")}
+    assert len(models) == 12 and row["cards/other/gpus"] == 2
+    rl.close()
+
+
 async def test_with_audits_on_the_trainer_the_validator_loop_never_concludes_them_itself(tmp_path):
     from reliquary.validator.rl_leases import LeaseRequest
 
@@ -598,4 +686,82 @@ async def test_with_audits_on_the_trainer_the_validator_loop_never_concludes_the
         task.cancel()
     await asyncio.gather(*loops, return_exceptions=True)
     assert [g.lease_id for g in rl.submissions.audit_jobs(10)] == [lease.lease_id]   # left to the trainer
+    rl.close()
+
+
+def test_card_windows_do_not_replay_groups_after_restart(tmp_path, monkeypatch):
+    from reliquary.validator.miner_setup import MinerSetupStore
+    from reliquary.validator.rl_leases import LeaseRequest
+    from reliquary.validator.rl_metrics import CardFeed, controller_metrics
+
+    setups = MinerSetupStore(tmp_path / "setups.sqlite3")
+    rl = components(tmp_path)
+    rl.book.adopt_checkpoint(0)
+    feed = CardFeed(setups)
+    [lease] = rl.book.grant([LeaseRequest("A", ENV, (3,), 0)])[0].leases
+    assert rl.submissions.submit(lease.lease_id, "A", group(8))["verdict"] == "in_zone"
+    rl.submissions.report_training(lease.lease_id, rollout_match=[1.0] * 16, accepted=True)
+    first_end = time.time() + 1
+    first = controller_metrics(rl, first_end, cards=feed)
+    assert first["cards/undeclared/groups"] == 1
+    monkeypatch.setattr(time, "time", lambda: first_end + 1)
+    restarted = CardFeed(setups)
+    after = controller_metrics(rl, first_end + 2, cards=restarted)
+    assert first_end <= after["cards/window_start"] <= after["_timestamp"]
+    assert after["cards/undeclared/groups"] == 0
+    # A backward wall-clock correction produces no negative interval or replay.
+    backward = controller_metrics(rl, first_end, cards=restarted)
+    assert backward["cards/window_start"] == backward["_timestamp"] == first_end
+    forward = controller_metrics(rl, first_end + 3, cards=restarted)
+    assert forward["cards/window_start"] == after["_timestamp"]
+    rl.close()
+
+
+@pytest.mark.parametrize("judged, expected_groups", [(True, 1), (False, 0), (None, 0)])
+def test_zero_match_quality_preserves_judged_skip_and_legacy_distinction(tmp_path, judged, expected_groups):
+    from reliquary.trainer.rl_link import TrainerLink
+    from reliquary.validator.miner_setup import MinerSetupStore
+    from reliquary.validator.rl_leases import LeaseRequest
+    from reliquary.validator.rl_metrics import CardFeed, controller_metrics
+
+    rl = components(tmp_path)
+    rl.book.adopt_checkpoint(0)
+    feed = CardFeed(MinerSetupStore(tmp_path / "setups.sqlite3"))
+    [lease] = rl.book.grant([LeaseRequest("A", ENV, (3,), 0)])[0].leases
+    assert rl.submissions.submit(lease.lease_id, "A", group(8))["verdict"] == "in_zone"
+    app = FastAPI()
+    app.include_router(build_rl_trainer_router(rl, token=TOKEN))
+    link = TrainerLink("http://testserver", TOKEN, client=TestClient(app), patience_s=0.0)
+    link.report_training(lease.lease_id, rollout_match=[0.0] * 16, accepted=False, judged=judged)
+    raw = rl.book.db.execute("SELECT detail FROM rl_events WHERE kind='untrained'").fetchone()[0]
+    detail = json.loads(raw)
+    assert detail.get("judged") is judged
+    assert ("judged" in detail) is (judged is not None)
+    assert detail["failure_class"] is None
+    assert rl.book.db.execute("SELECT COUNT(*) FROM rl_verdicts WHERE source='training'").fetchone()[0] == 0
+    row = controller_metrics(rl, time.time() + 1, cards=feed)
+    assert row["cards/undeclared/groups"] == expected_groups
+    assert row["cards/undeclared/groups_rejected"] == expected_groups
+    assert row["cards/undeclared/match_weight"] == 16 * expected_groups
+    assert row["cards/undeclared/trained_tokens"] == 0
+    if judged:
+        assert row["cards/undeclared/rejected_ratio"] == 1.0
+        assert row["cards/undeclared/rollout_match_mean"] == 0.0
+    rl.close()
+
+
+@pytest.mark.parametrize("judged", [0, 1, "true"])
+def test_invalid_judged_flag_does_not_consume_a_group(tmp_path, judged):
+    from reliquary.validator.rl_leases import LeaseRequest
+
+    rl = components(tmp_path)
+    rl.book.adopt_checkpoint(0)
+    [lease] = rl.book.grant([LeaseRequest("A", ENV, (3,), 0)])[0].leases
+    assert rl.submissions.submit(lease.lease_id, "A", group(8))["verdict"] == "in_zone"
+    app = FastAPI()
+    app.include_router(build_rl_trainer_router(rl, token=TOKEN))
+    response = TestClient(app).post("/rl/trainer/report", headers={"Authorization": "Bearer " + TOKEN}, json={
+        "lease_id": lease.lease_id, "rollout_match": [0.0] * 16, "accepted": False, "judged": judged})
+    assert response.status_code == 422
+    assert rl.buffer.get(lease.lease_id) is not None
     rl.close()

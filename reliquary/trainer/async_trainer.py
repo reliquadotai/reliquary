@@ -356,7 +356,7 @@ class AsyncTrainer:
     def _report_untrained(self, groups, failure_class=None) -> None:
         for group in groups:
             self.submissions.report_training(group.lease_id, rollout_match=[0.0] * len(group.completions),
-                                             accepted=False, failure_class=failure_class)
+                                             accepted=False, failure_class=failure_class, judged=False)
 
     def drop_stale(self) -> int:
         below = self.version - self.config.max_lag
@@ -485,11 +485,12 @@ class AsyncTrainer:
             if gate.accepted is not None and gate.accepted[g]:
                 matched = [gate.tallies[s][3] if gate.admitted[s] else 0 for s in slots]
                 self.submissions.report_training(group.lease_id, rollout_match=match, accepted=True,
-                                                 matched_tokens=matched,
+                                                 matched_tokens=matched, judged=True,
                                                  substitutions=[gate.substitutions[s] for s in slots])
                 trained[group.environment] = trained.get(group.environment, 0) + sum(matched)
                 continue
-            self.submissions.report_training(group.lease_id, rollout_match=match, accepted=False)
+            self.submissions.report_training(group.lease_id, rollout_match=match, accepted=False,
+                                             judged=any(gate.forwarded[s] for s in slots))
         return trained
 
 
