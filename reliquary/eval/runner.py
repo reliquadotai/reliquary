@@ -306,7 +306,8 @@ class EvalRunner:
                  work_dir: str | Path, chunk_problems: int = CHUNK_PROBLEMS,
                  heartbeat_seconds: float = HEARTBEAT_SECONDS,
                  max_heartbeat_failures: int = MAX_HEARTBEAT_FAILURES,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic,
+                 remote_model_factory: Callable[[], Generator] | None = None) -> None:
         if chunk_problems <= 0:
             raise ValueError("chunk_problems must be positive")
         self._client, self._generator = client, generator
@@ -315,6 +316,7 @@ class EvalRunner:
         self._heartbeat_seconds = heartbeat_seconds
         self._max_failures = max_heartbeat_failures
         self._clock = clock
+        self._remote_model_factory = remote_model_factory
 
     # ---- local state, what survives a crash ---------------------------------
 
@@ -402,7 +404,7 @@ class EvalRunner:
         return rows
 
     def _run(self, task: dict, heartbeat: _Heartbeat) -> dict:
-        from reliquary.eval.protocol import validate_execution, validate_request
+        from reliquary.eval.protocol import CLAUDE_CLI_HARNESS, validate_execution, validate_request
 
         task_id = str(task["task_id"])
         validate_model(task["model"]["repo"], task["model"]["revision"])
@@ -417,19 +419,24 @@ class EvalRunner:
                          for entry in task.get("envs", [])]
         if task.get("protocol") and task["protocol"].get("sets") != selected_sets:
             raise ValueError("request protocol selected sets changed")
+        if self._remote_model_factory is not None:
+            if ((task.get("protocol") or {}).get("harness") not in {"signed-bash-v2", CLAUDE_CLI_HARNESS}
+                    or type(self._generator) is not VLLMGenerator):
+                raise ValueError("remote inference requires the versioned signed episode runner")
         if task.get("protocol") and type(self._generator) is VLLMGenerator:
             from reliquary.eval.model_process import ModelProcess
 
-            self._generator = ModelProcess(VLLMGenerator,
+            self._generator = ModelProcess(self._remote_model_factory or VLLMGenerator,
                 timeout_seconds=task["protocol"]["episode_timeout_seconds"],
                 cancelled=lambda: heartbeat.lost is not None)
         started = self._clock()
         rows = self._rows(task)
-        plan = hashlib.sha256(json.dumps(
-            [self._chunk, [(r["problem_id"], r["samples"]) for r in rows],
+        plan_inputs = [self._chunk, [(r["problem_id"], r["samples"]) for r in rows],
              task["model"], access, task.get("protocol_sha256"), task.get("protocol_bindings"),
-             task.get("sampling"), task["max_new_tokens"], bool(task["thinking"])],
-            sort_keys=True).encode()).hexdigest()
+             task.get("sampling"), task["max_new_tokens"], bool(task["thinking"])]
+        if self._remote_model_factory is not None:
+            plan_inputs.append("private-loopback-token-transport/v1")
+        plan = hashlib.sha256(json.dumps(plan_inputs, sort_keys=True).encode()).hexdigest()
         state = self._load_state(task_id, plan)
         directory = self._root / task_id
         directory.mkdir(parents=True, exist_ok=True)
@@ -442,8 +449,9 @@ class EvalRunner:
                 loaded_at = self._clock()
                 private = {}
                 if access == "private":
-                    token = self._client.model_credential(task["model"])
-                    private = {"model_access": "private", "hf_token": token}
+                    private = {"model_access": "private"}
+                    if self._remote_model_factory is None:
+                        private["hf_token"] = self._client.model_credential(task["model"])
                 if task.get("protocol"):
                     private["max_total_tokens"] = task["protocol"]["max_episode_tokens"]
                 info = self._generator.load(
@@ -555,7 +563,8 @@ class EvalRunner:
             grant = self._client.sandbox_session(row["set_id"], row["problem_id"], sample_index,
                                                 timeout_seconds=max(0.001, deadline - time.monotonic()))
             result = asyncio.run(run_signed_episode(generator=self._generator, task=task, row=row,
-                sample_index=sample_index, grant=grant, seed=seed, deadline=deadline))
+                sample_index=sample_index, grant=grant, seed=seed, deadline=deadline,
+                cancelled=lambda: heartbeat.lost is not None))
             return Completion(result["completion"], result["completion_tokens"], result["finish_reason"],
                 {**result["episode"], **{key: result[key] for key in ("turns", "tool_calls", "transcript_tokens")}})
         from reliquary.eval.agentic import EpisodeCompletion, load_telecom_benchmark, run_telecom_episode
@@ -613,7 +622,8 @@ class EvalRunner:
 
 
 def run_evaluation(*, platform: str, executor_id: str, work_dir: str,
-                   chunk_problems: int = CHUNK_PROBLEMS) -> dict | None:
+                   chunk_problems: int = CHUNK_PROBLEMS,
+                   remote_model_factory: Callable[[], Generator] | None = None) -> dict | None:
     from reliquary.eval.platform_client import TOKEN_ENV
 
     client = PlatformClient(platform, os.environ.get(TOKEN_ENV, "").strip(),
@@ -626,7 +636,8 @@ def run_evaluation(*, platform: str, executor_id: str, work_dir: str,
         signal.signal(signal.SIGTERM, stopping)
     try:
         return EvalRunner(client, VLLMGenerator(), work_dir=work_dir,
-                          chunk_problems=chunk_problems).run()
+                          chunk_problems=chunk_problems,
+                          remote_model_factory=remote_model_factory).run()
     finally:
         if previous is not None:
             signal.signal(signal.SIGTERM, previous)

@@ -621,6 +621,7 @@ def build_episode_set(source: str, *, out: str | Path, interaction: str, count: 
     if count <= 0:
         raise ValueError("episode count must be positive")
     config = dict(episode_config or {})
+    cli_cap = None
     if interaction == "episode" and source == agentic.TELECOM_ENVIRONMENT:
         from reliquary.environment.registry import get_environment_spec
         manifest = get_environment_spec(source).environment_manifest_sha256
@@ -639,31 +640,41 @@ def build_episode_set(source: str, *, out: str | Path, interaction: str, count: 
     elif interaction == "signed_episode":
         from reliquary.environment.bridged_episode import BridgedEnvConfig, BridgedEpisodeSource
         from reliquary.eval.signed_agentic import resolve_task
-        from reliquary.eval.protocol import renderer_sha256, SIGNED_SOURCE_POLICIES, signed_evaluation_policy
+        from reliquary.eval.protocol import (BOUNDED_SIGNED_HARNESSES, CLAUDE_CLI_HARNESS,
+            renderer_sha256, SIGNED_SOURCE_POLICIES, signed_cli_capability, signed_evaluation_policy)
         from reliquary.environment.agentic_swe import harness_tools
         required = {"package", "split", "options", "image_lock_sha256", "renderer_sha256",
                     "tools_version", "tools", "max_turns", "source_policy_sha256"}
         harness = config.get("harness", "signed-bash-v1")
-        if harness == "signed-bash-v2":
+        if harness in BOUNDED_SIGNED_HARNESSES:
             required |= {"harness", "max_episode_tokens", "evaluation_policy_sha256"}
+        if harness == CLAUDE_CLI_HARNESS:
+            required.add("cli_capability_sha256")
         if set(config) != required:
             raise ValueError("signed source requires the reviewed package/split/options/lock/renderer/tools")
         policy = SIGNED_SOURCE_POLICIES.get((config["package"], config["split"]))
         if (policy is None or config["source_policy_sha256"] != policy
                 or (protocol or {}).get("data", {}).get("environment.toml") != policy):
             raise ValueError("signed source requires its reviewed declared turn policy")
-        if harness == "signed-bash-v2":
+        if harness in BOUNDED_SIGNED_HARNESSES:
             evaluation_policy = digest(signed_evaluation_policy(config["package"], config["split"], harness=harness))
             if (config["evaluation_policy_sha256"] != evaluation_policy
                     or (protocol or {}).get("data", {}).get("evaluation-cli-policy.json") != evaluation_policy
                     or type(config["max_episode_tokens"]) is not int or config["max_episode_tokens"] != 65536
                     or type(config["max_turns"]) is not int or config["max_turns"] != 48):
                 raise ValueError("signed source requires its exact evaluation turn and context policy")
+        if harness == CLAUDE_CLI_HARNESS:
+            cli_cap, cli_identity, cli_sha = signed_cli_capability()
+            if (config["cli_capability_sha256"] != cli_sha
+                    or (protocol or {}).get("data", {}).get("signed-cli-capability.json") != cli_sha
+                    or config["tools_version"] != cli_cap.tools_version
+                    or config["tools"] != ["bash", "edit"]):
+                raise ValueError("signed source requires its exact approved CLI capability")
         bridge = BridgedEnvConfig(source, config["package"], config["split"],
                                   config["options"], config["image_lock_sha256"])
         environment = open_episode(source, config) if open_episode else BridgedEpisodeSource(bridge)
         if (type(config["max_turns"]) is not int
-                or not 1 <= config["max_turns"] <= (48 if harness == "signed-bash-v2" else 40)):
+                or not 1 <= config["max_turns"] <= (48 if harness in BOUNDED_SIGNED_HARNESSES else 40)):
             raise ValueError("signed source turn bound is unsupported")
         manifest, split = environment.manifest_sha256(), config["split"]
         renderer_id, renderer_sha = "renderers:qwen38@0.1.11", config["renderer_sha256"]
@@ -678,9 +689,11 @@ def build_episode_set(source: str, *, out: str | Path, interaction: str, count: 
                  "env_options_sha256": environment.options_sha256, "tools_version": config["tools_version"],
                  "tools": config["tools"], "renderer_id": renderer_id,
                  "source_policy_sha256": policy}}
-        if harness == "signed-bash-v2":
+        if harness in BOUNDED_SIGNED_HARNESSES:
             extra.update(harness_id=harness, harness_max_episode_tokens=config["max_episode_tokens"])
             extra["signed_episode"]["evaluation_policy_sha256"] = evaluation_policy
+        if cli_cap is not None:
+            extra["signed_episode"].update(cli_capability=cli_identity, cli_capability_sha256=cli_sha)
     else:
         raise ValueError("unsupported episode source; no split or harness fallback")
     if count > length:
@@ -690,7 +703,8 @@ def build_episode_set(source: str, *, out: str | Path, interaction: str, count: 
     for ordinal, index in enumerate(random.Random(seed).sample(range(length), count)):
         prompt, reference, public, image = resolved(index)
         problem_id = f"{set_id}-{ordinal:06d}"
-        task_tools = public["tools"] if public is not None else list(harness_tools(config["tools"]))
+        task_tools = (public["tools"] if public is not None else cli_cap.model_tools
+                      if cli_cap is not None else list(harness_tools(config["tools"])))
         if tools is not None and tools != task_tools:
             raise ValueError("one frozen episode set must use one exact tool schema")
         tools = task_tools
@@ -698,6 +712,8 @@ def build_episode_set(source: str, *, out: str | Path, interaction: str, count: 
             image_pin = re.search(r"(?:^|@)sha256:([0-9a-f]{64})\Z", image)
             if image_pin is None:
                 raise ValueError("episode runtime image requires an exact digest")
+            if cli_cap is not None and image_pin[1] == cli_cap.runtime_image.rsplit("sha256:", 1)[1]:
+                raise ValueError("the signed task image must differ from the CLI runtime image")
             images.add(image_pin[1])
         prompts.append({"problem_id": problem_id, "env": source, "set_id": set_id,
             "interaction": interaction, "messages": [{"role": "user", "content": prompt}],

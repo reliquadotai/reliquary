@@ -75,6 +75,8 @@ jobs:
         test_tasks_create_composed test_admin_eval_sandbox test_evaluation_sessions
         test_eval_signed_agentic test_eval_signed_policy test_eval_signed_limits test_eval_model_wire
         test_eval_remote_model
+        test_eval_remote_operator
+        test_eval_claude_cli
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -96,6 +98,9 @@ jobs:
               "verifiers.v1.harnesses.bash.harness", "reliquary_sandbox.attest",
               "reliquary_sandbox.observation", "reliquary_sandbox_verifiers.task",
               "reliquary_sandbox_verifiers.runner",
+              "reliquary_sandbox_verifiers.cli",
+              "reliquary_sandbox_verifiers.cli_transport",
+              "reliquary_sandbox_verifiers.cli_runner",
               "reliquary_sandbox_service.episodes.testing",
               "reliquary_sandbox_service.episodes.state_archive",
           ):

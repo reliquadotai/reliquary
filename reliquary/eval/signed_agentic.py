@@ -139,7 +139,103 @@ def model_client(generator, *, task, source, deadline, seed, cli_bridge=None):
     return LocalClient()
 
 
-async def run_signed_episode(*, generator, task, row, sample_index, grant, seed, deadline):
+def _validate_cli_grant(*, task, row, grant, binding, source):
+    """Check issuer-bound authority before an actual CLI can open its workspace.
+
+    The gateway verifies the token signature; these checks bind that token's
+    claims to this frozen sample and the locally approved CLI capability.
+    """
+    from reliquary.eval.protocol import (CLAUDE_CLI_HARNESS, signed_cli_capability,
+                                        signed_evaluation_policy)
+    from reliquary.sandbox.evaluation_engagements import _engagement
+    from reliquary_sandbox.attest import SessionClaims
+    from reliquary_sandbox_verifiers.cli import require_context_date, utc_context_date
+
+    cap, _, cap_sha = signed_cli_capability()
+    frozen = task["set_protocols"][row["set_id"]]["protocol"]
+    messages = row.get("messages")
+    if (not isinstance(messages, list) or len(messages) != 1
+            or not isinstance(messages[0], dict) or set(messages[0]) != {"role", "content"}
+            or messages[0]["role"] != "user" or not isinstance(messages[0]["content"], str)
+            or prompt_sha256(messages[0]["content"]) != binding.get("prompt_sha256")
+            or not isinstance(binding.get("reference_sha256"), str)
+            or len(binding["reference_sha256"]) != 64
+            or any(char not in "0123456789abcdef" for char in binding["reference_sha256"])):
+        raise ValueError("signed CLI prompt differs from its authoritative source")
+    policy = digest(signed_evaluation_policy("reliquary-swe==0.3.0", "eval", harness=CLAUDE_CLI_HARNESS))
+    expected = {"environment": frozen["source"]["id"],
+        "environment_manifest_sha256": frozen["source"]["environment_manifest_sha256"],
+        "source_index": row["source_index"], "harness": CLAUDE_CLI_HARNESS,
+        "harness_sha256": frozen["harness"]["sha256"], "episode": source,
+        "renderer_id": cap.renderer_id, "tools_version": cap.tools_version,
+        "tools": ["bash", "edit"], "cli_capability_sha256": cap_sha,
+        "cli_runtime_image": cap.runtime_image, "evaluation_policy_sha256": policy,
+        "max_turns": task["protocol"]["max_turns"],
+        "max_episode_tokens": task["protocol"]["max_episode_tokens"]}
+    if (any(binding.get(key) != value for key, value in expected.items())
+            or type(binding.get("source_index")) is not int
+            or type(binding.get("max_turns")) is not int
+            or type(binding.get("max_episode_tokens")) is not int
+            or not 1 <= binding["max_turns"] <= 48
+            or not 1 <= binding["max_episode_tokens"] <= 65536
+            or binding.get("authority_kind") != "leased_worker"
+            or not isinstance(binding.get("lease_fence"), str)
+            or len(binding["lease_fence"]) != 64
+            or any(char not in "0123456789abcdef" for char in binding["lease_fence"])):
+        raise ValueError("signed CLI grant identity changed")
+    if require_context_date(binding.get("context_date")) != utc_context_date():
+        raise ValueError("signed CLI grant context date changed before execution")
+    claims = SessionClaims.from_dict(grant["token"].get("claims"))
+    image_sha = claims.image.rsplit("@sha256:", 1)[1]
+    if (claims.session_id != grant["session_id"] or claims.hotkey != binding.get("worker_id")
+            or claims.engagement != _engagement(binding)
+            or claims.env != expected["environment"] or claims.split != "eval"
+            or claims.index != row["source_index"] or claims.image != binding.get("image")
+            or claims.checkpoint != binding["checkpoint"]
+            or asdict(claims.budgets) != binding.get("budgets")
+            or claims.expires_at != grant.get("expires_at")
+            or claims.expires_at <= time.time()
+            or claims.budgets.wall_s > task["protocol"]["episode_timeout_seconds"]
+            or image_sha == cap.runtime_image.rsplit("sha256:", 1)[1]
+            or source["runtime_image_sha256"] not in (None, image_sha)
+            or frozen["source"]["data"].get("signed-cli-capability.json") != cap_sha
+            or frozen["source"]["data"].get("evaluation-cli-policy.json") != policy):
+        raise ValueError("signed CLI token does not bind its actual grant")
+    return cap, cap_sha
+
+
+async def _lease_bound(awaitable, *, generator, cancelled):
+    from reliquary.eval.platform_client import LeaseLost
+
+    async def watch():
+        while not cancelled():
+            await asyncio.sleep(0.1)
+        raise LeaseLost("signed episode lease lost")
+
+    running, watcher = asyncio.create_task(awaitable), asyncio.create_task(watch())
+    try:
+        done, _ = await asyncio.wait((running, watcher), return_when=asyncio.FIRST_COMPLETED)
+        if watcher in done:
+            watcher.result()
+        result = await running
+        if cancelled():
+            raise LeaseLost("signed episode lease lost before completion")
+        return result
+    finally:
+        watcher.cancel()
+        if not running.done():
+            generator.close()
+            running.cancel()
+        settled = asyncio.gather(running, watcher, return_exceptions=True)
+        try:
+            await asyncio.shield(settled)
+        except asyncio.CancelledError:
+            await asyncio.shield(settled)
+            raise
+
+
+async def run_signed_episode(*, generator, task, row, sample_index, grant, seed, deadline,
+                             cancelled=lambda: False):
     from reliquary.environment.agentic_swe import SUPPORTED_VERIFIERS, _dist_commit
     from reliquary_sandbox_verifiers import SandboxEpisodeRunner
     from reliquary_sandbox_verifiers.runner import env_config
@@ -148,6 +244,8 @@ async def run_signed_episode(*, generator, task, row, sample_index, grant, seed,
     from verifiers.v1.interception import InterceptionServer
     from verifiers.v1.types import Sampling
     from verifiers.v1.utils.loaders import load_environment, resolve_env_config
+    from reliquary.eval.platform_client import LeaseLost
+    from reliquary.eval.protocol import CLAUDE_CLI_HARNESS, SIGNED_HARNESSES
 
     if _dist_commit("verifiers") != SUPPORTED_VERIFIERS:
         raise ValueError("signed evaluation requires the pinned Verifiers implementation")
@@ -164,9 +262,42 @@ async def run_signed_episode(*, generator, task, row, sample_index, grant, seed,
                        for key in ("gateway_url", "session_id"))):
         raise ValueError("signed session grant is invalid")
     source = task["set_protocols"][row["set_id"]]["protocol"]["source"]["episode"]
+    harness = task["protocol"]["harness"]
+    if harness not in SIGNED_HARNESSES:
+        raise ValueError("signed harness is unavailable")
     if time.monotonic() >= deadline:
         raise TimeoutError("signed episode session preparation exceeded its deadline")
-    client = model_client(generator, task=task, source=source, deadline=deadline, seed=seed)
+    if cancelled():
+        raise LeaseLost("signed episode lease lost before execution")
+    if harness == CLAUDE_CLI_HARNESS:
+        from reliquary_sandbox_verifiers.cli_runner import CLILeaseLost, run_cli_episode
+
+        _, cap_sha = _validate_cli_grant(task=task, row=row, grant=grant, binding=binding, source=source)
+        client = None
+
+        def make_client(bridge, effective_deadline):
+            nonlocal client
+            if client is not None:
+                raise ValueError("signed CLI requested another checkpoint client")
+            client = model_client(generator, task=task, source=source,
+                deadline=effective_deadline, seed=seed, cli_bridge=bridge)
+            return client
+
+        try:
+            result = await run_cli_episode(protocol_id=harness, expected_capability_sha256=cap_sha,
+                context_date=binding["context_date"], gateway_url=grant["gateway_url"], token=grant["token"],
+                model=task["model"]["repo"] + "@" + task["model"]["revision"],
+                prompt=row["messages"][0]["content"], make_model_client=make_client,
+                max_turns=task["protocol"]["max_turns"],
+                max_episode_tokens=task["protocol"]["max_episode_tokens"], deadline=deadline,
+                cancelled=cancelled)
+        except CLILeaseLost as exc:
+            generator.close()
+            raise LeaseLost(str(exc)) from None
+        if client is None:
+            raise ValueError("signed CLI did not bind its checkpoint client")
+    else:
+        client = model_client(generator, task=task, source=source, deadline=deadline, seed=seed)
     # Explicit unused endpoint config is a key only; every model call is injected locally.
     config = EvalClientConfig(base_url="http://127.0.0.1", api_key_var="RELIQUARY_EVAL_UNUSED_KEY")
     context = ModelContext(model=task["model"]["repo"] + "@" + task["model"]["revision"],
@@ -186,10 +317,17 @@ async def run_signed_episode(*, generator, task, row, sample_index, grant, seed,
                 self._envs[key] = env
             return self._envs[key]
 
-    async with PinnedRunner(ctx=context, gateway_url=grant["gateway_url"],
-                            max_turns=task["protocol"]["max_turns"]) as runner:
-        async with asyncio.timeout_at(deadline):
-            result = await runner.run(token=grant["token"], prompt=row["messages"][0]["content"])
+    async def run_bash():
+        async with PinnedRunner(ctx=context, gateway_url=grant["gateway_url"],
+                                max_turns=task["protocol"]["max_turns"]) as runner:
+            async with asyncio.timeout_at(deadline):
+                return await runner.run(token=grant["token"], prompt=row["messages"][0]["content"])
+
+    if harness != CLAUDE_CLI_HARNESS:
+        result = await _lease_bound(run_bash(), generator=generator, cancelled=cancelled)
+    if cancelled():
+        generator.close()
+        raise LeaseLost("signed episode lease lost before completion")
     if result.error or result.final.get("body", {}).get("status") != "graded":
         raise ValueError("signed episode did not produce a graded final")
     return {"completion": "", "completion_tokens": len(client.token_ids),

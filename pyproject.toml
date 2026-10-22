@@ -63,13 +63,13 @@ wandb = [
 ]
 # Signed-episode sandboxes (plan 3): reliquary-sandbox, public, pinned by one commit.
 sandbox = [
-    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@f8c208bd35848a13cf5b9e44b64309d835d1d81e",
+    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@867e521d8b10fd594319ba86bbf3350f7ce94d29",
 ]
 sandbox-miner = [
-    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@f8c208bd35848a13cf5b9e44b64309d835d1d81e",
+    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@867e521d8b10fd594319ba86bbf3350f7ce94d29",
 ]
 sandbox-test = [
-    "reliquary-sandbox[service] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@f8c208bd35848a13cf5b9e44b64309d835d1d81e",
+    "reliquary-sandbox[service] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@867e521d8b10fd594319ba86bbf3350f7ce94d29",
 ]
 
 [project.scripts]

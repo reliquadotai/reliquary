@@ -11,9 +11,12 @@ from pathlib import Path
 SET_PROTOCOL = "reliquary/evaluation-protocol/v1"
 REQUEST_PROTOCOL = "reliquary/evaluation-request/v1"
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+CLAUDE_CLI_HARNESS = "signed-claude-code-cli-v1"
 HARNESSES = {"single-turn": ("single_turn", 1), "telecom-episode-v1": ("episode", 40),
-             "signed-bash-v1": ("signed_episode", 40), "signed-bash-v2": ("signed_episode", 48)}
-SIGNED_HARNESSES = frozenset({"signed-bash-v1", "signed-bash-v2"})
+             "signed-bash-v1": ("signed_episode", 40), "signed-bash-v2": ("signed_episode", 48),
+             CLAUDE_CLI_HARNESS: ("signed_episode", 48)}
+SIGNED_HARNESSES = frozenset({"signed-bash-v1", "signed-bash-v2", CLAUDE_CLI_HARNESS})
+BOUNDED_SIGNED_HARNESSES = frozenset({"signed-bash-v2", CLAUDE_CLI_HARNESS})
 
 # Declared source policy, not a measured capacity or task qualification.
 SIGNED_SOURCE_POLICIES = {
@@ -33,15 +36,39 @@ def digest(document) -> str:
     return hashlib.sha256(canonical(document)).hexdigest()
 
 
+def signed_cli_capability():
+    """Only the installed, reviewed registry can authorize an actual CLI identity."""
+    try:
+        from reliquary_sandbox_verifiers.cli import CLI_DATE_RECIPE, CLIUnavailable, qualified_capability
+        from reliquary_sandbox_verifiers.cli_runner import capability_identity, capability_sha256
+    except ImportError:
+        raise ValueError("actual CLI capability is not installed") from None
+
+    try:
+        cap = qualified_capability(CLAUDE_CLI_HARNESS)
+    except CLIUnavailable:
+        raise ValueError("actual CLI capability is not approved") from None
+    identity, sha = capability_identity(cap), capability_sha256(cap)
+    if (cap.protocol_id != CLAUDE_CLI_HARNESS or digest(identity) != sha
+            or cap.max_episode_tokens != 65536 or cap.date_recipe != CLI_DATE_RECIPE):
+        raise ValueError("actual CLI capability identity changed")
+    return cap, identity, sha
+
+
 def signed_evaluation_policy(package: str, split: str, *, harness: str) -> dict:
     """Declare the new evaluation bounds separately from the unchanged source policy."""
     source_policy = SIGNED_SOURCE_POLICIES.get((package, split))
-    if (harness != "signed-bash-v2" or package != "reliquary-terminal==0.3.1"
-            or split not in {"tmax", "tmax_sft", "tmax_rl"} or source_policy is None):
+    terminal = (harness == "signed-bash-v2" and package == "reliquary-terminal==0.3.1"
+                and split in {"tmax", "tmax_sft", "tmax_rl"})
+    claude = harness == CLAUDE_CLI_HARNESS and package == "reliquary-swe==0.3.0" and split == "eval"
+    if source_policy is None or not (terminal or claude):
         raise ValueError("signed evaluation policy is unavailable for this source or harness")
-    return {"schema": "reliquary/evaluation-cli-policy/v1", "package": package, "split": split,
+    policy = {"schema": "reliquary/evaluation-cli-policy/v1", "package": package, "split": split,
             "source_policy_sha256": source_policy, "harness": harness,
             "max_turns": 48, "max_episode_tokens": 65536}
+    if claude:
+        policy["cli_capability_sha256"] = signed_cli_capability()[2]
+    return policy
 
 
 def _same(a, b) -> bool:
@@ -103,8 +130,11 @@ def harness_sha256(harness: str = "single-turn") -> str:
         from reliquary.eval.verifiers_source import installed_artifacts
         files["signed_sandbox_and_verifiers"] = installed_artifacts("reliquary-sandbox")
         files["shared_agentic_harness"] = installed_artifacts("reliquary-harness")
-    if harness == "signed-bash-v2":
+    if harness in BOUNDED_SIGNED_HARNESSES:
         files["harness_id"] = harness
+        files["remote_model.py"] = hashlib.sha256((root / "remote_model.py").read_bytes()).hexdigest()
+    if harness == CLAUDE_CLI_HARNESS:
+        files["cli_capability_sha256"] = signed_cli_capability()[2]
     return digest(files)
 
 
@@ -161,12 +191,12 @@ def validate_execution(document: dict, bindings: dict, *, request: dict | None =
         turns = harness.get("max_turns")
         expected = {"id": identity, "max_turns": turns, "sha256": harness_sha256(identity)} \
             if identity in HARNESSES else None
-        if identity == "signed-bash-v2":
+        if identity in BOUNDED_SIGNED_HARNESSES:
             expected["max_episode_tokens"] = 65536
         if (identity not in HARNESSES or type(turns) is not int
                 or not 1 <= turns <= HARNESSES[identity][1]
                 or (identity != "signed-bash-v1" and turns != HARNESSES[identity][1])
-                or (identity == "signed-bash-v2" and type(harness.get("max_episode_tokens")) is not int)
+                or (identity in BOUNDED_SIGNED_HARNESSES and type(harness.get("max_episode_tokens")) is not int)
                 or harness != expected):
             raise ValueError("set protocol harness drift")
         if request is not None and (request["harness"] != identity
@@ -179,6 +209,19 @@ def validate_execution(document: dict, bindings: dict, *, request: dict | None =
             raise ValueError("set protocol renderer drift")
         if identity == "telecom-episode-v1" and body["source"]["episode"]["renderer_sha256"] != telecom_renderer_sha256():
             raise ValueError("set protocol renderer drift")
+        if identity == CLAUDE_CLI_HARNESS:
+            cap, _, cap_sha = signed_cli_capability()
+            source = body["source"]
+            data = source.get("data") or {}
+            if (source.get("split") != "eval"
+                    or data.get("environment.toml") != SIGNED_SOURCE_POLICIES[("reliquary-swe==0.3.0", "eval")]
+                    or data.get("evaluation-cli-policy.json") != digest(signed_evaluation_policy(
+                        "reliquary-swe==0.3.0", "eval", harness=identity))
+                    or data.get("signed-cli-capability.json") != cap_sha
+                    or source["episode"]["renderer_id"] != cap.renderer_id
+                    or source["episode"]["tools_sha256"] != cap.model_tools_sha256
+                    or source["episode"]["runtime_image_sha256"] == cap.runtime_image.rsplit("sha256:", 1)[1]):
+                raise ValueError("actual CLI source capability changed")
 
 
 def seal_set(card: dict, *, reviewed: dict | None = None) -> dict:
@@ -226,7 +269,7 @@ def seal_set(card: dict, *, reviewed: dict | None = None) -> dict:
     if interaction != "single_turn" and not _episode_identity(episode):
         raise ValueError("episode source requires its exact renderer/tool/runtime identity")
     harness_body = {"id": harness, "max_turns": turns, "sha256": harness_sha256(harness)}
-    if harness == "signed-bash-v2":
+    if harness in BOUNDED_SIGNED_HARNESSES:
         if (turns != 48 or type(card.get("harness_max_episode_tokens")) is not int
                 or card["harness_max_episode_tokens"] != 65536):
             raise ValueError("signed evaluation requires its exact turn and context bounds")
@@ -245,7 +288,7 @@ def seal_set(card: dict, *, reviewed: dict | None = None) -> dict:
     raw = canonical(protocol)
     result = {**card, "protocol": protocol, "protocol_json": raw.decode("utf-8"),
               "protocol_sha256": hashlib.sha256(raw).hexdigest()}
-    if harness == "signed-bash-v2":
+    if harness in BOUNDED_SIGNED_HARNESSES:
         validate_set(result)
     return result
 
@@ -283,7 +326,7 @@ def validate_set(card: dict, *, current_grader: bool = False) -> str | None:
                 or type(card.get("harness_max_turns")) is not int
                 or not 1 <= card["harness_max_turns"] <= HARNESSES[identity][1]):
             raise ValueError("signed source policy changed")
-        if identity == "signed-bash-v2":
+        if identity in BOUNDED_SIGNED_HARNESSES:
             expected_policy = digest(signed_evaluation_policy(private.get("package"), card["split"], harness=identity))
             if (private.get("evaluation_policy_sha256") != expected_policy
                     or (source.get("data") or {}).get("evaluation-cli-policy.json") != expected_policy
@@ -293,6 +336,17 @@ def validate_set(card: dict, *, current_grader: bool = False) -> str | None:
                     or type(body.get("harness", {}).get("max_episode_tokens")) is not int
                     or body.get("harness", {}).get("max_episode_tokens") != 65536):
                 raise ValueError("signed evaluation policy changed")
+        if identity == CLAUDE_CLI_HARNESS:
+            cap, _, cap_sha = signed_cli_capability()
+            if (private.get("cli_capability_sha256") != cap_sha
+                    or digest(private.get("cli_capability")) != cap_sha
+                    or (source.get("data") or {}).get("signed-cli-capability.json") != cap_sha
+                    or private.get("renderer_id") != cap.renderer_id
+                    or private.get("tools_version") != cap.tools_version
+                    or private.get("tools") != ["bash", "edit"]
+                    or source.get("episode", {}).get("tools_sha256") != cap.model_tools_sha256
+                    or source.get("episode", {}).get("runtime_image_sha256") == cap.runtime_image.rsplit("sha256:", 1)[1]):
+                raise ValueError("signed CLI capability changed")
     return sha
 
 
@@ -334,4 +388,6 @@ def validate_request(document: dict, *, bindings: dict | None = None) -> str | N
         raise ValueError("a model turn must leave room for its frozen transcript")
     if body["harness"] == "telecom-episode-v1" and body["thinking"] is not True:
         raise ValueError("the telecom harness requires its thinking renderer")
+    if body["harness"] == CLAUDE_CLI_HARNESS:
+        signed_cli_capability()
     return sha
