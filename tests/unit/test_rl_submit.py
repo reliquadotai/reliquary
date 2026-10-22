@@ -430,7 +430,9 @@ def test_the_buffer_hands_out_oldest_first_records_the_queue_signal_and_survives
     book.close()
     reopened = LeaseBook(tmp_path / "leases.sqlite3", book.config, quota=QuotaController(), clock=lambda: NOW)
     again = service(reopened)
-    assert again.buffer.depth() == {ENV: 2}                          # taken groups come back at reopen
+    assert again.buffer.depth() == {} and again.buffer.take(5) == []   # a live trainer may still hold them
+    assert again.buffer.requeue() == 2                               # only the trainer knows it holds nothing
+    assert again.buffer.depth() == {ENV: 2}
     reopened.close()
 
 
