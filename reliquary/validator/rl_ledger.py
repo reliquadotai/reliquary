@@ -276,15 +276,17 @@ class RlPayLedger:
         for name, entry in environments.items():
             entry["recent"] = self._recent(name)
         return {"policy": "pay-per-matched-token/v1", "floor": self.config.floor, "cap": self.config.cap,
+                "start_pool": getattr(self.prices, "start_pool", self.config.cap),
                 "period": cp.period_of(now, self.config.genesis), "period_seconds": cp.PERIOD_SECONDS,
                 "environments": environments, "hotkeys": balances,
                 "settled_periods": [{"work_period": w, "entry_period": e, "published": p == 1}
                                     for w, e, p in periods],
                 "note": ("Units are fractions of the task's emission cap. A trained rollout at or above the floor "
                          "earns its matched tokens x the env's token_price; an out-of-zone first scan earns 25 % of "
-                         "token_price x the env's mean matched tokens per trained group. Each 72-minute period pays "
-                         "at most the cap (scaled down when over) and enters the weights through the per-period EMA; "
-                         "a ban forfeits what is not settled.")}
+                         "token_price x the env's mean matched tokens per trained group. At multiplier 1 and the "
+                         "target mix a 72-minute period pays start_pool; it pays at most the cap (scaled down when "
+                         "over) and enters the weights through the per-period EMA; a ban forfeits what is not "
+                         "settled.")}
 
 
 __all__ = ["ACCRUED", "FORFEITED", "LedgerConfig", "RL_PERIOD_ARCHIVE_SCHEMA", "RlPayLedger", "SETTLED",

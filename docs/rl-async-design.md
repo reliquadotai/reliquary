@@ -305,6 +305,13 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   queue: while the cap refuses leases no price rises, while the trainer waits (over 5 % of the
   tick) no price descends. The trainer neither took nor waited for 3 ticks (down): hold.
   `/rl/pay` publishes ratio, supply, demand and price per env.
+- Nominal price (fixed 2026-10-22): one rate for every env, `start_pool / planned_tokens_per_period`
+  per matched token, times the env's multiplier. At the target mix and multiplier 1 env e earns
+  `start_pool x share(e)` and the period pays `start_pool` (the earlier `cap x share(e) / planned`
+  paid only `cap x sum share^2`). `start_pool` (`rl_start_pool`, `--start-pool`, default the cap)
+  is the starting budget; the cap stays the most a period pays (settlement scales down above it),
+  so scarcity can raise the total from `start_pool` up to the cap. The multiplier's ceiling is
+  max(4, cap / start_pool).
   Simulation (scratchpad `queue_sim.py`, 72 h, 7 scenarios, miners reallocating on prices, groups
   taking several steps to generate): without the guards, miners moving between envs keep some
   env short at every tick, it rises x1.05 while the long ones descend 2 %, and every price

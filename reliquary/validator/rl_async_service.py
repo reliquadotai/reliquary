@@ -56,6 +56,8 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from reliquary.shared.task_registry import RL_START_POOL_PARAM
+
 logger = logging.getLogger(__name__)
 
 RL_MODE_ENV = "RELIQUARY_RL_MODE"
@@ -71,6 +73,7 @@ DB_NAME = "rl-async.sqlite3"
 
 # Registry params of an async task (``rl_async_params``), beside the price fields every entry carries.
 PLANNED_TOKENS_PARAM = "rl_planned_tokens_per_period"   # matched tokens the trainer consumes per 72-min period
+START_POOL_PARAM = RL_START_POOL_PARAM                  # what the starting prices pay a period (absent: the cap)
 LEASE_SPEED_PARAM = "rl_lease_reference_tokens_per_s"   # a slow reference card's decode speed, per sequence
 LEASE_MARGIN_PARAM = "rl_lease_expiry_margin"
 PRICE_TICK_PARAM = "rl_price_tick_s"
@@ -97,13 +100,15 @@ def rl_mode(env: Mapping[str, str] = os.environ) -> str:
     return value
 
 
-def rl_async_params(*, planned_tokens_per_period: float, lease_tokens_per_s: float = DEFAULT_LEASE_TOKENS_PER_S,
+def rl_async_params(*, planned_tokens_per_period: float, start_pool: float | None = None,
+                    lease_tokens_per_s: float = DEFAULT_LEASE_TOKENS_PER_S,
                     lease_margin: float = DEFAULT_LEASE_MARGIN, tick_s: float | None = None,
                     max_pending_groups: int | None = None, episode_envs: Mapping[str, Any] | None = None,
                     lease_expiry_s: Mapping[str, float] | None = None) -> dict:
     """The params an async task adds to its registry entry (pay by period: ``settlement = period-ema-v1``).
-    ``episode_envs``: the signed-episode envs' blocks (``rl_async_episodes``: episode, catalogue?, version?);
-    ``lease_expiry_s``: per-env lease lifetimes overriding the computed ones."""
+    ``start_pool``: the budget the starting prices pay a period at the target mix (None: the cap; at most the cap,
+    checked by the registry). ``episode_envs``: the signed-episode envs' blocks (``rl_async_episodes``: episode,
+    catalogue?, version?); ``lease_expiry_s``: per-env lease lifetimes overriding the computed ones."""
     from reliquary.shared.task_registry import SETTLEMENT_PERIOD_EMA
     from reliquary.validator.rl_async_episodes import (
         EPISODE_ENVS_PARAM, LEASE_EXPIRY_PARAM, episode_blocks, expiry_overrides,
@@ -114,6 +119,10 @@ def rl_async_params(*, planned_tokens_per_period: float, lease_tokens_per_s: flo
     params: dict[str, Any] = {"settlement": SETTLEMENT_PERIOD_EMA,
                               PLANNED_TOKENS_PARAM: float(planned_tokens_per_period),
                               LEASE_SPEED_PARAM: float(lease_tokens_per_s), LEASE_MARGIN_PARAM: float(lease_margin)}
+    if start_pool is not None:
+        if not start_pool > 0:
+            raise ValueError("start_pool must be positive")
+        params[START_POOL_PARAM] = float(start_pool)
     if tick_s is not None:
         params[PRICE_TICK_PARAM] = float(tick_s)
     if max_pending_groups is not None:
@@ -135,6 +144,7 @@ class RlAsyncSettings:
     targets: Mapping[str, float]                # env -> target share of the trainer's speed (priced, not enforced)
     planned_tokens_per_period: float
     lease_expiry_s: Mapping[str, float]
+    start_pool: float | None = None             # what the starting prices pay a period (None: the cap)
     price: Any = None                           # AsyncPriceParams (None: the defaults)
     max_pending_groups: int = DEFAULT_MAX_PENDING_GROUPS
     episodes: Mapping[str, Any] = field(default_factory=dict)   # env -> its validated episode block (§4.10)
@@ -191,6 +201,8 @@ def rl_async_settings(entry, cap: float, *, run: str | None = None,
     return RlAsyncSettings(task_id=str(entry.task_id), cap=float(cap),
                            run=run or os.environ.get(RUN_ENV) or str(entry.task_id), targets=targets,
                            planned_tokens_per_period=float(params[PLANNED_TOKENS_PARAM]), lease_expiry_s=expiry,
+                           start_pool=(min(float(params[START_POOL_PARAM]), float(cap))
+                                       if START_POOL_PARAM in params else None),
                            price=price, episodes=blocks, cooldown_k=cooldowns,
                            max_pending_groups=int(params.get(PENDING_PARAM, DEFAULT_MAX_PENDING_GROUPS)))
 
@@ -235,7 +247,8 @@ def build_rl_async(settings: RlAsyncSettings, *, path: str | os.PathLike[str], g
                      else LeaseCollector(book, interval_s=collector_interval_s))
         submissions = RlSubmissions(book, grader, config=submit_config, clock=clock)
         prices = AsyncPriceController(book, dict(settings.targets), settings.cap, settings.planned_tokens_per_period,
-                                      params=settings.price or AsyncPriceParams(), clock=clock)
+                                      start_pool=settings.start_pool, params=settings.price or AsyncPriceParams(),
+                                      clock=clock)
         ledger = RlPayLedger(book, submissions, prices, LedgerConfig(task_id=settings.task_id, cap=settings.cap),
                              clock=clock)
     except BaseException:
@@ -841,7 +854,7 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
 
 __all__ = [
     "ASYNC", "AUDIT_DEVICE_ENV", "AUDIT_SOURCE_ENV", "AuditModel", "MAX_TRAINER_AUDITS", "DB_NAME", "LEASE_MARGIN_PARAM", "LEASE_SPEED_PARAM", "PENDING_PARAM",
-    "PLANNED_TOKENS_PARAM", "PRICE_TICK_PARAM", "RL_MODE_ENV", "RUN_ENV", "RlAsync", "RlAsyncSettings",
+    "PLANNED_TOKENS_PARAM", "PRICE_TICK_PARAM", "RL_MODE_ENV", "RUN_ENV", "RlAsync", "RlAsyncSettings", "START_POOL_PARAM",
     "TRAINER_BIND_ENV", "TRAINER_INSECURE_BIND_ENV", "TRAINER_TOKEN_ENV", "WINDOW", "audit_source", "build_rl_async", "build_rl_trainer_app",
     "build_rl_trainer_router", "index_signer_for", "mount_rl_async", "rl_async_loops", "rl_async_params",
     "episode_body_cap", "load_episode_environments", "renderer_for_checkpoint", "rl_async_settings", "rl_mode",

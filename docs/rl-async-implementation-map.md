@@ -745,8 +745,10 @@ New code next to the window path (`emission_price`, `settlement`, `rl_pay`, `wei
   the global cap (`LeaseBook.drain_full`, r >= `low`) descends (`decay` scaled to the tick), else holds. Guards:
   any cap refusal in the tick -> no rise; waited > `starved` (5 %) of the tick -> no descent; neither took nor
   waited for `stale_ticks` (3): hold.
-  Clamped to [0.05, 4.0]. Per-token price = multiplier x cap x target share / `planned_tokens_per_period` (at 1, the planned
-  consumption at target mix pays exactly the cap). Snap and breaker dropped (no window to fill). State in
+  Clamped to [0.05, max(4.0, cap / start_pool)]. Per-token price = multiplier x `start_pool` /
+  `planned_tokens_per_period`, the same for every env (at 1, the planned consumption at target mix pays exactly
+  `start_pool`, `rl_start_pool` or the cap when absent; the cap still bounds the period). Snap and breaker dropped (no window to fill).
+  State in
   `rl_prices` (restart-safe).
 - `GET /rl/pay?hotkey=` (`build_rl_lease_router(pay=ledger)`): per-env multiplier, token price, per-Mtok price,
   target, regime and last signal; per-hotkey accrued / paid / forfeited / banned_until; the last settled periods.

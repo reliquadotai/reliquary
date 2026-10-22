@@ -47,7 +47,7 @@ def amounts(book):
     return book.db.execute("SELECT hotkey, kind, matched_tokens, amount, status FROM rl_accruals ORDER BY seq").fetchall()
 
 
-NOMINAL = CAP * 0.5 / PLANNED                     # ENV's price per matched token at multiplier 1
+NOMINAL = CAP / PLANNED                     # every env's price per matched token at multiplier 1 (start pool = cap)
 
 
 def test_trained_groups_are_paid_flat_per_matched_token(book):
@@ -341,6 +341,53 @@ def test_a_period_never_pays_more_than_the_cap(book):
     assert doc["scale"] == pytest.approx(CAP / doc["accrued_total"])
     assert sum(doc["rewards_by_hotkey"].values()) == pytest.approx(CAP)
     assert doc["rewards_by_hotkey"]["A"] == pytest.approx(2 * doc["rewards_by_hotkey"]["B"])
+
+
+def set_multiplier(book, env, price):
+    book.db.execute("INSERT INTO rl_prices(environment, price, last_good, regime, at, signal) VALUES(?,?,?,?,?,?) "
+                    "ON CONFLICT(environment) DO UPDATE SET price=excluded.price", (env, price, 1.0, RISE, NOW, "{}"))
+    book.db.commit()
+
+
+def test_every_env_has_one_nominal_and_the_target_mix_pays_the_start_pool(book):
+    targets = {ENV: 0.8, OTHER: 0.2}
+    prices = AsyncPriceController(book, targets, CAP, PLANNED, start_pool=0.2, clock=lambda: NOW)
+    assert prices.nominal == pytest.approx(0.2 / PLANNED)
+    assert prices.token_price(ENV) == prices.token_price(OTHER) == pytest.approx(prices.nominal)
+    assert prices.token_price("unknown") == 0.0
+    paid = {env: share * PLANNED * prices.token_price(env) for env, share in targets.items()}
+    assert paid == {ENV: pytest.approx(0.8 * 0.2), OTHER: pytest.approx(0.2 * 0.2)}     # start_pool x share
+    assert sum(paid.values()) == pytest.approx(0.2)
+    assert prices.board()[OTHER]["per_million_tokens"] == pytest.approx(1e6 * 0.2 / PLANNED)
+    legacy = AsyncPriceController(book, targets, CAP, PLANNED, clock=lambda: NOW)       # no start pool: the cap
+    assert legacy.start_pool == CAP and legacy.token_price(OTHER) == pytest.approx(CAP / PLANNED)
+    for bad in (0.0, -0.1, CAP * 1.01):
+        with pytest.raises(ValueError, match="start_pool"):
+            AsyncPriceController(book, targets, CAP, PLANNED, start_pool=bad)
+
+
+def test_the_multiplier_ceiling_lets_scarcity_reach_the_cap(book):
+    assert AsyncPriceController(book, {ENV: 1.0}, CAP, PLANNED, start_pool=CAP / 2).params.base.cap == 4.0
+    low = AsyncPriceController(book, {ENV: 1.0}, CAP, PLANNED, start_pool=CAP / 10)
+    assert low.params.base.cap == pytest.approx(10.0)
+    assert advance_async(PriceState(9.9, 1.0), EnvSignal(300, 0, 500), low.params).price == pytest.approx(10.0)
+
+
+@pytest.mark.parametrize("multiplier, total, scale", [(1.0, CAP / 2, 1.0), (1.5, 0.75 * CAP, 1.0),
+                                                      (3.0, CAP, CAP / (1.5 * CAP))])
+def test_scarcity_raises_the_total_above_the_start_pool_up_to_the_cap(book, multiplier, total, scale):
+    subs = service(book, probation_groups=0)
+    # The trainer plans three groups a period: at multiplier 1 they pay the start pool, half the cap.
+    prices = AsyncPriceController(book, {ENV: 1.0}, CAP, 3 * GROUP_TOKENS, start_pool=CAP / 2, clock=lambda: NOW)
+    set_multiplier(book, ENV, multiplier)
+    ledger = ledger_for(book, subs, prices)
+    for prompt, hotkey in ((1, "A"), (2, "A"), (3, "B")):
+        trained(book, subs, prompt, hotkey=hotkey)
+    ledger.ingest()
+    (doc,) = ledger.settle(cp.period_end(cp.period_of(NOW)) + 600)
+    assert doc["accrued_total"] == pytest.approx(multiplier * CAP / 2)
+    assert doc["scale"] == pytest.approx(scale) and sum(doc["rewards_by_hotkey"].values()) == pytest.approx(total)
+    assert ledger.board(NOW)["start_pool"] == CAP / 2 and ledger.board(NOW)["cap"] == CAP
 
 
 def test_the_pay_route_publishes_prices_and_balances(book):

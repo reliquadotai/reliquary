@@ -431,8 +431,8 @@ def with_job_harness(episode, value):
     return {**episode, "harness_spec": _harness_pin(harness_id, version, "--harness", variants=False)}
 
 
-def with_rl_async_params(entry, *, planned_tokens_per_period, lease_tokens_per_s=None, episode_envs=None,
-                         lease_expiry_s=None):
+def with_rl_async_params(entry, *, planned_tokens_per_period, start_pool=None, lease_tokens_per_s=None,
+                         episode_envs=None, lease_expiry_s=None):
     """An RL entry declared for the async protocol: paid by period (``settlement = period-ema-v1``, the weight
     setter's period EMA), its ``env_split`` as the trainer's target mix, the ``rl_*`` params of
     ``rl_async_service.rl_async_params``."""
@@ -448,8 +448,11 @@ def with_rl_async_params(entry, *, planned_tokens_per_period, lease_tokens_per_s
     if planned_tokens_per_period is None:
         raise ValueError("--rl-async needs --planned-tokens-per-period")
     extra = {} if lease_tokens_per_s is None else {"lease_tokens_per_s": lease_tokens_per_s}
-    params = rl_async_params(planned_tokens_per_period=planned_tokens_per_period, episode_envs=episode_envs,
-                             lease_expiry_s=lease_expiry_s, **extra)
+    cap = float(entry.params.get("cap", 0.0))
+    if start_pool is not None and not 0 < start_pool <= cap:
+        raise ValueError(f"--start-pool must be positive and at most --cap ({cap}), got {start_pool}")
+    params = rl_async_params(planned_tokens_per_period=planned_tokens_per_period, start_pool=start_pool,
+                             episode_envs=episode_envs, lease_expiry_s=lease_expiry_s, **extra)
     for label, names in (("--rl-episode-envs", params.get("rl_episode_envs") or {}),
                          ("--lease-expiry", params.get("rl_lease_expiry_s") or {})):
         missing = sorted(set(names) - set(entry.env_split))
@@ -695,7 +698,12 @@ def tasks_create(
     planned_tokens_per_period: float = typer.Option(
         None, "--planned-tokens-per-period",
         help="With --rl-async: matched tokens the trainer consumes per 72-minute period at the target mix "
-        "(at price 1 they pay exactly the cap)",
+        "(at price 1 they pay exactly --start-pool)",
+    ),
+    start_pool: float = typer.Option(
+        None, "--start-pool",
+        help="With --rl-async: the budget the starting prices pay a period at the target mix (default: --cap); "
+        "--cap is the most a period ever pays, scarcity raises prices towards it",
     ),
     lease_tokens_per_s: float = typer.Option(
         None, "--lease-tokens-per-s",
@@ -836,13 +844,14 @@ def tasks_create(
             raise ValueError("--ack-service-fleet requires --service-contract")
         if rl_async:
             entry = with_rl_async_params(entry, planned_tokens_per_period=planned_tokens_per_period,
+                                         start_pool=start_pool,
                                          lease_tokens_per_s=lease_tokens_per_s,
                                          episode_envs=with_episode_harnesses(_read_episode_envs(rl_episode_envs),
                                                                              harness),
                                          lease_expiry_s=_parse_lease_expiry(lease_expiry))
-        elif (planned_tokens_per_period is not None or lease_tokens_per_s is not None or rl_episode_envs is not None
-              or lease_expiry is not None or harness is not None):
-            raise ValueError("--planned-tokens-per-period, --lease-tokens-per-s, --rl-episode-envs, "
+        elif (planned_tokens_per_period is not None or start_pool is not None or lease_tokens_per_s is not None
+              or rl_episode_envs is not None or lease_expiry is not None or harness is not None):
+            raise ValueError("--planned-tokens-per-period, --start-pool, --lease-tokens-per-s, --rl-episode-envs, "
                              "--lease-expiry and --harness need --rl-async")
         asyncio.run(create_task(entry))
     except (RegistryError, ValueError) as exc:
