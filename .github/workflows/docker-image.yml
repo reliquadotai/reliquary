@@ -43,6 +43,13 @@ jobs:
           docker-images: false   # we need docker for the build itself
           swap-storage: false
 
+      - name: Provide swap for CUDA compiler memory peaks
+        run: |
+          sudo fallocate -l 16G /swapfile-runtime
+          sudo chmod 600 /swapfile-runtime
+          sudo mkswap /swapfile-runtime
+          sudo swapon /swapfile-runtime
+
       - uses: actions/checkout@v4
 
       - name: Read the reviewed Logic release source

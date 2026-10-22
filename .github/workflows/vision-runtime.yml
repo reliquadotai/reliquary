@@ -37,7 +37,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu
       - run: pip install pytest pytest-asyncio Pillow==13.0.0 transformers==5.10.4 peft==0.21.2 accelerate==1.15.0 num2words==0.5.14
       # This worker does not import validator/server dependencies or fixtures.
       - run: python -m pytest --noconftest tests/unit/test_vision* -q
@@ -48,7 +48,22 @@ jobs:
   container-smoke:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        torch-index: [cpu, cu130]
     steps:
+      - name: Free disk space for CUDA dependencies
+        if: matrix.torch-index == 'cu130'
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
@@ -69,9 +84,9 @@ jobs:
           Path("/tmp/vision-smoke-output").mkdir(mode=0o777)
           Path("/tmp/vision-smoke-output").chmod(0o777)
           PY
-      - name: Build the CPU test image
+      - name: Build the test image
         run: |
-          docker build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu \
+          docker build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/${{ matrix.torch-index }} \
             -f docker/Dockerfile.vision-training -t vision-runtime:test .
       - name: Test offline training and continuation in the unprivileged image
         run: |
@@ -120,7 +135,7 @@ jobs:
             --security-opt no-new-privileges --pids-limit 512 --memory 4g --cpus 2 \
             --tmpfs /tmp:rw,nosuid,nodev,size=1g \
             --entrypoint python "$IMAGE:sha-$GITHUB_SHA" -c \
-            'import PIL, torch, torchvision, transformers, peft; from reliquary.vision import runner, runtime; assert PIL.__version__ == "13.0.0", PIL.__version__; assert torch.version.cuda == "12.8"; assert not torch.cuda.is_available(); print(f"Pillow {PIL.__version__} and CUDA-wheel imports passed; GPU execution remains unqualified.")'
+            'import PIL, torch, torchvision, transformers, peft; from reliquary.vision import runner, runtime; assert PIL.__version__ == "13.0.0", PIL.__version__; assert torch.__version__.split("+")[0] == "2.13.0", torch.__version__; assert torchvision.__version__.split("+")[0] == "0.28.0", torchvision.__version__; assert torch.version.cuda == "13.0"; assert not torch.cuda.is_available(); print(f"Pillow {PIL.__version__}, Torch {torch.__version__}, torchvision {torchvision.__version__} and CUDA-wheel imports passed; GPU execution remains unqualified.")'
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:

@@ -2,7 +2,7 @@
 ARG GRADER_PY_IMAGE=python:3.12-slim@sha256:090ba77e2958f6af52a5341f788b50b032dd4ca28377d2893dcf1ecbdfdfe203
 FROM ${GRADER_PY_IMAGE} AS grader-rootfs
 
-FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04
+FROM nvidia/cuda:13.0.0-cudnn-devel-ubuntu24.04
 
 ARG RELIQUARY_BUILD_REVISION=unknown
 ARG RELIQUARY_INSTALL_LOGIC=0
@@ -23,30 +23,29 @@ RUN apt-get update -qq && apt-get install -y -qq \
 RUN python3.12 -m venv /opt/reliquary-venv
 ENV PATH="/opt/reliquary-venv/bin:${PATH}"
 
-# torch 2.7.0 + CUDA 12.8 (matches our Targon setup)
+# CUDA 13 requires an NVIDIA 580-series or newer host driver.
 RUN pip install --upgrade pip wheel setuptools \
- && pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+ && pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
 
-# flash-attn prebuilt wheel for torch 2.7 / cu12 / cp312 / cxx11abi=TRUE.
-# Do NOT rename the wheel on download: pip parses the version and platform
-# tags from the filename and rejects anything that doesn't match the
-# ``name-version-...-abi.whl`` shape with "Invalid wheel filename
-# (wrong number of parts)".
-ARG FA_URL=https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
-RUN wget -q "${FA_URL}" -P /tmp/ \
- && pip install /tmp/flash_attn-*.whl \
- && rm /tmp/flash_attn-*.whl
+# Build against this Torch ABI; released wheels target older Torch versions.
+# PyTorch 2.13 needs C++20; apply upstream FlashAttention's build-only fix.
+RUN pip install ninja packaging \
+ && curl -fsSL https://files.pythonhosted.org/packages/6c/b1/b77625e3d11260d2bd6a4fc249a4be9a3da97ff848e2222e810c4f0e0211/flash_attn-2.8.3.post2.tar.gz -o /tmp/flash_attn.tar.gz \
+ && echo 'd0f9f0b08a986cdeadbffcf5ec8b3a8f514366c68ad1853d3ab061bc83cc340b  /tmp/flash_attn.tar.gz' | sha256sum -c - \
+ && tar -xzf /tmp/flash_attn.tar.gz -C /tmp \
+ && python -c 'from pathlib import Path; p = Path("/tmp/flash_attn-2.8.3.post2/setup.py"); s = p.read_text(); assert s.count("-std=c++17") == 4; p.write_text(s.replace("-std=c++17", "-std=c++20", 2))' \
+ && FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTN_CUDA_ARCHS='80;90;100' MAX_JOBS=2 NVCC_THREADS=1 \
+    pip install --no-build-isolation --no-deps /tmp/flash_attn-2.8.3.post2 \
+ && rm -rf /tmp/flash_attn.tar.gz /tmp/flash_attn-2.8.3.post2
 
 # flash-linear-attention + causal-conv1d: transformers enables Qwen3.5's fast
 # GatedDeltaNet path only when BOTH are importable — with either one missing it
 # silently falls back to the torch scan for the whole layer (measured 3.77x
 # slower forward at 15.7k tokens; the old "fla alone is enough" assumption ran
-# production on the fallback for weeks). Prebuilt wheel: no nvcc needed.
+# production on the fallback for weeks).
 RUN pip install flash-linear-attention==0.5.0
-ARG CC1D_URL=https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.2/causal_conv1d-1.5.2+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
-RUN wget -q "${CC1D_URL}" -P /tmp/ \
- && pip install /tmp/causal_conv1d-*.whl \
- && rm /tmp/causal_conv1d-*.whl
+RUN CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=1 \
+    pip install --no-build-isolation --no-deps causal-conv1d==1.6.2.post1
 
 # Source + install
 WORKDIR /opt/reliquary
