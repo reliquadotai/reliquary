@@ -321,11 +321,12 @@ async def test_submit_once_asks_for_row_projection_for_service_tasks_only(monkey
 
     async def recent(current_window, n, *, task_id=None, fields=None, **kw):
         seen[task_id] = kw
-        return []
+        return [settled()] if task_id == TASK else [{"window_start": 3, "rewards_by_hotkey": {}}]
 
     monkeypatch.setattr(weight_only.storage, "list_recent_datasets", recent)
     await wov.submit_once()
-    assert seen["default"] == {} and seen[TASK] == {
+    assert seen["default"] == {"strict": True} and seen[TASK] == {
+        "strict": True,
         "row_fields": {"batch": ("hotkey", "env_name", "prompt_idx")},
         "number_map_fields": weight_only.SERVICE_NUMBER_MAPS,
         "nested_number_map_fields": weight_only.SERVICE_NESTED_NUMBER_MAPS}
@@ -339,7 +340,7 @@ async def test_submit_once_fetches_the_service_fields_only_for_service_tasks(mon
 
     async def recent(current_window, n, *, task_id=None, fields=None, **kw):
         seen[task_id] = fields
-        return [settled()] if task_id == TASK else []
+        return [settled()] if task_id == TASK else [{"window_start": 3, "rewards_by_hotkey": {}}]
 
     monkeypatch.setattr(weight_only.storage, "list_recent_datasets", recent)
     await wov.submit_once()
