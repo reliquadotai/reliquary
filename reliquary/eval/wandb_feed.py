@@ -147,23 +147,35 @@ def log_feed(feed: Mapping[str, Any], *, short_of: Mapping[str, str], state_path
              entity: str | None = None) -> dict:
     """Log the feed's new points; fail-soft (the feed itself is unaffected), unlogged points retried next time."""
     state_path = Path(state_path)
-    logged = set(json.loads(state_path.read_text())) if state_path.exists() else set()
-    rows, marks = new_rows(feed, short_of, logged)
     where = target(feed["run_id"], run_id=run_id, project=project, entity=entity)
-    if not rows:
-        return {"run": where["run_id"], "logged": 0}
     try:
+        if where["entity"] is None:
+            import wandb
+
+            where["entity"] = wandb.Api().default_entity
+            if not isinstance(where["entity"], str) or not where["entity"]:
+                raise ValueError("W&B default entity is unavailable")
+        identity = {"trainer_run_id": feed["run_id"], "entity": where["entity"],
+                    "project": where["project"], "run_id": where["run_id"]}
+        destination = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        state = json.loads(state_path.read_text()) if state_path.exists() else {}
+        # Unbound marks cannot establish delivery; retain each destination on a switch back.
+        targets = state.get("targets", {}) if isinstance(state, dict) else {}
+        logged = set(targets.get(destination, []))
+        rows, marks = new_rows(feed, short_of, logged)
+        if not rows:
+            return {"run": where["run_id"], "logged": 0}
         run = init(run_id=where["run_id"], group=where["group"], project=where["project"], entity=where["entity"],
                    config={"trainer_run_id": feed["run_id"]})
         for row in rows:
             run.log(row)
         run.finish()
+        tmp = state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"targets": {**targets, destination: sorted(logged | set(marks))}}))
+        tmp.replace(state_path)
     except Exception as exc:        # wandb down or misconfigured: the scores stay in the feed
-        logger.warning("wandb eval log failed (%s): %d points kept for the next feed", exc, len(marks))
+        logger.warning("wandb eval log failed (%s); points kept for the next feed", exc)
         return {"run": where["run_id"], "logged": 0, "error": type(exc).__name__}
-    tmp = state_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(sorted(logged | set(marks))))
-    tmp.replace(state_path)
     return {"run": where["run_id"], "logged": len(marks)}
 
 

@@ -56,18 +56,18 @@ def test_each_point_is_logged_once_and_a_failure_is_retried(tmp_path):
     def init(**kw):
         return FakeRun(sink, **kw)
 
-    assert log_feed(_feed(aime=[(500, 0.6)]), short_of=SHORT, state_path=state, init=init)["logged"] == 3
-    assert log_feed(_feed(aime=[(500, 0.6)]), short_of=SHORT, state_path=state, init=init)["logged"] == 0
+    assert log_feed(_feed(aime=[(500, 0.6)]), short_of=SHORT, state_path=state, init=init, entity="team")["logged"] == 3
+    assert log_feed(_feed(aime=[(500, 0.6)]), short_of=SHORT, state_path=state, init=init, entity="team")["logged"] == 0
 
     def down(**kw):
         raise RuntimeError("wandb down")
 
-    out = log_feed(_feed(aime=[(500, 0.6), (1000, 0.62)]), short_of=SHORT, state_path=state, init=down)
+    out = log_feed(_feed(aime=[(500, 0.6), (1000, 0.62)]), short_of=SHORT, state_path=state, init=down, entity="team")
     assert out["logged"] == 0 and out["error"] == "RuntimeError"
-    out = log_feed(_feed(aime=[(500, 0.6), (1000, 0.62)]), short_of=SHORT, state_path=state, init=init)
+    out = log_feed(_feed(aime=[(500, 0.6), (1000, 0.62)]), short_of=SHORT, state_path=state, init=init, entity="team")
     assert out == {"run": "5H47sFL6-teutonic-rl-async-v1-evals", "logged": 1}
     assert sink[-1] == {"rl_step": 1000, "eval/aime25/pass@1": 0.62, "eval/aime25/delta": 0.62 - 0.55}
-    assert "aime25@1000" in json.loads(state.read_text())
+    assert "aime25@1000" in next(iter(json.loads(state.read_text())["targets"].values()))
 
 
 # --- the run monitor's envelope in the evaluation run's summary ------------------------------------------------
@@ -114,7 +114,7 @@ class FakeWandb:
     """The `wandb` module: runs by id, each with its summary; `Api().run` reads it back as W&B serves it."""
 
     def __init__(self):
-        self.runs, self.inits = {}, []
+        self.runs, self.inits, self.default_entity = {}, [], "reliquary"
 
     def module(self):
         fake = self
@@ -137,7 +137,9 @@ class FakeWandb:
             return fake.runs.setdefault(kw["id"], Run(kw["id"]))
 
         class Api:
-            default_entity = "reliquary"
+            @property
+            def default_entity(self):
+                return fake.default_entity
 
             def run(self, path):
                 run_id = path.split("/")[-1]
@@ -243,3 +245,49 @@ def test_eval_schedule_writes_each_rebuilt_feed_into_the_evaluation_run(tmp_path
     bench = run.summary[SUMMARY_KEY]["benchmarks"][0]
     assert bench["baseline"]["step"] is None and [p["step"] for p in bench["checkpoints"]] == [5]
     assert [r["rl_step"] for r in run.rows] == [0, 5]
+
+
+@pytest.mark.parametrize("changed", [
+    {"run_id": "another-evals"}, {"project": "another-project"}, {"entity": "another-team"},
+    {"trainer": "another-trainer"},
+])
+def test_history_marks_belong_to_the_trainer_and_effective_destination(tmp_path, fake_wandb, changed):
+    state = tmp_path / "logged.json"
+    feed = _feed(aime=[(500, 0.6)])
+    where = {"run_id": "evals", "project": "project", "entity": "team"}
+    assert log_feed(feed, short_of=SHORT, state_path=state, **where)["logged"] == 3
+    if "trainer" in changed:
+        feed["run_id"] = changed["trainer"]
+    else:
+        where.update(changed)
+    assert log_feed(feed, short_of=SHORT, state_path=state, **where)["logged"] == 3
+    assert log_feed(feed, short_of=SHORT, state_path=state, **where)["logged"] == 0
+    saved = json.loads(state.read_text())
+    identity = json.dumps({"trainer_run_id": feed["run_id"], **where}, sort_keys=True, separators=(",", ":"))
+    assert len(saved["targets"]) == 2 and len(saved["targets"][identity]) == 3
+    # Switching back must not replay the first destination's history either.
+    assert log_feed(_feed(aime=[(500, 0.6)]), short_of=SHORT, state_path=state,
+                    run_id="evals", project="project", entity="team")["logged"] == 0
+
+
+def test_default_entity_is_resolved_before_reusing_history_marks(tmp_path, fake_wandb):
+    state, feed = tmp_path / "logged.json", _feed()
+    assert log_feed(feed, short_of=SHORT, state_path=state)["logged"] == 2
+    assert fake_wandb.inits[-1]["entity"] == "reliquary"
+    assert log_feed(feed, short_of=SHORT, state_path=state, entity="reliquary")["logged"] == 0
+    fake_wandb.default_entity = "another-team"
+    assert log_feed(feed, short_of=SHORT, state_path=state)["logged"] == 2
+    assert fake_wandb.inits[-1]["entity"] == "another-team"
+    assert log_feed(feed, short_of=SHORT, state_path=state)["logged"] == 0
+    fake_wandb.default_entity = "reliquary"
+    assert log_feed(feed, short_of=SHORT, state_path=state)["logged"] == 0
+
+
+def test_unresolved_default_entity_does_not_change_saved_history(tmp_path, fake_wandb):
+    state, feed = tmp_path / "logged.json", _feed()
+    assert log_feed(feed, short_of=SHORT, state_path=state)["logged"] == 2
+    saved = state.read_bytes()
+    fake_wandb.default_entity = None
+    out = log_feed(feed, short_of=SHORT, state_path=state)
+    assert out["logged"] == 0 and out["error"] == "ValueError"
+    assert state.read_bytes() == saved
