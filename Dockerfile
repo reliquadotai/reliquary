@@ -30,7 +30,7 @@ RUN pip install ninja packaging \
  && echo 'd0f9f0b08a986cdeadbffcf5ec8b3a8f514366c68ad1853d3ab061bc83cc340b  /tmp/flash_attn.tar.gz' | sha256sum -c - \
  && tar -xzf /tmp/flash_attn.tar.gz -C /tmp \
  && python -c 'from pathlib import Path; p = Path("/tmp/flash_attn-2.8.3.post2/setup.py"); s = p.read_text(); assert s.count("-std=c++17") == 4; p.write_text(s.replace("-std=c++17", "-std=c++20", 2))' \
- && FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTN_CUDA_ARCHS='80;90;100' MAX_JOBS=2 NVCC_THREADS=1 \
+ && FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=2 NVCC_THREADS=1 \
     pip install --no-build-isolation --no-deps /tmp/flash_attn-2.8.3.post2 \
  && rm -rf /tmp/flash_attn.tar.gz /tmp/flash_attn-2.8.3.post2
 
