@@ -58,6 +58,82 @@ def test_a_worker_that_dies_is_the_graders_outage():
         scorer.close()
 
 
+def _sleepy(environment, problem, texts, materials):
+    time.sleep(float(problem))
+    return [0.0] * len(texts)
+
+
+def test_a_group_queued_behind_an_overrun_is_never_cancelled_into_a_reward_error():
+    """Production 2026-10-22: one competitive-code group overran its 20 s, the pool was replaced, and the groups
+    queued in it came back as CancelledError, which the grader turned into ``reward_error`` against their miners.
+    Now a group waits for a slot before its clock starts, and whatever the pool raises is the grader's outage."""
+    import threading
+
+    scorer = PooledScorer(["env"], workers=1, function=_sleepy, wall_seconds=lambda env: 2.0)
+    outcomes: dict[str, object] = {}
+
+    def run(name, seconds):
+        try:
+            outcomes[name] = scorer("env", seconds, ["a"], None)
+        except Exception as exc:                                   # noqa: BLE001  the test records the type
+            outcomes[name] = exc
+
+    try:
+        slow = threading.Thread(target=run, args=("slow", 30))
+        slow.start()
+        time.sleep(0.5)
+        queued = [threading.Thread(target=run, args=(f"q{i}", 0.2)) for i in range(3)]
+        for thread in queued:
+            thread.start()
+        for thread in (slow, *queued):
+            thread.join(timeout=60)
+        assert isinstance(outcomes["slow"], GraderInfrastructureError)
+        for i in range(3):                     # waited for the slot, then scored on a fresh pool within their wall
+            assert outcomes[f"q{i}"] == [0.0], outcomes
+        assert scorer.timeouts == {"env": 1}
+    finally:
+        scorer.close()
+
+
+def test_a_cancelled_or_shut_down_pool_is_the_graders_outage(monkeypatch):
+    from concurrent.futures import CancelledError, Future
+
+    scorer = PooledScorer(["env"], workers=1, function=_score, wall_seconds=lambda env: 5.0)
+    try:
+        pool = scorer._pool("env")
+        cancelled: Future = Future()
+        cancelled.cancel()
+        monkeypatch.setattr(pool, "submit", lambda *a, **k: cancelled)
+        with pytest.raises(GraderInfrastructureError):
+            scorer("env", "a", ["a"], None)
+        with pytest.raises(CancelledError):
+            cancelled.result()
+
+        def shut(*args, **kwargs):
+            raise RuntimeError("cannot schedule new futures after shutdown")
+
+        monkeypatch.setattr(pool, "submit", shut)
+        with pytest.raises(GraderInfrastructureError):
+            scorer("env", "a", ["a"], None)
+        assert scorer("env", "a", ["a"], None) == [1.0]                # replaced: a fresh pool serves the next
+    finally:
+        scorer.close()
+
+
+def test_a_stdio_program_group_gets_wall_per_program_run_up_to_a_ceiling():
+    from reliquary.constants import (
+        CODE_ADMISSION_WALL_SECONDS, STDIO_ADMISSION_MAX_WALL_SECONDS, STDIO_ADMISSION_SECONDS_PER_RUN,
+    )
+
+    env = "reliquary_competitive_code_v1"
+    scorer = PooledScorer([env], workers=1)
+    tests = [{"stdin": "", "stdout": "", "time_limit_s": 1.0, "output_cap": 1}]
+    assert scorer.budget(env, ["a"] * 16, tests * 10) == pytest.approx(
+        CODE_ADMISSION_WALL_SECONDS + STDIO_ADMISSION_SECONDS_PER_RUN * 160)
+    assert scorer.budget(env, ["a"] * 16, tests * 400) == STDIO_ADMISSION_MAX_WALL_SECONDS
+    assert scorer.budget("openmathinstruct", ["a"] * 16, None) == 45.0          # other envs: unchanged
+
+
 def test_the_async_validator_starts_the_grader_service_only_for_code_envs():
     from reliquary.cli.main import _envs_need_grader
 

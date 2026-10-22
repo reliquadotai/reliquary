@@ -30,6 +30,8 @@ STDIO_PROGRAM_CONTRACT = "reliquary/stdio-program/v1"
 _EXTRACTION = ("extraction", "extract_program")
 _COMPARISON = ("judge.compare", "outputs_match")
 _GUEST = "judge/guest.py"
+# Completions of one group graded at once against the grading service (its pool is 16 workers in production).
+STDIO_GROUP_PARALLELISM = 4
 
 
 @dataclass(frozen=True)
@@ -140,7 +142,17 @@ def score_stdio_program(
     spec = get_environment_spec(str(problem.get("environment", "")))
     tests = _tests(reward_materials)
     judge = stdio_judge(spec)
-    return [1.0 if _passes(judge, _client, tests, text) else 0.0 for text in completion_texts]
+    texts = list(completion_texts)
+    if len(texts) <= 1 or STDIO_GROUP_PARALLELISM <= 1:
+        return [1.0 if _passes(judge, _client, tests, text) else 0.0 for text in texts]
+    # The completions are independent (each its own program, stopped at its first failure): a few at a time on the
+    # grading service's pool, results in order. Any raise (an outage) is the group's.
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=min(len(texts), STDIO_GROUP_PARALLELISM),
+                            thread_name_prefix="stdio-grade") as threads:
+        passed = list(threads.map(lambda text: _passes(judge, _client, tests, text), texts))
+    return [1.0 if ok else 0.0 for ok in passed]
 
 
 __all__ = ["STDIO_PROGRAM_CONTRACT", "StdioJudge", "score_stdio_program", "stdio_judge"]

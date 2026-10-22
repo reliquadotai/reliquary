@@ -13,9 +13,10 @@
    miner's fault), and the pool is replaced.
 3. One transaction on the lease book's file: the lease closes (whatever the outcome; there is no release), the
    group is stored in ``rl_groups`` and:
-   * refused for integrity (bad termination, tampered force span, out-of-vocab or over-long tokens, a scorer that
-     cannot grade it): ``rejected``, no observation (decision A), and the quota is halved as for an expiry
-     (malformed or forged work is no delivery);
+   * refused for integrity (bad termination, tampered force span, out-of-vocab or over-long tokens):
+     ``rejected``, no observation (decision A), and the quota is halved as for an expiry (malformed or forged
+     work is no delivery). A group the env's scorer raised on (``reward_error``) is rejected too, but it is the
+     validator's failure, not the miner's: its slot is freed without the halving (``GRADER_FAULTS``);
    * otherwise ``classify_group`` gives the verdict, ``LeaseBook.record_outcome`` records the scan and moves the
      prompt, and the quota frees the lease's slot (it credits the delivery only once the group is paid);
    * in zone: the group (tokens, lease nonce, k, arrival, hotkey) goes to the ``TrainingBuffer``. It is verified
@@ -56,7 +57,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import CancelledError, ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
@@ -80,6 +81,9 @@ from reliquary.validator.rl_leases import IN_ZONE, LeaseBook, classify_group
 logger = logging.getLogger(__name__)
 
 REJECTED = "rejected"
+# Rejections that are the validator's failure to grade, never the miner's: the lease closes (the group is not graded
+# again) but the quota is not halved.
+GRADER_FAULTS = frozenset({"reward_error"})
 # Episode envs a lease takes: signed by the sandbox (``rl_episode``) or replayed by the validator (``rl_suite_episodes``).
 EPISODE_MODES = frozenset({"signed_episode", "episode"})
 AUDIT_MAX_ATTEMPTS = 3        # raising audit forwards of one group before it is concluded inconclusive
@@ -256,9 +260,15 @@ class GroupGrader:
         except GraderInfrastructureError:
             raise
         except Exception:
+            logger.exception("reward_error: %s prompt %d: the scorer raised", environment, prompt_idx)
             return Graded(prompt, reject="reward_error")
-        rewards = tuple(float(r) for r in rewards)
+        try:
+            rewards = tuple(float(r) for r in rewards)
+        except (TypeError, ValueError):
+            rewards = ()
         if len(rewards) != len(rollouts) or not all(math.isfinite(r) for r in rewards):
+            logger.error("reward_error: %s prompt %d: %d rewards for %d rollouts (%s)", environment, prompt_idx,
+                         len(rewards), len(rollouts), list(rewards)[:16])
             return Graded(prompt, reject="reward_error")
         # A rollout cut at the cap gave no answer: it scores 0, whatever an answer-like string in its unfinished
         # reasoning would grade (the failure reward, never masked: the group trains on it).
@@ -323,23 +333,32 @@ _LISTENER_FINALIZED = False
 class PooledScorer:
     """``GroupGrader``'s scorer in the service: each env scores in its own process pool (spawned, workers recycled
     after ``max_tasks`` groups), and a group gets the window path's wall budget for its resource class
-    (``CODE_ADMISSION_WALL_SECONDS`` for sandboxed code, ``MATH_ADMISSION_WALL_SECONDS`` otherwise). A group that
-    overruns it, or a pool whose worker died, raises ``GraderInfrastructureError`` (the submission is resent, as
-    the window path's ``worker_dropped``) and the env's pool is replaced, so one group never holds a worker."""
+    (``CODE_ADMISSION_WALL_SECONDS`` for sandboxed code, ``MATH_ADMISSION_WALL_SECONDS`` otherwise), plus
+    ``run_seconds`` per program run for a stdio-program env (one run per hidden test and rollout: a 250-test
+    problem is 4,000 runs). A group that overruns it, or a pool whose worker died, raises
+    ``GraderInfrastructureError`` (the submission is resent, as the window path's ``worker_dropped``) and the env's
+    pool is replaced, so one group never holds a worker.
+
+    At most ``workers`` groups are in an env's pool at once (the others wait here, before their wall clock starts):
+    a group never spends its budget queued behind another's, and replacing the pool never cancels a group that was
+    only queued in it. Whatever the pool itself raises (a group cancelled or killed with a replaced pool, a submit
+    to a pool shut down meanwhile) is the grader's outage, never a ``reward_error`` against the miner."""
 
     def __init__(self, environments: Sequence[str], *, workers: int = 2, max_tasks: int | None = None,
                  wall_seconds: Callable[[str], float] | None = None, function: Callable[..., Any] = score_group,
-                 mp_context: str = "spawn") -> None:
+                 mp_context: str = "spawn", run_seconds: Callable[[str], float] | None = None) -> None:
         from reliquary.constants import ADMISSION_PROCESS_MAX_TASKS
 
         self.environments = tuple(environments)
         self.workers = int(workers)
         self.max_tasks = ADMISSION_PROCESS_MAX_TASKS if max_tasks is None else int(max_tasks)
         self.wall_seconds = wall_seconds or _wall_seconds
+        self.run_seconds = run_seconds or _run_seconds
         self.function = function
         self._context = multiprocessing.get_context(mp_context)
         self._pools: dict[str, ProcessPoolExecutor] = {}
         self._lock = threading.Lock()
+        self._slots: dict[str, threading.BoundedSemaphore] = {}
         self.timeouts: dict[str, int] = {}
         self.restarts: dict[str, int] = {}
 
@@ -362,26 +381,62 @@ class PooledScorer:
                 process.kill()
         pool.shutdown(wait=False, cancel_futures=True)
 
-    def __call__(self, environment: str, problem: Any, texts: Sequence[str], materials: Any) -> list[float]:
-        pool = self._pool(environment)
+    def _slot(self, environment: str) -> threading.BoundedSemaphore:
+        with self._lock:
+            slot = self._slots.get(environment)
+            if slot is None:
+                slot = self._slots[environment] = threading.BoundedSemaphore(max(1, self.workers))
+            return slot
+
+    def budget(self, environment: str, texts: Sequence[str], materials: Any) -> float:
+        """A group's wall budget: the env's, plus ``run_seconds`` per program run of a stdio-program group."""
         wall = float(self.wall_seconds(environment))
-        try:
-            return list(pool.submit(_score_in_worker, self.function, environment, problem, list(texts),
-                                    materials).result(
-                timeout=max(1.0, wall)))
-        except FutureTimeout as exc:
-            self.timeouts[environment] = self.timeouts.get(environment, 0) + 1
-            self._replace(environment, pool)
-            raise GraderInfrastructureError(f"{environment} grading overran {wall:.0f} s") from exc
-        except BrokenProcessPool as exc:
-            self._replace(environment, pool)
-            raise GraderInfrastructureError(f"{environment} grading worker died") from exc
+        per_run = float(self.run_seconds(environment))
+        if per_run > 0 and isinstance(materials, Sequence) and not isinstance(materials, (str, bytes)):
+            from reliquary.constants import STDIO_ADMISSION_MAX_WALL_SECONDS
+
+            wall = min(max(wall, STDIO_ADMISSION_MAX_WALL_SECONDS),
+                       wall + per_run * len(materials) * len(texts))
+        return max(1.0, wall)
+
+    def __call__(self, environment: str, problem: Any, texts: Sequence[str], materials: Any) -> list[float]:
+        wall = self.budget(environment, texts, materials)
+        with self._slot(environment):
+            pool = self._pool(environment)
+            try:
+                future = pool.submit(_score_in_worker, self.function, environment, problem, list(texts), materials)
+            except (BrokenProcessPool, RuntimeError) as exc:       # broken, or shut down by a concurrent replace
+                self._replace(environment, pool)
+                raise GraderInfrastructureError(f"{environment} grading pool unavailable ({exc})") from exc
+            try:
+                return list(future.result(timeout=wall))
+            except FutureTimeout as exc:
+                self.timeouts[environment] = self.timeouts.get(environment, 0) + 1
+                self._replace(environment, pool)
+                raise GraderInfrastructureError(f"{environment} grading overran {wall:.0f} s") from exc
+            except BrokenProcessPool as exc:
+                self._replace(environment, pool)
+                raise GraderInfrastructureError(f"{environment} grading worker died") from exc
+            except CancelledError as exc:                          # its pool was replaced under it
+                raise GraderInfrastructureError(f"{environment} grading cancelled with its pool") from exc
 
     def close(self) -> None:
         with self._lock:
             pools, self._pools = list(self._pools.items()), {}
         for _, pool in pools:
             pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _run_seconds(environment: str) -> float:
+    """The wall allowance per program run of a stdio-program env (0 for any other env, or an unknown name)."""
+    from reliquary.constants import STDIO_ADMISSION_SECONDS_PER_RUN
+    from reliquary.environment.stdio_program import STDIO_PROGRAM_CONTRACT
+
+    try:
+        spec = get_environment_spec(environment)
+    except (KeyError, ValueError):
+        return 0.0
+    return STDIO_ADMISSION_SECONDS_PER_RUN if spec.contract_version == STDIO_PROGRAM_CONTRACT else 0.0
 
 
 def _wall_seconds(environment: str) -> float:
@@ -465,6 +520,9 @@ class RlSubmissions:
             graded = self.grader.grade_episodes(lease, rollouts, received=arrived_at)
         else:
             graded = self.grader.grade(lease.environment, lease.prompt_idx, rollouts)
+        if graded.reject in GRADER_FAULTS:
+            logger.error("%s: lease %s of %s (%s prompt %d) closed, quota kept", graded.reject, lease_id[:12],
+                         hotkey[:12], lease.environment, lease.prompt_idx)
         # Truncated rollouts count as failures inside the group (no truncation ceiling): the draw, not the miner,
         # decides where a rollout stops, and a group dropped for its truncations would teach nothing about length.
         verdict = REJECTED if graded.reject else classify_group(graded.rewards, graded.truncated,
@@ -476,8 +534,9 @@ class RlSubmissions:
         db = self.book.db
         tokens = sum(group.model_tokens(i) for i in range(len(rollouts)))
         with self.book.transaction():
-            self.book.submit(lease_id, hotkey, in_zone=verdict == IN_ZONE, delivered=verdict != REJECTED,
-                             now=arrived_at)
+            # a group the validator failed to grade is not the miner's fault: its slot is freed, unhalved
+            self.book.submit(lease_id, hotkey, in_zone=verdict == IN_ZONE,
+                             delivered=verdict != REJECTED or graded.reject in GRADER_FAULTS, now=arrived_at)
             scan = None if verdict == REJECTED else self.book.record_outcome(
                 lease.environment, lease.prompt_idx, lease.checkpoint, graded.rewards, verdict, now=arrived_at)
             audit = training = None
