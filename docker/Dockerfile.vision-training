@@ -11,7 +11,7 @@ COPY tests/fixtures/reliquarylogic_v1.jsonl ./tests/fixtures/reliquarylogic_v1.j
 COPY scripts/vision-training-runtime.py ./training.py
 RUN python -m pip install --no-cache-dir torch==2.7.0 torchvision==0.22.0 --index-url "${TORCH_INDEX_URL}" \
     && python -m pip install --no-cache-dir transformers==5.10.4 huggingface-hub==1.30.0 \
-       peft==0.21.2 accelerate==1.15.0 Pillow==12.3.0 num2words==0.5.14 \
+       peft==0.21.2 accelerate==1.15.0 Pillow==13.0.0 num2words==0.5.14 \
     && python -m pip install --no-cache-dir --no-deps .
 ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false HOME=/tmp \
     OMP_NUM_THREADS=1 MKL_NUM_THREADS=1

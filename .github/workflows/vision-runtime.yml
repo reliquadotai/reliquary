@@ -38,7 +38,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cpu
-      - run: pip install pytest pytest-asyncio Pillow==12.3.0 transformers==5.10.4 peft==0.21.2 accelerate==1.15.0 num2words==0.5.14
+      - run: pip install pytest pytest-asyncio Pillow==13.0.0 transformers==5.10.4 peft==0.21.2 accelerate==1.15.0 num2words==0.5.14
       # This worker does not import validator/server dependencies or fixtures.
       - run: python -m pytest --noconftest tests/unit/test_vision* -q
         env:
@@ -120,7 +120,7 @@ jobs:
             --security-opt no-new-privileges --pids-limit 512 --memory 4g --cpus 2 \
             --tmpfs /tmp:rw,nosuid,nodev,size=1g \
             --entrypoint python "$IMAGE:sha-$GITHUB_SHA" -c \
-            'import torch, torchvision, transformers, peft; from reliquary.vision import runner, runtime; assert torch.version.cuda == "12.8"; assert not torch.cuda.is_available(); print("CUDA-wheel imports passed; GPU execution remains unqualified.")'
+            'import PIL, torch, torchvision, transformers, peft; from reliquary.vision import runner, runtime; assert PIL.__version__ == "13.0.0", PIL.__version__; assert torch.version.cuda == "12.8"; assert not torch.cuda.is_available(); print(f"Pillow {PIL.__version__} and CUDA-wheel imports passed; GPU execution remains unqualified.")'
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
