@@ -404,7 +404,7 @@ class EvalRunner:
         return rows
 
     def _run(self, task: dict, heartbeat: _Heartbeat) -> dict:
-        from reliquary.eval.protocol import CLAUDE_CLI_HARNESS, validate_execution, validate_request
+        from reliquary.eval.protocol import BOUNDED_SIGNED_HARNESSES, validate_execution, validate_request
 
         task_id = str(task["task_id"])
         validate_model(task["model"]["repo"], task["model"]["revision"])
@@ -420,7 +420,7 @@ class EvalRunner:
         if task.get("protocol") and task["protocol"].get("sets") != selected_sets:
             raise ValueError("request protocol selected sets changed")
         if self._remote_model_factory is not None:
-            if ((task.get("protocol") or {}).get("harness") not in {"signed-bash-v2", CLAUDE_CLI_HARNESS}
+            if ((task.get("protocol") or {}).get("harness") not in BOUNDED_SIGNED_HARNESSES
                     or type(self._generator) is not VLLMGenerator):
                 raise ValueError("remote inference requires the versioned signed episode runner")
         if task.get("protocol") and type(self._generator) is VLLMGenerator:

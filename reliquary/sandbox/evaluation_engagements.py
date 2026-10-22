@@ -130,7 +130,10 @@ class EvaluationSessions:
         checkpoint = checkpoint_identity(binding["model"])
         if binding.get("identity_kind") != "hf-snapshot/v1" or binding.get("checkpoint") != checkpoint:
             raise ValueError("evaluation_checkpoint_identity_changed")
-        from reliquary.eval.protocol import CLAUDE_CLI_HARNESS, signed_cli_capability
+        from reliquary.eval.protocol import BOUNDED_SIGNED_HARNESSES, CLAUDE_CLI_HARNESS, signed_cli_capability
+        if card["protocol"]["harness"]["id"] in BOUNDED_SIGNED_HARNESSES:
+            if any(binding.get(key) != row.get(key) for key in ("prompt_sha256", "reference_sha256")):
+                raise ValueError("evaluation_prompt_identity_changed")
         if card["protocol"]["harness"]["id"] == CLAUDE_CLI_HARNESS:
             from reliquary_sandbox_verifiers.cli import require_context_date
 
@@ -138,7 +141,6 @@ class EvaluationSessions:
             episode = card["signed_episode"]
             require_context_date(binding.get("context_date"))
             if (binding.get("harness") != CLAUDE_CLI_HARNESS
-                    or any(binding.get(key) != row.get(key) for key in ("prompt_sha256", "reference_sha256"))
                     or binding.get("cli_capability_sha256") != cap_sha
                     or binding.get("cli_runtime_image") != cap.runtime_image
                     or binding.get("evaluation_policy_sha256") != episode["evaluation_policy_sha256"]
@@ -282,13 +284,13 @@ class EvaluationSessions:
                        episode=card["protocol"]["source"]["episode"], budgets=budget)
         if protocol["harness"] in BOUNDED_SIGNED_HARNESSES:
             binding.update(max_turns=protocol["max_turns"], max_episode_tokens=protocol["max_episode_tokens"],
-                           evaluation_policy_sha256=episode["evaluation_policy_sha256"])
+                           evaluation_policy_sha256=episode["evaluation_policy_sha256"],
+                           prompt_sha256=row["prompt_sha256"], reference_sha256=row["reference_sha256"])
         if cli_cap is not None:
             from reliquary_sandbox_verifiers.cli import utc_context_date
 
             binding.update(cli_capability_sha256=cli_sha, cli_runtime_image=cli_cap.runtime_image,
-                           context_date=utc_context_date(), prompt_sha256=row["prompt_sha256"],
-                           reference_sha256=row["reference_sha256"])
+                           context_date=utc_context_date())
         binding_sha = digest(binding)
         engagement = _engagement(binding)
         sample_prefix = engagement.rsplit(":", 1)[0] + ":"

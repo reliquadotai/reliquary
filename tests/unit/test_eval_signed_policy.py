@@ -2,6 +2,8 @@
 
 import copy
 import hashlib
+import asyncio
+import time
 
 import pytest
 
@@ -145,10 +147,10 @@ def test_new_frozen_policy_cannot_be_changed_after_sealing(tmp_path):
         ep.validate_execution({card["set_id"]: changed}, {card["set_id"]: changed["protocol_sha256"]})
 
 
-def test_actual_signed_grant_binds_new_policy_and_model_bounds(tmp_path):
+def bounded_session(tmp_path):
     pytest.importorskip("reliquary_sandbox.attest")
     from reliquary.eval.storage import subnet_key
-    from tests.unit.test_evaluation_sessions import build as build_session, open_
+    from tests.unit.test_evaluation_sessions import build as build_session
 
     env = build_session(tmp_path)
     config, reviewed = configuration()
@@ -162,14 +164,75 @@ def test_actual_signed_grant_binds_new_policy_and_model_bounds(tmp_path):
     env.body.update(protocol=request, protocol_json=ep.canonical(request).decode(),
         protocol_sha256=ep.digest(request), protocol_bindings=request["protocol_bindings"],
         set_protocol={key: card[key] for key in ("protocol", "protocol_json", "protocol_sha256")})
+    env.card = card
+    return env
+
+
+def test_actual_signed_grant_binds_new_policy_and_model_bounds(tmp_path):
+    from tests.unit.test_evaluation_sessions import open_
+
+    env = bounded_session(tmp_path)
+    request = env.body["protocol"]
     grant = open_(env)
     binding = grant["binding"]
     assert binding["harness"] == "signed-bash-v2"
     assert binding["max_turns"] == 48 and binding["max_episode_tokens"] == 65536
-    assert binding["evaluation_policy_sha256"] == config["evaluation_policy_sha256"]
+    assert binding["evaluation_policy_sha256"] == env.card["signed_episode"]["evaluation_policy_sha256"]
+    assert binding["prompt_sha256"] == env.rows[0]["prompt_sha256"]
+    assert binding["reference_sha256"] == env.rows[0]["reference_sha256"]
     assert len(env.persisted.documents) == 1
     changed = {**request, "max_turns": 49}
     with pytest.raises(ValueError):
         open_(env, {"protocol": changed, "protocol_json": ep.canonical(changed).decode(),
                     "protocol_sha256": ep.digest(changed)})
     assert len(env.persisted.documents) == 1
+
+
+def test_bounded_bash_actual_input_is_fenced_before_model_or_runner(tmp_path, monkeypatch):
+    from reliquary.environment import agentic_swe
+    from reliquary.eval import signed_agentic
+    from tests.unit.test_evaluation_sessions import open_
+
+    env = bounded_session(tmp_path)
+    grant = open_(env)
+    task = {"eval_id": env.body["eval_id"], "task_id": env.body["task_id"], "model": env.body["model"],
+        "protocol": env.body["protocol"], "protocol_sha256": env.body["protocol_sha256"],
+        "set_protocols": {env.card["set_id"]: env.body["set_protocol"]}}
+    row = {**env.rows[0], "set_id": env.card["set_id"],
+           "messages": [{"role": "user", "content": env.source.prompt(env.rows[0]["source_index"])}]}
+    signed_agentic._validate_signed_prompt(row=row, binding=grant["binding"], token=grant["grant"]["token"])
+    monkeypatch.setattr(agentic_swe, "_dist_commit", lambda _: agentic_swe.SUPPORTED_VERIFIERS)
+    calls = []
+    def model_forbidden(*args, **kwargs):
+        calls.append(True)
+        raise AssertionError("model construction preceded the input fence")
+    monkeypatch.setattr(signed_agentic, "model_client", model_forbidden)
+    changed = {**row, "messages": [{"role": "user", "content": "changed API task"}]}
+    for actual_row, actual_grant in (
+        (changed, grant),
+        ({**row, "messages": row["messages"] * 2}, grant),
+        (changed, {**grant, "binding": {**grant["binding"],
+             "prompt_sha256": signed_agentic.prompt_sha256("changed API task")}}),
+        (row, {**grant, "binding": {**grant["binding"], "reference_sha256": "0" * 64}}),
+    ):
+        with pytest.raises(ValueError, match="prompt"):
+            asyncio.run(signed_agentic.run_signed_episode(generator=None, task=task, row=actual_row,
+                sample_index=0, grant=actual_grant, seed=7, deadline=time.monotonic() + 60))
+    assert calls == []
+
+
+def test_bounded_receipt_hashes_are_authoritative_and_legacy_wire_is_unchanged(tmp_path):
+    from tests.unit.test_evaluation_sessions import build as build_session, open_, signed_receipt
+
+    legacy = build_session(tmp_path / "legacy")
+    old_grant = open_(legacy)
+    assert "prompt_sha256" not in old_grant["binding"] and "reference_sha256" not in old_grant["binding"]
+    env = bounded_session(tmp_path / "bounded")
+    grant = open_(env)
+    receipt = signed_receipt(env, grant)
+    for key in ("prompt_sha256", "reference_sha256"):
+        with pytest.raises(ValueError, match="prompt_identity_changed"):
+            asyncio.run(env.sessions.verify_result({**grant["binding"], key: "0" * 64}, receipt,
+                card=env.card, row=env.rows[0], final_state=b"final\x00archive"))
+    assert asyncio.run(env.sessions.verify_result(grant["binding"], receipt, card=env.card,
+        row=env.rows[0], final_state=b"final\x00archive")) == 1

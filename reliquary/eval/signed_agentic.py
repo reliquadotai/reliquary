@@ -139,6 +139,24 @@ def model_client(generator, *, task, source, deadline, seed, cli_bridge=None):
     return LocalClient()
 
 
+def _validate_signed_prompt(*, row, binding, token):
+    """Bind actual input text to the issuer's resolved task before generation."""
+    from reliquary.sandbox.evaluation_engagements import _engagement
+    from reliquary_sandbox.attest import SessionClaims
+
+    messages = row.get("messages")
+    if (not isinstance(messages, list) or len(messages) != 1
+            or not isinstance(messages[0], dict) or set(messages[0]) != {"role", "content"}
+            or messages[0]["role"] != "user" or not isinstance(messages[0]["content"], str)
+            or prompt_sha256(messages[0]["content"]) != binding.get("prompt_sha256")
+            or not isinstance(binding.get("reference_sha256"), str)
+            or len(binding["reference_sha256"]) != 64
+            or any(char not in "0123456789abcdef" for char in binding["reference_sha256"])):
+        raise ValueError("signed episode prompt differs from its authoritative source")
+    if SessionClaims.from_dict(token.get("claims")).engagement != _engagement(binding):
+        raise ValueError("signed episode prompt binding differs from its token")
+
+
 def _validate_cli_grant(*, task, row, grant, binding, source):
     """Check issuer-bound authority before an actual CLI can open its workspace.
 
@@ -153,15 +171,7 @@ def _validate_cli_grant(*, task, row, grant, binding, source):
 
     cap, _, cap_sha = signed_cli_capability()
     frozen = task["set_protocols"][row["set_id"]]["protocol"]
-    messages = row.get("messages")
-    if (not isinstance(messages, list) or len(messages) != 1
-            or not isinstance(messages[0], dict) or set(messages[0]) != {"role", "content"}
-            or messages[0]["role"] != "user" or not isinstance(messages[0]["content"], str)
-            or prompt_sha256(messages[0]["content"]) != binding.get("prompt_sha256")
-            or not isinstance(binding.get("reference_sha256"), str)
-            or len(binding["reference_sha256"]) != 64
-            or any(char not in "0123456789abcdef" for char in binding["reference_sha256"])):
-        raise ValueError("signed CLI prompt differs from its authoritative source")
+    _validate_signed_prompt(row=row, binding=binding, token=grant["token"])
     policy = digest(signed_evaluation_policy("reliquary-swe==0.3.0", "eval", harness=CLAUDE_CLI_HARNESS))
     expected = {"environment": frozen["source"]["id"],
         "environment_manifest_sha256": frozen["source"]["environment_manifest_sha256"],
@@ -245,7 +255,7 @@ async def run_signed_episode(*, generator, task, row, sample_index, grant, seed,
     from verifiers.v1.types import Sampling
     from verifiers.v1.utils.loaders import load_environment, resolve_env_config
     from reliquary.eval.platform_client import LeaseLost
-    from reliquary.eval.protocol import CLAUDE_CLI_HARNESS, SIGNED_HARNESSES
+    from reliquary.eval.protocol import BOUNDED_SIGNED_HARNESSES, CLAUDE_CLI_HARNESS, SIGNED_HARNESSES
 
     if _dist_commit("verifiers") != SUPPORTED_VERIFIERS:
         raise ValueError("signed evaluation requires the pinned Verifiers implementation")
@@ -297,6 +307,8 @@ async def run_signed_episode(*, generator, task, row, sample_index, grant, seed,
         if client is None:
             raise ValueError("signed CLI did not bind its checkpoint client")
     else:
+        if harness in BOUNDED_SIGNED_HARNESSES:
+            _validate_signed_prompt(row=row, binding=binding, token=grant["token"])
         client = model_client(generator, task=task, source=source, deadline=deadline, seed=seed)
     # Explicit unused endpoint config is a key only; every model call is injected locally.
     config = EvalClientConfig(base_url="http://127.0.0.1", api_key_var="RELIQUARY_EVAL_UNUSED_KEY")
