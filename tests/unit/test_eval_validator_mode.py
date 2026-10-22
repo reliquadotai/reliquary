@@ -284,7 +284,7 @@ def test_a_served_eval_job_is_graded_on_cpu_from_its_audited_records(
     assert series["id"] == "verifiers-fake-r0-n5" and series["protocol"]["attempts"] == 4
     assert series["checkpoints"][0]["step"] == 40 and series["checkpoints"][0]["samples"] == 3
     assert series["checkpoints"][0]["score"] == pytest.approx(env["pass@1"]["value"])
-    assert series["baseline"]["step"] == 0 and series["checkpoints"][0]["at"] == 1000
+    assert series["baseline"]["step"] is None and series["checkpoints"][0]["at"] == 1000
 
 
 def test_the_rl_identity_is_read_from_a_backup_name_or_given():

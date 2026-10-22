@@ -4,7 +4,8 @@ Each ``tick`` (idempotent, its state in one JSON file):
 
 1. A checkpoint being served: grade each of its jobs once drained (``grade_served_job`` with the RL identity), the
    ones missing samples after ``max_wait_s`` counted as failures (``--allow-incomplete``); once all are graded,
-   stop its validator and rebuild the feed (``run_feed``), published when asked. A validator found dead is
+   stop its validator and rebuild the feed (``run_feed``), published when asked (public bucket and/or the summary
+   of a W&B evaluation run, ``wandb_feed``). A validator found dead is
    restarted.
 2. Nothing served: the start checkpoint first (the baseline), then the NEWEST milestone backup
    (``<namespace>/<prefix>-step-<n>``, ``n`` a multiple of ``every``) past the last one taken. The ones in between
@@ -98,6 +99,10 @@ class Settings:
     max_wait_s: float = 6 * 3600
     publish: bool = False
     upload: bool = False
+    wandb: bool = False                 # the feed into a W&B evaluation run too (wandb_feed.mirror)
+    wandb_run_id: str | None = None     # default: <trainer group>-evals
+    wandb_project: str | None = None    # default: WANDB_PROJECT, then reliquary-validator
+    wandb_entity: str | None = None     # default: WANDB_ENTITY
 
     def repo(self, step: int) -> str:
         return f"{self.hf_namespace}/{self.hf_prefix}-step-{step:08d}"
@@ -369,6 +374,13 @@ def live_ports(settings: Settings) -> Ports:
         if settings.publish:
             summary["published"] = run_feed.publish_feed(
                 built, base_url=os.environ.get("RELIQUARY_RUN_BENCHMARKS_BASE_URL", "").strip() or None)
+        if settings.wandb:
+            from reliquary.eval import wandb_feed
+
+            summary["wandb"] = wandb_feed.mirror(
+                built, short_of={e.set_id: e.short for e in settings.suite},
+                state_path=settings.results_dir / "wandb-logged.json", run_id=settings.wandb_run_id,
+                project=settings.wandb_project, entity=settings.wandb_entity)
         return summary
 
     def run(argv: list[str]) -> None:
