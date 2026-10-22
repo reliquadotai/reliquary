@@ -687,7 +687,8 @@ over the module-level `batcher.admission_problem_materials`, shared with P3).
   next to `rl_prompt_scans` (public log). TODO: the decision-D R2 segment writer reads `rl_prompt_scans` by `seq`.
 - `validator/rl_buffer.py`: `TrainingBuffer` (SQLite, same file): `take(n)` any env in arrival order, `release`,
   `depth`, `drain_tick` (the prices' signal: queued completion tokens per env, completion tokens the trainer took,
-  seconds it waited, between takes at most 30 s apart); taken groups requeue at reopen. `SubmittedGroup` carries env, k, nonce, arrival, hotkey,
+  seconds it waited, between takes at most 30 s apart); reopening preserves taken groups, which the sole trainer
+  requeues when it holds nothing before a step. `SubmittedGroup` carries env, k, nonce, arrival, hotkey,
   prompt tokens, completions, force spans, rewards.
 - Audit (§C, design §4.4): draw after submission with `SystemRandom`; probation = < 100 passed out-of-zone audits,
   or < 20 passes since the last failure; a failure of any class -> unpaid, re-probation, never a ban (10-17);

@@ -5,8 +5,9 @@ A group is buffered by the submission path (``rl_submit``) in the same transacti
 lease book's SQLite file, so a restart loses none. The trainer (P4) ``take``s groups (freshest first within an
 env: highest k, then latest arrival), runs its forward against the published checkpoint (Gumbel picks from the
 lease ``nonce``), and reports each group back through ``RlSubmissions.report_training`` (which removes it). Groups
-taken but never reported (a trainer restart) go back to the queue when the buffer is opened again, or by
-``release``. Env mix, max-lag drop and batch assembly are P4's.
+taken but never reported go back to the queue when the sole trainer starts or recovers holding nothing, or by
+``release``. Reopening the controller preserves groups still held by a live trainer. Env mix, max-lag drop and
+batch assembly are P4's.
 
 Each hand-out counts (``attempts``): a group taken again after a step that never reported it (the step raised, the
 trainer died) goes after the fresh ones, at most one such group per take, so a group that breaks every step it is
@@ -102,11 +103,10 @@ class TrainingBuffer:
             if "attempts" not in {row[1] for row in book.db.execute("PRAGMA table_info(rl_buffer)")}:
                 book.db.execute("ALTER TABLE rl_buffer ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")   # an older file
             book.db.commit()
-        self.requeue()                                        # a trainer that died holding groups: give them back
 
     def requeue(self) -> int:
-        """Every taken group back to the queue: at open, and when the (only) trainer starts or recovers holding
-        nothing. Returns how many."""
+        """Every taken group back to the queue when the sole trainer starts or recovers holding nothing.
+        Returns how many."""
         with self.book.transaction():
             return self.book.db.execute("UPDATE rl_buffer SET state=? WHERE state=?", (QUEUED, TAKEN)).rowcount
 

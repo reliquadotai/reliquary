@@ -765,3 +765,62 @@ def test_invalid_judged_flag_does_not_consume_a_group(tmp_path, judged):
     assert response.status_code == 422
     assert rl.buffer.get(lease.lease_id) is not None
     rl.close()
+
+
+def test_controller_reopen_does_not_reissue_groups_held_by_a_live_trainer(tmp_path):
+    from reliquary.trainer.async_trainer import AsyncTrainer, AsyncTrainerConfig
+    from reliquary.trainer.rl_link import TrainerLink
+    from reliquary.validator.rl_leases import LeaseRequest
+
+    live = {"rl": components(tmp_path)}
+    live["rl"].book.adopt_checkpoint(0)
+
+    def client_for(rl):
+        return TestClient(build_rl_trainer_app(rl, token=TOKEN))
+
+    def submit(prompt):
+        rl = live["rl"]
+        held = rl.book.grant([LeaseRequest("A", ENV, (prompt,), 0)])[0].leases[0]
+        rl.submissions.submit(held.lease_id, "A", group(8))
+        return held.lease_id
+
+    live["client"] = client_for(live["rl"])
+    leases = [submit(3)]
+    reopened = []
+
+    class Transport:
+        def request(self, *args, **kwargs):
+            return live["client"].request(*args, **kwargs)
+
+        def close(self):
+            live["client"].close()
+
+    def wait_for_more(_):
+        assert not reopened, "the trainer should finish when one new group arrives"
+        held = list(live["rl"].book.db.execute("SELECT lease_id,state,attempts FROM rl_buffer"))
+        paid = live["rl"].book.quota.state("A")["counters"].get("paid", 0)
+        live["client"].close()
+        live["rl"].close()
+        live["rl"] = components(tmp_path)                    # same durable book; trainer remains alive
+        assert list(live["rl"].book.db.execute("SELECT lease_id,state,attempts FROM rl_buffer")) == held
+        assert live["rl"].book.quota.state("A")["counters"].get("paid", 0) == paid
+        live["client"] = client_for(live["rl"])
+        leases.append(submit(4))
+        reopened.append(True)
+
+    link = TrainerLink("http://testserver", TOKEN, client=Transport())
+    trainer = AsyncTrainer(None, config=AsyncTrainerConfig(2), buffer=link, submissions=link, book=link,
+                           sleep=wait_for_more)
+    try:
+        batch = trainer.assemble()
+        assert [g.lease_id for g in batch] == leases
+        assert dict(live["rl"].book.db.execute("SELECT lease_id,attempts FROM rl_buffer")) == dict.fromkeys(leases, 1)
+        trainer._report_untrained(batch)
+        assert live["rl"].buffer.depth() == {}
+        assert live["rl"].book.db.execute("SELECT COUNT(*) FROM rl_buffer").fetchone()[0] == 0
+        assert [(e["lease_id"], e["kind"]) for e in live["rl"].submissions.events()] == [
+            (lease_id, "untrained") for lease_id in leases]
+    finally:
+        trainer.close()
+        link.close()
+        live["rl"].close()

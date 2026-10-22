@@ -404,7 +404,9 @@ def test_a_take_whose_answer_was_lost_is_requeued_before_the_next_step():
     buffer = TrainingBuffer(book)
     buffer.push(submitted(model, "g", n=2))
     assert [g.lease_id for g in buffer.take(1)] == ["g"]          # taken, answer lost: the trainer never saw it
-    trainer, subs, _ = loop(model, book, buffer, batch=1)
+    reopened = TrainingBuffer(book)
+    assert reopened.depth() == {}                                 # controller reopen does not recover the trainer
+    trainer, subs, _ = loop(model, book, reopened, batch=1)
     assert trainer.run_once() == "trained" and "g" in subs.reports
     trainer.close()
 
