@@ -2559,6 +2559,8 @@ def eval_schedule(
     max_wait_hours: float = typer.Option(6.0, "--max-wait-hours", help="Then missing samples count as failures"),
     publish: bool = typer.Option(False, "--publish", help="Publish the feed after each graded checkpoint"),
     upload: bool = typer.Option(False, "--upload", help="Upload each grading to the subnet bucket"),
+    wandb: bool = typer.Option(False, "--wandb", help="Also log the scores to wandb, run <trainer group>-evals "
+                                                      "(WANDB_API_KEY, WANDB_PROJECT)"),
     execute: bool = typer.Option(False, "--execute", help="Act (default: a dry run printing what it would do)"),
     loop_seconds: float = typer.Option(0.0, "--loop-seconds", help="Tick again every N seconds (0: once)"),
 ) -> None:
@@ -2578,7 +2580,7 @@ def eval_schedule(
             baseline_model=baseline_model, baseline_revision=baseline_revision, results_dir=Path(results_dir),
             state_path=Path(state) if state else Path(results_dir) / "schedule-state.json",
             start_cmd=start_cmd or rl_schedule.DEFAULT_START, start_values=values,
-            max_wait_s=max_wait_hours * 3600, publish=publish, upload=upload)
+            max_wait_s=max_wait_hours * 3600, publish=publish, upload=upload, wandb=wandb)
         for entry in settings.suite:
             rl_schedule.job_id(run_tag, 99999, entry.short)
         scheduler = rl_schedule.Scheduler(settings, rl_schedule.live_ports(settings))

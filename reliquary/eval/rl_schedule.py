@@ -98,6 +98,7 @@ class Settings:
     max_wait_s: float = 6 * 3600
     publish: bool = False
     upload: bool = False
+    wandb: bool = False                 # mirror the feed's scores into wandb (wandb_feed)
 
     def repo(self, step: int) -> str:
         return f"{self.hf_namespace}/{self.hf_prefix}-step-{step:08d}"
@@ -369,6 +370,11 @@ def live_ports(settings: Settings) -> Ports:
         if settings.publish:
             summary["published"] = run_feed.publish_feed(
                 built, base_url=os.environ.get("RELIQUARY_RUN_BENCHMARKS_BASE_URL", "").strip() or None)
+        if settings.wandb:
+            from reliquary.eval import wandb_feed
+
+            summary["wandb"] = wandb_feed.log_feed(built, short_of={e.set_id: e.short for e in settings.suite},
+                                                   state_path=settings.results_dir / "wandb-logged.json")
         return summary
 
     def run(argv: list[str]) -> None:
