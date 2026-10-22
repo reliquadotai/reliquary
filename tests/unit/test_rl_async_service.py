@@ -69,6 +69,69 @@ def test_an_async_task_is_declared_paid_by_period_with_its_mix():
         with_rl_async_params(entry, planned_tokens_per_period=None)
 
 
+def test_an_async_task_declares_a_start_pool_under_its_cap():
+    from dataclasses import replace
+
+    from reliquary.cli.main import build_task_entry, with_rl_async_params
+    from reliquary.constants import PROTOCOL_PROFILE_ID
+    from reliquary.protocol.profiles import resolve_protocol_profile
+    from reliquary.shared.task_registry import RegistryError, set_cap, validate_entry
+    from reliquary.validator.rl_async_service import START_POOL_PARAM
+
+    envs = sorted(resolve_protocol_profile(PROTOCOL_PROFILE_ID).environments)
+    split = {env: (1.0 if i == 0 else 0.0) for i, env in enumerate(envs)}
+    entry = build_task_entry(task_id="rl-async", profile_id=PROTOCOL_PROFILE_ID, cap=0.4, overrides={},
+                             env_split=split)
+    declared = with_rl_async_params(entry, planned_tokens_per_period=2e8, start_pool=0.1)
+    validate_entry(declared)
+    assert declared.params[START_POOL_PARAM] == 0.1
+    settings = rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000)
+    assert settings.start_pool == 0.1 and settings.cap == 0.4
+    legacy = rl_async_settings(with_rl_async_params(entry, planned_tokens_per_period=2e8), 0.4,
+                               max_tokens=lambda env: 4000)
+    assert legacy.start_pool is None                                    # the controller prices on the cap
+    for bad in (0.0, -0.1, 0.5):
+        with pytest.raises(ValueError, match="--start-pool"):
+            with_rl_async_params(entry, planned_tokens_per_period=2e8, start_pool=bad)
+    for bad in (0.0, 0.5, "x"):
+        with pytest.raises(RegistryError):
+            validate_entry(replace(declared, params={**declared.params, START_POOL_PARAM: bad}))
+    with pytest.raises(RegistryError, match="async RL"):                # a window task has no start pool
+        validate_entry(replace(entry, params={**entry.params, START_POOL_PARAM: 0.1}))
+    lowered = set_cap({"rl-async": declared}, "rl-async", 0.05)["rl-async"]
+    assert lowered.params[START_POOL_PARAM] == 0.05                     # a lowered cap bounds the start pool
+    assert set_cap({"rl-async": declared}, "rl-async", 0.3)["rl-async"].params[START_POOL_PARAM] == 0.1
+
+
+def test_the_cli_takes_a_start_pool_only_with_rl_async(monkeypatch):
+    from typer.testing import CliRunner
+
+    from reliquary.cli.main import app
+
+    created = []
+
+    async def create(entry):
+        created.append(entry)
+
+    from reliquary.constants import PROTOCOL_PROFILE_ID
+    from reliquary.protocol.profiles import resolve_protocol_profile
+    from reliquary.validator.rl_async_service import START_POOL_PARAM
+
+    envs = sorted(resolve_protocol_profile(PROTOCOL_PROFILE_ID).environments)
+    split = ",".join(f"{env}={1.0 if i == 0 else 0.0}" for i, env in enumerate(envs))
+    monkeypatch.setattr("reliquary.infrastructure.task_registry_store.create_task", create)
+    base = ["tasks", "create", "--task-id", "rl-async", "--profile-id", PROTOCOL_PROFILE_ID, "--cap", "0.4",
+            "--env-split", split]
+    result = CliRunner().invoke(app, [*base, "--start-pool", "0.1"])
+    assert result.exit_code != 0 and "need --rl-async" in result.output
+    result = CliRunner().invoke(app, [*base, "--rl-async", "--planned-tokens-per-period", "2e8", "--start-pool", "0.5"])
+    assert result.exit_code != 0 and "--start-pool" in result.output
+    assert created == []
+    result = CliRunner().invoke(app, [*base, "--rl-async", "--planned-tokens-per-period", "2e8", "--start-pool", "0.1"])
+    assert result.exit_code == 0, result.output
+    assert [e.params[START_POOL_PARAM] for e in created] == [0.1]
+
+
 def settings_for(**kw) -> RlAsyncSettings:
     return RlAsyncSettings(**{"task_id": "rl-async", "cap": 0.5, "run": "smoke", "targets": {ENV: 1.0},
                               "planned_tokens_per_period": 1e6, "lease_expiry_s": {ENV: 600.0}, **kw})

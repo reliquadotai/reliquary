@@ -19,10 +19,13 @@ is read from the training queue (``TrainingBuffer.drain_tick``), nothing is repo
 * No speed yet, or the trainer neither took nor waited for ``stale_ticks`` ticks (trainer down): every price holds.
 
 No global price: the trainer's speed is the sum of the demands, so every env at r ~ 1 means the miners as a whole
-match the trainer. The price is a multiplier of the env's nominal rate: per matched token an env pays ``multiplier x
-cap x target_share / planned_tokens_per_period``. Prices above 1 (up to ``cap`` = 4 x nominal) are bounded by the
-settlement's normalisation (``rl_ledger``): a period never pays more than the cap, the rest burns. State lives in the
-lease book's SQLite file (``rl_prices``, ``rl_trainer_speed``) and survives a restart.
+match the trainer. The price is a multiplier of one nominal rate, the same for every env: per matched token an env
+pays ``multiplier x start_pool / planned_tokens_per_period``. At the target mix and multiplier 1 env e supplies
+``share(e) x planned`` tokens and earns ``start_pool x share(e)``: the period pays ``start_pool`` (the starting
+budget, the task's cap when not declared). Multipliers above 1 (up to 4, or ``cap / start_pool`` when larger, so
+that scarcity can reach the cap) raise the total towards the cap; the settlement's normalisation (``rl_ledger``)
+keeps the cap the most a period pays, the rest burns. State lives in the lease book's SQLite file (``rl_prices``,
+``rl_trainer_speed``) and survives a restart.
 """
 from __future__ import annotations
 
@@ -118,19 +121,27 @@ def advance_async(state: PriceState, signal: EnvSignal, params: AsyncPriceParams
 @dataclass
 class AsyncPriceController:
     """Per-env multipliers, persisted in ``book``'s file. ``targets``: env -> target share of trained tokens (the
-    trainer's mix, summing to 1); ``cap`` and ``planned_tokens_per_period`` set the nominal rate per token."""
+    trainer's mix, summing to 1); ``start_pool`` (None: ``cap``) and ``planned_tokens_per_period`` set the nominal
+    rate per token, ``cap`` the most a period pays."""
     book: object
     targets: Mapping[str, float]
     cap: float
     planned_tokens_per_period: float
+    start_pool: float | None = None
     params: AsyncPriceParams = field(default_factory=AsyncPriceParams)
     clock: Callable[[], float] = time.time
 
     def __post_init__(self) -> None:
         if not self.targets or any(v < 0 for v in self.targets.values()) or abs(sum(self.targets.values()) - 1) > 1e-6:
             raise ValueError("targets are non-negative shares summing to 1")
-        if not (self.cap > 0 and self.planned_tokens_per_period > 0):
-            raise ValueError("cap and planned_tokens_per_period must be positive")
+        if self.start_pool is None:
+            self.start_pool = self.cap
+        if not (self.cap > 0 and self.planned_tokens_per_period > 0 and 0 < self.start_pool <= self.cap):
+            raise ValueError("cap and planned_tokens_per_period must be positive, 0 < start_pool <= cap")
+        # A fleet short everywhere must still be priceable up to the cap: the ceiling is at least cap / start_pool.
+        base = self.params.base
+        if self.cap / self.start_pool > base.cap:
+            self.params = replace(self.params, base=replace(base, cap=self.cap / self.start_pool))
         with self.book.lock:
             self.book.db.executescript(_SCHEMA)
             self.book.db.execute("INSERT OR IGNORE INTO rl_price_clock(id, last_tick) VALUES(0, ?)",
@@ -145,8 +156,14 @@ class AsyncPriceController:
 
     def token_price(self, environment: str) -> float:
         """What one matched token of ``environment`` pays now, in cap units (0 for an env without a target)."""
-        nominal = self.cap * float(self.targets.get(environment, 0.0)) / self.planned_tokens_per_period
-        return self.multiplier(environment) * nominal
+        if float(self.targets.get(environment, 0.0)) <= 0:
+            return 0.0
+        return self.multiplier(environment) * self.nominal
+
+    @property
+    def nominal(self) -> float:
+        """Every env's price per matched token at multiplier 1: the target mix pays ``start_pool`` a period."""
+        return self.start_pool / self.planned_tokens_per_period
 
     def board(self) -> dict[str, dict]:
         with self.book.lock:
