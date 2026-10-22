@@ -115,13 +115,16 @@ class TrainerLink:
 
     # --- the submissions ------------------------------------------------------------------------------------------
     def report_training(self, lease_id: str, *, rollout_match, accepted: bool, failure_class: str | None = None,
-                        matched_tokens=None, substitutions=None) -> None:
-        self._call("POST", "report", {
+                        matched_tokens=None, substitutions=None, judged: bool | None = None) -> None:
+        body = {
             "lease_id": lease_id, "rollout_match": [float(m) for m in rollout_match], "accepted": bool(accepted),
             "failure_class": failure_class,
             "matched_tokens": None if matched_tokens is None else [int(n) for n in matched_tokens],
             "substitutions": None if substitutions is None else [[[int(p), int(t)] for p, t in s]
-                                                                 for s in substitutions]}, resend_ok=True)
+                                                                 for s in substitutions]}
+        if judged is not None:
+            body["judged"] = judged
+        self._call("POST", "report", body, resend_ok=True)
 
 
     # --- the audits (trainer.audits) ------------------------------------------------------------------------------

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +31,7 @@ class CardFeed:
     Every card model once published stays in every later row (zeros when idle), so the dashboard's model set (the
     run summary) always has a full same-row vector; it is persisted at ``path`` across restarts of a resumed run.
     Verdict counts cover the disjoint window ``[cards/window_start, _timestamp)``; the previous row's end is the
-    next one's start."""
+    next one's start. A new feed starts now, without replaying the interval before its process started."""
 
     def __init__(self, setups: Any, path: str | Path | None = None) -> None:
         self.setups = setups
@@ -41,7 +42,7 @@ class CardFeed:
                 self.named = [str(c) for c in json.loads(self.path.read_text())][:MAX_NAMED_CARDS]
             except (OSError, ValueError, TypeError):
                 logger.warning("card models at %s unreadable; starting over", self.path)
-        self.since: float | None = None
+        self.since = time.time()
 
     def _admit(self, classes: list[str]) -> None:
         new = [c for c in classes if c not in self.named and c not in BUCKETS][:MAX_NAMED_CARDS - len(self.named)]
@@ -57,9 +58,9 @@ class CardFeed:
     def row(self, rl: Any, now: float, window_s: float = METRICS_EVERY_S) -> dict[str, float]:
         from reliquary.validator.miner_setup import summarize
 
-        start = max(now - window_s if self.since is None else self.since, now - CARD_WINDOW_MAX_S)
+        start = min(now, max(self.since, now - CARD_WINDOW_MAX_S))
         out = card_metrics(rl, summarize(self.setups.rows(), now=now), now, start, self)
-        self.since = now
+        self.since = max(self.since, now)
         return out
 
 
@@ -98,8 +99,9 @@ def card_metrics(rl: Any, summary: list[dict], now: float, start: float, feed: C
     for at, hotkey, kind, raw in events:
         detail = json.loads(raw)
         match = detail.get("rollout_match") or []
-        if not any(m > 0 for m in match):       # skipped step, stale or exhausted: the trainer never judged it
-            continue
+        judged = detail.get("judged")
+        if judged is False or (judged is None and not any(m > 0 for m in match)):
+            continue                           # legacy all-zero reports cannot distinguish skipped from judged
         c = t[bucket(cards.get(hotkey, ("undeclared", 0))[0])]
         tokens = int(sum(detail.get("matched_tokens") or detail.get("completion_tokens") or [])) \
             if kind == "trained" else 0

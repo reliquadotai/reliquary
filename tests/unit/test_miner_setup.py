@@ -164,3 +164,19 @@ def test_the_miner_side_sends_a_report_the_route_accepts(harness):
         module.time.time = original
     assert ok
     assert len(store.rows()) == 1
+
+
+def test_concurrent_replays_are_stored_once(harness):
+    import httpx
+
+    client, store, _ = harness
+    body = _body(_report())
+
+    async def burst():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app), base_url="http://v") as http:
+            return await asyncio.gather(*(http.post("/miner/setup", json=body) for _ in range(16)))
+
+    responses = asyncio.run(burst())
+    assert [r.status_code for r in responses].count(200) == 1
+    assert all(r.status_code in (200, 429) for r in responses)
+    assert len(store.rows()) == 1

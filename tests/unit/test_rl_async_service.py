@@ -608,6 +608,8 @@ def test_the_controller_row_breaks_the_trainer_verdicts_down_per_declared_card(t
     setups.put("B", "b" * 16, int(now), now, {"gpus": [{"name": "NVIDIA GeForce RTX 4090", "id_hash": "3" * 16}]})
     rl = components(tmp_path)
     rl.book.adopt_checkpoint(0)
+    feed = CardFeed(setups, tmp_path / "cards.json")
+    first_start = feed.since
     leases = {}
     for hotkey, idx in (("A", 3), ("B", 4), ("C", 5)):
         [lease] = rl.book.grant([LeaseRequest(hotkey, ENV, (idx,), 0)])[0].leases
@@ -617,12 +619,11 @@ def test_the_controller_row_breaks_the_trainer_verdicts_down_per_declared_card(t
                                    matched_tokens=[1] * 16)
     rl.submissions.report_training(leases["B"], rollout_match=[0.5] * 15 + [0.25], accepted=False)
     rl.submissions.report_training(leases["C"], rollout_match=[0.0] * 16, accepted=False)   # never judged
-    feed = CardFeed(setups, tmp_path / "cards.json")
     at = time.time() + 1
     row = controller_metrics(rl, at, cards=feed)
     h, r, u = "cards/h100-80gb-hbm3/", "cards/rtx-4090/", "cards/undeclared/"
     # The platform's shared/rl-card-fleet.ts: a same-row vector for every model, window start in Unix seconds.
-    assert row["_timestamp"] == at and row["cards/window_start"] == at - 60
+    assert row["_timestamp"] == at and row["cards/window_start"] == first_start
     models = {k.split("/")[1] for k in row if k.startswith("cards/") and k.count("/") == 2}
     assert models == {"h100-80gb-hbm3", "rtx-4090", "mixed", "undeclared", "other"}
     for m in models:
@@ -685,4 +686,82 @@ async def test_with_audits_on_the_trainer_the_validator_loop_never_concludes_the
         task.cancel()
     await asyncio.gather(*loops, return_exceptions=True)
     assert [g.lease_id for g in rl.submissions.audit_jobs(10)] == [lease.lease_id]   # left to the trainer
+    rl.close()
+
+
+def test_card_windows_do_not_replay_groups_after_restart(tmp_path, monkeypatch):
+    from reliquary.validator.miner_setup import MinerSetupStore
+    from reliquary.validator.rl_leases import LeaseRequest
+    from reliquary.validator.rl_metrics import CardFeed, controller_metrics
+
+    setups = MinerSetupStore(tmp_path / "setups.sqlite3")
+    rl = components(tmp_path)
+    rl.book.adopt_checkpoint(0)
+    feed = CardFeed(setups)
+    [lease] = rl.book.grant([LeaseRequest("A", ENV, (3,), 0)])[0].leases
+    assert rl.submissions.submit(lease.lease_id, "A", group(8))["verdict"] == "in_zone"
+    rl.submissions.report_training(lease.lease_id, rollout_match=[1.0] * 16, accepted=True)
+    first_end = time.time() + 1
+    first = controller_metrics(rl, first_end, cards=feed)
+    assert first["cards/undeclared/groups"] == 1
+    monkeypatch.setattr(time, "time", lambda: first_end + 1)
+    restarted = CardFeed(setups)
+    after = controller_metrics(rl, first_end + 2, cards=restarted)
+    assert first_end <= after["cards/window_start"] <= after["_timestamp"]
+    assert after["cards/undeclared/groups"] == 0
+    # A backward wall-clock correction produces no negative interval or replay.
+    backward = controller_metrics(rl, first_end, cards=restarted)
+    assert backward["cards/window_start"] == backward["_timestamp"] == first_end
+    forward = controller_metrics(rl, first_end + 3, cards=restarted)
+    assert forward["cards/window_start"] == after["_timestamp"]
+    rl.close()
+
+
+@pytest.mark.parametrize("judged, expected_groups", [(True, 1), (False, 0), (None, 0)])
+def test_zero_match_quality_preserves_judged_skip_and_legacy_distinction(tmp_path, judged, expected_groups):
+    from reliquary.trainer.rl_link import TrainerLink
+    from reliquary.validator.miner_setup import MinerSetupStore
+    from reliquary.validator.rl_leases import LeaseRequest
+    from reliquary.validator.rl_metrics import CardFeed, controller_metrics
+
+    rl = components(tmp_path)
+    rl.book.adopt_checkpoint(0)
+    feed = CardFeed(MinerSetupStore(tmp_path / "setups.sqlite3"))
+    [lease] = rl.book.grant([LeaseRequest("A", ENV, (3,), 0)])[0].leases
+    assert rl.submissions.submit(lease.lease_id, "A", group(8))["verdict"] == "in_zone"
+    app = FastAPI()
+    app.include_router(build_rl_trainer_router(rl, token=TOKEN))
+    link = TrainerLink("http://testserver", TOKEN, client=TestClient(app), patience_s=0.0)
+    link.report_training(lease.lease_id, rollout_match=[0.0] * 16, accepted=False, judged=judged)
+    raw = rl.book.db.execute("SELECT detail FROM rl_events WHERE kind='untrained'").fetchone()[0]
+    detail = json.loads(raw)
+    assert detail.get("judged") is judged
+    assert ("judged" in detail) is (judged is not None)
+    assert detail["failure_class"] is None
+    assert rl.book.db.execute("SELECT COUNT(*) FROM rl_verdicts WHERE source='training'").fetchone()[0] == 0
+    row = controller_metrics(rl, time.time() + 1, cards=feed)
+    assert row["cards/undeclared/groups"] == expected_groups
+    assert row["cards/undeclared/groups_rejected"] == expected_groups
+    assert row["cards/undeclared/match_weight"] == 16 * expected_groups
+    assert row["cards/undeclared/trained_tokens"] == 0
+    if judged:
+        assert row["cards/undeclared/rejected_ratio"] == 1.0
+        assert row["cards/undeclared/rollout_match_mean"] == 0.0
+    rl.close()
+
+
+@pytest.mark.parametrize("judged", [0, 1, "true"])
+def test_invalid_judged_flag_does_not_consume_a_group(tmp_path, judged):
+    from reliquary.validator.rl_leases import LeaseRequest
+
+    rl = components(tmp_path)
+    rl.book.adopt_checkpoint(0)
+    [lease] = rl.book.grant([LeaseRequest("A", ENV, (3,), 0)])[0].leases
+    assert rl.submissions.submit(lease.lease_id, "A", group(8))["verdict"] == "in_zone"
+    app = FastAPI()
+    app.include_router(build_rl_trainer_router(rl, token=TOKEN))
+    response = TestClient(app).post("/rl/trainer/report", headers={"Authorization": "Bearer " + TOKEN}, json={
+        "lease_id": lease.lease_id, "rollout_match": [0.0] * 16, "accepted": False, "judged": judged})
+    assert response.status_code == 422
+    assert rl.buffer.get(lease.lease_id) is not None
     rl.close()

@@ -39,21 +39,22 @@ class MinerSetupStore:
             "PRIMARY KEY (hotkey, instance_id))")
         self._db.commit()
 
-    def last(self, hotkey: str, instance_id: str) -> tuple[int, float] | None:
-        with self._lock:
-            row = self._db.execute("SELECT at, received_at FROM setups WHERE hotkey=? AND instance_id=?",
-                                   (hotkey, instance_id)).fetchone()
-        return None if row is None else (int(row[0]), float(row[1]))
-
-    def put(self, hotkey: str, instance_id: str, at: int, received_at: float, report: dict) -> None:
-        with self._lock:
+    def put(self, hotkey: str, instance_id: str, at: int, received_at: float, report: dict,
+            *, min_interval_s: float | None = None) -> bool:
+        with self._lock, self._db:
+            self._db.execute("BEGIN IMMEDIATE")
+            if min_interval_s is not None:
+                last = self._db.execute("SELECT at, received_at FROM setups WHERE hotkey=? AND instance_id=?",
+                                        (hotkey, instance_id)).fetchone()
+                if last is not None and (at <= last[0] or received_at - last[1] < min_interval_s):
+                    return False
             self._db.execute("INSERT OR REPLACE INTO setups VALUES (?, ?, ?, ?, ?)",
                              (hotkey, instance_id, at, received_at, json.dumps(report, sort_keys=True)))
             # Bound one hotkey's rows: its oldest instances go first.
             self._db.execute(
                 "DELETE FROM setups WHERE hotkey=? AND instance_id NOT IN (SELECT instance_id FROM setups "
                 "WHERE hotkey=? ORDER BY received_at DESC LIMIT ?)", (hotkey, hotkey, MAX_INSTANCES_PER_HOTKEY))
-            self._db.commit()
+            return True
 
     def rows(self) -> list[dict]:
         with self._lock:
@@ -121,11 +122,10 @@ def build_miner_setup_router(store: MinerSetupStore, *, validator_hotkey: str,
             if why is not None:
                 return refuse(503, "registration_unavailable")
         instance = request.report.instance_id
-        last = await asyncio.to_thread(store.last, request.miner_hotkey, instance)
-        if last is not None and (request.at <= last[0] or now - last[1] < min_interval_s):
+        stored = await asyncio.to_thread(store.put, request.miner_hotkey, instance, request.at, now,
+                                         request.report.model_dump(mode="json"), min_interval_s=min_interval_s)
+        if not stored:
             return refuse(429, "too_frequent", min_interval_s=min_interval_s)
-        await asyncio.to_thread(store.put, request.miner_hotkey, instance, request.at, now,
-                                request.report.model_dump(mode="json"))
         return {"stored": True}
 
     return router

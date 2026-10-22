@@ -684,15 +684,18 @@ class RlSubmissions:
     def report_training(self, lease_id: str, *, rollout_match: Sequence[float], accepted: bool,
                         failure_class: str | None = None, matched_tokens: Sequence[int] | None = None,
                         substitutions: Sequence[Sequence[tuple[int, int]]] | None = None,
-                        now: float | None = None) -> None:
+                        judged: bool | None = None, now: float | None = None) -> None:
         """The trainer's forward judged a buffered group: ``rollout_match`` per rollout (match rate against the
         published checkpoint, §4.6), ``accepted`` the group verdict. An accepted group is payable (P5 pays the
         matched tokens of rollouts above the floor); a rejected one is unpaid, and a ``failure_class`` logs it as a
         failed verdict (the hotkey back in probation).
         ``matched_tokens``: per rollout, the positions equal to the validator's pick (what P5 pays); without it the
-        ledger uses ``floor(match x completion tokens)``. ``substitutions``: per rollout, the suspect mismatches
+        ledger uses ``floor(match x completion tokens)``. ``judged`` is telemetry only: False for a skipped report,
+        True when a ratio was judged, None for an older trainer. ``substitutions``: per rollout, the suspect mismatches
         (``_rewards_hold``); an accepted group whose rewards move is reported untrained, unsanctioned
         (``reward_moved``), so it is not paid. LookupError: not a buffered group."""
+        if judged is not None and not isinstance(judged, bool):
+            raise ValueError("judged must be true, false or null")
         now = float(self.clock()) if now is None else now
         moved = False
         if accepted and substitutions:
@@ -717,6 +720,8 @@ class RlSubmissions:
             # an episode's tool observations are no work of the miner's model: pay counts model tokens only
             detail = {"rollout_match": match, "completion_tokens": model,
                       "checkpoint": group.checkpoint, "environment": group.environment}
+            if judged is not None:
+                detail["judged"] = judged
             if matched_tokens is not None:
                 detail["matched_tokens"] = [int(n) for n in matched_tokens]
             if moved:

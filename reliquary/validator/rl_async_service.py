@@ -303,7 +303,7 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
                                        accepted=bool(b["accepted"]), failure_class=b.get("failure_class"),
                                        matched_tokens=None if matched is None else [int(n) for n in matched],
                                        substitutions=None if subs is None else [[(int(p), int(t)) for p, t in s]
-                                                                                for s in subs])
+                                                                                for s in subs], judged=b.get("judged"))
         return {"ok": True}
 
     def adopt(b: dict) -> dict:
