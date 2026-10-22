@@ -15,7 +15,7 @@ from reliquary.corpus.job import parse_job
 from reliquary.environment import agentic_swe
 from tests.unit.test_corpus_job_episode import _episode, _manifest
 from tests.unit.test_corpus_job_signed_sandbox import signed_episode
-from tests.unit.test_harness_goldens import TOKENIZERS
+from tests.unit.harness_tokenizers import TOKENIZERS
 
 
 def _pin(spec):

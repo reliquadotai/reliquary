@@ -506,7 +506,8 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
                      start: int = 0, count: int | None = None, sample: int | None = None,
                      seed: int | None = None, set_id: str | None = None,
                      taskset_args: dict | None = None,
-                     protocol: dict | None = None,
+                     protocol: dict | None = None, bridge: dict | None = None,
+                     open_bridged: Callable[..., Any] | None = None,
                      open_environment: Callable[[str, str], Any] = open_source,
                      open_taskset: Callable[..., Any] | None = None,
                      clock: Callable[[], float] = time.time) -> dict:
@@ -514,7 +515,11 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
 
     A catalog environment at any split, or ``verifiers:<taskset-id>``: an
     installed single-turn Verifiers taskset under ``taskset_args``. The four
-    held-out presets keep `build_set`, whose sets the platform already holds."""
+    held-out presets keep `build_set`, whose sets the platform already holds.
+
+    A bridged eval env (``corpus.job.BRIDGED_EVAL_PACKAGES``, e.g. reliquary-terminal)
+    needs ``bridge``, ``{"options", "image_lock_sha256"}`` as the gateway serves it: its
+    rows are references to the tasks that env serves at ``split``."""
     from reliquary.eval import verifiers_source
 
     if start < 0 or (count is not None and count <= 0):
@@ -529,9 +534,25 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
             protocol=protocol)
     if taskset_args:
         raise ValueError("taskset args belong to a Verifiers source")
+    from reliquary.corpus.job import BRIDGED_EVAL_PACKAGES
     from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
 
-    if source == SWE_SOURCE:
+    bridged = None
+    if (source in BRIDGED_EVAL_PACKAGES) != (bridge is not None):
+        raise ValueError(f"a bridge belongs to a bridged eval env ({sorted(BRIDGED_EVAL_PACKAGES)}), "
+                         "and one needs it")
+    if source in BRIDGED_EVAL_PACKAGES:
+        if not split:
+            raise ValueError(f"{source!r} needs the split its gateway serves")
+        if set(bridge) != {"options", "image_lock_sha256"}:
+            raise ValueError("bridge must be {options, image_lock_sha256}")
+        if open_bridged is None:
+            from reliquary.environment.agentic_swe import bridged_source_for as open_bridged
+
+        bridged = open_bridged(source, split, bridge)
+        spec, profile, interaction, environment = None, None, "signed_bridged", None
+        length_of = lambda _split: len(bridged)  # noqa: E731
+    elif source == SWE_SOURCE:
         from reliquary.environment import bridged_swe
 
         spec, profile, interaction, environment = None, None, "swe", None
@@ -573,6 +594,7 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
         # A reference: the task is rebuilt from (split, index) by whoever runs it, and
         # must carry this id. `grading.jsonl` holds the same row.
         instance_id = (bridged_swe.instance_id_of(split, index) if interaction == "swe"
+                       else bridged.instance_id(index) if bridged is not None
                        else str(environment.get_task(index).id))
         if not instance_id:
             raise ValueError(f"{source!r}:{split} row {index} has no instance id")
@@ -603,7 +625,12 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
     if interaction != INTERACTION:
         card["renderer_id"] = getattr(spec, "renderer_id", None)
         card["env_manifest"] = (bridged_swe.package_version() if interaction == "swe"
+                                else bridged.identity if bridged is not None
                                 else getattr(spec, "environment_manifest_sha256", None))
+    if bridged is not None:
+        card["bridge"] = {"options": dict(bridge["options"]),
+                          "image_lock_sha256": bridge["image_lock_sha256"],
+                          "options_sha256": bridged.options_sha256, "env_package": bridged.identity}
     return _write_set(directory, prompts, grading, card, protocol=protocol,
                       reference_only=interaction != INTERACTION)
 

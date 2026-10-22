@@ -368,6 +368,10 @@ class SignedSweEpisodeRunner:
         self._generate_url, self._sampling = generate_url, sampling
         self._harness_env = dict(harness_env or {})
         self._source = source or job_signed_source(job)
+        if getattr(getattr(job, "episode", None), "is_bridged", False):
+            # A bridged eval env's graded state is the gateway's archive, not a diff:
+            # the reward the gateway signs is the whole result, so none is submitted.
+            self.requires_text_state = False
         self._runner_factory = runner_factory
         self._clock, self._new_request_id, self._sleep = clock, new_request_id, sleep
         self._monotonic = monotonic

@@ -182,7 +182,11 @@ class SignedEpisodeIntake(EpisodeIntake):
                                     calls=result.calls, offered=opened.tools, final=final)
         except TrajectoryRefused as refused:
             return IntakeRefusal(refused.reason, refused.detail)
-        if not state_matches(final.state_sha256, trajectory.final_diff):
+        if getattr(episode, "is_bridged", False):
+            # A bridged eval env submits no state: the reward the gateway signs is its result.
+            if trajectory.final_diff:
+                return IntakeRefusal(REASON_SANDBOX_STATE_MISMATCH, {"final_diff": "submitted"})
+        elif not state_matches(final.state_sha256, trajectory.final_diff):
             return IntakeRefusal(REASON_SANDBOX_STATE_MISMATCH, {"state_sha256": final.state_sha256})
         refusal = self._shape_refusal(trajectory, spans, prompt_ids)
         if refusal is not None:

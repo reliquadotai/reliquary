@@ -354,7 +354,14 @@ def wire_signed_job(w, *, services: SandboxServices, routes: Callable[[], Any],
         return False if check is None else bool(await check(hotkey))
 
     rows = job_row_map(job)                   # resolved once: the view keeps it
-    resolve_task = resolver_factory(rows.split).resolve
+    if getattr(job.episode, "is_bridged", False) and resolver_factory is SweTaskResolver:
+        # A bridged eval env: the image and limits of the env the gateway serves, with
+        # its options and lock digests (`episode.bridge`).
+        from reliquary.environment.agentic_swe import episode_bridged_source
+
+        resolve_task = episode_bridged_source(job.episode).resolve
+    else:
+        resolve_task = resolver_factory(rows.split).resolve
     if not rows.is_identity:
         resolve_row = resolve_task
 

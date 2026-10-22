@@ -154,7 +154,7 @@ def single_turn_messages(messages) -> tuple[str | None, str] | None:
     return None
 
 
-REFERENCE_INTERACTIONS = frozenset({"episode", "swe"})
+REFERENCE_INTERACTIONS = frozenset({"episode", "swe", "signed_bridged"})
 """Sets whose rows name a source row instead of carrying rendered messages: the job
 rebuilds the task from ``(split, source_index)`` and checks it is ``instance_id``."""
 
@@ -174,7 +174,7 @@ def reference_of(row: Mapping) -> tuple[str, int, str] | None:
 
 def set_interaction(rows: Sequence[Mapping]) -> str:
     """``"single_turn"`` (rows without an ``interaction``, or saying so), ``"episode"``
-    or ``"swe"``: the one interaction of the set. A mix, an unknown interaction or no
+    ``"swe"`` or ``"signed_bridged"`` (a bridged env on the signed sandbox): the one interaction of the set. A mix, an unknown interaction or no
     row at all is refused: a set is rendered, replayed and graded one way."""
     if not rows:
         raise ValueError("a set holds no row")

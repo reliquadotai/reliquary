@@ -334,3 +334,30 @@ Before the first run, in order:
    miner would mine the wrong rows), `jobs create --eval-set ... --episode-file ...`,
    miners with `mine-agentic --validator-hotkey <validator-ss58>`, validator on a
    card, `eval grade`, `eval compare`, retire, stop.
+
+## 9. Other bridged envs: TMax `tmax_sft` (signed sandbox)
+
+**Status: not run yet.** An eval job may run a bridged env other than `reliquary-swe`
+(`corpus.job.BRIDGED_EVAL_PACKAGES`, today `reliquary-terminal`): signed sandbox and
+eval only. Its episode carries `bridge`, the options its gateway serves the env with
+and the digest of its image lock, and every side reads the env through
+`BridgedEpisodeSource`, as an RL run does. The contract environment is
+`reliquary_agentic_signed_v1`; the score is the gateway's signed final reward. No
+graded state is submitted (TMax's is an archive, not a diff).
+
+`tmax_sft` is held out: SFT v3 had no TMax episodes and the RL trains `tmax_rl`.
+Never train on it.
+
+1. Set: `reliquary eval build-set --source reliquary-terminal --split tmax_sft
+   --sample 200 --seed 7 --bridge-file bridge.json --out <dir>`, with
+   `bridge.json` = `{"options": {"tools": ["bash"], "splits": {"tmax_sft":
+   {"split": "tmax_sft"}}}, "image_lock_sha256": "<lock>"}`, on a host with the
+   gateways' `reliquary-terminal` installed (non-editable).
+2. Episode file: as a signed SWE one, with `env.package` `reliquary-terminal`,
+   `env.split` `tmax_sft`, `sandbox.tools` `["bash"]`, `sandbox.env_package` the
+   gateway's identity, and the same `bridge` as the set.
+3. A gateway serving `reliquary-terminal` with exactly `bridge.options` (its
+   `env_options_sha256` must match): not an RL gateway, whose options serve
+   `tmax_rl`. The TMax base image on it.
+4. Then as section 7: publish, `jobs create --eval-set ... --episode-file ...`,
+   miners and validator on a release with this path, `eval grade`.

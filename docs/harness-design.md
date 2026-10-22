@@ -27,7 +27,7 @@ Tags: **DECIDED** (the user agreed), **DONE** (on the branches, tested), **PROPO
 
 | Step | Where | What | Evidence |
 |---|---|---|---|
-| 0 | Catalyst `6c6d331d` | Goldens frozen from the old code, for two tokenizers (qwen38 `cd79c4a4…`, Teutonic `422fa182…`). (a) The validator's render: SWE signed bash+edit, a `context_length` stop on a capped turn, SWE corpus with the network notice, TMax bash only, 13 real model turns from smoke3, EnvScaler v2 ChatML. (b) The miner's loop at the generate endpoint: verifiers' real bash harness under its train client, against the real gateway over FakeBoxes, in six scenarios (honest, `max_turns`, `episode_closed`, `context_length`, capped turn, bash only). | `tests/unit/test_harness_goldens.py`, `tests/unit/test_harness_episode_parity.py` (`RUN_VERIFIERS_BRIDGE=1` replays verifiers: identical) |
+| 0 | Catalyst `6c6d331d` | Goldens frozen from the old code, for two tokenizers (qwen38 `cd79c4a4…`, Teutonic `422fa182…`). (a) The validator's render: SWE signed bash+edit, a `context_length` stop on a capped turn, SWE corpus with the network notice, TMax bash only, 13 real model turns from smoke3, EnvScaler v2 ChatML. (b) The miner's loop at the generate endpoint: verifiers' real bash harness under its train client, against the real gateway over FakeBoxes, in six scenarios (honest, `max_turns`, `episode_closed`, `context_length`, capped turn, bash only). | Goldens checked then removed (raw outputs, not kept in the repo) |
 | 1 | sandbox `753b208` | `reliquary_harness`: `spec` (HarnessSpec, canonical JSON, digest, `digest_refusal`, `BASH_VF_B2E4E81`), `qwen` (QwenTurnRenderer moved), `engine` (one turn, as the train client sends it), `loop` (the episode loop and its stops), `variant` (the seed draw). The verifiers files it reproduces are vendored (MIT) and pinned by sha256. | `harness/tests/`: parity with upstream (never skipped), goldens, loop, spec |
 | 2 | Catalyst `c31bcdb3` | `agentic_swe.py` loses its copies (prompt, tools, filter, notice, QwenTurnRenderer). It re-exports the spec under the old names. `HARNESS_DIGEST` pins the spec, and `harness_refusal` refuses SWE and signed jobs on another digest. | goldens identical; `test_harness_pin.py` (never skipped) |
 | 3 | Catalyst `2a3a4bea` | `miner/harness_episode.py`: `HarnessEpisodeRunner` replaces `SandboxEpisodeRunner` for signed corpus and RL episodes (`SignedSweEpisodeRunner._default_runner`). verifiers no longer runs the miner's loop. | the six recorded scenarios are reproduced exactly at the generate endpoint (prompt ids, sampling params, session, stop, signed calls, final, refusals) |
@@ -389,8 +389,7 @@ tokenizers):
 - reliquary-harness: `test_spec`, `test_qwen_goldens`, `test_upstream_parity` (never skipped),
   `test_variants`, `test_loop`, `test_mini` (with the reasoning-closed turn and the renderers
   release refusal): green.
-- Catalyst: `test_harness_goldens` (13), `test_harness_episode_parity` (13, plus 12 that replay
-  verifiers when `RUN_VERIFIERS_BRIDGE=1`), `test_harness_episode`, `test_harness_pin`,
+- Catalyst: `test_harness_episode`, `test_harness_pin`,
   `test_harness_contract` (12), `test_harness_variants_e2e` (5), `test_harness_mini_e2e`,
   `test_rl_async_episodes` (17), `test_episode_inertness`, `test_episode_protocol`,
   `test_episode_group_miner`, `test_rl_episode_miner_side`, `test_service_episode_wire`:

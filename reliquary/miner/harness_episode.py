@@ -13,9 +13,7 @@ its offered tools, then `reliquary_harness.loop.play` with
   (the signed record's rendering, or a refusal's text),
 
 then finish the episode and fetch its transcript. What goes on the wire, turn by turn, is
-what verifiers b2e4e81's bash harness under its train client sent
-(`tests/unit/test_harness_episode_parity.py` holds the two equal at the generate
-endpoint); the result has `SandboxEpisodeResult`'s shape, so `SignedSweEpisodeRunner`
+what verifiers b2e4e81's bash harness under its train client sent; the result has `SandboxEpisodeResult`'s shape, so `SignedSweEpisodeRunner`
 settles it unchanged.
 """
 

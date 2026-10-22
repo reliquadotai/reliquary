@@ -70,7 +70,7 @@ jobs:
         test_rl_yield test_rl_yield_wiring test_sandbox_dependency
         test_sandbox_directory test_sandbox_fleet test_sandbox_routes
         test_sandbox_sessions test_signed_episode_e2e test_signed_episode_environment
-        test_signed_grading_and_wiring test_signed_intake test_signed_miner
+        test_signed_grading_and_wiring test_signed_intake test_signed_miner test_signed_bridged_eval
         test_signed_parse test_signed_state test_signed_wire
         test_tasks_create_composed test_admin_eval_sandbox test_evaluation_sessions
         test_eval_signed_agentic test_eval_signed_policy test_eval_signed_limits test_eval_model_wire

@@ -19,7 +19,7 @@ from reliquary.validator.rl_async_episodes import (
     async_episode_policy, load_episode_environment, validate_episode_block,
 )
 from tests.unit.episode_v2_fixtures import EPISODE, episode_block, episode_contract_dict
-from tests.unit.test_harness_goldens import TOKENIZERS
+from tests.unit.harness_tokenizers import TOKENIZERS
 
 
 def _pin(spec, **extra):

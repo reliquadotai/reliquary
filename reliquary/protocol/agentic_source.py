@@ -36,10 +36,31 @@ AGENTIC_SWE_BODY = EnvironmentProfile(
     environment_contract_id=AGENTIC_SWE_CONTRACT_ID,
     environment_manifest_sha256=AGENTIC_SWE_MANIFEST_SHA256,
 )
+# An eval job on a bridged env other than reliquary-swe (corpus.job.BRIDGED_EVAL_PACKAGES).
+AGENTIC_SIGNED_ENVIRONMENT = "reliquary_agentic_signed_v1"
+AGENTIC_SIGNED_CONTRACT_ID = "reliquary/agentic-signed/v1"
+AGENTIC_SIGNED_MANIFEST = {
+    "contract": AGENTIC_SIGNED_CONTRACT_ID,
+    "rows": "the eval set's references to tasks of the bridged env episode.env.package names, "
+            "at episode.env.split, as the gateway serves it with episode.bridge",
+    "rendering": "episode.renderer over the bash harness system turn, the tools "
+                 "episode.sandbox.tools names, and the task prompt; one assistant span per model turn",
+    "grading": "the reward of the signed sandbox's graded final record",
+}
+AGENTIC_SIGNED_MANIFEST_SHA256 = hashlib.sha256(json.dumps(
+    AGENTIC_SIGNED_MANIFEST, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+AGENTIC_SIGNED_BODY = EnvironmentProfile(
+    max_new_tokens=8192,
+    bft=None,
+    answer_format="text",
+    prompt_template=PromptTemplateProfile("reliquary-agentic-signed-prompt-v1", "$problem"),
+    environment_contract_id=AGENTIC_SIGNED_CONTRACT_ID,
+    environment_manifest_sha256=AGENTIC_SIGNED_MANIFEST_SHA256,
+)
 AGENTIC_BODIES: Mapping[str, EnvironmentProfile] = MappingProxyType(
-    {AGENTIC_SWE_ENVIRONMENT: AGENTIC_SWE_BODY})
+    {AGENTIC_SWE_ENVIRONMENT: AGENTIC_SWE_BODY, AGENTIC_SIGNED_ENVIRONMENT: AGENTIC_SIGNED_BODY})
 
-__all__ = ["AGENTIC_BODIES", "AGENTIC_SWE_BODY", "AGENTIC_SWE_CONTRACT_ID", "suite_episode_body",
+__all__ = ["AGENTIC_BODIES", "AGENTIC_SIGNED_BODY", "AGENTIC_SIGNED_ENVIRONMENT", "AGENTIC_SWE_BODY", "AGENTIC_SWE_CONTRACT_ID", "suite_episode_body",
            "AGENTIC_SWE_ENVIRONMENT", "AGENTIC_SWE_MANIFEST", "AGENTIC_SWE_MANIFEST_SHA256"]
 
 
