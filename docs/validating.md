@@ -180,6 +180,22 @@ RELIQUARY_PROOF_CAPACITY_MANIFEST=/root/reliquary/state/proof-capacity.json
 RELIQUARY_PROOF_CAPACITY_MANIFEST_SHA256=<64-lowercase-hex>
 ```
 
+### Application startup without weight submission
+
+Use `reliquary validate --no-set-weights` to run the validator application
+without its background weight setter. This applies to both window-based and
+async RL. Without an explicit choice, RL validators still start the setter;
+corpus validators leave it off. Use `--set-weights` to enable it explicitly.
+`--no-train --no-set-weights` is rejected before startup because weight-only
+mode has no application to run.
+
+These are direct CLI arguments; `docker/entrypoint.sh` does not forward
+arguments appended to the container command.
+
+This option controls weight submission only. It does not disable checkpoint
+publication, application writes, or axon advertisement when `--external-ip`
+is supplied. DRAIN admission control remains independent of weight submission.
+
 ### Proof slots (several proof processes per GPU)
 
 `RELIQUARY_PROOF_SLOTS_PER_DEVICE` (default `1`) runs more than one proof
