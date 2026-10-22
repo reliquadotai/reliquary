@@ -34,7 +34,7 @@ def model_client(generator, *, task, source, deadline, seed, cli_bridge=None):
     from verifiers.v1.clients.client import RelayReply
     from verifiers.v1.clients.train import message_to_wire, tool_to_wire
     from verifiers.v1.types import Response, TurnTokens
-    from reliquary.eval.model_wire import completion_events, native_completion
+    from reliquary.eval.model_wire import completion_events, native_completion, restore_local_thinking
 
     model = task["model"]["repo"] + "@" + task["model"]["revision"]
     limits = task["protocol"]
@@ -61,6 +61,7 @@ def model_client(generator, *, task, source, deadline, seed, cli_bridge=None):
             if len(body.get("tools") or []) != len(request.tools or []):
                 raise ValueError("signed harness offered unsupported native tools")
             messages = [message_to_wire(message) for message in (turn.prompt if turn is not None else request.messages)]
+            messages = restore_local_thinking(messages, dialect)
             tools = [tool_to_wire(tool) for tool in request.tools] if request.tools else None
             if digest(tools or []) != source["tools_sha256"]:
                 raise ValueError("signed harness tool schemas changed")

@@ -5,6 +5,33 @@ from __future__ import annotations
 import json
 
 
+def restore_local_thinking(messages: list[dict], dialect) -> list[dict]:
+    """Restore only the thinking block emitted by this local Anthropic envelope.
+
+    The pinned parser retains that block as provider state, which its wire helper
+    otherwise sends to the renderer under a different reasoning field.
+    """
+    from verifiers.v1.dialects import AnthropicDialect
+
+    if type(dialect) is not AnthropicDialect:
+        return messages
+    restored = []
+    for message in messages:
+        if "reasoning_details" in message:
+            blocks = message["reasoning_details"]
+            if (message.get("role") != "assistant" or "reasoning_content" in message
+                    or not isinstance(blocks, list) or len(blocks) != 1
+                    or not isinstance(blocks[0], dict)
+                    or set(blocks[0]) != {"type", "thinking", "signature"}
+                    or blocks[0]["type"] != "thinking" or blocks[0]["signature"] != ""
+                    or not isinstance(blocks[0]["thinking"], str) or not blocks[0]["thinking"]):
+                raise ValueError("unsupported local thinking state")
+            message = {key: value for key, value in message.items() if key != "reasoning_details"}
+            message["reasoning_content"] = blocks[0]["thinking"]
+        restored.append(message)
+    return restored
+
+
 def native_completion(response, dialect) -> dict:
     from verifiers.v1.clients.train import serialize_completion
     from verifiers.v1.dialects import AnthropicDialect, ChatDialect, ResponsesDialect

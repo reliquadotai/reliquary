@@ -143,6 +143,73 @@ async def test_local_token_count_never_invokes_inference_or_forwards_an_aux_requ
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_local_thinking_survives_native_tool_history_before_the_next_render(stream):
+    import copy
+
+    from reliquary.eval.model_wire import native_completion
+
+    tools = [{"type": "function", "function": {"name": "signed_bash", "description": "",
+                                               "parameters": {"type": "object"}}}]
+    body = {"model": MODEL, "max_tokens": 64, "messages": BODY["messages"],
+            "tools": [{"name": "signed_bash", "input_schema": {"type": "object"}}]}
+
+    class StrictBridge:
+        capability = SimpleNamespace(protocol_id="signed-claude-code-cli-v1",
+                                     require_model_tools=lambda offered: None)
+        history = copy.deepcopy(BODY["messages"])
+
+        def validate_messages(self, messages):
+            assert messages == self.history
+
+        def register_turn(self, turn, calls, *, assistant_message):
+            self.history.append(assistant_message)
+
+    class ThinkingGenerator(Generator):
+        def render_messages(self, messages, **kwargs):
+            assert kwargs["thinking"] is True
+            if self.calls:
+                assert messages[-2]["reasoning_content"] == "complete sampled thought"
+                assert "reasoning_details" not in messages[-2]
+            return [1, 2]
+
+        def generate_turn(self, ids, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return {"token_ids": [17], "finish_reason": "tool_calls", "message": {
+                    "content": None, "reasoning_content": "complete sampled thought", "tool_calls": [
+                        {"id": "call_1", "name": "signed_bash", "arguments": "{}"}]}}
+            return {"token_ids": [18], "finish_reason": "stop", "message": {"content": "done"}}
+
+    bridge, generator, dialect = StrictBridge(), ThinkingGenerator(), AnthropicDialect()
+    client = model_client(generator, task={**TASK, "thinking": True},
+        source={**SOURCE, "tools_sha256": digest(tools)},
+        deadline=time.monotonic() + 10, seed=7, cli_bridge=bridge)
+    if stream:
+        reply = await client.relay(dialect, body)
+        parser = dialect.stream_parser()
+        async for chunk in reply.chunks:
+            parser.feed(chunk)
+        await reply.close()
+        first = parser.finish()
+    else:
+        reply = await client.get_response(dialect, body, None)
+        first = dialect.parse_response(dialect.validate_response(reply.raw))
+    raw = native_completion(first, dialect)
+    bridge.history.append({"role": "tool", "tool_call_id": "call_1", "content": "signed output"})
+    next_body = {**body, "messages": [*body["messages"],
+        {"role": "assistant", "content": raw["content"]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_1", "content": "signed output"}]}]}
+    changed = copy.deepcopy(next_body)
+    changed["messages"][-2]["content"][0]["thinking"] = "changed thought"
+    with pytest.raises(AssertionError):
+        await client.get_response(dialect, changed, None)
+    assert generator.calls == 1
+    assert (await client.get_response(dialect, next_body, None)).message.content == "done"
+    assert generator.calls == client.turns == 2
+
+
+@pytest.mark.asyncio
 async def test_native_custom_tools_are_refused_before_normalization_can_drop_them():
     generator = Generator()
     client = local(generator, cli_bridge=Bridge("signed-codex-cli-v1"))
