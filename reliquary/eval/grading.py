@@ -598,7 +598,8 @@ class JobRows:
 
 
 # What graded an episode set's samples, by the set's interaction.
-EPISODE_SCHEMES = {"episode": "suite-replay", "swe": "signed-sandbox"}
+EPISODE_SCHEMES = {"episode": "suite-replay", "swe": "signed-sandbox",
+                   "signed_bridged": "signed-sandbox"}
 
 
 def episode_score(document: Mapping) -> float | None:

@@ -1473,16 +1473,37 @@ def _eval_job_source(*, job_id, eval_set, prompt_count, prompt_start, renderer_i
         from reliquary.protocol.agentic_source import AGENTIC_SWE_ENVIRONMENT
 
         environment = AGENTIC_SWE_ENVIRONMENT   # as for a signed corpus job
+    elif interaction == "signed_bridged":
+        from reliquary.protocol.agentic_source import AGENTIC_SIGNED_ENVIRONMENT
+
+        environment = AGENTIC_SIGNED_ENVIRONMENT
     else:
         environment = contract_environment_for(card)
     return source.name, count, environment, seed
+
+
+def _refuse_bridge_disagreeing_with_set(card, episode, env):
+    """A bridged eval env's episode serves the set's package, at the identity, options and
+    image lock the set was frozen from."""
+    bridge, frozen = episode.get("bridge"), card.get("bridge") or {}
+    sandbox = episode.get("sandbox") if isinstance(episode.get("sandbox"), dict) else {}
+    if env.get("package") != card["source"]:
+        raise ValueError(f"the set's environment is {card['source']!r}, the episode names "
+                         f"{env.get('package')!r}")
+    if not isinstance(bridge, dict) or {k: bridge.get(k) for k in ("options", "image_lock_sha256")} \
+            != {k: frozen.get(k) for k in ("options", "image_lock_sha256")}:
+        raise ValueError("the episode's bridge (options, image lock) is not the one the set "
+                         "was frozen from")
+    if sandbox.get("env_package") != frozen.get("env_package"):
+        raise ValueError(f"the set was frozen from {frozen.get('env_package')!r}, the episode "
+                         f"pins {sandbox.get('env_package')!r}")
 
 
 def _refuse_episode_disagreeing_with_set(card, eval_set, episode, renderer_id):
     """A set of references is played by an episode job whose environment, split and
     renderer are the set's own: anything else would grade other tasks than the set names."""
     interaction = card["interaction"]
-    if interaction not in ("episode", "swe"):
+    if interaction not in ("episode", "swe", "signed_bridged"):
         raise ValueError(f"set {eval_set} holds {interaction!r} problems: no eval job plays them")
     if not isinstance(episode, dict):
         raise ValueError(f"set {eval_set} holds {interaction} tasks: pass the episode that plays "
@@ -1491,10 +1512,12 @@ def _refuse_episode_disagreeing_with_set(card, eval_set, episode, renderer_id):
     if env.get("split") != card["split"]:
         raise ValueError(f"the set's split is {card['split']!r}, the episode names "
                          f"{env.get('split')!r}")
-    if interaction == "swe":
+    if interaction in ("swe", "signed_bridged"):
         if episode.get("execution") != "signed_sandbox":
             raise ValueError("an eval job on SWE runs in the signed sandbox: the episode's "
                              f"execution is {episode.get('execution')!r}, not 'signed_sandbox'")
+        if interaction == "signed_bridged":
+            _refuse_bridge_disagreeing_with_set(card, episode, env)
         return
     if episode.get("harness") != "suite":
         raise ValueError(f"set {eval_set} holds suite episode tasks: the episode's harness is "
@@ -2287,6 +2310,9 @@ def eval_build_set(
         help="single_turn, episode (telecom benchmark), or signed_episode (reviewed sandbox source)"),
     episode_config: str | None = typer.Option(None, "--episode-config",
         help="Reviewed episode source configuration JSON file; no secret command arguments"),
+    bridge_file: str | None = typer.Option(None, "--bridge-file",
+        help="A bridged eval env's source (e.g. reliquary-terminal): JSON {options, "
+             "image_lock_sha256}, as its gateway serves it"),
 ) -> None:
     """Freeze problems into a set: prompts.jsonl, grading.jsonl, set.json.
 
@@ -2315,6 +2341,8 @@ def eval_build_set(
                 seed=seed, episode_config=config, set_id=set_id, protocol=reviewed)
         elif episode_config is not None:
             raise ValueError("--episode-config requires an episode interaction")
+        elif bridge_file is not None and preset is not None:
+            raise ValueError("--bridge-file goes with --source")
         elif preset is not None:
             if count is None or seed is None or sample is not None or start or split \
                     or taskset_args:
@@ -2325,9 +2353,12 @@ def eval_build_set(
             args = json.loads(taskset_args) if taskset_args else None
             if args is not None and not isinstance(args, dict):
                 raise ValueError("--taskset-args must be a JSON object")
+            bridge = json.loads(Path(bridge_file).read_text()) if bridge_file else None
+            if bridge is not None and not isinstance(bridge, dict):
+                raise ValueError("--bridge-file must hold a JSON object")
             card = sets.build_source_set(source, out=out, split=split, start=start,
                                          count=count, sample=sample, seed=seed,
-                                         set_id=set_id, taskset_args=args,
+                                         set_id=set_id, taskset_args=args, bridge=bridge,
                                          open_environment=sets.open_source, protocol=reviewed)
     except (ValueError, OSError, KeyError) as exc:
         typer.echo(f"error: {exc}", err=True)
