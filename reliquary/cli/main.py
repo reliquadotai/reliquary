@@ -14,6 +14,7 @@ import threading
 import time as _time
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Optional
 
 import typer
 
@@ -4428,12 +4429,14 @@ def validate(
         ),
     ),
     log_level: str = typer.Option("INFO", help="Log level"),
-    set_weights: bool = typer.Option(
-        False, "--set-weights/--no-set-weights",
-        help="Corpus tasks only: also set weights from this process. Off by default: the RL validator's setter already pays every task.",
+    set_weights: Optional[bool] = typer.Option(
+        None, "--set-weights/--no-set-weights",
+        help="Submit weights from this process. Defaults to on for RL, off for corpus tasks; required in --no-train mode.",
     ),
 ):
     """Run Reliquary validator (trainer mode by default; --no-train for weight-only)."""
+    if not train and set_weights is False:
+        raise typer.BadParameter("--no-set-weights requires --train")
     setup_logging(log_level)
     logger = logging.getLogger("reliquary.cli")
 
@@ -4532,7 +4535,7 @@ def validate(
                         jobs=[(c.entry, c.emission_cap) for c in corpus_configs],
                         wallet=wallet, netuid=netuid, signer_client=signer_client,
                         http_host=http_host, http_port=http_port,
-                        set_weights=set_weights,
+                        set_weights=bool(set_weights),
                     )
                 except (RuntimeError, ValueError) as exc:
                     logger.critical("%s; fix the declaration before starting this validator", exc)
@@ -4601,7 +4604,7 @@ def validate(
                         jobs=[(task_config.entry, task_config.emission_cap)],
                         wallet=wallet, netuid=netuid, signer_client=signer_client,
                         http_host=http_host, http_port=http_port,
-                        set_weights=set_weights,
+                        set_weights=bool(set_weights),
                     )
                 except (RuntimeError, ValueError) as exc:
                     logger.critical("%s; fix the declaration before starting this validator", exc)
@@ -4626,16 +4629,18 @@ def validate(
                                     "--rl-async`)")
                     raise typer.Exit(code=4)
                 from reliquary.validator.rl_async_service import run_rl_async_validator
-                from reliquary.validator.weight_only import WeightOnlyValidator
 
                 if _envs_need_grader(declared_entry.env_split or ()):
                     _ensure_grader_running()        # code envs score through the sandboxed grader service
 
-                threading.Thread(
-                    target=lambda: asyncio.run(WeightOnlyValidator(
-                        wallet=wallet, netuid=netuid, signer_client=signer_client).run()),
-                    name="weight-setter", daemon=True,
-                ).start()
+                if set_weights is not False:
+                    from reliquary.validator.weight_only import WeightOnlyValidator
+
+                    threading.Thread(
+                        target=lambda: asyncio.run(WeightOnlyValidator(
+                            wallet=wallet, netuid=netuid, signer_client=signer_client).run()),
+                        name="weight-setter", daemon=True,
+                    ).start()
                 try:
                     await run_rl_async_validator(
                         wallet=wallet, netuid=netuid, signer_client=signer_client, http_host=http_host,
@@ -4981,24 +4986,25 @@ def validate(
             # GRAIL verifier is holding) would stall set_weights too. The
             # weight setter's own subtensor (see WeightOnlyValidator.run)
             # plus its own loop here means neither side can block the other.
-            from reliquary.validator.weight_only import WeightOnlyValidator
+            if set_weights is not False:
+                from reliquary.validator.weight_only import WeightOnlyValidator
 
-            def _run_weight_setter() -> None:
-                try:
-                    worker = WeightOnlyValidator(
-                        wallet=wallet,
-                        netuid=netuid,
-                        signer_client=signer_client,
-                    )
-                    asyncio.run(worker.run())
-                except Exception:
-                    logger.exception("weight-setter thread crashed")
+                def _run_weight_setter() -> None:
+                    try:
+                        worker = WeightOnlyValidator(
+                            wallet=wallet,
+                            netuid=netuid,
+                            signer_client=signer_client,
+                        )
+                        asyncio.run(worker.run())
+                    except Exception:
+                        logger.exception("weight-setter thread crashed")
 
-            threading.Thread(
-                target=_run_weight_setter,
-                name="weight-setter",
-                daemon=True,
-            ).start()
+                threading.Thread(
+                    target=_run_weight_setter,
+                    name="weight-setter",
+                    daemon=True,
+                ).start()
             await service.run(subtensor)
         else:
             from reliquary.validator.weight_only import WeightOnlyValidator
