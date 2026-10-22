@@ -170,7 +170,7 @@ class EvaluationSessions:
     async def open(self, request: EvaluationSessionRequest) -> dict:
         from reliquary.eval.grading import load_sets
         from reliquary.eval.signed_agentic import checkpoint_identity
-        from reliquary.eval.protocol import _envelope, digest, validate_execution, validate_request
+        from reliquary.eval.protocol import SIGNED_HARNESSES, _envelope, digest, validate_execution, validate_request
         from reliquary.sandbox.sessions import EngagementTerms, Refusal, token_validity_s
 
         now = int(self._clock())
@@ -185,7 +185,7 @@ class EvaluationSessions:
         protocol = _envelope(request.model_dump())
         validate_request({**request.model_dump(), **{key: protocol.get(key) for key in
                          ("sampling", "thinking", "max_new_tokens")}})
-        if protocol.get("interaction") != "signed_episode" or protocol.get("harness") != "signed-bash-v1":
+        if protocol.get("interaction") != "signed_episode" or protocol.get("harness") not in SIGNED_HARNESSES:
             raise ValueError("evaluation_harness_unsupported")
         if request.protocol_bindings.get(request.set_id) != request.set_protocol.get("protocol_sha256"):
             raise ValueError("evaluation_set_protocol_changed")
@@ -256,6 +256,9 @@ class EvaluationSessions:
                        tools_version=episode["tools_version"], harness=protocol["harness"],
                        renderer_id=episode["renderer_id"], harness_sha256=card["protocol"]["harness"]["sha256"],
                        episode=card["protocol"]["source"]["episode"], budgets=budget)
+        if protocol["harness"] == "signed-bash-v2":
+            binding.update(max_turns=protocol["max_turns"], max_episode_tokens=protocol["max_episode_tokens"],
+                           evaluation_policy_sha256=episode["evaluation_policy_sha256"])
         binding_sha = digest(binding)
         engagement = _engagement(binding)
         sample_prefix = engagement.rsplit(":", 1)[0] + ":"

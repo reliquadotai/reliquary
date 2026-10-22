@@ -27,15 +27,21 @@ def checkpoint_identity(model: dict) -> str:
     return digest({"schema": "hf-snapshot/v1", **model})
 
 
-def model_client(generator, *, task, source, deadline, seed):
+def model_client(generator, *, task, source, deadline, seed, cli_bridge=None):
     """The pinned harness's existing interception calls the owned local model only."""
     from verifiers.v1.clients import Client
-    from verifiers.v1.dialects import ChatDialect
-    from verifiers.v1.clients.train import message_to_wire, tool_to_wire, serialize_completion
-    from verifiers.v1.types import Response
+    from verifiers.v1.dialects import AnthropicDialect, ChatDialect, ResponsesDialect
+    from verifiers.v1.clients.client import RelayReply
+    from verifiers.v1.clients.train import message_to_wire, tool_to_wire
+    from verifiers.v1.types import Response, TurnTokens
+    from reliquary.eval.model_wire import completion_events, native_completion
 
     model = task["model"]["repo"] + "@" + task["model"]["revision"]
     limits = task["protocol"]
+    dialect_type = (ChatDialect if cli_bridge is None else {
+        "signed-codex-cli-v1": ResponsesDialect,
+        "signed-claude-code-cli-v1": AnthropicDialect,
+    }[cli_bridge.capability.protocol_id])
 
     class LocalClient(Client):
         turns = 0
@@ -45,32 +51,89 @@ def model_client(generator, *, task, source, deadline, seed):
         transcript_tokens = 0
         finish_reason = None
 
-        async def get_response(self, dialect, body, sampling, session_id=None, turn=None, headers=None):
-            if not isinstance(dialect, ChatDialect) or body.get("model") != model:
+        def __init__(self):
+            self._serial = asyncio.Lock()
+
+        def _request(self, dialect, body, turn=None):
+            if type(dialect) is not dialect_type or body.get("model") != model:
                 raise ValueError("signed harness requested another model or dialect")
-            if self.turns >= limits["max_turns"] or time.monotonic() >= deadline:
-                raise TimeoutError("signed episode turn or time budget exhausted")
             request = dialect.parse_request(body)
+            if len(body.get("tools") or []) != len(request.tools or []):
+                raise ValueError("signed harness offered unsupported native tools")
             messages = [message_to_wire(message) for message in (turn.prompt if turn is not None else request.messages)]
             tools = [tool_to_wire(tool) for tool in request.tools] if request.tools else None
             if digest(tools or []) != source["tools_sha256"]:
                 raise ValueError("signed harness tool schemas changed")
-            ids = await asyncio.to_thread(generator.render_messages, messages, tools=tools,
-                thinking=task["thinking"], renderer_id=source["renderer_id"])
-            result = await asyncio.to_thread(generator.generate_turn, ids,
-                max_new_tokens=task["max_new_tokens"], seed=(seed + self.turns) % 2**31,
-                sampling=task["sampling"], absolute_deadline=deadline)
-            self.turns += 1
-            self.generated_spans += ((len(self.token_ids), len(self.token_ids) + len(result["token_ids"])),)
-            self.token_ids += tuple(result["token_ids"])
-            self.transcript_tokens = len(ids) + len(result["token_ids"])
-            self.finish_reason = result["finish_reason"]
-            self.tool_calls += len(result["message"].get("tool_calls") or [])
-            response = Response.model_validate({"id": f"evaluation-turn-{self.turns}", "created": 0,
-                "model": model, "message": result["message"], "finish_reason": result["finish_reason"],
-                "usage": {"prompt_tokens": len(ids), "completion_tokens": len(result["token_ids"])}})
-            response.raw = serialize_completion(response, model)
-            return response
+            if cli_bridge is not None:
+                cli_bridge.capability.require_model_tools(tools or [])
+                cli_bridge.validate_messages(messages)
+            return messages, tools
+
+        async def get_response(self, dialect, body, sampling, session_id=None, turn=None, headers=None):
+            async with self._serial:
+                if self.turns >= limits["max_turns"] or time.monotonic() >= deadline:
+                    raise TimeoutError("signed episode turn or time budget exhausted")
+                messages, tools = self._request(dialect, body, turn)
+                try:
+                    ids = await asyncio.to_thread(generator.render_messages, messages, tools=tools,
+                        thinking=task["thinking"], renderer_id=source["renderer_id"])
+                    remaining = limits["max_episode_tokens"] - len(ids)
+                    if remaining <= 0:
+                        raise ValueError("episode transcript token budget exhausted")
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("signed episode rendering exceeded its deadline")
+                    seed_for_turn = (seed + self.turns) % 2**31
+                    self.turns += 1
+                    maximum = min(task["max_new_tokens"], remaining)
+                    result = await asyncio.to_thread(generator.generate_turn, ids,
+                        max_new_tokens=maximum, seed=seed_for_turn,
+                        sampling=task["sampling"], absolute_deadline=deadline)
+                except asyncio.CancelledError:
+                    generator.close()
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("signed episode inference exceeded its deadline")
+                tokens = result["token_ids"]
+                if len(tokens) > maximum or any(type(token) is not int or token < 0 for token in tokens):
+                    raise ValueError("signed model exceeded its frozen token budget")
+                response = Response.model_validate({"id": f"evaluation-turn-{self.turns}", "created": 0,
+                    "model": model, "message": result["message"], "finish_reason": result["finish_reason"],
+                    "usage": {"prompt_tokens": len(ids), "completion_tokens": len(tokens)}})
+                response.tokens = TurnTokens(prompt_ids=ids, completion_ids=tokens)
+                response.raw = native_completion(response, dialect)
+                if cli_bridge is not None:
+                    cli_bridge.register_turn(self.turns - 1, [
+                        (call.id, call.name, call.arguments) for call in response.message.tool_calls or ()],
+                        assistant_message=message_to_wire(response.message))
+                self.generated_spans += ((len(self.token_ids), len(self.token_ids) + len(tokens)),)
+                self.token_ids += tuple(tokens)
+                self.transcript_tokens = max(self.transcript_tokens, len(ids) + len(tokens))
+                self.finish_reason = result["finish_reason"]
+                self.tool_calls += len(response.message.tool_calls or ())
+                return response
+
+        async def relay(self, dialect, body, session_id=None, headers=None):
+            response = await self.get_response(dialect, body, None, session_id=session_id, headers=headers)
+
+            async def chunks():
+                for chunk in completion_events(response.raw, dialect):
+                    yield chunk
+
+            async def close():
+                pass
+
+            return RelayReply("text/event-stream", chunks(), close)
+
+        async def relay_aux(self, dialect, route, body, headers=None):
+            if type(dialect) is not AnthropicDialect or route != "/v1/messages/count_tokens":
+                raise ValueError("unsupported local auxiliary request")
+            async with self._serial:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("signed episode time budget exhausted")
+                messages, tools = self._request(dialect, body)
+                ids = await asyncio.to_thread(generator.render_messages, messages, tools=tools,
+                    thinking=task["thinking"], renderer_id=source["renderer_id"])
+                return {"input_tokens": len(ids)}
 
     return LocalClient()
 
