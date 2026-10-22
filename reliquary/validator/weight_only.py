@@ -187,8 +187,6 @@ class WeightOnlyValidator:
         connection cannot stall a submission. We open many of these per
         day (one per epoch), and ``initialize`` is cheap (~0.5s).
         """
-        from botocore.exceptions import ClientError
-
         try:
             declared, _ = await read_registry()
         except Exception:
@@ -230,21 +228,27 @@ class WeightOnlyValidator:
                 archives = await storage.list_recent_datasets(
                     current_window=horizon,
                     n=ROLLING_WINDOWS_HISTORY * 3,
+                    strict=True,
                     task_id=task_id,
                     # The replay reads only these; the task comes from the R2 prefix.
                     fields=fields,
                     **extra,
                 )
+                expected_windows = {
+                    w for w in windows_by_task[task_id]
+                    if horizon - ROLLING_WINDOWS_HISTORY * 3 <= w < horizon
+                }
+                if not expected_windows.issubset({a["window_start"] for a in archives}):
+                    logger.error("Listed window archives missing; abstaining from this epoch")
+                    return False
                 # A task whose last window fell out of the shared horizon
                 # contributes nothing, and must not be counted as an
                 # archived task either.
                 if archives:
                     by_task[task_id] = archives
-        except ClientError:
-            # A partial listing would submit a confident vector that pays
-            # only the tasks we managed to see — worse than submitting
-            # nothing. Abstain and let the next epoch retry the listing.
-            logger.exception("Archive listing failed; abstaining from this epoch")
+        except Exception:
+            # Never submit a vector reconstructed from partially read history.
+            logger.exception("Archive read failed; abstaining from this epoch")
             return False
         try:
             periods = await self._period_weights(declared)
