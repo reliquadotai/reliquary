@@ -25,9 +25,10 @@ def main() -> None:
     if not os.environ.get("VISION_TEST_MODEL_DIR"):
         print("Skipped: VISION_TEST_MODEL_DIR is not set.")
         return
-    from PIL import Image
+    from PIL import Image, __version__ as pillow_version
     from reliquary.vision import runner
 
+    assert pillow_version == "13.0.0", pillow_version
     source = Path(os.environ["VISION_TEST_MODEL_DIR"])
     output = Path(os.environ["VISION_TEST_OUTPUT_DIR"])
     if output.is_symlink() or (output.exists() and any(output.iterdir())):
@@ -138,7 +139,7 @@ def main() -> None:
         "profileIdentities": "Explicit synthetic test fixtures, not qualified capacity.",
         "cases": reports,
     })
-    print(json.dumps({"status": "passed", "cases": reports}))
+    print(json.dumps({"status": "passed", "pillowVersion": pillow_version, "cases": reports}))
 
 
 if __name__ == "__main__":
