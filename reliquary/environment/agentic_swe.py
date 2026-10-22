@@ -16,6 +16,7 @@ import json
 import subprocess
 import threading
 from collections.abc import Sequence
+from types import SimpleNamespace
 
 from reliquary_harness import qwen as _harness_qwen
 from reliquary_harness.spec import (
@@ -266,9 +267,10 @@ def episode_support_refusal(episode, *, need_verifiers: bool) -> str | None:
         return f"episode.verifiers {episode.verifiers} is not the supported {SUPPORTED_VERIFIERS}"
     if _renderers_version() != RENDERERS_VERSION:
         return f"renderers {RENDERERS_VERSION} is not installed (found {_renderers_version()})"
-    installed = installed_env_commit()
+    installed = (installed_env_commit() if episode.env.package == "reliquary-swe"
+                 else _dist_commit(episode.env.package))
     if installed != episode.env.version:
-        return (f"reliquary-swe is installed at {installed}, the job pins "
+        return (f"{episode.env.package} is installed at {installed}, the job pins "
                 f"{episode.env.version}")
     if need_verifiers and installed_verifiers_commit() != SUPPORTED_VERIFIERS:
         return (f"verifiers is installed at {installed_verifiers_commit()}, "
@@ -394,6 +396,31 @@ class SignedSweSource:
         return EpisodeTask(id=self.instance_id(index), prompt=self.prompt(index), tools=())
 
 
+def _bridged_source(package: str, version: str, split: str, options_json: str, lock: str):
+    from reliquary.environment.bridged_episode import BridgedEnvConfig, BridgedEpisodeSource
+
+    return BridgedEpisodeSource(BridgedEnvConfig(
+        environment=package, package=f"{package}=={version}", rl_split=split,
+        options=json.loads(options_json), image_lock_sha256=lock))
+
+
+_bridged_sources = functools.lru_cache(maxsize=8)(_bridged_source)
+
+
+def bridged_source_for(package: str, split: str, bridge):
+    """The installed bridged env `package` at `split`, built with the gateway's own options
+    and checked against its image lock (`bridge`), as an RL run builds its bridged envs;
+    one per (package, split, options, lock) and process."""
+    return _bridged_sources(package, importlib.metadata.version(package), split,
+                            json.dumps(bridge["options"], sort_keys=True, separators=(",", ":")),
+                            bridge["image_lock_sha256"])
+
+
+def episode_bridged_source(episode):
+    """The bridged env an eval episode on a non-SWE package reads (`episode.bridge`)."""
+    return bridged_source_for(episode.env.package, episode.env.split, episode.bridge)
+
+
 def job_signed_source(job, *, prompt_of=None, row_of=None) -> SignedSweSource:
     """The one source of a signed-sandbox job, for its intake, grader, export and miner.
 
@@ -403,6 +430,14 @@ def job_signed_source(job, *, prompt_of=None, row_of=None) -> SignedSweSource:
     index, as before. Build it once per job and process: the check reads every row."""
     from reliquary.eval.rows import job_row_map
 
+    if getattr(job.episode, "is_bridged", False) and prompt_of is None and row_of is None:
+        bridged = episode_bridged_source(job.episode)
+
+        def prompt_of(split, index):
+            return bridged.prompt(index)
+
+        def row_of(split, index):
+            return None, SimpleNamespace(instance_id=bridged.instance_id(index))
     source = SignedSweSource(job_row_map(job), prompt_of=prompt_of, row_of=row_of)
     source.check()
     return source
@@ -471,9 +506,14 @@ def sandbox_support_refusal(episode, *, need_bridge: bool = False) -> str | None
     except Exception as exc:  # the bridge refuses an unpinned verifiers with RuntimeError
         return f"the verifiers bridge cannot load: {exc}"
     try:
-        from reliquary.environment import bridged_swe
+        if getattr(episode, "is_bridged", False):
+            if tuple(episode.bridge["options"].get("tools") or ()) != tuple(episode.sandbox.tools):
+                return "episode.bridge.options.tools is not episode.sandbox.tools"
+            episode_bridged_source(episode)
+        else:
+            from reliquary.environment import bridged_swe
 
-        bridged_swe.bridged_env()
+            bridged_swe.bridged_env()
     except Exception as exc:  # e.g. an editable install: the bridge serves packaged tasksets only
         return f"the bridge cannot serve the installed {package} ({type(exc).__name__}: {exc})"
     return None

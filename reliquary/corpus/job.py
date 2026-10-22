@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import json
 import re
 from typing import Any
 
@@ -89,10 +90,16 @@ SUITE_STOPS = ("agent_completed", "max_turns")
 SUITE_ACTION_BYTES = 16 * 1024
 SUITE_BYTES_PER_TOKEN = 5
 MAX_SUITE_TOKENS_PER_TURN = SUITE_ACTION_BYTES // SUITE_BYTES_PER_TOKEN
-EPISODE_ENV_PACKAGES = frozenset({"reliquary-swe", SUITE_PACKAGE})
+SWE_PACKAGE = "reliquary-swe"
+# Envs served through the sandbox's verifiers bridge that an eval job may run besides
+# reliquary-swe: signed only, eval only, read through `episode.bridge` (the gateway's
+# options and image lock), as an RL run reads its bridged envs.
+BRIDGED_EVAL_PACKAGES = frozenset({"reliquary-terminal"})
+EPISODE_ENV_PACKAGES = frozenset({SWE_PACKAGE, SUITE_PACKAGE}) | BRIDGED_EVAL_PACKAGES
 EPISODE_HARNESSES = frozenset({"bash", SUITE_HARNESS})
-# The package each harness runs: never mixed.
-_HARNESS_PACKAGE = {"bash": "reliquary-swe", SUITE_HARNESS: SUITE_PACKAGE}
+# The packages each harness runs: never mixed.
+_HARNESS_PACKAGES = {"bash": frozenset({SWE_PACKAGE}) | BRIDGED_EVAL_PACKAGES,
+                     SUITE_HARNESS: frozenset({SUITE_PACKAGE})}
 _EPISODE_FIELDS = ("env", "harness", "renderer", "verifiers", "max_turns",
                    "max_tokens_per_turn", "max_total_tokens", "replay_fraction_failed")
 _EPISODE_ENV_FIELDS = ("package", "version", "split", "num_images")
@@ -110,7 +117,10 @@ _RENDERER_RE = re.compile(r"\Arenderers:[a-z0-9.]+@\d+\.\d+\.\d+\Z")
 EXECUTION_REPLAY = "replay"
 EXECUTION_SIGNED_SANDBOX = "signed_sandbox"
 EXECUTIONS = frozenset({EXECUTION_REPLAY, EXECUTION_SIGNED_SANDBOX})
-_EPISODE_OPTIONAL_FIELDS = ("execution", "sandbox", "harness_spec")
+_EPISODE_OPTIONAL_FIELDS = ("execution", "sandbox", "harness_spec", "bridge")
+# `bridge` (a bridged eval env's only, so every other manifest hashes as before): the
+# options the gateway serves the env with and the digest of its image lock.
+_BRIDGE_FIELDS = ("options", "image_lock_sha256")
 # `harness_spec` (written only when set, so every manifest that predates it hashes
 # byte-identically): the reliquary-harness spec the bash harness renders with, pinned by
 # digest. Absent, the compatibility harness bash-vf-b2e4e81@1. The binaries check it
@@ -249,10 +259,16 @@ class EpisodeSpec:
     sandbox: SandboxSpec | None = None
     # {"id", "version", "digest"} of the reliquary-harness spec; None: the compatibility one.
     harness_spec: Mapping[str, str] | None = None
+    # A bridged eval env's {"options", "image_lock_sha256"}; None for reliquary-swe and suites.
+    bridge: Mapping[str, Any] | None = None
 
     @property
     def is_suite(self) -> bool:
         return self.harness == SUITE_HARNESS
+
+    @property
+    def is_bridged(self) -> bool:
+        return self.bridge is not None
 
     def to_contract(self) -> dict[str, Any]:
         if self.is_suite:
@@ -270,6 +286,9 @@ class EpisodeSpec:
             contract["sandbox"] = self.sandbox.to_contract()
         if self.harness_spec is not None:
             contract["harness_spec"] = dict(self.harness_spec)
+        if self.bridge is not None:
+            contract["bridge"] = {"options": dict(self.bridge["options"]),
+                                  "image_lock_sha256": self.bridge["image_lock_sha256"]}
         return contract
 
 
@@ -538,9 +557,9 @@ def _parse_episode(raw: Any, eval_job: bool = False) -> EpisodeSpec:
     _check_split(env["split"], eval_job)
     if raw["harness"] not in EPISODE_HARNESSES:
         raise JobError(f"episode.harness must be one of {sorted(EPISODE_HARNESSES)}")
-    if _HARNESS_PACKAGE[raw["harness"]] != env["package"]:
-        raise JobError(f"the {raw['harness']!r} harness runs {_HARNESS_PACKAGE[raw['harness']]!r}, "
-                       f"not {env['package']!r}")
+    if env["package"] not in _HARNESS_PACKAGES[raw["harness"]]:
+        raise JobError(f"the {raw['harness']!r} harness runs "
+                       f"{sorted(_HARNESS_PACKAGES[raw['harness']])}, not {env['package']!r}")
     if not isinstance(raw["renderer"], str) or not _RENDERER_RE.match(raw["renderer"]):
         raise JobError(f"episode.renderer must read renderers:<name>@<version>, got {raw['renderer']!r}")
     if not isinstance(raw["verifiers"], str) or not _COMMIT_RE.match(raw["verifiers"]):
@@ -564,6 +583,15 @@ def _parse_episode(raw: Any, eval_job: bool = False) -> EpisodeSpec:
     harness_spec = None
     if "harness_spec" in raw:
         harness_spec = _parse_harness_spec(raw["harness_spec"], "episode.harness_spec")
+    bridge = None
+    if env["package"] in BRIDGED_EVAL_PACKAGES:
+        if not eval_job or execution != EXECUTION_SIGNED_SANDBOX:
+            raise JobError(f"{env['package']!r} runs only in an eval job on the signed sandbox")
+        if "bridge" not in raw:
+            raise JobError(f"an episode on {env['package']!r} needs episode.bridge")
+        bridge = _parse_bridge(raw["bridge"])
+    elif "bridge" in raw:
+        raise JobError(f"episode.bridge is only for {sorted(BRIDGED_EVAL_PACKAGES)}")
     episode = EpisodeSpec(
         env=EpisodeEnv(package=env["package"], version=env["version"], split=env["split"],
                        num_images=_bounded_int(env, "num_images", 1, 1000, "episode.env")),
@@ -572,9 +600,24 @@ def _parse_episode(raw: Any, eval_job: bool = False) -> EpisodeSpec:
         max_tokens_per_turn=_bounded_int(raw, "max_tokens_per_turn", 1, max_total, "episode"),
         max_total_tokens=max_total,
         replay_fraction_failed=float(fraction),
-        execution=execution, sandbox=sandbox, harness_spec=harness_spec,
+        execution=execution, sandbox=sandbox, harness_spec=harness_spec, bridge=bridge,
     )
     return episode
+
+
+def _parse_bridge(raw: Any) -> dict[str, Any]:
+    raw = _fields(raw, _BRIDGE_FIELDS, "episode.bridge")
+    options = raw["options"]
+    if not isinstance(options, Mapping) or not options:
+        raise JobError("episode.bridge.options must be the gateway's options for the env")
+    try:
+        json.dumps(options, allow_nan=False)
+    except (TypeError, ValueError):
+        raise JobError("episode.bridge.options must be plain JSON") from None
+    lock = raw["image_lock_sha256"]
+    if not isinstance(lock, str) or not _SHA256_RE.match(lock):
+        raise JobError("episode.bridge.image_lock_sha256 must be a 64-hex sha256")
+    return {"options": dict(options), "image_lock_sha256": lock}
 
 
 def parse_harness_spec(raw: Any, where: str) -> dict[str, str]:
