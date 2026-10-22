@@ -8,7 +8,8 @@ import torch
 # Torch loads the shared libraries required by the native extensions.
 import causal_conv1d_cuda
 import flash_attn_2_cuda
-import fla
+from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 
 from reliquary.shared.runtime_fingerprint import collect_runtime_fingerprint
 
@@ -24,10 +25,16 @@ for name, release in expected.items():
     assert installed[name].split("+")[0] == release, installed
 assert torch.version.cuda == "13.0", torch.version.cuda
 profile = collect_runtime_fingerprint()
-for key in (
-    "qwen35_fast_path_all", "qwen35_fla_chunk", "qwen35_fla_recurrent",
-    "qwen35_causal_conv_prefill", "qwen35_causal_conv_update",
-):
-    assert profile[key] is True, (key, profile[key])
+assert all(callable(kernel) for kernel in (
+    causal_conv1d_fn, causal_conv1d_update,
+    chunk_gated_delta_rule, fused_recurrent_gated_delta_rule,
+))
+# Transformers enables these bindings only when a GPU is attached.
+if torch.cuda.is_available():
+    for key in (
+        "qwen35_fast_path_all", "qwen35_fla_chunk", "qwen35_fla_recurrent",
+        "qwen35_causal_conv_prefill", "qwen35_causal_conv_update",
+    ):
+        assert profile[key] is True, (key, profile[key])
 print(json.dumps({"versions": installed, "cuda": torch.version.cuda,
                   "extensionImports": "passed", "gpuExecutionVerified": False}))
