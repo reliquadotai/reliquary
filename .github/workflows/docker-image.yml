@@ -125,8 +125,6 @@ jobs:
             RELIQUARY_INSTALL_LOGIC=${{ (github.event_name == 'push' || inputs.include_logic) && '1' || '0' }}
           secret-files: |
             ${{ (github.event_name == 'push' || inputs.include_logic) && format('logic_wheel={0}/logic-release/{1}', runner.temp, steps.logic.outputs.wheel) || '' }}
-          cache-from: type=gha
-          # The optional CUDA+Logic variant already publishes its image to
-          # GHCR. Exporting its multi-GB cache delayed the candidate job long
-          # after that push completed; leave normal main caching unchanged.
-          cache-to: ${{ github.event_name != 'push' && !inputs.include_logic && 'type=gha,mode=max' || '' }}
+          # Reuse native builds through the image already published to GHCR.
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/reliquary-validator:latest
+          cache-to: type=inline

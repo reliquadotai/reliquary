@@ -4,15 +4,11 @@ FROM ${GRADER_PY_IMAGE} AS grader-rootfs
 
 FROM nvidia/cuda:13.0.0-cudnn-devel-ubuntu24.04
 
-ARG RELIQUARY_BUILD_REVISION=unknown
-ARG RELIQUARY_INSTALL_LOGIC=0
-
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    RELIQUARY_BUILD_REVISION=${RELIQUARY_BUILD_REVISION}
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 RUN apt-get update -qq && apt-get install -y -qq \
         python3.12 python3.12-venv python3-pip \
@@ -50,6 +46,8 @@ RUN CAUSAL_CONV1D_FORCE_BUILD=TRUE MAX_JOBS=1 \
 # Source + install
 WORKDIR /opt/reliquary
 COPY . /opt/reliquary
+ARG RELIQUARY_BUILD_REVISION=unknown
+ENV RELIQUARY_BUILD_REVISION=${RELIQUARY_BUILD_REVISION}
 RUN printf '%s\n' "${RELIQUARY_BUILD_REVISION}" \
       > /opt/reliquary/.build-revision \
  && pip install -e .
@@ -65,6 +63,7 @@ RUN pip install wandb "opentelemetry-api==1.44.0" "opentelemetry-sdk==1.44.0"
 # Explicit candidate variant only. Hash-check before install, then verify the
 # installed artifact/import/reward. A local release candidate can be supplied
 # with --secret id=logic_wheel,src=/absolute/path/to/the/reviewed.whl.
+ARG RELIQUARY_INSTALL_LOGIC=0
 RUN --mount=type=secret,id=logic_wheel,target=/tmp/logic.whl \
     case "${RELIQUARY_INSTALL_LOGIC}" in \
       0) ;; \
