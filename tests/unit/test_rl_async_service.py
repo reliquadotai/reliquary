@@ -658,6 +658,35 @@ def test_the_controller_row_breaks_the_trainer_verdicts_down_per_declared_card(t
     rl.close()
 
 
+def test_a_tagged_group_counts_for_its_miner_process_cards(tmp_path):
+    import time
+
+    from reliquary.validator.miner_setup import MinerSetupStore
+    from reliquary.validator.rl_leases import LeaseRequest
+    from reliquary.validator.rl_metrics import CardFeed, controller_metrics
+
+    now = time.time()
+    setups = MinerSetupStore(tmp_path / "setups.sqlite3")
+    setups.put("M", "c" * 16, int(now), now, {"gpus": [{"name": "NVIDIA H100 80GB HBM3", "id_hash": "1" * 16}]})
+    setups.put("M", "d" * 16, int(now), now, {"gpus": [{"name": "NVIDIA GeForce RTX 4090", "id_hash": "2" * 16}]})
+    rl = components(tmp_path)
+    rl.book.adopt_checkpoint(0)
+    feed = CardFeed(setups)
+    for idx, instance in ((3, "c" * 16), (4, "d" * 16), (5, None), (6, "e" * 16)):   # e: never declared
+        [lease] = rl.book.grant([LeaseRequest("M", ENV, (idx,), 0)])[0].leases
+        assert rl.submissions.submit(lease.lease_id, "M", group(8))["verdict"] == "in_zone"
+        if instance is not None:
+            rl.submissions.tag_instance(lease.lease_id, "M", instance)
+        rl.submissions.report_training(lease.lease_id, rollout_match=[0.99] * 16, accepted=True,
+                                       matched_tokens=[1] * 16)
+    row = controller_metrics(rl, time.time() + 1, cards=feed)
+    # The fleet is still per hotkey (mixed); each tagged group goes to its process's cards, the rest to the hotkey's.
+    assert row["cards/mixed/miners"] == 1 and row["cards/mixed/gpus"] == 2
+    assert row["cards/h100-80gb-hbm3/groups"] == 1 and row["cards/rtx-4090/groups"] == 1
+    assert row["cards/mixed/groups"] == 2
+    rl.close()
+
+
 def test_past_nine_named_cards_the_rest_is_other(tmp_path):
     import time
 

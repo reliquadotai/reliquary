@@ -323,6 +323,22 @@ def test_a_signed_submission_ends_its_lease_and_answers_the_validators_grades(su
     assert unknown.status_code == 404 and unknown.json()["reason"] == "lease_unknown"
 
 
+def test_a_submission_may_name_its_miner_process_for_the_card_census(submitting):
+    from tests.unit.test_rl_submit import ENV as MATH, group
+    from reliquary.validator.rl_leases import LeaseRequest
+
+    book, _, client = submitting
+    tagged, plain = (book.grant([LeaseRequest(MINER.ss58_address, MATH, (i,), 0)])[0].leases[0] for i in (5, 6))
+    malformed = {**submit_body(MINER, tagged.lease_id, group(8)), "instance_id": "NOT-HEX"}
+    assert client.post("/rl/submit", json=malformed).status_code == 422
+    assert book.lease(tagged.lease_id).state == "open"
+    body = {**submit_body(MINER, tagged.lease_id, group(8), at=NOW + 1), "instance_id": "c" * 16}   # unsigned
+    assert client.post("/rl/submit", json=body).status_code == 200
+    assert client.post("/rl/submit", json=submit_body(MINER, plain.lease_id, group(8), at=NOW + 2)).status_code == 200
+    rows = book.db.execute("SELECT lease_id, hotkey, instance_id FROM rl_group_instances").fetchall()
+    assert rows == [(tagged.lease_id, MINER.ss58_address, "c" * 16)]
+
+
 def test_undecodable_tokens_are_refused_before_the_lease_is_touched(submitting):
     from reliquary.protocol.rl_submit import rollouts_digest
     from reliquary.protocol.signatures import build_rl_submit_binding

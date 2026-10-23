@@ -59,14 +59,46 @@ class CardFeed:
         from reliquary.validator.miner_setup import summarize
 
         start = min(now, max(self.since, now - CARD_WINDOW_MAX_S))
-        out = card_metrics(rl, summarize(self.setups.rows(), now=now), now, start, self)
+        rows = self.setups.rows()
+        out = card_metrics(rl, summarize(rows, now=now), now, start, self, instances=instance_classes(rows, now))
         self.since = max(self.since, now)
         return out
 
 
-def card_metrics(rl: Any, summary: list[dict], now: float, start: float, feed: CardFeed) -> dict[str, float]:
+def instance_classes(rows: list[dict], now: float) -> dict[tuple[str, str], str]:
+    """``(hotkey, instance_id)`` -> the card class of that miner process's declared GPUs (``mixed`` if they differ),
+    over the setups seen in ``miner_setup.ACTIVE_WINDOW_S``; the latest report of an instance wins."""
+    from reliquary.validator.miner_setup import ACTIVE_WINDOW_S
+
+    out: dict[tuple[str, str], str] = {}
+    for row in sorted(rows, key=lambda r: r["received_at"]):
+        if now - row["received_at"] > ACTIVE_WINDOW_S:
+            continue
+        classes = {card_class(gpu["name"]) for gpu in row["report"].get("gpus", [])}
+        if classes:
+            out[(row["hotkey"], row["instance_id"])] = classes.pop() if len(classes) == 1 else "mixed"
+    return out
+
+
+def _events(db: Any, since: float, now: float) -> list[tuple]:
+    """``(at, hotkey, kind, detail, instance_id or None)`` of the trained/untrained events in ``[since, now)``."""
+    tagged = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='rl_group_instances'").fetchone()
+    if tagged is None:
+        return [(*row, None) for row in db.execute(
+            "SELECT at, hotkey, kind, detail FROM rl_events WHERE at>=? AND at<? AND kind IN (?, ?)",
+            (since, now, "trained", "untrained"))]
+    return db.execute("SELECT e.at, e.hotkey, e.kind, e.detail, i.instance_id FROM rl_events e "
+                      "LEFT JOIN rl_group_instances i ON i.lease_id=e.lease_id AND i.hotkey=e.hotkey "
+                      "WHERE e.at>=? AND e.at<? AND e.kind IN (?, ?)", (since, now, "trained", "untrained")).fetchall()
+
+
+def card_metrics(rl: Any, summary: list[dict], now: float, start: float, feed: CardFeed,
+                 instances: dict[tuple[str, str], str] | None = None) -> dict[str, float]:
     """Per declared card model (``miner_setup.summarize``): the active fleet now, and how the trainer judged its
-    groups in ``[start, now)``. A hotkey whose cards differ is ``mixed``, one that declared nothing ``undeclared``."""
+    groups in ``[start, now)``. A hotkey whose cards differ is ``mixed``, one that declared nothing ``undeclared``.
+    A group its miner tagged with a declared ``instance_id`` (``instances``, from ``instance_classes``) counts for
+    that process's cards instead of its hotkey's."""
+    instances = instances or {}
     cards = {}
     for line in summary:
         classes = {card_class(n) for n in line["gpus"]}
@@ -76,8 +108,7 @@ def card_metrics(rl: Any, summary: list[dict], now: float, start: float, feed: C
     with rl.book.lock:
         active = [h for (h,) in db.execute("SELECT DISTINCT hotkey FROM rl_leases WHERE issued_at>=?",
                                            (now - ACTIVE_MINER_S,))]
-        events = db.execute("SELECT at, hotkey, kind, detail FROM rl_events WHERE at>=? AND at<? AND kind IN (?, ?)",
-                            (min(start, now - SHARE_WINDOW_S), now, "trained", "untrained")).fetchall()
+        events = _events(db, min(start, now - SHARE_WINDOW_S), now)
     fleet: dict[str, list[int]] = {}
     for hotkey in active:
         cls, gpus = cards.get(hotkey, ("undeclared", 0))
@@ -85,6 +116,7 @@ def card_metrics(rl: Any, summary: list[dict], now: float, start: float, feed: C
         miners_gpus[0] += 1
         miners_gpus[1] += gpus
     feed._admit([c for c, _ in sorted(fleet.items(), key=lambda kv: (-kv[1][1], -kv[1][0], kv[0]))])
+    feed._admit(sorted({c for c in instances.values() if c != "mixed"}))   # a mixed hotkey's own card kinds
 
     def bucket(cls: str) -> str:
         return cls if cls in feed.named or cls in BUCKETS else "other"
@@ -96,13 +128,14 @@ def card_metrics(rl: Any, summary: list[dict], now: float, start: float, feed: C
     for cls, (miners, gpus) in fleet.items():
         t[bucket(cls)]["miners"] += miners
         t[bucket(cls)]["gpus"] += gpus
-    for at, hotkey, kind, raw in events:
+    for at, hotkey, kind, raw, instance in events:
         detail = json.loads(raw)
         match = detail.get("rollout_match") or []
         judged = detail.get("judged")
         if judged is False or (judged is None and not any(m > 0 for m in match)):
             continue                           # legacy all-zero reports cannot distinguish skipped from judged
-        c = t[bucket(cards.get(hotkey, ("undeclared", 0))[0])]
+        cls = instances.get((hotkey, instance)) if instance is not None else None
+        c = t[bucket(cls or cards.get(hotkey, ("undeclared", 0))[0])]
         tokens = int(sum(detail.get("matched_tokens") or detail.get("completion_tokens") or [])) \
             if kind == "trained" else 0
         c["share_tokens"] += tokens
@@ -207,4 +240,4 @@ def controller_metrics(rl: Any, now: float, window_s: float = METRICS_EVERY_S,
     return out
 
 
-__all__ = ["METRICS_EVERY_S", "CardFeed", "card_class", "card_metrics", "controller_metrics"]
+__all__ = ["METRICS_EVERY_S", "CardFeed", "card_class", "card_metrics", "controller_metrics", "instance_classes"]

@@ -107,6 +107,8 @@ CREATE TABLE IF NOT EXISTS rl_verdicts(seq INTEGER PRIMARY KEY AUTOINCREMENT, le
 CREATE INDEX IF NOT EXISTS rl_verdicts_hotkey ON rl_verdicts(hotkey, seq);
 CREATE TABLE IF NOT EXISTS rl_events(seq INTEGER PRIMARY KEY AUTOINCREMENT, lease_id TEXT NOT NULL,
     hotkey TEXT NOT NULL, kind TEXT NOT NULL, at REAL NOT NULL, detail TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS rl_group_instances(lease_id TEXT PRIMARY KEY, hotkey TEXT NOT NULL,
+    instance_id TEXT NOT NULL, at REAL NOT NULL);
 """
 
 
@@ -590,6 +592,14 @@ class RlSubmissions:
             self.book.credit(lease_id, now=at)
         else:
             self._event(lease_id, hotkey, FIRST_SCAN_FORFEITED, at, {"audit": audit, "tokens": tokens})
+
+    def tag_instance(self, lease_id: str, hotkey: str, instance_id: str) -> None:
+        """Keep the miner's optional, self-declared ``instance_id`` of a received group (the first one sent wins).
+        Read by the dashboard's card metrics only: nothing scores or pays on it."""
+        with self.book.lock:
+            self.book.db.execute("INSERT OR IGNORE INTO rl_group_instances(lease_id, hotkey, instance_id, at) "
+                                 "VALUES(?,?,?,?)", (lease_id, hotkey, instance_id, self.clock()))
+            self.book.db.commit()
 
     def _event(self, lease_id: str, hotkey: str, kind: str, at: float, detail: dict) -> None:
         self.book.db.execute("INSERT INTO rl_events(lease_id, hotkey, kind, at, detail) VALUES(?,?,?,?,?)",

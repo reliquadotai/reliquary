@@ -16,6 +16,7 @@ from reliquary.protocol.miner_setup import (
 logger = logging.getLogger(__name__)
 
 RESEND_EVERY_S = 6 * 3600
+INSTANCE_ID_FILE = "state/miner-setup-instance-id"   # under the work dir: shared with the submissions' tag
 
 
 async def send_miner_setup(client, *, validator_url: str, validator_hotkey: str, wallet, report) -> bool:
@@ -39,7 +40,7 @@ async def send_miner_setup(client, *, validator_url: str, validator_hotkey: str,
 async def share_setup_forever(client, *, validator_url: str, validator_hotkey: str, wallet, work_dir: str,
                               note: str = "", every_s: float = RESEND_EVERY_S) -> None:
     hotkey = wallet.hotkey.ss58_address
-    instance_id = load_instance_id(Path(work_dir) / "state" / "miner-setup-instance-id")
+    instance_id = load_instance_id(Path(work_dir) / INSTANCE_ID_FILE)
     while True:
         report = await asyncio.to_thread(collect_miner_setup, hotkey=hotkey, instance_id=instance_id, note=note)
         if await send_miner_setup(client, validator_url=validator_url, validator_hotkey=validator_hotkey,
@@ -49,4 +50,4 @@ async def share_setup_forever(client, *, validator_url: str, validator_hotkey: s
         await asyncio.sleep(every_s)
 
 
-__all__ = ["send_miner_setup", "share_setup_forever"]
+__all__ = ["INSTANCE_ID_FILE", "send_miner_setup", "share_setup_forever"]
