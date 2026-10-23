@@ -143,8 +143,18 @@ def test_the_async_price_moves_on_supply_against_its_share_of_the_trainer_speed(
     assert no_speed.regime == HOLD and no_speed.r is None
     capped = advance_async(PriceState(3.9, 1.0), EnvSignal(300, 0, 500), params)
     assert capped.price == 4.0
-    floored = advance_async(PriceState(0.05, 1.0), EnvSignal(3e6, 10**9, 1), params)
-    assert floored.price == 0.05
+    floored = advance_async(PriceState(0.02, 1.0), EnvSignal(3e6, 10**9, 1), params)
+    assert floored.price == 0.02
+    # a waiting trainer: the mix still moves (relative = supply share / target share), within the band it does not
+    assert advance_async(state, EnvSignal(300, 600, 500, starved=True, relative=1.05), params).regime == HOLD
+    over = advance_async(state, EnvSignal(300, 600, 500, starved=True, relative=3.0), params)
+    assert over.regime == DESCEND and over.price == pytest.approx(1 / 1.02)
+    short = advance_async(state, EnvSignal(300, 100, 500, starved=True, relative=0.5), params)
+    assert short.regime == RISE and short.price == pytest.approx(1.05 * 1.02)
+    both_short = advance_async(state, EnvSignal(300, 100, 500, starved=True, relative=1.3), params)
+    assert both_short.regime == RISE and both_short.price == pytest.approx(1.05 / 1.02)  # short, less than the rest
+    assert advance_async(state, EnvSignal(300, 100, 500, capped=True, starved=True, relative=0.5),
+                         params).regime == HOLD                                         # the full queue still wins
 
 
 def test_the_controller_reads_the_trainer_speed_from_the_queue_persists_and_prices_per_token(book):
@@ -162,11 +172,13 @@ def test_the_controller_reads_the_trainer_speed_from_the_queue_persists_and_pric
     clock[0] += 300
     decisions = prices.tick(QueueTick({ENV: 300 * 1_200, OTHER: 300 * 100}, 150_000, 150.0))   # 1,000 tok/s
     assert 150_000 / 290 < prices.trainer_speed() < 1_000                                # sums decayed per tick
-    assert decisions[ENV].regime == HOLD and decisions[OTHER].regime == RISE              # starved: no descent
-    assert prices.token_price(OTHER) == pytest.approx(1.05 * NOMINAL) and not prices.due()
+    # starved: ENV descends on the mix only (12x OTHER's supply for the same share), OTHER rises twice
+    assert decisions[ENV].regime == DESCEND and decisions[OTHER].regime == RISE
+    assert decisions[ENV].price == pytest.approx(0.817 ** 0.1 / 1.02)
+    assert prices.token_price(OTHER) == pytest.approx(1.05 * 1.02 * NOMINAL) and not prices.due()
     assert prices.tick(QueueTick()) == {}                                               # no time elapsed
     again = AsyncPriceController(book, {ENV: 0.5, OTHER: 0.5}, CAP, PLANNED, clock=lambda: clock[0])
-    assert again.multiplier(OTHER) == pytest.approx(1.05)                               # restart-safe
+    assert again.multiplier(OTHER) == pytest.approx(1.05 * 1.02)                        # restart-safe
     signal = again.board()[OTHER]["signal"]
     assert again.board()[OTHER]["regime"] == RISE and signal["full"] is False and signal["starved_s"] == 150.0
     assert signal["ratio"] == pytest.approx(300 * 100 / 300 / signal["demand_tps"])
@@ -174,9 +186,10 @@ def test_the_controller_reads_the_trainer_speed_from_the_queue_persists_and_pric
     decisions = prices.tick(QueueTick({ENV: 300 * 1_000}, 300_000))                     # OTHER dry: ENV takes all
     assert decisions[OTHER].regime == RISE and decisions[ENV].r == pytest.approx(1_000 / prices.trainer_speed())
     clock[0] += 300
+    before = prices.multiplier(ENV)
     decisions = prices.tick(QueueTick({ENV: 300 * 500, OTHER: 300 * 100}, 0, 300.0), {ENV})  # waited, took nothing
     assert prices.trainer_speed() is not None                                          # alive: speed kept
-    assert decisions[ENV].regime != DESCEND                                             # full ignored: starved
+    assert decisions[ENV].price == pytest.approx(before / 1.02)                         # the mix's step, full ignored
     clock[0] += 300 * 3 + 1                                                              # neither took nor waited
     assert again.trainer_speed() is None
     with pytest.raises(ValueError):
@@ -341,6 +354,31 @@ def test_a_period_never_pays_more_than_the_cap(book):
     assert doc["scale"] == pytest.approx(CAP / doc["accrued_total"])
     assert sum(doc["rewards_by_hotkey"].values()) == pytest.approx(CAP)
     assert doc["rewards_by_hotkey"]["A"] == pytest.approx(2 * doc["rewards_by_hotkey"]["B"])
+
+
+@pytest.mark.parametrize("k", [None, 2.0])
+def test_the_per_env_guard_holds_an_env_to_k_times_its_share_of_the_cap(book, k):
+    subs = service(book, probation_groups=0)
+    prices = AsyncPriceController(book, {ENV: 0.2, OTHER: 0.8}, CAP, 100.0, clock=lambda: NOW)  # ENV alone > cap
+    ledger = ledger_for(book, subs, prices, env_pay_k=k)
+    trained(book, subs, 1, hotkey="A")
+    trained(book, subs, 2, hotkey="B")
+    ledger.ingest()
+    (doc,) = ledger.settle(cp.period_end(cp.period_of(NOW)) + 600)
+    paid = sum(doc["rewards_by_hotkey"].values())
+    if k is None:
+        assert paid == pytest.approx(CAP) and "env_scale" not in doc                     # off: the archive unchanged
+    else:
+        assert paid == pytest.approx(2.0 * 0.2 * CAP)                                   # the surplus burns
+        assert doc["env_scale"][ENV] == pytest.approx(0.4 * CAP * 100 / (2 * GROUP_TOKENS * CAP))
+        assert doc["accrued_total"] == pytest.approx(0.4 * CAP) and doc["scale"] == 1.0
+    assert doc["rewards_by_hotkey"]["A"] == pytest.approx(doc["rewards_by_hotkey"]["B"])
+    with pytest.raises(ValueError):
+        LedgerConfig(task_id="t", cap=CAP, env_pay_k=0.0)
+    from reliquary.validator.rl_async_service import ENV_PAY_K_PARAM, rl_async_params
+
+    assert rl_async_params(planned_tokens_per_period=1.0, env_pay_k=2.0)[ENV_PAY_K_PARAM] == 2.0
+    assert ENV_PAY_K_PARAM not in rl_async_params(planned_tokens_per_period=1.0)
 
 
 def set_multiplier(book, env, price):
