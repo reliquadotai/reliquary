@@ -218,6 +218,10 @@ class LeaseBookConfig:
     # leases are not counted (the quota and expiry bound them; a growing buffer is the oversupply signal), but one
     # hotkey may hold at most ``HOTKEY_MAX_OPEN`` of them (refused as ``quota``). None: no cap.
     max_pending_groups: int | None = None
+    # Per-env lanes inside the global cap: env -> buffered groups kept for it. An env under its reserve is granted
+    # whatever the others hold; past it, only while the cap has room once every env counts at least its reserve.
+    # A flood of one env then never refuses another env's leases. Empty: the global cap alone.
+    lane_reserve: Mapping[str, int] | None = None
     # Releases of signed ``box_failed`` leases per hotkey per day before they are charged again. PLACEHOLDER.
     box_failed_releases_per_day: int = 48
 
@@ -228,6 +232,11 @@ class LeaseBookConfig:
             raise ValueError("max_lag must be non-negative")
         if self.max_pending_groups is not None and self.max_pending_groups < 1:
             raise ValueError("max_pending_groups must be positive")
+        reserve = dict(self.lane_reserve or {})
+        if any(int(v) < 0 for v in reserve.values()):
+            raise ValueError("lane reserves must be non-negative")
+        if reserve and (self.max_pending_groups is None or sum(reserve.values()) > self.max_pending_groups):
+            raise ValueError("lane reserves need a global cap at least their sum")
         if self.box_failed_releases_per_day < 0:
             raise ValueError("box_failed_releases_per_day must be non-negative")
 
@@ -252,6 +261,19 @@ CREATE INDEX IF NOT EXISTS rl_prompt_state_seq ON rl_prompt_state(seq);
 CREATE TABLE IF NOT EXISTS rl_hotkey_bans(hotkey TEXT PRIMARY KEY, until REAL NOT NULL);
 """
 _COLUMNS = "lease_id, hotkey, environment, prompt_idx, k, nonce, issued_at, expires_at, state"
+
+
+def _lane_room(env: str, pending: int, by_env: Mapping[str, int], reserve: Mapping[str, int], cap: int) -> bool:
+    """May ``env`` get one more lease? Without lanes: the global cap. With lanes: yes under its own reserve; past it,
+    only while the buffered groups, each env counted at least at its reserve, stay under the cap (so the reserves
+    of the envs not using them stay free for them)."""
+    if not reserve:
+        return pending < cap
+    if by_env.get(env, 0) < reserve.get(env, 0):
+        return True
+    held = sum(max(int(by_env.get(e, 0)), int(r)) for e, r in reserve.items())
+    held += sum(int(n) for e, n in by_env.items() if e not in reserve)
+    return held < cap
 
 
 def _private_file(path: Path) -> None:
@@ -530,6 +552,8 @@ class LeaseBook:
                         claims.append((i, prompt))
             self._rng.shuffle(claims)
             pending = self._pending() if cap is not None else 0
+            reserve = dict(self.config.lane_reserve or {}) if cap is not None else {}
+            by_env = self._pending_by_env() if reserve else {}
             for i, prompt in claims:
                 request = requests[i]
                 env, k, hotkey = request.environment, request.checkpoint, request.hotkey
@@ -555,7 +579,7 @@ class LeaseBook:
                 if room[hotkey] <= 0:
                     answers[i].refused[prompt] = QUOTA
                     continue
-                if cap is not None and pending >= cap:
+                if cap is not None and not _lane_room(env, pending, by_env, reserve, cap):
                     answers[i].refused[prompt] = FULL
                     self._full.add(env)
                     continue
@@ -578,6 +602,21 @@ class LeaseBook:
         if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='rl_buffer'").fetchone():
             return int(self.db.execute("SELECT COUNT(*) FROM rl_buffer").fetchone()[0])
         return 0
+
+    def _pending_by_env(self) -> dict[str, int]:
+        """Buffered groups per env (the lanes' measure); empty without a ``TrainingBuffer`` in the file."""
+        if not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='rl_buffer'").fetchone():
+            return {}
+        return {str(env): int(n) for env, n in
+                self.db.execute("SELECT environment, COUNT(*) FROM rl_buffer GROUP BY environment")}
+
+    def lanes(self) -> dict[str, dict[str, int]]:
+        """Per env: its buffered groups and its reserve (for /rl/state and the operators)."""
+        with self.lock:
+            by_env = self._pending_by_env()
+        reserve = dict(self.config.lane_reserve or {})
+        return {env: {"buffered": by_env.get(env, 0), "reserve": int(reserve.get(env, 0))}
+                for env in sorted(set(by_env) | set(reserve))}
 
     def drain_full(self) -> set[str]:
         """Envs refused for the global cap since the last drain (the price controller's oversupply signal)."""

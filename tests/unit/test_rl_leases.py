@@ -258,6 +258,47 @@ def test_the_global_cap_counts_buffered_groups_only_and_names_the_full_envs(tmp_
         LeaseBookConfig(expiry_s={ENV: 1.0}, max_pending_groups=0)
 
 
+def _buffer(book, counts):
+    with book.transaction():
+        book.db.execute("CREATE TABLE IF NOT EXISTS rl_buffer(lease_id TEXT PRIMARY KEY, environment TEXT)")
+        book.db.execute("DELETE FROM rl_buffer")
+        book.db.executemany("INSERT INTO rl_buffer VALUES(?,?)",
+                            [(f"{env}-{i}", env) for env, n in counts.items() for i in range(n)])
+
+
+def test_a_flooded_env_fills_only_the_room_the_other_lanes_leave(tmp_path):
+    book = book_at(tmp_path, max_pending_groups=10, lane_reserve={ENV: 2, OTHER_ENV: 4})
+    book.adopt_checkpoint(0)
+    _buffer(book, {ENV: 5})                       # math over its reserve: 5 + code's reserve 4 = 9 < 10
+    assert len(book.grant([ask("A", [1])])[0].leases) == 1
+    _buffer(book, {ENV: 6})                       # 6 + 4 = 10: math refused, code still served
+    answers = book.grant([ask("B", [2]), ask("C", [3], env=OTHER_ENV)])
+    assert answers[0].refused == {2: FULL} and len(answers[1].leases) == 1
+    assert book.drain_full() == {ENV}
+    _buffer(book, {ENV: 6, OTHER_ENV: 3})         # code under its reserve is served even with math at the limit
+    assert len(book.grant([ask("D", [4], env=OTHER_ENV)])[0].leases) == 1
+    assert book.lanes() == {ENV: {"buffered": 6, "reserve": 2}, OTHER_ENV: {"buffered": 3, "reserve": 4}}
+
+
+def test_past_its_reserve_an_env_shares_the_cap_like_the_global_cap(tmp_path):
+    book = book_at(tmp_path, max_pending_groups=10, lane_reserve={ENV: 2, OTHER_ENV: 2})
+    book.adopt_checkpoint(0)
+    _buffer(book, {ENV: 4, OTHER_ENV: 6})         # both past their reserves, 10 buffered: everyone refused
+    answers = book.grant([ask("A", [1]), ask("B", [2], env=OTHER_ENV)])
+    assert [a.refused for a in answers] == [{1: FULL}, {2: FULL}]
+    _buffer(book, {ENV: 4, OTHER_ENV: 5})
+    assert len(book.grant([ask("C", [3])])[0].leases) == 1
+
+
+def test_lane_reserves_need_a_cap_that_holds_them(tmp_path):
+    with pytest.raises(ValueError):
+        LeaseBookConfig(expiry_s={ENV: 1.0}, lane_reserve={ENV: 3})
+    with pytest.raises(ValueError):
+        LeaseBookConfig(expiry_s={ENV: 1.0}, max_pending_groups=4, lane_reserve={ENV: 3, OTHER_ENV: 2})
+    with pytest.raises(ValueError):
+        LeaseBookConfig(expiry_s={ENV: 1.0}, max_pending_groups=4, lane_reserve={ENV: -1})
+
+
 def test_one_hotkey_holds_at_most_hotkey_max_open_leases_under_a_global_cap(tmp_path, monkeypatch):
     monkeypatch.setattr(rl_leases, "HOTKEY_MAX_OPEN", 2)
     book = book_at(tmp_path, max_pending_groups=8)

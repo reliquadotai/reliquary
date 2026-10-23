@@ -19,7 +19,7 @@ def test_async_serving_refreshes_readiness_and_awaits_monitor_shutdown(
     closed, servers, monitors, collected = [], [], [], []
     real_server = server_module.ValidatorServer
     settings = SimpleNamespace(task_id="async-test", run="test", targets={"math": 1.0},
-                               episodes={}, max_pending_groups=1)
+                               episodes={}, max_pending_groups=1, lane_reserves=dict)
     rl = SimpleNamespace(sandbox=None, book=SimpleNamespace(latest_checkpoint=None),
                          submissions=SimpleNamespace(grader=SimpleNamespace()),
                          close=lambda: closed.append("rl"))

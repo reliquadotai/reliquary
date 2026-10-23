@@ -82,6 +82,10 @@ PENDING_PARAM = "rl_max_pending_groups"         # global cap: buffered groups (q
 # Two batches of 512 groups (decision N, 2026-10-20: ~8k rollouts per optimizer step, one step per checkpoint).
 # queue_sim 10-17 at 64 per batch: trainer wait 7 % at 2 batches, 1 % at 3, <1 % at 4.
 DEFAULT_MAX_PENDING_GROUPS = 1024
+LANE_RESERVE_PARAM = "rl_lane_reserve"          # share of the global cap kept per env, split by the target mix
+# Operator overrides read at start (a controller restart applies them; no registry change).
+MAX_PENDING_ENV = "RELIQUARY_RL_MAX_PENDING_GROUPS"
+LANE_RESERVE_ENV = "RELIQUARY_RL_LANE_RESERVE"
 DEFAULT_LEASE_TOKENS_PER_S = 20.0      # placeholder: the design's "3090 at max length", measured at qualification
 DEFAULT_LEASE_MARGIN = 2.0
 
@@ -155,6 +159,11 @@ class RlAsyncSettings:
     episodes: Mapping[str, Any] = field(default_factory=dict)   # env -> its validated episode block (§4.10)
     cooldown_k: Mapping[str, int] = field(default_factory=dict)  # env -> operator's fixed cooldown (rl_cooldown)
     env_pay_k: float | None = None              # the ledger's per-env settlement guard (None: off)
+    lane_reserve: float = 0.0                   # share of the global cap kept per env (0: the global cap alone)
+
+    def lane_reserves(self) -> dict[str, int]:
+        """env -> buffered groups kept for it: ``lane_reserve`` x the cap, split by the target shares."""
+        return lane_reserves(self.targets, self.max_pending_groups, self.lane_reserve)
 
     def episode_policies(self) -> dict:
         from reliquary.validator.rl_async_episodes import episode_policies
@@ -162,8 +171,35 @@ class RlAsyncSettings:
         return episode_policies(self.episodes)
 
 
+def lane_reserves(targets: Mapping[str, float], cap: int, fraction: float) -> dict[str, int]:
+    """Each env's reserve in groups: ``fraction`` of ``cap`` split by the target shares (rounded down, so the sum
+    stays within the cap). Empty when ``fraction`` is 0."""
+    if not 0.0 <= fraction < 1.0:
+        raise ValueError("the lane reserve must be in [0, 1)")
+    total = sum(float(v) for v in targets.values())
+    if fraction == 0.0 or total <= 0:
+        return {}
+    return {str(env): int(fraction * cap * float(share) / total) for env, share in targets.items()}
+
+
+def _operator_overrides(params: Mapping[str, Any], environ: Mapping[str, str]) -> tuple[int, float]:
+    """(global cap, lane reserve) from the registry params, overridden by the operator's env vars."""
+    cap = int(params.get(PENDING_PARAM, DEFAULT_MAX_PENDING_GROUPS))
+    reserve = float(params.get(LANE_RESERVE_PARAM, 0.0))
+    if str(environ.get(MAX_PENDING_ENV, "")).strip():
+        cap = int(environ[MAX_PENDING_ENV])
+    if str(environ.get(LANE_RESERVE_ENV, "")).strip():
+        reserve = float(environ[LANE_RESERVE_ENV])
+    if cap < 1:
+        raise ValueError("max_pending_groups must be positive")
+    if not 0.0 <= reserve < 1.0:
+        raise ValueError("the lane reserve must be in [0, 1)")
+    return cap, reserve
+
+
 def rl_async_settings(entry, cap: float, *, run: str | None = None,
-                      max_tokens: Callable[[str], int] | None = None) -> RlAsyncSettings:
+                      max_tokens: Callable[[str], int] | None = None,
+                      environ: Mapping[str, str] | None = None) -> RlAsyncSettings:
     """An async task's settings from its registry entry. ValueError when the entry was not declared for it."""
     from reliquary.validator import corpus_periods as cp
     from reliquary.validator.rl_price import AsyncPriceParams
@@ -202,6 +238,7 @@ def rl_async_settings(entry, cap: float, *, run: str | None = None,
     unknown = sorted(set(cooldowns) - set(targets))
     if unknown:
         raise ValueError(f"cooldown overrides for envs outside the env_split: {unknown}")
+    max_pending, lane_reserve = _operator_overrides(params, os.environ if environ is None else environ)
     price = AsyncPriceParams(**{key: cast(params[name]) for key, name, cast in (
         ("tick_s", PRICE_TICK_PARAM, float),) if name in params})
     return RlAsyncSettings(task_id=str(entry.task_id), cap=float(cap),
@@ -212,7 +249,7 @@ def rl_async_settings(entry, cap: float, *, run: str | None = None,
                            price=price, episodes=blocks, cooldown_k=cooldowns,
                            env_pay_k=(float(params[ENV_PAY_K_PARAM])
                                       if params.get(ENV_PAY_K_PARAM) is not None else None),
-                           max_pending_groups=int(params.get(PENDING_PARAM, DEFAULT_MAX_PENDING_GROUPS)))
+                           max_pending_groups=max_pending, lane_reserve=lane_reserve)
 
 
 @dataclass
@@ -247,7 +284,8 @@ def build_rl_async(settings: RlAsyncSettings, *, path: str | os.PathLike[str], g
     cooldown = AdaptiveCooldown(prompt_range=prompt_range, overrides=settings.cooldown_k)
     book = LeaseBook(path, LeaseBookConfig(expiry_s=dict(settings.lease_expiry_s),
                                            prompt_range=None if prompt_range is None else dict(prompt_range),
-                                           max_pending_groups=settings.max_pending_groups, cooldown_of=cooldown),
+                                           max_pending_groups=settings.max_pending_groups,
+                                           lane_reserve=settings.lane_reserves() or None, cooldown_of=cooldown),
                      quota=QuotaController(), clock=clock)
     cooldown.attach(book)
     try:
@@ -785,7 +823,8 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
 
     telemetry.init(validator_hotkey, {"task_id": settings.task_id, "run": settings.run, "cap": cap,
                                       "targets": dict(settings.targets),
-                                      "max_pending_groups": settings.max_pending_groups},
+                                      "max_pending_groups": settings.max_pending_groups,
+                                      "lane_reserve": settings.lane_reserves()},
                    role="controller", version=settings.run)
     publisher = _public_boards(rl, wallet, validator_hotkey, signer_client)
     audit_model, source = None, audit_source()
