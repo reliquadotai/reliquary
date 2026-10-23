@@ -134,6 +134,56 @@ class _UnpackedMasks(Mapping):
         return len(self._base.bits)
 
 
+_NORM_CHUNK = 1 << 24
+
+
+def update_metrics(old: Mapping[str, torch.Tensor], new: Mapping[str, torch.Tensor]) -> dict[str, float]:
+    """Size of one optimizer step on the published (CPU) weights: global and per-group relative L2 norm
+    ||new - old|| / ||old||, the largest per-tensor one, and the share of elements that changed."""
+    groups: dict[str, list[float]] = {}
+    worst, changed, total = 0.0, 0, 0
+    for name, b in new.items():
+        a = old[name]
+        if not (a.is_floating_point() and b.is_floating_point()) or a.shape != b.shape:
+            continue
+        fa, fb = a.reshape(-1), b.reshape(-1)
+        diff_sq = base_sq = 0.0
+        for i in range(0, fa.numel(), _NORM_CHUNK):
+            xa, xb = fa[i:i + _NORM_CHUNK].float(), fb[i:i + _NORM_CHUNK].float()
+            d = xb - xa
+            diff_sq += float(d.square().sum())
+            base_sq += float(xa.square().sum())
+            changed += int((d != 0).sum())
+        total += fa.numel()
+        if base_sq > 0:
+            worst = max(worst, (diff_sq / base_sq) ** 0.5)
+        for key in ("all", _param_group(name)):
+            acc = groups.setdefault(key, [0.0, 0.0])
+            acc[0] += diff_sq
+            acc[1] += base_sq
+    out = {f"async/update/rel_norm_{key}": (d / b) ** 0.5 for key, (d, b) in groups.items() if b > 0}
+    out["async/update/rel_norm_tensor_max"] = worst
+    out["async/update/changed_ratio"] = changed / total if total else 0.0
+    return out
+
+
+def _param_group(name: str) -> str:
+    """lm_head | embed | layer_<index> | norm | other."""
+    lowered = name.lower()
+    if "lm_head" in lowered:
+        return "lm_head"
+    if "embed" in lowered:
+        return "embed"
+    parts = lowered.split(".")
+    if "layers" in parts:
+        i = parts.index("layers")
+        if i + 1 < len(parts) and parts[i + 1].isdigit():
+            return f"layer_{int(parts[i + 1]):03d}"
+    if "norm" in lowered:
+        return "norm"
+    return "other"
+
+
 class DeltaPublisher:
     def __init__(
         self,
@@ -169,6 +219,8 @@ class DeltaPublisher:
         self._prev_sha: str | None = None
         self._last_anchor: int | None = None
         self._bases: list[_Base] = []
+        self.last_update: dict[str, float] = {}     # update-size telemetry of the last delta (``update_metrics``)
+        self._update_pair: tuple | None = None
         self.anchors: list[dict] = []
         self.deltas: list[dict] = []
         # Entries already published by an earlier process stay listed (and pruned
@@ -212,11 +264,24 @@ class DeltaPublisher:
             "published_at": round(float(self._clock()), 3),
         }
         self._store.put_bytes(index_key(self.run), json.dumps(index, sort_keys=True).encode())
+        self._update_pair = (self._prev, snapshot) if self._prev is not None else None
         self._prev, self._prev_version, self._prev_sha = snapshot, version, sha
         if dropped:
             self._doomed.append((float(self._clock()) + self._prune_grace_s, dropped))
         self._delete_due()
         return index
+
+    def measure_update(self) -> dict[str, float]:
+        """``update_metrics`` of the last publication, run after it (it keeps the previous weights until then)."""
+        pair, self._update_pair = self._update_pair, None
+        if pair is None:
+            return {}
+        try:
+            self.last_update = update_metrics(*pair)
+        except Exception:                                # telemetry never fails a publication
+            logger.exception("update-size telemetry failed")
+            self.last_update = {}
+        return self.last_update
 
     # ------------------------------------------------------------------ steps
 

@@ -558,3 +558,60 @@ def test_a_forwarded_zero_match_group_is_reported_as_judged(forwarded):
     report = subs.reports["zero-match"]
     assert report["accepted"] is False and report["rollout_match"] == [0.0] * ROLLOUTS
     assert report["judged"] is forwarded and report.get("failure_class") is None
+
+
+def test_drift_rows_split_matches_by_position_entropy_and_gap():
+    t = torch.tensor
+    rows = training._DrawRows(
+        targets=t([0, 0, 0, 0, 0]), drawn=t([True, True, True, True, False]),
+        match=t([True, False, True, False, False]), stochastic=t([True, True, True, False, False]),
+        entropy=t([0.1, 1.0, 2.0, 0.0, 0.0]), gap=t([0.0, 0.3, 0.0, 9.0, 0.0]))
+    first, second = training._rollout_drift_rows(rows, [3, 2])
+    assert len(first) == training.DRIFT_WIDTH
+    assert first[:2] == pytest.approx([3.1, 3.0]) and second[:2] == [0.0, 2.0]
+    # position buckets: every row sits under 1k tokens -> bucket 0 holds (stochastic, matches)
+    assert first[2:4] == [3.0, 2.0] and sum(first[4:10]) == 0
+    # entropy buckets <0.5, 0.5-1.5, >=1.5 (stochastic rows only)
+    assert first[10:16] == [1.0, 1.0, 1.0, 0.0, 1.0, 1.0]
+    gaps = first[16:]
+    assert gaps[1] == 1.0 and sum(gaps) == 1.0                       # one mismatch, gap 0.3 in (0.25, 0.5]
+    assert second[16 + 8] == 1.0                                     # gap 9 in (8, 12]
+
+
+def test_the_gate_breaks_drift_down_by_lag_and_env():
+    model = _Model()
+    groups = [training_group(submitted(model, name, noisy=noisy), slot0=4 * i, index=i)
+              for i, (name, noisy) in enumerate((("fresh", ()), ("stale", {0, 1, 2, 3})))]
+    plan = [(g, [1.0, -1.0, 1.0, -1.0], 1.0 / (2 * ROLLOUTS * N_TOK)) for g in groups]
+    gate = DrawGate([[0, 1, 2, 3], [4, 5, 6, 7]], rollout_floor=0.0, group_floor=0.0, forgery_floor=0.0,
+                    gap_tolerance=float("inf"), envs=["math", "code"], lags=[0, 5])
+    grads_of(model, plan, gate)
+    m = gate.metrics()
+    assert m["async/lag_max"] == 5 and m["async/by_lag/0/groups"] == 1 and m["async/by_lag/3plus/groups"] == 1
+    assert m["async/by_lag/0/match_rate"] == 1.0 and m["async/by_lag/0/substitution_rate"] == 0.0
+    assert m["async/by_lag/3plus/match_rate"] < 1.0 and m["async/by_lag/3plus/substitution_rate"] > 0.0
+    assert m["async/by_env/code/rollouts"] == 4 and m["async/by_env/math/regraded_ratio"] == 0.0
+    assert m["async/drift/match_by_position/lt1k"] < 1.0 and m["async/drift/mismatched_tokens"] > 0
+    assert 0 < m["async/drift/mismatch_gap_p99"] and m["async/rollout_gap_p99"] >= m["async/rollout_gap_p50"]
+    assert {"async/by_lag/0/entropy", "async/by_env/math/groups_rejected_ratio"} <= set(m)
+
+
+def test_the_wandb_row_carries_the_drift_breakdowns(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from reliquary.validator import telemetry
+
+    fake_wandb = MagicMock()
+    monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+    monkeypatch.setattr(telemetry, "_enabled", True)
+    monkeypatch.setattr(telemetry, "_held", None)
+    model, book = _Model(), Book(latest=3)
+    buffer = TrainingBuffer(book)
+    buffer.push(submitted(model, "a", k=3, arrived=1.0))
+    buffer.push(submitted(model, "b", k=2, env="code", arrived=0.0))
+    trainer, *_ = loop(model, book, buffer)
+    assert trainer.run_once() == "trained"
+    trainer.close()
+    row = fake_wandb.log.call_args.args[0]
+    assert row["async/by_lag/0/groups"] == 1 and row["async/by_lag/1/groups"] == 1 and row["async/lag_max"] == 1
+    assert row["async/by_env/code/completion_tokens_mean"] == N_TOK and row["async/by_env/math/truncated_ratio"] == 0

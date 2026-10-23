@@ -2212,6 +2212,51 @@ def _rollout_draw_tallies(draw_rows: _DrawRows, keep_seg: list[int]) -> list[tup
     return [tuple(int(v) for v in row) for row in out.tolist()]
 
 
+# Per-rollout drift telemetry row (async gate): fixed width so the gate can all-reduce it per slot.
+DRIFT_POSITION_EDGES = (1024, 8192, 32768)          # scored-token position buckets: <1k, 1k-8k, 8k-32k, >=32k
+DRIFT_ENTROPY_EDGES = (0.5, 1.5)                    # nats, stochastic positions only
+DRIFT_GAP_EDGES = (0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0)  # Gumbel gap of mismatched drawn tokens
+_DRIFT_POS = len(DRIFT_POSITION_EDGES) + 1
+_DRIFT_ENT = len(DRIFT_ENTROPY_EDGES) + 1
+_DRIFT_GAP = len(DRIFT_GAP_EDGES) + 1
+# entropy sum, rows | (stochastic, matches) per position bucket | (stochastic, matches) per entropy bucket | gap bins
+DRIFT_WIDTH = 2 + 2 * _DRIFT_POS + 2 * _DRIFT_ENT + _DRIFT_GAP
+
+
+def _rollout_drift_rows(draw_rows: _DrawRows, keep_seg: list[int]) -> list[list[float]]:
+    """Per rollout, over its kept rows, the ``DRIFT_WIDTH`` counters the async gate breaks down by lag and env."""
+    with torch.no_grad():
+        device = draw_rows.drawn.device
+        n_seg = len(keep_seg)
+        out = torch.zeros(n_seg, DRIFT_WIDTH, dtype=torch.float64, device=device)
+        if not n_seg or int(draw_rows.drawn.numel()) == 0:
+            return out.tolist()
+        lengths = torch.tensor(keep_seg, device=device)
+        owner = torch.repeat_interleave(torch.arange(n_seg, device=device), lengths)
+        starts = torch.cumsum(lengths, 0) - lengths
+        position = torch.arange(owner.numel(), device=device) - starts[owner]
+        stoch = (draw_rows.drawn & draw_rows.stochastic).double()
+        match = (draw_rows.drawn & draw_rows.stochastic & draw_rows.match).double()
+        out[:, 0].index_add_(0, owner, draw_rows.entropy.double())
+        out[:, 1].index_add_(0, owner, torch.ones_like(stoch))
+        col = 2
+        for bucket, count in ((torch.bucketize(position, torch.tensor(DRIFT_POSITION_EDGES, device=device),
+                                               right=True), _DRIFT_POS),
+                              (torch.bucketize(draw_rows.entropy.float(),
+                                               torch.tensor(DRIFT_ENTROPY_EDGES, device=device), right=True),
+                               _DRIFT_ENT)):
+            flat = torch.zeros(n_seg * count, dtype=torch.float64, device=device)
+            index = owner * count + bucket
+            out[:, col:col + 2 * count:2] = flat.index_add(0, index, stoch).view(n_seg, count)
+            out[:, col + 1:col + 2 * count:2] = flat.index_add(0, index, match).view(n_seg, count)
+            col += 2 * count
+        miss = (draw_rows.drawn & ~draw_rows.match).double()
+        bins = torch.bucketize(draw_rows.gap.float(), torch.tensor(DRIFT_GAP_EDGES, device=device), right=True)
+        flat = torch.zeros(n_seg * _DRIFT_GAP, dtype=torch.float64, device=device)
+        out[:, col:col + _DRIFT_GAP] = flat.index_add(0, owner * _DRIFT_GAP + bins, miss).view(n_seg, _DRIFT_GAP)
+    return out.tolist()
+
+
 def _draw_suspects(draw_rows: _DrawRows, seg: list[int], positions, plens, substitute_gap: float,
                    stop_ids=frozenset()):
     """Per rollout, over every scored row (before the keep mask): (largest Gumbel gap, [(completion position, v*)]
@@ -2245,6 +2290,9 @@ def _gate_rows(gate, kl_stats, batch, new_lp, ref_lp, claimed_old, behavior_old,
         raise RuntimeError("the async trainer's gate needs the substitution loss")
     rollouts = [item[9] if len(item) > 9 else None for item in batch]
     _record_draw_stats(kl_stats, draw_rows, keep_seg, rollouts, getattr(gate, "rollout_floor", None))
+    for rollout, row in zip(rollouts, _rollout_drift_rows(draw_rows, keep_seg)):
+        if rollout is not None:
+            rollout._drift_row = row
     admitted = gate.admit(rollouts, _rollout_draw_tallies(draw_rows, keep_seg), suspects)
     old_cat = new_lp.detach()
     if admitted is None or all(admitted):

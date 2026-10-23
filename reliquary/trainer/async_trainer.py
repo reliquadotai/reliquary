@@ -62,7 +62,14 @@ from reliquary.protocol.rl_draw import pooled_rate, rollout_rate
 from reliquary.validator import telemetry
 from reliquary.validator.rl_buffer import SubmittedGroup
 from reliquary.validator.rl_leases import SECRET_REVEAL_LAG
-from reliquary.validator.training import TrainingStepSkipped, train_step as _default_train_step
+from reliquary.validator.training import (
+    DRIFT_ENTROPY_EDGES,
+    DRIFT_GAP_EDGES,
+    DRIFT_POSITION_EDGES,
+    DRIFT_WIDTH,
+    TrainingStepSkipped,
+    train_step as _default_train_step,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,8 +102,11 @@ class DrawGate:
     def __init__(self, groups: list[list[int]], *, rollout_floor: float = ASYNC_ROLLOUT_FLOOR,
                  group_floor: float = ASYNC_GROUP_FLOOR, forgery_floor: float = ASYNC_FORGERY_FLOOR,
                  gap_tolerance: float = RL_GAP_TOLERANCE, substitute_gap: float = RL_SUBSTITUTE_GAP,
-                 terminal_gap: float = RL_TERMINAL_GAP, eos_ids=()) -> None:
+                 terminal_gap: float = RL_TERMINAL_GAP, eos_ids=(), envs=None, lags=None) -> None:
         self.groups = [list(g) for g in groups]
+        # Per-group labels for the drift breakdowns (telemetry only).
+        self.envs = list(envs) if envs is not None else None
+        self.lags = [int(v) for v in lags] if lags is not None else None
         self.rollout_floor, self.group_floor = float(rollout_floor), float(group_floor)
         self.forgery_floor = float(forgery_floor)
         self.gap_tolerance, self.substitute_gap = float(gap_tolerance), float(substitute_gap)
@@ -113,6 +123,7 @@ class DrawGate:
         self.forwarded = [0] * n
         self.bad_terminal = [0] * n
         self.admitted = [0] * n
+        self.drift = [[0.0] * DRIFT_WIDTH for _ in range(n)]
         self.accepted: list[bool] | None = None
         self.undone = 0
 
@@ -122,6 +133,9 @@ class DrawGate:
             slot = int(rollout._async_slot)
             self.tallies[slot] = [int(v) for v in tally]
             self.forwarded[slot] = 1
+            row = getattr(rollout, "_drift_row", None)
+            if row is not None and len(row) == DRIFT_WIDTH:
+                self.drift[slot] = [float(v) for v in row]
             if suspects is not None:
                 self.max_gap[slot], self.substitutions[slot] = float(suspects[i][0]), list(suspects[i][1])
                 tokens, meta = rollout.commit["tokens"], rollout.commit.get("rollout", {})
@@ -155,9 +169,9 @@ class DrawGate:
 
             from reliquary.trainer.distributed import all_reduce_tensor_sum
 
-            flat = torch.tensor([t + [f, a, m, b] for t, f, a, m, b in zip(self.tallies, self.forwarded,
-                                                                            self.admitted, self.max_gap,
-                                                                            self.bad_terminal)],
+            flat = torch.tensor([t + [f, a, m, b] + d for t, f, a, m, b, d in zip(self.tallies, self.forwarded,
+                                                                                   self.admitted, self.max_gap,
+                                                                                   self.bad_terminal, self.drift)],
                                 dtype=torch.float64, device=dist.device)
             rows = all_reduce_tensor_sum(flat).cpu().tolist()      # each slot is forwarded on one rank only
             self.tallies = [[int(v) for v in row[:4]] for row in rows]
@@ -165,6 +179,7 @@ class DrawGate:
             self.admitted = [int(row[5]) for row in rows]
             self.max_gap = [float(row[6]) for row in rows]
             self.bad_terminal = [int(row[7]) for row in rows]
+            self.drift = [[float(v) for v in row[8:]] for row in rows]
             if torch.distributed.is_initialized():
                 every = [None] * torch.distributed.get_world_size()
                 torch.distributed.all_gather_object(every, self.substitutions)
@@ -198,7 +213,97 @@ class DrawGate:
         if self.accepted is not None:
             out["async/groups_accepted"] = sum(self.accepted)
             out["async/groups_rejected"] = len(self.accepted) - sum(self.accepted)
-        return {**out, **self.extra}
+        return {**out, **self.drift_metrics(), **self.extra}
+
+    def drift_metrics(self) -> dict[str, float]:
+        """Miner-vs-trainer drift broken down by lag bucket, env, token position, entropy and Gumbel gap."""
+        out: dict[str, float] = {}
+        slots = [s for s, f in enumerate(self.forwarded) if f]
+        if not slots:
+            return out
+        gaps = sorted(self.max_gap[s] for s in slots)
+        for q in (50, 90, 99):
+            out[f"async/rollout_gap_p{q}"] = gaps[min(len(gaps) - 1, int(len(gaps) * q / 100))]
+        total = [sum(self.drift[s][i] for s in slots) for i in range(DRIFT_WIDTH)]
+        out.update(_drift_breakdown(total, "async/drift"))
+        if self.lags is not None:
+            lags = sorted(self.lags)
+            out["async/lag_max"] = lags[-1]
+            out["async/lag_p90"] = lags[min(len(lags) - 1, int(len(lags) * 0.9))]
+        labels = []
+        if self.lags is not None:
+            labels.append(("by_lag", [_lag_bucket(v) for v in self.lags]))
+        if self.envs is not None:
+            labels.append(("by_env", self.envs))
+        for kind, names in labels:
+            for name in sorted(set(names)):
+                members = [g for g, n in enumerate(names) if n == name]
+                out.update(self._slice_metrics(f"async/{kind}/{name}", members))
+        return out
+
+    def _slice_metrics(self, prefix: str, members: list[int]) -> dict[str, float]:
+        slots = [s for g in members for s in self.groups[g] if self.forwarded[s]]
+        tallies = [sum(self.tallies[s][i] for s in slots) for i in range(4)]
+        out = {f"{prefix}/groups": len(members), f"{prefix}/rollouts": len(slots),
+               f"{prefix}/match_rate": tallies[1] / tallies[0] if tallies[0] else 1.0,
+               f"{prefix}/substitution_rate": 1.0 - tallies[3] / tallies[2] if tallies[2] else 0.0}
+        if slots:
+            n = len(slots)
+            out[f"{prefix}/below_floor_ratio"] = sum(1 - self.admitted[s] for s in slots) / n
+            out[f"{prefix}/over_gap_tolerance_ratio"] = sum(self.max_gap[s] > self.gap_tolerance for s in slots) / n
+            out[f"{prefix}/regraded_ratio"] = sum(bool(self.substitutions[s]) for s in slots) / n
+            rows = sum(self.drift[s][1] for s in slots)
+            out[f"{prefix}/entropy"] = sum(self.drift[s][0] for s in slots) / rows if rows else 0.0
+        if self.accepted is not None and members:
+            out[f"{prefix}/groups_rejected_ratio"] = sum(not self.accepted[g] for g in members) / len(members)
+        return out
+
+
+def _lag_bucket(lag: int) -> str:
+    return str(lag) if lag < 3 else "3plus"
+
+
+def _edge_names(edges, unit: str = "") -> list[str]:
+    fmt = lambda v: f"{v // 1024}k" if unit == "k" else f"{v:g}".replace(".", "p")  # noqa: E731 (no dots in wandb keys)
+    return ([f"lt{fmt(edges[0])}"] + [f"{fmt(a)}_{fmt(b)}" for a, b in zip(edges, edges[1:])]
+            + [f"ge{fmt(edges[-1])}"])
+
+
+def _drift_breakdown(total: list[float], prefix: str) -> dict[str, float]:
+    """Match rate per position and entropy bucket, and mismatch-gap quantiles, from summed drift rows."""
+    out: dict[str, float] = {}
+    col = 2
+    for kind, edges, unit in (("match_by_position", DRIFT_POSITION_EDGES, "k"),
+                              ("match_by_entropy", DRIFT_ENTROPY_EDGES, "")):
+        for i, name in enumerate(_edge_names(edges, unit)):
+            n_stoch, n_match = total[col + 2 * i], total[col + 2 * i + 1]
+            out[f"{prefix}/{kind}/{name}"] = n_match / n_stoch if n_stoch else 1.0
+            out[f"{prefix}/stochastic_tokens/{kind.split('_by_')[1]}/{name}"] = n_stoch
+        col += 2 * (len(edges) + 1)
+    bins = total[col:col + len(DRIFT_GAP_EDGES) + 1]
+    missed = sum(bins)
+    out[f"{prefix}/mismatched_tokens"] = missed
+    for q in (50, 90, 99):
+        # Upper edge of the bin holding the quantile (inf past the last edge is reported as twice it).
+        value, seen = 0.0, 0.0
+        for i, count in enumerate(bins):
+            seen += count
+            if missed and seen >= missed * q / 100:
+                value = DRIFT_GAP_EDGES[i] if i < len(DRIFT_GAP_EDGES) else 2 * DRIFT_GAP_EDGES[-1]
+                break
+        out[f"{prefix}/mismatch_gap_p{q}"] = value
+    return out
+
+
+def _env_length_metrics(submitted: list[SubmittedGroup]) -> dict[str, float]:
+    """Per env: mean completion length and the share of truncated rollouts in the batch."""
+    tokens: dict[str, list[int]] = {}
+    cut: dict[str, int] = {}
+    for group in submitted:
+        tokens.setdefault(group.environment, []).extend(len(c) for c in group.completions)
+        cut[group.environment] = cut.get(group.environment, 0) + sum(bool(t) for t in group.truncated)
+    return {**{f"async/by_env/{env}/completion_tokens_mean": sum(v) / len(v) for env, v in tokens.items() if v},
+            **{f"async/by_env/{env}/truncated_ratio": cut[env] / len(v) for env, v in tokens.items() if v}}
 
 
 def training_group(group: SubmittedGroup, *, slot0: int, index: int) -> SimpleNamespace:
@@ -340,6 +445,9 @@ class AsyncTrainer:
         self.last_publication = {"async/published_checkpoint": version, "async/publish_s": seconds,
                                  **({"async/delta_bytes": deltas[-1]} if deltas else {})}
         logger.info("async checkpoint %d published and adopted in %.1fs", version, seconds)
+        measure = getattr(self.publisher, "measure_update", None)
+        if measure is not None:                       # after adoption: miners never wait for it
+            self.last_publication = {**self.last_publication, **measure()}
 
     def wait_published(self) -> None:
         if self._pending is not None:
@@ -417,14 +525,16 @@ class AsyncTrainer:
         gate = DrawGate([[r._async_slot for r in g.rollouts] for g in batch],
                         rollout_floor=self.config.rollout_floor, group_floor=self.config.group_floor,
                         forgery_floor=self.config.forgery_floor, gap_tolerance=self.config.gap_tolerance,
-                        substitute_gap=self.config.substitute_gap, terminal_gap=self.config.terminal_gap, eos_ids=self.config.eos_ids)
+                        substitute_gap=self.config.substitute_gap, terminal_gap=self.config.terminal_gap, eos_ids=self.config.eos_ids,
+                        envs=[g.environment for g in submitted], lags=[self.version - g.checkpoint for g in submitted])
         envs: dict[str, int] = {}
         for group in submitted:
             envs[group.environment] = envs.get(group.environment, 0) + 1
         gate.extra = {"async/checkpoint": self.version, "async/stale_dropped": dropped,
                       "async/exhausted_dropped": exhausted,
                       "async/lag_mean": sum(self.version - g.checkpoint for g in submitted) / len(submitted),
-                      **{f"async/batch_groups/{env}": n for env, n in envs.items()}}
+                      **{f"async/batch_groups/{env}": n for env, n in envs.items()},
+                      **_env_length_metrics(submitted)}
         try:
             self.model = self._train_step(self.model, [batch], ref_model=self.ref_model,
                                           window_index=self.steps + 1, global_step_hint=self.global_step_hint,
