@@ -67,6 +67,8 @@ def _set_entries(report: Mapping[str, Any], source: str) -> list[dict]:
                     "sampling": {k: sampling.get(k) for k in ("temperature", "top_p", "top_k")},
                     "max_new_tokens": provenance.get("max_new_tokens"),
                     "thinking": bool(provenance.get("thinking")), "scheme": scheme}
+        if provenance.get("episode") is not None:       # absent for one-turn sets: their ids stay put
+            protocol["episode"] = dict(provenance["episode"])
         headline = env.get("pass@1")
         out.append({"protocol": protocol, "score": None if headline is None else headline["value"],
                     "samples": int(env["n_problems"]), "at": int(float(report["created_at"]) * 1000),
@@ -78,18 +80,27 @@ def _set_entries(report: Mapping[str, Any], source: str) -> list[dict]:
 
 def _protocol_block(protocol: Mapping[str, Any]) -> dict:
     digest = hashlib.sha256(json.dumps(protocol, sort_keys=True).encode()).hexdigest()
-    sampling = protocol["sampling"]
     dataset = protocol["source"] + (f" ({protocol['split']})" if protocol.get("split") else "")
     return {
         "id": f"{protocol['set_id'][:140]}@{digest[:12]}",
         "dataset": dataset[:160],
         "revision": f"prompts {protocol['prompts_sha256'][:16]}, grading {protocol['grading_sha256'][:16]}",
-        "harness": (f"reliquary served eval, {protocol['scheme']}; temperature {sampling['temperature']}, "
-                    f"top_p {sampling['top_p']}, top_k {sampling['top_k']}; "
-                    f"thinking {'on' if protocol['thinking'] else 'off'}; {protocol['problems']} problems"),
+        "harness": _harness_text(protocol),
         "attempts": int(protocol["samples"]),
         "max_output_tokens": int(protocol["max_new_tokens"]),
     }
+
+
+def _harness_text(protocol: Mapping[str, Any]) -> str:
+    sampling, episode = protocol["sampling"], protocol.get("episode")
+    if not episode:
+        return (f"reliquary served eval, {protocol['scheme']}; temperature {sampling['temperature']}, "
+                f"top_p {sampling['top_p']}, top_k {sampling['top_k']}; "
+                f"thinking {'on' if protocol['thinking'] else 'off'}; {protocol['problems']} problems")
+    # The platform caps it at 160 characters; the full episode is in the protocol id's digest.
+    return (f"reliquary signed episodes; {episode['harness']}, {episode['max_turns']} turns, "
+            f"{episode['max_total_tokens']} tokens; T {sampling['temperature']}, top_p {sampling['top_p']}; "
+            f"{protocol['problems']} problems")[:160]
 
 
 def _benchmark_id(set_id: str) -> str:

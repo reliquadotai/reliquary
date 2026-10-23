@@ -272,3 +272,49 @@ def test_a_grading_is_uploaded_create_only(tmp_path):
     (tmp_path / "report.json").write_bytes(b"regraded")
     with pytest.raises(SetConflict):
         asyncio.run(upload_grading("eval-r7-s00010-aime", tmp_path, subnet=subnet))
+
+
+EPISODE = {"env": "reliquary-swe@15ad131b473f59f46b62d363bfacf430f4931f39", "split": "eval",
+           "harness": "mini-swe@2", "renderer": "renderers:qwen38@0.1.11", "max_turns": 48,
+           "max_tokens_per_turn": 8192, "max_total_tokens": 60000}
+
+
+def episode_report(*, step=None, score=0.36, episode=EPISODE):
+    r = report("reliquary-swe-eval-r0-n500-x7-k100-s7", step=step, score=score, problems=100, samples=2,
+               env="reliquary-swe")
+    r["provenance"]["episode"] = dict(episode)
+    r["provenance"]["max_new_tokens"] = 8192
+    r["provenance"]["verification"] = {"scheme": "swe-tests-v1"}
+    return r
+
+
+def test_an_agentic_set_carries_its_episode_in_the_protocol():
+    feed = build_feed(RUN, [("s", episode_report(step=20, score=0.4))], [("b", episode_report())],
+                      observed_at_ms=NOW)
+    (swe,) = feed["benchmarks"]
+    harness = swe["protocol"]["harness"]
+    assert "mini-swe@2, 48 turns, 60000 tokens" in harness and len(harness) <= 160
+    assert swe["protocol"]["max_output_tokens"] == 8192 and swe["protocol"]["attempts"] == 2
+    assert swe["baseline"]["score"] == 0.36 and swe["checkpoints"][0]["score"] == 0.4
+    # the same set and sampling played under other bounds is another protocol
+    bare = build_feed(RUN, [("s", episode_report(step=20, episode={**EPISODE, "max_turns": 24}))],
+                      observed_at_ms=NOW)["benchmarks"][0]
+    assert bare["protocol"]["id"] != swe["protocol"]["id"]
+    with pytest.raises(ValueError, match="another protocol"):
+        build_feed(RUN, [("s", episode_report(step=20, episode={**EPISODE, "harness": "bash-vf@1"}))],
+                   [("b", episode_report())], observed_at_ms=NOW)
+
+
+def test_one_turn_protocol_ids_do_not_move():
+    """The ids of the baselines already published (no episode) stay what they were."""
+    import hashlib
+
+    feed = build_feed(RUN, [("a", report(step=4))], observed_at_ms=NOW)
+    protocol = {"set_id": "verifiers-aime25-r0-n30", "source": "verifiers:aime25", "split": None,
+                "problems": 30, "samples": 8, "prompts_sha256": "c" * 64, "grading_sha256": "7" * 64,
+                "sampling": {"temperature": 0.6, "top_p": 0.95, "top_k": 0}, "max_new_tokens": 32768,
+                "thinking": True, "scheme": "toploc-v1"}
+    digest = hashlib.sha256(json.dumps(protocol, sort_keys=True).encode()).hexdigest()
+    assert feed["benchmarks"][0]["protocol"]["id"] == f"verifiers-aime25-r0-n30@{digest[:12]}"
+    assert feed["benchmarks"][0]["protocol"]["harness"] == (
+        "reliquary served eval, toploc-v1; temperature 0.6, top_p 0.95, top_k 0; thinking on; 30 problems")

@@ -182,6 +182,11 @@ def test_episode_grade_scores_rewards(tmp_path, monkeypatch, interaction, scheme
     assert provenance["verification"]["scheme"] == scheme
     assert provenance["verification"]["source"] == "grade documents"
     assert provenance["job_complete"] is True and provenance["miner_hotkeys"] == 2
+    from reliquary.eval.job_grading import episode_protocol
+
+    assert provenance["episode"] == episode_protocol(job.episode)
+    assert provenance["episode"]["max_turns"] == job.episode.max_turns
+    assert provenance["episode"]["env"] == f"{job.episode.env.package}@{job.episode.env.version}"
     table = pq.read_table(tmp_path / "out" / "graded.parquet").to_pylist()
     assert [(r["problem_id"], r["sample_index"], r["score"], r["correct"]) for r in table] == [
         (rows[0]["problem_id"], 0, 1.0, True), (rows[0]["problem_id"], 1, 0.0, False),

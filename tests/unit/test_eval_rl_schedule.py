@@ -200,3 +200,90 @@ def test_eval_schedule_is_a_dry_run_unless_told(tmp_path, monkeypatch):
     done = CliRunner().invoke(app, argv + ["--execute", "--wallet-name", "w", "--hotkey", "h", "--http-port", "1"])
     assert done.exit_code == 0, done.output
     assert world.started and (tmp_path / "results" / "schedule-state.json").exists()
+
+
+def test_an_agentic_set_declares_its_episode_harness_and_renderer(tmp_path):
+    (tmp_path / "swe").mkdir()
+    (tmp_path / "swe" / "episode.json").write_text(json.dumps({"harness": "bash", "max_turns": 48}))
+    path = tmp_path / "suite.json"
+    agentic = {"set_id": "reliquary-swe-eval-r0-n500-x7-k100-s7", "short": "swe-verified", "slots_per_prompt": 2,
+               "cap": 0.02, "max_new_tokens": 8192, "episode_file": "swe/episode.json", "harness": "mini-swe@2",
+               "renderer_id": "renderers:qwen38@0.1.11"}
+    path.write_text(json.dumps([{"set_id": "s", "short": "aime", "slots_per_prompt": 8, "cap": 0.02,
+                                 "max_new_tokens": 32768}, agentic]))
+    one_turn, swe = load_suite(path)
+    assert swe.episode_file == str(tmp_path / "swe" / "episode.json")       # relative to the suite file
+    world = World()
+    sch = scheduler(tmp_path, world, suite=[one_turn, swe])
+    sch.tick(execute=True)
+    plain, episode = world.commands
+    assert "--episode-file" not in plain and "--harness" not in plain
+    assert plain[plain.index("--renderer-id") + 1] == "chat-template-thinking-v1"
+    assert episode[episode.index("--episode-file") + 1] == swe.episode_file
+    assert episode[episode.index("--harness") + 1] == "mini-swe@2"
+    assert episode[episode.index("--renderer-id") + 1] == "renderers:qwen38@0.1.11"
+    assert episode[episode.index("--max-new-tokens") + 1] == "8192"
+    assert episode[episode.index("--job-id") + 1] == "eval-r7-base-swe-verified"
+
+
+@pytest.mark.parametrize("change", [{"harness": "mini-swe@2", "episode_file": None},
+                                    {"episode_file": "missing.json"}, {"episode_file": "list.json"}])
+def test_an_agentic_set_without_a_readable_episode_is_refused(tmp_path, change):
+    (tmp_path / "list.json").write_text("[]")
+    entry = {"set_id": "s", "short": "swe", "slots_per_prompt": 2, "cap": 0.02, "max_new_tokens": 8192, **change}
+    path = tmp_path / "suite.json"
+    path.write_text(json.dumps([entry]))
+    with pytest.raises((ValueError, OSError)):
+        load_suite(path)
+
+
+def test_chosen_steps_and_sets_run_exactly_those(tmp_path):
+    world = World()
+    world.backups = [50, 100, 150]
+    s = scheduler(tmp_path, world, baseline_model=None, every=None, steps=(100, 50), only=("gpqa",))
+    s.tick(execute=True)
+    assert [a[a.index("--job-id") + 1] for a in world.commands] == ["eval-r7-s00100-gpqa"]
+    assert "RELIQUARY_TASK_ID=eval-r7-s00100-gpqa" in world.started[0]
+    world.drained.add("eval-r7-s00100-gpqa")
+    s.tick(execute=True)                                   # graded, then the next asked step, nothing skipped
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert state["active"] == "50" and "150" not in state["checkpoints"]
+    world.drained.add("eval-r7-s00050-gpqa")
+    assert "the asked steps are evaluated" in s.tick(execute=True)
+
+
+def test_a_step_no_longer_on_hf_is_reported(tmp_path):
+    world = World()
+    world.backups = [50]
+    world.incomplete.add("ReliquaryForge/teutonic-rl-r7-step-00000040")
+    s = scheduler(tmp_path, world, baseline_model=None, every=None, steps=(40,))
+    assert "step 40: no complete backup ReliquaryForge/teutonic-rl-r7-step-00000040" in s.tick(execute=True)
+    assert not world.commands
+
+
+def test_a_set_added_later_runs_on_the_baseline_and_checkpoint_with_their_weights(tmp_path):
+    world = World()
+    world.backups = [50]
+    state = {"run_id": RUN, "active": None, "pid": None, "checkpoints": {"base": {
+        "status": "graded", "repo": "ReliquaryForge/Teutonic-I-Reliquary-SFT", "revision": "b" * 40,
+        "sha256": "c" * 64, "jobs": ["eval-seeded-sft-aime"], "graded": ["eval-seeded-sft-aime"],
+        "abandoned": [], "started_at": 1.0}}}
+    (tmp_path / "state.json").write_text(json.dumps(state))
+    s = scheduler(tmp_path, world, every=None, steps=(50,))
+    s.tick(execute=True)                                   # the seeded aime baseline counts: only gpqa runs
+    assert [a[a.index("--job-id") + 1] for a in world.commands] == ["eval-r7-base-gpqa"]
+    create = world.commands[0]
+    assert create[create.index("--checkpoint-sha256") + 1] == "c" * 64
+    assert "RELIQUARY_TASK_ID=eval-r7-base-gpqa" in world.started[0]
+    world.drained.add("eval-r7-base-gpqa")
+    s.tick(execute=True)
+    base = json.loads((tmp_path / "state.json").read_text())["checkpoints"]["base"]
+    assert base["graded"] == ["eval-seeded-sft-aime", "eval-r7-base-gpqa"]
+    assert world.graded[0][0] == "eval-r7-base-gpqa"
+
+
+def test_steps_or_every_and_known_sets_only(tmp_path):
+    with pytest.raises(ValueError, match="--every"):
+        scheduler(tmp_path, World(), every=None)
+    with pytest.raises(ValueError, match="not in the suite"):
+        scheduler(tmp_path, World(), only=("mmlu",))

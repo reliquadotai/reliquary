@@ -7,12 +7,13 @@ Each ``tick`` (idempotent, its state in one JSON file):
    stop its validator and rebuild the feed (``run_feed``), published when asked (public bucket and/or the summary
    of a W&B evaluation run, ``wandb_feed``). A validator found dead is
    restarted.
-2. Nothing served: the start checkpoint first (the baseline), then the NEWEST milestone backup
+2. Nothing served: the start checkpoint first (the baseline, and later the suite's sets it never ran), then the
+   steps asked for (``steps``: exactly those, each for the sets it misses), else the NEWEST milestone backup
    (``<namespace>/<prefix>-step-<n>``, ``n`` a multiple of ``every``) past the last one taken. The ones in between
    are marked skipped: when evaluations fall behind they jump to the latest milestone, and training never waits
    (the trainer does not know this exists). Its jobs are declared (``jobs create``, ids
    ``eval-<run>-s<step:05d>-<short>``) and one validator process is started for that model; the suite's later jobs
-   join it as hot jobs (one model per process).
+   join it as hot jobs (one model per process). ``only`` narrows the suite to some of its sets.
 
 Dry run by default: the reads happen (backups, job drains), the writes are printed, the state is not saved.
 """
@@ -20,7 +21,7 @@ Dry run by default: the reads happen (backups, job drains), the writes are print
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import logging
 from pathlib import Path
@@ -45,23 +46,41 @@ class SuiteEntry:
     short: str
     slots_per_prompt: int
     cap: float
-    max_new_tokens: int
+    max_new_tokens: int                 # an episode job: per turn
     prompt_count: int | None = None
+    # An agentic (multi-turn) set: its `jobs create --episode-file`, `--harness id@version` and renderer.
+    episode_file: str | None = None
+    harness: str | None = None
+    renderer_id: str | None = None
+
+
+_SUITE_KEYS = {"set_id", "short", "slots_per_prompt", "cap", "max_new_tokens", "prompt_count",
+               "episode_file", "harness", "renderer_id"}
 
 
 def load_suite(path: str | Path) -> list[SuiteEntry]:
-    """A JSON list of ``{set_id, short, slots_per_prompt, cap, max_new_tokens[, prompt_count]}``."""
-    raw = json.loads(Path(path).read_text())
+    """A JSON list of ``{set_id, short, slots_per_prompt, cap, max_new_tokens[, prompt_count]}``, plus
+    ``episode_file`` (relative to the suite file), ``harness`` and ``renderer_id`` for an agentic set."""
+    path = Path(path)
+    raw = json.loads(path.read_text())
     if not isinstance(raw, list) or not raw:
         raise ValueError("the suite is a non-empty JSON list")
     suite = []
     for item in raw:
-        unknown = set(item) - {"set_id", "short", "slots_per_prompt", "cap", "max_new_tokens", "prompt_count"}
+        unknown = set(item) - _SUITE_KEYS
         if unknown:
             raise ValueError(f"suite entry {item.get('set_id')!r}: unknown keys {sorted(unknown)}")
         entry = SuiteEntry(**item)
         if not _SHORT.fullmatch(entry.short):
             raise ValueError(f"short {entry.short!r}: lowercase letters, digits and '-', at most 16")
+        if entry.episode_file is None:
+            if entry.harness is not None:
+                raise ValueError(f"suite entry {entry.set_id!r}: a harness needs an episode_file")
+        else:
+            episode = (path.parent / entry.episode_file).resolve()
+            if not isinstance(json.loads(episode.read_text()), dict):
+                raise ValueError(f"suite entry {entry.set_id!r}: {episode} is not an episode object")
+            entry = replace(entry, episode_file=str(episode))
         suite.append(entry)
     if len({e.short for e in suite}) != len(suite) or len({e.set_id for e in suite}) != len(suite):
         raise ValueError("suite set ids and shorts must be unique")
@@ -82,7 +101,7 @@ class Settings:
     run_id: str                         # the trainer's wandb run id (the feed's run_id)
     run_tag: str                        # short lowercase tag in the job ids
     suite: Sequence[SuiteEntry]
-    every: int                          # a checkpoint every N steps (a multiple of the milestone cadence)
+    every: int | None                   # a checkpoint every N steps (a multiple of the milestone cadence)
     hf_namespace: str
     hf_prefix: str
     model_architecture: str
@@ -103,6 +122,8 @@ class Settings:
     wandb_run_id: str | None = None     # default: <trainer group>-evals
     wandb_project: str | None = None    # default: WANDB_PROJECT, then reliquary-validator
     wandb_entity: str | None = None     # default: WANDB_ENTITY
+    steps: Sequence[int] = ()           # evaluate exactly these steps instead of following the milestones
+    only: Sequence[str] = ()            # these suite shorts only (default: the whole suite)
 
     def repo(self, step: int) -> str:
         return f"{self.hf_namespace}/{self.hf_prefix}-step-{step:08d}"
@@ -127,6 +148,12 @@ class Ports:
 class Scheduler:
     def __init__(self, settings: Settings, ports: Ports, *, clock: Callable[[], float] = time.time) -> None:
         self.s, self.p, self.clock = settings, ports, clock
+        unknown = set(settings.only) - {e.short for e in settings.suite}
+        if unknown:
+            raise ValueError(f"--only {sorted(unknown)}: not in the suite")
+        if not settings.steps and settings.every is None:
+            raise ValueError("give --every (follow the milestones) or --step (these checkpoints)")
+        self.entries = [e for e in settings.suite if not settings.only or e.short in settings.only]
 
     # --- state ---------------------------------------------------------------------------------------------------
     def load(self) -> dict:
@@ -159,9 +186,14 @@ class Scheduler:
             self.save(state)
         return log
 
-    def _jobs(self, key: str) -> list[str]:
-        step = None if key == BASE else int(key)
-        return [job_id(self.s.run_tag, step, e.short) for e in self.s.suite]
+    def _job(self, key: str, entry: SuiteEntry) -> str:
+        return job_id(self.s.run_tag, None if key == BASE else int(key), entry.short)
+
+    def _missing(self, state: dict, key: str) -> list[SuiteEntry]:
+        """The selected sets this checkpoint never ran (graded and abandoned jobs count as run). A job is matched by
+        its set's short, so a seeded baseline under other job names counts too."""
+        have = state["checkpoints"].get(key, {}).get("jobs", ())
+        return [e for e in self.entries if not any(j.endswith(f"-{e.short}") for j in have)]
 
     def _serve(self, state: dict, log: list[str], execute: bool) -> bool:
         """True once the active checkpoint is done (graded or abandoned) and its validator stopped."""
@@ -222,8 +254,18 @@ class Scheduler:
 
     def _next(self, state: dict, log: list[str]) -> str | None:
         cps = state["checkpoints"]
-        if self.s.baseline_model and BASE not in cps:
+        if self.s.baseline_model and self._missing(state, BASE):
             return BASE
+        if self.s.steps:
+            for step in self.s.steps:
+                if not self._missing(state, str(step)):
+                    continue
+                if self.p.revision(self.s.repo(step)) is None:
+                    log.append(f"step {step}: no complete backup {self.s.repo(step)}")
+                    continue
+                return str(step)
+            log.append("the asked steps are evaluated")
+            return None
         taken = [int(k) for k in cps if k != BASE]
         last = max(taken, default=0)
         fresh = sorted(s for s in self.p.backups() if s > last and s % self.s.every == 0)
@@ -243,15 +285,23 @@ class Scheduler:
         return str(ready)
 
     def _begin(self, state: dict, key: str, log: list[str], execute: bool) -> None:
-        if key == BASE:
+        new = self._missing(state, key)
+        old = state["checkpoints"].get(key, {})
+        if "jobs" in old:                                 # ran before: the same weights, the sets it missed
+            repo, revision, sha = old["repo"], old["revision"], old["sha256"]
+        elif key == BASE:
             repo, revision = self.s.baseline_model, self.s.baseline_revision or self.p.revision(self.s.baseline_model)
+            sha = self.p.fingerprint(repo, revision) if execute else "<jobs fingerprint>"
         else:
             repo = self.s.repo(int(key))
             revision = self.p.revision(repo)
-        sha = self.p.fingerprint(repo, revision) if execute else "<jobs fingerprint>"
-        cp = {"status": "serving", "repo": repo, "revision": revision, "sha256": sha, "jobs": self._jobs(key),
-              "graded": [], "abandoned": [], "started_at": self.clock()}
-        for entry, job in zip(self.s.suite, cp["jobs"]):
+            sha = self.p.fingerprint(repo, revision) if execute else "<jobs fingerprint>"
+        cp = {"status": "serving", "repo": repo, "revision": revision, "sha256": sha,
+              "jobs": [*old.get("jobs", ()), *(self._job(key, e) for e in new)],
+              "graded": list(old.get("graded", ())), "abandoned": list(old.get("abandoned", ())),
+              "started_at": self.clock()}
+        for entry in new:
+            job = self._job(key, entry)
             if self.p.job_exists(job):
                 log.append(f"job {job} already declared")
                 continue
@@ -268,24 +318,30 @@ class Scheduler:
         argv = ["reliquary", "jobs", "create", "--fleet-knows-corpus-generation", "--job-id", job,
                 "--model", repo, "--model-revision", revision, "--model-architecture", self.s.model_architecture,
                 "--checkpoint-sha256", sha, "--eval-set", entry.set_id,
-                "--renderer-id", self.s.renderer_id, "--eos-token-id", str(self.s.eos_token_id),
+                "--renderer-id", entry.renderer_id or self.s.renderer_id, "--eos-token-id", str(self.s.eos_token_id),
                 "--max-new-tokens", str(entry.max_new_tokens), "--slots-per-prompt", str(entry.slots_per_prompt),
                 "--temperature", str(self.s.temperature), "--top-p", str(self.s.top_p), "--cap", str(entry.cap)]
         if entry.prompt_count is not None:
             argv += ["--prompt-count", str(entry.prompt_count)]
+        if entry.episode_file is not None:
+            argv += ["--episode-file", entry.episode_file]
+        if entry.harness is not None:
+            argv += ["--harness", entry.harness]
         return argv
 
     def _command(self, cp: dict) -> str:
-        job = cp["jobs"][0]
+        pending = [j for j in cp["jobs"] if j not in cp["graded"] and j not in cp["abandoned"]]
+        job = pending[0]                                  # the validator serves the jobs not graded yet
         values = {k: shlex.quote(str(v)) for k, v in self.s.start_values.items()}
-        return self.s.start_cmd.format(job=job, jobs=",".join(cp["jobs"]), model=cp["repo"],
+        return self.s.start_cmd.format(job=job, jobs=",".join(pending), model=cp["repo"],
                                        revision=cp["revision"],
                                        contract=shlex.quote(str(self.s.results_dir / f"{job}.contract.json")),
                                        **values)
 
     def _start(self, cp: dict) -> int:
         self.s.results_dir.mkdir(parents=True, exist_ok=True)
-        return self.p.start(self._command(cp), self.s.results_dir / f"validator-{cp['jobs'][0]}.log")
+        pending = next(j for j in cp["jobs"] if j not in cp["graded"] and j not in cp["abandoned"])
+        return self.p.start(self._command(cp), self.s.results_dir / f"validator-{pending}.log")
 
 
 # --- the real ports -----------------------------------------------------------------------------------------------
