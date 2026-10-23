@@ -1322,6 +1322,12 @@ if AUCTION_EARLY_CLOSE_MODE not in {"off", "shadow", "enforce"}:
 # pathological. They do not control GPU proof time, which has its own budget.
 MATH_ADMISSION_WALL_SECONDS = 45.0
 CODE_ADMISSION_WALL_SECONDS = 20.0
+# A stdio-program group (competitive code) runs one program per hidden test and rollout: up to ~250 x 16 runs, each a
+# fork in a gVisor worker (~15 ms for an honest program). The async submission path adds this much wall per run to
+# CODE_ADMISSION_WALL_SECONDS, up to the max: a 20 s budget for 4,000 runs made every group that was mostly right
+# on a big problem overrun, and the pool replacement took the groups queued behind it down with it.
+STDIO_ADMISSION_SECONDS_PER_RUN = 0.05
+STDIO_ADMISSION_MAX_WALL_SECONDS = 300.0
 ADMISSION_PROCESS_MAX_TASKS = 128
 
 # Per-hotkey cap on BAD_ENVELOPE_SIGNATURE rejects per window. The

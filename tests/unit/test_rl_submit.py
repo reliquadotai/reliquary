@@ -189,6 +189,27 @@ def test_a_grader_outage_leaves_the_lease_open_for_a_resend(book, monkeypatch):
     assert book.lease(held.lease_id).state == "open" and subs.group(held.lease_id) is None
 
 
+def test_a_scorer_that_raises_is_a_logged_reward_error_that_never_halves_the_quota(book, monkeypatch, caplog):
+    subs = service(book)
+    held = lease(book, 7)
+    before = book.quota.state("A", NOW)
+
+    def broken(*args, **kwargs):
+        raise KeyError("scorer bug")
+
+    monkeypatch.setattr("reliquary.environment.registry.EnvironmentSpec.score_many", broken)
+    with caplog.at_level("ERROR", logger="reliquary.validator.rl_submit"):
+        answer = subs.submit(held.lease_id, "A", group(8))
+    assert answer["verdict"] == "rejected" and answer["reason"] == "reward_error"
+    assert book.lease(held.lease_id).state == "submitted"                  # closed: never graded twice
+    logged = [r for r in caplog.records if "reward_error" in r.getMessage()]
+    assert len(logged) == 2 and all(ENV in r.getMessage() and "prompt 7" in r.getMessage() for r in logged)
+    assert logged[0].exc_info is not None and logged[0].exc_info[0] is KeyError        # the traceback
+    assert held.lease_id[:12] in logged[1].getMessage() and "A" in logged[1].getMessage()
+    after = book.quota.state("A", NOW)
+    assert after["quota"] == before["quota"] and after["counters"]["rejected"] == 0     # the validator's failure
+
+
 def test_probation_audits_every_group_then_the_rate_draws_after_submission(book):
     subs = service(book, probation_groups=2, audit_rate=0.0)
     first = [lease(book, p) for p in (10, 11)]
