@@ -57,6 +57,8 @@ dev = [
     "Pillow==13.0.0",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "pytest-timeout>=2.3",
+    "pytest-xdist>=3.5",
 ]
 wandb = [
     "wandb>=0.16",
