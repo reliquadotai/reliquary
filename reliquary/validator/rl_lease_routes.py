@@ -138,6 +138,9 @@ class RlSubmitRequestBody(BaseModel):
     lease_id: str = Field(min_length=1, max_length=64)
     rollouts: list[RlSubmitRollout] = Field(min_length=1, max_length=GROUP_ROLLOUTS)
     k_generated: int | None = Field(default=None, ge=0, strict=True)   # informational: unsigned, ignored
+    # Optional, unsigned, never scored or paid: the miner process's /miner/setup instance_id, so the dashboard can
+    # attribute the group to the cards that process declared (a hotkey may run several kinds of cards).
+    instance_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{16,64}$")
     signature: str = Field(default="", max_length=256)
 
 
@@ -565,6 +568,12 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
                 entry[1] -= 1
                 if not entry[1]:
                     graders.pop(hotkey, None)
+            if request.instance_id is not None:
+                try:
+                    await asyncio.to_thread(submissions.tag_instance, request.lease_id, hotkey, request.instance_id)
+                except Exception as exc:                 # a census label: never fails the submission
+                    logger.warning("rl submit: instance tag of %s not kept (%s)", request.lease_id[:12],
+                                   type(exc).__name__)
             logger.info("rl submit: %s from %s: %s%s (k_generated=%s)", request.lease_id[:12], hotkey[:12],
                         answer["verdict"], " (resend)" if answer.get("resent") else "", request.k_generated)
             return _answer(answer)

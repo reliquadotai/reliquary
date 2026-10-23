@@ -755,3 +755,56 @@ async def test_the_http_forfeit_names_the_sandbox_failure_and_falls_back_for_an_
         bodies.clear()
         await transport.forfeit("L2")
         assert [b.get("reason") for b in bodies] == [None]
+
+
+async def test_the_transport_tags_submissions_with_its_instance_and_drops_the_tag_for_an_older_validator(tmp_path):
+    """--share-setup: each submission names the process's /miner/setup instance; a validator that does not know the
+    field refuses it as malformed, and the same group goes through once without it (the tag is then never sent)."""
+    bt = pytest.importorskip("bittensor")
+    httpx = pytest.importorskip("httpx")
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+
+    from reliquary.miner.rl_async import HeldLease, HttpRlTransport
+    from reliquary.validator.rl_lease_quota import QuotaConfig, QuotaController
+    from reliquary.validator.rl_lease_routes import build_rl_lease_router
+    from reliquary.validator.rl_leases import LeaseBook, LeaseBookConfig, LeaseCollector
+    from reliquary.validator.rl_submit import GroupGrader, RlSubmissions
+    from tests.unit.test_rl_submit import ENV as MATH, MathEnv, Tokenizer, group
+
+    miner_key = bt.Keypair.create_from_uri("//Alice")
+    validator_key = bt.Keypair.create_from_uri("//Bob")
+    book = LeaseBook(tmp_path / "leases.sqlite3", LeaseBookConfig(expiry_s={MATH: 600.0}, cooldown_of=lambda e: 2),
+                     quota=QuotaController(QuotaConfig(initial=4)))
+    book.adopt_checkpoint(0)
+    subs = RlSubmissions(book, GroupGrader({MATH: MathEnv()}, Tokenizer(), eos_token_ids=(1,)), rng=random.Random(0))
+    app = FastAPI()
+    app.include_router(build_rl_lease_router(book=book, collector=LeaseCollector(book, interval_s=0.0),
+                                             validator_hotkey=validator_key.ss58_address, submissions=subs))
+    seen, older = [], False
+
+    @app.middleware("http")
+    async def older_validator(request, call_next):           # forbids the field, as before it existed
+        body = json.loads(await request.body() or b"{}")
+        seen.append("instance_id" in body)
+        if request.url.path == "/rl/submit" and "instance_id" in body and older:
+            return JSONResponse(
+                status_code=422, content={"error": "malformed_request", "reason": "malformed_request",
+                                          "errors": [{"loc": ["instance_id"], "type": "extra_forbidden"}]})
+        return await call_next(request)
+
+    rollouts = [list(r.tokens) for r in group(8)]
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://v") as client:
+        transport = HttpRlTransport(client, base_url="http://v", hotkey=miner_key.ss58_address,
+                                    validator_hotkey=validator_key.ss58_address,
+                                    sign_binding=lambda binding: miner_key.sign(binding).hex())
+        transport.instance_id = "c" * 32
+        held = [HeldLease.from_wire(item) for item in (await transport.lease(MATH, 0, [1, 2, 3]))["leases"]]
+        assert (await transport.submit(encode_submission(held[0], rollouts, 0)))["verdict"] == "in_zone"
+        assert book.db.execute("SELECT instance_id FROM rl_group_instances").fetchall() == [("c" * 32,)]
+        older, seen[:] = True, []
+        assert (await transport.submit(encode_submission(held[1], rollouts, 0)))["verdict"] == "in_zone"
+        assert seen == [True, False] and transport.instance_id is None
+        seen[:] = []
+        assert (await transport.submit(encode_submission(held[2], rollouts, 0)))["verdict"] == "in_zone"
+        assert seen == [False]

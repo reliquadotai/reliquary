@@ -217,9 +217,11 @@ class HeldLease:
 class RequestRefused(Exception):
     """A route answered with a refusal for the whole request. ``retryable``: 429/503/5xx or a transport error."""
 
-    def __init__(self, reason: str, *, retryable: bool, retry_after: float | None = None) -> None:
+    def __init__(self, reason: str, *, retryable: bool, retry_after: float | None = None,
+                 errors: Sequence[Mapping[str, Any]] = ()) -> None:
         super().__init__(reason)
         self.reason, self.retryable, self.retry_after = reason, retryable, retry_after
+        self.errors = list(errors)                    # a malformed_request's field errors ({loc, type})
 
 
 @dataclass(frozen=True)
@@ -305,6 +307,9 @@ class HttpRlTransport:
         self._client, self._base = client, base_url.rstrip("/")
         self.hotkey, self.validator_hotkey, self._prefix = hotkey, validator_hotkey, prefix
         self._sign, self._clock = sign_binding, clock
+        # Set with --share-setup: each submission names this process's /miner/setup instance (unsigned, census only)
+        # so the dashboard can tell a hotkey's cards apart. Dropped for good if the validator does not know the field.
+        self.instance_id: str | None = None
 
     async def _call(self, method: str, path: str, **kwargs) -> Any:
         import httpx
@@ -315,13 +320,17 @@ class HttpRlTransport:
             raise RequestRefused(type(exc).__name__, retryable=True) from exc
         if response.status_code == 200:
             return response.json()
+        errors: list = []
         try:
-            reason = str(response.json().get("reason") or response.status_code)
-        except ValueError:
+            answer = response.json()
+            reason = str(answer.get("reason") or response.status_code)
+            errors = [e for e in answer.get("errors") or [] if isinstance(e, dict)]
+        except (ValueError, AttributeError):
             reason = str(response.status_code)
         retry_after = response.headers.get("Retry-After")
         raise RequestRefused(reason, retryable=response.status_code in (429, 503) or response.status_code >= 500,
-                             retry_after=float(retry_after) if retry_after and retry_after.isdigit() else None)
+                             retry_after=float(retry_after) if retry_after and retry_after.isdigit() else None,
+                             errors=errors)
 
     async def prompt_state(self, since: int, environment: str) -> dict:
         return await self._call("GET", f"{self._prefix}/prompts/state",
@@ -343,6 +352,18 @@ class HttpRlTransport:
         return await self._call("POST", path, json=body)
 
     async def submit(self, payload: dict) -> dict:
+        if self.instance_id is None:
+            return await self._submit(payload)
+        try:
+            return await self._submit({**payload, "instance_id": self.instance_id})
+        except RequestRefused as exc:
+            if not any(list(e.get("loc") or ()) == ["instance_id"] for e in exc.errors):
+                raise
+            logger.info("the validator does not take a submission's instance_id; submitting without it")
+            self.instance_id = None
+            return await self._submit(payload)
+
+    async def _submit(self, payload: dict) -> dict:
         from reliquary.protocol.signatures import build_rl_submit_binding
 
         path = f"{self._prefix}/submit"
@@ -1299,7 +1320,10 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
                                   model_dir=model_files)
             weights = PayWeights(validator_url).weights
             if share_setup is not None:
-                from reliquary.miner.miner_setup import share_setup_forever
+                from reliquary.miner.miner_setup import INSTANCE_ID_FILE, share_setup_forever
+                from reliquary.protocol.miner_setup import load_instance_id
+
+                transport.instance_id = load_instance_id(Path(work_dir) / INSTANCE_ID_FILE)
 
                 sharing = asyncio.create_task(share_setup_forever(
                     client, validator_url=validator_url, validator_hotkey=validator_hotkey, wallet=wallet,
