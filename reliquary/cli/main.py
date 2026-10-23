@@ -2593,8 +2593,12 @@ def eval_schedule(
     suite: str = typer.Option(..., "--suite", help="JSON list of {set_id, short, slots_per_prompt, cap, "
                                                    "max_new_tokens[, prompt_count]}; an agentic set adds "
                                                    "episode_file (relative to the suite), harness, renderer_id"),
-    every: int = typer.Option(..., "--every", min=1, help="Evaluate checkpoints whose step is a multiple of this "
-                                                          "(a multiple of RELIQUARY_RL_HF_BACKUP_MILESTONE_EVERY)"),
+    every: int | None = typer.Option(None, "--every", min=1, help="Follow the run: the newest checkpoint whose step "
+                                     "is a multiple of this (a multiple of RELIQUARY_RL_HF_BACKUP_MILESTONE_EVERY)"),
+    steps: list[int] = typer.Option([], "--step", min=1, help="Instead of --every: evaluate exactly this step "
+                                    "(repeatable; still on HF: a milestone or one of the last backups)"),
+    only: str = typer.Option("", "--only", help="Comma-separated suite shorts to run (default: the whole suite); "
+                             "a checkpoint already evaluated runs only the sets it misses"),
     hf_prefix: str = typer.Option(..., "--hf-prefix", help="RELIQUARY_RL_HF_BACKUP_PREFIX of the trainer"),
     hf_namespace: str = typer.Option("ReliquaryForge", "--hf-namespace"),
     model_architecture: str = typer.Option(..., "--model-architecture"),
@@ -2642,13 +2646,16 @@ def eval_schedule(
             state_path=Path(state) if state else Path(results_dir) / "schedule-state.json",
             start_cmd=start_cmd or rl_schedule.DEFAULT_START, start_values=values,
             max_wait_s=max_wait_hours * 3600, publish=publish, upload=upload, wandb=wandb or bool(wandb_run_id),
-            wandb_run_id=wandb_run_id, wandb_project=wandb_project, wandb_entity=wandb_entity)
+            wandb_run_id=wandb_run_id, wandb_project=wandb_project, wandb_entity=wandb_entity,
+            steps=tuple(steps), only=tuple(x.strip() for x in only.split(",") if x.strip()))
         if settings.wandb:
             from reliquary.eval.wandb_feed import target
 
             target(run_id, run_id=wandb_run_id)
         for entry in settings.suite:
             rl_schedule.job_id(run_tag, 99999, entry.short)
+        if every is not None and steps:
+            raise ValueError("--every follows the run, --step picks checkpoints: one or the other")
         scheduler = rl_schedule.Scheduler(settings, rl_schedule.live_ports(settings))
         while True:
             for line in scheduler.tick(execute=execute):
