@@ -859,3 +859,24 @@ def test_controller_reopen_does_not_reissue_groups_held_by_a_live_trainer(tmp_pa
         trainer.close()
         link.close()
         live["rl"].close()
+
+
+def test_the_operator_sets_the_global_cap_and_the_lanes_by_env_var():
+    from reliquary.cli.main import build_task_entry, with_rl_async_params
+    from reliquary.constants import PROTOCOL_PROFILE_ID
+    from reliquary.protocol.profiles import resolve_protocol_profile
+    from reliquary.validator.rl_async_service import DEFAULT_MAX_PENDING_GROUPS, lane_reserves
+
+    envs = sorted(resolve_protocol_profile(PROTOCOL_PROFILE_ID).environments)[:2]
+    entry = build_task_entry(task_id="rl-async", profile_id=PROTOCOL_PROFILE_ID, cap=0.4, overrides={},
+                             env_split={envs[0]: 0.75, envs[1]: 0.25})
+    declared = with_rl_async_params(entry, planned_tokens_per_period=2e8)
+    plain = rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={})
+    assert plain.max_pending_groups == DEFAULT_MAX_PENDING_GROUPS and plain.lane_reserves() == {}
+    laned = rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000,
+                              environ={"RELIQUARY_RL_MAX_PENDING_GROUPS": "1536", "RELIQUARY_RL_LANE_RESERVE": "0.5"})
+    assert laned.max_pending_groups == 1536 and laned.lane_reserves() == {envs[0]: 576, envs[1]: 192}
+    assert sum(lane_reserves({"a": 1, "b": 1, "c": 1}, 10, 0.99).values()) <= 10
+    for bad in ({"RELIQUARY_RL_LANE_RESERVE": "1"}, {"RELIQUARY_RL_MAX_PENDING_GROUPS": "0"}):
+        with pytest.raises(ValueError):
+            rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ=bad)
