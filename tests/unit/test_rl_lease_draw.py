@@ -82,3 +82,26 @@ def test_a_rollout_too_short_for_a_rate_is_left_to_the_gap_tests():
     assert rollout_rate((5, 4, 40, 30)) == 0.75                     # long enough: the rate on every drawn position
     assert rollout_rate((25, 20, 40, 35)) == 0.8                    # enough stochastic positions: their rate
     assert pooled_rate([(3, 2, 3, 2)] * 4) == 8 / 12                # a group pools every position, short or not
+
+
+def test_a_range_of_uniforms_is_u_at_bit_for_bit():
+    from reliquary.environment.forced_sampling import u_range
+
+    rng = random.Random(3)
+    for _ in range(5):
+        randomness = "".join(rng.choice("0123456789abcdef") for _ in range(64))
+        tag = "".join(rng.choice("0123456789abcdef") for _ in range(rng.randint(1, 80)))
+        prompt, rollout, n = rng.randrange(2**40), rng.randrange(16), rng.randrange(1, 400)
+        assert u_range(randomness, prompt, tag, rollout, n) == [u_at(randomness, prompt, tag, rollout, t)
+                                                                 for t in range(n)]
+    assert u_range("r", 1, "c", 0, 0) == []
+
+
+def test_the_parallel_batch_returns_the_same_floats():
+    from reliquary.protocol.rl_draw import lease_uniforms_many
+
+    jobs = [("ab" * 16, 10 + i, 7, i % 16, 50 + 13 * i) for i in range(12)]
+    expected = [lease_uniforms(*job) for job in jobs]
+    assert lease_uniforms_many(jobs, parallel=False) == expected
+    assert lease_uniforms_many(jobs, parallel=True) == expected            # a spawned pool, floats bit for bit
+    assert lease_uniforms_many([], parallel=True) == []

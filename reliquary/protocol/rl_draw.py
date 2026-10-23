@@ -23,7 +23,7 @@ Every lease of one (env, prompt, k) therefore draws the same 16 streams, whoever
 from __future__ import annotations
 
 from reliquary.constants import FORCED_SEED_MIN_STOCH_POSITIONS, FORCED_SEED_ROLLOUT_MIN_STOCH
-from reliquary.environment.forced_sampling import u_at
+from reliquary.environment.forced_sampling import u_at, u_range
 
 
 def lease_checkpoint_tag(checkpoint: int) -> str:
@@ -67,8 +67,52 @@ def model_positions(completion_length: int, spans=None) -> list[int]:
 def lease_uniforms(nonce: str, prompt_idx: int, checkpoint: int, rollout_index: int, positions: int) -> list[float]:
     """The public uniforms of rollout ``rollout_index`` at model-token positions ``0..positions-1``."""
     context = lease_draw_context(nonce, prompt_idx, checkpoint)
-    return [u_at(context["randomness"], context["prompt_idx"], context["checkpoint_hash"], int(rollout_index), t)
-            for t in range(int(positions))]
+    return u_range(context["randomness"], context["prompt_idx"], context["checkpoint_hash"], int(rollout_index),
+                   int(positions))
+
+
+# The trainer's batch: ~8k rollouts and ~190M positions a step, ~3 min of one core even through ``u_range``; the GPUs
+# wait for it. Below this many positions a pool is not worth its start.
+PARALLEL_MIN_POSITIONS = 2_000_000
+UNIFORM_WORKERS_ENV = "RELIQUARY_DRAW_UNIFORM_WORKERS"
+_POOL = None
+
+
+def _uniforms_bytes(job: tuple) -> bytes:
+    from array import array
+
+    return array("d", lease_uniforms(*job)).tobytes()
+
+
+def _pool():
+    """One spawned pool per process, kept for the next batch (spawn: the trainer holds CUDA and threads)."""
+    global _POOL
+    if _POOL is None:
+        import multiprocessing
+        import os
+        from concurrent.futures import ProcessPoolExecutor
+
+        workers = int(os.environ.get(UNIFORM_WORKERS_ENV) or min(32, os.cpu_count() or 1))
+        _POOL = ProcessPoolExecutor(max_workers=max(1, workers), mp_context=multiprocessing.get_context("spawn"))
+    return _POOL
+
+
+def lease_uniforms_many(jobs, *, parallel: bool | None = None) -> list[list[float]]:
+    """``[lease_uniforms(*job) for job in jobs]`` (job = nonce, prompt_idx, checkpoint, rollout_index, positions),
+    the same floats, over a process pool when the batch is large (``parallel=None``) or asked to."""
+    jobs = [tuple(job) for job in jobs]
+    if parallel is None:
+        parallel = sum(int(job[4]) for job in jobs) >= PARALLEL_MIN_POSITIONS
+    if not parallel or len(jobs) < 2:
+        return [lease_uniforms(*job) for job in jobs]
+    from array import array
+
+    out = []
+    for blob in _pool().map(_uniforms_bytes, jobs, chunksize=max(1, len(jobs) // 256)):
+        values = array("d")
+        values.frombytes(blob)
+        out.append(values.tolist())
+    return out
 
 
 def rollout_rate(tally, min_stoch: int = FORCED_SEED_ROLLOUT_MIN_STOCH,
@@ -91,5 +135,6 @@ def pooled_rate(tallies, min_stoch: int = FORCED_SEED_MIN_STOCH_POSITIONS) -> fl
     return rollout_rate([sum(t[i] for t in tallies) for i in range(4)], min_stoch, min_drawn=0)
 
 
-__all__ = ["lease_checkpoint_tag", "lease_draw_context", "lease_extra_args", "lease_uniforms", "model_positions",
+__all__ = ["lease_checkpoint_tag", "lease_draw_context", "lease_extra_args", "lease_uniforms", "lease_uniforms_many",
+           "model_positions",
            "pooled_rate", "rollout_rate"]

@@ -1309,7 +1309,9 @@ def _selected_logprobs_from_hidden(
         # The FSDP2 head (reliquary.trainer.distributed) runs this same chunk
         # loop inside ONE module call, so its sharded weight is gathered once
         # for every chunk and its gradient reduced once.
-        return lm_head(hidden_rows, indices, draws, chunk=chunk)
+        from reliquary.trainer.distributed import OpaqueArg
+
+        return lm_head(hidden_rows, indices, None if draws is None else OpaqueArg(draws), chunk=chunk)
     draw_rows = None
     if draws is not None:
         draw_rows = _forced_draw_rows(
