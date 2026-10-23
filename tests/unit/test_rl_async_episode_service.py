@@ -688,6 +688,7 @@ async def test_a_lease_whose_box_died_is_released_on_the_machines_signed_record_
     """A box OOM-killed at its limit: the gateway signs ``box_failed``, the miner closes the session with it and
     forfeits the lease for a sandbox failure: released, no quota cut, no scan. The same claim on a lease whose
     episodes ended graded is charged as an expiry."""
+    world = World(tmp_path, monkeypatch)                       # skipped without the sandbox SDK
     from reliquary_sandbox.attest import SessionClaims
 
     from reliquary.miner.rl_async import HttpRlTransport
@@ -695,7 +696,6 @@ async def test_a_lease_whose_box_died_is_released_on_the_machines_signed_record_
     from reliquary.validator.rl_leases import LeaseRequest
     from tests.unit.sandbox_fixtures import transcript
 
-    world = World(tmp_path, monkeypatch)
     await world.start()
     try:
         died, healthy = world.rl.book.grant([LeaseRequest(MINER.ss58_address, EPISODE, (7, 8), 0)])[0].leases
