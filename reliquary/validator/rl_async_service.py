@@ -539,7 +539,7 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
     async def expire() -> None:
         expired = await asyncio.to_thread(rl.book.expire_due)
         if expired:
-            logger.info("rl leases expired: %d", expired)
+            logger.info("rl leases ended unsubmitted (expired or released): %d", expired)
 
     async def audit() -> None:
         from reliquary.validator.rl_audit import run_rl_audits
@@ -680,6 +680,7 @@ def wire_episode_sandbox(rl: RlAsync, config, *, validator_hotkey: str, environm
                                      environments=environments, policies=rl.settings.episode_policies(),
                                      renderer_for=renderer_for, registration=registration, **kwargs)
     rl.submissions.grader.add_episodes(sandbox.checkers)
+    rl.book.sandbox_failure = sandbox.lease_failure      # a lease our sandbox failed is released, not charged
     rl.sandbox = sandbox
     return sandbox
 

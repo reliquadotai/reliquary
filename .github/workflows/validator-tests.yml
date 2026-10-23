@@ -62,6 +62,7 @@ jobs:
         test_agentic_swe_signed test_bridged_episode test_bridged_swe
         test_corpus_export_signed test_corpus_job_signed_sandbox test_corpus_multi_job_contract
         test_corpus_period_settlement test_corpus_quota test_corpus_settlement
+        test_rl_async_episode_service test_rl_async_episodes
         test_rl_capacity test_rl_capacity_attacks test_rl_check_cap
         test_rl_engagements test_rl_episode_e2e test_rl_episode_miner_side
         test_rl_episode_routes test_rl_episode_wiring test_rl_options_and_boot

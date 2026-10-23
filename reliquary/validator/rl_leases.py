@@ -1,5 +1,5 @@
 """The RL lease book (rl-async-design.md §4.2; implementation map §1.2): a miner reserves prompts before it
-generates them, and every lease ends in a submission or an expiry (there is no release).
+generates them, and every lease ends in a submission, an expiry, or a release when our sandbox failed it.
 
 * **Exclusive.** At most one live lease per ``(environment, prompt, checkpoint k)``; once a lease of it is
   submitted, the key is closed for that k (the draw would be identical anyway). A SQLite partial unique index
@@ -28,6 +28,10 @@ generates them, and every lease ends in a submission or an expiry (there is no r
   margin), never derived from the miner. ``expire_due`` sweeps (each ``grant`` and ``submit`` sweeps too) and
   cuts the hotkey's quota (``EXPIRY_BACKOFF``). A submission is judged at its arrival: a lease held by ``hold_submission`` (arrived
   on time, waiting for or in grading) is never expired by a sweep.
+* **Sandbox failures** (episode envs): an expiry or a forfeit of a lease whose episode our sandbox side ended
+  (``sandbox_failure(lease)``: the session book's verified records, never the miner's word) is a release:
+  state ``released``, no quota cut, no scan. A signed ``box_failed`` (the gateway also gives it when the agent
+  broke its own box) is released at most ``box_failed_releases_per_day`` times per hotkey, then charged.
 * **One lease of a prompt at a time** across checkpoints (``taken``): the same prompt cannot be leased at every
   unrevealed k at once. A request is cut to the hotkey's room (``quota - in_use``, capped by its share of the
   global cap) before any lookup.
@@ -49,6 +53,7 @@ import hashlib
 import os
 import random
 import json
+import logging
 import math
 import secrets as _secrets
 import sqlite3
@@ -64,10 +69,16 @@ from reliquary.constants import MAX_TRUNCATED_PER_SUBMISSION, SIGMA_MIN_V4, prom
 from reliquary.protocol.rl_prompt_ranges import PromptRows
 from reliquary.validator.rl_lease_quota import QuotaController
 
+logger = logging.getLogger(__name__)
+
 TAKEN, COOLING, BLACKLISTED, QUOTA, STALE, BANNED = "taken", "cooling", "blacklisted", "quota", "stale", "banned"
 FULL = "full"     # the global cap: buffered groups reached ``max_pending_groups``
 REFUSALS = frozenset({TAKEN, COOLING, BLACKLISTED, QUOTA, STALE, BANNED, FULL})
-OPEN, SUBMITTED, EXPIRED = "open", "submitted", "expired"
+OPEN, SUBMITTED, EXPIRED, RELEASED = "open", "submitted", "expired", "released"
+# Why a lease closed without a submission (``rl_leases.cause``): charged ones, then released ones.
+EXPIRED_CAUSE, FORFEITED, BOX_FAILED_OVER_BUDGET = "expired", "forfeited", "box_failed_over_budget"
+BOX_FAILED = "box_failed"                # a released cause the gateway can also give for the agent's own doing
+DAY_S = 86_400.0
 IN_ZONE, TOO_EASY, TOO_HARD, TRUNCATED = "in_zone", "too_easy", "too_hard", "truncated"
 VERDICTS = frozenset({IN_ZONE, TOO_EASY, TOO_HARD, TRUNCATED})
 COOLDOWN = "cooldown"                    # a prompt's stored state is COOLDOWN (until_k) or BLACKLISTED
@@ -207,6 +218,8 @@ class LeaseBookConfig:
     # leases are not counted (the quota and expiry bound them; a growing buffer is the oversupply signal), but one
     # hotkey may hold at most ``HOTKEY_MAX_OPEN`` of them (refused as ``quota``). None: no cap.
     max_pending_groups: int | None = None
+    # Releases of signed ``box_failed`` leases per hotkey per day before they are charged again. PLACEHOLDER.
+    box_failed_releases_per_day: int = 48
 
     def __post_init__(self) -> None:
         if not self.expiry_s or any(not (float(v) > 0) for v in self.expiry_s.values()):
@@ -215,6 +228,8 @@ class LeaseBookConfig:
             raise ValueError("max_lag must be non-negative")
         if self.max_pending_groups is not None and self.max_pending_groups < 1:
             raise ValueError("max_pending_groups must be positive")
+        if self.box_failed_releases_per_day < 0:
+            raise ValueError("box_failed_releases_per_day must be non-negative")
 
 
 _SCHEMA = """
@@ -223,7 +238,7 @@ CREATE TABLE IF NOT EXISTS rl_lease_secrets(k INTEGER PRIMARY KEY, secret BLOB N
     adopted_at REAL NOT NULL, revealed_at REAL);
 CREATE TABLE IF NOT EXISTS rl_leases(lease_id TEXT PRIMARY KEY, hotkey TEXT NOT NULL, environment TEXT NOT NULL,
     prompt_idx INTEGER NOT NULL, k INTEGER NOT NULL, nonce TEXT NOT NULL, issued_at REAL NOT NULL,
-    expires_at REAL NOT NULL, state TEXT NOT NULL, closed_at REAL);
+    expires_at REAL NOT NULL, state TEXT NOT NULL, closed_at REAL, cause TEXT);
 CREATE UNIQUE INDEX IF NOT EXISTS rl_leases_live ON rl_leases(environment, prompt_idx, k)
     WHERE state IN ('open', 'submitted');
 CREATE INDEX IF NOT EXISTS rl_leases_due ON rl_leases(state, expires_at);
@@ -257,6 +272,9 @@ class LeaseBook:
         self._depth = 0
         self._full: set[str] = set()              # envs refused for the global cap since the last drain
         self._submitting: dict[str, int] = {}     # leases whose on-time submission is being graded: never expired
+        # The episode sandbox's verdict on a lease (``RlLeaseSandbox.lease_failure``): (cause, detail) when our side
+        # ended one of its episodes, else None. Unset: every unsubmitted lease is charged.
+        self.sandbox_failure: Callable[[Lease], tuple[str, str] | None] | None = None
         path = Path(path)
         _private_file(path)
         self.db = sqlite3.connect(path, timeout=30, check_same_thread=False)
@@ -268,6 +286,8 @@ class LeaseBook:
             for column, kind in (("state", "TEXT"), ("until_k", "INTEGER")):   # a book from before the scan log
                 if column not in columns:
                     self.db.execute(f"ALTER TABLE rl_prompt_scans ADD COLUMN {column} {kind}")
+            if "cause" not in {row[1] for row in self.db.execute("PRAGMA table_info(rl_leases)")}:
+                self.db.execute("ALTER TABLE rl_leases ADD COLUMN cause TEXT")   # a book from before releases
             self.db.commit()
             quota.attach(self.db, self.lock)
             self._boot()
@@ -407,16 +427,50 @@ class LeaseBook:
             f"SELECT {_COLUMNS} FROM rl_leases WHERE state=? AND expires_at<=?", (OPEN, now)).fetchall()]
         due = [lease for lease in due if lease.lease_id not in self._submitting]
         for lease in due:
-            self.db.execute("UPDATE rl_leases SET state=?, closed_at=? WHERE lease_id=?",
-                            (EXPIRED, now, lease.lease_id))
-            self.quota.record_expiry(lease.hotkey, lease, now=now)
+            self._close_unsubmitted(lease, now, EXPIRED_CAUSE)
         return len(due)
+
+    def _verified_failure(self, lease: Lease) -> tuple[str, str] | None:
+        check = self.sandbox_failure
+        if check is None:
+            return None
+        try:
+            return check(lease)
+        except Exception:
+            logger.exception("sandbox failure check of lease %s failed: charged", lease.lease_id[:12])
+            return None
+
+    def _close_unsubmitted(self, lease: Lease, now: float, charged: str) -> str:
+        """Close an open lease that will not be submitted: released when the sandbox side verifiably failed it (no
+        quota cut, no scan), charged as its expiry otherwise. Returns its new state."""
+        failure = self._verified_failure(lease)
+        if failure is not None and failure[0] == BOX_FAILED:
+            used = self.db.execute("SELECT COUNT(*) FROM rl_leases WHERE hotkey=? AND state=? AND cause=? AND "
+                                   "closed_at>?", (lease.hotkey, RELEASED, BOX_FAILED, now - DAY_S)).fetchone()[0]
+            if used >= self.config.box_failed_releases_per_day:
+                logger.warning("rl lease %s of %s: box_failed past the %d releases a day: charged (%s)",
+                               lease.lease_id[:12], lease.hotkey[:12], self.config.box_failed_releases_per_day,
+                               failure[1])
+                failure, charged = None, BOX_FAILED_OVER_BUDGET
+        if failure is None:
+            self.db.execute("UPDATE rl_leases SET state=?, closed_at=?, cause=? WHERE lease_id=?",
+                            (EXPIRED, now, charged, lease.lease_id))
+            self.quota.record_expiry(lease.hotkey, lease, now=now)
+            return EXPIRED
+        cause, detail = failure
+        self.db.execute("UPDATE rl_leases SET state=?, closed_at=?, cause=? WHERE lease_id=?",
+                        (RELEASED, now, cause, lease.lease_id))
+        self.quota.record_release(lease.hotkey, lease, now=now)
+        logger.warning("rl lease %s of %s (%s prompt %d) released without penalty: sandbox failure %s (%s)",
+                       lease.lease_id[:12], lease.hotkey[:12], lease.environment, lease.prompt_idx, cause, detail)
+        return RELEASED
 
     def forfeit(self, lease_id: str, hotkey: str, now: float | None = None) -> Lease:
         """The miner gives up its open lease now (e.g. episodes that could not all be played): closed and charged
         exactly as its expiry (``record_expiry``), so it is never cheaper than delivering, only sooner; the quota
-        slot is freed now rather than at the lease's end. LookupError: no open lease of ``hotkey`` by that id, or
-        one whose submission is being judged."""
+        slot is freed now rather than at the lease's end. Released instead when the sandbox side verifiably failed
+        it (``_close_unsubmitted``: whatever the miner says). The lease comes back in its new state. LookupError: no
+        open lease of ``hotkey`` by that id, or one whose submission is being judged."""
         now = float(self.clock()) if now is None else now
         with self._txn():
             row = self.db.execute(f"SELECT {_COLUMNS} FROM rl_leases WHERE lease_id=?", (lease_id,)).fetchone()
@@ -424,10 +478,8 @@ class LeaseBook:
             if (lease is None or lease.hotkey != hotkey or lease.state != OPEN
                     or lease.lease_id in self._submitting):
                 raise LookupError("no open lease of this hotkey to forfeit")
-            self.db.execute("UPDATE rl_leases SET state=?, closed_at=? WHERE lease_id=?",
-                            (EXPIRED, now, lease.lease_id))
-            self.quota.record_expiry(lease.hotkey, lease, now=now)
-        return lease
+            state = self._close_unsubmitted(lease, now, FORFEITED)
+        return replace(lease, state=state)
 
     def expire_due(self, now: float | None = None) -> int:
         now = float(self.clock()) if now is None else now
@@ -718,8 +770,8 @@ class LeaseCollector:
 
 
 __all__ = [
-    "BANNED", "BLACKLISTED", "COMMIT_DOMAIN", "COOLDOWN", "COOLING", "EXPIRED", "FULL", "IN_ZONE", "NONCE_DOMAIN", "OPEN", "QUOTA",
-    "REFUSALS", "SECRET_REVEAL_LAG", "STALE", "SUBMITTED", "TAKEN", "TOO_EASY", "TOO_HARD", "TRUNCATED", "VERDICTS",
+    "BANNED", "BLACKLISTED", "BOX_FAILED", "BOX_FAILED_OVER_BUDGET", "COMMIT_DOMAIN", "COOLDOWN", "COOLING", "EXPIRED", "EXPIRED_CAUSE", "FORFEITED", "FULL", "IN_ZONE", "NONCE_DOMAIN", "OPEN", "QUOTA",
+    "REFUSALS", "RELEASED", "SECRET_REVEAL_LAG", "STALE", "SUBMITTED", "TAKEN", "TOO_EASY", "TOO_HARD", "TRUNCATED", "VERDICTS",
     "Lease", "LeaseAnswer", "LeaseBook", "LeaseBookConfig", "LeaseCollector", "LeaseRequest", "Scan",
     "classify_group", "lease_expiry_s", "lease_nonce", "secret_commitment", "verify_reveal",
 ]

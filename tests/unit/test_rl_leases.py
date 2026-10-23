@@ -542,3 +542,82 @@ def test_an_excluded_row_is_outside_the_range(tmp_path):
         with pytest.raises(ValueError, match="RL range"):
             book.check_request(ask("A", bad))
     book.check_request(ask("A", [9, 20, 51]))
+
+
+# --- sandbox failures: released, never charged ------------------------------------------------------------------
+
+def test_an_expiry_our_sandbox_caused_is_released_without_a_cut_or_a_scan(tmp_path):
+    clock = Clock()
+    book = book_at(tmp_path, clock=clock)
+    book.adopt_checkpoint(0)
+    failed, charged = book.grant([ask("A", [1, 2])])[0].leases
+    before = book.quota.state("A", clock.t)
+    book.sandbox_failure = lambda lease: ("box_failed", "rollout 3") if lease.prompt_idx == 1 else None
+    clock.t += 601
+    assert book.expire_due() == 2
+    assert book.lease(failed.lease_id).state == rl_leases.RELEASED
+    assert book.lease(charged.lease_id).state == rl_leases.EXPIRED
+    causes = dict(book.db.execute("SELECT lease_id, cause FROM rl_leases").fetchall())
+    assert causes == {failed.lease_id: "box_failed", charged.lease_id: "expired"}
+    after = book.quota.state("A", clock.t)
+    assert after["in_use"] == 0 and after["counters"]["released"] == 1 and after["counters"]["expired"] == 1
+    assert after["quota"] == before["quota"] - 1                       # only the charged one cut it
+    assert book.prompt_state()["scans"] == [] and book.prompt_state()["prompts"] == []   # no scan either
+    assert book.grant([ask("B", [1])])[0].leases[0].nonce == failed.nonce            # leasable again, same draw
+
+
+def test_a_forfeit_is_released_on_the_books_evidence_only(tmp_path):
+    book = book_at(tmp_path)
+    book.adopt_checkpoint(0)
+    first, second = book.grant([ask("A", [1, 2])])[0].leases
+    quota = book.quota.quota("A", NOW)
+    assert book.forfeit(first.lease_id, "A").state == rl_leases.EXPIRED    # no sandbox evidence: charged
+    assert book.quota.quota("A", NOW) < quota
+    quota = book.quota.quota("A", NOW)
+    book.sandbox_failure = lambda lease: ("aborted", "rollout 0")
+    assert book.forfeit(second.lease_id, "A").state == rl_leases.RELEASED
+    assert book.quota.quota("A", NOW) == quota and book.in_use("A") == 0
+    causes = dict(book.db.execute("SELECT lease_id, cause FROM rl_leases").fetchall())
+    assert causes == {first.lease_id: "forfeited", second.lease_id: "aborted"}
+    with pytest.raises(LookupError):
+        book.forfeit(second.lease_id, "A")                             # once
+
+
+def test_box_failed_releases_are_capped_per_hotkey_per_day_and_a_broken_check_charges(tmp_path):
+    clock = Clock()
+    book = book_at(tmp_path, clock=clock, box_failed_releases_per_day=1)
+    book.adopt_checkpoint(0)
+    leases = book.grant([ask("A", [1, 2, 3, 4])])[0].leases
+    book.sandbox_failure = lambda lease: ("box_failed" if lease.prompt_idx < 3 else "aborted", "r")
+    assert book.forfeit(leases[0].lease_id, "A").state == rl_leases.RELEASED
+    assert book.forfeit(leases[1].lease_id, "A").state == rl_leases.EXPIRED     # the agent may break its own box
+    assert book.forfeit(leases[2].lease_id, "A").state == rl_leases.RELEASED    # an abort is ours: never capped
+    cause = book.db.execute("SELECT cause FROM rl_leases WHERE lease_id=?", (leases[1].lease_id,)).fetchone()[0]
+    assert cause == rl_leases.BOX_FAILED_OVER_BUDGET
+
+    def broken(lease):
+        raise RuntimeError("session book unreadable")
+
+    book.sandbox_failure = broken
+    assert book.forfeit(leases[3].lease_id, "A").state == rl_leases.EXPIRED
+    clock.t += rl_leases.DAY_S + 1                                     # a day later the budget is back
+    book.sandbox_failure = lambda lease: ("box_failed", "r")
+    fresh = book.grant([ask("A", [5])])[0].leases[0]
+    assert book.forfeit(fresh.lease_id, "A").state == rl_leases.RELEASED
+
+
+def test_a_book_from_before_releases_gains_the_cause_column(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.sqlite3"
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE rl_leases(lease_id TEXT PRIMARY KEY, hotkey TEXT NOT NULL, environment TEXT NOT NULL, "
+               "prompt_idx INTEGER NOT NULL, k INTEGER NOT NULL, nonce TEXT NOT NULL, issued_at REAL NOT NULL, "
+               "expires_at REAL NOT NULL, state TEXT NOT NULL, closed_at REAL)")
+    db.commit()
+    db.close()
+    book = book_at(tmp_path, name="old.sqlite3")
+    book.adopt_checkpoint(0)
+    lease = book.grant([ask("A", [1])])[0].leases[0]
+    assert book.forfeit(lease.lease_id, "A").state == rl_leases.EXPIRED
+    assert book.db.execute("SELECT cause FROM rl_leases").fetchone()[0] == "forfeited"

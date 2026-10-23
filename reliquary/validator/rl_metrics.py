@@ -152,6 +152,10 @@ def controller_metrics(rl: Any, now: float, window_s: float = METRICS_EVERY_S,
                                  "GROUP BY 1", (since,)).fetchall(),
             "issued": db.execute("SELECT environment, COUNT(*) FROM rl_leases WHERE issued_at>=? GROUP BY 1",
                                  (since,)).fetchall(),
+            # unsubmitted leases by cause: released ones (our sandbox failed them) and charged ones
+            "unsubmitted": db.execute("SELECT state, environment, cause, COUNT(*) FROM rl_leases WHERE state IN "
+                                      "('expired', 'released') AND closed_at>=? GROUP BY 1, 2, 3",
+                                      (since,)).fetchall(),
             "groups": db.execute("SELECT environment, verdict, COUNT(*) FROM rl_groups WHERE arrived_at>=? "
                                  "GROUP BY 1, 2", (since,)).fetchall(),
             "events": db.execute("SELECT kind, COUNT(*) FROM rl_events WHERE at>=? GROUP BY 1", (since,)).fetchall(),
@@ -171,6 +175,11 @@ def controller_metrics(rl: Any, now: float, window_s: float = METRICS_EVERY_S,
         out[f"leases/{state}"] = n
     for env, n in rows["issued"]:
         out[f"leases_issued/{env}"] = n
+    out["leases/sandbox_failure_released"] = 0
+    for state, env, cause, n in rows["unsubmitted"]:
+        out[f"leases_{state}/{env}/{cause or 'unknown'}"] = n
+        if state == "released":
+            out["leases/sandbox_failure_released"] += n
     for env, verdict, n in rows["groups"]:
         out[f"groups/{env}/{verdict}"] = n
     for kind, n in rows["events"]:

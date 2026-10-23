@@ -392,3 +392,28 @@ def test_a_miner_forfeits_its_own_open_lease_at_the_price_of_an_expiry(served):
     assert served.lease(leases[0]["lease_id"]).state == "expired" and served.in_use(MINER.ss58_address) == 1
     assert served.quota.quota(MINER.ss58_address, NOW) < before                           # charged as an expiry
     assert forfeit(leases[0]["lease_id"], at=NOW + 1).status_code == 409                  # once
+
+
+def test_a_forfeit_for_a_sandbox_failure_is_released_only_on_the_validators_evidence(served):
+    from reliquary.protocol.signatures import build_rl_lease_forfeit_binding
+
+    client = client_for(served)
+    leases = client.post("/rl/lease", json=body(prompts=(1, 2))).json()["leases"]
+
+    def forfeit(lease_id, reason="sandbox_failure"):
+        binding = build_rl_lease_forfeit_binding(hotkey=MINER.ss58_address, at=NOW, lease_id=lease_id,
+                                                 validator_hotkey=VALIDATOR.ss58_address, path="/rl/lease/forfeit")
+        return client.post("/rl/lease/forfeit", json={"miner_hotkey": MINER.ss58_address, "at": NOW,
+                                                      "lease_id": lease_id, "reason": reason,
+                                                      "signature": MINER.sign(binding).hex()})
+
+    assert forfeit(leases[0]["lease_id"], reason="trust_me").status_code == 422          # only the one reason
+    before = served.quota.quota(MINER.ss58_address, NOW)
+    claimed = forfeit(leases[0]["lease_id"])                    # the miner's word alone: charged
+    assert claimed.status_code == 200 and claimed.json()["state"] == "expired"
+    assert served.quota.quota(MINER.ss58_address, NOW) < before
+    served.sandbox_failure = lambda lease: ("box_failed", "rollout 4, session s1")
+    before = served.quota.quota(MINER.ss58_address, NOW)
+    released = forfeit(leases[1]["lease_id"])
+    assert released.status_code == 200 and released.json()["state"] == "released"
+    assert released.json()["quota"] == before and served.in_use(MINER.ss58_address) == 0

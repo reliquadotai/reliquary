@@ -336,3 +336,39 @@ def test_a_signed_open_refusal_frees_a_lease_rollout_only():
     other = rl_engagement(1, "b" * 64, 0)               # the window path keeps its rule
     book.add(record(10, other, "open_refused:no_capacity"))
     assert book.engagement_held(other)
+
+
+def test_a_lease_is_failed_by_the_sandbox_only_on_its_rollouts_last_verified_sessions():
+    from reliquary.protocol.service_episode import rl_lease_engagement
+    from reliquary.sandbox.rl_engagements import lease_sandbox_failure
+    from reliquary.sandbox.sessions import CLOSED_GRADED, LIVE, SessionRecord
+
+    def record(n, index, state, status=None, *, lease_id="a" * 32, hotkey=HOTKEY, at=NOW, fault=None, ended=None):
+        return SessionRecord(session_id=f"s{n}", hotkey=hotkey, request_id=f"r{n}", engagement_sha256="0" * 64,
+                             kind="rl_lease", engagement=rl_lease_engagement(lease_id, index), env="e", split="rl",
+                             index=0, checkpoint="k0", job_id=None, prompt_index=None, machine_id=MACHINE,
+                             issued_at=at, expires_at=at + 60, token_sha256=f"{n:064d}", state=state,
+                             closed_status=status, fault=fault, ended_status=ended)
+
+    lease = SimpleNamespace(lease_id="a" * 32, hotkey=HOTKEY)
+    book = SessionBook(SandboxPolicy())
+    book.add(record(0, 0, CLOSED_GRADED, "graded", ended="graded"))
+    book.add(record(1, 1, LIVE))
+    book.add(record(2, 2, CLOSED, "expired", ended="expired"))       # the agent ran out of time: its own doing
+    book.add(record(3, 3, CLOSED, "open_failed"))                     # an unverified failed open: the miner's word
+    book.add(record(4, 4, CLOSED, "box_failed", hotkey="5Other"))     # another hotkey's session never counts
+    book.add(record(5, 5, CLOSED, "box_failed", lease_id="b" * 32))   # nor one of another lease
+    assert lease_sandbox_failure(book, lease) is None
+    book.add(record(6, 6, ABORTED, "aborted", ended="aborted"))
+    book.add(record(7, 6, CLOSED_GRADED, "graded", at=NOW + 5))       # played again after the abort: judged by it
+    assert lease_sandbox_failure(book, lease) is None
+    book.add(record(8, 7, CLOSED, "box_failed", ended="box_failed"))   # its box died (OOM at its limit)
+    cause, detail = lease_sandbox_failure(book, lease)
+    assert cause == "box_failed" and "rollout 7" in detail and "s8" in detail
+    for state, status, fault, expected in ((ABORTED, "aborted", None, "aborted"),
+                                           (VOIDED, "machine_drained", None, "machine_drained"),
+                                           (CLOSED, "open_failed", "open_refused:no_capacity", "open_refused"),
+                                           (CLOSED, "open_failed", "validator_restarted", "validator_restarted")):
+        one = SessionBook(SandboxPolicy())
+        one.add(record(20, 9, state, status, fault=fault))
+        assert lease_sandbox_failure(one, lease)[0] == expected

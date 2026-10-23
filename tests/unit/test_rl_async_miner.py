@@ -708,3 +708,50 @@ def test_the_miner_draws_an_episode_env_from_its_blocks_rows():
     assert ranges == {"swe": PromptRows(5, 50, ((10, 20), (30, 31))), "tmax": PromptRows(0, 7), ENV: (0, 9)}
     with pytest.raises(ValueError, match="past the installed taskset"):
         planner_ranges(("swe",), sources={"swe": [None] * 49}, blocks=blocks)
+
+
+# --- sandbox failures: forfeited at once, with the reason -----------------------------------------------------
+async def test_a_lease_our_sandbox_failed_is_forfeited_with_that_reason_and_others_without():
+    from reliquary.miner.rl_async_episodes import EpisodeLeaseFailed
+
+    miner, transport, generator, _ = miner_for(quota=3)
+    plain = generator.generate
+
+    async def agenerate(leases):
+        groups = plain(leases)
+        failures = [EpisodeLeaseFailed("rollout 3: the sandbox ended its episode box_failed",
+                                       sandbox_failure="box_failed"), EpisodeLeaseFailed("rollout 1: unusable")]
+        return [failures[i] if i < 2 else g for i, g in enumerate(groups)]
+
+    generator.agenerate = agenerate
+    await miner.refresh_quota()
+    await miner.lease_more()
+    ids = [lease.lease_id for lease in sorted(miner.queue, key=lambda lease: lease.expires_at)]
+    assert await miner.generate_once() == 1
+    await miner.drain()
+    assert sorted(transport.forfeits) == sorted([(ids[0], "sandbox_failure"), (ids[1], None)])
+    assert miner.stats["forfeited"] == 2 and miner.stats["released"] == 1 and miner.stats["submitted"] == 1
+
+
+async def test_the_http_forfeit_names_the_sandbox_failure_and_falls_back_for_an_older_validator():
+    httpx = pytest.importorskip("httpx")
+    from reliquary.miner.rl_async import HttpRlTransport
+
+    bodies = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        if "reason" in body:                                        # an older validator: extra fields forbidden
+            return httpx.Response(422, json={"reason": "malformed_request"})
+        return httpx.Response(200, json={"lease_id": body["lease_id"], "state": "expired", "quota": 3})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://v") as client:
+        transport = HttpRlTransport(client, base_url="http://v", hotkey="5Miner", validator_hotkey="5Val",
+                                    sign_binding=lambda binding: "00", clock=lambda: NOW)
+        answer = await transport.forfeit("L1", "sandbox_failure")
+        assert answer["state"] == "expired"
+        assert [b.get("reason") for b in bodies] == ["sandbox_failure", None]
+        bodies.clear()
+        await transport.forfeit("L2")
+        assert [b.get("reason") for b in bodies] == [None]

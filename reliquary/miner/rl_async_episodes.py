@@ -14,7 +14,9 @@ the lease's ``ROLLOUTS`` episodes at once through the window path's machinery, u
 Submission is mandatory and an episode cannot be withheld: when one of the lease's episodes is unusable the whole
 lease fails (its graded sessions are withdrawn, the lease expires unsubmitted); the miner never chooses among
 episodes. A machine-signed ``aborted`` final is played again once (the issuer frees that engagement once), as in
-the window miner.
+the window miner. An episode our sandbox ended (``SANDBOX_FAILURES``: its box died, an abort replayed) fails the
+lease at once: the other episodes are stopped, and the lease is forfeited with the reason ``sandbox_failure`` (the
+validator releases it without a quota cut on its own session records).
 """
 from __future__ import annotations
 
@@ -36,8 +38,24 @@ ABORT_REPLAYS = 1
 OPEN_RETRY_S, OPEN_RETRY_MAX_S = 15.0, 120.0
 
 
+# Signed finals that end an episode on our side (a box that died, OOM at its limit included; a sandbox abort played
+# again ``ABORT_REPLAYS`` times): the lease fails at once and is forfeited with the reason ``sandbox_failure``.
+SANDBOX_FAILURES = frozenset({"box_failed", "aborted"})
+
+
 class EpisodeLeaseFailed(RuntimeError):
-    """A lease whose episodes cannot all be submitted."""
+    """A lease whose episodes cannot all be submitted. ``sandbox_failure``: the signed final status that failed it
+    when our sandbox side did (``SANDBOX_FAILURES``), else None."""
+
+    def __init__(self, why: str, *, sandbox_failure: str | None = None) -> None:
+        super().__init__(why)
+        self.sandbox_failure = sandbox_failure
+
+
+def _sandbox_failure(outcome) -> str | None:
+    result = getattr(outcome, "result", None)
+    status = None if result is None or result.ok else getattr(result, "final_status", None)
+    return status if status in SANDBOX_FAILURES else None
 
 
 class EpisodeLeaseGenerator:
@@ -180,7 +198,7 @@ class EpisodeLeaseGenerator:
                 return SimpleNamespace(seed_index=index, result=result, session=session)
 
         async with runner:
-            outcomes = await asyncio.gather(*(one(i) for i in range(self.rollouts)), return_exceptions=True)
+            outcomes, failed = await self._play_all(one, label)
             kept, why = [], None
             for index, outcome in enumerate(outcomes):
                 if isinstance(outcome, BaseException) or outcome is None:
@@ -192,10 +210,12 @@ class EpisodeLeaseGenerator:
                 if admitted is None:
                     why = why or f"rollout {index}: {refusal}"
                 kept.append(admitted)
+            if failed is not None:
+                why = f"rollout {failed[0]}: the sandbox ended its episode {failed[1]}"
             if why is not None:
                 logger.warning("%s cannot be submitted: %s", label, why)   # now, not when its batch ends
                 await _release([o for o in outcomes if not isinstance(o, BaseException) and o is not None])
-                raise EpisodeLeaseFailed(why)
+                raise EpisodeLeaseFailed(why, sandbox_failure=None if failed is None else failed[1])
             for outcome in outcomes:
                 done = getattr(outcome.result, "submitted", None)
                 if done is not None:
@@ -204,6 +224,36 @@ class EpisodeLeaseGenerator:
                                tuple((int(s) - prompt_len, int(e) - prompt_len) for s, e in value.spans),
                                str(value.stop), dict(outcome.result.transcript))
                 for value, outcome in zip(kept, outcomes)]
+
+
+    async def _play_all(self, one, label: str) -> tuple[list, tuple[int, str] | None]:
+        """Every rollout's outcome (an exception, None or the episode), and ``(index, status)`` of the first one our
+        sandbox ended: the rollouts still running are then cancelled (the lease cannot be submitted any more)."""
+        tasks = {asyncio.create_task(one(i)): i for i in range(self.rollouts)}
+        outcomes: list[Any] = [None] * self.rollouts
+        failed = None
+        try:
+            pending = set(tasks)
+            while pending and failed is None:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in sorted(done, key=tasks.get):
+                    index = tasks[task]
+                    outcomes[index] = (asyncio.CancelledError() if task.cancelled()
+                                       else task.exception() or task.result())
+                    status = _sandbox_failure(outcomes[index])
+                    if failed is None and status is not None:
+                        failed = (index, status)
+            if pending:
+                logger.warning("%s: rollout %d ended %s by the sandbox: %d running rollouts stopped", label,
+                               failed[0], failed[1], len(pending))
+        finally:
+            for task in tasks:
+                task.cancel()
+            settled = await asyncio.gather(*tasks, return_exceptions=True)
+        for task, value in zip(tasks, settled):
+            if outcomes[tasks[task]] is None:
+                outcomes[tasks[task]] = value
+        return outcomes, failed
 
 
 class EpisodeEngineHost:
@@ -546,5 +596,5 @@ async def _release(outcomes) -> None:
             logger.exception("withdrawing the episode of rollout %s failed", outcome.seed_index)
 
 
-__all__ = ["ABORT_REPLAYS", "EpisodeEngineHost", "EpisodeLeaseFailed", "EpisodeLeaseGenerator", "EpisodeWeights",
+__all__ = ["ABORT_REPLAYS", "SANDBOX_FAILURES", "EpisodeEngineHost", "EpisodeLeaseFailed", "EpisodeLeaseGenerator", "EpisodeWeights",
            "MixedGenerator", "build_episode_generator"]
