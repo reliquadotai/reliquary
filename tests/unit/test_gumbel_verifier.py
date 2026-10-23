@@ -179,6 +179,38 @@ def test_fp32_head_projects_bf16_rows_in_fp32():
     assert default[1:4].dtype == torch.bfloat16
 
 
+def test_fp32_head_restores_the_tf32_flag():
+    gen = torch.Generator().manual_seed(6)
+    weight = torch.randn(_VOCAB, _HIDDEN_DIM, generator=gen).to(torch.bfloat16)
+    rows = torch.randn(3, _HIDDEN_DIM, generator=gen).to(torch.bfloat16)
+    before = torch.backends.cuda.matmul.allow_tf32
+    try:
+        for flag in (True, False):
+            torch.backends.cuda.matmul.allow_tf32 = flag
+            assert torch.equal(verifier.fp32_head_matmul(rows, weight), rows.float() @ weight.float().T)
+            assert torch.backends.cuda.matmul.allow_tf32 is flag
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = before
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_fp32_head_on_cuda_is_the_fp32_product_of_bf16_operands():
+    """bf16 operands are exact in TF32: the tensor-core path differs from an fp32 SGEMM by summation order only."""
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    weight = torch.randn(4096, 1024, generator=gen, device="cuda").to(torch.bfloat16)
+    rows = torch.randn(64, 1024, generator=gen, device="cuda").to(torch.bfloat16)
+    previous = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        exact = rows.double() @ weight.double().T
+        got = verifier.fp32_head_matmul(rows, weight)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+    assert got.dtype == torch.float32
+    assert torch.backends.cuda.matmul.allow_tf32 is False
+    assert (got.double() - exact).abs().max().item() < 1e-3
+
+
 def test_proof_forward_uses_the_fp32_head_when_the_profile_does(monkeypatch):
     seen = {}
     real = verifier._LazyLogitRows

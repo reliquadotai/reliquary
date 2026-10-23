@@ -553,17 +553,22 @@ def fp32_head_matmul(rows: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """``sampling.lm_head_fp32``: rows @ W.T with fp32 products and accumulation, fp32 out. With bf16 operands on
     CUDA (production) it is the cuBLAS call vLLM's ``head_dtype=float32`` makes (``torch.mm(..., out_dtype=
     float32)``, tensor cores; 13.7x faster than an fp32 SGEMM at 2048 rows of the 9B on H100, 1 different Gumbel
-    pick in 381k, 2026-10-16); otherwise, or on a torch without ``out_dtype`` (2.7), an fp32 matmul with TF32 off.
+    pick in 381k, 2026-10-16). On a torch without ``out_dtype`` (2.7, the pinned one) the same tensor-core product:
+    the operands upcast to fp32 with TF32 on. A bf16 value (8-bit significand) is exact in TF32 (11-bit), so TF32
+    rounds nothing and the products and fp32 accumulation are those of ``out_dtype``; only the summation order may
+    differ. With TF32 off this fallback ran the head 10x slower: ~65 % of every training step on
+    teutonic-rl-async-v1 (2026-10-23). Any other operands: an fp32 matmul with TF32 off.
     bf16 x bf16 products are exact in fp32: only the summation order differs (~4e-4 at most on the 9B)."""
     weight = weight.detach()
-    if rows.is_cuda and rows.dtype == weight.dtype == torch.bfloat16:
+    bf16_cuda = rows.is_cuda and rows.dtype == weight.dtype == torch.bfloat16
+    if bf16_cuda:
         try:
             with torch.autocast(device_type="cuda", enabled=False):
                 return torch.mm(rows, weight.T, out_dtype=torch.float32)
-        except TypeError:           # no out_dtype in this torch: the SGEMM below, same products
+        except TypeError:           # no out_dtype in this torch: the same products through TF32 below
             pass
     previous = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = bf16_cuda
     try:
         with torch.autocast(device_type=rows.device.type, enabled=False):
             return rows.float() @ weight.float().T
