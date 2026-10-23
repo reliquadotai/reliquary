@@ -1,0 +1,54 @@
+name: CUDA runtime contracts
+
+on:
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - "pyproject.toml"
+      - "scripts/check_cuda_runtime.py"
+      - ".github/workflows/cuda-runtime.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  cuda-runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space for CUDA compilation
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+      - uses: actions/checkout@v4
+      - name: Provide swap for CUDA compiler memory peaks
+        run: |
+          sudo fallocate -l 16G /swapfile-runtime
+          sudo chmod 600 /swapfile-runtime
+          sudo mkswap /swapfile-runtime
+          sudo swapon /swapfile-runtime
+          free -h
+          df -h /
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the validator CUDA image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: validator-runtime:test
+          cache-from: type=gha,scope=cuda-runtime
+          cache-to: type=gha,scope=cuda-runtime,mode=max
+      - name: Check CUDA extensions and Qwen fast-path imports offline
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 512 --memory 8g --cpus 2 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+            --entrypoint sh validator-runtime:test -c \
+            'python -m pip check && python scripts/check_cuda_runtime.py'
