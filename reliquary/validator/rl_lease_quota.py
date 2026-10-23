@@ -9,7 +9,8 @@ The quota is measured, never declared. Per hotkey:
   counted from the last change: when the round ends with the hotkey having held its full quota at some point
   (``saturated``) and no lease expired, ``cap`` doubles (slow start: 4 -> ~1,600 in ~9 rounds). An expiry cuts
   the quota by ``EXPIRY_BACKOFF`` (x0.9, at least one lease, never below ``floor``) and ends slow start; a
-  submission refused for integrity halves it.
+  submission refused for integrity halves it. A lease our sandbox side failed (``record_release``) only frees its
+  slot: no cut, no credit, the round unchanged.
 * ``target`` is Little's law over a sliding window: measured throughput (paid deliveries per second over the
   window, or over the hotkey's life when shorter) x measured mean lease-to-submit latency of those deliveries x
   ``headroom`` (1.5). It is the concurrency the hotkey actually sustains, plus room to grow.
@@ -61,7 +62,8 @@ class QuotaConfig:
 
 
 def _counters() -> dict[str, int]:
-    return {"leased": 0, "submitted": 0, "in_zone": 0, "out_of_zone": 0, "paid": 0, "expired": 0, "rejected": 0}
+    return {"leased": 0, "submitted": 0, "in_zone": 0, "out_of_zone": 0, "paid": 0, "expired": 0, "rejected": 0,
+            "released": 0}
 
 
 @dataclass
@@ -244,6 +246,15 @@ class QuotaController:
                     entry.phase = STEADY
                     entry.reason = f"steady: delivered {entry.round_quota} without using the full quota"
                 self._new_round(entry, now)
+            self._save(hotkey, entry)
+
+    def record_release(self, hotkey: str, lease, *, now: float) -> None:
+        """A lease ended unsubmitted because our sandbox side failed its episode (verified by the lease book): its
+        slot is free, nothing else changes."""
+        with self._lock:
+            entry = self._entry(hotkey)
+            entry.in_use = max(0, entry.in_use - 1)
+            entry.counters["released"] += 1
             self._save(hotkey, entry)
 
     def record_expiry(self, hotkey: str, lease, *, now: float, cause: str = "expired") -> None:

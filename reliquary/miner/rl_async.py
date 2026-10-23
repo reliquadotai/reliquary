@@ -381,16 +381,26 @@ class HttpRlTransport:
                                                            validator_hotkey=self.validator_hotkey, path=path))
         return await self._call("GET", path, params={"hotkey": self.hotkey, "at": str(at), "signature": signature})
 
-    async def forfeit(self, lease_id: str) -> dict:
-        """``POST /rl/lease/forfeit``: give up an open lease (charged as its expiry, its quota slot freed now)."""
+    async def forfeit(self, lease_id: str, reason: str | None = None) -> dict:
+        """``POST /rl/lease/forfeit``: give up an open lease (charged as its expiry, its quota slot freed now;
+        released without a cut when the validator's own session records show our sandbox failed it). ``reason``
+        (``sandbox_failure``) is logged by the validator, not trusted; a validator that does not know it refuses
+        the body and the forfeit is sent again without it."""
         from reliquary.protocol.signatures import build_rl_lease_forfeit_binding
 
         path = f"{self._prefix}/lease/forfeit"
         at = int(self._clock())
         signature = self._sign(build_rl_lease_forfeit_binding(hotkey=self.hotkey, at=at, lease_id=lease_id,
                                                               validator_hotkey=self.validator_hotkey, path=path))
-        return await self._call("POST", path, json={"miner_hotkey": self.hotkey, "at": at, "lease_id": lease_id,
-                                                    "signature": signature})
+        body = {"miner_hotkey": self.hotkey, "at": at, "lease_id": lease_id, "signature": signature}
+        if reason is None:
+            return await self._call("POST", path, json=body)
+        try:
+            return await self._call("POST", path, json={**body, "reason": reason})
+        except RequestRefused as exc:
+            if exc.retryable or exc.reason != "malformed_request":
+                raise
+            return await self._call("POST", path, json=body)
 
     async def checkpoint(self) -> dict | None:
         try:
@@ -433,6 +443,7 @@ class DryRunTransport:
         self.submit_failures: list[RequestRefused] = [] # raised by the next submits, in order
         self.checkpoints: list[dict | None] = []
         self.state_calls: list[int] = []
+        self.forfeits: list[tuple[str, str | None]] = []
 
     async def prompt_state(self, since: int, environment: str) -> dict:
         self.state_calls.append(int(since))
@@ -448,9 +459,10 @@ class DryRunTransport:
         return {"leases": [lease.to_wire() for lease in self.open.values()], "latest": self.latest,
                 "lease_expiry_s": {}}
 
-    async def forfeit(self, lease_id: str) -> dict:
+    async def forfeit(self, lease_id: str, reason: str | None = None) -> dict:
         self.open.pop(lease_id, None)
-        return {"lease_id": lease_id, "state": "expired", "quota": self.quota_value}
+        self.forfeits.append((lease_id, reason))
+        return {"lease_id": lease_id, "state": "released" if reason else "expired", "quota": self.quota_value}
 
     async def lease(self, environment: str, checkpoint: int, prompt_ids: Sequence[int]) -> dict:
         self.lease_calls.append((environment, int(checkpoint), [int(p) for p in prompt_ids]))
@@ -712,17 +724,25 @@ class AsyncMiner:
                 self._close(lease)
                 self._forfeit(lease)
 
-    def _forfeit(self, lease: HeldLease) -> None:
+    def _forfeit(self, lease: HeldLease, failure: BaseException | None = None) -> None:
         """Tell the validator a given-up lease will not be submitted: charged as its expiry, its quota slot freed
-        now instead of at its end (an episode lease's end is over an hour away)."""
+        now instead of at its end (an episode lease's end is over an hour away). A lease our sandbox failed
+        (``failure.sandbox_failure``) is forfeited with that reason: the validator releases it without a cut when its
+        own session records agree."""
         call = getattr(self.transport, "forfeit", None)
         if call is None:
             return
+        reason = "sandbox_failure" if getattr(failure, "sandbox_failure", None) else None
 
         async def send() -> None:
             try:
-                await call(lease.lease_id)
+                answer = await (call(lease.lease_id, reason) if reason else call(lease.lease_id))
+                state = answer.get("state") if isinstance(answer, dict) else None
                 self.stats["forfeited"] = self.stats.get("forfeited", 0) + 1
+                if state == "released":
+                    self.stats["released"] = self.stats.get("released", 0) + 1
+                if reason:
+                    logger.info("lease %s forfeited after a sandbox failure: %s", lease.lease_id[:12], state)
             except Exception as exc:                     # the lease then expires as before
                 logger.warning("forfeit of lease %s failed (%s)", lease.lease_id[:12], exc)
 
@@ -779,7 +799,7 @@ class AsyncMiner:
             if isinstance(rollouts, BaseException):          # that lease alone failed, for good (e.g. episodes)
                 logger.error("lease %s given up: %s", lease_id[:12], rollouts)
                 self._close(lease)
-                self._forfeit(lease)
+                self._forfeit(lease, rollouts)
                 continue
             if len(rollouts) != ROLLOUTS:
                 logger.error("lease %s came back with %d rollouts", lease_id[:12], len(rollouts))
@@ -817,7 +837,7 @@ class AsyncMiner:
             if isinstance(rollouts, BaseException):          # that lease alone failed, for good (e.g. episodes)
                 logger.error("lease %s given up: %s", lease.lease_id[:12], rollouts)
                 self._close(lease)
-                self._forfeit(lease)
+                self._forfeit(lease, rollouts)
                 continue
             self._hand_over(lease, rollouts, version)
             done += 1

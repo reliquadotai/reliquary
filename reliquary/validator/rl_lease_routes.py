@@ -44,7 +44,7 @@ import math
 import time
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -117,6 +117,8 @@ class RlLeaseForfeitBody(BaseModel):
     at: int = Field(ge=0, strict=True)
     lease_id: str = Field(min_length=1, max_length=64)
     signature: str = Field(default="", max_length=256)
+    # The miner's reading (logged only): the controller releases a lease on its own session records, never on this.
+    reason: Literal["sandbox_failure"] | None = None
 
 
 class RlSubmitRollout(BaseModel):
@@ -440,7 +442,8 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
 
     @router.post(forfeit_path)
     async def forfeit(http: Request) -> JSONResponse:
-        """A miner gives up an open lease of its own: charged as its expiry (``LeaseBook.forfeit``)."""
+        """A miner gives up an open lease of its own: charged as its expiry, or released when our sandbox side
+        verifiably failed it (``LeaseBook.forfeit``)."""
         try:
             raw = await _read_within(http, MAX_BODY_BYTES, BODY_TIMEOUT_S)
             if preauth.locked():
@@ -451,9 +454,10 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
                 lease = await asyncio.to_thread(book.forfeit, request.lease_id, hotkey)
             except LookupError:
                 return _refusal("lease_closed", {"lease_id": request.lease_id})
-            logger.info("rl lease %s forfeited by %s", lease.lease_id[:12], hotkey[:12])
+            logger.info("rl lease %s forfeited by %s%s: %s", lease.lease_id[:12], hotkey[:12],
+                        f" ({request.reason})" if request.reason else "", lease.state)
             quota = await asyncio.to_thread(book.quota.quota, hotkey, float(clock()))
-            return _answer({"lease_id": lease.lease_id, "state": "expired", "quota": quota})
+            return _answer({"lease_id": lease.lease_id, "state": lease.state, "quota": quota})
         except _Refused as refused:
             return refused.response
         except Exception as exc:

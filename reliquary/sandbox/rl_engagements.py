@@ -42,9 +42,13 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from reliquary.sandbox.sessions import (
+    ABORTED,
+    CLOSED,
+    VOIDED,
     EngagementTerms,
     Refusal,
     SessionBook,
+    SessionRecord,
     token_validity_s,
 )
 from reliquary.sandbox.tasks import ResolvedTask
@@ -347,6 +351,56 @@ def session_budgets(policy, task) -> dict[str, int]:
     return budgets
 
 
-__all__ = ["WINDOW_AGE_MARGIN_S", "EpisodeEnvironmentView", "NoOutcomes", "OpenQuota", "RlEpisodeEngagements",
+# A lease rollout's last session, ended by our side: its cause (``lease_sandbox_failure``).
+SANDBOX_FAILURE_CAUSES = ("box_failed", "aborted", "machine_drained", "open_refused", "validator_restarted")
+
+
+def _session_failure(record: SessionRecord) -> str | None:
+    """Why our sandbox side ended this session, from what the issuer verified or did itself, else None: a signed
+    ``box_failed`` or ``aborted`` final, a drained machine, a signed open refusal, an open answer our restart lost."""
+    fault = str(record.fault or "")
+    if fault.startswith("open_refused:"):
+        return "open_refused"
+    if fault == "validator_restarted":
+        return "validator_restarted"
+    if record.state == VOIDED:
+        return "machine_drained"
+    if record.state == ABORTED:
+        return "aborted"
+    if record.state == CLOSED and "box_failed" in (record.ended_status, record.closed_status):
+        return "box_failed"
+    return None
+
+
+def lease_sandbox_failure(sessions: SessionBook, lease) -> tuple[str, str] | None:
+    """``(cause, detail)`` when the last session of one of ``lease``'s rollouts was ended by our sandbox side
+    (``_session_failure``), else None. Only the session book counts (records verified at their close, or the
+    issuer's own drains): a rollout played again after an abort is judged by its replay. Read off the event loop
+    (the lease book's sweep thread): a read that met the loop's change of the index is read again."""
+    from reliquary.protocol.service_episode import RL_LEASE_ENGAGEMENT_PREFIX
+
+    prefix = f"{RL_LEASE_ENGAGEMENT_PREFIX}:{lease.lease_id}:"
+    for attempt in range(3):
+        try:
+            records = sessions.of_hotkey(lease.hotkey)
+            break
+        except RuntimeError:                     # the set changed size during the read
+            if attempt == 2:
+                raise
+    last: dict[str, SessionRecord] = {}
+    for record in records:
+        if record.engagement.startswith(prefix):
+            seen = last.get(record.engagement)
+            if seen is None or (record.issued_at, record.session_id) > (seen.issued_at, seen.session_id):
+                last[record.engagement] = record
+    for engagement, record in sorted(last.items()):
+        cause = _session_failure(record)
+        if cause is not None:
+            return cause, (f"rollout {engagement.rsplit(':', 1)[1]}, session {record.session_id} on "
+                           f"{record.machine_id}: {record.state}/{record.closed_status}")
+    return None
+
+
+__all__ = ["SANDBOX_FAILURE_CAUSES", "WINDOW_AGE_MARGIN_S", "EpisodeEnvironmentView", "NoOutcomes", "OpenQuota", "RlEpisodeEngagements",
            "RlLeaseEngagements", "SessionOutcomes",
-           "SessionQuota", "session_budgets"]
+           "SessionQuota", "lease_sandbox_failure", "session_budgets"]

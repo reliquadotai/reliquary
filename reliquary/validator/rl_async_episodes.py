@@ -48,6 +48,11 @@ verdict) and the yield ledger / yield quota. The engagement already makes a tran
 per (lease, rollout), a lease closes at its first submission) and the lease quota decides how many sessions a
 hotkey holds; settlement and yield are the window's capacity accounting (who may open how much), which the
 lease quota replaces. Sessions end by their close (final record) or their expiry (``maintain_forever``).
+
+Sandbox failures (``lease_failure``, the lease book's ``sandbox_failure``): a lease that ends unsubmitted (expiry
+or forfeit) while the last session of one of its rollouts was ended by our side (a signed ``box_failed`` or
+``aborted`` final, a drained machine, a signed open refusal) is released without a quota cut. Only the session
+book's records count, verified at their close: a miner's forfeit reason is a label, never evidence.
 """
 from __future__ import annotations
 
@@ -299,6 +304,15 @@ class RlLeaseSandbox:
         except Exception as exc:
             logger.warning("episode lease admission failed (%s): refused retryably", type(exc).__name__)
             return "fleet_unavailable", {"environment": environment}
+
+    def lease_failure(self, lease) -> tuple[str, str] | None:
+        """``LeaseBook.sandbox_failure``: why our side failed one of this lease's episodes, from the session book
+        (``rl_engagements.lease_sandbox_failure``); None for a lease of an env this sandbox does not serve."""
+        from reliquary.sandbox.rl_engagements import lease_sandbox_failure
+
+        if lease.environment not in self.environments:
+            return None
+        return lease_sandbox_failure(self.book, lease)
 
     async def start(self) -> None:
         """Before serving: the directory read once, then the lease sessions restored (bounded, retried; a restore

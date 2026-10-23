@@ -682,3 +682,48 @@ def test_the_cli_entry_splits_onto_the_episode_envs():
     assert entry.env_split[EPISODE] == 1.0
     with pytest.raises(ValueError, match="does not declare"):
         build_task_entry(task_id="rl-ep", profile_id=PROTOCOL_PROFILE_ID, cap=1.0, overrides={}, env_split=split)
+
+
+async def test_a_lease_whose_box_died_is_released_on_the_machines_signed_record_only(tmp_path, monkeypatch):
+    """A box OOM-killed at its limit: the gateway signs ``box_failed``, the miner closes the session with it and
+    forfeits the lease for a sandbox failure: released, no quota cut, no scan. The same claim on a lease whose
+    episodes ended graded is charged as an expiry."""
+    from reliquary_sandbox.attest import SessionClaims
+
+    from reliquary.miner.rl_async import HttpRlTransport
+    from reliquary.miner.signed_episode import signed_close_request
+    from reliquary.validator.rl_leases import LeaseRequest
+    from tests.unit.sandbox_fixtures import transcript
+
+    world = World(tmp_path, monkeypatch)
+    await world.start()
+    try:
+        died, healthy = world.rl.book.grant([LeaseRequest(MINER.ss58_address, EPISODE, (7, 8), 0)])[0].leases
+        async with world.client() as client:
+            async def play(lease, status, reason=None):
+                grant = (await open_session(client, lease.lease_id, 0)).json()
+                claims = SessionClaims.from_dict(grant["token"]["claims"])
+                signed = transcript(world.validator, world.machine, claims, status=status, reason=reason,
+                                    env_package=ENV_PACKAGE, at=claims.issued_at)
+                path = f"/rl/sandbox/sessions/{grant['session_id']}/close"
+                close = signed_close_request(hotkey=MINER.ss58_address, session_id=grant["session_id"],
+                                             reason="withdraw" if status == "graded" else "final", transcript=signed,
+                                             sign_binding=sign, now=time.time(), request_id=os.urandom(16).hex(),
+                                             validator_hotkey=VALIDATOR.ss58_address, path=path)
+                assert (await client.post(path, json=close)).status_code == 200
+
+            await play(died, "box_failed", reason="the agent's box is unusable")
+            await play(healthy, "graded")
+            transport = HttpRlTransport(client, base_url="http://validator", hotkey=MINER.ss58_address,
+                                        validator_hotkey=VALIDATOR.ss58_address, sign_binding=sign)
+            quota = world.rl.book.quota.quota(MINER.ss58_address)
+            released = await transport.forfeit(died.lease_id, "sandbox_failure")
+            assert released["state"] == "released" and released["quota"] == quota
+            claimed = await transport.forfeit(healthy.lease_id, "sandbox_failure")       # the miner's word alone
+            assert claimed["state"] == "expired" and claimed["quota"] < quota
+        assert world.rl.book.prompt_state()["scans"] == []
+        cause = world.rl.book.db.execute("SELECT cause FROM rl_leases WHERE lease_id=?", (died.lease_id,)).fetchone()
+        assert cause == ("box_failed",)
+    finally:
+        await world.rl.sandbox.stop()
+        world.rl.close()

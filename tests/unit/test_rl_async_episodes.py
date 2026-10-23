@@ -629,3 +629,62 @@ def test_a_batch_of_leases_is_one_engine_call_each_request_keyed_by_its_own_leas
                 last = int(fs.pick_rows(table[last:last + 1], [u], draw=fs.DRAW_GUMBEL_MAX)[0])
                 want.append(last)
             assert completion == want
+
+
+def test_an_episode_our_sandbox_ended_fails_the_lease_at_once_with_that_reason(monkeypatch):
+    from reliquary.miner import episode_commit
+    from reliquary.miner.forced_draw import ForcedDraws
+    from reliquary.miner.rl_async_episodes import EpisodeLeaseFailed, EpisodeLeaseGenerator
+
+    lease = HeldLease("lease9", "ep", 4, 2, NONCE, 1e12)
+
+    class Engine:
+        def take_session(self, session_id):
+            return SimpleNamespace(session_id=session_id)
+
+        def drop_session(self, session_id):
+            return None
+
+    monkeypatch.setattr(episode_commit, "episode_admissible", lambda outcome, **kw: (
+        episode_commit.AdmissibleEpisode([7, 7, 7, 1, 5], [(3, 4)], episode_commit.AdmittedStop("agent_completed")),
+        None))
+
+    class Runner(_Runner):
+        def __init__(self, status):
+            super().__init__()
+            self.status, self.cancelled = status, 0
+
+        async def run(self, index, on_session=None):
+            on_session(f"s{index}")
+            self.runs.append(index)
+            if index == 3:
+                await asyncio.sleep(0.01)
+                return _Result(index, ok=False, final_status=self.status)
+            if index < 3:                                         # done before the box died: withdrawn after
+                result = _Result(index)
+                self.results.append(result)
+                return result
+            try:
+                await asyncio.sleep(3600)                         # a long episode still running
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+
+    runners = []
+
+    def factory(policy, held, text):
+        runners.append(Runner(status))
+        return runners[-1]
+
+    generator = EpisodeLeaseGenerator(policies={"ep": SimpleNamespace(environment="ep")}, runner_factory=factory,
+                                      engine=Engine(), draws=ForcedDraws(),
+                                      renderer_for=lambda p: SimpleNamespace(initial_ids=lambda t: [7, 7, 7]),
+                                      task_prompt=lambda env, idx: "task")
+    for status in ("box_failed", "aborted"):
+        (failed,) = asyncio.run(asyncio.wait_for(generator.agenerate([lease]), 30))
+        runner = runners[-1]
+        assert isinstance(failed, EpisodeLeaseFailed) and failed.sandbox_failure == status
+        assert runner.cancelled == 12                                 # the 12 running episodes stopped at once
+        assert all(r.released for r in runner.results)                # the graded ones withdrawn
+        if status == "aborted":
+            assert runner.runs.count(3) == 2                          # an abort is played again first

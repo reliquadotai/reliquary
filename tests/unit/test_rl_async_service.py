@@ -581,6 +581,12 @@ def test_the_controller_wandb_row_reads_prices_buffer_leases_and_miners(tmp_path
     assert row[f"price/{ENV}/multiplier"] > 0 and row[f"buffer/{ENV}/queued"] == 1
     assert row["leases/open"] == 1 and row["leases/submitted"] == 1 and row[f"leases_issued/{ENV}"] == 2
     assert row[f"groups/{ENV}/in_zone"] == 1 and row["miners/active"] == 1 and row["miners/banned"] == 0
+    assert row["leases/sandbox_failure_released"] == 0
+    rl.book.sandbox_failure = lambda lease: ("box_failed", "rollout 2")     # our sandbox failed its episode
+    rl.book.forfeit(leases[1].lease_id, "A")
+    row = controller_metrics(rl, time.time())
+    assert row["leases/sandbox_failure_released"] == 1 and row[f"leases_released/{ENV}/box_failed"] == 1
+    assert row["leases/released"] == 1 and "leases/open" not in row
     rl.close()
 
 
