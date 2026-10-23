@@ -23,14 +23,14 @@ from reliquary.protocol.rl_submit import (  # noqa: E402
     MAX_SUBMIT_BODY_BYTES, encode_tokens, gzip_body, inflate_body,
 )
 from reliquary.validator.rl_async_episodes import (  # noqa: E402
-    EPISODE_ENVS_PARAM, EPISODE_SESSION_SLACK_S, LEASE_EXPIRY_PARAM, async_episode_policy, episode_blocks,
-    episode_lease_expiry_s, validate_episode_block,
+    EPISODE_ENVS_PARAM, EPISODE_SESSION_SLACK_S, LEASE_EXPIRY_PARAM, MEMORY_FLOOR_ENV, async_episode_policy,
+    episode_blocks, episode_lease_expiry_s, episode_policies, memory_floors, validate_episode_block,
 )
 from reliquary.validator.rl_async_service import (  # noqa: E402
     PLANNED_TOKENS_PARAM, RlAsyncSettings, build_rl_async, mount_rl_async, rl_async_params, rl_async_settings,
     wire_episode_sandbox,
 )
-from tests.unit.episode_v2_fixtures import BUDGETS, ENV_PACKAGE, EPISODE, SANDBOX_ENV, episode_block  # noqa: E402
+from tests.unit.episode_v2_fixtures import BUDGETS, ENV_PACKAGE, EPISODE, GIB, SANDBOX_ENV, episode_block  # noqa: E402
 from tests.unit.test_rl_submit import CAP, ENV, MathEnv, Tokenizer  # noqa: E402
 
 MINER = bt.Keypair.create_from_uri("//Alice")
@@ -130,6 +130,39 @@ def test_the_settings_carry_the_episode_policies_and_a_lease_lifetime_with_sandb
         rl_async_params(planned_tokens_per_period=1e6, lease_expiry_s={EPISODE: -1})
 
 
+def test_the_memory_floor_is_read_strictly(monkeypatch):
+    monkeypatch.delenv(MEMORY_FLOOR_ENV, raising=False)
+    assert memory_floors() == {} and memory_floors("") == {}
+    assert memory_floors(json.dumps({EPISODE: 4 * GIB})) == {EPISODE: 4 * GIB}
+    for bad in ("{", "[]", '{"e": "4294967296"}', '{"e": 4.0}', '{"e": true}', '{"e": 0}', '{"e": -1}',
+                json.dumps({"e": 8 * GIB + 1})):
+        with pytest.raises(ValueError, match=MEMORY_FLOOR_ENV):
+            memory_floors(bad)
+    monkeypatch.setenv(MEMORY_FLOOR_ENV, "{nope")
+    with pytest.raises(ValueError, match=MEMORY_FLOOR_ENV):     # refused at startup
+        rl_async_settings(entry(rl_async_params(planned_tokens_per_period=1e6,
+                                                episode_envs={EPISODE: {"episode": episode_block()}})), 0.3,
+                          max_tokens=lambda env: 4000)
+
+
+def test_the_memory_floor_only_raises_the_issued_memory_budget(monkeypatch):
+    monkeypatch.delenv(MEMORY_FLOOR_ENV, raising=False)
+    small = {**BUDGETS, "memory_bytes": 2 * GIB}
+    blocks = {EPISODE: validate_episode_block(EPISODE, {"episode": episode_block(budgets=small)})}
+    plain = async_episode_policy(EPISODE, blocks[EPISODE])
+    assert episode_policies(blocks) == {EPISODE: plain}                  # no floor: the block's policy, unchanged
+    raised = episode_policies(blocks, {EPISODE: 4 * GIB})[EPISODE]
+    assert raised.budgets_dict() == {**small, "memory_bytes": 4 * GIB}
+    assert raised == plain.__class__(**{**{f: getattr(plain, f) for f in plain.__slots__},
+                                        "budgets": raised.budgets})     # nothing else moves
+    assert episode_policies(blocks, {EPISODE: GIB})[EPISODE] == plain   # never lowered
+    monkeypatch.setenv(MEMORY_FLOOR_ENV, json.dumps({EPISODE: 4 * GIB}))
+    assert episode_policies(blocks)[EPISODE] == raised
+    assert blocks[EPISODE]["episode"]["budgets"] == small                # the block (/rl/episodes) is untouched
+    with pytest.raises(ValueError, match="not episode envs"):
+        episode_policies(blocks, {"other": 4 * GIB})
+
+
 def test_the_cli_declares_episode_envs_and_lease_lifetimes(tmp_path, monkeypatch):
     from reliquary.cli.main import _parse_lease_expiry, _read_episode_envs, with_rl_async_params
 
@@ -160,8 +193,8 @@ def test_gzip_bodies_inflate_within_the_cap():
 
 
 # --- the async validator app with its sandbox side ------------------------------------------------------------------
-def _settings(**kw) -> RlAsyncSettings:
-    block = validate_episode_block(EPISODE, {"episode": episode_block()})
+def _settings(budgets=None, **kw) -> RlAsyncSettings:
+    block = validate_episode_block(EPISODE, {"episode": episode_block(**({"budgets": budgets} if budgets else {}))})
     values = dict(task_id="rl-ep", cap=0.5, run="ep", targets={ENV: 0.5, EPISODE: 0.5}, planned_tokens_per_period=1e6,
                   lease_expiry_s={ENV: 600.0, EPISODE: 5000.0}, episodes={EPISODE: block})
     values.update(kw)
@@ -191,7 +224,8 @@ class ImageSource:
 class World:
     """The async validator (lease book, submissions, the sandbox side over a fake machine) and its ASGI app."""
 
-    def __init__(self, tmp_path, monkeypatch, *, machine_ids=None):
+    def __init__(self, tmp_path, monkeypatch, *, machine_ids=None, budgets=None, floor=None, capacity=32,
+                 resources=None):
         attest = pytest.importorskip("reliquary_sandbox.attest")
         from reliquary.environment.signed_episode import SignedEpisodeEnvironment
         from reliquary.infrastructure.sandbox_store import MemorySessionStore
@@ -203,24 +237,29 @@ class World:
         from tests.unit.test_trajectory_parse import FakeRenderer
 
         register_episode_env(monkeypatch)
+        if floor is None:
+            monkeypatch.delenv(MEMORY_FLOOR_ENV, raising=False)
+        else:
+            monkeypatch.setenv(MEMORY_FLOOR_ENV, json.dumps({EPISODE: floor}))
+        self.memory = max(floor or 0, (budgets or BUDGETS)["memory_bytes"])     # what a session is issued
         # Without an installed reliquary-sandbox distribution (a source checkout on the path) no commit is known.
         monkeypatch.setattr("reliquary.sandbox.sandbox_commit_refusal", lambda pinned: None)
         self.attest = attest
         self.validator, self.machine = episode_signers(tmp_path / "keys")
         grader = GroupGrader({ENV: MathEnv()}, Tokenizer(), eos_token_ids=(1,))
-        self.rl = build_rl_async(_settings(), path=tmp_path / "rl-async.sqlite3", grader=grader,
+        self.rl = build_rl_async(_settings(budgets), path=tmp_path / "rl-async.sqlite3", grader=grader,
                                  prompt_range={ENV: (0, 50), EPISODE: (0, 1000)}, collector_interval_s=0.0)
         self.rl.book.adopt_checkpoint(0)
         machine = self.machine
         self.fetched = []
 
         async def read_documents():
-            return [machine_document(machine, capacity=32)]
+            return [machine_document(machine, capacity=capacity)]
 
         async def fetch_report(address):
             self.fetched.append(address)
-            return capacity_report(machine, at=int(time.time()), capacity=32, free=32, images=(IMAGE,),
-                                   env_packages={SANDBOX_ENV: ENV_PACKAGE})
+            return capacity_report(machine, at=int(time.time()), capacity=capacity, free=capacity, images=(IMAGE,),
+                                   env_packages={SANDBOX_ENV: ENV_PACKAGE}, resources=resources)
 
         config = SandboxValidatorConfig(key_file=Path("unused"), key_id=self.validator.key_id, retired_keys={},
                                         machine_ids=machine_ids)
@@ -249,6 +288,26 @@ async def test_machine_scope_reaches_async_lease_polling_and_capacity(tmp_path, 
     assert fleet.session_capacity() == capacity
     assert len(world.fetched) == (1 if capacity else 0)
     assert fleet.directory_if_ready().public_key("machine-1", world.machine.key_id, int(time.time())) is not None
+
+
+@pytest.mark.parametrize("floor,hostable", [(None, 320), (4 * GIB, 160)])
+async def test_the_fleet_counts_sessions_at_the_floored_memory(tmp_path, monkeypatch, floor, hostable):
+    from reliquary.sandbox.rl_capacity import SessionTiers
+
+    resources = {"cpu_millis": 320_000, "memory_bytes": 640 * GIB, "used_cpu_millis": 0, "used_memory_bytes": 0,
+                 "free_cpu_millis": 320_000, "free_memory_bytes": 640 * GIB, "max_box_cpu_millis": 1_000,
+                 "boxes_per_episode": 1, "cpu_overcommit_permille": 1_000, "present_window_s": 120, "sessions": []}
+    world = World(tmp_path, monkeypatch, budgets={**BUDGETS, "memory_bytes": 2 * GIB}, floor=floor, capacity=320,
+                  resources=resources)
+    await world.start()
+    try:
+        tiers = SessionTiers(world.rl.settings.episode_policies())
+        assert tiers.reservation(EPISODE)["memory_bytes"] == world.memory
+        assert world.rl.sandbox.fleet.session_capacity(reservations=tiers.reservations()) == hostable
+        assert await world.rl.sandbox.lease_refusal(EPISODE, 0) is None        # placement at the floored budget
+    finally:
+        await world.rl.sandbox.stop()
+        world.rl.close()
 
 
 def sign(binding: bytes) -> str:
@@ -300,6 +359,7 @@ class RouteEpisodes:
             self.opened.append(grant["session_id"])
             claims = SessionClaims.from_dict(grant["token"]["claims"])
             assert claims.engagement == f"rl-lease:{lease.lease_id}:{index}" and claims.checkpoint == "k0"
+            assert claims.budgets.memory_bytes == self.world.memory               # the floor, signed
             signed = transcript(self.world.validator, self.world.machine, claims, status="graded",
                                 reward=float(index % 2 == 0), env_package=ENV_PACKAGE, at=claims.issued_at,
                                 calls=[{"turn": 0, "k": 0, "arguments": {"command": "c0"}, "output": "ok"}])
@@ -321,10 +381,11 @@ class RouteEpisodes:
         return rollouts
 
 
-async def test_an_episode_lease_end_to_end_through_the_async_validator_app(tmp_path, monkeypatch):
+@pytest.mark.parametrize("floor", [None, 6 * GIB])
+async def test_an_episode_lease_end_to_end_through_the_async_validator_app(tmp_path, monkeypatch, floor):
     from reliquary.miner.rl_async import AsyncMiner, AsyncMinerConfig, HttpRlTransport, PromptPlanner
 
-    world = World(tmp_path, monkeypatch)
+    world = World(tmp_path, monkeypatch, floor=floor)
     await world.start()
     sent = []
     try:

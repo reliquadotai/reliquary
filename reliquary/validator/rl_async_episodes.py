@@ -71,6 +71,8 @@ RESTORE_ATTEMPTS = 3
 RESTORE_TIMEOUT_S = 60.0
 RESTORE_BACKOFF_S = 5.0
 STOP_TIMEOUT_S = 10.0
+MEMORY_FLOOR_ENV = "RELIQUARY_RL_EPISODE_MEMORY_FLOOR_BYTES"
+"""Controller-side memory floor per env (``memory_floors``): JSON {env: bytes}, e.g. {"swe_v1": 4294967296}."""
 _BLOCK_FIELDS = frozenset({"episode", "catalogue", "version", "rows"})
 
 
@@ -154,8 +156,44 @@ def async_episode_policy(name: str, block: Mapping[str, Any], *, rollouts: int |
         harness_mix=harness_mix_pairs(episode))
 
 
-def episode_policies(blocks: Mapping[str, Mapping[str, Any]]) -> dict:
-    return {name: async_episode_policy(name, block) for name, block in blocks.items()}
+def memory_floors(raw: str | None = None) -> dict[str, int]:
+    """``MEMORY_FLOOR_ENV``: env -> the least memory (bytes) a session of it is issued, at most the sandbox's
+    ceiling (``EPISODE_BUDGET_CEILINGS``). ``raw`` None: the environment's. ValueError when malformed."""
+    import os
+
+    from reliquary.protocol.service_contract import EPISODE_BUDGET_CEILINGS
+
+    raw = os.environ.get(MEMORY_FLOOR_ENV) if raw is None else raw
+    if raw is None or not raw.strip():
+        return {}
+    try:
+        value = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"{MEMORY_FLOOR_ENV} is not JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{MEMORY_FLOOR_ENV} must map env names to bytes")
+    ceiling = EPISODE_BUDGET_CEILINGS["memory_bytes"]
+    for name, floor in value.items():
+        if type(floor) is not int or not 0 < floor <= ceiling:
+            raise ValueError(f"{MEMORY_FLOOR_ENV}[{name!r}] must be an int of bytes in (0, {ceiling}]")
+    return dict(value)
+
+
+def episode_policies(blocks: Mapping[str, Mapping[str, Any]], floors: Mapping[str, int] | None = None) -> dict:
+    """The validator's policies: each block's, its memory budget raised to the env's floor (``memory_floors``;
+    None: the environment's). Only the issued sessions change: ``GET /rl/episodes`` serves the blocks as declared."""
+    floors = memory_floors() if floors is None else dict(floors)
+    unknown = sorted(set(floors) - set(blocks))
+    if unknown:
+        raise ValueError(f"{MEMORY_FLOOR_ENV} names envs that are not episode envs: {unknown}")
+    policies = {name: async_episode_policy(name, block) for name, block in blocks.items()}
+    for name, floor in sorted(floors.items()):
+        budgets = policies[name].budgets_dict()
+        if floor > budgets["memory_bytes"]:          # only ever raised
+            budgets["memory_bytes"] = floor
+            policies[name] = dataclasses.replace(policies[name], budgets=tuple(budgets.items()))
+        logger.info("rl episode env %s: session budgets %s (memory floor %d)", name, budgets, floor)
+    return policies
 
 
 def episode_lease_expiry_s(policy, *, reference_tokens_per_s: float, margin: float,
@@ -367,7 +405,8 @@ def build_rl_lease_sandbox(
 
 
 __all__ = [
-    "EPISODE_ENVS_PARAM", "EPISODE_SESSION_SLACK_S", "LEASE_EXPIRY_PARAM", "RlLeaseSandbox", "async_episode_policy",
-    "build_rl_lease_sandbox", "episode_blocks", "episode_lease_expiry_s", "episode_policies", "episode_prompt_rows",
-    "episodes_answer", "expiry_overrides", "load_episode_environment", "validate_episode_block",
+    "EPISODE_ENVS_PARAM", "EPISODE_SESSION_SLACK_S", "LEASE_EXPIRY_PARAM", "MEMORY_FLOOR_ENV", "RlLeaseSandbox",
+    "async_episode_policy", "build_rl_lease_sandbox", "episode_blocks", "episode_lease_expiry_s",
+    "episode_policies", "episode_prompt_rows", "memory_floors", "episodes_answer", "expiry_overrides",
+    "load_episode_environment", "validate_episode_block",
 ]
