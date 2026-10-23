@@ -89,3 +89,37 @@ def test_a_failed_backup_leaves_the_worker_running(tmp_path):
     backup.submit(2, lambda folder: None)
     _wait(lambda: backup.completed == [2])
     backup.close(timeout=5)
+
+
+def test_a_missing_staging_dir_is_created_before_the_first_backup(tmp_path):
+    # Production 2026-10-22: <state>/async/hf-staging did not exist on a fresh volume, so every
+    # backup failed in mkdtemp before writing anything.
+    staging = tmp_path / "async" / "hf-staging"
+    uploaded = []
+
+    def upload(step, folder):
+        assert folder.parent == staging
+        uploaded.append((step, (folder / "weights").read_text()))
+
+    backup = BackgroundHfBackup(upload=upload, list_backups=lambda: [1],
+                                delete_backup=lambda s: None, keep_last=1, staging_dir=staging)
+    backup.submit(1, lambda folder: (folder / "weights").write_text("1"))
+    _wait(lambda: backup.completed == [1])
+    backup.close(timeout=5)
+    assert uploaded == [(1, "1")]
+    assert staging.is_dir() and not list(staging.iterdir())
+    assert staging.stat().st_mode & 0o777 == 0o700
+
+
+def test_a_staging_dir_removed_between_backups_is_recreated(tmp_path):
+    import shutil
+
+    staging = tmp_path / "hf-staging"
+    backup = BackgroundHfBackup(upload=lambda step, folder: None, list_backups=lambda: [],
+                                delete_backup=lambda s: None, keep_last=1, staging_dir=staging)
+    backup.submit(1, lambda folder: None)
+    _wait(lambda: backup.completed == [1])
+    shutil.rmtree(staging)
+    backup.submit(2, lambda folder: None)
+    _wait(lambda: backup.completed == [1, 2])
+    backup.close(timeout=5)
