@@ -16,7 +16,9 @@ Input: the submission path's event stream (``RlSubmissions.events(since)``, in `
 
 Settlement (epochs = the drand periods of ``corpus_periods``, 72 min = one Bittensor epoch): a period closes
 ``slack_s`` after its end; its accruals are summed per hotkey and normalised to the task cap (``scale = min(1, cap
-/ total)``: the cap is the most a period pays, the unpaid rest burns). The result is a period archive
+/ total)``: the cap is the most a period pays, the unpaid rest burns). With ``env_pay_k`` set (registry
+``rl_env_pay_k``, default off), each env's accruals are first scaled down to at most ``k x its target share x cap``
+(the surplus burns): no env can take the period by being cheap to mine. The result is a period archive
 (``rewards_by_hotkey``, ``work_period``, ``entry_period`` from ``cp.entry_for``) of the same shape as a corpus
 period archive, so the unchanged weight setter (``weight_only._period_weights``: EMA decayed per period, capped
 per task) pays it once the task is declared with ``params.settlement = "period-ema-v1"``. Archives are kept in the
@@ -64,10 +66,12 @@ class LedgerConfig:
     default_group_tokens: int = 16384
     slack_s: float = 120.0
     genesis: float = cp.PERIOD_EPOCH
+    env_pay_k: float | None = None   # an env's period pay <= k x its target share x cap (None: off)
 
     def __post_init__(self) -> None:
         if not (0 < self.cap <= 1 and 0 <= self.floor <= 1 and self.reference_groups > 0
-                and self.default_group_tokens > 0 and self.slack_s >= 0):
+                and self.default_group_tokens > 0 and self.slack_s >= 0
+                and (self.env_pay_k is None or self.env_pay_k > 0)):
             raise ValueError("invalid ledger config")
 
 
@@ -158,11 +162,12 @@ class RlPayLedger:
             periods = [p for p, in db.execute("SELECT DISTINCT period FROM rl_accruals WHERE status=? AND period<=? "
                                               "ORDER BY period", (ACCRUED, closed)).fetchall()]
             for period in periods:
-                rows = db.execute("SELECT hotkey, amount, matched_tokens FROM rl_accruals WHERE status=? AND "
-                                  "period=? ORDER BY seq", (ACCRUED, period)).fetchall()
+                rows = db.execute("SELECT hotkey, amount, matched_tokens, environment FROM rl_accruals WHERE "
+                                  "status=? AND period=? ORDER BY seq", (ACCRUED, period)).fetchall()
+                env_scale = self._env_scale(rows)
                 accrued: dict[str, float] = {}
-                for hotkey, amount, _ in rows:
-                    accrued[hotkey] = accrued.get(hotkey, 0.0) + amount
+                for hotkey, amount, _, env in rows:
+                    accrued[hotkey] = accrued.get(hotkey, 0.0) + amount * env_scale.get(env, 1.0)
                 total = math.fsum(accrued.values())
                 scale = 1.0 if total <= self.config.cap else self.config.cap / total
                 entered = [e for e, in db.execute("SELECT entry_period FROM rl_pay_periods").fetchall()]
@@ -173,10 +178,27 @@ class RlPayLedger:
                        "accrued_by_hotkey": {h: accrued[h] for h in sorted(accrued)}, "accrued_total": total,
                        "scale": scale, "cap": self.config.cap, "groups": len(rows),
                        "matched_tokens": sum(r[2] for r in rows)}
+                if self.config.env_pay_k is not None:
+                    doc["env_scale"] = env_scale
                 db.execute("INSERT INTO rl_pay_periods(work_period, entry_period, doc, published) VALUES(?,?,?,?)",
                            (period, entry, json.dumps(doc, sort_keys=True), _UNATTEMPTED))
                 db.execute("UPDATE rl_accruals SET status=? WHERE status=? AND period=?", (SETTLED, ACCRUED, period))
                 out.append(doc)
+        return out
+
+    def _env_scale(self, rows) -> dict[str, float]:
+        """Per env of a period's accrual rows: the factor holding its pay to ``env_pay_k x share x cap``."""
+        k = self.config.env_pay_k
+        if k is None:
+            return {}
+        targets = getattr(self.prices, "targets", {}) or {}
+        totals: dict[str, float] = {}
+        for _, amount, _, env in rows:
+            totals[env] = totals.get(env, 0.0) + amount
+        out = {}
+        for env, total in sorted(totals.items()):
+            limit = k * float(targets.get(env, 0.0)) * self.config.cap
+            out[env] = 1.0 if total <= limit else (limit / total if total > 0 else 1.0)
         return out
 
     def unpublished(self) -> list[dict]:

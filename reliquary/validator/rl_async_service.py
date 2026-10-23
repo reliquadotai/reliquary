@@ -77,6 +77,7 @@ START_POOL_PARAM = RL_START_POOL_PARAM                  # what the starting pric
 LEASE_SPEED_PARAM = "rl_lease_reference_tokens_per_s"   # a slow reference card's decode speed, per sequence
 LEASE_MARGIN_PARAM = "rl_lease_expiry_margin"
 PRICE_TICK_PARAM = "rl_price_tick_s"
+ENV_PAY_K_PARAM = "rl_env_pay_k"                # an env's period pay <= k x its share x cap (absent: off)
 PENDING_PARAM = "rl_max_pending_groups"         # global cap: buffered groups (queued or taken)
 # Two batches of 512 groups (decision N, 2026-10-20: ~8k rollouts per optimizer step, one step per checkpoint).
 # queue_sim 10-17 at 64 per batch: trainer wait 7 % at 2 batches, 1 % at 3, <1 % at 4.
@@ -104,7 +105,7 @@ def rl_async_params(*, planned_tokens_per_period: float, start_pool: float | Non
                     lease_tokens_per_s: float = DEFAULT_LEASE_TOKENS_PER_S,
                     lease_margin: float = DEFAULT_LEASE_MARGIN, tick_s: float | None = None,
                     max_pending_groups: int | None = None, episode_envs: Mapping[str, Any] | None = None,
-                    lease_expiry_s: Mapping[str, float] | None = None) -> dict:
+                    lease_expiry_s: Mapping[str, float] | None = None, env_pay_k: float | None = None) -> dict:
     """The params an async task adds to its registry entry (pay by period: ``settlement = period-ema-v1``).
     ``start_pool``: the budget the starting prices pay a period at the target mix (None: the cap; at most the cap,
     checked by the registry). ``episode_envs``: the signed-episode envs' blocks (``rl_async_episodes``: episode,
@@ -129,6 +130,10 @@ def rl_async_params(*, planned_tokens_per_period: float, start_pool: float | Non
         if max_pending_groups < 1:
             raise ValueError("max_pending_groups must be positive")
         params[PENDING_PARAM] = int(max_pending_groups)
+    if env_pay_k is not None:
+        if not env_pay_k > 0:
+            raise ValueError("env_pay_k must be positive")
+        params[ENV_PAY_K_PARAM] = float(env_pay_k)
     if episode_envs:
         params[EPISODE_ENVS_PARAM] = episode_blocks({EPISODE_ENVS_PARAM: episode_envs})
     if lease_expiry_s:
@@ -149,6 +154,7 @@ class RlAsyncSettings:
     max_pending_groups: int = DEFAULT_MAX_PENDING_GROUPS
     episodes: Mapping[str, Any] = field(default_factory=dict)   # env -> its validated episode block (§4.10)
     cooldown_k: Mapping[str, int] = field(default_factory=dict)  # env -> operator's fixed cooldown (rl_cooldown)
+    env_pay_k: float | None = None              # the ledger's per-env settlement guard (None: off)
 
     def episode_policies(self) -> dict:
         from reliquary.validator.rl_async_episodes import episode_policies
@@ -204,6 +210,8 @@ def rl_async_settings(entry, cap: float, *, run: str | None = None,
                            start_pool=(min(float(params[START_POOL_PARAM]), float(cap))
                                        if START_POOL_PARAM in params else None),
                            price=price, episodes=blocks, cooldown_k=cooldowns,
+                           env_pay_k=(float(params[ENV_PAY_K_PARAM])
+                                      if params.get(ENV_PAY_K_PARAM) is not None else None),
                            max_pending_groups=int(params.get(PENDING_PARAM, DEFAULT_MAX_PENDING_GROUPS)))
 
 
@@ -249,7 +257,8 @@ def build_rl_async(settings: RlAsyncSettings, *, path: str | os.PathLike[str], g
         prices = AsyncPriceController(book, dict(settings.targets), settings.cap, settings.planned_tokens_per_period,
                                       start_pool=settings.start_pool, params=settings.price or AsyncPriceParams(),
                                       clock=clock)
-        ledger = RlPayLedger(book, submissions, prices, LedgerConfig(task_id=settings.task_id, cap=settings.cap),
+        ledger = RlPayLedger(book, submissions, prices,
+                             LedgerConfig(task_id=settings.task_id, cap=settings.cap, env_pay_k=settings.env_pay_k),
                              clock=clock)
     except BaseException:
         book.close()

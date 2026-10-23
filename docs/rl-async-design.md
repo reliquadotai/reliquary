@@ -305,6 +305,19 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   queue: while the cap refuses leases no price rises, while the trainer waits (over 5 % of the
   tick) no price descends. The trainer neither took nor waited for 3 ticks (down): hold.
   `/rl/pay` publishes ratio, supply, demand and price per env.
+- Steering under a shortage (fixed 2026-10-23): in teutonic-rl-async-v1 the trainer waited at every
+  tick, so every env rose to the ceiling (4) and stayed there 10 h with nothing moving miners
+  between envs (hard math 66 % of the pay for a 21 % target, SWE 1 % for 23 %). While the trainer
+  waits, each env's share of the recent supply (decayed sums, half-life 2 ticks: long episodes
+  land in lumps) over its target share (`relative`) adds a step `relative^-1` within x/÷ 1.02
+  outside the 0.90-1.10 band, on top of the level step: an over-supplied env not short itself
+  descends, an env short against the mix out-rises the rest. One ceiling for the board: a rise
+  past it divides every multiplier by the same factor (ratios are what miners see). Floor 0.02
+  (was 0.05): the live mix needs ~65x between SWE and hard math. Simulated from the stuck board
+  (`tests/unit/test_rl_price_steer.py`, 4 miner models, elasticity 1-2, 3-30 % of GPUs moving per
+  tick, SWE/TMax lumps up to 6 ticks): within 3 points of every target in 6-12 h, no cycle;
+  steps of x1.05 or a 6-tick half-life oscillate. Optional per-env settlement guard
+  (`rl_env_pay_k`, off): an env's period pay at most k x its share x cap, the surplus burns.
 - Nominal price (fixed 2026-10-22): one rate for every env, `start_pool / planned_tokens_per_period`
   per matched token, times the env's multiplier. At the target mix and multiplier 1 env e earns
   `start_pool x share(e)` and the period pays `start_pool` (the earlier `cap x share(e) / planned`
