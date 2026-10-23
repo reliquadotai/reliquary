@@ -178,7 +178,7 @@ def controller_metrics(rl: Any, now: float, window_s: float = METRICS_EVERY_S,
                 out[f"price/{env}/{key}"] = price["signal"][key]
     db = rl.book.db
     with rl.book.lock:
-        speed = db.execute("SELECT tokens, seconds FROM rl_trainer_speed WHERE id=0").fetchone()
+        speed = db.execute("SELECT tokens, seconds FROM rl_trainer_work WHERE id=0").fetchone()
         rows = {
             "buffer": db.execute("SELECT environment, state, COUNT(*) FROM rl_buffer GROUP BY 1, 2").fetchall(),
             "leases": db.execute("SELECT state, COUNT(*) FROM rl_leases WHERE state='open' OR closed_at>=? "

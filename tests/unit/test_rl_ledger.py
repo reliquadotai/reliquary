@@ -165,13 +165,17 @@ def test_the_controller_reads_the_trainer_speed_from_the_queue_persists_and_pric
     assert prices.due()
     assert all(d.regime == HOLD for d in prices.tick(QueueTick({ENV: 9_000})).values())   # no speed yet: hold
     clock[0] += 300
-    # 150,000 tokens taken in the 150 s it did not wait: 1,000 tokens/s, 500 per env
+    # the first take opens a batch: its work is measured at the next take
+    assert all(d.regime == HOLD for d in prices.tick(QueueTick({ENV: 9_000}, 150_000)).values())
+    assert prices.trainer_speed() is None
+    clock[0] += 300
+    # the next take, 300 s later with 10 s of waiting: 150,000 tokens over 290 s of work, 500 per env
     decisions = prices.tick(QueueTick({ENV: 300 * 1_200, OTHER: 300 * 100}, 150_000, 10.0), {ENV})  # r 2.4, 0.2
     assert prices.trainer_speed() == pytest.approx(150_000 / 290)
     assert decisions[ENV].regime == DESCEND and decisions[OTHER].regime == HOLD           # capped: no rise
     clock[0] += 300
-    decisions = prices.tick(QueueTick({ENV: 300 * 1_200, OTHER: 300 * 100}, 150_000, 150.0))   # 1,000 tok/s
-    assert 150_000 / 290 < prices.trainer_speed() < 1_000                                # sums decayed per tick
+    decisions = prices.tick(QueueTick({ENV: 300 * 1_200, OTHER: 300 * 100}, 150_000, 150.0))
+    assert prices.trainer_speed() == pytest.approx(300_000 / 440, rel=0.01)               # sums over the batches
     # starved: ENV descends on the mix only (12x OTHER's supply for the same share), OTHER rises twice
     assert decisions[ENV].regime == DESCEND and decisions[OTHER].regime == RISE
     assert decisions[ENV].price == pytest.approx(0.817 ** 0.1 / 1.02)
@@ -190,10 +194,34 @@ def test_the_controller_reads_the_trainer_speed_from_the_queue_persists_and_pric
     decisions = prices.tick(QueueTick({ENV: 300 * 500, OTHER: 300 * 100}, 0, 300.0), {ENV})  # waited, took nothing
     assert prices.trainer_speed() is not None                                          # alive: speed kept
     assert decisions[ENV].price == pytest.approx(before / 1.02)                         # the mix's step, full ignored
-    clock[0] += 300 * 3 + 1                                                              # neither took nor waited
+    clock[0] += 4 * 3600 + 1                                                             # neither took nor waited
     assert again.trainer_speed() is None
     with pytest.raises(ValueError):
         AsyncPriceController(book, {ENV: 0.7}, CAP, PLANNED)
+
+
+def test_a_step_long_trainer_keeps_its_speed_between_takes(book):
+    """The trainer takes one batch at the start of a 90 min step: the speed is that batch over the step, measured at
+    the next take and held in between (no hold of the prices), never one batch over one tick
+    (teutonic-rl-async-v1, 2026-10-23)."""
+    clock = [NOW]
+    prices = AsyncPriceController(book, {ENV: 0.5, OTHER: 0.5}, CAP, PLANNED, clock=lambda: clock[0])
+    batch, ticks = 5_400_000, 18                                                        # 1,000 tokens/s over 90 min
+    speeds, regimes = [], []
+    for k in range(4 * ticks):
+        clock[0] += 300
+        if k % ticks == 0:                                                              # a take in two halves
+            prices.tick(QueueTick({ENV: 300 * 400, OTHER: 300 * 400}, batch // 2, 100.0))
+            clock[0] += 300
+            decisions = prices.tick(QueueTick({ENV: 300 * 400, OTHER: 300 * 400}, batch - batch // 2, 200.0))
+        else:
+            decisions = prices.tick(QueueTick({ENV: 300 * 400, OTHER: 300 * 400}))
+        speeds.append(prices.trainer_speed())
+        regimes.append({d.regime for d in decisions.values()})
+    assert speeds[:ticks] == [None] * ticks                                             # one batch open: no speed
+    late = speeds[ticks:]
+    assert all(v is not None and 950 < v < 1_150 for v in late), late                   # ~1,000, not 18,000
+    assert all(r == {RISE} for r in regimes[ticks:])                                    # 400 of 500 per env: short
 
 
 class Archives:
