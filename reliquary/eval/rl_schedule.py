@@ -20,7 +20,7 @@ Dry run by default: the reads happen (backups, job drains), the writes are print
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import logging
 from pathlib import Path
@@ -45,23 +45,41 @@ class SuiteEntry:
     short: str
     slots_per_prompt: int
     cap: float
-    max_new_tokens: int
+    max_new_tokens: int                 # an episode job: per turn
     prompt_count: int | None = None
+    # An agentic (multi-turn) set: its `jobs create --episode-file`, `--harness id@version` and renderer.
+    episode_file: str | None = None
+    harness: str | None = None
+    renderer_id: str | None = None
+
+
+_SUITE_KEYS = {"set_id", "short", "slots_per_prompt", "cap", "max_new_tokens", "prompt_count",
+               "episode_file", "harness", "renderer_id"}
 
 
 def load_suite(path: str | Path) -> list[SuiteEntry]:
-    """A JSON list of ``{set_id, short, slots_per_prompt, cap, max_new_tokens[, prompt_count]}``."""
-    raw = json.loads(Path(path).read_text())
+    """A JSON list of ``{set_id, short, slots_per_prompt, cap, max_new_tokens[, prompt_count]}``, plus
+    ``episode_file`` (relative to the suite file), ``harness`` and ``renderer_id`` for an agentic set."""
+    path = Path(path)
+    raw = json.loads(path.read_text())
     if not isinstance(raw, list) or not raw:
         raise ValueError("the suite is a non-empty JSON list")
     suite = []
     for item in raw:
-        unknown = set(item) - {"set_id", "short", "slots_per_prompt", "cap", "max_new_tokens", "prompt_count"}
+        unknown = set(item) - _SUITE_KEYS
         if unknown:
             raise ValueError(f"suite entry {item.get('set_id')!r}: unknown keys {sorted(unknown)}")
         entry = SuiteEntry(**item)
         if not _SHORT.fullmatch(entry.short):
             raise ValueError(f"short {entry.short!r}: lowercase letters, digits and '-', at most 16")
+        if entry.episode_file is None:
+            if entry.harness is not None:
+                raise ValueError(f"suite entry {entry.set_id!r}: a harness needs an episode_file")
+        else:
+            episode = (path.parent / entry.episode_file).resolve()
+            if not isinstance(json.loads(episode.read_text()), dict):
+                raise ValueError(f"suite entry {entry.set_id!r}: {episode} is not an episode object")
+            entry = replace(entry, episode_file=str(episode))
         suite.append(entry)
     if len({e.short for e in suite}) != len(suite) or len({e.set_id for e in suite}) != len(suite):
         raise ValueError("suite set ids and shorts must be unique")
@@ -268,11 +286,15 @@ class Scheduler:
         argv = ["reliquary", "jobs", "create", "--fleet-knows-corpus-generation", "--job-id", job,
                 "--model", repo, "--model-revision", revision, "--model-architecture", self.s.model_architecture,
                 "--checkpoint-sha256", sha, "--eval-set", entry.set_id,
-                "--renderer-id", self.s.renderer_id, "--eos-token-id", str(self.s.eos_token_id),
+                "--renderer-id", entry.renderer_id or self.s.renderer_id, "--eos-token-id", str(self.s.eos_token_id),
                 "--max-new-tokens", str(entry.max_new_tokens), "--slots-per-prompt", str(entry.slots_per_prompt),
                 "--temperature", str(self.s.temperature), "--top-p", str(self.s.top_p), "--cap", str(entry.cap)]
         if entry.prompt_count is not None:
             argv += ["--prompt-count", str(entry.prompt_count)]
+        if entry.episode_file is not None:
+            argv += ["--episode-file", entry.episode_file]
+        if entry.harness is not None:
+            argv += ["--harness", entry.harness]
         return argv
 
     def _command(self, cp: dict) -> str:

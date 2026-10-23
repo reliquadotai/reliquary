@@ -48,6 +48,17 @@ def rl_provenance(model: str | None, *, run_id: str | None = None, step: int | N
     return {k: v for k, v in named.items() if v is not None}
 
 
+def episode_protocol(episode) -> dict:
+    """What an agentic job's score depends on beyond the set and sampling: the env build, the harness
+    and the bounds. Machine and sandbox pins are left out (they do not change a grade)."""
+    env = episode.env
+    spec = episode.harness_spec
+    return {"env": f"{env.package}@{env.version}", "split": env.split,
+            "harness": f"{spec['id']}@{spec['version']}" if spec else episode.harness,
+            "renderer": episode.renderer, "max_turns": episode.max_turns,
+            "max_tokens_per_turn": episode.max_tokens_per_turn, "max_total_tokens": episode.max_total_tokens}
+
+
 async def _thresholds(job_id: str, entries: Callable | None) -> tuple[str | None, dict | None]:
     if entries is None:
         from reliquary.infrastructure.task_registry_store import read_registry
@@ -158,6 +169,7 @@ async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bo
         "thinking": CHAT_TEMPLATE_RENDERERS.get(job.renderer_id, False),
         "max_new_tokens": job.sampling.max_new_tokens, "seed": job.seed,
         "eos_token_id": job.eos_token_id,
+        **({"episode": episode_protocol(job.episode)} if job.episode is not None else {}),
         "verification": verification,
         "job_complete": complete, "prompts_exhausted": len(exhausted),
         "exhausted_problem_ids": [rows[i]["problem_id"] for i in exhausted],

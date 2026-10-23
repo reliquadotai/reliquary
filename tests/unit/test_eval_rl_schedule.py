@@ -200,3 +200,38 @@ def test_eval_schedule_is_a_dry_run_unless_told(tmp_path, monkeypatch):
     done = CliRunner().invoke(app, argv + ["--execute", "--wallet-name", "w", "--hotkey", "h", "--http-port", "1"])
     assert done.exit_code == 0, done.output
     assert world.started and (tmp_path / "results" / "schedule-state.json").exists()
+
+
+def test_an_agentic_set_declares_its_episode_harness_and_renderer(tmp_path):
+    (tmp_path / "swe").mkdir()
+    (tmp_path / "swe" / "episode.json").write_text(json.dumps({"harness": "bash", "max_turns": 48}))
+    path = tmp_path / "suite.json"
+    agentic = {"set_id": "reliquary-swe-eval-r0-n500-x7-k100-s7", "short": "swe-verified", "slots_per_prompt": 2,
+               "cap": 0.02, "max_new_tokens": 8192, "episode_file": "swe/episode.json", "harness": "mini-swe@2",
+               "renderer_id": "renderers:qwen38@0.1.11"}
+    path.write_text(json.dumps([{"set_id": "s", "short": "aime", "slots_per_prompt": 8, "cap": 0.02,
+                                 "max_new_tokens": 32768}, agentic]))
+    one_turn, swe = load_suite(path)
+    assert swe.episode_file == str(tmp_path / "swe" / "episode.json")       # relative to the suite file
+    world = World()
+    sch = scheduler(tmp_path, world, suite=[one_turn, swe])
+    sch.tick(execute=True)
+    plain, episode = world.commands
+    assert "--episode-file" not in plain and "--harness" not in plain
+    assert plain[plain.index("--renderer-id") + 1] == "chat-template-thinking-v1"
+    assert episode[episode.index("--episode-file") + 1] == swe.episode_file
+    assert episode[episode.index("--harness") + 1] == "mini-swe@2"
+    assert episode[episode.index("--renderer-id") + 1] == "renderers:qwen38@0.1.11"
+    assert episode[episode.index("--max-new-tokens") + 1] == "8192"
+    assert episode[episode.index("--job-id") + 1] == "eval-r7-base-swe-verified"
+
+
+@pytest.mark.parametrize("change", [{"harness": "mini-swe@2", "episode_file": None},
+                                    {"episode_file": "missing.json"}, {"episode_file": "list.json"}])
+def test_an_agentic_set_without_a_readable_episode_is_refused(tmp_path, change):
+    (tmp_path / "list.json").write_text("[]")
+    entry = {"set_id": "s", "short": "swe", "slots_per_prompt": 2, "cap": 0.02, "max_new_tokens": 8192, **change}
+    path = tmp_path / "suite.json"
+    path.write_text(json.dumps([entry]))
+    with pytest.raises((ValueError, OSError)):
+        load_suite(path)

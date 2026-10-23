@@ -2591,7 +2591,8 @@ def eval_schedule(
     run_id: str = typer.Option(..., "--run-id", help="The trainer's wandb run id (the feed's run_id)"),
     run_tag: str = typer.Option(..., "--run-tag", help="Short lowercase tag in the job ids: eval-<tag>-s<step>-.."),
     suite: str = typer.Option(..., "--suite", help="JSON list of {set_id, short, slots_per_prompt, cap, "
-                                                   "max_new_tokens[, prompt_count]}"),
+                                                   "max_new_tokens[, prompt_count]}; an agentic set adds "
+                                                   "episode_file (relative to the suite), harness, renderer_id"),
     every: int = typer.Option(..., "--every", min=1, help="Evaluate checkpoints whose step is a multiple of this "
                                                           "(a multiple of RELIQUARY_RL_HF_BACKUP_MILESTONE_EVERY)"),
     hf_prefix: str = typer.Option(..., "--hf-prefix", help="RELIQUARY_RL_HF_BACKUP_PREFIX of the trainer"),
