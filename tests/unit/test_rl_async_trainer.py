@@ -615,3 +615,45 @@ def test_the_wandb_row_carries_the_drift_breakdowns(monkeypatch):
     row = fake_wandb.log.call_args.args[0]
     assert row["async/by_lag/0/groups"] == 1 and row["async/by_lag/1/groups"] == 1 and row["async/lag_max"] == 1
     assert row["async/by_env/code/completion_tokens_mean"] == N_TOK and row["async/by_env/math/truncated_ratio"] == 0
+
+
+def test_the_batch_uniforms_are_each_rollouts_draw_uniforms():
+    from reliquary.trainer.async_trainer import batch_uniforms, training_group
+
+    groups = [SubmittedGroup(lease_id=f"L{j}", hotkey="A", environment="math", prompt_idx=7 + j, checkpoint=3,
+                             nonce="cd" * 32, arrived_at=0.0, rewards=(1.0, 0.0) * (ROLLOUTS // 2),
+                             truncated=(False,) * ROLLOUTS, prompt_tokens=(1, 2, 3),
+                             completions=tuple((0,) * (4 + i + j) for i in range(ROLLOUTS)),
+                             force_spans=(None,) * ROLLOUTS) for j in range(3)]
+    got = batch_uniforms(groups)
+    assert got == [[g.draw_uniforms(i) for i in range(ROLLOUTS)] for g in groups]
+    built = training_group(groups[1], slot0=0, index=1, uniforms=got[1])
+    assert [r._forced_draw_uniforms for r in built.rollouts] == got[1]
+
+
+def test_the_fused_head_takes_its_draws_through_fsdp_as_one_object(monkeypatch):
+    """FSDP2's pre-forward walks and rebuilds every list argument element by element; the draws (one per row)
+    reach the head wrapped, and the head unwraps them."""
+    from reliquary.trainer import distributed
+    from reliquary.validator import training
+
+    seen = {}
+
+    class Head:
+        fused_selected_logprobs = True
+
+        def __call__(self, hidden, targets, draws, chunk=None):
+            seen["draws"] = draws
+            return "ok"
+
+    draws = [0.25, None, 0.5]
+    assert training._selected_logprobs_from_hidden(torch.zeros(3, 4), torch.zeros(3, dtype=torch.long), Head(),
+                                                   draws=draws) == "ok"
+    assert isinstance(seen["draws"], distributed.OpaqueArg) and seen["draws"].value is draws
+
+    captured = {}
+    monkeypatch.setattr(training, "_selected_logprobs_from_hidden",
+                        lambda hidden, targets, project, **kw: captured.setdefault("draws", kw["draws"]))
+    head = distributed.FusedLogprobHead(4, 5, bias=False)
+    head(torch.zeros(3, 4), torch.zeros(3, dtype=torch.long), distributed.OpaqueArg(draws))
+    assert captured["draws"] is draws

@@ -97,6 +97,17 @@ def init_distributed(*, device_type: str = "cuda") -> DistContext:
     return DistContext(rank, world_size, device, control)
 
 
+class OpaqueArg:
+    """A Python value FSDP2's ``_root_pre_forward`` hands through untouched: it walks and rebuilds every list in a
+    module's arguments element by element (``torch.distributed.utils._recursive_to``), and the draws are one float
+    per row: seconds per micro-batch with every other rank waiting in a collective (2026-10-23)."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value) -> None:
+        self.value = value
+
+
 class FusedLogprobHead(torch.nn.Linear):
     """The LM head under FSDP2: ``head(hidden, targets)`` runs train_step's
     whole checkpointed chunk loop inside one module call.
@@ -116,6 +127,8 @@ class FusedLogprobHead(torch.nn.Linear):
             from reliquary.trainer.audits import head_projection
 
             return audit(head_projection(self.weight, self.bias))
+        if isinstance(draws, OpaqueArg):
+            draws = draws.value
         if targets is None:
             return super().forward(hidden)
         from reliquary.validator.training import _LOGPROB_CHUNK, _selected_logprobs_from_hidden

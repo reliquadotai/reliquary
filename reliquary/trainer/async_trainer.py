@@ -306,13 +306,26 @@ def _env_length_metrics(submitted: list[SubmittedGroup]) -> dict[str, float]:
             **{f"async/by_env/{env}/truncated_ratio": cut[env] / len(v) for env, v in tokens.items() if v}}
 
 
-def training_group(group: SubmittedGroup, *, slot0: int, index: int) -> SimpleNamespace:
+def batch_uniforms(submitted) -> list[list[list[float]]]:
+    """Every rollout's lease uniforms of a batch (``SubmittedGroup.draw_uniforms``), computed in parallel: ~190M
+    positions a step kept the 8 GPUs idle ~8 min on one core (teutonic-rl-async-v1, 2026-10-23)."""
+    from reliquary.protocol.rl_draw import lease_uniforms_many
+
+    jobs = [(g.nonce, g.prompt_idx, g.checkpoint, i, g.model_tokens(i)) for g in submitted
+            for i in range(len(g.completions))]
+    flat = iter(lease_uniforms_many(jobs))
+    return [[next(flat) for _ in g.completions] for g in submitted]
+
+
+def training_group(group: SubmittedGroup, *, slot0: int, index: int,
+                   uniforms: list[list[float]] | None = None) -> SimpleNamespace:
     """A buffered group as the trainer's group object (the window decoder's shape): full token rows, the BFT span
     in absolute positions, the lease's uniforms, and the gate's slot ids. Miners send no logprobs; the
     ``token_logprobs`` placeholder only carries the policy-position count (pi_old is the policy under the gate).
     An episode (§4.10) is the window path's Episode v1 shape: its validated model spans (absolute) are the policy
     mask (``_validated_assistant_spans``), so tool observations get no loss, no substitution and no match, and
-    its uniforms are one per model token across turns."""
+    its uniforms are one per model token across turns. ``uniforms``: the rollouts' uniforms already computed
+    (``batch_uniforms``), else each is recomputed here."""
     p = len(group.prompt_tokens)
     rollouts = []
     for i, completion in enumerate(group.completions):
@@ -326,7 +339,8 @@ def training_group(group: SubmittedGroup, *, slot0: int, index: int) -> SimpleNa
         rollout = SimpleNamespace(
             reward=float(group.rewards[i]), env_name=group.environment,
             commit={"tokens": list(group.prompt_tokens) + list(completion), "rollout": meta},
-            _forced_draw_uniforms=group.draw_uniforms(i), _async_slot=slot0 + i, _async_group=index)
+            _forced_draw_uniforms=group.draw_uniforms(i) if uniforms is None else uniforms[i],
+            _async_slot=slot0 + i, _async_group=index)
         if spans is not None:
             rollout._validated_assistant_spans = spans
         if span is not None:
@@ -519,8 +533,9 @@ class AsyncTrainer:
         started = self._clock()
         _reset_peak_memory()
         batch, slot = [], 0
+        uniforms = batch_uniforms(submitted)
         for i, group in enumerate(submitted):
-            batch.append(training_group(group, slot0=slot, index=i))
+            batch.append(training_group(group, slot0=slot, index=i, uniforms=uniforms[i]))
             slot += len(group.completions)
         gate = DrawGate([[r._async_slot for r in g.rollouts] for g in batch],
                         rollout_floor=self.config.rollout_floor, group_floor=self.config.group_floor,
