@@ -34,10 +34,19 @@ jobs:
           python -m pip install -e ".[dev]"
       - name: Run validator suite (shard ${{ matrix.shard }}/4)
         run: |
-          pytest -q -n 4 --durations=15 \
+          pytest -q -n 4 --durations=15 --timeout=900 \
             --test-shard=${{ matrix.shard }}/4 \
             --ignore=tests/gpu \
-            --ignore=tests/integration/test_grader_e2e.py
+            --ignore=tests/integration/test_grader_e2e.py \
+            --ignore=tests/unit/test_corpus_split_e2e.py
+      - name: Every corpus-split-e2e test has its own job
+        if: matrix.shard == 1
+        run: |
+          listed=$(sed -n '/^  corpus-split-e2e:/,/^    steps:/p' .github/workflows/validator-tests.yml \
+            | sed -n 's/^ *- \(test_[a-z0-9_]*\)$/\1/p' | sort)
+          collected=$(pytest -q --collect-only tests/unit/test_corpus_split_e2e.py | sed -n 's/.*::\(test_[a-z0-9_]*\)$/\1/p' | sort)
+          test -n "$collected" && test "$listed" = "$collected" || {
+            echo "corpus-split-e2e matrix: $listed"; echo "collected: $collected"; exit 1; }
       - name: Check V5 authenticity boundaries
         if: matrix.shard == 1
         env:
@@ -47,16 +56,44 @@ jobs:
           pytest -q tests/unit/test_grpo_window_batcher.py \
             -k 'all_token_auth or forced_seed_group_gate or forced_seed_gate_abstains or forced_seed_cdf_gate or forged or tamper'
 
+  # Each of these tests runs a split validator as several real processes for minutes; two on one runner starve
+  # each other, so each gets its own.
+  corpus-split-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - test_the_split_writes_the_single_process_verdicts_and_archives
+          - test_a_gpu_process_that_dies_makes_audits_wait_never_fail
+          - test_a_front_that_dies_leaves_the_judges_judging
+          - test_a_judge_killed_mid_pass_resumes_from_the_bucket
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install CPU test runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[dev]"
+      - name: Run ${{ matrix.test }}
+        run: pytest -q --timeout=1500 "tests/unit/test_corpus_split_e2e.py::${{ matrix.test }}"
+
   cpu-suite:
     runs-on: ubuntu-24.04
-    needs: [cpu-tests, signed-sandbox-cpu]
+    needs: [cpu-tests, corpus-split-e2e, signed-sandbox-cpu]
     if: always()
     steps:
       - name: Require all CPU suites
         env:
           CPU_RESULT: ${{ needs.cpu-tests.result }}
+          SPLIT_RESULT: ${{ needs.corpus-split-e2e.result }}
           SANDBOX_RESULT: ${{ needs.signed-sandbox-cpu.result }}
-        run: test "$CPU_RESULT" = success && test "$SANDBOX_RESULT" = success
+        run: test "$CPU_RESULT" = success && test "$SPLIT_RESULT" = success && test "$SANDBOX_RESULT" = success
 
   signed-sandbox-cpu:
     runs-on: ubuntu-24.04
