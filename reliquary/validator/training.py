@@ -1213,25 +1213,49 @@ class _DrawRows(NamedTuple):
 
 def _draw_logits(project, weight):
     """The rows -> logits map the forced draw reads, as the verifier computes it: the
-    profile's fp32 head (``verifier.fp32_head_matmul``) or the head's own projection."""
-    from reliquary.validator.verifier import fp32_head_matmul, lm_head_fp32
+    profile's fp32 head (``verifier.fp32_head_matmul``) or the head's own projection. The fp32
+    head's weight operand is upcast once here for every chunk of the micro-batch
+    (``verifier.fp32_head_weight``), not once per chunk; it lives as long as the map."""
+    from reliquary.validator.verifier import fp32_head_matmul, fp32_head_weight, lm_head_fp32
 
     if not lm_head_fp32():
         return project
     if weight is None:
         raise RuntimeError("fp32 LM head: the forced draw needs the head's weight")
     w = weight.detach().to(torch.bfloat16)
+    w32 = fp32_head_weight(w)
     return lambda rows: fp32_head_matmul(rows.reshape(-1, rows.shape[-1]).to(torch.bfloat16),
-                                         w).reshape(*rows.shape[:-1], -1)
+                                         w, weight_fp32=w32).reshape(*rows.shape[:-1], -1)
+
+
+def _draw_stats(logits: torch.Tensor, threshold: float, *, scratch: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    """(max p < ``threshold``, entropy in nats) per row of ``logits`` [n, vocab], in two full-vocab temporaries
+    at most (one when ``scratch``: the logits are the caller's to overwrite). With ``m`` the row max, ``t = x - m``
+    and ``s = sum exp(t)``: max p = 1 / s and H = log s - sum(exp(t) t) / s, the softmax entropy without
+    materialising log_softmax, probs and their product (four [n, vocab] fp32 tensors before)."""
+    t = logits.float()                          # a copy unless the logits are fp32 already
+    if t is logits and not scratch:
+        t = t.clone()
+    m = t.amax(dim=-1, keepdim=True)
+    t.sub_(m)                                   # <= 0; -inf rows of a masked vocab stay -inf
+    e = t.exp()
+    total = e.sum(dim=-1)
+    weighted = e.mul_(t).nan_to_num_(0.0).sum(dim=-1)   # exp(-inf) * -inf = nan -> 0, as before
+    stochastic = total.reciprocal() < threshold
+    entropy = total.log() - weighted / total
+    return stochastic, entropy
 
 
 @torch.no_grad()
-def _forced_draw_rows(logits_of, rows, targets, draws, chunk: int = _LOGPROB_CHUNK) -> _DrawRows:
+def _forced_draw_rows(logits_of, rows, targets, draws, chunk: int = _LOGPROB_CHUNK, *,
+                      scratch: bool = False) -> _DrawRows:
     """v* = the profile's forced pick (``forced_sampling.pick_rows``, the verifier's own) of
     each row whose public uniform ``draws[i]`` is known (None: keep the miner's token), plus
     the verifier's stochastic flag and the entropy. ``logits_of`` maps a row chunk to its
     logits; at most ``chunk`` rows of full-vocab logits live at once, and ``pick_rows``
-    bounds its own noise workspace (or runs the fused Triton pass)."""
+    bounds its own noise workspace (or runs the fused Triton pass). ``scratch``: ``logits_of``
+    returns a fresh tensor (a projection), which the stats then overwrite after the pick; an
+    identity map over the caller's logits must leave them intact (False)."""
     from reliquary.environment.forced_sampling import DRAW_GUMBEL_MAX, gumbel_gaps, pick_rows
     from reliquary.validator.verifier import draw_settings
 
@@ -1250,15 +1274,11 @@ def _forced_draw_rows(logits_of, rows, targets, draws, chunk: int = _LOGPROB_CHU
             logits = logits_of(rows[start:end])
         finally:
             torch.set_autocast_cache_enabled(cache_enabled)
-        logp = torch.log_softmax(logits.float(), dim=-1)
-        probs = logp.exp()
-        stochastic[start:end] = probs.max(dim=-1).values < settings.stochastic_threshold
-        entropy[start:end] = -(probs * logp).nan_to_num(0.0).sum(dim=-1)
-        del logp, probs
         local = [k for k in range(start, end) if draws[k] is not None]
         if local:
+            # The pick first, on the untouched logits; every row drawn (the usual case) needs no copy.
             index = torch.tensor(local, device=targets.device, dtype=torch.long)
-            rows_logits = logits.index_select(0, index - start)
+            rows_logits = logits if len(local) == end - start else logits.index_select(0, index - start)
             uniforms = [float(draws[k]) for k in local]
             if settings.draw == DRAW_GUMBEL_MAX:
                 chosen, gaps = gumbel_gaps(rows_logits, uniforms, targets[index])
@@ -1267,6 +1287,10 @@ def _forced_draw_rows(logits_of, rows, targets, draws, chunk: int = _LOGPROB_CHU
                 chosen = pick_rows(rows_logits, uniforms, draw=settings.draw, t=settings.t,
                                    top_k=settings.top_k, top_p=settings.top_p)
             picked[index] = chosen.to(picked.device)
+            del rows_logits
+        stochastic[start:end], entropy[start:end] = _draw_stats(logits, settings.stochastic_threshold,
+                                                                scratch=scratch)
+        del logits
     drawn = torch.tensor([u is not None for u in draws], dtype=torch.bool, device=targets.device)
     return _DrawRows(picked, drawn, drawn & (picked == targets), stochastic, entropy, gap)
 
@@ -1316,7 +1340,7 @@ def _selected_logprobs_from_hidden(
     if draws is not None:
         draw_rows = _forced_draw_rows(
             _draw_logits(lm_head, weight if weight is not None else getattr(lm_head, "weight", None)),
-            hidden_rows.detach(), indices, draws, chunk,
+            hidden_rows.detach(), indices, draws, chunk, scratch=True,
         )
         indices = draw_rows.targets
     n = hidden_rows.shape[0]
