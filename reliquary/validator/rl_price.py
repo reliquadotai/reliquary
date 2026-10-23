@@ -4,8 +4,11 @@ The target is the trainer's speed: each env must supply its target share of what
 is read from the training queue (``TrainingBuffer.drain_tick``), nothing is reported by the trainer. Per tick
 (``tick_s`` of wall time, the validator's timer):
 
-* **trainer speed** = the completion tokens it took from the queue over the seconds it did not wait for groups
-  (kept as sums decayed with a half-life of one tick, persisted);
+* **trainer speed** = the completion tokens of the batches it finished over the seconds it worked on them (did not
+  wait for groups), decayed with a half-life of ``speed_halflife_s``, persisted. A take closes the work since the
+  previous one, which was spent on the tokens taken then; between takes the speed holds. The trainer takes a whole
+  batch at the start of a step that can last 90 min: a speed measured per tick read one batch over 300 s (18x too
+  fast) and went stale between two takes (teutonic-rl-async-v1, 2026-10-23: every price on hold for hours);
 * **demand** of an env = its target share (renormalised over the envs that supplied anything in the tick: a dry
   env's share goes to the others, since the trainer takes what arrives) x the trainer's speed;
 * **supply** = the completion tokens of the env's groups queued for training during the tick, per second;
@@ -26,7 +29,8 @@ is read from the training queue (``TrainingBuffer.drain_tick``), nothing is repo
 * One ceiling for the board: when a rise would pass it, every multiplier is divided by the same factor. Ratios are
   what the miners see (settlement normalises to the cap), so a short env at the ceiling keeps gaining on the others
   instead of the others catching up with it.
-* No speed yet, or the trainer neither took nor waited for ``stale_ticks`` ticks (trainer down): every price holds.
+* No speed yet (the first batch is measured at the second take), or the trainer neither took nor waited for
+  ``stale_s`` (trainer down; longer than a step): every price holds.
 
 No global price: the trainer's speed is the sum of the demands, so every env at r ~ 1 means the miners as a whole
 match the trainer. The price is a multiplier of one nominal rate, the same for every env: per matched token an env
@@ -35,7 +39,7 @@ pays ``multiplier x start_pool / planned_tokens_per_period``. At the target mix 
 budget, the task's cap when not declared). Multipliers above 1 (up to 4, or ``cap / start_pool`` when larger, so
 that scarcity can reach the cap) raise the total towards the cap; the settlement's normalisation (``rl_ledger``)
 keeps the cap the most a period pays, the rest burns. State lives in the lease book's SQLite file (``rl_prices``,
-``rl_trainer_speed``, ``rl_supply``) and survives a restart.
+``rl_trainer_work``, ``rl_supply``) and survives a restart.
 """
 from __future__ import annotations
 
@@ -67,6 +71,8 @@ CREATE TABLE IF NOT EXISTS rl_prices(environment TEXT PRIMARY KEY, price REAL NO
 CREATE TABLE IF NOT EXISTS rl_price_clock(id INTEGER PRIMARY KEY CHECK(id=0), last_tick REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS rl_trainer_speed(id INTEGER PRIMARY KEY CHECK(id=0), tokens REAL NOT NULL,
     seconds REAL NOT NULL, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS rl_trainer_work(id INTEGER PRIMARY KEY CHECK(id=0), tokens REAL NOT NULL,
+    seconds REAL NOT NULL, pending_tokens REAL NOT NULL, pending_seconds REAL NOT NULL, active REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS rl_supply(environment TEXT PRIMARY KEY, tokens REAL NOT NULL);
 """
 
@@ -77,7 +83,8 @@ class AsyncPriceParams:
     tick_s: float = 300.0
     low: float = 0.90            # placeholders: the supply/demand band the price holds in
     high: float = 1.10
-    stale_ticks: float = 3.0     # no trainer speed for this many ticks: hold every price
+    stale_s: float = 4 * 3600.0  # the trainer neither took nor waited this long: down, hold every price
+    speed_halflife_s: float = 8 * 3600.0   # several steps: one batch per step reads as a few % of sawtooth
     starved: float = 0.05        # placeholder: the trainer waited over this share of the tick: no price descends
     # Steering under a shortage (test_rl_price_steer, 2026-10-23): the supply mix ``relative`` reads is decayed with
     # this half-life (long-episode envs arrive in lumps); the step against the mix is relative ** -gain within
@@ -87,10 +94,12 @@ class AsyncPriceParams:
     steer_gain: float = 1.0
 
     def __post_init__(self) -> None:
-        if not (self.tick_s > 0 and 0 < self.low <= self.high and self.stale_ticks > 0 and 0 <= self.starved < 1
+        if not (self.tick_s > 0 and 0 < self.low <= self.high and self.stale_s > 0 and self.speed_halflife_s > 0
+                and 0 <= self.starved < 1
                 and self.steer_halflife_ticks > 0 and self.steer_step >= 1
                 and self.steer_gain >= 0):
-            raise ValueError("tick_s > 0, 0 < low <= high, stale_ticks > 0, 0 <= starved < 1, steering out of range")
+            raise ValueError("tick_s > 0, 0 < low <= high, stale_s > 0, speed_halflife_s > 0, 0 <= starved < 1, "
+                             "steering out of range")
         if not 0 < self.base.floor <= self.base.start <= self.base.cap:
             raise ValueError("floor <= start <= cap")
 
@@ -213,19 +222,28 @@ class AsyncPriceController:
         return out
 
     # --- signals and ticks ---------------------------------------------------------------------------------
-    def _note_speed(self, tokens: float, seconds: float, now: float) -> None:
-        """Inside ``tick``'s transaction: ``tokens`` taken in ``seconds`` the trainer did not wait. A trainer that
-        took nothing but waited is alive: its speed is kept, refreshed."""
+    def _note_work(self, tokens: float, starved_s: float, seconds: float, now: float) -> None:
+        """Inside ``tick``'s transaction: one tick of ``seconds`` in which the trainer took ``tokens`` and waited
+        ``starved_s``. Its work goes to the batch in progress (``pending``); a take closes that batch into the sums
+        (decayed with a half-life of ``speed_halflife_s``) and opens the next one with the tokens just taken."""
         db = self.book.db
-        row = db.execute("SELECT tokens, seconds, at FROM rl_trainer_speed WHERE id=0").fetchone()
-        if tokens <= 0 or seconds <= 0:
-            db.execute("UPDATE rl_trainer_speed SET at=? WHERE id=0", (now,))
+        row = db.execute("SELECT tokens, seconds, pending_tokens, pending_seconds, active FROM rl_trainer_work "
+                         "WHERE id=0").fetchone()
+        if row is None:                               # the first take opens a batch; the work before it is unknown
+            if tokens > 0:
+                db.execute("INSERT INTO rl_trainer_work VALUES(0, 0, 0, ?, 0, ?)", (tokens, now))
             return
-        keep = 0.0 if row is None else 0.5 ** (max(now - row[2], 0.0) / self.params.tick_s)
-        db.execute("INSERT INTO rl_trainer_speed(id, tokens, seconds, at) VALUES(0,?,?,?) ON CONFLICT(id) DO UPDATE "
-                   "SET tokens=excluded.tokens, seconds=excluded.seconds, at=excluded.at",
-                   (tokens + (0.0 if row is None else keep * row[0]), seconds + (0.0 if row is None else keep * row[1]),
-                    now))
+        done_tokens, done_s, pending_tokens, pending_s, active = row
+        pending_s += max(seconds - min(starved_s, seconds), 0.0)
+        if tokens > 0 and pending_s < self.params.tick_s / 2:
+            pending_tokens += tokens                  # barely any work since the last take: the same batch, taken
+        elif tokens > 0:                              # in parts while the trainer waited for groups
+            keep = 0.5 ** (pending_s / self.params.speed_halflife_s)
+            done_tokens, done_s = keep * done_tokens + pending_tokens, keep * done_s + pending_s
+            pending_tokens, pending_s = tokens, 0.0
+        db.execute("UPDATE rl_trainer_work SET tokens=?, seconds=?, pending_tokens=?, pending_seconds=?, active=? "
+                   "WHERE id=0", (done_tokens, done_s, pending_tokens, pending_s,
+                                  now if tokens > 0 or starved_s > 0 else active))
 
     def _note_supply(self, arrivals: Mapping[str, int], seconds: float) -> dict[str, float]:
         """Inside ``tick``'s transaction: each env's queued tokens, decayed with a half-life of
@@ -239,11 +257,12 @@ class AsyncPriceController:
         return out
 
     def trainer_speed(self, now: float | None = None) -> float | None:
-        """Completion tokens per second of trainer work; None before any step or after ``stale_ticks`` without."""
+        """Completion tokens per second of trainer work over its finished batches; None before the second take, or
+        after ``stale_s`` without a take or a wait."""
         now = float(self.clock()) if now is None else now
         with self.book.lock:
-            row = self.book.db.execute("SELECT tokens, seconds, at FROM rl_trainer_speed WHERE id=0").fetchone()
-        if row is None or row[1] <= 0 or now - row[2] > self.params.stale_ticks * self.params.tick_s:
+            row = self.book.db.execute("SELECT tokens, seconds, active FROM rl_trainer_work WHERE id=0").fetchone()
+        if row is None or row[0] <= 0 or row[1] <= 0 or now - row[2] > self.params.stale_s:
             return None
         return row[0] / row[1]
 
@@ -266,8 +285,7 @@ class AsyncPriceController:
             seconds = max(now - last, 0.0)
             if seconds <= 0:
                 return {}
-            if queue.taken or queue.starved_s:
-                self._note_speed(float(queue.taken), seconds - min(float(queue.starved_s), seconds), now)
+            self._note_work(float(queue.taken), float(queue.starved_s), seconds, now)
             speed = self.trainer_speed(now)
             # An env nobody supplied gives its share to the others (the trainer takes what arrives), and still rises.
             live = sum(float(v) for env, v in self.targets.items() if arrivals.get(env, 0) > 0) or 1.0

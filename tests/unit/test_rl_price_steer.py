@@ -50,6 +50,9 @@ def stuck_controller(clock, start=4.0):
         for env in TARGETS:
             prices.book.db.execute("INSERT INTO rl_prices VALUES(?,?,?,?,?,?)",
                                    (env, start, 1.0, "rise", clock[0], "{}"))
+        # a trainer measured at TRAINER_TPS, its next batch open (the first take of a run gives no speed)
+        prices.book.db.execute("INSERT INTO rl_trainer_work VALUES(0, ?, ?, 0, 0, ?)",
+                               (TRAINER_TPS * TICK, TICK, clock[0]))
     return prices
 
 
