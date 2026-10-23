@@ -114,6 +114,9 @@ class BackgroundHfBackup:
                 logger.exception("HF backup of step %d failed; training continues", step)
 
     def _backup(self, step: int, save: Callable[[Path], None]) -> None:
+        if self._staging is not None:
+            # mkdtemp does not create its parent: a fresh state volume has no staging dir yet.
+            self._staging.mkdir(parents=True, mode=0o700, exist_ok=True)
         folder = Path(tempfile.mkdtemp(prefix=f"hf-backup-{step}-", dir=self._staging))
         try:
             save(folder)
