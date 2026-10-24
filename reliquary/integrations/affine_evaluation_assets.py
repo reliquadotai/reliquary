@@ -6,39 +6,13 @@ import hashlib
 from itertools import islice
 import os
 from pathlib import Path
-import stat
 
 from .affine import _private_file, _private_path
+from .affine_checkpoint import _member, _stamp
 from .affine_epoch import canonical, signed
 from .affine_evaluation import HEX, SCHEMA
 from .affine_scoring import checksum, read_json, require, write_json
 from reliquary.protocol.release_contract import canonical_sha256
-
-
-def _stamp(info):
-    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
-
-
-def _member(path):
-    _private_file(path)
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd, "rb") as stream:
-        before = os.fstat(stream.fileno())
-        require(
-            stat.S_ISREG(before.st_mode)
-            and before.st_uid == os.getuid()
-            and not before.st_mode & 0o077,
-            "ordinary owner-private checkpoint file required",
-        )
-        value = hashlib.sha256()
-        for block in iter(lambda: stream.read(4 * 1024**2), b""):
-            value.update(block)
-        after = os.fstat(stream.fileno())
-    require(
-        _stamp(before) == _stamp(after) == _stamp(path.stat(follow_symlinks=False)),
-        "local checkpoint changed while hashing",
-    )
-    return {"sha256": value.hexdigest(), "bytes": after.st_size}
 
 
 def check_assets(config_path: Path, output: Path) -> dict:

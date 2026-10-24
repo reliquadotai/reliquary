@@ -14,6 +14,10 @@ def main(argv=None):
         from .affine_scoring_cli import main as scoring_main
 
         return scoring_main(arguments[1:])
+    if arguments and arguments[0] == "native-evaluation":
+        from .affine_native_evaluation_cli import main as native_evaluation_main
+
+        return native_evaluation_main(arguments[1:])
     if arguments and arguments[0] == "evaluation":
         from pathlib import Path
         from .affine_evaluation import prepare
