@@ -332,6 +332,8 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
         return True
 
     try:
+        if _DIST is not None:
+            _reshard_fsdp(model)
         params = list(model.parameters())
     except (AttributeError, TypeError):
         logger.warning("_lazy_init: model has no .parameters(); skipping init")
@@ -341,6 +343,11 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
         return False
 
     if _DIST is not None:
+        from torch.distributed.tensor import DTensor
+
+        unsharded = [name for name, p in model.named_parameters() if not isinstance(p, DTensor)]
+        if unsharded:
+            raise RuntimeError(f"fsdp2 optimizer would step unsharded weights: {unsharded[:5]}")
         # FSDP2 shards are fp32 masters already; bitsandbytes cannot step
         # sharded tensors.
         _optimizer = torch.optim.AdamW(
@@ -408,6 +415,19 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
     _optimizer_model_id = id(model)
     logger.info("Training state initialised (optimizer, scheduler)")
     return True
+
+
+def _reshard_fsdp(model) -> None:
+    """Register every FSDP2 unit's sharded parameters again. After a forward FSDP2 leaves the unsharded weights
+    registered on a unit that does not reshard (the base, ``reshard_after_forward=False``) and on one called outside
+    the root's forward (the LM head): an optimizer built from them steps buffers FSDP2 refills from the shards and
+    frees, never the shards themselves (teutonic-rl-async-v1, until 2026-10-24: embed_tokens, model.norm and lm_head
+    never moved, and the optimizer-state snapshot read freed storage)."""
+    from torch.distributed.fsdp import FSDPModule
+
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            module.reshard()
 
 
 def _stepped():
