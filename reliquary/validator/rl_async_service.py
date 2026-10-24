@@ -90,6 +90,7 @@ LEASE_MARGIN_ENV = "RELIQUARY_RL_LEASE_EXPIRY_MARGIN"   # the operator's lease m
 # The operator's pricing and queue switches (2026-10-24 burn fix; registry params of the same meaning, env wins):
 PRICE_MODE_PARAM, PRICE_MODE_ENV = "rl_price_mode", "RELIQUARY_RL_PRICE_MODE"                 # per_env | level
 CARRY_PARAM, CARRY_ENV = "rl_pay_carry_periods", "RELIQUARY_RL_PAY_CARRY_PERIODS"             # 0: excess burns
+CARRY_CAPS_PARAM, CARRY_CAPS_ENV = "rl_pay_carry_max_caps", "RELIQUARY_RL_PAY_CARRY_MAX_CAPS"  # most carried, caps
 LANE_MAX_PARAM, LANE_MAX_ENV = "rl_lane_max_batches", "RELIQUARY_RL_LANE_MAX_BATCHES"         # per-env queue max
 BATCH_FACTOR_PARAM, BATCH_FACTOR_ENV = "rl_batch_env_factor", "RELIQUARY_RL_BATCH_ENV_FACTOR"  # per-env batch cap
 BATCH_GROUPS_PARAM, BATCH_GROUPS_ENV = "rl_batch_groups", "RELIQUARY_RL_BATCH_GROUPS"         # the trainer's batch
@@ -173,6 +174,7 @@ class RlAsyncSettings:
     env_pay_k: float | None = None              # the ledger's per-env settlement guard (None: off)
     lane_reserve: float = 0.0                   # share of the global cap kept per env (0: the global cap alone)
     pay_carry_periods: int = 0                  # a period's pay over the cap is carried this many periods (0: burns)
+    pay_carry_max_caps: float = 2.0             # the most carried at once, in caps (over it the oldest burns)
     lane_max_batches: float | None = None       # an env holds at most this many batches of its group share (None: off)
     batch_env_factor: float | None = None       # one take hands out at most this x an env's group share (None: off)
     batch_groups: int = 512                     # the trainer's batch, in groups (the limits' unit)
@@ -277,11 +279,12 @@ def rl_async_settings(entry, cap: float, *, run: str | None = None,
     batch_factor = _switch(params, operator_env, BATCH_FACTOR_PARAM, BATCH_FACTOR_ENV)
     switches = dict(
         pay_carry_periods=int(_switch(params, operator_env, CARRY_PARAM, CARRY_ENV, 0)),
+        pay_carry_max_caps=float(_switch(params, operator_env, CARRY_CAPS_PARAM, CARRY_CAPS_ENV, 2.0)),
         lane_max_batches=None if lane_max is None else float(lane_max),
         batch_env_factor=None if batch_factor is None else float(batch_factor),
         batch_groups=int(_switch(params, operator_env, BATCH_GROUPS_PARAM, BATCH_GROUPS_ENV, 512)))
-    if switches["pay_carry_periods"] < 0 or switches["batch_groups"] < 1:
-        raise ValueError("pay carry periods >= 0, batch groups >= 1")
+    if switches["pay_carry_periods"] < 0 or switches["pay_carry_max_caps"] < 0 or switches["batch_groups"] < 1:
+        raise ValueError("pay carry periods >= 0, carry max caps >= 0, batch groups >= 1")
     return RlAsyncSettings(task_id=str(entry.task_id), cap=float(cap),
                            run=run or os.environ.get(RUN_ENV) or str(entry.task_id), targets=targets,
                            planned_tokens_per_period=float(params[PLANNED_TOKENS_PARAM]), lease_expiry_s=expiry,
@@ -347,7 +350,8 @@ def build_rl_async(settings: RlAsyncSettings, *, path: str | os.PathLike[str], g
                                       clock=clock)
         ledger = RlPayLedger(book, submissions, prices,
                              LedgerConfig(task_id=settings.task_id, cap=settings.cap, env_pay_k=settings.env_pay_k,
-                                          carry_periods=settings.pay_carry_periods),
+                                          carry_periods=settings.pay_carry_periods,
+                                          carry_max_caps=getattr(settings, "pay_carry_max_caps", 2.0)),
                              clock=clock)
     except BaseException:
         book.close()
@@ -881,7 +885,8 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
                                       "price_tuning": {f: getattr(getattr(settings, "price", None), f, None)
                                                        for f in PRICE_TUNING_FIELDS},
                                       **{key: getattr(settings, key, None) for key in (
-                                          "pay_carry_periods", "lane_max_batches", "batch_env_factor")}},
+                                          "pay_carry_periods", "pay_carry_max_caps", "lane_max_batches",
+                                          "batch_env_factor")}},
                    role="controller", version=settings.run)
     publisher = _public_boards(rl, wallet, validator_hotkey, signer_client)
     audit_model, source = None, audit_source()

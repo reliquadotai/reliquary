@@ -1019,3 +1019,20 @@ def test_the_operator_tunes_the_price_level_by_env_var():
     assert tuned.price.level_decay_h == AsyncPriceParams().level_decay_h
     with pytest.raises(ValueError):                    # out of range is refused at start, not mid-run
         rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={"RELIQUARY_RL_PRICE_PAY_TARGET": "1.5"})
+
+
+def test_the_operator_sets_the_carry_ceiling_by_env_var():
+    from reliquary.cli.main import build_task_entry, with_rl_async_params
+    from reliquary.constants import PROTOCOL_PROFILE_ID
+    from reliquary.protocol.profiles import resolve_protocol_profile
+
+    envs = sorted(resolve_protocol_profile(PROTOCOL_PROFILE_ID).environments)[:2]
+    entry = build_task_entry(task_id="rl-async", profile_id=PROTOCOL_PROFILE_ID, cap=0.4, overrides={},
+                             env_split={envs[0]: 0.75, envs[1]: 0.25})
+    declared = with_rl_async_params(entry, planned_tokens_per_period=2e8)
+    assert rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={}).pay_carry_max_caps == 2.0
+    tuned = rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={
+        "RELIQUARY_RL_PAY_CARRY_PERIODS": "8", "RELIQUARY_RL_PAY_CARRY_MAX_CAPS": "4"})
+    assert (tuned.pay_carry_periods, tuned.pay_carry_max_caps) == (8, 4.0)
+    with pytest.raises(ValueError):
+        rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={"RELIQUARY_RL_PAY_CARRY_MAX_CAPS": "-1"})
