@@ -13,12 +13,13 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 METRICS_EVERY_S = 60.0
-ACTIVE_MINER_S = 600.0          # a hotkey issued a lease this recently counts as an active miner
+ACTIVE_MINER_S = 600.0          # a hotkey issued a lease this recently (or holding a live one) is an active miner
 MAX_NAMED_CARDS = 9             # declared names are miner-chosen: past these, "other" (12 models with the 3 buckets)
 BUCKETS = ("mixed", "undeclared", "other")
 CARD_WINDOW_MAX_S = 240.0       # the dashboard drops a card window longer than 300 s
 SHARE_WINDOW_S = 600.0          # trained-token shares: trailing, so a row between two trainer steps still has them
 RUNNING_INSTANCE_S = 1800.0     # a miner process with a tagged submission this recently counts in the fleet
+                                # (at least the longest lease lifetime: a slow card delivers that rarely)
 
 
 def card_class(name: str) -> str:
@@ -103,6 +104,20 @@ def _events(db: Any, since: float, now: float) -> list[tuple]:
                       "WHERE e.at>=? AND e.at<? AND e.kind IN (?, ?)", (since, now, "trained", "untrained")).fetchall()
 
 
+def active_hotkeys(db: Any, now: float) -> list[str]:
+    """Hotkeys issued a lease in ``ACTIVE_MINER_S`` or holding an open unexpired one: a slow card at full quota
+    asks for no new lease until it delivers, yet it is generating."""
+    return [h for (h,) in db.execute("SELECT hotkey FROM rl_leases WHERE issued_at>=? UNION "
+                                     "SELECT hotkey FROM rl_leases WHERE state='open' AND expires_at>?",
+                                     (now - ACTIVE_MINER_S, now))]
+
+
+def running_instance_s(rl: Any) -> float:
+    """``RUNNING_INSTANCE_S``, raised to the longest lease lifetime."""
+    expiry = getattr(getattr(rl.book, "config", None), "expiry_s", None) or {}
+    return max([RUNNING_INSTANCE_S, *(float(v) for v in expiry.values())])
+
+
 def _running_instances(db: Any, since: float) -> dict[str, set[str]]:
     """hotkey -> the instance ids its tagged submissions named since ``since``."""
     if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='rl_group_instances'").fetchone() is None:
@@ -119,7 +134,7 @@ def card_metrics(rl: Any, summary: list[dict], now: float, start: float, feed: C
                  instance_gpus: dict[tuple[str, str], dict[str, str]] | None = None) -> dict[str, float]:
     """Per declared card model (``miner_setup.summarize``): the active fleet now, and how the trainer judged its
     groups in ``[start, now)``. An active hotkey's GPUs are those of its processes that submitted a tagged group in
-    ``RUNNING_INSTANCE_S`` (``instance_gpus``, from ``instance_cards``), else all it declared; each card counts
+    ``running_instance_s`` (``instance_gpus``, from ``instance_cards``), else all it declared; each card counts
     under its own model, and the hotkey as a miner of each. One that declared nothing is ``undeclared``.
     A group its miner tagged with a declared ``instance_id`` (``instances``, from ``instance_classes``) counts for
     that process's cards instead of its hotkey's (``mixed`` when the untagged hotkey's cards differ)."""
@@ -135,10 +150,9 @@ def card_metrics(rl: Any, summary: list[dict], now: float, start: float, feed: C
             declared[line["hotkey"]][card_class(name)] += int(n)
     db = rl.book.db
     with rl.book.lock:
-        active = [h for (h,) in db.execute("SELECT DISTINCT hotkey FROM rl_leases WHERE issued_at>=?",
-                                           (now - ACTIVE_MINER_S,))]
+        active = active_hotkeys(db, now)
         events = _events(db, min(start, now - SHARE_WINDOW_S), now)
-        running = _running_instances(db, now - RUNNING_INSTANCE_S)
+        running = _running_instances(db, now - running_instance_s(rl))
     fleet: dict[str, list[int]] = {}
     for hotkey in active:
         seen: dict[str, str] = {}
@@ -235,8 +249,7 @@ def controller_metrics(rl: Any, now: float, window_s: float = METRICS_EVERY_S,
                                   "GROUP BY 1", (since,)).fetchall(),
         }
         audit_queue = db.execute("SELECT COUNT(*) FROM rl_audits").fetchone()[0]
-        miners = db.execute("SELECT COUNT(DISTINCT hotkey) FROM rl_leases WHERE issued_at>=?",
-                            (now - ACTIVE_MINER_S,)).fetchone()[0]
+        miners = len(active_hotkeys(db, now))
         banned = db.execute("SELECT COUNT(*) FROM rl_hotkey_bans WHERE until>?", (now,)).fetchone()[0]
         caps = [json.loads(state).get("cap", 0) for (state,) in db.execute("SELECT state FROM rl_lease_quota")]
     for env, state, n in rows["buffer"]:
