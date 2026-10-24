@@ -549,7 +549,39 @@ class _LazyLogitRows:
         return self._project(self._hidden[key])
 
 
-def fp32_head_matmul(rows: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+_MM_OUT_DTYPE: bool | None = None
+
+
+def _mm_has_out_dtype() -> bool:
+    """Whether this torch's ``torch.mm`` takes ``out_dtype`` on CUDA (probed once on a 1x1 product)."""
+    global _MM_OUT_DTYPE
+    if _MM_OUT_DTYPE is None:
+        try:
+            one = torch.ones(1, 1, dtype=torch.bfloat16, device="cuda")
+            torch.mm(one, one, out_dtype=torch.float32)
+            _MM_OUT_DTYPE = True
+        except TypeError:
+            _MM_OUT_DTYPE = False
+    return _MM_OUT_DTYPE
+
+
+def fp32_head_weight(weight: torch.Tensor) -> torch.Tensor | None:
+    """The fp32 operand ``fp32_head_matmul`` would cast ``weight`` to on every call, cast once, for a caller that
+    projects many row chunks through the same weight (the forced draw of a micro-batch: 4 GB re-cast per 512-row
+    chunk on the 9B costs as much as the TF32 product). None when the call needs no cast (``out_dtype``, or not a
+    bf16 CUDA weight) or ``RELIQUARY_FP32_HEAD_WEIGHT_CACHE=0``."""
+    import os
+
+    if os.environ.get("RELIQUARY_FP32_HEAD_WEIGHT_CACHE", "1") == "0":
+        return None
+    weight = weight.detach()
+    if not (weight.is_cuda and weight.dtype == torch.bfloat16) or _mm_has_out_dtype():
+        return None
+    return weight.float()
+
+
+def fp32_head_matmul(rows: torch.Tensor, weight: torch.Tensor, *,
+                     weight_fp32: torch.Tensor | None = None) -> torch.Tensor:
     """``sampling.lm_head_fp32``: rows @ W.T with fp32 products and accumulation, fp32 out. With bf16 operands on
     CUDA (production) it is the cuBLAS call vLLM's ``head_dtype=float32`` makes (``torch.mm(..., out_dtype=
     float32)``, tensor cores; 13.7x faster than an fp32 SGEMM at 2048 rows of the 9B on H100, 1 different Gumbel
@@ -557,21 +589,21 @@ def fp32_head_matmul(rows: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     the operands upcast to fp32 with TF32 on. A bf16 value (8-bit significand) is exact in TF32 (11-bit), so TF32
     rounds nothing and the products and fp32 accumulation are those of ``out_dtype``; only the summation order may
     differ. With TF32 off this fallback ran the head 10x slower: ~65 % of every training step on
-    teutonic-rl-async-v1 (2026-10-23). Any other operands: an fp32 matmul with TF32 off.
+    teutonic-rl-async-v1 (2026-10-23). Any other operands: an fp32 matmul with TF32 off. ``weight_fp32``:
+    ``fp32_head_weight(weight)``, the same upcast done once by the caller (the products are unchanged).
     bf16 x bf16 products are exact in fp32: only the summation order differs (~4e-4 at most on the 9B)."""
     weight = weight.detach()
     bf16_cuda = rows.is_cuda and rows.dtype == weight.dtype == torch.bfloat16
-    if bf16_cuda:
-        try:
-            with torch.autocast(device_type="cuda", enabled=False):
-                return torch.mm(rows, weight.T, out_dtype=torch.float32)
-        except TypeError:           # no out_dtype in this torch: the same products through TF32 below
-            pass
+    if bf16_cuda and _mm_has_out_dtype():
+        with torch.autocast(device_type="cuda", enabled=False):
+            return torch.mm(rows, weight.T, out_dtype=torch.float32)
+    # no out_dtype in this torch (or not bf16 CUDA): the same products through TF32 below
     previous = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = bf16_cuda
     try:
         with torch.autocast(device_type=rows.device.type, enabled=False):
-            return rows.float() @ weight.float().T
+            rhs = weight_fp32 if weight_fp32 is not None and bf16_cuda else weight.float()
+            return rows.float() @ rhs.T
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous
 
