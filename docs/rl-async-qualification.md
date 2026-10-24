@@ -163,3 +163,27 @@ miners (single-turn and episodes), the gVisor sandbox host.
 - Math at the 64k cap: FSDP2 trainer memory and step time on 64k sequences, lease lifetimes, cut share per env
   (watch it during the run; raise the cap if it stays high).
 - Cut rollouts score 0 and their groups train: in-zone share and length trend of the math envs over the first steps.
+
+## Optional miner submission journal
+
+The async validator can expose `GET /rl/miner-submissions?run_id=<native-run>` when
+`RELIQUARY_RL_MINER_SUBMISSIONS_MODE=enabled` and
+`RELIQUARY_RL_MINER_SUBMISSIONS_START_AT` names a qualified coverage boundary in
+Unix seconds. The route is absent by default. Invalid exporter configuration
+leaves the existing mining routes running and the optional export unavailable.
+
+Qualify the existing journal file and its lineage against the native run before
+enabling the projection. A W&B run creation time or process restart is not a
+run boundary. The feed contains at most the newest 1,000 recorded groups across
+miners, with `has_older` indicating additional covered records; it is not an
+all-time request log. Rejected requests that never entered the journal are absent.
+The public projection includes scalar outcomes, not prompts, completions, raw
+lease IDs, nonces or rejection details.
+
+Reads use a separate read-only, query-only SQLite connection with a 64 KiB
+record/value limit and a bounded VM scan. Successful and failed refresh attempts
+are cached for sixty seconds per process. The exporter does not create schema,
+change leases, requeue training groups or alter grading and payment state.
+Source tests and an isolated runtime check do not establish live source coverage;
+verify the actual mounted route and both miners' distinct records before enabling
+a downstream collector.
