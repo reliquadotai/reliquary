@@ -81,6 +81,9 @@ def async_trainer_settings(env: Mapping[str, str] = os.environ) -> dict[str, Any
         "audits": str(env.get("RELIQUARY_RL_TRAINER_AUDITS", "1")).strip() != "0",
         "audits_per_step": _int(env, "RELIQUARY_RL_TRAINER_AUDITS_PER_STEP", 8),
         "audit_budget_s": float(env.get("RELIQUARY_RL_TRAINER_AUDIT_BUDGET_S", "120")),
+        # the next batch is downloaded while this one trains; the step's reports go out in parallel
+        "prefetch": str(env.get("RELIQUARY_RL_TRAINER_PREFETCH", "1")).strip() != "0",
+        "report_workers": _int(env, "RELIQUARY_RL_TRAINER_REPORT_WORKERS", 16),
     }
 
 
@@ -224,7 +227,8 @@ def run_async_train_worker() -> None:
                                     hf_backup_every=settings["hf_every"],
                                     eos_ids=_eos_ids(model_path, load_kwargs),
                                     audits_per_step=settings["audits_per_step"],
-                                    audit_budget_s=settings["audit_budget_s"])
+                                    audit_budget_s=settings["audit_budget_s"],
+                                    prefetch=settings["prefetch"], report_workers=settings["report_workers"])
         link.requeue()                          # this trainer holds nothing yet
 
         def backup_save(state, folder, *, lr_schedule_step):
