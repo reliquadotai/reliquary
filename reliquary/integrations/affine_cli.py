@@ -10,6 +10,10 @@ def main(argv=None):
     import sys
 
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "scoring":
+        from .affine_scoring_cli import main as scoring_main
+
+        return scoring_main(arguments[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("check", "delegate", "prepare", "run", "evidence", "reconcile"))
     parser.add_argument("--config", required=True)
