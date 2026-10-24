@@ -188,6 +188,16 @@ def test_fixture_and_native_modes_cannot_be_crossed(case, monkeypatch):
         scoring.run(bundle, work, fixture=True)
 
 
+@pytest.mark.parametrize("uid,euid", [(0, 10001), (10001, 0)])
+def test_direct_native_execution_refuses_root_before_asset_probes(
+    monkeypatch, uid, euid
+):
+    monkeypatch.setattr(scoring.os, "getuid", lambda: uid)
+    monkeypatch.setattr(scoring.os, "geteuid", lambda: euid)
+    with pytest.raises(ValueError, match="unprivileged UID"):
+        scoring._runtime({}, None, None)
+
+
 @pytest.mark.parametrize("kind", ["dimensions", "nonfinite"])
 def test_invalid_real_child_output_never_completes(case, monkeypatch, kind):
     bundle, work, output = case

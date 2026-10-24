@@ -381,6 +381,10 @@ def native_mounts(bundle, workspace, checkpoint):
 
 def _runtime(job, checkpoint, workspace):
     require(
+        os.getuid() != 0 and os.geteuid() != 0,
+        "native execution requires an unprivileged UID",
+    )
+    require(
         platform.system() == "Linux" and Path("/.dockerenv").is_file(),
         "native execution requires the qualified container host",
     )
