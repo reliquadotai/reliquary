@@ -40,10 +40,33 @@ budget, the task's cap when not declared). Multipliers above 1 (up to 4, or ``ca
 that scarcity can reach the cap) raise the total towards the cap; the settlement's normalisation (``rl_ledger``)
 keeps the cap the most a period pays, the rest burns. State lives in the lease book's SQLite file (``rl_prices``,
 ``rl_trainer_work``, ``rl_supply``) and survives a restart.
+
+**Level mode** (``AsyncPriceParams.mode = "level"``): the multiplier above splits into ``level x weight``.
+
+* The **level** L (one, ``rl_price_level``) is a normalisation, not a ratchet: it aims at the level where the
+  recent supply S (all envs, decayed with a half-life of ``supply_halflife_s``) priced at its weights pays
+  ``pay_target`` of the cap a period, ``L* = pay_target x o x cap / (nominal x period_s x S x w)`` with w the
+  supply-weighted mean weight, and moves towards it by at most ``level_rise`` / ``level_decay`` a tick. A short
+  fleet thus earns the whole budget (each token pays more the fewer they are); a fleet past the trainer earns
+  less per token, and the trainer's share of it is paid. ``o`` (oversupply, in ``[oversupply_floor, 1]``) descends
+  ``oversupply_decay`` a tick while leases are refused for a full queue and climbs back otherwise: a supply the
+  trainer cannot take is then paid less in total and the rest burns. The level that pays the cap at the trainer's
+  speed would burn ``1 - S/T`` under a shortage and lower the pay when the trainer speeds up; a level that rises
+  until the cap is paid overshoots and oscillates (``cc-data/rl-price-level``, 2026-10-24 simulation).
+* The **weight** r of an env (``rl_price_weights``) only moves the mix: its share of the recent supply (half-life
+  ``mix_halflife_s``) over its target share under ``low`` rises ``weight_rise``, over ``high`` (or its leases
+  refused) descends ``weight_decay``, then the weights are rescaled so that ``sum(target x r) = sum(target)`` over
+  the envs supplied within ``idle_s``. An env nobody supplies for ``idle_s`` is frozen and left out of the
+  rescaling: it no longer weighs on the others (teutonic-rl-async-v1, 2026-10-24: EnvScaler, without a single
+  miner, sat at the ceiling and pushed every price down ~3 % a tick while the trainer starved). Within
+  ``[weight_floor, weight_cap]``.
+* Switching to level mode starts from the live board: L = the target-weighted mean of the multipliers, r = the
+  multiplier over L, so no price jumps; L then walks to L* at its step limits.
 """
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
@@ -68,6 +91,10 @@ RISE, DESCEND, HOLD = "rise", "descend", "hold"
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS rl_prices(environment TEXT PRIMARY KEY, price REAL NOT NULL, last_good REAL NOT NULL,
     regime TEXT NOT NULL, at REAL NOT NULL, signal TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS rl_price_level(id INTEGER PRIMARY KEY CHECK(id=0), level REAL NOT NULL, mass REAL NOT NULL,
+    mix_mass REAL NOT NULL, oversupply REAL NOT NULL, at REAL NOT NULL, signal TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS rl_price_weights(environment TEXT PRIMARY KEY, weight REAL NOT NULL, supply REAL NOT NULL,
+    mix REAL NOT NULL, supplied_at REAL);
 CREATE TABLE IF NOT EXISTS rl_price_clock(id INTEGER PRIMARY KEY CHECK(id=0), last_tick REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS rl_trainer_speed(id INTEGER PRIMARY KEY CHECK(id=0), tokens REAL NOT NULL,
     seconds REAL NOT NULL, at REAL NOT NULL);
@@ -92,6 +119,24 @@ class AsyncPriceParams:
     steer_halflife_ticks: float = 2.0
     steer_step: float = 1.02
     steer_gain: float = 1.0
+    # Level mode (module doc). Placeholders until simulated against the live run.
+    mode: str = "per_env"        # "per_env" (one multiplier per env, above) or "level" (level x weight)
+    pay_target: float = 0.9      # the share of the cap the recent supply is priced to earn a period
+    level_rise: float = 1.03     # the most L moves towards its aim a tick (simulated: 1.02-1.05 converge)
+    level_decay: float = 0.98
+    level_floor: float = 0.01
+    level_cap: float = 100.0
+    oversupply_decay: float = 0.98   # a tick of leases refused for a full queue
+    oversupply_rise: float = 1.02
+    oversupply_floor: float = 0.1
+    weight_rise: float = 1.02
+    weight_decay: float = 0.98
+    weight_floor: float = 0.01   # instruction following needs ~0.01 at its 1 % target (simulated)
+    weight_cap: float = 20.0
+    supply_halflife_s: float = 3600.0    # the level's supply
+    mix_halflife_s: float = 600.0        # the weights' mix (2 h lagged and oscillated, simulated)
+    idle_s: float = 6 * 3600.0
+    period_s: float = 4320.0     # one settlement period (72 min)
 
     def __post_init__(self) -> None:
         if not (self.tick_s > 0 and 0 < self.low <= self.high and self.stale_s > 0 and self.speed_halflife_s > 0
@@ -100,6 +145,15 @@ class AsyncPriceParams:
                 and self.steer_gain >= 0):
             raise ValueError("tick_s > 0, 0 < low <= high, stale_s > 0, speed_halflife_s > 0, 0 <= starved < 1, "
                              "steering out of range")
+        if self.mode not in ("per_env", "level"):
+            raise ValueError("mode is per_env or level")
+        if not (0 < self.pay_target <= 1 and self.level_rise >= 1 and 0 < self.level_decay <= 1
+                and 0 < self.level_floor <= self.level_cap and 0 < self.oversupply_decay <= 1
+                and self.oversupply_rise >= 1 and 0 < self.oversupply_floor <= 1
+                and self.weight_rise >= 1 and 0 < self.weight_decay <= 1
+                and 0 < self.weight_floor <= 1 <= self.weight_cap and self.supply_halflife_s > 0
+                and self.mix_halflife_s > 0 and self.idle_s > 0 and self.period_s > 0):
+            raise ValueError("level mode parameters out of range")
         if not 0 < self.base.floor <= self.base.start <= self.base.cap:
             raise ValueError("floor <= start <= cap")
 
@@ -272,12 +326,23 @@ class AsyncPriceController:
             last = self.book.db.execute("SELECT last_tick FROM rl_price_clock WHERE id=0").fetchone()[0]
         return now - last >= self.params.tick_s
 
-    def tick(self, queue: QueueTick, full: Iterable[str] = (), now: float | None = None) -> dict[str, PriceDecision]:
+    def level(self) -> float | None:
+        """Level mode's L (None before its first tick)."""
+        with self.book.lock:
+            row = self.book.db.execute("SELECT level FROM rl_price_level WHERE id=0").fetchone()
+        return None if row is None else float(row[0])
+
+    def tick(self, queue: QueueTick, full: Iterable[str] = (), now: float | None = None,
+             lane_full: Iterable[str] = ()) -> dict[str, PriceDecision]:
         """Advance every target env over the time since the last tick. ``queue``: ``TrainingBuffer.drain_tick``;
-        ``full``: envs refused for the global cap (``LeaseBook.drain_full``)."""
+        ``full``: envs refused for the global cap (``LeaseBook.drain_full``); ``lane_full``: envs refused for their
+        own maximum (``LeaseBook.drain_lane_full``): over-supplied themselves, the queue not full."""
+        if self.params.mode == "level":
+            return _tick_level(self, queue, full, now, lane_full)
         now = float(self.clock()) if now is None else now
         arrivals = queue.arrivals
-        full = set(full)
+        capped_by = set(full)
+        full = capped_by | set(lane_full)
         decisions: dict[str, PriceDecision] = {}
         with self.book.transaction():
             db = self.book.db
@@ -289,7 +354,7 @@ class AsyncPriceController:
             speed = self.trainer_speed(now)
             # An env nobody supplied gives its share to the others (the trainer takes what arrives), and still rises.
             live = sum(float(v) for env, v in self.targets.items() if arrivals.get(env, 0) > 0) or 1.0
-            capped, starved = bool(full), queue.starved_s > self.params.starved * seconds
+            capped, starved = bool(capped_by), queue.starved_s > self.params.starved * seconds
             mix = self._note_supply(arrivals, seconds)
             supplied = sum(mix.values())
             moves: dict[str, tuple[PriceState, EnvSignal, float, float, str]] = {}
@@ -326,6 +391,109 @@ class AsyncPriceController:
                             json.dumps(detail, sort_keys=True)))
             db.execute("UPDATE rl_price_clock SET last_tick=? WHERE id=0", (now,))
         return decisions
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return min(max(value, low), high)
+
+
+def _tick_level(self, queue: QueueTick, full: Iterable[str] = (), now: float | None = None,
+                lane_full: Iterable[str] = ()) -> dict[str, PriceDecision]:
+    """``tick`` in level mode (module doc)."""
+    params = self.params
+    now = float(self.clock()) if now is None else now
+    arrivals, capped_by = queue.arrivals, set(full)
+    full = capped_by | set(lane_full)
+    decisions: dict[str, PriceDecision] = {}
+    with self.book.transaction():
+        db = self.book.db
+        last = db.execute("SELECT last_tick FROM rl_price_clock WHERE id=0").fetchone()[0]
+        seconds = max(now - last, 0.0)
+        if seconds <= 0:
+            return {}
+        steps = seconds / params.tick_s
+        self._note_work(float(queue.taken), float(queue.starved_s), seconds, now)
+        speed = self.trainer_speed(now)
+        prices = dict(db.execute("SELECT environment, price FROM rl_prices").fetchall())
+        row = db.execute("SELECT level, mass, mix_mass, oversupply FROM rl_price_level WHERE id=0").fetchone()
+        if row is None:                               # from the live board: no price moves at the switch
+            level = sum(float(self.targets[e]) * float(prices.get(e, params.base.start)) for e in self.targets)
+            level, mass, mix_mass, over = _clamp(level, params.level_floor, params.level_cap), 0.0, 0.0, 1.0
+        else:
+            level, mass, mix_mass, over = (float(v) for v in row)
+        stored = {env: (w, sup, mix, at) for env, w, sup, mix, at in db.execute(
+            "SELECT environment, weight, supply, mix, supplied_at FROM rl_price_weights").fetchall()}
+        # decayed sums over their decayed seconds: rates without warm-up bias
+        keep, mix_keep = (0.5 ** (seconds / h) for h in (params.supply_halflife_s, params.mix_halflife_s))
+        mass, mix_mass = keep * mass + seconds, mix_keep * mix_mass + seconds
+        weights, sums, mixes, rates, mix_rates, supplied_at = {}, {}, {}, {}, {}, {}
+        for env in sorted(self.targets):
+            # an env new to level mode starts at its live multiplier and counts as supplied now (no jump)
+            w, sup, mix, at = stored.get(env, (float(prices.get(env, params.base.start)) / level, 0.0, 0.0, now))
+            got = float(arrivals.get(env, 0))
+            sums[env], mixes[env] = keep * sup + got, mix_keep * mix + got
+            weights[env], supplied_at[env] = float(w), (now if got > 0 else at)
+            rates[env], mix_rates[env] = sums[env] / mass, mixes[env] / mix_mass
+        supply, mix_supply = math.fsum(rates.values()), math.fsum(mix_rates.values())
+        capped = bool(capped_by)
+        over = (over * params.oversupply_decay ** steps if capped else over * params.oversupply_rise ** steps)
+        over = _clamp(over, params.oversupply_floor, 1.0)
+        active = [e for e in sorted(self.targets)
+                  if supplied_at[e] is not None and now - supplied_at[e] <= params.idle_s and self.targets[e] > 0]
+        moves: dict[str, str] = {}
+        relative: dict[str, float | None] = {}
+        for env in sorted(self.targets):
+            target = float(self.targets[env])
+            rel = mix_rates[env] / mix_supply / target if mix_supply > 0 and target > 0 else None
+            relative[env] = rel
+            move = HOLD
+            if env in active:
+                if env in full or (rel is not None and rel > params.high):
+                    weights[env] *= params.weight_decay ** steps
+                    move = DESCEND
+                elif rel is not None and rel < params.low:
+                    weights[env] *= params.weight_rise ** steps
+                    move = RISE
+            moves[env] = move
+        mass_t = math.fsum(float(self.targets[e]) for e in active)
+        if mass_t > 0:
+            norm = math.fsum(float(self.targets[e]) * weights[e] for e in active) / mass_t
+            for env in active:
+                weights[env] = _clamp(weights[env] / norm, params.weight_floor, params.weight_cap)
+        # the level: towards what prices the recent supply at pay_target x o of the cap a period
+        mean_weight = math.fsum(rates[e] * weights[e] for e in rates) / supply if supply > 0 else None
+        aim, regime = None, HOLD
+        if mean_weight and speed is not None:
+            aim = params.pay_target * over * self.cap / (self.nominal * params.period_s * supply * mean_weight)
+            moved = _clamp(aim, level * params.level_decay ** steps, level * params.level_rise ** steps)
+            regime = RISE if moved > level else DESCEND if moved < level else HOLD
+            level = _clamp(moved, params.level_floor, params.level_cap)
+        signal = {"seconds": seconds, "level": level, "aim": aim, "regime": regime, "supply_tps": supply,
+                  "trainer_tps": speed, "oversupply": over, "capped": capped, "starved_s": queue.starved_s,
+                  "pay_per_period": (level * self.nominal * params.period_s * supply * mean_weight
+                                     if mean_weight else 0.0), "active": active}
+        db.execute("INSERT INTO rl_price_level(id, level, mass, mix_mass, oversupply, at, signal) VALUES(0,?,?,?,?,?,?) "
+                   "ON CONFLICT(id) DO UPDATE SET level=excluded.level, mass=excluded.mass, "
+                   "mix_mass=excluded.mix_mass, oversupply=excluded.oversupply, at=excluded.at, "
+                   "signal=excluded.signal", (level, mass, mix_mass, over, now, json.dumps(signal, sort_keys=True)))
+        for env in sorted(self.targets):
+            price = level * weights[env]
+            db.execute("INSERT INTO rl_price_weights(environment, weight, supply, mix, supplied_at) VALUES(?,?,?,?,?) "
+                       "ON CONFLICT(environment) DO UPDATE SET weight=excluded.weight, supply=excluded.supply, "
+                       "mix=excluded.mix, supplied_at=excluded.supplied_at",
+                       (env, weights[env], sums[env], mixes[env], supplied_at[env]))
+            detail = {"seconds": seconds, "level": level, "level_regime": regime, "weight": weights[env],
+                      "relative": relative[env], "supply_tps": rates[env], "trainer_tps": speed,
+                      "target_share": float(self.targets[env]), "full": env in full, "active": env in active}
+            db.execute("INSERT INTO rl_prices(environment, price, last_good, regime, at, signal) "
+                       "VALUES(?,?,?,?,?,?) ON CONFLICT(environment) DO UPDATE SET price=excluded.price, "
+                       "last_good=excluded.last_good, regime=excluded.regime, at=excluded.at, "
+                       "signal=excluded.signal",
+                       (env, price, price, moves[env], now, json.dumps(detail, sort_keys=True)))
+            decisions[env] = PriceDecision(price=price, last_good=price, recent_fill_prices=(),
+                                           r=relative[env], r_smoothed=None, regime=moves[env])
+        db.execute("UPDATE rl_price_clock SET last_tick=? WHERE id=0", (now,))
+    return decisions
 
 
 __all__ = [

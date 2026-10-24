@@ -505,3 +505,53 @@ def test_the_public_board_is_rebuilt_at_most_every_15_seconds(book):
     assert fresh["environments"][ENV]["recent"] == {"groups": 1, "trained_share": 1.0, "first_scan_share": 0.0}
     assert first["environments"][ENV]["recent"] == {"groups": 0, "trained_share": None, "first_scan_share": None}
     assert ledger.board(NOW + BOARD_CACHE_S)["hotkeys"]["A"] == fresh["hotkeys"]["A"]
+
+
+def _over_the_cap(book, subs, carry_periods):
+    """Three groups worth 2.5 caps in one period: A earns two, B one."""
+    prices = AsyncPriceController(book, {ENV: 1.0}, CAP, 3 * GROUP_TOKENS / 2.5, clock=lambda: NOW)
+    ledger = ledger_for(book, subs, prices, carry_periods=carry_periods)
+    trained(book, subs, 1, hotkey="A")
+    trained(book, subs, 2, hotkey="A")
+    trained(book, subs, 3, hotkey="B")
+    ledger.ingest()
+    return ledger
+
+
+def _settle_through(ledger, offset):
+    return ledger.settle(cp.period_end(cp.period_of(NOW) + offset) + 600)
+
+
+def test_pay_over_the_cap_is_carried_into_the_next_periods(book):
+    ledger = _over_the_cap(book, service(book, probation_groups=0), carry_periods=4)
+    docs = _settle_through(ledger, 0) + _settle_through(ledger, 1) + _settle_through(ledger, 2) \
+        + _settle_through(ledger, 5)
+    paid = [sum(d["rewards_by_hotkey"].values()) / CAP for d in docs]
+    assert paid == [pytest.approx(1.0), pytest.approx(1.0), pytest.approx(0.5)]      # 2.5 caps, nothing burned
+    assert [d["work_period"] - docs[0]["work_period"] for d in docs] == [0, 1, 2]       # periods without a step pay
+    for d in docs:
+        assert d["rewards_by_hotkey"]["A"] == pytest.approx(2 * d["rewards_by_hotkey"]["B"])
+    assert docs[1]["accrued_fresh"] == 0 and docs[1]["carried_in"] == pytest.approx(1.5 * CAP)
+    assert not book.db.execute("SELECT * FROM rl_pay_carry").fetchall()
+
+
+def test_a_carry_older_than_its_periods_burns(book):
+    ledger = _over_the_cap(book, service(book, probation_groups=0), carry_periods=1)
+    docs = _settle_through(ledger, 0) + _settle_through(ledger, 1) + _settle_through(ledger, 4)
+    assert [sum(d["rewards_by_hotkey"].values()) / CAP for d in docs] == [pytest.approx(1.0), pytest.approx(1.0)]
+    assert not book.db.execute("SELECT * FROM rl_pay_carry").fetchall()               # the last half cap burned
+
+
+def test_without_carry_periods_the_excess_burns_as_before(book):
+    ledger = _over_the_cap(book, service(book, probation_groups=0), carry_periods=0)
+    docs = _settle_through(ledger, 0) + _settle_through(ledger, 3)
+    assert len(docs) == 1 and "carried_in" not in docs[0]
+    assert sum(docs[0]["rewards_by_hotkey"].values()) == pytest.approx(CAP)
+
+
+def test_the_carry_holds_at_most_its_caps_and_the_excess_burns(book):
+    ledger = _over_the_cap(book, service(book, probation_groups=0), carry_periods=4)
+    ledger.config = LedgerConfig(task_id="rl-async", cap=CAP, carry_periods=4, carry_max_caps=1.0)
+    docs = _settle_through(ledger, 0) + _settle_through(ledger, 5)
+    assert docs[0]["carried_out"] == pytest.approx(1.0 * CAP)                  # 1.5 caps over, 1 kept
+    assert [sum(d["rewards_by_hotkey"].values()) / CAP for d in docs] == [pytest.approx(1.0), pytest.approx(1.0)]
