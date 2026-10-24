@@ -14,6 +14,31 @@ def main(argv=None):
         from .affine_scoring_cli import main as scoring_main
 
         return scoring_main(arguments[1:])
+    if arguments and arguments[0] == "evaluation":
+        from pathlib import Path
+        from .affine_evaluation import prepare
+        from .affine_evaluation_assets import check_assets
+
+        parser = argparse.ArgumentParser(
+            description="Prepare a private independent subnet evaluation offer."
+        )
+        parser.add_argument("command", choices=("prepare", "check-assets"))
+        parser.add_argument("--config", type=Path, required=True)
+        parser.add_argument("--out", type=Path, required=True)
+        args = parser.parse_args(arguments[1:])
+        try:
+            result = (prepare if args.command == "prepare" else check_assets)(args.config, args.out)
+        except Exception:
+            print(
+                json.dumps(
+                    {
+                        "error": "Evaluation preparation refused; inspect private operator inputs."
+                    }
+                )
+            )
+            return 1
+        print(json.dumps(result, sort_keys=True))
+        return 0
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("check", "delegate", "prepare", "run", "evidence", "reconcile"))
     parser.add_argument("--config", required=True)
