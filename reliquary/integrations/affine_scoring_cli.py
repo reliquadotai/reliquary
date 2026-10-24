@@ -105,7 +105,7 @@ def main(argv=None):
                 need("workspace", "out")
                 result = scoring.export(args.bundle, args.workspace, args.out)
         print(json.dumps(result, sort_keys=True))
-        return 0
+        return 1 if result.get("comparisonPassed") is False else 0
     except Exception:
         print(
             json.dumps(

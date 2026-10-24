@@ -117,6 +117,8 @@ reward verification and chain transactions explicitly false.
 operator-provided reference and reports mismatch counts and maximum absolute
 error. Supply explicitly agreed finite tolerances for hardware comparison. This
 does not authenticate the oracle or change the compute receipt's acceptance flags.
+The comparison command returns a nonzero exit status when any value differs
+beyond the supplied tolerances.
 
 A completed workspace is verified on retry. Other previous attempts block reuse.
 `reconcile --workspace "$PRIVATE_WORKSPACE"` confirms that its recorded process

@@ -227,6 +227,26 @@ def test_comparison_tolerance_and_oracle_binding(rehearsal, tmp_path):
     assert not scoring.compare(bundle, work, reference, atol=0.124, rtol=0)[
         "comparisonPassed"
     ]
+    from reliquary.integrations.affine_scoring_cli import main
+
+    assert (
+        main(
+            [
+                "compare",
+                "--bundle",
+                str(bundle),
+                "--workspace",
+                str(work),
+                "--reference",
+                str(reference),
+                "--atol",
+                "0.124",
+                "--rtol",
+                "0",
+            ]
+        )
+        == 1
+    )
     result = scoring.compare(bundle, work, reference, atol=0.125, rtol=0)
     assert result["comparisonPassed"] and result["values"] == 16
     assert result["maxAbsError"] == 0.125 and not result["independentReferenceVerified"]
