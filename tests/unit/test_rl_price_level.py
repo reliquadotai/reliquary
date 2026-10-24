@@ -52,7 +52,7 @@ def test_the_supply_is_priced_to_earn_the_pay_target_of_the_cap():
     clock = [0.0]
     c = controller(clock, {"a": 1.0, "b": 1.0, "idle": 1.0})
     run(c, clock, 60, ON_TARGET)
-    assert pay_per_period(c, ON_TARGET) == pytest.approx(0.9 * CAP, rel=0.02)
+    assert pay_per_period(c, ON_TARGET) == pytest.approx(0.95 * CAP, rel=0.02)
 
 
 def test_half_the_supply_earns_the_same_budget_at_twice_the_price_per_token():
@@ -63,7 +63,7 @@ def test_half_the_supply_earns_the_same_budget_at_twice_the_price_per_token():
     half = {e: v / 2 for e, v in ON_TARGET.items()}
     run(c, clock, 120, half, starved=0.5)
     assert c.level() == pytest.approx(2 * before, rel=0.03)
-    assert pay_per_period(c, half) == pytest.approx(0.9 * CAP, rel=0.03)
+    assert pay_per_period(c, half) == pytest.approx(0.95 * CAP, rel=0.03)
 
 
 def test_one_tick_moves_the_level_by_its_step_limits_at_most():
@@ -85,7 +85,7 @@ def test_a_full_queue_lowers_the_budget_and_it_comes_back_after():
     run(c, clock, 36, ON_TARGET, full=("a",))                     # 3 h of leases refused for a full queue
     assert pay_per_period(c, ON_TARGET) < 0.6 * CAP
     run(c, clock, 200, ON_TARGET)
-    assert pay_per_period(c, ON_TARGET) == pytest.approx(0.9 * CAP, rel=0.02)
+    assert pay_per_period(c, ON_TARGET) == pytest.approx(0.95 * CAP, rel=0.02)
 
 
 def test_weights_move_the_mix_only_and_keep_their_target_mean():
@@ -118,7 +118,7 @@ def test_an_env_at_its_own_maximum_descends_alone_and_the_budget_holds():
     run(c, clock, 12, ON_TARGET, lane_full=("b",))
     w = {e: c.multiplier(e) / c.level() for e in TARGETS}
     assert w["b"] < 1 < w["a"]
-    assert pay_per_period(c, ON_TARGET) == pytest.approx(0.9 * CAP, rel=0.03)  # a lane refusal is not a full queue
+    assert pay_per_period(c, ON_TARGET) == pytest.approx(0.95 * CAP, rel=0.03)  # a lane refusal is not a full queue
 
 
 def test_per_env_mode_is_still_the_default():
@@ -134,3 +134,26 @@ def test_a_trainer_down_holds_the_level():
         clock[0] += TICK
         c.tick(QueueTick({e: int(v * TICK) for e, v in ON_TARGET.items()}))   # no take, no wait: the trainer is gone
     assert c.level() == pytest.approx(0.98 ** 2)                                # two ticks before it went stale
+
+
+def test_most_envs_at_their_maximum_with_a_busy_trainer_lower_the_budget():
+    clock = [0.0]
+    c = controller(clock, {"a": 1.0, "b": 1.0, "idle": 1.0})
+    run(c, clock, 60, ON_TARGET)
+    run(c, clock, 36, ON_TARGET, lane_full=("a",))                 # a holds 50 % of the targets
+    assert pay_per_period(c, ON_TARGET) < 0.6 * CAP
+    clock2 = [0.0]
+    c2 = controller(clock2, {"a": 1.0, "b": 1.0, "idle": 1.0})
+    run(c2, clock2, 60, ON_TARGET)
+    run(c2, clock2, 36, ON_TARGET, lane_full=("a",), starved=0.5)   # the trainer waits: not a flood
+    assert pay_per_period(c2, ON_TARGET) > 0.8 * CAP
+
+
+def test_an_env_frozen_moves_no_price_at_once():
+    clock = [0.0]
+    c = controller(clock, {"a": 1.0, "b": 1.0, "idle": 1.0})
+    run(c, clock, 12 * 6 - 1, {"a": 2500, "b": 1500})              # idle about to drop out
+    before = {e: c.multiplier(e) for e in TARGETS}
+    run(c, clock, 2, {"a": 2500, "b": 1500})
+    for env in ("a", "b"):
+        assert 0.98 ** 2 * 0.96 <= c.multiplier(env) / before[env] <= 1.03 ** 2 * 1.05

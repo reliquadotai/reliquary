@@ -49,7 +49,8 @@ keeps the cap the most a period pays, the rest burns. State lives in the lease b
   supply-weighted mean weight, and moves towards it by at most ``level_rise`` / ``level_decay`` a tick. A short
   fleet thus earns the whole budget (each token pays more the fewer they are); a fleet past the trainer earns
   less per token, and the trainer's share of it is paid. ``o`` (oversupply, in ``[oversupply_floor, 1]``) descends
-  ``oversupply_decay`` a tick while leases are refused for a full queue and climbs back otherwise: a supply the
+  ``oversupply_decay`` a tick while leases are refused for a full queue, or for their env's maximum on envs
+  holding ``oversupply_share`` of the targets with the trainer not waiting, and climbs back otherwise: a supply the
   trainer cannot take is then paid less in total and the rest burns. The level that pays the cap at the trainer's
   speed would burn ``1 - S/T`` under a shortage and lower the pay when the trainer speeds up; a level that rises
   until the cap is paid overshoots and oscillates (``cc-data/rl-price-level``, 2026-10-24 simulation).
@@ -57,7 +58,7 @@ keeps the cap the most a period pays, the rest burns. State lives in the lease b
   ``mix_halflife_s``) over its target share under ``low`` rises ``weight_rise``, over ``high`` (or its leases
   refused) descends ``weight_decay``, then the weights are rescaled so that ``sum(target x r) = sum(target)`` over
   the envs supplied within ``idle_s``. An env nobody supplies for ``idle_s`` is frozen and left out of the
-  rescaling: it no longer weighs on the others (teutonic-rl-async-v1, 2026-10-24: EnvScaler, without a single
+  rescaling (the level absorbs the rescaling, so no price jumps): it no longer weighs on the others (teutonic-rl-async-v1, 2026-10-24: EnvScaler, without a single
   miner, sat at the ceiling and pushed every price down ~3 % a tick while the trainer starved). Within
   ``[weight_floor, weight_cap]``.
 * Switching to level mode starts from the live board: L = the target-weighted mean of the multipliers, r = the
@@ -121,7 +122,10 @@ class AsyncPriceParams:
     steer_gain: float = 1.0
     # Level mode (module doc). Placeholders until simulated against the live run.
     mode: str = "per_env"        # "per_env" (one multiplier per env, above) or "level" (level x weight)
-    pay_target: float = 0.9      # the share of the cap the recent supply is priced to earn a period
+    pay_target: float = 0.95     # the share of the cap the recent supply is priced to earn a period (simulated:
+                                 # 0.9 burns 9-12 %, 0.95 5-9 %, 1.0 3-5 % but loses up to 4 % to carry expiry)
+    oversupply_share: float = 0.5    # leases refused for their env's maximum on envs holding this much of the
+                                     # targets, the trainer not waiting: the supply is past the trainer too
     level_rise: float = 1.03     # the most L moves towards its aim a tick (simulated: 1.02-1.05 converge)
     level_decay: float = 0.98
     level_floor: float = 0.01
@@ -149,7 +153,7 @@ class AsyncPriceParams:
             raise ValueError("mode is per_env or level")
         if not (0 < self.pay_target <= 1 and self.level_rise >= 1 and 0 < self.level_decay <= 1
                 and 0 < self.level_floor <= self.level_cap and 0 < self.oversupply_decay <= 1
-                and self.oversupply_rise >= 1 and 0 < self.oversupply_floor <= 1
+                and self.oversupply_rise >= 1 and 0 < self.oversupply_floor <= 1 and 0 < self.oversupply_share <= 1
                 and self.weight_rise >= 1 and 0 < self.weight_decay <= 1
                 and 0 < self.weight_floor <= 1 <= self.weight_cap and self.supply_halflife_s > 0
                 and self.mix_halflife_s > 0 and self.idle_s > 0 and self.period_s > 0):
@@ -436,7 +440,10 @@ def _tick_level(self, queue: QueueTick, full: Iterable[str] = (), now: float | N
             rates[env], mix_rates[env] = sums[env] / mass, mixes[env] / mix_mass
         supply, mix_supply = math.fsum(rates.values()), math.fsum(mix_rates.values())
         capped = bool(capped_by)
-        over = (over * params.oversupply_decay ** steps if capped else over * params.oversupply_rise ** steps)
+        starved = queue.starved_s > params.starved * seconds
+        lanes_full = math.fsum(float(self.targets.get(e, 0.0)) for e in set(lane_full)) >= params.oversupply_share
+        flooded = capped or (lanes_full and not starved)
+        over = (over * params.oversupply_decay ** steps if flooded else over * params.oversupply_rise ** steps)
         over = _clamp(over, params.oversupply_floor, 1.0)
         active = [e for e in sorted(self.targets)
                   if supplied_at[e] is not None and now - supplied_at[e] <= params.idle_s and self.targets[e] > 0]
@@ -460,6 +467,9 @@ def _tick_level(self, queue: QueueTick, full: Iterable[str] = (), now: float | N
             norm = math.fsum(float(self.targets[e]) * weights[e] for e in active) / mass_t
             for env in active:
                 weights[env] = _clamp(weights[env] / norm, params.weight_floor, params.weight_cap)
+            # the level absorbs the rescaling: an env frozen or thawed moves no price at once (simulated: an
+            # outage's renormalisation otherwise jumped the others x2-x4 and burned up to 39 % in carry expiry)
+            level = _clamp(level * norm, params.level_floor, params.level_cap)
         # the level: towards what prices the recent supply at pay_target x o of the cap a period
         mean_weight = math.fsum(rates[e] * weights[e] for e in rates) / supply if supply > 0 else None
         aim, regime = None, HOLD
@@ -469,7 +479,7 @@ def _tick_level(self, queue: QueueTick, full: Iterable[str] = (), now: float | N
             regime = RISE if moved > level else DESCEND if moved < level else HOLD
             level = _clamp(moved, params.level_floor, params.level_cap)
         signal = {"seconds": seconds, "level": level, "aim": aim, "regime": regime, "supply_tps": supply,
-                  "trainer_tps": speed, "oversupply": over, "capped": capped, "starved_s": queue.starved_s,
+                  "trainer_tps": speed, "oversupply": over, "capped": capped, "flooded": flooded, "starved_s": queue.starved_s,
                   "pay_per_period": (level * self.nominal * params.period_s * supply * mean_weight
                                      if mean_weight else 0.0), "active": active}
         db.execute("INSERT INTO rl_price_level(id, level, mass, mix_mass, oversupply, at, signal) VALUES(0,?,?,?,?,?,?) "
