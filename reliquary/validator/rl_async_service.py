@@ -543,6 +543,10 @@ def mount_rl_async(server, rl: RlAsync, *, validator_hotkey: str, registration=N
         for sessions in rl.sandbox.routers:
             server.mount_rl_lease_router(sessions)
 
+    from reliquary.validator.rl_miner_submissions import mount_miner_submissions
+
+    mount_miner_submissions(server, rl)
+
 
 async def _lease_admission(rl, environment: str, prompt_idx: int) -> tuple[str, dict] | None:
     """The lease route's ``admit``: an episode env's task needs a fleet that can host its sessions now
