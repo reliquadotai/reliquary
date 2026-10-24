@@ -222,6 +222,10 @@ class LeaseBookConfig:
     # whatever the others hold; past it, only while the cap has room once every env counts at least its reserve.
     # A flood of one env then never refuses another env's leases. Empty: the global cap alone.
     lane_reserve: Mapping[str, int] | None = None
+    # Per-env maximum (``rl_env_shares.EnvGroupCaps.lane_max``): env -> buffered groups it may hold, read at each
+    # grant. Past it the env's leases are refused (answered ``full``, the code every miner handles: wait for the next
+    # quota poll) and reported apart (``drain_lane_full``): its price weight descends, the level does not. None: off.
+    lane_max: Callable[[], Mapping[str, int]] | None = None
     # Releases of signed ``box_failed`` leases per hotkey per day before they are charged again. PLACEHOLDER.
     box_failed_releases_per_day: int = 48
 
@@ -293,6 +297,7 @@ class LeaseBook:
         self.lock = threading.RLock()
         self._depth = 0
         self._full: set[str] = set()              # envs refused for the global cap since the last drain
+        self._lane_full: set[str] = set()         # envs refused for their own maximum since the last drain
         self._submitting: dict[str, int] = {}     # leases whose on-time submission is being graded: never expired
         # The episode sandbox's verdict on a lease (``RlLeaseSandbox.lease_failure``): (cause, detail) when our side
         # ended one of its episodes, else None. Unset: every unsubmitted lease is charged.
@@ -553,7 +558,8 @@ class LeaseBook:
             self._rng.shuffle(claims)
             pending = self._pending() if cap is not None else 0
             reserve = dict(self.config.lane_reserve or {}) if cap is not None else {}
-            by_env = self._pending_by_env() if reserve else {}
+            lane_max = dict(self.config.lane_max() or {}) if self.config.lane_max is not None and claims else {}
+            by_env = self._pending_by_env() if reserve or lane_max else {}
             for i, prompt in claims:
                 request = requests[i]
                 env, k, hotkey = request.environment, request.checkpoint, request.hotkey
@@ -578,6 +584,10 @@ class LeaseBook:
                     continue
                 if room[hotkey] <= 0:
                     answers[i].refused[prompt] = QUOTA
+                    continue
+                if env in lane_max and by_env.get(env, 0) >= lane_max[env]:
+                    answers[i].refused[prompt] = FULL
+                    self._lane_full.add(env)
                     continue
                 if cap is not None and not _lane_room(env, pending, by_env, reserve, cap):
                     answers[i].refused[prompt] = FULL
@@ -615,13 +625,21 @@ class LeaseBook:
         with self.lock:
             by_env = self._pending_by_env()
         reserve = dict(self.config.lane_reserve or {})
-        return {env: {"buffered": by_env.get(env, 0), "reserve": int(reserve.get(env, 0))}
-                for env in sorted(set(by_env) | set(reserve))}
+        most = dict(self.config.lane_max() or {}) if self.config.lane_max is not None else {}
+        return {env: {"buffered": by_env.get(env, 0), "reserve": int(reserve.get(env, 0)),
+                      **({"max": int(most[env])} if env in most else {})}
+                for env in sorted(set(by_env) | set(reserve) | set(most))}
 
     def drain_full(self) -> set[str]:
         """Envs refused for the global cap since the last drain (the price controller's oversupply signal)."""
         with self.lock:
             full, self._full = self._full, set()
+        return full
+
+    def drain_lane_full(self) -> set[str]:
+        """Envs refused for their own maximum (``lane_max``) since the last drain."""
+        with self.lock:
+            full, self._lane_full = self._lane_full, set()
         return full
 
     def _submittable(self, lease_id: str, hotkey: str, now: float) -> tuple[Lease | None, Exception | None]:

@@ -925,3 +925,24 @@ def test_the_operator_sets_the_lease_margin_by_env_var():
     with pytest.raises(ValueError):
         rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000,
                           environ={"RELIQUARY_RL_LEASE_EXPIRY_MARGIN": "0.5"})
+
+
+def test_the_operator_switches_the_price_level_the_carry_and_the_env_limits_by_env_var():
+    from reliquary.cli.main import build_task_entry, with_rl_async_params
+    from reliquary.constants import PROTOCOL_PROFILE_ID
+    from reliquary.protocol.profiles import resolve_protocol_profile
+
+    envs = sorted(resolve_protocol_profile(PROTOCOL_PROFILE_ID).environments)[:2]
+    entry = build_task_entry(task_id="rl-async", profile_id=PROTOCOL_PROFILE_ID, cap=0.4, overrides={},
+                             env_split={envs[0]: 0.75, envs[1]: 0.25})
+    declared = with_rl_async_params(entry, planned_tokens_per_period=2e8)
+    plain = rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={})
+    assert plain.price.mode == "per_env" and plain.pay_carry_periods == 0
+    assert plain.lane_max_batches is None and plain.batch_env_factor is None and plain.batch_groups == 512
+    switched = rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={
+        "RELIQUARY_RL_PRICE_MODE": "level", "RELIQUARY_RL_PAY_CARRY_PERIODS": "4",
+        "RELIQUARY_RL_LANE_MAX_BATCHES": "2", "RELIQUARY_RL_BATCH_ENV_FACTOR": "1.5"})
+    assert switched.price.mode == "level" and switched.pay_carry_periods == 4
+    assert switched.lane_max_batches == 2.0 and switched.batch_env_factor == 1.5
+    with pytest.raises(ValueError):
+        rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={"RELIQUARY_RL_PRICE_MODE": "x"})

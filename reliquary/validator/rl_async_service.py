@@ -87,6 +87,12 @@ LANE_RESERVE_PARAM = "rl_lane_reserve"          # share of the global cap kept p
 MAX_PENDING_ENV = "RELIQUARY_RL_MAX_PENDING_GROUPS"
 LANE_RESERVE_ENV = "RELIQUARY_RL_LANE_RESERVE"
 LEASE_MARGIN_ENV = "RELIQUARY_RL_LEASE_EXPIRY_MARGIN"   # the operator's lease margin, over the registry's
+# The operator's pricing and queue switches (2026-10-24 burn fix; registry params of the same meaning, env wins):
+PRICE_MODE_PARAM, PRICE_MODE_ENV = "rl_price_mode", "RELIQUARY_RL_PRICE_MODE"                 # per_env | level
+CARRY_PARAM, CARRY_ENV = "rl_pay_carry_periods", "RELIQUARY_RL_PAY_CARRY_PERIODS"             # 0: excess burns
+LANE_MAX_PARAM, LANE_MAX_ENV = "rl_lane_max_batches", "RELIQUARY_RL_LANE_MAX_BATCHES"         # per-env queue max
+BATCH_FACTOR_PARAM, BATCH_FACTOR_ENV = "rl_batch_env_factor", "RELIQUARY_RL_BATCH_ENV_FACTOR"  # per-env batch cap
+BATCH_GROUPS_PARAM, BATCH_GROUPS_ENV = "rl_batch_groups", "RELIQUARY_RL_BATCH_GROUPS"         # the trainer's batch
 DEFAULT_LEASE_TOKENS_PER_S = 20.0      # placeholder: the design's "3090 at max length", measured at qualification
 DEFAULT_LEASE_MARGIN = 2.0
 
@@ -161,6 +167,10 @@ class RlAsyncSettings:
     cooldown_k: Mapping[str, int] = field(default_factory=dict)  # env -> operator's fixed cooldown (rl_cooldown)
     env_pay_k: float | None = None              # the ledger's per-env settlement guard (None: off)
     lane_reserve: float = 0.0                   # share of the global cap kept per env (0: the global cap alone)
+    pay_carry_periods: int = 0                  # a period's pay over the cap is carried this many periods (0: burns)
+    lane_max_batches: float | None = None       # an env holds at most this many batches of its group share (None: off)
+    batch_env_factor: float | None = None       # one take hands out at most this x an env's group share (None: off)
+    batch_groups: int = 512                     # the trainer's batch, in groups (the limits' unit)
 
     def lane_reserves(self) -> dict[str, int]:
         """env -> buffered groups kept for it: ``lane_reserve`` x the cap, split by the target shares."""
@@ -196,6 +206,15 @@ def _operator_overrides(params: Mapping[str, Any], environ: Mapping[str, str]) -
     if not 0.0 <= reserve < 1.0:
         raise ValueError("the lane reserve must be in [0, 1)")
     return cap, reserve
+
+
+def _switch(params: Mapping[str, Any], environ: Mapping[str, str], param: str, env: str, default: Any = None):
+    """The operator's env var, else the registry param, else ``default`` (an empty env var counts as unset)."""
+    raw = str(environ.get(env, "")).strip()
+    if raw:
+        return raw
+    value = params.get(param)
+    return default if value is None else value
 
 
 def rl_async_settings(entry, cap: float, *, run: str | None = None,
@@ -243,8 +262,19 @@ def rl_async_settings(entry, cap: float, *, run: str | None = None,
     if unknown:
         raise ValueError(f"cooldown overrides for envs outside the env_split: {unknown}")
     max_pending, lane_reserve = _operator_overrides(params, os.environ if environ is None else environ)
+    operator_env = os.environ if environ is None else environ
     price = AsyncPriceParams(**{key: cast(params[name]) for key, name, cast in (
-        ("tick_s", PRICE_TICK_PARAM, float),) if name in params})
+        ("tick_s", PRICE_TICK_PARAM, float),) if name in params},
+        mode=str(_switch(params, operator_env, PRICE_MODE_PARAM, PRICE_MODE_ENV, "per_env")))
+    lane_max = _switch(params, operator_env, LANE_MAX_PARAM, LANE_MAX_ENV)
+    batch_factor = _switch(params, operator_env, BATCH_FACTOR_PARAM, BATCH_FACTOR_ENV)
+    switches = dict(
+        pay_carry_periods=int(_switch(params, operator_env, CARRY_PARAM, CARRY_ENV, 0)),
+        lane_max_batches=None if lane_max is None else float(lane_max),
+        batch_env_factor=None if batch_factor is None else float(batch_factor),
+        batch_groups=int(_switch(params, operator_env, BATCH_GROUPS_PARAM, BATCH_GROUPS_ENV, 512)))
+    if switches["pay_carry_periods"] < 0 or switches["batch_groups"] < 1:
+        raise ValueError("pay carry periods >= 0, batch groups >= 1")
     return RlAsyncSettings(task_id=str(entry.task_id), cap=float(cap),
                            run=run or os.environ.get(RUN_ENV) or str(entry.task_id), targets=targets,
                            planned_tokens_per_period=float(params[PLANNED_TOKENS_PARAM]), lease_expiry_s=expiry,
@@ -253,7 +283,7 @@ def rl_async_settings(entry, cap: float, *, run: str | None = None,
                            price=price, episodes=blocks, cooldown_k=cooldowns,
                            env_pay_k=(float(params[ENV_PAY_K_PARAM])
                                       if params.get(ENV_PAY_K_PARAM) is not None else None),
-                           max_pending_groups=max_pending, lane_reserve=lane_reserve)
+                           max_pending_groups=max_pending, lane_reserve=lane_reserve, **switches)
 
 
 @dataclass
@@ -285,22 +315,32 @@ def build_rl_async(settings: RlAsyncSettings, *, path: str | os.PathLike[str], g
     from reliquary.validator.rl_cooldown import AdaptiveCooldown
     from reliquary.validator.rl_submit import RlSubmissions
 
+    from reliquary.validator.rl_env_shares import EnvGroupCaps
+
     cooldown = AdaptiveCooldown(prompt_range=prompt_range, overrides=settings.cooldown_k)
+    limits: list = []                       # the per-env limits read the book's own file: bound once it is open
+    lane_max = (lambda: limits[0].lane_max() if limits else {}) if settings.lane_max_batches is not None else None
     book = LeaseBook(path, LeaseBookConfig(expiry_s=dict(settings.lease_expiry_s),
                                            prompt_range=None if prompt_range is None else dict(prompt_range),
                                            max_pending_groups=settings.max_pending_groups,
-                                           lane_reserve=settings.lane_reserves() or None, cooldown_of=cooldown),
+                                           lane_reserve=settings.lane_reserves() or None, cooldown_of=cooldown,
+                                           lane_max=lane_max),
                      quota=QuotaController(), clock=clock)
+    limits.append(EnvGroupCaps(book, dict(settings.targets), batch_groups=settings.batch_groups,
+                               lane_batches=settings.lane_max_batches, batch_factor=settings.batch_env_factor))
     cooldown.attach(book)
     try:
         collector = (LeaseCollector(book) if collector_interval_s is None
                      else LeaseCollector(book, interval_s=collector_interval_s))
         submissions = RlSubmissions(book, grader, config=submit_config, clock=clock)
+        if settings.batch_env_factor is not None:
+            submissions.buffer.batch_caps = limits[0].batch_caps
         prices = AsyncPriceController(book, dict(settings.targets), settings.cap, settings.planned_tokens_per_period,
                                       start_pool=settings.start_pool, params=settings.price or AsyncPriceParams(),
                                       clock=clock)
         ledger = RlPayLedger(book, submissions, prices,
-                             LedgerConfig(task_id=settings.task_id, cap=settings.cap, env_pay_k=settings.env_pay_k),
+                             LedgerConfig(task_id=settings.task_id, cap=settings.cap, env_pay_k=settings.env_pay_k,
+                                          carry_periods=settings.pay_carry_periods),
                              clock=clock)
     except BaseException:
         book.close()
@@ -608,7 +648,8 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
         now = float(clock())
         if not await asyncio.to_thread(rl.prices.due, now):
             return
-        await asyncio.to_thread(lambda: rl.prices.tick(rl.buffer.drain_tick(), rl.book.drain_full(), now))
+        await asyncio.to_thread(lambda: rl.prices.tick(rl.buffer.drain_tick(), rl.book.drain_full(), now,
+                                                       lane_full=rl.book.drain_lane_full()))
 
     async def follow() -> None:
         await audit_model.follow_once(rl.board)
@@ -828,7 +869,10 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     telemetry.init(validator_hotkey, {"task_id": settings.task_id, "run": settings.run, "cap": cap,
                                       "targets": dict(settings.targets),
                                       "max_pending_groups": settings.max_pending_groups,
-                                      "lane_reserve": settings.lane_reserves()},
+                                      "lane_reserve": settings.lane_reserves(),
+                                      "price_mode": getattr(getattr(settings, "price", None), "mode", "per_env"),
+                                      **{key: getattr(settings, key, None) for key in (
+                                          "pay_carry_periods", "lane_max_batches", "batch_env_factor")}},
                    role="controller", version=settings.run)
     publisher = _public_boards(rl, wallet, validator_hotkey, signer_client)
     audit_model, source = None, audit_source()

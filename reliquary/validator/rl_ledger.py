@@ -18,7 +18,12 @@ Settlement (epochs = the drand periods of ``corpus_periods``, 72 min = one Bitte
 ``slack_s`` after its end; its accruals are summed per hotkey and normalised to the task cap (``scale = min(1, cap
 / total)``: the cap is the most a period pays, the unpaid rest burns). With ``env_pay_k`` set (registry
 ``rl_env_pay_k``, default off), each env's accruals are first scaled down to at most ``k x its target share x cap``
-(the surplus burns): no env can take the period by being cheap to mine. The result is a period archive
+(the surplus burns): no env can take the period by being cheap to mine. With ``carry_periods`` > 0 the part of a
+period over the cap is not burned at once but carried, per hotkey, into the next periods (``rl_pay_carry``), where
+it is paid before the cap like a fresh accrual; a carry older than ``carry_periods`` periods burns. The trainer pays
+in lumps (a step's groups are all reported at its end, and a step outlasts a period): without the carry a period
+holding a step end is cut to the cap while the periods between steps pay nothing, and the gap burns
+(teutonic-rl-async-v1, 2026-10-24: 67 % of the cap burned). The result is a period archive
 (``rewards_by_hotkey``, ``work_period``, ``entry_period`` from ``cp.entry_for``) of the same shape as a corpus
 period archive, so the unchanged weight setter (``weight_only._period_weights``: EMA decayed per period, capped
 per task) pays it once the task is declared with ``params.settlement = "period-ema-v1"``. Archives are kept in the
@@ -52,6 +57,8 @@ CREATE TABLE IF NOT EXISTS rl_accruals(seq INTEGER PRIMARY KEY, lease_id TEXT NO
 CREATE INDEX IF NOT EXISTS rl_accruals_open ON rl_accruals(status, period);
 CREATE INDEX IF NOT EXISTS rl_accruals_env ON rl_accruals(environment, kind, seq);
 CREATE TABLE IF NOT EXISTS rl_pay_bans(hotkey TEXT PRIMARY KEY, until REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS rl_pay_carry(hotkey TEXT NOT NULL, origin_period INTEGER NOT NULL, amount REAL NOT NULL,
+    PRIMARY KEY(hotkey, origin_period));
 CREATE TABLE IF NOT EXISTS rl_pay_periods(work_period INTEGER PRIMARY KEY, entry_period INTEGER NOT NULL,
     doc TEXT NOT NULL, published INTEGER NOT NULL);
 """
@@ -67,11 +74,15 @@ class LedgerConfig:
     slack_s: float = 120.0
     genesis: float = cp.PERIOD_EPOCH
     env_pay_k: float | None = None   # an env's period pay <= k x its target share x cap (None: off)
+    carry_periods: int = 0           # a period's pay over the cap is carried this many periods before it burns
+    carry_max_caps: float = 2.0      # the most carried at once, in caps (the oldest burns first; simulated: an
+                                     # uncapped carry stalled at 2-3 caps after an outage and kept paying over)
 
     def __post_init__(self) -> None:
         if not (0 < self.cap <= 1 and 0 <= self.floor <= 1 and self.reference_groups > 0
                 and self.default_group_tokens > 0 and self.slack_s >= 0
-                and (self.env_pay_k is None or self.env_pay_k > 0)):
+                and (self.env_pay_k is None or self.env_pay_k > 0) and self.carry_periods >= 0
+                and self.carry_max_caps >= 0):
             raise ValueError("invalid ledger config")
 
 
@@ -159,17 +170,22 @@ class RlPayLedger:
         out = []
         with self.book.transaction():
             db = self.book.db
-            periods = [p for p, in db.execute("SELECT DISTINCT period FROM rl_accruals WHERE status=? AND period<=? "
-                                              "ORDER BY period", (ACCRUED, closed)).fetchall()]
-            for period in periods:
+            for period in self._due_periods(closed):
                 rows = db.execute("SELECT hotkey, amount, matched_tokens, environment FROM rl_accruals WHERE "
                                   "status=? AND period=? ORDER BY seq", (ACCRUED, period)).fetchall()
                 env_scale = self._env_scale(rows)
                 accrued: dict[str, float] = {}
                 for hotkey, amount, _, env in rows:
                     accrued[hotkey] = accrued.get(hotkey, 0.0) + amount * env_scale.get(env, 1.0)
+                fresh = math.fsum(accrued.values())
+                carried = self._take_carry(period)          # hotkey -> [(origin period, amount)], expired burned
+                if not rows and not carried:
+                    continue
+                for hotkey, parts in carried.items():
+                    accrued[hotkey] = accrued.get(hotkey, 0.0) + math.fsum(a for _, a in parts)
                 total = math.fsum(accrued.values())
                 scale = 1.0 if total <= self.config.cap else self.config.cap / total
+                carried_out = self._carry(period, rows, env_scale, carried, 1.0 - scale) if scale < 1 else 0.0
                 entered = [e for e, in db.execute("SELECT entry_period FROM rl_pay_periods").fetchall()]
                 entry = cp.entry_for(cp.period_of(now, genesis) + 1, entered)
                 doc = {"schema": RL_PERIOD_ARCHIVE_SCHEMA, "task_id": self.config.task_id, "mechanism": "rl-async",
@@ -178,6 +194,9 @@ class RlPayLedger:
                        "accrued_by_hotkey": {h: accrued[h] for h in sorted(accrued)}, "accrued_total": total,
                        "scale": scale, "cap": self.config.cap, "groups": len(rows),
                        "matched_tokens": sum(r[2] for r in rows)}
+                if self.config.carry_periods:
+                    doc.update({"accrued_fresh": fresh, "carried_in": total - fresh, "carried_out": carried_out,
+                                "carry_periods": self.config.carry_periods})
                 if self.config.env_pay_k is not None:
                     doc["env_scale"] = env_scale
                 db.execute("INSERT INTO rl_pay_periods(work_period, entry_period, doc, published) VALUES(?,?,?,?)",
@@ -185,6 +204,58 @@ class RlPayLedger:
                 db.execute("UPDATE rl_accruals SET status=? WHERE status=? AND period=?", (SETTLED, ACCRUED, period))
                 out.append(doc)
         return out
+
+    def _due_periods(self, closed: int) -> list[int]:
+        """Closed periods to archive, oldest first: those holding accruals, and, while a carry is pending, every
+        period after the last archive (a period with no step end still pays the carry)."""
+        db = self.book.db
+        due = {p for p, in db.execute("SELECT DISTINCT period FROM rl_accruals WHERE status=? AND period<=?",
+                                      (ACCRUED, closed)).fetchall()}
+        if self.config.carry_periods and db.execute("SELECT 1 FROM rl_pay_carry LIMIT 1").fetchone():
+            last = db.execute("SELECT MAX(work_period) FROM rl_pay_periods").fetchone()[0]
+            starts = list(due) + ([int(last) + 1] if last is not None else [])
+            due.update(range(min(starts) if starts else closed, closed + 1))
+        return sorted(due)
+
+    def _take_carry(self, period: int) -> dict[str, list[tuple[int, float]]]:
+        """The carry pending before ``period`` (removed: what is not paid is carried again); older than
+        ``carry_periods`` burns."""
+        db = self.book.db
+        out: dict[str, list[tuple[int, float]]] = {}
+        for hotkey, origin, amount in db.execute("SELECT hotkey, origin_period, amount FROM rl_pay_carry WHERE "
+                                                 "origin_period<? ORDER BY origin_period", (period,)).fetchall():
+            if period - origin <= self.config.carry_periods and not self._banned(hotkey, float(self.clock())):
+                out.setdefault(hotkey, []).append((int(origin), float(amount)))
+        db.execute("DELETE FROM rl_pay_carry WHERE origin_period<?", (period,))
+        return out
+
+    def _carry(self, period: int, rows, env_scale, carried, unpaid: float) -> float:
+        """Carry ``unpaid`` (the share over the cap) of each hotkey's fresh accrual (origin ``period``) and of
+        what it had carried in (its origin kept); returns the amount carried."""
+        if not self.config.carry_periods:
+            return 0.0
+        parts: dict[tuple[str, int], float] = {}
+        for hotkey, amount, _, env in rows:
+            key = (hotkey, period)
+            parts[key] = parts.get(key, 0.0) + amount * env_scale.get(env, 1.0) * unpaid
+        for hotkey, items in carried.items():
+            for origin, amount in items:
+                parts[(hotkey, origin)] = parts.get((hotkey, origin), 0.0) + amount * unpaid
+        excess = math.fsum(parts.values()) - self.config.carry_max_caps * self.config.cap
+        for origin in sorted({o for _, o in parts}):            # over the most: the oldest burns first
+            if excess <= 0:
+                break
+            mine = [key for key in parts if key[1] == origin]
+            held = math.fsum(parts[key] for key in mine)
+            cut = min(excess, held)
+            for key in mine:
+                parts[key] *= 1.0 - cut / held if held > 0 else 0.0
+            excess -= cut
+        self.book.db.executemany(
+            "INSERT INTO rl_pay_carry(hotkey, origin_period, amount) VALUES(?,?,?) ON CONFLICT(hotkey, origin_period) "
+            "DO UPDATE SET amount=amount+excluded.amount",
+            [(h, o, a) for (h, o), a in sorted(parts.items()) if a > 0])
+        return math.fsum(parts.values())
 
     def _env_scale(self, rows) -> dict[str, float]:
         """Per env of a period's accrual rows: the factor holding its pay to ``env_pay_k x share x cap``."""

@@ -662,3 +662,15 @@ def test_a_book_from_before_releases_gains_the_cause_column(tmp_path):
     lease = book.grant([ask("A", [1])])[0].leases[0]
     assert book.forfeit(lease.lease_id, "A").state == rl_leases.EXPIRED
     assert book.db.execute("SELECT cause FROM rl_leases").fetchone()[0] == "forfeited"
+
+
+def test_an_env_at_its_own_maximum_is_refused_alone_and_reported_apart(tmp_path):
+    book = book_at(tmp_path, lane_max=lambda: {ENV: 3})          # no global cap: the maximum alone
+    book.adopt_checkpoint(0)
+    _buffer(book, {ENV: 2, OTHER_ENV: 50})
+    assert len(book.grant([ask("A", [1])])[0].leases) == 1
+    _buffer(book, {ENV: 3, OTHER_ENV: 50})
+    answers = book.grant([ask("B", [2]), ask("C", [3], env=OTHER_ENV)])
+    assert answers[0].refused == {2: FULL} and len(answers[1].leases) == 1  # the wire code miners already handle
+    assert book.drain_lane_full() == {ENV} and book.drain_full() == set()  # not a full queue
+    assert book.lanes()[ENV] == {"buffered": 3, "reserve": 0, "max": 3}

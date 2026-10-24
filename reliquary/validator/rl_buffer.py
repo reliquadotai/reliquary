@@ -92,8 +92,10 @@ class SubmittedGroup:
 
 
 class TrainingBuffer:
-    def __init__(self, book, clock=time.time) -> None:
-        self.book, self.clock = book, clock
+    def __init__(self, book, clock=time.time, batch_caps=None) -> None:
+        """``batch_caps(limit)``: env -> the most of its groups one take hands out (``rl_env_shares.EnvGroupCaps``;
+        None: arrival order alone). A capped env's later groups wait for the next take."""
+        self.book, self.clock, self.batch_caps = book, clock, batch_caps
         self._arrived: dict[str, int] = {}                   # completion tokens queued per env since the last drain
         self._taken = 0                                      # completion tokens the trainer took since the last drain
         self._starved_s = 0.0
@@ -139,9 +141,26 @@ class TrainingBuffer:
         with self.book.transaction():
             # A group handed out once and back (a restart, a lost answer, one failed step) is served like a fresh one;
             # from its second return on it is a suspect: at most one per batch, so it cannot sink the others again.
-            fresh = self.book.db.execute("SELECT lease_id, body FROM rl_buffer WHERE state=? AND attempts<? "
-                                         "ORDER BY arrived_at, lease_id LIMIT ?",
-                                         (QUEUED, SUSPECT_ATTEMPTS, int(limit))).fetchall()
+            caps = dict(self.batch_caps(int(limit)) or {}) if self.batch_caps is not None else {}
+            if caps:
+                chosen, counts = [], {}
+                for lease_id, env in self.book.db.execute(
+                        "SELECT lease_id, environment FROM rl_buffer WHERE state=? AND attempts<? "
+                        "ORDER BY arrived_at, lease_id", (QUEUED, SUSPECT_ATTEMPTS)):
+                    if len(chosen) >= limit:
+                        break
+                    if env in caps and counts.get(env, 0) >= caps[env]:
+                        continue
+                    counts[env] = counts.get(env, 0) + 1
+                    chosen.append(lease_id)
+                bodies = dict(self.book.db.execute(
+                    f"SELECT lease_id, body FROM rl_buffer WHERE lease_id IN ({','.join('?' * len(chosen))})",
+                    chosen).fetchall()) if chosen else {}
+                fresh = [(lease_id, bodies[lease_id]) for lease_id in chosen]
+            else:
+                fresh = self.book.db.execute("SELECT lease_id, body FROM rl_buffer WHERE state=? AND attempts<? "
+                                             "ORDER BY arrived_at, lease_id LIMIT ?",
+                                             (QUEUED, SUSPECT_ATTEMPTS, int(limit))).fetchall()
             held = self.book.db.execute("SELECT 1 FROM rl_buffer WHERE state=? AND attempts>? LIMIT 1",
                                         (TAKEN, SUSPECT_ATTEMPTS)).fetchone()
             retried = [] if len(fresh) >= limit or held else self.book.db.execute(
