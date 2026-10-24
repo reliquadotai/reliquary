@@ -946,3 +946,24 @@ def test_the_operator_switches_the_price_level_the_carry_and_the_env_limits_by_e
     assert switched.lane_max_batches == 2.0 and switched.batch_env_factor == 1.5
     with pytest.raises(ValueError):
         rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={"RELIQUARY_RL_PRICE_MODE": "x"})
+
+
+def test_the_operator_tunes_the_price_level_by_env_var():
+    from reliquary.cli.main import build_task_entry, with_rl_async_params
+    from reliquary.constants import PROTOCOL_PROFILE_ID
+    from reliquary.protocol.profiles import resolve_protocol_profile
+    from reliquary.validator.rl_price import AsyncPriceParams
+
+    envs = sorted(resolve_protocol_profile(PROTOCOL_PROFILE_ID).environments)[:2]
+    entry = build_task_entry(task_id="rl-async", profile_id=PROTOCOL_PROFILE_ID, cap=0.4, overrides={},
+                             env_split={envs[0]: 0.75, envs[1]: 0.25})
+    declared = with_rl_async_params(entry, planned_tokens_per_period=2e8)
+    plain = rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={"RELIQUARY_RL_PRICE_MODE": "level"})
+    assert plain.price == AsyncPriceParams(mode="level")
+    tuned = rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={
+        "RELIQUARY_RL_PRICE_MODE": "level", "RELIQUARY_RL_PRICE_PAY_TARGET": "0.8",
+        "RELIQUARY_RL_PRICE_LEVEL_RISE_H": "1.02", "RELIQUARY_RL_PRICE_SUPPLY_HALFLIFE_S": "7200"})
+    assert (tuned.price.pay_target, tuned.price.level_rise_h, tuned.price.supply_halflife_s) == (0.8, 1.02, 7200.0)
+    assert tuned.price.level_decay_h == AsyncPriceParams().level_decay_h
+    with pytest.raises(ValueError):                    # out of range is refused at start, not mid-run
+        rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={"RELIQUARY_RL_PRICE_PAY_TARGET": "1.5"})

@@ -13,11 +13,17 @@ SPEED = 10_000.0                     # trainer tokens per second
 CAP, PLANNED, START_POOL = 0.8, 1e7, 0.5
 NOMINAL = START_POOL / PLANNED
 ON_TARGET = {"a": 2500, "b": 1500, "idle": 1000}        # 5000 tok/s on the target mix
+# The first live speeds (x1.03 / x0.98 a 5-min tick, no band, 1 h / 10 min half-lives): the tests below that predate
+# the slow defaults keep them, so their tick counts stay readable.
+FAST = dict(level_rise_h=1.03 ** 12, level_decay_h=0.98 ** 12, level_band=0.0, oversupply_rise_h=1.02 ** 12,
+            oversupply_decay_h=0.98 ** 12, weight_rise_h=1.02 ** 12, weight_decay_h=0.98 ** 12, weight_low=0.9,
+            weight_high=1.1, supply_halflife_s=3600.0, mix_halflife_s=600.0)
 
 
-def controller(clock, prices=None, **params):
+def controller(clock, prices=None, slow=False, **params):
     c = AsyncPriceController(MemBook(), TARGETS, cap=CAP, planned_tokens_per_period=PLANNED, start_pool=START_POOL,
-                             params=AsyncPriceParams(mode="level", **params), clock=lambda: clock[0])
+                             params=AsyncPriceParams(mode="level", **({} if slow else FAST) | params),
+                             clock=lambda: clock[0])
     with c.book.transaction():
         for env, price in (prices or {}).items():
             c.book.db.execute("INSERT INTO rl_prices VALUES(?,?,?,?,?,?)", (env, price, price, "hold", clock[0], "{}"))
@@ -157,3 +163,53 @@ def test_an_env_frozen_moves_no_price_at_once():
     run(c, clock, 2, {"a": 2500, "b": 1500})
     for env in ("a", "b"):
         assert 0.98 ** 2 * 0.96 <= c.multiplier(env) / before[env] <= 1.03 ** 2 * 1.05
+
+
+# --- the slow defaults (2026-10-24: the first speeds cut the burn from ~60 % to ~10 % in one period) -------------
+
+def test_speeds_are_per_hour_whatever_the_tick():
+    for tick in (60.0, 300.0, 900.0):
+        clock = [0.0]
+        c = controller(clock, {"a": 1.0, "b": 1.0, "idle": 1.0}, slow=True, tick_s=tick)    # aim ~0.67: a descent
+        for _ in range(int(3600 / tick)):
+            clock[0] += tick
+            c.tick(QueueTick({e: int(v * tick) for e, v in ON_TARGET.items()}, taken=int(SPEED * tick)))
+        assert c.level() == pytest.approx(0.90)
+
+
+def test_the_slow_level_takes_hours_to_close_a_gap_of_two():
+    clock = [0.0]
+    c = controller(clock, {"a": 0.5, "b": 0.5, "idle": 0.5}, slow=True)      # aim ~0.67 x 2 = ~1.35
+    run(c, clock, 12, {e: v / 2 for e, v in ON_TARGET.items()}, starved=0.5)
+    assert c.level() <= 0.5 * 1.10 + 1e-9                                      # at most +10 % an hour
+    run(c, clock, 12 * 11, {e: v / 2 for e, v in ON_TARGET.items()}, starved=0.5)
+    assert c.level() > 0.5 * 2 * 0.9
+
+
+def test_the_level_holds_inside_its_band():
+    clock = [0.0]
+    c = controller(clock, {"a": 1.0, "b": 1.0, "idle": 1.0}, slow=True)
+    run(c, clock, 12 * 24, ON_TARGET)                  # came down from above: settled at the band's upper edge
+    settled = c.level()
+    run(c, clock, 12 * 6, {e: v * 0.97 for e, v in ON_TARGET.items()})        # -3 % supply: the aim stays inside
+    assert c.level() == pytest.approx(settled)
+    assert 0.95 / 1.05 * CAP * 0.99 <= pay_per_period(c, ON_TARGET) <= 0.95 * 1.05 * CAP * 1.01
+
+
+def test_one_new_miner_moves_no_price_within_the_hour():
+    clock = [0.0]
+    c = controller(clock, {"a": 1.0, "b": 1.0, "idle": 1.0}, slow=True)
+    run(c, clock, 12 * 24, ON_TARGET)
+    before = {e: c.multiplier(e) for e in TARGETS}
+    run(c, clock, 12, {**ON_TARGET, "a": ON_TARGET["a"] * 1.2})                # a's supply +20 % for an hour
+    for env in TARGETS:
+        assert c.multiplier(env) == pytest.approx(before[env], rel=0.08)
+
+
+def test_a_flood_lowers_the_budget_slowly():
+    clock = [0.0]
+    c = controller(clock, {"a": 1.0, "b": 1.0, "idle": 1.0}, slow=True)
+    run(c, clock, 12 * 24, ON_TARGET)
+    before = pay_per_period(c, ON_TARGET)
+    run(c, clock, 12, ON_TARGET, full=("a",))                                  # an hour of a full queue
+    assert pay_per_period(c, ON_TARGET) == pytest.approx(before * 0.95, rel=0.01)
