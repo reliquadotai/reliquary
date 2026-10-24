@@ -17,13 +17,14 @@ import logging
 import math
 import os
 import threading
+import time
 import warnings
 from typing import Any, NamedTuple, Optional
 
 import torch
 import torch.utils.checkpoint
 
-from reliquary.validator import telemetry
+from reliquary.validator import optimizer_state, telemetry
 from reliquary.constants import (
     ADAM_BETA2, GRAD_CLIP_NORM, GRAD_NORM_SKIP_THRESHOLD, KL_BETA, LEARNING_RATE,
     LR_WARMUP_WINDOWS,
@@ -141,6 +142,7 @@ _UNPAD_CACHE_INSTALLED = _install_unpad_sync_cache()
 _optimizer: Optional["torch.optim.Optimizer | _MasterWeightOptimizer"] = None
 _scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None
 _optimizer_model_id: Optional[int] = None
+_state_writer: Optional[optimizer_state.SnapshotWriter] = None
 # Set by the fsdp2 trainer backend (reliquary.trainer.distributed); None means
 # one process, today's path byte for byte.
 _DIST = None
@@ -354,7 +356,8 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
         _optimizer = _build_optimizer(params)
 
     hint = max(0, int(global_step_hint or 0))
-    rewarmup = LR_RESTART_REWARMUP_WINDOWS if hint > 0 else 0
+    restored = hint > 0 and _restore_optimizer_state(hint)
+    rewarmup = LR_RESTART_REWARMUP_WINDOWS if hint > 0 and not restored else 0
 
     def _lr_lambda(step: int) -> float:
         # Linear warmup, then FLAT — DAPO's schedule (§4.1: AdamW, constant
@@ -367,7 +370,7 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
         )
         if rewarmup > 0 and step >= hint:
             # Same-run restart: schedule position was restored, but the
-            # Adam moments were not persisted — a short ramp over the first
+            # Adam moments were not (no matching snapshot) — a short ramp over the first
             # ``rewarmup`` windows after boot lets them re-estimate before
             # full LR ((r+1)-denominator: exactly r windows run reduced).
             base *= min(1.0, (step - hint + 1) / (rewarmup + 1))
@@ -407,6 +410,67 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
     return True
 
 
+def _stepped():
+    """The tensors the optimizer steps (FSDP2 shards or fp32 masters) and the optimizer that holds their state."""
+    if isinstance(_optimizer, _MasterWeightOptimizer):
+        return _optimizer.masters, _optimizer.inner
+    return [p for group in _optimizer.param_groups for p in group["params"]], _optimizer
+
+
+def _rank_world() -> tuple[int, int]:
+    return (_DIST.rank, _DIST.world_size) if _DIST is not None else (0, 1)
+
+
+def _all_ranks_agree(ok: bool) -> bool:
+    if _DIST is None:
+        return ok
+    flag = torch.tensor([1 if ok else 0], device=_DIST.device)
+    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+    return bool(flag.item())
+
+
+def _restore_optimizer_state(hint: int) -> bool:
+    """Load this rank's snapshot at schedule step *hint* if every rank has a valid one (collective under FSDP2)."""
+    root = optimizer_state.state_dir()
+    if root is None:
+        return False
+    params, optimizer = _stepped()
+    rank, world = _rank_world()
+    snap, reason = None, "no snapshot"
+    try:
+        snap = optimizer_state.load(root, rank, world, hint)
+        if snap is not None:
+            reason = optimizer_state.check(params, snap, hint)
+    except Exception as exc:  # noqa: BLE001 - a bad snapshot means a re-warmup, not a crash
+        reason = f"unreadable ({exc})"
+    if not _all_ranks_agree(reason is None):
+        logger.warning("optimizer state not restored at step %d (rank %d: %s)", hint, rank,
+                       reason or "another rank has none")
+        return False
+    optimizer_state.restore(params, optimizer, snap)
+    logger.info("optimizer state restored at step %d (Adam moments and fp32 masters; no re-warmup)", hint)
+    return True
+
+
+def _save_optimizer_state() -> None:
+    """Snapshot to host now, write in the background; never fails the step."""
+    global _state_writer
+    root = optimizer_state.state_dir()
+    if root is None or _scheduler is None:
+        return
+    try:
+        if _state_writer is None:
+            _state_writer = optimizer_state.SnapshotWriter(root, *_rank_world())
+        _state_writer.wait()
+        started = time.monotonic()
+        params, optimizer = _stepped()
+        _state_writer.submit(optimizer_state.snapshot(params, optimizer, int(_scheduler.last_epoch)))
+        logger.info("optimizer state copied to host at step %d in %.1f s", int(_scheduler.last_epoch),
+                    time.monotonic() - started)
+    except Exception:  # noqa: BLE001
+        logger.exception("optimizer state snapshot failed")
+
+
 def current_lr_schedule_step() -> int | None:
     """Exact scheduler position (steps taken), or None before first init.
 
@@ -424,10 +488,13 @@ def reset_training_state() -> None:
     Production code should never call this — it throws away optimiser
     momentum.
     """
-    global _optimizer, _scheduler, _optimizer_model_id
+    global _optimizer, _scheduler, _optimizer_model_id, _state_writer
+    if _state_writer is not None:
+        _state_writer.wait()
     _optimizer = None
     _scheduler = None
     _optimizer_model_id = None
+    _state_writer = None
 
 
 # ---------------------------------------------------------------------------
@@ -2668,6 +2735,7 @@ def train_step(
         )
     _optimizer.step()
     _scheduler.step()
+    _save_optimizer_state()
     # Backward (and its checkpoint recomputes) are done: release this
     # thread's pinned unpad slot so the ~1 MB goes back to the allocator.
     _clear_unpad_sync_cache()
