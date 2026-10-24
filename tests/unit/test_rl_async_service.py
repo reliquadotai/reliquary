@@ -906,3 +906,22 @@ def test_the_operator_sets_the_global_cap_and_the_lanes_by_env_var():
     for bad in ({"RELIQUARY_RL_LANE_RESERVE": "1"}, {"RELIQUARY_RL_MAX_PENDING_GROUPS": "0"}):
         with pytest.raises(ValueError):
             rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ=bad)
+
+
+def test_the_operator_sets_the_lease_margin_by_env_var():
+    from reliquary.cli.main import build_task_entry, with_rl_async_params
+    from reliquary.constants import PROTOCOL_PROFILE_ID
+    from reliquary.protocol.profiles import resolve_protocol_profile
+
+    envs = sorted(resolve_protocol_profile(PROTOCOL_PROFILE_ID).environments)[:2]
+    entry = build_task_entry(task_id="rl-async", profile_id=PROTOCOL_PROFILE_ID, cap=0.4, overrides={},
+                             env_split={envs[0]: 0.75, envs[1]: 0.25})
+    declared = with_rl_async_params(entry, planned_tokens_per_period=2e8)
+    plain = rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={})
+    longer = rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000,
+                               environ={"RELIQUARY_RL_LEASE_EXPIRY_MARGIN": "4"})
+    for env in envs:
+        assert longer.lease_expiry_s[env] == pytest.approx(2 * plain.lease_expiry_s[env])
+    with pytest.raises(ValueError):
+        rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000,
+                          environ={"RELIQUARY_RL_LEASE_EXPIRY_MARGIN": "0.5"})
