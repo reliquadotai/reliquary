@@ -1,0 +1,170 @@
+"""A same-run restart resumes Adam from the per-rank snapshot instead of re-warming the LR."""
+import pytest
+import torch
+
+import reliquary.validator.training as training
+from reliquary.constants import LR_RESTART_REWARMUP_WINDOWS
+from reliquary.validator import optimizer_state
+
+
+@pytest.fixture(autouse=True)
+def _fresh(tmp_path, monkeypatch):
+    monkeypatch.setenv(optimizer_state.STATE_DIR_ENV, str(tmp_path))
+    training.reset_training_state()
+    yield
+    training.reset_training_state()
+
+
+def _model(dtype=torch.float32):
+    torch.manual_seed(0)
+    return torch.nn.Linear(8, 8).to(dtype)
+
+
+def _steps(model, n, hint):
+    assert training._lazy_init(model, global_step_hint=hint)
+    for i in range(n):
+        model(torch.randn(4, 8, dtype=next(model.parameters()).dtype) * (i + 1)).float().pow(2).sum().backward()
+        training._optimizer.step()
+        training._scheduler.step()
+        training._save_optimizer_state()
+        training._optimizer.zero_grad()
+    training._state_writer.wait()
+
+
+def _state(optimizer, params):
+    return [{k: v.clone() for k, v in optimizer.state[p].items()} for p in params]
+
+
+def _published(model):
+    """What the trainer resumes from: the bf16 weights of the checkpoint."""
+    return {k: v.to(torch.bfloat16) for k, v in model.state_dict().items()}
+
+
+def _resumed(published, dtype=torch.float32):
+    model = _model(dtype)
+    model.load_state_dict({k: v.to(dtype) for k, v in published.items()})
+    return model
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_restart_restores_moments_and_skips_rewarmup(dtype):
+    model = _model(dtype)
+    _steps(model, 12, hint=0)
+    params, optimizer = training._stepped()
+    want_state, want_masters = _state(optimizer, params), [p.detach().clone() for p in params]
+    published = _published(model)
+    training.reset_training_state()
+
+    resumed = _resumed(published, dtype)
+    assert training._lazy_init(resumed, global_step_hint=12)
+    params, optimizer = training._stepped()
+    for got, want in zip(_state(optimizer, params), want_state):
+        assert got.keys() == want.keys()
+        for key in want:
+            assert torch.equal(got[key], want[key]), key
+    for got, want in zip(params, want_masters):
+        assert torch.equal(got.detach(), want)          # the fp32 masters, not the bf16 rounding
+    lam = training._scheduler.lr_lambdas[0]
+    assert lam(12) == 1.0 and lam(13) == 1.0
+
+
+def test_no_snapshot_rewarms():
+    model = _model()
+    _steps(model, 12, hint=0)
+    published = _published(model)
+    training.reset_training_state()
+    for path in optimizer_state.state_dir().iterdir():
+        path.unlink()
+    assert training._lazy_init(_resumed(published), global_step_hint=12)
+    assert training._scheduler.lr_lambdas[0](12) == pytest.approx(1 / (LR_RESTART_REWARMUP_WINDOWS + 1))
+    assert not training._optimizer.state
+
+
+def test_snapshot_of_other_weights_is_refused():
+    model = _model()
+    _steps(model, 12, hint=0)
+    other = _published(model)
+    other["weight"] = other["weight"] + 1
+    training.reset_training_state()
+    assert training._lazy_init(_resumed(other), global_step_hint=12)
+    assert training._scheduler.lr_lambdas[0](12) < 1.0
+    assert not training._optimizer.state
+
+
+def test_snapshot_at_other_step_is_refused():
+    """Crash after a step that was never published: the checkpoint is one step behind the last snapshot."""
+    model = _model()
+    _steps(model, 12, hint=0)
+    published = _published(model)
+    _steps(model, 1, hint=0)
+    training.reset_training_state()
+    assert training._lazy_init(_resumed(published), global_step_hint=12)
+    assert training._optimizer.state                     # the step-12 snapshot is still kept
+    training.reset_training_state()
+    assert training._lazy_init(_resumed(published), global_step_hint=11)
+    assert not training._optimizer.state
+
+
+def test_keeps_last_snapshots_only(tmp_path):
+    _steps(_model(), 5, hint=0)
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert names == ["rank00-of01-step00000004.pt", "rank00-of01-step00000005.pt"]
+
+
+def test_off_without_dir(monkeypatch, tmp_path):
+    monkeypatch.delenv(optimizer_state.STATE_DIR_ENV)
+    _steps_no_wait = _model()
+    assert training._lazy_init(_steps_no_wait, global_step_hint=0)
+    training._save_optimizer_state()
+    assert training._state_writer is None and not list(tmp_path.iterdir())
+
+
+def _sharded_resume(state_dir, steps_before, steps_after, restart):
+    """FSDP2 on gloo: train, optionally restart from the bf16 checkpoint plus the snapshots, train on."""
+    import os
+
+    import torch.distributed as dist
+
+    from reliquary.trainer.distributed import gather_full_state_dict, init_distributed, shard_model
+    from reliquary.validator import training
+    from tests.unit.test_train_step_sharded import _batches
+    from tests.unit.trainer_dist_helpers import tiny_qwen35
+
+    os.environ[optimizer_state.STATE_DIR_ENV] = state_dir
+    ctx = init_distributed(device_type="cpu")
+    training.reset_training_state()
+    training.KL_BETA = 0.0
+    training.configure_distributed(ctx)
+    model = tiny_qwen35()
+    batches = [_batches(model, seed=s) for s in range(steps_before + steps_after)]
+    model = shard_model(model, ctx, param_dtype=torch.float32)
+    for batch in batches[:steps_before]:
+        training.train_step(model, batch, ref_model=None, global_step_hint=0)
+    restored = None
+    if restart:
+        published = [gather_full_state_dict(model, ctx)]
+        dist.broadcast_object_list(published, src=0)
+        training.reset_training_state()
+        model = tiny_qwen35()
+        model.load_state_dict({k: v.float() for k, v in published[0].items()})
+        model = shard_model(model, ctx, param_dtype=torch.float32)
+        assert training._lazy_init(model, global_step_hint=steps_before)
+        restored = bool(training._optimizer.state)
+    for batch in batches[steps_before:]:
+        training.train_step(model, batch, ref_model=None, global_step_hint=steps_before)
+    training._state_writer.wait()
+    full = {}
+    for name, tensor in model.state_dict().items():
+        full[name] = tensor.full_tensor().clone()
+    return full, restored
+
+
+def test_sharded_restart_continues_exactly(tmp_path):
+    from tests.unit.trainer_dist_helpers import run_ranks
+
+    straight = run_ranks(_sharded_resume, 2, str(tmp_path / "a"), 2, 1, False)
+    resumed = run_ranks(_sharded_resume, 2, str(tmp_path / "b"), 2, 1, True)
+    for rank in (0, 1):
+        assert resumed[rank][1] is True
+        for name, tensor in straight[rank][0].items():
+            assert torch.equal(tensor, resumed[rank][0][name]), name

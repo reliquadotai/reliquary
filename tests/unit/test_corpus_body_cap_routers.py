@@ -4,6 +4,7 @@ episode job the split validator cannot serve is refused for good."""
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -41,9 +42,11 @@ def test_the_eval_control_router_carries_its_jobs_cap():
     _accepts_twelve_megabytes(job_set._router_for(w))
 
 
-def test_the_single_job_server_mount_carries_its_jobs_cap():
+@pytest.mark.parametrize("durable_mode", ["0", "1"])
+def test_the_single_job_server_mount_carries_its_jobs_cap(monkeypatch, durable_mode):
     from reliquary.validator.server import ValidatorServer
 
+    monkeypatch.setenv("RELIQUARY_CORPUS_DURABLE_RECORDS", durable_mode)
     job = _big_job()
     holder = SimpleNamespace(app=FastAPI())
     entry = SimpleNamespace(job_id=job.job_id, mechanism=MECHANISM_CORPUS_GENERATION)

@@ -141,6 +141,13 @@ def _pi_old_for_encode(rollout: Any, completion_length: int) -> list[float] | No
     return floats
 
 
+def _is_signed_episode(meta: dict) -> bool:
+    """A signed episode (lazy import: the trainer process stays light)."""
+    from reliquary.protocol.submission import is_signed_episode
+
+    return is_signed_episode(meta)
+
+
 def encode_training_payload(
     window_batches: dict[str, list],
     *,
@@ -158,6 +165,8 @@ def encode_training_payload(
     validated_spans: list[list[int] | None] = []
     assistant_spans: list[list[list[int]] | None] = []
     termination_paths: list[str | None] = []
+    # The checkpoint each signed episode was generated on (None for every other rollout).
+    rollout_checkpoints: list[str | None] = []
     rewards: list[float] = []
     env_names: list[str] = []
     tokens_flat: list[int] = []
@@ -167,6 +176,10 @@ def encode_training_payload(
     pi_old_flat: list[float] = []
     pi_old_off: list[int] = [0]
     has_pi_old: list[bool] = []
+    # Substitution loss: the forced draw's public uniforms per policy position, float64
+    # (gumbel_key reads all 53 bits). Written only when some rollout carries them.
+    draw_u_flat: list[float] = []
+    draw_u_off: list[int] = [0]
 
     for env in env_order:
         for group in window_batches.get(env, []):
@@ -179,6 +192,14 @@ def encode_training_payload(
                 commit = rollout.commit or {}
                 meta = dict(commit.get("rollout") or {})
                 miner_lp = list(meta.pop("token_logprobs", []) or [])
+                signed = _is_signed_episode(meta)
+                if signed:
+                    from reliquary.protocol.submission import episode_without_transcript
+
+                    # The trainer reads tokens, spans, rewards and pi_old; never the transcript (MiBs,
+                    # and it carries a session token). The miner's commit is left untouched.
+                    meta = episode_without_transcript(meta)
+                rollout_checkpoints.append(str(checkpoint_revision) if signed else None)
                 completion_length = int(meta.get("completion_length", 0) or 0)
                 rollout_meta.append(meta)
                 span = getattr(rollout, "_validated_force_span", None)
@@ -188,6 +209,8 @@ def encode_training_payload(
                 episode_spans = getattr(
                     rollout, "_validated_assistant_spans", None
                 )
+                if signed and episode_spans is None:
+                    raise ValueError("signed episode rollout has no validated assistant spans")
                 assistant_spans.append(
                     (
                         [
@@ -218,6 +241,10 @@ def encode_training_payload(
                     has_pi_old.append(True)
                     pi_old_flat.extend(pi_old)
                 pi_old_off.append(len(pi_old_flat))
+                uniforms = getattr(rollout, "_forced_draw_uniforms", None)
+                if isinstance(uniforms, list) and len(uniforms) == policy_length:
+                    draw_u_flat.extend(float(v) for v in uniforms)
+                draw_u_off.append(len(draw_u_flat))
 
     extended = env_targets is not None or any(item is not None for item in assistant_spans)
     artifact_schema = (
@@ -241,6 +268,10 @@ def encode_training_payload(
         "validated_spans": validated_spans,
         "termination_paths": termination_paths,
     }
+    if any(value is not None for value in rollout_checkpoints):
+        # Synchronous windows: the window's checkpoint. Recorded per episode so async windows can be
+        # enabled without a format change (spec decision 3). Absent otherwise: legacy bytes unchanged.
+        header["rollout_checkpoints"] = rollout_checkpoints
     if protocol_header["schema_version"] == EPISODE_PAYLOAD_SCHEMA_VERSION:
         header["assistant_spans"] = assistant_spans
         resolved_targets = dict(env_targets or {})
@@ -258,6 +289,11 @@ def encode_training_payload(
             environment: int(resolved_targets[environment])
             for environment in env_order
         }
+    draw_arrays = (
+        {"draw_u_flat": np.asarray(draw_u_flat, dtype=np.float64),
+         "draw_u_off": np.asarray(draw_u_off, dtype=np.int64)}
+        if draw_u_flat else {}
+    )
     buf = io.BytesIO()
     np.savez_compressed(
         buf,
@@ -271,6 +307,7 @@ def encode_training_payload(
         pi_old_flat=np.asarray(pi_old_flat, dtype=np.float32),
         pi_old_off=np.asarray(pi_old_off, dtype=np.int64),
         has_pi_old=np.asarray(has_pi_old, dtype=np.bool_),
+        **draw_arrays,
     )
     return buf.getvalue()
 
@@ -329,7 +366,54 @@ class DecodedPayload:
         self._validated_spans = header.get("validated_spans") or []
         self._assistant_spans = header.get("assistant_spans") or []
         self._termination_paths = header.get("termination_paths") or []
+        checkpoints = header.get("rollout_checkpoints")
+        signed = [isinstance(m, dict) and _is_signed_episode(m) for m in self._rollout_meta]
+        if checkpoints is None:
+            if any(signed):
+                raise ValueError("training payload rollout checkpoints missing for a signed episode")
+        elif (
+            not isinstance(checkpoints, list) or len(checkpoints) != len(self._rollout_meta)
+            or any(
+                (c is not None) != is_signed
+                or (c is not None and (not isinstance(c, str) or not c or c.strip() != c))
+                for c, is_signed in zip(checkpoints, signed)
+            )
+        ):
+            raise ValueError("training payload rollout checkpoints must name one revision per signed episode")
+        self._rollout_checkpoints = list(checkpoints or [])
         self._arrays = arrays
+        self._check_assistant_spans(signed)
+
+    def _check_assistant_spans(self, signed: list[bool]) -> None:
+        """A signed episode trains on its model spans only: refuse any payload where they are unclear."""
+        spans = self._assistant_spans
+        if not any(signed) and not any(item is not None for item in spans):
+            return
+        # A signed episode must carry spans. A non-signed Episode v1 rollout (schema 3 path) legitimately
+        # carries them too, but only alongside its episode metadata.
+        if len(spans) != len(self._rollout_meta) or any(
+            (item is None and is_signed)
+            or (item is not None and not is_signed and not (isinstance(meta, dict) and isinstance(meta.get("episode"), dict)))
+            for item, is_signed, meta in zip(spans, signed, self._rollout_meta)
+        ):
+            raise ValueError("training payload assistant spans must be present exactly for signed episodes")
+        a = self._arrays
+        for i, item in enumerate(spans):
+            if item is None:
+                continue
+            length = int(a["tokens_off"][i + 1]) - int(a["tokens_off"][i])
+            prompt_length = self._rollout_meta[i].get("prompt_length")
+            cursor = prompt_length if type(prompt_length) is int and prompt_length >= 0 else None
+            if cursor is None or not isinstance(item, list) or not item:
+                raise ValueError("training payload assistant spans are malformed")
+            for span in item:
+                if (
+                    not isinstance(span, list) or len(span) != 2
+                    or any(type(v) is not int for v in span)
+                    or not (cursor <= span[0] < span[1] <= length)
+                ):
+                    raise ValueError("training payload assistant spans are malformed")
+                cursor = span[1]
 
     def batches(self) -> dict[str, list]:
         a = self._arrays
@@ -358,6 +442,10 @@ class DecodedPayload:
                     rollout._validated_completion_logprobs = [
                         float(v) for v in a["pi_old_flat"][p0:p1]
                     ]
+                if "draw_u_off" in a:
+                    u0, u1 = int(a["draw_u_off"][i]), int(a["draw_u_off"][i + 1])
+                    if u1 > u0:
+                        rollout._forced_draw_uniforms = [float(v) for v in a["draw_u_flat"][u0:u1]]
                 if i < len(self._validated_spans):
                     span = self._validated_spans[i]
                     if span:
@@ -375,6 +463,8 @@ class DecodedPayload:
                     term = self._termination_paths[i]
                     if term:
                         rollout._validated_termination_path = str(term)
+                if i < len(self._rollout_checkpoints) and self._rollout_checkpoints[i] is not None:
+                    rollout.checkpoint_revision = str(self._rollout_checkpoints[i])
                 rollouts.append(rollout)
                 cursor += 1
             out[gm["env"]].append(

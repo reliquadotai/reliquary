@@ -157,7 +157,7 @@ def test_new_admission_pool_prewarms_every_worker(monkeypatch):
 @pytest.mark.asyncio
 async def test_prepare_admission_pools_runs_outside_event_loop(monkeypatch):
     environment = "openmathinstruct"
-    batcher = SimpleNamespace(difficulty_auction_enabled=True)
+    batcher = SimpleNamespace(difficulty_auction_enabled=True, env=range(1000))
     server = ValidatorServer()
     server._auction_admission_enabled = True
     event_loop_thread = threading.get_ident()
@@ -350,7 +350,7 @@ def test_spawned_worker_deadline_is_terminal():
             materials,
             _context(),
             time.monotonic() - 1.0,
-        ).result(timeout=5.0)
+        ).result(timeout=60.0)   # bounds the wait only: a spawned worker imports torch first (~5 s)
 
     assert prepared.reject_reason is RejectReason.WORKER_DROPPED
     assert prepared.reject_stage == "admission_timeout"

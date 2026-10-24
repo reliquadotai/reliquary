@@ -1,0 +1,1200 @@
+"""Signed episodes end to end on CPU: two real episode miners (the ``reliquary mine-episodes`` loop:
+``run_episode_miner`` -> ``EpisodeGroupMiner``) against this validator's real RL side, in one window.
+
+Real: reliquary-sandbox's gateway over ``FakeBoxes`` on 127.0.0.1 (real routes, signing, grading); the RL
+services (``build_rl_episode_services``: machine directory and fleet over a fake bucket, session book and
+issuer, the ``/rl`` precommit / open / close routes, the episode intake); the miner loop, its stack
+(forced ``GenerateEngine`` and its generate app, ``ForcedDraws``, ``HttpRlEpisodes``,
+``RlSignedEpisodeRunner``, ``hf_prover`` over a tiny CPU model, the verdict poll); the validator's admission
+worker (``ValidatorServer._process_auction_submission``: the admission child's ``prepare_submission`` run
+in-process, the parent's episode intake, the submitted records, the batcher's acceptance and the
+settlement of the claims); the batcher, its arrival proof and exploration audit on a real
+``GlobalProofScheduler`` (``ValidationService._execute_scheduled_proof``); the seal drain, the settlement,
+the final verdicts, the training payload, weight replay and the public events.
+
+Fakes: the checkpoint is a tiny CPU model whose logits follow a script (``Checkpoint``: two equally likely
+words of prose, then a bash call whose command is the answer or not; every party loads the same weights);
+vLLM's core runs it with the miner's real ``ForcedSeedVLLMProcessor`` (``FakeCore``); the validator's
+forward is the real ``verify_commitment_proofs`` over its own copy (GRAIL, TOPLOC, forced-seed CDF,
+logprobs, stop picks). The verifiers harness (``Harness``: the same steps over the real gateway and
+generate endpoint); the admission child's process boundary; the HTTP hops (ASGI, in this event loop);
+the ``/submit`` envelope protocol's HTTP part; drand and ``/miner-state``.
+
+Honest miner: plays the 2M seeds (the forced draw decides which ones find the answer), submits an in-zone
+group of M (training lane), proven on arrival, selected, paid; the others withdrawn. A replay of its group
+is refused. Forger: its engine writes the answer whatever command the draw picked (every seed solves: a
+uniform group, exploration lane); the probation audit's forward finds a model token outside the forced
+draw's CDF interval: a deterministic failure (R31): banned for a day, its window forfeited, nothing paid."""
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import json
+import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+
+import httpx
+import pytest
+from fastapi import FastAPI
+
+pytest.importorskip("reliquary_sandbox_service.episodes.testing")
+bt = pytest.importorskip("bittensor")
+torch = pytest.importorskip("torch")
+transformers = pytest.importorskip("transformers")
+
+from reliquary_sandbox.episode_client import EpisodeClient  # noqa: E402
+from reliquary_sandbox.tool_routing import ToolRouter  # noqa: E402
+from reliquary_sandbox_service.episodes import registry, testing  # noqa: E402
+from reliquary_sandbox_verifiers.runner import SandboxEpisodeResult  # noqa: E402
+
+from reliquary import constants  # noqa: E402
+from reliquary.constants import M_ROLLOUTS  # noqa: E402
+from reliquary.infrastructure import sandbox_store  # noqa: E402
+from reliquary.miner import episode_group_miner as group_miner_module  # noqa: E402
+from reliquary.miner import episode_mining as em  # noqa: E402
+from reliquary.miner.corpus_generate_server import SESSION_HEADER, Finished  # noqa: E402
+from reliquary.miner.vllm_generation import FORCED_SEED_KEY  # noqa: E402
+from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, TOPLOC_DEPLOYED_DEFAULTS  # noqa: E402
+from reliquary.protocol.service_episode import parse_rl_engagement  # noqa: E402
+from reliquary.protocol.signatures import sign_envelope  # noqa: E402
+from reliquary.protocol.submission import BatchSubmissionResponse, RejectReason  # noqa: E402
+from reliquary.sandbox.sessions import CLOSED, SUBMITTED  # noqa: E402
+from reliquary.services import runtime as runtime_module  # noqa: E402
+from reliquary.services.runtime import ServiceRuntime, protocol_slot_geometry  # noqa: E402
+from reliquary.services.settlement import service_archive_rewards  # noqa: E402
+from reliquary.shared.task_registry import MECHANISM_SERVICE_RL  # noqa: E402
+from reliquary.shared.training_payload import decode_training_payload, encode_training_payload  # noqa: E402
+from reliquary.validator import batcher as batcher_module  # noqa: E402
+from reliquary.validator.batcher import audit_scheduler_environment  # noqa: E402
+from reliquary.validator.fill_window import FillState  # noqa: E402
+from reliquary.validator.observability import DrandRoundObservation, SubmitTelemetry  # noqa: E402
+from reliquary.validator.proof_scheduler import GlobalProofScheduler  # noqa: E402
+from reliquary.validator.rl_sandbox_wiring import build_rl_episode_services  # noqa: E402
+from reliquary.validator.sandbox_wiring import SandboxValidatorConfig  # noqa: E402
+from reliquary.validator.server import ValidatorServer, _QueuedAuctionSubmission, _UploadPrecommitReceipt  # noqa: E402
+from reliquary.validator.service import ValidationService  # noqa: E402
+from reliquary.validator.weight_only import WeightOnlyValidator  # noqa: E402
+from reliquary.environment.bridged_episode import BridgedEpisodeSource  # noqa: E402
+from tests.unit.episode_v2_fixtures import (  # noqa: E402
+    CATALOGUE, CATALOGUE_IMAGES, ENV_PACKAGE, EPISODE, POOL, PROMPT_TEXT, REVISION, TASK, WINDOW_BEACON,
+    episode_contract, make_test_episode_env, register_episode_env,
+)
+from tests.unit.service_v2_fixtures import qualification_v2  # noqa: E402
+from tests.unit.test_corpus_service import _r2_client, fake_r2  # noqa: E402, F401
+from tests.unit.test_episode_mining import miner_state  # noqa: E402
+from tests.unit.test_grpo_window_batcher import _make_batcher  # noqa: E402
+from tests.unit.test_signed_episode_e2e import (  # noqa: E402, F401
+    CMD_CLOSE, CMD_OPEN, JOB, RIGHT, VALIDATOR, WRONG, ScriptRenderer, r2,
+)
+from tests.unit.test_trajectory_parse import CHAR, EOT, GEN, TERM, TEXT, TR  # noqa: E402
+
+HONEST = bt.Keypair.create_from_uri("//Alice")
+FORGER = bt.Keypair.create_from_uri("//Charlie")
+URL = "http://validator.test"
+RANDOMNESS = "cd" * 32                     # the window's randomness (``test_episode_mining.miner_state``)
+FORGED_TASK = TASK + 1
+# The catalogue changes the order's sha256, so every public pool: in the catalogued order's pool of task
+# TASK + 1, the draws of the forger's M lowest seeds all pick the answer (nothing to forge in its group). Task
+# TASK + 4's mix both commands among them, as task TASK + 1 does in the plain order.
+CATALOGUED_FORGED_TASK = TASK + 4
+PICKS, SLOTS = protocol_slot_geometry()
+TOPLOC = TOPLOC_DEPLOYED_DEFAULTS
+CAPACITY = 4 * M_ROLLOUTS                  # both pools live at once on the one machine
+CLOCK = {"round": 1_000}
+OPERATORS = {HONEST.ss58_address: "operator-a", FORGER.ss58_address: "operator-b"}
+SHADOW_TOPLOC_PROFILE = dataclasses.replace(
+    ACTIVE_PROTOCOL_PROFILE, proofs=(*ACTIVE_PROTOCOL_PROFILE.proofs, dataclasses.replace(TOPLOC, mode="shadow")))
+
+
+# -- the checkpoint: a tiny CPU model whose turns follow a script ---------------------------------------------
+
+
+PROSE = (TEXT, TEXT + 1)            # two words, equally likely: a sampled draw of the checkpoint
+PROSE_WORDS = 20      # each turn's prose: an episode holds >= CHALLENGE_K model tokens (the logprob challenge)
+
+
+def command_ids(command: str) -> list[int]:
+    return [CMD_OPEN] + [CHAR + ord(c) for c in command] + [CMD_CLOSE]
+
+
+def script_options(prefix) -> tuple[int, ...] | None:
+    """The tokens the checkpoint may write next after ``prefix`` (equally likely; the forced draw picks),
+    or None outside a model turn. A turn starts after the renderer's generation prompt (GEN): PROSE_WORDS words
+    of prose; on the first turn a bash call, whose command is the answer or not (one draw decides), then
+    the turn's end; on the next turn (an observation was rendered) the turn's end."""
+    prefix = list(prefix)
+    if GEN not in prefix:
+        return None
+    start = len(prefix) - prefix[::-1].index(GEN)
+    generated, before = prefix[start:], prefix[:start]
+    k = len(generated)
+    if k < PROSE_WORDS:
+        return PROSE
+    if TR in before:                                       # the second turn
+        return (TERM,) if k == PROSE_WORDS else None
+    if k == PROSE_WORDS:
+        return (CMD_OPEN,)
+    branches = {CHAR + ord(RIGHT[0]): RIGHT, CHAR + ord(WRONG[0]): WRONG}
+    at = k - PROSE_WORDS - 1                               # the command's own position
+    if at == 0:
+        return tuple(branches)
+    chosen = generated[PROSE_WORDS + 1]
+    command = command_ids(branches[chosen])[1:] + [TERM] if chosen in branches else []
+    return (command[at],) if at < len(command) else None
+
+
+class ScriptedHead(torch.nn.Module):
+    """``lm_head``: the weights' logits, replaced where the script decides (rows matched to positions)."""
+
+    def __init__(self, inner):
+        super().__init__()
+        self.inner, self.last = inner, None
+
+    def forward(self, hidden):
+        logits = self.inner(hidden)
+        stored, ids = self.last
+        if hidden.dim() == 3:
+            rows = [(0, t, t) for t in range(hidden.shape[1])]
+            out = logits.clone()
+            view = lambda r: out[0, r]                      # noqa: E731
+        else:
+            matches = [(stored[0] == row).all(-1).nonzero().flatten() for row in hidden]
+            rows = [(None, int(m[0]), i) for i, m in enumerate(matches) if len(m)]
+            out = logits.clone()
+            view = lambda r: out[r]                         # noqa: E731
+        for _, position, row in rows:
+            options = script_options(ids[:position + 1])
+            if options is not None:
+                target = view(row)
+                target.fill_(-30.0)
+                target[list(options)] = 30.0
+        return out
+
+
+class ScriptedBase(torch.nn.Module):
+    def __init__(self, inner, head):
+        super().__init__()
+        self.inner, self.head = inner, head
+
+    def forward(self, input_ids, attention_mask=None, **kwargs):
+        out = self.inner(input_ids, attention_mask=attention_mask, use_cache=False)
+        self.head.last = (out.last_hidden_state.detach(), [int(t) for t in input_ids[0]])
+        return out
+
+
+class Checkpoint(torch.nn.Module):
+    """The announced checkpoint on CPU (each party loads its own copy: same weights, same script)."""
+
+    base_model_prefix = "model"
+
+    _weights = None
+    _weights_lock = threading.Lock()
+
+    def __init__(self):
+        import copy
+
+        super().__init__()
+        with Checkpoint._weights_lock:          # built once: every party loads the same weights
+            if Checkpoint._weights is None:
+                config = transformers.AutoConfig.for_model(
+                    "qwen3", vocab_size=2048, hidden_size=128, intermediate_size=256, num_hidden_layers=2,
+                    num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=4096,
+                    eos_token_id=EOT, tie_word_embeddings=True)
+                torch.manual_seed(0)
+                Checkpoint._weights = transformers.AutoModelForCausalLM.from_config(config).to(torch.float32).eval()
+            inner = copy.deepcopy(Checkpoint._weights)
+        self.config, self.name_or_path = inner.config, "models/test"
+        self.lm_head = ScriptedHead(inner.lm_head)
+        self.model = ScriptedBase(inner.model, self.lm_head)
+        self.eval()
+
+    def get_input_embeddings(self):
+        return self.model.inner.embed_tokens
+
+    def forward(self, input_ids, attention_mask=None, output_hidden_states=False, **kwargs):
+        hidden = self.model(input_ids, attention_mask=attention_mask).last_hidden_state
+        return SimpleNamespace(logits=self.lm_head(hidden), hidden_states=(hidden,) if output_hidden_states else None)
+
+
+class FakeCore:
+    """vLLM's place behind the forced ``GenerateEngine``: the checkpoint's logits, then the miner's real
+    ``ForcedSeedVLLMProcessor`` one-hots the seed's pick (the engine takes the argmax). ``cheat(prompt,
+    generated, pick)`` lets an engine write another token than the draw's."""
+
+    def __init__(self, model, cheat=None):
+        self.model, self.cheat, self.queue, self.draws = model, cheat, [], []
+        self.turns, self.cheated = [], set()          # (seed, offset, completion); seeds written off-draw
+        self._lock = threading.Lock()
+
+    def add(self, request_id, prompt_ids, max_tokens, draw=None):
+        if draw is None:
+            raise ValueError("a forced core takes every request with its draw")
+        forced = draw[FORCED_SEED_KEY]
+        with self._lock:
+            self.draws.append((int(forced["seed_index"]), int(forced["base_offset"])))
+            self.queue.append((request_id, list(prompt_ids), dict(draw), int(max_tokens)))
+
+    def has_unfinished(self):
+        with self._lock:
+            return bool(self.queue)
+
+    def step(self):
+        from reliquary.miner.vllm_generation import ForcedSeedVLLMProcessor
+
+        with self._lock:
+            queue, self.queue = self.queue, []
+        done = []
+        for request_id, prompt, draw, cap in queue:
+            seed, offset = int(draw[FORCED_SEED_KEY]["seed_index"]), int(draw[FORCED_SEED_KEY]["base_offset"])
+            processor = ForcedSeedVLLMProcessor()
+            processor.update_state(SimpleNamespace(removed=(), moved=(),
+                                                   added=[(0, SimpleNamespace(extra_args=draw))]))
+            generated, logprobs = [], []
+            while len(generated) < cap:
+                with torch.no_grad():
+                    logits = self.model(torch.tensor([prompt + generated])).logits[0, -1].float()
+                pick = int(processor.apply(logits.unsqueeze(0))[0].argmax())
+                if self.cheat is not None:
+                    written = self.cheat(prompt, generated, pick)
+                    if written != pick:
+                        self.cheated.add(seed)
+                    pick = written
+                logprobs.append(float(torch.log_softmax(logits, -1)[pick]))
+                generated.append(pick)
+                if pick in (TERM, EOT):
+                    break
+            self.turns.append((seed, offset, tuple(generated)))
+            done.append(Finished(request_id, tuple(generated), tuple(logprobs), "stop", ()))
+        return done
+
+
+def forger_cheat(prompt, generated, pick):
+    """The forger's engine: the answer, whatever command the draw picked."""
+    if len(generated) == PROSE_WORDS + 1 and pick == CHAR + ord(WRONG[0]):
+        return CHAR + ord(RIGHT[0])
+    return pick
+
+
+FORWARDS: list[dict] = []
+
+
+def cpu_forward(commit, model, randomness, *, tokenizer=None, seed_u_values=None):
+    """The validator's real verifier over its copy of the checkpoint (recorded for the assertions)."""
+    from reliquary.validator.verifier import verify_commitment_proofs
+
+    result = verify_commitment_proofs(commit, model, randomness, tokenizer=tokenizer, seed_u_values=seed_u_values)
+    episode = commit["rollout"]["episode"]
+    FORWARDS.append({"seed": episode["seed_index"], "uniforms": list(seed_u_values or ()),
+                     "transcript": "transcript" in episode, "hard": result.seed_n_hard_mismatch,
+                     "toploc": (result.toploc_checked, result.toploc_passed), "grail": result.all_passed,
+                     "positions": result.seed_n_positions})
+    return result
+
+
+# -- the harness: verifiers' steps over the real gateway and the miner's real generate endpoint --------------
+
+
+class Harness:
+    def __init__(self, url, world, runner_kwargs):
+        self.url, self.world, self.kwargs = url, world, runner_kwargs
+        self.renderer = ScriptRenderer()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return None
+
+    async def run(self, *, token, prompt, on_trace=None):
+        import uuid
+
+        trace = SimpleNamespace(id=uuid.uuid4().hex, stop_condition=None, ok=True, errors=[])
+        on_trace(trace)                    # the trace is bound to its seed's draw before its first turn
+        app = self.world.generate_apps[self.kwargs["hotkey"]]
+        async with EpisodeClient(self.url) as client:
+            episode = await client.open(token)
+            router = ToolRouter(episode, offered=tuple(episode.record0["body"]["tools"]))
+            ids, error = self.renderer.initial_ids(prompt), None
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url=self.kwargs["generate_url"]) as generate:
+                for turn in range(self.kwargs["policy"].max_turns):
+                    answer = await generate.post("/inference/v1/generate", headers={SESSION_HEADER: trace.id},
+                                                 json={"token_ids": ids, "model": self.kwargs["model_name"]})
+                    if answer.status_code != 200:
+                        error = f"generate {answer.status_code}: {answer.text}"
+                        break
+                    completion = answer.json()["choices"][0]["token_ids"]
+                    calls = [(f"call_{j}", name, arguments)
+                             for j, (name, arguments) in enumerate(self.renderer.tool_calls(completion))]
+                    if not calls:
+                        trace.stop_condition = "agent_completed"
+                        break
+                    observations = [await router.answer(turn, calls, call_id) for call_id, _, _ in calls]
+                    ids = self.renderer.next_prompt(ids, completion, observations)
+                else:
+                    trace.stop_condition = "max_turns"
+            finished = await episode.finish()
+            transcript = (await episode.transcript())["transcript"]
+        return SandboxEpisodeResult(episode.id, trace, finished.record, finished.state, transcript,
+                                    tuple(router.refusals), error)
+
+
+class AppBridge(httpx.BaseTransport):
+    """The miner's session client is synchronous (it runs in worker threads): each request is served by
+    the validator's ASGI app on the test's event loop."""
+
+    def __init__(self, app, loop):
+        self.app, self.loop = app, loop
+
+    def handle_request(self, request):
+        body = request.read()
+
+        async def send():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url=URL) as client:
+                answer = await client.request(request.method, str(request.url), headers=dict(request.headers),
+                                              content=body)
+                return answer.status_code, dict(answer.headers), answer.content
+
+        status, headers, content = asyncio.run_coroutine_threadsafe(send(), self.loop).result(120)
+        headers.pop("content-length", None)
+        return httpx.Response(status, headers=headers, content=content)
+
+
+# -- the validator ----------------------------------------------------------------------------------------------
+
+
+class Tokenizer:
+    eos_token_id = TERM
+
+
+def make_runtime(path, *, catalogue=None) -> ServiceRuntime:
+    if catalogue is None:
+        contract = episode_contract()
+    else:                       # its version: the manifest of the catalogued install (1 000 tasks), as described
+        from tests.unit.episode_v2_fixtures import bridged_version
+
+        contract = episode_contract(catalogue=catalogue, episode_version=bridged_version(catalogue, ENV_PACKAGE, 1000))
+    path.mkdir(parents=True, exist_ok=True)
+    rt = ServiceRuntime(path / "runtime.sqlite3", contract, qualification_v2(contract), now=time.time() - 10,
+                        drand_round_at=lambda instant: CLOCK["round"])
+    rt.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision=REVISION)
+    rt.open_window(1, pools={name: POOL for name in contract.environments}, picks_target=PICKS,
+                   batch_slots=SLOTS, now=time.time() - 5)
+    rt.announcement(window=1, randomness=WINDOW_BEACON)
+    return rt
+
+
+class Validator:
+    """This validator in one window: the RL services, the admission worker, the episode batcher and its
+    proof plane. ``submit`` is ``/submit``'s worker for one group (the HTTP envelope protocol aside)."""
+
+    def __init__(self, gateway, rt, tmp_path, *, production: bool = False, yield_path=...):
+        """``production``: the services as the validator builds them for a signed-episode order (the yield ledger,
+        hence the quota, the fair open queue and the allocation route; machines must report their resources; the
+        boot check of the served envs; the settled windows' uses), their routes on the server's app too and their
+        background jobs running. ``yield_path``: the ledger's file (default ``rl-yield.sqlite3``; None: none)."""
+        self.rt, self.opened, self.production, self.jobs = rt, time.time(), production, []
+        config = SandboxValidatorConfig(key_file=tmp_path / "unused", key_id=gateway.validator.key_id,
+                                        retired_keys={})
+        model, tokenizer = Checkpoint(), Tokenizer()        # the validator's own copy of the checkpoint
+        from reliquary.shared.modeling import resolve_eos_token_ids
+
+        extra = {}
+        if production:
+            extra = dict(yield_path=tmp_path / "rl-yield.sqlite3" if yield_path is ... else yield_path,
+                         require_resources=True, boot_wait_s=5.0, window_uses=rt.window_uses,
+                         operator_of=OPERATORS.get)
+        self.services = build_rl_episode_services(
+            config, validator_hotkey=VALIDATOR.ss58_address, runtime=rt,
+            environments={EPISODE: make_test_episode_env()}, renderer_for=lambda policy: ScriptRenderer(),
+            current_window=lambda: 1, chunk_tokens=TOPLOC.chunk_tokens,
+            window_started_at=lambda window: self.opened if window == 1 else None,
+            proof_stop_ids=resolve_eos_token_ids(model, tokenizer), signer=gateway.validator, **extra)
+        self.service = ValidationService.__new__(ValidationService)
+        self.service._service_runtime = rt
+        self.service._proof_models = {"d0": model}
+        self.service._proof_measurements = None
+        self.scheduler = GlobalProofScheduler(
+            devices=("d0",), environments=(EPISODE, audit_scheduler_environment(EPISODE)),
+            proof_callable=self.service._execute_scheduled_proof, checkpoint_revision=REVISION)
+        b = _make_batcher(window_start=1, env=make_test_episode_env(), model=model, tokenizer=tokenizer,
+                          verify_commitment_proofs_fn=cpu_forward, verify_signature_fn=None,
+                          proof_scheduler=self.scheduler,
+                          operator_by_hotkey=OPERATORS)
+        b.randomness = RANDOMNESS
+        b.service_runtime, b.service_environment = rt, EPISODE
+        b.service_policy = rt.announcement(window=1, randomness=WINDOW_BEACON, environment=EPISODE)
+        b.current_checkpoint_hash = REVISION
+        b.fill_state = FillState(budgets={EPISODE: 64}, picks_target=PICKS)
+        # A profile whose environments name the episode env (auction, final verdicts), as the order's own.
+        b.difficulty_auction_enabled = True
+        b.episode_proof_inconclusive = self.services.batcher_hook(EPISODE, 1)
+        self.batcher = b
+        self.server = ValidatorServer()
+        self.server.set_active_batchers({EPISODE: b})
+        self.server._episode_intake = self.services.intake
+        self.server._admission_materialization_pool = ThreadPoolExecutor(max_workers=2)
+
+        async def in_process(environment, function, *args, wall_seconds):
+            # The admission child, without its process: on the main thread (its deadline is a SIGALRM).
+            return function(*args)
+
+        self.server._run_admission_process = in_process
+        self.service.server = self.server
+        self.service._active_batchers = {EPISODE: b}
+        self.app = FastAPI()
+        for router in self.services.routers:
+            self.app.include_router(router)
+            if production:                      # as the validator serves them (the allocation route included)
+                self.server.app.include_router(router)
+        self.receipts, self.workers, self.requests = [], [], {}
+
+    async def start(self):
+        await self.services.start()
+        await self.services.fleet.refresh_directory()
+        await self.services.fleet.poll_once()
+        if self.production:
+            self.jobs = [asyncio.ensure_future(job) for job in self.services.background()]
+
+    async def submit(self, url, request, *, client, wallet, randomness):
+        """The miner's ``submit_batch_v2`` and the validator's ``/submit`` in one: the envelope is finalized
+        and signed as the submitter does, the body is queued for the real admission worker, and the miner
+        gets its queue receipt (the verdict follows on ``/miner-verdicts``)."""
+        assert url == URL and randomness == RANDOMNESS
+        nonce = os.urandom(16).hex()
+        signature = sign_envelope(
+            wallet=wallet, miner_hotkey=request.miner_hotkey, window_start=request.window_start,
+            prompt_idx=request.prompt_idx, merkle_root=request.merkle_root, checkpoint_hash=request.checkpoint_hash,
+            drand_round=0, randomness=randomness, nonce=nonce, protocol_version=request.protocol_version,
+            generation_profile_id=request.generation_profile_id, pool_selection=request.pool_selection,
+            service_binding=request.service_binding).hex()
+        request = request.model_copy(update={"drand_round": 0, "nonce": nonce, "envelope_signature": signature})
+        self.requests.setdefault(request.miner_hotkey, []).append(request)
+        self.enqueue(request)
+        return BatchSubmissionResponse(accepted=True, reason=RejectReason.SUBMITTED)
+
+    def enqueue(self, request):
+        import hashlib
+
+        exclude = {"generation_profile_id"} if not request.generation_profile_id else None
+        raw = request.model_dump_json(exclude=exclude).encode("utf-8")
+        receipt_id, now = os.urandom(8).hex(), time.time()
+        # The upload protocol's bookkeeping (``/submit/precommit``, then the body's bytes), on the batcher.
+        b = self.batcher
+        accepted, why, _ = b.try_register_upload_precommit(receipt_id, request.miner_hotkey, t_arrival_wall=now,
+                                                           payload_bytes=len(raw))
+        assert accepted, why
+        assert b.account_upload_precommit_bytes(receipt_id, t_arrival_wall=now, chunk_bytes=len(raw))[0]
+        assert b.mark_upload_precommit_transport_complete(receipt_id, completed_at_wall=now)[0]
+        assert b.mark_upload_precommit_revealed(receipt_id)
+        receipt = _UploadPrecommitReceipt(
+            receipt_id=receipt_id, precommit_signature="signed", miner_hotkey=request.miner_hotkey,
+            prompt_idx=request.prompt_idx, window_start=request.window_start, merkle_root=request.merkle_root,
+            checkpoint_hash=request.checkpoint_hash, environment=EPISODE, payload_bytes=len(raw),
+            payload_sha256=hashlib.sha256(raw).hexdigest(), drand_round=request.drand_round,
+            protocol_version=request.protocol_version, nonce=request.nonce,
+            generation_profile_id=request.generation_profile_id, expires_at_wall=time.time() + 60.0,
+            precommit_arrival_ts=time.time(),
+            drand_observation=DrandRoundObservation(
+                submitted_drand_round=request.drand_round, arrival_drand_round=request.drand_round, drand_delta=0,
+                drand_tolerance=0, drand_status="current", reject_reason=None),
+            batcher=self.batcher, consumed=True, operator=b._operator_for_hotkey(request.miner_hotkey),
+            body_completed_at_wall=now)
+        item = _QueuedAuctionSubmission(
+            raw_body=raw, receipt=receipt, batcher=self.batcher,
+            telemetry=SubmitTelemetry.from_request(request, t_arrival=time.time()), enqueued_monotonic=time.monotonic())
+        self.receipts.append(receipt)
+        self.workers.append(asyncio.ensure_future(self.server._process_auction_submission(item, asyncio.Queue())))
+        return receipt
+
+    async def close(self):
+        await asyncio.gather(*self.workers, return_exceptions=True)
+        for job in self.jobs:
+            job.cancel()
+        await asyncio.gather(*self.jobs, return_exceptions=True)
+        self.scheduler.close()
+        self.server._admission_materialization_pool.shutdown(wait=True)
+        await self.services.stop()
+
+
+# -- the miners --------------------------------------------------------------------------------------------------
+
+
+class Miners:
+    """``deps`` of each miner's real stack: its own fake vLLM core and tiny proof model, the validator over
+    ASGI. ``generate_apps[hotkey]``: the generate endpoint each stack serves (the harness plays on it)."""
+
+    def __init__(self, validator: Validator, loop):
+        self.validator, self.loop = validator, loop
+        self.generate_apps, self.cores, self.runners = {}, {}, []
+        self.allocations: list[tuple[str, int, dict | None]] = []     # (hotkey, status, answer) of the route
+
+    def _log_allocation(self, hotkey):
+        async def log(response):
+            if response.request.method == "POST" and response.request.url.path.endswith("/sessions/allocation"):
+                await response.aread()
+                answer = response.json() if response.status_code == 200 else None
+                self.allocations.append((hotkey, response.status_code, answer))
+        return log
+
+    def deps(self, keypair, cheat):
+        hotkey = keypair.ss58_address
+
+        def make_core(directory, **kwargs):
+            assert kwargs["max_total_tokens"] == self.validator.rt.contract.episode_policy(EPISODE).max_episode_tokens
+            self.cores[hotkey] = FakeCore(Checkpoint(), cheat)
+            return self.cores[hotkey]
+
+        async def serve(app, port):
+            self.generate_apps[hotkey] = app
+            serving = asyncio.get_running_loop().create_future()
+            serving.set_result(None)
+            return SimpleNamespace(should_exit=False), serving
+
+        def make_runner(**kwargs):
+            from reliquary.miner.rl_episode_client import RlSignedEpisodeRunner
+
+            runner = RlSignedEpisodeRunner(**kwargs, runner_factory=lambda url: Harness(url, self, kwargs))
+            self.runners.append(runner)
+            return runner
+
+        return em.EpisodeStackDeps(
+            download=lambda repo, revision, cache_dir: f"/checkpoints/{revision[:8]}",
+            load_renderer=lambda directory, tools, spec=None: ScriptRenderer(), make_core=make_core,
+            max_model_len=lambda core, default: default, release_core=lambda core: None,
+            load_proof_model=lambda directory: Checkpoint(), release_model=lambda model: None,
+            toploc=lambda: TOPLOC, serve=serve, make_runner=make_runner, submit=self.validator.submit,
+            sync_http=lambda url: httpx.Client(base_url=url, transport=AppBridge(self.validator.app, self.loop)),
+            async_http=lambda: httpx.AsyncClient(transport=httpx.ASGITransport(app=self.validator.server.app),
+                                                 event_hooks={"response": [self._log_allocation(hotkey)]}),
+            package_refusal=lambda policy: None)
+
+    def run(self, keypair, cheat, task, *, task_prompts=None):
+        """``run_episode_miner`` for ``keypair``, offered the one task ``task`` (all others in cooldown).
+        ``task_prompts``: the miner's prompts (the registry's by default)."""
+        stop = asyncio.Event()
+        state = miner_state(self.validator.rt, cooldown=set(range(1000)) - {task}, prompt_range=(0, 1000))
+        config = em.EpisodeMinerConfig(environments=em.parse_episode_environments(EPISODE), validator_url=URL,
+                                       validator_hotkey=VALIDATOR.ss58_address, groups_in_flight=1)
+
+        async def read_state():
+            return state
+
+        async def poll(seconds):
+            await asyncio.sleep(0.05)
+
+        task_ = asyncio.ensure_future(em.run_episode_miner(
+            config=config, wallet=SimpleNamespace(hotkey=keypair), stop=stop, deps=self.deps(keypair, cheat),
+            task_prompts=task_prompts or em.EpisodeTaskPrompts([EPISODE]), read_state=read_state, sleep=poll))
+        return stop, task_
+
+
+class CatalogueVerifiersEnv:
+    """The verifiers env a miner installs for the order's catalogue: every task's prompt is the validator's
+    (``PROMPT_TEXT``), every task's image the fake gateway's, and its lock is the catalogue's."""
+
+    def __init__(self, split):
+        self.split = split
+        self.lock = SimpleNamespace(images=dict(CATALOGUE_IMAGES))
+
+    def taskset(self, split):
+        assert split == self.split
+        return list(range(1000))
+
+    def task(self, split, index):
+        assert split == self.split
+        return SimpleNamespace(data=SimpleNamespace(prompt=PROMPT_TEXT))
+
+    def sandbox_task(self, split, index):
+        return SimpleNamespace(image=testing.FAKE_IMAGE, limits=SimpleNamespace(cpus=None, memory_bytes=None))
+
+
+def catalogue_prompts():
+    """A miner that knows the env from the order's catalogue only: the static registry is never used."""
+    def forbidden(name):
+        raise AssertionError(f"the miner used the static registry for {name}")
+
+    def build_source(config):
+        return BridgedEpisodeSource(config, env=CatalogueVerifiersEnv(config.rl_split), identity=ENV_PACKAGE)
+
+    return em.EpisodeTaskPrompts([EPISODE], load=forbidden, build_source=build_source)
+
+
+# -- helpers ------------------------------------------------------------------------------------------------------
+
+
+async def until(predicate, seconds=120.0, what="", explain=None):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if predicate():
+            return
+        await asyncio.sleep(0.05)
+    assert predicate(), f"timed out waiting for {what}: {explain() if explain else ''}"
+
+
+def proof_state(b):
+    return {"rows": list(b.difficulty_auction_metadata_by_id.values()), "forwards": FORWARDS,
+            "pending": [(p.hotkey[:8], p.proof_reject_stage, getattr(p, "proof_reject_scope", None))
+                        for p in b.pending_submissions()]}
+
+
+def sessions_of(services, hotkey):
+    """{seed: record} of the hotkey's RL sessions (one precommit each here)."""
+    out = {}
+    for record in services.book.records():
+        if record.hotkey == hotkey:
+            out[parse_rl_engagement(record.engagement)[2]] = record
+    return out
+
+
+@pytest.fixture
+def wide_gateway(tmp_path, monkeypatch):
+    """The signed corpus e2e's gateway with room for two pools at once."""
+    monkeypatch.setattr(registry, "_package_of", lambda entry: JOB.episode.sandbox.env_package)
+    with testing.fake_gateway(tmp_path / "gw", envs={"reliquary-swe": testing.FAKE_ENV_ENTRY},
+                              episode_capacity=CAPACITY) as (served, boxes):
+        served.boxes = boxes
+        yield served
+
+
+@pytest.fixture(autouse=True)
+def quick(monkeypatch):
+    CLOCK["round"] = 1_000
+    FORWARDS.clear()
+    monkeypatch.setattr(runtime_module, "_verified_beacon", lambda round_id: "ef" * 32)
+    # The validator's profile names TOPLOC (as the order's must for signed episodes).
+    monkeypatch.setattr(batcher_module, "_active_profile", lambda: SHADOW_TOPLOC_PROFILE)
+    # The v6 fill-closed window (arrival proofs, FIFO picks), as the order's validator runs it.
+    monkeypatch.setattr(batcher_module, "FILL_CLOSED_ENABLED", True)
+    monkeypatch.setattr(group_miner_module, "VERDICT_POLL_S", 0.1)
+    monkeypatch.setattr(group_miner_module, "VERDICT_POLL_MAX_S", 0.3)
+    monkeypatch.setattr(constants, "SERVICE_EXPLORATION_DRAIN_SECONDS", 20.0)
+    monkeypatch.setattr(constants, "SERVICE_EXPLORATION_DRAIN_PROBATION_SECONDS", 20.0)
+
+
+# -- the test --------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("catalogued", [False, True], ids=["registered", "catalogued"])
+async def test_two_miners_one_window_precommit_sessions_choice_proof_audit_settlement_replay(
+        wide_gateway, r2, tmp_path, monkeypatch, catalogued):  # noqa: F811
+    """``catalogued``: the order's entry carries a public catalogue, and the miners know the env from it only
+    (their prompts are built from the announcement); the validator side is the same."""
+    register_episode_env(monkeypatch)
+    await sandbox_store.register_machine(
+        machine_id=wide_gateway.settings.machine_id, address=wide_gateway.url, provider="local",
+        capacity=CAPACITY, key_id=wide_gateway.machine.key_id, public_key_b64=wide_gateway.machine.public_key_b64,
+        valid_from=0, now=time.time())
+    rt = make_runtime(tmp_path / "rt", catalogue=CATALOGUE if catalogued else None)
+    v = Validator(wide_gateway, rt, tmp_path)
+    await v.start()
+    miners = Miners(v, asyncio.get_running_loop())
+    b, services, server = v.batcher, v.services, v.server
+    two_m = 2 * M_ROLLOUTS
+    try:
+        prompts = {key: catalogue_prompts() if catalogued else None for key in ("honest", "forger")}
+        honest_stop, honest = miners.run(HONEST, None, TASK, task_prompts=prompts["honest"])
+        forged_task = CATALOGUED_FORGED_TASK if catalogued else FORGED_TASK
+        forger_stop, forger = miners.run(FORGER, forger_cheat, forged_task, task_prompts=prompts["forger"])
+
+        # 1. Both groups reach the batcher: every seed of each 2M pool opened once, played and closed final.
+        await until(lambda: len(v.receipts) >= 2 and all(r.terminal for r in v.receipts[:2]), 300,
+                    "both groups admitted")
+        if catalogued:
+            for prompts_ in prompts.values():
+                source = prompts_.sources[EPISODE]
+                assert isinstance(source, BridgedEpisodeSource) and source.config.rl_split == CATALOGUE["rl_split"]
+        for receipt in v.receipts[:2]:
+            # Admitted into the pool (the miner reads it on ``/miner-verdicts``): its kept episodes are its group.
+            assert receipt.outcome.accepted and receipt.outcome.reason is RejectReason.ACCEPTED, receipt.outcome
+        for hotkey, task in ((HONEST.ss58_address, TASK), (FORGER.ss58_address, forged_task)):
+            precommit = rt.episode_precommit_sha(window=1, environment=EPISODE, task_index=task, hotkey=hotkey)
+            sessions = sessions_of(services, hotkey)
+            assert sorted(sessions) == list(range(two_m))
+            assert {parse_rl_engagement(r.engagement)[1] for r in sessions.values()} == {precommit}
+        (honest_request,) = v.requests[HONEST.ss58_address]
+        (forged_request,) = v.requests[FORGER.ss58_address]
+        # Every model turn of every seed was generated under that seed's forced draw (the miner's own
+        # processor), each turn's offset counting the episode's model tokens so far; the draw decided
+        # which seeds found the answer.
+        solved = {}
+        for hotkey in (HONEST.ss58_address, FORGER.ss58_address):
+            turns = miners.cores[hotkey].turns
+            assert {seed for seed, _, _ in turns} == set(range(two_m))
+            for seed in range(two_m):
+                (first, offset0), (second, offset1) = sorted(((c, o) for s_, o, c in turns if s_ == seed),
+                                                             key=lambda item: item[1])
+                assert (offset0, offset1) == (0, len(first)) and second[-1] == TERM
+                solved[hotkey, seed] = command_ids(RIGHT)[1] in first
+        honest_seeds = honest_request.pool_selection["seeds"]
+        honest_rewards = [r.reward for r in honest_request.rollouts]
+        assert honest_rewards == [float(solved[HONEST.ss58_address, s]) for s in honest_seeds]
+        assert 0.0 in honest_rewards and 1.0 in honest_rewards              # in zone: the training lane
+        assert honest_request.service_binding["purpose"] == "training"
+        # The forger solved every seed: a uniform group, sent as exploration; some of its seeds' draws had
+        # picked the wrong command.
+        forged_seeds = forged_request.pool_selection["seeds"]
+        assert all(solved[FORGER.ss58_address, s] for s in range(two_m))
+        assert forged_request.service_binding["purpose"] == "exploration"
+        assert set(forged_seeds) & miners.cores[FORGER.ss58_address].cheated
+        # The chosen sessions are paid (submitted) the moment the batcher takes the group.
+        honest_sessions = sessions_of(services, HONEST.ss58_address)
+        assert {honest_sessions[s].state for s in honest_seeds} == {SUBMITTED}
+
+        # 2. The training group is proven on arrival (the real scheduler and verifier, the batcher's own
+        # checks, the checkpoint's forward on CPU): proven, its training observation recorded.
+        await until(lambda: (b._reconcile_fill_state_decisions(EPISODE),
+                             len(b._proven_groups.get(EPISODE, [])) == 1)[1], 60, "the training proof",
+                    lambda: proof_state(b))
+        (proven,) = [group.value for group in b._proven_groups[EPISODE]]
+        assert proven.hotkey == HONEST.ss58_address and proven.prompt_idx == TASK
+        assert [r.reward for r in proven.rollouts] == honest_rewards
+        honest_forwards = FORWARDS[:M_ROLLOUTS]
+        assert [f["seed"] for f in honest_forwards] == honest_seeds and not any(f["transcript"] for f in FORWARDS)
+        assert all(f["hard"] == 0 and f["toploc"] == (True, True) and f["grail"] for f in honest_forwards)
+        pool = rt.seed_pool(environment=EPISODE, prompt_idx=TASK, window=1)
+        for forward in honest_forwards:
+            # The validator checks each model token against the seed's pool uniforms, by model-token offset.
+            assert forward["uniforms"] == [pool.uniform(forward["seed"], j) for j in range(forward["positions"])]
+
+        # 3. A replay of the honest group (same sessions) is refused before any claim.
+        real_admit, intake_answers = services.intake.admit, []
+
+        async def admit(**kwargs):
+            prepared, claim = await real_admit(**kwargs)
+            intake_answers.append((prepared.reject_reason, prepared.reject_stage, claim))
+            return prepared, claim
+
+        services.intake.admit = admit
+        replay = v.enqueue(honest_request)
+        await until(lambda: replay.terminal, 60, "the replay's verdict")
+        assert (replay.outcome.accepted, replay.outcome.reason) == (False, RejectReason.HASH_DUPLICATE)
+        assert intake_answers == [(RejectReason.HASH_DUPLICATE, "episode_session_reused", None)]
+        # (the miner reads the server's identity refusal, checked after the intake: same reason)
+        assert server._verdicts[HONEST.ss58_address][-1]["reject_stage"] == "logical_dedup"
+        assert {honest_sessions[s].state for s in honest_seeds} == {SUBMITTED}
+
+        # 4. The forged group: exploration, forced to audit (probation); the audit's forward finds model
+        # tokens the forced draw never picked: deterministic (R31), banned, its window forfeited.
+        CLOCK["round"] += 100                                  # its draw round is due
+        await until(lambda: (b.service_exploration_tick(), rt.exploration_banned(FORGER.ss58_address))[1], 180,
+                    "the forger's audit", lambda: {"rows": rt.ledger.rows(1, environment=EPISODE),
+                                                   "proofs": proof_state(b)})
+        (row,) = rt.ledger.rows(1, environment=EPISODE)
+        assert row["status"] == "forfeited" and row["audit"] == "failed"
+        forged_pending = [p for p in b.pending_submissions() if p.hotkey == FORGER.ss58_address]
+        assert forged_pending and forged_pending[0].proof_reject_stage == "forced_seed"
+        assert forged_pending[0].proof_reject_scope == "cdf_hard_mismatch"
+        assert b.difficulty_auction_metadata_by_id[id(forged_pending[0])]["status"] == "exploration_forfeited"
+        assert not rt.exploration_banned(HONEST.ss58_address)
+        ban = rt.contract.reward_policy["ban_seconds"]
+        assert ban == 86_400 and not rt.exploration_banned(FORGER.ss58_address, now=time.time() + ban + 1)
+
+        # 5. The seal: the audits drained, every env finalized, the window settled from its batch.
+        await v.service._drain_service_exploration([b])
+        paid = [proven]
+        archive = {"window_start": 1, "window_status": "complete", "rewards_by_hotkey": {},
+                   "batch": [{"hotkey": g.hotkey, "env_name": EPISODE, "prompt_idx": g.prompt_idx} for g in paid]}
+        result = await v.service._settle_service_archive(rt, archive)
+        assert set(result["rewards_by_hotkey"]) == {HONEST.ss58_address}
+        assert result["rewards_by_hotkey"][HONEST.ss58_address] > 0
+        v.service._auction_final_verdict_records(b, paid_groups=paid, finalize=True)
+
+        # 6. The miners read their verdicts: the honest group is submitted, every other episode withdrawn.
+        def settled(hotkey, chosen):
+            states = {seed: record.state for seed, record in sessions_of(services, hotkey).items()}
+            return all(states[s] == (SUBMITTED if s in chosen else CLOSED) for s in range(two_m))
+
+        await until(lambda: settled(HONEST.ss58_address, honest_seeds) and settled(FORGER.ss58_address, forged_seeds),
+                    60, "the withdrawals")
+        (honest_final,) = [x for x in server._verdicts[HONEST.ss58_address] if x.get("selected_for_batch") is not None]
+        assert honest_final["merkle_root"] == honest_request.merkle_root
+        assert honest_final["accepted"] and honest_final["selected_for_batch"] and honest_final["rewarded"]
+        (forger_final,) = [x for x in server._verdicts[FORGER.ss58_address] if x.get("selected_for_batch") is not None]
+        assert forger_final["merkle_root"] == forged_request.merkle_root
+        assert not forger_final["rewarded"] and forger_final["outcome_code"] == "exploration_unpaid"
+    finally:
+        for stop in (locals().get("honest_stop"), locals().get("forger_stop")):
+            if stop is not None:
+                stop.set()
+        for task in (locals().get("honest"), locals().get("forger")):
+            if task is not None:
+                await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 60)
+        await v.close()
+
+    # 7. Weight replay pays exactly what the seal settled.
+    record = {**json.loads(json.dumps(result)), "task_id": "next-rl"}
+    replayed = service_archive_rewards(record, rt.contract, cap=0.5, picks_target=PICKS, batch_slots=SLOTS)
+    assert replayed == pytest.approx(result["rewards_by_hotkey"], abs=1e-12)
+    declared = {"next-rl": SimpleNamespace(mechanism=MECHANISM_SERVICE_RL, service_contract=rt.contract.to_dict(),
+                                           params={"cap": 0.5})}
+    (out,) = WeightOnlyValidator._validated_service_archives([record], declared)
+    assert out["rewards_by_hotkey"] == pytest.approx(result["rewards_by_hotkey"], abs=1e-12)
+
+    # 8. The training payload of the proven group, encoded as an episode protocol (v5+) writes it: tokens,
+    # model-token spans, rewards and the generation checkpoint; no transcript. (No pi_old here: the
+    # window was proven at this profile's T_PROTO, where the verify forward gives none.)
+    monkeypatch.setattr(constants, "PROTOCOL_VERSION", 7)
+    monkeypatch.setattr(constants, "T_PROTO", 1.0)
+    monkeypatch.setattr(constants, "PI_OLD_FROM_VERIFY_LOGPROBS", True)
+    monkeypatch.setattr(constants, "RECOMPUTE_PI_OLD_FROM_VERIFY", True)
+    data = encode_training_payload({EPISODE: paid}, window_start=1, checkpoint_revision=REVISION,
+                                   env_order=[EPISODE], env_targets={EPISODE: len(paid)},
+                                   window_quarantine={"quarantined": False, "reasons": []})
+    assert b"transcript" not in data and HONEST.ss58_address.encode() not in data
+    (group,) = decode_training_payload(data).batches()[EPISODE]
+    assert [r.reward for r in group.rollouts] == honest_rewards
+    for trained_rollout, sent in zip(group.rollouts, proven.rollouts):
+        assert trained_rollout.commit["tokens"] == sent.commit["tokens"]
+        assert [list(span) for span in trained_rollout._validated_assistant_spans] == \
+            sent.commit["rollout"]["episode"]["assistant_spans"]
+        assert trained_rollout.checkpoint_revision == REVISION
+        assert "transcript" not in trained_rollout.commit["rollout"]["episode"]
+        assert "transcript" in sent.commit["rollout"]["episode"]          # the miner's commit is untouched
+
+    # 9. Publication: the training observation like a single-turn one; no tokens, transcript or hotkey.
+    events = [event for _, event in rt.events(limit=10_000)]
+    published = json.dumps(events)
+    assert "transcript" not in published and "tokens" not in published
+    assert HONEST.ss58_address not in published and FORGER.ss58_address not in published
+    trained = [e for e in events if e.get("type") == "observation" and e.get("lane") == "training"]
+    assert trained and trained[0]["candidate"]["seeds"] == honest_seeds
+    assert trained[0]["rewards_bps"] == [int(r * 10000) for r in honest_rewards]
+    assert any(key.startswith(sandbox_store.RL_SESSION_PREFIX) for key in r2.client.objects)
+
+
+# -- the production configuration ----------------------------------------------------------------------------------
+
+
+AGENT_MEMORY = dict(episode_contract().episode_policy(EPISODE).budgets)["memory_bytes"]
+ONE_POOL = 2 * M_ROLLOUTS                  # the agent boxes the machine's CPU and memory hold at once: one pool
+
+
+@pytest.fixture
+def production_gateway(tmp_path, monkeypatch):
+    """The fake gateway as an RL machine runs: it reserves each episode's CPU (one per box) and memory, for one pool
+    of agent boxes at once, so the second miner's opens wait in the queue until the first one's sessions close; it
+    grades in a pool of its own, lists its live sessions in its reports and signs its open refusals."""
+    monkeypatch.setattr(registry, "_package_of", lambda entry: JOB.episode.sandbox.env_package)
+    with testing.fake_gateway(tmp_path / "gw", envs={"reliquary-swe": testing.FAKE_ENV_ENTRY},
+                              episode_capacity=CAPACITY, episode_nano_cpus=1_000_000_000,
+                              episode_cpu_millis_total=ONE_POOL * 1_000,
+                              episode_memory_bytes_total=ONE_POOL * AGENT_MEMORY,
+                              episode_grading_cpu_millis_total=4_000,
+                              episode_grading_memory_bytes_total=4 * AGENT_MEMORY,
+                              episode_present_window_s=120) as (served, boxes):
+        served.boxes = boxes
+        yield served
+
+
+class ForeignSessions:
+    """Sessions the machine runs that this validator's book does not hold (another validator's on a shared machine,
+    or ones a restart lost): tokens signed with a key the gateway accepts, each holding one agent box's CPU and
+    memory until it is finished. The fleet's size stays the machine's (its totals); only its reports show them."""
+
+    def __init__(self, gateway, services):
+        self.gateway, self.services, self.live = gateway, services, []
+
+    async def open(self, n):
+        from reliquary_sandbox.attest import Budgets, SessionClaims, issue_session_token
+
+        from reliquary.sandbox.rl_engagements import session_budgets
+
+        view = self.services.views[EPISODE]
+        task = await view.resolve_task(TASK)
+        budgets = Budgets(**session_budgets(view.policy, task))
+        for _ in range(n):
+            now = int(time.time())
+            claims = SessionClaims(
+                session_id=os.urandom(16).hex(), hotkey="5ForeignValidatorsMiner", engagement="elsewhere",
+                env=view.policy.sandbox_env, split=view.policy.split, index=TASK, image=task.image,
+                checkpoint=REVISION, machine_id=self.gateway.settings.machine_id, issued_at=now,
+                expires_at=now + 3_600, budgets=budgets)
+            client = EpisodeClient(self.gateway.url)
+            await client.__aenter__()
+            episode = await client.open(issue_session_token(claims, self.gateway.validator))
+            self.live.append((client, episode))
+
+    async def finish(self, n=None):
+        n = len(self.live) if n is None else n
+        done, self.live = self.live[:n], self.live[n:]
+        for client, episode in done:
+            await episode.finish()
+            await client.__aexit__(None, None, None)
+
+
+async def test_the_production_rl_configuration_end_to_end(production_gateway, r2, tmp_path, monkeypatch):  # noqa: F811
+    """The production RL validator end to end, against a gateway that reserves resources, grades in a pool, lists
+    its live sessions and signs its open refusals: booted on the pinned reliquary-sandbox; the yield ledger, the
+    quota (its fleet bound and demand memory), the fair open queue (its tickets for the seeds a started group owes
+    below M), placement by reported resources, the boot check of the served envs, the window's active envs and the
+    signed allocation route the reference miners follow.
+
+    The machine is first held by sessions this validator's book does not hold (``ForeignSessions``): the quota
+    admits both groups (its fleet size is the machine's), the machine has no room, so the miners' opens wait in the
+    queue; a stray open of a waiting miner's precommit is cancelled meanwhile. Freed in two steps, the machine
+    takes the groups' seeds; each group holds its M (the fleet bound: no more fit) and is played from them. One of
+    the forger's boxes fails to start: the gateway's signed receipt, forwarded by the miner's own runner, is verified
+    by the pinned verifier, and that session is nobody's waste."""
+    from reliquary_sandbox import attest
+    from reliquary_sandbox_service.task_runtime import InfraUnavailable
+
+    from reliquary.sandbox import SANDBOX_COMMIT, sandbox_commit_refusal
+    from reliquary.sandbox import fleet as fleet_module
+    from reliquary.sandbox.open_queue import Ticket
+    from reliquary.sandbox.rl_capacity import NEWCOMER, YIELD_MIN_DECIDED
+
+    if not hasattr(attest, "open_refusal_valid"):
+        pytest.skip("the installed reliquary-sandbox signs no open refusals (before the re-pin)")
+    # Booted on the pinned sandbox: the services refuse to build on any other (the RL-start check).
+    assert sandbox_commit_refusal(SANDBOX_COMMIT) is None
+    monkeypatch.setattr(fleet_module, "POLL_SECONDS", 1.0)    # reports list the short-lived sessions of this run
+    register_episode_env(monkeypatch)
+    gateway, boxes = production_gateway, production_gateway.boxes
+    await sandbox_store.register_machine(
+        machine_id=gateway.settings.machine_id, address=gateway.url, provider="local",
+        capacity=CAPACITY, key_id=gateway.machine.key_id, public_key_b64=gateway.machine.public_key_b64,
+        valid_from=0, now=time.time())
+    rt = make_runtime(tmp_path / "rt", catalogue=CATALOGUE)
+    v = Validator(gateway, rt, tmp_path, production=True)
+    miners = Miners(v, asyncio.get_running_loop())
+    b, services, server = v.batcher, v.services, v.server
+    m, two_m, machine = M_ROLLOUTS, 2 * M_ROLLOUTS, gateway.settings.machine_id
+    honest_key, forger_key = HONEST.ss58_address, FORGER.ss58_address
+
+    # -- the spies (observation only) --
+    joins = []                                       # (hotkey, engagement, ticket or refusal) of the open queue
+    if services.queue is not None:
+        real_join = services.queue.join
+
+        def join(hotkey, *, cls, engagement=None):
+            answer = real_join(hotkey, cls=cls, engagement=engagement)
+            joins.append((hotkey, engagement, answer))
+            return answer
+
+        services.queue.join = join
+    first_close = {}                                 # session id -> its ended_at at its first close
+    events = services.issuer._events
+    held_given = {}                                  # session id -> the held seconds the ledger decided it with
+    refusal_checks = []                              # (session id, verdict) of the pinned verifier's checks
+    if services.ledger is not None:                  # (the services without a ledger: no events, no queue)
+        real_closed, real_decide = events.closed, services.ledger.decide
+        real_check = services.issuer._open_refusal_check
+
+        def closed(record, final):
+            first_close.setdefault(record.session_id, record.ended_at)
+            return real_closed(record, final)
+
+        def decide(sha, sessions, **kwargs):
+            sessions = list(sessions)
+            held_given.update((row[0], row[4]) for row in sessions)
+            return real_decide(sha, sessions, **kwargs)
+
+        def check(receipt, record):
+            verdict = real_check(receipt, record)
+            refusal_checks.append((record.session_id, verdict))
+            return verdict
+
+        events.closed, services.ledger.decide, services.issuer._open_refusal_check = closed, decide, check
+    polls = []                       # per accepted report: (sessions it lists, sessions still reserved, held, expected)
+    listed_so_far = set()            # every session a report listed so far
+    real_polled = services.fleet.on_polled
+
+    def polled():
+        fleet = services.fleet
+        document = fleet._reports.get(machine)
+        if document is not None:
+            resources = document["resources"]
+            listed = fleet_module._listed(resources)
+            listed_so_far.update(listed)
+            reserved = fleet._reserved.get(machine, ())
+            # a session is held until a report lists it (or its present window passed with none listing it)
+            pending = [r for r in reserved if r[3] not in listed_so_far and document["at"] <= r[1]]
+            expected = tuple(sum(fleet_module.reservation_need(resources, r[2])[k] for r in pending) for k in (0, 1))
+            polls.append((listed, {r[3] for r in reserved}, fleet._held(machine, document, resources), expected))
+        return real_polled()
+
+    services.fleet.on_polled = polled
+    peak_live = [0]
+    refused_box = {}                                 # the forger's seed whose box fails to start, and its session
+    real_create = boxes.create
+
+    def create(box_id, episode_id, spec):
+        record = services.book.get(episode_id)
+        if (not refused_box and record is not None and record.hotkey == forger_key
+                and parse_rl_engagement(record.engagement)[2] == 3):
+            refused_box.update(seed=3, session_id=episode_id)
+            raise InfraUnavailable("cannot start")      # the gateway signs open_failed for this very token
+        return real_create(box_id, episode_id, spec)
+
+    boxes.create = create
+
+    async def watch():
+        while True:
+            peak_live[0] = max(peak_live[0], sum(1 for r in services.book.records() if r.state == "live"))
+            await asyncio.sleep(0.02)
+
+    await v.start()
+    watcher = asyncio.ensure_future(watch())
+    foreign = ForeignSessions(gateway, services)
+    try:
+        assert services.unserved_envs == set()       # the boot check found the env served
+        # The window opens: only its envs count in the fleet size and the allocation answer.
+        services.set_active_envs(sorted(rt.contract.environments))
+        assert services.counted_envs() == frozenset({EPISODE})
+        assert services.allocation_pool_sizes() == {EPISODE: two_m}
+        assert services.fleet.session_capacity(reservations=services.reservations()) == ONE_POOL
+        await foreign.open(ONE_POOL)                 # the machine is full; the fleet's size is still one pool
+
+
+        async def machine_full():                    # (its report shows it before any miner asks)
+            await services.fleet.poll_once()
+            return services.fleet._reports[machine]["resources"]
+
+        for _ in range(100):
+            resources = await machine_full()
+            if resources["free_cpu_millis"] == 0:
+                break
+            await asyncio.sleep(0.1)
+        assert resources["free_cpu_millis"] == 0 and len(fleet_module._listed(resources)) == ONE_POOL
+        assert services.fleet.session_capacity(reservations=services.reservations()) == ONE_POOL
+        prompts = {key: catalogue_prompts() for key in ("honest", "forger")}
+        forger_stop, forger = miners.run(FORGER, forger_cheat, CATALOGUED_FORGED_TASK, task_prompts=prompts["forger"])
+        honest_stop, honest = miners.run(HONEST, None, TASK, task_prompts=prompts["honest"])
+
+        # 0. Both miners' first opens wait in the queue (the quota admits them, the machine has no room).
+        def waiting(hotkey):
+            return [e for h, e, a in joins if h == hotkey and isinstance(a, Ticket) and a.active and not a.granted]
+
+        await until(lambda: waiting(honest_key) and waiting(forger_key), 60, "both miners waiting in the queue",
+                    lambda: [(h[:6], e, getattr(a, "reason", "ticket")) for h, e, a in joins])
+        assert not [r for r in services.book.records() if r.state == "live"]
+        # A stray open of the honest miner's precommit (a seed it opens later), cancelled while it waits.
+        (queued,) = waiting(honest_key)[:1]
+        precommit_sha, seed = parse_rl_engagement(queued)[1], parse_rl_engagement(queued)[2]
+        stray_seed = seed + 1 if seed + 1 < two_m else seed - 1       # the miner sends it once its probe is granted
+        stray = {"kind": "rl_precommit", "precommit": {"precommit_sha256": precommit_sha, "seed_index": stray_seed}}
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(services.issuer.open(hotkey=honest_key, request_id="stray-" + os.urandom(8).hex(),
+                                                        engagement=stray), 0.2)
+        assert stray_seed not in sessions_of(services, honest_key)
+        assert not [t for t in services.queue._tickets() if t.engagement and t.engagement.endswith(f":{stray_seed}")
+                    and t.key == honest_key and t.engagement != queued]
+        # 1. A quarter of the machine is freed: the groups start, and the seeds they still owe below M wait in the
+        # queue on tickets kept for them; then the rest is freed.
+        await foreign.finish(ONE_POOL // 4)
+        await until(lambda: any(isinstance(a, Ticket) and a.reserved is not None for _, _, a in joins), 60,
+                    "an owed seed's ticket", lambda: [(h[:6], e, getattr(a, "reason", "ticket")) for h, e, a in joins])
+        await foreign.finish()
+
+        await until(lambda: len(v.receipts) >= 2 and all(r.terminal for r in v.receipts[:2]), 300,
+                    "both groups admitted", lambda: (len(v.receipts), peak_live, len(joins)))
+        for receipt in v.receipts[:2]:
+            assert receipt.outcome.accepted and receipt.outcome.reason is RejectReason.ACCEPTED, receipt.outcome
+        (honest_request,) = v.requests[honest_key]
+        (forged_request,) = v.requests[forger_key]
+        honest_seeds = honest_request.pool_selection["seeds"]
+        honest_rewards = [r.reward for r in honest_request.rollouts]
+        assert honest_request.service_binding["purpose"] == "training"
+        assert forged_request.service_binding["purpose"] == "exploration"
+        assert set(forged_request.pool_selection["seeds"]) & miners.cores[forger_key].cheated   # something to find
+        assert 0.0 in honest_rewards and 1.0 in honest_rewards                               # in zone
+        # The fleet bound: never more live sessions than the fleet holds; each group holds its M and was played
+        # from the seeds it got (no more fit, the miner did not wait for more).
+        assert peak_live[0] <= ONE_POOL
+        honest_sessions, forger_sessions = sessions_of(services, honest_key), sessions_of(services, forger_key)
+        assert len(honest_sessions) >= m and len(forger_sessions) >= m + 1          # (its failed open, then one more)
+        assert len(honest_sessions) + len(forger_sessions) - 1 <= ONE_POOL           # both groups within the fleet
+        assert stray_seed in honest_sessions and honest_sessions[stray_seed].request_id[:6] != "stray-"
+        # The gateway's signed refusal of the forger's failed box: forwarded by the miner's runner, verified by the
+        # pinned verifier; the session's fault is ours.
+        failed = services.book.get(refused_box["session_id"])
+        assert failed.closed_status == "open_failed" and failed.fault == "open_refused:open_failed"
+        assert (refused_box["session_id"], True) in refusal_checks
+        # The queue was busy, the stray open left it, every ticket left it.
+        assert waiting(honest_key) == [] and waiting(forger_key) == [] and services.queue.waiting == 0
+        # The fleet: each report listed the sessions it ran; a session it listed is no longer held by the fleet.
+        assert any(listed & reserved for listed, reserved, _, _ in polls)
+        assert all(held == expected for _, _, held, expected in polls), polls
+        listed_ever = set().union(*(listed for listed, _, _, _ in polls))
+        assert listed_ever & set(r.session_id for r in honest_sessions.values())
+        assert listed_ever & set(r.session_id for r in forger_sessions.values())
+        # The reference miners asked the signed allocation route for their own allocation and were answered.
+        for hotkey in (honest_key, forger_key):
+            answers = [a for h, status, a in miners.allocations if h == hotkey and status == 200]
+            assert answers and all(a["hotkey"] == hotkey for a in answers), miners.allocations
+            assert any(a["lane"] == NEWCOMER and a["groups"][EPISODE] >= 1 for a in answers), answers
+            assert all(a["pool_seeds"] == {EPISODE: two_m} for a in answers)
+
+        # 2. The training group is proven on arrival.
+        await until(lambda: (b._reconcile_fill_state_decisions(EPISODE),
+                             len(b._proven_groups.get(EPISODE, [])) == 1)[1], 60, "the training proof",
+                    lambda: proof_state(b))
+        (proven,) = [group.value for group in b._proven_groups[EPISODE]]
+        assert proven.hotkey == honest_key and proven.prompt_idx == TASK
+
+        # 4. The forged group's audit fails: banned, its window forfeited.
+        CLOCK["round"] += 100
+        await until(lambda: (b.service_exploration_tick(), rt.exploration_banned(forger_key))[1], 180,
+                    "the forger's audit", lambda: {"rows": rt.ledger.rows(1, environment=EPISODE),
+                                                   "proofs": proof_state(b)})
+        (row,) = rt.ledger.rows(1, environment=EPISODE)
+        assert row["status"] == "forfeited" and row["audit"] == "failed"
+
+        # 5. The seal and the settlement.
+        await v.service._drain_service_exploration([b])
+        paid = [proven]
+        archive = {"window_start": 1, "window_status": "complete", "rewards_by_hotkey": {},
+                   "batch": [{"hotkey": g.hotkey, "env_name": EPISODE, "prompt_idx": g.prompt_idx} for g in paid]}
+        result = await v.service._settle_service_archive(rt, archive)
+        assert set(result["rewards_by_hotkey"]) == {honest_key}
+        v.service._auction_final_verdict_records(b, paid_groups=paid, finalize=True)
+
+        # 6. The miners' verdicts: the honest group submitted, every other episode withdrawn.
+        def settled(hotkey, chosen):
+            return all(r.state == (SUBMITTED if s in chosen else CLOSED)
+                       for s, r in sessions_of(services, hotkey).items() if r.session_id != refused_box["session_id"])
+
+        forged_seeds = forged_request.pool_selection["seeds"]
+        await until(lambda: settled(honest_key, honest_seeds) and settled(forger_key, forged_seeds), 60,
+                    "the withdrawals")
+
+        # 7. The yield ledger decides both precommits from the settlement: the honest one useful (trained), the
+        # forger's wasted (its exploration forfeited) but for its failed box (ours: no verdict).
+        await services.settle_yield()
+        honest_n = len(sessions_of(services, honest_key))
+        forger_n = len(sessions_of(services, forger_key)) - 1
+        stats = {hotkey: services.ledger.stats(hotkey) for hotkey in (honest_key, forger_key)}
+        assert (stats[honest_key].useful, stats[honest_key].decided) == (honest_n, honest_n)
+        assert (stats[forger_key].useful, stats[forger_key].decided) == (0, forger_n)
+        assert max(honest_n, forger_n) < YIELD_MIN_DECIDED        # both still newcomers
+        assert services.quota.lane(honest_key) == services.quota.lane(forger_key) == NEWCOMER
+        # ended_at: each session's box end, set at its first close (with its machine's final) and never moved by
+        # its submission or withdrawal; the held seconds the ledger counted run from issue to it, whether a report
+        # listed the session or not. The failed open has no box end.
+        for hotkey in (honest_key, forger_key):
+            for record in sessions_of(services, hotkey).values():
+                assert record.ended_at == first_close[record.session_id]
+                if record.session_id == refused_box["session_id"]:
+                    assert record.ended_at is None and record.ended_status is None
+                    continue
+                assert record.ended_status == "graded"         # its machine's final (a withdrawal never moves it)
+                assert record.ended_at is not None and record.closed_at >= record.ended_at
+                assert held_given[record.session_id] == record.ended_at - record.issued_at
+        # The demand memory: each key's demand is remembered at what it held once its group ended.
+        services.quota.allocation()
+        for hotkey in (honest_key, forger_key):
+            assert services.quota._memory[hotkey][0] >= m
+    finally:
+        watcher.cancel()
+        for stop in (locals().get("honest_stop"), locals().get("forger_stop")):
+            if stop is not None:
+                stop.set()
+        for task in (locals().get("honest"), locals().get("forger")):
+            if task is not None:
+                await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 60)
+        await foreign.finish()
+        await v.close()

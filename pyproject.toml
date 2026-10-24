@@ -22,7 +22,11 @@ dependencies = [
     "pydantic>=2.3,<3.0.0",
     "requests>=2.28.0",
     "httpx>=0.25.0",
-    "huggingface-hub>=0.20.0",
+    # Pinned exact: the proof worker reads the Hub commit list through
+    # huggingface_hub private internals (utils._pagination.paginate,
+    # HfApi._build_hf_headers). 1.30.0 is the version the published image
+    # already runs (docker/logic-runtime-requirements.lock reinstalls it).
+    "huggingface-hub==1.30.0",
     "datasets>=2.14.0",
     "aiobotocore>=2.0.0",
     "boto3>=1.24.0",
@@ -34,17 +38,42 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.52,<0.53",
     "bitsandbytes>=0.43.0",
+    # The agentic harness miners and validators share (render, parse, loop): one commit
+    # of reliquary-sandbox's harness/ distribution. `agentic_swe.HARNESS_DIGEST` pins
+    # the spec it must install; another digest refuses SWE and signed jobs.
+    "reliquary-harness[qwen] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@7d559fd16564ac16af52486fe6552084c685bca6#subdirectory=harness",
 ]
 
 [project.optional-dependencies]
 affine = ["PyNaCl==1.6.2"]
+vision = [
+    "torch==2.7.0",
+    "peft==0.21.2",
+    "accelerate==1.15.0",
+    "Pillow==13.0.0",
+    "torchvision==0.22.0",
+    "num2words==0.5.14",
+]
 dev = [
+    "Pillow==13.0.0",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "PyNaCl==1.6.2",
+    "pytest-timeout>=2.3",
+    "pytest-xdist>=3.5",
 ]
 wandb = [
     "wandb>=0.16",
+]
+# Signed-episode sandboxes (plan 3): reliquary-sandbox, public, pinned by one commit.
+sandbox = [
+    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@f8c208bd35848a13cf5b9e44b64309d835d1d81e",
+]
+sandbox-miner = [
+    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@f8c208bd35848a13cf5b9e44b64309d835d1d81e",
+]
+sandbox-test = [
+    "reliquary-sandbox[service] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@f8c208bd35848a13cf5b9e44b64309d835d1d81e",
 ]
 
 [project.scripts]
@@ -54,6 +83,13 @@ affine-runtime = "reliquary.integrations.affine_cli:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel.force-include]
+# The historical manifest binds this exact path relative to the installed package root.
+"tests/fixtures/reliquarylogic_v1.jsonl" = "tests/fixtures/reliquarylogic_v1.jsonl"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

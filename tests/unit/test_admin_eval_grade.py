@@ -183,3 +183,18 @@ def test_grading_needs_the_platform_bucket(tmp_path):
         SIGNATURE_HEADER: sign_request(SECRET, stamp, nonce, "POST", path, body),
         "content-type": "application/json"})
     assert response.status_code == 503
+
+
+def test_an_order_against_an_episode_set_is_refused_now(admin, monkeypatch):
+    """An episode or SWE set is graded from its job: an order naming one is a 422
+    answered at once, never a grading that crashes or scores grader errors."""
+    from tests.unit.test_eval_episode_grading import _publish
+
+    _, rows, _ = _publish(admin.root, monkeypatch, "swe")
+    set_id = rows[0]["set_id"]
+    request = {"set_ids": [set_id],
+               "completion_keys": ["evaluations/order-e2/completions-00000.jsonl"],
+               "problems_per_set": {set_id: 2}, "samples_per_set": {set_id: 1},
+               "provenance": PROVENANCE}
+    response = admin("POST", "/admin/v1/evaluations/order-e2/grade", request)
+    assert response.status_code == 422 and "grade it from its job" in response.json()["detail"]

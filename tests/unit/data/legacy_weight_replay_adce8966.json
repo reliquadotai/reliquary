@@ -1,0 +1,580 @@
+{
+ "archives": [
+  {
+   "rewards_by_hotkey": {
+    "hk04": 0.152647343,
+    "hk06": 0.362337163
+   },
+   "task_id": "default",
+   "window_start": 49,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.001701206,
+    "hk01": 0.180120896,
+    "hk03": 0.202341029,
+    "hk06": 0.247512076,
+    "hk07": 0.257384471
+   },
+   "task_id": "side-task",
+   "window_start": 43,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.029455997,
+    "hk03": 0.04927001,
+    "hk06": 0.075398681,
+    "hk07": 0.042749158,
+    "hk08": 0.292764048
+   },
+   "task_id": "side-task",
+   "window_start": 56,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.33175844,
+    "hk03": 0.278264111,
+    "hk04": 0.004972435,
+    "hk05": 0.45375501,
+    "hk06": 0.481555762,
+    "hk07": 0.040351865,
+    "hk08": 0.499073111
+   },
+   "task_id": "default",
+   "window_start": 41,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.086145081,
+    "hk04": 0.22568387,
+    "hk06": 0.048036659,
+    "hk08": 0.227424069
+   },
+   "task_id": "side-task",
+   "window_start": 46,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk01": 0.50506947,
+    "hk02": 0.058675326,
+    "hk04": 0.06319969,
+    "hk06": 0.007643122,
+    "hk07": 0.249245681,
+    "hk08": 0.075523683
+   },
+   "task_id": "default",
+   "window_start": 58,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.145885726,
+    "hk03": 0.161179876,
+    "hk04": 0.44432334,
+    "hk06": 0.251443544
+   },
+   "task_id": "default",
+   "window_start": 48,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.239289857,
+    "hk01": 0.153084771,
+    "hk02": 0.045770972,
+    "hk03": 0.228748566,
+    "hk04": 0.220701856,
+    "hk05": 0.253627699,
+    "hk06": 0.227636368,
+    "hk08": 0.224863617
+   },
+   "task_id": "side-task",
+   "window_start": 40,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.02638245,
+    "hk02": 0.288838005,
+    "hk03": 0.003619253,
+    "hk05": 0.153167972,
+    "hk07": 0.368136067,
+    "hk08": 0.556751518,
+    "tiny": 1e-05
+   },
+   "task_id": "default",
+   "window_start": 54,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.263152042,
+    "hk02": 0.052034949,
+    "hk04": 0.404949916,
+    "hk05": 0.07306372,
+    "hk07": 0.218757763,
+    "hk08": 0.598866889
+   },
+   "task_id": "default",
+   "window_start": 40,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.404061601,
+    "hk01": 0.522782205,
+    "hk02": 0.425289455,
+    "hk03": 0.212218155,
+    "hk04": 0.271940462,
+    "hk05": 0.318126608,
+    "hk06": 0.588961342,
+    "hk07": 0.329550469
+   },
+   "task_id": "default",
+   "window_start": 61,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk01": 0.285612196,
+    "hk03": 0.062932045,
+    "hk04": 0.183187081,
+    "hk05": 0.254263537,
+    "hk07": 0.046612945,
+    "hk08": 0.097179009
+   },
+   "task_id": "side-task",
+   "window_start": 61,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk02": 0.540849442,
+    "hk04": 0.163550555,
+    "hk05": 0.466934664,
+    "hk06": 0.256902993,
+    "hk07": 0.312621031
+   },
+   "task_id": "default",
+   "window_start": 42,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk02": 0.191605468,
+    "hk03": 0.143376179,
+    "hk04": 0.043212607,
+    "hk05": 0.081194489,
+    "hk06": 0.29602763,
+    "hk08": 0.02977441
+   },
+   "task_id": "side-task",
+   "window_start": 41,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.137813663,
+    "hk01": 0.290919411,
+    "hk02": 0.49409872,
+    "hk03": 0.133314849,
+    "hk04": 0.522088248
+   },
+   "task_id": "default",
+   "window_start": 56,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.044493052,
+    "hk01": 0.13354883,
+    "hk03": 0.039067806,
+    "hk05": 0.032714278
+   },
+   "task_id": "side-task",
+   "window_start": 50,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk02": 0.082323878,
+    "hk05": 0.028991181,
+    "hk08": 0.048940518
+   },
+   "task_id": "side-task",
+   "window_start": 51,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk01": 0.091741763,
+    "hk03": 0.06036302,
+    "hk05": 0.092547795,
+    "hk07": 0.020203701,
+    "hk08": 0.178335544
+   },
+   "task_id": "side-task",
+   "window_start": 47,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk01": 0.281262764,
+    "hk02": 0.007007169,
+    "hk03": 0.123611159,
+    "hk05": 0.258533853,
+    "hk06": 0.036747161,
+    "hk08": 0.105844066
+   },
+   "task_id": "side-task",
+   "window_start": 55,
+   "window_status": "aborted"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk02": 0.258068952,
+    "hk04": 0.090280715,
+    "hk06": 0.157465026,
+    "hk08": 0.026753052
+   },
+   "task_id": "side-task",
+   "window_start": 48,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.040544895,
+    "hk01": 0.002523449,
+    "hk08": 0.280180613
+   },
+   "task_id": "default",
+   "window_start": 47,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.064609346,
+    "hk01": 0.131531398,
+    "hk02": 0.173978319,
+    "hk03": 0.085613094,
+    "hk04": 0.047785436,
+    "hk07": 0.273998942,
+    "hk08": 0.019756629
+   },
+   "task_id": "side-task",
+   "window_start": 52,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.247021245,
+    "hk01": 0.229253487,
+    "hk02": 0.239939361,
+    "hk03": 0.415955234,
+    "hk04": 0.537480126,
+    "hk06": 0.157947503,
+    "hk07": 0.383863379
+   },
+   "task_id": "default",
+   "window_start": 51,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk03": 0.299926886,
+    "hk07": 0.253685624,
+    "hk08": 0.308397053
+   },
+   "task_id": "default",
+   "window_start": 52,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.03279057,
+    "hk01": 0.017887946,
+    "hk04": 0.278356504,
+    "hk05": 0.028298937,
+    "hk06": 0.247306274,
+    "hk07": 0.159884229,
+    "hk08": 0.263777745,
+    "tiny": 1e-05
+   },
+   "task_id": "side-task",
+   "window_start": 45,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk01": 0.031167528,
+    "hk06": 0.275189734,
+    "hk07": 0.39442212,
+    "hk08": 0.557962271
+   },
+   "task_id": "default",
+   "window_start": 46,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.16060506,
+    "hk01": 0.572054771,
+    "hk02": 0.333731913,
+    "hk03": 0.280134707,
+    "hk05": 0.506286073,
+    "hk07": 0.183826521,
+    "hk08": 0.169805816
+   },
+   "task_id": "default",
+   "window_start": 44,
+   "window_status": "aborted"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.189144181,
+    "hk01": 0.429852101,
+    "hk02": 0.426208044,
+    "hk03": 0.029026168,
+    "hk04": 0.220012039,
+    "hk06": 0.552011978
+   },
+   "task_id": "default",
+   "window_start": 59,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.162589964,
+    "hk01": 0.383053418,
+    "hk04": 0.47229237,
+    "hk05": 0.011259008,
+    "hk07": 0.068311051
+   },
+   "task_id": "default",
+   "window_start": 53,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.47697306,
+    "hk01": 0.486218678,
+    "hk03": 0.052159523,
+    "hk04": 0.113056901,
+    "hk06": 0.34942419
+   },
+   "task_id": "default",
+   "window_start": 50,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.471246888,
+    "hk01": 0.031490983,
+    "hk02": 0.462662567,
+    "hk03": 0.347514557,
+    "hk05": 0.510773293,
+    "hk06": 0.502119271
+   },
+   "task_id": "default",
+   "window_start": 55,
+   "window_status": "aborted"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.146032279,
+    "hk04": 0.159941119,
+    "hk06": 0.165643206,
+    "hk07": 0.133412536,
+    "tiny": 1e-05
+   },
+   "task_id": "side-task",
+   "window_start": 54,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.139067046,
+    "hk02": 0.256853142,
+    "hk04": 0.080260159,
+    "hk05": 0.197017285
+   },
+   "task_id": "side-task",
+   "window_start": 59,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.020556431,
+    "hk01": 0.257003298,
+    "hk02": 0.028819435,
+    "hk03": 0.282952063,
+    "hk04": 0.251132247,
+    "hk05": 0.113974454,
+    "hk06": 0.246607095,
+    "hk08": 0.259510531
+   },
+   "task_id": "side-task",
+   "window_start": 58,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.05946883,
+    "hk02": 0.10904083,
+    "hk03": 0.401126096,
+    "hk04": 0.174490973,
+    "hk05": 0.344379507,
+    "hk07": 0.445965291
+   },
+   "task_id": "default",
+   "window_start": 43,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.024049041,
+    "hk01": 0.245021138,
+    "hk02": 0.035097571,
+    "hk04": 0.144287297,
+    "hk05": 0.249060549,
+    "hk06": 0.108717571
+   },
+   "task_id": "side-task",
+   "window_start": 49,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.133025905,
+    "hk01": 0.043437399,
+    "hk02": 0.164615949,
+    "hk03": 0.249756668,
+    "hk05": 0.017952963,
+    "hk07": 0.13655767
+   },
+   "task_id": "side-task",
+   "window_start": 57,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.383001745,
+    "hk03": 0.486439821,
+    "hk04": 0.334756846,
+    "hk05": 0.382960258,
+    "hk06": 0.150313602
+   },
+   "task_id": "default",
+   "window_start": 60,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk01": 0.194662032,
+    "hk06": 0.456303044
+   },
+   "task_id": "default",
+   "window_start": 57,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.112244425,
+    "hk01": 0.21476159,
+    "hk03": 0.137231568,
+    "hk04": 0.002292174,
+    "hk07": 0.167005532,
+    "hk08": 0.294377391
+   },
+   "task_id": "side-task",
+   "window_start": 44,
+   "window_status": "aborted"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk00": 0.023310839,
+    "hk01": 0.267138796,
+    "hk02": 0.13024641,
+    "hk03": 0.087382343,
+    "hk05": 0.565654277,
+    "hk07": 0.246376608,
+    "tiny": 1e-05
+   },
+   "task_id": "default",
+   "window_start": 45,
+   "window_status": "complete"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk01": 0.267693221,
+    "hk02": 0.24380702,
+    "hk03": 0.202985313,
+    "hk06": 0.108171351,
+    "hk08": 0.063313976
+   },
+   "task_id": "side-task",
+   "window_start": 42,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk02": 0.031822752,
+    "hk03": 0.256155956,
+    "hk06": 0.006306514,
+    "hk07": 0.113593054
+   },
+   "task_id": "side-task",
+   "window_start": 60,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk01": 0.263422032,
+    "hk03": 0.222231357,
+    "hk05": 0.121530573,
+    "hk08": 0.039423717
+   },
+   "task_id": "side-task",
+   "window_start": 53,
+   "window_status": "completed"
+  },
+  {
+   "rewards_by_hotkey": {
+    "hk01": 0.05
+   },
+   "task_id": "default",
+   "window_start": 70
+  }
+ ],
+ "caps": {
+  "default": 0.6,
+  "side-task": 0.2
+ },
+ "weights": {
+  "hk00": 0.07520887839996625,
+  "hk01": 0.10674492550740354,
+  "hk02": 0.08091077151422099,
+  "hk03": 0.08325225879358615,
+  "hk04": 0.106052191625879,
+  "hk05": 0.0749583454121022,
+  "hk06": 0.10804571882103504,
+  "hk07": 0.08295352242472342,
+  "hk08": 0.07745221869409638
+ },
+ "weights_uncapped": {
+  "hk00": 0.0824214650346203,
+  "hk01": 0.12238099729337612,
+  "hk02": 0.09212655024961569,
+  "hk03": 0.09914915906558958,
+  "hk04": 0.11892033665650723,
+  "hk05": 0.08634165219688755,
+  "hk06": 0.12129844564913778,
+  "hk07": 0.09199966437742077,
+  "hk08": 0.09042831122397565
+ }
+}

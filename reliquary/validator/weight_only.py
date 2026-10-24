@@ -32,6 +32,21 @@ ROLLING_WINDOWS_HISTORY = 72
 
 logger = logging.getLogger(__name__)
 
+# What replay fetches of a service (v2) archive on top of the three legacy fields. ``batch`` is
+# needed because the money is recomputed from the paid rows; the cooldown advice, the recomputed
+# delta, the context and the archive's own ``randomness`` are deliberately NOT read.
+# Per-row projection of ``batch`` applied while the archive is decoded (settlement's ``_count_rows``
+# reads exactly these keys): no prompt, ground truth or rollout is ever retained.
+SERVICE_ROW_FIELDS = {"batch": ("hotkey", "env_name", "prompt_idx")}
+# Maps replay reads as numbers: bounded while decoded (storage.list_recent_datasets), a map that is not
+# {short str: number} with at most 10 000 entries drops its archive (the consumer refuses ``None``).
+SERVICE_NUMBER_MAPS = ("service_pools_by_environment", "service_scale_by_environment")
+SERVICE_NESTED_NUMBER_MAPS = ("service_training_by_environment", "service_exploration_by_environment")
+SERVICE_ARCHIVE_FIELDS = ("batch", "service_payment_policy", "service_order_sha256", "service_schedule",
+                          "service_schedule_sha256", "service_pools_by_environment", "service_picks_target",
+                          "service_batch_slots", "service_training_by_environment",
+                          "service_exploration_by_environment", "service_scale_by_environment")
+
 
 class WeightOnlyValidator:
     """Lightweight validator that only sets weights.
@@ -172,7 +187,11 @@ class WeightOnlyValidator:
         connection cannot stall a submission. We open many of these per
         day (one per epoch), and ``initialize`` is cheap (~0.5s).
         """
-        from botocore.exceptions import ClientError
+        try:
+            declared, _ = await read_registry()
+        except Exception:
+            logger.exception("Task registry unreadable; abstaining from this epoch")
+            return False
 
         by_task: dict[str, list[dict]] = {}
         try:
@@ -191,28 +210,45 @@ class WeightOnlyValidator:
                 (max(w) for w in windows_by_task.values()), default=0
             ) + 1
             for task_id in windows_by_task:
+                if self._is_corpus_task(declared.get(task_id)):
+                    # A corpus task is paid by period only: the window archives
+                    # it wrote before stay in place, unread. They still count in
+                    # the horizon above, so RL reads exactly what it read.
+                    continue
+                from reliquary.shared.task_registry import MECHANISM_SERVICE_RL
+                fields = ("window_start", "window_status", "rewards_by_hotkey")
+                if getattr(declared.get(task_id), "mechanism", None) == MECHANISM_SERVICE_RL:
+                    fields += SERVICE_ARCHIVE_FIELDS
+                extra = {}
+                if fields != ("window_start", "window_status", "rewards_by_hotkey"):
+                    # v2 service task only: keep no rollout data, replay counts rows by these keys.
+                    extra["row_fields"] = SERVICE_ROW_FIELDS
+                    extra["number_map_fields"] = SERVICE_NUMBER_MAPS
+                    extra["nested_number_map_fields"] = SERVICE_NESTED_NUMBER_MAPS
                 archives = await storage.list_recent_datasets(
                     current_window=horizon,
                     n=ROLLING_WINDOWS_HISTORY * 3,
+                    strict=True,
                     task_id=task_id,
                     # The replay reads only these; the task comes from the R2 prefix.
-                    fields=("window_start", "window_status", "rewards_by_hotkey"),
+                    fields=fields,
+                    **extra,
                 )
+                expected_windows = {
+                    w for w in windows_by_task[task_id]
+                    if horizon - ROLLING_WINDOWS_HISTORY * 3 <= w < horizon
+                }
+                if not expected_windows.issubset({a["window_start"] for a in archives}):
+                    logger.error("Listed window archives missing; abstaining from this epoch")
+                    return False
                 # A task whose last window fell out of the shared horizon
                 # contributes nothing, and must not be counted as an
                 # archived task either.
                 if archives:
                     by_task[task_id] = archives
-        except ClientError:
-            # A partial listing would submit a confident vector that pays
-            # only the tasks we managed to see — worse than submitting
-            # nothing. Abstain and let the next epoch retry the listing.
-            logger.exception("Archive listing failed; abstaining from this epoch")
-            return False
-        try:
-            declared, _ = await read_registry()
         except Exception:
-            logger.exception("Task registry unreadable; abstaining from this epoch")
+            # Never submit a vector reconstructed from partially read history.
+            logger.exception("Archive read failed; abstaining from this epoch")
             return False
         try:
             periods = await self._period_weights(declared)
@@ -245,6 +281,12 @@ class WeightOnlyValidator:
                 return False
 
         archives = self._merge_archives(by_task)
+        from reliquary.shared.task_registry import MECHANISM_SERVICE_RL
+        try:
+            archives = self._validated_service_archives(archives, declared)
+        except ValueError as exc:  # only an unusable registry entry/contract; bad archives are dropped inside
+            logger.error("Service task registry entry unusable (%s); abstaining from weights", exc)
+            return False
         logger.info(
             "Replaying %d archives across %d task(s): %s",
             len(archives), len(by_task), ", ".join(sorted(by_task)),
@@ -256,6 +298,9 @@ class WeightOnlyValidator:
             caps=self._caps_by_task(declared),
             floors=self._floors_by_task(declared),
             periods=periods,
+            period_caps=self._period_caps_by_task(declared),
+            service_tasks=frozenset(str(task_id) for task_id, entry in declared.items()
+                                    if getattr(entry, "mechanism", None) == MECHANISM_SERVICE_RL),
         )
         miner_weights = dict(ema)
 
@@ -273,13 +318,134 @@ class WeightOnlyValidator:
         return submitted
 
     @staticmethod
+    def _validated_service_archives(archives: list[dict], declared: Mapping[str, Any], *,
+                                    geometry: tuple[int, int] | None = None) -> list[dict]:
+        """Legacy archives untouched; each v2 service archive validated and reduced to the
+        fields replay pays from, with ``rewards_by_hotkey`` REPLACED by the recomputed map.
+
+        ``geometry`` is ``(picks_target, batch_slots)``, the protocol's unless a test gives one. The
+        task cap is the registry's, not the runtime self-check's 1.0. An unusable registry entry,
+        contract or cap raises ``SettlementError`` (a ``ValueError``; the caller abstains). An archive
+        that fails validation is DROPPED (pays nothing, logged at error, ruling R27): only that
+        (task, window); legacy archives never reach this handling. A window present twice for
+        one service task keeps ONE archive (the smallest canonical JSON, a rule every validator
+        applies alike) and logs it; they are never summed. An aborted archive pays nothing at all
+        (``_replay_ema`` skips it); a non-aborted archive with neither paid rows nor exploration
+        pays nothing and is logged. Aborted status is self-declared: no independent signal exists
+        in the archive stream today.
+        """
+        from reliquary.protocol.release_contract import canonical_json_bytes
+        from reliquary.protocol.service_contract import ServiceContract
+        from reliquary.services.settlement import SettlementError, service_archive_rewards
+        from reliquary.shared.task_registry import MECHANISM_SERVICE_RL
+
+        def is_service(archive) -> bool:
+            return getattr(declared.get(archive.get("task_id")), "mechanism", None) == MECHANISM_SERVICE_RL
+
+        if geometry is None:
+            from reliquary.services.runtime import protocol_slot_geometry
+            geometry = protocol_slot_geometry()
+        picks, slots = geometry
+        refusals = (ValueError, ArithmeticError, RecursionError, TypeError, KeyError, AttributeError)
+
+        def drop(archive, reason, exc: BaseException | None = None) -> None:
+            # R27: a bad v2 archive is treated as aborted (pays nothing); every validator sees the
+            # same archives, so the drop is deterministic and the unpaid remainder burns as today.
+            # A TypeError/KeyError/AttributeError (also as the cause of the SettlementError that wraps
+            # it) is a code-shaped fault, not a plain refusal: its traceback is logged in full.
+            cause = exc if isinstance(exc, (TypeError, KeyError, AttributeError)) else getattr(exc, "__cause__", None)
+            detail = cause if isinstance(cause, (TypeError, KeyError, AttributeError)) else None
+            logger.error("service task %s window %s dropped from weight replay: %s",
+                         archive.get("task_id"), archive.get("window_start"), reason,
+                         exc_info=detail)
+
+        chosen: dict[tuple[str, int], dict] = {}
+        poisoned: set[tuple[str, int]] = set()
+        out: list[dict] = []
+        seen_windows: dict[str, int] = {}
+        for archive in archives:
+            if not is_service(archive):       # legacy guard: never reaches the drop handling below
+                out.append(archive)
+                continue
+            seen_windows[str(archive.get("task_id"))] = seen_windows.get(str(archive.get("task_id")), 0) + 1
+            try:
+                key = (str(archive["task_id"]), int(archive["window_start"]))
+            except refusals as exc:
+                drop(archive, f"no usable window ({type(exc).__name__})", exc)
+                continue
+            if key in poisoned:
+                continue
+            if key not in chosen:
+                chosen[key] = archive
+                continue
+            # A real duplicate: the canonical JSON is needed only here, to keep the same one everywhere.
+            logger.warning("service task %s window %d has several archives; keeping one deterministically",
+                           key[0], key[1])
+            try:
+                rank, held = canonical_json_bytes(archive), canonical_json_bytes(chosen[key])
+            except refusals as exc:
+                # Either copy unrankable: drop the window whichever copy came first (order-free).
+                drop(archive, f"duplicate archives, one not canonical JSON ({type(exc).__name__})", exc)
+                del chosen[key]
+                poisoned.add(key)
+                continue
+            if rank < held:
+                chosen[key] = archive
+        contracts: dict[str, tuple[Any, float]] = {}
+        for (task_id, _), archive in chosen.items():
+            if task_id in contracts:
+                continue
+            entry = declared[task_id]
+            try:
+                contracts[task_id] = (ServiceContract.from_dict(entry.service_contract), float(entry.params["cap"]))
+            except (ValueError, TypeError, KeyError, AttributeError, ArithmeticError) as exc:
+                raise SettlementError("service task has no usable contract or cap") from exc
+            if not 0 < contracts[task_id][1] <= 1:     # NaN fails too; a registry fault, not an archive's
+                raise SettlementError("service task has no usable contract or cap")
+        for archive in chosen.values():
+            contract, cap = contracts[archive["task_id"]]
+            aborted = archive.get("window_status") == "aborted"
+            if aborted:
+                rewards = {}      # pays nothing: no recomputation (M1)
+            else:
+                try:
+                    rewards = service_archive_rewards(archive, contract, cap=cap, picks_target=picks,
+                                                      batch_slots=slots)
+                except refusals as exc:
+                    drop(archive, f"{type(exc).__name__}: {exc}", exc)
+                    continue
+                if not archive.get("batch") and not archive.get("service_exploration_by_environment"):
+                    logger.warning("service task %s window %s paid nothing (no batch, no exploration)",
+                                   archive["task_id"], archive["window_start"])
+            out.append({"task_id": archive["task_id"], "window_start": int(archive["window_start"]),
+                        "window_status": "aborted" if aborted else archive.get("window_status", "completed"),
+                        "rewards_by_hotkey": rewards})
+        kept = {str(row["task_id"]) for row in out if is_service(row)}
+        for task_id in sorted(set(seen_windows) - kept):
+            # Every window of the task dropped: the whole task pays nothing this epoch. One line, so the
+            # operator sees it without reading each drop above.
+            logger.error("service task %s: EVERY one of its %d archived v2 window(s) was dropped from weight "
+                         "replay; the task pays nothing this epoch", task_id, seen_windows[task_id])
+        return sorted(out, key=lambda r: (int(r["window_start"]), str(r.get("task_id", ""))))
+
+    @staticmethod
     async def _period_weights(declared: Mapping[str, Any], *, archives=None,
                               now: float | None = None,
-                              genesis: float | None = None,
-                              native_archive_reader=None) -> dict[str, dict[str, float]]:
+                              genesis: float | None = None) -> dict[str, dict[str, float]]:
         """Each period-settled task's weights at the current drand period: its
         archives that entered within the replay depth, decayed once per period
-        (design 2026-10-03). Window archives never hold these tasks' pay."""
+        (design 2026-10-03). Window archives never hold these tasks' pay.
+
+        Each archive is held to the cap it was settled under, never past the
+        highest cap the registry gave the task (``cp.pay_ceiling``), not to
+        the cap the task has now: the current cap governs the periods still to
+        be worked (the settler pays them under it), so lowering it, to 0 when
+        the job is finished, lets what was earned run out. Each archive is one
+        period's pay, and ``_replay_ema`` bounds the task at
+        ``CATCHUP_ENTRIES`` such caps on that ground. An archive moved to an
+        earlier entry (``replaces_entry_period``,
+        scripts/requeue_period_archives.py) hides the one it replaces, should
+        that one still be listed."""
         from reliquary.validator import corpus_periods as cp
 
         tasks = sorted(str(t) for t, e in (declared or {}).items() if cp.is_period_task(e))
@@ -294,34 +460,61 @@ class WeightOnlyValidator:
 
             genesis = _drand_genesis()
         current = cp.period_of(time.time() if now is None else now, genesis)
+        ceilings = WeightOnlyValidator._period_caps_by_task(declared)
         weights: dict[str, dict[str, float]] = {}
         for task_id in tasks:
-            from reliquary.shared.task_registry import MECHANISM_NATIVE_AFFINE_POINTS
-
-            if getattr(declared[task_id], "mechanism", None) == MECHANISM_NATIVE_AFFINE_POINTS:
-                if native_archive_reader is None:
-                    from reliquary.integrations.affine_competition import read_archive
-
-                    native_archive_reader = read_archive
-                document = await native_archive_reader(declared[task_id])
-                replayed = cp.replay([document] if document is not None else [], current)
-                if replayed:
-                    weights[task_id] = replayed
-                continue
-            keys = [(work, entry) for work, entry in await archives.list(task_id)
+            listed = await archives.list(task_id)
+            keys = [(work, entry) for work, entry in listed
                     if 0 <= current - entry <= cp.REPLAY_DEPTH]
+            # A key that may have been replaced: an earlier entry of its work
+            # period exists. Those earlier archives are read to find out.
+            entries_of: dict[int, list[int]] = {}
+            for work, entry in listed:
+                entries_of.setdefault(work, []).append(entry)
+            read: dict[tuple[int, int], Mapping] = {}
+
+            async def doc_of(work, entry):
+                if (work, entry) not in read:
+                    doc = await archives.read(task_id, work, entry)
+                    if doc is None:
+                        raise RuntimeError(f"period archive {task_id} {work}-{entry} "
+                                           "listed but unreadable")
+                    read[(work, entry)] = doc
+                return read[(work, entry)]
+
+            replaced: set[tuple[int, int]] = set()
+            for work, entry in keys:
+                for earlier in entries_of[work]:
+                    if earlier < entry:
+                        moved = (await doc_of(work, earlier)).get("replaces_entry_period")
+                        if moved is not None and int(moved) == entry:
+                            replaced.add((work, entry))
+            ceiling = ceilings.get(task_id)
             docs = []
             for work, entry in keys:
-                doc = await archives.read(task_id, work, entry)
-                if doc is None:
-                    raise RuntimeError(f"period archive {task_id} {work}-{entry} listed "
-                                       "but unreadable")
-                docs.append({"entry_period": entry,
-                             "rewards_by_hotkey": doc.get("rewards_by_hotkey") or {}})
+                if (work, entry) in replaced:
+                    continue
+                doc = await doc_of(work, entry)
+                rewards = {str(hk): float(v) for hk, v in
+                           (doc.get("rewards_by_hotkey") or {}).items()}
+                paid = sum(rewards.values())
+                cap = cp.archive_bound(doc.get("cap"), ceiling)
+                if cap is not None and paid > cap * (1 + 1e-9):
+                    logger.warning("period archive %s %d-%d pays %.4f over its cap %.4f; "
+                                   "scaled down", task_id, work, entry, paid, cap)
+                    rewards = ({} if cap <= 0 else
+                               {hk: v * cap / paid for hk, v in rewards.items()})
+                docs.append({"entry_period": entry, "rewards_by_hotkey": rewards})
             replayed = cp.replay(docs, current)
             if replayed:
                 weights[task_id] = replayed
         return weights
+
+    @staticmethod
+    def _is_corpus_task(entry) -> bool:
+        from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+
+        return getattr(entry, "mechanism", None) == MECHANISM_CORPUS_GENERATION
 
     @staticmethod
     def _merge_archives(by_task: Mapping[str, list[dict]]) -> list[dict]:
@@ -455,12 +648,32 @@ class WeightOnlyValidator:
         return caps
 
     @staticmethod
+    def _period_caps_by_task(declared: Mapping[str, Any]) -> dict[str, float]:
+        """Each period task's ``cp.pay_ceiling``: what one of its archives may
+        pay, kept after its cap is lowered so the earned tail is not cut."""
+        from reliquary.validator import corpus_periods as cp
+
+        ceilings: dict[str, float] = {}
+        for task_id, entry in (declared or {}).items():
+            if not cp.is_period_task(entry):
+                continue
+            try:
+                ceiling = cp.pay_ceiling(entry.params)
+            except (TypeError, ValueError):
+                continue
+            if ceiling is not None:
+                ceilings[str(task_id)] = ceiling
+        return ceilings
+
+    @staticmethod
     def _replay_ema(
         archives: list[dict],
         *,
         caps: Mapping[str, float] | None = None,
         floors: Mapping[str, tuple[float, float]] | None = None,
         periods: Mapping[str, Mapping[str, float]] | None = None,
+        period_caps: Mapping[str, float] | None = None,
+        service_tasks: frozenset[str] = frozenset(),
     ) -> dict[str, float]:
         """Replay the per-window emission distribution into an EMA.
 
@@ -469,6 +682,8 @@ class WeightOnlyValidator:
         ``select_batch_and_distribute`` at seal time. The dict's values are
         already in units of ``pool`` (≤ 1.0 per window), so they map
         directly onto the EMA fraction with no further normalization.
+        Explicit service tasks retain every positive fraction; historical
+        tasks keep their pruning threshold even when their floor is zero.
 
         The field is deliberately mechanism-agnostic. Historical archives may
         contain same-prompt/boundary splits; auction-v2 archives contain one
@@ -499,16 +714,20 @@ class WeightOnlyValidator:
         The global clamp at the end stays as a backstop against a
         misconfigured sum of shares exceeding one pool — it is logged, never
         silent, because it rescales every miner's emission.
+
+        A period task (``periods``) is bounded by ``period_caps`` (its
+        ``cp.pay_ceiling``) rather than its current cap when one is given: its
+        current cap only prices work still to come.
         """
         by_task: dict[str, list[dict]] = {}
         for record in archives:
             by_task.setdefault(record.get("task_id", ""), []).append(record)
 
         combined: dict[str, float] = {}
-        # Period-settled tasks arrive already replayed on their own clock, and
-        # are added to whatever window archives the same task still has (a job
-        # settled by window before its validator learnt periods): neither tail
-        # is dropped. The cap and the floor apply to the sum, as to every task.
+        # Period-settled tasks arrive already replayed on their own clock. A
+        # corpus task's window archives are no longer read (``submit_once``),
+        # so for one of them nothing is added here; a caller that passes both
+        # gets their sum. The cap and the floor apply to the sum, as to every task.
         periods = periods or {}
         for task_id in dict.fromkeys((*by_task, *periods)):
             ema = {}
@@ -521,12 +740,21 @@ class WeightOnlyValidator:
                 for hk in all_hotkeys:
                     fraction = rewards.get(hk, 0.0)
                     ema[hk] = alpha * fraction + (1 - alpha) * ema.get(hk, 0.0)
-                ema = {hk: v for hk, v in ema.items() if v > 1e-6}
+                cutoff = 0.0 if task_id in service_tasks else 1e-6
+                ema = {hk: v for hk, v in ema.items() if v > cutoff}
             for hk, v in (periods.get(task_id) or {}).items():
                 ema[hk] = ema.get(hk, 0.0) + float(v)
-            ema = WeightOnlyValidator._clamp_to_cap(
-                task_id, ema, None if caps is None else caps.get(task_id)
-            )
+            cap = None if caps is None else caps.get(task_id)
+            if task_id in periods and period_caps is not None and task_id in period_caps:
+                cap = period_caps[task_id]
+            if cap is not None and task_id in periods:
+                from reliquary.validator import corpus_periods as cp
+
+                # Archives hold one cap each and up to CATCHUP_ENTRIES enter in
+                # one period: a backlog paid back is that much at most, and
+                # comes out of what would otherwise burn.
+                cap = cap * cp.CATCHUP_ENTRIES
+            ema = WeightOnlyValidator._clamp_to_cap(task_id, ema, cap)
             if floors is not None:
                 start, threshold = floors.get(
                     task_id, (MIN_INCENTIVE_RAMP_START, MIN_INCENTIVE_SHARE)

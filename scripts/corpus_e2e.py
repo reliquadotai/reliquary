@@ -830,7 +830,8 @@ def orchestrate(args) -> int:
         total = sum(paid_tokens.values())
         checks["archive_pays_paid_records_by_tokens"] = set(rewards) == set(paid_tokens) and all(
             abs(rewards[h] - args.cap * t / total) < 1e-9 for h, t in paid_tokens.items())
-        checks["archive_sums_to_cap"] = abs(sum(rewards.values()) - args.cap) < 1e-9
+        checks["archive_sums_to_cap"] = abs(
+            sum(rewards.values()) - args.cap * summary["archive"].get("archives", 1)) < 1e-9
         checks["second_settlement_is_a_noop"] = summary["archive"]["second_settle"] is None
 
         summary["export"] = _export(state, env, job_id)
@@ -862,7 +863,8 @@ def two_job_checks(jobs: dict, miners: dict, verdicts: dict, archives: dict,
     for key in ("a", "b"):
         rewards = archives[key].get("rewards_by_hotkey") or {}
         checks[f"{key}_archive_pays_only_its_own_miners"] = set(rewards) == paid_by[key]
-        checks[f"{key}_archive_sums_to_its_cap"] = abs(sum(rewards.values()) - jobs[key]["cap"]) < 1e-9
+        checks[f"{key}_archive_sums_to_its_cap"] = abs(
+            sum(rewards.values()) - jobs[key]["cap"] * archives[key].get("archives", 1)) < 1e-9
         checks[f"{key}_second_settlement_is_a_noop"] = archives[key]["second_settle"] is None
     on_a = [v for v in verdicts["a"] if v["hotkey"] == cheat]
     on_b = [v for v in verdicts["b"] if v["hotkey"] == cheat]
@@ -1013,21 +1015,35 @@ def orchestrate_two_jobs(args) -> int:
 
 
 async def _settle_and_read(task_id: str, job_id: str, cap: float) -> dict:
+    """Settle the job by period, as the validator would once its periods have
+    closed (the clock is moved past them), and read back what was archived.
+    A run inside one period writes one archive; its ``rewards_by_hotkey`` is
+    that archive's. Spanning two, the rewards are the archives' sum and
+    ``archives`` says how many caps they hold."""
+    import time
+
+    from reliquary.infrastructure.corpus_period_store import R2PeriodArchives
     from reliquary.infrastructure.corpus_record_store import BucketRecordStore
-    from reliquary.infrastructure.storage import dataset_object_key, download_json
-    from reliquary.validator.corpus_settlement import CorpusSettler, R2Archives
+    from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler
+    from reliquary.validator.corpus_periods import PERIOD_SECONDS
 
     records = BucketRecordStore()
-    settler = CorpusSettler(task_id=task_id, job_id=job_id, cap=cap,
-                            records=records, archives=R2Archives())
-    window = await settler.settle_once()
-    if window is None:
+    archives = R2PeriodArchives()
+    later = time.time() + 2 * PERIOD_SECONDS
+    settler = CorpusPeriodSettler(task_id=task_id, job_id=job_id, cap=cap, records=records,
+                                  archives=archives, oldest_pending=lambda: None,
+                                  clock=lambda: later)
+    work = await settler.settle_once()
+    if work is None:
         return {"window": None, "second_settle": None, "settled_ids": []}
-    key = dataset_object_key(window, task_id)
-    archive = await download_json(key, strict=True)
-    return {"window": window, "key": key, "rewards_by_hotkey": archive["rewards_by_hotkey"],
-            "sum": sum(archive["rewards_by_hotkey"].values()),
-            "window_status": archive.get("window_status"),
+    rewards: dict[str, float] = {}
+    listed = await archives.list(task_id)
+    for w, e in listed:
+        doc = await archives.read(task_id, w, e)
+        for hotkey, value in (doc.get("rewards_by_hotkey") or {}).items():
+            rewards[hotkey] = rewards.get(hotkey, 0.0) + float(value)
+    return {"window": work, "archives": len(listed), "rewards_by_hotkey": rewards,
+            "sum": sum(rewards.values()),
             "second_settle": await settler.settle_once(),
             "settled_ids": (await records.read_settlement(job_id))[0].get("settled") or []}
 

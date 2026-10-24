@@ -1,0 +1,76 @@
+{
+  "synthetic_only": true,
+  "set_protocol": {
+    "schema": "reliquary/evaluation-protocol/v1",
+    "set": {
+      "set_id": "fixture-set",
+      "count": 1,
+      "prompts_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "grading_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    "source": {
+      "id": "fixture-é",
+      "kind": "catalog",
+      "split": "test",
+      "environment_manifest_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "taskset": {
+        "args_sha256": "f0f2c5f4f921d7032759bb0bfb80c0f6cc50a58b174076feeb5f10e4f6b4aa4a"
+      },
+      "data": {
+        "test.jsonl": "4444444444444444444444444444444444444444444444444444444444444444"
+      },
+      "licenses": [
+        {
+          "id": "fixture",
+          "sha256": "5555555555555555555555555555555555555555555555555555555555555555"
+        }
+      ],
+      "grader_sha256": "6666666666666666666666666666666666666666666666666666666666666666"
+    },
+    "disjointness": {
+      "disjoint": true,
+      "evidence_sha256": "7777777777777777777777777777777777777777777777777777777777777777"
+    },
+    "harness": {
+      "id": "single-turn",
+      "sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+      "max_turns": 1
+    }
+  },
+  "set_protocol_json": "{\"schema\":\"reliquary/evaluation-protocol/v1\",\"set\":{\"set_id\":\"fixture-set\",\"count\":1.0,\"prompts_sha256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"grading_sha256\":\"2222222222222222222222222222222222222222222222222222222222222222\"},\"source\":{\"id\":\"fixture-é\",\"kind\":\"catalog\",\"split\":\"test\",\"environment_manifest_sha256\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"taskset\":{\"args_sha256\":\"f0f2c5f4f921d7032759bb0bfb80c0f6cc50a58b174076feeb5f10e4f6b4aa4a\"},\"data\":{\"test.jsonl\":\"4444444444444444444444444444444444444444444444444444444444444444\"},\"licenses\":[{\"id\":\"fixture\",\"sha256\":\"5555555555555555555555555555555555555555555555555555555555555555\"}],\"grader_sha256\":\"6666666666666666666666666666666666666666666666666666666666666666\"},\"disjointness\":{\"disjoint\":true,\"evidence_sha256\":\"7777777777777777777777777777777777777777777777777777777777777777\"},\"harness\":{\"id\":\"single-turn\",\"sha256\":\"8888888888888888888888888888888888888888888888888888888888888888\",\"max_turns\":1e0}}",
+  "set_protocol_sha256": "8ee19d48f127ef043bfd07d5c4dde063c5022a42b9cab71b9b5ab0559726ba03",
+  "protocol": {
+    "schema": "reliquary/evaluation-request/v1",
+    "sets": [
+      {
+        "set_id": "fixture-set",
+        "env": "math",
+        "problems": 1,
+        "samples": 1
+      }
+    ],
+    "protocol_bindings": {
+      "fixture-set": "8ee19d48f127ef043bfd07d5c4dde063c5022a42b9cab71b9b5ab0559726ba03"
+    },
+    "sampling": {
+      "temperature": 1,
+      "top_p": 1e-7,
+      "top_k": 0,
+      "seed": 0
+    },
+    "thinking": false,
+    "max_new_tokens": 512,
+    "harness": "single-turn",
+    "max_turns": 1,
+    "max_episode_tokens": 8192,
+    "episode_timeout_seconds": 300,
+    "interaction": "single_turn"
+  },
+  "protocol_json": "{\"episode_timeout_seconds\":300,\"harness\":\"single-turn\",\"interaction\":\"single_turn\",\"max_episode_tokens\":8192,\"max_new_tokens\":512,\"max_turns\":1,\"protocol_bindings\":{\"fixture-set\":\"8ee19d48f127ef043bfd07d5c4dde063c5022a42b9cab71b9b5ab0559726ba03\"},\"sampling\":{\"seed\":0,\"temperature\":1,\"top_k\":0,\"top_p\":1e-7},\"schema\":\"reliquary/evaluation-request/v1\",\"sets\":[{\"env\":\"math\",\"problems\":1,\"samples\":1,\"set_id\":\"fixture-set\"}],\"thinking\":false}",
+  "protocol_sha256": "0496e81550a43928a5f611a3a5c1f420ba0a28eac5bd4cab99b7d9ac4d993c11",
+  "numeric_input": {
+    "whole": 1,
+    "negative_zero": -0,
+    "exponent": 1e-7
+  }
+}

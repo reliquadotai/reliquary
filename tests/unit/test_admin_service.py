@@ -31,6 +31,12 @@ class _Records:
     def __init__(self):
         self.subs, self.verdicts, self.settlement = {}, {}, {}
 
+    async def read_job(self, job_id):
+        return await job_store.read_job(job_id)
+
+    async def read_ledgers(self, job_id):
+        return await job_store.read_ledgers(job_id)
+
     async def list_submission_ids(self, job_id):
         return sorted(self.subs)
 
@@ -58,6 +64,15 @@ def bucket(monkeypatch):
 @pytest.fixture
 def admin(bucket, registry, monkeypatch, tmp_path):  # noqa: F811
     from reliquary.corpus.delivery import LocalDirectorySink
+    from reliquary.infrastructure import task_registry_store
+
+    monkeypatch.setattr(task_registry_store, "get_s3_client", lambda **kw: bucket)
+
+    async def read_registry(*, strict=True, **kw):
+        admissions, _ = await task_registry_store._read_admissions(**kw)
+        return task_registry_store._overlay_admissions(registry["entries"], admissions), registry["etag"]
+
+    monkeypatch.setattr(task_registry_store, "read_registry", read_registry)
 
     stub_source_rows(monkeypatch, SOURCE, 100_000)
     registry["entries"] = {"default": _rl_entry("default", 0.5)}
@@ -97,6 +112,26 @@ def _job(job_id="math-a", cap=0.1, **kw):
 
 def test_an_unsigned_request_is_refused(admin):
     assert admin.client.get("/admin/v1/executors/pod-1").status_code == 401
+
+
+def test_signed_pause_resume_is_reversible_and_retirement_cannot_resume(admin):
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    before = admin("GET", "/admin/v1/tasks/math-a").json()["task"]
+    path = "/admin/v1/tasks/math-a/admission"
+    assert admin.client.post(path, json={"admission": "paused"}).status_code == 401
+    assert admin("GET", "/admin/v1/task-catalog").json()["admission_controls_supported"] is True
+    for admission in ("paused", "paused", "open"):
+        response = admin("POST", path, {"admission": admission})
+        assert response.status_code == 200
+        assert response.json() == {"task_id": "math-a", "status": "active", "admission": admission}
+        after = admin("GET", "/admin/v1/tasks/math-a").json()["task"]
+        assert after["admission"] == admission
+        assert after["profile_sha256"] == before["profile_sha256"]
+        assert {k: v for k, v in after.items() if k != "admission"} == {
+            k: v for k, v in before.items() if k != "admission"}
+    assert admin("POST", path, {"admission": "open", "cap": 0}).status_code == 422
+    assert admin("POST", "/admin/v1/tasks/math-a/retire", {}).status_code == 200
+    assert admin("POST", path, {"admission": "open"}).status_code == 409
 
 
 def test_a_replayed_request_is_refused(admin):
@@ -157,6 +192,219 @@ def test_create_job_is_idempotent_on_the_job_id(admin):
     assert other.status_code == 409
 
 
+def test_signed_catalog_and_scoped_task_contracts(admin):
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    assert admin.client.get("/admin/v1/task-catalog").status_code == 401
+    catalog = admin("GET", "/admin/v1/task-catalog").json()
+    assert catalog["schema"] == "subnet-task-catalog/v1"
+    assert catalog["zero_cap_supported"] is True
+    assert catalog["models"][0] == {"model": MODEL, **MODELS[MODEL]}
+    source = next(e for e in catalog["environments"] if e["environment"] == SOURCE)
+    assert source["contract_sha256"] == canonical_sha256(source["contract"])
+    assert source["legacy_generation_supported"] is True
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    tasks = admin("GET", "/admin/v1/tasks").json()["tasks"]
+    assert [e["task_id"] for e in tasks] == ["math-a"]
+    task = admin("GET", "/admin/v1/tasks/math-a").json()["task"]
+    assert task["profile_sha256"] == canonical_sha256(task["contract"])
+    assert admin("GET", "/admin/v1/tasks/default").status_code == 409
+
+
+def test_task_catalog_keeps_descriptor_but_withholds_an_absent_external_package(admin, monkeypatch):
+    import importlib.metadata
+    from reliquary.protocol.environment_catalog import environment_body_contract
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    environment = "reliquary_science_v1"
+    distribution = importlib.metadata.distribution
+
+    def installed(name):
+        if name == "reliquary-science":
+            raise importlib.metadata.PackageNotFoundError(name)
+        return distribution(name)
+
+    monkeypatch.setattr(importlib.metadata, "distribution", installed)
+    before = dict(admin.bucket.objects)
+    reply = admin("GET", "/admin/v1/task-catalog")
+    assert reply.status_code == 200, reply.text
+    sources = {row["environment"]: row for row in reply.json()["environments"]}
+    source = sources[environment]
+    assert source["legacy_generation_supported"] is False
+    assert source["qualified_generation_supported"] is False
+    assert source["contract"] == environment_body_contract(environment)
+    assert source["contract_sha256"] == canonical_sha256(source["contract"])
+    assert sources[SOURCE]["legacy_generation_supported"] is True
+    assert admin.bucket.objects == before
+
+
+@pytest.mark.parametrize("error", [None, ValueError("artifact digest mismatch"), PermissionError(),
+                                   TypeError("artifact distribution must be an object")])
+def test_task_catalog_support_depends_on_verified_external_artifact(admin, monkeypatch, error):
+    from reliquary.environment.agentic import external
+    from reliquary.environment.registry import ENVIRONMENT_SPECS
+
+    environment = "reliquary_logic_v2"
+    checked = []
+
+    def verify(spec):
+        checked.append(spec)
+        if spec.name == environment and error is not None:
+            raise error
+        return {}
+
+    monkeypatch.setattr(external, "verify_external_artifact", verify)
+    reply = admin("GET", "/admin/v1/task-catalog")
+    assert reply.status_code == 200, reply.text
+    sources = {row["environment"]: row for row in reply.json()["environments"]}
+    assert ENVIRONMENT_SPECS[environment] in checked
+    assert all(spec.interaction_mode == "single_turn" for spec in checked)
+    assert sources[environment]["legacy_generation_supported"] is (error is None)
+    assert sources[environment]["qualified_generation_supported"] is (error is None)
+    assert sources[SOURCE]["legacy_generation_supported"] is True
+    error = ValueError("artifact digest mismatch") if error is None else None
+    reply = admin("GET", "/admin/v1/task-catalog")
+    assert reply.status_code == 200, reply.text
+    source = next(row for row in reply.json()["environments"] if row["environment"] == environment)
+    assert source["legacy_generation_supported"] is (error is None)
+    assert source["qualified_generation_supported"] is (error is None)
+
+
+def test_reviewed_zero_cap_manifest_is_read_only_then_created_and_replayed(admin):
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    body = _job(cap=0.0, prompt_count=2, samples_per_prompt=1, max_new_tokens=128)
+    before = dict(admin.bucket.objects)
+    review = admin("POST", "/admin/v1/jobs/validate", body)
+    assert review.status_code == 200, review.text
+    contract = review.json()
+    assert admin.bucket.objects == before
+    assert list(admin.registry["entries"]) == ["default"]
+    assert contract["manifest_sha256"] == canonical_sha256(contract["manifest"])
+    assert contract["profile_sha256"] == canonical_sha256(contract["task"]["contract"])
+    pinned = {**body, "manifest_sha256": contract["manifest_sha256"],
+              "profile_sha256": contract["profile_sha256"]}
+    assert admin("POST", "/admin/v1/jobs", pinned).status_code == 201
+    assert admin("POST", "/admin/v1/jobs", pinned).status_code == 200
+    entry = admin.registry["entries"]["math-a"]
+    assert entry.params["cap"] == entry.params["floor"] == 0.0
+    assert entry.params["min_incentive_share"] == 0.0
+    status = admin("GET", "/admin/v1/jobs/math-a/status").json()
+    assert status["manifest"] == contract["manifest"]
+    assert status["manifest_sha256"] == contract["manifest_sha256"]
+    assert status["profile_sha256"] == contract["profile_sha256"]
+
+
+def test_operator_generation_review_create_and_replay_keep_pinned_scoped_contract(admin):
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    job_id = "math-gen-ops-01234567-89ab-4cde-8fab-0123456789ab"
+    body = _job(job_id, task_id=job_id, cap=0.0, prompt_count=2,
+                samples_per_prompt=1, max_new_tokens=32)
+    before = dict(admin.bucket.objects)
+    for path in ("/admin/v1/jobs/validate", "/admin/v1/jobs"):
+        assert admin.client.post(path, json=body).status_code == 401
+    review = admin("POST", "/admin/v1/jobs/validate", body)
+    assert review.status_code == 200, review.text
+    contract = review.json()
+    assert admin.bucket.objects == before
+    assert list(admin.registry["entries"]) == ["default"]
+    assert contract["manifest"]["submit"] == "scoped"
+    assert contract["manifest"]["checkpoint_repo"] == MODEL
+    assert contract["manifest"]["checkpoint_revision"] == MODELS[MODEL]["revision"]
+    assert contract["manifest"]["checkpoint_sha256"] == MODELS[MODEL]["checkpoint_sha256"]
+    assert contract["manifest_sha256"] == canonical_sha256(contract["manifest"])
+    pinned = {**body, "manifest_sha256": contract["manifest_sha256"],
+              "profile_sha256": contract["profile_sha256"]}
+    assert admin("POST", "/admin/v1/jobs", pinned).status_code == 201
+    assert admin("POST", "/admin/v1/jobs", pinned).status_code == 200
+    stored = asyncio.run(job_store.read_job(job_id))[0]
+    assert stored.to_contract() == contract["manifest"]
+    assert stored.submit == "scoped"
+    assert admin.registry["entries"][job_id].params["cap"] == 0.0
+    # Operator work never writes a commercial order or qualification record.
+    assert not any("eval" in key for key in admin.bucket.objects)
+
+
+@pytest.mark.parametrize("path", ["/admin/v1/jobs/validate", "/admin/v1/jobs"])
+@pytest.mark.parametrize("change", [
+    {"task_id": None},
+    {"task_id": "math-gen-other"},
+    {"task_id": "math-gen-ops-01234567-89ab-4cde-8fab-0123456789ac"},
+    {"job_id": "math-gen-other"},
+    {"job_id": "math-gen-ops-fresh", "task_id": "math-gen-ops-fresh"},
+    {"job_id": "math-gen-ops-01234567-89ab-1cde-8fab-0123456789ab",
+     "task_id": "math-gen-ops-01234567-89ab-1cde-8fab-0123456789ab"},
+    {"model": "org/Unknown"},
+    {"sampling": {"temperature": 1.0}},
+    {"qualification_id": "math-q1"},
+    {"cap": None},
+])
+def test_operator_generation_refuses_other_ids_or_unpinned_fields_before_write(admin, path, change):
+    job_id = "math-gen-ops-01234567-89ab-4cde-8fab-0123456789ab"
+    body = _job(job_id, task_id=job_id, cap=0.0, prompt_count=2,
+                samples_per_prompt=1, max_new_tokens=32)
+    before = dict(admin.bucket.objects)
+    response = admin("POST", path, {**body, **change})
+    assert response.status_code == 422, response.text
+    assert admin.bucket.objects == before
+    assert list(admin.registry["entries"]) == ["default"]
+
+
+def test_review_hash_changes_are_refused_before_a_write(admin):
+    body = _job(manifest_sha256="0" * 64)
+    before = dict(admin.bucket.objects)
+    response = admin("POST", "/admin/v1/jobs", body)
+    assert response.status_code == 409
+    assert response.json()["detail"] == "reviewed_contract_changed"
+    assert admin.bucket.objects == before
+    assert list(admin.registry["entries"]) == ["default"]
+
+
+def test_zero_cap_review_and_create_do_not_scan_inherited_retired_jobs(admin, monkeypatch):
+    from reliquary.corpus.delivery import LocalDirectorySink
+    from reliquary.validator import corpus_job_status
+
+    assert admin("POST", "/admin/v1/jobs", _job("math-old", cap=0.2)).status_code == 201
+    assert admin("POST", "/admin/v1/tasks/math-old/retire", {}).status_code == 200
+    before = dict(admin.registry["entries"])
+
+    async def forbidden_read(*args, **kwargs):
+        raise AssertionError("zero-cap operations must not read historical job counts")
+
+    monkeypatch.setattr(corpus_job_status, "stored_job_counts", forbidden_read)
+    app = create_admin_app(secret=SECRET, pool_max=0.0, models=MODELS, records=admin.records,
+                           task_prefix="math-", deliveries=LocalDirectorySink(admin.platform))
+    body = _job("math-zero", cap=0.0, prompt_count=2, samples_per_prompt=1, max_new_tokens=128)
+    with TestClient(app) as client:
+        def signed(path, body):
+            data = json.dumps(body).encode()
+            stamp, nonce = str(int(time.time())), secrets.token_hex(16)
+            return client.post(path, content=data, headers={
+                TIMESTAMP_HEADER: stamp, NONCE_HEADER: nonce,
+                SIGNATURE_HEADER: sign_request(SECRET, stamp, nonce, "POST", path, data),
+                "content-type": "application/json"})
+
+        review = signed("/admin/v1/jobs/validate", body)
+        assert review.status_code == 200, review.text
+        pins = review.json()
+        created = signed("/admin/v1/jobs", {**body,
+            "manifest_sha256": pins["manifest_sha256"], "profile_sha256": pins["profile_sha256"]})
+        assert created.status_code == 201, created.text
+        assert signed("/admin/v1/tasks/math-zero/cap", {"cap": 0.0}).status_code == 200
+    assert admin.registry["entries"]["default"] == before["default"]
+    assert admin.registry["entries"]["math-zero"].params["cap"] == 0.0
+    assert admin.registry["entries"]["math-old"] == before["math-old"]
+
+
+def test_reusing_a_job_id_cannot_silently_change_the_emission_cap(admin):
+    assert admin("POST", "/admin/v1/jobs", _job(cap=0.0)).status_code == 201
+    response = admin("POST", "/admin/v1/jobs", _job(cap=0.01))
+    assert response.status_code == 409
+    assert response.json()["detail"] == "task_exists_with_another_contract"
+    assert admin.registry["entries"]["math-a"].params["cap"] == 0.0
+
+
 def test_create_job_resumes_a_declaration_whose_registry_write_was_lost(admin):
     assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
     del admin.registry["entries"]["math-a"]
@@ -177,6 +425,10 @@ def test_the_corpus_pool_limit_holds_and_keeps_the_manifest(admin):
     assert "math-b" not in admin.registry["entries"]
     # Never deleted: a racing call's task may name it; an orphan is harmless.
     assert "reliquary/corpus/jobs/math-b.json" in admin.bucket.objects
+    status = admin("GET", "/admin/v1/jobs/math-b/status").json()
+    assert len(status["manifest_sha256"]) == 64
+    assert status["profile_sha256"] is None
+    assert status["tasks"] == status["task_contracts"] == []
 
 
 def test_the_sum_of_active_caps_stays_within_one(admin):
@@ -245,12 +497,20 @@ def test_register_read_and_revoke_an_executor(admin):
 # --------------------------------------------------------------------------
 
 
-def test_a_delivery_runs_beside_the_request_and_returns_its_keys(admin):
+def test_a_delivery_runs_beside_the_request_and_returns_its_keys(admin, monkeypatch):
     assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    from reliquary.validator import corpus_service
+
+    class _Environment:
+        def get_problem(self, index):
+            return {"prompt": f"canonical question {index}?"}
+
+    monkeypatch.setattr(corpus_service, "prompt_job_for_spec",
+                        lambda job: corpus_service.SingleTurnPromptJob(job, _Environment()))
     sid = "1" * 64
     admin.records.verdicts = {sid: {"passed": True}}
     admin.records.subs = {sid: {"prompt_index": 3, "rendered_prompt": "q",
-                                "completions": [{"text": "a", "tokens": [1]}]}}
+                                "completions": [{"text": "a", "tokens": [1, 151645]}]}}
     admin.records.settlement = {"settled": [sid], "pending": None}
     first = admin("POST", "/admin/v1/jobs/math-a/deliveries", {"delivery_id": "order-1"})
     assert first.status_code == 202 and first.json()["state"] == "running"
@@ -264,6 +524,10 @@ def test_a_delivery_runs_beside_the_request_and_returns_its_keys(admin):
     assert done is not None and done["state"] == "done" and done["rows"] == 1
     assert "deliveries/order-1/manifest.json" in done["keys"]
     assert (admin.platform / "deliveries" / "order-1" / "report.json").exists()
+    assert "deliveries/order-1/instruction-00000.jsonl" in done["keys"]
+    instruction = admin.platform / "deliveries" / "order-1" / "instruction-00000.jsonl"
+    assert json.loads(instruction.read_text()) == {"prompt": "canonical question 3?",
+                                                 "response": "a"}
     # Done stays done, from the bucket.
     again = admin("POST", "/admin/v1/jobs/math-a/deliveries", {"delivery_id": "order-1"})
     assert again.status_code == 200 and again.json()["keys"] == done["keys"]
@@ -271,6 +535,99 @@ def test_a_delivery_runs_beside_the_request_and_returns_its_keys(admin):
 
 def test_a_delivery_of_an_unknown_job_is_404(admin):
     assert admin("POST", "/admin/v1/jobs/math-ghost/deliveries", {}).status_code == 404
+
+
+def test_a_stored_delivery_cannot_be_returned_for_another_job(admin):
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    root = admin.platform / "deliveries" / "order-existing"
+    root.mkdir(parents=True)
+    (root / "manifest.json").write_text(json.dumps({"job_id": "math-other", "keys": [],
+                                                   "rows": 0}))
+    response = admin("POST", "/admin/v1/jobs/math-a/deliveries",
+                     {"delivery_id": "order-existing"})
+    assert response.status_code == 409
+    assert response.json()["detail"] == "delivery_belongs_to_another_job"
+
+
+def test_cached_delivery_retry_checks_the_immutable_job_contract(admin, monkeypatch):
+    from reliquary.corpus.delivery import LocalDirectorySink, export_delivery
+    from reliquary.corpus.job import parse_job
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    job = parse_job(admin("GET", "/admin/v1/jobs/math-a/status").json()["manifest"])
+    pin = canonical_sha256(job.to_contract())
+    root = admin.platform / "deliveries" / "order-existing"
+    root.mkdir(parents=True)
+    sink = LocalDirectorySink(admin.platform)
+    for required, fields, accepted in (
+        (False, {"job_manifest_sha256": pin}, True),
+        (False, {"job_manifest_sha256": "b" * 64}, False),
+        (False, {}, True),  # Historical storage exports predate the pin.
+        (True, {"job_manifest_sha256": pin}, True),
+        (True, {}, False),  # HTTP delivery recovery always requires it.
+    ):
+        monkeypatch.setattr(LocalDirectorySink, "requires_job_contract_pin", required,
+                            raising=False)
+        manifest = {"job_id": job.job_id, "keys": [], "rows": 1, **fields}
+        (root / "manifest.json").write_text(json.dumps(manifest))
+        response = admin("POST", "/admin/v1/jobs/math-a/deliveries",
+                         {"delivery_id": "order-existing"})
+        retry = export_delivery(job=job, records=None, sink=sink,
+                                delivery_id="order-existing")
+        if accepted:
+            assert response.status_code == 200 and response.json()["state"] == "done"
+            assert asyncio.run(retry) == manifest
+        else:
+            assert response.status_code == 409
+            assert response.json()["detail"] == "delivery_belongs_to_another_contract"
+            with pytest.raises(ValueError, match="another job contract"):
+                asyncio.run(retry)
+
+
+def test_a_bounded_delivery_sink_refuses_unsupported_namespaces_and_evaluation(admin, monkeypatch):
+    from reliquary.corpus.delivery import LocalDirectorySink
+
+    monkeypatch.setattr(LocalDirectorySink, "accepts_delivery_id", lambda self, value: False,
+                        raising=False)
+    monkeypatch.setattr(LocalDirectorySink, "evaluation_supported", False, raising=False)
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    refused = admin("POST", "/admin/v1/jobs/math-a/deliveries", {"delivery_id": "order-other"})
+    assert refused.status_code == 503
+    assert refused.json()["detail"] == "delivery_namespace_not_configured"
+    grade = admin("POST", "/admin/v1/evaluations/math-a/grade",
+                  {"source": "job", "job_id": "math-a", "set_ids": ["math"],
+                   "problems_per_set": {"math": 1}, "samples_per_set": {"math": 1}})
+    assert grade.status_code == 503
+    assert admin("GET", "/admin/v1/evaluations/math-a/files/report.json").status_code == 503
+
+
+def test_a_missing_raw_source_preserves_the_original_admin_delivery(admin, monkeypatch):
+    from reliquary.validator import corpus_service
+
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+
+    def missing(job):
+        raise corpus_service.CorpusPromptSourceError("fixture source not installed")
+
+    monkeypatch.setattr(corpus_service, "prompt_job_for_spec", missing)
+    sid = "1" * 64
+    admin.records.verdicts = {sid: {"passed": True}}
+    admin.records.subs = {sid: {"prompt_index": 3, "rendered_prompt": "q",
+                                "completions": [{"text": "a", "tokens": [1, 151645]}]}}
+    admin.records.settlement = {"settled": [sid], "pending": None}
+    path, body = "/admin/v1/jobs/math-a/deliveries", {"delivery_id": "order-raw-missing"}
+    assert admin("POST", path, body).status_code == 202
+    for _ in range(100):
+        response = admin("POST", path, body)
+        if response.status_code == 200:
+            break
+        time.sleep(0.02)
+    assert response.status_code == 200 and response.json()["rows"] == 1
+    root = admin.platform / "deliveries" / "order-raw-missing"
+    manifest = json.loads((root / "manifest.json").read_text())
+    assert manifest["shards"] and manifest["instruction_shards"] == []
+    assert manifest["instruction"]["omitted"] == {"prompt_source_unavailable": 1}
 
 
 def test_a_bad_pool_is_refused_at_build():
@@ -287,7 +644,8 @@ def test_admin_serve_refuses_to_start_unconfigured_and_serves_once_configured(
     from reliquary.cli.main import app
 
     for name in ("RELIQUARY_ADMIN_SECRET", "RELIQUARY_ADMIN_POOL_MAX", "RELIQUARY_ADMIN_MODELS",
-                 "RELIQUARY_PLATFORM_BUCKET"):
+                 "RELIQUARY_PLATFORM_BUCKET", "RELIQUARY_PLATFORM_DELIVERY_URL",
+                 "RELIQUARY_PLATFORM_DELIVERY_SECRET"):
         monkeypatch.delenv(name, raising=False)
     served = []
     monkeypatch.setattr(uvicorn, "run", lambda application, **kw: served.append((application, kw)))
@@ -303,6 +661,26 @@ def test_admin_serve_refuses_to_start_unconfigured_and_serves_once_configured(
     result = CliRunner().invoke(app, ["admin", "serve", "--port", "9999"])
     assert result.exit_code == 0, result.output
     assert served and served[0][1]["port"] == 9999
+
+
+def test_admin_environment_uses_the_bounded_http_delivery_sink(tmp_path, monkeypatch):
+    from reliquary.cli import main
+    from reliquary.corpus.delivery import HTTPDeliverySink
+
+    models = tmp_path / "models.json"
+    models.write_text(json.dumps(MODELS))
+    monkeypatch.setenv("RELIQUARY_ADMIN_SECRET", "s" * 32)
+    monkeypatch.setenv("RELIQUARY_ADMIN_MODELS", str(models))
+    monkeypatch.setenv("RELIQUARY_ADMIN_POOL_MAX", "0")
+    monkeypatch.setenv("RELIQUARY_PLATFORM_DELIVERY_URL", "https://example.test")
+    monkeypatch.setenv("RELIQUARY_PLATFORM_DELIVERY_SECRET", "s" * 32)
+    monkeypatch.setattr("reliquary.admin.service.create_admin_app", lambda **kwargs: kwargs)
+    configured = main.build_admin_app_from_environment()
+    assert isinstance(configured["deliveries"], HTTPDeliverySink)
+    assert configured["deliveries"].max_file_bytes == 64 * 1024 * 1024
+    monkeypatch.delenv("RELIQUARY_PLATFORM_DELIVERY_SECRET")
+    with pytest.raises(ValueError, match="secret"):
+        main.build_admin_app_from_environment()
 
 
 
@@ -473,7 +851,36 @@ def test_an_operator_catalog_job_is_declared_byte_identically(admin):
     assert admin("POST", "/admin/v1/jobs", _job(thinking=True)).status_code == 201
     entry = admin.registry["entries"]["math-a"]
     manifest = json.loads(admin.bucket.objects["reliquary/corpus/jobs/math-a.json"][0])
-    document = {"manifest": manifest, "contract": entry.contract, "params": entry.params}
+    # Every corpus task is now paid by period: the settlement is the one
+    # param added since the pin; manifest, contract and the rest are unchanged.
+    assert entry.params["settlement"] == "period-ema-v1"
+    params = {k: v for k, v in entry.params.items() if k != "settlement"}
+    document = {"manifest": manifest, "contract": entry.contract, "params": params}
     digest = hashlib.sha256(json.dumps(document, sort_keys=True,
                                        separators=(",", ":")).encode()).hexdigest()
     assert digest == CATALOG_JOB_GOLDEN
+
+
+def test_keep_rejected_without_a_filter_to_apply_is_refused(admin):
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    sid = "1" * 64
+    admin.records.verdicts = {sid: {"passed": True}}
+    admin.records.subs = {sid: {"prompt_index": 3, "rendered_prompt": "q",
+                                "completions": [{"text": "a", "tokens": [1, 151645]}]}}
+    admin.records.settlement = {"settled": [sid], "pending": None}
+    response = admin("POST", "/admin/v1/jobs/math-a/deliveries",
+                     {"delivery_id": "order-keep", "keep_rejected": True})
+    assert response.status_code == 422
+    assert "keep_rejected" in response.json()["detail"]
+    assert not (admin.platform / "deliveries" / "order-keep").exists()
+
+
+def test_a_delivery_dedupes_against_a_known_job_in_scope(admin):
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    path = "/admin/v1/jobs/math-a/deliveries"
+    for body, detail in (({"dedupe_against": ["math-a"]}, "dedupe_against_itself"),
+                         ({"dedupe_against": ["math-ghost"]}, "dedupe_against_unknown"),
+                         ({"dedupe_against": ["other-a"]}, "outside_admin_scope")):
+        response = admin("POST", path, {"delivery_id": "order-dedupe", **body})
+        assert response.status_code in (409, 422) and detail in response.json()["detail"]
+    assert not (admin.platform / "deliveries" / "order-dedupe").exists()

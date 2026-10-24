@@ -21,6 +21,7 @@ from reliquary.corpus.checks import (
     check_token_budget,
 )
 from reliquary.corpus.job import PROMPT_ORDER_MINER_WALK, JobSpec
+from reliquary.corpus.signed_reasons import REASON_SANDBOX_SESSION_REUSED
 from reliquary.corpus.slots import SlotLedger
 from reliquary.corpus.walk import CursorLedger, job_walk_index
 
@@ -49,6 +50,7 @@ def admit(
     proof_counts: Sequence[int] | None = None,
     proof_chunk_tokens: int | None = None,
     episode_checked: bool = False,
+    session_key: str | None = None,
 ) -> Verdict:
     """Decide one submission, consuming a slot and a cursor step when earned.
 
@@ -67,6 +69,11 @@ def admit(
     An episode job's trajectory is checked by the caller (``checks.check_turn_*``,
     the intake's parse) before admission; ``episode_checked`` says so, and the
     single-completion checks do not apply to it.
+
+    ``session_key`` (signed-sandbox trajectories): the session's seen key
+    (``signed_reasons.session_seen_key``). The caller adds it to the turn's digests,
+    so an accept records it in the same compare-and-swap that consumes the slot;
+    here a key already seen is refused, so a session pays once.
     """
     # The three sequences describe the same completions, so a disagreement in
     # length means some completion would be paid for without ever being checked.
@@ -103,6 +110,9 @@ def admit(
             # The per-turn checks live in the intake; admitting without them
             # would pay a trajectory nothing has looked at.
             return Verdict(False, "malformed_submission", detail={"episode_checked": False})
+        if session_key is not None and session_key in seen:
+            return Verdict(False, REASON_SANDBOX_SESSION_REUSED,
+                           detail={"why": "this sandbox session was already paid"})
         checks = (lambda: check_duplicates(digests, seen),)
     else:
         checks = (
@@ -126,7 +136,16 @@ def admit(
     for check in checks:
         result = check()
         if not result.ok:
-            return Verdict(False, result.reason or "", detail=dict(result.detail))
+            detail = dict(result.detail)
+            if _repeats_itself(job, result.reason, detail, seen):
+                # A prompt the model answers one way only can never take n
+                # distinct completions, so it never fills and no skip may cross
+                # it: holding the cursor here would lock the walk for good. The
+                # miner did answer the prompt its walk named, so it steps on
+                # unpaid, exactly as on a full prompt.
+                _advance(job, cursors, hotkey)
+                detail["within_submission"] = True
+            return Verdict(False, result.reason or "", detail=detail)
 
     # Past this point the miner really did answer the prompt its walk named,
     # so the cursor moves whether or not a slot was still free. This prices a
@@ -259,6 +278,19 @@ def out_of_range_detail(job: JobSpec, prompt_index: int) -> dict[str, int]:
     if job.prompt_start:
         detail = {"prompt_start": job.prompt_start, **detail}
     return detail
+
+
+def _repeats_itself(
+    job: JobSpec, reason: str | None, detail: dict[str, Any], seen: AbstractSet[str]
+) -> bool:
+    """A single-completion walk submission refused only because two of its own
+    completions are the same text, not because it copies earlier work."""
+    return (
+        reason == "hash_duplicate"
+        and job.prompt_order == PROMPT_ORDER_MINER_WALK
+        and job.episode is None
+        and detail.get("digest") not in seen
+    )
 
 
 def _advance(job: JobSpec, cursors: CursorLedger, hotkey: str) -> None:

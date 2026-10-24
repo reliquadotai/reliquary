@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import tempfile
 from typing import Any, Callable
 import uuid
 
@@ -28,27 +29,48 @@ from reliquary.shared.checkpoint_identity import (
     require_immutable_checkpoint_revision,
 )
 from reliquary.shared.strict_json import strict_json_loads
+from reliquary.shared.checkpoint_namespace import (
+    CheckpointNamespace, active_checkpoint_namespace,
+    LEGACY_CANDIDATE_MANIFEST_KEY, LEGACY_CHECKPOINT_PREFIX,
+)
 from reliquary.trainer.storage_guard import HfStorageGuard
 from reliquary.validator.control import write_json
 
 logger = logging.getLogger(__name__)
-# Knowingly NOT task-scoped: it sits on the live checkpoint-adoption path and
-# cannot collide until a second task runs a trainer. Scope it before one does.
-CANDIDATE_MANIFEST_KEY = "reliquary/training/candidate-manifest.json"
-R2_CHECKPOINT_PREFIX = "reliquary/checkpoints"
+CANDIDATE_MANIFEST_KEY = LEGACY_CANDIDATE_MANIFEST_KEY
+R2_CHECKPOINT_PREFIX = LEGACY_CHECKPOINT_PREFIX
 PUBLICATION_RECEIPT = "reliquary_publication.json"
 PENDING_PUBLICATION = "publication.json"
 WEIGHT_PATTERNS = (
     "model.safetensors", "model.safetensors.index.json", "model-*.safetensors",
     "pytorch_model.bin", "pytorch_model.bin.index.json", "pytorch_model-*.bin",
 )
+# Weight blobs are mirrored AFTER the candidate manifest: the controller stages
+# only metadata, so the multi-gigabyte upload stays off the rotation path.
+# MIRROR_COMPLETE is written last; any reader that needs the weights from the
+# mirror must see it first.
+MIRROR_DEFERRED_SUFFIXES = (".safetensors", ".bin")
+MIRROR_COMPLETE = "reliquary_mirror_complete.json"
+# The deferred mirror and its marker are the new trainer's protocol: used for a
+# task-scoped namespace, or when this flag is "1". Otherwise (the legacy
+# namespace, the live run) every file is mirrored before the manifest and no
+# marker is written or required, exactly as before, so a controller and a
+# trainer of either release adopt each other's checkpoints.
+MIRROR_MARKER_ENV = "RELIQUARY_CHECKPOINT_MIRROR_MARKER"
+
+
+def mirror_marker_required(namespace: CheckpointNamespace | None = None,
+                           environ: Any = None) -> bool:
+    namespace = namespace or active_checkpoint_namespace()
+    flag = (os.environ if environ is None else environ).get(MIRROR_MARKER_ENV, "").strip()
+    return bool(namespace.scoped) or flag == "1"
 
 
 class PublicationConflict(RuntimeError):
     """Local or remote state cannot be attributed to this publication."""
 
 
-def checkpoint_key(revision: str, filename: str) -> str:
+def checkpoint_key(revision: str, filename: str, *, namespace: CheckpointNamespace | None = None) -> str:
     revision = require_immutable_checkpoint_revision(revision)
     if (
         not isinstance(filename, str)
@@ -59,7 +81,8 @@ def checkpoint_key(revision: str, filename: str) -> str:
         or Path(filename).name != filename
     ):
         raise ValueError("checkpoint filename must be a single path component")
-    return f"{R2_CHECKPOINT_PREFIX}/{revision}/{filename}"
+    namespace = namespace or active_checkpoint_namespace()
+    return f"{namespace.checkpoint_prefix}/{revision}/{filename}"
 
 
 def _multipart_transfer_config():
@@ -170,11 +193,13 @@ class TrainerPublisher:
         storage_guard: HfStorageGuard | None = None,
         hf_head_fn: Callable | None = None,
         hf_verify_fn: Callable | None = None,
+        namespace: CheckpointNamespace | None = None,
     ) -> None:
         from reliquary.validator.checkpoint import _default_save_hf_format
 
         self.repo_id = require_checkpoint_repository(repo_id)
-        self.staging_dir = Path(staging_dir)
+        self.namespace = namespace or active_checkpoint_namespace()
+        self.staging_dir = self.namespace.local_path(staging_dir)
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         _fsync_directory(self.staging_dir.parent)
         self.tokenizer, self._r2, self._bucket = tokenizer, r2_client, bucket
@@ -191,12 +216,12 @@ class TrainerPublisher:
             if checkpoint_number_floor is not None
             else None
         )
-        self._pending = self.staging_dir / PENDING_PUBLICATION
+        self._pending = self.namespace.child_path(self.staging_dir, PENDING_PUBLICATION)
 
     @contextmanager
     def _lock(self):
         # The persistent inode must never be unlinked while another process waits.
-        with (self.staging_dir / ".publication.lock").open("a") as handle:
+        with self.namespace.child_path(self.staging_dir, ".publication.lock").open("a") as handle:
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
@@ -209,7 +234,9 @@ class TrainerPublisher:
                 fcntl.flock(handle, fcntl.LOCK_UN)
 
     def _snapshot(self, transaction: dict) -> Path:
-        return self.staging_dir / f"ckpt_{transaction['manifest']['checkpoint_n']}"
+        return self.namespace.child_path(
+            self.staging_dir, f"ckpt_{transaction['manifest']['checkpoint_n']}",
+        )
 
     def has_pending(self) -> bool:
         return self._pending.exists()
@@ -219,7 +246,7 @@ class TrainerPublisher:
 
         try:
             response = self._r2.get_object(
-                Bucket=self._bucket, Key=CANDIDATE_MANIFEST_KEY
+                Bucket=self._bucket, Key=self.namespace.candidate_manifest_key
             )
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") in {
@@ -239,6 +266,7 @@ class TrainerPublisher:
         manifest = strict_json_loads(raw)
         if not isinstance(manifest, dict):
             raise PublicationConflict("candidate manifest must be an object")
+        self.namespace.require_identity(manifest)
         canonical_checkpoint_identity(
             manifest.get("checkpoint_n"),
             manifest.get("repo_id"),
@@ -275,12 +303,15 @@ class TrainerPublisher:
         if (
             transaction["bucket"] != self._bucket
             or manifest["repo_id"] != self.repo_id
-            or any(manifest.get(k) != v for k, v in active_training_identity().items())
+            or any(manifest.get(k) != v for k, v in {
+                **active_training_identity(), **self.namespace.identity,
+            }.items())
             or manifest.get("journal_key_space") != active_journal_key_space()
         ):
             raise PublicationConflict(
                 "pending publication belongs to another repository/profile/run"
             )
+        self.namespace.require_identity(manifest)
         require_checkpoint_number(manifest["checkpoint_n"])
         require_checkpoint_number(manifest["trained_window_cursor"])
         require_immutable_checkpoint_revision(transaction["parent_revision"])
@@ -354,6 +385,7 @@ class TrainerPublisher:
                 )
             manifest = {
                 **active_training_identity(),
+                **self.namespace.identity,
                 "checkpoint_n": checkpoint_n,
                 "repo_id": self.repo_id,
                 "trained_window_cursor": trained_window_cursor,
@@ -387,7 +419,7 @@ class TrainerPublisher:
             }
             if lr_schedule_step is not None:
                 extra["lr_schedule_step"] = lr_schedule_step
-            write_checkpoint_profile(snapshot, extra=extra)
+            write_checkpoint_profile(snapshot, extra=extra, namespace=self.namespace)
             files = {
                 path.name: await asyncio.to_thread(_file_identity, path)
                 for path in sorted(snapshot.iterdir())
@@ -407,7 +439,9 @@ class TrainerPublisher:
             _fsync_directory(snapshot)
             transaction.update(state="prepared", files=files)
             write_json(self._pending, transaction)
-            return (await self._resume(transaction))["revision"]
+            return (
+                await self._resume(transaction, snapshot_verified=True)
+            )["revision"]
 
     async def recover_pending(self) -> dict | None:
         """Call before resolve_resume_point/model loading; never requires a model.
@@ -424,7 +458,11 @@ class TrainerPublisher:
                 return None
             return await self._resume(transaction)
 
-    async def _resume(self, transaction: dict) -> dict:
+    async def _resume(
+        self, transaction: dict, *, snapshot_verified: bool = False,
+    ) -> dict:
+        # snapshot_verified: publish() hashed these files under this same lock an
+        # instant ago; re-reading 8 GB only matters when resuming after a crash.
         snapshot = self._snapshot(transaction)
         revision = transaction["revision"]
         if transaction["state"] != "committed":
@@ -436,7 +474,9 @@ class TrainerPublisher:
                     "pending publication lacks its snapshot receipt"
                 )
             for name, expected in transaction["files"].items():
-                checkpoint_key(transaction["parent_revision"], name)
+                checkpoint_key(transaction["parent_revision"], name, namespace=self.namespace)
+                if snapshot_verified:
+                    continue
                 if await asyncio.to_thread(_file_identity, snapshot / name) != expected:
                     raise PublicationConflict(
                         f"local publication content changed: {name}"
@@ -511,6 +551,10 @@ class TrainerPublisher:
         if await asyncio.to_thread(self._hf_head, self.repo_id) != revision:
             raise PublicationConflict("HF HEAD changed before candidate publication")
         manifest = {**transaction["manifest"], "revision": revision}
+        deferred = mirror_marker_required(self.namespace)
+        weights = ([name for name in sorted(transaction["files"])
+                    if name.endswith(MIRROR_DEFERRED_SUFFIXES)] if deferred else [])
+        metadata = [name for name in sorted(transaction["files"]) if name not in weights]
         current, etag = await asyncio.to_thread(self._read_candidate)
         if current != manifest:
             if (
@@ -521,24 +565,22 @@ class TrainerPublisher:
                 raise PublicationConflict(
                     "candidate manifest advanced or changed during publication"
                 )
-            config = _multipart_transfer_config()
-            for name in sorted(transaction["files"]):
-                await asyncio.to_thread(
-                    self._r2.upload_file,
-                    str(snapshot / name),
-                    self._bucket,
-                    checkpoint_key(revision, name),
-                    Config=config,
-                )
+            await self._mirror_files(snapshot, revision, metadata)
             if await asyncio.to_thread(self._hf_head, self.repo_id) != revision:
                 raise PublicationConflict("HF HEAD changed during mirror upload")
             condition = {"IfNoneMatch": "*"} if etag is None else {"IfMatch": etag}
             await asyncio.to_thread(
                 self._r2.put_object,
                 Bucket=self._bucket,
-                Key=CANDIDATE_MANIFEST_KEY,
+                Key=self.namespace.candidate_manifest_key,
                 Body=json.dumps(manifest, sort_keys=True).encode(),
                 **condition,
+            )
+        if deferred and transaction["state"] != "committed":
+            # Idempotent: recovery replays it until the transaction commits.
+            await self._mirror_files(snapshot, revision, weights)
+            await asyncio.to_thread(
+                self._upload_mirror_complete, revision, sorted(transaction["files"]),
             )
         transaction["state"] = "committed"
         write_json(self._pending, transaction)
@@ -561,18 +603,42 @@ class TrainerPublisher:
         )
         return manifest
 
+    async def _mirror_files(self, snapshot: Path, revision: str, names: list[str]) -> None:
+        config = _multipart_transfer_config()
+        for name in names:
+            await asyncio.to_thread(
+                self._r2.upload_file,
+                str(snapshot / name),
+                self._bucket,
+                checkpoint_key(revision, name, namespace=self.namespace),
+                Config=config,
+            )
+
+    def _upload_mirror_complete(self, revision: str, files: list[str]) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / MIRROR_COMPLETE
+            marker.write_bytes(
+                json.dumps({"revision": revision, "files": files}, sort_keys=True).encode()
+            )
+            self._r2.upload_file(
+                str(marker),
+                self._bucket,
+                checkpoint_key(revision, MIRROR_COMPLETE, namespace=self.namespace),
+                Config=_multipart_transfer_config(),
+            )
+
     def _existing_mirror_revisions(self) -> list[str]:
         # Bound deletion candidates BEFORE this publication. A later publisher's
         # new mirror can never be deleted by an old or recovering process.
         try:
             response = self._r2.list_objects_v2(
-                Bucket=self._bucket, Prefix=f"{R2_CHECKPOINT_PREFIX}/", Delimiter="/"
+                Bucket=self._bucket, Prefix=f"{self.namespace.checkpoint_prefix}/", Delimiter="/"
             )
             return [
-                entry["Prefix"].removeprefix(f"{R2_CHECKPOINT_PREFIX}/").rstrip("/")
+                entry["Prefix"].removeprefix(f"{self.namespace.checkpoint_prefix}/").rstrip("/")
                 for entry in response.get("CommonPrefixes", [])
                 if re.fullmatch(
-                    f"{R2_CHECKPOINT_PREFIX}/[0-9a-f]{{40}}/", entry["Prefix"]
+                    re.escape(self.namespace.checkpoint_prefix) + r"/[0-9a-f]{40}/", entry["Prefix"]
                 )
             ]
         except Exception:
@@ -585,7 +651,7 @@ class TrainerPublisher:
                 require_immutable_checkpoint_revision(revision)
                 if revision in keep:
                     continue
-                prefix = f"{R2_CHECKPOINT_PREFIX}/{revision}/"
+                prefix = f"{self.namespace.checkpoint_prefix}/{revision}/"
                 response = self._r2.list_objects_v2(Bucket=self._bucket, Prefix=prefix)
                 for item in response.get("Contents", []):
                     if item["Key"].startswith(prefix):

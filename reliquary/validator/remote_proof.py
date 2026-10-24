@@ -45,6 +45,16 @@ def executor_mode() -> str:
 _LANE = "~"
 
 
+def _config_namespace(config):
+    """A worker's reported config as attributes, its nested ``text_config`` too (the EOS resolver reads
+    ``config.text_config.eos_token_id`` by attribute, as on a real multimodal config). Used by the episode
+    boot check only: the proxies the legacy batcher proves with keep a flat config (``text_config`` a dict)."""
+    fields = dict(vars(config) if isinstance(config, SimpleNamespace) else config)
+    if isinstance(fields.get("text_config"), dict):
+        fields["text_config"] = SimpleNamespace(**fields["text_config"])
+    return SimpleNamespace(**fields)
+
+
 class RemoteProofPool:
     is_remote = True
 

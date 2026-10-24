@@ -517,7 +517,7 @@ async def test_next_epoch_submits_again():
 
 
 @pytest.mark.asyncio
-async def test_blocks_until_timeout_recycles_subtensor():
+async def test_blocks_until_timeout_recycles_subtensor(monkeypatch):
     """On a chain-call TimeoutError, the run loop must close the wedged
     polling subtensor and pull a fresh one on the next iteration. The
     previous reconnect path leaked the old subtensor, whose background
@@ -565,8 +565,8 @@ async def test_blocks_until_timeout_recycles_subtensor():
 
     wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
     wov._submit_weights = AsyncMock(return_value=True)
-    wov_mod.storage.list_all_window_keys = AsyncMock(return_value=[1])
-    wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[])
+    monkeypatch.setattr(wov_mod.storage, "list_all_window_keys", AsyncMock(return_value=[1]))
+    monkeypatch.setattr(wov_mod.storage, "list_recent_datasets", AsyncMock(return_value=[]))
 
     try:
         task = _asyncio.create_task(wov.run())
@@ -835,6 +835,7 @@ async def test_submit_once_applies_the_floor_to_shares():
 
     wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
     originals, _ = _patch_chain_and_storage(blocks_until=200)
+    wov_mod.storage.list_all_window_keys = AsyncMock(return_value=[1])
     wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
         _archive(1, [], rewards_by_hotkey={"hk_big": 0.98, "hk_mid": 0.015, "hk_small": 0.005}),
     ])
@@ -870,6 +871,7 @@ async def test_submit_once_keeps_a_hotkey_exactly_on_the_floor_in_full():
 
     wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
     originals, _ = _patch_chain_and_storage(blocks_until=200)
+    wov_mod.storage.list_all_window_keys = AsyncMock(return_value=[1])
     wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
         _archive(1, [], rewards_by_hotkey={"hk_a": 0.5, "hk_b": 0.5}),
     ])
@@ -911,6 +913,7 @@ async def test_submit_once_shares_the_freed_mass_and_leaves_the_burn_unchanged()
     async def _run_once(ramp_start, min_share):
         wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
         originals, _ = _patch_chain_and_storage(blocks_until=200)
+        wov_mod.storage.list_all_window_keys = AsyncMock(return_value=[1])
         wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
             _archive(1, [], rewards_by_hotkey={"hk_big": 0.985, "hk_mid": 0.015}),
         ])
@@ -959,6 +962,7 @@ async def test_submit_once_floor_disabled_drops_nothing():
 
     wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
     originals, _ = _patch_chain_and_storage(blocks_until=200)
+    wov_mod.storage.list_all_window_keys = AsyncMock(return_value=[1])
     wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
         _archive(1, [], rewards_by_hotkey={"hk_big": 1.0, "hk_tiny": 0.01}),
     ])
@@ -1118,6 +1122,7 @@ async def test_submit_once_kill_switch_ignores_a_nonzero_ramp_start():
 
     wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
     originals, _ = _patch_chain_and_storage(blocks_until=200)
+    wov_mod.storage.list_all_window_keys = AsyncMock(return_value=[1])
     wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
         _archive(1, [], rewards_by_hotkey={"hk_big": 1.0, "hk_tiny": 0.01}),
     ])
@@ -1147,6 +1152,7 @@ async def test_submit_once_start_equals_threshold_reproduces_the_old_cliff_end_t
 
     wov = WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
     originals, _ = _patch_chain_and_storage(blocks_until=200)
+    wov_mod.storage.list_all_window_keys = AsyncMock(return_value=[1])
     wov_mod.storage.list_recent_datasets = AsyncMock(return_value=[
         _archive(1, [], rewards_by_hotkey={"hk_big": 0.985, "hk_small": 0.015}),
     ])
@@ -1188,6 +1194,112 @@ async def test_submit_once_abstains_when_a_task_is_undeclared():
 
     assert result is False
     assert captured["submit_calls"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure,listed,expected", [
+    ("AccessDenied", True, False),
+    ("InternalError", True, False),
+    ("timeout", True, False),
+    ("body", True, False),
+    ("gzip", True, False),
+    ("json", True, False),
+    ("window", True, False),
+    ("NoSuchKey", True, False),
+    ("404", True, False),
+    ("NoSuchKey", False, True),
+    ("404", False, True),
+])
+async def test_submit_once_requires_complete_archive_reads(monkeypatch, failure, listed, expected):
+    import gzip
+    import json
+    from botocore.exceptions import ClientError
+    import reliquary.validator.weight_only as mod
+
+    originals, captured = _patch_chain_and_storage(blocks_until=200)
+    mod.storage.list_recent_datasets = originals["storage"]["list_recent_datasets"]
+    mod.storage.list_all_window_keys.return_value = [0, 1, 2] if listed else [0, 2]
+    bodies = []
+
+    async def get_object(*, Bucket, Key):
+        window = int(Key.rsplit("window-", 1)[1].split(".", 1)[0])
+        if window == 1 and failure in ("AccessDenied", "InternalError", "NoSuchKey", "404"):
+            raise ClientError({"Error": {"Code": failure}}, "GetObject")
+        if window == 1 and failure == "timeout":
+            raise TimeoutError("archive read timed out")
+        payload = _archive(window, ["alice"])
+        if window == 1 and failure == "window":
+            payload["window_start"] = 99
+        encoded = gzip.compress(json.dumps(payload).encode())
+        if window == 1 and failure == "gzip":
+            encoded = b"invalid gzip"
+        if window == 1 and failure == "json":
+            encoded = gzip.compress(b"invalid json")
+        body = MagicMock()
+        body.read = AsyncMock(return_value=encoded)
+        if window == 1 and failure == "body":
+            body.read.side_effect = OSError("archive body unavailable")
+        bodies.append(body)
+        return {"Body": body}
+
+    client = MagicMock(get_object=AsyncMock(side_effect=get_object))
+    context = AsyncMock()
+    context.__aenter__.return_value = client
+    monkeypatch.setattr(mod.storage, "get_s3_client", lambda **kwargs: context)
+    validator = mod.WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    validator._submit_weights = AsyncMock(return_value=True)
+    try:
+        assert await validator.submit_once() is expected
+        assert validator._submit_weights.await_count == int(expected)
+        assert captured["chain_mocks"]["get_subtensor"].await_count == int(expected)
+        if expected:
+            weights = validator._submit_weights.call_args.args[1]
+            assert weights == mod.WeightOnlyValidator._replay_ema([_archive(0, ["alice"]), _archive(2, ["alice"])])
+        for body in bodies:
+            body.close.assert_called_once()
+    finally:
+        _restore(originals)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reader", ["list_task_ids", "list_all_window_keys"])
+@pytest.mark.parametrize("failure", ["client", "timeout"])
+async def test_submit_once_abstains_on_archive_listing_failure(reader, failure):
+    from botocore.exceptions import ClientError
+    import reliquary.validator.weight_only as mod
+
+    originals, captured = _patch_chain_and_storage(blocks_until=200)
+    listing = getattr(mod.storage, reader)
+    listing.side_effect = (ClientError({"Error": {"Code": "AccessDenied"}}, "ListObjectsV2")
+                           if failure == "client" else TimeoutError("listing timed out"))
+    validator = mod.WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    validator._submit_weights = AsyncMock()
+    try:
+        assert await validator.submit_once() is False
+        assert listing.call_args.kwargs["strict"] is True
+        validator._submit_weights.assert_not_awaited()
+        captured["chain_mocks"]["get_subtensor"].assert_not_awaited()
+    finally:
+        _restore(originals)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reader", ["list_task_ids", "list_recent_datasets"])
+async def test_submit_once_preserves_archive_read_cancellation(reader):
+    import asyncio
+    import reliquary.validator.weight_only as mod
+
+    originals, captured = _patch_chain_and_storage(blocks_until=200)
+    getattr(mod.storage, reader).side_effect = asyncio.CancelledError
+    validator = mod.WeightOnlyValidator(wallet=_FakeWallet(), netuid=81)
+    validator._submit_weights = AsyncMock()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await validator.submit_once()
+        validator._submit_weights.assert_not_awaited()
+        captured["chain_mocks"]["get_subtensor"].assert_not_awaited()
+    finally:
+        _restore(originals)
 
 
 @pytest.mark.asyncio

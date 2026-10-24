@@ -11,7 +11,7 @@ from __future__ import annotations
 import collections
 import logging
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -92,6 +92,27 @@ def job_status(*, job_id: str, job: Any, slots: Any, stats: JobStats, settled: i
     }
 
 
+def pay_status(*, cap: float, price: Mapping | None, last_period: Mapping | None) -> dict:
+    """What a period of work may pay and what the last one paid: the cap (a
+    share of the miners' pool), the price ceiling in alpha per million verified
+    tokens (None: the cap alone), and the last settled period's pay per
+    million tokens, in alpha when the ceiling names the emission it used."""
+    view = dict(price) if price else None
+    pay = {"cap": float(cap),
+           "max_price_alpha_per_mtoken": (view or {}).get("max_price_alpha_per_mtoken"),
+           "price_ceiling": view, "last_period": None}
+    if last_period and int(last_period.get("verified_tokens") or 0) > 0:
+        tokens, paid = int(last_period["verified_tokens"]), float(last_period["paid"])
+        emission = (view or {}).get("miner_alpha_per_period")
+        pay["last_period"] = {
+            "work_period": int(last_period["work_period"]), "verified_tokens": tokens,
+            "paid_pool_share": paid,
+            "paid_pool_share_per_mtoken": paid / tokens * 1e6,
+            "paid_alpha_per_mtoken": (None if emission is None
+                                      else paid / tokens * 1e6 * float(emission))}
+    return pay
+
+
 def _eval_prompt_counts(job: Any, slots: Any) -> dict[str, Any]:
     """An eval job's completeness: ``prompts_complete`` (V slots of work not
     failed), ``prompts_exhausted`` (every attempt used) and ``complete`` (each
@@ -108,6 +129,16 @@ def _eval_prompt_counts(job: Any, slots: Any) -> dict[str, Any]:
 async def stored_job_counts(records: Any, job_id: str) -> dict[str, Any]:
     """What the bucket says of a job's drain, by listing it: the counts
     `jobs status` prints and the admin service proxies."""
+    from reliquary.validator.corpus_service import rebuild_ledgers
+
+    # These reads must use the record store's own bucket, not ambient storage
+    # defaults. An implementation without them cannot certify a drain.
+    job, _ = await records.read_job(job_id)
+    before, before_etag = await records.read_ledgers(job_id)
+    before = {} if before is None else before
+    pending_records = len(rebuild_ledgers(job, before).records) if job is not None else 0
+    if job is None and before:
+        raise ValueError("stored ledger has no job manifest")
     submissions = set(await records.list_submission_ids(job_id))
     verdicts = set(await records.list_verdict_ids(job_id))
     state, _ = await records.read_settlement(job_id)
@@ -116,13 +147,21 @@ async def stored_job_counts(records: Any, job_id: str) -> dict[str, Any]:
     pending = state.get("pending")
     unaudited = len(submissions - verdicts)
     unsettled = len(verdicts - settled)
+    after, after_etag = await records.read_ledgers(job_id)
+    after = {} if after is None else after
+    after_pending = len(rebuild_ledgers(job, after).records) if job is not None else 0
+    if job is None and after:
+        raise ValueError("stored ledger has no job manifest")
+    pending_records = max(pending_records, after_pending)
     return {
         "submissions": len(submissions), "verdicts": len(verdicts), "unaudited": unaudited,
         "settled": len(settled), "unsettled": unsettled,
+        "pending_records": pending_records,
         "pending_window": (pending.get("window", pending.get("work_period"))
                            if pending else None),
         "last_window": state.get("last_window"),
-        "drained": unaudited == 0 and unsettled == 0 and pending is None,
+        "drained": (unaudited == 0 and unsettled == 0 and pending is None
+                    and pending_records == 0 and before_etag == after_etag and before == after),
     }
 
 

@@ -10,7 +10,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -27,6 +27,44 @@ logger = logging.getLogger(__name__)
 
 _GPU_VOCAB_FLOAT_WORKSPACE_BYTES = 256 * 1024 * 1024
 _UTILITY_ENTROPY_MAX_POSITIONS = 64
+
+
+class DrawSettings(NamedTuple):
+    """The forced draw the active profile prescribes, as the verifier checks it."""
+
+    draw: str
+    t: float
+    top_k: int
+    top_p: float
+    stochastic_threshold: float
+    # In the draw's own miss units: CDF distance, or Gumbel relative score shortfall.
+    boundary_epsilon: float
+
+
+def draw_settings() -> DrawSettings:
+    """Read at call time, so a process checks the draw its profile declares."""
+    from reliquary import constants
+    from reliquary.environment.forced_sampling import DRAW_GUMBEL_MAX
+
+    gumbel = constants.FORCED_DRAW == DRAW_GUMBEL_MAX
+    return DrawSettings(
+        draw=constants.FORCED_DRAW,
+        t=T_PROTO,
+        top_k=constants.TOP_K_PROTO,
+        top_p=constants.TOP_P_PROTO,
+        stochastic_threshold=constants.FORCED_SEED_STOCHASTIC_MAXPROB,
+        boundary_epsilon=(
+            constants.FORCED_SEED_GUMBEL_BOUNDARY_EPSILON
+            if gumbel else constants.FORCED_SEED_CDF_BOUNDARY_EPSILON
+        ),
+    )
+
+
+def lm_head_fp32() -> bool:
+    """Whether the profile's logits come from an fp32 LM head (``sampling.lm_head_fp32``)."""
+    from reliquary import constants
+
+    return bool(constants.LM_HEAD_FP32)
 
 
 def _uses_math_bft_environment(env_name: str | None) -> bool:
@@ -144,6 +182,12 @@ class ProofResult:
     toploc_worst_exp: int = 0
     toploc_worst_mant_mean: float = 0.0
     toploc_worst_mant_median: float = 0.0
+    # Signed episodes only: every model turn ending on a stop token ends on the forced pick.
+    # None: no such turn checked, or not a signed episode.
+    episode_stop_picks_ok: bool | None = None
+    episode_stop_first_bad_turn: int | None = None
+    # Telemetry only (never a relaxation): the first failed turn's distance to its stop's CDF interval.
+    episode_stop_cdf_miss: float | None = None
 
 
 def verify_signature(commit: dict, hotkey: str) -> bool:
@@ -472,9 +516,11 @@ class _LazyLogitRows:
     tests/unit/test_verifier_fused_lm_head.py.
     """
 
-    def __init__(self, hidden: torch.Tensor, lm_head: Any, vocab_size: int) -> None:
+    def __init__(self, hidden: torch.Tensor, lm_head: Any, vocab_size: int, *,
+                 fp32_head: bool = False) -> None:
         self._hidden = hidden
         self._lm_head = lm_head
+        self._fp32_head = bool(fp32_head)
         self.shape = torch.Size((int(hidden.shape[0]), int(vocab_size)))
 
     @property
@@ -489,7 +535,10 @@ class _LazyLogitRows:
         # returned, so guard here too: a graph held on lm_head weights would
         # retain exactly the memory this class exists to free.
         with torch.no_grad():
+            if self._fp32_head:
+                return _fp32_head_logits(rows, self._lm_head)
             return self._lm_head(rows)
+
 
     def index_select(self, dim: int, index: torch.Tensor) -> torch.Tensor:
         if dim != 0:
@@ -498,6 +547,71 @@ class _LazyLogitRows:
 
     def __getitem__(self, key: Any) -> torch.Tensor:
         return self._project(self._hidden[key])
+
+
+_MM_OUT_DTYPE: bool | None = None
+
+
+def _mm_has_out_dtype() -> bool:
+    """Whether this torch's ``torch.mm`` takes ``out_dtype`` on CUDA (probed once on a 1x1 product)."""
+    global _MM_OUT_DTYPE
+    if _MM_OUT_DTYPE is None:
+        try:
+            one = torch.ones(1, 1, dtype=torch.bfloat16, device="cuda")
+            torch.mm(one, one, out_dtype=torch.float32)
+            _MM_OUT_DTYPE = True
+        except TypeError:
+            _MM_OUT_DTYPE = False
+    return _MM_OUT_DTYPE
+
+
+def fp32_head_weight(weight: torch.Tensor) -> torch.Tensor | None:
+    """The fp32 operand ``fp32_head_matmul`` would cast ``weight`` to on every call, cast once, for a caller that
+    projects many row chunks through the same weight (the forced draw of a micro-batch: 4 GB re-cast per 512-row
+    chunk on the 9B costs as much as the TF32 product). None when the call needs no cast (``out_dtype``, or not a
+    bf16 CUDA weight) or ``RELIQUARY_FP32_HEAD_WEIGHT_CACHE=0``."""
+    import os
+
+    if os.environ.get("RELIQUARY_FP32_HEAD_WEIGHT_CACHE", "1") == "0":
+        return None
+    weight = weight.detach()
+    if not (weight.is_cuda and weight.dtype == torch.bfloat16) or _mm_has_out_dtype():
+        return None
+    return weight.float()
+
+
+def fp32_head_matmul(rows: torch.Tensor, weight: torch.Tensor, *,
+                     weight_fp32: torch.Tensor | None = None) -> torch.Tensor:
+    """``sampling.lm_head_fp32``: rows @ W.T with fp32 products and accumulation, fp32 out. With bf16 operands on
+    CUDA (production) it is the cuBLAS call vLLM's ``head_dtype=float32`` makes (``torch.mm(..., out_dtype=
+    float32)``, tensor cores; 13.7x faster than an fp32 SGEMM at 2048 rows of the 9B on H100, 1 different Gumbel
+    pick in 381k, 2026-10-16). On a torch without ``out_dtype`` (2.7, the pinned one) the same tensor-core product:
+    the operands upcast to fp32 with TF32 on. A bf16 value (8-bit significand) is exact in TF32 (11-bit), so TF32
+    rounds nothing and the products and fp32 accumulation are those of ``out_dtype``; only the summation order may
+    differ. With TF32 off this fallback ran the head 10x slower: ~65 % of every training step on
+    teutonic-rl-async-v1 (2026-10-23). Any other operands: an fp32 matmul with TF32 off. ``weight_fp32``:
+    ``fp32_head_weight(weight)``, the same upcast done once by the caller (the products are unchanged).
+    bf16 x bf16 products are exact in fp32: only the summation order differs (~4e-4 at most on the 9B)."""
+    weight = weight.detach()
+    bf16_cuda = rows.is_cuda and rows.dtype == weight.dtype == torch.bfloat16
+    if bf16_cuda and _mm_has_out_dtype():
+        with torch.autocast(device_type="cuda", enabled=False):
+            return torch.mm(rows, weight.T, out_dtype=torch.float32)
+    # no out_dtype in this torch (or not bf16 CUDA): the same products through TF32 below
+    previous = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = bf16_cuda
+    try:
+        with torch.autocast(device_type=rows.device.type, enabled=False):
+            rhs = weight_fp32 if weight_fp32 is not None and bf16_cuda else weight.float()
+            return rows.float() @ rhs.T
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+
+
+def _fp32_head_logits(rows: torch.Tensor, lm_head: Any) -> torch.Tensor:
+    if getattr(lm_head, "bias", None) is not None:
+        raise RuntimeError("fp32 LM head: a biased head is not supported")
+    return fp32_head_matmul(rows.reshape(-1, rows.shape[-1]), lm_head.weight).reshape(*rows.shape[:-1], -1)
 
 
 def _lm_head_vocab_size(lm_head: Any) -> int | None:
@@ -534,6 +648,69 @@ def policy_token_positions(
     return _completion_valid_t(
         tokens, prompt_length, completion_length, len(tokens)
     )
+
+
+def signed_episode_spans(rollout_meta: dict[str, Any], seq_len: int) -> list[tuple[int, int]] | None:
+    """The model spans of a signed episode; None for any other rollout, ``[]`` when malformed
+    (no proof passes an empty span list). Read strictly: integer pairs, ordered, non-empty,
+    non-overlapping, inside the sequence and after the declared prompt."""
+    from reliquary.protocol.submission import is_signed_episode
+
+    if not is_signed_episode(rollout_meta):
+        return None
+    episode = rollout_meta["episode"]
+    raw_spans = episode.get("assistant_spans")
+    if not isinstance(raw_spans, (list, tuple)):
+        return []
+    try:
+        prompt_length = int(rollout_meta.get("prompt_length", 0))
+    except (TypeError, ValueError, OverflowError):
+        return []
+    spans: list[tuple[int, int]] = []
+    previous = max(1, prompt_length)
+    for raw in raw_spans:
+        if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+            return []
+        if not all(type(value) is int for value in raw):
+            return []
+        start, end = raw
+        if start < previous or end <= start or end > seq_len:
+            return []
+        spans.append((start, end))
+        previous = end
+    return spans
+
+
+def _episode_stop_picks(
+    logits_gpu: Any,
+    tokens: list[int],
+    spans: list[tuple[int, int]],
+    policy_positions: list[int],
+    stop_ids: set[int],
+    seed_u_values: list[float],
+) -> tuple[bool | None, int | None, float | None]:
+    """Each model turn that ends on a stop token (a natural stop or a tool-call stop) must end
+    on the profile's forced pick for ``u_j`` over ``logits[t - 1]``, ``j`` its model-token offset in the episode.
+    A turn cut by its cap ends on no stop: the admission's structural check (exactly the cap) covers it.
+    ``(True, None, None)`` when every checked turn passed, ``(False, turn, cdf_miss)`` at the first that did
+    not (a stop the u-stream does not reach fails too, with no distance), ``(None, None, None)`` when no turn
+    ended on a stop. ``cdf_miss`` is telemetry only."""
+    if not stop_ids:
+        return None, None, None
+    offset_of = {position: offset for offset, position in enumerate(policy_positions)}
+    checked = False
+    for turn, (_start, end) in enumerate(spans):
+        t = end - 1
+        if int(tokens[t]) not in stop_ids:
+            continue
+        offset = offset_of.get(t)
+        if offset is None or offset >= len(seed_u_values):
+            return False, turn, None
+        exact, miss = _forced_pick_diagnostics(logits_gpu[t - 1], int(tokens[t]), seed_u_values[offset])
+        checked = True
+        if not exact:
+            return False, turn, min(1.0, max(0.0, float(miss)))
+    return (True, None, None) if checked else (None, None, None)
 
 
 def proof_challenge_indices(
@@ -700,6 +877,46 @@ def verify_commitment_proofs_batch(
     return results
 
 
+def proof_forward_rows(model: Any, tokens: list[int], *, forward: tuple[Any, Any] | None = None,
+                       device: Any = None) -> tuple[torch.Tensor, Any]:
+    """The proof path's forward of one sequence: (hidden [seq_len, hidden], logit rows [seq_len, vocab]).
+
+    Batch 1 on the model's device unless ``forward`` hands this sequence's rows out of a batched pass.
+    The logit rows are projected lazily through ``lm_head`` (in fp32 when the profile's
+    ``sampling.lm_head_fp32`` says so); a model without a separable head returns its materialised logits."""
+    from reliquary.shared.forward import forward_single_layer
+
+    lm_head = getattr(model, "lm_head", None)
+    # Row-wise projection needs a separable head whose width we can read
+    # without projecting; anything else keeps the old materialised block.
+    vocab_size = _lm_head_vocab_size(lm_head)
+    can_project_rows = vocab_size is not None
+    if forward is not None:
+        # This rollout's rows out of a pass that ran for several of them: one traversal of the
+        # model serves the whole batch, which is what makes a streamed replica affordable.
+        hidden_states_gpu, logits_batch = forward
+    else:
+        if device is None:
+            device = next(model.parameters()).device
+        input_ids = torch.tensor([list(tokens)], device=device)
+        with torch.no_grad():
+            hidden_rows, logits_rows = forward_single_layer(
+                model, input_ids, None, LAYER_INDEX,
+                materialize_logits=not can_project_rows,
+            )
+        hidden_states_gpu = hidden_rows[0]
+        logits_batch = None if logits_rows is None else logits_rows[0]
+
+    fp32_head = lm_head_fp32()
+    if logits_batch is None:
+        return hidden_states_gpu, _LazyLogitRows(hidden_states_gpu, lm_head, vocab_size,
+                                                 fp32_head=fp32_head)
+    if fp32_head:
+        raise RuntimeError("fp32 LM head: this model's logits come materialised from its "
+                           "forward, not from a separable lm_head")
+    return hidden_states_gpu, logits_batch  # [seq_len, vocab_size], kept on GPU
+
+
 def verify_commitment_proofs(
     commit: dict,
     model: Any,
@@ -729,7 +946,6 @@ def verify_commitment_proofs(
     clients), ``seed_n_stochastic``/``seed_n_match`` stay at 0 — no-op.
     """
     from reliquary.protocol.grail_verifier import GRAILVerifier
-    from reliquary.shared.forward import forward_single_layer
     from reliquary.shared.hf_compat import resolve_hidden_size
     from reliquary.validator.utility_telemetry import utility_telemetry_enabled
 
@@ -741,6 +957,7 @@ def verify_commitment_proofs(
     policy_positions = policy_token_positions(tokens, rollout_meta)
 
     seq_len = len(tokens)
+    signed_spans = signed_episode_spans(rollout_meta, seq_len)
     capture_utility = utility_telemetry_enabled()
 
     # SECURITY: Always use the validator's independently-computed randomness.
@@ -765,30 +982,7 @@ def verify_commitment_proofs(
     expected_challenges = min(CHALLENGE_K, challenge_domain_size)
 
     device = next(model.parameters()).device
-    lm_head = getattr(model, "lm_head", None)
-    # Row-wise projection needs a separable head whose width we can read
-    # without projecting; anything else keeps the old materialised block.
-    vocab_size = _lm_head_vocab_size(lm_head)
-    can_project_rows = vocab_size is not None
-    if forward is not None:
-        # This rollout's rows out of a pass that ran for several of them: one traversal of the
-        # model serves the whole batch, which is what makes a streamed replica affordable.
-        hidden_states_gpu, logits_batch = forward
-    else:
-        input_ids = torch.tensor([tokens], device=device)
-        with torch.no_grad():
-            hidden_rows, logits_rows = forward_single_layer(
-                model, input_ids, None, LAYER_INDEX,
-                materialize_logits=not can_project_rows,
-            )
-        hidden_states_gpu = hidden_rows[0]
-        logits_batch = None if logits_rows is None else logits_rows[0]
-
-    # [seq_len, hidden_dim]
-    if logits_batch is None:
-        logits_gpu: Any = _LazyLogitRows(hidden_states_gpu, lm_head, vocab_size)
-    else:
-        logits_gpu = logits_batch  # [seq_len, vocab_size], kept on GPU
+    hidden_states_gpu, logits_gpu = proof_forward_rows(model, tokens, forward=forward, device=device)
 
     p_stop = _gpu_p_stop(
         logits_gpu, seq_len, _eos_set_from_model(model, tokenizer), device,
@@ -823,6 +1017,9 @@ def verify_commitment_proofs(
     terminal_pick_cdf_miss = None
     natural_close_pick_ok = None
     natural_close_pick_cdf_miss = None
+    episode_stop_picks_ok = None
+    episode_stop_first_bad_turn = None
+    episode_stop_cdf_miss = None
     if seed_u_values is not None:
         valid_t = policy_positions
         # Exclude BFT-injected force_span tokens: validator-accepted but not
@@ -833,7 +1030,8 @@ def verify_commitment_proofs(
         # well-formed 2-element one; ignore it otherwise so a non-forced
         # force_span=[0, huge] cannot exclude every position and void the gate.
         force_span = rollout_meta.get("force_span")
-        if (rollout_meta.get("forced")
+        # A signed episode has no injected span: every model position was drawn.
+        if (signed_spans is None and rollout_meta.get("forced")
                 and isinstance(force_span, (list, tuple)) and len(force_span) == 2):
             try:
                 fs0, fs1 = int(force_span[0]), int(force_span[1])
@@ -883,18 +1081,34 @@ def verify_commitment_proofs(
                 (fs0, fs1),
             )
             )
-        (
-            natural_close_pick_ok,
-            natural_close_pick_cdf_miss,
-        ) = _gpu_natural_close_forced_pick_diagnostics(
-            logits_gpu, tokens, prompt_length, completion_length, seq_len,
-            tokenizer, seed_u_values, rollout_meta,
-        )
+        if signed_spans is not None:
+            natural_close_pick_ok, natural_close_pick_cdf_miss = None, None
+        else:
+            (
+                natural_close_pick_ok,
+                natural_close_pick_cdf_miss,
+            ) = _gpu_natural_close_forced_pick_diagnostics(
+                logits_gpu, tokens, prompt_length, completion_length, seq_len,
+                tokenizer, seed_u_values, rollout_meta,
+            )
+        if signed_spans:
+            episode_stop_picks_ok, episode_stop_first_bad_turn, episode_stop_cdf_miss = _episode_stop_picks(
+                logits_gpu, tokens, signed_spans, policy_positions,
+                _eos_set_from_model(model, tokenizer), seed_u_values,
+            )
+        elif signed_spans is not None:
+            # A malformed signed episode: fail closed, with or without a TOPLOC spec to judge it.
+            episode_stop_picks_ok, episode_stop_first_bad_turn = False, None
 
     hidden_states = hidden_states_gpu.detach().to("cpu")
-    from reliquary.validator.toploc_check import toploc_verdict
+    if signed_spans is not None:
+        from reliquary.validator.toploc_check import toploc_span_verdict
 
-    toploc = toploc_verdict(hidden_states, commit, prompt_length)
+        toploc = toploc_span_verdict(hidden_states, commit, signed_spans)
+    else:
+        from reliquary.validator.toploc_check import toploc_verdict
+
+        toploc = toploc_verdict(hidden_states, commit, prompt_length)
     if capture_utility:
         (
             hidden_start_f16_b64,
@@ -983,6 +1197,9 @@ def verify_commitment_proofs(
         toploc_worst_exp=0 if toploc is None else int(toploc.worst_exp),
         toploc_worst_mant_mean=0.0 if toploc is None else float(toploc.worst_mant_mean),
         toploc_worst_mant_median=0.0 if toploc is None else float(toploc.worst_mant_median),
+        episode_stop_picks_ok=episode_stop_picks_ok,
+        episode_stop_first_bad_turn=episode_stop_first_bad_turn,
+        episode_stop_cdf_miss=episode_stop_cdf_miss,
     )
 
 
@@ -991,30 +1208,16 @@ def _forced_pick_diagnostics(
     token_id: int,
     u: float,
 ) -> tuple[bool, float]:
-    """Return exact-pick status and distance to the token's CDF interval."""
-    from reliquary.constants import TOP_K_PROTO, TOP_P_PROTO
-    from reliquary.environment.forced_sampling import pick, warp
+    """Return exact-pick status and the distance to it under the profile's draw:
+    the CDF-interval distance (inverse_cdf) or the relative score shortfall
+    (gumbel_max), both in [0, 1] and telemetry only."""
+    from reliquary.environment.forced_sampling import forced_pick_diagnostics
 
-    probs = warp(
-        logits.float(), t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO,
+    settings = draw_settings()
+    return forced_pick_diagnostics(
+        logits, int(token_id), u, draw=settings.draw,
+        t=settings.t, top_k=settings.top_k, top_p=settings.top_p,
     )
-    token = int(token_id)
-    exact = pick(probs, u) == token
-    if exact:
-        return True, 0.0
-    cdf = torch.cumsum(probs, dim=-1)
-    upper = float(cdf[token].item())
-    lower = upper - float(probs[token].item())
-    u_value = float(
-        torch.tensor(float(u), device=probs.device, dtype=probs.dtype).item()
-    )
-    if u_value < lower:
-        miss = lower - u_value
-    elif u_value >= upper:
-        miss = u_value - upper
-    else:
-        miss = 0.0
-    return exact, max(0.0, float(miss))
 
 
 def _gpu_terminal_forced_pick_diagnostics(
@@ -1029,7 +1232,7 @@ def _gpu_terminal_forced_pick_diagnostics(
     """Diagnose whether the final token is the forced inverse-CDF pick.
 
     Recomputes the protocol draw the miner was obliged to make at the position
-    that produced ``tokens[-1]``: ``pick(warp(logits[t-1]), u_j)``. A match means
+    that produced ``tokens[-1]``: the profile's pick for ``u_j`` over ``logits[t-1]``. A match means
     the stop was the one legal token there — the miner cannot steer ``u``, so this
     cannot be manufactured, while a forged EOS (injected where ``u`` selected some
     other token) does not match.
@@ -1391,27 +1594,23 @@ def _gpu_seed_consistency_diagnostics(
     position_offsets: list[int] | None = None,
     logit_positions: list[int] | None = None,
 ):
-    from reliquary.constants import (
-        FORCED_SEED_CDF_BOUNDARY_EPSILON,
-        FORCED_SEED_STOCHASTIC_MAXPROB,
-        TOP_K_PROTO,
-        TOP_P_PROTO,
-    )
     from reliquary.environment.forced_sampling import (
         seed_consistency_diagnostics,
     )
 
+    settings = draw_settings()
     return seed_consistency_diagnostics(
         logits_slice,
         list(token_ids),
         list(u_values),
-        t=T_PROTO,
-        top_k=TOP_K_PROTO,
-        top_p=TOP_P_PROTO,
-        stochastic_threshold=FORCED_SEED_STOCHASTIC_MAXPROB,
-        boundary_epsilon=FORCED_SEED_CDF_BOUNDARY_EPSILON,
+        t=settings.t,
+        top_k=settings.top_k,
+        top_p=settings.top_p,
+        stochastic_threshold=settings.stochastic_threshold,
+        boundary_epsilon=settings.boundary_epsilon,
         position_offsets=position_offsets,
         logit_positions=logit_positions,
+        draw=settings.draw,
     )
 
 

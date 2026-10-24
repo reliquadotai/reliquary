@@ -12,11 +12,18 @@ import json
 import math
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from string import Template
 from types import MappingProxyType
 from typing import Any
+
+
+# The forced draw (``reliquary.environment.forced_sampling``): which public pick every
+# sampled token must be. Restated here because this module must not import torch.
+DRAW_INVERSE_CDF = "inverse_cdf"
+DRAW_GUMBEL_MAX = "gumbel_max"
+_DRAWS = (DRAW_INVERSE_CDF, DRAW_GUMBEL_MAX)
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +33,24 @@ class SamplingProfile:
     top_p: float
     top_k: int
     do_sample: bool
+    # Both default to what every profile before v10 meant, and are written into a
+    # contract only when they differ, so those contracts keep their bytes.
+    draw: str = DRAW_INVERSE_CDF
+    # The LM head's logits in fp32 (bf16 products, fp32 accumulation) on the miner's
+    # engine and in the validator's proof forward, instead of the model dtype.
+    lm_head_fp32: bool = False
+
+    def __post_init__(self) -> None:
+        if self.draw not in _DRAWS:
+            raise ValueError(f"unknown forced draw {self.draw!r}; expected one of {_DRAWS}")
+        if not isinstance(self.lm_head_fp32, bool):
+            raise ValueError(f"lm_head_fp32 must be true or false, got {self.lm_head_fp32!r}")
+        if self.draw == DRAW_GUMBEL_MAX and not (
+            float(self.temperature) == 1.0 and not (self.top_k and self.top_k > 0)
+            and float(self.top_p) >= 1.0
+        ):
+            # argmax(logit + G) samples softmax(logits): no other distribution.
+            raise ValueError("the gumbel_max draw needs temperature 1, top_k 0 and top_p 1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -432,6 +457,10 @@ class ProtocolProfile:
             },
             "environments": environments,
         }
+        if self.sampling.draw != DRAW_INVERSE_CDF:
+            contract["sampling"]["draw"] = self.sampling.draw
+        if self.sampling.lm_head_fp32:
+            contract["sampling"]["lm_head_fp32"] = True
         # Emitted only when set, like `episode` and `batch_target`: that is what
         # keeps the compiled profiles' contract bytes, and their digests,
         # identical to what the fleet already attests.
@@ -484,7 +513,7 @@ _CONTRACT_FIELDS = (
     "collection_seconds", "upload_grace_seconds", "sampling", "environments",
     "proofs",
 )
-_SAMPLING_FIELDS = ("rollouts", "temperature", "top_p", "top_k", "do_sample")
+_SAMPLING_FIELDS = ("rollouts", "temperature", "top_p", "top_k", "do_sample", "draw", "lm_head_fp32")
 _ENVIRONMENT_FIELDS = (
     "max_new_tokens", "answer_format", "bft", "prompt_template",
     "batch_target", "environment_contract_id", "environment_manifest_sha256",
@@ -687,6 +716,25 @@ def _proof_from_contract(index: int, body: Any) -> ProofProfile:
     )
 
 
+def _sampling_options_from_contract(body: Mapping[str, Any]) -> dict[str, Any]:
+    """``draw`` and ``lm_head_fp32``: present only when not the default, so a profile has
+    one encoding and an earlier contract its earlier bytes."""
+    context = "generation contract 'sampling'"
+    options: dict[str, Any] = {}
+    if "draw" in body:
+        draw = body["draw"]
+        if not isinstance(draw, str) or draw not in _DRAWS:
+            raise ValueError(f"{context} 'draw' must be one of {_DRAWS}, got {draw!r}")
+        if draw == DRAW_INVERSE_CDF:
+            raise ValueError(f"{context} 'draw' is the default {draw!r}: omit it")
+        options["draw"] = draw
+    if "lm_head_fp32" in body:
+        if not _coerce_bool(body["lm_head_fp32"], "lm_head_fp32", context=context):
+            raise ValueError(f"{context} 'lm_head_fp32' is the default false: omit it")
+        options["lm_head_fp32"] = True
+    return options
+
+
 def profile_from_contract(contract: Mapping[str, Any]) -> ProtocolProfile:
     """Rebuild a profile from what ``to_generation_contract`` produced.
 
@@ -764,6 +812,7 @@ def profile_from_contract(contract: Mapping[str, Any]) -> ProtocolProfile:
                 context="generation contract 'sampling'",
             ),
             do_sample=bool(_required(sampling_body, "do_sample", context="generation contract 'sampling'")),
+            **_sampling_options_from_contract(sampling_body),
         ),
         environments={
             name: _environment_from_contract(name, body)
@@ -1299,6 +1348,23 @@ _PROFILE_VALUES = (
                 # One pass through the 10,871-problem train split at 8 a window.
                 prompt_cooldown_windows=1359,
             ),
+            "reliquary_hard_math_v1": EnvironmentProfile(
+                # The competition-maths budget, not yet measured on this
+                # corpus, which is harder than DAPO's on upstream's pass rates.
+                max_new_tokens=32768,
+                bft=None,
+                answer_format="boxed",
+                batch_target=8,
+                prompt_template=PromptTemplateProfile(
+                    "reliquary-external-prompt-v1", "$problem",
+                ),
+                environment_contract_id="reliquary/boxed-answer/v1",
+                environment_manifest_sha256=(
+                    "cda025161a6c551abed72a96b7cbbefdac5cf5eab217df37831d947b2e55a6df"
+                ),
+                # One pass through the 23,227-problem train split at 8 a window.
+                prompt_cooldown_windows=2904,
+            ),
             "reliquary_instruction_following_v1": EnvironmentProfile(
                 max_new_tokens=8192,
                 bft=None,
@@ -1335,6 +1401,42 @@ _PROFILE_VALUES = (
                 ),
                 # No cooldown override: 2,481,806 prompts at 16 a window outlast
                 # the global horizon, which is what that horizon was sized for.
+            ),
+            "reliquary_competitive_code_v1": EnvironmentProfile(
+                # The package's own default, not yet measured on this policy:
+                # twice the sibling's, since an algorithm comes before the
+                # program.
+                max_new_tokens=16384,
+                bft=None,
+                answer_format="fenced_python",
+                batch_target=8,
+                prompt_template=PromptTemplateProfile(
+                    "reliquary-external-prompt-v1", "$problem",
+                ),
+                environment_contract_id="reliquary/stdio-program/v1",
+                environment_manifest_sha256=(
+                    "42a38bda5b3e5910fde5fdfb0ea8537a5f2e53cdd1b2447ef4a8649757beac50"
+                ),
+                # One pass through the 2,718-problem RL share at 8 a window.
+                prompt_cooldown_windows=340,
+            ),
+            "reliquary_general_v1": EnvironmentProfile(
+                # The package's largest segment budget (chat and multi-turn,
+                # thinking); a corpus job declares its own segment's, from
+                # 2,048 to 16,384. Not measured on this policy.
+                max_new_tokens=16384,
+                bft=None,
+                answer_format="text",
+                batch_target=16,
+                prompt_template=PromptTemplateProfile(
+                    "reliquary-external-prompt-v1", "$problem",
+                ),
+                environment_contract_id="reliquary/checked-answer/v1",
+                environment_manifest_sha256=(
+                    "fc874fefc78de44891b94401a77f71d1b6fb4d5048e04d7908b073eb681b84f1"
+                ),
+                # One pass through the 122,638-row train split at 16 a window.
+                prompt_cooldown_windows=7664,
             ),
             "reliquary_telecom_solo_v1": EnvironmentProfile(
                 # For an episode this is the whole transcript, as `max_episode_tokens`.
@@ -1388,6 +1490,59 @@ _PROFILE_VALUES = (
             ),
         },
         throughput_tiebreak=None,
+    ),
+)
+
+# v10: v9 drawn with Gumbel-max instead of the inverse CDF (docs/rl-async-design.md 4.1).
+# Measured (offpolicy-lab, 2026-10-14/15, 9B, T=1 full vocab, vLLM 0.30 runner-keyed
+# miners on 3090/A6000/L40/5090, HF proof-path validators): honest stochastic match 0.986
+# on every card (spread 0.0006) against 0.945-0.950 for the inverse CDF, no rollout under
+# 0.95, no honest group rejected; 0.994 with an fp32 LM head on both sides (``lm_head_fp32``,
+# decided 2026-10-15: on). The new version moves the forced-seed domain too, so v9 and v10
+# streams never coincide.
+# The math envs get a 64k cap (2026-10-19 budget probe of the SFT starting model, docs/rl-async-qualification.md):
+# at 32k about half the rollouts cut were correct once given room, so a cut there scored good reasoning 0.
+# Competitive code too (2026-10-20 probe of the same model): at 16k about half its rollouts were cut, at 64k a sixth.
+_TEUTONIC_V9 = next(p for p in _PROFILE_VALUES if p.profile_id == "teutonic-9b-reliquary-suite-v9-dev1")
+_V10_LONG_MAX_NEW_TOKENS = 65536
+_V10_LONG_ENVS = ("reliquary_dapo_math_v1", "reliquary_hard_math_v1", "reliquary_competitive_code_v1")
+# EnvScaler tool worlds (2026-10-21): a replayed episode env on the lease path (validator/rl_suite_episodes.py), the
+# run's native function-calling env. RL range [0, 1296) (26 worlds no SFT row comes from). 65,536 an episode, the
+# world's own 25 turns, and a suite turn's cap (corpus.job.MAX_SUITE_TOKENS_PER_TURN, 3,276): a turn's whole text is
+# one GeneratedAction, refused past 16 KiB; at 8,192 a turn 4 % of the episodes on the 2026-10-21 H200 probe
+# overran it, and a lease of 16 dies with one of them. The signed episodes' engine (8,192 a turn) cannot serve it:
+# a miner mines it with a process of its own.
+# TODO(GPU): measure the policy's success per RL world and narrow the range off the worlds it never solves.
+_V10_ENVSCALER = EnvironmentProfile(
+    # For an episode this is the whole transcript, as `max_episode_tokens`.
+    max_new_tokens=65536,
+    bft=None,
+    answer_format="episode_json_action_v1",
+    batch_target=16,
+    environment_contract_id="envscaler-tools-v2",
+    environment_manifest_sha256=(
+        "d933a0f97d71e69ef55768f74bf27f96876c7e3ce61b9b3649f2ae7bb002c370"
+    ),
+    episode=EpisodeProfile(
+        schema="reliquary/episode/v1",
+        renderer_id="reliquary-chatml-tools-v1",
+        max_turns=25,
+        max_action_tokens=3276,
+        max_episode_tokens=65536,
+        max_observation_bytes=65536,
+    ),
+)
+_PROFILE_VALUES = _PROFILE_VALUES + (
+    replace(
+        _TEUTONIC_V9,
+        profile_id="teutonic-9b-reliquary-suite-v10-gumbel-dev1",
+        protocol_version=10,
+        sampling=replace(_SAMPLING_DAPO, draw=DRAW_GUMBEL_MAX, lm_head_fp32=True),
+        environments={
+            **{name: (replace(env, max_new_tokens=_V10_LONG_MAX_NEW_TOKENS) if name in _V10_LONG_ENVS else env)
+               for name, env in _TEUTONIC_V9.environments.items()},
+            "envscaler_tools_v2": _V10_ENVSCALER,
+        },
     ),
 )
 
@@ -1505,6 +1660,8 @@ __all__ = [
     "ACTIVE_PROTOCOL_PROFILE",
     "BFTProfile",
     "DEFAULT_PROFILE_ID",
+    "DRAW_GUMBEL_MAX",
+    "DRAW_INVERSE_CDF",
     "EnvironmentProfile",
     "EpisodeProfile",
     "PromptTemplateProfile",

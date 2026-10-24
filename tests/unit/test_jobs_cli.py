@@ -554,6 +554,16 @@ class _StatusRecords:
     def __init__(self, submissions, verdicts, state):
         self.submissions, self.verdicts, self.state = submissions, verdicts, state
 
+    async def read_job(self, job_id):
+        from reliquary.corpus.job import parse_job
+        from tests.unit.test_corpus_service import _manifest
+
+        return parse_job({**_manifest(), "job_id": job_id}), None
+
+    async def read_ledgers(self, job_id):
+        return {"schema": "reliquary/corpus-ledgers/v2", "slots": {"0": len(self.submissions)},
+                "cursors": {}, "seen_pending": [], "seen_segments": []}, None
+
     async def list_submission_ids(self, job_id):
         return sorted(self.submissions)
 
@@ -599,6 +609,19 @@ def test_jobs_status_is_not_drained_while_a_settlement_is_pending(monkeypatch):
                                         "pending": {"window": 46001, "ids": ids}})
     result = _status(monkeypatch, records)
     assert "pending=46001" in result.output and "drained: no" in result.output
+
+
+def test_jobs_status_names_committed_bodies_still_pending_publication(monkeypatch):
+    class Pending(_StatusRecords):
+        async def read_ledgers(self, job_id):
+            return {"schema": "reliquary/corpus-ledgers/v3", "slots": {"0": 1},
+                    "cursors": {}, "seen_pending": ["c" * 64], "seen_segments": [],
+                    "pending_records": [{"submission_id": "a" * 64, "sha256": "b" * 64,
+                                         "received_at": 123.0}]}, '"pending"'
+
+    result = _status(monkeypatch, Pending([], [], {"pending": None}))
+    assert result.exit_code == 0, result.output
+    assert "pending_records=1" in result.output and "drained: no" in result.output
 
 
 def test_without_a_declared_budget_the_job_takes_the_templates_own(bucket, registry):

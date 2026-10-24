@@ -10,12 +10,8 @@ def main(argv=None):
     import sys
 
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments and arguments[0] == "competition":
-        from .affine_competition_cli import main as competition_main
-
-        return competition_main(arguments[1:])
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("check", "delegate", "prepare", "run", "evidence", "reconcile", "competition"))
+    parser.add_argument("command", choices=("check", "delegate", "prepare", "run", "evidence", "reconcile"))
     parser.add_argument("--config", required=True)
     parser.add_argument("--epoch")
     parser.add_argument("--miner")

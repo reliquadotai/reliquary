@@ -1,12 +1,10 @@
 """Span chunking: a short trailing chunk is merged into the previous one."""
 
-import json
-from pathlib import Path
-
 import pytest
 import torch
 
 from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS as PROOF
+from reliquary.protocol.toploc import sequence_verdict
 from reliquary.protocol.toploc_proof import (
     MIN_CHUNK_TOKENS,
     build_chunk_proofs,
@@ -16,8 +14,6 @@ from reliquary.protocol.toploc_proof import (
     verify_chunk_proofs,
     verify_span_proofs,
 )
-
-_M1 = Path(__file__).resolve().parents[2] / "docs/design/measurements"
 
 
 @pytest.mark.parametrize("length,bounds", [
@@ -64,14 +60,28 @@ def test_verify_refuses_a_proof_count_that_is_not_the_span_count():
         verify_span_proofs(hidden, proofs, chunk_tokens=32, topk=128)
 
 
-def test_m1_short_chunks_are_the_only_ones_above_the_full_chunk_band():
-    chunks = []  # (chunk length, exp mismatches) over both M1 runs
-    for name in ("2026-10-03-m1-agentic-proofs.json",
-                 "2026-10-03-m1-agentic-proofs-control-cache-off.json"):
-        for row in json.loads((_M1 / name).read_text())["report"]:
-            start, end = row["span"]
-            for i, (exp, _mean, _median) in enumerate(row["chunks"]):
-                chunks.append((min(PROOF.chunk_tokens, end - start - PROOF.chunk_tokens * i), exp))
-    full_max = max(exp for length, exp in chunks if length == PROOF.chunk_tokens)
-    outliers = {length for length, exp in chunks if exp > full_max}
-    assert outliers and max(outliers) < MIN_CHUNK_TOKENS
+@pytest.mark.parametrize("tail_tokens", range(1, MIN_CHUNK_TOKENS + 1))
+def test_synthetic_tail_outlier_is_merged_only_below_the_standalone_boundary(tail_tokens):
+    hidden = torch.cat((
+        torch.full((PROOF.chunk_tokens, PROOF.topk), 4.0, dtype=torch.bfloat16),
+        torch.full((tail_tokens, PROOF.topk), 0.25, dtype=torch.bfloat16),
+    ))
+    replayed = hidden.clone()
+    replayed[-tail_tokens:] *= 2  # Change only the low-magnitude tail's bf16 exponent.
+    shape = {"chunk_tokens": PROOF.chunk_tokens, "topk": PROOF.topk}
+    fixed = verify_chunk_proofs(replayed, build_chunk_proofs(hidden, **shape), **shape)
+    assert len(fixed) == 2 and fixed[0].exp_mismatches == 0
+    assert fixed[1].exp_mismatches > PROOF.exp_mismatch_threshold
+    assert sequence_verdict(fixed, PROOF.thresholds()) == (False, "exp_mismatch")
+
+    spans = verify_span_proofs(replayed, build_span_proofs(hidden, **shape), **shape)
+    if tail_tokens < MIN_CHUNK_TOKENS:
+        assert span_chunk_bounds(len(hidden), PROOF.chunk_tokens) == [(0, len(hidden))]
+        assert len(spans) == 1 and spans[0].exp_mismatches == fixed[0].exp_mismatches
+        assert sequence_verdict(spans, PROOF.thresholds()) == (True, None)
+    else:
+        assert span_chunk_bounds(len(hidden), PROOF.chunk_tokens) == [
+            (0, PROOF.chunk_tokens), (PROOF.chunk_tokens, len(hidden)),
+        ]
+        assert spans == fixed
+        assert sequence_verdict(spans, PROOF.thresholds()) == (False, "exp_mismatch")

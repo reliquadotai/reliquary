@@ -19,7 +19,7 @@ import hashlib
 import inspect
 import json
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -164,6 +164,7 @@ class TasksetHandle:
     package: str | None = None
     package_version: str | None = None
     verifiers_version: str | None = None
+    artifact_sha256: str | None = None
     score_trace: Callable[..., float] | None = None
     refuse: Callable[[Any], str | None] | None = None
     _by_key: dict | None = field(default=None, repr=False)
@@ -182,7 +183,32 @@ class TasksetHandle:
     def provenance(self) -> dict:
         return {"id": self.taskset_id, "args": self.args, "package": self.package,
                 "package_version": self.package_version,
-                "verifiers_version": self.verifiers_version}
+                "verifiers_version": self.verifiers_version,
+                **({"artifact_sha256": self.artifact_sha256} if self.artifact_sha256 else {})}
+
+
+def installed_artifacts(package: str | None) -> str:
+    from importlib.metadata import distribution
+    from reliquary.eval.protocol import digest
+
+    files = {}
+    for name in (package, "verifiers"):
+        if name is None:
+            raise ValueError("an evaluation taskset must be installed as a distribution")
+        dist = distribution(name)
+        code_files = 0
+        for path in dist.files or ():
+            if str(path).endswith("direct_url.json"):
+                direct = json.loads(Path(path.locate()).read_bytes())
+                if direct.get("dir_info", {}).get("editable") is True:
+                    raise ValueError("frozen evaluation packages require a non-editable artifact")
+            if path.suffix == ".py":
+                code_files += 1
+            if path.suffix == ".py" or str(path).endswith("direct_url.json"):
+                files[f"{name}/{path}"] = hashlib.sha256(Path(path.locate()).read_bytes()).hexdigest()
+        if not code_files:
+            raise ValueError("an evaluation taskset needs installed artifact hashes")
+    return digest(files)
 
 
 def open_taskset(taskset_id_: str, args: dict) -> TasksetHandle:
@@ -200,7 +226,8 @@ def open_taskset(taskset_id_: str, args: dict) -> TasksetHandle:
     package, package_version = _distribution_of(type(taskset).__module__)
     return TasksetHandle(taskset_id_, dict(args), taskset, package=package,
                          package_version=package_version,
-                         verifiers_version=_verifiers_version(), score_trace=score_trace,
+                         verifiers_version=_verifiers_version(), artifact_sha256=installed_artifacts(package),
+                         score_trace=score_trace,
                          refuse=refusal)
 
 
@@ -262,7 +289,15 @@ def _docker_missing(exc: BaseException) -> bool:
     return any(s in text for s in ("docker", "no such file or directory", "connection refused"))
 
 
-def score_answer(handle: TasksetHandle, key: str, frozen_sha256: str, answer: str) -> float:
+def reference_sha256(task) -> str:
+    from reliquary.eval.protocol import digest
+
+    data = task.data.model_dump(mode="json") if hasattr(task.data, "model_dump") else vars(task.data)
+    return digest(data)
+
+
+def score_answer(handle: TasksetHandle, key: str, frozen_sha256: str, answer: str,
+                 reference: str | None = None) -> float:
     """The task's score for ``answer``; ``LookupError("source_drift")`` when the
     task no longer holds the prompt the set froze (``frozen_sha256``)."""
     try:
@@ -272,6 +307,8 @@ def score_answer(handle: TasksetHandle, key: str, frozen_sha256: str, answer: st
         raise LookupError("source_drift") from None
     frozen = freeze(task)
     if prompt_digest(frozen.system, frozen.prompt) != frozen_sha256:
+        raise LookupError("source_drift")
+    if reference is not None and reference_sha256(task) != reference:
         raise LookupError("source_drift")
     return float(handle.score_trace(task, frozen, answer))
 
@@ -288,8 +325,8 @@ def _child_handle(name: str, args_json: str) -> TasksetHandle:
 
 
 def _score_in_child(name: str, args_json: str, key: str, frozen_sha256: str,
-                    answer: str) -> float:
-    return score_answer(_child_handle(name, args_json), key, frozen_sha256, answer)
+                    answer: str, reference: str | None = None) -> float:
+    return score_answer(_child_handle(name, args_json), key, frozen_sha256, answer, reference)
 
 
 def _provenance_in_child(name: str, args_json: str) -> dict:
@@ -346,8 +383,9 @@ class ChildScorer:
                 self._kill()
                 raise ScoreTimeout(f"scoring took over {self._timeout:.0f} s") from None
 
-    def score(self, name: str, args: dict, key: str, frozen_sha256: str, answer: str) -> float:
-        return self._call(_score_in_child, name, _canonical(args), key, frozen_sha256, answer)
+    def score(self, name: str, args: dict, key: str, frozen_sha256: str, answer: str,
+              reference: str | None = None) -> float:
+        return self._call(_score_in_child, name, _canonical(args), key, frozen_sha256, answer, reference)
 
     def provenance(self, name: str, args: dict) -> dict:
         """The taskset and verifiers versions installed where rows are scored."""
@@ -371,7 +409,7 @@ def _args_tag(args: dict) -> str:
 def build_set(source: str, *, out: str | Path, start: int, count: int | None,
               sample: int | None, seed: int | None, set_id: str | None,
               taskset_args: dict, open_taskset: Callable[[str, dict], TasksetHandle],
-              clock: Callable[[], float] = time.time) -> dict:
+              clock: Callable[[], float] = time.time, protocol: dict | None = None) -> dict:
     """Freeze tasks ``[start, start + count)`` of the taskset, whole or sampled."""
     from reliquary.eval import sets
 
@@ -404,6 +442,7 @@ def build_set(source: str, *, out: str | Path, start: int, count: int | None,
                         "interaction": sets.INTERACTION, "messages": messages})
         grading.append({"problem_id": problem_id, "source": source, "source_index": index,
                         "task_key": frozen.key,
+                        "reference_sha256": reference_sha256(task),
                         "prompt_sha256": prompt_digest(frozen.system, frozen.prompt)})
     card = {
         "schema": sets.SET_SCHEMA, "set_id": set_id, "env": source, "source": source,
@@ -417,11 +456,11 @@ def build_set(source: str, *, out: str | Path, start: int, count: int | None,
         "created_at": clock(), "taskset": handle.provenance(), "needs_runtime": runtime,
         "prompt_template_id": None, "default_max_new_tokens": None,
         "environment_manifest_sha256": None,
-        "disjointness": {"external_benchmark": True, "disjoint": True, "rl": [],
-                         "corpus": [], "held_out": [],
-                         "note": "not in Reliquary training data"},
+        "disjointness": {"external_benchmark": None, "disjoint": None, "rl": None,
+                         "corpus": None, "held_out": None,
+                         "note": "training overlap is unknown without reviewed source evidence"},
     }
-    return sets._write_set(directory, prompts, grading, card)
+    return sets._write_set(directory, prompts, grading, card, protocol=protocol)
 
 
 __all__ = [

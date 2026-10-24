@@ -262,10 +262,9 @@ def test_worker_adoption_binds_real_published_number_profile_and_loaded_oid(monk
         training_run_id=profile["training_run_id"], checkpoint_n=7,
         repo_id="test/checkpoints", revision=REV)
     commits = [SimpleNamespace(commit_id=REV, title="checkpoint 7 (test)")]
-    def api(**kwargs):
-        assert kwargs == {"token": False}
-        return SimpleNamespace(list_repo_commits=lambda **kw: commits)
-    monkeypatch.setattr(huggingface_hub, "HfApi", api)
+    def commit_source(repo_id):
+        assert repo_id == cp.repo_id
+        return ((c.commit_id, c.title) for c in commits)
     def download(repo, name, **kwargs):
         assert (repo, name, kwargs) == (cp.repo_id, CHECKPOINT_PROFILE_NAME,
                                        {"revision": REV, "token": False})
@@ -274,15 +273,16 @@ def test_worker_adoption_binds_real_published_number_profile_and_loaded_oid(monk
     pool = MetadataPool()
     pool.bound = (7, cp.repo_id, REV)
     pool.describe = lambda device: {"revision": pool.installed}
-    backend = ProofBackend(pool)
+    backend = ProofBackend(pool, commit_source=commit_source)
     backend.adopt(cp)
     assert pool.installed == REV
     with pytest.raises(ValueError, match="number"):
         backend.adopt(cp.model_copy(update={"checkpoint_n": 8}))
-    commits.append(SimpleNamespace(commit_id="d" * 40, title="checkpoint 7 (duplicate)"))
+    # A later commit claiming the same number (history is newest first).
+    commits.insert(0, SimpleNamespace(commit_id="d" * 40, title="checkpoint 7 (duplicate)"))
     with pytest.raises(ValueError, match="ambiguous"):
         backend.adopt(cp)
-    commits.pop()
+    commits.pop(0)
     profile["training_run_id"] = "another-run"
     (tmp_path / CHECKPOINT_PROFILE_NAME).write_text(json.dumps(profile))
     with pytest.raises(ValueError, match="training_run_id"):
@@ -324,3 +324,31 @@ def test_remote_unavailability_is_visible_before_new_window(controller):
     assert "remote_proof_unavailable" in snapshot["degraded_reasons"]
     with pytest.raises(FatalProofPlaneError):
         asyncio.run(service._ensure_proof_scheduler_ready())
+
+
+def test_worker_adoption_reads_only_commits_newer_than_the_last_scan():
+    """Each adoption used to page the whole HF history (72 pages, ~6 s in
+    production, growing with every checkpoint). A commit id covers its
+    ancestors, so the scan stops at the first commit already verified."""
+    from reliquary.validator.remote_proof_server import _scan_published_commits
+
+    old = [("c" * 40, "checkpoint 2 (x)"), ("b" * 40, "checkpoint 1 (x)")]
+    read = []
+
+    def source(history):
+        def pages(repo_id):
+            for item in history:
+                read.append(item)
+                yield item
+        return pages
+
+    first = _scan_published_commits(source(old), "r", [])
+    assert first == old and len(read) == 2
+    read.clear()
+    head = [("e" * 40, "checkpoint 4 (x)"), ("d" * 40, "checkpoint 3 (x)")]
+    second = _scan_published_commits(source(head + old), "r", first)
+    assert second == head + old
+    assert read == head + [old[0]]  # stopped at the first verified commit
+
+    rewritten = [("f" * 40, "checkpoint 1 (squashed)")]
+    assert _scan_published_commits(source(rewritten), "r", second) == rewritten

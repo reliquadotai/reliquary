@@ -62,6 +62,13 @@ def test_legacy_config_uses_causal_lm_auto_class():
     assert auto_model_class_for_config(cfg).__name__ == "AutoModelForCausalLM"
 
 
+def test_qwen35_text_config_uses_causal_lm_auto_class():
+    # Teutonic-I with Qwen3.5 attention grafted: a text-only Qwen3.5 checkpoint.
+    cfg = SimpleNamespace(model_type="qwen3_5_text", architectures=["Qwen3_5ForCausalLM"])
+
+    assert auto_model_class_for_config(cfg).__name__ == "AutoModelForCausalLM"
+
+
 def test_checkpoint_download_patterns_include_qwen35_shards():
     assert "model*.safetensors" in MODEL_SNAPSHOT_ALLOW_PATTERNS
     assert "model.safetensors.index.json" in MODEL_SNAPSHOT_ALLOW_PATTERNS

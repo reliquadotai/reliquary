@@ -147,14 +147,9 @@ unchanged.
 
 ### 7. Budget
 
-A cap of 0 pays nothing and counts for nothing in `total_cap`, so freeing a
+A cap of 0 pays nothing new and counts for nothing in `total_cap`, so freeing a
 finished task's share needs no new registry status (one an older binary could not
-read). `reliquary tasks close --task-id X` sets the cap to 0, then retires the task,
-and refuses unless:
-- its job is drained (every submission has a verdict, every verdict is settled);
-- for a `period-ema-v1` task: its replayed pay is below 0.1 % of its cap (computed
-  from its archives as the weight setter would), i.e. what it earned is paid;
-- for a task settled by RL window: `--cut-tail`, since its pay never decays by itself.
+read). See §9 for how a task is closed.
 
 ### 8. Transition: a job keeps the rule it was declared under
 
@@ -184,6 +179,64 @@ serve old and new jobs side by side.
 Evaluation jobs are corpus tasks: once this ships they are declared
 `period-ema-v1` like any new job.
 
+**2026-10-08: the window settlement is gone for corpus tasks.** Every corpus
+entry is declared `period-ema-v1` (`jobs create` and the admin service alike;
+`--settlement windows` is refused). The corpus validator, its split judges and
+the order control settle only period tasks; a window-settled one is refused
+when wired hot and left out with an ERROR at startup (never a crash, so a stale
+`RELIQUARY_TASK_ID` does not stop the others). The weight setter no longer
+replays a corpus task's window archives, which stay in R2; their windows still
+count in the shared horizon, so RL's replay is byte-identical. Every corpus
+window task left in prod was at cap 0 or retired when this shipped.
+
+### 9. Closing a task
+
+**The cap governs only the periods still to be worked.** Until 2026-10-08 the
+weight setter held every archive, and the task, to the task's *current* cap, so
+setting the cap to 0 when a job finished cut the tail it had earned (measured:
+`corpus-science-v1`, cap 0 eleven periods after its last entry, lost about
+0.01 pool·period, 0.5 % of what it earned). Now:
+
+- each archive records the cap it was settled under (`cap`);
+- the weight setter pays it up to that cap, never past the task's pay ceiling
+  `max(cap, tail_cap)`, where `tail_cap` is the highest cap the task had,
+  written by `set_cap` whenever a period task's cap is lowered. An archive
+  written before `cap` was recorded is held to the ceiling;
+- the per-task bound is `CATCHUP_ENTRIES` × the ceiling (was × the cap);
+- a period settled at cap 0 writes no archive: nothing new is ever paid.
+
+So a lowered cap lets the earned tail run out in full (to the loss
+`(1 − α)^(K+1)`), and no period pays more than the cap it was settled under. A
+cap lowered by a binary older than this writes no `tail_cap`, and its tail is
+cut as before.
+
+**A finished job closes itself.** The corpus validator's job set looks, at most
+every 10 minutes, for a served job that is full (every prompt's slots taken, or
+every eval prompt complete) and drained (no write being admitted, nothing
+ungraded or held by its grader, every submission audited, every verdict
+settled, so no period open and the last archive written), with its task active,
+period-settled, paying and not paused. It then writes cap 0 through
+`set_task_cap` (compare-and-swap, guarded on the entry still being that job's,
+active and paying), once, logged at INFO with the job's counts. A cap already 0
+is skipped, so a restart writes nothing again. `RELIQUARY_CORPUS_AUTOCLOSE=0`
+turns it off.
+
+The task is **not retired** automatically: a retired task named in a corpus
+validator's `RELIQUARY_TASK_ID` stops that validator from starting (and
+rollback containers on older images would loop on it), while a retirement
+frees nothing a 0 cap has not already freed.
+
+**`reliquary tasks close --task-id X`** sets the cap to 0 (if it is not) and
+retires the task, refusing unless its job is drained. It no longer waits for
+the tail to decay, since the cap no longer cuts it; it prints the tail still
+being paid. `--cut-tail` is accepted and ignored.
+
+**Budget while a tail pays.** A 0 cap frees the share in `total_cap` at once,
+while the tail is still paid from it for up to K periods (about 29 h, 99 %
+within 17 h). A share reassigned meanwhile can make the sum paid exceed the
+pool; the weight setter's global clamp then scales every miner down for that
+time. Reassign once the tail has run out.
+
 ## Parameters
 
 | Name | Value | Where |
@@ -192,7 +245,7 @@ Evaluation jobs are corpus tasks: once this ships they are declared
 | N, α | 6, 2/7 | protocol constant |
 | replay depth K | 24 periods | protocol constant |
 | admission slack | the auditor's accept slack (420 s) | existing |
-| close threshold | replayed pay < 0.1 % of cap | `tasks close` |
+| autoclose pass | at most every 600 s | `corpus_autoclose` |
 
 ## Tests
 
@@ -210,9 +263,12 @@ Evaluation jobs are corpus tasks: once this ships they are declared
   appear in window listings or move the horizon.
 - Mode: an entry without `settlement` is settled by today's settler; `jobs create`
   writes `period-ema-v1`.
-- `tasks close`: refused while undrained, above threshold, or window-settled without
-  `--cut-tail`; a real corpus entry takes cap 0 then retires; a 0 cap frees its
-  share in `total_cap`.
+- `tasks close`: refused while undrained; a real corpus entry takes cap 0 (its
+  `tail_cap` kept) then retires; a 0 cap frees its share in `total_cap`.
+- Tail (§9): a cap set to 0 while archives still queue pays exactly what they
+  earned, nothing more; a period settled at cap 0 writes nothing.
+- Autoclose (§9): full but undrained, paused, retired or already at cap 0: no
+  write; finished: one write, none after a restart.
 
 ## Rulings from the branch review
 
@@ -243,5 +299,6 @@ Evaluation jobs are corpus tasks: once this ships they are declared
   whose settlement state is a window one.
 - **Deploying:** `jobs create` refuses a `period-ema-v1` job without
   `--fleet-knows-period-settlement`, the corpus-generation guard's pattern.
-- **A cap change applies to what is replayed from then on**, earned tails included,
-  as for window tasks: lower a period task's cap only once its job is drained.
+- **A cap change applies to the periods still to be worked** (2026-10-08, §9):
+  archives already written pay up to the cap they were settled under. (Before,
+  it applied to what was replayed from then on, earned tails included.)

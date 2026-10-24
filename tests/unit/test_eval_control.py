@@ -243,24 +243,22 @@ def test_the_audit_executor_speaks_the_eval_prefix_when_told():
 
 
 def test_settlement_archives_only_the_eval_tasks_this_process_serves():
+    import asyncio as _asyncio
+
+    from reliquary.infrastructure import corpus_period_store
+    from reliquary.infrastructure.corpus_period_store import R2PeriodArchives
     from reliquary.validator.eval_control import EvalArchives
 
-    written = []
-
-    async def upload(window, data, task_id):
-        written.append((task_id, window))
-
-    async def other_max(task_id):
-        return 7
-
-    archives = EvalArchives(served=lambda: {"order-eval-1", "code-v1"}, upload=upload,
-                            other_max=other_max)
-    asyncio.run(archives.write("order-eval-1", 7, {}))
-    assert written == [("order-eval-1", 7)]
+    guard = EvalArchives(served=lambda: {"order-eval-1", "code-v1"})
+    guard.refuse_unserved("order-eval-1")
     for task_id in ("order-eval-2", "code-v1"):
         with pytest.raises(RuntimeError):
-            asyncio.run(archives.write(task_id, 7, {}))
-    assert asyncio.run(archives.other_max("order-eval-1")) == 7
+            guard.refuse_unserved(task_id)
+    # The period archives the order control settles through ask the guard first.
+    archives = R2PeriodArchives(guard=guard)
+    with pytest.raises(RuntimeError):
+        _asyncio.run(archives.write("code-v1", 3, 4, {}))
+    assert corpus_period_store  # nothing reached the bucket
 
 
 def _three_way(h, results):
@@ -407,7 +405,8 @@ def test_the_corpus_control_refuses_an_eval_task_at_boot_and_never_reads_one_hot
     from reliquary.validator.corpus_validator import run_corpus_validator
 
     entry = SimpleNamespace(task_id="order-eval-1", job_id="order-eval-1", status="active",
-                            mechanism="corpus-generation", params={"cap": 0.02}, contract={})
+                            mechanism="corpus-generation",
+                            params={"cap": 0.02, "settlement": "period-ema-v1"}, contract={})
     with pytest.raises(RuntimeError, match="eval control"):
         asyncio.run(run_corpus_validator(
             entry=entry, cap=0.02, wallet=None, netuid=0, signer_client=None,

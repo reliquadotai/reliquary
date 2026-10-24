@@ -23,10 +23,9 @@ MECHANISM_RL_DISCOVERED_PRICE = "rl-discovered-price"
 # Corpus generation on a frozen checkpoint: paid per verified token, with the
 # price pinned by declaring floor == cap.
 MECHANISM_CORPUS_GENERATION = "corpus-generation"
-MECHANISM_NATIVE_AFFINE_POINTS = "native-affine-points"
+MECHANISM_SERVICE_RL = "rl-service-policy/v1"
 KNOWN_MECHANISMS = frozenset(
-    {MECHANISM_RL_DISCOVERED_PRICE, MECHANISM_CORPUS_GENERATION,
-     MECHANISM_NATIVE_AFFINE_POINTS}
+    {MECHANISM_RL_DISCOVERED_PRICE, MECHANISM_CORPUS_GENERATION, MECHANISM_SERVICE_RL}
 )
 # What a task may pin as the way its rollouts are verified. Declaring one makes every validator
 # run the same path whatever its card; declaring none lets each derive it, which is the default.
@@ -52,6 +51,26 @@ PRICE_PARAM_FIELDS = (
 # Optional per-task minimum-incentive floor: a hotkey's share is measured within
 # its own task, and absent keys fall back to the protocol-wide floor.
 INCENTIVE_FLOOR_FIELDS = ("min_incentive_share", "min_incentive_ramp_start")
+
+# How a corpus task is paid (``validator.corpus_periods``, which names the same
+# value): by its own drand periods. The only settlement a corpus task has.
+SETTLEMENT_PERIOD_EMA = "period-ema-v1"
+# A period task's highest cap paid, kept when its cap is lowered so the pay it
+# already earned is not cut (``validator.corpus_periods.pay_ceiling``).
+TAIL_CAP_PARAM = "tail_cap"
+# A period task's price ceiling, written together or not at all
+# (``validator.corpus_periods.price_params``, which names the same keys): the
+# pool share one verified token may pay, the alpha per million tokens it was
+# converted from, the miner alpha per period used, and when.
+MAX_PRICE_PARAM = "max_price_per_token"
+MAX_PRICE_PARAMS = (MAX_PRICE_PARAM, "max_price_alpha_per_mtoken",
+                    "max_price_miner_alpha_per_period", "max_price_set_at")
+# Omitted from ``set_cap``: the price ceiling is kept as it is.
+KEEP = object()
+# An async RL task's starting budget (``validator.rl_async_service``): what its
+# starting prices pay a period at the target mix; the cap stays the most a
+# period pays. Absent: the cap.
+RL_START_POOL_PARAM = "rl_start_pool"
 
 # Float addition of exact decimals is not exact; 1.0 must not fail by 1e-16.
 _SUM_TOLERANCE = 1e-9
@@ -84,6 +103,11 @@ class TaskEntry:
     # it: the contract says how generation happens, the job says which work to
     # do, and putting it inside would move every RL contract's digest.
     job_id: str | None = None
+    # Only on the explicit service mechanism; old readers refuse that mechanism.
+    # Absent fields never alter historical registry bytes or generation hashes.
+    service_contract: Mapping[str, Any] | None = None
+    # Admission is reversible; retirement and the economic controller remain separate.
+    admission: str = "open"
 
 
 def _number(value: Any, field: str) -> float:
@@ -121,6 +145,39 @@ def _validate_incentive_floor(params: Mapping[str, Any]) -> None:
         )
 
 
+def _validate_token_price(entry: TaskEntry) -> None:
+    declared = [f for f in MAX_PRICE_PARAMS if f in entry.params]
+    if not declared:
+        return
+    if len(declared) != len(MAX_PRICE_PARAMS):
+        missing = sorted(set(MAX_PRICE_PARAMS) - set(declared))
+        raise RegistryError(f"task {entry.task_id!r} price ceiling misses {', '.join(missing)}")
+    if (entry.mechanism != MECHANISM_CORPUS_GENERATION
+            or entry.params.get("settlement") != SETTLEMENT_PERIOD_EMA):
+        raise RegistryError(f"task {entry.task_id!r}: a price ceiling applies to a corpus "
+                            f"task settled by period ({SETTLEMENT_PERIOD_EMA})")
+    price, alpha, emission, _ = (_number(entry.params[f], f) for f in MAX_PRICE_PARAMS)
+    if price <= 0 or alpha <= 0 or emission <= 0:
+        raise RegistryError(f"task {entry.task_id!r} price ceiling must be positive; "
+                            "remove it to pay the cap alone")
+    if not math.isclose(price, alpha / 1e6 / emission, rel_tol=1e-9):
+        raise RegistryError(f"task {entry.task_id!r} price {price} is not {alpha} alpha per "
+                            f"million tokens at {emission} miner alpha per period")
+
+
+def _validate_rl_start_pool(entry: TaskEntry, cap: float) -> None:
+    if RL_START_POOL_PARAM not in entry.params:
+        return
+    if (entry.mechanism != MECHANISM_RL_DISCOVERED_PRICE
+            or entry.params.get("settlement") != SETTLEMENT_PERIOD_EMA):
+        raise RegistryError(f"task {entry.task_id!r}: {RL_START_POOL_PARAM} applies to an async RL "
+                            f"task settled by period ({SETTLEMENT_PERIOD_EMA})")
+    pool = _number(entry.params[RL_START_POOL_PARAM], RL_START_POOL_PARAM)
+    if not 0.0 < pool <= cap:
+        raise RegistryError(f"task {entry.task_id!r}: {RL_START_POOL_PARAM} {pool} must be "
+                            f"positive and at most the cap {cap}")
+
+
 def validate_entry(entry: TaskEntry) -> None:
     """Everything checkable about one entry without reading the image or R2."""
     try:
@@ -138,6 +195,32 @@ def validate_entry(entry: TaskEntry) -> None:
         )
     if entry.mechanism not in KNOWN_MECHANISMS:
         raise RegistryError(f"unknown incentive mechanism {entry.mechanism!r}")
+    if entry.mechanism == MECHANISM_SERVICE_RL:
+        from reliquary.protocol.service_contract import ServiceContract, ServiceContractError
+        if entry.service_contract is None or not isinstance(entry.contract, Mapping):
+            raise RegistryError("service tasks carry both generation and service contracts")
+        try:
+            contract = ServiceContract.from_dict(entry.service_contract)
+        except ServiceContractError as exc:
+            raise RegistryError(f"invalid service contract: {exc}") from exc
+        if contract.version != 2:
+            raise RegistryError("RL service tasks need service-contract/v2")
+        service = contract.to_dict()
+        if entry.env_split is not None:
+            raise RegistryError("service tasks take env shares from their schedule, not env_split")
+        if entry.params.get("min_incentive_share") != 0 or entry.params.get("min_incentive_ramp_start") != 0:
+            raise RegistryError("service payouts require explicit zero incentive floor to preserve absolute group entitlements")
+        if service["service_kind"] != "adaptive_training" or service["generation_contract_sha256"] != entry.profile_sha256:
+            raise RegistryError("service must bind this adaptive generation contract")
+        declared = set(entry.contract.get("environments", {}))
+        missing = sorted(set(service["environments"]) - declared)
+        if missing:
+            raise RegistryError(f"service environment absent from generation contract: {missing}")
+        if (service["checkpoint"]["repo"] != entry.contract.get("model_id") or
+            service["checkpoint"]["revision"] != entry.contract.get("model_revision")):
+            raise RegistryError("service checkpoint does not match generation model")
+    elif entry.service_contract is not None:
+        raise RegistryError("service contract requires the explicit service mechanism")
     if entry.verification is not None and entry.verification not in KNOWN_VERIFICATION:
         raise RegistryError(
             f"unknown verification replica {entry.verification!r}; "
@@ -145,6 +228,10 @@ def validate_entry(entry: TaskEntry) -> None:
         )
     if entry.status not in {"active", "retired"}:
         raise RegistryError(f"unknown status {entry.status!r}")
+    if entry.admission not in {"open", "paused"}:
+        raise RegistryError(f"unknown admission state {entry.admission!r}")
+    if entry.admission == "paused" and entry.mechanism != MECHANISM_CORPUS_GENERATION:
+        raise RegistryError("reversible admission applies to corpus tasks")
     missing = [f for f in PRICE_PARAM_FIELDS if f not in entry.params]
     if missing:
         raise RegistryError(f"missing price parameters: {', '.join(missing)}")
@@ -172,6 +259,12 @@ def validate_entry(entry: TaskEntry) -> None:
     cap = _number(entry.params["cap"], "cap")
     if not 0.0 <= cap <= 1.0:
         raise RegistryError(f"cap must be between 0.0 and 1.0, got {cap}")
+    if TAIL_CAP_PARAM in entry.params:
+        tail = _number(entry.params[TAIL_CAP_PARAM], TAIL_CAP_PARAM)
+        if not 0.0 <= tail <= 1.0:
+            raise RegistryError(f"{TAIL_CAP_PARAM} must be between 0.0 and 1.0, got {tail}")
+    _validate_token_price(entry)
+    _validate_rl_start_pool(entry, cap)
     floor = _number(entry.params["floor"], "floor")
     if floor > cap:
         raise RegistryError(f"floor {floor} exceeds cap {cap}")
@@ -190,29 +283,6 @@ def validate_entry(entry: TaskEntry) -> None:
             f"task {entry.task_id!r} names a job but its mechanism is "
             f"{entry.mechanism!r}, which does not run one"
         )
-    if entry.mechanism == MECHANISM_NATIVE_AFFINE_POINTS:
-        import re
-
-        contract = entry.contract
-        fields = {"schema", "authority", "epoch_digest", "manifest_digest", "bindings",
-                  "start", "deadline", "reward_basis", "enrollment_digest"}
-        if not isinstance(contract, Mapping) or set(contract) != fields:
-            raise RegistryError("native Affine task requires its exact competition contract")
-        if contract["schema"] != "affine-native-competition/v1" \
-                or contract["reward_basis"] != "native-finalized-observed-subset-weight" \
-                or entry.params.get("settlement") != "period-ema-v1" \
-                or floor != cap or entry.verification is not None or entry.env_split is not None:
-            raise RegistryError("native Affine task requires pinned cap and native period settlement")
-        if any(not isinstance(contract[name], str) or not re.fullmatch("[0-9a-f]{64}", contract[name])
-               for name in ("authority", "epoch_digest", "manifest_digest", "enrollment_digest")):
-            raise RegistryError("native Affine competition bindings must be SHA256/public-key hex")
-        bindings = contract["bindings"]
-        if not isinstance(bindings, Mapping) or set(bindings) != {
-            "bootstrapDigest", "checkpointDigest", "environmentDigest", "harnessDigest", "sourceBundleDigest"
-        } or any(not isinstance(v, str) or not re.fullmatch("[0-9a-f]{64}", v) for v in bindings.values()):
-            raise RegistryError("native Affine task requires exact runtime bindings")
-        if _number(contract["start"], "native start") >= _number(contract["deadline"], "native deadline"):
-            raise RegistryError("native Affine deadline must follow start")
     if entry.env_split is not None:
         if not isinstance(entry.env_split, Mapping) or not entry.env_split:
             raise RegistryError("env_split must be a non-empty object")
@@ -274,13 +344,7 @@ def validate_registry(entries: Mapping[str, TaskEntry]) -> None:
     # double-pay for one, and counting them would make a cancelled job
     # undeclarable forever. Their cap stays guarded by the sum above.
     claimed: dict[str, str] = {}
-    native_epochs: set[str] = set()
     for task_id, entry in sorted(entries.items()):
-        if entry.mechanism == MECHANISM_NATIVE_AFFINE_POINTS:
-            epoch = entry.contract["epoch_digest"]
-            if epoch in native_epochs:
-                raise RegistryError("one native Affine epoch is paid by one task")
-            native_epochs.add(epoch)
         if not entry.job_id or entry.status != "active":
             continue
         if entry.job_id in claimed:
@@ -349,12 +413,6 @@ def require_fleet_knows_corpus_generation(
     )
 
 
-def require_fleet_knows_native_affine_points(entry: TaskEntry, *, acknowledged: bool) -> None:
-    """An unknown native mechanism invalidates the whole registry on old readers."""
-    if entry.mechanism == MECHANISM_NATIVE_AFFINE_POINTS and not acknowledged:
-        raise RegistryError("every validator must know native-affine-points before declaration")
-
-
 def retire_task(
     entries: Mapping[str, TaskEntry], task_id: str, retired_at: int
 ) -> dict[str, TaskEntry]:
@@ -373,7 +431,7 @@ def retire_task(
 def set_cap(
     entries: Mapping[str, TaskEntry],
     task_id: str,
-    cap: float,
+    cap: float | None,
     floor: float | None = None,
     min_incentive_share: float | None = None,
     audit_q: float | None = None,
@@ -383,8 +441,13 @@ def set_cap(
     audit_ban_after_failures: int | None = None,
     audit_ban_window_seconds: float | None = None,
     audit_ban_seconds: float | None = None,
+    *,
+    token_price: Mapping[str, float] | None | object = KEEP,
 ) -> dict[str, TaskEntry]:
     """Change one live entry's cap (and optionally floor), nothing else.
+
+    ``cap`` None keeps the cap. ``token_price`` (``corpus_periods.price_params``)
+    sets a period task's price ceiling, None removes it, omitted keeps it.
 
     The contract and its digest stay as they are: a cap is what the task may
     pay, not how it generates. A corpus task's price follows its cap unless a
@@ -397,14 +460,32 @@ def set_cap(
     if task_id not in entries:
         raise RegistryError(f"task {task_id!r} is not in the registry")
     entry = entries[task_id]
+    if cap is None:
+        cap = _number(entry.params.get("cap"), "cap")
     if entry.status != "active":
         # A retired cap is reserved while its EMA decays; changing it would
         # hand out budget that is still being paid.
         raise RegistryError(f"task {task_id!r} is {entry.status}; its cap cannot change")
     params = {**entry.params, "cap": float(cap)}
+    old_cap = _number(entry.params.get("cap"), "cap")
+    if (entry.mechanism == MECHANISM_CORPUS_GENERATION
+            and entry.params.get("settlement") == SETTLEMENT_PERIOD_EMA
+            and float(cap) < old_cap):
+        # Its archives were paid under the old cap and still owe their tail:
+        # the weight setter keeps paying them up to the highest cap the task
+        # had (``corpus_periods.pay_ceiling``). The new cap prices only the
+        # periods still to be worked; at 0, none.
+        params[TAIL_CAP_PARAM] = max(
+            old_cap, _number(entry.params.get(TAIL_CAP_PARAM, 0.0), TAIL_CAP_PARAM))
+    if RL_START_POOL_PARAM in params and float(cap) < _number(params[RL_START_POOL_PARAM], RL_START_POOL_PARAM):
+        # A lowered cap bounds the starting budget too (at 0 nothing is paid: dropped).
+        if float(cap) > 0:
+            params[RL_START_POOL_PARAM] = float(cap)
+        else:
+            params.pop(RL_START_POOL_PARAM)
     if floor is not None:
         params["floor"] = float(floor)
-    elif entry.mechanism in {MECHANISM_CORPUS_GENERATION, MECHANISM_NATIVE_AFFINE_POINTS}:
+    elif entry.mechanism == MECHANISM_CORPUS_GENERATION:
         params["floor"] = float(cap)
     if min_incentive_share is not None:
         params["min_incentive_share"] = float(min_incentive_share)
@@ -424,7 +505,27 @@ def set_cap(
         params["audit_ban_window_seconds"] = float(audit_ban_window_seconds)
     if audit_ban_seconds is not None:
         params["audit_ban_seconds"] = float(audit_ban_seconds)
+    if token_price is not KEEP:
+        for field in MAX_PRICE_PARAMS:
+            params.pop(field, None)
+        if token_price is not None:
+            params.update({f: float(token_price[f]) for f in MAX_PRICE_PARAMS})
     updated = {**entries, task_id: replace(entry, params=params)}
+    validate_registry(updated)
+    return updated
+
+
+def set_admission(entries: Mapping[str, TaskEntry], task_id: str, admission: str) -> dict[str, TaskEntry]:
+    if admission not in {"open", "paused"}:
+        raise RegistryError("admission must be open or paused")
+    entry = entries.get(task_id)
+    if entry is None:
+        raise RegistryError(f"task {task_id!r} is not in the registry")
+    if entry.status != "active":
+        raise RegistryError(f"task {task_id!r} is retired; admission cannot reopen")
+    if entry.mechanism != MECHANISM_CORPUS_GENERATION:
+        raise RegistryError("reversible admission applies to corpus tasks")
+    updated = {**entries, task_id: replace(entry, admission=admission)}
     validate_registry(updated)
     return updated
 
@@ -499,6 +600,9 @@ def parse_registry(raw: bytes, *, strict: bool = True) -> dict[str, TaskEntry]:
             ),
             verification=_verification_of(task_id, body),
             job_id=_job_id_of(task_id, body),
+            service_contract=(None if body.get("service_contract") is None else
+                              json.loads(json.dumps(body["service_contract"]))),
+            admission=body.get("admission", "open"),
         )
     if strict:
         validate_registry(entries)
@@ -537,6 +641,11 @@ def render_registry(entries: Mapping[str, TaskEntry]) -> bytes:
         # entries renders exactly as it did before contracts existed.
         if entry.contract is not None:
             body["contract"] = dict(entry.contract)
+        if entry.service_contract is not None:
+            body["service_contract"] = dict(entry.service_contract)
+        # Keep the historical bytes when admission is open.
+        if entry.admission != "open":
+            body["admission"] = entry.admission
         return body
 
     document = {

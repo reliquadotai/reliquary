@@ -35,6 +35,8 @@ import math
 import time
 from collections.abc import Callable
 
+from reliquary.shared.async_tasks import gather_owned
+
 from reliquary.corpus.audit_policy import after_confirmed_failure, replay_drawn
 from reliquary.corpus.replay_compare import allowed_mismatches
 from reliquary.corpus.trajectory_parse import TrajectoryRefused, parse_trajectory
@@ -247,7 +249,7 @@ class CorpusGrader:
             async with gate:
                 return sid, await reader(self._job.job_id, sid)
 
-        for sid, meta in await asyncio.gather(*(one(sid) for sid in missing)):
+        for sid, meta in await gather_owned(one(sid) for sid in missing):
             if meta is not None:
                 self._learn_arrival(sid, meta.get("received_at"))
 
@@ -317,7 +319,10 @@ class CorpusGrader:
         await self._learn_arrivals(sid for sid in listed if sid not in self._final)
         await self._learn_arrivals(self._regrading | self._regrade_retry)
         self._listed = {sid for sid in listed if sid not in self._final}
-        for sid in listed:
+        # Oldest arrival first (the gate admits in this order): a period is paid
+        # once all of it is graded, so a backlog graded in id order, larger than
+        # what the executors grade meanwhile, would let no period close.
+        for sid in sorted(listed, key=lambda sid: (self._arrival.get(sid, math.inf), sid)):
             self._enqueue(sid)
         self._ungraded = sum(1 for sid in listed if sid not in self._final)
         for executor_id in sorted(self._held_executors - self._executor_regrades_inflight):
@@ -328,12 +333,19 @@ class CorpusGrader:
             self._spawn(self._regrade(sid))
 
     async def run(self) -> None:
-        while True:
-            try:
-                await self.rescan_once()
-            except Exception:
-                logger.exception("grader rescan of %s failed", self._job.job_id)
-            await asyncio.sleep(self._rescan)
+        try:
+            while True:
+                try:
+                    await self.rescan_once()
+                except Exception:
+                    logger.exception("grader rescan of %s failed", self._job.job_id)
+                await asyncio.sleep(self._rescan)
+        finally:
+            while self._tasks:
+                tasks = list(self._tasks)
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     # -- one submission ---------------------------------------------------------
 
@@ -621,7 +633,7 @@ class CorpusGrader:
                 regrade = await reader(self._job.job_id, sid) if reader is not None else None
                 return sid, grade, regrade
 
-        for sid, grade, regrade in await asyncio.gather(*(one(sid) for sid in pending)):
+        for sid, grade, regrade in await gather_owned(one(sid) for sid in pending):
             # Both: ``_regrade`` decides from the latest, whichever executor it is for.
             for document in (grade, regrade):
                 if document is not None:
@@ -760,7 +772,7 @@ class CorpusGrader:
         sids = sorted(self._sole.pop(executor_id, set()))
         self._regrading |= set(sids)
         self._held_executors.discard(executor_id)
-        await asyncio.gather(*(self._regrade(sid) for sid in sids))
+        await gather_owned(self._regrade(sid) for sid in sids)
         if sids:
             logger.warning("corpus job %s: re-graded %d submission(s) of quarantined executor %s",
                            self._job.job_id, len(sids), executor_id)

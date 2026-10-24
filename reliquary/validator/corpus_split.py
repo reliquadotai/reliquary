@@ -22,6 +22,7 @@ import asyncio
 import ctypes
 import importlib
 import logging
+import math
 import multiprocessing
 import os
 import signal
@@ -44,6 +45,7 @@ MAX_RESTART_BACKOFF_SECONDS = 60.0
 # A child up this long has its backoff reset.
 HEALTHY_SECONDS = 300.0
 STOP_GRACE_SECONDS = 20.0
+STOP_GRACE_ENV = "RELIQUARY_CORPUS_SPLIT_STOP_GRACE_SECONDS"
 POLL_SECONDS = 1.0
 
 
@@ -51,7 +53,7 @@ def judge_socket(run_dir: str | Path, index: int) -> Path:
     return Path(run_dir) / f"judge-{index}.sock"
 
 
-def plan_groups(value: str | None, jobs, *, front_only=()) -> list[list[str]]:
+def plan_groups(value: str | None, jobs, *, front_only=(), ignored=()) -> list[list[str]]:
     """The job ids of each judge process. ``jobs`` is ``(task_id, job_id)``
     pairs; ``value`` names jobs by job id or task id, ``,`` inside a group and
     ``;`` between groups; ``*`` gives every job no group names its own process.
@@ -60,7 +62,12 @@ def plan_groups(value: str | None, jobs, *, front_only=()) -> list[list[str]]:
     ``front_only`` are the job ids the front must judge itself (episode jobs:
     their grader, grade dispatcher and grade routes live in the front, judge
     processes host none). ``*`` leaves them there; a group naming one is
-    refused."""
+    refused.
+
+    ``ignored`` are the task and job ids left out of this validator (window
+    settled, ``corpus_validator.period_served``): a group naming one drops it
+    with an ERROR rather than refusing the start, and an emptied group goes."""
+    ignored = {str(name) for name in ignored}
     front_only = {str(j) for j in front_only}
     value = "*" if value is None or not value.strip() else value
     by_name: dict[str, str] = {}
@@ -81,6 +88,10 @@ def plan_groups(value: str | None, jobs, *, front_only=()) -> list[list[str]]:
         for name in names:
             if name == "*":
                 raise ValueError(f"{JUDGES_ENV}: '*' must be a group of its own")
+            if name not in by_name and name in ignored:
+                logger.error("%s names %r, which this validator left out (window settled); "
+                             "ignored", JUDGES_ENV, name)
+                continue
             if name not in by_name:
                 raise ValueError(f"{JUDGES_ENV} names {name!r}, which this validator does not serve "
                                  f"(it serves {sorted({str(j) for _, j in jobs})})")
@@ -94,7 +105,8 @@ def plan_groups(value: str | None, jobs, *, front_only=()) -> list[list[str]]:
                                  "a job is judged in exactly one process")
             placed.add(job_id)
             group.append(job_id)
-        groups.append(group)
+        if group:
+            groups.append(group)
     if star:
         groups += [[str(job_id)] for _, job_id in jobs
                    if str(job_id) not in placed and str(job_id) not in front_only]
@@ -152,10 +164,33 @@ def _set_parent_death_signal() -> None:
         logger.debug("PR_SET_PDEATHSIG unavailable", exc_info=True)
 
 
-def _exit_now(signum, frame) -> None:
-    logging.getLogger(__name__).info("corpus split: signal %d, exiting", signum)
-    logging.shutdown()
-    os._exit(0)
+async def _run_child(coroutine) -> None:
+    """A signal cancels this child's owner once and awaits its finalizers."""
+    loop = asyncio.get_running_loop()
+    owner = asyncio.current_task()
+    stopping = False
+
+    def stop() -> None:
+        nonlocal stopping
+        if not stopping:
+            stopping = True
+            owner.cancel()
+
+    signals = (signal.SIGTERM, signal.SIGINT)
+    previous = {sig: signal.getsignal(sig) for sig in signals}
+    # An ordinary handler lets Uvicorn replace it while it drains HTTP, then
+    # restore and replay it. A loop signal callback would also fire during
+    # that native drain and cancel the serving task prematurely.
+    for sig in signals:
+        signal.signal(sig, lambda signum, frame: loop.call_soon_threadsafe(stop))
+    try:
+        await coroutine
+    except asyncio.CancelledError:
+        if not stopping:
+            raise
+    finally:
+        for sig in signals:
+            signal.signal(sig, previous[sig])
 
 
 def _call(path: str) -> None:
@@ -222,20 +257,18 @@ def child_main(role: str, index: int, spec: SplitSpec) -> None:
         except OSError:
             pass
     _set_parent_death_signal()
-    # SIGTERM ends the child at once: what it was doing is safe to cut (create-only
-    # verdicts, CAS ledgers and settlement). The front's HTTP server takes the
-    # signal first, drains in-flight submissions, then re-raises it here.
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, _exit_now)
     logging.basicConfig(
         level=logging.INFO,
         format=f"%(asctime)s | {name} | %(threadName)s | %(name)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S", force=True)
+    from reliquary.shared.log_levels import unmute_reliquary_loggers
+
+    unmute_reliquary_loggers()          # bittensor muted the modules imported before it
     if spec.child_init:
         _call(spec.child_init)
     coroutine = {"front": lambda: _front(spec), "gpu": lambda: _gpu(spec),
                  "judge": lambda: _judge(spec, index)}[role]()
-    asyncio.run(coroutine)
+    asyncio.run(_run_child(coroutine))
 
 
 @dataclass
@@ -260,6 +293,9 @@ class Supervisor:
         self._clock = clock
         self._backoff = backoff_seconds
         self._max_backoff = max_backoff_seconds
+        self._stop_grace = float(os.environ.get(STOP_GRACE_ENV, STOP_GRACE_SECONDS))
+        if not math.isfinite(self._stop_grace) or self._stop_grace < 0:
+            raise ValueError(f"{STOP_GRACE_ENV} must be finite and nonnegative")
         self._context = multiprocessing.get_context("spawn")
         self.children: dict[str, _Child] = {"gpu": _Child("gpu", "gpu", 0)}
         for index in range(len(spec.groups)):
@@ -312,7 +348,11 @@ class Supervisor:
             if now >= child.restart_at and not self._stopping:
                 self._start(child)
 
-    def stop(self, grace_seconds: float = STOP_GRACE_SECONDS) -> None:
+    def stop(self, grace_seconds: float | None = None) -> None:
+        if grace_seconds is None:
+            grace_seconds = self._stop_grace
+        if not math.isfinite(grace_seconds) or grace_seconds < 0:
+            raise ValueError(f"{STOP_GRACE_ENV} must be finite and nonnegative")
         self._stopping = True
         live = [c.process for c in self.children.values()
                 if c.process is not None and c.process.is_alive()]
@@ -408,10 +448,14 @@ async def run_corpus_split(*, served, netuid: int, http_host: str, http_port: in
     if remote_audit:
         raise RuntimeError("remote audit executors are not served by the split validator; "
                            "unset RELIQUARY_CORPUS_REMOTE_AUDIT or RELIQUARY_CORPUS_SPLIT")
+    from reliquary.validator.corpus_validator import period_served
+
+    served, dropped = period_served(served)
     checked = await preflight(served)
     # Before any child starts: an episode job is judged and graded in the front.
     groups = plan_groups(os.environ.get(JUDGES_ENV), checked.jobs,
-                         front_only=checked.episode_jobs)
+                         front_only=checked.episode_jobs,
+                         ignored={str(n) for e in dropped for n in (e.task_id, e.job_id)})
     run_dir = os.environ.get(DIR_ENV) or DEFAULT_RUN_DIR
     spec = SplitSpec(served=list(served), directory=checked.directory,
                      fingerprint=checked.fingerprint, proof=checked.proof, run_dir=run_dir,

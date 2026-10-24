@@ -105,6 +105,21 @@ class CooldownMap:
         with self._lock:
             return len(self._last_batched)
 
+    @property
+    def cooldown_windows(self) -> int:
+        return self._cooldown_windows
+
+    def with_cooldown_windows(self, cooldown_windows: int) -> "CooldownMap":
+        """A NEW map with another horizon and the same recorded windows.
+
+        This map is not touched: a window already running keeps the horizon it
+        was built with, and the next window is built on the returned one.
+        """
+        changed = CooldownMap(_nonnegative_int(cooldown_windows, "cooldown_windows"))
+        with self._lock:
+            changed._last_batched = dict(self._last_batched)
+        return changed
+
     # ---------- persistence ----------
 
     def save(self, path) -> None:
@@ -283,3 +298,14 @@ class ContentCooldownMap:
     def __len__(self) -> int:
         with self._lock:
             return len(self._last_selected)
+
+    @property
+    def cooldown_windows(self) -> int:
+        return self._cooldown_windows
+
+    def with_cooldown_windows(self, cooldown_windows: int) -> "ContentCooldownMap":
+        """A NEW map with another horizon and the same recorded windows (this one is not touched)."""
+        changed = ContentCooldownMap(_nonnegative_int(cooldown_windows, "cooldown_windows"))
+        with self._lock:
+            changed._last_selected = dict(self._last_selected)
+        return changed

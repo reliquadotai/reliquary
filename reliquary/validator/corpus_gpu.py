@@ -17,11 +17,13 @@ from __future__ import annotations
 import array
 import asyncio
 import collections
+import inspect
 import json
 import logging
 import os
 import sys
 import time
+import traceback
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -172,6 +174,7 @@ class GpuBatcher:
         self._on_fatal = on_fatal
         self._fatal_after = fatal_after
         self._failures = 0
+        self.ready = True
         self.stats = collections.Counter()
 
     @property
@@ -204,9 +207,32 @@ class GpuBatcher:
     async def _call(self, rows, chunk_tokens, topk):
         from reliquary.validator.corpus_judge_threads import run_in
 
-        return await run_in(self._executor, self._score, rows, chunk_tokens, topk)
+        result = await run_in(self._executor, self._score, rows, chunk_tokens, topk)
+        if rows:
+            self.ready = True
+        return result
 
     def _failed(self, exc: BaseException) -> None:
+        self.ready = False
+        # Executor Futures may keep their own traceback. Clear completed
+        # synchronous forward frames, but never close a suspended caller if
+        # the same exception was raised before. Keep its type and message.
+        continuation_flags = inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR | inspect.CO_GENERATOR
+        pending, seen = [exc], set()
+        while pending:
+            error = pending.pop()
+            if id(error) in seen:
+                continue
+            seen.add(id(error))
+            pending.extend(link for link in (error.__cause__, error.__context__) if link is not None)
+            for frame, _ in traceback.walk_tb(error.__traceback__):
+                if frame.f_code.co_flags & continuation_flags:
+                    continue
+                try:
+                    frame.clear()
+                except RuntimeError:
+                    pass  # A still-executing synchronous caller cannot be cleared.
+            error.__traceback__ = error.__cause__ = error.__context__ = None
         if self._on_error is not None:
             self._on_error()
         if not is_out_of_memory(exc):
@@ -233,22 +259,28 @@ class GpuBatcher:
             return
         rows = [row for r in live for row in r.rows]
         started = time.monotonic()
+        failure = None
         try:
             scores, forward, verify = await self._call(rows, live[0].chunk_tokens, live[0].topk)
         except Exception as exc:  # noqa: BLE001 - handed to the requests
+            failure = exc
+        if failure is not None:
             self.stats["failed_batches"] += 1
-            self._failed(exc)
+            self._failed(failure)
             if len(live) == 1:
-                self._settle(live[0], exc=exc)
+                self._settle(live[0], exc=failure)
                 return
             logger.warning("corpus gpu batch of %d requests failed (%r); each alone",
-                           len(live), exc)
+                           len(live), failure)
             for request in live:
+                failure = None
                 try:
                     result = await self._call(request.rows, request.chunk_tokens, request.topk)
                 except Exception as alone:  # noqa: BLE001
-                    self._failed(alone)
-                    self._settle(request, exc=alone)
+                    failure = alone
+                if failure is not None:
+                    self._failed(failure)
+                    self._settle(request, exc=failure)
                 else:
                     self._failures = 0
                     self._settle(request, result)
@@ -284,7 +316,7 @@ def build_gpu_app(batcher: GpuBatcher, info: dict) -> FastAPI:
 
     @app.get("/info")
     async def gpu_info() -> dict:
-        return info
+        return {**info, "ready": batcher.ready}
 
     @app.post("/score")
     async def score(request: Request):
@@ -353,7 +385,7 @@ def _free_cuda() -> None:
         logger.debug("empty_cache failed", exc_info=True)
 
 
-async def serve_unix(app, path: str | Path) -> None:
+async def serve_unix(app, path: str | Path, *, services=()) -> None:
     """``app`` on the unix socket ``path`` (a stale one is removed first).
 
     Signals are left to the process (``corpus_split.child_main``): an
@@ -362,6 +394,7 @@ async def serve_unix(app, path: str | Path) -> None:
     import contextlib
 
     import uvicorn
+    from reliquary.validator.corpus_validator import _run_corpus_services
 
     class _Server(uvicorn.Server):
         @contextlib.contextmanager
@@ -372,7 +405,7 @@ async def serve_unix(app, path: str | Path) -> None:
     path.unlink(missing_ok=True)
     server = _Server(uvicorn.Config(app, uds=str(path), log_level="warning", ws="none",
                                     timeout_keep_alive=600))
-    await server.serve()
+    await _run_corpus_services(server, services)
 
 
 async def run_gpu_process(*, directory: str, run_dir: str, model_id: str = "",
@@ -398,19 +431,24 @@ async def run_gpu_process(*, directory: str, run_dir: str, model_id: str = "",
         # The answers in flight go out first; then the supervisor reloads us.
         loop.call_later(1.0, os._exit, 1)
 
-    batcher = GpuBatcher(score, executor=ThreadPoolExecutor(1, thread_name_prefix="corpus-gpu"),
+    executor = ThreadPoolExecutor(1, thread_name_prefix="corpus-gpu")
+    batcher = GpuBatcher(score, executor=executor,
                          on_error=_free_cuda, on_fatal=fatal)
     app = build_gpu_app(batcher, info)
-    server = asyncio.ensure_future(serve_unix(app, Path(run_dir) / GPU_SOCKET))
-    worker = asyncio.ensure_future(batcher.run())
-    # Published once the socket exists: a reader of the info can connect.
-    for _ in range(200):
-        if (Path(run_dir) / GPU_SOCKET).exists():
-            break
-        await asyncio.sleep(0.05)
-    write_info(run_dir, info)
-    logger.info("corpus gpu: ready (vocab %d)", info["vocab_size"])
-    await asyncio.gather(server, worker)
+
+    async def ready() -> None:
+        # Published once the socket exists: a reader of the info can connect.
+        for _ in range(200):
+            if (Path(run_dir) / GPU_SOCKET).exists():
+                break
+            await asyncio.sleep(0.05)
+        write_info(run_dir, info)
+        logger.info("corpus gpu: ready (vocab %d)", info["vocab_size"])
+
+    try:
+        await serve_unix(app, Path(run_dir) / GPU_SOCKET, services=[batcher.run(), ready()])
+    finally:
+        await asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=True)
 
 
 class GpuScorer:

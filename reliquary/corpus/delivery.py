@@ -36,6 +36,10 @@ READ_CONCURRENCY = 16
 READ_WINDOW = 64
 # Room left in a shard for the Parquet footer and page headers.
 SHARD_OVERHEAD_BYTES = 1024 * 1024
+# The private dataset library's JSONL limits, including JavaScript string length.
+INSTRUCTION_MAX_BYTES = 5 * 1024 * 1024
+INSTRUCTION_MAX_ROWS = 10_000
+INSTRUCTION_MAX_UTF16 = 32_000
 
 _DELIVERY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
@@ -93,6 +97,16 @@ class EpisodeUnrendered(ValueError):
     """The rebuilt messages do not render back to the row's tokens."""
 
 
+class EpisodeKindMismatch(ValueError):
+    """A record whose trajectory is not its job's kind: a transcript on a replay job's
+    record, or none on a signed-sandbox job's. The job chooses the parser, never the
+    record."""
+
+
+class EpisodeSandboxUnavailable(ValueError):
+    """A signed-sandbox job's row needs reliquary-sandbox, which this host cannot import."""
+
+
 def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, renderer,
                 user_prompt: str) -> dict:
     """The row of one graded trajectory. Messages are rebuilt from the proven
@@ -100,9 +114,13 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
     user messages must render to the record's prompt tokens, so the messages
     and the tokens are one and the same trajectory.
 
-    Raises ``TrajectoryRefused``, ``EpisodePromptMismatch`` or
-    ``EpisodeUnrendered``."""
-    from reliquary.corpus.trajectory_parse import parse_trajectory
+    The job chooses the parser (``is_signed_sandbox``): a replay job's record never
+    carries a transcript and a signed job's always does (``EpisodeKindMismatch``).
+
+    Raises ``TrajectoryRefused``, ``EpisodePromptMismatch``, ``EpisodeUnrendered``,
+    ``EpisodeKindMismatch`` or ``EpisodeSandboxUnavailable``."""
+    from reliquary.corpus.job import is_signed_sandbox
+    from reliquary.corpus.trajectory_parse import TrajectoryRefused, parse_trajectory
     from reliquary.environment.agentic_swe import BASH_SYSTEM_PROMPT
 
     trajectory = record["completions"][0]
@@ -111,17 +129,53 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
     spans = [(int(turn["start"]), int(turn["end"])) for turn in trajectory["turns"]]
     if [int(t) for t in renderer.initial_ids(user_prompt)] != prompt:
         raise EpisodePromptMismatch(submission_id)
-    parsed = parse_trajectory(renderer, prompt_ids=prompt, tokens=tokens, spans=spans,
-                              stop=trajectory["stop"], max_turns=job.episode.max_turns)
-    messages = [{"role": "system", "content": BASH_SYSTEM_PROMPT},
+    signed = trajectory.get("transcript")
+    signed_job = is_signed_sandbox(job)
+    if signed_job != (signed is not None):
+        raise EpisodeKindMismatch(submission_id)
+    if not signed_job:
+        parsed = parse_trajectory(renderer, prompt_ids=prompt, tokens=tokens, spans=spans,
+                                  stop=trajectory["stop"], max_turns=job.episode.max_turns)
+        system_prompt = BASH_SYSTEM_PROMPT
+        final_diff = trajectory["final_diff"]
+    else:
+        # A signed episode: its observations are the signed records' renderings, compared
+        # forward against the tokens, never decoded from them (plan 3 ruling 6).
+        try:
+            from reliquary.corpus.signed_parse import parse_signed_trajectory, signed_records
+            from reliquary.corpus.signed_state import swe_patch
+            import reliquary_sandbox_service.episodes.state_archive  # noqa: F401
+        except ImportError as exc:
+            raise EpisodeSandboxUnavailable(submission_id) from exc
+        from reliquary.corpus.signed_reasons import REASON_SANDBOX_TRANSCRIPT
+
+        try:
+            found = signed_records(signed)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TrajectoryRefused(REASON_SANDBOX_TRANSCRIPT, {"why": str(exc)}) from exc
+        parsed = parse_signed_trajectory(renderer, prompt_ids=prompt, tokens=tokens, spans=spans,
+                                         stop=trajectory["stop"], max_turns=job.episode.max_turns,
+                                         calls=found.calls, offered=found.tools,
+                                         final=found.final)
+        # The job's harness, as the renderer shows it (the compatibility harness: verifiers' prompt).
+        system_prompt = renderer.spec.system_prompt_for(found.tools)
+        user_prompt = renderer.spec.user_prompt(user_prompt)
+        # The graded state is the bridge's (header + artifact archive): the row carries
+        # the git patch inside it, the shape of a replay job's final_diff. An unreadable
+        # state is a ValueError (counted unparseable).
+        final_diff = swe_patch(trajectory["final_diff"])
+    messages = [{"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}]
     for t, ((start, end), turn) in enumerate(zip(spans, parsed.turns)):
         message = renderer.assistant_message(tokens[start:end])
         for k, call in enumerate(message.get("tool_calls") or ()):
             call["id"] = f"call_{t}_{k}"         # unique in the conversation, not per turn
         messages.append(message)
-        messages += [{"role": "tool", "tool_call_id": f"call_{t}_{k}", "content": text}
-                     for k, text in enumerate(turn.observations)]
+        for k, observation in enumerate(renderer.tool_messages(turn.observations)
+                                        if signed_job else _tool_messages(turn.observations)):
+            if "tool_call_id" in observation:
+                observation["tool_call_id"] = f"call_{t}_{k}"
+            messages.append(observation)
     # The proof the messages are the tokens (see EPISODE_ROW_FIELDS for why
     # whitespace is erased first).
     if renderer.whitespace_free(renderer.render_messages(messages)) \
@@ -134,9 +188,80 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
             "prompt_index": int(record["prompt_index"]),
             "task_id": str(grade.get("instance_id") or ""),
             "messages": json.dumps(messages, ensure_ascii=False), "tokens": prompt + tokens,
-            "assistant_mask": mask, "final_diff": trajectory["final_diff"],
+            "assistant_mask": mask, "final_diff": final_diff,
             "graded_success": bool(grade.get("graded_success")),
             "replay_certified": bool(grade.get("replay_certified")),
+            "turns": json.dumps([[s, e] for s, e in spans]), "stop": trajectory["stop"]}
+
+
+def _tool_messages(observations) -> list[dict]:
+    """A replay job's observations, as verifiers' bash harness bridges them."""
+    return [{"role": "tool", "tool_call_id": f"call_{k}", "content": text} for k, text in enumerate(observations)]
+
+
+# Suite episode jobs (design 2026-10-13): one row per certified trajectory,
+# in the form the post-training `kind: episode` reader takes (it trains on
+# `tokens` and `assistant_mask` as they are, and drops a row whose
+# `graded_success` or `replay_certified` is false). `tokens` are the proven
+# ones rewritten into the chat template (`suite_episode.export_tokens`, named
+# in `tokens_transform`); `messages` + `tools` are the same conversation for
+# reading, rebuilt by replaying the trajectory, never from miner text.
+SUITE_EPISODE_ROW_FIELDS = ("job_id", "submission_id", "prompt_index", "task_id", "messages",
+                            "tools", "tokens", "assistant_mask", "tokens_transform",
+                            "graded_success", "replay_certified", "reward", "turns", "stop")
+
+
+class EpisodeUnreplayed(ValueError):
+    """The stored trajectory no longer replays to itself (another environment
+    or tokenizer than the one that admitted it)."""
+
+
+def suite_episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, source,
+                      encode, decode) -> dict:
+    """The row of one graded suite trajectory. Raises ``EpisodePromptMismatch``
+    or ``EpisodeUnreplayed``."""
+    from reliquary.corpus.suite_episode import (
+        END_OF_TEXT, IM_END, compare_replay, episode_seed, export_tokens, replay_suite, single_id,
+        suite_messages, tools_of,
+    )
+
+    trajectory = record["completions"][0]
+    index = int(record["prompt_index"])
+    prompt = [int(t) for t in trajectory["prompt_tokens"]]
+    tokens = [int(t) for t in trajectory["tokens"]]
+    spans = [(int(turn["start"]), int(turn["end"])) for turn in trajectory["turns"]]
+    task = source.task(index)
+    if [int(t) for t in source.renderer(encode).encode_initial(task)] != prompt:
+        raise EpisodePromptMismatch(submission_id)
+    # The task through the source's row map (its environment is built at the
+    # job's split); the seed is the row's.
+    trace = replay_suite(source.environment, renderer_id=job.episode.renderer,
+                         task_index=source.rows.index(index),
+                         seed=episode_seed(job.job_id, index), prompt_ids=prompt, tokens=tokens,
+                         spans=spans, encode=encode, decode=decode,
+                         max_turns=job.episode.max_turns)
+    refusal = compare_replay(trace, prompt_ids=prompt, tokens=tokens, spans=spans,
+                             stop=trajectory["stop"])
+    if refusal is not None:
+        raise EpisodeUnreplayed(f"{submission_id}: {refusal}")
+    full_spans = [(len(prompt) + s, len(prompt) + e) for s, e in spans]
+    try:
+        end_of_text = single_id(encode, END_OF_TEXT)
+    except ValueError:
+        end_of_text = None
+    exported, mask, transforms = export_tokens(
+        prompt + tokens, full_spans, im_end_id=single_id(encode, IM_END),
+        newline_ids=encode("\n"), end_of_text_id=end_of_text)
+    return {"job_id": job.job_id, "submission_id": submission_id, "prompt_index": index,
+            "task_id": str(grade.get("instance_id") or trace.task_id),
+            "messages": json.dumps(suite_messages(trace, task=task, decode=decode,
+                                                  spans=full_spans), ensure_ascii=False),
+            "tools": json.dumps(tools_of(task), ensure_ascii=False),
+            "tokens": exported, "assistant_mask": mask,
+            "tokens_transform": "+".join(transforms),
+            "graded_success": bool(grade.get("graded_success")),
+            "replay_certified": bool(grade.get("replay_certified")),
+            "reward": float(trace.reward.reward),
             "turns": json.dumps([[s, e] for s, e in spans]), "stop": trajectory["stop"]}
 
 
@@ -172,25 +297,49 @@ async def _bounded(calls, gate: asyncio.Semaphore) -> list:
 
 
 async def delivery_rows(*, job, records, counts: dict, grade=None,
+                        seen: set[bytes] | None = None,
                         concurrency: int = READ_CONCURRENCY,
                         window: int = READ_WINDOW) -> AsyncIterator[dict]:
-    """One row per completion of every passing submission, in verdict-id order.
+    """One row per finished completion of every passing, not voided submission, in
+    verdict-id order.
 
-    No hotkey: the delivery is the work, not who did it. ``grade`` annotates
+    No hotkey: the delivery is the work, not who did it. An unfinished
+    completion (``unfinished_reason``: no EOS, or a thinking block not closed
+    exactly once) is left out before grading and counted under ``unfinished``
+    by reason. With ``seen`` (``is_duplicate``), a completion already seen, in
+    this job or in the ones ``seen`` was filled from, is left out too, before
+    grading, and counted as ``duplicate_completion``. ``grade`` annotates
     (``accepted``, ``score``) and never drops a row. ``counts`` is filled in as
     the rows go.
     """
+    from reliquary.corpus.export import (
+        is_duplicate, new_unfinished_counts, submission_voided, thinking_render,
+        unfinished_reason, voided_submission_ids,
+    )
+
+    thinking = thinking_render(job)
     ids = list(await records.list_verdict_ids(job.job_id))
-    counts.update(verdicts=len(ids), passing_submissions=0, missing_records=0, rows=0,
+    voided = await voided_submission_ids(records, job.job_id)
+    counts.update(verdicts=len(ids), passing_submissions=0, voided=0,
+                  missing_records=0, completions=0,
+                  unfinished=new_unfinished_counts(),
+                  duplicate_completion=0 if seen is not None else None, rows=0,
                   rows_accepted=0 if grade is not None else None)
     gate = asyncio.Semaphore(concurrency)
     for start in range(0, len(ids), window):
         chunk = ids[start:start + window]
         verdicts = await _bounded((records.read_verdict(job.job_id, s) for s in chunk), gate)
         passing = [sid for sid, v in zip(chunk, verdicts) if v and v.get("passed")]
-        found = await _bounded((records.read_submission(job.job_id, s) for s in passing), gate)
+        kept = [sid for sid in passing if sid not in voided]
+        counts["voided"] += len(passing) - len(kept)
+        found = await _bounded((records.read_submission(job.job_id, s) for s in kept), gate)
+        invalidated = await _bounded((submission_voided(records, job.job_id, s, voided)
+                                      for s in kept), gate)
         rows = []
-        for sid, record in zip(passing, found):
+        for sid, record, is_voided in zip(kept, found, invalidated):
+            if is_voided:
+                counts["voided"] += 1
+                continue
             if record is None:
                 # A verdict can be visible before its record (R2 is not transactional).
                 logger.warning("corpus delivery: submission %s passed but has no record", sid[:12])
@@ -198,6 +347,15 @@ async def delivery_rows(*, job, records, counts: dict, grade=None,
                 continue
             counts["passing_submissions"] += 1
             for index, completion in enumerate(record["completions"]):
+                counts["completions"] += 1
+                reason = unfinished_reason(completion, eos_token_id=job.eos_token_id,
+                                           thinking=thinking)
+                if reason is not None:
+                    counts["unfinished"][reason] += 1
+                    continue
+                if is_duplicate(completion, seen):
+                    counts["duplicate_completion"] += 1
+                    continue
                 rows.append({
                     "job_id": job.job_id, "submission_id": sid,
                     "prompt_index": int(record["prompt_index"]), "completion_index": index,
@@ -223,14 +381,21 @@ async def delivery_rows(*, job, records, counts: dict, grade=None,
 async def episode_rows(*, job, records, renderer, source, counts: dict, sft_only: bool = False,
                        quarantined: Collection[str] | None,
                        concurrency: int = READ_CONCURRENCY,
-                       window: int = READ_WINDOW) -> AsyncIterator[dict]:
+                       window: int = READ_WINDOW, codec=None) -> AsyncIterator[dict]:
     """One row per passing, not voided, certified trajectory, in verdict-id
     order; ``sft_only`` keeps the certified successes (spec N6's SFT set).
 
     The effective grade is the latest regrade, else the grade. A grade that an
     executor of ``quarantined`` decided alone is held, as the settler holds it;
     the caller names the registry's quarantined grade executors (None refuses:
-    an export blind to quarantines must not run)."""
+    an export blind to quarantines must not run).
+
+    A suite job's rows are ``suite_episode_row``s: ``source`` is its
+    ``SuiteSource``, ``codec`` the checkpoint tokenizer's ``encode``/``decode``
+    (an object with both), and ``renderer`` is unused."""
+    suite = job.episode.is_suite
+    if suite and codec is None:
+        raise ValueError("a suite episode export replays its trajectories: it needs a codec")
     if quarantined is None:
         raise ValueError("an episode export needs the quarantined grade executors "
                          "(the registry's), to hold what they decided alone")
@@ -240,7 +405,8 @@ async def episode_rows(*, job, records, renderer, source, counts: dict, sft_only
     read_voided = getattr(records, "read_voided", None)
     counts.update(verdicts=len(ids), passing_submissions=0, voided=0, ungraded=0, held=0,
                   uncertified=0, not_successful=0, missing_records=0, task_mismatch=0,
-                  prompt_mismatch=0, unparseable=0, unrendered=0, sft_rows=0, rows=0)
+                  prompt_mismatch=0, unparseable=0, unrendered=0, kind_mismatch=0,
+                  sandbox_unavailable=0, sft_rows=0, rows=0)
     gate = asyncio.Semaphore(concurrency)
     for start in range(0, len(ids), window):
         chunk = ids[start:start + window]
@@ -283,12 +449,27 @@ async def episode_rows(*, job, records, renderer, source, counts: dict, sft_only
                 counts["task_mismatch"] += 1
                 continue
             try:
-                row = await asyncio.to_thread(
-                    episode_row, job=job, submission_id=sid, record=record, grade=document,
-                    renderer=renderer, user_prompt=source.prompt(index))
+                if suite:
+                    row = await asyncio.to_thread(
+                        suite_episode_row, job=job, submission_id=sid, record=record,
+                        grade=document, source=source, encode=codec.encode, decode=codec.decode)
+                else:
+                    row = await asyncio.to_thread(
+                        episode_row, job=job, submission_id=sid, record=record, grade=document,
+                        renderer=renderer, user_prompt=source.prompt(index))
             except EpisodeUnrendered:
                 logger.error("corpus export: %s's messages do not render to its tokens", sid[:12])
                 counts["unrendered"] += 1
+                continue
+            except EpisodeKindMismatch:
+                logger.error("corpus export: %s's record is not its job's kind (replay or "
+                             "signed)", sid[:12])
+                counts["kind_mismatch"] += 1
+                continue
+            except EpisodeSandboxUnavailable:
+                logger.error("corpus export: %s is a signed episode and reliquary-sandbox is "
+                             "not installed here", sid[:12])
+                counts["sandbox_unavailable"] += 1
                 continue
             except EpisodePromptMismatch:
                 logger.error("corpus export: %s's prompt tokens are not its task's", sid[:12])
@@ -336,9 +517,13 @@ class _ShardWriter:
         self.index = 0
 
     async def add(self, row: dict) -> None:
+        raw_bytes = _raw_size(row)
+        group_budget = min(ROW_GROUP_MAX_BYTES, max(1, self._max // 2))
+        if self._buffer and self._buffer_bytes + raw_bytes > group_budget:
+            await self._flush()
         self._buffer.append(row)
-        self._buffer_bytes += _raw_size(row)
-        if len(self._buffer) >= self._group_rows or self._buffer_bytes >= ROW_GROUP_MAX_BYTES:
+        self._buffer_bytes += raw_bytes
+        if len(self._buffer) >= self._group_rows or self._buffer_bytes >= group_budget:
             await self._flush()
 
     async def _flush(self) -> None:
@@ -384,6 +569,82 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def instruction_source_for_job(job):
+    """Only chat-template single-turn jobs have an authoritative raw user prompt.
+
+    Legacy sources may already contain a rendered prompt; episode and system
+    messages cannot be represented by the library's prompt/response schema.
+    A missing source leaves the original Parquet delivery available.
+    """
+    from reliquary.validator.corpus_service import (
+        CHAT_TEMPLATE_RENDERERS, CorpusPromptSourceError, SingleTurnPromptJob,
+        prompt_job_for_spec,
+    )
+
+    if getattr(job, "episode", None) is not None:
+        return None, "episode_schema"
+    if getattr(job, "renderer_id", None) not in CHAT_TEMPLATE_RENDERERS:
+        return None, "unsupported_renderer"
+    try:
+        source = prompt_job_for_spec(job)
+    except CorpusPromptSourceError:
+        return None, "prompt_source_unavailable"
+    if not isinstance(source, SingleTurnPromptJob):
+        return None, "unsupported_prompt_source"
+    return source, None
+
+
+class _InstructionWriter:
+    """Bounded JSONL shards alongside (not replacing) the Parquet shards."""
+
+    def __init__(self, directory: Path, on_close) -> None:
+        self.directory, self.on_close = directory, on_close
+        self.path, self.rows, self.size, self.index = None, 0, 0, 0
+
+    async def add(self, prompt: str, response: str) -> None:
+        body = (json.dumps({"prompt": prompt, "response": response}, ensure_ascii=False,
+                           separators=(",", ":")) + "\n").encode()
+        if len(body) > INSTRUCTION_MAX_BYTES:
+            raise ValueError("an instruction example exceeds its shard byte limit")
+        if self.path is not None and (self.rows >= INSTRUCTION_MAX_ROWS
+                                      or self.size + len(body) > INSTRUCTION_MAX_BYTES):
+            await self.close()
+        if self.path is None:
+            self.path = self.directory / f"instruction-{self.index:05d}.jsonl"
+        with self.path.open("ab") as handle:
+            handle.write(body)
+        self.rows += 1
+        self.size += len(body)
+
+    async def close(self) -> None:
+        if self.path is not None:
+            await self.on_close(self.path, self.rows)
+            self.path, self.rows, self.size = None, 0, 0
+            self.index += 1
+
+
+def _instruction_text(value) -> bool:
+    # JS String.trim() also removes FEFF, which Python str.strip() retains.
+    if not isinstance(value, str) or re.search(r"[^\s\ufeff]", value) is None:
+        return False
+    try:
+        return len(value.encode("utf-16-le")) // 2 <= INSTRUCTION_MAX_UTF16
+    except UnicodeError:
+        return False
+
+
+def validate_cached_delivery(manifest: Mapping, *, job, sink) -> None:
+    """Bind a completed delivery to its immutable job, retaining legacy storage reads."""
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    if manifest.get("job_id") != job.job_id:
+        raise ValueError("delivery belongs to another job")
+    if ("job_manifest_sha256" in manifest
+            or getattr(sink, "requires_job_contract_pin", False)):
+        if manifest.get("job_manifest_sha256") != canonical_sha256(job.to_contract()):
+            raise ValueError("delivery belongs to another job contract")
+
+
 async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
                           filter_note: str | None = None, work_dir: str | Path | None = None,
                           shard_max_bytes: int = SHARD_MAX_BYTES,
@@ -391,14 +652,39 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
                           concurrency: int = READ_CONCURRENCY, window: int = READ_WINDOW,
                           clock: Callable[[], float] = time.time, renderer=None, source=None,
                           sft_only: bool = False,
-                          quarantined: Collection[str] | None = None) -> dict:
+                          quarantined: Collection[str] | None = None,
+                          instruction_source=None, instruction_note: str | None = None,
+                          keep_rejected: bool = False, dedupe: bool = False,
+                          dedupe_against: Collection[str] = ()) -> dict:
     """Write ``deliveries/{delivery_id}/``: the shards, ``report.json``, then
     ``manifest.json``. A delivery whose manifest exists is returned as stored.
+
+    ``keep_rejected`` keeps the finished completions ``grade`` rejects in the
+    instruction shards instead of omitting them (an SFT without the
+    correctness filter); the Parquet rows carry ``accepted``/``score`` either
+    way. Unfinished completions are never delivered.
+
+    ``dedupe`` delivers a completion once (by ``completion_fingerprint``):
+    the first copy in verdict-id order, and none already in a passing
+    submission of a job in ``dedupe_against`` (which implies ``dedupe``), e.g.
+    a v2 job on the prompts of its v1.
 
     An episode job is delivered as episode rows (``episode_rows``): it needs
     its pinned ``renderer``, its task ``source`` and the registry's
     ``quarantined`` grade executors."""
     episode = getattr(job, "episode", None) is not None
+    if keep_rejected and (episode or grade is None):
+        raise ValueError("keep_rejected needs a grader: it keeps what the filter rejects")
+    dedupe_against = sorted(set(dedupe_against))
+    if job.job_id in dedupe_against:
+        raise ValueError("a delivery cannot be deduplicated against itself")
+    dedupe = dedupe or bool(dedupe_against)
+    if episode and dedupe:
+        raise ValueError("an episode delivery is not deduplicated by completion")
+    if episode and job.episode.is_suite:
+        # Its rows have their own fields (SUITE_EPISODE_ROW_FIELDS), which the
+        # Parquet schema here does not carry.
+        raise ValueError("a suite episode job is exported with `reliquary jobs export --sft`")
     if episode and (renderer is None or source is None or quarantined is None):
         raise ValueError("an episode job is exported with its pinned renderer, its task source "
                          "and the quarantined grade executors")
@@ -407,56 +693,138 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
     manifest_key = f"{prefix}/manifest.json"
     stored = await sink.get_json(manifest_key)
     if stored is not None:
+        validate_cached_delivery(stored, job=job, sink=sink)
         return stored
+    report_key = f"{prefix}/report.json"
+    stored_report = await sink.get_json(report_key)
+    if stored_report is not None:
+        if (stored_report.get("job_id") != job.job_id
+                or stored_report.get("delivery_id") != delivery_id
+                or stored_report.get("job") != job.to_contract()):
+            raise ValueError("delivery report belongs to another job contract")
+        stamp = stored_report.get("created_at")
+        if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
+            raise ValueError("delivery report has no creation timestamp")
+    else:
+        stamp = clock()
     root = Path(work_dir) if work_dir is not None else Path(tempfile.gettempdir())
     root.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix=f"delivery-{delivery_id}-", dir=root))
     shards: list[dict] = []
+    instruction_shards: list[dict] = []
+    instruction_reason = ("episode_schema" if episode else instruction_note
+                          or ("raw_prompt_source_not_provided" if instruction_source is None
+                              else None))
+    if instruction_reason is None:
+        from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS
+
+        if getattr(job, "renderer_id", None) not in CHAT_TEMPLATE_RENDERERS:
+            instruction_reason = "unsupported_renderer"
+    instruction = {"format": "instruction", "rows": 0, "omitted": {},
+                   "source": {"supported": instruction_reason is None,
+                              "reason": instruction_reason},
+                   "filter_applied": grade is not None,
+                   "policy": ("audited_passing_completions" if grade is None
+                              else "finished_completions_annotated" if keep_rejected
+                              else "accepted_completions"),
+                   "limits": {"bytes_per_shard": INSTRUCTION_MAX_BYTES,
+                              "rows_per_shard": INSTRUCTION_MAX_ROWS,
+                              "utf16_units_per_field": INSTRUCTION_MAX_UTF16}}
+    if keep_rejected:
+        instruction["rejected_kept"] = 0
 
     async def uploaded(path: Path, rows: int) -> None:
         digest = await asyncio.to_thread(_sha256, path)
         size = path.stat().st_size
         key = f"{prefix}/{path.name}"
         await sink.put_file(key, path)
-        shards.append({"name": path.name, "key": key, "rows": rows, "bytes": size,
+        target = instruction_shards if path.suffix == ".jsonl" else shards
+        target.append({"name": path.name, "key": key, "rows": rows, "bytes": size,
                        "sha256": digest})
         path.unlink()
 
+    def omitted(reason: str) -> None:
+        instruction["omitted"][reason] = instruction["omitted"].get(reason, 0) + 1
+
     counts: dict = {}
+    seen = None
+    if dedupe:
+        from reliquary.corpus.export import job_fingerprints
+
+        seen = await job_fingerprints(records, dedupe_against, concurrency=concurrency)
+    fingerprints_against = len(seen) if seen is not None else 0
     try:
+        shard_max_bytes = min(shard_max_bytes, getattr(sink, "max_file_bytes", shard_max_bytes))
         writer = _ShardWriter(directory, max_bytes=shard_max_bytes,
                               row_group_rows=row_group_rows, on_close=uploaded,
                               schema=_episode_row_schema() if episode else None)
+        instructions = _InstructionWriter(directory, uploaded)
         rows = (episode_rows(job=job, records=records, renderer=renderer, source=source,
                              counts=counts, sft_only=sft_only, quarantined=quarantined,
                              concurrency=concurrency, window=window)
                 if episode else
                 delivery_rows(job=job, records=records, counts=counts, grade=grade,
-                              concurrency=concurrency, window=window))
+                              seen=seen, concurrency=concurrency, window=window))
         async for row in rows:
             await writer.add(row)
+            if instruction_reason is not None:
+                omitted(instruction_reason)
+            elif grade is not None and row["accepted"] is not True and not keep_rejected:
+                omitted("filter_rejected")
+            else:
+                from reliquary.validator.corpus_service import CorpusPromptSourceError
+
+                try:
+                    task = await asyncio.to_thread(instruction_source.task_for,
+                                                   row["prompt_index"])
+                except CorpusPromptSourceError:
+                    omitted("prompt_source_unavailable")
+                    continue
+                if (getattr(task, "metadata", None) or {}).get("system"):
+                    omitted("system_message")
+                elif not (_instruction_text(task.prompt)
+                          and _instruction_text(row["completion"])):
+                    omitted("invalid_or_oversized_text")
+                else:
+                    await instructions.add(task.prompt, row["completion"])
+                    instruction["rows"] += 1
+                    if keep_rejected and row["accepted"] is not True:
+                        instruction["rejected_kept"] += 1
         await writer.close()
+        await instructions.close()
     finally:
         shutil.rmtree(directory, ignore_errors=True)
     report = {
         "schema": DELIVERY_SCHEMA, "delivery_id": delivery_id, "job_id": job.job_id,
-        "created_at": clock(), "job": job.to_contract(), "counts": counts,
+        "created_at": stamp, "job": job.to_contract(), "counts": counts,
         "filter": (
             {"applied": sft_only,
              "note": ("graded_success and replay_certified" if sft_only
                       else "every replay-certified trajectory")} if episode
             else {"applied": True, "grader_id": job.filter.grader_id,
-                  "threshold": job.filter.threshold} if grade is not None
-            else {"applied": False, "note": filter_note or "the job declares no filter"}),
+                  "threshold": job.filter.threshold, "keep_rejected": keep_rejected}
+            if grade is not None
+            else {"applied": False, "note": filter_note or (
+                "the declared filter was not applied" if job.filter is not None
+                else "the job declares no filter")}),
         "shards": len(shards),
+        "instruction": instruction,
     }
-    report_key = f"{prefix}/report.json"
+    if dedupe:
+        from reliquary.corpus.export import DEDUPE_KEY
+
+        report["dedupe"] = {"within_job": True, "against": dedupe_against,
+                            "fingerprints_against": fingerprints_against, "key": DEDUPE_KEY}
     await sink.put_json(report_key, report)
+    from reliquary.protocol.release_contract import canonical_sha256
+
     manifest = {
         "schema": DELIVERY_SCHEMA, "delivery_id": delivery_id, "job_id": job.job_id,
+        "job_manifest_sha256": canonical_sha256(job.to_contract()),
         "created_at": report["created_at"], "rows": counts.get("rows", 0), "shards": shards,
+        "instruction_shards": instruction_shards, "instruction": instruction,
         "columns": list(EPISODE_ROW_FIELDS if episode else ROW_FIELDS), "report": report_key,
-        "keys": [s["key"] for s in shards] + [report_key, manifest_key],
+        "keys": [s["key"] for s in shards + instruction_shards] + [report_key, manifest_key],
     }
     await sink.put_json(manifest_key, manifest)
     logger.info("corpus delivery %s of %s: %d rows in %d shards", delivery_id, job.job_id,
@@ -535,15 +903,17 @@ class R2DeliverySink:
     async def put_file(self, key: str, path: Path) -> None:
         from boto3.s3.transfer import TransferConfig
 
+        digest = await asyncio.to_thread(_sha256, path)
         config = TransferConfig(multipart_threshold=32 * 1024 * 1024,
                                 multipart_chunksize=32 * 1024 * 1024, max_concurrency=8)
         await asyncio.to_thread(self._client.upload_file, str(path), self._bucket, key,
-                                Config=config)
+                                Config=config, ExtraArgs={"Metadata": {"sha256": digest}})
 
     async def put_json(self, key: str, document: Mapping) -> None:
         body = json.dumps(document, sort_keys=True).encode()
         await asyncio.to_thread(self._client.put_object, Bucket=self._bucket, Key=key,
-                                Body=body, ContentType="application/json")
+                                Body=body, ContentType="application/json",
+                                Metadata={"sha256": hashlib.sha256(body).hexdigest()})
 
     async def get_json(self, key: str) -> dict | None:
         from botocore.exceptions import ClientError
@@ -585,10 +955,119 @@ class R2DeliverySink:
         return True
 
 
+class HTTPDeliverySink:
+    """Immutable bounded subnet-run uploads to one configured HTTPS origin."""
+
+    max_file_bytes = 64 * 1024 * 1024
+    max_json_bytes = 1024 * 1024
+    requires_job_contract_pin = True
+    evaluation_supported = False
+    _key = re.compile(r"^deliveries/subnet-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+                      r"[89ab][0-9a-f]{3}-[0-9a-f]{12})/([A-Za-z0-9_.()-]{1,100})$")
+
+    def __init__(self, *, url: str, secret: str) -> None:
+        from urllib.parse import urlsplit
+
+        origin = urlsplit(url)
+        if (origin.scheme != "https" or not origin.hostname or origin.username is not None
+                or origin.password is not None or origin.path not in ("", "/")
+                or origin.query or origin.fragment):
+            raise ValueError("platform delivery URL must be an HTTPS origin")
+        if len(secret) < 32 or not secret.isascii() or any(ord(c) < 33 or ord(c) == 127
+                                                        for c in secret):
+            raise ValueError("platform delivery secret must be at least 32 header-safe characters")
+        self._host, self._port, self._secret = origin.hostname, origin.port or 443, secret
+
+    @classmethod
+    def from_environment(cls) -> "HTTPDeliverySink":
+        return cls(url=os.getenv("RELIQUARY_PLATFORM_DELIVERY_URL", "").strip(),
+                   secret=os.getenv("RELIQUARY_PLATFORM_DELIVERY_SECRET", ""))
+
+    def _route(self, key: str) -> str:
+        match = self._key.fullmatch(key)
+        if match is None:
+            raise ValueError("HTTP delivery sink only accepts subnet-run delivery keys")
+        return f"/api/internal/subnet/tasks/{match[1]}/deliveries/{match[2]}"
+
+    def accepts_delivery_id(self, delivery_id: str) -> bool:
+        return self._key.fullmatch(f"deliveries/{delivery_id}/manifest.json") is not None
+
+    def _connection(self):
+        from http.client import HTTPSConnection
+
+        return HTTPSConnection(self._host, self._port, timeout=60)
+
+    def _put(self, key: str, *, size: int, digest: str, body=None, path=None) -> None:
+        route = self._route(key)
+        limit = self.max_json_bytes if key.endswith(".json") else self.max_file_bytes
+        if size < 1 or size > limit:
+            raise ValueError("HTTP delivery object exceeds its size limit")
+        conn = self._connection()
+        try:
+            conn.putrequest("PUT", route)
+            conn.putheader("Authorization", "Bearer " + self._secret)
+            conn.putheader("Content-Length", str(size))
+            conn.putheader("X-Content-SHA256", digest)
+            conn.putheader("Content-Type", "application/json" if key.endswith(".json")
+                           else "application/octet-stream")
+            conn.endheaders()
+            if path is not None:
+                with Path(path).open("rb") as handle:
+                    for block in iter(lambda: handle.read(1024 * 1024), b""):
+                        conn.send(block)
+            else:
+                conn.send(body)
+            response = conn.getresponse()
+            if response.status not in (200, 201, 204):
+                raise RuntimeError(f"platform delivery upload refused ({response.status})")
+            response.read(self.max_json_bytes + 1)
+        finally:
+            conn.close()
+
+    async def put_file(self, key: str, path: Path) -> None:
+        digest = await asyncio.to_thread(_sha256, path)
+        await asyncio.to_thread(self._put, key, size=path.stat().st_size, digest=digest, path=path)
+
+    async def put_json(self, key: str, document: Mapping) -> None:
+        body = json.dumps(document, sort_keys=True).encode()
+        await asyncio.to_thread(self._put, key, size=len(body),
+                                digest=hashlib.sha256(body).hexdigest(), body=body)
+
+    def _get_json(self, key: str) -> dict | None:
+        route = self._route(key)
+        if key.rsplit("/", 1)[1] not in ("manifest.json", "report.json"):
+            raise ValueError("HTTP delivery reads only allow its manifest and report")
+        conn = self._connection()
+        try:
+            conn.request("GET", route, headers={"Authorization": "Bearer " + self._secret})
+            response = conn.getresponse()
+            if response.status == 404:
+                return None
+            if response.status != 200:
+                raise RuntimeError(f"platform delivery read refused ({response.status})")
+            body = response.read(self.max_json_bytes + 1)
+            if len(body) > self.max_json_bytes:
+                raise ValueError("HTTP delivery JSON exceeds its size limit")
+            document = json.loads(body)
+            if not isinstance(document, dict):
+                raise ValueError("HTTP delivery JSON must be an object")
+            return document
+        finally:
+            conn.close()
+
+    async def get_json(self, key: str) -> dict | None:
+        return await asyncio.to_thread(self._get_json, key)
+
+
 __all__ = [
     "DELIVERY_SCHEMA",
     "EPISODE_ROW_FIELDS",
+    "EpisodeKindMismatch",
+    "EpisodeSandboxUnavailable",
+    "SUITE_EPISODE_ROW_FIELDS",
+    "suite_episode_row",
     "LocalDirectorySink",
+    "HTTPDeliverySink",
     "R2DeliverySink",
     "ROW_FIELDS",
     "SHARD_MAX_BYTES",
@@ -596,5 +1075,7 @@ __all__ = [
     "episode_row",
     "episode_rows",
     "export_delivery",
+    "instruction_source_for_job",
+    "validate_cached_delivery",
     "validated_delivery_id",
 ]

@@ -1,0 +1,34 @@
+{
+  "schema": "reliquary/environment-artifact/v1",
+  "environment": "reliquary_general_v1",
+  "contract": "reliquary/checked-answer/v1",
+  "distribution": {
+    "name": "reliquary-general",
+    "version": "0.1.0a1"
+  },
+  "entrypoints": {
+    "taskset": "reliquary_general:GeneralTaskset",
+    "replay": "reliquary_general:GeneralPromptsEnvironment"
+  },
+  "source_manifest_sha256": "ad41738f7faad43964cb1c90c1574b25ba9c939077abb79894478adacf0aec5e",
+  "files": {
+    "reliquary_general/__init__.py": "8f329934495678b092b9c821c5b2d922cfc11edfe3be52ddc0e6bbb399520d04",
+    "reliquary_general/_ifeval/LICENSE": "b998a796c55d006a974a48c73aa32674e6901e8d49aa98d74722e0c1063b40b6",
+    "reliquary_general/_ifeval/__init__.py": "c1c8e8be49232e4225084a21da737088f6a7fe2402eba288a29b7ea3218014c7",
+    "reliquary_general/_ifeval/instructions.py": "4f08a7a94209644b7a1b5c81cd937999442507fe1d2564e6ae0e64f277d8e44a",
+    "reliquary_general/_ifeval/instructions_registry.py": "31996342e777a01fd753193c7ca6df364b02cbe521f108bb3890c063c3830858",
+    "reliquary_general/_ifeval/instructions_util.py": "62a5b902adf5b1f8813ff373c21967bff763466ff00180b6eb51d97c8acc2e60",
+    "reliquary_general/_pins.py": "98fd31341b75c0bd45fb98df330b0bb861e962751c6b2926876e3e49a747b96a",
+    "reliquary_general/corpus.py": "6653b77f70fcba06c747e5b9ac59cfbedffb4e36d81fe5d2e828c98811b68d0c",
+    "reliquary_general/environment.py": "65006841b2f61895463a2093fc9c0cf1fcbbfe6d6dfd3c9165212afdb19c10cb",
+    "reliquary_general/goldens/reference.jsonl": "abe49aff376dab295fd9a70f93554f76ececa703b74ccc6ee0c8b823d370abe5",
+    "reliquary_general/grading/__init__.py": "cc15195c4b31198d8fac752cef5288aedb050bce8df092f334a34e76a592bc16",
+    "reliquary_general/grading/answer.py": "86978a9b3cc3a603b0c3e999c7d667fae753fb2915a141a77296a8aa551080cf",
+    "reliquary_general/grading/clarify.py": "c758c24a0b074d1ec99e2cffd7775368dc72d779ae598c5eceee72f274ff62e5",
+    "reliquary_general/grading/identity.py": "f530b01fba4b794f87880004ed610c902052b912dee5933b5fb4e53f353149eb",
+    "reliquary_general/grading/ifeval.py": "bf407dfdbe67eb77c1266bc1c76d0cde39177709c1dae7375757331b714bc687",
+    "reliquary_general/grading/structured.py": "8191d2df38fbd28ab4078ca79d005e5dfd5f4985fc2394d8520439138bbef934",
+    "reliquary_general/grading/tools.py": "86319d67cc7d66f989dd56cd92d22592013f2038d23283b66f59f7fa5f39d801",
+    "reliquary_general/taskset.py": "78b348d2f7f28abb1b47503a1b8e788f09f5f4e2fff6e4697a913d6af6f0495f"
+  }
+}

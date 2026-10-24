@@ -18,13 +18,17 @@ reversible step.
 from __future__ import annotations
 
 import asyncio
+import base64
 import collections
 import contextlib
+import functools
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 import logging
+import math
+import os
 import re
 import time
 from typing import Any, NamedTuple, Protocol
@@ -43,7 +47,7 @@ from reliquary.corpus.admission import (
 )
 from reliquary.corpus.checks import CheckResult, completion_digest
 from reliquary.corpus.job import PROMPT_ORDER_MINER_WALK, JobError, JobSpec
-from reliquary.corpus.slots import SlotLedger
+from reliquary.corpus.slots import OPEN_ENCODING, SlotLedger
 from reliquary.corpus.walk import CursorLedger, job_walk_index
 from reliquary.environment.agentic.types import EpisodeTask
 from reliquary.environment.registry import ENVIRONMENT_SPECS
@@ -60,7 +64,7 @@ from reliquary.protocol.corpus_submission import (
     CorpusSubmissionResponse,
 )
 from reliquary.infrastructure.corpus_record_store import RECORD_SCHEMA_V2
-from reliquary.validator.agentic_intake import IntakeFacts
+from reliquary.validator.agentic_intake import IntakeFacts, ReplayUnavailable
 from reliquary.validator.corpus_text import (
     Renderer,
     check_prompt_fidelity,
@@ -82,6 +86,21 @@ NEXT_PATH = "/corpus/next/{hotkey}"
 NEXT_SCOPED_PATH = "/corpus/jobs/{job_id}/next/{hotkey}"
 SKIP_PATH = "/corpus/skip"
 SKIP_SCOPED_PATH = "/corpus/jobs/{job_id}/skip"
+# Check before starting an episode: which of the job's prompts still have a
+# slot, whatever its prompt order (a free job has no walk for `next` to read).
+OPEN_PATH = "/corpus/open"
+OPEN_SCOPED_PATH = "/corpus/jobs/{job_id}/open"
+# How long one computed open map answers every caller, and what a client or a
+# proxy in front may keep it: a miner acts on it for minutes anyway.
+OPEN_CACHE_SECONDS = 5.0
+# One bit per prompt: 128 KiB of bitmap at this count. A generated source
+# declares up to 1 << 31 prompts; past this the route refuses rather than
+# build (and ship) a map that size.
+OPEN_MAX_PROMPTS = 1 << 20
+
+
+def _open_clock() -> float:
+    return time.monotonic()
 
 # The record's own schema tag, so a reader of the bucket can tell what shape
 # to expect before it parses the rest of the document.
@@ -107,6 +126,7 @@ RECORD_WRITE_ATTEMPTS = 3
 # later the schema marker gives the named failure instead.
 LEDGER_SCHEMA_V1 = "reliquary/corpus-ledgers/v1"
 LEDGER_SCHEMA_V2 = "reliquary/corpus-ledgers/v2"
+LEDGER_SCHEMA_V3 = "reliquary/corpus-ledgers/v3"
 # The schema this binary writes.
 LEDGER_SCHEMA = LEDGER_SCHEMA_V2
 LEDGER_FIELDS = {
@@ -116,6 +136,8 @@ LEDGER_FIELDS = {
         # submission failed: every other ledger is byte-identical.
         {"schema", "slots", "cursors", "seen_pending", "seen_segments", "failed"}
     ),
+    LEDGER_SCHEMA_V3: frozenset({"schema", "slots", "cursors", "seen_pending",
+                                "seen_segments", "failed", "pending_records"}),
 }
 
 # Pending digests are sealed into a segment once this many accumulate, so the
@@ -131,8 +153,8 @@ SEGMENT_PARALLELISM = 8
 # a request that never returns.
 DEFAULT_WRITE_ATTEMPTS = 4
 
-# How long a submission waits for its turn on the ledger. One hung PUT can hold
-# the turn for botocore's full ~135 s; past this the miner gets the retryable 503.
+# How long a submission waits for a turn not yet taken. Storage retries can
+# hold a taken turn longer; this timeout never abandons its durable writes.
 LEDGER_LOCK_TIMEOUT_SECONDS = 30.0
 
 # The most submissions and skips one ledger turn decides (group commit): one
@@ -252,6 +274,16 @@ class SingleTurnPromptJob:
                 f"prompt source {self._job.prompt_source!r} returned no prompt "
                 f"text for row {position}"
             )
+        # A source that shares train between SFT and RL marks each row's use
+        # (by problem identity, so a range typo cannot move it): a corpus job
+        # sells SFT data and is never served an RL row.
+        use = problem.get("use")
+        if use is not None and use != "sft":
+            raise CorpusPromptSourceError(
+                f"row {position} of {self._job.prompt_source!r} is in its "
+                f"{use!r} share, kept for RL; a corpus job is never served it"
+            )
+        _refuse_unless_one_user_turn(self._job, position, problem, prompt)
         # The row's identity here is its index: fidelity compares the prompt
         # text, and carrying the environment's own id would only add a way for
         # a source to hand back something `EpisodeTask` refuses.
@@ -263,6 +295,48 @@ class SingleTurnPromptJob:
         return EpisodeTask(
             id=f"{self._job.prompt_source}#{position}", prompt=prompt, tools=(),
             metadata={"system": system} if isinstance(system, str) and system else {},
+        )
+
+
+def _refuse_unless_one_user_turn(
+    job: JobSpec, position: int, problem: Mapping[str, Any], prompt: str
+) -> None:
+    """Refuse a row this path would serve as a different task.
+
+    A single-turn job renders `prompt` as one user turn and nothing else. A
+    source whose rows can carry more -- a frozen history, a task system
+    message, tools (reliquary_general_v1's metadata says so per row) -- is
+    served here only where the row is that one turn: each mark is checked on
+    its own, so a row cannot get through on a `single_turn` it contradicts.
+    A row that names the renderer it was drawn for (its thinking mode) is
+    served only through that renderer. Sources whose rows carry none of these
+    fields are unaffected.
+    """
+    reasons = []
+    if problem.get("single_turn") is False:
+        reasons.append("it is marked multi-turn")
+    if problem.get("tools"):
+        reasons.append("it carries tools")
+    messages = problem.get("messages")
+    if messages is not None and (
+        not isinstance(messages, (list, tuple))
+        or len(messages) != 1
+        or not isinstance(messages[0], Mapping)
+        or messages[0].get("role") != "user"
+        or messages[0].get("content") != prompt
+    ):
+        reasons.append("its messages are not exactly that user turn")
+    if reasons:
+        raise CorpusPromptSourceError(
+            f"row {position} of {job.prompt_source!r} is not one user turn "
+            f"({'; '.join(reasons)}); a single-turn job renders its prompt alone "
+            "and would serve it as a different task"
+        )
+    renderer = problem.get("renderer")
+    if renderer is not None and renderer != job.renderer_id:
+        raise CorpusPromptSourceError(
+            f"row {position} of {job.prompt_source!r} was drawn for renderer "
+            f"{renderer!r}; job {job.job_id!r} renders through {job.renderer_id!r}"
         )
 
 
@@ -317,17 +391,26 @@ class SingleTurnPromptRenderer:
 
 class AgenticSourceSpec:
     """What `resolve_prompt_source` returns for the agentic contract
-    environment: the job's `episode`, buildable into its SWE-smith rows."""
+    environment: the job's `episode`, buildable (`create(job)`) into its
+    SWE-smith rows. An eval job's rows (a signed job's: agentic eval jobs are
+    refused) are its set's references, read through the bridged env
+    (`agentic_swe.job_signed_source`)."""
 
     interaction_mode = "agentic"
 
     def __init__(self, episode: Any) -> None:
         self.episode = episode
 
-    def create(self):
+    def create(self, job: JobSpec):
         from reliquary.environment import agentic_swe
+        from reliquary.eval.rows import job_row_map
 
-        return agentic_swe.load_swe_source(self.episode.env.num_images)
+        try:
+            if job_row_map(job).is_identity:
+                return agentic_swe.load_swe_source(self.episode.env.num_images)
+            return agentic_swe.job_signed_source(job)
+        except ValueError as exc:
+            raise CorpusPromptSourceError(str(exc)) from exc
 
 
 class AgenticPromptJob:
@@ -357,18 +440,57 @@ class EpisodePromptRenderer:
             "an episode job's prompt is checked by its episode intake, not rendered as text")
 
 
+class SuiteSourceSpec:
+    """What `resolve_prompt_source` returns for a suite episode job: the
+    registry environment it names, buildable (`create(job)`) into the job's
+    tasks (`reliquary.corpus.suite_episode.job_suite_source`)."""
+
+    interaction_mode = "agentic"
+
+    def __init__(self, episode: Any) -> None:
+        self.episode = episode
+
+    def create(self, job: JobSpec):
+        from reliquary.corpus.suite_episode import job_suite_source
+
+        try:
+            return job_suite_source(job)
+        except ValueError as exc:
+            raise CorpusPromptSourceError(str(exc)) from exc
+
+
+def _resolve_suite(prompt_source: str, renderer_id: str | None, episode: Any) -> SuiteSourceSpec:
+    from reliquary.corpus.suite_episode import suite_spec_refusal
+    from reliquary.eval.prompt_source import is_eval_source
+
+    if prompt_source != episode.env.name and not is_eval_source(prompt_source):
+        raise CorpusPromptSourceError(
+            f"a suite episode job draws its prompts from {episode.env.name!r} or an eval "
+            f"set, not {prompt_source!r}")
+    if renderer_id is not None and renderer_id != episode.renderer:
+        raise CorpusPromptSourceError(
+            f"the job's renderer_id {renderer_id!r} is not its episode.renderer {episode.renderer!r}")
+    refusal = suite_spec_refusal(episode)
+    if refusal:
+        raise CorpusPromptSourceError(refusal)
+    return SuiteSourceSpec(episode)
+
+
 def _resolve_agentic(prompt_source: str, renderer_id: str | None, episode: Any) -> AgenticSourceSpec:
     from reliquary.environment import agentic_swe
+    from reliquary.eval.prompt_source import is_eval_source
     from reliquary.protocol.agentic_source import AGENTIC_SWE_ENVIRONMENT
 
+    if episode is not None and getattr(episode, "is_suite", False):
+        return _resolve_suite(prompt_source, renderer_id, episode)
     if episode is None:
         raise CorpusPromptSourceError(
             f"prompt source {prompt_source!r} serves agentic episodes: a job reading it "
             "must declare `episode`")
-    if prompt_source != AGENTIC_SWE_ENVIRONMENT:
+    if prompt_source != AGENTIC_SWE_ENVIRONMENT and not is_eval_source(prompt_source):
         raise CorpusPromptSourceError(
-            f"a job with `episode` draws its prompts from {AGENTIC_SWE_ENVIRONMENT!r}, "
-            f"not {prompt_source!r}")
+            f"a job with `episode` draws its prompts from {AGENTIC_SWE_ENVIRONMENT!r} "
+            f"or an eval set, not {prompt_source!r}")
     if renderer_id is not None and renderer_id != episode.renderer:
         raise CorpusPromptSourceError(
             f"the job's renderer_id {renderer_id!r} is not its episode.renderer {episode.renderer!r}")
@@ -570,8 +692,10 @@ def prompt_job_for_spec(
         profile=profile,
         episode=job.episode,
     )
+    agentic = getattr(spec, "interaction_mode", None) == "agentic"
     try:
-        environment = spec.create()
+        # An episode job's source is its own: built from the job's row map.
+        environment = spec.create(job) if agentic else spec.create()
         rows = len(environment)
     except CorpusPromptSourceError:
         raise
@@ -590,7 +714,7 @@ def prompt_job_for_spec(
                if job.prompt_start else "")
             + f" but {job.prompt_source!r} has {rows}"
         )
-    if getattr(spec, "interaction_mode", None) == "agentic":
+    if agentic:
         return AgenticPromptJob(job, environment)
     if getattr(spec, "interaction_mode", None) == "episode":
         return EnvironmentPromptJob(job, environment)
@@ -681,6 +805,25 @@ class LedgerState:
     cursors: CursorLedger
     pending: set[str]
     segments: tuple[SegmentRef, ...]
+    records: tuple[dict[str, Any], ...] = ()
+
+
+def _record_refs(job: JobSpec, value: Any) -> tuple[dict[str, Any], ...]:
+    if not isinstance(value, list):
+        raise LedgerSnapshotError(f"job {job.job_id!r} has no pending record list")
+    refs = []
+    for ref in value:
+        if (not isinstance(ref, dict) or set(ref) != {"submission_id", "sha256", "received_at"}
+                or not all(isinstance(ref[k], str) and _SEGMENT_ID_RE.fullmatch(ref[k])
+                           for k in ("submission_id", "sha256"))
+                or isinstance(ref["received_at"], bool)
+                or not isinstance(ref["received_at"], (int, float))
+                or not math.isfinite(ref["received_at"]) or ref["received_at"] < 0):
+            raise LedgerSnapshotError(f"job {job.job_id!r} has an invalid pending record")
+        refs.append(dict(ref))
+    if len({ref["submission_id"] for ref in refs}) != len(refs):
+        raise LedgerSnapshotError(f"job {job.job_id!r} repeats a pending record")
+    return tuple(refs)
 
 
 def _digest_list(job: JobSpec, field: str, value: Any, *, unique: bool) -> list[str]:
@@ -768,7 +911,8 @@ def rebuild_ledgers(job: JobSpec, snapshot: Any) -> LedgerState:
             raise LedgerSnapshotError(f"job {job.job_id!r} has v2 ledgers without {field}")
     pending = _digest_list(job, "seen_pending", snapshot["seen_pending"], unique=True)
     return LedgerState(
-        schema, slots, cursors, set(pending), _segment_refs(job, snapshot["seen_segments"])
+        schema, slots, cursors, set(pending), _segment_refs(job, snapshot["seen_segments"]),
+        _record_refs(job, snapshot.get("pending_records")) if schema == LEDGER_SCHEMA_V3 else (),
     )
 
 
@@ -777,12 +921,13 @@ def ledger_snapshot(
     cursors: CursorLedger,
     pending: Iterable[str],
     segments: Sequence[SegmentRef] = (),
+    *, pending_records: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """The JSON-native v2 form the store persists. Prompt indices are
     stringified here rather than by the encoder, so a snapshot compares equal
     to the one that comes back out of the bucket."""
     snapshot = {
-        "schema": LEDGER_SCHEMA_V2,
+        "schema": LEDGER_SCHEMA_V3 if pending_records is not None else LEDGER_SCHEMA_V2,
         "slots": {str(index): count for index, count in slots.snapshot().items()},
         "cursors": cursors.snapshot(),
         "seen_pending": sorted(pending),
@@ -791,6 +936,9 @@ def ledger_snapshot(
     failed = slots.failed_snapshot()
     if failed:
         snapshot["failed"] = {str(index): count for index, count in failed.items()}
+    if pending_records is not None:
+        snapshot["pending_records"] = sorted((dict(ref) for ref in pending_records),
+                                              key=lambda ref: ref["submission_id"])
     return snapshot
 
 
@@ -809,12 +957,13 @@ async def record_prompt_failure(store: Any, job: JobSpec, prompt_index: int,
     for _ in range(attempts):
         snapshot, etag = await store.read_ledgers(job.job_id)
         state = await asyncio.to_thread(rebuild_ledgers, job, snapshot)
-        if snapshot and state.schema != LEDGER_SCHEMA_V2:
+        if snapshot and state.schema not in (LEDGER_SCHEMA_V2, LEDGER_SCHEMA_V3):
             raise LedgerSnapshotError(f"job {job.job_id!r} ledgers are not v2")
         outcome = state.slots.record_failure(prompt_index, submission_id)
         if outcome is None:
             return None
-        after = ledger_snapshot(state.slots, state.cursors, state.pending, state.segments)
+        after = ledger_snapshot(state.slots, state.cursors, state.pending, state.segments,
+                                pending_records=state.records if state.schema == LEDGER_SCHEMA_V3 else None)
         try:
             await store.write_ledgers(job.job_id, after, etag)
         except CorpusStoreConflict:
@@ -834,14 +983,9 @@ def seal_chunks(digests: Iterable[str], segment_max: int = SEGMENT_MAX) -> list[
 async def _all_or_cancel(awaitables: Iterable[Awaitable[Any]]) -> list[Any]:
     """``gather``, except that the first failure cancels and awaits the rest,
     so no segment call outlives the request and no exception goes unretrieved."""
-    tasks = [asyncio.ensure_future(awaitable) for awaitable in awaitables]
-    try:
-        return list(await asyncio.gather(*tasks))
-    except BaseException:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+    from reliquary.shared.async_tasks import gather_owned
+
+    return await gather_owned(awaitables)
 
 
 class SeenIndex:
@@ -978,8 +1122,13 @@ class _TurnEntry:
     enqueued: float
     # Run once the verdict is in, by a task the HTTP handler cannot cancel.
     settled: Callable[["_TurnResult"], Awaitable[None]] | None = None
+    # Run instead of `settled` when the entry gets no verdict at all (withdrawn
+    # before a turn took it, or its turn failed).
+    abandoned: Callable[[], Awaitable[None]] | None = None
     taken: bool = False
     finisher: asyncio.Task | None = None
+    record_ref: dict[str, Any] | None = None
+    record: dict[str, Any] | None = None
 
 
 class _TurnResult(NamedTuple):
@@ -1018,6 +1167,7 @@ def plan_turn(
     failed: set[int] = set()
     while True:
         slots, cursors, pending = state.slots, state.cursors, state.pending
+        record_refs = {ref["submission_id"]: ref for ref in state.records}
         # Sealed earlier in this turn: seen exactly as if a ledger named them.
         sealed: set[str] = set()
         chunks: list[list[str]] = []
@@ -1041,6 +1191,11 @@ def plan_turn(
                 # `admit` reads `seen`, it does not grow it: recording what was
                 # paid for is the caller's half of the duplicate check.
                 pending.update(entry.digests)
+                ref = getattr(entry, "record_ref", None)
+                if ref is not None:
+                    if ref["submission_id"] in record_refs and record_refs[ref["submission_id"]] != ref:
+                        raise LedgerSnapshotError("accepted record reference cannot be replaced")
+                    record_refs[ref["submission_id"]] = ref
             elif (slots.filled, cursors.snapshot()) == before:
                 # A refusal that moved nothing costs no write.
                 continue
@@ -1053,7 +1208,9 @@ def plan_turn(
             if not moved:
                 return TurnPlan(outcomes, None, [])
             return TurnPlan(
-                outcomes, ledger_snapshot(slots, cursors, pending, state.segments), chunks
+                outcomes, ledger_snapshot(slots, cursors, pending, state.segments,
+                    pending_records=tuple(record_refs.values())
+                    if state.schema == LEDGER_SCHEMA_V3 or record_refs else None), chunks
             )
         state = rebuild_ledgers(job, snapshot)
 
@@ -1092,8 +1249,8 @@ async def ensure_ledgers_v2(
         if etag is None:
             return "absent"
         state = await asyncio.to_thread(rebuild_ledgers, job, snapshot)
-        if state.schema == LEDGER_SCHEMA_V2:
-            return "v2"
+        if state.schema in (LEDGER_SCHEMA_V2, LEDGER_SCHEMA_V3):
+            return "v3" if state.schema == LEDGER_SCHEMA_V3 else "v2"
         await store.write_ledgers_backup(job.job_id, snapshot)
         chunks = await asyncio.to_thread(seal_chunks, state.pending, segment_max)
         refs = await _write_segments(store, job.job_id, chunks, parallelism)
@@ -1176,6 +1333,8 @@ async def downgrade_ledgers_v1(store: Any, job: JobSpec) -> str:
             return "absent"
         if state.schema == LEDGER_SCHEMA_V1:
             return "v1"
+        if state.records:
+            raise LedgerSnapshotError("pending accepted records must be recovered before downgrade")
         base = ledger_snapshot(state.slots, state.cursors, ())
         v1 = {
             "schema": LEDGER_SCHEMA_V1,
@@ -1191,16 +1350,62 @@ async def downgrade_ledgers_v1(store: Any, job: JobSpec) -> str:
     raise CorpusStoreConflict(f"ledgers of {job.job_id!r} kept changing during downgrade")
 
 
+async def recover_pending_records(store: Any, records: Any, job: JobSpec, *,
+                                  on_recovered=None) -> list[str]:
+    """Materialize only bodies committed by the slot CAS; then clear matching refs.
+
+    A failed publication or cleanup leaves the reference durable. Retrying
+    verifies the same create-only canonical body; it never consumes another slot.
+    """
+    snapshot, _ = await store.read_ledgers(job.job_id)
+    state = await asyncio.to_thread(rebuild_ledgers, job, snapshot)
+    if not state.records:
+        return []
+    if records is None:
+        raise LedgerSnapshotError("accepted record recovery has no record store")
+    committed = {ref["submission_id"]: ref for ref in state.records}
+    for sid, ref in committed.items():
+        # This ref came from the actual ledger, not an uncommitted staged body.
+        record = await records.promote_submission(job.job_id, ref)
+        if (record.get("submission_id") != sid or record.get("job_id") != job.job_id
+                or record.get("received_at") != ref["received_at"]):
+            raise LedgerSnapshotError("published accepted record differs from its committed reference")
+        if on_recovered is not None:
+            on_recovered(sid)
+    for _ in range(LEDGER_REWRITE_ATTEMPTS):
+        current, etag = await store.read_ledgers(job.job_id)
+        state = await asyncio.to_thread(rebuild_ledgers, job, current)
+        remaining = []
+        for ref in state.records:
+            sid = ref["submission_id"]
+            if sid in committed and ref != committed[sid]:
+                raise LedgerSnapshotError("committed accepted record reference changed")
+            if sid not in committed:
+                remaining.append(ref)
+        if len(remaining) == len(state.records):
+            return list(committed)
+        after = ledger_snapshot(state.slots, state.cursors, state.pending, state.segments,
+                                pending_records=remaining)
+        try:
+            await store.write_ledgers(job.job_id, after, etag)
+        except CorpusStoreConflict:
+            continue
+        return list(committed)
+    raise CorpusStoreConflict("accepted record cleanup stayed contended")
+
+
 async def verify_ledgers(store: Any, job: JobSpec) -> dict[str, Any]:
     """Sizes of the stored ledger, after checking every segment it names
     (I2, I3). ``problems`` names an I1 violation by count: each accepted
     submission consumed one slot and added ``sampling.n`` digests, so the
-    seen set must hold exactly ``filled * n``."""
+    seen set must hold exactly ``filled * n`` (a signed-sandbox job's accept also
+    adds its session's seen key: ``filled * (n + 1)``)."""
+    from reliquary.corpus.job import is_signed_sandbox
     from reliquary.infrastructure.corpus_job_store import _encode
 
     snapshot, etag, state, index = await _loaded(store, job)
     seen = len(index) + len(state.pending)
-    expected = state.slots.filled * job.sampling.n
+    expected = state.slots.filled * (job.sampling.n + (1 if is_signed_sandbox(job) else 0))
     problems = []
     if seen != expected:
         problems.append(
@@ -1300,7 +1505,10 @@ def worst_case_body(job: JobSpec) -> int:
     completions at about 24 JSON bytes a token, plus the rendered prompt and
     slack; an episode job's trajectory is bounded by the minimum."""
     if job.episode is not None:
-        return MIN_SUBMIT_BODY_BYTES
+        from reliquary.corpus.job import is_signed_sandbox
+        from reliquary.protocol.corpus_submission import MAX_TRANSCRIPT_BYTES
+
+        return MIN_SUBMIT_BODY_BYTES + (MAX_TRANSCRIPT_BYTES if is_signed_sandbox(job) else 0)
     sampling = job.sampling
     return max(MIN_SUBMIT_BODY_BYTES,
                sampling.n * sampling.max_new_tokens * 24 + MAX_RENDERED_PROMPT_CHARS + 64 * 1024)
@@ -1346,6 +1554,13 @@ def _capped_route(cap_for: Callable[[Request], int]) -> type[APIRoute]:
     return CappedSubmitRoute
 
 
+def _retry_later(refusal) -> HTTPException:
+    """A transient intake refusal (stale sandbox directory, a session whose other
+    submission is in flight): retryable, nothing consumed."""
+    return HTTPException(status_code=503, detail=refusal.reason,
+                         headers={"Retry-After": str(int(refusal.retry_after))})
+
+
 def _body_too_large() -> JSONResponse:
     return JSONResponse(status_code=413, content={"detail": "corpus_body_too_large"},
                         headers={"Connection": "close"})
@@ -1374,6 +1589,8 @@ def build_corpus_router(
     ledger_batch_max: int = LEDGER_BATCH_MAX,
     episode_intake=None,
     job: JobSpec | None = None,
+    durable_records: bool | None = None,
+    pending_record_arrivals: dict[str, float] | None = None,
 ) -> APIRouter:
     """The corpus submission endpoint, over an already-bound job store.
 
@@ -1407,12 +1624,60 @@ def build_corpus_router(
     committer: list[asyncio.Task] = []
     # Strong references to the post-turn tasks until they finish.
     finishing: set[asyncio.Task] = set()
+    # Enable writers only after every ledger reader has v3 support. Existing
+    # v3 refs are still readable and recoverable with the writer opt-in off.
+    if durable_records is None:
+        option = os.environ.get("RELIQUARY_CORPUS_DURABLE_RECORDS", "0")
+        if option not in ("0", "1"):
+            raise ValueError("RELIQUARY_CORPUS_DURABLE_RECORDS must be 0 or 1")
+        durable_records = option == "1"
+    if durable_records and (records is None or any(not callable(getattr(records, name, None))
+            for name in ("stage_submission", "promote_submission", "read_submission"))):
+        raise ValueError("durable admission requires staged record storage")
+    record_arrivals = pending_record_arrivals if pending_record_arrivals is not None else {}
+    active_records: collections.Counter = collections.Counter()
+    announced: set[str] = set()
+    record_lock = asyncio.Lock()
+
+    def announce(sid: str) -> None:
+        if sid not in announced and on_accepted is not None:
+            on_accepted(sid)
+            announced.add(sid)
+
+    async def recover_records(job: JobSpec | None = None) -> None:
+        if job is None:
+            job = await _read_job_checked()
+        if job is None:
+            return
+        async with record_lock:
+            snapshot, _ = await _from_store(store.read_ledgers(job_id), "ledger recovery read")
+            state = _rebuild_ledgers_checked(job, snapshot)
+            record_arrivals.update((ref["submission_id"], ref["received_at"]) for ref in state.records)
+            try:
+                await _from_store(recover_pending_records(store, records, job, on_recovered=announce),
+                                  "accepted record recovery")
+            except (ValueError, LedgerSnapshotError) as exc:
+                raise _ledger_corrupt(exc) from exc
+            except CorpusStoreConflict as exc:
+                raise HTTPException(status_code=503, detail="corpus_records_pending") from exc
+            current, _ = await _from_store(store.read_ledgers(job_id), "ledger recovery readback")
+            current_refs = _rebuild_ledgers_checked(job, current).records
+            record_arrivals.update((ref["submission_id"], ref["received_at"]) for ref in current_refs)
+            pending = {ref["submission_id"] for ref in current_refs}
+            for sid in list(record_arrivals):
+                if sid not in pending and not active_records[sid]:
+                    del record_arrivals[sid]
+                    active_records.pop(sid, None)
+                    announced.discard(sid)
     # The sealed part of the seen set, touched only under `ledger_lock`; the
     # startup path hands in one it has already loaded.
     if seen_index is None:
         seen_index = SeenIndex(store, job_id)
     # One rebuilt ledger state, keyed by the ETag it was read under (`_read_state`).
     read_cache: dict[str, Any] = {}
+    # The last open map (`corpus_open`): when it was built, from which state.
+    open_cache: dict[str, Any] = {}
+    open_lock = asyncio.Lock()
 
     async def _from_store(call, what: str):
         try:
@@ -1423,17 +1688,22 @@ def build_corpus_router(
     # Also exposed, so the mount can reach the check without the handler.
     router.prompt_fidelity = prompt_fidelity
 
-    async def _record_accepted(request: CorpusSubmissionRequest, served: str,
-                               episode_facts: IntakeFacts | None = None) -> None:
-        # After the ledger write, never before: a record without its slot would
-        # be paid for work the ledgers say never happened.
-        if records is None:
-            return
+    def _accepted_record(request: CorpusSubmissionRequest, served: str,
+                         episode_facts: IntakeFacts | None = None, *, received_at=None) -> dict:
+        # Staging is not auditable. Only a ledger-committed reference may
+        # publish this body under the canonical submissions prefix.
         from reliquary.protocol.signatures import corpus_submission_id
 
         submission_id = corpus_submission_id(request)
         if episode_facts is not None:
             trajectory = request.trajectory.model_dump()
+            transcript = trajectory.get("transcript")
+            if transcript is None:
+                trajectory.pop("transcript", None)      # replay records stay as they were
+            elif isinstance(transcript.get("token"), dict):
+                # The token's signature is a bearer secret, never written to R2; the
+                # grader and the export read its claims only.
+                transcript["token"].pop("signature", None)
             # The prompt the audit prefills is the validator's own render,
             # never the miner's.
             trajectory["prompt_tokens"] = list(episode_facts.prompt_ids)
@@ -1450,10 +1720,18 @@ def build_corpus_router(
             "cursor": request.cursor,
             "prompt_index": request.prompt_index,
             "rendered_prompt": request.rendered_prompt,
-            "received_at": time.time(),
+            "received_at": time.time() if received_at is None else received_at,
             "token_count": token_count,
             "completions": completions,
         }
+        return record
+
+    async def _record_accepted(request: CorpusSubmissionRequest, served: str,
+                               episode_facts: IntakeFacts | None = None) -> None:
+        if records is None:
+            return
+        record = _accepted_record(request, served, episode_facts)
+        submission_id = record["submission_id"]
         written = False
         for attempt in range(RECORD_WRITE_ATTEMPTS):
             try:
@@ -1536,6 +1814,10 @@ def build_corpus_router(
     async def submit_corpus(
         request: CorpusSubmissionRequest,
     ) -> CorpusSubmissionResponse:
+        # The intake's clock, read on arrival (a signed job's deadline is when the
+        # submission was received, not when its check ran).
+        intake_clock = getattr(episode_intake, "clock", None)
+        received = intake_clock() if intake_clock is not None else None
         # First, and before the store is touched at all: another job's work is
         # not this validator's to admit, record or eventually pay for.
         if request.job_id != job_id:
@@ -1588,9 +1870,22 @@ def build_corpus_router(
             if episode_intake is None:
                 logger.error("corpus job %s is an episode job but has no episode intake", job_id)
                 raise HTTPException(status_code=500, detail="corpus_episode_intake_unconfigured")
-            # Every refusal here precedes any slot or cursor consumption.
-            outcome = await asyncio.to_thread(episode_intake.check, request)
+            # Every refusal here precedes any slot or cursor consumption. The
+            # signed intake's deadline is the time the submission arrived.
+            check = (functools.partial(episode_intake.check, request, received=received)
+                     if received is not None else functools.partial(episode_intake.check, request))
+            try:
+                # On the intake's own threads when it has them (a suite one,
+                # which waits on its replay pool), else the default executor.
+                outcome = await asyncio.get_running_loop().run_in_executor(
+                    getattr(episode_intake, "executor", None), check)
+            except ReplayUnavailable as exc:
+                # Ours, not the miner's: a retryable 503, never a refusal.
+                logger.error("corpus job %s: replay unavailable: %s", job_id, exc)
+                raise HTTPException(status_code=503, detail="corpus_replay_unavailable") from exc
             if not isinstance(outcome, IntakeFacts):
+                if getattr(outcome, "retry_after", None) is not None:
+                    raise _retry_later(outcome)
                 try:
                     reason = CorpusRejectReason(outcome.reason)
                 except ValueError:
@@ -1650,7 +1945,36 @@ def build_corpus_router(
                 if not text.ok:
                     return _refuse(CorpusRejectReason(text.reason), text.detail)
 
+        # A signed-sandbox session's seen key joins the turn's digests: recorded in the
+        # same compare-and-swap that consumes the slot (admit refuses it when seen).
+        session_key = getattr(episode_facts, "session_key", "") or None
+        seen_keys = [*digests, session_key] if session_key else list(digests)
         timing["checks"] = time.perf_counter() - started - timing["job_read"]
+
+        record = None
+        if durable_records:
+            from reliquary.protocol.signatures import corpus_submission_id
+
+            await recover_records(job)
+            sid = corpus_submission_id(request)
+            standing = await _from_store(records.read_submission(job_id, sid), "accepted record read")
+            # Freeze arrival only after the read. No await may let the feed's
+            # coverage advance between this timestamp and its pending fence.
+            record = _accepted_record(request, job_id, episode_facts)
+            if standing is not None:
+                # A response can be lost after publication. The identical signed
+                # request retrieves its acceptance without consuming another slot.
+                arrival = standing.get("received_at")
+                if (type(arrival) not in (int, float) or not math.isfinite(arrival) or arrival < 0
+                        or standing != {**record, "received_at": arrival}):
+                    raise _ledger_corrupt(LedgerSnapshotError("existing accepted record differs"))
+                state = await _read_state(job)
+                return _respond(Verdict(True, "accepted", slots_remaining=state.slots.remaining(request.prompt_index)))
+            active_records[sid] += 1
+            # Fence coverage before queueing. The serialized turn stages only
+            # entries its native admission plan actually accepts.
+            record_arrivals.setdefault(sid, record["received_at"])
+            record["received_at"] = record_arrivals[sid]
 
         def decide(slots: SlotLedger, cursors: CursorLedger, seen: AbstractSet[str]) -> Verdict:
             # Run inside a ledger turn, against the ledgers as the entries
@@ -1671,18 +1995,47 @@ def build_corpus_router(
                               else [len(c.proofs) for c in request.completions]),
                 proof_chunk_tokens=None if episode_facts is not None else proof_chunk_tokens,
                 episode_checked=episode_facts is not None,
+                session_key=session_key,
             )
+
+        # A signed-sandbox session is claimed before the write and the claim ends
+        # exactly once: `accepted` after an accepting write, `release` otherwise.
+        claim_open = [False]
+
+        async def end_claim(accepted: bool) -> None:
+            if not claim_open[0]:
+                return
+            claim_open[0] = False
+            try:
+                if accepted:
+                    await episode_intake.accepted(episode_facts)
+                else:
+                    await episode_intake.release(episode_facts)
+            except Exception:
+                logger.exception("ending sandbox session %s's claim failed",
+                                 getattr(episode_facts, "session_id", "?"))
+
+        async def abandoned() -> None:
+            await end_claim(False)
 
         async def settled(turn: _TurnResult) -> None:
             # Outside the turn: the record is create-only and keyed by its own
             # id, so it needs no turn on the ledger. Run even if the miner hung
             # up, so a slot the ledger consumed always gets its record.
-            if turn.verdict is None or not turn.verdict.accepted:
-                return
-            timing.update(turn.timing)
-            mark = time.perf_counter()
-            await _record_accepted(request, job_id, episode_facts)
-            timing["record_write"] = time.perf_counter() - mark
+            accepted = turn.verdict is not None and turn.verdict.accepted
+            try:
+                if not accepted:
+                    return
+                timing.update(turn.timing)
+                mark = time.perf_counter()
+                if record is not None:
+                    await recover_records(job)
+                else:
+                    await _record_accepted(request, job_id, episode_facts)
+                timing["record_write"] = time.perf_counter() - mark
+            finally:
+                # Whatever the record step does: the ledger's verdict decides.
+                await end_claim(accepted)
             timing["total"] = time.perf_counter() - started
             logger.info(
                 "corpus submission timing %s: %s attempts=%d batch=%d",
@@ -1692,8 +2045,18 @@ def build_corpus_router(
                 turn.batch,
             )
 
+        if session_key is not None:
+            refused = await episode_intake.claim(episode_facts)
+            if refused is not None:
+                if refused.retry_after is not None:
+                    raise _retry_later(refused)
+                return _refuse(CorpusRejectReason(refused.reason), refused.detail)
+            claim_open[0] = True
+
         try:
-            turn = await _take_turn(job, decide, digests, settled)
+            turn = await _take_turn(job, decide, seen_keys, settled,
+                                    abandoned if session_key is not None else None,
+                                    record=record)
         except asyncio.TimeoutError:
             logger.warning(
                 "corpus ledger turn for %s not granted within %.0f s (miner %s)",
@@ -1704,6 +2067,20 @@ def build_corpus_router(
         written = turn.verdict
 
         if written is not None:
+            if record is not None and not written.accepted:
+                # Concurrent retries of the same signed request can share a
+                # ledger turn. Only the verified canonical receipt makes the
+                # losing duplicate an idempotent acceptance.
+                await recover_records(job)
+                standing = await _from_store(records.read_submission(job_id, sid),
+                                              "accepted record retry read")
+                if standing is not None:
+                    arrival = standing.get("received_at")
+                    if (type(arrival) not in (int, float) or not math.isfinite(arrival) or arrival < 0
+                            or standing != {**record, "received_at": arrival}):
+                        raise _ledger_corrupt(LedgerSnapshotError("existing accepted record differs"))
+                    state = await _read_state(job)
+                    written = Verdict(True, "accepted", slots_remaining=state.slots.remaining(request.prompt_index))
             return _respond(written)
 
         logger.warning(
@@ -1768,6 +2145,56 @@ def build_corpus_router(
             "slots_remaining": state.slots.remaining(prompt_index),
             "skip_to": skip_target(job, hotkey, cursor, state.slots),
         }
+
+    def _open_response(body: dict) -> JSONResponse:
+        return JSONResponse(body, headers={
+            "Cache-Control": f"public, max-age={int(OPEN_CACHE_SECONDS)}"})
+
+    def _open_cached() -> dict | None:
+        if "body" in open_cache and _open_clock() - open_cache["at"] < OPEN_CACHE_SECONDS:
+            return open_cache["body"]
+        return None
+
+    @router.get(OPEN_PATH)
+    async def corpus_open() -> JSONResponse:
+        """Which of the job's prompts still have a slot, for any prompt order:
+        ``open`` is base64 of one bit per SOURCE row from ``prompt_start``
+        (``slots.OPEN_ENCODING``), ``as_of`` the unix time the ledger was read.
+        A read, exposed like the cursor: no signature, no write. One answer
+        serves every caller for ``OPEN_CACHE_SECONDS``, so polling miners cost
+        neither a bucket read nor a second pass over the ledger."""
+        body = _open_cached()
+        if body is not None:
+            return _open_response(body)
+        async with open_lock:
+            # Whoever held the lock may have just built it.
+            body = _open_cached()
+            if body is not None:
+                return _open_response(body)
+            job = await _read_job_checked()
+            if job is None:
+                raise HTTPException(status_code=404, detail="corpus_job_unknown")
+            if job.prompt_count > OPEN_MAX_PROMPTS:
+                raise HTTPException(status_code=409, detail="corpus_job_open_too_large")
+            state = await _read_state(job)
+            as_of = time.time()
+            if open_cache.get("state") is state:
+                # The same ledger version: the map stands, only its age moves.
+                body = {**open_cache["body"], "as_of": as_of}
+            else:
+                # Off the loop: a pass over every consumed prompt.
+                bitmap, opened = await asyncio.to_thread(state.slots.open_bitmap)
+                body = {
+                    "job_id": job.job_id,
+                    "prompt_start": job.prompt_start,
+                    "prompt_count": job.prompt_count,
+                    "open_count": opened,
+                    "as_of": as_of,
+                    "encoding": OPEN_ENCODING,
+                    "open": base64.b64encode(bitmap).decode("ascii"),
+                }
+            open_cache.update(at=_open_clock(), state=state, body=body)
+            return _open_response(body)
 
     @router.post(SKIP_PATH, response_model=CorpusSkipResponse)
     async def skip_corpus(request: CorpusSkipRequest) -> CorpusSkipResponse:
@@ -1852,14 +2279,14 @@ def build_corpus_router(
         )
 
     async def _take_turn(job: JobSpec, decide, digests: Sequence[str],
-                         settled=None) -> "_TurnResult":
+                         settled=None, abandoned=None, *, record=None) -> "_TurnResult":
         """Queue one decision for the next ledger turn and wait for its
         verdict. Raises ``asyncio.TimeoutError`` when no turn takes it within
         ``ledger_lock_timeout`` (it is then withdrawn: nothing was consumed);
         once a turn has taken it, it waits for that turn as a lock holder did."""
         loop = asyncio.get_running_loop()
         entry = _TurnEntry(job, decide, digests, loop.create_future(), time.perf_counter(),
-                           settled)
+                           settled, abandoned, record=record)
         turn_queue.append(entry)
         _wake_committer()
         try:
@@ -1867,19 +2294,56 @@ def build_corpus_router(
         except BaseException:
             if not entry.taken:
                 turn_queue.remove(entry)
+                _abandon(entry)
+                await release_record(entry)
             raise
         if not done and not entry.taken:
             turn_queue.remove(entry)
+            _abandon(entry)
+            await release_record(entry)
             raise asyncio.TimeoutError
         # Shielded: a request cancelled now must not cancel its turn's result
         # out from under the batch it shares, nor its record write.
         return await asyncio.shield(entry.finisher)
 
+    def _abandon(entry: _TurnEntry) -> None:
+        """An entry withdrawn before any turn took it: its `abandoned` runs in a task
+        of its own, since the handler withdrawing it may be cancelled."""
+        if entry.abandoned is not None:
+            task = asyncio.get_running_loop().create_task(entry.abandoned())
+            finishing.add(task)
+            task.add_done_callback(_finished)
+
     async def _finish(entry: _TurnEntry) -> _TurnResult:
-        turn = await entry.future
-        if entry.settled is not None:
-            await entry.settled(turn)
-        return turn
+        try:
+            turn = await entry.future
+        except BaseException:
+            if entry.abandoned is not None:
+                await entry.abandoned()
+            raise
+        else:
+            if entry.settled is not None:
+                await entry.settled(turn)
+            return turn
+        finally:
+            # The detached turn, not its HTTP handler, owns this fence.
+            await release_record(entry)
+
+    async def release_record(entry: _TurnEntry) -> None:
+        if entry.record is None:
+            return
+        sid = entry.record["submission_id"]
+        active_records[sid] -= 1
+        if not active_records[sid]:
+            active_records.pop(sid, None)
+        try:
+            current, _ = await store.read_ledgers(job_id)
+            committed = {ref["submission_id"] for ref in rebuild_ledgers(entry.job, current).records}
+            if sid not in committed and not active_records[sid]:
+                record_arrivals.pop(sid, None)
+                announced.discard(sid)
+        except Exception:
+            logger.warning("corpus accepted record fence retained until recovery", exc_info=True)
 
     def _finished(task: asyncio.Task) -> None:
         finishing.discard(task)
@@ -1954,6 +2418,17 @@ def build_corpus_router(
                 mark = time.perf_counter()
                 snapshot, etag = await _from_store(store.read_ledgers(job_id), "ledger read")
                 state = await asyncio.to_thread(_rebuild_ledgers_checked, job, snapshot)
+                if state.schema == LEDGER_SCHEMA_V3 and not durable_records:
+                    raise HTTPException(status_code=503, detail="corpus_durable_records_disabled")
+                if state.records and any(entry.record is not None for entry in live):
+                    # A queued burst can predate the first failed publication.
+                    # Do not consume its next batch until the committed bodies
+                    # are canonical; one batch is bounded by ledger_batch_max.
+                    await recover_records(job)
+                    snapshot, etag = await _from_store(store.read_ledgers(job_id), "ledger recovery read")
+                    state = await asyncio.to_thread(_rebuild_ledgers_checked, job, snapshot)
+                    if state.records:
+                        raise HTTPException(status_code=503, detail="corpus_records_pending")
                 timing["ledger_read"] += time.perf_counter() - mark
 
                 # The integrity step before anything is decided (I2, I3).
@@ -1990,6 +2465,31 @@ def build_corpus_router(
                         settle(entry, verdict)
                     return
                 after = plan.after
+                committed_refs = {ref["submission_id"]: ref for ref in after.get("pending_records", [])}
+                for entry, verdict in decided:
+                    if not verdict.accepted or entry.record is None:
+                        continue
+                    if entry.record_ref is None:
+                        sid = entry.record["submission_id"]
+                        try:
+                            ref = await _from_store(records.stage_submission(job_id, sid, entry.record),
+                                                    "accepted record staging")
+                            _record_refs(job, [ref])
+                            if ref["submission_id"] != sid or ref["received_at"] != entry.record["received_at"]:
+                                raise LedgerSnapshotError("staged accepted record identity differs")
+                        except CorpusStoreConflict as exc:
+                            raise HTTPException(status_code=503, detail="corpus_records_pending") from exc
+                        except (ValueError, LedgerSnapshotError) as exc:
+                            raise _ledger_corrupt(exc) from exc
+                        entry.record_ref = ref
+                    ref = entry.record_ref
+                    sid = ref["submission_id"]
+                    if sid in committed_refs and committed_refs[sid] != ref:
+                        raise _ledger_corrupt(LedgerSnapshotError("accepted record reference cannot be replaced"))
+                    committed_refs[sid] = ref
+                if committed_refs or "pending_records" in after:
+                    after["schema"] = LEDGER_SCHEMA_V3
+                    after["pending_records"] = sorted(committed_refs.values(), key=lambda ref: ref["submission_id"])
                 mark = time.perf_counter()
                 if plan.chunks:
                     sealed = await seal(plan.chunks)
@@ -2012,7 +2512,8 @@ def build_corpus_router(
             for entry in live:
                 settle(entry, None)
         except Exception as exc:
-            # A store or ledger failure is every entry's: none of them was written.
+            # A failed acknowledgment may still have committed the CAS. Its
+            # durable references, not this exception, decide recovery.
             for entry in live:
                 fail(entry, exc)
         finally:
@@ -2087,16 +2588,36 @@ def build_corpus_router(
         return job, await _read_state(job)
 
     router.ledger_state = ledger_state
+
+    async def slots_remaining(prompt_index: int) -> int | None:
+        """Slots this prompt still accepts, read fresh; None when the job is complete,
+        unknown or does not own the prompt (the sandbox session issuer's view)."""
+        job, state = await ledger_state()
+        if job is None or state is None or state.slots.is_complete or not job.owns(prompt_index):
+            return None
+        return state.slots.remaining(prompt_index)
+
+    router.slots_remaining = slots_remaining
     # The handlers themselves, so `build_corpus_jobs_router` can dispatch to
     # this job without a second copy of any of them.
     router.corpus_job = corpus_job
     router.corpus_cursor = corpus_cursor
     router.submit_corpus = submit_corpus
     router.corpus_next = corpus_next
+    router.corpus_open = corpus_open
     router.skip_corpus = skip_corpus
     router.ledger_lock = ledger_lock
+    router.recover_records = recover_records
     # How many decisions wait for the next ledger turn.
     router.ledger_waiting = lambda: len(turn_queue)
+    # A cancelled HTTP handler can leave a taken turn and its durable record
+    # write running. Retirement must include those tasks, not only handlers.
+    router.admission_pending = lambda: bool(
+        turn_queue
+        or any(not task.done() for task in committer)
+        or any(not task.done() for task in finishing)
+        or bool(record_arrivals)
+    )
     return router
 
 
@@ -2115,8 +2636,9 @@ class CorpusJobRoutes:
         # Each job's prompt source: an eval job's names the set miners fetch.
         self.prompt_sources: dict[str, str] = {}
         self.retired: set[str] = set()
-        # Admissions (submit, skip) past the retired check and not yet returned:
-        # a job is unwired only once none is left.
+        self.paused: set[str] = set()
+        # Handlers past the retired check. admission_pending also accounts for
+        # taken turns that continue after their HTTP handler is cancelled.
         self.in_flight: collections.Counter = collections.Counter()
         self.default = default if default is not None else next(iter(self.routers), None)
 
@@ -2133,6 +2655,12 @@ class CorpusJobRoutes:
     def retire(self, job_id: str) -> None:
         self.retired.add(job_id)
 
+    def set_admission(self, job_id: str, admission: str) -> None:
+        if admission == "paused":
+            self.paused.add(job_id)
+        elif admission == "open" and job_id not in self.retired:
+            self.paused.discard(job_id)
+
     def remove(self, job_id: str) -> None:
         # Stays in `retired`: its miners keep hearing 410, not an unknown job.
         self.retired.add(job_id)
@@ -2141,13 +2669,28 @@ class CorpusJobRoutes:
         self.prompt_sources.pop(job_id, None)
 
     def open_jobs(self) -> list[str]:
-        return sorted(j for j in self.routers if j not in self.retired)
+        return sorted(j for j in self.routers if j not in self.retired and j not in self.paused)
+
+    def admission_pending(self, job_id: str) -> bool:
+        """A write handler or its detached ledger/record work is still running."""
+        if self.in_flight[job_id]:
+            return True
+        router = self.routers.get(job_id)
+        pending = getattr(router, "admission_pending", None)
+        return bool(pending is not None and pending())
+
+    async def recover_records(self, job_id: str) -> None:
+        recover = getattr(self.routers.get(job_id), "recover_records", None)
+        if recover is not None:
+            await recover()
 
     @contextlib.asynccontextmanager
     async def admission(self, job_id: str):
         """The job's router for one write, refused once retired, counted while it runs."""
         if job_id in self.retired:
             raise HTTPException(status_code=410, detail=JOB_RETIRED)
+        if job_id in self.paused:
+            raise HTTPException(status_code=409, detail="job_paused")
         router = self.routers.get(job_id)
         if router is None:
             raise HTTPException(status_code=404, detail="corpus_job_not_served")
@@ -2200,6 +2743,15 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
         # Before any store is touched: a retired job admits nothing more.
         if job_id in routes.retired:
             raise HTTPException(status_code=410, detail=JOB_RETIRED)
+        if job_id in routes.paused:
+            raise HTTPException(status_code=409, detail="job_paused")
+        return _served(job_id)
+
+    def _open_of(job_id: str) -> APIRouter:
+        # A read, so a paused job answers; a retired one admits nothing more,
+        # and its miners stop on the 410 instead of reading a map of slots.
+        if job_id in routes.retired:
+            raise HTTPException(status_code=410, detail=JOB_RETIRED)
         return _served(job_id)
 
     @router.get(JOBS_PATH)
@@ -2217,6 +2769,10 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
     @router.get(NEXT_SCOPED_PATH)
     async def corpus_next_scoped(job_id: str, hotkey: str) -> dict:
         return await _admitting(job_id).corpus_next(hotkey)
+
+    @router.get(OPEN_SCOPED_PATH)
+    async def corpus_open_scoped(job_id: str) -> JSONResponse:
+        return await _open_of(job_id).corpus_open()
 
     @router.post(SKIP_SCOPED_PATH, response_model=CorpusSkipResponse)
     async def skip_corpus_scoped(job_id: str, request: CorpusSkipRequest) -> CorpusSkipResponse:
@@ -2251,6 +2807,10 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
     @router.get(NEXT_PATH)
     async def corpus_next_legacy(hotkey: str) -> dict:
         return await _admitting(_default()).corpus_next(hotkey)
+
+    @router.get(OPEN_PATH)
+    async def corpus_open_legacy() -> JSONResponse:
+        return await _open_of(_default()).corpus_open()
 
     @router.post(SKIP_PATH, response_model=CorpusSkipResponse)
     async def skip_corpus_legacy(request: CorpusSkipRequest) -> CorpusSkipResponse:
@@ -2292,6 +2852,10 @@ __all__ = [
     "JOBS_PATH",
     "NEXT_PATH",
     "NEXT_SCOPED_PATH",
+    "OPEN_CACHE_SECONDS",
+    "OPEN_MAX_PROMPTS",
+    "OPEN_PATH",
+    "OPEN_SCOPED_PATH",
     "SKIP_PATH",
     "SKIP_SCOPED_PATH",
     "JOB_PATH",
@@ -2299,6 +2863,7 @@ __all__ = [
     "LEDGER_SCHEMA",
     "LEDGER_SCHEMA_V1",
     "LEDGER_SCHEMA_V2",
+    "LEDGER_SCHEMA_V3",
     "LedgerState",
     "MAX_RESOLVED_PROMPT_SOURCES",
     "LedgerSnapshotError",
@@ -2324,6 +2889,7 @@ __all__ = [
     "ledger_snapshot",
     "prompt_job_for_spec",
     "rebuild_ledgers",
+    "recover_pending_records",
     "seal_chunks",
     "refuse_unsigned_corpus_submissions",
     "renderer_for_job",

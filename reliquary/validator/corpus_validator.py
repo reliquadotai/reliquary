@@ -11,6 +11,7 @@ import asyncio
 import functools
 import logging
 import math
+import os
 import re
 import time
 from types import SimpleNamespace
@@ -306,29 +307,68 @@ def build_corpus_audit_wiring(*, entry, job, records):
     return params, miner_states, is_banned, drand_beacon, LazyRoundAt()
 
 
+WINDOW_SETTLED = ("it is settled by RL window, which corpus tasks no longer are (design "
+                  "2026-10-03): it is not served and its window archives are no longer paid; "
+                  "close it (`reliquary tasks close`) and take it out of RELIQUARY_TASK_ID")
+
+
+def window_settled(entry) -> bool:
+    """A corpus task declared before every corpus task was period-settled."""
+    from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
+    from reliquary.validator.corpus_periods import is_period_task
+
+    return (getattr(entry, "mechanism", None) == MECHANISM_CORPUS_GENERATION
+            and not is_period_task(entry))
+
+
+def period_served(served):
+    """``served`` (``(entry, cap)`` pairs) split into the period-settled ones,
+    served, and the window-settled entries, left out with an ERROR each: a
+    stale RELIQUARY_TASK_ID naming one must not stop the others."""
+    kept, dropped = [], []
+    for entry, cap in served:
+        if window_settled(entry):
+            logger.error("corpus task %s (job %s) left out: %s",
+                         getattr(entry, "task_id", "?"), getattr(entry, "job_id", "?"),
+                         WINDOW_SETTLED)
+            dropped.append(entry)
+        else:
+            kept.append((entry, cap))
+    return kept, dropped
+
+
 def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof, model,
                    tokenizer, gpu_lock=None, remote=None, scorer=None, vocab_size=None,
                    arrivals_covered=None, auditor_kwargs=None) -> None:
     """One job's auditor, settler and status books, on ``w`` (which carries
     ``entry``, ``job``, ``cap`` and ``stats``): what judges and pays the job,
-    in whichever process runs it.
+    in whichever process runs it. Only a period-settled job: a window-settled
+    one is refused (``ValueError``).
 
     ``records`` is the route-side store (the ban check, the status books);
     ``judge_records`` the judges' own (connections and codec threads).
     ``scorer``/``vocab_size`` stand for ``model`` in a process that has none.
     """
+    if window_settled(w.entry):
+        raise ValueError(f"corpus task {w.entry.task_id!r}: {WINDOW_SETTLED}")
     from reliquary.validator.corpus_auditor import CorpusAuditor
     from reliquary.validator.corpus_miner_states import MinerStates
     from reliquary.validator.corpus_miner_status import (
         MinerBook, feed, proof_thresholds, read_recent_windows,
     )
-    from reliquary.validator.corpus_settlement import (
-        SETTLE_FULL_LIST_SECONDS, CorpusSettler, settler_fed,
-    )
+    from reliquary.validator.corpus_settlement import SETTLE_FULL_LIST_SECONDS, settler_fed
 
     params, miner_states, w.is_banned, beacon, round_at = build_corpus_audit_wiring(
         entry=w.entry, job=w.job, records=records
     )
+    if not hasattr(w, "pending_record_arrivals"):
+        w.pending_record_arrivals = {}
+
+    def covered():
+        if w.pending_record_arrivals:
+            return None
+        return arrivals_covered() if arrivals_covered is not None else math.inf
+
     # The miner status route's view: in memory, fed by the same reports.
     w.audit_params, w.miner_states = params, miner_states
     w.miners = MinerBook(job_id=w.job.job_id, task_id=w.entry.task_id, records=records,
@@ -338,32 +378,25 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
     # `entry.cap` does not exist on `TaskEntry` (the cap lives in
     # `params["cap"]`); the CLI passes the value `TaskConfig` already resolved.
     # Fed by the auditor: the store is listed only as the net.
-    from reliquary.validator.corpus_periods import is_period_task
+    #
+    # Paid on its own clock (design 2026-10-03): closes a period when the
+    # auditor holds nothing undecided received in it -- and, for an episode
+    # job, its grader nothing ungraded or held (ruling P21).
+    from reliquary.infrastructure.corpus_period_store import R2PeriodArchives
+    from reliquary.validator import corpus_periods as cp
+    from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler, oldest_of
 
     grader = getattr(w, "grader", None)
-    if is_period_task(w.entry):
-        # Paid on its own clock (design 2026-10-03): closes a period when the
-        # auditor holds nothing undecided received in it -- and, for an episode
-        # job, its grader nothing ungraded or held (ruling P21).
-        from reliquary.infrastructure.corpus_period_store import R2PeriodArchives
-        from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler, oldest_of
-
-        sources = [lambda: w.auditor.oldest_pending_received_at()]
-        if grader is not None:
-            sources.append(lambda: grader.oldest_unready_received_at())
-        w.settler = CorpusPeriodSettler(
-            task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap, records=judge_records,
-            archives=R2PeriodArchives(guard=archives), oldest_pending=oldest_of(*sources),
-            on_settled=on_settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
-            executor=judge_threads.codec,
-            ready=grader.ready if grader is not None else None)
-    else:
-        w.settler = CorpusSettler(task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap,
-                                  records=judge_records, archives=archives,
-                                  on_settled=on_settled,
-                                  full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
-                                  executor=judge_threads.codec,
-                                  ready=grader.ready if grader is not None else None)
+    sources = [lambda: w.auditor.oldest_pending_received_at()]
+    if grader is not None:
+        sources.append(lambda: grader.oldest_unready_received_at())
+    w.settler = CorpusPeriodSettler(
+        task_id=w.entry.task_id, job_id=w.job.job_id, cap=w.cap, records=judge_records,
+        archives=R2PeriodArchives(guard=archives), oldest_pending=oldest_of(*sources),
+        on_settled=on_settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
+        executor=judge_threads.codec,
+        ready=grader.ready if grader is not None else None,
+        max_price=cp.max_price(w.entry.params))
     w.auditor = CorpusAuditor(job_id=w.job.job_id, records=judge_records, model=model,
                               tokenizer=tokenizer, proof=proof, params=params,
                               miner_states=MinerStates(judge_records, w.job.job_id),
@@ -372,7 +405,7 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
                               on_verdict=settler_fed(w.settler, on_verdict),
                               remote=remote, on_voided=w.miners.voided,
                               threads=judge_threads, scorer=scorer, vocab_size=vocab_size,
-                              arrivals_covered=arrivals_covered,
+                              arrivals_covered=covered,
                               **(auditor_kwargs or {}))
     w.settler.on_window = w.miners.window
     if getattr(w, "grader", None) is not None:
@@ -403,6 +436,17 @@ def judge_jobs(w, *, intake_only: bool, settle_every_seconds: float, settle=None
     return jobs
 
 
+def remote_graded(job) -> bool:
+    """An episode job graded by remote grade executors (SWE replay): not a suite
+    one, which its validator grades by replay (``suite_grading``), nor a
+    signed-sandbox one, graded from its verified transcript. Neither has an
+    executor pin, a replay lease or a dispatcher to refuse it."""
+    from reliquary.corpus.job import is_signed_sandbox
+
+    episode = getattr(job, "episode", None)
+    return episode is not None and not episode.is_suite and not is_signed_sandbox(job)
+
+
 def grade_refusal(job, dispatcher) -> None:
     """``ValueError`` (permanent until a restart) for an episode job that
     ``dispatcher`` cannot grade: none (the process started without an episode
@@ -414,6 +458,60 @@ def grade_refusal(job, dispatcher) -> None:
     if tuple(dispatcher.env_pin) != pin:
         raise ValueError(f"this validator grades {tuple(dispatcher.env_pin)}, episode job "
                          f"{job.job_id!r} pins {pin}; restart it to grade the job")
+
+
+SANDBOX_UNAVAILABLE = "sandbox_unavailable"
+SANDBOX_UNAVAILABLE_RETRY_AFTER_S = 300
+
+
+class SandboxUnavailableIntake:
+    """A signed-sandbox job's intake while this validator's sandbox services are down:
+    every submission is refused, retryable (503 + Retry-After), nothing consumed. The
+    job stays declared and unchanged; a restart with working services serves it again."""
+
+    def __init__(self, why: str, retry_after: int = SANDBOX_UNAVAILABLE_RETRY_AFTER_S) -> None:
+        self.why = why
+        self.retry_after = int(retry_after)
+
+    def check(self, request, received: float | None = None):
+        from reliquary.validator.agentic_intake import IntakeRefusal
+
+        return IntakeRefusal(SANDBOX_UNAVAILABLE, {"why": self.why}, retry_after=self.retry_after)
+
+
+async def start_sandbox_services(services, wiring, *, on_disabled=None) -> bool:
+    """Start the sandbox services (directory read, session restore). When that fails,
+    ONLY the signed-sandbox jobs are disabled (their sessions are no longer opened and
+    their intake refuses, retryable); every other job keeps serving. False then: the
+    caller drops the services (no session route, no background loop)."""
+    from reliquary.corpus.job import is_signed_sandbox
+
+    try:
+        await services.start()
+        return True
+    except Exception as exc:  # noqa: BLE001 - isolated: the other jobs still serve
+        why = f"sandbox services failed to start: {type(exc).__name__}: {exc}"
+        signed = [w for w in wiring if is_signed_sandbox(w.job)]
+        logger.error("ALERT: %s. Signed-sandbox jobs NOT SERVED until a restart with working "
+                     "sandbox services: %s. Every other job is served.", why,
+                     ", ".join(str(w.job.job_id) for w in signed) or "none",
+                     exc_info=(type(exc), exc, exc.__traceback__))
+        for w in signed:
+            forget = getattr(services, "forget", None)
+            if forget is not None:
+                forget(str(w.job.job_id))
+            w.episode_intake = SandboxUnavailableIntake(why)
+            if on_disabled is not None:
+                on_disabled(w, why)
+        return False
+
+
+def replay_episode_pins(wiring) -> set[tuple[str, str]]:
+    """The env pins the replay grade dispatcher serves: episode jobs that are not
+    signed-sandbox ones (graded from their transcripts) nor suite ones (graded
+    by the validator's own replay)."""
+    return {(w.job.episode.env.package, w.job.episode.env.version) for w in wiring
+            if remote_graded(w.job)}
 
 
 async def warm_drand_chain(executor) -> None:
@@ -444,6 +542,14 @@ def wire_job_grader(w, *, records, judge_records, dispatcher, parse_executor=Non
     the intake's) on ``parse_executor``, and reads drand on ``beacon_executor``:
     in a process serving submit routes, never their default executor."""
     if w.job.episode is None or getattr(w, "grader", None) is not None:
+        return
+    if w.job.episode.is_suite:
+        # Graded by its replay, here: no dispatcher, no executor, no lease.
+        from reliquary.validator.suite_grading import LocalEpisodeGrader
+
+        w.grader = LocalEpisodeGrader(job=w.job, records=judge_records,
+                                      replayer=w.episode_intake.replayer,
+                                      source=w.episode_intake.source)
         return
     grade_refusal(w.job, dispatcher)
     from reliquary.validator.corpus_grading import CorpusGrader
@@ -503,6 +609,9 @@ class JudgedElsewhere:
         # The judge process reads the registry itself (`refresh_caps`).
         return None
 
+    def set_max_price(self, price) -> None:
+        return None
+
     async def pending_ids(self) -> list[str]:
         """For the drain check: listed, as the auditor's own net does."""
         submitted = await self._records.list_submission_ids(self._job_id)
@@ -521,6 +630,9 @@ def wire_job_front_only(w, *, records, link) -> None:
     w.miners = None
     w.auditor = w.settler = JudgedElsewhere(records, str(w.job.job_id))
     job_id = str(w.job.job_id)
+    if not hasattr(w, "pending_record_arrivals"):
+        w.pending_record_arrivals = {}
+    link.pending_record_arrivals[job_id] = w.pending_record_arrivals
 
     def on_accepted(submission_id: str) -> None:
         w.stats.accepted()
@@ -591,6 +703,8 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
             registration=registration,
             seen_index=getattr(served, "seen_index", None),
             episode_intake=getattr(served, "episode_intake", None), job=getattr(served, "job", None),
+            pending_record_arrivals=getattr(served, "pending_record_arrivals", None),
+            durable_records=False if not hasattr(served, "pending_record_arrivals") else None,
         )
 
     # Miners have no registry access: each job's own task contract. With one
@@ -600,6 +714,7 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
         routes.add(str(served.entry.job_id), router_for(served),
                    contract=contract if len(jobs) == 1 else getattr(served.entry, "contract", None),
                    prompt_source=getattr(served.job, "prompt_source", None))
+        routes.set_admission(str(served.entry.job_id), getattr(served.entry, "admission", "open"))
     app = FastAPI()
     app.include_router(build_corpus_jobs_router(routes, legacy=True))
     app.state.corpus_routes = routes
@@ -616,6 +731,24 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
             raise HTTPException(status_code=404, detail="corpus_contract_unknown")
         return legacy_contract
 
+    @app.get("/corpus/runtime-contract")
+    async def corpus_runtime_contract() -> dict:
+        runtime = getattr(app.state, "corpus_runtime_contract", None)
+        if runtime is None:
+            raise HTTPException(status_code=503, detail="corpus_runtime_contract_unavailable")
+        job_set = getattr(app.state, "corpus_jobs", None)
+        failure = getattr(job_set, "_failure", None)
+        healthy = bool(job_set is not None and job_set.running and failure is not None
+                       and not failure.done())
+        audit_ready = False
+        if healthy:
+            try:
+                audit_ready = await app.state.corpus_audit_ready()
+            except Exception:
+                logger.warning("corpus runtime: audit readiness unavailable", exc_info=True)
+        return {**runtime, "ready": healthy and audit_ready, "audit_ready": audit_ready,
+                "jobs": routes.open_jobs()}
+
     @app.get("/corpus/jobs/{job_id}/status")
     async def corpus_job_status(job_id: str) -> dict:
         # Public: counts only. The job set is attached once the process runs.
@@ -629,6 +762,31 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
             raise HTTPException(status_code=404, detail="corpus_job_not_served")
         return status
 
+    @app.get("/corpus/pay")
+    async def corpus_pay() -> dict:
+        # Public: an estimate of what each active period job pays per verified
+        # token, recomputed at most once a minute (`corpus_pay`).
+        job_set = getattr(app.state, "corpus_jobs", None)
+        if job_set is None:
+            raise HTTPException(status_code=503, detail="corpus_pay_unavailable")
+        board = getattr(app.state, "corpus_pay", None)
+        if board is None:
+            from reliquary.validator.corpus_pay import PayBoard
+
+            board = app.state.corpus_pay = PayBoard(job_set)
+        try:
+            return await board.pay()
+        except Exception as exc:
+            logger.warning("corpus pay unavailable: %r", exc)
+            raise HTTPException(status_code=503, detail="corpus_pay_unavailable") from exc
+
+    async def stop_pay_board() -> None:
+        board = getattr(app.state, "corpus_pay", None)
+        if board is not None:
+            await board.close()
+
+    app.router.on_shutdown.append(stop_pay_board)
+
     tasks_cache: dict = {}
 
     async def read_tasks() -> dict:
@@ -640,6 +798,7 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
         tasks = [
             {"task_id": e.task_id, "mechanism": e.mechanism, "cap": float(e.params["cap"]),
              "status": e.status, "job_id": getattr(e, "job_id", None),
+             "admission": getattr(e, "admission", "open"),
              "retired_at": getattr(e, "retired_at", None)}
             for e in sorted(entries.values(), key=lambda e: e.task_id)
         ]
@@ -663,6 +822,14 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
 
     # The serving process warms it at start (`run_corpus_validator`).
     app.state.warm_corpus_tasks = refresh_tasks
+
+    async def stop_tasks_refresh() -> None:
+        task = tasks_cache.get("refresh")
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    app.router.on_shutdown.append(stop_tasks_refresh)
 
     @app.get("/corpus/tasks")
     async def corpus_tasks() -> dict:
@@ -743,6 +910,43 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
     return app
 
 
+async def _run_corpus_services(server, services, *, cleanup=None) -> None:
+    """Stop and await every service when HTTP serving ends or a service fails."""
+    from contextlib import nullcontext
+
+    # Uvicorn replays captured signals when serve() returns. Keep that replay
+    # inside its handler until the other services have finished cleanup.
+    with getattr(server, "capture_signals", nullcontext)():
+        serving = asyncio.create_task(server.serve())
+        workers = [asyncio.create_task(service) for service in services]
+        group = asyncio.gather(*workers)
+        try:
+            done, _ = await asyncio.wait((serving, group) if workers else (serving,),
+                                         return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
+        finally:
+            serving.cancel()
+            for task in workers:
+                task.cancel()
+            await asyncio.gather(serving, group, *workers, return_exceptions=True)
+            if cleanup is not None:
+                await cleanup()
+
+
+def sandbox_validator_hotkey(config, wallet) -> str:
+    """The ss58 address miners sign session requests to: the configured one
+    (``RELIQUARY_SANDBOX_VALIDATOR_HOTKEY``), else the wallet's. The split front
+    runs with no wallet, so there it must be configured."""
+    if config.validator_hotkey:
+        return config.validator_hotkey
+    if wallet is None:
+        raise ValueError("this process has no wallet (the split front): set "
+                         "RELIQUARY_SANDBOX_VALIDATOR_HOTKEY to the ss58 address miners "
+                         "sign session requests to")
+    return wallet.hotkey.ss58_address
+
+
 async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http_port,
                                set_weights: bool, entry=None, cap: float | None = None,
                                jobs=None, settle_every_seconds: float = 60.0,
@@ -751,7 +955,8 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                                remote_audit: bool = False,
                                recheck_fraction: float | None = None,
                                split=None, auditor_kwargs=None,
-                               intake_only: bool = False) -> None:
+                               intake_only: bool = False,
+                               generation_only: bool = False) -> None:
     """Serve one corpus task (``entry``, ``cap``) or several (``jobs``, a list
     of ``(entry, cap)``) from one process and one loaded model.
 
@@ -780,7 +985,10 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     if intake_only and (remote_audit or split is not None):
         raise RuntimeError("intake-only serves no audit; unset RELIQUARY_CORPUS_REMOTE_AUDIT "
                            "and RELIQUARY_CORPUS_SPLIT")
-    if split is not None and remote_audit:
+    if generation_only and (split is None or split.links or set_weights):
+        raise RuntimeError("a pinned generation control needs one external GPU scorer, "
+                           "no judge links and no weight setting")
+    if split is not None and remote_audit and not generation_only:
         raise RuntimeError("remote audit executors are not served by the split validator; "
                            "unset RELIQUARY_CORPUS_REMOTE_AUDIT or RELIQUARY_CORPUS_SPLIT")
     if split is not None and set_weights:
@@ -807,21 +1015,36 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         JudgeThreads, judge_record_store, run_in,
     )
     from reliquary.validator.corpus_hot_jobs import (
-        JOB_REFRESH_SECONDS, CorpusJobSet, hot_job_refusal, job_drained, order_entry_screen,
+        JOB_REFRESH_SECONDS, CorpusJobSet, generation_entry_screen, hot_job_refusal,
+        job_drained, order_entry_screen,
     )
     from reliquary.validator.corpus_service import prompt_job_for_spec, renderer_for_job
     from reliquary.validator.corpus_settlement import R2Archives
+    from reliquary.shared.log_levels import unmute_reliquary_loggers
+
+    # bittensor (imported by now) set the loggers of every module imported before it to
+    # CRITICAL: this module's operator ALERTs would never reach the logs.
+    unmute_reliquary_loggers()
 
     served = list(jobs) if jobs is not None else [(entry, cap)]
+    if not served and not generation_only:
+        raise RuntimeError("the corpus control requires an initial job")
     from reliquary.eval.prompt_source import is_order_job_id
 
     for task_entry, _ in served:
-        if is_order_job_id(task_entry.job_id):
+        if generation_only:
+            if generation_entry_screen(task_entry) is not None:
+                raise RuntimeError("the pinned generation control serves generation orders only")
+        elif is_order_job_id(task_entry.job_id):
             # Its own process serves it; two would pay its records twice.
             raise RuntimeError(f"task {task_entry.task_id!r} is an order job (eval or "
                                "generation): the order control (eval control) serves it, "
                                "never the corpus control")
+    served, _ = period_served(served)
+    if not served and not generation_only:
+        raise RuntimeError("the corpus control has no period-settled job to serve")
     store = BucketJobStore()
+    records = BucketRecordStore()
 
     # A tokenizer isn't loaded yet, but the renderer only calls `encode` once
     # a submission arrives -- by then `tokenizer_box` is populated. Resolving
@@ -834,7 +1057,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         encoded = tokenizer_box["tokenizer"].encode(text, add_special_tokens=False)
         return list(getattr(encoded, "ids", encoded))
 
-    from reliquary.validator.corpus_service import migrate_ledgers_at_startup
+    from reliquary.validator.corpus_service import migrate_ledgers_at_startup, recover_pending_records
 
     several = len(served) > 1
     manifests = []
@@ -845,7 +1068,16 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                 f"task {task_entry.task_id!r} declares job {task_entry.job_id!r} but it has no manifest"
             )
         manifests.append((task_entry, task_cap, job))
-    for _, _, job in manifests:
+    for task_entry, _, job in manifests:
+        if generation_only and job.episode is not None:
+            raise RuntimeError("the pinned generation control serves single-turn generation jobs")
+        if generation_only:
+            refusal = hot_job_refusal(
+                task_entry, job, process_profile=ACTIVE_PROTOCOL_PROFILE,
+                process_contract=ACTIVE_PROTOCOL_PROFILE.to_generation_contract(),
+                fingerprint=split.fingerprint, generation_only=True)
+            if refusal is not None:
+                raise RuntimeError(refusal[1])
         # Before any download or ledger migration: a judge process cannot grade.
         refusal = split_episode_refusal(split, job)
         if refusal is not None:
@@ -875,6 +1107,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             prompt_job_for=(functools.partial(prompt_job_for_spec, profile=own_profile)
                             if own_profile is not None else None),
             stats=JobStats(),
+            pending_record_arrivals={},
         )
 
         def on_accepted(submission_id: str) -> None:
@@ -912,6 +1145,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                                and getattr(task_entry, "contract", None) is not None else None)
                 renderer = build_renderer(job, own_profile)
                 seen_index = await migrate_ledgers_at_startup(store, job)
+                await recover_pending_records(store, records, job)
             except Exception as exc:  # noqa: BLE001 - isolated: the others still start
                 not_served(task_entry, job, "its renderer or ledger migration", exc)
                 continue
@@ -920,6 +1154,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         # Before anything serves: the route would otherwise seal a v1 seen set
         # inside its first submission's ledger turn. One ledger, one index, per job.
         seen_index = await migrate_ledgers_at_startup(store, job)
+        await recover_pending_records(store, records, job)
         # With several jobs the process runs their merged contract; each job's
         # renderer is still checked against its OWN task's contract.
         own_profile = (_entry_profile(task_entry)
@@ -950,7 +1185,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             logger.warning("subnet registrations unknown at start; miners get 503 until they load")
 
     # Every job names this one checkpoint (`multi_job_refusal`): load it once.
-    first = wiring[0].job
+    first = wiring[0].job if wiring else None
     if split is None:
         directory = Path(snapshot_download(first.checkpoint_repo,
                                            revision=first.checkpoint_revision))
@@ -984,7 +1219,6 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
 
         model, proof = None, split.proof
         vocab_size = (await read_info(split.run_dir))["vocab_size"]
-    records = BucketRecordStore()
     # The auditors' and settlers' own connections (miners.json included): their
     # reads and writes in flight (up to 32 a job) never queue the route's behind
     # botocore's 10. The route's ban check keeps the route's client.
@@ -1008,6 +1242,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     remote = directory = None
     if remote_audit:
         from reliquary.infrastructure import corpus_executor_store as executor_store
+        from reliquary.infrastructure.corpus_attempt_store import AttemptStore
         from reliquary.validator.corpus_audit import rows_of_items, score_sequences
         from reliquary.validator.corpus_audit_remote import (
             RECHECK_FRACTION, ExecutorDirectory, RemoteAuditDispatcher,
@@ -1017,16 +1252,24 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         async def local_scores(items):
             # The trusted verifier: this GPU, in turn with every job's auditor.
             async with gpu_lock:
+                if scorer is not None:
+                    scores, _, _ = await scorer(rows_of_items(items))
+                    return scores
                 scores, _, _ = await run_in(judge_threads.gpu, lambda: score_sequences(
                     model, rows_of_items(items),
                     chunk_tokens=proof.chunk_tokens, topk=proof.topk,
                     batch_tokens=AUDIT_BATCH_TOKENS))
             return scores
 
-        directory = ExecutorDirectory(model_id=first.checkpoint_repo,
-                                      model_revision=first.checkpoint_revision)
+        model_id = first.checkpoint_repo if first is not None else ACTIVE_PROTOCOL_PROFILE.model_id
+        model_revision = first.checkpoint_revision if first is not None else ACTIVE_PROTOCOL_PROFILE.model_revision
+        checkpoint_sha256 = first.checkpoint_sha256 if first is not None else fingerprint
+        directory = ExecutorDirectory(model_id=model_id, model_revision=model_revision)
         remote = RemoteAuditDispatcher(
             directory=directory, proof=proof, local_scores=local_scores,
+            attempt_store=AttemptStore({"kind": "audit", "model": model_id,
+                "revision": model_revision, "checkpoint_sha256": checkpoint_sha256,
+                "chunk_tokens": proof.chunk_tokens, "topk": proof.topk}),
             recheck_fraction=RECHECK_FRACTION if recheck_fraction is None else recheck_fraction,
             quarantine=lambda executor_id, reason: executor_store.set_executor_status(
                 executor_id, "quarantined", reason=reason),
@@ -1044,21 +1287,51 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         except RuntimeError as exc:
             raise ValueError(str(exc)) from exc
 
+    from reliquary.corpus.job import is_signed_sandbox
+
+    # Signed-sandbox jobs (plan 3): the validator's token key, the machine directory,
+    # the session route. Without the key settings, signed jobs are not served. A
+    # replay-only validator never imports reliquary-sandbox (it may not be installed).
+    sandbox_services = None
+    routes_ref: dict = {}
+    signed_wiring = [w for w in wiring if is_signed_sandbox(w.job)]
+    sandbox_configured = bool(os.environ.get("RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE")
+                              or os.environ.get("RELIQUARY_SANDBOX_VALIDATOR_KEY_ID"))
+    if signed_wiring or sandbox_configured:
+        try:
+            from reliquary.validator.sandbox_wiring import (
+                SandboxValidatorConfig, build_sandbox_services,
+            )
+
+            sandbox_config = SandboxValidatorConfig.from_env()
+            if sandbox_config is None:
+                raise ValueError("set RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE and "
+                                 "RELIQUARY_SANDBOX_VALIDATOR_KEY_ID to serve signed-sandbox jobs")
+            sandbox_services = build_sandbox_services(
+                sandbox_config, validator_hotkey=sandbox_validator_hotkey(sandbox_config, wallet),
+                registration=registered.reason if registered is not None else None)
+        except Exception as exc:  # noqa: BLE001 - isolated: replay jobs still start
+            # The key loader's errors name the path and its mode, never the key.
+            logger.error("sandbox services not started: %r", exc)
+            for w in signed_wiring:
+                not_served(w.entry, w.job, "its sandbox services", exc, retried=False)
+                wiring.remove(w)
+
     # One grade dispatcher for every episode job: one env pin per validator.
     grade_dispatcher = grade_directory = None
     graders: dict[str, object] = {}
-    pins = {(w.job.episode.env.package, w.job.episode.env.version)
-            for w in wiring if w.job.episode is not None}
+    pins = replay_episode_pins(wiring)
     if len(pins) > 1:
         raise RuntimeError(f"one validator grades one env pin, these jobs name {sorted(pins)}")
     if pins:
         from reliquary.infrastructure import corpus_executor_store as grade_store
+        from reliquary.infrastructure.corpus_attempt_store import AttemptStore
         from reliquary.validator.corpus_audit_remote import ExecutorDirectory
         from reliquary.validator.corpus_grade_remote import RemoteGradeDispatcher
 
         (package, version), = pins
         # Ruling P26: never serve a job whose replays outlive the replay lease.
-        for w in [w for w in wiring if w.job.episode is not None]:
+        for w in [w for w in wiring if remote_graded(w.job)]:
             try:
                 await lease_checked(w.job)
             except Exception as exc:  # noqa: BLE001 - isolated: the others still start
@@ -1067,6 +1340,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         grade_directory = ExecutorDirectory(model_id=package, model_revision=version, scope="grade")
         grade_dispatcher = RemoteGradeDispatcher(
             directory=grade_directory, env_package=package, env_version=version,
+            attempt_store=AttemptStore({"kind": "grade", "package": package, "version": version}),
             quarantine=lambda executor_id, reason: grade_store.set_executor_status(
                 executor_id, "quarantined", reason=reason, scope="grade"),
             record_heartbeat=lambda executor_id, at, detail: grade_store.record_heartbeat(
@@ -1076,7 +1350,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         try:
             await grade_directory.refresh()
         except Exception as exc:  # noqa: BLE001 - no grader without the quarantines
-            for w in [w for w in wiring if w.job.episode is not None]:
+            for w in [w for w in wiring if remote_graded(w.job)]:
                 not_served(w.entry, w.job, "reading the grade executor registry", exc,
                            retried=False)
                 wiring.remove(w)
@@ -1086,7 +1360,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     # Every grader's trajectory parses, on threads of their own (bounded):
     # never the default executor the submit routes' ledger turns run on.
     grade_parse_threads = None
-    if grade_dispatcher is not None:
+    if grade_dispatcher is not None or sandbox_services is not None:
         from concurrent.futures import ThreadPoolExecutor
 
         from reliquary.validator.corpus_grading import GRADE_PARSE_THREADS
@@ -1094,14 +1368,42 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         grade_parse_threads = ThreadPoolExecutor(GRADE_PARSE_THREADS,
                                                  thread_name_prefix="corpus-grade-parse")
     job_set: CorpusJobSet | None = None
-    archives = R2Archives(served=lambda: job_set.hot_task_ids() if job_set is not None else ())
+    archives = R2Archives(
+        served=lambda: ((job_set.task_ids() if generation_only else job_set.hot_task_ids())
+                        if job_set is not None else ()),
+        served_only=generation_only,
+    )
+
+    suite_replayer_box: dict = {}
 
     def episode_intake_for(w):
         # Loads the task set and the renderers: blocking, so a hot-added job
         # builds it off the event loop (`wire_hot`). The grader gets its own
         # renderer: its parses never queue on the intake's renderer lock.
+        if is_signed_sandbox(w.job):
+            if sandbox_services is None:
+                raise ValueError(f"job {w.job.job_id!r} is a signed-sandbox job and this "
+                                 "validator has no sandbox key configured")
+            from reliquary.validator.sandbox_wiring import wire_signed_job
+
+            wire_signed_job(w, services=sandbox_services, routes=lambda: routes_ref.get("routes"),
+                            checkpoint_dir=checkpoint_dir, tokenizer=tokenizer,
+                            vocab_size=vocab_size, chunk_tokens=proof.chunk_tokens,
+                            publish=False)       # published once the whole job is wired
+            return w.episode_intake
         from reliquary.validator import agentic_intake
 
+        if w.job.episode.is_suite:
+            # Replayed at intake and graded by the same replay, in one
+            # process pool for every suite job here (built at the first).
+            from reliquary.validator import suite_intake
+
+            if suite_replayer_box.get("replayer") is None:
+                suite_replayer_box["replayer"] = suite_intake.PoolSuiteReplayer.for_tokenizer(
+                    tokenizer)
+            return suite_intake.build_suite_intake(
+                w.job, tokenizer=tokenizer, vocab_size=vocab_size,
+                chunk_tokens=proof.chunk_tokens, replayer=suite_replayer_box["replayer"])
         intake = agentic_intake.build_episode_intake(
             w.job, checkpoint_dir=checkpoint_dir, tokenizer=tokenizer,
             vocab_size=vocab_size, chunk_tokens=proof.chunk_tokens)
@@ -1114,7 +1416,14 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             raise ValueError(refusal[1])                       # never paid ungraded
         if w.job.episode is not None and getattr(w, "episode_intake", None) is None:
             w.episode_intake = episode_intake_for(w)
-        if w.job.episode is not None:
+        if is_signed_sandbox(w.job):
+            from reliquary.validator.sandbox_wiring import wire_signed_grader
+
+            # Not in `graders`: a grade executor's quarantine never holds or regrades
+            # a transcript grade (no executor decided it).
+            wire_signed_grader(w, judge_records=judge_records,
+                               parse_executor=grade_parse_threads)
+        elif w.job.episode is not None:
             wire_job_grader(w, records=records, judge_records=judge_records,
                             dispatcher=grade_dispatcher, parse_executor=grade_parse_threads,
                             beacon_executor=judge_threads.beacon)
@@ -1138,14 +1447,29 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         except Exception as exc:  # noqa: BLE001 - isolated: the others still start
             not_served(w.entry, w.job, "its intake, grader or auditor wiring", exc)
             graders.pop(str(w.job.job_id), None)
+            if sandbox_services is not None:
+                sandbox_services.forget(str(w.job.job_id))
             wiring.remove(w)
-    if not wiring:
+            continue
+        if sandbox_services is not None and is_signed_sandbox(w.job):
+            sandbox_services.publish(w)
+    if not wiring and (served or not generation_only):
         raise RuntimeError("no corpus job left to serve: " + "; ".join(
             f"{task}: {why}" for task, why in sorted(unserved.items())))
     if any(w.job.episode is not None for w in wiring):
         # The drand chain once, off the loop: an episode job's auditor and
         # grader here would otherwise resolve it on the loop at first use.
         await warm_drand_chain(judge_threads.beacon)
+
+    if sandbox_services is not None:
+        # Before any route serves (it would otherwise serve opens with empty
+        # reservations and caps). A failure disables the signed-sandbox jobs only.
+        def sandbox_unserved(w, why):
+            unserved[str(w.entry.task_id)] = why
+
+        if not await start_sandbox_services(sandbox_services, wiring,
+                                            on_disabled=sandbox_unserved):
+            sandbox_services = None
 
     app = build_corpus_jobs_app(jobs=wiring, store=store, records=records, tokenizer=tokenizer,
                                 verify_signature=verify_corpus_signature,
@@ -1154,6 +1478,10 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                                 vocab_size=vocab_size,
                                 registration=registered.reason if registered is not None else None,
                                 contract=getattr(wiring[0].entry, "contract", None) if len(wiring) == 1 else None)
+    routes_ref["routes"] = app.state.corpus_routes
+    if sandbox_services is not None:
+        app.include_router(sandbox_services.router)
+        app.state.corpus_sandbox = sandbox_services
 
     async def wire_hot(task_entry, task_cap, job):
         refusal = split_episode_refusal(split, job)
@@ -1163,17 +1491,32 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         # The renderer first: a job refused for it leaves its ledger untouched.
         own_profile = _entry_profile(task_entry)
         renderer = build_renderer(job, own_profile)
-        if job.episode is not None:
+        if is_signed_sandbox(job):
+            if sandbox_services is None:
+                raise ValueError(f"signed-sandbox job {job.job_id!r} joined a validator "
+                                 "without a sandbox key; configure it and restart")
+        elif remote_graded(job):
             # Before its intake (a task set download): a job this process
             # cannot grade is refused for nothing.
             grade_refusal(job, grade_dispatcher)
             await lease_checked(job)
         seen_index = await migrate_ledgers_at_startup(store, job)
+        await recover_pending_records(store, records, job)
         w = prepared(task_entry, task_cap, job, own_profile, renderer, seen_index)
-        if job.episode is not None:
-            w.episode_intake = await asyncio.to_thread(episode_intake_for, w)
-            await warm_drand_chain(judge_threads.beacon)
-        audit_and_settle(w)
+        try:
+            if job.episode is not None:
+                w.episode_intake = await asyncio.to_thread(episode_intake_for, w)
+                await warm_drand_chain(judge_threads.beacon)
+            audit_and_settle(w)
+        except BaseException:
+            if sandbox_services is not None and is_signed_sandbox(job):
+                sandbox_services.forget(str(job.job_id))     # no session for an unwired job
+            raise
+        if sandbox_services is not None and is_signed_sandbox(job):
+            # Only now: a job still being wired (or failing to be) is never visible to
+            # the session issuer. Its router is adopted after this; until then an
+            # open is refused `job_not_ready`.
+            sandbox_services.publish(w)
         unserved.pop(str(task_entry.task_id), None)       # served now
         return w
 
@@ -1186,22 +1529,75 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
     async def drained(w) -> bool:
         return await job_drained(auditor=w.auditor, records=records, job_id=w.job.job_id)
 
+    from reliquary.validator.corpus_autoclose import AutoClose, autoclose_enabled
+
+    autoclose = None
+    if autoclose_enabled() and not intake_only and not generation_only:
+        # A finished job's task goes to cap 0 by itself (its earned tail keeps
+        # being paid); the admin service's orders keep their own lifecycle.
+        async def registry_entries():
+            if read_registry is not None:
+                return await read_registry()
+            from reliquary.infrastructure.task_registry_store import read_registry as read
+
+            found, _ = await read()
+            return found
+
+        autoclose = AutoClose(read_entries=registry_entries)
     job_set = CorpusJobSet(
         routes=app.state.corpus_routes, router_for=app.state.corpus_router_for,
         wire=wire_hot,
         jobs_of=lambda w: judge_jobs(w, intake_only=intake_only,
                                      settle_every_seconds=settle_every_seconds),
         read_entries=read_registry, read_job=read_job,
-        screen=order_entry_screen,
+        screen=generation_entry_screen if generation_only else order_entry_screen,
         admit=lambda task_entry, job: split_episode_refusal(split, job) or hot_job_refusal(
             task_entry, job, process_profile=ACTIVE_PROTOCOL_PROFILE,
-            process_contract=process_contract, fingerprint=fingerprint),
+            process_contract=process_contract, fingerprint=fingerprint,
+            generation_only=generation_only),
         drained=drained,
+        finals=records if generation_only else None,
+        wire_retired=generation_only,
         refresh_every_seconds=(refresh_every_seconds if refresh_every_seconds is not None
                                else JOB_REFRESH_SECONDS),
+        autoclose=autoclose,
     )
     app.state.corpus_jobs = job_set
     app.state.corpus_unserved = unserved
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    runtime_contract = ACTIVE_PROTOCOL_PROFILE.to_generation_contract()
+    app.state.corpus_runtime_contract = {
+        "schema": "corpus-runtime-contract/v1",
+        "contract": runtime_contract, "contract_sha256": canonical_sha256(runtime_contract),
+        "checkpoint_sha256": fingerprint, "registry_refresh_enabled": hot,
+        "intake_only": intake_only,
+        "execution_scope": "generation-operations" if generation_only else "corpus",
+        "durable_executor_attempts": remote is not None or grade_dispatcher is not None,
+    }
+    if split is not None:
+        from reliquary.validator.corpus_feed import UdsClient
+        from reliquary.validator.corpus_gpu import GPU_SOCKET
+
+        gpu_status = UdsClient(Path(split.run_dir) / GPU_SOCKET, timeout=2.0)
+
+    async def audit_ready() -> bool:
+        if intake_only:
+            return False
+        if split is None:
+            return model is not None
+        info = await gpu_status.get("/info")
+        if info is None or info.get("ready", True) is not True or (
+                info.get("model_id"), info.get("model_revision")) != (
+                ACTIVE_PROTOCOL_PROFILE.model_id, ACTIVE_PROTOCOL_PROFILE.model_revision):
+            return False
+        # One existing job per judge is enough to prove its status route is live.
+        judged = {id(w.judge_link): w for w in job_set.served.values()
+                  if getattr(w, "judge_link", None) is not None}
+        return all(result is not None for result in await asyncio.gather(
+            *(w.judge_link.stats(w.job.job_id) for w in judged.values())))
+
+    app.state.corpus_audit_ready = audit_ready
     for w in wiring:
         job_set.adopt(w)
 
@@ -1215,6 +1611,9 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         ).start()
 
     background = [registered.refresh_forever()] if registered is not None else []
+    if sandbox_services is not None:
+        # After the restore above; cancelled with every other service at shutdown.
+        background += sandbox_services.background()
     if split is not None:
         # One sender per judge process, whatever number of jobs it judges.
         background += [link.run() for link in {id(k): k for k in split.links.values()}.values()]
@@ -1239,7 +1638,21 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
         background.append(grade_dispatcher.run())
 
     server = uvicorn.Server(uvicorn.Config(app, host=http_host, port=http_port, log_level="info"))
-    await asyncio.gather(server.serve(), job_set.run(), app.state.warm_corpus_tasks(), *background)
+    async def cleanup_threads() -> None:
+        if sandbox_services is not None:
+            try:
+                await sandbox_services.stop()      # in-flight session writes, bounded
+            except Exception:  # noqa: BLE001 - the other services still clean up
+                logger.exception("sandbox services did not stop cleanly")
+        replayer = suite_replayer_box.get("replayer")
+        if replayer is not None:
+            replayer.close()                    # kills the suite replay workers
+        await asyncio.to_thread(judge_threads.shutdown, wait=True)
+        if grade_parse_threads is not None:
+            await asyncio.to_thread(grade_parse_threads.shutdown, wait=True, cancel_futures=True)
+
+    await _run_corpus_services(server, [job_set.run(), app.state.warm_corpus_tasks(), *background],
+                               cleanup=cleanup_threads)
 
 
 __all__ = [
@@ -1256,6 +1669,9 @@ __all__ = [
     "settle_forever",
     "startup_refusal",
     "wire_job_front_only",
+    "remote_graded",
+    "start_sandbox_services",
+    "SandboxUnavailableIntake",
     "wire_job_grader",
     "wire_job_judge",
 ]

@@ -23,13 +23,15 @@ from reliquary.shared.checkpoint_identity import (
     require_immutable_checkpoint_revision,
 )
 from reliquary.shared.strict_json import strict_json_loads
+from reliquary.shared.checkpoint_namespace import (
+    CheckpointNamespace, active_checkpoint_namespace,
+    LEGACY_CANDIDATE_MANIFEST_KEY, LEGACY_CHECKPOINT_PREFIX,
+)
 
 logger = logging.getLogger(__name__)
 
-# Knowingly NOT task-scoped: it sits on the live checkpoint-adoption path and
-# cannot collide until a second task runs a trainer. Scope it before one does.
-CANDIDATE_MANIFEST_KEY = "reliquary/training/candidate-manifest.json"
-R2_CHECKPOINT_PREFIX = "reliquary/checkpoints"
+CANDIDATE_MANIFEST_KEY = LEGACY_CANDIDATE_MANIFEST_KEY
+R2_CHECKPOINT_PREFIX = LEGACY_CHECKPOINT_PREFIX
 
 
 def default_r2_client():
@@ -84,6 +86,10 @@ def _multipart_transfer_config():
 WEIGHT_FILE_SUFFIXES = (".safetensors", ".bin")
 
 
+class _MirrorPending(RuntimeError):
+    """The candidate is published but its weight mirror is not complete yet."""
+
+
 class CheckpointIntake:
     def __init__(
         self,
@@ -97,11 +103,13 @@ class CheckpointIntake:
         validate_fn: Callable[[Path], dict[str, Any]] = _default_validate,
         expected_identity: dict[str, Any] | None = None,
         fetch_weights: bool = True,
+        namespace: CheckpointNamespace | None = None,
     ) -> None:
         self._r2 = r2_client
         self._fetch_weights = bool(fetch_weights)
         self._bucket = bucket
-        self.staging_dir = Path(staging_dir)
+        self.namespace = namespace or active_checkpoint_namespace()
+        self.staging_dir = self.namespace.local_path(staging_dir)
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         self.installed_revision = (
             require_immutable_checkpoint_revision(
@@ -204,14 +212,19 @@ class CheckpointIntake:
         """
         try:
             body = self._r2.get_object(
-                Bucket=self._bucket, Key=CANDIDATE_MANIFEST_KEY,
+                Bucket=self._bucket, Key=self.namespace.candidate_manifest_key,
             )["Body"].read()
-        except Exception:
+        except Exception as exc:
+            if self.namespace.scoped:
+                code = getattr(exc, "response", {}).get("Error", {}).get("Code")
+                self.last_error = (None if code in {"NoSuchKey", "404", "NotFound"}
+                                   else "candidate manifest is unreadable")
             return None
         try:
             manifest = strict_json_loads(body)
             if not isinstance(manifest, dict):
                 raise TypeError("candidate manifest must be an object")
+            self.namespace.require_identity(manifest)
             candidate = self._manifest_identity(manifest)
             _, _, revision = candidate
             self._require_successor(candidate)
@@ -230,6 +243,8 @@ class CheckpointIntake:
                 + ", ".join(sorted(mismatches))
             )
             return None
+        if self.namespace.scoped:
+            self.last_error = None
         ignored = {self.staged_revision, self._staging_revision}
         if not include_installed:
             ignored.add(self.installed_revision)
@@ -245,6 +260,7 @@ class CheckpointIntake:
         try:
             if not isinstance(manifest, dict):
                 raise TypeError("candidate manifest must be an object")
+            self.namespace.require_identity(manifest)
             candidate = self._manifest_identity(manifest)
             _, _, revision = candidate
             self._require_successor(candidate)
@@ -269,13 +285,25 @@ class CheckpointIntake:
             dest = candidate_dest
             self._staging_revision = revision
             self._staging_identity = candidate
-            prefix = f"{R2_CHECKPOINT_PREFIX}/{revision}/"
+            prefix = f"{self.namespace.checkpoint_prefix}/{revision}/"
             listed = self._r2.list_objects_v2(
                 Bucket=self._bucket, Prefix=prefix,
             )
             contents = listed.get("Contents", [])
             if not contents:
                 raise RuntimeError(f"R2 mirror has no objects under {prefix}")
+            from reliquary.trainer.publisher import MIRROR_COMPLETE, mirror_marker_required
+
+            complete_key = prefix + MIRROR_COMPLETE
+            # Only the new trainer's mirror (scoped namespace or the explicit flag)
+            # defers weights behind the marker; a legacy mirror is whole before its
+            # manifest, as before, and carries no marker.
+            if self._fetch_weights and mirror_marker_required(self.namespace) and not any(
+                obj.get("Key") == complete_key for obj in contents
+            ):
+                # Weights land after the manifest; poll() offers it again.
+                raise _MirrorPending(f"weight mirror for {revision[:12]} still uploading")
+            contents = [obj for obj in contents if obj.get("Key") != complete_key]
             config = _multipart_transfer_config()
             dest.mkdir(parents=True, exist_ok=True)
             for obj in contents:
@@ -302,7 +330,34 @@ class CheckpointIntake:
                 self._r2.download_file(
                     self._bucket, key, str(target), Config=config,
                 )
-            self._validate(dest)
+            if self.namespace.scoped and self._validate is _default_validate:
+                from reliquary.validator.checkpoint_profile import (
+                    active_checkpoint_profile, validate_checkpoint_profile,
+                )
+                profile = validate_checkpoint_profile(
+                    dest, required=True,
+                    expected=active_checkpoint_profile(namespace=self.namespace),
+                )
+            else:
+                profile = self._validate(dest)
+            if self.namespace.scoped:
+                self.namespace.require_identity(profile)
+                bindings = {"trained_window_cursor": "trained_window_cursor", "journal_key_space": "journal_key_space",
+                            "generation_contract_sha256": "generation_contract_sha256", "profile_id": "protocol_profile_id",
+                            "protocol_version": "protocol_version"}
+                for profile_key, manifest_key in bindings.items():
+                    if profile_key not in profile or profile[profile_key] != manifest.get(manifest_key):
+                        raise ValueError(f"candidate snapshot mismatch for {profile_key}")
+                from reliquary.trainer.publisher import PUBLICATION_RECEIPT
+
+                receipt = strict_json_loads((dest / PUBLICATION_RECEIPT).read_bytes())
+                expected_receipt_manifest = {k: v for k, v in manifest.items() if k != "revision"}
+                if receipt.get("manifest") != expected_receipt_manifest:
+                    raise ValueError("candidate snapshot publication receipt mismatch")
+        except _MirrorPending as exc:
+            self.last_error = str(exc)
+            logger.info("checkpoint staging deferred: %s", exc)
+            return False
         except Exception as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
             logger.exception(

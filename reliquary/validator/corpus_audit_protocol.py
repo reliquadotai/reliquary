@@ -50,6 +50,9 @@ class ClaimRequest(_Strict):
 class HeartbeatRequest(_Strict):
     executor_id: ExecutorId
     detail: dict[str, int | float | str | bool] | None = Field(default=None, max_length=32)
+    # The leases the executor holds right now (grade executors). Absent (an
+    # older executor, an audit one): the control takes nothing back on it.
+    held_leases: list[LeaseId] | None = Field(default=None, max_length=256)
 
 
 class AuditItem(_Strict):

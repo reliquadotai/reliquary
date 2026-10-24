@@ -35,6 +35,27 @@ if TYPE_CHECKING:
 
 ARTIFACT_SCHEMA = "reliquary/environment-artifact/v1"
 
+# The tokens that end an assistant turn. A rollout that stopped on its own ends
+# in one, and both admission and the miner decode with special tokens kept, so
+# it is the last thing in the text a checker reads.
+TURN_TERMINATORS = ("<|im_end|>", "<|endoftext|>")
+
+
+def strip_turn_terminators(text: str) -> str:
+    """The answer without the terminator(s) that closed its turn.
+
+    Only trailing ones: the terminator is how the turn ended, not part of what
+    was answered, and a checker that reads the end of the answer ("ends
+    with...", JSON, last word) fails on it. A terminator inside the text stays.
+    """
+    while True:
+        for terminator in TURN_TERMINATORS:
+            if text.endswith(terminator):
+                text = text[: -len(terminator)]
+                break
+        else:
+            return text
+
 
 def _object(
     value: Any,
@@ -556,11 +577,30 @@ class _ArtifactSourceLoader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
 def load_external_backend(spec: EnvironmentSpec, *, split: str = "train") -> Any:
     """Import the replay entrypoint only after checking its complete artifact.
 
-    Split selection is for offline qualification. Runtime catalog factories use
-    the fixed train split; a different prompt/generator needs a different pin.
+    Runtime catalog factories use the train split; evaluation jobs build an
+    episode environment at another split through `EnvironmentSpec.create`.
+    A different prompt/generator needs a different pin.
     """
-    if split not in ("train", "eval", "qualification"):
+    if split not in ("train", "eval", "qualification", "benchmark"):
         raise ValueError("unsupported external environment split")
+    artifact, (module,) = _import_verified(
+        spec, lambda artifact: [artifact["entrypoints"]["replay"].partition(":")[0]])
+    entrypoint = artifact["entrypoints"]["replay"]
+    backend_type = getattr(module, entrypoint.partition(":")[2], None)
+    if not callable(backend_type):
+        raise TypeError(f"external replay entrypoint is not callable: {entrypoint}")
+    return backend_type() if split == "train" else backend_type(split=split)
+
+
+def import_external_modules(
+    spec: EnvironmentSpec, module_names: Sequence[str]
+) -> tuple[Mapping[str, Any], list[Any]]:
+    """The artifact and the named modules of a wheel, imported from its
+    verified bytes only (as the replay entrypoint is), without building it."""
+    return _import_verified(spec, lambda _artifact: list(module_names))
+
+
+def _import_verified(spec: EnvironmentSpec, module_names_of) -> tuple[Mapping[str, Any], list[Any]]:
     with _IMPORT_LOCK:
         artifact = verify_external_artifact(spec)
         distribution = importlib.metadata.distribution(spec.external_distribution or "")
@@ -590,17 +630,16 @@ def load_external_backend(spec: EnvironmentSpec, *, split: str = "train") -> Any
         loader = _ArtifactSourceLoader(
             package, sources, spec.environment_manifest_sha256, resources
         )
-        entrypoint = artifact["entrypoints"]["replay"]
-        module_name, _, attribute_name = entrypoint.partition(":")
+        names = module_names_of(artifact)
+        for name in names:
+            if name != package and not name.startswith(package + "."):
+                raise ValueError(f"module {name!r} is not in package {package!r}")
         sys.meta_path.insert(0, loader)
         try:
-            module = importlib.import_module(module_name)
+            modules = [importlib.import_module(name) for name in names]
         finally:
             sys.meta_path.remove(loader)
-        backend_type = getattr(module, attribute_name, None)
-        if not callable(backend_type):
-            raise TypeError(f"external replay entrypoint is not callable: {entrypoint}")
-        return backend_type() if split == "train" else backend_type(split=split)
+        return artifact, modules
 
 
 class ExternalAnswerEnvironment:
@@ -693,11 +732,18 @@ class ExternalAnswerEnvironment:
         return materials
 
     def compute_reward(self, problem: dict, completion: str) -> float:
+        if self._spec.contract_version == "reliquary/stdio-program/v1":
+            # The wheel's grade runs the program in a local subprocess. Here
+            # it is scored from its materials, in the sandbox, or not at all.
+            raise TypeError(
+                f"{self.name} is graded in the sandbox from its materials, "
+                "never by its wheel on this host"
+            )
         index = problem.get("generator_index")
         if (not isinstance(index, int) or isinstance(index, bool) or index < 0
                 or problem != self.get_problem(index) or not isinstance(completion, str)):
             return 0.0
-        raw = _object(self._backend.grade(index, completion),
+        raw = _object(self._backend.grade(index, strip_turn_terminators(completion)),
                       name="external answer reward",
                       required={"reward", "success", "state_digest"})
         reward = _number(raw["reward"], name="external answer reward")
@@ -719,8 +765,10 @@ class ExternalAnswerEnvironment:
         return reward
 
 
-def load_external_episode_environment(spec: EnvironmentSpec) -> ExternalEpisodeEnvironment:
-    return ExternalEpisodeEnvironment(load_external_backend(spec), spec)
+def load_external_episode_environment(
+    spec: EnvironmentSpec, *, split: str = "train",
+) -> ExternalEpisodeEnvironment:
+    return ExternalEpisodeEnvironment(load_external_backend(spec, split=split), spec)
 
 
 def load_external_answer_environment(spec: EnvironmentSpec) -> ExternalAnswerEnvironment:
@@ -744,9 +792,11 @@ __all__ = [
     "ARTIFACT_SCHEMA",
     "ExternalEpisodeEnvironment",
     "ExternalAnswerEnvironment",
+    "import_external_modules",
     "load_external_backend",
     "load_external_answer_environment",
     "load_external_episode_environment",
     "score_external_answers",
+    "strip_turn_terminators",
     "verify_external_artifact",
 ]

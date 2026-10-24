@@ -166,6 +166,18 @@ ENVIRONMENT_CATALOG: Mapping[str, EnvironmentProfile] = MappingProxyType({
         ),
         prompt_cooldown_windows=1359,
     ),
+    "reliquary_hard_math_v1": EnvironmentProfile(
+        max_new_tokens=32768,
+        bft=None,
+        answer_format="boxed",
+        batch_target=8,
+        prompt_template=_EXTERNAL_PROMPT,
+        environment_contract_id="reliquary/boxed-answer/v1",
+        environment_manifest_sha256=(
+            "cda025161a6c551abed72a96b7cbbefdac5cf5eab217df37831d947b2e55a6df"
+        ),
+        prompt_cooldown_windows=2904,
+    ),
     "reliquary_instruction_following_v1": EnvironmentProfile(
         max_new_tokens=8192,
         bft=None,
@@ -189,6 +201,30 @@ ENVIRONMENT_CATALOG: Mapping[str, EnvironmentProfile] = MappingProxyType({
         environment_manifest_sha256=(
             "71e4f23c614b7f321bbb9f6cf74f98b772137442bdf9960e5b6d9b6387f41216"
         ),
+    ),
+    "reliquary_competitive_code_v1": EnvironmentProfile(
+        max_new_tokens=16384,
+        bft=None,
+        answer_format="fenced_python",
+        batch_target=8,
+        prompt_template=_EXTERNAL_PROMPT,
+        environment_contract_id="reliquary/stdio-program/v1",
+        environment_manifest_sha256=(
+            "42a38bda5b3e5910fde5fdfb0ea8537a5f2e53cdd1b2447ef4a8649757beac50"
+        ),
+        prompt_cooldown_windows=340,
+    ),
+    "reliquary_general_v1": EnvironmentProfile(
+        max_new_tokens=16384,
+        bft=None,
+        answer_format="text",
+        batch_target=16,
+        prompt_template=_EXTERNAL_PROMPT,
+        environment_contract_id="reliquary/checked-answer/v1",
+        environment_manifest_sha256=(
+            "fc874fefc78de44891b94401a77f71d1b6fb4d5048e04d7908b073eb681b84f1"
+        ),
+        prompt_cooldown_windows=7664,
     ),
     "reliquary_telecom_solo_v1": EnvironmentProfile(
         max_new_tokens=49152,
@@ -224,8 +260,11 @@ CATALOG_PROVENANCE: Mapping[str, str] = MappingProxyType({
     "reliquarylogic_v1": "qwen3-4b-reliquary-logic-v8-dev1",
     "reliquary_dapo_math_v1": "teutonic-9b-reliquary-suite-v9-dev1",
     "reliquary_science_v1": "teutonic-9b-reliquary-suite-v9-dev1",
+    "reliquary_hard_math_v1": "teutonic-9b-reliquary-suite-v9-dev1",
     "reliquary_instruction_following_v1": "teutonic-9b-reliquary-suite-v9-dev1",
     "reliquary_code_v1": "teutonic-9b-reliquary-suite-v9-dev1",
+    "reliquary_competitive_code_v1": "teutonic-9b-reliquary-suite-v9-dev1",
+    "reliquary_general_v1": "teutonic-9b-reliquary-suite-v9-dev1",
     "reliquary_telecom_solo_v1": "teutonic-9b-reliquary-suite-v9-dev1",
 })
 

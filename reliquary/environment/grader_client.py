@@ -44,6 +44,16 @@ _CANDIDATE_FAILURE_STATUSES = frozenset({
 })
 
 
+# What a stdio run may come back as for the candidate's own doing.
+_STDIO_CANDIDATE_STATUSES = frozenset({
+    "ok",
+    "output_limit",
+    "runtime_error",
+    "forbidden_import",
+    "timeout",
+})
+
+
 class GraderClient:
     """Thin JSON-over-Unix-socket client.
 
@@ -109,6 +119,62 @@ class GraderClient:
             raise GraderInfrastructureError("invalid_score")
         return passed / total
 
+    def run_stdio(
+        self,
+        *,
+        code: str,
+        guest: str,
+        stdin: str,
+        output_cap: int,
+        time_limit_s: float,
+    ) -> tuple[str, str]:
+        """Run a whole program on one stdin in the sandbox: ``(status, stdout)``.
+
+        No expected output is sent; the caller compares. Candidate statuses
+        come back as they are. ``harness_overload`` (the host starved the
+        program, so there is no verdict) and every service failure raise
+        :class:`GraderInfrastructureError`, never a zero.
+        """
+        from reliquary.environment.grader.worker import (
+            STDIO_DRAIN_S,
+            STDIO_WALL_FACTOR,
+            STDIO_WALL_SLACK_S,
+        )
+
+        wall_s = STDIO_WALL_FACTOR * float(time_limit_s) + STDIO_WALL_SLACK_S
+        req = {
+            "req_id": uuid.uuid4().hex,
+            "mode": "stdio",
+            "guest": guest,
+            "code": code,
+            "stdin": stdin,
+            "output_cap": output_cap,
+            "time_limit_s": time_limit_s,
+            "timeout_s": wall_s,
+            # Covers a wait for a free worker as well as the run itself.
+            "deadline_monotonic": min(
+                time.monotonic() + wall_s + STDIO_DRAIN_S + 30.0
+                + _SOCKET_TIMEOUT_HEADROOM_S,
+                self.deadline_monotonic if self.deadline_monotonic is not None
+                else float("inf"),
+            ),
+        }
+        for attempt in (1, 2):
+            try:
+                response = self._round_trip(req)
+                break
+            except (OSError, ConnectionError) as e:
+                if attempt == 1:
+                    time.sleep(0.1)
+                    continue
+                raise GraderInfrastructureError("unreachable") from e
+        status = response.get("status")
+        stdout = response.get("stdout")
+        if status in _STDIO_CANDIDATE_STATUSES and isinstance(stdout, str):
+            return status, stdout
+        raise GraderInfrastructureError(
+            str(response.get("reason") or status or "malformed_response"))
+
     def _round_trip(self, req: dict) -> dict:
         deadline = req.get("deadline_monotonic", time.monotonic() + req["timeout_s"] + _SOCKET_TIMEOUT_HEADROOM_S)
         def remaining():
@@ -121,15 +187,17 @@ class GraderClient:
             s.connect(self.socket_path)
             s.settimeout(remaining())
             s.sendall(json.dumps(req).encode() + b"\n")
-            buf = b""
+            # Joined once: a stdio reply carries the program's whole stdout.
+            chunks: list[bytes] = []
             while True:
                 s.settimeout(remaining())
-                chunk = s.recv(4096)
+                chunk = s.recv(65536)
                 if not chunk:
                     break
-                buf += chunk
-                if b"\n" in buf:
+                chunks.append(chunk)
+                if b"\n" in chunk:
                     break
+            buf = b"".join(chunks)
             if not buf:
                 return {}
             try:

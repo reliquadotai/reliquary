@@ -19,7 +19,6 @@ from reliquary.eval.storage import SubnetEvalStore, publish_set
 from reliquary.infrastructure import corpus_executor_store as executors
 from reliquary.infrastructure import corpus_job_store as job_store
 from tests.unit.test_corpus_job_store import _FakeMultiObjectR2
-from tests.unit.test_eval_sets import opener
 from tests.unit.test_jobs_cli import _rl_entry, registry  # noqa: F401
 
 SECRET = b"admin-secret"
@@ -34,6 +33,12 @@ class _JobRecords:
 
     def __init__(self):
         self.subs, self.verdicts, self.voided, self.settled = {}, {}, set(), []
+
+    async def read_job(self, job_id):
+        return await job_store.read_job(job_id)
+
+    async def read_ledgers(self, job_id):
+        return await job_store.read_ledgers(job_id)
 
     async def list_submission_ids(self, job_id):
         return sorted(self.subs)
@@ -63,11 +68,12 @@ def admin(tmp_path, monkeypatch, registry):  # noqa: F811
     monkeypatch.setattr(executors, "get_s3_client", lambda **kw: fake)
     monkeypatch.setattr(ps, "_loaded", {})
     registry["entries"] = {"default": _rl_entry("default", 0.5)}
-    build_set("logic", count=8, seed=1, out=tmp_path / "set", open_environment=opener(),
+    from tests.unit.test_eval_grading import GradingEnvironment, _plain_scorer
+
+    build_set("logic", count=8, seed=1, out=tmp_path / "set", open_environment=lambda s, sp: GradingEnvironment(s),
               clock=lambda: 1.0)
     asyncio.run(publish_set(tmp_path / "set", platform=LocalDirectorySink(tmp_path / "p"),
                             subnet=SubnetEvalStore()))
-    from tests.unit.test_eval_grading import GradingEnvironment, _plain_scorer
 
     records = _JobRecords()
     # What the admin reads of a model's own files: per model, facts or an error.
@@ -366,7 +372,11 @@ def test_an_eval_job_is_declared_byte_identically(admin):
     assert admin("POST", "/admin/v1/jobs", _eval_job()).status_code == 201
     entry = admin.registry["entries"]["order-eval-7"]
     manifest = json.loads(admin.bucket.objects["reliquary/corpus/jobs/order-eval-7.json"][0])
-    document = {"manifest": manifest, "contract": entry.contract, "params": entry.params}
+    # Every corpus task is now paid by period: the settlement is the one
+    # param added since the pin; manifest, contract and the rest are unchanged.
+    assert entry.params["settlement"] == "period-ema-v1"
+    params = {k: v for k, v in entry.params.items() if k != "settlement"}
+    document = {"manifest": manifest, "contract": entry.contract, "params": params}
     digest = hashlib.sha256(json.dumps(document, sort_keys=True,
                                        separators=(",", ":")).encode()).hexdigest()
     assert digest == EVAL_JOB_GOLDEN

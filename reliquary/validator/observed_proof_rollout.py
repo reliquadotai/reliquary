@@ -33,6 +33,9 @@ def observed_restart_checkpoint(pool):
     checkpoint = pool.health.checkpoint if pool.health is not None else None
     if not observed_live_requested() or not state_dir or checkpoint is None:
         raise ValueError("observed restart requires an adopted checkpoint and durable state")
+    from reliquary.shared.checkpoint_namespace import active_checkpoint_namespace
+
+    state_dir = active_checkpoint_namespace().local_path(state_dir)
     binding = (checkpoint.checkpoint_n, checkpoint.revision)
     gate = FillClosedRotationStore(state_dir).load()
     if gate is not None and (
@@ -133,12 +136,13 @@ def authorize_observed_live(pool, activation_revision):
     if not getattr(pool, "is_remote", False) or pool.health is None:
         raise ValueError("observed rollout requires authenticated remote proof health")
     health = pool._validate_health(pool.health)
-    if len(health.slots) != 1:
-        raise ValueError("observed rollout is limited to one GPU and one proof slot")
+    if not health.slots or len({
+            (s.physical_device, s.device_uuid, s.hardware_class) for s in health.slots}) != 1:
+        raise ValueError("observed rollout is limited to one GPU")
     if health.checkpoint is None or health.checkpoint.revision != activation_revision:
         raise ValueError("observed rollout requires the exact adopted activation checkpoint")
     slot = health.slots[0]
-    if slot.revision != activation_revision:
+    if any(s.revision != activation_revision for s in health.slots):
         raise ValueError("observed rollout slot checkpoint mismatch")
     budget = capacity_budget()
     environments = sorted(c.MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV)
@@ -161,6 +165,10 @@ def authorize_observed_live(pool, activation_revision):
         "device_uuid": slot.device_uuid, "hardware_class": slot.hardware_class,
         "environments": environments,
     }
+    # Several slots share the card (cuda:0#0, cuda:0#1, ...). The count is
+    # pinned only when above one, so a one-slot manifest keeps its identity.
+    if len(health.slots) > 1:
+        identity["proof_slots"] = len(health.slots)
     evidence_checkpoint = health.checkpoint
     pinned_identity = identity
     if observed_restart_checkpoint(pool) is not None:

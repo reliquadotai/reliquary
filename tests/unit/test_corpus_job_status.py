@@ -54,31 +54,20 @@ def test_the_settler_persists_totals_once_per_settled_verdict():
 
     records = _Records({"1" * 64: _v("A", 10), "2" * 64: _v("B", 30, ok=False)})
     settled_ids = []
-    settler = _settler(records, _Archives(46000))
+    settler = _settler(records, _Archives())
     settler.on_settled = settled_ids.extend
     asyncio.run(settler.settle_once())
-    assert records.state["totals"] == {"verdicts": 2, "passed": 1, "verified_tokens": 10,
-                                       "complete": True}
+    assert records.state["totals"] == {"verdicts": 2, "passed": 1, "verified_tokens": 10}
     assert settler.totals == records.state["totals"] and sorted(settled_ids) == sorted(records.verdicts)
     records.verdicts["3" * 64] = _v("A", 5)
     records.fail_state_writes_after = 1  # the pending write lands, the finish crashes
-    archives = _Archives(46001)
+    archives = _Archives()
     crashed = _settler(records, archives)
     with pytest.raises(OSError):
         asyncio.run(crashed.settle_once())
     records.fail_state_writes_after = None
     asyncio.run(_settler(records, archives).settle_once())
     assert records.state["totals"]["verdicts"] == 3 and records.state["totals"]["passed"] == 2
-
-
-def test_a_job_settled_before_totals_existed_says_its_counts_are_incomplete():
-    from tests.unit.test_corpus_settlement import _Archives, _Records, _settler
-
-    records = _Records({})
-    records.state = {"settled": ["9" * 64], "last_window": 3}
-    settler = _settler(records, _Archives(None))
-    asyncio.run(settler.settle_once())
-    assert settler.totals["complete"] is False
 
 
 # --------------------------------------------------------------------------
@@ -129,7 +118,7 @@ def test_a_served_job_reports_every_field_and_no_hotkey():
     stats.accepted()
     status = asyncio.run(job_set.status("job-b"))
     assert status == {
-        "job_id": "job-b", "state": "open", "prompts_total": 3, "prompts_full": 1,
+        "job_id": "job-b", "state": "open", "admission": "open", "prompts_total": 3, "prompts_full": 1,
         "submissions_accepted": 3, "audited": 12, "passed": 9, "verified_tokens": 90,
         "settled": 4, "accepted_last_hour": 1, "counts_complete": True,
     }
@@ -163,6 +152,19 @@ def test_the_status_is_cached_and_the_ledger_read_at_most_once_per_period():
     now[0] += 30.5
     assert asyncio.run(job_set.status("job-b"))["passed"] == 9
     assert router.reads == 2
+
+
+def test_observed_admission_changes_without_recounting_cached_progress():
+    now = [10_000.0]
+    job_set, router, _ = _set({0: 1}, now=now)
+    before = asyncio.run(job_set.status("job-b"))
+    assert before["admission"] == "open"
+    job_set._routes.set_admission("job-b", "paused")
+    paused = asyncio.run(job_set.status("job-b"))
+    assert paused["admission"] == "paused" and router.reads == 1
+    job_set._routes.set_admission("job-b", "open")
+    assert asyncio.run(job_set.status("job-b"))["admission"] == "open"
+    assert router.reads == 1
 
 
 def test_concurrent_requests_on_an_expired_cache_recompute_once():
@@ -241,7 +243,7 @@ def test_the_settler_keeps_the_count_it_settled():
     from tests.unit.test_corpus_settlement import _Archives, _Records, _settler, _v
 
     records = _Records({"1" * 64: _v("A", 10), "2" * 64: _v("B", 30)})
-    settler = _settler(records, _Archives(46000))
+    settler = _settler(records, _Archives())
     assert settler.settled_count is None
     asyncio.run(settler.settle_once())
     assert settler.settled_count == 2
@@ -261,7 +263,7 @@ def test_with_the_flags_off_boot_reads_no_verdict(
     import reliquary.protocol.profiles as profiles
     import reliquary.shared.modeling as modeling
     from reliquary.infrastructure import corpus_record_store
-    from reliquary.validator import corpus_auditor, corpus_settlement
+    from reliquary.validator import corpus_auditor, corpus_period_settlement
     from reliquary.validator.corpus_validator import run_corpus_validator
     from tests.unit.test_corpus_multi_job_validator import _Model, _entry
     from tests.unit.test_corpus_service import CHECKPOINT, _Tokenizer
@@ -289,7 +291,7 @@ def test_with_the_flags_off_boot_reads_no_verdict(
         return None
 
     monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", idle)
-    monkeypatch.setattr(corpus_settlement.CorpusSettler, "settle_once", settle_once)
+    monkeypatch.setattr(corpus_period_settlement.CorpusPeriodSettler, "settle_once", settle_once)
 
     class _Stop(Exception):
         pass

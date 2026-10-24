@@ -42,7 +42,8 @@ def test_tasks_lists_every_declared_task_with_its_share(seeded_job):  # noqa: F8
     assert body.status_code == 200, body.text
     tasks = {t["task_id"]: t for t in body.json()["tasks"]}
     assert tasks["default"] == {"task_id": "default", "mechanism": "rl", "cap": 0.8,
-                                "status": "active", "job_id": None, "retired_at": None}
+                                "status": "active", "job_id": None, "retired_at": None,
+                                "admission": "open"}
     assert tasks["corpus-math"]["job_id"] == "swe-v1"
     assert tasks["old"]["status"] == "retired"
     # Only active tasks count toward what the subnet may pay.

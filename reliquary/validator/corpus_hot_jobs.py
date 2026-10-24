@@ -51,8 +51,18 @@ def order_entry_screen(entry) -> tuple[str, str] | None:
 eval_entry_screen = order_entry_screen
 
 
+def generation_entry_screen(entry) -> tuple[str, str] | None:
+    """The pinned control owns only operator generation-order job ids."""
+    from reliquary.eval.prompt_source import gen_job_prefix
+
+    if not str(getattr(entry, "job_id", "") or "").startswith(gen_job_prefix() + "ops-"):
+        return OTHER_MODEL, "not an operator generation order, served by another control"
+    return None
+
+
 def hot_job_refusal(entry, job, *, process_profile, process_contract: Mapping[str, Any],
-                    fingerprint: str, profile_of=_entry_profile) -> tuple[str, str] | None:
+                    fingerprint: str, profile_of=_entry_profile,
+                    generation_only: bool = False) -> tuple[str, str] | None:
     """Why a registry entry cannot join this running process, or None.
 
     ``(OTHER_MODEL, why)`` is an entry for another checkpoint: not ours, not an
@@ -65,11 +75,19 @@ def hot_job_refusal(entry, job, *, process_profile, process_contract: Mapping[st
     from reliquary.protocol.profiles import toploc_proof
     from reliquary.validator.corpus_validator import startup_refusal
 
-    screened = order_entry_screen(entry)
+    screened = (generation_entry_screen(entry) if generation_only else order_entry_screen(entry))
     if screened is not None:
         # Served by the order control alone, whatever its model: two processes
         # auditing and settling one job would pay its records twice.
         return screened
+    from reliquary.validator.corpus_validator import WINDOW_SETTLED, window_settled
+
+    if window_settled(entry):
+        return REFUSED, WINDOW_SETTLED
+    if generation_only and getattr(job, "episode", None) is not None:
+        return REFUSED, "the pinned generation control serves single-turn generation jobs"
+    if generation_only and getattr(job, "submit", None) != "scoped":
+        return REFUSED, "the pinned generation control requires scoped submission routes"
     if getattr(entry, "contract", None) is None:
         return REFUSED, "it carries no contract to check against the one this process runs"
     try:
@@ -115,10 +133,9 @@ async def job_drained(*, auditor, records, job_id: str) -> bool:
     what `jobs status` prints as ``drained: yes``."""
     if await auditor.pending_ids():
         return False
-    verdicts = set(await records.list_verdict_ids(job_id))
-    state, _ = await records.read_settlement(job_id)
-    state = state or {}
-    return state.get("pending") is None and verdicts <= set(state.get("settled") or ())
+    from reliquary.validator.corpus_job_status import stored_job_counts
+
+    return (await stored_job_counts(records, job_id))["drained"]
 
 
 class JudgedStats:
@@ -169,12 +186,15 @@ class CorpusJobSet:
                  clock: Callable[[], float] = time.time,
                  screen: Callable[[Any], tuple[str, str] | None] | None = None,
                  on_unwired: Callable[[Any], None] | None = None,
-                 finals=None, wire_retired: bool = False) -> None:
+                 finals=None, wire_retired: bool = False, autoclose=None) -> None:
         # ``screen(entry)`` decides from the entry alone, before any manifest
         # read; ``on_unwired(wiring)`` releases what a drained job held.
         # ``finals`` (``read_final_status``/``write_final_status``) keeps a
         # drained job's status across restarts; with ``wire_retired`` a retired
         # entry not yet drained is wired again (admission closed) to finish.
+        # ``autoclose`` (``corpus_autoclose.AutoClose``) sets a finished job's
+        # task cap to 0, looked for from the same loop as the refresh.
+        self._autoclose = autoclose
         self._screen = screen
         self._on_unwired = on_unwired
         self._finals = finals
@@ -197,9 +217,11 @@ class CorpusJobSet:
         # (job, hotkey) -> (computed at, status).
         self._miner_cache: collections.OrderedDict = collections.OrderedDict()
         self._tasks: dict[str, list[asyncio.Task]] = {}
+        self._stopping: set[str] = set()
         # Task ids already decided against (ignored or refused): logged once.
         self._passed_over: set[str] = set()
         self._failure: asyncio.Future | None = None
+        self.running = False
         # One refresh at a time: two interleaved would wire one entry twice.
         self._refresh_lock = asyncio.Lock()
         # Jobs retired as of the end of the last refresh: only those may be unwired.
@@ -247,6 +269,13 @@ class CorpusJobSet:
             await self._refresh()
 
     async def _refresh(self) -> None:
+        # Use the existing refresh loop for committed records whose publish
+        # or cleanup failed. Retired jobs must recover before their drain gate.
+        for job_id in list(self.served):
+            try:
+                await self._routes.recover_records(job_id)
+            except Exception:
+                logger.exception("corpus job %s: accepted record recovery failed; retrying", job_id)
         try:
             entries = await self._read_entries()
         except Exception:
@@ -268,10 +297,14 @@ class CorpusJobSet:
                     self._routes.retire(job_id)
                 continue
             cap = float(entry.params["cap"])
+            self._routes.set_admission(job_id, getattr(entry, "admission", "open"))
             if cap != float(wiring.cap):
                 logger.info("corpus task %s cap %s -> %s", task_id, wiring.cap, cap)
                 wiring.cap = cap
                 wiring.settler.set_cap(cap)
+            from reliquary.validator.corpus_period_settlement import apply_max_price
+
+            apply_max_price(wiring, entry)
         for task_id, entry in corpus.items():
             if task_id in by_task or task_id in self._passed_over:
                 continue
@@ -345,6 +378,7 @@ class CorpusJobSet:
         self._wire_failures.pop(task_id, None)
         self._routes.add(job_id, router, contract=entry.contract,
                          prompt_source=job.prompt_source)
+        self._routes.set_admission(job_id, getattr(entry, "admission", "open"))
         if entry.status != "active":
             # Wired only to finish its audits and settlement: no admission.
             self._routes.retire(job_id)
@@ -362,12 +396,12 @@ class CorpusJobSet:
 
     async def _maybe_unwire(self, job_id: str) -> None:
         wiring = self.served[job_id]
-        if self._routes.in_flight[job_id]:
+        if self._routes.admission_pending(job_id):
             return
         try:
-            # The gate is closed (retired) and nothing is in flight: no record can
-            # appear after this check.
-            if not await self._drained(wiring) or self._routes.in_flight[job_id]:
+            # The gate is closed and neither handlers nor their detached turns
+            # are pending: no record can appear after this check.
+            if not await self._drained(wiring) or self._routes.admission_pending(job_id):
                 return
         except Exception:
             logger.exception("corpus job %s: drain check failed; retrying next refresh", job_id)
@@ -386,22 +420,63 @@ class CorpusJobSet:
             except Exception:
                 logger.exception("corpus job %s: final status not written; retrying", job_id)
                 return
-        for task in self._tasks.pop(job_id, ()):
-            task.cancel()
+        await self._stop_jobs(job_id)
         self._routes.remove(job_id)
         del self.served[job_id]
         self.finished[job_id] = final
         self._status_cache.pop(job_id, None)
         self._status_locks.pop(job_id, None)
-        book = getattr(wiring, "miners", None)
-        if book is not None:
-            book.close()
         if self._on_unwired is not None:
             try:
                 self._on_unwired(wiring)
             except Exception:
                 logger.exception("corpus job %s: releasing its wiring failed", job_id)
         logger.info("corpus job %s drained and unwired", job_id)
+
+    async def job_finished(self, job_id: str) -> dict | None:
+        """The job's status if it is finished, else None: admitting (not
+        retired, not paused), full (every prompt's slots taken, or every eval
+        prompt complete), nothing still being admitted, graded or replayed,
+        and drained (every submission audited, every verdict settled, so every
+        period closed and its archive written). Cheap checks first: the drain
+        check lists the job's records."""
+        wiring = self.served.get(job_id)
+        if (wiring is None or self.is_retired(job_id) or job_id in self._routes.paused
+                or self._drained is None):
+            return None
+        status = await self._compute_status(job_id)
+        full = (status.get("complete") is True if "complete" in status
+                else int(status.get("prompts_full", 0)) >= int(status.get("prompts_total", 1)))
+        if not full or self._routes.admission_pending(job_id):
+            return None
+        grader = getattr(wiring, "grader", None)
+        if grader is not None:
+            try:
+                if grader.oldest_unready_received_at() is not None:
+                    return None
+            except LookupError:
+                return None  # cannot tell yet what is still graded or replayed
+        if not await self._drained(wiring) or self._routes.admission_pending(job_id):
+            return None
+        return status
+
+    async def _stop_jobs(self, job_id: str) -> None:
+        """Cancel this job once, and retain ownership until its workers exit."""
+        tasks = self._tasks.get(job_id, ())
+        book = getattr(self.served.get(job_id), "miners", None)
+        if job_id not in self._stopping:
+            self._stopping.add(job_id)
+            for task in tasks:
+                task.cancel()
+            if book is not None:
+                book.close()
+        # A shutdown interrupting retirement must not cancel their cleanup
+        # again; run() still owns and awaits the same tasks in its finally.
+        await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
+        if book is not None and hasattr(book, "wait_backfill"):
+            await asyncio.shield(asyncio.gather(book.wait_backfill(), return_exceptions=True))
+        self._tasks.pop(job_id, None)
+        self._stopping.discard(job_id)
 
     async def _compute_status(self, job_id: str, *, drained: bool = False) -> dict:
         from reliquary.validator.corpus_job_status import job_status
@@ -412,6 +487,7 @@ class CorpusJobSet:
         stats = wiring.stats
         settled = getattr(wiring.settler, "settled_count", 0)
         totals = getattr(wiring.settler, "totals", None)
+        last_period = getattr(wiring.settler, "last_period", None)
         link = getattr(wiring, "judge_link", None)
         if link is not None:
             # Judged in another process: its counts come from there.
@@ -420,6 +496,7 @@ class CorpusJobSet:
                 raise RuntimeError(f"the judge of {job_id} does not serve it")
             stats = JudgedStats(wiring.stats, judged["unsettled"])
             settled, totals = judged["settled_count"], judged["totals"]
+            last_period = judged.get("last_period")
         status = job_status(job_id=job_id, job=job or wiring.job, slots=state.slots,
                             stats=stats, settled=settled, totals=totals,
                             retired=self.is_retired(job_id), drained=drained)
@@ -427,6 +504,15 @@ class CorpusJobSet:
         if grader is not None:
             # An episode job: grading holds payment, so its backlog is public.
             status = {**status, "grading": grader.status()}
+        status["admission"] = "paused" if job_id in self._routes.paused else "open"
+        if getattr(wiring, "cap", None) is not None:
+            from reliquary.validator import corpus_periods as cp
+            from reliquary.validator.corpus_job_status import pay_status
+
+            price = (wiring.price if hasattr(wiring, "price")
+                     else cp.price_view(getattr(getattr(wiring, "entry", None), "params", None)))
+            status["pay"] = pay_status(cap=float(wiring.cap), price=price,
+                                       last_period=last_period)
         return status
 
     async def status(self, job_id: str) -> dict | None:
@@ -449,14 +535,19 @@ class CorpusJobSet:
         now = self._clock()
         cached = self._status_cache.get(job_id)
         if cached is not None and now - cached[0] < STATUS_CACHE_SECONDS:
-            return cached[1]
+            return self._observed_admission(job_id, cached[1])
         lock = self._status_locks.setdefault(job_id, asyncio.Lock())
         async with lock:
             # One recompute per period, however many requests wait on it.
             cached = self._status_cache.get(job_id)
             if cached is not None and self._clock() - cached[0] < STATUS_CACHE_SECONDS:
-                return cached[1]
-            return await self._recompute(job_id, cached)
+                return self._observed_admission(job_id, cached[1])
+            status = await self._recompute(job_id, cached)
+            return self._observed_admission(job_id, status)
+
+    def _observed_admission(self, job_id: str, status: dict) -> dict:
+        status["admission"] = "paused" if job_id in self._routes.paused else "open"
+        return status
 
     async def _recompute(self, job_id: str, cached) -> dict:
         now = self._clock()
@@ -511,6 +602,7 @@ class CorpusJobSet:
         """Refresh forever (when a registry reader is given) and raise the first
         background task failure."""
         self._failure = asyncio.get_running_loop().create_future()
+        self.running = True
         for tasks in self._tasks.values():
             for task in tasks:
                 if task.done():
@@ -519,13 +611,17 @@ class CorpusJobSet:
             while True:
                 if self.refreshing:
                     await self.refresh()
+                if self._autoclose is not None:
+                    try:
+                        await self._autoclose.maybe_run(self)
+                    except Exception:
+                        logger.exception("corpus autoclose pass failed; retrying later")
                 done, _ = await asyncio.wait({self._failure}, timeout=self._refresh_every)
                 if done:
                     self._failure.result()
         finally:
-            for tasks in self._tasks.values():
-                for task in tasks:
-                    task.cancel()
+            self.running = False
+            await asyncio.gather(*(self._stop_jobs(job_id) for job_id in list(self._tasks)))
 
 
 __all__ = [
@@ -537,6 +633,7 @@ __all__ = [
     "REFUSED",
     "eval_entry_screen",
     "order_entry_screen",
+    "generation_entry_screen",
     "hot_job_refusal",
     "job_drained",
 ]

@@ -30,8 +30,11 @@ EXPECTED_PROVENANCE = {
     "reliquarylogic_v1": "qwen3-4b-reliquary-logic-v8-dev1",
     "reliquary_dapo_math_v1": TEUTONIC,
     "reliquary_science_v1": TEUTONIC,
+    "reliquary_hard_math_v1": TEUTONIC,
     "reliquary_instruction_following_v1": TEUTONIC,
     "reliquary_code_v1": TEUTONIC,
+    "reliquary_competitive_code_v1": TEUTONIC,
+    "reliquary_general_v1": TEUTONIC,
     "reliquary_telecom_solo_v1": TEUTONIC,
 }
 
@@ -47,8 +50,11 @@ GOLDEN_BODY_SHA256 = {
     "reliquarylogic_v1": "effc1b3a997f9acda707d9582cdfd9e3ebdd72b50d4415564dd8de8ecb0ec520",
     "reliquary_dapo_math_v1": "072af5acf59f88ff6308b857001844d1cdb0d5d0ca26d97a5e1dbd7b2af775a7",
     "reliquary_science_v1": "4a96faeb8130291002ec1679aa7790e9c2d7fbeeed3b1a07b6a68e8bcef528c8",
+    "reliquary_hard_math_v1": "6af1cd1403221f161d80fe0eaa16ebb34aafa14ba36ed9c37d2f074e84e74014",
     "reliquary_instruction_following_v1": "6d6040473b809d87367198dec14eae5d72232b8c2ff3a773b81b7b51c1f0fbab",
     "reliquary_code_v1": "0724aa4fa09254d27547d757d8b77a7a0fbe6d3a78f8c9522be0ed23a27b4509",
+    "reliquary_competitive_code_v1": "8d4e5dfd8d41b392dae038909690bcf9f1d193ed59f703a57812233c431512c2",
+    "reliquary_general_v1": "d75b444d5244ca25dfd1152692ed52281a47c131fda60372f1420658558fedbe",
     "reliquary_telecom_solo_v1": "5d7ec17b0250dc935a43fdf38a6873f34053caa460546b35331dde5870f9556a",
 }
 
@@ -67,6 +73,8 @@ NOT_REPRODUCIBLE = [
     "qwen35-2b-auction-v2",
     "qwen35-4b-auction-v3",
     "qwen3-4b-base-dapo-v4",
+    # Its math and competitive-code envs run at a 64k cap, the catalog's lower.
+    "teutonic-9b-reliquary-suite-v10-gumbel-dev1",
 ]
 
 

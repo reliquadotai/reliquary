@@ -19,12 +19,15 @@ def test_the_profile_speaks_to_an_instruct_policy() -> None:
     assert len(PROFILE.model_revision) == 40
 
 
-def test_it_declares_exactly_the_five_packaged_environments() -> None:
+def test_it_declares_exactly_the_eight_packaged_environments() -> None:
     assert set(PROFILE.environments) == {
         "reliquary_dapo_math_v1",
         "reliquary_science_v1",
+        "reliquary_hard_math_v1",
         "reliquary_instruction_following_v1",
         "reliquary_code_v1",
+        "reliquary_competitive_code_v1",
+        "reliquary_general_v1",
         "reliquary_telecom_solo_v1",
     }
 
@@ -47,8 +50,14 @@ def test_the_measured_budgets() -> None:
     assert envs["reliquary_dapo_math_v1"].max_new_tokens == 32768
     # Not measured: the maths sibling's budget until a probe says otherwise.
     assert envs["reliquary_science_v1"].max_new_tokens == 32768
+    # Not measured on this corpus either: the competition-maths budget.
+    assert envs["reliquary_hard_math_v1"].max_new_tokens == 32768
     assert envs["reliquary_instruction_following_v1"].max_new_tokens == 8192
     assert envs["reliquary_code_v1"].max_new_tokens == 8192
+    # Not measured: the package's default until the 8k/16k/32k band says.
+    assert envs["reliquary_competitive_code_v1"].max_new_tokens == 16384
+    # The package's largest segment budget; each corpus job declares its own.
+    assert envs["reliquary_general_v1"].max_new_tokens == 16384
 
 
 def test_telecom_is_an_episode_in_the_dialect_the_policy_was_tuned_in() -> None:
@@ -119,8 +128,10 @@ def test_the_reasoning_mode_reaches_the_generation_contract() -> None:
 def test_every_historical_profile_keeps_thinking_on() -> None:
     """The flag is new and optional. Nothing that existed before it declares
     it, so every earlier contract keeps its exact bytes."""
+    # v10 is v9 with another forced draw: it carries v9's environments as they are.
+    later = {PROFILE.profile_id, "teutonic-9b-reliquary-suite-v10-gumbel-dev1"}
     for profile_id, profile in PROFILES.items():
-        if profile_id == PROFILE.profile_id:
+        if profile_id in later:
             continue
         for env in profile.environments.values():
             assert env.thinking is None, profile_id

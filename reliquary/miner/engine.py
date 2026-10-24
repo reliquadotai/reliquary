@@ -115,6 +115,7 @@ def _release_state_mismatch_reason(
             "protocol_version",
             "generation_profile_id",
             "generation_contract",
+            "service_policy",
         )
     ):
         return "contract_changed"
@@ -198,6 +199,15 @@ async def maybe_pull_checkpoint(
     update is needed (remote is older, identities match, or the remote snapshot
     is not published yet), returns inputs unchanged.
     """
+    from reliquary.shared.checkpoint_namespace import active_checkpoint_namespace
+
+    service_policy = getattr(state, "service_policy", None)
+    if service_policy is not None:
+        from reliquary.protocol.service_catalogue import announced_contract
+
+        policy = service_policy.model_dump() if hasattr(service_policy, "model_dump") else service_policy
+        contract = announced_contract(policy)
+        active_checkpoint_namespace().require_policy(contract.to_dict()["policies"]["checkpoint"])
     remote_identity = checkpoint_identity_from_state(state)
     if remote_identity is None:
         return local_n, local_repo_id, local_hash, local_model
@@ -214,6 +224,13 @@ async def maybe_pull_checkpoint(
                 "checkpoint number was rebound to a different repository or revision"
             )
     local_path = await download_fn(remote_identity.repo_id, remote_identity.oid)
+    from reliquary.validator.checkpoint_profile import validate_checkpoint_profile
+
+    # Scoped snapshots must agree with this runtime before either model is
+    # touched. Optional legacy metadata also exposes a requested mode mismatch.
+    validate_checkpoint_profile(
+        local_path, required=active_checkpoint_namespace().scoped,
+    )
     new_model = await asyncio.to_thread(load_fn, local_path)
     if new_model is None:
         raise RuntimeError("checkpoint loader returned no activated model")
@@ -230,12 +247,18 @@ async def _hf_download(repo_id: str, revision: str) -> str:
     import asyncio
     from huggingface_hub import snapshot_download
     from reliquary.shared.modeling import MODEL_SNAPSHOT_ALLOW_PATTERNS
+    from reliquary.shared.checkpoint_namespace import active_checkpoint_namespace
+    from reliquary.validator.checkpoint_profile import CHECKPOINT_PROFILE_NAME
+
+    patterns = MODEL_SNAPSHOT_ALLOW_PATTERNS
+    if active_checkpoint_namespace().scoped:
+        patterns = [*patterns, CHECKPOINT_PROFILE_NAME]
 
     return await asyncio.to_thread(
         snapshot_download,
         repo_id=repo_id,
         revision=revision,
-        allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
+        allow_patterns=patterns,
     )
 
 
@@ -286,8 +309,14 @@ def pick_env_and_prompt(
     max_attempts: int = 1000,
     randomness: str | None = None,
     prompt_ranges: dict[str, tuple[int, int]] | None = None,
+    weights_override: dict[str, float] | None = None,
 ) -> tuple[str, int]:
     """Sample env per `mix` weights, then a prompt within that env.
+
+    ``weights_override`` (the validator's advertised pay, see
+    ``reliquary.miner.rl_pay_client``) replaces the mix weights for the envs
+    it names and zeroes the others; when it gives every env of the mix zero,
+    the mix weights stand.
 
     When ``randomness`` is given, each env's prompt is drawn only from that
     window's slice (``window_prompt_range``), matching the validator. Falls
@@ -299,10 +328,18 @@ def pick_env_and_prompt(
     weights = [w for _, w in mix]
     if not names:
         raise RuntimeError("pick_env_and_prompt: empty mix")
+    if weights_override:
+        priced = [float(weights_override.get(n, 0.0)) for n in names]
+        if any(w > 0 for w in priced):
+            weights = priced
 
     available = list(names)
     while available:
         avail_weights = [weights[names.index(n)] for n in available]
+        if not any(w > 0 for w in avail_weights):
+            # The priced envs are exhausted (cooldown, prompt slice) and only
+            # unpriced ones remain: draw them by the mix, never crash the loop.
+            avail_weights = [w for n, w in mix if n in available]
         env_name = rng.choices(available, weights=avail_weights)[0]
         env = envs[env_name]
         prompt_range = (
@@ -325,6 +362,28 @@ def pick_env_and_prompt(
             available.remove(env_name)
 
     raise RuntimeError("pick_env_and_prompt: all envs fully in cooldown")
+
+
+def _single_turn_envs(envs: dict, mix: list) -> tuple[dict, list]:
+    """``envs`` and ``mix`` without the signed-episode envs: those are mined by
+    ``reliquary.miner.episode_group_miner.EpisodeGroupMiner``, never as single-turn text. ValueError when
+    none is left."""
+    def signed(name: str) -> bool:
+        try:
+            return get_environment_spec(name).interaction_mode == "signed_episode"
+        except ValueError:          # not a registered env: this engine's own business
+            return False
+
+    left_out = sorted(name for name in envs if signed(name))
+    if not left_out:
+        return envs, mix            # untouched (the same objects)
+    logger.warning("signed-episode environments %s are not mined by the single-turn engine "
+                   "(EpisodeGroupMiner mines them)", left_out)
+    kept = {name: env for name, env in envs.items() if name not in left_out}
+    if not kept:
+        raise ValueError("no single-turn environment to mine: signed-episode environments are mined by "
+                         "reliquary.miner.episode_group_miner.EpisodeGroupMiner")
+    return kept, [(name, weight) for name, weight in mix if name not in left_out]
 
 
 def _compute_merkle_root(rollouts) -> str:
@@ -372,10 +431,33 @@ def _current_drand_round_at_send() -> int:
     return compute_current_drand_round(time.time(), ci["genesis_time"], ci["period"])
 
 
+def bind_public_seed_group(seed_pool, generations) -> list[dict]:
+    """Make any ``group_size`` generations of distinct pool seeds a submittable group.
+
+    Each generation must carry the ``seed_pool`` binding it was generated with
+    (whatever group and rank that was). The result is ordered by seed index and
+    every generation is rebound to its rank in the new selection, which is the
+    single canonical encoding of the subset. Duplicate seeds, a wrong count or a
+    binding of another pool raise ``ValueError``.
+    """
+    from reliquary.protocol.seed_pool import parse_rollout_binding
+
+    claimed = []
+    for generation in generations:
+        claim = parse_rollout_binding(generation.get("seed_pool"))
+        if claim.pool_sha256 != seed_pool.sha256:
+            raise ValueError("generation belongs to another public pool")
+        claimed.append((claim.seed_index, generation))
+    claimed.sort(key=lambda item: item[0])
+    selection = seed_pool.selection([seed for seed, _ in claimed])
+    return [dict(generation, seed_pool=selection.rollout_binding(index))
+            for index, (_, generation) in enumerate(claimed)]
+
+
 def _bft_assemble_rollouts(
     *, model, phase1_tensor, prompt_tokens, think_close_ids, force_ids,
     eos_ids, answer_budget, randomness, hotkey, prompt_idx, checkpoint_hash,
-    gen_kwargs=None,
+    gen_kwargs=None, seed_pool=None, seeds=None,
 ):
     """Budget-Forced Termination assembly.
 
@@ -444,6 +526,7 @@ def _bft_assemble_rollouts(
                 [len(p) for p in unfinished_primed], plen,
             ),
             start_len=width,
+            seed_pool=seed_pool, seeds=seeds,
         )
         ans = model.generate(
             torch.tensor(rows, device=device),
@@ -527,15 +610,16 @@ class MiningEngine:
         self._initial_checkpoint_identity = initial_checkpoint_identity
 
         if envs is not None and mix is not None:
-            self.envs = envs
-            self.mix = mix
-            self.env = next(iter(envs.values()))  # legacy fallback
+            self.envs, self.mix = _single_turn_envs(envs, mix)
+            self.env = next(iter(self.envs.values()))  # legacy fallback
         else:
             assert env is not None, "must pass either env or envs+mix"
-            self.envs = {env.name: env}
-            self.mix = [(env.name, 1)]
+            self.envs, self.mix = _single_turn_envs({env.name: env}, [(env.name, 1)])
             self.env = env
         self._cooldown_per_env: dict[str, set[int]] = {n: set() for n in self.envs}
+        self._observations = None
+        self._prompt_policy = None
+        self._configure_observations()
 
         # Lazy imports for heavy deps — keep module import cheap.
         from reliquary.shared.hf_compat import resolve_hidden_size
@@ -559,6 +643,7 @@ class MiningEngine:
         window_number: int,
         checkpoint_revision: str,
         runtime_fingerprint=None,
+        service_binding=None,
     ):
         """Turn backend-produced token sequences into a protocol request.
 
@@ -573,6 +658,13 @@ class MiningEngine:
             raise ValueError(
                 f"expected {M_ROLLOUTS} generations, got {len(generations)}"
             )
+        if service_binding is not None:
+            from reliquary.protocol.service_submission import ServiceBinding
+            binding = ServiceBinding.from_dict(service_binding)
+            generations = [dict(generation, service_binding=binding.rollout_binding(index))
+                           for index, generation in enumerate(generations)]
+        elif any(generation.get("service_binding") is not None for generation in generations):
+            raise ValueError("service rollout binding requires its envelope intent")
         rollouts = [
             self._build_rollout_submission(
                 generation,
@@ -582,6 +674,18 @@ class MiningEngine:
             )
             for generation in generations
         ]
+        pool_bindings = [generation.get("seed_pool") for generation in generations]
+        pool_selection = None
+        if any(binding is not None for binding in pool_bindings):
+            # The signed selection is rebuilt from what each rollout says it drew: rollout i
+            # carries the i-th chosen seed, so the list must already be strictly increasing.
+            from reliquary.protocol.seed_pool import PoolSelection, parse_rollout_binding
+            claims = [parse_rollout_binding(binding) for binding in pool_bindings]
+            if any(claim.rollout_index != index or claim.pool_sha256 != claims[0].pool_sha256
+                   for index, claim in enumerate(claims)):
+                raise ValueError("rollouts must be bound to one pool, in the order of their seeds")
+            pool_selection = PoolSelection(
+                claims[0].pool_sha256, [claim.seed_index for claim in claims]).to_dict()
         return BatchSubmissionRequest(
             miner_hotkey=self.wallet.hotkey.ss58_address,
             prompt_idx=prompt_idx,
@@ -597,6 +701,8 @@ class MiningEngine:
                 if ACTIVE_PROTOCOL_PROFILE.protocol_version >= 3
                 else ""
             ),
+            pool_selection=pool_selection,
+            service_binding=service_binding,
         )
 
     async def mine_window(
@@ -638,6 +744,12 @@ class MiningEngine:
         else:
             metagraph = await chain.get_metagraph(subtensor, chain.NETUID)
             url = discover_validator_url(metagraph)
+
+        from reliquary.miner.rl_pay_client import PayWeights, env_choice_mode
+
+        # Draw environments by the validator's advertised pay (GET /rl/pay),
+        # unless RELIQUARY_MINER_ENV_CHOICE=mix keeps the static mix.
+        pay = PayWeights(url) if env_choice_mode() == "price" else None
 
         # v2.3: randomness is fetched per-window from /state instead of
         # recomputed locally. The validator aligns window OPEN to a drand
@@ -908,29 +1020,55 @@ class MiningEngine:
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
-                try:
-                    env_name, prompt_idx = pick_env_and_prompt(
-                        self.envs,
-                        generation_mix,
-                        self._cooldown_per_env,
-                        rng=rng,
-                        randomness=randomness,
-                        prompt_ranges=prompt_ranges or None,
-                    )
-                except RuntimeError:
+                picked = None
+                pay_weights = (
+                    None if pay is None else await asyncio.to_thread(pay.weights)
+                )
+                for cooldowns in await self._cooldown_options(state, rng):
+                    try:
+                        picked = pick_env_and_prompt(
+                            self.envs,
+                            generation_mix,
+                            cooldowns,
+                            rng=rng,
+                            randomness=randomness,
+                            prompt_ranges=prompt_ranges or None,
+                            weights_override=pay_weights,
+                        )
+                        break
+                    except RuntimeError:
+                        continue
+                if picked is None:
                     logger.info("all envs fully in cooldown; sleeping")
                     await asyncio.sleep(5)
                     continue
+                env_name, prompt_idx = picked
 
                 env = self.envs[env_name]
                 problem = env.get_problem(prompt_idx)
                 environment_spec = get_environment_spec(env_name)
+                service_policy = getattr(state, "service_policy", None)
+                policy_value = service_policy.model_dump() if hasattr(service_policy, "model_dump") else service_policy
+                from reliquary.protocol.seed_pool import pool_from_service_policy
+                seed_pool = pool_from_service_policy(
+                    service_policy, environment=env_name,
+                    prompt_idx=prompt_idx, checkpoint_hash=local_hash,
+                )
                 if environment_spec.interaction_mode == "episode":
+                    if service_policy is not None:
+                        raise ValueError("service group proofs are single-turn only")
                     generations = self._generate_m_episode_rollouts(
                         env,
                         randomness,
                         prompt_idx=prompt_idx,
                         checkpoint_hash=local_hash,
+                    )
+                elif seed_pool is not None:
+                    if policy_value["contract"]["scoring"]["weights_bps"] != {"reward": 10000}:
+                        raise ValueError("public pool selection requires a qualified reward-only grader")
+                    generations = self._generate_public_pool_rollouts(
+                        problem, randomness, env=env, prompt_idx=prompt_idx,
+                        checkpoint_hash=local_hash, seed_pool=seed_pool,
                     )
                 else:
                     generations = self._generate_m_rollouts(
@@ -953,6 +1091,9 @@ class MiningEngine:
                     window_number=state.window_n,
                     checkpoint_revision=local_hash,
                     runtime_fingerprint=runtime_fingerprint,
+                    service_binding=(self._service_submission_binding(
+                        policy_value, generations, problem, env,
+                    ) if policy_value is not None else None),
                 )
 
                 # Generation and proof construction can span a state
@@ -1155,9 +1296,15 @@ class MiningEngine:
 
     def _generate_m_rollouts(
         self, problem, randomness, *, env_name: str | None = None,
-        prompt_idx: int, checkpoint_hash: str,
+        prompt_idx: int, checkpoint_hash: str, seed_pool=None, seeds=None,
     ) -> list[dict]:
         """Generate M_ROLLOUTS completions at T_PROTO in one batched call.
+
+        With a public ``seed_pool``, ``seeds`` is any ``M_ROLLOUTS`` distinct seed
+        indices of the pool in ascending order: rollout ``i`` is drawn from
+        ``seeds[i]`` and comes back bound to it. A seed's draw does not depend on
+        the other seeds of the call, so two calls covering the whole pool
+        over-generate it (see ``choose_public_seed_group``).
 
         One .generate() with batch shape (M_ROLLOUTS, prompt_len) is ~5-7×
         faster on GPU than M_ROLLOUTS serial calls — the matmul tiling
@@ -1191,6 +1338,17 @@ class MiningEngine:
         )
 
         hotkey = self.wallet.hotkey.ss58_address
+        selection = None
+        if seed_pool is not None:
+            selection = seed_pool.selection(seeds)
+            seed_pool.validate_selection(selection, rollout_count=M_ROLLOUTS)
+            seeds = selection.seeds
+            if seed_pool.prompt_idx != prompt_idx or seed_pool.checkpoint_hash != checkpoint_hash:
+                raise ValueError("public pool does not match generation context")
+            if env_name is None or get_environment_spec(env_name).interaction_mode != "single_turn":
+                raise ValueError("public seed pools are single-turn only")
+        elif seeds is not None:
+            raise ValueError("seeds require a public pool")
         # Resolved before the prompt is encoded: whether the template opens a
         # reasoning block is per environment, and the validator renders this
         # same prompt with the same lookup.
@@ -1238,14 +1396,16 @@ class MiningEngine:
                 rollouts=M_ROLLOUTS,
                 max_new_tokens=environment_cap,
                 eos_ids=sorted(eos_ids),
+                **({"seed_pool": seed_pool, "seeds": seeds} if seed_pool is not None else {}),
             )
             return [
                 {
                     "tokens": prompt_tokens + list(completion),
                     "prompt_length": prompt_length,
                     "forced": False,
+                    **({"seed_pool": selection.rollout_binding(index)} if selection is not None else {}),
                 }
-                for completion in completions
+                for index, completion in enumerate(completions)
             ]
 
         with torch.no_grad():
@@ -1274,6 +1434,7 @@ class MiningEngine:
                 checkpoint_hash=checkpoint_hash,
                 rollout_indices=list(range(M_ROLLOUTS)),
                 base_offsets=[0] * M_ROLLOUTS, start_len=prompt_length,
+                seed_pool=seed_pool, seeds=seeds,
             )
             outputs = self.vllm_model.generate(
                 input_tensor,
@@ -1289,7 +1450,7 @@ class MiningEngine:
                 phase2_kwargs = {"pad_token_id": pad_token_id}
                 if eos_ids:
                     phase2_kwargs["eos_token_id"] = sorted(eos_ids)
-                return _bft_assemble_rollouts(
+                assembled = _bft_assemble_rollouts(
                     model=self.vllm_model,
                     phase1_tensor=outputs,
                     prompt_tokens=prompt_tokens,
@@ -1300,7 +1461,12 @@ class MiningEngine:
                     randomness=randomness, hotkey=hotkey, prompt_idx=prompt_idx,
                     checkpoint_hash=checkpoint_hash,
                     gen_kwargs=phase2_kwargs,
+                    seed_pool=seed_pool, seeds=seeds,
                 )
+                if selection is not None:
+                    for index, generation in enumerate(assembled):
+                        generation["seed_pool"] = selection.rollout_binding(index)
+                return assembled
         rollouts = []
         for i in range(M_ROLLOUTS):
             seq = outputs[i].tolist()
@@ -1313,7 +1479,155 @@ class MiningEngine:
                 "prompt_length": prompt_length,
                 "forced": False,
             })
+        if selection is not None:
+            for index, generation in enumerate(rollouts):
+                generation["seed_pool"] = selection.rollout_binding(index)
         return rollouts
+
+    # ------------------------------------------------------------------
+    # Optional run observation source (decision D, miner side)
+    # ------------------------------------------------------------------
+
+    def _configure_observations(self) -> None:
+        """Read the observation source from the environment. Without RELIQUARY_OBSERVATIONS_URL nothing
+        is created and mining is exactly the legacy one."""
+        url = os.environ.get("RELIQUARY_OBSERVATIONS_URL")
+        if not url:
+            return
+        from reliquary.miner.observation_client import (
+            DEFAULT_RETAIN_WINDOWS, ObservationClient, load_policy,
+        )
+        self._observations = ObservationClient(
+            url, os.environ["RELIQUARY_OBSERVATIONS_RUN_ID"],
+            os.environ["RELIQUARY_OBSERVATIONS_VALIDATOR_HOTKEY"],
+            directory=os.environ.get("RELIQUARY_OBSERVATIONS_DIR") or None,
+            retain_windows=int(os.environ.get("RELIQUARY_OBSERVATIONS_RETAIN_WINDOWS") or DEFAULT_RETAIN_WINDOWS))
+        self._prompt_policy = load_policy(os.environ.get("RELIQUARY_PROMPT_POLICY"))
+
+    async def _cooldown_options(self, state, rng) -> list[dict[str, set[int]]]:
+        """Cooldown sets to try, in order, for the prompt choice. Legacy: the one set of the engine."""
+        observations = getattr(self, "_observations", None)
+        if observations is None or getattr(state, "service_policy", None) is None:
+            return [self._cooldown_per_env]
+        try:
+            await asyncio.to_thread(observations.sync)  # rate-limited and backed off inside
+        except Exception:
+            logger.warning("observation sync failed; using the table as it is", exc_info=True)
+        try:
+            checkpoint_n = int(getattr(state, "checkpoint_n", 0) or 0)
+            policy, table = self._prompt_policy, observations.table
+            seed = rng.getrandbits(32)
+            hard = {env: set(cooled) | observations.skipped(env, policy=policy, checkpoint_n=checkpoint_n)
+                    for env, cooled in self._cooldown_per_env.items()}
+            prefers = getattr(policy, "prefers_unscanned", None)
+            fresh = {env: (cooled | observations.scanned(env)
+                           if prefers is not None and prefers(table, env, seed=seed) else cooled)
+                     for env, cooled in hard.items()}
+        except Exception:
+            logger.warning("observation source failed; mining without it", exc_info=True)
+            return [self._cooldown_per_env]
+        # Last resort: the miner's own cooldown set, so a policy that skips every prompt of an env cannot stall it.
+        options: list = []
+        for candidate in (fresh, hard, self._cooldown_per_env):
+            if not any(candidate == held for held in options):
+                options.append(candidate)
+        return options
+
+    def _preferred_public_seeds(self, seed_pool) -> tuple[int, ...] | None:
+        choose = getattr(self._prompt_policy, "preferred_seeds", None)
+        if choose is None:
+            return None
+        try:
+            seeds = choose(self._observations.table, seed_pool.environment, seed_pool.prompt_idx,
+                           pool_sha256=seed_pool.sha256, group_size=seed_pool.group_size,
+                           pool_seeds=seed_pool.pool_seeds)
+        except Exception:
+            logger.warning("prompt policy failed choosing seeds; using the default", exc_info=True)
+            return None
+        return None if seeds is None else tuple(seeds)
+
+    def choose_public_seed_group(self, seed_pool, generate, *, problem, env) -> list[dict]:
+        """HOOK -- which ``seed_pool.group_size`` seeds of the public pool this miner submits.
+
+        The pool holds ``seed_pool.pool_seeds`` (= 2 x group size) public seeds, the
+        same for every miner, and a group is ANY ``group_size`` distinct seeds of
+        it. ``generate(seeds)`` returns one generation per seed for ``group_size``
+        distinct ascending seed indices; a seed's completion is the same whatever
+        the other seeds of the call are.
+
+        This reference policy is deliberately the cheapest deterministic one: it
+        generates and returns the first ``group_size`` seeds and never looks at a
+        reward. A real miner replaces this method to over-generate and keep the
+        subset it prefers, e.g.::
+
+            low = generate(tuple(range(seed_pool.group_size)))
+            high = generate(tuple(range(seed_pool.group_size, seed_pool.pool_seeds)))
+            rewards = self._local_group_rewards(low + high, problem, env)
+            keep = ...  # any group_size of the 2 x group_size generations
+            return bind_public_seed_group(seed_pool, keep)
+
+        Return exactly ``group_size`` generations of distinct seeds, each still
+        carrying the ``seed_pool`` binding ``generate`` gave it. The caller orders
+        them by seed and rebinds them, so the returned order does not matter; a
+        duplicate seed or a wrong count is refused before anything is signed.
+        """
+        if getattr(self, "_observations", None) is not None:
+            preferred = self._preferred_public_seeds(seed_pool)
+            if preferred is not None:
+                return generate(preferred)
+        return generate(tuple(range(seed_pool.group_size)))
+
+    def _generate_public_pool_rollouts(
+        self, problem, randomness, *, env, prompt_idx: int, checkpoint_hash: str,
+        seed_pool,
+    ) -> list[dict]:
+        """One group of the public pool, chosen by ``choose_public_seed_group``."""
+        def generate(seeds) -> list[dict]:
+            return self._generate_m_rollouts(
+                problem, randomness, env_name=env.name, prompt_idx=prompt_idx,
+                checkpoint_hash=checkpoint_hash, seed_pool=seed_pool,
+                seeds=tuple(seeds),
+            )
+
+        chosen = self.choose_public_seed_group(seed_pool, generate, problem=problem, env=env)
+        group = bind_public_seed_group(seed_pool, chosen)
+        if len(group) != M_ROLLOUTS:
+            raise ValueError("public pool group size differs from the protocol group size")
+        return group
+
+    def _local_group_rewards(self, generations, problem, env) -> list[float | None]:
+        import math
+
+        rewards = []
+        for generation in generations:
+            completion = self.tokenizer.decode(generation["tokens"][generation["prompt_length"]:])
+            try:
+                reward = env.compute_reward(problem, completion)
+            except Exception:
+                reward = None
+            if reward is not None and (isinstance(reward, bool) or not isinstance(reward, (int, float))
+                                       or not math.isfinite(reward) or not 0 <= reward <= 1):
+                raise ValueError("candidate grader returned an invalid reward")
+            rewards.append(float(reward) if reward is not None else None)
+        return rewards
+
+    def _service_submission_binding(self, policy, generations, problem, env) -> dict:
+        from reliquary.protocol.service_catalogue import announced_contract
+        from reliquary.protocol.service_submission import ServiceBinding
+        from reliquary.services.scoring import classify_signal
+
+        contract = announced_contract(policy)
+        value = contract.to_dict()
+        rewards = (self._local_group_rewards(generations, problem, env)
+                   if value["scoring"]["weights_bps"] == {"reward": 10000}
+                   else [None] * len(generations))
+        signal = classify_signal(rewards, expected=M_ROLLOUTS,
+                                 sigma_min_bps=value["scoring"]["sigma_min_bps"])
+        purpose = "training"
+        if (contract.environment(env.name)["exploration"] == 1
+                and signal.category in ("uniform-low", "uniform-high", "uniform-intermediate")):
+            purpose = "exploration"
+        return ServiceBinding(contract.sha256, purpose).to_dict()
 
     def _generate_m_episode_rollouts(
         self,
@@ -1423,6 +1737,8 @@ class MiningEngine:
         from reliquary.protocol.signatures import (
             sign_commit_binding,
             sign_episode_commit_binding,
+            sign_public_group_commit_binding,
+            sign_service_commit_binding,
         )
         from reliquary.shared.forward import forward_single_layer
 
@@ -1462,6 +1778,16 @@ class MiningEngine:
 
         model_name: str = getattr(self.hf_model, "name_or_path", "unknown")
         rollout_metadata = _rollout_metadata(generation, token_logprobs)
+        pool_binding = generation.get("seed_pool")
+        service_binding = generation.get("service_binding")
+        if service_binding is not None:
+            if trace is not None:
+                raise ValueError("service group proofs do not support episodes")
+            rollout_metadata["service_binding"] = service_binding
+        if pool_binding is not None:
+            if trace is not None:
+                raise ValueError("public group proofs do not support episodes")
+            rollout_metadata["seed_pool"] = pool_binding
         if trace is not None:
             reward = trace.reward
             if reward is None:
@@ -1491,6 +1817,21 @@ class MiningEngine:
                 self.wallet,
             )
             proof_version = GRAIL_EPISODE_PROOF_VERSION
+        elif service_binding is not None:
+            from reliquary.protocol.service_submission import PROOF_VERSION as SERVICE_PROOF_VERSION
+            from reliquary.protocol.seed_pool import PROOF_VERSION as POOL_PROOF_VERSION
+            signature = sign_service_commit_binding(
+                all_tokens, randomness, model_name, LAYER_INDEX, commitments,
+                service_binding, self.wallet, seed_pool=pool_binding,
+            )
+            proof_version = POOL_PROOF_VERSION if pool_binding is not None else SERVICE_PROOF_VERSION
+        elif pool_binding is not None:
+            from reliquary.protocol.seed_pool import PROOF_VERSION
+            signature = sign_public_group_commit_binding(
+                all_tokens, randomness, model_name, LAYER_INDEX,
+                commitments, pool_binding, self.wallet,
+            )
+            proof_version = PROOF_VERSION
         else:
             signature = sign_commit_binding(
                 all_tokens, randomness, model_name, LAYER_INDEX,

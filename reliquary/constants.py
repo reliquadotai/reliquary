@@ -14,6 +14,10 @@ from reliquary.environment.grader import (
     GRADER_SOCKET_PATH as GRADER_SOCKET_PATH,
 )
 from reliquary.shared.task_id import parse_task_ids
+from reliquary.shared import (
+    SERVICE_OBSERVATION_FLUSH_SECONDS as SERVICE_OBSERVATION_FLUSH_SECONDS,
+    SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS as SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS,
+)
 
 # ────────────────  GRAIL PROOF VERSION  ────────────────
 
@@ -104,9 +108,10 @@ PROTOCOL_GENERATION_CONTRACT = (
 
 # Model architectures this image can actually run, drawn from the HF configs
 # behind the nine compiled profiles in reliquary/protocol/profiles.py: dense
-# Qwen3 (Qwen/Qwen3-4B-Base, seven profiles) and Qwen3.5's conditional
+# Qwen3 (Qwen/Qwen3-4B-Base, seven profiles), Qwen3.5's conditional
 # generation class (Qwen/Qwen3.5-2B and -4B, including the default profile;
-# see reliquary/shared/modeling.py's `_is_qwen35_conditional_config`). No
+# see reliquary/shared/modeling.py's `_is_qwen35_conditional_config`) and its
+# text-only class (the Teutonic profile's checkpoint). No
 # profile names an MoE checkpoint, so that architecture is deliberately absent
 # rather than pre-approved on spec. A task contract naming anything else is
 # refused at startup rather than at the first forward pass.
@@ -136,6 +141,13 @@ SUPPORTED_ARCHITECTURES: dict[str, tuple[str, ...]] = {
         "tests/unit/test_corpus_audit_batched.py::measured\non Qwen3.8-27B",
         "tests/fixtures/corpus_code_v1_contract.json::\"model_architecture\":\"Qwen3_5ForConditionalGeneration\"",
         "tests/fixtures/live_registry_2026_09_30.json::Qwen3_5ForConditionalGeneration",
+    ),
+    # Qwen3.5's text-only class (Teutonic-I with Qwen3.5 attention grafted, and
+    # its SFT checkpoints): the 2026-09-25 H100 rehearsal measured vLLM capture
+    # + HF verification on teutonic-i-graft-sft-cot-v2, every check passed.
+    "Qwen3_5ForCausalLM": (
+        "tests/unit/test_modeling_helpers.py::test_qwen35_text_config_uses_causal_lm_auto_class",
+        "docs/runbooks/corpus-task-launch.md::(`teutonic-i-graft-sft-cot-v2@d5256c5`) against Qwen3.5-4B",
     ),
 }
 SUPPORTED_MODEL_ARCHITECTURES = frozenset(SUPPORTED_ARCHITECTURES)
@@ -362,9 +374,10 @@ if not _math.isfinite(SHAPE_LEN_FRAC) or not 0.0 < SHAPE_LEN_FRAC <= 1.0:
 # a linear penalty reaching −factor at the cap, correct or not. 0 disables.
 # 0.5 matches DAPO's penalty-to-correctness ratio: they use 1.0 on the 2-wide
 # {−1,+1} reward scale, ours is [0,1].
+# Protocol 10 (async RL): 0.1, a mild zone near the cap on top of the failure reward a truncated rollout gets.
 OVERLONG_PENALTY_FACTOR = float(_os.environ.get(
     "RELIQUARY_OVERLONG_PENALTY_FACTOR",
-    "0.5" if PROTOCOL_VERSION >= 3 else "0",
+    "0.1" if PROTOCOL_VERSION >= 10 else "0.5" if PROTOCOL_VERSION >= 3 else "0",
 ))
 if (
     not _math.isfinite(OVERLONG_PENALTY_FACTOR)
@@ -740,7 +753,10 @@ DEFAULT_HF_REPO_ID = "aivolutionedge/reliquary-sn"
 # softens the manufactured-variance surface — deliberate, see the v4 cutover
 # plan; the auction value σ-weighting and forced-seed / distribution layers are
 # the remaining defense. v3 keeps 0.43/0.33 so live economics are byte-identical.
-SIGMA_MIN = 0.24 if PROTOCOL_VERSION >= 4 else 0.43
+# The async RL lifecycle (rl-async-design.md §4.4) is a 16-rollout protocol: it uses the v4 gate whatever the
+# active profile.
+SIGMA_MIN_V4 = 0.24
+SIGMA_MIN = SIGMA_MIN_V4 if PROTOCOL_VERSION >= 4 else 0.43
 BOOTSTRAP_SIGMA_MIN = 0.22 if PROTOCOL_VERSION >= 4 else 0.33
 
 # Number of rollouts per submission (= size of each GRPO group).
@@ -786,6 +802,10 @@ def _require_environment_corpora() -> None:
             spec = get_environment_spec(name)
         except (KeyError, ValueError):
             continue  # unknown names are the environment list's business
+        if spec.interaction_mode == "episode" and int(ACTIVE_PROTOCOL_PROFILE.protocol_version) >= 10:
+            # A replayed env of an async profile is loaded at startup by the processes that serve it (the
+            # validator's checkers, a miner mining it), and only by them: the others never need its corpus.
+            continue
         variable = spec.required_data_env_var
         if variable and not _os.environ.get(variable):
             raise ValueError(
@@ -823,9 +843,18 @@ _FILL_CLOSED_REQUESTED = _os.environ.get(
     "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 _FILL_CLOSED_PROFILE_ID = "qwen3-4b-base-dapo-fill-closed-v6"
-_FILL_CLOSED_PROFILE_IDS = {
+# Profiles that cannot run without fill-closed.
+_FILL_CLOSED_REQUIRED_PROFILE_IDS = {
     _FILL_CLOSED_PROFILE_ID,
     "qwen3-4b-base-dapo-reliquary-v1",
+}
+# Profiles that may run with it. The Teutonic suite also serves the corpus
+# tasks, which run timed windows, so it accepts fill-closed without requiring
+# it. Nothing in the fill-closed path reads the model: the window's shape is
+# B_BATCH, the publish interval and the environment list, all set below.
+_FILL_CLOSED_PROFILE_IDS = {
+    *_FILL_CLOSED_REQUIRED_PROFILE_IDS,
+    "teutonic-9b-reliquary-suite-v9-dev1",
 }
 if _os.environ.get("RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED", "0").strip().lower() not in {"", "0", "false", "no", "off"}:
     raise ValueError("RELIQUARY_EXPERIMENTAL_CHECKPOINT_EPOCH_ENABLED is retired; remove it")
@@ -839,11 +868,18 @@ if _FILL_CLOSED_REQUESTED and PROTOCOL_PROFILE_ID not in _FILL_CLOSED_PROFILE_ID
         "RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED requires the exact "
         f"fill-closed profiles {sorted(_FILL_CLOSED_PROFILE_IDS)!r}"
     )
-if PROTOCOL_PROFILE_ID in _FILL_CLOSED_PROFILE_IDS and not FILL_CLOSED_ENABLED:
+if PROTOCOL_PROFILE_ID in _FILL_CLOSED_REQUIRED_PROFILE_IDS and not FILL_CLOSED_ENABLED:
     raise ValueError(
         f"the {PROTOCOL_PROFILE_ID!r} profile requires its explicit "
         "experimental fill-closed capability"
     )
+if FILL_CLOSED_ENABLED:
+    # A fill-closed pick takes B_BATCH groups from every environment: the
+    # assembler, the active-window record and its recovery all hold that shape
+    # and refuse any other. An environment's weight in the window is its
+    # emission share, not a smaller group count, so a profile's per-environment
+    # batch_target (sized for the timed auction window) does not apply here.
+    ENVIRONMENT_MIX = [(name, B_BATCH) for name, _ in ENVIRONMENT_MIX]
 
 # The durable key stride cannot change in an existing training run. A smaller
 # operational pick target closes earlier and pads the unused keys with tombstones.
@@ -859,6 +895,50 @@ FILL_CLOSED_TARGET_GROUPS_PER_ENV = int(_os.environ.get(
 if FILL_CLOSED_TARGET_GROUPS_PER_ENV != FILL_CLOSED_PICKS_PER_WINDOW * B_BATCH:
     raise ValueError("fill-closed target must equal picks per window * B_BATCH within the journal range")
 _FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV = FILL_CLOSED_TARGET_GROUPS_PER_ENV
+
+# Next RL run (service-contract/v2). Inert unless a service task is configured.
+SERVICE_EXPLORATION_AUDIT_BUDGET_PER_ENV = int(_os.environ.get(
+    "RELIQUARY_SERVICE_EXPLORATION_AUDIT_BUDGET_PER_ENV", str(FILL_CLOSED_TARGET_GROUPS_PER_ENV)))
+SERVICE_EXPLORATION_AUDIT_PRIORITY = 5
+# A hotkey still in exploration probation may hold at most this many reserved rows whose audit has not
+# passed, per (window, env): it cannot squat the whole per-env cap with fake groups before its first audit.
+PROBATION_PENDING_LIMIT = 4
+# Graded audit sanction (R31, amended). The class of a failed audit is that of its STRONGEST failure: an
+# audit that fails a statistical gate is re-proven with the statistical gates off, and any failure there
+# makes it deterministic. A DETERMINISTIC forgery (proof/TOPLOC mismatch, token authenticity, forged
+# termination, forced-seed hard CDF mismatch) bans for the order's ``ban_seconds`` and forfeits the window.
+# A STATISTICAL-only failure (threshold checks: forced-seed agreement floors, logprob, distribution, ...)
+# forfeits the window, does NOT ban, and puts the hotkey back in probation (100 % audit) until it has
+# ``SERVICE_REPROBATION_PASSES`` new passed audits counted from its last failure of ANY class (a hotkey
+# whose deterministic ban expired comes back in probation too). Recidivism: the ban applies when more than
+# ``SERVICE_STATISTICAL_FAIL_MAX`` of the hotkey's last ``SERVICE_STATISTICAL_FAIL_WINDOW`` NON-FORCED
+# (drawn at the base rate) concluded audits failed statistically; forced (probation) audits never count, so
+# passing the forced re-probation audits cannot dilute the failures.
+# TO RECALIBRATE at qualification from the measured honest false-reject rate of the statistical stages.
+SERVICE_REPROBATION_PASSES = 20
+SERVICE_STATISTICAL_FAIL_WINDOW = 20
+SERVICE_STATISTICAL_FAIL_MAX = 3
+# Exploration audits (decision C, R15). They run as they are drawn on a plan of their own at
+# ``SERVICE_EXPLORATION_AUDIT_PRIORITY``. At most ``..._INFLIGHT`` are handed to the proof scheduler at a
+# time, so the queue order (past-probation hotkeys first) is decided at the last moment; of every
+# ``..._PROBATION_EVERY`` audits handed over while the window runs, one goes to a hotkey still in
+# probation when one waits, so newcomers see audits every window.
+SERVICE_EXPLORATION_AUDIT_INFLIGHT = 2
+SERVICE_EXPLORATION_PROBATION_EVERY = 4
+SERVICE_EXPLORATION_TICK_SECONDS = 1.0
+# Non-training acceptances (exploration and unproven observations) one hotkey may have in one (window, env)
+# batcher. Beyond it the submission is refused before its payload is retained (R26): the sybil bound on the
+# memory these groups hold for the audit.
+SERVICE_NON_TRAINING_PER_HOTKEY_WINDOW_ENV = 32
+# Seal drain. After the window seals the validator stops admitting exploration, waits at most
+# ``..._DRAW_WAIT_ROUNDS`` drand rounds for pending draws, proves EVERY queued audit of a hotkey past
+# probation (at most ``..._DRAIN_SECONDS`` in all) and lets hotkeys still in probation use only the first
+# ``..._DRAIN_PROBATION_SECONDS`` of that wait. Then it finalizes whatever is left as unaudited (unpaid,
+# never sanctioned), so a stuck proof can delay a window by the bound and never by more.
+SERVICE_EXPLORATION_DRAW_WAIT_ROUNDS = 2
+SERVICE_EXPLORATION_DRAIN_SECONDS = float(_os.environ.get("RELIQUARY_SERVICE_EXPLORATION_DRAIN_SECONDS", "600"))
+SERVICE_EXPLORATION_DRAIN_PROBATION_SECONDS = float(
+    _os.environ.get("RELIQUARY_SERVICE_EXPLORATION_DRAIN_PROBATION_SECONDS", "120"))
 
 # Backstop only. A window normally ends on its fill; this stops stalled
 # candidate supply holding one open forever, and seals whatever is proven.
@@ -1034,6 +1114,21 @@ T_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.temperature
 TOP_P_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.top_p
 TOP_K_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.top_k
 DO_SAMPLE_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.do_sample
+# Which public pick every forced token must be ("inverse_cdf" or "gumbel_max"), and
+# whether the LM head's logits are fp32 on the miner's engine and the validator's
+# proof forward. Both from the profile; see reliquary.environment.forced_sampling.
+FORCED_DRAW = ACTIVE_PROTOCOL_PROFILE.sampling.draw
+LM_HEAD_FP32 = ACTIVE_PROTOCOL_PROFILE.sampling.lm_head_fp32
+# The token the policy term scores (docs/rl-async-design.md 4.7). "current": the miner's
+# token. "substitution": v*, the forced pick recomputed from the trainer's own logits with
+# the rollout's public uniforms, equal to the miner's token wherever they agree. On by
+# default under the Gumbel draw only; RELIQUARY_TRAINING_LOSS is the guard.
+TRAINING_LOSSES = ("current", "substitution")
+TRAINING_LOSS = _os.environ.get("RELIQUARY_TRAINING_LOSS", "").strip().lower() or (
+    "substitution" if FORCED_DRAW == "gumbel_max" else "current"
+)
+if TRAINING_LOSS not in TRAINING_LOSSES:
+    raise ValueError(f"RELIQUARY_TRAINING_LOSS must be one of {TRAINING_LOSSES}, got {TRAINING_LOSS!r}")
 
 # Do not add miner-only logits processors here. A presence/repetition penalty
 # changes the sampling policy; unless the validator also recomputes and verifies
@@ -1227,6 +1322,12 @@ if AUCTION_EARLY_CLOSE_MODE not in {"off", "shadow", "enforce"}:
 # pathological. They do not control GPU proof time, which has its own budget.
 MATH_ADMISSION_WALL_SECONDS = 45.0
 CODE_ADMISSION_WALL_SECONDS = 20.0
+# A stdio-program group (competitive code) runs one program per hidden test and rollout: up to ~250 x 16 runs, each a
+# fork in a gVisor worker (~15 ms for an honest program). The async submission path adds this much wall per run to
+# CODE_ADMISSION_WALL_SECONDS, up to the max: a 20 s budget for 4,000 runs made every group that was mostly right
+# on a big problem overrun, and the pool replacement took the groups queued behind it down with it.
+STDIO_ADMISSION_SECONDS_PER_RUN = 0.05
+STDIO_ADMISSION_MAX_WALL_SECONDS = 300.0
 ADMISSION_PROCESS_MAX_TASKS = 128
 
 # Per-hotkey cap on BAD_ENVELOPE_SIGNATURE rejects per window. The
@@ -1523,8 +1624,9 @@ EMISSION_PRICE_ARMED = _os.environ.get(
 # showed 5e-7 produced a sketch delta of ~600 (≈10 % of the 6000 sketch
 # tolerance) over 50 training steps — effectively indistinguishable from the
 # base model, which also means stale-model cheaters pass GRAIL. Matched
-# DAPO / R1-Zero-scale literature (1e-6 to 5e-6) by bumping to 5e-6.
-_PROFILE_LEARNING_RATE = "1e-6" if PROTOCOL_VERSION >= 3 else "5e-6"
+# DAPO / R1-Zero-scale literature (1e-6 to 5e-6) by bumping to 5e-6. The 9B async launch (protocol 10) runs 2e-6
+# (decision N, user 2026-10-17): 5e-6 learns faster but widens the honest drift of lagged miners.
+_PROFILE_LEARNING_RATE = "2e-6" if PROTOCOL_VERSION >= 10 else "1e-6" if PROTOCOL_VERSION >= 3 else "5e-6"
 LEARNING_RATE = float(
     _os.environ.get("RELIQUARY_LEARNING_RATE", _PROFILE_LEARNING_RATE)
 )
@@ -1686,8 +1788,7 @@ PI_OLD_FROM_VERIFY_LOGPROBS = _os.environ.get(
     "RELIQUARY_PI_OLD_FROM_VERIFY_LOGPROBS", "true"
 ).strip().lower() in ("1", "true", "yes", "on")
 
-# Pipelined window collection (design: docs/superpowers/specs/
-# 2026-08-19-pipelined-window-collection-design.md). When on, the next
+# Pipelined window collection. When on, the next
 # window's collection opens BEFORE the previous window's GPU half (proofs +
 # train) runs, hiding the collection deadline entirely under GPU work:
 # cycle -> max(GPU, collection) ~= P+T. Nothing is proven before its own
@@ -1744,7 +1845,14 @@ MICROBATCH_MAX_PADDED_TOKENS = 32768
 # After it the schedule is FLAT, per DAPO §4.1 (AdamW, constant LR + linear
 # warmup). The 10k-window cosine that used to follow reached factor 0.49 in
 # 5.5 days at the live cadence — a run decaying to a halt nobody had chosen.
-LR_WARMUP_WINDOWS = 10
+# Protocol 10 (async, one step per checkpoint on ~8k rollouts): 8 steps (decision N).
+LR_WARMUP_WINDOWS = int(_os.environ.get("RELIQUARY_LR_WARMUP_STEPS", "8" if PROTOCOL_VERSION >= 10 else "10"))
+if LR_WARMUP_WINDOWS < 1:
+    raise ValueError("RELIQUARY_LR_WARMUP_STEPS must be at least 1")
+# AdamW's second-moment decay (every optimizer the trainer builds). A run of a few hundred steps may want 0.99.
+ADAM_BETA2 = float(_os.environ.get("RELIQUARY_ADAM_BETA2", "0.999"))
+if not _math.isfinite(ADAM_BETA2) or not 0.0 < ADAM_BETA2 < 1.0:
+    raise ValueError("RELIQUARY_ADAM_BETA2 must be in (0, 1)")
 
 # Short LR re-ramp applied after a process restart WITHIN the same training
 # run: the schedule position is reconstructed from the published checkpoint
@@ -1904,6 +2012,44 @@ FORCED_SEED_ROLLOUT_MIN_STOCH = 20
 # exact gate ships in telemetry mode until live incremental-vs-teacher-forced
 # distance data establishes a consensus-safe epsilon.
 FORCED_SEED_CDF_BOUNDARY_EPSILON = 0.002
+# The same tolerance for the gumbel_max draw, in its miss units: the relative score
+# shortfall 1 - exp(-(s_win - s_token)) of logit + G (forced_sampling). A candidate
+# for the same telemetry-first rollout as the CDF one; FORCED_SEED_CDF_ENFORCE arms both.
+FORCED_SEED_GUMBEL_BOUNDARY_EPSILON = 0.05
+# Async RL (rl-async-design.md §4.4, §4.6): the per-rollout match floor on stochastic positions under the Gumbel
+# draw, against the latest checkpoint. One value for the trainer's verification, the audit and the pay ledger.
+# 0.90: trainer-vs-vLLM bf16 noise leaves a few honest rollouts just under 0.95 even at lag 0, and the gap tests
+# already judge each mismatch. PLACEHOLDER, to confirm on the 9B.
+RL_ROLLOUT_MATCH_FLOOR = 0.90
+# The pooled match floor a group must reach (trainer and audit alike), on 16 rollouts (honest pool 0.986).
+# PLACEHOLDER, as above.
+RL_GROUP_MATCH_FLOOR = 0.90
+# An audited rollout that follows the draw (match >= the floor) yet carries more than this many hard mismatches at
+# near-deterministic positions (max p >= FORCED_SEED_STOCHASTIC_MAXPROB, Gumbel shortfall beyond the boundary
+# epsilon) was edited after the draw: deterministic forgery. PLACEHOLDER: calibrate on honest lag-2 rollouts.
+RL_AUDIT_FORGERY_MISMATCH_TOLERANCE = 1
+# That allowance is per this many near-deterministic positions of the rollout (rounded up, at least one block):
+# bf16 noise leaves a rare honest hard mismatch, so a long rollout gets proportionally more. PLACEHOLDER.
+RL_AUDIT_FORGERY_MISMATCH_POSITIONS = 4096
+# An audit runs against the latest checkpoint; one queued longer than this many checkpoints after its lease's is
+# dropped unjudged (inconclusive: unpaid, no probation effect) instead of judged on drifted weights. PLACEHOLDER.
+RL_AUDIT_MAX_LAG = 4
+# A rollout whose match falls this far under the rollout floor is no honest noise (honest single rollouts bottom
+# around 0.8): its whole group is rejected (trainer) or fails (audit) as statistical evidence, so a forged rollout
+# (e.g. one [EOS] that moves a 16/16 group into the zone) cannot ride on 15 honest ones. PLACEHOLDER.
+RL_FORGERY_MATCH_FLOOR = 0.5
+# Gumbel gap of a mismatched token: the best score minus the miner's token's score (s = logit + G). Honest gaps grow
+# with the trainer's drift. A rollout with a gap over the tolerance is not trained nor paid; a mismatch over the
+# substitute gap is re-graded with the trainer's pick (the reward must not change).
+# PLACEHOLDERS: calibrate on the logged gaps of a real run.
+RL_GAP_TOLERANCE = 8.0
+RL_SUBSTITUTE_GAP = 3.0
+# A rollout that ends on EOS: the final EOS needs a gap of at most RL_TERMINAL_GAP. No probability floor: an honest
+# draw ends on an unlikely EOS too. PLACEHOLDER, as above.
+RL_TERMINAL_GAP = 1.0
+# The model tokens (16 x 64) an out-of-zone group needs for its first-scan pay: a group of near-empty rollouts
+# verifies nothing and earns nothing. PLACEHOLDER.
+RL_FIRST_SCAN_MIN_TOKENS = 1024
 FORCED_SEED_CDF_ENFORCE = _os.environ.get(
     "FORCED_SEED_CDF_ENFORCE", "false"
 ).strip().lower() in ("1", "true", "yes", "on")

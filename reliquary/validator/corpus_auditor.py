@@ -24,6 +24,9 @@ from collections.abc import Callable
 
 import torch
 
+
+from reliquary.shared.async_tasks import gather_owned
+
 from reliquary.corpus.audit_policy import (
     PASS_IDS,
     AuditParams,
@@ -602,7 +605,7 @@ class CorpusAuditor:
             self._remember(submission_id, meta)
 
         with self._timed("read"):
-            await asyncio.gather(*(one(sid) for sid in dict.fromkeys(submission_ids)))
+            await gather_owned(one(sid) for sid in dict.fromkeys(submission_ids))
 
     async def _read_all(self, submission_ids) -> dict[str, dict]:
         """_read for many ids, READ_CONCURRENCY at a time; the readable ones."""
@@ -613,7 +616,7 @@ class CorpusAuditor:
                 return submission_id, await self._read(submission_id)
 
         with self._timed("read"):
-            pairs = await asyncio.gather(*(one(sid) for sid in dict.fromkeys(submission_ids)))
+            pairs = await gather_owned(one(sid) for sid in dict.fromkeys(submission_ids))
         return {sid: record for sid, record in pairs if record is not None}
 
     def _recent(self, hotkey: str, now: float) -> int:
@@ -790,7 +793,7 @@ class CorpusAuditor:
                 return await self._write(submission_id, verdict)
 
         with self._timed("write"):
-            return await asyncio.gather(*(one(sid, v) for sid, v in items),
+            return await gather_owned((one(sid, v) for sid, v in items),
                                         return_exceptions=True)
 
     @staticmethod
@@ -831,8 +834,8 @@ class CorpusAuditor:
             if many is not None:
                 got = await many(hotkeys)
             else:
-                got = dict(zip(hotkeys, await asyncio.gather(
-                    *(self._miner_states.get(hotkey) for hotkey in hotkeys))))
+                got = dict(zip(hotkeys, await gather_owned(
+                    self._miner_states.get(hotkey) for hotkey in hotkeys)))
         return {hotkey: await self._end_ban(hotkey, got[hotkey], now) for hotkey in hotkeys}
 
     async def _end_ban(self, hotkey: str, state: MinerState, now: float) -> MinerState:
@@ -1093,7 +1096,7 @@ class CorpusAuditor:
             async with gate:
                 await self._randomness_for(round_number)
 
-        await asyncio.gather(*(one(r) for r in sorted(rounds)))
+        await gather_owned(one(r) for r in sorted(rounds))
         self._pass_rounds[0] += len(cached) + len(rounds)
         self._pass_rounds[1] += len(cached)
         return len(rounds)
@@ -1553,7 +1556,7 @@ class CorpusAuditor:
                 # One round_at per pending record: off the event loop.
                 wanted = await asyncio.to_thread(self._rounds_wanted, self._clock())
                 for i in range(0, len(wanted), PREFETCH_ROUNDS):
-                    await asyncio.gather(*(one(r) for r in wanted[i:i + PREFETCH_ROUNDS]))
+                    await gather_owned(one(r) for r in wanted[i:i + PREFETCH_ROUNDS])
                 if wanted:
                     logger.info("corpus job %s: drand prefetch fetched %d round(s) (%d cached)",
                                 self._job_id, len(wanted), len(self._randomness))
@@ -1593,3 +1596,5 @@ class CorpusAuditor:
             rescan.cancel()
             if prefetch is not None:
                 prefetch.cancel()
+            await asyncio.gather(rescan, *([prefetch] if prefetch is not None else []),
+                                 return_exceptions=True)

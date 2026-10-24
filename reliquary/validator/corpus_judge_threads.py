@@ -34,9 +34,9 @@ class JudgeThreads:
         self.beacon = ThreadPoolExecutor(beacon, thread_name_prefix="corpus-judge-drand")
         self.gpu = ThreadPoolExecutor(1, thread_name_prefix="corpus-judge-gpu")
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, wait: bool = False) -> None:
         for pool in (self.codec, self.beacon, self.gpu):
-            pool.shutdown(wait=False, cancel_futures=True)
+            pool.shutdown(wait=wait, cancel_futures=True)
 
 
 async def run_in(executor, func, *args):

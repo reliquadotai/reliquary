@@ -118,11 +118,14 @@ def step_cursor_key(task_id: str | None = None) -> str:
 
 
 def _default_queue_dir() -> str:
+    from reliquary.shared.checkpoint_namespace import active_checkpoint_namespace
+
+    namespace = active_checkpoint_namespace()
     explicit = os.environ.get("RELIQUARY_TRAINING_PAYLOAD_QUEUE_DIR")
     if explicit:
-        return explicit
+        return str(namespace.local_path(explicit))
     state_dir = os.environ.get("RELIQUARY_STATE_DIR", "/root/reliquary/state")
-    return os.path.join(state_dir, "pending_training_payloads")
+    return str(namespace.local_path(state_dir) / "pending_training_payloads")
 
 
 def _default_upload(key: str, body: bytes) -> None:

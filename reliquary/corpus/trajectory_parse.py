@@ -10,8 +10,9 @@ and the actions the replay runs are one and the same thing.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from reliquary.corpus.checks import REASON_BAD_TURNS
 from reliquary.corpus.replay_compare import Action
@@ -47,8 +48,14 @@ class TurnRenderer(Protocol):
 
     def assistant_message(self, completion_ids: Sequence[int]) -> dict: ...
 
-    # Export only (``delivery.episode_row``): the whole conversation rendered
-    # back to ids, and ids compared with whitespace erased.
+    # Export only (``delivery.episode_row``): the harness spec the conversation is
+    # rebuilt in (system prompt, first user message), a turn's observations as the
+    # messages it bridges them as, the whole conversation rendered back to ids, and
+    # ids compared with whitespace erased.
+    spec: Any
+
+    def tool_messages(self, observations: Sequence[str]) -> list[dict]: ...
+
     def render_messages(self, messages: Sequence[dict]) -> list[int]: ...
 
     def whitespace_free(self, ids: Sequence[int]) -> object: ...
@@ -74,13 +81,63 @@ class ParsedTrajectory:
     actions: tuple[Action, ...]
 
 
+def _check_span_tokens(tokens: Sequence[int], k: int, start: int, end: int, *,
+                       stop_ids: AbstractSet[int], markup_ids: AbstractSet[int]) -> None:
+    for position in range(start, end):
+        token = tokens[position]
+        if token in markup_ids or (token in stop_ids and position != end - 1):
+            raise TrajectoryRefused(REASON_BAD_TURNS, {"turn": k, "why": "turn markup or stop inside the span",
+                                                       "at": position - start})
+
+
+def check_span_tokens(tokens: Sequence[int], spans: Sequence[tuple[int, int]], *,
+                      stop_ids: AbstractSet[int], markup_ids: AbstractSet[int]) -> None:
+    """Each span is ONE assistant turn: a stop id only as its last token, and
+    no turn markup (``<|im_start|>``, tool-response tags) anywhere in it.
+    Otherwise one span could hold a closed turn, a made-up observation and
+    another turn, all of it trained as the model's and paid as one turn.
+    Raises ``TrajectoryRefused`` (``bad_turns``). Spans must be in bounds.
+    Shared by the SWE parse, the suite intake and the miners' prechecks."""
+    for k, (start, end) in enumerate(spans):
+        _check_span_tokens(tokens, k, start, end, stop_ids=stop_ids, markup_ids=markup_ids)
+
+
+STOP_FORMAT_ERROR = "format_error"
+"""An async RL lease's episode ended at the model's first malformed turn (``turn_format_violation``): that turn
+is the last, none of its calls was sent, and it scores 0. Never a corpus or window stop."""
+
+
+def turn_format_violation(renderer: TurnRenderer, completion_ids: Sequence[int]) -> str | None:
+    """Why one model turn is malformed, or None: turn markup or a stop id before its last token (the model
+    wrote its own observation or next turn), or a turn with calls that ended on a stop id other than the turn
+    terminator (the end-of-text token: the episode cannot go on after it). The miner ends a lease's episode at
+    the first such turn and the validator admits it there only if this says so: one definition for both."""
+    tokens = list(completion_ids)
+    if not tokens:
+        return None
+    for position, token in enumerate(tokens[:-1]):
+        if token in renderer.turn_markup_ids or token in renderer.stop_ids:
+            return "turn markup or stop inside the turn"
+    if tokens[-1] in renderer.turn_markup_ids:
+        return "turn markup ends the turn"
+    if tokens[-1] in renderer.stop_ids and tokens[-1] != renderer.terminator_id:
+        try:
+            calls = renderer.tool_calls(tokens)
+        except (ValueError, TypeError, KeyError, IndexError):
+            calls = []
+        if calls:
+            return "a turn with calls ended on another stop than the turn terminator"
+    return None
+
+
 def _check_spans(renderer: TurnRenderer, tokens: Sequence[int],
                  spans: Sequence[tuple[int, int]], stop: str) -> None:
     """Spans are ordered and in bounds, and each is one assistant turn: a stop
     token only as its last token, no turn markup inside. The renderer's parser
     cuts at the first stop token while its bridge trims at the last, so a span
-    holding either would split what is replayed from what is trained."""
-    forbidden = renderer.turn_markup_ids
+    holding either would split what is replayed from what is trained. A
+    ``format_error`` episode's last turn is the malformed one: nothing is
+    replayed after it, so its tokens are checked by ``turn_format_violation``."""
     previous = 0
     for k, (start, end) in enumerate(spans):
         if not (previous <= start < end <= len(tokens)):
@@ -88,11 +145,10 @@ def _check_spans(renderer: TurnRenderer, tokens: Sequence[int],
         if k + 1 < len(spans) and end > spans[k + 1][0]:
             raise TrajectoryRefused(REASON_BAD_TURNS, {"turn": k, "why": "spans overlap"})
         previous = end
-        for position in range(start, end):
-            token = tokens[position]
-            if token in forbidden or (token in renderer.stop_ids and position != end - 1):
-                raise TrajectoryRefused(REASON_BAD_TURNS, {"turn": k, "why": "turn markup or stop inside the span",
-                                                           "at": position - start})
+        if stop == STOP_FORMAT_ERROR and k == len(spans) - 1:
+            continue
+        _check_span_tokens(tokens, k, start, end, stop_ids=renderer.stop_ids,
+                           markup_ids=renderer.turn_markup_ids)
     last_start, last_end = spans[-1]
     if stop == "agent_completed" and tokens[last_end - 1] not in renderer.stop_ids:
         raise TrajectoryRefused(REASON_BAD_TURNS, {"why": "final turn is not closed"})
@@ -160,3 +216,7 @@ def parse_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int],
         actions += [Action(name, arguments, observation)
                     for (name, arguments), observation in zip(calls, observations)]
     return ParsedTrajectory(tuple(turns), tuple(actions))
+
+
+# The span structure check, shared with the signed parser (`corpus.signed_parse`).
+check_span_structure = _check_spans

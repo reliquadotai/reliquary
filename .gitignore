@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
 *.egg-info/
 .venv/
 
@@ -37,10 +40,14 @@ reliquary-infra/inventory/known_hosts
 /docs/superpowers/
 /docs/evidence/
 /.private-research/
+/private-subnet-integration/
+*.integration-private.*
 /reports/private/
 /affine-state/
 *.affine-private.json
 *.affine-private.md
+*.affine-private.*
+*.private.*
 
 # Generated ML and research artifacts
 /wandb/
@@ -64,7 +71,9 @@ reliquary-infra/inventory/known_hosts
 # Local tooling
 .DS_Store
 .coverage
+.coverage.*
 htmlcov/
+/test-results/
 
 # Local restart recovery caches
 rollout-hashes.json.gz

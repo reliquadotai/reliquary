@@ -105,6 +105,7 @@ from reliquary.constants import (
 from reliquary.environment.virtual_parquet import PromptSourceUnavailable
 from reliquary.environment.registry import get_environment_spec
 from reliquary.infrastructure.process_health import collect_process_health
+from reliquary.protocol.episode_retry import RETRYABLE_STAGES as _EPISODE_RETRYABLE_STAGES
 from reliquary.protocol.legacy_merkle import (
     legacy_submission_merkle_matches,
 )
@@ -288,6 +289,12 @@ class _QueuedAuctionSubmission:
 # At ~250 B per verdict × 200 entries × ~50 hotkeys ≈ 2.5 MB — cheap.
 VERDICT_CAP_PER_HOTKEY = 200
 
+# An episode refusal the miner may retry at once reserves no (operator, prompt) identity. The
+# shared protocol set ``_EPISODE_RETRYABLE_STAGES`` (imports nothing: a legacy validator never loads the
+# episode modules).
+# How long a clean shutdown waits for episode settlements in flight before cutting them.
+EPISODE_DRAIN_S = 10.0
+
 
 def _chain_client_fingerprint() -> dict[str, str | None]:
     """Return the chain codec versions that determine SCALE compatibility."""
@@ -314,6 +321,53 @@ def _is_mock_like(value: Any) -> bool:
     when the object is clearly a mock.
     """
     return type(value).__module__.startswith("unittest.mock")
+
+
+SERVICE_OBSERVATIONS_TOKEN_ENV = "RELIQUARY_SERVICE_OBSERVATIONS_TOKEN"
+SERVICE_OBSERVATIONS_MAX_PAGE = 1000
+SERVICE_OBSERVATIONS_MAX_AFTER = 2**62
+
+
+def register_service_observations(app, active_batcher_fn) -> None:
+    """The ADMIN-ONLY observation log of a service run.
+
+    ``Authorization: Bearer <RELIQUARY_SERVICE_OBSERVATIONS_TOKEN>`` (constant-time compare).
+    No token configured: 404 whatever the request, so the route reveals nothing; a missing or
+    wrong token is 401 and is decided before the run is looked at. The events carry hotkeys:
+    they are for the operator only (the public publication is a static artifact). Events are
+    served raw, in sequence order: a reader keeps the LAST settle event per observation id.
+    """
+
+    @app.get("/service-observations")
+    async def service_observations(
+        request: Request, after: str | None = None, limit: str | None = None,
+    ):
+        import hmac
+
+        token = os.environ.get(SERVICE_OBSERVATIONS_TOKEN_ENV, "")
+        if not token:
+            raise HTTPException(status_code=404, detail="no_service_task")
+        supplied = request.headers.get("Authorization", "")
+        if not hmac.compare_digest(supplied.encode(), f"Bearer {token}".encode()):
+            raise HTTPException(status_code=401, detail="unauthorized")
+        batcher = active_batcher_fn()
+        runtime = getattr(batcher, "service_runtime", None) if batcher is not None else None
+        if runtime is None or _is_mock_like(runtime):
+            raise HTTPException(status_code=404, detail="no_service_task")
+        try:
+            after_n = 0 if after is None else int(after)
+            limit_n = 100 if limit is None else int(limit)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid_cursor")
+        if not 0 <= after_n <= SERVICE_OBSERVATIONS_MAX_AFTER or not 1 <= limit_n <= SERVICE_OBSERVATIONS_MAX_PAGE:
+            raise HTTPException(status_code=400, detail="invalid_cursor")
+        after, limit = after_n, limit_n
+        events = await asyncio.to_thread(runtime.admin_events, after=after, limit=limit)
+        return {
+            "schema": "service-observation-admin/v1",
+            "watermark": events[-1][0] if events else after,
+            "events": [{"seq": seq, **event} for seq, event in events],
+        }
 
 
 def _protocol_contract_reject_reason(
@@ -1282,7 +1336,34 @@ class _Health(BaseModel):
     training_kl_reference: dict[str, Any] = Field(default_factory=dict)
 
 
+def _episode_admission_fields(batcher: Any) -> dict:
+    """``signed_episode`` / ``episode_max_tokens`` of an ``AdmissionContext``: set only for a
+    signed-episode env of a v2 service window; every other batcher (legacy, a v1 contract, a single-turn
+    env) gets the defaults. A contract that does not parse gets them too: the child's service policy
+    refuses the group anyway."""
+    policy = getattr(batcher, "service_policy", None)
+    if not isinstance(policy, dict):
+        return {}
+    from reliquary.protocol.service_catalogue import announced_contract
+    from reliquary.protocol.service_contract import ServiceContractError
+
+    name = str(getattr(batcher.env, "name", ""))
+    try:
+        contract = announced_contract(policy)
+        if contract.version != 2 or name not in contract.environments:
+            return {}
+        episode = contract.episode_policy(name)
+    except (ServiceContractError, KeyError, TypeError, ValueError):
+        return {}
+    return {} if episode is None else {"signed_episode": True, "episode_max_tokens": episode.max_episode_tokens}
+
+
 class ValidatorServer:
+    # N3: verdict keys never stored for ANY verdict of this process (set by ValidationService for a
+    # service task: an early verdict must not tie a public exploration observation to its hotkey).
+    # Empty for legacy RL tasks and corpus jobs: their verdict bytes are unchanged.
+    _verdict_withhold: frozenset[str] = frozenset()
+
     def __init__(
         self,
         host: str = "0.0.0.0",
@@ -1301,6 +1382,8 @@ class ValidatorServer:
         self._emission_cap = float(emission_cap)
         # The price block /tasks shows miners; the service publishes it each window.
         self._price_view: dict | None = None
+        # Set by the service: the board behind GET /rl/pay.
+        self._rl_pay_board = None
         self._app_started_at = time.time()
         self._image_revision = runtime_revision()
         self._runtime_fingerprint = collect_runtime_fingerprint()
@@ -1336,6 +1419,11 @@ class ValidatorServer:
         self._training_publish_state: dict[str, Any] = {}
         self._training_kl_reference_state: dict[str, Any] = {}
         self._last_committed_window_n = 0
+        # Service runs: /health never names a candidate (not yet opened) window or its stage.
+        self.service_health_redaction = False
+        # Plain attribute refreshed off the event loop by ValidationService (window open, each
+        # boundary, the 5 s heartbeat): the request path never takes the runtime lock or SQLite.
+        self.service_runtime_active = True
         self._candidate_window_n: int | None = None
         self._window_preparation_stage: str | None = None
         self._last_window_preparation_failure: dict[str, Any] | None = None
@@ -1385,6 +1473,8 @@ class ValidatorServer:
         )
         from reliquary.validator.http_metrics import HttpMetrics
         self.http_metrics = HttpMetrics()
+        # The RL validator sets it when its order has signed-episode envs.
+        self._episode_intake = None
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
@@ -1491,6 +1581,46 @@ class ValidatorServer:
         self._verdict_persistence_error = False
         self._recent_reject_counts: collections.Counter[str] = collections.Counter()
 
+    def set_service_runtime_active(self, active: bool) -> None:
+        self.service_runtime_active = bool(active)
+
+    def _service_state_key(self, batcher):
+        """What a service batcher's served state depends on, from memory only.
+
+        The announcement is frozen per window and held by the batcher, so the schedule and
+        checkpoint come from it (no database read, no runtime lock on the request path). Whether the order is still
+        active is the ``service_runtime_active`` attribute, refreshed off the event loop.
+        """
+        runtime = getattr(batcher, "service_runtime", None)
+        if runtime is None or _is_mock_like(runtime):
+            return None
+        policy = getattr(batcher, "service_policy", None)
+        policy = policy if isinstance(policy, dict) else {}
+        schedule = policy.get("schedule")
+        checkpoint = policy.get("checkpoint")
+        return (
+            runtime.contract.sha256,
+            policy.get("pool_epoch"),
+            policy.get("pool_randomness"),
+            schedule.get("revision") if isinstance(schedule, dict) else None,
+            checkpoint.get("revision") if isinstance(checkpoint, dict) else None,
+            bool(self.service_runtime_active),
+        )
+
+    @staticmethod
+    def _service_window_announced(batcher) -> bool:
+        """True unless this is a service batcher whose window the runtime has not announced.
+
+        ``ValidationService`` hands a batcher its announcement only after the runtime froze
+        the window (plan ``opened``); a service batcher without one for its own window is
+        never served (503), so a candidate window is not advertised.
+        """
+        runtime = getattr(batcher, "service_runtime", None)
+        if runtime is None or _is_mock_like(runtime):
+            return True
+        policy = getattr(batcher, "service_policy", None)
+        return isinstance(policy, dict) and policy.get("pool_epoch") == batcher.window_start
+
     def _state_cache_key(self, batcher) -> tuple:
         """Everything the /state payload depends on, for one batcher."""
         cp = self._current_checkpoint
@@ -1535,6 +1665,7 @@ class ValidatorServer:
             fill_collection_closed,
             fill_sealed,
             fill_admission_closed,
+            self._service_state_key(batcher),
         )
 
     def _miner_state_cache_key(self) -> tuple:
@@ -1547,6 +1678,7 @@ class ValidatorServer:
                     environment,
                     id(batcher),
                     int(batcher.window_start),
+                    self._service_state_key(batcher),
                     str(batcher.randomness),
                     getattr(batcher, "prompt_range", None),
                     float(batcher.window_opened_wall_ts),
@@ -2630,8 +2762,13 @@ class ValidatorServer:
         sigma: float | None = None,
         details: dict[str, Any] | None = None,
         batch_filled_reason: str | None = None,
+        withhold: frozenset[str] = frozenset(),
     ) -> dict[str, Any]:
         """Record a per-submission verdict for ``/verdicts/{hotkey}``.
+
+        ``withhold``: keys never stored, whatever telemetry or ``details`` carry (m5: a service
+        exploration verdict must not name its prompt). Empty for every legacy caller. The server's
+        own ``_verdict_withhold`` (N3) is added for every verdict of the process.
 
         Called from every code path that decides a lifecycle stage:
 
@@ -2706,6 +2843,8 @@ class ValidatorServer:
             entry["sigma"] = float(sigma)
         if batch_filled_reason is not None:
             entry["batch_filled_reason"] = batch_filled_reason
+        for key in withhold | self._verdict_withhold:
+            entry.pop(key, None)
         self._verdict_sequence_by_hotkey[hotkey] += 1
         entry["_sequence"] = self._verdict_sequence_by_hotkey[hotkey]
         self._verdicts[hotkey].append(entry)
@@ -3059,6 +3198,7 @@ class ValidatorServer:
                 or (
                     self._candidate_window_n is not None
                     and self._last_window_preparation_failure is not None
+                    and not self.service_health_redaction
                 )
                 or (
                     self._registration_gate_enforced
@@ -3094,18 +3234,24 @@ class ValidatorServer:
             current_validator_state=getattr(self._current_state, "value", str(self._current_state)),
             current_window_n=batcher.window_start if batcher else None,
             last_committed_window_n=self._last_committed_window_n,
-            candidate_window_n=self._candidate_window_n,
-            window_preparation_stage=self._window_preparation_stage,
+            candidate_window_n=(
+                None if self.service_health_redaction else self._candidate_window_n
+            ),
+            window_preparation_stage=(
+                None if self.service_health_redaction else self._window_preparation_stage
+            ),
             last_window_preparation_failure=(
                 dict(self._last_window_preparation_failure)
                 if self._last_window_preparation_failure is not None
+                and not self.service_health_redaction
                 else None
             ),
             window_preparation_failures_total=(
                 self._window_preparation_failures_total
             ),
-            window_preparation_failures_by_stage=dict(
-                self._window_preparation_failures_by_stage
+            window_preparation_failures_by_stage=(
+                {} if self.service_health_redaction
+                else dict(self._window_preparation_failures_by_stage)
             ),
             window_preparation_failures_by_error=dict(
                 self._window_preparation_failures_by_error
@@ -3566,6 +3712,8 @@ class ValidatorServer:
             bootstrap=bool(getattr(batcher, "bootstrap", False)),
             enforce_envelope_signature=ENFORCE_ENVELOPE_SIGNATURE,
             enforce_legacy_merkle=LEGACY_MERKLE_ROOT_ENFORCE,
+            service_policy=(batcher.service_policy if isinstance(getattr(batcher, "service_policy", None), dict) else None),
+            **_episode_admission_fields(batcher),
         )
         self._admission_contexts[cache_key] = context
         return context
@@ -3747,7 +3895,9 @@ class ValidatorServer:
         self,
         batchers: dict[str, GrpoWindowBatcher],
     ) -> None:
-        """Prewarm auction workers before a candidate window becomes OPEN."""
+        """Prepare prompt metadata and auction workers before a candidate becomes OPEN."""
+        for batcher in batchers.values():
+            await asyncio.to_thread(len, batcher.env)
         if not self._auction_admission_enabled:
             return
         for environment, batcher in batchers.items():
@@ -5058,6 +5208,8 @@ class ValidatorServer:
                     protocol_version=request.protocol_version,
                     generation_profile_id=request.generation_profile_id,
                     envelope_signature=request.envelope_signature,
+                    pool_selection=request.pool_selection,
+                    service_binding=request.service_binding,
                 )
                 if not envelope_signature_valid:
                     # CONNECTION-PRIMING DEFENCE — force socket teardown.
@@ -5856,6 +6008,8 @@ class ValidatorServer:
                 )
             )
 
+        register_service_observations(app, lambda: self.active_batcher)
+
         @app.get(
             "/state",
             response_model=GrpoBatchState,
@@ -5907,6 +6061,10 @@ class ValidatorServer:
             # Hits are normally answered by ``_StateFastPathMiddleware`` before
             # the FastAPI stack; this in-handler check only serves requests
             # that raced a cache fill.
+            if not self._service_window_announced(batcher):
+                raise HTTPException(
+                    status_code=503, detail="no_active_window", headers={"Retry-After": "1"},
+                )
             cache_slot = f"{env or ''}|{window if window is not None else ''}"
             cache_key = self._state_cache_key(batcher)
             cached = self._state_response_cache.get(cache_slot)
@@ -5946,6 +6104,7 @@ class ValidatorServer:
                     else None
                 ),
                 fill_closed=fill_closed,
+                service_policy=(batcher.service_policy if isinstance(getattr(batcher, "service_policy", None), dict) else None),
                 randomness=batcher.randomness,
             )
             excluded_fields: set[str] = set()
@@ -6006,6 +6165,10 @@ class ValidatorServer:
                     },
                 )
 
+            if not all(self._service_window_announced(b) for b in self._active_batchers.values()):
+                raise HTTPException(
+                    status_code=503, detail="no_active_window", headers={"Retry-After": "1"},
+                )
             first_batcher = next(iter(self._active_batchers.values()))
             environments: dict[str, MinerEnvironmentState] = {}
             for environment, batcher in sorted(self._active_batchers.items()):
@@ -6023,7 +6186,7 @@ class ValidatorServer:
                     prompt_range = window_prompt_range(
                         batcher.randomness,
                         getattr(batcher.env, "name", environment),
-                        len(batcher.env),
+                        await asyncio.to_thread(len, batcher.env),
                         PROMPT_RANGE_SIZE,
                     )
                 if prompt_range is None:
@@ -6031,6 +6194,12 @@ class ValidatorServer:
                 membership = getattr(batcher, "cooldown_prompts_membership", None)
                 if membership is None:
                     membership = set(batcher.cooldown_prompts_snapshot)
+                runtime = getattr(batcher, "service_runtime", None)
+                if runtime is not None and not _is_mock_like(runtime) and not self.service_runtime_active:
+                    # No eligibility mask: the only service-wide closure is an exhausted order.
+                    lo, hi = prompt_range
+                    membership = set(membership)
+                    membership.update(range(lo, hi))
                 bitmap, cooldown_count = encode_cooldown_bitmap(membership, prompt_range)
                 productive_remaining = max(
                     0,
@@ -6065,6 +6234,8 @@ class ValidatorServer:
                         productive_remaining,
                         grading_remaining,
                     )
+                if runtime is not None and not _is_mock_like(runtime) and not self.service_runtime_active:
+                    admission_remaining = 0
                 accepting_submissions = (
                     self._current_state is WindowState.OPEN
                     and not batcher.is_sealed()
@@ -6111,6 +6282,7 @@ class ValidatorServer:
                     else None
                 ),
                 randomness=first_batcher.randomness,
+                service_policy=(first_batcher.service_policy if isinstance(getattr(first_batcher, "service_policy", None), dict) else None),
             )
             body = payload.model_dump_json().encode("utf-8")
             if self._miner_state_cache_key() != cache_key:
@@ -6154,6 +6326,20 @@ class ValidatorServer:
                 "revision": cp.revision,
                 "signature": cp.signature,
             }
+
+        @app.get("/rl/pay")
+        async def get_rl_pay(tokens_per_second: float | None = None):
+            """What each RL environment pays per paid token, per hour and per
+            GPU-hour (``tokens_per_second`` adds the bounded estimate)."""
+            board = getattr(self, "_rl_pay_board", None)
+            if tokens_per_second is not None and not (0 < tokens_per_second < 1e7):
+                return JSONResponse(status_code=422, content={"error": "tokens_per_second out of range"})
+            if board is None:
+                return JSONResponse(status_code=503, content={"status": "unavailable"})
+            answer = await board.answer(tokens_per_second)
+            if answer.get("status") == "loading":
+                return JSONResponse(status_code=503, content=answer)
+            return answer
 
         @app.get("/tasks")
         async def get_tasks():
@@ -6353,6 +6539,18 @@ class ValidatorServer:
         app.add_middleware(HttpMetricsMiddleware, metrics=self.http_metrics)
         return app
 
+    def mount_rl_lease_router(self, router: Any) -> None:
+        """Serve the async-RL lease routes (``POST /rl/lease``, ``GET /rl/quota``, ``GET
+        /rl/lease/commitments``, ``GET /rl/prompts/state``) built by ``rl_lease_routes.build_rl_lease_router``.
+        The async validator mounts them (``rl_async_service.mount_rl_async``, ``RELIQUARY_RL_MODE=async``).
+        A route the router serves replaces the app's own at the same path and method (the async ``GET /rl/pay``
+        replaces the window board's)."""
+        served = {(getattr(r, "path", None), m) for r in router.routes for m in (getattr(r, "methods", None) or ())}
+        self.app.router.routes[:] = [
+            r for r in self.app.router.routes
+            if not any((getattr(r, "path", None), m) in served for m in (getattr(r, "methods", None) or ()))]
+        self.app.include_router(router)
+
     def mount_corpus_router(
         self,
         entry: Any,
@@ -6405,9 +6603,126 @@ class ValidatorServer:
                 seen_index=seen_index,
                 # Sets the submit body cap (a single-turn job may be large).
                 job=job,
+                durable_records=False,
             )
         )
         return True
+
+    async def _admit_episode_group(self, batcher, receipt, prepared, telemetry, *,
+                                   deadline: float | None = None):
+        """The parent-side half of an episode group's admission (``validator.episode_intake``):
+        the child already ran the service policy (checkpoint = the window's announced one) and the
+        signatures. Returns ``(prepared, claim)``; the caller settles a claim after the batcher's answer.
+        ``deadline`` (``time.monotonic``): the admission's; the intake is cut there. A cut while the
+        transcript check itself ran past it is the miner's (RATE_LIMITED ``episode_timeout``, not
+        refunded); a cut anywhere else (the issuer lock, the precommit lookup, the claim) is the
+        validator's (WORKER_DROPPED ``episode_checker_busy``, refunded, retryable). Either way what it
+        claimed is released, and a running check keeps its global slot until its thread returns."""
+        def refuse(reason: RejectReason, stage: str):
+            prepared.episode_pending = False
+            prepared.reject_reason = reason
+            prepared.reject_stage = stage
+            return prepared, None
+
+        intake = getattr(self, "_episode_intake", None)
+        policy = getattr(batcher, "service_policy", None)
+        if intake is None or not isinstance(policy, dict):
+            return refuse(RejectReason.GENERATION_CONTRACT_MISMATCH, "episode_unserved")
+        request = prepared.request
+        # The window: still this server's active one, the group's own, not sealed. (The batcher checks
+        # the seal again under its lock when it takes the group; a refusal then releases the claims.)
+        if not self._batcher_is_active(batcher):
+            return refuse(RejectReason.WINDOW_NOT_ACTIVE, "episode_window")
+        if request.window_start != getattr(batcher, "window_start", None):
+            return refuse(RejectReason.WINDOW_MISMATCH, "episode_window")
+        admission_closed = getattr(type(batcher), "_fill_proof_admission_closed", None)
+        if getattr(batcher, "seal_snapshot_started", False) is True or (
+                admission_closed is not None and admission_closed(batcher)):
+            return refuse(RejectReason.BATCH_FILLED, "episode_window_sealed")
+        # Defence in depth: the child ran the service policy (checkpoint = the announced one, an active
+        # env, exactly M seeds of its pool, the episode branch); never verify a group that skipped it.
+        from reliquary.services.admission_policy import validate_submission_policy
+
+        try:
+            await asyncio.to_thread(validate_submission_policy, request, policy)
+        except (ValueError, TypeError, KeyError):
+            return refuse(RejectReason.GENERATION_CONTRACT_MISMATCH, "service_contract")
+        try:
+            received = float(getattr(telemetry, "t_body_completed", None))
+        except (TypeError, ValueError):
+            received = 0.0
+        if not 0.0 < received < float("inf"):
+            received = time.time()
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            # Spent before the intake (the miner's body parse, the policy re-run): not refunded.
+            return refuse(RejectReason.RATE_LIMITED, "episode_timeout")
+        from reliquary.validator.episode_intake import CheckProgress
+
+        progress = CheckProgress()
+        try:
+            return await asyncio.wait_for(
+                intake.admit(environment=str(receipt.environment), prepared=prepared, received=received,
+                             contract=batcher._service_window_contract(),
+                             operator=getattr(receipt, "operator", None), progress=progress),
+                remaining)
+        except asyncio.TimeoutError:
+            ran_past = progress.ran_past(deadline)
+            logger.warning("episode group of %s: admission deadline reached in the intake (%s)",
+                           str(getattr(receipt, "miner_hotkey", ""))[:12],
+                           "the check ran past it" if ran_past else "the validator was busy")
+            if ran_past:
+                return refuse(RejectReason.RATE_LIMITED, "episode_timeout")
+            return refuse(RejectReason.WORKER_DROPPED, "episode_checker_busy")
+
+    def _start_episode_settlement(self, claim, *, accepted: bool, stage: str | None = None) -> asyncio.Task:
+        """The settlement of an episode group's claims as a task of its own, kept until it ends: a
+        cancellation of the admission that awaits it never cuts it. ``stage``: this admission's refusal stage
+        of a group not accepted (the yield accounting tells ours from the miner's by it)."""
+        tasks = self.__dict__.setdefault("_episode_settlements", set())
+        task = asyncio.get_running_loop().create_task(
+            self._settle_episode_claim(claim, accepted=accepted, stage=stage))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return task
+
+    async def _drain_episode_tasks(self, timeout: float = EPISODE_DRAIN_S) -> int:
+        """Clean shutdown: the episode settlements in flight, then the intake's own releases, each
+        awaited up to ``timeout`` s and cut after. Returns how many were cut."""
+        cut = 0
+        pending = [task for task in self.__dict__.get("_episode_settlements", ()) if not task.done()]
+        if pending:
+            _, late = await asyncio.wait(pending, timeout=timeout)
+            for task in late:
+                task.cancel()
+            if late:
+                await asyncio.gather(*late, return_exceptions=True)
+                logger.error("ALERT %d episode settlements cut at shutdown", len(late))
+            cut += len(late)
+        intake = getattr(self, "_episode_intake", None)
+        if intake is not None:
+            cut += await intake.drain(timeout)
+        return cut
+
+    async def _persist_episode_claim(self, claim, deadline: float) -> bool:
+        """The claimed sessions' ``submitted`` records written before the batcher takes the
+        group, bounded by ``deadline`` (``time.monotonic``); late counts as not stored."""
+        try:
+            return await asyncio.wait_for(self._episode_intake.persist(claim),
+                                          max(0.0, deadline - time.monotonic()))
+        except asyncio.TimeoutError:
+            logger.warning("episode group of %s: submitted records not written by the admission deadline",
+                           str(claim.hotkey)[:12])
+            return False
+
+    async def _settle_episode_claim(self, claim, *, accepted: bool, stage: str | None = None) -> None:
+        intake = getattr(self, "_episode_intake", None)
+        if intake is None or claim is None:
+            return
+        try:
+            await intake.settle(claim, accepted=accepted, stage=stage)
+        except Exception:
+            logger.exception("episode group sessions not settled")
 
     async def _process_auction_submission(
         self,
@@ -6431,6 +6746,11 @@ class ValidatorServer:
         batch_filled_reason: str | None = None
         request: BatchSubmissionRequest | None = None
         admission_started = False
+        # An episode group's claimed sessions, settled in ``finally`` by the batcher's own answer.
+        episode_claim = None
+        episode_accepted = False
+        episode_stage = None
+        episode_hold_deadline = None
         identity_reserved = False
         cancel_identity_on_exit = False
         wall_seconds = self._admission_wall_seconds(environment)
@@ -6498,10 +6818,24 @@ class ValidatorServer:
                 deadline,
                 wall_seconds=max(0.001, deadline - time.monotonic()),
             )
+            if getattr(prepared, "episode_pending", False) is True:
+                prepared, episode_claim = await self._admit_episode_group(batcher, receipt, prepared, telemetry,
+                                                                          deadline=deadline)
+                episode_hold_deadline = deadline
             if item.admission_predecessor is not None:
                 # Parsing and grading stay parallel; every state-changing
                 # post-grade decision follows observed ingress order.
-                await asyncio.shield(item.admission_predecessor)
+                if episode_claim is not None:
+                    # The sessions' claim is held through this wait, bounded by this
+                    # admission's deadline plus the predecessor's own wall (same batcher, so the same
+                    # environment's), which may end as late as its deadline: the records' write
+                    # below shares that bound. Two walls in all; the claim ttl outlives
+                    # ``CLAIM_TTL_MARGIN`` walls (asserted by the intake).
+                    episode_hold_deadline = deadline + wall_seconds
+                    await asyncio.wait_for(asyncio.shield(item.admission_predecessor),
+                                           max(0.0, episode_hold_deadline - time.monotonic()))
+                else:
+                    await asyncio.shield(item.admission_predecessor)
             if receipt.terminal:
                 response = receipt.outcome or BatchSubmissionResponse(
                     accepted=False, reason=RejectReason.WORKER_DROPPED,
@@ -6588,7 +6922,7 @@ class ValidatorServer:
             identity_should_be_reserved = structurally_authenticated and (
                 prepared.reject_reason is not RejectReason.WORKER_DROPPED
                 or prepared.grader_failure_reason == "crash"
-            )
+            ) and prepared.reject_stage not in _EPISODE_RETRYABLE_STAGES
             if identity_should_be_reserved:
                 reserved, identity_reason, identity_stage = (
                     batcher.reserve_prepared_identity(
@@ -6651,10 +6985,30 @@ class ValidatorServer:
                 return
             admission_started = True
 
+            if episode_claim is not None and not await self._persist_episode_claim(
+                    episode_claim, episode_hold_deadline):
+                # Not one ``submitted`` record stored: the batcher never takes the group (a
+                # restart would not know its sessions paid). Retryable, the claims are released.
+                batcher.cancel_logical_group_reservation(request)
+                reject_stage = "episode_persist_failed"
+                response = batcher.reject_prepared_submission(
+                    request,
+                    RejectReason.WORKER_DROPPED,
+                    reject_stage,
+                    telemetry=telemetry,
+                )
+                return
+
             reject_stage = prepared.reject_stage or "proof"
+            if episode_claim is not None:
+                telemetry.batcher_reject_stage = None
             response = batcher.accept_prepared_submission(
                 prepared, telemetry=telemetry
             )
+            episode_accepted = bool(response.accepted)
+            if episode_claim is not None and not episode_accepted:
+                # The batcher's own stage (ours, such as a missing content digest, or the miner's).
+                episode_stage = getattr(telemetry, "batcher_reject_stage", None)
             if response.reason is RejectReason.BATCH_FILLED:
                 # The one capacity this call refuses on.
                 batch_filled_reason = "auction_seal_snapshot_started"
@@ -6709,55 +7063,85 @@ class ValidatorServer:
                     RejectReason.WORKER_DROPPED, reject_stage
                 )
         finally:
+            settlement = None
+            cancelled_while_settling = False
             try:
-                if cancel_identity_on_exit and request is not None:
-                    batcher.cancel_logical_group_reservation(request)
-                if admission_started and request is not None:
-                    batcher.finish_proof_admission(request)
+                try:
+                    try:
+                        if cancel_identity_on_exit and request is not None:
+                            batcher.cancel_logical_group_reservation(request)
+                        if admission_started and request is not None:
+                            batcher.finish_proof_admission(request)
+                    finally:
+                        self._finish_admission_turn(item)
+                finally:
+                    if episode_claim is not None:
+                        # Only the batcher's acceptance pays the sessions (their records are
+                        # already stored); any other end releases them. A tracked task, started whatever
+                        # happens above, and done BEFORE the receipt: a miner told its group was refused
+                        # finds its sessions and precommit free when it retries.
+                        settlement = self._start_episode_settlement(
+                            episode_claim, accepted=episode_accepted,
+                            stage=None if episode_accepted else episode_stage or reject_stage)
+                if settlement is not None:
+                    try:
+                        if self._auction_admission_enabled:
+                            await asyncio.shield(settlement)
+                        else:
+                            # Shutting down: ``stop`` waits for this worker; it drains (and cuts)
+                            # what is left of the settlement itself.
+                            await asyncio.wait_for(asyncio.shield(settlement), EPISODE_DRAIN_S)
+                    except asyncio.TimeoutError:
+                        logger.error("episode settlement still running at shutdown; left to the drain")
+                    except asyncio.CancelledError:
+                        # A second cancellation stops this wait, never the settlement nor the
+                        # bookkeeping below; it is raised again at the end.
+                        cancelled_while_settling = True
+                if response is None:
+                    response = BatchSubmissionResponse(
+                        accepted=False, reason=RejectReason.WORKER_DROPPED
+                    )
+                if receipt.terminal and receipt.outcome is not None:
+                    response = receipt.outcome
+                else:
+                    self._complete_upload_receipt(receipt, response)
+                telemetry.mark_admission_finished()
+                telemetry.refresh_from_batcher(batcher, at_decision=True)
+                telemetry.mark_decision(verified=True)
+                self._record_admission_latency(batcher, telemetry)
+                if (
+                    not response.accepted
+                    and response.reason is RejectReason.WORKER_DROPPED
+                    and (
+                        request is None
+                        or self._worker_drop_refunds_quota(request)
+                    )
+                ):
+                    self._refund_submission_quota(
+                        receipt.miner_hotkey,
+                        receipt.window_start,
+                    )
+                self._record_raw_terminal(
+                    receipt,
+                    telemetry,
+                    response,
+                    stage=reject_stage,
+                    batch_filled_reason=batch_filled_reason,
+                )
+                self._admission_active_by_environment[environment] = max(
+                    0,
+                    self._admission_active_by_environment[environment] - 1,
+                )
+                self._inflight_proofs = max(0, self._inflight_proofs - 1)
+                self._inflight_proofs_by_environment[environment] = max(
+                    0,
+                    self._inflight_proofs_by_environment[environment] - 1,
+                )
+                self._admission_inflight_items.pop(receipt.receipt_id, None)
+                self._admission_inflight_requests.pop(receipt.receipt_id, None)
             finally:
-                self._finish_admission_turn(item)
-            if response is None:
-                response = BatchSubmissionResponse(
-                    accepted=False, reason=RejectReason.WORKER_DROPPED
-                )
-            if receipt.terminal and receipt.outcome is not None:
-                response = receipt.outcome
-            else:
-                self._complete_upload_receipt(receipt, response)
-            telemetry.mark_admission_finished()
-            telemetry.refresh_from_batcher(batcher, at_decision=True)
-            telemetry.mark_decision(verified=True)
-            self._record_admission_latency(batcher, telemetry)
-            if (
-                not response.accepted
-                and response.reason is RejectReason.WORKER_DROPPED
-                and (
-                    request is None
-                    or self._worker_drop_refunds_quota(request)
-                )
-            ):
-                self._refund_submission_quota(
-                    receipt.miner_hotkey,
-                    receipt.window_start,
-                )
-            self._record_raw_terminal(
-                receipt,
-                telemetry,
-                response,
-                stage=reject_stage,
-                batch_filled_reason=batch_filled_reason,
-            )
-            self._admission_active_by_environment[environment] = max(
-                0,
-                self._admission_active_by_environment[environment] - 1,
-            )
-            self._inflight_proofs = max(0, self._inflight_proofs - 1)
-            self._inflight_proofs_by_environment[environment] = max(
-                0,
-                self._inflight_proofs_by_environment[environment] - 1,
-            )
-            self._admission_inflight_items.pop(receipt.receipt_id, None)
-            self._admission_inflight_requests.pop(receipt.receipt_id, None)
+                if cancelled_while_settling:
+                    raise asyncio.CancelledError()
 
     async def _submit_worker(
         self,
@@ -7245,6 +7629,8 @@ class ValidatorServer:
         self._worker_task = None
         self._code_worker_task = None
         self._extra_worker_tasks = []
+        # The episode settlements the cancelled admissions left running (bounded).
+        await self._drain_episode_tasks()
         for pool in self._admission_process_pools.values():
             await asyncio.to_thread(self._terminate_admission_pool, pool)
         self._admission_process_pools = {}

@@ -23,6 +23,22 @@ def test_defaults_come_from_the_shipped_controller():
     assert len(entry.profile_sha256) == 64
 
 
+def test_pause_resume_cli_calls_only_admission(monkeypatch):
+    from typer.testing import CliRunner
+    from reliquary.cli.main import app
+
+    calls = []
+
+    async def change(task_id, admission, **kw):
+        calls.append((task_id, admission))
+
+    monkeypatch.setattr("reliquary.infrastructure.task_registry_store.set_task_admission", change)
+    runner = CliRunner()
+    assert runner.invoke(app, ["tasks", "pause", "--task-id", "cpu-data"]).exit_code == 0
+    assert runner.invoke(app, ["tasks", "resume", "--task-id", "cpu-data"]).exit_code == 0
+    assert calls == [("cpu-data", "paused"), ("cpu-data", "open")]
+
+
 def test_an_override_replaces_one_parameter_only():
     entry = build_task_entry(
         task_id="logic-probe",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -70,3 +71,28 @@ def test_the_subnet_store_is_create_only(monkeypatch):
     assert asyncio.run(store.get_bytes("reliquary/eval-sets/x/none")) is None
     with pytest.raises(SetConflict):
         asyncio.run(store.put_bytes("reliquary/eval-sets/x/grading.jsonl", b"b"))
+
+
+def test_explicit_reviewed_publication_keeps_private_args_out_and_registration_withdrawn(tmp_path):
+    from reliquary.eval.protocol import seal_set
+    directory = _built(tmp_path)
+    card = json.loads((directory / "set.json").read_bytes())
+    card.update(source_kind="verifiers", taskset={"id": "fixture", "args": {"private": "sensitive-option"},
+        "package": "fixture", "package_version": "1", "verifiers_version": "1",
+        "artifact_sha256": "a" * 64})
+    card = seal_set(card, reviewed={"data": {"fixture": "1" * 64},
+        "licenses": [{"id": "MIT", "sha256": "2" * 64}],
+        "disjointness": {"disjoint": False, "evidence_sha256": "3" * 64}})
+    (directory / "set.json").write_text(json.dumps(card))
+    platform, subnet = LocalDirectorySink(tmp_path / "p"), LocalDirectorySink(tmp_path / "s")
+    private_only = asyncio.run(publish_set(directory, platform=None, subnet=subnet))
+    assert len(private_only["written"]) == 3
+    answer = asyncio.run(publish_set(directory, platform=platform, subnet=subnet, publish_reviewed=True))
+    assert answer["registration"]["availability"] == "withdrawn"
+    assert answer["registration"]["avg_tokens"] is None
+    public = (tmp_path / "p" / "eval-sets" / card["set_id"] / "set.json").read_text()
+    assert "sensitive-option" not in public and '"args"' not in public
+    assert json.loads(public)["protocol_sha256"] == card["protocol_sha256"]
+    assert json.loads(public)["order"] == [json.loads(line)["problem_id"]
+        for line in (directory / "prompts.jsonl").read_text().splitlines()]
+    assert "sensitive-option" in (tmp_path / "s/reliquary/eval-sets" / card["set_id"] / "set.json").read_text()

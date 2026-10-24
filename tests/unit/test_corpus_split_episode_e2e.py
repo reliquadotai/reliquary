@@ -72,6 +72,11 @@ def test_an_honest_trajectory_is_admitted_audited_graded_and_paid(bucket):
                 ep.wait(lambda: sid in h.listed(root, ep.EPISODE_JOB, "grades"), 120,
                         "the trajectory's grade")
                 grade = h.listed(root, ep.EPISODE_JOB, "grades")[sid]
+                # A native decision may be written before its result receipt
+                # finishes persisting and the executor sees the HTTP answer.
+                ep.wait(lambda: {"grade", "replay"} <= {
+                    mode for _, mode, outcome in executors.answered if outcome == "accepted"},
+                    120, "the grading and replay result acknowledgements")
                 modes = {mode for _, mode, outcome in executors.answered if outcome == "accepted"}
                 assert {"grade", "replay"} <= modes, executors.answered
 

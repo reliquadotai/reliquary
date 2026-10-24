@@ -1,8 +1,5 @@
 # Detached Trainer — Operator Runbook
 
-Design: `docs/superpowers/specs/2026-08-21-detached-trainer-r2-design.md`.
-Plan: `docs/superpowers/plans/2026-08-21-detached-trainer-r2.md`.
-
 The validator writes one training payload (or tombstone) per sealed
 window to R2 under `reliquary/training/`; a standalone
 `reliquary train-worker` process consumes them strictly in order, runs
@@ -10,6 +7,14 @@ window to R2 under `reliquary/training/`; a standalone
 R2 mirror (validator's fast path). The validator polls the candidate
 manifest, downloads the mirrored snapshot in the background, and swaps
 its verify plane on the serial publication beat.
+
+Publication order: HF commit, then the small snapshot files (profile,
+receipt, config) to the mirror, then the candidate manifest, then the weight
+files, then `reliquary_mirror_complete.json`. A validator whose proof plane
+adopts by revision only needs the metadata, so the weight upload stays off the
+rotation path. Any reader that takes the weights from the mirror (a local proof
+plane, trainer resume) waits for the marker; trainer resume falls back to HF
+without it.
 
 ## Flags
 

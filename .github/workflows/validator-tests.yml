@@ -8,10 +8,19 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: validator-tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  cpu-suite:
+  cpu-tests:
     runs-on: ubuntu-24.04
+    # The suite is ~50 CPU-minutes: 4 shards (stable hash of the test id), each on 4 xdist workers.
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,18 +32,178 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -e ".[dev]"
-      - name: Run validator suite
+      - name: Run validator suite (shard ${{ matrix.shard }}/4)
         run: |
-          pytest -q \
+          pytest -q -n 4 --durations=15 --timeout=900 \
+            --test-shard=${{ matrix.shard }}/4 \
             --ignore=tests/gpu \
-            --ignore=tests/integration/test_grader_e2e.py
+            --ignore=tests/integration/test_grader_e2e.py \
+            --ignore=tests/unit/test_corpus_split_e2e.py
+      - name: Every corpus-split-e2e test has its own job
+        if: matrix.shard == 1
+        run: |
+          listed=$(sed -n '/^  corpus-split-e2e:/,/^    steps:/p' .github/workflows/validator-tests.yml \
+            | sed -n 's/^ *- \(test_[a-z0-9_]*\)$/\1/p' | sort)
+          collected=$(pytest -q --collect-only tests/unit/test_corpus_split_e2e.py | sed -n 's/.*::\(test_[a-z0-9_]*\)$/\1/p' | sort)
+          test -n "$collected" && test "$listed" = "$collected" || {
+            echo "corpus-split-e2e matrix: $listed"; echo "collected: $collected"; exit 1; }
       - name: Check V5 authenticity boundaries
+        if: matrix.shard == 1
         env:
           RELIQUARY_PROTOCOL_PROFILE: qwen3-4b-base-dapo-reasoning-v5
           RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED: "0"
         run: |
           pytest -q tests/unit/test_grpo_window_batcher.py \
             -k 'all_token_auth or forced_seed_group_gate or forced_seed_gate_abstains or forced_seed_cdf_gate or forged or tamper'
+
+  # Each of these tests runs a split validator as several real processes for minutes; two on one runner starve
+  # each other, so each gets its own.
+  corpus-split-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - test_the_split_writes_the_single_process_verdicts_and_archives
+          - test_a_gpu_process_that_dies_makes_audits_wait_never_fail
+          - test_a_front_that_dies_leaves_the_judges_judging
+          - test_a_judge_killed_mid_pass_resumes_from_the_bucket
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install CPU test runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[dev]"
+      - name: Run ${{ matrix.test }}
+        run: pytest -q --timeout=1500 "tests/unit/test_corpus_split_e2e.py::${{ matrix.test }}"
+
+  cpu-suite:
+    runs-on: ubuntu-24.04
+    needs: [cpu-tests, corpus-split-e2e, signed-sandbox-cpu]
+    if: always()
+    steps:
+      - name: Require all CPU suites
+        env:
+          CPU_RESULT: ${{ needs.cpu-tests.result }}
+          SPLIT_RESULT: ${{ needs.corpus-split-e2e.result }}
+          SANDBOX_RESULT: ${{ needs.signed-sandbox-cpu.result }}
+        run: test "$CPU_RESULT" = success && test "$SPLIT_RESULT" = success && test "$SANDBOX_RESULT" = success
+
+  signed-sandbox-cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      OMP_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
+      SIGNED_SANDBOX_MODULES: >-
+        test_agentic_swe_signed test_bridged_episode test_bridged_swe
+        test_corpus_export_signed test_corpus_job_signed_sandbox test_corpus_multi_job_contract
+        test_corpus_period_settlement test_corpus_quota test_corpus_settlement
+        test_rl_async_episode_service test_rl_async_episodes
+        test_rl_capacity test_rl_capacity_attacks test_rl_check_cap
+        test_rl_engagements test_rl_episode_e2e test_rl_episode_miner_side
+        test_rl_episode_routes test_rl_episode_wiring test_rl_options_and_boot
+        test_rl_pay test_rl_prompt_ranges test_rl_quota
+        test_rl_quota_wiring test_rl_saturation test_rl_session_events
+        test_rl_yield test_rl_yield_wiring test_sandbox_dependency
+        test_sandbox_directory test_sandbox_fleet test_sandbox_routes
+        test_sandbox_sessions test_signed_episode_e2e test_signed_episode_environment
+        test_signed_grading_and_wiring test_signed_intake test_signed_miner
+        test_signed_parse test_signed_state test_signed_wire
+        test_tasks_create_composed test_admin_eval_sandbox test_evaluation_sessions
+        test_eval_signed_agentic
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.15"
+          cache: pip
+      - name: Install pinned sandbox test runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[dev,sandbox-test,sandbox-miner]"
+      - name: Require the signed sandbox dependencies and exact source pin
+        run: |
+          python - <<'PY'
+          import importlib
+          from reliquary.sandbox import SANDBOX_COMMIT, sandbox_commit_refusal
+          for module in (
+              "bittensor", "renderers", "verifiers.v1.clients.train",
+              "verifiers.v1.harnesses.bash.harness", "reliquary_sandbox.attest",
+              "reliquary_sandbox.observation", "reliquary_sandbox_verifiers.task",
+              "reliquary_sandbox_verifiers.runner",
+              "reliquary_sandbox_service.episodes.testing",
+              "reliquary_sandbox_service.episodes.state_archive",
+          ):
+              importlib.import_module(module)
+          refusal = sandbox_commit_refusal(SANDBOX_COMMIT)
+          assert refusal is None, refusal
+          print("Installed sandbox source:", SANDBOX_COMMIT)
+          PY
+      - name: Run signed sandbox CPU tests
+        id: signed_tests
+        run: |
+          paths=()
+          for module in $SIGNED_SANDBOX_MODULES; do
+            paths+=("tests/unit/$module.py")
+          done
+          pytest -q "${paths[@]}" \
+            --junitxml="$RUNNER_TEMP/signed-sandbox.xml" \
+            -o junit_logging=no -o junit_log_passing_tests=false
+      - name: Check every required module ran and write a safe summary
+        if: always()
+        env:
+          TEST_OUTCOME: ${{ steps.signed_tests.outcome }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          report = Path(os.environ["RUNNER_TEMP"]) / "signed-sandbox.xml"
+          try:
+              cases = list(ET.parse(report).iter("testcase"))
+          except (FileNotFoundError, ET.ParseError):
+              cases = []
+          required = {f"tests.unit.{name}" for name in os.environ["SIGNED_SANDBOX_MODULES"].split()}
+          exercised = {case.get("classname") for case in cases if case.find("skipped") is None}
+          missing = required - exercised
+          failed = sum(case.find("failure") is not None for case in cases)
+          errors = sum(case.find("error") is not None for case in cases)
+          skipped = sum(case.find("skipped") is not None for case in cases)
+          passed = sum(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped"))
+                       for case in cases)
+          succeeded = os.environ["TEST_OUTCOME"] == "success"
+          summary = {
+              "status": "passed" if succeeded and not (missing or failed or errors) else "failed",
+              "revision": os.environ["GITHUB_SHA"],
+              "tests": len(cases), "passed": passed,
+              "failed": failed, "errors": errors, "skipped": skipped,
+              "modules_expected": len(required), "modules_exercised": len(required & exercised),
+          }
+          target = Path("test-results/signed-sandbox-summary.json")
+          target.parent.mkdir(exist_ok=True)
+          target.write_text(json.dumps(summary, sort_keys=True) + "\n")
+          assert not missing, "A required signed-sandbox module ran no tests"
+          assert failed == errors == 0, "Signed-sandbox tests failed"
+          assert succeeded, "Signed-sandbox test execution did not succeed"
+          PY
+      - name: Upload signed sandbox test counts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-sandbox-test-summary
+          path: test-results/signed-sandbox-summary.json
+          if-no-files-found: error
+          retention-days: 7
 
   # The suite above runs at DEFAULT_PROFILE_ID, which is still v2, so it
   # exercises the fill-closed code with B_BATCH=8 and M_ROLLOUTS=8. This job
@@ -100,6 +269,10 @@ jobs:
             tests/unit/test_v1_cutover.py \
             tests/unit/test_trainer_publication_recovery.py \
             tests/unit/test_remote_proof_controller.py \
+            tests/unit/test_seed_pool.py \
+            tests/unit/test_public_pool_sampling.py \
+            tests/unit/test_service_policy_admission.py \
+            tests/unit/test_service_checkpoint_adoption.py \
             tests/integration/test_remote_proof_mtls.py
       - name: Check inherited V5 authenticity boundaries
         run: |

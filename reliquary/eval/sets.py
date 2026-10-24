@@ -20,8 +20,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from reliquary.eval.prompt_source import REFERENCE_INTERACTIONS
+
 SET_SCHEMA = "reliquary/eval-set/v1"
 RL_SPLIT = "train"
+SWE_SOURCE = "reliquary-swe"
 _SET_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 
 
@@ -62,13 +65,93 @@ class HeldOut:
 # corpus job. `prompt_start`/`prompt_count` as their manifests declare them.
 CORPUS_RANGES: tuple[UsedRange, ...] = (
     UsedRange("corpus", "reliquary_code_v1", "train", 0, 100_000, "code-qwen38-27b-v1"),
+    UsedRange("corpus", "reliquary_code_v1", "train", 100_000, 100_000, "code-qwen38-27b-v2"),
     UsedRange("corpus", "openmathinstruct", "train", 10_000_000, 400_000,
               "math-omi-qwen38-27b-v1"),
     UsedRange("corpus", "reliquary_instruction_following_v1", "train", 0, 20_000,
               "if-qwen38-27b-v1"),
     UsedRange("corpus", "reliquary_logic_v2", "train", 100_000_000, 50_000,
               "logic-qwen38-27b-v1"),
+    UsedRange("corpus", "reliquary_science_v1", "train", 0, 10_871, "science-qwen38-27b-v1"),
+    UsedRange("corpus", "reliquary_science_v1", "train", 0, 10_871, "science-qwen38-27b-v2"),
+    UsedRange("corpus", "reliquary_hard_math_v1", "train", 0, 15_749, "hard-math-qwen38-27b-v1"),
+    UsedRange("corpus", "reliquary_hard_math_v1", "train", 0, 15_749, "hard-math-qwen38-27b-v2"),
+    UsedRange("corpus", "reliquary_competitive_code_v1", "train", 0, 4181,
+              "competitive-code-qwen38-27b-v1"),
+    UsedRange("corpus", "reliquary_competitive_code_v1", "train", 6899, 1893,
+              "competitive-code-v2-qwen38-27b-v1"),
 )
+
+# reliquary_telecom_solo_v2 0.2.0a1 (reliquary-environments c72f918) lays
+# train out SFT first then RL, as its environment.toml `[data]` declares
+# (train_sft_start/count, train_rl_start/count; the package's
+# `layout.use_range`), as (start, count). Its 134 tau2-bench benchmark tickets
+# are a split of their own, `benchmark`, never train.
+TELECOM_SOLO_V2_SFT = (0, 1220)
+TELECOM_SOLO_V2_RL = (1220, 493)
+
+# Rows a source keeps for RL alone: no corpus job may take them, whatever it
+# declares. reliquary_competitive_code_v1 shares train by problem identity
+# (the package's `layout.use_of`), SFT first then RL, as its environment.toml
+# `[data]` declares: SFT [0, 4181), RL [4181, 6899). v1.1
+# (ReliquaryForge/competitive-code-curated@4ae52941, reliquary-environments
+# 63f1d02) appends 1,893 problems, all SFT, after the v1 rows: SFT also
+# [6899, 8792). The v1 rows, and so the RL share, are unchanged.
+#
+# envscaler_tools_v2 splits by world: its RL worlds' scenarios are [0, 1296),
+# restated from `envscaler_tools_v2.environment.RL_RANGE` (a test holds the
+# two equal).
+RL_ONLY_RANGES: tuple[UsedRange, ...] = (
+    UsedRange("rl", "reliquary_competitive_code_v1", "train", 4181, 2718,
+              "competitive-code RL share"),
+    UsedRange("rl", "reliquary_telecom_solo_v2", "train", *TELECOM_SOLO_V2_RL,
+              "telecom v2 RL share"),
+    UsedRange("rl", "envscaler_tools_v2", "train", 0, 1296,
+              "envscaler RL worlds"),
+)
+
+# Sources a corpus job may take only part of: its range must lie inside ONE of
+# these. reliquary_general_v1 lays train out as (block, thinking mode)
+# segments, each opening with its single-turn rows (one user message, no
+# tools, no system message). Stage A serves those rows of chat, safety, ifeval
+# and structured, one segment per job (one renderer); multi-turn, tool and
+# task-system rows, clarification and identity wait for stage B, which renders
+# messages and tools. Counts from the package's `segments()` at
+# ReliquaryForge/general-prompts-curated@02b3ef7a.
+#
+# An empty tuple serves no corpus job: reliquary_telecom_solo_v1's train split
+# still holds the benchmark tickets, so telecom is distilled from v2's SFT
+# share only.
+CORPUS_SERVABLE_RANGES: dict[str, tuple[UsedRange, ...]] = {
+    "reliquary_telecom_solo_v1": (),
+    "reliquary_telecom_solo_v2": (
+        UsedRange("corpus", "reliquary_telecom_solo_v2", "train", *TELECOM_SOLO_V2_SFT,
+                  "telecom v2 SFT share"),
+    ),
+    "reliquary_general_v1": tuple(
+        UsedRange("corpus", "reliquary_general_v1", "train", start, stop - start,
+                  f"{segment} single-turn (stage A)")
+        for segment, start, stop in (
+            ("chat/direct", 0, 30_141),
+            ("chat/thinking", 30_141, 51_965),
+            ("ifeval/direct", 66_291, 70_971),
+            ("ifeval/thinking", 71_720, 82_808),
+            ("structured/direct", 84_587, 86_967),
+            ("structured/thinking", 87_540, 93_067),
+            ("safety/direct", 94_476, 101_778),
+            ("safety/thinking", 101_778, 107_165),
+        )
+    ),
+    # `SFT_CORPUS_RANGE`, restated from `envscaler_tools_v2.environment`: the
+    # graded scenarios of the 12 SFT worlds kept for the corpus. The whole
+    # graded SFT range [1296, 2546) (25 worlds, 13 of which a 27B policy
+    # almost never wins) and the ungraded range [2546, 7225)
+    # (EnvScaler-SFT-Scenario, no checks) are held in reserve.
+    "envscaler_tools_v2": (
+        UsedRange("corpus", "envscaler_tools_v2", "train", 7225, 600,
+                  "SFT worlds kept for the corpus, graded"),
+    ),
+}
 
 _CODE_LENGTH = 2_481_806
 _CODE_HELD_OUT = 100_000
@@ -128,7 +211,8 @@ CONTAMINATION_NOTES: dict[str, str] = {
 def rl_ranges() -> list[UsedRange]:
     """RL's prompt universe: the whole train split of every catalog source
     (`window_prompt_range` slices [0, len(env)), and runtime factories build
-    the train split)."""
+    the train split). A service task offers only `rl_prompt_ranges` of it, but
+    a legacy task on the same source still samples the whole split."""
     from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
 
     return [UsedRange("rl", source, RL_SPLIT, 0, None, "RL prompt sampling")
@@ -147,6 +231,18 @@ SOURCE_LINEAGE: dict[str, tuple[str, str]] = {
     "reliquary_logic_v2": ("reliquary-logic-generator-v2", "reliquary_logic_v2"),
     "reliquary_instruction_following_v1": ("nvidia/Nemotron-Cascade-2-RL-data:IF-RL",
                                            "reliquary_instruction_following_v1"),
+    "reliquary_competitive_code_v1": (
+        "ReliquaryForge/competitive-code-curated@4ae52941",
+        "reliquary_competitive_code_v1"),
+    "reliquary_general_v1": (
+        "ReliquaryForge/general-prompts-curated@02b3ef7a",
+        "reliquary_general_v1"),
+    # One upstream corpus, two index spaces: v1 by upstream position, v2 by
+    # its own split-by-world layout.
+    "envscaler_tools_v1": ("XXHStudyHard/EnvScaler", "envscaler_tools_v1"),
+    "envscaler_tools_v2": ("XXHStudyHard/EnvScaler", "envscaler_tools_v2"),
+    # Not a catalog environment: a set source of `build_source_set` only.
+    SWE_SOURCE: ("princeton-nlp/SWE-bench_Verified+SWE-smith", "reliquary-swe"),
 }
 
 
@@ -181,6 +277,23 @@ def refuse_held_out_overlap(source: str, prompt_start: int, prompt_count: int) -
                 f"rows [{held.start}, {held.region.end}) of {source!r} are held out for the "
                 f"{held.env!r} evaluation set; this job's [{job.start}, {job.end}) reaches them"
             )
+    servable = CORPUS_SERVABLE_RANGES.get(source)
+    if servable is not None and not any(
+        allowed.start <= job.start and job.end <= allowed.end for allowed in servable
+    ):
+        if not servable:
+            raise ValueError(f"{source!r} serves no corpus job (CORPUS_SERVABLE_RANGES)")
+        raise ValueError(
+            f"{source!r} serves corpus jobs only inside its corpus ranges, one "
+            f"segment per job ({', '.join(f'[{r.start}, {r.end}) {r.what}' for r in servable)}); "
+            f"this job's [{job.start}, {job.end}) is not inside one"
+        )
+    for reserved in RL_ONLY_RANGES:
+        if lineage(source)[1] == lineage(reserved.source)[1] and overlaps(job, reserved):
+            raise ValueError(
+                f"rows [{reserved.start}, {reserved.end}) of {source!r} are the RL share "
+                f"({reserved.what}); this job's [{job.start}, {job.end}) reaches them"
+            )
 
 
 def _disjointness(held: HeldOut) -> dict:
@@ -209,10 +322,13 @@ def _disjointness(held: HeldOut) -> dict:
 
 def open_source(source: str, split: str):
     """The catalog environment at ``split``: the runtime factory for train, the
-    package's own split otherwise (an external answer environment)."""
+    package's own split otherwise (an external answer environment). An episode
+    environment is built at any of its splits through ``spec.create(split=...)``."""
     from reliquary.environment.registry import ENVIRONMENT_SPECS
 
     spec = ENVIRONMENT_SPECS[source]
+    if spec.interaction_mode == "episode":
+        return spec.create(split=split)
     if split == RL_SPLIT:
         return spec.create()
     if spec.external_distribution is None or spec.interaction_mode != "single_turn":
@@ -242,6 +358,7 @@ def validated_set_id(set_id: Any) -> str:
 
 def build_set(env: str, *, count: int, seed: int, out: str | Path,
               set_id: str | None = None,
+              protocol: dict | None = None,
               open_environment: Callable[[str, str], Any] = open_source,
               clock: Callable[[], float] = time.time) -> dict:
     """Freeze ``count`` problems of ``env``'s held-out region into ``out``."""
@@ -278,8 +395,11 @@ def build_set(env: str, *, count: int, seed: int, out: str | Path,
         problem_id = f"{set_id}-{ordinal:06d}"
         prompts.append({"problem_id": problem_id, "env": env, "set_id": set_id,
                         "messages": [{"role": "user", "content": prompt}]})
+        from reliquary.eval.protocol import digest
+
         grading.append({"problem_id": problem_id, "source": held.source, "split": held.split,
-                        "source_index": index, "prompt_sha256": prompt_sha256(prompt)})
+                        "source_index": index, "prompt_sha256": prompt_sha256(prompt),
+                        "reference_sha256": digest(problem)})
     prompts_body, grading_body = _jsonl(prompts), _jsonl(grading)
     profile = ENVIRONMENT_CATALOG[held.source]
     card = {
@@ -296,14 +416,11 @@ def build_set(env: str, *, count: int, seed: int, out: str | Path,
         "environment_manifest_sha256": getattr(profile, "environment_manifest_sha256", None),
         "disjointness": disjointness,
     }
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "prompts.jsonl").write_bytes(prompts_body)
-    (directory / "grading.jsonl").write_bytes(grading_body)
-    (directory / "set.json").write_text(json.dumps(card, sort_keys=True, indent=1))
-    return card
+    return _write_set(directory, prompts, grading, card, protocol=protocol)
 
 
 INTERACTION = "single_turn"
+INTERACTIONS = (INTERACTION, *sorted(REFERENCE_INTERACTIONS))
 
 
 def select_indices(low: int, high: int, *, sample: int | None,
@@ -340,12 +457,16 @@ def _catalog_spec(source: str):
     from reliquary.environment.registry import ENVIRONMENT_SPECS
     from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
 
-    if source not in ENVIRONMENT_CATALOG or source not in ENVIRONMENT_SPECS:
+    if source not in ENVIRONMENT_SPECS:
         raise ValueError(f"{source!r} is not a catalog environment")
     spec = ENVIRONMENT_SPECS[source]
-    if getattr(spec, "interaction_mode", None) != INTERACTION:
+    if getattr(spec, "interaction_mode", None) not in (INTERACTION, "episode"):
         raise ValueError(f"{source!r} is {spec.interaction_mode!r}: a set holds "
-                         "single-turn problems only")
+                         "single-turn or episode problems only")
+    # An episode environment needs no profile (telecom v2 has none): it is a
+    # registry spec, run through the episode path.
+    if source not in ENVIRONMENT_CATALOG and spec.interaction_mode != "episode":
+        raise ValueError(f"{source!r} is not a catalog environment")
     return spec
 
 
@@ -355,10 +476,18 @@ def _source_set_id(source: str, split: str, low: int, count: int,
     return base if sample is None else f"{base}-k{sample}-s{seed}"
 
 
-def _write_set(directory: Path, prompts: list[dict], grading: list[dict], card: dict) -> dict:
+def _write_set(directory: Path, prompts: list[dict], grading: list[dict], card: dict,
+               *, protocol: dict | None = None, reference_only: bool = False) -> dict:
+    from reliquary.eval.protocol import seal_set
+
     prompts_body, grading_body = _jsonl(prompts), _jsonl(grading)
     card = {**card, "prompts_sha256": hashlib.sha256(prompts_body).hexdigest(),
             "grading_sha256": hashlib.sha256(grading_body).hexdigest()}
+    if reference_only:
+        if protocol is not None:
+            raise ValueError("reference-only sets do not have an executor protocol")
+    else:
+        card = seal_set(card, reviewed=protocol)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "prompts.jsonl").write_bytes(prompts_body)
     (directory / "grading.jsonl").write_bytes(grading_body)
@@ -377,6 +506,8 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
                      start: int = 0, count: int | None = None, sample: int | None = None,
                      seed: int | None = None, set_id: str | None = None,
                      taskset_args: dict | None = None,
+                     protocol: dict | None = None, bridge: dict | None = None,
+                     open_bridged: Callable[..., Any] | None = None,
                      open_environment: Callable[[str, str], Any] = open_source,
                      open_taskset: Callable[..., Any] | None = None,
                      clock: Callable[[], float] = time.time) -> dict:
@@ -384,7 +515,11 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
 
     A catalog environment at any split, or ``verifiers:<taskset-id>``: an
     installed single-turn Verifiers taskset under ``taskset_args``. The four
-    held-out presets keep `build_set`, whose sets the platform already holds."""
+    held-out presets keep `build_set`, whose sets the platform already holds.
+
+    A bridged eval env (``corpus.job.BRIDGED_EVAL_PACKAGES``, e.g. reliquary-terminal)
+    needs ``bridge``, ``{"options", "image_lock_sha256"}`` as the gateway serves it: its
+    rows are references to the tasks that env serves at ``split``."""
     from reliquary.eval import verifiers_source
 
     if start < 0 or (count is not None and count <= 0):
@@ -395,16 +530,43 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
         return verifiers_source.build_set(
             source, out=out, start=start, count=count, sample=sample, seed=seed,
             set_id=set_id, taskset_args=dict(taskset_args or {}),
-            open_taskset=open_taskset or verifiers_source.open_taskset, clock=clock)
+            open_taskset=open_taskset or verifiers_source.open_taskset, clock=clock,
+            protocol=protocol)
     if taskset_args:
         raise ValueError("taskset args belong to a Verifiers source")
+    from reliquary.corpus.job import BRIDGED_EVAL_PACKAGES
     from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
 
-    _catalog_spec(source)
+    bridged = None
+    if (source in BRIDGED_EVAL_PACKAGES) != (bridge is not None):
+        raise ValueError(f"a bridge belongs to a bridged eval env ({sorted(BRIDGED_EVAL_PACKAGES)}), "
+                         "and one needs it")
+    if source in BRIDGED_EVAL_PACKAGES:
+        if not split:
+            raise ValueError(f"{source!r} needs the split its gateway serves")
+        if set(bridge) != {"options", "image_lock_sha256"}:
+            raise ValueError("bridge must be {options, image_lock_sha256}")
+        if open_bridged is None:
+            from reliquary.environment.agentic_swe import bridged_source_for as open_bridged
+
+        bridged = open_bridged(source, split, bridge)
+        spec, profile, interaction, environment = None, None, "signed_bridged", None
+        length_of = lambda _split: len(bridged)  # noqa: E731
+    elif source == SWE_SOURCE:
+        from reliquary.environment import bridged_swe
+
+        spec, profile, interaction, environment = None, None, "swe", None
+        length_of = bridged_swe.split_length
+    else:
+        spec = _catalog_spec(source)
+        profile = ENVIRONMENT_CATALOG.get(source)
+        interaction = "episode" if spec.interaction_mode == "episode" else INTERACTION
+        environment, length_of = None, None
     split = split or RL_SPLIT
     directory = _empty_directory(out)
-    environment = open_environment(source, split)
-    length = len(environment)
+    if environment is None and length_of is None:
+        environment = open_environment(source, split)
+    length = len(environment) if length_of is None else length_of(split)
     high = length if count is None else start + count
     if high > length:
         raise ValueError(f"[{start}, {high}) runs past {source!r}:{split} ({length} rows)")
@@ -415,24 +577,38 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
                                                        sample, seed))
     prompts, grading = [], []
     for ordinal, index in enumerate(indices):
-        problem = environment.get_problem(index)
-        prompt = problem.get("prompt") if isinstance(problem, dict) else None
-        if not isinstance(prompt, str) or not prompt:
-            raise ValueError(f"{source!r} row {index} has no prompt")
         problem_id = f"{set_id}-{ordinal:06d}"
-        prompts.append({"problem_id": problem_id, "env": source, "set_id": set_id,
-                        "interaction": INTERACTION,
-                        "messages": [{"role": "user", "content": prompt}]})
-        grading.append({"problem_id": problem_id, "source": source, "split": split,
-                        "source_index": index, "prompt_sha256": prompt_sha256(prompt)})
+        if interaction == INTERACTION:
+            from reliquary.eval.protocol import digest
+            problem = environment.get_problem(index)
+            prompt = problem.get("prompt") if isinstance(problem, dict) else None
+            if not isinstance(prompt, str) or not prompt:
+                raise ValueError(f"{source!r} row {index} has no prompt")
+            prompts.append({"problem_id": problem_id, "env": source, "set_id": set_id,
+                            "interaction": INTERACTION,
+                            "messages": [{"role": "user", "content": prompt}]})
+            grading.append({"problem_id": problem_id, "source": source, "split": split,
+                            "source_index": index, "prompt_sha256": prompt_sha256(prompt),
+                            "reference_sha256": digest(problem)})
+            continue
+        # A reference: the task is rebuilt from (split, index) by whoever runs it, and
+        # must carry this id. `grading.jsonl` holds the same row.
+        instance_id = (bridged_swe.instance_id_of(split, index) if interaction == "swe"
+                       else bridged.instance_id(index) if bridged is not None
+                       else str(environment.get_task(index).id))
+        if not instance_id:
+            raise ValueError(f"{source!r}:{split} row {index} has no instance id")
+        row = {"problem_id": problem_id, "interaction": interaction, "split": split,
+               "source_index": index, "instance_id": instance_id}
+        prompts.append({**row, "env": source, "set_id": set_id})
+        grading.append(row)
     overlap = range_overlaps(source, split, start, high)
     overlap["note"] = (None if overlap["disjoint"] else
                        "rows of this set were eligible for training (see rl and corpus): "
                        "scores of models Reliquary trained on them may be inflated")
-    profile = ENVIRONMENT_CATALOG[source]
     card = {
         "schema": SET_SCHEMA, "set_id": set_id, "env": source, "source": source,
-        "source_kind": "catalog", "interaction": INTERACTION, "split": split,
+        "source_kind": "catalog", "interaction": interaction, "split": split,
         "index_range": [start, high], "source_length": length, "count": len(indices),
         "seed": seed, "selection": {"start": start, "count": count, "sample": sample,
                                     "seed": seed},
@@ -440,18 +616,125 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
                   "random.Random(seed).sample(index_range, sample); an order of N "
                   "problems takes the first N"),
         "created_at": clock(),
-        "prompt_template_id": getattr(profile.prompt_template, "template_id", None),
-        "default_max_new_tokens": profile.max_new_tokens,
+        "prompt_template_id": getattr(getattr(profile, "prompt_template", None),
+                                      "template_id", None),
+        "default_max_new_tokens": getattr(profile, "max_new_tokens", None),
         "environment_manifest_sha256": getattr(profile, "environment_manifest_sha256", None),
         "disjointness": overlap,
     }
-    return _write_set(directory, prompts, grading, card)
+    if interaction != INTERACTION:
+        card["renderer_id"] = getattr(spec, "renderer_id", None)
+        card["env_manifest"] = (bridged_swe.package_version() if interaction == "swe"
+                                else bridged.identity if bridged is not None
+                                else getattr(spec, "environment_manifest_sha256", None))
+    if bridged is not None:
+        card["bridge"] = {"options": dict(bridge["options"]),
+                          "image_lock_sha256": bridge["image_lock_sha256"],
+                          "options_sha256": bridged.options_sha256, "env_package": bridged.identity}
+    return _write_set(directory, prompts, grading, card, protocol=protocol,
+                      reference_only=interaction != INTERACTION)
+
+
+def build_episode_set(source: str, *, out: str | Path, interaction: str, count: int,
+                      seed: int, episode_config: dict | None = None, set_id: str | None = None,
+                      protocol: dict | None = None, open_episode=None) -> dict:
+    """Freeze supported episode tasks without opening a sandbox or loading a model."""
+    import asyncio
+    from dataclasses import asdict
+    from reliquary.eval.protocol import digest, telecom_renderer_sha256
+    from reliquary.eval import agentic
+    from reliquary.environment.agentic.chatml import CHATML_RENDERER_ID
+
+    if count <= 0:
+        raise ValueError("episode count must be positive")
+    config = dict(episode_config or {})
+    if interaction == "episode" and source == agentic.TELECOM_ENVIRONMENT:
+        from reliquary.environment.registry import get_environment_spec
+        manifest = get_environment_spec(source).environment_manifest_sha256
+        benchmark = (open_episode(source, config) if open_episode else
+                     agentic.load_telecom_benchmark(manifest))
+        environment, split = benchmark.environment, "benchmark"
+        renderer_id = CHATML_RENDERER_ID
+        renderer_sha = telecom_renderer_sha256()
+        def resolved(index):
+            task = environment.get_task(index)
+            public = task.to_public_wire()
+            return task.prompt, {"source_index": index, "task_id": task.id,
+                "reference_sha256": digest(asdict(task))}, public, None
+        length = len(environment)
+        extra = {}
+    elif interaction == "signed_episode":
+        from reliquary.environment.bridged_episode import BridgedEnvConfig, BridgedEpisodeSource
+        from reliquary.eval.signed_agentic import resolve_task
+        from reliquary.eval.protocol import renderer_sha256, SIGNED_SOURCE_POLICIES
+        from reliquary.environment.agentic_swe import harness_tools
+        required = {"package", "split", "options", "image_lock_sha256", "renderer_sha256",
+                    "tools_version", "tools", "max_turns", "source_policy_sha256"}
+        if set(config) != required:
+            raise ValueError("signed source requires the reviewed package/split/options/lock/renderer/tools")
+        policy = SIGNED_SOURCE_POLICIES.get((config["package"], config["split"]))
+        if (policy is None or config["source_policy_sha256"] != policy
+                or (protocol or {}).get("data", {}).get("environment.toml") != policy):
+            raise ValueError("signed source requires its reviewed declared turn policy")
+        bridge = BridgedEnvConfig(source, config["package"], config["split"],
+                                  config["options"], config["image_lock_sha256"])
+        environment = open_episode(source, config) if open_episode else BridgedEpisodeSource(bridge)
+        if (type(config["max_turns"]) is not int
+                or not 1 <= config["max_turns"] <= 40):
+            raise ValueError("signed source turn bound is unsupported")
+        manifest, split = environment.manifest_sha256(), config["split"]
+        renderer_id, renderer_sha = "renderers:qwen38@0.1.11", config["renderer_sha256"]
+        if renderer_sha != renderer_sha256():
+            raise ValueError("reviewed renderer differs from the installed source")
+        def resolved(index):
+            result = asyncio.run(resolve_task(environment, index))
+            return environment.prompt(index), result, None, result["task"]["image"]
+        length = len(environment)
+        extra = {"harness_max_turns": config["max_turns"], "signed_episode": {"package": config["package"], "options": config["options"],
+                 "image_lock_sha256": environment.lock_sha256, "env_package": environment.identity,
+                 "env_options_sha256": environment.options_sha256, "tools_version": config["tools_version"],
+                 "tools": config["tools"], "renderer_id": renderer_id,
+                 "source_policy_sha256": policy}}
+    else:
+        raise ValueError("unsupported episode source; no split or harness fallback")
+    if count > length:
+        raise ValueError("episode count exceeds the actual source")
+    set_id = validated_set_id(set_id or f"{source.replace('_', '-')}-{split}-s{seed}-n{count}")
+    prompts, grading, images, tools = [], [], set(), None
+    for ordinal, index in enumerate(random.Random(seed).sample(range(length), count)):
+        prompt, reference, public, image = resolved(index)
+        problem_id = f"{set_id}-{ordinal:06d}"
+        task_tools = public["tools"] if public is not None else list(harness_tools(config["tools"]))
+        if tools is not None and tools != task_tools:
+            raise ValueError("one frozen episode set must use one exact tool schema")
+        tools = task_tools
+        if image is not None:
+            image_pin = re.search(r"(?:^|@)sha256:([0-9a-f]{64})\Z", image)
+            if image_pin is None:
+                raise ValueError("episode runtime image requires an exact digest")
+            images.add(image_pin[1])
+        prompts.append({"problem_id": problem_id, "env": source, "set_id": set_id,
+            "interaction": interaction, "messages": [{"role": "user", "content": prompt}],
+            "source_index": index, **({"episode_task": public} if public is not None else {})})
+        grading.append({"problem_id": problem_id, "source": source, "split": split,
+            "prompt_sha256": prompt_sha256(prompt), **reference})
+    card = {"schema": SET_SCHEMA, "set_id": set_id, "env": source, "source": source,
+        "source_kind": interaction, "interaction": interaction, "split": split, "count": count,
+        "seed": seed, "created_at": time.time(), "source_length": length,
+        "default_max_new_tokens": 4096,
+        "environment_manifest_sha256": manifest, "disjointness": {"disjoint": None},
+        "episode": {"renderer_id": renderer_id, "renderer_sha256": renderer_sha,
+            "tools_sha256": digest(tools), "runtime_image_sha256": next(iter(images)) if len(images) == 1 else None},
+        **extra}
+    return _write_set(_empty_directory(out), prompts, grading, card, protocol=protocol)
 
 
 __all__ = [
     "CORPUS_RANGES",
     "HELD_OUT",
     "HeldOut",
+    "INTERACTIONS",
+    "SWE_SOURCE",
     "CONTAMINATION_NOTES",
     "RL_OVERLAP_RULED",
     "SOURCE_LINEAGE",
@@ -460,11 +743,14 @@ __all__ = [
     "UsedRange",
     "build_set",
     "build_source_set",
+    "build_episode_set",
     "range_overlaps",
     "select_indices",
     "open_source",
     "overlaps",
     "prompt_sha256",
+    "CORPUS_SERVABLE_RANGES",
+    "RL_ONLY_RANGES",
     "refuse_held_out_overlap",
     "rl_ranges",
     "validated_set_id",

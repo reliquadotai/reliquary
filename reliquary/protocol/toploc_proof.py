@@ -142,3 +142,25 @@ def completion_proofs_b64(
     rows = hidden[prompt_length - 1 : total_length - 1]
     proofs = build_chunk_proofs(rows, chunk_tokens=chunk_tokens, topk=topk)
     return [base64.b64encode(proof).decode() for proof in proofs]
+
+
+def span_proofs_b64(
+    hidden: torch.Tensor,
+    spans: Sequence[tuple[int, int]],
+    *,
+    chunk_tokens: int,
+    topk: int,
+    min_chunk_tokens: int = MIN_CHUNK_TOKENS,
+) -> list[str]:
+    """Wire-ready proofs of a signed episode from one full-sequence forward. Each model span
+    ``[start, end)`` is proven over rows ``start - 1 .. end - 2`` (the rows that drew its tokens) and
+    the span lists are concatenated in span order, as ``corpus_audit.trajectory_chunk_scores`` reads them."""
+    proofs: list[str] = []
+    for start, end in spans:
+        if not 0 < start < end <= hidden.shape[0]:
+            raise ValueError(f"span [{start}, {end}) has no rows in {hidden.shape[0]}")
+        rows = hidden[start - 1 : end - 1]
+        proofs += [base64.b64encode(proof).decode()
+                   for proof in build_span_proofs(rows, chunk_tokens=chunk_tokens, topk=topk,
+                                                  min_chunk_tokens=min_chunk_tokens)]
+    return proofs

@@ -462,20 +462,17 @@ def test_a_cached_grade_of_a_quarantined_executor_is_dropped():
 
 
 def test_settlement_waits_for_the_grade():
-    from reliquary.validator.corpus_settlement import CorpusSettler
-    from tests.unit.test_corpus_settlement import _Archives
+    from tests.unit.test_corpus_settlement import RECEIVED, _Archives, _settler
     from tests.unit.test_corpus_settlement import _Records as _SettleRecords
 
-    verdict = {"passed": True, "hotkey": "5Hot", "token_count": 10}
+    verdict = {"passed": True, "hotkey": "5Hot", "token_count": 10, "received_at": RECEIVED}
     records = _SettleRecords({SID: verdict, "b" * 64: dict(verdict)})
     graded = {"b" * 64}
 
     async def ready(ids):
         return {s for s in ids if s in graded}
 
-    settler = CorpusSettler(task_id="t", job_id="j", cap=0.1, records=records,
-                            archives=_Archives(other_max=None), ready=ready,
-                            advance_every_seconds=0.0)
+    settler = _settler(records, _Archives(), ready=ready)
     asyncio.run(settler.settle_once())
     assert records.state["settled"] == ["b" * 64]
     graded.add(SID)
@@ -484,23 +481,23 @@ def test_settlement_waits_for_the_grade():
 
 
 def test_a_void_landing_before_payment_is_never_paid():
-    from reliquary.validator.corpus_settlement import CorpusSettler
-    from tests.unit.test_corpus_settlement import _Archives
+    from tests.unit.test_corpus_settlement import RECEIVED, _Archives, _settler
     from tests.unit.test_corpus_settlement import _Records as _SettleRecords
 
     class _Voiding(_SettleRecords):
         async def list_voided_ids(self, job_id):
             return [SID]
 
-    records = _Voiding({SID: {"passed": True, "hotkey": "5Hot", "token_count": 10},
-                        "b" * 64: {"passed": True, "hotkey": "5Other", "token_count": 10}})
+    records = _Voiding({SID: {"passed": True, "hotkey": "5Hot", "token_count": 10,
+                              "received_at": RECEIVED},
+                        "b" * 64: {"passed": True, "hotkey": "5Other", "token_count": 10,
+                                   "received_at": RECEIVED}})
 
     async def ready(ids):
         return set(ids)
 
-    archives = _Archives(other_max=None)
-    settler = CorpusSettler(task_id="t", job_id="j", cap=0.1, records=records,
-                            archives=archives, ready=ready)
+    archives = _Archives()
+    settler = _settler(records, archives, ready=ready)
     asyncio.run(settler.settle_once())
     (archive,) = archives.written.values()
     assert archive["rewards_by_hotkey"] == {"5Other": pytest.approx(0.1)}
@@ -1187,3 +1184,41 @@ def test_an_uncertified_replay_without_any_vote_voids_unpaid():
     assert doc["replay"]["status"] == "uncertified" and doc["replay_certified"] is False
     assert records.voided[SID]["reason"] == "replay_unjudgeable" and voided == [SID]
     assert records.voided[SID]["graded_by"] == [] and states.states == {}
+
+
+def test_the_rescan_grades_the_oldest_arrivals_first():
+    """A backlog relisted after a restart is graded by arrival, not by id: a
+    period settles once all of it is graded, so an id-ordered backlog larger
+    than the grading rate never lets any period close."""
+    records, dispatcher = _Records(), _Dispatcher(FAILED, CERTIFIED)
+    arrivals = {"c" * 64: 100.0, "a" * 64: 300.0, "b" * 64: 200.0}
+    records.submissions = {sid: {**_record(), "received_at": at} for sid, at in arrivals.items()}
+    grader = CorpusGrader(job=_job(fraction=0.0), records=records, dispatcher=dispatcher,
+                          renderer=R, source=SweSource([("i0", "p"), ("repo__x.1", "fix it"),
+                                                        ("i2", "q")]),
+                          params=AuditParams(), clock=lambda: 1000.0, concurrency=1)
+
+    async def run():
+        await grader.rescan_once()
+        await grader.drain()
+
+    asyncio.run(run())
+    graded = [item["submission_id"] for item in dispatcher.items if item["mode"] == "grade"]
+    assert graded == sorted(arrivals, key=arrivals.get)
+
+
+def test_the_grade_lease_cap_follows_its_setting():
+    """Read once at import: checked in a fresh interpreter."""
+    import os
+    import subprocess
+    import sys
+
+    code = ("from reliquary.validator import corpus_grade_remote as g; "
+            "print(g.MAX_LEASES_PER_EXECUTOR)")
+    def cap(value):
+        env = {**os.environ, "RELIQUARY_CORPUS_GRADE_MAX_LEASES_PER_EXECUTOR": value}
+        return subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                              text=True)
+
+    assert cap("12").stdout.strip() == "12"
+    assert cap("500").returncode != 0  # out of bounds: refused at start, as every bound
