@@ -390,10 +390,14 @@ class AsyncTrainerConfig:
     poll_s: float = 0.5                      # while the batch is not full
     audits_per_step: int = 8                 # out-of-zone audits judged before each step (``trainer.audits``)
     audit_budget_s: float = 120.0            # their time budget per round; waiting for a batch runs more rounds
+    prefetch: bool = False                   # take the next batch while this one trains (when enough is queued)
+    report_workers: int = 1                  # report_training calls in flight at once
 
     def __post_init__(self) -> None:
         if self.batch_groups < 1 or (self.hf_backup_every or 1) < 1 or self.max_attempts < 1:
             raise ValueError("batch_groups, hf_backup_every and max_attempts must be positive")
+        if self.report_workers < 1:
+            raise ValueError("report_workers must be positive")
         if self.audits_per_step < 0 or self.audit_budget_s < 0:
             raise ValueError("audits_per_step and audit_budget_s must be non-negative")
         if self.steps_per_checkpoint != 1:
@@ -425,6 +429,11 @@ class AsyncTrainer:
         self.audits = audits                    # trainer.audits.TrainerAudits: out-of-zone audits on this model
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ckpt-publish")
         self._pending: Future | None = None
+        self._fetcher = ThreadPoolExecutor(max_workers=1, thread_name_prefix="batch-prefetch")
+        self._prefetched: Future | None = None
+        self._uniforms: dict[str, list[list[float]]] = {}     # lease_id -> its rollouts' uniforms (prefetched)
+        self._reporter = (ThreadPoolExecutor(max_workers=config.report_workers, thread_name_prefix="report")
+                          if config.report_workers > 1 else None)
         self.since_checkpoint = 0
         self.published: list[int] = []
         self.last_step: dict = {}
@@ -473,6 +482,9 @@ class AsyncTrainer:
             self.wait_published()
         finally:
             self._executor.shutdown(wait=True)
+            self._fetcher.shutdown(wait=True)        # what it took stays taken: the next start requeues it
+            if self._reporter is not None:
+                self._reporter.shutdown(wait=True)
 
     # --- batch ---------------------------------------------------------------------------------------------
     def _report_untrained(self, groups, failure_class=None) -> None:
@@ -505,10 +517,13 @@ class AsyncTrainer:
             self._report_untrained(exhausted)
             dropped += len(exhausted)
 
-    def assemble(self) -> list[SubmittedGroup]:
-        """``batch_groups`` groups in arrival order; waits until the batch is full, judging queued audits meanwhile."""
-        taken: list[SubmittedGroup] = []
+    def assemble(self, held: list[SubmittedGroup] | None = None) -> list[SubmittedGroup]:
+        """``batch_groups`` groups in arrival order (after ``held``, already taken); waits until the batch is full,
+        judging queued audits meanwhile."""
+        taken: list[SubmittedGroup] = list(held or [])
         while True:
+            if len(taken) >= self.config.batch_groups:
+                return taken
             taken += self.buffer.take(self.config.batch_groups - len(taken))
             if len(taken) >= self.config.batch_groups:
                 return taken
@@ -521,19 +536,66 @@ class AsyncTrainer:
             return 0
         return self.audits.run(self.model, limit=self.config.audits_per_step, budget_s=self.config.audit_budget_s)
 
+    # --- prefetch ------------------------------------------------------------------------------------------
+    def _start_prefetch(self) -> None:
+        """Take the next batch in the background while this one trains, only when a full batch is already queued:
+        a short take would start the controller's starvation clock while the trainer is busy."""
+        if not self.config.prefetch or self._prefetched is not None:
+            return
+        depth = getattr(self.buffer, "depth", None)
+        if depth is None:
+            return
+        self._prefetched = self._fetcher.submit(self._prefetch_job, depth)
+
+    def _prefetch_job(self, depth) -> list[SubmittedGroup]:
+        started = time.monotonic()
+        if sum(depth().values()) < self.config.batch_groups:
+            return []
+        taken = self.buffer.take(self.config.batch_groups)
+        fetched = time.monotonic()
+        # the lease uniforms depend on the leases only, not on the weights: computed here too
+        self._uniforms.update(zip((g.lease_id for g in taken), batch_uniforms(taken)))
+        logger.info("next batch prefetched: %d groups in %.1fs, uniforms in %.1fs", len(taken), fetched - started,
+                    time.monotonic() - fetched)
+        return taken
+
+    def _collect_prefetch(self) -> list[SubmittedGroup] | None:
+        """The groups the prefetch took (None: nothing held, or the take failed and may have half-happened)."""
+        if self._prefetched is None:
+            return None
+        pending, self._prefetched = self._prefetched, None
+        try:
+            return pending.result()
+        except Exception:  # noqa: BLE001 - the step takes its batch itself after a requeue
+            logger.exception("batch prefetch failed")
+            return None
+
     # --- step ----------------------------------------------------------------------------------------------
     def run_once(self) -> str:
         began = self._clock()
         telemetry.hold()                # train_step's row and this step's timings go to wandb as one row
-        self.buffer.requeue()           # between steps the trainer holds nothing: a take whose answer was lost
+        held = self._collect_prefetch()
+        if held is None:
+            self.buffer.requeue()       # between steps the trainer holds nothing: a take whose answer was lost
+            held = []
         dropped = self.drop_stale()
+        below = self.version - self.config.max_lag
+        stale = [g for g in held if g.checkpoint < below]
+        if stale:                       # prefetched one checkpoint ago: past the max lag now
+            self._report_untrained(stale)
+            dropped += len(stale)
+            held = [g for g in held if g.checkpoint >= below]
         exhausted = self.drop_exhausted()
         self.run_audits()                       # bounded: audits progress even when batches are always full
-        submitted = self.assemble()
+        submitted = self.assemble(held)
         started = self._clock()
         _reset_peak_memory()
         batch, slot = [], 0
-        uniforms = batch_uniforms(submitted)
+        missing = [g for g in submitted if g.lease_id not in self._uniforms]
+        self._uniforms.update(zip((g.lease_id for g in missing), batch_uniforms(missing)))
+        uniforms = [self._uniforms.pop(g.lease_id) for g in submitted]
+        self._uniforms.clear()          # dropped groups' (stale, released): never trained under these leases
+        self._start_prefetch()
         for i, group in enumerate(submitted):
             batch.append(training_group(group, slot0=slot, index=i, uniforms=uniforms[i]))
             slot += len(group.completions)
@@ -564,6 +626,9 @@ class AsyncTrainer:
             # Nothing reported: the groups go back (each hand-out counted), behind the fresh ones and one per batch.
             logger.exception("async train step raised; %d groups back to the buffer", len(submitted))
             self.buffer.release([g.lease_id for g in submitted])
+            prefetched = self._collect_prefetch()
+            if prefetched:
+                self.buffer.release([g.lease_id for g in prefetched])
             raise
         trained = self._clock()
         self.steps += 1
@@ -600,8 +665,10 @@ class AsyncTrainer:
         return "trained"
 
     def _report(self, submitted: list[SubmittedGroup], gate: DrawGate) -> dict[str, int]:
-        """``report_training`` for every group of the step; returns the matched tokens trained per env."""
+        """``report_training`` for every group of the step (``report_workers`` at once); returns the matched tokens
+        trained per env."""
         trained: dict[str, int] = {}
+        calls = []
         slot = 0
         for g, group in enumerate(submitted):
             slots = range(slot, slot + len(group.completions))
@@ -609,13 +676,23 @@ class AsyncTrainer:
             match = [gate.rate(s) for s in slots]
             if gate.accepted is not None and gate.accepted[g]:
                 matched = [gate.tallies[s][3] if gate.admitted[s] else 0 for s in slots]
-                self.submissions.report_training(group.lease_id, rollout_match=match, accepted=True,
-                                                 matched_tokens=matched, judged=True,
-                                                 substitutions=[gate.substitutions[s] for s in slots])
+                calls.append(dict(lease_id=group.lease_id, rollout_match=match, accepted=True,
+                                  matched_tokens=matched, judged=True,
+                                  substitutions=[gate.substitutions[s] for s in slots]))
                 trained[group.environment] = trained.get(group.environment, 0) + sum(matched)
                 continue
-            self.submissions.report_training(group.lease_id, rollout_match=match, accepted=False,
-                                             judged=any(gate.forwarded[s] for s in slots))
+            calls.append(dict(lease_id=group.lease_id, rollout_match=match, accepted=False,
+                              judged=any(gate.forwarded[s] for s in slots)))
+        started = time.monotonic()
+        if self._reporter is None:
+            for call in calls:
+                self.submissions.report_training(call.pop("lease_id"), **call)
+        else:
+            futures = [self._reporter.submit(self.submissions.report_training, call.pop("lease_id"), **call)
+                       for call in calls]
+            for future in futures:
+                future.result()
+        logger.info("%d groups reported in %.1fs", len(calls), time.monotonic() - started)
         return trained
 
 

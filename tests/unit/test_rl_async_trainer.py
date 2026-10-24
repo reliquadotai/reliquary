@@ -59,7 +59,8 @@ class Subs:
         self.buffer, self.reports = buffer, {}
 
     def report_training(self, lease_id, **kw):
-        assert self.buffer._remove(lease_id)
+        with self.buffer.book.transaction():           # the controller's report is one transaction too
+            assert self.buffer._remove(lease_id)
         self.reports[lease_id] = kw
 
 
@@ -657,3 +658,55 @@ def test_the_fused_head_takes_its_draws_through_fsdp_as_one_object(monkeypatch):
     head = distributed.FusedLogprobHead(4, 5, bias=False)
     head(torch.zeros(3, 4), torch.zeros(3, dtype=torch.long), distributed.OpaqueArg(draws))
     assert captured["draws"] is draws
+
+
+# --- prefetch and parallel reports -------------------------------------------------------------------------------
+def test_the_next_batch_is_taken_while_this_one_trains_and_trained_next():
+    model, book = _Model(), Book(latest=3)
+    buffer = TrainingBuffer(book)
+    for i, lease in enumerate(["a", "b", "c", "d", "e"]):
+        buffer.push(submitted(model, lease, arrived=float(i)))
+    trainer, subs, _ = loop(model, book, buffer, prefetch=True, report_workers=4)
+    assert trainer.run_once() == "trained"
+    assert set(subs.reports) == {"a", "b"}
+    trainer._prefetched.result()
+    assert buffer.depth() == {"math": 1}                    # c and d taken during the step, e still queued
+    assert trainer.run_once() == "trained"                   # no requeue: the prefetched batch is trained
+    assert set(subs.reports) == {"a", "b", "c", "d"}
+    trainer.close()
+    assert buffer.depth() == {"math": 1}                    # e: not enough queued for a full batch, no prefetch
+
+
+def test_a_prefetched_group_past_the_max_lag_is_dropped_unpaid():
+    model, book = _Model(), Book(latest=10)
+    buffer = TrainingBuffer(book)
+    for i, lease in enumerate(["a", "b"]):
+        buffer.push(submitted(model, lease, k=10, arrived=float(i)))
+    buffer.push(submitted(model, "old", k=3, arrived=2.0))  # within max_lag 8 of 10, past it once 12 is out
+    buffer.push(submitted(model, "new", k=10, arrived=3.0))
+    trainer, subs, _ = loop(model, book, buffer, prefetch=True, max_lag=8)
+    assert trainer.run_once() == "trained"
+    trainer.version += 1                                     # one more checkpoint out meanwhile
+    buffer.push(submitted(model, "next", k=11, arrived=4.0))
+    assert trainer.run_once() == "trained"
+    trainer.close()
+    assert subs.reports["old"]["accepted"] is False and subs.reports["old"]["judged"] is False
+    assert {"new", "next"} <= set(subs.reports)
+
+
+def test_a_failed_step_releases_the_prefetched_batch_too():
+    model, book = _Model(), Book(latest=3)
+    buffer = TrainingBuffer(book)
+    for i, lease in enumerate(["a", "b", "c", "d"]):
+        buffer.push(submitted(model, lease, arrived=float(i)))
+
+    def broken(*args, **kwargs):
+        trainer._prefetched.result()                        # the prefetch has taken c and d
+        raise RuntimeError("boom")
+
+    trainer, subs, _ = loop(model, book, buffer, prefetch=True)
+    trainer._train_step = broken
+    with pytest.raises(RuntimeError):
+        trainer.run_once()
+    trainer.close()
+    assert buffer.depth() == {"math": 4} and not subs.reports
