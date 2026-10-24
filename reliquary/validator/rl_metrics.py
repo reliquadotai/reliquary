@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ MAX_NAMED_CARDS = 9             # declared names are miner-chosen: past these, "
 BUCKETS = ("mixed", "undeclared", "other")
 CARD_WINDOW_MAX_S = 240.0       # the dashboard drops a card window longer than 300 s
 SHARE_WINDOW_S = 600.0          # trained-token shares: trailing, so a row between two trainer steps still has them
+RUNNING_INSTANCE_S = 1800.0     # a miner process with a tagged submission this recently counts in the fleet
 
 
 def card_class(name: str) -> str:
@@ -60,24 +62,33 @@ class CardFeed:
 
         start = min(now, max(self.since, now - CARD_WINDOW_MAX_S))
         rows = self.setups.rows()
-        out = card_metrics(rl, summarize(rows, now=now), now, start, self, instances=instance_classes(rows, now))
+        out = card_metrics(rl, summarize(rows, now=now), now, start, self, instances=instance_classes(rows, now),
+                           instance_gpus=instance_cards(rows, now))
         self.since = max(self.since, now)
         return out
 
 
-def instance_classes(rows: list[dict], now: float) -> dict[tuple[str, str], str]:
-    """``(hotkey, instance_id)`` -> the card class of that miner process's declared GPUs (``mixed`` if they differ),
-    over the setups seen in ``miner_setup.ACTIVE_WINDOW_S``; the latest report of an instance wins."""
+def instance_cards(rows: list[dict], now: float) -> dict[tuple[str, str], dict[str, str]]:
+    """``(hotkey, instance_id)`` -> ``{card key: card class}`` of that miner process's declared GPUs, over the setups
+    seen in ``miner_setup.ACTIVE_WINDOW_S``; the latest report of an instance wins. A card's key is its ``id_hash``,
+    so two processes sharing a card count it once."""
     from reliquary.validator.miner_setup import ACTIVE_WINDOW_S
 
-    out: dict[tuple[str, str], str] = {}
+    out: dict[tuple[str, str], dict[str, str]] = {}
     for row in sorted(rows, key=lambda r: r["received_at"]):
         if now - row["received_at"] > ACTIVE_WINDOW_S:
             continue
-        classes = {card_class(gpu["name"]) for gpu in row["report"].get("gpus", [])}
-        if classes:
-            out[(row["hotkey"], row["instance_id"])] = classes.pop() if len(classes) == 1 else "mixed"
+        gpus = row["report"].get("gpus", [])
+        cards = {gpu.get("id_hash") or f"{row['instance_id']}:{i}": card_class(gpu["name"]) for i, gpu in enumerate(gpus)}
+        if cards:
+            out[(row["hotkey"], row["instance_id"])] = cards
     return out
+
+
+def instance_classes(rows: list[dict], now: float) -> dict[tuple[str, str], str]:
+    """``(hotkey, instance_id)`` -> the card class of that miner process (``mixed`` if its GPUs differ)."""
+    return {k: (v.pop() if len(v) == 1 else "mixed")
+            for k, v in ((k, set(c.values())) for k, c in instance_cards(rows, now).items())}
 
 
 def _events(db: Any, since: float, now: float) -> list[tuple]:
@@ -92,31 +103,54 @@ def _events(db: Any, since: float, now: float) -> list[tuple]:
                       "WHERE e.at>=? AND e.at<? AND e.kind IN (?, ?)", (since, now, "trained", "untrained")).fetchall()
 
 
+def _running_instances(db: Any, since: float) -> dict[str, set[str]]:
+    """hotkey -> the instance ids its tagged submissions named since ``since``."""
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='rl_group_instances'").fetchone() is None:
+        return {}
+    out: dict[str, set[str]] = {}
+    for hotkey, instance in db.execute("SELECT DISTINCT hotkey, instance_id FROM rl_group_instances WHERE at>=?",
+                                       (since,)):
+        out.setdefault(hotkey, set()).add(instance)
+    return out
+
+
 def card_metrics(rl: Any, summary: list[dict], now: float, start: float, feed: CardFeed,
-                 instances: dict[tuple[str, str], str] | None = None) -> dict[str, float]:
+                 instances: dict[tuple[str, str], str] | None = None,
+                 instance_gpus: dict[tuple[str, str], dict[str, str]] | None = None) -> dict[str, float]:
     """Per declared card model (``miner_setup.summarize``): the active fleet now, and how the trainer judged its
-    groups in ``[start, now)``. A hotkey whose cards differ is ``mixed``, one that declared nothing ``undeclared``.
+    groups in ``[start, now)``. An active hotkey's GPUs are those of its processes that submitted a tagged group in
+    ``RUNNING_INSTANCE_S`` (``instance_gpus``, from ``instance_cards``), else all it declared; each card counts
+    under its own model, and the hotkey as a miner of each. One that declared nothing is ``undeclared``.
     A group its miner tagged with a declared ``instance_id`` (``instances``, from ``instance_classes``) counts for
-    that process's cards instead of its hotkey's."""
-    instances = instances or {}
+    that process's cards instead of its hotkey's (``mixed`` when the untagged hotkey's cards differ)."""
+    instances, instance_gpus = instances or {}, instance_gpus or {}
+    declared: dict[str, Counter] = {}
     cards = {}
     for line in summary:
         classes = {card_class(n) for n in line["gpus"]}
         cards[line["hotkey"]] = (classes.pop() if len(classes) == 1 else "mixed" if classes else "undeclared",
                                  int(line["gpu_count"]))
+        declared[line["hotkey"]] = Counter()
+        for name, n in line["gpus"].items():
+            declared[line["hotkey"]][card_class(name)] += int(n)
     db = rl.book.db
     with rl.book.lock:
         active = [h for (h,) in db.execute("SELECT DISTINCT hotkey FROM rl_leases WHERE issued_at>=?",
                                            (now - ACTIVE_MINER_S,))]
         events = _events(db, min(start, now - SHARE_WINDOW_S), now)
+        running = _running_instances(db, now - RUNNING_INSTANCE_S)
     fleet: dict[str, list[int]] = {}
     for hotkey in active:
-        cls, gpus = cards.get(hotkey, ("undeclared", 0))
-        miners_gpus = fleet.setdefault(cls, [0, 0])
-        miners_gpus[0] += 1
-        miners_gpus[1] += gpus
+        seen: dict[str, str] = {}
+        for instance in running.get(hotkey, ()):
+            seen.update(instance_gpus.get((hotkey, instance), {}))
+        gpus = Counter(seen.values()) if seen else declared.get(hotkey) or Counter({"undeclared": 0})
+        for cls, n in gpus.items():
+            miners_gpus = fleet.setdefault(cls, [0, 0])
+            miners_gpus[0] += 1
+            miners_gpus[1] += n
     feed._admit([c for c, _ in sorted(fleet.items(), key=lambda kv: (-kv[1][1], -kv[1][0], kv[0]))])
-    feed._admit(sorted({c for c in instances.values() if c != "mixed"}))   # a mixed hotkey's own card kinds
+    feed._admit(sorted({c for c in instances.values() if c != "mixed"}))   # a mixed process's own card kinds
 
     def bucket(cls: str) -> str:
         return cls if cls in feed.named or cls in BUCKETS else "other"
@@ -240,4 +274,5 @@ def controller_metrics(rl: Any, now: float, window_s: float = METRICS_EVERY_S,
     return out
 
 
-__all__ = ["METRICS_EVERY_S", "CardFeed", "card_class", "card_metrics", "controller_metrics", "instance_classes"]
+__all__ = ["METRICS_EVERY_S", "CardFeed", "card_class", "card_metrics", "controller_metrics", "instance_cards",
+           "instance_classes"]
