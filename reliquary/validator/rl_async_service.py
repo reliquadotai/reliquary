@@ -93,6 +93,11 @@ CARRY_PARAM, CARRY_ENV = "rl_pay_carry_periods", "RELIQUARY_RL_PAY_CARRY_PERIODS
 LANE_MAX_PARAM, LANE_MAX_ENV = "rl_lane_max_batches", "RELIQUARY_RL_LANE_MAX_BATCHES"         # per-env queue max
 BATCH_FACTOR_PARAM, BATCH_FACTOR_ENV = "rl_batch_env_factor", "RELIQUARY_RL_BATCH_ENV_FACTOR"  # per-env batch cap
 BATCH_GROUPS_PARAM, BATCH_GROUPS_ENV = "rl_batch_groups", "RELIQUARY_RL_BATCH_GROUPS"         # the trainer's batch
+# Level-mode tuning: AsyncPriceParams field f is read from RELIQUARY_RL_PRICE_<F> (env) or rl_price_<f> (registry).
+PRICE_TUNING_FIELDS = (
+    "pay_target", "level_rise_h", "level_decay_h", "level_band", "oversupply_rise_h", "oversupply_decay_h",
+    "oversupply_share", "weight_rise_h", "weight_decay_h", "weight_low", "weight_high", "supply_halflife_s",
+    "mix_halflife_s")
 DEFAULT_LEASE_TOKENS_PER_S = 20.0      # placeholder: the design's "3090 at max length", measured at qualification
 DEFAULT_LEASE_MARGIN = 2.0
 
@@ -263,9 +268,11 @@ def rl_async_settings(entry, cap: float, *, run: str | None = None,
         raise ValueError(f"cooldown overrides for envs outside the env_split: {unknown}")
     max_pending, lane_reserve = _operator_overrides(params, os.environ if environ is None else environ)
     operator_env = os.environ if environ is None else environ
+    tuning = {f: float(v) for f in PRICE_TUNING_FIELDS
+              if (v := _switch(params, operator_env, f"rl_price_{f}", f"RELIQUARY_RL_PRICE_{f.upper()}")) is not None}
     price = AsyncPriceParams(**{key: cast(params[name]) for key, name, cast in (
         ("tick_s", PRICE_TICK_PARAM, float),) if name in params},
-        mode=str(_switch(params, operator_env, PRICE_MODE_PARAM, PRICE_MODE_ENV, "per_env")))
+        mode=str(_switch(params, operator_env, PRICE_MODE_PARAM, PRICE_MODE_ENV, "per_env")), **tuning)
     lane_max = _switch(params, operator_env, LANE_MAX_PARAM, LANE_MAX_ENV)
     batch_factor = _switch(params, operator_env, BATCH_FACTOR_PARAM, BATCH_FACTOR_ENV)
     switches = dict(
@@ -871,6 +878,8 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
                                       "max_pending_groups": settings.max_pending_groups,
                                       "lane_reserve": settings.lane_reserves(),
                                       "price_mode": getattr(getattr(settings, "price", None), "mode", "per_env"),
+                                      "price_tuning": {f: getattr(getattr(settings, "price", None), f, None)
+                                                       for f in PRICE_TUNING_FIELDS},
                                       **{key: getattr(settings, key, None) for key in (
                                           "pay_carry_periods", "lane_max_batches", "batch_env_factor")}},
                    role="controller", version=settings.run)
