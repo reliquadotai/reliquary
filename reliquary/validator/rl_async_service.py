@@ -86,6 +86,7 @@ LANE_RESERVE_PARAM = "rl_lane_reserve"          # share of the global cap kept p
 # Operator overrides read at start (a controller restart applies them; no registry change).
 MAX_PENDING_ENV = "RELIQUARY_RL_MAX_PENDING_GROUPS"
 LANE_RESERVE_ENV = "RELIQUARY_RL_LANE_RESERVE"
+LEASE_MARGIN_ENV = "RELIQUARY_RL_LEASE_EXPIRY_MARGIN"   # the operator's lease margin, over the registry's
 DEFAULT_LEASE_TOKENS_PER_S = 20.0      # placeholder: the design's "3090 at max length", measured at qualification
 DEFAULT_LEASE_MARGIN = 2.0
 
@@ -221,6 +222,9 @@ def rl_async_settings(entry, cap: float, *, run: str | None = None,
     targets = {str(env): float(share) for env, share in entry.env_split.items() if float(share) > 0}
     speed = float(params.get(LEASE_SPEED_PARAM, DEFAULT_LEASE_TOKENS_PER_S))
     margin = float(params.get(LEASE_MARGIN_PARAM, DEFAULT_LEASE_MARGIN))
+    operator_env = os.environ if environ is None else environ
+    if str(operator_env.get(LEASE_MARGIN_ENV, "")).strip():
+        margin = float(operator_env[LEASE_MARGIN_ENV])
     blocks = episode_blocks(params, targets)
     policies = episode_policies(blocks)
     expiry = {env: (episode_lease_expiry_s(policies[env], reference_tokens_per_s=speed, margin=margin)

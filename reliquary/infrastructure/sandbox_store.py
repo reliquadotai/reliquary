@@ -50,7 +50,7 @@ MACHINE_PREFIX = "reliquary/sandbox/machines/"
 MACHINE_STATUSES = frozenset({"active", "draining", "revoked"})
 WRITE_ATTEMPTS = 5
 RETRY_BASE_S = 0.05
-READ_CONCURRENCY = 16
+READ_CONCURRENCY = 64
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 # scheme://host[:port]: a DNS name or IPv4 address, or a bracketed IPv6 literal; no
