@@ -679,11 +679,37 @@ def test_a_tagged_group_counts_for_its_miner_process_cards(tmp_path):
             rl.submissions.tag_instance(lease.lease_id, "M", instance)
         rl.submissions.report_training(lease.lease_id, rollout_match=[0.99] * 16, accepted=True,
                                        matched_tokens=[1] * 16)
+    setups.put("M", "f" * 16, int(now), now, {"gpus": [{"name": "NVIDIA B200", "id_hash": "4" * 16}]})   # idle
     row = controller_metrics(rl, time.time() + 1, cards=feed)
-    # The fleet is still per hotkey (mixed); each tagged group goes to its process's cards, the rest to the hotkey's.
-    assert row["cards/mixed/miners"] == 1 and row["cards/mixed/gpus"] == 2
+    # The fleet counts the cards of the processes that submitted, each under its model; never one "mixed" lump.
+    for model in ("h100-80gb-hbm3", "rtx-4090"):
+        assert row[f"cards/{model}/miners"] == 1 and row[f"cards/{model}/gpus"] == 1
+    assert row["cards/mixed/miners"] == 0 and row["cards/b200/gpus"] == 0
+    # Each tagged group goes to its process's cards, the rest to the hotkey's (mixed: its cards differ).
     assert row["cards/h100-80gb-hbm3/groups"] == 1 and row["cards/rtx-4090/groups"] == 1
     assert row["cards/mixed/groups"] == 2
+    rl.close()
+
+
+def test_an_untagged_hotkey_counts_every_card_it_declared_under_its_model(tmp_path):
+    import time
+
+    from reliquary.validator.miner_setup import MinerSetupStore
+    from reliquary.validator.rl_leases import LeaseRequest
+    from reliquary.validator.rl_metrics import CardFeed, controller_metrics
+
+    now = time.time()
+    setups = MinerSetupStore(tmp_path / "setups.sqlite3")
+    h200 = {"name": "NVIDIA H200"}
+    setups.put("M", "c" * 16, int(now), now, {"gpus": [{**h200, "id_hash": "1" * 16}, {**h200, "id_hash": "2" * 16}]})
+    setups.put("M", "d" * 16, int(now), now, {"gpus": [{"name": "NVIDIA B200", "id_hash": "3" * 16}]})
+    rl = components(tmp_path)
+    rl.book.adopt_checkpoint(0)
+    rl.book.grant([LeaseRequest("M", ENV, (3,), 0)])
+    row = controller_metrics(rl, time.time() + 1, cards=CardFeed(setups))
+    assert (row["cards/h200/miners"], row["cards/h200/gpus"]) == (1, 2)
+    assert (row["cards/b200/miners"], row["cards/b200/gpus"]) == (1, 1)
+    assert row["cards/mixed/gpus"] == 0
     rl.close()
 
 
