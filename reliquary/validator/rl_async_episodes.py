@@ -73,7 +73,7 @@ EPISODE_SESSION_SLACK_S = 300.0
 """Beyond the session's wall budget: an open waiting for a fleet slot, the image prepare, the transcript upload."""
 SESSION_MAINTAIN_SECONDS = 60.0
 RESTORE_ATTEMPTS = 3
-RESTORE_TIMEOUT_S = 60.0
+RESTORE_TIMEOUT_S = 900.0   # 17k sessions (4 days of SWE/TMax) took ~40 s at 64 reads; 60 s at 16 timed out
 RESTORE_BACKOFF_S = 5.0
 STOP_TIMEOUT_S = 10.0
 MEMORY_FLOOR_ENV = "RELIQUARY_RL_EPISODE_MEMORY_FLOOR_BYTES"
