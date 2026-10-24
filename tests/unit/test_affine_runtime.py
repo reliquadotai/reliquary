@@ -169,7 +169,8 @@ time.sleep(30)
         path = self.root / "config.affine-private.json"
         path.write_text(json.dumps(asdict(config), default=str))
         path.chmod(0o600)
-        (config.state_dir / "started").unlink()
+        # The budget may expire before the child writes its readiness marker.
+        (config.state_dir / "started").unlink(missing_ok=True)
         parent = subprocess.Popen([sys.executable, "-c",
             "import sys;from reliquary.integrations.affine import AffineRunner,load_config;"
             "AffineRunner(load_config(sys.argv[1])).run()", str(path)],
