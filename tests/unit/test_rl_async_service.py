@@ -733,6 +733,58 @@ def test_past_nine_named_cards_the_rest_is_other(tmp_path):
     rl.close()
 
 
+def _long_leases(rl, seconds=3.5 * 3600):
+    from dataclasses import replace
+
+    rl.book.config = replace(rl.book.config, expiry_s={ENV: seconds})   # the run's leases live 13107-20607 s
+
+
+def test_a_slow_card_holding_a_live_lease_stays_in_the_fleet_under_its_own_model(tmp_path):
+    import time
+
+    from reliquary.validator.miner_setup import MinerSetupStore
+    from reliquary.validator.rl_leases import LeaseRequest
+    from reliquary.validator.rl_metrics import CardFeed, controller_metrics
+
+    t0 = time.time()
+    setups = MinerSetupStore(tmp_path / "setups.sqlite3")
+    setups.put("M", "a" * 16, int(t0), t0, {"gpus": [{"name": "NVIDIA RTX A6000", "id_hash": "1" * 16}]})
+    setups.put("M", "h" * 16, int(t0), t0, {"gpus": [{"name": "NVIDIA H100 80GB HBM3", "id_hash": "2" * 16}]})
+    rl = components(tmp_path)
+    _long_leases(rl)
+    rl.book.adopt_checkpoint(0)
+    [done] = rl.book.grant([LeaseRequest("M", ENV, (3,), 0)])[0].leases
+    assert rl.submissions.submit(done.lease_id, "M", group(8))["verdict"] == "in_zone"
+    rl.submissions.tag_instance(done.lease_id, "M", "a" * 16)
+    rl.book.grant([LeaseRequest("M", ENV, (4,), 0)])                     # still generating, expires in 2 h 50
+    row = controller_metrics(rl, t0 + 2400, cards=CardFeed(setups))      # 40 min without a new lease
+    assert row["miners/active"] == 1
+    assert (row["cards/rtx-a6000/miners"], row["cards/rtx-a6000/gpus"]) == (1, 1)
+    assert row.get("cards/h100-80gb-hbm3/gpus", 0) == 0                  # its last delivery was the A6000's
+    rl.close()
+
+
+def test_a_hotkey_without_a_recent_or_live_lease_is_not_a_miner(tmp_path):
+    import time
+
+    from reliquary.validator.miner_setup import MinerSetupStore
+    from reliquary.validator.rl_leases import LeaseRequest
+    from reliquary.validator.rl_metrics import CardFeed, controller_metrics
+
+    t0 = time.time()
+    setups = MinerSetupStore(tmp_path / "setups.sqlite3")
+    setups.put("M", "a" * 16, int(t0), t0, {"gpus": [{"name": "NVIDIA RTX A6000", "id_hash": "1" * 16}]})
+    rl = components(tmp_path)
+    _long_leases(rl)
+    rl.book.adopt_checkpoint(0)
+    [done] = rl.book.grant([LeaseRequest("M", ENV, (3,), 0)])[0].leases
+    assert rl.submissions.submit(done.lease_id, "M", group(8))["verdict"] == "in_zone"   # submitted, not expired
+    rl.book.grant([LeaseRequest("M", ENV, (4,), 0)], now=t0 - 4 * 3600)  # open, expired 30 min ago, unswept
+    row = controller_metrics(rl, t0 + 1200, cards=CardFeed(setups))
+    assert row["miners/active"] == 0 and row.get("cards/rtx-a6000/miners", 0) == 0
+    rl.close()
+
+
 async def test_with_audits_on_the_trainer_the_validator_loop_never_concludes_them_itself(tmp_path):
     from reliquary.validator.rl_leases import LeaseRequest
 
