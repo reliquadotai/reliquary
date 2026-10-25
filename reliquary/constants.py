@@ -1573,8 +1573,9 @@ EMA_ALPHA = 2.0 / (72 + 1)  # ≈ 0.0274
 
 # A hotkey below this share of the miner total is ramped down and what it loses
 # is shared out among the miners above it: the floor decides who is paid, never
-# how much burns.
-_MIN_INCENTIVE_SHARE_RAW = _os.environ.get("RELIQUARY_MIN_INCENTIVE_SHARE", "0.02")
+# how much burns. Off by default: a floor cuts small GPUs out of emissions
+# entirely. A task can still declare its own.
+_MIN_INCENTIVE_SHARE_RAW = _os.environ.get("RELIQUARY_MIN_INCENTIVE_SHARE", "0.0")
 try:
     MIN_INCENTIVE_SHARE = float(_MIN_INCENTIVE_SHARE_RAW)
 except ValueError as _exc:
@@ -1592,7 +1593,7 @@ if not 0.0 <= MIN_INCENTIVE_SHARE < 1.0 or MIN_INCENTIVE_SHARE != MIN_INCENTIVE_
 # should not reward. `start == MIN_INCENTIVE_SHARE` degenerates to today's
 # cliff exactly.
 _MIN_INCENTIVE_RAMP_START_RAW = _os.environ.get(
-    "RELIQUARY_MIN_INCENTIVE_RAMP_START", "0.01"
+    "RELIQUARY_MIN_INCENTIVE_RAMP_START", "0.0"
 )
 try:
     MIN_INCENTIVE_RAMP_START = float(_MIN_INCENTIVE_RAMP_START_RAW)
