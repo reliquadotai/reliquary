@@ -127,6 +127,9 @@ RL_GOLDEN = {
 
 
 def test_rl_weights_are_unchanged_to_the_bit(monkeypatch):
+    # The golden was computed under the old 1%-2% protocol floor.
+    monkeypatch.setattr("reliquary.validator.weight_only.MIN_INCENTIVE_RAMP_START", 0.01)
+    monkeypatch.setattr("reliquary.validator.weight_only.MIN_INCENTIVE_SHARE", 0.02)
     result, submitted, asked = _run(monkeypatch, DECLARED)
     assert result is True
     rl = {hk: v for hk, v in submitted.items() if hk.startswith("rl-")}
