@@ -6,7 +6,8 @@ Each ``tick`` (idempotent, its state in one JSON file):
    ones missing samples after ``max_wait_s`` counted as failures (``--allow-incomplete``); once all are graded,
    stop its validator and rebuild the feed (``run_feed``), published when asked (public bucket and/or the summary
    of a W&B evaluation run, ``wandb_feed``). A validator found dead is
-   restarted.
+   restarted. Each graded job is closed (``tasks close``) and each abandoned one set to cap 0, so the next
+   checkpoint's jobs find their share of the pool free.
 2. Nothing served: the start checkpoint first (the baseline, and later the suite's sets it never ran), then the
    steps asked for (``steps``: exactly those, each for the sets it misses), else the NEWEST milestone backup
    (``<namespace>/<prefix>-step-<n>``, ``n`` a multiple of ``every``) past the last one taken. The ones in between
@@ -143,6 +144,7 @@ class Ports:
     alive: Callable[[int], bool]
     stop: Callable[[int], None]
     feed: Callable[[list[str], list[str]], dict]             # (checkpoint jobs, baseline jobs) -> summary
+    release: Callable[[str, bool], None]                     # (job, drained): close it, else cap 0
 
 
 class Scheduler:
@@ -224,6 +226,7 @@ class Scheduler:
                 continue
             cp["graded"].append(job)
             log.append(f"graded {job}")
+        self._release(cp, log, execute)
         if len(cp["graded"]) + len(cp["abandoned"]) < len(cp["jobs"]):
             pid = state["pid"]
             if pid is not None and not self.p.alive(pid):
@@ -240,6 +243,24 @@ class Scheduler:
         state["active"] = None
         self._feed(state, log, execute)
         return True
+
+    def _release(self, cp: dict, log: list[str], execute: bool) -> None:
+        """Free the pool share of the jobs done with: a failure is retried on the next tick."""
+        released = cp.setdefault("released", [])
+        for job in [*cp["graded"], *cp["abandoned"]]:
+            if job in released:
+                continue
+            drained = job in cp["graded"]
+            if not execute:
+                log.append(f"release {job} ({'close' if drained else 'cap 0'})")
+                continue
+            try:
+                self.p.release(job, drained)
+            except Exception as exc:                      # noqa: BLE001 - the registry may be briefly unreachable
+                log.append(f"release {job} failed, retried next tick: {exc}")
+                continue
+            released.append(job)
+            log.append(f"released {job}")
 
     def _feed(self, state: dict, log: list[str], execute: bool) -> None:
         cps = state["checkpoints"]
@@ -442,8 +463,14 @@ def live_ports(settings: Settings) -> Ports:
     def run(argv: list[str]) -> None:
         subprocess.run(argv, check=True)
 
+    def release(job: str, drained: bool) -> None:
+        # `tasks close` refuses a job not drained: an abandoned one only gives its share back.
+        run(["reliquary", "tasks", "close", "--task-id", job] if drained
+            else ["reliquary", "tasks", "set-cap", "--task-id", job, "--cap", "0"])
+
     return Ports(backups=repos.list_backups, revision=revision, fingerprint=fingerprint, job_exists=job_exists,
-                 drained=drained, run=run, grade=grade, start=start, alive=alive, stop=stop, feed=feed)
+                 drained=drained, run=run, grade=grade, start=start, alive=alive, stop=stop, feed=feed,
+                 release=release)
 
 
 __all__ = ["BASE", "DEFAULT_START", "Ports", "Scheduler", "Settings", "SuiteEntry", "job_id", "live_ports",

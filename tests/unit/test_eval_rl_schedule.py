@@ -22,6 +22,7 @@ class World:
         self.declared, self.drained, self.short = set(), set(), set()
         self.commands, self.graded, self.started, self.stopped, self.feeds = [], [], [], [], []
         self.dead = set()
+        self.released, self.release_fails = [], 0
         self.now = 1000.0
 
     def ports(self):
@@ -39,12 +40,19 @@ class World:
             self.started.append(command)
             return 100 + len(self.started)
 
+        def release(job, drained):
+            if self.release_fails:
+                self.release_fails -= 1
+                raise RuntimeError("registry unreachable")
+            self.released.append((job, drained))
+
         return Ports(backups=lambda: list(self.backups),
                      revision=lambda repo: None if repo in self.incomplete else "f" * 40,
                      fingerprint=lambda repo, rev: "a" * 64, job_exists=lambda job: job in self.declared,
                      drained=lambda job: job in self.drained, run=run, grade=grade, start=start,
                      alive=lambda pid: pid not in self.dead, stop=self.stopped.append,
-                     feed=lambda jobs, base: self.feeds.append((jobs, base)) or {"points": len(jobs)})
+                     feed=lambda jobs, base: self.feeds.append((jobs, base)) or {"points": len(jobs)},
+                     release=release)
 
 
 def scheduler(tmp_path, world, **overrides):
@@ -287,3 +295,23 @@ def test_steps_or_every_and_known_sets_only(tmp_path):
         scheduler(tmp_path, World(), every=None)
     with pytest.raises(ValueError, match="not in the suite"):
         scheduler(tmp_path, World(), only=("mmlu",))
+
+
+def test_jobs_done_with_give_their_pool_share_back(tmp_path):
+    world = World()
+    s = scheduler(tmp_path, world, baseline_model=None)
+    world.backups = [50]
+    s.tick(execute=True)
+    world.drained.add("eval-r7-s00050-aime")
+    world.release_fails = 1
+    assert any(line.startswith("release eval-r7-s00050-aime failed") for line in s.tick(execute=True))
+    assert not world.released                              # retried on the next tick
+    s.tick(execute=True)
+    assert world.released == [("eval-r7-s00050-aime", True)]
+    world.now += 3601                                      # gpqa never drains: abandoned, cap 0 only
+    lines = s.tick(execute=True)
+    assert world.released[-1] == ("eval-r7-s00050-gpqa", False) and "released eval-r7-s00050-gpqa" in lines
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert state["checkpoints"]["50"]["released"] == ["eval-r7-s00050-aime", "eval-r7-s00050-gpqa"]
+    s.tick(execute=True)
+    assert len(world.released) == 2                        # never released twice
