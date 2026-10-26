@@ -260,7 +260,8 @@ CREATE TABLE IF NOT EXISTS rl_prompt_scans(seq INTEGER PRIMARY KEY AUTOINCREMENT
     prompt_idx INTEGER NOT NULL, k INTEGER NOT NULL, rewards TEXT NOT NULL, verdict TEXT NOT NULL,
     first_scan INTEGER NOT NULL, at REAL NOT NULL, state TEXT, until_k INTEGER);
 CREATE TABLE IF NOT EXISTS rl_prompt_state(environment TEXT NOT NULL, prompt_idx INTEGER NOT NULL,
-    state TEXT NOT NULL, until_k INTEGER, seq INTEGER NOT NULL, PRIMARY KEY(environment, prompt_idx));
+    state TEXT NOT NULL, until_k INTEGER, seq INTEGER NOT NULL, start_k INTEGER, revised INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(environment, prompt_idx));
 CREATE INDEX IF NOT EXISTS rl_prompt_state_seq ON rl_prompt_state(seq);
 CREATE TABLE IF NOT EXISTS rl_hotkey_bans(hotkey TEXT PRIMARY KEY, until REAL NOT NULL);
 """
@@ -315,6 +316,10 @@ class LeaseBook:
                     self.db.execute(f"ALTER TABLE rl_prompt_scans ADD COLUMN {column} {kind}")
             if "cause" not in {row[1] for row in self.db.execute("PRAGMA table_info(rl_leases)")}:
                 self.db.execute("ALTER TABLE rl_leases ADD COLUMN cause TEXT")   # a book from before releases
+            columns = {row[1] for row in self.db.execute("PRAGMA table_info(rl_prompt_state)")}
+            for column, kind in (("start_k", "INTEGER"), ("revised", "INTEGER NOT NULL DEFAULT 0")):
+                if column not in columns:                                     # a book from before revisions
+                    self.db.execute(f"ALTER TABLE rl_prompt_state ADD COLUMN {column} {kind}")
             self.db.commit()
             quota.attach(self.db, self.lock)
             self._boot()
@@ -365,6 +370,12 @@ class LeaseBook:
             counts = dict(self.db.execute("SELECT hotkey, COUNT(*) FROM rl_leases WHERE state=? GROUP BY hotkey",
                                           (OPEN,)).fetchall())
             self.quota.reconcile(counts)
+            # A cooldown recorded before revisions: it started at the latest checkpoint when its scan was recorded
+            # (the scan's k when that is later), the rule ``record_outcome`` applies.
+            self.db.execute(
+                "UPDATE rl_prompt_state SET start_k=(SELECT MAX(s.k, COALESCE((SELECT MAX(x.k) FROM rl_lease_secrets x "
+                "WHERE x.adopted_at<=s.at), s.k)) FROM rl_prompt_scans s WHERE s.seq=rl_prompt_state.seq) "
+                "WHERE state=? AND start_k IS NULL", (COOLDOWN,))
 
     # --- checkpoints and secrets ----------------------------------------------------------------------------
     @property
@@ -393,6 +404,8 @@ class LeaseBook:
                 # closed keys of retired k can never be asked again: keep the open ones (they still end)
                 self.db.execute("DELETE FROM rl_leases WHERE k<? AND state<>?", (retired - self.config.max_lag, OPEN))
             row = self.db.execute("SELECT commitment FROM rl_lease_secrets WHERE k=?", (k,)).fetchone()
+        if latest != k:
+            self.revise_cooldowns()
         return bytes.fromhex(row[0])
 
     def commitments(self) -> dict:
@@ -736,7 +749,8 @@ class LeaseBook:
         """Record a graded group of (env, prompt) leased at k and move the prompt: a second ``too_easy`` scan
         blacklists it for the run (one group is not proof enough to retire a prompt for good); any other scan cools
         it down until ``latest + cooldown`` (never shortening a running cooldown, never lifting a blacklist). The
-        cooldown counts from the latest k, not the lease's: a lagged lease must not shorten it."""
+        cooldown counts from the latest k, not the lease's: a lagged lease must not shorten it. A later fall of the
+        env's cooldown shortens it at the next checkpoint (``revise_cooldowns``)."""
         if environment not in self.config.expiry_s:
             raise ValueError("environment not served")
         if verdict not in VERDICTS:
@@ -759,16 +773,71 @@ class LeaseBook:
                 state, until = BLACKLISTED, None
             else:
                 start = max(checkpoint, self.latest_checkpoint or 0)
-                state, until = COOLDOWN, max(start + cooldown, (prior or (0, 0))[1])
+                state, until = COOLDOWN, max(start + cooldown, (prior or (0, 0))[1] or 0)
             # The scan keeps the state it moved the prompt to: the published log (``rl_observations``) rebuilds
             # every prompt's state from the scans alone.
             seq = self.db.execute("INSERT INTO rl_prompt_scans(environment, prompt_idx, k, rewards, verdict, "
                                   "first_scan, at, state, until_k) VALUES(?,?,?,?,?,?,?,?,?)",
                                   (environment, prompt_idx, checkpoint, json.dumps(rewards), verdict,
                                    int(prior is None), now, state, until)).lastrowid
-            self.db.execute("INSERT OR REPLACE INTO rl_prompt_state(environment, prompt_idx, state, until_k, seq) "
-                            "VALUES(?,?,?,?,?)", (environment, prompt_idx, state, until, seq))
+            self.db.execute("INSERT OR REPLACE INTO rl_prompt_state(environment, prompt_idx, state, until_k, seq, "
+                            "start_k, revised) VALUES(?,?,?,?,?,?,0)",
+                            (environment, prompt_idx, state, until, seq, start if state == COOLDOWN else None))
         return Scan(int(seq), environment, prompt_idx, checkpoint, rewards, verdict, prior is None, now)
+
+    def revise_cooldowns(self) -> dict[str, int]:
+        """Bring every running cooldown in line with its env's current one (``cooldown_of``): ``until_k`` becomes
+        ``start_k + cooldown`` when that is earlier, never later, so an env whose cooldown fell (it measured more
+        consumption, or left the start-up value) gets its prompts back without waiting out the old figure. Runs at
+        each new checkpoint and when the service starts. Returns the prompts shortened per env.
+
+        The miners' table learns it from ``prompt_state`` without a new scan: the revised states take a seq of the
+        scans' sequence that no scan will use, and the cursor moves to it once no scan is pending, so a dry env
+        is reached too. A revised cooldown still running is published again at each pass (a miner that rebuilt its
+        table from the scan log, which keeps each scan's own ``until_k``, is corrected within a checkpoint). An env
+        whose cooldown cannot be read is left as it was (logged): a checkpoint is never refused for it."""
+        cooldowns = {}
+        for env in self.config.expiry_s:
+            try:
+                cooldown = self.config.cooldown_of(env)
+                _u64(cooldown)
+                cooldowns[env] = cooldown
+            except Exception:                                   # noqa: BLE001 - never block an adoption on it
+                logger.warning("cooldown of %s not read: its running cooldowns stay as they are", env, exc_info=True)
+        shortened: dict[str, int] = {}
+        with self._txn():
+            latest = self.latest_checkpoint
+            if latest is None:
+                return shortened
+            stamp = None
+            for env, cooldown in cooldowns.items():
+                due = self.db.execute("SELECT COUNT(*) FROM rl_prompt_state WHERE environment=? AND state=? AND "
+                                      "start_k IS NOT NULL AND (until_k>start_k+? OR (revised=1 AND until_k>?))",
+                                      (env, COOLDOWN, cooldown, latest)).fetchone()[0]
+                if not due:
+                    continue
+                if stamp is None:
+                    stamp = self._reserve_seq()
+                n = self.db.execute("UPDATE rl_prompt_state SET until_k=start_k+?, seq=?, revised=1 WHERE "
+                                    "environment=? AND state=? AND start_k IS NOT NULL AND until_k>start_k+?",
+                                    (cooldown, stamp, env, COOLDOWN, cooldown)).rowcount
+                self.db.execute("UPDATE rl_prompt_state SET seq=? WHERE environment=? AND state=? AND revised=1 "
+                                "AND until_k>? AND seq<>?", (stamp, env, COOLDOWN, latest, stamp))
+                if n:
+                    shortened[env] = int(n)
+        if shortened:
+            logger.info("running cooldowns shortened to the current ones at checkpoint %s: %s", latest, shortened)
+        return shortened
+
+    def _reserve_seq(self) -> int:
+        """A seq of the scans' sequence (AUTOINCREMENT: the next scan takes one past it) that no scan will use."""
+        row = self.db.execute("SELECT seq FROM sqlite_sequence WHERE name='rl_prompt_scans'").fetchone()
+        stamp = (int(row[0]) if row is not None else 0) + 1
+        if row is None:
+            self.db.execute("INSERT INTO sqlite_sequence(name, seq) VALUES('rl_prompt_scans', ?)", (stamp,))
+        else:
+            self.db.execute("UPDATE sqlite_sequence SET seq=? WHERE name='rl_prompt_scans'", (stamp,))
+        return stamp
 
     def prompt_state(self, since: int = 0, *, environment: str | None = None,
                      limit: int = MAX_SCANS_PER_PAGE) -> dict:
@@ -782,6 +851,9 @@ class LeaseBook:
                                    f"rl_prompt_scans WHERE {where} ORDER BY seq LIMIT ?", (*args, limit + 1)).fetchall()
             more, rows = len(rows) > limit, rows[:limit]
             cursor = rows[-1][0] if rows else since
+            if not more:      # revised states sit at reserved seqs no scan takes: past the last scan, reach them too
+                cursor = max(cursor, self.db.execute(f"SELECT COALESCE(MAX(seq), 0) FROM rl_prompt_state WHERE "
+                                                     f"{where}", args).fetchone()[0])
             states = self.db.execute(f"SELECT environment, prompt_idx, state, until_k FROM rl_prompt_state WHERE "
                                      f"{where} AND seq<=? ORDER BY seq", (*args, cursor)).fetchall()
             latest = self.latest_checkpoint

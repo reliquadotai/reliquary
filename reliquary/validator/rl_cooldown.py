@@ -5,11 +5,13 @@ the cooldown counts checkpoints. ``AdaptiveCooldown`` is the book's ``cooldown_o
 
     cooldown = N x p / Q x margin, clamped to [floor, ceiling]
 
-where ``N`` is the env's prompt range, ``p`` the in-zone share of its recent first scans and ``Q`` its in-zone groups per
-checkpoint over the recent checkpoints. ``N x p / Q`` is how many checkpoints the env's in-zone prompts last at its
-current consumption; a cooldown under it (``margin`` < 1) returns prompts before the env runs dry, so a too-hard prompt
-is tried again once the policy has moved and an in-zone one is trained again in a later epoch. Until an env has
-``min_first_scans`` first scans and in-zone groups in the window, it gets ``initial``. An operator override per env
+where ``N`` is the env's prompt range less its blacklisted prompts (they never come back), ``p`` the in-zone share of
+its recent first scans and ``Q`` its in-zone groups per checkpoint over the recent checkpoints. ``N x p / Q`` is how
+many checkpoints the env's in-zone prompts last at its current consumption; a cooldown under it (``margin`` < 1)
+returns prompts before the env runs dry, so a too-hard prompt is tried again once the policy has moved and an in-zone
+one is trained again in a later epoch. The lease book applies a fall of the value to the running cooldowns too
+(``LeaseBook.revise_cooldowns``), not only to the next ones. Until an env has ``min_first_scans`` first scans and
+in-zone groups in the window, it gets ``initial``. An operator override per env
 (``params.rl_cooldown_k``) wins. Values are cached ``refresh_s`` seconds; ``snapshot`` feeds the controller metrics.
 """
 from __future__ import annotations
@@ -31,9 +33,11 @@ COOLDOWN_PARAM = "rl_cooldown_k"
 @dataclass(frozen=True)
 class CooldownParams:
     margin: float = 0.5
-    floor: int = 20
+    # In checkpoints. The floor keeps an in-zone prompt from being trained at every checkpoint; the start-up value
+    # holds until the env is measured, and ``LeaseBook.revise_cooldowns`` brings it down to the measured one then.
+    floor: int = 4
     ceiling: int = 1000
-    initial: int = 100
+    initial: int = 20
     min_first_scans: int = 200
     first_scan_window: int = 2000            # recent first scans that measure p
     checkpoint_window: int = 50              # recent checkpoints that measure Q
@@ -113,6 +117,10 @@ class AdaptiveCooldown:
         if self.book is None or not n:
             return initial
         db, latest = self.book.db, self.book.latest_checkpoint
+        blacklisted = db.execute("SELECT COUNT(*) FROM rl_prompt_state WHERE environment=? AND state='blacklisted'",
+                                 (environment,)).fetchone()[0]
+        n = max(1, n - int(blacklisted))
+        initial["n"] = n
         firsts = db.execute("SELECT verdict FROM rl_prompt_scans WHERE environment=? AND first_scan=1 "
                             "ORDER BY seq DESC LIMIT ?", (environment, p.first_scan_window)).fetchall()
         if latest is None or len(firsts) < p.min_first_scans:

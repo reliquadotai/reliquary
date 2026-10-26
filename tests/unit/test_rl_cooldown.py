@@ -68,3 +68,20 @@ def test_the_cooldown_counts_the_rows_left_after_exclusions():
 
     cooldown = AdaptiveCooldown(prompt_range={ENV: PromptRows(0, 1000, ((100, 400),))}, params=PARAMS)
     assert cooldown.state(ENV)["n"] == 700
+
+
+def test_the_blacklisted_prompts_are_not_counted_as_supply(tmp_path):
+    from reliquary.validator.rl_leases import TOO_EASY
+
+    cooldown = AdaptiveCooldown(prompt_range={ENV: (0, 1000)}, params=PARAMS)
+    book = book_with(tmp_path, cooldown)
+    book.adopt_checkpoint(0)
+    for prompt in range(100):                            # too easy twice: retired for the run
+        book.record_outcome(ENV, prompt, 0, [1.0] * 16, TOO_EASY)
+        book.record_outcome(ENV, prompt, 0, [1.0] * 16, TOO_EASY)
+    assert cooldown.state(ENV)["n"] == 900
+
+
+def test_the_start_up_cooldown_is_short_and_the_floor_low():
+    params = CooldownParams()
+    assert (params.initial, params.floor) == (20, 4)

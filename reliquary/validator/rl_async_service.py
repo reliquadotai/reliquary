@@ -339,6 +339,7 @@ def build_rl_async(settings: RlAsyncSettings, *, path: str | os.PathLike[str], g
     limits.append(EnvGroupCaps(book, dict(settings.targets), batch_groups=settings.batch_groups,
                                lane_batches=settings.lane_max_batches, batch_factor=settings.batch_env_factor))
     cooldown.attach(book)
+    book.revise_cooldowns()                 # the cooldowns recorded before this start follow the current ones
     try:
         collector = (LeaseCollector(book) if collector_interval_s is None
                      else LeaseCollector(book, interval_s=collector_interval_s))
