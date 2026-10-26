@@ -147,6 +147,10 @@ class Ports:
     release: Callable[[str, bool], None]                     # (job, drained): close it, else cap 0
 
 
+class NoSamples(Exception):
+    """A job closed with no sample at all: nothing to grade, it is abandoned instead of scored 0."""
+
+
 class Scheduler:
     def __init__(self, settings: Settings, ports: Ports, *, clock: Callable[[], float] = time.time) -> None:
         self.s, self.p, self.clock = settings, ports, clock
@@ -224,7 +228,13 @@ class Scheduler:
             except JobNotGradable as exc:
                 log.append(f"wait {job}: {exc}")
                 continue
+            except NoSamples:
+                log.append(f"abandon {job}: no sample after {self.s.max_wait_s:.0f}s, not graded")
+                cp["abandoned"].append(job)
+                self.save(state)
+                continue
             cp["graded"].append(job)
+            self.save(state)                              # a restart must not grade (and upload) it again
             log.append(f"graded {job}")
         self._release(cp, log, execute)
         if len(cp["graded"]) + len(cp["abandoned"]) < len(cp["jobs"]):
@@ -408,6 +418,8 @@ def live_ports(settings: Settings) -> Ports:
         from reliquary.eval.job_grading import grade_served_job, upload_grading
 
         manifest = asyncio.run(grade_served_job(job, out=out, rl=rl, allow_incomplete=allow_incomplete))
+        if not manifest.get("rows"):
+            raise NoSamples(job)
         if settings.upload:
             asyncio.run(upload_grading(job, out))
         return manifest

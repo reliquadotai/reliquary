@@ -7,7 +7,7 @@ import json
 import pytest
 
 from reliquary.eval.job_grading import JobNotGradable
-from reliquary.eval.rl_schedule import Ports, Scheduler, Settings, SuiteEntry, job_id, load_suite
+from reliquary.eval.rl_schedule import NoSamples, Ports, Scheduler, Settings, SuiteEntry, job_id, load_suite
 
 RUN = "5F3sa2TJ-r7-trainer"
 SUITE = [SuiteEntry("verifiers-aime25-r0-n30", "aime", 8, 0.02, 32768),
@@ -23,6 +23,7 @@ class World:
         self.commands, self.graded, self.started, self.stopped, self.feeds = [], [], [], [], []
         self.dead = set()
         self.released, self.release_fails = [], 0
+        self.empty, self.grade_fails = set(), set()
         self.now = 1000.0
 
     def ports(self):
@@ -33,6 +34,10 @@ class World:
         def grade(job, *, out, rl, allow_incomplete):
             if job in self.short and not allow_incomplete:
                 raise JobNotGradable(f"job {job} misses samples on some problems")
+            if job in self.grade_fails:
+                raise RuntimeError("bucket unreachable")
+            if job in self.empty:
+                raise NoSamples(job)
             self.graded.append((job, rl, allow_incomplete))
             return {"complete": not allow_incomplete}
 
@@ -315,3 +320,33 @@ def test_jobs_done_with_give_their_pool_share_back(tmp_path):
     assert state["checkpoints"]["50"]["released"] == ["eval-r7-s00050-aime", "eval-r7-s00050-gpqa"]
     s.tick(execute=True)
     assert len(world.released) == 2                        # never released twice
+
+
+def test_a_job_nobody_mined_is_abandoned_not_scored_zero(tmp_path):
+    world = World()
+    s = scheduler(tmp_path, world, baseline_model=None)
+    world.backups = [50]
+    s.tick(execute=True)
+    world.drained |= {"eval-r7-s00050-aime", "eval-r7-s00050-gpqa"}  # an empty job is drained too
+    world.empty |= {"eval-r7-s00050-aime", "eval-r7-s00050-gpqa"}
+    world.now += 3601
+    lines = s.tick(execute=True)
+    assert not world.graded and not world.feeds
+    assert any(line.startswith("abandon eval-r7-s00050-aime: no sample") for line in lines)
+    assert world.released == [("eval-r7-s00050-aime", False), ("eval-r7-s00050-gpqa", False)]
+
+
+def test_a_graded_job_survives_a_crash_later_in_the_tick(tmp_path):
+    world = World()
+    s = scheduler(tmp_path, world, baseline_model=None)
+    world.backups = [50]
+    s.tick(execute=True)
+    world.drained |= {"eval-r7-s00050-aime", "eval-r7-s00050-gpqa"}
+    world.grade_fails.add("eval-r7-s00050-gpqa")
+    with pytest.raises(RuntimeError):
+        s.tick(execute=True)
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert state["checkpoints"]["50"]["graded"] == ["eval-r7-s00050-aime"]
+    world.grade_fails.clear()
+    s.tick(execute=True)
+    assert [g[0] for g in world.graded] == ["eval-r7-s00050-aime", "eval-r7-s00050-gpqa"]  # aime not again

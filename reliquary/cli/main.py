@@ -2658,8 +2658,13 @@ def eval_schedule(
             raise ValueError("--every follows the run, --step picks checkpoints: one or the other")
         scheduler = rl_schedule.Scheduler(settings, rl_schedule.live_ports(settings))
         while True:
-            for line in scheduler.tick(execute=execute):
-                typer.echo(line if execute else f"[dry run] {line}")
+            try:
+                for line in scheduler.tick(execute=execute):
+                    typer.echo(line if execute else f"[dry run] {line}")
+            except Exception as exc:                      # noqa: BLE001 - a looping schedule retries next tick
+                if not loop_seconds:
+                    raise
+                typer.echo(f"tick failed, retried in {loop_seconds:.0f}s: {exc!r}", err=True)
             if not loop_seconds:
                 break
             _time.sleep(loop_seconds)
