@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 METRICS_EVERY_S = 60.0
 ACTIVE_MINER_S = 600.0          # a hotkey issued a lease this recently (or holding a live one) is an active miner
-MAX_NAMED_CARDS = 9             # declared names are miner-chosen: past these, "other" (12 models with the 3 buckets)
+MAX_NAMED_CARDS = 61            # every declared card gets its own key; only a sanity bound (platform: 64 with buckets)
 BUCKETS = ("mixed", "undeclared", "other")
 CARD_WINDOW_MAX_S = 240.0       # the dashboard drops a card window longer than 300 s
 SHARE_WINDOW_S = 600.0          # trained-token shares: trailing, so a row between two trainer steps still has them

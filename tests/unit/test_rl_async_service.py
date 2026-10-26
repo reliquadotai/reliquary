@@ -713,12 +713,17 @@ def test_an_untagged_hotkey_counts_every_card_it_declared_under_its_model(tmp_pa
     rl.close()
 
 
-def test_past_nine_named_cards_the_rest_is_other(tmp_path):
+def test_past_the_sanity_bound_the_rest_is_other(tmp_path, monkeypatch):
     import time
 
+    from reliquary.validator import rl_metrics
     from reliquary.validator.miner_setup import MinerSetupStore
     from reliquary.validator.rl_leases import LeaseRequest
     from reliquary.validator.rl_metrics import CardFeed, controller_metrics
+
+    # Production names every declared card: 61 + 3 buckets is the platform monitor's 64-model bound.
+    assert rl_metrics.MAX_NAMED_CARDS + len(rl_metrics.BUCKETS) == 64
+    monkeypatch.setattr(rl_metrics, "MAX_NAMED_CARDS", 9)
 
     now = time.time()
     setups = MinerSetupStore(tmp_path / "setups.sqlite3")
