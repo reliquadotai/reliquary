@@ -5,7 +5,7 @@ description = "Reliquary — Verifiable Inference Subnet"
 requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
-    "torch>=2.1.0",
+    "torch>=2.13.0",
     "numpy>=1.20.0",
     # Pinned exact: apply_chat_template output (encode_prompt) must be
     # byte-identical across all validators and miners, or PROMPT_MISMATCH
@@ -46,11 +46,11 @@ dependencies = [
 
 [project.optional-dependencies]
 vision = [
-    "torch==2.7.0",
+    "torch==2.13.0",
     "peft==0.21.2",
     "accelerate==1.15.0",
     "Pillow==13.0.0",
-    "torchvision==0.22.0",
+    "torchvision==0.28.0",
     "num2words==0.5.14",
 ]
 dev = [
