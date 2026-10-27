@@ -746,6 +746,14 @@ def test_offline_preflight_prices_ceiling_and_never_qualifies_runtime(
     assert result["runtimeInventory"]["wheelInventoryVerified"] is True
     assert not result["nativeExecutionReady"] and not result["activated"]
     assert not result["runtimeInventory"]["dependencyResolutionVerified"]
+    config["image"] = "sha256:" + "a" * 64
+    save(path, config)
+    assert preflight(bundle, path)["image"] == config["image"]
+    for image in ("runtime:latest", "sha256:" + "a" * 12, " sha256:" + "a" * 64):
+        save(path, {**config, "image": image})
+        with pytest.raises(ValueError, match="immutable runtime image"):
+            preflight(bundle, path)
+    save(path, config)
     descriptor = native.read_json(bundle / "job.private.json")
     synthetic = {**descriptor, "assurance": "native-mimo-evaluation"}
     synthetic["jobDigest"] = native.canonical_sha256(

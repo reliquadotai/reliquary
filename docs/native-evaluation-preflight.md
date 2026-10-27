@@ -9,6 +9,10 @@ access. The owner-private configuration outside Git has schema
 - `providerCeilingMicroUsdPerGpuHour`, `gpuCount`, `companyCostCeilingMicroUsd`.
 - `image`, pinned by SHA256, `requirementsFile` and `wheelDirectory`.
 
+The image may be a repository reference ending in `@sha256:...` or an exact
+local Docker image ID `sha256:...`. A local image ID identifies its configuration;
+it is not a repository manifest digest. Offline preflight does not inspect Docker.
+
 All money and duration values are bounded integers. The maximum customer reserve
 and provider compute estimate round up once to integer micro-USD. They cover the
 requested allocation duration. The company estimate covers GPU time only;

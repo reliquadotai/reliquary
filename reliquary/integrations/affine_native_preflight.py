@@ -123,8 +123,8 @@ def preflight(bundle, config_path, *, now=None):
         )
     require(
         isinstance(c["image"], str)
-        and re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", c["image"]),
-        "digest-pinned runtime image required",
+        and re.fullmatch(r"(?:[^\s]+@)?sha256:[0-9a-f]{64}", c["image"]),
+        "immutable runtime image digest or local image ID required",
     )
     d, job, _, _ = native.load_bundle(bundle)
     now = time.time() if now is None else now
