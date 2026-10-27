@@ -664,6 +664,7 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
                **dict(every or {})}
 
     async def expire() -> None:
+        await asyncio.to_thread(rl.book.mark_alive)     # first: a stall since the last sweep is our downtime
         expired = await asyncio.to_thread(rl.book.expire_due)
         if expired:
             logger.info("rl leases ended unsubmitted (expired or released): %d", expired)

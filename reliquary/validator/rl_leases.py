@@ -44,6 +44,13 @@ Persistence follows the service runtime (``services/runtime.py``): one SQLite fi
 ``BEGIN IMMEDIATE`` under an ``RLock``), created ``0600`` because it holds the unrevealed secrets. Open leases,
 secrets, the latest k and the quota state (``QuotaController.attach``) survive a restart. A lease that fell due
 while the validator was down is extended to ``now + RESTART_GRACE_S`` at boot: its holder could not submit.
+
+The validator's own downtime is never charged (2026-10-27: every restart cost miners quota, restored by hand). The
+service loop marks the book alive before each expiry sweep (``mark_alive``, written at most every ``ALIVE_EVERY_S``).
+A silence longer than ``DOWNTIME_MIN_S`` (a stop, a crash, an OOM kill, a slow start, a stalled loop), seen at boot
+or at the next mark, is recorded as a downtime and every open lease gets its length back. A lease that was open during a downtime and ends unsubmitted (expired or forfeited) is released
+(``VALIDATOR_UNAVAILABLE``: no quota cut), whatever happened to it after: its sandbox sessions and its submission
+may have failed against a validator that was not there.
 """
 from __future__ import annotations
 
@@ -90,6 +97,9 @@ MAX_REVEALED_LISTED = 64
 MAX_PROMPTS_PER_REQUEST = 1024
 INTERVAL_S = 1.0          # the collection interval inside which arrival order buys nothing
 RESTART_GRACE_S = 120.0   # what a lease that fell due while the validator was down gets at boot
+ALIVE_EVERY_S = 30.0      # the expiry sweep marks the book alive at most this often
+DOWNTIME_MIN_S = 90.0     # a silence longer than this at boot is a downtime (the sweep runs every few seconds)
+VALIDATOR_UNAVAILABLE = "validator_unavailable"   # a released cause: the lease lived through our downtime
 SECRET_REVEAL_LAG = 16    # S_k is revealed, and k stops being leasable, once k < latest - this
 MAX_SCANS_PER_PAGE = 1000
 HOTKEY_MAX_OPEN = 64          # PLACEHOLDER: the most open leases one hotkey may hold under a global cap
@@ -264,6 +274,8 @@ CREATE TABLE IF NOT EXISTS rl_prompt_state(environment TEXT NOT NULL, prompt_idx
     PRIMARY KEY(environment, prompt_idx));
 CREATE INDEX IF NOT EXISTS rl_prompt_state_seq ON rl_prompt_state(seq);
 CREATE TABLE IF NOT EXISTS rl_hotkey_bans(hotkey TEXT PRIMARY KEY, until REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS rl_validator_alive(id INTEGER PRIMARY KEY CHECK(id=0), at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS rl_validator_downtime(start REAL NOT NULL, end REAL NOT NULL);
 """
 _COLUMNS = "lease_id, hotkey, environment, prompt_idx, k, nonce, issued_at, expires_at, state"
 
@@ -300,6 +312,7 @@ class LeaseBook:
         self._full: set[str] = set()              # envs refused for the global cap since the last drain
         self._lane_full: set[str] = set()         # envs refused for their own maximum since the last drain
         self._submitting: dict[str, int] = {}     # leases whose on-time submission is being graded: never expired
+        self._alive_at: float | None = None       # the last ``mark_alive`` write (memory only)
         # The episode sandbox's verdict on a lease (``RlLeaseSandbox.lease_failure``): (cause, detail) when our side
         # ended one of its episodes, else None. Unset: every unsubmitted lease is charged.
         self.sandbox_failure: Callable[[Lease], tuple[str, str] | None] | None = None
@@ -366,6 +379,11 @@ class LeaseBook:
         now = float(self.clock())
         floor = now + RESTART_GRACE_S
         with self._txn():
+            row = self.db.execute("SELECT at FROM rl_validator_alive WHERE id=0").fetchone()
+            if row is not None:
+                self._downtime(float(row[0]), now)
+            self.db.execute("DELETE FROM rl_validator_downtime WHERE end<?", (now - 7 * DAY_S,))
+            self._mark_alive(now)
             self.db.execute("UPDATE rl_leases SET expires_at=? WHERE state=? AND expires_at<?", (floor, OPEN, floor))
             counts = dict(self.db.execute("SELECT hotkey, COUNT(*) FROM rl_leases WHERE state=? GROUP BY hotkey",
                                           (OPEN,)).fetchall())
@@ -462,6 +480,37 @@ class LeaseBook:
             return int(self.db.execute("SELECT COUNT(*) FROM rl_leases WHERE hotkey=? AND state=?",
                                        (hotkey, OPEN)).fetchone()[0])
 
+    def _mark_alive(self, now: float) -> None:
+        self.db.execute("INSERT INTO rl_validator_alive(id, at) VALUES(0, ?) ON CONFLICT(id) DO UPDATE SET at=?",
+                        (now, now))
+        self._alive_at = now
+
+    def _downtime(self, since: float, now: float) -> None:
+        """Record ``[since, now]`` as a downtime when longer than ``DOWNTIME_MIN_S`` and give its length back to
+        every open lease."""
+        down = now - since
+        if down <= DOWNTIME_MIN_S:
+            return
+        self.db.execute("INSERT INTO rl_validator_downtime(start, end) VALUES(?,?)", (since, now))
+        extended = self.db.execute("UPDATE rl_leases SET expires_at=expires_at+? WHERE state=?",
+                                   (down, OPEN)).rowcount
+        logger.warning("validator unavailable %.0f s: recorded, %d open leases extended by it", down, extended)
+
+    def mark_alive(self, now: float | None = None) -> None:
+        """The validator is up (written at most every ``ALIVE_EVERY_S``); a longer silence since the last mark (a
+        slow start, a stalled loop) is a downtime. The service calls it before each expiry sweep."""
+        now = float(self.clock()) if now is None else now
+        if self._alive_at is not None and 0 <= now - self._alive_at < ALIVE_EVERY_S:
+            return
+        with self._txn():
+            if self._alive_at is not None:
+                self._downtime(self._alive_at, now)
+            self._mark_alive(now)
+
+    def _lived_through_downtime(self, lease: Lease, now: float) -> bool:
+        return self.db.execute("SELECT 1 FROM rl_validator_downtime WHERE end>? AND start<? LIMIT 1",
+                               (lease.issued_at, now)).fetchone() is not None
+
     def _expire(self, now: float) -> int:
         due = [self._lease(row) for row in self.db.execute(
             f"SELECT {_COLUMNS} FROM rl_leases WHERE state=? AND expires_at<=?", (OPEN, now)).fetchall()]
@@ -492,6 +541,8 @@ class LeaseBook:
                                lease.lease_id[:12], lease.hotkey[:12], self.config.box_failed_releases_per_day,
                                failure[1])
                 failure, charged = None, BOX_FAILED_OVER_BUDGET
+        if failure is None and self._lived_through_downtime(lease, now):
+            failure = (VALIDATOR_UNAVAILABLE, "open while the validator was down")
         if failure is None:
             self.db.execute("UPDATE rl_leases SET state=?, closed_at=?, cause=? WHERE lease_id=?",
                             (EXPIRED, now, charged, lease.lease_id))
@@ -900,6 +951,7 @@ class LeaseCollector:
 
 __all__ = [
     "BANNED", "BLACKLISTED", "BOX_FAILED", "BOX_FAILED_OVER_BUDGET", "COMMIT_DOMAIN", "COOLDOWN", "COOLING", "EXPIRED", "EXPIRED_CAUSE", "FORFEITED", "FULL", "IN_ZONE", "NONCE_DOMAIN", "OPEN", "QUOTA",
+    "VALIDATOR_UNAVAILABLE",
     "REFUSALS", "RELEASED", "SECRET_REVEAL_LAG", "STALE", "SUBMITTED", "TAKEN", "TOO_EASY", "TOO_HARD", "TRUNCATED", "VERDICTS",
     "Lease", "LeaseAnswer", "LeaseBook", "LeaseBookConfig", "LeaseCollector", "LeaseRequest", "Scan",
     "classify_group", "lease_expiry_s", "lease_nonce", "secret_commitment", "verify_reveal",
