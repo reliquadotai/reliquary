@@ -350,3 +350,15 @@ def test_a_graded_job_survives_a_crash_later_in_the_tick(tmp_path):
     world.grade_fails.clear()
     s.tick(execute=True)
     assert [g[0] for g in world.graded] == ["eval-r7-s00050-aime", "eval-r7-s00050-gpqa"]  # aime not again
+
+
+def test_a_serving_checkpoint_without_a_validator_starts_one(tmp_path):
+    world = World()
+    s = scheduler(tmp_path, world, baseline_model=None)
+    world.backups = [50]
+    s.tick(execute=True)
+    state = json.loads((tmp_path / "state.json").read_text())
+    state["pid"] = None
+    (tmp_path / "state.json").write_text(json.dumps(state))
+    lines = s.tick(execute=True)
+    assert any("is gone: restart" in line for line in lines) and len(world.started) == 2

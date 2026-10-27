@@ -239,7 +239,7 @@ class Scheduler:
         self._release(cp, log, execute)
         if len(cp["graded"]) + len(cp["abandoned"]) < len(cp["jobs"]):
             pid = state["pid"]
-            if pid is not None and not self.p.alive(pid):
+            if pid is None or not self.p.alive(pid):     # no pid: the schedule was restarted without its validator
                 log.append(f"validator {pid} for {cp['repo']} is gone: restart")
                 if execute:
                     state["pid"] = self._start(cp)
