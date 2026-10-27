@@ -196,6 +196,34 @@ def test_native_report_inherits_private_umask(tmp_path, monkeypatch):
     assert native.verify(bundle, workspace)["successes"] == 4
 
 
+def test_native_jit_cache_is_private_and_bounded_to_the_allocation(tmp_path, monkeypatch):
+    bundle, *_ = prepared(tmp_path)
+    ambient = tmp_path / "ambient-cache"
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(ambient))
+    original = subprocess.Popen
+
+    def cached_report_writer(command, **kwargs):
+        command = list(command)
+        command[4] = (
+            "import os,sys;sys.path.insert(0,sys.argv[1]);"
+            "from pathlib import Path;"
+            "from reliquary.integrations import affine_native_evaluation as native;"
+            "cache=Path(os.environ['TRITON_CACHE_DIR']);"
+            "(cache/'kernel.so').write_bytes(b'bounded fixture cache');"
+            "native._fixture_worker(sys.argv[2],sys.argv[3])"
+        )
+        return original(command, **kwargs)
+
+    monkeypatch.setattr(native.subprocess, "Popen", cached_report_writer)
+    workspace = tmp_path / "work"
+    assert native.run(bundle, workspace, fixture=True)["successes"] == 4
+    cache = workspace / "triton-cache"
+    assert cache.stat().st_mode & 0o777 == 0o700
+    assert (cache / "kernel.so").stat().st_mode & 0o777 == 0o600
+    assert not ambient.exists()
+    assert native.verify(bundle, workspace)["successes"] == 4
+
+
 def test_native_cli_dispatch_preserves_fixture_boundary(tmp_path, capsys):
     from reliquary.integrations.affine_cli import main
 
