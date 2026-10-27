@@ -53,6 +53,16 @@ def _set_entries(report: Mapping[str, Any], source: str) -> list[dict]:
     sets = provenance.get("sets") or []
     if not sets:
         raise ValueError(f"{source}: no set in the report")
+    request_sha = None
+    if any(report.get(key) is not None for key in ("protocol", "protocol_json", "protocol_sha256")):
+        from reliquary.eval.protocol import validate_request
+
+        request_sha = validate_request(
+            {**provenance, **{key: report.get(key) for key in
+                             ("protocol", "protocol_json", "protocol_sha256", "protocol_bindings")}},
+            bindings={s["set_id"]: s.get("protocol_sha256") for s in sets})
+        if request_sha is None:
+            raise ValueError(f"{source}: incomplete request protocol envelope")
     envs = [s["env"] for s in sets]
     if len(set(envs)) != len(envs):
         raise ValueError(f"{source}: two sets on one environment, their scores are merged")
@@ -67,6 +77,19 @@ def _set_entries(report: Mapping[str, Any], source: str) -> list[dict]:
                     "sampling": {k: sampling.get(k) for k in ("temperature", "top_p", "top_k")},
                     "max_new_tokens": provenance.get("max_new_tokens"),
                     "thinking": bool(provenance.get("thinking")), "scheme": scheme}
+        # Preserve old ids when absent; every recorded extra condition must agree.
+        protocol["sampling"].update({key: value for key, value in sampling.items()
+                                     if key not in protocol["sampling"] and value is not None})
+        for key, value in (("seed", provenance.get("seed")),
+                           ("environment_manifest_sha256", s.get("environment_manifest_sha256")),
+                           ("set_protocol_sha256", s.get("protocol_sha256")),
+                           ("request_protocol_sha256", request_sha)):
+            if value is not None:
+                protocol[key] = value
+        if s.get("source_kind") == "verifiers":
+            graded = s.get("taskset_at_grading") or {}
+            protocol["grader"] = {key: graded.get(key) for key in
+                                   ("package_version", "verifiers_version", "artifact_sha256")}
         if provenance.get("episode") is not None:       # absent for one-turn sets: their ids stay put
             protocol["episode"] = dict(provenance["episode"])
         headline = env.get("pass@1")
@@ -135,7 +158,7 @@ def build_feed(run_id: str, checkpoints: Iterable[tuple[str, Mapping[str, Any]]]
         found = series.setdefault(set_id, {"protocol": entry["protocol"], "baseline": None, "points": {}})
         if found["protocol"] != entry["protocol"]:
             raise ValueError(f"{entry['source']}: set {set_id} graded under another protocol "
-                             "(problems, samples, sampling, budget, thinking or grader differ)")
+                             "(problems, samples, sampling/seed, budget, source, thinking or grader differ)")
         return found
 
     for source, report in checkpoints:
