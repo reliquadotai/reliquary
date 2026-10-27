@@ -28,3 +28,11 @@ image, H200 numerical qualification and account/capacity approval.
 
 Exit code 2 means valid but blocked preparation; 1 means refused inputs; 0 means
 offline checks passed. These statuses never launch, publish or fund a job.
+
+To stage a public checkpoint before preflight, native `prepare` accepts
+`--hf-repository OWNER/MODEL --hf-revision FULL_40_HEX_REVISION
+--max-checkpoint-bytes BYTE_LIMIT`. It authenticates the original signed job
+before fetching and copies only checkpoint bytes matching its signed inventory.
+The private source receipt binds the immutable revision to the prepared profile.
+HF transport options are refused by offline preflight. An internally authorized
+nonpayable benchmark remains distinct from an externally authorized customer job.

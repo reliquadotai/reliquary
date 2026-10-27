@@ -17,16 +17,28 @@ def main(argv=None):
     for name in ("config", "bundle", "workspace", "checkpoint", "out"):
         parser.add_argument("--" + name, type=Path)
     parser.add_argument("--max-seconds", type=float)
+    parser.add_argument("--hf-repository")
+    parser.add_argument("--hf-revision")
+    parser.add_argument("--max-checkpoint-bytes", type=int)
     parser.add_argument("--fixture", action="store_true")
     args = parser.parse_args(argv)
+    hf_options = (args.hf_repository, args.hf_revision, args.max_checkpoint_bytes)
+    if any(value is not None for value in hf_options) and args.command != "prepare":
+        parser.error("HF options require prepare")
 
     def need(*names):
         if any(getattr(args, name) is None for name in names):
-            parser.error("required: " + ", ".join("--" + name for name in names))
+            parser.error("required: " + ", ".join("--" + name.replace("_", "-") for name in names))
 
     try:
         if args.command == "prepare":
             need("config", "out")
+            if any(value is not None for value in hf_options):
+                need("hf_repository", "hf_revision", "max_checkpoint_bytes")
+                from .affine_hf_checkpoint import materialize
+
+                materialize(args.config, repository=args.hf_repository, revision=args.hf_revision,
+                            max_bytes=args.max_checkpoint_bytes)
             result = evaluation.prepare(args.config, args.out)
         else:
             need("bundle")

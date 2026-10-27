@@ -282,13 +282,9 @@ def _limits(value):
     )
 
 
-def prepare(config_path, destination):
-    """Freeze reviewed local inputs without importing or executing native code."""
-    config_path, destination = Path(config_path), Path(destination)
-    require(
-        config_path.is_absolute() and destination.is_absolute(),
-        "absolute private paths required",
-    )
+def _load_intake(config_path):
+    config_path = Path(config_path)
+    require(config_path.is_absolute(), "absolute private paths required")
     _private_file(config_path)
     c = read_json(config_path, 1024**2)
     require(
@@ -323,6 +319,17 @@ def prepare(config_path, destination):
             "absolute private inputs required",
         )
         _private_path(Path(c[key]))
+    _private_file(Path(c["jobEnvelope"]))
+    envelope = read_json(c["jobEnvelope"], 4_000_000)
+    job, manifest, _ = _admit(envelope, c["authority"], now=time.time())
+    return c, envelope, job, manifest
+
+
+def prepare(config_path, destination):
+    """Freeze reviewed local inputs without importing or executing native code."""
+    destination = Path(destination)
+    require(destination.is_absolute(), "absolute private paths required")
+    c, envelope, job, manifest = _load_intake(config_path)
     require(
         all(
             destination != Path(c[key]) and Path(c[key]) not in destination.parents
@@ -330,9 +337,6 @@ def prepare(config_path, destination):
         ),
         "prepared bundle must be separate from input trees",
     )
-    _private_file(Path(c["jobEnvelope"]))
-    envelope = read_json(c["jobEnvelope"], 4_000_000)
-    job, manifest, _ = _admit(envelope, c["authority"], now=time.time())
     source = inventory(c["sourceDirectory"], max_bytes=256 * 1024**2)
     require(
         {
@@ -922,7 +926,7 @@ def native_mounts(bundle, workspace, checkpoint):
 
 
 def verify(bundle, workspace):
-    _, job, _, _ = load_bundle(bundle)
+    d, job, _, _ = load_bundle(bundle)
     workspace = Path(workspace)
     verified = verify_report(
         bundle, workspace / "native" / "jobs" / job["job_id"] / "report.json"
@@ -931,6 +935,10 @@ def verify(bundle, workspace):
     require(
         all(canonical(result.get(k)) == canonical(v) for k, v in verified.items()),
         "saved evaluation result differs",
+    )
+    require(
+        result.get("nativeAdmissionVerified") is (d["assurance"] != "fixture"),
+        "saved evaluation admission assurance differs",
     )
     require(
         type(result.get("elapsedSeconds")) in (int, float)
