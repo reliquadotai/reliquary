@@ -208,7 +208,7 @@ def test_the_trainer_takes_the_audits_and_reports_their_verdicts_through_its_lin
     assert rl.submissions.submit(lease.lease_id, "A", group(0))["verdict"] == "too_hard"   # probation: drawn
     [job] = link.take_audits(8)
     assert job.lease_id == lease.lease_id and link.take_audits(8)[0].lease_id == lease.lease_id   # until reported
-    for bad in (0, 33):
+    for bad in (0, 257):
         with pytest.raises(TrainerLinkError) as refused:
             link.take_audits(bad)
         assert refused.value.status == 422
@@ -1041,3 +1041,53 @@ def test_the_operator_sets_the_carry_ceiling_by_env_var():
     assert (tuned.pay_carry_periods, tuned.pay_carry_max_caps) == (8, 4.0)
     with pytest.raises(ValueError):
         rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={"RELIQUARY_RL_PAY_CARRY_MAX_CAPS": "-1"})
+
+
+def test_the_outage_pay_and_the_probation_sampling_are_on_by_default_and_switchable():
+    from reliquary.cli.main import build_task_entry, with_rl_async_params
+    from reliquary.constants import PROTOCOL_PROFILE_ID
+    from reliquary.protocol.profiles import resolve_protocol_profile
+
+    envs = sorted(resolve_protocol_profile(PROTOCOL_PROFILE_ID).environments)[:2]
+    entry = build_task_entry(task_id="rl-async", profile_id=PROTOCOL_PROFILE_ID, cap=0.4, overrides={},
+                             env_split={envs[0]: 0.75, envs[1]: 0.25})
+    declared = with_rl_async_params(entry, planned_tokens_per_period=2e8)
+    plain = rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={})
+    assert plain.pay_outage_fill and plain.pay_outage_grace_s == 600.0 and plain.pay_outage_max_s == 86_400.0
+    assert plain.probation_repeat_audit_rate == 0.25
+    off = rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={
+        "RELIQUARY_RL_PAY_OUTAGE_FILL": "0", "RELIQUARY_RL_PAY_OUTAGE_GRACE_S": "300",
+        "RELIQUARY_RL_PROBATION_REPEAT_AUDIT_RATE": "1"})
+    assert not off.pay_outage_fill and off.pay_outage_grace_s == 300.0 and off.probation_repeat_audit_rate == 1.0
+    with pytest.raises(ValueError):
+        rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000,
+                          environ={"RELIQUARY_RL_PROBATION_REPEAT_AUDIT_RATE": "2"})
+
+
+def test_every_trainer_call_is_a_beat_and_the_heartbeat_never_stops(tmp_path):
+    from reliquary.trainer.rl_link import TrainerHeartbeat, TrainerLink
+    from reliquary.validator.rl_submit import GroupGrader
+
+    grader = GroupGrader({ENV: MathEnv()}, Tokenizer(), eos_token_ids=(1,))
+    rl = build_rl_async(settings_for(pay_outage_fill=True, probation_repeat_audit_rate=0.25),
+                        path=tmp_path / "rl-async.sqlite3", grader=grader, prompt_range={ENV: (0, 50)},
+                        collector_interval_s=0.0)
+    assert rl.ledger.config.outage_fill and rl.submissions.config.probation_repeat_audit_rate == 0.25
+    app = FastAPI()
+    app.include_router(build_rl_trainer_router(rl, token=TOKEN))
+    client = TestClient(app)
+    assert client.post("/rl/trainer/heartbeat", json={}).status_code == 401
+    link = TrainerLink("http://testserver", TOKEN, client=client, patience_s=0.0)
+    assert link.latest_checkpoint is None                               # any trainer call proves it alive
+    assert rl.book.db.execute("SELECT COUNT(*) FROM rl_trainer_beat").fetchone()[0] == 1
+    link.heartbeat()
+    rl.close()
+
+    old = FastAPI()                                                     # a validator without the route
+    beat = TrainerHeartbeat(TrainerLink("http://testserver", TOKEN, client=TestClient(old), patience_s=0.0), 0.01)
+    beat.start()
+    beat._thread.join(timeout=0.3)
+    assert beat._thread.is_alive()                                      # keeps beating: the route may come back
+    beat.stop()
+    beat._thread.join(timeout=5)
+    assert not beat._thread.is_alive()

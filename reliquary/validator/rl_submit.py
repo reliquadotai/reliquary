@@ -22,7 +22,9 @@
    * in zone: the group (tokens, lease nonce, k, arrival, hotkey) goes to the ``TrainingBuffer``. It is verified
      in the trainer's forward (§4.7), which reports back through ``report_training``;
    * out of zone: the audit draw, made after submission with the validator's own randomness (``SystemRandom``):
-     every group of a hotkey in probation, else ``audit_rate`` (15 %). A drawn group keeps its tokens in
+     a hotkey in probation: every first scan (it is paid) and ``probation_repeat_audit_rate`` of its other out-of-zone
+     groups (they earn nothing; 2026-10-27: auditing them all buried the first scans past ``audit_max_lag``), else
+     ``audit_rate`` (15 %). A drawn group keeps its tokens in
      ``rl_audits`` until ``report_audit``. An out-of-zone FIRST scan is payable (25 %, §4.5) at once when not
      drawn, after a passed audit when drawn, and only with at least ``first_scan_min_tokens`` model tokens (a
      group of near-empty rollouts verifies nothing).
@@ -154,6 +156,7 @@ ProofForward = Callable[[SubmittedGroup], AuditResult]
 @dataclass(frozen=True)
 class SubmitConfig:
     audit_rate: float = 0.15
+    probation_repeat_audit_rate: float = 1.0   # share of a probation hotkey's repeat out-of-zone scans audited
     probation_groups: int = 100
     reprobation_passes: int = SERVICE_REPROBATION_PASSES
     first_scan_fraction: float = 0.25
@@ -162,7 +165,8 @@ class SubmitConfig:
     audit_max_lag: int = RL_AUDIT_MAX_LAG
 
     def __post_init__(self) -> None:
-        if not (0.0 <= self.audit_rate <= 1.0 and 0.0 <= self.first_scan_fraction <= 1.0):
+        if not (0.0 <= self.audit_rate <= 1.0 and 0.0 <= self.first_scan_fraction <= 1.0
+                and 0.0 <= self.probation_repeat_audit_rate <= 1.0):
             raise ValueError("audit rate and first-scan fraction are fractions")
         if min(self.probation_groups, self.reprobation_passes, self.first_scan_min_tokens, self.audit_max_lag) < 0:
             raise ValueError("audit counts must be non-negative")
@@ -547,7 +551,9 @@ class RlSubmissions:
                 self.buffer.push(group)
             elif scan is not None:
                 forced = self._in_probation(hotkey)
-                if forced or self._rng.random() < self.config.audit_rate:
+                rate = ((1.0 if scan.first_scan else self.config.probation_repeat_audit_rate) if forced
+                        else self.config.audit_rate)
+                if rate >= 1.0 or self._rng.random() < rate:
                     audit = PENDING
                     db.execute("INSERT INTO rl_audits(lease_id, hotkey, forced, queued_at, body) VALUES(?,?,?,?,?)",
                                (lease_id, hotkey, int(forced), arrived_at, group.pack()))
@@ -641,12 +647,15 @@ class RlSubmissions:
             self._event("", hotkey, BAN, now, {"reason": str(reason), "until": float(until)})
 
     def audit_jobs(self, limit: int) -> list[SubmittedGroup]:
-        """Queued audits, newest first, hotkeys past probation before those in probation (decisions doc §C).
+        """Queued audits: hotkeys past probation before those in probation (decisions doc §C), then first scans (they
+        are paid) before repeats, newest first.
         The forward runs against the latest checkpoint (§4.4): under a backlog the freshest groups are judged and the
         stale ones dropped (``drop_stale_audits``)."""
         with self.book.lock:
-            rows = self.book.db.execute("SELECT body FROM rl_audits WHERE body IS NOT NULL ORDER BY forced, "
-                                        "queued_at DESC LIMIT ?", (int(limit),)).fetchall()
+            rows = self.book.db.execute(
+                "SELECT a.body FROM rl_audits a LEFT JOIN rl_groups g ON g.lease_id=a.lease_id WHERE a.body IS NOT "
+                "NULL ORDER BY a.forced, COALESCE(g.first_scan, 0) DESC, a.queued_at DESC LIMIT ?",
+                (int(limit),)).fetchall()
         return [SubmittedGroup.unpack(body) for body, in rows]
 
     def report_audit(self, lease_id: str, result: AuditResult, now: float | None = None) -> None:

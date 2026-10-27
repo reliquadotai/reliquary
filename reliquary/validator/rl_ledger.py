@@ -29,11 +29,24 @@ period archive, so the unchanged weight setter (``weight_only._period_weights``:
 per task) pays it once the task is declared with ``params.settlement = "period-ema-v1"``. Archives are kept in the
 ledger (``rl_pay_periods``) until ``publish`` writes them (``R2PeriodArchives``); an accrual that lands after its
 period settled moves to the next open period. Nothing here talks to the chain.
+
+Trainer outages (``outage_fill``): miners are paid when the trainer reports a step, so a dead trainer used to leave
+its periods empty and their emission burned (teutonic-rl-async-v1, 2026-10-27: ~5 periods). The trainer now sends a
+heartbeat (``trainer_beat``); a silence longer than ``outage_grace_s`` is an outage, counted from the last beat and
+for at most ``outage_max_s``. A period holding outage time pays each hotkey, on top of its accruals and under the
+same cap, its mean reward over the last ``OUTAGE_REFERENCE_PERIODS`` archives that were mostly not outage, times
+the share of the period the trainer was down. Before the first heartbeat nothing is filled. Every trainer-link call
+counts as a beat (``trainer_beat``, throttled). The validator's own downtime (``rl_validator_downtime``, written by
+the lease book) is cut out of the outages: the trainer could not reach it, and its late step report pays then. A
+piece shorter than the grace is dropped. With the fill on, a period settles ``outage_grace_s`` after its end at the
+earliest, so an outage at its very end is seen before it is archived.
 """
 from __future__ import annotations
 
 import json
+import logging
 import math
+import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -41,6 +54,11 @@ from dataclasses import dataclass
 from reliquary.constants import RL_ROLLOUT_MATCH_FLOOR
 from reliquary.validator import corpus_periods as cp
 from reliquary.validator.rl_submit import BAN, FIRST_SCAN, TRAINED
+
+logger = logging.getLogger(__name__)
+
+BEAT_EVERY_S = 10.0          # trainer_beat writes at most this often
+OUTAGE_KEEP_S = 7 * 86_400.0  # recorded outages older than this are pruned
 
 RL_PERIOD_ARCHIVE_SCHEMA = "reliquary/rl-async-period/v1"
 BOARD_CACHE_S = 15.0       # the public board is rebuilt at most this often (it sums every accrual under the lock)
@@ -61,7 +79,11 @@ CREATE TABLE IF NOT EXISTS rl_pay_carry(hotkey TEXT NOT NULL, origin_period INTE
     PRIMARY KEY(hotkey, origin_period));
 CREATE TABLE IF NOT EXISTS rl_pay_periods(work_period INTEGER PRIMARY KEY, entry_period INTEGER NOT NULL,
     doc TEXT NOT NULL, published INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS rl_trainer_beat(id INTEGER PRIMARY KEY CHECK(id=0), last_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS rl_trainer_outages(start REAL NOT NULL, end REAL NOT NULL);
 """
+# Archives a period's outage fill is averaged over (only those with less than half the period in outage).
+OUTAGE_REFERENCE_PERIODS = 6
 
 
 @dataclass(frozen=True)
@@ -77,12 +99,15 @@ class LedgerConfig:
     carry_periods: int = 0           # a period's pay over the cap is carried this many periods before it burns
     carry_max_caps: float = 2.0      # the most carried at once, in caps (the oldest burns first; simulated: an
                                      # uncapped carry stalled at 2-3 caps after an outage and kept paying over)
+    outage_fill: bool = False        # pay the recent mean for the time the trainer was down (module docstring)
+    outage_grace_s: float = 600.0    # a heartbeat silence longer than this is an outage
+    outage_max_s: float = 86_400.0   # an outage is filled for at most this long
 
     def __post_init__(self) -> None:
         if not (0 < self.cap <= 1 and 0 <= self.floor <= 1 and self.reference_groups > 0
                 and self.default_group_tokens > 0 and self.slack_s >= 0
                 and (self.env_pay_k is None or self.env_pay_k > 0) and self.carry_periods >= 0
-                and self.carry_max_caps >= 0):
+                and self.carry_max_caps >= 0 and self.outage_grace_s > 0 and self.outage_max_s >= 0):
             raise ValueError("invalid ledger config")
 
 
@@ -101,6 +126,7 @@ class RlPayLedger:
         """``prices.token_price(env)`` prices a matched token (``AsyncPriceController``)."""
         self.book, self.submissions, self.prices, self.config, self.clock = book, submissions, prices, config, clock
         self._board: tuple[float, dict] | None = None
+        self._beat_at: float | None = None        # the last trainer_beat write (memory only)
         with book.lock:
             book.db.executescript(_SCHEMA)
             book.db.execute("INSERT OR IGNORE INTO rl_pay_cursor(id, seq) VALUES(0, 0)")
@@ -166,11 +192,13 @@ class RlPayLedger:
         """Archive every closed period holding accruals, oldest first (each once); returns the new archives."""
         now = float(self.clock()) if now is None else now
         genesis = self.config.genesis
-        closed = cp.closed_through(now=now, oldest_pending=None, genesis=genesis, slack=self.config.slack_s)
+        slack = max(self.config.slack_s, self.config.outage_grace_s) if self.config.outage_fill else self.config.slack_s
+        closed = cp.closed_through(now=now, oldest_pending=None, genesis=genesis, slack=slack)
         out = []
         with self.book.transaction():
             db = self.book.db
-            for period in self._due_periods(closed):
+            outages = self._outages(now)
+            for period in self._due_periods(closed, outages):
                 rows = db.execute("SELECT hotkey, amount, matched_tokens, environment FROM rl_accruals WHERE "
                                   "status=? AND period=? ORDER BY seq", (ACCRUED, period)).fetchall()
                 env_scale = self._env_scale(rows)
@@ -179,10 +207,14 @@ class RlPayLedger:
                     accrued[hotkey] = accrued.get(hotkey, 0.0) + amount * env_scale.get(env, 1.0)
                 fresh = math.fsum(accrued.values())
                 carried = self._take_carry(period)          # hotkey -> [(origin period, amount)], expired burned
-                if not rows and not carried:
+                down_s = self._outage_seconds(period, outages)
+                fill = self._outage_fill(down_s / cp.PERIOD_SECONDS) if down_s > 0 else {}
+                if not rows and not carried and not fill:
                     continue
                 for hotkey, parts in carried.items():
                     accrued[hotkey] = accrued.get(hotkey, 0.0) + math.fsum(a for _, a in parts)
+                for hotkey, amount in fill.items():
+                    accrued[hotkey] = accrued.get(hotkey, 0.0) + amount
                 total = math.fsum(accrued.values())
                 scale = 1.0 if total <= self.config.cap else self.config.cap / total
                 carried_out = self._carry(period, rows, env_scale, carried, 1.0 - scale) if scale < 1 else 0.0
@@ -199,23 +231,114 @@ class RlPayLedger:
                                 "carry_periods": self.config.carry_periods})
                 if self.config.env_pay_k is not None:
                     doc["env_scale"] = env_scale
+                if down_s > 0:
+                    doc.update({"outage_s": down_s, "outage_fraction": down_s / cp.PERIOD_SECONDS,
+                                "outage_fill": math.fsum(fill.values())})
                 db.execute("INSERT INTO rl_pay_periods(work_period, entry_period, doc, published) VALUES(?,?,?,?)",
                            (period, entry, json.dumps(doc, sort_keys=True), _UNATTEMPTED))
                 db.execute("UPDATE rl_accruals SET status=? WHERE status=? AND period=?", (SETTLED, ACCRUED, period))
                 out.append(doc)
         return out
 
-    def _due_periods(self, closed: int) -> list[int]:
-        """Closed periods to archive, oldest first: those holding accruals, and, while a carry is pending, every
-        period after the last archive (a period with no step end still pays the carry)."""
+    def _due_periods(self, closed: int, outages: list[tuple[float, float]] = ()) -> list[int]:
+        """Closed periods to archive, oldest first: those holding accruals, while a carry is pending every period
+        after the last archive (a period with no step end still pays the carry), and those after the last archive
+        that hold outage time."""
         db = self.book.db
         due = {p for p, in db.execute("SELECT DISTINCT period FROM rl_accruals WHERE status=? AND period<=?",
                                       (ACCRUED, closed)).fetchall()}
+        if outages:
+            last = db.execute("SELECT MAX(work_period) FROM rl_pay_periods").fetchone()[0]
+            genesis = self.config.genesis
+            for start, end in outages:
+                first = cp.period_of(start, genesis)
+                if last is not None:
+                    first = max(first, int(last) + 1)
+                due.update(range(first, min(cp.period_of(end, genesis), closed) + 1))
         if self.config.carry_periods and db.execute("SELECT 1 FROM rl_pay_carry LIMIT 1").fetchone():
             last = db.execute("SELECT MAX(work_period) FROM rl_pay_periods").fetchone()[0]
             starts = list(due) + ([int(last) + 1] if last is not None else [])
             due.update(range(min(starts) if starts else closed, closed + 1))
         return sorted(due)
+
+    # --- trainer outages -------------------------------------------------------------------------------------
+    def trainer_beat(self, now: float | None = None) -> None:
+        """The trainer is alive (its heartbeat, or any trainer-link call; written at most every ``BEAT_EVERY_S``).
+        A silence before this beat longer than the grace is recorded as an outage."""
+        if not self.config.outage_fill:
+            return
+        now = float(self.clock()) if now is None else now
+        if self._beat_at is not None and 0 <= now - self._beat_at < BEAT_EVERY_S:
+            return
+        with self.book.transaction():
+            db = self.book.db
+            row = db.execute("SELECT last_at FROM rl_trainer_beat WHERE id=0").fetchone()
+            if row is not None and now - row[0] > self.config.outage_grace_s:
+                db.execute("INSERT INTO rl_trainer_outages(start, end) VALUES(?,?)", (row[0], now))
+                logger.warning("trainer heartbeat back after %.0f s: outage recorded", now - row[0])
+            db.execute("INSERT INTO rl_trainer_beat(id, last_at) VALUES(0, ?) ON CONFLICT(id) "
+                       "DO UPDATE SET last_at=MAX(last_at, excluded.last_at)", (now,))
+            db.execute("DELETE FROM rl_trainer_outages WHERE end<?", (now - OUTAGE_KEEP_S,))
+        self._beat_at = now
+
+    def _validator_downtime(self) -> list[tuple[float, float]]:
+        try:
+            return [(float(s), float(e)) for s, e in
+                    self.book.db.execute("SELECT start, end FROM rl_validator_downtime")]
+        except sqlite3.OperationalError:          # a book without the table
+            return []
+
+    def _outages(self, now: float) -> list[tuple[float, float]]:
+        """The trainer's outages: those recorded and the one going on (a silence longer than the grace, up to
+        ``now``), less the validator's own downtime, pieces shorter than the grace dropped, each cut to
+        ``outage_max_s``."""
+        if not self.config.outage_fill:
+            return []
+        db = self.book.db
+        spans = [(float(s), float(e)) for s, e in db.execute("SELECT start, end FROM rl_trainer_outages")]
+        row = db.execute("SELECT last_at FROM rl_trainer_beat WHERE id=0").fetchone()
+        if row is not None and now - row[0] > self.config.outage_grace_s:
+            spans.append((float(row[0]), now))
+        down = sorted(self._validator_downtime())
+        out = []
+        for s, e in spans:
+            pieces = [(s, e)]
+            for ds, de in down:
+                pieces = [p for a, b in pieces for p in ((a, min(b, ds)), (max(a, de), b)) if p[1] > p[0]]
+            out += [(a, min(b, a + self.config.outage_max_s)) for a, b in pieces
+                    if b - a > self.config.outage_grace_s]
+        return out
+
+    def _outage_seconds(self, period: int, outages) -> float:
+        """Seconds of ``period`` the trainer was down (overlapping outages counted once)."""
+        end = cp.period_end(period, self.config.genesis)
+        start = end - cp.PERIOD_SECONDS
+        spans = sorted((max(s, start), min(e, end)) for s, e in outages if s < end and e > start)
+        total, reach = 0.0, start
+        for s, e in spans:
+            if e > reach:
+                total += e - max(s, reach)
+                reach = e
+        return total
+
+    def _outage_fill(self, fraction: float) -> dict[str, float]:
+        """hotkey -> ``fraction`` of its mean reward over the last reference archives (banned hotkeys excluded)."""
+        docs = []
+        for (text,) in self.book.db.execute("SELECT doc FROM rl_pay_periods ORDER BY work_period DESC"):
+            doc = json.loads(text)
+            if float(doc.get("outage_fraction", 0.0)) < 0.5:
+                docs.append(doc)
+                if len(docs) == OUTAGE_REFERENCE_PERIODS:
+                    break
+        if not docs:
+            return {}
+        fraction = min(1.0, fraction)
+        now = float(self.clock())
+        out: dict[str, float] = {}
+        for doc in docs:
+            for hotkey, reward in (doc.get("rewards_by_hotkey") or {}).items():
+                out[hotkey] = out.get(hotkey, 0.0) + float(reward) * fraction / len(docs)
+        return {h: a for h, a in sorted(out.items()) if a > 0 and not self._banned(h, now)}
 
     def _take_carry(self, period: int) -> dict[str, list[tuple[int, float]]]:
         """The carry pending before ``period`` (removed: what is not paid is carried again); older than
