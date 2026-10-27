@@ -168,3 +168,49 @@ def test_sharded_restart_continues_exactly(tmp_path):
         assert resumed[rank][1] is True
         for name, tensor in straight[rank][0].items():
             assert torch.equal(tensor, resumed[rank][0][name]), name
+
+
+def _forward_then_step(state_dir):
+    """As in production: the sharded model runs forwards (pi_old, audits) before its first train step."""
+    import os
+
+    from torch.distributed.tensor import DTensor
+
+    from reliquary.trainer.distributed import init_distributed, shard_model
+    from reliquary.validator import training
+    from reliquary.validator.training import _batched_completion_logprobs
+    from tests.unit.test_train_step_sharded import _batches
+    from tests.unit.trainer_dist_helpers import tiny_qwen35
+
+    os.environ[optimizer_state.STATE_DIR_ENV] = state_dir
+    ctx = init_distributed(device_type="cpu")
+    training.reset_training_state()
+    training.KL_BETA = 0.0
+    training.configure_distributed(ctx)
+    model = tiny_qwen35()
+    batch = _batches(model, seed=0)
+    model = shard_model(model, ctx, param_dtype=torch.float32)
+    with torch.no_grad():                                    # leaves the unsharded weights registered
+        x = torch.tensor([batch[0][0].rollouts[0].tokens])
+        _batched_completion_logprobs(model, x, torch.ones_like(x), [8], [x.shape[1]])
+    before = {}
+    for name, p in model.named_parameters():
+        before[name] = (p.full_tensor() if isinstance(p, DTensor) else p).detach().clone()
+    training.train_step(model, batch, ref_model=None, global_step_hint=0)
+    training._state_writer.wait()
+    params, _ = training._stepped()
+    unchanged = [name for name, p in model.named_parameters()
+                 if torch.equal(before[name], (p.full_tensor() if isinstance(p, DTensor) else p).detach())]
+    return unchanged, all(isinstance(p, DTensor) for p in params), sorted(os.listdir(state_dir))
+
+
+def test_the_optimizer_steps_the_shards_after_a_forward_left_weights_unsharded(tmp_path):
+    """teutonic-rl-async-v1 2026-10-24: the optimizer held the base's and the head's unsharded weights (FSDP2
+    registers them after a forward); embed_tokens, model.norm and lm_head never moved and the snapshot failed."""
+    from tests.unit.trainer_dist_helpers import run_ranks
+
+    out = run_ranks(_forward_then_step, 2, str(tmp_path))
+    for rank in (0, 1):
+        unchanged, sharded, files = out[rank]
+        assert unchanged == [] and sharded
+        assert any(f.startswith(f"rank{rank:02d}-") for f in files)

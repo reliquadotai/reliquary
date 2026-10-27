@@ -46,17 +46,18 @@ keeps the cap the most a period pays, the rest burns. State lives in the lease b
 * The **level** L (one, ``rl_price_level``) is a normalisation, not a ratchet: it aims at the level where the
   recent supply S (all envs, decayed with a half-life of ``supply_halflife_s``) priced at its weights pays
   ``pay_target`` of the cap a period, ``L* = pay_target x o x cap / (nominal x period_s x S x w)`` with w the
-  supply-weighted mean weight, and moves towards it by at most ``level_rise`` / ``level_decay`` a tick. A short
+  supply-weighted mean weight, and moves towards it by at most ``level_rise_h`` / ``level_decay_h`` an hour,
+  holding while the aim is within ``level_band`` of it. A short
   fleet thus earns the whole budget (each token pays more the fewer they are); a fleet past the trainer earns
   less per token, and the trainer's share of it is paid. ``o`` (oversupply, in ``[oversupply_floor, 1]``) descends
-  ``oversupply_decay`` a tick while leases are refused for a full queue, or for their env's maximum on envs
+  ``oversupply_decay_h`` an hour while leases are refused for a full queue, or for their env's maximum on envs
   holding ``oversupply_share`` of the targets with the trainer not waiting, and climbs back otherwise: a supply the
   trainer cannot take is then paid less in total and the rest burns. The level that pays the cap at the trainer's
   speed would burn ``1 - S/T`` under a shortage and lower the pay when the trainer speeds up; a level that rises
   until the cap is paid overshoots and oscillates (``cc-data/rl-price-level``, 2026-10-24 simulation).
 * The **weight** r of an env (``rl_price_weights``) only moves the mix: its share of the recent supply (half-life
-  ``mix_halflife_s``) over its target share under ``low`` rises ``weight_rise``, over ``high`` (or its leases
-  refused) descends ``weight_decay``, then the weights are rescaled so that ``sum(target x r) = sum(target)`` over
+  ``mix_halflife_s``) over its target share under ``weight_low`` rises ``weight_rise_h`` an hour, over
+  ``weight_high`` (or its leases refused) descends ``weight_decay_h``, then the weights are rescaled so that ``sum(target x r) = sum(target)`` over
   the envs supplied within ``idle_s``. An env nobody supplies for ``idle_s`` is frozen and left out of the
   rescaling (the level absorbs the rescaling, so no price jumps): it no longer weighs on the others (teutonic-rl-async-v1, 2026-10-24: EnvScaler, without a single
   miner, sat at the ceiling and pushed every price down ~3 % a tick while the trainer starved). Within
@@ -126,19 +127,27 @@ class AsyncPriceParams:
                                  # 0.9 burns 9-12 %, 0.95 5-9 %, 1.0 3-5 % but loses up to 4 % to carry expiry)
     oversupply_share: float = 0.5    # leases refused for their env's maximum on envs holding this much of the
                                      # targets, the trainer not waiting: the supply is past the trainer too
-    level_rise: float = 1.03     # the most L moves towards its aim a tick (simulated: 1.02-1.05 converge)
-    level_decay: float = 0.98
+    # Speeds are per hour (scaled to the tick's length). Miners take hours to move (renting cards, changing env): a
+    # controller faster than they are overshoots and oscillates. 2026-10-24 live: x1.03 / x0.98 a 5-min tick
+    # (+43 % / -22 % an hour) cut the burn from ~60 % to ~10 % in one period. Simulated with miners reacting 2-6 h
+    # late (cc-data/rl-price-slow): those speeds swing L x2-4 and the fleet up to 130 % without settling; these
+    # settle in ~1.5 days, pay moving < ~15 % a period (p90). L at +-5 %/h burned more after a renormalisation.
+    level_rise_h: float = 1.10   # the most L moves towards its aim an hour
+    level_decay_h: float = 0.90
+    level_band: float = 0.05     # L holds while its aim is within x/÷ (1 + band) of it: no chasing the noise
     level_floor: float = 0.01
     level_cap: float = 100.0
-    oversupply_decay: float = 0.98   # a tick of leases refused for a full queue
-    oversupply_rise: float = 1.02
+    oversupply_decay_h: float = 0.95   # an hour of leases refused for a full queue (or a flood of lanes)
+    oversupply_rise_h: float = 1.05
     oversupply_floor: float = 0.1
-    weight_rise: float = 1.02
-    weight_decay: float = 0.98
+    weight_rise_h: float = 1.08
+    weight_decay_h: float = 0.93
+    weight_low: float = 0.85     # an env's share of the recent supply over its target share: under it the weight
+    weight_high: float = 1.15    # rises, over it descends, in between it holds
     weight_floor: float = 0.01   # instruction following needs ~0.01 at its 1 % target (simulated)
     weight_cap: float = 20.0
-    supply_halflife_s: float = 3600.0    # the level's supply
-    mix_halflife_s: float = 600.0        # the weights' mix (2 h lagged and oscillated, simulated)
+    supply_halflife_s: float = 6 * 3600.0   # the level's supply: one miner coming or going moves no price
+    mix_halflife_s: float = 3600.0          # the weights' mix (long-episode envs arrive in lumps)
     idle_s: float = 6 * 3600.0
     period_s: float = 4320.0     # one settlement period (72 min)
 
@@ -151,10 +160,12 @@ class AsyncPriceParams:
                              "steering out of range")
         if self.mode not in ("per_env", "level"):
             raise ValueError("mode is per_env or level")
-        if not (0 < self.pay_target <= 1 and self.level_rise >= 1 and 0 < self.level_decay <= 1
-                and 0 < self.level_floor <= self.level_cap and 0 < self.oversupply_decay <= 1
-                and self.oversupply_rise >= 1 and 0 < self.oversupply_floor <= 1 and 0 < self.oversupply_share <= 1
-                and self.weight_rise >= 1 and 0 < self.weight_decay <= 1
+        if not (0 < self.pay_target <= 1 and self.level_rise_h >= 1 and 0 < self.level_decay_h <= 1
+                and self.level_band >= 0 and 0 < self.level_floor <= self.level_cap
+                and 0 < self.oversupply_decay_h <= 1 and self.oversupply_rise_h >= 1
+                and 0 < self.oversupply_floor <= 1 and 0 < self.oversupply_share <= 1
+                and self.weight_rise_h >= 1 and 0 < self.weight_decay_h <= 1
+                and 0 < self.weight_low <= 1 <= self.weight_high
                 and 0 < self.weight_floor <= 1 <= self.weight_cap and self.supply_halflife_s > 0
                 and self.mix_halflife_s > 0 and self.idle_s > 0 and self.period_s > 0):
             raise ValueError("level mode parameters out of range")
@@ -415,7 +426,7 @@ def _tick_level(self, queue: QueueTick, full: Iterable[str] = (), now: float | N
         seconds = max(now - last, 0.0)
         if seconds <= 0:
             return {}
-        steps = seconds / params.tick_s
+        hours = seconds / 3600.0
         self._note_work(float(queue.taken), float(queue.starved_s), seconds, now)
         speed = self.trainer_speed(now)
         prices = dict(db.execute("SELECT environment, price FROM rl_prices").fetchall())
@@ -443,7 +454,7 @@ def _tick_level(self, queue: QueueTick, full: Iterable[str] = (), now: float | N
         starved = queue.starved_s > params.starved * seconds
         lanes_full = math.fsum(float(self.targets.get(e, 0.0)) for e in set(lane_full)) >= params.oversupply_share
         flooded = capped or (lanes_full and not starved)
-        over = (over * params.oversupply_decay ** steps if flooded else over * params.oversupply_rise ** steps)
+        over = (over * params.oversupply_decay_h ** hours if flooded else over * params.oversupply_rise_h ** hours)
         over = _clamp(over, params.oversupply_floor, 1.0)
         active = [e for e in sorted(self.targets)
                   if supplied_at[e] is not None and now - supplied_at[e] <= params.idle_s and self.targets[e] > 0]
@@ -455,11 +466,11 @@ def _tick_level(self, queue: QueueTick, full: Iterable[str] = (), now: float | N
             relative[env] = rel
             move = HOLD
             if env in active:
-                if env in full or (rel is not None and rel > params.high):
-                    weights[env] *= params.weight_decay ** steps
+                if env in full or (rel is not None and rel > params.weight_high):
+                    weights[env] *= params.weight_decay_h ** hours
                     move = DESCEND
-                elif rel is not None and rel < params.low:
-                    weights[env] *= params.weight_rise ** steps
+                elif rel is not None and rel < params.weight_low:
+                    weights[env] *= params.weight_rise_h ** hours
                     move = RISE
             moves[env] = move
         mass_t = math.fsum(float(self.targets[e]) for e in active)
@@ -475,7 +486,12 @@ def _tick_level(self, queue: QueueTick, full: Iterable[str] = (), now: float | N
         aim, regime = None, HOLD
         if mean_weight and speed is not None:
             aim = params.pay_target * over * self.cap / (self.nominal * params.period_s * supply * mean_weight)
-            moved = _clamp(aim, level * params.level_decay ** steps, level * params.level_rise ** steps)
+            band = 1.0 + params.level_band
+            if level / band <= aim <= level * band:
+                moved = level
+            else:                                     # towards the band's edge, so the hold resumes inside it
+                moved = _clamp(aim * band if aim < level else aim / band,
+                               level * params.level_decay_h ** hours, level * params.level_rise_h ** hours)
             regime = RISE if moved > level else DESCEND if moved < level else HOLD
             level = _clamp(moved, params.level_floor, params.level_cap)
         signal = {"seconds": seconds, "level": level, "aim": aim, "regime": regime, "supply_tps": supply,

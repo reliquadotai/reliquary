@@ -713,12 +713,17 @@ def test_an_untagged_hotkey_counts_every_card_it_declared_under_its_model(tmp_pa
     rl.close()
 
 
-def test_past_nine_named_cards_the_rest_is_other(tmp_path):
+def test_past_the_sanity_bound_the_rest_is_other(tmp_path, monkeypatch):
     import time
 
+    from reliquary.validator import rl_metrics
     from reliquary.validator.miner_setup import MinerSetupStore
     from reliquary.validator.rl_leases import LeaseRequest
     from reliquary.validator.rl_metrics import CardFeed, controller_metrics
+
+    # Production names every declared card: 61 + 3 buckets is the platform monitor's 64-model bound.
+    assert rl_metrics.MAX_NAMED_CARDS + len(rl_metrics.BUCKETS) == 64
+    monkeypatch.setattr(rl_metrics, "MAX_NAMED_CARDS", 9)
 
     now = time.time()
     setups = MinerSetupStore(tmp_path / "setups.sqlite3")
@@ -730,6 +735,58 @@ def test_past_nine_named_cards_the_rest_is_other(tmp_path):
     row = controller_metrics(rl, time.time() + 1, cards=CardFeed(setups))
     models = {k.split("/")[1] for k in row if k.startswith("cards/") and k.endswith("/gpus")}
     assert len(models) == 12 and row["cards/other/gpus"] == 2
+    rl.close()
+
+
+def _long_leases(rl, seconds=3.5 * 3600):
+    from dataclasses import replace
+
+    rl.book.config = replace(rl.book.config, expiry_s={ENV: seconds})   # the run's leases live 13107-20607 s
+
+
+def test_a_slow_card_holding_a_live_lease_stays_in_the_fleet_under_its_own_model(tmp_path):
+    import time
+
+    from reliquary.validator.miner_setup import MinerSetupStore
+    from reliquary.validator.rl_leases import LeaseRequest
+    from reliquary.validator.rl_metrics import CardFeed, controller_metrics
+
+    t0 = time.time()
+    setups = MinerSetupStore(tmp_path / "setups.sqlite3")
+    setups.put("M", "a" * 16, int(t0), t0, {"gpus": [{"name": "NVIDIA RTX A6000", "id_hash": "1" * 16}]})
+    setups.put("M", "h" * 16, int(t0), t0, {"gpus": [{"name": "NVIDIA H100 80GB HBM3", "id_hash": "2" * 16}]})
+    rl = components(tmp_path)
+    _long_leases(rl)
+    rl.book.adopt_checkpoint(0)
+    [done] = rl.book.grant([LeaseRequest("M", ENV, (3,), 0)])[0].leases
+    assert rl.submissions.submit(done.lease_id, "M", group(8))["verdict"] == "in_zone"
+    rl.submissions.tag_instance(done.lease_id, "M", "a" * 16)
+    rl.book.grant([LeaseRequest("M", ENV, (4,), 0)])                     # still generating, expires in 2 h 50
+    row = controller_metrics(rl, t0 + 2400, cards=CardFeed(setups))      # 40 min without a new lease
+    assert row["miners/active"] == 1
+    assert (row["cards/rtx-a6000/miners"], row["cards/rtx-a6000/gpus"]) == (1, 1)
+    assert row.get("cards/h100-80gb-hbm3/gpus", 0) == 0                  # its last delivery was the A6000's
+    rl.close()
+
+
+def test_a_hotkey_without_a_recent_or_live_lease_is_not_a_miner(tmp_path):
+    import time
+
+    from reliquary.validator.miner_setup import MinerSetupStore
+    from reliquary.validator.rl_leases import LeaseRequest
+    from reliquary.validator.rl_metrics import CardFeed, controller_metrics
+
+    t0 = time.time()
+    setups = MinerSetupStore(tmp_path / "setups.sqlite3")
+    setups.put("M", "a" * 16, int(t0), t0, {"gpus": [{"name": "NVIDIA RTX A6000", "id_hash": "1" * 16}]})
+    rl = components(tmp_path)
+    _long_leases(rl)
+    rl.book.adopt_checkpoint(0)
+    [done] = rl.book.grant([LeaseRequest("M", ENV, (3,), 0)])[0].leases
+    assert rl.submissions.submit(done.lease_id, "M", group(8))["verdict"] == "in_zone"   # submitted, not expired
+    rl.book.grant([LeaseRequest("M", ENV, (4,), 0)], now=t0 - 4 * 3600)  # open, expired 30 min ago, unswept
+    row = controller_metrics(rl, t0 + 1200, cards=CardFeed(setups))
+    assert row["miners/active"] == 0 and row.get("cards/rtx-a6000/miners", 0) == 0
     rl.close()
 
 
@@ -946,3 +1003,41 @@ def test_the_operator_switches_the_price_level_the_carry_and_the_env_limits_by_e
     assert switched.lane_max_batches == 2.0 and switched.batch_env_factor == 1.5
     with pytest.raises(ValueError):
         rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={"RELIQUARY_RL_PRICE_MODE": "x"})
+
+
+def test_the_operator_tunes_the_price_level_by_env_var():
+    from reliquary.cli.main import build_task_entry, with_rl_async_params
+    from reliquary.constants import PROTOCOL_PROFILE_ID
+    from reliquary.protocol.profiles import resolve_protocol_profile
+    from reliquary.validator.rl_price import AsyncPriceParams
+
+    envs = sorted(resolve_protocol_profile(PROTOCOL_PROFILE_ID).environments)[:2]
+    entry = build_task_entry(task_id="rl-async", profile_id=PROTOCOL_PROFILE_ID, cap=0.4, overrides={},
+                             env_split={envs[0]: 0.75, envs[1]: 0.25})
+    declared = with_rl_async_params(entry, planned_tokens_per_period=2e8)
+    plain = rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={"RELIQUARY_RL_PRICE_MODE": "level"})
+    assert plain.price == AsyncPriceParams(mode="level")
+    tuned = rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={
+        "RELIQUARY_RL_PRICE_MODE": "level", "RELIQUARY_RL_PRICE_PAY_TARGET": "0.8",
+        "RELIQUARY_RL_PRICE_LEVEL_RISE_H": "1.02", "RELIQUARY_RL_PRICE_SUPPLY_HALFLIFE_S": "7200"})
+    assert (tuned.price.pay_target, tuned.price.level_rise_h, tuned.price.supply_halflife_s) == (0.8, 1.02, 7200.0)
+    assert tuned.price.level_decay_h == AsyncPriceParams().level_decay_h
+    with pytest.raises(ValueError):                    # out of range is refused at start, not mid-run
+        rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={"RELIQUARY_RL_PRICE_PAY_TARGET": "1.5"})
+
+
+def test_the_operator_sets_the_carry_ceiling_by_env_var():
+    from reliquary.cli.main import build_task_entry, with_rl_async_params
+    from reliquary.constants import PROTOCOL_PROFILE_ID
+    from reliquary.protocol.profiles import resolve_protocol_profile
+
+    envs = sorted(resolve_protocol_profile(PROTOCOL_PROFILE_ID).environments)[:2]
+    entry = build_task_entry(task_id="rl-async", profile_id=PROTOCOL_PROFILE_ID, cap=0.4, overrides={},
+                             env_split={envs[0]: 0.75, envs[1]: 0.25})
+    declared = with_rl_async_params(entry, planned_tokens_per_period=2e8)
+    assert rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={}).pay_carry_max_caps == 2.0
+    tuned = rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={
+        "RELIQUARY_RL_PAY_CARRY_PERIODS": "8", "RELIQUARY_RL_PAY_CARRY_MAX_CAPS": "4"})
+    assert (tuned.pay_carry_periods, tuned.pay_carry_max_caps) == (8, 4.0)
+    with pytest.raises(ValueError):
+        rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={"RELIQUARY_RL_PAY_CARRY_MAX_CAPS": "-1"})
