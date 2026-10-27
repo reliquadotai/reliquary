@@ -19,6 +19,23 @@ permissions:
   contents: read
 
 jobs:
+  native-evaluation-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest PyNaCl==1.6.2
+      - name: Check the signed native evaluation contract against its pinned upstream oracle
+        env:
+          AFFINE_NATIVE_EVALUATOR_FILE: ${{ runner.temp }}/mimo_evaluation.py
+        run: |
+          curl --fail --silent --show-error \
+            https://raw.githubusercontent.com/AffineFoundation/affine/ebf4f5f67dd34e3a13c6c275e1b9e3fd3c9766cd/subnet/mimo_evaluation.py \
+            --output "$AFFINE_NATIVE_EVALUATOR_FILE"
+          python -m pytest --noconftest tests/unit/test_affine_native_evaluation.py -q
   cpu-contracts:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

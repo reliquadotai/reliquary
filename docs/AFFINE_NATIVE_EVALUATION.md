@@ -116,3 +116,7 @@ file's pinned hash and executes its suite admission, evaluator and result
 validator with a scripted CPU runtime and grader. Its correct/wrong/capped/error
 rows must also pass this bridge's independent report checker. This checks report
 semantics without claiming real sampling mathematics or model execution.
+The dedicated native contract CI job downloads that exact pinned revision and
+runs the oracle alongside fixed32 coverage, partial-report rejection,
+cancellation, lost-lease and interrupted-attempt retry checks. It uses no model
+weights or GPU runtime.

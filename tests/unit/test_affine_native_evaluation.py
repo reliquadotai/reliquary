@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from threading import Event
 import time
 from types import ModuleType, SimpleNamespace
 import zipfile
@@ -181,6 +182,27 @@ def test_native_cli_dispatch_preserves_fixture_boundary(tmp_path, capsys):
     assert result["assurance"] == "fixture" and result["nativeParityVerified"] is False
     assert main(prefix + ["verify", "--bundle", str(bundle), "--workspace", str(workspace)]) == 0
     assert json.loads(capsys.readouterr().out) == result
+
+
+def test_fixed32_delivers_every_signed_attempt_and_refuses_partial_report(tmp_path):
+    path, config, job, manifest = intake(tmp_path)
+    suite = manifest["evaluation_sets"][0]
+    suite.update(name="fixed32", indices=list(range(1, 33)))
+    manifest["environments"][0]["spec"]["num_samples"] = 64
+    job["evaluation"]["set_name"] = "fixed32"
+    job["manifest"] = sign(manifest)
+    save(Path(config["jobEnvelope"]), sign(job))
+    bundle = tmp_path / "bundle"
+    native.prepare(path, bundle)
+    report, workspace = report_fixture(bundle, tmp_path)
+    result = native.verify(bundle, workspace)
+    assert (result["requested_count"], result["count"], result["successes"]) == (32, 32, 32)
+    value = json.loads(report.read_bytes())
+    assert [row["index"] for row in value["evaluation"]["rows"]] == suite["indices"]
+    value["evaluation"]["rows"].pop()
+    save(report, value)
+    with pytest.raises(ValueError, match="every original evaluation attempt"):
+        native.verify(bundle, workspace)
 
 
 def test_export_refuses_report_changed_after_verification(tmp_path, monkeypatch):
@@ -385,6 +407,38 @@ def test_lost_host_lease_stops_child_and_preserves_failed_attempt(
     assert not (workspace / "lease.private.json").exists()
     with pytest.raises(ProcessLookupError):
         os.kill(state["pid"], 0)
+    assert not (workspace / "evaluation-result.private.json").exists()
+    with pytest.raises(ValueError, match="previous native attempt"):
+        native.run(bundle, workspace, fixture=True)
+
+
+def test_cancellation_stops_child_without_delivering_a_successful_result(tmp_path, monkeypatch):
+    bundle, *_ = prepared(tmp_path)
+    original = subprocess.Popen
+    monkeypatch.setattr(
+        native.subprocess,
+        "Popen",
+        lambda *args, **kwargs: original(
+            [sys.executable, "-c", "import time;time.sleep(30)"], **kwargs
+        ),
+    )
+    stopped = Event()
+    calls = 0
+
+    def lease():
+        nonlocal calls
+        calls += 1
+        if calls > 2:
+            stopped.set()
+
+    workspace = tmp_path / "work"
+    with pytest.raises(ValueError, match="did not complete"):
+        native.run(bundle, workspace, fixture=True, stop_event=stopped, lease_check=lease)
+    state = json.loads((workspace / "state.private.json").read_bytes())
+    assert state["stage"] == "cancelled"
+    with pytest.raises(ProcessLookupError):
+        os.kill(state["pid"], 0)
+    assert not (workspace / "lease.private.json").exists()
     assert not (workspace / "evaluation-result.private.json").exists()
 
 
