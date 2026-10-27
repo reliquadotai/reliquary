@@ -37,7 +37,7 @@ BASE = "base"
 _SHORT = re.compile(r"[a-z0-9][a-z0-9-]{0,15}")
 # the merged contract of every job served: one job's contract would refuse the others' environments
 DEFAULT_START = ("reliquary tasks contract {task_ids} > {contract} && "
-                 "RELIQUARY_TASK_ID={job} RELIQUARY_TASK_CONTRACT={contract} RELIQUARY_CORPUS_HOT_JOBS=1 "
+                 "RELIQUARY_TASK_ID={jobs} RELIQUARY_TASK_CONTRACT={contract} RELIQUARY_CORPUS_HOT_JOBS=1 "
                  "exec reliquary validate --wallet-name {wallet} --hotkey {hotkey} "
                  "--http-host 0.0.0.0 --http-port {port} --no-set-weights")
 
@@ -433,6 +433,11 @@ def live_ports(settings: Settings) -> Ports:
         return process.pid
 
     def alive(pid: int) -> bool:
+        try:
+            if os.waitpid(pid, os.WNOHANG)[0] == pid:    # our child exited: reap it, a zombie still answers kill 0
+                return False
+        except ChildProcessError:
+            pass                                          # not our child (a schedule restarted under the same pid)
         try:
             os.kill(pid, 0)
         except ProcessLookupError:

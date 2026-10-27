@@ -370,3 +370,4 @@ def test_the_validator_runs_the_merged_contract_of_every_job_it_serves(tmp_path)
     world.backups = [50]
     s.tick(execute=True)
     assert "tasks contract --task-id eval-r7-s00050-aime --task-id eval-r7-s00050-gpqa >" in world.started[0]
+    assert "RELIQUARY_TASK_ID=eval-r7-s00050-aime,eval-r7-s00050-gpqa " in world.started[0]
