@@ -92,6 +92,13 @@ PRICE_MODE_PARAM, PRICE_MODE_ENV = "rl_price_mode", "RELIQUARY_RL_PRICE_MODE"   
 CARRY_PARAM, CARRY_ENV = "rl_pay_carry_periods", "RELIQUARY_RL_PAY_CARRY_PERIODS"             # 0: excess burns
 CARRY_CAPS_PARAM, CARRY_CAPS_ENV = "rl_pay_carry_max_caps", "RELIQUARY_RL_PAY_CARRY_MAX_CAPS"  # most carried, caps
 LANE_MAX_PARAM, LANE_MAX_ENV = "rl_lane_max_batches", "RELIQUARY_RL_LANE_MAX_BATCHES"         # per-env queue max
+# Trainer outages paid at the recent mean (rl_ledger, 2026-10-27): on/off, the heartbeat grace, the longest filled.
+OUTAGE_FILL_PARAM, OUTAGE_FILL_ENV = "rl_pay_outage_fill", "RELIQUARY_RL_PAY_OUTAGE_FILL"
+OUTAGE_GRACE_PARAM, OUTAGE_GRACE_ENV = "rl_pay_outage_grace_s", "RELIQUARY_RL_PAY_OUTAGE_GRACE_S"
+OUTAGE_MAX_PARAM, OUTAGE_MAX_ENV = "rl_pay_outage_max_s", "RELIQUARY_RL_PAY_OUTAGE_MAX_S"
+# Share of a probation hotkey's repeat out-of-zone scans audited (its first scans always are; rl_submit).
+PROBATION_REPEAT_PARAM, PROBATION_REPEAT_ENV = ("rl_probation_repeat_audit_rate",
+                                                "RELIQUARY_RL_PROBATION_REPEAT_AUDIT_RATE")
 BATCH_FACTOR_PARAM, BATCH_FACTOR_ENV = "rl_batch_env_factor", "RELIQUARY_RL_BATCH_ENV_FACTOR"  # per-env batch cap
 BATCH_GROUPS_PARAM, BATCH_GROUPS_ENV = "rl_batch_groups", "RELIQUARY_RL_BATCH_GROUPS"         # the trainer's batch
 # Level-mode tuning: AsyncPriceParams field f is read from RELIQUARY_RL_PRICE_<F> (env) or rl_price_<f> (registry).
@@ -105,7 +112,7 @@ DEFAULT_LEASE_MARGIN = 2.0
 EXPIRE_EVERY_S = 5.0
 AUDIT_EVERY_S = 2.0
 AUDIT_LIMIT = 8
-MAX_TRAINER_AUDITS = 32           # audit jobs one trainer-link take may ask for
+MAX_TRAINER_AUDITS = 256          # audit jobs one trainer-link take may ask for
 LEDGER_EVERY_S = 30.0
 PRICE_EVERY_S = 30.0
 CHECKPOINT_FOLLOW_EVERY_S = 10.0
@@ -178,6 +185,10 @@ class RlAsyncSettings:
     lane_max_batches: float | None = None       # an env holds at most this many batches of its group share (None: off)
     batch_env_factor: float | None = None       # one take gives an env this x its group share, then spills (None: off)
     batch_groups: int = 512                     # the trainer's batch, in groups (the limits' unit)
+    pay_outage_fill: bool = False               # pay the recent mean while the trainer is down (rl_ledger)
+    pay_outage_grace_s: float = 600.0           # a heartbeat silence longer than this is an outage
+    pay_outage_max_s: float = 86_400.0          # an outage is filled for at most this long
+    probation_repeat_audit_rate: float = 1.0    # repeat out-of-zone scans audited in probation (first scans: all)
 
     def lane_reserves(self) -> dict[str, int]:
         """env -> buffered groups kept for it: ``lane_reserve`` x the cap, split by the target shares."""
@@ -282,9 +293,18 @@ def rl_async_settings(entry, cap: float, *, run: str | None = None,
         pay_carry_max_caps=float(_switch(params, operator_env, CARRY_CAPS_PARAM, CARRY_CAPS_ENV, 2.0)),
         lane_max_batches=None if lane_max is None else float(lane_max),
         batch_env_factor=None if batch_factor is None else float(batch_factor),
-        batch_groups=int(_switch(params, operator_env, BATCH_GROUPS_PARAM, BATCH_GROUPS_ENV, 512)))
+        batch_groups=int(_switch(params, operator_env, BATCH_GROUPS_PARAM, BATCH_GROUPS_ENV, 512)),
+        pay_outage_fill=str(_switch(params, operator_env, OUTAGE_FILL_PARAM, OUTAGE_FILL_ENV, "1")).strip().lower()
+        not in ("0", "false", "off", "no"),
+        pay_outage_grace_s=float(_switch(params, operator_env, OUTAGE_GRACE_PARAM, OUTAGE_GRACE_ENV, 600.0)),
+        pay_outage_max_s=float(_switch(params, operator_env, OUTAGE_MAX_PARAM, OUTAGE_MAX_ENV, 86_400.0)),
+        probation_repeat_audit_rate=float(_switch(params, operator_env, PROBATION_REPEAT_PARAM,
+                                                  PROBATION_REPEAT_ENV, 0.25)))
     if switches["pay_carry_periods"] < 0 or switches["pay_carry_max_caps"] < 0 or switches["batch_groups"] < 1:
         raise ValueError("pay carry periods >= 0, carry max caps >= 0, batch groups >= 1")
+    if switches["pay_outage_grace_s"] <= 0 or switches["pay_outage_max_s"] < 0 \
+            or not 0.0 <= switches["probation_repeat_audit_rate"] <= 1.0:
+        raise ValueError("outage grace > 0, outage max >= 0, probation repeat audit rate in [0, 1]")
     return RlAsyncSettings(task_id=str(entry.task_id), cap=float(cap),
                            run=run or os.environ.get(RUN_ENV) or str(entry.task_id), targets=targets,
                            planned_tokens_per_period=float(params[PLANNED_TOKENS_PARAM]), lease_expiry_s=expiry,
@@ -343,6 +363,11 @@ def build_rl_async(settings: RlAsyncSettings, *, path: str | os.PathLike[str], g
     try:
         collector = (LeaseCollector(book) if collector_interval_s is None
                      else LeaseCollector(book, interval_s=collector_interval_s))
+        if submit_config is None:
+            from reliquary.validator.rl_submit import SubmitConfig
+
+            submit_config = SubmitConfig(
+                probation_repeat_audit_rate=getattr(settings, "probation_repeat_audit_rate", 1.0))
         submissions = RlSubmissions(book, grader, config=submit_config, clock=clock)
         if settings.batch_env_factor is not None:
             submissions.buffer.batch_caps = limits[0].batch_caps
@@ -352,7 +377,10 @@ def build_rl_async(settings: RlAsyncSettings, *, path: str | os.PathLike[str], g
         ledger = RlPayLedger(book, submissions, prices,
                              LedgerConfig(task_id=settings.task_id, cap=settings.cap, env_pay_k=settings.env_pay_k,
                                           carry_periods=settings.pay_carry_periods,
-                                          carry_max_caps=getattr(settings, "pay_carry_max_caps", 2.0)),
+                                          carry_max_caps=getattr(settings, "pay_carry_max_caps", 2.0),
+                                          outage_fill=getattr(settings, "pay_outage_fill", False),
+                                          outage_grace_s=getattr(settings, "pay_outage_grace_s", 600.0),
+                                          outage_max_s=getattr(settings, "pay_outage_max_s", 86_400.0)),
                              clock=clock)
     except BaseException:
         book.close()
@@ -446,6 +474,7 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
     route("POST", "report", report)
     route("POST", "audits", take_audits)
     route("POST", "audit", report_audit)
+    route("POST", "heartbeat", lambda b: rl.ledger.trainer_beat() or {"ok": True})
 
     async def checkpoint(request: Request) -> JSONResponse:
         """``/rl/checkpoint``'s answer for the trainer's resume (it reaches this listener only)."""
@@ -891,7 +920,8 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
                                                        for f in PRICE_TUNING_FIELDS},
                                       **{key: getattr(settings, key, None) for key in (
                                           "pay_carry_periods", "pay_carry_max_caps", "lane_max_batches",
-                                          "batch_env_factor")}},
+                                          "batch_env_factor", "pay_outage_fill", "pay_outage_grace_s",
+                                          "pay_outage_max_s", "probation_repeat_audit_rate")}},
                    role="controller", version=settings.run)
     publisher = _public_boards(rl, wallet, validator_hotkey, signer_client)
     audit_model, source = None, audit_source()

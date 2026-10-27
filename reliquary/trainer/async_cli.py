@@ -79,11 +79,13 @@ def async_trainer_settings(env: Mapping[str, str] = os.environ) -> dict[str, Any
         "hf_milestone_every": _int(env, "RELIQUARY_RL_HF_BACKUP_MILESTONE_EVERY", None),
         # the out-of-zone audits on this trainer's weights (the validator's default audit source)
         "audits": str(env.get("RELIQUARY_RL_TRAINER_AUDITS", "1")).strip() != "0",
-        "audits_per_step": _int(env, "RELIQUARY_RL_TRAINER_AUDITS_PER_STEP", 8),
-        "audit_budget_s": float(env.get("RELIQUARY_RL_TRAINER_AUDIT_BUDGET_S", "120")),
+        "audits_per_step": _int(env, "RELIQUARY_RL_TRAINER_AUDITS_PER_STEP", 128),
+        "audit_budget_s": float(env.get("RELIQUARY_RL_TRAINER_AUDIT_BUDGET_S", "420")),
         # the next batch is downloaded while this one trains; the step's reports go out in parallel
         "prefetch": str(env.get("RELIQUARY_RL_TRAINER_PREFETCH", "1")).strip() != "0",
         "report_workers": _int(env, "RELIQUARY_RL_TRAINER_REPORT_WORKERS", 16),
+        # liveness for the validator's outage pay (0: off)
+        "heartbeat_s": float(env.get("RELIQUARY_RL_TRAINER_HEARTBEAT_S", "60")),
     }
 
 
@@ -244,11 +246,18 @@ def run_async_train_worker() -> None:
             train_step_fn=step_fn, audits=audits,
             global_step_hint=None if version is None else version * settings["steps_per_checkpoint"])
         live["trainer"] = trainer
+        heartbeat = None
+        if settings["heartbeat_s"] > 0:
+            from reliquary.trainer.rl_link import TrainerHeartbeat
+
+            heartbeat = TrainerHeartbeat(link, settings["heartbeat_s"]).start()
         logger.info("train-async starting: task %s, run %s, target mix %s (priced, not enforced), checkpoint %d",
                     task["task_id"], task["run"], task["targets"], trainer.version)
         try:
             run_forever(trainer)
         finally:
+            if heartbeat is not None:
+                heartbeat.stop()
             trainer.close()
             if backup is not None:
                 backup.close(timeout=60)
