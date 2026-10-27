@@ -128,7 +128,7 @@ class RlPayLedger:
         with self.book.transaction():
             db = self.book.db
             cursor = db.execute("SELECT seq FROM rl_pay_cursor WHERE id=0").fetchone()[0]
-            events = self.submissions.events(cursor)[:limit]
+            events = self.submissions.events(cursor, limit=limit)
             if not events:
                 return 0
             for event in events:

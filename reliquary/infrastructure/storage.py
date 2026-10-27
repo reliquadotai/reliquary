@@ -529,7 +529,7 @@ def public_checkpoint_bucket() -> str:
     return os.getenv("R2_PUBLIC_BUCKET", "reliquary-public")
 
 
-def public_checkpoint_client():
+def public_checkpoint_client(*, metadata_only: bool = False):
     """Sync boto3 client for the checkpoint bucket, from R2_PUBLIC_ENDPOINT,
     R2_PUBLIC_ACCESS_KEY_ID and R2_PUBLIC_SECRET_ACCESS_KEY: a token scoped to
     that bucket alone, separate from the private buckets' R2_* credentials."""
@@ -547,9 +547,10 @@ def public_checkpoint_client():
         aws_secret_access_key=os.getenv("R2_PUBLIC_SECRET_ACCESS_KEY", ""),
         config=_SyncConfig(
             signature_version="s3v4",
-            connect_timeout=15,
-            read_timeout=120,
-            retries={"max_attempts": 5, "mode": "standard"},
+            connect_timeout=1 if metadata_only else 15,
+            read_timeout=2 if metadata_only else 120,
+            retries={"total_max_attempts": 1, "mode": "standard"} if metadata_only else
+                    {"max_attempts": 5, "mode": "standard"},
             max_pool_connections=32,
         ),
     )

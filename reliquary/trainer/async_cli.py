@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any, Mapping
@@ -91,19 +92,22 @@ def resume_weights(link, *, validator_hotkey: str, work_dir: Path, sync=None, fe
     """``(state, version, model_files_dir)`` of the latest published checkpoint, or None on a fresh book. A published
     version ahead of the book (published, then the trainer died before adopting it) is adopted here."""
     latest = link.latest_checkpoint
-    if latest is None:
-        return None
     if fetch is None:
-        fetch = link.checkpoint
+        fetch = link.checkpoint_if_available if latest is None else link.checkpoint
+    answer = fetch()
+    if answer is None:
+        if latest is None:
+            return None
+        raise RuntimeError("the adopted checkpoint is unavailable")
     if sync is None:
         from reliquary.miner.ckpt_sync import CheckpointSync
 
         sync = CheckpointSync(validator_hotkey=validator_hotkey, work_dir=work_dir / "download",
                               model_dir=work_dir / "model-files")
-    state, version, _ = sync.sync(fetch(), None, None)
-    if version < latest:
+    state, version, _ = sync.sync(answer, None, None)
+    if latest is not None and version < latest:
         raise RuntimeError(f"the bucket's latest checkpoint {version} is behind the adopted {latest}")
-    if version > latest:
+    if latest is None or version > latest:
         logger.warning("checkpoint %d was published but not adopted; adopting it", version)
         link.adopt_checkpoint(version)
     return state, version, sync.model_dir
@@ -150,9 +154,11 @@ def run_async_train_worker() -> None:
             _run_train_follower(dist_ctx, channel)
             return
 
+    link = None
     try:
         settings = async_trainer_settings()
         link = TrainerLink(settings["url"], settings["token"])
+        link.claim_ownership(start_heartbeat=True)
         task = link.config()
         telemetry.init(settings["validator_hotkey"], {
             "task_id": task["task_id"], "run": task["run"], "targets": task["targets"], "backend": backend,
@@ -211,7 +217,8 @@ def run_async_train_worker() -> None:
         publisher = DeltaPublisher(run=str(task["run"]),
                                    store=R2ObjectStore(public_checkpoint_client(), public_checkpoint_bucket()),
                                    staging_dir=state_dir / "staging", anchor_interval=settings["anchor_interval"],
-                                   model_dir=model_dir)
+                                   model_dir=model_dir, writer_id=link.writer_id,
+                                   publish_index=link.publish_index, assert_owner=link.assert_ownership)
         backup = None
         if settings["hf_prefix"]:
             from reliquary.trainer.hf_backup import BackgroundHfBackup, HfRepoPerBackup
@@ -254,9 +261,17 @@ def run_async_train_worker() -> None:
                 backup.close(timeout=60)
             telemetry.finish()
     finally:
-        # Followers block on the next command; release them on any exit.
-        if channel is not None:
+        # A failed collective cannot safely participate in another broadcast.
+        failed = sys.exc_info()[0] is not None
+        if channel is not None and not failed:
             channel.send("STOP")
+        if link is not None:
+            try:
+                link.close()
+            except Exception:
+                if not failed:
+                    raise
+                logger.exception("trainer link cleanup failed")
 
 
 def run_forever(trainer, *, steps: int | None = None) -> None:

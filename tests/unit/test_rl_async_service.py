@@ -183,9 +183,12 @@ def test_the_trainer_link_needs_its_token_and_round_trips(tmp_path):
     assert [g.lease_id for g in taken] == [lease.lease_id] and link.depth() == {}
     assert link.requeue() == 1 and link.depth() == {ENV: 1}
     assert link.take(4)[0].completions == taken[0].completions
-    link.report_training(lease.lease_id, rollout_match=[1.0] * 16, accepted=True, matched_tokens=[3] * 16)
+    receipt = link.admit_training(lease.lease_id, [[] for _ in range(16)])
+    link.report_training(lease.lease_id, rollout_match=[1.0] * 16, accepted=True, matched_tokens=[3] * 16,
+                         admission_id=receipt["admission_id"])
     with pytest.raises(TrainerLinkError) as missing:
-        link.report_training(lease.lease_id, rollout_match=[1.0] * 16, accepted=True)
+        link.report_training(lease.lease_id, rollout_match=[1.0] * 16, accepted=True,
+                             admission_id=receipt["admission_id"])
     assert missing.value.status == 404                                  # a first attempt: not a resend
     with pytest.raises(TrainerLinkError):
         link.adopt_checkpoint(-1)
@@ -217,6 +220,56 @@ def test_the_trainer_takes_the_audits_and_reports_their_verdicts_through_its_lin
     with pytest.raises(TrainerLinkError) as missing:
         link.report_audit(lease.lease_id, AuditResult(True, None, (0.99,) * 16))
     assert missing.value.status == 404
+    rl.close()
+
+
+def test_detached_audit_failures_survive_restarts_and_a_lost_start_response(tmp_path, monkeypatch):
+    from reliquary.trainer.audits import TrainerAudits
+    from reliquary.trainer.rl_link import TrainerLink
+    from reliquary.validator.rl_leases import LeaseRequest
+
+    rl = components(tmp_path)
+    app = FastAPI()
+    app.include_router(build_rl_trainer_router(rl, token=TOKEN))
+    client = TestClient(app)
+    link = TrainerLink("http://testserver", TOKEN, client=client, patience_s=1.0, backoff_s=(0.0,))
+    link.adopt_checkpoint(0)
+    lease = rl.book.grant([LeaseRequest("A", ENV, (5,), 0)])[0].leases[0]
+    rl.submissions.submit(lease.lease_id, "A", group(0))
+    request, lost = client.request, []
+
+    def lose_first_start(method, url, **kw):
+        response = request(method, url, **kw)
+        if url.endswith("/audit_start") and not lost:
+            lost.append(True)
+            raise httpx.ReadTimeout("lost start response")
+        return response
+
+    monkeypatch.setattr(client, "request", lose_first_start)
+    assert link.start_audit(lease.lease_id, "c" * 32)
+    assert rl.book.db.execute("SELECT attempts FROM rl_audits").fetchone()[0] == 1
+    assert not link.report_audit_failure(lease.lease_id, "c" * 32)
+    forwarded = []
+
+    def fail(model, pending):
+        forwarded.append(pending.lease_id)
+        raise RuntimeError("forward failed")
+
+    # Each new trainer object sees the same durable attempts. Failure never becomes a miner failure verdict.
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="forward failed"):
+            TrainerAudits(link, audit_fn=fail).run(object(), limit=8, budget_s=30)
+    assert TrainerAudits(link, audit_fn=fail).run(object(), limit=8, budget_s=30) == 0
+    assert forwarded == [lease.lease_id] * 2
+    assert rl.submissions.group(lease.lease_id)["audit"] == "inconclusive"
+    assert rl.book.db.execute("SELECT COUNT(*) FROM rl_verdicts").fetchone()[0] == 0
+    assert rl.book.banned_until("A") is None
+    for path in ("audit_start", "audit_failure"):
+        assert client.post(f"/rl/trainer/{path}", json={}).status_code == 401
+    assert client.post("/rl/trainer/audit_start", headers={"Authorization": f"Bearer {TOKEN}"},
+                       json={"lease_id": lease.lease_id, "attempt_id": "invalid"}).status_code == 409
+    assert client.post("/rl/trainer/audit_start", headers=link._headers,
+                       json={"lease_id": lease.lease_id, "attempt_id": "invalid"}).status_code == 422
     rl.close()
 
 
@@ -262,9 +315,10 @@ def test_a_lost_report_answer_is_resent_and_counts_as_done(tmp_path):
             self.inner, self.calls = inner, 0
 
         def request(self, *args, **kwargs):
-            self.calls += 1
+            report = str(args[1]).endswith("/report")
+            self.calls += int(report)
             answer = self.inner.request(*args, **kwargs)
-            if self.calls == 1:
+            if report and self.calls == 1:
                 raise httpx.ReadTimeout("lost")
             return answer
 
@@ -279,7 +333,9 @@ def test_a_lost_report_answer_is_resent_and_counts_as_done(tmp_path):
     rl.buffer.take(1)
     flaky = LosesFirstAnswer(TestClient(app))
     link = TrainerLink("http://testserver", TOKEN, client=flaky, sleep=lambda s: None)
-    link.report_training(lease.lease_id, rollout_match=[1.0] * 16, accepted=True)
+    receipt = link.admit_training(lease.lease_id, [[] for _ in range(16)])
+    link.report_training(lease.lease_id, rollout_match=[1.0] * 16, accepted=True,
+                         admission_id=receipt["admission_id"])
     assert flaky.calls == 2 and [e["kind"] for e in rl.submissions.events()] == ["trained"]
     rl.close()
 
@@ -305,7 +361,7 @@ def test_the_trainer_resumes_from_the_latest_published_checkpoint(tmp_path):
             return {"w": torch.zeros(1)}, self.version, None
 
     fresh = Link(None)
-    assert resume_weights(fresh, validator_hotkey="v", work_dir=tmp_path, sync=Sync(0), fetch=dict) is None
+    assert resume_weights(fresh, validator_hotkey="v", work_dir=tmp_path, sync=Sync(0), fetch=lambda: None) is None
     behind = Link(3)
     state, version, files = resume_weights(behind, validator_hotkey="v", work_dir=tmp_path, sync=Sync(4),
                                            fetch=dict)
@@ -391,6 +447,7 @@ async def test_end_to_end_lease_submit_train_pay_and_sync(tmp_path):
                               sign_fn=lambda payload: VALIDATOR.sign(payload), validator_hotkey=VALIDATOR.ss58_address,
                               presign=lambda key: f"mem://{key}", refresh_seconds=0)
     rl = components(tmp_path, board=board)
+    rl.checkpoint_store = store
     server = ValidatorServer()
     mount_rl_async(server, rl, validator_hotkey=VALIDATOR.ss58_address)
     served, trainer_served = Served(server.app), Served(build_rl_trainer_app(rl, token=TOKEN))
@@ -407,12 +464,16 @@ async def test_end_to_end_lease_submit_train_pay_and_sync(tmp_path):
                 n = len(g.rollouts[0].commit["tokens"]) - g.rollouts[0].commit["rollout"]["prompt_length"]
                 gate.admit(g.rollouts, [(30, 30, n, n)] * len(g.rollouts))
             gate.judge([])
+            gate.check_commit()
             with torch.no_grad():
                 model.weight[0, :3] += 1.0
             return model
 
         link = TrainerLink(trainer_served.url, TOKEN, patience_s=5.0)
-        publisher = DeltaPublisher(run="smoke", store=store, staging_dir=tmp_path / "staging", model_dir=model_dir)
+        link.claim_ownership()
+        publisher = DeltaPublisher(run="smoke", store=store, staging_dir=tmp_path / "staging", model_dir=model_dir,
+                                   writer_id=link.writer_id, publish_index=link.publish_index,
+                                   assert_owner=link.assert_ownership)
         trainer = AsyncTrainer(model, config=AsyncTrainerConfig(batch_groups=4),
                                buffer=link, submissions=link, book=link, publisher=publisher,
                                train_step_fn=fake_step)
@@ -587,6 +648,31 @@ def test_the_controller_wandb_row_reads_prices_buffer_leases_and_miners(tmp_path
     row = controller_metrics(rl, time.time())
     assert row["leases/sandbox_failure_released"] == 1 and row[f"leases_released/{ENV}/box_failed"] == 1
     assert row["leases/released"] == 1 and "leases/open" not in row
+    rl.close()
+
+
+def test_audit_backlog_metrics_exclude_history_and_show_age_and_infrastructure_exhaustion(tmp_path):
+    from reliquary.validator.rl_leases import LeaseRequest
+    from reliquary.validator.rl_metrics import controller_metrics
+    from reliquary.validator.rl_submit import AuditResult
+
+    rl = components(tmp_path)
+    rl.book.adopt_checkpoint(0)
+    leases = rl.book.grant([LeaseRequest("A", ENV, (3, 4, 5), 0)])[0].leases
+    for i, lease in enumerate(leases):
+        rl.submissions.submit(lease.lease_id, "A", group(0), arrived_at=100.0 + i)
+    rl.submissions.report_audit(leases[0].lease_id, AuditResult(True))
+    assert rl.submissions.start_audit(leases[1].lease_id, "d" * 32)
+    assert not rl.submissions.report_audit_failure(leases[1].lease_id, "d" * 32)
+    assert rl.submissions.start_audit(leases[1].lease_id, "f" * 32)
+    assert rl.submissions.start_audit(leases[2].lease_id, "e" * 32, max_attempts=1)
+    assert rl.submissions.report_audit_failure(leases[2].lease_id, "e" * 32, max_attempts=1)
+    row = controller_metrics(rl, 200.0)
+    assert row["audits/queued"] == 1 and row["audits/oldest_age_s"] == 99.0
+    assert row["audits/retried"] == 1 and row["audits/infrastructure_inconclusive"] == 1
+    rl.submissions.report_audit(leases[1].lease_id, AuditResult(True))
+    empty = controller_metrics(rl, 300.0)
+    assert empty["audits/queued"] == empty["audits/oldest_age_s"] == empty["audits/retried"] == 0
     rl.close()
 
 
@@ -878,7 +964,12 @@ def test_invalid_judged_flag_does_not_consume_a_group(tmp_path, judged):
     assert rl.submissions.submit(lease.lease_id, "A", group(8))["verdict"] == "in_zone"
     app = FastAPI()
     app.include_router(build_rl_trainer_router(rl, token=TOKEN))
-    response = TestClient(app).post("/rl/trainer/report", headers={"Authorization": "Bearer " + TOKEN}, json={
+    client = TestClient(app)
+    from reliquary.trainer.rl_link import TrainerLink
+
+    link = TrainerLink("http://testserver", TOKEN, client=client, patience_s=0)
+    link.claim_ownership()
+    response = client.post("/rl/trainer/report", headers=link._headers, json={
         "lease_id": lease.lease_id, "rollout_match": [0.0] * 16, "accepted": False, "judged": judged})
     assert response.status_code == 422
     assert rl.buffer.get(lease.lease_id) is not None

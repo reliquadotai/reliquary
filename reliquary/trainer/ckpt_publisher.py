@@ -26,14 +26,15 @@ trainer is free to keep updating its own weights. It never reads deltas back.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
 import logging
-from pathlib import Path
+import re
 import shutil
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -201,10 +202,18 @@ class DeltaPublisher:
         model_dir: str | Path | None = None,
         clock: Callable[[], float] = time.time,
         prune_grace_s: float = PRUNE_GRACE_S,
+        writer_id: str | None = None,
+        publish_index: Callable[[dict], None] | None = None,
+        assert_owner: Callable[[], None] | None = None,
     ) -> None:
         if anchor_interval < 1 or cumulative_stride < 1 or keep_anchors < 1:
             raise ValueError("intervals and keep_anchors must be positive")
         self.run, self._store = run, store
+        if writer_id is not None and not re.fullmatch(r"[1-9][0-9]*-[0-9a-f]{32}", writer_id):
+            raise ValueError("invalid checkpoint writer identity")
+        self._writer_id, self._publish_index, self._assert_owner = writer_id, publish_index, assert_owner
+        if writer_id is not None and (publish_index is None or assert_owner is None):
+            raise ValueError("a checkpoint writer requires fenced index publication")
         self._staging = Path(staging_dir)
         self.anchor_interval, self.cumulative_stride = anchor_interval, cumulative_stride
         self.max_cumulative_bases = max_cumulative_bases
@@ -238,6 +247,8 @@ class DeltaPublisher:
         return self._prev
 
     def publish(self, version: int, state: Mapping[str, torch.Tensor]) -> dict:
+        if self._assert_owner is not None:
+            self._assert_owner()
         version = int(version)
         if self._prev_version is not None and version <= self._prev_version:
             raise ValueError(f"version {version} does not follow {self._prev_version}")
@@ -263,7 +274,10 @@ class DeltaPublisher:
             "anchors": self.anchors, "deltas": self.deltas,
             "published_at": round(float(self._clock()), 3),
         }
-        self._store.put_bytes(index_key(self.run), json.dumps(index, sort_keys=True).encode())
+        if self._publish_index is None:
+            self._store.put_bytes(index_key(self.run), json.dumps(index, sort_keys=True).encode())
+        else:
+            self._publish_index(index)
         self._update_pair = (self._prev, snapshot) if self._prev is not None else None
         self._prev, self._prev_version, self._prev_sha = snapshot, version, sha
         if dropped:
@@ -285,6 +299,14 @@ class DeltaPublisher:
 
     # ------------------------------------------------------------------ steps
 
+    def _object_key(self, key: str) -> str:
+        if self._assert_owner is not None:
+            self._assert_owner()
+        if self._writer_id is None:
+            return key
+        prefix = index_key(self.run).rsplit("/", 1)[0] + "/"
+        return prefix + "writers/" + self._writer_id + "/" + key[len(prefix):]
+
     def _put_delta(self, state, masks, from_version: int, base_sha: str, to_version: int,
                    sha: str) -> dict | None:
         delta = delta_from_masks(state, masks, from_version=from_version, to_version=to_version,
@@ -293,7 +315,7 @@ class DeltaPublisher:
         if (self.max_cumulative_bytes is not None and to_version - from_version > 1
                 and len(blob) > self.max_cumulative_bytes):
             return None
-        key = delta_key(self.run, from_version, to_version)
+        key = self._object_key(delta_key(self.run, from_version, to_version))
         self._store.put_bytes(key, blob)
         entry = {"from": from_version, "to": to_version, "key": key, "size": len(blob),
                  "sha256": hashlib.sha256(blob).hexdigest(), "target_sha256": sha}
@@ -328,7 +350,7 @@ class DeltaPublisher:
         try:
             files = []
             for path in write_anchor_shards(state, folder, shard_bytes=self._shard_bytes):
-                key = anchor_key(self.run, version, path.name)
+                key = self._object_key(anchor_key(self.run, version, path.name))
                 self._store.put_file(key, path)
                 files.append({"key": key, "size": path.stat().st_size,
                               "sha256": _sha256_file(path)})
@@ -339,7 +361,7 @@ class DeltaPublisher:
             anchor["model_files"] = []
             for path in self._model_files:
                 data = path.read_bytes()
-                key = model_file_key(self.run, version, path.name)
+                key = self._object_key(model_file_key(self.run, version, path.name))
                 self._store.put_bytes(key, data)
                 anchor["model_files"].append({"name": path.name, "key": key, "size": len(data),
                                               "sha256": hashlib.sha256(data).hexdigest()})
@@ -367,6 +389,8 @@ class DeltaPublisher:
         while self._doomed and self._doomed[0][0] <= now:
             for key in self._doomed.pop(0)[1]:
                 try:
+                    if self._assert_owner is not None:
+                        self._assert_owner()
                     self._store.delete(key)
                 except Exception:
                     logger.warning("could not delete %s; left in the bucket", key, exc_info=True)
