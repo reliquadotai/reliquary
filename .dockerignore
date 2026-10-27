@@ -4,6 +4,10 @@
 __pycache__
 *.pyc
 *.pyo
+*.private.*
+*.affine-private.*
+.private-research
+affine-state
 .pytest_cache
 docs/superpowers
 tests/*

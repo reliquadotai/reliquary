@@ -46,6 +46,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+affine = ["PyNaCl==1.6.2"]
 vision = [
     "torch==2.7.0",
     "peft==0.21.2",
@@ -58,6 +59,7 @@ dev = [
     "Pillow==13.0.0",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "PyNaCl==1.6.2",
     "pytest-timeout>=2.3",
     "pytest-xdist>=3.5",
 ]
@@ -77,6 +79,7 @@ sandbox-test = [
 
 [project.scripts]
 reliquary = "reliquary.cli.main:app"
+affine-runtime = "reliquary.integrations.affine_cli:main"
 
 [build-system]
 requires = ["hatchling"]

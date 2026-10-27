@@ -1,0 +1,68 @@
+name: Frozen scoring contracts
+
+on:
+  pull_request:
+    paths:
+      - "reliquary/integrations/affine*"
+      - "tests/unit/test_affine*"
+      - "docker/Dockerfile.affine-scoring"
+      - ".github/workflows/affine-scoring.yml"
+  push:
+    branches: [main]
+    paths:
+      - "reliquary/integrations/affine*"
+      - "tests/unit/test_affine*"
+      - "docker/Dockerfile.affine-scoring"
+      - ".github/workflows/affine-scoring.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  native-evaluation-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest PyNaCl==1.6.2
+      - name: Check the signed native evaluation contract against its pinned upstream oracle
+        env:
+          AFFINE_NATIVE_EVALUATOR_FILE: ${{ runner.temp }}/mimo_evaluation.py
+        run: |
+          curl --fail --silent --show-error \
+            https://raw.githubusercontent.com/AffineFoundation/affine/ebf4f5f67dd34e3a13c6c275e1b9e3fd3c9766cd/subnet/mimo_evaluation.py \
+            --output "$AFFINE_NATIVE_EVALUATOR_FILE"
+          python -m pytest --noconftest tests/unit/test_affine_native_evaluation.py -q
+  cpu-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest numpy==2.3.5
+      - run: python -m pytest --noconftest tests/unit/test_affine_scoring*.py -q
+      - name: Build the candidate with CPU wheels
+        run: docker build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu -f docker/Dockerfile.affine-scoring -t scoring-runtime:test .
+      - name: Check offline imports and unprivileged fixed-path traversal
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,size=128m \
+            --entrypoint python scoring-runtime:test -c '
+          import os, torch, numpy, transformers
+          from transformers import AutoModelForImageTextToText
+          from reliquary.integrations import affine_scoring
+          assert os.getuid() == 10001 and os.access("/root/sn120-scorer-v9", os.X_OK)
+          assert numpy.__version__ == "2.3.5" and transformers.__version__ == "5.10.4"
+          assert not torch.cuda.is_available()
+          print("Offline imports passed; GPU execution remains unqualified.")'
+      - name: Rehearse the CLI in the offline CPU container
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 64 --memory 1g --cpus 2 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=128m \
+            scoring-runtime:test rehearse --out /tmp/scoring-rehearsal
