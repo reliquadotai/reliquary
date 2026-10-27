@@ -5,9 +5,11 @@ finds them cached (prod 2026-10-03 02:30: decide=257 s of a 329 s pass)."""
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
+import sys
 import time
 
 import pytest
@@ -93,7 +95,7 @@ def relays(monkeypatch):
         monkeypatch.setattr(drand, "DRAND_URLS", list(delays))
         monkeypatch.setattr(drand, "_get_thread_session", lambda: fake)
         monkeypatch.setattr(drand, "_ensure_params", lambda refresh=False: None)
-        monkeypatch.setattr(drand, "_DRAND_CHAIN_HASH", "c" * 64)
+        monkeypatch.setattr(drand, "_DRAND_CHAIN_HASH", drand.DRAND_CHAINS["quicknet"]["hash"])
         # Genuine for its round iff it spells it (stands in for the BLS check).
         monkeypatch.setattr(drand, "verify_round_signature",
                             lambda r, sig: sig == f"{r:096x}")
@@ -205,7 +207,7 @@ def test_a_relay_padding_the_signature_cannot_choose_the_randomness(monkeypatch,
     monkeypatch.setattr(drand, "DRAND_URLS", ["https://evil"])
     monkeypatch.setattr(drand, "_get_thread_session", lambda: _One())
     monkeypatch.setattr(drand, "_ensure_params", lambda refresh=False: None)
-    monkeypatch.setattr(drand, "_DRAND_CHAIN_HASH", "c" * 64)
+    monkeypatch.setattr(drand, "_DRAND_CHAIN_HASH", drand.DRAND_CHAINS["quicknet"]["hash"])
     assert drand.get_verified_beacon(ROUND) is None
     assert drand.get_agreed_beacon(ROUND, agree=1) is None
 
@@ -225,7 +227,136 @@ def test_the_randomness_is_the_hash_of_the_verified_48_bytes(monkeypatch):
     monkeypatch.setattr(drand, "DRAND_URLS", ["https://cf"])
     monkeypatch.setattr(drand, "_get_thread_session", lambda: _One())
     monkeypatch.setattr(drand, "_ensure_params", lambda refresh=False: None)
-    monkeypatch.setattr(drand, "_DRAND_CHAIN_HASH", "c" * 64)
+    monkeypatch.setattr(drand, "_DRAND_CHAIN_HASH", drand.DRAND_CHAINS["quicknet"]["hash"])
     beacon = drand.get_verified_beacon(ROUND)
     assert beacon["randomness"] == hashlib.sha256(bytes.fromhex(SIG)).hexdigest()
     assert beacon["signature"] == SIG
+
+
+@pytest.mark.parametrize("round_number,signature,valid", [
+    (ROUND, SIG, True),
+    (ROUND + 1, SIG, False),
+    (ROUND, "ab" * 48, False),
+    (ROUND, SIG + "00", False),
+])
+@pytest.mark.parametrize("native_available", [True, False])
+def test_every_real_beacon_path_authenticates_the_round(monkeypatch, round_number, signature, valid,
+                                                       native_available):
+    if not native_available:
+        monkeypatch.setitem(sys.modules, "bittensor_drand", None)
+    valid = valid and native_available
+    randomness = hashlib.sha256(bytes.fromhex(signature)).hexdigest()
+    payload = {"round": round_number, "signature": signature, "randomness": randomness}
+    monkeypatch.setattr(drand, "_current_chain", "quicknet")
+    monkeypatch.setattr(drand, "_http_get_json", lambda paths: dict(payload))
+    monkeypatch.setattr(drand, "DRAND_URLS", ["https://relay-a.invalid", "https://relay-b.invalid"])
+
+    class Session:
+        def get(self, *args, **kwargs):
+            class Response:
+                status_code = 200
+
+                def json(self):
+                    return dict(payload)
+
+            return Response()
+
+    monkeypatch.setattr(drand, "_get_thread_session", Session)
+    assert drand.verify_beacon_signature(drand.DRAND_CHAINS["quicknet"]["hash"],
+                                         round_number, randomness, signature) is valid
+    assert (drand.get_verified_beacon(round_number) is not None) is valid
+    assert (drand.get_agreed_beacon(round_number) is not None) is valid
+    monkeypatch.delenv(corpus_validator.DRAND_CACHE_ENV, raising=False)
+    monkeypatch.setattr(corpus_validator, "_BEACONS", {round_number: dict(payload)})
+    assert (corpus_validator._cached_beacon(round_number) is not None) is valid
+    if valid:
+        assert drand.get_drand_beacon(round_number)["randomness"] == randomness
+    else:
+        with pytest.raises(RuntimeError, match="verification"):
+            drand.get_drand_beacon(round_number)
+
+
+def test_chain_timing_never_reads_relay_metadata(monkeypatch):
+    monkeypatch.setattr(drand, "_current_chain", "quicknet")
+    monkeypatch.setattr(drand, "_DRAND_GENESIS_TIME", 1)
+    monkeypatch.setattr(drand, "_DRAND_PERIOD", 999)
+    monkeypatch.setattr(drand, "_http_get_json", lambda paths: pytest.fail("timing read the network"))
+    drand._ensure_params(refresh=True)
+    chain = drand.get_current_chain()
+    assert (chain["genesis_time"], chain["period"]) == (1692803367, 3)
+    assert corpus_validator.LazyRoundAt()(1692803367) == 2
+
+
+def test_latest_is_bound_to_the_local_chain_clock(monkeypatch):
+    monkeypatch.setattr(drand, "_current_chain", "quicknet")
+    monkeypatch.setattr(drand.time, "time", lambda: 1692803367 + ROUND * 3)
+    paths_seen = []
+
+    def fetch(paths):
+        paths_seen.extend(paths)
+        return {"round": ROUND, "signature": SIG}
+
+    monkeypatch.setattr(drand, "_http_get_json", fetch)
+    with pytest.raises(RuntimeError, match="verification"):
+        drand.get_drand_beacon()
+    assert paths_seen and all(path.endswith(str(ROUND + 1)) for path in paths_seen)
+
+
+def test_another_chain_cannot_use_the_quicknet_verifier(monkeypatch):
+    randomness = hashlib.sha256(bytes.fromhex(SIG)).hexdigest()
+    assert not drand.verify_beacon_signature(drand.DRAND_CHAINS["default"]["hash"], ROUND, randomness, SIG)
+    monkeypatch.setattr(drand, "_current_chain", "default")
+    assert drand.get_verified_beacon(ROUND) is None
+    assert drand.get_agreed_beacon(ROUND) is None
+    with pytest.raises(RuntimeError, match="quicknet"):
+        drand.get_drand_beacon(ROUND)
+
+
+@pytest.mark.parametrize("round_number", [0, -1, 2**64, True, str(ROUND), float(ROUND)])
+def test_only_an_unsigned_64_bit_round_number_is_verified(round_number):
+    assert not drand.verify_round_signature(round_number, SIG)
+    assert drand.get_verified_beacon(round_number) is None
+    assert drand.get_agreed_beacon(round_number) is None
+    with pytest.raises(ValueError, match="round"):
+        drand.get_drand_beacon(round_number)
+
+
+def test_a_legacy_cache_is_preserved_and_refreshed_with_a_signed_record(tmp_path, monkeypatch):
+    randomness = hashlib.sha256(bytes.fromhex(SIG)).hexdigest()
+    original = json.dumps({"round": ROUND, "randomness": "ab" * 32}) + "\n"
+    path = tmp_path / "beacons.jsonl"
+    path.write_text(original)
+    monkeypatch.setenv(corpus_validator.DRAND_CACHE_ENV, str(path))
+    monkeypatch.setattr(corpus_validator, "_BEACONS", {ROUND: "ab" * 32})
+    monkeypatch.setattr(corpus_validator, "_DISK_LOADED", set())
+    monkeypatch.setattr(drand, "_current_chain", "quicknet")
+    calls = []
+
+    def fetch(round_number):
+        calls.append(round_number)
+        return {"round": ROUND, "signature": SIG, "randomness": randomness}
+
+    monkeypatch.setattr(drand, "get_verified_beacon", fetch)
+    assert corpus_validator.drand_beacon(ROUND) == randomness
+    assert calls == [ROUND]
+    assert path.read_text().startswith(original)
+    assert json.loads(path.read_text().splitlines()[-1])["signature"] == SIG
+    # A restarted process verifies the signed disk entry without a relay.
+    monkeypatch.setattr(corpus_validator, "_BEACONS", {})
+    monkeypatch.setattr(corpus_validator, "_DISK_LOADED", set())
+    assert corpus_validator.drand_beacon(ROUND) == randomness
+    assert calls == [ROUND]
+
+
+@pytest.mark.parametrize("entry", [
+    "ab" * 32,
+    {"round": ROUND, "randomness": "ab" * 32},
+    {"round": ROUND, "signature": SIG, "randomness": "ab" * 32},
+    {"round": ROUND + 1, "signature": SIG, "randomness": hashlib.sha256(bytes.fromhex(SIG)).hexdigest()},
+    {"round": ROUND, "signature": "ab" * 48, "randomness": hashlib.sha256(bytes.fromhex("ab" * 48)).hexdigest()},
+])
+def test_cache_entries_require_a_matching_round_signature_and_randomness(monkeypatch, entry):
+    monkeypatch.delenv(corpus_validator.DRAND_CACHE_ENV, raising=False)
+    monkeypatch.setattr(corpus_validator, "_BEACONS", {ROUND: entry})
+    monkeypatch.setattr(drand, "_current_chain", "quicknet")
+    assert corpus_validator._cached_beacon(ROUND) is None

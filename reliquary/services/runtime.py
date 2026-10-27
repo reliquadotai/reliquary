@@ -1415,8 +1415,10 @@ class ServiceRuntime:
         dict of ``drand.get_verified_beacon`` (its ``round`` is checked) or its randomness hex, or
         None when it is not available yet. Default: ``drand.get_verified_beacon``. A round later
         than the validator clock's current round is never asked for, so "latest" can never stand
-        in for a future round. The first beacon stored for a round is the one every draw of that
-        round uses, in every window and after a restart (table ``service_draw_beacons``).
+        in for a future round. Persisted randomness is revalidated through that provider for
+        every still-pending draw, including after restart. An unavailable or disagreeing
+        beacon leaves the draw pending; already resolved outcomes and the stored first value
+        never change (table ``service_draw_beacons``).
         Fetching happens outside the lock and outside any transaction.
         """
         instant = _instant(now)
@@ -1425,8 +1427,6 @@ class ServiceRuntime:
             environments = self._environments(window, environment)
             rounds = sorted({round_id for env in environments
                              for round_id in self.ledger.pending_draw_rounds(window, environment=env)})
-            known = {round_id for round_id in rounds if self.db.execute(
-                "SELECT 1 FROM service_draw_beacons WHERE order_id=? AND round=?", (order, round_id)).fetchone()}
         if not rounds:
             return []
         try:
@@ -1437,7 +1437,7 @@ class ServiceRuntime:
         fetch = beacon_for_round or _verified_beacon
         fresh: dict[int, str] = {}
         for round_id in rounds:
-            if round_id in known or round_id > current:
+            if round_id > current:
                 continue
             try:
                 randomness = self._beacon_randomness(round_id, fetch(round_id))
@@ -1448,13 +1448,18 @@ class ServiceRuntime:
                 fresh[round_id] = randomness
         selected: list[str] = []
         with self._txn():
+            authenticated: dict[int, str] = {}
             for round_id, randomness in fresh.items():
+                stored = self.db.execute(
+                    "SELECT randomness FROM service_draw_beacons WHERE order_id=? AND round=?",
+                    (order, round_id)).fetchone()
+                if stored is not None and stored[0] != randomness:
+                    logger.error("audit beacon for round %d differs from its stored value; draws wait", round_id)
+                    continue
                 self.db.execute("INSERT OR IGNORE INTO service_draw_beacons VALUES(?,?,?)", (order, round_id, randomness))
-            stored = {round_id: randomness for round_id, randomness in self.db.execute(
-                "SELECT round, randomness FROM service_draw_beacons WHERE order_id=?", (order,))
-                if round_id in rounds}
+                authenticated[round_id] = randomness
             for env in environments:
-                selected.extend(self.ledger.resolve_draws(window, environment=env, beacon_for_round=stored.get,
+                selected.extend(self.ledger.resolve_draws(window, environment=env, beacon_for_round=authenticated.get,
                                                           audit_bps=self.contract.reward_policy["audit_bps"],
                                                           run_salt=self.log.run_salt))
         return selected
