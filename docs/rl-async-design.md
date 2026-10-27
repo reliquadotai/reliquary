@@ -233,6 +233,14 @@ GET /rl/checkpoint  --------->  index (signed) + presigned R2 URLs
   full (DECIDED 2026-10-16; prime-rl, AReaL, PipelineRL, verl, SkyRL, open-instruct all do this).
   The batch mix is whatever arrives: each group has its own baseline, so composition adds noise,
   not bias. The loss is the global token mean of the step.
+- Batch mix (2026-10-27): miners submit in waves of one env, so arrival order gave steps of 50-60 %
+  one env next to steps of 4 %. With `rl_batch_env_factor` (env `RELIQUARY_RL_BATCH_ENV_FACTOR`) set, a
+  take gives each env at most factor x its group share (its token target over its mean group tokens,
+  `rl_env_shares`), then fills what is still missing from the capped envs' extra groups in arrival
+  order: the cap orders the queue, it never makes the trainer wait for groups already queued (the
+  strict cap of 2026-10-24 did, 2.5 h). Groups within 2 checkpoints of `max_lag` go first, above any
+  cap, so the cap never costs a miner a group. The mix only bites when more than a batch is queued:
+  the global cap on buffered groups (`rl_max_pending_groups`, taken groups included) sets that depth.
 - A global cap on buffered groups (`rl_max_pending_groups`, placeholder 256 = 4 batches; open
   leases are not counted, the quota and expiry bound them, and one hotkey's open leases take at
   most 1/4 of the cap) holds miners back when they outrun the trainer (refusal `full`), instead of

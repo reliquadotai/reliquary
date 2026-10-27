@@ -176,7 +176,7 @@ class RlAsyncSettings:
     pay_carry_periods: int = 0                  # a period's pay over the cap is carried this many periods (0: burns)
     pay_carry_max_caps: float = 2.0             # the most carried at once, in caps (over it the oldest burns)
     lane_max_batches: float | None = None       # an env holds at most this many batches of its group share (None: off)
-    batch_env_factor: float | None = None       # one take hands out at most this x an env's group share (None: off)
+    batch_env_factor: float | None = None       # one take gives an env this x its group share, then spills (None: off)
     batch_groups: int = 512                     # the trainer's batch, in groups (the limits' unit)
 
     def lane_reserves(self) -> dict[str, int]:

@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass
 
 QUEUED, TAKEN = "queued", "taken"
 SUSPECT_ATTEMPTS = 2        # hand-outs after which a group not yet trained is served at most one per batch
+URGENT_LAG_MARGIN = 2       # this close to the max lag a group skips the env caps (a prefetch trains one k later)
 MAX_POLL_GAP_S = 30.0       # a wait counts between two of the trainer's takes at most this far apart (a dead trainer)
 
 _SCHEMA = """
@@ -91,10 +92,36 @@ class SubmittedGroup:
                       "force_spans": tuple(None if s is None else tuple(s) for s in body["force_spans"])})
 
 
+def mixed_take(rows, caps: dict[str, int], limit: int, urgent_below: int | None = None) -> list[str]:
+    """Lease ids for one take from queued ``rows`` (lease_id, env, k) in arrival order. Groups about to pass the
+    max lag (``k < urgent_below``) go first, oldest checkpoint first, whatever their env's cap; then each env up to
+    its cap; then, if the batch is still short, the capped envs' extra groups in arrival order, so the cap never
+    makes the trainer wait for groups that are already queued."""
+    chosen, counts, extra = [], {}, []
+    urgent = sorted((r for r in rows if urgent_below is not None and r[2] < urgent_below), key=lambda r: r[2])
+    picked = set()
+    for lease_id, env, _ in urgent[:limit]:
+        chosen.append(lease_id)
+        picked.add(lease_id)
+        counts[env] = counts.get(env, 0) + 1
+    for lease_id, env, _ in rows:
+        if len(chosen) >= limit:
+            break
+        if lease_id in picked:
+            continue
+        if env in caps and counts.get(env, 0) >= caps[env]:
+            extra.append(lease_id)
+            continue
+        counts[env] = counts.get(env, 0) + 1
+        chosen.append(lease_id)
+    return chosen + extra[:max(0, limit - len(chosen))]
+
+
 class TrainingBuffer:
     def __init__(self, book, clock=time.time, batch_caps=None) -> None:
-        """``batch_caps(limit)``: env -> the most of its groups one take hands out (``rl_env_shares.EnvGroupCaps``;
-        None: arrival order alone). A capped env's later groups wait for the next take."""
+        """``batch_caps(limit)``: env -> its share of the groups one take hands out (``rl_env_shares.EnvGroupCaps``;
+        None: arrival order alone). A capped env's extra groups wait for the next take unless the batch would be
+        short without them (``mixed_take``)."""
         self.book, self.clock, self.batch_caps = book, clock, batch_caps
         self._arrived: dict[str, int] = {}                   # completion tokens queued per env since the last drain
         self._taken = 0                                      # completion tokens the trainer took since the last drain
@@ -132,9 +159,9 @@ class TrainingBuffer:
         return tick
 
     def take(self, limit: int) -> list[SubmittedGroup]:
-        """Up to ``limit`` queued groups of any env, in arrival order; a group handed out ``SUSPECT_ATTEMPTS`` times
-        already comes after the fresh ones and only while no other such group is taken (one per batch: the trainer
-        holds one batch at a time); they stay
+        """Up to ``limit`` queued groups of any env, in arrival order (with ``batch_caps``: ``mixed_take``); a group
+        handed out ``SUSPECT_ATTEMPTS`` times already comes after the fresh ones and only while no other such group
+        is taken (one per batch: the trainer holds one batch at a time); they stay
         buffered (``taken``) until reported or released. The trainer asks for what its batch still lacks: a short
         answer means it waits for groups."""
         now = float(self.clock())
@@ -143,16 +170,10 @@ class TrainingBuffer:
             # from its second return on it is a suspect: at most one per batch, so it cannot sink the others again.
             caps = dict(self.batch_caps(int(limit)) or {}) if self.batch_caps is not None else {}
             if caps:
-                chosen, counts = [], {}
-                for lease_id, env in self.book.db.execute(
-                        "SELECT lease_id, environment FROM rl_buffer WHERE state=? AND attempts<? "
-                        "ORDER BY arrived_at, lease_id", (QUEUED, SUSPECT_ATTEMPTS)):
-                    if len(chosen) >= limit:
-                        break
-                    if env in caps and counts.get(env, 0) >= caps[env]:
-                        continue
-                    counts[env] = counts.get(env, 0) + 1
-                    chosen.append(lease_id)
+                rows = self.book.db.execute(
+                    "SELECT lease_id, environment, k FROM rl_buffer WHERE state=? AND attempts<? "
+                    "ORDER BY arrived_at, lease_id", (QUEUED, SUSPECT_ATTEMPTS)).fetchall()
+                chosen = mixed_take(rows, caps, int(limit), self._urgent_below())
                 bodies = dict(self.book.db.execute(
                     f"SELECT lease_id, body FROM rl_buffer WHERE lease_id IN ({','.join('?' * len(chosen))})",
                     chosen).fetchall()) if chosen else {}
@@ -176,6 +197,14 @@ class TrainingBuffer:
         with self.book.lock:
             self._taken += sum(len(c) for g in groups for c in g.completions)
         return groups
+
+    def _urgent_below(self) -> int | None:
+        """Groups generated below this checkpoint are about to pass the trainer's max lag (None: unknown)."""
+        latest = getattr(self.book, "latest_checkpoint", None)
+        max_lag = getattr(getattr(self.book, "config", None), "max_lag", None)
+        if latest is None or max_lag is None:
+            return None
+        return int(latest) - int(max_lag) + URGENT_LAG_MARGIN
 
     def take_older(self, below_k: int, limit: int) -> list[SubmittedGroup]:
         """Up to ``limit`` queued groups of any env generated on a checkpoint older than ``below_k``: the trainer's
