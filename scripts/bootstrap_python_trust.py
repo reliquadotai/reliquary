@@ -7,8 +7,11 @@ environments; --verify-only checks the final installed bundles without writes.
 from __future__ import annotations
 
 import argparse
+import base64
+import csv
 import hashlib
 import importlib.metadata
+import io
 import os
 from pathlib import Path
 import re
@@ -74,9 +77,120 @@ def check_pem(pem: bytes, label: str) -> None:
     context.load_verify_locations(cadata=pem.decode("ascii"))
 
 
+def virtualenv_wheels() -> list[Path]:
+    try:
+        distribution = importlib.metadata.distribution("virtualenv")
+    except importlib.metadata.PackageNotFoundError:
+        return []
+    wheels = sorted(Path(distribution.locate_file("virtualenv/seed/wheels/embed")).glob("pip-*.whl"))
+    if not wheels:
+        raise ValueError("Unsupported virtualenv embedded wheel layout")
+    return wheels
+
+
+def update_record(record: bytes, changes: dict[str, bytes]) -> bytes:
+    result = []
+    found = set()
+    for line in record.decode("utf-8").splitlines(keepends=True):
+        row, = csv.reader([line])
+        if len(row) != 3:
+            raise ValueError("Unsupported wheel RECORD layout")
+        if row[0] in changes:
+            if row[0] in found:
+                raise ValueError("Duplicate wheel RECORD entry")
+            found.add(row[0])
+            data = changes[row[0]]
+            digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode("ascii")
+            output = io.StringIO(newline="")
+            csv.writer(output, lineterminator="\r\n" if line.endswith("\r\n") else "\n").writerow(
+                [row[0], "sha256=" + digest, str(len(data))])
+            line = output.getvalue()
+        result.append(line)
+    if found != changes.keys():
+        raise ValueError("Missing wheel RECORD entry")
+    return "".join(result).encode("utf-8")
+
+
+def repair_virtualenv() -> None:
+    wheels = virtualenv_wheels()
+    if not wheels:
+        return
+    selector = wheels[0].parent / "__init__.py"
+    original_source = selector.read_bytes().decode("utf-8")
+    source = original_source
+    changes = {}
+    bundle = "pip/_vendor/certifi/cacert.pem"
+    for wheel in wheels:
+        with zipfile.ZipFile(wheel) as archive:
+            names = archive.namelist()
+            record = "pip-" + wheel.name.split("-")[1] + ".dist-info/RECORD"
+            if (len(names) != len(set(names)) or bundle not in names or record not in names
+                    or record + ".jws" in names or record + ".p7s" in names):
+                raise ValueError("Unsupported embedded pip wheel layout")
+            original = archive.read(bundle)
+            clean = CERTIFICATE.sub(lambda match: b"" if distrusted(match[0]) else match[0], original)
+            check_pem(clean, str(wheel))
+            if clean == original:
+                continue
+            members = {bundle: clean, record: update_record(archive.read(record), {bundle: clean})}
+            output = io.BytesIO()
+            with zipfile.ZipFile(output, "w") as repaired:
+                repaired.comment = archive.comment
+                for info in archive.infolist():
+                    repaired.writestr(info, members.get(info.filename, archive.read(info)))
+            data = output.getvalue()
+            with zipfile.ZipFile(io.BytesIO(data)) as repaired:
+                if repaired.testzip() is not None:
+                    raise ValueError("Repaired embedded pip wheel failed validation")
+            old = hashlib.sha256(wheel.read_bytes()).hexdigest()
+            new = hashlib.sha256(data).hexdigest()
+            if re.search(r"(?m)^BUNDLE_SHA256\s*=", source):
+                pattern = r'(["\x27]' + re.escape(wheel.name) + r'["\x27]:\s*["\x27])' + old + r'(["\x27])'
+                source, count = re.subn(pattern, lambda match: match[1] + new + match[2], source)
+                if count != 1:
+                    raise ValueError("Unsupported virtualenv embedded wheel checksum layout")
+            changes[wheel] = data
+    if not changes:
+        return
+    if source != original_source:
+        changes[selector] = source.encode("utf-8")
+    distribution = importlib.metadata.distribution("virtualenv")
+    records = [path for path in distribution.files or [] if str(path).endswith(".dist-info/RECORD")]
+    if len(records) != 1:
+        raise ValueError("Unsupported virtualenv installed RECORD layout")
+    installed_record = Path(distribution.locate_file(records[0]))
+    changes[installed_record] = update_record(installed_record.read_bytes(), {
+        "virtualenv/seed/wheels/embed/" + path.name: data for path, data in changes.items()})
+    staged = []
+    try:
+        for path, data in changes.items():
+            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temporary:
+                pending = Path(temporary.name)
+                staged.append((pending, path))
+                temporary.write(data)
+            shutil.copymode(path, pending)
+        for pending, path in staged:
+            os.replace(pending, path)
+        # A same-size checksum edit must not reuse a timestamp-based bytecode cache.
+        for cache in selector.parent.glob("__pycache__/__init__.*.pyc"):
+            cache.unlink()
+    finally:
+        for pending, _ in staged:
+            pending.unlink(missing_ok=True)
+
+
 def verify(*, system: bool = False) -> None:
     for bundle in package_bundles():
         check_pem(bundle.read_bytes(), str(bundle))
+    wheels = virtualenv_wheels()
+    for wheel in wheels:
+        with zipfile.ZipFile(wheel) as archive:
+            check_pem(archive.read("pip/_vendor/certifi/cacert.pem"), str(wheel))
+    if wheels:
+        subprocess.run([sys.executable, "-I", "-B", "-c",
+                        "from virtualenv.seed.wheels.embed import BUNDLE_SUPPORT, get_embed_wheel; "
+                        "assert all(get_embed_wheel('pip', version) is not None for version in BUNDLE_SUPPORT)"],
+                       check=True)
     if system:
         context = ssl.create_default_context()
         roots = context.get_ca_certs(binary_form=True)
@@ -154,6 +268,7 @@ def bootstrap(*, system: bool = False) -> None:
             repair_system(wheels[0])
     for bundle in package_bundles():
         clean_bundle(bundle)
+    repair_virtualenv()
     verify(system=system)
 
 
