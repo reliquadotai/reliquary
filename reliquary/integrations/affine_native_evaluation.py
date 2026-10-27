@@ -759,6 +759,8 @@ def run(
             "previous native attempt needs reconciliation and a new workspace",
         )
         (workspace / "native").mkdir(mode=0o700)
+        jit_cache = workspace / "triton-cache"
+        jit_cache.mkdir(mode=0o700)
         write_json(workspace / "lease.private.json", {"jobDigest": d["jobDigest"]})
         if fixture:
             bootstrap = "import sys;sys.path.insert(0,sys.argv[1]);from reliquary.integrations.affine_native_evaluation import _fixture_worker;_fixture_worker(sys.argv[2],sys.argv[3])"
@@ -819,6 +821,7 @@ def run(
                     "PYTHONNOUSERSITE": "1",
                     "PYTHONDONTWRITEBYTECODE": "1",
                     "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+                    "TRITON_CACHE_DIR": str(jit_cache),
                 },
             )
             state["pid"] = process.pid
