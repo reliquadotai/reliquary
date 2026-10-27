@@ -44,6 +44,7 @@ import asyncio
 import base64
 import contextlib
 import hmac
+import json
 import logging
 import os
 import threading
@@ -309,6 +310,7 @@ class RlAsync:
     observations: Any = None                    # rl_observations.ObservationBoard (None: /rl/observations 503s)
     sandbox: Any = None                         # rl_async_episodes.RlLeaseSandbox (episode envs only)
     benchmarks: Any = None                      # run_id -> the run's benchmark feed bytes or None (/rl/benchmarks)
+    checkpoint_store: Any = None                # authoritative index publication on the private trainer listener
 
     def close(self) -> None:
         self.book.close()
@@ -372,6 +374,9 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
         raise ValueError(f"{TRAINER_TOKEN_ENV} must be at least 16 characters")
     expected = f"Bearer {token}".encode()
     router = APIRouter()
+    from reliquary.validator.rl_trainer_owner import EPOCH_HEADER, OWNER_HEADER, TrainerOwner, TrainerOwnerRefused
+
+    owner = TrainerOwner(rl.book)
 
     def refused(status: int, reason: str, detail: str = "") -> JSONResponse:
         return JSONResponse(status_code=status, content={"reason": reason, "detail": detail},
@@ -388,7 +393,28 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
                 body = await request.json() if method == "POST" else dict(request.query_params)
                 if not isinstance(body, dict):
                     raise ValueError("the body is not an object")
-                result = await asyncio.to_thread(op, body)
+                def apply():
+                    if path == "admit":
+                        with rl.book.transaction():
+                            body["_owner_epoch"] = owner.require(request.headers.get(OWNER_HEADER),
+                                                                 request.headers.get(EPOCH_HEADER))
+                        # Admission rechecks this epoch in its final transaction after CPU grading.
+                        return op(body)
+                    with rl.book.transaction() if method == "POST" else contextlib.nullcontext():
+                        if method == "POST" and not path.startswith("owner/"):
+                            body["_owner_epoch"] = owner.require(request.headers.get(OWNER_HEADER),
+                                                                 request.headers.get(EPOCH_HEADER))
+                        if path == "owner/claim":
+                            return owner.claim(body.get("owner"))
+                        if path == "owner/heartbeat":
+                            return owner.heartbeat(request.headers.get(OWNER_HEADER), request.headers.get(EPOCH_HEADER))
+                        if path == "owner/release":
+                            return owner.release(request.headers.get(OWNER_HEADER), request.headers.get(EPOCH_HEADER))
+                        return op(body)
+
+                result = await asyncio.to_thread(apply)
+            except TrainerOwnerRefused as exc:
+                return refused(409, str(exc))
             except LookupError as exc:
                 return refused(404, "unknown", str(exc))
             except (ValueError, TypeError, KeyError) as exc:
@@ -402,12 +428,51 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
 
     def report(b: dict) -> dict:
         matched, subs = b.get("matched_tokens"), b.get("substitutions")
+        if type(b.get("accepted")) is not bool:
+            raise ValueError("accepted must be true or false")
+        if b.get("accepted") is True and not b.get("admission_id"):
+            raise ValueError("accepted reports require precommit reward admission")
         rl.submissions.report_training(str(b["lease_id"]), rollout_match=[float(m) for m in b["rollout_match"]],
                                        accepted=bool(b["accepted"]), failure_class=b.get("failure_class"),
                                        matched_tokens=None if matched is None else [int(n) for n in matched],
                                        substitutions=None if subs is None else [[(int(p), int(t)) for p, t in s]
-                                                                                for s in subs], judged=b.get("judged"))
+                                                                                for s in subs], judged=b.get("judged"),
+                                       admission_id=b.get("admission_id"), owner_epoch=b.get("_owner_epoch"))
         return {"ok": True}
+
+    def publish_index(b: dict) -> dict:
+        from reliquary.shared.ckpt_index import index_key
+        from reliquary.shared.strict_json import strict_json_loads
+        from reliquary.signer.protocol import RlCheckpointIndex
+
+        index = b["index"]
+        RlCheckpointIndex.model_validate(index)
+        if index["run"] != rl.settings.run:
+            raise ValueError("checkpoint index belongs to another run")
+        store = getattr(rl, "checkpoint_store", None)
+        if store is None:
+            raise RuntimeError("checkpoint publication is unavailable")
+        key = index_key(rl.settings.run)
+        previous, etag = store.get_bytes_with_etag(key)
+        if previous:
+            previous = strict_json_loads(previous)
+            old, new = previous["latest"], index["latest"]
+            if new["version"] < old["version"] or (new["version"] == old["version"] and index != previous):
+                raise ValueError("checkpoint index cannot replace an existing version")
+            if index == previous:
+                return {"ok": True}
+        data = json.dumps(index, sort_keys=True).encode()
+        try:
+            # The condition is checked by storage when committing, even after a client timeout.
+            store.put_bytes_if_match(key, data, etag)
+        except Exception:
+            if store.get_bytes(key) != data:
+                raise
+        return {"ok": True}
+
+    def admit(b: dict) -> dict:
+        return rl.submissions.admit_training(str(b["lease_id"]), b["substitutions"],
+                                             owner_epoch=b.get("_owner_epoch"))
 
     def adopt(b: dict) -> dict:
         rl.book.adopt_checkpoint(int(b["k"]))
@@ -434,6 +499,9 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
     route("GET", "config", lambda b: {"task_id": rl.settings.task_id, "run": rl.settings.run,
                                       "targets": dict(rl.settings.targets), "latest": rl.book.latest_checkpoint})
     route("GET", "latest", lambda b: {"latest": rl.book.latest_checkpoint})
+    for path in ("owner/claim", "owner/heartbeat", "owner/release"):
+        route("POST", path, lambda b: None)
+    route("POST", "publish_index", publish_index)
     route("POST", "adopt", adopt)
     route("POST", "take", lambda b: {"groups": [_pack(g) for g in rl.buffer.take(int(b["limit"]))]})
     route("POST", "take_older", lambda b: {"groups": [_pack(g) for g in rl.buffer.take_older(int(b["below_k"]),
@@ -444,7 +512,12 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
     route("POST", "requeue", lambda b: {"requeued": rl.buffer.requeue()})
     route("GET", "depth", lambda b: {"depth": rl.buffer.depth()})
     route("POST", "report", report)
+    route("POST", "admit", admit)
     route("POST", "audits", take_audits)
+    route("POST", "audit_start", lambda b: {"started": rl.submissions.start_audit(
+        str(b["lease_id"]), b["attempt_id"])})
+    route("POST", "audit_failure", lambda b: {"concluded": rl.submissions.report_audit_failure(
+        str(b["lease_id"]), str(b["attempt_id"]))})
     route("POST", "audit", report_audit)
 
     async def checkpoint(request: Request) -> JSONResponse:
@@ -805,6 +878,8 @@ def _public_boards(rl: RlAsync, wallet, validator_hotkey: str, signer_client=Non
     run = rl.settings.run
     client, bucket = public_checkpoint_client(), public_checkpoint_bucket()
     store, presign = R2ObjectStore(client, bucket), presigner(client, bucket)
+    # Index operations serialize writer takeover; bulk-transfer retries must not hold that lock.
+    rl.checkpoint_store = R2ObjectStore(public_checkpoint_client(metadata_only=True), bucket)
     rl.board = RlCheckpointBoard(load_index=lambda: store.get_bytes(index_key(run)),
                                  index_signer=index_signer_for(wallet, signer_client),
                                  validator_hotkey=validator_hotkey, presign=presign)
