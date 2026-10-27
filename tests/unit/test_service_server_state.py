@@ -292,6 +292,9 @@ async def test_an_accepted_unpaid_group_ends_with_its_own_unrewarded_final_verdi
     service._service_runtime = runtime
     service.server = ValidatorServer()
     await service._record_auction_final_verdicts(batcher, paid_groups=[])
+    # An independent transport UUID may coincidentally contain the prompt index.
+    stream_id = "a" * 12 + "4321" + "b" * 16
+    service.server._verdict_epoch_by_hotkey["fixture-miner"] = stream_id
     body = TestClient(service.server.app).get("/verdicts/fixture-miner?details=true").json()
     (verdict,) = body["verdicts"]
     assert verdict["accepted"] is True and verdict["rewarded"] is False
@@ -303,7 +306,11 @@ async def test_an_accepted_unpaid_group_ends_with_its_own_unrewarded_final_verdi
     client = TestClient(service.server.app)
     for path in ("/verdicts/fixture-miner?details=true", "/miner-verdicts/fixture-miner?details=true",
                  f"/miner-verdicts/fixture-miner/1/{'e' * 64}"):
-        text = client.get(path).text
+        payload = client.get(path).json()
+        if "stream_id" in payload:
+            assert payload.pop("stream_id") == stream_id, path
+        text = json.dumps(payload)
+        assert "prompt_idx" not in text and "prompt_hash_lead" not in text, path
         assert "4321" not in text and canonical_prompt_hash_lead(4321) not in text, path
         if status != "exploration_unpaid":
             assert status not in text, path
