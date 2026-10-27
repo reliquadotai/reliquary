@@ -1064,7 +1064,7 @@ def test_the_outage_pay_and_the_probation_sampling_are_on_by_default_and_switcha
                           environ={"RELIQUARY_RL_PROBATION_REPEAT_AUDIT_RATE": "2"})
 
 
-def test_the_trainer_heartbeat_reaches_the_ledger_and_stops_on_an_old_validator(tmp_path):
+def test_every_trainer_call_is_a_beat_and_the_heartbeat_never_stops(tmp_path):
     from reliquary.trainer.rl_link import TrainerHeartbeat, TrainerLink
     from reliquary.validator.rl_submit import GroupGrader
 
@@ -1078,12 +1078,16 @@ def test_the_trainer_heartbeat_reaches_the_ledger_and_stops_on_an_old_validator(
     client = TestClient(app)
     assert client.post("/rl/trainer/heartbeat", json={}).status_code == 401
     link = TrainerLink("http://testserver", TOKEN, client=client, patience_s=0.0)
-    link.heartbeat()
+    assert link.latest_checkpoint is None                               # any trainer call proves it alive
     assert rl.book.db.execute("SELECT COUNT(*) FROM rl_trainer_beat").fetchone()[0] == 1
+    link.heartbeat()
     rl.close()
 
     old = FastAPI()                                                     # a validator without the route
     beat = TrainerHeartbeat(TrainerLink("http://testserver", TOKEN, client=TestClient(old), patience_s=0.0), 0.01)
     beat.start()
+    beat._thread.join(timeout=0.3)
+    assert beat._thread.is_alive()                                      # keeps beating: the route may come back
+    beat.stop()
     beat._thread.join(timeout=5)
     assert not beat._thread.is_alive()

@@ -48,9 +48,10 @@ while the validator was down is extended to ``now + RESTART_GRACE_S`` at boot: i
 The validator's own downtime is never charged (2026-10-27: every restart cost miners quota, restored by hand). The
 service loop marks the book alive before each expiry sweep (``mark_alive``, written at most every ``ALIVE_EVERY_S``).
 A silence longer than ``DOWNTIME_MIN_S`` (a stop, a crash, an OOM kill, a slow start, a stalled loop), seen at boot
-or at the next mark, is recorded as a downtime and every open lease gets its length back. A lease that was open during a downtime and ends unsubmitted (expired or forfeited) is released
-(``VALIDATOR_UNAVAILABLE``: no quota cut), whatever happened to it after: its sandbox sessions and its submission
-may have failed against a validator that was not there.
+or at the next mark, is recorded as a downtime and every open lease gets its length back. A lease already open
+when a downtime began that ends unsubmitted (expired or forfeited) is released (``VALIDATOR_UNAVAILABLE``: no quota
+cut): its sandbox sessions and its submission may have failed against a validator that was not there. A box failure
+over the daily budget stays charged.
 """
 from __future__ import annotations
 
@@ -508,7 +509,8 @@ class LeaseBook:
             self._mark_alive(now)
 
     def _lived_through_downtime(self, lease: Lease, now: float) -> bool:
-        return self.db.execute("SELECT 1 FROM rl_validator_downtime WHERE end>? AND start<? LIMIT 1",
+        """The lease was already open when a downtime began (one issued during a stall is not excused)."""
+        return self.db.execute("SELECT 1 FROM rl_validator_downtime WHERE start>=? AND start<? LIMIT 1",
                                (lease.issued_at, now)).fetchone() is not None
 
     def _expire(self, now: float) -> int:
@@ -541,7 +543,7 @@ class LeaseBook:
                                lease.lease_id[:12], lease.hotkey[:12], self.config.box_failed_releases_per_day,
                                failure[1])
                 failure, charged = None, BOX_FAILED_OVER_BUDGET
-        if failure is None and self._lived_through_downtime(lease, now):
+        if failure is None and charged != BOX_FAILED_OVER_BUDGET and self._lived_through_downtime(lease, now):
             failure = (VALIDATOR_UNAVAILABLE, "open while the validator was down")
         if failure is None:
             self.db.execute("UPDATE rl_leases SET state=?, closed_at=?, cause=? WHERE lease_id=?",
@@ -552,7 +554,7 @@ class LeaseBook:
         self.db.execute("UPDATE rl_leases SET state=?, closed_at=?, cause=? WHERE lease_id=?",
                         (RELEASED, now, cause, lease.lease_id))
         self.quota.record_release(lease.hotkey, lease, now=now)
-        logger.warning("rl lease %s of %s (%s prompt %d) released without penalty: sandbox failure %s (%s)",
+        logger.warning("rl lease %s of %s (%s prompt %d) released without penalty: %s (%s)",
                        lease.lease_id[:12], lease.hotkey[:12], lease.environment, lease.prompt_idx, cause, detail)
         return RELEASED
 

@@ -35,13 +35,18 @@ its periods empty and their emission burned (teutonic-rl-async-v1, 2026-10-27: ~
 heartbeat (``trainer_beat``); a silence longer than ``outage_grace_s`` is an outage, counted from the last beat and
 for at most ``outage_max_s``. A period holding outage time pays each hotkey, on top of its accruals and under the
 same cap, its mean reward over the last ``OUTAGE_REFERENCE_PERIODS`` archives that were mostly not outage, times
-the share of the period the trainer was down. Before the first heartbeat nothing is filled.
+the share of the period the trainer was down. Before the first heartbeat nothing is filled. Every trainer-link call
+counts as a beat (``trainer_beat``, throttled). The validator's own downtime (``rl_validator_downtime``, written by
+the lease book) is cut out of the outages: the trainer could not reach it, and its late step report pays then. A
+piece shorter than the grace is dropped. With the fill on, a period settles ``outage_grace_s`` after its end at the
+earliest, so an outage at its very end is seen before it is archived.
 """
 from __future__ import annotations
 
 import json
 import logging
 import math
+import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -51,6 +56,9 @@ from reliquary.validator import corpus_periods as cp
 from reliquary.validator.rl_submit import BAN, FIRST_SCAN, TRAINED
 
 logger = logging.getLogger(__name__)
+
+BEAT_EVERY_S = 10.0          # trainer_beat writes at most this often
+OUTAGE_KEEP_S = 7 * 86_400.0  # recorded outages older than this are pruned
 
 RL_PERIOD_ARCHIVE_SCHEMA = "reliquary/rl-async-period/v1"
 BOARD_CACHE_S = 15.0       # the public board is rebuilt at most this often (it sums every accrual under the lock)
@@ -118,6 +126,7 @@ class RlPayLedger:
         """``prices.token_price(env)`` prices a matched token (``AsyncPriceController``)."""
         self.book, self.submissions, self.prices, self.config, self.clock = book, submissions, prices, config, clock
         self._board: tuple[float, dict] | None = None
+        self._beat_at: float | None = None        # the last trainer_beat write (memory only)
         with book.lock:
             book.db.executescript(_SCHEMA)
             book.db.execute("INSERT OR IGNORE INTO rl_pay_cursor(id, seq) VALUES(0, 0)")
@@ -183,7 +192,8 @@ class RlPayLedger:
         """Archive every closed period holding accruals, oldest first (each once); returns the new archives."""
         now = float(self.clock()) if now is None else now
         genesis = self.config.genesis
-        closed = cp.closed_through(now=now, oldest_pending=None, genesis=genesis, slack=self.config.slack_s)
+        slack = max(self.config.slack_s, self.config.outage_grace_s) if self.config.outage_fill else self.config.slack_s
+        closed = cp.closed_through(now=now, oldest_pending=None, genesis=genesis, slack=slack)
         out = []
         with self.book.transaction():
             db = self.book.db
@@ -253,10 +263,13 @@ class RlPayLedger:
 
     # --- trainer outages -------------------------------------------------------------------------------------
     def trainer_beat(self, now: float | None = None) -> None:
-        """The trainer is alive. A silence before this beat longer than the grace is recorded as an outage."""
+        """The trainer is alive (its heartbeat, or any trainer-link call; written at most every ``BEAT_EVERY_S``).
+        A silence before this beat longer than the grace is recorded as an outage."""
         if not self.config.outage_fill:
             return
         now = float(self.clock()) if now is None else now
+        if self._beat_at is not None and 0 <= now - self._beat_at < BEAT_EVERY_S:
+            return
         with self.book.transaction():
             db = self.book.db
             row = db.execute("SELECT last_at FROM rl_trainer_beat WHERE id=0").fetchone()
@@ -265,10 +278,20 @@ class RlPayLedger:
                 logger.warning("trainer heartbeat back after %.0f s: outage recorded", now - row[0])
             db.execute("INSERT INTO rl_trainer_beat(id, last_at) VALUES(0, ?) ON CONFLICT(id) "
                        "DO UPDATE SET last_at=MAX(last_at, excluded.last_at)", (now,))
+            db.execute("DELETE FROM rl_trainer_outages WHERE end<?", (now - OUTAGE_KEEP_S,))
+        self._beat_at = now
+
+    def _validator_downtime(self) -> list[tuple[float, float]]:
+        try:
+            return [(float(s), float(e)) for s, e in
+                    self.book.db.execute("SELECT start, end FROM rl_validator_downtime")]
+        except sqlite3.OperationalError:          # a book without the table
+            return []
 
     def _outages(self, now: float) -> list[tuple[float, float]]:
-        """The trainer's outages, each cut to ``outage_max_s``: those recorded, and the one going on (a silence
-        longer than the grace, up to ``now``)."""
+        """The trainer's outages: those recorded and the one going on (a silence longer than the grace, up to
+        ``now``), less the validator's own downtime, pieces shorter than the grace dropped, each cut to
+        ``outage_max_s``."""
         if not self.config.outage_fill:
             return []
         db = self.book.db
@@ -276,7 +299,15 @@ class RlPayLedger:
         row = db.execute("SELECT last_at FROM rl_trainer_beat WHERE id=0").fetchone()
         if row is not None and now - row[0] > self.config.outage_grace_s:
             spans.append((float(row[0]), now))
-        return [(s, min(e, s + self.config.outage_max_s)) for s, e in spans if e > s]
+        down = sorted(self._validator_downtime())
+        out = []
+        for s, e in spans:
+            pieces = [(s, e)]
+            for ds, de in down:
+                pieces = [p for a, b in pieces for p in ((a, min(b, ds)), (max(a, de), b)) if p[1] > p[0]]
+            out += [(a, min(b, a + self.config.outage_max_s)) for a, b in pieces
+                    if b - a > self.config.outage_grace_s]
+        return out
 
     def _outage_seconds(self, period: int, outages) -> float:
         """Seconds of ``period`` the trainer was down (overlapping outages counted once)."""

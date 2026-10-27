@@ -452,6 +452,23 @@ def test_a_lease_that_lived_through_a_downtime_is_never_charged(tmp_path):
     assert counters["released"] == 2 and counters["expired"] == 1
 
 
+def test_a_lease_issued_during_a_stall_or_a_box_failure_over_budget_is_still_charged(tmp_path):
+    clock = Clock()
+    book = book_at(tmp_path, clock=clock, box_failed_releases_per_day=0)
+    book.adopt_checkpoint(0)
+    held = book.grant([ask("A", [1])])[0].leases[0]                        # open when the stall begins
+    clock.t = NOW + 10
+    during = book.grant([ask("A", [2])])[0].leases[0]                      # issued while the loop stalled
+    clock.t = NOW + 240
+    book.mark_alive()                                                      # the stall: a downtime from NOW
+    book.sandbox_failure = lambda lease: ("box_failed", "r") if lease.lease_id == held.lease_id else None
+    clock.t = max(lease.expires_at for lease in book.open_leases("A")) + 1
+    assert book.expire_due() == 2
+    causes = dict(book.db.execute("SELECT lease_id, cause FROM rl_leases").fetchall())
+    assert causes[during.lease_id] == "expired"
+    assert causes[held.lease_id] == rl_leases.BOX_FAILED_OVER_BUDGET
+
+
 def test_a_short_silence_and_a_running_sweep_are_not_a_downtime(tmp_path):
     clock = Clock()
     book = book_at(tmp_path, clock=clock)

@@ -150,8 +150,8 @@ __all__ = ["TrainerLink", "TrainerLinkError"]
 
 
 class TrainerHeartbeat:
-    """A daemon thread calling ``link.heartbeat()`` every ``every_s`` seconds, steps included. A validator without
-    the route (404) turns it off; any other failure is logged and retried at the next beat."""
+    """A daemon thread calling ``link.heartbeat()`` every ``every_s`` seconds, steps included. It never turns itself
+    off: a failure (a validator restarting, one without the route) is logged and retried at the next beat."""
 
     def __init__(self, link, every_s: float = 60.0) -> None:
         self.link, self.every_s = link, float(every_s)
@@ -170,9 +170,6 @@ class TrainerHeartbeat:
             try:
                 self.link.heartbeat()
             except TrainerLinkError as exc:
-                if exc.status == 404:
-                    logger.warning("the validator has no heartbeat route: heartbeat off")
-                    return
                 logger.warning("trainer heartbeat failed: %s", exc)
             except Exception:
                 logger.exception("trainer heartbeat failed")

@@ -408,6 +408,14 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
     def authorized(request: Request) -> bool:
         return hmac.compare_digest(request.headers.get("authorization", "").encode(), expected)
 
+    def beat_then(op: Callable[[dict], Any], body: dict) -> Any:
+        """Any trainer call proves it alive (the outage pay); a failed beat never fails the call."""
+        try:
+            rl.ledger.trainer_beat()
+        except Exception:
+            logger.exception("trainer beat failed")
+        return op(body)
+
     def route(method: str, path: str, op: Callable[[dict], Any]) -> None:
         async def handler(request: Request) -> JSONResponse:
             if not authorized(request):
@@ -416,7 +424,7 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
                 body = await request.json() if method == "POST" else dict(request.query_params)
                 if not isinstance(body, dict):
                     raise ValueError("the body is not an object")
-                result = await asyncio.to_thread(op, body)
+                result = await asyncio.to_thread(beat_then, op, body)
             except LookupError as exc:
                 return refused(404, "unknown", str(exc))
             except (ValueError, TypeError, KeyError) as exc:
@@ -474,7 +482,7 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
     route("POST", "report", report)
     route("POST", "audits", take_audits)
     route("POST", "audit", report_audit)
-    route("POST", "heartbeat", lambda b: rl.ledger.trainer_beat() or {"ok": True})
+    route("POST", "heartbeat", lambda b: {"ok": True})        # the beat is in every call
 
     async def checkpoint(request: Request) -> JSONResponse:
         """``/rl/checkpoint``'s answer for the trainer's resume (it reaches this listener only)."""
