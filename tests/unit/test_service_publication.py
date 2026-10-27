@@ -659,6 +659,71 @@ def test_stopping_the_service_closes_the_publisher_before_the_runtime():
     assert order == ["publisher"]
 
 
+def test_cancelling_shutdown_drains_publisher_threads_before_closing_runtime(tmp_path):
+    import threading
+    from unittest.mock import AsyncMock
+    from reliquary.validator.service import ValidationService
+
+    rt = runtime(tmp_path)
+    pub, _ = publisher(rt, [])
+    release = threading.Event()
+    order = []
+    real_close = rt.close
+
+    def close_runtime():
+        order.append("runtime")
+        real_close()
+    rt.close = close_runtime
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        started, closing = asyncio.Event(), asyncio.Event()
+
+        def blocked():
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(5)
+            rt.last_published_number()
+            order.append("thread")
+
+        task = asyncio.create_task(pub._thread(blocked))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        close_publisher = pub.close
+
+        async def closing_publisher():
+            closing.set()
+            await close_publisher()
+        pub.close = closing_publisher
+
+        service = SimpleNamespace(
+            _observation_task=task, _observation_stop=asyncio.Event(), _observation_publisher=pub,
+            _stop_observation_publication=lambda: ValidationService._stop_observation_publication(service),
+            _service_runtime=rt,
+            _close_proof_scheduler=AsyncMock(), server=SimpleNamespace(stop=AsyncMock()),
+            _stop_episode_services=AsyncMock(),
+        )
+        shutdown = asyncio.create_task(ValidationService._stop_serving(service))
+        try:
+            await asyncio.wait_for(closing.wait(), timeout=5)
+            for _ in range(2):
+                shutdown.cancel()
+                await asyncio.sleep(0)
+                assert not shutdown.done()
+                assert not order
+        finally:
+            release.set()
+            await close_publisher()
+            await asyncio.gather(shutdown, return_exceptions=True)
+        with pytest.raises(asyncio.CancelledError):
+            await shutdown
+
+    asyncio.run(scenario())
+    assert order == ["thread", "runtime"]
+
+
 # --- Fix round 2 (N-1 .. N-5) ---
 
 def fake_segments(n):
