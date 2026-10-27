@@ -7,7 +7,8 @@ import json
 import pytest
 
 from reliquary.eval.job_grading import JobNotGradable
-from reliquary.eval.rl_schedule import NoSamples, Ports, Scheduler, Settings, SuiteEntry, job_id, load_suite
+from reliquary.eval.rl_schedule import (NoSamples, Ports, Scheduler, Settings, SuiteEntry, job_id, load_suite,
+                                        ungraded_rows)
 
 RUN = "5F3sa2TJ-r7-trainer"
 SUITE = [SuiteEntry("verifiers-aime25-r0-n30", "aime", 8, 0.02, 32768),
@@ -371,3 +372,9 @@ def test_the_validator_runs_the_merged_contract_of_every_job_it_serves(tmp_path)
     s.tick(execute=True)
     assert "tasks contract --task-id eval-r7-s00050-aime --task-id eval-r7-s00050-gpqa >" in world.started[0]
     assert "RELIQUARY_TASK_ID=eval-r7-s00050-aime,eval-r7-s00050-gpqa " in world.started[0]
+
+
+def test_a_report_with_rows_the_graders_could_not_score_is_flagged():
+    assert ungraded_rows({"envs": {"verifiers:aime25": {"ungraded_rows": 240}, "verifiers:gpqa": {"ungraded_rows": 0}}}) == 240
+    assert ungraded_rows({"envs": {"verifiers:aime25": {"ungraded_rows": 0}}}) == 0
+    assert ungraded_rows({"envs": {}}) == 0

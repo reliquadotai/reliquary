@@ -152,6 +152,11 @@ class NoSamples(Exception):
     """A job closed with no sample at all: nothing to grade, it is abandoned instead of scored 0."""
 
 
+def ungraded_rows(report: Mapping) -> int:
+    """Rows the graders could not score (a taskset not installed, a grader crash): such a report is not uploaded."""
+    return sum(env.get("ungraded_rows") or 0 for env in report.get("envs", {}).values())
+
+
 class Scheduler:
     def __init__(self, settings: Settings, ports: Ports, *, clock: Callable[[], float] = time.time) -> None:
         self.s, self.p, self.clock = settings, ports, clock
@@ -422,6 +427,10 @@ def live_ports(settings: Settings) -> Ports:
         manifest = asyncio.run(grade_served_job(job, out=out, rl=rl, allow_incomplete=allow_incomplete))
         if not manifest.get("rows"):
             raise NoSamples(job)
+        failed = ungraded_rows(json.loads((out / "report.json").read_text()))
+        if failed:
+            raise RuntimeError(f"{job}: {failed} rows not graded (grader errors, see graded.parquet), "
+                               "not uploaded; retried next tick")
         if settings.upload:
             asyncio.run(upload_grading(job, out))
         return manifest
