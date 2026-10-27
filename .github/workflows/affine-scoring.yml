@@ -30,7 +30,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python scripts/bootstrap_python_trust.py
-      - run: pip install pytest PyNaCl==1.6.2
+      - run: pip install pytest PyNaCl==1.6.2 huggingface-hub==1.30.0
       - run: python scripts/bootstrap_python_trust.py
       - name: Check the signed native evaluation contract against its pinned upstream oracle
         env:
@@ -39,7 +39,7 @@ jobs:
           curl --fail --silent --show-error \
             https://raw.githubusercontent.com/AffineFoundation/affine/ebf4f5f67dd34e3a13c6c275e1b9e3fd3c9766cd/subnet/mimo_evaluation.py \
             --output "$AFFINE_NATIVE_EVALUATOR_FILE"
-          python -m pytest --noconftest tests/unit/test_affine_native_evaluation.py -q
+          python -m pytest --noconftest tests/unit/test_affine_native_evaluation.py tests/unit/test_affine_hf_checkpoint.py -q
   cpu-contracts:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

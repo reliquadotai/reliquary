@@ -101,6 +101,33 @@ Run, verify and export require the same bundle and workspace. `--fixture` is
 explicit for synthetic runs. The connected platform adapter additionally owns
 the broker lease, host deadline, receipt signing, delivery and settlement.
 
+For a public ungated Hugging Face checkpoint, preparation can materialize the
+signed file inventory first:
+
+```sh
+python -m reliquary.integrations.affine_cli native-evaluation prepare \
+  --config "$INTAKE" --out "$BUNDLE" --hf-repository "$REPOSITORY" \
+  --hf-revision "$FULL_40_HEX_COMMIT" --max-checkpoint-bytes "$BYTE_CEILING"
+```
+
+The original job and opening must already be signed and unexpired. The command
+does not sign them or change their checkpoint. It resolves metadata at exactly
+the supplied immutable commit, requires public ungated access without a token,
+checks the total size and free disk for both cache and export, then downloads
+only the signed filenames through the normal Hub cache. Streamed hashes and
+sizes must match before owner-only regular files are published into a new
+`checkpointDirectory`. Existing exports are never overwritten. Partial exports
+are removed on failure; the shared Hub cache remains available for reuse.
+
+The adjacent `<checkpointDirectory-name>.hf-source.private.json` stays outside
+the exact checkpoint inventory. Its five fields are `schema` equal to
+`hf-checkpoint-source/v1`, `repository`, `revision`, `checkpointId` and
+`checkpointInventoryDigest`. The last two bind the native file-hash map and the
+private export's file hashes and byte sizes respectively. This records source
+provenance; it does not establish Affine authorization, model compatibility,
+native parity or hardware qualification. A complete export remains available
+if a later source/bundle preparation check refuses the job.
+
 ```sh
 python -m pytest --noconftest tests/unit/test_affine_native_evaluation.py -q
 ```
