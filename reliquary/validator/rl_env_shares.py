@@ -8,9 +8,12 @@ its tokens). The tokens per group are the mean of the env's last in-zone groups,
 * ``lane_max``: the most groups an env may hold in the queue (queued or taken), ``lane_batches`` batches of its
   share; past it its leases are refused (``LeaseBook``, refusal ``lane_full``) and its price weight descends. The
   other envs are untouched.
-* ``batch_caps``: the most groups of an env one take hands the trainer, ``batch_factor`` x its share of the take
-  (``TrainingBuffer.take``): a cheap env cannot fill the batch while the others are short
-  (2026-10-24: 391 instruction-following groups of 512, a 35 M-token step instead of ~120 M).
+* ``batch_caps``: an env's groups in one take, ``batch_factor`` x its share of the take (``TrainingBuffer.take``,
+  ``rl_buffer.mixed_take``): a wave of one env cannot fill the batch while the others are queued
+  (2026-10-24: 391 instruction-following groups of 512, a 35 M-token step instead of ~120 M). A take still fills
+  the batch from the capped envs' extra groups when the others are short (2026-10-24 the strict cap held the
+  trainer 2.5 h on a queue of capped envs), and groups about to pass the max lag go first, above any cap.
+  ``batch_factor`` 1.0: exactly the target mix whenever the queue allows it.
 """
 from __future__ import annotations
 
