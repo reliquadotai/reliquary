@@ -547,8 +547,8 @@ def public_checkpoint_client(*, metadata_only: bool = False):
         aws_secret_access_key=os.getenv("R2_PUBLIC_SECRET_ACCESS_KEY", ""),
         config=_SyncConfig(
             signature_version="s3v4",
-            connect_timeout=1 if metadata_only else 15,
-            read_timeout=2 if metadata_only else 120,
+            connect_timeout=2 if metadata_only else 15,
+            read_timeout=5 if metadata_only else 120,
             retries={"total_max_attempts": 1, "mode": "standard"} if metadata_only else
                     {"max_attempts": 5, "mode": "standard"},
             max_pool_connections=32,

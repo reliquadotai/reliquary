@@ -453,7 +453,7 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
         if store is None:
             raise RuntimeError("checkpoint publication is unavailable")
         key = index_key(rl.settings.run)
-        previous = store.get_bytes(key)
+        previous, etag = store.get_bytes_with_etag(key)
         if previous:
             previous = strict_json_loads(previous)
             old, new = previous["latest"], index["latest"]
@@ -461,7 +461,13 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
                 raise ValueError("checkpoint index cannot replace an existing version")
             if index == previous:
                 return {"ok": True}
-        store.put_bytes(key, json.dumps(index, sort_keys=True).encode())
+        data = json.dumps(index, sort_keys=True).encode()
+        try:
+            # The condition is checked by storage when committing, even after a client timeout.
+            store.put_bytes_if_match(key, data, etag)
+        except Exception:
+            if store.get_bytes(key) != data:
+                raise
         return {"ok": True}
 
     def admit(b: dict) -> dict:

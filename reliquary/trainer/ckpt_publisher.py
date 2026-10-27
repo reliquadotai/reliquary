@@ -87,6 +87,25 @@ class R2ObjectStore:
     def put_bytes(self, key: str, data: bytes) -> None:
         self._client.put_object(Bucket=self.bucket, Key=key, Body=data)
 
+    def put_bytes_if_match(self, key: str, data: bytes, etag: str | None) -> None:
+        condition = {"IfNoneMatch": "*"} if etag is None else {"IfMatch": etag}
+        self._client.put_object(Bucket=self.bucket, Key=key, Body=data, **condition)
+
+    def get_bytes_with_etag(self, key: str) -> tuple[bytes | None, str | None]:
+        try:
+            response = self._client.get_object(Bucket=self.bucket, Key=key)
+        except self._client.exceptions.NoSuchKey:
+            return None, None
+        body = response["Body"]
+        try:
+            data = body.read()
+        finally:
+            body.close()
+        etag = response.get("ETag")
+        if not isinstance(etag, str) or not etag:
+            raise RuntimeError("checkpoint index requires an ETag for conditional replacement")
+        return data, etag
+
     def put_file(self, key: str, path: Path) -> None:
         from reliquary.trainer.publisher import _multipart_transfer_config
 

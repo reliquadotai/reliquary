@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
 import json
 import random
 import socket
@@ -383,6 +384,15 @@ class MemoryStore:
 
     def get_bytes(self, key):
         return self.objects.get(key)
+
+    def get_bytes_with_etag(self, key):
+        data = self.get_bytes(key)
+        return data, None if data is None else hashlib.sha256(data).hexdigest()
+
+    def put_bytes_if_match(self, key, data, etag):
+        if self.get_bytes_with_etag(key)[1] != etag:
+            raise RuntimeError("object changed")
+        self.put_bytes(key, data)
 
     def delete(self, key):
         self.objects.pop(key, None)
