@@ -347,7 +347,7 @@ def test_resolve_draws_uses_the_beacon_of_exactly_that_round_and_never_a_future_
     assert rt.resolve_draws(1, beacon_for_round=lambda r: {"round": r, "randomness": BEACON}, now=200.0) == \
         [early["observation_id"]]
     assert rt.pending_draw_rounds(1) == [102] and rt.pending_draw_rounds(1, environment=CODE) == []
-    # A stored beacon is THE beacon of its round: a later, different answer is not used.
+    # Stored first values remain fixed, but pending draws require matching fresh verification.
     stored = rt.db.execute("SELECT round, randomness FROM service_draw_beacons").fetchall()
     assert stored == [(42, BEACON)]
     assert rt.resolve_draws(1, beacon_for_round=lambda r: "ee" * 32, now=400.0) == [late["observation_id"]]
@@ -355,9 +355,9 @@ def test_resolve_draws_uses_the_beacon_of_exactly_that_round_and_never_a_future_
         {42: BEACON, 102: "ee" * 32}
     same_round = explore(rt, prompt=5, now=500.0, arrived_at=120.0)       # a later row of round 42
     asked.clear()
-    assert rt.resolve_draws(1, beacon_for_round=lambda r: asked.append(r) or "11" * 32, now=600.0) == \
-        [same_round["observation_id"]]
-    assert asked == []                                     # round 42 is not fetched twice
+    assert rt.resolve_draws(1, beacon_for_round=lambda r: asked.append(r) or "11" * 32, now=600.0) == []
+    assert asked == [42] and rt.pending_draw_rounds(1) == [42]
+    assert rt.resolve_draws(1, beacon_for_round=lambda r: BEACON, now=600.0) == [same_round["observation_id"]]
 
 
 def test_default_beacon_source_is_the_verified_drand_beacon(tmp_path, monkeypatch):
@@ -368,6 +368,57 @@ def test_default_beacon_source_is_the_verified_drand_beacon(tmp_path, monkeypatc
                         lambda round_id: calls.append(round_id) or {"round": round_id, "signature": "", "randomness": BEACON})
     assert rt.resolve_draws(1, now=10_000.0) == [result["observation_id"]]
     assert calls == [42]
+
+
+@pytest.mark.parametrize("cached", [BEACON, "ee" * 32])
+def test_pending_legacy_draw_cache_needs_matching_verification_after_restart(tmp_path, monkeypatch, cached):
+    rt = runtime(tmp_path)
+    result = explore(rt)
+    rt.db.execute("INSERT INTO service_draw_beacons VALUES(?,?,?)", (rt.contract.sha256, 42, cached))
+    rt.db.commit()
+    rt.close()
+    rt = build(tmp_path / "runtime.sqlite3")
+    calls = []
+    monkeypatch.setattr(runtime_module, "_verified_beacon", lambda r: calls.append(r) or None)
+    assert rt.resolve_draws(1, now=200.0) == []
+    assert calls == [42] and rt.pending_draw_rounds(1) == [42]
+    monkeypatch.setattr(runtime_module, "_verified_beacon", lambda r: calls.append(r) or BEACON)
+    expected = [result["observation_id"]] if cached == BEACON else []
+    assert rt.resolve_draws(1, now=201.0) == expected
+    assert calls == [42, 42]
+    assert rt.pending_draw_rounds(1) == ([] if cached == BEACON else [42])
+    assert rt.db.execute("SELECT round, randomness FROM service_draw_beacons").fetchall() == [(42, cached)]
+    rt.close()
+
+
+def test_a_cached_future_draw_waits_for_its_round(tmp_path):
+    rt = runtime(tmp_path)
+    explore(rt)
+    rt.db.execute("INSERT INTO service_draw_beacons VALUES(?,?,?)", (rt.contract.sha256, 42, BEACON))
+    rt.db.commit()
+    asked = []
+    assert rt.resolve_draws(1, beacon_for_round=lambda r: asked.append(r) or BEACON, now=125.0) == []
+    assert asked == [] and rt.pending_draw_rounds(1) == [42]
+    rt.close()
+
+
+def test_finalized_draw_history_is_preserved_without_a_beacon_fetch_after_restart(tmp_path):
+    rt = runtime(tmp_path)
+    result = explore(rt)
+    audited(rt, result, now=200.0)
+    rt.reconcile_archive(archive(), now=300.0)
+    rows = rt.ledger.rows(1, environment=MATH)
+    stored = rt.db.execute("SELECT round, randomness FROM service_draw_beacons").fetchall()
+    rt.close()
+    rt = build(tmp_path / "runtime.sqlite3")
+
+    def unavailable(round_id):
+        pytest.fail("a finalized draw fetched a beacon")
+
+    assert rt.resolve_draws(1, beacon_for_round=unavailable, now=400.0) == []
+    assert rt.ledger.rows(1, environment=MATH) == rows
+    assert rt.db.execute("SELECT round, randomness FROM service_draw_beacons").fetchall() == stored
+    rt.close()
 
 
 def test_audit_queue_runs_hotkeys_past_probation_first_then_by_draw_round(tmp_path):
@@ -1358,7 +1409,7 @@ def test_i2_a_window_settled_aborted_then_called_not_aborted_is_a_valid_archive_
 
 # ---------------------------------------------------------------- restart
 
-def test_restart_reuses_the_stored_draw_beacon_and_the_run_salt_whatever_the_new_beacon_source_says(tmp_path):
+def test_restart_revalidates_pending_draws_and_preserves_resolved_draws_and_run_salt(tmp_path):
     from reliquary.services.exploration import audit_selected
     path = tmp_path / "runtime.sqlite3"
     contract = reward_contract(new_hotkey_audit_groups=0, audit_bps=5000)   # the beacon and the salt decide
@@ -1390,10 +1441,15 @@ def test_restart_reuses_the_stored_draw_beacon_and_the_run_salt_whatever_the_new
     asked = []
     other = "ee" * 32                                                       # the reopened source disagrees
     rt.resolve_draws(1, beacon_for_round=lambda r: asked.append(r) or other, now=10_000.0)
-    assert asked == []                                                      # round 42 is stored: never asked again
+    assert asked == [42]
     assert rt.db.execute("SELECT round, randomness FROM service_draw_beacons").fetchall() == [(42, BEACON)]
     after = state(rt)
     assert {key: after[key] for key in early} == before                     # drawn rows did not move
+    assert all(after[key] == "pending_draw" for key in keys if key not in early)
+    assert rt.resolve_draws(1, beacon_for_round=lambda r: None, now=10_001.0) == []
+    assert state(rt) == after                                               # outages do not reuse unsigned rows
+    rt.resolve_draws(1, beacon_for_round=lambda r: BEACON, now=10_002.0)
+    after = state(rt)
 
     def selection(beacon, run_salt):
         return {key: ("queued" if audit_selected(beacon_randomness=beacon, observation_id=ids[key], audit_bps=5000,

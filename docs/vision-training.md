@@ -8,10 +8,13 @@ task or extend the text proof protocol.
 
 ## Runtime
 
-Use a dedicated Python 3.12 environment for the optional runtime:
+Prepare a dedicated Python 3.12 environment using the
+[trusted bootstrap steps](../README.md#local-development), then install the
+optional runtime:
 
 ```sh
-python -m pip install '.[vision]'
+PIP_USE_DEPRECATED=legacy-certs python -m pip install '.[vision]'
+python scripts/bootstrap_python_trust.py
 python -m reliquary.vision --help
 ```
 

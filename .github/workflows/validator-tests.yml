@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PIP_USE_DEPRECATED: legacy-certs
+
 concurrency:
   group: validator-tests-${{ github.ref }}
   cancel-in-progress: true
@@ -29,9 +32,10 @@ jobs:
           cache: pip
       - name: Install CPU test runtime
         run: |
-          python -m pip install --upgrade pip
+          python scripts/bootstrap_python_trust.py
           python -m pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -e ".[dev]"
+          python scripts/bootstrap_python_trust.py
       - name: Run validator suite (shard ${{ matrix.shard }}/4)
         run: |
           pytest -q -n 4 --durations=15 --timeout=900 \
@@ -77,9 +81,10 @@ jobs:
           cache: pip
       - name: Install CPU test runtime
         run: |
-          python -m pip install --upgrade pip
+          python scripts/bootstrap_python_trust.py
           python -m pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -e ".[dev]"
+          python scripts/bootstrap_python_trust.py
       - name: Run ${{ matrix.test }}
         run: pytest -q --timeout=1500 "tests/unit/test_corpus_split_e2e.py::${{ matrix.test }}"
 
@@ -126,9 +131,10 @@ jobs:
           cache: pip
       - name: Install pinned sandbox test runtime
         run: |
-          python -m pip install --upgrade pip
+          python scripts/bootstrap_python_trust.py
           python -m pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -e ".[dev,sandbox-test,sandbox-miner]"
+          python scripts/bootstrap_python_trust.py
       - name: Require the signed sandbox dependencies and exact source pin
         run: |
           python - <<'PY'
@@ -231,9 +237,10 @@ jobs:
           cache: pip
       - name: Install CPU test runtime
         run: |
-          python -m pip install --upgrade pip
+          python scripts/bootstrap_python_trust.py
           python -m pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -e ".[dev]"
+          python scripts/bootstrap_python_trust.py
       - name: Assert the profile actually resolved
         run: |
           python - <<'PY'

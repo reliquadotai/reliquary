@@ -16,6 +16,7 @@ on:
       - "reliquary/environment/manifests/**"
       - "tests/fixtures/reliquarylogic_v1.jsonl"
       - "scripts/test_evaluation_package.py"
+      - "scripts/bootstrap_python_trust.py"
 
 permissions:
   contents: read

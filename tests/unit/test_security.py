@@ -387,11 +387,12 @@ class TestBeaconSignatureVerification:
         assert verify_beacon_signature("abc", 1, crafted_rand, "cc" * 48) is False
 
     def test_correct_dst_for_quicknet(self):
-        """The DST must use BLS12381G1, not BN254G1."""
+        """The quicknet scheme verifies its published round, offline."""
         import reliquary.infrastructure.drand as drand_mod
-        source = inspect.getsource(drand_mod.verify_beacon_signature)
-        assert "BLS12381G1" in source or "BLS_SIG_BLS12381G1" in source
-        assert "BN254G1" not in source
+        signature = ("afaef99ecc0a56993fc66f032403971368456f07f3d727bdcd365af742331a2c"
+                     "57ffad1c5ad3052166b4beaa7ea7727c")
+        assert drand_mod.verify_round_signature(32_700_000, signature)
+        assert not drand_mod.verify_round_signature(32_700_001, signature)
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -5,6 +5,7 @@ on:
       - "reliquary/environment/**"
       - "scripts/*logic*"
       - "scripts/qualify_verifiers_interop.py"
+      - "scripts/bootstrap_python_trust.py"
       - "tests/unit/test_prime_v1_interop.py"
       - "docker/logic*"
       - "docker/Dockerfile.environment-qualification"
@@ -34,7 +35,7 @@ jobs:
           path: .logic-source
       - uses: astral-sh/setup-uv@v7
         with:
-          version: "0.11.10"
+          version: "0.13.5"
           python-version: "3.12"
       - name: Reproduce the reviewed Logic wheel
         working-directory: .logic-source

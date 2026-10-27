@@ -4,6 +4,8 @@ FROM vllm/vllm-openai@sha256:3e10e8189823e0f7ae4620c271bcdaaf64127ec7d0edc351591
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
+COPY scripts/bootstrap_python_trust.py /opt/bootstrap_python_trust.py
+RUN python3 /opt/bootstrap_python_trust.py --system
 WORKDIR /opt/evaluation-source
 COPY pyproject.toml README.md ./
 COPY reliquary ./reliquary
@@ -16,6 +18,7 @@ RUN python3 -c "from importlib.metadata import version; import torch; assert ver
     && python3 -m pip check \
     && python3 -c "import torch; assert torch.version.cuda == '12.9'" \
     && rm /tmp/evaluation-constraints.txt
+RUN python3 /opt/bootstrap_python_trust.py --system
 
 RUN useradd --uid 10001 --user-group --create-home --home-dir /home/evaluation evaluation \
     && mkdir -p /opt/reliquary-eval /home/evaluation/.cache \
