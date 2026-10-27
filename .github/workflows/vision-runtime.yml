@@ -5,6 +5,7 @@ on:
     paths:
       - "reliquary/vision/**"
       - "scripts/vision-training-runtime.py"
+      - "scripts/bootstrap_python_trust.py"
       - "docker/Dockerfile.vision-training"
       - ".dockerignore"
       - "tests/fixtures/reliquarylogic_v1.jsonl"
@@ -15,6 +16,7 @@ on:
   push:
     branches: [main]
     paths:
+      - "scripts/bootstrap_python_trust.py"
       - "reliquary/vision/**"
       - "scripts/vision-training-runtime.py"
       - "docker/Dockerfile.vision-training"
@@ -28,6 +30,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PIP_USE_DEPRECATED: legacy-certs
+
 jobs:
   contracts:
     runs-on: ubuntu-24.04
@@ -37,8 +42,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - run: python scripts/bootstrap_python_trust.py
       - run: pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cpu
       - run: pip install pytest pytest-asyncio Pillow==13.0.0 transformers==5.10.4 peft==0.21.2 accelerate==1.15.0 num2words==0.5.14
+      - run: python scripts/bootstrap_python_trust.py
       # This worker does not import validator/server dependencies or fixtures.
       - run: python -m pytest --noconftest tests/unit/test_vision* -q
         env:
@@ -54,9 +61,13 @@ jobs:
         with:
           python-version: "3.12"
       - name: Download the immutable public test model
+        env:
+          HF_HUB_DISABLE_XET: "1"
         run: |
+          python scripts/bootstrap_python_trust.py
           pip install huggingface-hub==1.30.0
-          python - <<'PY'
+          python scripts/bootstrap_python_trust.py
+          SSL_CERT_FILE="$(python -c 'import certifi; print(certifi.where())')" python - <<'PY'
           from huggingface_hub import snapshot_download
           from pathlib import Path
           import shutil

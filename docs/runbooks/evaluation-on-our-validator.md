@@ -239,7 +239,18 @@ reliquary eval feed --run-id <wandb-run-id> --job-prefix eval-<tag>-s \
 ```
 
 It is checked against the platform's validator (`shared/run-benchmarks.ts`)
-before it is written. `--publish` puts it at `rl-runs/<wandb-run-id>/benchmarks.json`
+before it is written. Baseline and checkpoint reports must agree on the frozen
+request/set protocols, sampler and recorded seed, source manifest, grader,
+reasoning mode and budgets. Pinned requests are verified against their exact
+producer `protocol_json` bytes; their digest binds the full request. Legacy
+reports without those pins remain readable but cannot establish missing evidence.
+The baseline step remains null; checkpoint points require an explicit `rl_step`.
+An HF backup's `-step-N` suffix supplies the optimizer step only. Its checkpoint
+publication version remains unknown unless separately supplied; publication
+cadence can span multiple optimizer steps.
+The curve shows conservative pass@1; use the retained report and graded rows to
+distinguish wrong answers, token caps, missing samples and grader errors.
+`--publish` puts it at `rl-runs/<wandb-run-id>/benchmarks.json`
 in `reliquary-public`; that bucket is private, so the RL validator serves it at
 `GET /rl/benchmarks?run_id=<wandb-run-id>`. On the platform:
 `RELIQUARY_RUN_BENCHMARKS_URL=https://<rl-validator-public-host>/rl/benchmarks`

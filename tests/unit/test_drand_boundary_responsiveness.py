@@ -37,6 +37,8 @@ async def test_cold_chain_import_keeps_health_endpoints_responsive(monkeypatch):
     def cold_import(name, globals=None, locals=None, fromlist=(), level=0):
         if name == "reliquary.infrastructure.drand":
             import_threads.append(threading.get_ident())
+            started.set()
+            served_during_bootstrap.append(release.wait(1))
             spec = importlib.util.spec_from_file_location("cold_drand_metadata", drand.__file__)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
@@ -44,9 +46,7 @@ async def test_cold_chain_import_keeps_health_endpoints_responsive(monkeypatch):
         return original_import(name, globals, locals, fromlist, level)
 
     def get(session, url, **kwargs):
-        started.set()
-        served_during_bootstrap.append(release.wait(1))
-        return SimpleNamespace(status_code=200, json=lambda: {"genesis_time": 10, "period": 3})
+        pytest.fail("chain metadata must be pinned without a network fetch")
 
     monkeypatch.setattr(builtins, "__import__", cold_import)
     monkeypatch.setattr(requests.Session, "get", get)

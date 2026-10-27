@@ -591,6 +591,7 @@ def _run_train_follower(ctx, channel) -> None:
         run_follower,
     )
     from reliquary.validator.training import (
+        TrainingAdmissionError,
         TrainingStepSkipped,
         reset_training_state,
         train_step,
@@ -606,7 +607,7 @@ def _run_train_follower(ctx, channel) -> None:
     def train(model, payload):
         try:
             train_step(model, payload["batches"], **payload["kwargs"])
-        except TrainingStepSkipped:
+        except (TrainingStepSkipped, TrainingAdmissionError):
             pass  # every rank took the same decision; rank 0 handles it
 
     def audit(model, payload):

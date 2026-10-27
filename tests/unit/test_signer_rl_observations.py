@@ -356,7 +356,7 @@ async def test_the_async_validator_signs_both_public_boards_through_the_signer(m
         def generate_presigned_url(self, op, Params, ExpiresIn):
             return f"mem://{Params['Key']}"
 
-    monkeypatch.setattr(storage, "public_checkpoint_client", lambda: Bucket())
+    monkeypatch.setattr(storage, "public_checkpoint_client", lambda **kwargs: Bucket())
     monkeypatch.setattr(storage, "public_checkpoint_bucket", lambda: "public")
     book = LeaseBook(tmp_path / "rl.sqlite3", LeaseBookConfig(expiry_s={"math": 600.0}, cooldown_of=lambda env: 2),
                      quota=QuotaController(), clock=lambda: 1000.0)

@@ -1,0 +1,23 @@
+# Candidate compute runtime; exact-image GPU qualification is still required.
+ARG BASE_IMAGE=python:3.12-slim@sha256:090ba77e2958f6af52a5341f788b50b032dd4ca28377d2893dcf1ecbdfdfe203
+FROM ${BASE_IMAGE}
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
+COPY scripts/bootstrap_python_trust.py /opt/bootstrap_python_trust.py
+RUN python /opt/bootstrap_python_trust.py --system
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install --no-cache-dir torch==2.7.0 --index-url "${TORCH_INDEX_URL}" \
+    && python -m pip install --no-cache-dir numpy==2.3.5 transformers==5.10.4 \
+    && chmod 0711 /root \
+    && mkdir -p /root/sn120-scorer-v9 /root/ckpt-cache /root/trusted-sampler/data
+RUN python /opt/bootstrap_python_trust.py --system
+WORKDIR /opt/scoring-runtime
+COPY reliquary/__init__.py ./reliquary/
+COPY reliquary/integrations/__init__.py reliquary/integrations/affine.py reliquary/integrations/affine_scoring*.py ./reliquary/integrations/
+COPY reliquary/protocol/__init__.py reliquary/protocol/release_contract.py ./reliquary/protocol/
+COPY reliquary/shared/__init__.py reliquary/shared/strict_json.py ./reliquary/shared/
+ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false HOME=/tmp \
+    OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+USER 10001:10001
+HEALTHCHECK NONE
+ENTRYPOINT ["python", "-m", "reliquary.integrations.affine_scoring_cli"]

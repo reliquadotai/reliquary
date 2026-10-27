@@ -316,14 +316,23 @@ class ObservationPublisher:
 
     async def close(self, timeout: float = 30.0) -> None:
         """Return once no thread call is running and none can start any more. Never gives up: the caller
-        closes the runtime right after, which must not happen under a running thread."""
+        closes the runtime right after, which must not happen under a running thread. Cancellation
+        propagates only after this drain; ``timeout`` is the interval between busy warnings."""
         def seal():
             with self._calls:
                 self._closed = True
         sealing = asyncio.ensure_future(asyncio.to_thread(seal))
+        cancelled = None
         while True:
-            done, _ = await asyncio.wait({sealing}, timeout=timeout)
+            try:
+                done, _ = await asyncio.wait({sealing}, timeout=timeout)
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+                continue
             if done:
+                sealing.result()
+                if cancelled is not None:
+                    raise cancelled
                 return
             logger.error("observation publisher still busy after %.0f s; still waiting", timeout)
 

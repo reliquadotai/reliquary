@@ -612,30 +612,47 @@ def test_every_reason_the_runtime_can_emit_is_in_the_published_allow_list(tmp_pa
     assert reasons == {"token_limit"} <= publication.PUBLIC_REASONS
 
 
-def test_close_waits_for_a_running_thread_call_and_refuses_later_ones(tmp_path):
-    import time
+@pytest.mark.parametrize("timeout", [30.0, 0.01])
+def test_close_waits_for_a_running_thread_call_and_refuses_later_ones(tmp_path, monkeypatch, timeout):
+    import threading
     rt = runtime(tmp_path)
     explore(rt)
     pub, _ = publisher(rt, [])
     done = []
     real = rt.plan_segment
 
-    def slow(**kw):
-        time.sleep(0.3)
-        out = real(**kw)
-        done.append(1)
-        return out
-    rt.plan_segment = slow
-
     async def scenario():
+        loop = asyncio.get_running_loop()
+        started, busy = asyncio.Event(), asyncio.Event()
+        release = threading.Event()
+        monkeypatch.setattr(publication.logger, "error", lambda *args: busy.set())
+
+        def slow(**kw):
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(5)
+            out = real(**kw)
+            done.append(1)
+            return out
+        rt.plan_segment = slow
         task = asyncio.create_task(pub.flush())
-        await asyncio.sleep(0.05)
-        await pub.close()
-        finished = list(done)
-        task.cancel()
-        with pytest.raises(BaseException):
-            await task
-        return finished
+        closing = None
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            closing = asyncio.create_task(pub.close(timeout=timeout))
+            await asyncio.sleep(0)
+            if timeout < 1:
+                await asyncio.wait_for(busy.wait(), timeout=5)
+            assert not closing.done()
+            assert not done
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+            if closing is not None:
+                await closing
+        return list(done)
     assert asyncio.run(scenario()) == [1]
     with pytest.raises(RuntimeError, match="closed"):
         asyncio.run(pub._thread(lambda: None))
@@ -657,6 +674,71 @@ def test_stopping_the_service_closes_the_publisher_before_the_runtime():
         await ValidationService._stop_observation_publication(me)
     asyncio.run(scenario())
     assert order == ["publisher"]
+
+
+def test_cancelling_shutdown_drains_publisher_threads_before_closing_runtime(tmp_path):
+    import threading
+    from unittest.mock import AsyncMock
+    from reliquary.validator.service import ValidationService
+
+    rt = runtime(tmp_path)
+    pub, _ = publisher(rt, [])
+    release = threading.Event()
+    order = []
+    real_close = rt.close
+
+    def close_runtime():
+        order.append("runtime")
+        real_close()
+    rt.close = close_runtime
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        started, closing = asyncio.Event(), asyncio.Event()
+
+        def blocked():
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(5)
+            rt.last_published_number()
+            order.append("thread")
+
+        task = asyncio.create_task(pub._thread(blocked))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        close_publisher = pub.close
+
+        async def closing_publisher():
+            closing.set()
+            await close_publisher()
+        pub.close = closing_publisher
+
+        service = SimpleNamespace(
+            _observation_task=task, _observation_stop=asyncio.Event(), _observation_publisher=pub,
+            _stop_observation_publication=lambda: ValidationService._stop_observation_publication(service),
+            _service_runtime=rt,
+            _close_proof_scheduler=AsyncMock(), server=SimpleNamespace(stop=AsyncMock()),
+            _stop_episode_services=AsyncMock(),
+        )
+        shutdown = asyncio.create_task(ValidationService._stop_serving(service))
+        try:
+            await asyncio.wait_for(closing.wait(), timeout=5)
+            for _ in range(2):
+                shutdown.cancel()
+                await asyncio.sleep(0)
+                assert not shutdown.done()
+                assert not order
+        finally:
+            release.set()
+            await close_publisher()
+            await asyncio.gather(shutdown, return_exceptions=True)
+        with pytest.raises(asyncio.CancelledError):
+            await shutdown
+
+    asyncio.run(scenario())
+    assert order == ["thread", "runtime"]
 
 
 # --- Fix round 2 (N-1 .. N-5) ---
@@ -848,33 +930,6 @@ def test_remote_check_disables_when_a_remote_page_is_missing_forged_or_differs(t
     pub, _ = publisher(remote_rt, [], get=store_getter({**store, page1: resigned}))
     asyncio.run(pub.flush())
     assert pub.disabled
-
-
-def test_close_keeps_waiting_for_a_thread_call_that_outlives_the_timeout(tmp_path):
-    import time
-    rt = runtime(tmp_path)
-    explore(rt)
-    pub, _ = publisher(rt, [])
-    finished = []
-    real = rt.plan_segment
-
-    def slow(**kw):
-        time.sleep(0.4)
-        out = real(**kw)
-        finished.append(1)
-        return out
-    rt.plan_segment = slow
-
-    async def scenario():
-        task = asyncio.create_task(pub.flush())
-        await asyncio.sleep(0.05)
-        await pub.close(timeout=0.05)
-        seen = list(finished)
-        task.cancel()
-        with pytest.raises(BaseException):
-            await task
-        return seen
-    assert asyncio.run(scenario()) == [1]    # close() returned only after the running call ended
 
 
 def test_verify_index_refuses_a_head_holding_a_whole_page(monkeypatch):
