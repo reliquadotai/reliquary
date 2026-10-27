@@ -176,10 +176,28 @@ def test_native_cli_dispatch_preserves_fixture_boundary(tmp_path, capsys):
     checked = json.loads(capsys.readouterr().out)
     assert checked["expired"] is False and checked["activated"] is False
     workspace = tmp_path / "cli-work"
-    assert main(prefix + ["run", "--bundle", str(bundle), "--workspace", str(workspace), "--fixture"]) == 0
+    assert (
+        main(
+            prefix
+            + [
+                "run",
+                "--bundle",
+                str(bundle),
+                "--workspace",
+                str(workspace),
+                "--fixture",
+            ]
+        )
+        == 0
+    )
     result = json.loads(capsys.readouterr().out)
     assert result["assurance"] == "fixture" and result["nativeParityVerified"] is False
-    assert main(prefix + ["verify", "--bundle", str(bundle), "--workspace", str(workspace)]) == 0
+    assert (
+        main(
+            prefix + ["verify", "--bundle", str(bundle), "--workspace", str(workspace)]
+        )
+        == 0
+    )
     assert json.loads(capsys.readouterr().out) == result
 
 
@@ -554,3 +572,93 @@ def test_original_native_evaluator_report_contract(tmp_path, monkeypatch):
         result["error_count"],
     ) == (4, 3, 1, 1)
     assert result["status"] == "error" and result["mean_reward"] is None
+
+
+def test_offline_preflight_prices_ceiling_and_never_qualifies_runtime(
+    tmp_path, capsys, monkeypatch
+):
+    from reliquary.integrations.affine_native_preflight import preflight
+
+    bundle, _, job, _ = prepared(tmp_path)
+    wheels = tmp_path / "wheels"
+    wheels.mkdir(mode=0o700)
+    hashes = {}
+    for name in job["runtime_versions"]:
+        path = wheels / (name + "-fixture-py3-none-any.whl")
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr(
+                name + ".dist-info/METADATA", "Name: " + name + "\nVersion: fixture\n"
+            )
+        path.chmod(0o600)
+        hashes[name] = native.checksum(path)
+    lock = tmp_path / "requirements.txt"
+    lock.write_text(
+        "\n".join(n + "==fixture --hash=sha256:" + h for n, h in hashes.items())
+    )
+    lock.chmod(0o600)
+    config = dict(
+        schema="affine-native-preflight/v1",
+        maxSeconds=29,
+        rateMicroUsdPerHour=7_000_000,
+        maxCostMicroUsd=1_000_000,
+        providerCeilingMicroUsdPerGpuHour=5_080_000,
+        gpuCount=1,
+        companyCostCeilingMicroUsd=1_000_000,
+        image="runtime@sha256:" + "a" * 64,
+        requirementsFile=str(lock),
+        wheelDirectory=str(wheels),
+    )
+    path = tmp_path / "preflight.private.json"
+    save(path, config)
+    result = preflight(bundle, path)
+    assert result["blockers"] == ["fixture_only"]
+    from reliquary.integrations.affine_native_evaluation_cli import main
+
+    assert main(["preflight", "--bundle", str(bundle), "--config", str(path)]) == 2
+    summary = capsys.readouterr().out
+    assert '"nativeExecutionReady": false' in summary and str(path) not in summary
+
+    assert result["maxReservedMicroUsd"] == 56389
+    assert result["maxProviderComputeMicroUsd"] == 40923
+    assert result["runtimeInventory"]["wheelInventoryVerified"] is True
+    assert not result["nativeExecutionReady"] and not result["activated"]
+    assert not result["runtimeInventory"]["dependencyResolutionVerified"]
+    descriptor = native.read_json(bundle / "job.private.json")
+    synthetic = {**descriptor, "assurance": "native-mimo-evaluation"}
+    synthetic["jobDigest"] = native.canonical_sha256(
+        {k: v for k, v in synthetic.items() if k != "jobDigest"}
+    )
+    with monkeypatch.context() as context:
+        context.setattr(
+            native, "EVALUATOR_SHA256", job["source_files"]["subnet/mimo_evaluation.py"]
+        )
+        save(bundle / "job.private.json", synthetic)
+        offline = preflight(bundle, path)
+        assert offline["offlineReady"] is True
+        assert offline["nativeExecutionReady"] is False
+        assert offline["totalRentalCostQualified"] is False
+    save(bundle / "job.private.json", descriptor)
+
+    assert (
+        "original_job_lifetime_insufficient"
+        in preflight(bundle, path, now=job["expires_at"] - 1)["blockers"]
+    )
+    config["gpuCount"] = 2
+    save(path, config)
+    with pytest.raises(ValueError, match="bounded preflight"):
+        preflight(bundle, path)
+    config["gpuCount"] = 1
+    config.update(maxCostMicroUsd=1, companyCostCeilingMicroUsd=1)
+    save(path, config)
+    result = preflight(bundle, path, now=job["expires_at"])
+    assert set(result["blockers"]) == {
+        "fixture_only",
+        "original_job_lifetime_insufficient",
+        "customer_budget_insufficient",
+        "company_compute_budget_insufficient",
+    }
+    (wheels / "torch-fixture-py3-none-any.whl").unlink()
+    assert "runtime_wheels_missing" in preflight(bundle, path)["blockers"]
+    lock.write_text("torch==wrong --hash=sha256:" + "a" * 64)
+    with pytest.raises(ValueError, match="fingerprint"):
+        preflight(bundle, path)

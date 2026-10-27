@@ -1,0 +1,30 @@
+# Offline native evaluation preflight
+
+`reliquary affine native-evaluation preflight --bundle BUNDLE --config CONFIG`
+checks the existing immutable signed bundle without native execution or network
+access. The owner-private configuration outside Git has schema
+`affine-native-preflight/v1` and exactly these fields:
+
+- `maxSeconds`, `rateMicroUsdPerHour`, `maxCostMicroUsd`.
+- `providerCeilingMicroUsdPerGpuHour`, `gpuCount`, `companyCostCeilingMicroUsd`.
+- `image`, pinned by SHA256, `requirementsFile` and `wheelDirectory`.
+
+All money and duration values are bounded integers. The maximum customer reserve
+and provider compute estimate round up once to integer micro-USD. They cover the
+requested allocation duration. The company estimate covers GPU time only;
+additional operating costs require a separate approved allowance.
+
+The supplied lock must contain exact versions and SHA256 hashes. Available wheel
+metadata and bytes must match that lock and the original signed job's native
+package versions. Missing wheels are returned as blockers without downloads.
+This inventory does not resolve dependencies, build an image, establish wheel
+platform compatibility or qualify native numerical behavior.
+
+The requested duration must fit the original job lifetime, frozen allocation
+limit and finalization reserve. Customer and company ceilings are independent.
+Fixtures always remain blocked for native execution. The result always reports
+`nativeExecutionReady: false`; a usable inventory still needs a resolved runtime
+image, H200 numerical qualification and account/capacity approval.
+
+Exit code 2 means valid but blocked preparation; 1 means refused inputs; 0 means
+offline checks passed. These statuses never launch, publish or fund a job.

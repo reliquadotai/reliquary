@@ -13,7 +13,7 @@ from . import affine_native_evaluation as evaluation
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("prepare", "check", "run", "verify", "export"))
+    parser.add_argument("command", choices=("prepare", "check", "preflight", "run", "verify", "export"))
     for name in ("config", "bundle", "workspace", "checkpoint", "out"):
         parser.add_argument("--" + name, type=Path)
     parser.add_argument("--max-seconds", type=float)
@@ -30,7 +30,11 @@ def main(argv=None):
             result = evaluation.prepare(args.config, args.out)
         else:
             need("bundle")
-            if args.command == "check":
+            if args.command == "preflight":
+                need("config")
+                from .affine_native_preflight import preflight
+                result = preflight(args.bundle, args.config)
+            elif args.command == "check":
                 job, *_ = evaluation.load_bundle(args.bundle)
                 result = {"stage": "metadata_checked", "jobDigest": job["jobDigest"],
                           "assurance": job["assurance"], "expired": job["nativeJobExpiresAt"] <= time.time(),
@@ -54,7 +58,7 @@ def main(argv=None):
                 need("workspace", "out")
                 result = evaluation.export(args.bundle, args.workspace, args.out)
         print(json.dumps(result, sort_keys=True))
-        return 0
+        return 2 if args.command == "preflight" and not result["offlineReady"] else 0
     except Exception:
         print(json.dumps({"stage": "unavailable", "error": "Native evaluation refused; inspect private inputs and state."}))
         return 1
