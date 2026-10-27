@@ -35,7 +35,8 @@ logger = logging.getLogger(__name__)
 
 BASE = "base"
 _SHORT = re.compile(r"[a-z0-9][a-z0-9-]{0,15}")
-DEFAULT_START = ("reliquary tasks contract --task-id {job} > {contract} && "
+# the merged contract of every job served: one job's contract would refuse the others' environments
+DEFAULT_START = ("reliquary tasks contract {task_ids} > {contract} && "
                  "RELIQUARY_TASK_ID={job} RELIQUARY_TASK_CONTRACT={contract} RELIQUARY_CORPUS_HOT_JOBS=1 "
                  "exec reliquary validate --wallet-name {wallet} --hotkey {hotkey} "
                  "--http-host 0.0.0.0 --http-port {port} --no-set-weights")
@@ -364,7 +365,8 @@ class Scheduler:
         pending = [j for j in cp["jobs"] if j not in cp["graded"] and j not in cp["abandoned"]]
         job = pending[0]                                  # the validator serves the jobs not graded yet
         values = {k: shlex.quote(str(v)) for k, v in self.s.start_values.items()}
-        return self.s.start_cmd.format(job=job, jobs=",".join(pending), model=cp["repo"],
+        task_ids = " ".join(f"--task-id {shlex.quote(j)}" for j in pending)
+        return self.s.start_cmd.format(job=job, jobs=",".join(pending), task_ids=task_ids, model=cp["repo"],
                                        revision=cp["revision"],
                                        contract=shlex.quote(str(self.s.results_dir / f"{job}.contract.json")),
                                        **values)

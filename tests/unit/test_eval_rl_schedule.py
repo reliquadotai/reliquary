@@ -362,3 +362,11 @@ def test_a_serving_checkpoint_without_a_validator_starts_one(tmp_path):
     (tmp_path / "state.json").write_text(json.dumps(state))
     lines = s.tick(execute=True)
     assert any("is gone: restart" in line for line in lines) and len(world.started) == 2
+
+
+def test_the_validator_runs_the_merged_contract_of_every_job_it_serves(tmp_path):
+    world = World()
+    s = scheduler(tmp_path, world, baseline_model=None)
+    world.backups = [50]
+    s.tick(execute=True)
+    assert "tasks contract --task-id eval-r7-s00050-aime --task-id eval-r7-s00050-gpqa >" in world.started[0]
