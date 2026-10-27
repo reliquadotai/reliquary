@@ -368,6 +368,8 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
 
     hint = max(0, int(global_step_hint or 0))
     restored = hint > 0 and _restore_optimizer_state(hint)
+    if hint > 0 and not restored and os.environ.get("RELIQUARY_REQUIRE_OPTIMIZER_RESUME", "").strip() == "1":
+        raise RuntimeError(f"matching optimizer state is required to resume step {hint}")
     rewarmup = LR_RESTART_REWARMUP_WINDOWS if hint > 0 and not restored else 0
 
     def _lr_lambda(step: int) -> float:

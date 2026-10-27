@@ -10,7 +10,8 @@ Start: a fresh lease book (no checkpoint adopted) starts from the base model (``
 ``RELIQUARY_RL_BASE_MODEL``), published and adopted as checkpoint 0. Otherwise the trainer resumes from the weights
 of the latest published checkpoint, rebuilt from the bucket through the validator's signed index (``GET
 /rl/trainer/checkpoint``, ``CheckpointSync``); a version published but never adopted (a crash between the two) is adopted
-first. The optimizer starts fresh (the bf16 checkpoint is all the bucket holds).
+first. Matching local per-rank snapshots restore Adam moments and fp32 masters; without them the default is a
+short re-warmup. ``RELIQUARY_REQUIRE_OPTIMIZER_RESUME=1`` refuses a resumed run without matching optimizer state.
 
 Publication: ``DeltaPublisher`` into ``reliquary-public`` (``R2_PUBLIC_*``), the anchors carrying the model's config
 and tokenizer; Hugging Face backups every ``RELIQUARY_RL_HF_BACKUP_EVERY`` steps under
