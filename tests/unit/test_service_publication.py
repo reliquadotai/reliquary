@@ -612,30 +612,47 @@ def test_every_reason_the_runtime_can_emit_is_in_the_published_allow_list(tmp_pa
     assert reasons == {"token_limit"} <= publication.PUBLIC_REASONS
 
 
-def test_close_waits_for_a_running_thread_call_and_refuses_later_ones(tmp_path):
-    import time
+@pytest.mark.parametrize("timeout", [30.0, 0.01])
+def test_close_waits_for_a_running_thread_call_and_refuses_later_ones(tmp_path, monkeypatch, timeout):
+    import threading
     rt = runtime(tmp_path)
     explore(rt)
     pub, _ = publisher(rt, [])
     done = []
     real = rt.plan_segment
 
-    def slow(**kw):
-        time.sleep(0.3)
-        out = real(**kw)
-        done.append(1)
-        return out
-    rt.plan_segment = slow
-
     async def scenario():
+        loop = asyncio.get_running_loop()
+        started, busy = asyncio.Event(), asyncio.Event()
+        release = threading.Event()
+        monkeypatch.setattr(publication.logger, "error", lambda *args: busy.set())
+
+        def slow(**kw):
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(5)
+            out = real(**kw)
+            done.append(1)
+            return out
+        rt.plan_segment = slow
         task = asyncio.create_task(pub.flush())
-        await asyncio.sleep(0.05)
-        await pub.close()
-        finished = list(done)
-        task.cancel()
-        with pytest.raises(BaseException):
-            await task
-        return finished
+        closing = None
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            closing = asyncio.create_task(pub.close(timeout=timeout))
+            await asyncio.sleep(0)
+            if timeout < 1:
+                await asyncio.wait_for(busy.wait(), timeout=5)
+            assert not closing.done()
+            assert not done
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+            if closing is not None:
+                await closing
+        return list(done)
     assert asyncio.run(scenario()) == [1]
     with pytest.raises(RuntimeError, match="closed"):
         asyncio.run(pub._thread(lambda: None))
@@ -913,33 +930,6 @@ def test_remote_check_disables_when_a_remote_page_is_missing_forged_or_differs(t
     pub, _ = publisher(remote_rt, [], get=store_getter({**store, page1: resigned}))
     asyncio.run(pub.flush())
     assert pub.disabled
-
-
-def test_close_keeps_waiting_for_a_thread_call_that_outlives_the_timeout(tmp_path):
-    import time
-    rt = runtime(tmp_path)
-    explore(rt)
-    pub, _ = publisher(rt, [])
-    finished = []
-    real = rt.plan_segment
-
-    def slow(**kw):
-        time.sleep(0.4)
-        out = real(**kw)
-        finished.append(1)
-        return out
-    rt.plan_segment = slow
-
-    async def scenario():
-        task = asyncio.create_task(pub.flush())
-        await asyncio.sleep(0.05)
-        await pub.close(timeout=0.05)
-        seen = list(finished)
-        task.cancel()
-        with pytest.raises(BaseException):
-            await task
-        return seen
-    assert asyncio.run(scenario()) == [1]    # close() returned only after the running call ended
 
 
 def test_verify_index_refuses_a_head_holding_a_whole_page(monkeypatch):
