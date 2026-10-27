@@ -111,9 +111,10 @@ class TrainerLink:
         self._call("POST", "publish_index", {"index": index})
 
     def _call(self, method: str, path: str, body: Mapping[str, Any] | None = None, *, resend_ok: bool = False,
-              unavailable_ok: bool = False) -> Any:
+              unavailable_ok: bool = False, patience_s: float | None = None) -> Any:
         import httpx
 
+        patience = self._patience if patience_s is None else patience_s
         owned = method == "POST" and not path.startswith("owner/")
         if owned and self._epoch is None:
             self.claim_ownership()
@@ -137,7 +138,7 @@ class TrainerLink:
             except httpx.HTTPError as exc:
                 why = f"{path}: {type(exc).__name__}"
             delay = self._backoff[min(attempt, len(self._backoff) - 1)]
-            if (self._clock() - started + delay > self._patience
+            if (self._clock() - started + delay > patience
                     or (self._epoch is not None and self._clock() + delay >= self._owner_deadline)):
                 raise TrainerLinkError(f"validator unreachable: {why}")
             logger.warning("trainer link %s; retrying in %.0fs", why, delay)
@@ -209,6 +210,10 @@ class TrainerLink:
         self._call("POST", "report", body, resend_ok=True)
 
 
+    def heartbeat(self, patience_s: float = 30.0) -> None:
+        """Tell the validator this trainer is alive (it pays miners for the time the trainer is down)."""
+        self._call("POST", "heartbeat", {}, patience_s=patience_s)
+
     # --- the audits (trainer.audits) ------------------------------------------------------------------------------
     def take_audits(self, limit: int) -> list[SubmittedGroup]:
         """Up to ``limit`` queued out-of-zone audits (the validator drops the stale ones first)."""
@@ -231,3 +236,30 @@ class TrainerLink:
 
 
 __all__ = ["TrainerLink", "TrainerLinkError"]
+
+
+class TrainerHeartbeat:
+    """A daemon thread calling ``link.heartbeat()`` every ``every_s`` seconds, steps included. It never turns itself
+    off: a failure (a validator restarting, one without the route) is logged and retried at the next beat."""
+
+    def __init__(self, link, every_s: float = 60.0) -> None:
+        self.link, self.every_s = link, float(every_s)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="trainer-heartbeat", daemon=True)
+
+    def start(self) -> "TrainerHeartbeat":
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.link.heartbeat()
+            except TrainerLinkError as exc:
+                logger.warning("trainer heartbeat failed: %s", exc)
+            except Exception:
+                logger.exception("trainer heartbeat failed")
+            self._stop.wait(self.every_s)

@@ -131,3 +131,32 @@ def test_the_packed_group_forward_gives_each_rollouts_own_diagnostics(make, budg
     assert group_diagnostics(model, group, token_budget=budget) == [
         rollout_diagnostics(model, group, i) for i in range(16)]
     assert audit_group(model, group) == rl_audit.audit_forward(model)(group)
+
+
+def test_audits_are_taken_a_few_at_a_time_so_the_budget_leaves_little_downloaded(monkeypatch):
+    from reliquary.trainer import audits as audits_module
+
+    monkeypatch.setattr(audits_module, "AUDIT_CHUNK", 2)
+    t = [0.0]
+
+    def audit_fn(model, group):
+        t[0] += 10.0
+        return AuditResult(True, None, (1.0,) * 16)
+
+    source = Source([Job(f"L{i}") for i in range(9)])
+    audits = TrainerAudits(source, audit_fn=audit_fn, clock=lambda: t[0])
+    assert audits.run(object(), limit=7, budget_s=1000.0) == 7
+    assert source.asked == [2, 2, 2, 1]
+    source.asked.clear()
+    assert audits.run(object(), limit=7, budget_s=15.0) == 2 and source.asked == [2]
+
+
+def test_audit_chunks_stay_bounded_when_every_start_is_refused(monkeypatch):
+    from reliquary.trainer import audits as audits_module
+
+    monkeypatch.setattr(audits_module, "AUDIT_CHUNK", 2)
+    source = Source([Job("L0"), Job("L1")])
+    source.start_audit = lambda *args: False
+    audits = TrainerAudits(source, audit_fn=lambda *args: pytest.fail("a refused audit cannot run"))
+    assert audits.run(object(), limit=5, budget_s=1000.0) == 0
+    assert source.asked == [2, 2, 1]
