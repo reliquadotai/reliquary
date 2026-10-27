@@ -811,6 +811,7 @@ def run(
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                umask=0o077,
                 env={
                     **env,
                     "HF_HUB_OFFLINE": "1",

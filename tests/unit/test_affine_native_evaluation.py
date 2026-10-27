@@ -168,6 +168,34 @@ def test_frozen_signed_job_runs_fixture_and_exports_owned_original_report(tmp_pa
         native.export(bundle, workspace, archive)
 
 
+def test_native_report_inherits_private_umask(tmp_path, monkeypatch):
+    bundle, *_ = prepared(tmp_path)
+    original = subprocess.Popen
+
+    def ordinary_report_writer(command, **kwargs):
+        command = list(command)
+        command[4] = (
+            "import sys;sys.path.insert(0,sys.argv[1]);"
+            "from pathlib import Path;"
+            "from reliquary.integrations import affine_native_evaluation as native;"
+            "native.write_json=lambda path,value:Path(path).write_bytes(native.canonical(value));"
+            "native._fixture_worker(sys.argv[2],sys.argv[3])"
+        )
+        return original(command, **kwargs)
+
+    monkeypatch.setattr(native.subprocess, "Popen", ordinary_report_writer)
+    workspace = tmp_path / "work"
+    previous = os.umask(0o022)
+    try:
+        result = native.run(bundle, workspace, fixture=True)
+    finally:
+        os.umask(previous)
+    report = workspace / "native/jobs/fixture-evaluation/report.json"
+    assert result["stage"] == "evaluation_completed"
+    assert report.stat().st_mode & 0o777 == 0o600
+    assert native.verify(bundle, workspace)["successes"] == 4
+
+
 def test_native_cli_dispatch_preserves_fixture_boundary(tmp_path, capsys):
     from reliquary.integrations.affine_cli import main
 
