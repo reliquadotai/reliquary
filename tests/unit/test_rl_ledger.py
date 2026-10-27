@@ -61,6 +61,37 @@ def test_trained_groups_are_paid_flat_per_matched_token(book):
     assert ledger.ingest() == 0                        # the cursor persists
 
 
+def test_ingest_reads_only_its_event_page_before_decoding_and_advancing_the_cursor(book):
+    import json
+
+    subs = service(book, probation_groups=0)
+    ledger = ledger_for(book, subs)
+    for prompt in (1, 2, 3):
+        trained(book, subs, prompt)
+    assert len(subs.events()) == 3                     # unbounded operator reads retain their old contract
+    with book.transaction():
+        book.db.execute("INSERT INTO rl_events(lease_id, hotkey, kind, at, detail) VALUES('unread', 'A', "
+                        "'trained', ?, 'unreadable')", (NOW,))
+    assert ledger.ingest(limit=2) == 2                 # a later unreadable row is not fetched or decoded
+    assert len(amounts(book)) == 2
+    assert book.db.execute("SELECT seq FROM rl_pay_cursor").fetchone()[0] == 2
+    assert ledger.ingest(limit=1) == 1 and len(amounts(book)) == 3
+    assert ledger.ingest(limit=0) == 0
+    assert book.db.execute("SELECT seq FROM rl_pay_cursor").fetchone()[0] == 3
+    with pytest.raises(json.JSONDecodeError):
+        ledger.ingest(limit=1)
+    assert len(amounts(book)) == 3                    # failure rolls back the cursor and accruals together
+    assert book.db.execute("SELECT seq FROM rl_pay_cursor").fetchone()[0] == 3
+
+
+@pytest.mark.parametrize("limit", [-1, 1.5, True])
+def test_ingest_rejects_an_invalid_event_limit_before_advancing_the_cursor(book, limit):
+    ledger = ledger_for(book, service(book))
+    with pytest.raises(ValueError, match="event limit"):
+        ledger.ingest(limit=limit)
+    assert book.db.execute("SELECT seq FROM rl_pay_cursor").fetchone()[0] == 0
+
+
 def test_rollouts_under_the_floor_are_never_paid(book):
     subs = service(book, probation_groups=0)
     ledger = ledger_for(book, subs)
@@ -601,6 +632,21 @@ def test_an_outage_is_filled_for_at_most_its_longest(book):
     docs = ledger.settle(cp.period_end(period + 3) + 601)
     assert [d["work_period"] for d in docs] == [period + 1]
     assert docs[0]["outage_s"] == pytest.approx(cp.PERIOD_SECONDS)
+
+
+def test_validator_downtime_does_not_restart_a_single_trainer_outages_fill_cap(book):
+    ledger, period, _ = _reference_period(book, service(book, probation_groups=0),
+                                          outage_max_s=float(cp.PERIOD_SECONDS))
+    start = cp.period_end(period)
+    book.db.execute("INSERT INTO rl_validator_downtime(start, end) VALUES(?,?)", (start + 1000, start + 1900))
+    book.db.commit()
+    docs = ledger.settle(cp.period_end(period + 3) + 601)
+    assert [doc["work_period"] for doc in docs] == [period + 1]
+    assert sum(doc["outage_s"] for doc in docs) == pytest.approx(cp.PERIOD_SECONDS - 900)
+    stored = book.db.execute("SELECT work_period, entry_period, doc FROM rl_pay_periods ORDER BY work_period").fetchall()
+    _beats(ledger, cp.period_end(period + 3) + 602, cp.period_end(period + 4) + 601)
+    assert ledger.settle(cp.period_end(period + 4) + 601) == []
+    assert book.db.execute("SELECT work_period, entry_period, doc FROM rl_pay_periods ORDER BY work_period").fetchall() == stored
 
 
 def test_without_a_heartbeat_or_the_switch_nothing_is_filled(book):
