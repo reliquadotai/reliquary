@@ -586,3 +586,120 @@ def test_the_carry_holds_at_most_its_caps_and_the_excess_burns(book):
     docs = _settle_through(ledger, 0) + _settle_through(ledger, 5)
     assert docs[0]["carried_out"] == pytest.approx(1.0 * CAP)                  # 1.5 caps over, 1 kept
     assert [sum(d["rewards_by_hotkey"].values()) / CAP for d in docs] == [pytest.approx(1.0), pytest.approx(1.0)]
+
+
+def _reference_period(book, subs, **config):
+    """A settled period paying A two groups and B one; the trainer beats last at its end."""
+    period = cp.period_of(NOW)
+    ledger = ledger_for(book, subs, slack_s=60, outage_fill=True, **config)
+    for i, hotkey in enumerate("AAB"):
+        trained(book, subs, 1 + i, hotkey=hotkey)
+    ledger.ingest()
+    (doc,) = ledger.settle(cp.period_end(period) + 601)                 # settled a grace after its end
+    assert "outage_s" not in doc
+    ledger.trainer_beat(cp.period_end(period))
+    return ledger, period, GROUP_TOKENS * NOMINAL
+
+
+def _beats(ledger, start, end, every=300):
+    for at in range(int(start), int(end) + 1, every):
+        ledger.trainer_beat(float(at))
+
+
+def test_a_dead_trainer_pays_its_periods_at_the_recent_mean(book):
+    ledger, period, unit = _reference_period(book, service(book, probation_groups=0))
+    docs = ledger.settle(cp.period_end(period + 2) + 601)               # the trainer never came back
+    assert [d["work_period"] for d in docs] == [period + 1, period + 2]
+    for doc in docs:
+        assert doc["outage_fraction"] == pytest.approx(1.0) and doc["groups"] == 0
+        assert doc["rewards_by_hotkey"] == {"A": pytest.approx(2 * unit), "B": pytest.approx(unit)}
+    assert ledger.settle(cp.period_end(period + 2) + 601) == []         # once
+
+
+def test_a_trainer_back_mid_period_fills_only_the_time_it_was_down(book):
+    ledger, period, unit = _reference_period(book, service(book, probation_groups=0))
+    start = cp.period_end(period)
+    _beats(ledger, start + cp.PERIOD_SECONDS / 2, cp.period_end(period + 1) + 601)   # back halfway, alive since
+    (doc,) = ledger.settle(cp.period_end(period + 1) + 601)
+    assert doc["work_period"] == period + 1
+    assert doc["outage_s"] == pytest.approx(cp.PERIOD_SECONDS / 2)
+    assert doc["rewards_by_hotkey"] == {"A": pytest.approx(unit), "B": pytest.approx(unit / 2)}
+
+
+def test_an_outage_is_filled_for_at_most_its_longest(book):
+    ledger, period, _ = _reference_period(book, service(book, probation_groups=0),
+                                          outage_max_s=float(cp.PERIOD_SECONDS))
+    docs = ledger.settle(cp.period_end(period + 3) + 601)
+    assert [d["work_period"] for d in docs] == [period + 1]
+    assert docs[0]["outage_s"] == pytest.approx(cp.PERIOD_SECONDS)
+
+
+def test_validator_downtime_does_not_restart_a_single_trainer_outages_fill_cap(book):
+    ledger, period, _ = _reference_period(book, service(book, probation_groups=0),
+                                          outage_max_s=float(cp.PERIOD_SECONDS))
+    start = cp.period_end(period)
+    book.db.execute("INSERT INTO rl_validator_downtime(start, end) VALUES(?,?)", (start + 1000, start + 1900))
+    book.db.commit()
+    docs = ledger.settle(cp.period_end(period + 3) + 601)
+    assert [doc["work_period"] for doc in docs] == [period + 1]
+    assert sum(doc["outage_s"] for doc in docs) == pytest.approx(cp.PERIOD_SECONDS - 900)
+    stored = book.db.execute("SELECT work_period, entry_period, doc FROM rl_pay_periods ORDER BY work_period").fetchall()
+    _beats(ledger, cp.period_end(period + 3) + 602, cp.period_end(period + 4) + 601)
+    assert ledger.settle(cp.period_end(period + 4) + 601) == []
+    assert book.db.execute("SELECT work_period, entry_period, doc FROM rl_pay_periods ORDER BY work_period").fetchall() == stored
+
+
+def test_without_a_heartbeat_or_the_switch_nothing_is_filled(book):
+    subs = service(book, probation_groups=0)
+    period = cp.period_of(NOW)
+    ledger = ledger_for(book, subs, slack_s=60, outage_fill=True)
+    trained(book, subs, 1)
+    ledger.ingest()
+    assert len(ledger.settle(cp.period_end(period) + 601)) == 1
+    assert ledger.settle(cp.period_end(period + 3) + 601) == []         # a trainer that never beat: no outage
+    off = ledger_for(book, subs, slack_s=60)
+    off.trainer_beat(cp.period_end(period + 3))                         # switched off: not even recorded
+    assert book.db.execute("SELECT * FROM rl_trainer_beat").fetchall() == []
+
+
+def test_the_validators_own_downtime_is_not_a_trainer_outage(book):
+    ledger, period, _ = _reference_period(book, service(book, probation_groups=0))
+    end = cp.period_end(period)
+    # the validator was down from 100 s to 1000 s after the end; the trainer (alive) is heard again at 1060 s
+    book.db.execute("INSERT INTO rl_validator_downtime(start, end) VALUES(?,?)", (end + 100, end + 1000))
+    book.db.commit()
+    _beats(ledger, end + 1060, cp.period_end(period + 1) + 601)
+    assert ledger.settle(cp.period_end(period + 1) + 601) == []         # the pieces around it are under the grace
+
+
+def test_a_trainer_outage_around_a_validator_restart_is_still_paid_less_the_restart(book):
+    ledger, period, unit = _reference_period(book, service(book, probation_groups=0))
+    end = cp.period_end(period)
+    book.db.execute("INSERT INTO rl_validator_downtime(start, end) VALUES(?,?)", (end + 1000, end + 1900))
+    book.db.commit()
+    _beats(ledger, end + cp.PERIOD_SECONDS / 2, cp.period_end(period + 1) + 601)
+    (doc,) = ledger.settle(cp.period_end(period + 1) + 601)
+    assert doc["outage_s"] == pytest.approx(1000)                      # before the restart; the 260 s after it is under the grace
+
+
+def test_a_trainer_dead_just_before_a_period_end_is_seen_before_the_period_settles(book):
+    subs = service(book, probation_groups=0)
+    period = cp.period_of(NOW)
+    ledger = ledger_for(book, subs, slack_s=60, outage_fill=True)
+    trained(book, subs, 1)
+    ledger.ingest()
+    end = cp.period_end(period)
+    ledger.trainer_beat(end - 300)                                      # the last beat, 5 min before the end
+    assert ledger.settle(end + 120) == []                               # not settled before the grace
+    (doc,) = ledger.settle(end + 601)
+    assert doc["work_period"] == period and doc["outage_s"] == pytest.approx(300)
+
+
+def test_beats_are_throttled_and_old_outages_pruned(book):
+    ledger = ledger_for(book, service(book, probation_groups=0), outage_fill=True)
+    book.db.execute("INSERT INTO rl_trainer_outages(start, end) VALUES(?,?)", (NOW - 10 * 86_400, NOW - 9 * 86_400))
+    book.db.commit()
+    ledger.trainer_beat(NOW)
+    ledger.trainer_beat(NOW + 5)                                        # under BEAT_EVERY_S: not written
+    assert book.db.execute("SELECT last_at FROM rl_trainer_beat").fetchall() == [(NOW,)]
+    assert book.db.execute("SELECT COUNT(*) FROM rl_trainer_outages").fetchone()[0] == 0

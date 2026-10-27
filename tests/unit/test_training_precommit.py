@@ -172,7 +172,7 @@ def _distributed_admission(fail):
 @pytest.mark.parametrize('fail',[False,True])
 def test_all_ranks_receive_final_admission_or_abort(fail):
     from tests.unit.trainer_dist_helpers import run_ranks
-    results = run_ranks(_distributed_admission,2,fail,timeout=60)
+    results = run_ranks(_distributed_admission,2,fail)
     expected = 'aborted' if fail else [True,False]
     assert results == {0:(expected,[0]),1:(expected,[])}
 

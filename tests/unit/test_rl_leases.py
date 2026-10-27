@@ -15,7 +15,7 @@ from reliquary.constants import prompt_cooldown_windows_for_environment
 from reliquary.validator.rl_lease_quota import QuotaConfig, QuotaController
 from reliquary.validator import rl_leases
 from reliquary.validator.rl_leases import (
-    BLACKLISTED, COOLING, FULL, IN_ZONE, QUOTA, RESTART_GRACE_S, SECRET_REVEAL_LAG, STALE, TAKEN, TOO_EASY, TOO_HARD,
+    BLACKLISTED, COOLING, FULL, IN_ZONE, QUOTA, RESTART_GRACE_S, VALIDATOR_UNAVAILABLE, SECRET_REVEAL_LAG, STALE, TAKEN, TOO_EASY, TOO_HARD,
     TRUNCATED, LeaseBook, LeaseBookConfig, LeaseCollector, LeaseRequest, classify_group, lease_expiry_s, lease_nonce,
     secret_commitment, verify_reveal,
 )
@@ -426,8 +426,71 @@ def test_a_lease_that_fell_due_while_the_validator_was_down_gets_a_grace(tmp_pat
     reopened = LeaseBook(tmp_path / "leases.sqlite3", LeaseBookConfig(expiry_s={ENV: 600.0}),
                          quota=QuotaController(QuotaConfig(initial=4)), clock=clock)
     assert reopened.expire_due() == 0
-    assert reopened.lease(lease.lease_id).expires_at == clock.t + RESTART_GRACE_S
+    down = clock.t - NOW                                                   # the book was last alive at NOW
+    assert reopened.lease(lease.lease_id).expires_at == lease.expires_at + down    # the downtime given back
+    assert reopened.lease(lease.lease_id).expires_at >= clock.t + RESTART_GRACE_S
     reopened.submit(lease.lease_id, "A", in_zone=True)
+
+
+def test_a_lease_that_lived_through_a_downtime_is_never_charged(tmp_path):
+    clock = Clock()
+    book = book_at(tmp_path, clock=clock)
+    book.adopt_checkpoint(0)
+    held = book.grant([ask("A", [1, 2])])[0].leases
+    book.close()
+    clock.t = NOW + 600                                                    # crashed at NOW, back 10 min later
+    book = book_at(tmp_path, clock=clock)
+    assert book.db.execute("SELECT start, end FROM rl_validator_downtime").fetchall() == [(NOW, NOW + 600)]
+    later = book.grant([ask("A", [3])])[0].leases[0]                       # issued after the downtime
+    book.forfeit(held[0].lease_id, "A")                                    # its sessions died while we were down
+    clock.t = max(lease.expires_at for lease in book.open_leases("A")) + 1
+    assert book.expire_due() == 2
+    causes = dict(book.db.execute("SELECT lease_id, cause FROM rl_leases").fetchall())
+    assert causes[held[0].lease_id] == causes[held[1].lease_id] == VALIDATOR_UNAVAILABLE
+    assert causes[later.lease_id] == "expired"                             # our downtime excuses nothing after it
+    counters = book.quota.state("A", clock.t)["counters"]
+    assert counters["released"] == 2 and counters["expired"] == 1
+
+
+def test_a_lease_issued_during_a_stall_or_a_box_failure_over_budget_is_still_charged(tmp_path):
+    clock = Clock()
+    book = book_at(tmp_path, clock=clock, box_failed_releases_per_day=0)
+    book.adopt_checkpoint(0)
+    held = book.grant([ask("A", [1])])[0].leases[0]                        # open when the stall begins
+    clock.t = NOW + 10
+    during = book.grant([ask("A", [2])])[0].leases[0]                      # issued while the loop stalled
+    clock.t = NOW + 240
+    book.mark_alive()                                                      # the stall: a downtime from NOW
+    book.sandbox_failure = lambda lease: ("box_failed", "r") if lease.lease_id == held.lease_id else None
+    clock.t = max(lease.expires_at for lease in book.open_leases("A")) + 1
+    assert book.expire_due() == 2
+    causes = dict(book.db.execute("SELECT lease_id, cause FROM rl_leases").fetchall())
+    assert causes[during.lease_id] == "expired"
+    assert causes[held.lease_id] == rl_leases.BOX_FAILED_OVER_BUDGET
+
+
+def test_a_short_silence_and_a_running_sweep_are_not_a_downtime(tmp_path):
+    clock = Clock()
+    book = book_at(tmp_path, clock=clock)
+    book.adopt_checkpoint(0)
+    for minute in range(1, 30):                                            # the service loop keeps it alive
+        clock.t = NOW + 60 * minute
+        book.mark_alive()
+    book.close()
+    clock.t += 60                                                          # a quick restart
+    book = book_at(tmp_path, clock=clock)
+    assert book.db.execute("SELECT COUNT(*) FROM rl_validator_downtime").fetchone()[0] == 0
+
+
+def test_a_slow_start_or_a_stalled_loop_is_a_downtime_too(tmp_path):
+    clock = Clock()
+    book = book_at(tmp_path, clock=clock)                                  # boot: alive at NOW
+    book.adopt_checkpoint(0)
+    lease = book.grant([ask("A", [1])])[0].leases[0]
+    clock.t = NOW + 240                                                    # 4 min before the first sweep
+    book.mark_alive()
+    assert book.db.execute("SELECT start, end FROM rl_validator_downtime").fetchall() == [(NOW, NOW + 240)]
+    assert book.lease(lease.lease_id).expires_at == lease.expires_at + 240
 
 
 def test_the_database_file_is_private(tmp_path):

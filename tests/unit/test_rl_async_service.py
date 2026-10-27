@@ -212,7 +212,7 @@ def test_the_trainer_takes_the_audits_and_reports_their_verdicts_through_its_lin
     assert rl.submissions.submit(lease.lease_id, "A", group(0))["verdict"] == "too_hard"   # probation: drawn
     [job] = link.take_audits(8)
     assert job.lease_id == lease.lease_id and link.take_audits(8)[0].lease_id == lease.lease_id   # until reported
-    for bad in (0, 33):
+    for bad in (0, 257):
         with pytest.raises(TrainerLinkError) as refused:
             link.take_audits(bad)
         assert refused.value.status == 422
@@ -1142,3 +1142,102 @@ def test_the_operator_sets_the_carry_ceiling_by_env_var():
     assert (tuned.pay_carry_periods, tuned.pay_carry_max_caps) == (8, 4.0)
     with pytest.raises(ValueError):
         rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={"RELIQUARY_RL_PAY_CARRY_MAX_CAPS": "-1"})
+
+
+def test_the_outage_pay_and_the_probation_sampling_are_on_by_default_and_switchable():
+    from reliquary.cli.main import build_task_entry, with_rl_async_params
+    from reliquary.constants import PROTOCOL_PROFILE_ID
+    from reliquary.protocol.profiles import resolve_protocol_profile
+
+    envs = sorted(resolve_protocol_profile(PROTOCOL_PROFILE_ID).environments)[:2]
+    entry = build_task_entry(task_id="rl-async", profile_id=PROTOCOL_PROFILE_ID, cap=0.4, overrides={},
+                             env_split={envs[0]: 0.75, envs[1]: 0.25})
+    declared = with_rl_async_params(entry, planned_tokens_per_period=2e8)
+    plain = rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={})
+    assert plain.pay_outage_fill and plain.pay_outage_grace_s == 600.0 and plain.pay_outage_max_s == 86_400.0
+    assert plain.probation_repeat_audit_rate == 0.25
+    off = rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={
+        "RELIQUARY_RL_PAY_OUTAGE_FILL": "0", "RELIQUARY_RL_PAY_OUTAGE_GRACE_S": "300",
+        "RELIQUARY_RL_PROBATION_REPEAT_AUDIT_RATE": "1"})
+    assert not off.pay_outage_fill and off.pay_outage_grace_s == 300.0 and off.probation_repeat_audit_rate == 1.0
+    with pytest.raises(ValueError):
+        rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000,
+                          environ={"RELIQUARY_RL_PROBATION_REPEAT_AUDIT_RATE": "2"})
+
+
+def test_runtime_trainer_calls_beat_and_the_heartbeat_never_stops(tmp_path):
+    from reliquary.trainer.rl_link import TrainerHeartbeat, TrainerLink
+    from reliquary.validator.rl_submit import GroupGrader
+
+    grader = GroupGrader({ENV: MathEnv()}, Tokenizer(), eos_token_ids=(1,))
+    rl = build_rl_async(settings_for(pay_outage_fill=True, probation_repeat_audit_rate=0.25),
+                        path=tmp_path / "rl-async.sqlite3", grader=grader, prompt_range={ENV: (0, 50)},
+                        collector_interval_s=0.0)
+    assert rl.ledger.config.outage_fill and rl.submissions.config.probation_repeat_audit_rate == 0.25
+    app = FastAPI()
+    app.include_router(build_rl_trainer_router(rl, token=TOKEN))
+    client = TestClient(app)
+    assert client.post("/rl/trainer/heartbeat", json={}).status_code == 401
+    link = TrainerLink("http://testserver", TOKEN, client=client, patience_s=0.0)
+    assert link.latest_checkpoint is None                               # discovery is before the model loads
+    assert rl.book.db.execute("SELECT COUNT(*) FROM rl_trainer_beat").fetchone()[0] == 0
+    assert link.take(1) == []                                           # runtime work proves readiness
+    assert rl.book.db.execute("SELECT COUNT(*) FROM rl_trainer_beat").fetchone()[0] == 1
+    link.heartbeat()
+    rl.close()
+
+    old = FastAPI()                                                     # a validator without the route
+    beat = TrainerHeartbeat(TrainerLink("http://testserver", TOKEN, client=TestClient(old), patience_s=0.0), 0.01)
+    beat.start()
+    beat._thread.join(timeout=0.3)
+    assert beat._thread.is_alive()                                      # keeps beating: the route may come back
+    beat.stop()
+    beat._thread.join(timeout=5)
+    assert not beat._thread.is_alive()
+
+
+def test_owner_renewal_is_separate_from_ready_trainer_heartbeat_during_long_steps(tmp_path):
+    from reliquary.trainer.rl_link import TrainerLink, TrainerLinkError
+
+    rl = components(tmp_path)
+    rl.ledger.config = dataclasses.replace(rl.ledger.config, outage_fill=True)
+    now = [1000.0]
+    rl.book.clock = rl.ledger.clock = lambda: now[0]
+    client = TestClient(build_rl_trainer_app(rl, token=TOKEN))
+    link = TrainerLink("http://testserver", TOKEN, client=client, clock=lambda: now[0], patience_s=0)
+    link.claim_ownership()
+    link.config()
+    assert link.latest_checkpoint is None and link.checkpoint_if_available() is None
+    link.adopt_checkpoint(0)
+
+    def renew():
+        link._accept_owner(link._call("POST", "owner/heartbeat", {}), now[0])
+
+    for _ in range(30):                                                # model loading can take half an hour
+        now[0] += 60
+        renew()
+    assert rl.book.db.execute("SELECT * FROM rl_trainer_beat").fetchall() == []
+    assert rl.ledger._outages(now[0]) == []                             # no historical fill before readiness
+    link.heartbeat()
+    for _ in range(90):                                                # beats continue during a 90-minute TRAIN
+        now[0] += 60
+        renew()
+        link.heartbeat()
+    assert rl.ledger._outages(now[0]) == []
+    last_ready = now[0]
+    for _ in range(20):                                                # a lease keeper alone cannot hide downtime
+        now[0] += 60
+        renew()
+    assert rl.ledger._outages(now[0]) == [(last_ready, now[0])]
+    now[0] += 180
+    current = TrainerLink("http://testserver", TOKEN, client=client, clock=lambda: now[0], patience_s=0)
+    current.claim_ownership()
+    link._owner_deadline = now[0] + 180                                 # force an old request to reach the server
+    with pytest.raises(TrainerLinkError) as lost:
+        link.heartbeat()
+    assert lost.value.status == 409
+    assert link.depth() == {}                                          # stale read access cannot beat either
+    assert rl.book.db.execute("SELECT last_at FROM rl_trainer_beat").fetchone()[0] == last_ready
+    current.take(1)
+    assert rl.book.db.execute("SELECT last_at FROM rl_trainer_beat").fetchone()[0] == now[0]
+    rl.close()
