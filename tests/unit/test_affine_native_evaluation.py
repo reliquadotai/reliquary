@@ -222,6 +222,19 @@ def test_export_refuses_report_changed_after_verification(tmp_path, monkeypatch)
     assert not destination.exists()
 
 
+def test_fixture_result_cannot_claim_native_admission_when_reloaded(tmp_path):
+    bundle, *_ = prepared(tmp_path)
+    _, workspace = report_fixture(bundle, tmp_path)
+    path = workspace / "evaluation-result.private.json"
+    result = json.loads(path.read_bytes())
+    result["nativeAdmissionVerified"] = True
+    save(path, result)
+    with pytest.raises(ValueError, match="admission assurance"):
+        native.verify(bundle, workspace)
+    with pytest.raises(ValueError, match="admission assurance"):
+        native.export(bundle, workspace, tmp_path / "promoted.private.zip")
+
+
 @pytest.mark.parametrize(
     "field,value",
     [

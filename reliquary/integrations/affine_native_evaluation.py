@@ -922,7 +922,7 @@ def native_mounts(bundle, workspace, checkpoint):
 
 
 def verify(bundle, workspace):
-    _, job, _, _ = load_bundle(bundle)
+    d, job, _, _ = load_bundle(bundle)
     workspace = Path(workspace)
     verified = verify_report(
         bundle, workspace / "native" / "jobs" / job["job_id"] / "report.json"
@@ -931,6 +931,10 @@ def verify(bundle, workspace):
     require(
         all(canonical(result.get(k)) == canonical(v) for k, v in verified.items()),
         "saved evaluation result differs",
+    )
+    require(
+        result.get("nativeAdmissionVerified") is (d["assurance"] != "fixture"),
+        "saved evaluation admission assurance differs",
     )
     require(
         type(result.get("elapsedSeconds")) in (int, float)
