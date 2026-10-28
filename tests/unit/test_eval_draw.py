@@ -279,9 +279,13 @@ def _diag(**fields):
     (4809, 4776, True),       # the worst honest drift measured on H200 (0.69 %)
     (5000, 4900, True),       # 2 %: the floor
     (5000, 4899, False),
-    (36, 35, True),           # a short sample: one honest near-tie is not a refusal
-    (36, 34, True),           # EVAL_MATCH_GRACE
-    (36, 33, False),
+    (36, 35, True),           # a short sample: a few honest near-ties are not a refusal
+    (36, 28, True),           # EVAL_MATCH_GRACE
+    (36, 27, False),
+    (145, 142, True),         # live honest refusals at the old grace of 2 (2026-10-28)
+    (163, 159, True),
+    (24, 18, True),           # a quarter of a shorter sample, at most
+    (24, 17, False),
 ])
 def test_the_match_floor_is_two_percent_with_a_grace_for_short_samples(stochastic, exact, ok):
     d = _diag(n_positions=stochastic * 2, n_stochastic=stochastic, n_exact_match=exact,
@@ -293,3 +297,75 @@ def test_a_sample_with_too_few_stochastic_positions_is_judged_on_every_one():
     assert eval_draw.judge([_diag(n_positions=10, n_stochastic=3, n_exact_match=3, n_drawn_exact_match=8)])[0]
     assert not eval_draw.judge([_diag(n_positions=10, n_stochastic=3, n_exact_match=3, n_drawn_exact_match=7)])[0]
     assert not eval_draw.judge([_diag()])[0]               # nothing drawn: nothing verified
+
+
+class _Verdicts:
+    """The auditor's record store: submissions, create-only verdicts."""
+
+    def __init__(self, submissions):
+        self.submissions, self.verdicts = submissions, {}
+
+    async def write_verdict(self, job_id, submission_id, verdict):
+        if submission_id in self.verdicts:
+            return False
+        self.verdicts[submission_id] = verdict
+        return True
+
+    async def read_verdict(self, job_id, submission_id):
+        return self.verdicts.get(submission_id)
+
+    async def read_submission(self, job_id, submission_id):
+        return self.submissions.get(submission_id)
+
+    async def list_verdict_ids(self, job_id):
+        return list(self.verdicts)
+
+
+def _draw_auditor(job, records, slot_store):
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    auditor = CorpusAuditor.__new__(CorpusAuditor)
+    auditor._job_id, auditor._draw_job, auditor._records, auditor._slot_store = job.job_id, job, records, slot_store
+    auditor._on_verdict = None
+    auditor._mark_judged = lambda submission_id: None
+    return auditor
+
+
+def test_a_failed_draw_sample_reopens_its_prompts_slot(monkeypatch):
+    """Else the prompt stays full without the sample and the job never completes."""
+    import asyncio
+
+    from reliquary.infrastructure import corpus_job_store as job_store
+    from reliquary.infrastructure.corpus_job_store import BucketJobStore
+    from reliquary.validator.corpus_service import rebuild_ledgers
+    from tests.unit.test_corpus_job_store import _FakeMultiObjectR2
+
+    monkeypatch.setattr(job_store, "get_s3_client", lambda **kw: _FakeMultiObjectR2())
+    store, job = BucketJobStore(), _job()
+    bad, good = "b" * 64, "a" * 64
+    records = _Verdicts({bad: {"prompt_index": 2}, good: {"prompt_index": 3}})
+    auditor = _draw_auditor(job, records, store)
+
+    async def capacity(index):
+        snapshot, _ = await store.read_ledgers(job.job_id)
+        return rebuild_ledgers(job, snapshot).slots.capacity(index)
+
+    async def go():
+        await auditor._write(good, {"passed": True})
+        await auditor._write(bad, {"passed": False, "reason": eval_draw.REASON_DRAW_MISMATCH})
+        assert await capacity(2) == job.slots_per_prompt + 1
+        assert await capacity(3) == job.slots_per_prompt
+        # A restart records nothing twice.
+        assert await auditor.reconcile_failures() == 1
+        assert await capacity(2) == job.slots_per_prompt + 1
+
+    asyncio.run(go())
+
+
+def test_a_free_job_never_reopens_a_slot():
+    import asyncio
+
+    records = _Verdicts({"b" * 64: {"prompt_index": 2}})
+    auditor = _draw_auditor(_job(), records, None)
+    asyncio.run(auditor._write("b" * 64, {"passed": False}))
+    assert asyncio.run(auditor.reconcile_failures()) == 0

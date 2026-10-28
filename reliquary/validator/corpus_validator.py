@@ -337,6 +337,12 @@ def period_served(served):
     return kept, dropped
 
 
+def _slot_store():
+    from reliquary.infrastructure.corpus_job_store import BucketJobStore
+
+    return BucketJobStore()
+
+
 def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof, model,
                    tokenizer, gpu_lock=None, remote=None, scorer=None, vocab_size=None,
                    arrivals_covered=None, auditor_kwargs=None) -> None:
@@ -408,6 +414,7 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
                               threads=judge_threads, scorer=scorer, vocab_size=vocab_size,
                               arrivals_covered=covered,
                               draw_job=w.job if has_draw(w.job) else None,
+                              slot_store=_slot_store() if has_draw(w.job) else None,
                               **(auditor_kwargs or {}))
     w.settler.on_window = w.miners.window
     if getattr(w, "grader", None) is not None:

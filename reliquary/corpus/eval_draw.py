@@ -18,7 +18,8 @@ A token that differs is never substituted (the tokens after it would not fit it)
 the floor.
 
 A draw slot is taken once (``slot_key`` joins the accepted digests). It ranges over the prompt's attempts
-(``SlotLedger.attempt_limit``), so a sample that failed its audit is replaced by the next slot's draw.
+(``SlotLedger.attempt_limit``): a sample that failed its audit reopens its prompt's slot (the auditor records the
+failure in the ledger), and the next slot's draw replaces it.
 """
 from __future__ import annotations
 
@@ -41,11 +42,11 @@ EVAL_DRAW_DOMAIN = "reliquary-eval-draw-v1"
 EVAL_DRAWS = (EVAL_DRAW,)
 REASON_DRAW_MISMATCH = "draw_mismatch"
 # The draw a sample must follow: at least this share of its stochastic positions exact (honest bf16 drift
-# measured 0.69 % at worst on H200, 2026-10-28), with EVAL_MATCH_GRACE misses allowed whatever its length so a
-# short sample is not refused for one honest near-tie. Nothing is substituted: a token changed would not fit the
-# tokens after it.
+# measured 0.69 % at worst on H200, 2026-10-28), with up to EVAL_MATCH_GRACE misses allowed whatever its length
+# (never more than a quarter of it): honest short samples miss 2-2.5 % (live, 2026-10-28), a re-roll 30-50 %.
+# Nothing is substituted: a token changed would not fit the tokens after it.
 EVAL_MATCH_FLOOR = 0.98
-EVAL_MATCH_GRACE = 2
+EVAL_MATCH_GRACE = 8
 REASON_DRAW_SLOT_TAKEN = "draw_slot_taken"
 REASON_BAD_CURSOR = "bad_cursor"
 
@@ -118,11 +119,15 @@ def match_rate(d) -> float:
     return exact / counted if counted else 0.0
 
 
+def allowed_misses(counted: int) -> int:
+    return max(min(EVAL_MATCH_GRACE, counted // 4), math.floor((1 - EVAL_MATCH_FLOOR) * counted))
+
+
 def judge(diags) -> tuple[bool, dict[str, Any]]:
     """One sample's verdict over its diagnostics (one per completion or trajectory). Every one must:
 
     * follow the draw: at most ``1 - EVAL_MATCH_FLOOR`` of its counted positions missed, ``EVAL_MATCH_GRACE``
-      misses allowed in any case;
+      misses allowed in any case (a quarter of a shorter sample);
     * carry no edit: no more hard mismatches at near-deterministic positions than the RL audit allows (a token no
       draw produces where the model was sure was written afterwards)."""
     worst: dict[str, Any] = {}
@@ -137,7 +142,7 @@ def judge(diags) -> tuple[bool, dict[str, Any]]:
                   "deterministic_misses": d.n_deterministic_hard_mismatch}
         if not worst or detail["match"] < worst["match"]:
             worst = detail
-        followed = counted > 0 and misses <= max(EVAL_MATCH_GRACE, math.floor((1 - EVAL_MATCH_FLOOR) * counted))
+        followed = counted > 0 and misses <= allowed_misses(counted)
         if not followed or d.n_deterministic_hard_mismatch > allowance:
             return False, detail
     return True, worst
@@ -153,6 +158,6 @@ def parse_draw(raw: Mapping[str, Any]) -> str | None:
     return value
 
 
-__all__ = ["EVAL_DRAW", "EVAL_DRAW_DOMAIN", "REASON_BAD_CURSOR", "REASON_DRAW_MISMATCH", "REASON_DRAW_SLOT_TAKEN", "diagnostics", "draw_context",
+__all__ = ["EVAL_DRAW", "EVAL_DRAW_DOMAIN", "REASON_BAD_CURSOR", "REASON_DRAW_MISMATCH", "REASON_DRAW_SLOT_TAKEN", "allowed_misses", "diagnostics", "draw_context",
            "draw_randomness", "has_draw", "judge", "match_rate", "parse_draw", "rollout_index", "slot_count",
            "slot_key", "uniforms"]
