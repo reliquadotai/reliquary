@@ -44,6 +44,14 @@ Persistence follows the service runtime (``services/runtime.py``): one SQLite fi
 ``BEGIN IMMEDIATE`` under an ``RLock``), created ``0600`` because it holds the unrevealed secrets. Open leases,
 secrets, the latest k and the quota state (``QuotaController.attach``) survive a restart. A lease that fell due
 while the validator was down is extended to ``now + RESTART_GRACE_S`` at boot: its holder could not submit.
+
+The validator's own downtime is never charged (2026-10-27: every restart cost miners quota, restored by hand). The
+service loop marks the book alive before each expiry sweep (``mark_alive``, written at most every ``ALIVE_EVERY_S``).
+A silence longer than ``DOWNTIME_MIN_S`` (a stop, a crash, an OOM kill, a slow start, a stalled loop), seen at boot
+or at the next mark, is recorded as a downtime and every open lease gets its length back. A lease already open
+when a downtime began that ends unsubmitted (expired or forfeited) is released (``VALIDATOR_UNAVAILABLE``: no quota
+cut): its sandbox sessions and its submission may have failed against a validator that was not there. A box failure
+over the daily budget stays charged.
 """
 from __future__ import annotations
 
@@ -90,6 +98,9 @@ MAX_REVEALED_LISTED = 64
 MAX_PROMPTS_PER_REQUEST = 1024
 INTERVAL_S = 1.0          # the collection interval inside which arrival order buys nothing
 RESTART_GRACE_S = 120.0   # what a lease that fell due while the validator was down gets at boot
+ALIVE_EVERY_S = 30.0      # the expiry sweep marks the book alive at most this often
+DOWNTIME_MIN_S = 90.0     # a silence longer than this at boot is a downtime (the sweep runs every few seconds)
+VALIDATOR_UNAVAILABLE = "validator_unavailable"   # a released cause: the lease lived through our downtime
 SECRET_REVEAL_LAG = 16    # S_k is revealed, and k stops being leasable, once k < latest - this
 MAX_SCANS_PER_PAGE = 1000
 HOTKEY_MAX_OPEN = 64          # PLACEHOLDER: the most open leases one hotkey may hold under a global cap
@@ -260,9 +271,12 @@ CREATE TABLE IF NOT EXISTS rl_prompt_scans(seq INTEGER PRIMARY KEY AUTOINCREMENT
     prompt_idx INTEGER NOT NULL, k INTEGER NOT NULL, rewards TEXT NOT NULL, verdict TEXT NOT NULL,
     first_scan INTEGER NOT NULL, at REAL NOT NULL, state TEXT, until_k INTEGER);
 CREATE TABLE IF NOT EXISTS rl_prompt_state(environment TEXT NOT NULL, prompt_idx INTEGER NOT NULL,
-    state TEXT NOT NULL, until_k INTEGER, seq INTEGER NOT NULL, PRIMARY KEY(environment, prompt_idx));
+    state TEXT NOT NULL, until_k INTEGER, seq INTEGER NOT NULL, start_k INTEGER, revised INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(environment, prompt_idx));
 CREATE INDEX IF NOT EXISTS rl_prompt_state_seq ON rl_prompt_state(seq);
 CREATE TABLE IF NOT EXISTS rl_hotkey_bans(hotkey TEXT PRIMARY KEY, until REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS rl_validator_alive(id INTEGER PRIMARY KEY CHECK(id=0), at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS rl_validator_downtime(start REAL NOT NULL, end REAL NOT NULL);
 """
 _COLUMNS = "lease_id, hotkey, environment, prompt_idx, k, nonce, issued_at, expires_at, state"
 
@@ -299,6 +313,7 @@ class LeaseBook:
         self._full: set[str] = set()              # envs refused for the global cap since the last drain
         self._lane_full: set[str] = set()         # envs refused for their own maximum since the last drain
         self._submitting: dict[str, int] = {}     # leases whose on-time submission is being graded: never expired
+        self._alive_at: float | None = None       # the last ``mark_alive`` write (memory only)
         # The episode sandbox's verdict on a lease (``RlLeaseSandbox.lease_failure``): (cause, detail) when our side
         # ended one of its episodes, else None. Unset: every unsubmitted lease is charged.
         self.sandbox_failure: Callable[[Lease], tuple[str, str] | None] | None = None
@@ -315,6 +330,10 @@ class LeaseBook:
                     self.db.execute(f"ALTER TABLE rl_prompt_scans ADD COLUMN {column} {kind}")
             if "cause" not in {row[1] for row in self.db.execute("PRAGMA table_info(rl_leases)")}:
                 self.db.execute("ALTER TABLE rl_leases ADD COLUMN cause TEXT")   # a book from before releases
+            columns = {row[1] for row in self.db.execute("PRAGMA table_info(rl_prompt_state)")}
+            for column, kind in (("start_k", "INTEGER"), ("revised", "INTEGER NOT NULL DEFAULT 0")):
+                if column not in columns:                                     # a book from before revisions
+                    self.db.execute(f"ALTER TABLE rl_prompt_state ADD COLUMN {column} {kind}")
             self.db.commit()
             quota.attach(self.db, self.lock)
             self._boot()
@@ -361,10 +380,21 @@ class LeaseBook:
         now = float(self.clock())
         floor = now + RESTART_GRACE_S
         with self._txn():
+            row = self.db.execute("SELECT at FROM rl_validator_alive WHERE id=0").fetchone()
+            if row is not None:
+                self._downtime(float(row[0]), now)
+            self.db.execute("DELETE FROM rl_validator_downtime WHERE end<?", (now - 7 * DAY_S,))
+            self._mark_alive(now)
             self.db.execute("UPDATE rl_leases SET expires_at=? WHERE state=? AND expires_at<?", (floor, OPEN, floor))
             counts = dict(self.db.execute("SELECT hotkey, COUNT(*) FROM rl_leases WHERE state=? GROUP BY hotkey",
                                           (OPEN,)).fetchall())
             self.quota.reconcile(counts)
+            # A cooldown recorded before revisions: it started at the latest checkpoint when its scan was recorded
+            # (the scan's k when that is later), the rule ``record_outcome`` applies.
+            self.db.execute(
+                "UPDATE rl_prompt_state SET start_k=(SELECT MAX(s.k, COALESCE((SELECT MAX(x.k) FROM rl_lease_secrets x "
+                "WHERE x.adopted_at<=s.at), s.k)) FROM rl_prompt_scans s WHERE s.seq=rl_prompt_state.seq) "
+                "WHERE state=? AND start_k IS NULL", (COOLDOWN,))
 
     # --- checkpoints and secrets ----------------------------------------------------------------------------
     @property
@@ -393,6 +423,8 @@ class LeaseBook:
                 # closed keys of retired k can never be asked again: keep the open ones (they still end)
                 self.db.execute("DELETE FROM rl_leases WHERE k<? AND state<>?", (retired - self.config.max_lag, OPEN))
             row = self.db.execute("SELECT commitment FROM rl_lease_secrets WHERE k=?", (k,)).fetchone()
+        if latest != k:
+            self.revise_cooldowns()
         return bytes.fromhex(row[0])
 
     def commitments(self) -> dict:
@@ -449,6 +481,38 @@ class LeaseBook:
             return int(self.db.execute("SELECT COUNT(*) FROM rl_leases WHERE hotkey=? AND state=?",
                                        (hotkey, OPEN)).fetchone()[0])
 
+    def _mark_alive(self, now: float) -> None:
+        self.db.execute("INSERT INTO rl_validator_alive(id, at) VALUES(0, ?) ON CONFLICT(id) DO UPDATE SET at=?",
+                        (now, now))
+        self._alive_at = now
+
+    def _downtime(self, since: float, now: float) -> None:
+        """Record ``[since, now]`` as a downtime when longer than ``DOWNTIME_MIN_S`` and give its length back to
+        every open lease."""
+        down = now - since
+        if down <= DOWNTIME_MIN_S:
+            return
+        self.db.execute("INSERT INTO rl_validator_downtime(start, end) VALUES(?,?)", (since, now))
+        extended = self.db.execute("UPDATE rl_leases SET expires_at=expires_at+? WHERE state=?",
+                                   (down, OPEN)).rowcount
+        logger.warning("validator unavailable %.0f s: recorded, %d open leases extended by it", down, extended)
+
+    def mark_alive(self, now: float | None = None) -> None:
+        """The validator is up (written at most every ``ALIVE_EVERY_S``); a longer silence since the last mark (a
+        slow start, a stalled loop) is a downtime. The service calls it before each expiry sweep."""
+        now = float(self.clock()) if now is None else now
+        if self._alive_at is not None and 0 <= now - self._alive_at < ALIVE_EVERY_S:
+            return
+        with self._txn():
+            if self._alive_at is not None:
+                self._downtime(self._alive_at, now)
+            self._mark_alive(now)
+
+    def _lived_through_downtime(self, lease: Lease, now: float) -> bool:
+        """The lease was already open when a downtime began (one issued during a stall is not excused)."""
+        return self.db.execute("SELECT 1 FROM rl_validator_downtime WHERE start>=? AND start<? LIMIT 1",
+                               (lease.issued_at, now)).fetchone() is not None
+
     def _expire(self, now: float) -> int:
         due = [self._lease(row) for row in self.db.execute(
             f"SELECT {_COLUMNS} FROM rl_leases WHERE state=? AND expires_at<=?", (OPEN, now)).fetchall()]
@@ -479,6 +543,8 @@ class LeaseBook:
                                lease.lease_id[:12], lease.hotkey[:12], self.config.box_failed_releases_per_day,
                                failure[1])
                 failure, charged = None, BOX_FAILED_OVER_BUDGET
+        if failure is None and charged != BOX_FAILED_OVER_BUDGET and self._lived_through_downtime(lease, now):
+            failure = (VALIDATOR_UNAVAILABLE, "open while the validator was down")
         if failure is None:
             self.db.execute("UPDATE rl_leases SET state=?, closed_at=?, cause=? WHERE lease_id=?",
                             (EXPIRED, now, charged, lease.lease_id))
@@ -488,7 +554,7 @@ class LeaseBook:
         self.db.execute("UPDATE rl_leases SET state=?, closed_at=?, cause=? WHERE lease_id=?",
                         (RELEASED, now, cause, lease.lease_id))
         self.quota.record_release(lease.hotkey, lease, now=now)
-        logger.warning("rl lease %s of %s (%s prompt %d) released without penalty: sandbox failure %s (%s)",
+        logger.warning("rl lease %s of %s (%s prompt %d) released without penalty: %s (%s)",
                        lease.lease_id[:12], lease.hotkey[:12], lease.environment, lease.prompt_idx, cause, detail)
         return RELEASED
 
@@ -736,7 +802,8 @@ class LeaseBook:
         """Record a graded group of (env, prompt) leased at k and move the prompt: a second ``too_easy`` scan
         blacklists it for the run (one group is not proof enough to retire a prompt for good); any other scan cools
         it down until ``latest + cooldown`` (never shortening a running cooldown, never lifting a blacklist). The
-        cooldown counts from the latest k, not the lease's: a lagged lease must not shorten it."""
+        cooldown counts from the latest k, not the lease's: a lagged lease must not shorten it. A later fall of the
+        env's cooldown shortens it at the next checkpoint (``revise_cooldowns``)."""
         if environment not in self.config.expiry_s:
             raise ValueError("environment not served")
         if verdict not in VERDICTS:
@@ -759,16 +826,71 @@ class LeaseBook:
                 state, until = BLACKLISTED, None
             else:
                 start = max(checkpoint, self.latest_checkpoint or 0)
-                state, until = COOLDOWN, max(start + cooldown, (prior or (0, 0))[1])
+                state, until = COOLDOWN, max(start + cooldown, (prior or (0, 0))[1] or 0)
             # The scan keeps the state it moved the prompt to: the published log (``rl_observations``) rebuilds
             # every prompt's state from the scans alone.
             seq = self.db.execute("INSERT INTO rl_prompt_scans(environment, prompt_idx, k, rewards, verdict, "
                                   "first_scan, at, state, until_k) VALUES(?,?,?,?,?,?,?,?,?)",
                                   (environment, prompt_idx, checkpoint, json.dumps(rewards), verdict,
                                    int(prior is None), now, state, until)).lastrowid
-            self.db.execute("INSERT OR REPLACE INTO rl_prompt_state(environment, prompt_idx, state, until_k, seq) "
-                            "VALUES(?,?,?,?,?)", (environment, prompt_idx, state, until, seq))
+            self.db.execute("INSERT OR REPLACE INTO rl_prompt_state(environment, prompt_idx, state, until_k, seq, "
+                            "start_k, revised) VALUES(?,?,?,?,?,?,0)",
+                            (environment, prompt_idx, state, until, seq, start if state == COOLDOWN else None))
         return Scan(int(seq), environment, prompt_idx, checkpoint, rewards, verdict, prior is None, now)
+
+    def revise_cooldowns(self) -> dict[str, int]:
+        """Bring every running cooldown in line with its env's current one (``cooldown_of``): ``until_k`` becomes
+        ``start_k + cooldown`` when that is earlier, never later, so an env whose cooldown fell (it measured more
+        consumption, or left the start-up value) gets its prompts back without waiting out the old figure. Runs at
+        each new checkpoint and when the service starts. Returns the prompts shortened per env.
+
+        The miners' table learns it from ``prompt_state`` without a new scan: the revised states take a seq of the
+        scans' sequence that no scan will use, and the cursor moves to it once no scan is pending, so a dry env
+        is reached too. A revised cooldown still running is published again at each pass (a miner that rebuilt its
+        table from the scan log, which keeps each scan's own ``until_k``, is corrected within a checkpoint). An env
+        whose cooldown cannot be read is left as it was (logged): a checkpoint is never refused for it."""
+        cooldowns = {}
+        for env in self.config.expiry_s:
+            try:
+                cooldown = self.config.cooldown_of(env)
+                _u64(cooldown)
+                cooldowns[env] = cooldown
+            except Exception:                                   # noqa: BLE001 - never block an adoption on it
+                logger.warning("cooldown of %s not read: its running cooldowns stay as they are", env, exc_info=True)
+        shortened: dict[str, int] = {}
+        with self._txn():
+            latest = self.latest_checkpoint
+            if latest is None:
+                return shortened
+            stamp = None
+            for env, cooldown in cooldowns.items():
+                due = self.db.execute("SELECT COUNT(*) FROM rl_prompt_state WHERE environment=? AND state=? AND "
+                                      "start_k IS NOT NULL AND (until_k>start_k+? OR (revised=1 AND until_k>?))",
+                                      (env, COOLDOWN, cooldown, latest)).fetchone()[0]
+                if not due:
+                    continue
+                if stamp is None:
+                    stamp = self._reserve_seq()
+                n = self.db.execute("UPDATE rl_prompt_state SET until_k=start_k+?, seq=?, revised=1 WHERE "
+                                    "environment=? AND state=? AND start_k IS NOT NULL AND until_k>start_k+?",
+                                    (cooldown, stamp, env, COOLDOWN, cooldown)).rowcount
+                self.db.execute("UPDATE rl_prompt_state SET seq=? WHERE environment=? AND state=? AND revised=1 "
+                                "AND until_k>? AND seq<>?", (stamp, env, COOLDOWN, latest, stamp))
+                if n:
+                    shortened[env] = int(n)
+        if shortened:
+            logger.info("running cooldowns shortened to the current ones at checkpoint %s: %s", latest, shortened)
+        return shortened
+
+    def _reserve_seq(self) -> int:
+        """A seq of the scans' sequence (AUTOINCREMENT: the next scan takes one past it) that no scan will use."""
+        row = self.db.execute("SELECT seq FROM sqlite_sequence WHERE name='rl_prompt_scans'").fetchone()
+        stamp = (int(row[0]) if row is not None else 0) + 1
+        if row is None:
+            self.db.execute("INSERT INTO sqlite_sequence(name, seq) VALUES('rl_prompt_scans', ?)", (stamp,))
+        else:
+            self.db.execute("UPDATE sqlite_sequence SET seq=? WHERE name='rl_prompt_scans'", (stamp,))
+        return stamp
 
     def prompt_state(self, since: int = 0, *, environment: str | None = None,
                      limit: int = MAX_SCANS_PER_PAGE) -> dict:
@@ -782,6 +904,9 @@ class LeaseBook:
                                    f"rl_prompt_scans WHERE {where} ORDER BY seq LIMIT ?", (*args, limit + 1)).fetchall()
             more, rows = len(rows) > limit, rows[:limit]
             cursor = rows[-1][0] if rows else since
+            if not more:      # revised states sit at reserved seqs no scan takes: past the last scan, reach them too
+                cursor = max(cursor, self.db.execute(f"SELECT COALESCE(MAX(seq), 0) FROM rl_prompt_state WHERE "
+                                                     f"{where}", args).fetchone()[0])
             states = self.db.execute(f"SELECT environment, prompt_idx, state, until_k FROM rl_prompt_state WHERE "
                                      f"{where} AND seq<=? ORDER BY seq", (*args, cursor)).fetchall()
             latest = self.latest_checkpoint
@@ -828,6 +953,7 @@ class LeaseCollector:
 
 __all__ = [
     "BANNED", "BLACKLISTED", "BOX_FAILED", "BOX_FAILED_OVER_BUDGET", "COMMIT_DOMAIN", "COOLDOWN", "COOLING", "EXPIRED", "EXPIRED_CAUSE", "FORFEITED", "FULL", "IN_ZONE", "NONCE_DOMAIN", "OPEN", "QUOTA",
+    "VALIDATOR_UNAVAILABLE",
     "REFUSALS", "RELEASED", "SECRET_REVEAL_LAG", "STALE", "SUBMITTED", "TAKEN", "TOO_EASY", "TOO_HARD", "TRUNCATED", "VERDICTS",
     "Lease", "LeaseAnswer", "LeaseBook", "LeaseBookConfig", "LeaseCollector", "LeaseRequest", "Scan",
     "classify_group", "lease_expiry_s", "lease_nonce", "secret_commitment", "verify_reveal",

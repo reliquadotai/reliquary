@@ -186,6 +186,9 @@ def broadcasting_audit(channel, audit_fn: Callable = audit_group) -> Callable:
     return audit
 
 
+AUDIT_CHUNK = 8   # audits taken per call
+
+
 class TrainerAudits:
     """Take audit jobs from ``source`` (``take_audits(limit)`` / ``report_audit(lease_id, result)``: the trainer
     link, or ``RlSubmissions`` in process) and judge them with ``audit_fn(model, group)``."""
@@ -200,19 +203,23 @@ class TrainerAudits:
         if limit <= 0:
             return 0
         began = self.clock()
-        jobs = self.source.take_audits(limit)
         done = 0
-        for group in jobs:
-            if done and self.clock() - began > budget_s:
-                break                           # the rest stay queued for the next round
-            result = self.audit_fn(model, group)
-            try:
-                self.source.report_audit(group.lease_id, result)
-            except Exception as exc:
-                if not (isinstance(exc, LookupError) or getattr(exc, "status", None) == 404):
-                    raise
-                # concluded meanwhile (dropped as stale): nothing to report
-            done += 1
+        while done < limit and not (done and self.clock() - began > budget_s):
+            # taken a few at a time: a group body is large, and what the budget leaves is downloaded again
+            jobs = self.source.take_audits(min(AUDIT_CHUNK, limit - done))
+            if not jobs:
+                break
+            for group in jobs:
+                if done and self.clock() - began > budget_s:
+                    break                       # the rest stay queued for the next round
+                result = self.audit_fn(model, group)
+                try:
+                    self.source.report_audit(group.lease_id, result)
+                except Exception as exc:
+                    if not (isinstance(exc, LookupError) or getattr(exc, "status", None) == 404):
+                        raise
+                    # concluded meanwhile (dropped as stale): nothing to report
+                done += 1
         spent = self.clock() - began
         self.done += done
         self.seconds += spent

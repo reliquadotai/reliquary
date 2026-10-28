@@ -580,3 +580,34 @@ def test_an_answer_is_graded_without_its_terminator(book):
     answer = subs.submit(held.lease_id, "A", [fenced] * 8 + [Rollout(text("```py\nx") + (EOS,))] * 8)
     assert answer["rewards"] == [1.0] * 8 + [0.0] * 8
     assert not any("<|im_end|>" in t for t in seen)
+
+
+def test_probation_audits_every_first_scan_and_samples_the_repeat_scans(book):
+    """In probation a first scan (paid) is always audited; a repeat out-of-zone scan (unpaid) only at its rate."""
+    subs = service(book, probation_groups=100, audit_rate=0.0, probation_repeat_audit_rate=0.0)
+    first = lease(book, 30)
+    subs.submit(first.lease_id, "A", group(0))
+    assert subs.group(first.lease_id)["audit"] == "pending"
+    book.adopt_checkpoint(1)
+    book.adopt_checkpoint(2)                                           # the 0/16 cooldown is over
+    again = book.grant([LeaseRequest("A", ENV, (30,), 2)])[0].leases[0]
+    subs.submit(again.lease_id, "A", group(0))
+    assert subs.group(again.lease_id)["first_scan"] == 0 and subs.group(again.lease_id)["audit"] == "not_drawn"
+    assert kinds(subs) == []                                           # neither is payable before its audit
+    every = service(book, probation_groups=100, audit_rate=0.0, probation_repeat_audit_rate=1.0)
+    book.adopt_checkpoint(3)
+    book.adopt_checkpoint(4)
+    third = book.grant([LeaseRequest("A", ENV, (30,), 4)])[0].leases[0]
+    every.submit(third.lease_id, "A", group(0))
+    assert every.group(third.lease_id)["audit"] == "pending"           # the old rule: every group in probation
+
+
+def test_audit_jobs_serve_first_scans_before_repeats(book):
+    subs = service(book, probation_groups=100, audit_rate=0.0, probation_repeat_audit_rate=1.0)
+    first = lease(book, 40)
+    subs.submit(first.lease_id, "A", group(0), arrived_at=NOW)
+    book.adopt_checkpoint(1)
+    book.adopt_checkpoint(2)
+    again = book.grant([LeaseRequest("A", ENV, (40,), 2)])[0].leases[0]
+    subs.submit(again.lease_id, "A", group(0), arrived_at=NOW + 10)    # newer, but a repeat
+    assert [g.lease_id for g in subs.audit_jobs(10)] == [first.lease_id, again.lease_id]
