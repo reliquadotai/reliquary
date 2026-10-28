@@ -198,7 +198,7 @@ def outcome_from_scores(
 def score_sequences(
     model, sequences: Sequence[tuple], *,
     chunk_tokens: int, topk: int, batch_tokens: int,
-    min_chunk_tokens: int = MIN_CHUNK_TOKENS,
+    min_chunk_tokens: int = MIN_CHUNK_TOKENS, observe=None,
 ) -> tuple[list[tuple[str, tuple[ChunkResult, ...]]], float, float]:
     """``completion_chunk_scores`` for many ``(tokens, prompt_len, proofs)``,
     packed shortest first into forward passes under ``batch_tokens`` padded
@@ -210,6 +210,9 @@ def score_sequences(
     an 80 GB card (spec 7 M3).
 
     One function for the control and the executor, so both compute alike.
+
+    ``observe(k, rows)``, when given, sees the rows the proofs were checked against before they are freed: a
+    single-turn row's completion states, a trajectory's list of span states (the forced-draw check reads them).
     """
     import time
 
@@ -247,6 +250,8 @@ def score_sequences(
         for k, hidden in zip(sub_batch, hidden_states):
             scores[k] = completion_chunk_scores(
                 hidden, sequences[k][2], chunk_tokens=chunk_tokens, topk=topk)
+            if observe is not None:
+                observe(k, hidden)
         verify_seconds += time.perf_counter() - mark
         # Drop this sub-batch's padded activations before the next one is
         # computed: two final-hidden-state tensors must never be live at once.
@@ -264,6 +269,8 @@ def score_sequences(
         mark = time.perf_counter()
         scores[k] = trajectory_chunk_scores(rows, proofs, chunk_tokens=chunk_tokens, topk=topk,
                                             min_chunk_tokens=min_chunk_tokens)
+        if observe is not None:
+            observe(k, rows)
         verify_seconds += time.perf_counter() - mark
         del rows
     return scores, forward_seconds, verify_seconds

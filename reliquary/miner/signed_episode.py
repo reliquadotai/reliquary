@@ -742,6 +742,9 @@ def signed_trajectory_precheck(renderer, *, max_turns: int, job=None, tokenizer=
     from reliquary.corpus.trajectory_parse import TrajectoryRefused
     from reliquary.protocol.corpus_submission import MAX_TRANSCRIPT_BYTES
 
+    from reliquary.corpus.eval_draw import has_draw
+
+    drawn = job is not None and has_draw(job)
     intake = None
     if job is not None:
         from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS
@@ -787,7 +790,7 @@ def signed_trajectory_precheck(renderer, *, max_turns: int, job=None, tokenizer=
             parse_signed_trajectory(renderer, prompt_ids=prompt_ids,
                                     tokens=list(built.tokens), spans=spans, stop=built.stop,
                                     max_turns=max_turns, calls=found.calls, offered=found.tools,
-                                    final=found.final)
+                                    final=found.final, canonical=not drawn)
         except TrajectoryRefused as refused:
             return refused.reason, dict(refused.detail)
         if not state_matches(found.final.state_sha256, built.final_diff):

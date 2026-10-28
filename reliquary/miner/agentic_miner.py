@@ -7,16 +7,20 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
+import random
+import secrets
 import time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from reliquary.corpus.eval_draw import REASON_DRAW_SLOT_TAKEN, has_draw
 from reliquary.corpus.job import PROMPT_ORDER_FREE
 from reliquary.corpus.slots import OpenMap, parse_open_map
 from reliquary.corpus.trajectory import BuiltTrajectory, TrajectoryUnbuildable, build_trajectory
 from reliquary.corpus.walk import job_walk_index
 from reliquary.miner.corpus_miner import _HALT, CorpusJobRetired, CorpusMinerHalted, _retry
+from reliquary.miner.forced_draw import EvalDrawBinding, ForcedDraws
 from reliquary.protocol.sandbox_session import SessionRefused
 
 logger = logging.getLogger(__name__)
@@ -144,6 +148,11 @@ class OpenPrompts:
         self._map: OpenMap | None = None
         self._read_at: float | None = None
         self._lock = asyncio.Lock()
+        # A forced-draw job's draw slots: the validator's taken ones (a hint), and what this process filled,
+        # learnt taken, or is running now, across its identities.
+        self._remote_taken: dict[int, set[int]] = {}
+        self._taken: dict[int, set[int]] = {}
+        self._running: set[tuple[int, int]] = set()
 
     @property
     def exhausted(self) -> bool:
@@ -189,6 +198,36 @@ class OpenPrompts:
                 self._map = self._read = None
                 return
             self._map = parsed
+            try:
+                taken = ((body.get("draw_slots") or {}).get("taken") or {})
+                self._remote_taken = {int(k): {int(x) for x in v} for k, v in taken.items()}
+            except (AttributeError, TypeError, ValueError):
+                self._remote_taken = {}
+
+    def take_draw_slot(self, job, rng) -> tuple[int, int] | None:
+        """A (prompt, draw slot) to run now: a random open prompt with a slot no one filled or runs, its lowest.
+        Reserved until ``end_draw_slot``. None when nothing is left to start."""
+        from reliquary.corpus.eval_draw import slot_count
+
+        slots = slot_count(job)
+        prompts = (self._map.indices() if self._map is not None
+                   else range(job.prompt_start, job.prompt_end))
+        candidates = []
+        for prompt in prompts:
+            busy = self._taken.get(prompt, set()) | self._remote_taken.get(prompt, set())
+            free = [k for k in range(slots) if k not in busy and (prompt, k) not in self._running]
+            if free:
+                candidates.append((prompt, free[0]))
+        if not candidates:
+            return None
+        choice = rng.choice(candidates)
+        self._running.add(choice)
+        return choice
+
+    def end_draw_slot(self, prompt: int, slot: int, *, taken: bool) -> None:
+        self._running.discard((prompt, slot))
+        if taken:
+            self._taken.setdefault(prompt, set()).add(slot)
 
 
 class _SubmitDeadline(Exception):
@@ -207,13 +246,31 @@ def _submit(client, body: dict, counts: Counter, submit_by: float | None = None)
                   max_consecutive_failures=5)
 
 
+def drawn_stop(raw, turns, job, stop_ids) -> str:
+    """A forced-draw eval episode is submitted however it ended (``corpus.eval_draw``): a last turn the cap cut,
+    which verifiers labels ``agent_completed``, is labelled by what cut it."""
+    if raw != "agent_completed" or not turns:
+        return raw
+    last = list(turns[-1].completion_ids)
+    if last and last[-1] in stop_ids:
+        return raw
+    return "max_turns" if len(turns) == job.episode.max_turns else "context_length"
+
+
+# How long a forced-draw miner with nothing to start waits before reading the open prompts again.
+DRAW_SLOT_WAIT_SECONDS = 30.0
+
+
 async def _mine_identity(*, job, identity: Identity, client, engine, runner, decode,
                          slots: asyncio.Semaphore, counts: Counter, stop: asyncio.Event,
-                         precheck=None, open_prompts: OpenPrompts | None = None) -> None:
+                         precheck=None, open_prompts: OpenPrompts | None = None,
+                         stop_ids: frozenset = frozenset()) -> None:
     tasks: set[asyncio.Task] = set()
     if open_prompts is None:
         open_prompts = OpenPrompts(job, client)
     tag = identity.hotkey[:8]
+    drawn = has_draw(job)
+    rng = random.Random(secrets.randbits(64))
 
     def halt() -> None:
         """The identity is done (job complete, retired, halted): episodes still
@@ -242,12 +299,21 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             logger.warning("reporting the sandbox session of episode %d timed out", prompt_index)
 
     async def episode(cursor: int, prompt_index: int, sessions: list[str],
-                      pending: list) -> None:
+                      pending: list) -> str | None:
         deadline = getattr(runner, "deadline", None)
         limit = deadline(prompt_index) if deadline is not None else None
+        on_session = sessions.append
+        if drawn:
+            # A forced-draw eval job: every generate session of the episode draws sample `cursor`'s stream,
+            # bound before its first turn (the forced engine refuses an unbound one).
+            binding = EvalDrawBinding(job, prompt_index, cursor)
+
+            def on_session(session_id: str) -> None:
+                engine._draws.bind(session_id, binding)
+                sessions.append(session_id)
         try:
             async with asyncio.timeout(limit):
-                result = await runner.run(prompt_index, on_session=sessions.append)
+                result = await runner.run(prompt_index, on_session=on_session)
         except TimeoutError:
             counts["episode_timeout"] += 1
             logger.warning("episode %d of %s passed its %s s deadline", prompt_index, tag, limit)
@@ -287,7 +353,9 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             await unsubmitted()
             return
         try:
-            built = build_trajectory(session.turns, final_diff=result.final_diff, stop=result.stop)
+            built = build_trajectory(session.turns, final_diff=result.final_diff,
+                                     stop=drawn_stop(result.stop, session.turns, job, stop_ids)
+                                     if drawn else result.stop)
             if result.transcript is not None:
                 built = dataclasses.replace(built, transcript=result.transcript)
         except TrajectoryUnbuildable as exc:
@@ -353,15 +421,19 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
                     f"{answer['detail']} " if answer.get("detail") else "", result.reward)
         if reason == "job_complete" or reason in _HALT:
             halt()
+        return reason
 
-    async def one(cursor: int) -> None:
+    async def one(cursor: int, prompt_index: int | None = None) -> None:
         """One episode, isolated: whatever it raises is counted and logged
-        here, and its generate sessions are dropped, never its siblings'."""
-        prompt_index = job_walk_index(job, identity.hotkey, cursor)
+        here, and its generate sessions are dropped, never its siblings'.
+        A forced-draw job names its prompt; ``cursor`` is then the draw slot."""
+        if prompt_index is None:
+            prompt_index = job_walk_index(job, identity.hotkey, cursor)
         sessions: list[str] = []
         pending: list = []
+        reason = None
         try:
-            await episode(cursor, prompt_index, sessions, pending)
+            reason = await episode(cursor, prompt_index, sessions, pending)
         except asyncio.CancelledError:
             counts["episode_cancelled"] += 1
             await bounded_report(pending, prompt_index)
@@ -376,6 +448,9 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
                     engine.drop_session(session_id)
                 except Exception:
                     logger.exception("dropping session %s failed", session_id)
+            if drawn:
+                open_prompts.end_draw_slot(prompt_index, cursor,
+                                           taken=reason in ("accepted", REASON_DRAW_SLOT_TAKEN))
 
     # `cursor` is this hotkey's walk position, and the validator of a free job
     # (every episode job) does not check it: positions whose prompt is full
@@ -411,6 +486,24 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             stop.set()
             slots.release()
             break
+        if drawn:
+            choice = open_prompts.take_draw_slot(job, rng)
+            if choice is None:
+                # Every open prompt's free slots are running here: wait for one to end.
+                counts["no_free_draw_slot"] += 1
+                slots.release()
+                if not tasks or all(t.done() for t in tasks):
+                    await asyncio.sleep(DRAW_SLOT_WAIT_SECONDS)
+                else:
+                    await asyncio.wait([t for t in tasks if not t.done()],
+                                       return_when=asyncio.FIRST_COMPLETED)
+                continue
+            prompt, slot = choice
+            task = asyncio.create_task(one(slot, prompt))
+            task.add_done_callback(lambda _t: slots.release())
+            tasks.add(task)
+            started += 1
+            continue
         for _ in range(_OPEN_SCAN):
             if open_prompts.is_open(job_walk_index(job, identity.hotkey, cursor)):
                 break
@@ -432,7 +525,8 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
 
 async def mine_agentic(*, job, identities, client, engine, runners, decode,
                        concurrency: int, precheck=None,
-                       runner_for: Callable[[Identity], object] | None = None) -> dict[str, Counter]:
+                       runner_for: Callable[[Identity], object] | None = None,
+                       stop_ids=()) -> dict[str, Counter]:
     """Every identity mines until its episode count or the job's end; at most
     ``concurrency`` episodes run at once across them. ``precheck`` (see
     ``trajectory_precheck``) drops what the validator would refuse, unsigned.
@@ -448,7 +542,8 @@ async def mine_agentic(*, job, identities, client, engine, runners, decode,
                                else runners[harness_key(identity.harness_env)]),
                        decode=decode,
                        slots=slots, counts=counts[identity.hotkey], stop=stops[identity.hotkey],
-                       precheck=precheck, open_prompts=open_prompts)
+                       precheck=precheck, open_prompts=open_prompts,
+                       stop_ids=frozenset(int(t) for t in stop_ids))
         for identity in identities), return_exceptions=True)
     for identity, outcome in zip(identities, outcomes):
         if isinstance(outcome, BaseException):
@@ -524,11 +619,15 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
     renderer = (job_turn_renderer(job, checkpoint_dir) if signed
                 else load_turn_renderer(checkpoint_dir, tools=("bash", "edit")))
     stop_ids = sorted(renderer.stop_ids)
+    drawn = has_draw(job)
+    # A forced-draw eval job: every turn draws its sample's stream over an fp32 LM head (``corpus.eval_draw``).
     core = VllmTurnCore(checkpoint_dir, sampling=job.sampling, proof=proof, stop_token_ids=stop_ids,
                         max_total_tokens=job.episode.max_total_tokens, max_num_seqs=max_num_seqs,
-                        gpu_memory_utilization=gpu_memory_utilization)
+                        gpu_memory_utilization=gpu_memory_utilization,
+                        **({"forced": True, "lm_head_fp32": True} if drawn else {}))
     engine = GenerateEngine(core, max_total_tokens=job.episode.max_total_tokens,
-                            max_tokens_per_turn=job.episode.max_tokens_per_turn)
+                            max_tokens_per_turn=job.episode.max_tokens_per_turn,
+                            **({"draws": ForcedDraws()} if drawn else {}))
     engine.start()
     server = serving = None
     try:
@@ -561,7 +660,8 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
                     concurrency=concurrency,
                     precheck=signed_trajectory_precheck(
                         renderer, max_turns=job.episode.max_turns, job=job, tokenizer=tokenizer,
-                        source=source, chunk_tokens=proof.chunk_tokens))
+                        source=source, chunk_tokens=proof.chunk_tokens),
+                    stop_ids=stop_ids)
             runners = {}
             for identity in identities:
                 key = harness_key(identity.harness_env)

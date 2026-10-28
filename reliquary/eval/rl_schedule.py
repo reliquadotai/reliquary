@@ -111,8 +111,10 @@ class Settings:
     results_dir: Path
     state_path: Path
     renderer_id: str = "chat-template-thinking-v1"
-    temperature: float = 0.6
-    top_p: float = 0.95
+    # The RL path's sampling, forced by the job's public draw (``corpus.eval_draw``): every sample verifiable.
+    temperature: float = 1.0
+    top_p: float = 1.0
+    draw: str | None = "gumbel_max"
     baseline_model: str | None = None
     baseline_revision: str | None = None
     start_cmd: str = DEFAULT_START
@@ -358,6 +360,8 @@ class Scheduler:
                 "--renderer-id", entry.renderer_id or self.s.renderer_id, "--eos-token-id", str(self.s.eos_token_id),
                 "--max-new-tokens", str(entry.max_new_tokens), "--slots-per-prompt", str(entry.slots_per_prompt),
                 "--temperature", str(self.s.temperature), "--top-p", str(self.s.top_p), "--cap", str(entry.cap)]
+        if self.s.draw is not None:
+            argv += ["--draw", self.s.draw]
         if entry.prompt_count is not None:
             argv += ["--prompt-count", str(entry.prompt_count)]
         if entry.episode_file is not None:

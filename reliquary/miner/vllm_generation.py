@@ -106,6 +106,7 @@ class ForcedSeedVLLMProcessor(LogitsProcessor):  # type: ignore[misc,valid-type]
         forced = _one_hot_picks(
             logits, slots,
             [_uniform(self._slots[slot], self._slots[slot]["offset"]) for slot in slots],
+            kinds=[self._slots[slot].get("draw") for slot in slots],
         )
         for slot in slots:
             self._slots[slot]["offset"] += 1
@@ -122,6 +123,14 @@ def _forced_state(forced: dict[str, Any]) -> dict[str, Any]:
         "rollout_index": int(forced["rollout_index"]),
         "offset": int(forced.get("base_offset", 0)),
     }
+    # An eval job's draw (``corpus.eval_draw``) names its own stream domain and draw, whatever the profile's.
+    if forced.get("domain") is not None:
+        state["domain"] = str(forced["domain"])
+    if forced.get("draw") is not None:
+        from reliquary.environment.forced_sampling import check_draw
+
+        check_draw(str(forced["draw"]))     # a request-named draw samples at T=1 over the full vocabulary
+        state["draw"] = str(forced["draw"])
     if "public_pool" in forced:
         from reliquary.protocol.seed_pool import SeedPool
         pool = SeedPool.from_dict(forced["public_pool"])
@@ -139,17 +148,29 @@ def _uniform(state: dict[str, Any], position: int) -> float:
     if "seed_pool" in state:
         return state["seed_pool"].uniform(state["seed_index"], position)
     return u_at(state["randomness"], state["prompt_idx"], state["checkpoint_hash"],
-                state["rollout_index"], position)
+                state["rollout_index"], position, domain=state.get("domain"))
+
+
+def _row_picks(logits: torch.Tensor, draws: list[float], kinds: list[str | None] | None) -> torch.Tensor:
+    """The forced pick of each row: the profile's draw, or the one its request names (T=1, full vocabulary)."""
+    if kinds is None or all(kind is None for kind in kinds):
+        return pick_rows(logits, draws, draw=default_draw(), t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO)
+    picks = torch.empty(len(draws), dtype=torch.int64, device=logits.device)
+    for kind in set(kinds):
+        at = [i for i, k in enumerate(kinds) if k == kind]
+        index = host_to_device(at, torch.int64, logits.device)
+        picks[index] = (_row_picks(logits[index], [draws[i] for i in at], None) if kind is None
+                        else pick_rows(logits[index], [draws[i] for i in at], draw=kind))
+    return picks
 
 
 def _one_hot_picks(logits: torch.Tensor, rows: list[int], draws: list[float], *,
-                   keep_other_rows: bool = False) -> torch.Tensor:
+                   keep_other_rows: bool = False, kinds: list[str | None] | None = None) -> torch.Tensor:
     """Each forced row becomes -inf but for the profile's forced pick (the shared
-    ``forced_sampling.pick_rows``). The other rows are kept as they are, or
-    blanked as the slot-counter processor always did."""
+    ``forced_sampling.pick_rows``), or the draw its request names (``kinds``). The other
+    rows are kept as they are, or blanked as the slot-counter processor always did."""
     index = host_to_device(rows, torch.int64, logits.device)
-    picks = pick_rows(logits[index], draws, draw=default_draw(),
-                      t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO)
+    picks = _row_picks(logits[index], draws, kinds)
     # index_fill_ takes its value as a kernel argument; ``forced[index] = v`` copies v to the GPU
     # from pageable memory, which blocks the host on the stream every decode step.
     if keep_other_rows:
@@ -187,7 +208,7 @@ def _slot_index(value: Any) -> int:
 def forced_seed_extra_args(
     *, randomness: str, prompt_idx: int, checkpoint_hash: str,
     rollout_index: int, base_offset: int = 0, seed_pool=None,
-    seed_index: int | None = None,
+    seed_index: int | None = None, domain: str | None = None, draw: str | None = None,
 ) -> dict[str, Any]:
     """What one request tells the processor about its place in the draw.
 
@@ -201,6 +222,9 @@ def forced_seed_extra_args(
             "checkpoint_hash": checkpoint_hash,
             "rollout_index": int(rollout_index),
             "base_offset": int(base_offset),
+            # An eval job's own stream and draw (``corpus.eval_draw``); absent, the profile's.
+            **({"domain": str(domain)} if domain is not None else {}),
+            **({"draw": str(draw)} if draw is not None else {}),
         }
     }
     if seed_pool is not None:
@@ -346,7 +370,8 @@ class RunnerForcedSeedVLLMProcessor(ForcedSeedVLLMProcessor):
         self._states = states  # requests not sampled this step are parsed again if they return
         draws = [_uniform(states[req_id][1], states[req_id][1]["offset"] + position)
                  for _, req_id, _, position in rows]
-        return _one_hot_picks(logits, [row for row, *_ in rows], draws, keep_other_rows=True)
+        return _one_hot_picks(logits, [row for row, *_ in rows], draws, keep_other_rows=True,
+                              kinds=[states[req_id][1].get("draw") for _, req_id, _, _ in rows])
 
 
 class VLLMRolloutGenerator:

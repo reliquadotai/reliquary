@@ -20,6 +20,9 @@ from reliquary.corpus.checks import (
     check_termination,
     check_token_budget,
 )
+from reliquary.corpus.eval_draw import (
+    REASON_BAD_CURSOR, REASON_DRAW_SLOT_TAKEN, has_draw, slot_count, slot_key,
+)
 from reliquary.corpus.job import PROMPT_ORDER_MINER_WALK, JobSpec
 from reliquary.corpus.signed_reasons import REASON_SANDBOX_SESSION_REUSED
 from reliquary.corpus.slots import SlotLedger
@@ -104,6 +107,14 @@ def admit(
             return refused
     elif not job.owns(prompt_index):
         return Verdict(False, "prompt_mismatch", detail=out_of_range_detail(job, prompt_index))
+
+    if has_draw(job):
+        # The cursor is the sample's draw slot: one of the prompt's attempts, each filled once.
+        if not 0 <= cursor < slot_count(job):
+            return Verdict(False, REASON_BAD_CURSOR,
+                           detail={"why": "the cursor is the draw slot", "slots": slot_count(job)})
+        if slot_key(prompt_index, cursor) in seen:
+            return Verdict(False, REASON_DRAW_SLOT_TAKEN, detail={"draw_slot": cursor})
 
     if job.episode is not None:
         if not episode_checked:

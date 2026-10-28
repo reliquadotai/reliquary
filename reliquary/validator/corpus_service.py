@@ -46,6 +46,7 @@ from reliquary.corpus.admission import (
     skip_target,
 )
 from reliquary.corpus.checks import CheckResult, completion_digest
+from reliquary.corpus.eval_draw import has_draw, slot_count, slot_key
 from reliquary.corpus.job import PROMPT_ORDER_MINER_WALK, JobError, JobSpec
 from reliquary.corpus.slots import OPEN_ENCODING, SlotLedger
 from reliquary.corpus.walk import CursorLedger, job_walk_index
@@ -1949,6 +1950,9 @@ def build_corpus_router(
         # same compare-and-swap that consumes the slot (admit refuses it when seen).
         session_key = getattr(episode_facts, "session_key", "") or None
         seen_keys = [*digests, session_key] if session_key else list(digests)
+        if has_draw(job):
+            # A forced-draw eval job: the draw slot is taken in the same compare-and-swap.
+            seen_keys.append(slot_key(request.prompt_index, request.cursor))
         timing["checks"] = time.perf_counter() - started - timing["job_read"]
 
         record = None
@@ -2193,6 +2197,8 @@ def build_corpus_router(
                     "encoding": OPEN_ENCODING,
                     "open": base64.b64encode(bitmap).decode("ascii"),
                 }
+                if has_draw(job):
+                    body["draw_slots"] = await asyncio.to_thread(_taken_draw_slots, job, state)
             open_cache.update(at=_open_clock(), state=state, body=body)
             return _open_response(body)
 
@@ -2559,6 +2565,21 @@ def build_corpus_router(
         # operator repairs it, so the refusal is named rather than a bare 500.
         logger.error("corpus ledgers for %s are unreadable: %s", job_id, exc)
         return HTTPException(status_code=500, detail="corpus_ledger_corrupt")
+
+    def _taken_draw_slots(job: JobSpec, state: LedgerState) -> dict:
+        """A forced-draw job's taken draw slots, by prompt with any: a hint so miners do not generate a taken
+        sample. Read from the pending set and the segments already in memory, never loading one (``ensure`` is
+        the submit path's), so a slot sealed in a segment not yet read here may be missing."""
+        seen = set(state.pending)
+        for ref in state.segments:
+            seen.update(seen_index._contents.get(ref.id, ()))
+        slots = slot_count(job)
+        taken = {}
+        for prompt in range(job.prompt_start, job.prompt_end):
+            filled = [slot for slot in range(slots) if slot_key(prompt, slot) in seen]
+            if filled:
+                taken[str(prompt)] = filled
+        return {"slots": slots, "taken": taken}
 
     async def _ensure_seen(refs: Sequence[SegmentRef]) -> None:
         """Load the segments a ledger version names: a missing or altered one

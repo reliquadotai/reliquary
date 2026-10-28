@@ -118,6 +118,8 @@ class CorpusRejectReason(str, Enum):
     SANDBOX_SESSION_REUSED = "sandbox_session_reused"
     SANDBOX_CALL_MISMATCH = "sandbox_call_mismatch"
     SANDBOX_STATE_MISMATCH = "sandbox_state_mismatch"
+    # A forced-draw eval job (``corpus.eval_draw``): this prompt's draw slot (the cursor) was already filled.
+    DRAW_SLOT_TAKEN = "draw_slot_taken"
 
 
 class CorpusCompletion(BaseModel):

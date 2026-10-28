@@ -52,6 +52,22 @@ class LeaseDrawBinding:
         return lease_extra_args(self.nonce, self.prompt_idx, self.checkpoint, self.rollout_index, base_offset)
 
 
+@dataclass(frozen=True)
+class EvalDrawBinding:
+    """A forced-draw eval job's sample (``corpus.eval_draw``): its prompt and draw slot fix the stream; a turn's
+    draw starts at the model tokens the session has generated so far."""
+    job: Any
+    prompt_idx: int
+    draw_slot: int
+
+    def extra_args(self, base_offset: int) -> dict:
+        from reliquary.corpus.eval_draw import draw_context
+        from reliquary.miner.vllm_generation import forced_seed_extra_args
+
+        return forced_seed_extra_args(**draw_context(self.job, self.prompt_idx, self.draw_slot),
+                                      base_offset=int(base_offset))
+
+
 class ForcedDraws:
     """Session id -> binding; thread-safe (the generate endpoint reads it from its request handlers)."""
 
@@ -83,4 +99,4 @@ def forced_sampling_params(base: dict, draw: dict) -> dict:
     return params
 
 
-__all__ = ["DrawBinding", "ForcedDraws", "LeaseDrawBinding", "forced_sampling_params"]
+__all__ = ["DrawBinding", "EvalDrawBinding", "ForcedDraws", "LeaseDrawBinding", "forced_sampling_params"]
