@@ -44,6 +44,7 @@ from reliquary_sandbox.attest import GRADING_GRACE_S, Expected, verify_transcrip
 from reliquary_sandbox.observation import TOOLS_VERSIONS
 
 from reliquary.corpus.checks import check_turn_spans
+from reliquary.corpus.eval_draw import has_draw
 from reliquary.corpus.signed_parse import parse_signed_trajectory
 from reliquary.corpus.signed_reasons import (
     REASON_SANDBOX_EXPIRED, REASON_SANDBOX_SESSION_REUSED, REASON_SANDBOX_STATE_MISMATCH,
@@ -179,7 +180,10 @@ class SignedEpisodeIntake(EpisodeIntake):
         try:
             parse_signed_trajectory(self._renderer, prompt_ids=prompt_ids, tokens=tokens,
                                     spans=spans, stop=trajectory.stop, max_turns=episode.max_turns,
-                                    calls=result.calls, offered=opened.tools, final=final)
+                                    calls=result.calls, offered=opened.tools, final=final,
+                                    # A forced-draw eval episode is scored, never exported: a turn the cap
+                                    # cut is taken as the model left it (``corpus.eval_draw``).
+                                    canonical=not has_draw(self._job))
         except TrajectoryRefused as refused:
             return IntakeRefusal(refused.reason, refused.detail)
         if getattr(episode, "is_bridged", False):

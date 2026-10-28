@@ -222,6 +222,9 @@ reliquary eval schedule --run-id <wandb-run-id> --run-tag <tag> --suite suite.js
   `results/<tag>/<job>/`; a job missing samples after `--max-wait-hours` is graded
   with them as failures, one never drained is abandoned. Then the validator is
   stopped, `results/<tag>/benchmarks.json` rebuilt and published.
+- Each graded job is closed (`tasks close`) and each abandoned one set to cap 0
+  as soon as it is done with, so the next checkpoint's jobs fit in the pool.
+  Size the suite's caps for one checkpoint at a time next to the run's own cap.
 - Evaluations behind training: the milestones between the last one evaluated and
   the newest are marked skipped, never queued. To backfill one, grade it by hand
   (`eval grade --rl-run-id ... --rl-step ...`) and pass it to `eval feed --jobs`.

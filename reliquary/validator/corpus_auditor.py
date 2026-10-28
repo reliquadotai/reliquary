@@ -151,10 +151,15 @@ class CorpusAuditor:
                  scorer: Callable | None = None,
                  vocab_size: int | None = None,
                  arrivals_covered: Callable[[], float | None] | None = None,
-                 prefetch_rounds: bool = True) -> None:
+                 prefetch_rounds: bool = True, draw_job=None) -> None:
         # Fetch, in the background, every drand round the pending records need.
         self._prefetch = prefetch_rounds
         self._job_id = job_id
+        # A forced-draw eval job (``corpus.eval_draw``): its samples are also judged against the draw, here, on
+        # the rows the proofs are checked against. Only with the model in this process.
+        self._draw_job = draw_job
+        if draw_job is not None and (model is None or remote is not None or scorer is not None):
+            raise ValueError(f"job {job_id}: a forced-draw job is audited with the model in this process")
         # In a judge process: ``await scorer(rows)`` scores (tokens,
         # prompt_len, proofs) rows on the GPU process, as ``score_sequences``
         # would here, and ``vocab_size`` stands for the model's embeddings.
@@ -525,17 +530,56 @@ class CorpusAuditor:
         """Judge several records at once: every completion of every record that
         needs the GPU is packed, sorted by length, into shared forward passes."""
         results, items = self._prepare(records)
+        draws: dict[int, list] = {}
+        observe = None
+        if self._draw_job is not None:
+            def observe(k, rows):
+                draws[k] = self._draw_diagnostics(records[items[k][0]], items[k], rows)
         scores, forward_seconds, verify_seconds = score_sequences(
             self._model, [(tokens, n, proofs) if spans is None else (tokens, n, proofs, spans)
              for _, _, tokens, n, proofs, spans in items],
             chunk_tokens=self._proof.chunk_tokens, topk=self._proof.topk,
-            batch_tokens=AUDIT_BATCH_TOKENS)
+            batch_tokens=AUDIT_BATCH_TOKENS, **({"observe": observe} if observe is not None else {}))
         outcomes = {(item[0], item[1]): self._outcome(item, status, chunks)
                     for item, (status, chunks) in zip(items, scores)}
         self._aggregate(records, results, outcomes)
+        if self._draw_job is not None:
+            self._judge_draws(results, items, draws)
         self._log_batch(records, [(len(item[2]), item[0], item[1]) for item in items],
                         forward_seconds, verify_seconds)
         return results
+
+    def _draw_diagnostics(self, record: dict, item: tuple, rows):
+        """One sample's forced-draw diagnostics over its audited rows: a completion's, or a trajectory's model
+        spans, draw ``t`` counting its model tokens across turns."""
+        from reliquary.corpus import eval_draw
+        from reliquary.validator.verifier import _LazyLogitRows, _lm_head_vocab_size
+
+        _, c_idx, tokens, prompt_len, _, spans = item
+        if spans is None:
+            hidden, drawn = rows, list(tokens[prompt_len:])
+        else:
+            hidden = torch.cat(list(rows), dim=0)
+            drawn = [tokens[p] for start, end in spans for p in range(start, end)]
+        head = self._model.lm_head
+        logits = _LazyLogitRows(hidden, head, _lm_head_vocab_size(head), fp32_head=True)
+        u = eval_draw.uniforms(self._draw_job, int(record["prompt_index"]), int(record["cursor"]),
+                               c_idx, len(drawn))
+        return eval_draw.diagnostics(logits, drawn, u)
+
+    def _judge_draws(self, results: list[dict], items: list[tuple], draws: dict[int, object]) -> None:
+        """A record whose proofs passed fails when any of its samples does not follow the draw."""
+        from reliquary.corpus import eval_draw
+
+        by_record: dict[int, list] = {}
+        for k, item in enumerate(items):
+            by_record.setdefault(item[0], []).append(draws[k])
+        for i, diags in by_record.items():
+            if not results[i].get("passed"):
+                continue
+            ok, detail = eval_draw.judge(diags)
+            results[i] = {**results[i], "forced_draw": detail} if ok else {
+                **results[i], "passed": False, "reason": eval_draw.REASON_DRAW_MISMATCH, "forced_draw": detail}
 
     def _log_batch(self, records: list[dict], queue: list, forward: float,
                    verify: float, called: float | None = None) -> None:

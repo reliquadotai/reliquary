@@ -351,6 +351,7 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
     """
     if window_settled(w.entry):
         raise ValueError(f"corpus task {w.entry.task_id!r}: {WINDOW_SETTLED}")
+    from reliquary.corpus.eval_draw import has_draw
     from reliquary.validator.corpus_auditor import CorpusAuditor
     from reliquary.validator.corpus_miner_states import MinerStates
     from reliquary.validator.corpus_miner_status import (
@@ -406,6 +407,7 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
                               remote=remote, on_voided=w.miners.voided,
                               threads=judge_threads, scorer=scorer, vocab_size=vocab_size,
                               arrivals_covered=covered,
+                              draw_job=w.job if has_draw(w.job) else None,
                               **(auditor_kwargs or {}))
     w.settler.on_window = w.miners.window
     if getattr(w, "grader", None) is not None:

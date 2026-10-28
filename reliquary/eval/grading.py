@@ -852,12 +852,21 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
             else:
                 note = ("sampling not verified: TOPLOC proves the completions were computed "
                         "by the model, not that they were sampled as the order asked")
+            from reliquary.corpus.eval_draw import EVAL_DRAW, has_draw
+
+            # A forced-draw job's every passing sample was checked against its public draw, when every
+            # submission was audited: the tokens are the ones the draw gives, whoever mined them.
+            drawn = (has_draw(job_rows.job) and bool(job_rows.verdicts)
+                     and job_rows.audited == job_rows.verdicts)
+            if drawn:
+                note = (f"sampling verified: every sample follows the job's public {EVAL_DRAW} draw "
+                        "(T=1, full vocabulary), checked on the validator's forward with TOPLOC")
             provenance = {
                 **dict(provenance), "generation": "sn81-miners", "job_id": job_rows.job.job_id,
                 "miner_hotkeys": len(job_rows.hotkeys),
                 "audited_fraction": (job_rows.audited / job_rows.verdicts
                                      if job_rows.verdicts else None),
-                "sampling_verified": False, "note": note,
+                "sampling_verified": drawn, "note": note,
             }
         by_env: dict[str, list[tuple[str, int]]] = defaultdict(list)
         for problem_id, (_, card, _, samples) in selected.items():

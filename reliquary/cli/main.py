@@ -1226,6 +1226,7 @@ def build_job_manifest(
     seed=None,
     submit=None,
     episode=None,
+    draw=None,
 ):
     """The manifest as the job store will hold it, refused unless every
     submission it will ever be paid for could be admitted.
@@ -1268,6 +1269,8 @@ def build_job_manifest(
             "min_new_tokens": min_new_tokens,
             "max_new_tokens": max_new_tokens,
             "n": n,
+            # An eval job's forced draw (``corpus.eval_draw``); absent, free sampling.
+            **({"draw": draw} if draw is not None else {}),
         },
         "slots_per_prompt": slots_per_prompt,
         "filter": (
@@ -1355,7 +1358,7 @@ def prepare_corpus_job(
     min_new_tokens=2, temperature=1.0, top_p=1.0, top_k=0, n=1, grader_id=None,
     threshold=None, prompt_order="free", deadline_round=None, overrides=None,
     verification=None, seed=None, contract_environment=None, toploc_thresholds=None,
-    submit=None, episode=None,
+    submit=None, episode=None, draw=None,
 ):
     """The manifest and the registry entry `jobs create` writes, built and
     checked without writing either (the admin service declares jobs with it).
@@ -1416,6 +1419,7 @@ def prepare_corpus_job(
         seed=seed,
         submit=submit,
         episode=episode,
+        draw=draw,
     )
     entry = build_corpus_task_entry(
         task_id=task_id or job_id,
@@ -1659,6 +1663,11 @@ def jobs_create(
     temperature: float = typer.Option(1.0, "--temperature"),
     top_p: float = typer.Option(1.0, "--top-p"),
     top_k: int = typer.Option(0, "--top-k"),
+    draw: str = typer.Option(
+        None, "--draw",
+        help="Eval jobs: 'gumbel_max' forces every sample with the job's public draw (T=1, top-p 1, "
+        "top-k 0), checked by the audit; omit for free sampling",
+    ),
     n: int = typer.Option(1, "--n", help="Completions per submitted slot"),
     grader_id: str = typer.Option(
         None, "--grader-id", help="Rejection sampling: what decides membership"
@@ -1782,7 +1791,7 @@ def jobs_create(
             min_new_tokens=min_new_tokens, temperature=temperature, top_p=top_p, top_k=top_k,
             n=n, grader_id=grader_id, threshold=threshold, prompt_order=prompt_order,
             deadline_round=deadline_round, overrides=overrides, verification=verification,
-            contract_environment=contract_environment, seed=seed, episode=episode,
+            contract_environment=contract_environment, seed=seed, episode=episode, draw=draw,
         )
     except (RegistryError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -2604,8 +2613,10 @@ def eval_schedule(
     model_architecture: str = typer.Option(..., "--model-architecture"),
     eos_token_id: int = typer.Option(..., "--eos-token-id"),
     renderer_id: str = typer.Option("chat-template-thinking-v1", "--renderer-id"),
-    temperature: float = typer.Option(0.6, "--temperature"),
-    top_p: float = typer.Option(0.95, "--top-p"),
+    temperature: float = typer.Option(1.0, "--temperature"),
+    top_p: float = typer.Option(1.0, "--top-p"),
+    draw: str = typer.Option("gumbel_max", "--draw", help="The jobs' forced draw (T=1, top-p 1); 'none' for "
+                             "free sampling at --temperature/--top-p, unverified"),
     baseline_model: str | None = typer.Option(None, "--baseline-model", help="The run's start checkpoint repo"),
     baseline_revision: str | None = typer.Option(None, "--baseline-revision"),
     results_dir: str = typer.Option(..., "--results-dir", help="Gradings, logs and benchmarks.json go here"),
@@ -2642,7 +2653,7 @@ def eval_schedule(
             run_id=run_id, run_tag=run_tag, suite=rl_schedule.load_suite(suite), every=every,
             hf_namespace=hf_namespace, hf_prefix=hf_prefix, model_architecture=model_architecture,
             eos_token_id=eos_token_id, renderer_id=renderer_id, temperature=temperature, top_p=top_p,
-            baseline_model=baseline_model, baseline_revision=baseline_revision, results_dir=Path(results_dir),
+            draw=None if draw == "none" else draw, baseline_model=baseline_model, baseline_revision=baseline_revision, results_dir=Path(results_dir),
             state_path=Path(state) if state else Path(results_dir) / "schedule-state.json",
             start_cmd=start_cmd or rl_schedule.DEFAULT_START, start_values=values,
             max_wait_s=max_wait_hours * 3600, publish=publish, upload=upload, wandb=wandb or bool(wandb_run_id),
@@ -2658,8 +2669,13 @@ def eval_schedule(
             raise ValueError("--every follows the run, --step picks checkpoints: one or the other")
         scheduler = rl_schedule.Scheduler(settings, rl_schedule.live_ports(settings))
         while True:
-            for line in scheduler.tick(execute=execute):
-                typer.echo(line if execute else f"[dry run] {line}")
+            try:
+                for line in scheduler.tick(execute=execute):
+                    typer.echo(line if execute else f"[dry run] {line}")
+            except Exception as exc:                      # noqa: BLE001 - a looping schedule retries next tick
+                if not loop_seconds:
+                    raise
+                typer.echo(f"tick failed, retried in {loop_seconds:.0f}s: {exc!r}", err=True)
             if not loop_seconds:
                 break
             _time.sleep(loop_seconds)

@@ -109,7 +109,7 @@ def _lp(b: bytes) -> bytes:
 
 
 def u_at(randomness: str, prompt_idx: int, checkpoint_hash: str,
-         rollout_index: int, t: int) -> float:
+         rollout_index: int, t: int, *, domain: str | None = None) -> float:
     """Public uniform in [0, 1) for rollout `rollout_index`, completion position `t`.
 
     v2: the hotkey is deliberately NOT hashed. The forced group for a prompt is
@@ -117,8 +117,9 @@ def u_at(randomness: str, prompt_idx: int, checkpoint_hash: str,
     yield N copies of the same draw — variance farming (best-of-N distinct draws)
     is impossible. Anti-pregeneration still holds: `randomness` is unknown until
     the window opens. Keyed on the v2 domain so v1 and v2 streams never collide.
+    ``domain``: another stream's own domain (the eval draw's), else the protocol's.
     """
-    msg = (FORCED_SEED_DOMAIN.encode()
+    msg = ((domain or FORCED_SEED_DOMAIN).encode()
            + _lp(randomness.encode())
            + int(prompt_idx).to_bytes(8, "big")
            + _lp(checkpoint_hash.encode())
@@ -127,11 +128,12 @@ def u_at(randomness: str, prompt_idx: int, checkpoint_hash: str,
     return int.from_bytes(hashlib.sha256(msg).digest()[:8], "big") / 2.0**64
 
 
-def u_range(randomness: str, prompt_idx: int, checkpoint_hash: str, rollout_index: int, n: int) -> list[float]:
+def u_range(randomness: str, prompt_idx: int, checkpoint_hash: str, rollout_index: int, n: int, *,
+            domain: str | None = None) -> list[float]:
     """``[u_at(randomness, prompt_idx, checkpoint_hash, rollout_index, t) for t in range(n)]``, bit for bit: every
     message shares its prefix up to ``t``, so the prefix is hashed once and each position only adds its 4 bytes
     (~2.5x faster than ``u_at``; the trainer draws ~190M of them per step)."""
-    prefix = hashlib.sha256(FORCED_SEED_DOMAIN.encode()
+    prefix = hashlib.sha256((domain or FORCED_SEED_DOMAIN).encode()
                             + _lp(randomness.encode())
                             + int(prompt_idx).to_bytes(8, "big")
                             + _lp(checkpoint_hash.encode())

@@ -7,7 +7,8 @@ import json
 import pytest
 
 from reliquary.eval.job_grading import JobNotGradable
-from reliquary.eval.rl_schedule import Ports, Scheduler, Settings, SuiteEntry, job_id, load_suite
+from reliquary.eval.rl_schedule import (NoSamples, Ports, Scheduler, Settings, SuiteEntry, job_id, load_suite,
+                                        ungraded_rows)
 
 RUN = "5F3sa2TJ-r7-trainer"
 SUITE = [SuiteEntry("verifiers-aime25-r0-n30", "aime", 8, 0.02, 32768),
@@ -22,6 +23,8 @@ class World:
         self.declared, self.drained, self.short = set(), set(), set()
         self.commands, self.graded, self.started, self.stopped, self.feeds = [], [], [], [], []
         self.dead = set()
+        self.released, self.release_fails = [], 0
+        self.empty, self.grade_fails = set(), set()
         self.now = 1000.0
 
     def ports(self):
@@ -32,6 +35,10 @@ class World:
         def grade(job, *, out, rl, allow_incomplete):
             if job in self.short and not allow_incomplete:
                 raise JobNotGradable(f"job {job} misses samples on some problems")
+            if job in self.grade_fails:
+                raise RuntimeError("bucket unreachable")
+            if job in self.empty:
+                raise NoSamples(job)
             self.graded.append((job, rl, allow_incomplete))
             return {"complete": not allow_incomplete}
 
@@ -39,12 +46,19 @@ class World:
             self.started.append(command)
             return 100 + len(self.started)
 
+        def release(job, drained):
+            if self.release_fails:
+                self.release_fails -= 1
+                raise RuntimeError("registry unreachable")
+            self.released.append((job, drained))
+
         return Ports(backups=lambda: list(self.backups),
                      revision=lambda repo: None if repo in self.incomplete else "f" * 40,
                      fingerprint=lambda repo, rev: "a" * 64, job_exists=lambda job: job in self.declared,
                      drained=lambda job: job in self.drained, run=run, grade=grade, start=start,
                      alive=lambda pid: pid not in self.dead, stop=self.stopped.append,
-                     feed=lambda jobs, base: self.feeds.append((jobs, base)) or {"points": len(jobs)})
+                     feed=lambda jobs, base: self.feeds.append((jobs, base)) or {"points": len(jobs)},
+                     release=release)
 
 
 def scheduler(tmp_path, world, **overrides):
@@ -287,3 +301,80 @@ def test_steps_or_every_and_known_sets_only(tmp_path):
         scheduler(tmp_path, World(), every=None)
     with pytest.raises(ValueError, match="not in the suite"):
         scheduler(tmp_path, World(), only=("mmlu",))
+
+
+def test_jobs_done_with_give_their_pool_share_back(tmp_path):
+    world = World()
+    s = scheduler(tmp_path, world, baseline_model=None)
+    world.backups = [50]
+    s.tick(execute=True)
+    world.drained.add("eval-r7-s00050-aime")
+    world.release_fails = 1
+    assert any(line.startswith("release eval-r7-s00050-aime failed") for line in s.tick(execute=True))
+    assert not world.released                              # retried on the next tick
+    s.tick(execute=True)
+    assert world.released == [("eval-r7-s00050-aime", True)]
+    world.now += 3601                                      # gpqa never drains: abandoned, cap 0 only
+    lines = s.tick(execute=True)
+    assert world.released[-1] == ("eval-r7-s00050-gpqa", False) and "released eval-r7-s00050-gpqa" in lines
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert state["checkpoints"]["50"]["released"] == ["eval-r7-s00050-aime", "eval-r7-s00050-gpqa"]
+    s.tick(execute=True)
+    assert len(world.released) == 2                        # never released twice
+
+
+def test_a_job_nobody_mined_is_abandoned_not_scored_zero(tmp_path):
+    world = World()
+    s = scheduler(tmp_path, world, baseline_model=None)
+    world.backups = [50]
+    s.tick(execute=True)
+    world.drained |= {"eval-r7-s00050-aime", "eval-r7-s00050-gpqa"}  # an empty job is drained too
+    world.empty |= {"eval-r7-s00050-aime", "eval-r7-s00050-gpqa"}
+    world.now += 3601
+    lines = s.tick(execute=True)
+    assert not world.graded and not world.feeds
+    assert any(line.startswith("abandon eval-r7-s00050-aime: no sample") for line in lines)
+    assert world.released == [("eval-r7-s00050-aime", False), ("eval-r7-s00050-gpqa", False)]
+
+
+def test_a_graded_job_survives_a_crash_later_in_the_tick(tmp_path):
+    world = World()
+    s = scheduler(tmp_path, world, baseline_model=None)
+    world.backups = [50]
+    s.tick(execute=True)
+    world.drained |= {"eval-r7-s00050-aime", "eval-r7-s00050-gpqa"}
+    world.grade_fails.add("eval-r7-s00050-gpqa")
+    with pytest.raises(RuntimeError):
+        s.tick(execute=True)
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert state["checkpoints"]["50"]["graded"] == ["eval-r7-s00050-aime"]
+    world.grade_fails.clear()
+    s.tick(execute=True)
+    assert [g[0] for g in world.graded] == ["eval-r7-s00050-aime", "eval-r7-s00050-gpqa"]  # aime not again
+
+
+def test_a_serving_checkpoint_without_a_validator_starts_one(tmp_path):
+    world = World()
+    s = scheduler(tmp_path, world, baseline_model=None)
+    world.backups = [50]
+    s.tick(execute=True)
+    state = json.loads((tmp_path / "state.json").read_text())
+    state["pid"] = None
+    (tmp_path / "state.json").write_text(json.dumps(state))
+    lines = s.tick(execute=True)
+    assert any("is gone: restart" in line for line in lines) and len(world.started) == 2
+
+
+def test_the_validator_runs_the_merged_contract_of_every_job_it_serves(tmp_path):
+    world = World()
+    s = scheduler(tmp_path, world, baseline_model=None)
+    world.backups = [50]
+    s.tick(execute=True)
+    assert "tasks contract --task-id eval-r7-s00050-aime --task-id eval-r7-s00050-gpqa >" in world.started[0]
+    assert "RELIQUARY_TASK_ID=eval-r7-s00050-aime,eval-r7-s00050-gpqa " in world.started[0]
+
+
+def test_a_report_with_rows_the_graders_could_not_score_is_flagged():
+    assert ungraded_rows({"envs": {"verifiers:aime25": {"ungraded_rows": 240}, "verifiers:gpqa": {"ungraded_rows": 0}}}) == 240
+    assert ungraded_rows({"envs": {"verifiers:aime25": {"ungraded_rows": 0}}}) == 0
+    assert ungraded_rows({"envs": {}}) == 0

@@ -6,7 +6,8 @@ Each ``tick`` (idempotent, its state in one JSON file):
    ones missing samples after ``max_wait_s`` counted as failures (``--allow-incomplete``); once all are graded,
    stop its validator and rebuild the feed (``run_feed``), published when asked (public bucket and/or the summary
    of a W&B evaluation run, ``wandb_feed``). A validator found dead is
-   restarted.
+   restarted. Each graded job is closed (``tasks close``) and each abandoned one set to cap 0, so the next
+   checkpoint's jobs find their share of the pool free.
 2. Nothing served: the start checkpoint first (the baseline, and later the suite's sets it never ran), then the
    steps asked for (``steps``: exactly those, each for the sets it misses), else the NEWEST milestone backup
    (``<namespace>/<prefix>-step-<n>``, ``n`` a multiple of ``every``) past the last one taken. The ones in between
@@ -34,8 +35,9 @@ logger = logging.getLogger(__name__)
 
 BASE = "base"
 _SHORT = re.compile(r"[a-z0-9][a-z0-9-]{0,15}")
-DEFAULT_START = ("reliquary tasks contract --task-id {job} > {contract} && "
-                 "RELIQUARY_TASK_ID={job} RELIQUARY_TASK_CONTRACT={contract} RELIQUARY_CORPUS_HOT_JOBS=1 "
+# the merged contract of every job served: one job's contract would refuse the others' environments
+DEFAULT_START = ("reliquary tasks contract {task_ids} > {contract} && "
+                 "RELIQUARY_TASK_ID={jobs} RELIQUARY_TASK_CONTRACT={contract} RELIQUARY_CORPUS_HOT_JOBS=1 "
                  "exec reliquary validate --wallet-name {wallet} --hotkey {hotkey} "
                  "--http-host 0.0.0.0 --http-port {port} --no-set-weights")
 
@@ -109,8 +111,10 @@ class Settings:
     results_dir: Path
     state_path: Path
     renderer_id: str = "chat-template-thinking-v1"
-    temperature: float = 0.6
-    top_p: float = 0.95
+    # The RL path's sampling, forced by the job's public draw (``corpus.eval_draw``): every sample verifiable.
+    temperature: float = 1.0
+    top_p: float = 1.0
+    draw: str | None = "gumbel_max"
     baseline_model: str | None = None
     baseline_revision: str | None = None
     start_cmd: str = DEFAULT_START
@@ -143,6 +147,16 @@ class Ports:
     alive: Callable[[int], bool]
     stop: Callable[[int], None]
     feed: Callable[[list[str], list[str]], dict]             # (checkpoint jobs, baseline jobs) -> summary
+    release: Callable[[str, bool], None]                     # (job, drained): close it, else cap 0
+
+
+class NoSamples(Exception):
+    """A job closed with no sample at all: nothing to grade, it is abandoned instead of scored 0."""
+
+
+def ungraded_rows(report: Mapping) -> int:
+    """Rows the graders could not score (a taskset not installed, a grader crash): such a report is not uploaded."""
+    return sum(env.get("ungraded_rows") or 0 for env in report.get("envs", {}).values())
 
 
 class Scheduler:
@@ -222,11 +236,18 @@ class Scheduler:
             except JobNotGradable as exc:
                 log.append(f"wait {job}: {exc}")
                 continue
+            except NoSamples:
+                log.append(f"abandon {job}: no sample after {self.s.max_wait_s:.0f}s, not graded")
+                cp["abandoned"].append(job)
+                self.save(state)
+                continue
             cp["graded"].append(job)
+            self.save(state)                              # a restart must not grade (and upload) it again
             log.append(f"graded {job}")
+        self._release(cp, log, execute)
         if len(cp["graded"]) + len(cp["abandoned"]) < len(cp["jobs"]):
             pid = state["pid"]
-            if pid is not None and not self.p.alive(pid):
+            if pid is None or not self.p.alive(pid):     # no pid: the schedule was restarted without its validator
                 log.append(f"validator {pid} for {cp['repo']} is gone: restart")
                 if execute:
                     state["pid"] = self._start(cp)
@@ -240,6 +261,24 @@ class Scheduler:
         state["active"] = None
         self._feed(state, log, execute)
         return True
+
+    def _release(self, cp: dict, log: list[str], execute: bool) -> None:
+        """Free the pool share of the jobs done with: a failure is retried on the next tick."""
+        released = cp.setdefault("released", [])
+        for job in [*cp["graded"], *cp["abandoned"]]:
+            if job in released:
+                continue
+            drained = job in cp["graded"]
+            if not execute:
+                log.append(f"release {job} ({'close' if drained else 'cap 0'})")
+                continue
+            try:
+                self.p.release(job, drained)
+            except Exception as exc:                      # noqa: BLE001 - the registry may be briefly unreachable
+                log.append(f"release {job} failed, retried next tick: {exc}")
+                continue
+            released.append(job)
+            log.append(f"released {job}")
 
     def _feed(self, state: dict, log: list[str], execute: bool) -> None:
         cps = state["checkpoints"]
@@ -321,6 +360,8 @@ class Scheduler:
                 "--renderer-id", entry.renderer_id or self.s.renderer_id, "--eos-token-id", str(self.s.eos_token_id),
                 "--max-new-tokens", str(entry.max_new_tokens), "--slots-per-prompt", str(entry.slots_per_prompt),
                 "--temperature", str(self.s.temperature), "--top-p", str(self.s.top_p), "--cap", str(entry.cap)]
+        if self.s.draw is not None:
+            argv += ["--draw", self.s.draw]
         if entry.prompt_count is not None:
             argv += ["--prompt-count", str(entry.prompt_count)]
         if entry.episode_file is not None:
@@ -333,7 +374,8 @@ class Scheduler:
         pending = [j for j in cp["jobs"] if j not in cp["graded"] and j not in cp["abandoned"]]
         job = pending[0]                                  # the validator serves the jobs not graded yet
         values = {k: shlex.quote(str(v)) for k, v in self.s.start_values.items()}
-        return self.s.start_cmd.format(job=job, jobs=",".join(pending), model=cp["repo"],
+        task_ids = " ".join(f"--task-id {shlex.quote(j)}" for j in pending)
+        return self.s.start_cmd.format(job=job, jobs=",".join(pending), task_ids=task_ids, model=cp["repo"],
                                        revision=cp["revision"],
                                        contract=shlex.quote(str(self.s.results_dir / f"{job}.contract.json")),
                                        **values)
@@ -387,6 +429,12 @@ def live_ports(settings: Settings) -> Ports:
         from reliquary.eval.job_grading import grade_served_job, upload_grading
 
         manifest = asyncio.run(grade_served_job(job, out=out, rl=rl, allow_incomplete=allow_incomplete))
+        if not manifest.get("rows"):
+            raise NoSamples(job)
+        failed = ungraded_rows(json.loads((out / "report.json").read_text()))
+        if failed:
+            raise RuntimeError(f"{job}: {failed} rows not graded (grader errors, see graded.parquet), "
+                               "not uploaded; retried next tick")
         if settings.upload:
             asyncio.run(upload_grading(job, out))
         return manifest
@@ -398,6 +446,11 @@ def live_ports(settings: Settings) -> Ports:
         return process.pid
 
     def alive(pid: int) -> bool:
+        try:
+            if os.waitpid(pid, os.WNOHANG)[0] == pid:    # our child exited: reap it, a zombie still answers kill 0
+                return False
+        except ChildProcessError:
+            pass                                          # not our child (a schedule restarted under the same pid)
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -442,8 +495,14 @@ def live_ports(settings: Settings) -> Ports:
     def run(argv: list[str]) -> None:
         subprocess.run(argv, check=True)
 
+    def release(job: str, drained: bool) -> None:
+        # `tasks close` refuses a job not drained: an abandoned one only gives its share back.
+        run(["reliquary", "tasks", "close", "--task-id", job] if drained
+            else ["reliquary", "tasks", "set-cap", "--task-id", job, "--cap", "0"])
+
     return Ports(backups=repos.list_backups, revision=revision, fingerprint=fingerprint, job_exists=job_exists,
-                 drained=drained, run=run, grade=grade, start=start, alive=alive, stop=stop, feed=feed)
+                 drained=drained, run=run, grade=grade, start=start, alive=alive, stop=stop, feed=feed,
+                 release=release)
 
 
 __all__ = ["BASE", "DEFAULT_START", "Ports", "Scheduler", "Settings", "SuiteEntry", "job_id", "live_ports",

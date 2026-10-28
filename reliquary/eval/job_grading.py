@@ -90,6 +90,7 @@ async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bo
     """Grade a drained eval job our validator served; the manifest, its files in ``out``.
     ``rl``: ``rl_provenance`` keywords (run_id, step, checkpoint_version)."""
     from reliquary.corpus.delivery import LocalDirectorySink
+    from reliquary.corpus.eval_draw import EVAL_DRAW_DOMAIN, draw_randomness, has_draw
     from reliquary.eval import grading
     from reliquary.eval.prompt_source import (
         REFERENCE_INTERACTIONS, is_eval_source, is_order_job_id, load_eval_rows,
@@ -160,7 +161,11 @@ async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bo
                       else ("toploc-v1", "task contract"))
     verification = {"scheme": scheme, "source": origin,
                     "validator": "our corpus validator, on the job's model",
-                    "task_id": task_id, "thresholds": thresholds, "sampling_verified": False}
+                    "task_id": task_id, "thresholds": thresholds,
+                    # A forced-draw job's audit also checks every sample against its public draw.
+                    "sampling_verified": has_draw(job),
+                    **({"draw": {"kind": job.sampling.draw, "domain": EVAL_DRAW_DOMAIN,
+                                 "randomness": draw_randomness(job)}} if has_draw(job) else {})}
     provenance = {
         "model": job.checkpoint_repo, "revision": job.checkpoint_revision,
         "model_sha": job.checkpoint_revision, "checkpoint_sha256": job.checkpoint_sha256,

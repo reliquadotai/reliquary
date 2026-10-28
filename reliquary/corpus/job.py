@@ -178,6 +178,8 @@ class Sampling:
     min_new_tokens: int
     max_new_tokens: int
     n: int
+    # Eval jobs only: the forced draw every sample follows (``corpus.eval_draw``); None = free sampling.
+    draw: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,6 +356,8 @@ class JobSpec:
                 "min_new_tokens": self.sampling.min_new_tokens,
                 "max_new_tokens": self.sampling.max_new_tokens,
                 "n": self.sampling.n,
+                # Written only when set: every free-sampling manifest hashes as before.
+                **({"draw": self.sampling.draw} if self.sampling.draw is not None else {}),
             },
             "slots_per_prompt": self.slots_per_prompt,
             "filter": (
@@ -403,7 +407,7 @@ def _number(value: Any, field: str) -> float:
 def _parse_sampling(raw: Any) -> Sampling:
     if not isinstance(raw, Mapping):
         raise JobError("sampling must be an object")
-    unknown = set(raw) - set(_SAMPLING_FIELDS)
+    unknown = set(raw) - set(_SAMPLING_FIELDS) - {"draw"}
     if unknown:
         raise JobError(f"sampling has unknown fields: {sorted(unknown)}")
     missing = [f for f in _SAMPLING_FIELDS if f not in raw]
@@ -443,6 +447,15 @@ def _parse_sampling(raw: Any) -> Sampling:
             f"{MAX_COMPLETIONS_PER_SUBMISSION} completions per submission, so "
             "every submission this job asks for would be refused unparsed"
         )
+    from reliquary.corpus.eval_draw import parse_draw
+
+    try:
+        draw = parse_draw(raw)
+    except ValueError as exc:
+        raise JobError(str(exc)) from None
+    if draw is not None and not (temperature == 1.0 and top_p == 1.0 and top_k == 0):
+        raise JobError(f"sampling.draw {draw!r} samples at T=1 over the full vocabulary: "
+                       f"temperature 1, top_p 1, top_k 0, got {temperature}, {top_p}, {top_k}")
     return Sampling(
         temperature=temperature,
         top_p=top_p,
@@ -450,6 +463,7 @@ def _parse_sampling(raw: Any) -> Sampling:
         min_new_tokens=min_new_tokens,
         max_new_tokens=max_new_tokens,
         n=n,
+        draw=draw,
     )
 
 
@@ -740,7 +754,19 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
     )
     if job.episode is not None:
         _check_episode_job(job)
+    if job.sampling.draw is not None:
+        _check_draw_job(job)
     return job
+
+
+def _check_draw_job(job: JobSpec) -> None:
+    """A forced draw is an eval job's: keyed on its seed, its samples in free order (``corpus.eval_draw``)."""
+    if not is_eval_source(job.prompt_source):
+        raise JobError("sampling.draw is for eval jobs: their slots reopen, a draw slot per attempt")
+    if job.seed is None:
+        raise JobError("sampling.draw keys the draw on the job's seed: a seed is required")
+    if job.prompt_order == PROMPT_ORDER_MINER_WALK:
+        raise JobError("sampling.draw takes the draw slot from the cursor: a miner_walk job walks it")
 
 
 def is_signed_sandbox(job: JobSpec) -> bool:
