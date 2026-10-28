@@ -90,6 +90,8 @@ allow-direct-references = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Stated, not left to the plugin: pytest-asyncio warns when it is unset, and warnings are errors here.
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 markers = [
     "classic_window: asserts the pre-v6 timed-window behaviour. These pass under the default profile and are deselected by the v6 job, where the product answers differently by design.",
