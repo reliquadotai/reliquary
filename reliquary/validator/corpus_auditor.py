@@ -539,7 +539,7 @@ class CorpusAuditor:
             self._model, [(tokens, n, proofs) if spans is None else (tokens, n, proofs, spans)
              for _, _, tokens, n, proofs, spans in items],
             chunk_tokens=self._proof.chunk_tokens, topk=self._proof.topk,
-            batch_tokens=AUDIT_BATCH_TOKENS, observe=observe)
+            batch_tokens=AUDIT_BATCH_TOKENS, **({"observe": observe} if observe is not None else {}))
         outcomes = {(item[0], item[1]): self._outcome(item, status, chunks)
                     for item, (status, chunks) in zip(items, scores)}
         self._aggregate(records, results, outcomes)
