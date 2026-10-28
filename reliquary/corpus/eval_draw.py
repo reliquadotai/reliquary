@@ -13,7 +13,9 @@ Its stream is keyed on the job alone, never on the miner:
 
 So whoever generates sample k of a prompt gets the same tokens: a miner cannot re-roll a sample until it likes
 the outcome, and the score does not depend on who mined it. The validator recomputes the draw over its own
-forward and refuses tokens it does not produce (``judge``), with the RL audit's floors.
+forward and refuses a sample that does not follow it (``judge``): a 0.98 match floor and the RL audit's edit check.
+A token that differs is never substituted (the tokens after it would not fit it); honest bf16 drift stays far under
+the floor.
 
 A draw slot is taken once (``slot_key`` joins the accepted digests). It ranges over the prompt's attempts
 (``SlotLedger.attempt_limit``), so a sample that failed its audit is replaced by the next slot's draw.
@@ -31,7 +33,6 @@ from reliquary.constants import (
     FORCED_SEED_STOCHASTIC_MAXPROB,
     RL_AUDIT_FORGERY_MISMATCH_POSITIONS,
     RL_AUDIT_FORGERY_MISMATCH_TOLERANCE,
-    RL_ROLLOUT_MATCH_FLOOR,
 )
 from reliquary.environment.forced_sampling import DRAW_GUMBEL_MAX, u_range
 
@@ -39,6 +40,12 @@ EVAL_DRAW = DRAW_GUMBEL_MAX
 EVAL_DRAW_DOMAIN = "reliquary-eval-draw-v1"
 EVAL_DRAWS = (EVAL_DRAW,)
 REASON_DRAW_MISMATCH = "draw_mismatch"
+# The draw a sample must follow: at least this share of its stochastic positions exact (honest bf16 drift
+# measured 0.69 % at worst on H200, 2026-10-28), with EVAL_MATCH_GRACE misses allowed whatever its length so a
+# short sample is not refused for one honest near-tie. Nothing is substituted: a token changed would not fit the
+# tokens after it.
+EVAL_MATCH_FLOOR = 0.98
+EVAL_MATCH_GRACE = 2
 REASON_DRAW_SLOT_TAKEN = "draw_slot_taken"
 REASON_BAD_CURSOR = "bad_cursor"
 
@@ -99,29 +106,39 @@ def diagnostics(logits, token_ids, u_values):
         boundary_epsilon=FORCED_SEED_GUMBEL_BOUNDARY_EPSILON, draw=EVAL_DRAW)
 
 
-def match_rate(d) -> float:
-    """The rate on stochastic positions when there are enough, else on every drawn one (``rl_draw.rollout_rate``,
-    a short sample rated too: an eval has no gap test to judge it otherwise)."""
+def _counted(d) -> tuple[int, int]:
+    """(positions, exact) the floor reads: the stochastic ones when there are enough, else every drawn one."""
     if d.n_stochastic >= FORCED_SEED_ROLLOUT_MIN_STOCH:
-        return d.n_exact_match / d.n_stochastic
-    return d.n_drawn_exact_match / d.n_positions if d.n_positions else 0.0
+        return d.n_stochastic, d.n_exact_match
+    return d.n_positions, d.n_drawn_exact_match
+
+
+def match_rate(d) -> float:
+    counted, exact = _counted(d)
+    return exact / counted if counted else 0.0
 
 
 def judge(diags) -> tuple[bool, dict[str, Any]]:
-    """One sample's verdict over its diagnostics (one per completion or trajectory): every one must follow the draw
-    (rate >= RL_ROLLOUT_MATCH_FLOOR) and carry no more hard mismatches at near-deterministic positions than the RL
-    audit allows (tokens no draw produces there were edited afterwards)."""
+    """One sample's verdict over its diagnostics (one per completion or trajectory). Every one must:
+
+    * follow the draw: at most ``1 - EVAL_MATCH_FLOOR`` of its counted positions missed, ``EVAL_MATCH_GRACE``
+      misses allowed in any case;
+    * carry no edit: no more hard mismatches at near-deterministic positions than the RL audit allows (a token no
+      draw produces where the model was sure was written afterwards)."""
     worst: dict[str, Any] = {}
     for i, d in enumerate(diags):
-        rate = match_rate(d)
+        counted, exact = _counted(d)
+        misses = counted - exact
         deterministic = max(0, d.n_positions - d.n_stochastic)
         allowance = RL_AUDIT_FORGERY_MISMATCH_TOLERANCE * max(
             1, math.ceil(deterministic / RL_AUDIT_FORGERY_MISMATCH_POSITIONS))
-        detail = {"completion": i, "match": round(rate, 4), "positions": d.n_positions,
-                  "stochastic": d.n_stochastic, "deterministic_misses": d.n_deterministic_hard_mismatch}
-        if not worst or rate < worst["match"]:
+        detail = {"completion": i, "match": round(exact / counted, 4) if counted else 0.0,
+                  "positions": d.n_positions, "stochastic": d.n_stochastic, "misses": misses,
+                  "deterministic_misses": d.n_deterministic_hard_mismatch}
+        if not worst or detail["match"] < worst["match"]:
             worst = detail
-        if rate < RL_ROLLOUT_MATCH_FLOOR or d.n_deterministic_hard_mismatch > allowance:
+        followed = counted > 0 and misses <= max(EVAL_MATCH_GRACE, math.floor((1 - EVAL_MATCH_FLOOR) * counted))
+        if not followed or d.n_deterministic_hard_mismatch > allowance:
             return False, detail
     return True, worst
 

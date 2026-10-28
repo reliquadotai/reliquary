@@ -267,3 +267,29 @@ def test_a_cut_last_turn_is_submitted_under_what_cut_it():
     assert drawn_stop("agent_completed", [turn(1, 2)], job, stops) == "context_length"
     assert drawn_stop("agent_completed", [turn(9), turn(9), turn(1, 2)], job, stops) == "max_turns"
     assert drawn_stop("max_turns", [turn(9)], job, stops) == "max_turns"
+
+
+def _diag(**fields):
+    from reliquary.environment.forced_sampling import SeedConsistencyDiagnostics
+
+    return SeedConsistencyDiagnostics(**fields)
+
+
+@pytest.mark.parametrize("stochastic, exact, ok", [
+    (4809, 4776, True),       # the worst honest drift measured on H200 (0.69 %)
+    (5000, 4900, True),       # 2 %: the floor
+    (5000, 4899, False),
+    (36, 35, True),           # a short sample: one honest near-tie is not a refusal
+    (36, 34, True),           # EVAL_MATCH_GRACE
+    (36, 33, False),
+])
+def test_the_match_floor_is_two_percent_with_a_grace_for_short_samples(stochastic, exact, ok):
+    d = _diag(n_positions=stochastic * 2, n_stochastic=stochastic, n_exact_match=exact,
+              n_drawn_exact_match=stochastic + exact)
+    assert eval_draw.judge([d])[0] is ok
+
+
+def test_a_sample_with_too_few_stochastic_positions_is_judged_on_every_one():
+    assert eval_draw.judge([_diag(n_positions=10, n_stochastic=3, n_exact_match=3, n_drawn_exact_match=8)])[0]
+    assert not eval_draw.judge([_diag(n_positions=10, n_stochastic=3, n_exact_match=3, n_drawn_exact_match=7)])[0]
+    assert not eval_draw.judge([_diag()])[0]               # nothing drawn: nothing verified
