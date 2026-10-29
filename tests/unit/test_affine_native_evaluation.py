@@ -258,6 +258,75 @@ def test_native_cli_dispatch_preserves_fixture_boundary(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out) == result
 
 
+@pytest.mark.parametrize(
+    ("mutation", "oversized"), [("rename", False), ("unlink", False), ("rename", True)]
+)
+def test_native_workspace_monitor_handles_atomic_cache_changes(
+    tmp_path, monkeypatch, mutation, oversized
+):
+    bundle, *_ = prepared(tmp_path)
+    workspace = tmp_path / "work"
+    pending, published = workspace / "cache-pending", workspace / "cache-ready"
+    member = pending / "part.bin"
+    original_popen, original_is_file = subprocess.Popen, Path.is_file
+    changed = False
+    process, exit_watch = None, None
+
+    def report_writer(command, **kwargs):
+        nonlocal process, exit_watch
+        pending.mkdir(mode=0o700)
+        member.write_bytes(b"x" * (2_000_001 if oversized else 1))
+        member.chmod(0o600)
+        command = list(command)
+        command[4] = "import time;time.sleep(0.3);" + command[4]
+        process = original_popen(command, **kwargs)
+        if oversized and not hasattr(os, "waitid"):
+            exit_watch = native.select.kqueue()
+            exit_watch.control(
+                [
+                    native.select.kevent(
+                        process.pid,
+                        filter=native.select.KQ_FILTER_PROC,
+                        flags=native.select.KQ_EV_ADD | native.select.KQ_EV_ONESHOT,
+                        fflags=native.select.KQ_NOTE_EXIT,
+                    )
+                ],
+                0,
+                0,
+            )
+        return process
+
+    def change_after_file_check(path):
+        nonlocal changed
+        exists = original_is_file(path)
+        if path == member and exists and not changed:
+            if oversized:
+                if exit_watch:
+                    assert exit_watch.control(None, 1, 10)
+                    exit_watch.close()
+                else:
+                    os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT)
+            changed = True
+            if mutation == "rename":
+                pending.rename(published)
+            else:
+                member.unlink()
+        return exists
+
+    monkeypatch.setattr(native.subprocess, "Popen", report_writer)
+    monkeypatch.setattr(Path, "is_file", change_after_file_check)
+    if oversized:
+        with pytest.raises(ValueError, match="did not complete"):
+            native.run(bundle, workspace, fixture=True)
+        state = json.loads((workspace / "state.private.json").read_bytes())
+        assert state["stage"] == "storage_limit_exceeded"
+        assert not (workspace / "evaluation-result.private.json").exists()
+    else:
+        assert native.run(bundle, workspace, fixture=True)["successes"] == 4
+    assert changed
+    assert not (workspace / "lease.private.json").exists()
+
+
 def test_fixed32_delivers_every_signed_attempt_and_refuses_partial_report(tmp_path):
     path, config, job, manifest = intake(tmp_path)
     suite = manifest["evaluation_sets"][0]

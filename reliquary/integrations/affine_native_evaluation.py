@@ -853,15 +853,22 @@ def run(
                     if time.monotonic() >= deadline:
                         reason = "budget_exhausted"
                         break
-                    paths = list(workspace.rglob("*"))
-                    require(
-                        len(paths) <= 8192 and not any(p.is_symlink() for p in paths),
-                        "invalid native workspace tree",
-                    )
+                    try:
+                        paths = list(workspace.rglob("*"))
+                        require(
+                            len(paths) <= 8192 and not any(p.is_symlink() for p in paths),
+                            "invalid native workspace tree",
+                        )
+                        workspace_bytes = sum(
+                            p.stat().st_size for p in paths if p.is_file()
+                        )
+                    except FileNotFoundError:
+                        # Cache publication can invalidate a scan; retry before accepting exit.
+                        time.sleep(0.05)
+                        continue
                     if (
                         Path(log.name).stat().st_size > d["limits"]["maxLogBytes"]
-                        or sum(p.stat().st_size for p in paths if p.is_file())
-                        > d["limits"]["maxWorkspaceBytes"]
+                        or workspace_bytes > d["limits"]["maxWorkspaceBytes"]
                     ):
                         reason = "storage_limit_exceeded"
                         break
