@@ -115,7 +115,7 @@ def discover_checkpoint(repository, revision, baseline, baseline_config, *, api=
 def bounded_deadline(now, session_deadline, provider_deadline, max_seconds):
     require(type(now) is int and type(session_deadline) is int and type(provider_deadline) is int,
             "finite window required")
-    expires = min(session_deadline, provider_deadline) - 600
+    expires = min(session_deadline, provider_deadline - 600)
     require(1425 <= expires - now <= 86400 and max_seconds == 900,
             "insufficient native execution and finalization window")
     return expires

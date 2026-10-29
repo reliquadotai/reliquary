@@ -87,9 +87,9 @@ def test_rejects_unsafe_checkpoint_members(name):
 
 
 def test_deadline_reserves_provider_and_customer_window():
-    assert owned.bounded_deadline(1000, 8200, 9000, 900) == 7600
+    assert owned.bounded_deadline(1000, 8200, 9000, 900) == 8200
     assert owned.bounded_deadline(1000, 8200, 8000, 900) == 7400
     with pytest.raises(ValueError, match="window"):
-        owned.bounded_deadline(1000, 3024, 9000, 900)
+        owned.bounded_deadline(1000, 2424, 9000, 900)
     with pytest.raises(ValueError, match="window"):
         owned.bounded_deadline(1000, 8200, 9000, 3600)
