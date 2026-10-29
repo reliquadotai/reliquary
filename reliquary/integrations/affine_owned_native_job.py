@@ -179,6 +179,8 @@ def issue(*, recipe_path, recipe_sha256, observation_path, baseline_config_path,
             filename = getattr(module, "__file__", None)
             require(filename is None or Path(filename).resolve().is_relative_to(source),
                     "original source must run in its own fresh process")
+    previous_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
     sys.path.insert(0, str(source))
     try:
         from subnet.mimo_manifest import build
@@ -210,6 +212,7 @@ def issue(*, recipe_path, recipe_sha256, observation_path, baseline_config_path,
         _admit(envelope, identity.id, now=now)
     finally:
         sys.path.remove(str(source))
+        sys.dont_write_bytecode = previous_bytecode
     root = Path(request["runtimeRoot"])
     require(root.is_absolute() and ".." not in root.parts, "absolute isolated runtime root required")
     output = Path(output)
