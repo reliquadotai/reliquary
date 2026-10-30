@@ -15,12 +15,15 @@
 #   reliquary-code                   -> reliquary_code_v1
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
+COPY scripts/bootstrap_python_trust.py /opt/bootstrap_python_trust.py
+RUN python /opt/bootstrap_python_trust.py --system
 
 RUN --mount=type=bind,from=envs,target=/tmp/envs \
     pip install /tmp/envs/reliquary_logic-*.whl \
                 /tmp/envs/reliquary_dapo_math-*.whl \
                 /tmp/envs/reliquary_instruction_following-*.whl \
                 /tmp/envs/reliquary_code-*.whl
+RUN python /opt/bootstrap_python_trust.py --system
 
 # Fails the build unless bittensor_drand (the partial audit's draw), the hub
 # and tokenizer libraries import and every package verifies against the

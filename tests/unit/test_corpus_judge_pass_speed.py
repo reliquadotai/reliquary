@@ -68,9 +68,10 @@ def relays(monkeypatch):
         monkeypatch.setattr(drand, "DRAND_URLS", list(delays))
         monkeypatch.setattr(drand, "_get_thread_session", lambda: fake)
         monkeypatch.setattr(drand, "_ensure_params", lambda refresh=False: None)
-        monkeypatch.setattr(drand, "_DRAND_CHAIN_HASH", "c" * 64)
+        monkeypatch.setattr(drand, "_DRAND_CHAIN_HASH", drand.DRAND_CHAINS["quicknet"]["hash"])
         monkeypatch.setattr(drand, "_DRAND_PERIOD", 3)
-        # Their signatures are fakes: only agreement can vouch for them here.
+        # Synthetic signatures use a local-verification oracle in timing tests.
+        monkeypatch.setattr(drand, "verify_round_signature", lambda r, sig: sig == _sig(r))
         monkeypatch.setattr(drand, "get_verified_beacon", lambda round_id: None)
         return fake
 
