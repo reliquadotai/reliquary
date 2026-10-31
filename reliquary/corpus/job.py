@@ -762,7 +762,7 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
 def _check_draw_job(job: JobSpec) -> None:
     """A forced draw is an eval job's: keyed on its seed, its samples in free order (``corpus.eval_draw``)."""
     if not is_eval_source(job.prompt_source):
-        raise JobError("sampling.draw is for eval jobs: their slots reopen, a draw slot per attempt")
+        raise JobError("sampling.draw is for eval jobs: a failed draw slot reopens with its own draw")
     if job.seed is None:
         raise JobError("sampling.draw keys the draw on the job's seed: a seed is required")
     if job.prompt_order == PROMPT_ORDER_MINER_WALK:

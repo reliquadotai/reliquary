@@ -46,7 +46,7 @@ from reliquary.corpus.admission import (
     skip_target,
 )
 from reliquary.corpus.checks import CheckResult, completion_digest
-from reliquary.corpus.eval_draw import has_draw, slot_count, slot_key
+from reliquary.corpus.eval_draw import attempt_digests, has_draw, slot_count, slot_key
 from reliquary.corpus.job import PROMPT_ORDER_MINER_WALK, JobError, JobSpec
 from reliquary.corpus.slots import OPEN_ENCODING, SlotLedger
 from reliquary.corpus.walk import CursorLedger, job_walk_index
@@ -944,11 +944,12 @@ def ledger_snapshot(
 
 
 async def record_prompt_failure(store: Any, job: JobSpec, prompt_index: int,
-                                submission_id: str, *,
+                                submission_id: str, *, slot: int | None = None, hotkey: str | None = None,
                                 attempts: int = DEFAULT_WRITE_ATTEMPTS) -> bool | None:
     """An eval job's submission failed its audit: record it in the ledger
     (idempotent per submission), which reopens the prompt's slot until its
     attempts run out. True: reopened; False: exhausted; None: already recorded.
+    ``slot`` and ``hotkey`` (a forced-draw job): the draw slot reopens with its own draw.
     Compare-and-swap against the route's own writes, which retry on conflict."""
     from reliquary.eval.prompt_source import is_eval_source
 
@@ -960,7 +961,7 @@ async def record_prompt_failure(store: Any, job: JobSpec, prompt_index: int,
         state = await asyncio.to_thread(rebuild_ledgers, job, snapshot)
         if snapshot and state.schema not in (LEDGER_SCHEMA_V2, LEDGER_SCHEMA_V3):
             raise LedgerSnapshotError(f"job {job.job_id!r} ledgers are not v2")
-        outcome = state.slots.record_failure(prompt_index, submission_id)
+        outcome = state.slots.record_failure(prompt_index, submission_id, slot=slot, hotkey=hotkey)
         if outcome is None:
             return None
         after = ledger_snapshot(state.slots, state.cursors, state.pending, state.segments,
@@ -972,6 +973,26 @@ async def record_prompt_failure(store: Any, job: JobSpec, prompt_index: int,
         return outcome
     raise CorpusStoreConflict(f"job {job.job_id!r}: the failure of {submission_id[:12]} "
                               "kept losing its ledger race")
+
+
+def draw_failure_slot(record: Mapping[str, Any]) -> dict[str, Any]:
+    """The draw slot (the submission's cursor) and hotkey a failed forced-draw record names, for
+    ``record_prompt_failure``; empty for a record that lacks them (it then reopens capacity only)."""
+    cursor, hotkey = record.get("cursor"), record.get("hotkey")
+    if isinstance(cursor, bool) or not isinstance(cursor, int) or not isinstance(hotkey, str) or not hotkey:
+        return {}
+    return {"slot": cursor, "hotkey": hotkey}
+
+
+def draw_seen_keys(prompt_index: int, cursor: int, digests: Sequence[str],
+                   extra: Sequence[str] = ()) -> Callable[[SlotLedger], list[str]]:
+    """What a forced-draw submission's accept adds to the seen set, at the attempt its slot is at in the turn:
+    its salted completion digests, ``extra`` keys (a sandbox session's) and the slot key."""
+    def keys(slots: SlotLedger) -> list[str]:
+        attempt = slots.slot_attempt(prompt_index, cursor)
+        return [*attempt_digests(prompt_index, cursor, attempt, digests), *extra,
+                slot_key(prompt_index, cursor, attempt)]
+    return keys
 
 
 def seal_chunks(digests: Iterable[str], segment_max: int = SEGMENT_MAX) -> list[list[str]]:
@@ -1117,8 +1138,9 @@ class _TurnEntry:
     # Decides against (slots, cursors, seen), mutating the ledgers as `admit`
     # and `skip` do; returns the verdict.
     decide: Callable[[SlotLedger, CursorLedger, AbstractSet[str]], Verdict]
-    # What an accept adds to the seen set: a submission's digests, a skip none.
-    digests: Sequence[str]
+    # What an accept adds to the seen set: a submission's digests, a skip none. A forced-draw submission's depend
+    # on its slot's attempt, read in the turn: a callable of the slot ledger (``draw_seen_keys``).
+    digests: Sequence[str] | Callable[[SlotLedger], Sequence[str]]
     future: asyncio.Future
     enqueued: float
     # Run once the verdict is in, by a task the HTTP handler cannot cancel.
@@ -1191,7 +1213,7 @@ def plan_turn(
             if verdict.accepted:
                 # `admit` reads `seen`, it does not grow it: recording what was
                 # paid for is the caller's half of the duplicate check.
-                pending.update(entry.digests)
+                pending.update(entry.digests(slots) if callable(entry.digests) else entry.digests)
                 ref = getattr(entry, "record_ref", None)
                 if ref is not None:
                     if ref["submission_id"] in record_refs and record_refs[ref["submission_id"]] != ref:
@@ -1950,9 +1972,12 @@ def build_corpus_router(
         # same compare-and-swap that consumes the slot (admit refuses it when seen).
         session_key = getattr(episode_facts, "session_key", "") or None
         seen_keys = [*digests, session_key] if session_key else list(digests)
-        if has_draw(job):
-            # A forced-draw eval job: the draw slot is taken in the same compare-and-swap.
-            seen_keys.append(slot_key(request.prompt_index, request.cursor))
+        drawn = has_draw(job)
+        if drawn:
+            # A forced-draw eval job: the draw slot is taken at its current attempt in the same compare-and-swap,
+            # and its digests are salted with that attempt so an honest redo of a failed slot is no duplicate.
+            seen_keys = draw_seen_keys(request.prompt_index, request.cursor, digests,
+                                       [session_key] if session_key else ())
         timing["checks"] = time.perf_counter() - started - timing["job_read"]
 
         record = None
@@ -1991,7 +2016,9 @@ def build_corpus_router(
                 checkpoint_sha256=request.checkpoint_sha256,
                 token_counts=token_counts,
                 last_token_ids=last_token_ids,
-                digests=digests,
+                digests=(attempt_digests(request.prompt_index, request.cursor,
+                                         slots.slot_attempt(request.prompt_index, request.cursor), digests)
+                         if drawn else digests),
                 slots=slots,
                 cursors=cursors,
                 seen=seen,
@@ -2574,12 +2601,22 @@ def build_corpus_router(
         for ref in state.segments:
             seen.update(seen_index._contents.get(ref.id, ()))
         slots = slot_count(job)
-        taken = {}
+        taken, cursors = {}, {}
+        ledger = state.slots
         for prompt in range(job.prompt_start, job.prompt_end):
-            filled = [slot for slot in range(slots) if slot_key(prompt, slot) in seen]
+            open_cursors = ledger.draw_cursors(prompt, slots)
+            if open_cursors > slots:
+                cursors[str(prompt)] = open_cursors
+            filled = [slot for slot in range(open_cursors)
+                      if ledger.slot_exhausted(prompt, slot)
+                      or slot_key(prompt, slot, ledger.slot_attempt(prompt, slot)) in seen]
             if filled:
                 taken[str(prompt)] = filled
-        return {"slots": slots, "taken": taken}
+        hint = {"slots": slots, "taken": taken}
+        if cursors:
+            # Prompts with failures recorded before slots were (``SlotLedger.draw_cursors``).
+            hint["cursors"] = cursors
+        return hint
 
     async def _ensure_seen(refs: Sequence[SegmentRef]) -> None:
         """Load the segments a ledger version names: a missing or altered one

@@ -78,6 +78,7 @@ class SeedConsistencyDiagnostics:
     max_cdf_miss: float = 0.0
     first_hard_mismatch_offset: int | None = None
     n_drawn_exact_match: int = 0      # exact picks over every position (``n_exact_match``: stochastic ones only)
+    last_miss: float = 0.0            # the last position's miss (0 when exact): an end the pick did not make
 
 
 def warp(logits: torch.Tensor, t: float, top_k: int, top_p: float) -> torch.Tensor:
@@ -530,6 +531,7 @@ def seed_consistency_diagnostics(
     counts = None
     max_cdf_miss = None
     first_hard = None
+    last_miss = None
     for start in range(0, n, chunk_rows):
         end = min(n, start + chunk_rows)
         if selected_positions is None:
@@ -586,6 +588,7 @@ def seed_consistency_diagnostics(
             )
         )
         chunk_max = miss.max().double()
+        last_miss = miss[-1]
         chunk_first = (hard_offsets.min() if hard_offsets.numel()
                        else torch.tensor(-1, device=offsets.device, dtype=torch.long))
         if counts is None:
@@ -599,6 +602,7 @@ def seed_consistency_diagnostics(
     counts = [int(value) for value in counts.tolist()]
     max_cdf_miss = float(max_cdf_miss.item())
     first_hard = int(first_hard.item())
+    last_miss = float(last_miss.item())
     first_hard_mismatch_offset = None if first_hard < 0 else first_hard
     return SeedConsistencyDiagnostics(
         n_positions=n,
@@ -613,6 +617,7 @@ def seed_consistency_diagnostics(
         max_cdf_miss=max_cdf_miss,
         first_hard_mismatch_offset=first_hard_mismatch_offset,
         n_drawn_exact_match=int(counts[8]),
+        last_miss=last_miss,
     )
 
 

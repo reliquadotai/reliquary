@@ -402,13 +402,15 @@ def pick_draw_slot(job, open_body, taken: dict[int, set[int]], closed: set[int],
     from reliquary.corpus.eval_draw import slot_count
     from reliquary.corpus.slots import parse_open_map
 
-    open_map, remote = None, {}
+    open_map, remote, extra = None, {}, {}
     if open_body is not None:
         try:
             open_map = parse_open_map(open_body)
-            remote = {int(k): set(v) for k, v in ((open_body.get("draw_slots") or {}).get("taken") or {}).items()}
+            hint = open_body.get("draw_slots") or {}
+            remote = {int(k): set(v) for k, v in (hint.get("taken") or {}).items()}
+            extra = {int(k): int(v) for k, v in (hint.get("cursors") or {}).items()}
         except (ValueError, TypeError, AttributeError):
-            open_map, remote = None, {}
+            open_map, remote, extra = None, {}, {}
         if open_map is not None and open_map.open_count == 0:
             return None
     slots = slot_count(job)
@@ -416,7 +418,8 @@ def pick_draw_slot(job, open_body, taken: dict[int, set[int]], closed: set[int],
     for prompt in range(job.prompt_start, job.prompt_end):
         if prompt in closed or (open_map is not None and not open_map.is_open(prompt)):
             continue
-        free = [k for k in range(slots) if k not in taken.get(prompt, ()) and k not in remote.get(prompt, ())]
+        free = [k for k in range(max(slots, extra.get(prompt, 0)))
+                if k not in taken.get(prompt, ()) and k not in remote.get(prompt, ())]
         if free:
             candidates.append((prompt, free[0]))
     return rng.choice(candidates) if candidates else None
@@ -430,17 +433,18 @@ def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
     import random
 
     from reliquary.corpus.eval_draw import REASON_DRAW_SLOT_TAKEN, draw_context
+    from reliquary.miner.forced_draw import TakenSlots
 
     retry_kwargs = dict(sleep=sleep, counts=counts, max_consecutive_failures=max_consecutive_failures)
     rng = random.Random(secrets.randbits(64))
-    taken: dict[int, set[int]] = {}
+    taken = TakenSlots()
     closed: set[int] = set()
     steps = 0
     while max_steps is None or steps < max_steps:
         steps += 1
         reader = getattr(client, "open_prompts", None)
         open_body = _retry(reader, **retry_kwargs) if reader is not None else None
-        choice = pick_draw_slot(job, open_body, taken, closed, rng)
+        choice = pick_draw_slot(job, open_body, taken.view(now=time.monotonic()), closed, rng)
         if choice is None:
             counts["job_complete"] += 1
             break
@@ -465,7 +469,7 @@ def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
         if reason in _HALT:
             raise CorpusMinerHalted(f"the validator refused this hotkey: {reason}", counts=dict(counts))
         if answer.get("accepted") or reason == REASON_DRAW_SLOT_TAKEN:
-            taken.setdefault(prompt_index, set()).add(slot)
+            taken.add(prompt_index, slot, now=time.monotonic())
         elif reason == "prompt_full":
             closed.add(prompt_index)
         else:
