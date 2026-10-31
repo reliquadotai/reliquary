@@ -18,8 +18,8 @@ A token that differs is never substituted (the tokens after it would not fit it)
 the floor.
 
 A draw slot is taken once per attempt (``slot_key`` joins the accepted digests). A sample that failed its audit
-reopens its own slot, with the same draw, for any hotkey but the one that failed it, up to ``ATTEMPTS_PER_SLOT``
-attempts: the samples a job scores never depend on which ones failed or who mined them.
+reopens its own slot, with the same draw, up to ``ATTEMPTS_PER_SLOT`` attempts: the samples a job scores never
+depend on which ones failed or who mined them.
 """
 from __future__ import annotations
 
@@ -44,9 +44,10 @@ REASON_DRAW_MISMATCH = "draw_mismatch"
 # Nothing is substituted: a token changed would not fit the tokens after it.
 EVAL_MATCH_FLOOR = 0.98
 # Gumbel score gaps (best score minus the submitted token's): honest misses on Qwen3.8-27B at T 1, 2026-10-31:
-# q99.9 0.64, max 2.9; half of all runner-up edits are over 4. The last token's is tighter: an end is never a tie.
+# q99.9 0.64, max 2.9; half of all runner-up edits are over 4. The last token's is tighter (just over the honest
+# maximum): a sample cut where the draw went on has its end token far from the pick.
 EVAL_GAP_TOLERANCE = 4.0
-EVAL_TERMINAL_GAP = 1.0
+EVAL_TERMINAL_GAP = 3.0
 EVAL_MATCH_GRACE = 8
 REASON_DRAW_SLOT_TAKEN = "draw_slot_taken"
 REASON_BAD_CURSOR = "bad_cursor"
@@ -129,7 +130,7 @@ def match_rate(d) -> float:
 
 
 def allowed_misses(counted: int) -> int:
-    return max(min(EVAL_MATCH_GRACE, counted // 4), math.floor((1 - EVAL_MATCH_FLOOR) * counted))
+    return max(min(EVAL_MATCH_GRACE, max(1, counted // 4)), math.floor((1 - EVAL_MATCH_FLOOR) * counted))
 
 
 def _gap(miss: float) -> float:

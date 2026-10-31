@@ -90,8 +90,9 @@ class SlotLedger:
     in all. A job that never records a failure is exactly V slots.
 
     A forced-draw job also records the failed draw slot and hotkey
-    (``<id12>@<slot>@<hotkey>``): the same slot reopens with the same draw, for
-    any hotkey but that one, up to ``ATTEMPTS_PER_SLOT`` attempts per slot.
+    (``<id12>@<slot>@<hotkey>``): the same slot reopens with the same draw, up
+    to ``ATTEMPTS_PER_SLOT`` attempts per slot; the failure that uses a slot's
+    last attempt reopens nothing.
     """
 
     __slots__ = (
@@ -136,11 +137,22 @@ class SlotLedger:
     def attempt_limit(self) -> int:
         return ATTEMPTS_PER_SLOT * self._slots_per_prompt
 
+    def _reopened(self, position: int) -> int:
+        """Failures that reopened a slot: every slotless one (as before slots were recorded), and per draw slot
+        all but the one that used its last attempt (that slot never fills again)."""
+        legacy, per_slot = 0, {}
+        for entry in self._failed.get(position, ()):
+            parts = entry.split("@", 2)
+            if len(parts) == 3:
+                per_slot[parts[1]] = per_slot.get(parts[1], 0) + 1
+            else:
+                legacy += 1
+        return legacy + sum(min(n, ATTEMPTS_PER_SLOT - 1) for n in per_slot.values())
+
     def capacity(self, index: int) -> int:
-        """The slots this prompt has: V, plus one per failed submission, bounded."""
+        """The slots this prompt has: V, plus one per failure that reopened a slot, bounded."""
         position = self._check(index)
-        return min(self._slots_per_prompt + len(self._failed.get(position, ())),
-                   self.attempt_limit)
+        return min(self._slots_per_prompt + self._reopened(position), self.attempt_limit)
 
     def remaining(self, index: int) -> int:
         position = self._check(index)
@@ -174,10 +186,6 @@ class SlotLedger:
     def slot_attempt(self, index: int, slot: int) -> int:
         """The attempt a draw slot is at: how many times it failed."""
         return len(self._slot_failures(index, slot))
-
-    def barred(self, index: int, slot: int, hotkey: str) -> bool:
-        """Whether ``hotkey`` already failed this draw slot."""
-        return str(hotkey) in self._slot_failures(index, slot)
 
     def draw_cursors(self, index: int, slots_per_prompt: int) -> int:
         """How many draw slots this prompt takes cursors for: its logical slots, plus one per failure recorded
@@ -266,8 +274,8 @@ class SlotLedger:
 
     @property
     def total(self) -> int:
-        extra = sum(min(len(failed), self.attempt_limit - self._slots_per_prompt)
-                    for failed in self._failed.values())
+        extra = sum(min(self._reopened(position), self.attempt_limit - self._slots_per_prompt)
+                    for position in self._failed)
         return self._prompt_count * self._slots_per_prompt + extra
 
     @property

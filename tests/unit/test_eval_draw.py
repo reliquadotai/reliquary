@@ -108,7 +108,9 @@ def test_admission_refuses_a_cursor_past_the_prompts_slots():
     last = job.slots_per_prompt - 1
     assert eval_draw.slot_count(job) == last + 1
     assert _admit(job, frozenset(), cursor=last).accepted
-    refused = _admit(job, frozenset(), cursor=last + 1)
+    retired = _admit(job, frozenset(), cursor=last + 1)          # the former attempt range: taken
+    assert (retired.accepted, retired.reason) == (False, eval_draw.REASON_DRAW_SLOT_TAKEN)
+    refused = _admit(job, frozenset(), cursor=ATTEMPTS_PER_SLOT * job.slots_per_prompt)
     assert (refused.accepted, refused.reason) == (False, eval_draw.REASON_BAD_CURSOR)
 
 
@@ -314,7 +316,7 @@ def test_an_end_the_pick_did_not_make_is_refused():
 
     base = dict(n_positions=1000, n_stochastic=500, n_drawn_exact_match=999)
     assert eval_draw.judge([_diag(**base, last_miss=1 - math.exp(-0.5))])[0]
-    ok, detail = eval_draw.judge([_diag(**base, last_miss=1 - math.exp(-2.0))])
+    ok, detail = eval_draw.judge([_diag(**base, last_miss=1 - math.exp(-5.0))])
     assert not ok and detail["last_gap"] > eval_draw.EVAL_TERMINAL_GAP
 
 

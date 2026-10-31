@@ -17,15 +17,15 @@ def _failed_ledger(job, prompt=5, slot=0, hotkeys=(FAILER,)):
     slots = SlotLedger(job.prompt_count, job.slots_per_prompt)
     for k, hotkey in enumerate(hotkeys):
         slots.consume(prompt)
-        assert slots.record_failure(prompt, f"{k}" * 64, slot=slot, hotkey=hotkey) is True
+        # True while it reopens the slot; False for the failure that uses its last attempt.
+        assert slots.record_failure(prompt, f"{k}" * 64, slot=slot, hotkey=hotkey) is (k < ATTEMPTS_PER_SLOT - 1)
     return slots
 
 
-def test_a_failure_is_recorded_on_its_slot_and_bars_its_hotkey():
+def test_a_failure_is_recorded_on_its_slot():
     slots = _failed_ledger(_job())
     assert slots.slot_attempt(5, 0) == 1
     assert slots.slot_attempt(5, 1) == 0
-    assert slots.barred(5, 0, FAILER) and not slots.barred(5, 0, OTHER) and not slots.barred(5, 1, FAILER)
     assert slots.record_failure(5, "0" * 64, slot=0, hotkey=FAILER) is None    # idempotent
     assert slots.slot_attempt(5, 0) == 1
 
@@ -35,7 +35,7 @@ def test_slot_failures_round_trip_through_the_snapshot():
     slots = _failed_ledger(job)
     again = SlotLedger.from_snapshot(job.prompt_count, job.slots_per_prompt, slots.snapshot(),
                                      failed=slots.failed_snapshot())
-    assert again.slot_attempt(5, 0) == 1 and again.barred(5, 0, FAILER)
+    assert again.slot_attempt(5, 0) == 1
     assert again.capacity(5) == slots.capacity(5)
 
 
@@ -44,7 +44,7 @@ def test_a_legacy_failure_reopens_capacity_but_names_no_slot():
     slots.consume(5)
     assert slots.record_failure(5, "a" * 64) is True
     assert slots.capacity(5) == 5
-    assert slots.slot_attempt(5, 0) == 0 and not slots.barred(5, 0, FAILER)
+    assert slots.slot_attempt(5, 0) == 0
 
 
 def test_a_slot_that_used_every_attempt_exhausts_a_prompt_that_cannot_complete():
@@ -76,21 +76,28 @@ def _admit(job, seen, slots, *, hotkey, cursor, prompt_index=5):
                  slots=slots, cursors=CursorLedger(), seen=seen)
 
 
-def test_a_failed_slot_reopens_with_the_same_cursor_for_another_hotkey():
+def test_a_failed_slot_reopens_with_the_same_cursor_for_anyone():
+    """The hotkey that failed it too: with the same draw a retry selects nothing, and a job with one miner must
+    still complete or run out of attempts."""
     job = _job()
     slots = _failed_ledger(job)
     seen = frozenset({eval_draw.slot_key(5, 0, 0)})
     assert _admit(job, seen, slots, hotkey=OTHER, cursor=0).accepted
-    barred = _admit(job, seen, slots, hotkey=FAILER, cursor=0)
-    assert (barred.accepted, barred.reason) == (False, eval_draw.REASON_DRAW_SLOT_TAKEN)
+    assert _admit(job, seen, slots, hotkey=FAILER, cursor=0).accepted
     retaken = _admit(job, seen | {eval_draw.slot_key(5, 0, 1)}, slots, hotkey=OTHER, cursor=0)
     assert (retaken.accepted, retaken.reason) == (False, eval_draw.REASON_DRAW_SLOT_TAKEN)
 
 
 def test_a_cursor_past_the_logical_slots_is_refused():
+    """Taken up to the old 3 x V range (a miner on the previous image marks it and moves on instead of regenerating
+    it forever), a bad cursor past it."""
     job = _job()
     slots = SlotLedger(job.prompt_count, job.slots_per_prompt)
-    refused = _admit(job, frozenset(), slots, hotkey=OTHER, cursor=job.slots_per_prompt)
+    retired = _admit(job, frozenset(), slots, hotkey=OTHER, cursor=job.slots_per_prompt)
+    assert (retired.accepted, retired.reason) == (False, eval_draw.REASON_DRAW_SLOT_TAKEN)
+    last_old = ATTEMPTS_PER_SLOT * job.slots_per_prompt - 1
+    assert _admit(job, frozenset(), slots, hotkey=OTHER, cursor=last_old).reason == eval_draw.REASON_DRAW_SLOT_TAKEN
+    refused = _admit(job, frozenset(), slots, hotkey=OTHER, cursor=last_old + 1)
     assert (refused.accepted, refused.reason) == (False, eval_draw.REASON_BAD_CURSOR)
 
 
@@ -125,7 +132,7 @@ def test_the_ledger_records_the_failed_slot_and_hotkey(monkeypatch):
         assert await record_prompt_failure(store, job, 2, "d" * 64, slot=1, hotkey=FAILER) is True
         snapshot, _ = await store.read_ledgers(job.job_id)
         state = rebuild_ledgers(job, snapshot)
-        assert state.slots.slot_attempt(2, 1) == 1 and state.slots.barred(2, 1, FAILER)
+        assert state.slots.slot_attempt(2, 1) == 1
 
     asyncio.run(go())
 
@@ -159,8 +166,6 @@ def test_a_ledger_turn_records_the_attempt_keys_and_admits_the_honest_redo():
     state.slots.record_failure(5, "f" * 64, slot=0, hotkey=FAILER)
     failed = ledger_snapshot(state.slots, state.cursors, state.pending, state.segments)
 
-    barred, _ = turn(failed, FAILER)
-    assert (barred.accepted, barred.reason) == (False, eval_draw.REASON_DRAW_SLOT_TAKEN)
     redo, after = turn(failed, OTHER)
     assert redo.accepted
     assert {*eval_draw.attempt_digests(5, 0, 1, raw), eval_draw.slot_key(5, 0, 1)} <= set(after["seen_pending"])
@@ -183,7 +188,7 @@ def test_both_auditors_record_the_failed_slot_and_its_hotkey(monkeypatch):
         await auditor._write(bad, {"passed": False, "reason": eval_draw.REASON_DRAW_MISMATCH})
         snapshot, _ = await store.read_ledgers(job.job_id)
         slots = rebuild_ledgers(job, snapshot).slots
-        assert slots.slot_attempt(2, 1) == 1 and slots.barred(2, 1, FAILER)
+        assert slots.slot_attempt(2, 1) == 1
 
     asyncio.run(go())
 
@@ -217,8 +222,8 @@ def test_a_failure_recorded_without_its_slot_still_opens_the_next_slot():
     v = job.slots_per_prompt
     assert slots.draw_cursors(5, v) == v + 1
     assert _admit(job, seen, slots, hotkey=OTHER, cursor=v).accepted
-    refused = _admit(job, seen, slots, hotkey=OTHER, cursor=v + 1)
-    assert (refused.accepted, refused.reason) == (False, eval_draw.REASON_BAD_CURSOR)
+    retired = _admit(job, seen, slots, hotkey=OTHER, cursor=v + 1)
+    assert (retired.accepted, retired.reason) == (False, eval_draw.REASON_DRAW_SLOT_TAKEN)
 
 
 def test_the_miner_reaches_a_cursor_past_the_logical_slots_when_the_hint_names_it():
@@ -238,3 +243,31 @@ def test_the_miner_reaches_a_cursor_past_the_logical_slots_when_the_hint_names_i
     assert pick_draw_slot(job, body, {}, set(), random.Random(0)) == (1, v)
     del body["draw_slots"]["cursors"]
     assert pick_draw_slot(job, body, {}, set(), random.Random(0)) is None
+
+
+def test_the_failure_that_exhausts_a_slot_adds_no_capacity_so_the_prompt_finishes():
+    """V = 2: slot 1 passes, slot 0 fails three times. The prompt is exhausted, and nothing stays open."""
+    slots = SlotLedger(1, 2)
+    slots.consume(0)                                       # slot 1
+    for k in range(ATTEMPTS_PER_SLOT):
+        slots.consume(0)
+        slots.record_failure(0, f"{k}" * 64, slot=0, hotkey=f"5H{k}")
+    assert slots.prompt_state(0) == "exhausted"
+    assert slots.remaining(0) == 0 and slots.is_complete
+    assert slots.open_bitmap()[1] == 0
+
+
+def test_a_very_short_sample_may_miss_once():
+    from tests.unit.test_eval_draw import _diag
+
+    assert eval_draw.judge([_diag(n_positions=3, n_stochastic=3, n_drawn_exact_match=2)])[0]
+    assert not eval_draw.judge([_diag(n_positions=3, n_stochastic=3, n_drawn_exact_match=1)])[0]
+
+
+def test_an_honest_near_tie_on_the_last_token_is_not_a_cut():
+    import math
+
+    from tests.unit.test_eval_draw import _diag
+
+    base = dict(n_positions=1000, n_stochastic=500, n_drawn_exact_match=999)
+    assert eval_draw.judge([_diag(**base, last_miss=1 - math.exp(-2.9))])[0]

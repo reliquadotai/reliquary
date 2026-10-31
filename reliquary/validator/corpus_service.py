@@ -949,7 +949,7 @@ async def record_prompt_failure(store: Any, job: JobSpec, prompt_index: int,
     """An eval job's submission failed its audit: record it in the ledger
     (idempotent per submission), which reopens the prompt's slot until its
     attempts run out. True: reopened; False: exhausted; None: already recorded.
-    ``slot`` and ``hotkey`` (a forced-draw job): the draw slot reopens with its own draw, barred to that hotkey.
+    ``slot`` and ``hotkey`` (a forced-draw job): the draw slot reopens with its own draw.
     Compare-and-swap against the route's own writes, which retry on conflict."""
     from reliquary.eval.prompt_source import is_eval_source
 
