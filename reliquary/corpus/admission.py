@@ -110,9 +110,10 @@ def admit(
 
     if has_draw(job):
         # The cursor is the sample's draw slot, filled once per attempt; a failed one reopens for other hotkeys.
-        if not 0 <= cursor < slot_count(job):
+        cursors_open = slots.draw_cursors(prompt_index, slot_count(job))
+        if not 0 <= cursor < cursors_open:
             return Verdict(False, REASON_BAD_CURSOR,
-                           detail={"why": "the cursor is the draw slot", "slots": slot_count(job)})
+                           detail={"why": "the cursor is the draw slot", "slots": cursors_open})
         if slots.slot_exhausted(prompt_index, cursor):
             return Verdict(False, REASON_DRAW_SLOT_TAKEN, detail={"draw_slot": cursor, "exhausted": True})
         if slots.barred(prompt_index, cursor, hotkey):

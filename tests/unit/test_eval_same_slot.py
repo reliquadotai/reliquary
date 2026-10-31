@@ -203,3 +203,38 @@ def test_a_miner_forgets_a_taken_slot_so_a_reopened_one_is_mined_again():
     taken.add(5, 0, now=1000.0)
     assert taken.view(now=1200.0) == {5: {0}}
     assert taken.view(now=1301.0) == {}
+
+
+def test_a_failure_recorded_without_its_slot_still_opens_the_next_slot():
+    """A ledger written before slots were recorded (the #431 image): each such failure opens one more cursor past
+    the logical slots, as it did then, so a running job stays completable across the upgrade."""
+    job = _job()
+    slots = SlotLedger(job.prompt_count, job.slots_per_prompt)
+    for _ in range(job.slots_per_prompt):
+        slots.consume(5)
+    slots.record_failure(5, "a" * 64)
+    seen = frozenset(eval_draw.slot_key(5, k) for k in range(job.slots_per_prompt))
+    v = job.slots_per_prompt
+    assert slots.draw_cursors(5, v) == v + 1
+    assert _admit(job, seen, slots, hotkey=OTHER, cursor=v).accepted
+    refused = _admit(job, seen, slots, hotkey=OTHER, cursor=v + 1)
+    assert (refused.accepted, refused.reason) == (False, eval_draw.REASON_BAD_CURSOR)
+
+
+def test_the_miner_reaches_a_cursor_past_the_logical_slots_when_the_hint_names_it():
+    import base64
+    import random
+
+    from reliquary.corpus.slots import OPEN_ENCODING
+    from reliquary.miner.corpus_miner import pick_draw_slot
+
+    job = _job()
+    v = job.slots_per_prompt
+    bitmap = bytearray(4)
+    bitmap[0] = 0b01000000                                 # only prompt 1 open
+    body = {"job_id": job.job_id, "prompt_start": 0, "prompt_count": 30, "open_count": 1, "as_of": 0,
+            "encoding": OPEN_ENCODING, "open": base64.b64encode(bytes(bitmap)).decode(),
+            "draw_slots": {"slots": v, "taken": {"1": list(range(v))}, "cursors": {"1": v + 1}}}
+    assert pick_draw_slot(job, body, {}, set(), random.Random(0)) == (1, v)
+    del body["draw_slots"]["cursors"]
+    assert pick_draw_slot(job, body, {}, set(), random.Random(0)) is None

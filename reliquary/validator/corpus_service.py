@@ -2601,15 +2601,22 @@ def build_corpus_router(
         for ref in state.segments:
             seen.update(seen_index._contents.get(ref.id, ()))
         slots = slot_count(job)
-        taken = {}
+        taken, cursors = {}, {}
         ledger = state.slots
         for prompt in range(job.prompt_start, job.prompt_end):
-            filled = [slot for slot in range(slots)
+            open_cursors = ledger.draw_cursors(prompt, slots)
+            if open_cursors > slots:
+                cursors[str(prompt)] = open_cursors
+            filled = [slot for slot in range(open_cursors)
                       if ledger.slot_exhausted(prompt, slot)
                       or slot_key(prompt, slot, ledger.slot_attempt(prompt, slot)) in seen]
             if filled:
                 taken[str(prompt)] = filled
-        return {"slots": slots, "taken": taken}
+        hint = {"slots": slots, "taken": taken}
+        if cursors:
+            # Prompts with failures recorded before slots were (``SlotLedger.draw_cursors``).
+            hint["cursors"] = cursors
+        return hint
 
     async def _ensure_seen(refs: Sequence[SegmentRef]) -> None:
         """Load the segments a ledger version names: a missing or altered one

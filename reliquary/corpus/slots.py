@@ -179,6 +179,13 @@ class SlotLedger:
         """Whether ``hotkey`` already failed this draw slot."""
         return str(hotkey) in self._slot_failures(index, slot)
 
+    def draw_cursors(self, index: int, slots_per_prompt: int) -> int:
+        """How many draw slots this prompt takes cursors for: its logical slots, plus one per failure recorded
+        without its slot (a ledger from before slots were recorded, when a failure opened the next slot)."""
+        position = self._check(index)
+        legacy = sum(1 for entry in self._failed.get(position, ()) if "@" not in entry)
+        return min(int(slots_per_prompt) + legacy, self.attempt_limit)
+
     def slot_exhausted(self, index: int, slot: int) -> bool:
         return self.slot_attempt(index, slot) >= ATTEMPTS_PER_SLOT
 

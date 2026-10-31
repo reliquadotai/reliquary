@@ -402,13 +402,15 @@ def pick_draw_slot(job, open_body, taken: dict[int, set[int]], closed: set[int],
     from reliquary.corpus.eval_draw import slot_count
     from reliquary.corpus.slots import parse_open_map
 
-    open_map, remote = None, {}
+    open_map, remote, extra = None, {}, {}
     if open_body is not None:
         try:
             open_map = parse_open_map(open_body)
-            remote = {int(k): set(v) for k, v in ((open_body.get("draw_slots") or {}).get("taken") or {}).items()}
+            hint = open_body.get("draw_slots") or {}
+            remote = {int(k): set(v) for k, v in (hint.get("taken") or {}).items()}
+            extra = {int(k): int(v) for k, v in (hint.get("cursors") or {}).items()}
         except (ValueError, TypeError, AttributeError):
-            open_map, remote = None, {}
+            open_map, remote, extra = None, {}, {}
         if open_map is not None and open_map.open_count == 0:
             return None
     slots = slot_count(job)
@@ -416,7 +418,8 @@ def pick_draw_slot(job, open_body, taken: dict[int, set[int]], closed: set[int],
     for prompt in range(job.prompt_start, job.prompt_end):
         if prompt in closed or (open_map is not None and not open_map.is_open(prompt)):
             continue
-        free = [k for k in range(slots) if k not in taken.get(prompt, ()) and k not in remote.get(prompt, ())]
+        free = [k for k in range(max(slots, extra.get(prompt, 0)))
+                if k not in taken.get(prompt, ()) and k not in remote.get(prompt, ())]
         if free:
             candidates.append((prompt, free[0]))
     return rng.choice(candidates) if candidates else None

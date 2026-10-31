@@ -151,6 +151,7 @@ class OpenPrompts:
         # A forced-draw job's draw slots: the validator's taken ones (a hint), and what this process filled,
         # learnt taken, or is running now, across its identities.
         self._remote_taken: dict[int, set[int]] = {}
+        self._remote_cursors: dict[int, int] = {}
         from reliquary.miner.forced_draw import TakenSlots
 
         self._taken = TakenSlots()
@@ -201,10 +202,11 @@ class OpenPrompts:
                 return
             self._map = parsed
             try:
-                taken = ((body.get("draw_slots") or {}).get("taken") or {})
-                self._remote_taken = {int(k): {int(x) for x in v} for k, v in taken.items()}
+                hint = body.get("draw_slots") or {}
+                self._remote_taken = {int(k): {int(x) for x in v} for k, v in (hint.get("taken") or {}).items()}
+                self._remote_cursors = {int(k): int(v) for k, v in (hint.get("cursors") or {}).items()}
             except (AttributeError, TypeError, ValueError):
-                self._remote_taken = {}
+                self._remote_taken, self._remote_cursors = {}, {}
 
     def take_draw_slot(self, job, rng) -> tuple[int, int] | None:
         """A (prompt, draw slot) to run now: a random open prompt with a slot no one filled or runs, its lowest.
@@ -218,7 +220,8 @@ class OpenPrompts:
         candidates = []
         for prompt in prompts:
             busy = local.get(prompt, set()) | self._remote_taken.get(prompt, set())
-            free = [k for k in range(slots) if k not in busy and (prompt, k) not in self._running]
+            free = [k for k in range(max(slots, self._remote_cursors.get(prompt, 0)))
+                    if k not in busy and (prompt, k) not in self._running]
             if free:
                 candidates.append((prompt, free[0]))
         if not candidates:
