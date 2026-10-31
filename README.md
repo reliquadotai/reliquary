@@ -1,16 +1,16 @@
 <p align="center">
-  <a href="https://www.reliqua.ai">
+  <a href="https://www.reliqua.ai/">
     <img
       src="docs/assets/readme/reliquary-hero.svg"
-      alt="Reliquary — verified frontier search for decentralized model training"
+      alt="Reliquary — asynchronous RL, verified training data and evaluation on Bittensor Subnet 81"
       width="100%"
     />
   </a>
 </p>
 
 <p align="center">
-  <strong>Verified frontier search for decentralized language-model training.</strong><br />
-  Sixteen trajectories per prompt. Validator-authoritative rewards. Public evidence at every boundary.
+  <strong>Permissionless post-training on a distributed GPU network.</strong><br />
+  Asynchronous reinforcement learning · Verified SFT data generation · Model evaluation
 </p>
 
 <p align="center">
@@ -24,185 +24,240 @@
     <img alt="Validator image" src="https://github.com/reliquadotai/reliquary/actions/workflows/docker-image.yml/badge.svg?branch=main" />
   </a>
   <a href="LICENSE.md">
-    <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-e87a3e" />
+    <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue" />
   </a>
 </p>
 
 <p align="center">
-  <a href="https://www.reliqua.ai/dashboard">Live dashboard</a>
-  ·
-  <a href="https://www.reliqua.ai/research">Research</a>
-  ·
-  <a href="https://huggingface.co/Qwen/Qwen3-4B-Base">Base model</a>
-  ·
-  <a href="https://github.com/orgs/reliquadotai/packages/container/package/reliquary-validator">Container</a>
-  ·
-  <a href="docs/mining.md">Mine</a>
-  ·
-  <a href="docs/validating.md">Validate</a>
+  <a href="https://www.reliqua.ai/">Website</a>
+  · <a href="https://app.reliqua.ai/monitoring/run">Training dashboard</a>
+  · <a href="https://app.reliqua.ai/monitoring/miner">RL miner dashboard</a>
+  · <a href="https://app.reliqua.ai/docs">Mining documentation</a>
+  · <a href="https://www.reliqua.ai/research">Research</a>
 </p>
 
 ---
 
 Reliquary is the open protocol and reference implementation for decentralized
-GRPO training on Bittensor subnet 81. Independent miners spend their own GPU
-compute searching for prompts at the policy's learning frontier. The trainer
-admits, ranks, verifies, rewards, and—when the safety gates permit—trains on the
-best groups.
+AI post-training on **Bittensor Subnet 81**. Independent miners contribute GPU
+compute to generate training data, produce RL rollouts and run evaluations.
+Validators check the work against the declared model and task; verified
+contributions feed training and the subnet's reward accounting.
 
-The key incentive shift is simple: miners are not paid for producing the most
-rollouts. They compete to contribute verified rollout groups the trainer can
-use.
+The Teutonic post-training workflow combines verified miner-generated SFT data
+with subsequent RL. Each run binds its own model, environments and checkpoint
+lineage.
 
-## V1.0 miner migration
+The network can use spare GPU capacity wherever it is available. In async RL,
+miners work at their own pace and synchronize checkpoints in the background;
+fast machines do not wait for a fleet-wide generation round. A machine can
+join or leave between completed jobs, while prompt leases bound the work it
+has already committed to deliver.
 
-Adapt your existing miner deployment; no separate starter package is required.
-Stop the old miner before starting V1 and preserve your registered hotkey,
-miner state directory and Hugging Face cache.
+## Workloads
 
-Use the pinned miner image (the controller has additional server-only fixes):
+| Workload | What miners do | Verification and result |
+| --- | --- | --- |
+| **Asynchronous RL** | Lease prompts, generate rollout groups from a recent checkpoint, and submit single-turn answers or multi-turn tool episodes. | Validator-authoritative rewards; token verification and correction before the GRPO update; checkpoint publication and matched-token reward accounting. |
+| **SFT data generation** (`corpus-generation`) | Generate completions or agentic trajectories from a job's frozen model and prompt source. | Contract-bound TOPLOC proofs and audit policy; verified tokens are settled and delivered as a dataset for training. This is data generation, not an optimizer running on every miner. |
+| **Model evaluation** | Produce samples for a frozen evaluation set and model under the job's sampling contract. | Evaluation jobs audit every completion, enforce their declared draw, and grade results for comparable reports and benchmark feeds. |
 
-```sh
-docker pull ghcr.io/reliquadotai/reliquary-validator:sha-3b3af1d-logic@sha256:7bb847499605308b1ad7b21f5430b1662eae506deacb6899d682bc0c11ce2742
-```
+These are supported code paths, not a promise that every workload or environment
+is accepting work at a given moment. The task registry, published contracts and
+validator responses determine what is active, its model, limits and emission cap.
+The repo is not tied to the former Qwen3-4B migration or one historical run.
 
-Set these variables **inside your existing miner service or container**:
+RL runs can combine mathematics, competitive code and instruction following
+with sandboxed agent tasks such as software repair and terminal work. The
+enabled environment IDs and their budgets come from the run's contract.
 
-```dotenv
-RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-reliquary-v1
-RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED=1
-RELIQUARY_TRAINING_RUN_ID=qwen3-4b-base-dapo-reliquary-v1-20260910
-```
-
-Keep your existing GPU selection, wallet mounts and persistent state/cache
-paths. Inside that configured environment, adapt your existing miner command:
-
-```sh
-reliquary mine \
-  --network finney --netuid 81 \
-  --wallet-name YOUR_EXISTING_WALLET \
-  --hotkey YOUR_REGISTERED_HOTKEY \
-  --wallet-path YOUR_EXISTING_WALLET_DIRECTORY \
-  --validator-url http://62.238.81.36:8000 \
-  --environments openmathinstruct,opencodeinstruct,reliquary_logic_v2
-```
-
-Choose any nonempty subset of **Math** (`openmathinstruct`), **Code**
-(`opencodeinstruct`) and **Logic** (`reliquary_logic_v2`). Running all three is
-optional. Use one miner process per hotkey/state directory.
-
-Before starting, follow the current operator notice and check readiness:
-
-```sh
-curl --fail --silent --show-error --max-time 10 http://62.238.81.36:8000/readyz
-curl --fail --silent --show-error --max-time 10 http://62.238.81.36:8000/state
-```
-
-A failed readiness check or HTTP 503 means keep the miner paused. This README
-is configuration guidance, not a live GO notice. The initial V1 checkpoint is
-**N1812**, repository `ReliquaryForge/qwen3-4b-base-dapo-v4`, revision
-`6c3f02be8e720d3ccfd1bd320de8ea7f864a04e6`. Follow the validator's advertised
-successor checkpoints automatically; do not permanently pin N1812 or delete
-checkpoint identity records to bypass a mismatch.
-
-V1 uses **fill-closed windows**. Follow the deadlines and phase in `/state`:
-windows may close underfilled, and an upload acknowledgement is not a final
-proof, selection or payment verdict. No extra controller bounded-service flag
-is needed on miners. See [Mining](docs/mining.md) for the submission lifecycle.
-
-Logic uses a pinned integration with the **Prime Intellect Verifiers format
-for supported environment contracts**. This supports further integrations;
-it does not certify every Prime environment.
-
-## Legacy auction profile loop
-
-The fixed-window values below describe the legacy auction profiles. For V1
-configuration and fill-closed timing, use the migration instructions above and
-the validator's advertised runtime state.
+## How asynchronous RL works
 
 <p align="center">
   <img
     src="docs/assets/readme/protocol-loop.svg"
-    alt="Reliquary protocol loop: mine, grade, rank, prove, accumulate, train, and publish"
+    alt="Async RL loop: lease prompts, generate rollouts, grade submissions, verify and correct tokens, train, publish and settle"
     width="100%"
   />
 </p>
 
-1. **Collect.** Math and Code each accept up to 96 productive candidates. The
-   100-second profile value is a hard ceiling; a GPU-aware quiet/drain check may
-   close from 60 seconds onward, after the primary 64-candidate population.
-   Every group contains exactly 16 rollouts.
-2. **Grade.** The validator recomputes Math rewards and executes Code cases in
-   its sandbox. Groups below the reward-variance gate are rejected.
-3. **Rank.** In-zone groups rank by
-   `std(rewards) × (1 − mean(rewards))`; equal values use a capped throughput
-   bucket, then a post-seal drand tie-break. Validator-observed arrival is used
-   once, as the throughput denominator, not again as a second speed preference.
-4. **Prove.** Economic proof runs top-down only for candidates that can still
-   win. A bounded, unpaid non-winner sample is also proven for forensic
-   telemetry and cannot affect the auction.
-5. **Select and reward.** At most 16 content-distinct groups win per
-   environment. Each winner receives one uniform slot. There is no active
-   runner-up split or per-operator winner cap; unfilled slots burn.
-6. **Retain and train.** Clean winners accumulate under one exact public
-   checkpoint until both environment targets are full. Quarantined selections
-   remain archived and credited but never enter the optimizer.
-7. **Publish.** Accepted optimizer steps produce a Hugging Face checkpoint. The
-   default cadence is 16 trained steps, with an earlier safe publication when
-   the behavior-policy drift gate requires it.
+1. **Lease work.** A registered miner reserves prompts within its measured
+   quota. Leases have deadlines; requesting more than the machine can return
+   reduces useful throughput and can reduce its quota. Explicitly forfeiting
+   a lease is not a free way to reroll a prompt.
+2. **Generate.** The miner uses the run's checkpoint and reproducible forced
+   Gumbel sampling. The reference async miner generates 16 rollouts per lease.
+   Episode environments additionally bind the tool harness and sandbox contract.
+3. **Grade and route.** The validator recomputes rewards. Groups with a useful
+   learning signal enter the training buffer; out-of-zone first scans follow
+   a separate audit and payment policy. An accepted upload is not a final
+   training or payment verdict.
+4. **Verify and correct.** The trainer checks the submitted token choices
+   against its own forward pass. Match thresholds gate participation;
+   token substitution corrects numerical differences before training.
+   Termination and reward changes are also checked. This is the async RL
+   verification path, distinct from corpus TOPLOC proofs and legacy GRAIL.
+5. **Train asynchronously.** The detached trainer builds a batch from eligible
+   groups, performs the GRPO update and reports verification outcomes.
+   Checkpoint-lag limits keep excessively stale work out of training.
+6. **Publish and settle.** Signed checkpoint indexes expose hashed anchors and
+   deltas through short-lived R2 download URLs. Miners sync the next weights;
+   the ledger accrues eligible work and publishes period settlements for the
+   subnet's weight calculation.
 
-The normative mechanism and rejection semantics live in
-[Concepts](docs/concepts.md). Historical design documents are evidence of how
-the protocol evolved; they are not the production contract.
+The goal is to let heterogeneous GPUs contribute without letting differences
+in their inference numerics destabilize training. Permissionless participation
+still requires enough memory for the model and context, a compatible runtime,
+and compliance with the run's verification rules.
 
-## Feature status
+### Rewards
 
-Runtime availability is reported by `/readyz`; this table is not a GO notice.
+Async RL pays eligible trained rollouts by **matched tokens**, at the
+environment's token price, rather than by a miner's claimed GPU model or raw
+submission count. First scans outside the learning zone have their own reduced
+reward rule. Task caps, audit outcomes, bans and settlement rules constrain the
+final emission share; an accrual is not a guaranteed on-chain payout.
 
-| Layer | State |
+Corpus jobs account for verified tokens under their own audit and settlement
+policy. Use the task's published cap and the miner's settled share to interpret
+rewards. Neither token accounting nor a declared GPU count is a GPU-rental price
+or a guaranteed dollar return.
+
+## Start mining
+
+Start with the [mining documentation](https://app.reliqua.ai/docs) and the
+operator's current task announcement. Use the runtime or image qualified for
+that task's contract: the CPU development setup below is not a GPU installation
+recipe, and a historical container tag is not a current compatibility guarantee.
+Keep the miner's work directory persistent across restarts.
+
+### Async RL miner
+
+The following is a command template for an installed, compatible runtime. Set
+`RL_ENVIRONMENTS` to a comma-separated subset of the run's advertised environment
+IDs, and set `VALIDATOR_URL` and `VALIDATOR_HOTKEY` from its operator announcement.
+The validator hotkey is its **public SS58 address**; the miner hotkey below is
+the name of your existing identity registered on SN81.
+
+```bash
+reliquary mine-async \
+  --validator-url "$VALIDATOR_URL" \
+  --validator-hotkey "$VALIDATOR_HOTKEY" \
+  --wallet-name YOUR_WALLET \
+  --hotkey YOUR_REGISTERED_HOTKEY \
+  --environments "$RL_ENVIRONMENTS" \
+  --work-dir ./rl-async-work
+```
+
+Omit **both** validator options to discover the validator through the metagraph.
+With an explicit URL, its public hotkey is required to bind signed requests to
+the intended validator. The miner syncs the published checkpoint anchors and
+deltas; do not reuse a model revision or protocol profile from an older run.
+
+`reliquary mine-async --help` lists generation batching, lease and queue limits,
+context length, memory utilization, quantization and episode-engine options.
+Choose settings that fit the card **and** pass the run's verification rules;
+quantization support alone does not establish eligibility. For episode tasks,
+also install the exact advertised environment/harness dependencies.
+
+`--share-setup` optionally reports hardware information for observability.
+These are **declared GPU specifications**, not hardware attestation, and are
+never used as proof of useful work or as a direct scoring input.
+
+### Corpus and evaluation miner
+
+Select a job served by the corpus validator; each process mines one job:
+
+```bash
+reliquary corpus mine \
+  --validator-url "$CORPUS_VALIDATOR_URL" \
+  --job-id "$JOB_ID" \
+  --wallet-name YOUR_WALLET \
+  --hotkey YOUR_REGISTERED_HOTKEY
+```
+
+The miner reads the served job and contract, checks the checkpoint fingerprint
+and generates its TOPLOC proofs. Agentic corpus jobs use
+`reliquary corpus mine-agentic`; check its help for the required validator and
+harness options. Read one public hotkey's job status without loading a wallet:
+
+```bash
+reliquary corpus status \
+  --validator-url "$CORPUS_VALIDATOR_URL" \
+  --job-id "$JOB_ID" \
+  --hotkey "$MINER_SS58_ADDRESS"
+```
+
+This reports audit state, accepted/pending/passed/failed submissions, recent
+audit failures and available settlement information.
+
+## Validators, training and environments
+
+- **Controller:** owns the declared task, prompt leases, admission, grading,
+  submission state, reward ledger and public RL routes. Async mode is selected
+  with `RELIQUARY_RL_MODE=async` and requires a task declared with
+  `reliquary tasks create --rl-async`.
+- **Detached trainer:** `reliquary train-async` consumes the controller's buffer,
+  verifies tokens, runs optimizer steps and publishes checkpoints. Its
+  authenticated trainer listener is separate from the public mining API and
+  belongs on loopback or a private network. See the
+  [trainer command](reliquary/cli/main.py) for its environment variables.
+- **Weight-only validators:** read task settlement archives, compute the
+  scoring signal and submit subnet weights without running the optimizer.
+- **Environment packages:** define task generation, tool interaction and
+  authoritative grading. New environment source lives in
+  [reliquary-environments](https://github.com/reliquadotai/reliquary-environments);
+  execution isolation and the shared harness live in
+  [reliquary-sandbox](https://github.com/reliquadotai/reliquary-sandbox).
+  Installing an environment does not activate it: the run must declare its
+  pinned identity and pass the relevant qualification gates.
+
+Deployment requires the run's task declaration, compatible model/runtime,
+storage, sandbox and signing configuration. Use the operator runbooks and
+qualified release before starting a production workload.
+
+## Follow the work
+
+The [training dashboard](https://app.reliqua.ai/monitoring/run) presents run
+progress, benchmark results, training health and declared GPU participation.
+The [RL miner dashboard](https://app.reliqua.ai/monitoring/miner) exposes
+available hotkey-level performance and diagnostics.
+
+The async validator provides these read-only surfaces:
+
+| Route | Purpose |
 | --- | --- |
-| V1 profile: fill-closed windows with Math, Code and Logic | Configuration above; follow operator notices and runtime readiness |
-| Qwen3-4B Base DAPO reasoning-v5 profile, deferred-proof auction, and GRAIL verification | **Release candidate — runtime gates pending** |
-| Mixed OpenMath + OpenCode collection and validator-authoritative rewards | **Live** |
-| Canonical prompt-content identity and one-shot cooldown | **Live** |
-| Utility telemetry | **Live, observation only** |
-| Behavior descriptors and a novelty archive | **Not deployed** |
-| Novelty-shaped ranking, rewards, or training loss | **0% influence** |
+| `GET /rl/checkpoint` | Signed checkpoint index and expiring anchor/delta download URLs. |
+| `GET /rl/quota?hotkey=<SS58>` | The miner's quota and its explanation. |
+| `GET /rl/pay?hotkey=<SS58>` | Environment prices and the hotkey's ledger state. |
+| `GET /rl/prompts/state` | Prompt lifecycle, scans and cooldown state. |
+| `GET /rl/observations` | Signed observation segments for network monitoring. |
+| `GET /rl/benchmarks?run_id=<RUN_ID>` | Published benchmark feed for that native run; unavailable until a feed exists. |
+| `GET /rl/episodes` | Advertised episode contracts, when the run includes episode environments. |
 
-The observation-only utility foundation does not alter admission, ranking,
-selection, payout, or training. Its activation gates are documented in
-[Auction v3 Utility Foundation](docs/auction-v3-utility-foundation.md).
-Change the v5 row to **Live** only at the coordinated runtime activation. See
-the [reasoning-prompt v5 cutover](docs/reasoning-prompt-v5-cutover.md) for the
-fresh-baseline and deployment gates.
+The optional `GET /rl/miner-submissions?run_id=<RUN_ID>` journal is disabled by
+default and requires an operator-qualified export boundary. When enabled it
+returns a bounded recent history, not every historical request. See
+[submission journal configuration](docs/rl-async-qualification.md#optional-miner-submission-journal).
 
-## Trust and verification boundaries
+### Trust boundaries
 
-Reliquary is auditable, but it is not currently trustless:
-
-- The production trainer owns checkpoint publication and is authoritative for
-  reward computation, selection, quarantine, and optimizer execution.
-- GRAIL sketches, signed submissions, and validator recomputation provide
-  evidence that selected rollouts match their announced checkpoint. They do
-  not prove that the optimizer or the validator's policy is correct.
-- A signed checkpoint manifest binds a checkpoint number to an immutable
-  Hugging Face revision. It is an authenticated announcement, not a proof of
-  every training transition.
-- Weight-only validators replay the public archive into the scoring signal.
-  Multi-trainer checkpoint consensus is not implemented.
-
-These boundaries are intentional and explicit while the network bootstraps.
-The dashboard, model revisions, window archives, and security reports expose
-the evidence needed to evaluate them.
+Reliquary publishes evidence, but is **not fully trustless**. The controller
+and trainer remain authoritative for grading, token checks, optimizer execution
+and checkpoint publication. Signed submissions and checkpoint indexes
+authenticate identities and artifact hashes; they do not prove an optimizer
+transition or an unforgeable GPU identity. There is no multi-trainer checkpoint
+consensus. Qualification measurements describe the configurations tested, not
+every GPU or future run.
 
 ## Local development
 
-The following matches the CPU environment used by the validator test workflow:
+The following matches the Linux CPU baseline in
+[validator CI](.github/workflows/validator-tests.yml):
 
 ```bash
 git clone https://github.com/reliquadotai/reliquary.git
 cd reliquary
-
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -213,23 +268,30 @@ python -m pip install -e ".[dev]"
 pytest -q \
   --ignore=tests/gpu \
   --ignore=tests/integration/test_grader_e2e.py \
-  --disable-warnings
+  --ignore=tests/unit/test_corpus_split_e2e.py
 ```
 
-Mining and training require the pinned inference stack and suitable NVIDIA
-hardware; the CPU setup above is for development and tests. Start with the
-[miner guide](docs/mining.md) or [validator guide](docs/validating.md) before
-running an operator workload.
+CI runs the corpus split end-to-end tests separately and shards the remaining
+CPU suite. GPU generation/training, model qualification and sandbox integration
+need their own compatible hardware and runtime; passing CPU tests does not
+qualify a production deployment.
 
-## Documentation
+## Documentation and implementation
 
-| Guide | Purpose |
+| Reference | Scope |
 | --- | --- |
-| [Concepts](docs/concepts.md) | Current mechanism, incentives, verification, and economics |
-| [Mining](docs/mining.md) | Reference miner, submission lifecycle, hardware, and troubleshooting |
-| [Validating](docs/validating.md) | Weight-only and trainer deployment |
-| [Validator observability](docs/validator_observability.md) | Health, verdict, archive, and runtime evidence |
-| [Utility foundation](docs/auction-v3-utility-foundation.md) | Observation-only research surface and activation gates |
+| [CLI](reliquary/cli/main.py), [async miner](reliquary/miner/rl_async.py), [controller](reliquary/validator/rl_async_service.py), [trainer](reliquary/trainer/async_trainer.py) | Current async entry points and behavior. |
+| [Async RL design](docs/rl-async-design.md), [qualification record](docs/rl-async-qualification.md) | Design background and launch measurements/plans; dated values are not live configuration. |
+| [Corpus task launch](docs/runbooks/corpus-task-launch.md) | Declare, qualify, serve and settle a data-generation job. |
+| [Checkpoint evaluation](docs/runbooks/evaluation-on-our-validator.md) | Frozen sets, verified samples, grading and comparable reports. |
+| [Task lifecycle](docs/task-lifecycle.md) | Corpus admission, pause/resume, retirement and executor recovery. |
+| [Environment qualification](docs/standalone-environment-qualification.md), [episode bridge](docs/runbooks/rl-bridged-episode-envs.md) | Pinned environment integration and qualification; check which runtime a section targets. |
+
+**Historical documentation:** [Mining](docs/mining.md),
+[Concepts](docs/concepts.md) and [Validating](docs/validating.md) retain material
+about fixed windows, auctions, GRAIL and older model profiles. Do not apply those
+timings, selection rules or migration pins to `mine-async`. The current task
+contract and runtime take precedence.
 
 Project-wide policies:
 [Contributing](https://github.com/reliquadotai/.github/blob/main/CONTRIBUTING.md)
