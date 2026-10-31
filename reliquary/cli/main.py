@@ -2,6 +2,7 @@
 
 import asyncio
 import atexit
+import json
 import logging
 import math
 import os
@@ -1227,6 +1228,7 @@ def build_job_manifest(
     submit=None,
     episode=None,
     draw=None,
+    judge=None,
 ):
     """The manifest as the job store will hold it, refused unless every
     submission it will ever be paid for could be admitted.
@@ -1291,6 +1293,13 @@ def build_job_manifest(
         manifest["submit"] = submit
     if episode is not None:
         manifest["episode"] = episode
+    if judge is not None:
+        from reliquary.corpus.job import judge_field
+
+        # Some of a forced draw's judge thresholds, the others at their defaults; none written when all are.
+        field = judge_field(judge)
+        if field is not None:
+            manifest["judge"] = field
     # Resolving RENDERS the source's rule and BUILDING it counts its rows, and
     # both are refusals the operator would otherwise meet one submission at a
     # time: an unrenderable source fails fidelity forever, and a range
@@ -1358,7 +1367,7 @@ def prepare_corpus_job(
     min_new_tokens=2, temperature=1.0, top_p=1.0, top_k=0, n=1, grader_id=None,
     threshold=None, prompt_order="free", deadline_round=None, overrides=None,
     verification=None, seed=None, contract_environment=None, toploc_thresholds=None,
-    submit=None, episode=None, draw=None,
+    submit=None, episode=None, draw=None, judge=None,
 ):
     """The manifest and the registry entry `jobs create` writes, built and
     checked without writing either (the admin service declares jobs with it).
@@ -1420,6 +1429,7 @@ def prepare_corpus_job(
         submit=submit,
         episode=episode,
         draw=draw,
+        judge=judge,
     )
     entry = build_corpus_task_entry(
         task_id=task_id or job_id,
@@ -1668,6 +1678,11 @@ def jobs_create(
         help="Eval jobs: 'gumbel_max' forces every sample with the job's public draw (T=1, top-p 1, "
         "top-k 0), checked by the audit; omit for free sampling",
     ),
+    draw_judge: str = typer.Option(
+        None, "--draw-judge",
+        help="With --draw: the judge's thresholds as JSON, some of floor_rate, grace, gap_tolerance, terminal_gap "
+        "(the others at their defaults), e.g. '{\"floor_rate\": 0.95}'",
+    ),
     n: int = typer.Option(1, "--n", help="Completions per submitted slot"),
     grader_id: str = typer.Option(
         None, "--grader-id", help="Rejection sampling: what decides membership"
@@ -1792,6 +1807,7 @@ def jobs_create(
             n=n, grader_id=grader_id, threshold=threshold, prompt_order=prompt_order,
             deadline_round=deadline_round, overrides=overrides, verification=verification,
             contract_environment=contract_environment, seed=seed, episode=episode, draw=draw,
+            judge=json.loads(draw_judge) if draw_judge is not None else None,
         )
     except (RegistryError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)

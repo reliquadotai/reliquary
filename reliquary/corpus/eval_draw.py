@@ -42,6 +42,7 @@ REASON_DRAW_MISMATCH = "draw_mismatch"
 # measured 0.69 % at worst on H200, 2026-10-28), with up to EVAL_MATCH_GRACE misses allowed whatever its length
 # (never more than a quarter of it): honest short samples miss 2-2.5 % (live, 2026-10-28), a re-roll 30-50 %.
 # Nothing is substituted: a token changed would not fit the tokens after it.
+# Defaults of a job's ``judge`` (``corpus.job.DEFAULT_DRAW_JUDGE``), named here for the readers that predate it.
 EVAL_MATCH_FLOOR = 0.98
 # Gumbel score gaps (best score minus the submitted token's): honest misses on Qwen3.8-27B at T 1, 2026-10-31:
 # q99.9 0.64, max 2.9; half of all runner-up edits are over 4. The last token's is tighter (just over the honest
@@ -129,8 +130,10 @@ def match_rate(d) -> float:
     return exact / counted if counted else 0.0
 
 
-def allowed_misses(counted: int) -> int:
-    return max(min(EVAL_MATCH_GRACE, max(1, counted // 4)), math.floor((1 - EVAL_MATCH_FLOOR) * counted))
+def allowed_misses(counted: int, policy: Any = None) -> int:
+    grace, floor_rate = ((EVAL_MATCH_GRACE, EVAL_MATCH_FLOOR) if policy is None
+                         else (policy.grace, policy.floor_rate))
+    return max(min(grace, max(1, counted // 4)), math.floor((1 - floor_rate) * counted))
 
 
 def _gap(miss: float) -> float:
@@ -138,7 +141,7 @@ def _gap(miss: float) -> float:
     return -math.log1p(-miss) if miss < 1.0 else math.inf
 
 
-def judge(diags) -> tuple[bool, dict[str, Any]]:
+def judge(diags, policy: Any = None) -> tuple[bool, dict[str, Any]]:
     """One sample's verdict over its diagnostics (one per completion or trajectory). Every one must:
 
     * follow the draw: at most ``1 - EVAL_MATCH_FLOOR`` of its drawn positions missed, up to ``EVAL_MATCH_GRACE``
@@ -146,7 +149,11 @@ def judge(diags) -> tuple[bool, dict[str, Any]]:
     * carry no edit: every miss within ``EVAL_GAP_TOLERANCE`` of the pick's score (an honest miss is a near-tie;
       a token written in place of the draw is far from it);
     * end where the draw ended it: the last token within ``EVAL_TERMINAL_GAP`` (a sample cut short is not a
-      near-tie)."""
+      near-tie).
+
+    ``policy``: the job's ``corpus.job.DrawJudge``; None, the defaults."""
+    gap_tolerance, terminal_gap = ((EVAL_GAP_TOLERANCE, EVAL_TERMINAL_GAP) if policy is None
+                                   else (policy.gap_tolerance, policy.terminal_gap))
     worst: dict[str, Any] = {}
     for i, d in enumerate(diags):
         counted, exact = _counted(d)
@@ -156,9 +163,9 @@ def judge(diags) -> tuple[bool, dict[str, Any]]:
                   "max_gap": round(_gap(d.max_cdf_miss), 4), "last_gap": round(_gap(d.last_miss), 4)}
         if not worst or detail["match"] < worst["match"]:
             worst = detail
-        followed = counted > 0 and misses <= allowed_misses(counted)
-        if (not followed or _gap(d.max_cdf_miss) > EVAL_GAP_TOLERANCE
-                or _gap(d.last_miss) > EVAL_TERMINAL_GAP):
+        followed = counted > 0 and misses <= allowed_misses(counted, policy)
+        if (not followed or _gap(d.max_cdf_miss) > gap_tolerance
+                or _gap(d.last_miss) > terminal_gap):
             return False, detail
     return True, worst
 
