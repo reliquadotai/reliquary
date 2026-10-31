@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 import json
+import math
 import re
 from typing import Any
 
@@ -62,7 +63,33 @@ _JOB_FIELDS = (
 # manifest that predates it stores and hashes byte-identically. A binary that
 # predates it refuses a manifest carrying it (unknown field): miners and
 # validators of a job with ``prompt_start > 0`` need a build that knows it.
-_OPTIONAL_JOB_FIELDS = ("prompt_start", "seed", "submit", "episode")
+_OPTIONAL_JOB_FIELDS = ("prompt_start", "seed", "submit", "episode", "judge")
+# A forced-draw job's judge (``corpus.eval_draw.judge``): how far a sample may stray from its draw.
+_JUDGE_FIELDS = ("floor_rate", "grace", "gap_tolerance", "terminal_gap")
+MIN_JUDGE_FLOOR_RATE = 0.5
+MAX_JUDGE_GRACE = 64
+MAX_JUDGE_GAP = 64.0
+
+
+@dataclass(frozen=True, slots=True)
+class DrawJudge:
+    """The thresholds a forced-draw sample is judged under: at most ``1 - floor_rate`` of its drawn positions
+    missed (``grace`` misses always allowed, up to a quarter of a short sample), every miss within
+    ``gap_tolerance`` of the pick's Gumbel score, the last token within ``terminal_gap``."""
+
+    floor_rate: float
+    grace: int
+    gap_tolerance: float
+    terminal_gap: float
+
+    def to_contract(self) -> dict[str, Any]:
+        return {name: getattr(self, name) for name in _JUDGE_FIELDS}
+
+
+# Today's values: honest bf16 / fp32-head miners lose 0.1-0.3 % of samples on Qwen3.8-27B at every warp tested
+# (2026-10-31); a job that keeps them writes no ``judge`` and hashes as before.
+DEFAULT_DRAW_JUDGE = DrawJudge(floor_rate=0.98, grace=8, gap_tolerance=4.0, terminal_gap=3.0)
+
 # The one value of `submit`: submissions go to the job's own scoped route
 # (order jobs, on the order control); absent, to the legacy `/corpus/submit`.
 SUBMIT_SCOPED = "scoped"
@@ -158,6 +185,47 @@ def _check_split(split: Any, eval_job: bool) -> None:
         raise JobError(f"episode.env.split must be a split name, got {split!r}")
     if not eval_job and split != "train":
         raise JobError(f"episode.env.split must be 'train', got {split!r}")
+
+
+def _judge(raw) -> DrawJudge:
+    if "judge" not in raw:
+        return DEFAULT_DRAW_JUDGE
+    body = raw["judge"]
+    if not isinstance(body, Mapping) or set(body) != set(_JUDGE_FIELDS):
+        raise JobError(f"judge must be an object with exactly {list(_JUDGE_FIELDS)}, got {body!r}")
+    numbers = {}
+    for name in ("floor_rate", "gap_tolerance", "terminal_gap"):
+        value = body[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise JobError(f"judge.{name} must be a finite number, got {value!r}")
+        numbers[name] = float(value)
+    grace = body["grace"]
+    if isinstance(grace, bool) or not isinstance(grace, int) or not 0 <= grace <= MAX_JUDGE_GRACE:
+        raise JobError(f"judge.grace must be an integer in [0, {MAX_JUDGE_GRACE}], got {grace!r}")
+    if not MIN_JUDGE_FLOOR_RATE <= numbers["floor_rate"] <= 1.0:
+        raise JobError(f"judge.floor_rate must be in [{MIN_JUDGE_FLOOR_RATE}, 1], got {numbers['floor_rate']}")
+    for name in ("gap_tolerance", "terminal_gap"):
+        if not 0.0 < numbers[name] <= MAX_JUDGE_GAP:
+            raise JobError(f"judge.{name} must be in (0, {MAX_JUDGE_GAP}], got {numbers[name]}")
+    return DrawJudge(numbers["floor_rate"], grace, numbers["gap_tolerance"], numbers["terminal_gap"])
+
+
+def draw_judge_from(partial: Mapping[str, Any]) -> DrawJudge:
+    """A judge from some of its fields, the others at their defaults (``jobs create --draw-judge``, a suite set's
+    ``judge``); refused like a manifest's."""
+    if not isinstance(partial, Mapping):
+        raise JobError(f"a draw judge is an object, got {partial!r}")
+    unknown = sorted(set(partial) - set(_JUDGE_FIELDS))
+    if unknown:
+        raise JobError(f"a draw judge takes {list(_JUDGE_FIELDS)}, not {unknown}")
+    return _judge({"judge": {**DEFAULT_DRAW_JUDGE.to_contract(), **partial}})
+
+
+def judge_field(partial: Mapping[str, Any]) -> dict[str, Any] | None:
+    """A manifest's ``judge`` for these fields: the full block, or None when it is the defaults (never written,
+    so the manifest hashes as one that never named it)."""
+    judge = draw_judge_from(partial)
+    return None if judge == DEFAULT_DRAW_JUDGE else judge.to_contract()
 
 
 def _submit(raw) -> str | None:
@@ -319,6 +387,8 @@ class JobSpec:
     submit: str | None = None
     # Multi-turn agentic jobs only (spec §6); absent on every other job.
     episode: EpisodeSpec | None = None
+    # A forced-draw job's judge thresholds; written only when they differ from the defaults.
+    judge: DrawJudge = DEFAULT_DRAW_JUDGE
 
     @property
     def prompt_end(self) -> int:
@@ -373,6 +443,7 @@ class JobSpec:
             **({"prompt_start": self.prompt_start} if self.prompt_start else {}),
             **({"seed": self.seed} if self.seed is not None else {}),
             **({"submit": self.submit} if self.submit is not None else {}),
+            **({"judge": self.judge.to_contract()} if self.judge != DEFAULT_DRAW_JUDGE else {}),
             **({"episode": self.episode.to_contract()} if self.episode is not None else {}),
         }
 
@@ -749,6 +820,7 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
         ),
         seed=_non_negative_int(raw, "seed") if "seed" in raw else None,
         submit=_submit(raw),
+        judge=_judge(raw),
         episode=(_parse_episode(raw["episode"], is_eval_source(prompt_source))
                  if "episode" in raw else None),
     )
@@ -756,6 +828,8 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
         _check_episode_job(job)
     if job.sampling.draw is not None:
         _check_draw_job(job)
+    elif "judge" in raw:
+        raise JobError("judge sets a forced draw's thresholds: a job without sampling.draw has none to judge")
     return job
 
 
