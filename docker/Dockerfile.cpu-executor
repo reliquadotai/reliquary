@@ -1,8 +1,12 @@
 # syntax=docker/dockerfile:1.6
 ARG PYTHON_IMAGE=python:3.12-slim@sha256:090ba77e2958f6af52a5341f788b50b032dd4ca28377d2893dcf1ecbdfdfe203
 FROM ${PYTHON_IMAGE} AS grader-rootfs
+COPY scripts/bootstrap_python_trust.py /opt/bootstrap_python_trust.py
+RUN python /opt/bootstrap_python_trust.py --system
 
 FROM ${PYTHON_IMAGE}
+COPY scripts/bootstrap_python_trust.py /opt/bootstrap_python_trust.py
+RUN python /opt/bootstrap_python_trust.py --system
 
 ARG RELIQUARY_BUILD_REVISION=unknown
 ARG RUNSC_RELEASE=20260817
@@ -23,6 +27,7 @@ COPY docker/cpu-executor-requirements.lock /tmp/cpu-executor-requirements.lock
 RUN pip install --require-hashes --no-deps \
       --requirement /tmp/cpu-executor-requirements.lock \
  && rm -f /tmp/cpu-executor-requirements.lock
+RUN python /opt/bootstrap_python_trust.py --system
 
 # Pin a dated gVisor production release. Docker verifies the checksum committed
 # with this build rather than trusting a checksum downloaded beside the binary.

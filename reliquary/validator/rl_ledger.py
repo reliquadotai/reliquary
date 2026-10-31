@@ -35,8 +35,9 @@ its periods empty and their emission burned (teutonic-rl-async-v1, 2026-10-27: ~
 heartbeat (``trainer_beat``); a silence longer than ``outage_grace_s`` is an outage, counted from the last beat and
 for at most ``outage_max_s``. A period holding outage time pays each hotkey, on top of its accruals and under the
 same cap, its mean reward over the last ``OUTAGE_REFERENCE_PERIODS`` archives that were mostly not outage, times
-the share of the period the trainer was down. Before the first heartbeat nothing is filled. Every trainer-link call
-counts as a beat (``trainer_beat``, throttled). The validator's own downtime (``rl_validator_downtime``, written by
+the share of the period the trainer was down. Before the first heartbeat nothing is filled. Runtime trainer-link
+calls from the current owner count as a beat (``trainer_beat``, throttled); ownership renewal and startup checkpoint
+discovery do not declare the model ready. The validator's own downtime (``rl_validator_downtime``, written by
 the lease book) is cut out of the outages: the trainer could not reach it, and its late step report pays then. A
 piece shorter than the grace is dropped. With the fill on, a period settles ``outage_grace_s`` after its end at the
 earliest, so an outage at its very end is seen before it is archived.
@@ -154,7 +155,7 @@ class RlPayLedger:
         with self.book.transaction():
             db = self.book.db
             cursor = db.execute("SELECT seq FROM rl_pay_cursor WHERE id=0").fetchone()[0]
-            events = self.submissions.events(cursor)[:limit]
+            events = self.submissions.events(cursor, limit=limit)
             if not events:
                 return 0
             for event in events:
@@ -289,9 +290,8 @@ class RlPayLedger:
             return []
 
     def _outages(self, now: float) -> list[tuple[float, float]]:
-        """The trainer's outages: those recorded and the one going on (a silence longer than the grace, up to
-        ``now``), less the validator's own downtime, pieces shorter than the grace dropped, each cut to
-        ``outage_max_s``."""
+        """Recorded and ongoing trainer silences, limited to their first ``outage_max_s`` seconds, less the
+        validator's downtime; pieces shorter than the grace are dropped."""
         if not self.config.outage_fill:
             return []
         db = self.book.db
@@ -305,8 +305,10 @@ class RlPayLedger:
             pieces = [(s, e)]
             for ds, de in down:
                 pieces = [p for a, b in pieces for p in ((a, min(b, ds)), (max(a, de), b)) if p[1] > p[0]]
-            out += [(a, min(b, a + self.config.outage_max_s)) for a, b in pieces
-                    if b - a > self.config.outage_grace_s]
+            # Controller restarts do not reset the cap of the original trainer silence.
+            cutoff = min(e, s + self.config.outage_max_s)
+            out += [(a, min(b, cutoff)) for a, b in pieces
+                    if b - a > self.config.outage_grace_s and a < cutoff]
         return out
 
     def _outage_seconds(self, period: int, outages) -> float:

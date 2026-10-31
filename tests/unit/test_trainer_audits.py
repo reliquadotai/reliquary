@@ -53,6 +53,7 @@ def test_the_fused_head_projects_the_audit_rows_inside_its_own_call():
 class Source:
     def __init__(self, jobs, gone=()):
         self.jobs, self.gone, self.reported, self.asked = list(jobs), set(gone), {}, []
+        self.started, self.failures = [], []
 
     def take_audits(self, limit):
         self.asked.append(limit)
@@ -63,6 +64,14 @@ class Source:
             raise LookupError(lease_id)
         self.reported[lease_id] = result
         self.jobs = [j for j in self.jobs if j.lease_id != lease_id]
+
+    def start_audit(self, lease_id, attempt_id):
+        self.started.append((lease_id, attempt_id))
+        return True
+
+    def report_audit_failure(self, lease_id, attempt_id):
+        self.failures.append((lease_id, attempt_id))
+        return False
 
 
 class Job:
@@ -86,6 +95,22 @@ def test_the_trainer_loop_takes_judges_and_reports_within_its_budget():
     assert audits.metrics() == {"async/audits": 3.0, "async/audit_s": 30.0}
     assert audits.metrics() == {"async/audits": 0.0, "async/audit_s": 0.0}
     assert audits.run(object(), limit=0, budget_s=25.0) == 0 and source.asked == [4]
+
+
+def test_a_forward_failure_is_recorded_then_escapes_without_another_collective():
+    source = Source([Job("bad"), Job("next")])
+    forwarded = []
+
+    def fail(model, group):
+        assert source.started[-1][0] == group.lease_id     # durable claim precedes the forward
+        forwarded.append(group.lease_id)
+        raise RuntimeError("collective failed")
+
+    audits = TrainerAudits(source, audit_fn=fail)
+    with pytest.raises(RuntimeError, match="collective failed"):
+        audits.run(object(), limit=2, budget_s=25.0)
+    assert forwarded == ["bad"] and source.failures == source.started
+    assert source.reported == {} and audits.metrics()["async/audits"] == 0
 
 
 def _ragged(group, lengths):
@@ -124,3 +149,14 @@ def test_audits_are_taken_a_few_at_a_time_so_the_budget_leaves_little_downloaded
     assert source.asked == [2, 2, 2, 1]
     source.asked.clear()
     assert audits.run(object(), limit=7, budget_s=15.0) == 2 and source.asked == [2]
+
+
+def test_audit_chunks_stay_bounded_when_every_start_is_refused(monkeypatch):
+    from reliquary.trainer import audits as audits_module
+
+    monkeypatch.setattr(audits_module, "AUDIT_CHUNK", 2)
+    source = Source([Job("L0"), Job("L1")])
+    source.start_audit = lambda *args: False
+    audits = TrainerAudits(source, audit_fn=lambda *args: pytest.fail("a refused audit cannot run"))
+    assert audits.run(object(), limit=5, budget_s=1000.0) == 0
+    assert source.asked == [2, 2, 1]
