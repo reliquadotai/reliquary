@@ -151,7 +151,9 @@ class OpenPrompts:
         # A forced-draw job's draw slots: the validator's taken ones (a hint), and what this process filled,
         # learnt taken, or is running now, across its identities.
         self._remote_taken: dict[int, set[int]] = {}
-        self._taken: dict[int, set[int]] = {}
+        from reliquary.miner.forced_draw import TakenSlots
+
+        self._taken = TakenSlots()
         self._running: set[tuple[int, int]] = set()
 
     @property
@@ -210,11 +212,12 @@ class OpenPrompts:
         from reliquary.corpus.eval_draw import slot_count
 
         slots = slot_count(job)
+        local = self._taken.view(now=time.monotonic())
         prompts = (self._map.indices() if self._map is not None
                    else range(job.prompt_start, job.prompt_end))
         candidates = []
         for prompt in prompts:
-            busy = self._taken.get(prompt, set()) | self._remote_taken.get(prompt, set())
+            busy = local.get(prompt, set()) | self._remote_taken.get(prompt, set())
             free = [k for k in range(slots) if k not in busy and (prompt, k) not in self._running]
             if free:
                 candidates.append((prompt, free[0]))
@@ -227,7 +230,7 @@ class OpenPrompts:
     def end_draw_slot(self, prompt: int, slot: int, *, taken: bool) -> None:
         self._running.discard((prompt, slot))
         if taken:
-            self._taken.setdefault(prompt, set()).add(slot)
+            self._taken.add(prompt, slot, now=time.monotonic())
 
 
 class _SubmitDeadline(Exception):

@@ -610,7 +610,8 @@ def eval_auditor(**kwargs):
         # (a generation order's never does: today's corpus semantics)
 
         async def _record_failure(self, submission_id: str) -> None:
-            from reliquary.validator.corpus_service import record_prompt_failure
+            from reliquary.corpus.eval_draw import has_draw
+            from reliquary.validator.corpus_service import draw_failure_slot, record_prompt_failure
 
             if not self.reopen_slots or self.job is None or self.job_store is None:
                 return
@@ -619,7 +620,8 @@ def eval_auditor(**kwargs):
                 if record is None:
                     return
                 outcome = await record_prompt_failure(
-                    self.job_store, self.job, int(record["prompt_index"]), submission_id)
+                    self.job_store, self.job, int(record["prompt_index"]), submission_id,
+                    **(draw_failure_slot(record) if has_draw(self.job) else {}))
                 if outcome is False:
                     logger.warning("eval job %s: prompt %s exhausted its attempts",
                                    self._job_id, record["prompt_index"])

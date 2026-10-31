@@ -17,8 +17,9 @@ forward and refuses a sample that does not follow it (``judge``): a 0.98 match f
 A token that differs is never substituted (the tokens after it would not fit it); honest bf16 drift stays far under
 the floor.
 
-A draw slot is taken once (``slot_key`` joins the accepted digests). It ranges over the prompt's attempts
-(``SlotLedger.attempt_limit``), so a sample that failed its audit is replaced by the next slot's draw.
+A draw slot is taken once per attempt (``slot_key`` joins the accepted digests). A sample that failed its audit
+reopens its own slot, with the same draw, for any hotkey but the one that failed it, up to ``ATTEMPTS_PER_SLOT``
+attempts: the samples a job scores never depend on which ones failed or who mined them.
 """
 from __future__ import annotations
 
@@ -29,10 +30,7 @@ from typing import Any
 
 from reliquary.constants import (
     FORCED_SEED_GUMBEL_BOUNDARY_EPSILON,
-    FORCED_SEED_ROLLOUT_MIN_STOCH,
     FORCED_SEED_STOCHASTIC_MAXPROB,
-    RL_AUDIT_FORGERY_MISMATCH_POSITIONS,
-    RL_AUDIT_FORGERY_MISMATCH_TOLERANCE,
 )
 from reliquary.environment.forced_sampling import DRAW_GUMBEL_MAX, u_range
 
@@ -41,11 +39,15 @@ EVAL_DRAW_DOMAIN = "reliquary-eval-draw-v1"
 EVAL_DRAWS = (EVAL_DRAW,)
 REASON_DRAW_MISMATCH = "draw_mismatch"
 # The draw a sample must follow: at least this share of its stochastic positions exact (honest bf16 drift
-# measured 0.69 % at worst on H200, 2026-10-28), with EVAL_MATCH_GRACE misses allowed whatever its length so a
-# short sample is not refused for one honest near-tie. Nothing is substituted: a token changed would not fit the
-# tokens after it.
+# measured 0.69 % at worst on H200, 2026-10-28), with up to EVAL_MATCH_GRACE misses allowed whatever its length
+# (never more than a quarter of it): honest short samples miss 2-2.5 % (live, 2026-10-28), a re-roll 30-50 %.
+# Nothing is substituted: a token changed would not fit the tokens after it.
 EVAL_MATCH_FLOOR = 0.98
-EVAL_MATCH_GRACE = 2
+# Gumbel score gaps (best score minus the submitted token's): honest misses on Qwen3.8-27B at T 1, 2026-10-31:
+# q99.9 0.64, max 2.9; half of all runner-up edits are over 4. The last token's is tighter: an end is never a tie.
+EVAL_GAP_TOLERANCE = 4.0
+EVAL_TERMINAL_GAP = 1.0
+EVAL_MATCH_GRACE = 8
 REASON_DRAW_SLOT_TAKEN = "draw_slot_taken"
 REASON_BAD_CURSOR = "bad_cursor"
 
@@ -65,20 +67,27 @@ def draw_randomness(job: Any) -> str:
 
 
 def slot_count(job: Any) -> int:
-    """Draw slots a prompt has: one per attempt it may use (``SlotLedger.attempt_limit``)."""
-    from reliquary.corpus.slots import ATTEMPTS_PER_SLOT
-
-    return ATTEMPTS_PER_SLOT * int(job.slots_per_prompt)
+    """Draw slots a prompt has: one per sample. A failed one reopens with the same draw (``slot_key``'s attempt)."""
+    return int(job.slots_per_prompt)
 
 
 def rollout_index(job: Any, draw_slot: int, completion: int = 0) -> int:
     return int(draw_slot) * int(job.sampling.n) + int(completion)
 
 
-def slot_key(prompt_index: int, draw_slot: int) -> str:
-    """The seen key of a taken draw slot in the job's ledger: a digest like the others it sits with,
-    domain-separated so it never equals a completion's or a session's."""
-    return hashlib.sha256(f"{EVAL_DRAW_DOMAIN}/slot/{int(prompt_index)}/{int(draw_slot)}".encode()).hexdigest()
+def slot_key(prompt_index: int, draw_slot: int, attempt: int = 0) -> str:
+    """The seen key of a taken draw slot at one attempt in the job's ledger: a digest like the others it sits with,
+    domain-separated so it never equals a completion's or a session's. Attempt 0 keeps the first key's form."""
+    base = f"{EVAL_DRAW_DOMAIN}/slot/{int(prompt_index)}/{int(draw_slot)}"
+    return hashlib.sha256((base if not attempt else f"{base}/{int(attempt)}").encode()).hexdigest()
+
+
+def attempt_digests(prompt_index: int, draw_slot: int, attempt: int, digests) -> list[str]:
+    """A draw job's seen digests: the completion digests salted with their slot, attempt and position, so the
+    honest redo of a failed slot (the same tokens) is not a duplicate, and two equal completions of one slot
+    are not either (the draw fixes them; the slot key already makes each sample unique)."""
+    prefix = f"{EVAL_DRAW_DOMAIN}/sample/{int(prompt_index)}/{int(draw_slot)}/{int(attempt)}"
+    return [hashlib.sha256(f"{prefix}/{c}/{d}".encode()).hexdigest() for c, d in enumerate(digests)]
 
 
 def draw_context(job: Any, prompt_index: int, draw_slot: int, completion: int = 0) -> dict[str, Any]:
@@ -107,9 +116,10 @@ def diagnostics(logits, token_ids, u_values):
 
 
 def _counted(d) -> tuple[int, int]:
-    """(positions, exact) the floor reads: the stochastic ones when there are enough, else every drawn one."""
-    if d.n_stochastic >= FORCED_SEED_ROLLOUT_MIN_STOCH:
-        return d.n_stochastic, d.n_exact_match
+    """(positions, exact) the floor reads: every drawn position. Honest misses are near-ties, which stay near-ties
+    at any temperature, so a count over stochastic positions only would refuse more honest samples as the
+    temperature drops (measured on Qwen3.8-27B, 2026-10-31: 3.4 % at T 1, 21 % at T 0.7 / top_p 0.8, against
+    0.1-0.3 % over every position)."""
     return d.n_positions, d.n_drawn_exact_match
 
 
@@ -118,27 +128,36 @@ def match_rate(d) -> float:
     return exact / counted if counted else 0.0
 
 
+def allowed_misses(counted: int) -> int:
+    return max(min(EVAL_MATCH_GRACE, counted // 4), math.floor((1 - EVAL_MATCH_FLOOR) * counted))
+
+
+def _gap(miss: float) -> float:
+    """A Gumbel miss (``1 - exp(-gap)``) as its score gap; an impossible token is an infinite one."""
+    return -math.log1p(-miss) if miss < 1.0 else math.inf
+
+
 def judge(diags) -> tuple[bool, dict[str, Any]]:
     """One sample's verdict over its diagnostics (one per completion or trajectory). Every one must:
 
-    * follow the draw: at most ``1 - EVAL_MATCH_FLOOR`` of its counted positions missed, ``EVAL_MATCH_GRACE``
-      misses allowed in any case;
-    * carry no edit: no more hard mismatches at near-deterministic positions than the RL audit allows (a token no
-      draw produces where the model was sure was written afterwards)."""
+    * follow the draw: at most ``1 - EVAL_MATCH_FLOOR`` of its drawn positions missed, up to ``EVAL_MATCH_GRACE``
+      misses allowed in any case (a quarter of a shorter sample);
+    * carry no edit: every miss within ``EVAL_GAP_TOLERANCE`` of the pick's score (an honest miss is a near-tie;
+      a token written in place of the draw is far from it);
+    * end where the draw ended it: the last token within ``EVAL_TERMINAL_GAP`` (a sample cut short is not a
+      near-tie)."""
     worst: dict[str, Any] = {}
     for i, d in enumerate(diags):
         counted, exact = _counted(d)
         misses = counted - exact
-        deterministic = max(0, d.n_positions - d.n_stochastic)
-        allowance = RL_AUDIT_FORGERY_MISMATCH_TOLERANCE * max(
-            1, math.ceil(deterministic / RL_AUDIT_FORGERY_MISMATCH_POSITIONS))
         detail = {"completion": i, "match": round(exact / counted, 4) if counted else 0.0,
                   "positions": d.n_positions, "stochastic": d.n_stochastic, "misses": misses,
-                  "deterministic_misses": d.n_deterministic_hard_mismatch}
+                  "max_gap": round(_gap(d.max_cdf_miss), 4), "last_gap": round(_gap(d.last_miss), 4)}
         if not worst or detail["match"] < worst["match"]:
             worst = detail
-        followed = counted > 0 and misses <= max(EVAL_MATCH_GRACE, math.floor((1 - EVAL_MATCH_FLOOR) * counted))
-        if not followed or d.n_deterministic_hard_mismatch > allowance:
+        followed = counted > 0 and misses <= allowed_misses(counted)
+        if (not followed or _gap(d.max_cdf_miss) > EVAL_GAP_TOLERANCE
+                or _gap(d.last_miss) > EVAL_TERMINAL_GAP):
             return False, detail
     return True, worst
 
@@ -153,6 +172,6 @@ def parse_draw(raw: Mapping[str, Any]) -> str | None:
     return value
 
 
-__all__ = ["EVAL_DRAW", "EVAL_DRAW_DOMAIN", "REASON_BAD_CURSOR", "REASON_DRAW_MISMATCH", "REASON_DRAW_SLOT_TAKEN", "diagnostics", "draw_context",
+__all__ = ["EVAL_DRAW", "EVAL_DRAW_DOMAIN", "EVAL_GAP_TOLERANCE", "EVAL_TERMINAL_GAP", "REASON_BAD_CURSOR", "REASON_DRAW_MISMATCH", "REASON_DRAW_SLOT_TAKEN", "allowed_misses", "attempt_digests", "diagnostics", "draw_context",
            "draw_randomness", "has_draw", "judge", "match_rate", "parse_draw", "rollout_index", "slot_count",
            "slot_key", "uniforms"]

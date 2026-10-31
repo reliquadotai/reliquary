@@ -100,3 +100,23 @@ def forced_sampling_params(base: dict, draw: dict) -> dict:
 
 
 __all__ = ["DrawBinding", "EvalDrawBinding", "ForcedDraws", "LeaseDrawBinding", "forced_sampling_params"]
+
+
+class TakenSlots:
+    """The forced-draw slots this miner saw taken (accepted, or refused as taken), forgotten after ``ttl_s``: the
+    validator's open map is the truth and a failed slot reopens with the same draw, so a local mark only bridges the
+    open map's lag; kept forever it would hide a reopened slot until a restart."""
+
+    def __init__(self, ttl_s: float = 300.0) -> None:
+        self._ttl = float(ttl_s)
+        self._at: dict[tuple[int, int], float] = {}
+
+    def add(self, prompt: int, slot: int, *, now: float) -> None:
+        self._at[(int(prompt), int(slot))] = float(now)
+
+    def view(self, *, now: float) -> dict[int, set[int]]:
+        self._at = {key: at for key, at in self._at.items() if now - at <= self._ttl}
+        out: dict[int, set[int]] = {}
+        for prompt, slot in self._at:
+            out.setdefault(prompt, set()).add(slot)
+        return out

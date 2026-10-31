@@ -103,9 +103,9 @@ def test_admission_takes_a_free_draw_slot_once():
     assert _admit(job, taken, cursor=0, prompt_index=6).accepted
 
 
-def test_admission_refuses_a_cursor_past_the_prompts_attempts():
+def test_admission_refuses_a_cursor_past_the_prompts_slots():
     job = _job()
-    last = ATTEMPTS_PER_SLOT * job.slots_per_prompt - 1
+    last = job.slots_per_prompt - 1
     assert eval_draw.slot_count(job) == last + 1
     assert _admit(job, frozenset(), cursor=last).accepted
     refused = _admit(job, frozenset(), cursor=last + 1)
@@ -155,7 +155,7 @@ def test_edits_at_near_deterministic_positions_fail():
     ok, _ = eval_draw.judge([eval_draw.diagnostics(logits, tokens, u)])
     assert ok
     ok, detail = eval_draw.judge([eval_draw.diagnostics(logits, edited, u)])
-    assert not ok and detail["deterministic_misses"] == 3
+    assert not ok and detail["misses"] == 3 and detail["max_gap"] > eval_draw.EVAL_GAP_TOLERANCE
 
 
 def test_one_bad_completion_fails_the_submission():
@@ -275,21 +275,135 @@ def _diag(**fields):
     return SeedConsistencyDiagnostics(**fields)
 
 
-@pytest.mark.parametrize("stochastic, exact, ok", [
-    (4809, 4776, True),       # the worst honest drift measured on H200 (0.69 %)
-    (5000, 4900, True),       # 2 %: the floor
+@pytest.mark.parametrize("positions, exact, ok", [
+    (9618, 9585, True),       # the worst honest drift measured on H200 (0.69 % of stochastic positions)
+    (5000, 4900, True),       # 2 % of every drawn position: the floor
     (5000, 4899, False),
-    (36, 35, True),           # a short sample: one honest near-tie is not a refusal
-    (36, 34, True),           # EVAL_MATCH_GRACE
-    (36, 33, False),
+    (36, 35, True),           # a short sample: a few honest near-ties are not a refusal
+    (36, 28, True),           # EVAL_MATCH_GRACE
+    (36, 27, False),
+    (290, 284, True),         # live honest refusals at the old grace of 2 (2026-10-28)
+    (24, 18, True),           # a quarter of a shorter sample, at most
+    (24, 17, False),
 ])
-def test_the_match_floor_is_two_percent_with_a_grace_for_short_samples(stochastic, exact, ok):
-    d = _diag(n_positions=stochastic * 2, n_stochastic=stochastic, n_exact_match=exact,
-              n_drawn_exact_match=stochastic + exact)
+def test_the_match_floor_is_two_percent_of_every_drawn_position(positions, exact, ok):
+    d = _diag(n_positions=positions, n_stochastic=positions // 2, n_drawn_exact_match=exact)
     assert eval_draw.judge([d])[0] is ok
 
 
-def test_a_sample_with_too_few_stochastic_positions_is_judged_on_every_one():
-    assert eval_draw.judge([_diag(n_positions=10, n_stochastic=3, n_exact_match=3, n_drawn_exact_match=8)])[0]
-    assert not eval_draw.judge([_diag(n_positions=10, n_stochastic=3, n_exact_match=3, n_drawn_exact_match=7)])[0]
-    assert not eval_draw.judge([_diag()])[0]               # nothing drawn: nothing verified
+def test_a_low_temperature_sample_is_not_refused_for_having_few_stochastic_positions():
+    """Honest misses are near-ties, which stay near-ties at any temperature, while the stochastic positions shrink:
+    over stochastic positions only, 10 misses in 300 is 3.3 %; over the 1,000 drawn positions it is 1 %."""
+    d = _diag(n_positions=1000, n_stochastic=300, n_exact_match=290, n_drawn_exact_match=990)
+    assert eval_draw.judge([d])[0]
+
+
+def test_a_miss_far_from_the_pick_is_an_edit_whatever_the_count():
+    import math
+
+    honest = 1 - math.exp(-0.6)         # an honest near-tie (honest gaps q99.9 0.64, max 2.9 on the 27B)
+    edit = 1 - math.exp(-5.0)
+    base = dict(n_positions=1000, n_stochastic=500, n_drawn_exact_match=999)
+    assert eval_draw.judge([_diag(**base, max_cdf_miss=honest)])[0]
+    ok, detail = eval_draw.judge([_diag(**base, max_cdf_miss=edit)])
+    assert not ok and detail["max_gap"] > eval_draw.EVAL_GAP_TOLERANCE
+
+
+def test_an_end_the_pick_did_not_make_is_refused():
+    import math
+
+    base = dict(n_positions=1000, n_stochastic=500, n_drawn_exact_match=999)
+    assert eval_draw.judge([_diag(**base, last_miss=1 - math.exp(-0.5))])[0]
+    ok, detail = eval_draw.judge([_diag(**base, last_miss=1 - math.exp(-2.0))])
+    assert not ok and detail["last_gap"] > eval_draw.EVAL_TERMINAL_GAP
+
+
+def test_nothing_drawn_is_nothing_verified():
+    assert not eval_draw.judge([_diag()])[0]
+
+
+def test_the_diagnostics_carry_the_last_positions_miss():
+    from reliquary.environment.forced_sampling import DRAW_GUMBEL_MAX, seed_consistency_diagnostics
+
+    logits = _logits(12, peaked=0.0)
+    u = [((i * 7919) % 1000) / 1000.0 for i in range(12)]
+    tokens = pick_rows(logits, u, draw=DRAW_GUMBEL_MAX).tolist()
+    honest = seed_consistency_diagnostics(logits, tokens, u, t=1.0, top_k=0, top_p=1.0, stochastic_threshold=0.99,
+                                          boundary_epsilon=0.05, draw=DRAW_GUMBEL_MAX)
+    assert honest.last_miss == 0.0
+    cut = tokens[:-1] + [(tokens[-1] + 1) % logits.shape[1]]
+    edited = seed_consistency_diagnostics(logits, cut, u, t=1.0, top_k=0, top_p=1.0, stochastic_threshold=0.99,
+                                          boundary_epsilon=0.05, draw=DRAW_GUMBEL_MAX)
+    assert edited.last_miss > 0.0
+
+
+class _Verdicts:
+    """The auditor's record store: submissions, create-only verdicts."""
+
+    def __init__(self, submissions):
+        self.submissions, self.verdicts = submissions, {}
+
+    async def write_verdict(self, job_id, submission_id, verdict):
+        if submission_id in self.verdicts:
+            return False
+        self.verdicts[submission_id] = verdict
+        return True
+
+    async def read_verdict(self, job_id, submission_id):
+        return self.verdicts.get(submission_id)
+
+    async def read_submission(self, job_id, submission_id):
+        return self.submissions.get(submission_id)
+
+    async def list_verdict_ids(self, job_id):
+        return list(self.verdicts)
+
+
+def _draw_auditor(job, records, slot_store):
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    auditor = CorpusAuditor.__new__(CorpusAuditor)
+    auditor._job_id, auditor._draw_job, auditor._records, auditor._slot_store = job.job_id, job, records, slot_store
+    auditor._on_verdict = None
+    auditor._mark_judged = lambda submission_id: None
+    return auditor
+
+
+def test_a_failed_draw_sample_reopens_its_prompts_slot(monkeypatch):
+    """Else the prompt stays full without the sample and the job never completes."""
+    import asyncio
+
+    from reliquary.infrastructure import corpus_job_store as job_store
+    from reliquary.infrastructure.corpus_job_store import BucketJobStore
+    from reliquary.validator.corpus_service import rebuild_ledgers
+    from tests.unit.test_corpus_job_store import _FakeMultiObjectR2
+
+    monkeypatch.setattr(job_store, "get_s3_client", lambda **kw: _FakeMultiObjectR2())
+    store, job = BucketJobStore(), _job()
+    bad, good = "b" * 64, "a" * 64
+    records = _Verdicts({bad: {"prompt_index": 2}, good: {"prompt_index": 3}})
+    auditor = _draw_auditor(job, records, store)
+
+    async def capacity(index):
+        snapshot, _ = await store.read_ledgers(job.job_id)
+        return rebuild_ledgers(job, snapshot).slots.capacity(index)
+
+    async def go():
+        await auditor._write(good, {"passed": True})
+        await auditor._write(bad, {"passed": False, "reason": eval_draw.REASON_DRAW_MISMATCH})
+        assert await capacity(2) == job.slots_per_prompt + 1
+        assert await capacity(3) == job.slots_per_prompt
+        # A restart records nothing twice.
+        assert await auditor.reconcile_failures() == 1
+        assert await capacity(2) == job.slots_per_prompt + 1
+
+    asyncio.run(go())
+
+
+def test_a_free_job_never_reopens_a_slot():
+    import asyncio
+
+    records = _Verdicts({"b" * 64: {"prompt_index": 2}})
+    auditor = _draw_auditor(_job(), records, None)
+    asyncio.run(auditor._write("b" * 64, {"passed": False}))
+    assert asyncio.run(auditor.reconcile_failures()) == 0

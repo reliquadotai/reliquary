@@ -151,7 +151,7 @@ class CorpusAuditor:
                  scorer: Callable | None = None,
                  vocab_size: int | None = None,
                  arrivals_covered: Callable[[], float | None] | None = None,
-                 prefetch_rounds: bool = True, draw_job=None) -> None:
+                 prefetch_rounds: bool = True, draw_job=None, slot_store=None) -> None:
         # Fetch, in the background, every drand round the pending records need.
         self._prefetch = prefetch_rounds
         self._job_id = job_id
@@ -160,6 +160,9 @@ class CorpusAuditor:
         self._draw_job = draw_job
         if draw_job is not None and (model is None or remote is not None or scorer is not None):
             raise ValueError(f"job {job_id}: a forced-draw job is audited with the model in this process")
+        # The job's ledger store: a failed sample of a forced-draw job reopens its prompt's slot there, so the next
+        # draw slot replaces it (else the prompt stays full without the sample and the job never completes).
+        self._slot_store = slot_store if draw_job is not None else None
         # In a judge process: ``await scorer(rows)`` scores (tokens,
         # prompt_len, proofs) rows on the GPU process, as ``score_sequences``
         # would here, and ``vocab_size`` stands for the model's embeddings.
@@ -807,14 +810,56 @@ class CorpusAuditor:
     async def _write(self, submission_id: str, verdict: dict) -> tuple[dict, bool]:
         """Create-only: the verdict that stands, and whether this call wrote it."""
         written = await self._records.write_verdict(self._job_id, submission_id, verdict)
-        if written:
-            self._mark_judged(submission_id)
-            self._report(submission_id, verdict)
-            return verdict, True
-        standing = await self._records.read_verdict(self._job_id, submission_id)
+        standing = verdict if written else await self._records.read_verdict(self._job_id, submission_id)
         self._mark_judged(submission_id)
         self._report(submission_id, standing)
-        return standing, False
+        if standing is not None and not standing.get("passed"):
+            await self._reopen_slot(submission_id)
+        return standing, written
+
+    async def _reopen_slot(self, submission_id: str) -> None:
+        """A failed sample of a forced-draw job: its prompt's slot reopens (idempotent). Never raises: a failure
+        not recorded is recorded by the next start's reconcile."""
+        if self._slot_store is None:
+            return
+        from reliquary.validator.corpus_service import draw_failure_slot, record_prompt_failure
+
+        try:
+            record = await self._records.read_submission(self._job_id, submission_id)
+            if record is None:
+                return
+            outcome = await record_prompt_failure(self._slot_store, self._draw_job, int(record["prompt_index"]),
+                                                  submission_id, **draw_failure_slot(record))
+            if outcome is False:
+                logger.warning("corpus job %s: prompt %s used every attempt", self._job_id, record["prompt_index"])
+        except Exception:
+            logger.exception("corpus job %s: failure of %s not recorded in the ledger", self._job_id,
+                             submission_id[:12])
+
+    async def _reconcile_quietly(self) -> None:
+        try:
+            count = await self.reconcile_failures()
+            if count:
+                logger.info("corpus job %s: %d failed samples recorded in the ledger", self._job_id, count)
+        except Exception:
+            logger.exception("corpus job %s: failure reconcile failed", self._job_id)
+
+    async def reconcile_failures(self) -> int:
+        """Every failed or voided sample of a forced-draw job recorded in the ledger: a stop between a verdict and
+        its ledger write would leave its prompt full without it."""
+        if self._slot_store is None:
+            return 0
+        ids = list(await self._records.list_verdict_ids(self._job_id))
+        lister = getattr(self._records, "list_voided_ids", None)
+        voided = set(await lister(self._job_id)) if lister is not None else set()
+        failed = []
+        for submission_id in ids:
+            verdict = await self._records.read_verdict(self._job_id, submission_id)
+            if verdict and (not verdict.get("passed") or submission_id in voided):
+                failed.append(submission_id)
+        for submission_id in failed:
+            await self._reopen_slot(submission_id)
+        return len(failed)
 
     # Verdict writes of this auditor in flight at once, over every concurrent
     # `_write_all`; 1 writes them one at a time.
@@ -1610,6 +1655,7 @@ class CorpusAuditor:
 
     async def run(self) -> None:
         await self._start()
+        reconcile = (asyncio.create_task(self._reconcile_quietly()) if self._slot_store is not None else None)
         rescan = asyncio.create_task(self._rescan_forever())
         prefetch = (asyncio.create_task(self._prefetch_forever())
                     if self._prefetch and self._params.q < 1.0 and self._beacon is not None
@@ -1637,8 +1683,7 @@ class CorpusAuditor:
                         f"{self._validator_errors} consecutive validator-side audit errors"
                     )
         finally:
-            rescan.cancel()
-            if prefetch is not None:
-                prefetch.cancel()
-            await asyncio.gather(rescan, *([prefetch] if prefetch is not None else []),
-                                 return_exceptions=True)
+            others = [t for t in (prefetch, reconcile) if t is not None]
+            for task in (rescan, *others):
+                task.cancel()
+            await asyncio.gather(rescan, *others, return_exceptions=True)
