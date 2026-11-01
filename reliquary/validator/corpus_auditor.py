@@ -580,7 +580,7 @@ class CorpusAuditor:
         for i, diags in by_record.items():
             if not results[i].get("passed"):
                 continue
-            ok, detail = eval_draw.judge(diags)
+            ok, detail = eval_draw.judge(diags, getattr(self._draw_job, "judge", None))
             results[i] = {**results[i], "forced_draw": detail} if ok else {
                 **results[i], "passed": False, "reason": eval_draw.REASON_DRAW_MISMATCH, "forced_draw": detail}
 

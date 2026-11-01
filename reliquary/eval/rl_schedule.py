@@ -54,10 +54,12 @@ class SuiteEntry:
     episode_file: str | None = None
     harness: str | None = None
     renderer_id: str | None = None
+    # The set's draw judge, some of ``corpus.job.DrawJudge``'s fields (the others at their defaults).
+    judge: dict | None = None
 
 
 _SUITE_KEYS = {"set_id", "short", "slots_per_prompt", "cap", "max_new_tokens", "prompt_count",
-               "episode_file", "harness", "renderer_id"}
+               "episode_file", "harness", "renderer_id", "judge"}
 
 
 def load_suite(path: str | Path) -> list[SuiteEntry]:
@@ -75,6 +77,10 @@ def load_suite(path: str | Path) -> list[SuiteEntry]:
         entry = SuiteEntry(**item)
         if not _SHORT.fullmatch(entry.short):
             raise ValueError(f"short {entry.short!r}: lowercase letters, digits and '-', at most 16")
+        if entry.judge is not None:
+            from reliquary.corpus.job import draw_judge_from
+
+            draw_judge_from(entry.judge)                    # refused here, not at the first declaration
         if entry.episode_file is None:
             if entry.harness is not None:
                 raise ValueError(f"suite entry {entry.set_id!r}: a harness needs an episode_file")
@@ -362,6 +368,8 @@ class Scheduler:
                 "--temperature", str(self.s.temperature), "--top-p", str(self.s.top_p), "--cap", str(entry.cap)]
         if self.s.draw is not None:
             argv += ["--draw", self.s.draw]
+            if entry.judge is not None:
+                argv += ["--draw-judge", json.dumps(entry.judge, sort_keys=True)]
         if entry.prompt_count is not None:
             argv += ["--prompt-count", str(entry.prompt_count)]
         if entry.episode_file is not None:
