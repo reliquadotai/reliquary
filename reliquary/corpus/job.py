@@ -65,30 +65,39 @@ _JOB_FIELDS = (
 # validators of a job with ``prompt_start > 0`` need a build that knows it.
 _OPTIONAL_JOB_FIELDS = ("prompt_start", "seed", "submit", "episode", "judge")
 # A forced-draw job's judge (``corpus.eval_draw.judge``): how far a sample may stray from its draw.
-_JUDGE_FIELDS = ("floor_rate", "grace", "gap_tolerance", "terminal_gap")
+_JUDGE_FIELDS = ("floor_rate", "grace", "gap_tolerance", "terminal_gap", "edge_margin")
 MIN_JUDGE_FLOOR_RATE = 0.5
 MAX_JUDGE_GRACE = 64
 MAX_JUDGE_GAP = 64.0
+MAX_JUDGE_EDGE_MARGIN = 0.5
+DEFAULT_EDGE_MARGIN = 0.15
 
 
 @dataclass(frozen=True, slots=True)
 class DrawJudge:
     """The thresholds a forced-draw sample is judged under: at most ``1 - floor_rate`` of its drawn positions
     missed (``grace`` misses always allowed, up to a quarter of a short sample), every miss within
-    ``gap_tolerance`` of the pick's Gumbel score, the last token within ``terminal_gap``."""
+    ``gap_tolerance`` of the pick's Gumbel score, the last token within ``terminal_gap``. Under a warp (top-k,
+    top-p, min-p) a cut that moved by ``edge_margin`` (``forced_sampling.Warp.widened``) is drift, not an edit."""
 
     floor_rate: float
     grace: int
     gap_tolerance: float
     terminal_gap: float
+    edge_margin: float = 0.15                 # DEFAULT_EDGE_MARGIN
 
     def to_contract(self) -> dict[str, Any]:
-        return {name: getattr(self, name) for name in _JUDGE_FIELDS}
+        """Every threshold; ``edge_margin`` only when not the default, so a judge written before it hashes the same."""
+        return {name: getattr(self, name) for name in _JUDGE_FIELDS
+                if name != "edge_margin" or self.edge_margin != DEFAULT_EDGE_MARGIN}
 
 
 # Today's values: honest bf16 / fp32-head miners lose 0.1-0.3 % of samples on Qwen3.8-27B at every warp tested
-# (2026-10-31); a job that keeps them writes no ``judge`` and hashes as before.
-DEFAULT_DRAW_JUDGE = DrawJudge(floor_rate=0.98, grace=8, gap_tolerance=4.0, terminal_gap=3.0)
+# (2026-10-31); a job that keeps them writes no ``judge`` and hashes as before. The edge margin covers the honest
+# top-p drift measured there (validator mass before a token the miner kept: up to p + 0.03 at p 0.95, p + 0.13
+# at p 0.8).
+DEFAULT_DRAW_JUDGE = DrawJudge(floor_rate=0.98, grace=8, gap_tolerance=4.0, terminal_gap=3.0,
+                               edge_margin=DEFAULT_EDGE_MARGIN)
 
 # The one value of `submit`: submissions go to the job's own scoped route
 # (order jobs, on the order control); absent, to the legacy `/corpus/submit`.
@@ -191,10 +200,12 @@ def _judge(raw) -> DrawJudge:
     if "judge" not in raw:
         return DEFAULT_DRAW_JUDGE
     body = raw["judge"]
-    if not isinstance(body, Mapping) or set(body) != set(_JUDGE_FIELDS):
-        raise JobError(f"judge must be an object with exactly {list(_JUDGE_FIELDS)}, got {body!r}")
+    if not isinstance(body, Mapping) or set(body) - {"edge_margin"} != set(_JUDGE_FIELDS) - {"edge_margin"}:
+        raise JobError(f"judge must be an object with exactly {list(_JUDGE_FIELDS)} (edge_margin optional), "
+                       f"got {body!r}")
+    body = {"edge_margin": DEFAULT_EDGE_MARGIN, **body}
     numbers = {}
-    for name in ("floor_rate", "gap_tolerance", "terminal_gap"):
+    for name in ("floor_rate", "gap_tolerance", "terminal_gap", "edge_margin"):
         value = body[name]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
             raise JobError(f"judge.{name} must be a finite number, got {value!r}")
@@ -207,7 +218,10 @@ def _judge(raw) -> DrawJudge:
     for name in ("gap_tolerance", "terminal_gap"):
         if not 0.0 < numbers[name] <= MAX_JUDGE_GAP:
             raise JobError(f"judge.{name} must be in (0, {MAX_JUDGE_GAP}], got {numbers[name]}")
-    return DrawJudge(numbers["floor_rate"], grace, numbers["gap_tolerance"], numbers["terminal_gap"])
+    if not 0.0 <= numbers["edge_margin"] <= MAX_JUDGE_EDGE_MARGIN:
+        raise JobError(f"judge.edge_margin must be in [0, {MAX_JUDGE_EDGE_MARGIN}], got {numbers['edge_margin']}")
+    return DrawJudge(numbers["floor_rate"], grace, numbers["gap_tolerance"], numbers["terminal_gap"],
+                     numbers["edge_margin"])
 
 
 def draw_judge_from(partial: Mapping[str, Any]) -> DrawJudge:
@@ -248,6 +262,8 @@ class Sampling:
     n: int
     # Eval jobs only: the forced draw every sample follows (``corpus.eval_draw``); None = free sampling.
     draw: str | None = None
+    # Draw jobs only (free-sampling miners do not apply it): tokens under min_p times the most likely are cut.
+    min_p: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -428,6 +444,7 @@ class JobSpec:
                 "n": self.sampling.n,
                 # Written only when set: every free-sampling manifest hashes as before.
                 **({"draw": self.sampling.draw} if self.sampling.draw is not None else {}),
+                **({"min_p": self.sampling.min_p} if self.sampling.min_p else {}),
             },
             "slots_per_prompt": self.slots_per_prompt,
             "filter": (
@@ -478,7 +495,7 @@ def _number(value: Any, field: str) -> float:
 def _parse_sampling(raw: Any) -> Sampling:
     if not isinstance(raw, Mapping):
         raise JobError("sampling must be an object")
-    unknown = set(raw) - set(_SAMPLING_FIELDS) - {"draw"}
+    unknown = set(raw) - set(_SAMPLING_FIELDS) - {"draw", "min_p"}
     if unknown:
         raise JobError(f"sampling has unknown fields: {sorted(unknown)}")
     missing = [f for f in _SAMPLING_FIELDS if f not in raw]
@@ -524,9 +541,11 @@ def _parse_sampling(raw: Any) -> Sampling:
         draw = parse_draw(raw)
     except ValueError as exc:
         raise JobError(str(exc)) from None
-    if draw is not None and not (temperature == 1.0 and top_p == 1.0 and top_k == 0):
-        raise JobError(f"sampling.draw {draw!r} samples at T=1 over the full vocabulary: "
-                       f"temperature 1, top_p 1, top_k 0, got {temperature}, {top_p}, {top_k}")
+    min_p = _number(raw["min_p"], "sampling.min_p") if "min_p" in raw else 0.0
+    if not 0.0 <= min_p < 1.0:
+        raise JobError(f"sampling.min_p must be in [0, 1), got {min_p}")
+    if min_p and draw is None:
+        raise JobError("sampling.min_p is for draw jobs: a free-sampling miner does not apply it")
     return Sampling(
         temperature=temperature,
         top_p=top_p,
@@ -535,6 +554,7 @@ def _parse_sampling(raw: Any) -> Sampling:
         max_new_tokens=max_new_tokens,
         n=n,
         draw=draw,
+        min_p=min_p,
     )
 
 

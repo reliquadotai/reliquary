@@ -106,13 +106,6 @@ def test_gumbel_is_an_exact_sampler_chi_square():
     assert chi2 < 20.52  # df=5, alpha=0.001
 
 
-def test_gumbel_rejects_a_warped_profile():
-    logits, us = _honest_rows(2, 10)
-    for kw in ({"t": 0.6}, {"top_k": 20}, {"top_p": 0.95}):
-        with pytest.raises(ValueError, match="gumbel_max"):
-            fs.pick_rows(logits, us, draw=fs.DRAW_GUMBEL_MAX, **kw)
-
-
 def test_unknown_draw_is_refused():
     logits, us = _honest_rows(2, 10)
     with pytest.raises(ValueError, match="draw"):

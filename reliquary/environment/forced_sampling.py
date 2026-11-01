@@ -10,8 +10,10 @@ stream identity, its plumbing and its domain are shared:
 
 * ``inverse_cdf`` (every profile before v10): the first token whose cumulative warped
   probability, in vocabulary order, exceeds ``u_t``.
-* ``gumbel_max``: ``argmax_v (logit_v + G_v)`` over the raw logits, an exact sample of
-  ``softmax(logits)``. Only the identity warp (T=1, no top-k, no top-p) is allowed. The
+* ``gumbel_max``: ``argmax_v (logit_v / T + G_v)`` over the warp's support (``Warp``,
+  ``warp_support``: top-k, then top-p over the top-k set, then min-p), an exact sample of the
+  warped distribution; a profile's draw (RL) is the identity warp, T=1 over the raw logits,
+  and only a job's draw (``corpus.eval_draw``) names another. The
   noise ``G_v = -log(-log U_v)`` comes from the 53-bit integer
 
       key_t = int(u_t * 2**64) mod 2**64              (as a two's-complement int64)
@@ -51,6 +53,8 @@ stream identity, its plumbing and its domain are shared:
 from __future__ import annotations
 
 import hashlib
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
@@ -95,6 +99,97 @@ def warp(logits: torch.Tensor, t: float, top_k: int, top_p: float) -> torch.Tens
         sp = torch.where((cum - sp) < top_p, sp, torch.zeros_like(sp))  # include crossing token
         probs = torch.zeros_like(probs).scatter(-1, si, sp)
     return probs / probs.sum()
+
+
+@dataclass(frozen=True, slots=True)
+class Warp:
+    """What a Gumbel draw samples: softmax(logits / t) over ``warp_support``. The default is the
+    identity warp (T=1, full vocabulary). ``top_k`` 0 and ``top_p`` 1 and ``min_p`` 0 are off."""
+
+    t: float = 1.0
+    top_k: int = 0
+    top_p: float = 1.0
+    min_p: float = 0.0
+
+    @property
+    def identity(self) -> bool:
+        return self.t == 1.0 and self.top_k <= 0 and self.top_p >= 1.0 and self.min_p <= 0.0
+
+    def to_dict(self) -> dict:
+        return {"t": self.t, "top_k": self.top_k, "top_p": self.top_p, "min_p": self.min_p}
+
+    @classmethod
+    def from_dict(cls, raw: Mapping) -> "Warp":
+        if not isinstance(raw, Mapping) or set(raw) != {"t", "top_k", "top_p", "min_p"}:
+            raise ValueError(f"a warp has exactly t, top_k, top_p and min_p, got {raw!r}")
+        if isinstance(raw["top_k"], bool) or not isinstance(raw["top_k"], int):
+            raise ValueError(f"warp top_k must be a whole number, got {raw['top_k']!r}")
+        warp = cls(t=float(raw["t"]), top_k=int(raw["top_k"]), top_p=float(raw["top_p"]),
+                   min_p=float(raw["min_p"]))
+        check_warp(warp)
+        return warp
+
+    def widened(self, margin: float) -> "Warp":
+        """Every cut moved by ``margin`` (> 0 looser, < 0 tighter): top_k by a ``|margin|`` share of k (at least
+        one token), top_p by ``margin``, min_p by a ``margin`` share of itself. The validator's tolerance for a
+        cut that moved under drift (``seed_consistency_diagnostics``)."""
+        if margin == 0:
+            return self
+        top_k = self.top_k
+        if top_k > 0:
+            step = max(1, math.ceil(abs(margin) * top_k))
+            top_k = top_k + step if margin > 0 else max(1, top_k - step)
+        top_p = self.top_p if self.top_p >= 1.0 else min(1.0, max(0.0, self.top_p + margin))
+        return Warp(t=self.t, top_k=top_k, top_p=top_p, min_p=self.min_p * (1.0 - margin))
+
+
+IDENTITY_WARP = Warp()
+
+
+def check_warp(warp: Warp) -> None:
+    if not (math.isfinite(warp.t) and warp.t > 0):
+        raise ValueError(f"warp temperature must be finite and positive, got {warp.t}")
+    if warp.top_k < 0:
+        raise ValueError(f"warp top_k must be 0 (off) or positive, got {warp.top_k}")
+    if not 0.0 < warp.top_p <= 1.0:
+        raise ValueError(f"warp top_p must be in (0, 1], got {warp.top_p}")
+    if not 0.0 <= warp.min_p < 1.0:
+        raise ValueError(f"warp min_p must be in [0, 1), got {warp.min_p}")
+
+
+def warp_support(x: torch.Tensor, warp: Warp) -> torch.Tensor:
+    """[n, V] bool: the tokens ``warp`` keeps of the temperature-scaled logits ``x`` [n, V]. Top-k keeps the k
+    highest; top-p then keeps, in descending order over the top-k set renormalised, each token whose mass before
+    it is under top_p (the crossing token kept); min-p keeps tokens at least min_p times the most likely one.
+    The most likely token always stays."""
+    keep = torch.ones_like(x, dtype=torch.bool)
+    vocab = int(x.shape[-1])
+    k = warp.top_k if 0 < warp.top_k < vocab else vocab
+    if k < vocab or warp.top_p < 1.0:
+        values, index = torch.topk(x.float(), k, dim=-1)
+        ranked = torch.ones_like(values, dtype=torch.bool)
+        if warp.top_p < 1.0:
+            probs = torch.softmax(values, dim=-1)
+            ranked = (torch.cumsum(probs, dim=-1) - probs) < warp.top_p
+            ranked[:, 0] = True
+        keep = torch.zeros_like(keep).scatter(-1, index, ranked)
+    if warp.min_p > 0.0:
+        xf = x.float()
+        top = xf.max(dim=-1, keepdim=True).values
+        # ``| (xf == top)``: a min_p over 1 (a tightened cut, ``Warp.widened``) still keeps the most likely token.
+        keep &= (xf >= top + math.log(warp.min_p)) | (xf == top)
+    return keep
+
+
+def warped_logits(logits: torch.Tensor, warp: Warp) -> torch.Tensor:
+    """``logits / t`` in float32, -inf outside ``warp_support``: the scores the Gumbel draw adds its noise to.
+    The identity warp returns ``logits`` itself (the RL draw, bit for bit)."""
+    if warp.identity:
+        return logits
+    x = logits.float() / float(warp.t) if warp.t != 1.0 else logits.float()
+    if warp.top_k <= 0 and warp.top_p >= 1.0 and warp.min_p <= 0.0:
+        return x
+    return x.masked_fill(~warp_support(x, warp), float("-inf"))
 
 
 def pick(probs: torch.Tensor, u: float) -> int:
@@ -154,17 +249,19 @@ DRAW_GUMBEL_MAX = "gumbel_max"
 DRAWS = (DRAW_INVERSE_CDF, DRAW_GUMBEL_MAX)
 
 
-def check_draw(draw: str, *, t: float = 1.0, top_k: int = 0, top_p: float = 1.0) -> None:
-    """Refuse an unknown draw, and a Gumbel draw over a warped distribution: argmax(logit + G)
-    samples softmax(logits), so anything but T=1 over the full vocabulary is not its distribution."""
+def check_draw(draw: str, *, t: float = 1.0, top_k: int = 0, top_p: float = 1.0, min_p: float = 0.0) -> None:
+    """Refuse an unknown draw, a malformed warp, and min-p under the inverse CDF (its warp has none)."""
     if draw not in DRAWS:
         raise ValueError(f"unknown forced draw {draw!r}; expected one of {DRAWS}")
-    if draw == DRAW_GUMBEL_MAX and not (
-        float(t) == 1.0 and not (top_k and int(top_k) > 0) and (top_p is None or float(top_p) >= 1.0)
-    ):
-        raise ValueError(
-            f"the gumbel_max draw needs T=1 over the full vocabulary, got T={t} top_k={top_k} top_p={top_p}"
-        )
+    check_warp(_warp_of(t, top_k, top_p, min_p))
+    if draw == DRAW_INVERSE_CDF and min_p:
+        raise ValueError(f"the inverse_cdf draw has no min_p, got {min_p}")
+
+
+def _warp_of(t, top_k, top_p, min_p) -> Warp:
+    # top_k -1 is verl's "off", as 0.
+    return Warp(t=float(t), top_k=max(0, int(top_k or 0)), top_p=1.0 if top_p is None else float(top_p),
+                min_p=float(min_p or 0.0))
 
 
 def gumbel_key(u: float) -> int:
@@ -326,15 +423,16 @@ def gumbel_gaps(logits: torch.Tensor, draws: list[float], tokens: torch.Tensor) 
 
 
 def pick_rows(logits: torch.Tensor, draws: list[float], *, draw: str = DRAW_INVERSE_CDF,
-              t: float = 1.0, top_k: int = 0, top_p: float = 1.0) -> torch.Tensor:
+              t: float = 1.0, top_k: int = 0, top_p: float = 1.0, min_p: float = 0.0) -> torch.Tensor:
     """The forced pick of each row of ``logits`` [n, vocab] for its public uniform ``draws[i]``,
     as a [n] int64 tensor on the logits' device. The one batched pick the miner's processors
     and the validator's checks share."""
-    check_draw(draw, t=t, top_k=top_k, top_p=top_p)
+    check_draw(draw, t=t, top_k=top_k, top_p=top_p, min_p=min_p)
     if len(draws) != int(logits.shape[0]):
         raise ValueError("one public uniform per logits row is required")
     if draw == DRAW_GUMBEL_MAX:
-        return gumbel_argmax(logits, _gumbel_keys(draws, logits.device))[0]
+        scores = warped_logits(logits, _warp_of(t, top_k, top_p, min_p))
+        return gumbel_argmax(scores, _gumbel_keys(draws, logits.device))[0]
     probs = _warp_batch(logits, t=t, top_k=top_k, top_p=top_p)
     cdf = torch.cumsum(probs, dim=-1)
     uniforms = torch.tensor(draws, device=cdf.device, dtype=cdf.dtype).unsqueeze(1)
@@ -478,6 +576,8 @@ def seed_consistency_diagnostics(
     position_offsets: list[int] | None = None,
     logit_positions: list[int] | None = None,
     draw: str = DRAW_INVERSE_CDF,
+    min_p: float = 0.0,
+    edge_margin: float = 0.0,
 ) -> SeedConsistencyDiagnostics:
     """Classify exact picks and numerical CDF-boundary misses on GPU.
 
@@ -492,8 +592,16 @@ def seed_consistency_diagnostics(
     (``forced_pick_diagnostics``), classified against ``boundary_epsilon`` in
     those units; the ``max_cdf_miss`` and ``n_miss_gt_*`` fields then carry it.
     A position is stochastic by the same max-probability rule for both draws.
+
+    Under a warped Gumbel draw (``Warp``) the pick is over the validator's support, and a miss is
+    scored against a support tightened by ``edge_margin`` (``Warp.widened``): a boundary token the
+    miner's cut dropped never makes a gap. A token outside the support widened by ``edge_margin`` is
+    impossible (miss 1); inside it, its miss is the score gap to the tight support's best, so a
+    token the miner's cut kept where the validator's did not is an ordinary near-tie miss.
     """
-    check_draw(draw, t=t, top_k=top_k, top_p=top_p)
+    check_draw(draw, t=t, top_k=top_k, top_p=top_p, min_p=min_p)
+    warp = _warp_of(t, top_k, top_p, min_p)
+    warped = draw == DRAW_GUMBEL_MAX and not warp.identity
     available_rows = (
         len(logit_positions)
         if logit_positions is not None
@@ -523,7 +631,10 @@ def seed_consistency_diagnostics(
         1,
         min(n, _DIAGNOSTIC_FLOAT_WORKSPACE_BYTES // (vocab_size * 4)),
     )
-    if draw == DRAW_GUMBEL_MAX and not (str(logits.device).startswith("cuda") and _triton_argmax()):
+    if warped:
+        # Support masks, a top-k sort and three masked score copies per row.
+        chunk_rows = max(1, min(chunk_rows, _DIAGNOSTIC_FLOAT_WORKSPACE_BYTES // (vocab_size * 4 * 8)))
+    elif draw == DRAW_GUMBEL_MAX and not (str(logits.device).startswith("cuda") and _triton_argmax()):
         # The torch reference holds ~6 float64 [rows, V] temporaries; the fused kernel none (an RL audit of 120k
         # positions at the reference's 21 rows a chunk spent ~70 s in 5,700 chunks, 2026-10-18).
         chunk_rows = min(chunk_rows, _gumbel_chunk_rows(vocab_size))
@@ -549,7 +660,12 @@ def seed_consistency_diagnostics(
             device=chunk_logits.device,
             dtype=torch.long,
         )
-        if draw == DRAW_GUMBEL_MAX:
+        if warped:
+            exact, miss, stochastic = _gumbel_warp_chunk_stats(
+                chunk_logits, toks, [float(x) for x in u_values[start:end]], warp,
+                float(edge_margin), stochastic_threshold,
+            )
+        elif draw == DRAW_GUMBEL_MAX:
             exact, miss, stochastic = _gumbel_chunk_stats(
                 chunk_logits, toks, [float(x) for x in u_values[start:end]],
                 stochastic_threshold,
@@ -630,6 +746,24 @@ def _gumbel_chunk_stats(chunk_logits, toks, draws, stochastic_threshold):
                     + gumbel_noise_from_bits(_splitmix_bits(keys, toks)))
     exact = picks == toks
     miss = torch.where(exact, torch.zeros_like(best), -torch.expm1(-(best - token_scores)))
+    return exact, miss, max_probs < stochastic_threshold
+
+
+def _gumbel_warp_chunk_stats(chunk_logits, toks, draws, warp, edge_margin, stochastic_threshold):
+    """(exact, miss, stochastic) per row under a warped Gumbel draw (``seed_consistency_diagnostics``)."""
+    x = chunk_logits.float() / float(warp.t)
+    keys = _gumbel_keys(draws, x.device)
+    support = warp_support(x, warp)
+    picks, _ = gumbel_argmax(x.masked_fill(~support, float("-inf")), keys)
+    tight = warp_support(x, warp.widened(-edge_margin)) & support
+    _, best = gumbel_argmax(x.masked_fill(~tight, float("-inf")), keys)
+    loose = warp_support(x, warp.widened(edge_margin)) | support
+    own = x.gather(1, toks.unsqueeze(1)).squeeze(1) + gumbel_noise_from_bits(_splitmix_bits(keys, toks))
+    exact = picks == toks
+    near = -torch.expm1(-(best - own).clamp_min(0.0))
+    possible = loose.gather(1, toks.unsqueeze(1)).squeeze(1)
+    miss = torch.where(exact, torch.zeros_like(near), torch.where(possible, near, torch.ones_like(near)))
+    max_probs = torch.softmax(x.masked_fill(~support, float("-inf")), dim=-1).max(dim=-1).values
     return exact, miss, max_probs < stochastic_threshold
 
 

@@ -1,7 +1,8 @@
 """The forced draw of an eval job: one legal generation per (job, prompt, sample).
 
 An eval job whose ``sampling.draw`` is ``gumbel_max`` fixes every sampled token with a public Gumbel-max draw
-(``environment.forced_sampling``), at T=1 over the full vocabulary with the LM head in fp32, the RL path's draw.
+(``environment.forced_sampling``) over the job's warp (temperature, top-k, top-p, min-p; ``job_warp``) with the LM head
+in fp32: at T=1 over the full vocabulary, the RL path's draw.
 Its stream is keyed on the job alone, never on the miner:
 
 * ``randomness``: ``sha256(EVAL_DRAW_DOMAIN, job_id, checkpoint_sha256, seed)`` in hex;
@@ -32,7 +33,7 @@ from reliquary.constants import (
     FORCED_SEED_GUMBEL_BOUNDARY_EPSILON,
     FORCED_SEED_STOCHASTIC_MAXPROB,
 )
-from reliquary.environment.forced_sampling import DRAW_GUMBEL_MAX, u_range
+from reliquary.environment.forced_sampling import DRAW_GUMBEL_MAX, Warp, u_range
 
 EVAL_DRAW = DRAW_GUMBEL_MAX
 EVAL_DRAW_DOMAIN = "reliquary-eval-draw-v1"
@@ -92,12 +93,22 @@ def attempt_digests(prompt_index: int, draw_slot: int, attempt: int, digests) ->
     return [hashlib.sha256(f"{prefix}/{c}/{d}".encode()).hexdigest() for c, d in enumerate(digests)]
 
 
+def job_warp(job: Any) -> Warp:
+    """What the job's draw samples: its sampling's temperature, top-k, top-p and min-p."""
+    s = job.sampling
+    return Warp(t=float(s.temperature), top_k=int(s.top_k), top_p=float(s.top_p),
+                min_p=float(getattr(s, "min_p", 0.0)))
+
+
 def draw_context(job: Any, prompt_index: int, draw_slot: int, completion: int = 0) -> dict[str, Any]:
-    """The forced-seed request fields (``vllm_generation.forced_seed_extra_args``) of one sample."""
+    """The forced-seed request fields (``vllm_generation.forced_seed_extra_args``) of one sample. The warp is named
+    only when it is not the identity, so a T=1 full-vocabulary request is the same as before warps existed."""
+    warp = job_warp(job)
     return {"randomness": draw_randomness(job), "prompt_idx": int(prompt_index),
             "checkpoint_hash": str(job.checkpoint_revision),
             "rollout_index": rollout_index(job, draw_slot, completion),
-            "domain": EVAL_DRAW_DOMAIN, "draw": EVAL_DRAW}
+            "domain": EVAL_DRAW_DOMAIN, "draw": EVAL_DRAW,
+            **({} if warp.identity else {"warp": warp.to_dict()})}
 
 
 def uniforms(job: Any, prompt_index: int, draw_slot: int, completion: int, positions: int) -> list[float]:
@@ -107,12 +118,16 @@ def uniforms(job: Any, prompt_index: int, draw_slot: int, completion: int, posit
                    context["rollout_index"], int(positions), domain=EVAL_DRAW_DOMAIN)
 
 
-def diagnostics(logits, token_ids, u_values):
-    """``seed_consistency_diagnostics`` under the eval draw (T=1, full vocabulary)."""
-    from reliquary.environment.forced_sampling import seed_consistency_diagnostics
+def diagnostics(logits, token_ids, u_values, job: Any = None):
+    """``seed_consistency_diagnostics`` under the job's draw: its warp, a cut moved by its judge's ``edge_margin``
+    counted as drift. No job: T=1 over the full vocabulary."""
+    from reliquary.environment.forced_sampling import IDENTITY_WARP, seed_consistency_diagnostics
 
+    warp = IDENTITY_WARP if job is None else job_warp(job)
+    judge = getattr(job, "judge", None)
     return seed_consistency_diagnostics(
-        logits, list(token_ids), list(u_values), t=1.0, top_k=0, top_p=1.0,
+        logits, list(token_ids), list(u_values), t=warp.t, top_k=warp.top_k, top_p=warp.top_p, min_p=warp.min_p,
+        edge_margin=0.0 if judge is None else float(judge.edge_margin),
         stochastic_threshold=FORCED_SEED_STOCHASTIC_MAXPROB,
         boundary_epsilon=FORCED_SEED_GUMBEL_BOUNDARY_EPSILON, draw=EVAL_DRAW)
 
@@ -181,5 +196,5 @@ def parse_draw(raw: Mapping[str, Any]) -> str | None:
 
 
 __all__ = ["EVAL_DRAW", "EVAL_DRAW_DOMAIN", "EVAL_GAP_TOLERANCE", "EVAL_TERMINAL_GAP", "REASON_BAD_CURSOR", "REASON_DRAW_MISMATCH", "REASON_DRAW_SLOT_TAKEN", "allowed_misses", "attempt_digests", "diagnostics", "draw_context",
-           "draw_randomness", "has_draw", "judge", "match_rate", "parse_draw", "rollout_index", "slot_count",
+           "draw_randomness", "has_draw", "job_warp", "judge", "match_rate", "parse_draw", "rollout_index", "slot_count",
            "slot_key", "uniforms"]

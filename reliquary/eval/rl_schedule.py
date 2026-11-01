@@ -120,6 +120,8 @@ class Settings:
     # The RL path's sampling, forced by the job's public draw (``corpus.eval_draw``): every sample verifiable.
     temperature: float = 1.0
     top_p: float = 1.0
+    top_k: int = 0
+    min_p: float = 0.0                  # the draw's only
     draw: str | None = "gumbel_max"
     baseline_model: str | None = None
     baseline_revision: str | None = None
@@ -366,6 +368,10 @@ class Scheduler:
                 "--renderer-id", entry.renderer_id or self.s.renderer_id, "--eos-token-id", str(self.s.eos_token_id),
                 "--max-new-tokens", str(entry.max_new_tokens), "--slots-per-prompt", str(entry.slots_per_prompt),
                 "--temperature", str(self.s.temperature), "--top-p", str(self.s.top_p), "--cap", str(entry.cap)]
+        if self.s.top_k:
+            argv += ["--top-k", str(self.s.top_k)]
+        if self.s.min_p:
+            argv += ["--min-p", str(self.s.min_p)]
         if self.s.draw is not None:
             argv += ["--draw", self.s.draw]
             if entry.judge is not None:

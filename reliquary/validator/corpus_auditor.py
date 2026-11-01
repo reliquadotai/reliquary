@@ -568,7 +568,7 @@ class CorpusAuditor:
         logits = _LazyLogitRows(hidden, head, _lm_head_vocab_size(head), fp32_head=True)
         u = eval_draw.uniforms(self._draw_job, int(record["prompt_index"]), int(record["cursor"]),
                                c_idx, len(drawn))
-        return eval_draw.diagnostics(logits, drawn, u)
+        return eval_draw.diagnostics(logits, drawn, u, self._draw_job)
 
     def _judge_draws(self, results: list[dict], items: list[tuple], draws: dict[int, object]) -> None:
         """A record whose proofs passed fails when any of its samples does not follow the draw."""

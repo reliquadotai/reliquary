@@ -37,7 +37,7 @@ from typing import Any
 import torch
 
 from reliquary.constants import T_PROTO, TOP_K_PROTO, TOP_P_PROTO
-from reliquary.environment.forced_sampling import host_to_device, pick_rows, u_at
+from reliquary.environment.forced_sampling import DRAW_GUMBEL_MAX, host_to_device, pick_rows, u_at
 from reliquary.shared.modeling import first_eos_index
 
 logger = logging.getLogger(__name__)
@@ -106,7 +106,7 @@ class ForcedSeedVLLMProcessor(LogitsProcessor):  # type: ignore[misc,valid-type]
         forced = _one_hot_picks(
             logits, slots,
             [_uniform(self._slots[slot], self._slots[slot]["offset"]) for slot in slots],
-            kinds=[self._slots[slot].get("draw") for slot in slots],
+            kinds=[_draw_kind(self._slots[slot]) for slot in slots],
         )
         for slot in slots:
             self._slots[slot]["offset"] += 1
@@ -127,10 +127,15 @@ def _forced_state(forced: dict[str, Any]) -> dict[str, Any]:
     if forced.get("domain") is not None:
         state["domain"] = str(forced["domain"])
     if forced.get("draw") is not None:
-        from reliquary.environment.forced_sampling import check_draw
+        from reliquary.environment.forced_sampling import IDENTITY_WARP, Warp, check_draw
 
-        check_draw(str(forced["draw"]))     # a request-named draw samples at T=1 over the full vocabulary
+        # A request-named draw samples its own warp (``Warp``); none named, T=1 over the full vocabulary.
+        warp = Warp.from_dict(forced["warp"]) if forced.get("warp") is not None else IDENTITY_WARP
+        check_draw(str(forced["draw"]), t=warp.t, top_k=warp.top_k, top_p=warp.top_p, min_p=warp.min_p)
         state["draw"] = str(forced["draw"])
+        state["warp"] = warp
+    elif forced.get("warp") is not None:
+        raise ValueError("a request's warp needs the draw it warps")
     if "public_pool" in forced:
         from reliquary.protocol.seed_pool import SeedPool
         pool = SeedPool.from_dict(forced["public_pool"])
@@ -151,16 +156,27 @@ def _uniform(state: dict[str, Any], position: int) -> float:
                 state["rollout_index"], position, domain=state.get("domain"))
 
 
-def _row_picks(logits: torch.Tensor, draws: list[float], kinds: list[str | None] | None) -> torch.Tensor:
-    """The forced pick of each row: the profile's draw, or the one its request names (T=1, full vocabulary)."""
+def _draw_kind(state: dict[str, Any]) -> tuple | None:
+    """A request's own (draw, warp), or None for the profile's."""
+    return None if state.get("draw") is None else (state["draw"], state["warp"])
+
+
+def _row_picks(logits: torch.Tensor, draws: list[float], kinds: list[tuple | None] | None) -> torch.Tensor:
+    """The forced pick of each row: the profile's draw, or the (draw, warp) its request names."""
     if kinds is None or all(kind is None for kind in kinds):
-        return pick_rows(logits, draws, draw=default_draw(), t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO)
+        draw = default_draw()
+        if draw == DRAW_GUMBEL_MAX and not (T_PROTO == 1.0 and TOP_K_PROTO <= 0 and TOP_P_PROTO >= 1.0):
+            # The RL draw is the identity warp: its trainer and substitution read softmax(logits).
+            raise ValueError("a profile's gumbel_max draw samples at T=1 over the full vocabulary, "
+                             f"got T={T_PROTO} top_k={TOP_K_PROTO} top_p={TOP_P_PROTO}")
+        return pick_rows(logits, draws, draw=draw, t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO)
     picks = torch.empty(len(draws), dtype=torch.int64, device=logits.device)
     for kind in set(kinds):
         at = [i for i, k in enumerate(kinds) if k == kind]
         index = host_to_device(at, torch.int64, logits.device)
         picks[index] = (_row_picks(logits[index], [draws[i] for i in at], None) if kind is None
-                        else pick_rows(logits[index], [draws[i] for i in at], draw=kind))
+                        else pick_rows(logits[index], [draws[i] for i in at], draw=kind[0], t=kind[1].t,
+                                       top_k=kind[1].top_k, top_p=kind[1].top_p, min_p=kind[1].min_p))
     return picks
 
 
@@ -209,6 +225,7 @@ def forced_seed_extra_args(
     *, randomness: str, prompt_idx: int, checkpoint_hash: str,
     rollout_index: int, base_offset: int = 0, seed_pool=None,
     seed_index: int | None = None, domain: str | None = None, draw: str | None = None,
+    warp: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """What one request tells the processor about its place in the draw.
 
@@ -225,6 +242,8 @@ def forced_seed_extra_args(
             # An eval job's own stream and draw (``corpus.eval_draw``); absent, the profile's.
             **({"domain": str(domain)} if domain is not None else {}),
             **({"draw": str(draw)} if draw is not None else {}),
+            # The draw's warp (``forced_sampling.Warp.to_dict``); absent, T=1 over the full vocabulary.
+            **({"warp": dict(warp)} if warp is not None else {}),
         }
     }
     if seed_pool is not None:
@@ -371,7 +390,7 @@ class RunnerForcedSeedVLLMProcessor(ForcedSeedVLLMProcessor):
         draws = [_uniform(states[req_id][1], states[req_id][1]["offset"] + position)
                  for _, req_id, _, position in rows]
         return _one_hot_picks(logits, [row for row, *_ in rows], draws, keep_other_rows=True,
-                              kinds=[states[req_id][1].get("draw") for _, req_id, _, _ in rows])
+                              kinds=[_draw_kind(states[req_id][1]) for _, req_id, _, _ in rows])
 
 
 class VLLMRolloutGenerator:
