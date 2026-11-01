@@ -631,7 +631,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail=(
                 f"a generation order's ids both start with {gen_prefix!r}"))
         if generation and body.seed is not None and body.draw is None:
-            raise HTTPException(status_code=422, detail="a seed keys a forced draw: name draw")
+            raise HTTPException(status_code=422, detail="eval fields on a generation order: a seed keys a forced draw")
         if not evaluation and not generation and any(
                 v is not None for v in (body.qualification_id, body.seed, body.audit_q, body.draw, body.judge)):
             raise HTTPException(status_code=422, detail="eval fields on a non-eval job")
@@ -1079,13 +1079,13 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     qualification_id=body.qualification_id, model=body.model,
                     revision=body.revision, env=body.env,
                     prompt_start=body.prompt_start or 0, problems=body.problems,
-                    completions=body.completions, sampling=body.sampling.model_dump(),
+                    completions=body.completions, sampling=body.sampling.conditions(),
                     max_new_tokens=body.max_new_tokens, thinking=body.thinking, clock=clock)
             else:
                 wanted = qual.new_request(
                     qualification_id=body.qualification_id, model=body.model,
                     revision=body.revision, set_id=body.set_id, problems=body.problems,
-                    completions=body.completions, sampling=body.sampling.model_dump(),
+                    completions=body.completions, sampling=body.sampling.conditions(),
                     max_new_tokens=body.max_new_tokens, thinking=body.thinking, clock=clock)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
