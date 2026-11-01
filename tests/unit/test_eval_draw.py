@@ -10,7 +10,7 @@ from reliquary.corpus.admission import admit
 from reliquary.corpus.job import JOB_SCHEMA, JobError, parse_job
 from reliquary.corpus.slots import ATTEMPTS_PER_SLOT, SlotLedger
 from reliquary.corpus.walk import CursorLedger
-from reliquary.environment.forced_sampling import DRAW_GUMBEL_MAX, pick_rows, u_range
+from reliquary.environment.forced_sampling import DRAW_GUMBEL_MAX, IDENTITY_WARP, pick_rows, u_range
 
 SHA = "a" * 64
 EOS = 151645
@@ -53,12 +53,10 @@ def test_a_free_job_contract_is_unchanged():
     assert "draw" not in job.to_contract()["sampling"]
 
 
-@pytest.mark.parametrize("change", [
-    {"temperature": 0.6}, {"top_p": 0.95}, {"top_k": 20}, {"draw": "inverse_cdf"},
-])
-def test_a_draw_job_samples_at_t1_over_the_full_vocabulary(change):
+def test_a_draw_job_is_a_gumbel_draw():
+    """Any warp is the job's (``test_draw_warp``); the inverse CDF is not a job draw."""
     with pytest.raises(JobError):
-        _job(sampling=_sampling(**change))
+        _job(sampling=_sampling(draw="inverse_cdf"))
 
 
 @pytest.mark.parametrize("overrides", [
@@ -179,7 +177,7 @@ def test_the_miner_processor_draws_the_eval_stream():
     u = eval_draw.uniforms(job, 4, 1, 1, 8)
     assert [_uniform(state, 3 + t) for t in range(5)] == u[3:8]
     logits = _logits(5)
-    forced = _one_hot_picks(logits, [0, 1, 2, 3, 4], u[3:8], kinds=[DRAW_GUMBEL_MAX] * 5)
+    forced = _one_hot_picks(logits, [0, 1, 2, 3, 4], u[3:8], kinds=[(DRAW_GUMBEL_MAX, IDENTITY_WARP)] * 5)
     assert forced.argmax(-1).tolist() == _sample(logits, u[3:8])
 
 
@@ -189,7 +187,7 @@ def test_a_request_named_draw_is_picked_beside_the_profiles_rows(monkeypatch):
     logits = _logits(4)
     draws = [0.1, 0.5, 0.7, 0.9]
     monkeypatch.setattr(vg, "default_draw", lambda: "inverse_cdf")
-    mixed = vg._row_picks(logits, draws, [None, DRAW_GUMBEL_MAX, None, DRAW_GUMBEL_MAX]).tolist()
+    mixed = vg._row_picks(logits, draws, [None, (DRAW_GUMBEL_MAX, IDENTITY_WARP), None, (DRAW_GUMBEL_MAX, IDENTITY_WARP)]).tolist()
     profile = vg._row_picks(logits, draws, None).tolist()
     gumbel = pick_rows(logits, draws, draw=DRAW_GUMBEL_MAX).tolist()
     assert mixed == [profile[0], gumbel[1], profile[2], gumbel[3]]

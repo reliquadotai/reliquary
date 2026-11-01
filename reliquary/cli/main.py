@@ -1228,6 +1228,7 @@ def build_job_manifest(
     submit=None,
     episode=None,
     draw=None,
+    min_p=0.0,
     judge=None,
 ):
     """The manifest as the job store will hold it, refused unless every
@@ -1273,6 +1274,8 @@ def build_job_manifest(
             "n": n,
             # An eval job's forced draw (``corpus.eval_draw``); absent, free sampling.
             **({"draw": draw} if draw is not None else {}),
+            # A draw job's min-p; absent (0), every manifest without it hashes as before.
+            **({"min_p": min_p} if min_p else {}),
         },
         "slots_per_prompt": slots_per_prompt,
         "filter": (
@@ -1367,7 +1370,7 @@ def prepare_corpus_job(
     min_new_tokens=2, temperature=1.0, top_p=1.0, top_k=0, n=1, grader_id=None,
     threshold=None, prompt_order="free", deadline_round=None, overrides=None,
     verification=None, seed=None, contract_environment=None, toploc_thresholds=None,
-    submit=None, episode=None, draw=None, judge=None,
+    submit=None, episode=None, draw=None, judge=None, min_p=0.0,
 ):
     """The manifest and the registry entry `jobs create` writes, built and
     checked without writing either (the admin service declares jobs with it).
@@ -1418,6 +1421,7 @@ def prepare_corpus_job(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
+        min_p=min_p,
         min_new_tokens=min_new_tokens,
         max_new_tokens=max_new_tokens,
         n=n,
@@ -1673,15 +1677,16 @@ def jobs_create(
     temperature: float = typer.Option(1.0, "--temperature"),
     top_p: float = typer.Option(1.0, "--top-p"),
     top_k: int = typer.Option(0, "--top-k"),
+    min_p: float = typer.Option(0.0, "--min-p", help="With --draw: cut tokens under min-p times the most likely"),
     draw: str = typer.Option(
         None, "--draw",
-        help="Eval jobs: 'gumbel_max' forces every sample with the job's public draw (T=1, top-p 1, "
-        "top-k 0), checked by the audit; omit for free sampling",
+        help="Eval jobs: 'gumbel_max' forces every sample with the job's public draw at its --temperature, "
+        "--top-k, --top-p and --min-p, checked by the audit; omit for free sampling",
     ),
     draw_judge: str = typer.Option(
         None, "--draw-judge",
-        help="With --draw: the judge's thresholds as JSON, some of floor_rate, grace, gap_tolerance, terminal_gap "
-        "(the others at their defaults), e.g. '{\"floor_rate\": 0.95}'",
+        help="With --draw: the judge's thresholds as JSON, some of floor_rate, grace, gap_tolerance, terminal_gap, "
+        "edge_margin (the others at their defaults), e.g. '{\"floor_rate\": 0.95}'",
     ),
     n: int = typer.Option(1, "--n", help="Completions per submitted slot"),
     grader_id: str = typer.Option(
@@ -1807,7 +1812,7 @@ def jobs_create(
             n=n, grader_id=grader_id, threshold=threshold, prompt_order=prompt_order,
             deadline_round=deadline_round, overrides=overrides, verification=verification,
             contract_environment=contract_environment, seed=seed, episode=episode, draw=draw,
-            judge=json.loads(draw_judge) if draw_judge is not None else None,
+            judge=json.loads(draw_judge) if draw_judge is not None else None, min_p=min_p,
         )
     except (RegistryError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -2631,8 +2636,10 @@ def eval_schedule(
     renderer_id: str = typer.Option("chat-template-thinking-v1", "--renderer-id"),
     temperature: float = typer.Option(1.0, "--temperature"),
     top_p: float = typer.Option(1.0, "--top-p"),
-    draw: str = typer.Option("gumbel_max", "--draw", help="The jobs' forced draw (T=1, top-p 1); 'none' for "
-                             "free sampling at --temperature/--top-p, unverified"),
+    top_k: int = typer.Option(0, "--top-k"),
+    min_p: float = typer.Option(0.0, "--min-p", help="With the draw only"),
+    draw: str = typer.Option("gumbel_max", "--draw", help="The jobs' forced draw, at the sampling above; 'none' "
+                             "for free sampling at --temperature/--top-p/--top-k, unverified"),
     baseline_model: str | None = typer.Option(None, "--baseline-model", help="The run's start checkpoint repo"),
     baseline_revision: str | None = typer.Option(None, "--baseline-revision"),
     results_dir: str = typer.Option(..., "--results-dir", help="Gradings, logs and benchmarks.json go here"),
@@ -2669,6 +2676,7 @@ def eval_schedule(
             run_id=run_id, run_tag=run_tag, suite=rl_schedule.load_suite(suite), every=every,
             hf_namespace=hf_namespace, hf_prefix=hf_prefix, model_architecture=model_architecture,
             eos_token_id=eos_token_id, renderer_id=renderer_id, temperature=temperature, top_p=top_p,
+            top_k=top_k, min_p=min_p,
             draw=None if draw == "none" else draw, baseline_model=baseline_model, baseline_revision=baseline_revision, results_dir=Path(results_dir),
             state_path=Path(state) if state else Path(results_dir) / "schedule-state.json",
             start_cmd=start_cmd or rl_schedule.DEFAULT_START, start_values=values,
