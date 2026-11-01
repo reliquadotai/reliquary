@@ -263,6 +263,14 @@ class HttpCorpusClient:
         """Step over a full prompt, or None from a validator without the route."""
         return _unless_absent(lambda: self._http.post(self._path("skip"), json=body))
 
+    def lease(self, body: dict) -> dict | None:
+        """A light lease on a draw job's free slot (``corpus.draw_leases``), or None from a validator that predates
+        leases (404, 405)."""
+        return _unless_absent(lambda: self._http.post(self._path("lease"), json=body), absent=(404, 405))
+
+    def release_lease(self, body: dict) -> dict | None:
+        return _unless_absent(lambda: self._http.post(self._path("lease/release"), json=body), absent=(404, 405))
+
     def open_prompts(self) -> dict | None:
         """Which prompts still have a slot (``slots.parse_open_map`` reads it),
         or None from a validator without the route (404, 405) or a job too
@@ -375,7 +383,7 @@ def _retry(call, *, sleep, counts, max_consecutive_failures):
 def mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
                max_steps: int | None = None, sleep=time.sleep,
                max_consecutive_failures: int = _MAX_CONSECUTIVE_FAILURES,
-               sign_skip=None) -> dict[str, int]:
+               sign_skip=None, sign_lease=None) -> dict[str, int]:
     """``_mine_steps``, ended cleanly (one log line, no retry) when the
     validator says the job is retired."""
     counts: Counter[str] = Counter()
@@ -384,7 +392,7 @@ def mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
             return _mine_draw_steps(job=job, hotkey=hotkey, client=client, generator=generator,
                                     tokenizer=tokenizer, render=render, sign=sign, max_steps=max_steps,
                                     sleep=sleep, max_consecutive_failures=max_consecutive_failures,
-                                    counts=counts)
+                                    counts=counts, sign_lease=sign_lease)
         return _mine_steps(job=job, hotkey=hotkey, client=client, generator=generator,
                            tokenizer=tokenizer, render=render, sign=sign, max_steps=max_steps,
                            sleep=sleep, max_consecutive_failures=max_consecutive_failures,
@@ -425,11 +433,34 @@ def pick_draw_slot(job, open_body, taken: dict[int, set[int]], closed: set[int],
     return rng.choice(candidates) if candidates else None
 
 
+def lease_body(job_id: str, hotkey: str, sign_lease) -> dict:
+    """A fresh signed lease request (``CorpusLeaseRequest``)."""
+    body = {"job_id": job_id, "miner_hotkey": hotkey, "issued_at": int(time.time()),
+            "nonce": secrets.token_hex(16)}
+    body["signature"] = sign_lease(body)
+    return body
+
+
+def release_body(job_id: str, hotkey: str, lease_id: str, sign_lease) -> dict:
+    body = {"job_id": job_id, "miner_hotkey": hotkey, "lease_id": lease_id}
+    body["signature"] = sign_lease(body)
+    return body
+
+
+# A lease refusal after which the miner picks slots from the open map as before (an older validator's answer).
+_LEASE_FALLBACK = frozenset({"signature_unverifiable", "not_a_draw_job", "job_not_served"})
+# Every slot leased or pending its audit: ask again after this many seconds.
+LEASE_WAIT_SECONDS = 30.0
+
+
 def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
                      max_steps: int | None, sleep, max_consecutive_failures: int,
-                     counts: Counter) -> dict[str, int]:
-    """A forced-draw eval job (``corpus.eval_draw``): each step fills one draw slot of an open prompt, its
-    completions the draw's samples, the slot sent as the cursor. Whatever they score, they are submitted."""
+                     counts: Counter, sign_lease=None) -> dict[str, int]:
+    """A forced-draw job (``corpus.eval_draw``): each step fills one draw slot of an open prompt, its
+    completions the draw's samples, the slot sent as the cursor. Whatever they score, they are submitted.
+
+    With ``sign_lease``, each step first leases its slot (``corpus.draw_leases``) so no other miner decodes it;
+    a validator without leases is mined from the open map as before."""
     import random
 
     from reliquary.corpus.eval_draw import REASON_DRAW_SLOT_TAKEN, draw_context
@@ -440,11 +471,33 @@ def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
     taken = TakenSlots()
     closed: set[int] = set()
     steps = 0
+    leasing = sign_lease is not None and callable(getattr(client, "lease", None))
     while max_steps is None or steps < max_steps:
         steps += 1
-        reader = getattr(client, "open_prompts", None)
-        open_body = _retry(reader, **retry_kwargs) if reader is not None else None
-        choice = pick_draw_slot(job, open_body, taken.view(now=time.monotonic()), closed, rng)
+        lease_id = None
+        choice = None
+        if leasing:
+            answer = _retry(lambda: client.lease(lease_body(job.job_id, hotkey, sign_lease)), **retry_kwargs)
+            reason = None if answer is None else str(answer.get("reason"))
+            if answer is not None and answer.get("leased"):
+                choice, lease_id = (int(answer["prompt_index"]), int(answer["slot"])), str(answer["lease_id"])
+            elif reason == "job_complete":
+                counts["job_complete"] += 1
+                break
+            elif reason in _HALT:
+                raise CorpusMinerHalted(f"the validator refused this hotkey: {reason}", counts=dict(counts))
+            elif answer is None or reason in _LEASE_FALLBACK:
+                logger.info("the validator leases no slot (%s): mining from the open map", reason or "no route")
+                leasing = False
+            else:
+                # Every slot leased or awaiting its audit (no_free_slot), or this hotkey's cap: ask again later.
+                counts[f"lease_{reason}"] += 1
+                sleep(LEASE_WAIT_SECONDS)
+                continue
+        if choice is None:
+            reader = getattr(client, "open_prompts", None)
+            open_body = _retry(reader, **retry_kwargs) if reader is not None else None
+            choice = pick_draw_slot(job, open_body, taken.view(now=time.monotonic()), closed, rng)
         if choice is None:
             counts["job_complete"] += 1
             break
@@ -456,6 +509,10 @@ def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
         except ValueError as exc:
             logger.warning("dropping a corpus generation step: %s", exc)
             counts["generation_failed"] += 1
+            if lease_id is not None:
+                # Free at once for another miner, rather than at its expiry.
+                _retry(lambda: client.release_lease(release_body(job.job_id, hotkey, lease_id, sign_lease)),
+                       **retry_kwargs)
             continue
         body = build_submission(
             job=job, hotkey=hotkey, cursor=slot, prompt_index=prompt_index,

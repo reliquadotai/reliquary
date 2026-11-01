@@ -3252,7 +3252,7 @@ def corpus_mine(
         mine_steps,
     )
     from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
-    from reliquary.protocol.signatures import sign_corpus_skip, sign_corpus_submission
+    from reliquary.protocol.signatures import sign_corpus_lease, sign_corpus_skip, sign_corpus_submission
     from reliquary.shared.modeling import load_tokenizer
     from reliquary.validator.corpus_service import prompt_job_for_spec, renderer_for_job
 
@@ -3323,6 +3323,7 @@ def corpus_mine(
             # Full prompts are skipped, not generated for; an older validator
             # without the routes is mined as before.
             sign_skip=lambda body: sign_corpus_skip(wallet, body),
+            sign_lease=lambda body: sign_corpus_lease(wallet, body),
             max_steps=max_steps or None,
         )
     except CorpusMinerHalted as exc:
@@ -3383,7 +3384,7 @@ def corpus_mine_agentic(
     )
     from reliquary.miner.suite_episode import is_suite_episode, suite_support
     from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
-    from reliquary.protocol.signatures import sign_corpus_submission
+    from reliquary.protocol.signatures import sign_corpus_lease, sign_corpus_submission
     from reliquary.shared.modeling import load_tokenizer
 
     proof = toploc_proof(ACTIVE_PROTOCOL_PROFILE)
@@ -3464,7 +3465,8 @@ def corpus_mine_agentic(
     identity = Identity(hotkey=wallet.hotkey.ss58_address,
                         sign=lambda body: sign_corpus_submission(wallet, body),
                         episodes=episodes or None,
-                        sign_binding=lambda binding: wallet.hotkey.sign(binding).hex())
+                        sign_binding=lambda binding: wallet.hotkey.sign(binding).hex(),
+                        sign_lease=lambda body: sign_corpus_lease(wallet, body))
     counts = asyncio.run(run_agentic_miner(
         job=job, checkpoint_dir=directory, proof=proof, tokenizer=load_tokenizer(directory),
         identities=[identity], client=client, concurrency=concurrency, port=port,

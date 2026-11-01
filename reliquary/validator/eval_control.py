@@ -1071,10 +1071,13 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         dispatcher.attention[str(job_id)].append(f"refused: {why}"[:300])
 
     def router_for(w):
+        from reliquary.validator.corpus_validator import _lease_verifier
+
         return build_corpus_router(
             job_id=str(w.entry.job_id), store=store, tokenizer=w.tokenizer,
             renderer=w.renderer, verify_signature=verify_signature,
             verify_skip_signature=verify_skip_signature, prompt_job_for=w.prompt_job_for,
+            verify_lease_signature=_lease_verifier(verify_skip_signature),
             records=records, on_accepted=w.on_accepted,
             # A draw job's samples carry no proof: the draw is their check.
             proof_chunk_tokens=None if has_draw(w.job) else w.proof.chunk_tokens, vocab_size=w.vocab_size,

@@ -58,6 +58,9 @@ from reliquary.infrastructure.corpus_job_store import (
 )
 from reliquary.protocol.corpus_submission import (
     MAX_RENDERED_PROMPT_CHARS,
+    CorpusLeaseReleaseRequest,
+    CorpusLeaseRequest,
+    CorpusLeaseResponse,
     CorpusRejectReason,
     CorpusSkipRequest,
     CorpusSkipResponse,
@@ -90,6 +93,13 @@ SKIP_SCOPED_PATH = "/corpus/jobs/{job_id}/skip"
 # Check before starting an episode: which of the job's prompts still have a
 # slot, whatever its prompt order (a free job has no walk for `next` to read).
 OPEN_PATH = "/corpus/open"
+# A draw job's light leases (``corpus.draw_leases``).
+LEASE_PATH = "/corpus/lease"
+LEASE_RELEASE_PATH = "/corpus/lease/release"
+LEASE_SCOPED_PATH = "/corpus/jobs/{job_id}/lease"
+LEASE_RELEASE_SCOPED_PATH = "/corpus/jobs/{job_id}/lease/release"
+# A lease request is fresh within this many seconds of its ``issued_at``; its nonce is single-use meanwhile.
+LEASE_REQUEST_SKEW_SECONDS = 120.0
 OPEN_SCOPED_PATH = "/corpus/jobs/{job_id}/open"
 # How long one computed open map answers every caller, and what a client or a
 # proxy in front may keep it: a miner acts on it for minutes anyway.
@@ -1603,6 +1613,7 @@ def build_corpus_router(
     renderer: Renderer,
     verify_signature,
     verify_skip_signature=None,
+    verify_lease_signature=None,
     prompt_job_for=prompt_job_for_spec,
     max_write_attempts: int = DEFAULT_WRITE_ATTEMPTS,
     records=None,
@@ -1667,6 +1678,18 @@ def build_corpus_router(
     active_records: collections.Counter = collections.Counter()
     announced: set[str] = set()
     record_lock = asyncio.Lock()
+
+    # A draw job's light leases (``corpus.draw_leases``), in this process: a restart drops them.
+    leases_by_job: dict[str, Any] = {}
+    lease_nonces: dict[str, float] = {}
+
+    def _leases(job: JobSpec):
+        from reliquary.corpus.draw_leases import DrawLeases
+
+        leases = leases_by_job.get(job.job_id)
+        if leases is None:
+            leases = leases_by_job[job.job_id] = DrawLeases(job)
+        return leases
 
     def announce(sid: str) -> None:
         if sid not in announced and on_accepted is not None:
@@ -1984,6 +2007,10 @@ def build_corpus_router(
             # and its digests are salted with that attempt so an honest redo of a failed slot is no duplicate.
             seen_keys = draw_seen_keys(request.prompt_index, request.cursor, digests,
                                        [session_key] if session_key else ())
+            # Another hotkey's live lease on this slot: it is decoding it (``corpus.draw_leases``).
+            if _leases(job).refusal(request.miner_hotkey, request.prompt_index, request.cursor) is not None:
+                return _refuse(CorpusRejectReason.DRAW_SLOT_LEASED,
+                               {"prompt_index": request.prompt_index, "cursor": request.cursor})
         timing["checks"] = time.perf_counter() - started - timing["job_read"]
 
         record = None
@@ -2103,6 +2130,9 @@ def build_corpus_router(
             raise HTTPException(status_code=503, detail="corpus_ledger_contention") from None
         written = turn.verdict
 
+        if written is not None and drawn and (written.accepted or written.reason == CorpusRejectReason.DRAW_SLOT_TAKEN.value):
+            # The slot is taken: its leases end.
+            _leases(job).settle(request.prompt_index, request.cursor)
         if written is not None:
             if record is not None and not written.accepted:
                 # Concurrent retries of the same signed request can share a
@@ -2661,6 +2691,83 @@ def build_corpus_router(
             return None
         return state.slots.remaining(prompt_index)
 
+    def _lease_refused(reason, detail: dict | None = None) -> CorpusLeaseResponse:
+        return CorpusLeaseResponse(leased=False, reason=str(getattr(reason, "value", reason)), detail=detail or {})
+
+    async def _lease_gate(request) -> CorpusLeaseResponse | None:
+        """The job, the signature and the hotkey gates of a lease or a release; None when they pass."""
+        if request.job_id != job_id:
+            return _lease_refused(CorpusRejectReason.JOB_NOT_SERVED, {"job_id": request.job_id, "serves": [job_id]})
+        if verify_lease_signature is None:
+            return _lease_refused(CorpusRejectReason.SIGNATURE_UNVERIFIABLE)
+        try:
+            verified = verify_lease_signature(request)
+        except CorpusSignatureUnavailable:
+            return _lease_refused(CorpusRejectReason.SIGNATURE_UNVERIFIABLE)
+        if not verified:
+            return _lease_refused(CorpusRejectReason.BAD_SIGNATURE)
+        gated = await _hotkey_refusal(request.miner_hotkey)
+        return _lease_refused(gated) if gated is not None else None
+
+    async def lease_corpus(request: CorpusLeaseRequest) -> CorpusLeaseResponse:
+        """A light lease on one of this draw job's free slots (``corpus.draw_leases``)."""
+        now = time.time()
+        if abs(now - request.issued_at) > LEASE_REQUEST_SKEW_SECONDS:
+            return _lease_refused("stale_request", {"now": int(now)})
+        for nonce in [n for n, until in lease_nonces.items() if until <= now]:
+            del lease_nonces[nonce]
+        if request.nonce in lease_nonces:
+            return _lease_refused("replayed_request")
+        refused = await _lease_gate(request)
+        if refused is not None:
+            return refused
+        lease_nonces[request.nonce] = now + 2 * LEASE_REQUEST_SKEW_SECONDS
+        job = await _read_job_checked()
+        if job is None:
+            return _lease_refused(CorpusRejectReason.JOB_UNKNOWN, {"job_id": job_id})
+        if not has_draw(job):
+            return _lease_refused("not_a_draw_job")
+        state = await _read_state(job)
+        if state.slots.is_complete:
+            return _lease_refused(CorpusRejectReason.JOB_COMPLETE)
+
+        def grant():
+            from reliquary.corpus.draw_leases import free_draw_slots
+
+            seen = set(state.pending)
+            for ref in state.segments:
+                seen.update(seen_index._contents.get(ref.id, ()))
+            ledger = state.slots
+
+            def taken(prompt: int, slot: int) -> bool:
+                return slot_key(prompt, slot, ledger.slot_attempt(prompt, slot)) in seen
+
+            return _leases(job).grant(request.miner_hotkey, free_draw_slots(job, ledger, taken))
+
+        lease = await asyncio.to_thread(grant)
+        if lease is None:
+            return _lease_refused("no_free_slot")
+        if isinstance(lease, str):
+            return _lease_refused(lease)
+        return CorpusLeaseResponse(leased=True, reason="accepted", **lease.to_wire())
+
+    async def release_corpus_lease(request: CorpusLeaseReleaseRequest) -> CorpusLeaseResponse:
+        refused = await _lease_gate(request)
+        if refused is not None:
+            return refused
+        job = await _read_job_checked()
+        if job is None:
+            return _lease_refused(CorpusRejectReason.JOB_UNKNOWN, {"job_id": job_id})
+        released = _leases(job).release(request.miner_hotkey, request.lease_id)
+        return CorpusLeaseResponse(leased=False, reason="released" if released else "lease_unknown")
+
+    # Mounted like submit when this router serves alone (tests, a single job); the jobs router dispatches to them.
+    router.add_api_route(LEASE_PATH, lease_corpus, methods=["POST"], response_model=CorpusLeaseResponse)
+    router.add_api_route(LEASE_RELEASE_PATH, release_corpus_lease, methods=["POST"],
+                         response_model=CorpusLeaseResponse)
+    router.lease_corpus = lease_corpus
+    router.release_corpus_lease = release_corpus_lease
+    router.draw_leases = leases_by_job
     router.slots_remaining = slots_remaining
     # The handlers themselves, so `build_corpus_jobs_router` can dispatch to
     # this job without a second copy of any of them.
@@ -2845,6 +2952,16 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
         async with routes.admission(job_id) as served:
             return await served.skip_corpus(request)
 
+    @router.post(LEASE_SCOPED_PATH, response_model=CorpusLeaseResponse)
+    async def lease_corpus_scoped(job_id: str, request: CorpusLeaseRequest) -> CorpusLeaseResponse:
+        async with routes.admission(job_id) as served:
+            return await served.lease_corpus(request)
+
+    @router.post(LEASE_RELEASE_SCOPED_PATH, response_model=CorpusLeaseResponse)
+    async def release_corpus_lease_scoped(job_id: str, request: CorpusLeaseReleaseRequest) -> CorpusLeaseResponse:
+        async with routes.admission(job_id) as served:
+            return await served.release_corpus_lease(request)
+
     @router.post(SUBMIT_SCOPED_PATH, response_model=CorpusSubmissionResponse)
     async def submit_corpus_scoped(
         job_id: str, request: CorpusSubmissionRequest
@@ -2889,6 +3006,30 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
         async with routes.admission(request.job_id) as target:
             return await target.skip_corpus(request)
 
+    async def _lease_target(request):
+        if request.job_id in routes.retired:
+            raise HTTPException(status_code=410, detail=JOB_RETIRED)
+        if request.job_id not in routes.routers:
+            return None
+        return request.job_id
+
+    @router.post(LEASE_PATH, response_model=CorpusLeaseResponse)
+    async def lease_corpus_legacy(request: CorpusLeaseRequest) -> CorpusLeaseResponse:
+        # Dispatched on the body, as submit is.
+        if await _lease_target(request) is None:
+            return CorpusLeaseResponse(leased=False, reason=CorpusRejectReason.JOB_NOT_SERVED.value,
+                                       detail={"job_id": request.job_id, "serves": routes.open_jobs()})
+        async with routes.admission(request.job_id) as target:
+            return await target.lease_corpus(request)
+
+    @router.post(LEASE_RELEASE_PATH, response_model=CorpusLeaseResponse)
+    async def release_corpus_lease_legacy(request: CorpusLeaseReleaseRequest) -> CorpusLeaseResponse:
+        if await _lease_target(request) is None:
+            return CorpusLeaseResponse(leased=False, reason=CorpusRejectReason.JOB_NOT_SERVED.value,
+                                       detail={"job_id": request.job_id, "serves": routes.open_jobs()})
+        async with routes.admission(request.job_id) as target:
+            return await target.release_corpus_lease(request)
+
     @router.post(SUBMIT_PATH, response_model=CorpusSubmissionResponse)
     async def submit_corpus(request: CorpusSubmissionRequest) -> CorpusSubmissionResponse:
         # As a single job's route does: refused before any store is touched.
@@ -2918,6 +3059,10 @@ __all__ = [
     "NEXT_SCOPED_PATH",
     "OPEN_CACHE_SECONDS",
     "OPEN_MAX_PROMPTS",
+    "LEASE_PATH",
+    "LEASE_RELEASE_PATH",
+    "LEASE_RELEASE_SCOPED_PATH",
+    "LEASE_SCOPED_PATH",
     "OPEN_PATH",
     "OPEN_SCOPED_PATH",
     "SKIP_PATH",

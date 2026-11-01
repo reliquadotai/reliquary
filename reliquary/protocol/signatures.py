@@ -820,6 +820,44 @@ def verify_corpus_skip_signature(request) -> bool:
         return False
 
 
+# A draw job's light leases (``corpus.draw_leases``), each under its own domain.
+CORPUS_LEASE_DOMAIN = b"reliquary/corpus-lease/v1"
+CORPUS_LEASE_RELEASE_DOMAIN = b"reliquary/corpus-lease-release/v1"
+
+
+def build_corpus_lease_binding(request) -> bytes:
+    body = _corpus_fields(request)
+    if "lease_id" in body:
+        return _bound(CORPUS_LEASE_RELEASE_DOMAIN, [str(body["job_id"]).encode(), str(body["miner_hotkey"]).encode(),
+                                                   str(body["lease_id"]).encode()])
+    return _bound(CORPUS_LEASE_DOMAIN, [str(body["job_id"]).encode(), str(body["miner_hotkey"]).encode(),
+                                        int(body["issued_at"]).to_bytes(8, "big", signed=False),
+                                        str(body["nonce"]).encode()])
+
+
+def sign_corpus_lease(wallet, request) -> str:
+    """A lease request's or a release's signature (``CorpusLeaseRequest`` / ``CorpusLeaseReleaseRequest``)."""
+    if bt is None:
+        raise ImportError("bittensor is required for sign_corpus_lease")
+    return wallet.hotkey.sign(build_corpus_lease_binding(request)).hex()  # type: ignore[union-attr]
+
+
+def verify_corpus_lease_signature(request) -> bool:
+    """False on any failure; fail-closed without bittensor, like a submission."""
+    if bt is None:
+        return False
+    body = _corpus_fields(request)
+    try:
+        sig_bytes = bytes.fromhex(str(body.get("signature") or ""))
+        if not sig_bytes:
+            return False
+        keypair = bt.Keypair(ss58_address=str(body["miner_hotkey"]))  # type: ignore[union-attr]
+        return bool(keypair.verify(data=build_corpus_lease_binding(request), signature=sig_bytes))
+    except Exception as e:
+        logger.debug("corpus lease signature verify failed: %s", e)
+        return False
+
+
 # Sandbox session requests (plan 3), each under its own domain: an open never verifies
 # as a close, a submission or a skip.
 SANDBOX_OPEN_DOMAIN = b"reliquary/sandbox-session-open/v1"

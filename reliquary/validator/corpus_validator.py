@@ -683,6 +683,15 @@ def build_corpus_app(*, entry, job, store, records, tokenizer, renderer, verify_
     )
 
 
+def _lease_verifier(verify_skip_signature):
+    """The lease signature check beside a skip's: none when skips are not verified (a test's router)."""
+    if verify_skip_signature is None:
+        return None
+    from reliquary.protocol.signatures import verify_corpus_lease_signature
+
+    return verify_corpus_lease_signature
+
+
 def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
                           proof_chunk_tokens, prompt_job_for=None, vocab_size=None,
                           registration=None, contract=None,
@@ -704,6 +713,9 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
             job_id=str(served.entry.job_id), store=store, tokenizer=tokenizer,
             renderer=served.renderer, verify_signature=verify_signature,
             verify_skip_signature=verify_skip_signature,
+            # A draw job's light leases: verified for real wherever a skip is (tests pass their own fakes to
+            # ``build_corpus_router``).
+            verify_lease_signature=_lease_verifier(verify_skip_signature),
             prompt_job_for=(getattr(served, "prompt_job_for", None) or prompt_job_for
                             or prompt_job_for_spec),
             records=records,
