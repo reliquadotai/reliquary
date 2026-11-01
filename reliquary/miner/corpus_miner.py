@@ -680,7 +680,7 @@ class VllmGenerator:
     """
 
     def __init__(self, checkpoint_dir: str, sampling, proof, eos_token_id: int,
-                 gpu_memory_utilization: float | None = None) -> None:
+                 gpu_memory_utilization: float | None = None, max_prompt_tokens: int | None = None) -> None:
         import os
 
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -689,8 +689,9 @@ class VllmGenerator:
 
         from reliquary.miner.vllm_hidden_capture import capture_hidden_states
 
-        self._capture_cm = capture_hidden_states()
-        self._capture = self._capture_cm.__enter__()
+        # A forced-draw job's samples carry no proof (the draw is their check): nothing to capture.
+        self._capture_cm = None if getattr(sampling, "draw", None) is not None else capture_hidden_states()
+        self._capture = None if self._capture_cm is None else self._capture_cm.__enter__()
         # Only passed when set: a miner alone on its card keeps vLLM's own
         # default, one sharing it (e.g. with a validator) asks for less.
         memory = {} if gpu_memory_utilization is None else {"gpu_memory_utilization": gpu_memory_utilization}
@@ -700,7 +701,9 @@ class VllmGenerator:
         seed = secrets.randbelow(2**31 - 1) + 1
         # vLLM otherwise reserves the checkpoint's own maximum length, whose KV
         # cache need not fit the card; the job never asks for more than this.
-        extra = {"max_model_len": sampling.max_new_tokens + PROMPT_ALLOWANCE_TOKENS,
+        # A long-context job declares its longest prompt (``JobSpec.max_prompt_tokens``).
+        prompt_tokens = max(PROMPT_ALLOWANCE_TOKENS, int(max_prompt_tokens or 0))
+        extra = {"max_model_len": sampling.max_new_tokens + prompt_tokens,
                  "max_num_seqs": MAX_NUM_SEQS}
         if _has_vision_encoder(checkpoint_dir):
             # The job's prompts are text: skip the vision encoder's profiling.
@@ -784,6 +787,8 @@ class VllmGenerator:
         from reliquary.protocol.toploc_proof import build_chunk_proofs
 
         generations = []
+        if self._capture is None:
+            return [Generation(list(output.outputs[0].token_ids), []) for output in outputs]
         for index, (output, prompt_length) in enumerate(zip(outputs, prompt_lengths)):
             tokens = list(output.outputs[0].token_ids)
             # `pop`, not `for_request`: this generator lives for the whole

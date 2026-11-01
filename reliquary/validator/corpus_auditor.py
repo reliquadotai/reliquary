@@ -155,11 +155,9 @@ class CorpusAuditor:
         # Fetch, in the background, every drand round the pending records need.
         self._prefetch = prefetch_rounds
         self._job_id = job_id
-        # A forced-draw eval job (``corpus.eval_draw``): its samples are also judged against the draw, here, on
-        # the rows the proofs are checked against. Only with the model in this process.
+        # A forced-draw job (``corpus.eval_draw``): its samples carry no proof; each is judged against its draw
+        # alone, from the diagnostics whichever forward scores it computes (``corpus.draw_audit``).
         self._draw_job = draw_job
-        if draw_job is not None and (model is None or remote is not None or scorer is not None):
-            raise ValueError(f"job {job_id}: a forced-draw job is audited with the model in this process")
         # The job's ledger store: a failed sample of a forced-draw job reopens its prompt's slot there, so the next
         # draw slot replaces it (else the prompt stays full without the sample and the job never completes).
         self._slot_store = slot_store if draw_job is not None else None
@@ -451,6 +449,8 @@ class CorpusAuditor:
                 item = self._prepare_trajectory(record)
                 if min(item[1]) < 0 or max(item[1]) >= vocabulary:
                     results[i] = {"passed": False, "reason": REASON_TOKEN_OUT_OF_VOCAB, **worst_zero}
+                elif self._draw_job is not None:
+                    items.append((i, *item[:3], None, item[4]))
                 else:
                     items.append((i, *item))
                 continue
@@ -473,7 +473,7 @@ class CorpusAuditor:
             prompt = prompt_token_ids(self._tokenizer, record["rendered_prompt"])
             for c_idx, completion in enumerate(record["completions"]):
                 items.append((i, c_idx, prompt + list(completion["tokens"]), len(prompt),
-                              completion["proofs"], None))
+                              None if self._draw_job is not None else completion["proofs"], None))
         return results, items
 
     def _aggregate(self, records: list[dict], results: list[dict | None],
@@ -533,50 +533,67 @@ class CorpusAuditor:
         """Judge several records at once: every completion of every record that
         needs the GPU is packed, sorted by length, into shared forward passes."""
         results, items = self._prepare(records)
-        draws: dict[int, list] = {}
-        observe = None
-        if self._draw_job is not None:
-            def observe(k, rows):
-                draws[k] = self._draw_diagnostics(records[items[k][0]], items[k], rows)
         scores, forward_seconds, verify_seconds = score_sequences(
-            self._model, [(tokens, n, proofs) if spans is None else (tokens, n, proofs, spans)
-             for _, _, tokens, n, proofs, spans in items],
+            self._model, self._rows(records, items),
             chunk_tokens=self._proof.chunk_tokens, topk=self._proof.topk,
-            batch_tokens=AUDIT_BATCH_TOKENS, **({"observe": observe} if observe is not None else {}))
-        outcomes = {(item[0], item[1]): self._outcome(item, status, chunks)
-                    for item, (status, chunks) in zip(items, scores)}
-        self._aggregate(records, results, outcomes)
-        if self._draw_job is not None:
-            self._judge_draws(results, items, draws)
+            batch_tokens=AUDIT_BATCH_TOKENS)
+        self._verdicts(records, results, items, scores)
         self._log_batch(records, [(len(item[2]), item[0], item[1]) for item in items],
                         forward_seconds, verify_seconds)
         return results
 
-    def _draw_diagnostics(self, record: dict, item: tuple, rows):
-        """One sample's forced-draw diagnostics over its audited rows: a completion's, or a trajectory's model
-        spans, draw ``t`` counting its model tokens across turns."""
-        from reliquary.corpus import eval_draw
-        from reliquary.validator.verifier import _LazyLogitRows, _lm_head_vocab_size
+    def _draw_spec(self, record: dict, item: tuple):
+        """The public draw context of one sample of a draw job (``corpus.draw_audit``)."""
+        from reliquary.corpus.draw_audit import spec_for
 
-        _, c_idx, tokens, prompt_len, _, spans = item
-        if spans is None:
-            hidden, drawn = rows, list(tokens[prompt_len:])
-        else:
-            hidden = torch.cat(list(rows), dim=0)
-            drawn = [tokens[p] for start, end in spans for p in range(start, end)]
-        head = self._model.lm_head
-        logits = _LazyLogitRows(hidden, head, _lm_head_vocab_size(head), fp32_head=True)
-        u = eval_draw.uniforms(self._draw_job, int(record["prompt_index"]), int(record["cursor"]),
-                               c_idx, len(drawn))
-        return eval_draw.diagnostics(logits, drawn, u, self._draw_job)
+        return spec_for(self._draw_job, int(record["prompt_index"]), int(record["cursor"]), item[1])
+
+    def _rows(self, records: list[dict], items: list[tuple]) -> list[tuple]:
+        """``score_sequences`` rows of ``items``: a draw job's carry no proof and their draw context."""
+        if self._draw_job is None:
+            return [(tokens, n, proofs) if spans is None else (tokens, n, proofs, spans)
+                    for _, _, tokens, n, proofs, spans in items]
+        return [(tokens, n, None, spans, self._draw_spec(records[i], item).to_wire())
+                for item in items for i, _, tokens, n, _, spans in (item,)]
+
+    def _wire_items(self, records: list[dict], items: list[tuple]) -> list[dict]:
+        """The rows as a remote scorer's items (``corpus_audit_protocol``)."""
+        return [{"tokens": row[0], "prompt_len": row[1], "proofs": row[2],
+                 **({"spans": row[3]} if len(row) > 3 and row[3] is not None else {}),
+                 **({"draw": row[4]} if len(row) > 4 else {})}
+                for row in self._rows(records, items)]
+
+    def _verdicts(self, records: list[dict], results: list[dict | None], items: list[tuple],
+                  scores: list) -> list[dict]:
+        """Each record's verdict from its items' scores: the proof's thresholds over the chunk scores, or a draw
+        job's judge over the draw diagnostics (a score's third field)."""
+        if self._draw_job is None:
+            outcomes = {(item[0], item[1]): self._outcome(item, score[0], score[1])
+                        for item, score in zip(items, scores)}
+            return self._aggregate(records, results, outcomes)
+        from reliquary.corpus.draw_audit import diagnostics_from_wire
+        from reliquary.validator.corpus_audit import SCORE_OK, AuditOutcome
+
+        outcomes, draws = {}, {}
+        for k, (item, score) in enumerate(zip(items, scores)):
+            status = score[0]
+            outcomes[item[0], item[1]] = AuditOutcome(status == SCORE_OK, None if status == SCORE_OK else status)
+            if status == SCORE_OK:
+                if len(score) < 3 or score[2] is None:
+                    raise RuntimeError("a draw job's row was scored without its draw diagnostics")
+                draws[k] = diagnostics_from_wire(score[2])
+        self._aggregate(records, results, outcomes)
+        self._judge_draws(results, items, draws)
+        return results
 
     def _judge_draws(self, results: list[dict], items: list[tuple], draws: dict[int, object]) -> None:
-        """A record whose proofs passed fails when any of its samples does not follow the draw."""
+        """A record still passing fails when any of its samples does not follow the draw."""
         from reliquary.corpus import eval_draw
 
         by_record: dict[int, list] = {}
         for k, item in enumerate(items):
-            by_record.setdefault(item[0], []).append(draws[k])
+            if k in draws:
+                by_record.setdefault(item[0], []).append(draws[k])
         for i, diags in by_record.items():
             if not results[i].get("passed"):
                 continue
@@ -676,18 +693,15 @@ class CorpusAuditor:
         if not local and self._remote is not None and self._remote.connected():
             # An executor computes the chunk scores; the decision stays here.
             results, items = await self._in("codec", self._prepare, records)
-            # Trajectory rows carry their spans; the dispatcher leases them to
-            # v2 executors only, or scores them here.
-            scores = await self._remote.score(
-                [{"tokens": tokens, "prompt_len": n, "proofs": proofs,
-                  **({"spans": spans} if spans is not None else {})}
-                 for _, _, tokens, n, proofs, spans in items])
-            outcomes, scored_by = {}, {}
-            for item, (status, chunks, executor) in zip(items, scores):
-                outcomes[item[0], item[1]] = self._outcome(item, status, chunks)
+            # Trajectory rows carry their spans, a draw job's rows their draw; the dispatcher leases each to
+            # the executors that speak its protocol, or scores it here.
+            scores = await self._remote.score(self._wire_items(records, items))
+            scored_by = {}
+            for item, (_, _, executor, *_) in zip(items, scores):
                 if executor is not None:
                     scored_by.setdefault(item[0], set()).add(executor)
-            judged = self._aggregate(records, results, outcomes)
+            judged = self._verdicts(records, results, items,
+                                    [(status, chunks, *extra) for status, chunks, _, *extra in scores])
             for i, executors in scored_by.items():
                 judged[i] = {**judged[i], "scored_by": sorted(executors)}
             return judged
@@ -704,11 +718,14 @@ class CorpusAuditor:
         """``self._scorer`` over ``rows``: the single-turn rows in one request
         (as always), the trajectory rows in requests of at most
         EPISODE_GPU_REQUEST_TOKENS (one trajectory alone if longer)."""
-        single = [k for k, row in enumerate(rows) if len(row) == 3]
+        def single_turn(row):
+            return len(row) == 3 or row[3] is None
+
+        single = [k for k, row in enumerate(rows) if single_turn(row)]
         requests = [single] if single else []
         current, tokens = [], 0
         for k, row in enumerate(rows):
-            if len(row) == 3:
+            if single_turn(row):
                 continue
             size = len(row[0])
             if current and tokens + size > EPISODE_GPU_REQUEST_TOKENS:
@@ -741,13 +758,9 @@ class CorpusAuditor:
             called = time.monotonic()
             if items:
                 with self._timed("forward"):
-                    scores, forward, verify = await self._score_in_requests(
-                        [(tokens, n, proofs) if spans is None else (tokens, n, proofs, spans)
-                         for _, _, tokens, n, proofs, spans in items])
+                    scores, forward, verify = await self._score_in_requests(self._rows(records, items))
             called = time.monotonic() - called
-        outcomes = {(item[0], item[1]): self._outcome(item, status, chunks)
-                    for item, (status, chunks) in zip(items, scores)}
-        self._aggregate(records, results, outcomes)
+        self._verdicts(records, results, items, scores)
         self._log_batch(records, [(len(item[2]), item[0], item[1]) for item in items], forward, verify,
                         called)
         return results

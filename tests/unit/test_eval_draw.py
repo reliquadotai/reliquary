@@ -193,8 +193,16 @@ def test_a_request_named_draw_is_picked_beside_the_profiles_rows(monkeypatch):
     assert mixed == [profile[0], gumbel[1], profile[2], gumbel[3]]
 
 
+def _row_diag(job, head, record, item, rows):
+    """A sample's draw diagnostics as every audit path computes them (``corpus.draw_audit``)."""
+    from reliquary.corpus.draw_audit import diagnostics_from_wire, row_diagnostics, spec_for
+
+    spec = spec_for(job, int(record["prompt_index"]), int(record["cursor"]), item[1])
+    return diagnostics_from_wire(row_diagnostics(head, rows, item[2], item[3], item[5], spec))
+
+
 def test_the_auditor_judges_the_draw_on_the_audited_rows():
-    """``CorpusAuditor._draw_diagnostics`` over an fp32 head: the miner's tokens pass, a re-roll fails."""
+    """The draw diagnostics over an fp32 head: the miner's tokens pass, a re-roll fails."""
     from reliquary.validator.corpus_auditor import CorpusAuditor
 
     job = _job()
@@ -212,8 +220,8 @@ def test_the_auditor_judges_the_draw_on_the_audited_rows():
     record = {"prompt_index": 2, "cursor": 3}
     honest = _sample(logits, eval_draw.uniforms(job, 2, 3, 0, 40))
     reroll = _sample(logits, eval_draw.uniforms(job, 2, 4, 0, 40))
-    good = auditor._draw_diagnostics(record, item(honest), hidden)
-    bad = auditor._draw_diagnostics(record, item(reroll), hidden)
+    good = _row_diag(job, head, record, item(honest), hidden)
+    bad = _row_diag(job, head, record, item(reroll), hidden)
     results = [{"passed": True, "reason": None}, {"passed": True, "reason": None}]
     auditor._judge_draws(results, [(0, 0), (1, 0)], {0: good, 1: bad})
     assert results[0]["passed"] and results[0]["forced_draw"]["match"] == 1.0
@@ -234,7 +242,7 @@ def test_a_trajectory_is_drawn_over_its_model_tokens_across_turns():
     u = eval_draw.uniforms(job, 1, 0, 0, 14)
     model_tokens = _sample(logits, u)
     tokens = [1, 2, 3] + model_tokens[:6] + [50, 51, 52] + model_tokens[6:]
-    d = auditor._draw_diagnostics({"prompt_index": 1, "cursor": 0}, (0, 0, tokens, 1, [], spans), rows)
+    d = _row_diag(job, head, {"prompt_index": 1, "cursor": 0}, (0, 0, tokens, 1, [], spans), rows)
     assert d.n_positions == 14 and eval_draw.judge([d])[0]
 
 

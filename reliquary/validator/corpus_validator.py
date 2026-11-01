@@ -694,6 +694,7 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
     for every job. ``app.state.corpus_routes`` is the live routing table and
     ``app.state.corpus_router_for`` builds a router for a job wired later.
     """
+    from reliquary.corpus.eval_draw import has_draw
     from reliquary.validator.corpus_service import (
         CorpusJobRoutes, build_corpus_jobs_router, build_corpus_router, prompt_job_for_spec,
     )
@@ -707,7 +708,8 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
                             or prompt_job_for_spec),
             records=records,
             on_accepted=getattr(served, "on_accepted", None) or served.auditor.enqueue,
-            proof_chunk_tokens=proof_chunk_tokens,
+            # A draw job's samples carry no proof: the draw is their check.
+            proof_chunk_tokens=None if has_draw(getattr(served, "job", None)) else proof_chunk_tokens,
             vocab_size=vocab_size, is_banned=getattr(served, "is_banned", None),
             registration=registration,
             seen_index=getattr(served, "seen_index", None),

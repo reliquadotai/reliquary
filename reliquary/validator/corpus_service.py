@@ -362,6 +362,11 @@ class ChatTemplatePromptRenderer:
         self._thinking = thinking
 
     def initial_text(self, task: EpisodeTask) -> str:
+        from reliquary.corpus.encoding import is_token_ids_text
+
+        if is_token_ids_text(task.prompt):
+            # A prompt given as token ids is rendered already: the ids are the whole prompt.
+            return task.prompt
         tokenizer = self._tokenizer() if callable(self._tokenizer) and not hasattr(
             self._tokenizer, "apply_chat_template"
         ) else self._tokenizer
@@ -953,9 +958,10 @@ async def record_prompt_failure(store: Any, job: JobSpec, prompt_index: int,
     Compare-and-swap against the route's own writes, which retry on conflict."""
     from reliquary.eval.prompt_source import is_eval_source
 
-    if not is_eval_source(job.prompt_source):
-        # Any other job's slots are consumed for good, generation orders included.
-        raise ValueError(f"job {job.job_id!r} is not an eval job: its slots never reopen")
+    if not (is_eval_source(job.prompt_source) or has_draw(job)):
+        # Any other job's slots are consumed for good: a free-sampling generation order's included. A draw
+        # job's failed slot reopens with its own draw, so what it delivers never depends on what failed.
+        raise ValueError(f"job {job.job_id!r} is neither an eval nor a draw job: its slots never reopen")
     for _ in range(attempts):
         snapshot, etag = await store.read_ledgers(job.job_id)
         state = await asyncio.to_thread(rebuild_ledgers, job, snapshot)

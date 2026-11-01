@@ -27,6 +27,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from reliquary.corpus.encoding import token_ids_text
+
 EVAL_SOURCE_PREFIX = "eval-set:"
 # Job ids of evaluation jobs are `<admin task prefix>eval-`: the eval control
 # serves them, the corpus control never.
@@ -196,7 +198,12 @@ def register_eval_prompts(source: EvalSource, body: bytes) -> tuple[dict, ...]:
     rows = tuple(json.loads(line) for line in head.splitlines())
     if set_interaction(rows) == "single_turn":
         for row in rows:
-            if single_turn_messages(row.get("messages")) is None:
+            if "prompt_token_ids" in row:
+                # A prompt given as token ids, already rendered (a batch request's): exactly that, no messages.
+                if "messages" in row:
+                    raise ValueError(f"problem {row.get('problem_id')!r} carries both messages and token ids")
+                token_ids_text(row["prompt_token_ids"])
+            elif single_turn_messages(row.get("messages")) is None:
                 raise ValueError(f"problem {row.get('problem_id')!r} is not one user turn, "
                                  "optionally after one system turn")
     else:
@@ -279,6 +286,10 @@ class EvalSetEnvironment:
 
     def get_problem(self, index: int) -> dict:
         row = self._rows[int(index)]
+        if "prompt_token_ids" in row:
+            # Rendered already: the chat template renderer hands it back as it is (``encoding``).
+            return {"prompt": token_ids_text(row["prompt_token_ids"]), "id": row["problem_id"],
+                    "problem_id": row["problem_id"]}
         system, prompt = single_turn_messages(row["messages"])
         problem = {"prompt": prompt, "id": row["problem_id"], "problem_id": row["problem_id"]}
         if system is not None:

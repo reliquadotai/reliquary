@@ -83,6 +83,12 @@ class CreateJob(BaseModel):
     seed: int | None = Field(default=None, ge=0, le=2**63 - 1)
     audit_q: float | None = Field(default=None, gt=0.0, le=1.0)
     sampling: "OrderSampling | None" = None
+    # Eval and generation orders: every sample follows the job's public forced draw (``corpus.eval_draw``),
+    # checked by the audit in place of a proof; ``judge`` sets some of its thresholds (``corpus.job.DrawJudge``).
+    draw: Literal["gumbel_max"] | None = None
+    judge: dict[str, float | int] | None = Field(default=None, max_length=8)
+    # A long-context order: its longest prompt in tokens (miners size their engine to it).
+    max_prompt_tokens: int | None = Field(default=None, gt=0, le=131072)
     # A reviewed contract can be pinned before the first durable write.
     manifest_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     profile_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
@@ -95,6 +101,13 @@ class OrderSampling(BaseModel):
     temperature: float = Field(gt=0.0, le=4.0)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     top_k: int = Field(default=0, ge=0)
+    # Draw orders only (free-sampling miners do not apply it).
+    min_p: float = Field(default=0.0, ge=0.0, lt=1.0)
+
+    def conditions(self) -> dict:
+        """What a qualification records and an order repeats: min_p only when set, so the conditions of every
+        order without it read as before it existed."""
+        return self.model_dump(exclude=None if self.min_p else {"min_p"})
 
 
 class RequestQualification(BaseModel):
@@ -472,7 +485,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail=f"set {set_id} holds {card['count']} problems")
         # Thresholds hold only for the conditions they were measured under.
         wanted = {"set_id": set_id, "problems": body.prompt_count,
-                  "sampling": body.sampling.model_dump(), "max_new_tokens": body.max_new_tokens,
+                  "sampling": body.sampling.conditions(), "max_new_tokens": body.max_new_tokens,
                   "thinking": body.thinking}
         differs = sorted(k for k, v in wanted.items() if record.get(k) != v)
         if differs:
@@ -480,15 +493,14 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                                 detail=f"qualification_conditions_differ: {differs}")
         source = eval_source_for(set_id, prompts_body, body.prompt_count)
         register_eval_prompts(source, prompts_body)
-        seed = body.seed if body.seed is not None else int(
-            hashlib.sha256(body.job_id.encode()).hexdigest()[:15], 16)
+        seed = body.seed if body.seed is not None else job_seed(body.job_id)
         try:
             if record_order:
                 await eval_jobs.create({
                     "schema": qual.EVAL_JOB_SCHEMA, "job_id": body.job_id,
                     "qualification_id": body.qualification_id, "set_id": set_id,
                     "problems": body.prompt_count, "samples": body.samples_per_prompt,
-                    "sampling": body.sampling.model_dump(), "max_new_tokens": body.max_new_tokens,
+                    "sampling": body.sampling.conditions(), "max_new_tokens": body.max_new_tokens,
                     "thinking": body.thinking})
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -499,8 +511,19 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             seed=seed,
             toploc_thresholds=result["thresholds"], audit_params={"audit_q": 1.0},
             temperature=body.sampling.temperature, top_p=body.sampling.top_p,
-            top_k=body.sampling.top_k,
+            top_k=body.sampling.top_k, **draw_arguments(body),
         )
+
+    def job_seed(job_id: str) -> int:
+        return int(hashlib.sha256(job_id.encode()).hexdigest()[:15], 16)
+
+    def draw_arguments(body: CreateJob) -> dict:
+        """The order's forced draw, its judge and min_p (``prepare_corpus_job``); refused without a draw."""
+        if body.draw is None:
+            if body.judge is not None or (body.sampling is not None and body.sampling.min_p):
+                raise HTTPException(status_code=422, detail="judge and min_p set a forced draw: name draw")
+            return {}
+        return {"draw": body.draw, "judge": body.judge, "min_p": body.sampling.min_p}
 
     async def gen_job_arguments(body: CreateJob, *, record_order: bool) -> dict:
         """What a generation order on any model is declared from: its catalog
@@ -534,7 +557,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         refuse_unsupported(result)
         profile = ENVIRONMENT_CATALOG.get(body.env)
         wanted = {"env": body.env, "prompt_start": body.prompt_start,
-                  "problems": body.prompt_count, "sampling": body.sampling.model_dump(),
+                  "problems": body.prompt_count, "sampling": body.sampling.conditions(),
                   "max_new_tokens": body.max_new_tokens, "thinking": body.thinking,
                   # The package the rows render through, as it is here now.
                   "environment_manifest_sha256": getattr(
@@ -550,7 +573,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     "schema": qual.ORDER_JOB_SCHEMA, "job_id": body.job_id, "kind": qual.GENERATION,
                     "qualification_id": body.qualification_id, "env": body.env,
                     "prompt_start": body.prompt_start, "problems": body.prompt_count,
-                    "samples": body.samples_per_prompt, "sampling": body.sampling.model_dump(),
+                    "samples": body.samples_per_prompt, "sampling": body.sampling.conditions(),
                     "max_new_tokens": body.max_new_tokens, "thinking": body.thinking})
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -563,7 +586,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             audit_params={**GEN_AUDIT_PARAMS,
                           **({"audit_q": body.audit_q} if body.audit_q is not None else {})},
             temperature=body.sampling.temperature, top_p=body.sampling.top_p,
-            top_k=body.sampling.top_k,
+            top_k=body.sampling.top_k, **draw_arguments(body),
+            # A draw order's stream is keyed on its seed: the client's, else one derived from the job id.
+            **({"seed": body.seed if body.seed is not None else job_seed(body.job_id)} if body.draw else {}),
         )
 
     def operator_generation_job(body: CreateJob) -> bool:
@@ -605,10 +630,10 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if generation and not (body.task_id or body.job_id).startswith(gen_prefix):
             raise HTTPException(status_code=422, detail=(
                 f"a generation order's ids both start with {gen_prefix!r}"))
-        if generation and body.seed is not None:
-            raise HTTPException(status_code=422, detail="eval fields on a generation order")
+        if generation and body.seed is not None and body.draw is None:
+            raise HTTPException(status_code=422, detail="a seed keys a forced draw: name draw")
         if not evaluation and not generation and any(
-                v is not None for v in (body.qualification_id, body.seed, body.audit_q)):
+                v is not None for v in (body.qualification_id, body.seed, body.audit_q, body.draw, body.judge)):
             raise HTTPException(status_code=422, detail="eval fields on a non-eval job")
         cap = body.cap
         if evaluation:
@@ -644,6 +669,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 prompt_start=body.prompt_start, renderer_id=THINKING_RENDERERS[body.thinking],
                 slots_per_prompt=body.samples_per_prompt,
                 max_new_tokens=body.max_new_tokens, cap=cap, min_incentive_share=0.0,
+                **({"max_prompt_tokens": body.max_prompt_tokens} if body.max_prompt_tokens is not None else {}),
                 **arguments,
             )
         except (RegistryError, ValueError) as exc:

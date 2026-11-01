@@ -1229,6 +1229,7 @@ def build_job_manifest(
     episode=None,
     draw=None,
     min_p=0.0,
+    max_prompt_tokens=None,
     judge=None,
 ):
     """The manifest as the job store will hold it, refused unless every
@@ -1278,6 +1279,8 @@ def build_job_manifest(
             **({"min_p": min_p} if min_p else {}),
         },
         "slots_per_prompt": slots_per_prompt,
+        # A long-context job's longest prompt; absent, the miners' default allowance.
+        **({"max_prompt_tokens": max_prompt_tokens} if max_prompt_tokens is not None else {}),
         "filter": (
             None
             if grader_id is None
@@ -1370,7 +1373,7 @@ def prepare_corpus_job(
     min_new_tokens=2, temperature=1.0, top_p=1.0, top_k=0, n=1, grader_id=None,
     threshold=None, prompt_order="free", deadline_round=None, overrides=None,
     verification=None, seed=None, contract_environment=None, toploc_thresholds=None,
-    submit=None, episode=None, draw=None, judge=None, min_p=0.0,
+    submit=None, episode=None, draw=None, judge=None, min_p=0.0, max_prompt_tokens=None,
 ):
     """The manifest and the registry entry `jobs create` writes, built and
     checked without writing either (the admin service declares jobs with it).
@@ -1422,6 +1425,7 @@ def prepare_corpus_job(
         top_p=top_p,
         top_k=top_k,
         min_p=min_p,
+        max_prompt_tokens=max_prompt_tokens,
         min_new_tokens=min_new_tokens,
         max_new_tokens=max_new_tokens,
         n=n,
@@ -1678,6 +1682,9 @@ def jobs_create(
     top_p: float = typer.Option(1.0, "--top-p"),
     top_k: int = typer.Option(0, "--top-k"),
     min_p: float = typer.Option(0.0, "--min-p", help="With --draw: cut tokens under min-p times the most likely"),
+    max_prompt_tokens: int = typer.Option(
+        None, "--max-prompt-tokens", help="Long context: the job's longest prompt in tokens (miners size their "
+        "engine to it); default the miners' 8,192-token allowance"),
     draw: str = typer.Option(
         None, "--draw",
         help="Eval jobs: 'gumbel_max' forces every sample with the job's public draw at its --temperature, "
@@ -1813,6 +1820,7 @@ def jobs_create(
             deadline_round=deadline_round, overrides=overrides, verification=verification,
             contract_environment=contract_environment, seed=seed, episode=episode, draw=draw,
             judge=json.loads(draw_judge) if draw_judge is not None else None, min_p=min_p,
+            max_prompt_tokens=max_prompt_tokens,
         )
     except (RegistryError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -3308,7 +3316,8 @@ def corpus_mine(
         counts = mine_steps(
             job=job, hotkey=wallet.hotkey.ss58_address, client=client,
             generator=VllmGenerator(directory, job.sampling, proof, job.eos_token_id,
-                                    gpu_memory_utilization=gpu_memory_utilization),
+                                    gpu_memory_utilization=gpu_memory_utilization,
+                                    max_prompt_tokens=job.max_prompt_tokens),
             tokenizer=tokenizer, render=lambda i: renderer.initial_text(prompts.task_for(i)),
             sign=lambda body: sign_corpus_submission(wallet, body),
             # Full prompts are skipped, not generated for; an older validator

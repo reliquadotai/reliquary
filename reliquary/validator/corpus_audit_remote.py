@@ -33,6 +33,7 @@ from reliquary.validator.durable_attempts import DurableAttempts
 from reliquary.validator.corpus_audit_protocol import (
     AUDIT_PROTOCOL,
     AUDIT_PROTOCOL_V2,
+    AUDIT_PROTOCOL_V3,
     ITEM_ERROR,
     ITEM_OK,
     MAX_LEASE_ITEMS,
@@ -217,19 +218,43 @@ def _lease_units(items: Sequence[dict]) -> list[list[int]]:
     return units
 
 
+def _misfit(score, item: dict) -> bool:
+    """A result item that does not fit its lease item: a drawn item scores no chunk and returns its draw's
+    diagnostics; a proven one, one chunk per proof."""
+    if score.status != ITEM_OK:
+        return False
+    if item.get("draw") is not None:
+        return bool(score.chunks) or score.draw is None
+    return score.draw is not None or len(score.chunks) != len(item["proofs"])
+
+
+def converted_scores(scores) -> list:
+    """A result's ``ItemScore``s as ``(status, chunks[, diagnostics])``."""
+    return [(s.status, tuple(ChunkResult(int(e), float(m), float(d)) for e, m, d in s.chunks),
+             *(() if s.draw is None else (s.draw,))) for s in scores]
+
+
 def scores_agree(remote: Sequence[Score], local: Sequence[Score], proof, *,
                  exp_drift: int = RECHECK_EXP_DRIFT,
                  mant_drift_fraction: float = RECHECK_MANT_DRIFT_FRACTION) -> bool:
     """The same decision per item, and every chunk measure within the
-    cross-hardware drift (a small fraction of the threshold, never a whole one)."""
+    cross-hardware drift (a small fraction of the threshold, never a whole one).
+    A drawn item's diagnostics: the same positions, exact picks within one."""
+    from reliquary.corpus.draw_audit import diagnostics_agree
     from reliquary.validator.corpus_audit import outcome_from_scores
 
     if len(remote) != len(local):
         return False
+    for r, l in zip(remote, local):
+        if (len(r) > 2) != (len(l) > 2):
+            return False
+        if len(r) > 2 and (r[0] != l[0] or not diagnostics_agree(r[2], l[2])):
+            return False
+    pairs = [(r[:2], l[:2]) for r, l in zip(remote, local) if len(r) <= 2]
     thresholds = proof.thresholds()
     mean_drift = mant_drift_fraction * thresholds.mant_mean
     median_drift = mant_drift_fraction * thresholds.mant_median
-    for (r_status, r_chunks), (l_status, l_chunks) in zip(remote, local):
+    for (r_status, r_chunks), (l_status, l_chunks) in pairs:
         if r_status != l_status or len(r_chunks) != len(l_chunks):
             return False
         if (outcome_from_scores(r_status, r_chunks, proof).passed
@@ -486,19 +511,25 @@ class RemoteAuditDispatcher(ExecutorLeases):
         return any(protocol in self._protocols.get(eid, (AUDIT_PROTOCOL,))
                    for eid in self._live_executors())
 
-    async def score(self, items: Sequence[dict]) -> list[tuple[str, tuple, str | None]]:
-        """``(status, chunks, scored_by)`` for each item (``tokens``,
-        ``prompt_len``, ``proofs``); ``scored_by`` is None when the control
-        computed it."""
+    async def score(self, items: Sequence[dict]) -> list[tuple]:
+        """``(status, chunks, scored_by[, diagnostics])`` for each item (``tokens``,
+        ``prompt_len``, ``proofs``; a drawn item's ``draw`` adds its diagnostics);
+        ``scored_by`` is None when the control computed it."""
         loop = asyncio.get_running_loop()
         units = []
-        # Rows with spans lease apart: v1 rows never wait for a v2 executor.
-        spanned = [k for k, item in enumerate(items) if item.get("spans") is not None]
-        plain = [k for k, item in enumerate(items) if item.get("spans") is None]
-        for protocol, group in ((AUDIT_PROTOCOL, plain), (AUDIT_PROTOCOL_V2, spanned)):
-            # One trajectory per v2 lease: a 60k prefill takes ~16 s (M3), and
+        # Rows with spans lease apart: v1 rows never wait for a v2 executor; drawn rows go v3.
+        drawn = [k for k, item in enumerate(items) if item.get("draw") is not None]
+        spanned = [k for k, item in enumerate(items)
+                   if item.get("spans") is not None and item.get("draw") is None]
+        plain = [k for k, item in enumerate(items) if item.get("spans") is None and item.get("draw") is None]
+        drawn_spanned = [k for k in drawn if items[k].get("spans") is not None]
+        drawn_plain = [k for k in drawn if items[k].get("spans") is None]
+        for protocol, group, alone in ((AUDIT_PROTOCOL, plain, False), (AUDIT_PROTOCOL_V2, spanned, True),
+                                       (AUDIT_PROTOCOL_V3, drawn_plain, False),
+                                       (AUDIT_PROTOCOL_V3, drawn_spanned, True)):
+            # One trajectory per lease: a 60k prefill takes ~16 s (M3), and
             # several would outrun the lease and strike an honest executor.
-            grouped = ([[k] for k in range(len(group))] if protocol == AUDIT_PROTOCOL_V2
+            grouped = ([[k] for k in range(len(group))] if alone
                        else _lease_units([items[k] for k in group]))
             for unit in grouped:
                 indexes = [group[k] for k in unit]
@@ -511,8 +542,8 @@ class RemoteAuditDispatcher(ExecutorLeases):
         scored: list = [None] * len(items)
         for indexes, work in units:
             scores, scored_by = await (asyncio.shield(work.future) if self._attempt_store else work.future)
-            for k, (status, chunks) in zip(indexes, scores):
-                scored[k] = (status, chunks, scored_by)
+            for k, (status, chunks, *extra) in zip(indexes, scores):
+                scored[k] = (status, chunks, scored_by, *extra)
         return scored
 
     # -- the executor's side -----------------------------------------------
@@ -542,9 +573,10 @@ class RemoteAuditDispatcher(ExecutorLeases):
                 "chunk_tokens": self._proof.chunk_tokens, "topk": self._proof.topk,
                 "expires_at": lease.expires_at,
                 "items": [{"tokens": list(i["tokens"]), "prompt_len": int(i["prompt_len"]),
-                           "proofs": list(i["proofs"]),
+                           "proofs": list(i.get("proofs") or ()),
                            **({"spans": [list(s) for s in i["spans"]]}
-                              if i.get("spans") is not None else {})}
+                              if i.get("spans") is not None else {}),
+                           **({"draw": i["draw"]} if i.get("draw") is not None else {})}
                           for i in work.items],
             }
             if work.protocol == AUDIT_PROTOCOL_V2:
@@ -566,9 +598,7 @@ class RemoteAuditDispatcher(ExecutorLeases):
             raise LeaseRefused(410, "lease_expired")
         self._strikes[executor_id] = 0
         scores = result.scores
-        if len(scores) != len(work.items) or any(
-                s.status == ITEM_OK and len(s.chunks) != len(item["proofs"])
-                for s, item in zip(scores, work.items)):
+        if len(scores) != len(work.items) or any(_misfit(s, item) for s, item in zip(scores, work.items)):
             self._requeue(work)
             raise LeaseRefused(422, "result_does_not_fit_the_lease")
         if any(s.status == ITEM_ERROR for s in scores):
@@ -576,8 +606,7 @@ class RemoteAuditDispatcher(ExecutorLeases):
             self.stats["executor_errors"] += 1
             self._requeue(work)
             return "requeued"
-        converted = [(s.status, tuple(ChunkResult(int(e), float(m), float(d))
-                                      for e, m, d in s.chunks)) for s in scores]
+        converted = converted_scores(scores)
         self.stats["scored"] += 1
         if getattr(work, "recheck_drawn", None) is None:
             work.recheck_drawn = self._rng.random() < self._fraction

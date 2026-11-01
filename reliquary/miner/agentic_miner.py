@@ -627,7 +627,9 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
     stop_ids = sorted(renderer.stop_ids)
     drawn = has_draw(job)
     # A forced-draw eval job: every turn draws its sample's stream over an fp32 LM head (``corpus.eval_draw``).
-    core = VllmTurnCore(checkpoint_dir, sampling=job.sampling, proof=proof, stop_token_ids=stop_ids,
+    # Its turns carry no proof either: the draw is their check (nothing captured, preemption allowed).
+    core = VllmTurnCore(checkpoint_dir, sampling=job.sampling, proof=None if drawn else proof,
+                        stop_token_ids=stop_ids,
                         max_total_tokens=job.episode.max_total_tokens, max_num_seqs=max_num_seqs,
                         gpu_memory_utilization=gpu_memory_utilization,
                         **({"forced": True, "lm_head_fp32": True} if drawn else {}))
