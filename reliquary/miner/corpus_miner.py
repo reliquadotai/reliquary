@@ -448,7 +448,9 @@ def release_body(job_id: str, hotkey: str, lease_id: str, sign_lease) -> dict:
 
 
 # A lease refusal after which the miner picks slots from the open map as before (an older validator's answer).
-_LEASE_FALLBACK = frozenset({"signature_unverifiable", "not_a_draw_job", "job_not_served"})
+_LEASE_FALLBACK = frozenset({"signature_unverifiable", "not_a_draw_job", "job_not_served",
+                             # This host's clock or key does not suit the validator: slots from the map as before.
+                             "stale_request", "bad_signature"})
 # Every slot leased or pending its audit: ask again after this many seconds.
 LEASE_WAIT_SECONDS = 30.0
 
@@ -521,6 +523,10 @@ def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
         answer = _retry(lambda: client.submit(body), **retry_kwargs)
         reason = str(answer.get("reason"))
         counts[reason] += 1
+        if lease_id is not None and not answer.get("accepted") and reason != REASON_DRAW_SLOT_TAKEN:
+            # Refused but not taken: the slot is free again for another miner at once.
+            _retry(lambda: client.release_lease(release_body(job.job_id, hotkey, lease_id, sign_lease)),
+                   **retry_kwargs)
         if reason == "job_complete":
             break
         if reason in _HALT:

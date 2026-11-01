@@ -15,14 +15,18 @@ from __future__ import annotations
 
 import random
 import secrets
+import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
 REASON_DRAW_SLOT_LEASED = "draw_slot_leased"
-# Live leases one hotkey may hold on one job: a miner's batch of concurrent samples, not the whole job.
+# Live leases one hotkey may hold on one job: a miner's batch of concurrent samples, never more than a share of the
+# job's slots, and halved for each of its leases that expired unused within the last lease time (a hotkey that holds
+# slots and never submits them ends with one).
 MAX_LEASES_PER_HOTKEY = 64
+MAX_JOB_SHARE_PER_HOTKEY = 0.25
 # A second lessee on a slot whose lease has run this share of its time (the job's tail).
 SECOND_LESSEE_AFTER = 0.5
 # Lease time: a floor, plus the job's longest sample at a slow decode rate.
@@ -65,6 +69,10 @@ class DrawLeases:
         self.seconds = float(seconds if seconds is not None else lease_seconds(job))
         self._by_id: dict[str, Lease] = {}
         self._by_slot: dict[tuple[int, int], list[str]] = {}
+        # Each hotkey's leases that expired unused, by when they expired.
+        self._unused: dict[str, list[float]] = {}
+        # The route grants off the event loop and refuses and settles on it.
+        self._lock = threading.RLock()
 
     # -- bookkeeping ---------------------------------------------------------
 
@@ -80,21 +88,41 @@ class DrawLeases:
             self._by_slot.pop(key, None)
 
     def expire(self) -> None:
-        now = self._clock()
-        for lease_id in [i for i, lease in self._by_id.items() if lease.expires_at <= now]:
-            self._drop(lease_id)
+        with self._lock:
+            now = self._clock()
+            for lease_id in [i for i, lease in self._by_id.items() if lease.expires_at <= now]:
+                lease = self._by_id[lease_id]
+                self._unused.setdefault(lease.hotkey, []).append(lease.expires_at)
+                self._drop(lease_id)
+            for hotkey in list(self._unused):
+                recent = [t for t in self._unused[hotkey] if now - t < self.seconds]
+                if recent:
+                    self._unused[hotkey] = recent
+                else:
+                    del self._unused[hotkey]
 
     def holders(self, prompt_index: int, slot: int) -> list[Lease]:
-        self.expire()
-        return [self._by_id[i] for i in self._by_slot.get((int(prompt_index), int(slot)), ())]
+        with self._lock:
+            self.expire()
+            return [self._by_id[i] for i in self._by_slot.get((int(prompt_index), int(slot)), ())]
 
     def held_by(self, hotkey: str) -> list[Lease]:
-        self.expire()
-        return [lease for lease in self._by_id.values() if lease.hotkey == hotkey]
+        with self._lock:
+            self.expire()
+            return [lease for lease in self._by_id.values() if lease.hotkey == hotkey]
+
+    def cap(self, hotkey: str) -> int:
+        """The live leases this hotkey may hold now (``MAX_LEASES_PER_HOTKEY``)."""
+        with self._lock:
+            self.expire()
+            share = int(MAX_JOB_SHARE_PER_HOTKEY * self._job.prompt_count * int(self._job.slots_per_prompt))
+            cap = max(1, min(self._max, share))
+            return max(1, cap >> len(self._unused.get(hotkey, ())))
 
     def __len__(self) -> int:
-        self.expire()
-        return len(self._by_id)
+        with self._lock:
+            self.expire()
+            return len(self._by_id)
 
     # -- the miner's side ----------------------------------------------------
 
@@ -102,8 +130,12 @@ class DrawLeases:
         """A lease for ``hotkey`` on a free slot: an unleased one, else (the job's tail) one leased to another hotkey
         for more than half its time. ``free_slots(start)`` yields the job's open ``(prompt, slot)``, prompts from
         ``start`` round. None: no slot to lease; a string: why this hotkey gets none."""
+        with self._lock:
+            return self._grant(hotkey, free_slots)
+
+    def _grant(self, hotkey, free_slots):
         self.expire()
-        if len(self.held_by(hotkey)) >= self._max:
+        if len(self.held_by(hotkey)) >= self.cap(hotkey):
             return "too_many_leases"
         now = self._clock()
         span = self._job.prompt_count
@@ -128,11 +160,12 @@ class DrawLeases:
         return lease
 
     def release(self, hotkey: str, lease_id: str) -> bool:
-        lease = self._by_id.get(lease_id)
-        if lease is None or lease.hotkey != hotkey:
-            return False
-        self._drop(lease_id)
-        return True
+        with self._lock:
+            lease = self._by_id.get(lease_id)
+            if lease is None or lease.hotkey != hotkey:
+                return False
+            self._drop(lease_id)
+            return True
 
     # -- the submission's side -----------------------------------------------
 
@@ -145,8 +178,9 @@ class DrawLeases:
 
     def settle(self, prompt_index: int, slot: int) -> None:
         """The slot was taken: every lease on it ends."""
-        for lease_id in list(self._by_slot.get((int(prompt_index), int(slot)), ())):
-            self._drop(lease_id)
+        with self._lock:
+            for lease_id in list(self._by_slot.get((int(prompt_index), int(slot)), ())):
+                self._drop(lease_id)
 
 
 def free_draw_slots(job: Any, slots_ledger: Any, taken: Callable[[int, int], bool]):

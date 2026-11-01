@@ -1682,6 +1682,8 @@ def build_corpus_router(
     # A draw job's light leases (``corpus.draw_leases``), in this process: a restart drops them.
     leases_by_job: dict[str, Any] = {}
     lease_nonces: dict[str, float] = {}
+    # The taken keys of the ledger version last leased from: rebuilt once per version, not per request.
+    lease_seen: dict[str, Any] = {}
 
     def _leases(job: JobSpec):
         from reliquary.corpus.draw_leases import DrawLeases
@@ -2734,9 +2736,12 @@ def build_corpus_router(
         def grant():
             from reliquary.corpus.draw_leases import free_draw_slots
 
-            seen = set(state.pending)
-            for ref in state.segments:
-                seen.update(seen_index._contents.get(ref.id, ()))
+            if lease_seen.get("state") is not state:
+                built = set(state.pending)
+                for ref in state.segments:
+                    built.update(seen_index._contents.get(ref.id, ()))
+                lease_seen.update(state=state, seen=built)
+            seen = lease_seen["seen"]
             ledger = state.slots
 
             def taken(prompt: int, slot: int) -> bool:

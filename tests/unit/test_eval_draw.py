@@ -60,7 +60,7 @@ def test_a_draw_job_is_a_gumbel_draw():
 
 
 @pytest.mark.parametrize("overrides", [
-    {"seed": None}, {"prompt_source": "openmathinstruct"}, {"prompt_order": "miner_walk"},
+    {"seed": None}, {"prompt_order": "miner_walk"},
 ])
 def test_a_draw_job_is_a_seeded_free_order_eval_job(overrides):
     raw = _raw(**overrides)

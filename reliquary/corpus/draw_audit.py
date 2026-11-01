@@ -127,9 +127,29 @@ def diagnostics_from_wire(raw: Mapping) -> SeedConsistencyDiagnostics:
                                       last_miss=float(misses[1]))
 
 
-def diagnostics_agree(a: Mapping, b: Mapping, *, slack: int = 1) -> bool:
-    """Two executors' diagnostics of one row agree: same positions, exact counts within ``slack``."""
-    return (a["positions"] == b["positions"] and abs(a["exact"] - b["exact"]) <= slack)
+# Two honest scorers of one row, on different hardware: exact picks within one, the gaps the judge reads (the worst
+# miss's and the last token's, ``eval_draw.judge``) within a near-tie's drift. A scorer that hides an edit (a gap of 4
+# or more reported as 0) or invents one disagrees.
+GAP_AGREEMENT = 1.0
+
+
+def _gap(miss: float) -> float:
+    return -math.log1p(-miss) if miss < 1.0 else math.inf
+
+
+def diagnostics_agree(a: Mapping, b: Mapping, *, slack: int = 1, gap_slack: float = GAP_AGREEMENT) -> bool:
+    """Two scorers' diagnostics of one row agree: the same positions, exact picks within ``slack``, and the worst
+    and last gaps within ``gap_slack`` (both infinite, or both finite and close)."""
+    if a["positions"] != b["positions"] or abs(a["exact"] - b["exact"]) > slack:
+        return False
+    for name in ("max_miss", "last_miss"):
+        ga, gb = _gap(float(a[name])), _gap(float(b[name]))
+        if math.isinf(ga) or math.isinf(gb):
+            if ga != gb:
+                return False
+        elif abs(ga - gb) > gap_slack:
+            return False
+    return True
 
 
 __all__ = ["DrawSpec", "diagnostics_agree", "diagnostics_from_wire", "diagnostics_to_wire", "row_diagnostics",

@@ -298,3 +298,118 @@ def test_a_draw_jobs_verdict_is_its_judge_alone():
     assert not results[2]["passed"] and results[2]["reason"] == "error"
     with pytest.raises(RuntimeError):
         auditor._verdicts(records[:1], [None], items[:1], [("ok", ())])
+
+
+# ------------------------------------------------------------------ review fixes
+
+
+def test_diagnostics_agree_on_the_gaps_the_judge_reads():
+    import math
+
+    honest = {"positions": 1000, "stochastic": 500, "exact": 990, "max_miss": 1 - math.exp(-0.6), "last_miss": 0.0}
+    assert draw_audit.diagnostics_agree(honest, {**honest, "exact": 991, "max_miss": 1 - math.exp(-1.2)})
+    # An edit (gap 5) reported as none, a cut end hidden, an impossible token hidden: disagreements.
+    edited = {**honest, "max_miss": 1 - math.exp(-5.0)}
+    assert not draw_audit.diagnostics_agree(edited, honest)
+    assert not draw_audit.diagnostics_agree({**honest, "last_miss": 1 - math.exp(-4.0)}, honest)
+    assert not draw_audit.diagnostics_agree({**honest, "max_miss": 1.0}, honest)
+    assert draw_audit.diagnostics_agree({**honest, "max_miss": 1.0}, {**honest, "max_miss": 1.0})
+
+
+def test_an_eval_pair_that_agrees_on_counts_but_not_the_decision_calls_a_third():
+    import asyncio
+
+    from reliquary.corpus.job import DEFAULT_DRAW_JUDGE
+    from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS as PROOF
+    from reliquary.validator.corpus_audit_protocol import AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3, AuditResult
+    from tests.unit.test_eval_control import MODEL_A, _executor, _Harness
+
+    items = [{"tokens": [1, 2, 3, 4], "prompt_len": 2, "proofs": None, "draw": spec().to_wire()}]
+    v3 = (AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3)
+
+    def result(exact):
+        return AuditResult.model_validate({"scores": [{"status": "ok", "chunks": [],
+                                                       "draw": _diag(exact, 1000)}]})
+
+    async def go():
+        h = _Harness()
+        scoring = asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF, "j", DEFAULT_DRAW_JUDGE).score(items))
+        await asyncio.sleep(0)
+        a = h.dispatcher.claim(_executor("a"), v3)
+        b = h.dispatcher.claim(_executor("b"), v3)
+        # 20 misses passes the 2 % floor of 1,000 positions, 21 does not: within one of each other.
+        await h.dispatcher.result("a", a["lease_id"], result(980))
+        await h.dispatcher.result("b", b["lease_id"], result(979))
+        assert not scoring.done() and h.dispatcher.stats["parked"] == 0
+        assert h.dispatcher.status()["models"][f"{MODEL_A[0]}@{MODEL_A[1]}"]["waiting_draw_batches"] == 1
+        c = h.dispatcher.claim(_executor("c"), v3)
+        await h.dispatcher.result("c", c["lease_id"], result(980))
+        (status, _, by, _), = await scoring
+        assert by == ("a", "c") and h.quarantined == ["b"]
+
+    asyncio.run(go())
+
+
+def test_the_status_counts_draw_executors_for_draw_batches():
+    import asyncio
+
+    from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS as PROOF
+    from tests.unit.test_eval_control import MODEL_A, _executor, _Harness
+
+    items = [{"tokens": [1, 2, 3, 4], "prompt_len": 2, "proofs": None, "draw": spec().to_wire()}]
+
+    async def go():
+        h = _Harness()
+        scoring = asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF, "j").score(items))
+        await asyncio.sleep(0)
+        for name in ("old1", "old2"):
+            assert h.dispatcher.claim(_executor(name)) is None
+        model = h.dispatcher.status()["models"][f"{MODEL_A[0]}@{MODEL_A[1]}"]
+        assert model["executors_needed"] == 2 and model["live_draw_executors"] == 0
+        scoring.cancel()
+
+    asyncio.run(go())
+
+
+def test_an_executor_offers_v3_again_after_a_control_refused_it():
+    import asyncio
+
+    from reliquary.validator.corpus_audit_executor import EVAL_AUDIT_PREFIX, V3_RETRY_SECONDS, AuditExecutor
+
+    claims, now, upgraded = [], [0.0], [False]
+
+    class Http:
+        async def post(self, path, json=None, **kw):
+            if path.endswith("/claim"):
+                claims.append("protocols" in json)
+                refused = "protocols" in json and not upgraded[0]
+                status = 422 if refused else 204
+            else:
+                status = 200
+            return type("R", (), {"status_code": status, "raise_for_status": lambda self: None,
+                                  "json": lambda self: {}})()
+
+    executor = AuditExecutor(http=Http(), executor_id="pod-1", token="x", model_id="m", model_revision="r",
+                             load_model=lambda m, r: None, prefix=EVAL_AUDIT_PREFIX, clock=lambda: now[0])
+    executor.heartbeat_if_due = lambda: asyncio.sleep(0)
+    asyncio.run(executor.step())
+    assert claims == [True, False]                     # refused, then claimed as before
+    asyncio.run(executor.step())
+    assert claims[-1] is False                         # not offered again at once
+    upgraded[0] = True
+    now[0] += V3_RETRY_SECONDS + 1
+    asyncio.run(executor.step())
+    assert claims[-1] is True
+
+
+def test_a_recheck_catches_an_executor_hiding_an_edit():
+    import math
+
+    from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS as PROOF
+    from reliquary.validator.corpus_audit_remote import scores_agree
+
+    local = [("ok", (), {"positions": 1000, "stochastic": 500, "exact": 995,
+                         "max_miss": 1 - math.exp(-6.0), "last_miss": 0.0})]
+    hidden = [("ok", (), {**local[0][2], "max_miss": 0.0})]
+    assert scores_agree(local, local, PROOF)
+    assert not scores_agree(hidden, local, PROOF)

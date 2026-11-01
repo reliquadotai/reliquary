@@ -80,7 +80,7 @@ def test_the_tail_goes_to_a_second_lessee_after_half_the_lease():
     # Both may submit; the first valid one takes it. Never a third, never the holder twice.
     assert leases.refusal("a", first.prompt_index, first.slot) is None
     assert leases.refusal("b", first.prompt_index, first.slot) is None
-    assert leases.grant("c", free) is None and leases.grant("a", free) is None
+    assert leases.grant("c", free) is None and leases.grant("a", free) in (None, "too_many_leases")
 
 
 def test_a_hotkey_holds_a_bounded_number_of_leases():
@@ -88,6 +88,17 @@ def test_a_hotkey_holds_a_bounded_number_of_leases():
     assert all(leases.grant("a", free) is not None for _ in range(3))
     assert leases.grant("a", free) == "too_many_leases"
     assert leases.grant("b", free) is not None
+
+
+def test_a_hotkey_whose_leases_expire_unused_holds_fewer():
+    _, _, _, clock, leases, free = _setup(prompts=10, slots=4)
+    assert leases.cap("a") == 10                      # a quarter of the job's 40 slots
+    for _ in range(2):
+        leases.grant("a", free)
+    clock.now += 101
+    assert leases.cap("a") == 2 and leases.cap("b") == 10
+    clock.now += 101                                   # a lease time later, forgotten
+    assert leases.cap("a") == 10
 
 
 def test_closed_prompts_and_exhausted_slots_are_never_leased():
@@ -285,3 +296,14 @@ def test_a_validator_without_leases_is_mined_from_the_open_map():
     client = _LeasingClient([], has_route=False)
     counts = _mine(client, _Gen(), sign_lease=lambda body: "lsig", max_steps=1)
     assert client.lease_bodies == [] and counts.get("job_complete", 0) == 0 and client.submitted
+
+
+def test_a_refused_submission_releases_its_lease():
+    class Refusing(_LeasingClient):
+        def submit(self, body):
+            self.submitted.append((body["prompt_index"], body["cursor"]))
+            return {"accepted": False, "reason": "bad_termination"}
+
+    client = Refusing([_granted(3, 1, "a" * 32)])
+    _mine(client, _Gen(), sign_lease=lambda body: "lsig")
+    assert client.released == ["a" * 32]

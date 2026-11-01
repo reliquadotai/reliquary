@@ -205,6 +205,8 @@ class PairedAuditDispatcher:
         self._unwritten: dict[str, str] = {}
         self._documents: dict[str, dict] = {}
         self._detail: dict[str, dict] = {}
+        # The audit protocols each executor last claimed with: a v3 (draw) batch waits for v3 executors only.
+        self._protocols: dict[str, tuple[str, ...]] = {}
         self._written: dict[str, tuple[float, dict]] = {}
         # job id -> why it needs attention (parked batches), for the status.
         self.attention: dict[str, list[str]] = collections.defaultdict(list)
@@ -301,6 +303,7 @@ class PairedAuditDispatcher:
         Raises ``LeaseRefused(409)`` for an executor whose placement is unknown."""
         executor_id = document["executor_id"]
         self.heartbeat(executor_id, document)
+        self._protocols[executor_id] = tuple(protocols)
         place = _placement(document)
         if place is None:
             raise LeaseRefused(409, "executor_provider_unknown")
@@ -368,11 +371,14 @@ class PairedAuditDispatcher:
         if len(batch.scores) < 2:
             return
         ids = sorted(batch.scores)
-        pairs = [(e, o) for k, e in enumerate(ids) for o in ids[k + 1:]
-                 if scores_agree(batch.scores[e], batch.scores[o], batch.proof)]
 
         def decision(executor_id: str) -> tuple:
             return tuple(_passes(score, batch) for score in batch.scores[executor_id])
+
+        # A pair agrees on the measures and on the decision: two honest scorers either side of a judge's floor
+        # by drift call a third, rather than parking the batch.
+        pairs = [(e, o) for k, e in enumerate(ids) for o in ids[k + 1:]
+                 if scores_agree(batch.scores[e], batch.scores[o], batch.proof) and decision(e) == decision(o)]
 
         decisions = {decision(e) for pair in pairs for e in pair}
         members = sorted({e for pair in pairs for e in pair})
@@ -419,12 +425,21 @@ class PairedAuditDispatcher:
             waiting = [b for b in queue if not b.future.done()]
             live = self.live_executors(model)
             providers = {_placement(d)[0] for d in live}
-            hosts = {_placement(d)[1] for d in live}
-            required = max((b.needed for b in waiting), default=0)
+            needed = 0
+            # Per protocol: a draw (v3) batch is scored by v3 executors alone.
+            for protocol in {b.protocol for b in waiting}:
+                able = [d for d in live
+                        if protocol in self._protocols.get(d["executor_id"], (AUDIT_PROTOCOL,))]
+                required = max(b.needed for b in waiting if b.protocol == protocol)
+                distinct = min(len({_placement(d)[0] for d in able}), len({_placement(d)[1] for d in able}))
+                needed = max(needed, required - distinct)
             models[f"{model[0]}@{model[1]}"] = {
-                "executors_needed": max(0, required - min(len(providers), len(hosts))),
+                "executors_needed": max(0, needed),
                 "live_executors": len(live), "live_providers": len(providers),
+                "live_draw_executors": sum(1 for d in live if AUDIT_PROTOCOL_V3 in self._protocols.get(
+                    d["executor_id"], ())),
                 "waiting_batches": len(waiting),
+                "waiting_draw_batches": sum(1 for b in waiting if b.protocol == AUDIT_PROTOCOL_V3),
                 "awaiting_third_scorer": sum(1 for b in waiting if b.needed > 2)}
         jobs = {job_id: {"needs_attention": True, "parked_batches": self.parked[job_id],
                          "reasons": list(reasons)}

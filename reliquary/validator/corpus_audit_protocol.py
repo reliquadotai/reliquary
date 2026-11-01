@@ -30,8 +30,9 @@ MAX_ITEM_SPANS = 64
 # Bounds of one lease: what keeps a request and a response a few megabytes.
 MAX_LEASE_ITEMS = 64
 MAX_LEASE_TOKENS = 262_144
-# A long-context sample: its prompt (``JobSpec.max_prompt_tokens``) and its completion, alone in a lease.
-MAX_SEQUENCE_TOKENS = MAX_LEASE_TOKENS
+MAX_SEQUENCE_TOKENS = 65_536
+# A drawn (v3) long-context sample: its prompt (``JobSpec.max_prompt_tokens``) and its completion, alone in a lease.
+MAX_DRAWN_SEQUENCE_TOKENS = MAX_LEASE_TOKENS
 MAX_ITEM_PROOFS = 4096
 
 ITEM_OK = "ok"
@@ -65,7 +66,7 @@ class HeartbeatRequest(_Strict):
 
 
 class AuditItem(_Strict):
-    tokens: list[Annotated[int, Field(ge=0)]] = Field(min_length=2, max_length=MAX_SEQUENCE_TOKENS)
+    tokens: list[Annotated[int, Field(ge=0)]] = Field(min_length=2, max_length=MAX_DRAWN_SEQUENCE_TOKENS)
     prompt_len: int = Field(ge=1)
     proofs: list[Proof] = Field(max_length=MAX_ITEM_PROOFS)
     # v2: assistant spans in `tokens` coordinates; `proofs` are their lists concatenated.
@@ -86,6 +87,8 @@ class AuditItem(_Strict):
     def _spans_fit(self) -> "AuditItem":
         if self.draw is not None and self.proofs:
             raise ValueError("a drawn item carries no proofs: the draw is its check")
+        if self.draw is None and len(self.tokens) > MAX_SEQUENCE_TOKENS:
+            raise ValueError(f"a proven item holds at most {MAX_SEQUENCE_TOKENS} tokens")
         if self.spans is not None:
             edge = self.prompt_len
             for start, end in self.spans:

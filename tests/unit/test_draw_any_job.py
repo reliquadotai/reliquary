@@ -139,11 +139,15 @@ def test_a_long_context_job_declares_its_longest_prompt():
             parse_job(_gen_raw(max_prompt_tokens=bad))
 
 
-def test_an_audit_item_holds_a_long_context_sample():
-    from reliquary.validator.corpus_audit_protocol import MAX_SEQUENCE_TOKENS, AuditItem
+def test_a_drawn_audit_item_holds_a_long_context_sample_a_proven_one_does_not():
+    from reliquary.validator.corpus_audit_protocol import MAX_DRAWN_SEQUENCE_TOKENS, AuditItem
+    from tests.unit.test_draw_only_audit import spec
 
-    assert MAX_SEQUENCE_TOKENS >= 131072 + 60000
-    AuditItem.model_validate({"tokens": [1] * 150000, "prompt_len": 100000, "proofs": []})
+    assert MAX_DRAWN_SEQUENCE_TOKENS >= 131072 + 60000
+    AuditItem.model_validate({"tokens": [1] * 150000, "prompt_len": 100000, "proofs": [],
+                              "draw": spec().to_wire()})
+    with pytest.raises(ValueError):
+        AuditItem.model_validate({"tokens": [1] * 150000, "prompt_len": 100000, "proofs": []})
 
 
 # ------------------------------------------------------------------ admin orders
