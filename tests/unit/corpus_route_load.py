@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import re
 import statistics
 import threading
 import time
@@ -35,14 +36,21 @@ class LatentR2(_FakeMultiObjectR2):
         self._rng = random.Random(seed)
         self.unclosed = 0
 
-    async def get_object(self, Bucket, Key):
+    async def get_object(self, Bucket, Key, Range=None):
         await asyncio.sleep(self._rng.uniform(0.05, 0.10))
         response = await super().get_object(Bucket=Bucket, Key=Key)
         body, store = response["Body"], self
+        bounds = None if Range is None else re.fullmatch(r"bytes=(\d*)-(\d*)", Range)
+        if Range is not None and (bounds is None or not any(bounds.groups())):
+            raise ValueError("unsupported byte range")
 
         class _Body:
-            async def read(self):
-                return await body.read()
+            async def read(self, amount=None):
+                data = await body.read()
+                if bounds is not None:
+                    start, end = bounds.groups()
+                    data = data[int(start):int(end) + 1 if end else None] if start else data[-int(end):]
+                return data if amount is None else data[:amount]
 
             def close(self):
                 store.unclosed -= 1
