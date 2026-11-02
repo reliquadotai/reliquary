@@ -5,6 +5,8 @@ thread, never on the event loop."""
 
 from __future__ import annotations
 
+from reliquary.corpus.eval_draw import has_draw
+
 import functools
 import threading
 import time
@@ -139,7 +141,6 @@ class EpisodeIntake:
         tokens = trajectory.tokens
         episode = self._job.episode
         checks = (
-            lambda: check_short_turns(spans, self._min_chunk),
             lambda: check_turn_budget(spans, prompt_len=len(prompt_ids), length=len(tokens),
                                       max_tokens_per_turn=episode.max_tokens_per_turn,
                                       max_total_tokens=episode.max_total_tokens),
@@ -148,9 +149,13 @@ class EpisodeIntake:
                                            stop_ids=self._renderer.stop_ids,
                                            max_tokens_per_turn=episode.max_tokens_per_turn,
                                            max_total_tokens=episode.max_total_tokens),
-            lambda: check_turn_proof_shape(spans, [len(turn.proofs) for turn in trajectory.turns],
-                                           self._chunk_tokens),
         )
+        if not has_draw(self._job):
+            # A turn too short to prove, and the proofs' shape. A draw job's turns carry no proof: the draw
+            # checks every model token, however short its turn.
+            checks = (lambda: check_short_turns(spans, self._min_chunk), *checks,
+                      lambda: check_turn_proof_shape(spans, [len(turn.proofs) for turn in trajectory.turns],
+                                                     self._chunk_tokens))
         for check in checks:
             result = check()
             if not result.ok:

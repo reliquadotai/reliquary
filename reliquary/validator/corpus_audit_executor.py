@@ -14,13 +14,22 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from reliquary.validator.corpus_audit_protocol import ITEM_ERROR, AuditLease
+from reliquary.validator.corpus_audit_protocol import (
+    AUDIT_PROTOCOL,
+    AUDIT_PROTOCOL_V2,
+    AUDIT_PROTOCOL_V3,
+    ITEM_ERROR,
+    PROTOCOLS,
+    AuditLease,
+)
 from reliquary.validator.lease_executor import TOKEN_ENV, LeaseExecutor, serve_executor
 
 logger = logging.getLogger(__name__)
 
 HEARTBEAT_SECONDS = 20.0
 IDLE_SECONDS = 2.0
+# After a control refused v3, how long before the executor offers it again.
+V3_RETRY_SECONDS = 600.0
 AUDIT_PREFIX = "/corpus/internal/audit"
 EVAL_AUDIT_PREFIX = "/corpus/internal/eval-audit"
 
@@ -63,6 +72,8 @@ class AuditExecutor(LeaseExecutor):
 
             batch_tokens = AUDIT_BATCH_TOKENS
         self._batch_tokens = batch_tokens
+        self._v3 = True
+        self._v3_retry_at = 0.0
 
     def heartbeat_detail(self) -> dict:
         return {"leases": self.leases, "loaded": self._model is not None}
@@ -91,7 +102,9 @@ class AuditExecutor(LeaseExecutor):
                 raise ValueError(f"lease chunking floor {lease.min_chunk_tokens} is not this build's")
             scores, _, _ = score_sequences(
                 self._model,
-                [(i.tokens, i.prompt_len, i.proofs) if i.spans is None
+                [(i.tokens, i.prompt_len, None, None if i.spans is None else [tuple(s) for s in i.spans], i.draw)
+                 if i.draw is not None
+                 else (i.tokens, i.prompt_len, i.proofs) if i.spans is None
                  else (i.tokens, i.prompt_len, i.proofs, [tuple(s) for s in i.spans])
                  for i in lease.items],
                 chunk_tokens=lease.chunk_tokens, topk=lease.topk,
@@ -103,17 +116,30 @@ class AuditExecutor(LeaseExecutor):
                     for _ in lease.items]
         from reliquary.validator.corpus_gpu import scores_to_wire
 
-        return [{"status": status, "chunks": chunks} for status, chunks in scores_to_wire(scores)]
+        return [{"status": status, "chunks": chunks, **({"draw": extra[0]} if extra else {})}
+                for status, chunks, *extra in scores_to_wire(scores)]
 
     async def step(self) -> bool:
         """One claim; True when a lease was scored and posted."""
         await self.heartbeat_if_due()
         body = {"executor_id": self._executor_id, "model_id": self.model_id,
                 "model_revision": self.model_revision}
-        if self._prefix == AUDIT_PREFIX:
-            # The eval control's claim model knows no protocols field.
-            body["protocols"] = ["reliquary.corpus-audit/v1", "reliquary.corpus-audit/v2"]
+        if not self._v3 and self._clock() >= self._v3_retry_at:
+            self._v3 = True
+        if self._v3:
+            # The eval control scores v1 (pairs) and v3 (forced draws).
+            body["protocols"] = list(PROTOCOLS) if self._prefix == AUDIT_PREFIX else [AUDIT_PROTOCOL,
+                                                                                       AUDIT_PROTOCOL_V3]
+        elif self._prefix == AUDIT_PREFIX:
+            body["protocols"] = [AUDIT_PROTOCOL, AUDIT_PROTOCOL_V2]
         response = await self._post(f"{self._prefix}/claim", body)
+        if response.status_code == 422 and self._v3:
+            # A control that predates v3 refuses it: claim as before (corpus v1+v2; eval, no field), and offer v3
+            # again later, so an upgraded control gets it without a restart.
+            logger.warning("audit control at %s does not take v3; claiming without it", self._prefix)
+            self._v3 = False
+            self._v3_retry_at = self._clock() + V3_RETRY_SECONDS
+            return await self.step()
         if response.status_code == 204:
             return False
         response.raise_for_status()

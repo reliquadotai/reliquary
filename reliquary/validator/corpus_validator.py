@@ -683,6 +683,15 @@ def build_corpus_app(*, entry, job, store, records, tokenizer, renderer, verify_
     )
 
 
+def _lease_verifier(verify_skip_signature):
+    """The lease signature check beside a skip's: none when skips are not verified (a test's router)."""
+    if verify_skip_signature is None:
+        return None
+    from reliquary.protocol.signatures import verify_corpus_lease_signature
+
+    return verify_corpus_lease_signature
+
+
 def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
                           proof_chunk_tokens, prompt_job_for=None, vocab_size=None,
                           registration=None, contract=None,
@@ -694,6 +703,7 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
     for every job. ``app.state.corpus_routes`` is the live routing table and
     ``app.state.corpus_router_for`` builds a router for a job wired later.
     """
+    from reliquary.corpus.eval_draw import has_draw
     from reliquary.validator.corpus_service import (
         CorpusJobRoutes, build_corpus_jobs_router, build_corpus_router, prompt_job_for_spec,
     )
@@ -703,11 +713,15 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
             job_id=str(served.entry.job_id), store=store, tokenizer=tokenizer,
             renderer=served.renderer, verify_signature=verify_signature,
             verify_skip_signature=verify_skip_signature,
+            # A draw job's light leases: verified for real wherever a skip is (tests pass their own fakes to
+            # ``build_corpus_router``).
+            verify_lease_signature=_lease_verifier(verify_skip_signature),
             prompt_job_for=(getattr(served, "prompt_job_for", None) or prompt_job_for
                             or prompt_job_for_spec),
             records=records,
             on_accepted=getattr(served, "on_accepted", None) or served.auditor.enqueue,
-            proof_chunk_tokens=proof_chunk_tokens,
+            # A draw job's samples carry no proof: the draw is their check.
+            proof_chunk_tokens=None if has_draw(getattr(served, "job", None)) else proof_chunk_tokens,
             vocab_size=vocab_size, is_banned=getattr(served, "is_banned", None),
             registration=registration,
             seen_index=getattr(served, "seen_index", None),

@@ -62,6 +62,8 @@ class Identity:
     harness_env: dict | None = None
     # Signed-sandbox jobs: signs a session request's binding with the hotkey (hex).
     sign_binding: Callable[[bytes], str] | None = None
+    # Draw jobs: signs a light lease request or release (``corpus.draw_leases``); None, slots from the open map.
+    sign_lease: Callable[[dict], str] | None = None
 
 
 def harness_key(harness_env: dict | None) -> tuple:
@@ -230,6 +232,10 @@ class OpenPrompts:
         self._running.add(choice)
         return choice
 
+    def run_leased(self, prompt: int, slot: int) -> None:
+        """A slot the validator leased this hotkey: running here until ``end_draw_slot``."""
+        self._running.add((prompt, slot))
+
     def end_draw_slot(self, prompt: int, slot: int, *, taken: bool) -> None:
         self._running.discard((prompt, slot))
         if taken:
@@ -277,6 +283,43 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
     tag = identity.hotkey[:8]
     drawn = has_draw(job)
     rng = random.Random(secrets.randbits(64))
+    # A draw job's light leases (``corpus.draw_leases``): on while the validator grants them.
+    leasing = [drawn and identity.sign_lease is not None and callable(getattr(client, "lease", None))]
+
+    def take_lease():
+        """``((prompt, slot), lease_id)``, ``"wait"`` (none free now), ``"complete"``, or None (no leases here:
+        slots from the open map)."""
+        from reliquary.miner.corpus_miner import _LEASE_FALLBACK, lease_body
+
+        try:
+            answer = _retry(lambda: client.lease(lease_body(job.job_id, identity.hotkey, identity.sign_lease)),
+                            sleep=time.sleep, counts=counts, max_consecutive_failures=5)
+        except CorpusMinerHalted:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the open map still works
+            logger.warning("%s: lease request failed (%r); slots from the open map", tag, exc)
+            return None
+        reason = None if answer is None else str(answer.get("reason"))
+        if answer is not None and answer.get("leased"):
+            return (int(answer["prompt_index"]), int(answer["slot"])), str(answer["lease_id"])
+        if reason == "job_complete":
+            return "complete"
+        if reason in _HALT:
+            raise CorpusMinerHalted(f"the validator refused this hotkey: {reason}", counts=dict(counts))
+        if answer is None or reason in _LEASE_FALLBACK:
+            logger.info("%s: the validator leases no slot (%s); slots from the open map", tag, reason or "no route")
+            leasing[0] = False
+            return None
+        counts[f"lease_{reason}"] += 1
+        return "wait"
+
+    def release_lease(lease_id: str) -> None:
+        from reliquary.miner.corpus_miner import release_body
+
+        try:
+            client.release_lease(release_body(job.job_id, identity.hotkey, lease_id, identity.sign_lease))
+        except Exception as exc:  # noqa: BLE001 - it expires anyway
+            logger.info("%s: releasing lease %s failed (%r)", tag, lease_id[:8], exc)
 
     def halt() -> None:
         """The identity is done (job complete, retired, halted): episodes still
@@ -429,10 +472,10 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             halt()
         return reason
 
-    async def one(cursor: int, prompt_index: int | None = None) -> None:
+    async def one(cursor: int, prompt_index: int | None = None, lease_id: str | None = None) -> None:
         """One episode, isolated: whatever it raises is counted and logged
         here, and its generate sessions are dropped, never its siblings'.
-        A forced-draw job names its prompt; ``cursor`` is then the draw slot."""
+        A forced-draw job names its prompt; ``cursor`` is then the draw slot (leased: ``lease_id``)."""
         if prompt_index is None:
             prompt_index = job_walk_index(job, identity.hotkey, cursor)
         sessions: list[str] = []
@@ -457,6 +500,9 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             if drawn:
                 open_prompts.end_draw_slot(prompt_index, cursor,
                                            taken=reason in ("accepted", REASON_DRAW_SLOT_TAKEN))
+            if lease_id is not None and reason != "accepted":
+                # Not taken by us: free it now for another miner, rather than at its expiry.
+                await asyncio.to_thread(release_lease, lease_id)
 
     # `cursor` is this hotkey's walk position, and the validator of a free job
     # (every episode job) does not check it: positions whose prompt is full
@@ -493,7 +539,32 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             slots.release()
             break
         if drawn:
-            choice = open_prompts.take_draw_slot(job, rng)
+            lease_id = None
+            choice = None
+            if leasing[0]:
+                try:
+                    outcome = await asyncio.to_thread(take_lease)
+                except (CorpusJobRetired, CorpusMinerHalted) as exc:
+                    counts["halted"] += 1
+                    logger.error("%s stops: %s", tag, exc)
+                    halt()
+                    slots.release()
+                    break
+                if outcome == "complete":
+                    counts["job_complete"] += 1
+                    stop.set()
+                    slots.release()
+                    break
+                if outcome == "wait":
+                    slots.release()
+                    await asyncio.sleep(DRAW_SLOT_WAIT_SECONDS)
+                    continue
+                if outcome is not None:
+                    (prompt, slot), lease_id = outcome
+                    open_prompts.run_leased(prompt, slot)
+                    choice = (prompt, slot)
+            if choice is None:
+                choice = open_prompts.take_draw_slot(job, rng)
             if choice is None:
                 # Every open prompt's free slots are running here: wait for one to end.
                 counts["no_free_draw_slot"] += 1
@@ -505,7 +576,7 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
                                        return_when=asyncio.FIRST_COMPLETED)
                 continue
             prompt, slot = choice
-            task = asyncio.create_task(one(slot, prompt))
+            task = asyncio.create_task(one(slot, prompt, lease_id))
             task.add_done_callback(lambda _t: slots.release())
             tasks.add(task)
             started += 1
@@ -627,7 +698,9 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
     stop_ids = sorted(renderer.stop_ids)
     drawn = has_draw(job)
     # A forced-draw eval job: every turn draws its sample's stream over an fp32 LM head (``corpus.eval_draw``).
-    core = VllmTurnCore(checkpoint_dir, sampling=job.sampling, proof=proof, stop_token_ids=stop_ids,
+    # Its turns carry no proof either: the draw is their check (nothing captured, preemption allowed).
+    core = VllmTurnCore(checkpoint_dir, sampling=job.sampling, proof=None if drawn else proof,
+                        stop_token_ids=stop_ids,
                         max_total_tokens=job.episode.max_total_tokens, max_num_seqs=max_num_seqs,
                         gpu_memory_utilization=gpu_memory_utilization,
                         **({"forced": True, "lm_head_fp32": True} if drawn else {}))

@@ -11,6 +11,8 @@ never on the event loop, and never in the route's threads, which only wait.
 
 from __future__ import annotations
 
+from reliquary.corpus.eval_draw import has_draw
+
 import asyncio
 import functools
 import logging
@@ -422,7 +424,6 @@ class SuiteEpisodeIntake:
             return IntakeRefusal(inside[0], dict(inside[1]))
         # Only after the spans are known sound; cheap ones before the replay.
         checks = (
-            lambda: check_short_turns(spans, self._min_chunk),
             lambda: check_turn_budget(spans, prompt_len=len(prompt_ids), length=len(tokens),
                                       max_tokens_per_turn=episode.max_tokens_per_turn,
                                       max_total_tokens=episode.max_total_tokens),
@@ -431,9 +432,13 @@ class SuiteEpisodeIntake:
                                            stop_ids=self.stop_ids,
                                            max_tokens_per_turn=episode.max_tokens_per_turn,
                                            max_total_tokens=episode.max_total_tokens),
-            lambda: check_turn_proof_shape(spans, [len(turn.proofs) for turn in trajectory.turns],
-                                           self._chunk_tokens),
         )
+        if not has_draw(self._job):
+            # A turn too short to prove, and the proofs' shape. A draw job's turns carry no proof: the draw
+            # checks every model token, however short its turn.
+            checks = (lambda: check_short_turns(spans, self._min_chunk), *checks,
+                      lambda: check_turn_proof_shape(spans, [len(turn.proofs) for turn in trajectory.turns],
+                                                     self._chunk_tokens))
         for check in checks:
             result = check()
             if not result.ok:

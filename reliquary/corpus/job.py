@@ -63,7 +63,10 @@ _JOB_FIELDS = (
 # manifest that predates it stores and hashes byte-identically. A binary that
 # predates it refuses a manifest carrying it (unknown field): miners and
 # validators of a job with ``prompt_start > 0`` need a build that knows it.
-_OPTIONAL_JOB_FIELDS = ("prompt_start", "seed", "submit", "episode", "judge")
+_OPTIONAL_JOB_FIELDS = ("prompt_start", "seed", "submit", "episode", "judge", "max_prompt_tokens")
+# The longest prompt a job may declare it holds (``max_prompt_tokens``): a long-context job's miners size their
+# engine to it; the wire bounds a completion at the same.
+MAX_JOB_PROMPT_TOKENS = 131072
 # A forced-draw job's judge (``corpus.eval_draw.judge``): how far a sample may stray from its draw.
 _JUDGE_FIELDS = ("floor_rate", "grace", "gap_tolerance", "terminal_gap", "edge_margin")
 MIN_JUDGE_FLOOR_RATE = 0.5
@@ -242,6 +245,15 @@ def judge_field(partial: Mapping[str, Any]) -> dict[str, Any] | None:
     return None if judge == DEFAULT_DRAW_JUDGE else judge.to_contract()
 
 
+def _max_prompt_tokens(raw) -> int | None:
+    if "max_prompt_tokens" not in raw:
+        return None
+    value = _positive_int(raw, "max_prompt_tokens")
+    if value > MAX_JOB_PROMPT_TOKENS:
+        raise JobError(f"max_prompt_tokens must be at most {MAX_JOB_PROMPT_TOKENS}, got {value}")
+    return value
+
+
 def _submit(raw) -> str | None:
     if "submit" not in raw:
         return None
@@ -405,6 +417,9 @@ class JobSpec:
     episode: EpisodeSpec | None = None
     # A forced-draw job's judge thresholds; written only when they differ from the defaults.
     judge: DrawJudge = DEFAULT_DRAW_JUDGE
+    # Its longest prompt, in tokens, when longer than a miner's default allowance (long context); None: the
+    # default (``corpus_miner.PROMPT_ALLOWANCE_TOKENS``).
+    max_prompt_tokens: int | None = None
 
     @property
     def prompt_end(self) -> int:
@@ -461,6 +476,7 @@ class JobSpec:
             **({"seed": self.seed} if self.seed is not None else {}),
             **({"submit": self.submit} if self.submit is not None else {}),
             **({"judge": self.judge.to_contract()} if self.judge != DEFAULT_DRAW_JUDGE else {}),
+            **({"max_prompt_tokens": self.max_prompt_tokens} if self.max_prompt_tokens is not None else {}),
             **({"episode": self.episode.to_contract()} if self.episode is not None else {}),
         }
 
@@ -840,6 +856,7 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
         ),
         seed=_non_negative_int(raw, "seed") if "seed" in raw else None,
         submit=_submit(raw),
+        max_prompt_tokens=_max_prompt_tokens(raw),
         judge=_judge(raw),
         episode=(_parse_episode(raw["episode"], is_eval_source(prompt_source))
                  if "episode" in raw else None),
@@ -854,13 +871,14 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
 
 
 def _check_draw_job(job: JobSpec) -> None:
-    """A forced draw is an eval job's: keyed on its seed, its samples in free order (``corpus.eval_draw``)."""
-    if not is_eval_source(job.prompt_source):
-        raise JobError("sampling.draw is for eval jobs: a failed draw slot reopens with its own draw")
+    """A forced draw, on any job (eval or generation): keyed on its seed, its samples in free order, a failed slot
+    reopened with its own draw (``corpus.eval_draw``)."""
     if job.seed is None:
         raise JobError("sampling.draw keys the draw on the job's seed: a seed is required")
     if job.prompt_order == PROMPT_ORDER_MINER_WALK:
         raise JobError("sampling.draw takes the draw slot from the cursor: a miner_walk job walks it")
+    if job.episode is not None and getattr(job.episode, "harness", None) == "suite":
+        raise JobError("sampling.draw is not drawn by the suite episode miner yet: use free sampling")
 
 
 def is_signed_sandbox(job: JobSpec) -> bool:

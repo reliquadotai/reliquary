@@ -32,10 +32,12 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
+from reliquary.corpus.eval_draw import has_draw
 from reliquary.eval.qualify_protocol import EvalClaimRequest, QualifyResult
 from reliquary.protocol.toploc import ChunkResult
 from reliquary.validator.corpus_audit_protocol import (
     AUDIT_PROTOCOL,
+    AUDIT_PROTOCOL_V3,
     ITEM_ERROR,
     ITEM_OK,
     AuditResult,
@@ -49,6 +51,8 @@ from reliquary.validator.corpus_audit_remote import (
     REGISTRY_REFRESH_SECONDS,
     LeaseRefused,
     _lease_units,
+    _misfit,
+    converted_scores,
     scores_agree,
     token_sha256,
 )
@@ -157,6 +161,9 @@ class _Batch:
     leased: set[str] = field(default_factory=set)
     needed: int = 2
     job_id: str = ""
+    # v3: a forced-draw job's samples, leased to executors that score the draw, decided by its judge.
+    protocol: str = AUDIT_PROTOCOL
+    judge: Any = None
 
 
 @dataclass
@@ -198,6 +205,8 @@ class PairedAuditDispatcher:
         self._unwritten: dict[str, str] = {}
         self._documents: dict[str, dict] = {}
         self._detail: dict[str, dict] = {}
+        # The audit protocols each executor last claimed with: a v3 (draw) batch waits for v3 executors only.
+        self._protocols: dict[str, tuple[str, ...]] = {}
         self._written: dict[str, tuple[float, dict]] = {}
         # job id -> why it needs attention (parked batches), for the status.
         self.attention: dict[str, list[str]] = collections.defaultdict(list)
@@ -207,8 +216,8 @@ class PairedAuditDispatcher:
 
     # -- the auditors' side ------------------------------------------------
 
-    def view(self, model_id: str, model_revision: str, proof, job_id: str = "") -> "PoolView":
-        return PoolView(self, (model_id, model_revision), proof, job_id)
+    def view(self, model_id: str, model_revision: str, proof, job_id: str = "", judge=None) -> "PoolView":
+        return PoolView(self, (model_id, model_revision), proof, job_id, judge)
 
     def subscribe(self, listener: Callable[[str], Awaitable[Any]]) -> None:
         self._listeners.append(listener)
@@ -227,22 +236,33 @@ class PairedAuditDispatcher:
         self.attention.pop(job_id, None)
         self.parked.pop(job_id, None)
 
-    async def score(self, model: ModelKey, proof, items: Sequence[dict], job_id: str = ""):
-        """``(status, chunks, scored_by)`` per item; ``scored_by`` is the
-        tuple of executors whose agreement decided it."""
+    async def score(self, model: ModelKey, proof, items: Sequence[dict], job_id: str = "", judge=None):
+        """``(status, chunks, scored_by[, diagnostics])`` per item; ``scored_by`` is the
+        tuple of executors whose agreement decided it. Drawn items (``draw``) go in v3
+        batches, a trajectory alone, decided by ``judge`` (the job's ``DrawJudge``)."""
         loop = asyncio.get_running_loop()
         units = []
-        for indexes in _lease_units(items):
-            batch = _Batch(id=next(self._ids), model=model, proof=proof,
-                           items=[items[k] for k in indexes], future=loop.create_future(),
-                           job_id=job_id)
-            units.append((indexes, batch))
-            self._queues[model].append(batch)
+        drawn = [k for k, item in enumerate(items) if item.get("draw") is not None]
+        if any(item.get("spans") is not None and item.get("draw") is None for item in items):
+            raise RuntimeError("trajectory audit is not available on remote executors")
+        plain = [k for k, item in enumerate(items) if item.get("draw") is None]
+        groups = [(AUDIT_PROTOCOL, [[plain[k] for k in unit] for unit in _lease_units([items[k] for k in plain])])]
+        drawn_plain = [k for k in drawn if items[k].get("spans") is None]
+        groups.append((AUDIT_PROTOCOL_V3, [[drawn_plain[k] for k in unit]
+                                            for unit in _lease_units([items[k] for k in drawn_plain])]
+                       + [[k] for k in drawn if items[k].get("spans") is not None]))
+        for protocol, grouped in groups:
+            for indexes in grouped:
+                batch = _Batch(id=next(self._ids), model=model, proof=proof,
+                               items=[items[k] for k in indexes], future=loop.create_future(),
+                               job_id=job_id, protocol=protocol, judge=judge)
+                units.append((indexes, batch))
+                self._queues[model].append(batch)
         scored: list = [None] * len(items)
         for indexes, batch in units:
             scores, scored_by = await batch.future
-            for k, (status, chunks) in zip(indexes, scores):
-                scored[k] = (status, chunks, scored_by)
+            for k, (status, chunks, *extra) in zip(indexes, scores):
+                scored[k] = (status, chunks, scored_by, *extra)
         return scored
 
     def pending(self, model: ModelKey | None = None) -> int:
@@ -278,11 +298,12 @@ class PairedAuditDispatcher:
         # A distinct provider AND a distinct host from everyone already on it.
         return all(place[0] != p and place[1] != h for p, h in involved)
 
-    def claim(self, document: dict) -> dict | None:
-        """An audit lease for this executor's model, or None. Raises
-        ``LeaseRefused(409)`` for an executor whose placement is unknown."""
+    def claim(self, document: dict, protocols=(AUDIT_PROTOCOL,)) -> dict | None:
+        """An audit lease for this executor's model in one of ``protocols``, or None.
+        Raises ``LeaseRefused(409)`` for an executor whose placement is unknown."""
         executor_id = document["executor_id"]
         self.heartbeat(executor_id, document)
+        self._protocols[executor_id] = tuple(protocols)
         place = _placement(document)
         if place is None:
             raise LeaseRefused(409, "executor_provider_unknown")
@@ -294,7 +315,7 @@ class PairedAuditDispatcher:
             if batch.future.done():
                 queue.remove(batch)
                 continue
-            if not self._eligible(batch, executor_id, place):
+            if batch.protocol not in protocols or not self._eligible(batch, executor_id, place):
                 continue
             lease = _Lease(lease_id=secrets.token_hex(16), batch=batch, executor_id=executor_id,
                            expires_at=self._clock() + self._lease_seconds)
@@ -303,12 +324,15 @@ class PairedAuditDispatcher:
             batch.places[executor_id] = place
             self.stats["leased"] += 1
             return {
-                "protocol": AUDIT_PROTOCOL, "lease_id": lease.lease_id,
+                "protocol": batch.protocol, "lease_id": lease.lease_id,
                 "model_id": batch.model[0], "model_revision": batch.model[1],
                 "chunk_tokens": batch.proof.chunk_tokens, "topk": batch.proof.topk,
                 "expires_at": lease.expires_at,
                 "items": [{"tokens": list(i["tokens"]), "prompt_len": int(i["prompt_len"]),
-                           "proofs": list(i["proofs"])} for i in batch.items],
+                           "proofs": list(i.get("proofs") or ()),
+                           **({"spans": [list(s) for s in i["spans"]]} if i.get("spans") is not None else {}),
+                           **({"draw": i["draw"]} if i.get("draw") is not None else {})}
+                          for i in batch.items],
             }
         return None
 
@@ -327,17 +351,13 @@ class PairedAuditDispatcher:
             raise LeaseRefused(410, "lease_expired")
         self._strikes[executor_id] = 0
         scores = result.scores
-        if len(scores) != len(batch.items) or any(
-                s.status == ITEM_OK and len(s.chunks) != len(item["proofs"])
-                for s, item in zip(scores, batch.items)):
+        if len(scores) != len(batch.items) or any(_misfit(s, item) for s, item in zip(scores, batch.items)):
             raise LeaseRefused(422, "result_does_not_fit_the_lease")
         if any(s.status == ITEM_ERROR for s in scores) or batch.future.done():
             # The executor's own fault, or no longer needed: nobody is judged on it.
             self.stats["executor_errors" if not batch.future.done() else "late"] += 1
             return "requeued" if not batch.future.done() else "unneeded"
-        batch.scores[executor_id] = [
-            (s.status, tuple(ChunkResult(int(e), float(m), float(d)) for e, m, d in s.chunks))
-            for s in scores]
+        batch.scores[executor_id] = converted_scores(scores)
         self.stats["scored"] += 1
         await self._decide(batch)
         return "accepted"
@@ -351,12 +371,14 @@ class PairedAuditDispatcher:
         if len(batch.scores) < 2:
             return
         ids = sorted(batch.scores)
-        pairs = [(e, o) for k, e in enumerate(ids) for o in ids[k + 1:]
-                 if scores_agree(batch.scores[e], batch.scores[o], batch.proof)]
 
         def decision(executor_id: str) -> tuple:
-            return tuple(outcome_from_scores(status, chunks, batch.proof).passed
-                         for status, chunks in batch.scores[executor_id])
+            return tuple(_passes(score, batch) for score in batch.scores[executor_id])
+
+        # A pair agrees on the measures and on the decision: two honest scorers either side of a judge's floor
+        # by drift call a third, rather than parking the batch.
+        pairs = [(e, o) for k, e in enumerate(ids) for o in ids[k + 1:]
+                 if scores_agree(batch.scores[e], batch.scores[o], batch.proof) and decision(e) == decision(o)]
 
         decisions = {decision(e) for pair in pairs for e in pair}
         members = sorted({e for pair in pairs for e in pair})
@@ -403,12 +425,21 @@ class PairedAuditDispatcher:
             waiting = [b for b in queue if not b.future.done()]
             live = self.live_executors(model)
             providers = {_placement(d)[0] for d in live}
-            hosts = {_placement(d)[1] for d in live}
-            required = max((b.needed for b in waiting), default=0)
+            needed = 0
+            # Per protocol: a draw (v3) batch is scored by v3 executors alone.
+            for protocol in {b.protocol for b in waiting}:
+                able = [d for d in live
+                        if protocol in self._protocols.get(d["executor_id"], (AUDIT_PROTOCOL,))]
+                required = max(b.needed for b in waiting if b.protocol == protocol)
+                distinct = min(len({_placement(d)[0] for d in able}), len({_placement(d)[1] for d in able}))
+                needed = max(needed, required - distinct)
             models[f"{model[0]}@{model[1]}"] = {
-                "executors_needed": max(0, required - min(len(providers), len(hosts))),
+                "executors_needed": max(0, needed),
                 "live_executors": len(live), "live_providers": len(providers),
+                "live_draw_executors": sum(1 for d in live if AUDIT_PROTOCOL_V3 in self._protocols.get(
+                    d["executor_id"], ())),
                 "waiting_batches": len(waiting),
+                "waiting_draw_batches": sum(1 for b in waiting if b.protocol == AUDIT_PROTOCOL_V3),
                 "awaiting_third_scorer": sum(1 for b in waiting if b.needed > 2)}
         jobs = {job_id: {"needs_attention": True, "parked_batches": self.parked[job_id],
                          "reasons": list(reasons)}
@@ -511,14 +542,27 @@ class PairedAuditDispatcher:
             await asyncio.sleep(sweep_seconds)
 
 
+def _passes(score, batch: _Batch) -> bool:
+    """One scorer's decision on one item: the proof's thresholds, or a drawn item's judge."""
+    from reliquary.validator.corpus_audit import SCORE_OK, outcome_from_scores
+
+    if len(score) > 2:
+        from reliquary.corpus import eval_draw
+        from reliquary.corpus.draw_audit import diagnostics_from_wire
+
+        return score[0] == SCORE_OK and eval_draw.judge([diagnostics_from_wire(score[2])], batch.judge)[0]
+    return outcome_from_scores(score[0], score[1], batch.proof).passed
+
+
 class PoolView:
     """One job's window on the dispatcher: its model's pool and its own proof,
     in the shape ``CorpusAuditor`` uses a remote dispatcher."""
 
     def __init__(self, dispatcher: PairedAuditDispatcher, model: ModelKey, proof,
-                 job_id: str = "") -> None:
+                 job_id: str = "", judge=None) -> None:
         self._dispatcher, self._model, self._proof = dispatcher, model, proof
         self._job_id = job_id
+        self._judge = judge
         self._listeners: list = []
 
     def connected(self) -> bool:
@@ -537,7 +581,7 @@ class PoolView:
         self._dispatcher.forget_job(self._job_id)
 
     async def score(self, items: Sequence[dict]):
-        return await self._dispatcher.score(self._model, self._proof, items, self._job_id)
+        return await self._dispatcher.score(self._model, self._proof, items, self._job_id, self._judge)
 
 
 class _VocabularyOnly:
@@ -564,15 +608,15 @@ def eval_auditor(**kwargs):
 
         async def _forward(self, records, *, local: bool = False):
             results, items = await asyncio.to_thread(self._prepare, records)
-            self._refuse_trajectories(items)
-            scores = await self._remote.score(
-                [{"tokens": tokens, "prompt_len": n, "proofs": proofs}
-                 for _, _, tokens, n, proofs, _spans in items])
-            outcomes, scored_by = {}, {}
-            for (i, c_idx, *_), (status, chunks, executors) in zip(items, scores):
-                outcomes[i, c_idx] = outcome_from_scores(status, chunks, self._proof)
+            if self._draw_job is None:
+                # A draw job's trajectories go v3; proven ones have no executor here.
+                self._refuse_trajectories(items)
+            scores = await self._remote.score(self._wire_items(records, items))
+            scored_by = {}
+            for (i, *_), (_, _, executors, *_) in zip(items, scores):
                 scored_by.setdefault(i, set()).update(executors or ())
-            judged = self._aggregate(records, results, outcomes)
+            judged = self._verdicts(records, results, items,
+                                    [(status, chunks, *extra) for status, chunks, _, *extra in scores])
             for i, executors in scored_by.items():
                 judged[i] = {**judged[i], "scored_by": sorted(executors)}
             return judged
@@ -713,7 +757,7 @@ def build_eval_executor_router(*, dispatcher: PairedAuditDispatcher,
                 return lease
         if body.kind in ("audit", "any"):
             try:
-                lease = dispatcher.claim(document)
+                lease = dispatcher.claim(document, tuple(body.protocols))
             except LeaseRefused as exc:
                 raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
             if lease is not None:
@@ -1042,12 +1086,16 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         dispatcher.attention[str(job_id)].append(f"refused: {why}"[:300])
 
     def router_for(w):
+        from reliquary.validator.corpus_validator import _lease_verifier
+
         return build_corpus_router(
             job_id=str(w.entry.job_id), store=store, tokenizer=w.tokenizer,
             renderer=w.renderer, verify_signature=verify_signature,
             verify_skip_signature=verify_skip_signature, prompt_job_for=w.prompt_job_for,
+            verify_lease_signature=_lease_verifier(verify_skip_signature),
             records=records, on_accepted=w.on_accepted,
-            proof_chunk_tokens=w.proof.chunk_tokens, vocab_size=w.vocab_size,
+            # A draw job's samples carry no proof: the draw is their check.
+            proof_chunk_tokens=None if has_draw(w.job) else w.proof.chunk_tokens, vocab_size=w.vocab_size,
             is_banned=w.is_banned, registration=registration, seen_index=w.seen_index,
             job=getattr(w, "job", None), durable_records=False)
 
@@ -1103,9 +1151,10 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             job_id=job.job_id, records=records, tokenizer=tokenizer, proof=proof,
             params=params, miner_states=miner_states, beacon=beacon, round_at=round_at,
             on_verdict=settler_fed(w.settler, w.stats.observe), vocab_size=vocab_size,
-            job=job, job_store=store, reopen_slots=is_eval_source(job.prompt_source),
+            job=job, job_store=store, reopen_slots=is_eval_source(job.prompt_source) or has_draw(job),
+            draw_job=job if has_draw(job) else None,
             remote=dispatcher.view(job.checkpoint_repo, job.checkpoint_revision, proof,
-                                   job.job_id))
+                                   job.job_id, job.judge if has_draw(job) else None))
 
         def on_accepted(submission_id: str) -> None:
             w.stats.accepted()

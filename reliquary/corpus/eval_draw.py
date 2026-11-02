@@ -56,7 +56,8 @@ REASON_BAD_CURSOR = "bad_cursor"
 
 
 def has_draw(job: Any) -> bool:
-    return getattr(job.sampling, "draw", None) is not None
+    """A job whose samples follow a forced draw (and carry no proof). None (no job known): False."""
+    return job is not None and getattr(getattr(job, "sampling", None), "draw", None) is not None
 
 
 def draw_randomness(job: Any) -> str:

@@ -35,7 +35,9 @@ class DurableAttempts:
                 scores, executor = work.future.result()
                 state["decision"] = {"executor": executor, "scores": [
                     {"status": status, "chunks": [[c.exp_mismatches, c.mant_err_mean, c.mant_err_median]
-                                                   for c in chunks]} for status, chunks in scores]}
+                                                   for c in chunks],
+                     **({"draw": extra[0]} if extra and extra[0] is not None else {})}
+                    for status, chunks, *extra in scores]}
         else:
             state = {k: getattr(work, k) for k in ("results", "providers", "failed_at", "drawn",
                                                   "timeouts", "errors", "unserved", "swept_at")}
@@ -62,7 +64,8 @@ class DurableAttempts:
                 facts = self._result_model.model_validate({"scores": decision["scores"]})
                 if len(facts.scores) != len(work.items):
                     raise ValueError("audit decision does not fit its input")
-                self._resolve(work, [(s.status, tuple(ChunkResult(*c) for c in s.chunks))
+                self._resolve(work, [(s.status, tuple(ChunkResult(*c) for c in s.chunks),
+                                      *(() if s.draw is None else (s.draw,)))
                                      for s in facts.scores], decision["executor"])
         else:
             if (type(state.get("errors")) is not int or not 0 <= state["errors"] <= 3

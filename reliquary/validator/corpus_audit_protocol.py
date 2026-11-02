@@ -4,6 +4,10 @@ A lease carries what the auditor feeds the model (token ids, the prompt length
 and the committed proofs); a result carries, per item, the chunk comparisons
 ``score_sequences`` computes. The pass/fail decision never crosses: the control
 applies the proof's thresholds itself.
+
+v3 (a forced-draw job's samples, ``corpus.draw_audit``): an item carries no proof
+but its public draw context (``draw``), single-turn or with spans; its score
+carries the draw's diagnostics, which the control's judge reads.
 """
 
 from __future__ import annotations
@@ -18,11 +22,17 @@ from reliquary.protocol.toploc_wire import MAX_PROOF_B64_CHARS
 AUDIT_PROTOCOL = "reliquary.corpus-audit/v1"
 # Agentic trajectories: items carry their assistant spans (spec §5 N4).
 AUDIT_PROTOCOL_V2 = "reliquary.corpus-audit/v2"
+# Forced-draw samples: items carry their draw, scores its diagnostics.
+AUDIT_PROTOCOL_V3 = "reliquary.corpus-audit/v3"
+PROTOCOLS = (AUDIT_PROTOCOL, AUDIT_PROTOCOL_V2, AUDIT_PROTOCOL_V3)
+ProtocolName = Literal["reliquary.corpus-audit/v1", "reliquary.corpus-audit/v2", "reliquary.corpus-audit/v3"]
 MAX_ITEM_SPANS = 64
 # Bounds of one lease: what keeps a request and a response a few megabytes.
 MAX_LEASE_ITEMS = 64
 MAX_LEASE_TOKENS = 262_144
 MAX_SEQUENCE_TOKENS = 65_536
+# A drawn (v3) long-context sample: its prompt (``JobSpec.max_prompt_tokens``) and its completion, alone in a lease.
+MAX_DRAWN_SEQUENCE_TOKENS = MAX_LEASE_TOKENS
 MAX_ITEM_PROOFS = 4096
 
 ITEM_OK = "ok"
@@ -43,8 +53,8 @@ class ClaimRequest(_Strict):
     model_id: str = Field(min_length=1, max_length=256)
     model_revision: str = Field(min_length=1, max_length=256)
     # What the executor can score; an executor that predates v2 sends none.
-    protocols: list[Literal["reliquary.corpus-audit/v1", "reliquary.corpus-audit/v2"]] = Field(
-        default_factory=lambda: [AUDIT_PROTOCOL], min_length=1, max_length=2)
+    protocols: list[ProtocolName] = Field(
+        default_factory=lambda: [AUDIT_PROTOCOL], min_length=1, max_length=3)
 
 
 class HeartbeatRequest(_Strict):
@@ -56,14 +66,29 @@ class HeartbeatRequest(_Strict):
 
 
 class AuditItem(_Strict):
-    tokens: list[Annotated[int, Field(ge=0)]] = Field(min_length=2, max_length=MAX_SEQUENCE_TOKENS)
+    tokens: list[Annotated[int, Field(ge=0)]] = Field(min_length=2, max_length=MAX_DRAWN_SEQUENCE_TOKENS)
     prompt_len: int = Field(ge=1)
     proofs: list[Proof] = Field(max_length=MAX_ITEM_PROOFS)
     # v2: assistant spans in `tokens` coordinates; `proofs` are their lists concatenated.
     spans: list[tuple[int, int]] | None = Field(default=None, max_length=MAX_ITEM_SPANS)
+    # v3: the sample's public draw context (``corpus.draw_audit.DrawSpec`` wire); no proofs then.
+    draw: dict | None = None
+
+    @field_validator("draw")
+    @classmethod
+    def _draw_spec(cls, draw):
+        if draw is not None:
+            from reliquary.corpus.draw_audit import DrawSpec
+
+            DrawSpec.from_wire(draw)
+        return draw
 
     @model_validator(mode="after")
     def _spans_fit(self) -> "AuditItem":
+        if self.draw is not None and self.proofs:
+            raise ValueError("a drawn item carries no proofs: the draw is its check")
+        if self.draw is None and len(self.tokens) > MAX_SEQUENCE_TOKENS:
+            raise ValueError(f"a proven item holds at most {MAX_SEQUENCE_TOKENS} tokens")
         if self.spans is not None:
             edge = self.prompt_len
             for start, end in self.spans:
@@ -74,7 +99,7 @@ class AuditItem(_Strict):
 
 
 class AuditLease(_Strict):
-    protocol: Literal["reliquary.corpus-audit/v1", "reliquary.corpus-audit/v2"] = AUDIT_PROTOCOL
+    protocol: ProtocolName = AUDIT_PROTOCOL
     lease_id: LeaseId
     model_id: str
     model_revision: str
@@ -86,6 +111,11 @@ class AuditLease(_Strict):
 
     @model_validator(mode="after")
     def _v2_iff_spans(self) -> "AuditLease":
+        drawn = [item.draw is not None for item in self.items]
+        if any(drawn) or self.protocol == AUDIT_PROTOCOL_V3:
+            if not all(drawn) or self.protocol != AUDIT_PROTOCOL_V3 or self.min_chunk_tokens is not None:
+                raise ValueError("a v3 lease's items all carry a draw, and only a v3 lease's do")
+            return self
         spanned = any(item.spans is not None for item in self.items)
         if spanned != (self.protocol == AUDIT_PROTOCOL_V2) or spanned != (self.min_chunk_tokens is not None):
             raise ValueError("a v2 lease carries spans and min_chunk_tokens, a v1 lease neither")
@@ -98,6 +128,17 @@ class ItemScore(_Strict):
     chunks: list[tuple[Annotated[int, Field(ge=0)], float, float]] = Field(
         default_factory=list, max_length=MAX_ITEM_PROOFS)
     detail: str | None = Field(default=None, max_length=512)
+    # v3: the item's draw diagnostics (``corpus.draw_audit.diagnostics_to_wire``).
+    draw: dict | None = None
+
+    @field_validator("draw")
+    @classmethod
+    def _diagnostics(cls, draw):
+        if draw is not None:
+            from reliquary.corpus.draw_audit import diagnostics_from_wire
+
+            diagnostics_from_wire(draw)
+        return draw
 
     @field_validator("chunks")
     @classmethod
@@ -115,6 +156,8 @@ class AuditResult(_Strict):
 __all__ = [
     "AUDIT_PROTOCOL",
     "AUDIT_PROTOCOL_V2",
+    "AUDIT_PROTOCOL_V3",
+    "PROTOCOLS",
     "MAX_ITEM_SPANS",
     "AuditItem",
     "AuditLease",

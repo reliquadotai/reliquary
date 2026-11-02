@@ -82,18 +82,18 @@ class GpuScoreError(Exception):
 
 
 def scores_to_wire(scores: Sequence) -> list:
-    """``score_sequences`` output as the executor's ``ItemScore`` fields."""
+    """``score_sequences`` output as the executor's ``ItemScore`` fields; a draw row's diagnostics third."""
     return [[status, [[int(r.exp_mismatches), float(r.mant_err_mean), float(r.mant_err_median)]
-                      for r in results]]
-            for status, results in scores]
+                      for r in results], *extra]
+            for status, results, *extra in scores]
 
 
 def scores_from_wire(wire: Sequence) -> list:
-    """Back to ``(status, (ChunkResult, ...))``, as the dispatcher rebuilds them."""
+    """Back to ``(status, (ChunkResult, ...)[, diagnostics])``, as the dispatcher rebuilds them."""
     from reliquary.protocol.toploc import ChunkResult
 
-    return [(status, tuple(ChunkResult(int(e), float(m), float(d)) for e, m, d in chunks))
-            for status, chunks in wire]
+    return [(status, tuple(ChunkResult(int(e), float(m), float(d)) for e, m, d in chunks), *extra)
+            for status, chunks, *extra in wire]
 
 
 def encode_request(rows: Sequence, *, chunk_tokens: int, topk: int) -> bytes:
@@ -105,9 +105,14 @@ def encode_request(rows: Sequence, *, chunk_tokens: int, topk: int) -> bytes:
     tokens = array.array("i")
     for row_tokens, prompt_len, row_proofs, *rest in rows:
         tokens.extend(row_tokens)
-        proofs.extend(row_proofs)
-        items.append([len(row_tokens), int(prompt_len), len(row_proofs)]
-                     + ([[[int(a), int(b)] for a, b in rest[0]]] if rest and rest[0] is not None else []))
+        proofs.extend(row_proofs or ())
+        spans = [[int(a), int(b)] for a, b in rest[0]] if rest and rest[0] is not None else None
+        # A draw row (``corpus.draw_audit``): no proofs (-1) and its draw context last.
+        if len(rest) > 1 and rest[1] is not None:
+            draw = rest[1] if isinstance(rest[1], dict) else rest[1].to_wire()
+            items.append([len(row_tokens), int(prompt_len), -1, spans, draw])
+            continue
+        items.append([len(row_tokens), int(prompt_len), len(row_proofs)] + ([spans] if spans is not None else []))
     header = json.dumps({"chunk_tokens": int(chunk_tokens), "topk": int(topk), "items": items,
                          "token_bytes": len(tokens) * tokens.itemsize})
     if sys.byteorder != "little":
@@ -125,15 +130,20 @@ def decode_request(body: bytes) -> tuple[list, int, int]:
         tokens.byteswap()
     flat = tokens.tolist()
     text = body[start + header["token_bytes"]:]
-    total = sum(item[2] for item in header["items"])
+    total = sum(max(0, item[2]) for item in header["items"])
     # An empty proof is a proof (a failing one), never "no proof".
     proofs = text.decode().split("\n") if total else []
     if len(proofs) != total or len(flat) != sum(item[0] for item in header["items"]):
         raise ValueError("a request's proofs or tokens do not match its header")
     rows, at, proof_at = [], 0, 0
-    for n_tokens, prompt_len, n_proofs, *spans in header["items"]:
+    for n_tokens, prompt_len, n_proofs, *rest in header["items"]:
+        if n_proofs < 0:
+            spans = None if rest[0] is None else [tuple(s) for s in rest[0]]
+            rows.append((flat[at:at + n_tokens], prompt_len, None, spans, rest[1]))
+            at += n_tokens
+            continue
         row = (flat[at:at + n_tokens], prompt_len, proofs[proof_at:proof_at + n_proofs])
-        rows.append(row + ([tuple(s) for s in spans[0]],) if spans else row)
+        rows.append(row + ([tuple(s) for s in rest[0]],) if rest else row)
         at += n_tokens
         proof_at += n_proofs
     return rows, int(header["chunk_tokens"]), int(header["topk"])
