@@ -486,31 +486,25 @@ async def collect_job_records(job, records, *, concurrency: int = READ_CONCURREN
                               include_generation_status: bool = False) -> dict:
     """An eval job's verdicts and passing (not voided) records, read
     ``concurrency`` at a time: ``{"passing": [(sid, record)], "verdicts",
-    "audited", "samples_by_prompt"}``."""
-    ids = list(await records.list_verdict_ids(job.job_id))
-    lister = getattr(records, "list_voided_ids", None)
-    voided = set(await lister(job.job_id)) if lister is not None else set()
-    gate = asyncio.Semaphore(concurrency)
+    "audited", "samples_by_prompt"}``. Read through the delivery's reader
+    (``corpus.delivery.passing_batches``): a grading and a delivery of one job
+    hold the same submissions."""
+    from reliquary.corpus.delivery import passing_batches
 
-    async def one(submission_id):
-        async with gate:
-            verdict = await records.read_verdict(job.job_id, submission_id)
-            if not verdict or not verdict.get("passed") or submission_id in voided:
-                return submission_id, verdict, None
-            return submission_id, verdict, await records.read_submission(job.job_id, submission_id)
-
-    read = await asyncio.gather(*(one(sid) for sid in ids))
-    passing = [(sid, record) for sid, _, record in read if record is not None]
+    verdicts: list[dict] = []
+    kept: list[tuple[str, dict, dict]] = []
+    async for batch in passing_batches(job=job, records=records, counts={}, concurrency=concurrency,
+                                       on_verdict=lambda _sid, verdict: verdicts.append(verdict)):
+        kept.extend(batch)
+    passing = [(sid, record) for sid, _, record in kept]
     samples: Counter = Counter()
     for _, record in passing:
         samples[int(record["prompt_index"])] += len(record["completions"])
-    verdicts = [v for _, v, _ in read if v]
     result = {"passing": passing, "verdicts": len(verdicts),
               "audited": sum(1 for v in verdicts if v.get("audited")),
               "samples_by_prompt": dict(samples)}
     if include_generation_status:
-        result.update(_generation_status(
-            [v for _, v, record in read if record is not None], [v for _, v, _ in read if v]))
+        result.update(_generation_status([v for _, v, _ in kept], verdicts))
     return result
 
 
@@ -574,6 +568,7 @@ class JobRows:
                                                "verified" if self.generation_verified else "unverified")
 
     async def __aiter__(self):
+        from reliquary.corpus.delivery import finish_reason
         from reliquary.eval.prompt_source import load_eval_rows, parse_eval_source
 
         rows = await asyncio.to_thread(load_eval_rows, parse_eval_source(self.job.prompt_source))
@@ -592,8 +587,7 @@ class JobRows:
                     yield {"problem_id": rows[prompt_index]["problem_id"],
                            "sample_index": sample, "completion": completion["text"],
                            "completion_tokens": len(tokens),
-                           "finish_reason": ("stop" if tokens and tokens[-1] == self.job.eos_token_id
-                                             else "length")}
+                           "finish_reason": finish_reason(completion, self.job.eos_token_id)}
                     sample += 1
 
 

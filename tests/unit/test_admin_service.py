@@ -533,6 +533,45 @@ def test_a_delivery_runs_beside_the_request_and_returns_its_keys(admin, monkeypa
     assert again.status_code == 200 and again.json()["keys"] == done["keys"]
 
 
+def test_a_v3_delivery_runs_on_the_same_route_with_its_options(admin):
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    sid = "2" * 64
+    admin.records.verdicts = {sid: {"passed": True}}
+    admin.records.subs = {sid: {"prompt_index": 3, "rendered_prompt": "q",
+                                "completions": [{"text": "cut", "tokens": [1, 2]}]}}
+    admin.records.settlement = {"settled": [sid], "pending": None}
+    body = {"delivery_id": "order-v3", "schema_version": 3, "format": "openai_jsonl"}
+    assert admin("POST", "/admin/v1/jobs/math-a/deliveries", body).status_code == 202
+    done = None
+    for _ in range(100):
+        response = admin("POST", "/admin/v1/jobs/math-a/deliveries", body)
+        if response.status_code == 200:
+            done = response.json()
+            break
+        time.sleep(0.02)
+    assert done is not None and done["rows"] == 1
+    assert "deliveries/order-v3/output-00000.jsonl" in done["keys"]
+    line = json.loads((admin.platform / "deliveries" / "order-v3" / "output-00000.jsonl").read_text())
+    # A length-cut answer is a sample: delivered, named as cut.
+    assert line["response"]["body"]["choices"][0]["finish_reason"] == "length"
+    report = json.loads((admin.platform / "deliveries" / "order-v3" / "report.json").read_text())
+    assert report["schema"] == "reliquary/corpus-delivery/v3"
+
+
+def test_v3_options_need_schema_version_3_and_a_filter_needs_the_jobs(admin):
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    path = "/admin/v1/jobs/math-a/deliveries"
+    assert admin("POST", path, {"format": "openai_jsonl"}).status_code == 422
+    assert admin("POST", path, {"schema_version": 3, "keep_rejected": True}).status_code == 422
+    sid = "3" * 64
+    admin.records.verdicts = {sid: {"passed": True}}
+    admin.records.subs = {sid: {"prompt_index": 1, "rendered_prompt": "q",
+                                "completions": [{"text": "a", "tokens": [1, 151645]}]}}
+    admin.records.settlement = {"settled": [sid], "pending": None}
+    refused = admin("POST", path, {"schema_version": 3, "filter": "drop"})
+    assert refused.status_code == 422 and "declares none" in refused.json()["detail"]
+
+
 def test_a_delivery_of_an_unknown_job_is_404(admin):
     assert admin("POST", "/admin/v1/jobs/math-ghost/deliveries", {}).status_code == 404
 

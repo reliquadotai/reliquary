@@ -184,6 +184,24 @@ class CreateDelivery(BaseModel):
     # passing submission of these jobs (a v2 on the prompts of its v1).
     dedupe: bool = False
     dedupe_against: list[str] = Field(default_factory=list, max_length=16)
+    # Delivery v3 (``corpus.delivery._export_v3``): the one delivery of every order. 2 (the default) is the
+    # export the live platform reads; the fields below apply to 3 only, which ignores apply_filter.
+    schema_version: Literal[2, 3] = 2
+    # A length-cut completion is a sample at that budget: kept unless false.
+    include_truncated: bool | None = None
+    # "annotate" grades every row with the job's filter (accepted, score), "drop" leaves the rejected out.
+    filter: Literal["none", "annotate", "drop"] | None = None
+    format: Literal["parquet", "openai_jsonl"] | None = None
+
+    @model_validator(mode="after")
+    def _v3_fields(self):
+        if self.schema_version == 2:
+            if any(v is not None for v in (self.include_truncated, self.filter, self.format)):
+                raise ValueError("include_truncated, filter and format are delivery v3 options "
+                                 "(schema_version 3)")
+        elif self.keep_rejected:
+            raise ValueError("a v3 delivery keeps the rejected rows with filter 'annotate'")
+        return self
 
 
 class Provenance(BaseModel):
@@ -946,6 +964,22 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=404, detail="executor_unknown")
         return _public_executor(document)
 
+    async def v3_delivery(job, delivery_id: str, body: CreateDelivery, grade) -> dict:
+        """A v3 delivery, with the job's ledger (the prompts that used every attempt) and its frozen set's rows
+        (custom ids); ``grade`` is the job's grader when a filter is asked for."""
+        from reliquary.corpus.delivery import export_delivery, set_rows_for_job
+        from reliquary.validator.corpus_service import rebuild_ledgers
+
+        mode = body.filter or "none"
+        snapshot, _ = await job_store.read_ledgers(job.job_id)
+        slots = rebuild_ledgers(job, snapshot).slots
+        set_rows = await asyncio.to_thread(set_rows_for_job, job)
+        return await export_delivery(
+            job=job, records=records, sink=deliveries, delivery_id=delivery_id, grade=grade,
+            work_dir=work_dir, clock=clock, dedupe=body.dedupe, dedupe_against=body.dedupe_against,
+            schema_version=3, include_truncated=body.include_truncated is not False, filter_mode=mode,
+            output_format=body.format or "parquet", slots=slots, set_rows=set_rows)
+
     @router.post("/jobs/{job_id}/deliveries")
     async def create_delivery(job_id: str, body: CreateDelivery, response: Response) -> dict:
         from reliquary.corpus.delivery import (
@@ -1011,6 +1045,20 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             # A delivery is final once written: never from a job still moving.
             if not (await stored_job_counts(records, job_id))["drained"]:
                 raise HTTPException(status_code=409, detail="job_not_drained")
+            if body.schema_version == 3:
+                grade = None
+                if (body.filter or "none") != "none":
+                    if job.filter is None:
+                        raise HTTPException(status_code=422, detail=(
+                            f"filter {body.filter!r} needs the job's declared filter: the job declares none"))
+                    try:
+                        grade = await asyncio.to_thread(job_grader, job)
+                    except ValueError as exc:
+                        raise HTTPException(status_code=422, detail=f"filter_unavailable: {exc}") from exc
+                exports[delivery_id] = (job_id, asyncio.ensure_future(
+                    v3_delivery(job, delivery_id, body, grade)))
+                response.status_code = 202
+                return {"state": "running", "delivery_id": delivery_id}
             grade, note = None, None
             if body.apply_filter and job.filter is not None:
                 try:

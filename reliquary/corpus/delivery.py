@@ -1,4 +1,4 @@
-"""Export v2: a job's passing rows delivered as Parquet shards.
+"""Export v2: a job's passing rows delivered as Parquet shards; v3 (opt-in): the one delivery of every order.
 
 Streamed end to end: verdicts and records are read a window at a time, a
 bounded number in flight, and each shard is uploaded and deleted locally as
@@ -24,6 +24,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 DELIVERY_SCHEMA = "reliquary/corpus-delivery/v2"
+DELIVERY_SCHEMA_V3 = "reliquary/corpus-delivery/v3"
 DELIVERY_PREFIX = "deliveries"
 SHARD_MAX_BYTES = 500 * 1024 * 1024
 ROW_GROUP_ROWS = 2048
@@ -296,6 +297,56 @@ async def _bounded(calls, gate: asyncio.Semaphore) -> list:
     return await asyncio.gather(*(one(c) for c in calls))
 
 
+async def passing_batches(*, job, records, counts: dict, concurrency: int = READ_CONCURRENCY,
+                          window: int = READ_WINDOW,
+                          on_verdict: Callable[[str, Mapping], Any] | None = None,
+                          ) -> AsyncIterator[list[tuple[str, dict, dict]]]:
+    """The one reader of a job's delivered work: ``(submission_id, verdict, record)`` of every passing, not
+    voided submission whose record is readable, in verdict-id order, a window at a time (at most ``concurrency``
+    reads in flight). The delivery and the eval grading both read through it.
+
+    ``counts`` gets ``verdicts``, ``passing_submissions``, ``voided`` and ``missing_records``; ``on_verdict``
+    sees every verdict read, passing or not."""
+    from reliquary.corpus.export import submission_voided, voided_submission_ids
+
+    ids = list(await records.list_verdict_ids(job.job_id))
+    voided = await voided_submission_ids(records, job.job_id)
+    counts.update(verdicts=len(ids), passing_submissions=0, voided=0, missing_records=0)
+    gate = asyncio.Semaphore(concurrency)
+    for start in range(0, len(ids), window):
+        chunk = ids[start:start + window]
+        verdicts = await _bounded((records.read_verdict(job.job_id, s) for s in chunk), gate)
+        if on_verdict is not None:
+            for sid, verdict in zip(chunk, verdicts):
+                if verdict:
+                    on_verdict(sid, verdict)
+        passing = [(sid, v) for sid, v in zip(chunk, verdicts) if v and v.get("passed")]
+        kept = [(sid, v) for sid, v in passing if sid not in voided]
+        counts["voided"] += len(passing) - len(kept)
+        found = await _bounded((records.read_submission(job.job_id, s) for s, _ in kept), gate)
+        invalidated = await _bounded((submission_voided(records, job.job_id, s, voided)
+                                      for s, _ in kept), gate)
+        batch = []
+        for (sid, verdict), record, is_voided in zip(kept, found, invalidated):
+            if is_voided:
+                counts["voided"] += 1
+                continue
+            if record is None:
+                # A verdict can be visible before its record (R2 is not transactional).
+                logger.warning("corpus delivery: submission %s passed but has no record", sid[:12])
+                counts["missing_records"] += 1
+                continue
+            counts["passing_submissions"] += 1
+            batch.append((sid, verdict, record))
+        yield batch
+
+
+def finish_reason(completion: Mapping, eos_token_id: int) -> str:
+    """``"stop"`` when the completion ends on the model's eos, else ``"length"`` (cut at the budget)."""
+    tokens = completion.get("tokens") or ()
+    return "stop" if tokens and int(tokens[-1]) == int(eos_token_id) else "length"
+
+
 async def delivery_rows(*, job, records, counts: dict, grade=None,
                         seen: set[bytes] | None = None,
                         concurrency: int = READ_CONCURRENCY,
@@ -313,39 +364,17 @@ async def delivery_rows(*, job, records, counts: dict, grade=None,
     the rows go.
     """
     from reliquary.corpus.export import (
-        is_duplicate, new_unfinished_counts, submission_voided, thinking_render,
-        unfinished_reason, voided_submission_ids,
+        is_duplicate, new_unfinished_counts, thinking_render, unfinished_reason,
     )
 
     thinking = thinking_render(job)
-    ids = list(await records.list_verdict_ids(job.job_id))
-    voided = await voided_submission_ids(records, job.job_id)
-    counts.update(verdicts=len(ids), passing_submissions=0, voided=0,
-                  missing_records=0, completions=0,
-                  unfinished=new_unfinished_counts(),
+    counts.update(completions=0, unfinished=new_unfinished_counts(),
                   duplicate_completion=0 if seen is not None else None, rows=0,
                   rows_accepted=0 if grade is not None else None)
-    gate = asyncio.Semaphore(concurrency)
-    for start in range(0, len(ids), window):
-        chunk = ids[start:start + window]
-        verdicts = await _bounded((records.read_verdict(job.job_id, s) for s in chunk), gate)
-        passing = [sid for sid, v in zip(chunk, verdicts) if v and v.get("passed")]
-        kept = [sid for sid in passing if sid not in voided]
-        counts["voided"] += len(passing) - len(kept)
-        found = await _bounded((records.read_submission(job.job_id, s) for s in kept), gate)
-        invalidated = await _bounded((submission_voided(records, job.job_id, s, voided)
-                                      for s in kept), gate)
+    async for batch in passing_batches(job=job, records=records, counts=counts,
+                                       concurrency=concurrency, window=window):
         rows = []
-        for sid, record, is_voided in zip(kept, found, invalidated):
-            if is_voided:
-                counts["voided"] += 1
-                continue
-            if record is None:
-                # A verdict can be visible before its record (R2 is not transactional).
-                logger.warning("corpus delivery: submission %s passed but has no record", sid[:12])
-                counts["missing_records"] += 1
-                continue
-            counts["passing_submissions"] += 1
+        for sid, _, record in batch:
             for index, completion in enumerate(record["completions"]):
                 counts["completions"] += 1
                 reason = unfinished_reason(completion, eos_token_id=job.eos_token_id,
@@ -376,6 +405,291 @@ async def delivery_rows(*, job, records, counts: dict, grade=None,
             if row["accepted"]:
                 counts["rows_accepted"] += 1
             yield row
+
+
+# Delivery v3 (design 2026-10-31 §3.5): one schema for every order (a batch on a file, a batch on an env range,
+# an eval), one row per delivered completion, with what a customer joins and checks on.
+V3_ROW_FIELDS = ("job_id", "submission_id", "prompt_index", "problem_id", "custom_id", "completion_index",
+                 "sample_index", "draw_slot", "seed", "prompt_sha256", "prompt_tokens", "completion_token_ids",
+                 "completion", "completion_tokens", "finish_reason", "audited", "draw_match", "accepted", "score")
+V3_FILTERS = ("none", "annotate", "drop")
+V3_FORMATS = ("parquet", "openai_jsonl")
+
+
+def _v3_row_schema():
+    import pyarrow as pa
+
+    return pa.schema([
+        ("job_id", pa.string()), ("submission_id", pa.string()), ("prompt_index", pa.int64()),
+        ("problem_id", pa.string()), ("custom_id", pa.string()), ("completion_index", pa.int32()),
+        ("sample_index", pa.int64()), ("draw_slot", pa.int64()), ("seed", pa.int64()),
+        ("prompt_sha256", pa.string()), ("prompt_tokens", pa.int64()),
+        ("completion_token_ids", pa.list_(pa.int32())), ("completion", pa.string()),
+        ("completion_tokens", pa.int32()), ("finish_reason", pa.string()), ("audited", pa.bool_()),
+        ("draw_match", pa.float64()), ("accepted", pa.bool_()), ("score", pa.float64()),
+    ])
+
+
+def set_rows_for_job(job) -> tuple[dict, ...] | None:
+    """The frozen set rows a job reads (an eval-set source: ours, or an upload compiled to one), None for a
+    catalog source. Row ``i`` is the job's prompt ``i``."""
+    from reliquary.eval.prompt_source import is_eval_source, load_eval_rows, parse_eval_source
+
+    if not is_eval_source(getattr(job, "prompt_source", "")):
+        return None
+    return load_eval_rows(parse_eval_source(job.prompt_source))
+
+
+def _row_ids(set_rows, prompt_index: int) -> tuple[str | None, str | None]:
+    if set_rows is None or not 0 <= prompt_index < len(set_rows):
+        return None, None
+    row = set_rows[prompt_index]
+    custom = row.get("custom_id")
+    return row.get("problem_id"), custom if isinstance(custom, str) else None
+
+
+def _prompt_tokens(rendered: str, count_tokens) -> int | None:
+    """A prompt's token count: exact for a prompt given as token ids, else ``count_tokens`` (a tokenizer), else
+    unknown."""
+    from reliquary.corpus.encoding import is_token_ids_text, prompt_token_ids
+
+    if is_token_ids_text(rendered):
+        try:
+            return len(prompt_token_ids(None, rendered))
+        except ValueError:
+            return None
+    return None if count_tokens is None else int(count_tokens(rendered))
+
+
+async def delivery_rows_v3(*, job, records, counts: dict, grade=None, drop_rejected: bool = False,
+                           include_truncated: bool = True, seen: set[bytes] | None = None,
+                           set_rows=None, count_tokens=None,
+                           on_verdict: Callable[[str, Mapping], Any] | None = None,
+                           concurrency: int = READ_CONCURRENCY,
+                           window: int = READ_WINDOW) -> AsyncIterator[dict]:
+    """One v3 row per delivered completion of every passing, not voided submission, in verdict-id order.
+
+    Every completion is a sample: one cut at the token budget (``finish_reason`` ``length``) is kept unless
+    ``include_truncated`` is off; nothing is dropped for its thinking block. A forced-draw job's row names its
+    draw slot, its sample index (``draw_slot * n + completion``, the index the draw keys) and the job's seed, so
+    the customer can recompute it. ``audited``/``draw_match`` are the submission's verdict's (the match is the
+    lowest of the submission's samples). ``grade`` annotates (``accepted``, ``score``); ``drop_rejected`` then
+    leaves out the rejected rows."""
+    from reliquary.corpus.eval_draw import has_draw, rollout_index
+    from reliquary.corpus.export import is_duplicate
+
+    drawn = has_draw(job)
+    counts.update(completions=0, finish_reason={"stop": 0, "length": 0}, truncated_dropped=0,
+                  duplicate_completion=0 if seen is not None else None, rows=0,
+                  rows_accepted=0 if grade is not None else None,
+                  rejected_dropped=0 if drop_rejected else None,
+                  completion_tokens=0, audited_completion_tokens=0, prompt_tokens=0,
+                  prompt_tokens_unknown=0, samples_by_prompt={})
+    prompted: set[str] = set()
+    async for batch in passing_batches(job=job, records=records, counts=counts, concurrency=concurrency,
+                                       window=window, on_verdict=on_verdict):
+        rows = []
+        for sid, verdict, record in batch:
+            prompt_index = int(record["prompt_index"])
+            problem_id, custom_id = _row_ids(set_rows, prompt_index)
+            rendered = record.get("rendered_prompt") or ""
+            prompt_sha = hashlib.sha256(rendered.encode()).hexdigest()
+            prompt_tokens = _prompt_tokens(rendered, count_tokens)
+            cursor = record.get("cursor")
+            slot = int(cursor) if drawn and isinstance(cursor, int) and not isinstance(cursor, bool) else None
+            audited = verdict.get("audited", True) is True
+            match = (verdict.get("forced_draw") or {}).get("match") if audited else None
+            for index, completion in enumerate(record["completions"]):
+                counts["completions"] += 1
+                reason = finish_reason(completion, job.eos_token_id)
+                if reason == "length" and not include_truncated:
+                    counts["truncated_dropped"] += 1
+                    continue
+                if is_duplicate(completion, seen):
+                    counts["duplicate_completion"] += 1
+                    continue
+                tokens = [int(t) for t in completion.get("tokens") or ()]
+                rows.append({
+                    "job_id": job.job_id, "submission_id": sid, "prompt_index": prompt_index,
+                    "problem_id": problem_id, "custom_id": custom_id, "completion_index": index,
+                    "sample_index": rollout_index(job, slot, index) if slot is not None else None,
+                    "draw_slot": slot, "seed": int(job.seed) if drawn and job.seed is not None else None,
+                    "prompt_sha256": prompt_sha, "prompt_tokens": prompt_tokens,
+                    "completion_token_ids": tokens, "completion": completion["text"],
+                    "completion_tokens": len(tokens), "finish_reason": reason, "audited": audited,
+                    "draw_match": float(match) if isinstance(match, (int, float)) else None,
+                    "accepted": None, "score": None,
+                })
+        if grade is not None and rows:
+            def annotate(batch=rows):
+                for row in batch:
+                    accepted, score = grade(row["prompt_index"], row["completion"])
+                    row["accepted"], row["score"] = bool(accepted), float(score)
+
+            await asyncio.to_thread(annotate)
+        for row in rows:
+            if grade is not None and row["accepted"]:
+                counts["rows_accepted"] += 1
+            elif drop_rejected:
+                counts["rejected_dropped"] += 1
+                continue
+            counts["rows"] += 1
+            counts["finish_reason"][row["finish_reason"]] += 1
+            counts["completion_tokens"] += row["completion_tokens"]
+            if row["audited"]:
+                counts["audited_completion_tokens"] += row["completion_tokens"]
+            if row["submission_id"] not in prompted:
+                # A prompt counts once per submission: its completions share it.
+                prompted.add(row["submission_id"])
+                if row["prompt_tokens"] is None:
+                    counts["prompt_tokens_unknown"] += 1
+                else:
+                    counts["prompt_tokens"] += row["prompt_tokens"]
+            held = counts["samples_by_prompt"]
+            held[row["prompt_index"]] = held.get(row["prompt_index"], 0) + 1
+            yield row
+
+
+def _openai_choice(row: Mapping, *, chat: bool, index: int) -> dict:
+    choice = {"index": index, "finish_reason": row["finish_reason"]}
+    if chat:
+        choice["message"] = {"role": "assistant", "content": row["completion"]}
+    else:
+        choice["text"] = row["completion"]
+    choice["logprobs"] = None
+    return choice
+
+
+def openai_line(rows: list[Mapping], *, job, chat: bool) -> dict:
+    """One OpenAI Batch output line for one prompt: its delivered samples as choices, in sample order."""
+    first = rows[0]
+    custom = first["custom_id"] if first["custom_id"] is not None else f"prompt-{first['prompt_index']}"
+    request_id = f"{job.job_id}:{first['prompt_index']}"
+    prompt_tokens = first["prompt_tokens"]
+    completion_tokens = sum(int(r["completion_tokens"]) for r in rows)
+    body = {"id": f"{'chatcmpl' if chat else 'cmpl'}-{hashlib.sha256(request_id.encode()).hexdigest()[:24]}",
+            "object": "chat.completion" if chat else "text_completion",
+            "model": job.checkpoint_repo,
+            "choices": [_openai_choice(r, chat=chat, index=i) for i, r in enumerate(rows)],
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                      "total_tokens": None if prompt_tokens is None else prompt_tokens + completion_tokens}}
+    return {"id": f"batch_req_{hashlib.sha256(request_id.encode()).hexdigest()[:24]}", "custom_id": custom,
+            "response": {"status_code": 200, "request_id": request_id, "body": body}, "error": None}
+
+
+def _chat_output(job, set_rows) -> bool:
+    """A chat completion object unless the job's prompts were given as text-completion token ids: a set row
+    names its endpoint (``url``) when it came from an OpenAI batch file."""
+    if set_rows:
+        url = set_rows[0].get("url")
+        if isinstance(url, str):
+            return url.endswith("/chat/completions")
+        return "prompt_token_ids" not in set_rows[0]
+    return True
+
+
+class _JsonlShards:
+    """JSONL shards (``{stem}-NNNNN.jsonl``) no larger than ``max_bytes``, handed to ``on_close``."""
+
+    def __init__(self, directory: Path, stem: str, *, max_bytes: int, on_close) -> None:
+        self.directory, self.stem, self.max, self.on_close = directory, stem, max_bytes, on_close
+        self.path, self.rows, self.size, self.index = None, 0, 0, 0
+
+    async def add(self, document: Mapping) -> None:
+        body = (json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+        if len(body) > self.max:
+            raise ValueError(f"a {self.stem} line of {len(body)} bytes exceeds its shard limit")
+        if self.path is not None and self.size + len(body) > self.max:
+            await self.close()
+        if self.path is None:
+            self.path = self.directory / f"{self.stem}-{self.index:05d}.jsonl"
+        with self.path.open("ab") as handle:
+            handle.write(body)
+        self.rows += 1
+        self.size += len(body)
+
+    async def close(self) -> None:
+        if self.path is not None:
+            await self.on_close(self.path, self.rows)
+            self.path, self.rows, self.size = None, 0, 0
+            self.index += 1
+
+
+class _ByPrompt:
+    """Rows parked on local disk (sqlite) and read back grouped by prompt, in prompt then sample order: an
+    OpenAI line holds all of a prompt's samples, which the verdict order scatters."""
+
+    def __init__(self, directory: Path) -> None:
+        import sqlite3
+
+        self._db = sqlite3.connect(str(directory / "by-prompt.sqlite"))
+        self._db.execute("CREATE TABLE rows (prompt INTEGER, sample INTEGER, seq INTEGER, body TEXT)")
+        self._seq = 0
+
+    def add(self, row: Mapping) -> None:
+        sample = row["sample_index"] if row["sample_index"] is not None else self._seq
+        self._db.execute("INSERT INTO rows VALUES (?, ?, ?, ?)",
+                         (int(row["prompt_index"]), int(sample), self._seq, json.dumps(row)))
+        self._seq += 1
+
+    def groups(self):
+        self._db.execute("CREATE INDEX by_prompt ON rows (prompt, sample, seq)")
+        current, rows = None, []
+        for prompt, body in self._db.execute("SELECT prompt, body FROM rows ORDER BY prompt, sample, seq"):
+            if prompt != current and rows:
+                yield rows
+                rows = []
+            current = prompt
+            rows.append(json.loads(body))
+        if rows:
+            yield rows
+
+    def close(self) -> None:
+        self._db.close()
+
+
+def missing_prompts(job, samples_by_prompt: Mapping[int, int], slots=None) -> list[tuple[int, int, str]]:
+    """``(prompt_index, held, code)`` of every prompt of the job short of its samples: ``prompt_exhausted`` when
+    the job's ledger ``slots`` says every attempt was used (``draw_unfillable`` for a forced-draw job), else
+    ``missing_samples``."""
+    from reliquary.corpus.eval_draw import has_draw
+
+    wanted = int(job.slots_per_prompt) * int(job.sampling.n)
+    exhausted = "draw_unfillable" if has_draw(job) else "prompt_exhausted"
+    short = []
+    for index in range(job.prompt_start, job.prompt_start + job.prompt_count):
+        held = int(samples_by_prompt.get(index, 0))
+        if held < wanted:
+            code = exhausted if slots is not None and slots.prompt_state(index) == "exhausted" \
+                else "missing_samples"
+            short.append((index, held, code))
+    return short
+
+
+def verification_block(job, *, verdicts: int, audited: int, refusals: Mapping[str, int]) -> dict:
+    """What the delivery's samples were checked against: the forced draw (key recipe, warp, judge) or the
+    proof, and how much was audited."""
+    from reliquary.corpus.eval_draw import EVAL_DRAW_DOMAIN, draw_randomness, has_draw, job_warp
+
+    block = {"verdicts": verdicts, "audited": audited,
+             "audited_share": (audited / verdicts) if verdicts else None,
+             "refusals": dict(sorted(refusals.items()))}
+    if has_draw(job):
+        from reliquary.corpus.job import DEFAULT_DRAW_JUDGE
+
+        judge = getattr(job, "judge", None) or DEFAULT_DRAW_JUDGE
+        block.update(scheme="forced-draw", draw={
+            "kind": job.sampling.draw, "domain": EVAL_DRAW_DOMAIN, "seed": job.seed,
+            "randomness": draw_randomness(job), "checkpoint_hash": job.checkpoint_revision,
+            "warp": job_warp(job).to_dict(),
+            "recipe": "randomness = sha256 of the length-prefixed (domain, job_id, checkpoint_sha256, seed); a "
+                      "sample's uniforms are u_range(randomness, prompt_index, checkpoint_hash, "
+                      "draw_slot * n + completion_index, positions, domain)"},
+            judge={k: getattr(judge, k) for k in (
+                "floor_rate", "grace", "gap_tolerance", "terminal_gap", "edge_margin")})
+    else:
+        block.update(scheme="toploc-v1", draw=None, judge=None)
+    return block
 
 
 async def episode_rows(*, job, records, renderer, source, counts: dict, sft_only: bool = False,
@@ -655,9 +969,17 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
                           quarantined: Collection[str] | None = None,
                           instruction_source=None, instruction_note: str | None = None,
                           keep_rejected: bool = False, dedupe: bool = False,
-                          dedupe_against: Collection[str] = ()) -> dict:
+                          dedupe_against: Collection[str] = (), schema_version: int = 2,
+                          include_truncated: bool = True, filter_mode: str = "none",
+                          output_format: str = "parquet", slots=None, set_rows=None,
+                          count_tokens=None) -> dict:
     """Write ``deliveries/{delivery_id}/``: the shards, ``report.json``, then
     ``manifest.json``. A delivery whose manifest exists is returned as stored.
+
+    ``schema_version`` 3 is the one delivery of every order (``_export_v3``): ``include_truncated``,
+    ``filter_mode`` (``none``, ``annotate`` or ``drop``, with ``grade``) and ``output_format`` (``parquet`` or
+    ``openai_jsonl``) apply to it only; ``slots`` (the job's ledger) names exhausted prompts in its errors,
+    ``set_rows`` maps a frozen set's rows to their ids and ``count_tokens`` counts text prompts.
 
     ``keep_rejected`` keeps the finished completions ``grade`` rejects in the
     instruction shards instead of omitting them (an SFT without the
@@ -673,6 +995,20 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
     its pinned ``renderer``, its task ``source`` and the registry's
     ``quarantined`` grade executors."""
     episode = getattr(job, "episode", None) is not None
+    if schema_version == 3:
+        if episode:
+            raise ValueError("an episode job is exported with `reliquary jobs export --sft` (delivery v3 holds "
+                             "single-turn completions)")
+        if keep_rejected:
+            raise ValueError("delivery v3 keeps rejected completions with filter_mode 'annotate'")
+        return await _export_v3(
+            job=job, records=records, sink=sink, delivery_id=delivery_id, grade=grade, filter_note=filter_note,
+            work_dir=work_dir, shard_max_bytes=shard_max_bytes, row_group_rows=row_group_rows,
+            concurrency=concurrency, window=window, clock=clock, dedupe=dedupe, dedupe_against=dedupe_against,
+            include_truncated=include_truncated, filter_mode=filter_mode, output_format=output_format,
+            slots=slots, set_rows=set_rows, count_tokens=count_tokens)
+    if schema_version != 2:
+        raise ValueError(f"delivery schema version {schema_version!r} is not 2 or 3")
     if keep_rejected and (episode or grade is None):
         raise ValueError("keep_rejected needs a grader: it keeps what the filter rejects")
     dedupe_against = sorted(set(dedupe_against))
@@ -829,6 +1165,149 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
     await sink.put_json(manifest_key, manifest)
     logger.info("corpus delivery %s of %s: %d rows in %d shards", delivery_id, job.job_id,
                 manifest["rows"], len(shards))
+    return manifest
+
+
+async def _stored_stamp(sink, report_key: str, *, job, delivery_id: str, clock) -> float:
+    """The creation time of a delivery whose report was written before a crash, else now."""
+    stored_report = await sink.get_json(report_key)
+    if stored_report is None:
+        return clock()
+    if (stored_report.get("job_id") != job.job_id or stored_report.get("delivery_id") != delivery_id
+            or stored_report.get("job") != job.to_contract()):
+        raise ValueError("delivery report belongs to another job contract")
+    stamp = stored_report.get("created_at")
+    if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
+        raise ValueError("delivery report has no creation timestamp")
+    return stamp
+
+
+async def _export_v3(*, job, records, sink, delivery_id: str, grade, filter_note, work_dir, shard_max_bytes,
+                     row_group_rows, concurrency, window, clock, dedupe, dedupe_against, include_truncated,
+                     filter_mode, output_format, slots, set_rows, count_tokens) -> dict:
+    """Delivery v3: the job's delivered completions as v3 Parquet rows or OpenAI Batch output lines (one per
+    prompt, its samples as choices) plus an errors file naming the prompts short of their samples, then
+    ``report.json`` (counts, verification, billing basis) and ``manifest.json``."""
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    if filter_mode not in V3_FILTERS:
+        raise ValueError(f"filter_mode must be one of {V3_FILTERS}")
+    if output_format not in V3_FORMATS:
+        raise ValueError(f"output_format must be one of {V3_FORMATS}")
+    if (filter_mode != "none") != (grade is not None):
+        raise ValueError("filter_mode 'annotate' and 'drop' need the job's grader, 'none' takes none")
+    dedupe_against = sorted(set(dedupe_against))
+    if job.job_id in dedupe_against:
+        raise ValueError("a delivery cannot be deduplicated against itself")
+    dedupe = dedupe or bool(dedupe_against)
+    delivery_id = validated_delivery_id(delivery_id)
+    prefix = f"{DELIVERY_PREFIX}/{delivery_id}"
+    manifest_key, report_key = f"{prefix}/manifest.json", f"{prefix}/report.json"
+    stored = await sink.get_json(manifest_key)
+    if stored is not None:
+        validate_cached_delivery(stored, job=job, sink=sink)
+        return stored
+    stamp = await _stored_stamp(sink, report_key, job=job, delivery_id=delivery_id, clock=clock)
+    root = Path(work_dir) if work_dir is not None else Path(tempfile.gettempdir())
+    root.mkdir(parents=True, exist_ok=True)
+    directory = Path(tempfile.mkdtemp(prefix=f"delivery-{delivery_id}-", dir=root))
+    shards: list[dict] = []
+    error_shards: list[dict] = []
+
+    async def uploaded(path: Path, rows: int) -> None:
+        digest = await asyncio.to_thread(_sha256, path)
+        key = f"{prefix}/{path.name}"
+        await sink.put_file(key, path)
+        (error_shards if path.name.startswith("errors-") else shards).append(
+            {"name": path.name, "key": key, "rows": rows, "bytes": path.stat().st_size, "sha256": digest})
+        path.unlink()
+
+    counts: dict = {}
+    refusals: dict[str, int] = {}
+    audited = 0
+
+    def on_verdict(_sid: str, verdict: Mapping) -> None:
+        nonlocal audited
+        if verdict.get("audited", True) is True:
+            audited += 1
+        if not verdict.get("passed"):
+            reason = str(verdict.get("reason") or "unknown")
+            refusals[reason] = refusals.get(reason, 0) + 1
+
+    seen = None
+    if dedupe:
+        from reliquary.corpus.export import job_fingerprints
+
+        seen = await job_fingerprints(records, dedupe_against, concurrency=concurrency)
+    errors_written = 0
+    try:
+        shard_max_bytes = min(shard_max_bytes, getattr(sink, "max_file_bytes", shard_max_bytes))
+        rows = delivery_rows_v3(job=job, records=records, counts=counts, grade=grade,
+                                drop_rejected=filter_mode == "drop", include_truncated=include_truncated,
+                                seen=seen, set_rows=set_rows, count_tokens=count_tokens, on_verdict=on_verdict,
+                                concurrency=concurrency, window=window)
+        errors = _JsonlShards(directory, "errors", max_bytes=shard_max_bytes, on_close=uploaded)
+        if output_format == "parquet":
+            writer = _ShardWriter(directory, max_bytes=shard_max_bytes, row_group_rows=row_group_rows,
+                                  on_close=uploaded, schema=_v3_row_schema())
+            async for row in rows:
+                await writer.add(row)
+            await writer.close()
+        else:
+            parked = _ByPrompt(directory)
+            try:
+                async for row in rows:
+                    parked.add(row)
+                output = _JsonlShards(directory, "output", max_bytes=shard_max_bytes, on_close=uploaded)
+                chat = _chat_output(job, set_rows)
+                for group in parked.groups():
+                    await output.add(openai_line(group, job=job, chat=chat))
+                await output.close()
+            finally:
+                parked.close()
+        wanted = int(job.slots_per_prompt) * int(job.sampling.n)
+        short = missing_prompts(job, counts["samples_by_prompt"], slots)
+        for index, held, code in short:
+            _, custom_id = _row_ids(set_rows, index)
+            await errors.add({"custom_id": custom_id if custom_id is not None else f"prompt-{index}",
+                              "prompt_index": index,
+                              "error": {"code": code, "message": f"{held} of {wanted} samples delivered"}})
+            errors_written += 1
+        await errors.close()
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+    held = counts.pop("samples_by_prompt")
+    counts["prompts_delivered"] = len(held)
+    counts["prompts_short"] = errors_written
+    report = {
+        "schema": DELIVERY_SCHEMA_V3, "delivery_id": delivery_id, "job_id": job.job_id, "created_at": stamp,
+        "job": job.to_contract(), "counts": counts,
+        "options": {"format": output_format, "include_truncated": include_truncated, "filter": filter_mode,
+                    "dedupe": dedupe, "dedupe_against": dedupe_against},
+        "filter": ({"applied": True, "mode": filter_mode, "grader_id": job.filter.grader_id,
+                    "threshold": job.filter.threshold} if grade is not None
+                   else {"applied": False, "mode": "none", "note": filter_note}),
+        "verification": verification_block(job, verdicts=counts["verdicts"], audited=audited, refusals=refusals),
+        # What the customer is charged on: the completion tokens of the rows delivered (audited ones checked).
+        "billing": {"basis": "completion_tokens_of_delivered_rows",
+                    "completion_tokens": counts["completion_tokens"],
+                    "audited_completion_tokens": counts["audited_completion_tokens"],
+                    "prompt_tokens": counts["prompt_tokens"],
+                    "prompt_tokens_unknown": counts["prompt_tokens_unknown"]},
+        "shards": len(shards), "error_shards": len(error_shards),
+    }
+    await sink.put_json(report_key, report)
+    manifest = {
+        "schema": DELIVERY_SCHEMA_V3, "delivery_id": delivery_id, "job_id": job.job_id,
+        "job_manifest_sha256": canonical_sha256(job.to_contract()), "created_at": stamp,
+        "format": output_format, "rows": counts.get("rows", 0), "shards": shards, "error_shards": error_shards,
+        "instruction_shards": [],
+        "columns": list(V3_ROW_FIELDS) if output_format == "parquet" else None, "report": report_key,
+        "keys": [s["key"] for s in shards + error_shards] + [report_key, manifest_key],
+    }
+    await sink.put_json(manifest_key, manifest)
+    logger.info("corpus delivery v3 %s of %s: %d rows in %d shards (%s)", delivery_id, job.job_id,
+                manifest["rows"], len(shards), output_format)
     return manifest
 
 
@@ -1061,6 +1540,17 @@ class HTTPDeliverySink:
 
 __all__ = [
     "DELIVERY_SCHEMA",
+    "DELIVERY_SCHEMA_V3",
+    "V3_FILTERS",
+    "V3_FORMATS",
+    "V3_ROW_FIELDS",
+    "delivery_rows_v3",
+    "finish_reason",
+    "missing_prompts",
+    "openai_line",
+    "passing_batches",
+    "set_rows_for_job",
+    "verification_block",
     "EPISODE_ROW_FIELDS",
     "EpisodeKindMismatch",
     "EpisodeSandboxUnavailable",
