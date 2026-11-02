@@ -635,6 +635,13 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=404, detail="set_unknown")
         return json.loads(card_body), prompts_body
 
+    def upload_sampling_differs(sampling: Mapping, body: CreateJob) -> list[str]:
+        """An order on an upload's group runs the sampling its lines asked for (``orders.uploads``)."""
+        given = {**body.sampling.model_dump(), "max_tokens": body.max_new_tokens, "seed": body.seed,
+                 "n": body.samples_per_prompt}
+        return sorted(k for k, v in sampling.items()
+                      if k in given and v is not None and given[k] != v)
+
     async def pinned_order_arguments(body: CreateJob, *, evaluation: bool, record_order: bool) -> dict:
         """A forced-draw order (eval or generation) on any source: no qualification. Its model is pinned from
         its own files (``orders.models``), its thresholds are its judge, and its declared conditions are the
@@ -673,6 +680,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     raise HTTPException(status_code=422, detail="the upload was rendered for another model")
                 if evaluation and not card.get("graded"):
                     raise HTTPException(status_code=422, detail="an evaluation needs a set with references")
+                differs = upload_sampling_differs(card.get("sampling") or {}, body)
+                if differs:
+                    raise HTTPException(status_code=422, detail=f"upload_sampling_differs: {differs}")
             elif body.env not in (card.get("env"), card.get("source")):
                 raise HTTPException(status_code=422, detail=f"set {body.eval_set_id} is a {card.get('env')} set")
             if body.prompt_count > int(card["count"]):

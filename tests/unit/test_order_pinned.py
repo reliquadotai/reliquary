@@ -161,13 +161,14 @@ def test_a_revision_is_only_for_a_pinned_order(admin, pins):  # noqa: F811
     assert response.status_code == 422
 
 
-def _upload_set(admin, *, graded, model=MODEL, revision=REVISION):
+def _upload_set(admin, *, graded, model=MODEL, revision=REVISION, sampling=None):
     from reliquary.eval.storage import SubnetEvalStore, subnet_key
 
     rows = [{"problem_id": f"r-{i}", "custom_id": f"r-{i}", "prompt_token_ids": [1, 2, 3 + i]} for i in range(3)]
     body = b"".join(json.dumps(r, sort_keys=True).encode() + b"\n" for r in rows)
     card = {"schema": "reliquary/eval-set/v1", "set_id": "up-0123456789abcdef01234567", "source_kind": "upload",
-            "source": None, "env": None, "count": 3, "model": model, "revision": revision, "graded": graded}
+            "source": "upload", "env": None, "count": 3, "model": model, "revision": revision, "graded": graded,
+            "sampling": sampling or {}}
     store = SubnetEvalStore()
 
     async def put():
@@ -283,3 +284,15 @@ def test_a_pinned_eval_is_graded_with_its_draw_as_verification(admin, pins):  # 
     assert verification["scheme"] == "gumbel_max" and verification["sampling_verified"] is True
     assert verification["source"] == "order" and verification["pin"]["checkpoint_sha256"] == PIN_SHA
     assert verification["judge"]["floor_rate"] == 0.98
+
+
+def test_an_order_on_an_upload_group_runs_its_lines_sampling(admin, pins):  # noqa: F811
+    asked = {**SAMPLING, "min_p": 0.0, "max_tokens": 512, "seed": 11, "n": 4}
+    set_id = _upload_set(admin, graded=False, sampling=asked)
+    body = _order("gen", eval_set_id=set_id, prompt_count=3, env="upload", seed=11)
+    assert admin("POST", "/admin/v1/jobs", body).status_code == 201
+    for change, key in (({"seed": 12}, "seed"), ({"samples_per_prompt": 2}, "n"),
+                        ({"max_new_tokens": 256}, "max_tokens"),
+                        ({"sampling": {**SAMPLING, "temperature": 1.0}}, "temperature")):
+        refused = admin("POST", "/admin/v1/jobs", {**body, "job_id": "order-gen-p9", **change})
+        assert refused.status_code == 422 and "upload_sampling_differs" in refused.text and key in refused.text
