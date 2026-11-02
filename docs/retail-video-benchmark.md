@@ -74,5 +74,5 @@ For a lightweight local check without the unrelated validator server fixtures:
 
 ```sh
 python -m pytest --noconftest -c /dev/null \
-  tests/unit/test_retail_benchmark.py -q -p no:cacheprovider
+  tests/unit/test_vision_retail_benchmark.py -q -p no:cacheprovider
 ```
