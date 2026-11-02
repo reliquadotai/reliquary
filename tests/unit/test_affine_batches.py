@@ -211,3 +211,48 @@ def test_raw_outputs_require_an_owner_private_directory(tmp_path):
     work.chmod(0o755)
     with pytest.raises(ValueError, match="owner_private"):
         batch._work(work)
+
+
+def test_sigterm_wrapper_stops_the_separate_official_child_group(tmp_path):
+    import os
+    import signal
+    import sys
+    import time
+
+    marker = tmp_path / "child.pid"
+    child = "import os,time; from pathlib import Path; Path(%r).write_text(str(os.getpid())); time.sleep(60)" % str(marker)
+    wrapper = ("from types import SimpleNamespace; from reliquary.eval.affine_batches import _run; "
+               "_run(SimpleNamespace(work=%r, python=%r, timeout=60), ['-c', %r], 'official')"
+               % (str(tmp_path / "private-output"), sys.executable, child))
+    process = subprocess.Popen([sys.executable, "-c", wrapper], start_new_session=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    pid = None
+    def running(pid):
+        try:
+            status = Path('/proc/%d/stat' % pid)
+            if status.exists() and status.read_text().rsplit(')', 1)[1].split()[0] == 'Z':
+                return False
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+    try:
+        for _ in range(100):
+            if marker.exists():
+                break
+            time.sleep(.05)
+        assert marker.exists(), "official child did not start"
+        pid = int(marker.read_text())
+        os.kill(process.pid, signal.SIGTERM)
+        process.wait(timeout=10)
+        for _ in range(100):
+            if not running(pid):
+                break
+            time.sleep(.05)
+        assert not running(pid), "SIGTERM left the official child running in its separate session"
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        if pid and running(pid):
+            os.killpg(pid, signal.SIGKILL)

@@ -189,19 +189,55 @@ def _run(args, argv, label):
            "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2"}
     project = str(Path(__file__).resolve().parents[2])
     env["PYTHONPATH"] = project + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-    with open(stdout, "xb") as out, open(stderr, "xb") as err:
-        os.chmod(stdout, 0o600); os.chmod(stderr, 0o600)
-        process = subprocess.Popen([args.python, *map(str, argv)], stdout=out, stderr=err,
-                                   env=env, start_new_session=True, umask=0o077)
-        try:
+    process = None
+    cancelled = False
+    cleaning = False
+    class Interrupted(Exception):
+        pass
+    def interrupt(signum, frame):
+        nonlocal cancelled
+        cancelled = True
+        # Defer during Popen's constructor so a spawned child cannot lose its owner.
+        if process is not None and not cleaning:
+            raise Interrupted()
+    old_handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        for sig in old_handlers:
+            signal.signal(sig, interrupt)
+        with open(stdout, "xb") as out, open(stderr, "xb") as err:
+            os.chmod(stdout, 0o600); os.chmod(stderr, 0o600)
+            if cancelled:
+                raise Interrupted()
+            process = subprocess.Popen([args.python, *map(str, argv)], stdout=out, stderr=err,
+                                       env=env, start_new_session=True, umask=0o077)
+            if cancelled:
+                raise Interrupted()
             code = process.wait(timeout=args.timeout)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL); process.wait()
-            raise ValueError("stage_timeout") from None
+    except subprocess.TimeoutExpired:
+        raise ValueError("stage_timeout") from None
+    except Interrupted:
+        raise ValueError("stage_interrupted") from None
+    finally:
+        cleaning = True
+        try:
+            if process is not None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+                # A compiler/helper can remain in the owned group after its leader exits.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        finally:
+            for sig, previous in old_handlers.items():
+                signal.signal(sig, previous)
     if code:
         raise ValueError("official_stage_failed_" + label)
     return stdout
