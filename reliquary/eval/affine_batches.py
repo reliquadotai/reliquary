@@ -470,7 +470,7 @@ def main(argv=None):
             raise ValueError("invalid_seed")
         if not all(1 <= getattr(args, field) <= maximum for field, maximum in (
                 ("n", 19305), ("samples", 8), ("max_prompts", 125), ("per_prompt", 8),
-                ("token_budget", 16384), ("concurrency", 512), ("timeout", 3600))):
+                ("token_budget", 16384), ("concurrency", 512), ("timeout", 86400))):
             raise ValueError("invalid_bounds")
         if args.stage in ("_compare", "_validate"):
             globals()[args.stage](args); return 0
