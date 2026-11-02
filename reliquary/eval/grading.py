@@ -168,7 +168,7 @@ def require_sandboxes(sets: Mapping[str, tuple[dict, list[dict]]], require=None)
     if require is None:
         from reliquary.corpus.export import require_code_sandbox as require
     for card, _ in sets.values():
-        if card.get("source_kind") in {"verifiers", "signed_episode"}:
+        if card.get("source_kind") in {"verifiers", "signed_episode", "upload"}:
             # Its code runs, if at all, in the task's own Docker box.
             continue
         if card.get("interaction") in REFERENCE_INTERACTIONS:
@@ -250,6 +250,8 @@ class _Graders:
         """``(score, grader_detail, format_failure)``."""
         from reliquary.eval import verifiers_source
 
+        if "grader" in grading and "source" not in grading:
+            return self._grade_reference(grading, completion)
         if verifiers_source.is_verifiers_source(grading["source"]):
             return self._grade_verifiers(grading, completion, card or {})
         source, split = grading["source"], grading["split"]
@@ -272,6 +274,21 @@ class _Graders:
             if grading.get("reference_sha256") is not None and digest(problem) != grading["reference_sha256"]:
                 return None, "source_drift: the source reference changed", failed_format
             value = float(score(problem, answer))
+        except Exception as exc:
+            return None, f"grader_error: {type(exc).__name__}: {exc}"[:500], failed_format
+        return value, "format_failure" if failed_format else "", failed_format
+
+    def _grade_reference(self, grading: dict, completion: str) -> tuple[float | None, str, bool]:
+        """A customer's row: its reference, graded by a grader of ``orders.graders``."""
+        from reliquary.orders.graders import REFERENCE_GRADERS, grade_reference
+
+        grader = REFERENCE_GRADERS.get(grading.get("grader"))
+        if grader is None:
+            return None, f"grader_unknown: {grading.get('grader')!r}", False
+        answer = answer_text(grader.final_answer_policy, completion, thinking=self._thinking)
+        failed_format = format_failed(grader.final_answer_policy, answer)
+        try:
+            value = grade_reference(grader.name, grading["reference"], answer)
         except Exception as exc:
             return None, f"grader_error: {type(exc).__name__}: {exc}"[:500], failed_format
         return value, "format_failure" if failed_format else "", failed_format
@@ -486,31 +503,25 @@ async def collect_job_records(job, records, *, concurrency: int = READ_CONCURREN
                               include_generation_status: bool = False) -> dict:
     """An eval job's verdicts and passing (not voided) records, read
     ``concurrency`` at a time: ``{"passing": [(sid, record)], "verdicts",
-    "audited", "samples_by_prompt"}``."""
-    ids = list(await records.list_verdict_ids(job.job_id))
-    lister = getattr(records, "list_voided_ids", None)
-    voided = set(await lister(job.job_id)) if lister is not None else set()
-    gate = asyncio.Semaphore(concurrency)
+    "audited", "samples_by_prompt"}``. Read through the delivery's reader
+    (``corpus.delivery.passing_batches``): a grading and a delivery of one job
+    hold the same submissions."""
+    from reliquary.corpus.delivery import passing_batches
 
-    async def one(submission_id):
-        async with gate:
-            verdict = await records.read_verdict(job.job_id, submission_id)
-            if not verdict or not verdict.get("passed") or submission_id in voided:
-                return submission_id, verdict, None
-            return submission_id, verdict, await records.read_submission(job.job_id, submission_id)
-
-    read = await asyncio.gather(*(one(sid) for sid in ids))
-    passing = [(sid, record) for sid, _, record in read if record is not None]
+    verdicts: list[dict] = []
+    kept: list[tuple[str, dict, dict]] = []
+    async for batch in passing_batches(job=job, records=records, counts={}, concurrency=concurrency,
+                                       on_verdict=lambda _sid, verdict: verdicts.append(verdict)):
+        kept.extend(batch)
+    passing = [(sid, record) for sid, _, record in kept]
     samples: Counter = Counter()
     for _, record in passing:
         samples[int(record["prompt_index"])] += len(record["completions"])
-    verdicts = [v for _, v, _ in read if v]
     result = {"passing": passing, "verdicts": len(verdicts),
               "audited": sum(1 for v in verdicts if v.get("audited")),
               "samples_by_prompt": dict(samples)}
     if include_generation_status:
-        result.update(_generation_status(
-            [v for _, v, record in read if record is not None], [v for _, v, _ in read if v]))
+        result.update(_generation_status([v for _, v, _ in kept], verdicts))
     return result
 
 
@@ -574,6 +585,7 @@ class JobRows:
                                                "verified" if self.generation_verified else "unverified")
 
     async def __aiter__(self):
+        from reliquary.corpus.delivery import finish_reason
         from reliquary.eval.prompt_source import load_eval_rows, parse_eval_source
 
         rows = await asyncio.to_thread(load_eval_rows, parse_eval_source(self.job.prompt_source))
@@ -592,8 +604,7 @@ class JobRows:
                     yield {"problem_id": rows[prompt_index]["problem_id"],
                            "sample_index": sample, "completion": completion["text"],
                            "completion_tokens": len(tokens),
-                           "finish_reason": ("stop" if tokens and tokens[-1] == self.job.eos_token_id
-                                             else "length")}
+                           "finish_reason": finish_reason(completion, self.job.eos_token_id)}
                     sample += 1
 
 
@@ -891,7 +902,7 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
             "provenance": {
                 **dict(provenance),
                 "sets": [{"set_id": set_id, "env": card["env"], "source": card["source"],
-                          "split": card["split"], "problems": problems_per_set[set_id],
+                          "split": card.get("split"), "problems": problems_per_set[set_id],
                           "samples": samples_per_set[set_id],
                           "prompts_sha256": card["prompts_sha256"],
                           "grading_sha256": card["grading_sha256"],

@@ -44,18 +44,56 @@ def _lying():
 
 
 class _Harness:
-    def __init__(self):
+    # The agreement tests run with a pair; the default (one scorer) has its own tests.
+    def __init__(self, scorers=2):
         self.quarantined = []
         self.directory = SimpleNamespace(revoke_locally=lambda e: None)
 
         async def write(executor_id, reason):
             self.quarantined.append(executor_id)
 
-        self.dispatcher = PairedAuditDispatcher(directory=self.directory, quarantine=write)
+        self.dispatcher = PairedAuditDispatcher(directory=self.directory, quarantine=write,
+                                                scorers=scorers)
 
 
 def _run(coroutine_factory):
     return asyncio.run(coroutine_factory())
+
+
+def test_by_default_one_executor_scores_and_decides_a_batch():
+    from reliquary.validator.eval_control import PairedAuditDispatcher, order_audit_scorers
+
+    async def go():
+        h = _Harness(scorers=1)
+        scoring = asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF).score(ITEMS))
+        await asyncio.sleep(0)
+        a = h.dispatcher.claim(_executor("a"))
+        assert a is not None
+        # One lease per batch: nobody else is asked to score it.
+        assert h.dispatcher.claim(_executor("b")) is None
+        await h.dispatcher.result("a", a["lease_id"], _honest())
+        scored = await scoring
+        assert [s[2] for s in scored] == [("a",), ("a",)] and scored[0][0] == "ok"
+        status = h.dispatcher.status()
+        assert all(m["executors_needed"] == 0 for m in status["models"].values())
+    _run(go)
+    assert order_audit_scorers({}) == 1 and order_audit_scorers({"RELIQUARY_ORDER_AUDIT_SCORERS": "2"}) == 2
+    with pytest.raises(ValueError):
+        order_audit_scorers({"RELIQUARY_ORDER_AUDIT_SCORERS": "4"})
+    with pytest.raises(ValueError):
+        PairedAuditDispatcher(directory=SimpleNamespace(), scorers=0)
+
+
+def test_one_scorer_still_needs_one_live_executor():
+    async def go():
+        h = _Harness(scorers=1)
+        scoring = asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF).score(ITEMS))
+        await asyncio.sleep(0)
+        status = h.dispatcher.status()
+        (model,) = status["models"].values()
+        assert model["executors_needed"] == 1 and model["waiting_batches"] == 1
+        scoring.cancel()
+    _run(go)
 
 
 def test_two_executors_on_distinct_providers_decide_a_batch():

@@ -1,13 +1,15 @@
 """The GPU-less eval control: every evaluation job, whatever its model, in one process.
 
 It loads no model. Each job has its own tokenizer (CPU) and its own executor
-pool keyed by ``model@revision``. Every audit batch is scored by two executors
-on distinct providers (``provider_id`` and ``host`` both differ):
+pool keyed by ``model@revision``. Every audit batch is scored by one executor
+(``RELIQUARY_ORDER_AUDIT_SCORERS``, default 1), whose scores decide it, as the
+validator's own GPU decides the corpus audits. With two or more scorers, on
+distinct providers and hosts:
 - agreement (the same decision per item, every measure within R3's drift
   tolerance) decides the batch;
-- disagreement sends it to a third executor; whoever agrees with nobody is
-  quarantined, and the passes it co-signed are re-audited by fresh pairs;
-- one executor alone never decides: the batch waits.
+- disagreement sends it to one more executor; whoever agrees with nobody is
+  quarantined, and the passes it co-signed are re-audited;
+- fewer scorers than required never decide: the batch waits.
 
 Executors reach it on ``/corpus/internal/eval-audit/...``; miners on
 ``/corpus/jobs/order-eval-.../...``. The corpus control's behaviour is untouched:
@@ -60,9 +62,22 @@ from reliquary.validator.corpus_audit_remote import (
 logger = logging.getLogger(__name__)
 
 EVAL_AUDIT_PREFIX = "/corpus/internal/eval-audit"
-# Scorers of one batch: a pair, and a third on disagreement. No agreement then:
+# Scorers of one batch: one by default; with a pair, a third on disagreement. No agreement then:
 # the batch is parked (its records stay pending) and its job needs attention.
 MAX_SCORERS = 3
+SCORERS_ENV = "RELIQUARY_ORDER_AUDIT_SCORERS"
+DEFAULT_SCORERS = 1
+
+
+def order_audit_scorers(env=None) -> int:
+    """How many executors score each audit batch (1, 2 or 3)."""
+    import os
+
+    raw = (os.environ if env is None else env).get(SCORERS_ENV, "").strip()
+    value = int(raw) if raw else DEFAULT_SCORERS
+    if not 1 <= value <= MAX_SCORERS:
+        raise ValueError(f"{SCORERS_ENV} must be 1 to {MAX_SCORERS}, got {value}")
+    return value
 STATUS_SECONDS = 30.0
 HEARTBEAT_WRITE_SECONDS = 30.0
 EVAL_CONTROL_STATUS_KEY = "reliquary/eval/control/status.json"
@@ -175,8 +190,9 @@ class _Lease:
 
 
 class PairedAuditDispatcher:
-    """Audit batches of every model, each decided by two agreeing executors on
-    distinct providers. ``quarantine``/``record_heartbeat`` write the registry."""
+    """Audit batches of every model, each decided by ``scorers`` executors (one by default; two or
+    more must agree, on distinct providers and hosts). ``quarantine``/``record_heartbeat`` write the
+    registry."""
 
     def __init__(self, *, directory: EvalExecutorDirectory,
                  quarantine: Callable[[str, str], Awaitable[Any]] | None = None,
@@ -185,7 +201,11 @@ class PairedAuditDispatcher:
                  lease_seconds: float = AUDIT_LEASE_SECONDS,
                  live_seconds: float = EXECUTOR_LIVE_SECONDS,
                  max_leases_per_executor: int = MAX_LEASES_PER_EXECUTOR,
-                 expiry_strikes: int = LEASE_EXPIRY_STRIKES) -> None:
+                 expiry_strikes: int = LEASE_EXPIRY_STRIKES,
+                 scorers: int = DEFAULT_SCORERS) -> None:
+        if not 1 <= scorers <= MAX_SCORERS:
+            raise ValueError(f"scorers must be 1 to {MAX_SCORERS}")
+        self._scorers = scorers
         self._directory = directory
         self._quarantine_write = quarantine
         self._heartbeat_write = record_heartbeat
@@ -255,7 +275,8 @@ class PairedAuditDispatcher:
             for indexes in grouped:
                 batch = _Batch(id=next(self._ids), model=model, proof=proof,
                                items=[items[k] for k in indexes], future=loop.create_future(),
-                               job_id=job_id, protocol=protocol, judge=judge)
+                               job_id=job_id, protocol=protocol, judge=judge,
+                               needed=self._scorers)
                 units.append((indexes, batch))
                 self._queues[model].append(batch)
         scored: list = [None] * len(items)
@@ -368,6 +389,13 @@ class PairedAuditDispatcher:
         an id-ordered pick: conflicting pairs, or no pair, park the batch."""
         from reliquary.validator.corpus_audit import outcome_from_scores
 
+        if self._scorers == 1 and batch.scores:
+            # One scorer: its scores decide, as the validator's own GPU decides the corpus audits.
+            if not batch.future.done():
+                (executor_id, scores), = batch.scores.items()
+                batch.future.set_result((scores, (executor_id,)))
+                self.stats["scored_alone"] += 1
+            return
         if len(batch.scores) < 2:
             return
         ids = sorted(batch.scores)
@@ -440,7 +468,7 @@ class PairedAuditDispatcher:
                     d["executor_id"], ())),
                 "waiting_batches": len(waiting),
                 "waiting_draw_batches": sum(1 for b in waiting if b.protocol == AUDIT_PROTOCOL_V3),
-                "awaiting_third_scorer": sum(1 for b in waiting if b.needed > 2)}
+                "awaiting_third_scorer": sum(1 for b in waiting if b.needed > max(2, self._scorers))}
         jobs = {job_id: {"needs_attention": True, "parked_batches": self.parked[job_id],
                          "reasons": list(reasons)}
                 for job_id, reasons in self.attention.items() if reasons}
@@ -854,19 +882,24 @@ def order_job_refusal(entry, job) -> str | None:
         from reliquary.eval.qualification import order_environment_refusal
         from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS
 
+        declared = list(((getattr(entry, "contract", None) or {}).get("environments") or {}))
         if is_eval_source(job.prompt_source):
-            return "a generation order does not draw from an eval set"
-        refusal = order_environment_refusal(job.prompt_source)
-        if refusal is not None:
-            return refusal
+            # A frozen set (ours or a customer's upload): a forced-draw order, one declared environment.
+            if not has_draw(job):
+                return "a generation order draws from a set only under a forced draw"
+            if getattr(entry, "contract", None) is not None and len(declared) != 1:
+                return f"its contract declares environments {declared}, not one"
+        else:
+            refusal = order_environment_refusal(job.prompt_source)
+            if refusal is not None:
+                return refusal
+            if getattr(entry, "contract", None) is not None and declared != [job.prompt_source]:
+                return f"its contract declares environments {declared}, not {job.prompt_source!r} alone"
         if job.renderer_id not in CHAT_TEMPLATE_RENDERERS:
             return f"renderer {job.renderer_id!r} is not the model's chat template"
         if getattr(job, "submit", None) != "scoped":
             # Its miners would post to /corpus/submit, which this control lacks.
             return "its manifest does not send submissions to its scoped route"
-        declared = list(((getattr(entry, "contract", None) or {}).get("environments") or {}))
-        if getattr(entry, "contract", None) is not None and declared != [job.prompt_source]:
-            return f"its contract declares environments {declared}, not {job.prompt_source!r} alone"
     else:
         return "not an order job"
     if getattr(entry, "contract", None) is None:
@@ -906,6 +939,8 @@ def qualification_refusal(entry, job, declared: dict | None, record: dict | None
 
     if declared is None or declared.get("job_id") != job.job_id:
         return "no order record names this job: only the admin declares order jobs"
+    if declared.get("schema") == qual.ORDER_JOB_SCHEMA_V2:
+        return pinned_order_refusal(entry, job, declared)
     if record is None or record.get("qualification_id") != declared.get("qualification_id"):
         return f"its qualification {declared.get('qualification_id')!r} is not readable"
     if record.get("status") != qual.QUALIFIED:
@@ -960,6 +995,76 @@ def qualification_refusal(entry, job, declared: dict | None, record: dict | None
         if not here or here != record.get("environment_manifest_sha256") or here != in_contract:
             return (f"the {job.prompt_source!r} package here ({str(here)[:12]}) is not the "
                     "qualified one or the contract's")
+    return None
+
+
+def pinned_order_refusal(entry, job, declared: dict) -> str | None:
+    """Why a forced-draw order's job does not match the order record the admin wrote, or None. No qualification
+    backs it: its model pin, source and conditions are the record's, and its thresholds its judge."""
+    from reliquary.constants import SUPPORTED_ARCHITECTURES
+    from reliquary.eval import qualification as qual
+    from reliquary.eval.prompt_source import is_eval_source, is_gen_job_id, parse_eval_source
+    from reliquary.validator import corpus_service
+
+    generation = is_gen_job_id(job.job_id)
+    if (declared.get("kind") == qual.GENERATION) != generation:
+        return "its order record is of another kind"
+    if not has_draw(job) or declared.get("draw") != job.sampling.draw:
+        return "an order without a qualification is a forced-draw order"
+    pin = declared.get("pin") or {}
+    contract = getattr(entry, "contract", None) or {}
+    if (pin.get("model"), pin.get("revision")) != (job.checkpoint_repo, job.checkpoint_revision):
+        return "its order record pins another model"
+    if pin.get("architecture") not in SUPPORTED_ARCHITECTURES \
+            or pin.get("architecture") != contract.get("model_architecture"):
+        return f"its architecture {pin.get('architecture')!r} is not the supported one declared"
+    if pin.get("checkpoint_sha256") != job.checkpoint_sha256:
+        return "its checkpoint fingerprint is not the pinned one"
+    if pin.get("eos_token_id") != job.eos_token_id:
+        return "its eos is not the pinned one"
+    from reliquary.corpus.job import draw_judge_from
+
+    sampling = {"temperature": job.sampling.temperature, "top_p": job.sampling.top_p,
+                "top_k": job.sampling.top_k, **({"min_p": job.sampling.min_p} if job.sampling.min_p else {})}
+    # Every condition the admin declared, compared whole: a job unlike its record is never served.
+    keys = ("sampling", "max_new_tokens", "thinking", "samples", "seed", "n", "min_new_tokens",
+            "max_prompt_tokens", "judge", "audit_q")
+    wanted = {k: declared.get(k) for k in keys}
+    try:
+        wanted["judge"] = draw_judge_from(declared.get("judge") or {}).to_contract()
+    except ValueError:
+        return "its order record's judge cannot be read"
+    params = getattr(entry, "params", None) or {}
+    given = {"sampling": sampling, "max_new_tokens": job.sampling.max_new_tokens,
+             "thinking": corpus_service.CHAT_TEMPLATE_RENDERERS.get(job.renderer_id),
+             "samples": job.slots_per_prompt, "seed": job.seed, "n": job.sampling.n,
+             "min_new_tokens": job.sampling.min_new_tokens,
+             "max_prompt_tokens": getattr(job, "max_prompt_tokens", None), "judge": job.judge.to_contract(),
+             "audit_q": params.get("audit_q")}
+    source = declared.get("source") or {}
+    if is_eval_source(job.prompt_source):
+        parsed = parse_eval_source(job.prompt_source)
+        wanted["source"] = {"set_id": source.get("set_id"), "problems": source.get("problems"), "prompt_start": 0}
+        given["source"] = {"set_id": parsed.set_id, "problems": parsed.count, "prompt_start": job.prompt_start}
+        wanted["environments"] = [declared.get("contract_environment")]
+        given["environments"] = list((contract.get("environments") or {}))
+    else:
+        wanted["source"] = {k: source.get(k) for k in ("env", "prompt_start", "problems")}
+        given["source"] = {"env": job.prompt_source, "prompt_start": job.prompt_start,
+                           "problems": job.prompt_count}
+    if not generation and wanted["audit_q"] != 1.0:
+        return "an evaluation order audits every submission"
+    differs = sorted(k for k in wanted if wanted[k] != given[k])
+    if differs:
+        return f"its conditions differ from its order record: {differs}"
+    if not is_eval_source(job.prompt_source):
+        spec = corpus_service.ENVIRONMENT_SPECS.get(job.prompt_source)
+        here = getattr(spec, "environment_manifest_sha256", None)
+        in_contract = ((contract.get("environments") or {}).get(job.prompt_source) or {}).get(
+            "environment_manifest_sha256")
+        if not here or here != source.get("environment_manifest_sha256") or here != in_contract:
+            return (f"the {job.prompt_source!r} package here ({str(here)[:12]}) is not the "
+                    "ordered one or the contract's")
     return None
 
 
@@ -1322,7 +1427,7 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
         await registered.refresh()
     directory = EvalExecutorDirectory()
     dispatcher = PairedAuditDispatcher(
-        directory=directory,
+        directory=directory, scorers=order_audit_scorers(),
         quarantine=lambda executor_id, reason: executor_store.set_executor_status(
             executor_id, "quarantined", reason=reason, scope="eval"),
         record_heartbeat=lambda executor_id, at, detail: executor_store.record_heartbeat(
@@ -1429,6 +1534,8 @@ __all__ = [
     "build_order_control",
     "order_control_runtime_check",
     "qualification_refusal",
+    "pinned_order_refusal",
+    "order_audit_scorers",
     "order_job_refusal",
     "run_order_control",
     "EVAL_AUDIT_PREFIX",
