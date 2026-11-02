@@ -44,8 +44,8 @@ EXTERNAL_BODIES: Mapping[str, EnvironmentProfile] = MappingProxyType(
 
 def contract_environment_for(card: Mapping) -> str:
     """The environment an eval job on this set declares: its catalog source,
-    or the external eval environment for a set built from a Verifiers taskset."""
-    if card.get("source_kind") == "verifiers":
+    or the external eval environment for a set built from a Verifiers taskset or a customer upload."""
+    if card.get("source_kind") in ("verifiers", "upload"):
         return EXTERNAL_EVAL_ENVIRONMENT
     return card["source"]
 

@@ -854,19 +854,24 @@ def order_job_refusal(entry, job) -> str | None:
         from reliquary.eval.qualification import order_environment_refusal
         from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS
 
+        declared = list(((getattr(entry, "contract", None) or {}).get("environments") or {}))
         if is_eval_source(job.prompt_source):
-            return "a generation order does not draw from an eval set"
-        refusal = order_environment_refusal(job.prompt_source)
-        if refusal is not None:
-            return refusal
+            # A frozen set (ours or a customer's upload): a forced-draw order, one declared environment.
+            if not has_draw(job):
+                return "a generation order draws from a set only under a forced draw"
+            if getattr(entry, "contract", None) is not None and len(declared) != 1:
+                return f"its contract declares environments {declared}, not one"
+        else:
+            refusal = order_environment_refusal(job.prompt_source)
+            if refusal is not None:
+                return refusal
+            if getattr(entry, "contract", None) is not None and declared != [job.prompt_source]:
+                return f"its contract declares environments {declared}, not {job.prompt_source!r} alone"
         if job.renderer_id not in CHAT_TEMPLATE_RENDERERS:
             return f"renderer {job.renderer_id!r} is not the model's chat template"
         if getattr(job, "submit", None) != "scoped":
             # Its miners would post to /corpus/submit, which this control lacks.
             return "its manifest does not send submissions to its scoped route"
-        declared = list(((getattr(entry, "contract", None) or {}).get("environments") or {}))
-        if getattr(entry, "contract", None) is not None and declared != [job.prompt_source]:
-            return f"its contract declares environments {declared}, not {job.prompt_source!r} alone"
     else:
         return "not an order job"
     if getattr(entry, "contract", None) is None:
@@ -906,6 +911,8 @@ def qualification_refusal(entry, job, declared: dict | None, record: dict | None
 
     if declared is None or declared.get("job_id") != job.job_id:
         return "no order record names this job: only the admin declares order jobs"
+    if declared.get("schema") == qual.ORDER_JOB_SCHEMA_V2:
+        return pinned_order_refusal(entry, job, declared)
     if record is None or record.get("qualification_id") != declared.get("qualification_id"):
         return f"its qualification {declared.get('qualification_id')!r} is not readable"
     if record.get("status") != qual.QUALIFIED:
@@ -960,6 +967,65 @@ def qualification_refusal(entry, job, declared: dict | None, record: dict | None
         if not here or here != record.get("environment_manifest_sha256") or here != in_contract:
             return (f"the {job.prompt_source!r} package here ({str(here)[:12]}) is not the "
                     "qualified one or the contract's")
+    return None
+
+
+def pinned_order_refusal(entry, job, declared: dict) -> str | None:
+    """Why a forced-draw order's job does not match the order record the admin wrote, or None. No qualification
+    backs it: its model pin, source and conditions are the record's, and its thresholds its judge."""
+    from reliquary.constants import SUPPORTED_ARCHITECTURES
+    from reliquary.eval import qualification as qual
+    from reliquary.eval.prompt_source import is_eval_source, is_gen_job_id, parse_eval_source
+    from reliquary.validator import corpus_service
+
+    generation = is_gen_job_id(job.job_id)
+    if (declared.get("kind") == qual.GENERATION) != generation:
+        return "its order record is of another kind"
+    if not has_draw(job) or declared.get("draw") != job.sampling.draw:
+        return "an order without a qualification is a forced-draw order"
+    pin = declared.get("pin") or {}
+    contract = getattr(entry, "contract", None) or {}
+    if (pin.get("model"), pin.get("revision")) != (job.checkpoint_repo, job.checkpoint_revision):
+        return "its order record pins another model"
+    if pin.get("architecture") not in SUPPORTED_ARCHITECTURES \
+            or pin.get("architecture") != contract.get("model_architecture"):
+        return f"its architecture {pin.get('architecture')!r} is not the supported one declared"
+    if pin.get("checkpoint_sha256") != job.checkpoint_sha256:
+        return "its checkpoint fingerprint is not the pinned one"
+    if pin.get("eos_token_id") != job.eos_token_id:
+        return "its eos is not the pinned one"
+    sampling = {"temperature": job.sampling.temperature, "top_p": job.sampling.top_p,
+                "top_k": job.sampling.top_k, **({"min_p": job.sampling.min_p} if job.sampling.min_p else {})}
+    wanted = {"sampling": declared.get("sampling"), "max_new_tokens": declared.get("max_new_tokens"),
+              "thinking": declared.get("thinking"), "samples": declared.get("samples"),
+              "seed": declared.get("seed")}
+    given = {"sampling": sampling, "max_new_tokens": job.sampling.max_new_tokens,
+             "thinking": corpus_service.CHAT_TEMPLATE_RENDERERS.get(job.renderer_id),
+             "samples": job.slots_per_prompt, "seed": job.seed}
+    source = declared.get("source") or {}
+    if is_eval_source(job.prompt_source):
+        parsed = parse_eval_source(job.prompt_source)
+        wanted["source"] = {"set_id": source.get("set_id"), "problems": source.get("problems")}
+        given["source"] = {"set_id": parsed.set_id, "problems": parsed.count}
+    else:
+        wanted["source"] = {k: source.get(k) for k in ("env", "prompt_start", "problems")}
+        given["source"] = {"env": job.prompt_source, "prompt_start": job.prompt_start,
+                           "problems": job.prompt_count}
+    differs = sorted(k for k in wanted if wanted[k] != given[k])
+    for name, value in (declared.get("judge") or {}).items():
+        if getattr(job.judge, name, None) != value:
+            differs.append("judge")
+            break
+    if differs:
+        return f"its conditions differ from its order record: {differs}"
+    if not is_eval_source(job.prompt_source):
+        spec = corpus_service.ENVIRONMENT_SPECS.get(job.prompt_source)
+        here = getattr(spec, "environment_manifest_sha256", None)
+        in_contract = ((contract.get("environments") or {}).get(job.prompt_source) or {}).get(
+            "environment_manifest_sha256")
+        if not here or here != source.get("environment_manifest_sha256") or here != in_contract:
+            return (f"the {job.prompt_source!r} package here ({str(here)[:12]}) is not the "
+                    "ordered one or the contract's")
     return None
 
 
@@ -1429,6 +1495,7 @@ __all__ = [
     "build_order_control",
     "order_control_runtime_check",
     "qualification_refusal",
+    "pinned_order_refusal",
     "order_job_refusal",
     "run_order_control",
     "EVAL_AUDIT_PREFIX",

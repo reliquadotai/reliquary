@@ -327,6 +327,9 @@ def lease_prompt(row: dict) -> dict:
 EVAL_JOB_SCHEMA = "reliquary/eval-job/v1"
 # A generation order's record, in the same store: its qualification and conditions.
 ORDER_JOB_SCHEMA = "reliquary/order-job/v1"
+# A forced-draw order's record (eval or generation): its model pin, source and conditions, no qualification.
+ORDER_JOB_SCHEMA_V2 = "reliquary/order-job/v2"
+EVALUATION = "evaluation"
 EVAL_JOB_KEY_PREFIX = "reliquary/eval/jobs/"
 
 
@@ -644,6 +647,8 @@ __all__ = [
     "GENERATION",
     "ORDER_ENVIRONMENTS",
     "ORDER_JOB_SCHEMA",
+    "ORDER_JOB_SCHEMA_V2",
+    "EVALUATION",
     "qualification_expiry_seconds",
     "GEN_REQUEST_FIELDS",
     "catalog_prompts",

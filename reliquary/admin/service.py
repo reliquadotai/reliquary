@@ -89,6 +89,8 @@ class CreateJob(BaseModel):
     judge: dict[str, float | int] | None = Field(default=None, max_length=8)
     # A long-context order: its longest prompt in tokens (miners size their engine to it).
     max_prompt_tokens: int | None = Field(default=None, gt=0, le=131072)
+    # A forced-draw order without a qualification pins its model here (``orders.models``): the full revision.
+    revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     # A reviewed contract can be pinned before the first durable write.
     manifest_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     profile_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
@@ -296,7 +298,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      task_prefix: str = DEFAULT_TASK_PREFIX, eval_store=None,
                      open_environment=None, grade_scorer=None,
                      require_sandbox=None, qualifications=None, eval_jobs=None,
-                     model_facts=None, evaluation_sessions=None) -> FastAPI:
+                     model_facts=None, evaluation_sessions=None, pin_model=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
     ``eval_store`` the subnet bucket holding the eval sets' grading files."""
@@ -346,6 +348,11 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
             # The model's own config and tokenizer files, on CPU (no weights).
             return await asyncio.to_thread(read_facts, repo, revision)
+    if pin_model is None:
+        def pin_model(repo: str, revision: str):
+            from reliquary.orders import models
+
+            return models.pin_model(repo, revision)
     if evaluation_sessions is None:
         from reliquary.sandbox.evaluation_engagements import from_environment
 
@@ -591,6 +598,104 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             **({"seed": body.seed if body.seed is not None else job_seed(body.job_id)} if body.draw else {}),
         )
 
+    async def read_set(set_id: str) -> tuple[dict, bytes]:
+        from reliquary.eval.sets import validated_set_id
+        from reliquary.eval.storage import subnet_key
+
+        try:
+            set_id = validated_set_id(set_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        card_body = await eval_store.get_bytes(subnet_key(set_id, "set.json"))
+        prompts_body = await eval_store.get_bytes(subnet_key(set_id, "prompts.jsonl"))
+        if card_body is None or prompts_body is None:
+            raise HTTPException(status_code=404, detail="set_unknown")
+        return json.loads(card_body), prompts_body
+
+    async def pinned_order_arguments(body: CreateJob, *, evaluation: bool, record_order: bool) -> dict:
+        """A forced-draw order (eval or generation) on any source: no qualification. Its model is pinned from
+        its own files (``orders.models``), its thresholds are its judge, and its declared conditions are the
+        order record the order control checks the job against."""
+        from reliquary.eval import qualification as qual
+        from reliquary.eval.prompt_source import eval_source_for, register_eval_prompts
+        from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
+        from reliquary.protocol.external_eval import contract_environment_for
+
+        if body.revision is None:
+            raise HTTPException(status_code=422, detail="a forced-draw order pins its model revision")
+        if body.sampling is None or body.max_new_tokens is None:
+            raise HTTPException(status_code=422, detail="an order names its sampling and max_new_tokens")
+        try:
+            pin = await asyncio.to_thread(pin_model, body.model, body.revision)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)[:500]) from exc
+        except Exception as exc:
+            logger.warning("model files of %s@%s unavailable", body.model, body.revision, exc_info=True)
+            raise HTTPException(status_code=503, detail="model_files_unavailable") from exc
+        longest = (body.max_prompt_tokens or 0) + body.max_new_tokens
+        if pin.max_position_embeddings is not None and longest > pin.max_position_embeddings:
+            raise HTTPException(status_code=422, detail=(
+                f"context_too_long: {longest} tokens, the model holds {pin.max_position_embeddings}"))
+        if evaluation:
+            if body.eval_set_id is None:
+                raise HTTPException(status_code=422, detail="an evaluation order names its eval_set_id")
+            if body.audit_q not in (None, 1.0):
+                raise HTTPException(status_code=422, detail="an eval job audits every submission (audit_q 1.0)")
+        if body.eval_set_id is not None:
+            if body.prompt_start != 0:
+                raise HTTPException(status_code=422, detail="an order on a set starts at its first problem")
+            card, prompts_body = await read_set(body.eval_set_id)
+            if card.get("source_kind") == "upload":
+                if (card.get("model"), card.get("revision")) != (body.model, body.revision):
+                    raise HTTPException(status_code=422, detail="the upload was rendered for another model")
+                if evaluation and not card.get("graded"):
+                    raise HTTPException(status_code=422, detail="an evaluation needs a set with references")
+            elif body.env not in (card.get("env"), card.get("source")):
+                raise HTTPException(status_code=422, detail=f"set {body.eval_set_id} is a {card.get('env')} set")
+            if body.prompt_count > int(card["count"]):
+                raise HTTPException(status_code=422, detail=f"set {body.eval_set_id} holds {card['count']} problems")
+            source = eval_source_for(body.eval_set_id, prompts_body, body.prompt_count)
+            register_eval_prompts(source, prompts_body)
+            prompt_source, contract_environment = source.name, contract_environment_for(card)
+            declared_source = {"set_id": source.set_id, "problems": body.prompt_count}
+        else:
+            refusal = qual.order_environment_refusal(body.env)
+            if refusal is not None:
+                raise HTTPException(status_code=422, detail=refusal)
+            await refuse_past_the_source(body.env, body.prompt_start, body.prompt_count)
+            try:
+                from reliquary.eval.sets import refuse_held_out_overlap
+
+                refuse_held_out_overlap(body.env, body.prompt_start, body.prompt_count)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            prompt_source, contract_environment = body.env, None
+            declared_source = {"env": body.env, "prompt_start": body.prompt_start, "problems": body.prompt_count,
+                               "environment_manifest_sha256": getattr(
+                                   ENVIRONMENT_CATALOG.get(body.env), "environment_manifest_sha256", None)}
+        seed = body.seed if body.seed is not None else job_seed(body.job_id)
+        if record_order:
+            try:
+                await eval_jobs.create({
+                    "schema": qual.ORDER_JOB_SCHEMA_V2, "job_id": body.job_id,
+                    "kind": qual.EVALUATION if evaluation else qual.GENERATION, "pin": pin.to_dict(),
+                    "source": declared_source, "samples": body.samples_per_prompt,
+                    "sampling": body.sampling.conditions(), "max_new_tokens": body.max_new_tokens,
+                    "thinking": body.thinking, "draw": body.draw, "judge": body.judge, "seed": seed})
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        audit = {"audit_q": 1.0} if evaluation else {
+            **GEN_AUDIT_PARAMS, **({"audit_q": body.audit_q} if body.audit_q is not None else {})}
+        return dict(
+            model_revision=pin.revision, model_architecture=pin.architecture,
+            checkpoint_sha256=pin.checkpoint_sha256, eos_token_id=pin.eos_token_id,
+            prompt_source=prompt_source, contract_environment=contract_environment, seed=seed,
+            audit_params=audit, temperature=body.sampling.temperature, top_p=body.sampling.top_p,
+            top_k=body.sampling.top_k, **draw_arguments(body),
+            # Its miners submit on its own route (the order control has no legacy one).
+            **({} if evaluation else {"submit": "scoped"}),
+        )
+
     def operator_generation_job(body: CreateJob) -> bool:
         from reliquary.eval.prompt_source import gen_job_prefix
 
@@ -616,27 +721,34 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             if task_id.startswith(order_prefix) and not body.job_id.startswith(order_prefix):
                 raise HTTPException(status_code=422, detail=(
                     f"an {order_prefix!r} task id names an {order_prefix!r} job id"))
-        evaluation = body.eval_set_id is not None
-        # The eval control serves exactly the order-eval- ids (and routing
-        # sends it exactly those): one is an eval job if and only if it says so.
-        if evaluation != body.job_id.startswith(eval_prefix) or (
-                evaluation and not (body.task_id or body.job_id).startswith(eval_prefix)):
+        evaluation = body.job_id.startswith(eval_prefix)
+        if evaluation and not (body.task_id or body.job_id).startswith(eval_prefix):
             raise HTTPException(status_code=422, detail=(
                 f"an eval job's ids start with {eval_prefix!r}, and only an eval job's"))
         # Pinned operator work has its own exact namespace and catalog path.
-        # Other generation orders always require their qualification record.
+        # Other generation orders are qualified, or forced-draw orders pinned without one.
         operator_generation = operator_generation_job(body)
         generation = body.job_id.startswith(gen_prefix) and not operator_generation
         if generation and not (body.task_id or body.job_id).startswith(gen_prefix):
             raise HTTPException(status_code=422, detail=(
                 f"a generation order's ids both start with {gen_prefix!r}"))
+        # A forced-draw order needs no qualification: one path for eval and generation, on a set or an env.
+        pinned = (evaluation or generation) and body.draw is not None and body.qualification_id is None
+        if body.eval_set_id is not None and not (evaluation or (generation and pinned)):
+            raise HTTPException(status_code=422, detail=(
+                f"an eval job's ids start with {eval_prefix!r}, and only an eval job's"))
+        if body.revision is not None and not pinned:
+            raise HTTPException(status_code=422, detail="revision pins a forced-draw order without a qualification")
         if generation and body.seed is not None and body.draw is None:
             raise HTTPException(status_code=422, detail="eval fields on a generation order: a seed keys a forced draw")
         if not evaluation and not generation and any(
                 v is not None for v in (body.qualification_id, body.seed, body.audit_q, body.draw, body.judge)):
             raise HTTPException(status_code=422, detail="eval fields on a non-eval job")
         cap = body.cap
-        if evaluation:
+        if pinned:
+            arguments = await pinned_order_arguments(body, evaluation=evaluation, record_order=False)
+            cap = (DEFAULT_EVAL_CAP if evaluation else DEFAULT_GEN_CAP) if cap is None else cap
+        elif evaluation:
             arguments = await eval_job_arguments(body, record_order=False)
             cap = DEFAULT_EVAL_CAP if cap is None else cap
         elif generation:
@@ -785,7 +897,14 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
         manifest, entry = await prepare_job(body)
         cap = float(entry.params["cap"])
-        if body.eval_set_id is not None:
+        from reliquary.eval.prompt_source import eval_job_prefix
+
+        evaluation = body.job_id.startswith(eval_job_prefix(task_prefix))
+        if ((evaluation or body.job_id.startswith(gen_job_prefix(task_prefix)))
+                and body.draw is not None and body.qualification_id is None
+                and not operator_generation_job(body)):
+            await pinned_order_arguments(body, evaluation=evaluation, record_order=True)
+        elif evaluation:
             await eval_job_arguments(body, record_order=True)
         elif (body.job_id.startswith(gen_job_prefix(task_prefix))
               and not operator_generation_job(body)):
@@ -1158,9 +1277,11 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if given != expected:
             raise HTTPException(status_code=422, detail=f"job {job.job_id} grades as {expected}")
         declared = await eval_jobs.read(job.job_id)
+        # A forced-draw order has no qualification: its record is its own.
+        pinned = declared is not None and declared.get("schema") == qual.ORDER_JOB_SCHEMA_V2
         record, _ = (await qualifications.read(declared["qualification_id"])
-                     if declared else (None, None))
-        if declared is None or record is None:
+                     if declared and not pinned else (None, None))
+        if declared is None or (record is None and not pinned):
             raise HTTPException(status_code=409, detail="eval_job_record_missing")
         sampling = {"temperature": job.sampling.temperature, "top_p": job.sampling.top_p,
                     "top_k": job.sampling.top_k}
@@ -1185,25 +1306,37 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         exhausted = exhausted_prompts(job, collected, samples, slots)
         if not complete and not body.allow_incomplete:
             raise HTTPException(status_code=409, detail="job_not_complete")
-        verification = {"scheme": "toploc-v1", "source": "qualification",
-                        "qualification_id": declared["qualification_id"],
-                        "sampling_verified": False}
-        for entry in await entries_naming(job.job_id):
-            if body.service_contract is not None:
-                facts["generation_contract_sha256"] = entry.profile_sha256
-            proofs = (entry.contract or {}).get("proofs") or ()
-            toploc = [p for p in proofs if p.get("scheme") == "toploc-v1"]
-            if toploc:
-                verification["thresholds"] = {k: toploc[0][k] for k in (
-                    "exp_mismatch_threshold", "mant_mean_threshold", "mant_median_threshold")}
+        if pinned:
+            from reliquary.corpus.eval_draw import draw_randomness
+
+            # Every sample follows its slot's public draw, judged under the order's thresholds.
+            verification = {"scheme": job.sampling.draw, "source": "order", "sampling_verified": True,
+                            "judge": job.judge.to_contract(), "randomness": draw_randomness(job),
+                            "pin": declared.get("pin")}
+            for entry in await entries_naming(job.job_id):
+                if body.service_contract is not None:
+                    facts["generation_contract_sha256"] = entry.profile_sha256
                 verification["task_id"] = entry.task_id
-        result = record.get("result") or {}
-        verification["qualification"] = {
-            "band": result.get("band"), "clamped": result.get("clamped"),
-            "qualifiers": {eid: {"provider_id": m.get("provider_id"), "host": m.get("host"),
-                                 "gpu": m.get("gpu")}
-                           for eid, m in (result.get("measurements") or {}).items()},
-            "status": record.get("status")}
+        else:
+            verification = {"scheme": "toploc-v1", "source": "qualification",
+                            "qualification_id": declared["qualification_id"],
+                            "sampling_verified": False}
+            for entry in await entries_naming(job.job_id):
+                if body.service_contract is not None:
+                    facts["generation_contract_sha256"] = entry.profile_sha256
+                proofs = (entry.contract or {}).get("proofs") or ()
+                toploc = [p for p in proofs if p.get("scheme") == "toploc-v1"]
+                if toploc:
+                    verification["thresholds"] = {k: toploc[0][k] for k in (
+                        "exp_mismatch_threshold", "mant_mean_threshold", "mant_median_threshold")}
+                    verification["task_id"] = entry.task_id
+            result = record.get("result") or {}
+            verification["qualification"] = {
+                "band": result.get("band"), "clamped": result.get("clamped"),
+                "qualifiers": {eid: {"provider_id": m.get("provider_id"), "host": m.get("host"),
+                                     "gpu": m.get("gpu")}
+                               for eid, m in (result.get("measurements") or {}).items()},
+                "status": record.get("status")}
         provenance = {**facts, "checkpoint_sha256": job.checkpoint_sha256, "seed": job.seed,
                       "eos_token_id": job.eos_token_id, "verification": verification,
                       "job_complete": complete,
