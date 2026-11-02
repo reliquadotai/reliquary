@@ -339,3 +339,35 @@ def test_an_eval_on_a_customer_file_is_graded_by_its_references(admin, pins):  #
     (scores,) = report["envs"].values()
     assert scores["pass@1"]["value"] == pytest.approx(2 / 3)
     assert report["provenance"]["verification"]["sampling_verified"] is True
+
+
+def test_an_eval_order_on_several_sets_has_one_report(admin, pins):  # noqa: F811
+    from reliquary.corpus.delivery import LocalDirectorySink
+
+    platform = LocalDirectorySink(admin.root / "p")
+
+    def part(eval_id, env, value, complete=True):
+        report = {"complete": complete, "envs": {env: {"pass@1": {"value": value}, "pass@k": {"1": {"value": value}},
+                                                       "no_graded_rows": False}},
+                  "provenance": {"job_id": f"order-eval-{eval_id}"}}
+        asyncio.run(platform.put_json(f"evaluations/{eval_id}/report.json", report))
+        asyncio.run(platform.put_json(f"evaluations/{eval_id}/manifest.json", {"eval_id": eval_id}))
+
+    part("order-e1", "math", 0.5)
+    part("order-e2", "logic", 0.25)
+    part("order-e3", "math", 1.0, complete=False)
+    assert admin("POST", "/admin/v1/evaluations/order-all/combine",
+                 {"parts": ["order-e1", "order-x9"]}).status_code == 409
+    response = admin("POST", "/admin/v1/evaluations/order-all/combine",
+                     {"parts": ["order-e1", "order-e2", "order-e3"]})
+    assert response.status_code == 200, response.text
+    assert response.json()["complete"] is False
+    report = json.loads((admin.root / "p" / "evaluations" / "order-all" / "report.json").read_text())
+    assert set(report["envs"]) == {"math@order-e1", "logic", "math@order-e3"}
+    assert report["macro"]["pass@1"] == pytest.approx((0.5 + 0.25 + 1.0) / 3)
+    assert [p["eval_id"] for p in report["parts"]] == ["order-e1", "order-e2", "order-e3"]
+    # The same parts again: as stored; others under the same id: refused.
+    assert admin("POST", "/admin/v1/evaluations/order-all/combine",
+                 {"parts": ["order-e1", "order-e2", "order-e3"]}).status_code == 200
+    assert admin("POST", "/admin/v1/evaluations/order-all/combine", {"parts": ["order-e1"]}).status_code == 409
+    assert admin("POST", "/admin/v1/evaluations/order-e1/combine", {"parts": ["order-e1"]}).status_code == 422

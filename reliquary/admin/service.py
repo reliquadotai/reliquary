@@ -227,6 +227,12 @@ class Provenance(BaseModel):
     pod_provider_id: str | None = Field(default=None, min_length=1)
 
 
+class CombineEvaluation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # The gradings of an evaluation order's sets (one job each), in report order.
+    parts: list[str] = Field(min_length=1, max_length=64)
+
+
 class GradeEvaluation(BaseModel):
     model_config = ConfigDict(extra="forbid")
     # "uploads": the v1 pod's completion files; "job": an eval job's passing records.
@@ -1453,6 +1459,31 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             if response.status_code in (429, 503):
                 response.headers["Retry-After"] = str(max(1, math.ceil(refusal["retry_after"] or 5)))
         return result
+
+    @router.post("/evaluations/{eval_id}/combine")
+    async def combine_evaluation(eval_id: str, body: CombineEvaluation) -> dict:
+        """One report for an evaluation order on several sets: each set's grading, side by side, the macro over
+        all of them (``orders.reports``)."""
+        from reliquary.corpus.delivery import validated_delivery_id
+        from reliquary.orders import reports
+
+        for name in (eval_id, *body.parts):
+            in_scope(name)
+            try:
+                validated_delivery_id(name)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if eval_id in body.parts:
+            raise HTTPException(status_code=422, detail="a combined evaluation is not one of its parts")
+        if deliveries is None or not getattr(deliveries, "evaluation_supported", True):
+            raise HTTPException(status_code=503, detail="deliveries_not_configured")
+        try:
+            manifest = await reports.combine(deliveries, eval_id, body.parts, clock=clock)
+        except reports.PartNotGraded as exc:
+            raise HTTPException(status_code=409, detail=f"part_not_graded: {exc}") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"state": "done", "eval_id": eval_id, "keys": manifest["keys"], "complete": manifest["complete"]}
 
     @router.post("/evaluations/{eval_id}/grade")
     async def grade_evaluation(eval_id: str, body: GradeEvaluation, response: Response) -> dict:
