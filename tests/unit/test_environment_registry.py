@@ -203,3 +203,36 @@ def test_reliquaryverifiable_factory_is_local_and_valid():
         load_environment("reliquaryverifiable_v1"),
         ReliquaryVerifiableEnvironment,
     )
+
+
+def test_create_passes_split_to_external_episode_backend(monkeypatch):
+    from reliquary.environment.agentic import external
+
+    seen = []
+
+    class Stop(Exception):
+        pass
+
+    def fake(spec, *, split="train"):
+        seen.append(split)
+        raise Stop
+
+    monkeypatch.setattr(external, "load_external_episode_environment", fake)
+    spec = get_environment_spec("reliquary_telecom_solo_v2")
+    with pytest.raises(Stop):
+        spec.create()
+    with pytest.raises(Stop):
+        spec.create(split="benchmark")
+    assert seen == ["train", "benchmark"]
+
+
+def test_create_refuses_split_on_factory_env():
+    spec = get_environment_spec("reliquary_stateful_tools_v1")
+    with pytest.raises(ValueError, match="has no split benchmark"):
+        spec.create(split="benchmark")
+
+
+def test_create_refuses_split_on_external_answer_env():
+    spec = get_environment_spec("reliquary_code_v1")
+    with pytest.raises(ValueError, match="has no split eval"):
+        spec.create(split="eval")

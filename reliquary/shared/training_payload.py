@@ -176,6 +176,10 @@ def encode_training_payload(
     pi_old_flat: list[float] = []
     pi_old_off: list[int] = [0]
     has_pi_old: list[bool] = []
+    # Substitution loss: the forced draw's public uniforms per policy position, float64
+    # (gumbel_key reads all 53 bits). Written only when some rollout carries them.
+    draw_u_flat: list[float] = []
+    draw_u_off: list[int] = [0]
 
     for env in env_order:
         for group in window_batches.get(env, []):
@@ -237,6 +241,10 @@ def encode_training_payload(
                     has_pi_old.append(True)
                     pi_old_flat.extend(pi_old)
                 pi_old_off.append(len(pi_old_flat))
+                uniforms = getattr(rollout, "_forced_draw_uniforms", None)
+                if isinstance(uniforms, list) and len(uniforms) == policy_length:
+                    draw_u_flat.extend(float(v) for v in uniforms)
+                draw_u_off.append(len(draw_u_flat))
 
     extended = env_targets is not None or any(item is not None for item in assistant_spans)
     artifact_schema = (
@@ -281,6 +289,11 @@ def encode_training_payload(
             environment: int(resolved_targets[environment])
             for environment in env_order
         }
+    draw_arrays = (
+        {"draw_u_flat": np.asarray(draw_u_flat, dtype=np.float64),
+         "draw_u_off": np.asarray(draw_u_off, dtype=np.int64)}
+        if draw_u_flat else {}
+    )
     buf = io.BytesIO()
     np.savez_compressed(
         buf,
@@ -294,6 +307,7 @@ def encode_training_payload(
         pi_old_flat=np.asarray(pi_old_flat, dtype=np.float32),
         pi_old_off=np.asarray(pi_old_off, dtype=np.int64),
         has_pi_old=np.asarray(has_pi_old, dtype=np.bool_),
+        **draw_arrays,
     )
     return buf.getvalue()
 
@@ -428,6 +442,10 @@ class DecodedPayload:
                     rollout._validated_completion_logprobs = [
                         float(v) for v in a["pi_old_flat"][p0:p1]
                     ]
+                if "draw_u_off" in a:
+                    u0, u1 = int(a["draw_u_off"][i]), int(a["draw_u_off"][i + 1])
+                    if u1 > u0:
+                        rollout._forced_draw_uniforms = [float(v) for v in a["draw_u_flat"][u0:u1]]
                 if i < len(self._validated_spans):
                     span = self._validated_spans[i]
                     if span:

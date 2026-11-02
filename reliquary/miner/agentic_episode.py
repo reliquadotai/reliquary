@@ -30,7 +30,8 @@ class EpisodeResult:
     # Wall-clock time after which the validator would refuse the submission.
     submit_by: float | None = None
     # The machine-signed final's status of an episode that did not end graded (``aborted``: the box failed
-    # under the episode; an RL seed's engagement is freed once by it), else None.
+    # under the episode; an RL seed's engagement is freed once by it), ``open_refused`` when the machine refused
+    # the open with a signed receipt (no box ran; an RL lease rollout's engagement is freed by it), else None.
     final_status: str | None = None
 
 

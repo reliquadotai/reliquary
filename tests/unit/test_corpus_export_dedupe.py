@@ -33,6 +33,7 @@ class _Records:
 
     def __init__(self, jobs, failing=None):
         self.subs, self.verdicts = {}, {}
+        self.voided = set()
         for job_id, by_prompt in jobs.items():
             for i, completions in by_prompt.items():
                 sid = _sid(i)
@@ -53,6 +54,12 @@ class _Records:
 
     async def read_submission(self, job_id, sid):
         return self.subs.get((job_id, sid))
+
+    async def list_voided_ids(self, job_id):
+        return sorted(sid for j, sid in self.voided if j == job_id)
+
+    async def read_voided(self, job_id, sid):
+        return {} if (job_id, sid) in self.voided else None
 
 
 V1 = {0: [_c("alpha", [1]), _c("beta", [2])]}
@@ -76,6 +83,32 @@ def test_fingerprints_of_other_jobs_are_their_passing_completions():
     records = _Records({"v1": V1, "v2": V2}, failing=FAILING)
     seen = asyncio.run(job_fingerprints(records, ["v1"]))
     assert seen == {completion_fingerprint(c) for c in V1[0]}
+
+
+@pytest.mark.parametrize("invalidate_after_read", [False, True])
+def test_invalidated_history_does_not_suppress_a_later_valid_completion(
+    monkeypatch, invalidate_after_read,
+):
+    records = _Records({"v1": V1, "v2": V2})
+    if invalidate_after_read:
+        read_submission = records.read_submission
+
+        async def read(job_id, sid):
+            record = await read_submission(job_id, sid)
+            if job_id == "v1":
+                records.voided.add((job_id, sid))
+            return record
+
+        monkeypatch.setattr(records, "read_submission", read)
+    else:
+        records.voided.add(("v1", _sid(0)))
+
+    seen = asyncio.run(job_fingerprints(records, ["v1"]))
+    rows, counts = _rows(records, seen)
+
+    assert seen == {completion_fingerprint(c) for group in V2.values() for c in group}
+    assert [row["completion"] for row in rows] == ["alpha", "gamma", "delta"]
+    assert counts["duplicate_completion"] == 1
 
 
 def _rows(records, seen):

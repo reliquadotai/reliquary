@@ -609,9 +609,15 @@ def _run_train_follower(ctx, channel) -> None:
         except TrainingStepSkipped:
             pass  # every rank took the same decision; rank 0 handles it
 
+    def audit(model, payload):
+        from reliquary.trainer.audits import audit_group
+
+        audit_group(model, payload["group"])
+
     run_follower(
         channel,
         load=load,
         train=train,
         gather=lambda model: gather_full_state_dict(model, ctx),
+        audit=audit,
     )

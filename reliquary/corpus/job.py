@@ -9,8 +9,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import json
+import math
 import re
 from typing import Any
+
+# Pure: a prefix test on the prompt source, loading nothing.
+from reliquary.eval.prompt_source import is_eval_source
 
 JOB_SCHEMA = "reliquary/corpus-job/v1"
 
@@ -58,7 +63,45 @@ _JOB_FIELDS = (
 # manifest that predates it stores and hashes byte-identically. A binary that
 # predates it refuses a manifest carrying it (unknown field): miners and
 # validators of a job with ``prompt_start > 0`` need a build that knows it.
-_OPTIONAL_JOB_FIELDS = ("prompt_start", "seed", "submit", "episode")
+_OPTIONAL_JOB_FIELDS = ("prompt_start", "seed", "submit", "episode", "judge", "max_prompt_tokens")
+# The longest prompt a job may declare it holds (``max_prompt_tokens``): a long-context job's miners size their
+# engine to it; the wire bounds a completion at the same.
+MAX_JOB_PROMPT_TOKENS = 131072
+# A forced-draw job's judge (``corpus.eval_draw.judge``): how far a sample may stray from its draw.
+_JUDGE_FIELDS = ("floor_rate", "grace", "gap_tolerance", "terminal_gap", "edge_margin")
+MIN_JUDGE_FLOOR_RATE = 0.5
+MAX_JUDGE_GRACE = 64
+MAX_JUDGE_GAP = 64.0
+MAX_JUDGE_EDGE_MARGIN = 0.5
+DEFAULT_EDGE_MARGIN = 0.15
+
+
+@dataclass(frozen=True, slots=True)
+class DrawJudge:
+    """The thresholds a forced-draw sample is judged under: at most ``1 - floor_rate`` of its drawn positions
+    missed (``grace`` misses always allowed, up to a quarter of a short sample), every miss within
+    ``gap_tolerance`` of the pick's Gumbel score, the last token within ``terminal_gap``. Under a warp (top-k,
+    top-p, min-p) a cut that moved by ``edge_margin`` (``forced_sampling.Warp.widened``) is drift, not an edit."""
+
+    floor_rate: float
+    grace: int
+    gap_tolerance: float
+    terminal_gap: float
+    edge_margin: float = 0.15                 # DEFAULT_EDGE_MARGIN
+
+    def to_contract(self) -> dict[str, Any]:
+        """Every threshold; ``edge_margin`` only when not the default, so a judge written before it hashes the same."""
+        return {name: getattr(self, name) for name in _JUDGE_FIELDS
+                if name != "edge_margin" or self.edge_margin != DEFAULT_EDGE_MARGIN}
+
+
+# Today's values: honest bf16 / fp32-head miners lose 0.1-0.3 % of samples on Qwen3.8-27B at every warp tested
+# (2026-10-31); a job that keeps them writes no ``judge`` and hashes as before. The edge margin covers the honest
+# top-p drift measured there (validator mass before a token the miner kept: up to p + 0.03 at p 0.95, p + 0.13
+# at p 0.8).
+DEFAULT_DRAW_JUDGE = DrawJudge(floor_rate=0.98, grace=8, gap_tolerance=4.0, terminal_gap=3.0,
+                               edge_margin=DEFAULT_EDGE_MARGIN)
+
 # The one value of `submit`: submissions go to the job's own scoped route
 # (order jobs, on the order control); absent, to the legacy `/corpus/submit`.
 SUBMIT_SCOPED = "scoped"
@@ -86,10 +129,16 @@ SUITE_STOPS = ("agent_completed", "max_turns")
 SUITE_ACTION_BYTES = 16 * 1024
 SUITE_BYTES_PER_TOKEN = 5
 MAX_SUITE_TOKENS_PER_TURN = SUITE_ACTION_BYTES // SUITE_BYTES_PER_TOKEN
-EPISODE_ENV_PACKAGES = frozenset({"reliquary-swe", SUITE_PACKAGE})
+SWE_PACKAGE = "reliquary-swe"
+# Envs served through the sandbox's verifiers bridge that an eval job may run besides
+# reliquary-swe: signed only, eval only, read through `episode.bridge` (the gateway's
+# options and image lock), as an RL run reads its bridged envs.
+BRIDGED_EVAL_PACKAGES = frozenset({"reliquary-terminal"})
+EPISODE_ENV_PACKAGES = frozenset({SWE_PACKAGE, SUITE_PACKAGE}) | BRIDGED_EVAL_PACKAGES
 EPISODE_HARNESSES = frozenset({"bash", SUITE_HARNESS})
-# The package each harness runs: never mixed.
-_HARNESS_PACKAGE = {"bash": "reliquary-swe", SUITE_HARNESS: SUITE_PACKAGE}
+# The packages each harness runs: never mixed.
+_HARNESS_PACKAGES = {"bash": frozenset({SWE_PACKAGE}) | BRIDGED_EVAL_PACKAGES,
+                     SUITE_HARNESS: frozenset({SUITE_PACKAGE})}
 _EPISODE_FIELDS = ("env", "harness", "renderer", "verifiers", "max_turns",
                    "max_tokens_per_turn", "max_total_tokens", "replay_fraction_failed")
 _EPISODE_ENV_FIELDS = ("package", "version", "split", "num_images")
@@ -103,12 +152,20 @@ _RENDERER_RE = re.compile(r"\Arenderers:[a-z0-9.]+@\d+\.\d+\.\d+\Z")
 # How an episode's environment steps are trusted. "replay" (the default, never
 # written, so every manifest that predates it hashes byte-identically): the miner
 # runs the box and grade executors replay it. "signed_sandbox": every step runs on
-# our reliquary-sandbox machines and the validator verifies the signed transcript
-# (docs/superpowers/plans/2026-10-06-catalyst-signed-episodes.md).
+# our reliquary-sandbox machines and the validator verifies the signed transcript.
 EXECUTION_REPLAY = "replay"
 EXECUTION_SIGNED_SANDBOX = "signed_sandbox"
 EXECUTIONS = frozenset({EXECUTION_REPLAY, EXECUTION_SIGNED_SANDBOX})
-_EPISODE_OPTIONAL_FIELDS = ("execution", "sandbox")
+_EPISODE_OPTIONAL_FIELDS = ("execution", "sandbox", "harness_spec", "bridge")
+# `bridge` (a bridged eval env's only, so every other manifest hashes as before): the
+# options the gateway serves the env with and the digest of its image lock.
+_BRIDGE_FIELDS = ("options", "image_lock_sha256")
+# `harness_spec` (written only when set, so every manifest that predates it hashes
+# byte-identically): the reliquary-harness spec the bash harness renders with, pinned by
+# digest. Absent, the compatibility harness bash-vf-b2e4e81@1. The binaries check it
+# against what they serve (`agentic_swe.harness_pin_refusal`); this module loads nothing.
+_HARNESS_SPEC_FIELDS = ("id", "version", "digest")
+_HARNESS_NAME_RE = re.compile(r"\A[a-z0-9][a-z0-9.-]{0,63}\Z")
 _SANDBOX_FIELDS = ("env", "env_package", "tools", "sandbox_commit", "budgets")
 SANDBOX_BUDGET_FIELDS = ("max_calls", "per_call_timeout_s", "cpu_s", "wall_s",
                          "memory_bytes", "pids", "disk_bytes")
@@ -129,6 +186,74 @@ class JobError(ValueError):
     """The manifest does not describe a job this code can run."""
 
 
+def _check_split(split: Any, eval_job: bool) -> None:
+    """A training job runs its environment's `train` split; an eval job (its
+    prompt_source names a frozen eval set) runs the split its set references, any
+    one. Which split that is, and that the set's rows name it, is checked where
+    the job is resolved (`reliquary.eval.rows.row_map`): this layer is pure. A
+    release that predates eval jobs refuses every split but `train`, so an old
+    miner fails closed on an eval job's manifest."""
+    if not isinstance(split, str) or not split:
+        raise JobError(f"episode.env.split must be a split name, got {split!r}")
+    if not eval_job and split != "train":
+        raise JobError(f"episode.env.split must be 'train', got {split!r}")
+
+
+def _judge(raw) -> DrawJudge:
+    if "judge" not in raw:
+        return DEFAULT_DRAW_JUDGE
+    body = raw["judge"]
+    if not isinstance(body, Mapping) or set(body) - {"edge_margin"} != set(_JUDGE_FIELDS) - {"edge_margin"}:
+        raise JobError(f"judge must be an object with exactly {list(_JUDGE_FIELDS)} (edge_margin optional), "
+                       f"got {body!r}")
+    body = {"edge_margin": DEFAULT_EDGE_MARGIN, **body}
+    numbers = {}
+    for name in ("floor_rate", "gap_tolerance", "terminal_gap", "edge_margin"):
+        value = body[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise JobError(f"judge.{name} must be a finite number, got {value!r}")
+        numbers[name] = float(value)
+    grace = body["grace"]
+    if isinstance(grace, bool) or not isinstance(grace, int) or not 0 <= grace <= MAX_JUDGE_GRACE:
+        raise JobError(f"judge.grace must be an integer in [0, {MAX_JUDGE_GRACE}], got {grace!r}")
+    if not MIN_JUDGE_FLOOR_RATE <= numbers["floor_rate"] <= 1.0:
+        raise JobError(f"judge.floor_rate must be in [{MIN_JUDGE_FLOOR_RATE}, 1], got {numbers['floor_rate']}")
+    for name in ("gap_tolerance", "terminal_gap"):
+        if not 0.0 < numbers[name] <= MAX_JUDGE_GAP:
+            raise JobError(f"judge.{name} must be in (0, {MAX_JUDGE_GAP}], got {numbers[name]}")
+    if not 0.0 <= numbers["edge_margin"] <= MAX_JUDGE_EDGE_MARGIN:
+        raise JobError(f"judge.edge_margin must be in [0, {MAX_JUDGE_EDGE_MARGIN}], got {numbers['edge_margin']}")
+    return DrawJudge(numbers["floor_rate"], grace, numbers["gap_tolerance"], numbers["terminal_gap"],
+                     numbers["edge_margin"])
+
+
+def draw_judge_from(partial: Mapping[str, Any]) -> DrawJudge:
+    """A judge from some of its fields, the others at their defaults (``jobs create --draw-judge``, a suite set's
+    ``judge``); refused like a manifest's."""
+    if not isinstance(partial, Mapping):
+        raise JobError(f"a draw judge is an object, got {partial!r}")
+    unknown = sorted(set(partial) - set(_JUDGE_FIELDS))
+    if unknown:
+        raise JobError(f"a draw judge takes {list(_JUDGE_FIELDS)}, not {unknown}")
+    return _judge({"judge": {**DEFAULT_DRAW_JUDGE.to_contract(), **partial}})
+
+
+def judge_field(partial: Mapping[str, Any]) -> dict[str, Any] | None:
+    """A manifest's ``judge`` for these fields: the full block, or None when it is the defaults (never written,
+    so the manifest hashes as one that never named it)."""
+    judge = draw_judge_from(partial)
+    return None if judge == DEFAULT_DRAW_JUDGE else judge.to_contract()
+
+
+def _max_prompt_tokens(raw) -> int | None:
+    if "max_prompt_tokens" not in raw:
+        return None
+    value = _positive_int(raw, "max_prompt_tokens")
+    if value > MAX_JOB_PROMPT_TOKENS:
+        raise JobError(f"max_prompt_tokens must be at most {MAX_JOB_PROMPT_TOKENS}, got {value}")
+    return value
+
+
 def _submit(raw) -> str | None:
     if "submit" not in raw:
         return None
@@ -147,6 +272,10 @@ class Sampling:
     min_new_tokens: int
     max_new_tokens: int
     n: int
+    # Eval jobs only: the forced draw every sample follows (``corpus.eval_draw``); None = free sampling.
+    draw: str | None = None
+    # Draw jobs only (free-sampling miners do not apply it): tokens under min_p times the most likely are cut.
+    min_p: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,10 +355,18 @@ class EpisodeSpec:
     replay_fraction_failed: float | None
     execution: str = EXECUTION_REPLAY
     sandbox: SandboxSpec | None = None
+    # {"id", "version", "digest"} of the reliquary-harness spec; None: the compatibility one.
+    harness_spec: Mapping[str, str] | None = None
+    # A bridged eval env's {"options", "image_lock_sha256"}; None for reliquary-swe and suites.
+    bridge: Mapping[str, Any] | None = None
 
     @property
     def is_suite(self) -> bool:
         return self.harness == SUITE_HARNESS
+
+    @property
+    def is_bridged(self) -> bool:
+        return self.bridge is not None
 
     def to_contract(self) -> dict[str, Any]:
         if self.is_suite:
@@ -245,6 +382,11 @@ class EpisodeSpec:
         if self.execution != EXECUTION_REPLAY:
             contract["execution"] = self.execution
             contract["sandbox"] = self.sandbox.to_contract()
+        if self.harness_spec is not None:
+            contract["harness_spec"] = dict(self.harness_spec)
+        if self.bridge is not None:
+            contract["bridge"] = {"options": dict(self.bridge["options"]),
+                                  "image_lock_sha256": self.bridge["image_lock_sha256"]}
         return contract
 
 
@@ -273,6 +415,11 @@ class JobSpec:
     submit: str | None = None
     # Multi-turn agentic jobs only (spec §6); absent on every other job.
     episode: EpisodeSpec | None = None
+    # A forced-draw job's judge thresholds; written only when they differ from the defaults.
+    judge: DrawJudge = DEFAULT_DRAW_JUDGE
+    # Its longest prompt, in tokens, when longer than a miner's default allowance (long context); None: the
+    # default (``corpus_miner.PROMPT_ALLOWANCE_TOKENS``).
+    max_prompt_tokens: int | None = None
 
     @property
     def prompt_end(self) -> int:
@@ -310,6 +457,9 @@ class JobSpec:
                 "min_new_tokens": self.sampling.min_new_tokens,
                 "max_new_tokens": self.sampling.max_new_tokens,
                 "n": self.sampling.n,
+                # Written only when set: every free-sampling manifest hashes as before.
+                **({"draw": self.sampling.draw} if self.sampling.draw is not None else {}),
+                **({"min_p": self.sampling.min_p} if self.sampling.min_p else {}),
             },
             "slots_per_prompt": self.slots_per_prompt,
             "filter": (
@@ -325,6 +475,8 @@ class JobSpec:
             **({"prompt_start": self.prompt_start} if self.prompt_start else {}),
             **({"seed": self.seed} if self.seed is not None else {}),
             **({"submit": self.submit} if self.submit is not None else {}),
+            **({"judge": self.judge.to_contract()} if self.judge != DEFAULT_DRAW_JUDGE else {}),
+            **({"max_prompt_tokens": self.max_prompt_tokens} if self.max_prompt_tokens is not None else {}),
             **({"episode": self.episode.to_contract()} if self.episode is not None else {}),
         }
 
@@ -359,7 +511,7 @@ def _number(value: Any, field: str) -> float:
 def _parse_sampling(raw: Any) -> Sampling:
     if not isinstance(raw, Mapping):
         raise JobError("sampling must be an object")
-    unknown = set(raw) - set(_SAMPLING_FIELDS)
+    unknown = set(raw) - set(_SAMPLING_FIELDS) - {"draw", "min_p"}
     if unknown:
         raise JobError(f"sampling has unknown fields: {sorted(unknown)}")
     missing = [f for f in _SAMPLING_FIELDS if f not in raw]
@@ -399,6 +551,17 @@ def _parse_sampling(raw: Any) -> Sampling:
             f"{MAX_COMPLETIONS_PER_SUBMISSION} completions per submission, so "
             "every submission this job asks for would be refused unparsed"
         )
+    from reliquary.corpus.eval_draw import parse_draw
+
+    try:
+        draw = parse_draw(raw)
+    except ValueError as exc:
+        raise JobError(str(exc)) from None
+    min_p = _number(raw["min_p"], "sampling.min_p") if "min_p" in raw else 0.0
+    if not 0.0 <= min_p < 1.0:
+        raise JobError(f"sampling.min_p must be in [0, 1), got {min_p}")
+    if min_p and draw is None:
+        raise JobError("sampling.min_p is for draw jobs: a free-sampling miner does not apply it")
     return Sampling(
         temperature=temperature,
         top_p=top_p,
@@ -406,6 +569,8 @@ def _parse_sampling(raw: Any) -> Sampling:
         min_new_tokens=min_new_tokens,
         max_new_tokens=max_new_tokens,
         n=n,
+        draw=draw,
+        min_p=min_p,
     )
 
 
@@ -471,7 +636,7 @@ def _parse_sandbox(raw: Any, package: str) -> SandboxSpec:
                        sandbox_commit=commit, budgets=budgets)
 
 
-def _parse_suite_episode(raw: Mapping[str, Any]) -> EpisodeSpec:
+def _parse_suite_episode(raw: Mapping[str, Any], eval_job: bool) -> EpisodeSpec:
     """A suite episode: which registry environment, at which manifest, and the
     renderer it declares. That the registry has it, at that manifest and with
     that renderer, is checked where the job is resolved
@@ -484,8 +649,7 @@ def _parse_suite_episode(raw: Mapping[str, Any]) -> EpisodeSpec:
         raise JobError(f"episode.env.name must be a registry environment name, got {env['name']!r}")
     if not isinstance(env["version"], str) or not _SHA256_RE.match(env["version"]):
         raise JobError("episode.env.version must be the environment's 64-hex manifest sha256")
-    if env["split"] != "train":
-        raise JobError(f"episode.env.split must be 'train', got {env['split']!r}")
+    _check_split(env["split"], eval_job)
     renderer = raw["renderer"]
     if not isinstance(renderer, str) or not renderer or renderer.strip() != renderer:
         raise JobError(f"episode.renderer must be the environment's renderer id, got {renderer!r}")
@@ -502,22 +666,21 @@ def _parse_suite_episode(raw: Mapping[str, Any]) -> EpisodeSpec:
     )
 
 
-def _parse_episode(raw: Any) -> EpisodeSpec:
+def _parse_episode(raw: Any, eval_job: bool = False) -> EpisodeSpec:
     if isinstance(raw, Mapping) and raw.get("harness") == SUITE_HARNESS:
-        return _parse_suite_episode(raw)
+        return _parse_suite_episode(raw, eval_job)
     raw = _fields(raw, _EPISODE_FIELDS, "episode", optional=_EPISODE_OPTIONAL_FIELDS)
     env = _fields(raw["env"], _EPISODE_ENV_FIELDS, "episode.env")
     if not isinstance(env["package"], str) or env["package"] not in EPISODE_ENV_PACKAGES:
         raise JobError(f"episode.env.package must be one of {sorted(EPISODE_ENV_PACKAGES)}")
     if not isinstance(env["version"], str) or not _COMMIT_RE.match(env["version"]):
         raise JobError("episode.env.version must be the environment repository's 40-hex commit")
-    if env["split"] != "train":
-        raise JobError(f"episode.env.split must be 'train', got {env['split']!r}")
+    _check_split(env["split"], eval_job)
     if raw["harness"] not in EPISODE_HARNESSES:
         raise JobError(f"episode.harness must be one of {sorted(EPISODE_HARNESSES)}")
-    if _HARNESS_PACKAGE[raw["harness"]] != env["package"]:
-        raise JobError(f"the {raw['harness']!r} harness runs {_HARNESS_PACKAGE[raw['harness']]!r}, "
-                       f"not {env['package']!r}")
+    if env["package"] not in _HARNESS_PACKAGES[raw["harness"]]:
+        raise JobError(f"the {raw['harness']!r} harness runs "
+                       f"{sorted(_HARNESS_PACKAGES[raw['harness']])}, not {env['package']!r}")
     if not isinstance(raw["renderer"], str) or not _RENDERER_RE.match(raw["renderer"]):
         raise JobError(f"episode.renderer must read renderers:<name>@<version>, got {raw['renderer']!r}")
     if not isinstance(raw["verifiers"], str) or not _COMMIT_RE.match(raw["verifiers"]):
@@ -538,6 +701,18 @@ def _parse_episode(raw: Any) -> EpisodeSpec:
         sandbox = _parse_sandbox(raw["sandbox"], env["package"])
     elif "sandbox" in raw:
         raise JobError("episode.sandbox is only for execution 'signed_sandbox'")
+    harness_spec = None
+    if "harness_spec" in raw:
+        harness_spec = _parse_harness_spec(raw["harness_spec"], "episode.harness_spec")
+    bridge = None
+    if env["package"] in BRIDGED_EVAL_PACKAGES:
+        if not eval_job or execution != EXECUTION_SIGNED_SANDBOX:
+            raise JobError(f"{env['package']!r} runs only in an eval job on the signed sandbox")
+        if "bridge" not in raw:
+            raise JobError(f"an episode on {env['package']!r} needs episode.bridge")
+        bridge = _parse_bridge(raw["bridge"])
+    elif "bridge" in raw:
+        raise JobError(f"episode.bridge is only for {sorted(BRIDGED_EVAL_PACKAGES)}")
     episode = EpisodeSpec(
         env=EpisodeEnv(package=env["package"], version=env["version"], split=env["split"],
                        num_images=_bounded_int(env, "num_images", 1, 1000, "episode.env")),
@@ -546,9 +721,44 @@ def _parse_episode(raw: Any) -> EpisodeSpec:
         max_tokens_per_turn=_bounded_int(raw, "max_tokens_per_turn", 1, max_total, "episode"),
         max_total_tokens=max_total,
         replay_fraction_failed=float(fraction),
-        execution=execution, sandbox=sandbox,
+        execution=execution, sandbox=sandbox, harness_spec=harness_spec, bridge=bridge,
     )
     return episode
+
+
+def _parse_bridge(raw: Any) -> dict[str, Any]:
+    raw = _fields(raw, _BRIDGE_FIELDS, "episode.bridge")
+    options = raw["options"]
+    if not isinstance(options, Mapping) or not options:
+        raise JobError("episode.bridge.options must be the gateway's options for the env")
+    try:
+        json.dumps(options, allow_nan=False)
+    except (TypeError, ValueError):
+        raise JobError("episode.bridge.options must be plain JSON") from None
+    lock = raw["image_lock_sha256"]
+    if not isinstance(lock, str) or not _SHA256_RE.match(lock):
+        raise JobError("episode.bridge.image_lock_sha256 must be a 64-hex sha256")
+    return {"options": dict(options), "image_lock_sha256": lock}
+
+
+def parse_harness_spec(raw: Any, where: str) -> dict[str, str]:
+    """`{id, version, digest}` of a reliquary-harness spec, by shape (ValueError otherwise):
+    whether this binary serves it is `agentic_swe.harness_pin_refusal`'s."""
+    if not isinstance(raw, Mapping) or set(raw) != set(_HARNESS_SPEC_FIELDS):
+        raise ValueError(f"{where} must be {{id, version, digest}}")
+    for name in ("id", "version"):
+        if not isinstance(raw[name], str) or not _HARNESS_NAME_RE.match(raw[name]):
+            raise ValueError(f"{where}.{name} must be a harness name (lowercase, digits, '.' and '-')")
+    if not isinstance(raw["digest"], str) or not _SHA256_RE.match(raw["digest"]):
+        raise ValueError(f"{where}.digest must be a 64-hex sha256")
+    return {name: raw[name] for name in _HARNESS_SPEC_FIELDS}
+
+
+def _parse_harness_spec(raw: Any, where: str) -> dict[str, str]:
+    try:
+        return parse_harness_spec(raw, where)
+    except ValueError as exc:
+        raise JobError(str(exc)) from None
 
 
 def _check_episode_job(job: JobSpec) -> None:
@@ -573,13 +783,24 @@ def _check_episode_job(job: JobSpec) -> None:
                            "replay_fraction_failed must be 0")
         if episode.sandbox.budgets.max_calls < episode.max_turns:
             raise JobError("episode.sandbox.budgets.max_calls must be at least episode.max_turns")
-        if episode.env.num_images != BRIDGED_SWESMITH_IMAGES:
+        if is_eval_source(job.prompt_source) and episode.env.split == "train":
+            # A release that predates evals checks a signed job's split, not its
+            # prompt_source: on `train` it would mine the identity rows, the wrong tasks.
+            raise JobError("an eval job on the signed sandbox names its set's split, never "
+                           "'train', so a release that predates evals refuses it")
+        if episode.env.split == "train" and episode.env.num_images != BRIDGED_SWESMITH_IMAGES:
             raise JobError(f"a signed_sandbox job serves SWE-smith at the "
                            f"{BRIDGED_SWESMITH_IMAGES} images the bridge serves: "
                            f"episode.env.num_images must be {BRIDGED_SWESMITH_IMAGES}")
-    if episode.is_suite and job.prompt_source != episode.env.name:
-        raise JobError("a suite episode job draws its prompts from its environment: "
-                       f"prompt_source must be {episode.env.name!r}")
+    elif not episode.is_suite and is_eval_source(job.prompt_source):
+        # A replayed SWE episode trusts the miner's box: an eval of it would be
+        # graded on what the miner says its tests did.
+        raise JobError("an eval job on SWE runs in the signed sandbox")
+    if (episode.is_suite and job.prompt_source != episode.env.name
+            and not is_eval_source(job.prompt_source)):
+        raise JobError("a suite episode job draws its prompts from its environment "
+                       f"or an eval set: prompt_source must be {episode.env.name!r} "
+                       "or an eval source")
 
 
 def parse_job(raw: Mapping[str, Any]) -> JobSpec:
@@ -615,12 +836,13 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
     ):
         raise JobError(f"deadline_round must be a non-negative round or null, got {deadline_round!r}")
 
+    prompt_source = _text(raw, "prompt_source")
     job = JobSpec(
         job_id=job_id,
         checkpoint_repo=_text(raw, "checkpoint_repo"),
         checkpoint_revision=_text(raw, "checkpoint_revision"),
         checkpoint_sha256=checkpoint_sha256,
-        prompt_source=_text(raw, "prompt_source"),
+        prompt_source=prompt_source,
         prompt_count=_positive_int(raw, "prompt_count"),
         renderer_id=_text(raw, "renderer_id"),
         eos_token_id=_non_negative_int(raw, "eos_token_id"),
@@ -634,11 +856,29 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
         ),
         seed=_non_negative_int(raw, "seed") if "seed" in raw else None,
         submit=_submit(raw),
-        episode=_parse_episode(raw["episode"]) if "episode" in raw else None,
+        max_prompt_tokens=_max_prompt_tokens(raw),
+        judge=_judge(raw),
+        episode=(_parse_episode(raw["episode"], is_eval_source(prompt_source))
+                 if "episode" in raw else None),
     )
     if job.episode is not None:
         _check_episode_job(job)
+    if job.sampling.draw is not None:
+        _check_draw_job(job)
+    elif "judge" in raw:
+        raise JobError("judge sets a forced draw's thresholds: a job without sampling.draw has none to judge")
     return job
+
+
+def _check_draw_job(job: JobSpec) -> None:
+    """A forced draw, on any job (eval or generation): keyed on its seed, its samples in free order, a failed slot
+    reopened with its own draw (``corpus.eval_draw``)."""
+    if job.seed is None:
+        raise JobError("sampling.draw keys the draw on the job's seed: a seed is required")
+    if job.prompt_order == PROMPT_ORDER_MINER_WALK:
+        raise JobError("sampling.draw takes the draw slot from the cursor: a miner_walk job walks it")
+    if job.episode is not None and getattr(job.episode, "harness", None) == "suite":
+        raise JobError("sampling.draw is not drawn by the suite episode miner yet: use free sampling")
 
 
 def is_signed_sandbox(job: JobSpec) -> bool:
@@ -650,10 +890,3 @@ BRIDGED_SWESMITH_IMAGES = 20
 (reliquary-swe's default)."""
 
 
-def sandbox_split(episode: EpisodeSpec) -> str:
-    """The split a session token names: reliquary-swe's `train` (SWE-smith at its default
-    20 images, the split the bridge serves)."""
-    if episode.env.num_images != BRIDGED_SWESMITH_IMAGES:
-        raise ValueError(f"a signed reliquary-swe job serves SWE-smith at "
-                         f"{BRIDGED_SWESMITH_IMAGES} images, not {episode.env.num_images}")
-    return "train"

@@ -522,3 +522,34 @@ async def list_all_window_keys(
             logger.exception("list_all_window_keys failed")
             return []
     return sorted(windows)
+
+
+def public_checkpoint_bucket() -> str:
+    """The checkpoint transport bucket (kept private, read via presigned URLs)."""
+    return os.getenv("R2_PUBLIC_BUCKET", "reliquary-public")
+
+
+def public_checkpoint_client():
+    """Sync boto3 client for the checkpoint bucket, from R2_PUBLIC_ENDPOINT,
+    R2_PUBLIC_ACCESS_KEY_ID and R2_PUBLIC_SECRET_ACCESS_KEY: a token scoped to
+    that bucket alone, separate from the private buckets' R2_* credentials."""
+    import boto3
+    from botocore.config import Config as _SyncConfig
+
+    endpoint = os.getenv("R2_PUBLIC_ENDPOINT", "")
+    if not endpoint:
+        raise RuntimeError("R2_PUBLIC_ENDPOINT is not set")
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        region_name=os.getenv("R2_REGION", "auto"),
+        aws_access_key_id=os.getenv("R2_PUBLIC_ACCESS_KEY_ID", ""),
+        aws_secret_access_key=os.getenv("R2_PUBLIC_SECRET_ACCESS_KEY", ""),
+        config=_SyncConfig(
+            signature_version="s3v4",
+            connect_timeout=15,
+            read_timeout=120,
+            retries={"max_attempts": 5, "mode": "standard"},
+            max_pool_connections=32,
+        ),
+    )

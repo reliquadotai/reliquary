@@ -75,6 +75,15 @@ def test_an_env_split_naming_an_undeclared_environment_refuses():
     assert "math" in message and "code" in message
 
 
+def test_an_async_task_may_split_onto_its_signed_episode_envs():
+    params = {**PARAMS, "rl_episode_envs": {"swe": {"episode": {}}}}
+    config = _resolve({"default": _entry(params=params, env_split={"math": 0.4, "code": 0.3, "swe": 0.3})})
+
+    assert config.env_caps["swe"] == pytest.approx(0.18)
+    with pytest.raises(TaskConfigError, match="fake"):
+        _resolve({"default": _entry(params=params, env_split={"math": 0.4, "code": 0.3, "fake": 0.3})})
+
+
 def test_an_env_split_missing_a_declared_environment_refuses():
     """An incomplete split is accepted at write time and jams the first
     window's own FillClosedBatchAssembler construction if not refused here,

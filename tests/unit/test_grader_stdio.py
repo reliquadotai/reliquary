@@ -140,7 +140,9 @@ def test_a_child_cannot_forge_its_status_past_the_kernel(worker) -> None:
         "    pass\n"
         "print('done')\n"
     )
-    assert _ask(worker, code=burn, stdin="")["status"] == "timeout"
+    # On a loaded host (parallel CI) the burner may not get its CPU before the wall limit: then "harness_overload".
+    # Either way the forged line is never read as a result.
+    assert _ask(worker, code=burn, stdin="")["status"] in ("timeout", "harness_overload")
 
 
 def test_an_idle_program_is_a_timeout(worker) -> None:

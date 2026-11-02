@@ -40,6 +40,13 @@ if git -C "${REPO_DIR}" rev-parse HEAD >/dev/null 2>&1; then
     docker/signer-requirements.in \
     docker/signer-requirements.lock \
     reliquary/__init__.py \
+    reliquary/services/__init__.py \
+    reliquary/services/publication.py \
+    reliquary/shared/__init__.py \
+    reliquary/shared/ckpt_index.py \
+    reliquary/shared/task_id.py \
+    reliquary/protocol/__init__.py \
+    reliquary/protocol/release_contract.py \
     reliquary/signer; then
     echo "refusing to build with uncommitted signer source changes" >&2
     exit 2

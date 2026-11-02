@@ -96,6 +96,8 @@ REFUSAL_STATUS: dict[str, int] = {
     # (the env may be loading), the others are the miner's to change
     "precommit_unknown": 409, "precommit_stale": 409, "seed_out_of_pool": 409, "session_too_long": 409,
     "environment_not_served": 503,
+    # An RL lease engagement (rl_engagements.RlLeaseEngagements): another hotkey's lease, or one no longer open
+    "lease_not_yours": 403, "lease_closed": 409,
     # the intake's claim on a session (issuer.claim); `session_claimed` is retried
     "session_submitted": 409, "session_not_submittable": 409, "session_expired": 409,
     "session_claimed": 503, "session_busy": 503,

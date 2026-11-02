@@ -3,6 +3,7 @@
 import json
 
 import pytest
+from reliquary_harness.spec import BASH_VF_B2E4E81
 
 from reliquary.corpus.replay_compare import Action
 from reliquary.corpus.trajectory_parse import TrajectoryRefused, parse_trajectory
@@ -20,6 +21,11 @@ class FakeRenderer:
     turn_markup_ids = frozenset({TR, TRE})
     canonical = True
     unclosed = False
+    spec = BASH_VF_B2E4E81
+
+    def tool_messages(self, observations):
+        return [{"role": "tool", "tool_call_id": f"call_{i}", "content": text}
+                for i, text in enumerate(observations)]
 
     def span_is_canonical(self, prompt_ids, completion_ids):
         return self.canonical

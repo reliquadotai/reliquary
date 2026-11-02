@@ -23,9 +23,11 @@ import os
 import re
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+
+from reliquary.corpus.encoding import token_ids_text
 
 EVAL_SOURCE_PREFIX = "eval-set:"
 # Job ids of evaluation jobs are `<admin task prefix>eval-`: the eval control
@@ -154,6 +156,39 @@ def single_turn_messages(messages) -> tuple[str | None, str] | None:
     return None
 
 
+REFERENCE_INTERACTIONS = frozenset({"episode", "swe", "signed_bridged"})
+"""Sets whose rows name a source row instead of carrying rendered messages: the job
+rebuilds the task from ``(split, source_index)`` and checks it is ``instance_id``."""
+
+
+def reference_of(row: Mapping) -> tuple[str, int, str] | None:
+    """``(split, source_index, instance_id)`` of a reference row, None when the row
+    is not a well-formed one: a reference interaction, a non-empty split and instance
+    id, a non-negative integer index (a bool is not one)."""
+    if not isinstance(row, Mapping) or row.get("interaction") not in REFERENCE_INTERACTIONS:
+        return None
+    split, index, instance_id = row.get("split"), row.get("source_index"), row.get("instance_id")
+    if (not isinstance(split, str) or not split or type(index) is not int or index < 0
+            or not isinstance(instance_id, str) or not instance_id):
+        return None
+    return split, index, instance_id
+
+
+def set_interaction(rows: Sequence[Mapping]) -> str:
+    """``"single_turn"`` (rows without an ``interaction``, or saying so), ``"episode"``
+    ``"swe"`` or ``"signed_bridged"`` (a bridged env on the signed sandbox): the one interaction of the set. A mix, an unknown interaction or no
+    row at all is refused: a set is rendered, replayed and graded one way."""
+    if not rows:
+        raise ValueError("a set holds no row")
+    kinds = {(row.get("interaction") or "single_turn") for row in rows}
+    unknown = kinds - REFERENCE_INTERACTIONS - {"single_turn"}
+    if unknown:
+        raise ValueError(f"unknown interaction {sorted(unknown)[0]!r}")
+    if len(kinds) > 1:
+        raise ValueError(f"a set cannot mix interactions ({', '.join(sorted(kinds))})")
+    return next(iter(kinds))
+
+
 def register_eval_prompts(source: EvalSource, body: bytes) -> tuple[dict, ...]:
     """Check ``body`` (the job's lines, or the whole set's) against the source
     and keep the rows."""
@@ -161,10 +196,23 @@ def register_eval_prompts(source: EvalSource, body: bytes) -> tuple[dict, ...]:
     if hashlib.sha256(head).hexdigest() != source.sha256:
         raise ValueError(f"the prompts of {source.set_id!r} do not hash to the job's sha256")
     rows = tuple(json.loads(line) for line in head.splitlines())
-    for row in rows:
-        if single_turn_messages(row.get("messages")) is None:
-            raise ValueError(f"problem {row.get('problem_id')!r} is not one user turn, "
-                             "optionally after one system turn")
+    if set_interaction(rows) == "single_turn":
+        for row in rows:
+            if "prompt_token_ids" in row:
+                # A prompt given as token ids, already rendered (a batch request's): exactly that, no messages.
+                if "messages" in row:
+                    raise ValueError(f"problem {row.get('problem_id')!r} carries both messages and token ids")
+                token_ids_text(row["prompt_token_ids"])
+            elif single_turn_messages(row.get("messages")) is None:
+                raise ValueError(f"problem {row.get('problem_id')!r} is not one user turn, "
+                                 "optionally after one system turn")
+    else:
+        for row in rows:
+            if reference_of(row) is None:
+                raise ValueError(f"problem {row.get('problem_id')!r} is not a well-formed "
+                                 "row reference (split, source_index, instance_id)")
+        if len({row["split"] for row in rows}) > 1:
+            raise ValueError("a set of row references holds rows of one split")
     with _lock:
         _loaded[(source.set_id, source.count, source.sha256)] = (rows, head)
     return rows
@@ -238,6 +286,10 @@ class EvalSetEnvironment:
 
     def get_problem(self, index: int) -> dict:
         row = self._rows[int(index)]
+        if "prompt_token_ids" in row:
+            # Rendered already: the chat template renderer hands it back as it is (``encoding``).
+            return {"prompt": token_ids_text(row["prompt_token_ids"]), "id": row["problem_id"],
+                    "problem_id": row["problem_id"]}
         system, prompt = single_turn_messages(row["messages"])
         problem = {"prompt": prompt, "id": row["problem_id"], "problem_id": row["problem_id"]}
         if system is not None:
@@ -282,6 +334,9 @@ __all__ = [
     "load_eval_rows",
     "parse_eval_source",
     "register_eval_prompts",
+    "REFERENCE_INTERACTIONS",
+    "reference_of",
+    "set_interaction",
     "single_turn_messages",
     "declared_environment",
 ]

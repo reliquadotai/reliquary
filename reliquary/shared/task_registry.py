@@ -67,6 +67,10 @@ MAX_PRICE_PARAMS = (MAX_PRICE_PARAM, "max_price_alpha_per_mtoken",
                     "max_price_miner_alpha_per_period", "max_price_set_at")
 # Omitted from ``set_cap``: the price ceiling is kept as it is.
 KEEP = object()
+# An async RL task's starting budget (``validator.rl_async_service``): what its
+# starting prices pay a period at the target mix; the cap stays the most a
+# period pays. Absent: the cap.
+RL_START_POOL_PARAM = "rl_start_pool"
 
 # Float addition of exact decimals is not exact; 1.0 must not fail by 1e-16.
 _SUM_TOLERANCE = 1e-9
@@ -161,6 +165,19 @@ def _validate_token_price(entry: TaskEntry) -> None:
                             f"million tokens at {emission} miner alpha per period")
 
 
+def _validate_rl_start_pool(entry: TaskEntry, cap: float) -> None:
+    if RL_START_POOL_PARAM not in entry.params:
+        return
+    if (entry.mechanism != MECHANISM_RL_DISCOVERED_PRICE
+            or entry.params.get("settlement") != SETTLEMENT_PERIOD_EMA):
+        raise RegistryError(f"task {entry.task_id!r}: {RL_START_POOL_PARAM} applies to an async RL "
+                            f"task settled by period ({SETTLEMENT_PERIOD_EMA})")
+    pool = _number(entry.params[RL_START_POOL_PARAM], RL_START_POOL_PARAM)
+    if not 0.0 < pool <= cap:
+        raise RegistryError(f"task {entry.task_id!r}: {RL_START_POOL_PARAM} {pool} must be "
+                            f"positive and at most the cap {cap}")
+
+
 def validate_entry(entry: TaskEntry) -> None:
     """Everything checkable about one entry without reading the image or R2."""
     try:
@@ -247,6 +264,7 @@ def validate_entry(entry: TaskEntry) -> None:
         if not 0.0 <= tail <= 1.0:
             raise RegistryError(f"{TAIL_CAP_PARAM} must be between 0.0 and 1.0, got {tail}")
     _validate_token_price(entry)
+    _validate_rl_start_pool(entry, cap)
     floor = _number(entry.params["floor"], "floor")
     if floor > cap:
         raise RegistryError(f"floor {floor} exceeds cap {cap}")
@@ -459,6 +477,12 @@ def set_cap(
         # periods still to be worked; at 0, none.
         params[TAIL_CAP_PARAM] = max(
             old_cap, _number(entry.params.get(TAIL_CAP_PARAM, 0.0), TAIL_CAP_PARAM))
+    if RL_START_POOL_PARAM in params and float(cap) < _number(params[RL_START_POOL_PARAM], RL_START_POOL_PARAM):
+        # A lowered cap bounds the starting budget too (at 0 nothing is paid: dropped).
+        if float(cap) > 0:
+            params[RL_START_POOL_PARAM] = float(cap)
+        else:
+            params.pop(RL_START_POOL_PARAM)
     if floor is not None:
         params["floor"] = float(floor)
     elif entry.mechanism == MECHANISM_CORPUS_GENERATION:

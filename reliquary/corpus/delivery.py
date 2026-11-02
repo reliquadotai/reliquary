@@ -148,7 +148,6 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
         except ImportError as exc:
             raise EpisodeSandboxUnavailable(submission_id) from exc
         from reliquary.corpus.signed_reasons import REASON_SANDBOX_TRANSCRIPT
-        from reliquary.environment.agentic_swe import harness_system_prompt
 
         try:
             found = signed_records(signed)
@@ -158,7 +157,9 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
                                          stop=trajectory["stop"], max_turns=job.episode.max_turns,
                                          calls=found.calls, offered=found.tools,
                                          final=found.final)
-        system_prompt = harness_system_prompt(found.tools)
+        # The job's harness, as the renderer shows it (the compatibility harness: verifiers' prompt).
+        system_prompt = renderer.spec.system_prompt_for(found.tools)
+        user_prompt = renderer.spec.user_prompt(user_prompt)
         # The graded state is the bridge's (header + artifact archive): the row carries
         # the git patch inside it, the shape of a replay job's final_diff. An unreadable
         # state is a ValueError (counted unparseable).
@@ -170,8 +171,11 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
         for k, call in enumerate(message.get("tool_calls") or ()):
             call["id"] = f"call_{t}_{k}"         # unique in the conversation, not per turn
         messages.append(message)
-        messages += [{"role": "tool", "tool_call_id": f"call_{t}_{k}", "content": text}
-                     for k, text in enumerate(turn.observations)]
+        for k, observation in enumerate(renderer.tool_messages(turn.observations)
+                                        if signed_job else _tool_messages(turn.observations)):
+            if "tool_call_id" in observation:
+                observation["tool_call_id"] = f"call_{t}_{k}"
+            messages.append(observation)
     # The proof the messages are the tokens (see EPISODE_ROW_FIELDS for why
     # whitespace is erased first).
     if renderer.whitespace_free(renderer.render_messages(messages)) \
@@ -188,6 +192,11 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
             "graded_success": bool(grade.get("graded_success")),
             "replay_certified": bool(grade.get("replay_certified")),
             "turns": json.dumps([[s, e] for s, e in spans]), "stop": trajectory["stop"]}
+
+
+def _tool_messages(observations) -> list[dict]:
+    """A replay job's observations, as verifiers' bash harness bridges them."""
+    return [{"role": "tool", "tool_call_id": f"call_{k}", "content": text} for k, text in enumerate(observations)]
 
 
 # Suite episode jobs (design 2026-10-13): one row per certified trajectory,
@@ -224,7 +233,10 @@ def suite_episode_row(*, job, submission_id: str, record: Mapping, grade: Mappin
     task = source.task(index)
     if [int(t) for t in source.renderer(encode).encode_initial(task)] != prompt:
         raise EpisodePromptMismatch(submission_id)
-    trace = replay_suite(source.environment, renderer_id=job.episode.renderer, task_index=index,
+    # The task through the source's row map (its environment is built at the
+    # job's split); the seed is the row's.
+    trace = replay_suite(source.environment, renderer_id=job.episode.renderer,
+                         task_index=source.rows.index(index),
                          seed=episode_seed(job.job_id, index), prompt_ids=prompt, tokens=tokens,
                          spans=spans, encode=encode, decode=decode,
                          max_turns=job.episode.max_turns)
@@ -288,7 +300,7 @@ async def delivery_rows(*, job, records, counts: dict, grade=None,
                         seen: set[bytes] | None = None,
                         concurrency: int = READ_CONCURRENCY,
                         window: int = READ_WINDOW) -> AsyncIterator[dict]:
-    """One row per finished completion of every passing submission, in
+    """One row per finished completion of every passing, not voided submission, in
     verdict-id order.
 
     No hotkey: the delivery is the work, not who did it. An unfinished
@@ -301,12 +313,15 @@ async def delivery_rows(*, job, records, counts: dict, grade=None,
     the rows go.
     """
     from reliquary.corpus.export import (
-        is_duplicate, new_unfinished_counts, thinking_render, unfinished_reason,
+        is_duplicate, new_unfinished_counts, submission_voided, thinking_render,
+        unfinished_reason, voided_submission_ids,
     )
 
     thinking = thinking_render(job)
     ids = list(await records.list_verdict_ids(job.job_id))
-    counts.update(verdicts=len(ids), passing_submissions=0, missing_records=0, completions=0,
+    voided = await voided_submission_ids(records, job.job_id)
+    counts.update(verdicts=len(ids), passing_submissions=0, voided=0,
+                  missing_records=0, completions=0,
                   unfinished=new_unfinished_counts(),
                   duplicate_completion=0 if seen is not None else None, rows=0,
                   rows_accepted=0 if grade is not None else None)
@@ -315,9 +330,16 @@ async def delivery_rows(*, job, records, counts: dict, grade=None,
         chunk = ids[start:start + window]
         verdicts = await _bounded((records.read_verdict(job.job_id, s) for s in chunk), gate)
         passing = [sid for sid, v in zip(chunk, verdicts) if v and v.get("passed")]
-        found = await _bounded((records.read_submission(job.job_id, s) for s in passing), gate)
+        kept = [sid for sid in passing if sid not in voided]
+        counts["voided"] += len(passing) - len(kept)
+        found = await _bounded((records.read_submission(job.job_id, s) for s in kept), gate)
+        invalidated = await _bounded((submission_voided(records, job.job_id, s, voided)
+                                      for s in kept), gate)
         rows = []
-        for sid, record in zip(passing, found):
+        for sid, record, is_voided in zip(kept, found, invalidated):
+            if is_voided:
+                counts["voided"] += 1
+                continue
             if record is None:
                 # A verdict can be visible before its record (R2 is not transactional).
                 logger.warning("corpus delivery: submission %s passed but has no record", sid[:12])

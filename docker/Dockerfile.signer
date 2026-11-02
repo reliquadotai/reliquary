@@ -23,6 +23,9 @@ RUN pip install --require-hashes --no-deps \
 WORKDIR /opt/reliquary
 COPY reliquary/__init__.py /opt/reliquary/reliquary/__init__.py
 COPY reliquary/signer /opt/reliquary/reliquary/signer
+COPY reliquary/services/__init__.py reliquary/services/publication.py /opt/reliquary/reliquary/services/
+COPY reliquary/shared/__init__.py reliquary/shared/ckpt_index.py reliquary/shared/task_id.py /opt/reliquary/reliquary/shared/
+COPY reliquary/protocol/__init__.py reliquary/protocol/release_contract.py /opt/reliquary/reliquary/protocol/
 RUN printf '%s\n' "${RELIQUARY_BUILD_REVISION}" > /opt/reliquary/.build-revision \
  && python -m py_compile /opt/reliquary/reliquary/signer/*.py
 

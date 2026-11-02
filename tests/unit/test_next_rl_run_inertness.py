@@ -297,7 +297,7 @@ def test_the_weight_only_validator_reads_a_legacy_task_with_the_legacy_projectio
 
     async def recent(current_window, n, *, task_id=None, fields=None, **kw):
         seen[task_id] = (fields, kw)
-        return []
+        return [{"window_start": 3, "window_status": "aborted", "rewards_by_hotkey": {}}]
 
     with real_entry("reliquary.protocol.service_contract", "ServiceContract.from_dict"):
         wov, _ = wire(monkeypatch, [], [], declared())
@@ -305,7 +305,7 @@ def test_the_weight_only_validator_reads_a_legacy_task_with_the_legacy_projectio
     import asyncio
     with real_entry("reliquary.protocol.service_contract", "ServiceContract.from_dict"):
         asyncio.run(wov.submit_once())            # parses the declared v2 contract, nothing else of the stack
-    assert seen["default"] == (("window_start", "window_status", "rewards_by_hotkey"), {})
+    assert seen["default"] == (("window_start", "window_status", "rewards_by_hotkey"), {"strict": True})
     assert seen[TASK][1] and "number_map_fields" in seen[TASK][1]
 
 

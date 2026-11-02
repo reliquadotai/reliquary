@@ -44,7 +44,7 @@ from reliquary_sandbox.attest import GRADING_GRACE_S, Expected, verify_transcrip
 from reliquary_sandbox.observation import TOOLS_VERSIONS
 
 from reliquary.corpus.checks import check_turn_spans
-from reliquary.corpus.job import sandbox_split
+from reliquary.corpus.eval_draw import has_draw
 from reliquary.corpus.signed_parse import parse_signed_trajectory
 from reliquary.corpus.signed_reasons import (
     REASON_SANDBOX_EXPIRED, REASON_SANDBOX_SESSION_REUSED, REASON_SANDBOX_STATE_MISMATCH,
@@ -144,9 +144,11 @@ class SignedEpisodeIntake(EpisodeIntake):
             return IntakeRefusal("prompt_mismatch", {"got": request.prompt_index})
         episode = self._job.episode
         spec = episode.sandbox
+        # The engagement names the row; the session token names the task it runs.
+        task = self.source.task_ref(request.prompt_index)
         expected = Expected(hotkey=request.miner_hotkey,
                             engagement=corpus_engagement(self._job.job_id, request.prompt_index),
-                            env=spec.env, split=sandbox_split(episode), index=request.prompt_index,
+                            env=spec.env, split=task.split, index=task.index,
                             checkpoint=self._job.checkpoint_sha256,
                             seen_session_ids=self._seen(), require_graded=True)
         result = verify_transcript(trajectory.transcript, directory, self._tokens, expected)
@@ -178,10 +180,17 @@ class SignedEpisodeIntake(EpisodeIntake):
         try:
             parse_signed_trajectory(self._renderer, prompt_ids=prompt_ids, tokens=tokens,
                                     spans=spans, stop=trajectory.stop, max_turns=episode.max_turns,
-                                    calls=result.calls, offered=opened.tools, final=final)
+                                    calls=result.calls, offered=opened.tools, final=final,
+                                    # A forced-draw eval episode is scored, never exported: a turn the cap
+                                    # cut is taken as the model left it (``corpus.eval_draw``).
+                                    canonical=not has_draw(self._job))
         except TrajectoryRefused as refused:
             return IntakeRefusal(refused.reason, refused.detail)
-        if not state_matches(final.state_sha256, trajectory.final_diff):
+        if getattr(episode, "is_bridged", False):
+            # A bridged eval env submits no state: the reward the gateway signs is its result.
+            if trajectory.final_diff:
+                return IntakeRefusal(REASON_SANDBOX_STATE_MISMATCH, {"final_diff": "submitted"})
+        elif not state_matches(final.state_sha256, trajectory.final_diff):
             return IntakeRefusal(REASON_SANDBOX_STATE_MISMATCH, {"state_sha256": final.state_sha256})
         refusal = self._shape_refusal(trajectory, spans, prompt_ids)
         if refusal is not None:
@@ -222,9 +231,13 @@ def build_signed_episode_intake(job, *, checkpoint_dir: str, tokenizer, vocab_si
                or agentic_swe.sandbox_support_refusal(job.episode))
     if refusal:
         raise ValueError(f"job {job.job_id!r}: {refusal}")
+    try:
+        source = agentic_swe.job_signed_source(job)    # an eval set checked against the bridge
+    except ValueError as exc:
+        raise ValueError(f"job {job.job_id!r}: {exc}") from exc
     return SignedEpisodeIntake(
-        job=job, source=agentic_swe.SignedSweSource(sandbox_split(job.episode)),
-        renderer=agentic_swe.load_turn_renderer(checkpoint_dir, tools=job.episode.sandbox.tools),
+        job=job, source=source,
+        renderer=agentic_swe.job_turn_renderer(job, checkpoint_dir),
         tokenizer=tokenizer, vocab_size=vocab_size, chunk_tokens=chunk_tokens,
         directory=directory, token_verifier=token_verifier,
         sessions=sessions, seen=seen, retry_after_s=retry_after_s)

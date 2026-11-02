@@ -337,6 +337,12 @@ def period_served(served):
     return kept, dropped
 
 
+def _slot_store():
+    from reliquary.infrastructure.corpus_job_store import BucketJobStore
+
+    return BucketJobStore()
+
+
 def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof, model,
                    tokenizer, gpu_lock=None, remote=None, scorer=None, vocab_size=None,
                    arrivals_covered=None, auditor_kwargs=None) -> None:
@@ -351,6 +357,7 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
     """
     if window_settled(w.entry):
         raise ValueError(f"corpus task {w.entry.task_id!r}: {WINDOW_SETTLED}")
+    from reliquary.corpus.eval_draw import has_draw
     from reliquary.validator.corpus_auditor import CorpusAuditor
     from reliquary.validator.corpus_miner_states import MinerStates
     from reliquary.validator.corpus_miner_status import (
@@ -406,6 +413,8 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
                               remote=remote, on_voided=w.miners.voided,
                               threads=judge_threads, scorer=scorer, vocab_size=vocab_size,
                               arrivals_covered=covered,
+                              draw_job=w.job if has_draw(w.job) else None,
+                              slot_store=_slot_store() if has_draw(w.job) else None,
                               **(auditor_kwargs or {}))
     w.settler.on_window = w.miners.window
     if getattr(w, "grader", None) is not None:
@@ -548,7 +557,8 @@ def wire_job_grader(w, *, records, judge_records, dispatcher, parse_executor=Non
         from reliquary.validator.suite_grading import LocalEpisodeGrader
 
         w.grader = LocalEpisodeGrader(job=w.job, records=judge_records,
-                                      replayer=w.episode_intake.replayer)
+                                      replayer=w.episode_intake.replayer,
+                                      source=w.episode_intake.source)
         return
     grade_refusal(w.job, dispatcher)
     from reliquary.validator.corpus_grading import CorpusGrader
@@ -673,6 +683,15 @@ def build_corpus_app(*, entry, job, store, records, tokenizer, renderer, verify_
     )
 
 
+def _lease_verifier(verify_skip_signature):
+    """The lease signature check beside a skip's: none when skips are not verified (a test's router)."""
+    if verify_skip_signature is None:
+        return None
+    from reliquary.protocol.signatures import verify_corpus_lease_signature
+
+    return verify_corpus_lease_signature
+
+
 def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
                           proof_chunk_tokens, prompt_job_for=None, vocab_size=None,
                           registration=None, contract=None,
@@ -684,6 +703,7 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
     for every job. ``app.state.corpus_routes`` is the live routing table and
     ``app.state.corpus_router_for`` builds a router for a job wired later.
     """
+    from reliquary.corpus.eval_draw import has_draw
     from reliquary.validator.corpus_service import (
         CorpusJobRoutes, build_corpus_jobs_router, build_corpus_router, prompt_job_for_spec,
     )
@@ -693,11 +713,15 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
             job_id=str(served.entry.job_id), store=store, tokenizer=tokenizer,
             renderer=served.renderer, verify_signature=verify_signature,
             verify_skip_signature=verify_skip_signature,
+            # A draw job's light leases: verified for real wherever a skip is (tests pass their own fakes to
+            # ``build_corpus_router``).
+            verify_lease_signature=_lease_verifier(verify_skip_signature),
             prompt_job_for=(getattr(served, "prompt_job_for", None) or prompt_job_for
                             or prompt_job_for_spec),
             records=records,
             on_accepted=getattr(served, "on_accepted", None) or served.auditor.enqueue,
-            proof_chunk_tokens=proof_chunk_tokens,
+            # A draw job's samples carry no proof: the draw is their check.
+            proof_chunk_tokens=None if has_draw(getattr(served, "job", None)) else proof_chunk_tokens,
             vocab_size=vocab_size, is_banned=getattr(served, "is_banned", None),
             registration=registration,
             seen_index=getattr(served, "seen_index", None),

@@ -236,7 +236,15 @@ class EnvironmentSpec:
                     )
                 _validate_external_reward_shape(self)
 
-    def create(self) -> Environment | EpisodeEnvironment:
+    def create(self, split: str = "train") -> Environment | EpisodeEnvironment:
+        """Build the environment, at `split` for an external episode backend.
+
+        Only an external episode environment owns named splits (its backend
+        builds a different task set per split). An external answer
+        environment's other splits are task sets served through
+        `sets.open_source`, and a factory environment's rows are one index
+        space, so both refuse anything but `train`.
+        """
         if self.required_data_env_var and not os.environ.get(
             self.required_data_env_var
         ):
@@ -253,10 +261,22 @@ class EnvironmentSpec:
                 load_external_episode_environment,
             )
 
-            environment = (load_external_episode_environment(self)
-                           if self.interaction_mode == "episode"
-                           else load_external_answer_environment(self))
+            if self.interaction_mode == "episode":
+                environment = load_external_episode_environment(
+                    self, split=split)
+            elif split != "train":
+                raise ValueError(
+                    f"{self.name} has no split {split}: its other splits "
+                    "are task sets, not environment builds"
+                )
+            else:
+                environment = load_external_answer_environment(self)
         else:
+            if split != "train":
+                raise ValueError(
+                    f"{self.name} has no split {split}: its rows are one "
+                    "index space"
+                )
             factory = _import_attribute(self.factory_path)
             if not callable(factory):
                 raise TypeError(f"environment factory {self.factory_path!r} is not callable")
@@ -763,8 +783,8 @@ _SPEC_VALUES = (
         attainable_rewards=(0.0, 1.0),
         contract_version="reliquary/boxed-answer/v1",
         environment_manifest_sha256=(
-            "317ca1d13802c653a7e57fb7214bb5e7"
-            "e780a97396b3f0e9d094e7ba3f42b478"
+            "cda025161a6c551abed72a96b7cbbefdac"
+            "5cf5eab217df37831d947b2e55a6df"
         ),
         external_distribution="reliquary-hard-math",
         external_artifact_resource="reliquary_hard_math/artifact.json",

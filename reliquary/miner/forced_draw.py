@@ -31,6 +31,43 @@ class DrawBinding:
                                       seed_index=self.seed_index)
 
 
+@dataclass(frozen=True)
+class LeaseDrawBinding:
+    """An async RL lease's rollout (design §4.10): the same model-token stream as a window seed, keyed by the
+    lease (``protocol.rl_draw``: nonce, prompt, ``k<k>``, rollout index); a turn's draw starts at the model tokens
+    the session has generated so far."""
+    nonce: str
+    prompt_idx: int
+    checkpoint: int
+    rollout_index: int
+
+    def __post_init__(self) -> None:
+        from reliquary.protocol.rl_draw import lease_draw_context
+
+        lease_draw_context(self.nonce, self.prompt_idx, self.checkpoint)     # refuses a malformed nonce or k
+
+    def extra_args(self, base_offset: int) -> dict:
+        from reliquary.protocol.rl_draw import lease_extra_args
+
+        return lease_extra_args(self.nonce, self.prompt_idx, self.checkpoint, self.rollout_index, base_offset)
+
+
+@dataclass(frozen=True)
+class EvalDrawBinding:
+    """A forced-draw eval job's sample (``corpus.eval_draw``): its prompt and draw slot fix the stream; a turn's
+    draw starts at the model tokens the session has generated so far."""
+    job: Any
+    prompt_idx: int
+    draw_slot: int
+
+    def extra_args(self, base_offset: int) -> dict:
+        from reliquary.corpus.eval_draw import draw_context
+        from reliquary.miner.vllm_generation import forced_seed_extra_args
+
+        return forced_seed_extra_args(**draw_context(self.job, self.prompt_idx, self.draw_slot),
+                                      base_offset=int(base_offset))
+
+
 class ForcedDraws:
     """Session id -> binding; thread-safe (the generate endpoint reads it from its request handlers)."""
 
@@ -62,4 +99,24 @@ def forced_sampling_params(base: dict, draw: dict) -> dict:
     return params
 
 
-__all__ = ["DrawBinding", "ForcedDraws", "forced_sampling_params"]
+__all__ = ["DrawBinding", "EvalDrawBinding", "ForcedDraws", "LeaseDrawBinding", "forced_sampling_params"]
+
+
+class TakenSlots:
+    """The forced-draw slots this miner saw taken (accepted, or refused as taken), forgotten after ``ttl_s``: the
+    validator's open map is the truth and a failed slot reopens with the same draw, so a local mark only bridges the
+    open map's lag; kept forever it would hide a reopened slot until a restart."""
+
+    def __init__(self, ttl_s: float = 300.0) -> None:
+        self._ttl = float(ttl_s)
+        self._at: dict[tuple[int, int], float] = {}
+
+    def add(self, prompt: int, slot: int, *, now: float) -> None:
+        self._at[(int(prompt), int(slot))] = float(now)
+
+    def view(self, *, now: float) -> dict[int, set[int]]:
+        self._at = {key: at for key, at in self._at.items() if now - at <= self._ttl}
+        out: dict[int, set[int]] = {}
+        for prompt, slot in self._at:
+            out.setdefault(prompt, set()).add(slot)
+        return out

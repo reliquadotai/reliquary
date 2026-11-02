@@ -135,15 +135,57 @@ class PlatformClient:
     def heartbeat(self) -> None:
         self._request("POST", self._task_path("heartbeat"), json_body={})
 
+    def model_credential(self, model: dict) -> str:
+        """An active private lease's credential; kept only in the loader's memory."""
+        try:
+            answer = self._request("GET", self._task_path("model-credential")).json()
+        except PlatformError as exc:
+            raise type(exc)("private model credential unavailable", exc.status) from None
+        except ValueError:
+            raise PlatformError("private model credential response is invalid") from None
+        if not isinstance(answer, dict) or answer.get("model") != model \
+                or not isinstance(answer.get("token"), str) or not answer["token"].strip():
+            raise PlatformError("private model credential binding mismatch")
+        return answer["token"]
+
+    def sandbox_session(self, set_id: str, problem_id: str, sample_index: int,
+                         *, timeout_seconds: float) -> dict:
+        """One bounded, fenced grant request; an ambiguous reply is not replayed here."""
+        import httpx
+
+        try:
+            response = self._http.request("POST", self._task_path("sandbox-session"),
+                json={"set_id": set_id, "problem_id": problem_id, "sample_index": sample_index},
+                headers=self._headers(), timeout=timeout_seconds)
+        except httpx.TransportError:
+            raise PlatformError("evaluation sandbox session request failed") from None
+        if response.status_code in LOST_STATUSES:
+            raise LeaseLost("evaluation sandbox session lease refused", response.status_code)
+        if response.status_code != 200:
+            raise PlatformError("evaluation sandbox session unavailable", response.status_code)
+        try:
+            envelope = response.json()
+        except ValueError:
+            raise PlatformError("evaluation sandbox grant is invalid") from None
+        grant = envelope.get("grant") if isinstance(envelope, dict) else None
+        binding = envelope.get("binding") if isinstance(envelope, dict) else None
+        if (not isinstance(grant, dict) or not isinstance(binding, dict)
+                or not isinstance(grant.get("token"), dict) or not grant["token"]
+                or not all(isinstance(grant.get(key), str) and grant[key]
+                           for key in ("session_id", "gateway_url"))):
+            raise PlatformError("evaluation sandbox grant is invalid")
+        return envelope
+
     def event(self, kind: str, detail: dict) -> None:
         self._request("POST", self._task_path("events"), json_body={"kind": kind,
                                                                     "detail": detail})
 
     def result(self, *, completion_keys: list[str], vllm_version: str, gpu: str,
-               model_sha: str, rows: int, seconds: float) -> None:
+               model_sha: str, rows: int, seconds: float, protocol_sha256: str | None = None) -> None:
         self._request("POST", self._task_path("result"), json_body={
             "completion_keys": completion_keys, "vllm_version": vllm_version, "gpu": gpu,
             "model_sha": model_sha, "rows": rows, "seconds": seconds,
+            **({"protocol_sha256": protocol_sha256} if protocol_sha256 is not None else {}),
         })
 
     # ---- uploads -----------------------------------------------------------

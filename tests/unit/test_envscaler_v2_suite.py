@@ -27,6 +27,7 @@ import pytest
 
 from reliquary.corpus.job import parse_job
 from reliquary.corpus.suite_episode import (
+    SuiteSource,
     TokenizerCodec,
     episode_seed,
     replay_stop,
@@ -254,7 +255,8 @@ def test_a_mined_envscaler_episode_is_accepted_graded_and_exported(setting, fake
 
         # 4. The local grader replays it again, in the same pool.
         grade = asyncio.run(LocalEpisodeGrader(
-            job=job, records=records, replayer=replayer).grade_one(submission_id))
+            job=job, records=records, replayer=replayer,
+            source=source).grade_one(submission_id))
         assert grade["status"] == "ok" and grade["graded_success"] is True, grade
         assert grade["replay_certified"] is True and grade["instance_id"] == SCENARIO_TASK
     finally:
@@ -336,7 +338,8 @@ def test_a_replay_past_its_deadline_kills_its_world(setting) -> None:
     job = parse_job(_declare(SCENARIO_INDEX, 1)[0])
     request, _ = _mine(environment, job, codec, SOLUTION)
     kwargs = suite_intake.replay_kwargs(
-        job, prompt_index=SCENARIO_INDEX,
+        job, SuiteSource(environment, job.episode, job.episode.renderer),
+        prompt_index=SCENARIO_INDEX,
         prompt_ids=ChatMLEpisodeRenderer(codec.encode).encode_initial(
             environment.get_task(SCENARIO_INDEX)),
         tokens=request.trajectory.tokens,

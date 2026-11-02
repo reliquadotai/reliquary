@@ -90,11 +90,17 @@ async def _sleep_retry(delay: float, *, jitter: bool) -> None:
 
 
 def discover_validator_url(metagraph: Any, port: int = VALIDATOR_HTTP_PORT) -> str:
-    """Return the HTTP URL of the first validator advertised on the metagraph.
+    """Return the HTTP URL of the first validator advertised on the metagraph (``discover_validator``)."""
+    return discover_validator(metagraph, port)[0]
+
+
+def discover_validator(metagraph: Any, port: int = VALIDATOR_HTTP_PORT) -> tuple[str, str | None]:
+    """The HTTP URL and the hotkey of the first validator advertised on the metagraph.
 
     Picks the first uid with validator_permit=True and an axon IP that isn't
     the unset placeholder. Multi-validator coordination is out of scope; this
-    deliberately picks ONE validator.
+    deliberately picks ONE validator. The hotkey is ``metagraph.hotkeys[uid]``
+    (None when the metagraph carries none).
     """
     permits = getattr(metagraph, "validator_permit", None)
     axons = getattr(metagraph, "axons", None)
@@ -102,6 +108,7 @@ def discover_validator_url(metagraph: Any, port: int = VALIDATOR_HTTP_PORT) -> s
         raise NoValidatorFoundError(
             "metagraph missing validator_permit or axons attributes"
         )
+    hotkeys = list(getattr(metagraph, "hotkeys", None) or ())
     for uid, (permit, axon) in enumerate(zip(permits, axons)):
         if not permit:
             continue
@@ -110,7 +117,8 @@ def discover_validator_url(metagraph: Any, port: int = VALIDATOR_HTTP_PORT) -> s
             continue
         # Use the validator's own port if it's set; fall back to the protocol default.
         axon_port = getattr(axon, "port", None) or port
-        return f"http://{ip}:{axon_port}"
+        hotkey = hotkeys[uid] if uid < len(hotkeys) else getattr(axon, "hotkey", None)
+        return f"http://{ip}:{axon_port}", hotkey
     raise NoValidatorFoundError("no validator with permit and routable axon")
 
 

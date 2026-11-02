@@ -571,13 +571,19 @@ class GraderServer:
             container_id=container_id,
             stderr_file=stderr_file,
         )
-        # Insert or replace at slot.
+        # Insert or replace at slot. stop() snapshots the pool under this lock after setting the stop event, so a
+        # respawn that raced past its own check is either in that snapshot or sees the event here.
         with self._workers_lock:
+            stopping = self._stop_event.is_set()
             while len(self._workers) <= slot:
                 self._workers.append(w)
             self._workers[slot] = w
         with self._lifecycle_lock:
             self._workers_spawned_total += 1
+        if stopping:
+            self._terminate_worker(w)
+            self._publish_health()
+            return w
         self._metrics.inc("grader_worker_spawns_total")
         self._idle.put(w)
         logger.info("grader: spawned worker slot=%d pid=%d", slot, proc.pid)

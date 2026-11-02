@@ -138,6 +138,14 @@ class BridgedEpisodeSource:
             raise TypeError(f"{self.config.environment}: task {index}'s prompt is not text")
         return prompt
 
+    def instance_id(self, index: int) -> str:
+        """The id the task carries (a SWE task's ``instance_id``, a Harbor task's ``name``)."""
+        data = self._env.task(self.config.rl_split, int(index)).data
+        found = getattr(data, "instance_id", None) or getattr(data, "name", None)
+        if not found:
+            raise ValueError(f"{self.config.environment}: task {index} has no id")
+        return str(found)
+
     async def resolve(self, index: int) -> ResolvedTask:
         return await self._resolver.resolve(int(index))
 

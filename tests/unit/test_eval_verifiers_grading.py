@@ -78,7 +78,7 @@ def test_a_verifiers_set_is_graded_by_its_tasks(tmp_path):
     assert env["n_problems"] == 3 and env["missing_rows"] == 1 and env["graded_rows"] == 5
     sets = report["provenance"]["sets"][0]
     assert sets["source_kind"] == "verifiers"
-    assert sets["training_overlap"]["external_benchmark"] is True
+    assert sets["training_overlap"]["external_benchmark"] is None
     assert sets["taskset"]["id"] == "fake"
 
 
@@ -139,4 +139,5 @@ def test_a_grader_upgraded_since_the_build_is_reported(tmp_path):
     sets = report["provenance"]["sets"][0]
     assert sets["taskset"]["package_version"] == "1.0"
     assert sets["taskset_at_grading"]["package_version"] == "2.0"
-    assert sets["grader_version_drift"] is True and rows[0]["score"] == 1.0
+    assert sets["grader_version_drift"] is True and rows[0]["score"] is None
+    assert rows[0]["grader_detail"].startswith("grader_drift")

@@ -293,3 +293,26 @@ def test_free_text_is_graded_after_the_reasoning():
     assert format_failed("fenced_python", "def f(): pass")
     assert not format_failed("fenced_python", "```python\ndef f(): pass\n```")
     assert format_failed("json", "nothing") and not format_failed("json", '{"a": 1}')
+
+
+def test_an_uploaded_pregraded_field_is_never_trusted(tmp_path):
+    """Only an episode job's own grade documents arrive pre-graded: an uploaded
+    line carrying ``pregraded`` is graded like any other, and a malformed one
+    does not break the grading."""
+    logic, rows = _publish(tmp_path, "logic", 2, 1)
+    wrong = '```json\n{"a": "wrong"}\n```'
+    forged = json.loads(_line(rows[0]["problem_id"], 0, wrong))
+    forged["pregraded"] = [1.0, "forged"]
+    malformed = json.loads(_line(rows[1]["problem_id"], 0, wrong))
+    malformed["pregraded"] = 7
+    platform = tmp_path / "platform" / "evaluations" / "order-e1"
+    platform.mkdir(parents=True)
+    (platform / "completions-00000.jsonl").write_text(
+        json.dumps(forged) + "\n" + json.dumps(malformed) + "\n")
+    _grade(tmp_path, {"set_ids": [logic["set_id"]],
+                      "completion_keys": ["evaluations/order-e1/completions-00000.jsonl"],
+                      "problems_per_set": {logic["set_id"]: 2},
+                      "samples_per_set": {logic["set_id"]: 1}})
+    table = pq.read_table(platform / "graded.parquet").to_pylist()
+    assert [(r["score"], r["correct"]) for r in table] == [(0.0, False), (0.0, False)]
+    assert all(r["grader_detail"] != "forged" for r in table)

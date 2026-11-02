@@ -35,10 +35,11 @@ RL_THROTTLES = VALIDATOR_THROTTLES | {"open_busy", "environment_not_served", "sa
 """The RL routes' named 503s: the validator is serving (an unserved env may be loading, the sandbox fleet may be
 saturated); the seed is reopened, and they never count as "not serving"."""
 RL_FINAL_REFUSALS = frozenset({"precommit_unknown", "precommit_stale", "seed_out_of_pool", "engagement_taken",
-                               "session_too_long", "task_unplaceable"})
+                               "session_too_long", "task_unplaceable", "lease_closed", "lease_not_yours"})
 """The RL engagement book's own 4xx, and an open no machine could ever take: the seed is the miner's to change,
 never reopened."""
-RL_TASK_FINAL_REFUSALS = frozenset({"task_unplaceable", "precommit_unknown", "precommit_stale", "session_too_long"})
+RL_TASK_FINAL_REFUSALS = frozenset({"task_unplaceable", "precommit_unknown", "precommit_stale", "session_too_long",
+                                    "lease_closed", "lease_not_yours"})
 """Final for every seed of the precommit (they all play its one task, under one precommit): after one, the runner
 sends no other open of that precommit, so it costs one refused open, not one per seed (refused opens count toward
 the hotkey's refused-open rate)."""
@@ -151,25 +152,54 @@ def rl_transcript_refusal(transcript: Any, *, policy, precommit, seed_index: int
     signatures and the paid-session snapshot): the transcript size, ``verify_transcript`` with the RL
     binding and a graded final, the grading deadline, record 0's tools version, tools and env package.
     ``(reason, detail)`` (the admission's stage names) or None."""
-    from reliquary_sandbox.attest import Expected, Reason, verify_transcript
+    from reliquary_sandbox.attest import Expected
+
+    from reliquary.protocol.service_episode import rl_engagement
+
+    return _transcript_refusal(transcript, policy=policy, now=now, expected=lambda: Expected(
+        hotkey=precommit.hotkey, engagement=rl_engagement(precommit.window, precommit.sha256, int(seed_index)),
+        env=policy.sandbox_env, split=policy.split, index=precommit.task_index, checkpoint=precommit.checkpoint,
+        require_graded=True))
+
+
+def lease_transcript_refusal(transcript: Any, *, policy, lease, rollout_index: int, hotkey: str,
+                             now: float) -> tuple[str, dict] | None:
+    """``rl_transcript_refusal`` for rollout ``rollout_index`` of an async RL lease (engagement
+    ``rl-lease:{lease_id}:{index}``, checkpoint ``k<k>``, the leased prompt): the checks ``rl_episode`` runs."""
+    from reliquary_sandbox.attest import Expected
+
+    from reliquary.protocol.rl_draw import lease_checkpoint_tag
+    from reliquary.protocol.service_episode import rl_lease_engagement
+
+    return _transcript_refusal(transcript, policy=policy, now=now, finals=LEASE_FINAL_STATUSES, expected=lambda: Expected(
+        hotkey=hotkey, engagement=rl_lease_engagement(lease.lease_id, int(rollout_index)), env=policy.sandbox_env,
+        split=policy.split, index=int(lease.prompt_idx), checkpoint=lease_checkpoint_tag(int(lease.checkpoint)),
+        require_graded=False))
+
+
+LEASE_FINAL_STATUSES = frozenset({"graded", "budget_exhausted"})
+"""The finals a lease's episode may end on: graded, or closed by the machine on its budget (a rollout scored 0;
+``rl_episode.LeaseEpisodeChecker``)."""
+
+
+def _transcript_refusal(transcript: Any, *, policy, now: float, expected,
+                        finals: frozenset[str] | None = None) -> tuple[str, dict] | None:
+    from reliquary_sandbox.attest import Reason, verify_transcript
     from reliquary_sandbox.observation import TOOLS_VERSIONS
 
     from reliquary.protocol.corpus_submission import MAX_TRANSCRIPT_BYTES
-    from reliquary.protocol.service_episode import rl_engagement
 
     if not isinstance(transcript, Mapping):
         return "malformed_submission", {"transcript": None}
     size = len(_compact(transcript))
     if size > MAX_TRANSCRIPT_BYTES:
         return "trajectory_too_large", {"transcript_bytes": size}
-    expected = Expected(hotkey=precommit.hotkey,
-                        engagement=rl_engagement(precommit.window, precommit.sha256, int(seed_index)),
-                        env=policy.sandbox_env, split=policy.split, index=precommit.task_index,
-                        checkpoint=precommit.checkpoint, require_graded=True)
-    result = verify_transcript(transcript, _NoKeys(), _claims_of, expected)
+    result = verify_transcript(transcript, _NoKeys(), _claims_of, expected())
     reasons = [reason.value for reason in result.reasons if reason is not Reason.UNKNOWN_KEY]
     if reasons:
         return "episode_transcript", {"reasons": reasons}
+    if finals is not None and (result.final is None or result.final.status not in finals):
+        return "episode_transcript", {"reasons": ["not_graded"]}
     deadline = result.claims.expires_at + GRADING_GRACE_S
     if now > deadline:
         return "episode_deadline", {"now": int(now), "deadline": deadline}
@@ -426,6 +456,48 @@ class RlSignedEpisodeRunner(SignedSweEpisodeRunner):
                                      seed_index=index, now=now)
 
 
+def signed_lease_open_request(*, hotkey: str, lease_id: str, rollout_index: int,
+                              sign_binding: Callable[[bytes], str], now: float, request_id: str,
+                              validator_hotkey: str, path: str) -> dict:
+    """A session open for rollout ``rollout_index`` of an async RL lease (engagement ``rl_lease``)."""
+    body = {"miner_hotkey": hotkey, "request_id": request_id, "at": int(now),
+            "engagement": {"kind": "rl_lease", "lease": {"lease_id": lease_id, "rollout_index": int(rollout_index)}},
+            "signature": ""}
+    body["signature"] = sign_binding(build_sandbox_open_binding(body, validator_hotkey=validator_hotkey, path=path))
+    return body
+
+
+class LeaseEpisodeRunner(RlSignedEpisodeRunner):
+    """``RlSignedEpisodeRunner`` for one async RL lease (design §4.10): ``run(rollout_index, on_session)`` opens
+    that rollout's session (engagement ``rl_lease``), plays the leased prompt and checks the transcript with the
+    lease binding. Opens, throttles and reopens are the window runner's; the lease's own refusals
+    (``lease_closed``, ``lease_not_yours``) end every rollout. Opens stop at the lease's expiry."""
+
+    # A lease takes all its episodes: the model's first malformed turn ends one (scored 0), never the lease.
+    format_stop = True
+
+    def __init__(self, *, policy, lease, hotkey: str, prompt: str, **kwargs) -> None:
+        import hashlib
+
+        label = SimpleNamespace(hotkey=hotkey, environment=lease.environment, task_index=int(lease.prompt_idx),
+                                sha256=hashlib.sha256(f"rl-lease:{lease.lease_id}".encode()).hexdigest(),
+                                checkpoint=f"k{int(lease.checkpoint)}", window=0)
+        kwargs.setdefault("open_until", float(lease.expires_at))
+        self.takes_budget_exhausted = True       # every episode of a lease is a rollout: an exhausted one scores 0
+        kwargs.setdefault("max_live", 16)
+        super().__init__(policy=policy, precommit=label, prompt=prompt, hotkey=hotkey, **kwargs)
+        self._lease = lease
+
+    def _open_body(self, index: int, request_id: str) -> dict:
+        return signed_lease_open_request(hotkey=self._hotkey, lease_id=self._lease.lease_id, rollout_index=index,
+                                         sign_binding=self._sign, now=self._clock(), request_id=request_id,
+                                         validator_hotkey=self._validator, path=sandbox_open_path(self._prefix))
+
+    def _transcript_refusal(self, transcript, index: int, now: float):
+        return lease_transcript_refusal(transcript, policy=self._policy, lease=self._lease, rollout_index=index,
+                                        hotkey=self._hotkey, now=now)
+
+
 __all__ = [
     "RL_FINAL_REFUSALS",
     "RL_OPENS_IN_FLIGHT",
@@ -436,9 +508,12 @@ __all__ = [
     "RL_TASK_FINAL_REFUSALS",
     "RL_THROTTLES",
     "HttpRlEpisodes",
+    "LeaseEpisodeRunner",
     "RlSignedEpisodeRunner",
     "check_engine_caps",
+    "lease_transcript_refusal",
     "rl_transcript_refusal",
+    "signed_lease_open_request",
     "signed_precommit_body",
     "signed_rl_open_request",
 ]

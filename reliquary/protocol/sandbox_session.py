@@ -44,10 +44,11 @@ class SessionRefused(RuntimeError):
 class SandboxEngagement(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["corpus", "rl_precommit"]
+    kind: Literal["corpus", "rl_precommit", "rl_lease"]
     job_id: str | None = Field(default=None, min_length=1, max_length=64)
     prompt_index: int | None = Field(default=None, ge=0, strict=True)
     precommit: dict[str, Any] | None = None
+    lease: dict[str, Any] | None = None      # an async RL lease's rollout: {lease_id, rollout_index} (rl_engagements)
 
 
 class SandboxSessionOpenRequest(BaseModel):

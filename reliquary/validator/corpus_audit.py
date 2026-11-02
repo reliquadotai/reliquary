@@ -118,9 +118,16 @@ def rows_of_items(items: Sequence[dict]) -> list[tuple]:
     """``score_sequences`` rows from ``{tokens, prompt_len, proofs[, spans]}``
     dicts: a trajectory's spans must reach the scorer or it is read as a
     single-turn row."""
-    return [(i["tokens"], i["prompt_len"], i["proofs"])
-            if i.get("spans") is None
-            else (i["tokens"], i["prompt_len"], i["proofs"], i["spans"]) for i in items]
+    rows = []
+    for i in items:
+        if i.get("draw") is not None:
+            # A draw job's row: no proof, its draw context last (``score_sequences``).
+            rows.append((i["tokens"], i["prompt_len"], None, i.get("spans"), i["draw"]))
+        elif i.get("spans") is None:
+            rows.append((i["tokens"], i["prompt_len"], i["proofs"]))
+        else:
+            rows.append((i["tokens"], i["prompt_len"], i["proofs"], i["spans"]))
+    return rows
 
 
 def trajectory_chunk_scores(
@@ -198,7 +205,7 @@ def outcome_from_scores(
 def score_sequences(
     model, sequences: Sequence[tuple], *,
     chunk_tokens: int, topk: int, batch_tokens: int,
-    min_chunk_tokens: int = MIN_CHUNK_TOKENS,
+    min_chunk_tokens: int = MIN_CHUNK_TOKENS, observe=None,
 ) -> tuple[list[tuple[str, tuple[ChunkResult, ...]]], float, float]:
     """``completion_chunk_scores`` for many ``(tokens, prompt_len, proofs)``,
     packed shortest first into forward passes under ``batch_tokens`` padded
@@ -210,11 +217,36 @@ def score_sequences(
     an 80 GB card (spec 7 M3).
 
     One function for the control and the executor, so both compute alike.
+
+    ``observe(k, rows)``, when given, sees the rows the proofs were checked against before they are freed: a
+    single-turn row's completion states, a trajectory's list of span states (the forced-draw check reads them).
+
+    A draw job's row (``corpus.draw_audit``) is ``(tokens, prompt_len, None, spans or None, draw)``: no proof to
+    check (its score is ``(SCORE_OK, ())``), and ``draw`` (a ``DrawSpec`` or its wire dict) makes its score
+    ``(status, chunks, diagnostics)``, the draw's diagnostics as wire numbers.
     """
     import time
 
+    from reliquary.corpus.draw_audit import DrawSpec, row_diagnostics
+
     def spans_of(k):
         return sequences[k][3] if len(sequences[k]) > 3 else None
+
+    def draw_of(k):
+        if len(sequences[k]) <= 4 or sequences[k][4] is None:
+            return None
+        spec = sequences[k][4]
+        return spec if isinstance(spec, DrawSpec) else DrawSpec.from_wire(spec)
+
+    draws = [draw_of(k) for k in range(len(sequences))]
+
+    def check(k, rows, chunk_score):
+        proofs = sequences[k][2]
+        score = (SCORE_OK, ()) if proofs is None else chunk_score(proofs)
+        if draws[k] is not None:
+            tokens, prompt_len = sequences[k][0], sequences[k][1]
+            score = (*score, row_diagnostics(model.lm_head, rows, tokens, prompt_len, spans_of(k), draws[k]))
+        return score
 
     order = sorted((k for k in range(len(sequences)) if spans_of(k) is None),
                    key=lambda k: (len(sequences[k][0]), k))
@@ -245,8 +277,10 @@ def score_sequences(
         forward_seconds += time.perf_counter() - mark
         mark = time.perf_counter()
         for k, hidden in zip(sub_batch, hidden_states):
-            scores[k] = completion_chunk_scores(
-                hidden, sequences[k][2], chunk_tokens=chunk_tokens, topk=topk)
+            scores[k] = check(k, hidden, lambda proofs: completion_chunk_scores(
+                hidden, proofs, chunk_tokens=chunk_tokens, topk=topk))
+            if observe is not None:
+                observe(k, hidden)
         verify_seconds += time.perf_counter() - mark
         # Drop this sub-batch's padded activations before the next one is
         # computed: two final-hidden-state tensors must never be live at once.
@@ -262,8 +296,10 @@ def score_sequences(
             torch.cuda.synchronize(rows[0].device)
         forward_seconds += time.perf_counter() - mark
         mark = time.perf_counter()
-        scores[k] = trajectory_chunk_scores(rows, proofs, chunk_tokens=chunk_tokens, topk=topk,
-                                            min_chunk_tokens=min_chunk_tokens)
+        scores[k] = check(k, rows, lambda proofs: trajectory_chunk_scores(
+            rows, proofs, chunk_tokens=chunk_tokens, topk=topk, min_chunk_tokens=min_chunk_tokens))
+        if observe is not None:
+            observe(k, rows)
         verify_seconds += time.perf_counter() - mark
         del rows
     return scores, forward_seconds, verify_seconds

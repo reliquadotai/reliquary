@@ -119,7 +119,9 @@ def _eval_prompt_counts(job: Any, slots: Any) -> dict[str, Any]:
     prompt one or the other). Absent for every other job."""
     from reliquary.eval.prompt_source import is_eval_source
 
-    if not is_eval_source(getattr(job, "prompt_source", "")):
+    from reliquary.corpus.eval_draw import has_draw
+
+    if not (is_eval_source(getattr(job, "prompt_source", "")) or has_draw(job)):
         return {}
     counts = slots.prompt_counts()
     return {"prompts_complete": counts["complete"], "prompts_exhausted": counts["exhausted"],

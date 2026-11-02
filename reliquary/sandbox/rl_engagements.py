@@ -42,9 +42,13 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from reliquary.sandbox.sessions import (
+    ABORTED,
+    CLOSED,
+    VOIDED,
     EngagementTerms,
     Refusal,
     SessionBook,
+    SessionRecord,
     token_validity_s,
 )
 from reliquary.sandbox.tasks import ResolvedTask
@@ -249,6 +253,94 @@ class RlEpisodeEngagements:
             reserve={"cpu_millis": getattr(task, "cpu_millis", None), "memory_bytes": int(budgets["memory_bytes"])})
 
 
+class RlLeaseEngagements:
+    """The async RL path's engagement (design §4.10): a session of an episode lease names
+    ``{"kind": "rl_lease", "lease": {"lease_id", "rollout_index"}}`` and its token the engagement
+    ``rl-lease:{lease_id}:{index}`` (``rl_lease_engagement``). Its terms:
+
+    * the lease is this hotkey's, open and unexpired, and the hotkey not banned (``LeaseBook.check_submission``,
+      read again under the issuer lock: ``still_valid``); ``0 <= rollout_index < rollouts``;
+    * at most one session per (lease, index) (``exclusive``: only a machine-signed ``aborted`` final frees it,
+      once), so a miner cannot re-roll an episode; the lease closes at its first submission, so a transcript
+      serves no other lease;
+    * the token's checkpoint is the lease's ``k<k>``, its index the leased prompt; image and declared limits come
+      from the env's task source, budgets from its policy raised to the task's limits (``session_budgets``).
+
+    ``environments(env)``: the served episode env's view (``EpisodeEnvironmentView``: policy, resolve_task), None
+    when the env is not an episode env this validator serves. The quota is the lease quota itself: a hotkey holds
+    no more leases than it is granted, and at most ``rollouts`` sessions per lease."""
+
+    kind = "rl_lease"
+
+    def __init__(self, *, book, environments: Callable[[str], EpisodeEnvironmentView | None],
+                 sessions: SessionBook, rollouts: int = 16, clock: Callable[[], float] = time.time) -> None:
+        self._leases, self._environments, self._book = book, environments, sessions
+        self._rollouts, self._clock = int(rollouts), clock
+
+    def _lease(self, lease_id: str, hotkey: str):
+        try:
+            return self._leases.check_submission(lease_id, hotkey, float(self._clock())), None
+        except PermissionError as exc:
+            return None, Refusal("lease_not_yours", {"why": str(exc)})
+        except LookupError as exc:
+            return None, Refusal("lease_closed", {"why": str(exc)})
+
+    async def terms(self, hotkey: str, engagement: Mapping[str, Any]) -> EngagementTerms | Refusal:
+        from reliquary.protocol.rl_draw import lease_checkpoint_tag
+        from reliquary.protocol.service_episode import EpisodeWireError, rl_lease_engagement
+
+        timeout, retry = self._book.policy.io_timeout_s, self._book.policy.retry_after_s
+        value = engagement.get("lease")
+        if (set(engagement) != {"kind", "lease"} or not isinstance(value, Mapping)
+                or set(value) != {"lease_id", "rollout_index"}):
+            return Refusal("engagement_kind_unsupported",
+                           {"why": "an RL lease engagement names its lease and its rollout index, nothing else"})
+        lease_id, index = value["lease_id"], value["rollout_index"]
+        try:
+            name = rl_lease_engagement(lease_id, index)
+        except EpisodeWireError:
+            return Refusal("engagement_kind_unsupported", {"why": "malformed lease id or rollout index"})
+        if index >= self._rollouts:
+            return Refusal("seed_out_of_pool", {"rollout_index": index, "rollouts": self._rollouts})
+        try:
+            lease, refusal = await asyncio.wait_for(asyncio.to_thread(self._lease, lease_id, hotkey), timeout)
+        except Exception as exc:
+            logger.warning("rl lease session open: lease %s unreadable (%s)", str(lease_id)[:12], type(exc).__name__)
+            return Refusal("ledger_unavailable", {}, retry_after=retry)
+        if refusal is not None:
+            return refusal
+        view = self._environments(lease.environment)
+        if view is None:
+            return Refusal("environment_not_served", {"environment": lease.environment})
+        if self._book.engagement_held(name):
+            return Refusal("engagement_taken", {"engagement": name})
+        refused = self._book.open_refusal(hotkey, int(self._clock()))
+        if refused is not None:
+            return refused
+        try:
+            task = await asyncio.wait_for(view.resolve_task(lease.prompt_idx), timeout)
+        except Exception as exc:
+            logger.warning("rl lease session open: task %d of %s unresolved (%s)", lease.prompt_idx,
+                           lease.environment, type(exc).__name__)
+            return Refusal("task_unavailable", {"task_index": lease.prompt_idx}, retry_after=retry)
+        policy = view.policy
+        budgets = session_budgets(policy, task)
+        prepare = getattr(task, "prepare_timeout_s", None)
+        if token_validity_s(self._book.policy.open_window_s, int(budgets["wall_s"]), prepare) > MAX_SESSION_SPAN_S:
+            return Refusal("session_too_long", {"wall_s": int(budgets["wall_s"]), "max_span_s": MAX_SESSION_SPAN_S})
+
+        def still_valid() -> Refusal | None:
+            return self._lease(lease_id, hotkey)[1]               # under the issuer lock: the lease still open
+
+        return EngagementTerms(
+            engagement=name, env=policy.sandbox_env, split=policy.split, index=int(lease.prompt_idx),
+            checkpoint=lease_checkpoint_tag(int(lease.checkpoint)), image=task.image,
+            env_package=policy.env_package, budgets=budgets, exclusive=True, still_valid=still_valid,
+            prepare_timeout_s=prepare, env_options_sha256=getattr(task, "env_options_sha256", None),
+            env_lock_sha256=getattr(task, "env_lock_sha256", None),
+            reserve={"cpu_millis": getattr(task, "cpu_millis", None), "memory_bytes": int(budgets["memory_bytes"])})
+
+
 def session_budgets(policy, task) -> dict[str, int]:
     """The session's budgets: the policy's, raised to the task's declared limits (what ``terms`` grants; the
     precommit route's servable check uses the same)."""
@@ -259,5 +351,56 @@ def session_budgets(policy, task) -> dict[str, int]:
     return budgets
 
 
-__all__ = ["WINDOW_AGE_MARGIN_S", "EpisodeEnvironmentView", "NoOutcomes", "OpenQuota", "RlEpisodeEngagements", "SessionOutcomes",
-           "SessionQuota", "session_budgets"]
+# A lease rollout's last session, ended by our side: its cause (``lease_sandbox_failure``).
+SANDBOX_FAILURE_CAUSES = ("box_failed", "aborted", "machine_drained", "open_refused", "validator_restarted")
+
+
+def _session_failure(record: SessionRecord) -> str | None:
+    """Why our sandbox side ended this session, from what the issuer verified or did itself, else None: a signed
+    ``box_failed`` or ``aborted`` final, a drained machine, a signed open refusal, an open answer our restart lost."""
+    fault = str(record.fault or "")
+    if fault.startswith("open_refused:"):
+        return "open_refused"
+    if fault == "validator_restarted":
+        return "validator_restarted"
+    if record.state == VOIDED:
+        return "machine_drained"
+    if record.state == ABORTED:
+        return "aborted"
+    if record.state == CLOSED and "box_failed" in (record.ended_status, record.closed_status):
+        return "box_failed"
+    return None
+
+
+def lease_sandbox_failure(sessions: SessionBook, lease) -> tuple[str, str] | None:
+    """``(cause, detail)`` when the last session of one of ``lease``'s rollouts was ended by our sandbox side
+    (``_session_failure``), else None. Only the session book counts (records verified at their close, or the
+    issuer's own drains): a rollout played again after an abort is judged by its replay. Read off the event loop
+    (the lease book's sweep thread): a read that met the loop's change of the index is read again."""
+    from reliquary.protocol.service_episode import RL_LEASE_ENGAGEMENT_PREFIX
+
+    prefix = f"{RL_LEASE_ENGAGEMENT_PREFIX}:{lease.lease_id}:"
+    for attempt in range(3):
+        try:
+            records = sessions.of_hotkey(lease.hotkey)
+            break
+        except RuntimeError:                     # the set changed size during the read
+            if attempt == 2:
+                raise
+    last: dict[str, SessionRecord] = {}
+    for record in records:
+        if record.engagement.startswith(prefix):
+            seen = last.get(record.engagement)
+            if seen is None or (record.issued_at, record.session_id) > (seen.issued_at, seen.session_id):
+                last[record.engagement] = record
+    for engagement, record in sorted(last.items()):
+        cause = _session_failure(record)
+        if cause is not None:
+            return cause, (f"rollout {engagement.rsplit(':', 1)[1]}, session {record.session_id} on "
+                           f"{record.machine_id}: {record.state}/{record.closed_status}")
+    return None
+
+
+__all__ = ["SANDBOX_FAILURE_CAUSES", "WINDOW_AGE_MARGIN_S", "EpisodeEnvironmentView", "NoOutcomes", "OpenQuota", "RlEpisodeEngagements",
+           "RlLeaseEngagements", "SessionOutcomes",
+           "SessionQuota", "lease_sandbox_failure", "session_budgets"]

@@ -263,7 +263,9 @@ def _load(directory: str | Path) -> tuple[dict, dict[str, dict[str, list[bool | 
 
 
 def _sets(report: dict) -> list[tuple]:
-    return sorted((s["set_id"], s["problems"], s["samples"])
+    return sorted((s["set_id"], s["problems"], s["samples"], s.get("prompts_sha256"),
+                   s.get("grading_sha256"), s.get("environment_manifest_sha256"),
+                   s.get("protocol_sha256"))
                   for s in report["provenance"]["sets"])
 
 
@@ -285,9 +287,18 @@ def compare_reports(a: str | Path, b: str | Path, *, seed: int = 0,
     report_a, rows_a = _load(a)
     report_b, rows_b = _load(b)
     prov_a, prov_b = report_a["provenance"], report_b["provenance"]
+    from reliquary.eval.protocol import validate_request
+
+    for report, provenance in ((report_a, prov_a), (report_b, prov_b)):
+        if report.get("protocol") is not None:
+            validate_request({**provenance, **{key: report.get(key) for key in
+                             ("protocol", "protocol_json", "protocol_sha256", "protocol_bindings")}})
     differs = [k for k in CONDITIONS if k != "model" and prov_a.get(k) != prov_b.get(k)]
     if _sets(report_a) != _sets(report_b):
         differs.append("sets")
+    if (report_a.get("protocol_sha256") != report_b.get("protocol_sha256")
+            or report_a.get("protocol_bindings") != report_b.get("protocol_bindings")):
+        differs.append("protocol")
     if _grader_versions(report_a) != _grader_versions(report_b):
         # Another reward may score the same answer differently.
         differs.append("grader versions")
@@ -333,6 +344,7 @@ def compare_reports(a: str | Path, b: str | Path, *, seed: int = 0,
             "b": {"model": prov_b.get("model"), "revision": prov_b.get("revision"),
                   "eval_id": report_b.get("eval_id")},
             "conditions": {k: prov_a.get(k) for k in CONDITIONS if k != "model"},
+            "protocol_compatibility": "pinned" if report_a.get("protocol_sha256") else "legacy-unpinned",
             "bootstrap": {"seed": seed, "unit": "problem", "paired": True},
             "envs": envs}
 

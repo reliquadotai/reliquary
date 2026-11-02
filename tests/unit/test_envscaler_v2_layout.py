@@ -226,8 +226,10 @@ def test_the_environment_is_registered_as_a_chatml_binary_episode() -> None:
     assert MANIFEST["reward"] == v2.REWARD_MODE
 
 
-def test_no_profile_and_no_catalog_entry_names_it() -> None:
-    assert not [p for p in PROFILES.values() if ENVIRONMENT in p.environments]
+def test_only_the_async_v10_profile_names_it_and_no_catalog_entry() -> None:
+    # A replayed episode env of the lease path (validator/rl_suite_episodes.py), from v10 only.
+    assert [p.profile_id for p in PROFILES.values() if ENVIRONMENT in p.environments] == [
+        "teutonic-9b-reliquary-suite-v10-gumbel-dev1"]
     assert ENVIRONMENT not in ENVIRONMENT_CATALOG
 
 

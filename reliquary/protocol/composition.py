@@ -85,6 +85,7 @@ RUN_POLICIES: Mapping[str, RunPolicy] = MappingProxyType({
     "suite-v9": run_policy_of(PROFILES["teutonic-9b-reliquary-suite-v9-dev1"]),
     "episode-v7": run_policy_of(PROFILES["qwen3-4b-reliquary-episode-v7-dev1"]),
     "corpus-v1": run_policy_of(PROFILES["teutonic-9b-reliquary-suite-v9-dev1"]),
+    "suite-v10-gumbel": run_policy_of(PROFILES["teutonic-9b-reliquary-suite-v10-gumbel-dev1"]),
 })
 
 

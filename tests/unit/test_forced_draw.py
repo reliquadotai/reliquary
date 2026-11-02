@@ -9,7 +9,7 @@ import torch
 
 from reliquary.miner.corpus_generate_server import Finished, GenerateEngine, VllmTurnCore
 from reliquary.miner.forced_draw import DrawBinding, ForcedDraws, forced_sampling_params
-from reliquary.miner.vllm_generation import FORCED_SEED_KEY, ForcedSeedVLLMProcessor
+from reliquary.miner.vllm_generation import FORCED_SEED_KEY, ForcedSeedVLLMProcessor, RunnerForcedSeedVLLMProcessor
 from reliquary.protocol.seed_pool import SeedPool
 from reliquary.validator.verifier import policy_token_positions
 from tests.unit.episode_v2_fixtures import episode_contract, episode_pool
@@ -326,7 +326,12 @@ class _FakeLLM:
         self.llm_engine = _FakeVllmEngine()
 
 
-def _core(forced, monkeypatch):
+class _FakeRunner:
+    def _sample(self, logits, spec_decode_metadata):
+        return logits
+
+
+def _core(forced, monkeypatch, version="0.30.0"):
     """A VllmTurnCore built through ``__init__`` against a fake vLLM."""
     from contextlib import nullcontext
 
@@ -334,8 +339,11 @@ def _core(forced, monkeypatch):
     import reliquary.miner.vllm_hidden_capture as hidden
 
     vllm = ModuleType("vllm")
-    vllm.LLM, vllm.SamplingParams = _FakeLLM, dict
+    vllm.LLM, vllm.SamplingParams, vllm.__version__ = _FakeLLM, dict, version
     monkeypatch.setitem(sys.modules, "vllm", vllm)
+    runner = ModuleType("vllm.v1.worker.gpu_model_runner")
+    runner.GPUModelRunner = _FakeRunner
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu_model_runner", runner)
     inputs = ModuleType("vllm.inputs")
     inputs.TokensPrompt = lambda prompt_token_ids: list(prompt_token_ids)
     monkeypatch.setitem(sys.modules, "vllm.inputs", inputs)
@@ -351,7 +359,8 @@ def _core(forced, monkeypatch):
 def test_the_vllm_core_sends_the_draw_only_when_built_forced(monkeypatch):
     draw = DrawBinding(POOL, SEED).extra_args(4)
     forced = _core(True, monkeypatch)
-    assert _FakeLLM.kwargs["logits_processors"] == [ForcedSeedVLLMProcessor]
+    # the runner-keyed draw: a preempted turn must not restart its position at base_offset
+    assert _FakeLLM.kwargs["logits_processors"] == [RunnerForcedSeedVLLMProcessor]
     forced.add("r", [1, 2], 8, draw=draw)
     (_, params), = forced._engine.requests
     assert params["extra_args"] == draw and params["temperature"] == 0.0 and params["max_tokens"] == 8
@@ -364,3 +373,11 @@ def test_the_vllm_core_sends_the_draw_only_when_built_forced(monkeypatch):
     free.add("r4", [1, 2], 8)
     (_, params), = free._engine.requests
     assert "extra_args" not in params and params["temperature"] == 0.7
+
+
+def test_a_forced_vllm_core_refuses_an_unpinned_vllm(monkeypatch):
+    _FakeLLM.kwargs = None
+    with pytest.raises(RuntimeError, match="vLLM"):
+        _core(True, monkeypatch, version="0.31.0")
+    assert _FakeLLM.kwargs is None                                        # refused before any weights load
+    _core(False, monkeypatch, version="0.31.0")                           # a free core does not draw

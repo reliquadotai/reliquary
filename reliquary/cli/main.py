@@ -2,6 +2,7 @@
 
 import asyncio
 import atexit
+import json
 import logging
 import math
 import os
@@ -14,6 +15,7 @@ import threading
 import time as _time
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Optional
 
 import typer
 
@@ -101,8 +103,9 @@ def _registry_price_params() -> dict:
         params.pop(field, None)
     return params
 
-def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None, verification=None):
-    """One registry entry: shipped controller defaults, then explicit overrides."""
+def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None, verification=None, episode_envs=()):
+    """One registry entry: shipped controller defaults, then explicit overrides. ``episode_envs``: names of an async
+    task's signed-episode envs (``--rl-episode-envs``), which the split may name besides the profile's."""
     from dataclasses import asdict
 
     from reliquary.environment.abi import canonical_sha256
@@ -124,7 +127,7 @@ def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None, ver
     if env_split is not None:
         # Fail fast here; `resolve_task_config` is the runtime authority.
         declared = set(profile.environments)
-        named = set(env_split)
+        named = set(env_split) - set(episode_envs)
         unknown = named - declared
         if unknown:
             raise ValueError(
@@ -332,6 +335,131 @@ def build_corpus_task_entry(
         contract=contract,
         profile_sha256=canonical_sha256(contract),
     )
+
+
+def _read_episode_envs(path):
+    if path is None:
+        return None
+    from reliquary.shared.strict_json import strict_json_loads
+
+    if path.stat().st_size > 256 * 1024:
+        raise ValueError("--rl-episode-envs exceeds 256 KiB")
+    value = strict_json_loads(path.read_bytes())
+    if not isinstance(value, dict):
+        raise ValueError("--rl-episode-envs must hold a JSON object {env: block}")
+    return value
+
+
+def _parse_lease_expiry(value):
+    if not value:
+        return None
+    out = {}
+    for item in value.split(","):
+        name, sep, seconds = item.partition("=")
+        if not sep or not name.strip():
+            raise ValueError(f"--lease-expiry: env=seconds expected, got {item!r}")
+        out[name.strip()] = float(seconds)
+    return out
+
+
+def with_episode_harnesses(episode_envs, value):
+    """``--harness env=id@version,...``: each named episode env's block pins that reliquary-harness spec at the
+    digest this install serves (refused when it does not serve it). ``env=a@1:2+b@1:1`` is a weighted mix,
+    drawn per lease (weights are integers, 1 by default): the env's block names the list."""
+    import copy
+
+    from reliquary.protocol.service_contract import parse_harness_value
+
+    if not value:
+        return episode_envs
+    envs = copy.deepcopy(dict(episode_envs or {}))
+    named = set()
+    for item in value.split(","):
+        name, sep, keys = item.strip().partition("=")
+        if not sep or not name or not keys:
+            raise ValueError(f"--harness: env=id@version expected, got {item!r}")
+        if name in named:
+            raise ValueError(f"--harness names {name} twice: one harness, or one mix, per env")
+        if name not in envs:
+            raise ValueError(f"--harness names {name}, which is not an --rl-episode-envs env")
+        named.add(name)
+        entries = []
+        for key in keys.split("+"):
+            key, colon, weight = key.strip().partition(":")
+            harness_id, at, version = key.partition("@")
+            if not at or not harness_id or not version or (colon and not weight.isdigit()):
+                raise ValueError(f"--harness {name}: id@version[:weight] expected, got {key!r}")
+            pin = _harness_pin(harness_id, version, f"--harness {name}", variants=True)
+            entries.append({**pin, "weight": int(weight)} if colon else pin)
+        if len(entries) == 1:
+            if "weight" in entries[0]:
+                raise ValueError(f"--harness {name}: a weight needs a mix of at least two harnesses")
+            harness = entries[0]
+        else:
+            harness = [entry if "weight" in entry else {**entry, "weight": 1} for entry in entries]
+            parse_harness_value(harness, f"--harness {name}")
+        envs[name]["episode"] = {**envs[name]["episode"], "harness": harness}
+    return envs
+
+
+def _harness_pin(harness_id: str, version: str, where: str, *, variants: bool) -> dict:
+    """``{id, version, digest}`` of a reliquary-harness spec at the digest this install serves (refused when
+    it does not serve it, or, without ``variants``, when the spec draws surface variants)."""
+    from reliquary.environment.agentic_swe import harness_of, harness_pin_refusal
+
+    pin = {"id": harness_id, "version": version, "digest": ""}
+    try:
+        pin["digest"] = harness_of(pin).digest
+    except ValueError as exc:
+        raise ValueError(f"{where}: {exc}") from None
+    refusal = harness_pin_refusal(pin, variants=variants)
+    if refusal:
+        raise ValueError(f"{where}: {refusal}")
+    return pin
+
+
+def with_job_harness(episode, value):
+    """``jobs create --harness id@version``: the signed episode a corpus or eval job plays pins that
+    reliquary-harness spec (``episode.harness_spec``). None: the episode as given."""
+    if not value:
+        return episode
+    harness_id, at, version = value.strip().partition("@")
+    if not at or not harness_id or not version:
+        raise ValueError(f"--harness: id@version expected, got {value!r}")
+    if not isinstance(episode, dict) or episode.get("sandbox") is None:
+        raise ValueError("--harness needs a signed_sandbox --episode-file (a replay job plays "
+                         "the compatibility harness only)")
+    return {**episode, "harness_spec": _harness_pin(harness_id, version, "--harness", variants=False)}
+
+
+def with_rl_async_params(entry, *, planned_tokens_per_period, start_pool=None, lease_tokens_per_s=None,
+                         episode_envs=None, lease_expiry_s=None):
+    """An RL entry declared for the async protocol: paid by period (``settlement = period-ema-v1``, the weight
+    setter's period EMA), its ``env_split`` as the trainer's target mix, the ``rl_*`` params of
+    ``rl_async_service.rl_async_params``."""
+    from dataclasses import replace
+
+    from reliquary.shared.task_registry import MECHANISM_RL_DISCOVERED_PRICE
+    from reliquary.validator.rl_async_service import rl_async_params
+
+    if entry.mechanism != MECHANISM_RL_DISCOVERED_PRICE:
+        raise ValueError(f"--rl-async declares an RL task, not {entry.mechanism!r}")
+    if not entry.env_split:
+        raise ValueError("--rl-async needs --env-split: the async trainer's target mix")
+    if planned_tokens_per_period is None:
+        raise ValueError("--rl-async needs --planned-tokens-per-period")
+    extra = {} if lease_tokens_per_s is None else {"lease_tokens_per_s": lease_tokens_per_s}
+    cap = float(entry.params.get("cap", 0.0))
+    if start_pool is not None and not 0 < start_pool <= cap:
+        raise ValueError(f"--start-pool must be positive and at most --cap ({cap}), got {start_pool}")
+    params = rl_async_params(planned_tokens_per_period=planned_tokens_per_period, start_pool=start_pool,
+                             episode_envs=episode_envs, lease_expiry_s=lease_expiry_s, **extra)
+    for label, names in (("--rl-episode-envs", params.get("rl_episode_envs") or {}),
+                         ("--lease-expiry", params.get("rl_lease_expiry_s") or {})):
+        missing = sorted(set(names) - set(entry.env_split))
+        if missing:
+            raise ValueError(f"{label} names envs outside --env-split: {missing}")
+    return replace(entry, params={**entry.params, **params})
 
 
 def _with_enforced_toploc(contract, thresholds=None):
@@ -563,6 +691,40 @@ def tasks_create(
             "it from its own card."
         ),
     ),
+    rl_async: bool = typer.Option(
+        False, "--rl-async",
+        help="An async RL task (RELIQUARY_RL_MODE=async validators): paid by period (period-ema-v1); "
+        "--env-split is the trainer's target mix; needs --planned-tokens-per-period",
+    ),
+    planned_tokens_per_period: float = typer.Option(
+        None, "--planned-tokens-per-period",
+        help="With --rl-async: matched tokens the trainer consumes per 72-minute period at the target mix "
+        "(at price 1 they pay exactly --start-pool)",
+    ),
+    start_pool: float = typer.Option(
+        None, "--start-pool",
+        help="With --rl-async: the budget the starting prices pay a period at the target mix (default: --cap); "
+        "--cap is the most a period ever pays, scarcity raises prices towards it",
+    ),
+    lease_tokens_per_s: float = typer.Option(
+        None, "--lease-tokens-per-s",
+        help="With --rl-async: the slow reference decode speed lease expiries are cut against",
+    ),
+    rl_episode_envs: Path = typer.Option(
+        None, "--rl-episode-envs",
+        help="With --rl-async: JSON file {env: {episode, catalogue?, version?}}: the signed-episode envs of the "
+        "env split (the order's episode block and public catalogue; rl_async_episodes)",
+    ),
+    lease_expiry: str = typer.Option(
+        None, "--lease-expiry",
+        help="With --rl-async: env=seconds,... lease lifetimes overriding the computed ones",
+    ),
+    harness: str = typer.Option(
+        None, "--harness",
+        help="With --rl-async: env=id@version,... the reliquary-harness spec each --rl-episode-envs env plays "
+        "(e.g. swe_v1=mini-swe@2, tmax_v1=bash-surface@1), or a weighted mix drawn per lease "
+        "(swe_v1=mini-swe@2:1+bash-surface@1:1); unnamed envs play bash-vf-b2e4e81@1",
+    ),
 ) -> None:
     from reliquary.infrastructure.task_registry_store import create_task
     from reliquary.shared.task_registry import RegistryError
@@ -665,6 +827,7 @@ def tasks_create(
                 overrides=overrides,
                 env_split=_parse_env_split_option(env_split),
                 verification=verification,
+                episode_envs=tuple(_read_episode_envs(rl_episode_envs) or ()) if rl_async else (),
             )
         if service_contract_file is not None:
             from dataclasses import replace
@@ -680,6 +843,17 @@ def tasks_create(
                             params={**entry.params, "min_incentive_share": 0.0, "min_incentive_ramp_start": 0.0})
         elif ack_service_fleet:
             raise ValueError("--ack-service-fleet requires --service-contract")
+        if rl_async:
+            entry = with_rl_async_params(entry, planned_tokens_per_period=planned_tokens_per_period,
+                                         start_pool=start_pool,
+                                         lease_tokens_per_s=lease_tokens_per_s,
+                                         episode_envs=with_episode_harnesses(_read_episode_envs(rl_episode_envs),
+                                                                             harness),
+                                         lease_expiry_s=_parse_lease_expiry(lease_expiry))
+        elif (planned_tokens_per_period is not None or start_pool is not None or lease_tokens_per_s is not None
+              or rl_episode_envs is not None or lease_expiry is not None or harness is not None):
+            raise ValueError("--planned-tokens-per-period, --start-pool, --lease-tokens-per-s, --rl-episode-envs, "
+                             "--lease-expiry and --harness need --rl-async")
         asyncio.run(create_task(entry))
     except (RegistryError, ValueError) as exc:
         # Declaring the first task is the one CLI command that can stop the
@@ -1053,6 +1227,10 @@ def build_job_manifest(
     seed=None,
     submit=None,
     episode=None,
+    draw=None,
+    min_p=0.0,
+    max_prompt_tokens=None,
+    judge=None,
 ):
     """The manifest as the job store will hold it, refused unless every
     submission it will ever be paid for could be admitted.
@@ -1095,8 +1273,14 @@ def build_job_manifest(
             "min_new_tokens": min_new_tokens,
             "max_new_tokens": max_new_tokens,
             "n": n,
+            # An eval job's forced draw (``corpus.eval_draw``); absent, free sampling.
+            **({"draw": draw} if draw is not None else {}),
+            # A draw job's min-p; absent (0), every manifest without it hashes as before.
+            **({"min_p": min_p} if min_p else {}),
         },
         "slots_per_prompt": slots_per_prompt,
+        # A long-context job's longest prompt; absent, the miners' default allowance.
+        **({"max_prompt_tokens": max_prompt_tokens} if max_prompt_tokens is not None else {}),
         "filter": (
             None
             if grader_id is None
@@ -1115,6 +1299,13 @@ def build_job_manifest(
         manifest["submit"] = submit
     if episode is not None:
         manifest["episode"] = episode
+    if judge is not None:
+        from reliquary.corpus.job import judge_field
+
+        # Some of a forced draw's judge thresholds, the others at their defaults; none written when all are.
+        field = judge_field(judge)
+        if field is not None:
+            manifest["judge"] = field
     # Resolving RENDERS the source's rule and BUILDING it counts its rows, and
     # both are refusals the operator would otherwise meet one submission at a
     # time: an unrenderable source fails fidelity forever, and a range
@@ -1161,7 +1352,8 @@ def _corpus_base_profile(
         # episode bounds, and checked against the spec like any catalog body.
         from reliquary.protocol.agentic_source import suite_episode_body
 
-        catalog = {**catalog, prompt_source: suite_episode_body(prompt_source, suite_episode)}
+        catalog = {**catalog,
+                   prompt_source: suite_episode_body(prompt_source, suite_episode, external_eval)}
     # No environment overrides: two jobs on one source must carry one body to merge.
     return compose_profile(
         profile_id=normalise_task_id(task_id),
@@ -1181,7 +1373,7 @@ def prepare_corpus_job(
     min_new_tokens=2, temperature=1.0, top_p=1.0, top_k=0, n=1, grader_id=None,
     threshold=None, prompt_order="free", deadline_round=None, overrides=None,
     verification=None, seed=None, contract_environment=None, toploc_thresholds=None,
-    submit=None, episode=None,
+    submit=None, episode=None, draw=None, judge=None, min_p=0.0, max_prompt_tokens=None,
 ):
     """The manifest and the registry entry `jobs create` writes, built and
     checked without writing either (the admin service declares jobs with it).
@@ -1196,7 +1388,8 @@ def prepare_corpus_job(
         task_id=task_id or job_id, from_profile=from_profile, model=model,
         model_revision=model_revision, model_architecture=model_architecture,
         prompt_encoding=prompt_encoding, renderer_id=renderer_id,
-        prompt_source=environment, external_eval=is_eval_source(prompt_source), agentic=episode is not None,
+        prompt_source=environment, external_eval=is_eval_source(prompt_source),
+        agentic=episode is not None,
         suite_episode=(episode if isinstance(episode, dict) and episode.get("harness") == "suite"
                        else None),
     )
@@ -1231,6 +1424,8 @@ def prepare_corpus_job(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
+        min_p=min_p,
+        max_prompt_tokens=max_prompt_tokens,
         min_new_tokens=min_new_tokens,
         max_new_tokens=max_new_tokens,
         n=n,
@@ -1241,6 +1436,8 @@ def prepare_corpus_job(
         seed=seed,
         submit=submit,
         episode=episode,
+        draw=draw,
+        judge=judge,
     )
     entry = build_corpus_task_entry(
         task_id=task_id or job_id,
@@ -1261,11 +1458,14 @@ def prepare_corpus_job(
 
 
 def _eval_job_source(*, job_id, eval_set, prompt_count, prompt_start, renderer_id, audit_q,
-                     grader_id, threshold, from_profile):
+                     grader_id, threshold, from_profile, episode=None):
     """What an evaluation job served by our own validator is declared from: the
     set's first N problems as its prompt source (checked against the lines'
     sha256), the set's environment as its contract's, a seed from its id.
-    Refuses what would make it something else than a measurement."""
+    Refuses what would make it something else than a measurement.
+
+    A set of episode or SWE tasks is references: the job is the episode job
+    (``episode``, from ``--episode-file``) that plays them, at the set's split."""
     import hashlib
 
     from reliquary.eval.prompt_source import eval_source_for, register_eval_prompts
@@ -1273,9 +1473,16 @@ def _eval_job_source(*, job_id, eval_set, prompt_count, prompt_start, renderer_i
     from reliquary.protocol.external_eval import contract_environment_for
     from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS
 
-    if renderer_id not in CHAT_TEMPLATE_RENDERERS:
-        raise ValueError(f"an eval set's rows render only through the model's chat template "
-                         f"({sorted(CHAT_TEMPLATE_RENDERERS)}), not {renderer_id!r}")
+    card, prompts = read_published_set(eval_set)
+    interaction = card.get("interaction", "single_turn")
+    if interaction == "single_turn":
+        if episode is not None:
+            raise ValueError(f"set {eval_set} holds single-turn problems: omit --episode-file")
+        if renderer_id not in CHAT_TEMPLATE_RENDERERS:
+            raise ValueError(f"an eval set's rows render only through the model's chat template "
+                             f"({sorted(CHAT_TEMPLATE_RENDERERS)}), not {renderer_id!r}")
+    else:
+        _refuse_episode_disagreeing_with_set(card, eval_set, episode, renderer_id)
     if prompt_start:
         raise ValueError("an eval job starts at the set's first problem (--prompt-start 0)")
     if audit_q != 1.0:
@@ -1287,14 +1494,71 @@ def _eval_job_source(*, job_id, eval_set, prompt_count, prompt_start, renderer_i
     if from_profile is not None:
         raise ValueError("an eval job's contract is composed from the model and the set's "
                          "environment: omit --from-profile")
-    card, prompts = read_published_set(eval_set)
     count = int(card["count"]) if prompt_count is None else int(prompt_count)
     if not 1 <= count <= int(card["count"]):
         raise ValueError(f"set {eval_set} holds {card['count']} problems, not {count}")
     source = eval_source_for(eval_set, prompts, count)
     register_eval_prompts(source, prompts)
     seed = int(hashlib.sha256(job_id.encode()).hexdigest()[:15], 16)
-    return source.name, count, contract_environment_for(card), seed
+    if interaction == "swe":
+        from reliquary.protocol.agentic_source import AGENTIC_SWE_ENVIRONMENT
+
+        environment = AGENTIC_SWE_ENVIRONMENT   # as for a signed corpus job
+    elif interaction == "signed_bridged":
+        from reliquary.protocol.agentic_source import AGENTIC_SIGNED_ENVIRONMENT
+
+        environment = AGENTIC_SIGNED_ENVIRONMENT
+    else:
+        environment = contract_environment_for(card)
+    return source.name, count, environment, seed
+
+
+def _refuse_bridge_disagreeing_with_set(card, episode, env):
+    """A bridged eval env's episode serves the set's package, at the identity, options and
+    image lock the set was frozen from."""
+    bridge, frozen = episode.get("bridge"), card.get("bridge") or {}
+    sandbox = episode.get("sandbox") if isinstance(episode.get("sandbox"), dict) else {}
+    if env.get("package") != card["source"]:
+        raise ValueError(f"the set's environment is {card['source']!r}, the episode names "
+                         f"{env.get('package')!r}")
+    if not isinstance(bridge, dict) or {k: bridge.get(k) for k in ("options", "image_lock_sha256")} \
+            != {k: frozen.get(k) for k in ("options", "image_lock_sha256")}:
+        raise ValueError("the episode's bridge (options, image lock) is not the one the set "
+                         "was frozen from")
+    if sandbox.get("env_package") != frozen.get("env_package"):
+        raise ValueError(f"the set was frozen from {frozen.get('env_package')!r}, the episode "
+                         f"pins {sandbox.get('env_package')!r}")
+
+
+def _refuse_episode_disagreeing_with_set(card, eval_set, episode, renderer_id):
+    """A set of references is played by an episode job whose environment, split and
+    renderer are the set's own: anything else would grade other tasks than the set names."""
+    interaction = card["interaction"]
+    if interaction not in ("episode", "swe", "signed_bridged"):
+        raise ValueError(f"set {eval_set} holds {interaction!r} problems: no eval job plays them")
+    if not isinstance(episode, dict):
+        raise ValueError(f"set {eval_set} holds {interaction} tasks: pass the episode that plays "
+                         "them with --episode-file")
+    env = episode.get("env") if isinstance(episode.get("env"), dict) else {}
+    if env.get("split") != card["split"]:
+        raise ValueError(f"the set's split is {card['split']!r}, the episode names "
+                         f"{env.get('split')!r}")
+    if interaction in ("swe", "signed_bridged"):
+        if episode.get("execution") != "signed_sandbox":
+            raise ValueError("an eval job on SWE runs in the signed sandbox: the episode's "
+                             f"execution is {episode.get('execution')!r}, not 'signed_sandbox'")
+        if interaction == "signed_bridged":
+            _refuse_bridge_disagreeing_with_set(card, episode, env)
+        return
+    if episode.get("harness") != "suite":
+        raise ValueError(f"set {eval_set} holds suite episode tasks: the episode's harness is "
+                         f"{episode.get('harness')!r}, not 'suite'")
+    if env.get("name") != card["source"]:
+        raise ValueError(f"the set's environment is {card['source']!r}, the episode names "
+                         f"{env.get('name')!r}")
+    if not (renderer_id == episode.get("renderer") == card.get("renderer_id")):
+        raise ValueError(f"the renderer disagrees: --renderer-id {renderer_id!r}, the episode "
+                         f"{episode.get('renderer')!r}, the set {card.get('renderer_id')!r}")
 
 
 @jobs_app.command("create")
@@ -1417,6 +1681,20 @@ def jobs_create(
     temperature: float = typer.Option(1.0, "--temperature"),
     top_p: float = typer.Option(1.0, "--top-p"),
     top_k: int = typer.Option(0, "--top-k"),
+    min_p: float = typer.Option(0.0, "--min-p", help="With --draw: cut tokens under min-p times the most likely"),
+    max_prompt_tokens: int = typer.Option(
+        None, "--max-prompt-tokens", help="Long context: the job's longest prompt in tokens (miners size their "
+        "engine to it); default the miners' 8,192-token allowance"),
+    draw: str = typer.Option(
+        None, "--draw",
+        help="Eval jobs: 'gumbel_max' forces every sample with the job's public draw at its --temperature, "
+        "--top-k, --top-p and --min-p, checked by the audit; omit for free sampling",
+    ),
+    draw_judge: str = typer.Option(
+        None, "--draw-judge",
+        help="With --draw: the judge's thresholds as JSON, some of floor_rate, grace, gap_tolerance, terminal_gap, "
+        "edge_margin (the others at their defaults), e.g. '{\"floor_rate\": 0.95}'",
+    ),
     n: int = typer.Option(1, "--n", help="Completions per submitted slot"),
     grader_id: str = typer.Option(
         None, "--grader-id", help="Rejection sampling: what decides membership"
@@ -1440,6 +1718,13 @@ def jobs_create(
         "--episode-file",
         help="An agentic job: a JSON file holding the manifest's `episode` object "
         "(spec section 6). Its prompt source is reliquary_agentic_swe_v1",
+    ),
+    harness: str = typer.Option(
+        None,
+        "--harness",
+        help="The reliquary-harness spec the job's signed episodes play, as id@version (e.g. "
+        "mini-swe@2), pinned at the digest this install serves. Omit for the compatibility "
+        "harness bash-vf-b2e4e81@1. A harness with surface variants is an RL lease's only",
     ),
     settlement: str = typer.Option(
         "period-ema-v1",
@@ -1494,18 +1779,21 @@ def jobs_create(
     try:
         if (prompt_source is None) == (eval_set is None):
             raise ValueError("give exactly one of --prompt-source and --eval-set")
-        if eval_set is not None:
-            prompt_source, prompt_count, contract_environment, seed = _eval_job_source(
-                job_id=job_id, eval_set=eval_set, prompt_count=prompt_count,
-                prompt_start=prompt_start, renderer_id=renderer_id, audit_q=audit_q,
-                grader_id=grader_id, threshold=threshold, from_profile=from_profile)
-        elif prompt_count is None:
-            raise ValueError("--prompt-count is required with --prompt-source")
         if episode_file is not None:
             import json
 
             with open(episode_file, encoding="utf-8") as handle:
                 episode = json.load(handle)
+        if harness is not None:
+            episode = with_job_harness(episode, harness)
+        if eval_set is not None:
+            prompt_source, prompt_count, contract_environment, seed = _eval_job_source(
+                job_id=job_id, eval_set=eval_set, prompt_count=prompt_count,
+                prompt_start=prompt_start, renderer_id=renderer_id, audit_q=audit_q,
+                grader_id=grader_id, threshold=threshold, from_profile=from_profile,
+                episode=episode)
+        elif prompt_count is None:
+            raise ValueError("--prompt-count is required with --prompt-source")
     except (OSError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -1530,7 +1818,9 @@ def jobs_create(
             min_new_tokens=min_new_tokens, temperature=temperature, top_p=top_p, top_k=top_k,
             n=n, grader_id=grader_id, threshold=threshold, prompt_order=prompt_order,
             deadline_round=deadline_round, overrides=overrides, verification=verification,
-            contract_environment=contract_environment, seed=seed, episode=episode,
+            contract_environment=contract_environment, seed=seed, episode=episode, draw=draw,
+            judge=json.loads(draw_judge) if draw_judge is not None else None, min_p=min_p,
+            max_prompt_tokens=max_prompt_tokens,
         )
     except (RegistryError, ValueError) as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -1742,28 +2032,38 @@ def jobs_export(
             if job.episode.is_suite:
                 # Replayed here, with the job's checkpoint tokenizer and the
                 # environment this host has installed (refused if not the pin).
-                from reliquary.corpus.suite_episode import TokenizerCodec, suite_source
+                from reliquary.corpus.suite_episode import TokenizerCodec, job_suite_source
                 from reliquary.shared.modeling import load_tokenizer
 
                 renderer = None
                 try:
-                    source = await asyncio.to_thread(suite_source, job.episode)
+                    # An eval job's rows through its set (read from the eval
+                    # store), at the set's split.
+                    source = await asyncio.to_thread(job_suite_source, job)
                 except ValueError as exc:
                     raise typer.BadParameter(str(exc)) from exc
                 codec = TokenizerCodec(await asyncio.to_thread(
                     load_tokenizer, await asyncio.to_thread(_episode_tokenizer_dir, job)))
             else:
-                from reliquary.corpus.job import is_signed_sandbox, sandbox_split
+                from reliquary.corpus.job import is_signed_sandbox
 
                 signed_job = is_signed_sandbox(job)
                 tokenizer_dir = await asyncio.to_thread(_episode_tokenizer_dir, job)
-                # A replay job renders with the loader's default tools, as it always did.
+                # A replay job renders with the loader's default tools, as it always did; a signed
+                # one with its tools, in its harness.
                 renderer = await asyncio.to_thread(
-                    agentic_swe.load_turn_renderer, tokenizer_dir,
-                    *((job.episode.sandbox.tools,) if signed_job else ()))
-                source = (agentic_swe.SignedSweSource(sandbox_split(job.episode)) if signed_job
-                          else await asyncio.to_thread(agentic_swe.load_swe_source,
-                                                       job.episode.env.num_images))
+                    *((agentic_swe.job_turn_renderer, job, tokenizer_dir) if signed_job
+                      else (agentic_swe.load_turn_renderer, tokenizer_dir)))
+                if signed_job:
+                    try:
+                        # A signed eval job's rows through its set, checked against
+                        # the bridged env.
+                        source = await asyncio.to_thread(agentic_swe.job_signed_source, job)
+                    except ValueError as exc:
+                        raise typer.BadParameter(str(exc)) from exc
+                else:
+                    source = await asyncio.to_thread(agentic_swe.load_swe_source,
+                                                     job.episode.env.num_images)
             counts: dict = {}
             rows = episode_rows(job=job, records=BucketRecordStore(), renderer=renderer,
                                 source=source, counts=counts, sft_only=sft,
@@ -2051,6 +2351,15 @@ def eval_build_set(
         None, "--taskset-args",
         help="Verifiers only: the taskset config as JSON, frozen into the set"),
     set_id: str | None = typer.Option(None, "--set-id"),
+    protocol: str | None = typer.Option(
+        None, "--protocol", help="Reviewed JSON file with data/license digests and disjointness evidence"),
+    interaction: str = typer.Option("single_turn", "--interaction",
+        help="single_turn, episode (telecom benchmark), or signed_episode (reviewed sandbox source)"),
+    episode_config: str | None = typer.Option(None, "--episode-config",
+        help="Reviewed episode source configuration JSON file; no secret command arguments"),
+    bridge_file: str | None = typer.Option(None, "--bridge-file",
+        help="A bridged eval env's source (e.g. reliquary-terminal): JSON {options, "
+             "image_lock_sha256}, as its gateway serves it"),
 ) -> None:
     """Freeze problems into a set: prompts.jsonl, grading.jsonl, set.json.
 
@@ -2058,32 +2367,56 @@ def eval_build_set(
     over [START, START+COUNT), whole or --sample'd. Overlap with training is
     written on the card, never refused."""
     import json
+    from pathlib import Path
 
     from reliquary.eval import sets
 
     try:
+        reviewed = json.loads(Path(protocol).read_text()) if protocol else None
+        if reviewed is not None and not isinstance(reviewed, dict):
+            raise ValueError("--protocol must hold a JSON object")
         if (preset is None) == (source is None):
             raise ValueError("give exactly one of --preset and --source")
-        if preset is not None:
+        if interaction != "single_turn":
+            if preset is not None or source is None or count is None or seed is None \
+                    or sample is not None or start or split or taskset_args:
+                raise ValueError("an episode takes --source, --count and --seed with reviewed source configuration")
+            config = json.loads(Path(episode_config).read_text()) if episode_config else None
+            if config is not None and not isinstance(config, dict):
+                raise ValueError("--episode-config must hold a JSON object")
+            card = sets.build_episode_set(source, out=out, interaction=interaction, count=count,
+                seed=seed, episode_config=config, set_id=set_id, protocol=reviewed)
+        elif episode_config is not None:
+            raise ValueError("--episode-config requires an episode interaction")
+        elif bridge_file is not None and preset is not None:
+            raise ValueError("--bridge-file goes with --source")
+        elif preset is not None:
             if count is None or seed is None or sample is not None or start or split \
                     or taskset_args:
                 raise ValueError("a --preset takes --count and --seed only")
             card = sets.build_set(preset, count=count, seed=seed, out=out, set_id=set_id,
-                                  open_environment=sets.open_source)
+                                  open_environment=sets.open_source, protocol=reviewed)
         else:
             args = json.loads(taskset_args) if taskset_args else None
             if args is not None and not isinstance(args, dict):
                 raise ValueError("--taskset-args must be a JSON object")
+            bridge = json.loads(Path(bridge_file).read_text()) if bridge_file else None
+            if bridge is not None and not isinstance(bridge, dict):
+                raise ValueError("--bridge-file must hold a JSON object")
             card = sets.build_source_set(source, out=out, split=split, start=start,
                                          count=count, sample=sample, seed=seed,
-                                         set_id=set_id, taskset_args=args,
-                                         open_environment=sets.open_source)
-    except (ValueError, FileExistsError, KeyError) as exc:
+                                         set_id=set_id, taskset_args=args, bridge=bridge,
+                                         open_environment=sets.open_source, protocol=reviewed)
+    except (ValueError, OSError, KeyError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     keys = ("set_id", "env", "source", "split", "count", "index_range", "prompts_sha256",
-            "grading_sha256", "disjointness", "taskset", "needs_runtime")
-    typer.echo(json.dumps({k: card[k] for k in keys if k in card}, indent=1))
+            "grading_sha256", "disjointness", "taskset", "needs_runtime", "protocol", "protocol_sha256")
+    public = {k: card[k] for k in keys if k in card}
+    if card.get("protocol") and card.get("taskset"):
+        from reliquary.eval.protocol import public_taskset
+        public["taskset"] = public_taskset(card["taskset"])
+    typer.echo(json.dumps(public, indent=1))
 
 
 def _admin_client(admin_url: str):
@@ -2171,6 +2504,14 @@ def eval_grade(
     allow_incomplete: bool = typer.Option(False, "--allow-incomplete",
                                           help="Grade a drained job missing samples"),
     poll_seconds: float = typer.Option(10.0, "--poll-seconds"),
+    rl_run_id: str | None = typer.Option(None, "--rl-run-id",
+                                         help="The RL trainer's wandb run id this checkpoint belongs to"),
+    rl_step: int | None = typer.Option(None, "--rl-step", min=0,
+                                       help="Its trainer step (default: from a '-step-<n>' backup repo)"),
+    rl_checkpoint_version: int | None = typer.Option(None, "--rl-checkpoint-version", min=0,
+                                                     help="Its published checkpoint (default: the step)"),
+    upload: bool = typer.Option(False, "--upload", help="Also put the files under evaluations/<job>/ in the "
+                                                        "subnet bucket (create-only), where eval feed reads them"),
     admin_url: str = _ADMIN_URL,
 ) -> None:
     """Grade a drained eval job and write its report, manifest and graded rows.
@@ -2188,9 +2529,20 @@ def eval_grade(
         if not is_order_job_id(job_id):
             if out is None:
                 raise ValueError("--out is required: the grading is written here")
-            answer = asyncio.run(grade_served_job(job_id, out=out,
-                                                  allow_incomplete=allow_incomplete))
+            rl = {k: v for k, v in (("run_id", rl_run_id), ("step", rl_step),
+                                    ("checkpoint_version", rl_checkpoint_version)) if v is not None}
+            answer = asyncio.run(grade_served_job(job_id, out=out, allow_incomplete=allow_incomplete,
+                                                  **({"rl": rl} if rl else {})))
+            if upload:
+                from reliquary.eval.job_grading import upload_grading
+
+                answer = {**answer, "uploaded": asyncio.run(upload_grading(job_id, out))}
         else:
+            if upload:
+                raise ValueError("--upload applies to a job our validator served: the admin service "
+                                 "stores an order's grading")
+            if rl_run_id is not None or rl_step is not None or rl_checkpoint_version is not None:
+                raise ValueError("--rl-* options apply to a job our validator served, not an order job")
             answer = operator.grade_job(_admin_client(admin_url), job_id, out=out,
                                         eval_id=eval_id, allow_incomplete=allow_incomplete,
                                         poll_seconds=poll_seconds)
@@ -2198,6 +2550,170 @@ def eval_grade(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(json.dumps(answer, indent=1))
+
+
+@eval_app.command("feed")
+def eval_feed(
+    run_id: str = typer.Option(..., "--run-id", help="The trainer's wandb run id, as the platform's catalog has it"),
+    jobs: str = typer.Option("", "--jobs", help="Comma-separated checkpoint eval jobs"),
+    job_prefix: str = typer.Option("", "--job-prefix", help="And every graded job under this prefix"),
+    baseline_jobs: str = typer.Option("", "--baseline-job",
+                                      help="Comma-separated eval jobs of the start checkpoint (one per set)"),
+    reports_dir: str | None = typer.Option(None, "--reports-dir",
+                                           help="Read <dir>/<job>/report.json (default: the subnet bucket's "
+                                                "evaluations/<job>/report.json)"),
+    label: list[str] = typer.Option([], "--label", help="<set-id>=<label>, repeatable"),
+    max_checkpoints: int = typer.Option(120, "--max-checkpoints", min=1, max=120,
+                                        help="Newest points kept per set"),
+    out: str | None = typer.Option(None, "--out", help="Write the feed here"),
+    publish: bool = typer.Option(False, "--publish", help="Upload it to the public bucket (R2_PUBLIC_*) at "
+                                                          "rl-runs/<run-id>/benchmarks.json"),
+    wandb_run_id: str | None = typer.Option(None, "--wandb-run-id",
+                                            help="Write it into this W&B evaluation run's summary "
+                                                 "(reliquary_run_benchmarks), the platform's "
+                                                 "WANDB_RL_BENCHMARK_RUN_ID; never the trainer's run (WANDB_API_KEY)"),
+    wandb_project: str | None = typer.Option(None, "--wandb-project", help="Default: WANDB_PROJECT, then "
+                                                                           "reliquary-validator (the trainer's)"),
+    wandb_entity: str | None = typer.Option(None, "--wandb-entity", help="Default: WANDB_ENTITY"),
+) -> None:
+    """Build the run monitor's held-out benchmark feed (reliquary.run-benchmarks.v1) from graded reports."""
+    import json
+    import os
+    import time
+
+    from reliquary.eval import run_feed
+
+    def names(text):
+        return [n.strip() for n in text.split(",") if n.strip()]
+
+    try:
+        labels = {}
+        for item in label:
+            set_id, sep, text = item.partition("=")
+            if not sep or not set_id or not text:
+                raise ValueError(f"--label {item!r}: <set-id>=<label>")
+            labels[set_id] = text
+        if not (names(jobs) or job_prefix or names(baseline_jobs)):
+            raise ValueError("name the jobs: --jobs, --job-prefix and/or --baseline-job")
+        if wandb_run_id is not None:
+            from reliquary.eval import wandb_feed
+
+            wandb_feed.target(run_id, run_id=wandb_run_id)
+        reports = (run_feed.LocalReports(reports_dir) if reports_dir is not None
+                   else run_feed.BucketReports())
+        checkpoints, baselines, missing = asyncio.run(run_feed.collect(
+            reports, jobs=names(jobs), prefix=job_prefix or None, baseline_jobs=names(baseline_jobs)))
+        feed = run_feed.build_feed(run_id, checkpoints, baselines, observed_at_ms=int(time.time() * 1000),
+                                   labels=labels, max_checkpoints=max_checkpoints)
+        body = run_feed.encode_feed(feed)
+        if out is not None:
+            Path(out).write_bytes(body)
+        summary = {"run_id": run_id, "benchmarks": len(feed["benchmarks"]),
+                   "points": sum(len(b["checkpoints"]) for b in feed["benchmarks"]),
+                   "baselines": sum(b["baseline"] is not None for b in feed["benchmarks"]),
+                   "not_graded": missing, "bytes": len(body)}
+        if publish:
+            summary["published"] = run_feed.publish_feed(
+                feed, base_url=os.environ.get("RELIQUARY_RUN_BENCHMARKS_BASE_URL", "").strip() or None)
+        if wandb_run_id is not None:
+            summary["wandb"] = wandb_feed.publish_summary(feed, run_id=wandb_run_id, project=wandb_project,
+                                                          entity=wandb_entity)
+    except (ValueError, OSError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(json.dumps(summary, indent=1))
+
+
+@eval_app.command("schedule")
+def eval_schedule(
+    run_id: str = typer.Option(..., "--run-id", help="The trainer's wandb run id (the feed's run_id)"),
+    run_tag: str = typer.Option(..., "--run-tag", help="Short lowercase tag in the job ids: eval-<tag>-s<step>-.."),
+    suite: str = typer.Option(..., "--suite", help="JSON list of {set_id, short, slots_per_prompt, cap, "
+                                                   "max_new_tokens[, prompt_count]}; an agentic set adds "
+                                                   "episode_file (relative to the suite), harness, renderer_id"),
+    every: int | None = typer.Option(None, "--every", min=1, help="Follow the run: the newest checkpoint whose step "
+                                     "is a multiple of this (a multiple of RELIQUARY_RL_HF_BACKUP_MILESTONE_EVERY)"),
+    steps: list[int] = typer.Option([], "--step", min=1, help="Instead of --every: evaluate exactly this step "
+                                    "(repeatable; still on HF: a milestone or one of the last backups)"),
+    only: str = typer.Option("", "--only", help="Comma-separated suite shorts to run (default: the whole suite); "
+                             "a checkpoint already evaluated runs only the sets it misses"),
+    hf_prefix: str = typer.Option(..., "--hf-prefix", help="RELIQUARY_RL_HF_BACKUP_PREFIX of the trainer"),
+    hf_namespace: str = typer.Option("ReliquaryForge", "--hf-namespace"),
+    model_architecture: str = typer.Option(..., "--model-architecture"),
+    eos_token_id: int = typer.Option(..., "--eos-token-id"),
+    renderer_id: str = typer.Option("chat-template-thinking-v1", "--renderer-id"),
+    temperature: float = typer.Option(1.0, "--temperature"),
+    top_p: float = typer.Option(1.0, "--top-p"),
+    top_k: int = typer.Option(0, "--top-k"),
+    min_p: float = typer.Option(0.0, "--min-p", help="With the draw only"),
+    draw: str = typer.Option("gumbel_max", "--draw", help="The jobs' forced draw, at the sampling above; 'none' "
+                             "for free sampling at --temperature/--top-p/--top-k, unverified"),
+    baseline_model: str | None = typer.Option(None, "--baseline-model", help="The run's start checkpoint repo"),
+    baseline_revision: str | None = typer.Option(None, "--baseline-revision"),
+    results_dir: str = typer.Option(..., "--results-dir", help="Gradings, logs and benchmarks.json go here"),
+    state: str | None = typer.Option(None, "--state", help="Default: <results-dir>/schedule-state.json"),
+    start_cmd: str | None = typer.Option(None, "--start-cmd", help="Shell template starting the validator "
+                                         "({job} {jobs} {contract} {model} {revision} {wallet} {hotkey} {port})"),
+    wallet: str = typer.Option("", "--wallet-name"),
+    hotkey: str = typer.Option("", "--hotkey"),
+    port: str = typer.Option("", "--http-port"),
+    max_wait_hours: float = typer.Option(6.0, "--max-wait-hours", help="Then missing samples count as failures"),
+    publish: bool = typer.Option(False, "--publish", help="Publish the feed after each graded checkpoint"),
+    upload: bool = typer.Option(False, "--upload", help="Upload each grading to the subnet bucket"),
+    wandb: bool = typer.Option(False, "--wandb", help="After each feed rebuild, write it into a W&B evaluation run "
+                                                      "(summary reliquary_run_benchmarks + score history; "
+                                                      "WANDB_API_KEY)"),
+    wandb_run_id: str | None = typer.Option(None, "--wandb-run-id", help="That run (implies --wandb; default "
+                                            "<trainer group>-evals): the platform's WANDB_RL_BENCHMARK_RUN_ID"),
+    wandb_project: str | None = typer.Option(None, "--wandb-project", help="Default: WANDB_PROJECT, then "
+                                                                           "reliquary-validator (the trainer's)"),
+    wandb_entity: str | None = typer.Option(None, "--wandb-entity", help="Default: WANDB_ENTITY"),
+    execute: bool = typer.Option(False, "--execute", help="Act (default: a dry run printing what it would do)"),
+    loop_seconds: float = typer.Option(0.0, "--loop-seconds", help="Tick again every N seconds (0: once)"),
+) -> None:
+    """Evaluate an RL run's milestone checkpoints one at a time on this host's GPU and keep its feed current."""
+    from reliquary.eval import rl_schedule
+
+    try:
+        if baseline_model and not baseline_revision:
+            raise ValueError("--baseline-revision is required with --baseline-model")
+        values = {"wallet": wallet, "hotkey": hotkey, "port": port}
+        if start_cmd is None and execute and not all(values.values()):
+            raise ValueError("the default validator command needs --wallet-name, --hotkey and --http-port")
+        settings = rl_schedule.Settings(
+            run_id=run_id, run_tag=run_tag, suite=rl_schedule.load_suite(suite), every=every,
+            hf_namespace=hf_namespace, hf_prefix=hf_prefix, model_architecture=model_architecture,
+            eos_token_id=eos_token_id, renderer_id=renderer_id, temperature=temperature, top_p=top_p,
+            top_k=top_k, min_p=min_p,
+            draw=None if draw == "none" else draw, baseline_model=baseline_model, baseline_revision=baseline_revision, results_dir=Path(results_dir),
+            state_path=Path(state) if state else Path(results_dir) / "schedule-state.json",
+            start_cmd=start_cmd or rl_schedule.DEFAULT_START, start_values=values,
+            max_wait_s=max_wait_hours * 3600, publish=publish, upload=upload, wandb=wandb or bool(wandb_run_id),
+            wandb_run_id=wandb_run_id, wandb_project=wandb_project, wandb_entity=wandb_entity,
+            steps=tuple(steps), only=tuple(x.strip() for x in only.split(",") if x.strip()))
+        if settings.wandb:
+            from reliquary.eval.wandb_feed import target
+
+            target(run_id, run_id=wandb_run_id)
+        for entry in settings.suite:
+            rl_schedule.job_id(run_tag, 99999, entry.short)
+        if every is not None and steps:
+            raise ValueError("--every follows the run, --step picks checkpoints: one or the other")
+        scheduler = rl_schedule.Scheduler(settings, rl_schedule.live_ports(settings))
+        while True:
+            try:
+                for line in scheduler.tick(execute=execute):
+                    typer.echo(line if execute else f"[dry run] {line}")
+            except Exception as exc:                      # noqa: BLE001 - a looping schedule retries next tick
+                if not loop_seconds:
+                    raise
+                typer.echo(f"tick failed, retried in {loop_seconds:.0f}s: {exc!r}", err=True)
+            if not loop_seconds:
+                break
+            _time.sleep(loop_seconds)
+    except (ValueError, OSError, subprocess.CalledProcessError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
 
 @eval_app.command("compare")
@@ -2221,24 +2737,29 @@ def eval_compare(
 
 
 @eval_app.command("publish-set")
-def eval_publish_set(directory: str = typer.Argument(..., help="A directory build-set wrote")) -> None:
+def eval_publish_set(
+    directory: str = typer.Argument(..., help="A directory build-set wrote"),
+    publish_reviewed: bool = typer.Option(False, "--publish-reviewed",
+        help="Publish frozen public metadata and emit a withdrawn registration template"),
+) -> None:
     """Upload a set: its three files to the subnet bucket (R2_*); a platform
     preset's prompts.jsonl and set.json to the platform bucket too
-    (RELIQUARY_PLATFORM_*), which makes it orderable. An operator's set
-    (build-set --source) never goes there."""
+    (RELIQUARY_PLATFORM_*). Operator sets remain private by default.
+    --publish-reviewed emits public metadata and a withdrawn registration
+    template; it does not qualify or register the set."""
     import json
     from pathlib import Path
 
-    from reliquary.corpus.delivery import R2DeliverySink
     from reliquary.eval.storage import (
-        SetConflict, SubnetEvalStore, is_operator_set, publish_set,
+        PlatformEvalStore, SetConflict, SubnetEvalStore, is_operator_set, publish_set,
     )
 
     try:
         card = json.loads((Path(directory) / "set.json").read_text())
-        platform = None if is_operator_set(card) else R2DeliverySink.from_environment()
+        platform = (PlatformEvalStore.from_environment()
+                    if publish_reviewed or not is_operator_set(card) else None)
         answer = asyncio.run(publish_set(directory, platform=platform,
-                                         subnet=SubnetEvalStore()))
+                                         subnet=SubnetEvalStore(), publish_reviewed=publish_reviewed))
     except (ValueError, OSError, RuntimeError, SetConflict) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -2731,7 +3252,7 @@ def corpus_mine(
         mine_steps,
     )
     from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
-    from reliquary.protocol.signatures import sign_corpus_skip, sign_corpus_submission
+    from reliquary.protocol.signatures import sign_corpus_lease, sign_corpus_skip, sign_corpus_submission
     from reliquary.shared.modeling import load_tokenizer
     from reliquary.validator.corpus_service import prompt_job_for_spec, renderer_for_job
 
@@ -2795,12 +3316,14 @@ def corpus_mine(
         counts = mine_steps(
             job=job, hotkey=wallet.hotkey.ss58_address, client=client,
             generator=VllmGenerator(directory, job.sampling, proof, job.eos_token_id,
-                                    gpu_memory_utilization=gpu_memory_utilization),
+                                    gpu_memory_utilization=gpu_memory_utilization,
+                                    max_prompt_tokens=job.max_prompt_tokens),
             tokenizer=tokenizer, render=lambda i: renderer.initial_text(prompts.task_for(i)),
             sign=lambda body: sign_corpus_submission(wallet, body),
             # Full prompts are skipped, not generated for; an older validator
             # without the routes is mined as before.
             sign_skip=lambda body: sign_corpus_skip(wallet, body),
+            sign_lease=lambda body: sign_corpus_lease(wallet, body),
             max_steps=max_steps or None,
         )
     except CorpusMinerHalted as exc:
@@ -2859,9 +3382,9 @@ def corpus_mine_agentic(
         HttpCorpusClient,
         submits_scoped,
     )
-    from reliquary.miner.suite_episode import is_suite_episode, suite_support_refusal
+    from reliquary.miner.suite_episode import is_suite_episode, suite_support
     from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, toploc_proof
-    from reliquary.protocol.signatures import sign_corpus_submission
+    from reliquary.protocol.signatures import sign_corpus_lease, sign_corpus_submission
     from reliquary.shared.modeling import load_tokenizer
 
     proof = toploc_proof(ACTIVE_PROTOCOL_PROFILE)
@@ -2882,11 +3405,24 @@ def corpus_mine_agentic(
         typer.echo(f"error: job {job.job_id!r} is not an episode job; use `corpus mine`", err=True)
         raise typer.Exit(code=2)
     client.scoped_submit = submits_scoped(job)
-    sessions = None
+    from reliquary.eval.prompt_source import (
+        is_eval_source, parse_eval_source, register_eval_prompts,
+    )
+
+    if is_eval_source(job.prompt_source):
+        # An eval job's rows (suite or signed) come from the validator serving it,
+        # checked against the sha256 its manifest names, before its source is built:
+        # a miner has no sets directory nor eval bucket.
+        try:
+            register_eval_prompts(parse_eval_source(job.prompt_source), client.eval_prompts())
+        except (ValueError, CorpusJobSelectionError) as exc:
+            typer.echo(f"error: the eval job's prompts are unusable: {exc}", err=True)
+            raise typer.Exit(code=2) from exc
+    sessions = source = None
     signed = False
     if is_suite_episode(job.episode):
         # No verifiers, Docker or network: only the pinned environment wheel.
-        refusal = suite_support_refusal(job.episode)
+        refusal, source = suite_support(job)
         if refusal:
             typer.echo(f"error: refusing to mine: {refusal}", err=True)
             raise typer.Exit(code=4)
@@ -2929,12 +3465,13 @@ def corpus_mine_agentic(
     identity = Identity(hotkey=wallet.hotkey.ss58_address,
                         sign=lambda body: sign_corpus_submission(wallet, body),
                         episodes=episodes or None,
-                        sign_binding=lambda binding: wallet.hotkey.sign(binding).hex())
+                        sign_binding=lambda binding: wallet.hotkey.sign(binding).hex(),
+                        sign_lease=lambda body: sign_corpus_lease(wallet, body))
     counts = asyncio.run(run_agentic_miner(
         job=job, checkpoint_dir=directory, proof=proof, tokenizer=load_tokenizer(directory),
         identities=[identity], client=client, concurrency=concurrency, port=port,
         gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs,
-        sessions=sessions, max_live_per_job=max_live_per_job))
+        sessions=sessions, max_live_per_job=max_live_per_job, source=source))
     typer.echo({hotkey_: dict(c) for hotkey_, c in counts.items()})
     halted = [hotkey_ for hotkey_, c in counts.items()
               if c.get("halted") or c.get("identity_crashed")]
@@ -3262,6 +3799,21 @@ def _miner_requires_grader(env_names: list[str]) -> bool:
     # Miners never grade: opencode reward is validator-authoritative, so the
     # reference miner only generates rollouts. The gVisor grader runs on the
     # validator side. (Operators self-testing best-of-n run their own grader.)
+    return False
+
+
+def _envs_need_grader(env_names) -> bool:
+    """Whether a served env scores through the grader service: a sandboxed (code-executing) single-turn env.
+    Names the registry does not know (bridged episode envs, scored by their sandboxes) need none."""
+    from reliquary.environment.registry import get_environment_spec
+
+    for name in env_names:
+        try:
+            spec = get_environment_spec(str(name))
+        except Exception:
+            continue
+        if getattr(spec, "admission_resource_class", None) == "sandbox":
+            return True
     return False
 
 
@@ -3737,6 +4289,170 @@ def mine_episodes(
         raise typer.Exit(code=4) from exc
 
 
+async def _discover_rl_validator() -> tuple[str, str | None]:
+    """The first validator axon on the metagraph (``submitter.discover_validator``): (url, hotkey)."""
+    from reliquary.infrastructure.chain import NETUID, close_subtensor, get_metagraph, get_subtensor
+    from reliquary.miner.submitter import discover_validator
+
+    subtensor = await get_subtensor()
+    try:
+        return discover_validator(await get_metagraph(subtensor, NETUID))
+    finally:
+        await close_subtensor(subtensor)
+
+
+@app.command("miner-setups")
+def miner_setups(
+    state_dir: str = typer.Option("", "--state-dir", help="The validator's state dir (default: the active one)"),
+    hours: float = typer.Option(24.0, "--hours", help="Only instances heard from within this many hours"),
+    as_json: bool = typer.Option(False, "--json", help="Print the summary as JSON"),
+) -> None:
+    """The hardware opted-in miners declared (``mine-async --share-setup``): one line per hotkey."""
+    import json as _json
+
+    from reliquary.validator.miner_setup import DB_NAME, MinerSetupStore, summarize
+
+    if state_dir:
+        directory = Path(state_dir)
+    else:
+        from reliquary.validator.service import _validator_state_dir
+
+        directory = _validator_state_dir()
+    path = directory / DB_NAME
+    if not path.is_file():
+        typer.echo(f"no declarations yet ({path} missing)", err=True)
+        raise typer.Exit(code=1)
+    lines = summarize(MinerSetupStore(path).rows(), active_window_s=hours * 3600)
+    if as_json:
+        typer.echo(_json.dumps(lines, indent=2))
+        return
+    total = 0
+    for line in lines:
+        total += line["gpu_count"]
+        gpus = ", ".join(f"{n}x {name}" for name, n in sorted(line["gpus"].items())) or "no GPU"
+        note = f"  ({'; '.join(line['notes'])})" if line["notes"] else ""
+        typer.echo(f"{line['hotkey']}  {line['instances']} process(es)  {gpus}{note}")
+    typer.echo(f"{len(lines)} hotkey(s), {total} GPU(s)")
+
+
+@app.command("mine-async")
+def mine_async(
+    environments: str = typer.Option(
+        ..., "--environments", help="Comma-separated RL environments: single-turn ones on vLLM, the validator's "
+        "signed-episode ones (GET /rl/episodes) on the forced episode engine and the validator's sandboxes"),
+    validator_url: str = typer.Option(
+        "", "--validator-url", help="The RL validator's URL (default: the validator's axon on the metagraph)"),
+    validator_hotkey: str = typer.Option(
+        "", "--validator-hotkey", help="The RL validator's ss58 hotkey: leases and submissions are signed for it "
+        "(default: the discovered validator's)"),
+    wallet_name: str = typer.Option("default", help="Wallet name"),
+    hotkey: str = typer.Option("default", help="Hotkey name"),
+    wallet_path: str = typer.Option(os.getenv("BT_WALLET_PATH", ""), help="Optional wallet base path"),
+    base_model: str = typer.Option(
+        "", "--base-model", help="Local HF directory of the run's model: its config and tokenizer files "
+        "(default: the ones the published anchors carry, synced under the work dir)"),
+    work_dir: str = typer.Option("rl-async-work", "--work-dir",
+                                 help="Rebuilt weights, checkpoint downloads and the open-lease journal"),
+    initial_checkpoint: str = typer.Option(
+        "", "--initial-checkpoint",
+        help="HF directory of a published checkpoint to start from (else the first sync downloads an anchor)"),
+    initial_version: int = typer.Option(-1, "--initial-version", help="The version of --initial-checkpoint"),
+    weight_swap: str = typer.Option(
+        "push", "--weight-swap",
+        help="push: load new weights into the running vLLM; reload: write an HF directory and rebuild vLLM"),
+    lease_batch: int = typer.Option(8, "--lease-batch", min=1, help="Most prompts asked per lease request"),
+    max_open: int = typer.Option(64, "--max-open", min=1,
+                                 help="Most open leases (your GPU's ceiling); the validator's quota binds first"),
+    queue_groups: int = typer.Option(8, "--queue-groups", min=1,
+                                     help="Most leases waiting for generation (a waiting lease ages to expiry)"),
+    batch_groups: int = typer.Option(4, "--batch-groups", min=1,
+                                     help="Leases per generation batch; new weights are swapped between batches"),
+    gpu_memory_utilization: float = typer.Option(0.85, "--gpu-memory-utilization", help="vLLM's GPU share"),
+    max_num_seqs: int = typer.Option(256, "--max-num-seqs", help="vLLM's concurrent sequences"),
+    max_model_len: int = typer.Option(
+        0, "--max-model-len", min=0,
+        help="vLLM's context length (0: the model's, 262,144 for the 9B, which a 24 GB card cannot hold; "
+        "prompt + the run's max_new_tokens is enough)"),
+    quantization: str = typer.Option("", "--quantization", help="vLLM weight format, e.g. fp8 (default: bf16)"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="An in-process fake validator: no network, no wallet"),
+    fake_generator: bool = typer.Option(False, "--fake-generator", help="Generate fake tokens on CPU (tests)"),
+    generate_port: int = typer.Option(8013, "--generate-port",
+                                      help="Episode envs: loopback port of the forced generate endpoint"),
+    episode_max_num_seqs: int = typer.Option(64, "--episode-max-num-seqs",
+                                             help="Episode envs: the episode engine's concurrent sequences"),
+    episode_gpu_memory_utilization: float = typer.Option(
+        0.0, "--episode-gpu-memory-utilization",
+        help="Episode envs: the episode engine's GPU share (0: --gpu-memory-utilization; split the GPU when "
+             "single-turn and episode envs are mined by one process)"),
+    harness_env: list[str] = typer.Option(
+        [], "--harness-env", help="Episode envs: KEY=VALUE for the harness (repeatable; no secrets: ps shows them)"),
+    harness_env_file: str = typer.Option(
+        "", "--harness-env-file", help="Episode envs: file of KEY=VALUE lines for the harness (its secrets)"),
+    share_setup: bool = typer.Option(
+        False, "--share-setup", help="Opt in: send this process's GPUs (model, memory), CPU and RAM to the "
+        "validator at start and every 6 h. Informational only, never scored"),
+    setup_note: str = typer.Option("", "--setup-note", help="With --share-setup: a free note, e.g. '2 boxes 8xH100'"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+) -> None:
+    """Mine the asynchronous RL protocol: lease prompts within the measured quota, generate 16 rollouts per lease
+    on the latest checkpoint held (deltas downloaded in the background), and submit every leased group."""
+    from reliquary.miner.episode_mining import parse_harness_env
+    from reliquary.miner.rl_async import AsyncMinerConfig, run_async_miner
+
+    setup_logging(log_level)
+    names = tuple(name.strip() for name in environments.split(",") if name.strip())
+    episode_options = {"generate_port": generate_port, "max_num_seqs": episode_max_num_seqs,
+                       "gpu_memory_utilization": episode_gpu_memory_utilization or gpu_memory_utilization,
+                       "harness_env": parse_harness_env(harness_env, env_file=harness_env_file or None) or None}
+    if not dry_run and validator_url and not validator_hotkey:
+        typer.echo("error: --validator-url needs --validator-hotkey (or give neither: discovery)", err=True)
+        raise typer.Exit(code=2)
+    if not dry_run and not validator_url:
+        try:
+            validator_url, discovered = asyncio.run(_discover_rl_validator())
+        except Exception as exc:
+            typer.echo(f"error: no validator discovered on the metagraph ({exc}); pass --validator-url and "
+                       "--validator-hotkey", err=True)
+            raise typer.Exit(code=2) from exc
+        validator_hotkey = validator_hotkey or discovered or ""
+        if not validator_hotkey:
+            typer.echo("error: the discovered validator has no hotkey; pass --validator-hotkey", err=True)
+            raise typer.Exit(code=2)
+        typer.echo(f"validator discovered: {validator_url} ({validator_hotkey})")
+    try:
+        config = AsyncMinerConfig(environments=names, lease_batch=lease_batch, max_open=max_open,
+                                  queue_groups=queue_groups, batch_groups=batch_groups,
+                                  state_dir=str(Path(work_dir) / "state"))
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    wallet = None
+    if not dry_run:
+        import bittensor as bt
+
+        from reliquary.shared.log_levels import unmute_reliquary_loggers
+
+        unmute_reliquary_loggers()          # bittensor, imported after setup_logging, muted the miner's loggers
+        wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
+        if wallet_path:
+            wallet_kwargs["path"] = wallet_path
+        wallet = bt.Wallet(**wallet_kwargs)
+    try:
+        asyncio.run(run_async_miner(
+            config, validator_url=validator_url.rstrip("/"), validator_hotkey=validator_hotkey, wallet=wallet,
+            base_model_dir=base_model or None, work_dir=work_dir, initial_dir=initial_checkpoint or None,
+            initial_version=None if initial_version < 0 else initial_version, swap=weight_swap, dry_run=dry_run,
+            fake_generator=fake_generator, episode_options=episode_options,
+            share_setup=setup_note if share_setup else None,
+            engine_kwargs={"gpu_memory_utilization": gpu_memory_utilization, "max_num_seqs": max_num_seqs,
+                           "max_model_len": max_model_len or None, "quantization": quantization or None}))
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=4) from exc
+    except KeyboardInterrupt:
+        pass
+
+
 async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=None):
     """Bind the corpus submission route to the one job this task declares.
 
@@ -3878,12 +4594,14 @@ def validate(
         ),
     ),
     log_level: str = typer.Option("INFO", help="Log level"),
-    set_weights: bool = typer.Option(
-        False, "--set-weights/--no-set-weights",
-        help="Corpus tasks only: also set weights from this process. Off by default: the RL validator's setter already pays every task.",
+    set_weights: Optional[bool] = typer.Option(
+        None, "--set-weights/--no-set-weights",
+        help="Submit weights from this process. Defaults to on for RL, off for corpus tasks; required in --no-train mode.",
     ),
 ):
     """Run Reliquary validator (trainer mode by default; --no-train for weight-only)."""
+    if not train and set_weights is False:
+        raise typer.BadParameter("--no-set-weights requires --train")
     setup_logging(log_level)
     logger = logging.getLogger("reliquary.cli")
 
@@ -3982,7 +4700,7 @@ def validate(
                         jobs=[(c.entry, c.emission_cap) for c in corpus_configs],
                         wallet=wallet, netuid=netuid, signer_client=signer_client,
                         http_host=http_host, http_port=http_port,
-                        set_weights=set_weights,
+                        set_weights=bool(set_weights),
                     )
                 except (RuntimeError, ValueError) as exc:
                     logger.critical("%s; fix the declaration before starting this validator", exc)
@@ -4051,12 +4769,59 @@ def validate(
                         jobs=[(task_config.entry, task_config.emission_cap)],
                         wallet=wallet, netuid=netuid, signer_client=signer_client,
                         http_host=http_host, http_port=http_port,
-                        set_weights=set_weights,
+                        set_weights=bool(set_weights),
                     )
                 except (RuntimeError, ValueError) as exc:
                     logger.critical("%s; fix the declaration before starting this validator", exc)
                     raise typer.Exit(code=4) from exc
                 return
+
+            from reliquary.validator import corpus_periods as _periods
+            from reliquary.validator.rl_async_service import ASYNC, rl_mode
+
+            try:
+                async_mode = rl_mode() == ASYNC
+            except ValueError as exc:
+                logger.critical("%s", exc)
+                raise typer.Exit(code=2) from exc
+            declared_entry = getattr(task_config, "entry", None)
+            period_task = declared_entry is not None and _periods.is_period_task(declared_entry)
+            if async_mode:
+                # The async RL protocol: leases, submissions, the trainer link and pay by period, in one
+                # process without windows, batchers or a proof plane. Branch before any of them is built.
+                if declared_entry is None:
+                    logger.critical("RELIQUARY_RL_MODE=async needs a declared task (`reliquary tasks create "
+                                    "--rl-async`)")
+                    raise typer.Exit(code=4)
+                from reliquary.validator.rl_async_service import run_rl_async_validator
+
+                if _envs_need_grader(declared_entry.env_split or ()):
+                    _ensure_grader_running()        # code envs score through the sandboxed grader service
+
+                if set_weights is not False:
+                    from reliquary.validator.weight_only import WeightOnlyValidator
+
+                    threading.Thread(
+                        target=lambda: asyncio.run(WeightOnlyValidator(
+                            wallet=wallet, netuid=netuid, signer_client=signer_client).run()),
+                        name="weight-setter", daemon=True,
+                    ).start()
+                try:
+                    await run_rl_async_validator(
+                        wallet=wallet, netuid=netuid, signer_client=signer_client, http_host=http_host,
+                        http_port=http_port, entry=declared_entry, cap=task_config.emission_cap,
+                        checkpoint=checkpoint, subtensor=subtensor, external_ip=external_ip or None,
+                        external_port=external_port or None,
+                        load_kwargs=({"revision": DEFAULT_BASE_MODEL_REVISION}
+                                     if checkpoint == DEFAULT_BASE_MODEL else {}))
+                except (RuntimeError, ValueError) as exc:
+                    logger.critical("%s; fix the declaration or the async settings before starting", exc)
+                    raise typer.Exit(code=4) from exc
+                return
+            if period_task:
+                logger.critical("task %s is paid by period (an async RL task): start it with "
+                                "RELIQUARY_RL_MODE=async", task_config.task_id)
+                raise typer.Exit(code=4)
 
             # A service order's catalogue envs are built from the order at start; a task without a service
             # contract resolves its mix exactly as before.
@@ -4386,24 +5151,25 @@ def validate(
             # GRAIL verifier is holding) would stall set_weights too. The
             # weight setter's own subtensor (see WeightOnlyValidator.run)
             # plus its own loop here means neither side can block the other.
-            from reliquary.validator.weight_only import WeightOnlyValidator
+            if set_weights is not False:
+                from reliquary.validator.weight_only import WeightOnlyValidator
 
-            def _run_weight_setter() -> None:
-                try:
-                    worker = WeightOnlyValidator(
-                        wallet=wallet,
-                        netuid=netuid,
-                        signer_client=signer_client,
-                    )
-                    asyncio.run(worker.run())
-                except Exception:
-                    logger.exception("weight-setter thread crashed")
+                def _run_weight_setter() -> None:
+                    try:
+                        worker = WeightOnlyValidator(
+                            wallet=wallet,
+                            netuid=netuid,
+                            signer_client=signer_client,
+                        )
+                        asyncio.run(worker.run())
+                    except Exception:
+                        logger.exception("weight-setter thread crashed")
 
-            threading.Thread(
-                target=_run_weight_setter,
-                name="weight-setter",
-                daemon=True,
-            ).start()
+                threading.Thread(
+                    target=_run_weight_setter,
+                    name="weight-setter",
+                    daemon=True,
+                ).start()
             await service.run(subtensor)
         else:
             from reliquary.validator.weight_only import WeightOnlyValidator
@@ -4438,7 +5204,7 @@ def train_worker(
 ) -> None:
     """Detached trainer: consume R2 training payloads, publish checkpoints.
 
-    See docs/superpowers/specs/2026-08-21-detached-trainer-r2-design.md.
+    See docs/detached-trainer.md.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -4448,6 +5214,34 @@ def train_worker(
     from reliquary.trainer.cli import run_train_worker
 
     run_train_worker(shadow=shadow)
+
+
+@app.command("train-async")
+def train_async() -> None:
+    """Detached async trainer: train on the validator's buffer through the trainer link, publish one checkpoint
+    per step as deltas into reliquary-public (rl-async-design.md §4.7-4.8; ``RELIQUARY_RL_MODE=async`` validator).
+
+    Environment: RELIQUARY_RL_TRAINER_URL (the validator's trainer listener, RELIQUARY_RL_TRAINER_BIND on its side,
+    default 127.0.0.1:8889: a private address or an SSH tunnel, not the public port), RELIQUARY_RL_TRAINER_TOKEN,
+    RELIQUARY_RL_VALIDATOR_HOTKEY, R2_PUBLIC_*;
+    optional RELIQUARY_RL_BATCH_GROUPS, RELIQUARY_RL_STEPS_PER_CHECKPOINT, RELIQUARY_RL_ANCHOR_INTERVAL,
+    RELIQUARY_RL_HF_BACKUP_PREFIX + RELIQUARY_RL_HF_BACKUP_EVERY (+ _KEEP, _MILESTONE_EVERY),
+    RELIQUARY_RL_BASE_MODEL, RELIQUARY_TRAINER_BACKEND=fsdp2 under torchrun.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(threadName)s | %(name)s | %(levelname)s | %(message)s",
+    )
+    from reliquary.trainer.distributed import per_rank_triton_cache
+
+    per_rank_triton_cache()                 # before any kernel compiles
+    from reliquary.trainer.async_cli import run_async_train_worker
+
+    try:
+        run_async_train_worker()
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
 
 
 if __name__ == "__main__":

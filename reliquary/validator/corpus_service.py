@@ -46,6 +46,7 @@ from reliquary.corpus.admission import (
     skip_target,
 )
 from reliquary.corpus.checks import CheckResult, completion_digest
+from reliquary.corpus.eval_draw import attempt_digests, has_draw, slot_count, slot_key
 from reliquary.corpus.job import PROMPT_ORDER_MINER_WALK, JobError, JobSpec
 from reliquary.corpus.slots import OPEN_ENCODING, SlotLedger
 from reliquary.corpus.walk import CursorLedger, job_walk_index
@@ -57,6 +58,9 @@ from reliquary.infrastructure.corpus_job_store import (
 )
 from reliquary.protocol.corpus_submission import (
     MAX_RENDERED_PROMPT_CHARS,
+    CorpusLeaseReleaseRequest,
+    CorpusLeaseRequest,
+    CorpusLeaseResponse,
     CorpusRejectReason,
     CorpusSkipRequest,
     CorpusSkipResponse,
@@ -89,6 +93,13 @@ SKIP_SCOPED_PATH = "/corpus/jobs/{job_id}/skip"
 # Check before starting an episode: which of the job's prompts still have a
 # slot, whatever its prompt order (a free job has no walk for `next` to read).
 OPEN_PATH = "/corpus/open"
+# A draw job's light leases (``corpus.draw_leases``).
+LEASE_PATH = "/corpus/lease"
+LEASE_RELEASE_PATH = "/corpus/lease/release"
+LEASE_SCOPED_PATH = "/corpus/jobs/{job_id}/lease"
+LEASE_RELEASE_SCOPED_PATH = "/corpus/jobs/{job_id}/lease/release"
+# A lease request is fresh within this many seconds of its ``issued_at``; its nonce is single-use meanwhile.
+LEASE_REQUEST_SKEW_SECONDS = 120.0
 OPEN_SCOPED_PATH = "/corpus/jobs/{job_id}/open"
 # How long one computed open map answers every caller, and what a client or a
 # proxy in front may keep it: a miner acts on it for minutes anyway.
@@ -361,6 +372,11 @@ class ChatTemplatePromptRenderer:
         self._thinking = thinking
 
     def initial_text(self, task: EpisodeTask) -> str:
+        from reliquary.corpus.encoding import is_token_ids_text
+
+        if is_token_ids_text(task.prompt):
+            # A prompt given as token ids is rendered already: the ids are the whole prompt.
+            return task.prompt
         tokenizer = self._tokenizer() if callable(self._tokenizer) and not hasattr(
             self._tokenizer, "apply_chat_template"
         ) else self._tokenizer
@@ -391,17 +407,26 @@ class SingleTurnPromptRenderer:
 
 class AgenticSourceSpec:
     """What `resolve_prompt_source` returns for the agentic contract
-    environment: the job's `episode`, buildable into its SWE-smith rows."""
+    environment: the job's `episode`, buildable (`create(job)`) into its
+    SWE-smith rows. An eval job's rows (a signed job's: agentic eval jobs are
+    refused) are its set's references, read through the bridged env
+    (`agentic_swe.job_signed_source`)."""
 
     interaction_mode = "agentic"
 
     def __init__(self, episode: Any) -> None:
         self.episode = episode
 
-    def create(self):
+    def create(self, job: JobSpec):
         from reliquary.environment import agentic_swe
+        from reliquary.eval.rows import job_row_map
 
-        return agentic_swe.load_swe_source(self.episode.env.num_images)
+        try:
+            if job_row_map(job).is_identity:
+                return agentic_swe.load_swe_source(self.episode.env.num_images)
+            return agentic_swe.job_signed_source(job)
+        except ValueError as exc:
+            raise CorpusPromptSourceError(str(exc)) from exc
 
 
 class AgenticPromptJob:
@@ -433,30 +458,31 @@ class EpisodePromptRenderer:
 
 class SuiteSourceSpec:
     """What `resolve_prompt_source` returns for a suite episode job: the
-    registry environment it names, buildable into its tasks
-    (`reliquary.corpus.suite_episode.SuiteSource`)."""
+    registry environment it names, buildable (`create(job)`) into the job's
+    tasks (`reliquary.corpus.suite_episode.job_suite_source`)."""
 
     interaction_mode = "agentic"
 
     def __init__(self, episode: Any) -> None:
         self.episode = episode
 
-    def create(self):
-        from reliquary.corpus.suite_episode import suite_source
+    def create(self, job: JobSpec):
+        from reliquary.corpus.suite_episode import job_suite_source
 
         try:
-            return suite_source(self.episode)
+            return job_suite_source(job)
         except ValueError as exc:
             raise CorpusPromptSourceError(str(exc)) from exc
 
 
 def _resolve_suite(prompt_source: str, renderer_id: str | None, episode: Any) -> SuiteSourceSpec:
     from reliquary.corpus.suite_episode import suite_spec_refusal
+    from reliquary.eval.prompt_source import is_eval_source
 
-    if prompt_source != episode.env.name:
+    if prompt_source != episode.env.name and not is_eval_source(prompt_source):
         raise CorpusPromptSourceError(
-            f"a suite episode job draws its prompts from {episode.env.name!r}, "
-            f"not {prompt_source!r}")
+            f"a suite episode job draws its prompts from {episode.env.name!r} or an eval "
+            f"set, not {prompt_source!r}")
     if renderer_id is not None and renderer_id != episode.renderer:
         raise CorpusPromptSourceError(
             f"the job's renderer_id {renderer_id!r} is not its episode.renderer {episode.renderer!r}")
@@ -468,6 +494,7 @@ def _resolve_suite(prompt_source: str, renderer_id: str | None, episode: Any) ->
 
 def _resolve_agentic(prompt_source: str, renderer_id: str | None, episode: Any) -> AgenticSourceSpec:
     from reliquary.environment import agentic_swe
+    from reliquary.eval.prompt_source import is_eval_source
     from reliquary.protocol.agentic_source import AGENTIC_SWE_ENVIRONMENT
 
     if episode is not None and getattr(episode, "is_suite", False):
@@ -476,10 +503,10 @@ def _resolve_agentic(prompt_source: str, renderer_id: str | None, episode: Any) 
         raise CorpusPromptSourceError(
             f"prompt source {prompt_source!r} serves agentic episodes: a job reading it "
             "must declare `episode`")
-    if prompt_source != AGENTIC_SWE_ENVIRONMENT:
+    if prompt_source != AGENTIC_SWE_ENVIRONMENT and not is_eval_source(prompt_source):
         raise CorpusPromptSourceError(
-            f"a job with `episode` draws its prompts from {AGENTIC_SWE_ENVIRONMENT!r}, "
-            f"not {prompt_source!r}")
+            f"a job with `episode` draws its prompts from {AGENTIC_SWE_ENVIRONMENT!r} "
+            f"or an eval set, not {prompt_source!r}")
     if renderer_id is not None and renderer_id != episode.renderer:
         raise CorpusPromptSourceError(
             f"the job's renderer_id {renderer_id!r} is not its episode.renderer {episode.renderer!r}")
@@ -681,8 +708,10 @@ def prompt_job_for_spec(
         profile=profile,
         episode=job.episode,
     )
+    agentic = getattr(spec, "interaction_mode", None) == "agentic"
     try:
-        environment = spec.create()
+        # An episode job's source is its own: built from the job's row map.
+        environment = spec.create(job) if agentic else spec.create()
         rows = len(environment)
     except CorpusPromptSourceError:
         raise
@@ -701,7 +730,7 @@ def prompt_job_for_spec(
                if job.prompt_start else "")
             + f" but {job.prompt_source!r} has {rows}"
         )
-    if getattr(spec, "interaction_mode", None) == "agentic":
+    if agentic:
         return AgenticPromptJob(job, environment)
     if getattr(spec, "interaction_mode", None) == "episode":
         return EnvironmentPromptJob(job, environment)
@@ -930,23 +959,25 @@ def ledger_snapshot(
 
 
 async def record_prompt_failure(store: Any, job: JobSpec, prompt_index: int,
-                                submission_id: str, *,
+                                submission_id: str, *, slot: int | None = None, hotkey: str | None = None,
                                 attempts: int = DEFAULT_WRITE_ATTEMPTS) -> bool | None:
     """An eval job's submission failed its audit: record it in the ledger
     (idempotent per submission), which reopens the prompt's slot until its
     attempts run out. True: reopened; False: exhausted; None: already recorded.
+    ``slot`` and ``hotkey`` (a forced-draw job): the draw slot reopens with its own draw.
     Compare-and-swap against the route's own writes, which retry on conflict."""
     from reliquary.eval.prompt_source import is_eval_source
 
-    if not is_eval_source(job.prompt_source):
-        # Any other job's slots are consumed for good, generation orders included.
-        raise ValueError(f"job {job.job_id!r} is not an eval job: its slots never reopen")
+    if not (is_eval_source(job.prompt_source) or has_draw(job)):
+        # Any other job's slots are consumed for good: a free-sampling generation order's included. A draw
+        # job's failed slot reopens with its own draw, so what it delivers never depends on what failed.
+        raise ValueError(f"job {job.job_id!r} is neither an eval nor a draw job: its slots never reopen")
     for _ in range(attempts):
         snapshot, etag = await store.read_ledgers(job.job_id)
         state = await asyncio.to_thread(rebuild_ledgers, job, snapshot)
         if snapshot and state.schema not in (LEDGER_SCHEMA_V2, LEDGER_SCHEMA_V3):
             raise LedgerSnapshotError(f"job {job.job_id!r} ledgers are not v2")
-        outcome = state.slots.record_failure(prompt_index, submission_id)
+        outcome = state.slots.record_failure(prompt_index, submission_id, slot=slot, hotkey=hotkey)
         if outcome is None:
             return None
         after = ledger_snapshot(state.slots, state.cursors, state.pending, state.segments,
@@ -958,6 +989,26 @@ async def record_prompt_failure(store: Any, job: JobSpec, prompt_index: int,
         return outcome
     raise CorpusStoreConflict(f"job {job.job_id!r}: the failure of {submission_id[:12]} "
                               "kept losing its ledger race")
+
+
+def draw_failure_slot(record: Mapping[str, Any]) -> dict[str, Any]:
+    """The draw slot (the submission's cursor) and hotkey a failed forced-draw record names, for
+    ``record_prompt_failure``; empty for a record that lacks them (it then reopens capacity only)."""
+    cursor, hotkey = record.get("cursor"), record.get("hotkey")
+    if isinstance(cursor, bool) or not isinstance(cursor, int) or not isinstance(hotkey, str) or not hotkey:
+        return {}
+    return {"slot": cursor, "hotkey": hotkey}
+
+
+def draw_seen_keys(prompt_index: int, cursor: int, digests: Sequence[str],
+                   extra: Sequence[str] = ()) -> Callable[[SlotLedger], list[str]]:
+    """What a forced-draw submission's accept adds to the seen set, at the attempt its slot is at in the turn:
+    its salted completion digests, ``extra`` keys (a sandbox session's) and the slot key."""
+    def keys(slots: SlotLedger) -> list[str]:
+        attempt = slots.slot_attempt(prompt_index, cursor)
+        return [*attempt_digests(prompt_index, cursor, attempt, digests), *extra,
+                slot_key(prompt_index, cursor, attempt)]
+    return keys
 
 
 def seal_chunks(digests: Iterable[str], segment_max: int = SEGMENT_MAX) -> list[list[str]]:
@@ -1103,8 +1154,9 @@ class _TurnEntry:
     # Decides against (slots, cursors, seen), mutating the ledgers as `admit`
     # and `skip` do; returns the verdict.
     decide: Callable[[SlotLedger, CursorLedger, AbstractSet[str]], Verdict]
-    # What an accept adds to the seen set: a submission's digests, a skip none.
-    digests: Sequence[str]
+    # What an accept adds to the seen set: a submission's digests, a skip none. A forced-draw submission's depend
+    # on its slot's attempt, read in the turn: a callable of the slot ledger (``draw_seen_keys``).
+    digests: Sequence[str] | Callable[[SlotLedger], Sequence[str]]
     future: asyncio.Future
     enqueued: float
     # Run once the verdict is in, by a task the HTTP handler cannot cancel.
@@ -1177,7 +1229,7 @@ def plan_turn(
             if verdict.accepted:
                 # `admit` reads `seen`, it does not grow it: recording what was
                 # paid for is the caller's half of the duplicate check.
-                pending.update(entry.digests)
+                pending.update(entry.digests(slots) if callable(entry.digests) else entry.digests)
                 ref = getattr(entry, "record_ref", None)
                 if ref is not None:
                     if ref["submission_id"] in record_refs and record_refs[ref["submission_id"]] != ref:
@@ -1561,6 +1613,7 @@ def build_corpus_router(
     renderer: Renderer,
     verify_signature,
     verify_skip_signature=None,
+    verify_lease_signature=None,
     prompt_job_for=prompt_job_for_spec,
     max_write_attempts: int = DEFAULT_WRITE_ATTEMPTS,
     records=None,
@@ -1625,6 +1678,20 @@ def build_corpus_router(
     active_records: collections.Counter = collections.Counter()
     announced: set[str] = set()
     record_lock = asyncio.Lock()
+
+    # A draw job's light leases (``corpus.draw_leases``), in this process: a restart drops them.
+    leases_by_job: dict[str, Any] = {}
+    lease_nonces: dict[str, float] = {}
+    # The taken keys of the ledger version last leased from: rebuilt once per version, not per request.
+    lease_seen: dict[str, Any] = {}
+
+    def _leases(job: JobSpec):
+        from reliquary.corpus.draw_leases import DrawLeases
+
+        leases = leases_by_job.get(job.job_id)
+        if leases is None:
+            leases = leases_by_job[job.job_id] = DrawLeases(job)
+        return leases
 
     def announce(sid: str) -> None:
         if sid not in announced and on_accepted is not None:
@@ -1936,6 +2003,16 @@ def build_corpus_router(
         # same compare-and-swap that consumes the slot (admit refuses it when seen).
         session_key = getattr(episode_facts, "session_key", "") or None
         seen_keys = [*digests, session_key] if session_key else list(digests)
+        drawn = has_draw(job)
+        if drawn:
+            # A forced-draw eval job: the draw slot is taken at its current attempt in the same compare-and-swap,
+            # and its digests are salted with that attempt so an honest redo of a failed slot is no duplicate.
+            seen_keys = draw_seen_keys(request.prompt_index, request.cursor, digests,
+                                       [session_key] if session_key else ())
+            # Another hotkey's live lease on this slot: it is decoding it (``corpus.draw_leases``).
+            if _leases(job).refusal(request.miner_hotkey, request.prompt_index, request.cursor) is not None:
+                return _refuse(CorpusRejectReason.DRAW_SLOT_LEASED,
+                               {"prompt_index": request.prompt_index, "cursor": request.cursor})
         timing["checks"] = time.perf_counter() - started - timing["job_read"]
 
         record = None
@@ -1974,7 +2051,9 @@ def build_corpus_router(
                 checkpoint_sha256=request.checkpoint_sha256,
                 token_counts=token_counts,
                 last_token_ids=last_token_ids,
-                digests=digests,
+                digests=(attempt_digests(request.prompt_index, request.cursor,
+                                         slots.slot_attempt(request.prompt_index, request.cursor), digests)
+                         if drawn else digests),
                 slots=slots,
                 cursors=cursors,
                 seen=seen,
@@ -2053,6 +2132,9 @@ def build_corpus_router(
             raise HTTPException(status_code=503, detail="corpus_ledger_contention") from None
         written = turn.verdict
 
+        if written is not None and drawn and (written.accepted or written.reason == CorpusRejectReason.DRAW_SLOT_TAKEN.value):
+            # The slot is taken: its leases end.
+            _leases(job).settle(request.prompt_index, request.cursor)
         if written is not None:
             if record is not None and not written.accepted:
                 # Concurrent retries of the same signed request can share a
@@ -2180,6 +2262,8 @@ def build_corpus_router(
                     "encoding": OPEN_ENCODING,
                     "open": base64.b64encode(bitmap).decode("ascii"),
                 }
+                if has_draw(job):
+                    body["draw_slots"] = await asyncio.to_thread(_taken_draw_slots, job, state)
             open_cache.update(at=_open_clock(), state=state, body=body)
             return _open_response(body)
 
@@ -2547,6 +2631,31 @@ def build_corpus_router(
         logger.error("corpus ledgers for %s are unreadable: %s", job_id, exc)
         return HTTPException(status_code=500, detail="corpus_ledger_corrupt")
 
+    def _taken_draw_slots(job: JobSpec, state: LedgerState) -> dict:
+        """A forced-draw job's taken draw slots, by prompt with any: a hint so miners do not generate a taken
+        sample. Read from the pending set and the segments already in memory, never loading one (``ensure`` is
+        the submit path's), so a slot sealed in a segment not yet read here may be missing."""
+        seen = set(state.pending)
+        for ref in state.segments:
+            seen.update(seen_index._contents.get(ref.id, ()))
+        slots = slot_count(job)
+        taken, cursors = {}, {}
+        ledger = state.slots
+        for prompt in range(job.prompt_start, job.prompt_end):
+            open_cursors = ledger.draw_cursors(prompt, slots)
+            if open_cursors > slots:
+                cursors[str(prompt)] = open_cursors
+            filled = [slot for slot in range(open_cursors)
+                      if ledger.slot_exhausted(prompt, slot)
+                      or slot_key(prompt, slot, ledger.slot_attempt(prompt, slot)) in seen]
+            if filled:
+                taken[str(prompt)] = filled
+        hint = {"slots": slots, "taken": taken}
+        if cursors:
+            # Prompts with failures recorded before slots were (``SlotLedger.draw_cursors``).
+            hint["cursors"] = cursors
+        return hint
+
     async def _ensure_seen(refs: Sequence[SegmentRef]) -> None:
         """Load the segments a ledger version names: a missing or altered one
         is the named 500, a bucket that cannot answer the retryable 503."""
@@ -2584,6 +2693,86 @@ def build_corpus_router(
             return None
         return state.slots.remaining(prompt_index)
 
+    def _lease_refused(reason, detail: dict | None = None) -> CorpusLeaseResponse:
+        return CorpusLeaseResponse(leased=False, reason=str(getattr(reason, "value", reason)), detail=detail or {})
+
+    async def _lease_gate(request) -> CorpusLeaseResponse | None:
+        """The job, the signature and the hotkey gates of a lease or a release; None when they pass."""
+        if request.job_id != job_id:
+            return _lease_refused(CorpusRejectReason.JOB_NOT_SERVED, {"job_id": request.job_id, "serves": [job_id]})
+        if verify_lease_signature is None:
+            return _lease_refused(CorpusRejectReason.SIGNATURE_UNVERIFIABLE)
+        try:
+            verified = verify_lease_signature(request)
+        except CorpusSignatureUnavailable:
+            return _lease_refused(CorpusRejectReason.SIGNATURE_UNVERIFIABLE)
+        if not verified:
+            return _lease_refused(CorpusRejectReason.BAD_SIGNATURE)
+        gated = await _hotkey_refusal(request.miner_hotkey)
+        return _lease_refused(gated) if gated is not None else None
+
+    async def lease_corpus(request: CorpusLeaseRequest) -> CorpusLeaseResponse:
+        """A light lease on one of this draw job's free slots (``corpus.draw_leases``)."""
+        now = time.time()
+        if abs(now - request.issued_at) > LEASE_REQUEST_SKEW_SECONDS:
+            return _lease_refused("stale_request", {"now": int(now)})
+        for nonce in [n for n, until in lease_nonces.items() if until <= now]:
+            del lease_nonces[nonce]
+        if request.nonce in lease_nonces:
+            return _lease_refused("replayed_request")
+        refused = await _lease_gate(request)
+        if refused is not None:
+            return refused
+        lease_nonces[request.nonce] = now + 2 * LEASE_REQUEST_SKEW_SECONDS
+        job = await _read_job_checked()
+        if job is None:
+            return _lease_refused(CorpusRejectReason.JOB_UNKNOWN, {"job_id": job_id})
+        if not has_draw(job):
+            return _lease_refused("not_a_draw_job")
+        state = await _read_state(job)
+        if state.slots.is_complete:
+            return _lease_refused(CorpusRejectReason.JOB_COMPLETE)
+
+        def grant():
+            from reliquary.corpus.draw_leases import free_draw_slots
+
+            if lease_seen.get("state") is not state:
+                built = set(state.pending)
+                for ref in state.segments:
+                    built.update(seen_index._contents.get(ref.id, ()))
+                lease_seen.update(state=state, seen=built)
+            seen = lease_seen["seen"]
+            ledger = state.slots
+
+            def taken(prompt: int, slot: int) -> bool:
+                return slot_key(prompt, slot, ledger.slot_attempt(prompt, slot)) in seen
+
+            return _leases(job).grant(request.miner_hotkey, free_draw_slots(job, ledger, taken))
+
+        lease = await asyncio.to_thread(grant)
+        if lease is None:
+            return _lease_refused("no_free_slot")
+        if isinstance(lease, str):
+            return _lease_refused(lease)
+        return CorpusLeaseResponse(leased=True, reason="accepted", **lease.to_wire())
+
+    async def release_corpus_lease(request: CorpusLeaseReleaseRequest) -> CorpusLeaseResponse:
+        refused = await _lease_gate(request)
+        if refused is not None:
+            return refused
+        job = await _read_job_checked()
+        if job is None:
+            return _lease_refused(CorpusRejectReason.JOB_UNKNOWN, {"job_id": job_id})
+        released = _leases(job).release(request.miner_hotkey, request.lease_id)
+        return CorpusLeaseResponse(leased=False, reason="released" if released else "lease_unknown")
+
+    # Mounted like submit when this router serves alone (tests, a single job); the jobs router dispatches to them.
+    router.add_api_route(LEASE_PATH, lease_corpus, methods=["POST"], response_model=CorpusLeaseResponse)
+    router.add_api_route(LEASE_RELEASE_PATH, release_corpus_lease, methods=["POST"],
+                         response_model=CorpusLeaseResponse)
+    router.lease_corpus = lease_corpus
+    router.release_corpus_lease = release_corpus_lease
+    router.draw_leases = leases_by_job
     router.slots_remaining = slots_remaining
     # The handlers themselves, so `build_corpus_jobs_router` can dispatch to
     # this job without a second copy of any of them.
@@ -2768,6 +2957,16 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
         async with routes.admission(job_id) as served:
             return await served.skip_corpus(request)
 
+    @router.post(LEASE_SCOPED_PATH, response_model=CorpusLeaseResponse)
+    async def lease_corpus_scoped(job_id: str, request: CorpusLeaseRequest) -> CorpusLeaseResponse:
+        async with routes.admission(job_id) as served:
+            return await served.lease_corpus(request)
+
+    @router.post(LEASE_RELEASE_SCOPED_PATH, response_model=CorpusLeaseResponse)
+    async def release_corpus_lease_scoped(job_id: str, request: CorpusLeaseReleaseRequest) -> CorpusLeaseResponse:
+        async with routes.admission(job_id) as served:
+            return await served.release_corpus_lease(request)
+
     @router.post(SUBMIT_SCOPED_PATH, response_model=CorpusSubmissionResponse)
     async def submit_corpus_scoped(
         job_id: str, request: CorpusSubmissionRequest
@@ -2812,6 +3011,30 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
         async with routes.admission(request.job_id) as target:
             return await target.skip_corpus(request)
 
+    async def _lease_target(request):
+        if request.job_id in routes.retired:
+            raise HTTPException(status_code=410, detail=JOB_RETIRED)
+        if request.job_id not in routes.routers:
+            return None
+        return request.job_id
+
+    @router.post(LEASE_PATH, response_model=CorpusLeaseResponse)
+    async def lease_corpus_legacy(request: CorpusLeaseRequest) -> CorpusLeaseResponse:
+        # Dispatched on the body, as submit is.
+        if await _lease_target(request) is None:
+            return CorpusLeaseResponse(leased=False, reason=CorpusRejectReason.JOB_NOT_SERVED.value,
+                                       detail={"job_id": request.job_id, "serves": routes.open_jobs()})
+        async with routes.admission(request.job_id) as target:
+            return await target.lease_corpus(request)
+
+    @router.post(LEASE_RELEASE_PATH, response_model=CorpusLeaseResponse)
+    async def release_corpus_lease_legacy(request: CorpusLeaseReleaseRequest) -> CorpusLeaseResponse:
+        if await _lease_target(request) is None:
+            return CorpusLeaseResponse(leased=False, reason=CorpusRejectReason.JOB_NOT_SERVED.value,
+                                       detail={"job_id": request.job_id, "serves": routes.open_jobs()})
+        async with routes.admission(request.job_id) as target:
+            return await target.release_corpus_lease(request)
+
     @router.post(SUBMIT_PATH, response_model=CorpusSubmissionResponse)
     async def submit_corpus(request: CorpusSubmissionRequest) -> CorpusSubmissionResponse:
         # As a single job's route does: refused before any store is touched.
@@ -2841,6 +3064,10 @@ __all__ = [
     "NEXT_SCOPED_PATH",
     "OPEN_CACHE_SECONDS",
     "OPEN_MAX_PROMPTS",
+    "LEASE_PATH",
+    "LEASE_RELEASE_PATH",
+    "LEASE_RELEASE_SCOPED_PATH",
+    "LEASE_SCOPED_PATH",
     "OPEN_PATH",
     "OPEN_SCOPED_PATH",
     "SKIP_PATH",

@@ -32,7 +32,9 @@ DEADLINE_RETRIES = 3
 
 
 class LocalEpisodeGrader(CorpusGrader):
-    def __init__(self, *, job, records, replayer, **kwargs) -> None:
+    def __init__(self, *, job, records, replayer, source, **kwargs) -> None:
+        """``source`` is the job's ``SuiteSource`` (the intake's): the task a
+        row replays is looked up through its row map."""
         # As many grades in flight as there are replay workers: more would
         # only queue in the pool (``GRADE_CONCURRENCY`` is sized for remote
         # executors), and the intake shares that pool.
@@ -40,6 +42,7 @@ class LocalEpisodeGrader(CorpusGrader):
         super().__init__(job=job, records=records, dispatcher=None, renderer=None, source=None,
                          params=None, **kwargs)
         self._replayer = replayer
+        self._suite_source = source
         self._deadline_misses: dict[str, int] = {}
 
     def status(self) -> dict:
@@ -66,8 +69,8 @@ class LocalEpisodeGrader(CorpusGrader):
                 "replay_certified": False, "graded_at": self._clock()}, regrade=regrade)
         trajectory = record["completions"][0]
         outcome = await self._replayer.areplay(self._job.episode.env.name, **replay_kwargs(
-            self._job, prompt_index=record["prompt_index"], prompt_ids=trajectory["prompt_tokens"],
-            tokens=trajectory["tokens"],
+            self._job, self._suite_source, prompt_index=record["prompt_index"],
+            prompt_ids=trajectory["prompt_tokens"], tokens=trajectory["tokens"],
             spans=[(turn["start"], turn["end"]) for turn in trajectory["turns"]],
             stop=trajectory["stop"]))
         # A pool that cannot answer (``ReplayUnavailable``) raises: logged and

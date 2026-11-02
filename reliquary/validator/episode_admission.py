@@ -35,7 +35,7 @@ from collections.abc import Collection
 from dataclasses import dataclass, field
 
 from reliquary_sandbox.attest import GRADING_GRACE_S, Expected, Reason, verify_transcript
-from reliquary_sandbox.observation import TOOLS_VERSIONS, Refuse, plan_call, render_observation, sent_positions
+from reliquary_sandbox.observation import TOOLS_VERSIONS, Refuse, plan_call, sent_positions
 
 from reliquary.constants import CHALLENGE_K, T_PROTO
 from reliquary.corpus.checks import (
@@ -202,22 +202,11 @@ class EpisodeGroupChecker:
                             engagement=rl_engagement(precommit.window, precommit.sha256, seed),
                             env=policy.sandbox_env, split=policy.split, index=precommit.task_index,
                             checkpoint=precommit.checkpoint, seen_session_ids=seen, require_graded=True)
-        result = verify_transcript(episode.get("transcript"), directory, token_verifier, expected)
-        if not result.ok:
-            reasons = [reason.value for reason in result.reasons]
-            # A milder reason only when it is the whole story: any other failure is a forged transcript.
-            mapped = {_TRANSCRIPT_REASONS.get(reason) for reason in result.reasons}
-            if len(mapped) == 1 and None not in mapped:
-                wire, stage = mapped.pop()
-                return EpisodeRefusal(wire, stage, {**where, "reasons": reasons})
-            return EpisodeRefusal(RejectReason.REWARD_MISMATCH, "episode_transcript", {**where, "reasons": reasons})
+        result = verified_transcript(policy, episode.get("transcript"), expected, directory=directory,
+                                     token_verifier=token_verifier, received=received, where=where)
+        if isinstance(result, EpisodeRefusal):
+            return result
         claims, opened, final = result.claims, result.open, result.final
-        deadline = claims.expires_at + GRADING_GRACE_S
-        if received > deadline:
-            return EpisodeRefusal(RejectReason.PRECOMMIT_EXPIRED, "episode_deadline", {**where, "deadline": deadline})
-        if (opened.tools_version not in TOOLS_VERSIONS or tuple(opened.tools) != tuple(policy.tools)
-                or opened.env_package != policy.env_package):
-            return EpisodeRefusal(RejectReason.REWARD_MISMATCH, "episode_record0", where)
         return _Verified(commit=commit, stop=episode.get("stop"), tokens=tokens, spans=spans, claims=claims,
                          opened=opened, final=final, calls=tuple(result.calls))
 
@@ -237,16 +226,53 @@ class EpisodeGroupChecker:
         return None
 
 
+def verified_transcript(policy, transcript, expected, *, directory, token_verifier, received: float,
+                        where: dict | None = None):
+    """Steps 4-6 of one episode (the window admission's and the async lease path's): ``verify_transcript`` with
+    every binding ``expected`` names, the paid-session snapshot and a graded final; the grading deadline on this
+    validator's clock; record 0's tools version, tools and env package. The verification result, or the
+    refusal."""
+    where = dict(where or {})
+    result = verify_transcript(transcript, directory, token_verifier, expected)
+    if not result.ok:
+        reasons = [reason.value for reason in result.reasons]
+        # A milder reason only when it is the whole story: any other failure is a forged transcript.
+        mapped = {_TRANSCRIPT_REASONS.get(reason) for reason in result.reasons}
+        if len(mapped) == 1 and None not in mapped:
+            wire, stage = mapped.pop()
+            return EpisodeRefusal(wire, stage, {**where, "reasons": reasons})
+        return EpisodeRefusal(RejectReason.REWARD_MISMATCH, "episode_transcript", {**where, "reasons": reasons})
+    deadline = result.claims.expires_at + GRADING_GRACE_S
+    if received > deadline:
+        return EpisodeRefusal(RejectReason.PRECOMMIT_EXPIRED, "episode_deadline", {**where, "deadline": deadline})
+    opened = result.open
+    if (opened.tools_version not in TOOLS_VERSIONS or tuple(opened.tools) != tuple(policy.tools)
+            or opened.env_package != policy.env_package):
+        return EpisodeRefusal(RejectReason.REWARD_MISMATCH, "episode_record0", where)
+    return result
+
+
 def episode_shape_refusal(policy, renderer, *, prompt_ids, tokens, spans, stop, calls, opened, final,
-                          min_chunk_tokens: int = MIN_CHUNK_TOKENS) -> EpisodeRefusal | None:
+                          min_chunk_tokens: int = MIN_CHUNK_TOKENS, lease: bool = False) -> EpisodeRefusal | None:
     """Steps 7-9 of one episode, pure and GPU-free: the validator's admission and the miner (before it
     submits) run this one definition. ``tokens`` start with ``prompt_ids`` (the validator's own render);
     ``spans`` are absolute; ``calls``, ``opened`` and ``final`` are the verified transcript's call bodies,
     record 0 and final body (``verify_transcript``). Returns the refusal (its detail without the rollout
-    index) or None."""
+    index) or None.
+
+    ``lease``: an async RL lease's episode. No span proof is made for it (the trainer's forward and the audits
+    judge every model position), so the proof's shape rules (short turns, the model-token minimum) do not apply;
+    it is never exported, so neither do the export rules (``parse_signed_trajectory(canonical=False)``); and a last
+    turn cut at the per-turn cap is admitted as ``context_length``. A lease takes all its episodes, so what the
+    draw led the model to write must not refuse the lease."""
+    from reliquary.corpus.trajectory_parse import STOP_FORMAT_ERROR
+
     offset = len(prompt_ids)
     relative = [(start - offset, end - offset) for start, end in spans]
     completion = tokens[offset:]
+    if stop == STOP_FORMAT_ERROR and not lease:
+        return EpisodeRefusal(RejectReason.BAD_TERMINATION, "episode_termination",
+                              {"check": "bad_stop", "stop": stop, "why": "a format_error stop is a lease's only"})
     structure = check_turn_spans(relative, len(completion), policy.max_turns)
     if not structure.ok:
         return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_turns",
@@ -254,15 +280,16 @@ def episode_shape_refusal(policy, renderer, *, prompt_ids, tokens, spans, stop, 
     try:
         parse_signed_trajectory(renderer, prompt_ids=prompt_ids, tokens=completion, spans=relative,
                                 stop=stop, max_turns=policy.max_turns, calls=list(calls),
-                                offered=opened.tools, final=final)
+                                offered=opened.tools, final=final, canonical=not lease)
     except TrajectoryRefused as refused:
-        return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_parse", {"check": refused.reason})
+        return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_parse",
+                              {"check": refused.reason, **({"detail": refused.detail} if refused.detail else {})})
     except (ValueError, TypeError, KeyError, IndexError) as error:
         # The renderer on miner-chosen tokens: a refusal, never an exception out of admission.
         return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_parse", {"check": type(error).__name__})
-    checks = (
+    checks = (() if lease else (
         (RejectReason.BAD_TOKENS, "episode_turns",
-         lambda: check_short_turns(relative, min_chunk_tokens)),
+         lambda: check_short_turns(relative, min_chunk_tokens)),)) + (
         (RejectReason.BAD_TOKENS, "episode_length",
          lambda: check_turn_budget(relative, prompt_len=offset, length=len(completion),
                                    max_tokens_per_turn=policy.max_tokens_per_turn,
@@ -275,11 +302,16 @@ def episode_shape_refusal(policy, renderer, *, prompt_ids, tokens, spans, stop, 
     )
     for wire, stage, run in checks:
         outcome = run()
+        if (not outcome.ok and stop == STOP_FORMAT_ERROR and outcome.reason == "bad_termination"
+                and outcome.detail.get("turn") == len(relative) - 1):
+            # The malformed last turn of a format_error episode ends how the model ended it (the turns before it
+            # were checked first and passed); the parse checked it is malformed.
+            continue
         if not outcome.ok:
             return EpisodeRefusal(wire, stage, {"check": outcome.reason, "detail": dict(outcome.detail)})
     try:
         why = _limit_not_reached(policy, renderer, tokens=tokens, spans=spans, stop=stop, calls=tuple(calls),
-                                 opened=opened)
+                                 opened=opened, lease=lease)
     except (ValueError, TypeError, KeyError, IndexError) as error:
         return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_parse", {"check": type(error).__name__})
     if why is not None:
@@ -287,16 +319,16 @@ def episode_shape_refusal(policy, renderer, *, prompt_ids, tokens, spans, stop, 
                               {"check": "bad_stop", "stop": stop, "why": why})
     # Away from temperature 1 the proof's log-prob check is required, and it needs CHALLENGE_K model tokens.
     model_tokens = sum(end - start for start, end in relative)
-    if T_PROTO != 1.0 and model_tokens < CHALLENGE_K:
+    if not lease and T_PROTO != 1.0 and model_tokens < CHALLENGE_K:
         return EpisodeRefusal(RejectReason.BAD_TOKENS, "episode_length",
                               {"check": "too_few_model_tokens", "model_tokens": model_tokens, "min": CHALLENGE_K})
     return None
 
 
-def _limit_not_reached(policy, renderer, *, tokens, spans, stop, calls, opened) -> str | None:
+def _limit_not_reached(policy, renderer, *, tokens, spans, stop, calls, opened, lease: bool = False) -> str | None:
     """Why a ``context_length`` / ``max_turns`` stop is not a limit the harness really hit, or None.
     Runs after ``parse_signed_trajectory`` (the last turn's sent calls are the transcript's last call
-    records, in order) and the termination check."""
+    records, in order) and the termination check. ``lease``: a last turn cut at the per-turn cap is a limit."""
     if stop == "max_turns":
         return None if len(spans) == policy.max_turns else "fewer model turns than max_turns"
     if stop != "context_length":
@@ -305,6 +337,9 @@ def _limit_not_reached(policy, renderer, *, tokens, spans, stop, calls, opened) 
     if end == policy.max_episode_tokens:                # span length == max_episode_tokens - start (absolute)
         return None                                     # (a) the turn ran to the EPISODE cap, not a per-turn cap
     last = tokens[start:end]
+    if (lease and last and last[-1] not in renderer.stop_ids
+            and end - start == min(policy.max_tokens_per_turn, policy.max_episode_tokens - start)):
+        return None                                     # (c) a lease's turn ran to the per-turn cap
     if not last or last[-1] != renderer.terminator_id:
         return "the last turn neither reached the episode cap nor ended on the turn terminator"
     pairs = list(renderer.tool_calls(last))
@@ -313,8 +348,11 @@ def _limit_not_reached(policy, renderer, *, tokens, spans, stop, calls, opened) 
     plans = [plan_call(name, arguments, opened.tools) for name, arguments in pairs]
     sends = sum(1 for position in sent_positions(plans) if position is not None)
     records = iter(calls[len(calls) - sends:] if sends else ())
-    observations = [plan.observation if isinstance(plan, Refuse) else render_observation(next(records).to_dict())
-                     for plan in plans]
+    from reliquary.corpus.signed_parse import _observation, _refusal
+
+    observations = [_refusal(renderer, pair, plan) if isinstance(plan, Refuse)
+                    else _observation(renderer, next(records).to_dict())
+                    for pair, plan in zip(pairs, plans)]
     following = renderer.next_prompt(tokens[:start], last, observations)
     if following is not None and len(following) > policy.max_episode_tokens:
         return None                                     # (b) the observations overflow the episode
@@ -349,4 +387,4 @@ def finish_prepared(prepared, facts: EpisodeGroupFacts, contract) -> None:
 
 
 __all__ = ["EpisodeGroupChecker", "EpisodeGroupFacts", "EpisodeRefusal", "episode_shape_refusal",
-           "finish_prepared"]
+           "finish_prepared", "verified_transcript"]

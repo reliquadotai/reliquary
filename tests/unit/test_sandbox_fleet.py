@@ -50,6 +50,132 @@ def test_a_fresh_signed_heartbeat_makes_a_machine_eligible(tmp_path):
     assert fleet.pick(now=NOW, **PICK) == Placement(MACHINE, ADDRESS)
 
 
+@pytest.mark.parametrize("scope,additional,expected", [
+    (None, None, ("m-a", "m-b")), ({"m-b"}, None, ("m-b",)),
+    (set(), None, ()), ({"unknown"}, None, ()), ({"m-b", "unknown"}, None, ()),
+    (None, {"m-b"}, ("m-b",)), ({"m-a", "m-b"}, {"m-b"}, ("m-b",)),
+    ({"m-a"}, {"m-b"}, ()), ({"m-b"}, set(), ()),
+    ({"m-b"}, {"m-b", "unknown"}, ()), ({"m-b", "unknown"}, {"m-b"}, ()),
+])
+def test_machine_scope_limits_polling_heartbeat_writes_and_all_admission_capacity(tmp_path, scope, additional, expected):
+    one, two = signer(tmp_path, "a", "ka"), signer(tmp_path, "b", "kb")
+    documents = [machine_document(one, machine_id="m-a", address="http://a:1"),
+                 machine_document(two, machine_id="m-b", address="http://b:1")]
+    reports = {"http://a:1": capacity_report(one, at=NOW, machine_id="m-a", address="http://a:1"),
+               "http://b:1": capacity_report(two, at=NOW, machine_id="m-b", address="http://b:1")}
+    fetched, recorded, drained = [], [], []
+
+    async def read():
+        return documents
+
+    async def fetch(address):
+        fetched.append(address)
+        return reports[address]
+
+    async def record(machine_id, **kwargs):
+        recorded.append(machine_id)
+
+    fleet = Fleet(read_documents=read, fetch_report=fetch, record_heartbeat=record,
+                  on_drained=drained.append, clock=Clock(), machine_ids=scope,
+                  additional_machine_scope=additional)
+    asyncio.run(fleet.refresh_directory())
+    asyncio.run(fleet.poll_once())
+    assert fetched == [f"http://{m[-1]}:1" for m in expected]
+    assert recorded == list(expected) and drained == []
+    assert fleet.servable_machines(now=NOW, **PICK) == expected
+    assert fleet.servable_machines(now=NOW, include_unknown=True, **PICK) == expected
+    assert fleet.serving(ENV, ENV_PACKAGE) == list(expected)
+    assert fleet.session_room() == (4 * len(expected), 4 * len(expected))
+    assert fleet.slots_serving({(ENV, ENV_PACKAGE)}) == 4 * len(expected)
+    assert fleet.sessions_hostable(("m-a", "m-b"), None) == 4 * len(expected)
+    assert fleet.images_served(ENV, ENV_PACKAGE) == (frozenset({IMAGE}) if expected else frozenset())
+    assert fleet.capacity_by_env().get(ENV, {}).get("slots", 0) == 4 * len(expected)
+    assert fleet.nearest(now=NOW, **PICK) == (expected[0] if expected else None)
+    assert fleet.pick(now=NOW, **PICK) == (Placement(expected[0], f"http://{expected[0][-1]}:1")
+                                          if expected else None)
+    assert fleet.could_place(now=NOW, **PICK) is (True if expected else None)
+    assert fleet.directory_if_ready().public_key("m-a", "ka", NOW) is not None
+    if "m-a" not in expected:
+        assert not fleet.accept_report("m-a", reports["http://a:1"], NOW)
+        assert fleet.session_share("m-a", None) is None
+
+
+def test_unknown_scope_after_refresh_closes_cached_capacity_without_voiding_old_sessions(tmp_path):
+    fleet, machine, served, _ = make(tmp_path, machine_ids={MACHINE})
+    served[ADDRESS] = capacity_report(machine, at=NOW)
+    asyncio.run(fleet.poll_once())
+    assert fleet.pick(now=NOW, **PICK) is not None
+    drained = []
+    fleet.on_drained = drained.append
+    documents = []
+
+    async def read():
+        return documents
+
+    fleet._read_documents = read
+    asyncio.run(fleet.refresh_directory())
+    asyncio.run(fleet.poll_once())
+    assert fleet.pick(now=NOW, **PICK) is None
+    assert fleet.session_room() == (0, 0)
+    assert fleet.sessions_hostable([MACHINE], None) == 0
+    assert fleet.reported_load([MACHINE]) == 0 and fleet.load_share([MACHINE]) == 0.0
+    assert fleet.reported_packages(ENV) == []
+    assert not fleet.view_complete(ENV, ENV_PACKAGE)
+    assert drained == []
+    documents.append(machine_document(machine))
+    asyncio.run(fleet.refresh_directory())
+    asyncio.run(fleet.poll_once())
+    assert fleet.pick(now=NOW, **PICK) is not None
+
+
+def test_missing_additional_scope_id_outside_intersection_closes_cached_capacity(tmp_path):
+    fleet, machine, served, _ = make(tmp_path, machine_ids={MACHINE},
+                                   additional_machine_scope={MACHINE, "m-b"})
+    other = machine_document(signer(tmp_path, "b", "kb"), machine_id="m-b", address="http://b:1")
+    documents = asyncio.run(fleet._read_documents())
+    documents.append(other)
+    served[ADDRESS] = capacity_report(machine, at=NOW)
+    asyncio.run(fleet.refresh_directory())
+    asyncio.run(fleet.poll_once())
+    assert fleet.pick(now=NOW, **PICK) is not None
+    documents.remove(other)
+    asyncio.run(fleet.refresh_directory())
+    asyncio.run(fleet.poll_once())
+    assert fleet.pick(now=NOW, **PICK) is None and fleet.session_room() == (0, 0)
+    assert fleet.directory_if_ready().public_key(MACHINE, machine.key_id, NOW) is not None
+    documents.append(other)
+    asyncio.run(fleet.refresh_directory())
+    asyncio.run(fleet.poll_once())
+    assert fleet.pick(now=NOW, **PICK) is not None
+
+
+@pytest.mark.parametrize("scope", ["m-b", b"m-b", {"../m-b"}])
+def test_additional_machine_scope_rejects_invalid_collections_and_names(tmp_path, scope):
+    with pytest.raises(ValueError):
+        make(tmp_path, additional_machine_scope=scope)
+
+
+def test_existing_session_on_excluded_machine_can_close_with_its_signed_receipt(tmp_path):
+    from tests.unit.test_sandbox_sessions import build, close, final_of, open_
+
+    existing = build(tmp_path)
+    grant = open_(existing)
+    signed = final_of(existing, grant, "graded")
+
+    async def read():
+        return [machine_document(existing.machine)]
+
+    async def forbidden_fetch(address):
+        pytest.fail("an excluded machine must not be contacted")
+
+    fleet = Fleet(read_documents=read, fetch_report=forbidden_fetch, clock=existing.clock, machine_ids=set())
+    asyncio.run(fleet.refresh_directory())
+    asyncio.run(fleet.poll_once())
+    existing.issuer._fleet = fleet
+    assert close(existing, grant, signed)["state"] == "closed_graded"
+    assert fleet.pick(now=NOW, **PICK) is None
+
+
 def test_heartbeat_valid_always_gets_now_and_a_max_age(tmp_path, monkeypatch):
     seen = []
     real = fleet_module.heartbeat_valid

@@ -16,6 +16,7 @@ import math
 import re
 import time
 from collections.abc import Callable, Mapping
+from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
@@ -27,6 +28,8 @@ from reliquary.admin.auth import (
     TIMESTAMP_HEADER,
     HmacVerifier,
 )
+
+from reliquary.sandbox.evaluation_engagements import EvaluationSessionRequest
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +83,12 @@ class CreateJob(BaseModel):
     seed: int | None = Field(default=None, ge=0, le=2**63 - 1)
     audit_q: float | None = Field(default=None, gt=0.0, le=1.0)
     sampling: "OrderSampling | None" = None
+    # Eval and generation orders: every sample follows the job's public forced draw (``corpus.eval_draw``),
+    # checked by the audit in place of a proof; ``judge`` sets some of its thresholds (``corpus.job.DrawJudge``).
+    draw: Literal["gumbel_max"] | None = None
+    judge: dict[str, float | int] | None = Field(default=None, max_length=8)
+    # A long-context order: its longest prompt in tokens (miners size their engine to it).
+    max_prompt_tokens: int | None = Field(default=None, gt=0, le=131072)
     # A reviewed contract can be pinned before the first durable write.
     manifest_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     profile_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
@@ -92,6 +101,13 @@ class OrderSampling(BaseModel):
     temperature: float = Field(gt=0.0, le=4.0)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     top_k: int = Field(default=0, ge=0)
+    # Draw orders only (free-sampling miners do not apply it).
+    min_p: float = Field(default=0.0, ge=0.0, lt=1.0)
+
+    def conditions(self) -> dict:
+        """What a qualification records and an order repeats: min_p only when set, so the conditions of every
+        order without it read as before it existed."""
+        return self.model_dump(exclude=None if self.min_p else {"min_p"})
 
 
 class RequestQualification(BaseModel):
@@ -280,7 +296,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      task_prefix: str = DEFAULT_TASK_PREFIX, eval_store=None,
                      open_environment=None, grade_scorer=None,
                      require_sandbox=None, qualifications=None, eval_jobs=None,
-                     model_facts=None) -> FastAPI:
+                     model_facts=None, evaluation_sessions=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
     ``eval_store`` the subnet bucket holding the eval sets' grading files."""
@@ -330,6 +346,10 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
             # The model's own config and tokenizer files, on CPU (no weights).
             return await asyncio.to_thread(read_facts, repo, revision)
+    if evaluation_sessions is None:
+        from reliquary.sandbox.evaluation_engagements import from_environment
+
+        evaluation_sessions = from_environment(subnet=eval_store, clock=clock)
     # Rows of each order source, counted once (building one reads its package).
     source_rows: dict[str, int] = {}
 
@@ -465,7 +485,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail=f"set {set_id} holds {card['count']} problems")
         # Thresholds hold only for the conditions they were measured under.
         wanted = {"set_id": set_id, "problems": body.prompt_count,
-                  "sampling": body.sampling.model_dump(), "max_new_tokens": body.max_new_tokens,
+                  "sampling": body.sampling.conditions(), "max_new_tokens": body.max_new_tokens,
                   "thinking": body.thinking}
         differs = sorted(k for k, v in wanted.items() if record.get(k) != v)
         if differs:
@@ -473,15 +493,14 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                                 detail=f"qualification_conditions_differ: {differs}")
         source = eval_source_for(set_id, prompts_body, body.prompt_count)
         register_eval_prompts(source, prompts_body)
-        seed = body.seed if body.seed is not None else int(
-            hashlib.sha256(body.job_id.encode()).hexdigest()[:15], 16)
+        seed = body.seed if body.seed is not None else job_seed(body.job_id)
         try:
             if record_order:
                 await eval_jobs.create({
                     "schema": qual.EVAL_JOB_SCHEMA, "job_id": body.job_id,
                     "qualification_id": body.qualification_id, "set_id": set_id,
                     "problems": body.prompt_count, "samples": body.samples_per_prompt,
-                    "sampling": body.sampling.model_dump(), "max_new_tokens": body.max_new_tokens,
+                    "sampling": body.sampling.conditions(), "max_new_tokens": body.max_new_tokens,
                     "thinking": body.thinking})
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -492,8 +511,19 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             seed=seed,
             toploc_thresholds=result["thresholds"], audit_params={"audit_q": 1.0},
             temperature=body.sampling.temperature, top_p=body.sampling.top_p,
-            top_k=body.sampling.top_k,
+            top_k=body.sampling.top_k, **draw_arguments(body),
         )
+
+    def job_seed(job_id: str) -> int:
+        return int(hashlib.sha256(job_id.encode()).hexdigest()[:15], 16)
+
+    def draw_arguments(body: CreateJob) -> dict:
+        """The order's forced draw, its judge and min_p (``prepare_corpus_job``); refused without a draw."""
+        if body.draw is None:
+            if body.judge is not None or (body.sampling is not None and body.sampling.min_p):
+                raise HTTPException(status_code=422, detail="judge and min_p set a forced draw: name draw")
+            return {}
+        return {"draw": body.draw, "judge": body.judge, "min_p": body.sampling.min_p}
 
     async def gen_job_arguments(body: CreateJob, *, record_order: bool) -> dict:
         """What a generation order on any model is declared from: its catalog
@@ -527,7 +557,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         refuse_unsupported(result)
         profile = ENVIRONMENT_CATALOG.get(body.env)
         wanted = {"env": body.env, "prompt_start": body.prompt_start,
-                  "problems": body.prompt_count, "sampling": body.sampling.model_dump(),
+                  "problems": body.prompt_count, "sampling": body.sampling.conditions(),
                   "max_new_tokens": body.max_new_tokens, "thinking": body.thinking,
                   # The package the rows render through, as it is here now.
                   "environment_manifest_sha256": getattr(
@@ -543,7 +573,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     "schema": qual.ORDER_JOB_SCHEMA, "job_id": body.job_id, "kind": qual.GENERATION,
                     "qualification_id": body.qualification_id, "env": body.env,
                     "prompt_start": body.prompt_start, "problems": body.prompt_count,
-                    "samples": body.samples_per_prompt, "sampling": body.sampling.model_dump(),
+                    "samples": body.samples_per_prompt, "sampling": body.sampling.conditions(),
                     "max_new_tokens": body.max_new_tokens, "thinking": body.thinking})
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -556,7 +586,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             audit_params={**GEN_AUDIT_PARAMS,
                           **({"audit_q": body.audit_q} if body.audit_q is not None else {})},
             temperature=body.sampling.temperature, top_p=body.sampling.top_p,
-            top_k=body.sampling.top_k,
+            top_k=body.sampling.top_k, **draw_arguments(body),
+            # A draw order's stream is keyed on its seed: the client's, else one derived from the job id.
+            **({"seed": body.seed if body.seed is not None else job_seed(body.job_id)} if body.draw else {}),
         )
 
     def operator_generation_job(body: CreateJob) -> bool:
@@ -598,10 +630,10 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if generation and not (body.task_id or body.job_id).startswith(gen_prefix):
             raise HTTPException(status_code=422, detail=(
                 f"a generation order's ids both start with {gen_prefix!r}"))
-        if generation and body.seed is not None:
-            raise HTTPException(status_code=422, detail="eval fields on a generation order")
+        if generation and body.seed is not None and body.draw is None:
+            raise HTTPException(status_code=422, detail="eval fields on a generation order: a seed keys a forced draw")
         if not evaluation and not generation and any(
-                v is not None for v in (body.qualification_id, body.seed, body.audit_q)):
+                v is not None for v in (body.qualification_id, body.seed, body.audit_q, body.draw, body.judge)):
             raise HTTPException(status_code=422, detail="eval fields on a non-eval job")
         cap = body.cap
         if evaluation:
@@ -637,6 +669,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 prompt_start=body.prompt_start, renderer_id=THINKING_RENDERERS[body.thinking],
                 slots_per_prompt=body.samples_per_prompt,
                 max_new_tokens=body.max_new_tokens, cap=cap, min_incentive_share=0.0,
+                **({"max_prompt_tokens": body.max_prompt_tokens} if body.max_prompt_tokens is not None else {}),
                 **arguments,
             )
         except (RegistryError, ValueError) as exc:
@@ -1046,13 +1079,13 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     qualification_id=body.qualification_id, model=body.model,
                     revision=body.revision, env=body.env,
                     prompt_start=body.prompt_start or 0, problems=body.problems,
-                    completions=body.completions, sampling=body.sampling.model_dump(),
+                    completions=body.completions, sampling=body.sampling.conditions(),
                     max_new_tokens=body.max_new_tokens, thinking=body.thinking, clock=clock)
             else:
                 wanted = qual.new_request(
                     qualification_id=body.qualification_id, model=body.model,
                     revision=body.revision, set_id=body.set_id, problems=body.problems,
-                    completions=body.completions, sampling=body.sampling.model_dump(),
+                    completions=body.completions, sampling=body.sampling.conditions(),
                     max_new_tokens=body.max_new_tokens, thinking=body.thinking, clock=clock)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -1180,6 +1213,36 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                       **({"allow_incomplete": True} if body.allow_incomplete else {})}
         return JobRows(job=job, collected=collected), provenance
 
+    @router.post("/evaluations/{eval_id}/sandbox-session")
+    async def evaluation_sandbox_session(eval_id: str, body: EvaluationSessionRequest,
+                                         response: Response) -> dict:
+        from reliquary.eval.prompt_source import eval_job_prefix
+
+        in_scope(eval_id)
+        if eval_id != eval_job_prefix(task_prefix) + body.task_id:
+            raise HTTPException(status_code=409, detail="evaluation_identity_changed")
+        response.headers["Cache-Control"] = "no-store"
+        if eval_id != body.eval_id:
+            raise HTTPException(status_code=409, detail="evaluation_identity_changed")
+        if evaluation_sessions is None:
+            raise HTTPException(status_code=503, detail="evaluation_sandboxes_not_configured")
+        try:
+            result = await asyncio.wait_for(evaluation_sessions.open(body), 60)
+        except ValueError as exc:
+            logger.warning("evaluation sandbox refused (%s)", type(exc).__name__)
+            raise HTTPException(status_code=409, detail="evaluation_contract_refused") from exc
+        except Exception as exc:
+            logger.warning("evaluation sandbox unavailable (%s)", type(exc).__name__)
+            raise HTTPException(status_code=503, detail="evaluation_sandbox_unavailable") from exc
+        if "refusal" in result:
+            from reliquary.sandbox.routes import REFUSAL_STATUS
+
+            refusal = result["refusal"]
+            response.status_code = REFUSAL_STATUS.get(refusal["reason"], 409)
+            if response.status_code in (429, 503):
+                response.headers["Retry-After"] = str(max(1, math.ceil(refusal["retry_after"] or 5)))
+        return result
+
     @router.post("/evaluations/{eval_id}/grade")
     async def grade_evaluation(eval_id: str, body: GradeEvaluation, response: Response) -> dict:
         from reliquary.corpus.delivery import validated_delivery_id
@@ -1234,6 +1297,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     # Refusals the caller can act on are answered now, not polled for.
                     sets = await grading.load_sets(body.set_ids, body.problems_per_set,
                                                    body.samples_per_set, subnet=eval_store)
+                    grading.require_gradable(sets)
                     grading.require_sandboxes(sets, require_sandbox)
                 except grading.SetUnknown as exc:
                     raise HTTPException(status_code=404, detail="set_unknown") from exc
@@ -1254,6 +1318,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     except ValueError as exc:
                         raise HTTPException(status_code=422, detail=str(exc)) from exc
                 extra = {} if grade_scorer is None else {"scorer_for": grade_scorer}
+                if evaluation_sessions is not None:
+                    extra["verify_signed"] = evaluation_sessions.verify_result
                 gradings[eval_id] = (digest, asyncio.ensure_future(grading.grade_evaluation(
                     eval_id=eval_id, set_ids=body.set_ids, completion_keys=keys,
                     problems_per_set=body.problems_per_set,
@@ -1295,7 +1361,17 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         media = "application/json" if name.endswith(".json") else "application/octet-stream"
         return Response(content=content, media_type=media)
 
-    app = FastAPI()
+    @asynccontextmanager
+    async def lifespan(app):
+        if evaluation_sessions is not None:
+            await evaluation_sessions.start()
+        try:
+            yield
+        finally:
+            if evaluation_sessions is not None:
+                await evaluation_sessions.stop()
+
+    app = FastAPI(lifespan=lifespan)
     app.include_router(router)
     app.state.exports = exports
     app.state.gradings = gradings

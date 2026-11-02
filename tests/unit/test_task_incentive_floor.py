@@ -59,6 +59,16 @@ def test_floors_default_to_the_protocol_floor():
     assert floors["corpus-x"] == (0.0, 0.0)
 
 
+def test_the_protocol_pays_every_hotkey_by_default():
+    """No default floor: a small GPU holding 0.5% of a task is still paid."""
+    assert (MIN_INCENTIVE_RAMP_START, MIN_INCENTIVE_SHARE) == (0.0, 0.0)
+    rl = _archives("default", {"big": 0.995, "tiny": 0.005})
+    floors = W._floors_by_task({"default": _entry("default", 0.9)})
+    paid = W._replay_ema(rl, caps={"default": 0.9}, floors=floors)
+    assert paid["tiny"] > 0
+    assert paid == pytest.approx(W._replay_ema(rl, caps={"default": 0.9}))
+
+
 def test_a_share_alone_below_the_default_ramp_start_ramps_from_zero():
     entry = _entry("default", 0.9)
     low = replace(entry, params={**entry.params, "min_incentive_share": 0.005})

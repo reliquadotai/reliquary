@@ -48,7 +48,7 @@ import threading
 import time
 import zlib
 
-from reliquary.constants import SERVICE_OBSERVATION_FLUSH_SECONDS, SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS
+from reliquary.shared import SERVICE_OBSERVATION_FLUSH_SECONDS, SERVICE_OBSERVATION_SEGMENT_MAX_EVENTS
 from reliquary.protocol.release_contract import canonical_json_bytes
 
 logger = logging.getLogger(__name__)
@@ -76,16 +76,22 @@ PUBLIC_REASONS = frozenset({"already_scanned", "finalized", "zero_price", "cap",
                             "not_robust", REFUSED})
 
 
-def segment_key(run_id: str, number: int) -> str:
-    return f"observations/run-{run_id}/seg-{number:06d}.jsonl.gz"
+def run_root(run_id: str) -> str:
+    """Where a run's files live. Another log (the async RL scans: ``rl/<run>/observations``) passes its own
+    ``root`` to the key functions, the verifiers and the publisher; the format is the same."""
+    return f"observations/run-{run_id}"
 
 
-def index_key(run_id: str) -> str:
-    return f"observations/run-{run_id}/index.json"
+def segment_key(run_id: str, number: int, *, root: str | None = None) -> str:
+    return f"{root or run_root(run_id)}/seg-{number:06d}.jsonl.gz"
 
 
-def page_key(run_id: str, first_number: int, last_number: int) -> str:
-    return f"observations/run-{run_id}/index-{first_number:06d}-{last_number:06d}.json"
+def index_key(run_id: str, *, root: str | None = None) -> str:
+    return f"{root or run_root(run_id)}/index.json"
+
+
+def page_key(run_id: str, first_number: int, last_number: int, *, root: str | None = None) -> str:
+    return f"{root or run_root(run_id)}/index-{first_number:06d}-{last_number:06d}.json"
 
 
 def public_events(events: list[dict], *, flush_at: float) -> list[dict]:
@@ -108,38 +114,49 @@ def encode_segment(events: list[dict]) -> bytes:
     return gzip.compress(b"".join(canonical_json_bytes(e) + b"\n" for e in events), compresslevel=9, mtime=0)
 
 
-def segment_entry(run_id: str, s: dict) -> dict:
-    return {"number": s["number"], "key": segment_key(run_id, s["number"]), "first_seq": s["first_seq"],
+def segment_entry(run_id: str, s: dict, *, root: str | None = None) -> dict:
+    return {"number": s["number"], "key": segment_key(run_id, s["number"], root=root), "first_seq": s["first_seq"],
             "last_seq": s["last_seq"], "sha256": s["sha256"], "size": s["size"]}
 
 
-def sign_document(body: dict, wallet) -> bytes:
-    """The published bytes of a head or page: canonical JSON of ``body`` + its signature."""
-    signature = bytes(wallet.hotkey.sign(INDEX_DOMAIN + canonical_json_bytes(body))).hex()
+def document_signing_payload(body: dict) -> bytes:
+    """The signed bytes of a head or page body (without ``signature``): the index domain + canonical JSON."""
+    return INDEX_DOMAIN + canonical_json_bytes(body)
+
+
+def wallet_document_signer(wallet):
+    """``body -> hex signature`` with the local wallet hotkey."""
+    return lambda body: bytes(wallet.hotkey.sign(document_signing_payload(body))).hex()
+
+
+def sign_document(body: dict, wallet=None, *, signer=None) -> bytes:
+    """The published bytes of a head or page: canonical JSON of ``body`` + its signature (by ``wallet``, or by
+    ``signer``: ``body -> hex signature``, e.g. the remote signer's observation operation)."""
+    signature = (signer or wallet_document_signer(wallet))(body)
     return canonical_json_bytes({**body, "signature": signature})
 
 
-def build_page(*, run_id: str, validator: str, segments: list[dict]) -> dict:
+def build_page(*, run_id: str, validator: str, segments: list[dict], root: str | None = None) -> dict:
     return {"schema": PAGE_SCHEMA, "run_id": run_id, "validator": validator,
             "first_number": segments[0]["number"], "last_number": segments[-1]["number"],
-            "segments": [segment_entry(run_id, s) for s in segments]}
+            "segments": [segment_entry(run_id, s, root=root) for s in segments]}
 
 
 def build_head(*, run_id: str, order_sha256: str, validator: str, segments: list[dict], pages: list[dict],
-               last_number: int, generated_at: float) -> dict:
+               last_number: int, generated_at: float, root: str | None = None) -> dict:
     return {"schema": INDEX_SCHEMA, "run_id": run_id, "order_sha256": order_sha256, "validator": validator,
             "generated_at": generated_at, "last_number": last_number,
-            "segments": [segment_entry(run_id, s) for s in segments], "pages": pages}
+            "segments": [segment_entry(run_id, s, root=root) for s in segments], "pages": pages}
 
 
-def _check_entries(entries, run_id: str, *, first: int | None = None) -> None:
+def _check_entries(entries, run_id: str, *, first: int | None = None, root: str | None = None) -> None:
     if not isinstance(entries, list):
         raise ValueError("segments must be a list")
     previous = None
     for e in entries:
         if not isinstance(e, dict) or not all(k in e for k in ("number", "key", "first_seq", "last_seq", "sha256", "size")):
             raise ValueError("malformed segment entry")
-        if e["key"] != segment_key(run_id, e["number"]):
+        if e["key"] != segment_key(run_id, e["number"], root=root):
             raise ValueError("segment key does not match run id and number")
         if e["first_seq"] > e["last_seq"]:
             raise ValueError("segment sequence range is inverted")
@@ -150,7 +167,8 @@ def _check_entries(entries, run_id: str, *, first: int | None = None) -> None:
         raise ValueError("segments do not start where the index says")
 
 
-def verify_index(index_bytes, validator_ss58: str, *, expected_run_id: str, min_last_number: int = 0) -> dict:
+def verify_index(index_bytes, validator_ss58: str, *, expected_run_id: str, min_last_number: int = 0,
+                 root: str | None = None) -> dict:
     """The body of a head or page index (plus ``kind``: ``"head"`` or ``"page"``) if its signature by
     ``validator_ss58`` holds, its run id is ``expected_run_id``, it is contiguous with well-named keys
     and (head) its ``last_number`` is at least ``min_last_number``. A head must start right after its
@@ -161,31 +179,42 @@ def verify_index(index_bytes, validator_ss58: str, *, expected_run_id: str, min_
         document = json.loads(index_bytes) if isinstance(index_bytes, (bytes, bytearray, str)) else index_bytes
     except ValueError as exc:
         raise ValueError("observation index is not JSON") from exc
-    kinds = {INDEX_SCHEMA: "head", PAGE_SCHEMA: "page"}
-    if not isinstance(document, dict) or document.get("schema") not in kinds:
+    if not isinstance(document, dict) or document.get("schema") not in (INDEX_SCHEMA, PAGE_SCHEMA):
         raise ValueError("unknown observation index")
-    kind = kinds[document["schema"]]
     body = {k: v for k, v in document.items() if k != "signature"}
     if body.get("validator") != validator_ss58:
         raise ValueError("index names another validator (signature not checked)")
     try:
-        ok = Keypair(ss58_address=validator_ss58).verify(INDEX_DOMAIN + canonical_json_bytes(body),
+        ok = Keypair(ss58_address=validator_ss58).verify(document_signing_payload(body),
                                                          bytes.fromhex(document["signature"]))
     except Exception as exc:
         raise ValueError("bad index signature") from exc
     if not ok:
         raise ValueError("bad index signature")
+    kind = check_index_body(body, expected_run_id=expected_run_id, root=root)
+    if kind == "head" and body["last_number"] < min_last_number:
+        raise ValueError("stale observation index")
+    return {**body, "kind": kind}
+
+
+def check_index_body(body: dict, *, expected_run_id: str, root: str | None = None) -> str:
+    """The structure of a head or page body (signature not involved): ``"head"`` or ``"page"``, ValueError
+    otherwise. Shared by the readers (``verify_index``) and the remote signer's observation operation."""
+    kinds = {INDEX_SCHEMA: "head", PAGE_SCHEMA: "page"}
+    if not isinstance(body, dict) or body.get("schema") not in kinds:
+        raise ValueError("unknown observation index")
+    kind = kinds[body["schema"]]
     if body.get("run_id") != expected_run_id:
         raise ValueError("index belongs to another run")
     entries = body.get("segments")
     if kind == "page":
         if not isinstance(entries, list) or len(entries) != PAGE_SEGMENTS:
             raise ValueError("a page holds exactly %d segments" % PAGE_SEGMENTS)
-        _check_entries(entries, expected_run_id, first=body["first_number"])
+        _check_entries(entries, expected_run_id, first=body["first_number"], root=root)
         if entries[-1]["number"] != body["last_number"]:
             raise ValueError("page last_number does not match its segments")
     else:
-        _check_entries(entries, expected_run_id)
+        _check_entries(entries, expected_run_id, root=root)
         if len(entries) >= PAGE_SEGMENTS:
             raise ValueError("head lists a whole page of segments")
         pages = body.get("pages")
@@ -194,7 +223,8 @@ def verify_index(index_bytes, validator_ss58: str, *, expected_run_id: str, min_
         expected_first = 1
         for page in pages:
             if (page.get("first_number") != expected_first or page.get("last_number") != expected_first + PAGE_SEGMENTS - 1
-                    or page.get("key") != page_key(expected_run_id, page["first_number"], page["last_number"])):
+                    or page.get("key") != page_key(expected_run_id, page["first_number"], page["last_number"],
+                                                   root=root)):
                 raise ValueError("pages are not contiguous or badly named")
             expected_first += PAGE_SEGMENTS
         last = body.get("last_number")
@@ -204,9 +234,7 @@ def verify_index(index_bytes, validator_ss58: str, *, expected_run_id: str, min_
             raise ValueError("head last_number does not match its segments")
         if entries and entries[0]["number"] != expected_first:
             raise ValueError("head does not continue its pages")
-        if last < min_last_number:
-            raise ValueError("stale observation index")
-    return {**body, "kind": kind}
+    return kind
 
 
 def verify_page_entry(page_bytes: bytes, entry: dict) -> None:
@@ -256,8 +284,16 @@ def r2_get(bucket: str):
 
 
 class ObservationPublisher:
-    def __init__(self, runtime, *, run_id: str, task_id: str, wallet, put, get=None, clock=time.time):
+    def __init__(self, runtime, *, run_id: str, task_id: str, wallet, put, get=None, clock=time.time,
+                 root: str | None = None, project=public_events, signer=None):
         self.runtime, self.run_id, self.task_id, self.wallet, self.put, self.get, self.clock = runtime, run_id, task_id, wallet, put, get, clock
+        # ``root``: the key prefix (default ``observations/run-<run_id>``); ``project``: events -> published events.
+        self.root, self.project = root, project
+        # ``signer``: ``body -> hex signature`` (default: the wallet's hotkey; the async RL validator passes the
+        # remote signer's observation operation). The documents name the wallet's hotkey either way.
+        self.validator = wallet.hotkey.ss58_address
+        self._signer = signer or wallet_document_signer(wallet)
+        self.head_bytes: bytes | None = None     # the last head written (served by the async RL validator)
         # After a restart the last index PUT is unknown: write it once on the first flush.
         self._index_dirty = True
         self._checked = get is None          # the remote head is compared once per process, before any upload
@@ -298,7 +334,7 @@ class ObservationPublisher:
     def _events(self, plan: dict) -> list[dict]:
         count = plan["last_seq"] - plan["first_seq"] + 1
         rows = self.runtime.events(after=plan["first_seq"] - 1, limit=count)
-        return public_events([e for seq, e in rows if seq <= plan["last_seq"]], flush_at=plan["flush_at"])
+        return self.project([e for seq, e in rows if seq <= plan["last_seq"]], flush_at=plan["flush_at"])
 
     async def _check_remote(self) -> None:
         """Compare the published head and pages with the local journal: a restored (older) database must
@@ -318,12 +354,12 @@ class ObservationPublisher:
         self._checked = True
 
     async def _compare_remote(self) -> None:
-        raw = await self.get(index_key(self.run_id))
+        raw = await self.get(index_key(self.run_id, root=self.root))
         if raw is None:
             return
-        validator = self.wallet.hotkey.ss58_address
+        validator = self.validator
         try:
-            remote = verify_index(raw, validator, expected_run_id=self.run_id)
+            remote = verify_index(raw, validator, expected_run_id=self.run_id, root=self.root)
         except ValueError as exc:
             return self._disable(f"the published index does not verify ({exc})")
         if remote["kind"] != "head":
@@ -344,7 +380,7 @@ class ObservationPublisher:
                 return self._disable(f"the published head lists page {entry['key']} which is missing")
             try:
                 verify_page_entry(page_raw, entry)
-                page = verify_index(page_raw, validator, expected_run_id=self.run_id)
+                page = verify_index(page_raw, validator, expected_run_id=self.run_id, root=self.root)
             except ValueError as exc:
                 return self._disable(f"published page {entry['key']} does not verify ({exc})")
             if page["kind"] != "page" or page["first_number"] != entry["first_number"]:
@@ -364,8 +400,8 @@ class ObservationPublisher:
 
         def build() -> bytes:
             segments = self.runtime.published_segments(first_number=first, last_number=first + PAGE_SEGMENTS - 1)
-            return sign_document(build_page(run_id=self.run_id, validator=self.wallet.hotkey.ss58_address,
-                                            segments=segments), self.wallet)
+            return sign_document(build_page(run_id=self.run_id, validator=self.validator, segments=segments,
+                                            root=self.root), signer=self._signer)
         return self.runtime.index_page(first, build)
 
     def _closed_page_entries(self, closed: int) -> list[dict]:
@@ -377,7 +413,7 @@ class ObservationPublisher:
                 continue
             body = self._page_bytes(k)
             first = k * PAGE_SEGMENTS + 1
-            self._page_entries[k] = {"key": page_key(self.run_id, first, first + PAGE_SEGMENTS - 1),
+            self._page_entries[k] = {"key": page_key(self.run_id, first, first + PAGE_SEGMENTS - 1, root=self.root),
                                      "first_number": first, "last_number": first + PAGE_SEGMENTS - 1,
                                      "sha256": hashlib.sha256(body).hexdigest(), "size": len(body)}
             if k not in self._pages_written:
@@ -389,9 +425,9 @@ class ObservationPublisher:
         pages = self._closed_page_entries(closed)
         segments = self.runtime.published_segments(first_number=closed * PAGE_SEGMENTS + 1, last_number=last)
         head = build_head(run_id=self.run_id, order_sha256=self.runtime.contract.sha256,
-                          validator=self.wallet.hotkey.ss58_address, segments=segments, pages=pages,
-                          last_number=last, generated_at=self.clock())
-        return sign_document(head, self.wallet), head
+                          validator=self.validator, segments=segments, pages=pages,
+                          last_number=last, generated_at=self.clock(), root=self.root)
+        return sign_document(head, signer=self._signer), head
 
     async def flush(self) -> dict | None:
         """Publish the next segment (if any), the closed pages, then the head. None when nothing was written."""
@@ -406,8 +442,9 @@ class ObservationPublisher:
         if plan is not None:
             events = await self._thread(self._events, plan)
             body = await asyncio.to_thread(encode_segment, events)
-            await self.put(segment_key(self.run_id, plan["number"]), body, "application/gzip", SEGMENT_CACHE)
-            windows = sorted({e["window"] for e in events})
+            await self.put(segment_key(self.run_id, plan["number"], root=self.root), body, "application/gzip",
+                           SEGMENT_CACHE)
+            windows = sorted({e["window"] for e in events if "window" in e})
             checkpoints = sorted({e["checkpoint_n"] for e in events if "checkpoint_n" in e})
             await self._thread(self.runtime.commit_segment, plan["number"],
                                sha256=hashlib.sha256(body).hexdigest(), size=len(body),
@@ -428,7 +465,8 @@ class ObservationPublisher:
             await self.put(self._page_entries[k]["key"], body, "application/json", SEGMENT_CACHE)
             self._pages_written.add(k)
             self._page_pending.discard(k)
-        await self.put(index_key(self.run_id), head_bytes, "application/json", INDEX_CACHE)
+        await self.put(index_key(self.run_id, root=self.root), head_bytes, "application/json", INDEX_CACHE)
+        self.head_bytes = head_bytes
         self._index_dirty = False
         return head
 

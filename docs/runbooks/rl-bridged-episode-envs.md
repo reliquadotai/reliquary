@@ -114,3 +114,22 @@ restart, `set --active`), the waiting status and the automatic switch-off are in
 capacity (phase 2)" of `docs/next-rl-run-decisions.md`. The conformance report must be a gate of exactly this
 env under the catalogue's image lock: it records `image_lock_sha256`, and the validator refuses a report whose
 lock is not the catalogue's, or that names none.
+
+## 6. Restricting the rows an async RL run draws (`rows`)
+
+On the async lease path (`tasks create --rl-async --rl-episode-envs`), an episode env's block may add `rows`
+beside `episode`, `catalogue` and `version`. Without it the run draws the whole RL split.
+
+```json
+"swe_v1": {"episode": {...}, "catalogue": {...}, "version": "...",
+           "rows": {"start": 10016, "end": 17512, "exclude": [[11248, 11448], 16792]}}
+```
+
+- `[start, end)` is the slice of the split the run draws from.
+- `exclude` lists single rows and `[a, b)` intervals inside it, in any order, never overlapping.
+- `tasks create` refuses a malformed `rows`.
+- The validator and the miner refuse to load the env when `end` runs past the installed split.
+- The validator refuses a lease on a row outside the rows. The miner draws only inside them: both read the
+  same block, the miner from `GET /rl/episodes`.
+
+`rows` is not part of `version`: it is the run's choice, not the install's.

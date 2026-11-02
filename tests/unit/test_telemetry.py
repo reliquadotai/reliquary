@@ -222,3 +222,31 @@ def test_finish_fail_soft_on_exception(monkeypatch):
     telemetry.init(hotkey_ss58="5abc" + "0" * 44, config={})
     telemetry.finish()  # must not raise
     assert telemetry.is_active() is False
+
+
+def test_an_async_role_gets_its_own_run_in_the_run_group(monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "fake-key")
+    fake_wandb = MagicMock()
+    monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+    hotkey = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+    telemetry.init(hotkey_ss58=hotkey, config={}, role="trainer", version="run-7")
+    kwargs = fake_wandb.init.call_args.kwargs
+    assert kwargs["id"] == f"{hotkey[:8]}-run-7-trainer"
+    assert kwargs["group"] == f"{hotkey[:8]}-run-7" and kwargs["job_type"] == "trainer"
+
+
+def test_held_rows_go_out_as_one_row_at_the_flush_step(monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "fake-key")
+    fake_wandb = MagicMock()
+    monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+    telemetry.init(hotkey_ss58="5" * 48, config={})
+    telemetry.hold()
+    telemetry.log_training_step({"train/loss": 1.0}, step=1)       # a skipped step's row stays held
+    telemetry.hold()
+    telemetry.log_training_step({"train/kl": 0.5}, step=1)
+    assert fake_wandb.log.call_count == 0
+    telemetry.flush({"async/step_s": 3.0}, 12)
+    fake_wandb.log.assert_called_once_with({"train/loss": 1.0, "train/kl": 0.5, "async/step_s": 3.0},
+                                           step=12, commit=True)
+    telemetry.log_training_step({"x": 1}, step=13)                 # released: sent directly again
+    assert fake_wandb.log.call_count == 2

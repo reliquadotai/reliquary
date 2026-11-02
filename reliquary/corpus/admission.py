@@ -20,6 +20,10 @@ from reliquary.corpus.checks import (
     check_termination,
     check_token_budget,
 )
+from reliquary.corpus.slots import ATTEMPTS_PER_SLOT
+from reliquary.corpus.eval_draw import (
+    REASON_BAD_CURSOR, REASON_DRAW_SLOT_TAKEN, has_draw, slot_count, slot_key,
+)
 from reliquary.corpus.job import PROMPT_ORDER_MINER_WALK, JobSpec
 from reliquary.corpus.signed_reasons import REASON_SANDBOX_SESSION_REUSED
 from reliquary.corpus.slots import SlotLedger
@@ -104,6 +108,20 @@ def admit(
             return refused
     elif not job.owns(prompt_index):
         return Verdict(False, "prompt_mismatch", detail=out_of_range_detail(job, prompt_index))
+
+    if has_draw(job):
+        # The cursor is the sample's draw slot, filled once per attempt; a failed one reopens for other hotkeys.
+        cursors_open = slots.draw_cursors(prompt_index, slot_count(job))
+        if cursors_open <= cursor < ATTEMPTS_PER_SLOT * slot_count(job):
+            # A cursor of the former attempt range: taken, so a miner on the previous image marks it and moves on.
+            return Verdict(False, REASON_DRAW_SLOT_TAKEN, detail={"draw_slot": cursor, "retired": True})
+        if not 0 <= cursor < cursors_open:
+            return Verdict(False, REASON_BAD_CURSOR,
+                           detail={"why": "the cursor is the draw slot", "slots": cursors_open})
+        if slots.slot_exhausted(prompt_index, cursor):
+            return Verdict(False, REASON_DRAW_SLOT_TAKEN, detail={"draw_slot": cursor, "exhausted": True})
+        if slot_key(prompt_index, cursor, slots.slot_attempt(prompt_index, cursor)) in seen:
+            return Verdict(False, REASON_DRAW_SLOT_TAKEN, detail={"draw_slot": cursor})
 
     if job.episode is not None:
         if not episode_checked:

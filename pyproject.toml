@@ -38,6 +38,10 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.52,<0.53",
     "bitsandbytes>=0.43.0",
+    # The agentic harness miners and validators share (render, parse, loop): one commit
+    # of reliquary-sandbox's harness/ distribution. `agentic_swe.HARNESS_DIGEST` pins
+    # the spec it must install; another digest refuses SWE and signed jobs.
+    "reliquary-harness[qwen] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@7d559fd16564ac16af52486fe6552084c685bca6#subdirectory=harness",
 ]
 
 [project.optional-dependencies]
@@ -45,27 +49,29 @@ vision = [
     "torch==2.7.0",
     "peft==0.21.2",
     "accelerate==1.15.0",
-    "Pillow==12.3.0",
+    "Pillow==13.0.0",
     "torchvision==0.22.0",
     "num2words==0.5.14",
 ]
 dev = [
-    "Pillow==12.3.0",
+    "Pillow==13.0.0",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "pytest-timeout>=2.3",
+    "pytest-xdist>=3.5",
 ]
 wandb = [
     "wandb>=0.16",
 ]
 # Signed-episode sandboxes (plan 3): reliquary-sandbox, public, pinned by one commit.
 sandbox = [
-    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@be50c76824aaccd6506d8f50a84941b4cd548f6f",
+    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@f8c208bd35848a13cf5b9e44b64309d835d1d81e",
 ]
 sandbox-miner = [
-    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@be50c76824aaccd6506d8f50a84941b4cd548f6f",
+    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@f8c208bd35848a13cf5b9e44b64309d835d1d81e",
 ]
 sandbox-test = [
-    "reliquary-sandbox[service] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@be50c76824aaccd6506d8f50a84941b4cd548f6f",
+    "reliquary-sandbox[service] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@f8c208bd35848a13cf5b9e44b64309d835d1d81e",
 ]
 
 [project.scripts]
@@ -78,8 +84,14 @@ build-backend = "hatchling.build"
 [tool.hatch.metadata]
 allow-direct-references = true
 
+[tool.hatch.build.targets.wheel.force-include]
+# The historical manifest binds this exact path relative to the installed package root.
+"tests/fixtures/reliquarylogic_v1.jsonl" = "tests/fixtures/reliquarylogic_v1.jsonl"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Stated, not left to the plugin: pytest-asyncio warns when it is unset, and warnings are errors here.
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 markers = [
     "classic_window: asserts the pre-v6 timed-window behaviour. These pass under the default profile and are deselected by the v6 job, where the product answers differently by design.",

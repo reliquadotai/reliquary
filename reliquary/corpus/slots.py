@@ -68,6 +68,11 @@ def parse_open_map(body) -> OpenMap:
     return OpenMap(start, count, opened, bitmap)
 
 
+def _failure_id(entry: str) -> str:
+    """The submission id prefix of a ``failed`` entry (``<id12>`` or ``<id12>@<slot>@<hotkey>``)."""
+    return entry.split("@", 1)[0]
+
+
 class SlotExhausted(Exception):
     """This prompt has no slot left; it is finished for the life of the job."""
 
@@ -83,6 +88,11 @@ class SlotLedger:
     their audit (the first 12 hex of each id, so recording one is idempotent);
     each reopens a slot, up to ``ATTEMPTS_PER_SLOT × V`` slots for the prompt
     in all. A job that never records a failure is exactly V slots.
+
+    A forced-draw job also records the failed draw slot and hotkey
+    (``<id12>@<slot>@<hotkey>``): the same slot reopens with the same draw, up
+    to ``ATTEMPTS_PER_SLOT`` attempts per slot; the failure that uses a slot's
+    last attempt reopens nothing.
     """
 
     __slots__ = (
@@ -127,28 +137,73 @@ class SlotLedger:
     def attempt_limit(self) -> int:
         return ATTEMPTS_PER_SLOT * self._slots_per_prompt
 
+    def _reopened(self, position: int) -> int:
+        """Failures that reopened a slot: every slotless one (as before slots were recorded), and per draw slot
+        all but the one that used its last attempt (that slot never fills again)."""
+        legacy, per_slot = 0, {}
+        for entry in self._failed.get(position, ()):
+            parts = entry.split("@", 2)
+            if len(parts) == 3:
+                per_slot[parts[1]] = per_slot.get(parts[1], 0) + 1
+            else:
+                legacy += 1
+        return legacy + sum(min(n, ATTEMPTS_PER_SLOT - 1) for n in per_slot.values())
+
     def capacity(self, index: int) -> int:
-        """The slots this prompt has: V, plus one per failed submission, bounded."""
+        """The slots this prompt has: V, plus one per failure that reopened a slot, bounded."""
         position = self._check(index)
-        return min(self._slots_per_prompt + len(self._failed.get(position, ())),
-                   self.attempt_limit)
+        return min(self._slots_per_prompt + self._reopened(position), self.attempt_limit)
 
     def remaining(self, index: int) -> int:
         position = self._check(index)
         return self.capacity(position) - self._consumed.get(position, 0)
 
-    def record_failure(self, index: int, submission_id: str) -> bool | None:
+    def record_failure(self, index: int, submission_id: str, *, slot: int | None = None,
+                       hotkey: str | None = None) -> bool | None:
         """A submission for this prompt failed: True when that reopened a slot,
         False when the prompt had used every attempt (exhausted), None when it
-        was already recorded."""
+        was already recorded. ``slot`` and ``hotkey``: the failed draw slot and
+        who failed it (forced-draw jobs)."""
         position = self._check(index)
         key = str(submission_id)[:12]
         failed = self._failed.setdefault(position, [])
-        if key in failed:
+        if any(_failure_id(entry) == key for entry in failed):
             return None
         before = self.capacity(position)
-        failed.append(key)
+        failed.append(key if slot is None else f"{key}@{int(slot)}@{hotkey or ''}")
         return self.capacity(position) > before
+
+    def _slot_failures(self, index: int, slot: int) -> list[str]:
+        """The hotkeys that failed this draw slot, one per failure."""
+        position = self._check(index)
+        found = []
+        for entry in self._failed.get(position, ()):
+            parts = entry.split("@", 2)
+            if len(parts) == 3 and parts[1] == str(int(slot)):
+                found.append(parts[2])
+        return found
+
+    def slot_attempt(self, index: int, slot: int) -> int:
+        """The attempt a draw slot is at: how many times it failed."""
+        return len(self._slot_failures(index, slot))
+
+    def draw_cursors(self, index: int, slots_per_prompt: int) -> int:
+        """How many draw slots this prompt takes cursors for: its logical slots, plus one per failure recorded
+        without its slot (a ledger from before slots were recorded, when a failure opened the next slot)."""
+        position = self._check(index)
+        legacy = sum(1 for entry in self._failed.get(position, ()) if "@" not in entry)
+        return min(int(slots_per_prompt) + legacy, self.attempt_limit)
+
+    def slot_exhausted(self, index: int, slot: int) -> bool:
+        return self.slot_attempt(index, slot) >= ATTEMPTS_PER_SLOT
+
+    def _exhausted_slots(self, position: int) -> int:
+        slots = set()
+        for entry in self._failed.get(position, ()):
+            parts = entry.split("@", 2)
+            if len(parts) == 3:
+                slots.add(parts[1])
+        return sum(1 for slot in slots if self.slot_exhausted(position, int(slot)))
 
     def passing(self, index: int) -> int:
         """Slots holding work not known to have failed (passed or pending)."""
@@ -159,9 +214,13 @@ class SlotLedger:
         """``complete`` (V slots of work not failed), ``exhausted`` (every
         attempt used, fewer than V not failed) or ``open``."""
         position = self._check(index)
-        if self.passing(position) >= self._slots_per_prompt:
+        passing = self.passing(position)
+        if passing >= self._slots_per_prompt:
             return "complete"
         if self._consumed.get(position, 0) >= self.attempt_limit:
+            return "exhausted"
+        # A draw slot out of attempts never fills: the prompt cannot complete once its other slots are taken.
+        if passing + self._exhausted_slots(position) >= self._slots_per_prompt:
             return "exhausted"
         return "open"
 
@@ -215,8 +274,8 @@ class SlotLedger:
 
     @property
     def total(self) -> int:
-        extra = sum(min(len(failed), self.attempt_limit - self._slots_per_prompt)
-                    for failed in self._failed.values())
+        extra = sum(min(self._reopened(position), self.attempt_limit - self._slots_per_prompt)
+                    for position in self._failed)
         return self._prompt_count * self._slots_per_prompt + extra
 
     @property

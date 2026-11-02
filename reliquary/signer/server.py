@@ -40,6 +40,7 @@ def main() -> None:
             if os.environ.get("RELIQUARY_SIGNER_AXON_PORT", "").strip()
             else None
         ),
+        rl_run=os.environ.get("RELIQUARY_SIGNER_RL_RUN", "").strip() or None,
     )
     if (policy.axon_ip is None) != (policy.axon_port is None):
         raise RuntimeError("axon IP and port must be configured together")

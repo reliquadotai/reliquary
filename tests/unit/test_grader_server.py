@@ -692,3 +692,27 @@ def test_worker_stderr_capture_survives_an_ungraceful_server_kill(tmp_path):
         proc.wait(timeout=10.0)
 
     assert set(glob.glob("/tmp/grader-worker-*")) == before
+
+
+def test_a_respawn_that_races_stop_does_not_leave_a_live_worker():
+    from reliquary.environment.grader.server import GraderServer
+
+    short_tmp = tempfile.TemporaryDirectory(prefix="gr-", dir="/tmp")
+    health_path = Path(short_tmp.name) / "grader-health.json"
+    server = GraderServer(
+        socket_path=os.path.join(short_tmp.name, "grader.sock"),
+        pool_size=1,
+        worker_argv=[sys.executable, "-m", "reliquary.environment.grader.worker"],
+        eval_timeout_s=5.0,
+        metrics_port=0,
+        health_path=str(health_path),
+    )
+    server.start()
+    server.stop()
+    # A recycle thread that passed its stop check before stop() spawns its replacement now.
+    late = server._spawn_worker(0)
+    assert late.proc.poll() is not None
+    snapshot = server.health_snapshot()
+    assert snapshot["workers_alive"] == 0
+    assert snapshot["worker_reaped_total"] == snapshot["worker_terminations_total"]
+    short_tmp.cleanup()

@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
 *.egg-info/
 .venv/
 
@@ -64,7 +67,9 @@ reliquary-infra/inventory/known_hosts
 # Local tooling
 .DS_Store
 .coverage
+.coverage.*
 htmlcov/
+/test-results/
 
 # Local restart recovery caches
 rollout-hashes.json.gz

@@ -241,10 +241,12 @@ def test_a_hung_ledger_write_makes_the_next_submission_retryable_not_stuck(
     from reliquary.validator.corpus_service import build_corpus_router
 
     release = asyncio.Event()
+    entered = asyncio.Event()
 
     class _HangingStore(_YieldingStore):
         async def write_ledgers(self, job_id, snapshot, etag):
             if not release.is_set():
+                entered.set()
                 await release.wait()
             return await super().write_ledgers(job_id, snapshot, etag)
 
@@ -266,7 +268,9 @@ def test_a_hung_ledger_write_makes_the_next_submission_retryable_not_stuck(
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://v") as http:
             first = asyncio.create_task(http.post("/corpus/submit", json=_request("5HotA", 0)))
-            await asyncio.sleep(0.02)
+            # The first must hold the ledger lock before the second is sent (a fixed sleep raced on a loaded host:
+            # the second then hung in the write itself, and nothing released it).
+            await asyncio.wait_for(entered.wait(), 60)
             second = await http.post("/corpus/submit", json=_request("5HotB", 1))
             release.set()
             return (await first), second

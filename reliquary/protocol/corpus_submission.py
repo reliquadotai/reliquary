@@ -118,6 +118,10 @@ class CorpusRejectReason(str, Enum):
     SANDBOX_SESSION_REUSED = "sandbox_session_reused"
     SANDBOX_CALL_MISMATCH = "sandbox_call_mismatch"
     SANDBOX_STATE_MISMATCH = "sandbox_state_mismatch"
+    # A forced-draw eval job (``corpus.eval_draw``): this prompt's draw slot (the cursor) was already filled.
+    DRAW_SLOT_TAKEN = "draw_slot_taken"
+    # A draw job's slot another hotkey holds a live lease on (``corpus.draw_leases``).
+    DRAW_SLOT_LEASED = "draw_slot_leased"
 
 
 class CorpusCompletion(BaseModel):
@@ -279,6 +283,45 @@ class CorpusSkipRequest(BaseModel):
     # be full, and the validator bounds the length.
     to_cursor: int = Field(ge=1)
     signature: str = Field(min_length=1)
+
+
+class CorpusLeaseRequest(BaseModel):
+    """A signed request for a light lease on one of a draw job's free slots (``corpus.draw_leases``). ``issued_at``
+    (unix seconds) and ``nonce`` make it single-use: its signature is bound under its own domain."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1, max_length=256)
+    miner_hotkey: str = Field(min_length=1, max_length=64)
+    issued_at: int = Field(ge=0)
+    nonce: str = Field(pattern=r"^[0-9a-f]{32}$")
+    signature: str = Field(min_length=1, max_length=256)
+
+
+class CorpusLeaseReleaseRequest(BaseModel):
+    """A signed release of this hotkey's lease: the slot is free for another miner at once."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1, max_length=256)
+    miner_hotkey: str = Field(min_length=1, max_length=64)
+    lease_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    signature: str = Field(min_length=1, max_length=256)
+
+
+class CorpusLeaseResponse(BaseModel):
+    """``leased`` with the slot (``prompt_index``, ``slot`` = the submission's cursor) until ``expires_at``; else
+    ``reason``: ``job_complete``, ``no_free_slot`` (all leased, try later) or a refusal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    leased: bool
+    reason: str
+    lease_id: str | None = None
+    prompt_index: int | None = None
+    slot: int | None = None
+    expires_at: float | None = None
+    detail: dict[str, Any] = Field(default_factory=dict)
 
 
 class CorpusSkipResponse(BaseModel):

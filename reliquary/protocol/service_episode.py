@@ -19,6 +19,8 @@ PRECOMMIT_SCHEMA = "reliquary/episode-precommit/v1"
 # after a signed abort.
 GROUPS_IN_FLIGHT = 2
 RL_ENGAGEMENT_PREFIX = "rl"
+RL_LEASE_ENGAGEMENT_PREFIX = "rl-lease"
+_LEASE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 MAX_SAFE_INTEGER = 2**53 - 1
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _REVISION = re.compile(r"[0-9a-f]{40}\Z")
@@ -99,6 +101,16 @@ def rl_engagement(window: int, precommit_sha256: str, seed_index: int) -> str:
     _sha(precommit_sha256, "precommit_sha256")
     _uint(seed_index, "seed_index", MAX_ENGAGEMENT_SEED)
     return f"{RL_ENGAGEMENT_PREFIX}:{window}:{precommit_sha256}:{seed_index}"
+
+
+def rl_lease_engagement(lease_id: str, rollout_index: int) -> str:
+    """The engagement a session token names for rollout ``rollout_index`` of an async RL lease (design §4.10):
+    ``rl-lease:{lease_id}:{index}``. The lease id is unique and the lease closes at its first submission, so a
+    transcript can serve no other lease or rollout."""
+    if not isinstance(lease_id, str) or not _LEASE_ID.fullmatch(lease_id):
+        raise EpisodeWireError("lease id: 1-64 characters of [A-Za-z0-9_-]")
+    _uint(rollout_index, "rollout_index", MAX_ENGAGEMENT_SEED)
+    return f"{RL_LEASE_ENGAGEMENT_PREFIX}:{lease_id}:{int(rollout_index)}"
 
 
 def parse_rl_engagement(text: Any) -> tuple[int, str, int]:

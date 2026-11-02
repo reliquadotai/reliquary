@@ -12,6 +12,7 @@ attest = pytest.importorskip("reliquary_sandbox.attest")
 
 from reliquary.corpus.job import parse_job  # noqa: E402
 from reliquary.environment.agentic_swe import SignedSweSource  # noqa: E402
+from reliquary.eval.rows import RowMap  # noqa: E402
 from reliquary.infrastructure.corpus_record_store import RECORD_SCHEMA_V2  # noqa: E402
 from reliquary.infrastructure.sandbox_store import MemorySessionStore  # noqa: E402
 from reliquary.validator.sandbox_wiring import (  # noqa: E402
@@ -23,7 +24,7 @@ from tests.unit.test_corpus_job_episode import _manifest  # noqa: E402
 from tests.unit.test_corpus_job_signed_sandbox import signed_episode  # noqa: E402
 
 JOB = parse_job(_manifest(prompt_count=3, episode=signed_episode()))
-SOURCE = SignedSweSource("train", prompt_of=lambda s, i: "p",
+SOURCE = SignedSweSource(RowMap.identity("train", 0, 100), prompt_of=lambda s, i: "p",
                          row_of=lambda s, i: (None, SimpleNamespace(instance_id=f"repo__{i}")))
 VALIDATOR = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"      # //Bob, ss58 format 42
 
@@ -189,6 +190,25 @@ def test_the_fleet_takes_the_directory_settings(tmp_path):
     assert (fleet._refresh_s, fleet._max_age_s, fleet.directory_read_timeout_s) == (10.0, 45.0, 5.0)
 
 
+def test_machine_scope_configuration_is_optional_and_reaches_the_corpus_fleet(tmp_path):
+    keys = {"RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE": str(tmp_path / "v.pem"),
+            "RELIQUARY_SANDBOX_VALIDATOR_KEY_ID": "v1"}
+    assert SandboxValidatorConfig.from_env(keys).machine_ids is None
+    assert SandboxValidatorConfig.from_env({**keys, "RELIQUARY_SANDBOX_MACHINE_IDS": "[]"}).machine_ids == frozenset()
+    config = SandboxValidatorConfig.from_env({**keys, "RELIQUARY_SANDBOX_MACHINE_IDS": '["machine-b"]'})
+    _, services = _services(tmp_path, machine_ids=config.machine_ids)
+    assert services.fleet._machine_ids == frozenset({"machine-b"})
+
+
+@pytest.mark.parametrize("value", ["", " ", "null", '"machine-b"', "{}", "[1]", '[""]',
+                                    '["../machine-b"]', '["machine-b", "machine-b"]', "[bad]"])
+def test_malformed_machine_scope_is_refused_instead_of_using_all_machines(tmp_path, value):
+    keys = {"RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE": str(tmp_path / "v.pem"),
+            "RELIQUARY_SANDBOX_VALIDATOR_KEY_ID": "v1", "RELIQUARY_SANDBOX_MACHINE_IDS": value}
+    with pytest.raises(ValueError):
+        SandboxValidatorConfig.from_env(keys)
+
+
 def test_a_failed_restore_aborts_the_start(tmp_path):
     _, services = _services(tmp_path)
 
@@ -306,7 +326,7 @@ def test_a_signed_grade_round_trips_through_the_export(tmp_path):
             return self.grades.get(sid)
 
     records = Exported({"sub-1": stored}, verdicts={"sub-1": {"passed": True}})
-    source = SignedSweSource("train", prompt_of=lambda s, i: "Fix task 0.",
+    source = SignedSweSource(RowMap.identity("train", 0, 100), prompt_of=lambda s, i: "Fix task 0.",
                              row_of=lambda s, i: (None, SimpleNamespace(instance_id=f"repo__{i}")))
     grader = SignedEpisodeGrader(job=JOB, records=records, source=source, clock=lambda: NOW + 60)
     assert asyncio.run(grader.grade_one("sub-1"))["status"] == "ok"

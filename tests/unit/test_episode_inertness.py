@@ -10,8 +10,9 @@ What this file proves, behaviourally:
   ones (``-p tests.unit.episode_tripwires``: they legitimately run the phase 1 stack);
 * what a legacy task, a single-turn v2 order and a corpus job put on the wire and on disk is byte for byte what the
   tree before signed episodes (1c6930f4) produced (``tests/unit/legacy_wire_probe.py``, golden
-  ``tests/unit/data/legacy_wire_1c6930f4.json``), with ONE known exception pinned exactly: a remote proof worker's
-  result now carries three ``episode_stop_*`` keys (null for every legacy proof);
+  ``tests/unit/data/legacy_wire_1c6930f4.json``), with intentional changes pinned exactly below: the corrected
+  hard-math artifact updates its registry fingerprints, and a remote proof worker's result carries three
+  ``episode_stop_*`` keys (null for every legacy proof);
 * the corpus validator keeps refusing RL engagements, its routes, its session keys and store prefix.
 
 The tests choose their tripwires explicitly (``legacy_wires`` / ``episode_wires``) instead of the brief's module-wide
@@ -262,7 +263,14 @@ def test_legacy_and_corpus_bytes_are_the_ones_before_plan_2c(section, legacy_wir
     registered environments' manifests, the corpus session documents and keys."""
     from tests.unit import legacy_wire_probe
 
-    assert getattr(legacy_wire_probe, section)() == _golden()[section]
+    expected = _golden()[section]
+    if section == "environments":
+        # Keep the historical snapshot; only the corrected hard-math artifact moved.
+        expected["manifest_sha256"] = "289a652120ec75812ea34f0469d6b860ef40a9fb3109f39451751c5fa304aac4"
+        expected["per_env"]["reliquary_hard_math_v1"] = (
+            "4c2fc572520f5cb9855ea506f1fc965f96e19ee1a75e15ce7597399d8418f295"
+        )
+    assert getattr(legacy_wire_probe, section)() == expected
 
 
 @needs_default_profile

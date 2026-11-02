@@ -16,6 +16,7 @@ from reliquary.corpus.checks import completion_digest  # noqa: E402
 from reliquary.corpus.job import parse_job  # noqa: E402
 from reliquary.corpus.signed_reasons import corpus_engagement, session_seen_key  # noqa: E402
 from reliquary.environment.agentic_swe import SignedSweSource  # noqa: E402
+from reliquary.eval.rows import RowMap  # noqa: E402
 from reliquary.infrastructure import corpus_job_store as job_store  # noqa: E402
 from reliquary.infrastructure.sandbox_store import MemorySessionStore  # noqa: E402
 from reliquary.protocol.corpus_submission import CorpusSubmissionRequest  # noqa: E402
@@ -42,7 +43,7 @@ JOB = parse_job(MANIFEST)
 TOKENIZER = _Tokenizer()
 PROOF = "A" * 200
 DIFF = "diff --git a/x b/x\n"
-SOURCE = SignedSweSource("train", prompt_of=lambda split, index: f"Fix task {index}.")
+SOURCE = SignedSweSource(RowMap.identity("train", 0, 100), prompt_of=lambda split, index: f"Fix task {index}.")
 CALL_ZERO = {"turn": 0, "k": 0, "arguments": {"command": "c0"}, "output": "a.py\n"}
 
 
@@ -187,6 +188,28 @@ def test_an_honest_signed_episode_is_accepted_once(world):
     again = submit(world, final=[TEXT] * 10 + [TERM])         # new tokens, same session
     assert again["reason"] == "sandbox_transcript_invalid"     # the snapshot sees it first
     assert "session_reused" in again["detail"]["reasons"]
+    assert remaining(world) == JOB.slots_per_prompt - 1
+
+
+def test_existing_signed_submission_from_excluded_machine_is_accepted_once(world):
+    from reliquary.sandbox.fleet import Fleet as LiveFleet
+    from tests.unit.sandbox_fixtures import machine_document
+
+    async def documents():
+        return [machine_document(world.machine)]
+
+    async def forbidden_fetch(address):
+        pytest.fail("an excluded machine must not be contacted")
+
+    fleet = LiveFleet(read_documents=documents, fetch_report=forbidden_fetch,
+                      clock=world.clock, machine_ids=set())
+    asyncio.run(fleet.refresh_directory())
+    asyncio.run(fleet.poll_once())
+    world.intake._directory = fleet.directory_if_ready
+    world.issuer._fleet = fleet
+    assert submit(world)["reason"] == "accepted"
+    assert world.book.get("s-1").state == SUBMITTED
+    assert submit(world)["reason"] != "accepted"
     assert remaining(world) == JOB.slots_per_prompt - 1
 
 

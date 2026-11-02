@@ -33,6 +33,7 @@ class _Records:
 
     def __init__(self, n=30, text_len=50, missing=(4,)):
         self.subs, self.verdicts = {}, {}
+        self.voided = set()
         for i in range(n):
             sid = _sid(i)
             self.verdicts[sid] = {"passed": i % 3 != 2, "hotkey": f"HK{i}", "token_count": 2}
@@ -64,6 +65,12 @@ class _Records:
     async def read_submission(self, job_id, sid):
         return await self._track(self.subs.get(sid))
 
+    async def list_voided_ids(self, job_id):
+        return sorted(self.voided)
+
+    async def read_voided(self, job_id, sid):
+        return {} if sid in self.voided else None
+
 
 JOB = SimpleNamespace(job_id="math-v1", filter=None, eos_token_id=EOS,
                       to_contract=lambda: {"job_id": "math-v1", "prompt_count": 30})
@@ -85,7 +92,7 @@ def test_rows_are_the_completions_of_passing_submissions_with_no_hotkey():
     assert all("hotkey" not in r and "HK" not in json.dumps(r) for r in rows)
     assert rows[0]["prompt"] == "q0" and rows[0]["completion_tokens"] == 3
     assert rows[0]["accepted"] is None and rows[0]["score"] is None
-    assert counts == {"verdicts": 6, "passing_submissions": 4, "missing_records": 0,
+    assert counts == {"verdicts": 6, "passing_submissions": 4, "voided": 0, "missing_records": 0,
                       "completions": 8, "rows": 8, "rows_accepted": None,
                       "duplicate_completion": None,
                       "unfinished": {"unfinished_no_eos": 0, "unclosed_think": 0,
@@ -183,6 +190,38 @@ INSTRUCTION_JOB = SimpleNamespace(
 class _RawSource:
     def task_for(self, index):
         return SimpleNamespace(prompt=f"Raw question {index}?", metadata={})
+
+
+@pytest.mark.parametrize("invalidate_after_read", [False, True])
+def test_new_delivery_excludes_invalidated_submissions_from_both_formats(
+    tmp_path, monkeypatch, invalidate_after_read,
+):
+    records = _Records(n=3, missing=())
+    if invalidate_after_read:
+        read_submission = records.read_submission
+
+        async def read(job_id, sid):
+            record = await read_submission(job_id, sid)
+            if sid == _sid(0):
+                records.voided.add(sid)
+            return record
+
+        monkeypatch.setattr(records, "read_submission", read)
+    else:
+        records.voided.add(_sid(0))
+
+    _, manifest = _export(tmp_path, records, job=INSTRUCTION_JOB, dedupe=True,
+                          instruction_source=_RawSource())
+
+    parquet_rows = [row for shard in manifest["shards"]
+                    for row in pq.read_table(tmp_path / "bucket" / shard["key"]).to_pylist()]
+    assert [row["submission_id"] for row in parquet_rows] == [_sid(1), _sid(1)]
+    assert [row["prompt"] for row in _instructions(tmp_path, manifest)] == [
+        "Raw question 1?", "Raw question 1?",
+    ]
+    report = json.loads((tmp_path / "bucket" / manifest["report"]).read_text())
+    assert report["counts"]["voided"] == 1
+    assert report["counts"]["duplicate_completion"] == 0
 
 
 def _instructions(tmp_path, manifest):

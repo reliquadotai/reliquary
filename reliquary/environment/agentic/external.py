@@ -577,10 +577,11 @@ class _ArtifactSourceLoader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
 def load_external_backend(spec: EnvironmentSpec, *, split: str = "train") -> Any:
     """Import the replay entrypoint only after checking its complete artifact.
 
-    Split selection is for offline qualification. Runtime catalog factories use
-    the fixed train split; a different prompt/generator needs a different pin.
+    Runtime catalog factories use the train split; evaluation jobs build an
+    episode environment at another split through `EnvironmentSpec.create`.
+    A different prompt/generator needs a different pin.
     """
-    if split not in ("train", "eval", "qualification"):
+    if split not in ("train", "eval", "qualification", "benchmark"):
         raise ValueError("unsupported external environment split")
     artifact, (module,) = _import_verified(
         spec, lambda artifact: [artifact["entrypoints"]["replay"].partition(":")[0]])
@@ -764,8 +765,10 @@ class ExternalAnswerEnvironment:
         return reward
 
 
-def load_external_episode_environment(spec: EnvironmentSpec) -> ExternalEpisodeEnvironment:
-    return ExternalEpisodeEnvironment(load_external_backend(spec), spec)
+def load_external_episode_environment(
+    spec: EnvironmentSpec, *, split: str = "train",
+) -> ExternalEpisodeEnvironment:
+    return ExternalEpisodeEnvironment(load_external_backend(spec, split=split), spec)
 
 
 def load_external_answer_environment(spec: EnvironmentSpec) -> ExternalAnswerEnvironment:

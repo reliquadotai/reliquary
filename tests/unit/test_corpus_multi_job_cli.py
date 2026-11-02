@@ -26,6 +26,8 @@ def _process_contract():
     from reliquary.constants import PROTOCOL_GENERATION_CONTRACT
 
     contract = _with_enforced_toploc(dict(PROTOCOL_GENERATION_CONTRACT))
+    contract["environments"] = {name: contract["environments"][name]
+                                for name in ("openmathinstruct", "opencodeinstruct")}
     return {**contract, "profile_id": PROFILE_ID, "model_architecture": "Qwen3ForCausalLM"}
 
 
@@ -146,7 +148,7 @@ def test_a_legacy_entry_without_a_contract_refuses():
 # --------------------------------------------------------------------------
 
 
-def _boot(monkeypatch, registry, ids, side_effect=None):  # noqa: F811
+def _boot(monkeypatch, registry, ids, side_effect=None, options=()):  # noqa: F811
     from types import SimpleNamespace
 
     import bittensor
@@ -156,8 +158,10 @@ def _boot(monkeypatch, registry, ids, side_effect=None):  # noqa: F811
     import reliquary.validator.corpus_validator as corpus_validator
 
     monkeypatch.setattr(constants, "TASK_IDS", tuple(ids))
+    monkeypatch.setattr(constants, "TASK_ID", ids[0])
     monkeypatch.setattr(constants, "PROTOCOL_PROFILE_ID", PROFILE_ID)
-    monkeypatch.setattr(constants, "PROTOCOL_GENERATION_CONTRACT", _process_contract())
+    contract = _entries()[ids[0]].contract if len(ids) == 1 else _process_contract()
+    monkeypatch.setattr(constants, "PROTOCOL_GENERATION_CONTRACT", contract)
     monkeypatch.setattr(bittensor, "Wallet", lambda **kw: SimpleNamespace())
 
     async def subtensor():
@@ -172,7 +176,7 @@ def _boot(monkeypatch, registry, ids, side_effect=None):  # noqa: F811
             raise side_effect
 
     monkeypatch.setattr(corpus_validator, "run_corpus_validator", fake_run)
-    return CliRunner().invoke(cli_module.app, ["validate"]), calls
+    return CliRunner().invoke(cli_module.app, ["validate", *options]), calls
 
 
 def test_validate_on_two_corpus_ids_starts_one_validator_for_both(monkeypatch, registry):  # noqa: F811
@@ -187,6 +191,18 @@ def test_validate_on_two_corpus_ids_starts_one_validator_for_both(monkeypatch, r
                                                         ("corpus-code", "code-v1")]
     assert [cap for _, cap in jobs] == [pytest.approx(0.1), pytest.approx(0.2)]
     assert calls[0]["set_weights"] is False
+
+
+@pytest.mark.parametrize("ids", [("corpus-math",), ("corpus-math", "corpus-code")])
+@pytest.mark.parametrize("options, weights", [
+    ([], False), (["--no-set-weights"], False), (["--set-weights"], True),
+])
+def test_corpus_weight_choice(monkeypatch, registry, ids, options, weights):  # noqa: F811
+    registry["entries"] = _entries()
+    result, calls = _boot(monkeypatch, registry, ids, options=options)
+    assert result.exit_code == 0, (result.output, result.exception)
+    assert len(calls) == 1
+    assert calls[0]["set_weights"] is weights
 
 
 def test_validate_on_ids_mixing_rl_and_corpus_exits_four(monkeypatch, registry):  # noqa: F811

@@ -263,6 +263,14 @@ class HttpCorpusClient:
         """Step over a full prompt, or None from a validator without the route."""
         return _unless_absent(lambda: self._http.post(self._path("skip"), json=body))
 
+    def lease(self, body: dict) -> dict | None:
+        """A light lease on a draw job's free slot (``corpus.draw_leases``), or None from a validator that predates
+        leases (404, 405)."""
+        return _unless_absent(lambda: self._http.post(self._path("lease"), json=body), absent=(404, 405))
+
+    def release_lease(self, body: dict) -> dict | None:
+        return _unless_absent(lambda: self._http.post(self._path("lease/release"), json=body), absent=(404, 405))
+
     def open_prompts(self) -> dict | None:
         """Which prompts still have a slot (``slots.parse_open_map`` reads it),
         or None from a validator without the route (404, 405) or a job too
@@ -375,11 +383,16 @@ def _retry(call, *, sleep, counts, max_consecutive_failures):
 def mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
                max_steps: int | None = None, sleep=time.sleep,
                max_consecutive_failures: int = _MAX_CONSECUTIVE_FAILURES,
-               sign_skip=None) -> dict[str, int]:
+               sign_skip=None, sign_lease=None) -> dict[str, int]:
     """``_mine_steps``, ended cleanly (one log line, no retry) when the
     validator says the job is retired."""
     counts: Counter[str] = Counter()
     try:
+        if getattr(job.sampling, "draw", None) is not None:
+            return _mine_draw_steps(job=job, hotkey=hotkey, client=client, generator=generator,
+                                    tokenizer=tokenizer, render=render, sign=sign, max_steps=max_steps,
+                                    sleep=sleep, max_consecutive_failures=max_consecutive_failures,
+                                    counts=counts, sign_lease=sign_lease)
         return _mine_steps(job=job, hotkey=hotkey, client=client, generator=generator,
                            tokenizer=tokenizer, render=render, sign=sign, max_steps=max_steps,
                            sleep=sleep, max_consecutive_failures=max_consecutive_failures,
@@ -388,6 +401,143 @@ def mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
         counts["job_retired"] += 1
         logger.info("corpus job %s is retired; stopping it (%s)", job.job_id, exc)
         return dict(counts)
+
+
+def pick_draw_slot(job, open_body, taken: dict[int, set[int]], closed: set[int], rng) -> tuple[int, int] | None:
+    """A (prompt, draw slot) no one filled, on a prompt the validator says is open: a random open prompt, its
+    lowest free slot. None when nothing is left. The validator's map is a hint (``taken`` adds what this miner
+    learnt since); an unreadable or absent one leaves every prompt a candidate."""
+    from reliquary.corpus.eval_draw import slot_count
+    from reliquary.corpus.slots import parse_open_map
+
+    open_map, remote, extra = None, {}, {}
+    if open_body is not None:
+        try:
+            open_map = parse_open_map(open_body)
+            hint = open_body.get("draw_slots") or {}
+            remote = {int(k): set(v) for k, v in (hint.get("taken") or {}).items()}
+            extra = {int(k): int(v) for k, v in (hint.get("cursors") or {}).items()}
+        except (ValueError, TypeError, AttributeError):
+            open_map, remote, extra = None, {}, {}
+        if open_map is not None and open_map.open_count == 0:
+            return None
+    slots = slot_count(job)
+    candidates = []
+    for prompt in range(job.prompt_start, job.prompt_end):
+        if prompt in closed or (open_map is not None and not open_map.is_open(prompt)):
+            continue
+        free = [k for k in range(max(slots, extra.get(prompt, 0)))
+                if k not in taken.get(prompt, ()) and k not in remote.get(prompt, ())]
+        if free:
+            candidates.append((prompt, free[0]))
+    return rng.choice(candidates) if candidates else None
+
+
+def lease_body(job_id: str, hotkey: str, sign_lease) -> dict:
+    """A fresh signed lease request (``CorpusLeaseRequest``)."""
+    body = {"job_id": job_id, "miner_hotkey": hotkey, "issued_at": int(time.time()),
+            "nonce": secrets.token_hex(16)}
+    body["signature"] = sign_lease(body)
+    return body
+
+
+def release_body(job_id: str, hotkey: str, lease_id: str, sign_lease) -> dict:
+    body = {"job_id": job_id, "miner_hotkey": hotkey, "lease_id": lease_id}
+    body["signature"] = sign_lease(body)
+    return body
+
+
+# A lease refusal after which the miner picks slots from the open map as before (an older validator's answer).
+_LEASE_FALLBACK = frozenset({"signature_unverifiable", "not_a_draw_job", "job_not_served",
+                             # This host's clock or key does not suit the validator: slots from the map as before.
+                             "stale_request", "bad_signature"})
+# Every slot leased or pending its audit: ask again after this many seconds.
+LEASE_WAIT_SECONDS = 30.0
+
+
+def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
+                     max_steps: int | None, sleep, max_consecutive_failures: int,
+                     counts: Counter, sign_lease=None) -> dict[str, int]:
+    """A forced-draw job (``corpus.eval_draw``): each step fills one draw slot of an open prompt, its
+    completions the draw's samples, the slot sent as the cursor. Whatever they score, they are submitted.
+
+    With ``sign_lease``, each step first leases its slot (``corpus.draw_leases``) so no other miner decodes it;
+    a validator without leases is mined from the open map as before."""
+    import random
+
+    from reliquary.corpus.eval_draw import REASON_DRAW_SLOT_TAKEN, draw_context
+    from reliquary.miner.forced_draw import TakenSlots
+
+    retry_kwargs = dict(sleep=sleep, counts=counts, max_consecutive_failures=max_consecutive_failures)
+    rng = random.Random(secrets.randbits(64))
+    taken = TakenSlots()
+    closed: set[int] = set()
+    steps = 0
+    leasing = sign_lease is not None and callable(getattr(client, "lease", None))
+    while max_steps is None or steps < max_steps:
+        steps += 1
+        lease_id = None
+        choice = None
+        if leasing:
+            answer = _retry(lambda: client.lease(lease_body(job.job_id, hotkey, sign_lease)), **retry_kwargs)
+            reason = None if answer is None else str(answer.get("reason"))
+            if answer is not None and answer.get("leased"):
+                choice, lease_id = (int(answer["prompt_index"]), int(answer["slot"])), str(answer["lease_id"])
+            elif reason == "job_complete":
+                counts["job_complete"] += 1
+                break
+            elif reason in _HALT:
+                raise CorpusMinerHalted(f"the validator refused this hotkey: {reason}", counts=dict(counts))
+            elif answer is None or reason in _LEASE_FALLBACK:
+                logger.info("the validator leases no slot (%s): mining from the open map", reason or "no route")
+                leasing = False
+            else:
+                # Every slot leased or awaiting its audit (no_free_slot), or this hotkey's cap: ask again later.
+                counts[f"lease_{reason}"] += 1
+                sleep(LEASE_WAIT_SECONDS)
+                continue
+        if choice is None:
+            reader = getattr(client, "open_prompts", None)
+            open_body = _retry(reader, **retry_kwargs) if reader is not None else None
+            choice = pick_draw_slot(job, open_body, taken.view(now=time.monotonic()), closed, rng)
+        if choice is None:
+            counts["job_complete"] += 1
+            break
+        prompt_index, slot = choice
+        rendered = render(prompt_index)
+        draws = [draw_context(job, prompt_index, slot, c) for c in range(job.sampling.n)]
+        try:
+            generations = generator.generate_drawn(prompt_token_ids(tokenizer, rendered), draws)
+        except ValueError as exc:
+            logger.warning("dropping a corpus generation step: %s", exc)
+            counts["generation_failed"] += 1
+            if lease_id is not None:
+                # Free at once for another miner, rather than at its expiry.
+                _retry(lambda: client.release_lease(release_body(job.job_id, hotkey, lease_id, sign_lease)),
+                       **retry_kwargs)
+            continue
+        body = build_submission(
+            job=job, hotkey=hotkey, cursor=slot, prompt_index=prompt_index,
+            rendered_prompt=rendered, generations=generations, tokenizer=tokenizer, sign=sign,
+        )
+        answer = _retry(lambda: client.submit(body), **retry_kwargs)
+        reason = str(answer.get("reason"))
+        counts[reason] += 1
+        if lease_id is not None and not answer.get("accepted") and reason != REASON_DRAW_SLOT_TAKEN:
+            # Refused but not taken: the slot is free again for another miner at once.
+            _retry(lambda: client.release_lease(release_body(job.job_id, hotkey, lease_id, sign_lease)),
+                   **retry_kwargs)
+        if reason == "job_complete":
+            break
+        if reason in _HALT:
+            raise CorpusMinerHalted(f"the validator refused this hotkey: {reason}", counts=dict(counts))
+        if answer.get("accepted") or reason == REASON_DRAW_SLOT_TAKEN:
+            taken.add(prompt_index, slot, now=time.monotonic())
+        elif reason == "prompt_full":
+            closed.add(prompt_index)
+        else:
+            logger.warning("corpus submission refused: %s %s", reason, answer.get("detail"))
+    return dict(counts)
 
 
 def _mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
@@ -593,7 +743,7 @@ class VllmGenerator:
     """
 
     def __init__(self, checkpoint_dir: str, sampling, proof, eos_token_id: int,
-                 gpu_memory_utilization: float | None = None) -> None:
+                 gpu_memory_utilization: float | None = None, max_prompt_tokens: int | None = None) -> None:
         import os
 
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -602,8 +752,9 @@ class VllmGenerator:
 
         from reliquary.miner.vllm_hidden_capture import capture_hidden_states
 
-        self._capture_cm = capture_hidden_states()
-        self._capture = self._capture_cm.__enter__()
+        # A forced-draw job's samples carry no proof (the draw is their check): nothing to capture.
+        self._capture_cm = None if getattr(sampling, "draw", None) is not None else capture_hidden_states()
+        self._capture = None if self._capture_cm is None else self._capture_cm.__enter__()
         # Only passed when set: a miner alone on its card keeps vLLM's own
         # default, one sharing it (e.g. with a validator) asks for less.
         memory = {} if gpu_memory_utilization is None else {"gpu_memory_utilization": gpu_memory_utilization}
@@ -613,11 +764,24 @@ class VllmGenerator:
         seed = secrets.randbelow(2**31 - 1) + 1
         # vLLM otherwise reserves the checkpoint's own maximum length, whose KV
         # cache need not fit the card; the job never asks for more than this.
-        extra = {"max_model_len": sampling.max_new_tokens + PROMPT_ALLOWANCE_TOKENS,
+        # A long-context job declares its longest prompt (``JobSpec.max_prompt_tokens``).
+        prompt_tokens = max(PROMPT_ALLOWANCE_TOKENS, int(max_prompt_tokens or 0))
+        extra = {"max_model_len": sampling.max_new_tokens + prompt_tokens,
                  "max_num_seqs": MAX_NUM_SEQS}
         if _has_vision_encoder(checkpoint_dir):
             # The job's prompts are text: skip the vision encoder's profiling.
             extra["limit_mm_per_prompt"] = {"image": 0, "video": 0}
+        self._drawn = getattr(sampling, "draw", None) is not None
+        if self._drawn:
+            # A forced-draw eval job (``corpus.eval_draw``): the runner-keyed processor one-hots the draw's pick,
+            # over an fp32 LM head as the validator's check computes it.
+            from reliquary.miner.vllm_generation import (
+                FP32_HEAD_OVERRIDES, RunnerForcedSeedVLLMProcessor, require_runner_forced_draw,
+            )
+
+            require_runner_forced_draw()
+            extra.update(logits_processors=[RunnerForcedSeedVLLMProcessor],
+                         hf_overrides=dict(FP32_HEAD_OVERRIDES))
         self._llm = LLM(model=checkpoint_dir, dtype="bfloat16", enable_prefix_caching=False,
                         seed=seed, **memory, **extra)
         self._params = SamplingParams(
@@ -637,8 +801,29 @@ class VllmGenerator:
         )
         self._proof = proof
 
+    def generate_drawn(self, prompt_ids: list[int], draws: list[dict]) -> list[Generation]:
+        """One completion per forced-seed context (``eval_draw.draw_context``): the argmax of the one-hot the
+        processor leaves, so each is the draw's sample whoever runs it."""
+        from vllm.inputs import TokensPrompt
+
+        from reliquary.miner.vllm_generation import forced_seed_extra_args
+
+        if not self._drawn:
+            raise ValueError("this generator was built for free sampling")
+        params = []
+        for draw in draws:
+            p = self._params.clone()
+            p.temperature, p.top_p, p.top_k = 0.0, 1.0, -1
+            p.extra_args = forced_seed_extra_args(**draw)
+            params.append(p)
+        outputs = self._llm.generate([TokensPrompt(prompt_token_ids=prompt_ids)] * len(draws), params)
+        return self._generations(outputs, [len(prompt_ids)] * len(draws))
+
     def generate(self, prompt_ids: list[int], n: int) -> list[Generation]:
         from vllm.inputs import TokensPrompt
+
+        if self._drawn:
+            raise ValueError("a forced-draw job's samples come from generate_drawn")
 
         outputs = self._llm.generate([TokensPrompt(prompt_token_ids=prompt_ids)] * n, self._params)
         return self._generations(outputs, [len(prompt_ids)] * n)
@@ -665,6 +850,8 @@ class VllmGenerator:
         from reliquary.protocol.toploc_proof import build_chunk_proofs
 
         generations = []
+        if self._capture is None:
+            return [Generation(list(output.outputs[0].token_ids), []) for output in outputs]
         for index, (output, prompt_length) in enumerate(zip(outputs, prompt_lengths)):
             tokens = list(output.outputs[0].token_ids)
             # `pop`, not `for_request`: this generator lives for the whole

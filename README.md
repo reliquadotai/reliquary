@@ -229,9 +229,7 @@ running an operator workload.
 | [Mining](docs/mining.md) | Reference miner, submission lifecycle, hardware, and troubleshooting |
 | [Validating](docs/validating.md) | Weight-only and trainer deployment |
 | [Validator observability](docs/validator_observability.md) | Health, verdict, archive, and runtime evidence |
-| [Historical auction-v2 design](docs/superpowers/specs/2026-07-15-difficulty-auction-v2-design.md) | Origin of the fixed-window selector and payout mechanism; superseded values are non-normative |
 | [Utility foundation](docs/auction-v3-utility-foundation.md) | Observation-only research surface and activation gates |
-| [Security reports](docs/security/) | Incident chronology, hardening decisions, and operator evidence |
 
 Project-wide policies:
 [Contributing](https://github.com/reliquadotai/.github/blob/main/CONTRIBUTING.md)

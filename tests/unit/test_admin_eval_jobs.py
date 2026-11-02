@@ -19,7 +19,6 @@ from reliquary.eval.storage import SubnetEvalStore, publish_set
 from reliquary.infrastructure import corpus_executor_store as executors
 from reliquary.infrastructure import corpus_job_store as job_store
 from tests.unit.test_corpus_job_store import _FakeMultiObjectR2
-from tests.unit.test_eval_sets import opener
 from tests.unit.test_jobs_cli import _rl_entry, registry  # noqa: F401
 
 SECRET = b"admin-secret"
@@ -69,11 +68,12 @@ def admin(tmp_path, monkeypatch, registry):  # noqa: F811
     monkeypatch.setattr(executors, "get_s3_client", lambda **kw: fake)
     monkeypatch.setattr(ps, "_loaded", {})
     registry["entries"] = {"default": _rl_entry("default", 0.5)}
-    build_set("logic", count=8, seed=1, out=tmp_path / "set", open_environment=opener(),
+    from tests.unit.test_eval_grading import GradingEnvironment, _plain_scorer
+
+    build_set("logic", count=8, seed=1, out=tmp_path / "set", open_environment=lambda s, sp: GradingEnvironment(s),
               clock=lambda: 1.0)
     asyncio.run(publish_set(tmp_path / "set", platform=LocalDirectorySink(tmp_path / "p"),
                             subnet=SubnetEvalStore()))
-    from tests.unit.test_eval_grading import GradingEnvironment, _plain_scorer
 
     records = _JobRecords()
     # What the admin reads of a model's own files: per model, facts or an error.

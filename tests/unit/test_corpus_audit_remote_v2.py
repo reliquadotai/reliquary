@@ -195,7 +195,7 @@ async def test_the_router_passes_the_claimed_protocols_and_defaults_to_v1():
     assert await _router_claim({}) == [(AUDIT_PROTOCOL,)]
 
 
-async def _claim_body(prefix):
+async def _claim_bodies(prefix, refuse_v3=False):
     from reliquary.validator.corpus_audit_executor import AuditExecutor
 
     posts = []
@@ -203,18 +203,31 @@ async def _claim_body(prefix):
     class Http:
         async def post(self, path, json=None, **kw):
             posts.append((path, json))
-            return type("R", (), {"status_code": 204, "raise_for_status": lambda self: None,
+            refused = refuse_v3 and path.endswith("/claim") and "reliquary.corpus-audit/v3" in (
+                (json or {}).get("protocols") or ())
+            return type("R", (), {"status_code": 422 if refused else 204, "raise_for_status": lambda self: None,
                                   "json": lambda self: {}})()
 
     executor = AuditExecutor(http=Http(), executor_id="pod-1", token="x", model_id="m",
                              model_revision="r", load_model=lambda m, r: None, prefix=prefix)
     executor._last_heartbeat = executor._clock()
     await executor.step()
-    return next(body for path, body in posts if path.endswith("/claim"))
+    return [body for path, body in posts if path.endswith("/claim")]
 
 
-async def test_the_corpus_claim_carries_protocols_and_the_eval_claim_does_not():
+async def _claim_body(prefix):
+    return (await _claim_bodies(prefix))[-1]
+
+
+async def test_the_claims_carry_v3_and_fall_back_for_a_control_that_predates_it():
+    """v3 (forced draws) on both controls; an older control refuses the field, and the executor claims as
+    before: the corpus control v1+v2, the eval control no protocols field at all."""
     from reliquary.validator.corpus_audit_executor import AUDIT_PREFIX, EVAL_AUDIT_PREFIX
+    from reliquary.validator.corpus_audit_protocol import AUDIT_PROTOCOL_V3
 
-    assert (await _claim_body(AUDIT_PREFIX))["protocols"] == list(BOTH)
-    assert "protocols" not in await _claim_body(EVAL_AUDIT_PREFIX)
+    assert (await _claim_body(AUDIT_PREFIX))["protocols"] == [*BOTH, AUDIT_PROTOCOL_V3]
+    assert (await _claim_body(EVAL_AUDIT_PREFIX))["protocols"] == [AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3]
+    first, retry = await _claim_bodies(AUDIT_PREFIX, refuse_v3=True)
+    assert retry["protocols"] == list(BOTH)
+    first, retry = await _claim_bodies(EVAL_AUDIT_PREFIX, refuse_v3=True)
+    assert "protocols" not in retry

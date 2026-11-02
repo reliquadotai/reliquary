@@ -17,15 +17,16 @@ import logging
 import math
 import os
 import threading
+import time
 import warnings
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import torch
 import torch.utils.checkpoint
 
-from reliquary.validator import telemetry
+from reliquary.validator import optimizer_state, telemetry
 from reliquary.constants import (
-    GRAD_CLIP_NORM, GRAD_NORM_SKIP_THRESHOLD, KL_BETA, LEARNING_RATE,
+    ADAM_BETA2, GRAD_CLIP_NORM, GRAD_NORM_SKIP_THRESHOLD, KL_BETA, LEARNING_RATE,
     LR_WARMUP_WINDOWS,
     MICROBATCH_MAX_PADDED_TOKENS, PPO_CLIP_EPSILON_HIGH, PPO_CLIP_EPSILON_LOW,
     PPO_DUAL_CLIP_C,
@@ -141,12 +142,14 @@ _UNPAD_CACHE_INSTALLED = _install_unpad_sync_cache()
 _optimizer: Optional["torch.optim.Optimizer | _MasterWeightOptimizer"] = None
 _scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None
 _optimizer_model_id: Optional[int] = None
+_state_writer: Optional[optimizer_state.SnapshotWriter] = None
 # Set by the fsdp2 trainer backend (reliquary.trainer.distributed); None means
 # one process, today's path byte for byte.
 _DIST = None
 
 KL_STAT_MAX_KEYS = frozenset({
     "max", "log_ratio_abs_max", "ppo_log_ratio_abs_max", "pi_old_claim_abs_error_max",
+    "draw_rollout_mismatch_max",
 })
 
 
@@ -228,7 +231,7 @@ def _build_optimizer(params) -> torch.optim.Optimizer:
             return cls(
                 params,
                 lr=LEARNING_RATE,
-                betas=(0.9, 0.999),
+                betas=(0.9, ADAM_BETA2),
                 eps=1e-8,
                 weight_decay=0.01,
             )
@@ -240,7 +243,7 @@ def _build_optimizer(params) -> torch.optim.Optimizer:
     return torch.optim.AdamW(
         params,
         lr=LEARNING_RATE,
-        betas=(0.9, 0.999),
+        betas=(0.9, ADAM_BETA2),
         eps=1e-8,
         weight_decay=0.01,
     )
@@ -329,6 +332,8 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
         return True
 
     try:
+        if _DIST is not None:
+            _reshard_fsdp(model)
         params = list(model.parameters())
     except (AttributeError, TypeError):
         logger.warning("_lazy_init: model has no .parameters(); skipping init")
@@ -338,10 +343,15 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
         return False
 
     if _DIST is not None:
+        from torch.distributed.tensor import DTensor
+
+        unsharded = [name for name, p in model.named_parameters() if not isinstance(p, DTensor)]
+        if unsharded:
+            raise RuntimeError(f"fsdp2 optimizer would step unsharded weights: {unsharded[:5]}")
         # FSDP2 shards are fp32 masters already; bitsandbytes cannot step
         # sharded tensors.
         _optimizer = torch.optim.AdamW(
-            params, lr=LEARNING_RATE, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01,
+            params, lr=LEARNING_RATE, betas=(0.9, ADAM_BETA2), eps=1e-8, weight_decay=0.01,
         )
     elif _use_master_weights(params):
         _optimizer = _MasterWeightOptimizer(params, _build_optimizer)
@@ -353,7 +363,8 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
         _optimizer = _build_optimizer(params)
 
     hint = max(0, int(global_step_hint or 0))
-    rewarmup = LR_RESTART_REWARMUP_WINDOWS if hint > 0 else 0
+    restored = hint > 0 and _restore_optimizer_state(hint)
+    rewarmup = LR_RESTART_REWARMUP_WINDOWS if hint > 0 and not restored else 0
 
     def _lr_lambda(step: int) -> float:
         # Linear warmup, then FLAT — DAPO's schedule (§4.1: AdamW, constant
@@ -366,7 +377,7 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
         )
         if rewarmup > 0 and step >= hint:
             # Same-run restart: schedule position was restored, but the
-            # Adam moments were not persisted — a short ramp over the first
+            # Adam moments were not (no matching snapshot) — a short ramp over the first
             # ``rewarmup`` windows after boot lets them re-estimate before
             # full LR ((r+1)-denominator: exactly r windows run reduced).
             base *= min(1.0, (step - hint + 1) / (rewarmup + 1))
@@ -406,6 +417,80 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
     return True
 
 
+def _reshard_fsdp(model) -> None:
+    """Register every FSDP2 unit's sharded parameters again. After a forward FSDP2 leaves the unsharded weights
+    registered on a unit that does not reshard (the base, ``reshard_after_forward=False``) and on one called outside
+    the root's forward (the LM head): an optimizer built from them steps buffers FSDP2 refills from the shards and
+    frees, never the shards themselves (teutonic-rl-async-v1, until 2026-10-24: embed_tokens, model.norm and lm_head
+    never moved, and the optimizer-state snapshot read freed storage)."""
+    from torch.distributed.fsdp import FSDPModule
+
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            module.reshard()
+
+
+def _stepped():
+    """The tensors the optimizer steps (FSDP2 shards or fp32 masters) and the optimizer that holds their state."""
+    if isinstance(_optimizer, _MasterWeightOptimizer):
+        return _optimizer.masters, _optimizer.inner
+    return [p for group in _optimizer.param_groups for p in group["params"]], _optimizer
+
+
+def _rank_world() -> tuple[int, int]:
+    return (_DIST.rank, _DIST.world_size) if _DIST is not None else (0, 1)
+
+
+def _all_ranks_agree(ok: bool) -> bool:
+    if _DIST is None:
+        return ok
+    flag = torch.tensor([1 if ok else 0], device=_DIST.device)
+    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+    return bool(flag.item())
+
+
+def _restore_optimizer_state(hint: int) -> bool:
+    """Load this rank's snapshot at schedule step *hint* if every rank has a valid one (collective under FSDP2)."""
+    root = optimizer_state.state_dir()
+    if root is None:
+        return False
+    params, optimizer = _stepped()
+    rank, world = _rank_world()
+    snap, reason = None, "no snapshot"
+    try:
+        snap = optimizer_state.load(root, rank, world, hint)
+        if snap is not None:
+            reason = optimizer_state.check(params, snap, hint)
+    except Exception as exc:  # noqa: BLE001 - a bad snapshot means a re-warmup, not a crash
+        reason = f"unreadable ({exc})"
+    if not _all_ranks_agree(reason is None):
+        logger.warning("optimizer state not restored at step %d (rank %d: %s)", hint, rank,
+                       reason or "another rank has none")
+        return False
+    optimizer_state.restore(params, optimizer, snap)
+    logger.info("optimizer state restored at step %d (Adam moments and fp32 masters; no re-warmup)", hint)
+    return True
+
+
+def _save_optimizer_state() -> None:
+    """Snapshot to host now, write in the background; never fails the step."""
+    global _state_writer
+    root = optimizer_state.state_dir()
+    if root is None or _scheduler is None:
+        return
+    try:
+        if _state_writer is None:
+            _state_writer = optimizer_state.SnapshotWriter(root, *_rank_world())
+        _state_writer.wait()
+        started = time.monotonic()
+        params, optimizer = _stepped()
+        _state_writer.submit(optimizer_state.snapshot(params, optimizer, int(_scheduler.last_epoch)))
+        logger.info("optimizer state copied to host at step %d in %.1f s", int(_scheduler.last_epoch),
+                    time.monotonic() - started)
+    except Exception:  # noqa: BLE001
+        logger.exception("optimizer state snapshot failed")
+
+
 def current_lr_schedule_step() -> int | None:
     """Exact scheduler position (steps taken), or None before first init.
 
@@ -423,10 +508,13 @@ def reset_training_state() -> None:
     Production code should never call this — it throws away optimiser
     momentum.
     """
-    global _optimizer, _scheduler, _optimizer_model_id
+    global _optimizer, _scheduler, _optimizer_model_id, _state_writer
+    if _state_writer is not None:
+        _state_writer.wait()
     _optimizer = None
     _scheduler = None
     _optimizer_model_id = None
+    _state_writer = None
 
 
 # ---------------------------------------------------------------------------
@@ -1192,6 +1280,108 @@ def _selected_logprobs(
     return torch.cat(parts, dim=0)
 
 
+def training_loss() -> str:
+    """``constants.TRAINING_LOSS``, read at call time so tests and processes can switch it."""
+    from reliquary import constants
+
+    return constants.TRAINING_LOSS
+
+
+class _DrawRows(NamedTuple):
+    """The forced draw recomputed on the trainer's own logits, one entry per scored row."""
+
+    targets: torch.Tensor     # [N] the scored token: v* where drawn, the miner's elsewhere
+    drawn: torch.Tensor       # [N] bool: the row carried a public uniform
+    match: torch.Tensor       # [N] bool: drawn and v* is the miner's token
+    stochastic: torch.Tensor  # [N] bool: max p under the verifier's stochastic threshold
+    entropy: torch.Tensor     # [N] fp32, nats
+    gap: torch.Tensor         # [N] fp32: Gumbel score gap of the miner's token (0: it is v*, or not a Gumbel draw)
+
+
+def _draw_logits(project, weight):
+    """The rows -> logits map the forced draw reads, as the verifier computes it: the
+    profile's fp32 head (``verifier.fp32_head_matmul``) or the head's own projection. The fp32
+    head's weight operand is upcast once here for every chunk of the micro-batch
+    (``verifier.fp32_head_weight``), not once per chunk; it lives as long as the map."""
+    from reliquary.validator.verifier import fp32_head_matmul, fp32_head_weight, lm_head_fp32
+
+    if not lm_head_fp32():
+        return project
+    if weight is None:
+        raise RuntimeError("fp32 LM head: the forced draw needs the head's weight")
+    w = weight.detach().to(torch.bfloat16)
+    w32 = fp32_head_weight(w)
+    return lambda rows: fp32_head_matmul(rows.reshape(-1, rows.shape[-1]).to(torch.bfloat16),
+                                         w, weight_fp32=w32).reshape(*rows.shape[:-1], -1)
+
+
+def _draw_stats(logits: torch.Tensor, threshold: float, *, scratch: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    """(max p < ``threshold``, entropy in nats) per row of ``logits`` [n, vocab], in two full-vocab temporaries
+    at most (one when ``scratch``: the logits are the caller's to overwrite). With ``m`` the row max, ``t = x - m``
+    and ``s = sum exp(t)``: max p = 1 / s and H = log s - sum(exp(t) t) / s, the softmax entropy without
+    materialising log_softmax, probs and their product (four [n, vocab] fp32 tensors before)."""
+    t = logits.float()                          # a copy unless the logits are fp32 already
+    if t is logits and not scratch:
+        t = t.clone()
+    m = t.amax(dim=-1, keepdim=True)
+    t.sub_(m)                                   # <= 0; -inf rows of a masked vocab stay -inf
+    e = t.exp()
+    total = e.sum(dim=-1)
+    weighted = e.mul_(t).nan_to_num_(0.0).sum(dim=-1)   # exp(-inf) * -inf = nan -> 0, as before
+    stochastic = total.reciprocal() < threshold
+    entropy = total.log() - weighted / total
+    return stochastic, entropy
+
+
+@torch.no_grad()
+def _forced_draw_rows(logits_of, rows, targets, draws, chunk: int = _LOGPROB_CHUNK, *,
+                      scratch: bool = False) -> _DrawRows:
+    """v* = the profile's forced pick (``forced_sampling.pick_rows``, the verifier's own) of
+    each row whose public uniform ``draws[i]`` is known (None: keep the miner's token), plus
+    the verifier's stochastic flag and the entropy. ``logits_of`` maps a row chunk to its
+    logits; at most ``chunk`` rows of full-vocab logits live at once, and ``pick_rows``
+    bounds its own noise workspace (or runs the fused Triton pass). ``scratch``: ``logits_of``
+    returns a fresh tensor (a projection), which the stats then overwrite after the pick; an
+    identity map over the caller's logits must leave them intact (False)."""
+    from reliquary.environment.forced_sampling import DRAW_GUMBEL_MAX, gumbel_gaps, pick_rows
+    from reliquary.validator.verifier import draw_settings
+
+    settings = draw_settings()
+    n = int(targets.shape[0])
+    picked = targets.clone()
+    stochastic = torch.zeros(n, dtype=torch.bool, device=targets.device)
+    entropy = torch.zeros(n, dtype=torch.float32, device=targets.device)
+    gap = torch.zeros(n, dtype=torch.float32, device=targets.device)
+    for start in range(0, n, chunk):
+        end = min(n, start + chunk)
+        # A no-grad cast must not seed the checkpointed projection's weight cache.
+        cache_enabled = torch.is_autocast_cache_enabled()
+        try:
+            torch.set_autocast_cache_enabled(False)
+            logits = logits_of(rows[start:end])
+        finally:
+            torch.set_autocast_cache_enabled(cache_enabled)
+        local = [k for k in range(start, end) if draws[k] is not None]
+        if local:
+            # The pick first, on the untouched logits; every row drawn (the usual case) needs no copy.
+            index = torch.tensor(local, device=targets.device, dtype=torch.long)
+            rows_logits = logits if len(local) == end - start else logits.index_select(0, index - start)
+            uniforms = [float(draws[k]) for k in local]
+            if settings.draw == DRAW_GUMBEL_MAX:
+                chosen, gaps = gumbel_gaps(rows_logits, uniforms, targets[index])
+                gap[index] = gaps.to(gap.device)
+            else:
+                chosen = pick_rows(rows_logits, uniforms, draw=settings.draw, t=settings.t,
+                                   top_k=settings.top_k, top_p=settings.top_p)
+            picked[index] = chosen.to(picked.device)
+            del rows_logits
+        stochastic[start:end], entropy[start:end] = _draw_stats(logits, settings.stochastic_threshold,
+                                                                scratch=scratch)
+        del logits
+    drawn = torch.tensor([u is not None for u in draws], dtype=torch.bool, device=targets.device)
+    return _DrawRows(picked, drawn, drawn & (picked == targets), stochastic, entropy, gap)
+
+
 def _hidden_logprob_block(
     hidden_slice: torch.Tensor,
     indices_slice: torch.Tensor,
@@ -1209,7 +1399,10 @@ def _selected_logprobs_from_hidden(
     indices: torch.Tensor,
     lm_head,
     chunk: int = _LOGPROB_CHUNK,
-) -> torch.Tensor:
+    *,
+    draws: list | None = None,
+    weight: torch.Tensor | None = None,
+):
     """Compute selected token logprobs from hidden states in row chunks.
 
     This avoids materialising the full ``sequence × vocab`` logits tensor that
@@ -1217,12 +1410,26 @@ def _selected_logprobs_from_hidden(
     full-logits path is the difference between fitting long rollouts and
     getting killed by memory pressure. Checkpointing keeps backward memory at
     one chunk by recomputing the LM-head/logsumexp block as needed.
+
+    With ``draws`` (one public uniform or None per row) the scored token is v*,
+    the forced pick of these rows' own detached logits (``_forced_draw_rows``),
+    and the result is ``(logprobs, _DrawRows)``. ``weight`` is the head's
+    weight, for the profile's fp32 head; it defaults to ``lm_head.weight``.
     """
     if getattr(lm_head, "fused_selected_logprobs", False):
         # The FSDP2 head (reliquary.trainer.distributed) runs this same chunk
         # loop inside ONE module call, so its sharded weight is gathered once
         # for every chunk and its gradient reduced once.
-        return lm_head(hidden_rows, indices)
+        from reliquary.trainer.distributed import OpaqueArg
+
+        return lm_head(hidden_rows, indices, None if draws is None else OpaqueArg(draws), chunk=chunk)
+    draw_rows = None
+    if draws is not None:
+        draw_rows = _forced_draw_rows(
+            _draw_logits(lm_head, weight if weight is not None else getattr(lm_head, "weight", None)),
+            hidden_rows.detach(), indices, draws, chunk, scratch=True,
+        )
+        indices = draw_rows.targets
     n = hidden_rows.shape[0]
     use_ckpt = hidden_rows.requires_grad
     parts = []
@@ -1240,7 +1447,8 @@ def _selected_logprobs_from_hidden(
         else:
             part = _block(hidden_rows[i:end], indices[i:end])
         parts.append(part)
-    return torch.cat(parts, dim=0)
+    logprobs = torch.cat(parts, dim=0)
+    return logprobs if draw_rows is None else (logprobs, draw_rows)
 
 
 def _base_model_and_lm_head(model):
@@ -1528,12 +1736,19 @@ def _batched_completion_logprobs(
     prompt_lengths,
     lengths,
     policy_positions=None,
+    *,
+    draws: list | None = None,
+    targets: torch.Tensor | None = None,
 ):
     """Selected next-token logprobs over every rollout's completion tokens in a
     right-padded batch, concatenated in row order. Same per-token values as
     ``_selected_logprobs_for_tokens`` (each row depends only on its own hidden
     state) — only the completion-predicting rows are gathered. Returns
     ``(logprobs[N], seg)`` where ``seg[i]`` is rollout i's completion-token count.
+
+    ``targets`` [N] scores other tokens than the batch's own (the substituted
+    v* under a reference forward). ``draws`` [N] (public uniform or None) scores
+    v* picked from this forward's logits and returns ``(logprobs, seg, _DrawRows)``.
     """
     device = input_ids.device
     b_rows: list[int] = []
@@ -1551,7 +1766,8 @@ def _batched_completion_logprobs(
             p_rows.append(int(token_position) - 1)
     b_idx = torch.tensor(b_rows, device=device, dtype=torch.long)
     p_idx = torch.tensor(p_rows, device=device, dtype=torch.long)
-    targets = input_ids[b_idx, p_idx + 1]
+    if targets is None:
+        targets = input_ids[b_idx, p_idx + 1]
     base, lm_head = _base_model_and_lm_head(model)
     if base is not None and lm_head is not None:
         try:
@@ -1560,9 +1776,22 @@ def _batched_completion_logprobs(
             out = base(input_ids, use_cache=False)  # doubles without a mask kwarg
         hidden = _last_hidden_state(out)
         if hidden is not None:
-            return _selected_logprobs_from_hidden(hidden[b_idx, p_idx], targets, lm_head), seg
+            if draws is None:
+                return _selected_logprobs_from_hidden(hidden[b_idx, p_idx], targets, lm_head), seg
+            logprobs, draw_rows = _selected_logprobs_from_hidden(
+                hidden[b_idx, p_idx], targets, lm_head, draws=draws,
+            )
+            return logprobs, seg, draw_rows
     logits = model(input_ids, attention_mask=attention_mask, use_cache=False).logits
-    return _selected_logprobs(logits[b_idx, p_idx], targets), seg
+    if draws is None:
+        return _selected_logprobs(logits[b_idx, p_idx], targets), seg
+    from reliquary.validator.verifier import lm_head_fp32
+
+    if lm_head_fp32():
+        raise RuntimeError("fp32 LM head: this model's logits come materialised from its forward")
+    rows = logits[b_idx, p_idx]
+    draw_rows = _forced_draw_rows(lambda chunk: chunk, rows.detach(), targets, draws)
+    return _selected_logprobs(rows, draw_rows.targets), seg, draw_rows
 
 
 def _new_kl_stats() -> dict[str, float | int]:
@@ -1595,6 +1824,22 @@ def _new_kl_stats() -> dict[str, float | int]:
         "ppo_low_p_outside_count": 0,
         "ppo_high_p_count": 0,
         "ppo_high_p_outside_count": 0,
+        # The substitution loss's forced-draw counters, present only under it.
+        **(_new_draw_stats() if training_loss() == "substitution" else {}),
+    }
+
+
+def _new_draw_stats() -> dict[str, float | int]:
+    return {
+        "draw_token_count": 0,
+        "draw_drawn_count": 0,
+        "draw_substituted_count": 0,
+        "draw_stochastic_count": 0,
+        "draw_stochastic_match_count": 0,
+        "draw_entropy_sum": 0.0,
+        "draw_rollout_count": 0,
+        "draw_rollout_below_floor_count": 0,
+        "draw_rollout_mismatch_max": 0.0,
     }
 
 
@@ -1694,6 +1939,62 @@ def _record_kl_stats(
                 )
 
 
+def _record_draw_stats(stats, draw_rows: _DrawRows, keep_seg: list[int], rollouts, floor: float | None = None) -> None:
+    """Accumulate the forced-draw counters over the trained (kept) rows, and leave each
+    rollout its ``_training_draw_counts = (n_stochastic, n_match)``: the verifier's per-rollout
+    statistic, from the training forward (design 4.7, proposed; acceptance does not read it). ``floor``: the rollout
+    floor the below-floor count reads (the async gate's; default the window path's forced-seed floor)."""
+    if stats is None or "draw_token_count" not in stats:
+        return
+    from reliquary.constants import FORCED_SEED_ROLLOUT_FLOOR, FORCED_SEED_ROLLOUT_MIN_STOCH
+
+    with torch.no_grad():
+        stoch = draw_rows.drawn & draw_rows.stochastic
+        stats["draw_token_count"] += int(draw_rows.drawn.numel())
+        stats["draw_drawn_count"] += int(draw_rows.drawn.sum())
+        stats["draw_substituted_count"] += int((draw_rows.drawn & ~draw_rows.match).sum())
+        stats["draw_stochastic_count"] += int(stoch.sum())
+        stats["draw_stochastic_match_count"] += int((stoch & draw_rows.match).sum())
+        stats["draw_entropy_sum"] += float(draw_rows.entropy.sum())
+        owner = torch.repeat_interleave(
+            torch.arange(len(keep_seg), device=stoch.device),
+            torch.tensor(keep_seg, device=stoch.device),
+        )
+        per_stoch = torch.bincount(owner, weights=stoch.double(), minlength=len(keep_seg)).tolist()
+        per_match = torch.bincount(
+            owner, weights=(stoch & draw_rows.match).double(), minlength=len(keep_seg),
+        ).tolist()
+    for rollout, n_stoch, n_match in zip(rollouts, per_stoch, per_match):
+        if rollout is not None:
+            rollout._training_draw_counts = (int(n_stoch), int(n_match))
+        if n_stoch >= FORCED_SEED_ROLLOUT_MIN_STOCH:
+            rate = n_match / n_stoch
+            stats["draw_rollout_count"] += 1
+            stats["draw_rollout_below_floor_count"] += int(rate < (FORCED_SEED_ROLLOUT_FLOOR if floor is None
+                                                                   else floor))
+            stats["draw_rollout_mismatch_max"] = max(float(stats["draw_rollout_mismatch_max"]), 1.0 - rate)
+
+
+def _draw_telemetry_metrics(stats: dict[str, float | int]) -> dict[str, float]:
+    if "draw_token_count" not in stats:
+        return {}
+    drawn = int(stats["draw_drawn_count"])
+    stochastic = int(stats["draw_stochastic_count"])
+    rollouts = int(stats["draw_rollout_count"])
+    return {
+        # Share of trained tokens scored as v* instead of the miner's token.
+        "train/substitution_rate": int(stats["draw_substituted_count"]) / max(1, drawn),
+        # The verifier's match on stochastic positions (max p < 0.99), from this forward.
+        "train/draw_match_rate": int(stats["draw_stochastic_match_count"]) / max(1, stochastic),
+        "train/draw_stochastic_ratio": stochastic / max(1, drawn),
+        # Below 1.0: trained tokens without public uniforms, scored as the miner's token.
+        "train/draw_coverage_ratio": drawn / max(1, int(stats["draw_token_count"])),
+        "train/entropy": float(stats["draw_entropy_sum"]) / max(1, int(stats["draw_token_count"])),
+        "train/draw_rollout_match_min": 1.0 - float(stats["draw_rollout_mismatch_max"]) if rollouts else 1.0,
+        "train/draw_rollout_below_floor_ratio": int(stats["draw_rollout_below_floor_count"]) / max(1, rollouts),
+    }
+
+
 def _kl_telemetry_metrics(stats: dict[str, float | int]) -> dict[str, float]:
     token_count = int(stats["token_count"])
     denominator = max(1, token_count)
@@ -1787,7 +2088,7 @@ def _kl_telemetry_metrics(stats: dict[str, float | int]) -> dict[str, float]:
             int(stats["ppo_high_p_outside_count"])
             / max(1, int(stats["ppo_high_p_count"]))
         ),
-    }
+    } | _draw_telemetry_metrics(stats)
 
 
 def _microbatch_grad(
@@ -1800,6 +2101,7 @@ def _microbatch_grad(
     kl_stats=None,
     behavior_model=None,
     loss_scale: float = 1.0,
+    gate=None,
 ):
     """Forward + backward one micro-batch. ``batch`` is a list of
     ``(tokens, prompt_length, old_logprobs, advantage, scale, keep)`` where ``scale``
@@ -1811,6 +2113,11 @@ def _microbatch_grad(
     backward fully succeeds, so an OOM mid-backward (gradient-checkpoint
     recompute) leaves already-accumulated ``.grad`` untouched — the failed
     micro-batch contributes nothing and a split-retry stays correct.
+
+    ``gate`` (async trainer only, ``reliquary.trainer.async_trainer``; None in window mode) verifies in
+    this forward: pi_old is the policy itself (ratio 1, one step per checkpoint), and before the backward
+    ``gate.admit(rollouts, tallies)`` gets each rollout's forced-draw tallies and returns which rollouts
+    stay in the loss (None: all).
     """
     B = len(batch)
     T = max(len(it[0]) for it in batch)
@@ -1819,6 +2126,8 @@ def _microbatch_grad(
     plens, lens, olds, advs, scales, keeps, volds, positions = (
         [], [], [], [], [], [], [], []
     )
+    # Substitution loss: one public uniform (or None) per scored row.
+    draws = [] if training_loss() == "substitution" else None
     for j, item in enumerate(batch):
         tokens, p, old, adv, scale, keep, vold = item[:7]
         L = len(tokens)
@@ -1834,6 +2143,9 @@ def _microbatch_grad(
         positions.append(
             list(item[7]) if len(item) > 7 else list(range(p, L))
         )
+        if draws is not None:
+            uniforms = item[8] if len(item) > 8 else None
+            draws.extend(uniforms if uniforms is not None else [None] * len(positions[-1]))
 
     # pi_old from the seal-time verify pass when EVERY row carries it; the
     # no-grad forwards below only run when something still needs them.
@@ -1844,22 +2156,33 @@ def _microbatch_grad(
 
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                         enabled=device.type in ("cuda", "cpu")):
-        new_lp, seg = _batched_completion_logprobs(
-            model, input_ids, attn, plens, lens, positions
-        )
+        draw_rows = scored = None
+        if draws is None:
+            new_lp, seg = _batched_completion_logprobs(
+                model, input_ids, attn, plens, lens, positions
+            )
+        else:
+            # The policy term scores v*, picked from this forward's own logits;
+            # the reference and behavior forwards score the same tokens.
+            new_lp, seg, draw_rows = _batched_completion_logprobs(
+                model, input_ids, attn, plens, lens, positions, draws=draws,
+            )
+            scored = draw_rows.targets
         with torch.no_grad():
             ref_lp = None
             behavior_lp = None
             if need_ref_forward:
                 ref_lp, _ = _batched_completion_logprobs(
-                    ref_model, input_ids, attn, plens, lens, positions
+                    ref_model, input_ids, attn, plens, lens, positions,
+                    targets=scored,
                 )
             if need_pi_forward:
                 if share:
                     behavior_lp = ref_lp
                 else:
                     behavior_lp, behavior_seg = _batched_completion_logprobs(
-                        behavior_model, input_ids, attn, plens, lens, positions
+                        behavior_model, input_ids, attn, plens, lens, positions,
+                        targets=scored,
                     )
                     if behavior_seg != seg:
                         raise ValueError(
@@ -1887,6 +2210,11 @@ def _microbatch_grad(
             raise ValueError("behavior-model completion shape mismatch")
         behavior_old_cat = behavior_lp.detach()
         old_cat = behavior_old_cat
+    if draw_rows is not None and behavior_lp is None:
+        # pi_old (verify pass or claim) scores the miner's token. Where v* differs, its
+        # pi_old is the current policy's own value: the ratio is 1, exact with one step
+        # per checkpoint (design 4.7); the behavior forward above scores v* itself.
+        old_cat = torch.where(draw_rows.match | ~draw_rows.drawn, old_cat, new_lp.detach())
     adv_cat = torch.tensor(
         [advs[k] for k in range(B) for _ in range(seg[k])],
         device=device,
@@ -1897,6 +2225,9 @@ def _microbatch_grad(
         device=device,
         dtype=new_lp.dtype,
     )
+    suspects = None if gate is None or draw_rows is None else _draw_suspects(
+        draw_rows, seg, positions, plens, getattr(gate, "substitute_gap", float("inf")),
+        getattr(gate, "eos_ids", frozenset()))
     keep_cat = torch.tensor(
         [flag for keep in keeps for flag in keep],
         device=device,
@@ -1912,6 +2243,12 @@ def _microbatch_grad(
     adv_cat = adv_cat[keep_cat]
     scale_cat = scale_cat[keep_cat]
     keep_seg = [sum(1 for flag in keep if flag) for keep in keeps]
+    if draw_rows is not None:
+        draw_rows = _DrawRows(*(field[keep_cat] for field in draw_rows))
+    if gate is not None:
+        new_lp, ref_lp, old_cat, claimed_old_cat, behavior_old_cat, adv_cat, scale_cat, draw_rows, keep_seg = (
+            _gate_rows(gate, kl_stats, batch, new_lp, ref_lp, claimed_old_cat, behavior_old_cat, adv_cat,
+                       scale_cat, draw_rows, keep_seg, suspects))
     ppo_log_ratio = new_lp - old_cat
     ratio = torch.exp(ppo_log_ratio)
     surr, clip_active = _clipped_surrogate(ratio, adv_cat)
@@ -1943,7 +2280,7 @@ def _microbatch_grad(
         (loss * loss_scale).backward()
 
     _record_kl_stats(
-        kl_stats,
+        kl_stats if new_lp.numel() else None,
         ppo_tok=ppo_tok,
         kl_tok=kl_tok,
         kl_log=kl_log,
@@ -1957,33 +2294,148 @@ def _microbatch_grad(
         kl_term_computed=ref_lp is not None,
         pi_old=old_cat,
     )
+    if draw_rows is not None and gate is None:
+        _record_draw_stats(
+            kl_stats, draw_rows, keep_seg, [item[9] if len(item) > 9 else None for item in batch],
+        )
 
     sum_ppo = sum_kl = 0.0
     off = 0
     with torch.no_grad():
         for n in keep_seg:
+            if n == 0:
+                continue  # a rollout the gate kept out of the loss
             sum_ppo += float(ppo_tok[off:off + n].mean())
             sum_kl += float(kl_tok[off:off + n].mean())
             off += n
     return sum_ppo, sum_kl, B
 
 
+def _rollout_draw_tallies(draw_rows: _DrawRows, keep_seg: list[int]) -> list[tuple[int, int, int, int]]:
+    """Per rollout, over its kept rows: (stochastic, stochastic matches, drawn, drawn matches)."""
+    with torch.no_grad():
+        owner = torch.repeat_interleave(
+            torch.arange(len(keep_seg), device=draw_rows.drawn.device),
+            torch.tensor(keep_seg, device=draw_rows.drawn.device),
+        )
+        stoch = draw_rows.drawn & draw_rows.stochastic
+        cols = torch.stack([stoch, stoch & draw_rows.match, draw_rows.drawn, draw_rows.drawn & draw_rows.match], 1)
+        out = torch.zeros(len(keep_seg), 4, dtype=torch.float64, device=cols.device)
+        out.index_add_(0, owner, cols.double())
+    return [tuple(int(v) for v in row) for row in out.tolist()]
+
+
+# Per-rollout drift telemetry row (async gate): fixed width so the gate can all-reduce it per slot.
+DRIFT_POSITION_EDGES = (1024, 8192, 32768)          # scored-token position buckets: <1k, 1k-8k, 8k-32k, >=32k
+DRIFT_ENTROPY_EDGES = (0.5, 1.5)                    # nats, stochastic positions only
+DRIFT_GAP_EDGES = (0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0)  # Gumbel gap of mismatched drawn tokens
+_DRIFT_POS = len(DRIFT_POSITION_EDGES) + 1
+_DRIFT_ENT = len(DRIFT_ENTROPY_EDGES) + 1
+_DRIFT_GAP = len(DRIFT_GAP_EDGES) + 1
+# entropy sum, rows | (stochastic, matches) per position bucket | (stochastic, matches) per entropy bucket | gap bins
+DRIFT_WIDTH = 2 + 2 * _DRIFT_POS + 2 * _DRIFT_ENT + _DRIFT_GAP
+
+
+def _rollout_drift_rows(draw_rows: _DrawRows, keep_seg: list[int]) -> list[list[float]]:
+    """Per rollout, over its kept rows, the ``DRIFT_WIDTH`` counters the async gate breaks down by lag and env."""
+    with torch.no_grad():
+        device = draw_rows.drawn.device
+        n_seg = len(keep_seg)
+        out = torch.zeros(n_seg, DRIFT_WIDTH, dtype=torch.float64, device=device)
+        if not n_seg or int(draw_rows.drawn.numel()) == 0:
+            return out.tolist()
+        lengths = torch.tensor(keep_seg, device=device)
+        owner = torch.repeat_interleave(torch.arange(n_seg, device=device), lengths)
+        starts = torch.cumsum(lengths, 0) - lengths
+        position = torch.arange(owner.numel(), device=device) - starts[owner]
+        stoch = (draw_rows.drawn & draw_rows.stochastic).double()
+        match = (draw_rows.drawn & draw_rows.stochastic & draw_rows.match).double()
+        out[:, 0].index_add_(0, owner, draw_rows.entropy.double())
+        out[:, 1].index_add_(0, owner, torch.ones_like(stoch))
+        col = 2
+        for bucket, count in ((torch.bucketize(position, torch.tensor(DRIFT_POSITION_EDGES, device=device),
+                                               right=True), _DRIFT_POS),
+                              (torch.bucketize(draw_rows.entropy.float(),
+                                               torch.tensor(DRIFT_ENTROPY_EDGES, device=device), right=True),
+                               _DRIFT_ENT)):
+            flat = torch.zeros(n_seg * count, dtype=torch.float64, device=device)
+            index = owner * count + bucket
+            out[:, col:col + 2 * count:2] = flat.index_add(0, index, stoch).view(n_seg, count)
+            out[:, col + 1:col + 2 * count:2] = flat.index_add(0, index, match).view(n_seg, count)
+            col += 2 * count
+        miss = (draw_rows.drawn & ~draw_rows.match).double()
+        bins = torch.bucketize(draw_rows.gap.float(), torch.tensor(DRIFT_GAP_EDGES, device=device), right=True)
+        flat = torch.zeros(n_seg * _DRIFT_GAP, dtype=torch.float64, device=device)
+        out[:, col:col + _DRIFT_GAP] = flat.index_add(0, owner * _DRIFT_GAP + bins, miss).view(n_seg, _DRIFT_GAP)
+    return out.tolist()
+
+
+def _draw_suspects(draw_rows: _DrawRows, seg: list[int], positions, plens, substitute_gap: float,
+                   stop_ids=frozenset()):
+    """Per rollout, over every scored row (before the keep mask): (largest Gumbel gap, [(completion position, v*)]
+    of the mismatches whose gap exceeds ``substitute_gap``, or whose pick is one of ``stop_ids`` (the draw ended the
+    rollout there, whatever the gap), the last scored row's gap or None when it carried no draw): what the gate's
+    gap and termination tests and the re-grading read."""
+    with torch.no_grad():
+        gaps = draw_rows.gap.tolist()
+        picks = draw_rows.targets.tolist()
+        drawn = draw_rows.drawn.tolist()
+        matched = draw_rows.match.tolist()
+    out, offset = [], 0
+    for k, n in enumerate(seg):
+        rows = range(offset, offset + n)
+        offset += n
+        last = rows[-1] if n else None
+        out.append((max((gaps[r] for r in rows), default=0.0),
+                    [(int(positions[k][r - rows.start]) - int(plens[k]), int(picks[r]))
+                     for r in rows if gaps[r] > substitute_gap
+                     or (drawn[r] and not matched[r] and int(picks[r]) in stop_ids)],
+                    None if last is None or not drawn[last] else gaps[last]))
+    return out
+
+
+def _gate_rows(gate, kl_stats, batch, new_lp, ref_lp, claimed_old, behavior_old, adv_cat, scale_cat,
+               draw_rows, keep_seg, suspects=None):
+    """The async trainer's verification between forward and backward (design 4.7): pi_old := the policy
+    (ratio 1), the draw counters recorded over every forwarded rollout, then the rollouts ``gate`` refuses
+    (under the floor, or a token too far from the pick) leave the loss."""
+    if draw_rows is None:
+        raise RuntimeError("the async trainer's gate needs the substitution loss")
+    rollouts = [item[9] if len(item) > 9 else None for item in batch]
+    _record_draw_stats(kl_stats, draw_rows, keep_seg, rollouts, getattr(gate, "rollout_floor", None))
+    for rollout, row in zip(rollouts, _rollout_drift_rows(draw_rows, keep_seg)):
+        if rollout is not None:
+            rollout._drift_row = row
+    admitted = gate.admit(rollouts, _rollout_draw_tallies(draw_rows, keep_seg), suspects)
+    old_cat = new_lp.detach()
+    if admitted is None or all(admitted):
+        return new_lp, ref_lp, old_cat, claimed_old, behavior_old, adv_cat, scale_cat, draw_rows, keep_seg
+    rows = torch.repeat_interleave(
+        torch.tensor([bool(a) for a in admitted], device=new_lp.device),
+        torch.tensor(keep_seg, device=new_lp.device),
+    )
+    pick = lambda t: None if t is None else t[rows]  # noqa: E731
+    return (new_lp[rows], pick(ref_lp), old_cat[rows], claimed_old[rows], pick(behavior_old), adv_cat[rows],
+            scale_cat[rows], _DrawRows(*(field[rows] for field in draw_rows)),
+            [n if a else 0 for n, a in zip(keep_seg, admitted)])
+
+
 def _process_microbatch(
     model, ref_model, batch, device, *, atomic, kl_stats=None,
-    behavior_model=None, loss_scale: float = 1.0,
+    behavior_model=None, loss_scale: float = 1.0, gate=None,
 ):
     """One micro-batch; when atomic, on OOM halve and retry down to a single
     sequence (which, if it still OOMs, is a genuine unrecoverable OOM)."""
     if not atomic:
         return _microbatch_grad(
             model, ref_model, batch, device, atomic=False, kl_stats=kl_stats,
-            behavior_model=behavior_model, loss_scale=loss_scale,
+            behavior_model=behavior_model, loss_scale=loss_scale, gate=gate,
         )
     oom = False
     try:
         return _microbatch_grad(
             model, ref_model, batch, device, atomic=True, kl_stats=kl_stats,
-            behavior_model=behavior_model,
+            behavior_model=behavior_model, gate=gate,
         )
     except torch.cuda.OutOfMemoryError:
         if len(batch) == 1:
@@ -1997,18 +2449,18 @@ def _process_microbatch(
         mid = len(batch) // 2
         a = _process_microbatch(
             model, ref_model, batch[:mid], device,
-            atomic=True, kl_stats=kl_stats, behavior_model=behavior_model,
+            atomic=True, kl_stats=kl_stats, behavior_model=behavior_model, gate=gate,
         )
         b = _process_microbatch(
             model, ref_model, batch[mid:], device,
-            atomic=True, kl_stats=kl_stats, behavior_model=behavior_model,
+            atomic=True, kl_stats=kl_stats, behavior_model=behavior_model, gate=gate,
         )
         return a[0] + b[0], a[1] + b[1], a[2] + b[2]
 
 
 def _build_microbatch_items(plan):
     """Flatten plan -> list of (tokens, prompt_length, old_logprobs, advantage,
-    scale, keep, validator_old_logprobs), dropping rollouts the per-rollout path would have skipped (missing
+    scale, keep, validator_old_logprobs, positions, draw_uniforms, rollout), dropping rollouts the per-rollout path would have skipped (missing
     prompt_length/token_logprobs, or a miner/model completion-length mismatch).
     ``scale`` is the per-token loss weight w_e/N_e carried from the plan entry."""
     items = []
@@ -2042,8 +2494,20 @@ def _build_microbatch_items(plan):
                 tokens, p, old, adv, scale, keep,
                 _validator_completion_logprobs(rollout, n_completion),
                 positions,
+                _forced_draw_uniforms(rollout, n_completion),
+                rollout,
             ))
     return items
+
+
+def _forced_draw_uniforms(rollout, n_completion: int):
+    """The public uniforms of this rollout's policy positions (``_forced_draw_uniforms``,
+    attached by the batcher from the verifier's own stream), or None when absent or the
+    wrong length: the substitution loss then scores the miner's tokens for this rollout."""
+    values = getattr(rollout, "_forced_draw_uniforms", None)
+    if not isinstance(values, (list, tuple)) or len(values) != n_completion or n_completion == 0:
+        return None
+    return [float(v) for v in values]
 
 
 def _padding_pass(model, device) -> None:
@@ -2058,7 +2522,7 @@ def _padding_pass(model, device) -> None:
 
 def _accumulate_grouped_grads(
     model, ref_model, plan, device, *, budget, atomic, kl_stats=None,
-    behavior_model=None,
+    behavior_model=None, gate=None,
 ):
     """Pack the plan's rollouts into token-budget micro-batches and accumulate
     gradients. Returns ``(total_ppo, total_kl, n_processed)``."""
@@ -2089,7 +2553,7 @@ def _accumulate_grouped_grads(
         sp, sk, n = _process_microbatch(
             model, ref_model, [items[i] for i in idxs], device,
             atomic=atomic, kl_stats=kl_stats,
-            behavior_model=behavior_model, loss_scale=loss_scale,
+            behavior_model=behavior_model, loss_scale=loss_scale, gate=gate,
         )
         total_ppo += sp
         total_kl += sk
@@ -2111,6 +2575,7 @@ def train_step(
     behavior_model=None,
     window_index: int | None = None,
     global_step_hint: int | None = None,
+    gate=None,
 ) -> Any:
     """Run one GRPO step over the union of *batches*.
 
@@ -2128,6 +2593,11 @@ def train_step(
 
     *window_index* is used as the wandb step when telemetry is enabled.
     Safe to omit in tests.
+
+    *gate* (async trainer, ``reliquary.trainer.async_trainer.DrawGate``; None in window mode) makes the
+    training forward the verification: rollouts under the floor leave the loss before their backward,
+    then ``gate.judge`` pools each group's tallies and a failed group's admitted rollouts are backed out
+    by a second pass with negated advantages before the optimizer step (only failed groups pay it).
     """
     if not batches or all(not b for b in batches):
         logger.info("train_step: empty batch, skipping")
@@ -2175,12 +2645,13 @@ def train_step(
     # partial grads and retry the whole pass with the atomic split-retry path at
     # a halved budget (atomic = an OOM mid-backward commits no gradient).
     kl_stats = _new_kl_stats()
+    budget, atomic = _microbatch_budget(), False
     try:
         total_ppo, total_kl, n_processed = _accumulate_grouped_grads(
             model, ref_model, plan, device,
-            budget=_microbatch_budget(), atomic=False,
+            budget=budget, atomic=atomic,
             kl_stats=kl_stats,
-            behavior_model=behavior_model,
+            behavior_model=behavior_model, gate=gate,
         )
     except torch.cuda.OutOfMemoryError:
         if _DIST is not None:
@@ -2190,12 +2661,22 @@ def train_step(
         _reset_logit_histogram()
         torch.cuda.empty_cache()
         kl_stats = _new_kl_stats()
+        if gate is not None:
+            gate.reset()
+        budget, atomic = max(1, _microbatch_budget() // 2), True
         total_ppo, total_kl, n_processed = _accumulate_grouped_grads(
             model, ref_model, plan, device,
-            budget=max(1, _microbatch_budget() // 2), atomic=True,
+            budget=budget, atomic=atomic,
             kl_stats=kl_stats,
-            behavior_model=behavior_model,
+            behavior_model=behavior_model, gate=gate,
         )
+    if gate is not None:
+        undo = gate.judge(plan, _DIST)
+        if undo:
+            _accumulate_grouped_grads(
+                model, ref_model, undo, device, budget=budget, atomic=atomic,
+                behavior_model=behavior_model, gate=gate.replay(),
+            )
 
     if _DIST is not None:
         from reliquary.trainer.distributed import all_reduce_stats
@@ -2287,6 +2768,8 @@ def train_step(
         failure_metrics.update(overlong_metrics)
         failure_metrics.update(environment_metrics)
         failure_metrics.update(_logit_metrics())
+        if gate is not None:
+            failure_metrics.update(gate.metrics())
         telemetry.log_training_step(failure_metrics, step=window_index)
         _optimizer.zero_grad(set_to_none=True)
         raise TrainingStepSkipped(
@@ -2296,6 +2779,7 @@ def train_step(
         )
     _optimizer.step()
     _scheduler.step()
+    _save_optimizer_state()
     # Backward (and its checkpoint recomputes) are done: release this
     # thread's pinned unpad slot so the ~1 MB goes back to the allocator.
     _clear_unpad_sync_cache()
@@ -2351,6 +2835,8 @@ def train_step(
     metrics.update(overlong_metrics)
     metrics.update(environment_metrics)
     metrics.update(_logit_metrics())
+    if gate is not None:
+        metrics.update(gate.metrics())
     telemetry.log_training_step(metrics, step=window_index)
 
     return model

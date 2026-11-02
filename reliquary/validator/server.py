@@ -3895,7 +3895,9 @@ class ValidatorServer:
         self,
         batchers: dict[str, GrpoWindowBatcher],
     ) -> None:
-        """Prewarm auction workers before a candidate window becomes OPEN."""
+        """Prepare prompt metadata and auction workers before a candidate becomes OPEN."""
+        for batcher in batchers.values():
+            await asyncio.to_thread(len, batcher.env)
         if not self._auction_admission_enabled:
             return
         for environment, batcher in batchers.items():
@@ -6184,7 +6186,7 @@ class ValidatorServer:
                     prompt_range = window_prompt_range(
                         batcher.randomness,
                         getattr(batcher.env, "name", environment),
-                        len(batcher.env),
+                        await asyncio.to_thread(len, batcher.env),
                         PROMPT_RANGE_SIZE,
                     )
                 if prompt_range is None:
@@ -6536,6 +6538,18 @@ class ValidatorServer:
         from reliquary.validator.http_metrics import HttpMetricsMiddleware
         app.add_middleware(HttpMetricsMiddleware, metrics=self.http_metrics)
         return app
+
+    def mount_rl_lease_router(self, router: Any) -> None:
+        """Serve the async-RL lease routes (``POST /rl/lease``, ``GET /rl/quota``, ``GET
+        /rl/lease/commitments``, ``GET /rl/prompts/state``) built by ``rl_lease_routes.build_rl_lease_router``.
+        The async validator mounts them (``rl_async_service.mount_rl_async``, ``RELIQUARY_RL_MODE=async``).
+        A route the router serves replaces the app's own at the same path and method (the async ``GET /rl/pay``
+        replaces the window board's)."""
+        served = {(getattr(r, "path", None), m) for r in router.routes for m in (getattr(r, "methods", None) or ())}
+        self.app.router.routes[:] = [
+            r for r in self.app.router.routes
+            if not any((getattr(r, "path", None), m) in served for m in (getattr(r, "methods", None) or ()))]
+        self.app.include_router(router)
 
     def mount_corpus_router(
         self,

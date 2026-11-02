@@ -1,0 +1,34 @@
+# The evaluation runtime is isolated from validator and training images.
+FROM vllm/vllm-openai@sha256:3e10e8189823e0f7ae4620c271bcdaaf64127ec7d0edc351591a508498b7684a
+
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/evaluation-source
+COPY pyproject.toml README.md ./
+COPY reliquary ./reliquary
+COPY tests/fixtures/reliquarylogic_v1.jsonl ./tests/fixtures/reliquarylogic_v1.jsonl
+# Resolve the real package dependencies; never bypass incompatible metadata.
+RUN python3 -c "from importlib.metadata import version; import torch; assert version('torch').split('+')[0] == '2.13.0'; assert torch.version.cuda == '12.9'; print('torch==' + version('torch'))" \
+        > /tmp/evaluation-constraints.txt \
+    && python3 -m pip install --no-cache-dir --constraint /tmp/evaluation-constraints.txt \
+        '.[sandbox-miner]' 'vllm==0.29.0' 'mcp>=1.24,<2' 'renderers==0.1.11' \
+    && python3 -m pip check \
+    && python3 -c "import torch; assert torch.version.cuda == '12.9'" \
+    && rm /tmp/evaluation-constraints.txt
+
+RUN useradd --uid 10001 --user-group --create-home --home-dir /home/evaluation evaluation \
+    && mkdir -p /opt/reliquary-eval /home/evaluation/.cache \
+    && chown -R evaluation:evaluation /opt/reliquary-eval /home/evaluation
+ENV HOME=/home/evaluation \
+    HF_HOME=/home/evaluation/.cache/huggingface \
+    VLLM_CACHE_ROOT=/home/evaluation/.cache/vllm \
+    TRITON_CACHE_DIR=/home/evaluation/.cache/triton \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TOKENIZERS_PARALLELISM=false
+WORKDIR /opt/reliquary-eval
+USER 10001:10001
+HEALTHCHECK NONE
+# The provider supplies the existing authenticated `reliquary eval run` command.
+ENTRYPOINT []
+CMD ["reliquary", "eval", "run", "--help"]
