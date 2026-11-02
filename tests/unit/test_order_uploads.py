@@ -192,6 +192,8 @@ def test_an_upload_set_serves_through_the_eval_set_path_as_token_ids():
     # One endpoint per set: its delivery answers in that endpoint's object.
     assert [r["url"] for r in chats.rows] == [CHAT_URL]
     assert [r["url"] for r in completions.rows] == [COMPLETIONS_URL] * 2
+    assert chats.summary()["url"] == CHAT_URL
+    assert completions.summary()["url"] == COMPLETIONS_URL
     expected = [(chats, [token_ids_text(ids("<|user|>hi\n<|assistant|>"))]),
                 (completions, [token_ids_text([9, 8]), token_ids_text(ids("yo"))])]
     for prompt_set, prompts in expected:
@@ -317,3 +319,20 @@ def test_the_route_hashes_an_object_the_platform_could_not(admin):
     assert answer.json()["sha256"] == hashlib.sha256(body).hexdigest()
     # The same object again, with or without its hash: the first answer.
     assert admin(unhashed).json() == answer.json() == admin(request).json()
+
+
+
+@pytest.mark.parametrize("parameter", ["temperature", "top_k", "seed"])
+def test_an_oversized_number_is_only_a_line_error(parameter):
+    out = compile_(completion("ok", "fine"), completion("bad", "x", **{parameter: 10**400}))
+    assert [error.code for error in out.errors] == ["invalid_parameter"]
+    assert [row["custom_id"] for row in out.sets[0].rows] == ["ok"]
+
+
+def test_upload_seeds_preserve_the_json_safe_integer_boundary():
+    safe = 2**53 - 1
+    out = compile_(completion("safe", "x", seed=safe),
+                   completion("unsafe", "y", seed=safe + 1))
+    assert out.sets[0].sampling["seed"] == safe
+    assert [row["custom_id"] for row in out.sets[0].rows] == ["safe"]
+    assert [(e.custom_id, e.code) for e in out.errors] == [("unsafe", "invalid_parameter")]

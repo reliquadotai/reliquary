@@ -173,6 +173,7 @@ def test_v3_openai_jsonl_holds_one_line_per_prompt_with_its_samples(tmp_path):
     body = lines[0]["response"]["body"]
     assert lines[0]["error"] is None and lines[0]["response"]["status_code"] == 200
     assert body["object"] == "text_completion" and body["model"] == "org/model"
+    assert body["created"] == 5  # Stable export timestamp, not a generation timestamp.
     assert [(c["index"], c["text"], c["finish_reason"]) for c in body["choices"]] == [
         (0, "p0s0", "stop"), (1, "p0s1", "length")]
     assert body["usage"] == {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}
@@ -183,6 +184,7 @@ def test_v3_openai_jsonl_answers_a_chat_request_with_a_chat_completion(tmp_path)
     _, root = _export(tmp_path, _job(), _Records(), set_rows=rows, output_format="openai_jsonl")
     body = json.loads((root / "output-00000.jsonl").read_text().splitlines()[0])["response"]["body"]
     assert body["object"] == "chat.completion"
+    assert body["created"] == 5
     assert body["choices"][0]["message"] == {"role": "assistant", "content": "p0s0"}
 
 

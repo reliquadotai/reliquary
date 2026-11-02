@@ -738,7 +738,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             declared_source = {"env": body.env, "prompt_start": body.prompt_start, "problems": body.prompt_count,
                                "environment_manifest_sha256": getattr(
                                    ENVIRONMENT_CATALOG.get(body.env), "environment_manifest_sha256", None)}
-        longest = (body.max_prompt_tokens or 0) + body.max_new_tokens
+        from reliquary.miner.corpus_miner import PROMPT_ALLOWANCE_TOKENS
+
+        longest = max(PROMPT_ALLOWANCE_TOKENS, body.max_prompt_tokens or 0) + body.max_new_tokens
         if pin.max_position_embeddings is not None and longest > pin.max_position_embeddings:
             raise HTTPException(status_code=422, detail=(
                 f"context_too_long: {longest} tokens, the model holds {pin.max_position_embeddings}"))

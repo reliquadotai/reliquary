@@ -133,6 +133,7 @@ class PromptSet:
 
     def summary(self) -> dict:
         return {"set_id": self.set_id, "prompt_source": self.prompt_source, "count": self.count,
+                "url": self.rows[0]["url"],
                 "sampling": dict(self.sampling), "prompt_tokens_max": self.prompt_tokens_max,
                 "prompt_tokens_total": self.prompt_tokens_total,
                 "prompts_sha256": self.prompts_sha256, "graded": self.grading_body is not None}
@@ -179,9 +180,13 @@ def _number(value, name: str, *, integer: bool = False):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or (
             isinstance(value, float) and not math.isfinite(value)):
         raise _Bad("invalid_parameter", f"{name} must be a number")
-    if integer and not float(value).is_integer():
+    try:
+        numeric = float(value)
+    except OverflowError:
+        raise _Bad("invalid_parameter", f"{name} is too large") from None
+    if integer and not numeric.is_integer():
         raise _Bad("invalid_parameter", f"{name} must be a whole number")
-    return int(value) if integer else float(value)
+    return int(value) if integer else numeric
 
 
 def _sampling(body: Mapping) -> dict:
@@ -212,8 +217,9 @@ def _sampling(body: Mapping) -> dict:
     seed = body.get("seed")
     if seed is not None:
         seed = _number(seed, "seed", integer=True)
-        if not 0 <= seed <= 2**63 - 1:
-            raise _Bad("invalid_parameter", "seed must be in [0, 2^63 - 1]")
+        # The platform carries this value through JSON numbers without loss.
+        if not 0 <= seed <= 2**53 - 1:
+            raise _Bad("invalid_parameter", "seed must be in [0, 2^53 - 1]")
     n = _number(body.get("n", 1), "n", integer=True)
     if not 1 <= n <= MAX_SAMPLES:
         raise _Bad("invalid_parameter", f"n must be in [1, {MAX_SAMPLES}]")

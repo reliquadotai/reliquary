@@ -563,7 +563,7 @@ def _openai_choice(row: Mapping, *, chat: bool, index: int) -> dict:
     return choice
 
 
-def openai_line(rows: list[Mapping], *, job, chat: bool) -> dict:
+def openai_line(rows: list[Mapping], *, job, chat: bool, created_at: float) -> dict:
     """One OpenAI Batch output line for one prompt: its delivered samples as choices, in sample order."""
     first = rows[0]
     custom = first["custom_id"] if first["custom_id"] is not None else f"prompt-{first['prompt_index']}"
@@ -572,7 +572,7 @@ def openai_line(rows: list[Mapping], *, job, chat: bool) -> dict:
     completion_tokens = sum(int(r["completion_tokens"]) for r in rows)
     body = {"id": f"{'chatcmpl' if chat else 'cmpl'}-{hashlib.sha256(request_id.encode()).hexdigest()[:24]}",
             "object": "chat.completion" if chat else "text_completion",
-            "model": job.checkpoint_repo,
+            "model": job.checkpoint_repo, "created": int(created_at),
             "choices": [_openai_choice(r, chat=chat, index=i) for i, r in enumerate(rows)],
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                       "total_tokens": None if prompt_tokens is None else prompt_tokens + completion_tokens}}
@@ -1264,7 +1264,7 @@ async def _export_v3(*, job, records, sink, delivery_id: str, grade, filter_note
                 output = _JsonlShards(directory, "output", max_bytes=shard_max_bytes, on_close=uploaded)
                 chat = _chat_output(job, set_rows)
                 for group in parked.groups():
-                    await output.add(openai_line(group, job=job, chat=chat))
+                    await output.add(openai_line(group, job=job, chat=chat, created_at=stamp))
                 await output.close()
             finally:
                 parked.close()

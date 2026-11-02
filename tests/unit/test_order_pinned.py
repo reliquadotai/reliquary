@@ -159,6 +159,7 @@ def test_a_batch_on_an_env_range(admin, pins, monkeypatch):  # noqa: F811
     ({"prompt_start": 1}, 422, "first problem"),
     ({"eval_set_id": "logic-eval-s9-n9"}, 404, "set_unknown"),
     ({"max_new_tokens": 40000, "max_prompt_tokens": 2000}, 422, "context_too_long"),
+    ({"max_new_tokens": 40000}, 422, "context_too_long"),
     ({"sampling": None}, 422, "sampling"),
 ])
 def test_pinned_order_refusals(admin, pins, change, status, word):  # noqa: F811
