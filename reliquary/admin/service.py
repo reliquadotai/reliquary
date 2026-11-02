@@ -370,7 +370,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         records = BucketRecordStore()
     if prepare is None:
         from reliquary.cli.main import prepare_corpus_job as prepare
-    exports: dict[str, tuple[str, asyncio.Task]] = {}
+    # delivery id -> (job id, the export, what it was asked for)
+    exports: dict[str, tuple[str, asyncio.Task, dict]] = {}
     # eval id -> (request digest, the running grading)
     gradings: dict[str, tuple[str, asyncio.Task]] = {}
     # One decision at a time per eval id, so two first calls start one grading.
@@ -686,10 +687,6 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         except Exception as exc:
             logger.warning("model files of %s@%s unavailable", body.model, body.revision, exc_info=True)
             raise HTTPException(status_code=503, detail="model_files_unavailable") from exc
-        longest = (body.max_prompt_tokens or 0) + body.max_new_tokens
-        if pin.max_position_embeddings is not None and longest > pin.max_position_embeddings:
-            raise HTTPException(status_code=422, detail=(
-                f"context_too_long: {longest} tokens, the model holds {pin.max_position_embeddings}"))
         if evaluation:
             if body.eval_set_id is None:
                 raise HTTPException(status_code=422, detail="an evaluation order names its eval_set_id")
@@ -699,6 +696,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             if body.prompt_start != 0:
                 raise HTTPException(status_code=422, detail="an order on a set starts at its first problem")
             card, prompts_body = await read_set(body.eval_set_id)
+            if not evaluation and card.get("source_kind") != "upload":
+                # Our sets are held out: their completions are never deliverable training data.
+                raise HTTPException(status_code=422, detail="a generation order draws from an upload, not an eval set")
             if card.get("source_kind") == "upload":
                 if (card.get("model"), card.get("revision")) != (body.model, body.revision):
                     raise HTTPException(status_code=422, detail="the upload was rendered for another model")
@@ -707,6 +707,13 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 differs = upload_sampling_differs(card.get("sampling") or {}, body)
                 if differs:
                     raise HTTPException(status_code=422, detail=f"upload_sampling_differs: {differs}")
+                from reliquary.miner.corpus_miner import PROMPT_ALLOWANCE_TOKENS
+
+                # Miners size their engine to the job's longest prompt: the upload's must fit.
+                longest_prompt = int(card.get("prompt_tokens_max") or 0)
+                if longest_prompt > (body.max_prompt_tokens or PROMPT_ALLOWANCE_TOKENS):
+                    raise HTTPException(status_code=422, detail=(
+                        f"max_prompt_tokens_too_small: the upload's longest prompt is {longest_prompt} tokens"))
             elif body.env not in (card.get("env"), card.get("source")):
                 raise HTTPException(status_code=422, detail=f"set {body.eval_set_id} is a {card.get('env')} set")
             if body.prompt_count > int(card["count"]):
@@ -730,15 +737,28 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             declared_source = {"env": body.env, "prompt_start": body.prompt_start, "problems": body.prompt_count,
                                "environment_manifest_sha256": getattr(
                                    ENVIRONMENT_CATALOG.get(body.env), "environment_manifest_sha256", None)}
+        longest = (body.max_prompt_tokens or 0) + body.max_new_tokens
+        if pin.max_position_embeddings is not None and longest > pin.max_position_embeddings:
+            raise HTTPException(status_code=422, detail=(
+                f"context_too_long: {longest} tokens, the model holds {pin.max_position_embeddings}"))
         seed = body.seed if body.seed is not None else job_seed(body.job_id)
         if record_order:
+            from reliquary.corpus.job import draw_judge_from
+
+            try:
+                judge = draw_judge_from(body.judge or {}).to_contract()
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
             try:
                 await eval_jobs.create({
                     "schema": qual.ORDER_JOB_SCHEMA_V2, "job_id": body.job_id,
                     "kind": qual.EVALUATION if evaluation else qual.GENERATION, "pin": pin.to_dict(),
-                    "source": declared_source, "samples": body.samples_per_prompt,
+                    "source": declared_source, "contract_environment": contract_environment,
+                    "samples": body.samples_per_prompt, "n": 1, "min_new_tokens": 2,
                     "sampling": body.sampling.conditions(), "max_new_tokens": body.max_new_tokens,
-                    "thinking": body.thinking, "draw": body.draw, "judge": body.judge, "seed": seed})
+                    "max_prompt_tokens": body.max_prompt_tokens, "thinking": body.thinking,
+                    "draw": body.draw, "judge": judge, "seed": seed,
+                    "audit_q": 1.0 if evaluation else (body.audit_q or GEN_AUDIT_PARAMS["audit_q"])})
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
         audit = {"audit_q": 1.0} if evaluation else {
@@ -1173,7 +1193,27 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail="an episode job is delivered with "
                                 "`reliquary jobs export JOB --sft` on a host with its renderer")
 
+        from reliquary.corpus.delivery import DELIVERY_SCHEMA, DELIVERY_SCHEMA_V3
+
+        # What this request asks for: a delivery under its id answers it only if it was asked the same.
+        asked = {"schema": DELIVERY_SCHEMA_V3 if body.schema_version == 3 else DELIVERY_SCHEMA}
+        if body.schema_version == 3:
+            asked["options"] = {"format": body.format or "parquet",
+                                "include_truncated": True if body.include_truncated is None else body.include_truncated,
+                                "filter": body.filter or "none", "dedupe_against": sorted(set(body.dedupe_against))}
+
+        def same_request(manifest) -> bool:
+            # A v2 request takes any delivery written before v3 existed, as it always did.
+            if (manifest.get("schema") == DELIVERY_SCHEMA_V3) != (asked["schema"] == DELIVERY_SCHEMA_V3):
+                return False
+            options = manifest.get("options") or {}
+            return "options" not in asked or all(
+                (sorted(options.get(k) or ()) if k == "dedupe_against" else options.get(k)) == v
+                for k, v in asked["options"].items())
+
         def delivery_result(manifest):
+            if not same_request(manifest):
+                raise HTTPException(status_code=409, detail="delivery_exists_with_another_request")
             try:
                 validate_cached_delivery(manifest, job=job, sink=deliveries)
             except ValueError as exc:
@@ -1186,6 +1226,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         running_export = exports.get(delivery_id)
         if running_export is not None and running_export[0] != job_id:
             raise HTTPException(status_code=409, detail="delivery_belongs_to_another_job")
+        if running_export is not None and running_export[2] != asked:
+            raise HTTPException(status_code=409, detail="delivery_exists_with_another_request")
         running = running_export[1] if running_export is not None else None
         if running is not None and running.done():
             exports.pop(delivery_id)
@@ -1214,7 +1256,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     except ValueError as exc:
                         raise HTTPException(status_code=422, detail=f"filter_unavailable: {exc}") from exc
                 exports[delivery_id] = (job_id, asyncio.ensure_future(
-                    v3_delivery(job, delivery_id, body, grade)))
+                    v3_delivery(job, delivery_id, body, grade)), asked)
                 response.status_code = 202
                 return {"state": "running", "delivery_id": delivery_id}
             grade, note = None, None
@@ -1235,7 +1277,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 grade=grade, filter_note=note, work_dir=work_dir, clock=clock,
                 instruction_source=instruction_source, instruction_note=instruction_note,
                 keep_rejected=body.keep_rejected, dedupe=body.dedupe,
-                dedupe_against=body.dedupe_against)))
+                dedupe_against=body.dedupe_against)), asked)
         response.status_code = 202
         return {"state": "running", "delivery_id": delivery_id}
 
@@ -1525,8 +1567,13 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail="a combined evaluation is not one of its parts")
         if deliveries is None or not getattr(deliveries, "evaluation_supported", True):
             raise HTTPException(status_code=503, detail="deliveries_not_configured")
+        running = gradings.get(eval_id)
+        if running is not None:
+            raise HTTPException(status_code=409, detail="a grading runs under this id")
         try:
-            manifest = await reports.combine(deliveries, eval_id, body.parts, clock=clock)
+            # One writer per evaluation id: a grading and a combination never share files.
+            async with grade_locks.setdefault(eval_id, asyncio.Lock()):
+                manifest = await reports.combine(deliveries, eval_id, body.parts, clock=clock)
         except reports.PartNotGraded as exc:
             raise HTTPException(status_code=409, detail=f"part_not_graded: {exc}") from exc
         except ValueError as exc:

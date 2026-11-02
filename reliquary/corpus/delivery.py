@@ -484,7 +484,7 @@ async def delivery_rows_v3(*, job, records, counts: dict, grade=None, drop_rejec
                   rows_accepted=0 if grade is not None else None,
                   rejected_dropped=0 if drop_rejected else None,
                   completion_tokens=0, audited_completion_tokens=0, prompt_tokens=0,
-                  prompt_tokens_unknown=0, samples_by_prompt={})
+                  prompt_tokens_unknown=0, samples_by_prompt={}, delivered_by_prompt={})
     prompted: set[str] = set()
     async for batch in passing_batches(job=job, records=records, counts=counts, concurrency=concurrency,
                                        window=window, on_verdict=on_verdict):
@@ -501,6 +501,9 @@ async def delivery_rows_v3(*, job, records, counts: dict, grade=None, drop_rejec
             match = (verdict.get("forced_draw") or {}).get("match") if audited else None
             for index, completion in enumerate(record["completions"]):
                 counts["completions"] += 1
+                # Generated and verified: a sample this delivery leaves out on purpose is not a missing one.
+                generated = counts["samples_by_prompt"]
+                generated[prompt_index] = generated.get(prompt_index, 0) + 1
                 reason = finish_reason(completion, job.eos_token_id)
                 if reason == "length" and not include_truncated:
                     counts["truncated_dropped"] += 1
@@ -545,7 +548,7 @@ async def delivery_rows_v3(*, job, records, counts: dict, grade=None, drop_rejec
                     counts["prompt_tokens_unknown"] += 1
                 else:
                     counts["prompt_tokens"] += row["prompt_tokens"]
-            held = counts["samples_by_prompt"]
+            held = counts["delivered_by_prompt"]
             held[row["prompt_index"]] = held.get(row["prompt_index"], 0) + 1
             yield row
 
@@ -1276,7 +1279,8 @@ async def _export_v3(*, job, records, sink, delivery_id: str, grade, filter_note
         await errors.close()
     finally:
         shutil.rmtree(directory, ignore_errors=True)
-    held = counts.pop("samples_by_prompt")
+    counts.pop("samples_by_prompt")
+    held = counts.pop("delivered_by_prompt")
     counts["prompts_delivered"] = len(held)
     counts["prompts_short"] = errors_written
     report = {
@@ -1300,7 +1304,8 @@ async def _export_v3(*, job, records, sink, delivery_id: str, grade, filter_note
     manifest = {
         "schema": DELIVERY_SCHEMA_V3, "delivery_id": delivery_id, "job_id": job.job_id,
         "job_manifest_sha256": canonical_sha256(job.to_contract()), "created_at": stamp,
-        "format": output_format, "rows": counts.get("rows", 0), "shards": shards, "error_shards": error_shards,
+        "format": output_format, "options": report["options"],
+        "rows": counts.get("rows", 0), "shards": shards, "error_shards": error_shards,
         "instruction_shards": [],
         "columns": list(V3_ROW_FIELDS) if output_format == "parquet" else None, "report": report_key,
         "keys": [s["key"] for s in shards + error_shards] + [report_key, manifest_key],

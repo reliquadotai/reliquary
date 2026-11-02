@@ -20,6 +20,8 @@ from typing import Any
 REVISION_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 # Weights an order's miners must hold: two 80 GB cards in bf16.
 MAX_CHECKPOINT_BYTES = 160 * 10**9
+# Everything a miner downloads with them (the whole repo: other formats, originals, tokenizer).
+MAX_REPO_BYTES = 200 * 10**9
 PIN_SCHEMA = "reliquary/model-pin/v1"
 
 
@@ -46,9 +48,10 @@ def fingerprint_of(shards: Iterable[tuple[str, str]]) -> str:
     return outer.hexdigest()
 
 
-def hub_shards(repo: str, revision: str) -> list[tuple[str, str, int]]:
-    """``(name, sha256, size)`` of the revision's top-level ``*.safetensors`` files, from the hub's metadata.
-    ValueError: not a public model at that revision, or no shard; any other error is transient."""
+def hub_shards(repo: str, revision: str) -> list[tuple[str, str | None, int]]:
+    """``(name, sha256, size)`` of every file of the revision, from the hub's metadata (sha256 None for a file
+    that is not a top-level ``*.safetensors`` shard). ValueError: not a public model at that revision, or no
+    shard; any other error is transient."""
     from huggingface_hub import HfApi
     from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError, RevisionNotFoundError
 
@@ -60,16 +63,22 @@ def hub_shards(repo: str, revision: str) -> list[tuple[str, str, int]]:
     shards = []
     for sibling in info.siblings or ():
         name = sibling.rfilename
-        if "/" in name or not name.endswith(".safetensors"):
-            continue
         lfs = getattr(sibling, "lfs", None)
+        if not _is_shard(name):
+            shards.append((name, None, int(getattr(lfs, "size", None) or sibling.size or 0)))
+            continue
         sha256 = getattr(lfs, "sha256", None) if lfs is not None else None
         if not sha256:
             raise ValueError(f"{repo}@{revision}: shard {name} has no sha256 on the hub")
         shards.append((name, str(sha256), int(getattr(lfs, "size", None) or sibling.size or 0)))
-    if not shards:
+    if not any(_is_shard(f[0]) for f in shards):
         raise ValueError(f"{repo}@{revision} has no .safetensors shards")
     return shards
+
+
+def _is_shard(name: str) -> bool:
+    """A file ``checkpoint_fingerprint`` hashes: a top-level ``*.safetensors``."""
+    return "/" not in name and name.endswith(".safetensors")
 
 
 def _max_positions(config: Mapping) -> int | None:
@@ -98,14 +107,18 @@ def pin_model(repo: str, revision: str, *, facts: Callable[[str, str], Mapping] 
     if architecture not in SUPPORTED_ARCHITECTURES:
         raise ValueError(f"architecture_unsupported: {architecture!r}; supported: "
                          f"{sorted(SUPPORTED_ARCHITECTURES)}")
-    files = shards(repo, revision)
+    every = shards(repo, revision)
+    files = [f for f in every if _is_shard(f[0])]
     size = sum(int(f[2]) for f in files)
     if size > MAX_CHECKPOINT_BYTES:
         raise ValueError(f"model_too_large: {size} bytes of weights, at most {MAX_CHECKPOINT_BYTES}")
+    total = sum(int(f[2]) for f in every)
+    if total > MAX_REPO_BYTES:
+        raise ValueError(f"repo_too_large: miners download {total} bytes, at most {MAX_REPO_BYTES}")
     return ModelPin(model=repo, revision=revision, architecture=architecture,
                     eos_token_id=int(found["eos_token_id"]),
                     checkpoint_sha256=fingerprint_of((f[0], f[1]) for f in files),
                     checkpoint_bytes=size, max_position_embeddings=_max_positions(config(repo, revision)))
 
 
-__all__ = ["MAX_CHECKPOINT_BYTES", "ModelPin", "fingerprint_of", "hub_shards", "pin_model"]
+__all__ = ["MAX_CHECKPOINT_BYTES", "MAX_REPO_BYTES", "ModelPin", "fingerprint_of", "hub_shards", "pin_model"]

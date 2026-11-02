@@ -297,3 +297,12 @@ def test_the_route_refuses_a_changed_object_and_an_eval_without_grader(admin):
     assert admin({**request, "purpose": "eval"}).status_code == 422
     assert admin({**request, "object_key": "deliveries/x"}).status_code == 422
     assert "object_unknown" in admin({**request, "object_key": "batch-inputs/none"}).json()["detail"]
+
+
+def test_a_file_whose_prompts_hold_too_many_tokens_is_refused(monkeypatch):
+    from reliquary.orders import uploads
+
+    monkeypatch.setattr(uploads, "MAX_TOTAL_PROMPT_TOKENS", 5)
+    with pytest.raises(UploadRefused) as refused:
+        compile_(completion("a", [1, 2, 3]), completion("b", [4, 5, 6]))
+    assert refused.value.code == "too_many_tokens"

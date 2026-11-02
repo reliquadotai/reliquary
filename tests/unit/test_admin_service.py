@@ -556,6 +556,12 @@ def test_a_v3_delivery_runs_on_the_same_route_with_its_options(admin):
     assert line["response"]["body"]["choices"][0]["finish_reason"] == "length"
     report = json.loads((admin.platform / "deliveries" / "order-v3" / "report.json").read_text())
     assert report["schema"] == "reliquary/corpus-delivery/v3"
+    # The id answers only what it was asked: other options or v2 are refused, not served the v3 files.
+    for other in ({**body, "format": "parquet"}, {**body, "include_truncated": False},
+                  {"delivery_id": "order-v3"}):
+        refused = admin("POST", "/admin/v1/jobs/math-a/deliveries", other)
+        assert refused.status_code == 409 and "another_request" in refused.text, other
+    assert admin("POST", "/admin/v1/jobs/math-a/deliveries", body).status_code == 200
 
 
 def test_v3_options_need_schema_version_3_and_a_filter_needs_the_jobs(admin):

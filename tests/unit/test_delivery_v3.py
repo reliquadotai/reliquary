@@ -223,3 +223,13 @@ def test_the_eval_grading_and_the_delivery_read_the_same_submissions():
     assert {sid for sid, _ in collected["passing"]} == {_sid(0), _sid(1), _sid(3), _sid(4)}
     assert asyncio.run(delivered()) == {_sid(0), _sid(3), _sid(4)}
     assert collected["verdicts"] == 6 and collected["audited"] == 4
+
+
+def test_a_sample_left_out_on_purpose_is_not_reported_missing(tmp_path):
+    manifest, root = _export(tmp_path, _job(), _Records(), set_rows=SET_ROWS, slots=_Slots(exhausted={3}),
+                             include_truncated=False)
+    errors = [json.loads(line) for line in (root / "errors-00000.jsonl").read_text().splitlines()]
+    # Prompt 0's second sample was generated and verified, then cut at the budget and left out: no error for it.
+    assert [e["custom_id"] for e in errors] == ["req-1", "req-2", "req-3"]
+    report = json.loads((root / "report.json").read_text())
+    assert report["counts"]["truncated_dropped"] == 1 and report["counts"]["prompts_delivered"] == 3

@@ -71,6 +71,10 @@ def _pin_with(facts=None, shards=None, config=None, revision=REVISION):
 
 
 def test_a_pin_reads_architecture_eos_fingerprint_and_context():
+    # Only the top-level shards are hashed, as a GPU hashes the downloaded directory.
+    extra = _pin_with(shards=[("model.safetensors", "a" * 64, 1000), ("sub/model.safetensors", None, 5),
+                              ("README.md", None, 7)])
+    assert extra.checkpoint_sha256 == models.fingerprint_of([("model.safetensors", "a" * 64)])
     pin = _pin_with()
     assert (pin.architecture, pin.eos_token_id, pin.checkpoint_bytes) == ("Qwen3ForCausalLM", 7, 1000)
     assert pin.checkpoint_sha256 == models.fingerprint_of([("model.safetensors", "a" * 64)])
@@ -82,6 +86,8 @@ def test_a_pin_reads_architecture_eos_fingerprint_and_context():
     ({"facts": {"architecture": "MambaForCausalLM", "eos_token_id": 1}}, "architecture_unsupported"),
     ({"shards": [("model.safetensors", "a" * 64, models.MAX_CHECKPOINT_BYTES + 1)]}, "model_too_large"),
     ({"revision": "main"}, "40-hex"),
+    ({"shards": [("model.safetensors", "a" * 64, 1000), ("original/consolidated.pth", None, models.MAX_REPO_BYTES)]},
+     "repo_too_large"),
 ])
 def test_a_pin_outside_the_preset_is_refused(kw, word):
     with pytest.raises(ValueError, match=word):
@@ -106,12 +112,11 @@ def test_an_eval_order_needs_no_qualification(admin, pins):  # noqa: F811
 
 
 def test_a_batch_on_a_frozen_set_is_the_same_order(admin, pins):  # noqa: F811
-    created = admin("POST", "/admin/v1/jobs", _order("gen", seed=11))
+    created = admin("POST", "/admin/v1/jobs", _on_upload(admin, seed=11))
     assert created.status_code == 201, created.text
     job, _ = asyncio.run(job_store.read_job("order-gen-p1"))
-    eval_job_id = "order-eval-p1"
-    assert admin("POST", "/admin/v1/jobs", _order(seed=11)).status_code == 201
-    evaluation, _ = asyncio.run(job_store.read_job(eval_job_id))
+    assert admin("POST", "/admin/v1/jobs", _on_upload(admin, "eval", seed=11)).status_code == 201
+    evaluation, _ = asyncio.run(job_store.read_job("order-eval-p1"))
     # The same prompts, model, sampling and draw key: the same samples; only audit share, route and grading differ.
     same = ("prompt_source", "checkpoint_sha256", "seed", "slots_per_prompt", "renderer_id")
     assert {k: getattr(job, k) for k in same} == {k: getattr(evaluation, k) for k in same}
@@ -120,6 +125,19 @@ def test_a_batch_on_a_frozen_set_is_the_same_order(admin, pins):  # noqa: F811
     assert admin.registry["entries"]["order-gen-p1"].params["audit_q"] == 0.15
     record = asyncio.run(qual.EvalJobStore().read("order-gen-p1"))
     assert record["kind"] == qual.GENERATION and record["seed"] == 11
+
+
+def test_a_batch_never_draws_from_our_held_out_sets(admin, pins):  # noqa: F811
+    response = admin("POST", "/admin/v1/jobs", _order("gen"))
+    assert response.status_code == 422 and "upload" in response.text
+
+
+def test_an_upload_longer_than_the_job_allows_is_refused(admin, pins):  # noqa: F811
+    set_id = _upload_set(admin, graded=False, prompt_tokens_max=20_000)
+    body = _order("gen", eval_set_id=set_id, prompt_count=3, env="upload")
+    refused = admin("POST", "/admin/v1/jobs", body)
+    assert refused.status_code == 422 and "max_prompt_tokens_too_small" in refused.text
+    assert admin("POST", "/admin/v1/jobs", {**body, "max_prompt_tokens": 20_000}).status_code == 201
 
 
 def test_a_batch_on_an_env_range(admin, pins, monkeypatch):  # noqa: F811
@@ -161,14 +179,14 @@ def test_a_revision_is_only_for_a_pinned_order(admin, pins):  # noqa: F811
     assert response.status_code == 422
 
 
-def _upload_set(admin, *, graded, model=MODEL, revision=REVISION, sampling=None):
+def _upload_set(admin, *, graded, model=MODEL, revision=REVISION, sampling=None, prompt_tokens_max=3):
     from reliquary.eval.storage import SubnetEvalStore, subnet_key
 
     rows = [{"problem_id": f"r-{i}", "custom_id": f"r-{i}", "prompt_token_ids": [1, 2, 3 + i]} for i in range(3)]
     body = b"".join(json.dumps(r, sort_keys=True).encode() + b"\n" for r in rows)
     card = {"schema": "reliquary/eval-set/v1", "set_id": "up-0123456789abcdef01234567", "source_kind": "upload",
             "source": "upload", "env": None, "count": 3, "model": model, "revision": revision, "graded": graded,
-            "sampling": sampling or {}}
+            "sampling": sampling or {}, "prompt_tokens_max": prompt_tokens_max}
     store = SubnetEvalStore()
 
     async def put():
@@ -195,6 +213,11 @@ def test_an_upload_set_orders_as_any_set(admin, pins):  # noqa: F811
     assert other.status_code == 422 and "another model" in other.text
 
 
+def _on_upload(admin, kind="gen", **kw):  # noqa: F811
+    set_id = _upload_set(admin, graded=True)
+    return _order(kind, eval_set_id=set_id, prompt_count=3, env="upload", **kw)
+
+
 # -- the order control checks the job against the record ------------------------------
 
 
@@ -208,7 +231,7 @@ def _served(job_id):
 def test_the_order_control_serves_a_pinned_order(admin, pins, kind):  # noqa: F811
     from reliquary.validator.eval_control import order_job_refusal, qualification_refusal
 
-    assert admin("POST", "/admin/v1/jobs", _order(kind)).status_code == 201
+    assert admin("POST", "/admin/v1/jobs", _on_upload(admin, kind)).status_code == 201
     job_id = f"order-{kind}-p1"
     job, declared = _served(job_id)
     entry = admin.registry["entries"][job_id]
@@ -217,6 +240,8 @@ def test_the_order_control_serves_a_pinned_order(admin, pins, kind):  # noqa: F8
 
 
 @pytest.mark.parametrize("change,word", [
+    ({"max_prompt_tokens": 131072}, "max_prompt_tokens"),
+    ({"prompt_start": 1}, "source"),
     ({"checkpoint_sha256": "0" * 64}, "fingerprint"),
     ({"eos_token_id": 2}, "eos"),
     ({"seed": 99}, "seed"),
@@ -226,7 +251,7 @@ def test_the_order_control_serves_a_pinned_order(admin, pins, kind):  # noqa: F8
 def test_the_order_control_refuses_a_job_unlike_its_record(admin, pins, change, word):  # noqa: F811
     from reliquary.validator.eval_control import qualification_refusal
 
-    assert admin("POST", "/admin/v1/jobs", _order("gen")).status_code == 201
+    assert admin("POST", "/admin/v1/jobs", _on_upload(admin)).status_code == 201
     job, declared = _served("order-gen-p1")
     entry = admin.registry["entries"]["order-gen-p1"]
     assert word in qualification_refusal(entry, replace(job, **change), declared, None)
@@ -235,7 +260,7 @@ def test_the_order_control_refuses_a_job_unlike_its_record(admin, pins, change, 
 def test_the_order_control_refuses_a_changed_sampling_or_kind(admin, pins):  # noqa: F811
     from reliquary.validator.eval_control import qualification_refusal
 
-    assert admin("POST", "/admin/v1/jobs", _order("gen")).status_code == 201
+    assert admin("POST", "/admin/v1/jobs", _on_upload(admin)).status_code == 201
     job, declared = _served("order-gen-p1")
     entry = admin.registry["entries"]["order-gen-p1"]
     hotter = replace(job, sampling=replace(job.sampling, temperature=1.0))
@@ -248,7 +273,7 @@ def test_the_order_control_refuses_a_changed_sampling_or_kind(admin, pins):  # n
 def test_a_generation_order_on_a_set_needs_a_draw(admin, pins):  # noqa: F811
     from reliquary.validator.eval_control import order_job_refusal
 
-    assert admin("POST", "/admin/v1/jobs", _order("gen")).status_code == 201
+    assert admin("POST", "/admin/v1/jobs", _on_upload(admin)).status_code == 201
     job, _ = _served("order-gen-p1")
     entry = admin.registry["entries"]["order-gen-p1"]
     free = replace(job, sampling=replace(job.sampling, draw=None))
@@ -354,6 +379,12 @@ def test_an_eval_order_on_several_sets_has_one_report(admin, pins):  # noqa: F81
         asyncio.run(platform.put_json(f"evaluations/{eval_id}/manifest.json", {"eval_id": eval_id}))
 
     part("order-e1", "math", 0.5)
+    part("order-e8", "math", 0.5)
+    report8 = json.loads((admin.root / "p" / "evaluations" / "order-e8" / "report.json").read_text())
+    report8["provenance"]["checkpoint_sha256"] = "0" * 64
+    asyncio.run(platform.put_json("evaluations/order-e8/report.json", report8))
+    mixed = admin("POST", "/admin/v1/evaluations/order-mix/combine", {"parts": ["order-e1", "order-e8"]})
+    assert mixed.status_code == 409 and "different models" in mixed.text
     part("order-e2", "logic", 0.25)
     part("order-e3", "math", 1.0, complete=False)
     assert admin("POST", "/admin/v1/evaluations/order-all/combine",
@@ -371,3 +402,22 @@ def test_an_eval_order_on_several_sets_has_one_report(admin, pins):  # noqa: F81
                  {"parts": ["order-e1", "order-e2", "order-e3"]}).status_code == 200
     assert admin("POST", "/admin/v1/evaluations/order-all/combine", {"parts": ["order-e1"]}).status_code == 409
     assert admin("POST", "/admin/v1/evaluations/order-e1/combine", {"parts": ["order-e1"]}).status_code == 422
+
+
+def test_the_order_control_compares_the_whole_judge_and_audit_share(admin, pins):  # noqa: F811
+    from reliquary.corpus.job import DrawJudge
+    from reliquary.validator.eval_control import qualification_refusal
+
+    assert admin("POST", "/admin/v1/jobs", _on_upload(admin, "eval")).status_code == 201
+    job, declared = _served("order-eval-p1")
+    entry = admin.registry["entries"]["order-eval-p1"]
+    assert declared["judge"]["floor_rate"] == 0.98
+    lax = replace(job, judge=DrawJudge(0.5, 64, 64.0, 64.0, 0.5))
+    assert "judge" in qualification_refusal(entry, lax, declared, None)
+    many = replace(job, sampling=replace(job.sampling, n=8))
+    assert "n" in qualification_refusal(entry, many, declared, None)
+    sampled = replace(entry, params={**entry.params, "audit_q": 0.15})
+    assert "audit_q" in qualification_refusal(sampled, job, declared, None)
+    assert "every submission" in qualification_refusal(sampled, job, {**declared, "audit_q": 0.15}, None)
+    elsewhere = replace(entry, contract={**entry.contract, "environments": {"reliquary_logic_v2": {}}})
+    assert "environments" in qualification_refusal(elsewhere, job, declared, None)

@@ -30,6 +30,10 @@ def combine_reports(eval_id: str, parts: Sequence[tuple[str, Mapping, Mapping]],
 
     if not 1 <= len(parts) <= MAX_PARTS or len({p[0] for p in parts}) != len(parts):
         raise ValueError(f"an order combines 1 to {MAX_PARTS} distinct gradings")
+    models = {((r.get("provenance") or {}).get("model"), (r.get("provenance") or {}).get("checkpoint_sha256"))
+              for _, _, r in parts}
+    if len(models) > 1:
+        raise ValueError("the parts grade different models: one report is about one checkpoint")
     envs: dict[str, dict] = {}
     seen: dict[str, int] = {}
     for _, _, report in parts:

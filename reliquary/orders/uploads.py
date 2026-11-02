@@ -34,6 +34,8 @@ COMPLETIONS_URL = "/v1/completions"
 # OpenAI's own batch limits.
 MAX_LINES = 50_000
 MAX_BYTES = 200 * 1024 * 1024
+# Prompt tokens one file may hold in all: bounds what ingestion holds in memory (a token id list each).
+MAX_TOTAL_PROMPT_TOKENS = 30_000_000
 MAX_CUSTOM_ID_CHARS = 64
 MAX_SAMPLES = 64
 MAX_NEW_TOKENS = 131072
@@ -380,6 +382,7 @@ def compile_upload(body: bytes, *, tokenizer, vocab_size: int, model: str, revis
     seen: set[str] = set()
     # sampling key -> [(line, custom_id, ids, reference)], in file order
     groups: dict[str, tuple[dict, list]] = {}
+    total_tokens = 0
     for number, raw in enumerate(raw_lines, start=1):
         custom_id = None
         try:
@@ -399,6 +402,9 @@ def compile_upload(body: bytes, *, tokenizer, vocab_size: int, model: str, revis
         except _Bad as bad:
             errors.append(LineError(number, custom_id, bad.code, bad.message))
             continue
+        total_tokens += len(ids)
+        if total_tokens > MAX_TOTAL_PROMPT_TOKENS:
+            raise UploadRefused("too_many_tokens", f"the file's prompts hold more than {MAX_TOTAL_PROMPT_TOKENS} tokens")
         # One endpoint per set: its delivery answers in that endpoint's object.
         key = _digest({"sampling": sampling, "url": url})
         groups.setdefault(key, (sampling, url, []))[2].append((number, custom_id, ids, reference))

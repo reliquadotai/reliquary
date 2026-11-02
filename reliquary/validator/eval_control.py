@@ -994,28 +994,39 @@ def pinned_order_refusal(entry, job, declared: dict) -> str | None:
         return "its checkpoint fingerprint is not the pinned one"
     if pin.get("eos_token_id") != job.eos_token_id:
         return "its eos is not the pinned one"
+    from reliquary.corpus.job import draw_judge_from
+
     sampling = {"temperature": job.sampling.temperature, "top_p": job.sampling.top_p,
                 "top_k": job.sampling.top_k, **({"min_p": job.sampling.min_p} if job.sampling.min_p else {})}
-    wanted = {"sampling": declared.get("sampling"), "max_new_tokens": declared.get("max_new_tokens"),
-              "thinking": declared.get("thinking"), "samples": declared.get("samples"),
-              "seed": declared.get("seed")}
+    # Every condition the admin declared, compared whole: a job unlike its record is never served.
+    keys = ("sampling", "max_new_tokens", "thinking", "samples", "seed", "n", "min_new_tokens",
+            "max_prompt_tokens", "judge", "audit_q")
+    wanted = {k: declared.get(k) for k in keys}
+    try:
+        wanted["judge"] = draw_judge_from(declared.get("judge") or {}).to_contract()
+    except ValueError:
+        return "its order record's judge cannot be read"
+    params = getattr(entry, "params", None) or {}
     given = {"sampling": sampling, "max_new_tokens": job.sampling.max_new_tokens,
              "thinking": corpus_service.CHAT_TEMPLATE_RENDERERS.get(job.renderer_id),
-             "samples": job.slots_per_prompt, "seed": job.seed}
+             "samples": job.slots_per_prompt, "seed": job.seed, "n": job.sampling.n,
+             "min_new_tokens": job.sampling.min_new_tokens,
+             "max_prompt_tokens": getattr(job, "max_prompt_tokens", None), "judge": job.judge.to_contract(),
+             "audit_q": params.get("audit_q")}
     source = declared.get("source") or {}
     if is_eval_source(job.prompt_source):
         parsed = parse_eval_source(job.prompt_source)
-        wanted["source"] = {"set_id": source.get("set_id"), "problems": source.get("problems")}
-        given["source"] = {"set_id": parsed.set_id, "problems": parsed.count}
+        wanted["source"] = {"set_id": source.get("set_id"), "problems": source.get("problems"), "prompt_start": 0}
+        given["source"] = {"set_id": parsed.set_id, "problems": parsed.count, "prompt_start": job.prompt_start}
+        wanted["environments"] = [declared.get("contract_environment")]
+        given["environments"] = list((contract.get("environments") or {}))
     else:
         wanted["source"] = {k: source.get(k) for k in ("env", "prompt_start", "problems")}
         given["source"] = {"env": job.prompt_source, "prompt_start": job.prompt_start,
                            "problems": job.prompt_count}
+    if not generation and wanted["audit_q"] != 1.0:
+        return "an evaluation order audits every submission"
     differs = sorted(k for k in wanted if wanted[k] != given[k])
-    for name, value in (declared.get("judge") or {}).items():
-        if getattr(job.judge, name, None) != value:
-            differs.append("judge")
-            break
     if differs:
         return f"its conditions differ from its order record: {differs}"
     if not is_eval_source(job.prompt_source):
