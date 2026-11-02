@@ -355,11 +355,15 @@ def compile_upload(body: bytes, *, tokenizer, vocab_size: int, model: str, revis
 
     ``tokenizer`` is the revision's (``apply_chat_template``, ``encode``, ``chat_template``),
     ``vocab_size`` the embedding rows the config declares. ``purpose`` "eval" requires a
-    ``reference`` per line, written to ``grading.jsonl`` with ``grader`` (the grading env)."""
+    ``reference`` per line, written to ``grading.jsonl`` with ``grader`` (``orders.graders``)."""
     if purpose not in PURPOSES:
         raise ValueError(f"purpose is one of {PURPOSES}")
     if (purpose == "eval") != (grader is not None):
         raise ValueError("an eval upload names its grader, and only an eval upload does")
+    from reliquary.orders.graders import REFERENCE_GRADERS, check_reference
+
+    if grader is not None and grader not in REFERENCE_GRADERS:
+        raise ValueError(f"grader_unknown: {grader!r}; graders: {sorted(REFERENCE_GRADERS)}")
     if not isinstance(vocab_size, int) or vocab_size <= 0:
         raise ValueError("vocab_size must be positive")
     if len(body) > MAX_BYTES:
@@ -387,6 +391,11 @@ def compile_upload(body: bytes, *, tokenizer, vocab_size: int, model: str, revis
             sampling = _sampling(request_body)
             ids = _prompt_ids(tokenizer, url, request_body, variables, vocab_size=vocab_size,
                               limit=limit)
+            if grader is not None:
+                try:
+                    check_reference(grader, reference)
+                except ValueError as exc:
+                    raise _Bad("invalid_reference", str(exc)) from None
         except _Bad as bad:
             errors.append(LineError(number, custom_id, bad.code, bad.message))
             continue

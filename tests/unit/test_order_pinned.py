@@ -296,3 +296,46 @@ def test_an_order_on_an_upload_group_runs_its_lines_sampling(admin, pins):  # no
                         ({"sampling": {**SAMPLING, "temperature": 1.0}}, "temperature")):
         refused = admin("POST", "/admin/v1/jobs", {**body, "job_id": "order-gen-p9", **change})
         assert refused.status_code == 422 and "upload_sampling_differs" in refused.text and key in refused.text
+
+
+def test_an_eval_on_a_customer_file_is_graded_by_its_references(admin, pins):  # noqa: F811
+    import time
+
+    from reliquary.eval.storage import SubnetEvalStore, subnet_key
+    from reliquary.orders.uploads import compile_upload
+    from tests.unit.test_order_uploads import TOK, completion
+
+    lines = [{**completion(f"q{i}", f"{i}+{i}=", model=MODEL), "reference": str(2 * i)} for i in range(1, 4)]
+    body = b"".join(json.dumps(line).encode() + b"\n" for line in lines)
+    (prompt_set,) = compile_upload(body, tokenizer=TOK, vocab_size=200_000, model=MODEL, revision=REVISION,
+                                   purpose="eval", grader="boxed_math_v1").sets
+    store = SubnetEvalStore()
+
+    async def publish():
+        for name, data in prompt_set.files().items():
+            await store.put_bytes(subnet_key(prompt_set.set_id, name), data)
+
+    asyncio.run(publish())
+    order = _order(eval_set_id=prompt_set.set_id, env="upload", prompt_count=3, samples_per_prompt=1,
+                   sampling={"temperature": 1.0, "top_p": 1.0, "top_k": 0})
+    created = admin("POST", "/admin/v1/jobs", order)
+    assert created.status_code == 201, created.text
+    answers = ["\\boxed{2}", "\\boxed{5}", "so \\boxed{6}"]
+    for prompt, text in enumerate(answers):
+        sid = f"{prompt:064x}"
+        admin.records.subs[sid] = {"prompt_index": prompt, "hotkey": "hk1",
+                                   "completions": [{"text": text, "tokens": [5, 2]}]}
+        admin.records.verdicts[sid] = {"passed": True, "audited": True, "hotkey": "hk1"}
+        admin.records.settled.append(sid)
+    grade = {"source": "job", "job_id": "order-eval-p1", "set_ids": [prompt_set.set_id],
+             "problems_per_set": {prompt_set.set_id: 3}, "samples_per_set": {prompt_set.set_id: 1}}
+    for _ in range(200):
+        response = admin("POST", "/admin/v1/evaluations/order-ep2/grade", grade)
+        if response.status_code != 202:
+            break
+        time.sleep(0.02)
+    assert response.status_code == 200, response.text
+    report = json.loads((admin.root / "p" / "evaluations" / "order-ep2" / "report.json").read_text())
+    (scores,) = report["envs"].values()
+    assert scores["pass@1"]["value"] == pytest.approx(2 / 3)
+    assert report["provenance"]["verification"]["sampling_verified"] is True

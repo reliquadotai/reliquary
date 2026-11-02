@@ -1195,10 +1195,11 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if deliveries is None:
             raise HTTPException(status_code=503, detail="platform_bucket_unavailable")
         if body.grader is not None:
-            from reliquary.environment.registry import ENVIRONMENT_SPECS
+            from reliquary.orders.graders import REFERENCE_GRADERS
 
-            if body.grader not in ENVIRONMENT_SPECS:
-                raise HTTPException(status_code=422, detail=f"grader_unknown: {body.grader!r}")
+            if body.grader not in REFERENCE_GRADERS:
+                raise HTTPException(status_code=422, detail=(
+                    f"grader_unknown: {body.grader!r}; graders: {sorted(REFERENCE_GRADERS)}"))
         if upload_tokenizer is None:
             from reliquary.validator.eval_control import load_cpu_tokenizer as load_tokenizer
         else:
@@ -1228,9 +1229,16 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         evidence each entry rests on (``SUPPORTED_ARCHITECTURES``)."""
         from reliquary.constants import SUPPORTED_ARCHITECTURES
 
+        from reliquary.orders.graders import REFERENCE_GRADERS
+        from reliquary.orders.models import MAX_CHECKPOINT_BYTES
+
         return {"schema": "reliquary/architectures/v1",
                 "architectures": sorted(SUPPORTED_ARCHITECTURES),
-                "evidence": {k: list(v) for k, v in SUPPORTED_ARCHITECTURES.items()}}
+                "evidence": {k: list(v) for k, v in SUPPORTED_ARCHITECTURES.items()},
+                # What a forced-draw order may name (``orders``): its model's weights and its set's graders.
+                "orders": {"max_checkpoint_bytes": MAX_CHECKPOINT_BYTES,
+                           "reference_graders": {name: g.description
+                                                 for name, g in sorted(REFERENCE_GRADERS.items())}}}
 
     @router.get("/eval-control/status")
     async def eval_control_status() -> dict:

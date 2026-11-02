@@ -168,7 +168,7 @@ def require_sandboxes(sets: Mapping[str, tuple[dict, list[dict]]], require=None)
     if require is None:
         from reliquary.corpus.export import require_code_sandbox as require
     for card, _ in sets.values():
-        if card.get("source_kind") in {"verifiers", "signed_episode"}:
+        if card.get("source_kind") in {"verifiers", "signed_episode", "upload"}:
             # Its code runs, if at all, in the task's own Docker box.
             continue
         if card.get("interaction") in REFERENCE_INTERACTIONS:
@@ -250,6 +250,8 @@ class _Graders:
         """``(score, grader_detail, format_failure)``."""
         from reliquary.eval import verifiers_source
 
+        if "grader" in grading and "source" not in grading:
+            return self._grade_reference(grading, completion)
         if verifiers_source.is_verifiers_source(grading["source"]):
             return self._grade_verifiers(grading, completion, card or {})
         source, split = grading["source"], grading["split"]
@@ -272,6 +274,21 @@ class _Graders:
             if grading.get("reference_sha256") is not None and digest(problem) != grading["reference_sha256"]:
                 return None, "source_drift: the source reference changed", failed_format
             value = float(score(problem, answer))
+        except Exception as exc:
+            return None, f"grader_error: {type(exc).__name__}: {exc}"[:500], failed_format
+        return value, "format_failure" if failed_format else "", failed_format
+
+    def _grade_reference(self, grading: dict, completion: str) -> tuple[float | None, str, bool]:
+        """A customer's row: its reference, graded by a grader of ``orders.graders``."""
+        from reliquary.orders.graders import REFERENCE_GRADERS, grade_reference
+
+        grader = REFERENCE_GRADERS.get(grading.get("grader"))
+        if grader is None:
+            return None, f"grader_unknown: {grading.get('grader')!r}", False
+        answer = answer_text(grader.final_answer_policy, completion, thinking=self._thinking)
+        failed_format = format_failed(grader.final_answer_policy, answer)
+        try:
+            value = grade_reference(grader.name, grading["reference"], answer)
         except Exception as exc:
             return None, f"grader_error: {type(exc).__name__}: {exc}"[:500], failed_format
         return value, "format_failure" if failed_format else "", failed_format
@@ -891,7 +908,7 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
             "provenance": {
                 **dict(provenance),
                 "sets": [{"set_id": set_id, "env": card["env"], "source": card["source"],
-                          "split": card["split"], "problems": problems_per_set[set_id],
+                          "split": card.get("split"), "problems": problems_per_set[set_id],
                           "samples": samples_per_set[set_id],
                           "prompts_sha256": card["prompts_sha256"],
                           "grading_sha256": card["grading_sha256"],

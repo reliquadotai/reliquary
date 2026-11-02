@@ -137,9 +137,12 @@ def test_the_admin_serves_the_architecture_table(admin):  # noqa: F811
     response = admin("GET", "/admin/v1/architectures")
     assert response.status_code == 200
     body = response.json()
+    orders = body.pop("orders")
     assert body == {"schema": "reliquary/architectures/v1",
                     "architectures": sorted(SUPPORTED_ARCHITECTURES),
                     "evidence": {k: list(v) for k, v in SUPPORTED_ARCHITECTURES.items()}}
+    assert set(orders["reference_graders"]) == {"boxed_math_v1", "exact_match_v1"}
+    assert orders["max_checkpoint_bytes"] > 0
 
 
 def test_a_job_on_a_record_of_an_unsupported_architecture_is_refused(admin):  # noqa: F811

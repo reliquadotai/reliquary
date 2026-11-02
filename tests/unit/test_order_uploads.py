@@ -150,16 +150,24 @@ def test_a_file_without_a_usable_line_is_refused():
 
 def test_an_eval_upload_writes_its_references_for_its_grader():
     line = {**completion("q1", "1+1="), "reference": "2"}
-    out = compile_(line, completion("q2", "no ref"), purpose="eval", grader="openmathinstruct")
+    out = compile_(line, completion("q2", "no ref"), purpose="eval", grader="boxed_math_v1")
     assert [e.code for e in out.errors] == ["reference_required"]
     (prompt_set,) = out.sets
     grading = [json.loads(x) for x in prompt_set.grading_body.splitlines()]
-    assert grading == [{"problem_id": "q1", "custom_id": "q1", "grader": "openmathinstruct",
+    assert grading == [{"problem_id": "q1", "custom_id": "q1", "grader": "boxed_math_v1",
                         "reference": "2"}]
-    assert prompt_set.card["graded"] is True and prompt_set.card["env"] == "openmathinstruct"
+    assert prompt_set.card["graded"] is True and prompt_set.card["env"] == "boxed_math_v1"
     assert set(prompt_set.files()) == {"prompts.jsonl", "set.json", "grading.jsonl"}
     batch = compile_(completion("q1", "1+1="))
     assert batch.sets[0].grading_body is None and batch.sets[0].card["graded"] is False
+
+
+def test_an_eval_upload_takes_only_a_known_grader_and_a_string_reference():
+    with pytest.raises(ValueError, match="grader_unknown"):
+        compile_({**completion("q1", "1+1="), "reference": "2"}, purpose="eval", grader="openmathinstruct")
+    out = compile_({**completion("q1", "1+1="), "reference": "2"},
+                   {**completion("q2", "2+2="), "reference": {"answer": 4}}, purpose="eval", grader="exact_match_v1")
+    assert [e.code for e in out.errors] == ["invalid_reference"]
 
 
 def test_the_card_is_an_upload_card_of_the_eval_set_schema():
