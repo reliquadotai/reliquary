@@ -12,6 +12,10 @@ import time
 import pytest
 import torch
 
+# The dedicated vision job installs these optional runtime dependencies.
+pytest.importorskip("torchvision")
+pytest.importorskip("peft")
+
 pytestmark = pytest.mark.filterwarnings(
     "ignore:__array__ implementation doesn.t accept a copy keyword:DeprecationWarning"
 )
