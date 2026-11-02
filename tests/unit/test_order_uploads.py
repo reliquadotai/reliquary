@@ -187,15 +187,20 @@ def test_the_same_file_compiles_to_the_same_sets():
 
 
 def test_an_upload_set_serves_through_the_eval_set_path_as_token_ids():
-    prompt_set = compile_(chat("a", [{"role": "user", "content": "hi"}]),
-                          completion("b", [9, 8])).sets[0]
-    source = parse_eval_source(prompt_set.prompt_source)
-    assert (source.set_id, source.count) == (prompt_set.set_id, 2)
-    register_eval_prompts(source, prompt_set.prompts_body)
-    environment = EvalSetSpec(prompt_set.prompt_source).create()
-    assert environment.get_problem(0)["prompt"] == token_ids_text(ids("<|user|>hi\n<|assistant|>"))
-    assert environment.get_problem(1)["prompt"] == token_ids_text([9, 8])
-    assert environment.problem_id(1) == "b"
+    chats, completions = compile_(chat("a", [{"role": "user", "content": "hi"}]),
+                                  completion("b", [9, 8]), completion("c", "yo")).sets
+    # One endpoint per set: its delivery answers in that endpoint's object.
+    assert [r["url"] for r in chats.rows] == [CHAT_URL]
+    assert [r["url"] for r in completions.rows] == [COMPLETIONS_URL] * 2
+    expected = [(chats, [token_ids_text(ids("<|user|>hi\n<|assistant|>"))]),
+                (completions, [token_ids_text([9, 8]), token_ids_text(ids("yo"))])]
+    for prompt_set, prompts in expected:
+        source = parse_eval_source(prompt_set.prompt_source)
+        assert (source.set_id, source.count) == (prompt_set.set_id, len(prompts))
+        register_eval_prompts(source, prompt_set.prompts_body)
+        environment = EvalSetSpec(prompt_set.prompt_source).create()
+        assert [environment.get_problem(i)["prompt"] for i in range(len(prompts))] == prompts
+    assert environment.problem_id(0) == "b"
 
 
 # --------------------------------------------------------------------------

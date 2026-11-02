@@ -399,29 +399,30 @@ def compile_upload(body: bytes, *, tokenizer, vocab_size: int, model: str, revis
         except _Bad as bad:
             errors.append(LineError(number, custom_id, bad.code, bad.message))
             continue
-        key = _digest(sampling)
-        groups.setdefault(key, (sampling, []))[1].append((number, custom_id, ids, reference))
+        # One endpoint per set: its delivery answers in that endpoint's object.
+        key = _digest({"sampling": sampling, "url": url})
+        groups.setdefault(key, (sampling, url, []))[2].append((number, custom_id, ids, reference))
     if not groups:
         raise UploadRefused("no_usable_line", f"none of the {len(raw_lines)} lines is usable")
     sets = [_prompt_set(sampling, entries, model=model, revision=revision, purpose=purpose,
-                        grader=grader)
-            for sampling, entries in groups.values()]
+                        grader=grader, url=url)
+            for sampling, url, entries in groups.values()]
     return CompiledUpload(sets=sets, errors=errors, lines=len(raw_lines))
 
 
 def _prompt_set(sampling: dict, entries: list, *, model: str, revision: str, purpose: str,
-                grader: str | None) -> PromptSet:
+                grader: str | None, url: str) -> PromptSet:
     from reliquary.eval.sets import SET_SCHEMA, validated_set_id
 
     identity = {"model": model, "revision": revision, "sampling": sampling, "purpose": purpose,
-                "grader": grader, "rows": [[custom_id, ids] for _, custom_id, ids, _ in entries],
+                "grader": grader, "url": url, "rows": [[custom_id, ids] for _, custom_id, ids, _ in entries],
                 "references": [reference for *_, reference in entries] if purpose == "eval" else None}
     set_id = validated_set_id(f"up-{_digest(identity)[:24]}")
     rows, grading = [], []
     for number, custom_id, ids, reference in entries:
         problem_id = custom_id if _SAFE_PROBLEM_ID.match(custom_id) else f"#{number}"
         rows.append({"problem_id": problem_id, "custom_id": custom_id, "set_id": set_id,
-                     "prompt_token_ids": ids})
+                     "url": url, "prompt_token_ids": ids})
         if purpose == "eval":
             grading.append({"problem_id": problem_id, "custom_id": custom_id,
                             "grader": grader, "reference": reference})

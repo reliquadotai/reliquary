@@ -90,7 +90,22 @@ forward is checked once per architecture, before it enters the preset.
   {"parts": [<eval ids>]}` writes one report: the parts' environments side by side, the macro over all of them,
   and each part's manifest hash.
 
-## 5. Not yet
+## 5. Delivery (`POST /admin/v1/jobs/{job_id}/deliveries`, `schema_version: 3`)
+
+One delivery for every order (`reliquary/corpus/delivery.py`); the eval grading reads the same passing samples
+(`passing_batches`). Version 2 stays the default until the platform asks for 3.
+
+- `format`: `parquet` (one row per completion) or `openai_jsonl` (one line per `custom_id`, its samples as
+  `choices`, a `chat.completion` or `text_completion` body by the set's endpoint).
+- Each row: ids (`custom_id`, `problem_id`, `prompt_index`, `completion_index`), the draw (`draw_slot`,
+  `sample_index`, `seed`), token ids and text, `finish_reason`, `audited` and `draw_match`.
+- `include_truncated` (default true: a length-cut answer is a valid sample at that cap), `filter`
+  (`none` | `annotate` | `drop`, with the env's grader), `dedupe`.
+- `errors-NNNNN.jsonl`: every prompt short of its samples (`draw_unfillable`, `missing_samples`).
+- `report.json`: counts, the verification block (draw key, judge, audited share, refusals), and the billing basis:
+  verified tokens of delivered rows.
+
+## 6. Not yet
 
 - Agentic environments (episodes, sandboxes) as order sources: the source is designed to take them; the
   suite-harness draw is the missing piece.
