@@ -82,7 +82,13 @@ forward is checked once per architecture, before it enters the preset.
 - The admin writes an order record (`reliquary/order-job/v2`: kind, pin, source, conditions); the order control
   serves the job only if it matches that record (`eval_control.pinned_order_refusal`).
 
-## 4. Grading and reports
+## 4. Audits
+
+The order control loads no model: each audit batch goes to a GPU executor of the order's model, which
+scores the forced draw and decides it. `RELIQUARY_ORDER_AUDIT_SCORERS` (default 1) sets how many
+executors score each batch; with more than one they must agree.
+
+## 5. Grading and reports
 
 - One set: `POST /admin/v1/evaluations/{eval_id}/grade` with `source: "job"`, as before. The report's
   verification says `sampling_verified: true`, the judge, the draw's randomness and the model pin.
@@ -90,7 +96,7 @@ forward is checked once per architecture, before it enters the preset.
   {"parts": [<eval ids>]}` writes one report: the parts' environments side by side, the macro over all of them,
   and each part's manifest hash.
 
-## 5. Delivery (`POST /admin/v1/jobs/{job_id}/deliveries`, `schema_version: 3`)
+## 6. Delivery (`POST /admin/v1/jobs/{job_id}/deliveries`, `schema_version: 3`)
 
 One delivery for every order (`reliquary/corpus/delivery.py`); the eval grading reads the same passing samples
 (`passing_batches`). Version 2 stays the default until the platform asks for 3.
@@ -105,7 +111,7 @@ One delivery for every order (`reliquary/corpus/delivery.py`); the eval grading 
 - `report.json`: counts, the verification block (draw key, judge, audited share, refusals), and the billing basis:
   verified tokens of delivered rows.
 
-## 6. Not yet
+## 7. Not yet
 
 - Agentic environments (episodes, sandboxes) as order sources: the source is designed to take them; the
   suite-harness draw is the missing piece.
