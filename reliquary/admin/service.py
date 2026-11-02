@@ -144,6 +144,28 @@ class RequestQualification(BaseModel):
 CreateJob.model_rebuild()
 
 
+class IngestUpload(BaseModel):
+    """A batch file the platform holds, read as the order's prompts (``orders.uploads``)."""
+
+    model_config = ConfigDict(extra="forbid")
+    object_key: str = Field(min_length=1, max_length=512, pattern=r"^batch-inputs/[A-Za-z0-9._/-]+$")
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    model: str = Field(min_length=1, max_length=256)
+    revision: str = Field(pattern=r"^[0-9a-f]{40}$")
+    purpose: Literal["batch", "eval"] = "batch"
+    # An eval upload's grading environment (its references are graded by it).
+    grader: str | None = Field(default=None, min_length=1, max_length=128)
+    max_prompt_tokens: int | None = Field(default=None, gt=0, le=131072)
+
+    @model_validator(mode="after")
+    def _grader_for_eval(self):
+        if (self.purpose == "eval") != (self.grader is not None):
+            raise ValueError("an eval upload names its grader, and only an eval upload does")
+        if ".." in self.object_key:
+            raise ValueError("object_key must not climb out of batch-inputs/")
+        return self
+
+
 class SetCap(BaseModel):
     model_config = ConfigDict(extra="forbid")
     cap: float = Field(ge=0.0, le=1.0)
@@ -298,7 +320,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      task_prefix: str = DEFAULT_TASK_PREFIX, eval_store=None,
                      open_environment=None, grade_scorer=None,
                      require_sandbox=None, qualifications=None, eval_jobs=None,
-                     model_facts=None, evaluation_sessions=None, pin_model=None) -> FastAPI:
+                     model_facts=None, evaluation_sessions=None, pin_model=None,
+                     upload_tokenizer=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
     ``eval_store`` the subnet bucket holding the eval sets' grading files."""
@@ -1151,6 +1174,43 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 dedupe_against=body.dedupe_against)))
         response.status_code = 202
         return {"state": "running", "delivery_id": delivery_id}
+
+    @router.post("/uploads")
+    async def ingest_upload(body: IngestUpload) -> dict:
+        """A customer's batch file (OpenAI Batch JSONL in the platform bucket) as frozen
+        prompt sets, one per sampling (``orders.uploads``); idempotent on the request."""
+        from reliquary.eval.storage import SetConflict
+        from reliquary.orders import uploads
+
+        if deliveries is None:
+            raise HTTPException(status_code=503, detail="platform_bucket_unavailable")
+        if body.grader is not None:
+            from reliquary.environment.registry import ENVIRONMENT_SPECS
+
+            if body.grader not in ENVIRONMENT_SPECS:
+                raise HTTPException(status_code=422, detail=f"grader_unknown: {body.grader!r}")
+        if upload_tokenizer is None:
+            from reliquary.validator.eval_control import load_cpu_tokenizer as load_tokenizer
+        else:
+            load_tokenizer = upload_tokenizer
+        try:
+            return await uploads.ingest(
+                object_key=body.object_key, sha256=body.sha256, model=body.model,
+                revision=body.revision, purpose=body.purpose,
+                max_prompt_tokens=body.max_prompt_tokens, grader=body.grader,
+                read_object=deliveries.get_bytes, load_tokenizer=load_tokenizer,
+                eval_store=eval_store, errors_sink=deliveries)
+        except uploads.UploadRefused as exc:
+            raise HTTPException(status_code=422, detail=str(exc)[:500]) from exc
+        except SetConflict as exc:
+            raise HTTPException(status_code=409, detail=f"set_conflict: {exc}"[:500]) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"model_files_unreadable: {exc}"[:500]) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("upload %s could not be ingested", body.object_key, exc_info=True)
+            raise HTTPException(status_code=503, detail="upload_unavailable") from exc
 
     @router.get("/architectures")
     async def architectures() -> dict:
