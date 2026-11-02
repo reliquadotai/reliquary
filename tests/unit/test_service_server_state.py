@@ -270,8 +270,10 @@ UNPAID = ["already_scanned", "exploration_banned", "exploration_cap_reached", "e
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", UNPAID)
-async def test_an_accepted_unpaid_group_ends_with_its_own_unrewarded_final_verdict(status):
+async def test_an_accepted_unpaid_group_ends_with_its_own_unrewarded_final_verdict(status, monkeypatch):
     """/submit answers SUBMITTED for every admitted group; the miner then reads /verdicts."""
+    # A wall-clock timestamp can coincidentally contain the private prompt index.
+    monkeypatch.setattr(time, "time", lambda: 100.0)
     from unittest.mock import MagicMock
     from reliquary.validator.service import ValidationService
     runtime = SimpleNamespace(contract=contract_v2())

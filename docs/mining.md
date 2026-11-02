@@ -342,11 +342,15 @@ teacher forcing are not bit-identical on every supported stack.
 
 ## Install
 
+Start from a trusted local checkout, as in the
+[local development setup](../README.md#local-development).
+
 ```bash
-git clone <repo-url> reliquary
-cd reliquary
+cd /path/to/reliquary
 python3.11 -m venv .venv && source .venv/bin/activate
-pip install -e .
+python scripts/bootstrap_python_trust.py
+PIP_USE_DEPRECATED=legacy-certs python -m pip install -e .
+python scripts/bootstrap_python_trust.py
 ```
 
 Verify:

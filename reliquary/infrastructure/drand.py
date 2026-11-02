@@ -5,7 +5,7 @@ Drand distributed randomness beacon integration for Reliquary.
 Features:
 - v2-first HTTP API with v1 fallbacks
 - Correct chain hashes (quicknet=3s, default=30s)
-- Programmatic fetch of chain info (genesis_time, period) with caching
+- Pinned chain timing, independent of relay metadata
 - Robust networking (Session, retries, shuffled relays, sensible timeouts)
 - Uniform schema for real & mock beacons
 """
@@ -13,13 +13,11 @@ Features:
 from __future__ import annotations
 
 import concurrent.futures
-import json
 import re
 import logging
 import os
-import subprocess
-import sys
 import threading
+import time
 from threading import Lock
 from typing import Any
 
@@ -79,15 +77,15 @@ DRAND_CHAINS: dict[str, dict[str, Any]] = {
     "quicknet": {
         "hash": "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971",
         "description": "Fast 3-second randomness (unchained, recommended)",
-        # Reasonable defaults; will be refreshed via /info on first use:
+        # Published chain timing is immutable; never override it from a relay.
         "period": 3,
-        "genesis_time": None,
+        "genesis_time": 1692803367,
     },
     "default": {
         "hash": "8990e7a9aaed2ffed73dbd7092123d6f289930540d7651336225dc172e51b2ce",
         "description": "Original 30-second chain (chained)",
         "period": 30,
-        "genesis_time": None,
+        "genesis_time": 1595431050,
     },
 }
 
@@ -99,54 +97,11 @@ _DRAND_CHAIN_HASH: str | None = None
 _DRAND_GENESIS_TIME: int | None = None
 _DRAND_PERIOD: int | None = None
 
-# Cache chain-info lookups by chain-hash to avoid repeated /info calls
-_CHAIN_INFO_CACHE: dict[str, dict[str, Any]] = {}
-
 # Thread-safety for globals and mock counter
 _LOCK = Lock()
 _BEACON_COUNTER = 0
 
 # ─────────────────────────  BEACON SIGNATURE VERIFICATION  ──────────────────
-
-_SIGNATURE_FETCH_TIMEOUT_SECONDS = 30.0
-_SIGNATURE_FETCH_CODE = """
-import re
-import sys
-from bittensor_drand import get_signature_for_round
-
-signature = get_signature_for_round(int(sys.stdin.read()))
-if not isinstance(signature, str) or re.fullmatch(r"[0-9a-fA-F]{96}", signature) is None:
-    raise ValueError("invalid independent signature")
-sys.stdout.write(signature)
-"""
-
-
-def _fetch_independent_signature(round_number: int) -> str:
-    # This binding can hold the GIL during network IO. A fresh interpreter
-    # isolates that wait without forking the running model into a worker pool.
-    environment = {
-        name: os.environ[name]
-        for name in (
-            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-            "http_proxy", "https_proxy", "all_proxy", "no_proxy",
-            "SSL_CERT_FILE", "SSL_CERT_DIR",
-        )
-        if name in os.environ
-    }
-    environment.update(CUDA_VISIBLE_DEVICES="", NVIDIA_VISIBLE_DEVICES="void")
-    try:
-        result = subprocess.run(
-            [sys.executable, "-I", "-B", "-c", _SIGNATURE_FETCH_CODE],
-            input=str(int(round_number)), stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, encoding="ascii", check=True,
-            timeout=_SIGNATURE_FETCH_TIMEOUT_SECONDS, env=environment,
-        )
-    except (subprocess.SubprocessError, OSError, UnicodeError) as exc:
-        raise RuntimeError("independent signature fetch failed") from exc
-    if re.fullmatch(r"[0-9a-fA-F]{96}", result.stdout) is None:
-        raise ValueError("invalid independent signature response")
-    return result.stdout
-
 
 def verify_beacon_signature(
     chain_hash: str,
@@ -154,78 +109,17 @@ def verify_beacon_signature(
     randomness_hex: str,
     signature_hex: str | None,
 ) -> bool:
-    """Verify a drand quicknet beacon by cross-check against bittensor-drand.
+    """Verify the pinned quicknet round and SHA256(signature), offline."""
+    import hashlib
 
-    Drand quicknet signatures are BLS12-381 sigs on G1 (48 bytes) with the
-    chain's public key on G2 (message = SHA256(round_be8), DST
-    ``BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_``). The reference C
-    implementation is `supranational/blst`, which is NOT distributed on PyPI
-    as ``pip install blst`` — so pairing verification in Python would require
-    either shipping a compiled shared lib or rewriting hash-to-curve from
-    scratch (both brittle).
-
-    Instead, we rely on a second independent source: ``bittensor_drand`` is
-    already pulled in as a dependency of ``bittensor`` and is a Rust binding
-    that fetches the same quicknet chain (hash
-    ``52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971``)
-    from a separate relay (``api.drand.secureweb3.com:6875``). A beacon is
-    considered authentic iff:
-
-    1. The fetched signature is a non-empty hex string.
-    2. ``bittensor_drand.get_signature_for_round(round)`` returns a byte-for-
-       byte identical signature (forging requires compromising both mirrors).
-    3. The randomness field equals ``SHA256(sig)`` — the unchained quicknet
-       derivation.
-
-    Returns True if all three checks pass, False otherwise. Fails closed on
-    any network, format, or parsing error.
-    """
-    if not signature_hex:
-        logger.warning("[Drand] beacon has no signature — cannot verify")
+    if chain_hash != DRAND_CHAINS["quicknet"]["hash"]:
         return False
-
-    try:
-        import hashlib
-
-        # Check 1 — randomness derivation (unchained quicknet: sha256(sig))
-        try:
-            sig_bytes = bytes.fromhex(signature_hex)
-        except ValueError:
-            logger.warning("[Drand] signature is not valid hex, rejecting")
-            return False
-        expected_rand = hashlib.sha256(sig_bytes).hexdigest()
-        if randomness_hex.lower() != expected_rand:
-            logger.error(
-                "[Drand] randomness != SHA256(sig) for round %d — rejecting",
-                round_number,
-            )
-            return False
-
-        # Check 2 — cross-check the sig against bittensor-drand's independent
-        # relay fetch. Delegates BLS verification to the Rust binding's
-        # internal flow (drand quicknet, G1 sigs, BLS12381G1).
-        try:
-            canonical = _fetch_independent_signature(int(round_number))
-        except Exception as exc:
-            logger.error(
-                "[Drand] bittensor-drand failed to fetch round %d: %s",
-                round_number, exc,
-            )
-            return False
-
-        if canonical.lower() != signature_hex.lower():
-            logger.error(
-                "[Drand] signature mismatch for round %d — rejecting "
-                "(ours=%s... bittensor-drand=%s...)",
-                round_number, signature_hex[:16], canonical[:16],
-            )
-            return False
-
-        return True
-
-    except Exception as e:
-        logger.warning("[Drand] beacon signature verification failed: %s", e)
+    point = g1_signature(signature_hex)
+    if point is None or not isinstance(randomness_hex, str):
         return False
+    if randomness_hex.lower() != hashlib.sha256(point).hexdigest():
+        return False
+    return verify_round_signature(round_number, signature_hex)
 
 
 # ───────────────────────────────  UTILITIES  ────────────────────────────────
@@ -235,35 +129,6 @@ def _get_chain_record(name: str) -> dict[str, Any]:
     if name not in DRAND_CHAINS:
         raise ValueError(f"Unknown drand chain '{name}'. Available: {list(DRAND_CHAINS.keys())}")
     return DRAND_CHAINS[name]
-
-
-def _parse_chain_info_payload(
-    payload: dict[str, Any],
-) -> tuple[int | None, int | None]:
-    """
-    Extract (genesis_time, period) from v2 or v1 /info responses.
-    Be tolerant to possible key naming variants.
-    """
-    # Common/expected v2 keys
-    gt = (
-        payload.get("genesis_time") or payload.get("genesisTime") or payload.get("genesis")
-    )  # some docs use 'genesis'
-    pd = payload.get("period") or payload.get("round_time") or payload.get("roundTime")
-
-    # Many responses encode period as seconds int; sometimes strings—normalize:
-    try:
-        if isinstance(pd, str):
-            pd = int(pd)
-    except Exception:
-        pd = None
-
-    try:
-        if isinstance(gt, str):
-            gt = int(gt)
-    except Exception:
-        gt = None
-
-    return gt, pd
 
 
 def _http_get_json(paths: list[str]) -> dict[str, Any] | None:
@@ -325,76 +190,14 @@ def _http_get_json(paths: list[str]) -> dict[str, Any] | None:
     return None
 
 
-def _fetch_chain_info(chain_hash: str) -> dict[str, Any] | None:
-    """
-    Programmatically fetch chain info (genesis_time, period, pubkey...) from relays.
-    Tries v2 then v1 shapes; caches on success.
-    """
-    if chain_hash in _CHAIN_INFO_CACHE:
-        return _CHAIN_INFO_CACHE[chain_hash]
-
-    v2_info = f"/v2/chains/{chain_hash}/info"
-    v1_info = f"/{chain_hash}/info"
-    # Additional v1 fallback for 'default' (some relays allow /info at root):
-    root_info = "/info" if chain_hash == DRAND_CHAINS["default"]["hash"] else None
-
-    payload = _http_get_json([v2_info, v1_info, root_info])  # type: ignore[list-item]
-    if not payload:
-        logger.debug(f"[Drand] chain info fetch failed for {chain_hash}")
-        return None
-
-    # Normalize core fields we care about; keep full payload for callers.
-    gt, pd = _parse_chain_info_payload(payload)
-    if gt is not None:
-        payload["genesis_time"] = gt
-    if pd is not None:
-        payload["period"] = pd
-
-    _CHAIN_INFO_CACHE[chain_hash] = payload
-    return payload
-
-
 def _ensure_params(refresh: bool = False) -> None:
-    """
-    Ensure _DRAND_CHAIN_HASH / _DRAND_GENESIS_TIME / _DRAND_PERIOD are populated.
-    If refresh=True, re-fetch chain info and overwrite cached values.
-    """
+    """Resolve immutable published timing without trusting relay metadata."""
     global _DRAND_CHAIN_HASH, _DRAND_GENESIS_TIME, _DRAND_PERIOD
 
     rec = _get_chain_record(_current_chain)
-    chain_hash = rec["hash"]
-    if (
-        refresh
-        or _DRAND_CHAIN_HASH != chain_hash
-        or _DRAND_GENESIS_TIME is None
-        or _DRAND_PERIOD is None
-    ):
-        # Start with configured defaults:
-        gt = rec.get("genesis_time")
-        pd = rec.get("period")
-
-        # Try to fetch live chain info to override:
-        info = _fetch_chain_info(chain_hash)
-        if info:
-            gt_live = info.get("genesis_time")
-            pd_live = info.get("period")
-            if isinstance(gt_live, int) and gt_live > 0:
-                gt = gt_live
-            if isinstance(pd_live, int) and pd_live > 0:
-                pd = pd_live
-
-        _DRAND_CHAIN_HASH = chain_hash
-        _DRAND_GENESIS_TIME = int(gt) if gt is not None else None
-        _DRAND_PERIOD = int(pd) if pd is not None else None
-
-        msg = (
-            f"[Drand] chain={_current_chain} hash={_DRAND_CHAIN_HASH} "
-            f"period={_DRAND_PERIOD} genesis_time={_DRAND_GENESIS_TIME}"
-        )
-        if info:
-            logger.info(msg + " (refreshed via /info)")
-        else:
-            logger.info(msg + " (using configured defaults)")
+    _DRAND_CHAIN_HASH = rec["hash"]
+    _DRAND_GENESIS_TIME = rec["genesis_time"]
+    _DRAND_PERIOD = rec["period"]
 
 
 # ─────────────────────────────  PUBLIC API  ─────────────────────────────
@@ -430,7 +233,7 @@ def g1_signature(signature_hex: Any) -> bytes | None:
     return bytes.fromhex(signature_hex)
 
 
-def verify_round_signature(round_number: int, signature_hex: str) -> bool:
+def verify_round_signature(round_number: int, signature_hex: str | None) -> bool:
     """True iff ``signature_hex`` is quicknet's BLS signature of
     ``round_number``, checked here, offline, in ~7 ms.
 
@@ -442,6 +245,8 @@ def verify_round_signature(round_number: int, signature_hex: str) -> bool:
     """
     import secrets
 
+    if type(round_number) is not int or not 0 < round_number < 2**64:
+        return False
     point = g1_signature(signature_hex)
     if point is None:
         return False
@@ -463,8 +268,10 @@ def get_verified_beacon(round_id: int) -> dict[str, Any] | None:
     relay gives a verifiable answer."""
     import hashlib
 
+    if type(round_id) is not int or not 0 < round_id < 2**64:
+        return None
     _ensure_params(refresh=False)
-    if _DRAND_CHAIN_HASH is None:
+    if _DRAND_CHAIN_HASH != DRAND_CHAINS["quicknet"]["hash"] or not DRAND_URLS:
         return None
     rid = str(int(round_id))
     paths = [f"/v2/chains/{_DRAND_CHAIN_HASH}/rounds/{rid}", f"/{_DRAND_CHAIN_HASH}/public/{rid}"]
@@ -477,7 +284,7 @@ def get_verified_beacon(round_id: int) -> dict[str, Any] | None:
         except Exception as e:
             logger.debug(f"[Drand] GET {url} error: {e}")
             return None
-        if not isinstance(data, dict) or data.get("round") != int(round_id):
+        if not isinstance(data, dict) or type(data.get("round")) is not int or data["round"] != int(round_id):
             return None
         point = g1_signature(data.get("signature"))
         if point is None:
@@ -512,15 +319,15 @@ def get_agreed_beacon(round_id: int, *, agree: int = 2) -> dict[str, Any] | None
     Every relay is asked at once (v2 and v1 paths); the round is returned as
     soon as ``agree`` relays gave the same signature for it and randomness =
     SHA256(signature) holds, so its cost is the second-fastest relay's answer
-    (cloudflare's is ~60 ms from the corpus box). Forging it takes
-    compromising two relays, as the bittensor-drand cross-check did, without
-    that check's fetch from one fixed (slow) relay per round. None: no
-    agreement (a relay down, a lie, a disagreement); the caller falls back.
+    (cloudflare's is ~60 ms from the corpus box). Local BLS verification is
+    required as well. None: no verified agreement; the caller falls back.
     """
     import hashlib
 
+    if type(round_id) is not int or not 0 < round_id < 2**64:
+        return None
     _ensure_params(refresh=False)
-    if _DRAND_CHAIN_HASH is None:
+    if _DRAND_CHAIN_HASH != DRAND_CHAINS["quicknet"]["hash"] or not DRAND_URLS:
         return None
     rid = str(int(round_id))
     paths = [f"/v2/chains/{_DRAND_CHAIN_HASH}/rounds/{rid}", f"/{_DRAND_CHAIN_HASH}/public/{rid}"]
@@ -543,7 +350,7 @@ def get_agreed_beacon(round_id: int, *, agree: int = 2) -> dict[str, Any] | None
             data = fut.result()
         except concurrent.futures.CancelledError:
             continue
-        if not isinstance(data, dict) or data.get("round") != int(round_id):
+        if not isinstance(data, dict) or type(data.get("round")) is not int or data["round"] != int(round_id):
             continue
         point = g1_signature(data.get("signature"))
         if point is None:
@@ -555,7 +362,7 @@ def get_agreed_beacon(round_id: int, *, agree: int = 2) -> dict[str, Any] | None
             continue
         relays = votes.setdefault(sig.lower(), set())
         relays.add(futures[fut])
-        if len(relays) >= agree:
+        if len(relays) >= agree and verify_round_signature(int(round_id), sig):
             return {"round": int(round_id), "signature": sig.lower(), "randomness": randomness}
     return None
 
@@ -577,17 +384,18 @@ def get_drand_beacon(round_id: int | None = None, use_fallback: bool = False) ->
         }
     """
     _ensure_params(refresh=False)
-    if _DRAND_CHAIN_HASH is None or _DRAND_PERIOD is None:
-        raise RuntimeError("Drand chain parameters not initialized")
+    if _DRAND_CHAIN_HASH != DRAND_CHAINS["quicknet"]["hash"]:
+        raise RuntimeError("Only quicknet has an offline signature verifier")
 
-    rid = "latest" if round_id is None else str(int(round_id))
+    if round_id is None:
+        round_id = int((time.time() - _DRAND_GENESIS_TIME) // _DRAND_PERIOD) + 1
+    if type(round_id) is not int or not 0 < round_id < 2**64:
+        raise ValueError("drand round must be a positive unsigned 64-bit integer")
+    rid = str(int(round_id))
     v2_path = f"/v2/chains/{_DRAND_CHAIN_HASH}/rounds/{rid}"
     v1_path = f"/{_DRAND_CHAIN_HASH}/public/{rid}"
-    # Default chain extra fallback (root v1 path without chain hash)
-    root_v1 = f"/public/{rid}" if _DRAND_CHAIN_HASH == DRAND_CHAINS["default"]["hash"] else None
-
-    data = _http_get_json([v2_path, v1_path, root_v1])  # type: ignore[list-item]
-    if not data:
+    data = _http_get_json([v2_path, v1_path])
+    if not isinstance(data, dict) or not data:
         logger.warning("[Drand] All relays/paths failed to fetch beacon")
         if use_fallback:
             return get_mock_beacon()
@@ -596,40 +404,27 @@ def get_drand_beacon(round_id: int | None = None, use_fallback: bool = False) ->
     rnd = data.get("randomness")
     rno = data.get("round")
     sig = data.get("signature")
-    # The drand v2 HTTP API omits the `randomness` field and only returns
-    # `{round, signature}`. Per drand spec, randomness = SHA256(signature),
-    # so we derive it locally. The signature is still verified below.
-    if rnd is None and sig is not None:
-        import hashlib
-        try:
-            rnd = hashlib.sha256(bytes.fromhex(sig)).hexdigest()
-        except ValueError:
-            rnd = None
-    if rnd is None or rno is None:
-        logger.debug(f"[Drand] Missing fields in response: {json.dumps(data)[:200]}")
-        if use_fallback:
-            return get_mock_beacon()
-        raise RuntimeError("drand response missing required fields")
+    if (type(rno) is not int or (round_id is not None and rno != int(round_id))
+            or not verify_round_signature(rno, sig)):
+        raise RuntimeError("drand response failed local round verification")
+    import hashlib
 
-    # NB: cross-check against bittensor_drand moved off the hot path.
-    # The validator schedules it as a background asyncio task right
-    # after OPEN (see ``ValidatorService._verify_beacon_async``); if
-    # it fails, the window is invalidated before ``_train_and_publish``
-    # consumes any submissions. Miner callers get no cross-check —
-    # a bad relay just makes their commitments fail GRAIL on the
-    # validator side, no security implication for the miner.
-    # The local ``randomness == SHA256(sig)`` derivation above is
-    # gratis and stays.
+    expected_randomness = hashlib.sha256(bytes.fromhex(sig)).hexdigest()
+    # The v2 API omits randomness; derive it only from the verified point.
+    if rnd is None:
+        rnd = expected_randomness
+    if not isinstance(rnd, str) or rnd.lower() != expected_randomness:
+        raise RuntimeError("drand response has invalid randomness")
 
-    logger.debug(f"[Drand-{_current_chain}] ok round={rno} rand={str(rnd)[:8]}... (sig verify deferred)")
+    logger.debug(f"[Drand-{_current_chain}] ok round={rno} rand={rnd[:8]}... (locally verified)")
     return {
         "source": "drand",
         "chain": _current_chain,
         "chain_hash": _DRAND_CHAIN_HASH,
         "period": _DRAND_PERIOD,
         "round": int(rno),
-        "randomness": str(rnd),
-        "signature": sig,
+        "randomness": expected_randomness,
+        "signature": sig.lower(),
         "previous_signature": data.get("previous_signature"),
     }
 

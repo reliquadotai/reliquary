@@ -40,6 +40,7 @@ if git -C "${REPO_DIR}" rev-parse HEAD >/dev/null 2>&1; then
   if ! git -C "${REPO_DIR}" diff --quiet HEAD -- \
     .dockerignore \
     scripts/build_cpu_executor_artifact.sh \
+    scripts/bootstrap_python_trust.py \
     docker/Dockerfile.cpu-executor \
     docker/cpu-executor-requirements.in \
     docker/cpu-executor-requirements.lock \

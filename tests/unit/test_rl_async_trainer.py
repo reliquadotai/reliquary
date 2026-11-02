@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import threading
+import time
 import zlib
 from types import SimpleNamespace
 
@@ -62,6 +63,35 @@ class Subs:
         with self.buffer.book.transaction():           # the controller's report is one transaction too
             assert self.buffer._remove(lease_id)
         self.reports[lease_id] = kw
+
+    def admit_training(self, lease_id, substitutions):
+        return {"lease_id": lease_id, "admission_id": lease_id, "accepted": True,
+                "expires_at": time.time() + 3600}
+
+
+def test_price_queue_counts_model_tokens_equally_with_or_without_tool_observations():
+    signals = []
+    for length, spans in ((40, None), (400, (((0, 20), (380, 400)),))):
+        buffer = TrainingBuffer(Book())
+        group = SubmittedGroup(lease_id=f"length-{length}", hotkey="A", environment="same", prompt_idx=1,
+                               checkpoint=3, nonce="cd" * 32, arrived_at=0.0, rewards=(1.0,),
+                               truncated=(False,), prompt_tokens=(1, 2), completions=((0,) * length,),
+                               force_spans=(None,), spans=spans)
+        buffer.push(group)
+        arrivals = buffer.drain_tick().arrivals
+        [taken] = buffer.take(1)
+        assert len(taken.completions[0]) == length                 # tool context remains available to training
+        assert taken.model_tokens(0) == len(taken.model_positions(0))
+        signals.append((arrivals, buffer.drain_tick().taken))
+    assert signals == [({"same": 40}, 40), ({"same": 40}, 40)]
+
+
+@pytest.mark.parametrize("spans", [(), ((4, 2), (0, 3)), ((2, 5), (4, 9))])
+def test_model_token_count_matches_draw_positions_without_materializing_them(spans):
+    group = SubmittedGroup(lease_id="spans", hotkey="A", environment="same", prompt_idx=1, checkpoint=3,
+                           nonce="cd" * 32, arrived_at=0.0, rewards=(1.0,), truncated=(False,),
+                           prompt_tokens=(1, 2), completions=((0,) * 10,), force_spans=(None,), spans=(spans,))
+    assert group.model_tokens(0) == len(group.model_positions(0))
 
 
 class Publisher:

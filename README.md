@@ -197,18 +197,19 @@ the evidence needed to evaluate them.
 
 ## Local development
 
-The following matches the CPU environment used by the validator test workflow:
+Start from a trusted local checkout. The following matches the CPU environment
+used by the validator test workflow:
 
 ```bash
-git clone https://github.com/reliquadotai/reliquary.git
-cd reliquary
+cd /path/to/reliquary
 
 python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install torch==2.7.0 \
+python scripts/bootstrap_python_trust.py
+PIP_USE_DEPRECATED=legacy-certs python -m pip install torch==2.7.0 \
   --index-url https://download.pytorch.org/whl/cpu
-python -m pip install -e ".[dev]"
+PIP_USE_DEPRECATED=legacy-certs python -m pip install -e ".[dev]"
+python scripts/bootstrap_python_trust.py
 
 pytest -q \
   --ignore=tests/gpu \

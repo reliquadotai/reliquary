@@ -1,6 +1,7 @@
 """A corpus task's validator: refuses what it cannot run, serves what it can."""
 
 import asyncio
+import hashlib
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -352,9 +353,12 @@ def test_drand_beacon_lowercases_randomness_on_success(monkeypatch):
     from reliquary.infrastructure import drand
 
     calls = []
+    expected = hashlib.sha256(bytes.fromhex("cd" * 48)).hexdigest()
     monkeypatch.setattr(drand, "get_drand_beacon", lambda **kw: {
-        "round": 42, "randomness": "AB" * 32, "signature": "cd" * 48, "chain_hash": "x",
+        "round": 42, "randomness": expected.upper(),
+        "signature": "cd" * 48, "chain_hash": "x",
     })
+    monkeypatch.setattr(drand, "verify_round_signature", lambda r, sig: r == 42 and sig == "cd" * 48)
 
     def _verify(chain_hash, round_number, randomness_hex, signature_hex):
         calls.append((chain_hash, round_number, randomness_hex, signature_hex))
@@ -362,8 +366,8 @@ def test_drand_beacon_lowercases_randomness_on_success(monkeypatch):
 
     monkeypatch.setattr(drand, "verify_beacon_signature", _verify)
 
-    assert drand_beacon(42) == "ab" * 32
-    assert calls == [("x", 42, "ab" * 32, "cd" * 48)]
+    assert drand_beacon(42) == expected
+    assert calls == [("x", 42, expected, "cd" * 48)]
 
 
 def test_the_app_refuses_an_unregistered_hotkey(seeded_job):

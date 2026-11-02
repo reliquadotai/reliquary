@@ -1,6 +1,8 @@
 # This image needs separate hardware qualification before profile publication.
 ARG BASE_IMAGE=python:3.12-slim@sha256:090ba77e2958f6af52a5341f788b50b032dd4ca28377d2893dcf1ecbdfdfe203
 FROM ${BASE_IMAGE}
+COPY scripts/bootstrap_python_trust.py /opt/bootstrap_python_trust.py
+RUN python /opt/bootstrap_python_trust.py --system
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
@@ -12,7 +14,8 @@ COPY scripts/vision-training-runtime.py ./training.py
 RUN python -m pip install --no-cache-dir torch==2.7.0 torchvision==0.22.0 --index-url "${TORCH_INDEX_URL}" \
     && python -m pip install --no-cache-dir transformers==5.10.4 huggingface-hub==1.30.0 \
        peft==0.21.2 accelerate==1.15.0 Pillow==13.0.0 num2words==0.5.14 \
-    && python -m pip install --no-cache-dir --no-deps .
+    && python -m pip install --no-cache-dir --no-deps . \
+    && python /opt/bootstrap_python_trust.py --system
 ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false HOME=/tmp \
     OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
 USER 10001:10001

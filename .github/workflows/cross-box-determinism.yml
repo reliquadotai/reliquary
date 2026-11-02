@@ -12,11 +12,13 @@ on:
       - "reliquary/environment/logic_tasks.py"
       - "reliquary/environment/reliquarylogic.py"
       - "scripts/build_opencodeinstruct_subset.py"
+      - "scripts/bootstrap_python_trust.py"
       - "scripts/emit_episode_determinism.py"
       - ".github/workflows/cross-box-determinism.yml"
   push:
     branches: [main]
     paths:
+      - "scripts/bootstrap_python_trust.py"
       - "reliquary/environment/grader/**"
       - "reliquary/environment/opencodeinstruct.py"
       - "reliquary/environment/agentic/**"
@@ -26,6 +28,9 @@ on:
       - "reliquary/environment/logic_tasks.py"
       - "reliquary/environment/reliquarylogic.py"
       - "scripts/emit_episode_determinism.py"
+
+env:
+  PIP_USE_DEPRECATED: legacy-certs
 
 jobs:
   determinism:
@@ -41,7 +46,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install package
-        run: pip install -e .
+        run: |
+          python scripts/bootstrap_python_trust.py
+          pip install -e .
+          python scripts/bootstrap_python_trust.py
       - name: Run determinism corpus
         env:
           PYTHONHASHSEED: "0"
@@ -86,7 +94,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install package
-        run: pip install -e .
+        run: |
+          python scripts/bootstrap_python_trust.py
+          pip install -e .
+          python scripts/bootstrap_python_trust.py
       - name: Emit Episode v1 determinism corpus
         env:
           PYTHONHASHSEED: "random"
@@ -132,7 +143,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install package
-        run: pip install -e .
+        run: |
+          python scripts/bootstrap_python_trust.py
+          pip install -e .
+          python scripts/bootstrap_python_trust.py
       - name: Emit reliquarylogic_v1 determinism corpus
         env:
           PYTHONHASHSEED: "random"

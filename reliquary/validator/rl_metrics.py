@@ -248,7 +248,11 @@ def controller_metrics(rl: Any, now: float, window_s: float = METRICS_EVERY_S,
             "accrued": db.execute("SELECT kind, SUM(amount), SUM(matched_tokens) FROM rl_accruals WHERE at>=? "
                                   "GROUP BY 1", (since,)).fetchall(),
         }
-        audit_queue = db.execute("SELECT COUNT(*) FROM rl_audits").fetchone()[0]
+        audit_queue, oldest_audit, retried_audits = db.execute(
+            "SELECT COUNT(*), MIN(queued_at), COALESCE(SUM(attempts>1), 0) FROM rl_audits "
+            "WHERE body IS NOT NULL").fetchone()
+        infrastructure_audits = db.execute("SELECT COUNT(*) FROM rl_audits WHERE body IS NULL "
+                                           "AND failure_class='infrastructure'").fetchone()[0]
         miners = len(active_hotkeys(db, now))
         banned = db.execute("SELECT COUNT(*) FROM rl_hotkey_bans WHERE until>?", (now,)).fetchone()[0]
         caps = [json.loads(state).get("cap", 0) for (state,) in db.execute("SELECT state FROM rl_lease_quota")]
@@ -282,7 +286,10 @@ def controller_metrics(rl: Any, now: float, window_s: float = METRICS_EVERY_S,
         out[f"pay/{kind}/matched_tokens"] = tokens or 0
     if speed is not None and speed[1] > 0:
         out["trainer/completion_tokens_per_s"] = speed[0] / speed[1]
-    out.update({"audits/queued": audit_queue, "miners/active": miners, "miners/banned": banned,
+    out.update({"audits/queued": audit_queue,
+                "audits/oldest_age_s": max(0.0, now - oldest_audit) if oldest_audit is not None else 0.0,
+                "audits/retried": retried_audits, "audits/infrastructure_inconclusive": infrastructure_audits,
+                "miners/active": miners, "miners/banned": banned,
                 "miners/quota_cap_mean": sum(caps) / len(caps) if caps else 0.0})
     if cards is not None:
         out.update(cards.row(rl, now, window_s))

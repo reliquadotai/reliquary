@@ -1,5 +1,7 @@
 ARG BASE_IMAGE=ghcr.io/reliquadotai/reliquary-validator@sha256:ad1b1118008db63c1d6e7c1aad91670ab6dd8ead658815c14e898237d0a1dcde
 FROM ${BASE_IMAGE}
+COPY scripts/bootstrap_python_trust.py /opt/bootstrap_python_trust.py
+RUN python /opt/bootstrap_python_trust.py --system
 
 ARG RUNTIME_PROFILE
 ARG CAUSAL_CONV_URL=https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2.post1/causal_conv1d-1.6.2.post1%2Bcu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
@@ -17,5 +19,6 @@ RUN case "${RUNTIME_PROFILE}" in \
       *) \
         echo "unsupported RUNTIME_PROFILE=${RUNTIME_PROFILE}" >&2; exit 2 ;; \
     esac
+RUN python /opt/bootstrap_python_trust.py --system
 
 LABEL ai.reliquary.runtime-matrix-profile="${RUNTIME_PROFILE}"

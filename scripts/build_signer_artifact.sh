@@ -36,6 +36,7 @@ if git -C "${REPO_DIR}" rev-parse HEAD >/dev/null 2>&1; then
   if ! git -C "${REPO_DIR}" diff --quiet HEAD -- \
     .dockerignore \
     scripts/build_signer_artifact.sh \
+    scripts/bootstrap_python_trust.py \
     docker/Dockerfile.signer \
     docker/signer-requirements.in \
     docker/signer-requirements.lock \

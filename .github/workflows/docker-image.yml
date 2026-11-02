@@ -65,7 +65,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         if: github.event_name == 'push' || inputs.include_logic
         with:
-          version: "0.11.10"
+          version: "0.13.5"
           python-version: "3.12"
       - name: Build reviewed candidate wheel twice
         if: github.event_name == 'push' || inputs.include_logic

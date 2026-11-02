@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1.6
 ARG PYTHON_IMAGE=python:3.12-slim@sha256:090ba77e2958f6af52a5341f788b50b032dd4ca28377d2893dcf1ecbdfdfe203
 FROM ${PYTHON_IMAGE}
+COPY scripts/bootstrap_python_trust.py /opt/bootstrap_python_trust.py
+RUN python /opt/bootstrap_python_trust.py --system
 
 ARG RELIQUARY_BUILD_REVISION=unknown
 
@@ -28,6 +30,7 @@ COPY reliquary/shared/__init__.py reliquary/shared/ckpt_index.py reliquary/share
 COPY reliquary/protocol/__init__.py reliquary/protocol/release_contract.py /opt/reliquary/reliquary/protocol/
 RUN printf '%s\n' "${RELIQUARY_BUILD_REVISION}" > /opt/reliquary/.build-revision \
  && python -m py_compile /opt/reliquary/reliquary/signer/*.py
+RUN python /opt/bootstrap_python_trust.py --system
 
 LABEL org.opencontainers.image.title="Reliquary semantic hotkey signer" \
       org.opencontainers.image.revision="${RELIQUARY_BUILD_REVISION}" \

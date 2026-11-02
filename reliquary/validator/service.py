@@ -5153,12 +5153,11 @@ class ValidationService:
         randomness: str,
         signature: str | None,
     ) -> None:
-        """Background bittensor_drand cross-check for the just-fetched beacon.
+        """Background local signature check for the just-fetched beacon.
 
-        Runs ``verify_beacon_signature`` in a worker thread (it's blocking
-        I/O — fetches an independent signature from a second drand relay
-        and byte-compares). On any failure (mismatch, network error, library
-        crash) flips ``beacon_invalid`` on ALL active batchers so
+        Runs ``verify_beacon_signature`` in a worker thread. On any failure
+        (invalid signature, round binding, or library error) it flips
+        ``beacon_invalid`` on ALL active batchers so
         ``_train_and_publish`` drops the window before sealing.
 
         ``batchers`` may be a single batcher or a list of batchers.
@@ -9912,8 +9911,8 @@ class ValidationService:
         Returns ``(window_randomness, beacon_or_None)``. ``beacon`` is the
         raw drand beacon dict (``{round, randomness, signature, ...}``)
         when the drand path is active, so the caller can schedule a
-        background bittensor_drand cross-check. ``None`` on the legacy
-        mock path (no cross-check possible).
+        background local signature check. ``None`` on the legacy
+        mock path (no signature to check).
 
         The caller binds this public value to the candidate's preselected
         activation nonce before exposing the final seed at OPEN.
@@ -9921,9 +9920,7 @@ class ValidationService:
         if self.use_drand:
             import time
             from reliquary.infrastructure.drand import get_beacon, get_current_chain
-            # Both calls do synchronous HTTP to the drand relays; run them off
-            # the event loop so a slow relay can't stall the window-open path
-            # (and the HTTP server) while the seed is fetched.
+            # Fetch the beacon off the event loop so a slow relay cannot stall OPEN.
             chain_info = await asyncio.to_thread(get_current_chain)
             drand_round = chain.compute_current_drand_round(
                 time.time(), chain_info["genesis_time"], chain_info["period"],

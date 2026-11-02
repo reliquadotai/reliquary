@@ -2,6 +2,8 @@
 FROM python:3.12-slim@sha256:090ba77e2958f6af52a5341f788b50b032dd4ca28377d2893dcf1ecbdfdfe203
 RUN apt-get update -qq && apt-get install -y -qq git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+COPY scripts/bootstrap_python_trust.py /opt/bootstrap_python_trust.py
+RUN python /opt/bootstrap_python_trust.py --system
 WORKDIR /opt/reliquary
 COPY reliquary /opt/reliquary/reliquary
 # The immutable historical catalog binds this fixture at import time too.
@@ -10,5 +12,6 @@ COPY scripts /opt/reliquary/scripts
 COPY docker/logic-release.json docker/logic-runtime-requirements.lock /opt/reliquary/docker/
 ENV PYTHONPATH=/opt/reliquary PYTHONDONTWRITEBYTECODE=1
 RUN --mount=type=secret,id=logic_wheel,target=/tmp/logic.whl,required=true \
-    python scripts/install_logic_runtime.py --wheel /tmp/logic.whl
+    python scripts/install_logic_runtime.py --wheel /tmp/logic.whl \
+    && python /opt/bootstrap_python_trust.py --system
 CMD ["python", "scripts/install_logic_runtime.py", "--verify-only"]
