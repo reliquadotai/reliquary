@@ -130,7 +130,7 @@ def validate_job(job: dict, now: float | None = None) -> dict:
     if type(vision["schemaVersion"]) is not int or vision["schemaVersion"] != 1:
         raise ValueError("Unsupported vision contract version")
     if vision["mode"] != "timestamped_frames_v1" or vision["task"] not in {
-        "football_events", "image_grounding",
+        "football_events", "image_grounding", "retail_events",
     }:
         raise ValueError("Unsupported vision task or processor mode")
     _digest(vision["processorRevision"], REVISION, "processor revision")

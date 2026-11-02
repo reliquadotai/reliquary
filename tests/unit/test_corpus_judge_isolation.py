@@ -158,3 +158,23 @@ def test_a_body_whose_read_fails_is_still_closed():
     with pytest.raises(ConnectionError):
         asyncio.run(job_store._get("k", pool=_Pool(), bucket_name="b"))
     assert closed == [True]
+
+
+@pytest.mark.parametrize("byte_range,expected", [
+    (None, b"0123456789"), ("bytes=-4", b"6789"),
+    ("bytes=0-3", b"0123"), ("bytes=3-", b"3456789"),
+])
+def test_the_load_bucket_honors_metadata_byte_ranges(byte_range, expected):
+    bucket = load.LatentR2()
+    bucket.objects["record"] = (b"0123456789", '\"etag\"')
+
+    async def scenario():
+        response = await bucket.get_object(Bucket="test", Key="record", Range=byte_range)
+        try:
+            assert await response["Body"].read() == expected
+            assert response["ETag"] == '\"etag\"'
+        finally:
+            response["Body"].close()
+
+    asyncio.run(scenario())
+    assert bucket.unclosed == 0

@@ -1,10 +1,13 @@
-"""Bounded rewards for reviewed image grounding and football events."""
+"""Bounded rewards for reviewed grounding, football and retail events."""
 
 from __future__ import annotations
 
 import math
+import re
 
 from reliquary.shared.strict_json import strict_json_loads
+
+RETAIL_LABEL = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{0,63}")
 
 # Football weights and decay match Score's private soccer_action scorer at
 # 60b328cbaabe63024f0e034204a0f6deb0d3154f; confidence is diagnostic only.
@@ -31,7 +34,8 @@ def validate_target(target: object, task: str, duration_us: int) -> dict:
     """Reject ambiguous labels; coordinates and football frames are canonical."""
     if not isinstance(target, dict) or set(target) != {"type", "items"}:
         raise ValueError("target must contain exactly type and items")
-    expected = {"football_events": "soccer_action", "image_grounding": "grounding"}
+    expected = {"football_events": "soccer_action", "image_grounding": "grounding",
+                "retail_events": "retail_events"}
     if task not in expected or target["type"] != expected[task]:
         raise ValueError("target type does not match task")
     items = target["items"]
@@ -51,6 +55,24 @@ def validate_target(target: object, task: str, duration_us: int) -> dict:
             item["frame"] = int(frame)
             if not isinstance(item["action"], str) or item["action"] not in ACTION_CONFIGS:
                 raise ValueError("unknown football action")
+            confidence = item["confidence"]
+            if (type(confidence) not in (int, float) or not 0 <= confidence <= 1
+                    or not math.isfinite(confidence)):
+                raise ValueError("confidence must be finite and between zero and one")
+        elif task == "retail_events":
+            if set(item) != {"label", "start_us", "end_us", "confidence"}:
+                raise ValueError("retail event requires label, start_us, end_us and confidence")
+            label = item["label"]
+            if not isinstance(label, str) or not RETAIL_LABEL.fullmatch(label):
+                raise ValueError("retail label must be an ASCII event identifier of at most 64 characters")
+            for name in ("start_us", "end_us"):
+                value = item[name]
+                if (type(value) not in (int, float) or not 0 <= value <= duration_us
+                        or int(value) != value):
+                    raise ValueError("retail timestamps must be integer microseconds inside the clip")
+                item[name] = int(value)
+            if item["start_us"] >= item["end_us"]:
+                raise ValueError("retail interval must be nonempty")
             confidence = item["confidence"]
             if (type(confidence) not in (int, float) or not 0 <= confidence <= 1
                     or not math.isfinite(confidence)):
@@ -127,6 +149,31 @@ def grounding_score(predictions: list[dict], target: list[dict]) -> float:
     return earned / max(len(target), len(predictions))
 
 
+def temporal_iou(left: dict, right: dict) -> float:
+    intersection = max(0, min(left["end_us"], right["end_us"])
+                       - max(left["start_us"], right["start_us"]))
+    union = max(left["end_us"], right["end_us"]) - min(left["start_us"], right["start_us"])
+    return intersection / union
+
+
+def retail_score(predictions: list[dict], target: list[dict]) -> float:
+    """Per-window training diagnostic; camera-hour alert metrics are separate."""
+    if not target:
+        return 0.0
+    pairs = sorted(((temporal_iou(prediction, truth), i, j)
+                    for i, prediction in enumerate(predictions)
+                    for j, truth in enumerate(target) if prediction["label"] == truth["label"]),
+                   reverse=True)
+    used_predictions, used_targets = set(), set()
+    earned = 0.0
+    for overlap, i, j in pairs:
+        if i not in used_predictions and j not in used_targets:
+            used_predictions.add(i)
+            used_targets.add(j)
+            earned += overlap
+    return earned / max(len(target), len(predictions))
+
+
 def reward(example: dict, completion: str, training: bool = False) -> float:
     """Invalid completions score zero; invalid/unreviewed annotations fail closed."""
     task = example["task"]
@@ -149,5 +196,6 @@ def reward(example: dict, completion: str, training: bool = False) -> float:
         return 0.0
     if training and example["is_verified_negative"]:
         return float(not prediction["items"])
-    scorer = football_score if task == "football_events" else grounding_score
+    scorer = {"football_events": football_score, "image_grounding": grounding_score,
+              "retail_events": retail_score}[task]
     return scorer(prediction["items"], target["items"])

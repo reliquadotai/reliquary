@@ -104,6 +104,29 @@ def test_adapter_delivery_and_parent_continuation(allocation, monkeypatch):
         runner.load_parent(job, parent_output, value["configuration"], value["profile"])
 
 
+def test_retail_task_uses_existing_private_delivery_contract(allocation, monkeypatch):
+    model, job, output, value = allocation
+    from reliquary.vision import runtime
+    rows = [json.loads(line) for line in (job / "dataset.jsonl").read_text().splitlines()]
+    for row in rows:
+        row["task"] = "retail_events"
+        row["media"].update(kind="frames", duration_us=2_000_000)
+        row["target"] = {"type": "retail_events", "items": [
+            {"label": "zone_entry", "start_us": 0, "end_us": 1_000_000, "confidence": 1},
+        ]}
+    (job / "dataset.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    value["profile"]["vision"]["task"] = "retail_events"
+    value["configuration"]["dataset"]["sha256"] = runner.checksum(job / "dataset.jsonl")
+    (job / "job.json").write_text(json.dumps(value))
+    monkeypatch.setattr(runtime, "run_job", mock_training)
+    report = runner.execute(job, model, output)
+    assert report["vision"]["task"] == "retail_events"
+    assert runner.checksum(output / "checkpoint.tar") == report["checkpointSha256"]
+    with tarfile.open(output / "checkpoint.tar") as archive:
+        binding = json.load(archive.extractfile("binding.json"))
+        assert binding["vision"]["task"] == "retail_events"
+
+
 @pytest.mark.parametrize("mutation", [
     lambda v: v["profile"].update(datasetFormat="instruction"),
     lambda v: v["profile"].update(gpuCount=2),

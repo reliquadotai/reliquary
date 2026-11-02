@@ -154,6 +154,57 @@ def test_empty_labels_require_verified_negatives():
     validate_manifest(manifest(row))
 
 
+def retail_example(*, inline=False):
+    row = example(inline=inline)
+    row["task"] = "retail_events"
+    row["media"].pop("score_fps")
+    row["media"]["clip_start_us"] = 10_000_000
+    row["target"] = {"type": "retail_events", "items": [
+        {"label": "zone_entry", "start_us": 0, "end_us": 1_500_000, "confidence": 1.0},
+    ]}
+    return row
+
+
+def test_retail_uses_microseconds_without_football_timebase(tmp_path):
+    row = retail_example(inline=True)
+    second = dict(row["media"]["frames"][0], pts_us=1_000_000)
+    row["media"]["frames"].append(second)
+    source = write_jsonl(tmp_path / "retail.jsonl", [row])
+    prepared = load_manifest(prepare_jsonl(source, tmp_path / "prepared"))
+    actual = prepared["examples"][0]
+    assert actual["task"] == "retail_events"
+    assert actual["media"]["clip_start_us"] == 10_000_000
+    assert [frame["pts_us"] for frame in actual["media"]["frames"]] == [0, 1_000_000]
+    assert actual["target"]["items"][0]["end_us"] == 1_500_000
+    assert "score_fps" not in actual["media"]
+
+
+@pytest.mark.parametrize("changes", [
+    {"start_us": True}, {"start_us": -1}, {"start_us": 1.5},
+    {"end_us": 2_000_001}, {"end_us": 0}, {"end_us": float("inf")},
+    {"label": ""}, {"label": " zone_entry"}, {"confidence": True},
+    {"confidence": float("nan")}, {"confidence": 1.1}, {"extra": "no"},
+])
+def test_retail_rejects_ambiguous_intervals_or_fields(changes):
+    row = retail_example()
+    row["target"]["items"][0].update(changes)
+    with pytest.raises(ValueError):
+        validate_manifest(manifest(row))
+
+
+def test_retail_refuses_football_fps_and_requires_verified_negatives():
+    row = retail_example()
+    row["media"]["score_fps"] = 25
+    with pytest.raises(ValueError):
+        validate_manifest(manifest(row))
+    row["media"].pop("score_fps")
+    row["target"]["items"] = []
+    with pytest.raises(ValueError):
+        validate_manifest(manifest(row))
+    row["is_verified_negative"] = True
+    validate_manifest(manifest(row))
+
+
 def test_json_integral_numbers_are_canonicalized_without_accepting_booleans():
     row = example()
     row["media"]["duration_us"] = 2_000_000.0

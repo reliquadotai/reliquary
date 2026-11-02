@@ -84,3 +84,20 @@ def test_grounding_iou_is_class_aware_and_penalizes_extra_boxes():
     assert reward(example, response([dict(target, label="player")], "grounding")) == 0
     assert reward(example, response([dict(target, box=[0, 0, 500, 1000])], "grounding")) == 0.5
     assert reward(example, response([dict(target, box=[0, 0, 0, 0])], "grounding")) == 0
+
+
+def test_retail_interval_reward_is_separate_from_alert_rate():
+    target = {"label": "zone_entry", "start_us": 0, "end_us": 1_000_000, "confidence": 1}
+    example = {"task": "retail_events", "annotation_complete": True,
+               "is_verified_negative": False, "media": {"duration_us": 2_000_000},
+               "target": {"type": "retail_events", "items": [target]}}
+    assert reward(example, response([target], "retail_events")) == 1
+    assert reward(example, response([target, target], "retail_events")) == 0.5
+    assert reward(example, response([dict(target, label="wrong")], "retail_events")) == 0
+    assert reward(example, response([dict(target, start_us=500_000)], "retail_events")) == 0.5
+    assert reward(example, response([dict(target, end_us=2_000_001)], "retail_events")) == 0
+    example["target"]["items"] = []
+    example["is_verified_negative"] = True
+    assert reward(example, response([], "retail_events"), training=True) == 1
+    assert reward(example, response([target], "retail_events"), training=True) == 0
+    assert reward(example, response([], "retail_events")) == 0
