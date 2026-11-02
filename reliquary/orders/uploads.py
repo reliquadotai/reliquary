@@ -481,7 +481,7 @@ RESULT_PREFIX = "reliquary/order-uploads"
 ERRORS_PREFIX = "batch-uploads"
 
 
-async def ingest(*, object_key: str, sha256: str, model: str, revision: str, purpose: str,
+async def ingest(*, object_key: str, sha256: str | None, model: str, revision: str, purpose: str,
                  max_prompt_tokens: int | None, grader: str | None, read_object,
                  load_tokenizer, eval_store, errors_sink) -> dict:
     """Compile the platform object ``object_key`` (checked against ``sha256``) into prompt
@@ -490,11 +490,18 @@ async def ingest(*, object_key: str, sha256: str, model: str, revision: str, pur
 
     ``read_object(key) -> bytes | None``; ``load_tokenizer(model, revision) -> (tokenizer,
     vocab_size)``, blocking (run in a thread). Raises ``UploadRefused``, or what
-    ``load_tokenizer`` raises (ValueError: the model can never be read)."""
+    ``load_tokenizer`` raises (ValueError: the model can never be read). Without ``sha256`` (an
+    object the platform could not hash, written once under its own key), it is the object's own."""
     import asyncio
 
     from reliquary.eval.storage import subnet_key
 
+    body = None
+    if sha256 is None:
+        body = await read_object(object_key)
+        if body is None:
+            raise UploadRefused("object_unknown", f"no object {object_key!r} in the platform bucket")
+        sha256 = hashlib.sha256(body).hexdigest()
     uid = upload_id(sha256=sha256, model=model, revision=revision, purpose=purpose,
                     max_prompt_tokens=max_prompt_tokens, grader=grader)
     result_key = f"{RESULT_PREFIX}/{uid}/result.json"
@@ -502,7 +509,8 @@ async def ingest(*, object_key: str, sha256: str, model: str, revision: str, pur
     existing = await eval_store.get_bytes(result_key)
     if existing is not None:
         return json.loads(existing)
-    body = await read_object(object_key)
+    if body is None:
+        body = await read_object(object_key)
     if body is None:
         raise UploadRefused("object_unknown", f"no object {object_key!r} in the platform bucket")
     if hashlib.sha256(body).hexdigest() != sha256:

@@ -306,3 +306,14 @@ def test_a_file_whose_prompts_hold_too_many_tokens_is_refused(monkeypatch):
     with pytest.raises(UploadRefused) as refused:
         compile_(completion("a", [1, 2, 3]), completion("b", [4, 5, 6]))
     assert refused.value.code == "too_many_tokens"
+
+
+def test_the_route_hashes_an_object_the_platform_could_not(admin):
+    body = jsonl(completion("a", "x"))
+    request = _put(admin, body, key="batch-inputs/u2/file.jsonl")
+    unhashed = {k: v for k, v in request.items() if k != "sha256"}
+    answer = admin(unhashed)
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["sha256"] == hashlib.sha256(body).hexdigest()
+    # The same object again, with or without its hash: the first answer.
+    assert admin(unhashed).json() == answer.json() == admin(request).json()
