@@ -613,15 +613,17 @@ def test_every_reason_the_runtime_can_emit_is_in_the_published_allow_list(tmp_pa
 
 
 def test_close_waits_for_a_running_thread_call_and_refuses_later_ones(tmp_path):
-    import time
+    import threading
     rt = runtime(tmp_path)
     explore(rt)
     pub, _ = publisher(rt, [])
     done = []
     real = rt.plan_segment
+    entered, release = threading.Event(), threading.Event()
 
     def slow(**kw):
-        time.sleep(0.3)
+        entered.set()
+        assert release.wait(5)
         out = real(**kw)
         done.append(1)
         return out
@@ -629,13 +631,18 @@ def test_close_waits_for_a_running_thread_call_and_refuses_later_ones(tmp_path):
 
     async def scenario():
         task = asyncio.create_task(pub.flush())
-        await asyncio.sleep(0.05)
-        await pub.close()
-        finished = list(done)
-        task.cancel()
-        with pytest.raises(BaseException):
-            await task
-        return finished
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            closing = asyncio.create_task(pub.close())
+            await asyncio.sleep(0)
+            assert not closing.done()
+            release.set()
+            await asyncio.wait_for(closing, 5)
+            return list(done)
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
     assert asyncio.run(scenario()) == [1]
     with pytest.raises(RuntimeError, match="closed"):
         asyncio.run(pub._thread(lambda: None))
