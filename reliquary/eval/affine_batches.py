@@ -387,14 +387,21 @@ def _compare(args):
     sizes = {}
     for row in pool.values():
         sizes[row["env"]] = sizes.get(row["env"], 0) + 1
+    selection = {t: dict(env=pool[t]["env"], pi=probabilities[t]) for t in selected}
+    head_cells = gate.merge(blocks)
     # The current estimator removed cap_envs and implements the task-level cap itself.
-    decision = baseline.estimate({t: dict(env=pool[t]["env"], pi=probabilities[t]) for t in selected}, gate.merge(blocks), candidate, sizes,
+    decision = baseline.estimate(selection, head_cells, candidate, sizes,
                                 shares=cfg["shares"], tau=cfg["tau_run_separate"], sigma_run_floor=cfg["sigma_run_floor"],
                                 bar_z=bar, z_inclusive=cfg["z_inclusive"], cap_max=cfg["cap_max"], min_scored=cfg["min_scored"], min_cover=cfg["min_cover"])
     if bindings != _bindings(args, source) or candidate_digest != checkpoint_digest(args.candidate) or inspect_kit(args.kit) != source:
         raise ValueError("comparison_inputs_changed")
     _write(Path(args.work) / "comparison.private.json", {"bindings": bindings, "candidateDigest": checkpoint_digest(args.candidate),
            "decision": decision, "drawn": len(selected), "barZ": bar,
+           "headCells": head_cells, "candidateCells": candidate,
+           "drawSelection": {"tasks": selection, "envSizes": sizes, "estimatorSettings": {
+               "shares": cfg["shares"], "tau": cfg["tau_run_separate"], "sigma_run_floor": cfg["sigma_run_floor"],
+               "bar_z": bar, "z_inclusive": cfg["z_inclusive"], "cap_max": cfg["cap_max"],
+               "min_scored": cfg["min_scored"], "min_cover": cfg["min_cover"]}},
            "clock": {"trainingResultAt": args.training_result_at, "lastGreenDecidedAt": args.last_green_decided_at},
            "prior": "provided" if args.prior else "env-average", "baselineReused": False,
            "inferenceCheckpointIdentity": "caller-asserted-unverified", "headProvenance": "caller-provided-unverified"})
