@@ -75,6 +75,12 @@ frame at time zero, and a target such as
 Boxes are normalized integer xyxy coordinates. Empty targets require
 `is_verified_negative: true`; missing labels must not be encoded as negatives.
 
+Retail uses `task: "retail_events"`, timestamped frames without `score_fps`, and
+`type: "retail_events"` items containing `label`, `start_us`, `end_us` and
+`confidence`. Its class-aware interval reward is a per-window diagnostic, not
+an alert-rate metric. The [retail video workflow](retail-video.md) prepares causal
+windows, excludes the final test from training and evaluates camera-time exposure.
+
 Inputs are limited to 5 MiB, 256 examples, 64 frames per clip, 60 seconds per
 clip, 2048 pixels per dimension and 64 million decoded pixels per dataset.
 PNG must be static, non-interlaced, 8-bit RGB/RGBA. URLs, path references in

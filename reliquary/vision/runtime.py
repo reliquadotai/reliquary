@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import math
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -220,6 +221,7 @@ def _evaluate(model, processor, examples, encode, request, check_deadline):
     predictions = []
     for example in examples:
         check_deadline()
+        started = time.perf_counter()
         batch = encode(example)
         if batch["input_ids"].shape[1] + request["max_new_tokens"] > request["max_context_tokens"]:
             raise ValueError("The prompt plus completion budget exceeds the context limit")
@@ -229,7 +231,8 @@ def _evaluate(model, processor, examples, encode, request, check_deadline):
         )[0]
         score = 0.0 if row["truncated"] else reward(example, row["answer"], training=False)
         predictions.append({"id": example["id"], "answer": row["answer"],
-                            "reward": score, "truncated": row["truncated"]})
+                            "reward": score, "truncated": row["truncated"],
+                            "latency_ms": (time.perf_counter() - started) * 1000})
     return {"mean_reward": sum(row["reward"] for row in predictions) / len(predictions),
             "truncated": sum(row["truncated"] for row in predictions)}, predictions
 

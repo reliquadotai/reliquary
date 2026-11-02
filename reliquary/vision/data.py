@@ -185,7 +185,7 @@ def validate_manifest(
             raise ValueError("unknown dataset split")
         if sources.setdefault(example["source_id"], split) != split:
             raise ValueError("source_id crosses dataset splits")
-        if example["task"] not in ("image_grounding", "football_events"):
+        if example["task"] not in ("image_grounding", "football_events", "retail_events"):
             raise ValueError("unknown vision task")
         prompt = example["prompt"]
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 8192:
@@ -195,20 +195,21 @@ def validate_manifest(
         if type(example["is_verified_negative"]) is not bool:
             raise ValueError("is_verified_negative must be a boolean")
         football = example["task"] == "football_events"
+        temporal = example["task"] != "image_grounding"
         media_keys = {"kind", "frames", "clip_start_us", "duration_us"}
         if football:
             media_keys.add("score_fps")
         media = _keys(example["media"], media_keys, "media")
-        if media["kind"] != ("frames" if football else "image"):
+        if media["kind"] != ("frames" if temporal else "image"):
             raise ValueError("media kind does not match task")
         media["clip_start_us"] = _integer(
-            media["clip_start_us"], 0, 86_400_000_000 if football else 0, "clip_start_us")
+            media["clip_start_us"], 0, 86_400_000_000 if temporal else 0, "clip_start_us")
         media["duration_us"] = _integer(
-            media["duration_us"], 1 if football else 0, 60_000_000 if football else 0, "duration_us")
+            media["duration_us"], 1 if temporal else 0, 60_000_000 if temporal else 0, "duration_us")
         if football:
             media["score_fps"] = _integer(media["score_fps"], 25, 25, "score_fps")
         frames = media["frames"]
-        if not isinstance(frames, list) or not 1 <= len(frames) <= (64 if football else 1):
+        if not isinstance(frames, list) or not 1 <= len(frames) <= (64 if temporal else 1):
             raise ValueError("invalid number of frames")
         previous_pts = -1
         for frame in frames:
@@ -224,7 +225,7 @@ def validate_manifest(
             if total_pixels > MAX_TOTAL_PIXELS:
                 raise ValueError("dataset exceeds decoded pixel bound")
             pts = frame["pts_us"] = _integer(
-                frame["pts_us"], 0, media["duration_us"] - 1 if football else 0, "pts_us")
+                frame["pts_us"], 0, media["duration_us"] - 1 if temporal else 0, "pts_us")
             if pts <= previous_pts:
                 raise ValueError("frame timestamps must be strictly increasing")
             previous_pts = pts
