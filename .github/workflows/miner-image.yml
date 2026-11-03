@@ -76,7 +76,7 @@ jobs:
           from reliquary.miner.vllm_generation import SUPPORTED_VLLM_SERIES
 
           assert os.geteuid() == 10001
-          assert version("vllm").split("+")[0] == "0.30.0"
+          assert version("vllm") == "0.30.0+cu129"
           assert ".".join(version("vllm").split(".")[:2]) in SUPPORTED_VLLM_SERIES
           assert version("torch").split("+")[0] == "2.13.0"
           assert torch.version.cuda == "12.9"
