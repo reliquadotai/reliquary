@@ -3,7 +3,8 @@
 A draw job's sample ``(prompt, slot)`` is fixed by its public draw (``corpus.eval_draw``): a lease guards no
 integrity, only work. A miner asks the job for a lease and gets a free slot until ``expires_at``; meanwhile a
 submission of that slot by another hotkey is refused (``draw_slot_leased``). A lease ends when the slot is taken,
-when its holder releases it, or when it expires (no penalty: the quota is the RL controller's, later). When no free
+when its holder releases it, or when it expires (no penalty: the quota is the RL controller's, later; a job priced
+by auction, ``corpus.token_auction``, charges it instead and lifts the per-hotkey cap). When no free
 slot is left, a slot leased for more than half its time may be leased to a second miner, the first valid submission
 taking it, so a job's last slots never wait for a slow or vanished miner. A miner that asks for no lease (an older
 one) still submits any slot no one else holds.
@@ -51,6 +52,9 @@ class Lease:
     slot: int
     granted_at: float
     expires_at: float
+    # A job priced by auction: what each token of this lease pays (pool share) and the round it was granted in.
+    price: float | None = None
+    round: int | None = None
 
     def to_wire(self) -> dict[str, Any]:
         return {"lease_id": self.lease_id, "prompt_index": self.prompt_index, "slot": self.slot,
@@ -61,8 +65,15 @@ class DrawLeases:
     """The live leases of one draw job (``grant``, ``release``, ``refusal`` at submission, ``settle`` on accept)."""
 
     def __init__(self, job: Any, *, clock: Callable[[], float] = time.time, rng: random.Random | None = None,
-                 max_per_hotkey: int = MAX_LEASES_PER_HOTKEY, seconds: float | None = None) -> None:
+                 max_per_hotkey: int = MAX_LEASES_PER_HOTKEY, seconds: float | None = None,
+                 limit_per_hotkey: bool = True,
+                 on_unused: Callable[[Lease, float], None] | None = None) -> None:
+        """``limit_per_hotkey`` False (a job priced by auction): no per-hotkey cap, the price decides who works.
+        ``on_unused(lease, held_fraction)`` hears of a lease that ended without its slot taken: expired (1) or
+        released (the share of its time it was held)."""
         self._job = job
+        self._limit = bool(limit_per_hotkey)
+        self._on_unused = on_unused
         self._clock = clock
         self._rng = rng or random.Random(secrets.randbits(64))
         self._max = int(max_per_hotkey)
@@ -94,12 +105,22 @@ class DrawLeases:
                 lease = self._by_id[lease_id]
                 self._unused.setdefault(lease.hotkey, []).append(lease.expires_at)
                 self._drop(lease_id)
+                self._unused_lease(lease, 1.0)
             for hotkey in list(self._unused):
                 recent = [t for t in self._unused[hotkey] if now - t < self.seconds]
                 if recent:
                     self._unused[hotkey] = recent
                 else:
                     del self._unused[hotkey]
+
+    def _unused_lease(self, lease: Lease, held_fraction: float) -> None:
+        if self._on_unused is not None:
+            try:
+                self._on_unused(lease, held_fraction)
+            except Exception:                 # a charge never breaks the lease book
+                import logging
+
+                logging.getLogger(__name__).exception("draw leases: unused-lease hook failed")
 
     def holders(self, prompt_index: int, slot: int) -> list[Lease]:
         with self._lock:
@@ -115,7 +136,10 @@ class DrawLeases:
         """The live leases this hotkey may hold now (``MAX_LEASES_PER_HOTKEY``)."""
         with self._lock:
             self.expire()
-            share = int(MAX_JOB_SHARE_PER_HOTKEY * self._job.prompt_count * int(self._job.slots_per_prompt))
+            slots = int(self._job.prompt_count * int(self._job.slots_per_prompt))
+            if not self._limit:
+                return max(1, slots)
+            share = int(MAX_JOB_SHARE_PER_HOTKEY * slots)
             cap = max(1, min(self._max, share))
             return max(1, cap >> len(self._unused.get(hotkey, ())))
 
@@ -126,14 +150,15 @@ class DrawLeases:
 
     # -- the miner's side ----------------------------------------------------
 
-    def grant(self, hotkey: str, free_slots: Callable[[int], Iterable[tuple[int, int]]]) -> Lease | str | None:
+    def grant(self, hotkey: str, free_slots: Callable[[int], Iterable[tuple[int, int]]], *,
+              price: float | None = None, round: int | None = None) -> Lease | str | None:
         """A lease for ``hotkey`` on a free slot: an unleased one, else (the job's tail) one leased to another hotkey
         for more than half its time. ``free_slots(start)`` yields the job's open ``(prompt, slot)``, prompts from
         ``start`` round. None: no slot to lease; a string: why this hotkey gets none."""
         with self._lock:
-            return self._grant(hotkey, free_slots)
+            return self._grant(hotkey, free_slots, price, round)
 
-    def _grant(self, hotkey, free_slots):
+    def _grant(self, hotkey, free_slots, price=None, round=None):
         self.expire()
         if len(self.held_by(hotkey)) >= self.cap(hotkey):
             return "too_many_leases"
@@ -144,17 +169,19 @@ class DrawLeases:
         for prompt_index, slot in free_slots(start):
             held = self._by_slot.get((prompt_index, slot), ())
             if not held:
-                return self._add(hotkey, prompt_index, slot, now)
+                return self._add(hotkey, prompt_index, slot, now, price, round)
             leases = [self._by_id[i] for i in held]
             if (tail is None and len(leases) == 1 and leases[0].hotkey != hotkey
                     and now - leases[0].granted_at >= SECOND_LESSEE_AFTER * self.seconds):
                 tail = (prompt_index, slot)
         if tail is not None:
-            return self._add(hotkey, *tail, now)
+            return self._add(hotkey, *tail, now, price, round)
         return None
 
-    def _add(self, hotkey: str, prompt_index: int, slot: int, now: float) -> Lease:
-        lease = Lease(secrets.token_hex(16), hotkey, int(prompt_index), int(slot), now, now + self.seconds)
+    def _add(self, hotkey: str, prompt_index: int, slot: int, now: float, price: float | None = None,
+             round: int | None = None) -> Lease:
+        lease = Lease(secrets.token_hex(16), hotkey, int(prompt_index), int(slot), now, now + self.seconds,
+                      price, round)
         self._by_id[lease.lease_id] = lease
         self._by_slot.setdefault((lease.prompt_index, lease.slot), []).append(lease.lease_id)
         return lease
@@ -165,6 +192,8 @@ class DrawLeases:
             if lease is None or lease.hotkey != hotkey:
                 return False
             self._drop(lease_id)
+            held = (self._clock() - lease.granted_at) / self.seconds if self.seconds > 0 else 1.0
+            self._unused_lease(lease, held)
             return True
 
     # -- the submission's side -----------------------------------------------
@@ -174,6 +203,13 @@ class DrawLeases:
         holders = self.holders(prompt_index, slot)
         if holders and all(lease.hotkey != hotkey for lease in holders):
             return REASON_DRAW_SLOT_LEASED
+        return None
+
+    def held(self, hotkey: str, prompt_index: int, slot: int) -> Lease | None:
+        """``hotkey``'s own live lease on this slot, or None."""
+        for lease in self.holders(prompt_index, slot):
+            if lease.hotkey == hotkey:
+                return lease
         return None
 
     def settle(self, prompt_index: int, slot: int) -> None:

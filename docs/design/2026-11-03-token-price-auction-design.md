@@ -1,6 +1,7 @@
 # Token price auction: one price mechanism for RL, corpus and orders
 
-Status: draft for discussion. Nothing here is coded.
+Status: v1 coded for corpus and order draw jobs (§11), off unless a task declares `pricing: "auction"`. RL is
+unchanged.
 
 ## 1. Why
 
@@ -164,22 +165,34 @@ The forced draw checks every audited token. We start simple and loosen with meas
 | Escaping debt with a new hotkey | Registration cost; debt carried. Open question on a first-delivery allowance. |
 | Collusion with few operators | Ceiling bounds the damage. Visible as P at the ceiling with work served, not open. |
 
-## 7. Simulation (running)
+## 7. Simulation
 
-Replay of the RL lease history (controller DB backups 2026-10-26 → 10-30) under:
-- the uniform price with truthful asks;
-- the uniform price with adaptive bidders;
-- pay-as-bid with adaptive bidders.
+Replay of the RL run's lease history (controller DB, 2026-10-22 → 10-30, 116 trainer steps) with miner costs
+assumed from GPU rental prices and measured throughput. Miner behaviour is assumed, so the dollar levels are not
+predictions; the comparisons between rules are what holds.
 
-Miner costs are assumed from GPU rental prices and measured throughput. The outputs are:
-- cost vs what was paid;
-- burn;
-- the stability of P;
-- rounds in shortage;
-- concentration;
-- the minimum ceiling at which supply covers demand.
+**Measured** (no assumption):
+- 94.6 M trained tokens per step on average;
+- per-env prices swung by 10x or more under the current controller;
+- 46 % of the cap went unpaid;
+- a median of 36 active hotkeys per step, top-1 share 5.9 %;
+- envscaler is thin: 21 hotkeys, top-1 share 38 %.
 
-Results are to be added here.
+**Compared** (assumed costs):
+- **Pay-as-bid** looks cheaper only against naive bidders. Bidders that learn from past prices make it cost 1.4x
+  the uniform price, and 1.8x if bidding starts at the ceiling.
+- **The uniform price** barely moves when miners bid strategically (+3 %).
+- **Ceiling:** start at 1.5-2x the historical price per environment, then tighten toward the observed clearing
+  price. If costs are high, a 1x ceiling starves the trainer (80 % served); if they are low, the extra simply
+  burns.
+- **Main risk: a few large miners set P when supply is tight.**
+  - The top hotkey alone adds 6 % to the cost at today's trainer speed, and 46 % at twice the speed.
+  - The top-10 merged add 97 %.
+  - Thin environments and short rounds are the most exposed.
+- **Concentration** rises slightly: top-1 goes from 7 % to 10-12 %, and 70-77 hotkeys are still served.
+
+Decision: uniform price. The open follow-up is a guard against tight-supply manipulation (smoothing P over rounds,
+or a share cap per operator), to measure in production before choosing.
 
 ## 8. Code map (when decided)
 
@@ -205,3 +218,54 @@ Results are to be added here.
 3. Ask granularity for RL: per env (proposed), or one ask with per-env multipliers.
 4. Whether pay-as-bid is ever better for us (§7).
 5. When to move from 100 % to 15 % audit: volume threshold and honest failure rate.
+
+## 11. Implementation (v1)
+
+Scope: draw jobs served by the corpus validator and the order control (corpus and batch/eval orders). Off unless the
+task's registry params declare it:
+
+```
+reliquary tasks set-cap --task-id <task> --max-price-alpha-per-mtoken <ceiling> --pricing auction \
+    [--auction-round-seconds 600] [--auction-initial-leases 64]
+```
+
+A validator applies it when it wires the job (restart or hot-add); changing it on a live job needs a rewire.
+
+What is coded:
+
+- **`reliquary/corpus/token_auction.py`**: asks, rounds, price moves, leases per round, debts, public view.
+  - The round price is fixed when the round opens, at the highest live ask under the target, so a lease's price
+    is known when it is granted.
+  - Leases go to admitted hotkeys (ask ≤ round price) until the round's leases run out. This is the threshold
+    form of "cheapest first": within a round every admitted miner is paid the same, and at each round close the
+    target moves one ask down (saturated) or up (leases left while a miner was priced out).
+- **Leases** (`corpus/draw_leases.py`):
+  - no per-hotkey cap on an auction job;
+  - every lease carries its price and round;
+  - an expired lease charges its holder in full, a released lease by the share of its time held.
+- **Routes** (`validator/corpus_service.py`):
+  - `POST /corpus/ask` and `/corpus/jobs/{id}/ask`: signed and single-use, in micro-alpha per million tokens.
+  - `GET /corpus/jobs/{id}/auction`: the round, price, ceiling, leases and closed rounds, never an ask or a
+    hotkey.
+  - Lease answers carry `detail.price_alpha_per_mtoken`.
+  - A submission without the hotkey's own lease is refused `lease_required`.
+- **Records and verdicts:** an accepted record carries `lease_price` (pool share per token) and `lease_debit`. The
+  auditor copies them to the verdict.
+- **Settlement** (`corpus_settlement.rewards_for`): a period pays `tokens x lease_price − lease_debit` per hotkey,
+  scaled down only past the period's budget (`min(cap, ceiling x tokens)`); the rest burns.
+- **Audit queue:** the leases per round follow the audit backlog.
+  - The corpus auditor exposes `audit_backlog()`.
+  - The order control adds the samples waiting at its executors (`PairedAuditDispatcher.pending_items`).
+- **Miner:** `reliquary corpus mine --ask-alpha-per-mtoken X` posts the ask before leasing, every 10 min, and
+  again when the validator says it holds none.
+
+Limits of v1:
+
+- **State is in memory:** asks, debts and the target price. A restart drops debts and restarts the price at the
+  ceiling for one round. Miners repost asks within 10 min.
+- **Debt leaves with the job:** it is taken back from later submissions of the same job only.
+- **Agentic miners are not covered:** `corpus mine-agentic` does not post asks yet, so episode jobs should not be
+  priced by auction.
+- **Split corpus validators are not covered:** a front that serves routes apart from the judge does not wire the
+  auction.
+- **Audit rate:** start auction jobs at `audit_q = 1` (§4).

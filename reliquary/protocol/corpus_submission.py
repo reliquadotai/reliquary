@@ -122,6 +122,8 @@ class CorpusRejectReason(str, Enum):
     DRAW_SLOT_TAKEN = "draw_slot_taken"
     # A draw job's slot another hotkey holds a live lease on (``corpus.draw_leases``).
     DRAW_SLOT_LEASED = "draw_slot_leased"
+    # A job priced by auction (``corpus.token_auction``): only a slot this hotkey leased is paid, so only it is taken.
+    LEASE_REQUIRED = "lease_required"
 
 
 class CorpusCompletion(BaseModel):
@@ -307,6 +309,30 @@ class CorpusLeaseReleaseRequest(BaseModel):
     miner_hotkey: str = Field(min_length=1, max_length=64)
     lease_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     signature: str = Field(min_length=1, max_length=256)
+
+
+class CorpusAskRequest(BaseModel):
+    """A hotkey's signed ask on a job priced by auction (``corpus.token_auction``): the micro-alpha per million
+    verified tokens it works for. Single-use like a lease request; the latest one stands for an hour."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1, max_length=256)
+    miner_hotkey: str = Field(min_length=1, max_length=64)
+    micro_alpha_per_mtoken: int = Field(ge=1, le=10**15)
+    issued_at: int = Field(ge=0)
+    nonce: str = Field(pattern=r"^[0-9a-f]{32}$")
+    signature: str = Field(min_length=1, max_length=256)
+
+
+class CorpusAskResponse(BaseModel):
+    """``accepted`` with the job's auction view in ``detail``; else ``reason``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    accepted: bool
+    reason: str
+    detail: dict[str, Any] = Field(default_factory=dict)
 
 
 class CorpusLeaseResponse(BaseModel):

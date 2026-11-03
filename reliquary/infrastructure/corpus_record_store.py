@@ -43,6 +43,7 @@ _RECORD_FIELDS = frozenset({
     "schema", "submission_id", "job_id", "hotkey", "cursor", "prompt_index",
     "rendered_prompt", "received_at", "token_count", "completions",
 })
+_LEASE_FIELDS = frozenset({"lease_price", "lease_debit"})
 
 
 def _validated_id(submission_id: Any) -> str:
@@ -117,7 +118,12 @@ def _record_identity(job_id, submission_id, record) -> None:
         CorpusTrajectory,
     )
 
-    if (not isinstance(record, Mapping) or set(record) != _RECORD_FIELDS
+    lease_keys = set(record) - _RECORD_FIELDS if isinstance(record, Mapping) else set()
+    if (not isinstance(record, Mapping) or set(record) - lease_keys != _RECORD_FIELDS
+            # A job priced by auction adds both lease terms, finite and non-negative, or neither.
+            or lease_keys not in (set(), _LEASE_FIELDS)
+            or any(type(record[k]) not in (int, float) or not math.isfinite(record[k]) or record[k] < 0
+                   for k in lease_keys)
             or record["schema"] not in (RECORD_SCHEMA_V1, RECORD_SCHEMA_V2)
             or record["job_id"] != _validated_job_id(job_id)
             or record["submission_id"] != _validated_id(submission_id)
@@ -249,7 +255,20 @@ _META_KEYS = {
     "hotkey": re.compile(rb'"hotkey":"((?:[^"\\]|\\.)*)"'),
     "received_at": re.compile(rb'"received_at":(-?[0-9][0-9.eE+-]*|null)'),
     "token_count": re.compile(rb'"token_count":([0-9]+)'),
+    # A job priced by auction (``corpus.token_auction``): the lease's price per token and the debt taken back.
+    "lease_price": re.compile(rb'"lease_price":(-?[0-9][0-9.eE+-]*)'),
+    "lease_debit": re.compile(rb'"lease_debit":(-?[0-9][0-9.eE+-]*)'),
 }
+
+
+def _lease_terms(found: Mapping) -> dict:
+    """The lease terms of a record's metadata, present only on a job priced by auction."""
+    terms = {}
+    for name in ("lease_price", "lease_debit"):
+        value = found.get(name)
+        if value is not None:
+            terms[name] = float(value)
+    return terms
 
 
 def submission_meta(tail: bytes) -> dict | None:
@@ -268,7 +287,7 @@ def submission_meta(tail: bytes) -> dict | None:
     received = found["received_at"]
     return {"hotkey": json.loads(b'"' + found["hotkey"] + b'"'),
             "received_at": None if received in (None, b"null") else float(received),
-            "token_count": int(found["token_count"])}
+            "token_count": int(found["token_count"]), **_lease_terms(found)}
 
 
 async def read_submission_meta(job_id, submission_id, *,
@@ -288,7 +307,7 @@ async def read_submission_meta(job_id, submission_id, *,
     if record is None:
         return None
     return {"hotkey": record["hotkey"], "received_at": record.get("received_at"),
-            "token_count": int(record["token_count"])}
+            "token_count": int(record["token_count"]), **_lease_terms(record)}
 
 
 async def list_submission_ids(job_id, **client_kwargs) -> list[str]:

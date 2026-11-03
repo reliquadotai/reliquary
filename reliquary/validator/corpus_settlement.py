@@ -21,6 +21,12 @@ VERDICT_READ_CONCURRENCY = 16
 
 
 def rewards_for(verdicts: Iterable[Mapping], cap: float) -> dict[str, float]:
+    """What each hotkey earns of ``cap`` (the period's pool): its share of the passed tokens, or, on a job priced
+    by auction (verdicts carrying ``lease_price``), its tokens at their lease's price less the debt they carried,
+    scaled down only if that passes the pool (the rest burns)."""
+    verdicts = list(verdicts)
+    if any(v.get("lease_price") is not None for v in verdicts if v.get("passed")):
+        return _priced_rewards(verdicts, cap)
     tokens: dict[str, int] = {}
     for verdict in verdicts:
         if verdict.get("passed"):
@@ -29,6 +35,21 @@ def rewards_for(verdicts: Iterable[Mapping], cap: float) -> dict[str, float]:
     if total <= 0:
         return {}
     return {hotkey: cap * count / total for hotkey, count in tokens.items()}
+
+
+def _priced_rewards(verdicts: list[Mapping], cap: float) -> dict[str, float]:
+    earned: dict[str, float] = {}
+    for verdict in verdicts:
+        if not verdict.get("passed") or verdict.get("lease_price") is None:
+            continue
+        value = int(verdict["token_count"]) * float(verdict["lease_price"]) - float(verdict.get("lease_debit") or 0.0)
+        earned[verdict["hotkey"]] = earned.get(verdict["hotkey"], 0.0) + value
+    earned = {hotkey: value for hotkey, value in earned.items() if value > 0}
+    total = sum(earned.values())
+    if total <= 0:
+        return {}
+    scale = min(1.0, float(cap) / total) if cap > 0 else 0.0
+    return {hotkey: value * scale for hotkey, value in earned.items() if value * scale > 0}
 
 
 def _union(settled, ids) -> list[str]:
