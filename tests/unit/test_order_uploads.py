@@ -301,6 +301,15 @@ def test_the_route_refuses_a_changed_object_and_an_eval_without_grader(admin):
     assert "object_unknown" in admin({**request, "object_key": "batch-inputs/none"}).json()["detail"]
 
 
+def test_cached_compilation_keeps_the_current_source_file(admin):
+    body = jsonl(completion("a", "x"))
+    first = admin(_put(admin, body, key="batch-inputs/u1/first.jsonl")).json()
+    second = admin(_put(admin, body, key="batch-inputs/u1/second.jsonl")).json()
+    assert first["object_key"] == "batch-inputs/u1/first.jsonl"
+    assert second == {**first, "object_key": "batch-inputs/u1/second.jsonl"}
+    assert len(admin.loads) == 1
+
+
 def test_a_file_whose_prompts_hold_too_many_tokens_is_refused(monkeypatch):
     from reliquary.orders import uploads
 
@@ -319,6 +328,22 @@ def test_the_route_hashes_an_object_the_platform_could_not(admin):
     assert answer.json()["sha256"] == hashlib.sha256(body).hexdigest()
     # The same object again, with or without its hash: the first answer.
     assert admin(unhashed).json() == answer.json() == admin(request).json()
+
+
+def test_the_route_binds_http_error_writes_to_each_input(admin, monkeypatch):
+    written = []
+    put = admin.platform.put_bytes
+
+    async def scoped_writer(key, body, *, object_key):
+        written.append(object_key)
+        await put(key, body)
+
+    monkeypatch.setattr(admin.platform, "put_upload_errors", scoped_writer, raising=False)
+    first = _put(admin, jsonl(completion("a", "x")), key="batch-inputs/u1/file.jsonl")
+    second = _put(admin, jsonl(completion("b", "y")), key="batch-inputs/u2/file.jsonl")
+    assert admin(first).status_code == 200
+    assert admin(second).status_code == 200
+    assert written == [first["object_key"], second["object_key"]]
 
 
 

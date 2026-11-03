@@ -514,7 +514,7 @@ async def ingest(*, object_key: str, sha256: str | None, model: str, revision: s
     create = getattr(eval_store, "create_bytes", None) or eval_store.put_bytes
     existing = await eval_store.get_bytes(result_key)
     if existing is not None:
-        return json.loads(existing)
+        return {**json.loads(existing), "object_key": object_key}
     if body is None:
         body = await read_object(object_key)
     if body is None:
