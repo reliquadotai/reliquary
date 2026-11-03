@@ -15,7 +15,9 @@ import sys
 from urllib.parse import urlsplit
 
 UPSTREAM = "https://github.com/AffineFoundation/affine"
-REVISION = "a59734f8a7a494c46df47ca3955cc7f594ec6bc0"
+REVISION = "46c3cb6a83abbc881341d374e86d438af91eedb5"
+COMPARISON_RULE = "fixed-z-1-public-prior-v1"
+APPROXIMATION = "PUBLIC PRIOR APPROXIMATION"
 STAGES = ("plan", "generate", "validate", "train", "compare", "simulate")
 
 
@@ -125,11 +127,27 @@ def _master_digest(path):
     return hashlib.sha256(_canonical({p.name: _sha(p) for p in files})).hexdigest()
 
 
-def _train_policy(kit):
-    tree = ast.parse((Path(kit) / "miner/validator/batch/ff_format.py").read_text())
+def _constants(path, names):
+    tree = ast.parse(Path(path).read_text())
     return {node.targets[0].id: ast.literal_eval(node.value) for node in tree.body
             if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id in ("TRAIN_BOUNDS", "TRAIN_DEFAULTS")}
+            and node.targets[0].id in names}
+
+
+def _train_policy(kit):
+    return _constants(Path(kit) / "miner/validator/batch/ff_format.py",
+                      ("TRAIN_BOUNDS", "TRAIN_DEFAULTS", "KNOB_SPEC", "STEP_MULT_ALLOWED", "MAX_OUTPUT", "MAX_CONTEXT", "LEGACY_CAP"))
+
+
+def _gate_policy(kit):
+    cfg = _load(Path(kit) / "miner/validator/gate/gate-config.public.json")["heldout"]["prior_v1"]
+    expected = dict(N=500, k_cand=8, head_rollouts=12, head_blocks=3, scoring_mode="separate",
+                    floor=0.1, cap=0.1, shares="size", n_init=2, sigma_run_floor=0.003,
+                    bar_z=1, z_inclusive=False, cap_max=0.33, cap_rule="task-level",
+                    min_scored=100, min_cover=0.95, block_delay=3, weighting="irt-info")
+    if any((type(cfg.get(k)) is bool) != (type(v) is bool) or cfg.get(k) != v for k, v in expected.items()) or cfg.get("tau_run_separate") != 0 or cfg.get("tau_run_same") != 0 or cfg.get("z_bar_fixed_from_epoch") != 553:
+        raise ValueError("unsupported_public_gate_policy")
+    return cfg
 
 
 def _mining(path, kit):
@@ -145,12 +163,39 @@ def _mining(path, kit):
         raise ValueError("unsupported_batch_formats")
     policy = _train_policy(kit)
     fields = value["batch_file"]["train"]["fields"]
-    for name, (minimum, maximum) in policy["TRAIN_BOUNDS"].items():
-        limits = fields[name]
-        if any(type(limits[k]) not in (int, float) for k in ("min", "max", "default")) or (limits["min"], limits["max"], limits["default"]) != (minimum, maximum, policy["TRAIN_DEFAULTS"][name]):
+    specs = {name: ("number", bounds, policy["TRAIN_DEFAULTS"][name]) for name, bounds in policy["TRAIN_BOUNDS"].items()}
+    specs["step_mult"] = ("integer", policy["STEP_MULT_ALLOWED"], policy["TRAIN_DEFAULTS"]["step_mult"])
+    specs.update(policy["KNOB_SPEC"])
+    if len(specs) != 16 or set(fields) != set(specs):
+        raise ValueError("unsupported_mining_train_policy")
+    for name, (kind, limits, default) in specs.items():
+        field = fields[name]
+        if field.get("default") != default or (default is not None and type(field.get("default")) is bool):
             raise ValueError("unsupported_mining_train_policy")
+        if kind == "number":
+            if any(type(field.get(k)) not in (int, float) for k in ("min", "max")) or (field["min"], field["max"]) != tuple(limits) or field.get("type", "number") != "number":
+                raise ValueError("unsupported_mining_train_policy")
+        elif (field.get("type") != ("string" if kind == "choice" else kind)
+              or field.get("choices") != list(limits)
+              or kind == "integer" and (type(field.get("default")) is not int or any(type(x) is not int for x in field["choices"]))):
+            raise ValueError("unsupported_mining_train_policy")
+    if (policy["MAX_OUTPUT"], policy["MAX_CONTEXT"], policy["LEGACY_CAP"]) != (12288, 16384, 8192):
+        raise ValueError("unsupported_token_policy")
+    sampling = value["training"]["sampling"]
+    harness = sampling["harness"]["affine_math"]
+    if any(type(sampling.get(k)) not in (int, float) or sampling.get(k) != v for k, v in dict(temperature=1, top_p=0.95, top_k=20).items()) or harness.get("max_output_tokens") != policy["MAX_OUTPUT"] or harness.get("max_context_tokens") != policy["MAX_CONTEXT"] or harness.get("enable_thinking") is not True:
+        raise ValueError("unsupported_sampling_policy")
+    cfg = _gate_policy(kit)
+    heldout = value["training"]["promotion_gate"]["heldout"]
+    settings = heldout["current_round"]["settings"]
+    expected = {k: cfg[k] for k in ("N", "k_cand", "head_rollouts", "head_blocks", "scoring_mode", "floor", "cap", "shares", "n_init", "sigma_run_floor", "bar_z", "z_inclusive", "cap_max", "cap_rule", "min_scored", "min_cover", "block_delay", "weighting")}
+    expected.update(max_tokens=12288, max_context_tokens=16384, tau_run=0)
+    if any(settings.get(k) != v or (type(settings.get(k)) is bool) != (type(v) is bool) for k, v in expected.items()) or heldout["z_bar"].get("kind") != "fixed" or heldout["z_bar"].get("current") != 1 or heldout["z_bar"].get("from_epoch") != 553:
+        raise ValueError("unsupported_mining_gate_policy")
     return {"sha256": _sha(path), "epoch": value["epoch"], "checkpoint": value["checkpoint"],
-            "maxTasks": tasks, "maxRollouts": rollouts, "formats": formats}
+            "maxTasks": tasks, "maxRollouts": rollouts, "formats": formats,
+            "tokenLimits": {"maxOutput": 12288, "maxContext": 16384, "legacyCap": 8192},
+            "comparisonClockRule": COMPARISON_RULE, "comparisonMode": APPROXIMATION}
 
 
 def _bindings(args, source):
@@ -262,7 +307,7 @@ def plan(args):
         raise ValueError("batch_version_unavailable")
     train = document.get("train", {})
     clock = {"trainingResultAt": args.training_result_at, "lastGreenDecidedAt": args.last_green_decided_at}
-    hours = _clock(args.training_result_at, args.last_green_decided_at)
+    _clock(args.training_result_at, args.last_green_decided_at)
     common = ["python", "-m", "reliquary.eval.affine_batches"]
     base = ["--kit", "<KIT>", "--mining", "<MINING>", "--head", "<HEAD>", "--hotkey", args.hotkey, "--work", "<WORK>"]
     return {"schema": "affine-batch-plan/v1", "upstream": source,
@@ -272,9 +317,11 @@ def plan(args):
             "head": {"digest": bindings["headDigest"], "provenance": "caller-provided-unverified"},
             "reference": {"digest": bindings["referenceDigest"], "provenance": "caller-provided-unverified"},
             "training": {"master": "provided" if args.master else "bf16-bootstrap",
-                         "lr": train.get("lr", 5e-7), "kl": train.get("kl", 0.02)},
+                         "lr": train.get("lr", 5e-7), "kl": train.get("kl", 0.02),
+                         "parameters": train, "parameterValidation": "not_run"},
             "comparison": {"seed": args.seed, "prior": "provided" if args.prior else "env-average", **clock,
-                           "barZ": max(0.25, 1.0 - 0.75 * hours / 12)},
+                           "barZ": 1.0, "comparisonClockRule": COMPARISON_RULE, "mode": APPROXIMATION,
+                           "liveWeighting": "irt-info-private-unavailable", "localWeighting": "public-beta-prior"},
             "bindings": bindings, "structuralOnly": True, "tokenValidation": "not_run",
             "qualification": "not_run", "liveParity": False, "officialAcceptance": False, "chainSubmission": False,
             "commands": [{"stage": stage, "argv": common + [stage] + base + flags} for stage, flags in (
@@ -396,9 +443,9 @@ def _compare(args):
     sys.path.insert(0, str(Path(args.kit) / "miner/kit"))
     import gate_eval as gate
     import baseline_v1 as baseline
-    cfg = dict(baseline.DEFAULTS, **_load(Path(args.kit) / "miner/validator/gate/gate-config.public.json")["heldout"]["prior_v1"])
-    hours = _clock(args.training_result_at, args.last_green_decided_at)
-    bar = baseline.z_bar_at(hours, cfg["z_bar_schedule"])
+    cfg = dict(baseline.DEFAULTS, **_gate_policy(args.kit))
+    _clock(args.training_result_at, args.last_green_decided_at)
+    bar = cfg["bar_z"]
     cfg["N"] = args.n
     bindings = _bindings(args, source)
     candidate_digest = checkpoint_digest(args.candidate)
@@ -433,6 +480,8 @@ def _compare(args):
         raise ValueError("comparison_inputs_changed")
     _write(Path(args.work) / "comparison.private.json", {"bindings": bindings, "candidateDigest": checkpoint_digest(args.candidate),
            "decision": decision, "drawn": len(selected), "barZ": bar,
+           "comparisonClockRule": COMPARISON_RULE, "mode": APPROXIMATION,
+           "liveWeighting": "irt-info-private-unavailable", "localWeighting": "public-beta-prior",
            "headCells": head_cells, "candidateCells": candidate,
            "drawSelection": {"tasks": selection, "envSizes": sizes, "estimatorSettings": {
                "shares": cfg["shares"], "tau": cfg["tau_run_separate"], "sigma_run_floor": cfg["sigma_run_floor"],
