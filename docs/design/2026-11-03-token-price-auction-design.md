@@ -269,3 +269,26 @@ Limits of v1:
 - **Split corpus validators are not covered:** a front that serves routes apart from the judge does not wire the
   auction.
 - **Audit rate:** start auction jobs at `audit_q = 1` (§4).
+
+## 12. RL (later)
+
+v1 is not wired into the RL controller. Batch and eval orders come first. The auction keeps an RL run fully
+async: miners generate continuously, the trainer never waits on a round, and a lease's price is known when it is
+granted. The round is only the cadence of price changes, never a synchronisation point.
+
+Three changes are needed before an RL job is priced by auction:
+
+- **Leases per round follow the trainer, not only the audit queue.** In RL the trainer is the bottleneck. The
+  signal is the groups waiting for the trainer, plus the audit backlog.
+  - Too many leases: groups pile up, fall behind the checkpoint and honest miners fail the lag audit.
+  - Too few: the trainer waits.
+  - So the lease count is a lag regulator. Target a queue of about `groups per step x tolerated lag`. At
+    equilibrium the miners' rate equals what the trainer consumes.
+- **No debt when we void the lease.** A lease made stale by a checkpoint swap is not the miner's fault. It ends
+  without debt, like our outages are neutral in RL pay today.
+- **Short RL leases.** An RL lease lives under the maximum tolerated lag, not 72 min. The 10 min round can stay:
+  it is a little longer than a trainer step (~350-420 s), enough for a stable price.
+
+At equilibrium the cheapest miners keep their GPUs full and the most expensive admitted miner fills the gap. The
+price settles where supply just keeps up with the trainer. This replaces the RL price rise on trainer wait and
+the pay smoothing.
