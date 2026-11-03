@@ -107,7 +107,8 @@ def test_child_failure_remains_fail_closed_without_raw_output(monkeypatch, caplo
 @pytest.mark.parametrize("cancel", [False, True])
 async def test_owned_child_is_reaped_on_timeout_even_if_verification_cancelled(tmp_path, monkeypatch, cancel):
     pid_path = tmp_path / "child.pid"
-    code = f"import os,time; from pathlib import Path; Path({str(pid_path)!r}).write_text(str(os.getpid())); time.sleep(5)"
+    code = (f"import os,time; from pathlib import Path; p=Path({str(pid_path)!r}); "
+            "tmp=p.with_suffix('.tmp'); tmp.write_text(str(os.getpid())); tmp.replace(p); time.sleep(5)")
     monkeypatch.setattr(drand, "_SIGNATURE_FETCH_CODE", code)
     monkeypatch.setattr(drand, "_SIGNATURE_FETCH_TIMEOUT_SECONDS", 0.3)
     svc = SimpleNamespace(_window_n=41)
