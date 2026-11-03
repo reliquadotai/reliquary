@@ -506,6 +506,99 @@ def test_http_delivery_reads_manifest_for_restart_and_refuses_redirects(monkeypa
         asyncio.run(sink.get_json(HTTP_KEY))
 
 
+def test_http_batch_reads_are_bounded_and_keep_the_configured_origin(monkeypatch):
+    sink = HTTPDeliverySink(url="https://example.test", secret="s" * 32)
+    input_key = f"batch-inputs/{RUN_ID}/file-{RUN_ID}.jsonl"
+    requested, status, body = [], [200], [b'{"custom_id":"one"}\n']
+
+    class Connection:
+        def request(self, method, route, headers):
+            requested.append((method, route, headers))
+
+        def getresponse(self):
+            return SimpleNamespace(status=status[0], read=lambda n: body[0][:n])
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sink, "_connection", Connection)
+    assert asyncio.run(sink.get_bytes(input_key)) == body[0]
+    assert requested[-1][:2] == (
+        "GET", f"/api/internal/subnet/batch/files/file-{RUN_ID}/content")
+    assert requested[-1][2] == {"Authorization": "Bearer " + "s" * 32}
+    assert asyncio.run(sink.get_bytes("batch-uploads/" + "a" * 32 + "/errors.jsonl")) == body[0]
+    status[0] = 404
+    assert asyncio.run(sink.get_bytes(input_key)) is None
+    status[0] = 302
+    with pytest.raises(RuntimeError, match="refused"):
+        asyncio.run(sink.get_bytes(input_key))
+    status[0] = 200
+    monkeypatch.setattr(sink, "max_input_bytes", 2)
+    with pytest.raises(ValueError, match="size limit"):
+        asyncio.run(sink.get_bytes(input_key))
+    for key in ("private/keys.json", f"batch-inputs/{RUN_ID}/../secret.jsonl"):
+        with pytest.raises(ValueError):
+            asyncio.run(sink.get_bytes(key))
+
+
+def test_http_batch_errors_bind_each_source_and_allow_empty_files(tmp_path, monkeypatch):
+    sink = HTTPDeliverySink(url="https://example.test", secret="s" * 32)
+    writes = []
+
+    class Connection:
+        def __init__(self):
+            self.headers = {}
+
+        def putrequest(self, method, route):
+            self.route = route
+
+        def putheader(self, name, value):
+            self.headers[name] = value
+
+        def endheaders(self):
+            pass
+
+        def send(self, body):
+            pass
+
+        def getresponse(self):
+            writes.append((self.route, self.headers))
+            return SimpleNamespace(status=201, read=lambda n: b"")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sink, "_connection", Connection)
+    other = "87654321-4321-4321-8321-210987654321"
+
+    async def upload_both():
+        await asyncio.gather(*[
+            sink.put_upload_errors(f"batch-uploads/{digit * 32}/errors.jsonl", b"",
+                                   object_key=f"batch-inputs/{RUN_ID}/file-{file_id}.jsonl")
+            for digit, file_id in (("a", RUN_ID), ("b", other))
+        ])
+
+    asyncio.run(upload_both())
+    assert {route for route, _ in writes} == {
+        f"/api/internal/subnet/batch/files/file-{file_id}/uploads/{digit * 32}/errors.jsonl"
+        for digit, file_id in (("a", RUN_ID), ("b", other))
+    }
+    assert all(h["Content-Length"] == "0" and h["X-Content-SHA256"] == hashlib.sha256(b"").hexdigest()
+               for _, h in writes)
+    assert sink.requires_job_contract_pin is True and sink.evaluation_supported is False
+    assert sink.accepts_delivery_id("dl-" + RUN_ID)
+    assert not sink.accepts_delivery_id("dl-" + RUN_ID + "/../other")
+    empty = tmp_path / "errors.jsonl"
+    empty.write_bytes(b"")
+    asyncio.run(sink.put_file(f"deliveries/dl-{RUN_ID}/errors-00000.jsonl", empty))
+    assert writes[-1][0] == f"/api/internal/subnet/batch/orders/{RUN_ID}/deliveries/errors-00000.jsonl"
+    with pytest.raises(ValueError, match="size limit"):
+        asyncio.run(sink.put_file(HTTP_KEY, empty))
+    with pytest.raises(ValueError, match="processed input"):
+        asyncio.run(sink.put_upload_errors("batch-uploads/" + "a" * 32 + "/errors.jsonl", b"",
+                                          object_key="private/secret"))
+
+
 def test_export_obeys_the_sink_shard_limit(tmp_path):
     class _BoundedSink(LocalDirectorySink):
         max_file_bytes = 64 * 1024

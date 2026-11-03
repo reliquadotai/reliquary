@@ -1440,7 +1440,7 @@ class R2DeliverySink:
 
 
 class HTTPDeliverySink:
-    """Immutable bounded subnet-run uploads to one configured HTTPS origin."""
+    """Immutable bounded deliveries and batch inputs on one HTTPS origin."""
 
     max_file_bytes = 64 * 1024 * 1024
     max_json_bytes = 1024 * 1024
@@ -1448,6 +1448,12 @@ class HTTPDeliverySink:
     evaluation_supported = False
     _key = re.compile(r"^deliveries/subnet-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
                       r"[89ab][0-9a-f]{3}-[0-9a-f]{12})/([A-Za-z0-9_.()-]{1,100})$")
+    _uuid = r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+    _input = re.compile(rf"^batch-inputs/{_uuid}/(file-{_uuid})\.jsonl$")
+    _errors = re.compile(r"^batch-uploads/([0-9a-f]{32})/errors\.jsonl$")
+    _batch = re.compile(rf"^deliveries/dl-({_uuid})/([A-Za-z0-9_.()-]{{1,100}})$")
+    _batch_root = "/api/internal/subnet/batch"
+    max_input_bytes = 200 * 1024 * 1024
 
     def __init__(self, *, url: str, secret: str) -> None:
         from urllib.parse import urlsplit
@@ -1469,22 +1475,34 @@ class HTTPDeliverySink:
 
     def _route(self, key: str) -> str:
         match = self._key.fullmatch(key)
-        if match is None:
-            raise ValueError("HTTP delivery sink only accepts subnet-run delivery keys")
-        return f"/api/internal/subnet/tasks/{match[1]}/deliveries/{match[2]}"
+        if match is not None:
+            return f"/api/internal/subnet/tasks/{match[1]}/deliveries/{match[2]}"
+        match = self._input.fullmatch(key)
+        if match is not None:
+            return f"{self._batch_root}/files/{match[1]}/content"
+        match = self._errors.fullmatch(key)
+        if match is not None:
+            return f"{self._batch_root}/uploads/{match[1]}/errors.jsonl"
+        match = self._batch.fullmatch(key)
+        if match is not None and match[2] not in (".", ".."):
+            return f"{self._batch_root}/orders/{match[1]}/deliveries/{match[2]}"
+        raise ValueError("HTTP delivery sink only accepts subnet-run and batch keys")
 
     def accepts_delivery_id(self, delivery_id: str) -> bool:
-        return self._key.fullmatch(f"deliveries/{delivery_id}/manifest.json") is not None
+        key = f"deliveries/{delivery_id}/manifest.json"
+        return self._key.fullmatch(key) is not None or self._batch.fullmatch(key) is not None
 
     def _connection(self):
         from http.client import HTTPSConnection
 
         return HTTPSConnection(self._host, self._port, timeout=60)
 
-    def _put(self, key: str, *, size: int, digest: str, body=None, path=None) -> None:
-        route = self._route(key)
+    def _put(self, key: str, *, size: int, digest: str, body=None, path=None,
+             route: str | None = None) -> None:
+        route = route or self._route(key)
         limit = self.max_json_bytes if key.endswith(".json") else self.max_file_bytes
-        if size < 1 or size > limit:
+        minimum = 0 if route.startswith(self._batch_root + "/") and not key.endswith(".json") else 1
+        if size < minimum or size > limit:
             raise ValueError("HTTP delivery object exceeds its size limit")
         conn = self._connection()
         try:
@@ -1516,6 +1534,39 @@ class HTTPDeliverySink:
         body = json.dumps(document, sort_keys=True).encode()
         await asyncio.to_thread(self._put, key, size=len(body),
                                 digest=hashlib.sha256(body).hexdigest(), body=body)
+
+    async def put_upload_errors(self, key: str, body: bytes, *, object_key: str) -> None:
+        source, errors = self._input.fullmatch(object_key), self._errors.fullmatch(key)
+        if source is None or errors is None:
+            raise ValueError("batch errors require their processed input file")
+        route = f"{self._batch_root}/files/{source[1]}/uploads/{errors[1]}/errors.jsonl"
+        await asyncio.to_thread(self._put, key, size=len(body),
+                                digest=hashlib.sha256(body).hexdigest(), body=body, route=route)
+
+    def _get_bytes(self, key: str) -> bytes | None:
+        if self._input.fullmatch(key):
+            limit = self.max_input_bytes
+        elif self._errors.fullmatch(key):
+            limit = self.max_file_bytes
+        else:
+            raise ValueError("HTTP batch reads require an input or its errors")
+        conn = self._connection()
+        try:
+            conn.request("GET", self._route(key), headers={"Authorization": "Bearer " + self._secret})
+            response = conn.getresponse()
+            if response.status == 404:
+                return None
+            if response.status != 200:
+                raise RuntimeError(f"platform batch read refused ({response.status})")
+            body = response.read(limit + 1)
+            if len(body) > limit:
+                raise ValueError("HTTP batch object exceeds its size limit")
+            return body
+        finally:
+            conn.close()
+
+    async def get_bytes(self, key: str) -> bytes | None:
+        return await asyncio.to_thread(self._get_bytes, key)
 
     def _get_json(self, key: str) -> dict | None:
         route = self._route(key)

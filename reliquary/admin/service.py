@@ -17,6 +17,8 @@ import re
 import time
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
+from functools import partial
+from types import SimpleNamespace
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
@@ -1304,12 +1306,15 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         else:
             load_tokenizer = upload_tokenizer
         try:
+            writer = getattr(deliveries, "put_upload_errors", None)
+            errors_sink = (SimpleNamespace(put_bytes=partial(writer, object_key=body.object_key))
+                           if callable(writer) else deliveries)
             return await uploads.ingest(
                 object_key=body.object_key, sha256=body.sha256, model=body.model,
                 revision=body.revision, purpose=body.purpose,
                 max_prompt_tokens=body.max_prompt_tokens, grader=body.grader,
                 read_object=deliveries.get_bytes, load_tokenizer=load_tokenizer,
-                eval_store=eval_store, errors_sink=deliveries)
+                eval_store=eval_store, errors_sink=errors_sink)
         except uploads.UploadRefused as exc:
             raise HTTPException(status_code=422, detail=str(exc)[:500]) from exc
         except SetConflict as exc:
