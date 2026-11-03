@@ -837,7 +837,9 @@ class CorpusAuditor:
         verdict.update(self._lease_terms.get(submission_id, {}))
         if draw is not None:
             verdict["draw"] = draw
-        return verdict
+        # A diagnostic can be inf (e.g. a token outside the warp's support): JSON
+        # records refuse it, and an unwritable verdict blocks its period forever.
+        return _finite(verdict)
 
     async def _write(self, submission_id: str, verdict: dict) -> tuple[dict, bool]:
         """Create-only: the verdict that stands, and whether this call wrote it."""
@@ -1721,3 +1723,14 @@ class CorpusAuditor:
             for task in (rescan, *others):
                 task.cancel()
             await asyncio.gather(rescan, *others, return_exceptions=True)
+
+
+def _finite(value):
+    """``value`` with every non-finite float replaced by None."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite(v) for v in value]
+    return value
