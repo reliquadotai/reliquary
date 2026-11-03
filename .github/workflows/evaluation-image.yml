@@ -90,7 +90,7 @@ jobs:
           assert torch.version.cuda == "12.9"
           assert not torch.cuda.is_available()
           assert version("transformers") == "5.10.4"
-          assert version("huggingface-hub") == "1.30.0"
+          assert version("huggingface-hub") == "1.31.0"
           assert version("renderers") == "0.1.11"
           assert harness_refusal() is None
           assert "Qwen3_5ForCausalLM" in ModelRegistry.get_supported_archs()
