@@ -294,6 +294,8 @@ class GroupGenerator(Protocol):
     (called between two ``generate`` calls only)."""
     def generate(self, leases: Sequence[HeldLease]) -> list[list[list[int]]]: ...
     def load_weights(self, state: Mapping[str, Any], version: int) -> None: ...
+    # Optional: ``stage_weights(state, version)``, called by the follower before it offers ``state``, prepares the
+    # swap off the generation path.
 
 
 # ------------------------------------------------------------------------------------------- HTTP transport
@@ -925,6 +927,13 @@ class AsyncMiner:
         state, version, plan = await asyncio.to_thread(self._sync.sync, response, self._state, self._state_version)
         logger.info("checkpoint %d rebuilt (%s, %d bytes)", version,
                     "anchor" if plan.anchor is not None else f"{len(plan.deltas)} deltas", plan.bytes)
+        stage = getattr(self.generator, "stage_weights", None)
+        if callable(stage) and self.loaded_version is not None:
+            # The swap's shards are written here, while the generator runs, not inside the swap.
+            try:
+                await asyncio.to_thread(stage, state, version)
+            except Exception:
+                logger.exception("staging checkpoint %d failed; the swap writes its shards itself", version)
         self._state, self._state_version = state, version
         self._ready_since = self._clock()
         self._ready.set()
@@ -1092,12 +1101,63 @@ def _load_weights_from_files(worker, paths: list[str]) -> bool:
     return True
 
 
+class StagedShards:
+    """The next checkpoint as safetensors shards under ``folder``, written ahead of its swap.
+
+    ``stage`` is called by the checkpoint follower, off the generation path; ``paths`` hands the shards to the push,
+    writing them only when nothing was staged for that version. Writing the 18 GB of a 9B model to ``/dev/shm`` took
+    7-8 s of the ~10.5 s a push held generation (H100, 2026-11-03). One instance can serve several pushes of the
+    same checkpoint (``MixedGenerator``): its owner ``clear``s it after the last one.
+    """
+
+    def __init__(self, folder: Path) -> None:
+        import threading
+
+        self.folder = Path(folder)
+        self.version: int | None = None
+        self._paths: list[str] = []
+        self._lock = threading.Lock()
+
+    def stage(self, state: Mapping[str, Any], version: int) -> list[str]:
+        from reliquary.shared.ckpt_delta import write_anchor_shards
+
+        with self._lock:
+            if self.version == int(version) and self._paths and all(Path(p).is_file() for p in self._paths):
+                return list(self._paths)
+            self._clear()
+            self._paths = [str(p) for p in write_anchor_shards(state, self.folder)]
+            self.version = int(version)
+            return list(self._paths)
+
+    paths = stage
+
+    def clear(self) -> None:
+        with self._lock:
+            self._clear()
+
+    def _clear(self) -> None:
+        # Renamed at once, deleted in the background: removing 18 GB took ~1.3 s of the swap's pause.
+        import threading
+
+        self.version, self._paths = None, []
+        if not self.folder.exists():
+            return
+        trash = self.folder.with_name(f"{self.folder.name}.old-{time.monotonic_ns()}")
+        try:
+            self.folder.rename(trash)
+        except OSError:
+            shutil.rmtree(self.folder, ignore_errors=True)
+            return
+        threading.Thread(target=shutil.rmtree, args=(trash,), kwargs={"ignore_errors": True}, daemon=True).start()
+
+
 class VllmGroupGenerator:
     """``GroupGenerator`` over the existing ``VLLMRolloutGenerator`` (its draw is the active profile's).
 
-    Weights: ``swap="push"`` writes the state to shards in ``scratch_dir`` (``/dev/shm`` by default) and has every
-    worker load them through the model's ``load_weights`` (``LLM.collective_rpc``), then resets the prefix cache;
-    a failure falls back to ``"reload"``, which writes an HF directory and rebuilds the engine (a full model load).
+    Weights: ``swap="push"`` has every worker load the state's shards (``StagedShards`` in ``scratch_dir``,
+    ``/dev/shm`` by default, written ahead by ``stage_weights`` when the follower calls it) through the model's
+    ``load_weights`` (``LLM.collective_rpc``), then resets the prefix cache; a failure falls back to ``"reload"``,
+    which writes an HF directory and rebuilds the engine (a full model load).
 
     ``base_model_dir`` holds the HF config and tokenizer files. It may be the directory ``CheckpointSync`` keeps the
     anchors' model files in: it is read on the first ``load_weights``, after the first checkpoint arrived.
@@ -1110,6 +1170,7 @@ class VllmGroupGenerator:
         self.base, self.work, self.swap = Path(base_model_dir), Path(work_dir), swap
         # One per process: miners sharing a host swap at the same moment and would clear each other's shards.
         self.scratch = Path(scratch_dir or ("/dev/shm" if Path("/dev/shm").is_dir() else work_dir)) / f"rl-push-{os.getpid()}"
+        self.staged, self._owns_staged = StagedShards(self.scratch), True
         self.tokenizer = None
         self.eos_ids: list[int] = []
         if (self.base / "config.json").is_file():
@@ -1193,19 +1254,27 @@ class VllmGroupGenerator:
             shutil.rmtree(self._dir, ignore_errors=True)
         self._dir = new_dir
 
-    def _push(self, state: Mapping[str, Any]) -> None:
-        from reliquary.shared.ckpt_delta import write_anchor_shards
-
-        shutil.rmtree(self.scratch, ignore_errors=True)
+    def _push(self, state: Mapping[str, Any], version: int) -> None:
         try:
-            paths = [str(p) for p in write_anchor_shards(state, self.scratch)]
+            paths = self.staged.paths(state, version)
             llm = self._engine._llm
             llm.collective_rpc(_load_weights_from_files, args=(paths,))
             # Running requests are preempted and resumed on the new weights (their KV recomputed, their draw
             # placed by the runner's own token count): a swap never waits for the longest rollout.
             llm.reset_prefix_cache(reset_running_requests=True)
         finally:
-            shutil.rmtree(self.scratch, ignore_errors=True)
+            if self._owns_staged:
+                self.staged.clear()
+
+    def stage_weights(self, state: Mapping[str, Any], version: int) -> None:
+        """Write the shards of the next swap now, while the engine generates (a push only: a reload or the first
+        load writes an HF directory of its own)."""
+        if self.swap == "push" and self._engine is not None:
+            self.staged.stage(state, version)
+
+    def share_staged(self, staged: StagedShards) -> None:
+        """Push from ``staged``, which the caller stages and clears (one copy for several engines)."""
+        self.staged, self._owns_staged = staged, False
 
     @property
     def swaps_running(self) -> bool:
@@ -1221,7 +1290,7 @@ class VllmGroupGenerator:
             self._reload(state, version)
             return
         try:
-            self._push(state)
+            self._push(state, version)
         except Exception:
             if self._engine.has_running_groups():
                 raise                         # a rebuild would drop the running groups: the miner drains first

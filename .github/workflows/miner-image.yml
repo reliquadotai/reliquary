@@ -1,0 +1,127 @@
+name: Build corpus miner image candidate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "Dockerfile.miner"
+      - ".dockerignore"
+      - ".github/workflows/miner-image.yml"
+      - "pyproject.toml"
+      - "reliquary/miner/**"
+      - "reliquary/corpus/**"
+      - "reliquary/orders/**"
+      - "reliquary/cli/main.py"
+      - "reliquary/protocol/**"
+      - "reliquary/environment/**"
+      - "tests/fixtures/reliquarylogic_v1.jsonl"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: miner-image-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref_type == 'branch') ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/reliquary-evaluation
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Free disk space for the CUDA base
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false
+          swap-storage: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Build the corpus miner candidate
+        run: |
+          docker build --platform linux/amd64 -f Dockerfile.miner \
+            --label "org.opencontainers.image.revision=$SOURCE_SHA" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            -t "$IMAGE:miner-sha-$SOURCE_SHA" .
+      - name: Check dependencies and imports without GPU or network access
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 512 --memory 8g --cpus 2 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+            "$IMAGE:miner-sha-$SOURCE_SHA" python3 -m pip check
+          docker run --rm -i --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 512 --memory 8g --cpus 2 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+            --tmpfs /home/miner/.cache:rw,nosuid,nodev,uid=10001,gid=10001,size=2g \
+            "$IMAGE:miner-sha-$SOURCE_SHA" python3 - <<'PY'
+          import os
+          from importlib.metadata import version
+          import torch
+          import flashinfer
+          from vllm.model_executor.models import ModelRegistry
+          from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+          from reliquary.miner.vllm_generation import SUPPORTED_VLLM_SERIES
+
+          assert os.geteuid() == 10001
+          assert version("vllm") == "0.30.0+cu129"
+          assert ".".join(version("vllm").split(".")[:2]) in SUPPORTED_VLLM_SERIES
+          assert version("torch").split("+")[0] == "2.13.0"
+          assert torch.version.cuda == "12.9"
+          assert not torch.cuda.is_available()
+          assert version("transformers") == "5.10.4"
+          assert version("huggingface-hub") == "1.31.0"
+          assert version("mcp").split(".")[0] == "2"
+          assert "Qwen3_5ForCausalLM" in ModelRegistry.get_supported_archs()
+          assert "qwen3_5_text" in CONFIG_MAPPING
+          print("Offline producer imports passed; GPU execution is unqualified.")
+          PY
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 512 --memory 4g --cpus 2 \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+            --tmpfs /home/miner/.cache:rw,nosuid,nodev,uid=10001,gid=10001,size=1g \
+            "$IMAGE:miner-sha-$SOURCE_SHA" reliquary corpus mine --help
+      - name: Record the resolved dependencies
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges "$IMAGE:miner-sha-$SOURCE_SHA" \
+            python3 -m pip freeze --all > miner-pip-freeze.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: miner-dependencies-${{ env.SOURCE_SHA }}
+          path: miner-pip-freeze.txt
+          if-no-files-found: error
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the checked candidate
+        id: publish
+        run: |
+          docker push "$IMAGE:miner-sha-$SOURCE_SHA"
+          reference="$(docker image inspect "$IMAGE:miner-sha-$SOURCE_SHA" --format '{{index .RepoDigests 0}}')"
+          test "${reference%@*}" = "$IMAGE"
+          digest="${reference#*@}"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          {
+            printf 'Candidate: `%s`\n\n' "$reference"
+            printf 'Source revision: `%s`\n\n' "$SOURCE_SHA"
+            printf 'Dependency checks, offline CPU imports and CLI help passed. '
+            printf 'Exact-model GPU execution and provider qualification are still required before activation.\n'
+          } >> "$GITHUB_STEP_SUMMARY"

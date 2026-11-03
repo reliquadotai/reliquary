@@ -139,6 +139,16 @@ class EpisodeLeaseGenerator:
             raise RuntimeError("this episode engine takes no new weights in place: restart the miner")
         self._load(state, version)
 
+    def stage_weights(self, state: Mapping[str, Any], version: int) -> None:
+        stage = getattr(self._load, "stage", None)
+        if callable(stage):
+            stage(state, version)
+
+    def share_staged(self, staged) -> None:
+        share = getattr(self._load, "share_staged", None)
+        if callable(share):
+            share(staged)
+
     def _renderer(self, policy, variant: int = 0, spec=None):
         """The validator's renderer of the lease's surface: ``spec`` is named only for a harness mix."""
         key = (policy.environment, None if spec is None else spec.key, int(variant))
@@ -310,28 +320,33 @@ class EpisodeEngineHost:
         self.restarts += 1
 
     def push(self, state: Mapping[str, Any], scratch: Path) -> None:
+        """``push_shards`` of ``state`` written to ``scratch`` now (removed after)."""
+        from reliquary.miner.rl_async import StagedShards
+
+        staged = StagedShards(scratch)
+        try:
+            self.push_shards(staged.paths(state, 0))
+        finally:
+            staged.clear()
+
+    def push_shards(self, paths: Sequence[str]) -> None:
         """New weights into the running engine, in place and with turns in flight: between two engine steps (the
         engine thread runs it), every worker loads the shards through the model's ``load_weights``
         (``LLM.collective_rpc``) and the prefix cache is reset with the running turns preempted, so they resume on
         the new weights (their KV recomputed, their draw placed by the runner's own token count). The engine, its
         sessions and their waiters stay: no episode is interrupted, no model load, no second copy on the GPU."""
         from reliquary.miner.rl_async import _load_weights_from_files
-        from reliquary.shared.ckpt_delta import write_anchor_shards
 
         if self.core is None or self.engine is None:
             raise RuntimeError("no engine to push weights into")
-        shutil.rmtree(scratch, ignore_errors=True)
-        try:
-            paths = [str(p) for p in write_anchor_shards(state, scratch)]
-            llm = self.core._llm
+        paths = list(paths)
+        llm = self.core._llm
 
-            def load() -> None:
-                llm.collective_rpc(_load_weights_from_files, args=(paths,))
-                llm.reset_prefix_cache(reset_running_requests=True)
+        def load() -> None:
+            llm.collective_rpc(_load_weights_from_files, args=(paths,))
+            llm.reset_prefix_cache(reset_running_requests=True)
 
-            self.engine.between_steps(load)
-        finally:
-            shutil.rmtree(scratch, ignore_errors=True)
+        self.engine.between_steps(load)
 
     def has_turns_in_flight(self) -> bool:
         core = self.core
@@ -371,16 +386,32 @@ class EpisodeWeights:
     previous directory is removed."""
 
     def __init__(self, host: EpisodeEngineHost, *, base_model_dir: str, work_dir: str) -> None:
+        from reliquary.miner.rl_async import StagedShards
+
         self.host, self.base, self.work = host, Path(base_model_dir), Path(work_dir)
         self._dir: Path | None = None
+        self.staged = StagedShards(Path("/dev/shm" if Path("/dev/shm").is_dir() else self.work)
+                                   / f"rl-episode-push-{os.getpid()}")
+        self._owns_staged = True
+
+    def stage(self, state: Mapping[str, Any], version: int) -> None:
+        """Write the next push's shards now (``StagedShards``), while the engine plays."""
+        if self.host.core is not None:
+            self.staged.stage(state, version)
+
+    def share_staged(self, staged) -> None:
+        self.staged, self._owns_staged = staged, False
 
     def __call__(self, state: Mapping[str, Any], version: int) -> None:
         from reliquary.miner.rl_async import write_hf_dir
 
         if self.host.core is not None:
             try:
-                self.host.push(state, Path("/dev/shm" if Path("/dev/shm").is_dir() else self.work)
-                               / f"rl-episode-push-{os.getpid()}")
+                try:
+                    self.host.push_shards(self.staged.paths(state, version))
+                finally:
+                    if self._owns_staged:
+                        self.staged.clear()
                 logger.info("episode engine on checkpoint %d (weights pushed in place)", version)
                 return
             except Exception:
@@ -407,6 +438,16 @@ class MixedGenerator:
         if episodes is None and single is None:
             raise ValueError("no generator")
         self.episodes, self.single = episodes, single
+        self._staged = None
+        sides = [side for side in (episodes, single) if callable(getattr(side, "share_staged", None))]
+        if len(sides) == 2:
+            # Both engines push the same checkpoint: one copy of its shards, written once, cleared after both.
+            from reliquary.miner.rl_async import StagedShards
+
+            self._staged = StagedShards(Path("/dev/shm" if Path("/dev/shm").is_dir() else "/tmp")
+                                        / f"rl-mixed-push-{os.getpid()}")
+            for side in sides:
+                side.share_staged(self._staged)
 
     def _episode_names(self) -> set[str]:
         if self.episodes is None:
@@ -464,11 +505,22 @@ class MixedGenerator:
         return all(bool(getattr(side, "swaps_running", False)) for side in (self.episodes, self.single)
                    if side is not None)
 
+    def stage_weights(self, state: Mapping[str, Any], version: int) -> None:
+        # Each side stages only when it will push; a shared copy is written once (same version).
+        for side in (self.single, self.episodes):
+            stage = getattr(side, "stage_weights", None)
+            if callable(stage):
+                stage(state, version)
+
     def load_weights(self, state: Mapping[str, Any], version: int) -> None:
-        if self.single is not None:
-            self.single.load_weights(state, version)
-        if self.episodes is not None:
-            self.episodes.load_weights(state, version)
+        try:
+            if self.single is not None:
+                self.single.load_weights(state, version)
+            if self.episodes is not None:
+                self.episodes.load_weights(state, version)
+        finally:
+            if self._staged is not None:
+                self._staged.clear()
 
 
 def build_episode_generator(blocks: Mapping[str, Mapping[str, Any]], *, validator_url: str, validator_hotkey: str,

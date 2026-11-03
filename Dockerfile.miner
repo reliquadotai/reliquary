@@ -1,0 +1,35 @@
+# The corpus producer has its own runner dependencies; signed evaluation stays isolated.
+FROM vllm/vllm-openai@sha256:3e10e8189823e0f7ae4620c271bcdaaf64127ec7d0edc351591a508498b7684a
+
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/miner-source
+COPY pyproject.toml README.md ./
+COPY reliquary ./reliquary
+COPY tests/fixtures/reliquarylogic_v1.jsonl ./tests/fixtures/reliquarylogic_v1.jsonl
+# Resolve the real package dependencies; never bypass incompatible metadata.
+RUN python3 -c "from importlib.metadata import version; import torch; assert version('torch').split('+')[0] == '2.13.0'; assert torch.version.cuda == '12.9'; print('torch==' + version('torch'))" \
+        > /tmp/miner-constraints.txt \
+    && python3 -m pip uninstall -y flashinfer-cubin flashinfer-jit-cache \
+    && python3 -m pip install --no-cache-dir --constraint /tmp/miner-constraints.txt \
+        '.' 'vllm @ https://github.com/vllm-project/vllm/releases/download/v0.30.0/vllm-0.30.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl#sha256=e98cb69659bfcfc849cf11ce0781a7161d40b02b51a6c3636924a5909f2aabcc' 'huggingface-hub==1.31.0' 'mcp>=2,<3' 'renderers==0.1.11' \
+    && python3 -m pip check \
+    && python3 -c "import torch; assert torch.version.cuda == '12.9'" \
+    && rm /tmp/miner-constraints.txt
+
+RUN useradd --uid 10001 --user-group --create-home --home-dir /home/miner miner \
+    && mkdir -p /opt/reliquary-miner /home/miner/.cache \
+    && chown -R miner:miner /opt/reliquary-miner /home/miner
+ENV HOME=/home/miner \
+    HF_HOME=/home/miner/.cache/huggingface \
+    VLLM_CACHE_ROOT=/home/miner/.cache/vllm \
+    TRITON_CACHE_DIR=/home/miner/.cache/triton \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TOKENIZERS_PARALLELISM=false
+WORKDIR /opt/reliquary-miner
+USER 10001:10001
+HEALTHCHECK NONE
+# The operator supplies the authenticated corpus mining command.
+ENTRYPOINT []
+CMD ["reliquary", "corpus", "mine", "--help"]
