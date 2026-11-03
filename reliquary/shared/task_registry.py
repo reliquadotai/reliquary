@@ -165,6 +165,25 @@ def _validate_token_price(entry: TaskEntry) -> None:
                             f"million tokens at {emission} miner alpha per period")
 
 
+def _validate_pricing(entry: TaskEntry) -> None:
+    """A job priced by auction (``corpus.token_auction``): a corpus task settled by period, with a price ceiling."""
+    from reliquary.corpus.token_auction import AUCTION_PARAMS, PRICING_PARAM, auction_params
+
+    declared = [f for f in AUCTION_PARAMS if f in entry.params]
+    if not declared:
+        return
+    if PRICING_PARAM not in entry.params:
+        raise RegistryError(f"task {entry.task_id!r}: {', '.join(declared)} need {PRICING_PARAM}")
+    if (entry.mechanism != MECHANISM_CORPUS_GENERATION
+            or entry.params.get("settlement") != SETTLEMENT_PERIOD_EMA):
+        raise RegistryError(f"task {entry.task_id!r}: an auction prices a corpus task settled by period "
+                            f"({SETTLEMENT_PERIOD_EMA})")
+    try:
+        auction_params(entry.params)
+    except (TypeError, ValueError) as exc:
+        raise RegistryError(f"task {entry.task_id!r}: {exc}") from exc
+
+
 def _validate_rl_start_pool(entry: TaskEntry, cap: float) -> None:
     if RL_START_POOL_PARAM not in entry.params:
         return
@@ -264,6 +283,7 @@ def validate_entry(entry: TaskEntry) -> None:
         if not 0.0 <= tail <= 1.0:
             raise RegistryError(f"{TAIL_CAP_PARAM} must be between 0.0 and 1.0, got {tail}")
     _validate_token_price(entry)
+    _validate_pricing(entry)
     _validate_rl_start_pool(entry, cap)
     floor = _number(entry.params["floor"], "floor")
     if floor > cap:
@@ -443,11 +463,14 @@ def set_cap(
     audit_ban_seconds: float | None = None,
     *,
     token_price: Mapping[str, float] | None | object = KEEP,
+    pricing: Mapping[str, Any] | None | object = KEEP,
 ) -> dict[str, TaskEntry]:
     """Change one live entry's cap (and optionally floor), nothing else.
 
     ``cap`` None keeps the cap. ``token_price`` (``corpus_periods.price_params``)
     sets a period task's price ceiling, None removes it, omitted keeps it.
+    ``pricing`` (``corpus.token_auction``: ``{"pricing": "auction", ...}``) prices it by auction, None removes the
+    auction, omitted keeps it. A serving validator reads it when it wires the job.
 
     The contract and its digest stay as they are: a cap is what the task may
     pay, not how it generates. A corpus task's price follows its cap unless a
@@ -510,6 +533,13 @@ def set_cap(
             params.pop(field, None)
         if token_price is not None:
             params.update({f: float(token_price[f]) for f in MAX_PRICE_PARAMS})
+    if pricing is not KEEP:
+        from reliquary.corpus.token_auction import AUCTION_PARAMS
+
+        for field in AUCTION_PARAMS:
+            params.pop(field, None)
+        if pricing is not None:
+            params.update({f: pricing[f] for f in AUCTION_PARAMS if f in pricing})
     updated = {**entries, task_id: replace(entry, params=params)}
     validate_registry(updated)
     return updated

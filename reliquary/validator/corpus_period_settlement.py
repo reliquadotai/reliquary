@@ -370,6 +370,9 @@ class CorpusPeriodSettler:
                 self.open_periods.pop(str(period), None)
                 continue
             share = rewards_for(batch, pool)
+            # A job priced by auction pays what its leases' prices add up to, under the pool; the rest burns.
+            paid = (sum(share.values()) if any(v.get("lease_price") is not None for v in batch if v.get("passed"))
+                    else pool)
             # At most CATCHUP_ENTRIES archives per entry period: a backlog settled
             # at once is paid back over a few periods, in full (the weight setter
             # bounds a task at that many caps), instead of queueing one per period
@@ -379,7 +382,7 @@ class CorpusPeriodSettler:
                 "work_period": period, "entry_period": entry, "cap": self._cap,
                 "ids": ids, "rewards": share, "tokens": new_tokens, "totals": totals,
                 "period_tokens": earlier + new_tokens,
-                "period_paid": already + pool}}
+                "period_paid": already + paid}}
             if self._max_price is not None:
                 state["pending"].update(max_price=self._max_price, budget=budget)
             etag = await self._records.write_settlement(self._job_id, state, etag)

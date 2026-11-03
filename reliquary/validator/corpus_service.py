@@ -58,6 +58,8 @@ from reliquary.infrastructure.corpus_job_store import (
 )
 from reliquary.protocol.corpus_submission import (
     MAX_RENDERED_PROMPT_CHARS,
+    CorpusAskRequest,
+    CorpusAskResponse,
     CorpusLeaseReleaseRequest,
     CorpusLeaseRequest,
     CorpusLeaseResponse,
@@ -100,6 +102,23 @@ LEASE_SCOPED_PATH = "/corpus/jobs/{job_id}/lease"
 LEASE_RELEASE_SCOPED_PATH = "/corpus/jobs/{job_id}/lease/release"
 # A lease request is fresh within this many seconds of its ``issued_at``; its nonce is single-use meanwhile.
 LEASE_REQUEST_SKEW_SECONDS = 120.0
+# A job priced by auction (``corpus.token_auction``): a hotkey's ask, and the job's public rounds.
+ASK_PATH = "/corpus/ask"
+ASK_SCOPED_PATH = "/corpus/jobs/{job_id}/ask"
+AUCTION_SCOPED_PATH = "/corpus/jobs/{job_id}/auction"
+# What an accepted record of a job priced by auction carries: its lease's price per token (pool share) and the
+# debt taken back from it. A retried submission keeps the ones its first acceptance recorded.
+LEASE_RECORD_KEYS = ("lease_price", "lease_debit")
+
+
+def _same_record(standing: Mapping, record: Mapping, arrival) -> bool:
+    """``standing`` is ``record`` accepted at ``arrival``, with the lease terms its first acceptance recorded."""
+    expected = {**record, "received_at": arrival}
+    for key in LEASE_RECORD_KEYS:
+        expected.pop(key, None)
+        if key in standing:
+            expected[key] = standing[key]
+    return dict(standing) == expected
 OPEN_SCOPED_PATH = "/corpus/jobs/{job_id}/open"
 # How long one computed open map answers every caller, and what a client or a
 # proxy in front may keep it: a miner acts on it for minutes anyway.
@@ -1631,6 +1650,7 @@ def build_corpus_router(
     job: JobSpec | None = None,
     durable_records: bool | None = None,
     pending_record_arrivals: dict[str, float] | None = None,
+    auction=None,
 ) -> APIRouter:
     """The corpus submission endpoint, over an already-bound job store.
 
@@ -1649,6 +1669,8 @@ def build_corpus_router(
     (``agentic_intake.EpisodeIntake``); an episode job without one answers 500.
     ``job`` (the spec this router serves, when the caller has it) sets the
     submit body cap, ``router.body_cap``; without it the minimum applies.
+    ``auction`` (``corpus.token_auction.TokenAuction``) prices a draw job by auction: a lease goes only to a hotkey
+    whose ask the round admits, carries the round's price, and only a slot the hotkey leased is accepted.
     """
 
     body_cap = worst_case_body(job) if job is not None else MIN_SUBMIT_BODY_BYTES
@@ -1690,7 +1712,12 @@ def build_corpus_router(
 
         leases = leases_by_job.get(job.job_id)
         if leases is None:
-            leases = leases_by_job[job.job_id] = DrawLeases(job)
+            if auction is None:
+                leases = DrawLeases(job)
+            else:
+                leases = DrawLeases(job, limit_per_hotkey=False,
+                                    on_unused=lambda lease, held: auction.lease_ended(lease.hotkey, lease.price, held))
+            leases = leases_by_job[job.job_id] = leases
         return leases
 
     def announce(sid: str) -> None:
@@ -1743,7 +1770,8 @@ def build_corpus_router(
     router.prompt_fidelity = prompt_fidelity
 
     def _accepted_record(request: CorpusSubmissionRequest, served: str,
-                         episode_facts: IntakeFacts | None = None, *, received_at=None) -> dict:
+                         episode_facts: IntakeFacts | None = None, *, received_at=None,
+                         pricing: Mapping | None = None) -> dict:
         # Staging is not auditable. Only a ledger-committed reference may
         # publish this body under the canonical submissions prefix.
         from reliquary.protocol.signatures import corpus_submission_id
@@ -1776,15 +1804,16 @@ def build_corpus_router(
             "rendered_prompt": request.rendered_prompt,
             "received_at": time.time() if received_at is None else received_at,
             "token_count": token_count,
+            **({key: pricing[key] for key in LEASE_RECORD_KEYS} if pricing else {}),
             "completions": completions,
         }
         return record
 
     async def _record_accepted(request: CorpusSubmissionRequest, served: str,
-                               episode_facts: IntakeFacts | None = None) -> None:
+                               episode_facts: IntakeFacts | None = None, pricing: Mapping | None = None) -> None:
         if records is None:
             return
-        record = _accepted_record(request, served, episode_facts)
+        record = _accepted_record(request, served, episode_facts, pricing=pricing)
         submission_id = record["submission_id"]
         written = False
         for attempt in range(RECORD_WRITE_ATTEMPTS):
@@ -2013,6 +2042,26 @@ def build_corpus_router(
             if _leases(job).refusal(request.miner_hotkey, request.prompt_index, request.cursor) is not None:
                 return _refuse(CorpusRejectReason.DRAW_SLOT_LEASED,
                                {"prompt_index": request.prompt_index, "cursor": request.cursor})
+        # A job priced by auction pays a slot at its lease's price, less the hotkey's debt (``corpus.token_auction``):
+        # the debit is taken now and given back unless this submission is newly accepted.
+        pricing: dict | None = None
+        if auction is not None and drawn:
+            own = _leases(job).held(request.miner_hotkey, request.prompt_index, request.cursor)
+            if own is not None and own.price is not None:
+                value = float(own.price) * sum(token_counts)
+                pricing = {"lease_price": float(own.price),
+                           "lease_debit": auction.take_debit(request.miner_hotkey, value)}
+
+        def unpriced() -> None:
+            nonlocal pricing
+            if pricing is not None and pricing["lease_debit"] > 0:
+                auction.refund_debit(request.miner_hotkey, pricing["lease_debit"])
+            pricing = None if pricing is None else {**pricing, "lease_debit": 0.0}
+
+        lease_required = auction is not None and drawn and pricing is None
+        if lease_required and not durable_records:
+            return _refuse(CorpusRejectReason.LEASE_REQUIRED,
+                           {"prompt_index": request.prompt_index, "cursor": request.cursor})
         timing["checks"] = time.perf_counter() - started - timing["job_read"]
 
         record = None
@@ -2024,16 +2073,20 @@ def build_corpus_router(
             standing = await _from_store(records.read_submission(job_id, sid), "accepted record read")
             # Freeze arrival only after the read. No await may let the feed's
             # coverage advance between this timestamp and its pending fence.
-            record = _accepted_record(request, job_id, episode_facts)
+            record = _accepted_record(request, job_id, episode_facts, pricing=pricing)
             if standing is not None:
                 # A response can be lost after publication. The identical signed
                 # request retrieves its acceptance without consuming another slot.
+                unpriced()
                 arrival = standing.get("received_at")
                 if (type(arrival) not in (int, float) or not math.isfinite(arrival) or arrival < 0
-                        or standing != {**record, "received_at": arrival}):
+                        or not _same_record(standing, record, arrival)):
                     raise _ledger_corrupt(LedgerSnapshotError("existing accepted record differs"))
                 state = await _read_state(job)
                 return _respond(Verdict(True, "accepted", slots_remaining=state.slots.remaining(request.prompt_index)))
+            if lease_required:
+                return _refuse(CorpusRejectReason.LEASE_REQUIRED,
+                               {"prompt_index": request.prompt_index, "cursor": request.cursor})
             active_records[sid] += 1
             # Fence coverage before queueing. The serialized turn stages only
             # entries its native admission plan actually accepts.
@@ -2097,7 +2150,7 @@ def build_corpus_router(
                 if record is not None:
                     await recover_records(job)
                 else:
-                    await _record_accepted(request, job_id, episode_facts)
+                    await _record_accepted(request, job_id, episode_facts, pricing)
                 timing["record_write"] = time.perf_counter() - mark
             finally:
                 # Whatever the record step does: the ledger's verdict decides.
@@ -2124,13 +2177,22 @@ def build_corpus_router(
                                     abandoned if session_key is not None else None,
                                     record=record)
         except asyncio.TimeoutError:
+            unpriced()
             logger.warning(
                 "corpus ledger turn for %s not granted within %.0f s (miner %s)",
                 job_id, ledger_lock_timeout, request.miner_hotkey[:12],
             )
             # Nothing was consumed, so the same work resubmits cleanly.
             raise HTTPException(status_code=503, detail="corpus_ledger_contention") from None
+        except BaseException:
+            unpriced()
+            raise
         written = turn.verdict
+        if pricing is not None:
+            if written is not None and written.accepted:
+                auction.observe_tokens(sum(token_counts))
+            else:
+                unpriced()
 
         if written is not None and drawn and (written.accepted or written.reason == CorpusRejectReason.DRAW_SLOT_TAKEN.value):
             # The slot is taken: its leases end.
@@ -2146,7 +2208,7 @@ def build_corpus_router(
                 if standing is not None:
                     arrival = standing.get("received_at")
                     if (type(arrival) not in (int, float) or not math.isfinite(arrival) or arrival < 0
-                            or standing != {**record, "received_at": arrival}):
+                            or not _same_record(standing, record, arrival)):
                         raise _ledger_corrupt(LedgerSnapshotError("existing accepted record differs"))
                     state = await _read_state(job)
                     written = Verdict(True, "accepted", slots_remaining=state.slots.remaining(request.prompt_index))
@@ -2732,6 +2794,11 @@ def build_corpus_router(
         state = await _read_state(job)
         if state.slots.is_complete:
             return _lease_refused(CorpusRejectReason.JOB_COMPLETE)
+        terms = None
+        if auction is not None:
+            terms = auction.admit(request.miner_hotkey)
+            if isinstance(terms, str):
+                return _lease_refused(terms, auction.view())
 
         def grant():
             from reliquary.corpus.draw_leases import free_draw_slots
@@ -2747,14 +2814,47 @@ def build_corpus_router(
             def taken(prompt: int, slot: int) -> bool:
                 return slot_key(prompt, slot, ledger.slot_attempt(prompt, slot)) in seen
 
-            return _leases(job).grant(request.miner_hotkey, free_draw_slots(job, ledger, taken))
+            return _leases(job).grant(request.miner_hotkey, free_draw_slots(job, ledger, taken),
+                                      price=None if terms is None else terms.price,
+                                      round=None if terms is None else terms.round)
 
         lease = await asyncio.to_thread(grant)
-        if lease is None:
-            return _lease_refused("no_free_slot")
-        if isinstance(lease, str):
-            return _lease_refused(lease)
-        return CorpusLeaseResponse(leased=True, reason="accepted", **lease.to_wire())
+        if lease is None or isinstance(lease, str):
+            if terms is not None:
+                auction.unreserve(terms)
+            return _lease_refused("no_free_slot" if lease is None else lease)
+        detail = {}
+        if terms is not None:
+            detail = {"price_alpha_per_mtoken": auction.params.alpha_of(terms.price), "round": terms.round}
+        return CorpusLeaseResponse(leased=True, reason="accepted", **lease.to_wire(), detail=detail)
+
+    async def ask_corpus(request: CorpusAskRequest) -> CorpusAskResponse:
+        """A hotkey's ask on this job priced by auction (``corpus.token_auction``)."""
+        def refused(reason, detail: dict | None = None) -> CorpusAskResponse:
+            return CorpusAskResponse(accepted=False, reason=str(getattr(reason, "value", reason)),
+                                     detail=detail or {})
+
+        now = time.time()
+        if abs(now - request.issued_at) > LEASE_REQUEST_SKEW_SECONDS:
+            return refused("stale_request", {"now": int(now)})
+        for nonce in [n for n, until in lease_nonces.items() if until <= now]:
+            del lease_nonces[nonce]
+        if request.nonce in lease_nonces:
+            return refused("replayed_request")
+        gated = await _lease_gate(request)
+        if gated is not None:
+            return refused(gated.reason, gated.detail)
+        lease_nonces[request.nonce] = now + 2 * LEASE_REQUEST_SKEW_SECONDS
+        if auction is None:
+            return refused("not_priced_by_auction")
+        why = auction.post_ask(request.miner_hotkey, request.micro_alpha_per_mtoken / 1e6)
+        if why is not None:
+            return refused(why)
+        return CorpusAskResponse(accepted=True, reason="accepted", detail=auction.view())
+
+    def auction_view() -> dict | None:
+        """The job's public auction rounds, or None when it is not priced by auction."""
+        return None if auction is None else auction.view()
 
     async def release_corpus_lease(request: CorpusLeaseReleaseRequest) -> CorpusLeaseResponse:
         refused = await _lease_gate(request)
@@ -2770,8 +2870,12 @@ def build_corpus_router(
     router.add_api_route(LEASE_PATH, lease_corpus, methods=["POST"], response_model=CorpusLeaseResponse)
     router.add_api_route(LEASE_RELEASE_PATH, release_corpus_lease, methods=["POST"],
                          response_model=CorpusLeaseResponse)
+    router.add_api_route(ASK_PATH, ask_corpus, methods=["POST"], response_model=CorpusAskResponse)
     router.lease_corpus = lease_corpus
     router.release_corpus_lease = release_corpus_lease
+    router.ask_corpus = ask_corpus
+    router.auction_view = auction_view
+    router.auction = auction
     router.draw_leases = leases_by_job
     router.slots_remaining = slots_remaining
     # The handlers themselves, so `build_corpus_jobs_router` can dispatch to
@@ -2967,6 +3071,18 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
         async with routes.admission(job_id) as served:
             return await served.release_corpus_lease(request)
 
+    @router.post(ASK_SCOPED_PATH, response_model=CorpusAskResponse)
+    async def ask_corpus_scoped(job_id: str, request: CorpusAskRequest) -> CorpusAskResponse:
+        async with routes.admission(job_id) as served:
+            return await served.ask_corpus(request)
+
+    @router.get(AUCTION_SCOPED_PATH)
+    async def auction_scoped(job_id: str) -> dict:
+        view = _served(job_id).auction_view()
+        if view is None:
+            raise HTTPException(status_code=404, detail="not_priced_by_auction")
+        return view
+
     @router.post(SUBMIT_SCOPED_PATH, response_model=CorpusSubmissionResponse)
     async def submit_corpus_scoped(
         job_id: str, request: CorpusSubmissionRequest
@@ -3052,6 +3168,9 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
 
 
 __all__ = [
+    "ASK_PATH",
+    "ASK_SCOPED_PATH",
+    "AUCTION_SCOPED_PATH",
     "CURSOR_PATH",
     "CURSOR_SCOPED_PATH",
     "CorpusJobRoutes",

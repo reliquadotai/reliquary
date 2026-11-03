@@ -271,6 +271,11 @@ class HttpCorpusClient:
     def release_lease(self, body: dict) -> dict | None:
         return _unless_absent(lambda: self._http.post(self._path("lease/release"), json=body), absent=(404, 405))
 
+    def ask(self, body: dict) -> dict | None:
+        """Post this hotkey's ask on a job priced by auction (``corpus.token_auction``), or None from a validator
+        without the route (404, 405)."""
+        return _unless_absent(lambda: self._http.post(self._path("ask"), json=body), absent=(404, 405))
+
     def open_prompts(self) -> dict | None:
         """Which prompts still have a slot (``slots.parse_open_map`` reads it),
         or None from a validator without the route (404, 405) or a job too
@@ -383,7 +388,7 @@ def _retry(call, *, sleep, counts, max_consecutive_failures):
 def mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
                max_steps: int | None = None, sleep=time.sleep,
                max_consecutive_failures: int = _MAX_CONSECUTIVE_FAILURES,
-               sign_skip=None, sign_lease=None) -> dict[str, int]:
+               sign_skip=None, sign_lease=None, ask_alpha_per_mtoken: float | None = None) -> dict[str, int]:
     """``_mine_steps``, ended cleanly (one log line, no retry) when the
     validator says the job is retired."""
     counts: Counter[str] = Counter()
@@ -392,7 +397,8 @@ def mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
             return _mine_draw_steps(job=job, hotkey=hotkey, client=client, generator=generator,
                                     tokenizer=tokenizer, render=render, sign=sign, max_steps=max_steps,
                                     sleep=sleep, max_consecutive_failures=max_consecutive_failures,
-                                    counts=counts, sign_lease=sign_lease)
+                                    counts=counts, sign_lease=sign_lease,
+                                    ask_alpha_per_mtoken=ask_alpha_per_mtoken)
         return _mine_steps(job=job, hotkey=hotkey, client=client, generator=generator,
                            tokenizer=tokenizer, render=render, sign=sign, max_steps=max_steps,
                            sleep=sleep, max_consecutive_failures=max_consecutive_failures,
@@ -441,6 +447,15 @@ def lease_body(job_id: str, hotkey: str, sign_lease) -> dict:
     return body
 
 
+def ask_body(job_id: str, hotkey: str, alpha_per_mtoken: float, sign_lease) -> dict:
+    """A fresh signed ask (``CorpusAskRequest``): ``alpha_per_mtoken`` in micro-alpha, signed as a lease is."""
+    body = {"job_id": job_id, "miner_hotkey": hotkey,
+            "micro_alpha_per_mtoken": max(1, round(float(alpha_per_mtoken) * 1e6)),
+            "issued_at": int(time.time()), "nonce": secrets.token_hex(16)}
+    body["signature"] = sign_lease(body)
+    return body
+
+
 def release_body(job_id: str, hotkey: str, lease_id: str, sign_lease) -> dict:
     body = {"job_id": job_id, "miner_hotkey": hotkey, "lease_id": lease_id}
     body["signature"] = sign_lease(body)
@@ -457,12 +472,15 @@ LEASE_WAIT_SECONDS = 30.0
 
 def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
                      max_steps: int | None, sleep, max_consecutive_failures: int,
-                     counts: Counter, sign_lease=None) -> dict[str, int]:
+                     counts: Counter, sign_lease=None,
+                     ask_alpha_per_mtoken: float | None = None) -> dict[str, int]:
     """A forced-draw job (``corpus.eval_draw``): each step fills one draw slot of an open prompt, its
     completions the draw's samples, the slot sent as the cursor. Whatever they score, they are submitted.
 
     With ``sign_lease``, each step first leases its slot (``corpus.draw_leases``) so no other miner decodes it;
-    a validator without leases is mined from the open map as before."""
+    a validator without leases is mined from the open map as before. On a job priced by auction
+    (``corpus.token_auction``), ``ask_alpha_per_mtoken`` is posted before the first lease, every
+    ``ASK_REPOST_SECONDS`` after, and again when the validator says it holds no ask."""
     import random
 
     from reliquary.corpus.eval_draw import REASON_DRAW_SLOT_TAKEN, draw_context
@@ -474,10 +492,27 @@ def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
     closed: set[int] = set()
     steps = 0
     leasing = sign_lease is not None and callable(getattr(client, "lease", None))
+    asking = leasing and ask_alpha_per_mtoken is not None and callable(getattr(client, "ask", None))
+    asked_at = [None]
+
+    def post_ask(force: bool = False) -> None:
+        from reliquary.corpus.token_auction import ASK_REPOST_SECONDS
+
+        now = time.monotonic()
+        if not asking or (not force and asked_at[0] is not None and now - asked_at[0] < ASK_REPOST_SECONDS):
+            return
+        answer = _retry(lambda: client.ask(ask_body(job.job_id, hotkey, ask_alpha_per_mtoken, sign_lease)),
+                        **retry_kwargs)
+        asked_at[0] = now
+        if answer is not None and not answer.get("accepted"):
+            counts[f"ask_{answer.get('reason')}"] += 1
+            logger.warning("the validator refused this hotkey's ask: %s", answer.get("reason"))
+
     while max_steps is None or steps < max_steps:
         steps += 1
         lease_id = None
         choice = None
+        post_ask()
         if leasing:
             answer = _retry(lambda: client.lease(lease_body(job.job_id, hotkey, sign_lease)), **retry_kwargs)
             reason = None if answer is None else str(answer.get("reason"))
@@ -491,6 +526,15 @@ def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
             elif answer is None or reason in _LEASE_FALLBACK:
                 logger.info("the validator leases no slot (%s): mining from the open map", reason or "no route")
                 leasing = False
+            elif reason == "no_ask":
+                # A job priced by auction: post the ask now, or say how to set one.
+                counts["lease_no_ask"] += 1
+                if asking:
+                    post_ask(force=True)
+                else:
+                    logger.warning("this job is priced by auction: set --ask-alpha-per-mtoken to get leases")
+                    sleep(LEASE_WAIT_SECONDS)
+                continue
             else:
                 # Every slot leased or awaiting its audit (no_free_slot), or this hotkey's cap: ask again later.
                 counts[f"lease_{reason}"] += 1

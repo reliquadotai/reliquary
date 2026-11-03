@@ -728,7 +728,24 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
             episode_intake=getattr(served, "episode_intake", None), job=getattr(served, "job", None),
             pending_record_arrivals=getattr(served, "pending_record_arrivals", None),
             durable_records=False if not hasattr(served, "pending_record_arrivals") else None,
+            auction=_auction_of(served),
         )
+
+    def _auction_of(served):
+        """The job's token auction when its entry prices it so (``corpus.token_auction``), its leases opened by
+        the auditor's queue."""
+        from reliquary.corpus.token_auction import job_auction
+
+        if getattr(served, "auction", None) is not None:
+            return served.auction
+        auditor = getattr(served, "auditor", None)
+        auction = job_auction(getattr(served.entry, "params", None),
+                              backlog=getattr(auditor, "audit_backlog", None))
+        try:
+            served.auction = auction          # one auction per job, whatever rebuilds its router
+        except AttributeError:
+            pass
+        return auction
 
     # Miners have no registry access: each job's own task contract. With one
     # job at boot, the contract this process runs.
