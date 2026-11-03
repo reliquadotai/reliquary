@@ -43,7 +43,8 @@ JOB_ID = "suite-stateful-v1"
 CHUNK = 32
 PROOF = "A" * 200
 QWEN35_TOKENIZER = Path(os.environ.get(
-    "RELIQUARY_TEST_QWEN35_TOKENIZER", "/home/ubuntu/bench-rl-throughput/dryrun/tiny-qwen35"))
+    "RELIQUARY_TEST_QWEN35_TOKENIZER",
+    Path.home() / ".cache" / "reliquary" / "test-fixtures" / "tiny-qwen35"))
 
 
 # -- a tokenizer whose ChatML markers are single tokens ---------------------------

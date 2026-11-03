@@ -264,9 +264,12 @@ async def test_worker_processes_normally_when_not_sealed():
 
     grail_calls: list[BatchSubmissionRequest] = []
     original_accept = batcher.accept_submission
+    called = asyncio.Event()
+    loop = asyncio.get_running_loop()
 
     def trace_accept(req):
         grail_calls.append(req)
+        loop.call_soon_threadsafe(called.set)
         return original_accept(req)
 
     batcher.accept_submission = trace_accept  # type: ignore[method-assign]
@@ -292,10 +295,7 @@ async def test_worker_processes_normally_when_not_sealed():
 
     worker = asyncio.create_task(s._submit_worker())
     try:
-        for _ in range(50):
-            await asyncio.sleep(0.01)
-            if s._submit_queue.empty():
-                break
+        await asyncio.wait_for(called.wait(), timeout=5)
         # Worker DID call the verifier.
         assert len(grail_calls) == 1
         assert grail_calls[0].prompt_idx == 1

@@ -18,6 +18,16 @@ import importlib
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def restore_constants_after_reload(monkeypatch):
+    yield
+    # Restore the environment before rebuilding globals, including after a failed reload.
+    monkeypatch.undo()
+    import reliquary.constants as module
+
+    importlib.reload(module)
+
+
 def _constants(monkeypatch, **environment):
     for key, value in environment.items():
         monkeypatch.setenv(key, value)
