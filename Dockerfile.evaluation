@@ -12,7 +12,7 @@ COPY tests/fixtures/reliquarylogic_v1.jsonl ./tests/fixtures/reliquarylogic_v1.j
 RUN python3 -c "from importlib.metadata import version; import torch; assert version('torch').split('+')[0] == '2.13.0'; assert torch.version.cuda == '12.9'; print('torch==' + version('torch'))" \
         > /tmp/evaluation-constraints.txt \
     && python3 -m pip install --no-cache-dir --constraint /tmp/evaluation-constraints.txt \
-        '.[sandbox-miner]' 'vllm==0.29.0' 'mcp>=1.24,<2' 'renderers==0.1.11' \
+        '.[sandbox-miner]' 'vllm==0.30.0' 'mcp>=1.24,<2' 'renderers==0.1.11' \
     && python3 -m pip check \
     && python3 -c "import torch; assert torch.version.cuda == '12.9'" \
     && rm /tmp/evaluation-constraints.txt
