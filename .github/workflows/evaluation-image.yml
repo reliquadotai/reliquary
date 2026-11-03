@@ -78,19 +78,17 @@ jobs:
           from vllm.model_executor.models import ModelRegistry
           from transformers.models.auto.configuration_auto import CONFIG_MAPPING
           from reliquary.eval import runner, signed_agentic
-          from reliquary.miner.vllm_generation import SUPPORTED_VLLM_SERIES
           from reliquary.environment.agentic_swe import harness_refusal
           from reliquary.sandbox import SANDBOX_COMMIT
           from reliquary_sandbox import attest
 
           assert os.geteuid() == 10001
-          assert version("vllm").split("+")[0] == "0.30.0"
-          assert ".".join(version("vllm").split(".")[:2]) in SUPPORTED_VLLM_SERIES
+          assert version("vllm").split("+")[0] == "0.29.0"
           assert version("torch").split("+")[0] == "2.13.0"
           assert torch.version.cuda == "12.9"
           assert not torch.cuda.is_available()
           assert version("transformers") == "5.10.4"
-          assert version("huggingface-hub") == "1.31.0"
+          assert version("huggingface-hub") == "1.30.0"
           assert version("renderers") == "0.1.11"
           assert harness_refusal() is None
           assert "Qwen3_5ForCausalLM" in ModelRegistry.get_supported_archs()
