@@ -199,6 +199,8 @@ class CorpusAuditor:
         # first, so a record waiting out its hold is not re-judged every minute.
         # A heap entry whose time is not `_due[id]` is stale and skipped.
         self._due: dict[str, float] = {}
+        # A job priced by auction: each record's lease terms (``lease_price``, ``lease_debit``), copied to its verdict.
+        self._lease_terms: dict[str, dict[str, float]] = {}
         self._heap: list[tuple[float, float, str]] = []
         self._wake: asyncio.Event | None = None
         # Set by a pass for the ids it leaves pending: when to judge them again.
@@ -419,6 +421,12 @@ class CorpusAuditor:
         for sid in judged - self._judged:
             self._mark_judged(sid)
         return [sid for sid in submitted if sid not in judged]
+
+    def audit_backlog(self) -> int:
+        """Records due for judging now and not yet taken: the audit queue a job priced by auction opens its leases
+        by (``corpus.token_auction``). Records waiting out their hold are not counted."""
+        now = self._clock()
+        return sum(1 for at in self._due.values() if at <= now)
 
     def pending_count(self, hotkey: str) -> int:
         """Records of ``hotkey`` read and awaiting a verdict."""
@@ -642,6 +650,9 @@ class CorpusAuditor:
         # we first saw it, never as already over.
         received_at = float(received) if received is not None else self._clock()
         self._meta[submission_id] = (meta["hotkey"], received_at, int(meta["token_count"]))
+        terms = {k: float(meta[k]) for k in ("lease_price", "lease_debit") if meta.get(k) is not None}
+        if terms:
+            self._lease_terms[submission_id] = terms
         bisect.insort(self._arrivals.setdefault(meta["hotkey"], []), received_at)
         if submission_id not in self._judged:
             self._unjudged.setdefault(meta["hotkey"], set()).add(submission_id)
@@ -816,6 +827,8 @@ class CorpusAuditor:
             # The work's own time: a period-settled task pays it in the period
             # it was submitted in, not the one its verdict landed in.
             verdict["received_at"] = float(self._meta[submission_id][1])
+        # Paid at its lease's price, less the debt it carried (``corpus.token_auction``).
+        verdict.update(self._lease_terms.get(submission_id, {}))
         if draw is not None:
             verdict["draw"] = draw
         return verdict

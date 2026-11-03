@@ -905,6 +905,18 @@ def tasks_set_cap(
     clear_max_price: bool = typer.Option(
         False, "--clear-max-price", help="Remove the task's price ceiling: the cap alone",
     ),
+    pricing: str = typer.Option(
+        None, "--pricing",
+        help="'auction': price the draw job by its miners' asks under the ceiling (corpus.token_auction); "
+             "'none': remove the auction. A serving validator applies it when it wires the job",
+    ),
+    auction_round_seconds: float = typer.Option(
+        None, "--auction-round-seconds", help="With --pricing auction: one round's length (default 600)",
+    ),
+    auction_initial_leases: int = typer.Option(
+        None, "--auction-initial-leases",
+        help="With --pricing auction: the leases a round opens before the audit queue steers them (default 64)",
+    ),
     min_incentive_share: float = typer.Option(
         None, "--min-incentive-share",
         help="Minimum share of THIS task a hotkey needs to be paid; 0 pays everyone",
@@ -960,7 +972,25 @@ def tasks_set_cap(
             typer.echo(f"error: {exc}", err=True)
             raise typer.Exit(code=1) from exc
         priced = {"token_price": token_price}
-    if cap is None and not priced and all(v is None for v in (
+    auction = {}
+    if pricing is not None:
+        from reliquary.corpus.token_auction import (
+            INITIAL_LEASES_PARAM, PRICING_AUCTION, PRICING_PARAM, ROUND_SECONDS_PARAM,
+        )
+
+        if pricing not in (PRICING_AUCTION, "none"):
+            typer.echo("error: --pricing is 'auction' or 'none'", err=True)
+            raise typer.Exit(code=1)
+        declared = {PRICING_PARAM: PRICING_AUCTION}
+        if auction_round_seconds is not None:
+            declared[ROUND_SECONDS_PARAM] = float(auction_round_seconds)
+        if auction_initial_leases is not None:
+            declared[INITIAL_LEASES_PARAM] = int(auction_initial_leases)
+        auction = {"pricing": declared if pricing == PRICING_AUCTION else None}
+    elif auction_round_seconds is not None or auction_initial_leases is not None:
+        typer.echo("error: --auction-round-seconds and --auction-initial-leases need --pricing auction", err=True)
+        raise typer.Exit(code=1)
+    if cap is None and not priced and not auction and all(v is None for v in (
             floor, min_incentive_share, audit_q, audit_probation_submissions,
             audit_hold_seconds, audit_suspect_seconds, audit_ban_after_failures,
             audit_ban_window_seconds, audit_ban_seconds)):
@@ -975,7 +1005,7 @@ def tasks_set_cap(
             audit_ban_after_failures=audit_ban_after_failures,
             audit_ban_window_seconds=audit_ban_window_seconds,
             audit_ban_seconds=audit_ban_seconds,
-            **priced,
+            **priced, **auction,
         ))
     except (RegistryError, store.RegistryConflict) as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -987,6 +1017,10 @@ def tasks_set_cap(
         typer.echo(f"task {task_id} has no price ceiling: each period pays its cap")
     elif priced:
         typer.echo(_describe_token_price(task_id, priced["token_price"], source))
+    if auction:
+        typer.echo(f"task {task_id} is " + ("priced by auction under its ceiling" if auction["pricing"]
+                                             else "no longer priced by auction")
+                   + "; serving validators apply it when they wire the job")
 
 
 def _token_price(alpha_per_mtoken: float, miner_alpha_per_day: float | None):
@@ -3232,6 +3266,10 @@ def corpus_mine(
         None, "--job-id",
         help="The job to mine on a validator serving several; one process mines one job",
     ),
+    ask_alpha_per_mtoken: float = typer.Option(
+        None, "--ask-alpha-per-mtoken",
+        help="A job priced by auction: the alpha per million verified tokens this hotkey works for",
+    ),
 ) -> None:
     """Generate for the corpus job the validator serves, and submit it."""
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
@@ -3324,6 +3362,7 @@ def corpus_mine(
             # without the routes is mined as before.
             sign_skip=lambda body: sign_corpus_skip(wallet, body),
             sign_lease=lambda body: sign_corpus_lease(wallet, body),
+            ask_alpha_per_mtoken=ask_alpha_per_mtoken,
             max_steps=max_steps or None,
         )
     except CorpusMinerHalted as exc:

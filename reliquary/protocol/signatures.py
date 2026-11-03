@@ -823,10 +823,18 @@ def verify_corpus_skip_signature(request) -> bool:
 # A draw job's light leases (``corpus.draw_leases``), each under its own domain.
 CORPUS_LEASE_DOMAIN = b"reliquary/corpus-lease/v1"
 CORPUS_LEASE_RELEASE_DOMAIN = b"reliquary/corpus-lease-release/v1"
+# A job priced by auction (``corpus.token_auction``): a hotkey's ask, signed and single-use like a lease request.
+CORPUS_ASK_DOMAIN = b"reliquary/corpus-ask/v1"
 
 
 def build_corpus_lease_binding(request) -> bytes:
+    """A lease request's, a release's or an ask's binding (``CorpusAskRequest``), each under its own domain."""
     body = _corpus_fields(request)
+    if "micro_alpha_per_mtoken" in body:
+        return _bound(CORPUS_ASK_DOMAIN, [str(body["job_id"]).encode(), str(body["miner_hotkey"]).encode(),
+                                          int(body["issued_at"]).to_bytes(8, "big", signed=False),
+                                          str(body["nonce"]).encode(),
+                                          int(body["micro_alpha_per_mtoken"]).to_bytes(8, "big", signed=False)])
     if "lease_id" in body:
         return _bound(CORPUS_LEASE_RELEASE_DOMAIN, [str(body["job_id"]).encode(), str(body["miner_hotkey"]).encode(),
                                                    str(body["lease_id"]).encode()])

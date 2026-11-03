@@ -286,6 +286,11 @@ class PairedAuditDispatcher:
                 scored[k] = (status, chunks, scored_by, *extra)
         return scored
 
+    def pending_items(self, job_id: str) -> int:
+        """The samples of ``job_id`` waiting in batches not yet decided (claimed ones included)."""
+        return sum(len(batch.items) for queue in self._queues.values() for batch in queue
+                   if batch.job_id == str(job_id) and not batch.future.done())
+
     def pending(self, model: ModelKey | None = None) -> int:
         queues = [self._queues[model]] if model is not None else list(self._queues.values())
         return sum(1 for queue in queues for batch in queue if not batch.future.done())
@@ -1202,7 +1207,19 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             # A draw job's samples carry no proof: the draw is their check.
             proof_chunk_tokens=None if has_draw(w.job) else w.proof.chunk_tokens, vocab_size=w.vocab_size,
             is_banned=w.is_banned, registration=registration, seen_index=w.seen_index,
-            job=getattr(w, "job", None), durable_records=False)
+            job=getattr(w, "job", None), durable_records=False, auction=_auction_of(w))
+
+    def _auction_of(w):
+        """The job's token auction when its entry prices it so (``corpus.token_auction``), its leases opened by
+        what waits for the audit: the auditor's queue and the batches sent to executors."""
+        from reliquary.corpus.token_auction import job_auction
+
+        if not hasattr(w, "auction"):
+            job_id = str(w.entry.job_id)
+            w.auction = job_auction(
+                getattr(w.entry, "params", None),
+                backlog=lambda: w.auditor.audit_backlog() + dispatcher.pending_items(job_id))
+        return w.auction
 
     async def wire(entry, cap, job):
         from reliquary.eval.prompt_source import is_eval_source
