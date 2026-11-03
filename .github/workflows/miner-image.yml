@@ -71,6 +71,7 @@ jobs:
           import os
           from importlib.metadata import version
           import torch
+          import flashinfer
           from vllm.model_executor.models import ModelRegistry
           from transformers.models.auto.configuration_auto import CONFIG_MAPPING
           from reliquary.miner.vllm_generation import SUPPORTED_VLLM_SERIES

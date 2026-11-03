@@ -11,6 +11,7 @@ COPY tests/fixtures/reliquarylogic_v1.jsonl ./tests/fixtures/reliquarylogic_v1.j
 # Resolve the real package dependencies; never bypass incompatible metadata.
 RUN python3 -c "from importlib.metadata import version; import torch; assert version('torch').split('+')[0] == '2.13.0'; assert torch.version.cuda == '12.9'; print('torch==' + version('torch'))" \
         > /tmp/miner-constraints.txt \
+    && python3 -m pip uninstall -y flashinfer-cubin flashinfer-jit-cache \
     && python3 -m pip install --no-cache-dir --constraint /tmp/miner-constraints.txt \
         '.' 'vllm @ https://github.com/vllm-project/vllm/releases/download/v0.30.0/vllm-0.30.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl#sha256=e98cb69659bfcfc849cf11ce0781a7161d40b02b51a6c3636924a5909f2aabcc' 'huggingface-hub==1.31.0' 'mcp>=2,<3' 'renderers==0.1.11' \
     && python3 -m pip check \
