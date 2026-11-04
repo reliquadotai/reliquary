@@ -15,7 +15,7 @@ def kit(tmp_path, monkeypatch):
     (root / "miner/validator/gate").mkdir(parents=True)
     (root / "miner/kit").mkdir()
     config = root / "miner/validator/gate/gate-config.public.json"
-    config.write_text(json.dumps({"heldout": {"prior_v1": {'N': 500, 'a_hi': 2.0, 'a_lo': 0.5, 'a_shrink': 0.5, 'bar_z': 1.0, 'block_delay': 3, 'cap': 0.1, 'cap_max': 0.33, 'cap_rule': 'task-level', 'dapo_offset': 7496, 'floor': 0.1, 'head_blocks': 3, 'head_rollouts': 12, 'k_cand': 8, 'math_offset': 0, 'min_cover': 0.95, 'min_scored': 100, 'n_init': 2.0, 'probe_env': 'affine_gatepool', 'scoring_mode': 'separate', 'shares': 'size', 'sigma_run_floor': 0.003, 'tau_run_same': 0.0, 'tau_run_separate': 0.0, 'theta_min_rollouts': 200, 'theta_prior_sd': 2.0, 'weighting': 'irt-info', 'z_bar_fixed_from_epoch': 553, 'z_inclusive': False}}}))
+    config.write_text(json.dumps({"heldout": {"prior_v1": {'N': 500, 'a_hi': 2.0, 'a_lo': 0.5, 'a_shrink': 0.5, 'bar_z': 1.0, 'block_delay': 3, 'cap': 0.1, 'cap_max': 0.33, 'cap_rule': 'task-level', 'dapo_offset': 7496, 'floor': 0.1, 'head_blocks': 3, 'head_rollouts': 12, 'k_cand': 8, 'math_offset': 0, 'min_cover': 0.95, 'min_scored': 100, 'n_init': 2.0, 'probe_env': 'affine_gatepool', 'scoring_mode': 'separate', 'shares': 'size', 'sigma_run_floor': 0, 'tau_run_same': 0.0, 'tau_run_separate': 0.0, 'theta_min_rollouts': 200, 'theta_prior_sd': 2.0, 'weighting': 'irt-info', 'z_bar_fixed_from_epoch': 553, 'z_inclusive': False}}}))
     (root / "miner/kit/check_batch.py").write_text("# fixture\n")
     (root / "miner/validator/batch").mkdir()
     (root / "miner/validator/batch/ff_format.py").write_text("TRAIN_DEFAULTS = {'lr': 5e-07, 'kl': 0.02, 'step_mult': 1}\nTRAIN_BOUNDS = {'lr': (1.25e-07, 1e-06), 'kl': (0.005, 0.1)}\nSTEP_MULT_ALLOWED = (1, 2)\nKNOB_SPEC = {'lr_scale_attn': ('number', (0.0, 2.0), 1.0), 'lr_scale_mlp': ('number', (0.0, 2.0), 1.0), 'lr_scale_embed': ('number', (0.0, 2.0), 1.0), 'lr_scale_lm_head': ('number', (0.0, 2.0), 1.0), 'lr_scale_early': ('number', (0.0, 2.0), 1.0), 'lr_scale_late': ('number', (0.0, 2.0), 1.0), 'adam_eps': ('number', (1e-10, 0.001), 1e-08), 'weight_decay': ('number', (0.0, 0.05), 0.01), 'clamp_mode': ('choice', ('per_tensor', 'global_norm', 'both'), 'per_tensor'), 'global_norm_cap': ('number', (0.005, 1.0), 1.0), 'loss_agg': ('choice', ('seq_mean', 'token_mean'), 'seq_mean'), 'adv_center': ('choice', ('mean', 'none', 'group_norm'), 'mean'), 'adv_clip': ('number', (0.1, 100.0), None)}\nMAX_OUTPUT = 12288\nMAX_CONTEXT = 16384\nLEGACY_CAP = 8192\n")
@@ -99,6 +99,39 @@ def test_plan_is_declarative_and_binds_exact_inputs(args, monkeypatch):
     before = result["bindings"]
     Path(args.batch).write_text(Path(args.batch).read_text() + "\n")
     assert batch.plan(args)["bindings"]["batchSha256"] != before["batchSha256"]
+
+
+def test_current_zero_noise_floor_is_pinned_and_old_floor_is_refused(args, kit):
+    config = kit / "miner/validator/gate/gate-config.public.json"
+    value = json.loads(config.read_text())
+    value["heldout"]["prior_v1"]["sigma_run_floor"] = 0
+    config.write_text(json.dumps(value))
+    assert batch._gate_policy(kit)["sigma_run_floor"] == 0
+    value["heldout"]["prior_v1"]["sigma_run_floor"] = 0.003
+    config.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="unsupported_public_gate_policy"):
+        batch._gate_policy(kit)
+
+
+def test_generate_reuses_official_sampler_grader_and_export(args, kit, monkeypatch):
+    args.head_url = "http://127.0.0.1:8000"
+    calls = []
+    def script(_args, name, flags, label):
+        calls.append((name, flags, label))
+        output = Path(flags[flags.index("--out") + 1])
+        output.write_text('{"fixture":true}\n')
+    monkeypatch.setattr(batch, "_script", script)
+    result = batch.generate(args, batch.inspect_kit(kit))
+    assert [name for name, _, _ in calls] == ["generate.py", "make_batch.py"]
+    sampling = calls[0][1]
+    assert sampling[sampling.index("--head") + 1] == args.head
+    assert sampling[sampling.index("--url") + 1] == args.head_url
+    assert sampling[sampling.index("--seed") + 1] == args.seed
+    export = calls[1][1]
+    assert export[export.index("--rollouts") + 1] == Path(args.work) / "rollouts.private.jsonl"
+    assert export[export.index("--hotkey") + 1] == args.hotkey
+    assert result["result"]["batchSha256"] == batch._sha(args.batch)
+    assert result["officialAcceptance"] is result["liveParity"] is False
 
 
 def test_clock_is_explicit_and_not_wall_time(args):
@@ -286,6 +319,7 @@ def test_all_current_train_fields_are_bound(args, field):
     ("sampling", "top_k", 40), ("sampling", "temperature", True),
     ("gate", "bar_z", 0.25), ("gate", "max_tokens", 8192),
     ("gate", "weighting", "unknown"), ("gate", "cap_max", 0.2),
+    ("gate", "sigma_run_floor", 0.003),
 ])
 def test_changed_current_contract_fails_closed(args, section, key, bad):
     value = json.loads(Path(args.mining).read_text())
