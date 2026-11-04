@@ -1625,3 +1625,50 @@ __all__ = [
     "validate_cached_delivery",
     "validated_delivery_id",
 ]
+
+
+class SplitDeliverySink:
+    """The HTTP sink for every key it routes (subnet runs, batch files), the
+    platform bucket for the rest: evaluation files, which the HTTP routes do
+    not cover. Lets one admin deliver both through ``RELIQUARY_PLATFORM_DELIVERY_*``
+    and ``RELIQUARY_PLATFORM_R2_*`` together."""
+
+    evaluation_supported = True
+
+    def __init__(self, *, http: "HTTPDeliverySink", bucket: "R2DeliverySink") -> None:
+        self._http, self._bucket = http, bucket
+
+    def __getattr__(self, name: str):
+        # Limits, contract pins and batch error uploads stay the HTTP sink's.
+        return getattr(self._http, name)
+
+    def _for(self, key: str):
+        try:
+            self._http._route(key)
+        except ValueError:
+            return self._bucket
+        return self._http
+
+    async def put_file(self, key: str, path: Path) -> None:
+        await self._for(key).put_file(key, path)
+
+    async def put_json(self, key: str, document: Mapping) -> None:
+        await self._for(key).put_json(key, document)
+
+    async def put_bytes(self, key: str, body: bytes) -> None:
+        sink = self._for(key)
+        if sink is self._http:
+            raise ValueError("bytes go to the platform bucket only")
+        await sink.put_bytes(key, body)
+
+    async def get_json(self, key: str) -> dict | None:
+        return await self._for(key).get_json(key)
+
+    async def get_bytes(self, key: str) -> bytes | None:
+        return await self._for(key).get_bytes(key)
+
+    async def get_file(self, key: str, path: Path):
+        sink = self._for(key)
+        if sink is self._http:
+            raise ValueError("files are read from the platform bucket only")
+        return await sink.get_file(key, path)
