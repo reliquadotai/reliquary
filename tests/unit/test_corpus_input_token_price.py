@@ -188,3 +188,22 @@ def test_the_verdict_carries_its_records_prompt_token_count():
     auditor._remember("s2", {"hotkey": "h", "received_at": 1.0, "token_count": 3})
     assert auditor._verdict("s1", "h", 3, {"passed": True}, None)["prompt_token_count"] == 40
     assert "prompt_token_count" not in auditor._verdict("s2", "h", 3, {"passed": True}, None)
+
+
+# -- the operator CLI ----------------------------------------------------------------
+
+
+def test_the_cli_sets_an_input_price_beside_the_output_price(monkeypatch):
+    from tests.unit.test_corpus_token_price_ceiling import _cli
+
+    result, calls = _cli(monkeypatch, "--max-price-alpha-per-mtoken", "0.9",
+                         "--max-price-input-alpha-per-mtoken", "0.3",
+                         "--miner-emission-alpha-per-day", "2952")
+    assert result.exit_code == 0, result.output
+    price = calls[0][2]["token_price"]
+    per_period = 2952 * cp.PERIOD_SECONDS / 86400
+    assert price[cp.MAX_PRICE_INPUT_ALPHA_PARAM] == 0.3
+    assert price[cp.MAX_PRICE_INPUT_PARAM] == pytest.approx(0.3e-6 / per_period)
+    assert "0.3 alpha per million prompt tokens" in result.output
+    result, calls = _cli(monkeypatch, "--max-price-input-alpha-per-mtoken", "0.3")
+    assert result.exit_code == 1 and not calls
