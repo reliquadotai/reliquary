@@ -145,3 +145,18 @@ def test_seeding_from_whole_records_takes_tens_of_minutes():
     """The failure itself (prod 2026-10-02 21:50 -> 22:14+): no pass before the seed ends."""
     minutes, _ = _first_verdict_after_restart(metadata=False)
     assert minutes > 15.0, minutes
+
+
+@pytest.mark.parametrize("prompt", ["p" * 300, "q" * 20_000])
+def test_the_prompt_token_count_is_read_from_the_tail_or_the_whole_record(monkeypatch, prompt):
+    key = record_store._key("math-v1", "submissions", SID)
+    client = _RangeClient({key: _record(rendered_prompt=prompt, prompt_token_count=77)})
+    monkeypatch.setattr(record_store, "get_s3_client", lambda **kw: client)
+    meta = asyncio.run(record_store.BucketRecordStore().read_submission_meta("math-v1", SID))
+    assert meta == {"hotkey": "5HkAlice", "received_at": 1790000123.25, "token_count": 4200,
+                    "prompt_token_count": 77}
+
+
+def test_the_prompt_token_count_does_not_read_as_the_token_count():
+    meta = record_store.submission_meta(_record(prompt_token_count=77)[-4096:])
+    assert meta["token_count"] == 4200 and meta["prompt_token_count"] == 77

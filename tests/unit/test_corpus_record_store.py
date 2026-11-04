@@ -262,3 +262,17 @@ def test_recovery_enforces_the_native_aggregate_wire_limits(staged_r2, field):
     with pytest.raises(ValueError):
         run(records.promote_submission("math-v1", ref))
     assert run(records.list_submission_ids("math-v1")) == []
+
+
+def test_a_single_turn_receipt_may_carry_its_prompt_token_count(staged_r2):
+    record = {**_record(), "prompt_token_count": 5}
+    ref = run(records.stage_submission("math-v1", ID, record))
+    assert run(records.read_staged_submission("math-v1", ref)) == record
+
+
+@pytest.mark.parametrize("episode,value", [(False, -1), (False, 2.0), (False, True), (True, 5)])
+def test_a_bad_or_episode_prompt_token_count_never_reaches_staging(staged_r2, episode, value):
+    record = {**_record(episode=episode), "prompt_token_count": value}
+    with pytest.raises(ValueError):
+        run(records.stage_submission("math-v1", ID, record))
+    assert not staged_r2.objects

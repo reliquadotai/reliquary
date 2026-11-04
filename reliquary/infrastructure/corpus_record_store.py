@@ -44,6 +44,9 @@ _RECORD_FIELDS = frozenset({
     "rendered_prompt", "received_at", "token_count", "completions",
 })
 _LEASE_FIELDS = frozenset({"lease_price", "lease_debit"})
+# A single-turn record's prompt length in the job's tokens (absent on older
+# records and on episodes): what an input-priced ceiling pays for.
+PROMPT_TOKEN_COUNT = "prompt_token_count"
 
 
 def _validated_id(submission_id: Any) -> str:
@@ -118,8 +121,13 @@ def _record_identity(job_id, submission_id, record) -> None:
         CorpusTrajectory,
     )
 
-    lease_keys = set(record) - _RECORD_FIELDS if isinstance(record, Mapping) else set()
-    if (not isinstance(record, Mapping) or set(record) - lease_keys != _RECORD_FIELDS
+    lease_keys = (set(record) - _RECORD_FIELDS - {PROMPT_TOKEN_COUNT}
+                  if isinstance(record, Mapping) else set())
+    if (not isinstance(record, Mapping)
+            or set(record) - lease_keys - {PROMPT_TOKEN_COUNT} != _RECORD_FIELDS
+            or (PROMPT_TOKEN_COUNT in record and (
+                record.get("schema") != RECORD_SCHEMA_V1
+                or type(record[PROMPT_TOKEN_COUNT]) is not int or record[PROMPT_TOKEN_COUNT] < 0))
             # A job priced by auction adds both lease terms, finite and non-negative, or neither.
             or lease_keys not in (set(), _LEASE_FIELDS)
             or any(type(record[k]) not in (int, float) or not math.isfinite(record[k]) or record[k] < 0
@@ -255,6 +263,7 @@ _META_KEYS = {
     "hotkey": re.compile(rb'"hotkey":"((?:[^"\\]|\\.)*)"'),
     "received_at": re.compile(rb'"received_at":(-?[0-9][0-9.eE+-]*|null)'),
     "token_count": re.compile(rb'"token_count":([0-9]+)'),
+    PROMPT_TOKEN_COUNT: re.compile(rb'"prompt_token_count":([0-9]+)'),
     # A job priced by auction (``corpus.token_auction``): the lease's price per token and the debt taken back.
     "lease_price": re.compile(rb'"lease_price":(-?[0-9][0-9.eE+-]*)'),
     "lease_debit": re.compile(rb'"lease_debit":(-?[0-9][0-9.eE+-]*)'),
@@ -262,12 +271,15 @@ _META_KEYS = {
 
 
 def _lease_terms(found: Mapping) -> dict:
-    """The lease terms of a record's metadata, present only on a job priced by auction."""
+    """The lease terms of a record's metadata, present only on a job priced by auction,
+    and its prompt token count, present only when the record holds one."""
     terms = {}
     for name in ("lease_price", "lease_debit"):
         value = found.get(name)
         if value is not None:
             terms[name] = float(value)
+    if found.get(PROMPT_TOKEN_COUNT) is not None:
+        terms[PROMPT_TOKEN_COUNT] = int(found[PROMPT_TOKEN_COUNT])
     return terms
 
 

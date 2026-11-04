@@ -172,3 +172,19 @@ def test_a_full_usd_ceiling_is_valid():
     from reliquary.shared.task_registry import validate_entry
 
     validate_entry(_entry(**_USD))
+
+
+# -- the auditor ---------------------------------------------------------------------
+
+
+def test_the_verdict_carries_its_records_prompt_token_count():
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    auditor = CorpusAuditor.__new__(CorpusAuditor)
+    auditor._meta, auditor._lease_terms, auditor._arrivals = {}, {}, {}
+    auditor._judged, auditor._unjudged, auditor._clock = set(), {}, lambda: 5.0
+    auditor._remember("s1", {"hotkey": "h", "received_at": 1.0, "token_count": 3,
+                             "prompt_token_count": 40})
+    auditor._remember("s2", {"hotkey": "h", "received_at": 1.0, "token_count": 3})
+    assert auditor._verdict("s1", "h", 3, {"passed": True}, None)["prompt_token_count"] == 40
+    assert "prompt_token_count" not in auditor._verdict("s2", "h", 3, {"passed": True}, None)
