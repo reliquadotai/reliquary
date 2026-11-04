@@ -3,6 +3,8 @@ store, the executor registry and the platform bucket."""
 
 from __future__ import annotations
 
+import dataclasses
+
 import asyncio
 import hashlib
 import json
@@ -395,6 +397,38 @@ def test_zero_cap_review_and_create_do_not_scan_inherited_retired_jobs(admin, mo
     assert admin.registry["entries"]["default"] == before["default"]
     assert admin.registry["entries"]["math-zero"].params["cap"] == 0.0
     assert admin.registry["entries"]["math-old"] == before["math-old"]
+
+
+def test_a_paying_create_lists_only_retired_jobs_that_still_carry_a_cap(admin, monkeypatch):
+    from reliquary.corpus.delivery import LocalDirectorySink
+    from reliquary.validator import corpus_job_status
+
+    for job_id in ("math-old", "math-held"):
+        assert admin("POST", "/admin/v1/jobs", _job(job_id, cap=0.1)).status_code == 201
+        assert admin("POST", "/admin/v1/tasks/" + job_id + "/retire", {}).status_code == 200
+    # Retired, then its cap set to 0 (as operators close a task's pay); math-held keeps its cap.
+    old = admin.registry["entries"]["math-old"]
+    admin.registry["entries"]["math-old"] = dataclasses.replace(
+        old, params={**old.params, "cap": 0.0, **({"floor": 0.0} if "floor" in old.params else {})})
+    listed = []
+
+    async def counts(records, job_id):
+        listed.append(job_id)
+        return {"drained": True}
+
+    monkeypatch.setattr(corpus_job_status, "stored_job_counts", counts)
+    app = create_admin_app(secret=SECRET, pool_max=0.5, models=MODELS, records=admin.records,
+                           task_prefix="math-", deliveries=LocalDirectorySink(admin.platform))
+    with TestClient(app) as client:
+        data = json.dumps(_job("math-new", cap=0.2)).encode()
+        stamp, nonce = str(int(time.time())), secrets.token_hex(16)
+        created = client.post("/admin/v1/jobs", content=data, headers={
+            TIMESTAMP_HEADER: stamp, NONCE_HEADER: nonce,
+            SIGNATURE_HEADER: sign_request(SECRET, stamp, nonce, "POST", "/admin/v1/jobs", data),
+            "content-type": "application/json"})
+    assert created.status_code == 201, created.text
+    # Only the retired job still holding a cap can count against the pool.
+    assert listed == ["math-held"]
 
 
 def test_reusing_a_job_id_cannot_silently_change_the_emission_cap(admin):
