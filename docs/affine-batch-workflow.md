@@ -22,7 +22,9 @@ This reads pins and emits `affine-batch-plan/v1` JSON with declarative commands.
 
 ## Generate or supply a batch
 
-Serve the published head named in the captured `mining.json`, with its tokenizer. The original Hugging Face base and other teacher models are not interchangeable with that head. The official generator uses temperature 1, top-k 20 and top-p 0.95; tokens outside the head's sampler support are excluded from the policy-gradient term. The supplied server identity remains caller asserted.
+Serve the published head named in the captured `mining.json`, with its tokenizer. Generation checks the local checkpoint file descriptor against that captured head before starting compute. The original Hugging Face base and other teacher models are not interchangeable with that head. The official generator uses temperature 1, top-k 20 and top-p 0.95; tokens outside the head's sampler support are excluded from the policy-gradient term. The supplied server identity remains caller asserted.
+
+Keep the fetch helper's generated `CHECKPOINT.json` receipt outside the head model directory. It is not a published model file; the official descriptor calculation includes every top-level `.json`, `.safetensors` and `.jinja` file in that directory.
 
 With an explicitly provided head inference server on loopback:
 

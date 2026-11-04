@@ -348,6 +348,8 @@ def generate(args, source):
     _require(args, "head_url", "seed")
     _url(args.head_url)
     mining = _mining(args.mining, args.kit)
+    if checkpoint_digest(args.head) != mining["checkpoint"]:
+        raise ValueError("generation_head_mismatch")
     work = _work(args.work)
     rollouts, batch = work / "rollouts.private.jsonl", work / "batch.private.json"
     _unused(rollouts, batch)

@@ -115,6 +115,9 @@ def test_current_zero_noise_floor_is_pinned_and_old_floor_is_refused(args, kit):
 
 def test_generate_reuses_official_sampler_grader_and_export(args, kit, monkeypatch):
     args.head_url = "http://127.0.0.1:8000"
+    mining = json.loads(Path(args.mining).read_text())
+    mining["checkpoint"] = batch.checkpoint_digest(args.head)
+    Path(args.mining).write_text(json.dumps(mining))
     calls = []
     def script(_args, name, flags, label):
         calls.append((name, flags, label))
@@ -132,6 +135,14 @@ def test_generate_reuses_official_sampler_grader_and_export(args, kit, monkeypat
     assert export[export.index("--hotkey") + 1] == args.hotkey
     assert result["result"]["batchSha256"] == batch._sha(args.batch)
     assert result["officialAcceptance"] is result["liveParity"] is False
+
+
+def test_generation_refuses_a_different_local_head_before_compute(args, kit, monkeypatch):
+    args.head_url = "http://127.0.0.1:8000"
+    monkeypatch.setattr(batch, "_script", lambda *a: pytest.fail("must not dispatch a mismatched head"))
+    with pytest.raises(ValueError, match="generation_head_mismatch"):
+        batch.generate(args, batch.inspect_kit(kit))
+    assert not Path(args.work).exists()
 
 
 def test_clock_is_explicit_and_not_wall_time(args):
