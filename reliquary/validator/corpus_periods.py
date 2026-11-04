@@ -67,21 +67,69 @@ MAX_PRICE_EMISSION_PARAM = "max_price_miner_alpha_per_period"
 MAX_PRICE_SET_AT_PARAM = "max_price_set_at"
 MAX_PRICE_PARAMS = (MAX_PRICE_PARAM, MAX_PRICE_ALPHA_PARAM, MAX_PRICE_EMISSION_PARAM,
                     MAX_PRICE_SET_AT_PARAM)
+# Optional, beside the ceiling above (which then prices output tokens only):
+# what one prompt token may pay, in pool share and in the alpha it came from,
+# converted at the same miner emission. Written together or not at all.
+MAX_PRICE_INPUT_PARAM = "max_price_input_per_token"
+MAX_PRICE_INPUT_ALPHA_PARAM = "max_price_input_alpha_per_mtoken"
+MAX_PRICE_INPUT_PARAMS = (MAX_PRICE_INPUT_PARAM, MAX_PRICE_INPUT_ALPHA_PARAM)
+# Optional, audit only: the USD prices an API order gave and the rates that
+# turned them into alpha (USD per alpha, USD per TAO). Together or not at all.
+MAX_PRICE_USD_INPUT_PARAM = "max_price_usd_per_mtoken_input"
+MAX_PRICE_USD_OUTPUT_PARAM = "max_price_usd_per_mtoken_output"
+MAX_PRICE_ALPHA_USD_PARAM = "max_price_alpha_usd"
+MAX_PRICE_TAO_USD_PARAM = "max_price_tao_usd"
+MAX_PRICE_USD_PARAMS = (MAX_PRICE_USD_INPUT_PARAM, MAX_PRICE_USD_OUTPUT_PARAM,
+                        MAX_PRICE_ALPHA_USD_PARAM, MAX_PRICE_TAO_USD_PARAM)
+# Every key a ceiling may write: ``set_cap`` clears them all before setting one.
+ALL_PRICE_PARAMS = MAX_PRICE_PARAMS + MAX_PRICE_INPUT_PARAMS + MAX_PRICE_USD_PARAMS
 
 
 def price_params(alpha_per_mtoken: float, miner_alpha_per_period: float,
-                 set_at: float) -> dict[str, float]:
+                 set_at: float, *, input_alpha_per_mtoken: float | None = None) -> dict[str, float]:
     """The registry params of a ceiling of ``alpha_per_mtoken`` alpha per
     million verified tokens: a share of the pool is a share of the miners'
     emission, so one token may pay ``alpha / 1e6 / miner_alpha_per_period``
-    (an archive's share is paid out in full over its EMA tail)."""
+    (an archive's share is paid out in full over its EMA tail).
+    ``input_alpha_per_mtoken`` also prices prompt tokens (None or 0: not)."""
     alpha, emission = float(alpha_per_mtoken), float(miner_alpha_per_period)
     if not (math.isfinite(alpha) and alpha > 0):
         raise ValueError(f"the price must be a positive number of alpha, got {alpha_per_mtoken!r}")
     if not (math.isfinite(emission) and emission > 0):
         raise ValueError(f"the miner emission must be positive, got {miner_alpha_per_period!r}")
-    return {MAX_PRICE_PARAM: alpha / 1e6 / emission, MAX_PRICE_ALPHA_PARAM: alpha,
-            MAX_PRICE_EMISSION_PARAM: emission, MAX_PRICE_SET_AT_PARAM: float(set_at)}
+    params = {MAX_PRICE_PARAM: alpha / 1e6 / emission, MAX_PRICE_ALPHA_PARAM: alpha,
+              MAX_PRICE_EMISSION_PARAM: emission, MAX_PRICE_SET_AT_PARAM: float(set_at)}
+    if input_alpha_per_mtoken is not None:
+        given = float(input_alpha_per_mtoken)
+        if not (math.isfinite(given) and given >= 0):
+            raise ValueError(f"the input price must be a non-negative number of alpha, "
+                             f"got {input_alpha_per_mtoken!r}")
+        if given > 0:
+            params.update({MAX_PRICE_INPUT_PARAM: given / 1e6 / emission,
+                           MAX_PRICE_INPUT_ALPHA_PARAM: given})
+    return params
+
+
+def usd_price_params(*, usd_per_mtoken_input: float, usd_per_mtoken_output: float,
+                     alpha_usd: float, tao_usd: float, miner_alpha_per_period: float,
+                     set_at: float) -> dict[str, float]:
+    """A ceiling given in USD per million tokens, converted to alpha at
+    ``alpha_usd`` (USD per alpha); the USD prices and rates kept to audit it."""
+    rates = {"usd_per_mtoken_input": usd_per_mtoken_input,
+             "usd_per_mtoken_output": usd_per_mtoken_output,
+             "alpha_usd": alpha_usd, "tao_usd": tao_usd}
+    for name, value in rates.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f"{name} must be a finite number, got {value!r}")
+    if usd_per_mtoken_input < 0 or usd_per_mtoken_output <= 0 or alpha_usd <= 0 or tao_usd <= 0:
+        raise ValueError("the USD prices and rates must be positive (the input price may be 0)")
+    params = price_params(usd_per_mtoken_output / alpha_usd, miner_alpha_per_period, set_at,
+                          input_alpha_per_mtoken=usd_per_mtoken_input / alpha_usd)
+    params.update({MAX_PRICE_USD_INPUT_PARAM: float(usd_per_mtoken_input),
+                   MAX_PRICE_USD_OUTPUT_PARAM: float(usd_per_mtoken_output),
+                   MAX_PRICE_ALPHA_USD_PARAM: float(alpha_usd),
+                   MAX_PRICE_TAO_USD_PARAM: float(tao_usd)})
+    return params
 
 
 def max_price(params) -> float | None:
@@ -89,6 +137,20 @@ def max_price(params) -> float | None:
     if not isinstance(params, Mapping) or params.get(MAX_PRICE_PARAM) is None:
         return None
     return float(params[MAX_PRICE_PARAM])
+
+
+def max_input_price(params) -> float | None:
+    """The most one prompt token may pay, in pool share; None: not priced."""
+    if max_price(params) is None or params.get(MAX_PRICE_INPUT_PARAM) is None:
+        return None
+    return float(params[MAX_PRICE_INPUT_PARAM])
+
+
+def work_value(verdict: Mapping, price: float, input_price: float) -> float:
+    """What a verdict's work may pay under an input-priced ceiling: its output
+    tokens at ``price`` plus its prompt tokens (0 when unknown) at ``input_price``."""
+    return (float(price) * int(verdict.get("token_count") or 0)
+            + float(input_price) * int(verdict.get("prompt_token_count") or 0))
 
 
 def period_budget(cap: float, price: float | None, tokens: int) -> float:
@@ -102,10 +164,19 @@ def price_view(params) -> dict | None:
     """The ceiling as the public job status shows it; None without one."""
     if max_price(params) is None:
         return None
-    return {"max_price_alpha_per_mtoken": params.get(MAX_PRICE_ALPHA_PARAM),
+    view = {"max_price_alpha_per_mtoken": params.get(MAX_PRICE_ALPHA_PARAM),
             "max_price_pool_share_per_token": float(params[MAX_PRICE_PARAM]),
             "miner_alpha_per_period": params.get(MAX_PRICE_EMISSION_PARAM),
             "set_at": params.get(MAX_PRICE_SET_AT_PARAM)}
+    if max_input_price(params) is not None:
+        view.update(max_price_input_alpha_per_mtoken=params.get(MAX_PRICE_INPUT_ALPHA_PARAM),
+                    max_price_input_pool_share_per_token=max_input_price(params))
+    if params.get(MAX_PRICE_USD_OUTPUT_PARAM) is not None:
+        view["usd"] = {"input_per_mtoken": params.get(MAX_PRICE_USD_INPUT_PARAM),
+                       "output_per_mtoken": params.get(MAX_PRICE_USD_OUTPUT_PARAM),
+                       "alpha_usd": params.get(MAX_PRICE_ALPHA_USD_PARAM),
+                       "tao_usd": params.get(MAX_PRICE_TAO_USD_PARAM)}
+    return view
 
 
 def archive_bound(recorded, ceiling: float | None) -> float | None:
@@ -182,7 +253,12 @@ def replay(archives: Iterable[Mapping], current_period: int, *,
 
 
 __all__ = [
+    "ALL_PRICE_PARAMS",
     "CATCHUP_ENTRIES",
+    "MAX_PRICE_INPUT_ALPHA_PARAM",
+    "MAX_PRICE_INPUT_PARAM",
+    "MAX_PRICE_INPUT_PARAMS",
+    "MAX_PRICE_USD_PARAMS",
     "MAX_PRICE_ALPHA_PARAM",
     "MAX_PRICE_EMISSION_PARAM",
     "MAX_PRICE_PARAM",
@@ -199,6 +275,7 @@ __all__ = [
     "closed_through",
     "entry_for",
     "is_period_task",
+    "max_input_price",
     "max_price",
     "pay_ceiling",
     "period_budget",
@@ -207,4 +284,6 @@ __all__ = [
     "price_params",
     "price_view",
     "replay",
+    "usd_price_params",
+    "work_value",
 ]

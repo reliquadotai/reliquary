@@ -1268,7 +1268,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             archives=R2PeriodArchives(guard=settle_archives),
             oldest_pending=lambda: w.auditor.oldest_pending_received_at(),
             on_settled=w.stats.settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
-            max_price=cp.max_price(entry.params))
+            max_price=cp.max_price(entry.params), max_input_price=cp.max_input_price(entry.params))
         w.auditor = eval_auditor(
             job_id=job.job_id, records=records, tokenizer=tokenizer, proof=proof,
             params=params, miner_states=miner_states, beacon=beacon, round_at=round_at,

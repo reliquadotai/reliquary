@@ -403,7 +403,8 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
         on_settled=on_settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
         executor=judge_threads.codec,
         ready=grader.ready if grader is not None else None,
-        max_price=cp.max_price(w.entry.params))
+        max_price=cp.max_price(w.entry.params),
+        max_input_price=cp.max_input_price(w.entry.params))
     w.auditor = CorpusAuditor(job_id=w.job.job_id, records=judge_records, model=model,
                               tokenizer=tokenizer, proof=proof, params=params,
                               miner_states=MinerStates(judge_records, w.job.job_id),
