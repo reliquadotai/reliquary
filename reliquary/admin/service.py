@@ -516,8 +516,11 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
         entries, _ = await registry_store.read_registry(strict=False)
         for entry in entries.values():
+            # A retired task at cap 0 adds nothing to the totals, drained or not:
+            # listing its job (minutes for a large one) cannot change the decision.
             if (entry.status == "retired" and entry.mechanism == MECHANISM_CORPUS_GENERATION
-                    and entry.job_id and entry.task_id not in drained_tasks):
+                    and entry.job_id and entry.task_id not in drained_tasks
+                    and float(entry.params.get("cap") or 0.0) > 0.0):
                 if (await stored_job_counts(records, entry.job_id))["drained"]:
                     # Drained is for good: never listed again.
                     drained_tasks.add(entry.task_id)
