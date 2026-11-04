@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 import time
 from collections.abc import Callable, Mapping
@@ -51,6 +52,57 @@ GEN_AUDIT_PARAMS = {"audit_q": 0.15, "audit_probation_submissions": 100,
                     "audit_ban_seconds": 604800}
 # Renderer of a catalog source's rows: the model's own chat template.
 THINKING_RENDERERS = {False: "chat-template-v1", True: "chat-template-thinking-v1"}
+# An order's token ceiling is given in USD and converted at job creation with
+# the subnet's alpha price in TAO and TAO's USD price: this variable when set,
+# else CoinGecko's, cached a few minutes.
+TAO_USD_ENV = "RELIQUARY_TAO_USD"
+COINGECKO_TAO_USD_URL = "https://api.coingecko.com/api/v3/simple/price?ids=bittensor&vs_currencies=usd"
+TAO_USD_CACHE_SECONDS = 300.0
+
+
+async def _read_subnet_pool() -> dict:
+    """The subnet's alpha price in TAO and its miners' alpha per block (``chain.subnet_pool``)."""
+    from reliquary.infrastructure.chain import close_subtensor, get_subtensor, subnet_pool
+
+    subtensor = await get_subtensor()
+    try:
+        return await subnet_pool(subtensor)
+    finally:
+        await close_subtensor(subtensor)
+
+
+async def _fetch_tao_usd() -> float:
+    import httpx
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(COINGECKO_TAO_USD_URL)
+        response.raise_for_status()
+        return float(response.json()["bittensor"]["usd"])
+
+
+def tao_usd_reader(*, fetch: Callable | None = None, clock: Callable[[], float] = time.monotonic,
+                   ttl: float = TAO_USD_CACHE_SECONDS):
+    """TAO's USD price: ``RELIQUARY_TAO_USD`` when set, else fetched and kept ``ttl`` seconds."""
+    cached: dict[str, float] = {}
+
+    def checked(value) -> float:
+        value = float(value)
+        if not (math.isfinite(value) and value > 0):
+            raise ValueError(f"TAO/USD must be a positive number, got {value!r}")
+        return value
+
+    async def read() -> float:
+        given = os.environ.get(TAO_USD_ENV)
+        if given:
+            return checked(given)
+        now = clock()
+        if cached and 0 <= now - cached["at"] < ttl:
+            return cached["value"]
+        value = checked(await (fetch or _fetch_tao_usd)())
+        cached.update(value=value, at=now)
+        return value
+
+    return read
 
 
 class QualifiedModel(BaseModel):
@@ -61,6 +113,15 @@ class QualifiedModel(BaseModel):
     architecture: str = Field(min_length=1)
     checkpoint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     eos_token_id: int = Field(ge=0)
+
+
+class TokenCeiling(BaseModel):
+    """An order's price ceiling, in USD per million tokens: prompt (input) and
+    generated (output) tokens. Miners are never paid past it; the rest burns."""
+
+    model_config = ConfigDict(extra="forbid")
+    input: float = Field(ge=0.0, allow_inf_nan=False)
+    output: float = Field(gt=0.0, allow_inf_nan=False)
 
 
 class CreateJob(BaseModel):
@@ -96,6 +157,9 @@ class CreateJob(BaseModel):
     # A reviewed contract can be pinned before the first durable write.
     manifest_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     profile_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    # Eval and generation orders: the ceiling, converted to alpha when the task
+    # is first declared (a replay keeps the first conversion).
+    max_price_usd_per_mtoken: TokenCeiling | None = None
 
 
 class OrderSampling(BaseModel):
@@ -348,10 +412,12 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      open_environment=None, grade_scorer=None,
                      require_sandbox=None, qualifications=None, eval_jobs=None,
                      model_facts=None, evaluation_sessions=None, pin_model=None,
-                     upload_tokenizer=None) -> FastAPI:
+                     upload_tokenizer=None, subnet_pool=None, tao_usd=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
-    ``eval_store`` the subnet bucket holding the eval sets' grading files."""
+    ``eval_store`` the subnet bucket holding the eval sets' grading files.
+    ``subnet_pool`` (async, ``chain.subnet_pool``'s answer) and ``tao_usd``
+    (async, USD per TAO) convert an order's USD token ceiling."""
     from reliquary.infrastructure import corpus_executor_store as executors
     from reliquary.infrastructure import corpus_job_store as job_store
     from reliquary.infrastructure import task_registry_store as registry_store
@@ -408,6 +474,11 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         from reliquary.sandbox.evaluation_engagements import from_environment
 
         evaluation_sessions = from_environment(subnet=eval_store, clock=clock)
+    if subnet_pool is None:
+        async def subnet_pool() -> dict:
+            return await _read_subnet_pool()
+    if tao_usd is None:
+        tao_usd = tao_usd_reader()
     # Rows of each order source, counted once (building one reads its package).
     source_rows: dict[str, int] = {}
 
@@ -452,9 +523,16 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     drained_tasks.add(entry.task_id)
         return cap_limits(float(pool_max), drained_tasks=set(drained_tasks))
 
+    def price_of(entry) -> dict | None:
+        from reliquary.validator.corpus_periods import price_view
+
+        return price_view(entry.params)
+
     def idempotent(answer: dict, entry) -> dict:
-        return {**answer, "created": False, "status": entry.status,
-                "cap": float(entry.params["cap"])}
+        answer = {**answer, "created": False, "status": entry.status,
+                  "cap": float(entry.params["cap"])}
+        price = price_of(entry)
+        return answer if price is None else {**answer, "max_price": price}
 
     async def refuse_unservable_model(model: str, revision: str) -> None:
         """422 ``architecture_unsupported`` / ``model_files_unreadable`` from the
@@ -826,6 +904,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if not evaluation and not generation and any(
                 v is not None for v in (body.qualification_id, body.seed, body.audit_q, body.draw, body.judge)):
             raise HTTPException(status_code=422, detail="eval fields on a non-eval job")
+        if body.max_price_usd_per_mtoken is not None and not (evaluation or generation):
+            raise HTTPException(status_code=422, detail=(
+                "max_price_usd_per_mtoken applies to eval and generation orders"))
         cap = body.cap
         if pinned:
             arguments = await pinned_order_arguments(body, evaluation=evaluation, record_order=False)
@@ -874,6 +955,25 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 or (body.profile_sha256 is not None and body.profile_sha256 != entry.profile_sha256)):
             raise HTTPException(status_code=409, detail="reviewed_contract_changed")
         return manifest, entry
+
+    async def token_price(ceiling: TokenCeiling) -> dict:
+        """The registry params of an order's USD ceiling at today's rates: alpha
+        per million tokens = USD / (alpha price in TAO x TAO/USD), then a pool
+        share per token at the miners' emission per period (as ``tasks set-cap``)."""
+        from reliquary.validator import corpus_periods as cp
+
+        try:
+            pool = await subnet_pool()
+            tao = float(await tao_usd())
+            alpha_usd = float(pool["alpha_price_tao"]) * tao
+            emission = float(pool["miner_alpha_per_block"]) * cp.PERIOD_SECONDS / 12.0
+            return cp.usd_price_params(
+                usd_per_mtoken_input=ceiling.input, usd_per_mtoken_output=ceiling.output,
+                alpha_usd=alpha_usd, tao_usd=tao, miner_alpha_per_period=emission,
+                set_at=float(clock()))
+        except Exception as exc:
+            logger.warning("admin: the token ceiling could not be converted: %r", exc)
+            raise HTTPException(status_code=503, detail="token_price_unavailable") from exc
 
     def task_document(entry) -> dict:
         from reliquary.shared.task_registry import render_registry
@@ -932,7 +1032,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 "environments": environments,
                 "limits": {"max_prompts": 10000, "max_samples": 16,
                            "max_new_tokens": 32768},
-                "renderers": dict(THINKING_RENDERERS)}
+                "renderers": dict(THINKING_RENDERERS),
+                # A create accepts max_price_usd_per_mtoken on eval and generation orders.
+                "orders": {"token_ceilings": True}}
 
     @router.get("/tasks")
     async def list_tasks() -> dict:
@@ -1018,6 +1120,12 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if named:
             raise HTTPException(status_code=409, detail=(
                 f"job {body.job_id!r} is already declared by task {named[0].task_id!r}"))
+        if body.max_price_usd_per_mtoken is not None:
+            # Converted once, here: a replay answers the stored task above, whatever the rate is by then.
+            from dataclasses import replace
+
+            entry = replace(entry, params={**entry.params,
+                                           **await token_price(body.max_price_usd_per_mtoken)})
         try:
             await registry_store.create_task(entry, guard=await draining_limits(cap))
         except (RegistryError, registry_store.RegistryConflict) as exc:
@@ -1032,7 +1140,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         logger.info("admin: declared job %s as task %s, cap %s", body.job_id, entry.task_id,
                     cap)
         response.status_code = 201
-        return {**answer, "created": True, "status": "active", "cap": float(cap)}
+        created = {**answer, "created": True, "status": "active", "cap": float(cap)}
+        price = price_of(entry)
+        return created if price is None else {**created, "max_price": price}
 
     async def corpus_entry(task_id: str):
         """The task, refused unless it is a corpus task (never ``default``, never RL)."""
@@ -1103,7 +1213,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=404, detail="job_unknown")
         counts = await stored_job_counts(records, job_id)
         entries = await entries_naming(job_id)
-        tasks = [{"task_id": e.task_id, "status": e.status, "cap": float(e.params["cap"])}
+        tasks = [{"task_id": e.task_id, "status": e.status, "cap": float(e.params["cap"]),
+                  **({"max_price": price_of(e)} if price_of(e) is not None else {})}
                  for e in entries]
         manifest = job.to_contract()
         return {"job_id": job_id, **counts, "manifest": manifest, "tasks": tasks,
@@ -1340,7 +1451,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 "architectures": sorted(SUPPORTED_ARCHITECTURES),
                 "evidence": {k: list(v) for k, v in SUPPORTED_ARCHITECTURES.items()},
                 # What a forced-draw order may name (``orders``): its model's weights and its set's graders.
-                "orders": {"max_checkpoint_bytes": MAX_CHECKPOINT_BYTES,
+                # token_ceilings: a create accepts max_price_usd_per_mtoken.
+                "orders": {"max_checkpoint_bytes": MAX_CHECKPOINT_BYTES, "token_ceilings": True,
                            "reference_graders": {name: g.description
                                                  for name, g in sorted(REFERENCE_GRADERS.items())}}}
 
