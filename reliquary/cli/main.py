@@ -2344,9 +2344,12 @@ def build_admin_app_from_environment():
     deliveries = None
     if (os.getenv("RELIQUARY_PLATFORM_DELIVERY_URL", "").strip()
             or os.getenv("RELIQUARY_PLATFORM_DELIVERY_SECRET", "")):
-        from reliquary.corpus.delivery import HTTPDeliverySink
+        from reliquary.corpus.delivery import HTTPDeliverySink, R2DeliverySink, SplitDeliverySink
 
         deliveries = HTTPDeliverySink.from_environment()
+        if os.getenv("RELIQUARY_PLATFORM_BUCKET", "").strip():
+            # Evaluation files go to the platform bucket, the rest over HTTP.
+            deliveries = SplitDeliverySink(http=deliveries, bucket=R2DeliverySink.from_environment())
     elif os.getenv("RELIQUARY_PLATFORM_BUCKET", "").strip():
         from reliquary.corpus.delivery import R2DeliverySink
 
