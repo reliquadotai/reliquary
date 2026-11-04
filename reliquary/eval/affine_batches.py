@@ -15,7 +15,7 @@ import sys
 from urllib.parse import urlsplit
 
 UPSTREAM = "https://github.com/AffineFoundation/affine"
-REVISION = "46c3cb6a83abbc881341d374e86d438af91eedb5"
+REVISION = "eaf1ad20e4d018c85b30f53e9807b2b9a6a75e25"
 COMPARISON_RULE = "fixed-z-1-public-prior-v1"
 APPROXIMATION = "PUBLIC PRIOR APPROXIMATION"
 STAGES = ("plan", "generate", "validate", "train", "compare", "simulate")
@@ -142,7 +142,7 @@ def _train_policy(kit):
 def _gate_policy(kit):
     cfg = _load(Path(kit) / "miner/validator/gate/gate-config.public.json")["heldout"]["prior_v1"]
     expected = dict(N=500, k_cand=8, head_rollouts=12, head_blocks=3, scoring_mode="separate",
-                    floor=0.1, cap=0.1, shares="size", n_init=2, sigma_run_floor=0.003,
+                    floor=0.1, cap=0.1, shares="size", n_init=2, sigma_run_floor=0,
                     bar_z=1, z_inclusive=False, cap_max=0.33, cap_rule="task-level",
                     min_scored=100, min_cover=0.95, block_delay=3, weighting="irt-info")
     if any((type(cfg.get(k)) is bool) != (type(v) is bool) or cfg.get(k) != v for k, v in expected.items()) or cfg.get("tau_run_separate") != 0 or cfg.get("tau_run_same") != 0 or cfg.get("z_bar_fixed_from_epoch") != 553:
@@ -348,6 +348,8 @@ def generate(args, source):
     _require(args, "head_url", "seed")
     _url(args.head_url)
     mining = _mining(args.mining, args.kit)
+    if checkpoint_digest(args.head) != mining["checkpoint"]:
+        raise ValueError("generation_head_mismatch")
     work = _work(args.work)
     rollouts, batch = work / "rollouts.private.jsonl", work / "batch.private.json"
     _unused(rollouts, batch)

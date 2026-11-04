@@ -2,7 +2,7 @@
 
 `python -m reliquary.eval.affine_batches` composes an external official miner kit: generate rollouts, export a batch, validate its tokens, take one official training step and compare head/candidate responses with the official sampler, grader and estimator. It also accepts an existing batch. It never registers a miner, uploads a batch, submits chain transactions, provisions compute or starts model servers.
 
-The wrapper pins the external miner tree to `AffineFoundation/affine` revision `46c3cb6a83abbc881341d374e86d438af91eedb5`. It checks every tracked miner file against that commit and refuses modified, missing, symlinked or additional files. The published validator manifest is checked separately and retained as evidence; the wrapper never rewrites it. Keep this checkout separate from the running application.
+The wrapper pins the external miner tree to `AffineFoundation/affine` revision `eaf1ad20e4d018c85b30f53e9807b2b9a6a75e25`. It checks every tracked miner file against that commit and refuses modified, missing, symlinked or additional files. The published validator manifest is checked separately and retained as evidence; the wrapper never rewrites it. Keep this checkout separate from the running application.
 
 Use a separate Python environment with the official `miner/requirements-sim-cpu.txt` for CPU fixtures. The bounded CPU check uses Torch 2.14.0 and Transformers 5.14.1; no heavy dependency is added to the application package. The interpreter running the module must contain those dependencies, or pass its executable using `--python`. Run from the application checkout, or install the application module through your existing reviewed packaging process.
 
@@ -21,6 +21,10 @@ python -m reliquary.eval.affine_batches plan \
 This reads pins and emits `affine-batch-plan/v1` JSON with declarative commands. It creates no outputs and executes no model or kit code. `qualification` and `tokenValidation` remain `not_run`; `liveParity`, `officialAcceptance` and `chainSubmission` are false. Token validation is a separate stage.
 
 ## Generate or supply a batch
+
+Serve the published head named in the captured `mining.json`, with its tokenizer. Generation checks the local checkpoint file descriptor against that captured head before starting compute. The original Hugging Face base and other teacher models are not interchangeable with that head. The official generator uses temperature 1, top-k 20 and top-p 0.95; tokens outside the head's sampler support are excluded from the policy-gradient term. The supplied server identity remains caller asserted.
+
+Keep the fetch helper's generated `CHECKPOINT.json` receipt outside the head model directory. It is not a published model file; the official descriptor calculation includes every top-level `.json`, `.safetensors` and `.jinja` file in that directory.
 
 With an explicitly provided head inference server on loopback:
 
@@ -67,7 +71,7 @@ python -m reliquary.eval.affine_batches compare \
   --last-green-decided-at "$LAST_GREEN_DECIDED_AT"
 ```
 
-Comparison reuses the official prior-v1 draw, prompt rendering, sampler, grader and estimator through a narrow compatibility boundary. The comparison contract is `fixed-z-1-public-prior-v1`: the threshold is fixed at `barZ: 1`, independent of elapsed time. The two explicit frozen timestamps remain provenance and must be finite, nonnegative and ordered. It always collects a fresh baseline and binds the head, reference, tokenizer, batch, contract, prior, source, configuration and seed. Optional `--prior "$PRIOR"` supplies your own `{id,s,n}` JSONL; absent values use environment averages. Every current comparison is labeled **PUBLIC PRIOR APPROXIMATION**: the public Beta-prior inclusion sampler uses the optional counts or environment averages; it does not reproduce the live IRT information weighting, whose task parameters and head ability are private. No private IRT parameters are invented. Fresh sampling uses the official 12,288 output-token cap and 16,384 context limit, task-level candidate cap-hit ceiling 0.33, strict z > 1, and the official estimator.
+Comparison reuses the official prior-v1 draw, prompt rendering, sampler, grader and estimator through a narrow compatibility boundary. The comparison contract is `fixed-z-1-public-prior-v1`: the threshold is fixed at `barZ: 1`, independent of elapsed time. The two explicit frozen timestamps remain provenance and must be finite, nonnegative and ordered. It always collects a fresh baseline and binds the head, reference, tokenizer, batch, contract, prior, source, configuration and seed. Optional `--prior "$PRIOR"` supplies your own `{id,s,n}` JSONL; absent values use environment averages. Every current comparison is labeled **PUBLIC PRIOR APPROXIMATION**: the public Beta-prior inclusion sampler uses the optional counts or environment averages; it does not reproduce the live IRT information weighting, whose task parameters and head ability are private. No private IRT parameters are invented. Fresh sampling uses the official 12,288 output-token cap and 16,384 context limit, task-level candidate cap-hit ceiling 0.33, strict z > 1, zero run-noise floor, and the official estimator. Captures retaining the older 0.003 noise floor are refused.
 
 `simulate` composes generation when no `--batch` is provided, then validation, training and comparison. It accepts the same flags as those stages and still requires explicit device, inference URLs, seed and clocks. Stage reports use `affine-batch-stage-report/v1` and retain `assurance: source-pinned-local-simulation`; no local decision changes the qualification or acceptance flags.
 
