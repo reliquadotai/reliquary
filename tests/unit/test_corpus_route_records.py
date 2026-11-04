@@ -167,3 +167,48 @@ def test_a_corrupt_manifest_is_named_on_the_job_route(seeded_job, _r2_client):
     response = _client(seeded_job, _Records(), []).get("/corpus/job")
     assert response.status_code == 500
     assert response.json()["detail"] == "corpus_job_manifest_corrupt"
+
+
+class _CountingTokenizer:
+    """Decodes as the route's test tokenizer; encodes one token per character."""
+
+    def decode(self, ids, **kwargs):
+        return "".join(str(i) for i in ids)
+
+    def encode(self, text, add_special_tokens=True):
+        return [ord(ch) for ch in text]
+
+
+def test_a_single_turn_record_counts_its_prompt_tokens(seeded_job):
+    from reliquary.validator.corpus_service import build_corpus_router
+
+    records, accepted = _Records(), []
+    app = FastAPI()
+    app.include_router(build_corpus_router(
+        job_id="swe-v1", store=seeded_job.store, tokenizer=_CountingTokenizer(),
+        renderer=seeded_job.renderer, verify_signature=lambda r: True,
+        prompt_job_for=seeded_job.prompt_job_for, records=records,
+        on_accepted=accepted.append,
+    ))
+    request = _request([7] * 16 + [EOS])
+    assert TestClient(app).post("/corpus/submit", json=request.model_dump()).json()["accepted"]
+    record = records.written[corpus_submission_id(request)]
+    assert record["prompt_token_count"] == len(request.rendered_prompt)
+
+
+def test_a_prompt_that_cannot_be_counted_leaves_the_record_without_a_count(seeded_job):
+    records, accepted = _Records(), []
+    request = _request([7] * 16 + [EOS])
+    assert _client(seeded_job, records, accepted).post(
+        "/corpus/submit", json=request.model_dump()).json()["accepted"]
+    assert "prompt_token_count" not in records.written[corpus_submission_id(request)]
+
+
+def test_a_long_prompt_is_counted_off_the_loop():
+    import asyncio
+
+    from reliquary.validator import corpus_service
+
+    prompt = "x" * (corpus_service.PROMPT_COUNT_INLINE_CHARS + 1)
+    assert asyncio.run(corpus_service.count_prompt_tokens(_CountingTokenizer(), prompt)) == len(prompt)
+    assert asyncio.run(corpus_service.count_prompt_tokens(_CountingTokenizer(), "abc")) == 3

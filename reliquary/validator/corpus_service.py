@@ -109,6 +109,8 @@ AUCTION_SCOPED_PATH = "/corpus/jobs/{job_id}/auction"
 # What an accepted record of a job priced by auction carries: its lease's price per token (pool share) and the
 # debt taken back from it. A retried submission keeps the ones its first acceptance recorded.
 LEASE_RECORD_KEYS = ("lease_price", "lease_debit")
+# A prompt longer than this (in characters) is tokenized off the event loop.
+PROMPT_COUNT_INLINE_CHARS = 32_768
 
 
 def _same_record(standing: Mapping, record: Mapping, arrival) -> bool:
@@ -118,7 +120,26 @@ def _same_record(standing: Mapping, record: Mapping, arrival) -> bool:
         expected.pop(key, None)
         if key in standing:
             expected[key] = standing[key]
+    if "prompt_token_count" not in standing:
+        # Accepted by a binary that did not count prompts.
+        expected.pop("prompt_token_count", None)
     return dict(standing) == expected
+
+
+async def count_prompt_tokens(tokenizer, rendered_prompt: str) -> int | None:
+    """The prompt's length in the job's tokens, as the auditor tokenizes it; None
+    when it cannot be counted (the record then carries none, and its prompt is
+    never paid for)."""
+    from reliquary.corpus.encoding import prompt_token_ids
+
+    try:
+        if len(rendered_prompt) > PROMPT_COUNT_INLINE_CHARS:
+            return len(await asyncio.to_thread(prompt_token_ids, tokenizer, rendered_prompt))
+        return len(prompt_token_ids(tokenizer, rendered_prompt))
+    except Exception:
+        logger.warning("corpus prompt could not be counted; its record carries no prompt count",
+                       exc_info=True)
+        return None
 OPEN_SCOPED_PATH = "/corpus/jobs/{job_id}/open"
 # How long one computed open map answers every caller, and what a client or a
 # proxy in front may keep it: a miner acts on it for minutes anyway.
@@ -1771,7 +1792,7 @@ def build_corpus_router(
 
     def _accepted_record(request: CorpusSubmissionRequest, served: str,
                          episode_facts: IntakeFacts | None = None, *, received_at=None,
-                         pricing: Mapping | None = None) -> dict:
+                         pricing: Mapping | None = None, prompt_tokens: int | None = None) -> dict:
         # Staging is not auditable. Only a ledger-committed reference may
         # publish this body under the canonical submissions prefix.
         from reliquary.protocol.signatures import corpus_submission_id
@@ -1805,15 +1826,20 @@ def build_corpus_router(
             "received_at": time.time() if received_at is None else received_at,
             "token_count": token_count,
             **({key: pricing[key] for key in LEASE_RECORD_KEYS} if pricing else {}),
+            # Single-turn only: what an input-priced ceiling pays the prompt for.
+            **({"prompt_token_count": int(prompt_tokens)}
+               if prompt_tokens is not None and episode_facts is None else {}),
             "completions": completions,
         }
         return record
 
     async def _record_accepted(request: CorpusSubmissionRequest, served: str,
-                               episode_facts: IntakeFacts | None = None, pricing: Mapping | None = None) -> None:
+                               episode_facts: IntakeFacts | None = None, pricing: Mapping | None = None,
+                               prompt_tokens: int | None = None) -> None:
         if records is None:
             return
-        record = _accepted_record(request, served, episode_facts, pricing=pricing)
+        record = _accepted_record(request, served, episode_facts, pricing=pricing,
+                                  prompt_tokens=prompt_tokens)
         submission_id = record["submission_id"]
         written = False
         for attempt in range(RECORD_WRITE_ATTEMPTS):
@@ -1946,6 +1972,7 @@ def build_corpus_router(
                 out_of_range_detail(job, request.prompt_index),
             )
         episode_facts: IntakeFacts | None = None
+        prompt_tokens: int | None = None
         if job.episode is None and request.trajectory is not None:
             return _refuse(CorpusRejectReason.MALFORMED_SUBMISSION,
                            {"trajectory": "this job takes completions, not a trajectory"})
@@ -2027,6 +2054,7 @@ def build_corpus_router(
                 )
                 if not text.ok:
                     return _refuse(CorpusRejectReason(text.reason), text.detail)
+            prompt_tokens = await count_prompt_tokens(tokenizer, request.rendered_prompt)
 
         # A signed-sandbox session's seen key joins the turn's digests: recorded in the
         # same compare-and-swap that consumes the slot (admit refuses it when seen).
@@ -2073,7 +2101,8 @@ def build_corpus_router(
             standing = await _from_store(records.read_submission(job_id, sid), "accepted record read")
             # Freeze arrival only after the read. No await may let the feed's
             # coverage advance between this timestamp and its pending fence.
-            record = _accepted_record(request, job_id, episode_facts, pricing=pricing)
+            record = _accepted_record(request, job_id, episode_facts, pricing=pricing,
+                                      prompt_tokens=prompt_tokens)
             if standing is not None:
                 # A response can be lost after publication. The identical signed
                 # request retrieves its acceptance without consuming another slot.
@@ -2150,7 +2179,7 @@ def build_corpus_router(
                 if record is not None:
                     await recover_records(job)
                 else:
-                    await _record_accepted(request, job_id, episode_facts, pricing)
+                    await _record_accepted(request, job_id, episode_facts, pricing, prompt_tokens)
                 timing["record_write"] = time.perf_counter() - mark
             finally:
                 # Whatever the record step does: the ledger's verdict decides.

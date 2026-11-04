@@ -20,13 +20,27 @@ SETTLE_FULL_LIST_SECONDS = float(os.environ.get("RELIQUARY_CORPUS_SETTLE_FULL_LI
 VERDICT_READ_CONCURRENCY = 16
 
 
-def rewards_for(verdicts: Iterable[Mapping], cap: float) -> dict[str, float]:
+def rewards_for(verdicts: Iterable[Mapping], cap: float, *, price: float | None = None,
+                input_price: float | None = None) -> dict[str, float]:
     """What each hotkey earns of ``cap`` (the period's pool): its share of the passed tokens, or, on a job priced
     by auction (verdicts carrying ``lease_price``), its tokens at their lease's price less the debt they carried,
-    scaled down only if that passes the pool (the rest burns)."""
+    scaled down only if that passes the pool (the rest burns). With an ``input_price`` (and the output ``price``),
+    the share is of the passed work's value: output tokens x price + prompt tokens x input_price."""
     verdicts = list(verdicts)
     if any(v.get("lease_price") is not None for v in verdicts if v.get("passed")):
         return _priced_rewards(verdicts, cap)
+    if input_price is not None and price is not None:
+        from reliquary.validator.corpus_periods import work_value
+
+        values: dict[str, float] = {}
+        for verdict in verdicts:
+            if verdict.get("passed"):
+                values[verdict["hotkey"]] = (values.get(verdict["hotkey"], 0.0)
+                                             + work_value(verdict, price, input_price))
+        whole = sum(values.values())
+        if whole <= 0:
+            return {}
+        return {hotkey: cap * value / whole for hotkey, value in values.items()}
     tokens: dict[str, int] = {}
     for verdict in verdicts:
         if verdict.get("passed"):

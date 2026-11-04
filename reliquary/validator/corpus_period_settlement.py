@@ -4,7 +4,9 @@ Pays each closed period of work its own cap, or less under a price ceiling
 (min(cap, price x its verified tokens), the rest burns), split by the verified
 tokens of submissions received in it, in one archive per period that enters the weights
 the first period after it is written with room for it (``cp.entry_for``). No RL
-window is read: the clock is drand time.
+window is read: the clock is drand time. With an input price too, a period pays
+min(cap, its value), split by value: output tokens x price + prompt tokens x
+input price.
 
 Settlement stays two-phase (the pending archive is recorded in the settlement
 state before it is written), so a crash can delay a payment, never repeat it.
@@ -75,10 +77,12 @@ class CorpusPeriodSettler:
                  slack_seconds: float = ADMISSION_SLACK_SECONDS, on_settled=None,
                  full_list_every_seconds: float | None = None, executor=None,
                  ready: Callable[[list[str]], Awaitable[set[str]]] | None = None,
-                 max_price: float | None = None) -> None:
+                 max_price: float | None = None, max_input_price: float | None = None) -> None:
         self._ready = ready
         # Pool share one verified token may pay at most; None: the cap alone.
         self._max_price = None if max_price is None else float(max_price)
+        # Pool share one prompt token may pay, beside it; None: prompts unpaid.
+        self._max_input_price = None if max_input_price is None else float(max_input_price)
         self._task_id = task_id
         self._job_id = job_id
         self._cap = float(cap)
@@ -117,6 +121,9 @@ class CorpusPeriodSettler:
 
     def set_max_price(self, price: float | None) -> None:
         self._max_price = None if price is None else float(price)
+
+    def set_max_input_price(self, price: float | None) -> None:
+        self._max_input_price = None if price is None else float(price)
 
     def undecided_since(self) -> dict:
         """When the oldest submission still undecided was received: what holds
@@ -225,6 +232,9 @@ class CorpusPeriodSettler:
             # Audit only: the weight setter pays the rewards as written.
             document["max_price_per_token"] = pending["max_price"]
             document["budget"] = pending["budget"]
+        if pending.get("input_price") is not None:
+            document["max_price_input_per_token"] = pending["input_price"]
+            document["input_tokens"] = pending["input_tokens"]
         return document
 
     async def _entry(self, work: int, due: int) -> int:
@@ -256,6 +266,10 @@ class CorpusPeriodSettler:
                          str(pending["work_period"]): pending["period_tokens"]}
         final = {**state, "settled": await self._off(_union, state.get("settled"), pending["ids"]),
                  "pending": None, "totals": pending["totals"], "period_tokens": period_tokens}
+        if "period_value" in pending:
+            # Input-priced: the period's budget is on its value, not its tokens.
+            final["period_value"] = {**(state.get("period_value") or {}),
+                                     str(pending["work_period"]): pending["period_value"]}
         if "period_paid" in pending:
             # A pending recorded by an older binary has none: left unknown.
             final["period_paid"] = {**(state.get("period_paid") or {}),
@@ -353,12 +367,28 @@ class CorpusPeriodSettler:
             # it paid then.
             already = float(paid_before) if paid_before is not None else (
                 self._cap if earlier else 0.0)
+            # Prompt tokens are priced only beside an output price, never on an auction job.
+            input_price = (None if self._max_price is None or any(
+                v.get("lease_price") is not None for v in batch if v.get("passed"))
+                else self._max_input_price)
             if self._max_price is None:
                 pool = self._cap * new_tokens / (earlier + new_tokens)
-            else:
+            elif input_price is None:
                 # The whole period never pays past min(cap, price x its tokens),
                 # whatever was paid for it earlier.
                 budget = cp.period_budget(self._cap, self._max_price, earlier + new_tokens)
+                pool = max(0.0, budget - already)
+            else:
+                # The same, on the period's value: output tokens x price + prompt
+                # tokens x input price. An earlier pass that kept no value is
+                # taken at its output tokens alone.
+                passed = [v for v in batch if v.get("passed")]
+                new_value = sum(cp.work_value(v, self._max_price, input_price) for v in passed)
+                input_tokens = sum(int(v.get("prompt_token_count") or 0) for v in passed)
+                earlier_value = (state.get("period_value") or {}).get(str(period))
+                earlier_value = (float(earlier_value) if earlier_value is not None
+                                 else self._max_price * earlier)
+                budget = min(self._cap, earlier_value + new_value)
                 pool = max(0.0, budget - already)
             if pool <= 0:
                 logger.error("corpus task %s: period %d already paid its budget; %d late "
@@ -369,7 +399,7 @@ class CorpusPeriodSettler:
                 self._report(state, ids)
                 self.open_periods.pop(str(period), None)
                 continue
-            share = rewards_for(batch, pool)
+            share = rewards_for(batch, pool, price=self._max_price, input_price=input_price)
             # A job priced by auction pays what its leases' prices add up to, under the pool; the rest burns.
             paid = (sum(share.values()) if any(v.get("lease_price") is not None for v in batch if v.get("passed"))
                     else pool)
@@ -385,6 +415,9 @@ class CorpusPeriodSettler:
                 "period_paid": already + paid}}
             if self._max_price is not None:
                 state["pending"].update(max_price=self._max_price, budget=budget)
+            if input_price is not None:
+                state["pending"].update(input_price=input_price, input_tokens=input_tokens,
+                                        period_value=earlier_value + new_value)
             etag = await self._records.write_settlement(self._job_id, state, etag)
             last = await self._finish(state, etag)
             self.open_periods.pop(str(period), None)
@@ -408,6 +441,9 @@ def apply_max_price(wiring, entry) -> None:
     setter = getattr(wiring.settler, "set_max_price", None)
     if setter is not None:
         setter(cp.max_price(entry.params))
+    input_setter = getattr(wiring.settler, "set_max_input_price", None)
+    if input_setter is not None:
+        input_setter(cp.max_input_price(entry.params))
 
 
 __all__ = [

@@ -199,7 +199,8 @@ class CorpusAuditor:
         # first, so a record waiting out its hold is not re-judged every minute.
         # A heap entry whose time is not `_due[id]` is stale and skipped.
         self._due: dict[str, float] = {}
-        # A job priced by auction: each record's lease terms (``lease_price``, ``lease_debit``), copied to its verdict.
+        # A job priced by auction: each record's lease terms (``lease_price``, ``lease_debit``), copied to its verdict,
+        # with its ``prompt_token_count`` when the record holds one.
         self._lease_terms: dict[str, dict[str, float]] = {}
         self._heap: list[tuple[float, float, str]] = []
         self._wake: asyncio.Event | None = None
@@ -651,6 +652,9 @@ class CorpusAuditor:
         received_at = float(received) if received is not None else self._clock()
         self._meta[submission_id] = (meta["hotkey"], received_at, int(meta["token_count"]))
         terms = {k: float(meta[k]) for k in ("lease_price", "lease_debit") if meta.get(k) is not None}
+        if meta.get("prompt_token_count") is not None:
+            # What an input-priced ceiling pays its prompt for (absent: unknown, unpaid).
+            terms["prompt_token_count"] = int(meta["prompt_token_count"])
         if terms:
             self._lease_terms[submission_id] = terms
         bisect.insort(self._arrivals.setdefault(meta["hotkey"], []), received_at)
@@ -827,7 +831,7 @@ class CorpusAuditor:
             # The work's own time: a period-settled task pays it in the period
             # it was submitted in, not the one its verdict landed in.
             verdict["received_at"] = float(self._meta[submission_id][1])
-        # Paid at its lease's price, less the debt it carried (``corpus.token_auction``).
+        # Paid at its lease's price, less the debt it carried (``corpus.token_auction``); its prompt length.
         verdict.update(self._lease_terms.get(submission_id, {}))
         if draw is not None:
             verdict["draw"] = draw

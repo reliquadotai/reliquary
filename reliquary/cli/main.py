@@ -897,6 +897,12 @@ def tasks_set_cap(
         help="Period corpus task: the most a period pays per million verified tokens, in "
              "alpha; a period pays min(cap, price x tokens), the rest burns",
     ),
+    max_price_input_alpha_per_mtoken: float = typer.Option(
+        None, "--max-price-input-alpha-per-mtoken",
+        help="With --max-price-alpha-per-mtoken (then the output price): the most a period "
+             "pays per million prompt tokens, in alpha; a period pays min(cap, output tokens "
+             "x price + prompt tokens x this)",
+    ),
     miner_emission_alpha_per_day: float = typer.Option(
         None, "--miner-emission-alpha-per-day",
         help="Miner alpha emitted per day, to convert the price to a pool share; "
@@ -958,6 +964,10 @@ def tasks_set_cap(
     if clear_max_price and max_price_alpha_per_mtoken is not None:
         typer.echo("error: --clear-max-price and --max-price-alpha-per-mtoken conflict", err=True)
         raise typer.Exit(code=1)
+    if max_price_input_alpha_per_mtoken is not None and max_price_alpha_per_mtoken is None:
+        typer.echo("error: --max-price-input-alpha-per-mtoken needs --max-price-alpha-per-mtoken",
+                   err=True)
+        raise typer.Exit(code=1)
     if miner_emission_alpha_per_day is not None and max_price_alpha_per_mtoken is None:
         typer.echo("error: --miner-emission-alpha-per-day converts --max-price-alpha-per-mtoken",
                    err=True)
@@ -967,7 +977,8 @@ def tasks_set_cap(
     elif max_price_alpha_per_mtoken is not None:
         try:
             token_price, source = _token_price(max_price_alpha_per_mtoken,
-                                               miner_emission_alpha_per_day)
+                                               miner_emission_alpha_per_day,
+                                               input_alpha_per_mtoken=max_price_input_alpha_per_mtoken)
         except ValueError as exc:
             typer.echo(f"error: {exc}", err=True)
             raise typer.Exit(code=1) from exc
@@ -1023,7 +1034,8 @@ def tasks_set_cap(
                    + "; serving validators apply it when they wire the job")
 
 
-def _token_price(alpha_per_mtoken: float, miner_alpha_per_day: float | None):
+def _token_price(alpha_per_mtoken: float, miner_alpha_per_day: float | None, *,
+                 input_alpha_per_mtoken: float | None = None):
     """The registry params of a price ceiling, and where the miner emission
     that converts it came from (the flag, or the chain now)."""
     import time
@@ -1039,7 +1051,8 @@ def _token_price(alpha_per_mtoken: float, miner_alpha_per_day: float | None):
         emission = read["miner_alpha_per_block"] * blocks
         source = (f"on-chain netuid {read['netuid']}: alpha out {read['alpha_out_per_block']:.6f}"
                   f"/block, owner cut {read['owner_cut']:.4f}")
-    return cp.price_params(alpha_per_mtoken, emission, time.time()), source
+    return cp.price_params(alpha_per_mtoken, emission, time.time(),
+                           input_alpha_per_mtoken=input_alpha_per_mtoken), source
 
 
 async def _read_miner_emission() -> dict:
@@ -1057,8 +1070,10 @@ def _describe_token_price(task_id: str, params, source: str) -> str:
 
     price = params[cp.MAX_PRICE_PARAM]
     emission = params[cp.MAX_PRICE_EMISSION_PARAM]
+    inputs = (f" and {params[cp.MAX_PRICE_INPUT_ALPHA_PARAM]} alpha per million prompt tokens"
+              if cp.MAX_PRICE_INPUT_ALPHA_PARAM in params else "")
     return (f"task {task_id} max price {params[cp.MAX_PRICE_ALPHA_PARAM]} alpha per million "
-            f"verified tokens = {price:.6g} pool share per token "
+            f"verified tokens{inputs} = {price:.6g} pool share per token "
             f"({emission:.4f} miner alpha per {cp.PERIOD_SECONDS} s period; {source}); "
             f"a period pays its whole cap from {0.01 / price / 1e6:.4g} M verified "
             f"tokens per 0.01 of cap")

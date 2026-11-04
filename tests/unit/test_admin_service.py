@@ -929,3 +929,10 @@ def test_a_delivery_dedupes_against_a_known_job_in_scope(admin):
         response = admin("POST", path, {"delivery_id": "order-dedupe", **body})
         assert response.status_code in (409, 422) and detail in response.json()["detail"]
     assert not (admin.platform / "deliveries" / "order-dedupe").exists()
+
+
+def test_a_token_ceiling_is_refused_on_a_job_that_is_not_an_order(admin):
+    refused = admin("POST", "/admin/v1/jobs",
+                    _job(max_price_usd_per_mtoken={"input": 0.5, "output": 2.0}))
+    assert refused.status_code == 422 and "max_price_usd_per_mtoken" in refused.text
+    assert "math-a" not in admin.registry["entries"]

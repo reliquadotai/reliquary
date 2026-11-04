@@ -65,6 +65,13 @@ TAIL_CAP_PARAM = "tail_cap"
 MAX_PRICE_PARAM = "max_price_per_token"
 MAX_PRICE_PARAMS = (MAX_PRICE_PARAM, "max_price_alpha_per_mtoken",
                     "max_price_miner_alpha_per_period", "max_price_set_at")
+# Optional with the ceiling: the price of one prompt token, in pool share and
+# the alpha it came from (the ceiling above then prices output tokens only).
+MAX_PRICE_INPUT_PARAMS = ("max_price_input_per_token", "max_price_input_alpha_per_mtoken")
+# Optional with the ceiling, audit only: the USD prices it was given in and the
+# USD per alpha and per TAO used to convert them.
+MAX_PRICE_USD_PARAMS = ("max_price_usd_per_mtoken_input", "max_price_usd_per_mtoken_output",
+                        "max_price_alpha_usd", "max_price_tao_usd")
 # Omitted from ``set_cap``: the price ceiling is kept as it is.
 KEEP = object()
 # An async RL task's starting budget (``validator.rl_async_service``): what its
@@ -148,6 +155,10 @@ def _validate_incentive_floor(params: Mapping[str, Any]) -> None:
 def _validate_token_price(entry: TaskEntry) -> None:
     declared = [f for f in MAX_PRICE_PARAMS if f in entry.params]
     if not declared:
+        extra = [f for f in MAX_PRICE_INPUT_PARAMS + MAX_PRICE_USD_PARAMS if f in entry.params]
+        if extra:
+            raise RegistryError(f"task {entry.task_id!r}: {', '.join(extra)} need the "
+                                "output price ceiling")
         return
     if len(declared) != len(MAX_PRICE_PARAMS):
         missing = sorted(set(MAX_PRICE_PARAMS) - set(declared))
@@ -163,6 +174,35 @@ def _validate_token_price(entry: TaskEntry) -> None:
     if not math.isclose(price, alpha / 1e6 / emission, rel_tol=1e-9):
         raise RegistryError(f"task {entry.task_id!r} price {price} is not {alpha} alpha per "
                             f"million tokens at {emission} miner alpha per period")
+    inputs = [f for f in MAX_PRICE_INPUT_PARAMS if f in entry.params]
+    if inputs:
+        if len(inputs) != len(MAX_PRICE_INPUT_PARAMS):
+            raise RegistryError(f"task {entry.task_id!r} input price misses "
+                                f"{', '.join(sorted(set(MAX_PRICE_INPUT_PARAMS) - set(inputs)))}")
+        in_price, in_alpha = (_number(entry.params[f], f) for f in MAX_PRICE_INPUT_PARAMS)
+        if in_price <= 0 or in_alpha <= 0:
+            raise RegistryError(f"task {entry.task_id!r} input price must be positive; "
+                                "remove it to price output tokens alone")
+        if not math.isclose(in_price, in_alpha / 1e6 / emission, rel_tol=1e-9):
+            raise RegistryError(f"task {entry.task_id!r} input price {in_price} is not {in_alpha} "
+                                f"alpha per million tokens at {emission} miner alpha per period")
+    usd = [f for f in MAX_PRICE_USD_PARAMS if f in entry.params]
+    if usd:
+        if len(usd) != len(MAX_PRICE_USD_PARAMS):
+            raise RegistryError(f"task {entry.task_id!r} USD price misses "
+                                f"{', '.join(sorted(set(MAX_PRICE_USD_PARAMS) - set(usd)))}")
+        usd_in, usd_out, alpha_usd, tao_usd = (_number(entry.params[f], f)
+                                               for f in MAX_PRICE_USD_PARAMS)
+        if usd_in < 0 or usd_out <= 0 or alpha_usd <= 0 or tao_usd <= 0:
+            raise RegistryError(f"task {entry.task_id!r} USD prices and rates must be positive")
+        if not math.isclose(alpha, usd_out / alpha_usd, rel_tol=1e-9):
+            raise RegistryError(f"task {entry.task_id!r} output price {alpha} alpha is not "
+                                f"{usd_out} USD at {alpha_usd} USD per alpha")
+        if usd_in > 0 and not (inputs and math.isclose(in_alpha, usd_in / alpha_usd, rel_tol=1e-9)):
+            raise RegistryError(f"task {entry.task_id!r} input price is not {usd_in} USD "
+                                f"at {alpha_usd} USD per alpha")
+        if usd_in == 0 and inputs:
+            raise RegistryError(f"task {entry.task_id!r} prices input tokens at 0 USD")
 
 
 def _validate_pricing(entry: TaskEntry) -> None:
@@ -529,10 +569,12 @@ def set_cap(
     if audit_ban_seconds is not None:
         params["audit_ban_seconds"] = float(audit_ban_seconds)
     if token_price is not KEEP:
-        for field in MAX_PRICE_PARAMS:
+        optional = MAX_PRICE_INPUT_PARAMS + MAX_PRICE_USD_PARAMS
+        for field in MAX_PRICE_PARAMS + optional:
             params.pop(field, None)
         if token_price is not None:
             params.update({f: float(token_price[f]) for f in MAX_PRICE_PARAMS})
+            params.update({f: float(token_price[f]) for f in optional if f in token_price})
     if pricing is not KEEP:
         from reliquary.corpus.token_auction import AUCTION_PARAMS
 
