@@ -248,7 +248,10 @@ class SandboxServices:
 def build_sandbox_services(config: SandboxValidatorConfig, *, validator_hotkey: str,
                            store_kwargs=None, session_store=None, read_documents=None,
                            fetch_report=None, registration=None,
-                           clock: Callable[[], float] = time.time) -> SandboxServices:
+                           clock: Callable[[], float] = time.time,
+                           route_prefix: str = "/corpus") -> SandboxServices:
+    """``route_prefix``: where the session routes mount; the order control passes
+    ``protocol.sandbox_session.JOB_SCOPED_PREFIX``."""
     from reliquary_sandbox.attest import Ed25519TokenVerifier, Signer, load_private_key
 
     from reliquary.infrastructure import sandbox_store
@@ -308,7 +311,7 @@ def build_sandbox_services(config: SandboxValidatorConfig, *, validator_hotkey: 
         policy=policy, clock=clock, quota=quota)
     fleet.on_drained = issuer.void_machine
     router = build_sandbox_sessions_router(
-        issuer, policy=policy, validator_hotkey=validator_hotkey, prefix="/corpus",
+        issuer, policy=policy, validator_hotkey=validator_hotkey, prefix=route_prefix,
         registration=registration, clock=clock,
         max_concurrent_closes=config.close_concurrency,
         close_body_timeout_s=config.close_body_timeout_s,
