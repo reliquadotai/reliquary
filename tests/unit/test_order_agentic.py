@@ -301,6 +301,7 @@ def test_an_episode_order_is_wired_and_never_paid_before_its_grade(admin, swe_se
 
 
 def test_the_order_control_reads_only_its_own_sandbox_key(tmp_path):
+    pytest.importorskip("reliquary_sandbox")
     from reliquary.infrastructure.sandbox_store import ORDER_SESSION_PREFIX
     from reliquary.validator.eval_control import order_sandbox_services
 
@@ -334,6 +335,7 @@ def test_the_order_control_reads_only_its_own_sandbox_key(tmp_path):
 
 
 def test_a_sandbox_that_fails_to_start_refuses_episode_orders_only():
+    pytest.importorskip("reliquary_sandbox")
     from reliquary.validator.eval_control import order_sandbox_services
 
     class Broken:
