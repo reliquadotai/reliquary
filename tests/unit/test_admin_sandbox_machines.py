@@ -98,6 +98,7 @@ def test_a_short_prefix_is_refused():
 
 
 def test_the_order_control_reads_its_prefix_scope():
+    pytest.importorskip("reliquary_sandbox")
     from reliquary.validator.sandbox_wiring import _machine_prefixes
 
     assert _machine_prefixes({}) is None
