@@ -1135,14 +1135,29 @@ def load_cpu_tokenizer(repo: str, revision: str):
     return _cpu_tokenizer(directory, repo, revision), int(vocab)
 
 
+def _declared_stops(directory: str) -> list[int]:
+    """The stop tokens the model's own ``generation_config.json`` declares (none when it has no such file)."""
+    import json
+    from pathlib import Path
+
+    try:
+        value = json.loads((Path(directory) / "generation_config.json").read_text()).get("eos_token_id")
+    except (OSError, ValueError, AttributeError):
+        return []
+    values = value if isinstance(value, list) else [value]
+    return [int(v) for v in values if isinstance(v, int) and not isinstance(v, bool)]
+
+
 def model_facts(repo: str, revision: str) -> dict:
-    """The model's architecture and eos, read here from its own files (CPU):
+    """The model's architecture and eos (``turn_end_token_id``), read here from its own files (CPU):
     never taken from an executor. ValueError: the model can never be served
     (no config, no tokenizer, not public); any other error is transient."""
+    from reliquary.shared.modeling import turn_end_token_id
+
     directory = _model_files(repo, revision)
     config = _model_config(directory, repo, revision)
     architectures = config.get("architectures") or []
-    eos = _cpu_tokenizer(directory, repo, revision).eos_token_id
+    eos = turn_end_token_id(_cpu_tokenizer(directory, repo, revision), _declared_stops(directory))
     if not architectures or eos is None:
         raise ValueError(f"{repo}@{revision} names no architecture or eos")
     return {"architecture": str(architectures[0]), "eos_token_id": int(eos)}

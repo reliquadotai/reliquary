@@ -161,3 +161,103 @@ def test_a_text_only_load_of_a_text_checkpoint_is_the_usual_load(monkeypatch):
                         classmethod(lambda cls, *a, **k: types.SimpleNamespace()))
     monkeypatch.setattr(modeling, "load_text_generation_model", lambda source, **k: ("usual", source))
     assert modeling.load_text_only_model("/ckpt") == ("usual", "/ckpt")
+
+
+def test_gemma4_text_only_load_maps_language_model_weights(monkeypatch):
+    """Gemma 4 keeps its text weights under model.language_model: without the mapping its causal LM would load
+    nothing and keep random weights (every forced-draw sample refused, 2026-11-05). Its 512-wide global heads
+    cannot run on FlashAttention 2, so the load takes sdpa."""
+    import types
+
+    import transformers
+
+    from reliquary.shared import modeling
+
+    text_config = types.SimpleNamespace(head_dim=256, global_head_dim=512, hidden_size=5376,
+                                        num_attention_heads=32, final_logit_softcapping=30.0)
+    composite = types.SimpleNamespace(model_type="gemma4", text_config=text_config)
+    calls = {}
+    head = types.SimpleNamespace()
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained",
+                        classmethod(lambda cls, *a, **k: composite))
+
+    def load(cls, source, **k):
+        calls["kw"] = k
+        return types.SimpleNamespace(config=k["config"], lm_head=head)
+
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", classmethod(load))
+    modeling.load_text_only_model("/ckpt", torch_dtype="bf16", attn_implementation="flash_attention_2")
+    kwargs = calls["kw"]
+    assert kwargs["key_mapping"] == {r"^model\.language_model\.": "model."}
+    assert kwargs["attn_implementation"] == "sdpa"
+    assert getattr(head, modeling.LOGIT_SOFTCAP_ATTR) == 30.0
+
+
+def test_a_qwen_text_only_load_keeps_its_weights_names_and_attention(monkeypatch):
+    import types
+
+    import transformers
+
+    from reliquary.shared import modeling
+
+    text_config = types.SimpleNamespace(head_dim=256, hidden_size=5120, num_attention_heads=24)
+    composite = types.SimpleNamespace(model_type="qwen3_5", text_config=text_config)
+    calls = {}
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained",
+                        classmethod(lambda cls, *a, **k: composite))
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained",
+                        classmethod(lambda cls, source, **k: calls.setdefault("kw", k)))
+    modeling.load_text_only_model("/ckpt", attn_implementation="flash_attention_2")
+    assert "key_mapping" not in calls["kw"] and calls["kw"]["attn_implementation"] == "flash_attention_2"
+
+
+def test_a_softcapped_head_is_capped_by_the_verifier():
+    import torch
+
+    from reliquary.shared.modeling import LOGIT_SOFTCAP_ATTR
+    from reliquary.validator.verifier import _LazyLogitRows
+
+    head = torch.nn.Linear(4, 3, bias=False)
+    with torch.no_grad():
+        head.weight.copy_(torch.tensor([[40.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, -50.0, 0]]))
+    hidden = torch.ones(2, 4)
+    plain = _LazyLogitRows(hidden, head, 3, fp32_head=False)[0:2]
+    assert plain[0].tolist() == [40.0, 1.0, -50.0]
+    setattr(head, LOGIT_SOFTCAP_ATTR, 30.0)
+    capped = _LazyLogitRows(hidden, head, 3, fp32_head=False)[0:2]
+    assert torch.allclose(capped[0], 30.0 * torch.tanh(torch.tensor([40.0, 1.0, -50.0]) / 30.0))
+
+
+class _ChatTokenizer:
+    """A tokenizer whose template closes an assistant turn with ``closer``; ids by a fixed table."""
+
+    def __init__(self, eos_token_id, closer, special):
+        self.eos_token_id, self._closer = eos_token_id, closer
+        self.chat_template = "x"
+        self.all_special_ids = list(special.values())
+        self._special = special
+
+    def apply_chat_template(self, messages, tokenize=False):
+        return "".join(f"<{m['role']}>{m['content']}{self._closer}\n" for m in messages)
+
+    def encode(self, text, add_special_tokens=False):
+        for token, i in self._special.items():
+            if text.startswith(token):
+                return [i] + [9] * len(text[len(token):])
+        return [9] * len(text)
+
+
+def test_turn_end_token_prefers_a_declared_turn_terminator():
+    from reliquary.shared.modeling import turn_end_token_id
+
+    gemma = _ChatTokenizer(1, "<turn|>", {"<eos>": 1, "<turn|>": 106})
+    assert turn_end_token_id(gemma, [1, 106, 50]) == 106
+    # The model does not declare it a stop: the tokenizer's eos stands.
+    assert turn_end_token_id(gemma, [1]) == 1
+    assert turn_end_token_id(gemma, []) == 1
+    # Qwen instruct: the turn closer is already the eos.
+    qwen = _ChatTokenizer(151645, "<|im_end|>", {"<|im_end|>": 151645, "<|endoftext|>": 151643})
+    assert turn_end_token_id(qwen, [151645, 151643]) == 151645
+    # Qwen base: generation_config declares only <|endoftext|>, so the eos stays.
+    base = _ChatTokenizer(151643, "<|im_end|>", {"<|im_end|>": 151645, "<|endoftext|>": 151643})
+    assert turn_end_token_id(base, [151643]) == 151643

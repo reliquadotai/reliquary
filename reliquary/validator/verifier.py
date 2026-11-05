@@ -20,7 +20,7 @@ from reliquary.constants import (
     MIN_EOS_PROBABILITY,
     T_PROTO,
 )
-from reliquary.shared.modeling import resolve_eos_token_ids
+from reliquary.shared.modeling import LOGIT_SOFTCAP_ATTR, resolve_eos_token_ids
 from reliquary.environment.registry import get_environment_spec
 
 logger = logging.getLogger(__name__)
@@ -536,8 +536,10 @@ class _LazyLogitRows:
         # retain exactly the memory this class exists to free.
         with torch.no_grad():
             if self._fp32_head:
-                return _fp32_head_logits(rows, self._lm_head)
-            return self._lm_head(rows)
+                logits = _fp32_head_logits(rows, self._lm_head)
+            else:
+                logits = self._lm_head(rows)
+            return apply_logit_softcap(logits, self._lm_head)
 
 
     def index_select(self, dim: int, index: torch.Tensor) -> torch.Tensor:
@@ -606,6 +608,15 @@ def fp32_head_matmul(rows: torch.Tensor, weight: torch.Tensor, *,
             return rows.float() @ rhs.T
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous
+
+
+def apply_logit_softcap(logits: torch.Tensor, lm_head: Any) -> torch.Tensor:
+    """``cap * tanh(logits / cap)`` when the model caps its final logits (Gemma: ``final_logit_softcapping``,
+    marked on the head by ``shared.modeling``), as its own forward and vLLM do before any sampling; else as is."""
+    cap = getattr(lm_head, LOGIT_SOFTCAP_ATTR, None)
+    if not cap:
+        return logits
+    return torch.tanh(logits / cap) * cap
 
 
 def _fp32_head_logits(rows: torch.Tensor, lm_head: Any) -> torch.Tensor:
