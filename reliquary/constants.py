@@ -149,6 +149,16 @@ SUPPORTED_ARCHITECTURES: dict[str, tuple[str, ...]] = {
         "tests/unit/test_modeling_helpers.py::test_qwen35_text_config_uses_causal_lm_auto_class",
         "docs/runbooks/corpus-task-launch.md::(`teutonic-i-graft-sft-cot-v2@d5256c5`) against Qwen3.5-4B",
     ),
+    # Gemma 4 (google/gemma-4-31b-it), served text-only like Qwen3.5's conditional class: its text weights load
+    # under model.language_model (shared.modeling key mapping), its final logits are softcapped (the verifier
+    # applies the cap), its 512-wide global heads take sdpa, and its turns end on <turn|> (turn_end_token_id).
+    # 2026-11-05 H200 parity, the miner's VllmGenerator (vLLM 0.30) against the audit executor's scorer
+    # (torch 2.7): 32/32 forced-draw samples passed, 99.85 % median match, max gap 1.30 (4/32 without the cap).
+    "Gemma4ForConditionalGeneration": (
+        "tests/unit/test_modeling_helpers.py::test_gemma4_text_only_load_maps_language_model_weights",
+        "tests/unit/test_modeling_helpers.py::test_a_softcapped_head_is_capped_by_the_verifier",
+        "tests/unit/test_modeling_helpers.py::test_turn_end_token_prefers_a_declared_turn_terminator",
+    ),
 }
 SUPPORTED_MODEL_ARCHITECTURES = frozenset(SUPPORTED_ARCHITECTURES)
 

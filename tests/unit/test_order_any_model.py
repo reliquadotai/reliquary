@@ -93,7 +93,8 @@ def test_every_supported_architecture_names_evidence_that_exists():
     root = Path(__file__).resolve().parents[2]
     assert set(SUPPORTED_ARCHITECTURES) == {"Qwen3ForCausalLM",
                                             "Qwen3_5ForConditionalGeneration",
-                                            "Qwen3_5ForCausalLM"}
+                                            "Qwen3_5ForCausalLM",
+                                            "Gemma4ForConditionalGeneration"}
     # One table: the startup check reads the same names.
     assert SUPPORTED_MODEL_ARCHITECTURES == frozenset(SUPPORTED_ARCHITECTURES)
     for architecture, evidence in SUPPORTED_ARCHITECTURES.items():

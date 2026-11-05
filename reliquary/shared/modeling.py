@@ -48,6 +48,45 @@ def _config_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in kwargs.items() if k in allowed}
 
 
+# The attribute that carries a model's final-logit softcap on its LM head, for the readers that project hidden
+# states through the head themselves (``validator.verifier``): the model's own forward applies it after the head.
+LOGIT_SOFTCAP_ATTR = "reliquary_logit_softcap"
+
+
+# Multimodal checkpoints whose text weights the text-only causal LM must be told where to find.
+TEXT_WEIGHTS_UNDER_LANGUAGE_MODEL = frozenset({"gemma4"})
+
+
+FLASH_ATTN_MAX_HEAD_DIM = 256
+
+
+def max_head_dim(config: Any) -> int:
+    """The widest attention head a text config declares (Gemma 4 has a wider one on its global layers)."""
+    dims = [getattr(config, name, None) for name in ("head_dim", "global_head_dim")]
+    hidden, heads = getattr(config, "hidden_size", None), getattr(config, "num_attention_heads", None)
+    if hidden and heads:
+        dims.append(hidden // heads)
+    return max((int(d) for d in dims if isinstance(d, int)), default=0)
+
+
+def logit_softcap(config: Any) -> float | None:
+    """``final_logit_softcapping`` of a config or of its text config (Gemma 2 and 4), None when it has none."""
+    for c in (config, getattr(config, "text_config", None)):
+        cap = getattr(c, "final_logit_softcapping", None) if c is not None else None
+        if cap:
+            return float(cap)
+    return None
+
+
+def mark_logit_softcap(model: Any) -> Any:
+    """Mark the model's final-logit softcap on its LM head (``LOGIT_SOFTCAP_ATTR``); the model, returned."""
+    cap = logit_softcap(getattr(model, "config", None))
+    head = getattr(model, "lm_head", None)
+    if cap is not None and head is not None:
+        setattr(head, LOGIT_SOFTCAP_ATTR, cap)
+    return model
+
+
 def _is_qwen35_conditional_config(config: Any) -> bool:
     if getattr(config, "model_type", None) != "qwen3_5":
         return False
@@ -83,7 +122,14 @@ def load_text_only_model(source: str, **kwargs):
     text_config = getattr(config, "text_config", None)
     if text_config is None:
         return load_text_generation_model(source, **kwargs)
-    return AutoModelForCausalLM.from_pretrained(source, config=text_config, **kwargs)
+    if kwargs.get("attn_implementation") == "flash_attention_2" and max_head_dim(text_config) > FLASH_ATTN_MAX_HEAD_DIM:
+        # FlashAttention 2 refuses heads over 256 (Gemma 4's global layers: 512): the kernel torch ships instead.
+        kwargs["attn_implementation"] = "sdpa"
+    if getattr(config, "model_type", None) in TEXT_WEIGHTS_UNDER_LANGUAGE_MODEL and "key_mapping" not in kwargs:
+        # Gemma 4 keeps its text weights under model.language_model.*, which its causal LM does not map itself:
+        # loaded as is, every layer would stay at its random init.
+        kwargs["key_mapping"] = {r"^model\.language_model\.": "model."}
+    return mark_logit_softcap(AutoModelForCausalLM.from_pretrained(source, config=text_config, **kwargs))
 
 
 def load_text_generation_model(source: str, **kwargs):
@@ -98,7 +144,32 @@ def load_text_generation_model(source: str, **kwargs):
         kwargs["dtype"] = kwargs.pop("torch_dtype")
     config = AutoConfig.from_pretrained(source, **_config_kwargs(kwargs))
     auto_cls = auto_model_class_for_config(config)
-    return auto_cls.from_pretrained(source, **kwargs)
+    return mark_logit_softcap(auto_cls.from_pretrained(source, **kwargs))
+
+
+def turn_end_token_id(tokenizer, declared_stops: Iterable[int] = ()) -> int | None:
+    """The token a chat-rendered completion ends on: the tokenizer's eos, unless the chat template closes an
+    assistant turn with another special token that the model's ``generation_config.json`` also declares a stop
+    (``declared_stops``). Gemma 4: eos ``<eos>`` (1), turns end on ``<turn|>`` (106) and generation_config
+    lists both; a job stopping on 1 alone would run every sample past its answer to the token cap."""
+    eos = getattr(tokenizer, "eos_token_id", None)
+    stops = {int(t) for t in declared_stops}
+    if not stops or not getattr(tokenizer, "chat_template", None):
+        return eos
+    marker = "RELIQUARY_TURN_END_PROBE"
+    try:
+        text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "x"}, {"role": "assistant", "content": marker}], tokenize=False)
+    except Exception:  # noqa: BLE001 - a template that cannot render this keeps the eos
+        return eos
+    at = text.rfind(marker) if isinstance(text, str) else -1
+    if at < 0:
+        return eos
+    tail = tokenizer.encode(text[at + len(marker):], add_special_tokens=False)
+    tail = list(getattr(tail, "ids", tail))
+    if tail and tail[0] in stops and tail[0] in set(getattr(tokenizer, "all_special_ids", ()) or ()):
+        return int(tail[0])
+    return eos
 
 
 def load_tokenizer(source: str, **kwargs):
