@@ -359,6 +359,8 @@ SESSION_PREFIX = "reliquary/sandbox/sessions/"
 RL_SESSION_PREFIX = "reliquary/sandbox/rl-sessions/"
 # The async RL validator's lease sessions (engagement ``rl_lease``): neither window mode nor the corpus restores them.
 RL_LEASE_SESSION_PREFIX = "reliquary/sandbox/rl-lease-sessions/"
+# The order control's signed episode orders, under its own key: no other validator restores them.
+ORDER_SESSION_PREFIX = "reliquary/sandbox/order-sessions/"
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _DAY = 86400
 

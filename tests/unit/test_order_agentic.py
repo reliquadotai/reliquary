@@ -159,3 +159,170 @@ def test_a_qualified_order_never_runs_an_episode(admin, swe_set, qwen35):  # noq
     entry = admin.registry["entries"]["order-eval-swe1"]
     qualified = {**declared, "schema": "reliquary/eval-job/v1", "qualification_id": "q1"}
     assert "forced-draw" in qualification_refusal(entry, job, qualified, {"qualification_id": "q1"})
+
+
+# -- the order control wires and pays a signed episode order ------------------------------------
+
+
+def _control(admin, tmp_path, monkeypatch, sandbox):  # noqa: F811
+    """The order control over the admin's bucket, its background loops idle (the test drives them)."""
+    from reliquary.environment.agentic_swe import SignedSweSource
+    from reliquary.eval.rows import RowMap
+    from reliquary.infrastructure import corpus_executor_store as executors
+    from reliquary.infrastructure import corpus_record_store as record_store
+    from reliquary.infrastructure import drand
+    from reliquary.infrastructure.corpus_job_store import BucketJobStore
+    from reliquary.infrastructure.corpus_record_store import BucketRecordStore
+    from reliquary.validator import corpus_auditor, corpus_period_settlement, corpus_grading
+    from reliquary.validator.eval_control import EvalExecutorDirectory, PairedAuditDispatcher, build_eval_control
+    from tests.unit.test_eval_control_process import _Tokenizer
+
+    async def idle(self):
+        await asyncio.sleep(3600)
+
+    for module in (record_store, executors):
+        monkeypatch.setattr(module, "get_s3_client", lambda **kw: admin.bucket)
+    monkeypatch.setattr(drand, "get_current_chain", lambda: {})
+    # The fake bucket has no ranged reads: a record's metadata is the record.
+    monkeypatch.setattr(BucketRecordStore, "read_submission_meta",
+                        lambda self, job_id, sid: self.read_submission(job_id, sid))
+    monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", idle)
+    monkeypatch.setattr(corpus_grading.CorpusGrader, "run", idle)
+    monkeypatch.setattr(corpus_period_settlement.CorpusPeriodSettler, "settle_once", idle)
+    source = SignedSweSource(RowMap.identity("eval", 0, 100), prompt_of=lambda s, i: "p",
+                             row_of=lambda s, i: (None, SimpleNamespace(instance_id=f"repo__x-{i}")))
+
+    async def read_entries():
+        return dict(admin.registry["entries"])
+
+    directory = EvalExecutorDirectory()
+    return build_eval_control(
+        store=BucketJobStore(), records=BucketRecordStore(), dispatcher=PairedAuditDispatcher(directory=directory),
+        directory=directory, verify_signature=lambda request: True,
+        tokenizer_for=lambda repo, revision: (_Tokenizer(), 100), read_entries=read_entries,
+        sandbox=sandbox, sandbox_down="its sandbox services failed to start" if sandbox is None else None,
+        model_dir_for=lambda repo, revision: str(tmp_path),
+        signed_wiring={"intake_factory": lambda job, **kw: SimpleNamespace(source=source),
+                       "resolver_factory": lambda split: SimpleNamespace(resolve=None)})
+
+
+def test_an_episode_order_is_refused_without_the_controls_sandbox(admin, swe_set, qwen35, tmp_path,  # noqa: F811
+                                                                  monkeypatch):
+    assert admin("POST", "/admin/v1/jobs", _order()).status_code == 201
+    app, job_set = _control(admin, tmp_path, monkeypatch, None)
+
+    async def go():
+        await job_set.refresh()
+        return dict(job_set.served)
+
+    assert "order-eval-swe1" not in asyncio.run(go())
+    reasons = app.state.dispatcher.attention["order-eval-swe1"]
+    assert any("sandbox services failed to start" in r for r in reasons), reasons
+
+
+def test_an_episode_order_is_wired_and_never_paid_before_its_grade(admin, swe_set, qwen35, tmp_path,  # noqa: F811
+                                                                   monkeypatch):
+    pytest.importorskip("reliquary_sandbox.attest")
+    from reliquary.infrastructure.corpus_record_store import RECORD_SCHEMA_V2, BucketRecordStore
+    from reliquary.validator import corpus_period_settlement
+    from reliquary.validator.signed_grading import SignedEpisodeGrader
+    from tests.unit.sandbox_fixtures import claims, signer, transcript
+    from tests.unit.test_corpus_period_settlement import GENESIS, Archives, at, verdict
+    from tests.unit.test_signed_grading_and_wiring import _services
+
+    from reliquary.validator import corpus_service
+
+    settle = corpus_period_settlement.CorpusPeriodSettler.settle_once
+    built, build_router = {}, corpus_service.build_corpus_router
+
+    def spy(**kwargs):
+        built[kwargs["job_id"]] = kwargs
+        return build_router(**kwargs)
+
+    monkeypatch.setattr(corpus_service, "build_corpus_router", spy)
+    assert admin("POST", "/admin/v1/jobs", _order()).status_code == 201
+    _, services = _services(tmp_path)
+    app, job_set = _control(admin, tmp_path, monkeypatch, services)
+    job_id, sid = "order-eval-swe1", "a" * 64
+
+    async def go():
+        await job_set.refresh()
+        assert job_id in job_set.served
+        w = app.state.eval_served[job_id]
+        assert isinstance(w.grader, SignedEpisodeGrader) and services.jobs[job_id] is w.sandbox_view
+        assert built[job_id]["episode_intake"] is w.episode_intake
+        import httpx
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://o") as client:
+            # The session route is mounted (an unsigned open is refused, never 404).
+            opened = await client.post("/corpus/sandbox/sessions", json={})
+            assert opened.status_code not in (404, 405), opened.text
+        # One passing, audited episode received in period 3; it is paid only once graded.
+        records = BucketRecordStore()
+        signed = transcript(signer(tmp_path, "v", "v1"), signer(tmp_path, "m", "k1"), claims(), reward=1.0)
+        await records.write_submission(job_id, sid, {
+            "schema": RECORD_SCHEMA_V2, "hotkey": "5Hot", "prompt_index": 0, "received_at": at(3),
+            "completions": [{"transcript": signed}]})
+        await records.write_verdict(job_id, sid, verdict(sid, "5Hot", 10, at(3)))
+        w.settler._genesis, w.settler._clock, w.settler._archives = (lambda: GENESIS), (lambda: at(6)), Archives()
+        w.auditor.oldest_pending_received_at = lambda: None   # audited: only its grade is missing
+        w.grader._enqueue = lambda submission_id: None        # listed, not graded yet
+        await w.grader.rescan_once()
+        unpaid = await settle(w.settler)
+        assert w.settler._archives.docs == {}
+        assert await w.grader.grade_one(sid) is not None
+        paid = await settle(w.settler)
+        for tasks in job_set._tasks.values():
+            for task in tasks:
+                task.cancel()
+        return unpaid, paid, w.settler._archives.docs
+
+    unpaid, paid, docs = asyncio.run(go())
+    assert unpaid is None and paid == 3
+    assert docs[(3, 7)]["rewards_by_hotkey"] == {"5Hot": pytest.approx(0.02)}
+
+
+def test_the_order_control_reads_only_its_own_sandbox_key(tmp_path):
+    from reliquary.infrastructure.sandbox_store import ORDER_SESSION_PREFIX
+    from reliquary.validator.eval_control import order_sandbox_services
+
+    built = []
+
+    class Services:
+        async def start(self):
+            return None
+
+    def build(config, **kwargs):
+        built.append((config, kwargs))
+        return Services()
+
+    corpus_key = {"RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE": "/corpus.pem", "RELIQUARY_SANDBOX_VALIDATOR_KEY_ID": "v1",
+                  "RELIQUARY_SANDBOX_VALIDATOR_HOTKEY": "5Corpus"}
+    # The corpus validator's key is never this control's: without its own, no sandbox.
+    assert asyncio.run(order_sandbox_services(environ=corpus_key, build=build)) == (None, None)
+    own = {"RELIQUARY_ORDER_SANDBOX_KEY_FILE": str(tmp_path / "order.pem"),
+           "RELIQUARY_ORDER_SANDBOX_KEY_ID": "order-1"}
+    services, why = asyncio.run(order_sandbox_services(environ={**corpus_key, **own}, build=build))
+    assert services is None and "RELIQUARY_ORDER_SANDBOX_HOTKEY" in why
+    services, why = asyncio.run(order_sandbox_services(
+        environ={**corpus_key, **own, "RELIQUARY_ORDER_SANDBOX_HOTKEY": "5Order"}, build=build))
+    assert isinstance(services, Services) and why is None
+    config, kwargs = built[-1]
+    assert (str(config.key_file), config.key_id) == (own["RELIQUARY_ORDER_SANDBOX_KEY_FILE"], "order-1")
+    assert kwargs["validator_hotkey"] == "5Order"
+    # Its sessions are its own: the corpus validator never restores them, nor it the corpus validator's.
+    assert kwargs["session_store"]._prefix == ORDER_SESSION_PREFIX
+
+
+def test_a_sandbox_that_fails_to_start_refuses_episode_orders_only():
+    from reliquary.validator.eval_control import order_sandbox_services
+
+    class Broken:
+        async def start(self):
+            raise ConnectionError("restore failed")
+
+    environ = {"RELIQUARY_ORDER_SANDBOX_KEY_FILE": "/o.pem", "RELIQUARY_ORDER_SANDBOX_KEY_ID": "o1",
+               "RELIQUARY_ORDER_SANDBOX_HOTKEY": "5Order"}
+    services, why = asyncio.run(order_sandbox_services(environ=environ, build=lambda c, **k: Broken(),
+                                                       session_store=object()))
+    assert services is None and "failed to start" in why

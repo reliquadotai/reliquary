@@ -1183,10 +1183,17 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                        qualifications=None, registration=None, settle_archives=None,
                        read_entries=None, clock: Callable[[], float] = time.time,
                        refresh_every_seconds: float = 60.0, qualification_store=None,
-                       order_jobs=None):
+                       order_jobs=None, sandbox=None, sandbox_down: str | None = None,
+                       model_dir_for=None, signed_wiring=None):
     """The app and the job set of the eval control. Each wired job gets its own
     tokenizer, renderer, router, auditor (an executor pair per batch) and
-    settler; ``read_entries`` makes the set hot."""
+    settler; ``read_entries`` makes the set hot.
+
+    ``sandbox`` (``sandbox_wiring.SandboxServices``, started) serves signed-sandbox episode
+    orders as the corpus validator does: the session route, each job's signed intake and
+    its grader, whose grades gate the job's pay. Without it (``sandbox_down`` says why) an
+    episode order is refused. ``model_dir_for(repo, revision)``: the model's tokenizer files
+    the turn renderer loads; ``signed_wiring``: extra ``wire_signed_job`` arguments (tests)."""
     from fastapi import FastAPI
 
     from reliquary.eval.prompt_source import job_prompt_lines, parse_eval_source
@@ -1207,7 +1214,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     )
     from reliquary.infrastructure.corpus_period_store import R2PeriodArchives
     from reliquary.validator import corpus_periods as cp
-    from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler
+    from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler, oldest_of
     from reliquary.validator.corpus_settlement import SETTLE_FULL_LIST_SECONDS, settler_fed
     from reliquary.validator.corpus_validator import (
         WINDOW_SETTLED,
@@ -1218,6 +1225,15 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
 
     tokenizers: dict[ModelKey, tuple[Any, int]] = {}
     served: dict[str, Any] = {}
+    model_dir_for = model_dir_for or _model_files
+    grade_parse_threads = None
+    if sandbox is not None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        from reliquary.validator.corpus_grading import GRADE_PARSE_THREADS
+
+        # The graders' trajectory parses: never the default executor the submit routes use.
+        grade_parse_threads = ThreadPoolExecutor(GRADE_PARSE_THREADS, thread_name_prefix="order-grade-parse")
     if qualification_store is None or order_jobs is None:
         from reliquary.eval.qualification import EvalJobStore, QualificationStore
 
@@ -1240,7 +1256,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             # A draw job's samples carry no proof: the draw is their check.
             proof_chunk_tokens=None if has_draw(w.job) else w.proof.chunk_tokens, vocab_size=w.vocab_size,
             is_banned=w.is_banned, registration=registration, seen_index=w.seen_index,
-            job=getattr(w, "job", None), durable_records=False, auction=_auction_of(w))
+            job=getattr(w, "job", None), durable_records=False, auction=_auction_of(w),
+            episode_intake=getattr(w, "episode_intake", None))
 
     def _auction_of(w):
         """The job's token auction when its entry prices it so (``corpus.token_auction``), its leases opened by
@@ -1266,6 +1283,9 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             if declared is not None and declared.get("qualification_id"):
                 record, _ = await qualification_store.read(declared["qualification_id"])
             refusal = qualification_refusal(entry, job, declared, record)
+        if refusal is None and job.episode is not None and sandbox is None:
+            refusal = ("a signed-sandbox episode order and this order control serves no sandbox: "
+                       + (sandbox_down or "RELIQUARY_ORDER_SANDBOX_KEY_FILE/_KEY_ID are not set"))
         if refusal is not None:
             refused(entry.job_id, refusal)
             raise ValueError(refusal)
@@ -1294,6 +1314,9 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                             vocab_size=vocab_size, proof=proof, renderer=renderer,
                             prompt_job_for=prompt_job_for, seen_index=seen_index,
                             is_banned=is_banned, stats=JobStats())
+        if job.episode is not None:
+            # Published to the session issuer only at the end, once the whole job is wired.
+            await wire_episode(w)
         # The miner status route's view (`/corpus/jobs/{job}/miners/{hotkey}`), fed by the same reports.
         # A draw job carries no TOPLOC proof: its judge is in the contract.
         w.audit_params, w.miner_states = params, miner_states
@@ -1302,11 +1325,17 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                              thresholds=None if has_draw(job) else proof_thresholds(proof))
         on_verdict, on_settled = feed(w.stats, w.miners)
         # Paid by period, as every corpus task (design 2026-10-03): a period
-        # closes once the auditor holds nothing undecided received in it.
+        # closes once the auditor holds nothing undecided received in it -- and, for an
+        # episode order, its grader nothing ungraded (ruling P21): never paid ungraded.
+        grader = getattr(w, "grader", None)
+        pending = [lambda: w.auditor.oldest_pending_received_at()]
+        if grader is not None:
+            pending.append(grader.oldest_unready_received_at)
+            grader.on_voided = w.miners.voided
         w.settler = CorpusPeriodSettler(
             task_id=entry.task_id, job_id=job.job_id, cap=cap, records=records,
             archives=R2PeriodArchives(guard=settle_archives),
-            oldest_pending=lambda: w.auditor.oldest_pending_received_at(),
+            oldest_pending=oldest_of(*pending), ready=grader.ready if grader is not None else None,
             on_settled=on_settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
             max_price=cp.max_price(entry.params), max_input_price=cp.max_input_price(entry.params))
         w.auditor = eval_auditor(
@@ -1323,10 +1352,31 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         def on_accepted(submission_id: str) -> None:
             w.stats.accepted()
             w.auditor.enqueue(submission_id)
+            if grader is not None:
+                grader.enqueue(submission_id)
 
         w.on_accepted = on_accepted
+        if job.episode is not None:
+            # Only now: a job still being wired is never visible to the session issuer.
+            sandbox.publish(w)
         served[job.job_id] = w
         return w
+
+    async def wire_episode(w) -> None:
+        """A signed episode order, as the corpus validator wires one: its signed intake and
+        session view (published once the whole job is wired), its grader."""
+        from reliquary.validator.corpus_validator import warm_drand_chain
+        from reliquary.validator.sandbox_wiring import wire_signed_grader, wire_signed_job
+
+        job = w.job
+        model_dir = await asyncio.to_thread(model_dir_for, job.checkpoint_repo, job.checkpoint_revision)
+        await asyncio.to_thread(functools.partial(
+            wire_signed_job, w, services=sandbox, routes=lambda: routes, checkpoint_dir=model_dir,
+            tokenizer=w.tokenizer, vocab_size=w.vocab_size, chunk_tokens=w.proof.chunk_tokens,
+            publish=False, **(signed_wiring or {})))
+        wire_signed_grader(w, judge_records=records, parse_executor=grade_parse_threads)
+        # The drand chain once, off the loop: the auditor and grader would resolve it on it.
+        await warm_drand_chain(None)
 
     async def settle_forever(w, every: float = 60.0) -> None:
         while True:
@@ -1365,6 +1415,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         )
 
         served.pop(w.job.job_id, None)
+        if sandbox is not None and w.job.episode is not None:
+            sandbox.forget(str(w.job.job_id))
         w.auditor._remote.close()
         if is_eval_source(w.job.prompt_source):
             forget_eval_prompts(parse_eval_source(w.job.prompt_source))
@@ -1387,6 +1439,10 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     routes = CorpusJobRoutes()
     app = FastAPI()
     app.include_router(build_corpus_jobs_router(routes, legacy=False))
+    if sandbox is not None:
+        # /corpus/sandbox/sessions: the signed episode orders' sessions, under this control's key.
+        app.include_router(sandbox.router)
+        app.state.corpus_sandbox = sandbox
 
     @app.get("/corpus/jobs/{job_id}/eval-prompts")
     async def eval_prompts(job_id: str) -> Response:
@@ -1423,7 +1479,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                                                   qualifications=qualifications))
     job_set = CorpusJobSet(
         routes=routes, router_for=router_for, wire=wire,
-        jobs_of=lambda w: [guarded(w, w.auditor.run()), guarded(w, settle_forever(w))],
+        jobs_of=lambda w: [guarded(w, w.auditor.run()), guarded(w, settle_forever(w)),
+                           *([guarded(w, w.grader.run())] if getattr(w, "grader", None) is not None else [])],
         read_entries=read_entries, read_job=read_job, admit=admit, screen=screen,
         on_unwired=unwired, refresh_every_seconds=refresh_every_seconds,
         # A drained order's status outlives this process; a retired one is
@@ -1507,6 +1564,8 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
         entries, _ = await registry_store.read_registry(strict=True)
         return entries
 
+    sandbox, sandbox_down = await order_sandbox_services(
+        registration=registered.reason if registered is not None else None)
     job_set = None
     archives = OrderArchives(served=lambda: job_set.task_ids() if job_set else ())
     app, job_set = build_eval_control(
@@ -1515,7 +1574,7 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
         verify_skip_signature=verify_corpus_skip_signature, qualifications=qualifications,
         registration=registered.reason if registered is not None else None,
         settle_archives=archives, read_entries=read_entries,
-        refresh_every_seconds=refresh_every_seconds or 60.0)
+        refresh_every_seconds=refresh_every_seconds or 60.0, sandbox=sandbox, sandbox_down=sandbox_down)
 
     async def refresh_qualifications():
         while True:
@@ -1530,8 +1589,57 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
                   job_set.run()]
     if registered is not None:
         background.append(registered.refresh_forever())
+    if sandbox is not None:
+        background.extend(sandbox.background())
     server = uvicorn.Server(uvicorn.Config(app, host=http_host, port=http_port, log_level="info"))
-    await asyncio.gather(server.serve(), *background)
+    try:
+        await asyncio.gather(server.serve(), *background)
+    finally:
+        if sandbox is not None:
+            await sandbox.stop()
+
+
+# The order control's own sandbox key settings: never the corpus validator's, so neither verifies nor restores
+# the other's sessions. The other RELIQUARY_SANDBOX_* settings (policy, directory, machines) are read as there.
+ORDER_SANDBOX_KEY_SETTINGS = {"key_file": "RELIQUARY_ORDER_SANDBOX_KEY_FILE",
+                              "key_id": "RELIQUARY_ORDER_SANDBOX_KEY_ID",
+                              "retired_keys": "RELIQUARY_ORDER_SANDBOX_RETIRED_KEYS",
+                              "hotkey": "RELIQUARY_ORDER_SANDBOX_HOTKEY"}
+
+
+async def order_sandbox_services(*, registration=None, environ=None, build=None,
+                                 session_store=None) -> tuple[Any, str | None]:
+    """The signed-sandbox services episode orders are served with, started: ``(services, None)``; ``(None,
+    None)`` when this control has no sandbox key settings; ``(None, why)`` when they fail (episode orders are
+    then refused with ``why``, every other order is served). Its sessions live under their own prefix."""
+    import os
+
+    from reliquary.validator.corpus_validator import start_sandbox_services
+
+    environ = os.environ if environ is None else environ
+    try:
+        from reliquary.validator.sandbox_wiring import SandboxValidatorConfig, build_sandbox_services
+
+        config = SandboxValidatorConfig.from_env(environ, key_settings=ORDER_SANDBOX_KEY_SETTINGS)
+        if config is None:
+            return None, None
+        if not config.validator_hotkey:
+            # No wallet here: the ss58 address miners sign session requests to.
+            raise ValueError(f"set {ORDER_SANDBOX_KEY_SETTINGS['hotkey']}")
+        if session_store is None:
+            from reliquary.infrastructure.sandbox_store import ORDER_SESSION_PREFIX, R2SessionStore
+
+            session_store = R2SessionStore(prefix=ORDER_SESSION_PREFIX)
+        services = (build or build_sandbox_services)(
+            config, validator_hotkey=config.validator_hotkey, registration=registration,
+            session_store=session_store)
+    except Exception as exc:  # noqa: BLE001 - isolated: single-turn orders still serve
+        # The key loader's errors name the path and its mode, never the key.
+        logger.error("ALERT: order sandbox services not built: %r; episode orders are refused", exc)
+        return None, f"its sandbox services were not built ({type(exc).__name__}: {str(exc)[:120]})"
+    if not await start_sandbox_services(services, []):
+        return None, "its sandbox services failed to start"
+    return services, None
 
 
 # What the order control imports beyond the base install: the drand draw of
@@ -1589,6 +1697,7 @@ run_order_control = run_eval_control
 
 
 __all__ = [
+    "ORDER_SANDBOX_KEY_SETTINGS",
     "BatchParked",
     "OrderArchives",
     "build_order_control",
@@ -1597,6 +1706,7 @@ __all__ = [
     "pinned_order_refusal",
     "order_audit_scorers",
     "order_job_refusal",
+    "order_sandbox_services",
     "run_order_control",
     "EVAL_AUDIT_PREFIX",
     "EVAL_CONTROL_STATUS_KEY",
