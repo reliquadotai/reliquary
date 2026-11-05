@@ -317,6 +317,42 @@ def test_a_miss_far_from_the_pick_is_an_edit_whatever_the_count():
     assert not ok and detail["max_gap"] > eval_draw.EVAL_GAP_TOLERANCE
 
 
+def test_a_miss_a_little_over_the_tolerance_is_refused_without_penalty():
+    """Kernel drift reaches a gap of 5.3 on honest samples (Gemma 4, 2026-11-05): refused, never charged. Far past
+    it, too many misses, or an end the pick did not make, the refusal counts against the miner."""
+    import math
+
+    def miss(gap):
+        return 1 - math.exp(-gap)
+
+    base = dict(n_positions=1000, n_stochastic=500, n_drawn_exact_match=999)
+    ok, detail = eval_draw.judge([_diag(**base, max_cdf_miss=miss(5.3))])
+    assert not ok and detail["penalty"] is False
+    ok, detail = eval_draw.judge([_diag(**base, max_cdf_miss=miss(eval_draw.EVAL_FORGERY_GAP + 1))])
+    assert not ok and detail["penalty"] is True
+    ok, detail = eval_draw.judge([_diag(**{**base, "n_drawn_exact_match": 900}, max_cdf_miss=miss(5.3))])
+    assert not ok and detail["penalty"] is True
+    ok, detail = eval_draw.judge([_diag(**base, max_cdf_miss=miss(5.3), last_miss=miss(5.0))])
+    assert not ok and detail["penalty"] is True
+    assert "penalty" not in eval_draw.judge([_diag(**base, max_cdf_miss=miss(0.6))])[1]
+
+
+def test_the_auditor_marks_a_drift_refusal_without_penalty():
+    import math
+
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    auditor = CorpusAuditor.__new__(CorpusAuditor)
+    auditor._draw_job = _job()
+    base = dict(n_positions=1000, n_stochastic=500, n_drawn_exact_match=999)
+    drift = _diag(**base, max_cdf_miss=1 - math.exp(-5.3))
+    edit = _diag(**base, max_cdf_miss=1 - math.exp(-12.0))
+    results = [{"passed": True, "reason": None}, {"passed": True, "reason": None}]
+    auditor._judge_draws(results, [(0, 0), (1, 0)], {0: drift, 1: edit})
+    assert results[0]["passed"] is False and results[0]["penalty"] is False
+    assert results[1]["passed"] is False and "penalty" not in results[1]
+
+
 def test_an_end_the_pick_did_not_make_is_refused():
     import math
 
