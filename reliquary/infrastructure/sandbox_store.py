@@ -158,6 +158,18 @@ def validated_machine_id(machine_id: Any) -> str:
     return machine_id
 
 
+# A prefix names a family of machines (rented ones): long enough never to reach a static name by accident.
+MIN_PREFIX_LENGTH = 6
+
+
+def validated_machine_prefix(prefix: Any) -> str:
+    if (not isinstance(prefix, str) or len(prefix) < MIN_PREFIX_LENGTH or len(prefix) > 48
+            or not _ID_RE.fullmatch(prefix)):
+        raise ValueError(f"machine prefix {prefix!r} is not a name prefix of at least "
+                         f"{MIN_PREFIX_LENGTH} characters")
+    return prefix
+
+
 def validated_address(address: Any) -> str:
     match = _ADDRESS_RE.fullmatch(address) if isinstance(address, str) else None
     if match is None or (match["port"] is not None and not 0 < int(match["port"]) < 65536):

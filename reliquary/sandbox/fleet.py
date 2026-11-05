@@ -69,7 +69,7 @@ from typing import Any
 
 from reliquary_sandbox.attest import heartbeat_valid
 
-from reliquary.infrastructure.sandbox_store import validated_machine_id
+from reliquary.infrastructure.sandbox_store import validated_machine_id, validated_machine_prefix
 from reliquary.sandbox import transcript_cap_refusal
 from reliquary.sandbox.machines import DirectorySnapshot, snapshot_from_documents
 
@@ -185,11 +185,17 @@ class Fleet:
                  directory_max_age_s: float = DIRECTORY_MAX_AGE_SECONDS,
                  directory_read_timeout_s: float = DIRECTORY_READ_TIMEOUT_SECONDS,
                  machine_ids: Collection[str] | None = None,
-                 additional_machine_scope: Collection[str] | None = None) -> None:
+                 additional_machine_scope: Collection[str] | None = None,
+                 machine_prefixes: Collection[str] | None = None) -> None:
         if isinstance(machine_ids, (str, bytes)):
             raise ValueError("machine_ids must be a collection of machine names")
         self._machine_ids = (None if machine_ids is None else
                              frozenset(validated_machine_id(m) for m in machine_ids))
+        # Rented machines join and leave the directory under a prefix: in scope without a restart.
+        if isinstance(machine_prefixes, (str, bytes)):
+            raise ValueError("machine_prefixes must be a collection of machine name prefixes")
+        self._machine_prefixes = (None if machine_prefixes is None else
+                                  tuple(sorted(validated_machine_prefix(p) for p in machine_prefixes)))
         if isinstance(additional_machine_scope, (str, bytes)):
             raise ValueError("additional_machine_scope must be a collection of machine names")
         self._additional_machine_scope = (None if additional_machine_scope is None else
@@ -271,8 +277,14 @@ class Fleet:
             return _EMPTY_DIRECTORY
         return self._directory
 
+    def _in_primary_scope(self, machine_id: str) -> bool:
+        if self._machine_ids is None and self._machine_prefixes is None:
+            return True
+        return ((self._machine_ids is not None and machine_id in self._machine_ids)
+                or (self._machine_prefixes is not None and machine_id.startswith(self._machine_prefixes)))
+
     def _in_scope(self, machine_id: str) -> bool:
-        return (self._scope_ready and (self._machine_ids is None or machine_id in self._machine_ids)
+        return (self._scope_ready and self._in_primary_scope(machine_id)
                 and (self._additional_machine_scope is None or machine_id in self._additional_machine_scope))
 
     def _operated_entries(self):

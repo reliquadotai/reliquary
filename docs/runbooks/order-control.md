@@ -42,6 +42,15 @@ public half in its validator keys. Without these settings, or when the sandbox s
 episode orders are refused (the reason is in the control's status) and every other order is served.
 An order job's sandbox sessions are `/corpus/jobs/{job_id}/sandbox/sessions`, inside the order jobs' location.
 
+Rented gateways. The platform rents sandbox gateways while agentic orders run and registers each one in the
+machine directory through the admin service, under `RELIQUARY_ADMIN_SANDBOX_MACHINE_PREFIX` (for example
+`rlq-gw-prod-`): the admin's `/admin/v1/sandbox-machines` routes register, drain or revoke, and read only the
+machines named with it. Set the same prefix in the order control's `RELIQUARY_SANDBOX_MACHINE_PREFIXES`
+(`["rlq-gw-prod-"]`, alongside or instead of `RELIQUARY_SANDBOX_MACHINE_IDS`): a gateway registered after the
+start is polled and placed on from the next directory read (30 s), and one set `revoked` is left out, with no
+restart. The control records each accepted heartbeat in the directory (`last_heartbeat`), which is how the
+platform sees a gateway ready.
+
 It needs network to drand and to the Hugging Face hub. Route it with the locations
 `reliquary corpus order-nginx --port 8791` prints for the same `RELIQUARY_ADMIN_TASK_PREFIX`; miners need
 no setting. The admin service and the order control must run with the same prefix.

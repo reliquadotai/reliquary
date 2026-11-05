@@ -2222,7 +2222,8 @@ def build_admin_app_from_environment():
     credentials. Subnet-run deliveries may instead use the origin and secret in
     ``RELIQUARY_PLATFORM_DELIVERY_URL`` and ``RELIQUARY_PLATFORM_DELIVERY_SECRET``.
     Delivery is off without either sink. Eval sets' grading files are read
-    from the subnet bucket (``R2_*``).
+    from the subnet bucket (``R2_*``). ``RELIQUARY_ADMIN_SANDBOX_MACHINE_PREFIX`` lets the
+    platform register, drain and read the sandbox machines named with it (its rented gateways).
     """
     import json
 
@@ -2255,7 +2256,9 @@ def build_admin_app_from_environment():
     prefix = os.getenv("RELIQUARY_ADMIN_TASK_PREFIX", "order-")
     return create_admin_app(secret=secret.encode(), pool_max=float(pool), models=models,
                             deliveries=deliveries, task_prefix=prefix,
-                            work_dir=os.getenv("RELIQUARY_ADMIN_WORK_DIR") or None)
+                            work_dir=os.getenv("RELIQUARY_ADMIN_WORK_DIR") or None,
+                            sandbox_machine_prefix=os.getenv(
+                                "RELIQUARY_ADMIN_SANDBOX_MACHINE_PREFIX", "").strip() or None)
 
 
 @admin_app.command("serve")
