@@ -17,6 +17,12 @@ build context named `envs`. The build then runs `reliquary corpus order-control-
 - `huggingface_hub` and `transformers` import (model files and tokenizers are read on CPU);
 - each order source's package is installed, its artifact verifies, and its digest is the catalog's.
 
+For signed episode orders (SWE, TMax) the image also carries reliquary-sandbox with its verifiers bridge at
+`SANDBOX_COMMIT`, `reliquary-swe` and `reliquary-terminal` at the reliquary-environments commit the agentic eval
+sets pin (`ENVS`, checked against each set's `env_package`) and `renderers`; reliquary-harness comes with the
+base. The Verifiers tasksets single-turn sets are graded with go to `/opt/evalsets-site`, at the end of
+`sys.path`. A second build check fails unless all of these load at their pins.
+
 ## Run
 
 ```bash
@@ -24,6 +30,13 @@ docker run -d --name order-control --network host \
   --env-file <subnet bucket credentials> -e RELIQUARY_ADMIN_TASK_PREFIX=order- \
   <order-control image> --netuid 81
 ```
+
+Signed episode orders also need the order control's own sandbox token key (an Ed25519 PEM, mode 0600,
+`python -m reliquary_sandbox.attest.signing generate PATH`; never the corpus validator's key): mount it read-only
+and set `RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE`, `RELIQUARY_SANDBOX_VALIDATOR_KEY_ID`,
+`RELIQUARY_SANDBOX_VALIDATOR_HOTKEY` (the ss58 address miners sign session requests for) and
+`RELIQUARY_SANDBOX_MACHINE_IDS`. Each gateway lists the key's public half in its validator keys.
+An order job's sandbox sessions are `/corpus/jobs/{job_id}/sandbox/sessions`, inside the order jobs' location.
 
 It needs network to drand and to the Hugging Face hub. Route it with the locations
 `reliquary corpus order-nginx --port 8791` prints for the same `RELIQUARY_ADMIN_TASK_PREFIX`; miners need
