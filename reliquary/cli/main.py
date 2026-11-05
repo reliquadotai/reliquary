@@ -3437,6 +3437,7 @@ def corpus_mine_agentic(
     from reliquary.miner.corpus_miner import (
         CorpusJobSelectionError,
         HttpCorpusClient,
+        sandbox_sessions_prefix,
         submits_scoped,
     )
     from reliquary.miner.suite_episode import is_suite_episode, suite_support
@@ -3505,7 +3506,8 @@ def corpus_mine_agentic(
             raise typer.Exit(code=2)
         try:
             sessions = HttpSandboxSessions(httpx.Client(base_url=validator_url, timeout=60.0),
-                                           validator_hotkey=validator_hotkey)
+                                           validator_hotkey=validator_hotkey,
+                                           prefix=sandbox_sessions_prefix(job))
         except ValueError as exc:
             typer.echo(f"error: {exc}", err=True)
             raise typer.Exit(code=2) from exc

@@ -74,7 +74,8 @@ def order_routes_nginx(task_prefix: str | None = None, *, port: int = 8791) -> s
     """The nginx locations sending order jobs and their executors to the order
     control (``reliquary corpus order-nginx`` prints them)."""
     return (
-        "# Order jobs (eval and generation): miners' scoped reads and submits.\n"
+        "# Order jobs (eval and generation): miners' scoped reads, submits and sandbox\n"
+        "# sessions (a close carries up to 9 MiB: keep client_max_body_size >= 9m).\n"
         f"location ~ {order_jobs_route_regex(task_prefix)} {{\n"
         f"    proxy_pass http://127.0.0.1:{port};\n}}\n"
         "# Their executors (audit pairs and qualification): never the corpus control's.\n"

@@ -694,3 +694,48 @@ def test_a_close_is_parsed_and_its_signature_checked_off_the_event_loop(monkeypa
                     verify=verify).post(CLOSE, json=close_body())
     assert answer.status_code == 200
     assert threads["parse"] != threads["loop"] and threads["verify"] != threads["loop"]
+
+
+def test_a_job_scoped_router_binds_each_request_to_its_job_path():
+    import re as _re
+
+    from reliquary.eval.prompt_source import order_jobs_route_regex
+    from reliquary.protocol.sandbox_session import JOB_SCOPED_PREFIX, job_scoped_prefix
+
+    bt = pytest.importorskip("bittensor")
+    keypair = bt.Keypair.create_from_uri("//Alice")
+    issuer = FakeIssuer(Grant("s-1", TOKEN, "http://10.0.0.5:8080", NOW + 4500))
+    app = FastAPI()
+    app.include_router(build_sandbox_sessions_router(
+        issuer, policy=SandboxPolicy(), validator_hotkey=VALIDATOR, prefix=JOB_SCOPED_PREFIX,
+        clock=lambda: NOW))
+    http = TestClient(app, raise_server_exceptions=False)
+    job = "order-eval-swe-1"
+    scoped_open = sandbox_open_path(job_scoped_prefix(job))
+    scoped_close = sandbox_close_path(job_scoped_prefix(job), "s-1")
+    # The order jobs' nginx location already sends these paths to the order control.
+    assert _re.match(order_jobs_route_regex("order-"), scoped_open)
+    assert _re.match(order_jobs_route_regex("order-"), scoped_close)
+
+    def signed_open(job_id, path):
+        body = open_body(engagement={"kind": "corpus", "job_id": job_id, "prompt_index": 3})
+        body["signature"] = keypair.sign(opened(body, path=path)).hex()
+        return body
+
+    # Signed for the legacy path, or another job's: refused.
+    assert http.post(scoped_open, json=signed_open(job, OPEN)).status_code == 403
+    other = sandbox_open_path(job_scoped_prefix("order-eval-x"))
+    assert http.post(scoped_open, json=signed_open(job, other)).status_code == 403
+    # Signed for its path but engaging another job: not served here.
+    answer = http.post(scoped_open, json=signed_open("order-eval-x", scoped_open))
+    assert answer.status_code == 404 and answer.json()["reason"] == "job_not_served"
+    assert issuer.calls == []
+    answer = http.post(scoped_open, json=signed_open(job, scoped_open))
+    assert answer.status_code == 200 and issuer.calls[0][1]["engagement"]["job_id"] == job
+    close = close_body()
+    close["signature"] = keypair.sign(closed(close, path=CLOSE)).hex()
+    assert http.post(scoped_close, json=close).status_code == 403
+    close["signature"] = keypair.sign(closed(close, path=scoped_close)).hex()
+    issuer.outcome = {"session_id": "s-1", "state": "closed", "status": "expired"}
+    assert http.post(scoped_close, json=close).status_code == 200
+    assert issuer.calls[-1][0] == "close"

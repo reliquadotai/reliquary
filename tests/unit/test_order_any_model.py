@@ -624,3 +624,28 @@ def test_a_miner_submits_an_order_job_on_its_scoped_path():
                                     prompt_source="eval-set:s:1:" + "0" * 64))
     assert not submits_scoped(_job_spec(job_id="code-qwen38-27b-v1",
                                         prompt_source="reliquary_code_v1"))
+
+
+def test_a_miner_opens_an_order_jobs_sandbox_sessions_on_its_scoped_path():
+    from reliquary.miner.corpus_miner import sandbox_sessions_prefix
+    from reliquary.miner.signed_episode import HttpSandboxSessions
+    from tests.unit.test_corpus_export import _job_spec
+
+    order = _job_spec(job_id="order-eval-swe-1", prompt_source="eval-set:s:1:" + "0" * 64)
+    corpus = _job_spec(job_id="swe-signed-v1", prompt_source="reliquary_swe")
+    assert sandbox_sessions_prefix(order) == "/corpus/jobs/order-eval-swe-1"
+    assert sandbox_sessions_prefix(corpus) == "/corpus"
+    posted = []
+
+    class Http:
+        def post(self, path, **kwargs):
+            posted.append(path)
+            return SimpleNamespace(status_code=200, json=lambda: {})
+
+    bob = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+    sessions = HttpSandboxSessions(Http(), validator_hotkey=bob,
+                                   prefix=sandbox_sessions_prefix(order))
+    sessions.open({})
+    sessions.close("s-1", {})
+    assert posted == ["/corpus/jobs/order-eval-swe-1/sandbox/sessions",
+                      "/corpus/jobs/order-eval-swe-1/sandbox/sessions/s-1/close"]

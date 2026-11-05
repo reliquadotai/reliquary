@@ -1,7 +1,7 @@
 """`POST {prefix}/sandbox/sessions` and `POST {prefix}/sandbox/sessions/{id}/close`
 (plan 3 ruling 1). Mounted on the corpus app with prefix `/corpus` (the nginx
 location and tunnel miners already reach); the RL server mounts the same router under
-its own prefix. A request is fresh (±policy.request_skew_s of this validator's
+its own prefix, and the order control under `/corpus/jobs/{job_id}` (JOB_SCOPED_PREFIX). A request is fresh (±policy.request_skew_s of this validator's
 clock), signed by its hotkey and, when a registration check is wired, registered,
 before the issuer sees it.
 
@@ -309,11 +309,17 @@ def build_sandbox_sessions_router(
             logger.error("sandbox session %s failed (%s)", what, type(exc).__name__)
             return refuse("internal_error")
 
-    open_path = sandbox_open_path(prefix)
+    # A job-scoped prefix (JOB_SCOPED_PREFIX): each request is signed for its own job's
+    # path, and an open must engage that job.
+    scoped = "{job_id}" in prefix
 
-    @router.post(open_path)
+    def routed(http: Request) -> str:
+        return prefix.format(job_id=http.path_params["job_id"]) if scoped else prefix
+
+    @router.post(sandbox_open_path(prefix))
     async def open_session(http: Request) -> JSONResponse:
         async def step() -> JSONResponse:
+            open_path = sandbox_open_path(routed(http))
             if open_preauth is None:
                 request, hotkey = await _parse(http, SandboxSessionOpenRequest, MAX_OPEN_BODY_BYTES,
                                                open_body_timeout_s)
@@ -326,6 +332,8 @@ def build_sandbox_sessions_router(
                 async with open_preauth:
                     request, hotkey = await asyncio.to_thread(_decode, raw, SandboxSessionOpenRequest)
                     await gate(request, hotkey, verify_open, open_path)
+            if scoped and request.engagement.job_id != http.path_params["job_id"]:
+                return refuse("job_not_served", {"job_id": request.engagement.job_id})
             outcome = await issuer.open(
                 hotkey=hotkey, request_id=request.request_id,
                 engagement=request.engagement.model_dump(exclude_none=True))
@@ -380,7 +388,7 @@ def build_sandbox_sessions_router(
                                            MAX_CLOSE_BODY_BYTES, close_body_timeout_s)
             if request.session_id != session_id:
                 raise _Refused(refuse("session_unknown", {"session_id": request.session_id}))
-            await gate(request, hotkey, verify_close, sandbox_close_path(prefix, session_id))
+            await gate(request, hotkey, verify_close, sandbox_close_path(routed(http), session_id))
             return request, hotkey
 
         async def settle(request, hotkey: str) -> JSONResponse:
