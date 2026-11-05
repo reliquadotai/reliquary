@@ -24,6 +24,7 @@ from reliquary.shared.task_registry import (
     render_registry,
     require_default_declared_first,
     retire_task,
+    release_cap,
     set_cap,
     set_admission,
     validate_registry,
@@ -242,6 +243,11 @@ async def set_task_admission(task_id: str, admission: str, *, attempts: int = 5,
             continue
         return
     raise RegistryConflict("task admission kept changing under concurrent updates")
+
+
+async def release_task_cap(task_id: str, *, attempts: int = 5, **client_kwargs) -> None:
+    """``task_registry.release_cap``: a drained retired period task's cap to 0, its earned tail still paid."""
+    await _mutate(lambda e: release_cap(e, task_id), attempts=attempts, **client_kwargs)
 
 
 async def set_task_cap(
