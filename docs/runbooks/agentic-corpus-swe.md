@@ -202,6 +202,7 @@ capacity.
 | `RELIQUARY_SANDBOX_DIRECTORY_MAX_AGE_S` | 120 | the directory age past which the validator fails closed |
 | `RELIQUARY_SANDBOX_DIRECTORY_READ_TIMEOUT_S` | 15 | each directory read |
 | `RELIQUARY_SANDBOX_MACHINE_IDS` | unset | optional JSON array of machines to poll and place new sessions on; historical verification keeps all keys |
+| `RELIQUARY_SANDBOX_MACHINE_PREFIXES` | unset | optional JSON array of machine name prefixes (6+ characters): machines named with one are in scope too, from the next directory read (rented gateways) |
 | `RELIQUARY_SANDBOX_CLOSE_PREAUTH_CONCURRENCY` | 8 | closes read and authenticated at once; one more gets `503 close_busy` at once, before its body is read |
 | `RELIQUARY_SANDBOX_CLOSE_CONCURRENCY` | 4 | authenticated closes whose transcript is verified at once (a wait past the io timeout gets `503 close_busy`) |
 | `RELIQUARY_SANDBOX_CLOSE_BODY_TIMEOUT_S` | 30 | the time a close's body has to arrive, else `408 body_timeout` |

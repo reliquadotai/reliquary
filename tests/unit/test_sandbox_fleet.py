@@ -937,3 +937,41 @@ def test_a_machine_serving_the_env_with_other_options_gets_no_session(tmp_path, 
         assert MACHINE in errors[0] and expected in errors[0]
         assert (other in errors[0]) if published == {ENV: other} else \
             ("publishes no options digest" in errors[0])
+
+
+@pytest.mark.parametrize("ids,prefixes,expected", [
+    (None, ["m-gw-x"], ("m-gw-x1",)), ({"m-a"}, ["m-gw-x"], ("m-a", "m-gw-x1")),
+    ({"m-a"}, None, ("m-a",)), (None, ["m-none"], ()),
+])
+def test_a_prefix_scope_takes_machines_registered_after_start(tmp_path, ids, prefixes, expected):
+    one, two = signer(tmp_path, "a", "ka"), signer(tmp_path, "g", "kg")
+    documents = [machine_document(one, machine_id="m-a", address="http://a:1")]
+    reports = {"http://a:1": capacity_report(one, at=NOW, machine_id="m-a", address="http://a:1"),
+               "http://g:1": capacity_report(two, at=NOW, machine_id="m-gw-x1", address="http://g:1")}
+
+    async def read():
+        return documents
+
+    async def fetch(address):
+        return reports[address]
+
+    fleet = Fleet(read_documents=read, fetch_report=fetch, clock=Clock(), machine_ids=ids,
+                  machine_prefixes=prefixes)
+    asyncio.run(fleet.refresh_directory())
+    asyncio.run(fleet.poll_once())
+    assert fleet.servable_machines(now=NOW, **PICK) == tuple(m for m in expected if m == "m-a")
+    # A rented gateway joins the directory: the next read puts it in scope, no restart.
+    documents.append(machine_document(two, machine_id="m-gw-x1", address="http://g:1"))
+    asyncio.run(fleet.refresh_directory())
+    asyncio.run(fleet.poll_once())
+    assert fleet.servable_machines(now=NOW, **PICK) == expected
+
+
+def test_a_prefix_must_be_long_enough(tmp_path):
+    async def read():
+        return []
+
+    with pytest.raises(ValueError):
+        Fleet(read_documents=read, machine_prefixes=["m-gw"])
+    with pytest.raises(ValueError):
+        Fleet(read_documents=read, machine_prefixes="m-gw-xx")

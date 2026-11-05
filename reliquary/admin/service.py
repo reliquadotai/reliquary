@@ -251,6 +251,24 @@ class SetAdmission(BaseModel):
     admission: Literal["open", "paused"]
 
 
+class RegisterSandboxMachine(BaseModel):
+    """A rented sandbox gateway the platform registers once its box made its machine key."""
+    model_config = ConfigDict(extra="forbid")
+    machine_id: str = Field(min_length=1, max_length=64)
+    address: str = Field(min_length=1, max_length=300)
+    provider: str = Field(min_length=1, max_length=64)
+    capacity: int = Field(gt=0, le=1024)
+    key_id: str = Field(min_length=1, max_length=64)
+    public_key_b64: str = Field(min_length=1, max_length=64)
+    valid_from: int = Field(gt=0)
+
+
+class SandboxMachineStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["active", "draining", "revoked"]
+    reason: str | None = Field(default=None, max_length=200)
+
+
 class RegisterExecutor(BaseModel):
     model_config = ConfigDict(extra="forbid")
     executor_id: str
@@ -415,12 +433,15 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      open_environment=None, grade_scorer=None,
                      require_sandbox=None, qualifications=None, eval_jobs=None,
                      model_facts=None, evaluation_sessions=None, pin_model=None,
-                     upload_tokenizer=None, subnet_pool=None, tao_usd=None) -> FastAPI:
+                     upload_tokenizer=None, subnet_pool=None, tao_usd=None,
+                     sandbox_machine_prefix: str | None = None, sandbox_machines=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
     ``eval_store`` the subnet bucket holding the eval sets' grading files.
     ``subnet_pool`` (async, ``chain.subnet_pool``'s answer) and ``tao_usd``
-    (async, USD per TAO) convert an order's USD token ceiling."""
+    (async, USD per TAO) convert an order's USD token ceiling. ``sandbox_machine_prefix``
+    turns on the sandbox machine routes for the machines named with it (the platform's rented
+    gateways) and only those; ``sandbox_machines`` is the machine directory (``sandbox_store``)."""
     from reliquary.infrastructure import corpus_executor_store as executors
     from reliquary.infrastructure import corpus_job_store as job_store
     from reliquary.infrastructure import task_registry_store as registry_store
@@ -1285,6 +1306,52 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 "manifest_sha256": canonical_sha256(manifest),
                 "profile_sha256": entries[0].profile_sha256 if len(entries) == 1 else None,
                 "task_contracts": [task_document(e) for e in entries]}
+
+    if sandbox_machine_prefix is not None:
+        from reliquary.infrastructure import sandbox_store
+
+        machines = sandbox_machines or sandbox_store
+        machine_prefix = sandbox_store.validated_machine_prefix(sandbox_machine_prefix)
+
+        def own_machine(machine_id: str) -> str:
+            try:
+                sandbox_store.validated_machine_id(machine_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail="sandbox_machine_unknown") from exc
+            if not machine_id.startswith(machine_prefix):
+                raise HTTPException(status_code=409, detail="outside_admin_scope")
+            return machine_id
+
+        @router.post("/sandbox-machines")
+        async def register_sandbox_machine(body: RegisterSandboxMachine, response: Response) -> dict:
+            own_machine(body.machine_id)
+            try:
+                document, created = await machines.register_machine(
+                    machine_id=body.machine_id, address=body.address, provider=body.provider,
+                    capacity=body.capacity, key_id=body.key_id, public_key_b64=body.public_key_b64,
+                    valid_from=body.valid_from, now=clock())
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            except machines.MachineConflict as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            response.status_code = 201 if created else 200
+            return document
+
+        @router.post("/sandbox-machines/{machine_id}/status")
+        async def sandbox_machine_status(machine_id: str, body: SandboxMachineStatus) -> dict:
+            document = await machines.set_machine_status(own_machine(machine_id), body.status,
+                                                         reason=body.reason)
+            if document is None:
+                raise HTTPException(status_code=404, detail="sandbox_machine_unknown")
+            return document
+
+        @router.get("/sandbox-machines/{machine_id}")
+        async def read_sandbox_machine(machine_id: str) -> dict:
+            # last_heartbeat: when a control last accepted the machine's signed report.
+            document = await machines.read_machine(own_machine(machine_id))
+            if document is None:
+                raise HTTPException(status_code=404, detail="sandbox_machine_unknown")
+            return document
 
     @router.post("/executors")
     async def register_executor(body: RegisterExecutor, response: Response) -> dict:
