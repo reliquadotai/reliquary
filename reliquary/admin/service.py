@@ -524,7 +524,21 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 if (await stored_job_counts(records, entry.job_id))["drained"]:
                     # Drained is for good: never listed again.
                     drained_tasks.add(entry.task_id)
+                    await release_drained(entry)
         return cap_limits(float(pool_max), drained_tasks=set(drained_tasks))
+
+    async def release_drained(entry) -> None:
+        """Every period of a drained job is settled: its cap goes to 0 (its earned tail still paid), or the
+        registry's pool, which counts retired caps, would stay full of finished orders."""
+        from reliquary.shared.task_registry import SETTLEMENT_PERIOD_EMA
+
+        if entry.params.get("settlement") != SETTLEMENT_PERIOD_EMA:
+            return
+        try:
+            await registry_store.release_task_cap(entry.task_id)
+            logger.info("admin: released the cap of drained task %s", entry.task_id)
+        except Exception:  # noqa: BLE001 - the next create retries; the guard still counts it until then
+            logger.warning("admin: could not release the cap of drained task %s", entry.task_id, exc_info=True)
 
     def price_of(entry) -> dict | None:
         from reliquary.validator.corpus_periods import price_view

@@ -488,6 +488,26 @@ def retire_task(
     return {**entries, task_id: retired}
 
 
+def release_cap(entries: Mapping[str, TaskEntry], task_id: str) -> dict[str, TaskEntry]:
+    """A retired period task whose job has drained, its cap set to 0: nothing is left for it to work, and the
+    tail it earned is still paid up to the highest cap it had (``TAIL_CAP_PARAM``, as when an active task's cap
+    is lowered). Its budget no longer counts toward the pool, so new tasks can be declared. The caller checks
+    the job has drained (every period settled); a cap already 0 is left as it is."""
+    if task_id not in entries:
+        raise RegistryError(f"task {task_id!r} is not in the registry")
+    entry = entries[task_id]
+    if entry.status != "retired":
+        raise RegistryError(f"task {task_id!r} is {entry.status}; only a retired task's cap is released")
+    if entry.mechanism != MECHANISM_CORPUS_GENERATION or entry.params.get("settlement") != SETTLEMENT_PERIOD_EMA:
+        raise RegistryError(f"task {task_id!r} is not paid by period; its cap is reserved while its EMA decays")
+    old_cap = _number(entry.params.get("cap"), "cap")
+    if old_cap == 0.0:
+        return dict(entries)
+    params = {**entry.params, "cap": 0.0, "floor": 0.0,
+              TAIL_CAP_PARAM: max(old_cap, _number(entry.params.get(TAIL_CAP_PARAM, 0.0), TAIL_CAP_PARAM))}
+    return {**entries, task_id: replace(entry, params=params)}
+
+
 def set_cap(
     entries: Mapping[str, TaskEntry],
     task_id: str,
