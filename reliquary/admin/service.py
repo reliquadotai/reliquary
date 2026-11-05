@@ -1614,7 +1614,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         qualification's; the request's is only checked against it."""
         from reliquary.eval import qualification as qual
         from reliquary.eval.grading import (
-            JobRows, collect_job_records, exhausted_prompts, job_complete,
+            EpisodeJobRows, JobRows, collect_job_records, exhausted_prompts, job_complete,
         )
         from reliquary.eval.prompt_source import parse_eval_source
         from reliquary.validator.corpus_job_status import stored_job_counts
@@ -1655,7 +1655,18 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail=f"provenance_mismatch: {differs}")
         if not (await stored_job_counts(records, job.job_id))["drained"]:
             raise HTTPException(status_code=409, detail="job_not_drained")
-        collected = await collect_job_records(job, records, **({"include_generation_status": True} if body.service_contract is not None else {}))
+        if job.episode is not None:
+            from reliquary.eval.job_grading import JobNotGradable
+
+            # Graded already by the order control's grader, from its signed transcripts: its grade documents.
+            try:
+                job_rows = await EpisodeJobRows.collect(job, records, allow_incomplete=body.allow_incomplete)
+            except JobNotGradable as exc:
+                raise HTTPException(status_code=409, detail=f"job_not_graded: {exc}"[:500]) from exc
+            collected = {"samples_by_prompt": job_rows.samples_by_prompt}
+        else:
+            collected = await collect_job_records(job, records, **({"include_generation_status": True} if body.service_contract is not None else {}))
+            job_rows = JobRows(job=job, collected=collected)
         from reliquary.validator.corpus_service import rebuild_ledgers
 
         snapshot, _ = await job_store.read_ledgers(job.job_id)
@@ -1670,7 +1681,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             # Every sample follows its slot's public draw, judged under the order's thresholds.
             verification = {"scheme": job.sampling.draw, "source": "order", "sampling_verified": True,
                             "judge": job.judge.to_contract(), "randomness": draw_randomness(job),
-                            "pin": declared.get("pin")}
+                            "pin": declared.get("pin"),
+                            # An episode's score is its signed sandbox's final reward.
+                            **({"grade": "signed-sandbox"} if job.episode is not None else {})}
             for entry in await entries_naming(job.job_id):
                 if body.service_contract is not None:
                     facts["generation_contract_sha256"] = entry.profile_sha256
@@ -1702,7 +1715,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                       "prompts_exhausted": len(exhausted),
                       "exhausted_problem_ids": [_problem_id(source, i) for i in exhausted],
                       **({"allow_incomplete": True} if body.allow_incomplete else {})}
-        return JobRows(job=job, collected=collected), provenance
+        return job_rows, provenance
 
     @router.post("/evaluations/{eval_id}/sandbox-session")
     async def evaluation_sandbox_session(eval_id: str, body: EvaluationSessionRequest,
@@ -1768,6 +1781,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     async def grade_evaluation(eval_id: str, body: GradeEvaluation, response: Response) -> dict:
         from reliquary.corpus.delivery import validated_delivery_id
         from reliquary.eval import grading
+        from reliquary.eval.prompt_source import REFERENCE_INTERACTIONS
 
         in_scope(eval_id)
         if deliveries is None or not getattr(deliveries, "evaluation_supported", True):
@@ -1818,7 +1832,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     # Refusals the caller can act on are answered now, not polled for.
                     sets = await grading.load_sets(body.set_ids, body.problems_per_set,
                                                    body.samples_per_set, subnet=eval_store)
-                    grading.require_gradable(sets)
+                    # A job on reference sets (SWE, TMax) is graded by its grader: its grades, never re-run here.
+                    grading.require_gradable(sets, pregraded=body.source == "job" and any(
+                        card.get("interaction") in REFERENCE_INTERACTIONS for card, _ in sets.values()))
                     grading.require_sandboxes(sets, require_sandbox)
                 except grading.SetUnknown as exc:
                     raise HTTPException(status_code=404, detail="set_unknown") from exc

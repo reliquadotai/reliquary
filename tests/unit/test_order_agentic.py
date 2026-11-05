@@ -4,7 +4,6 @@ control serves the job only when its episode is the recorded one."""
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 from dataclasses import replace
 from types import SimpleNamespace
@@ -12,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from reliquary.eval import qualification as qual
-from reliquary.eval.storage import SubnetEvalStore, subnet_key
+from reliquary.eval.storage import SubnetEvalStore
 from reliquary.infrastructure import corpus_job_store as job_store
 from tests.unit.test_admin_eval_jobs import admin  # noqa: F401
 from tests.unit.test_jobs_cli import registry  # noqa: F401
@@ -34,24 +33,25 @@ def _swe_episode(**over):
 
 @pytest.fixture
 def swe_set(admin, monkeypatch):  # noqa: F811
-    """A published SWE set of 4 references in the subnet bucket, its rows checked against a faked bridge."""
+    """A SWE set of 4 references, built and published, its rows checked against a faked bridge."""
+    from reliquary.corpus.delivery import LocalDirectorySink
     from reliquary.environment import agentic_swe, bridged_swe
     from reliquary.eval import rows as eval_rows
+    from reliquary.eval.sets import build_source_set
+    from reliquary.eval.storage import publish_set
 
     monkeypatch.setattr(agentic_swe, "episode_support_refusal", lambda *a, **k: None)
     monkeypatch.setattr(agentic_swe, "load_swe_source", lambda *a, **k: [None] * 100)
+    monkeypatch.setattr(bridged_swe, "split_length", lambda split: 100)
+    monkeypatch.setattr(bridged_swe, "package_version", lambda: "fixture")
+    monkeypatch.setattr(bridged_swe, "instance_id_of", lambda split, index: f"repo__x-{index}")
     monkeypatch.setattr(bridged_swe, "row_of", lambda split, index: (
         None, SimpleNamespace(instance_id=f"repo__x-{index}")))
     eval_rows._row_map.cache_clear()
-    rows = [{"problem_id": f"p{i}", "env": "reliquary-swe", "interaction": "swe", "split": "eval",
-             "source_index": i, "instance_id": f"repo__x-{i}", "set_id": SWE_SET} for i in range(4)]
-    body = b"".join(json.dumps(row, sort_keys=True).encode() + b"\n" for row in rows)
-    card = {"set_id": SWE_SET, "count": 4, "prompts_sha256": hashlib.sha256(body).hexdigest(),
-            "interaction": "swe", "source": "reliquary-swe", "env": "reliquary-swe", "split": "eval",
-            "source_kind": "catalog", "renderer_id": None}
-    store = SubnetEvalStore()
-    asyncio.run(store.put_bytes(subnet_key(SWE_SET, "set.json"), json.dumps(card).encode()))
-    asyncio.run(store.put_bytes(subnet_key(SWE_SET, "prompts.jsonl"), body))
+    card = build_source_set("reliquary-swe", split="eval", count=4, set_id=SWE_SET, out=admin.root / "swe",
+                     clock=lambda: 1.0)
+    asyncio.run(publish_set(admin.root / "swe", platform=LocalDirectorySink(admin.root / "p"),
+                            subnet=SubnetEvalStore()))
     yield card
     eval_rows._row_map.cache_clear()
 
@@ -326,3 +326,62 @@ def test_a_sandbox_that_fails_to_start_refuses_episode_orders_only():
     services, why = asyncio.run(order_sandbox_services(environ=environ, build=lambda c, **k: Broken(),
                                                        session_store=object()))
     assert services is None and "failed to start" in why
+
+
+# -- the order's grading ----------------------------------------------------------------------
+
+
+def _graded_episodes(admin, rewards, ungraded=()):  # noqa: F811
+    """Passing, settled episodes of the order (2 per problem) and the grades its grader wrote."""
+    grades = {}
+
+    async def read_grade(job_id, sid):
+        return grades.get(sid)
+
+    async def list_grade_ids(job_id):
+        return sorted(grades)
+
+    admin.records.read_grade, admin.records.list_grade_ids = read_grade, list_grade_ids
+    for prompt in range(3):
+        for k in range(2):
+            sid = f"{prompt * 2 + k:064x}"
+            admin.records.subs[sid] = {"prompt_index": prompt, "hotkey": "hk1", "completions": [{"tokens": [5, 2]}]}
+            admin.records.verdicts[sid] = {"passed": True, "audited": True, "hotkey": "hk1", "token_count": 7}
+            admin.records.settled.append(sid)
+            if sid not in ungraded:
+                reward = rewards[prompt]
+                grades[sid] = {"status": "ok", "replay_certified": True, "grade": {"reward": reward},
+                               "graded_success": reward == 1.0, "prompt_index": prompt, "hotkey": "hk1",
+                               "instance_id": f"repo__x-{prompt}"}
+
+
+def _grade(admin, eval_id="order-swe-e1", **kw):  # noqa: F811
+    import time
+
+    body = {"source": "job", "job_id": "order-eval-swe1", "set_ids": [SWE_SET], "problems_per_set": {SWE_SET: 3},
+            "samples_per_set": {SWE_SET: 2}, **kw}
+    for _ in range(200):
+        response = admin("POST", f"/admin/v1/evaluations/{eval_id}/grade", body)
+        if response.status_code != 202:
+            return response
+        time.sleep(0.02)
+    return response
+
+
+def test_an_episode_order_is_graded_from_its_graders_grades(admin, swe_set, qwen35):  # noqa: F811
+    assert admin("POST", "/admin/v1/jobs", _order()).status_code == 201
+    _graded_episodes(admin, rewards=[1.0, 0.0, 1.0])
+    response = _grade(admin)
+    assert response.status_code == 200, response.text
+    report = json.loads((admin.root / "p" / "evaluations" / "order-swe-e1" / "report.json").read_text())
+    verification = report["provenance"]["verification"]
+    assert verification["scheme"] == "gumbel_max" and verification["grade"] == "signed-sandbox"
+    assert report["provenance"]["job_complete"] is True
+    assert json.dumps(report).count("0.6666") >= 1, report        # 4 of 6 episodes solved
+
+
+def test_an_episode_order_with_ungraded_passes_waits_for_its_grader(admin, swe_set, qwen35):  # noqa: F811
+    assert admin("POST", "/admin/v1/jobs", _order()).status_code == 201
+    _graded_episodes(admin, rewards=[1.0, 1.0, 1.0], ungraded={f"{0:064x}"})
+    response = _grade(admin)
+    assert response.status_code == 409 and "job_not_graded" in response.text, response.text
