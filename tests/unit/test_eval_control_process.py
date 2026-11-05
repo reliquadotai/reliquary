@@ -162,6 +162,25 @@ def test_one_process_serves_eval_jobs_of_two_models(world, monkeypatch):
             assert contract["model_id"] == "customer/A"
             assert (await client.get("/corpus/jobs/default/job")).status_code == 404
             assert (await client.get("/corpus/job")).status_code == 404  # no legacy paths
+            # The public status routes the corpus validator serves: a miner reads its own audit state here too.
+            hotkey = "5F3sa2TJAWMqDhXG6jhV4N8ko9SxwGy8TpaNS1repo5EYjQX"
+            mine = await client.get(f"/corpus/jobs/order-eval-a/miners/{hotkey}")
+            assert mine.status_code == 200, mine.text
+            assert mine.json()["audit_state"] == "probation" and mine.json()["submissions_accepted"] == 0
+            assert (await client.get("/corpus/jobs/order-eval-a/miners/not-a-key")).status_code == 400
+            assert (await client.get(f"/corpus/jobs/order-eval-z/miners/{hotkey}")).status_code == 404
+            tasks = (await client.get("/corpus/tasks")).json()
+            assert "default" in {t["task_id"] for t in tasks["tasks"]}
+
+            class Board:
+                async def pay(self):
+                    return {"jobs": []}
+
+                async def close(self):
+                    return None
+
+            app.state.corpus_pay = Board()  # the chain read is the pay board's own test
+            assert (await client.get("/corpus/pay")).json() == {"jobs": []}
             headers = {"Authorization": "Bearer token-one"}
             claim = {"executor_id": "e1", "model_id": "customer/A", "model_revision": "a" * 40}
             first = await client.post("/corpus/internal/eval-audit/claim", json=claim,

@@ -1164,6 +1164,9 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     from reliquary.protocol.profiles import profile_from_contract, toploc_proof
     from reliquary.validator.corpus_hot_jobs import OTHER_MODEL, CorpusJobSet, job_drained
     from reliquary.validator.corpus_job_status import JobStats
+    from reliquary.validator.corpus_miner_status import (
+        MinerBook, feed, proof_thresholds, read_recent_windows,
+    )
     from reliquary.validator.corpus_service import (
         CorpusJobRoutes,
         build_corpus_jobs_router,
@@ -1179,6 +1182,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     from reliquary.validator.corpus_settlement import SETTLE_FULL_LIST_SECONDS, settler_fed
     from reliquary.validator.corpus_validator import (
         WINDOW_SETTLED,
+        add_public_corpus_routes,
         build_corpus_audit_wiring,
         window_settled,
     )
@@ -1261,22 +1265,31 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                             vocab_size=vocab_size, proof=proof, renderer=renderer,
                             prompt_job_for=prompt_job_for, seen_index=seen_index,
                             is_banned=is_banned, stats=JobStats())
+        # The miner status route's view (`/corpus/jobs/{job}/miners/{hotkey}`), fed by the same reports.
+        # A draw job carries no TOPLOC proof: its judge is in the contract.
+        w.audit_params, w.miner_states = params, miner_states
+        w.miners = MinerBook(job_id=job.job_id, task_id=entry.task_id, records=records,
+                             read_windows=read_recent_windows,
+                             thresholds=None if has_draw(job) else proof_thresholds(proof))
+        on_verdict, on_settled = feed(w.stats, w.miners)
         # Paid by period, as every corpus task (design 2026-10-03): a period
         # closes once the auditor holds nothing undecided received in it.
         w.settler = CorpusPeriodSettler(
             task_id=entry.task_id, job_id=job.job_id, cap=cap, records=records,
             archives=R2PeriodArchives(guard=settle_archives),
             oldest_pending=lambda: w.auditor.oldest_pending_received_at(),
-            on_settled=w.stats.settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
+            on_settled=on_settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
             max_price=cp.max_price(entry.params), max_input_price=cp.max_input_price(entry.params))
         w.auditor = eval_auditor(
             job_id=job.job_id, records=records, tokenizer=tokenizer, proof=proof,
             params=params, miner_states=miner_states, beacon=beacon, round_at=round_at,
-            on_verdict=settler_fed(w.settler, w.stats.observe), vocab_size=vocab_size,
+            on_verdict=settler_fed(w.settler, on_verdict), on_voided=w.miners.voided, vocab_size=vocab_size,
             job=job, job_store=store, reopen_slots=is_eval_source(job.prompt_source) or has_draw(job),
             draw_job=job if has_draw(job) else None,
             remote=dispatcher.view(job.checkpoint_repo, job.checkpoint_revision, proof,
                                    job.job_id, job.judge if has_draw(job) else None))
+
+        w.settler.on_window = w.miners.window
 
         def on_accepted(submission_id: str) -> None:
             w.stats.accepted()
@@ -1376,6 +1389,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             raise HTTPException(status_code=404, detail="corpus_job_not_served")
         return status
 
+    add_public_corpus_routes(app, routes)
     app.include_router(build_eval_executor_router(dispatcher=dispatcher, directory=directory,
                                                   qualifications=qualifications))
     job_set = CorpusJobSet(

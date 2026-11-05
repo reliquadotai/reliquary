@@ -693,6 +693,121 @@ def _lease_verifier(verify_skip_signature):
     return verify_corpus_lease_signature
 
 
+def add_public_corpus_routes(app, routes) -> None:
+    """The public, read-only routes over ``app.state.corpus_jobs``: `/corpus/pay`,
+    `/corpus/tasks` and one hotkey's status per job. The corpus validator and
+    the order control both serve them."""
+    @app.get("/corpus/pay")
+    async def corpus_pay() -> dict:
+        # Public: an estimate of what each active period job pays per verified
+        # token, recomputed at most once a minute (`corpus_pay`).
+        job_set = getattr(app.state, "corpus_jobs", None)
+        if job_set is None:
+            raise HTTPException(status_code=503, detail="corpus_pay_unavailable")
+        board = getattr(app.state, "corpus_pay", None)
+        if board is None:
+            from reliquary.validator.corpus_pay import PayBoard
+
+            board = app.state.corpus_pay = PayBoard(job_set)
+        try:
+            return await board.pay()
+        except Exception as exc:
+            logger.warning("corpus pay unavailable: %r", exc)
+            raise HTTPException(status_code=503, detail="corpus_pay_unavailable") from exc
+
+    async def stop_pay_board() -> None:
+        board = getattr(app.state, "corpus_pay", None)
+        if board is not None:
+            await board.close()
+
+    app.router.on_shutdown.append(stop_pay_board)
+
+    tasks_cache: dict = {}
+
+    async def read_tasks() -> dict:
+        reader = getattr(app.state, "task_registry_reader", None)
+        if reader is None:
+            from reliquary.infrastructure.task_registry_store import read_registry as reader
+        now = time.time()
+        entries, _ = await reader()
+        tasks = [
+            {"task_id": e.task_id, "mechanism": e.mechanism, "cap": float(e.params["cap"]),
+             "status": e.status, "job_id": getattr(e, "job_id", None),
+             "admission": getattr(e, "admission", "open"),
+             "retired_at": getattr(e, "retired_at", None)}
+            for e in sorted(entries.values(), key=lambda e: e.task_id)
+        ]
+        body = {"as_of": now, "tasks": tasks,
+                "active_cap_total": round(math.fsum(t["cap"] for t in tasks
+                                                    if t["status"] == "active"), 9)}
+        tasks_cache.update(at=now, body=body)
+        return body
+
+    async def refresh_tasks() -> None:
+        try:
+            await read_tasks()
+        except Exception as exc:
+            logger.warning("corpus tasks: registry unavailable: %r", exc)
+
+    def refresh_tasks_behind() -> None:
+        # One refresh at a time; the task is kept so it is not collected mid-read.
+        running = tasks_cache.get("refresh")
+        if running is None or running.done():
+            tasks_cache["refresh"] = asyncio.get_running_loop().create_task(refresh_tasks())
+
+    # The serving process warms it at start (`run_corpus_validator`).
+    app.state.warm_corpus_tasks = refresh_tasks
+
+    async def stop_tasks_refresh() -> None:
+        task = tasks_cache.get("refresh")
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    app.router.on_shutdown.append(stop_tasks_refresh)
+
+    @app.get("/corpus/tasks")
+    async def corpus_tasks() -> dict:
+        # Public: every declared task's emission share. Served from the last registry
+        # read at once; a stale one is refreshed behind, so no request waits on R2.
+        if "body" in tasks_cache:
+            if tasks_cache["at"] + TASKS_CACHE_SECONDS <= time.time():
+                refresh_tasks_behind()
+            return tasks_cache["body"]
+        try:
+            return await read_tasks()
+        except Exception as exc:
+            logger.warning("corpus tasks: registry unavailable: %r", exc)
+            raise HTTPException(status_code=503, detail="task_registry_unavailable") from exc
+
+    async def miner_status(job_id: str, hotkey: str) -> dict:
+        # Public: this hotkey's own state and counts, from memory, cached.
+        from reliquary.validator.corpus_miner_status import valid_hotkey
+
+        if not valid_hotkey(hotkey):
+            raise HTTPException(status_code=400, detail="invalid_hotkey")
+        job_set = getattr(app.state, "corpus_jobs", None)
+        try:
+            status = await job_set.miner_status(job_id, hotkey) if job_set is not None else None
+        except Exception as exc:
+            logger.warning("corpus miner status on %s unavailable: %r", job_id, exc)
+            raise HTTPException(status_code=503, detail="corpus_miner_status_unavailable") from exc
+        if status is None:
+            raise HTTPException(status_code=404, detail="corpus_job_not_served")
+        return status
+
+    @app.get("/corpus/jobs/{job_id}/miners/{hotkey}")
+    async def corpus_miner_status(job_id: str, hotkey: str) -> dict:
+        return await miner_status(job_id, hotkey)
+
+    @app.get("/corpus/miners/{hotkey}")
+    async def corpus_miner_status_legacy(hotkey: str) -> dict:
+        # The legacy paths answer for the default job.
+        if routes.default is None:
+            raise HTTPException(status_code=404, detail="corpus_job_not_served")
+        return await miner_status(routes.default, hotkey)
+
+
 def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
                           proof_chunk_tokens, prompt_job_for=None, vocab_size=None,
                           registration=None, contract=None,
@@ -803,115 +918,7 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
             raise HTTPException(status_code=404, detail="corpus_job_not_served")
         return status
 
-    @app.get("/corpus/pay")
-    async def corpus_pay() -> dict:
-        # Public: an estimate of what each active period job pays per verified
-        # token, recomputed at most once a minute (`corpus_pay`).
-        job_set = getattr(app.state, "corpus_jobs", None)
-        if job_set is None:
-            raise HTTPException(status_code=503, detail="corpus_pay_unavailable")
-        board = getattr(app.state, "corpus_pay", None)
-        if board is None:
-            from reliquary.validator.corpus_pay import PayBoard
-
-            board = app.state.corpus_pay = PayBoard(job_set)
-        try:
-            return await board.pay()
-        except Exception as exc:
-            logger.warning("corpus pay unavailable: %r", exc)
-            raise HTTPException(status_code=503, detail="corpus_pay_unavailable") from exc
-
-    async def stop_pay_board() -> None:
-        board = getattr(app.state, "corpus_pay", None)
-        if board is not None:
-            await board.close()
-
-    app.router.on_shutdown.append(stop_pay_board)
-
-    tasks_cache: dict = {}
-
-    async def read_tasks() -> dict:
-        reader = getattr(app.state, "task_registry_reader", None)
-        if reader is None:
-            from reliquary.infrastructure.task_registry_store import read_registry as reader
-        now = time.time()
-        entries, _ = await reader()
-        tasks = [
-            {"task_id": e.task_id, "mechanism": e.mechanism, "cap": float(e.params["cap"]),
-             "status": e.status, "job_id": getattr(e, "job_id", None),
-             "admission": getattr(e, "admission", "open"),
-             "retired_at": getattr(e, "retired_at", None)}
-            for e in sorted(entries.values(), key=lambda e: e.task_id)
-        ]
-        body = {"as_of": now, "tasks": tasks,
-                "active_cap_total": round(math.fsum(t["cap"] for t in tasks
-                                                    if t["status"] == "active"), 9)}
-        tasks_cache.update(at=now, body=body)
-        return body
-
-    async def refresh_tasks() -> None:
-        try:
-            await read_tasks()
-        except Exception as exc:
-            logger.warning("corpus tasks: registry unavailable: %r", exc)
-
-    def refresh_tasks_behind() -> None:
-        # One refresh at a time; the task is kept so it is not collected mid-read.
-        running = tasks_cache.get("refresh")
-        if running is None or running.done():
-            tasks_cache["refresh"] = asyncio.get_running_loop().create_task(refresh_tasks())
-
-    # The serving process warms it at start (`run_corpus_validator`).
-    app.state.warm_corpus_tasks = refresh_tasks
-
-    async def stop_tasks_refresh() -> None:
-        task = tasks_cache.get("refresh")
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-
-    app.router.on_shutdown.append(stop_tasks_refresh)
-
-    @app.get("/corpus/tasks")
-    async def corpus_tasks() -> dict:
-        # Public: every declared task's emission share. Served from the last registry
-        # read at once; a stale one is refreshed behind, so no request waits on R2.
-        if "body" in tasks_cache:
-            if tasks_cache["at"] + TASKS_CACHE_SECONDS <= time.time():
-                refresh_tasks_behind()
-            return tasks_cache["body"]
-        try:
-            return await read_tasks()
-        except Exception as exc:
-            logger.warning("corpus tasks: registry unavailable: %r", exc)
-            raise HTTPException(status_code=503, detail="task_registry_unavailable") from exc
-
-    async def miner_status(job_id: str, hotkey: str) -> dict:
-        # Public: this hotkey's own state and counts, from memory, cached.
-        from reliquary.validator.corpus_miner_status import valid_hotkey
-
-        if not valid_hotkey(hotkey):
-            raise HTTPException(status_code=400, detail="invalid_hotkey")
-        job_set = getattr(app.state, "corpus_jobs", None)
-        try:
-            status = await job_set.miner_status(job_id, hotkey) if job_set is not None else None
-        except Exception as exc:
-            logger.warning("corpus miner status on %s unavailable: %r", job_id, exc)
-            raise HTTPException(status_code=503, detail="corpus_miner_status_unavailable") from exc
-        if status is None:
-            raise HTTPException(status_code=404, detail="corpus_job_not_served")
-        return status
-
-    @app.get("/corpus/jobs/{job_id}/miners/{hotkey}")
-    async def corpus_miner_status(job_id: str, hotkey: str) -> dict:
-        return await miner_status(job_id, hotkey)
-
-    @app.get("/corpus/miners/{hotkey}")
-    async def corpus_miner_status_legacy(hotkey: str) -> dict:
-        # The legacy paths answer for the default job.
-        if routes.default is None:
-            raise HTTPException(status_code=404, detail="corpus_job_not_served")
-        return await miner_status(routes.default, hotkey)
+    add_public_corpus_routes(app, routes)
 
     @app.get("/corpus/jobs/{job_id}/eval-prompts")
     async def corpus_eval_prompts(job_id: str) -> Response:
