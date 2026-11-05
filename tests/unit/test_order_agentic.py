@@ -120,3 +120,42 @@ def test_a_single_turn_set_takes_no_episode(admin, qwen35):  # noqa: F811
     body = _order(env="logic", eval_set_id="logic-eval-s1-n8", max_new_tokens=512)
     response = admin("POST", "/admin/v1/jobs", body)
     assert response.status_code == 422 and "single-turn" in response.text, response.text
+
+
+# -- the order control --------------------------------------------------------------------------
+
+
+def test_the_order_control_serves_the_recorded_episode_only(admin, swe_set, qwen35):  # noqa: F811
+    from reliquary.validator.eval_control import order_job_refusal, qualification_refusal
+
+    assert admin("POST", "/admin/v1/jobs", _order()).status_code == 201
+    job, declared = _served()
+    entry = admin.registry["entries"]["order-eval-swe1"]
+    assert order_job_refusal(entry, job) is None
+    assert qualification_refusal(entry, job, declared, None) is None
+    longer = replace(job, episode=replace(job.episode, max_turns=job.episode.max_turns + 1))
+    assert "episode" in qualification_refusal(entry, longer, declared, None)
+    assert "episode" in qualification_refusal(entry, job, {**declared, "episode": None}, None)
+
+
+def test_the_order_control_refuses_an_unsigned_or_unrendered_episode(admin, swe_set, qwen35):  # noqa: F811
+    from reliquary.corpus.job import EXECUTION_REPLAY
+    from reliquary.validator.eval_control import order_job_refusal
+
+    assert admin("POST", "/admin/v1/jobs", _order()).status_code == 201
+    job, _ = _served()
+    entry = admin.registry["entries"]["order-eval-swe1"]
+    replayed = replace(job, episode=replace(job.episode, execution=EXECUTION_REPLAY, sandbox=None))
+    assert "signed sandbox" in order_job_refusal(entry, replayed)
+    other = replace(entry, contract={**entry.contract, "model_architecture": "Qwen3ForCausalLM"})
+    assert "episode_renderer_unavailable" in order_job_refusal(other, job)
+
+
+def test_a_qualified_order_never_runs_an_episode(admin, swe_set, qwen35):  # noqa: F811
+    from reliquary.validator.eval_control import qualification_refusal
+
+    assert admin("POST", "/admin/v1/jobs", _order()).status_code == 201
+    job, declared = _served()
+    entry = admin.registry["entries"]["order-eval-swe1"]
+    qualified = {**declared, "schema": "reliquary/eval-job/v1", "qualification_id": "q1"}
+    assert "forced-draw" in qualification_refusal(entry, job, qualified, {"qualification_id": "q1"})

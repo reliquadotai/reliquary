@@ -35,6 +35,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from reliquary.corpus.eval_draw import has_draw
+from reliquary.corpus.job import is_signed_sandbox
 from reliquary.eval.qualify_protocol import EvalClaimRequest, QualifyResult
 from reliquary.protocol.toploc import ChunkResult
 from reliquary.validator.corpus_audit_protocol import (
@@ -883,6 +884,9 @@ def order_job_refusal(entry, job) -> str | None:
     if is_eval_job_id(entry.job_id):
         if not is_eval_source(job.prompt_source):
             return f"prompt source {job.prompt_source!r} is not an eval set"
+        if getattr(job, "episode", None) is not None and not is_signed_sandbox(job):
+            # Its steps would be trusted to the miner's box (or replayed by a grader this control lacks).
+            return "an order plays an episode only in the signed sandbox"
     elif is_gen_job_id(entry.job_id):
         from reliquary.eval.qualification import order_environment_refusal
         from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS
@@ -922,6 +926,12 @@ def order_job_refusal(entry, job) -> str | None:
     if architecture not in SUPPORTED_ARCHITECTURES:
         # Whatever wrote the entry: this table, never a self-declared string.
         return f"its architecture {architecture!r} is not supported"
+    if getattr(job, "episode", None) is not None:
+        from reliquary.eval.episode_jobs import episode_renderer_refusal
+
+        refusal = episode_renderer_refusal(architecture, job.episode.renderer)
+        if refusal is not None:
+            return refusal
     if (profile.model_id, profile.model_revision) != (job.checkpoint_repo,
                                                       job.checkpoint_revision):
         return "its contract's model is not the job's checkpoint"
@@ -946,6 +956,9 @@ def qualification_refusal(entry, job, declared: dict | None, record: dict | None
         return "no order record names this job: only the admin declares order jobs"
     if declared.get("schema") == qual.ORDER_JOB_SCHEMA_V2:
         return pinned_order_refusal(entry, job, declared)
+    if getattr(job, "episode", None) is not None:
+        # A qualification measured single-turn completions: an episode order is a forced-draw one.
+        return "an episode order is a forced-draw order, never a qualified one"
     if record is None or record.get("qualification_id") != declared.get("qualification_id"):
         return f"its qualification {declared.get('qualification_id')!r} is not readable"
     if record.get("status") != qual.QUALIFIED:
@@ -1032,7 +1045,7 @@ def pinned_order_refusal(entry, job, declared: dict) -> str | None:
     sampling = {"temperature": job.sampling.temperature, "top_p": job.sampling.top_p,
                 "top_k": job.sampling.top_k, **({"min_p": job.sampling.min_p} if job.sampling.min_p else {})}
     # Every condition the admin declared, compared whole: a job unlike its record is never served.
-    keys = ("sampling", "max_new_tokens", "thinking", "samples", "seed", "n", "min_new_tokens",
+    keys = ("sampling", "max_new_tokens", "thinking", "episode", "samples", "seed", "n", "min_new_tokens",
             "max_prompt_tokens", "judge", "audit_q")
     wanted = {k: declared.get(k) for k in keys}
     try:
@@ -1042,6 +1055,7 @@ def pinned_order_refusal(entry, job, declared: dict) -> str | None:
     params = getattr(entry, "params", None) or {}
     given = {"sampling": sampling, "max_new_tokens": job.sampling.max_new_tokens,
              "thinking": corpus_service.CHAT_TEMPLATE_RENDERERS.get(job.renderer_id),
+             "episode": job.episode.to_contract() if getattr(job, "episode", None) is not None else None,
              "samples": job.slots_per_prompt, "seed": job.seed, "n": job.sampling.n,
              "min_new_tokens": job.sampling.min_new_tokens,
              "max_prompt_tokens": getattr(job, "max_prompt_tokens", None), "judge": job.judge.to_contract(),
