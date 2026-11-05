@@ -288,7 +288,7 @@ def _card(**over):
                                            tools=["bash"])), "frozen from"),
 ])
 def test_jobs_create_holds_the_episode_to_the_set(episode, why):
-    from reliquary.cli.main import _refuse_episode_disagreeing_with_set
+    from reliquary.eval.episode_jobs import refuse_episode_disagreeing_with_set as _refuse_episode_disagreeing_with_set
 
     if why is None:
         _refuse_episode_disagreeing_with_set(_card(), SET_ID, episode, episode["renderer"])
@@ -298,7 +298,7 @@ def test_jobs_create_holds_the_episode_to_the_set(episode, why):
 
 
 def test_jobs_create_refuses_another_package():
-    from reliquary.cli.main import _refuse_episode_disagreeing_with_set
+    from reliquary.eval.episode_jobs import refuse_episode_disagreeing_with_set as _refuse_episode_disagreeing_with_set
 
     episode = terminal_episode()
     with pytest.raises(ValueError, match="environment"):
