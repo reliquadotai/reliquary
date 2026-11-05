@@ -33,9 +33,13 @@ docker run -d --name order-control --network host \
 
 Signed episode orders also need the order control's own sandbox token key (an Ed25519 PEM, mode 0600,
 `python -m reliquary_sandbox.attest.signing generate PATH`; never the corpus validator's key): mount it read-only
-and set `RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE`, `RELIQUARY_SANDBOX_VALIDATOR_KEY_ID`,
-`RELIQUARY_SANDBOX_VALIDATOR_HOTKEY` (the ss58 address miners sign session requests for) and
-`RELIQUARY_SANDBOX_MACHINE_IDS`. Each gateway lists the key's public half in its validator keys.
+and set `RELIQUARY_ORDER_SANDBOX_KEY_FILE`, `RELIQUARY_ORDER_SANDBOX_KEY_ID`,
+`RELIQUARY_ORDER_SANDBOX_HOTKEY` (the ss58 address miners sign session requests for), optionally
+`RELIQUARY_ORDER_SANDBOX_RETIRED_KEYS`, and `RELIQUARY_SANDBOX_MACHINE_IDS`. The key settings have their own
+names so the corpus validator's (`RELIQUARY_SANDBOX_VALIDATOR_*`) are never read here; the sessions are stored
+under `reliquary/sandbox/order-sessions/`, which no other validator restores. Each gateway lists the key's
+public half in its validator keys. Without these settings, or when the sandbox services fail to start,
+episode orders are refused (the reason is in the control's status) and every other order is served.
 An order job's sandbox sessions are `/corpus/jobs/{job_id}/sandbox/sessions`, inside the order jobs' location.
 
 It needs network to drand and to the Hugging Face hub. Route it with the locations

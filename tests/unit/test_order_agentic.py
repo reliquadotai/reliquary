@@ -206,6 +206,24 @@ def _control(admin, tmp_path, monkeypatch, sandbox):  # noqa: F811
                        "resolver_factory": lambda split: SimpleNamespace(resolve=None)})
 
 
+def _order_services(tmp_path, route_prefix):
+    from pathlib import Path
+
+    from reliquary.infrastructure.sandbox_store import MemorySessionStore
+    from reliquary.validator.sandbox_wiring import SandboxValidatorConfig, build_sandbox_services
+    from tests.unit.sandbox_fixtures import signer
+    from tests.unit.test_signed_grading_and_wiring import VALIDATOR
+
+    signer(tmp_path, "v", "v1")
+
+    async def none(*args):
+        return [] if not args else None
+
+    return build_sandbox_services(SandboxValidatorConfig(Path(tmp_path / "v.pem"), "v1", {}, None),
+                                  validator_hotkey=VALIDATOR, session_store=MemorySessionStore(),
+                                  read_documents=none, fetch_report=none, route_prefix=route_prefix)
+
+
 def test_an_episode_order_is_refused_without_the_controls_sandbox(admin, swe_set, qwen35, tmp_path,  # noqa: F811
                                                                   monkeypatch):
     assert admin("POST", "/admin/v1/jobs", _order()).status_code == 201
@@ -228,8 +246,7 @@ def test_an_episode_order_is_wired_and_never_paid_before_its_grade(admin, swe_se
     from reliquary.validator.signed_grading import SignedEpisodeGrader
     from tests.unit.sandbox_fixtures import claims, signer, transcript
     from tests.unit.test_corpus_period_settlement import GENESIS, Archives, at, verdict
-    from tests.unit.test_signed_grading_and_wiring import _services
-
+    from reliquary.protocol.sandbox_session import JOB_SCOPED_PREFIX
     from reliquary.validator import corpus_service
 
     settle = corpus_period_settlement.CorpusPeriodSettler.settle_once
@@ -241,7 +258,7 @@ def test_an_episode_order_is_wired_and_never_paid_before_its_grade(admin, swe_se
 
     monkeypatch.setattr(corpus_service, "build_corpus_router", spy)
     assert admin("POST", "/admin/v1/jobs", _order()).status_code == 201
-    _, services = _services(tmp_path)
+    services = _order_services(tmp_path, JOB_SCOPED_PREFIX)
     app, job_set = _control(admin, tmp_path, monkeypatch, services)
     job_id, sid = "order-eval-swe1", "a" * 64
 
@@ -255,8 +272,9 @@ def test_an_episode_order_is_wired_and_never_paid_before_its_grade(admin, swe_se
 
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://o") as client:
             # The session route is mounted (an unsigned open is refused, never 404).
-            opened = await client.post("/corpus/sandbox/sessions", json={})
+            opened = await client.post(f"/corpus/jobs/{job_id}/sandbox/sessions", json={})
             assert opened.status_code not in (404, 405), opened.text
+            assert (await client.post("/corpus/sandbox/sessions", json={})).status_code == 404
         # One passing, audited episode received in period 3; it is paid only once graded.
         records = BucketRecordStore()
         signed = transcript(signer(tmp_path, "v", "v1"), signer(tmp_path, "m", "k1"), claims(), reward=1.0)
@@ -312,6 +330,7 @@ def test_the_order_control_reads_only_its_own_sandbox_key(tmp_path):
     assert kwargs["validator_hotkey"] == "5Order"
     # Its sessions are its own: the corpus validator never restores them, nor it the corpus validator's.
     assert kwargs["session_store"]._prefix == ORDER_SESSION_PREFIX
+    assert kwargs["route_prefix"] == "/corpus/jobs/{job_id}"
 
 
 def test_a_sandbox_that_fails_to_start_refuses_episode_orders_only():

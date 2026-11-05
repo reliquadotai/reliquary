@@ -1440,7 +1440,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     app = FastAPI()
     app.include_router(build_corpus_jobs_router(routes, legacy=False))
     if sandbox is not None:
-        # /corpus/sandbox/sessions: the signed episode orders' sessions, under this control's key.
+        # /corpus/jobs/{job_id}/sandbox/sessions: the episode orders' sessions, under this control's key.
         app.include_router(sandbox.router)
         app.state.corpus_sandbox = sandbox
 
@@ -1616,6 +1616,8 @@ async def order_sandbox_services(*, registration=None, environ=None, build=None,
 
     from reliquary.validator.corpus_validator import start_sandbox_services
 
+    from reliquary.protocol.sandbox_session import JOB_SCOPED_PREFIX
+
     environ = os.environ if environ is None else environ
     try:
         from reliquary.validator.sandbox_wiring import SandboxValidatorConfig, build_sandbox_services
@@ -1632,7 +1634,7 @@ async def order_sandbox_services(*, registration=None, environ=None, build=None,
             session_store = R2SessionStore(prefix=ORDER_SESSION_PREFIX)
         services = (build or build_sandbox_services)(
             config, validator_hotkey=config.validator_hotkey, registration=registration,
-            session_store=session_store)
+            session_store=session_store, route_prefix=JOB_SCOPED_PREFIX)
     except Exception as exc:  # noqa: BLE001 - isolated: single-turn orders still serve
         # The key loader's errors name the path and its mode, never the key.
         logger.error("ALERT: order sandbox services not built: %r; episode orders are refused", exc)
