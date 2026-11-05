@@ -608,7 +608,9 @@ class CorpusAuditor:
                 continue
             ok, detail = eval_draw.judge(diags, getattr(self._draw_job, "judge", None))
             results[i] = {**results[i], "forced_draw": detail} if ok else {
-                **results[i], "passed": False, "reason": eval_draw.REASON_DRAW_MISMATCH, "forced_draw": detail}
+                **results[i], "passed": False, "reason": eval_draw.REASON_DRAW_MISMATCH, "forced_draw": detail,
+                # Kernel drift (``eval_draw.judge``): refused, its slot reopened, the miner not charged.
+                **({} if detail.get("penalty", True) else {"penalty": False})}
 
     def _log_batch(self, records: list[dict], queue: list, forward: float,
                    verify: float, called: float | None = None) -> None:
@@ -1014,7 +1016,8 @@ class CorpusAuditor:
         now = self._clock()
         failures: dict[str, list[str]] = {}
         for k in judged:
-            if not outcomes[k]["passed"]:
+            # A refusal without penalty (forced-draw drift) is no confirmed failure: no suspicion, no ban.
+            if not outcomes[k]["passed"] and outcomes[k].get("penalty", True):
                 failures.setdefault(records[k]["hotkey"], []).append(ids[k])
         failed_hotkeys = set(failures)
         states: dict[str, MinerState] = {}

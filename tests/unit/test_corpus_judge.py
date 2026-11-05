@@ -183,6 +183,23 @@ def test_a_failure_is_reaudited_before_it_counts(monkeypatch):
     assert state.audited_passed == 101
 
 
+@pytest.mark.parametrize("penalty, charged", [(False, False), (True, True)])
+def test_a_draw_refusal_without_penalty_is_no_confirmed_failure(monkeypatch, penalty, charged):
+    """Forced-draw kernel drift (``eval_draw.judge`` penalty False) refuses the sample and leaves the miner's
+    state alone; any other refusal, confirmed by the re-audit, still makes it suspect."""
+    sid = _ids(False, 1)[0]
+    records = _Records({sid: _rec(0)})
+    states = _States({HK: SAMPLED})
+    auditor = _judge(records, states, _Clock(T0 + 1), params=AuditParams())
+    refusal = {"passed": False, "reason": "draw_mismatch", "forced_draw": {"max_gap": 5.3},
+               **({} if penalty else {"penalty": False})}
+    monkeypatch.setattr(auditor, "_judge_many", lambda batch: [dict(refusal) for _ in batch])
+    asyncio.run(auditor.judge_many([sid]))
+    assert records.verdicts[sid]["passed"] is False
+    state = states.states[HK]
+    assert bool(state.confirmed_failures) is charged and (state.suspect_until is not None) is charged
+
+
 def test_a_confirmed_failure_audits_every_held_record_of_that_hotkey():
     hit = _ids(True, 1)[0]
     held = _ids(False, 3)

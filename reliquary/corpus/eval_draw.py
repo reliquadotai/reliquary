@@ -51,6 +51,12 @@ EVAL_MATCH_FLOOR = 0.98
 EVAL_GAP_TOLERANCE = 4.0
 EVAL_TERMINAL_GAP = 3.0
 EVAL_MATCH_GRACE = 8
+# A sample that follows the draw but misses one token by a gap over the job's tolerance and at most this much is
+# refused without a penalty: its slot reopens, the miner is not counted a failure. Honest misses come from bf16
+# kernel drift between the miner's engine and the audit and reach 5.3 (Gemma 4 on sdpa, 2026-11-05; 4.2 on a Qwen3
+# control): charged as confirmed failures they suspended honest miners (3 of 1,035 samples on Qwen3-8B,
+# 2026-11-04). A token written in place of the draw is usually far beyond it; past it, the failure counts.
+EVAL_FORGERY_GAP = 8.0
 REASON_DRAW_SLOT_TAKEN = "draw_slot_taken"
 REASON_BAD_CURSOR = "bad_cursor"
 
@@ -167,6 +173,9 @@ def judge(diags, policy: Any = None) -> tuple[bool, dict[str, Any]]:
     * end where the draw ended it: the last token within ``EVAL_TERMINAL_GAP`` (a sample cut short is not a
       near-tie).
 
+    A refused sample's detail says ``penalty``: False when it followed the draw and ended where it should, its
+    worst miss only a little over the tolerance (``EVAL_FORGERY_GAP``): kernel drift, never charged to the miner.
+
     ``policy``: the job's ``corpus.job.DrawJudge``; None, the defaults."""
     gap_tolerance, terminal_gap = ((EVAL_GAP_TOLERANCE, EVAL_TERMINAL_GAP) if policy is None
                                    else (policy.gap_tolerance, policy.terminal_gap))
@@ -180,9 +189,11 @@ def judge(diags, policy: Any = None) -> tuple[bool, dict[str, Any]]:
         if not worst or detail["match"] < worst["match"]:
             worst = detail
         followed = counted > 0 and misses <= allowed_misses(counted, policy)
-        if (not followed or _gap(d.max_cdf_miss) > gap_tolerance
-                or _gap(d.last_miss) > terminal_gap):
-            return False, detail
+        ended = _gap(d.last_miss) <= terminal_gap
+        if not followed or not ended or _gap(d.max_cdf_miss) > gap_tolerance:
+            # Penalised unless the one fault is a miss a little over the tolerance (``EVAL_FORGERY_GAP``).
+            drift = followed and ended and _gap(d.max_cdf_miss) <= max(EVAL_FORGERY_GAP, gap_tolerance)
+            return False, {**detail, "penalty": not drift}
     return True, worst
 
 
@@ -196,6 +207,6 @@ def parse_draw(raw: Mapping[str, Any]) -> str | None:
     return value
 
 
-__all__ = ["EVAL_DRAW", "EVAL_DRAW_DOMAIN", "EVAL_GAP_TOLERANCE", "EVAL_TERMINAL_GAP", "REASON_BAD_CURSOR", "REASON_DRAW_MISMATCH", "REASON_DRAW_SLOT_TAKEN", "allowed_misses", "attempt_digests", "diagnostics", "draw_context",
+__all__ = ["EVAL_DRAW", "EVAL_DRAW_DOMAIN", "EVAL_FORGERY_GAP", "EVAL_GAP_TOLERANCE", "EVAL_TERMINAL_GAP", "REASON_BAD_CURSOR", "REASON_DRAW_MISMATCH", "REASON_DRAW_SLOT_TAKEN", "allowed_misses", "attempt_digests", "diagnostics", "draw_context",
            "draw_randomness", "has_draw", "job_warp", "judge", "match_rate", "parse_draw", "rollout_index", "slot_count",
            "slot_key", "uniforms"]
