@@ -254,7 +254,11 @@ At shutdown, the session writes still in flight get 10 s.
 ### Session route
 
 The route is `POST /corpus/sandbox/sessions` (and `/{id}/close`) on the corpus app.
-The existing `/corpus` nginx location and tunnel serve it. A close carries a transcript
+The existing `/corpus` nginx location and tunnel serve it. A job with scoped submissions
+(an order job, served by the order control) has its own: `POST
+/corpus/jobs/{job_id}/sandbox/sessions` (and `/{id}/close`), signed for that path, which
+the order jobs' location (`reliquary corpus order-nginx`) already routes; the miner picks
+it from the job. A close carries a transcript
 of up to 8 MiB plus 64 KiB of envelope, so the `/corpus` location's
 `client_max_body_size` must be at least 9m. The current edge template sets 128m; check
 any other proxy in front.

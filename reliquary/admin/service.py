@@ -160,6 +160,9 @@ class CreateJob(BaseModel):
     # Eval and generation orders: the ceiling, converted to alpha when the task
     # is first declared (a replay keeps the first conversion).
     max_price_usd_per_mtoken: TokenCeiling | None = None
+    # A forced-draw eval order on a SWE or bridged (TMax) set: the manifest's signed-sandbox
+    # `episode` that plays its references (as `jobs create --episode-file`).
+    episode: dict[str, Any] | None = None
 
 
 class OrderSampling(BaseModel):
@@ -770,9 +773,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         its own files (``orders.models``), its thresholds are its judge, and its declared conditions are the
         order record the order control checks the job against."""
         from reliquary.eval import qualification as qual
+        from reliquary.eval.episode_jobs import set_contract_environment
         from reliquary.eval.prompt_source import eval_source_for, register_eval_prompts
         from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
-        from reliquary.protocol.external_eval import contract_environment_for
 
         if body.revision is None:
             raise HTTPException(status_code=422, detail="a forced-draw order pins its model revision")
@@ -816,11 +819,15 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 raise HTTPException(status_code=422, detail=f"set {body.eval_set_id} is a {card.get('env')} set")
             if body.prompt_count > int(card["count"]):
                 raise HTTPException(status_code=422, detail=f"set {body.eval_set_id} holds {card['count']} problems")
+            episode = order_episode(body, card, pin, evaluation=evaluation)
             source = eval_source_for(body.eval_set_id, prompts_body, body.prompt_count)
             register_eval_prompts(source, prompts_body)
-            prompt_source, contract_environment = source.name, contract_environment_for(card)
+            prompt_source, contract_environment = source.name, set_contract_environment(card)
             declared_source = {"set_id": source.set_id, "problems": body.prompt_count}
         else:
+            if body.episode is not None:
+                raise HTTPException(status_code=422, detail="an episode order plays a SWE or TMax eval set")
+            episode = None
             refusal = qual.order_environment_refusal(body.env)
             if refusal is not None:
                 raise HTTPException(status_code=422, detail=refusal)
@@ -838,6 +845,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         from reliquary.miner.corpus_miner import PROMPT_ALLOWANCE_TOKENS
 
         longest = max(PROMPT_ALLOWANCE_TOKENS, body.max_prompt_tokens or 0) + body.max_new_tokens
+        if episode is not None:
+            longest = max(longest, int(episode["max_total_tokens"]))
         if pin.max_position_embeddings is not None and longest > pin.max_position_embeddings:
             raise HTTPException(status_code=422, detail=(
                 f"context_too_long: {longest} tokens, the model holds {pin.max_position_embeddings}"))
@@ -856,7 +865,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     "source": declared_source, "contract_environment": contract_environment,
                     "samples": body.samples_per_prompt, "n": 1, "min_new_tokens": 2,
                     "sampling": body.sampling.conditions(), "max_new_tokens": body.max_new_tokens,
-                    "max_prompt_tokens": body.max_prompt_tokens, "thinking": body.thinking,
+                    "max_prompt_tokens": body.max_prompt_tokens,
+                    # An episode renders through its own renderer: no thinking toggle.
+                    "thinking": None if episode is not None else body.thinking, "episode": episode,
                     "draw": body.draw, "judge": judge, "seed": seed,
                     "audit_q": 1.0 if evaluation else (body.audit_q or GEN_AUDIT_PARAMS["audit_q"])})
             except ValueError as exc:
@@ -871,7 +882,38 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             top_k=body.sampling.top_k, **draw_arguments(body),
             # Its miners submit on its own route (the order control has no legacy one).
             **({} if evaluation else {"submit": "scoped"}),
+            **({"episode": episode, "renderer_id": episode["renderer"]} if episode is not None else {}),
         )
+
+    def order_episode(body: CreateJob, card: Mapping, pin, *, evaluation: bool) -> dict | None:
+        """The order's episode as its manifest carries it, None on a single-turn set: on a SWE or bridged (TMax)
+        set a signed-sandbox episode that agrees with the set (``eval.episode_jobs``), on a model that has its
+        renderer."""
+        from reliquary.corpus.job import episode_contract
+        from reliquary.eval.episode_jobs import episode_renderer_refusal, refuse_episode_disagreeing_with_set
+
+        interaction = card.get("interaction", "single_turn")
+        if interaction == "single_turn":
+            if body.episode is not None:
+                raise HTTPException(status_code=422, detail=f"set {body.eval_set_id} holds single-turn problems: "
+                                    "an order on it has no episode")
+            return None
+        if not evaluation or interaction not in ("swe", "signed_bridged"):
+            raise HTTPException(status_code=422, detail=(
+                f"set {body.eval_set_id} holds {interaction} tasks: an order plays only SWE or TMax sets, "
+                "in the signed sandbox, as an evaluation"))
+        if body.thinking:
+            raise HTTPException(status_code=422, detail="an episode renders through its own renderer: thinking is false")
+        try:
+            refuse_episode_disagreeing_with_set(card, body.eval_set_id, body.episode,
+                                                (body.episode or {}).get("renderer"))
+            episode = episode_contract(body.episode, eval_job=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)[:500]) from exc
+        refusal = episode_renderer_refusal(pin.architecture, episode["renderer"])
+        if refusal is not None:
+            raise HTTPException(status_code=422, detail=refusal)
+        return episode
 
     def operator_generation_job(body: CreateJob) -> bool:
         from reliquary.eval.prompt_source import gen_job_prefix
@@ -925,6 +967,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail=(
                 "max_price_usd_per_mtoken applies to eval and generation orders"))
         cap = body.cap
+        if body.episode is not None and not (pinned and evaluation):
+            raise HTTPException(status_code=422, detail="an episode order is a forced-draw evaluation (draw, no "
+                                "qualification)")
         if pinned:
             arguments = await pinned_order_arguments(body, evaluation=evaluation, record_order=False)
             cap = (DEFAULT_EVAL_CAP if evaluation else DEFAULT_GEN_CAP) if cap is None else cap
@@ -954,11 +999,13 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                              audit_params={})
             if operator_generation:
                 arguments["submit"] = "scoped"
+        # An episode order's renderer is its episode's.
+        renderer_id = arguments.pop("renderer_id", THINKING_RENDERERS[body.thinking])
         try:
             manifest, entry = await asyncio.to_thread(
                 prepare, job_id=body.job_id, task_id=body.task_id, model=body.model,
                 from_profile=None, prompt_encoding=None, prompt_count=body.prompt_count,
-                prompt_start=body.prompt_start, renderer_id=THINKING_RENDERERS[body.thinking],
+                prompt_start=body.prompt_start, renderer_id=renderer_id,
                 slots_per_prompt=body.samples_per_prompt,
                 max_new_tokens=body.max_new_tokens, cap=cap, min_incentive_share=0.0,
                 **({"max_prompt_tokens": body.max_prompt_tokens} if body.max_prompt_tokens is not None else {}),
@@ -1567,7 +1614,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         qualification's; the request's is only checked against it."""
         from reliquary.eval import qualification as qual
         from reliquary.eval.grading import (
-            JobRows, collect_job_records, exhausted_prompts, job_complete,
+            EpisodeJobRows, JobRows, collect_job_records, exhausted_prompts, job_complete,
         )
         from reliquary.eval.prompt_source import parse_eval_source
         from reliquary.validator.corpus_job_status import stored_job_counts
@@ -1608,7 +1655,18 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail=f"provenance_mismatch: {differs}")
         if not (await stored_job_counts(records, job.job_id))["drained"]:
             raise HTTPException(status_code=409, detail="job_not_drained")
-        collected = await collect_job_records(job, records, **({"include_generation_status": True} if body.service_contract is not None else {}))
+        if job.episode is not None:
+            from reliquary.eval.job_grading import JobNotGradable
+
+            # Graded already by the order control's grader, from its signed transcripts: its grade documents.
+            try:
+                job_rows = await EpisodeJobRows.collect(job, records, allow_incomplete=body.allow_incomplete)
+            except JobNotGradable as exc:
+                raise HTTPException(status_code=409, detail=f"job_not_graded: {exc}"[:500]) from exc
+            collected = {"samples_by_prompt": job_rows.samples_by_prompt}
+        else:
+            collected = await collect_job_records(job, records, **({"include_generation_status": True} if body.service_contract is not None else {}))
+            job_rows = JobRows(job=job, collected=collected)
         from reliquary.validator.corpus_service import rebuild_ledgers
 
         snapshot, _ = await job_store.read_ledgers(job.job_id)
@@ -1623,7 +1681,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             # Every sample follows its slot's public draw, judged under the order's thresholds.
             verification = {"scheme": job.sampling.draw, "source": "order", "sampling_verified": True,
                             "judge": job.judge.to_contract(), "randomness": draw_randomness(job),
-                            "pin": declared.get("pin")}
+                            "pin": declared.get("pin"),
+                            # An episode's score is its signed sandbox's final reward.
+                            **({"grade": "signed-sandbox"} if job.episode is not None else {})}
             for entry in await entries_naming(job.job_id):
                 if body.service_contract is not None:
                     facts["generation_contract_sha256"] = entry.profile_sha256
@@ -1655,7 +1715,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                       "prompts_exhausted": len(exhausted),
                       "exhausted_problem_ids": [_problem_id(source, i) for i in exhausted],
                       **({"allow_incomplete": True} if body.allow_incomplete else {})}
-        return JobRows(job=job, collected=collected), provenance
+        return job_rows, provenance
 
     @router.post("/evaluations/{eval_id}/sandbox-session")
     async def evaluation_sandbox_session(eval_id: str, body: EvaluationSessionRequest,
@@ -1721,6 +1781,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     async def grade_evaluation(eval_id: str, body: GradeEvaluation, response: Response) -> dict:
         from reliquary.corpus.delivery import validated_delivery_id
         from reliquary.eval import grading
+        from reliquary.eval.prompt_source import REFERENCE_INTERACTIONS
 
         in_scope(eval_id)
         if deliveries is None or not getattr(deliveries, "evaluation_supported", True):
@@ -1771,7 +1832,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     # Refusals the caller can act on are answered now, not polled for.
                     sets = await grading.load_sets(body.set_ids, body.problems_per_set,
                                                    body.samples_per_set, subnet=eval_store)
-                    grading.require_gradable(sets)
+                    # A job on reference sets (SWE, TMax) is graded by its grader: its grades, never re-run here.
+                    grading.require_gradable(sets, pregraded=body.source == "job" and any(
+                        card.get("interaction") in REFERENCE_INTERACTIONS for card, _ in sets.values()))
                     grading.require_sandboxes(sets, require_sandbox)
                 except grading.SetUnknown as exc:
                     raise HTTPException(status_code=404, detail="set_unknown") from exc

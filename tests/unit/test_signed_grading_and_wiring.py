@@ -583,3 +583,24 @@ def test_the_validator_publishes_a_signed_view_only_after_audit_and_settle():
     source = inspect.getsource(corpus_validator)
     assert "publish=False" in source
     assert source.count("sandbox_services.publish(w)") == 2
+
+
+def test_the_session_routes_mount_where_the_caller_says(tmp_path):
+    from reliquary.protocol.sandbox_session import JOB_SCOPED_PREFIX
+
+    signer(tmp_path, "v", "v1")
+    config = SandboxValidatorConfig(Path(tmp_path / "v.pem"), "v1", {}, None)
+
+    async def none():
+        return []
+
+    def paths(**kw):
+        services = build_sandbox_services(config, validator_hotkey=VALIDATOR,
+                                          session_store=MemorySessionStore(),
+                                          read_documents=none, fetch_report=none, **kw)
+        return {route.path for route in services.router.routes}
+
+    assert paths() == {"/corpus/sandbox/sessions", "/corpus/sandbox/sessions/{session_id}/close"}
+    assert paths(route_prefix=JOB_SCOPED_PREFIX) == {
+        "/corpus/jobs/{job_id}/sandbox/sessions",
+        "/corpus/jobs/{job_id}/sandbox/sessions/{session_id}/close"}

@@ -803,6 +803,11 @@ def _check_episode_job(job: JobSpec) -> None:
                        "or an eval source")
 
 
+def episode_contract(raw: Any, *, eval_job: bool) -> dict[str, Any]:
+    """An `episode` object as a manifest carries it once parsed (JobError otherwise)."""
+    return _parse_episode(raw, eval_job).to_contract()
+
+
 def parse_job(raw: Mapping[str, Any]) -> JobSpec:
     """Read one manifest, or refuse it naming exactly what is wrong."""
     if not isinstance(raw, Mapping):

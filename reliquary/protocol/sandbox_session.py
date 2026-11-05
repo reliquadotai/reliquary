@@ -21,6 +21,15 @@ from reliquary.protocol.corpus_submission import MAX_TRANSCRIPT_BYTES
 MAX_OPEN_REFUSAL_BYTES = 4096
 
 
+# The session routes of a job served by the order control: under the job's own
+# path, which the order jobs' nginx location already sends there.
+JOB_SCOPED_PREFIX = "/corpus/jobs/{job_id}"
+
+
+def job_scoped_prefix(job_id: str) -> str:
+    return JOB_SCOPED_PREFIX.format(job_id=job_id)
+
+
 def sandbox_open_path(prefix: str = "/corpus") -> str:
     return f"{prefix}/sandbox/sessions"
 
@@ -97,5 +106,6 @@ class SandboxSessionCloseRequest(BaseModel):
         return self
 
 
-__all__ = ["SandboxEngagement", "SandboxSessionCloseRequest", "SandboxSessionOpenRequest",
-           "SessionRefused", "sandbox_close_path", "sandbox_open_path"]
+__all__ = ["JOB_SCOPED_PREFIX", "SandboxEngagement", "SandboxSessionCloseRequest",
+           "SandboxSessionOpenRequest", "SessionRefused", "job_scoped_prefix", "sandbox_close_path",
+           "sandbox_open_path"]

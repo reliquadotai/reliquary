@@ -5,7 +5,7 @@
 # environment wheels from reliquary-environments). See docs/runbooks/order-control.md.
 #
 #   docker build -f docker/Dockerfile.order-control \
-#     --build-arg BASE_IMAGE=<the validator image> \
+#     --build-arg BASE_IMAGE=<the validator image, a -logic one> \
 #     --build-context envs=<directory holding exactly the four reviewed wheels> .
 #
 # Wheels (distribution -> source):
@@ -22,12 +22,66 @@ RUN --mount=type=bind,from=envs,target=/tmp/envs \
                 /tmp/envs/reliquary_instruction_following-*.whl \
                 /tmp/envs/reliquary_code-*.whl
 
+# Signed-sandbox episode orders (SWE, TMax): the same lines as the RL launch / eval
+# validator overlay (Dockerfile.rl-launch) and the corpus -sbx image: reliquary-sandbox
+# with its verifiers bridge at SANDBOX_COMMIT, and the env packages at the commit the
+# agentic eval sets pin (record 0's env_package). reliquary-harness comes with the base.
+ARG ENVS=15ad131b473f59f46b62d363bfacf430f4931f39
+ARG SBX=f8c208bd35848a13cf5b9e44b64309d835d1d81e
+ARG SWE_ENV_PACKAGE=reliquary-swe==0.3.0+ge8e1f1ed62a639ae.vfb2
+ARG TERMINAL_ENV_PACKAGE=reliquary-terminal==0.3.1+gcd4df2dcc1aaf175.vfb2
+RUN E="git+https://github.com/reliquadotai/reliquary-environments.git@${ENVS}" \
+ && pip install \
+      "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@${SBX}" \
+      "reliquary-swe @ ${E}#subdirectory=environments/code/reliquary_swe" \
+      "reliquary-terminal @ ${E}#subdirectory=environments/code/reliquary_terminal" \
+      "renderers==0.1.11"
+
+# The Verifiers tasksets single-turn eval sets are graded with (built against these),
+# in their own directory at the END of sys.path: the venv's versions always win.
+ARG TASKSETS_REPO=git+https://github.com/PrimeIntellect-ai/research-environments.git@f2e0d70968f9d89421c8035091febee8e9ac3975
+RUN R="${TASKSETS_REPO}#subdirectory=environments" \
+ && pip install --target /opt/evalsets-site \
+      "aime25 @ ${R}/math/aime25" "aime26 @ ${R}/math/aime26" "gpqa @ ${R}/science/gpqa" \
+      "ifbench @ ${R}/if/ifbench" "mmlu-pro @ ${R}/knowledge/mmlu_pro" \
+      "livecodebench @ ${R}/code/livecodebench" \
+ && echo /opt/evalsets-site > "$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')/zzz-evalsets.pth"
+
 # Fails the build unless bittensor_drand (the partial audit's draw), the hub
 # and tokenizer libraries import and every package verifies against the
 # catalog digest orders are qualified on.
 RUN reliquary corpus order-control-check
 
-LABEL ai.reliquary.role="order-control"
+# Fails the build unless a signed episode job could be served: the pinned sandbox,
+# harness and renderers, each env's bridged identity, and the tasksets.
+RUN SWE_ENV_PACKAGE="${SWE_ENV_PACKAGE}" TERMINAL_ENV_PACKAGE="${TERMINAL_ENV_PACKAGE}" SBX="${SBX}" \
+    python - <<'PY'
+import importlib, importlib.metadata as md, importlib.util, os, sys
+from reliquary.sandbox import SANDBOX_COMMIT, require_sandbox, sandbox_commit_refusal
+from reliquary.environment.agentic_swe import RENDERERS_VERSION, harness_refusal
+from reliquary.environment.bridged_swe import installed_env_package
+assert SANDBOX_COMMIT == os.environ["SBX"], SANDBOX_COMMIT
+require_sandbox()
+assert sandbox_commit_refusal(SANDBOX_COMMIT) is None, sandbox_commit_refusal(SANDBOX_COMMIT)
+assert harness_refusal() is None, harness_refusal()
+assert md.version("renderers") == RENDERERS_VERSION, md.version("renderers")
+importlib.import_module("reliquary_sandbox_verifiers")
+assert installed_env_package("reliquary-swe") == os.environ["SWE_ENV_PACKAGE"], installed_env_package("reliquary-swe")
+assert installed_env_package("reliquary-terminal") == os.environ["TERMINAL_ENV_PACKAGE"], installed_env_package("reliquary-terminal")
+for name in ("aime25", "aime26", "gpqa", "ifbench", "mmlu_pro", "livecodebench"):
+    importlib.import_module(name)
+assert "/opt/evalsets-site" in sys.path
+assert not importlib.util.find_spec("verifiers").origin.startswith("/opt/evalsets-site/")
+print("ORDER_CONTROL_EPISODES_OK")
+PY
+
+LABEL ai.reliquary.role="order-control" \
+      ai.reliquary.envs-commit="${ENVS}" ai.reliquary.sandbox-commit="${SBX}"
 EXPOSE 8791
-# No wallet and no grader: the order control signs nothing and grades nothing.
+# No wallet and no grader of single-turn orders. Signed episode orders need the order
+# control's own sandbox token key (never the corpus validator's), mounted at run time:
+#   -v <key.pem, 0600>:/run/reliquary/sandbox-order-control.pem:ro
+#   -e RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE=/run/reliquary/sandbox-order-control.pem
+#   -e RELIQUARY_SANDBOX_VALIDATOR_KEY_ID=<its key id> -e RELIQUARY_SANDBOX_VALIDATOR_HOTKEY=<ss58>
+#   -e RELIQUARY_SANDBOX_MACHINE_IDS='["<gateway id>", ...]'
 ENTRYPOINT ["reliquary", "corpus", "order-control", "--host", "0.0.0.0", "--port", "8791"]

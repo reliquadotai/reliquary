@@ -752,6 +752,14 @@ def submits_scoped(job) -> bool:
     return getattr(job, "submit", None) == SUBMIT_SCOPED or is_eval_source(job.prompt_source)
 
 
+def sandbox_sessions_prefix(job) -> str:
+    """The prefix of a signed-sandbox job's session routes: the job's own path
+    when its submissions are scoped (the order control's jobs), else ``/corpus``."""
+    from reliquary.protocol.sandbox_session import job_scoped_prefix
+
+    return job_scoped_prefix(job.job_id) if submits_scoped(job) else "/corpus"
+
+
 class CorpusContractError(RuntimeError):
     """The validator served a contract that does not describe this job."""
 

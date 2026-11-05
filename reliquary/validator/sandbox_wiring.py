@@ -116,6 +116,13 @@ def _machine_ids(environ: Mapping[str, str]) -> frozenset[str] | None:
     return result
 
 
+# The key settings' names; a process with a key of its own (the order control's) reads its own names.
+VALIDATOR_KEY_SETTINGS = {"key_file": "RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE",
+                          "key_id": "RELIQUARY_SANDBOX_VALIDATOR_KEY_ID",
+                          "retired_keys": "RELIQUARY_SANDBOX_VALIDATOR_RETIRED_KEYS",
+                          "hotkey": "RELIQUARY_SANDBOX_VALIDATOR_HOTKEY"}
+
+
 @dataclass(frozen=True)
 class SandboxValidatorConfig:
     key_file: Path
@@ -139,18 +146,19 @@ class SandboxValidatorConfig:
     machine_ids: frozenset[str] | None = None
 
     @classmethod
-    def from_env(cls, environ: Mapping[str, str] = os.environ) -> SandboxValidatorConfig | None:
-        key_file = environ.get("RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE")
-        key_id = environ.get("RELIQUARY_SANDBOX_VALIDATOR_KEY_ID")
+    def from_env(cls, environ: Mapping[str, str] = os.environ, *,
+                 key_settings: Mapping[str, str] = VALIDATOR_KEY_SETTINGS) -> SandboxValidatorConfig | None:
+        names = key_settings
+        key_file = environ.get(names["key_file"])
+        key_id = environ.get(names["key_id"])
         if not key_file and not key_id:
             return None
         if not (key_file and key_file.strip() and key_id and key_id.strip()):
-            raise ValueError("set both RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE and "
-                             "RELIQUARY_SANDBOX_VALIDATOR_KEY_ID (neither blank)")
-        retired = json.loads(environ.get("RELIQUARY_SANDBOX_VALIDATOR_RETIRED_KEYS") or "{}")
+            raise ValueError(f"set both {names['key_file']} and {names['key_id']} (neither blank)")
+        retired = json.loads(environ.get(names["retired_keys"]) or "{}")
         if not isinstance(retired, dict) or not all(
                 isinstance(k, str) and isinstance(v, str) for k, v in retired.items()):
-            raise ValueError("RELIQUARY_SANDBOX_VALIDATOR_RETIRED_KEYS must map key ids to keys")
+            raise ValueError(f"{names['retired_keys']} must map key ids to keys")
         return cls(
             Path(key_file), key_id, retired, SandboxPolicy.from_env(environ),
             directory_refresh_s=_positive(environ, "RELIQUARY_SANDBOX_DIRECTORY_REFRESH_S",
@@ -166,7 +174,7 @@ class SandboxValidatorConfig:
                                            CLOSE_BODY_TIMEOUT_S),
             close_preauth_concurrency=_positive(
                 environ, "RELIQUARY_SANDBOX_CLOSE_PREAUTH_CONCURRENCY", MAX_PREAUTH_CLOSES, int),
-            validator_hotkey=(environ.get("RELIQUARY_SANDBOX_VALIDATOR_HOTKEY") or "").strip() or None,
+            validator_hotkey=(environ.get(names["hotkey"]) or "").strip() or None,
             quota=_flag(environ, "RELIQUARY_SANDBOX_CORPUS_QUOTA", True),
             quota_max_live_per_hotkey=_count(environ, "RELIQUARY_SANDBOX_QUOTA_MAX_LIVE_PER_HOTKEY"),
             quota_max_live_per_hotkey_job=_count(environ, "RELIQUARY_SANDBOX_QUOTA_MAX_LIVE_PER_HOTKEY_JOB"),
@@ -248,7 +256,10 @@ class SandboxServices:
 def build_sandbox_services(config: SandboxValidatorConfig, *, validator_hotkey: str,
                            store_kwargs=None, session_store=None, read_documents=None,
                            fetch_report=None, registration=None,
-                           clock: Callable[[], float] = time.time) -> SandboxServices:
+                           clock: Callable[[], float] = time.time,
+                           route_prefix: str = "/corpus") -> SandboxServices:
+    """``route_prefix``: where the session routes mount; the order control passes
+    ``protocol.sandbox_session.JOB_SCOPED_PREFIX``."""
     from reliquary_sandbox.attest import Ed25519TokenVerifier, Signer, load_private_key
 
     from reliquary.infrastructure import sandbox_store
@@ -308,7 +319,7 @@ def build_sandbox_services(config: SandboxValidatorConfig, *, validator_hotkey: 
         policy=policy, clock=clock, quota=quota)
     fleet.on_drained = issuer.void_machine
     router = build_sandbox_sessions_router(
-        issuer, policy=policy, validator_hotkey=validator_hotkey, prefix="/corpus",
+        issuer, policy=policy, validator_hotkey=validator_hotkey, prefix=route_prefix,
         registration=registration, clock=clock,
         max_concurrent_closes=config.close_concurrency,
         close_body_timeout_s=config.close_body_timeout_s,
