@@ -49,3 +49,32 @@ async def test_a_pod_without_room_goes_silent_after_its_first_heartbeat():
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(executor.run(), timeout=0.3)
     assert [p for p in posts if p.endswith("/heartbeat")] == [posts[0]] and len(posts) == 1
+
+
+async def test_a_slow_load_keeps_heartbeating():
+    import threading
+    import time
+
+    posts = []
+
+    class Http:
+        async def post(self, path, json=None, **kw):
+            posts.append((path, json))
+            return SimpleNamespace(status_code=200, raise_for_status=lambda: None,
+                                   json=lambda: {"model_id": "m", "model_revision": "r"})
+
+    released = threading.Event()
+
+    def slow(model_id, revision):
+        released.wait(2)
+        return "model"
+
+    executor = ex.AuditExecutor(http=Http(), executor_id="pod-1", token="x", model_id="m",
+                                model_revision="r", load_model=slow, heartbeat_seconds=0.02)
+    start = asyncio.ensure_future(executor.start())
+    await asyncio.sleep(0.15)
+    released.set()
+    await start
+    beats = [body for path, body in posts if path.endswith("/heartbeat")]
+    assert len(beats) >= 3 and executor._model == "model"
+    assert beats[-1]["detail"]["loaded"] is False

@@ -138,12 +138,24 @@ class AuditExecutor(LeaseExecutor):
         logger.info("audit executor %s loading %s@%s", self._executor_id, self.model_id,
                     self.model_revision)
         try:
-            self._model = await asyncio.to_thread(self._load_model, self.model_id, self.model_revision)
+            self._model = await self._load_heartbeating()
         except DiskTooSmall as exc:
             # Exiting would only restart the container into the same full disk, heartbeating each time:
             # go silent instead, so the fleet sees a dead pod and replaces it on another host.
             logger.critical("audit executor %s cannot run on this pod: %s", self._executor_id, exc)
             await asyncio.Event().wait()
+
+    async def _load_heartbeating(self):
+        """Load the model while heartbeating, so a slow 27B download is not taken for a dead pod."""
+        loading = asyncio.ensure_future(asyncio.to_thread(self._load_model, self.model_id, self.model_revision))
+        while True:
+            done, _ = await asyncio.wait({loading}, timeout=self._heartbeat_every)
+            if done:
+                return loading.result()
+            try:
+                await self.heartbeat()
+            except Exception as exc:
+                logger.warning("audit executor heartbeat failed while loading: %r", exc)
 
     def _score(self, lease: AuditLease) -> list[dict]:
         from reliquary.protocol.toploc import MIN_CHUNK_TOKENS
