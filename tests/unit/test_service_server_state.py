@@ -290,6 +290,8 @@ async def test_an_accepted_unpaid_group_ends_with_its_own_unrewarded_final_verdi
     service._service_runtime = runtime
     service.server = ValidatorServer()
     await service._record_auction_final_verdicts(batcher, paid_groups=[])
+    # A public stream ID can contain the prompt's digits by chance.
+    service.server._verdict_epoch_by_hotkey["fixture-miner"] = "f" * 28 + "4321"
     body = TestClient(service.server.app).get("/verdicts/fixture-miner?details=true").json()
     (verdict,) = body["verdicts"]
     assert verdict["accepted"] is True and verdict["rewarded"] is False
@@ -302,7 +304,8 @@ async def test_an_accepted_unpaid_group_ends_with_its_own_unrewarded_final_verdi
     for path in ("/verdicts/fixture-miner?details=true", "/miner-verdicts/fixture-miner?details=true",
                  f"/miner-verdicts/fixture-miner/1/{'e' * 64}"):
         text = client.get(path).text
-        assert "4321" not in text and canonical_prompt_hash_lead(4321) not in text, path
+        assert '"prompt_idx"' not in text and '"prompt_hash_lead"' not in text, path
+        assert not re.search(r"\b4321\b", text) and canonical_prompt_hash_lead(4321) not in text, path
         if status != "exploration_unpaid":
             assert status not in text, path
 

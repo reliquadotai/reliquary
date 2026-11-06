@@ -1,5 +1,4 @@
-"""Per-turn rows from one prefill of a whole trajectory: a span's rows must be
-the ones a single-turn audit of that turn would take."""
+"""Per-turn rows from a whole trajectory must accept single-turn prefix proofs."""
 
 import base64
 
@@ -30,13 +29,17 @@ TOKENS = list(range(10, 100))
 SPANS = [(8, 40), (55, 90)]
 
 
-def test_each_span_equals_a_single_turn_audit_of_its_prefix():
+def test_each_span_accepts_the_single_turn_proofs_of_its_prefix():
     model = _tiny(0)
     rows = span_hidden_states(model, TOKENS, SPANS)
     for (start, end), got in zip(SPANS, rows):
         want = completion_hidden_states(model, TOKENS[:end], start)
         assert got.shape == want.shape == (end - start, 128)
-        assert torch.equal(got, want)
+        # Different sequence lengths can select different BF16 reduction kernels.
+        proofs = [base64.b64encode(p).decode()
+                  for p in build_chunk_proofs(want, chunk_tokens=PROOF.chunk_tokens, topk=PROOF.topk)]
+        assert audit_completion(got, proofs, PROOF).passed
+        assert not audit_completion(got.roll(1, dims=0), proofs, PROOF).passed
 
 
 def test_proofs_built_per_turn_pass_per_span():

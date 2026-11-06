@@ -26,9 +26,20 @@ def main() -> None:
         print("Skipped: VISION_TEST_MODEL_DIR is not set.")
         return
     from PIL import Image, __version__ as pillow_version
+    import torch
+    import torchvision
     from reliquary.vision import runner
 
     assert pillow_version == "13.0.0", pillow_version
+    assert torch.__version__.split("+")[0] == "2.13.0", torch.__version__
+    assert torchvision.__version__.split("+")[0] == "0.28.0", torchvision.__version__
+    assert torch.version.cuda in {None, "13.0"}, torch.version.cuda
+    versions = {"pillowVersion": pillow_version, "torchVersion": torch.__version__,
+                "torchvisionVersion": torchvision.__version__, "cudaVersion": torch.version.cuda}
+    assert torchvision.ops.nms(
+        torch.tensor([[0., 0., 2., 2.], [0., 0., 2., 2.]]),
+        torch.tensor([0.9, 0.8]), 0.5,
+    ).tolist() == [0]
     source = Path(os.environ["VISION_TEST_MODEL_DIR"])
     output = Path(os.environ["VISION_TEST_OUTPUT_DIR"])
     if output.is_symlink() or (output.exists() and any(output.iterdir())):
@@ -137,9 +148,10 @@ def main() -> None:
         "scope": "Synthetic inputs; CPU execution and adapter portability only.",
         "qualifiedGpu": False, "customerQualityMeasured": False,
         "profileIdentities": "Explicit synthetic test fixtures, not qualified capacity.",
+        **versions,
         "cases": reports,
     })
-    print(json.dumps({"status": "passed", "pillowVersion": pillow_version, "cases": reports}))
+    print(json.dumps({"status": "passed", **versions, "cases": reports}))
 
 
 if __name__ == "__main__":

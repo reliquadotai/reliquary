@@ -206,7 +206,7 @@ cd reliquary
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install torch==2.7.0 \
+python -m pip install torch==2.13.0 \
   --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -e ".[dev]"
 
@@ -220,6 +220,10 @@ Mining and training require the pinned inference stack and suitable NVIDIA
 hardware; the CPU setup above is for development and tests. Start with the
 [miner guide](docs/mining.md) or [validator guide](docs/validating.md) before
 running an operator workload.
+
+The validator and vision CUDA images use PyTorch 2.13.0 with CUDA 13.0. They
+require an NVIDIA driver version 580 or newer. Hardware execution and numerical
+parity must be qualified before upgrading an operator workload.
 
 ## Documentation
 
