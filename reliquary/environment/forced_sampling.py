@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -66,6 +67,10 @@ from reliquary.constants import FORCED_SEED_DOMAIN
 # (softmax, sort values/indices, CDF, and scatter output). Bound the source
 # matrix for each pass so long completions cannot consume the entire GPU.
 _DIAGNOSTIC_FLOAT_WORKSPACE_BYTES = 256 * 1024 * 1024
+# A warped draw holds ~8 float32 [rows, V] copies per chunk: under the 256 MiB budget that is 33
+# rows at a 248k vocab, thousands of chunks per lease, and the check outweighed the forward 5:1 on an
+# H200 (2026-11-06). Its own budget: 4 GiB = 540 rows, well under a 27B audit's forward peak.
+_WARP_WORKSPACE_BYTES = int(os.environ.get("RELIQUARY_DRAW_WARP_WORKSPACE_MIB", "4096")) * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -633,7 +638,7 @@ def seed_consistency_diagnostics(
     )
     if warped:
         # Support masks, a top-k sort and three masked score copies per row.
-        chunk_rows = max(1, min(chunk_rows, _DIAGNOSTIC_FLOAT_WORKSPACE_BYTES // (vocab_size * 4 * 8)))
+        chunk_rows = max(1, min(n, _WARP_WORKSPACE_BYTES // (vocab_size * 4 * 8)))
     elif draw == DRAW_GUMBEL_MAX and not (str(logits.device).startswith("cuda") and _triton_argmax()):
         # The torch reference holds ~6 float64 [rows, V] temporaries; the fused kernel none (an RL audit of 120k
         # positions at the reference's 21 rows a chunk spent ~70 s in 5,700 chunks, 2026-10-18).
