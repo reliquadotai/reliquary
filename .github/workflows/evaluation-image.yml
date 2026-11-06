@@ -81,6 +81,8 @@ jobs:
           from reliquary.environment.agentic_swe import harness_refusal
           from reliquary.sandbox import SANDBOX_COMMIT
           from reliquary_sandbox import attest
+          from reliquary_sandbox_verifiers.cli_runner import run_cli_episode
+          from reliquary_sandbox_verifiers.cli_transport import require_pinned_cli_sources
 
           assert os.geteuid() == 10001
           assert version("vllm").split("+")[0] == "0.29.0"
@@ -91,6 +93,7 @@ jobs:
           assert version("huggingface-hub") == "1.30.0"
           assert version("renderers") == "0.1.11"
           assert harness_refusal() is None
+          require_pinned_cli_sources()
           assert "Qwen3_5ForCausalLM" in ModelRegistry.get_supported_archs()
           assert "qwen3_5_text" in CONFIG_MAPPING
           for name, commit in {

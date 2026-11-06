@@ -148,9 +148,10 @@ def require_gradable(sets: Mapping[str, tuple[dict, list[dict]]], *,
         if card.get("protocol") is not None and card.get("interaction") in {
                 "episode", "signed_episode"}:
             validate_set(card)
-            expected = {"episode": "telecom-episode-v1", "signed_episode": "signed-bash-v1"}
+            from reliquary.eval.protocol import SIGNED_HARNESSES
+            expected = {"episode": {"telecom-episode-v1"}, "signed_episode": SIGNED_HARNESSES}
             if (card.get("source_kind") != card["interaction"]
-                    or card["protocol"]["harness"].get("id") != expected[card["interaction"]]):
+                    or card["protocol"]["harness"].get("id") not in expected[card["interaction"]]):
                 raise GradeRequestError(f"set {set_id} has no supported pinned episode grader")
             episode = False
         if episode and not pregraded:
