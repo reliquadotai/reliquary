@@ -547,7 +547,8 @@ class CorpusJobSet:
 
     def _observed_admission(self, job_id: str, status: dict) -> dict:
         status["admission"] = "paused" if job_id in self._routes.paused else "open"
-        if self._routes.is_held(job_id):
+        is_held = getattr(self._routes, "is_held", None)  # only an order control holds jobs
+        if is_held is not None and is_held(job_id):
             status["awaiting_audit"] = True
         else:
             status.pop("awaiting_audit", None)
