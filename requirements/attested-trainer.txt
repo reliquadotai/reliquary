@@ -1,0 +1,3 @@
+# Install into a dedicated virtual environment; never into the core runtime.
+# Package pin only: install frozen dependencies first (docs/attested-training.md).
+reliquary-tee[gpu] @ git+https://github.com/reliquadotai/reliquary-TEE.git@2aa9dd968c1b58b611b37c56d3fbdd6389857315
