@@ -464,3 +464,29 @@ def test_the_corpus_control_refuses_an_eval_task_at_boot_and_never_reads_one_hot
     asyncio.run(job_set.refresh())
     asyncio.run(job_set.refresh())
     assert reads == []
+
+
+def test_a_job_is_held_from_miners_until_an_executor_of_its_model_claims():
+    from reliquary.validator.corpus_audit_protocol import AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3
+    from reliquary.validator.corpus_service import CorpusJobRoutes
+
+    h = _Harness(scorers=1)
+    routes = CorpusJobRoutes({"draw": object(), "plain": object()})
+    routes.hold("draw", lambda: h.dispatcher.audit_ready(MODEL_A, AUDIT_PROTOCOL_V3))
+    routes.hold("plain", lambda: h.dispatcher.audit_ready(MODEL_A))
+    assert routes.open_jobs() == []
+    h.dispatcher.heartbeat("a", _executor("a"))  # alive but still loading: no claim yet
+    assert routes.open_jobs() == []
+    h.dispatcher.claim(_executor("a"), (AUDIT_PROTOCOL,))
+    # A v1-only executor cannot score a draw job.
+    assert routes.open_jobs() == ["plain"]
+    h.dispatcher.claim(_executor("b"), (AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3))
+    assert routes.open_jobs() == ["draw", "plain"] and routes.held == {}
+
+
+def test_a_hold_that_cannot_be_checked_keeps_the_job_held():
+    from reliquary.validator.corpus_service import CorpusJobRoutes
+
+    routes = CorpusJobRoutes({"j": object()})
+    routes.hold("j", lambda: 1 / 0)
+    assert routes.open_jobs() == [] and routes.is_held("j")
