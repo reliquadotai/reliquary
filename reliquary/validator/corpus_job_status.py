@@ -76,19 +76,20 @@ def job_status(*, job_id: str, job: Any, slots: Any, stats: JobStats, settled: i
         state = "open"
     verdicts, passed, tokens = stats.unsettled()
     base = totals or {}
+    audited = int(base.get("verdicts", 0)) + verdicts
     return {
         "job_id": job_id,
         "state": state,
         "prompts_total": int(job.prompt_count),
         "prompts_full": full,
         "submissions_accepted": int(slots.filled),
-        "audited": int(base.get("verdicts", 0)) + verdicts,
+        "audited": audited,
         "passed": int(base.get("passed", 0)) + passed,
         "verified_tokens": int(base.get("verified_tokens", 0)) + tokens,
         "settled": int(settled or 0),
         "accepted_last_hour": stats.accepted_last_hour(),
         "counts_complete": bool(totals is not None and totals.get("complete", True)),
-        **_eval_prompt_counts(job, slots),
+        **_eval_prompt_counts(job, slots, unaudited=int(slots.filled) - audited),
     }
 
 
@@ -113,10 +114,12 @@ def pay_status(*, cap: float, price: Mapping | None, last_period: Mapping | None
     return pay
 
 
-def _eval_prompt_counts(job: Any, slots: Any) -> dict[str, Any]:
+def _eval_prompt_counts(job: Any, slots: Any, *, unaudited: int) -> dict[str, Any]:
     """An eval job's completeness: ``prompts_complete`` (V slots of work not
     failed), ``prompts_exhausted`` (every attempt used) and ``complete`` (each
-    prompt one or the other). Absent for every other job."""
+    prompt one or the other, and no accepted submission still awaiting its
+    verdict: a pending one counts as passing until then, and a failure reopens
+    its slot, which only an open job can fill). Absent for every other job."""
     from reliquary.eval.prompt_source import is_eval_source
 
     from reliquary.corpus.eval_draw import has_draw
@@ -125,7 +128,7 @@ def _eval_prompt_counts(job: Any, slots: Any) -> dict[str, Any]:
         return {}
     counts = slots.prompt_counts()
     return {"prompts_complete": counts["complete"], "prompts_exhausted": counts["exhausted"],
-            "complete": counts["open"] == 0}
+            "complete": counts["open"] == 0 and unaudited <= 0}
 
 
 async def stored_job_counts(records: Any, job_id: str) -> dict[str, Any]:

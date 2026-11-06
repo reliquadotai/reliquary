@@ -844,9 +844,10 @@ class CorpusAuditor:
         written = await self._records.write_verdict(self._job_id, submission_id, verdict)
         standing = verdict if written else await self._records.read_verdict(self._job_id, submission_id)
         self._mark_judged(submission_id)
-        self._report(submission_id, standing)
+        # Reopen before reporting: the status must not see the verdict while the ledger still counts it passing.
         if standing is not None and not standing.get("passed"):
             await self._reopen_slot(submission_id)
+        self._report(submission_id, standing)
         return standing, written
 
     async def _reopen_slot(self, submission_id: str) -> None:
