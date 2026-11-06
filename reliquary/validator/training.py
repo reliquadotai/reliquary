@@ -170,6 +170,10 @@ def configure_distributed(ctx) -> None:
     _DIST = ctx
 
 
+class TrainingAdmissionError(RuntimeError):
+    """The authority could not finalize this update; no optimizer step is allowed."""
+
+
 class TrainingStepSkipped(RuntimeError):
     """A deliberately rejected optimizer step that must not be published."""
 
@@ -364,6 +368,8 @@ def _lazy_init(model, global_step_hint: int | None = None) -> bool:
 
     hint = max(0, int(global_step_hint or 0))
     restored = hint > 0 and _restore_optimizer_state(hint)
+    if hint > 0 and not restored and os.environ.get("RELIQUARY_REQUIRE_OPTIMIZER_RESUME", "").strip() == "1":
+        raise RuntimeError(f"matching optimizer state is required to resume step {hint}")
     rewarmup = LR_RESTART_REWARMUP_WINDOWS if hint > 0 and not restored else 0
 
     def _lr_lambda(step: int) -> float:
@@ -2677,6 +2683,9 @@ def train_step(
                 model, ref_model, undo, device, budget=budget, atomic=atomic,
                 behavior_model=behavior_model, gate=gate.replay(),
             )
+        if getattr(gate, "require_admission", False) and not any(gate.accepted):
+            _optimizer.zero_grad(set_to_none=True)
+            raise TrainingStepSkipped("no_admitted_groups", 0.0, metrics=gate.metrics())
 
     if _DIST is not None:
         from reliquary.trainer.distributed import all_reduce_stats
@@ -2777,6 +2786,8 @@ def train_step(
             grad_norm_value,
             metrics=failure_metrics,
         )
+    if getattr(gate, "require_admission", False):
+        gate.check_commit(_DIST)
     _optimizer.step()
     _scheduler.step()
     _save_optimizer_state()
