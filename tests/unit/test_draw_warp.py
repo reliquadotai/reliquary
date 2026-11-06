@@ -400,3 +400,27 @@ def test_the_schedule_passes_its_warp_to_each_job(tmp_path):
     assert command[command.index("--top-k") + 1] == "20"
     assert command[command.index("--min-p") + 1] == "0.05"
     assert command[command.index("--temperature") + 1] == "0.6"
+
+
+def test_warped_chunks_follow_their_own_workspace_and_agree(monkeypatch):
+    torch.manual_seed(5)
+    logits = torch.randn(9, 60) * 2
+    us = _us(9)
+    warp = Warp(t=0.7, top_k=12, top_p=0.9)
+    tokens = _picks(logits, us, warp)
+    tokens[4] = (tokens[4] + 1) % 60
+    whole = _diag(logits, tokens, us, warp)
+
+    seen = []
+    original = fs._gumbel_warp_chunk_stats
+
+    def recording(chunk, *args):
+        seen.append(int(chunk.shape[0]))
+        return original(chunk, *args)
+
+    monkeypatch.setattr(fs, "_gumbel_warp_chunk_stats", recording)
+    monkeypatch.setattr(fs, "_WARP_WORKSPACE_BYTES", 4 * 60 * 4 * 8)
+    # The general budget no longer caps a warped chunk.
+    monkeypatch.setattr(fs, "_DIAGNOSTIC_FLOAT_WORKSPACE_BYTES", 1)
+    assert _diag(logits, tokens, us, warp) == whole
+    assert seen == [4, 4, 1]
