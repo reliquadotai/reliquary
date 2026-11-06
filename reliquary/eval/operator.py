@@ -248,7 +248,7 @@ def grade_job(client: AdminClient, job_id: str, *, out: str | Path | None = None
     return answer
 
 
-CONDITIONS = ("model", "sampling", "max_new_tokens", "thinking")
+CONDITIONS = ("model", "sampling", "seed", "max_new_tokens", "thinking")
 
 
 def _load(directory: str | Path) -> tuple[dict, dict[str, dict[str, list[bool | None]]]]:
@@ -290,9 +290,12 @@ def compare_reports(a: str | Path, b: str | Path, *, seed: int = 0,
     from reliquary.eval.protocol import validate_request
 
     for report, provenance in ((report_a, prov_a), (report_b, prov_b)):
-        if report.get("protocol") is not None:
-            validate_request({**provenance, **{key: report.get(key) for key in
-                             ("protocol", "protocol_json", "protocol_sha256", "protocol_bindings")}})
+        if any(report.get(key) is not None for key in ("protocol", "protocol_json", "protocol_sha256")):
+            if validate_request({**provenance, **{key: report.get(key) for key in
+                                ("protocol", "protocol_json", "protocol_sha256", "protocol_bindings")}},
+                                bindings={s["set_id"]: s.get("protocol_sha256")
+                                          for s in provenance["sets"]}) is None:
+                raise ValueError("incomplete request protocol envelope")
     differs = [k for k in CONDITIONS if k != "model" and prov_a.get(k) != prov_b.get(k)]
     if _sets(report_a) != _sets(report_b):
         differs.append("sets")
