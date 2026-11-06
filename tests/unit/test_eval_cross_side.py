@@ -184,6 +184,27 @@ def test_an_eval_jobs_status_says_complete_and_exhausted_prompts():
     assert "prompts_complete" not in plain and "complete" not in plain
 
 
+def test_an_eval_job_is_not_complete_while_a_submission_awaits_its_audit():
+    from reliquary.corpus.slots import SlotLedger
+    from reliquary.validator.corpus_job_status import JobStats, job_status
+
+    job = _job("eval-set:s:2:" + "0" * 64, count=2)  # slots_per_prompt 1
+    slots = SlotLedger(2, 1)
+    slots.consume(0)
+    slots.consume(1)
+    stats = JobStats()
+    stats.observe("a" * 64, {"passed": True, "token_count": 5})
+
+    def complete():
+        return job_status(job_id=job.job_id, job=job, slots=slots, stats=stats, settled=0,
+                          totals=None, retired=False)["complete"]
+
+    # Both prompts hold work, one still unaudited: a failure there would reopen a slot.
+    assert complete() is False
+    stats.observe("b" * 64, {"passed": True, "token_count": 5})
+    assert complete() is True
+
+
 class _Records:
     def __init__(self):
         self.subs, self.verdicts = {}, {}
@@ -238,6 +259,24 @@ def test_a_failed_audit_reopens_its_prompts_slot(monkeypatch):
         assert rebuild_ledgers(job, snapshot).slots.failed_snapshot() == {
             2: ["a" * 12, "c" * 12]}
     asyncio.run(go())
+
+
+def test_a_failed_verdict_is_reported_after_its_slot_reopens():
+    from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    events = []
+    auditor = CorpusAuditor(job_id="j", records=_Records(), model=None, tokenizer=None,
+                            proof=TOPLOC_DEPLOYED_DEFAULTS,
+                            on_verdict=lambda sid, verdict: events.append("report"))
+
+    async def reopen(sid):
+        events.append("reopen")
+
+    auditor._reopen_slot = reopen
+    # The status reads the ledger when it counts the verdict: the failure must be there already.
+    asyncio.run(auditor._write("a" * 64, {"passed": False}))
+    assert events == ["reopen", "report"]
 
 
 def test_grading_counts_exhausted_prompts_as_complete_failures():
