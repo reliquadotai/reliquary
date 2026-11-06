@@ -34,16 +34,63 @@ AUDIT_PREFIX = "/corpus/internal/audit"
 EVAL_AUDIT_PREFIX = "/corpus/internal/eval-audit"
 
 
+# A rented pod's root disk can be a few dozen GB while its volume holds a terabyte.
+VOLUME_DIR = "/workspace"
+DISK_MARGIN_BYTES = 4 * 1024**3
+
+
+class DiskTooSmall(RuntimeError):
+    """This pod cannot hold the checkpoint: no retry here will fix it."""
+
+
+def _cache_dir(volume: str = VOLUME_DIR) -> str | None:
+    """The pod's volume when the operator set no HF cache and it is mounted and writable; else the default."""
+    import os
+
+    if os.environ.get("HF_HUB_CACHE") or os.environ.get("HF_HOME"):
+        return None
+    if os.path.ismount(volume) and os.access(volume, os.W_OK):
+        return os.path.join(volume, "hf", "hub")
+    return None
+
+
+def _check_disk(model_id: str, revision: str, cache_dir: str | None, *, info=None, free=None) -> None:
+    """Raise ``DiskTooSmall`` when the checkpoint does not fit where it will be downloaded."""
+    import os
+    import shutil
+
+    from huggingface_hub import HfApi, constants
+
+    target = cache_dir or constants.HF_HUB_CACHE
+    if info is None:
+        info = HfApi().model_info(model_id, revision=revision, files_metadata=True, token=False)
+    needed = sum(int(f.size or 0) for f in (info.siblings or ())) + DISK_MARGIN_BYTES
+    if free is None:
+        probe = target
+        while not os.path.exists(probe):
+            probe = os.path.dirname(probe) or "/"
+        free = shutil.disk_usage(probe).free
+    if free < needed:
+        raise DiskTooSmall(f"{model_id}@{revision[:12]} needs {needed / 1e9:.0f} GB at {target}, "
+                           f"{free / 1e9:.0f} GB free")
+
+
 def load_public_model(model_id: str, revision: str):
     """The checkpoint from the public HF repo at the pinned revision, with no
-    credential at all (``token=False``)."""
+    credential at all (``token=False``), on the pod's volume when it has one."""
     import torch
     from huggingface_hub import snapshot_download
 
     from reliquary.constants import ATTN_IMPLEMENTATION
     from reliquary.shared.modeling import load_text_only_model
 
-    directory = snapshot_download(model_id, revision=revision, token=False)
+    cache_dir = _cache_dir()
+    try:
+        directory = snapshot_download(model_id, revision=revision, token=False, cache_dir=cache_dir,
+                                      local_files_only=True)
+    except Exception:
+        _check_disk(model_id, revision, cache_dir)
+        directory = snapshot_download(model_id, revision=revision, token=False, cache_dir=cache_dir)
     return load_text_only_model(
         directory, torch_dtype=torch.bfloat16, attn_implementation=ATTN_IMPLEMENTATION,
     ).to("cuda").eval()
@@ -90,7 +137,25 @@ class AuditExecutor(LeaseExecutor):
             )
         logger.info("audit executor %s loading %s@%s", self._executor_id, self.model_id,
                     self.model_revision)
-        self._model = await asyncio.to_thread(self._load_model, self.model_id, self.model_revision)
+        try:
+            self._model = await self._load_heartbeating()
+        except DiskTooSmall as exc:
+            # Exiting would only restart the container into the same full disk, heartbeating each time:
+            # go silent instead, so the fleet sees a dead pod and replaces it on another host.
+            logger.critical("audit executor %s cannot run on this pod: %s", self._executor_id, exc)
+            await asyncio.Event().wait()
+
+    async def _load_heartbeating(self):
+        """Load the model while heartbeating, so a slow 27B download is not taken for a dead pod."""
+        loading = asyncio.ensure_future(asyncio.to_thread(self._load_model, self.model_id, self.model_revision))
+        while True:
+            done, _ = await asyncio.wait({loading}, timeout=self._heartbeat_every)
+            if done:
+                return loading.result()
+            try:
+                await self.heartbeat()
+            except Exception as exc:
+                logger.warning("audit executor heartbeat failed while loading: %r", exc)
 
     def _score(self, lease: AuditLease) -> list[dict]:
         from reliquary.protocol.toploc import MIN_CHUNK_TOKENS
@@ -156,4 +221,4 @@ def run_audit_executor(*, control_url: str, executor_id: str, model_id: str | No
         prefix=prefix, **client))
 
 
-__all__ = ["AuditExecutor", "TOKEN_ENV", "load_public_model", "run_audit_executor"]
+__all__ = ["AuditExecutor", "DiskTooSmall", "TOKEN_ENV", "load_public_model", "run_audit_executor"]
