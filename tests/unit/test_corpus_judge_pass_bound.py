@@ -21,6 +21,19 @@ from tests.unit import _main_corpus_auditor as main_module
 HOLD = 300.0
 
 
+
+@pytest.fixture
+def without_forfeit(monkeypatch):
+    """The reference judge (`_main_corpus_auditor`) predates forfeits: compared with it, none."""
+    from reliquary.validator import corpus_auditor
+
+    monkeypatch.setattr(corpus_auditor, "forfeits", lambda state, received_at: False)
+
+    async def nothing(self, states, now):
+        return []
+
+    monkeypatch.setattr(corpus_auditor.CorpusAuditor, "_void_forfeited", nothing)
+
 def _backlog_run(monkeypatch, *, rows, tokens, n=3000):
     """``n`` records up to an hour old from 6 hotkeys, steady traffic on top,
     every forward recorded (records per call, and when)."""
@@ -107,7 +120,7 @@ def test_unbounded_one_call_audits_a_pass_and_all_its_drawn_siblings(monkeypatch
 
 
 @pytest.mark.parametrize("seed", [7, 3])
-def test_a_bounded_judge_writes_main_s_verdicts(monkeypatch, seed):
+def test_a_bounded_judge_writes_main_s_verdicts(monkeypatch, seed, without_forfeit):
     """The faulted scenario of the equivalence test (ban, unreadable record,
     failed write, quarantined executor, restart) with passes of 3 audits."""
     monkeypatch.setattr(corpus_auditor, "PASS_AUDIT_ROWS", 3)

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 import logging
 import math
 import re
@@ -32,7 +33,7 @@ _MAX_BACKOFF_SECONDS = 8.0
 # entry ({}) never trips these.
 _NONNEGATIVE_INT_FIELDS = ("audited_passed",)
 _FINITE_NUMBER_LIST_FIELDS = ("confirmed_failures", "mant_mean_history")
-_FINITE_NUMBER_OR_NONE_FIELDS = ("suspect_until", "banned_until")
+_FINITE_NUMBER_OR_NONE_FIELDS = ("suspect_until", "banned_until", "forfeit_before")
 _SUBMISSION_ID = re.compile(r"[0-9a-f]{64}")
 
 
@@ -100,16 +101,38 @@ def _validate_entry(entry: object, job_id: str, hotkey: str) -> Mapping:
     return entry
 
 
+# A hotkey's probation progress, shared by the jobs that name one trust document:
+# a new order does not put a trusted hotkey back in probation, and a confirmed
+# failure anywhere resets it everywhere. Suspicion and bans stay per job: the draw
+# check still refuses some honest samples at T < 1 (2026-11-07), and a ban carried
+# to every order would cost an honest miner a week.
+TRUST_FIELDS = ("audited_passed",)
+
+
+def _standing(state: MinerState, cap: int | None) -> dict:
+    """The trust document's entry: the standing alone, its pass count capped at
+    the probation it decides (past it, a pass changes nothing there)."""
+    entry = {field: getattr(state, field) for field in TRUST_FIELDS}
+    if cap is not None:
+        entry["audited_passed"] = min(entry["audited_passed"], cap)
+    return entry
+
+
 class MinerStates:
-    """The per-job miners document, addressed one hotkey at a time."""
+    """The per-job miners document, addressed one hotkey at a time; with a
+    ``trust_id``, each hotkey's probation progress (``TRUST_FIELDS``) comes from
+    and goes to that shared document instead."""
 
-    __slots__ = ("_records", "_job_id", "_sleep", "_clock", "_mirror", "_mirror_lock")
+    __slots__ = ("_records", "_job_id", "_sleep", "_clock", "_mirror", "_mirror_lock", "_trust", "_trust_cap")
 
-    def __init__(self, records, job_id: str, *, sleep=asyncio.sleep, clock=time.time) -> None:
+    def __init__(self, records, job_id: str, *, sleep=asyncio.sleep, clock=time.time,
+                 trust_id: str | None = None, trust_cap: int | None = None) -> None:
         self._records = records
         self._job_id = job_id
         self._sleep = sleep
         self._clock = clock
+        self._trust = MinerStates(records, trust_id, sleep=sleep, clock=clock) if trust_id else None
+        self._trust_cap = trust_cap
         # The last document read or written, and when: the miner status route
         # answers from it instead of reading the store per request.
         self._mirror: tuple[Mapping, float] | None = None
@@ -121,8 +144,17 @@ class MinerStates:
         self._mirror = (document, self._clock())
         return document, etag
 
-    def _entry(self, document: Mapping, hotkey: str) -> MinerState:
+    def _own(self, document: Mapping, hotkey: str) -> MinerState:
         return MinerState.from_dict(_validate_entry(document.get(hotkey, {}), self._job_id, hotkey))
+
+    def _entry(self, document: Mapping, hotkey: str, trust: Mapping | None = None) -> MinerState:
+        state = self._own(document, hotkey)
+        if self._trust is None:
+            return state
+        if trust is None:
+            trust = (self._trust.mirror() or ({}, 0.0))[0]
+        standing = self._trust._own(trust, hotkey)
+        return replace(state, **{field: getattr(standing, field) for field in TRUST_FIELDS})
 
     def mirror(self) -> tuple[Mapping, float] | None:
         """The last document seen and when, or None before any read."""
@@ -137,16 +169,23 @@ class MinerStates:
             if self._mirror is None or self._clock() - self._mirror[1] > max_age:
                 await self._read_document()
         document, at = self._mirror
+        if self._trust is not None:
+            _, trusted_at = await self._trust.state_at_most(hotkey, max_age)
+            at = min(at, trusted_at)
         return self._entry(document, hotkey), at
+
+    async def _read_trust(self) -> Mapping | None:
+        return None if self._trust is None else (await self._trust._read_document())[0]
 
     async def get(self, hotkey: str) -> MinerState:
         document, _ = await self._read_document()
-        return self._entry(document, hotkey)
+        return self._entry(document, hotkey, await self._read_trust())
 
     async def get_many(self, hotkeys) -> dict[str, MinerState]:
-        """Several hotkeys' states from one read of the document."""
+        """Several hotkeys' states from one read of the document (and of the trust one)."""
         document, _ = await self._read_document()
-        return {hotkey: self._entry(document, hotkey) for hotkey in hotkeys}
+        trust = await self._read_trust()
+        return {hotkey: self._entry(document, hotkey, trust) for hotkey in hotkeys}
 
     async def hotkeys(self) -> list[str]:
         document, _ = await self._read_document()
@@ -169,8 +208,21 @@ class MinerStates:
         for attempt in range(attempts):
             try:
                 document, etag = await self._read_document()
-                updated = {hotkey: change(self._entry(document, hotkey))
+                trust = trust_etag = None
+                if self._trust is not None:
+                    trust, trust_etag = await self._trust._read_document()
+                updated = {hotkey: change(self._entry(document, hotkey, trust))
                            for hotkey, change in changes.items()}
+                if self._trust is not None:
+                    # The standing first: a crash before the order's own write then re-applies
+                    # the change, which counts a pass again (up to the cap) or resets again.
+                    standings = {hotkey: _standing(state, self._trust_cap) for hotkey, state in updated.items()}
+                    moved = {hotkey: entry for hotkey, entry in standings.items()
+                             if entry != _standing(self._trust._own(trust, hotkey), self._trust_cap)}
+                    if moved:
+                        shared = {**trust, **moved}
+                        await self._records.write_miners(self._trust._job_id, shared, trust_etag)
+                        self._trust._mirror = (shared, self._clock())
                 written = {**document,
                            **{hotkey: state.to_dict() for hotkey, state in updated.items()}}
                 await self._records.write_miners(self._job_id, written, etag)

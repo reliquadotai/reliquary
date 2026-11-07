@@ -280,7 +280,7 @@ class LazyRoundAt:
         self._resolved = make_round_at(genesis_time, period)
 
 
-def build_corpus_audit_wiring(*, entry, job, records):
+def build_corpus_audit_wiring(*, entry, job, records, trust_id: str | None = None):
     """This task's audit parameters, per-hotkey state, ban check, and drand
     draw -- everything ``run_corpus_validator`` hands the auditor and the
     route, assembled apart from the model and HTTP setup so it is cheap to
@@ -293,12 +293,16 @@ def build_corpus_audit_wiring(*, entry, job, records):
     job now (``LazyRoundAt``), deferred to first use and retried on its own
     schedule, so a chain that is not yet known when this process starts still
     turns sampling on later without a restart.
+
+    ``trust_id``: the miners document whose hotkey probation progress this
+    job shares with every other job naming it.
     """
     from reliquary.corpus.audit_policy import AuditParams, effective_state
     from reliquary.validator.corpus_miner_states import MinerStates
 
     params = AuditParams.from_params(entry.params)
-    miner_states = MinerStates(records, job.job_id)
+    miner_states = MinerStates(records, job.job_id, trust_id=trust_id,
+                               trust_cap=params.probation_submissions)
 
     async def is_banned(hotkey: str) -> bool:
         state = await miner_states.get(hotkey)

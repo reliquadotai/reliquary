@@ -43,10 +43,11 @@ DEFAULT_TASK_PREFIX = "order-"
 # No admin request is larger; the bound is checked before the body is read.
 MAX_BODY_BYTES = 1024 * 1024
 DEFAULT_EVAL_CAP = 0.02
-# A generation order on any model: the cap share it defaults to, and the
-# partial audit of corpus jobs (probation 100, then 15 % sampled by drand).
+# A generation order on any model: the cap share it defaults to, and its audit:
+# every submission unless the order asks for a sampled share (`audit_q`), then
+# a hotkey's first 20 audited passes (counted across orders) before sampling starts.
 DEFAULT_GEN_CAP = 0.02
-GEN_AUDIT_PARAMS = {"audit_q": 0.15, "audit_probation_submissions": 100,
+GEN_AUDIT_PARAMS = {"audit_q": 1.0, "audit_probation_submissions": 20,
                     "audit_hold_seconds": 4320, "audit_suspect_seconds": 86400,
                     "audit_ban_after_failures": 3, "audit_ban_window_seconds": 604800,
                     "audit_ban_seconds": 604800}
