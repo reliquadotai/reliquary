@@ -86,6 +86,9 @@ class MinerState:
     mant_mean_history: list = field(default_factory=list)
     failure_ids: list = field(default_factory=list)
     pass_ids: list = field(default_factory=list)
+    # The latest receipt among this job's confirmed failures: its unpaid work
+    # received up to then is forfeited (`forfeits`).
+    forfeit_before: float | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -161,13 +164,27 @@ def after_pass(m: MinerState, params: AuditParams, mant_mean: float,
                    pass_ids=ids)
 
 
+def forfeits(m: MinerState, received_at: float | None) -> bool:
+    """Whether a submission received at ``received_at`` is forfeited: a
+    confirmed failure of its hotkey was received at or after it. At a sampled
+    share q a cheat is caught with probability q, and the hold keeps at least
+    1/q of its hotkey's submissions unpaid: a caught cheat costs at least what
+    a cheat earns, whatever q."""
+    return (m.forfeit_before is not None and received_at is not None
+            and received_at <= m.forfeit_before)
+
+
 def after_confirmed_failure(m: MinerState, params: AuditParams, now: float,
-                            submission_id: str) -> MinerState:
+                            submission_id: str, received_at: float | None = None) -> MinerState:
     # Any confirmed failure resets audited_passed: probation (and the ban
     # that follows suspect) is left only with no confirmed failure (§5), so
     # a hotkey coming out of suspect always starts a fresh probation count.
     # Idempotent per submission: the state is written before the verdict, so a
     # retry after a crash between the two must not count the failure twice.
+    # Before the idempotence guard: a failure already in a shared standing still
+    # forfeits in the job whose own document missed it.
+    if received_at is not None and (m.forfeit_before is None or received_at > m.forfeit_before):
+        m = replace(m, forfeit_before=float(received_at))
     if submission_id in m.failure_ids:
         return m
     ids = (list(m.failure_ids) + [submission_id])[-FAILURE_IDS:]

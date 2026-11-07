@@ -122,7 +122,7 @@ def test_a_batch_on_a_frozen_set_is_the_same_order(admin, pins):  # noqa: F811
     assert {k: getattr(job, k) for k in same} == {k: getattr(evaluation, k) for k in same}
     assert job.sampling == evaluation.sampling
     assert job.submit == "scoped"
-    assert admin.registry["entries"]["order-gen-p1"].params["audit_q"] == 0.15
+    assert admin.registry["entries"]["order-gen-p1"].params["audit_q"] == 1.0
     record = asyncio.run(qual.EvalJobStore().read("order-gen-p1"))
     assert record["kind"] == qual.GENERATION and record["seed"] == 11
 

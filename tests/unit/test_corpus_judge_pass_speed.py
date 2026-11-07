@@ -30,6 +30,19 @@ from tests.unit import _main_corpus_auditor as main_module
 # -- drand: two agreeing relays, cached -----------------------------------------
 
 
+
+@pytest.fixture
+def without_forfeit(monkeypatch):
+    """The reference judge (`_main_corpus_auditor`) predates forfeits: compared with it, none."""
+    from reliquary.validator import corpus_auditor
+
+    monkeypatch.setattr(corpus_auditor, "forfeits", lambda state, received_at: False)
+
+    async def nothing(self, states, now):
+        return []
+
+    monkeypatch.setattr(corpus_auditor.CorpusAuditor, "_void_forfeited", nothing)
+
 def _sig(round_number, forged=False):
     # 48 bytes, the size of a quicknet signature (a G1 point).
     return (hashlib.sha256(f"sig-{round_number}-{forged}".encode()).hexdigest() * 2)[:96]
@@ -193,7 +206,7 @@ def test_backward_audits_never_list_the_job_and_failures_share_one_call(monkeypa
 
 
 @pytest.mark.parametrize("seed", [7, 3])
-def test_the_faster_judge_writes_main_s_verdicts(seed):
+def test_the_faster_judge_writes_main_s_verdicts(seed, without_forfeit):
     faults = equivalence.ALL
     main, _ = equivalence._run(main_module, "poll", faults, seed)
     fast, _ = equivalence._run(corpus_auditor, "run", faults, seed)

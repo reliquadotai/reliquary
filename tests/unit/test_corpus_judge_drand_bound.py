@@ -26,6 +26,19 @@ from tests.unit import _main_corpus_auditor as main_module
 HOLD = 3600.0
 
 
+
+@pytest.fixture
+def without_forfeit(monkeypatch):
+    """The reference judge (`_main_corpus_auditor`) predates forfeits: compared with it, none."""
+    from reliquary.validator import corpus_auditor
+
+    monkeypatch.setattr(corpus_auditor, "forfeits", lambda state, received_at: False)
+
+    async def nothing(self, states, now):
+        return []
+
+    monkeypatch.setattr(corpus_auditor.CorpusAuditor, "_void_forfeited", nothing)
+
 class _SlowBadBeacon(sim.Beacon):
     """Every round answers in 0.2 s, except one in 97: its relays fail after 90 s."""
 
@@ -126,7 +139,7 @@ def test_each_pass_announces_its_work(monkeypatch, caplog):
 
 
 @pytest.mark.parametrize("seed", [7, 3])
-def test_a_sibling_bounded_judge_writes_main_s_verdicts(monkeypatch, seed):
+def test_a_sibling_bounded_judge_writes_main_s_verdicts(monkeypatch, seed, without_forfeit):
     monkeypatch.setattr(corpus_auditor, "PASS_SIBLINGS", 4)
     faults = equivalence.ALL
     main, _ = equivalence._run(main_module, "poll", faults, seed)

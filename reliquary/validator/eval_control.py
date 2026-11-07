@@ -82,6 +82,9 @@ def order_audit_scorers(env=None) -> int:
 STATUS_SECONDS = 30.0
 HEARTBEAT_WRITE_SECONDS = 30.0
 EVAL_CONTROL_STATUS_KEY = "reliquary/eval/control/status.json"
+# The miners document every order shares: a hotkey's probation progress carries
+# from one order to the next (no `order-` prefix: it is no order).
+ORDER_TRUST_ID = "miner-trust-orders"
 
 
 class BatchParked(Exception):
@@ -1312,7 +1315,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         # v3 writers. Finish any committed bodies before constructing readers.
         await recover_pending_records(store, records, job)
         params, miner_states, is_banned, beacon, round_at = build_corpus_audit_wiring(
-            entry=entry, job=job, records=records)
+            entry=entry, job=job, records=records, trust_id=ORDER_TRUST_ID)
         w = SimpleNamespace(entry=entry, cap=cap, job=job, tokenizer=tokenizer,
                             vocab_size=vocab_size, proof=proof, renderer=renderer,
                             prompt_job_for=prompt_job_for, seen_index=seen_index,

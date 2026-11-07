@@ -20,7 +20,7 @@ import math
 import os
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import torch
 
@@ -36,6 +36,7 @@ from reliquary.corpus.audit_policy import (
     decision,
     drawn,
     effective_state,
+    forfeits,
 )
 from reliquary.corpus.encoding import prompt_token_ids
 from reliquary.protocol.profiles import ProofProfile
@@ -128,6 +129,8 @@ FEED_MARGIN_SECONDS = 15.0
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _WORST_ZERO = {"worst_exp": 0, "worst_mant_mean": 0.0, "worst_mant_median": 0.0}
 _BANNED_VOID = {"passed": False, "audited": False, "reason": "banned"}
+# Unpaid work of a hotkey received up to one of its confirmed failures (`forfeits`).
+_FORFEITED = {"passed": False, "audited": False, "reason": "forfeited"}
 
 
 # A hotkey refused at least this often, this unlikely at the rate of the job's other hotkeys, is charged.
@@ -237,6 +240,11 @@ class CorpusAuditor:
         self._draw_counts: dict[str, list[int]] = {}
         self._draw_totals = [0, 0]
         self._draw_counted: set[str] = set()
+        # Passes this process wrote, per hotkey (received_at, id), and whether the job's earlier ones
+        # were read once: a forfeit then never lists the job again (`_void_forfeited`).
+        self._paid: dict[str, list[tuple[float, str]]] = {}
+        self._paid_loaded = False
+        self._voided_ids: set[str] | None = None
         # Pending ids whose draw is known and undrawn: as a sibling they can
         # neither be audited nor be undecidable, so a pass need not decide them.
         self._undrawn: set[str] = set()
@@ -870,6 +878,13 @@ class CorpusAuditor:
             return {**outcome, "penalty": True, "charged_for": "frequent_refusals"}
         return outcome
 
+    def _received(self, submission_id: str, record: Mapping | None = None) -> float | None:
+        meta = self._meta.get(submission_id)
+        if meta is not None:
+            return float(meta[1])
+        value = (record or {}).get("received_at")
+        return float(value) if isinstance(value, (int, float)) else None
+
     def _verdict(self, submission_id: str, hotkey: str, token_count: int, outcome: dict,
                  draw: dict | None) -> dict:
         verdict = {
@@ -900,6 +915,9 @@ class CorpusAuditor:
         # Reopen before reporting: the status must not see the verdict while the ledger still counts it passing.
         if standing is not None and not standing.get("passed"):
             await self._reopen_slot(submission_id)
+        elif standing is not None and isinstance(standing.get("received_at"), (int, float)):
+            self._paid.setdefault(standing.get("hotkey"), []).append(
+                (float(standing["received_at"]), submission_id))
         self._report(submission_id, standing)
         return standing, written
 
@@ -1088,7 +1106,8 @@ class CorpusAuditor:
             # re-audits the records, and the retry counts nothing twice
             # (idempotent by submission id), instead of leaving a caught
             # cheater unsuspected while its held records are paid.
-            states.update(await self._escalate(failures, now))
+            states.update(await self._escalate(failures, now, {
+                ids[k]: self._received(ids[k], records[k]) for k in judged}))
 
         # Failures first: a ban they cause must void this batch's passes of that hotkey.
         order = sorted(judged, key=lambda k: outcomes[k]["passed"])
@@ -1103,6 +1122,8 @@ class CorpusAuditor:
             if outcome["passed"]:
                 if effective_state(states[hotkey], now, self._params) == "banned":
                     outcome = dict(_BANNED_VOID)
+                elif forfeits(states[hotkey], self._received(submission_id, record)):
+                    outcome = {**_FORFEITED, "audited": True}
             planned.append((k, outcome, self._verdict(
                 submission_id, hotkey, record["token_count"], outcome,
                 draws.get(submission_id) if outcome["audited"] else None)))
@@ -1144,21 +1165,82 @@ class CorpusAuditor:
             self._raise_first(landed)
         return results, failed_hotkeys
 
-    async def _escalate(self, failures: dict[str, list[str]],
-                        now: float) -> dict[str, MinerState]:
-        """Each hotkey's confirmed failures, in one write (miners.json is one key)."""
+    async def _escalate(self, failures: dict[str, list[str]], now: float,
+                        received: Mapping[str, float] | None = None) -> dict[str, MinerState]:
+        """Each hotkey's confirmed failures, in one write (miners.json is one key);
+        then its unpaid passes received up to them are voided (`forfeits`)."""
         if self._miner_states is None:
             return {}
+        # At q = 1 every submission is audited, so no cheat is ever paid: nothing to forfeit.
+        received = (received or {}) if self._params.q < 1.0 else {}
 
         def escalate(sids: list[str]) -> Callable[[MinerState], MinerState]:
             def change(m: MinerState) -> MinerState:
                 for sid in sids:
-                    m = after_confirmed_failure(m, self._params, now, sid)
+                    m = after_confirmed_failure(m, self._params, now, sid,
+                                                received_at=received.get(sid))
                 return m
             return change
 
-        return await self._miner_states.update_many(
+        states = await self._miner_states.update_many(
             {hotkey: escalate(sids) for hotkey, sids in failures.items()})
+        # Before the failing verdicts are written: a stop in between re-audits them, which voids again.
+        await self._void_forfeited({hotkey: states[hotkey] for hotkey in failures
+                                    if states[hotkey].forfeit_before is not None}, now)
+        return states
+
+    async def _void_forfeited(self, states: Mapping[str, MinerState], now: float) -> list[str]:
+        """Void every written, unsettled pass of these hotkeys that their failures forfeit. The job's
+        verdicts are read once per process (a pass written before a restart counts); after that, the
+        passes this process wrote are enough."""
+        writer = getattr(self._records, "write_voided", None)
+        if not states or writer is None:
+            return []
+        if self._voided_ids is None:
+            lister = getattr(self._records, "list_voided_ids", None)
+            self._voided_ids = set(await lister(self._job_id)) if lister is not None else set()
+        settlement = getattr(self._records, "read_settlement", None)
+        settled = set(((await settlement(self._job_id))[0] or {}).get("settled") or ()) \
+            if callable(settlement) else set()
+        if not self._paid_loaded:
+            await self._load_paid(settled)
+        forfeited = []
+        for hotkey, state in states.items():
+            kept = []
+            for received_at, sid in self._paid.get(hotkey, ()):
+                if sid in settled or sid in self._voided_ids:
+                    continue
+                if not forfeits(state, received_at):
+                    kept.append((received_at, sid))
+                    continue
+                document = {"schema": VOIDED_SCHEMA, "submission_id": sid, "hotkey": hotkey,
+                            "reason": "forfeited", "voided_at": now, "forfeit_before": state.forfeit_before}
+                await writer(self._job_id, sid, document)
+                self._voided_ids.add(sid)
+                self._report_voided(sid, document)
+                await self._reopen_slot(sid)
+                forfeited.append(sid)
+            self._paid[hotkey] = kept
+        if forfeited:
+            logger.warning("corpus job %s: %d unpaid pass(es) forfeited by confirmed failures of %s",
+                           self._job_id, len(forfeited), ", ".join(sorted(states)))
+        return forfeited
+
+    async def _load_paid(self, settled: set[str]) -> None:
+        """The job's unsettled passing verdicts written before this process (every hotkey: one read for all)."""
+        known = {sid for paid in self._paid.values() for _, sid in paid}
+        ids = [sid for sid in await self._records.list_verdict_ids(self._job_id)
+               if sid not in known and sid not in self._voided_ids and sid not in settled]
+        gate = asyncio.Semaphore(READ_CONCURRENCY)
+
+        async def one(sid):
+            async with gate:
+                return sid, await self._records.read_verdict(self._job_id, sid)
+
+        for sid, verdict in await gather_owned(one(sid) for sid in ids):
+            if verdict and verdict.get("passed") and isinstance(verdict.get("received_at"), (int, float)):
+                self._paid.setdefault(verdict.get("hotkey"), []).append((float(verdict["received_at"]), sid))
+        self._paid_loaded = True
 
     async def reaudit_executor(self, executor_id: str) -> list[str]:
         """Re-audit on this GPU every pass written from a quarantined executor's
@@ -1193,7 +1275,7 @@ class CorpusAuditor:
             by_hotkey: dict[str, list[str]] = {}
             for sid in failed:
                 by_hotkey.setdefault(records[sid]["hotkey"], []).append(sid)
-            await self._escalate(by_hotkey, now)
+            await self._escalate(by_hotkey, now, {sid: self._received(sid, records[sid]) for sid in failed})
             writer = getattr(self._records, "write_voided", None)
             for sid, outcome in failed.items():
                 if writer is not None:
@@ -1507,9 +1589,10 @@ class CorpusAuditor:
                     for t in undecided.get(hotkey, ())):
                 self._next_due[submission_id] = self._retry_at(hotkey, now)
                 continue
-            verdict = (submission_id, self._verdict(
-                submission_id, hotkey, token_count,
-                {"passed": True, "audited": False, "reason": None, **_WORST_ZERO}, draw))
+            paid = {"passed": True, "audited": False, "reason": None, **_WORST_ZERO}
+            if forfeits(states[hotkey], received_at):
+                paid = dict(_FORFEITED)
+            verdict = (submission_id, self._verdict(submission_id, hotkey, token_count, paid, draw))
             # No record of this hotkey is audited in this pass, so no failure
             # or error of it can come from the audit: written alongside it.
             (late if hotkey in audited_hotkeys else early).append(verdict)

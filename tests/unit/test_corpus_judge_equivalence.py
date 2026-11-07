@@ -30,6 +30,19 @@ _OK = {"passed": True, "reason": None, "worst_exp": 0, "worst_mant_mean": 0.01,
 _BAD = {**_OK, "passed": False, "reason": "exp_mismatch"}
 
 
+
+@pytest.fixture
+def without_forfeit(monkeypatch):
+    """The reference judge (`_main_corpus_auditor`) predates forfeits: compared with it, none."""
+    from reliquary.validator import corpus_auditor
+
+    monkeypatch.setattr(corpus_auditor, "forfeits", lambda state, received_at: False)
+
+    async def nothing(self, states, now):
+        return []
+
+    monkeypatch.setattr(corpus_auditor.CorpusAuditor, "_void_forfeited", nothing)
+
 def _params(faults):
     return AuditParams(q=0.25, probation_submissions=5, hold_seconds=300.0,
                        suspect_seconds=86400.0, ban_seconds=600.0,
@@ -194,7 +207,7 @@ ALL = ("ban", "unreadable", "write", "quarantine", "restart")
 
 
 @pytest.mark.parametrize("seed", [7, 3])
-def test_main_and_the_scheduled_judge_write_the_same_verdicts(seed):
+def test_main_and_the_scheduled_judge_write_the_same_verdicts(seed, without_forfeit):
     faults = ALL
     main, hotkey_of = _run(main_module, "poll", faults, seed)
     polled, _ = _run(new_module, "poll", faults, seed)
