@@ -33,7 +33,7 @@ from reliquary.constants import (
     FORCED_SEED_GUMBEL_BOUNDARY_EPSILON,
     FORCED_SEED_STOCHASTIC_MAXPROB,
 )
-from reliquary.environment.forced_sampling import DRAW_GUMBEL_MAX, Warp, u_range
+from reliquary.environment.forced_sampling import DRAW_GUMBEL_MAX, FAR_MISS_GAP, Warp, u_range
 
 EVAL_DRAW = DRAW_GUMBEL_MAX
 EVAL_DRAW_DOMAIN = "reliquary-eval-draw-v1"
@@ -59,6 +59,10 @@ EVAL_MATCH_GRACE = 8
 # refusal reopens its slot uncharged.
 EVAL_CHARGE_FLOOR = 0.90
 EVAL_CHARGE_MIN_POSITIONS = 64
+# And an edit: at least this many tokens before the last one far from the pick (``forced_sampling.FAR_MISS_GAP``).
+# Injecting text changes several tokens, each its own far gap; the honest glitch seen at T 0.7 is one far gap or a
+# cut end in a sample, spread evenly over every hotkey (2026-11-07). An executor that predates the count sends none.
+EVAL_EDIT_FAR_MISSES = 2
 REASON_DRAW_SLOT_TAKEN = "draw_slot_taken"
 REASON_BAD_CURSOR = "bad_cursor"
 
@@ -176,7 +180,8 @@ def judge(diags, policy: Any = None) -> tuple[bool, dict[str, Any]]:
       near-tie).
 
     A refused sample's detail says ``penalty``: True only when it matches under ``EVAL_CHARGE_FLOOR`` of at least
-    ``EVAL_CHARGE_MIN_POSITIONS`` positions (another model or draw); any other refusal is never charged to the miner.
+    ``EVAL_CHARGE_MIN_POSITIONS`` positions (another model or draw), or carries ``EVAL_EDIT_FAR_MISSES`` far misses
+    before its last token (an edit); any other refusal is never charged to the miner.
 
     ``policy``: the job's ``corpus.job.DrawJudge``; None, the defaults."""
     gap_tolerance, terminal_gap = ((EVAL_GAP_TOLERANCE, EVAL_TERMINAL_GAP) if policy is None
@@ -185,15 +190,18 @@ def judge(diags, policy: Any = None) -> tuple[bool, dict[str, Any]]:
     for i, d in enumerate(diags):
         counted, exact = _counted(d)
         misses = counted - exact
+        far = int(getattr(d, "n_far_miss", 0)) - (1 if _gap(d.last_miss) > FAR_MISS_GAP else 0)
         detail = {"completion": i, "match": round(exact / counted, 4) if counted else 0.0,
                   "positions": d.n_positions, "stochastic": d.n_stochastic, "misses": misses,
-                  "max_gap": round(_gap(d.max_cdf_miss), 4), "last_gap": round(_gap(d.last_miss), 4)}
+                  "max_gap": round(_gap(d.max_cdf_miss), 4), "last_gap": round(_gap(d.last_miss), 4),
+                  "far_misses": max(0, far)}
         if not worst or detail["match"] < worst["match"]:
             worst = detail
         followed = counted > 0 and misses <= allowed_misses(counted, policy)
         ended = _gap(d.last_miss) <= terminal_gap
         if not followed or not ended or _gap(d.max_cdf_miss) > gap_tolerance:
-            charged = counted >= EVAL_CHARGE_MIN_POSITIONS and exact < EVAL_CHARGE_FLOOR * counted
+            charged = (counted >= EVAL_CHARGE_MIN_POSITIONS and exact < EVAL_CHARGE_FLOOR * counted) \
+                or far >= EVAL_EDIT_FAR_MISSES
             return False, {**detail, "penalty": charged}
     return True, worst
 
@@ -208,6 +216,6 @@ def parse_draw(raw: Mapping[str, Any]) -> str | None:
     return value
 
 
-__all__ = ["EVAL_CHARGE_FLOOR", "EVAL_CHARGE_MIN_POSITIONS", "EVAL_DRAW", "EVAL_DRAW_DOMAIN", "EVAL_GAP_TOLERANCE", "EVAL_TERMINAL_GAP", "REASON_BAD_CURSOR", "REASON_DRAW_MISMATCH", "REASON_DRAW_SLOT_TAKEN", "allowed_misses", "attempt_digests", "diagnostics", "draw_context",
+__all__ = ["EVAL_CHARGE_FLOOR", "EVAL_CHARGE_MIN_POSITIONS", "EVAL_EDIT_FAR_MISSES", "EVAL_DRAW", "EVAL_DRAW_DOMAIN", "EVAL_GAP_TOLERANCE", "EVAL_TERMINAL_GAP", "REASON_BAD_CURSOR", "REASON_DRAW_MISMATCH", "REASON_DRAW_SLOT_TAKEN", "allowed_misses", "attempt_digests", "diagnostics", "draw_context",
            "draw_randomness", "has_draw", "job_warp", "judge", "match_rate", "parse_draw", "rollout_index", "slot_count",
            "slot_key", "uniforms"]
