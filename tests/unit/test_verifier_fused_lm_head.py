@@ -215,3 +215,17 @@ def test_logits_are_not_computed_for_prompt_only_positions():
 
     assert lm_head.positions, "lm_head was never called"
     assert min(lm_head.positions) >= _PROMPT_LENGTH - 1
+
+
+def test_the_fp32_head_weight_is_cast_once_until_the_weight_changes(monkeypatch):
+    from reliquary.validator import verifier
+
+    casts = []
+    monkeypatch.setattr(verifier, "fp32_head_weight", lambda w: casts.append(1) or w.float())
+    head = torch.nn.Linear(4, 6, bias=False)
+    first = verifier.cached_fp32_head_weight(head)
+    assert verifier.cached_fp32_head_weight(head) is first and len(casts) == 1
+    with torch.no_grad():
+        head.weight.add_(1.0)  # a delta or a swap writes the weight in place
+    again = verifier.cached_fp32_head_weight(head)
+    assert len(casts) == 2 and torch.equal(again, head.weight.float())

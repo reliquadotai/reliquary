@@ -406,7 +406,8 @@ def test_warped_chunks_follow_their_own_workspace_and_agree(monkeypatch):
     torch.manual_seed(5)
     logits = torch.randn(9, 60) * 2
     us = _us(9)
-    warp = Warp(t=0.7, top_k=12, top_p=0.9)
+    # No top-k: the whole-vocabulary path, which keeps its own workspace.
+    warp = Warp(t=0.7, top_p=0.9)
     tokens = _picks(logits, us, warp)
     tokens[4] = (tokens[4] + 1) % 60
     whole = _diag(logits, tokens, us, warp)
@@ -423,4 +424,42 @@ def test_warped_chunks_follow_their_own_workspace_and_agree(monkeypatch):
     # The general budget no longer caps a warped chunk.
     monkeypatch.setattr(fs, "_DIAGNOSTIC_FLOAT_WORKSPACE_BYTES", 1)
     assert _diag(logits, tokens, us, warp) == whole
+    assert seen == [4, 4, 1]
+
+
+@pytest.mark.parametrize("warp", [Warp(t=1.0, top_k=20, top_p=0.95), Warp(t=0.6, top_k=8),
+                                  Warp(t=1.3, top_k=30, top_p=0.8, min_p=0.05), Warp(t=1.0, top_k=1)])
+@pytest.mark.parametrize("margin", [0.0, 0.05, 0.2])
+def test_the_top_k_slice_judges_like_the_whole_vocabulary(warp, margin):
+    torch.manual_seed(11)
+    logits = torch.randn(64, 500) * 3
+    logits[::7] *= 0.05  # near-flat rows: many near-ties at the cut
+    us = _us(64)
+    tokens = _picks(logits, us, warp)
+    for row in range(0, 64, 3):  # edits: an edge token, a far token, a near one
+        tokens[row] = int(torch.argsort(logits[row], descending=True)[(row // 3) % 40])
+    args = (torch.tensor(tokens), us, warp, margin, 0.95)
+    sliced = fs._gumbel_warp_chunk_stats(logits, *args)
+    dense = fs._gumbel_warp_chunk_stats_dense(logits, *args)
+    assert torch.equal(sliced[0], dense[0])
+    assert torch.equal(sliced[2], dense[2])
+    assert torch.allclose(sliced[1], dense[1], atol=1e-6, rtol=0)
+
+
+def test_a_top_k_slice_takes_bigger_chunks_from_the_warp_workspace(monkeypatch):
+    seen = []
+    original = fs._gumbel_warp_chunk_stats
+
+    def recording(chunk, *args):
+        seen.append(int(chunk.shape[0]))
+        return original(chunk, *args)
+
+    monkeypatch.setattr(fs, "_gumbel_warp_chunk_stats", recording)
+    # Two [rows, V] float blocks a row: the slice needs neither the masks nor the score copies.
+    monkeypatch.setattr(fs, "_WARP_WORKSPACE_BYTES", 4 * 60 * 4 * 2)
+    torch.manual_seed(5)
+    logits = torch.randn(9, 60) * 2
+    us = _us(9)
+    warp = Warp(t=0.7, top_k=12, top_p=0.9)
+    _diag(logits, _picks(logits, us, warp), us, warp)
     assert seen == [4, 4, 1]
