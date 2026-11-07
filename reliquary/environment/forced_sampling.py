@@ -636,7 +636,10 @@ def seed_consistency_diagnostics(
         1,
         min(n, _DIAGNOSTIC_FLOAT_WORKSPACE_BYTES // (vocab_size * 4)),
     )
-    if warped:
+    if warped and _warp_slice_width(_warp_of(t, top_k, top_p, min_p), edge_margin, vocab_size):
+        # The slice path holds the projected rows and one top-k: bigger chunks, far fewer launches.
+        chunk_rows = max(1, min(n, _WARP_WORKSPACE_BYTES // (vocab_size * 4 * 2)))
+    elif warped:
         # Support masks, a top-k sort and three masked score copies per row.
         chunk_rows = max(1, min(n, _WARP_WORKSPACE_BYTES // (vocab_size * 4 * 8)))
     elif draw == DRAW_GUMBEL_MAX and not (str(logits.device).startswith("cuda") and _triton_argmax()):
@@ -754,8 +757,52 @@ def _gumbel_chunk_stats(chunk_logits, toks, draws, stochastic_threshold):
     return exact, miss, max_probs < stochastic_threshold
 
 
+def _warp_slice_width(warp: Warp, edge_margin: float, vocab: int) -> int:
+    """How many top tokens hold every support the warped check reads (exact, tight, loose), or 0 when no top-k
+    bounds them and the check must read the whole vocabulary."""
+    k = max(warp.top_k, warp.widened(edge_margin).top_k) if edge_margin else warp.top_k
+    return k if 0 < warp.top_k and k < vocab else 0
+
+
 def _gumbel_warp_chunk_stats(chunk_logits, toks, draws, warp, edge_margin, stochastic_threshold):
-    """(exact, miss, stochastic) per row under a warped Gumbel draw (``seed_consistency_diagnostics``)."""
+    """(exact, miss, stochastic) per row under a warped Gumbel draw (``seed_consistency_diagnostics``).
+
+    With a top-k cut every support lies in the row's top ``_warp_slice_width`` tokens, so the noise, the
+    supports and the picks are computed on that slice alone: one top-k over the vocabulary instead of three
+    top-k, two noise passes and the masked copies. Same scores bit for bit; the lowest token id still wins a
+    tie, as in ``gumbel_argmax``."""
+    width = _warp_slice_width(warp, edge_margin, int(chunk_logits.shape[-1]))
+    if not width:
+        return _gumbel_warp_chunk_stats_dense(chunk_logits, toks, draws, warp, edge_margin, stochastic_threshold)
+    logits = chunk_logits.float()
+    values, index = torch.topk(logits, width, dim=-1)
+    x = values / float(warp.t)
+    keys = _gumbel_keys(draws, x.device)
+    scores = x + gumbel_noise_from_bits(_splitmix_bits(keys[:, None], index))
+    support = warp_support(x, warp)
+    tight = warp_support(x, warp.widened(-edge_margin)) & support
+    loose = warp_support(x, warp.widened(edge_margin)) | support
+    no_id = torch.iinfo(torch.int64).max
+
+    def pick(mask):
+        masked = scores.masked_fill(~mask, float("-inf"))
+        best = masked.max(dim=-1).values
+        return torch.where(masked == best[:, None], index, no_id).min(dim=-1).values, best
+
+    picks, _ = pick(support)
+    _, best = pick(tight)
+    own = logits.gather(1, toks.unsqueeze(1)).squeeze(1) / float(warp.t) \
+        + gumbel_noise_from_bits(_splitmix_bits(keys, toks))
+    exact = picks == toks
+    near = -torch.expm1(-(best - own).clamp_min(0.0))
+    possible = ((index == toks[:, None]) & loose).any(dim=-1)
+    miss = torch.where(exact, torch.zeros_like(near), torch.where(possible, near, torch.ones_like(near)))
+    max_probs = torch.softmax(x.masked_fill(~support, float("-inf")), dim=-1).max(dim=-1).values
+    return exact, miss, max_probs < stochastic_threshold
+
+
+def _gumbel_warp_chunk_stats_dense(chunk_logits, toks, draws, warp, edge_margin, stochastic_threshold):
+    """``_gumbel_warp_chunk_stats`` over the whole vocabulary: the path without a top-k cut, and the reference."""
     x = chunk_logits.float() / float(warp.t)
     keys = _gumbel_keys(draws, x.device)
     support = warp_support(x, warp)

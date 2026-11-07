@@ -521,6 +521,7 @@ class _LazyLogitRows:
         self._hidden = hidden
         self._lm_head = lm_head
         self._fp32_head = bool(fp32_head)
+        self._weight_fp32 = cached_fp32_head_weight(lm_head) if self._fp32_head else None
         self.shape = torch.Size((int(hidden.shape[0]), int(vocab_size)))
 
     @property
@@ -536,7 +537,7 @@ class _LazyLogitRows:
         # retain exactly the memory this class exists to free.
         with torch.no_grad():
             if self._fp32_head:
-                logits = _fp32_head_logits(rows, self._lm_head)
+                logits = _fp32_head_logits(rows, self._lm_head, weight_fp32=self._weight_fp32)
             else:
                 logits = self._lm_head(rows)
             return apply_logit_softcap(logits, self._lm_head)
@@ -619,10 +620,36 @@ def apply_logit_softcap(logits: torch.Tensor, lm_head: Any) -> torch.Tensor:
     return torch.tanh(logits / cap) * cap
 
 
-def _fp32_head_logits(rows: torch.Tensor, lm_head: Any) -> torch.Tensor:
+def _fp32_head_logits(rows: torch.Tensor, lm_head: Any, *, weight_fp32: torch.Tensor | None = None) -> torch.Tensor:
     if getattr(lm_head, "bias", None) is not None:
         raise RuntimeError("fp32 LM head: a biased head is not supported")
-    return fp32_head_matmul(rows.reshape(-1, rows.shape[-1]), lm_head.weight).reshape(*rows.shape[:-1], -1)
+    return fp32_head_matmul(rows.reshape(-1, rows.shape[-1]), lm_head.weight,
+                            weight_fp32=weight_fp32).reshape(*rows.shape[:-1], -1)
+
+
+_HEAD_WEIGHT_CACHE_ATTR = "_reliquary_fp32_head_weight"
+
+
+def cached_fp32_head_weight(lm_head: Any) -> torch.Tensor | None:
+    """``fp32_head_weight`` of ``lm_head``, cast once and kept on the module until its weight changes (a swap or a
+    delta writes it in place and bumps its version). The audit projects a sequence's rows in hundreds of chunks:
+    re-cast per chunk, the head took ~60 % of the warped verify on the 9B (H200, torch 2.7, 2026-11-07)."""
+    weight = getattr(lm_head, "weight", None)
+    if not isinstance(weight, torch.Tensor):
+        return None
+    try:
+        stamp = (weight.data_ptr(), weight._version, tuple(weight.shape))
+    except RuntimeError:  # an inference-mode tensor has no version counter: never cached
+        return fp32_head_weight(weight)
+    held = getattr(lm_head, _HEAD_WEIGHT_CACHE_ATTR, None)
+    if held is not None and held[0] == stamp:
+        return held[1]
+    cast = fp32_head_weight(weight)
+    try:
+        object.__setattr__(lm_head, _HEAD_WEIGHT_CACHE_ATTR, (stamp, cast) if cast is not None else None)
+    except (AttributeError, TypeError):
+        pass
+    return cast
 
 
 def _lm_head_vocab_size(lm_head: Any) -> int | None:
