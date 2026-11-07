@@ -51,12 +51,14 @@ EVAL_MATCH_FLOOR = 0.98
 EVAL_GAP_TOLERANCE = 4.0
 EVAL_TERMINAL_GAP = 3.0
 EVAL_MATCH_GRACE = 8
-# A sample that follows the draw but misses one token by a gap over the job's tolerance and at most this much is
-# refused without a penalty: its slot reopens, the miner is not counted a failure. Honest misses come from bf16
-# kernel drift between the miner's engine and the audit and reach 5.3 (Gemma 4 on sdpa, 2026-11-05; 4.2 on a Qwen3
-# control): charged as confirmed failures they suspended honest miners (3 of 1,035 samples on Qwen3-8B,
-# 2026-11-04). A token written in place of the draw is usually far beyond it; past it, the failure counts.
-EVAL_FORGERY_GAP = 8.0
+# What a refusal is charged for (suspicion, ban, forfeit): a sample of at least EVAL_CHARGE_MIN_POSITIONS positions
+# matching under EVAL_CHARGE_FLOOR of them -- another model, a re-rolled draw or a 4-bit quantisation (0.5-0.86).
+# Honest drift never went under 0.90 past 150 tokens over 166,864 audited samples (14 orders, 2026-11-07), while
+# 131 refusals charged by the gap or the floor alone were honest: 18 hotkeys banned on one T 0.6 order (match
+# 0.974-0.979, every gap small), and single far gaps or cut ends spread evenly over every hotkey at T 0.7. Any other
+# refusal reopens its slot uncharged.
+EVAL_CHARGE_FLOOR = 0.90
+EVAL_CHARGE_MIN_POSITIONS = 64
 REASON_DRAW_SLOT_TAKEN = "draw_slot_taken"
 REASON_BAD_CURSOR = "bad_cursor"
 
@@ -173,8 +175,8 @@ def judge(diags, policy: Any = None) -> tuple[bool, dict[str, Any]]:
     * end where the draw ended it: the last token within ``EVAL_TERMINAL_GAP`` (a sample cut short is not a
       near-tie).
 
-    A refused sample's detail says ``penalty``: False when it followed the draw and ended where it should, its
-    worst miss only a little over the tolerance (``EVAL_FORGERY_GAP``): kernel drift, never charged to the miner.
+    A refused sample's detail says ``penalty``: True only when it matches under ``EVAL_CHARGE_FLOOR`` of at least
+    ``EVAL_CHARGE_MIN_POSITIONS`` positions (another model or draw); any other refusal is never charged to the miner.
 
     ``policy``: the job's ``corpus.job.DrawJudge``; None, the defaults."""
     gap_tolerance, terminal_gap = ((EVAL_GAP_TOLERANCE, EVAL_TERMINAL_GAP) if policy is None
@@ -191,9 +193,8 @@ def judge(diags, policy: Any = None) -> tuple[bool, dict[str, Any]]:
         followed = counted > 0 and misses <= allowed_misses(counted, policy)
         ended = _gap(d.last_miss) <= terminal_gap
         if not followed or not ended or _gap(d.max_cdf_miss) > gap_tolerance:
-            # Penalised unless the one fault is a miss a little over the tolerance (``EVAL_FORGERY_GAP``).
-            drift = followed and ended and _gap(d.max_cdf_miss) <= max(EVAL_FORGERY_GAP, gap_tolerance)
-            return False, {**detail, "penalty": not drift}
+            charged = counted >= EVAL_CHARGE_MIN_POSITIONS and exact < EVAL_CHARGE_FLOOR * counted
+            return False, {**detail, "penalty": charged}
     return True, worst
 
 
@@ -207,6 +208,6 @@ def parse_draw(raw: Mapping[str, Any]) -> str | None:
     return value
 
 
-__all__ = ["EVAL_DRAW", "EVAL_DRAW_DOMAIN", "EVAL_FORGERY_GAP", "EVAL_GAP_TOLERANCE", "EVAL_TERMINAL_GAP", "REASON_BAD_CURSOR", "REASON_DRAW_MISMATCH", "REASON_DRAW_SLOT_TAKEN", "allowed_misses", "attempt_digests", "diagnostics", "draw_context",
+__all__ = ["EVAL_CHARGE_FLOOR", "EVAL_CHARGE_MIN_POSITIONS", "EVAL_DRAW", "EVAL_DRAW_DOMAIN", "EVAL_GAP_TOLERANCE", "EVAL_TERMINAL_GAP", "REASON_BAD_CURSOR", "REASON_DRAW_MISMATCH", "REASON_DRAW_SLOT_TAKEN", "allowed_misses", "attempt_digests", "diagnostics", "draw_context",
            "draw_randomness", "has_draw", "job_warp", "judge", "match_rate", "parse_draw", "rollout_index", "slot_count",
            "slot_key", "uniforms"]
