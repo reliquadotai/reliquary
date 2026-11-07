@@ -859,17 +859,23 @@ class CorpusAuditor:
             return
         from reliquary.validator.corpus_service import draw_failure_slot, record_prompt_failure
 
-        try:
-            record = await self._records.read_submission(self._job_id, submission_id)
-            if record is None:
-                return
-            outcome = await record_prompt_failure(self._slot_store, self._draw_job, int(record["prompt_index"]),
-                                                  submission_id, **draw_failure_slot(record))
-            if outcome is False:
-                logger.warning("corpus job %s: prompt %s used every attempt", self._job_id, record["prompt_index"])
-        except Exception:
-            logger.exception("corpus job %s: failure of %s not recorded in the ledger", self._job_id,
-                             submission_id[:12])
+        # One ledger CAS at a time (verdicts themselves write in parallel): failures never race each other.
+        if getattr(self, "_reopen_lock", None) is None:
+            self._reopen_lock = asyncio.Lock()
+        async with self._reopen_lock:
+            try:
+                record = await self._records.read_submission(self._job_id, submission_id)
+                if record is None:
+                    return
+                outcome = await record_prompt_failure(self._slot_store, self._draw_job,
+                                                      int(record["prompt_index"]), submission_id,
+                                                      **draw_failure_slot(record))
+                if outcome is False:
+                    logger.warning("corpus job %s: prompt %s used every attempt", self._job_id,
+                                   record["prompt_index"])
+            except Exception:
+                logger.exception("corpus job %s: failure of %s not recorded in the ledger", self._job_id,
+                                 submission_id[:12])
 
     async def _reconcile_quietly(self) -> None:
         try:
