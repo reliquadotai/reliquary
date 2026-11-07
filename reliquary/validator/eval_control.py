@@ -450,6 +450,13 @@ class PairedAuditDispatcher:
                 and (document.get("model_id"), document.get("model_revision")) == model
                 and _placement(document) is not None]
 
+    def audit_ready(self, model: ModelKey, protocol: str | None = None) -> bool:
+        """Whether a live executor of ``model`` already claims audit leases (in ``protocol`` when
+        given): an executor claims only once its model is loaded."""
+        return any(d["executor_id"] in self._protocols
+                   and (protocol is None or protocol in self._protocols[d["executor_id"]])
+                   for d in self.live_executors(model))
+
     def status(self) -> dict:
         """Per model, what the fleet must know: ``executors_needed`` more
         executors (on providers and hosts distinct from the live ones) to
@@ -1359,6 +1366,10 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         if job.episode is not None:
             # Only now: a job still being wired is never visible to the session issuer.
             sandbox.publish(w)
+        # Miners wait for the audit: what they would send before an executor of the model has
+        # loaded it would only wait unaudited, or be lost on an order that never gets one.
+        protocol = AUDIT_PROTOCOL_V3 if has_draw(job) else None
+        routes.hold(str(job.job_id), lambda: dispatcher.audit_ready(key, protocol))
         served[job.job_id] = w
         return w
 

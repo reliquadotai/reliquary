@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from reliquary.eval import prompt_source as ps
+from reliquary.validator.corpus_audit_protocol import AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3
 from reliquary.eval import qualification as qual
 from reliquary.infrastructure import corpus_executor_store as executors
 from reliquary.infrastructure import corpus_job_store as job_store
@@ -181,11 +182,18 @@ def test_one_process_serves_eval_jobs_of_two_models(world, monkeypatch):
 
             app.state.corpus_pay = Board()  # the chain read is the pay board's own test
             assert (await client.get("/corpus/pay")).json() == {"jobs": []}
+            # No executor has loaded either model yet: miners are kept off both orders.
+            assert (await client.get("/corpus/jobs")).json() == {"jobs": []}
+            held = await client.get(f"/corpus/jobs/order-eval-a/next/{hotkey}")
+            assert held.status_code == 409 and held.json()["detail"] == "job_paused"
             headers = {"Authorization": "Bearer token-one"}
-            claim = {"executor_id": "e1", "model_id": "customer/A", "model_revision": "a" * 40}
+            claim = {"executor_id": "e1", "model_id": "customer/A", "model_revision": "a" * 40,
+                     "protocols": [AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3]}
             first = await client.post("/corpus/internal/eval-audit/claim", json=claim,
                                       headers=headers)
             assert first.status_code == 204, first.text
+            # Model A's executor now claims: its order opens, model B's stays held.
+            assert (await client.get("/corpus/jobs")).json() == {"jobs": ["order-eval-a"]}
             assert (await client.post("/corpus/internal/eval-audit/claim", json=claim,
                                       headers={"Authorization": "Bearer nope"})).status_code == 401
             beat = await client.post("/corpus/internal/eval-audit/heartbeat",

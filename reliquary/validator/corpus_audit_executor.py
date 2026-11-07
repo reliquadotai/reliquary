@@ -39,8 +39,19 @@ VOLUME_DIR = "/workspace"
 DISK_MARGIN_BYTES = 4 * 1024**3
 
 
+# A pod not ready within the fleet's ready timeout (1800 s from its rent) is destroyed: the
+# download plus the load onto the GPU must fit in less, the image start included.
+LOAD_BUDGET_SECONDS = 1500.0
+# The download rate is judged only after this long (its first seconds are metadata and setup).
+DOWNLOAD_PROBE_SECONDS = 120.0
+
+
 class DiskTooSmall(RuntimeError):
     """This pod cannot hold the checkpoint: no retry here will fix it."""
+
+
+class SlowDownload(RuntimeError):
+    """This pod downloads the checkpoint too slowly to be ready in time: another host will."""
 
 
 def _cache_dir(volume: str = VOLUME_DIR) -> str | None:
@@ -75,6 +86,40 @@ def _check_disk(model_id: str, revision: str, cache_dir: str | None, *, info=Non
                            f"{free / 1e9:.0f} GB free")
 
 
+_CHECKPOINT_BYTES: dict[tuple[str, str], int] = {}
+
+
+def download_progress(model_id: str, revision: str, *, cache_dir: str | None = None) -> tuple[int, int]:
+    """Bytes of the checkpoint on disk so far, and its full size. Allocated blocks, not file
+    lengths: a download may size its file before it writes it."""
+    import os
+
+    from huggingface_hub import HfApi, constants
+
+    key = (model_id, revision)
+    if key not in _CHECKPOINT_BYTES:
+        info = HfApi().model_info(model_id, revision=revision, files_metadata=True, token=False)
+        _CHECKPOINT_BYTES[key] = sum(int(f.size or 0) for f in (info.siblings or ()))
+    root = os.path.join(cache_dir or _cache_dir() or constants.HF_HUB_CACHE,
+                        "models--" + model_id.replace("/", "--"), "blobs")
+    done = 0
+    for entry in os.scandir(root) if os.path.isdir(root) else ():
+        try:
+            done += entry.stat(follow_symlinks=False).st_blocks * 512
+        except OSError:
+            continue
+    return min(done, _CHECKPOINT_BYTES[key]), _CHECKPOINT_BYTES[key]
+
+
+def too_slow(started: float, first: tuple[float, int], now: float, done: int, total: int, *,
+             probe: float = DOWNLOAD_PROBE_SECONDS, budget: float = LOAD_BUDGET_SECONDS) -> bool:
+    """Whether, at the rate measured since ``first`` (time, bytes), the download ends past the budget."""
+    if now - started < probe or done >= total:
+        return False
+    rate = (done - first[1]) / max(now - first[0], 1e-9)
+    return rate <= 0 or (now - started) + (total - done) / rate > budget
+
+
 def load_public_model(model_id: str, revision: str):
     """The checkpoint from the public HF repo at the pinned revision, with no
     credential at all (``token=False``), on the pod's volume when it has one."""
@@ -102,6 +147,7 @@ class AuditExecutor(LeaseExecutor):
     def __init__(self, *, http, executor_id: str, token: str, model_id: str | None = None,
                  model_revision: str | None = None,
                  load_model: Callable[[str, str], Any] = load_public_model,
+                 progress: Callable[[str, str], tuple[int, int]] | None = None,
                  batch_tokens: int | None = None,
                  heartbeat_seconds: float = HEARTBEAT_SECONDS,
                  idle_seconds: float = IDLE_SECONDS,
@@ -113,6 +159,7 @@ class AuditExecutor(LeaseExecutor):
                          clock=clock)
         self.model_id, self.model_revision = model_id, model_revision
         self._load_model = load_model
+        self._progress = progress
         self._model = None
         if batch_tokens is None:
             from reliquary.validator.corpus_auditor import AUDIT_BATCH_TOKENS
@@ -139,23 +186,43 @@ class AuditExecutor(LeaseExecutor):
                     self.model_revision)
         try:
             self._model = await self._load_heartbeating()
-        except DiskTooSmall as exc:
+        except (DiskTooSmall, SlowDownload) as exc:
             # Exiting would only restart the container into the same full disk, heartbeating each time:
             # go silent instead, so the fleet sees a dead pod and replaces it on another host.
             logger.critical("audit executor %s cannot run on this pod: %s", self._executor_id, exc)
             await asyncio.Event().wait()
 
     async def _load_heartbeating(self):
-        """Load the model while heartbeating, so a slow 27B download is not taken for a dead pod."""
+        """Load the model while heartbeating, so a slow 27B download is not taken for a dead pod;
+        raise ``SlowDownload`` once the download cannot end within the load budget."""
         loading = asyncio.ensure_future(asyncio.to_thread(self._load_model, self.model_id, self.model_revision))
+        started, first = self._clock(), None
         while True:
             done, _ = await asyncio.wait({loading}, timeout=self._heartbeat_every)
             if done:
                 return loading.result()
+            measured = await self._measure()
+            if measured is not None:
+                now = self._clock()
+                first = first or (now, measured[0])
+                if too_slow(started, first, now, *measured):
+                    # The download thread is left running: the pod is about to be destroyed.
+                    raise SlowDownload(f"{self.model_id}@{self.model_revision[:12]}: "
+                                       f"{measured[0] / 1e9:.1f} of {measured[1] / 1e9:.0f} GB "
+                                       f"after {now - started:.0f} s")
             try:
                 await self.heartbeat()
             except Exception as exc:
                 logger.warning("audit executor heartbeat failed while loading: %r", exc)
+
+    async def _measure(self) -> tuple[int, int] | None:
+        if self._progress is None:
+            return None
+        try:
+            return await asyncio.to_thread(self._progress, self.model_id, self.model_revision)
+        except Exception as exc:
+            logger.warning("audit executor cannot measure its download: %r", exc)
+            return None
 
     def _score(self, lease: AuditLease) -> list[dict]:
         from reliquary.protocol.toploc import MIN_CHUNK_TOKENS
@@ -218,7 +285,7 @@ def run_audit_executor(*, control_url: str, executor_id: str, model_id: str | No
                        model_revision: str | None = None, prefix: str = AUDIT_PREFIX) -> None:
     serve_executor(control_url, lambda **client: AuditExecutor(
         executor_id=executor_id, model_id=model_id, model_revision=model_revision,
-        prefix=prefix, **client))
+        progress=download_progress, prefix=prefix, **client))
 
 
-__all__ = ["AuditExecutor", "DiskTooSmall", "TOKEN_ENV", "load_public_model", "run_audit_executor"]
+__all__ = ["AuditExecutor", "DiskTooSmall", "SlowDownload", "TOKEN_ENV", "load_public_model", "run_audit_executor"]
