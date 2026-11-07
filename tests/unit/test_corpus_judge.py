@@ -1067,3 +1067,55 @@ def test_a_backward_audit_whose_verdict_cannot_be_written_ends_its_pass(monkeypa
     asyncio.run(go())
     assert set(records.verdicts) == {hit, held[1]}
     assert len(calls) <= 6
+
+
+def test_verdicts_write_in_parallel_while_slot_reopenings_never_overlap(monkeypatch):
+    """An order's auditor writes its verdicts WRITE_CONCURRENCY at a time (one at a time left the audit
+    card idle ~160 s a pass); only the ledger CAS of a failed one is serialised."""
+    from reliquary.validator import corpus_service
+
+    passes, fails = _ids(True, 40), _ids(False, 8, start=5000)
+
+    class _Counting(_Records):
+        in_flight = peak = 0
+
+        async def write_verdict(self, job_id, sid, verdict):
+            type(self).in_flight += 1
+            type(self).peak = max(type(self).peak, type(self).in_flight)
+            try:
+                await asyncio.sleep(0.01)
+                return await super().write_verdict(job_id, sid, verdict)
+            finally:
+                type(self).in_flight -= 1
+
+    reopening = {"now": 0, "peak": 0, "ids": []}
+
+    async def record_prompt_failure(store, job, prompt_index, submission_id, **_):
+        reopening["now"] += 1
+        reopening["peak"] = max(reopening["peak"], reopening["now"])
+        await asyncio.sleep(0.01)
+        reopening["now"] -= 1
+        reopening["ids"].append(submission_id)
+        return True
+
+    monkeypatch.setattr(corpus_service, "record_prompt_failure", record_prompt_failure)
+    records = _Counting({sid: {**_rec(0), "prompt_index": 0} for sid in [*passes, *fails]})
+    auditor = _judge(records, _States({HK: SAMPLED}), _Clock(T0 + 1))
+    auditor._slot_store, auditor._draw_job = object(), object()
+    items = [(sid, {"submission_id": sid, "passed": True}) for sid in passes]
+    items += [(sid, {"submission_id": sid, "passed": False}) for sid in fails]
+    asyncio.run(auditor._write_all(items))
+    assert set(records.verdicts) == set(passes) | set(fails)
+    assert _Counting.peak > 1
+    assert sorted(reopening["ids"]) == sorted(fails) and reopening["peak"] == 1
+
+
+def test_an_order_auditor_keeps_the_parallel_write_bound():
+    import inspect
+
+    from reliquary.validator import eval_control
+    from reliquary.validator.corpus_auditor import WRITE_CONCURRENCY
+
+    # The order control's auditor class is local to eval_auditor: no override of the bound in it.
+    assert "write_concurrency" not in inspect.getsource(eval_control.eval_auditor)
+    assert WRITE_CONCURRENCY > 1
