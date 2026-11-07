@@ -317,24 +317,35 @@ def test_a_miss_far_from_the_pick_is_an_edit_whatever_the_count():
     assert not ok and detail["max_gap"] > eval_draw.EVAL_GAP_TOLERANCE
 
 
-def test_a_miss_a_little_over_the_tolerance_is_refused_without_penalty():
-    """Kernel drift reaches a gap of 5.3 on honest samples (Gemma 4, 2026-11-05): refused, never charged. Far past
-    it, too many misses, or an end the pick did not make, the refusal counts against the miner."""
+def test_only_a_sample_far_off_the_draw_is_charged():
+    """Honest drift refused at T < 1 (match just under the floor, a single far gap, a cut end) is never charged;
+    another model or draw (under 0.90 of 64+ positions) is."""
     import math
 
     def miss(gap):
         return 1 - math.exp(-gap)
 
     base = dict(n_positions=1000, n_stochastic=500, n_drawn_exact_match=999)
-    ok, detail = eval_draw.judge([_diag(**base, max_cdf_miss=miss(5.3))])
+    for d in (_diag(**base, max_cdf_miss=miss(5.3)), _diag(**base, max_cdf_miss=miss(12.0)),
+              _diag(**base, max_cdf_miss=miss(0.6), last_miss=miss(5.0)),
+              _diag(**{**base, "n_drawn_exact_match": 975}, max_cdf_miss=miss(0.5))):
+        ok, detail = eval_draw.judge([d])
+        assert not ok and detail["penalty"] is False
+    ok, detail = eval_draw.judge([_diag(**{**base, "n_drawn_exact_match": 899}, max_cdf_miss=miss(9.0))])
+    assert not ok and detail["penalty"] is True
+    # Too short to tell a re-roll from drift: refused, not charged.
+    ok, detail = eval_draw.judge([_diag(n_positions=40, n_stochastic=20, n_drawn_exact_match=20,
+                                        max_cdf_miss=miss(9.0))])
     assert not ok and detail["penalty"] is False
-    ok, detail = eval_draw.judge([_diag(**base, max_cdf_miss=miss(eval_draw.EVAL_FORGERY_GAP + 1))])
-    assert not ok and detail["penalty"] is True
-    ok, detail = eval_draw.judge([_diag(**{**base, "n_drawn_exact_match": 900}, max_cdf_miss=miss(5.3))])
-    assert not ok and detail["penalty"] is True
-    ok, detail = eval_draw.judge([_diag(**base, max_cdf_miss=miss(5.3), last_miss=miss(5.0))])
-    assert not ok and detail["penalty"] is True
     assert "penalty" not in eval_draw.judge([_diag(**base, max_cdf_miss=miss(0.6))])[1]
+
+
+def test_a_judge_at_0_97_keeps_the_t_0_6_drift():
+    from reliquary.corpus.job import draw_judge_from
+
+    judge = draw_judge_from({"floor_rate": 0.97})
+    d = _diag(n_positions=346, n_stochastic=116, n_drawn_exact_match=337)  # match 0.974, gaps small
+    assert eval_draw.judge([d], judge)[0] and not eval_draw.judge([d])[0]
 
 
 def test_the_auditor_marks_a_drift_refusal_without_penalty():
@@ -350,7 +361,8 @@ def test_the_auditor_marks_a_drift_refusal_without_penalty():
     results = [{"passed": True, "reason": None}, {"passed": True, "reason": None}]
     auditor._judge_draws(results, [(0, 0), (1, 0)], {0: drift, 1: edit})
     assert results[0]["passed"] is False and results[0]["penalty"] is False
-    assert results[1]["passed"] is False and "penalty" not in results[1]
+    # A single far gap is refused uncharged too (it is spread over every honest hotkey at T 0.7).
+    assert results[1]["passed"] is False and results[1]["penalty"] is False
 
 
 def test_an_end_the_pick_did_not_make_is_refused():
