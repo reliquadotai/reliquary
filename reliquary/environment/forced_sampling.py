@@ -70,6 +70,10 @@ _DIAGNOSTIC_FLOAT_WORKSPACE_BYTES = 256 * 1024 * 1024
 # A warped draw holds ~8 float32 [rows, V] copies per chunk: under the 256 MiB budget that is 33
 # rows at a 248k vocab, thousands of chunks per lease, and the check outweighed the forward 5:1 on an
 # H200 (2026-11-06). Its own budget: 4 GiB = 540 rows, well under a 27B audit's forward peak.
+# A miss whose Gumbel score gap is over this (``n_far_miss``): far from any near-tie. Honest misses stay under
+# it (Qwen3.8-27B at T 1: q99.9 0.64, max 2.9, 2026-10-31); a token written in place of the draw is usually past it.
+FAR_MISS_GAP = 4.0
+_FAR_MISS = -math.expm1(-FAR_MISS_GAP)
 _WARP_WORKSPACE_BYTES = int(os.environ.get("RELIQUARY_DRAW_WARP_WORKSPACE_MIB", "4096")) * 1024 * 1024
 
 
@@ -88,6 +92,7 @@ class SeedConsistencyDiagnostics:
     first_hard_mismatch_offset: int | None = None
     n_drawn_exact_match: int = 0      # exact picks over every position (``n_exact_match``: stochastic ones only)
     last_miss: float = 0.0            # the last position's miss (0 when exact): an end the pick did not make
+    n_far_miss: int = 0               # positions whose gap is over FAR_MISS_GAP (the last one included)
 
 
 def warp(logits: torch.Tensor, t: float, top_k: int, top_p: float) -> torch.Tensor:
@@ -709,6 +714,7 @@ def seed_consistency_diagnostics(
                 (miss > 0.05).sum(),
                 (miss > 0.10).sum(),
                 exact.sum(),
+                (miss > _FAR_MISS).sum(),
             )
         )
         chunk_max = miss.max().double()
@@ -742,6 +748,7 @@ def seed_consistency_diagnostics(
         first_hard_mismatch_offset=first_hard_mismatch_offset,
         n_drawn_exact_match=int(counts[8]),
         last_miss=last_miss,
+        n_far_miss=int(counts[9]),
     )
 
 

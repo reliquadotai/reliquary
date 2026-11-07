@@ -24,6 +24,8 @@ from reliquary.environment.forced_sampling import (
 MAX_EDGE_MARGIN = 0.5
 _SPEC_FIELDS = ("randomness", "prompt_idx", "checkpoint_hash", "rollout_index", "domain", "warp", "edge_margin")
 _DIAG_FIELDS = ("positions", "stochastic", "exact", "max_miss", "last_miss")
+# Sent by an executor that counts its far misses (``n_far_miss``); an older one omits it.
+_FAR_FIELD = "far_misses"
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,12 +108,15 @@ def diagnostics_to_wire(d: SeedConsistencyDiagnostics) -> dict[str, Any]:
     """What the judge reads (``eval_draw.judge``), as plain numbers."""
     return {"positions": int(d.n_positions), "stochastic": int(d.n_stochastic),
             "exact": int(d.n_drawn_exact_match), "max_miss": float(d.max_cdf_miss),
-            "last_miss": float(d.last_miss)}
+            "last_miss": float(d.last_miss), _FAR_FIELD: int(d.n_far_miss)}
 
 
 def diagnostics_from_wire(raw: Mapping) -> SeedConsistencyDiagnostics:
-    if not isinstance(raw, Mapping) or set(raw) != set(_DIAG_FIELDS):
-        raise ValueError(f"draw diagnostics have exactly {list(_DIAG_FIELDS)}")
+    if not isinstance(raw, Mapping) or set(raw) - {_FAR_FIELD} != set(_DIAG_FIELDS):
+        raise ValueError(f"draw diagnostics have exactly {list(_DIAG_FIELDS)} (and {_FAR_FIELD!r})")
+    far = raw.get(_FAR_FIELD, 0)
+    if isinstance(far, bool) or not isinstance(far, int) or not 0 <= far <= raw.get("positions", 0):
+        raise ValueError(f"draw diagnostics {_FAR_FIELD} must be a whole number within its positions")
     counts = [raw[name] for name in ("positions", "stochastic", "exact")]
     if any(isinstance(c, bool) or not isinstance(c, int) or c < 0 for c in counts):
         raise ValueError("draw diagnostics counts must be non-negative whole numbers")
@@ -124,7 +129,7 @@ def diagnostics_from_wire(raw: Mapping) -> SeedConsistencyDiagnostics:
         raise ValueError("draw diagnostics misses must be in [0, 1]")
     return SeedConsistencyDiagnostics(n_positions=positions, n_stochastic=stochastic,
                                       n_drawn_exact_match=exact, max_cdf_miss=float(misses[0]),
-                                      last_miss=float(misses[1]))
+                                      last_miss=float(misses[1]), n_far_miss=far)
 
 
 # Two honest scorers of one row, on different hardware: exact picks within one, the gaps the judge reads (the worst
@@ -141,6 +146,8 @@ def diagnostics_agree(a: Mapping, b: Mapping, *, slack: int = 1, gap_slack: floa
     """Two scorers' diagnostics of one row agree: the same positions, exact picks within ``slack``, and the worst
     and last gaps within ``gap_slack`` (both infinite, or both finite and close)."""
     if a["positions"] != b["positions"] or abs(a["exact"] - b["exact"]) > slack:
+        return False
+    if _FAR_FIELD in a and _FAR_FIELD in b and abs(a[_FAR_FIELD] - b[_FAR_FIELD]) > slack:
         return False
     for name in ("max_miss", "last_miss"):
         ga, gb = _gap(float(a[name])), _gap(float(b[name]))

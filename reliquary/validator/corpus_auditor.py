@@ -130,6 +130,31 @@ _WORST_ZERO = {"worst_exp": 0, "worst_mant_mean": 0.0, "worst_mant_median": 0.0}
 _BANNED_VOID = {"passed": False, "audited": False, "reason": "banned"}
 
 
+# A hotkey refused at least this often, this unlikely at the rate of the job's other hotkeys, is charged.
+FREQUENT_REFUSALS_MIN = 3
+FREQUENT_REFUSALS_P = 1e-4
+
+
+def frequent_refusals(refused: int, audited: int, others_refused: int, others_audited: int) -> bool:
+    """Whether ``refused`` of ``audited`` is far above the others' rate: P(X >= refused) under Binomial(audited,
+    p) below FREQUENT_REFUSALS_P, p the others' rate with one refusal and one pass added (no evidence yet: 1/2, so
+    nothing is charged before the others have been audited)."""
+    if refused < FREQUENT_REFUSALS_MIN or audited <= 0:
+        return False
+    p = (others_refused + 1) / (others_audited + 2)
+    if p >= 1.0:
+        return False
+    log_p, log_q = math.log(p), math.log1p(-p)
+    tail = 0.0
+    for x in range(refused, audited + 1):
+        term = math.exp(math.lgamma(audited + 1) - math.lgamma(x + 1) - math.lgamma(audited - x + 1)
+                        + x * log_p + (audited - x) * log_q)
+        tail += term
+        if term < 1e-300:
+            break
+    return tail < FREQUENT_REFUSALS_P
+
+
 class CorpusAuditorHalted(Exception):
     """Too many audits in a row failed on our side: this validator cannot audit."""
 
@@ -208,6 +233,10 @@ class CorpusAuditor:
         self._next_due: dict[str, float] = {}
         # Write errors of the current judge_many, raised after its backward audit.
         self._deferred: list[BaseException] = []
+        # Forced-draw audits per hotkey [audited, refused], the job's totals, and the ids counted (`_count_refusal`).
+        self._draw_counts: dict[str, list[int]] = {}
+        self._draw_totals = [0, 0]
+        self._draw_counted: set[str] = set()
         # Pending ids whose draw is known and undrawn: as a sibling they can
         # neither be audited nor be undecidable, so a pass need not decide them.
         self._undrawn: set[str] = set()
@@ -819,6 +848,28 @@ class CorpusAuditor:
                     del solo_exc
         return judged
 
+    def _count_refusal(self, submission_id: str, hotkey: str, outcome: dict) -> dict:
+        """Count a forced-draw audit for its hotkey; an uncharged refusal is charged when its hotkey is refused far
+        more often than the job's other hotkeys (``frequent_refusals``): one edit at a time, repeated. Counted once
+        per submission, in this process (a restart starts the counts again)."""
+        if self._draw_job is None or submission_id in self._draw_counted:
+            return outcome
+        refused = not outcome["passed"] and outcome.get("reason") == "draw_mismatch"
+        if not (outcome["passed"] or refused):
+            return outcome
+        self._draw_counted.add(submission_id)
+        counts = self._draw_counts.setdefault(hotkey, [0, 0])
+        counts[0] += 1
+        counts[1] += int(refused)
+        self._draw_totals[0] += 1
+        self._draw_totals[1] += int(refused)
+        if refused and outcome.get("penalty") is False and frequent_refusals(
+                counts[1], counts[0], self._draw_totals[1] - counts[1], self._draw_totals[0] - counts[0]):
+            logger.warning("corpus job %s: %s refused %d of %d audits, far above the job's other hotkeys: charged",
+                           self._job_id, hotkey[:12], counts[1], counts[0])
+            return {**outcome, "penalty": True, "charged_for": "frequent_refusals"}
+        return outcome
+
     def _verdict(self, submission_id: str, hotkey: str, token_count: int, outcome: dict,
                  draw: dict | None) -> dict:
         verdict = {
@@ -1022,6 +1073,8 @@ class CorpusAuditor:
 
         results: list[dict | None] = [None] * len(ids)
         judged = [k for k, outcome in enumerate(outcomes) if isinstance(outcome, dict)]
+        for k in judged:
+            outcomes[k] = self._count_refusal(ids[k], records[k]["hotkey"], outcomes[k])
         now = self._clock()
         failures: dict[str, list[str]] = {}
         for k in judged:

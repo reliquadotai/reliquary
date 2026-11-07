@@ -463,3 +463,18 @@ def test_a_top_k_slice_takes_bigger_chunks_from_the_warp_workspace(monkeypatch):
     warp = Warp(t=0.7, top_k=12, top_p=0.9)
     _diag(logits, _picks(logits, us, warp), us, warp)
     assert seen == [4, 4, 1]
+
+
+@pytest.mark.parametrize("warp", [Warp(t=1.0, top_p=0.95), Warp(t=1.0, top_k=20, top_p=0.95), Warp()])
+def test_far_misses_are_counted_on_every_path(warp):
+    """Each token written far from the draw is one far miss (the edit pattern); honest picks are none."""
+    torch.manual_seed(3)
+    logits = torch.randn(40, 300) * 4
+    us = _us(40)
+    tokens = _picks(logits, us, warp)
+    assert _diag(logits, tokens, us, warp).n_far_miss == 0
+    edited = list(tokens)
+    for row in (5, 17, 29):  # the least likely token: far past any near-tie
+        edited[row] = int(torch.argmin(logits[row]))
+    d = _diag(logits, edited, us, warp)
+    assert d.n_far_miss == 3 and fs._FAR_MISS < d.max_cdf_miss
