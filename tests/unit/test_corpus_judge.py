@@ -1007,3 +1007,63 @@ def test_writes_of_one_auditor_share_one_bound():
     asyncio.run(auditor.judge_many([*hits, *xs]))
     assert set(hits) | set(xs) <= set(records.verdicts)
     assert _Counting.peak <= 2
+
+
+class _StrictRecords(_Records):
+    """The bucket store's encoding: non-finite JSON is refused."""
+
+    async def write_verdict(self, job_id, sid, verdict):
+        import json
+
+        json.dumps(verdict, allow_nan=False)
+        return await super().write_verdict(job_id, sid, verdict)
+
+
+def test_a_failed_draw_whose_gap_is_inf_is_still_written(monkeypatch):
+    """A token outside the warp's support makes the draw gap inf: its verdict must still be written,
+    or the record stays pending and is audited again forever."""
+    sid = _ids(False, 1)[0]
+    records = _StrictRecords({sid: _rec(0)})
+    states = _States({HK: SAMPLED})
+    auditor = _judge(records, states, _Clock(T0 + 1), params=AuditParams())
+    refusal = {"passed": False, "reason": "draw_mismatch", "forced_draw": {"max_gap": float("inf")}}
+    monkeypatch.setattr(auditor, "_judge_many", lambda batch: [dict(refusal) for _ in batch])
+    asyncio.run(auditor.judge_many([sid]))
+    assert records.verdicts[sid]["passed"] is False
+    assert records.verdicts[sid]["forced_draw"]["max_gap"] is None
+
+
+def test_a_backward_audit_whose_verdict_cannot_be_written_ends_its_pass(monkeypatch):
+    """A caught miner's held record whose verdict write keeps failing is tried once per pass: the pass
+    ends (raising the write's error) instead of auditing it again forever, so the rest of the queue runs."""
+    hit = _ids(True, 1)[0]
+    held = _ids(False, 2)
+    records = _Records({sid: _rec(1) for sid in [hit, *held]})
+    stuck = held[0]
+    real_write = records.write_verdict
+
+    async def write_verdict(job_id, sid, verdict):
+        if sid == stuck:
+            raise ValueError("Out of range float values are not JSON compliant: inf")
+        return await real_write(job_id, sid, verdict)
+
+    records.write_verdict = write_verdict
+    states = _States({HK: SAMPLED})
+    auditor = _judge(records, states, _Clock(T0 + 10), beacon=_Beacon())
+    asyncio.run(auditor.judge_many(held))
+    calls = []
+    real = auditor._judge_many
+
+    def counted(batch):
+        calls.append(len(batch))
+        return real(batch)
+
+    monkeypatch.setattr(auditor, "_judge_many", counted)
+
+    async def go():
+        with pytest.raises(ValueError, match="not JSON compliant"):
+            await asyncio.wait_for(auditor.judge_many([hit]), timeout=30)
+
+    asyncio.run(go())
+    assert set(records.verdicts) == {hit, held[1]}
+    assert len(calls) <= 6

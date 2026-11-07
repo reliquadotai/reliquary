@@ -837,7 +837,9 @@ class CorpusAuditor:
         verdict.update(self._lease_terms.get(submission_id, {}))
         if draw is not None:
             verdict["draw"] = draw
-        return verdict
+        # A diagnostic can be inf (e.g. a token outside the warp's support): JSON
+        # records refuse it, and an unwritable verdict blocks its period forever.
+        return _finite(verdict)
 
     async def _write(self, submission_id: str, verdict: dict) -> tuple[dict, bool]:
         """Create-only: the verdict that stands, and whether this call wrote it."""
@@ -1509,6 +1511,7 @@ class CorpusAuditor:
         self._raced = set()
         self._pass_rounds = [0, 0]
         try:
+            tried: set[str] = set()
             failed = await self._judge_once(list(submission_ids))
             # At q = 1 every held record is already being audited on arrival.
             while failed and self._params.q < 1.0:
@@ -1521,7 +1524,13 @@ class CorpusAuditor:
                 pending = [sid for sid in dict.fromkeys(
                     (*self._meta, *self._unreadable, *self._queued)) if sid not in self._judged]
                 await self._read_all([sid for sid in pending if sid not in self._meta])
-                held = [sid for sid in pending if sid in self._meta and self._meta[sid][0] in failed]
+                # Each held record once per pass: one whose verdict did not land (a write error) waits for
+                # the next pass, instead of being audited again here forever while the queue waits.
+                held = [sid for sid in pending if sid in self._meta and self._meta[sid][0] in failed
+                        and sid not in tried]
+                tried.update(held)
+                if not held:
+                    break
                 failed = await self._judge_once(held)
             # A write that failed leaves its record pending; raised only now, so
             # it never kept a caught hotkey's held records from their audit.
@@ -1721,3 +1730,14 @@ class CorpusAuditor:
             for task in (rescan, *others):
                 task.cancel()
             await asyncio.gather(rescan, *others, return_exceptions=True)
+
+
+def _finite(value):
+    """``value`` with every non-finite float replaced by None."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite(v) for v in value]
+    return value
