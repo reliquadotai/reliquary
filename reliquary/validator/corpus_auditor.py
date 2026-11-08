@@ -257,12 +257,14 @@ class CorpusAuditor:
         # Pending ids whose draw is known and undrawn: as a sibling they can
         # neither be audited nor be undecidable, so a pass need not decide them.
         self._undrawn: set[str] = set()
-        # `stake_at_receipt`: per hotkey, sorted (receipt, tokens, held) of what a later failure could forfeit
+        # `stake_at_receipt`: per hotkey, sorted (receipt, pay, held, id) of what a later failure could forfeit
         # (held: left unaudited and undrawn; else an audited pass); each record's stake as first counted; the
         # records already in a hotkey's list.
-        self._forfeitable_at: dict[str, list[tuple[float, int, bool]]] = {}
+        self._forfeitable_at: dict[str, list[tuple[float, float, bool, str]]] = {}
         self._stake: dict[str, float] = {}
         self._staked: set[str] = set()
+        # Its shortest completion's tokens, from a full read (a metadata read leaves it unknown).
+        self._shortest: dict[str, int] = {}
         # The fewest arrivals in a hold that keep a hotkey off the slow-hotkey rule.
         self._enough = self._fewest_not_slow(params.q)
         self._rescan_every = rescan_every_seconds
@@ -492,6 +494,7 @@ class CorpusAuditor:
         self._unreadable.discard(submission_id)
         self._undrawn.discard(submission_id)
         self._stake.pop(submission_id, None)
+        self._shortest.pop(submission_id, None)
         if submission_id in self._meta:
             self._unjudged.get(self._meta[submission_id][0], set()).discard(submission_id)
 
@@ -701,6 +704,12 @@ class CorpusAuditor:
 
     def _remember(self, submission_id: str, meta) -> None:
         """A record's (hotkey, arrival, size), from the record or its metadata."""
+        completions = meta.get("completions")
+        if self.stake_at_receipt and isinstance(completions, list) and completions:
+            try:
+                self._shortest[submission_id] = min(len(c["tokens"]) for c in completions)
+            except (KeyError, TypeError):
+                pass
         if submission_id in self._meta:
             return
         received = meta.get("received_at")
@@ -755,28 +764,41 @@ class CorpusAuditor:
             pairs = await gather_owned(one(sid) for sid in dict.fromkeys(submission_ids))
         return {sid: record for sid, record in pairs if record is not None}
 
+    def _pay(self, submission_id: str) -> float:
+        """What a record's work pays, in output-token units: its output tokens plus its prompt tokens at the
+        job's input price over its output price (`corpus_periods.work_value`)."""
+        tokens = self._meta[submission_id][2]
+        prompt = self._lease_terms.get(submission_id, {}).get("prompt_token_count", 0)
+        return float(tokens) + self.stake_input_weight * float(prompt)
+
     def _stake_of(self, submission_id: str, now: float) -> float:
-        """`stake_at_receipt`'s count for decision(), once per record: 1 + the tokens of its hotkey's records
-        received in the hold before it that a confirmed failure of it is sure to forfeit, over its own tokens:
+        """`stake_at_receipt`'s count for decision(), once per record: 1 + the pay of its hotkey's records
+        received in the hold before it, in its own settlement period, that a charged failure of it is sure to
+        forfeit, over its own pay:
 
         - left unaudited and undrawn: it lies inside each one's hold, so none is paid before it is decided and,
           drawn or slow, audited (the sibling guards);
-        - an audited pass received in its settlement period: the period settles only once nothing received
-          in it is undecided, so not before its verdict, which a failure writes after the forfeit.
+        - an audited pass: the period settles only once nothing received in it is undecided, so not before
+          its verdict, which a failure writes after the forfeit.
 
-        Cheating on it then costs at least q · (that count) of its pay: at least its pay from 1/q on."""
+        One period: its records are paid at one rate (a capped period scales them all alike). Cheating on it
+        then costs at least q · (that count) of its pay: at least its pay from 1/q on."""
         stake = self._stake.get(submission_id)
         if stake is None:
-            hotkey, received_at, tokens = self._meta[submission_id]
+            hotkey, received_at, _ = self._meta[submission_id]
             entries = self._forfeitable_at.get(hotkey, [])
             # Older than any record still pending could need: dropped (a backlog past it only audits more).
-            del entries[:bisect.bisect_left(entries, (now - self._params.hold_seconds - STAKE_KEEP_SECONDS,))]
+            cut = bisect.bisect_left(entries, (now - self._params.hold_seconds - STAKE_KEEP_SECONDS,))
+            for entry in entries[:cut]:
+                self._staked.discard(entry[3])
+            del entries[:cut]
             low = bisect.bisect_left(entries, (received_at - self._params.hold_seconds,))
             high = bisect.bisect_left(entries, (received_at,))
             period = _settlement_period(received_at)
-            held = sum(t for at, t, unaudited in entries[low:high]
-                       if unaudited or _settlement_period(at) == period)
-            stake = math.inf if tokens <= 0 else 1.0 + held / tokens
+            held = sum(pay for at, pay, _, _ in entries[low:high] if _settlement_period(at) == period)
+            own = self._pay(submission_id)
+            # Nothing it earns is no reason to pay it unaudited: an empty record is audited.
+            stake = 1.0 + held / own if own > 0 else 0.0
             self._stake[submission_id] = stake
         return stake
 
@@ -785,8 +807,20 @@ class CorpusAuditor:
         if submission_id in self._staked or submission_id not in self._meta:
             return
         self._staked.add(submission_id)
-        hotkey, received_at, tokens = self._meta[submission_id]
-        bisect.insort(self._forfeitable_at.setdefault(hotkey, []), (received_at, int(tokens), held))
+        hotkey, received_at, _ = self._meta[submission_id]
+        bisect.insort(self._forfeitable_at.setdefault(hotkey, []),
+                      (received_at, self._pay(submission_id), held, submission_id))
+
+    def _stake_applies(self, submission_id: str) -> bool:
+        """Whether a failure of this record would be charged, and so forfeit its stake: a forced-draw refusal
+        is charged per completion, only from EVAL_CHARGE_MIN_POSITIONS positions (or an edit), so a record with
+        a shorter completion, or not read in full, is judged on its hotkey's arrivals up to now (corpus rule)."""
+        from reliquary.corpus.eval_draw import EVAL_CHARGE_MIN_POSITIONS
+
+        if self._draw_job is None:
+            return True
+        shortest = self._shortest.get(submission_id)
+        return shortest is not None and shortest >= EVAL_CHARGE_MIN_POSITIONS
 
     def _recent(self, hotkey: str, now: float) -> int:
         arrivals = self._arrivals.get(hotkey, [])
@@ -1031,6 +1065,8 @@ class CorpusAuditor:
     # stopped submitting does not have its held records audited at their hold's end. False: the hotkey's
     # arrivals inside the hold up to now (`_recent`), counted again at every decision.
     stake_at_receipt = False
+    # Its stake's prompt tokens: the job's input price over its output price (0: prompts unpaid).
+    stake_input_weight = 0.0
 
     async def _write_all(self, items: list[tuple[str, dict]]) -> list:
         """_write for each (id, verdict), `write_concurrency` at a time: per item
@@ -1436,7 +1472,8 @@ class CorpusAuditor:
             if not self._seeded:
                 await self._seed(await self.pending_ids())
             # The stake needs the draw first (a drawn record is audited whatever it holds).
-            recent = math.inf if self.stake_at_receipt else self._recent(hotkey, now)
+            staked = self.stake_at_receipt and self._stake_applies(submission_id)
+            recent = math.inf if staked else self._recent(hotkey, now)
             if (recent >= 1.0 / self._params.q and self._beacon is not None
                     and self._round_at is not None):
                 # round_at(t) is the first round published strictly after t;
@@ -1465,7 +1502,7 @@ class CorpusAuditor:
                                 "drawn": drawn(randomness, submission_id, self._params.q)}
                         if not draw["drawn"] and submission_id not in self._judged:
                             self._undrawn.add(submission_id)
-            if self.stake_at_receipt:
+            if staked:
                 recent = self._stake_of(submission_id, now) if draw is not None else 0
         choice = decision(state, params=self._params, now=now, received_at=received_at,
                           recent_submissions=recent, randomness_hex=randomness,

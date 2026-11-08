@@ -76,7 +76,7 @@ def test_a_stake_of_fewer_tokens_than_the_record_does_not_cover_it():
     assert store.verdicts[x]["audited"] is True
 
 
-def test_an_audited_pass_of_an_earlier_period_does_not_count_a_held_record_does():
+def test_only_the_records_own_settlement_period_counts():
     boundary = PERIOD_EPOCH + math.ceil((T0 + 2 * HOLD - PERIOD_EPOCH) / PERIOD_SECONDS) * PERIOD_SECONDS
     audited, held = _ids(False, 2)
     x = _ids(False, 1, start=500)[0]
@@ -88,12 +88,44 @@ def test_an_audited_pass_of_an_earlier_period_does_not_count_a_held_record_does(
     _judge_at(auditor, clock, boundary - 80, [held])
     assert held not in store.verdicts  # held: the audited pass of its own period covers it
     _judge_at(auditor, clock, boundary + 70, [x])
-    # Only the held record counts for X: the audited pass settles with its own period, maybe before X.
-    entries = auditor._forfeitable_at[HK]
-    assert [(t - boundary, unaudited) for t, _, unaudited in entries] == [(-200, False), (-100, True),
-                                                                          (50, True)]
-    assert auditor._stake_of(x, boundary + 70) == 2.0
-    assert x not in store.verdicts  # waits for its hold, unaudited
+    # The earlier period may settle, at another rate per token, before X fails: none of it counts.
+    assert auditor._stake_of(x, boundary + 70) == 1.0
+    assert store.verdicts[x]["audited"] is True
+
+
+def test_a_prompt_counts_at_its_price():
+    y = _ids(False, 1)[0]
+    x = _ids(False, 1, start=500)[0]
+    # Same output; X carries a long prompt the order pays for.
+    store = _Store({y: {**_rec(0, received_at=T0), "prompt_token_count": 10},
+                    x: {**_rec(0, received_at=T0 + 30), "prompt_token_count": 100_000}})
+    clock = _Clock(T0)
+    auditor = _auditor(store, clock)
+    auditor.stake_input_weight = 0.5
+    _judge_at(auditor, clock, T0 + 20, [y])
+    _judge_at(auditor, clock, T0 + 40, [x])
+    assert auditor._stake_of(x, T0 + 40) < 1.0 / Q
+    assert store.verdicts[x]["audited"] is True
+
+
+def test_a_short_draw_sample_and_an_empty_record_are_not_paid_on_a_stake():
+    y = _ids(False, 1)[0]
+    store = _Store({y: _rec(0, received_at=T0)})
+    clock = _Clock(T0 + 20)
+    auditor = _auditor(store, clock)
+    asyncio.run(auditor.judge_many([y]))
+    # A forced-draw refusal is charged per completion, from EVAL_CHARGE_MIN_POSITIONS positions: a record
+    # with a shorter completion (whatever its total), or whose completions were never read, forfeits nothing.
+    auditor._draw_job = object()
+    long_ = {"tokens": [1] * 64, "text": ""}
+    auditor._remember("a" * 64, {**_rec(0), "completions": [long_, long_]})
+    auditor._remember("b" * 64, {**_rec(0), "completions": [{"tokens": [1] * 63, "text": ""}, long_]})
+    auditor._remember("c" * 64, {"hotkey": HK, "received_at": T0, "token_count": 500})
+    assert [auditor._stake_applies(sid * 64) for sid in "abc"] == [True, False, False]
+    hotkey, received_at, _ = auditor._meta[y]
+    auditor._meta[y] = (hotkey, received_at, 0)
+    auditor._stake.clear()
+    assert auditor._stake_of(y, T0 + 20) == 0.0
 
 
 def test_the_stake_counted_is_forfeited_when_a_drawn_record_fails():
