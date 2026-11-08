@@ -109,6 +109,14 @@ def test_one_process_serves_eval_jobs_of_two_models(world, monkeypatch):
 
     monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", idle)
     monkeypatch.setattr(corpus_period_settlement.CorpusPeriodSettler, "settle_once", lambda self: idle(self))
+    from reliquary.validator import corpus_validator
+
+    warmed = []
+
+    async def warm(executor):
+        warmed.append(executor)
+
+    monkeypatch.setattr(corpus_validator, "warm_drand_chain", warm)
     loaded = []
 
     def tokenizer_for(repo, revision):
@@ -152,6 +160,8 @@ def test_one_process_serves_eval_jobs_of_two_models(world, monkeypatch):
         await job_set.refresh()
         assert sorted(job_set.served) == ["order-eval-a", "order-eval-b"]
         assert sorted(loaded) == ["customer/A", "customer/B"]
+        # The drand chain is resolved as each job is wired, before any pass draws.
+        assert warmed == [None, None]
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://eval") as client:
             job = (await client.get("/corpus/jobs/order-eval-b/job")).json()

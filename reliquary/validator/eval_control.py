@@ -1316,6 +1316,11 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         await recover_pending_records(store, records, job)
         params, miner_states, is_banned, beacon, round_at = build_corpus_audit_wiring(
             entry=entry, job=job, records=records, trust_id=ORDER_TRUST_ID)
+        # The drand chain once, off the loop, before the job's first pass: left to that pass,
+        # a fetch still in flight has it audit every record it decides (sampling off).
+        from reliquary.validator.corpus_validator import warm_drand_chain
+
+        await warm_drand_chain(None)
         w = SimpleNamespace(entry=entry, cap=cap, job=job, tokenizer=tokenizer,
                             vocab_size=vocab_size, proof=proof, renderer=renderer,
                             prompt_job_for=prompt_job_for, seen_index=seen_index,
@@ -1375,7 +1380,6 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     async def wire_episode(w) -> None:
         """A signed episode order, as the corpus validator wires one: its signed intake and
         session view (published once the whole job is wired), its grader."""
-        from reliquary.validator.corpus_validator import warm_drand_chain
         from reliquary.validator.sandbox_wiring import wire_signed_grader, wire_signed_job
 
         job = w.job
@@ -1385,8 +1389,6 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             tokenizer=w.tokenizer, vocab_size=w.vocab_size, chunk_tokens=w.proof.chunk_tokens,
             publish=False, **(signed_wiring or {})))
         wire_signed_grader(w, judge_records=records, parse_executor=grade_parse_threads)
-        # The drand chain once, off the loop: the auditor and grader would resolve it on it.
-        await warm_drand_chain(None)
 
     async def settle_forever(w, every: float = 60.0) -> None:
         while True:
