@@ -396,15 +396,20 @@ def test_a_generation_order_samples_its_audits_on_the_gpu_less_control():
     )
 
     drawn, undrawn = _ids(True, 2), _ids(False, 3)
-    records = _Records({sid: _rec(0) for sid in drawn + undrawn})
+    # The hotkey's pass just before: what a failure of the later records would forfeit (their stake).
+    prior = _ids(False, 1, start=900)[0]
+    records = _Records({prior: _rec(0, received_at=T0 - 30), **{sid: _rec(0) for sid in drawn + undrawn}})
     states = _States({HK: SAMPLED})
-    clock = _Clock(T0 + 10)
+    clock = _Clock(T0 - 10)
     remote = _PairRemote()
     auditor = _gen_auditor(records, states, clock, remote)
     assert auditor.reopen_slots is False
+    asyncio.run(auditor.judge_many([prior]))
+    assert records.verdicts[prior]["audited"] is True  # nothing at stake before it: audited
+    clock.now = T0 + 10
     asyncio.run(auditor.judge_many(drawn + undrawn))
-    # Drawn: audited at once, by the pair. Undrawn: wait out the hold.
-    assert set(records.verdicts) == set(drawn)
+    # Drawn: audited at once, by the pair. Undrawn, with the prior pass at stake: wait out the hold.
+    assert set(records.verdicts) == {prior, *drawn}
     for sid in drawn:
         v = records.verdicts[sid]
         assert (v["passed"], v["audited"], v["scored_by"]) == (True, True, ["e1", "e2"])
@@ -423,17 +428,23 @@ def test_a_confirmed_failure_makes_the_hotkey_suspect_and_audits_its_held_record
     from tests.unit.test_corpus_judge import HK, SAMPLED, T0, _Clock, _ids, _rec, _States
 
     hit, held = _ids(True, 1)[0], _ids(False, 3)
-    records = _Records({sid: _rec(1) for sid in [hit, *held]})
+    # An honest pass first: the held records' stake.
+    prior = _ids(False, 1, start=900)[0]
+    records = _Records({prior: _rec(1, received_at=T0 - 30), **{sid: _rec(1) for sid in [hit, *held]}})
     states = _States({HK: SAMPLED})
     remote = _PairRemote()
+    clock = _Clock(T0 - 10)
+    auditor = _gen_auditor(records, states, clock, remote)
+    asyncio.run(auditor.judge_many([prior]))
+    assert records.verdicts[prior]["passed"] is True
     remote.fail_all = True
-    auditor = _gen_auditor(records, states, _Clock(T0 + 10), remote)
+    clock.now = T0 + 10
     asyncio.run(auditor.judge_many(held))
-    assert records.verdicts == {}
+    assert set(records.verdicts) == {prior}
     asyncio.run(auditor.judge_many([hit]))
-    assert set(records.verdicts) == {hit, *held}
-    assert all(v["passed"] is False and v["audited"] is True
-               and v["scored_by"] == ["e1", "e2"] for v in records.verdicts.values())
+    assert set(records.verdicts) == {prior, hit, *held}
+    assert all(v["passed"] is False and v["audited"] is True and v["scored_by"] == ["e1", "e2"]
+               for sid, v in records.verdicts.items() if sid != prior)
     state = states.states[HK]
     assert len(state.confirmed_failures) == 4 and state.suspect_until == T0 + 10 + 86400
 

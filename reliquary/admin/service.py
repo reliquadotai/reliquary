@@ -46,9 +46,11 @@ DEFAULT_EVAL_CAP = 0.02
 # A generation order on any model: the cap share it defaults to, and its audit:
 # every submission unless the order asks for a sampled share (`audit_q`), then
 # a hotkey's first 20 audited passes (counted across orders) before sampling starts.
+# Held 30 min before an unaudited pass is paid: orders now generate in under 20 min,
+# and the hold only has to outlast a drawn record's audit (minutes), not a corpus period.
 DEFAULT_GEN_CAP = 0.02
 GEN_AUDIT_PARAMS = {"audit_q": 1.0, "audit_probation_submissions": 20,
-                    "audit_hold_seconds": 4320, "audit_suspect_seconds": 86400,
+                    "audit_hold_seconds": 1800, "audit_suspect_seconds": 86400,
                     "audit_ban_after_failures": 3, "audit_ban_window_seconds": 604800,
                     "audit_ban_seconds": 604800}
 # Renderer of a catalog source's rows: the model's own chat template.

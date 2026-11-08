@@ -646,6 +646,9 @@ def eval_auditor(**kwargs):
     from reliquary.validator.corpus_auditor import CorpusAuditor
 
     class EvalAuditor(CorpusAuditor):
+        # Orders forfeit a caught cheat's unpaid work (#468): the slow-hotkey rule weighs that stake.
+        stake_at_receipt = True
+
         async def _forward(self, records, *, local: bool = False):
             results, items = await asyncio.to_thread(self._prepare, records)
             if self._draw_job is None:
@@ -1359,6 +1362,13 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                                    job.job_id, job.judge if has_draw(job) else None))
 
         w.settler.on_window = w.miners.window
+        # The stake weighs a record's prompt as the settler pays it (`corpus_periods.work_value`).
+        output_price, input_price = cp.max_price(entry.params), cp.max_input_price(entry.params)
+        if input_price and output_price:
+            w.auditor.stake_input_weight = float(input_price) / float(output_price)
+        elif input_price:
+            # Prompts paid at a price no output price compares with: the corpus rule, never a guessed stake.
+            w.auditor.stake_at_receipt = False
 
         def on_accepted(submission_id: str) -> None:
             w.stats.accepted()
