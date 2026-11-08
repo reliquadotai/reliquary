@@ -16,6 +16,7 @@ import re
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from reliquary.infrastructure.corpus_job_store import _ClientPool
 from reliquary.infrastructure.storage import get_s3_client
 
 EXECUTOR_SCHEMA = "reliquary/corpus-executor/v1"
@@ -59,6 +60,17 @@ def _bucket(client_kwargs: dict[str, Any]) -> str:
     return client_kwargs.pop("bucket_name", None) or os.getenv("R2_BUCKET_ID", "reliquary")
 
 
+# One long-lived client per loop (see `_ClientPool`): the control reads every
+# registration each refresh, and a client built per read held its loop at a core.
+# Looked up at build time, so a patched `get_s3_client` applies.
+_POOL = _ClientPool(lambda: get_s3_client())
+
+
+def _client(client_kwargs: dict[str, Any]):
+    """The shared client, or one of its own for explicit credentials."""
+    return _POOL.client() if not client_kwargs else get_s3_client(**client_kwargs)
+
+
 def _code(exc) -> str:
     return exc.response.get("Error", {}).get("Code", "")
 
@@ -67,7 +79,7 @@ async def _get(key: str, **client_kwargs) -> tuple[dict | None, str | None]:
     from botocore.exceptions import ClientError
 
     bucket = _bucket(client_kwargs)
-    async with get_s3_client(**client_kwargs) as client:
+    async with _client(client_kwargs) as client:
         try:
             response = await client.get_object(Bucket=bucket, Key=key)
         except ClientError as exc:
@@ -84,7 +96,7 @@ async def _put(key: str, document: Mapping, etag: str | None, **client_kwargs) -
     bucket = _bucket(client_kwargs)
     condition = {"IfNoneMatch": "*"} if etag is None else {"IfMatch": etag}
     body = json.dumps(dict(document), sort_keys=True).encode()
-    async with get_s3_client(**client_kwargs) as client:
+    async with _client(client_kwargs) as client:
         try:
             await client.put_object(Bucket=bucket, Key=key, Body=body, **condition)
         except ClientError as exc:
@@ -207,8 +219,7 @@ async def record_heartbeat(executor_id: str, *, at: float, detail: Mapping | Non
 async def list_executors(**client_kwargs) -> list[dict]:
     bucket = _bucket(dict(client_kwargs))
     keys: list[str] = []
-    async with get_s3_client(**{k: v for k, v in client_kwargs.items()
-                                if k != "bucket_name"}) as client:
+    async with _client({k: v for k, v in client_kwargs.items() if k != "bucket_name"}) as client:
         paginator = client.get_paginator("list_objects_v2")
         async for page in paginator.paginate(Bucket=bucket, Prefix=EXECUTOR_PREFIX):
             keys.extend(item["Key"] for item in page.get("Contents", ()))

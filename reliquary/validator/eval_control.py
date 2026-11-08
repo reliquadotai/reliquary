@@ -1543,6 +1543,7 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
         verify_corpus_signature,
         verify_corpus_skip_signature,
     )
+    from reliquary.validator.corpus_validator import JUDGE_POOL_CONNECTIONS
     registered = None
     if registration_gate:
         from reliquary.validator.corpus_registration import (
@@ -1579,7 +1580,10 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
     job_set = None
     archives = OrderArchives(served=lambda: job_set.task_ids() if job_set else ())
     app, job_set = build_eval_control(
-        store=BucketJobStore(), records=BucketRecordStore(), dispatcher=dispatcher,
+        # Every order's auditors and the miners' intake share these connections: the corpus
+        # validator's pool, not botocore's 10.
+        store=BucketJobStore(), records=BucketRecordStore(max_pool_connections=JUDGE_POOL_CONNECTIONS),
+        dispatcher=dispatcher,
         directory=directory, verify_signature=verify_corpus_signature,
         verify_skip_signature=verify_corpus_skip_signature, qualifications=qualifications,
         registration=registered.reason if registered is not None else None,
