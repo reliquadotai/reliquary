@@ -646,6 +646,9 @@ def eval_auditor(**kwargs):
     from reliquary.validator.corpus_auditor import CorpusAuditor
 
     class EvalAuditor(CorpusAuditor):
+        # Orders forfeit a caught cheat's unpaid work (#468): the slow-hotkey rule weighs that stake.
+        stake_at_receipt = True
+
         async def _forward(self, records, *, local: bool = False):
             results, items = await asyncio.to_thread(self._prepare, records)
             if self._draw_job is None:
