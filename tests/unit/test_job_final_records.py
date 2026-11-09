@@ -58,35 +58,44 @@ def _eval_records(*, failed_recorded=True, open_prompt=False, settled=()):
 
 
 def test_an_audited_eval_job_is_final_before_its_period_settles():
-    counts = asyncio.run(stored_job_counts(_eval_records(), "j"))
+    counts = asyncio.run(stored_job_counts(_eval_records(), "j", with_final=True))
     assert counts["unsettled"] == 3 and counts["drained"] is False
     assert counts["final"] is True
+
+
+def test_a_caller_after_the_drain_alone_reads_no_verdict():
+    # The control's unwire check runs every minute on every served job: final is not its business.
+    records = _eval_records()
+    counts = asyncio.run(stored_job_counts(records, "j"))
+    assert counts["final"] is counts["drained"] is False
+    assert records.verdict_reads == 0
 
 
 def test_a_failed_verdict_not_yet_recorded_in_the_ledger_is_not_final():
     # The auditor writes the verdict, then reopens the slot: in between, the job looks complete.
     records = _eval_records(failed_recorded=False)
-    counts = asyncio.run(stored_job_counts(records, "j"))
+    counts = asyncio.run(stored_job_counts(records, "j", with_final=True))
     assert counts["unaudited"] == 0 and counts["final"] is False
 
 
 def test_an_open_prompt_is_not_final():
-    counts = asyncio.run(stored_job_counts(_eval_records(open_prompt=True), "j"))
+    counts = asyncio.run(stored_job_counts(_eval_records(open_prompt=True), "j", with_final=True))
     assert counts["final"] is False
 
 
 def test_verdict_outcomes_are_read_once_across_calls():
     records = _eval_records(failed_recorded=False)
     cache: dict[str, bool] = {}
-    assert asyncio.run(stored_job_counts(records, "j", verdict_passed=cache))["final"] is False
+    assert asyncio.run(stored_job_counts(
+        records, "j", with_final=True, verdict_passed=cache))["final"] is False
     reads = records.verdict_reads
-    asyncio.run(stored_job_counts(records, "j", verdict_passed=cache))
+    asyncio.run(stored_job_counts(records, "j", with_final=True, verdict_passed=cache))
     assert records.verdict_reads == reads
 
 
 def test_a_drained_job_is_final_and_reads_no_verdict():
     records = _eval_records(settled=[SID["a"], SID["b"], SID["c"]])
-    counts = asyncio.run(stored_job_counts(records, "j"))
+    counts = asyncio.run(stored_job_counts(records, "j", with_final=True))
     assert counts["drained"] is True and counts["final"] is True and records.verdict_reads == 0
 
 
@@ -95,7 +104,7 @@ def test_an_episode_job_waits_for_its_drain():
     records.job = SimpleNamespace(**{k: getattr(records.job, k) for k in (
         "job_id", "prompt_count", "prompt_start", "slots_per_prompt", "prompt_source")},
         episode=object())
-    counts = asyncio.run(stored_job_counts(records, "j"))
+    counts = asyncio.run(stored_job_counts(records, "j", with_final=True))
     assert counts["final"] is False
 
 

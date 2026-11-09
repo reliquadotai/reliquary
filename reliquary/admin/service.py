@@ -534,16 +534,22 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         entries, _ = await registry_store.read_registry(strict=False)
         return [e for _, e in sorted(entries.items()) if e.job_id == job_id]
 
-    # Verdict outcomes by job, read once each (verdicts are create-only).
+    # Verdict outcomes by job, read once each (verdicts are create-only), until the job is final;
+    # then only that it is: final never reverts (no prompt open, every verdict written), so its
+    # verdicts are not read again by the delivery and grading that follow.
     verdict_outcomes: dict[str, dict[str, bool]] = {}
+    final_jobs: set[str] = set()
 
     async def job_counts(job_id: str) -> dict:
         """The stored counts; ``final`` gates grading and delivery, ``drained`` only pay."""
         from reliquary.validator.corpus_job_status import stored_job_counts
 
-        cache = verdict_outcomes.setdefault(job_id, {})
-        counts = await stored_job_counts(records, job_id, verdict_passed=cache)
-        if counts["final"]:
+        known = job_id in final_jobs
+        counts = await stored_job_counts(records, job_id, with_final=not known,
+                                         verdict_passed=verdict_outcomes.setdefault(job_id, {}))
+        if known or counts["final"]:
+            counts["final"] = True
+            final_jobs.add(job_id)
             verdict_outcomes.pop(job_id, None)
         return counts
 

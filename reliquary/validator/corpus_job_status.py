@@ -132,13 +132,16 @@ def _eval_prompt_counts(job: Any, slots: Any, *, unaudited: int) -> dict[str, An
             "complete": counts["open"] == 0 and unaudited <= 0}
 
 
-async def stored_job_counts(records: Any, job_id: str, *,
+async def stored_job_counts(records: Any, job_id: str, *, with_final: bool = False,
                             verdict_passed: dict[str, bool] | None = None) -> dict[str, Any]:
     """What the bucket says of a job's drain, by listing it: the counts
     `jobs status` prints and the admin service proxies.
 
     ``final``: what the job delivers can no longer change (``final_records``),
     which may come a period before ``drained``: pay settles on its own clock.
+    It reads every verdict of a quiet job, so only ``with_final`` computes it;
+    otherwise it is ``drained`` (a caller after the drain alone, e.g. the
+    control's unwire check every minute, never pays for it).
     ``verdict_passed`` caches verdict outcomes across calls (verdicts are
     create-only)."""
     from reliquary.validator.corpus_service import rebuild_ledgers
@@ -168,7 +171,7 @@ async def stored_job_counts(records: Any, job_id: str, *,
     quiet = (unaudited == 0 and pending_records == 0
              and before_etag == after_etag and before == after)
     drained = quiet and unsettled == 0 and pending is None
-    final = drained or (quiet and job is not None and await final_records(
+    final = drained or (with_final and quiet and job is not None and await final_records(
         records, job, after, verdicts, verdict_passed))
     return {
         "submissions": len(submissions), "verdicts": len(verdicts), "unaudited": unaudited,

@@ -121,7 +121,7 @@ async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bo
         raise JobNotGradable(f"job {job_id} reads {job.prompt_source!r}, not an eval set")
     source = parse_eval_source(job.prompt_source)
     samples = job.slots_per_prompt * job.sampling.n
-    if not (await stored_job_counts(records, job_id))["final"]:
+    if not (await stored_job_counts(records, job_id, with_final=True))["final"]:
         raise JobNotGradable(f"job {job_id} is not final: every submission must be audited "
                              "first (reliquary jobs status)")
     # The set's rows (the ones the job ran) say how it is graded; its card in
