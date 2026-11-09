@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import math
 
+import pytest
+
 from reliquary.corpus.audit_policy import AuditParams
 from reliquary.validator.corpus_auditor import CorpusAuditor
 from reliquary.validator.corpus_periods import PERIOD_EPOCH, PERIOD_SECONDS
@@ -183,3 +185,88 @@ def test_audits_pending_leaves_out_held_records_their_stake_covers():
     # A record whose decision may still turn into an audit (the corpus rule) counts again.
     auditor.stake_at_receipt = False
     assert auditor.audits_pending() == 2 and auditor.audits_idle_since is None
+
+
+class _Flaky(_Store):
+    def __init__(self, *args, fail=0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fail, self.reads = fail, 0
+
+    async def read_submission(self, job_id, sid):
+        self.reads += 1
+        if self.fail:
+            self.fail -= 1
+            raise OSError("transient")
+        return await super().read_submission(job_id, sid)
+
+
+_LONG = {"tokens": [1] * 64, "text": ""}
+_META = {"hotkey": HK, "received_at": T0, "token_count": 500}
+
+
+def _restarted(store, states=None):
+    """An auditor of a draw job that knows a record from its metadata only, as `_seed` leaves it."""
+    clock = _Clock(T0 + 20)
+    auditor = _auditor(store, clock, states=states)
+    auditor._draw_job = object()
+    return auditor
+
+
+def test_a_record_seeded_from_its_metadata_is_read_in_full_once_for_the_stake_rule():
+    # After a restart, `_seed` reads only each pending record's tail: no completions, so its shortest one is
+    # unknown and the stake rule would fall back to the arrivals rule (2026-11-09: an order audited at 99 %).
+    sid = _ids(False, 1)[0]
+    store = _Flaky({sid: {**_rec(0, received_at=T0), "completions": [_LONG, _LONG]}}, fail=1)
+    auditor = _restarted(store)
+    auditor._remember(sid, _META)
+    assert auditor._stake_applies(sid) is False
+    states = {HK: SAMPLED}
+    asyncio.run(auditor._learn_shortest([sid], states, T0 + 20))
+    assert auditor._stake_applies(sid) is False          # the read failed: tried again later
+    asyncio.run(auditor._learn_shortest([sid], states, T0 + 20))
+    assert auditor._stake_applies(sid) is True
+    # Read in full once, and not kept: a record whose full read finds no completion is not read every pass.
+    auditor._shortest.pop(sid)
+    asyncio.run(auditor._learn_shortest([sid], states, T0 + 20))
+    assert store.reads == 2
+
+
+def test_only_records_the_stake_rule_may_pay_are_read():
+    sid = _ids(False, 1)[0]
+    store = _Flaky({sid: {**_rec(0, received_at=T0), "completions": [_LONG]}})
+    from reliquary.corpus.audit_policy import MinerState
+
+    probation = MinerState(audited_passed=0)
+    auditor = _restarted(store)
+    auditor._remember(sid, _META)
+    asyncio.run(auditor._learn_shortest([sid], {HK: probation}, T0 + 20))  # audited anyway
+    corpus = _auditor(store, _Clock(T0 + 20))                               # not a draw job
+    corpus._remember(sid, _META)
+    asyncio.run(corpus._learn_shortest([sid], {HK: SAMPLED}, T0 + 20))
+    unstaked = _auditor(store, _Clock(T0 + 20), staked=False)
+    unstaked._draw_job = object()
+    unstaked._remember(sid, _META)
+    asyncio.run(unstaked._learn_shortest([sid], {HK: SAMPLED}, T0 + 20))
+    assert store.reads == 0
+
+
+def test_a_pass_learns_the_length_of_its_records_before_deciding():
+    first = _ids(False, 1)[0]
+    store = _Store({first: _rec(0, received_at=T0)})
+    auditor = _restarted(store)
+    auditor._remember(first, _META)
+    seen = []
+
+    class _Stop(Exception):
+        pass
+
+    async def learn(ids, states, now):
+        # Before any decision: the pass's own records are read for their length first.
+        seen.extend(ids)
+        raise _Stop
+
+    auditor._learn_shortest = learn
+    auditor._seeded = True
+    with pytest.raises(_Stop):
+        asyncio.run(auditor._judge_once([first]))
+    assert seen == [first]
