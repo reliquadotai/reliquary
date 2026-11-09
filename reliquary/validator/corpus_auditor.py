@@ -61,6 +61,8 @@ MAX_CONSECUTIVE_VALIDATOR_ERRORS = 5
 AUDIT_BATCH_TOKENS = int(os.environ.get("RELIQUARY_CORPUS_AUDIT_BATCH_TOKENS", "131072"))
 # Store reads in flight at once when many records must be read before judging.
 READ_CONCURRENCY = 16
+# Records read at once only for their shortest completion (`_learn_shortest`), then dropped.
+SHORTEST_READ_SLICE = 64
 # Verdict writes in flight at once. One at a time, each create-only PUT took
 # ~1.5 s on 2026-10-02 and capped a job near 2,400 verdicts an hour.
 WRITE_CONCURRENCY = 32
@@ -265,7 +267,7 @@ class CorpusAuditor:
         self._staked: set[str] = set()
         # Its shortest completion's tokens, from a full read (a metadata read leaves it unknown).
         self._shortest: dict[str, int] = {}
-        # Records read in full once for their shortest completion (a full read that finds none is not retried).
+        # Records read in full once for their shortest completion (`_learn_shortest`).
         self._read_for_shortest: set[str] = set()
         # Since when no pending record may still need an audit (`audits_pending`), None while one may.
         self._audits_idle_since: float | None = None
@@ -856,17 +858,35 @@ class CorpusAuditor:
         shortest = self._shortest.get(submission_id)
         return shortest is not None and shortest >= EVAL_CHARGE_MIN_POSITIONS
 
-    def _needing_shortest(self, submission_ids: list[str], read: dict) -> list[str]:
-        """Known records the stake rule needs read in full: seeded from their metadata after a restart, so
-        their shortest completion is unknown and `_stake_applies` would fall back to the arrivals rule, which
-        audits every record decided once the hotkey stopped submitting (2026-11-09: 99 % of an order)."""
+    async def _learn_shortest(self, submission_ids, states: dict, now: float) -> None:
+        """The shortest completion of known records the stake rule may pay on: seeded from their metadata after a
+        restart, it is unknown and `_stake_applies` would fall back to the arrivals rule, which audits every record
+        decided once its hotkey stopped submitting (2026-11-09: 99 % of an order). Each is read in full once, in
+        slices kept only for their length; a failed read is tried again on a later pass."""
         if not self.stake_at_receipt or self._draw_job is None or self._params.q >= 1.0:
-            return []
+            return
         wanted = [sid for sid in dict.fromkeys(submission_ids)
-                  if sid in self._meta and sid not in read and sid not in self._shortest
-                  and sid not in self._read_for_shortest]
-        self._read_for_shortest.update(wanted)
-        return wanted
+                  if sid in self._meta and sid not in self._shortest and sid not in self._read_for_shortest
+                  and sid not in self._judged and self._meta[sid][0] in states
+                  and effective_state(states[self._meta[sid][0]], now, self._params) == "sampled"]
+        if not wanted:
+            return
+        gate = asyncio.Semaphore(READ_CONCURRENCY)
+
+        async def one(sid):
+            async with gate:
+                try:
+                    record = await self._records.read_submission(self._job_id, sid)
+                except Exception:
+                    logger.warning("corpus read of %s for its length failed; retried later", sid[:12])
+                    return
+                if record is not None:
+                    self._remember(sid, record)
+                    self._read_for_shortest.add(sid)
+
+        with self._timed("read"):
+            for i in range(0, len(wanted), SHORTEST_READ_SLICE):
+                await gather_owned((one(sid) for sid in wanted[i:i + SHORTEST_READ_SLICE]))
 
     def _recent(self, hotkey: str, now: float) -> int:
         arrivals = self._arrivals.get(hotkey, [])
@@ -1567,12 +1587,12 @@ class CorpusAuditor:
         read: dict[str, dict] = {}
         read.update(await self._read_all(
             [sid for sid in submission_ids if sid not in self._meta]))
-        read.update(await self._read_all(self._needing_shortest(submission_ids, read)))
         known = [sid for sid in dict.fromkeys(submission_ids) if sid in self._meta]
         if self.stake_at_receipt:
             # Oldest first: a record's stake counts the earlier ones this pass leaves unaudited.
             known.sort(key=lambda sid: self._meta[sid][1])
         states = await self._states({self._meta[sid][0] for sid in known}, now)
+        await self._learn_shortest(known, states, now)
 
         audit_ids, draws, unaudited, voided = [], {}, [], []
         # Per hotkey, arrival times of records whose draw round is not out yet.
@@ -1659,6 +1679,7 @@ class CorpusAuditor:
                         "siblings=%d rounds_needed=%d rounds_cached=%d/%d", self._job_id,
                         len(known), len(kept), len(waiting), sum(taken.values()), rounds_needed,
                         self._pass_rounds[1], self._pass_rounds[0])
+            await self._learn_shortest([sid for sids in siblings.values() for sid in sids], states, now)
             reused: list[tuple[str, dict | None]] = []
             for hotkey, sids in siblings.items():
                 for sid in sids:
