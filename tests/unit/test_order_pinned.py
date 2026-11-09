@@ -127,6 +127,20 @@ def test_a_batch_on_a_frozen_set_is_the_same_order(admin, pins):  # noqa: F811
     assert record["kind"] == qual.GENERATION and record["seed"] == 11
 
 
+def test_an_order_names_the_audit_executors_its_speed_allows(admin, pins):  # noqa: F811
+    from reliquary.validator.eval_control import order_audit_executors
+
+    created = admin("POST", "/admin/v1/jobs", {**_on_upload(admin, seed=11), "audit_executors": 3})
+    assert created.status_code == 201, created.text
+    record = asyncio.run(qual.EvalJobStore().read("order-gen-p1"))
+    assert record["audit_executors"] == 3 and order_audit_executors(record) == 3
+    # One (the default) is never written: an order record without it allows one.
+    assert order_audit_executors({}) == order_audit_executors(None) == 1
+    assert order_audit_executors({"audit_executors": True}) == 1
+    assert admin("POST", "/admin/v1/jobs", {**_on_upload(admin, "eval", seed=11),
+                                            "audit_executors": 9}).status_code == 422
+
+
 def test_a_batch_never_draws_from_our_held_out_sets(admin, pins):  # noqa: F811
     response = admin("POST", "/admin/v1/jobs", _order("gen"))
     assert response.status_code == 422 and "upload" in response.text
