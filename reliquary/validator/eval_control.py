@@ -25,6 +25,7 @@ import hmac
 import json
 import itertools
 import logging
+import math
 import secrets
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -80,11 +81,85 @@ def order_audit_scorers(env=None) -> int:
         raise ValueError(f"{SCORERS_ENV} must be 1 to {MAX_SCORERS}, got {value}")
     return value
 STATUS_SECONDS = 30.0
+# Audit throughput is measured over this window: items scored per second an executor held a lease.
+THROUGHPUT_WINDOW_SECONDS = 900.0
+# Enough executors that the expected audits of a model's orders drain within this (env: DRAIN_ENV).
+DRAIN_ENV = "RELIQUARY_ORDER_AUDIT_DRAIN_SECONDS"
+DEFAULT_DRAIN_SECONDS = 1800.0
+MAX_EXECUTORS_ENV = "RELIQUARY_ORDER_MAX_AUDIT_EXECUTORS"
+DEFAULT_MAX_EXECUTORS = 3
+# Fewer executors are wanted only once fewer were enough for this long (no rent/release flapping).
+SCALE_DOWN_SECONDS = 600.0
+# Busy seconds measured before a rate is trusted.
+MIN_MEASURED_BUSY_SECONDS = 120.0
 HEARTBEAT_WRITE_SECONDS = 30.0
 EVAL_CONTROL_STATUS_KEY = "reliquary/eval/control/status.json"
 # The miners document every order shares: a hotkey's probation progress carries
 # from one order to the next (no `order-` prefix: it is no order).
 ORDER_TRUST_ID = "miner-trust-orders"
+
+
+def order_audit_drain_seconds(env=None) -> float:
+    import os
+
+    raw = (os.environ if env is None else env).get(DRAIN_ENV, "").strip()
+    value = float(raw) if raw else DEFAULT_DRAIN_SECONDS
+    if not value > 0:
+        raise ValueError(f"{DRAIN_ENV} must be positive, got {raw}")
+    return value
+
+
+def order_max_audit_executors(env=None) -> int:
+    import os
+
+    raw = (os.environ if env is None else env).get(MAX_EXECUTORS_ENV, "").strip()
+    value = int(raw) if raw else DEFAULT_MAX_EXECUTORS
+    if value < 1:
+        raise ValueError(f"{MAX_EXECUTORS_ENV} must be at least 1, got {raw}")
+    return value
+
+
+def executors_for_backlog(backlog: float, items_per_second: float | None, *, drain_seconds: float,
+                          max_executors: int) -> int | None:
+    """Executors that audit ``backlog`` items within ``drain_seconds`` at the measured rate of one: 0 with
+    nothing to audit, None while the rate is unmeasured (the fleet keeps what it has)."""
+    if backlog <= 0:
+        return 0
+    if not items_per_second:
+        return None
+    return max(1, min(max_executors, math.ceil(backlog / (items_per_second * drain_seconds))))
+
+
+class ExecutorSizing:
+    """Per model, the executors wanted: more at once, fewer only once fewer were enough for
+    SCALE_DOWN_SECONDS, so a backlog that dips between passes does not release a card."""
+
+    def __init__(self, *, clock: Callable[[], float] = time.time,
+                 scale_down_seconds: float = SCALE_DOWN_SECONDS) -> None:
+        self._clock = clock
+        self._down = scale_down_seconds
+        self._wanted: dict[str, int] = {}
+        self._lower_since: dict[str, float] = {}
+
+    def update(self, model: str, target: int | None) -> int | None:
+        current = self._wanted.get(model)
+        if target is None:
+            return current
+        now = self._clock()
+        if current is None or target >= current:
+            self._wanted[model] = target
+            self._lower_since.pop(model, None)
+        else:
+            since = self._lower_since.setdefault(model, now)
+            if now - since >= self._down:
+                self._wanted[model] = target
+                self._lower_since.pop(model, None)
+        return self._wanted[model]
+
+    def forget(self, keep: set[str]) -> None:
+        for model in [m for m in self._wanted if m not in keep]:
+            self._wanted.pop(model, None)
+            self._lower_since.pop(model, None)
 
 
 class BatchParked(Exception):
@@ -237,6 +312,11 @@ class PairedAuditDispatcher:
         self.parked: collections.Counter = collections.Counter()
         self.quarantined: set[str] = set()
         self.stats = collections.Counter()
+        # Throughput: per executor, since when it holds a lease; per model, (when, items scored) and
+        # (when it ended, busy seconds) of the last THROUGHPUT_WINDOW_SECONDS.
+        self._busy_since: dict[str, tuple[float, ModelKey]] = {}
+        self._scored_items: dict[ModelKey, collections.deque] = collections.defaultdict(collections.deque)
+        self._busy_spans: dict[ModelKey, collections.deque] = collections.defaultdict(collections.deque)
 
     # -- the auditors' side ------------------------------------------------
 
@@ -350,6 +430,7 @@ class PairedAuditDispatcher:
             lease = _Lease(lease_id=secrets.token_hex(16), batch=batch, executor_id=executor_id,
                            expires_at=self._clock() + self._lease_seconds)
             self._leases[lease.lease_id] = lease
+            self._mark_busy(executor_id, batch.model)
             batch.leased.add(executor_id)
             batch.places[executor_id] = place
             self.stats["leased"] += 1
@@ -377,6 +458,7 @@ class PairedAuditDispatcher:
         del self._leases[lease_id]
         batch = lease.batch
         batch.leased.discard(executor_id)
+        self._mark_busy(executor_id, batch.model)
         if lease.expires_at <= self._clock():
             raise LeaseRefused(410, "lease_expired")
         self._strikes[executor_id] = 0
@@ -389,6 +471,7 @@ class PairedAuditDispatcher:
             return "requeued" if not batch.future.done() else "unneeded"
         batch.scores[executor_id] = converted_scores(scores)
         self.stats["scored"] += 1
+        self._scored_items[batch.model].append((self._clock(), len(batch.items)))
         await self._decide(batch)
         return "accepted"
 
@@ -460,6 +543,31 @@ class PairedAuditDispatcher:
                    and (protocol is None or protocol in self._protocols[d["executor_id"]])
                    for d in self.live_executors(model))
 
+    def _mark_busy(self, executor_id: str, model: ModelKey) -> None:
+        """After a lease of ``executor_id`` was granted or ended: open or close its busy span."""
+        held = any(lease.executor_id == executor_id for lease in self._leases.values())
+        now = self._clock()
+        if held and executor_id not in self._busy_since:
+            self._busy_since[executor_id] = (now, model)
+        elif not held and executor_id in self._busy_since:
+            since, busy_model = self._busy_since.pop(executor_id)
+            self._busy_spans[busy_model].append((now, now - since))
+
+    def items_per_second(self, model: ModelKey) -> float | None:
+        """Items one executor of ``model`` scores per second it holds a lease, over the last
+        THROUGHPUT_WINDOW_SECONDS; None until MIN_MEASURED_BUSY_SECONDS were measured."""
+        now = self._clock()
+        start = now - THROUGHPUT_WINDOW_SECONDS
+        for log in (self._scored_items[model], self._busy_spans[model]):
+            while log and log[0][0] < start:
+                log.popleft()
+        items = sum(n for _, n in self._scored_items[model])
+        busy = sum(min(seconds, end - start) for end, seconds in self._busy_spans[model])
+        busy += sum(now - max(since, start) for since, m in self._busy_since.values() if m == model)
+        if busy < MIN_MEASURED_BUSY_SECONDS or items <= 0:
+            return None
+        return items / busy
+
     def status(self) -> dict:
         """Per model, what the fleet must know: ``executors_needed`` more
         executors (on providers and hosts distinct from the live ones) to
@@ -503,6 +611,7 @@ class PairedAuditDispatcher:
             if lease.executor_id == executor_id:
                 del self._leases[lease_id]
                 lease.batch.leased.discard(executor_id)
+                self._mark_busy(executor_id, lease.batch.model)
         for queue in self._queues.values():
             for batch in queue:
                 if not batch.future.done() and executor_id in batch.scores:
@@ -541,6 +650,7 @@ class PairedAuditDispatcher:
             if lease.expires_at <= now:
                 del self._leases[lease_id]
                 lease.batch.leased.discard(lease.executor_id)
+                self._mark_busy(lease.executor_id, lease.batch.model)
                 self._strikes[lease.executor_id] += 1
                 if self._strikes[lease.executor_id] >= self._strikes_limit:
                     await self.quarantine(lease.executor_id,
@@ -1512,9 +1622,15 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         drained=lambda w: job_drained(auditor=w.auditor, records=records,
                                       job_id=w.job.job_id),
         clock=clock)
+    drain_seconds = order_audit_drain_seconds()
+    max_executors = order_max_audit_executors()
+    sizing = ExecutorSizing(clock=clock)
+
     async def control_status() -> dict:
-        """The dispatcher's status, with each served job's completeness."""
+        """The dispatcher's status, with each served job's completeness, and per model the executors
+        its orders' expected audits want (`executors_wanted`)."""
         document = dispatcher.status()
+        backlog: dict[tuple[str, str], float] = collections.defaultdict(float)
         for job_id in list(served):
             try:
                 status = await job_set.status(job_id)
@@ -1531,8 +1647,23 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             # What the fleet needs to keep an audit executor for it: none once nothing left may need one.
             auditor = getattr(served.get(job_id), "auditor", None)
             if auditor is not None:
-                entry["audits_pending"] = auditor.audits_pending()
+                pending = auditor.audits_pending()
+                entry["audits_pending"] = pending
                 entry["audits_idle_since"] = auditor.audits_idle_since
+                job = served[job_id].job
+                backlog[(job.checkpoint_repo, job.checkpoint_revision)] += auditor.expected_audits(pending)
+        for model, expected in backlog.items():
+            key = f"{model[0]}@{model[1]}"
+            live = len(dispatcher.live_executors(model))
+            rate = dispatcher.items_per_second(model)
+            wanted = sizing.update(key, executors_for_backlog(
+                expected, rate, drain_seconds=drain_seconds, max_executors=max_executors))
+            entry = document["models"].setdefault(key, {"executors_needed": 0, "live_executors": live})
+            entry.update({"expected_audits": round(expected), "items_per_second": rate,
+                          "executors_wanted": wanted})
+            if wanted:
+                entry["executors_needed"] = max(entry.get("executors_needed", 0), wanted - live)
+        sizing.forget({f"{m[0]}@{m[1]}" for m in backlog})
         return document
 
     app.state.control_status = control_status

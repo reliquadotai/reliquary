@@ -78,6 +78,8 @@ SEED_SLICE_IDS = 2048
 SEED_META_CONCURRENCY = 64
 # `stake_at_receipt`: forfeitable receipts kept past the hold for records still pending behind a backlog.
 STAKE_KEEP_SECONDS = 6 * 3600.0
+# Decisions at q weighing in `expected_audits` before the job's own count.
+EXPECTED_AUDIT_PRIOR_DECISIONS = 50
 
 
 def _settlement_period(t: float) -> int:
@@ -315,6 +317,8 @@ class CorpusAuditor:
         # once per pass so an idle GPU shows what it was waiting for.
         self._phase: Counter = Counter()
         self._choices: Counter = Counter()
+        # Final decisions over the job's life ("audit" / "pass_unaudited"), for `expected_audits`.
+        self._decided: Counter = Counter()
 
     async def _in(self, pool: str, func, *args):
         """``func`` on the judges' ``pool`` threads, or the default executor."""
@@ -496,6 +500,16 @@ class CorpusAuditor:
         elif self._audits_idle_since is None:
             self._audits_idle_since = self._clock()
         return pending
+
+    def expected_audits(self, pending: int | None) -> float:
+        """Of ``pending`` (`audits_pending`), how many the GPU will audit: at the share of this job's decisions
+        audited so far, which starts at q and also counts probation and slow-hotkey audits."""
+        if not pending:
+            return 0.0
+        audited, unaudited = self._decided["audit"], self._decided["pass_unaudited"]
+        prior = EXPECTED_AUDIT_PRIOR_DECISIONS
+        share = (audited + self._params.q * prior) / (audited + unaudited + prior)
+        return pending * min(1.0, max(self._params.q, share))
 
     @property
     def audits_idle_since(self) -> float | None:
@@ -1568,6 +1582,8 @@ class CorpusAuditor:
             with self._timed("decide"):
                 choice, draw = await self._decide(submission_id, now, states[hotkey])
             self._choices[choice] += 1
+            if choice in ("audit", "pass_unaudited"):
+                self._decided[choice] += 1
             if choice == "audit":
                 audit_ids.append(submission_id)
                 if draw is not None:
