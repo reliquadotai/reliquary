@@ -159,3 +159,27 @@ def test_the_stake_is_counted_once():
     # Much later, with everything before it gone from memory, the record keeps its first count.
     auditor._forfeitable_at[HK].clear()
     assert auditor._stake_of(sid, T0 + 30 + HOLD + 1) == first == 2.0
+
+
+def test_audits_pending_leaves_out_held_records_their_stake_covers():
+    y = _ids(False, 1)[0]
+    x = _ids(False, 1, start=500)[0]
+    late = _ids(False, 1, start=700)[0]
+    store = _Store({y: _rec(0, received_at=T0), x: _rec(0, received_at=T0 + 30),
+                    late: _rec(0, received_at=T0 + 50)})
+    clock = _Clock(T0)
+    auditor = _auditor(store, clock)
+    assert auditor.audits_pending() is None  # before the seed: unknown
+    _judge_at(auditor, clock, T0 + 20, [y])
+    _judge_at(auditor, clock, T0 + 40, [x])
+    auditor.enqueue(late)
+    # X waits out its hold, covered: its hold's end only pays it. `late` is not decided yet.
+    assert auditor.audits_pending() == 1 and auditor.audits_idle_since is None
+    _judge_at(auditor, clock, T0 + 60, [late])
+    clock.now = T0 + 61
+    assert auditor.audits_pending() == 0 and auditor.audits_idle_since == T0 + 61
+    clock.now = T0 + 90
+    assert auditor.audits_pending() == 0 and auditor.audits_idle_since == T0 + 61
+    # A record whose decision may still turn into an audit (the corpus rule) counts again.
+    auditor.stake_at_receipt = False
+    assert auditor.audits_pending() == 2 and auditor.audits_idle_since is None

@@ -162,6 +162,11 @@ def test_one_process_serves_eval_jobs_of_two_models(world, monkeypatch):
         assert sorted(loaded) == ["customer/A", "customer/B"]
         # The drand chain is resolved as each job is wired, before any pass draws.
         assert warmed == [None, None]
+        # Each served job tells the fleet whether an audit executor is still needed: unknown before its seed.
+        status = await app.state.control_status()
+        assert {job: (status["jobs"][job]["audits_pending"], status["jobs"][job]["audits_idle_since"])
+                for job in ("order-eval-a", "order-eval-b")} == {"order-eval-a": (None, None),
+                                                                 "order-eval-b": (None, None)}
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://eval") as client:
             job = (await client.get("/corpus/jobs/order-eval-b/job")).json()
