@@ -123,17 +123,39 @@ def test_throughput_counts_a_lease_still_held():
     asyncio.run(go())
 
 
-def test_expected_audits_follow_the_jobs_audited_share():
-    auditor = CorpusAuditor.__new__(CorpusAuditor)
-    auditor._params = AuditParams(q=0.2, hold_seconds=600)
+def test_expected_audits_are_items_at_the_jobs_audited_share():
     from collections import Counter
 
+    auditor = CorpusAuditor.__new__(CorpusAuditor)
+    auditor._params = AuditParams(q=0.2, hold_seconds=600)
     auditor._decided = Counter()
-    assert auditor.expected_audits(None) == 0.0
-    assert auditor.expected_audits(1000) == pytest.approx(200)   # no decision yet: q
-    auditor._decided.update({"audit": 950, "pass_unaudited": 0})  # probation: everything audited
-    assert auditor.expected_audits(1000) == pytest.approx(1000 * (950 + 10) / 1000)
+    auditor._completions_read = [0, 0]
+    assert auditor.expected_audits(None) is None              # before the seed: unknown, not zero
+    assert auditor.expected_audits(0) == 0.0
+    assert auditor.expected_audits(1000) == pytest.approx(200)   # no verdict yet: q, one item per record
+    auditor._completions_read = [10, 40]                          # four completions per record: four items
+    assert auditor.expected_audits(1000) == pytest.approx(800)
+    auditor._completions_read = [0, 0]
+    auditor._decided = Counter({"audit": 950})                    # probation: everything audited
+    assert auditor.expected_audits(1000) == pytest.approx(1000 * 960 / 1000)
     auditor._decided = Counter({"audit": 600, "pass_unaudited": 1400})
     assert auditor.expected_audits(1000) == pytest.approx(1000 * 610 / 2050)
     auditor._decided = Counter({"audit": 100, "pass_unaudited": 1900})  # luck under q: never below q
     assert auditor.expected_audits(1000) == pytest.approx(200)
+
+
+def test_idle_executors_are_those_holding_no_lease():
+    clock = _Clock()
+
+    async def go():
+        d = _dispatcher(clock)
+        scoring = asyncio.ensure_future(d.view(*MODEL_A, PROOF).score(ITEMS))
+        await asyncio.sleep(0)
+        d.heartbeat("b", _executor("b"))
+        assert d.claim(_executor("a")) is not None
+        live, idle = d.executor_ids(MODEL_A)
+        scoring.cancel()
+        return live, idle
+
+    live, idle = asyncio.run(go())
+    assert live == ["a", "b"] and idle == ["b"]

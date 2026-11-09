@@ -553,6 +553,12 @@ class PairedAuditDispatcher:
             since, busy_model = self._busy_since.pop(executor_id)
             self._busy_spans[busy_model].append((now, now - since))
 
+    def executor_ids(self, model: ModelKey) -> tuple[list[str], list[str]]:
+        """The live executors of ``model``, and those of them holding no lease."""
+        live = sorted(d["executor_id"] for d in self.live_executors(model))
+        busy = {lease.executor_id for lease in self._leases.values()}
+        return live, [e for e in live if e not in busy]
+
     def items_per_second(self, model: ModelKey) -> float | None:
         """Items one executor of ``model`` scores per second it holds a lease, over the last
         THROUGHPUT_WINDOW_SECONDS; None until MIN_MEASURED_BUSY_SECONDS were measured."""
@@ -1630,12 +1636,17 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         """The dispatcher's status, with each served job's completeness, and per model the executors
         its orders' expected audits want (`executors_wanted`)."""
         document = dispatcher.status()
-        backlog: dict[tuple[str, str], float] = collections.defaultdict(float)
+        # Per model served, its orders' expected audit items; None while one of them is unknown.
+        backlog: dict[tuple[str, str], float | None] = {}
+        for w in list(served.values()):
+            backlog.setdefault((w.job.checkpoint_repo, w.job.checkpoint_revision), 0.0)
         for job_id in list(served):
             try:
                 status = await job_set.status(job_id)
             except Exception:
                 logger.warning("eval status of %s unavailable", job_id, exc_info=True)
+                job = served[job_id].job
+                backlog[(job.checkpoint_repo, job.checkpoint_revision)] = None
                 continue
             if status is None:
                 continue
@@ -1651,18 +1662,27 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 entry["audits_pending"] = pending
                 entry["audits_idle_since"] = auditor.audits_idle_since
                 job = served[job_id].job
-                backlog[(job.checkpoint_repo, job.checkpoint_revision)] += auditor.expected_audits(pending)
+                model = (job.checkpoint_repo, job.checkpoint_revision)
+                expected = auditor.expected_audits(pending)
+                if expected is None or backlog.get(model) is None:
+                    backlog[model] = None
+                else:
+                    backlog[model] += expected
         for model, expected in backlog.items():
             key = f"{model[0]}@{model[1]}"
-            live = len(dispatcher.live_executors(model))
+            live, idle = dispatcher.executor_ids(model)
             rate = dispatcher.items_per_second(model)
-            wanted = sizing.update(key, executors_for_backlog(
-                expected, rate, drain_seconds=drain_seconds, max_executors=max_executors))
-            entry = document["models"].setdefault(key, {"executors_needed": 0, "live_executors": live})
-            entry.update({"expected_audits": round(expected), "items_per_second": rate,
-                          "executors_wanted": wanted})
+            # Unknown backlog (a job seeding, a status unreadable): what is wanted stays as it was.
+            target = None if expected is None else executors_for_backlog(
+                expected, rate, drain_seconds=drain_seconds, max_executors=max_executors)
+            wanted = sizing.update(key, target)
+            entry = document["models"].setdefault(key, {"executors_needed": 0, "live_executors": len(live)})
+            # The fleet releases only an executor holding no lease (`idle_executors`): none of its work is lost.
+            entry.update({"expected_audits": None if expected is None else round(expected),
+                          "items_per_second": rate, "executors_wanted": wanted,
+                          "executors": live, "idle_executors": idle})
             if wanted:
-                entry["executors_needed"] = max(entry.get("executors_needed", 0), wanted - live)
+                entry["executors_needed"] = max(entry.get("executors_needed", 0), wanted - len(live))
         sizing.forget({f"{m[0]}@{m[1]}" for m in backlog})
         return document
 

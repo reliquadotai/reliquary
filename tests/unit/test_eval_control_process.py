@@ -167,9 +167,10 @@ def test_one_process_serves_eval_jobs_of_two_models(world, monkeypatch):
         assert {job: (status["jobs"][job]["audits_pending"], status["jobs"][job]["audits_idle_since"])
                 for job in ("order-eval-a", "order-eval-b")} == {"order-eval-a": (None, None),
                                                                  "order-eval-b": (None, None)}
-        # Nothing seeded yet, nothing expected: no executor asked for the backlog.
-        assert {m: (v["expected_audits"], v["executors_wanted"]) for m, v in status["models"].items()} == {
-            f"customer/{x}@{x.lower() * 40}": (0, 0) for x in "AB"}
+        # Nothing seeded yet: the backlog is unknown, so nothing is wanted yet (the fleet keeps what it has).
+        assert {m: (v["expected_audits"], v["executors_wanted"], v["idle_executors"])
+                for m, v in status["models"].items()} == {
+            f"customer/{x}@{x.lower() * 40}": (None, None, []) for x in "AB"}
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://eval") as client:
             job = (await client.get("/corpus/jobs/order-eval-b/job")).json()

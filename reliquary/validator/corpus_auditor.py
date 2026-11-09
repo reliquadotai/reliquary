@@ -321,8 +321,10 @@ class CorpusAuditor:
         # once per pass so an idle GPU shows what it was waiting for.
         self._phase: Counter = Counter()
         self._choices: Counter = Counter()
-        # Final decisions over the job's life ("audit" / "pass_unaudited"), for `expected_audits`.
+        # Verdicts this process wrote ("audit" / "pass_unaudited"), and the completions of the records read in
+        # full (an audit scores one item per completion), for `expected_audits`.
         self._decided: Counter = Counter()
+        self._completions_read = [0, 0]
 
     async def _in(self, pool: str, func, *args):
         """``func`` on the judges' ``pool`` threads, or the default executor."""
@@ -505,15 +507,20 @@ class CorpusAuditor:
             self._audits_idle_since = self._clock()
         return pending
 
-    def expected_audits(self, pending: int | None) -> float:
-        """Of ``pending`` (`audits_pending`), how many the GPU will audit: at the share of this job's decisions
-        audited so far, which starts at q and also counts probation and slow-hotkey audits."""
+    def expected_audits(self, pending: int | None) -> float | None:
+        """The items (completions) the GPU will audit of ``pending`` records (`audits_pending`): at the share of
+        this job's verdicts audited so far, which starts at q and also counts probation and slow-hotkey audits,
+        times the completions per record read. None while ``pending`` is unknown (before the seed)."""
+        if pending is None:
+            return None
         if not pending:
             return 0.0
         audited, unaudited = self._decided["audit"], self._decided["pass_unaudited"]
         prior = EXPECTED_AUDIT_PRIOR_DECISIONS
         share = (audited + self._params.q * prior) / (audited + unaudited + prior)
-        return pending * min(1.0, max(self._params.q, share))
+        records, completions = self._completions_read
+        per_record = completions / records if records else 1.0
+        return pending * min(1.0, max(self._params.q, share)) * per_record
 
     @property
     def audits_idle_since(self) -> float | None:
@@ -755,6 +762,9 @@ class CorpusAuditor:
     def _remember(self, submission_id: str, meta) -> None:
         """A record's (hotkey, arrival, size), from the record or its metadata."""
         completions = meta.get("completions")
+        if isinstance(completions, list) and completions:
+            self._completions_read[0] += 1
+            self._completions_read[1] += len(completions)
         if self.stake_at_receipt and isinstance(completions, list) and completions:
             try:
                 self._shortest[submission_id] = min(len(c["tokens"]) for c in completions)
@@ -1083,6 +1093,9 @@ class CorpusAuditor:
         elif standing is not None and isinstance(standing.get("received_at"), (int, float)):
             self._paid.setdefault(standing.get("hotkey"), []).append(
                 (float(standing["received_at"]), submission_id))
+        if written:
+            # Once per record: a decision deferred or held back to a later pass is counted when it lands.
+            self._decided["audit" if verdict.get("audited") else "pass_unaudited"] += 1
         self._report(submission_id, standing)
         return standing, written
 
@@ -1618,8 +1631,6 @@ class CorpusAuditor:
             with self._timed("decide"):
                 choice, draw = await self._decide(submission_id, now, states[hotkey])
             self._choices[choice] += 1
-            if choice in ("audit", "pass_unaudited"):
-                self._decided[choice] += 1
             if choice == "audit":
                 audit_ids.append(submission_id)
                 if draw is not None:
