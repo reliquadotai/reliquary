@@ -21,36 +21,12 @@ from types import SimpleNamespace
 import reliquary.constants as C
 import reliquary.validator.admission as admission
 from reliquary.validator.admission import _force_span_valid
-from reliquary.validator.verifier import validate_force_span
 
 _FORCE = [777, 7, 8]
 _CLOSE = {777}
 # prompt[0,1] + thinking[5,6] + force[777,7,8] + answer[55,99]
 _TOKENS = [0, 1, 5, 6, 777, 7, 8, 55, 99]
 _META = {"forced": True, "force_span": (4, 7), "prompt_length": 2}
-
-
-def test_validate_force_span_rejects_forced_claim_when_bft_disabled(monkeypatch):
-    monkeypatch.setattr(C, "BFT_ENABLED", False)
-
-    ok, exempt = validate_force_span(
-        _TOKENS, _META, _FORCE, 2, thinking_budget=2, think_close_ids=_CLOSE,
-    )
-
-    assert ok is False
-    assert exempt == set()
-
-
-def test_validate_force_span_leaves_non_forced_rollouts_alone(monkeypatch):
-    monkeypatch.setattr(C, "BFT_ENABLED", False)
-
-    ok, exempt = validate_force_span(
-        [0, 1, 5, 6], {"forced": False}, _FORCE, 2,
-        thinking_budget=2, think_close_ids=_CLOSE,
-    )
-
-    assert ok is True
-    assert exempt == set()
 
 
 def test_admission_rejects_forced_claim_when_bft_disabled(monkeypatch):

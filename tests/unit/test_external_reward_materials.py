@@ -84,17 +84,6 @@ def test_binary_environments_are_unchanged() -> None:
     assert spec.attainable_rewards == (0.0, 1.0)
 
 
-def test_sandbox_environments_are_what_fills_the_legacy_cases_channel() -> None:
-    """The name test this replaced would never have matched a packaged code
-    environment, which is the same environment under another name."""
-    from reliquary.validator.prompt_content import _cases_carry_the_target
-
-    assert _cases_carry_the_target("opencodeinstruct") is True
-    assert _cases_carry_the_target("openmathinstruct") is False
-    assert _cases_carry_the_target("reliquarylogic_v1") is False
-    assert _cases_carry_the_target("not-an-environment") is False
-
-
 class _Backend:
     """The minimum a packaged code environment has to expose."""
 

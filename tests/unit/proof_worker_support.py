@@ -57,29 +57,6 @@ def dispatch_handler(context: dict[str, Any], op: str, payload: Any) -> dict[str
     return echo_handler(context, payload)
 
 
-def proof_result_handler(context: dict[str, Any], commit, randomness, seed_u_values):
-    """Return a populated ProofResult, to prove it survives the pipe."""
-    from reliquary.validator.verifier import ProofResult
-
-    context["calls"] += 1
-    return ProofResult(
-        all_passed=True,
-        passed=len(commit["tokens"]),
-        checked=len(commit["tokens"]),
-        sketch_diff_max=17,
-        has_sparse_outputs=True,
-        p_stop=0.125,
-        challenge_lp_indices=[3, 5],
-        challenge_lp_values=[-0.5, -1.5],
-        completion_chosen_probs=[0.9] * 8,
-        completion_argmax_probs=[0.95] * 8,
-        completion_argmax_ids=[7] * 8,
-        seed_n_stochastic=6,
-        seed_n_match=5,
-        terminal_pick_ok=True,
-    )
-
-
 def build_device_context(*, device: str, tag: str = "") -> dict[str, Any]:
     return {"pid": os.getpid(), "calls": 0, "device": device,
             "tag": tag, "revision": None}

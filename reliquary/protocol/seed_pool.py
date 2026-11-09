@@ -137,37 +137,6 @@ def parse_rollout_binding(value: Any) -> RolloutSeed:
                        _integer(value["rollout_index"], "rollout_index", 0, MAX_GROUP_SIZE - 1))
 
 
-_ANNOUNCEMENT_FIELDS = {"contract", "schedule", "checkpoint", "supported_capabilities", "pool_epoch", "pool_randomness"}
-
-
-def pool_from_service_policy(value: Any, *, environment: str, prompt_idx: int,
-                             checkpoint_hash: str) -> SeedPool | None:
-    """Resolve the exact operator announcement for one env, refusing unsupported policies."""
-    if value is None:
-        return None
-    if hasattr(value, "model_dump"):
-        value = value.model_dump()
-    if not isinstance(value, dict) or set(value) != _ANNOUNCEMENT_FIELDS:
-        raise SeedPoolError("invalid service policy announcement")
-    from reliquary.protocol.service_catalogue import announced_contract
-
-    contract = announced_contract(value)
-    if contract.version != 2:
-        raise SeedPoolError("only service-contract/v2 announces public pools")
-    supported = value["supported_capabilities"]
-    if not isinstance(supported, list) or not 1 <= len(supported) <= 32 or any(not isinstance(x, str) or not 1 <= len(x) <= 256 for x in supported):
-        raise SeedPoolError("bounded service capabilities required")
-    contract.require_capabilities(set(supported))
-    policy = contract.environment(environment)["sampling"]
-    if policy["kind"] == "legacy/v1":
-        return None
-    if policy["kind"] != CAPABILITY:
-        raise SeedPoolError("sampling policy is not implemented by this miner")
-    return SeedPool.from_contract(contract, environment=environment, prompt_idx=prompt_idx,
-                                  checkpoint_hash=checkpoint_hash, pool_epoch=value["pool_epoch"],
-                                  randomness=value["pool_randomness"])
-
-
 @dataclass(frozen=True, slots=True)
 class SeedPool:
     """An operator-published pool of ``pool_seeds == 2 * group_size`` public seeds.
@@ -269,29 +238,3 @@ class SeedPool:
         return bits / 2**53
 
 
-def validate_rollout_selection(pool: SeedPool, selection: PoolSelection,
-                               commits: list[dict], *, signed_episodes: bool = False) -> None:
-    """Refuse, before any proof work, a group that is not one rollout per chosen seed, in order.
-
-    Rollout ``i`` must carry exactly ``selection.rollout_binding(i)``; since the selection is
-    strictly increasing, two rollouts can never claim the same seed. ``signed_episodes``:
-    the env's groups are signed episodes, so every rollout carries one, drawn from its own chosen
-    seed; otherwise no rollout may carry any episode.
-    """
-    pool.validate_selection(selection, rollout_count=len(commits))
-    for index, commit in enumerate(commits):
-        metadata = commit.get("rollout")
-        if not isinstance(metadata, dict):
-            raise SeedPoolError("public seed pool requires single-turn rollouts")
-        episode = metadata.get("episode")
-        if signed_episodes:
-            from reliquary.protocol.submission import is_signed_episode
-
-            if not is_signed_episode(metadata):
-                raise SeedPoolError("this environment takes signed episodes")
-            seed = episode.get("seed_index")
-            if type(seed) is not int or seed != selection.seeds[index]:
-                raise SeedPoolError("an episode is not the one of its chosen seed")
-        elif episode is not None:
-            raise SeedPoolError("public seed pool requires single-turn rollouts")
-        pool.validate_rollout_binding(metadata.get("seed_pool"), selection, index)

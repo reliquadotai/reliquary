@@ -5,11 +5,7 @@ import pytest
 
 from reliquary.constants import M_ROLLOUTS
 from reliquary.protocol.release_contract import canonical_json_bytes
-from reliquary.protocol.seed_pool import (
-    CAPABILITY, DRAW_DOMAIN, POOL_SCHEMA, ROLLOUT_SCHEMA, SELECTION_SCHEMA,
-    PoolSelection, RolloutSeed, SeedPool, SeedPoolError, parse_rollout_binding,
-    pool_from_service_policy, validate_rollout_selection,
-)
+from reliquary.protocol.seed_pool import CAPABILITY, DRAW_DOMAIN, POOL_SCHEMA, ROLLOUT_SCHEMA, SELECTION_SCHEMA, PoolSelection, RolloutSeed, SeedPool, SeedPoolError, parse_rollout_binding
 from reliquary.protocol.service_contract import (
     SUPPORTED_V2_CAPABILITIES, ServiceContract, ServiceContractError,
 )
@@ -82,16 +78,6 @@ def test_contract_declares_the_pool_and_no_group_count():
 
 # --- selection: one subset, one encoding ------------------------------------------------------
 
-def test_any_m_distinct_seeds_form_a_selection():
-    pool = _pool()
-    for seeds in (FIRST, ODD, tuple(range(M_ROLLOUTS, POOL_SEEDS)), (0, *range(POOL_SEEDS - M_ROLLOUTS + 1, POOL_SEEDS))):
-        selection = pool.selection(seeds)
-        assert selection.seeds == seeds and type(selection.seeds) is tuple
-        assert selection.to_dict() == {"schema": SELECTION_SCHEMA, "pool_sha256": pool.sha256, "seeds": list(seeds)}
-        assert PoolSelection.from_dict(selection.to_dict()) == selection
-        validate_rollout_selection(pool, selection, _commits(selection))
-
-
 @pytest.mark.parametrize("seeds", [
     (0,) * M_ROLLOUTS,                                  # duplicates
     (0, 0, *range(2, M_ROLLOUTS)),                      # one duplicate
@@ -153,45 +139,6 @@ def test_rollout_i_is_bound_to_the_i_th_chosen_seed():
                 {**selection.rollout_binding(0), "schema": "public-group-rollout/v1"}, None, []):
         with pytest.raises(SeedPoolError):
             parse_rollout_binding(bad)
-
-
-def test_rollouts_must_match_the_selection_and_their_position():
-    pool = _pool()
-    selection = pool.selection(ODD)
-    commits = _commits(selection)
-    validate_rollout_selection(pool, selection, commits)
-    for invalid in (commits[:-1], commits[::-1], commits + commits[:1]):
-        with pytest.raises(SeedPoolError):
-            validate_rollout_selection(pool, selection, invalid)
-    # two rollouts claiming the same seed
-    twice = copy.deepcopy(commits)
-    twice[1]["rollout"]["seed_pool"]["seed_index"] = twice[0]["rollout"]["seed_pool"]["seed_index"]
-    with pytest.raises(SeedPoolError):
-        validate_rollout_selection(pool, selection, twice)
-    # a rollout drawn from a seed outside the signed selection
-    foreign = copy.deepcopy(commits)
-    foreign[0]["rollout"]["seed_pool"]["seed_index"] = 0
-    with pytest.raises(SeedPoolError):
-        validate_rollout_selection(pool, selection, foreign)
-    # the right seeds, bound to other positions
-    swapped = copy.deepcopy(commits)
-    swapped[0]["rollout"]["seed_pool"], swapped[1]["rollout"]["seed_pool"] = (
-        swapped[1]["rollout"]["seed_pool"], swapped[0]["rollout"]["seed_pool"])
-    with pytest.raises(SeedPoolError):
-        validate_rollout_selection(pool, selection, swapped)
-    for field in ("seed_index", "rollout_index"):
-        boolean = copy.deepcopy(_commits(pool.selection(FIRST)))
-        boolean[1]["rollout"]["seed_pool"][field] = True     # True == 1 for dict equality
-        with pytest.raises(SeedPoolError):
-            validate_rollout_selection(pool, pool.selection(FIRST), boolean)
-    episode = copy.deepcopy(commits)
-    episode[0]["rollout"]["episode"] = {}
-    with pytest.raises(SeedPoolError):
-        validate_rollout_selection(pool, selection, episode)
-    # a selection of another pool (other prompt) is not this pool's
-    other = _pool(prompt_idx=8).selection(ODD)
-    with pytest.raises(SeedPoolError):
-        validate_rollout_selection(pool, other, _commits(other))
 
 
 # --- draw ---------------------------------------------------------------------------------------
@@ -260,39 +207,3 @@ def test_group_id_is_the_digest_of_the_selection():
 
 # --- announcement / legacy ------------------------------------------------------------------------
 
-def test_pool_resolution_requires_server_announcement_and_capabilities():
-    contract = contract_v2()
-    capabilities = sorted(SUPPORTED_V2_CAPABILITIES)
-    announcement = {"contract": contract.to_dict(), "schedule": initial_schedule(contract).to_dict(),
-                    "checkpoint": {"checkpoint_n": 3, "repo": "models/test", "revision": "d" * 40, "sha256": "e" * 64},
-                    "supported_capabilities": capabilities, "pool_epoch": 3, "pool_randomness": "ab" * 32}
-    kw = {"environment": MATH, "prompt_idx": 7, "checkpoint_hash": "d" * 40}
-    assert pool_from_service_policy(announcement, **kw) == _pool()
-    assert pool_from_service_policy(announcement, **{**kw, "environment": CODE}).environment == CODE
-    # an old miner's capability list does not cover the free-subset pool
-    old = [c for c in capabilities if c != CAPABILITY] + ["public-group-pool/v1"]
-    with pytest.raises(ValueError):
-        pool_from_service_policy({**announcement, "supported_capabilities": old}, **kw)
-    with pytest.raises(ValueError):
-        pool_from_service_policy({**announcement, "supported_capabilities": ["legacy/v1"]}, **kw)
-    with pytest.raises(SeedPoolError):
-        pool_from_service_policy({**announcement, "pool_randomness": ""}, **kw)
-    with pytest.raises(SeedPoolError):
-        pool_from_service_policy({**announcement, "extra": 1}, **kw)
-
-
-def test_legacy_paths_stay_inert():
-    kw = {"environment": MATH, "prompt_idx": 7, "checkpoint_hash": "d" * 40}
-    assert pool_from_service_policy(None, **kw) is None
-    value = contract_v2_dict()
-    for env in value["environments"].values():
-        env["sampling"] = {"kind": "legacy/v1"}
-    contract = ServiceContract.from_dict(value)
-    announcement = {"contract": contract.to_dict(), "schedule": initial_schedule(contract).to_dict(),
-                    "checkpoint": {"checkpoint_n": 3, "repo": "models/test", "revision": "d" * 40, "sha256": "e" * 64},
-                    "supported_capabilities": sorted(SUPPORTED_V2_CAPABILITIES), "pool_epoch": 0,
-                    "pool_randomness": ""}
-    assert pool_from_service_policy(announcement, **kw) is None
-    with pytest.raises(SeedPoolError):
-        SeedPool.from_contract(contract, environment=MATH, prompt_idx=7, checkpoint_hash="d" * 40,
-                               pool_epoch=0, randomness="ab" * 32)

@@ -186,31 +186,6 @@ def test_rows_without_uniforms_keep_the_miner_token(monkeypatch, substitution):
     assert training._kl_telemetry_metrics(stats)["train/draw_coverage_ratio"] == 0.0
 
 
-def test_v_star_and_match_counts_are_the_verifiers(substitution):
-    """The training forward's per-rollout (n_stochastic, n_match) is the proof's own, and an
-    honest rollout's tokens are v* everywhere."""
-    model = _Model().to(torch.bfloat16)
-    rollouts = [_rollout(model, 0, 40), _rollout(model, 1, 40, honest=False)]
-    _grads(model, _plan(rollouts, [1.0, -1.0]))
-    for index, rollout in enumerate(rollouts):
-        tokens = rollout.tokens
-        with torch.no_grad():
-            hidden = model.model.emb(torch.tensor([tokens]))
-        head_model = SimpleNamespace(lm_head=model.lm_head, parameters=lambda: iter([torch.zeros(1)]))
-        with patch("reliquary.shared.forward.forward_single_layer", return_value=(hidden, None)), \
-             patch("reliquary.shared.hf_compat.resolve_hidden_size", return_value=_HIDDEN), \
-             patch.object(verifier, "_eos_set_from_model", return_value={0}):
-            proof = verifier.verify_commitment_proofs(
-                {"tokens": tokens, "commitments": [{"sketch": 0}] * len(tokens),
-                 "rollout": rollout.commit["rollout"]},
-                head_model, _RANDOMNESS, seed_u_values=_uniforms(index, 40),
-            )
-        assert rollout._training_draw_counts == (proof.seed_n_stochastic, proof.seed_n_match)
-    honest, random = rollouts[0]._training_draw_counts, rollouts[1]._training_draw_counts
-    assert honest[0] > 20 and honest[1] == honest[0]
-    assert random[1] < random[0] // 2
-
-
 def test_chunking_gives_identical_picks(substitution):
     gen = torch.Generator().manual_seed(3)
     logits = torch.randn(37, _VOCAB, generator=gen)

@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
-from pathlib import Path
-from typing import Iterator
 
 from reliquary.protocol.release_contract import canonical_json_bytes, canonical_sha256
 from reliquary.protocol.service_contract import ServiceContract, _integer, _identifier, _object, _sha
@@ -59,43 +56,3 @@ def observation_signal(row: dict, contract: ServiceContract):
                            sigma_min_bps=contract.to_dict()["scoring"]["sigma_min_bps"])
 
 
-class ObservationStore:
-    """SQLite gives atomic append/dedupe and a resumable ordered delta cursor."""
-
-    def __init__(self, path: str | Path, contract: ServiceContract):
-        self.contract = contract
-        self.db = sqlite3.connect(path, timeout=30)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("CREATE TABLE IF NOT EXISTS observations (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, context TEXT NOT NULL, payload TEXT NOT NULL)")
-        self.db.execute("CREATE INDEX IF NOT EXISTS observation_context ON observations(context, seq)")
-        self.db.commit()
-
-    def close(self) -> None:
-        self.db.close()
-
-    def append(self, row: dict) -> tuple[str, bool]:
-        value = validate_observation(row, self.contract)
-        identifier, payload = observation_id(value), canonical_json_bytes(value).decode()
-        with self.db:
-            inserted = self.db.execute("INSERT OR IGNORE INTO observations(id,context,payload) VALUES(?,?,?)",
-                                      (identifier, self.contract.context_sha256, payload)).rowcount == 1
-            existing = self.db.execute("SELECT payload FROM observations WHERE id=?", (identifier,)).fetchone()[0]
-            if existing != payload:
-                raise ValueError("observation identity already exists with different evidence")
-        return identifier, inserted
-
-    def deltas(self, *, after: int = 0, limit: int = 1000) -> Iterator[tuple[int, dict]]:
-        _integer(after, "after", 0)
-        _integer(limit, "limit", 1, 10000)
-        for seq, payload in self.db.execute("SELECT seq,payload FROM observations WHERE context=? AND seq>? ORDER BY seq LIMIT ?",
-                                            (self.contract.context_sha256, after, limit)):
-            yield seq, json.loads(payload)
-
-    def rows(self) -> Iterator[dict]:
-        for payload, in self.db.execute("SELECT payload FROM observations WHERE context=? ORDER BY seq", (self.contract.context_sha256,)):
-            yield json.loads(payload)
-
-    def snapshot(self) -> dict:
-        row = self.db.execute("SELECT COALESCE(MAX(seq),0),COUNT(*) FROM observations WHERE context=?", (self.contract.context_sha256,)).fetchone()
-        return {"schema": "observation-snapshot/v1", "context_sha256": self.contract.context_sha256,
-                "watermark": row[0], "count": row[1]}

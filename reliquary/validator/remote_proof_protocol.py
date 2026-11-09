@@ -1,42 +1,19 @@
-"""Versioned JSON boundary for the existing GRAIL proof kernel.
-
-Only sparse, finite proof outputs cross this boundary. Model tensors, Python
-callbacks and the local multiprocessing transport never do.
-"""
+"""JSON wire helpers of the remote RL audit host (``remote_rl_audit``): canonical bytes, bounded strict
+models and gzip request bodies."""
 from __future__ import annotations
 
 import hashlib
 import json
 import zlib
-from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_serializer, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
-from reliquary.protocol.toploc_wire import ProofB64
-from reliquary.shared.checkpoint_identity import canonical_checkpoint_identity
 from reliquary.shared.strict_json import strict_json_loads
 
-PROOF_PROTOCOL = "reliquary.remote-proof/v1"
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
-# One batch per training group. A group is B_BATCH=16 rollouts, so a batch of
-# four split every group across four round trips: measured in production each
-# trip cost ~1.2 s of which only ~0.44 s was the forward, i.e. ~60% of proof
-# wall time was round-trip overhead and windows could not fill.
-MAX_PROOF_BATCH = 16
-# Deliberately not MAX_PROOF_BATCH * MAX_REQUEST_BYTES. A sixteen-item batch
-# measures ~500 KB in production, so these ceilings already keep two orders of
-# magnitude of headroom, and a larger batch must not enlarge the buffer a
-# single mTLS peer can make the worker allocate.
-MAX_BATCH_REQUEST_BYTES = 4 * MAX_REQUEST_BYTES + 1024
-MAX_BATCH_RESPONSE_BYTES = 4 * MAX_RESPONSE_BYTES + 1024
-# Requests one slot holds at once: one on the GPU, the rest waiting their turn, so a
-# controller can keep uploads and downloads in flight while the GPU works.
-MAX_PROOF_PIPELINE_DEPTH = 4
 MAX_TOKENS = 65536
-Hash = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
-OID = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
 Name = Annotated[str, Field(min_length=1, max_length=192, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/@+#-]*$")]
 Count = Annotated[int, Field(ge=0, le=2**63-1)]
 Probability = Annotated[float, Field(ge=0, le=1)]
@@ -51,9 +28,7 @@ def digest(value: object) -> str:
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
-# The proof RPC is a latency path, so the marginal ratio above level 1 is not
-# worth its CPU: measured on real batches, level 1 gives -57% for 6.5 ms where
-# level 6 gives -60% for 25 ms.
+# Level 1: the audit RPC is a latency path and higher levels gain little for their CPU.
 GZIP_LEVEL = 1
 # Below this a compressed body is not smaller than the plain one.
 GZIP_MIN_BYTES = 1024
@@ -120,17 +95,6 @@ class InflateRequest:
         await self.app({**scope, "headers": headers}, inflated_receive, send)
 
 
-def transport_hash() -> str:
-    """Pin the adapter as well as the unchanged kernel capacity contract."""
-    root = Path(__file__).parent
-    return digest({name: hashlib.sha256((root / name).read_bytes()).hexdigest()
-                   for name in ("remote_proof_protocol.py", "remote_proof.py",
-                                "remote_proof_server.py", "proof_worker.py",
-                                "proof_measurements.py", "batcher.py", "service.py",
-                                "proof_stress.py", "proof_capacity_combined.py",
-                                "remote_rl_audit.py")})
-
-
 class WireModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
 
@@ -139,245 +103,3 @@ class WireModel(BaseModel):
         if len(body) > limit:
             raise ValueError("remote proof message is too large")
         return cls.model_validate(strict_json_loads(body))
-
-
-class CheckpointBinding(WireModel):
-    profile_id: Name
-    generation_contract_sha256: Hash
-    training_run_id: Name
-    checkpoint_n: Count
-    repo_id: Name
-    revision: OID
-
-    @model_validator(mode="after")
-    def canonical_identity(self):
-        canonical_checkpoint_identity(self.checkpoint_n, self.repo_id, self.revision)
-        return self
-
-
-class RemoteProofMeasurement(WireModel):
-    protocol: Literal[PROOF_PROTOCOL] = PROOF_PROTOCOL
-    worker_id: Name
-    transport_sha256: Hash
-    pipeline_depth: Annotated[int, Field(ge=1, le=MAX_PROOF_PIPELINE_DEPTH)]
-    measurement_scope: Literal["validator-end-to-end-mtls"] = "validator-end-to-end-mtls"
-
-
-class Sketch(WireModel):
-    sketch: Annotated[int, Field(ge=0, le=2**63-1)]
-
-
-class ProofInput(WireModel):
-    tokens: Annotated[list[Annotated[int, Field(ge=0, le=2**31-1)]], Field(min_length=1, max_length=MAX_TOKENS)]
-    commitments: Annotated[list[Sketch], Field(min_length=1, max_length=MAX_TOKENS)]
-    # Existing, versioned rollout metadata includes the episode transcript.
-    # JSON values preserve that contract without admitting Python objects.
-    rollout: dict[str, JsonValue]
-    randomness: Annotated[str, Field(min_length=2, max_length=256, pattern=r"^(?:0x)?[0-9a-fA-F]+$")]
-    seed_u_values: Annotated[list[Probability], Field(max_length=MAX_TOKENS)] | None
-    # Sent only when the task's contract names toploc; the spec is the
-    # validator's, from its contract, never the miner's.
-    toploc_proofs: Annotated[list[ProofB64], Field(max_length=MAX_TOKENS)] | None = None
-    toploc_spec: dict[str, JsonValue] | None = None
-
-    @model_validator(mode="after")
-    def aligned(self):
-        if len(self.tokens) != len(self.commitments):
-            raise ValueError("one sketch per token is required")
-        return self
-
-    def commit(self) -> dict:
-        commit = {"tokens": self.tokens,
-                  "commitments": [x.model_dump() for x in self.commitments],
-                  "rollout": self.rollout}
-        if self.toploc_proofs is not None:
-            commit["toploc_proofs"] = list(self.toploc_proofs)
-        if self.toploc_spec is not None:
-            commit["toploc_spec"] = dict(self.toploc_spec)
-        return commit
-
-
-class ProofRequest(WireModel):
-    protocol: Literal[PROOF_PROTOCOL] = PROOF_PROTOCOL
-    job_id: Name
-    attempt: Annotated[int, Field(ge=0, le=16)]
-    worker_id: Name
-    session_id: Name
-    device_id: Name
-    runtime_hash: Hash
-    checkpoint: CheckpointBinding
-    window: Count
-    environment: Name
-    expires_at_ms: Count
-    content_sha256: Hash
-    payload: ProofInput
-
-    @model_validator(mode="after")
-    def bound_content(self):
-        if self.content_sha256 != digest(self.payload.model_dump()):
-            raise ValueError("proof content digest mismatch")
-        return self
-
-
-_EPISODE_STOP_FIELDS = ("episode_stop_picks_ok", "episode_stop_first_bad_turn", "episode_stop_cdf_miss")
-
-
-class ProofValues(WireModel):
-    all_passed: bool
-    passed: Count
-    checked: Count
-    sketch_diff_max: Count
-    has_sparse_outputs: Literal[True]
-    p_stop: Probability | None
-    challenge_lp_indices: list[Count]
-    challenge_lp_values: list[float]
-    completion_chosen_probs: list[Probability]
-    completion_argmax_probs: list[Probability]
-    completion_argmax_ids: list[Count]
-    completion_entropies: list[Annotated[float, Field(ge=0)]]
-    hidden_start_f16_b64: str | None
-    hidden_delta_f16_b64: str | None
-    hidden_dim: Count
-    hidden_end_completion_offset: Count | None
-    representation_shift_l2: Annotated[float, Field(ge=0)] | None
-    seed_n_stochastic: Count
-    seed_n_match: Count
-    seed_n_positions: Count
-    seed_n_boundary_match: Count
-    seed_n_hard_mismatch: Count
-    seed_n_deterministic_hard_mismatch: Count
-    seed_n_miss_gt_0_01: Count
-    seed_n_miss_gt_0_05: Count
-    seed_n_miss_gt_0_10: Count
-    seed_max_cdf_miss: Probability
-    seed_first_hard_mismatch_offset: Count | None
-    terminal_pick_ok: bool | None
-    terminal_pick_cdf_miss: Probability | None
-    natural_close_pick_ok: bool | None
-    natural_close_pick_cdf_miss: Probability | None
-    toploc_checked: bool = False
-    toploc_passed: bool = False
-    toploc_reason: Annotated[str, Field(max_length=64)] | None = None
-    toploc_worst_exp: Count = 0
-    toploc_worst_mant_mean: Annotated[float, Field(ge=0)] = 0.0
-    toploc_worst_mant_median: Annotated[float, Field(ge=0)] = 0.0
-    # An older worker omits them (None): the batcher then has no stop verdict.
-    episode_stop_picks_ok: bool | None = None
-    episode_stop_first_bad_turn: Count | None = None
-    episode_stop_cdf_miss: Probability | None = None
-
-    @model_serializer(mode="wrap")
-    def _omit_absent_episode_stop(self, handler):
-        # A legacy proof result is byte-identical to the pre-2C wire: the three keys appear only when set.
-        data = handler(self)
-        for name in _EPISODE_STOP_FIELDS:
-            if data.get(name) is None:
-                data.pop(name, None)
-        return data
-
-    @model_validator(mode="after")
-    def aligned(self):
-        if self.passed > self.checked or self.all_passed != (0 < self.checked == self.passed):
-            raise ValueError("inconsistent GRAIL counters")
-        if len(self.challenge_lp_indices) != len(self.challenge_lp_values):
-            raise ValueError("logprob challenges are not aligned")
-        if not (len(self.completion_chosen_probs) == len(self.completion_argmax_probs)
-                == len(self.completion_argmax_ids)):
-            raise ValueError("token authenticity vectors are not aligned")
-        return self
-
-    @classmethod
-    def from_kernel(cls, result):
-        return cls.model_validate({name: getattr(result, name)
-                                   for name in cls.model_fields})
-
-    def to_kernel(self):
-        from reliquary.validator.verifier import ProofResult
-        return ProofResult(**self.model_dump())
-
-    def validate_input_coverage(self, payload: ProofInput) -> None:
-        from reliquary.validator.verifier import (
-            _UTILITY_ENTROPY_MAX_POSITIONS, _stratified_indices,
-            policy_token_positions, proof_challenge_indices,
-        )
-        positions = policy_token_positions(payload.tokens, payload.rollout)
-        challenges = proof_challenge_indices(payload.tokens, payload.rollout, payload.randomness)
-        if self.checked != len(challenges) or len(self.completion_chosen_probs) != len(positions):
-            raise ValueError("remote proof did not cover every required token/challenge")
-        # Utility entropy is optional and sampled by the real kernel. Policy
-        # probabilities/argmax retain full coverage, independently of telemetry.
-        entropy_count = len(_stratified_indices(len(positions), _UTILITY_ENTROPY_MAX_POSITIONS))
-        if self.completion_entropies and len(self.completion_entropies) != entropy_count:
-            raise ValueError("remote proof entropy vector is incomplete")
-        if any(index not in positions for index in self.challenge_lp_indices):
-            raise ValueError("remote logprob result refers to another policy span")
-
-
-class ProofResponse(WireModel):
-    protocol: Literal[PROOF_PROTOCOL] = PROOF_PROTOCOL
-    request_sha256: Hash
-    job_id: Name
-    attempt: Count
-    worker_id: Name
-    session_id: Name
-    device_id: Name
-    runtime_hash: Hash
-    checkpoint: CheckpointBinding
-    window: Count
-    environment: Name
-    content_sha256: Hash
-    result: ProofValues
-
-
-class ProofBatchRequest(WireModel):
-    items: Annotated[list[ProofRequest], Field(min_length=1, max_length=MAX_PROOF_BATCH)]
-
-    @model_validator(mode="after")
-    def same_slot(self):
-        first = self.items[0]
-        fields = ("worker_id", "session_id", "device_id", "runtime_hash",
-                  "checkpoint", "window", "environment")
-        if any(any(getattr(item, key) != getattr(first, key) for key in fields)
-               for item in self.items):
-            raise ValueError("proof batch must share one slot, window and checkpoint")
-        if len({(item.job_id, item.attempt) for item in self.items}) != len(self.items):
-            raise ValueError("duplicate proof attempt in batch")
-        return self
-
-
-class ProofBatchResponse(WireModel):
-    items: Annotated[list[ProofResponse], Field(min_length=1, max_length=MAX_PROOF_BATCH)]
-
-
-class AdoptionRequest(WireModel):
-    protocol: Literal[PROOF_PROTOCOL] = PROOF_PROTOCOL
-    worker_id: Name
-    session_id: Name
-    checkpoint: CheckpointBinding
-
-
-class SlotState(WireModel):
-    device_id: Name
-    physical_device: Name
-    hardware_class: Annotated[str, Field(min_length=1, max_length=256)]
-    device_uuid: Name
-    revision: OID | None
-    runtime: dict[str, JsonValue]
-
-
-class ProofHealth(WireModel):
-    utility_telemetry_enabled: bool
-    protocol: Literal[PROOF_PROTOCOL] = PROOF_PROTOCOL
-    worker_id: Name
-    session_id: Name
-    profile_id: Name
-    generation_contract_sha256: Hash
-    training_run_id: Name
-    repo_id: Name
-    software_revision: OID
-    proof_path_hash: Hash
-    transport_sha256: Hash
-    checkpoint: CheckpointBinding | None
-    slots: Annotated[list[SlotState], Field(min_length=1, max_length=64)]
-    config: dict[str, JsonValue]
-    generation_config: dict[str, JsonValue]

@@ -76,15 +76,3 @@ def _legacy_walk():
     return prices
 
 
-def test_the_legacy_price_params_and_walk_are_mains(monkeypatch):
-    import dataclasses
-
-    from reliquary.validator import emission_price as ep
-
-    if ep.PRICE_RISE != 1.0:
-        pytest.skip("RELIQUARY_EMISSION_PRICE_RISE is set in this environment")
-    params = dataclasses.asdict(ep.PRODUCTION_PRICE_PARAMS)
-    params.pop("rise"), params.pop("rise_wait_fraction")
-    expected = FIXTURE["expected_legacy_price"]
-    assert params == expected["price_params"]
-    assert json.loads(json.dumps(_legacy_walk())) == expected["walk"]

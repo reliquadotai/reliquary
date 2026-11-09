@@ -161,27 +161,6 @@ def test_anything_but_the_legacy_task_alone_does_not_arm_the_fallback():
     assert legacy_registry_fallback({}, []) is False
 
 
-def test_both_call_sites_use_the_shared_predicate():
-    """The two fallbacks were written independently, already differed in
-    subject, and nothing linked them."""
-    import pathlib
-    import subprocess
-
-    root = pathlib.Path(__file__).resolve().parents[2] / "reliquary"
-    for module in ("cli/main.py", "validator/weight_only.py"):
-        text = (root / module).read_text()
-        assert "legacy_registry_fallback" in text, module
-
-    # And neither re-implements it: no call site still spells the condition
-    # out against DEFAULT_TASK_ID by hand.
-    hits = subprocess.run(
-        ["grep", "-n", "DEFAULT_TASK_ID",
-         str(root / "cli" / "main.py"), str(root / "validator" / "weight_only.py")],
-        capture_output=True, text=True,
-    ).stdout.strip()
-    assert hits == "", f"a fallback predicate is still written by hand:\n{hits}"
-
-
 def test_the_declared_verification_replica_reaches_the_task_config():
     """What the registry pins is what the proof plane is built with."""
     from reliquary.validator.task_config import legacy_task_config

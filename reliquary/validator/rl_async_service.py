@@ -1,5 +1,5 @@
-"""The async RL validator service (rl-async-design.md §3; implementation map §9), behind one switch:
-``RELIQUARY_RL_MODE=async`` (default ``window``: the window service runs, unchanged).
+"""The async RL validator service (rl-async-design.md §3; implementation map §9), the only RL mode
+(``RELIQUARY_RL_MODE`` defaults to ``async`` and refuses anything else).
 
 One process on the controller, like the corpus validator: no window, batcher or proof plane.
 
@@ -7,7 +7,7 @@ One process on the controller, like the corpus validator: no window, batcher or 
   ``LeaseBook`` with its ``QuotaController`` and ``LeaseCollector``, ``RlSubmissions`` (grading, audits, events)
   with its ``TrainingBuffer``, the ``AsyncPriceController`` and the ``RlPayLedger``; plus the ``RlCheckpointBoard``
   over the trainer's index in the ``reliquary-public`` bucket.
-* **Routes** (``mount_rl_async``, through ``ValidatorServer.mount_rl_lease_router``): ``/rl/lease``, ``/rl/quota``,
+* **Routes** (``mount_rl_async``, through ``RlHttpApp.mount_rl_lease_router``): ``/rl/lease``, ``/rl/quota``,
   ``/rl/lease/mine``, ``/rl/lease/commitments``, ``/rl/prompts/state``, ``/rl/submit``, ``/rl/pay`` (replaces the
   window board's), ``/rl/checkpoint`` and ``/rl/observations`` (the scan log's signed head + presigned URLs).
 * **Trainer link** (``/rl/trainer/*``, bearer ``RELIQUARY_RL_TRAINER_TOKEN``) on its own listener,
@@ -61,7 +61,7 @@ from reliquary.shared.task_registry import RL_START_POOL_PARAM
 logger = logging.getLogger(__name__)
 
 RL_MODE_ENV = "RELIQUARY_RL_MODE"
-WINDOW, ASYNC = "window", "async"
+ASYNC = "async"
 TRAINER_TOKEN_ENV = "RELIQUARY_RL_TRAINER_TOKEN"
 TRAINER_BIND_ENV = "RELIQUARY_RL_TRAINER_BIND"
 DEFAULT_TRAINER_BIND = "127.0.0.1:8889"
@@ -119,9 +119,10 @@ CHECKPOINT_FOLLOW_EVERY_S = 10.0
 
 
 def rl_mode(env: Mapping[str, str] = os.environ) -> str:
-    value = str(env.get(RL_MODE_ENV, WINDOW)).strip().lower() or WINDOW
-    if value not in (WINDOW, ASYNC):
-        raise ValueError(f"{RL_MODE_ENV} must be {WINDOW!r} or {ASYNC!r}, got {value!r}")
+    """Async is the only RL mode; the windowed loop is retired."""
+    value = str(env.get(RL_MODE_ENV, ASYNC)).strip().lower() or ASYNC
+    if value != ASYNC:
+        raise ValueError(f"{RL_MODE_ENV} must be {ASYNC!r} (the windowed loop is retired), got {value!r}")
     return value
 
 
@@ -530,7 +531,7 @@ def build_rl_trainer_app(rl: RlAsync, *, token: str):
 # --- routes -----------------------------------------------------------------------------------------------------
 def mount_rl_async(server, rl: RlAsync, *, validator_hotkey: str, registration=None,
                    clock: Callable[[], float] = time.time) -> None:
-    """Serve the public async routes on ``server`` (a ``ValidatorServer``); each replaces an app route at the same
+    """Serve the public async routes on ``server`` (an ``RlHttpApp``); each replaces an app route at the same
     path. The trainer link is not among them (``build_rl_trainer_app``, its own listener)."""
     from reliquary.validator.rl_checkpoint import rl_checkpoint_response
     from reliquary.validator.rl_observations import rl_observations_response
@@ -895,8 +896,7 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     from reliquary.shared.log_levels import unmute_reliquary_loggers
     from reliquary.validator.corpus_settlement import R2Archives
     from reliquary.validator.corpus_validator import _run_corpus_services
-    from reliquary.validator.server import ValidatorServer
-    from reliquary.validator.service import _validator_state_dir
+    from reliquary.validator.rl_http import RlHttpApp, validator_state_dir
 
     unmute_reliquary_loggers()
     load_kwargs = dict(load_kwargs or {})
@@ -915,7 +915,7 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     episode_envs = await asyncio.to_thread(load_episode_environments, settings)
     grader, ranges = await asyncio.to_thread(_grader_for, list(settings.targets), checkpoint, load_kwargs,
                                              episode_envs, settings.episodes)
-    state_dir = _validator_state_dir()
+    state_dir = validator_state_dir()
     state_dir.mkdir(parents=True, exist_ok=True)
     rl = build_rl_async(settings, path=state_dir / DB_NAME, grader=grader, prompt_range=ranges)
     from reliquary.validator import telemetry
@@ -963,7 +963,7 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
                              registration=None if registered is None else registered.reason,
                              require_resources=True)
         await rl.sandbox.start()
-    server = ValidatorServer(http_host, http_port, emission_cap=cap)
+    server = RlHttpApp()
     mount_rl_async(server, rl, validator_hotkey=validator_hotkey,
                    registration=None if registered is None else registered.reason)
     from reliquary.validator.miner_setup import DB_NAME as SETUP_DB, MinerSetupStore, build_miner_setup_router
@@ -1013,14 +1013,14 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
         await asyncio.to_thread(rl.close)
         telemetry.finish()
 
-    background.append(server._monitor_process_health())
+    background.append(server.monitor_process_health())
     await _run_corpus_services(http, background, cleanup=cleanup)
 
 
 __all__ = [
     "ASYNC", "AUDIT_DEVICE_ENV", "AUDIT_SOURCE_ENV", "AuditModel", "MAX_TRAINER_AUDITS", "DB_NAME", "LEASE_MARGIN_PARAM", "LEASE_SPEED_PARAM", "PENDING_PARAM",
     "PLANNED_TOKENS_PARAM", "PRICE_TICK_PARAM", "RL_MODE_ENV", "RUN_ENV", "RlAsync", "RlAsyncSettings", "START_POOL_PARAM",
-    "TRAINER_BIND_ENV", "TRAINER_INSECURE_BIND_ENV", "TRAINER_TOKEN_ENV", "WINDOW", "audit_source", "build_rl_async", "build_rl_trainer_app",
+    "TRAINER_BIND_ENV", "TRAINER_INSECURE_BIND_ENV", "TRAINER_TOKEN_ENV", "audit_source", "build_rl_async", "build_rl_trainer_app",
     "build_rl_trainer_router", "index_signer_for", "mount_rl_async", "rl_async_loops", "rl_async_params",
     "episode_body_cap", "load_episode_environments", "renderer_for_checkpoint", "rl_async_settings", "rl_mode",
     "run_rl_async_validator", "trainer_bind", "wire_episode_sandbox",

@@ -47,67 +47,7 @@ def _plain(value: Any) -> Any:
 
 # ------------------------------------------------------------------ training payload
 
-def _decoded(blob: bytes) -> dict:
-    from reliquary.shared.training_payload import decode_training_payload
-
-    decoded = decode_training_payload(blob)
-    return {"schema_version": decoded.schema_version, "batches": _plain(decoded.batches())}
-
-
-def payload() -> dict:
-    import numpy as np
-
-    from tests.unit.test_training_payload_codec import _payload_bytes
-
-    blob = _payload_bytes()
-    with np.load(io.BytesIO(blob), allow_pickle=False) as npz:
-        header = json.loads(bytes(npz["header"]))
-        arrays = {name: _sha(npz[name].tobytes()) for name in sorted(npz.files) if name != "header"}
-    historical = (Path(__file__).parents[1] / "fixtures/payloads/historical-episode-schema3.npz").read_bytes()
-    return {
-        "single_turn_header": header,
-        "single_turn_arrays": arrays,
-        "single_turn_decoded": _json_sha(_decoded(blob)),
-        "historical_episode_v1_decoded": _json_sha(_decoded(historical)),
-    }
-
-
 # ------------------------------------------------------------------ the submission wire
-
-def _rollout_meta_refused(meta: dict) -> bool:
-    from pydantic import ValidationError
-
-    from reliquary.protocol.submission import RolloutMetadata
-
-    try:
-        RolloutMetadata.model_validate(meta)
-    except ValidationError:
-        return True
-    return False
-
-
-def submission() -> dict:
-    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
-    from reliquary.protocol.submission import BatchSubmissionRequest, RolloutMetadata
-    from tests.unit.test_batch_submission_schema import _valid_rollouts
-    from tests.unit.test_episode_protocol import _episode_commit
-
-    request = BatchSubmissionRequest(miner_hotkey="hk" * 24, prompt_idx=42, window_start=1000,
-                                     merkle_root="00" * 32, rollouts=_valid_rollouts(k=4),
-                                     checkpoint_hash="sha256:test")
-    single = dict(request.rollouts[0].commit["rollout"])
-    episode = _episode_commit()["rollout"]
-    over = {**single, "completion_length": MAX_NEW_TOKENS_PROTOCOL_CAP + 1}
-    episode_over = {**episode, "completion_length": MAX_NEW_TOKENS_PROTOCOL_CAP + 1}
-    return {
-        "request_json": _sha(request.model_dump_json().encode()),
-        "request_dump": _json_sha(request.model_dump()),
-        "single_turn_meta": RolloutMetadata.model_validate(single).model_dump_json(),
-        "episode_v1_meta": _sha(RolloutMetadata.model_validate(episode).model_dump_json().encode()),
-        "over_cap_refused": [_rollout_meta_refused(over), _rollout_meta_refused(episode_over)],
-        "cap_accepted": _rollout_meta_refused({**single, "completion_length": MAX_NEW_TOKENS_PROTOCOL_CAP}),
-    }
-
 
 # ------------------------------------------------------------------ what a commit signature is checked against
 
@@ -173,139 +113,10 @@ def signature_messages() -> dict:
 
 # ------------------------------------------------------------------ the remote proof wire
 
-def proof_wire() -> dict:
-    from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS
-    from reliquary.validator import batcher
-    from reliquary.validator.remote_proof_protocol import ProofInput, ProofValues, canonical_bytes
-    from tests.unit.proof_worker_support import proof_result_handler
-
-    result = proof_result_handler({"calls": 0}, {"tokens": list(range(8))}, "ab", None)
-    toploc = copy.copy(result)
-    toploc.toploc_checked, toploc.toploc_passed, toploc.toploc_reason = True, False, "exp_mismatch"
-    commit = {"tokens": [5, 6, 7, 8], "commitments": [{"sketch": 0}] * 4,
-              "rollout": {"prompt_length": 2, "completion_length": 2}, "toploc_proofs": ["/9kAAQ=="]}
-    profile = SimpleNamespace(proofs=(TOPLOC_DEPLOYED_DEFAULTS,))
-    prove = getattr(batcher, "_proof_commit", batcher._with_toploc_spec)
-    sent = {}
-    for name, active in (("with_toploc", profile), ("without_toploc", SimpleNamespace(proofs=()))):
-        try:
-            proof_commit = prove(copy.deepcopy(commit), active)
-        except Exception as exc:          # a profile shape this tree does not read: say so, never guess
-            sent[name] = f"error:{type(exc).__name__}"
-            continue
-        payload = ProofInput(tokens=proof_commit["tokens"], commitments=proof_commit["commitments"],
-                             rollout=proof_commit["rollout"], randomness="ab", seed_u_values=None,
-                             toploc_proofs=proof_commit.get("toploc_proofs"),
-                             toploc_spec=proof_commit.get("toploc_spec"))
-        sent[name] = [_sha(canonical_bytes(proof_commit)), _sha(canonical_bytes(payload.model_dump()))]
-    return {
-        "proof_values": canonical_bytes(ProofValues.from_kernel(result).model_dump()).decode(),
-        "proof_values_toploc": canonical_bytes(ProofValues.from_kernel(toploc).model_dump()).decode(),
-        "proof_input": sent,
-    }
-
-
 # ------------------------------------------------------------------ a single-turn v2 order
 
 def _without_ids(value: dict) -> dict:
     return {k: v for k, v in value.items() if k not in ("id", "observation_id")}
-
-
-def single_turn_v2() -> dict:
-    from reliquary.protocol.release_contract import canonical_json_bytes
-    from tests.unit import test_service_runtime_v2 as rt_tests
-    from tests.unit.service_v2_fixtures import contract_v2
-
-    contract = contract_v2()
-    with tempfile.TemporaryDirectory() as tmp:
-        rt = rt_tests.runtime(Path(tmp))
-        try:
-            announcement = rt.announcement(window=1, randomness=rt_tests.WINDOW_BEACON)
-            explored = rt_tests.explore(rt)
-            trained = rt_tests.train(rt, prompt=9)
-            # Observation ids are salted per runtime (random): everything else of each event is compared.
-            events = [_without_ids(e) for _, e in rt.events(limit=10_000)]
-            envelope = rt.envelope(1)
-        finally:
-            rt.close()
-    return {
-        "contract_sha256": contract.sha256,
-        "contract_bytes": _sha(canonical_json_bytes(contract.to_dict())),
-        "announcement": _sha(canonical_json_bytes(announcement)),
-        "supported_capabilities": announcement["supported_capabilities"],
-        "explored": _json_sha(_without_ids(explored)),
-        "trained": _json_sha(_without_ids(trained)),
-        "events": _json_sha(events),
-        "envelope": _json_sha(envelope),
-    }
-
-
-def multi_turn_v2() -> dict:
-    """A multi-turn (signed-episode) order with nothing added to its schedule and no add request: the order and
-    schedule digests, the announcements, the public pool and a precommit, the runtime's events, envelope and
-    reconciled archive, the settlement record, its replay and the weights it pays."""
-    from types import SimpleNamespace
-
-    from reliquary.protocol.release_contract import canonical_json_bytes
-    from reliquary.protocol.service_schedule import initial_schedule
-    from reliquary.services.settlement import settle_window
-    from reliquary.shared.task_registry import MECHANISM_SERVICE_RL
-    from reliquary.validator.weight_only import WeightOnlyValidator
-    from tests.unit import test_service_runtime_v2 as rt_tests
-    from tests.unit.episode_v2_fixtures import EPISODE, episode_contract, episode_pool, episode_precommit
-    from tests.unit.service_v2_fixtures import MATH, contract_v2
-
-    contract = episode_contract()
-    schedule = initial_schedule(contract)
-    with tempfile.TemporaryDirectory() as tmp:
-        rt = rt_tests.build(Path(tmp) / "runtime.sqlite3", contract)
-        rt.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision="d" * 40)
-        rt_tests.open_window(rt, 1, pools={MATH: rt_tests.POOL, EPISODE: rt_tests.POOL})
-        try:
-            announcement = rt.announcement(window=1, randomness=rt_tests.WINDOW_BEACON)
-            per_env = {name: _sha(canonical_json_bytes(rt.announcement(window=1, randomness=rt_tests.WINDOW_BEACON,
-                                                                       environment=name)))
-                       for name in sorted(contract.environments)}
-            explored = rt_tests.explore(rt)
-            trained = rt_tests.train(rt, prompt=9)
-            events = [_without_ids(e) for _, e in rt.events(limit=10_000)]
-            envelope = rt.envelope(1)
-            reconciled = rt.reconcile_archive(rt_tests.archive(batch=[("t", MATH, 9)]), now=10_100.0)
-        finally:
-            rt.close()
-    settled_envelope = {"order_sha256": contract.sha256, "schedule": schedule.to_dict(),
-                        "schedule_sha256": schedule.sha256, "pools": {MATH: 0.25, EPISODE: 0.25}, "picks_target": 2,
-                        "batch_slots": 4, "checkpoint": {"checkpoint_n": 1, "repo": "models/test",
-                                                         "revision": "d" * 40, "sha256": "b" * 64}}
-    archive = {"window_start": 3, "window_status": "complete", "rewards_by_hotkey": {},
-               "batch": [{"hotkey": "a", "env_name": MATH, "prompt_idx": 0},
-                         {"hotkey": "b", "env_name": EPISODE, "prompt_idx": 1}]}
-    record = settle_window(archive=archive, envelope=settled_envelope, contract=contract,
-                           exploration={MATH: {"x": 1}}, aborted=False)
-    record = {**json.loads(json.dumps(record)), "task_id": "next-rl"}
-    declared = {"next-rl": SimpleNamespace(mechanism=MECHANISM_SERVICE_RL, service_contract=contract.to_dict(),
-                                           params={"cap": 0.5})}
-    replayed = WeightOnlyValidator._validated_service_archives([record], declared, geometry=(2, 4))
-    weights = WeightOnlyValidator._replay_ema(replayed, caps={"next-rl": 0.5}, service_tasks=frozenset({"next-rl"}))
-    return {
-        "contract_sha256": contract.sha256,
-        "contract_bytes": _sha(canonical_json_bytes(contract.to_dict())),
-        "schedule_sha256": schedule.sha256,
-        "schedule_bytes": _sha(canonical_json_bytes(schedule.to_dict())),
-        "single_turn_schedule_sha256": initial_schedule(contract_v2()).sha256,
-        "announcement": _sha(canonical_json_bytes(announcement)),
-        "announcement_per_env": per_env,
-        "pool": episode_pool(contract).sha256,
-        "precommit": episode_precommit(contract, hotkey="5Hot").sha256,
-        "explored": _json_sha(_without_ids(explored)),
-        "trained": _json_sha(_without_ids(trained)),
-        "events": _json_sha(events),
-        "envelope": _json_sha(envelope),
-        "reconciled": _json_sha(_without_ids(reconciled)),
-        "settled": _json_sha(record),
-        "replayed": _json_sha(replayed),
-        "weights": _json_sha(weights),
-    }
 
 
 # ------------------------------------------------------------------ registered environments
@@ -341,13 +152,3 @@ def corpus_sessions() -> dict:
     }
 
 
-def probe() -> dict:
-    return {
-        "payload": payload(),
-        "submission": submission(),
-        "signature_messages": signature_messages(),
-        "proof_wire": proof_wire(),
-        "single_turn_v2": single_turn_v2(),
-        "environments": environments(),
-        "corpus_sessions": corpus_sessions(),
-    }

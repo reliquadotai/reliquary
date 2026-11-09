@@ -23,7 +23,7 @@ from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from reliquary.validator.rl_async_service import (  # noqa: E402
-    ASYNC, AuditModel, PLANNED_TOKENS_PARAM, WINDOW, RlAsyncSettings, build_rl_async, build_rl_trainer_app,
+    ASYNC, AuditModel, PLANNED_TOKENS_PARAM, RlAsyncSettings, build_rl_async, build_rl_trainer_app,
     build_rl_trainer_router, mount_rl_async, rl_async_loops, rl_async_settings, rl_mode, trainer_bind,
 )
 from tests.unit.test_rl_submit import CAP, ENV, MathEnv, Tokenizer, group  # noqa: E402
@@ -39,8 +39,10 @@ def small_cap(monkeypatch):
     monkeypatch.setattr("reliquary.validator.rl_submit.max_new_tokens_for_environment", lambda env: CAP)
 
 
-def test_the_mode_switch_defaults_to_windows():
-    assert rl_mode({}) == WINDOW and rl_mode({"RELIQUARY_RL_MODE": " Async "}) == ASYNC
+def test_async_is_the_only_rl_mode():
+    assert rl_mode({}) == ASYNC and rl_mode({"RELIQUARY_RL_MODE": " Async "}) == ASYNC
+    with pytest.raises(ValueError, match="retired"):
+        rl_mode({"RELIQUARY_RL_MODE": "window"})
     with pytest.raises(ValueError):
         rl_mode({"RELIQUARY_RL_MODE": "both"})
 
@@ -146,10 +148,10 @@ def components(tmp_path, board=None):
 
 
 def test_the_run_benchmark_feed_is_served_from_the_private_bucket(tmp_path):
-    from reliquary.validator.server import ValidatorServer
+    from reliquary.validator.rl_http import RlHttpApp
 
     rl = components(tmp_path)
-    server = ValidatorServer()
+    server = RlHttpApp()
     mount_rl_async(server, rl, validator_hotkey=VALIDATOR.ss58_address)
     public = TestClient(server.app)
     assert public.get("/rl/benchmarks", params={"run_id": "abc-r1-trainer"}).status_code == 404   # none yet
@@ -222,7 +224,7 @@ def test_the_trainer_takes_the_audits_and_reports_their_verdicts_through_its_lin
 
 def test_the_trainer_link_has_its_own_listener_never_the_public_port(tmp_path):
     from reliquary.trainer.rl_link import TrainerLink
-    from reliquary.validator.server import ValidatorServer
+    from reliquary.validator.rl_http import RlHttpApp
 
     assert trainer_bind({}) == ("127.0.0.1", 8889)
     with pytest.raises(ValueError, match="not loopback"):                 # plain HTTP, a token that mints pay
@@ -240,7 +242,7 @@ def test_the_trainer_link_has_its_own_listener_never_the_public_port(tmp_path):
             return {"index": {"latest": {"version": 3}}, "signature": "s"}
 
     rl = components(tmp_path, board=Board())
-    server = ValidatorServer()
+    server = RlHttpApp()
     mount_rl_async(server, rl, validator_hotkey=VALIDATOR.ss58_address)
     public = TestClient(server.app)
     auth = {"Authorization": f"Bearer {TOKEN}"}
@@ -383,7 +385,7 @@ async def test_end_to_end_lease_submit_train_pay_and_sync(tmp_path):
     from reliquary.trainer.ckpt_publisher import DeltaPublisher
     from reliquary.trainer.rl_link import TrainerLink
     from reliquary.validator.rl_checkpoint import RlCheckpointBoard
-    from reliquary.validator.server import ValidatorServer
+    from reliquary.validator.rl_http import RlHttpApp
 
     started = time.monotonic()
     store = MemoryStore()
@@ -391,7 +393,7 @@ async def test_end_to_end_lease_submit_train_pay_and_sync(tmp_path):
                               sign_fn=lambda payload: VALIDATOR.sign(payload), validator_hotkey=VALIDATOR.ss58_address,
                               presign=lambda key: f"mem://{key}", refresh_seconds=0)
     rl = components(tmp_path, board=board)
-    server = ValidatorServer()
+    server = RlHttpApp()
     mount_rl_async(server, rl, validator_hotkey=VALIDATOR.ss58_address)
     served, trainer_served = Served(server.app), Served(build_rl_trainer_app(rl, token=TOKEN))
     try:
@@ -539,7 +541,7 @@ def test_mine_async_finds_the_validator_on_the_metagraph(monkeypatch):
     from typer.testing import CliRunner
 
     import reliquary.cli.main as cli
-    from reliquary.miner.submitter import discover_validator
+    from reliquary.miner.discovery import discover_validator
 
     meta = SimpleNamespace(validator_permit=[False, True], hotkeys=["5Miner", "5Validator"],
                            axons=[SimpleNamespace(ip="9.9.9.9", port=1), SimpleNamespace(ip="1.2.3.4", port=8888)])

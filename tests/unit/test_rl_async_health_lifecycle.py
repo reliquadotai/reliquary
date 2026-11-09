@@ -14,10 +14,10 @@ def test_async_serving_refreshes_readiness_and_awaits_monitor_shutdown(
     monkeypatch, tmp_path, health_status, expected_http,
 ):
     from reliquary.infrastructure import corpus_period_store
-    from reliquary.validator import corpus_settlement, rl_async_service, server as server_module, telemetry
+    from reliquary.validator import corpus_settlement, rl_async_service, rl_http as server_module, telemetry
 
     closed, servers, monitors, collected = [], [], [], []
-    real_server = server_module.ValidatorServer
+    real_server = server_module.RlHttpApp
     settings = SimpleNamespace(task_id="async-test", run="test", targets={"math": 1.0},
                                episodes={}, max_pending_groups=1, lane_reserves=dict)
     rl = SimpleNamespace(sandbox=None, book=SimpleNamespace(latest_checkpoint=None),
@@ -29,7 +29,7 @@ def test_async_serving_refreshes_readiness_and_awaits_monitor_shutdown(
 
     def construct_server(*args, **kwargs):
         server = real_server(*args, **kwargs)
-        assert server._process_health_snapshot["status"] == "pending"
+        assert server._process_health["status"] == "pending"
         servers.append(server)
         return server
 
@@ -43,12 +43,12 @@ def test_async_serving_refreshes_readiness_and_awaits_monitor_shutdown(
 
         async def serve(self):
             async def sampled():
-                while servers[0]._process_health_snapshot["status"] == "pending":
+                while servers[0]._process_health["status"] == "pending":
                     await asyncio.sleep(0)
 
             await asyncio.wait_for(sampled(), timeout=1)
             monitors.extend(task for task in asyncio.all_tasks()
-                            if task.get_coro().__name__ == "_monitor_process_health")
+                            if task.get_coro().__name__ == "monitor_process_health")
             assert len(monitors) == 1
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.config.app),
                                          base_url="http://test") as client:
@@ -71,7 +71,7 @@ def test_async_serving_refreshes_readiness_and_awaits_monitor_shutdown(
     monkeypatch.setattr(corpus_settlement, "R2Archives", lambda **kw: object())
     monkeypatch.setattr(telemetry, "init", lambda *a, **kw: None)
     monkeypatch.setattr(telemetry, "finish", lambda: closed.append("telemetry"))
-    monkeypatch.setattr(server_module, "ValidatorServer", construct_server)
+    monkeypatch.setattr(server_module, "RlHttpApp", construct_server)
     monkeypatch.setattr(server_module, "collect_process_health", collect)
     monkeypatch.setattr(uvicorn, "Server", HttpServer)
 
@@ -87,4 +87,3 @@ def test_async_serving_refreshes_readiness_and_awaits_monitor_shutdown(
     asyncio.run(exercise())
     assert collected == [health_status]
     assert closed == ["publisher", "rl", "telemetry"]
-    assert servers[0]._task is None                       # no legacy HTTP/admission startup

@@ -1,79 +1,23 @@
-"""Process-safe auction admission preparation.
-
-This module deliberately has no model or CUDA dependency. Production passes
-raw signed reveals through these functions in spawned processes, then commits
-only the compact validated result in the trainer process.
-"""
+"""Single-turn admission helpers shared by the async RL submission path and the environment scorers:
+termination classification, the trusted problem materials, and the registry's scoring adapters."""
 
 from __future__ import annotations
 
-import math
-import multiprocessing
-import os
-import signal
-import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Iterable, Iterator, Sequence
-
-from pydantic import ValidationError
+from typing import Any
 
 from reliquary.constants import (
-    BOOTSTRAP_SIGMA_MIN,
     BFT_ANSWER_BUDGET,
     BFT_THINKING_BUDGET,
-    FILL_CLOSED_ENABLED,
     GRADER_EVAL_TIMEOUT_SECONDS,
-    MATH_ANSWER_FORMAT,
-    ROBUST_TRUNCATION_UTILITY_ENABLED,
-    SIGMA_MIN,
-    episode_limits_for_environment,
     max_new_tokens_for_environment,
-    max_truncated_for_environment,
 )
-from reliquary.environment.grader_client import (
-    GraderClient,
-    GraderInfrastructureError,
-)
+from reliquary.environment.grader_client import GraderClient
 from reliquary.environment.opencodeinstruct import _entry_function_name, _extract_python
 from reliquary.environment.openmathinstruct import _compute_omi_reward
 from reliquary.environment.registry import get_environment_spec
-from reliquary.protocol.legacy_merkle import legacy_submission_merkle_matches
-from reliquary.protocol.signatures import (
-    verify_commit_signature,
-    verify_envelope_signature,
-)
-from reliquary.protocol.submission import (
-    BatchSubmissionRequest,
-    CommitModel,
-    RejectReason,
-)
-from reliquary.validator.boxed_integrity import (
-    has_malformed_final_answer,
-    is_missing_final_answer_box,
-)
-from reliquary.validator.dedup import compute_rollout_hash
-from reliquary.validator.rollout_patterns import detect_opposite_reward_clones
-from reliquary.validator.selection_digest import (
-    compute_rollouts_selection_digest,
-)
-
-
-@dataclass(frozen=True)
-class AdmissionReceiptBinding:
-    miner_hotkey: str
-    prompt_idx: int
-    window_start: int
-    merkle_root: str
-    checkpoint_hash: str
-    environment: str
-    payload_bytes: int
-    drand_round: int
-    protocol_version: int
-    nonce: str
-    generation_profile_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -95,35 +39,6 @@ class AdmissionContext:
     episode_max_tokens: int | None = None
 
 
-@dataclass
-class ParsedSubmission:
-    request: BatchSubmissionRequest | None
-    rollout_hashes: list[bytes]
-    selection_digest: bytes | None
-    reject_reason: RejectReason | None = None
-    reject_stage: str | None = None
-    legacy_merkle_status: str | None = None
-    body_parse_ms: float = 0.0
-    preparation_ms: float = 0.0
-    timed_out: bool = False
-
-
-@dataclass(frozen=True)
-class AdmissionRuntimeMaterials:
-    canonical_prompt_tokens: list[int] | None
-    problem: dict[str, Any]
-    completion_texts: list[str]
-    code_cases: list[dict[str, Any]] | None = None
-    reward_materials: Any = None
-
-    @property
-    def effective_reward_materials(self) -> Any:
-        return (
-            self.reward_materials
-            if self.reward_materials is not None
-            else self.code_cases
-        )
-
 
 @dataclass(frozen=True)
 class AdmissionProblemMaterials:
@@ -141,249 +56,8 @@ class AdmissionProblemMaterials:
         )
 
 
-@dataclass
-class PreparedSubmission:
-    request: BatchSubmissionRequest | None
-    completion_texts: list[str]
-    rewards: list[float]
-    rollout_hashes: list[bytes]
-    selection_digest: bytes | None
-    prompt_content_sha256: str = ""
-    target_content_sha256: str = ""
-    reject_reason: RejectReason | None = None
-    reject_stage: str | None = None
-    grader_failure_reason: str | None = None
-    legacy_merkle_status: str | None = None
-    body_parse_ms: float = 0.0
-    preparation_ms: float = 0.0
-    reward_grading_ms: float = 0.0
-    timed_out: bool = False
-    # True only after every rollout prefix matched the validator-rendered
-    # canonical prompt.  The parent process uses this authenticated signal to
-    # clear prompt-mismatch compatibility strikes even when a later, unrelated
-    # admission check rejects the group.
-    prompt_binding_verified: bool = False
-    # Rollouts that ran to the protocol cap without terminating. Carried to the
-    # auction so the group can be valued conservatively (a truncated rollout has
-    # no gradeable answer, and a miner can create one on purpose).
-    truncated_count: int = 0
-    truncated_index: int | None = None
-    # Math completions with no box score zero, but are uncertain for auction
-    # eligibility so deleting a box cannot manufacture useful variance.
-    unboxed_count: int = 0
-    # Service policy only (empty otherwise): which rollouts the length cap cut,
-    # and which have an untrusted reward (those, plus a missing box where the
-    # contract makes it uncertain).
-    truncated_indices: tuple[int, ...] = ()
-    uncertain_indices: tuple[int, ...] = ()
-    attainable_rewards: tuple[float, ...] = ()
-    robust_utility: float | None = None
-    # Completion-token telemetry used by training, archives and legacy-window
-    # recovery. Fixed-slot payment does not use it.
-    eos_tokens: int = 0
-    task_family: str | None = None
-    generator_version: str | None = None
-    operation_id: str | None = None
-    difficulty: int | None = None
-    # Parsed and authenticated, but its transcripts are still to be verified by the parent
-    # (``validator.episode_intake``); no reward, no lane yet.
-    episode_pending: bool = False
-
-
-class _AdmissionTimeout(TimeoutError):
-    pass
-
-
-_WORKER_TOKENIZER: Any | None = None
-
-
-def _guard_bittensor_queue_listener_eof_in_child() -> bool:
-    """Make bittensor's admission-child QueueListener exit cleanly on EOF.
-
-    Importing the signature verifier imports bittensor, whose global logger
-    starts a multiprocessing queue listener.  ``ProcessPoolExecutor`` retires
-    admission children after a bounded number of tasks; Python's process
-    teardown can close the queue pipe before that listener stops, producing a
-    noisy ``QueueListener ... EOFError`` thread traceback.
-
-    Do not close or join bittensor's queue here: doing so in a spawn initializer
-    can stall process-pool startup.  QueueListener treats ``None`` as its stop
-    sentinel, so translating teardown-only EOF/OSError to ``None`` preserves
-    normal logging while making retirement graceful.  The parent validator
-    logger is untouched.
-    """
-
-    if multiprocessing.parent_process() is None:
-        return False
-    try:
-        import bittensor as bt
-
-        logging_machine = getattr(bt, "logging", None)
-        listener = getattr(logging_machine, "_listener", None)
-        dequeue = getattr(listener, "dequeue", None)
-        if listener is None or not callable(dequeue):
-            return False
-        if getattr(listener, "_reliquary_eof_guarded", False):
-            return True
-
-        def _safe_dequeue(block: bool) -> Any:
-            try:
-                return dequeue(block)
-            except (EOFError, OSError):
-                return None
-
-        listener.dequeue = _safe_dequeue
-        listener._reliquary_eof_guarded = True
-        return True
-    except Exception:
-        # Logging cleanup must never prevent an admission worker from starting.
-        return False
-
-
-def initialize_admission_worker(tokenizer_json: str | None = None) -> None:
-    """Keep spawned admission children CPU-only and below control-plane priority."""
-    global _WORKER_TOKENIZER
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    os.environ["NVIDIA_VISIBLE_DEVICES"] = "void"
-    _guard_bittensor_queue_listener_eof_in_child()
-    try:
-        os.nice(5)
-    except OSError:
-        pass
-    if tokenizer_json:
-        from tokenizers import Tokenizer
-
-        _WORKER_TOKENIZER = Tokenizer.from_str(tokenizer_json)
-
-
-def admission_worker_ready(hold_seconds: float = 0.0) -> int:
-    """Small warm-up task that proves a spawned child ran its initializer."""
-    if _WORKER_TOKENIZER is None:
-        raise RuntimeError("admission worker tokenizer unavailable")
-    if hold_seconds > 0.0:
-        time.sleep(float(hold_seconds))
-    return os.getpid()
-
-
 _ADMISSION_DEADLINE = ContextVar("admission_deadline", default=None)
 
-
-@contextmanager
-def _deadline(deadline_monotonic: float) -> Iterator[None]:
-    remaining = float(deadline_monotonic) - time.monotonic()
-    if remaining <= 0.0:
-        raise _AdmissionTimeout("admission worker deadline exceeded")
-
-    def _raise_timeout(_signum: int, _frame: Any) -> None:
-        raise _AdmissionTimeout("admission worker deadline exceeded")
-
-    previous = signal.signal(signal.SIGALRM, _raise_timeout)
-    signal.setitimer(signal.ITIMER_REAL, remaining)
-    token = _ADMISSION_DEADLINE.set(deadline_monotonic)
-    try:
-        yield
-    finally:
-        _ADMISSION_DEADLINE.reset(token)
-        signal.setitimer(signal.ITIMER_REAL, 0.0)
-        signal.signal(signal.SIGALRM, previous)
-
-
-def _reject_parsed(
-    reason: RejectReason,
-    stage: str,
-    *,
-    request: BatchSubmissionRequest | None = None,
-    body_parse_ms: float = 0.0,
-    preparation_started: float,
-    legacy_merkle_status: str | None = None,
-    rollout_hashes: list[bytes] | None = None,
-    selection_digest: bytes | None = None,
-    timed_out: bool = False,
-) -> ParsedSubmission:
-    return ParsedSubmission(
-        request=request,
-        rollout_hashes=list(rollout_hashes or ()),
-        selection_digest=selection_digest,
-        reject_reason=reason,
-        reject_stage=stage,
-        legacy_merkle_status=legacy_merkle_status,
-        body_parse_ms=body_parse_ms,
-        preparation_ms=max(
-            0.0, (time.perf_counter() - preparation_started) * 1000.0
-        ),
-        timed_out=timed_out,
-    )
-
-
-def _binding_matches(
-    request: BatchSubmissionRequest,
-    binding: AdmissionReceiptBinding,
-) -> bool:
-    environments = {rollout.env_name for rollout in request.rollouts}
-    return (
-        request.miner_hotkey == binding.miner_hotkey
-        and request.prompt_idx == binding.prompt_idx
-        and request.window_start == binding.window_start
-        and request.merkle_root.lower() == binding.merkle_root.lower()
-        and request.checkpoint_hash == binding.checkpoint_hash
-        and environments == {binding.environment}
-        and request.drand_round == binding.drand_round
-        and request.protocol_version == binding.protocol_version
-        and request.generation_profile_id == binding.generation_profile_id
-        and request.nonce == binding.nonce
-    )
-
-
-def _tokens_valid(
-    tokens: list[int],
-    *,
-    vocab_size: int | None,
-    max_sequence_length: int,
-) -> bool:
-    if not tokens or len(tokens) > max_sequence_length:
-        return False
-    if vocab_size is None:
-        return all(isinstance(token, int) and token >= 0 for token in tokens)
-    return all(
-        isinstance(token, int) and 0 <= token < vocab_size for token in tokens
-    )
-
-
-def service_length_valid(
-    tokens: list[int],
-    meta: dict[str, Any],
-    environment: str,
-    *,
-    episode_max_tokens: int | None = None,
-) -> bool:
-    """Service path only: the rollout fits the environment's own length bound.
-
-    Completion length is at most ``max_new_tokens_for_environment`` (an episode: the whole episode is at most
-    its profile's ``max_episode_tokens``; a signed episode: its contract's ``episode_max_tokens``,
-    and it is refused without one). Shared by admission and the proof's pre-forward guard, so an oversize
-    payload is refused before it can reach the GPU."""
-    from reliquary.protocol.submission import is_signed_episode
-
-    meta = meta or {}
-    try:
-        prompt_length = int(meta.get("prompt_length", 0))
-    except (TypeError, ValueError, OverflowError):
-        return False
-    if prompt_length < 0 or prompt_length > len(tokens):
-        return False
-    episode = meta.get("episode")
-    if is_signed_episode(meta):
-        return episode_max_tokens is not None and 0 < prompt_length < len(tokens) <= episode_max_tokens
-    if isinstance(episode, dict):
-        limits = episode_limits_for_environment(environment)
-        if limits is not None:
-            return len(tokens) <= limits[1]
-    bound = max_new_tokens_for_environment(environment)
-    try:
-        claimed = int(meta.get("completion_length", len(tokens) - prompt_length))
-    except (TypeError, ValueError, OverflowError):
-        return False
-    return len(tokens) - prompt_length <= bound and claimed <= bound
 
 
 def _force_span_valid(
@@ -417,6 +91,7 @@ def _force_span_valid(
     return list(tokens[start:end]) == list(context.canonical_force_ids)
 
 
+
 def _forced_cap_termination(meta: dict[str, Any]) -> bool:
     if not meta.get("forced"):
         return False
@@ -433,6 +108,7 @@ def _forced_cap_termination(meta: dict[str, Any]) -> bool:
     return completion_length == (
         BFT_THINKING_BUDGET + (end - start) + BFT_ANSWER_BUDGET
     )
+
 
 
 def _natural_cap_termination(
@@ -466,29 +142,6 @@ def _natural_cap_termination(
     think_close = set(context.think_close_ids)
     return any(int(token) in think_close for token in phase_one)
 
-
-def submission_interaction_matches(request: BatchSubmissionRequest, environment: str) -> bool:
-    """Bind wire episode metadata to the registered environment before grading: a single-turn env takes
-    no episode, an Episode v1 env only Episode v1 metadata, a signed-episode env only signed
-    episodes."""
-    from reliquary.protocol.submission import is_signed_episode
-
-    try:
-        mode = get_environment_spec(environment).interaction_mode
-    except ValueError:
-        mode = "single_turn"
-    for rollout in request.rollouts:
-        meta = rollout.commit.get("rollout") or {}
-        value = meta.get("episode") if isinstance(meta, dict) else None
-        if mode not in ("episode", "signed_episode"):
-            if value is not None:
-                return False
-            continue
-        if not isinstance(value, dict):
-            return False
-        if is_signed_episode(meta) != (mode == "signed_episode"):
-            return False
-    return True
 
 
 def _classify_termination(rollout, context: AdmissionContext) -> str:
@@ -546,346 +199,6 @@ def _classify_termination(rollout, context: AdmissionContext) -> str:
     return "truncated"
 
 
-def count_truncated_rollouts(
-    request: BatchSubmissionRequest,
-    context: AdmissionContext,
-) -> int:
-    """How many rollouts ran to the protocol cap without terminating.
-
-    Feeds the auction's conservative valuation: a truncated rollout has no
-    gradeable answer, so the group is scored under the interpretation least
-    favourable to the miner (see ``conservative_difficulty_score``). Counting
-    only — admission acceptance is decided by ``_termination_reject``.
-    """
-    if not context.eos_token_ids:
-        return 0
-    return sum(
-        1
-        for rollout in request.rollouts
-        if _classify_termination(rollout, context) == "truncated"
-    )
-
-
-def truncated_rollout_indices(
-    request: BatchSubmissionRequest,
-    context: AdmissionContext,
-) -> tuple[int, ...]:
-    if not context.eos_token_ids:
-        return ()
-    return tuple(
-        index
-        for index, rollout in enumerate(request.rollouts)
-        if _classify_termination(rollout, context) == "truncated"
-    )
-
-
-def count_eos_completion_tokens(
-    request: BatchSubmissionRequest,
-    context: AdmissionContext,
-) -> int:
-    """Count validator-observed tokens in eligible EOS-terminated completions.
-
-    ``_classify_termination`` also accepts protocol-defined cap closures, so
-    this accounting path separately requires a genuine final EOS token. The
-    count comes from the validator-observed completion slice rather than a
-    miner-declared metadata value. The calculation is isolated behind the
-    disabled fill capability; existing production profiles continue to archive
-    ``eos_tokens=0``.
-    """
-    if not FILL_CLOSED_ENABLED:
-        return 0
-    if not context.eos_token_ids:
-        return 0
-    eos_ids = set(context.eos_token_ids)
-    total = 0
-    for rollout in request.rollouts:
-        if _classify_termination(rollout, context) != "ok":
-            continue
-        commit = rollout.commit
-        tokens = list(commit.get("tokens") or [])
-        meta = commit.get("rollout", {}) or {}
-        try:
-            prompt_length = int(meta.get("prompt_length", 0))
-            completion_length = int(meta.get("completion_length", 0))
-        except (TypeError, ValueError, OverflowError):
-            continue
-        completion = tokens[prompt_length: prompt_length + completion_length]
-        if completion and int(completion[-1]) in eos_ids:
-            total += len(completion)
-    return total
-
-
-def _termination_reject(
-    request: BatchSubmissionRequest,
-    context: AdmissionContext,
-) -> RejectReason | None:
-    eos_ids = set(context.eos_token_ids)
-    if not eos_ids:
-        return None
-    max_truncated = max_truncated_for_environment(
-        context.environment,
-        bootstrap=context.bootstrap,
-    )
-    truncated = 0
-    for rollout in request.rollouts:
-        kind = _classify_termination(rollout, context)
-        if kind == "bad_schema":
-            return RejectReason.BAD_SCHEMA
-        if kind == "tampered":
-            return RejectReason.TOKEN_TAMPERED
-        if kind == "bad_termination":
-            return RejectReason.BAD_TERMINATION
-        if kind == "truncated":
-            truncated += 1
-            # R21, as in the batcher: on the service path the robust rule prices every
-            # joint assignment of the capped rollouts; the count limit is legacy only.
-            if context.service_policy is None and truncated > max_truncated:
-                return RejectReason.BAD_TERMINATION
-    return None
-
-
-def parse_and_validate_submission(
-    raw_body: bytes,
-    binding: AdmissionReceiptBinding,
-    context: AdmissionContext,
-    deadline_monotonic: float,
-) -> ParsedSubmission:
-    """Parse and run every immutable structural/authenticity gate."""
-    started = time.perf_counter()
-    parse_ms = 0.0
-    request: BatchSubmissionRequest | None = None
-    try:
-        with _deadline(deadline_monotonic):
-            parse_started = time.perf_counter()
-            try:
-                request = BatchSubmissionRequest.model_validate_json(raw_body)
-            except ValidationError:
-                return _reject_parsed(
-                    RejectReason.BAD_SCHEMA,
-                    "schema",
-                    preparation_started=started,
-                )
-            parse_ms = (time.perf_counter() - parse_started) * 1000.0
-            request._payload_bytes = binding.payload_bytes
-            if not submission_interaction_matches(request, context.environment):
-                return _reject_parsed(
-                    RejectReason.BAD_SCHEMA, "environment_interaction",
-                    request=request, body_parse_ms=parse_ms,
-                    preparation_started=started,
-                )
-
-            if not _binding_matches(request, binding):
-                return _reject_parsed(
-                    RejectReason.PRECOMMIT_INVALID,
-                    "upload_precommit",
-                    request=request,
-                    body_parse_ms=parse_ms,
-                    preparation_started=started,
-                )
-            from reliquary.services.admission_policy import validate_submission_policy
-            try:
-                validate_submission_policy(request, context.service_policy)
-            except (ValueError, TypeError, KeyError):
-                return _reject_parsed(
-                    RejectReason.GENERATION_CONTRACT_MISMATCH, "service_contract",
-                    request=request, body_parse_ms=parse_ms, preparation_started=started,
-                )
-            if context.enforce_envelope_signature and not verify_envelope_signature(
-                miner_hotkey=request.miner_hotkey,
-                window_start=request.window_start,
-                prompt_idx=request.prompt_idx,
-                merkle_root=request.merkle_root,
-                checkpoint_hash=request.checkpoint_hash,
-                drand_round=request.drand_round,
-                randomness=context.randomness,
-                nonce=request.nonce,
-                protocol_version=request.protocol_version,
-                generation_profile_id=request.generation_profile_id,
-                envelope_signature=request.envelope_signature,
-                pool_selection=request.pool_selection,
-                service_binding=request.service_binding,
-            ):
-                return _reject_parsed(
-                    RejectReason.BAD_ENVELOPE_SIGNATURE,
-                    "envelope",
-                    request=request,
-                    body_parse_ms=parse_ms,
-                    preparation_started=started,
-                )
-
-            legacy_status = "disabled"
-            try:
-                legacy_matches, _ = legacy_submission_merkle_matches(request)
-                legacy_status = "match" if legacy_matches else "mismatch"
-            except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
-                legacy_matches = False
-                legacy_status = "error"
-            if context.enforce_legacy_merkle and not legacy_matches:
-                return _reject_parsed(
-                    RejectReason.MERKLE_ROOT_MISMATCH,
-                    "legacy_merkle",
-                    request=request,
-                    body_parse_ms=parse_ms,
-                    preparation_started=started,
-                    legacy_merkle_status=legacy_status,
-                )
-            request._legacy_merkle_verified = legacy_matches
-
-            rollout_hashes: list[bytes] = []
-            local_hashes: set[bytes] = set()
-            for rollout in request.rollouts:
-                try:
-                    commit = CommitModel.model_validate(rollout.commit)
-                except ValidationError:
-                    return _reject_parsed(
-                        RejectReason.BAD_SCHEMA,
-                        "schema",
-                        request=request,
-                        body_parse_ms=parse_ms,
-                        preparation_started=started,
-                        legacy_merkle_status=legacy_status,
-                    )
-                tokens = list(commit.tokens)
-                if tokens != list(rollout.tokens):
-                    return _reject_parsed(
-                        RejectReason.TOKENS_MISMATCH,
-                        "token_invariant",
-                        request=request,
-                        body_parse_ms=parse_ms,
-                        preparation_started=started,
-                        legacy_merkle_status=legacy_status,
-                    )
-                if not _tokens_valid(
-                    tokens,
-                    vocab_size=context.vocab_size,
-                    max_sequence_length=context.max_sequence_length,
-                ):
-                    return _reject_parsed(
-                        RejectReason.BAD_TOKENS,
-                        "tokens",
-                        request=request,
-                        body_parse_ms=parse_ms,
-                        preparation_started=started,
-                        legacy_merkle_status=legacy_status,
-                    )
-                if context.service_policy is not None and not service_length_valid(
-                    tokens, (rollout.commit or {}).get("rollout") or {}, context.environment,
-                    episode_max_tokens=context.episode_max_tokens,
-                ):
-                    # O1: a service group (training or exploration) longer than the environment's bound would
-                    # reach the proof plane as an OOM; refuse it before any retention or grading.
-                    return _reject_parsed(
-                        RejectReason.BAD_TOKENS,
-                        "service_length",
-                        request=request,
-                        body_parse_ms=parse_ms,
-                        preparation_started=started,
-                        legacy_merkle_status=legacy_status,
-                    )
-                if not verify_commit_signature(
-                    rollout.commit, request.miner_hotkey
-                ):
-                    return _reject_parsed(
-                        RejectReason.BAD_SIGNATURE,
-                        "rollout_signature",
-                        request=request,
-                        body_parse_ms=parse_ms,
-                        preparation_started=started,
-                        legacy_merkle_status=legacy_status,
-                    )
-                claimed_randomness = (
-                    (rollout.commit.get("beacon") or {}).get("randomness", "")
-                )
-                if claimed_randomness != context.randomness:
-                    return _reject_parsed(
-                        RejectReason.WRONG_RANDOMNESS,
-                        "randomness",
-                        request=request,
-                        body_parse_ms=parse_ms,
-                        preparation_started=started,
-                        legacy_merkle_status=legacy_status,
-                    )
-                rollout_hash = compute_rollout_hash(tokens)
-                if rollout_hash in local_hashes:
-                    return _reject_parsed(
-                        RejectReason.HASH_DUPLICATE,
-                        "dedup",
-                        request=request,
-                        body_parse_ms=parse_ms,
-                        preparation_started=started,
-                        legacy_merkle_status=legacy_status,
-                    )
-                local_hashes.add(rollout_hash)
-                rollout_hashes.append(rollout_hash)
-
-            termination_reason = _termination_reject(request, context)
-            if termination_reason is not None:
-                stage = (
-                    "force_span_preflight"
-                    if termination_reason is RejectReason.TOKEN_TAMPERED
-                    else "termination_preflight"
-                )
-                return _reject_parsed(
-                    termination_reason,
-                    stage,
-                    request=request,
-                    body_parse_ms=parse_ms,
-                    preparation_started=started,
-                    legacy_merkle_status=legacy_status,
-                    rollout_hashes=rollout_hashes,
-                    selection_digest=compute_rollouts_selection_digest(
-                        request.rollouts
-                    ),
-                )
-
-            return ParsedSubmission(
-                request=request,
-                rollout_hashes=rollout_hashes,
-                selection_digest=compute_rollouts_selection_digest(
-                    request.rollouts
-                ),
-                legacy_merkle_status=legacy_status,
-                body_parse_ms=parse_ms,
-                preparation_ms=(time.perf_counter() - started) * 1000.0,
-            )
-    except _AdmissionTimeout:
-        return _reject_parsed(
-            RejectReason.WORKER_DROPPED,
-            "admission_timeout",
-            request=request,
-            body_parse_ms=parse_ms,
-            preparation_started=started,
-            timed_out=True,
-        )
-    except Exception:
-        return _reject_parsed(
-            RejectReason.WORKER_DROPPED,
-            "admission_worker",
-            request=request,
-            body_parse_ms=parse_ms,
-            preparation_started=started,
-        )
-
-
-def _reward_matches(actual: float, claimed: float) -> bool:
-    return (
-        math.isfinite(float(actual))
-        and math.isfinite(float(claimed))
-        and abs(float(actual) - float(claimed)) <= 1e-6
-    )
-
-
-def _in_zone(rewards: list[float], *, bootstrap: bool) -> bool:
-    if len(rewards) < 2:
-        return False
-    mean = sum(rewards) / len(rewards)
-    sigma = (
-        sum((reward - mean) ** 2 for reward in rewards) / len(rewards)
-    ) ** 0.5
-    if sigma < 1e-8:
-        return False
-    return sigma >= (BOOTSTRAP_SIGMA_MIN if bootstrap else SIGMA_MIN)
-
 
 def _compute_code_rewards(
     completion_texts: list[str],
@@ -915,6 +228,7 @@ def _compute_code_rewards(
         executor.shutdown(wait=False, cancel_futures=True)
 
 
+
 def _score_openmath_adapter(
     problem: dict[str, Any],
     completion_texts: list[str],
@@ -925,6 +239,7 @@ def _score_openmath_adapter(
         float(_compute_omi_reward(problem, text))
         for text in completion_texts
     ]
+
 
 
 def _score_opencode_adapter(
@@ -939,642 +254,103 @@ def _score_opencode_adapter(
     )
 
 
-def score_and_finalize_submission(
-    parsed: ParsedSubmission,
-    materials: AdmissionRuntimeMaterials,
-    context: AdmissionContext,
-    deadline_monotonic: float,
-) -> PreparedSubmission:
-    """Bind the canonical prompt, grade rewards and validate group structure."""
-    started = time.perf_counter()
-    request = parsed.request
-    prompt_binding_verified = False
+def render_canonical_prompt(
+    tokenizer: Any, prompt: str, *, thinking: bool = True
+) -> str:
+    """Render a trusted user prompt exactly as admission will tokenize it."""
+    # Mirror of encode_prompt's guard. Both must switch on the same constant:
+    # this render feeds prompt_content_sha256 while encode_prompt feeds the
+    # generated tokens, and a disagreement between them is dropped silently at
+    # seal rather than rejected.
+    from reliquary.constants import RAW_COMPLETION_PROMPTS
 
-    def result(**kwargs: Any) -> PreparedSubmission:
-        return PreparedSubmission(
-            prompt_binding_verified=prompt_binding_verified,
+    if RAW_COMPLETION_PROMPTS:
+        return str(prompt)
+
+    rendered = str(prompt)
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if (
+        isinstance(chat_template, str)
+        and chat_template
+        and hasattr(tokenizer, "apply_chat_template")
+    ):
+        kwargs: dict[str, Any] = {
+            "add_generation_prompt": True,
+            "tokenize": False,
+        }
+        if "enable_thinking" in chat_template:
+            kwargs["enable_thinking"] = bool(thinking)
+        rendered = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
             **kwargs,
         )
+    return rendered
 
-    if parsed.reject_reason is not None or request is None:
-        return result(
-            request=request,
-            completion_texts=[],
-            rewards=[],
-            rollout_hashes=parsed.rollout_hashes,
-            selection_digest=parsed.selection_digest,
-            reject_reason=parsed.reject_reason or RejectReason.BAD_SCHEMA,
-            reject_stage=parsed.reject_stage or "schema",
-            body_parse_ms=parsed.body_parse_ms,
-            preparation_ms=parsed.preparation_ms,
-            timed_out=parsed.timed_out,
-        )
 
-    if not submission_interaction_matches(request, context.environment):
-        return result(
-            request=request, completion_texts=[], rewards=[],
-            rollout_hashes=parsed.rollout_hashes,
-            selection_digest=parsed.selection_digest,
-            reject_reason=RejectReason.BAD_SCHEMA,
-            reject_stage="environment_interaction",
-        )
-    reward_ms = 0.0
+def _environment_policy(env: Any, field: str, default: Any = None) -> Any:
+    """Resolve registered policy while retaining local test-env embedding."""
+
     try:
-        with _deadline(deadline_monotonic):
-            canonical = materials.canonical_prompt_tokens
-            if canonical is not None:
-                for rollout in request.rollouts:
-                    meta = rollout.commit.get("rollout", {}) or {}
-                    prompt_length = int(meta.get("prompt_length", 0))
-                    if list(rollout.commit.get("tokens", []))[
-                        :prompt_length
-                    ] != list(canonical):
-                        return result(
-                            request=request,
-                            completion_texts=materials.completion_texts,
-                            rewards=[],
-                            rollout_hashes=parsed.rollout_hashes,
-                            selection_digest=parsed.selection_digest,
-                            reject_reason=RejectReason.PROMPT_MISMATCH,
-                            reject_stage="prompt_binding",
-                            body_parse_ms=parsed.body_parse_ms,
-                            preparation_ms=(
-                                parsed.preparation_ms
-                                + (time.perf_counter() - started) * 1000.0
-                            ),
-                        )
-
-                prompt_binding_verified = True
-
-            reward_started = time.perf_counter()
-            try:
-                try:
-                    environment_spec = get_environment_spec(
-                        context.environment
-                    )
-                except ValueError:
-                    return result(
-                        request=request,
-                        completion_texts=materials.completion_texts,
-                        rewards=[],
-                        rollout_hashes=parsed.rollout_hashes,
-                        selection_digest=parsed.selection_digest,
-                        reject_reason=RejectReason.WORKER_DROPPED,
-                        reject_stage="unsupported_environment",
-                        body_parse_ms=parsed.body_parse_ms,
-                        preparation_ms=parsed.preparation_ms,
-                    )
-                if environment_spec.interaction_mode == "episode":
-                    if _WORKER_TOKENIZER is None:
-                        raise RuntimeError("episode replay tokenizer unavailable")
-                    from reliquary.environment.agentic.replay import (
-                        replay_tokenized_episode,
-                    )
-
-                    def encode_piece(text: str) -> list[int]:
-                        encoded = _WORKER_TOKENIZER.encode(
-                            text, add_special_tokens=False
-                        )
-                        return list(getattr(encoded, "ids", encoded))
-
-                    def decode_piece(ids: list[int]) -> str:
-                        return str(_WORKER_TOKENIZER.decode(
-                            list(ids), skip_special_tokens=False
-                        ))
-
-                    computed = []
-                    for rollout in request.rollouts:
-                        raw_meta = rollout.commit.get("rollout", {}) or {}
-                        episode = raw_meta.get("episode")
-                        if not isinstance(episode, dict):
-                            raise ValueError("episode metadata missing")
-                        spans = tuple(
-                            (int(span[0]), int(span[1]))
-                            for span in episode.get("assistant_spans", [])
-                        )
-                        limits = episode_limits_for_environment(
-                            context.environment
-                        )
-                        if limits is None:
-                            raise ValueError("episode limits missing from profile")
-                        (
-                            max_action_tokens,
-                            max_episode_tokens,
-                            max_observation_bytes,
-                        ) = limits
-                        if len(rollout.commit["tokens"]) > max_episode_tokens:
-                            raise ValueError("episode token budget exceeded")
-                        if any(
-                            end - start > max_action_tokens
-                            for start, end in spans
-                        ):
-                            raise ValueError("episode action token budget exceeded")
-                        trace = replay_tokenized_episode(
-                            environment_spec.create(),
-                            task_index=request.prompt_idx,
-                            seed=int(episode["seed"]),
-                            tokens=list(rollout.commit["tokens"]),
-                            assistant_spans=spans,
-                            decode=decode_piece,
-                            encode=encode_piece,
-                            max_episode_tokens=max_episode_tokens,
-                            max_observation_bytes=max_observation_bytes,
-                            # The dialect the environment declares, which is
-                            # the one the miner rendered with: the transcript
-                            # below is compared byte for byte.
-                            renderer_id=str(environment_spec.renderer_id),
-                        )
-                        reward = trace.reward
-                        if reward is None:
-                            raise ValueError("episode replay did not produce reward")
-                        if trace.task_id != str(episode.get("task_id")):
-                            raise ValueError("episode task binding mismatch")
-                        if [action.to_wire() for action in trace.actions] != list(
-                            episode.get("actions") or []
-                        ):
-                            raise ValueError("episode action binding mismatch")
-                        if tuple(trace.tokens) != tuple(rollout.commit["tokens"]):
-                            raise ValueError("episode canonical transcript mismatch")
-                        if trace.assistant_spans != spans:
-                            raise ValueError("episode assistant span mismatch")
-                        if list(trace.observation_digests) != list(
-                            episode.get("observation_digests") or []
-                        ):
-                            raise ValueError("episode observation mismatch")
-                        if trace.termination_reason != str(
-                            episode.get("termination_reason")
-                        ):
-                            raise ValueError("episode termination mismatch")
-                        if reward.state_digest != str(episode.get("state_digest")):
-                            raise ValueError("episode state digest mismatch")
-                        if trace.trace_digest != str(episode.get("trace_digest")):
-                            raise ValueError("episode trace digest mismatch")
-                        rollout._validated_assistant_spans = spans
-                        rollout._validated_episode_trace_digest = trace.trace_digest
-                        computed.append(float(reward.reward))
-                else:
-                    computed = environment_spec.score_many(
-                        materials.problem,
-                        materials.completion_texts,
-                        materials.effective_reward_materials,
-                    )
-                authoritative = (
-                    environment_spec.validator_authoritative_reward
-                )
-            except GraderInfrastructureError:
-                raise
-            except Exception:
-                return result(
-                    request=request,
-                    completion_texts=materials.completion_texts,
-                    rewards=[],
-                    rollout_hashes=parsed.rollout_hashes,
-                    selection_digest=parsed.selection_digest,
-                    reject_reason=RejectReason.REWARD_MISMATCH,
-                    reject_stage="reward",
-                    body_parse_ms=parsed.body_parse_ms,
-                    preparation_ms=parsed.preparation_ms,
-                )
-            reward_ms = (time.perf_counter() - reward_started) * 1000.0
-
-            for rollout, reward in zip(request.rollouts, computed, strict=True):
-                if not math.isfinite(reward):
-                    return result(
-                        request=request,
-                        completion_texts=materials.completion_texts,
-                        rewards=[],
-                        rollout_hashes=parsed.rollout_hashes,
-                        selection_digest=parsed.selection_digest,
-                        reject_reason=RejectReason.REWARD_MISMATCH,
-                        reject_stage="reward",
-                        body_parse_ms=parsed.body_parse_ms,
-                        preparation_ms=parsed.preparation_ms,
-                        reward_grading_ms=reward_ms,
-                    )
-                if authoritative:
-                    rollout.reward = reward
-                    meta = rollout.commit.get("rollout")
-                    if isinstance(meta, dict):
-                        meta["success"] = reward > 0.5
-                        meta["total_reward"] = reward
-                elif not _reward_matches(reward, rollout.reward):
-                    return result(
-                        request=request,
-                        completion_texts=materials.completion_texts,
-                        rewards=[],
-                        rollout_hashes=parsed.rollout_hashes,
-                        selection_digest=parsed.selection_digest,
-                        reject_reason=RejectReason.REWARD_MISMATCH,
-                        reject_stage="reward",
-                        body_parse_ms=parsed.body_parse_ms,
-                        preparation_ms=parsed.preparation_ms,
-                        reward_grading_ms=reward_ms,
-                    )
-
-            rewards = [float(rollout.reward) for rollout in request.rollouts]
-            truncated_indices = truncated_rollout_indices(request, context)
-            service_contract = None
-            if context.service_policy is None:
-                missing_box_uncertain = (
-                    environment_spec.final_answer_policy == "boxed"
-                    and MATH_ANSWER_FORMAT == "boxed"
-                )
-            else:
-                from reliquary.protocol.service_contract import ServiceContract
-                from reliquary.services.admission_policy import (
-                    missing_box_is_uncertain,
-                    service_lane,
-                )
-
-                service_contract = ServiceContract.from_dict(
-                    context.service_policy["contract"]
-                )
-                missing_box_uncertain = missing_box_is_uncertain(
-                    context.environment, service_contract
-                )
-            unboxed_indices = (
-                tuple(
-                    index
-                    for index, text in enumerate(materials.completion_texts)
-                    if is_missing_final_answer_box(text)
-                )
-                if missing_box_uncertain
-                else ()
-            )
-            uncertain_indices = tuple(
-                dict.fromkeys((*truncated_indices, *unboxed_indices))
-            )
-            robust_utility: float | None = None
-            attainable_rewards: tuple[float, ...] = ()
-            if (
-                ROBUST_TRUNCATION_UTILITY_ENABLED
-                and uncertain_indices
-                # The service path never ranks on this legacy-threshold utility (its lane is decided
-                # by the contract's threshold, and its order is arrival order).
-                and service_contract is None
-            ):
-                from reliquary.validator.difficulty_auction import (
-                    fractional_reward_lattice,
-                    robust_uncertain_reward_utility,
-                )
-
-                if environment_spec.attainable_rewards:
-                    attainable_rewards = (
-                        environment_spec.attainable_rewards
-                    )
-                else:
-                    total_tests = max(
-                        1,
-                        len(materials.effective_reward_materials or ()),
-                    )
-                    attainable_rewards = fractional_reward_lattice(
-                        total_tests
-                    )
-                robust_utility = robust_uncertain_reward_utility(
-                    rewards,
-                    sigma_min=(
-                        BOOTSTRAP_SIGMA_MIN
-                        if context.bootstrap
-                        else SIGMA_MIN
-                    ),
-                    uncertain_indices=uncertain_indices,
-                    attainable_rewards=attainable_rewards,
-                )
-            in_zone = (
-                robust_utility > 0.0
-                if robust_utility is not None
-                else _in_zone(rewards, bootstrap=context.bootstrap)
-            )
-            service_uncertainty: dict[str, Any] = {}
-            if service_contract is not None:
-                # The lattice is derived whether or not a rollout is uncertain
-                # yet: the proof may still find a length-capped rollout, and an
-                # environment whose lattice is unknown gets none (the policy
-                # then refuses any group with an uncertain rollout).
-                if environment_spec.attainable_rewards:
-                    attainable_rewards = environment_spec.attainable_rewards
-                elif materials.effective_reward_materials:
-                    from reliquary.validator.difficulty_auction import (
-                        fractional_reward_lattice,
-                    )
-
-                    attainable_rewards = fractional_reward_lattice(
-                        len(materials.effective_reward_materials)
-                    )
-                else:
-                    attainable_rewards = ()
-                # The lane is the validator's call from the vector (the batcher decides it again
-                # from the same inputs); the worker only refuses what is no observation at all.
-                try:
-                    in_zone = service_lane(
-                        request,
-                        service_contract,
-                        rewards,
-                        truncated_indices=truncated_indices,
-                        uncertain_indices=uncertain_indices,
-                        attainable_rewards=attainable_rewards,
-                    ) is not None
-                except ValueError:
-                    in_zone = False
-                service_uncertainty = {
-                    "truncated_indices": tuple(truncated_indices),
-                    "uncertain_indices": tuple(uncertain_indices),
-                }
-            if not in_zone:
-                return result(
-                    request=request,
-                    completion_texts=materials.completion_texts,
-                    rewards=rewards,
-                    rollout_hashes=parsed.rollout_hashes,
-                    selection_digest=parsed.selection_digest,
-                    reject_reason=RejectReason.OUT_OF_ZONE,
-                    reject_stage="zone",
-                    body_parse_ms=parsed.body_parse_ms,
-                    preparation_ms=parsed.preparation_ms,
-                    reward_grading_ms=reward_ms,
-                )
-
-            if environment_spec.final_answer_policy == "boxed":
-                for index, text in enumerate(materials.completion_texts):
-                    meta = request.rollouts[index].commit.get("rollout", {}) or {}
-                    malformed, _ = has_malformed_final_answer(
-                        rewards[index],
-                        text,
-                        completion_length=int(meta.get("completion_length", 0)),
-                        cap=max_new_tokens_for_environment(
-                            context.environment
-                        ),
-                    )
-                    if malformed:
-                        return result(
-                            request=request,
-                            completion_texts=materials.completion_texts,
-                            rewards=rewards,
-                            rollout_hashes=parsed.rollout_hashes,
-                            selection_digest=parsed.selection_digest,
-                            reject_reason=RejectReason.MALFORMED_FINAL_ANSWER,
-                            reject_stage="malformed_final_answer",
-                            body_parse_ms=parsed.body_parse_ms,
-                            preparation_ms=parsed.preparation_ms,
-                            reward_grading_ms=reward_ms,
-                        )
-
-            clone_metrics = detect_opposite_reward_clones(
-                materials.completion_texts, rewards
-            )
-            if clone_metrics.suspicious:
-                return result(
-                    request=request,
-                    completion_texts=materials.completion_texts,
-                    rewards=rewards,
-                    rollout_hashes=parsed.rollout_hashes,
-                    selection_digest=parsed.selection_digest,
-                    reject_reason=RejectReason.DISTRIBUTION_SUSPICIOUS,
-                    reject_stage="distribution",
-                    body_parse_ms=parsed.body_parse_ms,
-                    preparation_ms=parsed.preparation_ms,
-                    reward_grading_ms=reward_ms,
-                )
-
-            for rollout in request.rollouts:
-                meta = rollout.commit.get("rollout")
-                if isinstance(meta, dict):
-                    meta["truncated"] = False
-                    if environment_spec.termination_policy != "math_bft":
-                        meta["forced"] = False
-
-            return result(
-                request=request,
-                completion_texts=materials.completion_texts,
-                rewards=rewards,
-                rollout_hashes=parsed.rollout_hashes,
-                selection_digest=parsed.selection_digest,
-                # Derived from the token stream, so it is unaffected by the
-                # meta["truncated"] reset above.
-                truncated_count=len(truncated_indices),
-                truncated_index=(
-                    truncated_indices[0] if truncated_indices else None
-                ),
-                unboxed_count=len(unboxed_indices),
-                attainable_rewards=attainable_rewards,
-                robust_utility=robust_utility,
-                **service_uncertainty,
-                eos_tokens=count_eos_completion_tokens(request, context),
-                body_parse_ms=parsed.body_parse_ms,
-                preparation_ms=(
-                    parsed.preparation_ms
-                    + (time.perf_counter() - started) * 1000.0
-                ),
-                reward_grading_ms=reward_ms,
-            )
-    except _AdmissionTimeout:
-        return result(
-            request=request,
-            completion_texts=materials.completion_texts,
-            rewards=[],
-            rollout_hashes=parsed.rollout_hashes,
-            selection_digest=parsed.selection_digest,
-            reject_reason=RejectReason.WORKER_DROPPED,
-            reject_stage="admission_timeout",
-            body_parse_ms=parsed.body_parse_ms,
-            preparation_ms=parsed.preparation_ms,
-            reward_grading_ms=reward_ms,
-            timed_out=True,
+        return getattr(
+            get_environment_spec(str(getattr(env, "name", ""))),
+            field,
         )
-    except GraderInfrastructureError as exc:
-        return result(
-            request=request,
-            completion_texts=materials.completion_texts,
-            rewards=[],
-            rollout_hashes=parsed.rollout_hashes,
-            selection_digest=parsed.selection_digest,
-            reject_reason=RejectReason.WORKER_DROPPED,
-            reject_stage="code_grader",
-            grader_failure_reason=exc.reason,
-            body_parse_ms=parsed.body_parse_ms,
-            preparation_ms=parsed.preparation_ms,
-            reward_grading_ms=reward_ms,
-        )
-    except Exception:
-        return result(
-            request=request,
-            completion_texts=materials.completion_texts,
-            rewards=[],
-            rollout_hashes=parsed.rollout_hashes,
-            selection_digest=parsed.selection_digest,
-            reject_reason=RejectReason.WORKER_DROPPED,
-            reject_stage="admission_worker",
-            body_parse_ms=parsed.body_parse_ms,
-            preparation_ms=parsed.preparation_ms,
-            reward_grading_ms=reward_ms,
-        )
+    except (AttributeError, ValueError):
+        return getattr(env, field, default)
 
 
-def materialize_and_score_submission(
-    parsed: ParsedSubmission,
-    materials: AdmissionProblemMaterials,
-    context: AdmissionContext,
-    deadline_monotonic: float,
-) -> PreparedSubmission:
-    """Decode and grade entirely inside the isolated admission process."""
-    request = parsed.request
-    if parsed.reject_reason is not None or request is None:
-        return score_and_finalize_submission(
-            parsed,
-            AdmissionRuntimeMaterials(
-                canonical_prompt_tokens=None,
-                problem=materials.problem,
-                completion_texts=[],
-                code_cases=materials.code_cases,
-                reward_materials=materials.reward_materials,
-            ),
-            context,
-            deadline_monotonic,
-        )
-    if context.signed_episode:
-        # A signed episode's reward is its final record's. The parent process verifies the
-        # transcripts (it holds the machine directory and the session issuer) and decides the lane.
-        return PreparedSubmission(
-            request=request, completion_texts=[], rewards=[], rollout_hashes=parsed.rollout_hashes,
-            selection_digest=parsed.selection_digest, body_parse_ms=parsed.body_parse_ms,
-            preparation_ms=parsed.preparation_ms, episode_pending=True,
-        )
+def _render_environment_prompt(env: Any, tokenizer: Any, prompt_idx: int) -> str:
+    mode = _environment_policy(env, "interaction_mode", "single_turn")
+    if mode == "signed_episode":
+        # The task source's prompt verbatim (exactly what the harness renders, which the
+        # admission compared token for token with the trajectory's prompt); never a chat template here.
+        return str(env.get_problem(prompt_idx)["prompt"])
+    if mode == "episode":
+        from reliquary.environment.agentic.compat import rendered_episode_prompt
+
+        return rendered_episode_prompt(env, prompt_idx)
+    problem = env.get_problem(prompt_idx)
+    from reliquary.constants import thinking_for_environment
+
+    return render_canonical_prompt(
+        tokenizer,
+        str(problem["prompt"]),
+        thinking=thinking_for_environment(str(getattr(env, "name", ""))),
+    )
+
+
+def admission_problem_materials(env: Any, tokenizer: Any, prompt_idx: int):
+    """The trusted problem data admission grades against: the problem, its rendered prompt and its reward
+    materials, for the async submission path (``rl_submit``)."""
+    problem = env.get_problem(prompt_idx)
+    rendered_prompt = _render_environment_prompt(env, tokenizer, prompt_idx)
+    code_cases = None
+    reward_materials = None
     try:
-        with _deadline(deadline_monotonic):
-            if _WORKER_TOKENIZER is None:
-                raise RuntimeError("admission worker tokenizer unavailable")
-            encoded_prompt = _WORKER_TOKENIZER.encode(
-                materials.rendered_prompt,
-                add_special_tokens=False,
-            )
-            canonical_prompt_tokens = list(
-                getattr(encoded_prompt, "ids", encoded_prompt)
-            )
-            completion_texts = []
-            for rollout in request.rollouts:
-                meta = rollout.commit.get("rollout", {}) or {}
-                prompt_length = int(meta.get("prompt_length", 0))
-                completion_texts.append(
-                    _WORKER_TOKENIZER.decode(
-                        list(rollout.commit["tokens"])[prompt_length:],
-                        skip_special_tokens=False,
-                    )
-                )
-        return score_and_finalize_submission(
-            parsed,
-            AdmissionRuntimeMaterials(
-                canonical_prompt_tokens=canonical_prompt_tokens,
-                problem=materials.problem,
-                completion_texts=completion_texts,
-                code_cases=materials.code_cases,
-                reward_materials=materials.reward_materials,
-            ),
-            context,
-            deadline_monotonic,
-        )
-    except _AdmissionTimeout:
-        return PreparedSubmission(
-            request=request,
-            completion_texts=[],
-            rewards=[],
-            rollout_hashes=parsed.rollout_hashes,
-            selection_digest=parsed.selection_digest,
-            reject_reason=RejectReason.WORKER_DROPPED,
-            reject_stage="admission_timeout",
-            body_parse_ms=parsed.body_parse_ms,
-            preparation_ms=parsed.preparation_ms,
-            timed_out=True,
-        )
-    except Exception:
-        return PreparedSubmission(
-            request=request,
-            completion_texts=[],
-            rewards=[],
-            rollout_hashes=parsed.rollout_hashes,
-            selection_digest=parsed.selection_digest,
-            reject_reason=RejectReason.WORKER_DROPPED,
-            reject_stage="admission_worker",
-            body_parse_ms=parsed.body_parse_ms,
-            preparation_ms=parsed.preparation_ms,
-        )
+        from reliquary.environment.registry import get_environment_spec
 
-
-def prepare_submission(
-    raw_body: bytes,
-    binding: AdmissionReceiptBinding,
-    materials: AdmissionProblemMaterials,
-    context: AdmissionContext,
-    deadline_monotonic: float,
-) -> PreparedSubmission:
-    """Authoritative one-pass auction preparation entry point."""
-    parsed = parse_and_validate_submission(
-        raw_body,
-        binding,
-        context,
-        deadline_monotonic,
+        spec = get_environment_spec(getattr(env, "name", ""))
+    except ValueError:
+        spec = None
+    materializer_name = (
+        spec.reward_materializer_method if spec is not None else None
     )
-    prepared = materialize_and_score_submission(
-        parsed,
-        materials,
-        context,
-        deadline_monotonic,
-    )
-    from reliquary.validator.prompt_content import (
-        prompt_content_sha256,
-        target_content_sha256,
-    )
-
-    prepared.prompt_content_sha256 = prompt_content_sha256(
-        context.environment,
-        materials.rendered_prompt,
-    )
-    prepared.target_content_sha256 = target_content_sha256(
-        context.environment,
-        materials.problem,
-        code_cases=materials.code_cases,
-    )
-    prepared.task_family = (
-        str(materials.problem.get("task_family"))
-        if materials.problem.get("task_family") is not None
+    cases_loader = (
+        getattr(env, materializer_name, None)
+        if materializer_name
         else None
     )
-    prepared.generator_version = (
-        str(materials.problem.get("generator_version"))
-        if materials.problem.get("generator_version") is not None
-        else None
+    if callable(cases_loader):
+        reward_materials = cases_loader(problem)
+        # `code_cases` is the older, narrower channel; what fills it is the
+        # environment asking for the sandbox, not its name. The name test
+        # this replaces would never have matched a packaged code
+        # environment, which is the same environment under another name.
+        if spec is not None and spec.admission_resource_class == "sandbox":
+            code_cases = list(reward_materials)
+    return AdmissionProblemMaterials(
+        problem=dict(problem),
+        rendered_prompt=rendered_prompt,
+        code_cases=code_cases,
+        reward_materials=reward_materials,
     )
-    prepared.operation_id = (
-        str(materials.problem.get("operation_id"))
-        if materials.problem.get("operation_id") is not None
-        else None
-    )
-    try:
-        prepared.difficulty = (
-            int(materials.problem["difficulty"])
-            if "difficulty" in materials.problem
-            else None
-        )
-    except (TypeError, ValueError, OverflowError):
-        prepared.difficulty = None
-    prepared.legacy_merkle_status = parsed.legacy_merkle_status
-    return prepared
-
-
-def robust_utility_admits(
-    rewards: Sequence[float],
-    *,
-    sigma_min: float,
-    truncated_indices: Iterable[int] = (),
-    attainable_rewards: Iterable[float] = (0.0, 1.0),
-) -> bool:
-    """Require positive utility under every admissible reward completion."""
-    from reliquary.validator.difficulty_auction import (
-        robust_uncertain_reward_utility,
-    )
-
-    return robust_uncertain_reward_utility(
-        rewards,
-        sigma_min=sigma_min,
-        uncertain_indices=truncated_indices,
-        attainable_rewards=attainable_rewards,
-    ) > 0.0

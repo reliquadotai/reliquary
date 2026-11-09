@@ -57,22 +57,13 @@ def test_saved_checkpoint_reloads_bf16(tmp_path):
     assert torch.equal(got, want)
 
 
-def test_decoded_batches_pickle():
-    """A batch decoded from a real journal payload survives the broadcast."""
-    from reliquary.shared.training_payload import decode_training_payload
-    from tests.unit.test_trainer_journal import _payload_bytes
-
-    batches = decode_training_payload(_payload_bytes(3)).batches()
-    copy_ = pickle.loads(pickle.dumps(batches))
-    tokens = lambda b: [[r.commit["tokens"] for g in groups for r in g.rollouts] for groups in b.values()]
-    assert tokens(copy_) == tokens(batches)
 
 
 def test_a_failed_gather_is_fatal_not_retried(tmp_path, monkeypatch):
     """Rank 0 failing mid-gather must stop the trainer: a retried GATHER would
     pair its collectives with the followers' unfinished ones."""
     from reliquary.trainer import distributed
-    from reliquary.trainer.train_runner import TrainerStateUnsafe
+    from reliquary.trainer.distributed import TrainerStateUnsafe
 
     sent = []
 
@@ -91,9 +82,9 @@ def test_a_failed_gather_is_fatal_not_retried(tmp_path, monkeypatch):
 
 
 def test_launch_refuses_several_processes_without_fsdp2():
-    from reliquary.trainer.cli import _check_trainer_launch
+    from reliquary.trainer.distributed import check_trainer_launch
 
-    _check_trainer_launch("single", {"WORLD_SIZE": "1"})
-    _check_trainer_launch("fsdp2", {"WORLD_SIZE": "4"})
+    check_trainer_launch("single", {"WORLD_SIZE": "1"})
+    check_trainer_launch("fsdp2", {"WORLD_SIZE": "4"})
     with pytest.raises(SystemExit):
-        _check_trainer_launch("single", {"WORLD_SIZE": "4"})
+        check_trainer_launch("single", {"WORLD_SIZE": "4"})

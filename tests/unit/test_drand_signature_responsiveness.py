@@ -13,7 +13,6 @@ from types import SimpleNamespace
 import pytest
 
 from reliquary.infrastructure import drand
-from reliquary.validator.service import ValidationService
 
 SIGNATURE = "ab" * 48
 RANDOMNESS = hashlib.sha256(bytes.fromhex(SIGNATURE)).hexdigest()
@@ -103,34 +102,3 @@ def test_child_failure_remains_fail_closed_without_raw_output(monkeypatch, caplo
     assert "synthetic-private-value" not in caplog.text
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("cancel", [False, True])
-async def test_owned_child_is_reaped_on_timeout_even_if_verification_cancelled(tmp_path, monkeypatch, cancel):
-    pid_path = tmp_path / "child.pid"
-    code = (f"import os,time; from pathlib import Path; p=Path({str(pid_path)!r}); "
-            "tmp=p.with_suffix('.tmp'); tmp.write_text(str(os.getpid())); tmp.replace(p); time.sleep(5)")
-    monkeypatch.setattr(drand, "_SIGNATURE_FETCH_CODE", code)
-    monkeypatch.setattr(drand, "_SIGNATURE_FETCH_TIMEOUT_SECONDS", 0.3)
-    svc = SimpleNamespace(_window_n=41)
-    batcher = SimpleNamespace(beacon_invalid=False)
-    task = asyncio.create_task(ValidationService._verify_beacon_async(svc, [batcher], "synthetic", 42, RANDOMNESS, SIGNATURE))
-    deadline = time.monotonic() + 2
-    while not pid_path.exists() and not task.done() and time.monotonic() < deadline:
-        await asyncio.sleep(0.005)
-    assert pid_path.exists()
-    pid = int(pid_path.read_text())
-    if cancel:
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-    else:
-        await task
-        assert batcher.beacon_invalid
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            break
-        await asyncio.sleep(0.005)
-    else:
-        pytest.fail("owned native helper was not reaped within its bounded deadline")

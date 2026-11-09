@@ -227,7 +227,7 @@ class GroupGrader:
 
     def grade(self, environment: str, prompt_idx: int, rollouts: Sequence[Rollout]) -> Graded:
         from reliquary.validator.admission import _classify_termination, _force_span_valid
-        from reliquary.validator.batcher import admission_problem_materials
+        from reliquary.validator.admission import admission_problem_materials
 
         if environment in self.episodes or any(r.episode is not None for r in rollouts):
             return Graded((), reject="episode_schema")          # an episode env's group is all episodes

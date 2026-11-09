@@ -11,7 +11,6 @@ from reliquary.miner.corpus_generate_server import Finished, GenerateEngine, Vll
 from reliquary.miner.forced_draw import DrawBinding, ForcedDraws, forced_sampling_params
 from reliquary.miner.vllm_generation import FORCED_SEED_KEY, ForcedSeedVLLMProcessor, RunnerForcedSeedVLLMProcessor
 from reliquary.protocol.seed_pool import SeedPool
-from reliquary.validator.verifier import policy_token_positions
 from tests.unit.episode_v2_fixtures import episode_contract, episode_pool
 
 POOL = episode_pool(episode_contract())
@@ -274,40 +273,6 @@ def test_forced_sampling_takes_the_processors_pick_and_keeps_the_jobs_stops():
     assert params["temperature"] == 0.0 and params["top_p"] == 1.0 and params["top_k"] == -1
     assert params["stop_token_ids"] == [2] and params["logprobs"] == 1 and params["extra_args"] == draw
     assert base["temperature"] == 1.0
-
-
-def test_the_processor_reads_the_episode_stream_at_model_token_positions(monkeypatch):
-    """Two turns through ForcedSeedVLLMProcessor read u(seed, 0..n-1) over the concatenated model tokens,
-    exactly the validator's ``seed_uniforms`` over the episode's policy positions."""
-    read = []
-    real = SeedPool.uniform
-
-    def spy(self, seed_index, position):
-        read.append((seed_index, position))
-        return real(self, seed_index, position)
-
-    monkeypatch.setattr(SeedPool, "uniform", spy)
-    binding = DrawBinding(POOL, SEED)
-    processor = ForcedSeedVLLMProcessor()
-    logits = torch.zeros(1, 16)
-    offset = 0
-    reads = []
-    for turn_tokens in (3, 2):
-        params = SimpleNamespace(extra_args=binding.extra_args(offset))
-        processor.update_state(SimpleNamespace(removed=(), added=[(0, params)], moved=()))
-        read.clear()
-        for _ in range(turn_tokens):
-            processor.apply(logits)
-        assert read == [(SEED, offset + j) for j in range(turn_tokens)]
-        reads += read
-        processor.update_state(SimpleNamespace(removed=(0,), added=(), moved=()))
-        offset += turn_tokens
-    # the validator's stream: u(seed, j) for j over the episode's policy positions (batcher.seed_uniforms)
-    tokens = list(range(12))
-    meta = {"episode": {"assistant_spans": [[3, 6], [8, 10]]}}
-    positions = policy_token_positions(tokens, meta)
-    assert reads == [(SEED, j) for j in range(len(positions))]
-    assert [real(POOL, s, p) for s, p in reads] == [POOL.uniform(SEED, j) for j in range(len(positions))]
 
 
 class _FakeVllmEngine:

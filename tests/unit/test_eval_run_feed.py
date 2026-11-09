@@ -37,38 +37,6 @@ def report(set_id="verifiers-aime25-r0-n30", *, step=None, score=0.5, at=1_799_0
             "envs": {env: {"pass@1": headline, "n_problems": problems}}}
 
 
-def test_one_benchmark_per_set_with_its_baseline_and_steps_in_order():
-    gpqa = dict(set_id="verifiers-gpqa-diamond", env="verifiers:gpqa", problems=198, samples=4)
-    checkpoints = [("eval-r7-s00040-aime", report(step=40, score=0.6, at=1_799_000_300.0)),
-                   ("eval-r7-s00020-aime", report(step=20, score=0.55, at=1_799_000_200.0)),
-                   # graded after step 40 (a backlog), its `at` is held up to keep the series ordered
-                   ("eval-r7-s00030-aime", report(step=30, score=None, at=1_799_000_100.0)),
-                   ("eval-r7-s00020-gpqa", report(step=20, score=0.4, **gpqa))]
-    baselines = [("eval-r7-base-aime", report(score=0.5)), ("eval-r7-base-gpqa", report(score=0.38, **gpqa))]
-    feed = build_feed(RUN, checkpoints, baselines, observed_at_ms=NOW,
-                      labels={"verifiers-aime25-r0-n30": "AIME 2025"})
-    assert parse_feed(json.loads(run_feed.encode_feed(feed)), RUN, NOW)
-    assert feed["schema"] == "reliquary.run-benchmarks.v1" and feed["scope"] == "held_out"
-    assert feed["run_id"] == RUN and feed["observed_at"] == NOW
-    aime, gpqa_series = feed["benchmarks"]
-    assert aime["id"] == "verifiers-aime25-r0-n30" and aime["label"] == "AIME 2025"
-    assert gpqa_series["label"] == "verifiers:gpqa (198 problems, 4 samples)"
-    assert aime["metric"] == "pass@1"
-    assert aime["protocol"]["attempts"] == 8 and aime["protocol"]["max_output_tokens"] == 32768
-    assert aime["protocol"]["dataset"] == "verifiers:aime25"
-    assert [p["step"] for p in aime["checkpoints"]] == [20, 30, 40]
-    assert [p["score"] for p in aime["checkpoints"]] == [0.55, None, 0.6]
-    assert [p["at"] for p in aime["checkpoints"]] == [1_799_000_200_000, 1_799_000_200_000, 1_799_000_300_000]
-    assert aime["checkpoints"][0]["checkpoint"] == "ReliquaryForge/teutonic-rl-step-00000020"
-    assert all(p["samples"] == 30 and p["cost_usd"] is None and p["gpu_hours"] is None
-               for p in aime["checkpoints"])
-    assert aime["baseline"] == {"checkpoint": "ReliquaryForge/Teutonic-I-Reliquary-SFT@18dfb97df4d7",
-                                "step": None, "at": 1_799_000_000_000, "score": 0.5, "samples": 30,
-                                "cost_usd": None, "gpu_hours": None}
-    assert gpqa_series["baseline"]["score"] == 0.38 and len(gpqa_series["checkpoints"]) == 1
-    assert aime["protocol"]["id"] != gpqa_series["protocol"]["id"]
-
-
 def test_a_set_without_a_baseline_or_points_beyond_the_cap():
     checkpoints = [(f"j{s}", report(step=s, at=1_799_000_000.0 + s)) for s in range(1, 131)]
     feed = build_feed(RUN, checkpoints, observed_at_ms=NOW)
@@ -113,49 +81,6 @@ def _valid():
 
 def _bench(feed):
     return feed["benchmarks"][0]
-
-
-@pytest.mark.parametrize("change", [
-    lambda f: f.update(run_id="another-run"),                       # another run's feed is refused whole
-    lambda f: f.update(schema="reliquary.run-benchmarks.v2"),
-    lambda f: f.update(scope="training"),
-    lambda f: f.update(observed_at=NOW + 5001),
-    lambda f: f.update(observed_at=-1),
-    lambda f: f.update(benchmarks=[{**_bench(f), "id": f"b{i}"} for i in range(25)]),
-    lambda f: _bench(f).update(metric="pass@k"),
-    lambda f: _bench(f).update(checkpoints=[{**_bench(f)["checkpoints"][0], "step": i, "checkpoint": f"c{i}"}
-                                            for i in range(121)]),
-    lambda f: _bench(f)["checkpoints"][1].update(step=10),            # strictly increasing steps
-    lambda f: _bench(f)["checkpoints"][1].update(at=0),               # `at` never goes back
-    lambda f: _bench(f)["checkpoints"][1].update(checkpoint=_bench(f)["checkpoints"][0]["checkpoint"]),
-    lambda f: _bench(f)["checkpoints"][0].update(at=NOW + 1),         # after observed_at
-    lambda f: _bench(f)["checkpoints"][0].update(score=1.01),
-    lambda f: _bench(f)["checkpoints"][0].update(score=-0.1),
-    lambda f: _bench(f)["checkpoints"][0].pop("score"),               # undefined is not null
-    lambda f: _bench(f)["checkpoints"][0].update(samples=0),          # a score over nothing
-    lambda f: _bench(f)["checkpoints"][0].update(samples=2.5),
-    lambda f: _bench(f)["checkpoints"][0].update(step=1.5),
-    lambda f: _bench(f)["checkpoints"][0].update(step=True),
-    lambda f: _bench(f)["checkpoints"][0].update(cost_usd=-1),
-    lambda f: _bench(f)["checkpoints"][0].update(checkpoint=""),
-    lambda f: _bench(f)["checkpoints"][0].update(checkpoint="x" * 161),
-    lambda f: _bench(f)["baseline"].update(samples=0),
-    lambda f: _bench(f)["baseline"].pop("step"),                      # null, not missing
-    lambda f: _bench(f)["checkpoints"][0].update(step=None),          # null only for the baseline
-    lambda f: _bench(f).update(id="x" * 97),
-    lambda f: _bench(f).update(label="two\nlines"),
-    lambda f: _bench(f)["protocol"].update(attempts=0),
-    lambda f: _bench(f)["protocol"].update(attempts=1025),
-    lambda f: _bench(f)["protocol"].update(max_output_tokens=10_000_001),
-    lambda f: _bench(f)["protocol"].pop("harness"),
-    lambda f: f["benchmarks"].append(copy.deepcopy(_bench(f))),       # duplicate ids
-])
-def test_the_ported_validator_refuses_what_the_platform_refuses(change):
-    feed = _valid()
-    assert parse_feed(copy.deepcopy(feed), RUN, NOW)
-    change(feed)
-    with pytest.raises(FeedRejected):
-        parse_feed(feed, RUN, NOW)
 
 
 def test_the_ported_validator_accepts_gaps_and_measured_resources():

@@ -169,13 +169,6 @@ def test_a_machine_without_resources_gets_no_rl_session_once_resources_are_requi
     assert fleet.pick(now=NOW, **PICK) is not None                      # corpus: slots, unchanged
 
 
-def test_the_production_wiring_requires_resources(tmp_path):
-    from tests.unit.test_rl_episode_wiring import _services
-
-    assert _services(tmp_path / "a", require_resources=True)[0].fleet.resources_required is True
-    assert _services(tmp_path / "b")[0].fleet.resources_required is False
-
-
 @pytest.mark.parametrize("broken", [{"free_cpu_millis": "2000"}, {"boxes_per_episode": 0}, {"cpu_millis": -1},
                                     {"max_box_cpu_millis": 0}, {"free_memory_bytes": True}])
 def test_a_malformed_resources_block_places_nothing(tmp_path, broken):

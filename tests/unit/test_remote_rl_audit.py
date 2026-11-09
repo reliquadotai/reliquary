@@ -17,10 +17,6 @@ from tests.unit.test_rl_audit import OTHER_NONCE, TinyLM, _group, _transitions, 
 WORKER = "proof-test"
 
 
-class _ProofSlots:
-    devices = ("cuda:0",)
-
-
 class _Sync:
     """``CheckpointSync`` stand-in: version v of the run is ``TinyLM(table)``'s weights."""
 
@@ -61,9 +57,7 @@ def _remote(table):
 
     torch.manual_seed(1)
     backend = RlAuditBackend(TinyLM(torch.randn_like(table)), _Sync(table))   # starts at other weights
-    app = create_proof_app(backend=_ProofSlots(), worker_id=WORKER, profile_id="p", generation_contract_sha256="b" * 64,
-                           training_run_id="r", repo_id="t/c", software_revision="c" * 40, proof_path_hash="d" * 64,
-                           rl_audit=backend)
+    app = create_proof_app(rl_audit=backend, worker_id=WORKER)
     client = _NoTimeout(app)
     return backend, RemoteAuditModel(base_url="https://unused", worker_id=WORKER, client=client), client
 

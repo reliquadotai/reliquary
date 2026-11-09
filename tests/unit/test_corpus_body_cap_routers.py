@@ -42,21 +42,6 @@ def test_the_eval_control_router_carries_its_jobs_cap():
     _accepts_twelve_megabytes(job_set._router_for(w))
 
 
-@pytest.mark.parametrize("durable_mode", ["0", "1"])
-def test_the_single_job_server_mount_carries_its_jobs_cap(monkeypatch, durable_mode):
-    from reliquary.validator.server import ValidatorServer
-
-    monkeypatch.setenv("RELIQUARY_CORPUS_DURABLE_RECORDS", durable_mode)
-    job = _big_job()
-    holder = SimpleNamespace(app=FastAPI())
-    entry = SimpleNamespace(job_id=job.job_id, mechanism=MECHANISM_CORPUS_GENERATION)
-    assert ValidatorServer.mount_corpus_router(
-        holder, entry, store=MagicMock(), tokenizer=MagicMock(), renderer=None,
-        verify_signature=lambda request: True, job=job)
-    junk = b"x" * 12_000_000
-    assert TestClient(holder.app).post("/corpus/submit", content=junk).status_code == 422
-
-
 def test_a_hot_episode_job_in_a_split_judge_group_is_refused_for_good():
     from types import SimpleNamespace
 

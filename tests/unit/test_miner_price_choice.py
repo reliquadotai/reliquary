@@ -9,8 +9,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from reliquary.miner.engine import pick_env_and_prompt
-from reliquary.miner.episode_mining import pick_episode_task
 from reliquary.miner.rl_pay_client import PayWeights, env_choice_mode, weights_from_pay
 
 
@@ -81,56 +79,10 @@ ENVS = {"math": _Env(1000), "code": _Env(1000)}
 MIX = [("math", 1), ("code", 1)]
 
 
-def test_override_weights_bias_the_draw():
-    rng = random.Random(0)
-    drawn = collections.Counter(
-        pick_env_and_prompt(ENVS, MIX, {}, rng=rng, weights_override={"math": 3.0, "code": 1.0})[0]
-        for _ in range(4000))
-    assert 0.72 < drawn["math"] / 4000 < 0.78
-
-
-def test_no_override_keeps_todays_draw():
-    a = [pick_env_and_prompt(ENVS, MIX, {}, rng=random.Random(5)) for _ in range(1)]
-    b = [pick_env_and_prompt(ENVS, MIX, {}, rng=random.Random(5), weights_override=None) for _ in range(1)]
-    assert a == b
-
-
-def test_an_all_zero_override_falls_back_to_the_mix():
-    rng = random.Random(1)
-    drawn = collections.Counter(
-        pick_env_and_prompt(ENVS, MIX, {}, rng=rng, weights_override={"other": 2.0})[0]
-        for _ in range(2000))
-    assert drawn["math"] > 800 and drawn["code"] > 800
-
-
 def _view():
     return SimpleNamespace(accepting={"math": True, "code": True},
                            ranges={"math": (0, 100), "code": (0, 100)},
                            cooldowns={}, window=1)
-
-
-def test_episode_order_follows_the_weights():
-    rng = random.Random(2)
-    first = collections.Counter(
-        pick_episode_task(_view(), environments=["math", "code"], sizes={"math": 100, "code": 100},
-                          taken=set(), rng=rng, weights={"math": 9.0, "code": 1.0})[0]
-        for _ in range(2000))
-    assert first["math"] / 2000 > 0.85
-
-
-def test_episode_without_weights_is_todays_shuffle():
-    kwargs = dict(environments=["math", "code"], sizes={"math": 100, "code": 100}, taken=set())
-    assert (pick_episode_task(_view(), rng=random.Random(3), **kwargs)
-            == pick_episode_task(_view(), rng=random.Random(3), weights=None, **kwargs))
-
-
-def test_priced_envs_exhausted_falls_back_to_the_mix_instead_of_crashing():
-    """C2: when the only env left has weight 0 under the override, the draw
-    must use the mix, not raise ValueError out of the mining loop."""
-    cooldowns = {"math": set(range(1000))}           # math fully in cooldown
-    env, _ = pick_env_and_prompt(ENVS, MIX, cooldowns, rng=random.Random(0),
-                                 weights_override={"math": 5.0})
-    assert env == "code"
 
 
 def test_unpriced_and_zero_low_envs_still_get_drawn():

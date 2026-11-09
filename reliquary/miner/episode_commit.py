@@ -98,19 +98,6 @@ def _mapped_stop(raw, *, tokens, spans, max_turns, max_tokens_per_turn, max_epis
     return raw
 
 
-def episode_metadata(*, precommit_sha256: str, seed_index: int, spans, stop: AdmittedStop,
-                     transcript: dict) -> dict:
-    """``rollout.episode`` of a signed-episode commit; ``stop`` is ``episode_stop``'s (ValueError for a raw
-    label or anything else)."""
-    from reliquary.protocol.submission import SIGNED_EPISODE_SCHEMA
-
-    if not isinstance(stop, AdmittedStop) or str(stop) not in ADMITTED_STOPS:
-        raise ValueError(f"the stop {stop!r} is not one episode_stop admitted")
-    return {"schema_version": SIGNED_EPISODE_SCHEMA, "precommit_sha256": precommit_sha256,
-            "seed_index": int(seed_index), "assistant_spans": [[int(s), int(e)] for s, e in spans],
-            "stop": str(stop), "transcript": transcript}
-
-
 def episode_refusal(*, policy, renderer, prompt: str, tokens: Sequence[int], spans: Sequence[tuple[int, int]],
                     stop: Any, transcript: Any, min_chunk_tokens: int | None = None,
                     lease: bool = False) -> str | None:
@@ -177,72 +164,5 @@ def episode_admissible(outcome, *, policy, renderer, prompt: str, min_chunk_toke
     return (AdmissibleEpisode(tokens, spans, stop), None) if why is None else (None, why)
 
 
-async def withdraw_inadmissible(outcomes, *, policy, renderer, prompt: str,
-                                min_chunk_tokens: int | None = None) -> list[tuple[Any, AdmissibleEpisode]]:
-    """Before ``choose_episodes``: each outcome (``seed_index``, ``result``: ``EpisodeResult``, ``session``:
-    the generate session's log) the validator would admit (``episode_admissible``), with its sequence and stop;
-    every other one is withdrawn at once (``result.release()``: its slot and the hotkey's caps are freed), so no
-    group is ever built of an episode the validator refuses."""
-    kept: list[tuple[Any, AdmissibleEpisode]] = []
-    for outcome in outcomes:
-        result = outcome.result
-        admitted, why = episode_admissible(outcome, policy=policy, renderer=renderer, prompt=prompt,
-                                           min_chunk_tokens=min_chunk_tokens)
-        if admitted is not None:
-            kept.append((outcome, admitted))
-            continue
-        logger.info("seed %s withdrawn: the validator would refuse it (%s)", outcome.seed_index, why)
-        release = getattr(result, "release", None)
-        if release is not None:
-            try:
-                await release()
-            except Exception:
-                logger.exception("withdrawing the episode of seed %s failed", outcome.seed_index)
-    return kept
-
-
-def build_signed_episode_commit(*, model, verifier, tokens: Sequence[int], spans: Sequence[tuple[int, int]],
-                                episode: dict, service_binding: dict, seed_pool: dict, randomness: str, wallet,
-                                toploc) -> dict:
-    """The commit of one episode (``public-group-proof/v1``): ``toploc`` is the contract's TOPLOC profile
-    (``chunk_tokens``, ``topk``)."""
-    import torch
-
-    from reliquary.constants import LAYER_INDEX
-    from reliquary.protocol.seed_pool import PROOF_VERSION
-    from reliquary.protocol.signatures import sign_service_episode_commit_binding
-    from reliquary.protocol.toploc_proof import span_proofs_b64
-    from reliquary.shared.forward import forward_single_layer
-
-    tokens = [int(token) for token in tokens]
-    spans = [(int(start), int(end)) for start, end in spans]
-    if not spans or [list(span) for span in spans] != [list(span) for span in episode["assistant_spans"]]:
-        raise ValueError("the commit's spans are the episode's")
-    if not 0 < spans[0][0] or spans[-1][1] != len(tokens):
-        raise ValueError("the spans run from after the prompt to the last token")
-    device = next(model.parameters()).device
-    with torch.no_grad():
-        hidden, logits = forward_single_layer(model, torch.tensor([tokens], device=device), None, LAYER_INDEX)
-    hidden = hidden[0]
-    commitments = verifier.create_commitments_batch(hidden, verifier.generate_r_vec(randomness))
-    # fp32 log_softmax, as the validator and the single-turn miner.
-    log_probs = torch.log_softmax(logits[0].float(), dim=-1)
-    positions = [position for start, end in spans for position in range(start, end)]
-    token_logprobs = [log_probs[position - 1, tokens[position]].item() for position in positions]
-    model_name = getattr(model, "name_or_path", "unknown")
-    prompt_length = spans[0][0]
-    rollout = {"prompt_length": prompt_length, "completion_length": len(tokens) - prompt_length,
-               "success": False, "total_reward": 0.0, "advantage": 0.0, "token_logprobs": token_logprobs,
-               "forced": False, "force_span": None, "episode": dict(episode), "seed_pool": dict(seed_pool),
-               "service_binding": dict(service_binding)}
-    signature = sign_service_episode_commit_binding(tokens, randomness, model_name, LAYER_INDEX, commitments,
-                                                    rollout["service_binding"], rollout["seed_pool"],
-                                                    rollout["episode"], wallet)
-    return {"tokens": tokens, "commitments": commitments, "proof_version": PROOF_VERSION,
-            "model": {"name": model_name, "layer_index": LAYER_INDEX}, "signature": signature.hex(),
-            "beacon": {"randomness": randomness}, "rollout": rollout,
-            "toploc_proofs": span_proofs_b64(hidden, spans, chunk_tokens=toploc.chunk_tokens, topk=toploc.topk)}
-
-
-__all__ = ["ADMITTED_STOPS", "AdmissibleEpisode", "AdmittedStop", "build_signed_episode_commit", "episode_admissible",
-           "episode_metadata", "episode_refusal", "episode_sequence", "episode_stop", "withdraw_inadmissible"]
+__all__ = ["ADMITTED_STOPS", "AdmissibleEpisode", "AdmittedStop", "episode_admissible",
+           "episode_refusal", "episode_sequence", "episode_stop"]

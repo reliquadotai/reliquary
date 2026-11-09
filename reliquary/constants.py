@@ -28,36 +28,11 @@ GRAIL_EPISODE_PROOF_VERSION = "v8"
 
 # ────────────────  CRYPTOGRAPHIC CONSTANTS  ────────────────
 
-# Mersenne prime for modular sketch arithmetic.
-PRIME_Q = 2_147_483_647
-
 # Number of random challenge positions per completion.
 CHALLENGE_K = 32
 
-# PRF domain labels for different randomness derivations.
-RNG_LABEL = {"sketch": b"sketch", "open": b"open", "sat": b"sat"}
-
 # Transformer layer index for hidden state extraction (-1 = last layer).
 LAYER_INDEX = -1
-
-# Top-K activation selection for sketch computation.
-PROOF_TOPK = 16
-
-# Logarithmic bucketing: buckets per sign (16 total = 8 positive + 8 negative).
-PROOF_NUM_BUCKETS = 8
-
-# Bounded coefficient range for sketch robustness: r in [-127, 127].
-PROOF_COEFF_RANGE = 127
-
-# Sketch tolerance at position 0. Keep this synchronized with the current
-# production calibration and docs/mining.md. The value is deliberately higher
-# than the strict same-GPU cheater-curve threshold to leave room for honest
-# cross-kernel / cross-GPU numerical drift during the Qwen3.5 rollout.
-PROOF_SKETCH_TOLERANCE_BASE = 5000
-
-# Sketch tolerance sqrt growth factor per position.
-# tolerance(P) = base + growth * sqrt(P).
-PROOF_SKETCH_TOLERANCE_GROWTH = 5.0
 
 # Attention implementation forced across all model loading paths.
 # Override with GRAIL_ATTN_IMPL for test envs without flash-attn compiled
@@ -65,12 +40,6 @@ PROOF_SKETCH_TOLERANCE_GROWTH = 5.0
 # because sketch commitments are bit-sensitive to attention kernel variance.
 
 ATTN_IMPLEMENTATION = _os.environ.get("GRAIL_ATTN_IMPL", "flash_attention_2")
-
-# How many tokens one verification pass puts on the card at once. A pass costs one traversal of
-# the model, which a streamed replica pays in full, so the budget wants to be as large as the card
-# allows: measured at 13.5 GB of device memory for 65k tokens in flight on a 2048-wide model, and
-# a pass of 32 rollouts costs 0.22 s each against 7.6 s for one alone.
-PROOF_BATCH_TOKEN_BUDGET = int(_os.environ.get("RELIQUARY_PROOF_BATCH_TOKENS", "262144"))
 
 # How many of a request's rollouts one warming pass covers. A group is what a miner submits, so
 # warming a group at a time is what makes the pass shared without holding rows for rollouts the
@@ -99,9 +68,6 @@ PROTOCOL_PROFILE_ID = ACTIVE_PROTOCOL_PROFILE.profile_id
 PROTOCOL_MODEL_ID = ACTIVE_PROTOCOL_PROFILE.model_id
 PROTOCOL_MODEL_REVISION = ACTIVE_PROTOCOL_PROFILE.model_revision
 PROTOCOL_VERSION = ACTIVE_PROTOCOL_PROFILE.protocol_version
-# Draw ordering among equal-difficulty candidates. Part of the signed profile
-# contract, so a miner reads the rule it competes under; None on v2.
-PROTOCOL_THROUGHPUT_TIEBREAK = ACTIVE_PROTOCOL_PROFILE.throughput_tiebreak
 PROTOCOL_GENERATION_CONTRACT = (
     ACTIVE_PROTOCOL_PROFILE.to_generation_contract()
 )
@@ -127,7 +93,7 @@ SUPPORTED_ARCHITECTURES: dict[str, tuple[str, ...]] = {
     # 2026-09-24 rehearsal measured vLLM capture + HF verification on it.
     "Qwen3ForCausalLM": (
         "tests/unit/test_modeling_helpers.py::test_legacy_config_uses_causal_lm_auto_class",
-        "tests/unit/test_corpus_end_to_end.py::model_architecture=\"Qwen3ForCausalLM\"",
+        "tests/unit/test_corpus_task_declaration.py::model_architecture=\"Qwen3ForCausalLM\"",
         "scripts/corpus_e2e.py::--honest-model\", default=\"Qwen/Qwen3-4B-Base\"",
         "docs/runbooks/corpus-task-launch.md::Qwen3-4B-Base (906bfd4b), on one H100",
     ),
@@ -163,12 +129,6 @@ SUPPORTED_ARCHITECTURES: dict[str, tuple[str, ...]] = {
 SUPPORTED_MODEL_ARCHITECTURES = frozenset(SUPPORTED_ARCHITECTURES)
 
 # ────────────────  TIMING (CONSENSUS)  ────────────────
-
-# Blocks per window — 5 blocks × 12s ≈ 60s.
-# All roles use this to determine window boundaries. With a typical tempo of
-# 360 blocks, the EMA covers 72 windows of scoring history per on-chain
-# weight submission, providing ~72× smoothing of miner scores over the epoch.
-WINDOW_LENGTH = 5
 
 # Bittensor block time target average (seconds).
 BLOCK_TIME_SECONDS = 12
@@ -234,19 +194,6 @@ def max_new_tokens_for_environment(environment: str) -> int:
     )
 
 
-def episode_limits_for_environment(environment: str) -> tuple[int, int, int] | None:
-    """Return action-token, episode-token and observation-byte limits."""
-
-    profile = ACTIVE_PROTOCOL_PROFILE.environments.get(environment)
-    episode = profile.episode if profile is not None else None
-    if episode is None:
-        return None
-    return (
-        int(episode.max_action_tokens),
-        int(episode.max_episode_tokens),
-        int(episode.max_observation_bytes),
-    )
-
 # Budget-Forced Termination (BFT): if a rollout has not emitted </think> by
 # BFT_THINKING_BUDGET tokens, the miner appends BFT_FORCE_TEMPLATE and samples
 # the answer in BFT_ANSWER_BUDGET more tokens, so it terminates with a real
@@ -280,18 +227,6 @@ BFT_ANSWER_BUDGET = (
     _MATH_BFT_PROFILE.answer_budget if _MATH_BFT_PROFILE else 0
 )
 BFT_FORCE_TEMPLATE = "</think>\n\nFinal Answer: \\boxed{"
-# Clean-cap vs forced-answer at the budget. True (legacy): an unterminated rollout
-# is force-closed with BFT_FORCE_TEMPLATE + a sampled answer. False (clean-cap):
-# it is left truncated and grades as bad_termination (an honest failure — the
-# verifier already rejects an unterminated, non-forced, sub-protocol-cap rollout).
-# On the 2B the forced answer was a coin-flip that dominated reward variance; the
-# 4B is capable enough that within-group variance exists without it, so clean-cap
-# is the less-polluted signal. Kept True for a STAGED rollout: bump the budget to
-# 16k first (contract-consistent), then flip this to False once miners ship it.
-# WIRE-AFFECTING — flipping requires a coordinated miner+validator deploy.
-BFT_FORCE_ANSWER = bool(
-    _MATH_BFT_PROFILE and _MATH_BFT_PROFILE.force_answer
-)
 # DAPO-style overlong filtering, now OFF by default on every profile. Masking
 # made non-termination gradient-free while terminated-and-wrong stayed punished
 # in proportion to length — the inverted incentive behind the ckpt84 rumination
@@ -423,67 +358,6 @@ TRAIN_FORCED_REWARD_ZERO = (
 # one GRPO group are a sampling policy, not a rare exception, and have become
 # the main manufactured-loser path.
 MAX_TRUNCATED_PER_SUBMISSION = 1
-BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION = 1
-# Both environments keep the single-truncation ceiling. The former Code
-# allowance of three was inconsistent across admission paths and was not safe
-# under fractional rewards. V3 prices the one unknown outcome over the exact
-# validator-known reward lattice.
-# Code has no BFT to force termination, so the 4B loops to the cap on ~10% of
-# code rollouts; at eight rollouts that puts two or more truncations in ~19% of
-# HONEST groups, which a ceiling of one rejects wholesale. Three brings that to
-# ~0.5%. The exactness objection to a larger allowance is answered by
-# robust_truncation_utility pricing every JOINT assignment of the unknowns, so
-# the manufactured-truncation guarantee does not weaken as this rises. Math
-# stays at one: BFT terminates every rollout, so a truncated math rollout means
-# a non-compliant client.
-MAX_TRUNCATED_PER_SUBMISSION_BY_ENV: dict[str, int] = {
-    "opencodeinstruct": 3,
-}
-
-
-def max_truncated_for_environment(
-    environment: str,
-    *,
-    bootstrap: bool = False,
-) -> int:
-    if bootstrap:
-        return BOOTSTRAP_MAX_TRUNCATED_PER_SUBMISSION
-    return MAX_TRUNCATED_PER_SUBMISSION_BY_ENV.get(
-        environment,
-        MAX_TRUNCATED_PER_SUBMISSION,
-    )
-
-# Group-level reward-shape guard. The live attack manufactures binary reward
-# vectors such as 11110000 while cutting every zero-reward rollout to the same
-# local cap (120/150/4500 tokens). Exact repeated loser lengths are vanishingly
-# unlikely under natural sampling, especially when they occupy the ordered
-# suffix of the reward vector.
-REWARD_SHAPE_ZERO_MODE_MIN_LENGTH = 64
-REWARD_SHAPE_ZERO_MODE_MIN_SHARE = 0.75
-REWARD_SHAPE_MIN_REPEATED_ZERO_ROLLOUTS = 2
-REWARD_SHAPE_MIN_EXACT_ZERO_ROLLOUTS = 3
-
-# Training quarantine policy. Quarantine is intentionally conservative: it
-# skips train_step for windows whose selected batch has high-confidence poison
-# signatures, while still archiving the window so emissions/forensics remain
-# visible.
-TRAINING_QUARANTINE_ENABLED = True
-TRAINING_QUARANTINE_MAX_REWARD_VECTOR_SHARE = 0.75
-TRAINING_QUARANTINE_REWARD_VECTOR_MIN_GROUPS = 4
-TRAINING_QUARANTINE_MAX_MEAN_COMPLETION_LENGTH = 24576
-TRAINING_QUARANTINE_MAX_SINGLE_COMPLETION_LENGTH = 32768
-TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_ROLLOUTS = 4
-TRAINING_QUARANTINE_EXTREME_LENGTH_MIN_GROUPS = 3
-TRAINING_QUARANTINE_REJECT_SPIKE_MIN = 32
-TRAINING_QUARANTINE_REWARD_SHAPE_MIN_GROUPS = 2
-TRAINING_QUARANTINE_LONG_ZERO_TAIL_MIN_LENGTH = 16384
-
-# Soft cap on per-hotkey entries persisted to ``archive["rejected"]`` per
-# window. Beyond this, ``reject_counts`` still increments but no metadata is
-# appended — protects the R2 payload size against a flood of garbage
-# submissions from a single attacker.
-REJECTED_LIST_CAP_PER_HOTKEY = 5
-
 # ────────────────  GRPO BATCHING  ────────────────
 
 # Default HTTP port the validator listens on for miner submissions.
@@ -514,17 +388,6 @@ MAX_PROOF_GRADING_ATTEMPTS_PER_WINDOW = int(
 # It is consumed before deferred GRAIL proof, so coupling it to the smaller
 # seal-time proof prefix would let a small set of hotkeys fill an environment
 # with forged commitments before any GPU authentication runs.
-
-# The ceiling above bounds PRODUCTIVE admission: a submission that never
-# reached the grader (protocol conformance) or whose reward simply landed
-# outside the difficulty band is refunded, so one miner's always-invalid
-# flood cannot hold receipts the rest of the fleet needs to fill the window.
-# Refunding alone would leave grading work bounded only by the per-hotkey
-# quota times the fleet size, so this second, never-refunded ceiling caps the
-# total grading starts a window can be made to run. Keep this fixed at the
-# historical 256 even when the productive population changes: it is a
-# denial-of-service backstop, not a slot budget.
-MAX_GRADING_STARTS_PER_WINDOW = 256
 
 if not (
     PRIMARY_PROOF_GRADING_ATTEMPTS_PER_WINDOW
@@ -581,11 +444,6 @@ if (
     < MAX_PENDING_SUBMISSION_BYTES_PER_HOTKEY
 ):
     raise ValueError("per-environment pending byte cap must cover hotkey cap")
-# Absolute server-side bound across active and draining environment queues.
-# Per-batcher reservation caps remain the primary bound; this is the final
-# backstop during a window swap or prolonged GPU stall.
-MAX_PENDING_PROOF_QUEUE_DEPTH = 64
-
 # Reward admission runs before deferred GRAIL proof. Math grading benefits from
 # bounded CPU parallelism; four Code group workers each fan sixteen rollouts through
 # the shared capacity-bounded remote executor client. These are validator-runtime capacities, not miner
@@ -601,18 +459,6 @@ if not 1 <= MATH_ADMISSION_WORKERS <= 16:
 if not 1 <= CODE_ADMISSION_WORKERS <= 8:
     raise ValueError("RELIQUARY_CODE_ADMISSION_WORKERS must be within [1, 8]")
 
-# A hotkey that repeatedly reaches the expensive proof path and then fails
-# behavioural/integrity checks should not be allowed to consume the whole
-# window's scarce proof budget. Allow a small number of misses for honest
-# stack drift, then reject further proof admissions from that hotkey until the
-# next window.
-MAX_EXPENSIVE_PROOF_FAILURES_PER_HOTKEY_PER_WINDOW = 2
-
-# A coldkey may own many hotkeys, so a hotkey-only debt limit does not bound a
-# single operator's seal-time GPU denial of service. Applied independently per
-# environment after ownership is resolved from the window's metagraph snapshot.
-MAX_EXPENSIVE_PROOF_FAILURES_PER_OPERATOR_PER_WINDOW = 4
-
 # Registered-hotkey admission cache. Registration changes at chain cadence, not
 # submission cadence: refresh once per tempo-equivalent interval at a quiescent
 # pre-window boundary. Request handling only reads the immutable snapshot.
@@ -621,38 +467,6 @@ REGISTERED_HOTKEY_STALE_GRACE_SECONDS = float(
     2 * REGISTERED_HOTKEY_CACHE_TTL_SECONDS
 )
 REGISTERED_HOTKEY_REFRESH_TIMEOUT_SECONDS = 20.0
-
-# After the B-th distinct prompt records a seal-trigger drand round, admit only
-# a small tail of same-round stragglers. The hard window cap above remains the
-# outer bound; this cap protects the boundary fair-split extension from turning
-# one drand burst into an unbounded proof backlog.
-MAX_POST_TRIGGER_PROOF_CANDIDATES = 8
-
-# Safety timeout for the pre-seal drain phase. Auction environments stop new
-# admission at the collection deadline, drain work that arrived before it, then
-# freeze the pending population. Legacy mode uses the same bound after its seal
-# trigger. A stuck queue cannot freeze checkpoints indefinitely.
-MAX_SEAL_QUEUE_DRAIN_SECONDS = 60.0
-
-# Auction reveals are already bounded by 64 receipts and 8/4 isolated workers.
-# After upload grace closes, wait for the complete accepted population. If this
-# emergency wall is ever reached, abort the whole window instead of training a
-# timing-dependent partial snapshot.
-AUCTION_ADMISSION_DRAIN_DEADLINE_SECONDS = 390.0
-
-# Liveness poll interval while an OPEN validator window waits for either a
-# normal seal trigger or an exhausted proof-admission queue. This prevents a
-# window from waiting WINDOW_TIMEOUT_SECONDS after all admitted proof work has
-# drained but fewer than B valid submissions survived validation.
-PROOF_ADMISSION_STALL_POLL_SECONDS = 0.5
-
-# Legacy-selector sparse-window liveness breaker. Production auction
-# environments use their adaptive poll plus hard collection ceiling instead;
-# these values remain for the emergency kill-switch path and any out-of-scope
-# environment.
-SPARSE_VALID_IDLE_SEAL_SECONDS = 300.0
-SPARSE_VALID_IDLE_MIN_DISTINCT_PROMPTS = 4
-SPARSE_VALID_MAX_WINDOW_SECONDS = 900.0
 
 # Collection timing is versioned with the generation budget. The advertised
 # value remains the hard ceiling. Adaptive close may finish between 60 s and
@@ -665,19 +479,12 @@ WINDOW_COLLECTION_SECONDS = float(
     ACTIVE_PROTOCOL_PROFILE.collection_seconds
 )
 AUCTION_EARLY_CLOSE_MIN_SECONDS = 60.0
-AUCTION_EARLY_CLOSE_QUIET_SECONDS = 3.0
 if not (
     0 < AUCTION_EARLY_CLOSE_MIN_SECONDS < WINDOW_COLLECTION_SECONDS
 ):
     raise ValueError(
         "adaptive auction minimum must be below the collection ceiling"
     )
-
-# Difficulty-auction v2: number of ranked-pass non-winners proven per window
-# purely for the forensic auth gates (token-auth, distribution, forced-seed),
-# which otherwise only ever run on the winners. Selection is keyed by a drand
-# beacon fetched after the collection deadline, so miners cannot grind it.
-FORENSIC_SAMPLE_PER_WINDOW = 2
 
 # UID that receives unused slot emission budget (the burn address).
 #
@@ -766,9 +573,6 @@ DEFAULT_HF_REPO_ID = "aivolutionedge/reliquary-sn"
 # The async RL lifecycle (rl-async-design.md §4.4) is a 16-rollout protocol: it uses the v4 gate whatever the
 # active profile.
 SIGMA_MIN_V4 = 0.24
-SIGMA_MIN = SIGMA_MIN_V4 if PROTOCOL_VERSION >= 4 else 0.43
-BOOTSTRAP_SIGMA_MIN = 0.22 if PROTOCOL_VERSION >= 4 else 0.33
-
 # Number of rollouts per submission (= size of each GRPO group).
 M_ROLLOUTS = ACTIVE_PROTOCOL_PROFILE.sampling.rollouts
 
@@ -826,15 +630,6 @@ def _require_environment_corpora() -> None:
 
 
 _require_environment_corpora()
-
-# Auction-v3 deliberately narrows only the ranked GPU proof prefix: B_BATCH
-# winners plus B_BATCH possible failed candidates per environment. Derived from
-# B_BATCH rather than written as a literal, so a batch-size change cannot leave
-# the ranked prefix unable to prove the slots it must fill. A v3 fleet
-# qualifies this full ceiling plus the independent forensic budget.
-MAX_RANKED_PROOF_ATTEMPTS_PER_WINDOW = (
-    2 * B_BATCH if PROTOCOL_VERSION >= 3 else 64
-)
 
 # ────────────────  FILL-CLOSED WINDOW (v6)  ────────────────
 
@@ -906,10 +701,6 @@ if FILL_CLOSED_TARGET_GROUPS_PER_ENV != FILL_CLOSED_PICKS_PER_WINDOW * B_BATCH:
     raise ValueError("fill-closed target must equal picks per window * B_BATCH within the journal range")
 _FILL_CLOSED_TRAINABLE_GROUPS_PER_ENV = FILL_CLOSED_TARGET_GROUPS_PER_ENV
 
-# Next RL run (service-contract/v2). Inert unless a service task is configured.
-SERVICE_EXPLORATION_AUDIT_BUDGET_PER_ENV = int(_os.environ.get(
-    "RELIQUARY_SERVICE_EXPLORATION_AUDIT_BUDGET_PER_ENV", str(FILL_CLOSED_TARGET_GROUPS_PER_ENV)))
-SERVICE_EXPLORATION_AUDIT_PRIORITY = 5
 # A hotkey still in exploration probation may hold at most this many reserved rows whose audit has not
 # passed, per (window, env): it cannot squat the whole per-env cap with fake groups before its first audit.
 PROBATION_PENDING_LIMIT = 4
@@ -928,28 +719,6 @@ PROBATION_PENDING_LIMIT = 4
 SERVICE_REPROBATION_PASSES = 20
 SERVICE_STATISTICAL_FAIL_WINDOW = 20
 SERVICE_STATISTICAL_FAIL_MAX = 3
-# Exploration audits (decision C, R15). They run as they are drawn on a plan of their own at
-# ``SERVICE_EXPLORATION_AUDIT_PRIORITY``. At most ``..._INFLIGHT`` are handed to the proof scheduler at a
-# time, so the queue order (past-probation hotkeys first) is decided at the last moment; of every
-# ``..._PROBATION_EVERY`` audits handed over while the window runs, one goes to a hotkey still in
-# probation when one waits, so newcomers see audits every window.
-SERVICE_EXPLORATION_AUDIT_INFLIGHT = 2
-SERVICE_EXPLORATION_PROBATION_EVERY = 4
-SERVICE_EXPLORATION_TICK_SECONDS = 1.0
-# Non-training acceptances (exploration and unproven observations) one hotkey may have in one (window, env)
-# batcher. Beyond it the submission is refused before its payload is retained (R26): the sybil bound on the
-# memory these groups hold for the audit.
-SERVICE_NON_TRAINING_PER_HOTKEY_WINDOW_ENV = 32
-# Seal drain. After the window seals the validator stops admitting exploration, waits at most
-# ``..._DRAW_WAIT_ROUNDS`` drand rounds for pending draws, proves EVERY queued audit of a hotkey past
-# probation (at most ``..._DRAIN_SECONDS`` in all) and lets hotkeys still in probation use only the first
-# ``..._DRAIN_PROBATION_SECONDS`` of that wait. Then it finalizes whatever is left as unaudited (unpaid,
-# never sanctioned), so a stuck proof can delay a window by the bound and never by more.
-SERVICE_EXPLORATION_DRAW_WAIT_ROUNDS = 2
-SERVICE_EXPLORATION_DRAIN_SECONDS = float(_os.environ.get("RELIQUARY_SERVICE_EXPLORATION_DRAIN_SECONDS", "600"))
-SERVICE_EXPLORATION_DRAIN_PROBATION_SECONDS = float(
-    _os.environ.get("RELIQUARY_SERVICE_EXPLORATION_DRAIN_PROBATION_SECONDS", "120"))
-
 # Backstop only. A window normally ends on its fill; this stops stalled
 # candidate supply holding one open forever, and seals whatever is proven.
 #
@@ -1091,21 +860,6 @@ if not (
         f"{FILL_CLOSED_EMISSIONS_PER_WINDOW}]"
     )
 
-# Public identifiers for the v6 ordering change. Historical schema-v1 active
-# windows used rate then payload size; new windows use monotone FIFO.
-LEGACY_FILL_CLOSED_SELECTION_POLICY = "throughput-payload/v1"
-FILL_CLOSED_SELECTION_POLICY = "fifo-ingress/v1"
-
-# Runtime default for CLI/Docker operators. OpenCode remains available through
-# ENVIRONMENT_MIX, but code execution is opt-in until the runsc canary and
-# miner rollout are coordinated.
-DEFAULT_ENVIRONMENTS: str = "openmathinstruct"
-
-# Number of micro-batches accumulated before an optimizer step. Derived
-# from the mix — one micro-batch per active env. Not separately tunable
-# to keep semantics simple.
-GRAD_ACCUM_STEPS: int = len(ENVIRONMENT_MIX)
-
 # Per-env weight in the GRPO loss. The step normalizes token-level *within*
 # each env (each batch is one env), then recombines as Σ_e w_e·L_e. Empty =
 # equal weights (renormalized over the envs present in a window) — so a
@@ -1123,7 +877,6 @@ T_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.temperature
 # Top-p and top-k for sampling (fixed alongside T_PROTO).
 TOP_P_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.top_p
 TOP_K_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.top_k
-DO_SAMPLE_PROTO = ACTIVE_PROTOCOL_PROFILE.sampling.do_sample
 # Which public pick every forced token must be ("inverse_cdf" or "gumbel_max"), and
 # whether the LM head's logits are fp32 on the miner's engine and the validator's
 # proof forward. Both from the profile; see reliquary.environment.forced_sampling.
@@ -1184,19 +937,6 @@ def prompt_cooldown_windows_for_environment(environment: str) -> int:
         return BATCH_PROMPT_COOLDOWN_WINDOWS
     return int(declared)
 
-# Cooldown is restored at startup from a run-keyed snapshot persisted to R2
-# (see CooldownMap.export_state + service._restore_cooldown), so the FULL
-# cooldown survives a restart without replaying the whole
-# BATCH_PROMPT_COOLDOWN_WINDOWS history. COOLDOWN_REBUILD_LOOKBACK now only
-# bounds the *gap replay* — the windows recorded between the last snapshot and
-# the restart — so it just needs to comfortably exceed the snapshot cadence
-# (CHECKPOINT_PUBLISH_INTERVAL_WINDOWS). It is also the scan size for the
-# no-snapshot fallback. The old 300 default under-covered the 1M horizon and
-# let prompts beyond 300 windows back re-enter the batch (replay exploit).
-COOLDOWN_REBUILD_LOOKBACK = int(
-    _os.environ.get("COOLDOWN_REBUILD_LOOKBACK", "2000")
-)
-
 # Identity the cooldown snapshot is keyed by. Stable across restarts of the
 # SAME training run (successive checkpoints share it); change it when starting a
 # fresh training so the cooldown resets to zero — a fresh model must be allowed
@@ -1218,101 +958,6 @@ except ValueError as _exc:
 # Several ids are a corpus-only configuration: `validate` refuses any other
 # mechanism among them before anything reads this single id.
 TASK_ID = TASK_IDS[0]
-
-# How often (in windows) to persist the cooldown snapshot, INDEPENDENT of the
-# checkpoint-publish cadence. Publishing can stall (training starvation, HF
-# publish failures) while windows keep advancing, which would let the snapshot
-# fall arbitrarily far behind current_window — beyond what the gap replay
-# (COOLDOWN_REBUILD_LOOKBACK) can recover, re-opening the replay exploit. A small
-# fixed cadence keeps snapshot_window within this many windows of current.
-COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS = max(
-    1, int(_os.environ.get("COOLDOWN_SNAPSHOT_INTERVAL_WINDOWS", "10"))
-)
-
-# Per-window prompt range (anti pre-curation). Each window, miner and
-# validator derive the same contiguous slice of the prompt index space from
-# the shared per-window randomness; once enforcement is armed only
-# submissions whose prompt_idx falls in the slice are accepted. A static or
-# shared bank of pre-curated prompts then lands in-range only
-# ~PROMPT_RANGE_SIZE/len(env) of windows. See reliquary/shared/prompt_range.py.
-PROMPT_RANGE_SIZE = int(_os.environ.get("PROMPT_RANGE_SIZE", "5000"))
-
-# Window number from which the validator hard-enforces the prompt range.
-# Below this window the slice is NOT enforced (current behavior, no rejects),
-# so the upgraded miner client can ship ahead of the cutover. The default is
-# a "never enforce" sentinel: set PROMPT_RANGE_ENFORCE_FROM_WINDOW=N* to the
-# agreed cutover window AFTER the gated client is released and announced,
-# otherwise un-upgraded miners are rejected ~every window.
-PROMPT_RANGE_ENFORCE_FROM_WINDOW = int(
-    _os.environ.get("PROMPT_RANGE_ENFORCE_FROM_WINDOW", str(2 ** 63 - 1))
-)
-
-# Per-rollout content dedup horizon. Independent of and strictly longer
-# than the prompt cooldown: cooldown lets a prompt come back for fresh
-# content, the hash set blacklists the specific (tokens) of every rollout
-# already trained on. Startup rebuild is bounded for restart latency;
-# operators can widen HASH_DEDUP_RETENTION_WINDOWS when they explicitly
-# want a longer replay horizon and are willing to pay the R2 scan cost.
-HASH_DEDUP_RETENTION_WINDOWS = int(
-    _os.environ.get("HASH_DEDUP_RETENTION_WINDOWS", "300")
-)
-
-# Max submissions any single hotkey can send per window (per-env: one batcher
-# per environment). Counter resets at every new window. Excess submissions are
-# HTTP-rejected as RATE_LIMITED before touching the validation pipeline; a
-# precommit reserves one unit and its reveal does not re-consume, so it is one
-# unit per prompt either way.
-#
-# At exactly B_BATCH a hotkey can cover every prompt slot but has ZERO headroom:
-# a single retry (dropped packet, transient reject) is the (B_BATCH+1)th and is
-# rate-limited out. v4 doubles it to 2·B_BATCH for one full re-coverage of
-# retry/improvement margin. Safe to widen because the EXPENSIVE seal-time GRAIL
-# work is capped independently (MAX_RANKED_PROOF_ATTEMPTS = 2·B_BATCH, grading =
-# MAX_PROOF_GRADING_ATTEMPTS), so this only widens cheap admission bandwidth,
-# not GPU proof load. v3 stays at B_BATCH so live economics are byte-identical.
-# Fill-closed windows contain multiple batches; permit one hotkey to cover
-# the full window with the same 2x attempt margin. GPU/admission budgets and
-# proof-failure limits remain independently enforced. Legacy quotas stay fixed.
-MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = (
-    2 * FILL_CLOSED_EMISSIONS_PER_WINDOW * B_BATCH if FILL_CLOSED_ENABLED
-    else 2 * B_BATCH if PROTOCOL_VERSION >= 4 else B_BATCH
-)
-
-# A signed upload precommit grants only a bounded right to upload.  There is no
-# global receipt ceiling: any global counter can be deliberately burned before
-# honest bodies arrive.  Per-identity active bounds keep receipt memory finite
-# while actual chunks remain subject to the existing byte caps.
-MAX_PENDING_UPLOAD_PRECOMMITS_PER_HOTKEY = B_BATCH
-MAX_PENDING_UPLOAD_PRECOMMITS_PER_OPERATOR = B_BATCH
-
-# Repeated canonical prompt-binding failures identify an incompatible miner
-# client before any useful grading/proof work can happen.  Three mismatches in
-# a bounded rolling window arm a persistent circuit breaker for both the hotkey
-# and its metagraph operator.  Once a cooldown elapses, exactly one signed
-# precommit is admitted as a compatibility canary; another mismatch escalates
-# the cooldown.  Only that exact canary can clear an armed identity.
-#
-# This is validator-local admission policy (no wire/protocol change).  Keep an
-# operational kill switch so a deployment can be rolled back without an image
-# rebuild if unexpected false positives are observed.
-PROMPT_MISMATCH_CIRCUIT_ENABLED = _os.environ.get(
-    "RELIQUARY_PROMPT_MISMATCH_CIRCUIT_ENABLED", "1"
-).strip().lower() not in {"0", "false", "no", "off"}
-PROMPT_MISMATCH_CIRCUIT_FAILURE_THRESHOLD = 3
-PROMPT_MISMATCH_CIRCUIT_FAILURE_WINDOW_WINDOWS = 10
-PROMPT_MISMATCH_CIRCUIT_COOLDOWN_WINDOWS = (10, 50, 250)
-
-# A signed upload receipt is only a network grace token: until its exact body
-# starts arriving it must neither consume productive grading capacity nor keep
-# a window open past collection. Repeated receipts that never start an upload
-# are tracked at the immutable metagraph-operator scope so rotating hotkeys
-# cannot recreate the squatting channel.
-NO_REVEAL_CIRCUIT_ENABLED = _os.environ.get(
-    "RELIQUARY_NO_REVEAL_CIRCUIT_ENABLED", "1"
-).strip().lower() not in {"0", "false", "no", "off"}
-NO_REVEAL_CIRCUIT_FAILURE_THRESHOLD = 4
-NO_REVEAL_CIRCUIT_FAILURE_WINDOW_WINDOWS = 10
-NO_REVEAL_CIRCUIT_COOLDOWN_WINDOWS = (10, 50, 250)
 
 # Adaptive auction close. off | shadow (records eligibility, changes nothing) |
 # enforce. Production already runs enforce; keeping the switch provides an
@@ -1340,41 +985,6 @@ STDIO_ADMISSION_SECONDS_PER_RUN = 0.05
 STDIO_ADMISSION_MAX_WALL_SECONDS = 300.0
 ADMISSION_PROCESS_MAX_TASKS = 128
 
-# Per-hotkey cap on BAD_ENVELOPE_SIGNATURE rejects per window. The
-# envelope-signature gate (PR #35) deliberately does NOT bump
-# ``_per_window_counts`` on bad-sig rejects so an anonymous spoofer
-# cannot drain a victim's legitimate quota by spamming bogus packets
-# under the victim's hotkey — that anti-DoS property is preserved.
-#
-# This cap closes a follow-on side-channel discovered in the wild: the
-# zero-quota bad-envelope channel was being used by the LEGITIMATE
-# hotkey owner to warm HTTP/1.1 keep-alive connections at zero quota
-# cost (fire ~24 bogus POSTs to prime sockets, then ride the warm
-# connections for the real signed POSTs and gain a ~20-30 ms RTT edge
-# on the seal-trigger race against honest single-instance miners).
-#
-# Two defences combine in the fix:
-#   1. ``Connection: close`` is set on every BAD_ENVELOPE_SIGNATURE
-#      response, so the warm-up cannot happen (server tears the socket
-#      down immediately; attacker pays handshake on the next packet).
-#   2. This per-hotkey cap bounds bandwidth and verdict-ring noise even
-#      against an attacker who doesn't care about priming — past the cap
-#      the response is still BAD_ENVELOPE_SIGNATURE but the verdict is
-#      no longer appended to the per-hotkey ring (which would otherwise
-#      let a spoofer flood the victim's ``/verdicts/{hotkey}`` history
-#      with junk that displaces legitimate entries).
-#
-# Crucially the per-hotkey rate-limit quota is never moved by these
-# rejects, so PR #35's invariant holds end-to-end: an anonymous spoofer
-# firing N bad packets against victim V's hotkey writes at most
-# ``MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW`` verdict-ring entries and
-# burns N handshakes, but V's full legitimate quota is untouched.
-#
-# Cap of 2 is low because honest miners have no reason to emit multiple
-# bad envelopes per window — anything beyond a single accidental signing
-# bug strongly suggests intent.
-MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW = 2
-
 # When True, /submit verifies ``envelope_signature`` before any per-hotkey
 # rate-limit increment, and rejects unsigned / malformed / wrong-signer
 # requests as BAD_ENVELOPE_SIGNATURE. This closes the trivial DoS where
@@ -1397,98 +1007,6 @@ if FILL_CLOSED_ENABLED and not DIFFICULTY_AUCTION_ENFORCE:
     raise ValueError(
         "v6 fill-closed requires RELIQUARY_DIFFICULTY_AUCTION_ENFORCE=1"
     )
-DIFFICULTY_AUCTION_ENVIRONMENTS = tuple(
-    ACTIVE_PROTOCOL_PROFILE.environments
-)
-
-ENFORCE_ENVELOPE_SIGNATURE = _os.environ.get(
-    "RELIQUARY_ENFORCE_ENVELOPE_SIGNATURE", "1"
-).strip().lower() not in ("0", "false", "no", "off", "")
-
-# Recompute the exact root emitted by existing wire-v1 miners. The check ships
-# in shadow mode because privately maintained miners may have copied or
-# reimplemented the historical serializer. Once live telemetry demonstrates
-# byte parity, operators can enable rejection without changing miner payloads
-# or signatures.
-LEGACY_MERKLE_ROOT_ENFORCE = _os.environ.get(
-    "RELIQUARY_LEGACY_MERKLE_ROOT_ENFORCE", "false"
-).strip().lower() in ("1", "true", "yes", "on")
-
-# Max graded pending submissions retained per prompt per window. Once reached,
-# further submissions for that prompt are rejected as PROMPT_FULL before any
-# deferred GPU proof. Auction logical dedup separately permits only one claim
-# per (operator, prompt), so this cap bounds distinct-operator crowding.
-MAX_SUBMISSIONS_PER_PROMPT = 10
-
-# Legacy counterfactual retained for the emergency kill-switch path. Production
-# auction environments emit an armed schema through the same historical field
-# name for dashboard compatibility; this computation runs only when production
-# auction enforcement is disabled for an environment.
-DIFFICULTY_AUCTION_SHADOW_ENABLED = _os.environ.get(
-    "RELIQUARY_DIFFICULTY_AUCTION_SHADOW_ENABLED", "1"
-).strip().lower() not in ("0", "false", "no", "off", "")
-DIFFICULTY_AUCTION_SHADOW_ENVIRONMENTS = ("openmathinstruct",)
-DIFFICULTY_AUCTION_DELTA = 1.0
-
-# Flat auction valuation: every in-zone group ranks (and records) the same
-# value, so slot selection reduces to the sigma gate plus the throughput /
-# arrival tie-breaks. Removes the k=2 value peak (the Sybil duel target), the
-# manufactured-zero premium (+68% at k=6 under the peaked value function), and
-# the difficulty-hunting incentive: the batch k-distribution becomes the
-# natural corpus-times-model distribution, DAPO-style uniform + filter.
-#
-# Measured on production winners (.r2_analysis/_kcost.py, windows 27410-27494,
-# math): median generation cost is flat across k — 127.6k/127.6k/127.1k/
-# 127.0k/126.5k tokens for k=2..6 — while value-per-token under delta=1 pays
-# k=2 three times k=6 (2.55 vs 0.86 per Mtok). Same cost, 3x the pay: the
-# peak is pure incentive distortion, and the trained pool sits at mode k=2
-# (39% math, 65-88% code). Flat pay-per-token is ~7.87/Mtok for every k.
-#
-# Per-slot payment is already flat (pool / B_BATCH), so this changes which
-# groups win slots, never how much a slot pays. Default off.
-DIFFICULTY_AUCTION_FLAT_VALUE = _os.environ.get(
-    "RELIQUARY_DIFFICULTY_AUCTION_FLAT_VALUE", "0"
-).strip().lower() in ("1", "true", "yes", "on")
-
-# Conservative valuation of truncated rollouts (closes the manufactured-zero
-# hole). The auction pays more for HARD prompts (value peaks at low k), so a
-# miner can inflate a prompt's value by breaking one of its own correct
-# rollouts: suppressing EOS runs it to max_tokens, where it grades 0 and the
-# prompt looks harder. Measured on the live value function, one manufactured
-# zero at k=6 is worth +68%. GPU tests showed this is NOT reliably detectable —
-# an EOS-suppressed rollout looks like honest rambling, and any detector is
-# farmable (a miner retries prompts until one evades).
-#
-# So price it instead of policing it: a truncated rollout has no gradeable
-# answer, and the validator cannot know whether it would have been correct, so
-# the group is valued under the interpretation LEAST favourable to the miner
-# (min over "j of the truncated were actually correct", j = 0..t). The true
-# outcome is always one of those interpretations, so a manipulated group can
-# never score above its honest value — verified exhaustively over every
-# (k, truncated-correct, truncated-wrong) combination: 0 profitable cases.
-# Cost: an honestly-rambling group is also valued down, worst at high k (easy
-# prompts, already near-worthless) and mildest at low k (−7% at k=2), which is
-# where the auction competition actually happens. It also lets
-# MAX_TRUNCATED_PER_SUBMISSION be relaxed: groups that are rejected outright
-# today (earning zero) become admissible and earn a conservative value instead.
-# Auction/emission only — training keeps the real reward vector.
-# Declared in code, not by environment: this decides HOW MUCH a submission is
-# worth, and a miner cannot read the validator's environment. An env-only
-# scoring rule is invisible to the people it prices — and it silently reverts on
-# a clean redeploy (see DRAND_ROUND_BACKWARD_TOLERANCE, which rejected honest
-# miners for exactly that reason). Turning this on is a one-line PR: reviewable,
-# versioned, announced.
-CONSERVATIVE_TRUNCATION_VALUE = False
-# V3 uses the exact reward lattice and includes sigma eligibility in the
-# minimization. The older endpoint-only scorer remains available solely for
-# historical replay tests and must never be activated as the v3 defense.
-ROBUST_TRUNCATION_UTILITY_ENABLED = PROTOCOL_VERSION >= 3
-# The live proof budget currently caps each environment at 96 grading attempts.
-# Keep an independent ceiling so a future admission change cannot turn passive
-# telemetry into unbounded seal-time CPU or archive growth.
-DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES = int(
-    _os.environ.get("RELIQUARY_DIFFICULTY_AUCTION_SHADOW_MAX_CANDIDATES", "96")
-)
 DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR = int(
     _os.environ.get(
         "RELIQUARY_DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR", "2"
@@ -1499,53 +1017,6 @@ if DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR <= 0:
         "RELIQUARY_DIFFICULTY_AUCTION_SHADOW_MAX_SLOTS_PER_OPERATOR "
         "must be positive"
     )
-
-# How many drand-quicknet rounds backward of the validator's current round
-# the batcher accepts on the ``drand_round`` field. Default = 0: strict
-# equality. The miner must attach the drand round currently in progress
-# at HTTP arrival.
-#
-# Why zero is safe now
-# --------------------
-# The two reasons the tolerance was widened in earlier iterations are
-# both eliminated by the v2.3 fixes on this branch:
-#
-#   * Worker-side dequeue lag (PR #31 → tol=10). The seal/drand re-check
-#     used to run on the worker, minutes after arrival under GRAIL queue
-#     backpressure. Removed by the arrival-time refactor — drand is now
-#     checked only once at HTTP arrival, against the middleware-stamped
-#     ``t_arrival``.
-#   * RTT boundary crossing (commit 8b7f483 → tol=1). A miner firing at
-#     t=2.99 s of round R would land at the validator at t=3.00 s of
-#     R+1. Well-behaved miners are expected to apply a small boundary-
-#     safety margin client-side and sleep past the boundary if their
-#     corrected clock is within a few hundred ms of one. With both
-#     sides NTP-synced and the miner respecting the safety window, no
-#     honest submission should land in the wrong drand round.
-#
-# Submitted drand no longer participates in auction rank, but accepting an old
-# round still weakens the signed freshness contract and makes replay analysis
-# ambiguous. Keep this at zero. Cross-continent body upload is handled by the
-# signed precommit/reveal grace, whose drand observation is fixed when the small
-# precommit reaches the validator; widening this tolerance is not the transport
-# fix.
-# Tests pin specific values explicitly via
-# ``GrpoWindowBatcher(drand_round_backward_tolerance=...)``.
-#
-# Forward direction is also zero (FUTURE_ROUND is unrecoverable: a miner
-# that attaches round R+1 hasn't seen σ_{R+1} yet, so they're cheating).
-DRAND_ROUND_BACKWARD_TOLERANCE = int(
-    _os.environ.get("DRAND_ROUND_BACKWARD_TOLERANCE", "0")
-)
-
-# Bootstrap phase: first BOOTSTRAP_WINDOWS of a new subnet/checkpoint use
-# relaxed thresholds to keep the batch filling while miner pop + env
-# coverage are thin.
-BOOTSTRAP_WINDOWS = 100
-
-# First on-chain block at which this subnet deployed v2. Used to
-# determine bootstrap eligibility. Set at the coordinated cutover.
-SUBNET_START_BLOCK = 0
 
 # ────────────────  v2.1 BATCH-DRIVEN WINDOWS  ────────────────
 
@@ -1570,9 +1041,6 @@ if FILL_CLOSED_ENABLED and (
 ):
     raise ValueError("fill proof deadline must finish before the service window timeout")
 
-
-# Local directory for staged checkpoint files before R2 upload.
-CHECKPOINT_STAGING_DIR_DEFAULT = "reliquary/state/checkpoints"
 
 # ────────────────  SCORING  ────────────────
 
@@ -1621,12 +1089,6 @@ if (
         f"{MIN_INCENTIVE_RAMP_START} must be between 0.0 and "
         f"MIN_INCENTIVE_SHARE={MIN_INCENTIVE_SHARE}"
     )
-
-# Whether each window's pool follows the discovered emission price. Armed by
-# default; "0" is the kill switch, and the price is then only published.
-EMISSION_PRICE_ARMED = _os.environ.get(
-    "RELIQUARY_EMISSION_PRICE_ARMED", "1"
-).strip().lower() in ("1", "true", "yes", "on")
 
 # ────────────────  GRPO TRAINING (v2.1)  ────────────────
 
@@ -1690,13 +1152,6 @@ if MINER_GENERATION_BACKEND not in ("transformers", "vllm"):
     raise ValueError(
         "RELIQUARY_MINER_GENERATION_BACKEND must be 'transformers' or 'vllm'"
     )
-# Concurrent rollouts the vLLM engine keeps in flight. 256 measured 6,050 tok/s
-# on an H200; the ceiling is the KV cache, which vLLM pages.
-MINER_VLLM_MAX_NUM_SEQS = int(
-    _os.environ.get("RELIQUARY_MINER_VLLM_MAX_NUM_SEQS", "256")
-)
-
-
 PPO_CLIP_EPSILON_LOW = 0.2
 PPO_CLIP_EPSILON_HIGH = 0.28 if PROTOCOL_VERSION >= 4 else 0.2
 
@@ -1747,14 +1202,6 @@ _PROFILE_KL_BETA = (
 KL_BETA = float(_os.environ.get("RELIQUARY_KL_BETA", _PROFILE_KL_BETA))
 if not 0.0 <= KL_BETA <= 1.0:
     raise ValueError("RELIQUARY_KL_BETA must be finite and within [0, 1]")
-KL_BETA_EXPLICIT = "RELIQUARY_KL_BETA" in _os.environ
-
-# Optional fixed KL reference checkpoint. This should normally be the run's ck0
-# policy, not an unrelated raw pretrained model. Fixed mode is an explicit
-# reproducibility contract: the value must be "repo@<full HF commit SHA>".
-# Empty keeps the legacy rolling last-published verify_model reference.
-KL_BASE_MODEL = _os.environ.get("RELIQUARY_KL_BASE_MODEL", "").strip()
-
 # Max gradient norm before step — standard RL stability guard.
 GRAD_CLIP_NORM = 1.0
 
@@ -1797,31 +1244,6 @@ RECOMPUTE_PI_OLD_FROM_VERIFY = _os.environ.get(
 # (never to miner-claimed values). Kill-switch, no redeploy: set to 0.
 PI_OLD_FROM_VERIFY_LOGPROBS = _os.environ.get(
     "RELIQUARY_PI_OLD_FROM_VERIFY_LOGPROBS", "true"
-).strip().lower() in ("1", "true", "yes", "on")
-
-# Pipelined window collection. When on, the next
-# window's collection opens BEFORE the previous window's GPU half (proofs +
-# train) runs, hiding the collection deadline entirely under GPU work:
-# cycle -> max(GPU, collection) ~= P+T. Nothing is proven before its own
-# deadline, the GPU stays strictly serial, and the verify-model swap at
-# publish is deferred until the last window generated under the old
-# checkpoint has been proven. Default OFF: flipped per-deploy in the compose
-# overlay after a soak of the serial path on the same image.
-PIPELINED_WINDOWS = _os.environ.get(
-    "RELIQUARY_PIPELINED_WINDOWS", "0"
-).strip().lower() in ("1", "true", "yes", "on")
-
-# Detached-trainer plumbing (spec 2026-08-21-detached-trainer-r2).
-# WRITE_TRAINING_PAYLOADS turns on the per-window R2 training payload
-# (and tombstone) writer; it is independent from the trainer cutover so
-# a shadow trainer can consume live payloads while in-process training
-# still runs. DETACHED_TRAINER removes the in-process train/publish and
-# swaps checkpoints from the trainer's R2 candidate manifest instead.
-WRITE_TRAINING_PAYLOADS = _os.environ.get(
-    "RELIQUARY_WRITE_TRAINING_PAYLOADS", "0"
-).strip().lower() in ("1", "true", "yes", "on")
-DETACHED_TRAINER = _os.environ.get(
-    "RELIQUARY_DETACHED_TRAINER", "0"
 ).strip().lower() in ("1", "true", "yes", "on")
 
 # Memoize transformers' flash-attention unpad metadata per attention mask.
@@ -1898,105 +1320,12 @@ WANDB_TRAINING_VERSION = _os.environ.get("RELIQUARY_WANDB_VERSION", "v1")
 # cross-GPU / cross-attn / cross-batch trials with 0 % false-positive
 # rate. Do not re-tune without the same empirical setup.
 
-# Minimum probability the model must have assigned to EOS at the position
-# that produced it. Below this threshold, the rollout is presumed to be
-# artificially truncated (a miner truncating mid-reasoning to lock in a
-# favourable partial output). Upstream grail uses 0.02; we lowered to 0.01
-# after Qwen-family + T_PROTO=0.9 prod logs showed honest EOS clustering just
-# below 0.02. Mid-reasoning forgery still fails (p_stop typically < 0.001).
-# v4 (full-support T=1.0) values below were calibrated on H100 2026-08-12:
-# 40 honest Qwen3-4B-Base rollouts, real OMI prompts, 16384 cap, generation
-# through the miner's forced-seed path and verification through this repo's
-# validator functions, same box (a LOWER bound on cross-stack drift).
-MIN_EOS_PROBABILITY = 0.001 if PROTOCOL_VERSION >= 4 else 0.01
-
-# LogprobValidator: max allowed median importance-sampling deviation
-# across K=CHALLENGE_K positions. dev_i = exp(|model_lp - miner_lp|) - 1.
-# Reverted to GRAIL upstream's 0.10 (calibrated at 0% FP, ~50% headroom
-# over the worst honest case). The previous 0.01 was tightened against
-# same-stack miners observed at ~0.00013 median dev, but cross-stack
-# honest drift (transformers 4.x miner ↔ 5.x validator) sits around
-# 0.03-0.04 and was getting falsely rejected. 0.10 still flags clearly
-# stale or forged checkpoints (cheater drift grows quickly past 0.10),
-# while making the network functional for the majority of honest setups.
-LOGPROB_IS_EPS = 0.10
-
-# DistributionValidator: chosen-token probability thresholds. A "chosen
-# token" is the token the miner sampled at step t; its probability under
-# the validator's model (at the protocol temperature) is
-# p_t = softmax(logits_{t-1} / T)[token_t].
-SAMPLING_MIN_STEPS = 30         # completion must be at least this long
-SAMPLING_LOW_P = 0.10           # prob <= this → "low" chosen token
-SAMPLING_HIGH_P = 0.90           # prob >= this → "high" chosen token
-# v4: honest full-support sampling legitimately visits the tail, so both
-# floors drop to sit under the calibrated honest minima (median 0.121,
-# q10 0.00064) while staying far above forged-token mass (~1/vocab ≈ 7e-6).
-SAMPLING_MEDIAN_LOW_MAX = (
-    0.05 if PROTOCOL_VERSION >= 4 else 0.30
-)                               # median chosen prob must be above
-SAMPLING_LOW_Q10_MAX = (
-    0.0002 if PROTOCOL_VERSION >= 4 else 0.025
-)                               # 10th-percentile must be above
-
-# OpenMath final-answer tamper guard. The reward parser keys off the last
-# \boxed{...} content; swapping a few tokens there flips the reward without
-# moving median/q10. Tampered tokens land at p ≈ 1/vocab (~10⁻⁵ or lower)
-# under the validator's forward; honest low-confidence answer tokens stay
-# above ~10⁻³. Threshold sits in the gap.
-BOXED_ANSWER_MIN_PROB = 0.001
-
-# Token authenticity: a completion token whose chosen probability collapses
-# below this while the model's argmax sits at >= TOKEN_AUTH_ARGMAX_CONF was not
-# sampled — it was injected. Calibrated on 550k honest vLLM->HF tokens (floor
-# 3.5e-7); measured injections <= 1e-13.
-TOKEN_AUTH_THRESHOLD = 1e-8
-TOKEN_AUTH_ARGMAX_CONF = 0.99
-# Shadow mode: compute + log the check without rejecting. Flip to True once prod
-# shadow logs confirm zero false positives.
-TOKEN_AUTH_ENFORCE = True
-
-# All-token argmax-gated authenticity gate: a chosen completion token below this
-# threshold while the model's argmax is >= the confidence bound is flagged.
-# v5 samples the full distribution via a public inverse CDF, so a low-probability
-# token can be the legal seed-selected token. Keep telemetry, but do not reject
-# on this signal alone.
-ALL_TOKEN_AUTH_SHADOW_THRESHOLD = 1e-5
-ALL_TOKEN_AUTH_SHADOW_ARGMAX_CONF = TOKEN_AUTH_ARGMAX_CONF
-# Fill-closed keeps V5's full-support sampler: a legal tail draw is still
-# telemetry, not proof of tampering. Other V6 development profiles are separate.
-ALL_TOKEN_AUTH_ENFORCE = PROTOCOL_VERSION != 5 and not FILL_CLOSED_ENABLED
-
-# OpenCode semantic-token authenticity shadow gate. Generic token auth catches
-# near-impossible injections, and numeric auth catches many literal edits, but
-# plausible code edits can live at probabilities far above 1e-10. In shadow
-# mode, flag low-probability tokens that fall inside AST-sensitive code spans
-# (operators, boolean/keyword values, return/index/literal regions). Keep this
-# disabled until honest OpenCode calibration proves an acceptable false-positive
-# rate.
-CODE_SEMANTIC_AUTH_THRESHOLD = 0.001
-CODE_SEMANTIC_AUTH_ARGMAX_CONF = TOKEN_AUTH_ARGMAX_CONF
-CODE_SEMANTIC_AUTH_ENFORCE = False
-
 # ──────────────── FORCED-SEED SAMPLING ────────────────
 # Domain separation for the per-position public uniform u_{i,t}.
 FORCED_SEED_DOMAIN = f"reliquary-forced-seed-v{PROTOCOL_VERSION}"
 # A position counts toward the seed-consistency check only if its warped max
 # probability is below this (i.e. the forced draw actually chooses the token).
 FORCED_SEED_STOCHASTIC_MAXPROB = 0.99
-# Reject a group whose stochastic-position match rate is below this floor.
-# Keep the wire-v1 acceptance floor unchanged during the telemetry-only
-# rollout. Live 2026-07-14 data supports a future 0.90 candidate, but changing
-# acceptance policy belongs to the announced miner/protocol cutover after the
-# exact-CDF shadow gate has been calibrated across implementations.
-# Group-aggregate floor: _forced_seed_verdict sums (n_stoch, n_match) over ALL
-# rollouts of a prompt, so this gates the GROUP mean — ~0.95 for honest miners
-# at every sampling envelope (measured: v4 short groups 0.948-0.981, the 16k
-# aggregate 0.9495, v3 unchanged) while a pregenerated group scores 0.59-0.67
-# (H100 red-team 2026-08-12). 0.80 sits mid-gap, ~13pt margin on both sides.
-# It never needed a v4 value: only the per-ROLLOUT floor below had to drop for
-# v4's tail-heavy single-rollout drift. The 08-12 calibration briefly set this
-# to 0.70, which left only 3pt over pregeneration — reverted.
-FORCED_SEED_CONSISTENCY_FLOOR = 0.80
 # Below this many stochastic positions in a group, the gate abstains (accepts)
 # rather than risk a false reject on thin signal.
 FORCED_SEED_MIN_STOCH_POSITIONS = 30
@@ -2061,73 +1390,6 @@ RL_TERMINAL_GAP = 1.0
 # The model tokens (16 x 64) an out-of-zone group needs for its first-scan pay: a group of near-empty rollouts
 # verifies nothing and earns nothing. PLACEHOLDER.
 RL_FIRST_SCAN_MIN_TOKENS = 1024
-FORCED_SEED_CDF_ENFORCE = _os.environ.get(
-    "FORCED_SEED_CDF_ENFORCE", "false"
-).strip().lower() in ("1", "true", "yes", "on")
-# Master switch for forced-seed ENFORCEMENT. False = shadow (compute + log the
-# consistency score, never reject); True = enforce (reject a group / rollout
-# below the floors). Ships True so merging the branch arms the gate directly --
-# merge ONLY once miners run the forced-seed client, else honest legacy miners
-# are rejected. Env override (FORCED_SEED_ENFORCE=false) is a no-redeploy kill
-# switch; any non-truthy value disables (never crashes, never auto-arms garbage).
-FORCED_SEED_ENFORCE = _os.environ.get(
-    "FORCED_SEED_ENFORCE", "true"
-).strip().lower() in ("1", "true", "yes", "on")
-# Wire-advertised on BatchSubmissionRequest.protocol_version by clients that
-# sample from the forced stream (0 = legacy/pre-forced-seed). Lets the operator
-# identify clients that implement the forced stream.
-# v2 drops the hotkey from the forced seed (u_at) to kill multi-hotkey variance
-# farming — a coordinated miner+validator change, so it bumps the version.
-# This runtime implements only the v2 stream. With a checkpoint pinned and
-# forced-seed enforcement enabled, the validator rejects every other advertised
-# version before quota, reward grading, or proof admission. Deploy miners and
-# validator as a coordinated hard cutover; FORCED_SEED_ENFORCE=false is the
-# emergency compatibility switch.
-FORCED_SEED_PROTOCOL_VERSION = PROTOCOL_VERSION
-
-# Operator assertion that the CURRENT runtime is at least as fast on the proof
-# path as the one the proof-capacity manifest benchmarked (e.g. right after a
-# kernel upgrade such as installing causal-conv1d). Lets the stored
-# qualification carry over as a conservative lower bound instead of
-# crash-looping the weight-setter on the runtime-fingerprint check. Fail-closed
-# by default. NEVER assert this for a change that could slow proofs down —
-# re-run the capacity benchmark instead.
-PROOF_CAPACITY_ACCEPT_FASTER_RUNTIME = (
-    _os.environ.get("RELIQUARY_PROOF_CAPACITY_ACCEPT_FASTER_RUNTIME", "0")
-    not in ("0", "false", "False")
-)
-
-
-# Run the GRAIL proof plane in a dedicated process, one per proof device.
-#
-# The proof thread releases and re-acquires the GIL on every CUDA op — hundreds
-# of times per forward. Sharing an interpreter with the event loop, which holds
-# the GIL in long blocks to parse submission bodies and spawn admission
-# workers, convoys it off the lock. Measured 2026-08-23 on an H100: the same
-# forward costs 28.7 ms alone and 29.6 s against one CPU-bound python thread;
-# in production the partial convoy showed up as 161 ms of wall time per
-# forward, and 75% of a 139 s seal half.
-#
-# Every kernel, shape and dtype is identical to the in-process path, so no
-# accept/reject decision can shift.
-#
-# The earlier note here said a second worker on one GPU measures x1.04 because
-# the CUDA contexts time-slice, and that the replica MOVES so device memory is
-# unchanged. The time-slicing is real — see PROOF_SLOTS_PER_DEVICE, which is
-# what an MPS server fixes — but the move is not: nothing frees this process's
-# pair, so isolation ADDS a replica. Measured on the live validator
-# 2026-08-25: 31.4 GB in the main process (two replicas plus their allocator
-# blocks, sm=0 across a full proof burst) beside 10.3 GB in the worker. See
-# proof_worker.validator_replica_device, which now keeps this process's pair
-# on the CPU whenever the plane is isolated.
-#
-# Off by default; the isolated plane requires the detached-trainer checkpoint
-# intake, which is what stages a snapshot directory the worker can reload from.
-PROOF_PROCESS_ISOLATION = (
-    _os.environ.get("RELIQUARY_PROOF_PROCESS_ISOLATION", "0")
-    .strip().lower() in {"1", "true", "yes", "on"}
-)
-
 # Proof processes per GPU. Isolation gave the proof interpreter its own GIL;
 # slots give the card more than one interpreter feeding it.
 #
@@ -2173,10 +1435,6 @@ if PROOF_WORKER_REQUEST_TIMEOUT_SECONDS <= 0:
     raise ValueError(
         "RELIQUARY_PROOF_WORKER_REQUEST_TIMEOUT_SECONDS must be positive"
     )
-# Proof batches the controller keeps in flight per remote slot, so uploads and
-# downloads overlap GPU work. 1 keeps slot ids and behaviour unchanged.
-PROOF_PIPELINE_DEPTH = int(_os.environ.get("RELIQUARY_PROOF_PIPELINE_DEPTH", "1"))
-
 # Loading an 8 GB replica from a staged snapshot is slower than a proof.
 PROOF_WORKER_RELOAD_TIMEOUT_SECONDS = float(
     _os.environ.get("RELIQUARY_PROOF_WORKER_RELOAD_TIMEOUT_SECONDS", "900")

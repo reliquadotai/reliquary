@@ -3,81 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from reliquary.protocol.service_contract import PUBLIC_SEED_POOL, ServiceContract, supported_v2_capabilities
-
-
-def parse_service_announcement(announcement: dict, *, contract: ServiceContract | None = None):
-    """``(contract, schedule)`` of a window's announcement, checked (v2 only, capabilities). A batcher
-    parses its frozen announcement once per window and hands the pair to ``validate_submission_policy``.
-    ``contract``: the announcement's contract when the caller already parsed it."""
-    from reliquary.protocol.service_schedule import ServiceSchedule
-
-    if contract is None:
-        from reliquary.protocol.service_catalogue import announced_contract
-
-        contract = announced_contract(announcement)
-    if contract.version != 2:
-        raise ValueError("only service-contract/v2 runs RL")
-    contract.require_capabilities(set(announcement["supported_capabilities"]))
-    contract.require_capabilities(set(supported_v2_capabilities(contract)))
-    return contract, ServiceSchedule.from_dict(announcement["schedule"], contract)
-
-
-def validate_submission_policy(request, announcement: dict | None, *, parsed=None) -> ServiceContract | None:
-    """``parsed``: the announcement's ``parse_service_announcement`` result, when the caller holds it."""
-    from reliquary.protocol.seed_pool import PoolSelection, pool_from_service_policy, validate_rollout_selection
-    from reliquary.protocol.service_submission import ServiceBinding, validate_service_rollout_bindings
-
-    binding = getattr(request, "service_binding", None)
-    selection = getattr(request, "pool_selection", None)
-    metadata = [r.commit.get("rollout") or {} for r in request.rollouts]
-    if any(not isinstance(row, dict) for row in metadata):
-        raise ValueError("invalid rollout metadata")
-    if announcement is None:
-        from reliquary.protocol.submission import is_signed_episode
-
-        if (binding is not None or selection is not None
-                or any(row.get("service_binding") is not None or row.get("seed_pool") is not None for row in metadata)
-                or any(is_signed_episode(row) for row in metadata)):
-            raise ValueError("service metadata requires an active service task")
-        return None
-    contract, schedule = parse_service_announcement(announcement) if parsed is None else parsed
-    if binding is None:
-        raise ValueError("service task requires a signed service binding")
-    intent = ServiceBinding.from_dict(binding)
-    if intent.contract_sha256 != contract.sha256:
-        raise ValueError("service contract revision mismatch")
-    commits = [r.commit for r in request.rollouts]
-    names = {r.env_name for r in request.rollouts}
-    named = next(iter(names)) if len(names) == 1 else None
-    # An env whose contract entry has an episode block takes signed episodes, and only those.
-    # A v1 contract has no environments block, hence no episode env.
-    signed = (contract.version == 2 and isinstance(named, str)
-              and "episode" in (contract.environments.get(named) or {}))
-    validate_service_rollout_bindings(intent, commits, signed_episodes=signed)
-    if signed:
-        # The wire caps a signed episode at the corpus trajectory cap; the order caps it at its own limit.
-        limit = contract.episode_policy(named).max_episode_tokens
-        if any(row.get("completion_length", 0) > limit for row in metadata):
-            raise ValueError("a signed episode is over the order's max_episode_tokens")
-    if request.checkpoint_hash != announcement["checkpoint"]["revision"]:
-        raise ValueError("service checkpoint mismatch")
-    environments = {r.env_name for r in request.rollouts}
-    if len(environments) != 1:
-        raise ValueError("a service group belongs to one environment")
-    environment = next(iter(environments))
-    if environment not in schedule.active_environments():
-        raise ValueError("service environment is not active")
-    policy = contract.environment(environment)
-    if policy["sampling"]["kind"] == PUBLIC_SEED_POOL:
-        pool = pool_from_service_policy(announcement, environment=environment, prompt_idx=request.prompt_idx,
-                                        checkpoint_hash=request.checkpoint_hash)
-        validate_rollout_selection(pool, PoolSelection.from_dict(selection), commits, signed_episodes=signed)
-    elif selection is not None or any(row.get("seed_pool") is not None for row in metadata):
-        raise ValueError("pool metadata is not allowed by this contract")
-    if intent.purpose == "exploration" and policy["exploration"] != 1:
-        raise ValueError("exploration is not enabled for this environment")
-    return contract
+from reliquary.protocol.service_contract import ServiceContract
 
 
 MISSING_BOX_UNCERTAIN = "uncertain"
@@ -102,32 +28,11 @@ def missing_box_problems(contract: ServiceContract) -> list[str]:
     ]
 
 
-def missing_box_is_uncertain(environment: str, contract: ServiceContract) -> bool:
-    """Whether a properly terminated completion with no ``\\boxed`` is an uncertain outcome.
-
-    It grades 0 either way. The contract's per-environment ``missing_box`` decides, and only
-    for an environment whose final answer is boxed: elsewhere there is no box to miss.
-    """
-    from reliquary.environment.registry import get_environment_spec
-
-    try:
-        boxed = get_environment_spec(environment).final_answer_policy == "boxed"
-    except ValueError:
-        boxed = False
-    return boxed and contract.environment(environment)["missing_box"] == MISSING_BOX_UNCERTAIN
-
-
 def _indices(values, size: int) -> tuple[int, ...]:
     out = tuple(dict.fromkeys(values))
     if any(type(index) is not int or not 0 <= index < size for index in out):
         raise ValueError("a rollout index must identify one rollout of the group")
     return out
-
-
-def uncertain_rollout_indices(*, truncated_indices=(), unboxed_indices=(), size: int) -> tuple[int, ...]:
-    """Rollouts whose reward is not trusted: cut by the length cap (every environment), or
-    terminated without a box where the caller established that a missing box is uncertain."""
-    return _indices((*truncated_indices, *unboxed_indices), size)
 
 
 @dataclass(frozen=True, slots=True)

@@ -482,9 +482,9 @@ def test_the_pay_route_publishes_prices_and_balances(book):
     assert one["hotkeys"] == {VALIDATOR.ss58_address: {"accrued": 0.0, "paid": 0.0, "forfeited": 0.0}}
     assert client.get("/rl/pay", params={"hotkey": "nope"}).status_code == 422
 
-    from reliquary.validator.server import ValidatorServer
+    from reliquary.validator.rl_http import RlHttpApp
 
-    server = ValidatorServer()
+    server = RlHttpApp()
     server.mount_rl_lease_router(build_rl_lease_router(
         book=book, collector=LeaseCollector(book, interval_s=0.0), validator_hotkey=VALIDATOR.ss58_address,
         clock=lambda: NOW, pay=ledger))

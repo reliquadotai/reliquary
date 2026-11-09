@@ -22,12 +22,11 @@ import pytest
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-from reliquary.cli.main import app as cli, mount_corpus_service
+from reliquary.cli.main import app as cli
 from reliquary.environment.agentic.renderers import renderer_for
 from reliquary.environment.registry import ENVIRONMENT_SPECS
 from reliquary.infrastructure import corpus_job_store as job_store
 from reliquary.protocol.corpus_submission import CorpusSubmissionRequest
-from reliquary.validator.server import ValidatorServer
 from tests.unit.test_corpus_ledger_v2 import seen_union
 
 # The CLI's own fake bucket, fake registry and argument builder. A second copy
@@ -77,33 +76,6 @@ def _renderer(job):
     return renderer_for(job.renderer_id, lambda text: [])
 
 
-def _mount(entry, *, verify_signature=lambda request: True):
-    """The production startup path: the store, the job id and the renderer are
-    all derived from the declaration, not supplied by the test.
-
-    `verify_signature` is injected because the production default is the real
-    `verify_corpus_signature`, which fails closed on a fake hotkey like the
-    ones these tests submit -- a test of the rest of the wiring has to get
-    past it. One test below pins that default.
-    """
-    server = ValidatorServer()
-    mounted = asyncio.run(
-        mount_corpus_service(
-            server,
-            entry,
-            tokenizer=_DigitTokenizer(),
-            verify_signature=verify_signature,
-        )
-    )
-    return server, mounted
-
-
-def _mount_on(server, entry):
-    return asyncio.run(
-        mount_corpus_service(server, entry, tokenizer=_DigitTokenizer())
-    )
-
-
 def _rendered_prompt(job, prompt_index):
     """What the miner conditioned on, resolved the way a miner would: from the
     manifest's own `prompt_source`, through the manifest's own renderer."""
@@ -132,184 +104,6 @@ def _submit(client, job, *, prompt_index, filler, rendered_for=None, job_id=None
         signature="ok",
     )
     return client.post("/corpus/submit", json=request.model_dump()).json()
-
-
-def test_a_declared_job_accepts_a_submission_and_fills_its_last_slot(
-    bucket, registry
-):
-    """Declare a job through the CLI, mount the router on the task that pays
-    for it, and submit until one prompt's slots are gone."""
-    registry["entries"] = {"default": _rl_entry("default", 0.5)}
-
-    result = CliRunner().invoke(cli, _declared_args())
-    assert result.exit_code == 0, result.output
-
-    # The submissions below name the job the REGISTRY says this task pays for,
-    # not the one the test typed: the CLI writes that id twice, into two
-    # objects, and a mismatch between them reads as `job_unknown` here.
-    entry = registry["entries"][TASK_ID]
-    job, _ = asyncio.run(job_store.read_job(entry.job_id))
-    assert job is not None, "the CLI wrote no manifest for the task it declared"
-    assert job.slots_per_prompt == SLOTS_PER_PROMPT
-
-    server, mounted = _mount(entry)
-    assert mounted is True
-
-    with TestClient(server.app) as client:
-        filled = [
-            _submit(client, job, prompt_index=0, filler=index)
-            for index in range(SLOTS_PER_PROMPT)
-        ]
-        assert [body["accepted"] for body in filled] == [True] * SLOTS_PER_PROMPT
-        assert [body["slots_remaining"] for body in filled] == [2, 1, 0]
-
-        exhausted = _submit(client, job, prompt_index=0, filler=99)
-        assert exhausted["accepted"] is False
-        assert exhausted["reason"] == "prompt_full"
-        assert exhausted["slots_remaining"] == 0
-
-        # The same tokens under another prompt: a slot is spent per prompt,
-        # and the digest binds work to the question it answers. Without this
-        # the test above is satisfied by a job that refuses everything.
-        elsewhere = _submit(client, job, prompt_index=1, filler=0)
-        assert elsewhere["accepted"] is True
-        assert elsewhere["slots_remaining"] == SLOTS_PER_PROMPT - 1
-
-        # The accepted submissions above already prove the validator resolves
-        # the manifest's own prompt source; this is the refusing direction, so
-        # a mount that renders some other environment cannot pass both.
-        astray = _submit(client, job, prompt_index=1, filler=7, rendered_for=2)
-        assert astray["accepted"] is False
-        assert astray["reason"] == "prompt_not_faithful"
-
-        # The job id the route serves comes from the registry entry, so work
-        # declared under another task's cap is refused here, by name.
-        foreign = _submit(client, job, prompt_index=2, filler=7, job_id="other-job")
-        assert foreign["accepted"] is False
-        assert foreign["reason"] == "job_not_served"
-
-    # What the endpoint derived has to have reached the bucket, or the next
-    # validator to read these ledgers sells the same slots again.
-    raw, _ = bucket.objects[f"reliquary/corpus/jobs/{job.job_id}/ledgers.json"]
-    ledgers = json.loads(raw)
-    assert ledgers["slots"] == {"0": SLOTS_PER_PROMPT, "1": 1}
-    assert len(seen_union(bucket.objects, job.job_id)) == SLOTS_PER_PROMPT + 1
-
-
-def test_the_startup_path_binds_the_real_corpus_verifier(
-    bucket, registry, monkeypatch
-):
-    """A caller that leaves `verify_signature` unset gets the real
-    `verify_corpus_signature`, not a stub -- proven by swapping that name for
-    one that accepts and watching the swap reach the mounted route."""
-    import reliquary.protocol.signatures as signatures
-
-    registry["entries"] = {"default": _rl_entry("default", 0.5)}
-    assert CliRunner().invoke(cli, _declared_args()).exit_code == 0
-    entry = registry["entries"][TASK_ID]
-    job, _ = asyncio.run(job_store.read_job(entry.job_id))
-
-    calls = []
-    monkeypatch.setattr(
-        signatures,
-        "verify_corpus_signature",
-        lambda request: calls.append(request) or True,
-    )
-
-    server, mounted = _mount(entry, verify_signature=None)
-    assert mounted is True
-
-    with TestClient(server.app) as client:
-        body = _submit(client, job, prompt_index=0, filler=1)
-
-    assert len(calls) == 1
-    assert body["accepted"] is True
-
-
-def test_the_mount_migrates_a_v1_ledger_before_serving(bucket, registry):
-    """Both corpus entry points run the v2 migration before the route serves;
-    this is the one inside the main validator."""
-    registry["entries"] = {"default": _rl_entry("default", 0.5)}
-    assert CliRunner().invoke(cli, _declared_args()).exit_code == 0
-    entry = registry["entries"][TASK_ID]
-    key = f"reliquary/corpus/jobs/{entry.job_id}/ledgers.json"
-    seen = sorted(f"{i:064x}" for i in range(5))
-    bucket.objects[key] = (
-        json.dumps({"slots": {"0": 3, "1": 2}, "cursors": {}, "seen": seen}).encode(),
-        '"v1"',
-    )
-
-    server, mounted = _mount(entry)
-
-    assert mounted is True
-    ledgers = json.loads(bucket.objects[key][0])
-    assert ledgers["schema"] == "reliquary/corpus-ledgers/v2"
-    assert seen_union(bucket.objects, entry.job_id) == set(seen)
-
-    # The mount loaded the segments, so the first submission fetches none.
-    fetched = []
-    real_get = bucket.get_object
-
-    async def get_object(Bucket, Key):
-        fetched.append(Key)
-        return await real_get(Bucket=Bucket, Key=Key)
-
-    bucket.get_object = get_object
-    job, _ = asyncio.run(job_store.read_job(entry.job_id))
-    with TestClient(server.app) as client:
-        assert _submit(client, job, prompt_index=2, filler=1)["accepted"] is True
-    assert not [k for k in fetched if "/seen/" in k]
-
-
-def test_a_declared_job_with_no_manifest_refuses_to_start(bucket, registry):
-    """The task is declared and would take its share of the pool, so a job the
-    store cannot produce is a startup refusal -- not a route that 404s while
-    the task keeps its cap."""
-    from reliquary.validator.task_config import TaskConfigError
-
-    registry["entries"] = {"default": _rl_entry("default", 0.5)}
-    assert CliRunner().invoke(cli, _declared_args()).exit_code == 0
-    entry = registry["entries"][TASK_ID]
-    bucket.objects.pop(f"reliquary/corpus/jobs/{entry.job_id}.json")
-
-    with pytest.raises(TaskConfigError) as caught:
-        _mount(entry)
-
-    assert entry.job_id in str(caught.value)
-
-
-def test_a_validator_on_an_rl_task_exposes_no_corpus_route(bucket, registry):
-    """The mount is gated on the resolved task, so an RL validator serves no
-    route that sells slots nobody declared -- and neither does the legacy
-    fallback, whose task config carries no registry entry at all."""
-    server = ValidatorServer()
-
-    assert _mount_on(server, _rl_entry("default", 1.0)) is False
-    assert _mount_on(server, None) is False
-
-    # The OpenAPI paths, not `app.routes`: FastAPI >= 0.141 keeps an included
-    # router's routes out of `app.routes`, where this check would always pass.
-    assert [path for path in server.app.openapi()["paths"] if "corpus" in path] == []
-    with TestClient(server.app) as client:
-        assert client.post("/corpus/submit", json={}).status_code == 404
-
-
-def test_the_server_gate_does_not_depend_on_the_startup_path(bucket, registry):
-    """The mechanism gate lives on the mount itself, so a second caller cannot
-    open the route by skipping the CLI's half of it."""
-    server = ValidatorServer()
-    arguments = {
-        "store": None,
-        "tokenizer": _DigitTokenizer(),
-        "renderer": renderer_for("reliquary-jsonl-tools-v1", lambda text: []),
-        "verify_signature": lambda request: True,
-    }
-
-    assert server.mount_corpus_router(_rl_entry("default", 1.0), **arguments) is False
-    assert server.mount_corpus_router(None, **arguments) is False
-    # The OpenAPI paths, not `app.routes`: FastAPI >= 0.141 keeps an included
-    # router's routes out of `app.routes`, where this check would always pass.
-    assert [path for path in server.app.openapi()["paths"] if "corpus" in path] == []
 
 
 def _corpus_entry_this_binary_can_resolve(job_id):
@@ -378,48 +172,6 @@ def _seed_manifest(job_id, *, renderer_id=None):
         deadline_round=None,
     )
     asyncio.run(job_store.write_job(manifest, None))
-
-
-def test_a_server_that_declines_the_mount_is_not_walked_past(bucket, registry):
-    """Server and helper apply the same rule to the same entry, so a refusal
-    means they disagree -- which must stop the process, not leave a corpus
-    task running with no route."""
-    from reliquary.validator.task_config import TaskConfigError
-
-    registry["entries"] = {"default": _rl_entry("default", 0.5)}
-    assert CliRunner().invoke(cli, _declared_args()).exit_code == 0
-    entry = registry["entries"][TASK_ID]
-
-    class _DecliningServer:
-        def mount_corpus_router(self, entry, **kwargs):
-            return False
-
-    with pytest.raises(TaskConfigError) as caught:
-        _mount_on(_DecliningServer(), entry)
-
-    assert entry.job_id in str(caught.value)
-
-
-@pytest.mark.parametrize("schema,reason", [("reliquary/corpus-ledgers/v3", "no record store"),
-                                           ("reliquary/corpus-ledgers/v4", "v4")])
-def test_standalone_mount_refuses_pending_bodies_or_unknown_ledger_before_serving(
-    bucket, registry, schema, reason
-):
-    from reliquary.validator.corpus_service import LedgerSnapshotError
-
-    registry["entries"] = {"default": _rl_entry("default", 0.5)}
-    assert CliRunner().invoke(cli, _declared_args()).exit_code == 0
-    entry = registry["entries"][TASK_ID]
-    snapshot = {"schema": schema, "slots": {}, "cursors": {},
-                "seen_pending": [], "seen_segments": [],
-                "pending_records": [{"submission_id": "b" * 64, "sha256": "c" * 64,
-                                     "received_at": 1.0}]}
-    asyncio.run(job_store.write_ledgers(entry.job_id, snapshot, None))
-    server = ValidatorServer()
-    with pytest.raises(LedgerSnapshotError, match=reason):
-        _mount_on(server, entry)
-    assert not any(getattr(route, "path", "").startswith("/corpus/")
-                   for route in server.app.routes)
 
 
 def _boot_validate_dispatching_to_corpus_validator(monkeypatch, *, side_effect=None):
@@ -664,75 +416,3 @@ def test_a_corpus_job_naming_an_unknown_renderer_exits_four_before_any_download(
     assert result.exit_code == 4, (result.output, result.exception)
 
 
-def test_the_mount_refuses_the_task_config_wrapper(bucket, registry):
-    """The call site's own failure mode: `TaskConfig` has no `.mechanism`, so
-    a mount gated on `getattr(entry, "mechanism", None)` would decline a
-    declared corpus task in silence and the validator would boot, hold its
-    share of the pool and serve nothing."""
-    from reliquary.validator.task_config import TaskConfig, TaskConfigError
-
-    registry["entries"] = {"default": _rl_entry("default", 0.5)}
-    assert CliRunner().invoke(cli, _declared_args()).exit_code == 0
-    entry = registry["entries"][TASK_ID]
-    config = TaskConfig(
-        task_id=entry.task_id,
-        entry=entry,
-        price_params=None,
-        emission_cap=0.3,
-        env_caps={},
-    )
-
-    with pytest.raises(TaskConfigError) as caught:
-        _mount_on(ValidatorServer(), config)
-
-    assert "TaskConfig" in str(caught.value)
-
-
-def test_a_corpus_contract_for_another_source_boots_without_the_rl_environment_mix(
-    monkeypatch, registry, tmp_path
-):
-    """Final review, finding 2: `--environments` defaults to openmathinstruct,
-    which a corpus contract for another source does not declare. The corpus
-    branch must be taken before the RL mix is resolved (or the code grader
-    started), or `validate` refuses a correctly declared corpus task."""
-    from dataclasses import replace
-    import json as _json
-
-    import reliquary.cli.main as cli_module
-    import reliquary.constants as constants
-    from reliquary.cli.main import build_corpus_task_entry
-    from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR, resolve_protocol_profile
-
-    entry = build_corpus_task_entry(
-        task_id=constants.TASK_ID, job_id="logic-v1",
-        from_profile="qwen3-4b-base-dapo-reliquary-v1", model_id="Qwen/Qwen3-4B-Base",
-        model_revision="main", model_architecture="Qwen3ForCausalLM",
-        prompt_source="reliquary_logic_v2", cap=0.1, overrides={},
-    )
-    contract_path = tmp_path / "contract.json"
-    contract_path.write_text(_json.dumps(entry.contract))
-    monkeypatch.setenv(TASK_CONTRACT_ENV_VAR, str(contract_path))
-    # What importing under RELIQUARY_TASK_CONTRACT gives the process.
-    profile = resolve_protocol_profile()
-    assert "openmathinstruct" not in profile.environments
-    monkeypatch.setattr(cli_module, "ACTIVE_PROTOCOL_PROFILE", profile)
-    monkeypatch.setattr(constants, "PROTOCOL_PROFILE_ID", profile.profile_id)
-    monkeypatch.setattr(constants, "PROTOCOL_GENERATION_CONTRACT", profile.to_generation_contract())
-    registry["entries"] = {entry.task_id: replace(entry, profile_id=profile.profile_id)}
-
-    mix_calls = []
-    real_mix = cli_module._resolve_cli_environment_mix
-
-    def spy_mix(value):
-        mix_calls.append(value)
-        return real_mix(value)
-
-    monkeypatch.setattr(cli_module, "_resolve_cli_environment_mix", spy_mix)
-    monkeypatch.setattr(cli_module, "_ensure_grader_running",
-                        lambda *a, **kw: pytest.fail("grader started"))
-
-    result, calls = _boot_validate_dispatching_to_corpus_validator(monkeypatch)
-
-    assert result.exit_code == 0, (result.output, result.exception)
-    assert len(calls) == 1 and calls[0]["entry"].job_id == "logic-v1"
-    assert mix_calls == []

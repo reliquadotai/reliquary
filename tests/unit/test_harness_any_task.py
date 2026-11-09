@@ -60,33 +60,7 @@ def _policy(spec):
                            harness_pin=lambda: None if spec is None else _pin(spec))
 
 
-def test_an_rl_window_plays_any_harness_without_variants():
-    from reliquary.miner.episode_mining import _episode_policies
-    from reliquary.validator.service import ValidationService
-
-    for spec, served in [(None, True), (MINI_SWE_V2, True), (BASH_SURFACE_V1, False)]:
-        contract = SimpleNamespace(episode_policy=lambda name, spec=spec: _policy(spec))
-        if served:
-            assert _episode_policies(contract, ["swe_v1"], lambda policy: None)["swe_v1"].harness_pin() == \
-                (None if spec is None else _pin(spec))
-            continue
-        with pytest.raises(ValueError, match="an RL lease's"):
-            _episode_policies(contract, ["swe_v1"], lambda policy: None)
-        with pytest.raises(ValueError, match="an RL lease's"):
-            ValidationService._default_episode_renderer(SimpleNamespace(tokenizer=None), _policy(spec))
-
-
 needs_tokenizer = pytest.mark.skipif(not TOKENIZERS, reason="set RELIQUARY_QWEN38_TOKENIZER")
-
-
-@needs_tokenizer
-def test_the_window_validator_renders_in_the_orders_harness():
-    from reliquary.validator.service import ValidationService
-
-    tokenizer = SimpleNamespace(name_or_path=next(iter(TOKENIZERS.values())))
-    renderer = ValidationService._default_episode_renderer(SimpleNamespace(tokenizer=tokenizer),
-                                                           _policy(MINI_SWE_V2))
-    assert renderer.spec is MINI_SWE_V2 and [t["function"]["name"] for t in renderer.tools] == ["bash"]
 
 
 # -- a mini-swe eval/corpus job end to end ----------------------------------------------------------------

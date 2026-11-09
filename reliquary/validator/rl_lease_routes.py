@@ -1,6 +1,6 @@
 """The RL lease routes (rl-async-design.md §4.2-4.3, P2). The async validator (``rl_async_service.mount_rl_async``,
 ``RELIQUARY_RL_MODE=async``) builds a ``LeaseBook`` and a ``LeaseCollector`` and mounts ``build_rl_lease_router``
-(``ValidatorServer.mount_rl_lease_router``).
+(``RlHttpApp.mount_rl_lease_router``).
 
 * ``POST {prefix}/lease`` ``{miner_hotkey, at, environment, checkpoint, prompt_ids, signature}``, signed by the
   hotkey for this validator and route (``build_rl_lease_binding``), within ``request_skew_s`` of now. The
@@ -52,8 +52,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from reliquary.environment.grader_client import GraderInfrastructureError
 from reliquary.protocol.rl_submit import (
-    GROUP_ROLLOUTS, GZIP, HOTKEY_HEADER, MAX_EPISODE_SUBMIT_BODY_BYTES, MAX_SUBMIT_BODY_BYTES, decode_tokens, inflate_body,
-    rollouts_digest,
+    GROUP_ROLLOUTS, GZIP, HOTKEY_HEADER, MAX_EPISODE_SUBMIT_BODY_BYTES, MAX_SUBMIT_BODY_BYTES, decode_tokens,
+    inflate_body, rollouts_digest,
 )
 from reliquary.protocol.signatures import (
     hotkey_signature_bytes, verify_rl_lease_forfeit_signature, verify_rl_lease_mine_signature, verify_rl_lease_signature,

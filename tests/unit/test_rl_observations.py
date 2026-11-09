@@ -207,11 +207,11 @@ def test_the_route_serves_the_head_or_503(tmp_path):
     from fastapi.testclient import TestClient
 
     from reliquary.validator.rl_async_service import mount_rl_async
-    from reliquary.validator.server import ValidatorServer
+    from reliquary.validator.rl_http import RlHttpApp
     from tests.unit.test_rl_async_service import components
 
     rl = components(tmp_path)
-    server = ValidatorServer()
+    server = RlHttpApp()
     mount_rl_async(server, rl, validator_hotkey=VALIDATOR.ss58_address)
     client = TestClient(server.app)
     assert client.get("/rl/observations").status_code == 503

@@ -610,10 +610,6 @@ def _decode(raw: bytes) -> dict:
         raise ServiceContractError("invalid contract JSON") from exc
 
 
-def parse_service_contract(raw: bytes) -> ServiceContract:
-    return ServiceContract(raw)
-
-
 def supported_v2_capabilities(contract: ServiceContract) -> frozenset[str]:
     """What a v2 runtime supports and announces for ``contract``: the v2 set, plus the episode capability
     only when the order has an episode env (a single-turn order's announcement keeps its exact bytes)."""
