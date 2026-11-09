@@ -1086,6 +1086,7 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
         instruction["omitted"][reason] = instruction["omitted"].get(reason, 0) + 1
 
     counts: dict = {}
+    completion_tokens = 0
     seen = None
     if dedupe:
         from reliquary.corpus.export import job_fingerprints
@@ -1106,6 +1107,8 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
                               seen=seen, concurrency=concurrency, window=window))
         async for row in rows:
             await writer.add(row)
+            if not episode:
+                completion_tokens += row["completion_tokens"]
             if instruction_reason is not None:
                 omitted(instruction_reason)
             elif grade is not None and row["accepted"] is not True and not keep_rejected:
@@ -1149,6 +1152,9 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
         "shards": len(shards),
         "instruction": instruction,
     }
+    if not episode:
+        report["billing"] = {"basis": "completion_tokens_of_delivered_rows",
+                             "completion_tokens": completion_tokens}
     if dedupe:
         from reliquary.corpus.export import DEDUPE_KEY
 
@@ -1163,6 +1169,7 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
         "created_at": report["created_at"], "rows": counts.get("rows", 0), "shards": shards,
         "instruction_shards": instruction_shards, "instruction": instruction,
         "columns": list(EPISODE_ROW_FIELDS if episode else ROW_FIELDS), "report": report_key,
+        **({"billing": report["billing"]} if "billing" in report else {}),
         "keys": [s["key"] for s in shards + instruction_shards] + [report_key, manifest_key],
     }
     await sink.put_json(manifest_key, manifest)
@@ -1308,6 +1315,7 @@ async def _export_v3(*, job, records, sink, delivery_id: str, grade, filter_note
         "rows": counts.get("rows", 0), "shards": shards, "error_shards": error_shards,
         "instruction_shards": [],
         "columns": list(V3_ROW_FIELDS) if output_format == "parquet" else None, "report": report_key,
+        "billing": report["billing"],
         "keys": [s["key"] for s in shards + error_shards] + [report_key, manifest_key],
     }
     await sink.put_json(manifest_key, manifest)

@@ -409,12 +409,28 @@ class CorpusJobSet:
         try:
             final = await self._compute_status(job_id, drained=True)
         except Exception:
-            # Unwiring must not wait on a status read: the last one, marked drained.
+            if self._finals is not None:
+                # A stored final status cannot be refreshed after unwiring.
+                logger.warning("corpus job %s: final status unreadable; retrying", job_id)
+                return
             logger.warning("corpus job %s: final status unreadable; keeping the last one", job_id)
             last = self._status_cache.get(job_id)
-            final = {**(last[1] if last else {"job_id": job_id}), "state": "drained"}
+            final = {**(last[1] if last else {"job_id": job_id}), "state": "drained",
+                     "counts_complete": False}
         if self._finals is not None:
+            # A durable settlement can become visible before the local totals catch up.
+            if final["audited"] > final["settled"]:
+                return
             try:
+                if not final["counts_complete"]:
+                    # A retired job with no verdicts needs no settlement pass to certify zero.
+                    if (final["submissions_accepted"] or final["audited"] or final["settled"]
+                            or await self._finals.list_verdict_ids(job_id)):
+                        return
+                    final["counts_complete"] = True
+                # Historical settlements may have no totals for some of their settled verdicts.
+                if final["audited"] < final["settled"]:
+                    final["counts_complete"] = False
                 # Kept before anything is released: a restart serves it.
                 await self._finals.write_final_status(job_id, final)
             except Exception:
@@ -562,7 +578,7 @@ class CorpusJobSet:
             if cached is None:
                 raise
             logger.warning("corpus status of %s: ledger unreadable, serving the last one", job_id)
-            return cached[1]
+            return {**cached[1], "counts_complete": False}
         if job_id in self.served:
             self._status_cache[job_id] = (now, fresh)
         return fresh

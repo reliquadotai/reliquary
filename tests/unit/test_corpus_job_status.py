@@ -194,10 +194,70 @@ def test_a_ledger_read_that_fails_serves_the_last_status_or_raises():
 
     router.ledger_state = broken
     now[0] += 31
-    assert asyncio.run(job_set.status("job-b")) == first
+    assert first["counts_complete"] is True
+    assert asyncio.run(job_set.status("job-b")) == {**first, "counts_complete": False}
     job_set._status_cache.clear()
     with pytest.raises(OSError):
         asyncio.run(job_set.status("job-b"))
+
+
+@pytest.mark.parametrize("missing_historical_totals", [False, True])
+def test_unwiring_retries_until_it_can_store_fresh_final_counts(missing_historical_totals):
+    now = [10_000.0]
+    job_set, router, _ = _set({0: 1}, now=now)
+    job_set._routes.retire("job-b")
+    assert asyncio.run(job_set.status("job-b"))["counts_complete"] is True
+    read = router.ledger_state
+    saved = {}
+
+    async def drained(wiring):
+        return True
+
+    async def broken(job=None):
+        raise OSError("r2 down")
+
+    async def store(job_id, status):
+        saved[job_id] = status
+
+    job_set._drained = drained
+    job_set._finals = SimpleNamespace(write_final_status=store)
+    router.ledger_state = broken
+    asyncio.run(job_set._maybe_unwire("job-b"))
+    assert not saved and "job-b" in job_set.served
+
+    router.ledger_state = read
+    asyncio.run(job_set._maybe_unwire("job-b"))
+    assert not saved and "job-b" in job_set.served  # durable drain, stale local totals
+
+    settler = job_set.served["job-b"].settler
+    settler.totals = {**TOTALS, "verified_tokens": 70}
+    settler.settled_count = TOTALS["verdicts"] + int(missing_historical_totals)
+    asyncio.run(job_set._maybe_unwire("job-b"))
+    assert "job-b" not in job_set.served
+    assert saved["job-b"]["state"] == "drained"
+    assert saved["job-b"]["counts_complete"] is not missing_historical_totals
+    assert saved["job-b"]["verified_tokens"] == 70
+
+
+def test_unseeded_local_zero_does_not_hide_durable_verdicts():
+    job_set, _, _ = _set({}, now=[10_000.0])
+    job_set._routes.retire("job-b")
+    settler = job_set.served["job-b"].settler
+    settler.totals, settler.settled_count = None, None
+
+    async def drained(wiring):
+        return True
+
+    async def verdicts(job_id):
+        return ["settled-before-restart"]
+
+    async def store(job_id, status):
+        pytest.fail("unseeded local zero must not become a final count")
+
+    job_set._drained = drained
+    job_set._finals = SimpleNamespace(list_verdict_ids=verdicts, write_final_status=store)
+    asyncio.run(job_set._maybe_unwire("job-b"))
+    assert "job-b" in job_set.served
 
 
 # --------------------------------------------------------------------------

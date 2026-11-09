@@ -479,6 +479,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         from reliquary.cli.main import prepare_corpus_job as prepare
     # delivery id -> (job id, the export, what it was asked for)
     exports: dict[str, tuple[str, asyncio.Task, dict]] = {}
+    delivery_locks: dict[str, asyncio.Lock] = {}
     # eval id -> (request digest, the running grading)
     gradings: dict[str, tuple[str, asyncio.Task]] = {}
     # One decision at a time per eval id, so two first calls start one grading.
@@ -1505,61 +1506,63 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             return {"state": "done", "delivery_id": delivery_id, "keys": manifest["keys"],
                     "rows": manifest["rows"]}
 
-        running_export = exports.get(delivery_id)
-        if running_export is not None and running_export[0] != job_id:
-            raise HTTPException(status_code=409, detail="delivery_belongs_to_another_job")
-        if running_export is not None and running_export[2] != asked:
-            raise HTTPException(status_code=409, detail="delivery_exists_with_another_request")
-        running = running_export[1] if running_export is not None else None
-        if running is not None and running.done():
-            exports.pop(delivery_id)
-            if running.exception() is not None:
-                raise HTTPException(status_code=500,
-                                    detail=f"delivery failed: {running.exception()}")
-            manifest = running.result()
-            return delivery_result(manifest)
-        if running is None:
-            stored = await deliveries.get_json(f"deliveries/{delivery_id}/manifest.json")
-            if stored is not None:
-                return delivery_result(stored)
-            # A delivery is final once written: never from a job still moving.
-            if not (await job_counts(job_id))["final"]:
-                raise HTTPException(status_code=409, detail="job_not_drained")
-            if body.schema_version == 3:
-                grade = None
-                if (body.filter or "none") != "none":
-                    if job.filter is None:
-                        raise HTTPException(status_code=422, detail=(
-                            f"filter {body.filter!r} needs the job's declared filter: the job declares none"))
+        lock = delivery_locks.setdefault(delivery_id, asyncio.Lock())
+        async with lock:
+            running_export = exports.get(delivery_id)
+            if running_export is not None and running_export[0] != job_id:
+                raise HTTPException(status_code=409, detail="delivery_belongs_to_another_job")
+            if running_export is not None and running_export[2] != asked:
+                raise HTTPException(status_code=409, detail="delivery_exists_with_another_request")
+            running = running_export[1] if running_export is not None else None
+            if running is not None and running.done():
+                exports.pop(delivery_id)
+                if running.exception() is not None:
+                    raise HTTPException(status_code=500,
+                                        detail=f"delivery failed: {running.exception()}")
+                manifest = running.result()
+                return delivery_result(manifest)
+            if running is None:
+                stored = await deliveries.get_json(f"deliveries/{delivery_id}/manifest.json")
+                if stored is not None:
+                    return delivery_result(stored)
+                # A delivery is final once written: never from a job still moving.
+                if not (await job_counts(job_id))["final"]:
+                    raise HTTPException(status_code=409, detail="job_not_drained")
+                if body.schema_version == 3:
+                    grade = None
+                    if (body.filter or "none") != "none":
+                        if job.filter is None:
+                            raise HTTPException(status_code=422, detail=(
+                                f"filter {body.filter!r} needs the job's declared filter: the job declares none"))
+                        try:
+                            grade = await asyncio.to_thread(job_grader, job)
+                        except ValueError as exc:
+                            raise HTTPException(status_code=422, detail=f"filter_unavailable: {exc}") from exc
+                    exports[delivery_id] = (job_id, asyncio.ensure_future(
+                        v3_delivery(job, delivery_id, body, grade)), asked)
+                    response.status_code = 202
+                    return {"state": "running", "delivery_id": delivery_id}
+                grade, note = None, None
+                if body.apply_filter and job.filter is not None:
                     try:
                         grade = await asyncio.to_thread(job_grader, job)
                     except ValueError as exc:
-                        raise HTTPException(status_code=422, detail=f"filter_unavailable: {exc}") from exc
-                exports[delivery_id] = (job_id, asyncio.ensure_future(
-                    v3_delivery(job, delivery_id, body, grade)), asked)
-                response.status_code = 202
-                return {"state": "running", "delivery_id": delivery_id}
-            grade, note = None, None
-            if body.apply_filter and job.filter is not None:
-                try:
-                    grade = await asyncio.to_thread(job_grader, job)
-                except ValueError as exc:
-                    note = str(exc)
-            if body.keep_rejected and grade is None:
-                raise HTTPException(status_code=422, detail="keep_rejected needs the job's "
-                                    "filter applied: " + (note or "apply_filter is off or the "
-                                                          "job declares no filter"))
-            instruction_source, instruction_note = await asyncio.to_thread(
-                instruction_source_for_job, job)
-            # Long: run beside the request; the caller polls with the same id.
-            exports[delivery_id] = (job_id, asyncio.ensure_future(export_delivery(
-                job=job, records=records, sink=deliveries, delivery_id=delivery_id,
-                grade=grade, filter_note=note, work_dir=work_dir, clock=clock,
-                instruction_source=instruction_source, instruction_note=instruction_note,
-                keep_rejected=body.keep_rejected, dedupe=body.dedupe,
-                dedupe_against=body.dedupe_against)), asked)
-        response.status_code = 202
-        return {"state": "running", "delivery_id": delivery_id}
+                        note = str(exc)
+                if body.keep_rejected and grade is None:
+                    raise HTTPException(status_code=422, detail="keep_rejected needs the job's "
+                                        "filter applied: " + (note or "apply_filter is off or the "
+                                                              "job declares no filter"))
+                instruction_source, instruction_note = await asyncio.to_thread(
+                    instruction_source_for_job, job)
+                # Long: run beside the request; the caller polls with the same id.
+                exports[delivery_id] = (job_id, asyncio.ensure_future(export_delivery(
+                    job=job, records=records, sink=deliveries, delivery_id=delivery_id,
+                    grade=grade, filter_note=note, work_dir=work_dir, clock=clock,
+                    instruction_source=instruction_source, instruction_note=instruction_note,
+                    keep_rejected=body.keep_rejected, dedupe=body.dedupe,
+                    dedupe_against=body.dedupe_against)), asked)
+            response.status_code = 202
+            return {"state": "running", "delivery_id": delivery_id}
 
     @router.post("/uploads")
     async def ingest_upload(body: IngestUpload) -> dict:

@@ -927,6 +927,13 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
                 "reliquary_version": _reliquary_version(),
             },
         }
+        if job_rows is not None and all(
+                type(row["tokens"]) is int and row["tokens"] >= 0
+                for rows in per_problem.values() for row in rows):
+            report["billing"] = {
+                "basis": "completion_tokens_of_delivered_rows",
+                "completion_tokens": sum(row["tokens"] for rows in per_problem.values() for row in rows),
+            }
         report_path = directory / "report.json"
         report_path.write_text(json.dumps(report, sort_keys=True, indent=1))
         files = []
