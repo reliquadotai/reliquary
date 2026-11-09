@@ -183,3 +183,37 @@ def test_audits_pending_leaves_out_held_records_their_stake_covers():
     # A record whose decision may still turn into an audit (the corpus rule) counts again.
     auditor.stake_at_receipt = False
     assert auditor.audits_pending() == 2 and auditor.audits_idle_since is None
+
+
+def test_a_record_seeded_from_its_metadata_is_read_in_full_once_for_the_stake_rule():
+    # After a restart, `_seed` reads only each pending record's tail: no completions, so its shortest one is
+    # unknown and the stake rule would fall back to the arrivals rule (2026-11-09: an order audited at 99 %).
+    long_ = {"tokens": [1] * 64, "text": ""}
+    sid = _ids(False, 1)[0]
+    store = _Store({sid: {**_rec(0, received_at=T0), "completions": [long_, long_]}})
+    clock = _Clock(T0 + 20)
+    auditor = _auditor(store, clock)
+    auditor._draw_job = object()
+    auditor._remember(sid, {"hotkey": HK, "received_at": T0, "token_count": 500})
+    assert auditor._stake_applies(sid) is False
+    wanted = auditor._needing_shortest([sid], {})
+    assert wanted == [sid]
+    asyncio.run(auditor._read_all(wanted))
+    assert auditor._stake_applies(sid) is True
+    # Read in full once: a record whose full read finds no completion is not read again every pass.
+    auditor._shortest.pop(sid)
+    assert auditor._needing_shortest([sid], {}) == []
+
+
+def test_records_are_not_read_again_without_the_stake_rule():
+    sid = _ids(False, 1)[0]
+    store = _Store({sid: _rec(0, received_at=T0)})
+    clock = _Clock(T0 + 20)
+    meta = {"hotkey": HK, "received_at": T0, "token_count": 500}
+    corpus = _auditor(store, clock)  # not a draw job: every record forfeits, no length needed
+    corpus._remember(sid, meta)
+    unstaked = _auditor(store, clock, staked=False)
+    unstaked._draw_job = object()
+    unstaked._remember(sid, meta)
+    assert corpus._needing_shortest([sid], {}) == []
+    assert unstaked._needing_shortest([sid], {}) == []
