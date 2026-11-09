@@ -605,6 +605,48 @@ def test_a_delivery_runs_beside_the_request_and_returns_its_keys(admin, monkeypa
     assert again.status_code == 200 and again.json()["keys"] == done["keys"]
 
 
+def test_concurrent_requests_start_one_export_for_a_delivery(admin, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from reliquary.corpus import delivery
+    from reliquary.validator import corpus_job_status
+
+    assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
+    counts, export = corpus_job_status.stored_job_counts, delivery.export_delivery
+    started = []
+
+    async def slow_counts(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        return await counts(*args, **kwargs)
+
+    async def observe_export(**kwargs):
+        started.append(kwargs["delivery_id"])
+        await asyncio.sleep(0.05)
+        return await export(**kwargs)
+
+    monkeypatch.setattr(corpus_job_status, "stored_job_counts", slow_counts)
+    monkeypatch.setattr(delivery, "export_delivery", observe_export)
+    path, body = "/admin/v1/jobs/math-a/deliveries", {"delivery_id": "order-concurrent"}
+    together = Barrier(2)
+
+    def request():
+        together.wait(timeout=5)
+        return admin("POST", path, body)
+
+    with ThreadPoolExecutor(2) as threads:
+        calls = [threads.submit(request) for _ in range(2)]
+        assert all(call.result(timeout=10).status_code in (200, 202) for call in calls)
+    for _ in range(100):
+        response = admin("POST", path, body)
+        if response.status_code == 200:
+            break
+        assert response.status_code == 202
+        time.sleep(0.01)
+    assert response.status_code == 200
+    assert started == ["order-concurrent"]
+
+
 def test_a_v3_delivery_runs_on_the_same_route_with_its_options(admin):
     assert admin("POST", "/admin/v1/jobs", _job()).status_code == 201
     sid = "2" * 64

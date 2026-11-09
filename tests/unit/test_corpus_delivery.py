@@ -222,6 +222,11 @@ def test_new_delivery_excludes_invalidated_submissions_from_both_formats(
     report = json.loads((tmp_path / "bucket" / manifest["report"]).read_text())
     assert report["counts"]["voided"] == 1
     assert report["counts"]["duplicate_completion"] == 0
+    assert report["billing"] == {
+        "basis": "completion_tokens_of_delivered_rows",
+        "completion_tokens": sum(row["completion_tokens"] for row in parquet_rows),
+    }
+    assert manifest["billing"] == report["billing"]
 
 
 def _instructions(tmp_path, manifest):

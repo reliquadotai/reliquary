@@ -343,6 +343,10 @@ def test_single_turn_grade_unchanged(tmp_path, monkeypatch):
     table = pq.read_table(tmp_path / "out" / "graded.parquet").to_pylist()
     assert {r["completion"] for r in table} == {"<think>x</think>0", "<think>x</think>1",
                                                  "wrong"}
+    assert report["billing"] == {
+        "basis": "completion_tokens_of_delivered_rows",
+        "completion_tokens": sum(row["tokens"] for row in table),
+    }
     # The same report as grading the records through JobRows directly.
     collected = asyncio.run(grading.collect_job_records(job, records))
     direct = LocalDirectorySink(tmp_path / "direct")
