@@ -762,9 +762,10 @@ class CorpusAuditor:
     def _remember(self, submission_id: str, meta) -> None:
         """A record's (hotkey, arrival, size), from the record or its metadata."""
         completions = meta.get("completions")
-        if isinstance(completions, list) and completions:
-            self._completions_read[0] += 1
-            self._completions_read[1] += len(completions)
+        read = getattr(self, "_completions_read", None)
+        if isinstance(completions, list) and completions and read is not None:
+            read[0] += 1
+            read[1] += len(completions)
         if self.stake_at_receipt and isinstance(completions, list) and completions:
             try:
                 self._shortest[submission_id] = min(len(c["tokens"]) for c in completions)
@@ -1093,9 +1094,10 @@ class CorpusAuditor:
         elif standing is not None and isinstance(standing.get("received_at"), (int, float)):
             self._paid.setdefault(standing.get("hotkey"), []).append(
                 (float(standing["received_at"]), submission_id))
-        if written:
+        decided = getattr(self, "_decided", None)
+        if written and decided is not None:
             # Once per record: a decision deferred or held back to a later pass is counted when it lands.
-            self._decided["audit" if verdict.get("audited") else "pass_unaudited"] += 1
+            decided["audit" if verdict.get("audited") else "pass_unaudited"] += 1
         self._report(submission_id, standing)
         return standing, written
 
