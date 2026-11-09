@@ -317,6 +317,10 @@ class PairedAuditDispatcher:
         self._busy_since: dict[str, tuple[float, ModelKey]] = {}
         self._scored_items: dict[ModelKey, collections.deque] = collections.defaultdict(collections.deque)
         self._busy_spans: dict[ModelKey, collections.deque] = collections.defaultdict(collections.deque)
+        # Executors the fleet may release (more live than wanted): leased nothing more, so once their leases
+        # end they are idle for good and no batch waits on a destroyed card. First contact, to pick the newest.
+        self._releasing: set[str] = set()
+        self._first_seen: dict[str, float] = {}
 
     # -- the auditors' side ------------------------------------------------
 
@@ -370,6 +374,10 @@ class PairedAuditDispatcher:
                 scored[k] = (status, chunks, scored_by, *extra)
         return scored
 
+    @property
+    def scorers(self) -> int:
+        return self._scorers
+
     def pending_items(self, job_id: str) -> int:
         """The samples of ``job_id`` waiting in batches not yet decided (claimed ones included)."""
         return sum(len(batch.items) for queue in self._queues.values() for batch in queue
@@ -384,6 +392,7 @@ class PairedAuditDispatcher:
     def heartbeat(self, executor_id: str, document: dict | None = None,
                   detail: dict | None = None) -> None:
         self._seen[executor_id] = self._clock()
+        self._first_seen.setdefault(executor_id, self._seen[executor_id])
         if document is not None:
             self._documents[executor_id] = document
         if detail is not None:
@@ -417,6 +426,8 @@ class PairedAuditDispatcher:
         place = _placement(document)
         if place is None:
             raise LeaseRefused(409, "executor_provider_unknown")
+        if executor_id in self._releasing:
+            return None
         if sum(1 for lease in self._leases.values() if lease.executor_id == executor_id) \
                 >= self._max_leases:
             return None
@@ -552,6 +563,17 @@ class PairedAuditDispatcher:
         elif not held and executor_id in self._busy_since:
             since, busy_model = self._busy_since.pop(executor_id)
             self._busy_spans[busy_model].append((now, now - since))
+
+    def release_beyond(self, model: ModelKey, keep: int | None) -> list[str]:
+        """The newest live executors of ``model`` beyond ``keep`` (None: none), to release."""
+        live = sorted(self.live_executors(model),
+                      key=lambda d: (self._first_seen.get(d["executor_id"], 0.0), d["executor_id"]))
+        ids = [d["executor_id"] for d in live]
+        return ids[max(1, keep):] if keep is not None else []
+
+    def set_releasing(self, executor_ids) -> None:
+        """The executors leased nothing more: exactly these (a model no longer served keeps none)."""
+        self._releasing = set(executor_ids)
 
     def executor_ids(self, model: ModelKey) -> tuple[list[str], list[str]]:
         """The live executors of ``model``, and those of them holding no lease."""
@@ -1638,6 +1660,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         document = dispatcher.status()
         # Per model served, its orders' expected audit items; None while one of them is unknown.
         backlog: dict[tuple[str, str], float | None] = {}
+        released: list[str] = []
         for w in list(served.values()):
             backlog.setdefault((w.job.checkpoint_repo, w.job.checkpoint_revision), 0.0)
         for job_id in list(served):
@@ -1677,13 +1700,18 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 expected, rate, drain_seconds=drain_seconds, max_executors=max_executors)
             wanted = sizing.update(key, target)
             entry = document["models"].setdefault(key, {"executors_needed": 0, "live_executors": len(live)})
-            # The fleet releases only an executor holding no lease (`idle_executors`): none of its work is lost.
+            # Beyond what is wanted (at least the scorers a batch needs), the newest executors lease nothing more;
+            # the fleet releases one only once it holds no lease (`releasing` and `idle_executors`).
+            releasing = dispatcher.release_beyond(
+                model, None if wanted is None else max(wanted, dispatcher.scorers))
+            released.extend(releasing)
             entry.update({"expected_audits": None if expected is None else round(expected),
                           "items_per_second": rate, "executors_wanted": wanted,
-                          "executors": live, "idle_executors": idle})
+                          "executors": live, "idle_executors": idle, "releasing": releasing})
             if wanted:
                 entry["executors_needed"] = max(entry.get("executors_needed", 0), wanted - len(live))
         sizing.forget({f"{m[0]}@{m[1]}" for m in backlog})
+        dispatcher.set_releasing(released)
         return document
 
     app.state.control_status = control_status

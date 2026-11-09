@@ -159,3 +159,25 @@ def test_idle_executors_are_those_holding_no_lease():
 
     live, idle = asyncio.run(go())
     assert live == ["a", "b"] and idle == ["b"]
+
+
+def test_an_executor_to_release_is_leased_nothing_more():
+    clock = _Clock()
+
+    async def go():
+        d = _dispatcher(clock)
+        d.heartbeat("old", _executor("old"))
+        clock.now += 10
+        d.heartbeat("new", _executor("new"))
+        assert d.release_beyond(MODEL_A, None) == []        # nothing wanted known: none released
+        assert d.release_beyond(MODEL_A, 2) == []
+        assert d.release_beyond(MODEL_A, 0) == ["new"]      # at least one kept, the newest goes
+        d.set_releasing(["new"])
+        scoring = asyncio.ensure_future(d.view(*MODEL_A, PROOF).score(ITEMS))
+        await asyncio.sleep(0)
+        assert d.claim(_executor("new")) is None
+        assert d.claim(_executor("old")) is not None
+        d.set_releasing([])                                  # wanted again: leased as before
+        scoring.cancel()
+
+    asyncio.run(go())
