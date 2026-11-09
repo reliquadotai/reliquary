@@ -8,6 +8,7 @@ beyond what the settler and the ledger reads already do. Nothing names a hotkey.
 
 from __future__ import annotations
 
+import asyncio
 import collections
 import logging
 import time
@@ -131,9 +132,15 @@ def _eval_prompt_counts(job: Any, slots: Any, *, unaudited: int) -> dict[str, An
             "complete": counts["open"] == 0 and unaudited <= 0}
 
 
-async def stored_job_counts(records: Any, job_id: str) -> dict[str, Any]:
+async def stored_job_counts(records: Any, job_id: str, *,
+                            verdict_passed: dict[str, bool] | None = None) -> dict[str, Any]:
     """What the bucket says of a job's drain, by listing it: the counts
-    `jobs status` prints and the admin service proxies."""
+    `jobs status` prints and the admin service proxies.
+
+    ``final``: what the job delivers can no longer change (``final_records``),
+    which may come a period before ``drained``: pay settles on its own clock.
+    ``verdict_passed`` caches verdict outcomes across calls (verdicts are
+    create-only)."""
     from reliquary.validator.corpus_service import rebuild_ledgers
 
     # These reads must use the record store's own bucket, not ambient storage
@@ -158,6 +165,11 @@ async def stored_job_counts(records: Any, job_id: str) -> dict[str, Any]:
     if job is None and after:
         raise ValueError("stored ledger has no job manifest")
     pending_records = max(pending_records, after_pending)
+    quiet = (unaudited == 0 and pending_records == 0
+             and before_etag == after_etag and before == after)
+    drained = quiet and unsettled == 0 and pending is None
+    final = drained or (quiet and job is not None and await final_records(
+        records, job, after, verdicts, verdict_passed))
     return {
         "submissions": len(submissions), "verdicts": len(verdicts), "unaudited": unaudited,
         "settled": len(settled), "unsettled": unsettled,
@@ -165,9 +177,42 @@ async def stored_job_counts(records: Any, job_id: str) -> dict[str, Any]:
         "pending_window": (pending.get("window", pending.get("work_period"))
                            if pending else None),
         "last_window": state.get("last_window"),
-        "drained": (unaudited == 0 and unsettled == 0 and pending is None
-                    and pending_records == 0 and before_etag == after_etag and before == after),
+        "drained": drained,
+        "final": final,
     }
+
+
+async def final_records(records: Any, job: Any, ledgers: Mapping, verdict_ids: Iterable[str],
+                        verdict_passed: dict[str, bool] | None = None) -> bool:
+    """Whether a quiet single-turn eval or forced-draw job (every submission
+    audited, no record pending, ledgers unchanged across the read) is final:
+    no prompt still open, and every failed verdict recorded in the ledgers (the
+    auditor writes the verdict, then reopens its slot). Any other job is final
+    once drained: an episode's grade may still change, and a job retired
+    before it filled may still take a submission it admitted."""
+    from reliquary.corpus.eval_draw import has_draw
+    from reliquary.corpus.slots import _failure_id
+    from reliquary.eval.prompt_source import is_eval_source
+    from reliquary.validator.corpus_service import rebuild_ledgers
+
+    if getattr(job, "episode", None) is not None:
+        return False
+    if not (is_eval_source(getattr(job, "prompt_source", "")) or has_draw(job)):
+        return False
+    slots = rebuild_ledgers(job, ledgers).slots
+    if slots.prompt_counts()["open"]:
+        return False
+    cache = {} if verdict_passed is None else verdict_passed
+    unread = [sid for sid in verdict_ids if sid not in cache]
+    for start in range(0, len(unread), 64):
+        chunk = unread[start:start + 64]
+        read = await asyncio.gather(*(records.read_verdict(job.job_id, sid) for sid in chunk))
+        for sid, verdict in zip(chunk, read):
+            if verdict is None:
+                return False  # listed before it was readable
+            cache[sid] = bool(verdict.get("passed"))
+    recorded = {_failure_id(entry) for ids in slots.failed_snapshot().values() for entry in ids}
+    return all(cache[sid] or sid[:12] in recorded for sid in verdict_ids)
 
 
 __all__ = [

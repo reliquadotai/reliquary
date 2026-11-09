@@ -534,6 +534,19 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         entries, _ = await registry_store.read_registry(strict=False)
         return [e for _, e in sorted(entries.items()) if e.job_id == job_id]
 
+    # Verdict outcomes by job, read once each (verdicts are create-only).
+    verdict_outcomes: dict[str, dict[str, bool]] = {}
+
+    async def job_counts(job_id: str) -> dict:
+        """The stored counts; ``final`` gates grading and delivery, ``drained`` only pay."""
+        from reliquary.validator.corpus_job_status import stored_job_counts
+
+        cache = verdict_outcomes.setdefault(job_id, {})
+        counts = await stored_job_counts(records, job_id, verdict_passed=cache)
+        if counts["final"]:
+            verdict_outcomes.pop(job_id, None)
+        return counts
+
     async def draining_limits(new_cap: float):
         """The cap guard, counting retired corpus tasks whose job has not drained."""
         if new_cap == 0.0:
@@ -1292,7 +1305,6 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     @router.get("/jobs/{job_id}/status")
     async def job_status(job_id: str) -> dict:
         from reliquary.protocol.release_contract import canonical_sha256
-        from reliquary.validator.corpus_job_status import stored_job_counts
 
         in_scope(job_id)
         try:
@@ -1301,7 +1313,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=404, detail="job_unknown") from exc
         if job is None:
             raise HTTPException(status_code=404, detail="job_unknown")
-        counts = await stored_job_counts(records, job_id)
+        counts = await job_counts(job_id)
         entries = await entries_naming(job_id)
         tasks = [{"task_id": e.task_id, "status": e.status, "cap": float(e.params["cap"]),
                   **({"max_price": price_of(e)} if price_of(e) is not None else {})}
@@ -1492,10 +1504,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             stored = await deliveries.get_json(f"deliveries/{delivery_id}/manifest.json")
             if stored is not None:
                 return delivery_result(stored)
-            from reliquary.validator.corpus_job_status import stored_job_counts
-
             # A delivery is final once written: never from a job still moving.
-            if not (await stored_job_counts(records, job_id))["drained"]:
+            if not (await job_counts(job_id))["final"]:
                 raise HTTPException(status_code=409, detail="job_not_drained")
             if body.schema_version == 3:
                 grade = None
@@ -1689,7 +1699,6 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             EpisodeJobRows, JobRows, collect_job_records, exhausted_prompts, job_complete,
         )
         from reliquary.eval.prompt_source import parse_eval_source
-        from reliquary.validator.corpus_job_status import stored_job_counts
         from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS
 
         try:
@@ -1725,7 +1734,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                              {**{"top_p": 1.0, "top_k": 0}, **claimed[k]}) != v)
         if differs:
             raise HTTPException(status_code=422, detail=f"provenance_mismatch: {differs}")
-        if not (await stored_job_counts(records, job.job_id))["drained"]:
+        if not (await job_counts(job.job_id))["final"]:
             raise HTTPException(status_code=409, detail="job_not_drained")
         if job.episode is not None:
             from reliquary.eval.job_grading import JobNotGradable

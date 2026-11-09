@@ -1362,6 +1362,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                                    job.job_id, job.judge if has_draw(job) else None))
 
         w.settler.on_window = w.miners.window
+        w.settler.on_read = w.stats.observe
         # The stake weighs a record's prompt as the settler pays it (`corpus_periods.work_value`).
         output_price, input_price = cp.max_price(entry.params), cp.max_input_price(entry.params)
         if input_price and output_price:

@@ -249,7 +249,7 @@ def test_a_served_eval_job_is_graded_on_cpu_from_its_audited_records(
             right = f"<think>hmm</think>{prompt}"
             submit(f"{prompt:032x}{k:032x}", prompt, [right if k < 2 + (prompt == 0) else "x"])
     records.subs["f" * 64] = {"prompt_index": 0, "hotkey": "late", "completions": []}
-    with pytest.raises(JobNotGradable, match="not drained"):
+    with pytest.raises(JobNotGradable, match="not final"):
         grade()
     del records.subs["f" * 64]
     manifest = grade()
