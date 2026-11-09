@@ -98,7 +98,11 @@ class CorpusPeriodSettler:
         self._unsettled: set[str] = set()
         self._fed: dict[str, Mapping] = {}
         self.settled_count: int | None = None
-        self.totals: dict | None = None
+        self._totals: dict | None = None
+        # Verdicts unsettled at boot are read once by the first full list and
+        # reported to ``on_read`` (the job's status), which counts them from then on.
+        self.on_read: Callable[[str, Mapping], None] | None = None
+        self._seeded = False
         # The last period paid: work_period, verified_tokens, paid (pool share).
         self.last_period: dict | None = None
         # Unsettled verdicts by the period they were received in (str key):
@@ -108,6 +112,17 @@ class CorpusPeriodSettler:
         self.open_periods_at: float | None = None
         self.on_settled = on_settled
         self.on_window = None
+
+    @property
+    def totals(self) -> dict | None:
+        """Settled totals; marked incomplete until the unsettled verdicts found at boot were read."""
+        if self._totals is None or self._seeded:
+            return self._totals
+        return {**self._totals, "complete": False}
+
+    @totals.setter
+    def totals(self, value: dict | None) -> None:
+        self._totals = value
 
     # -- the feed ---------------------------------------------------------------
 
@@ -168,7 +183,21 @@ class CorpusPeriodSettler:
         self._unsettled -= settled
         if self._fed:
             self._fed = {sid: v for sid, v in self._fed.items() if sid not in settled}
+        if due and not self._seeded:
+            await self._seed(sorted(self._unsettled))
         return sorted(self._unsettled)
+
+    async def _seed(self, ids: list[str]) -> None:
+        """Read the unsettled verdicts no feed reported (written before this process
+        started) and report them to ``on_read``; kept as fed, so never read again."""
+        read = await self._verdicts([sid for sid in ids if sid not in self._fed])
+        for sid, verdict in read.items():
+            if verdict is None:
+                return  # listed before it was readable: the next full list seeds
+            self._fed[sid] = verdict
+            if self.on_read is not None:
+                self.on_read(sid, verdict)
+        self._seeded = True
 
     async def _verdicts(self, ids: list[str]) -> dict[str, Mapping | None]:
         gate = asyncio.Semaphore(VERDICT_READ_CONCURRENCY)

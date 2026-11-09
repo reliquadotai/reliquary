@@ -87,7 +87,7 @@ async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bo
                            require_sandbox=None, work_dir: str | Path | None = None,
                            rl: dict | None = None,
                            clock: Callable[[], float] = time.time) -> dict:
-    """Grade a drained eval job our validator served; the manifest, its files in ``out``.
+    """Grade a final eval job our validator served; the manifest, its files in ``out``.
     ``rl``: ``rl_provenance`` keywords (run_id, step, checkpoint_version)."""
     from reliquary.corpus.delivery import LocalDirectorySink
     from reliquary.corpus.eval_draw import EVAL_DRAW_DOMAIN, draw_randomness, has_draw
@@ -121,9 +121,9 @@ async def grade_served_job(job_id: str, *, out: str | Path, allow_incomplete: bo
         raise JobNotGradable(f"job {job_id} reads {job.prompt_source!r}, not an eval set")
     source = parse_eval_source(job.prompt_source)
     samples = job.slots_per_prompt * job.sampling.n
-    if not (await stored_job_counts(records, job_id))["drained"]:
-        raise JobNotGradable(f"job {job_id} is not drained: every submission must be audited "
-                             "and settled first (reliquary jobs status)")
+    if not (await stored_job_counts(records, job_id, with_final=True))["final"]:
+        raise JobNotGradable(f"job {job_id} is not final: every submission must be audited "
+                             "first (reliquary jobs status)")
     # The set's rows (the ones the job ran) say how it is graded; its card in
     # the bucket is read, and checked against them, by the grading itself.
     rows = await asyncio.to_thread(load_eval_rows, source)

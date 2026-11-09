@@ -422,6 +422,7 @@ def wire_job_judge(w, *, records, judge_records, judge_threads, archives, proof,
                               slot_store=_slot_store() if has_draw(w.job) else None,
                               **(auditor_kwargs or {}))
     w.settler.on_window = w.miners.window
+    w.settler.on_read = w.stats.observe
     if getattr(w, "grader", None) is not None:
         w.grader.on_voided = w.miners.voided
 
