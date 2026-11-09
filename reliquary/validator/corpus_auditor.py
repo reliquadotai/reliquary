@@ -265,6 +265,8 @@ class CorpusAuditor:
         self._staked: set[str] = set()
         # Its shortest completion's tokens, from a full read (a metadata read leaves it unknown).
         self._shortest: dict[str, int] = {}
+        # Records read in full once for their shortest completion (a full read that finds none is not retried).
+        self._read_for_shortest: set[str] = set()
         # Since when no pending record may still need an audit (`audits_pending`), None while one may.
         self._audits_idle_since: float | None = None
         # The fewest arrivals in a hold that keep a hotkey off the slow-hotkey rule.
@@ -526,6 +528,7 @@ class CorpusAuditor:
         self._undrawn.discard(submission_id)
         self._stake.pop(submission_id, None)
         self._shortest.pop(submission_id, None)
+        self._read_for_shortest.discard(submission_id)
         if submission_id in self._meta:
             self._unjudged.get(self._meta[submission_id][0], set()).discard(submission_id)
 
@@ -852,6 +855,18 @@ class CorpusAuditor:
             return True
         shortest = self._shortest.get(submission_id)
         return shortest is not None and shortest >= EVAL_CHARGE_MIN_POSITIONS
+
+    def _needing_shortest(self, submission_ids: list[str], read: dict) -> list[str]:
+        """Known records the stake rule needs read in full: seeded from their metadata after a restart, so
+        their shortest completion is unknown and `_stake_applies` would fall back to the arrivals rule, which
+        audits every record decided once the hotkey stopped submitting (2026-11-09: 99 % of an order)."""
+        if not self.stake_at_receipt or self._draw_job is None or self._params.q >= 1.0:
+            return []
+        wanted = [sid for sid in dict.fromkeys(submission_ids)
+                  if sid in self._meta and sid not in read and sid not in self._shortest
+                  and sid not in self._read_for_shortest]
+        self._read_for_shortest.update(wanted)
+        return wanted
 
     def _recent(self, hotkey: str, now: float) -> int:
         arrivals = self._arrivals.get(hotkey, [])
@@ -1552,6 +1567,7 @@ class CorpusAuditor:
         read: dict[str, dict] = {}
         read.update(await self._read_all(
             [sid for sid in submission_ids if sid not in self._meta]))
+        read.update(await self._read_all(self._needing_shortest(submission_ids, read)))
         known = [sid for sid in dict.fromkeys(submission_ids) if sid in self._meta]
         if self.stake_at_receipt:
             # Oldest first: a record's stake counts the earlier ones this pass leaves unaudited.
