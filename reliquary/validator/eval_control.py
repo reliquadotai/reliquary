@@ -119,6 +119,13 @@ def order_max_audit_executors(env=None) -> int:
     return value
 
 
+def order_audit_executors(declared: dict | None) -> int:
+    """The most audit executors an order allows for its model: its record's ``audit_executors`` (its chosen
+    speed), one without."""
+    value = (declared or {}).get("audit_executors")
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) and value >= 1 else 1
+
+
 def executors_for_backlog(backlog: float, items_per_second: float | None, *, drain_seconds: float,
                           max_executors: int) -> int | None:
     """Executors that audit ``backlog`` items within ``drain_seconds`` at the measured rate of one: 0 with
@@ -1463,6 +1470,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
 
         await warm_drand_chain(None)
         w = SimpleNamespace(entry=entry, cap=cap, job=job, tokenizer=tokenizer,
+                            audit_executors=order_audit_executors(declared),
                             vocab_size=vocab_size, proof=proof, renderer=renderer,
                             prompt_job_for=prompt_job_for, seen_index=seen_index,
                             is_banned=is_banned, stats=JobStats())
@@ -1660,9 +1668,13 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         document = dispatcher.status()
         # Per model served, its orders' expected audit items; None while one of them is unknown.
         backlog: dict[tuple[str, str], float | None] = {}
+        # Per model, the most executors its orders allow (the fastest order's choice), within the control's.
+        allowed: dict[tuple[str, str], int] = {}
         released: list[str] = []
         for w in list(served.values()):
-            backlog.setdefault((w.job.checkpoint_repo, w.job.checkpoint_revision), 0.0)
+            model = (w.job.checkpoint_repo, w.job.checkpoint_revision)
+            backlog.setdefault(model, 0.0)
+            allowed[model] = max(allowed.get(model, 1), getattr(w, "audit_executors", 1))
         for job_id in list(served):
             try:
                 status = await job_set.status(job_id)
@@ -1697,7 +1709,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             rate = dispatcher.items_per_second(model)
             # Unknown backlog (a job seeding, a status unreadable): what is wanted stays as it was.
             target = None if expected is None else executors_for_backlog(
-                expected, rate, drain_seconds=drain_seconds, max_executors=max_executors)
+                expected, rate, drain_seconds=drain_seconds,
+                max_executors=min(max_executors, allowed.get(model, 1)))
             wanted = sizing.update(key, target)
             entry = document["models"].setdefault(key, {"executors_needed": 0, "live_executors": len(live)})
             # Beyond what is wanted (at least the scorers a batch needs), the newest executors lease nothing more;
@@ -1705,7 +1718,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             releasing = dispatcher.release_beyond(
                 model, None if wanted is None else max(wanted, dispatcher.scorers))
             released.extend(releasing)
-            entry.update({"expected_audits": None if expected is None else round(expected),
+            entry.update({"executors_allowed": min(max_executors, allowed.get(model, 1)),
+                          "expected_audits": None if expected is None else round(expected),
                           "items_per_second": rate, "executors_wanted": wanted,
                           "executors": live, "idle_executors": idle, "releasing": releasing})
             if wanted:

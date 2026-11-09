@@ -129,6 +129,12 @@ class TokenCeiling(BaseModel):
     output: float = Field(gt=0.0, allow_inf_nan=False)
 
 
+def audit_executors_of(body) -> dict:
+    """The order record's ``audit_executors``, only when the order asks for more than one."""
+    n = getattr(body, "audit_executors", None)
+    return {"audit_executors": int(n)} if n is not None and n > 1 else {}
+
+
 class CreateJob(BaseModel):
     model_config = ConfigDict(extra="forbid")
     job_id: str = Field(min_length=1, max_length=128)
@@ -150,6 +156,9 @@ class CreateJob(BaseModel):
     qualification_id: str | None = Field(default=None, min_length=1, max_length=63)
     seed: int | None = Field(default=None, ge=0, le=2**63 - 1)
     audit_q: float | None = Field(default=None, gt=0.0, le=1.0)
+    # The most audit executors the order control may use for this order's model (none: one), at the order's
+    # chosen speed; the control's own maximum still applies.
+    audit_executors: int | None = Field(default=None, ge=1, le=8)
     sampling: "OrderSampling | None" = None
     # Eval and generation orders: every sample follows the job's public forced draw (``corpus.eval_draw``),
     # checked by the audit in place of a proof; ``judge`` sets some of its thresholds (``corpus.job.DrawJudge``).
@@ -683,7 +692,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     "qualification_id": body.qualification_id, "set_id": set_id,
                     "problems": body.prompt_count, "samples": body.samples_per_prompt,
                     "sampling": body.sampling.conditions(), "max_new_tokens": body.max_new_tokens,
-                    "thinking": body.thinking})
+                    "thinking": body.thinking, **audit_executors_of(body)})
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return dict(
@@ -756,7 +765,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     "qualification_id": body.qualification_id, "env": body.env,
                     "prompt_start": body.prompt_start, "problems": body.prompt_count,
                     "samples": body.samples_per_prompt, "sampling": body.sampling.conditions(),
-                    "max_new_tokens": body.max_new_tokens, "thinking": body.thinking})
+                    "max_new_tokens": body.max_new_tokens, "thinking": body.thinking,
+                    **audit_executors_of(body)})
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return dict(
@@ -895,7 +905,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     # An episode renders through its own renderer: no thinking toggle.
                     "thinking": None if episode is not None else body.thinking, "episode": episode,
                     "draw": body.draw, "judge": judge, "seed": seed,
-                    "audit_q": 1.0 if evaluation else (body.audit_q or GEN_AUDIT_PARAMS["audit_q"])})
+                    "audit_q": 1.0 if evaluation else (body.audit_q or GEN_AUDIT_PARAMS["audit_q"]),
+                    **audit_executors_of(body)})
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
         audit = {"audit_q": 1.0} if evaluation else {
@@ -987,7 +998,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if generation and body.seed is not None and body.draw is None:
             raise HTTPException(status_code=422, detail="eval fields on a generation order: a seed keys a forced draw")
         if not evaluation and not generation and any(
-                v is not None for v in (body.qualification_id, body.seed, body.audit_q, body.draw, body.judge)):
+                v is not None for v in (body.qualification_id, body.seed, body.audit_q, body.draw, body.judge,
+                                        body.audit_executors)):
             raise HTTPException(status_code=422, detail="eval fields on a non-eval job")
         if body.max_price_usd_per_mtoken is not None and not (evaluation or generation):
             raise HTTPException(status_code=422, detail=(
