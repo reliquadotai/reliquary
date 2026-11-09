@@ -1528,6 +1528,11 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             entry.update({key: status.get(key) for key in (
                 "state", "prompts_total", "prompts_full", "prompts_complete",
                 "prompts_exhausted", "complete")})
+            # What the fleet needs to keep an audit executor for it: none once nothing left may need one.
+            auditor = getattr(served.get(job_id), "auditor", None)
+            if auditor is not None:
+                entry["audits_pending"] = auditor.audits_pending()
+                entry["audits_idle_since"] = auditor.audits_idle_since
         return document
 
     app.state.control_status = control_status

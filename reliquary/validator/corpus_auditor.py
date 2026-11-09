@@ -265,6 +265,8 @@ class CorpusAuditor:
         self._staked: set[str] = set()
         # Its shortest completion's tokens, from a full read (a metadata read leaves it unknown).
         self._shortest: dict[str, int] = {}
+        # Since when no pending record may still need an audit (`audits_pending`), None while one may.
+        self._audits_idle_since: float | None = None
         # The fewest arrivals in a hold that keep a hotkey off the slow-hotkey rule.
         self._enough = self._fewest_not_slow(params.q)
         self._rescan_every = rescan_every_seconds
@@ -470,6 +472,35 @@ class CorpusAuditor:
                 at = -math.inf
             oldest = at if oldest is None else min(oldest, at)
         return oldest
+
+    def audits_pending(self) -> int | None:
+        """Pending records that may still need a GPU audit: every one not decided yet, and every one waiting out
+        its hold whose decision at the hold's end could still be an audit. Not counted: a record known undrawn
+        whose stake was counted enough (`stake_at_receipt`), which its hold's end only pays (or forfeits, or
+        voids) -- unless its hotkey's state changes meanwhile, which the next call counts. None before the
+        seed (an unknown backlog may hold anything). Updates `audits_idle_since`."""
+        if not self._seeded:
+            self._audits_idle_since = None
+            return None
+        enough = 1.0 / self._params.q
+        pending = 0
+        for sid in dict.fromkeys((*self._meta, *self._unreadable, *self._queued)):
+            if sid in self._judged:
+                continue
+            if (self.stake_at_receipt and self._params.q < 1.0 and sid in self._undrawn
+                    and self._stake.get(sid, 0.0) >= enough):
+                continue
+            pending += 1
+        if pending:
+            self._audits_idle_since = None
+        elif self._audits_idle_since is None:
+            self._audits_idle_since = self._clock()
+        return pending
+
+    @property
+    def audits_idle_since(self) -> float | None:
+        """When `audits_pending` last reached 0 and stayed there (None while it is not 0)."""
+        return self._audits_idle_since
 
     async def pending_ids(self) -> list[str]:
         with self._timed("list"):
