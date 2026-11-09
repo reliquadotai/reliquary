@@ -239,6 +239,27 @@ def test_unwiring_retries_until_it_can_store_fresh_final_counts(missing_historic
     assert saved["job-b"]["verified_tokens"] == 70
 
 
+def test_unseeded_local_zero_does_not_hide_durable_verdicts():
+    job_set, _, _ = _set({}, now=[10_000.0])
+    job_set._routes.retire("job-b")
+    settler = job_set.served["job-b"].settler
+    settler.totals, settler.settled_count = None, None
+
+    async def drained(wiring):
+        return True
+
+    async def verdicts(job_id):
+        return ["settled-before-restart"]
+
+    async def store(job_id, status):
+        pytest.fail("unseeded local zero must not become a final count")
+
+    job_set._drained = drained
+    job_set._finals = SimpleNamespace(list_verdict_ids=verdicts, write_final_status=store)
+    asyncio.run(job_set._maybe_unwire("job-b"))
+    assert "job-b" in job_set.served
+
+
 # --------------------------------------------------------------------------
 # The route, the auditor hook and the settler count
 # --------------------------------------------------------------------------

@@ -610,6 +610,7 @@ def test_an_order_job_finishes_across_a_restart(world, monkeypatch):  # noqa: F8
         assert sorted(job_set.served) == ["order-eval-b"]
         final = await records.read_final_status("order-eval-a")
         assert final["state"] == "drained" and final["job_id"] == "order-eval-a"
+        assert final["counts_complete"] is True and final["verified_tokens"] == 0
         assert {"prompts_total", "prompts_complete", "prompts_exhausted", "complete"} <= set(final)
         assert await records.read_final_status("order-eval-b") is None
         stop(job_set)

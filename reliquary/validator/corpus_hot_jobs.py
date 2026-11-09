@@ -419,12 +419,18 @@ class CorpusJobSet:
                      "counts_complete": False}
         if self._finals is not None:
             # A durable settlement can become visible before the local totals catch up.
-            if not final["counts_complete"] or final["audited"] > final["settled"]:
+            if final["audited"] > final["settled"]:
                 return
-            # Historical settlements may have no totals for some of their settled verdicts.
-            if final["audited"] < final["settled"]:
-                final["counts_complete"] = False
             try:
+                if not final["counts_complete"]:
+                    # A retired job with no verdicts needs no settlement pass to certify zero.
+                    if (final["submissions_accepted"] or final["audited"] or final["settled"]
+                            or await self._finals.list_verdict_ids(job_id)):
+                        return
+                    final["counts_complete"] = True
+                # Historical settlements may have no totals for some of their settled verdicts.
+                if final["audited"] < final["settled"]:
+                    final["counts_complete"] = False
                 # Kept before anything is released: a restart serves it.
                 await self._finals.write_final_status(job_id, final)
             except Exception:
