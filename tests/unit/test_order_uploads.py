@@ -79,6 +79,16 @@ def test_the_template_variables_name_what_a_line_may_set():
     assert {"enable_thinking", "tools", "messages"} <= template_variables(TOK)
 
 
+def test_template_variables_accept_the_tags_transformers_renders_with():
+    template = ("{% for m in messages %}{% if m.role == 'assistant' %}{% generation %}"
+                "{{ m.content }}{% endgeneration %}{% else %}{{ m.content }}{% endif %}"
+                "{% if loop.index > 50 %}{% break %}{% endif %}{% endfor %}"
+                "{% if enable_thinking %}<think>{% endif %}")
+    tok = Tok()
+    tok.chat_template = template
+    assert {"messages", "enable_thinking"} <= template_variables(tok)
+
+
 def test_a_multi_turn_chat_with_tools_is_rendered_once_into_token_ids():
     tools = [{"type": "function", "function": {"name": "search", "parameters": {}}}]
     messages = [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"},

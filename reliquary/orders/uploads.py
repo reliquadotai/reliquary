@@ -168,8 +168,18 @@ def template_variables(tokenizer) -> frozenset[str]:
     if not templates:
         return frozenset()
     from jinja2 import Environment, meta
+    from jinja2.ext import Extension, loopcontrols
 
-    environment = Environment()
+    class _Generation(Extension):
+        # transformers' {% generation %} block (assistant masks); its body is plain template.
+        tags = {"generation"}
+
+        def parse(self, parser):
+            next(parser.stream)
+            return parser.parse_statements(("name:endgeneration",), drop_needle=True)
+
+    # Same tags transformers renders with, so any template it accepts parses here.
+    environment = Environment(extensions=[_Generation, loopcontrols])
     names: set[str] = set()
     for text in templates:
         names |= meta.find_undeclared_variables(environment.parse(text))
