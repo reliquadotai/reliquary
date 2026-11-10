@@ -606,7 +606,7 @@ and that hotkey is failed and banned on the first job only.
 On each miner:
 
 ```bash
-reliquary corpus mine --validator-url http://<validator-ip>:<port> \
+reliquary corpus mine --validator-url https://api.reliqua.ai \
   --wallet-name <wallet> --hotkey <hotkey>
 ```
 
@@ -752,7 +752,7 @@ A hotkey the job has never seen answers 200 with zeros and `probation`. The
 answer is cached 30 s per hotkey; it costs the validator no store listing.
 
 ```bash
-reliquary corpus status --validator-url http://<validator-ip>:<port> \
+reliquary corpus status --validator-url https://api.reliqua.ai \
   --job-id <job> --hotkey <ss58>            # or --wallet-name/--wallet-hotkey
 reliquary corpus status ... --json          # the route's JSON as is
 ```

@@ -471,7 +471,7 @@ On a healthy startup:
 
 If submissions are rejected, the `reason` field tells you why (see the rejection table above).
 
-Corpus (SFT) tasks: `reliquary corpus status --validator-url URL --job-id JOB
+Corpus (SFT) tasks: `reliquary corpus status --validator-url https://api.reliqua.ai --job-id JOB
 --hotkey SS58` (route `GET /corpus/jobs/<job>/miners/<hotkey>`) shows your audit
 state, verdict counts, recent failures with their TOPLOC measures, and what the
 task paid you; see [Corpus task launch §4.2](runbooks/corpus-task-launch.md#42-your-own-status-audit-state-failures-pay).
@@ -511,7 +511,7 @@ submission. No extra command is needed for that miner. Custom miners can run:
 
 ```bash
 reliquary watch-verdicts \
-  --validator-url http://62.238.81.36:8000 \
+  --validator-url https://api.reliqua.ai \
   --hotkey YOUR_PUBLIC_HOTKEY | tee -a verdicts.jsonl
 ```
 
@@ -542,7 +542,7 @@ repeat records or leave a historical gap. Use the targeted lookup documented in
 To recover stored final outcomes for an entire window (100 records per page):
 
 ```bash
-reliquary watch-verdicts --validator-url http://62.238.81.36:8000 \
+reliquary watch-verdicts --validator-url https://api.reliqua.ai \
   --hotkey YOUR_PUBLIC_HOTKEY --window 45829 | tee window-verdicts.jsonl
 ```
 

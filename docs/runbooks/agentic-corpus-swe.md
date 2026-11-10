@@ -304,7 +304,7 @@ To mine one:
 2. Run the same command as for any episode job:
 
    ```bash
-   reliquary corpus mine-agentic --validator-url <url> --job-id <job>
+   reliquary corpus mine-agentic --validator-url https://api.reliqua.ai --job-id <job>
    ```
 
 You do not need Docker, verifiers or renderers, and the miner opens no network
