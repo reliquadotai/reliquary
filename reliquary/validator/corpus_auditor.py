@@ -766,7 +766,9 @@ class CorpusAuditor:
         if isinstance(completions, list) and completions and read is not None:
             read[0] += 1
             read[1] += len(completions)
-        if self.stake_at_receipt and isinstance(completions, list) and completions:
+        # A forced-draw record's shortest completion: the stake and the short-sample audit read it.
+        if ((self.stake_at_receipt or self._draw_job is not None) and isinstance(completions, list)
+                and completions):
             try:
                 self._shortest[submission_id] = min(len(c["tokens"]) for c in completions)
             except (KeyError, TypeError):
@@ -1602,9 +1604,19 @@ class CorpusAuditor:
         choice = decision(state, params=self._params, now=now, received_at=received_at,
                           recent_submissions=recent, randomness_hex=randomness,
                           submission_id=submission_id, slack_seconds=self._accept_slack)
+        if choice == "pass_unaudited" and self._short_draw(submission_id):
+            # Never paid unaudited: its refusal is not charged, so only an audit stops a cheap short sample.
+            choice = "audit"
         if self.stake_at_receipt and choice in ("wait", "pass_unaudited"):
             self._count_forfeitable(submission_id, held=True)
         return choice, draw
+
+    def _short_draw(self, submission_id: str) -> bool:
+        """Whether a forced-draw record holds a completion too short for its refusal to be charged."""
+        from reliquary.corpus.eval_draw import EVAL_CHARGE_MIN_POSITIONS
+
+        shortest = self._shortest.get(submission_id) if self._draw_job is not None else None
+        return shortest is not None and shortest < EVAL_CHARGE_MIN_POSITIONS
 
     async def _judge_once(self, submission_ids: list[str]) -> set[str]:
         now = self._clock()

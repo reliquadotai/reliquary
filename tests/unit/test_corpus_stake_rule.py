@@ -270,3 +270,33 @@ def test_a_pass_learns_the_length_of_its_records_before_deciding():
     with pytest.raises(_Stop):
         asyncio.run(auditor._judge_once([first]))
     assert seen == [first]
+
+
+def test_a_short_draw_sample_is_audited_instead_of_paid_unaudited(monkeypatch):
+    # Its refusal is never charged (under EVAL_CHARGE_MIN_POSITIONS positions), so a two-token sample costs a
+    # cheat nothing: it is audited rather than paid at its hold's end.
+    short = _ids(False, 1, start=500)[0]
+    monkeypatch.setattr(_Staked, "_short_draw", lambda self, sid: sid == short)
+    y = _ids(False, 1)[0]
+    store = _Store({y: _rec(0, received_at=T0), short: _rec(0, received_at=T0 + 30)})
+    clock = _Clock(T0)
+    auditor = _auditor(store, clock)
+    _judge_at(auditor, clock, T0 + 20, [y])
+    _judge_at(auditor, clock, T0 + 40, [short])
+    _judge_at(auditor, clock, T0 + 30 + HOLD + 1, [short])
+    assert store.verdicts[short]["audited"] is True
+
+
+def test_only_a_forced_draw_record_with_a_short_completion_is_short():
+    store = _Store({})
+    auditor = _auditor(store, _Clock(T0), staked=False)
+    long_ = {"tokens": [1] * 64, "text": ""}
+    short = {"tokens": [1] * 2, "text": ""}
+    auditor._remember("a" * 64, {**_rec(0), "completions": [short, long_]})
+    assert not auditor._short_draw("a" * 64)           # not a forced-draw job
+    auditor._draw_job = object()
+    auditor._remember("b" * 64, {**_rec(0), "completions": [short, long_]})
+    auditor._remember("c" * 64, {**_rec(0), "completions": [long_, long_]})
+    auditor._remember("d" * 64, {"hotkey": HK, "received_at": T0, "token_count": 500})
+    # Read even without the stake rule; a record never read in full is left to the usual rules.
+    assert [auditor._short_draw(sid * 64) for sid in "bcd"] == [True, False, False]
