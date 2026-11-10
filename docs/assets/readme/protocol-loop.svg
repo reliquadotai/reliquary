@@ -7,12 +7,12 @@
   aria-labelledby="reliquary-core-loop-title reliquary-core-loop-description"
   focusable="false"
 >
-  <title id="reliquary-core-loop-title">The Reliquary protocol loop</title>
+  <title id="reliquary-core-loop-title">The Reliquary asynchronous RL loop</title>
   <desc id="reliquary-core-loop-description">
-    Six ordered stages: miners generate candidate rollouts, validators grade rewards,
-    the auction ranks candidates, GRAIL verifies candidates that can still win, clean
-    groups accumulate into a checkpoint-bound batch, and eligible batches run a GRPO
-    step before publishing a checkpoint, archive, and on-chain weights.
+    Miners lease prompts and generate rollouts. The validator grades the work.
+    The trainer verifies and corrects token choices before the GRPO update.
+    Checkpoints are published for miners to sync and eligible work is settled.
+    These stages run asynchronously, without a fleet-wide generation barrier.
   </desc>
 
   <defs>
@@ -64,14 +64,14 @@
     font-size="19"
     font-weight="700"
     letter-spacing="4"
-  >THE PROTOCOL LOOP</text>
+  >THE ASYNC RL LOOP</text>
   <text
     x="62"
     y="132"
     fill="#f5f1ea"
     font-family="Georgia, 'Times New Roman', serif"
     font-size="46"
-  >Signal becomes a checkpoint.</text>
+  >Compute becomes model progress.</text>
 
   <path
     d="M 554 238 H 646"
@@ -111,44 +111,44 @@
 
   <g>
     <rect x="62" y="168" width="492" height="146" fill="#111113" stroke="#2b2b2f" />
-    <text x="88" y="205" fill="#e87a3e" font-family="'Courier New', Courier, monospace" font-size="18" font-weight="700" letter-spacing="3">01 · MINE</text>
-    <text x="88" y="254" fill="#f5f1ea" font-family="Georgia, 'Times New Roman', serif" font-size="38">Mine candidates.</text>
-    <text x="88" y="288" fill="#bfbab1" font-family="Arial, Helvetica, sans-serif" font-size="19">Miners spend compute on frontier prompts.</text>
+    <text x="88" y="205" fill="#e87a3e" font-family="'Courier New', Courier, monospace" font-size="18" font-weight="700" letter-spacing="3">01 · LEASE</text>
+    <text x="88" y="254" fill="#f5f1ea" font-family="Georgia, 'Times New Roman', serif" font-size="38">Reserve prompts.</text>
+    <text x="88" y="288" fill="#bfbab1" font-family="Arial, Helvetica, sans-serif" font-size="19">Measured quotas bound open work.</text>
   </g>
 
   <g>
     <rect x="646" y="168" width="492" height="146" fill="#111113" stroke="#2b2b2f" />
-    <text x="672" y="205" fill="#e87a3e" font-family="'Courier New', Courier, monospace" font-size="18" font-weight="700" letter-spacing="3">02 · GRADE</text>
-    <text x="672" y="254" fill="#f5f1ea" font-family="Georgia, 'Times New Roman', serif" font-size="38">Grade rewards.</text>
-    <text x="672" y="288" fill="#bfbab1" font-family="Arial, Helvetica, sans-serif" font-size="19">The validator is the reward authority.</text>
+    <text x="672" y="205" fill="#e87a3e" font-family="'Courier New', Courier, monospace" font-size="18" font-weight="700" letter-spacing="3">02 · GENERATE</text>
+    <text x="672" y="254" fill="#f5f1ea" font-family="Georgia, 'Times New Roman', serif" font-size="38">Generate rollouts.</text>
+    <text x="672" y="288" fill="#bfbab1" font-family="Arial, Helvetica, sans-serif" font-size="19">Recent checkpoint. Reproducible draws.</text>
   </g>
 
   <g>
     <rect x="62" y="386" width="492" height="146" fill="#111113" stroke="#2b2b2f" />
-    <text x="88" y="423" fill="#e87a3e" font-family="'Courier New', Courier, monospace" font-size="18" font-weight="700" letter-spacing="3">03 · RANK</text>
-    <text x="88" y="472" fill="#f5f1ea" font-family="Georgia, 'Times New Roman', serif" font-size="38">Rank the frontier.</text>
-    <text x="88" y="506" fill="#bfbab1" font-family="Arial, Helvetica, sans-serif" font-size="19">Auction rules order candidates that can still win.</text>
+    <text x="88" y="423" fill="#e87a3e" font-family="'Courier New', Courier, monospace" font-size="18" font-weight="700" letter-spacing="3">03 · GRADE</text>
+    <text x="88" y="472" fill="#f5f1ea" font-family="Georgia, 'Times New Roman', serif" font-size="38">Grade the task.</text>
+    <text x="88" y="506" fill="#bfbab1" font-family="Arial, Helvetica, sans-serif" font-size="19">Validator rewards identify useful groups.</text>
   </g>
 
   <g>
     <rect x="646" y="386" width="492" height="146" fill="#111113" stroke="#2b2b2f" />
-    <text x="672" y="423" fill="#e87a3e" font-family="'Courier New', Courier, monospace" font-size="18" font-weight="700" letter-spacing="3">04 · DEFERRED PROOF</text>
-    <text x="672" y="472" fill="#f5f1ea" font-family="Georgia, 'Times New Roman', serif" font-size="38">Deferred proof.</text>
-    <text x="672" y="506" fill="#bfbab1" font-family="Arial, Helvetica, sans-serif" font-size="19">GRAIL checks only candidates still in contention.</text>
+    <text x="672" y="423" fill="#e87a3e" font-family="'Courier New', Courier, monospace" font-size="18" font-weight="700" letter-spacing="3">04 · VERIFY &amp; CORRECT</text>
+    <text x="672" y="472" fill="#f5f1ea" font-family="Georgia, 'Times New Roman', serif" font-size="38">Check token choices.</text>
+    <text x="672" y="506" fill="#bfbab1" font-family="Arial, Helvetica, sans-serif" font-size="19">Verify matches. Correct numerical drift.</text>
   </g>
 
   <g>
     <rect x="62" y="604" width="492" height="130" fill="#111113" stroke="#4fb8e0" />
-    <text x="88" y="641" fill="#4fb8e0" font-family="'Courier New', Courier, monospace" font-size="18" font-weight="700" letter-spacing="3">05 · ACCUMULATE</text>
-    <text x="88" y="690" fill="#f5f1ea" font-family="Georgia, 'Times New Roman', serif" font-size="38">Accumulate signal.</text>
-    <text x="88" y="718" fill="#bfbab1" font-family="Arial, Helvetica, sans-serif" font-size="18">Retain clean, checkpoint-bound groups.</text>
+    <text x="88" y="641" fill="#4fb8e0" font-family="'Courier New', Courier, monospace" font-size="18" font-weight="700" letter-spacing="3">05 · TRAIN</text>
+    <text x="88" y="690" fill="#f5f1ea" font-family="Georgia, 'Times New Roman', serif" font-size="38">Update the model.</text>
+    <text x="88" y="718" fill="#bfbab1" font-family="Arial, Helvetica, sans-serif" font-size="18">Eligible groups feed async GRPO steps.</text>
   </g>
 
   <g>
     <rect x="646" y="604" width="492" height="130" fill="#111113" stroke="#d44d7a" />
-    <text x="672" y="641" fill="#d44d7a" font-family="'Courier New', Courier, monospace" font-size="18" font-weight="700" letter-spacing="3">06 · GRPO / PUBLISH</text>
-    <text x="672" y="690" fill="#f5f1ea" font-family="Georgia, 'Times New Roman', serif" font-size="38">GRPO, then publish.</text>
-    <text x="672" y="718" fill="#bfbab1" font-family="Arial, Helvetica, sans-serif" font-size="18">Checkpoint · archive · on-chain weights.</text>
+    <text x="672" y="641" fill="#d44d7a" font-family="'Courier New', Courier, monospace" font-size="18" font-weight="700" letter-spacing="3">06 · PUBLISH &amp; SETTLE</text>
+    <text x="672" y="690" fill="#f5f1ea" font-family="Georgia, 'Times New Roman', serif" font-size="38">Sync. Account. Repeat.</text>
+    <text x="672" y="718" fill="#bfbab1" font-family="Arial, Helvetica, sans-serif" font-size="18">Checkpoints, observations and settlements.</text>
   </g>
 
   <g fill="#e87a3e" aria-hidden="true">

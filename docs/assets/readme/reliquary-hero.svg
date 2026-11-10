@@ -7,10 +7,10 @@
   aria-labelledby="reliquary-core-hero-title reliquary-core-hero-description"
   focusable="false"
 >
-  <title id="reliquary-core-hero-title">Reliquary validator and miner runtime</title>
+  <title id="reliquary-core-hero-title">Reliquary: permissionless post-training</title>
   <desc id="reliquary-core-hero-description">
-    The core Reliquary runtime for decentralized GRPO training on Bittensor Subnet 81:
-    mine the frontier, prove the rollout, and train the checkpoint.
+    Asynchronous reinforcement learning, verified training data generation and
+    model evaluation on Bittensor Subnet 81, using distributed GPU capacity.
   </desc>
 
   <defs>
@@ -72,7 +72,7 @@
     font-family="Georgia, 'Times New Roman', serif"
     font-size="49"
     font-style="italic"
-  >Find the signal. Prove it. Train.</text>
+  >Spare compute. Verified work.</text>
 
   <text
     x="464"
@@ -80,7 +80,7 @@
     fill="#bfbab1"
     font-family="Arial, Helvetica, sans-serif"
     font-size="27"
-  >Auction selection · deferred GRAIL verification · checkpoint-bound GRPO</text>
+  >Async RL · Verified training data · Model evaluation</text>
 
   <line x1="464" y1="402" x2="1320" y2="402" stroke="#2b2b2f" />
   <circle cx="464" cy="402" r="5" fill="#e87a3e" />
@@ -94,5 +94,5 @@
     font-size="20"
     font-weight="700"
     letter-spacing="3"
-  >VALIDATOR · MINER · GRAIL · GRPO · ARCHIVE · CHAIN</text>
+  >MINERS · VALIDATORS · TRAINING · EVALUATION</text>
 </svg>
