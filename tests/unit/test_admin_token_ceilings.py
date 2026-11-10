@@ -118,3 +118,31 @@ def test_tao_usd_is_fetched_once_per_cache_window(monkeypatch):
     monkeypatch.setenv(service.TAO_USD_ENV, "nan")
     with pytest.raises(ValueError):
         asyncio.run(read())
+
+
+def test_an_order_is_priced_by_auction_when_the_admin_says_so(admin, pins, rates, monkeypatch):  # noqa: F811
+    from reliquary.corpus.token_auction import auction_params
+
+    monkeypatch.setenv(service.ORDER_PRICING_ENV, "auction")
+    created = admin("POST", "/admin/v1/jobs", _order(max_price_usd_per_mtoken=CEILING))
+    assert created.status_code == 201, created.text
+    declared = auction_params(admin.registry["entries"]["order-eval-p1"].params)
+    assert declared is not None and declared.alpha_of(declared.ceiling) == pytest.approx(0.5)
+
+
+def test_an_order_without_a_ceiling_is_never_priced_by_auction(admin, pins, rates, monkeypatch):  # noqa: F811
+    monkeypatch.setenv(service.ORDER_PRICING_ENV, "auction")
+    assert admin("POST", "/admin/v1/jobs", _order()).status_code == 201
+    assert "pricing" not in admin.registry["entries"]["order-eval-p1"].params
+
+
+def test_orders_are_first_come_unless_the_admin_says_auction(admin, pins, rates, monkeypatch):  # noqa: F811
+    monkeypatch.delenv(service.ORDER_PRICING_ENV, raising=False)
+    assert admin("POST", "/admin/v1/jobs", _order(max_price_usd_per_mtoken=CEILING)).status_code == 201
+    assert "pricing" not in admin.registry["entries"]["order-eval-p1"].params
+
+
+def test_a_misspelt_order_pricing_refuses_the_order(admin, pins, rates, monkeypatch):  # noqa: F811
+    monkeypatch.setenv(service.ORDER_PRICING_ENV, "auctoin")
+    refused = admin("POST", "/admin/v1/jobs", _order(max_price_usd_per_mtoken=CEILING))
+    assert refused.status_code == 503 and "order_pricing_misconfigured" in refused.text

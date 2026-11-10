@@ -388,7 +388,8 @@ def _retry(call, *, sleep, counts, max_consecutive_failures):
 def mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
                max_steps: int | None = None, sleep=time.sleep,
                max_consecutive_failures: int = _MAX_CONSECUTIVE_FAILURES,
-               sign_skip=None, sign_lease=None, ask_alpha_per_mtoken: float | None = None) -> dict[str, int]:
+               sign_skip=None, sign_lease=None, ask_alpha_per_mtoken: float | None = None,
+               ask_capacity: int | None = None) -> dict[str, int]:
     """``_mine_steps``, ended cleanly (one log line, no retry) when the
     validator says the job is retired."""
     counts: Counter[str] = Counter()
@@ -398,7 +399,7 @@ def mine_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
                                     tokenizer=tokenizer, render=render, sign=sign, max_steps=max_steps,
                                     sleep=sleep, max_consecutive_failures=max_consecutive_failures,
                                     counts=counts, sign_lease=sign_lease,
-                                    ask_alpha_per_mtoken=ask_alpha_per_mtoken)
+                                    ask_alpha_per_mtoken=ask_alpha_per_mtoken, ask_capacity=ask_capacity)
         return _mine_steps(job=job, hotkey=hotkey, client=client, generator=generator,
                            tokenizer=tokenizer, render=render, sign=sign, max_steps=max_steps,
                            sleep=sleep, max_consecutive_failures=max_consecutive_failures,
@@ -447,11 +448,14 @@ def lease_body(job_id: str, hotkey: str, sign_lease) -> dict:
     return body
 
 
-def ask_body(job_id: str, hotkey: str, alpha_per_mtoken: float, sign_lease) -> dict:
-    """A fresh signed ask (``CorpusAskRequest``): ``alpha_per_mtoken`` in micro-alpha, signed as a lease is."""
+def ask_body(job_id: str, hotkey: str, alpha_per_mtoken: float, sign_lease, capacity: int | None = None) -> dict:
+    """A fresh signed offer (``CorpusAskRequest``): ``alpha_per_mtoken`` in micro-alpha and the samples this hotkey
+    holds at once (``capacity``, left out for 1), signed as a lease is."""
     body = {"job_id": job_id, "miner_hotkey": hotkey,
             "micro_alpha_per_mtoken": max(1, round(float(alpha_per_mtoken) * 1e6)),
             "issued_at": int(time.time()), "nonce": secrets.token_hex(16)}
+    if capacity is not None:
+        body["capacity"] = int(capacity)
     body["signature"] = sign_lease(body)
     return body
 
@@ -473,7 +477,7 @@ LEASE_WAIT_SECONDS = 30.0
 def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
                      max_steps: int | None, sleep, max_consecutive_failures: int,
                      counts: Counter, sign_lease=None,
-                     ask_alpha_per_mtoken: float | None = None) -> dict[str, int]:
+                     ask_alpha_per_mtoken: float | None = None, ask_capacity: int | None = None) -> dict[str, int]:
     """A forced-draw job (``corpus.eval_draw``): each step fills one draw slot of an open prompt, its
     completions the draw's samples, the slot sent as the cursor. Whatever they score, they are submitted.
 
@@ -501,7 +505,8 @@ def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
         now = time.monotonic()
         if not asking or (not force and asked_at[0] is not None and now - asked_at[0] < ASK_REPOST_SECONDS):
             return
-        answer = _retry(lambda: client.ask(ask_body(job.job_id, hotkey, ask_alpha_per_mtoken, sign_lease)),
+        answer = _retry(lambda: client.ask(ask_body(job.job_id, hotkey, ask_alpha_per_mtoken, sign_lease,
+                                                    ask_capacity)),
                         **retry_kwargs)
         asked_at[0] = now
         if answer is not None and not answer.get("accepted"):

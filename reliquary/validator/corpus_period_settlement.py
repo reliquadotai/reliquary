@@ -27,6 +27,7 @@ from reliquary.validator import corpus_periods as cp
 from reliquary.validator.corpus_settlement import (
     VERDICT_READ_CONCURRENCY,
     _union,
+    period_price,
     rewards_for,
 )
 
@@ -299,6 +300,9 @@ class CorpusPeriodSettler:
             # Input-priced: the period's budget is on its value, not its tokens.
             final["period_value"] = {**(state.get("period_value") or {}),
                                      str(pending["work_period"]): pending["period_value"]}
+        if pending.get("period_price") is not None:
+            final["period_price"] = {**(state.get("period_price") or {}),
+                                     str(pending["work_period"]): pending["period_price"]}
         if "period_paid" in pending:
             # A pending recorded by an older binary has none: left unknown.
             final["period_paid"] = {**(state.get("period_paid") or {}),
@@ -428,7 +432,9 @@ class CorpusPeriodSettler:
                 self._report(state, ids)
                 self.open_periods.pop(str(period), None)
                 continue
-            share = rewards_for(batch, pool, price=self._max_price, input_price=input_price)
+            # A job priced by auction pays every token of the period at one price: the highest lease delivered in it.
+            uniform = period_price(batch, (state.get("period_price") or {}).get(str(period)))
+            share = rewards_for(batch, pool, price=self._max_price, input_price=input_price, uniform_price=uniform)
             # A job priced by auction pays what its leases' prices add up to, under the pool; the rest burns.
             paid = (sum(share.values()) if any(v.get("lease_price") is not None for v in batch if v.get("passed"))
                     else pool)
@@ -441,7 +447,7 @@ class CorpusPeriodSettler:
                 "work_period": period, "entry_period": entry, "cap": self._cap,
                 "ids": ids, "rewards": share, "tokens": new_tokens, "totals": totals,
                 "period_tokens": earlier + new_tokens,
-                "period_paid": already + paid}}
+                "period_paid": already + paid, "period_price": uniform}}
             if self._max_price is not None:
                 state["pending"].update(max_price=self._max_price, budget=budget)
             if input_price is not None:

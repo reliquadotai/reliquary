@@ -1738,6 +1738,7 @@ def build_corpus_router(
             else:
                 leases = DrawLeases(job, limit_per_hotkey=False,
                                     on_unused=lambda lease, held: auction.lease_ended(lease.hotkey, lease.price, held))
+                auction.bind_holdings(leases.counts)
             leases = leases_by_job[job.job_id] = leases
         return leases
 
@@ -2078,7 +2079,8 @@ def build_corpus_router(
             if own is not None and own.price is not None:
                 value = float(own.price) * sum(token_counts)
                 pricing = {"lease_price": float(own.price),
-                           "lease_debit": auction.take_debit(request.miner_hotkey, value)}
+                           "lease_debit": auction.take_debit(request.miner_hotkey, value),
+                           "granted_at": own.granted_at}
 
         def unpriced() -> None:
             nonlocal pricing
@@ -2220,6 +2222,7 @@ def build_corpus_router(
         if pricing is not None:
             if written is not None and written.accepted:
                 auction.observe_tokens(sum(token_counts))
+                auction.observe_delivery(request.miner_hotkey, time.time() - pricing["granted_at"])
             else:
                 unpriced()
 
@@ -2823,13 +2826,10 @@ def build_corpus_router(
         state = await _read_state(job)
         if state.slots.is_complete:
             return _lease_refused(CorpusRejectReason.JOB_COMPLETE)
-        terms = None
-        if auction is not None:
-            terms = auction.admit(request.miner_hotkey)
-            if isinstance(terms, str):
-                return _lease_refused(terms, auction.view())
+        wanted = 1 if request.count is None else int(request.count)
 
         def grant():
+            """Up to ``wanted`` leases, and why the next one was not granted (None when all were)."""
             from reliquary.corpus.draw_leases import free_draw_slots
 
             if lease_seen.get("state") is not state:
@@ -2839,23 +2839,42 @@ def build_corpus_router(
                 lease_seen.update(state=state, seen=built)
             seen = lease_seen["seen"]
             ledger = state.slots
+            leases = _leases(job)
 
             def taken(prompt: int, slot: int) -> bool:
                 return slot_key(prompt, slot, ledger.slot_attempt(prompt, slot)) in seen
 
-            return _leases(job).grant(request.miner_hotkey, free_draw_slots(job, ledger, taken),
-                                      price=None if terms is None else terms.price,
-                                      round=None if terms is None else terms.round)
+            granted = []
+            for _ in range(wanted):
+                terms = None
+                seconds = None
+                if auction is not None:
+                    terms = auction.admit(request.miner_hotkey)
+                    if isinstance(terms, str):
+                        return granted, terms
+                    seconds = auction.lease_seconds(request.miner_hotkey, leases.seconds)
+                try:
+                    lease = leases.grant(request.miner_hotkey, free_draw_slots(job, ledger, taken),
+                                         price=None if terms is None else terms.price, seconds=seconds)
+                finally:
+                    if terms is not None:
+                        auction.unreserve(terms)
+                if lease is None or isinstance(lease, str):
+                    return granted, "no_free_slot" if lease is None else lease
+                granted.append(lease)
+            return granted, None
 
-        lease = await asyncio.to_thread(grant)
-        if lease is None or isinstance(lease, str):
-            if terms is not None:
-                auction.unreserve(terms)
-            return _lease_refused("no_free_slot" if lease is None else lease)
+        granted, why = await asyncio.to_thread(grant)
+        if not granted:
+            return _lease_refused(why, None if auction is None else auction.view(request.miner_hotkey))
         detail = {}
-        if terms is not None:
-            detail = {"price_alpha_per_mtoken": auction.params.alpha_of(terms.price), "round": terms.round}
-        return CorpusLeaseResponse(leased=True, reason="accepted", **lease.to_wire(), detail=detail)
+        if auction is not None:
+            detail = {"price_alpha_per_mtoken": auction.params.alpha_of(granted[0].price)}
+        if why is not None:
+            detail["stopped"] = why
+        return CorpusLeaseResponse(leased=True, reason="accepted", **granted[0].to_wire(),
+                                   leases=[lease.to_wire() for lease in granted] if request.count is not None else [],
+                                   detail=detail)
 
     async def ask_corpus(request: CorpusAskRequest) -> CorpusAskResponse:
         """A hotkey's ask on this job priced by auction (``corpus.token_auction``)."""
@@ -2876,10 +2895,10 @@ def build_corpus_router(
         lease_nonces[request.nonce] = now + 2 * LEASE_REQUEST_SKEW_SECONDS
         if auction is None:
             return refused("not_priced_by_auction")
-        why = auction.post_ask(request.miner_hotkey, request.micro_alpha_per_mtoken / 1e6)
+        why = auction.post_ask(request.miner_hotkey, request.micro_alpha_per_mtoken / 1e6, request.capacity)
         if why is not None:
             return refused(why)
-        return CorpusAskResponse(accepted=True, reason="accepted", detail=auction.view())
+        return CorpusAskResponse(accepted=True, reason="accepted", detail=auction.view(request.miner_hotkey))
 
     def auction_view() -> dict | None:
         """The job's public auction rounds, or None when it is not priced by auction."""

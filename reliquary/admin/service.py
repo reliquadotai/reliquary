@@ -40,6 +40,8 @@ _SUM_TOLERANCE = 1e-9
 # The only task and job ids the platform may create or touch: never an
 # operator-declared prod job.
 DEFAULT_TASK_PREFIX = "order-"
+# ``auction``: order jobs with a token ceiling are priced by auction (``corpus.token_auction``).
+ORDER_PRICING_ENV = "RELIQUARY_ORDER_PRICING"
 # No admin request is larger; the bound is checked before the body is read.
 MAX_BODY_BYTES = 1024 * 1024
 DEFAULT_EVAL_CAP = 0.02
@@ -1097,6 +1099,16 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             logger.warning("admin: the token ceiling could not be converted: %r", exc)
             raise HTTPException(status_code=503, detail="token_price_unavailable") from exc
 
+    def order_pricing() -> dict:
+        """An order job with a ceiling is priced by auction (``corpus.token_auction``) when
+        ``RELIQUARY_ORDER_PRICING`` says ``auction``; else first come at the ceiling."""
+        from reliquary.corpus.token_auction import PRICING_AUCTION, PRICING_PARAM
+
+        chosen = os.environ.get(ORDER_PRICING_ENV, "").strip()
+        if chosen not in ("", PRICING_AUCTION):
+            raise HTTPException(status_code=503, detail="order_pricing_misconfigured")
+        return {PRICING_PARAM: PRICING_AUCTION} if chosen == PRICING_AUCTION else {}
+
     def task_document(entry) -> dict:
         from reliquary.shared.task_registry import render_registry
 
@@ -1247,7 +1259,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             from dataclasses import replace
 
             entry = replace(entry, params={**entry.params,
-                                           **await token_price(body.max_price_usd_per_mtoken)})
+                                           **await token_price(body.max_price_usd_per_mtoken),
+                                           **order_pricing()})
         try:
             await registry_store.create_task(entry, guard=await draining_limits(cap))
         except (RegistryError, registry_store.RegistryConflict) as exc:

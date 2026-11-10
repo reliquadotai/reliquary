@@ -20,15 +20,25 @@ SETTLE_FULL_LIST_SECONDS = float(os.environ.get("RELIQUARY_CORPUS_SETTLE_FULL_LI
 VERDICT_READ_CONCURRENCY = 16
 
 
+def period_price(verdicts: Iterable[Mapping], earlier: float | None = None) -> float | None:
+    """The one price a period priced by auction pays every token at: the highest lease price delivered in it
+    (``earlier``: the highest of the period's verdicts already settled)."""
+    prices = [float(v["lease_price"]) for v in verdicts if v.get("passed") and v.get("lease_price") is not None]
+    if earlier is not None:
+        prices.append(float(earlier))
+    return max(prices) if prices else None
+
+
 def rewards_for(verdicts: Iterable[Mapping], cap: float, *, price: float | None = None,
-                input_price: float | None = None) -> dict[str, float]:
+                input_price: float | None = None, uniform_price: float | None = None) -> dict[str, float]:
     """What each hotkey earns of ``cap`` (the period's pool): its share of the passed tokens, or, on a job priced
-    by auction (verdicts carrying ``lease_price``), its tokens at their lease's price less the debt they carried,
-    scaled down only if that passes the pool (the rest burns). With an ``input_price`` (and the output ``price``),
-    the share is of the passed work's value: output tokens x price + prompt tokens x input_price."""
+    by auction (verdicts carrying ``lease_price``), its tokens at the period's price (``uniform_price``, else the
+    highest lease price among them) less the debt they carried, scaled down only if that passes the pool (the
+    rest burns). With an ``input_price`` (and the output ``price``), the share is of the passed work's value:
+    output tokens x price + prompt tokens x input_price."""
     verdicts = list(verdicts)
     if any(v.get("lease_price") is not None for v in verdicts if v.get("passed")):
-        return _priced_rewards(verdicts, cap)
+        return _priced_rewards(verdicts, cap, period_price(verdicts, uniform_price))
     if input_price is not None and price is not None:
         from reliquary.validator.corpus_periods import work_value
 
@@ -51,12 +61,12 @@ def rewards_for(verdicts: Iterable[Mapping], cap: float, *, price: float | None 
     return {hotkey: cap * count / total for hotkey, count in tokens.items()}
 
 
-def _priced_rewards(verdicts: list[Mapping], cap: float) -> dict[str, float]:
+def _priced_rewards(verdicts: list[Mapping], cap: float, price: float) -> dict[str, float]:
     earned: dict[str, float] = {}
     for verdict in verdicts:
         if not verdict.get("passed") or verdict.get("lease_price") is None:
             continue
-        value = int(verdict["token_count"]) * float(verdict["lease_price"]) - float(verdict.get("lease_debit") or 0.0)
+        value = int(verdict["token_count"]) * float(price) - float(verdict.get("lease_debit") or 0.0)
         earned[verdict["hotkey"]] = earned.get(verdict["hotkey"], 0.0) + value
     earned = {hotkey: value for hotkey, value in earned.items() if value > 0}
     total = sum(earned.values())
