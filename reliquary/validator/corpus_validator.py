@@ -855,13 +855,14 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
     def _auction_of(served):
         """The job's token auction when its entry prices it so (``corpus.token_auction``), its leases opened by
         the auditor's queue."""
-        from reliquary.corpus.token_auction import job_auction
+        from reliquary.corpus.token_auction import job_auction, state_path_for
 
         if getattr(served, "auction", None) is not None:
             return served.auction
         auditor = getattr(served, "auditor", None)
         auction = job_auction(getattr(served.entry, "params", None),
-                              backlog=getattr(auditor, "audit_backlog", None))
+                              backlog=getattr(auditor, "audit_backlog", None),
+                              state_path=state_path_for(str(served.entry.job_id)))
         try:
             served.auction = auction          # one auction per job, whatever rebuilds its router
         except AttributeError:

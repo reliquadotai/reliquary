@@ -287,9 +287,14 @@ class CorpusSkipRequest(BaseModel):
     signature: str = Field(min_length=1)
 
 
+# The most leases one request may ask for.
+MAX_LEASES_PER_REQUEST = 256
+
+
 class CorpusLeaseRequest(BaseModel):
-    """A signed request for a light lease on one of a draw job's free slots (``corpus.draw_leases``). ``issued_at``
-    (unix seconds) and ``nonce`` make it single-use: its signature is bound under its own domain."""
+    """A signed request for light leases on a draw job's free slots (``corpus.draw_leases``): one, or up to
+    ``count``. ``issued_at`` (unix seconds) and ``nonce`` make it single-use: its signature is bound under its own
+    domain."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -297,6 +302,7 @@ class CorpusLeaseRequest(BaseModel):
     miner_hotkey: str = Field(min_length=1, max_length=64)
     issued_at: int = Field(ge=0)
     nonce: str = Field(pattern=r"^[0-9a-f]{32}$")
+    count: int | None = Field(default=None, ge=1, le=MAX_LEASES_PER_REQUEST)
     signature: str = Field(min_length=1, max_length=256)
 
 
@@ -312,14 +318,16 @@ class CorpusLeaseReleaseRequest(BaseModel):
 
 
 class CorpusAskRequest(BaseModel):
-    """A hotkey's signed ask on a job priced by auction (``corpus.token_auction``): the micro-alpha per million
-    verified tokens it works for. Single-use like a lease request; the latest one stands for an hour."""
+    """A hotkey's signed offer on a job priced by auction (``corpus.token_auction``): the micro-alpha per million
+    verified tokens it works for, and the samples it can hold at once (``capacity``, 1 when absent). Single-use like
+    a lease request; the latest one stands for an hour."""
 
     model_config = ConfigDict(extra="forbid")
 
     job_id: str = Field(min_length=1, max_length=256)
     miner_hotkey: str = Field(min_length=1, max_length=64)
     micro_alpha_per_mtoken: int = Field(ge=1, le=10**15)
+    capacity: int | None = Field(default=None, ge=1, le=10_000)
     issued_at: int = Field(ge=0)
     nonce: str = Field(pattern=r"^[0-9a-f]{32}$")
     signature: str = Field(min_length=1, max_length=256)
@@ -347,6 +355,8 @@ class CorpusLeaseResponse(BaseModel):
     prompt_index: int | None = None
     slot: int | None = None
     expires_at: float | None = None
+    # A request with ``count``: every lease granted (the first is also in the fields above).
+    leases: list[dict[str, Any]] = Field(default_factory=list)
     detail: dict[str, Any] = Field(default_factory=dict)
 
 

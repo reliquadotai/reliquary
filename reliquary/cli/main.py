@@ -916,12 +916,18 @@ def tasks_set_cap(
         help="'auction': price the draw job by its miners' asks under the ceiling (corpus.token_auction); "
              "'none': remove the auction. A serving validator applies it when it wires the job",
     ),
-    auction_round_seconds: float = typer.Option(
-        None, "--auction-round-seconds", help="With --pricing auction: one round's length (default 600)",
-    ),
     auction_initial_leases: int = typer.Option(
         None, "--auction-initial-leases",
-        help="With --pricing auction: the leases a round opens before the audit queue steers them (default 64)",
+        help="With --pricing auction: the leases out at once before the audit queue steers them (default 64)",
+    ),
+    auction_backlog_low: int = typer.Option(
+        None, "--auction-backlog-low",
+        help="With --pricing auction: under this many records waiting for the audit, more leases go out (default 8)",
+    ),
+    auction_backlog_high: int = typer.Option(
+        None, "--auction-backlog-high",
+        help="With --pricing auction: over this many records waiting for the audit, fewer leases go out "
+             "(default 32)",
     ),
     min_incentive_share: float = typer.Option(
         None, "--min-incentive-share",
@@ -986,20 +992,20 @@ def tasks_set_cap(
     auction = {}
     if pricing is not None:
         from reliquary.corpus.token_auction import (
-            INITIAL_LEASES_PARAM, PRICING_AUCTION, PRICING_PARAM, ROUND_SECONDS_PARAM,
+            BACKLOG_HIGH_PARAM, BACKLOG_LOW_PARAM, INITIAL_LEASES_PARAM, PRICING_AUCTION, PRICING_PARAM,
         )
 
         if pricing not in (PRICING_AUCTION, "none"):
             typer.echo("error: --pricing is 'auction' or 'none'", err=True)
             raise typer.Exit(code=1)
         declared = {PRICING_PARAM: PRICING_AUCTION}
-        if auction_round_seconds is not None:
-            declared[ROUND_SECONDS_PARAM] = float(auction_round_seconds)
-        if auction_initial_leases is not None:
-            declared[INITIAL_LEASES_PARAM] = int(auction_initial_leases)
+        for name, value in ((INITIAL_LEASES_PARAM, auction_initial_leases), (BACKLOG_LOW_PARAM, auction_backlog_low),
+                            (BACKLOG_HIGH_PARAM, auction_backlog_high)):
+            if value is not None:
+                declared[name] = int(value)
         auction = {"pricing": declared if pricing == PRICING_AUCTION else None}
-    elif auction_round_seconds is not None or auction_initial_leases is not None:
-        typer.echo("error: --auction-round-seconds and --auction-initial-leases need --pricing auction", err=True)
+    elif any(v is not None for v in (auction_initial_leases, auction_backlog_low, auction_backlog_high)):
+        typer.echo("error: the --auction-* options need --pricing auction", err=True)
         raise typer.Exit(code=1)
     if cap is None and not priced and not auction and all(v is None for v in (
             floor, min_incentive_share, audit_q, audit_probation_submissions,
@@ -3189,6 +3195,11 @@ def corpus_mine(
         None, "--ask-alpha-per-mtoken",
         help="A job priced by auction: the alpha per million verified tokens this hotkey works for",
     ),
+    ask_capacity: int = typer.Option(
+        None, "--ask-capacity",
+        help="A job priced by auction: the samples this hotkey can hold at once (default 1). Leases it cannot "
+             "deliver are charged and halve it for an hour",
+    ),
 ) -> None:
     """Generate for the corpus job the validator serves, and submit it."""
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
@@ -3281,7 +3292,7 @@ def corpus_mine(
             # without the routes is mined as before.
             sign_skip=lambda body: sign_corpus_skip(wallet, body),
             sign_lease=lambda body: sign_corpus_lease(wallet, body),
-            ask_alpha_per_mtoken=ask_alpha_per_mtoken,
+            ask_alpha_per_mtoken=ask_alpha_per_mtoken, ask_capacity=ask_capacity,
             max_steps=max_steps or None,
         )
     except CorpusMinerHalted as exc:

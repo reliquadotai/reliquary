@@ -825,22 +825,29 @@ CORPUS_LEASE_DOMAIN = b"reliquary/corpus-lease/v1"
 CORPUS_LEASE_RELEASE_DOMAIN = b"reliquary/corpus-lease-release/v1"
 # A job priced by auction (``corpus.token_auction``): a hotkey's ask, signed and single-use like a lease request.
 CORPUS_ASK_DOMAIN = b"reliquary/corpus-ask/v1"
+# An offer with its capacity, and a lease request for several slots: the new field is bound under a new domain.
+CORPUS_ASK_CAPACITY_DOMAIN = b"reliquary/corpus-ask/v2"
+CORPUS_LEASE_COUNT_DOMAIN = b"reliquary/corpus-lease/v2"
 
 
 def build_corpus_lease_binding(request) -> bytes:
     """A lease request's, a release's or an ask's binding (``CorpusAskRequest``), each under its own domain."""
     body = _corpus_fields(request)
     if "micro_alpha_per_mtoken" in body:
-        return _bound(CORPUS_ASK_DOMAIN, [str(body["job_id"]).encode(), str(body["miner_hotkey"]).encode(),
-                                          int(body["issued_at"]).to_bytes(8, "big", signed=False),
-                                          str(body["nonce"]).encode(),
-                                          int(body["micro_alpha_per_mtoken"]).to_bytes(8, "big", signed=False)])
+        parts = [str(body["job_id"]).encode(), str(body["miner_hotkey"]).encode(),
+                 int(body["issued_at"]).to_bytes(8, "big", signed=False), str(body["nonce"]).encode(),
+                 int(body["micro_alpha_per_mtoken"]).to_bytes(8, "big", signed=False)]
+        if body.get("capacity") is None:
+            return _bound(CORPUS_ASK_DOMAIN, parts)
+        return _bound(CORPUS_ASK_CAPACITY_DOMAIN, [*parts, int(body["capacity"]).to_bytes(8, "big", signed=False)])
     if "lease_id" in body:
         return _bound(CORPUS_LEASE_RELEASE_DOMAIN, [str(body["job_id"]).encode(), str(body["miner_hotkey"]).encode(),
                                                    str(body["lease_id"]).encode()])
-    return _bound(CORPUS_LEASE_DOMAIN, [str(body["job_id"]).encode(), str(body["miner_hotkey"]).encode(),
-                                        int(body["issued_at"]).to_bytes(8, "big", signed=False),
-                                        str(body["nonce"]).encode()])
+    parts = [str(body["job_id"]).encode(), str(body["miner_hotkey"]).encode(),
+             int(body["issued_at"]).to_bytes(8, "big", signed=False), str(body["nonce"]).encode()]
+    if body.get("count") is None:
+        return _bound(CORPUS_LEASE_DOMAIN, parts)
+    return _bound(CORPUS_LEASE_COUNT_DOMAIN, [*parts, int(body["count"]).to_bytes(8, "big", signed=False)])
 
 
 def sign_corpus_lease(wallet, request) -> str:

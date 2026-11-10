@@ -1,5 +1,6 @@
-"""A draw job priced by auction, through its routes: a hotkey posts an ask, its lease carries the round's price,
-only a leased slot is accepted, the record carries the lease's terms, and an unused lease is paid back."""
+"""A draw job priced by auction, through its routes: a hotkey posts an offer, its leases carry its price, only a
+leased slot is accepted, the record carries the lease's terms, an unused lease is paid back, and a period pays
+every token at one price."""
 from __future__ import annotations
 
 import asyncio
@@ -13,7 +14,6 @@ from tests.unit.test_corpus_service import _r2_client, fake_r2  # noqa: F401  (f
 from tests.unit.test_draw_leases import _submit_as
 
 EMISSION = 100.0
-ROUND = 600.0
 
 
 class Clock:
@@ -37,7 +37,7 @@ class _Records:
 
 def _auction(clock, ceiling_alpha=0.5):
     return TokenAuction(AuctionParams(ceiling=ceiling_alpha / 1e6 / EMISSION, miner_alpha_per_period=EMISSION,
-                                      round_seconds=ROUND, initial_leases=8), clock=clock, mean_tokens=100)
+                                      initial_leases=8), clock=clock, mean_tokens=100)
 
 
 def _route(fake_r2, auction, records, *, prompts=2, slots=1):
@@ -63,16 +63,20 @@ def _route(fake_r2, auction, records, *, prompts=2, slots=1):
     return TestClient(app), router
 
 
-def _ask(client, hotkey, alpha, *, signature="ok"):
-    return client.post("/corpus/ask", json={
-        "job_id": "swe-v1", "miner_hotkey": hotkey, "micro_alpha_per_mtoken": int(alpha * 1e6),
-        "issued_at": int(time.time()), "nonce": secrets.token_hex(16), "signature": signature}).json()
+def _ask(client, hotkey, alpha, *, signature="ok", capacity=None):
+    body = {"job_id": "swe-v1", "miner_hotkey": hotkey, "micro_alpha_per_mtoken": int(alpha * 1e6),
+            "issued_at": int(time.time()), "nonce": secrets.token_hex(16), "signature": signature}
+    if capacity is not None:
+        body["capacity"] = capacity
+    return client.post("/corpus/ask", json=body).json()
 
 
-def _lease(client, hotkey):
-    return client.post("/corpus/lease", json={
-        "job_id": "swe-v1", "miner_hotkey": hotkey, "issued_at": int(time.time()),
-        "nonce": secrets.token_hex(16), "signature": "ok"}).json()
+def _lease(client, hotkey, count=None):
+    body = {"job_id": "swe-v1", "miner_hotkey": hotkey, "issued_at": int(time.time()),
+            "nonce": secrets.token_hex(16), "signature": "ok"}
+    if count is not None:
+        body["count"] = count
+    return client.post("/corpus/lease", json=body).json()
 
 
 def test_a_hotkey_leases_only_after_posting_an_ask(fake_r2):
@@ -82,7 +86,6 @@ def test_a_hotkey_leases_only_after_posting_an_ask(fake_r2):
     assert _ask(client, "5A", 0.3, signature="bad")["reason"] == "bad_signature"
     answer = _ask(client, "5A", 0.3)
     assert answer["accepted"] is True and "5A" not in repr(answer["detail"])
-    clock.now += ROUND
     lease = _lease(client, "5A")
     assert lease["leased"] is True
     assert lease["detail"]["price_alpha_per_mtoken"] == pytest.approx(0.3)
@@ -92,7 +95,6 @@ def test_an_ask_over_the_round_price_gets_no_lease(fake_r2):
     clock = Clock()
     client, _ = _route(fake_r2, _auction(clock, ceiling_alpha=0.5), _Records())
     _ask(client, "5A", 0.9)
-    clock.now += ROUND
     refused = _lease(client, "5A")
     assert refused["reason"] == "ask_above_price"
     assert refused["detail"]["ceiling_alpha_per_mtoken"] == pytest.approx(0.5)
@@ -104,7 +106,6 @@ def test_only_a_leased_slot_is_accepted_and_its_record_carries_the_price(fake_r2
     records = _Records()
     client, _ = _route(fake_r2, auction, records)
     _ask(client, "5A", 0.2)
-    clock.now += ROUND
     assert _submit_as(client, "5A", 0, 0)["reason"] == "lease_required"
     lease = _lease(client, "5A")
     assert _submit_as(client, "5A", lease["prompt_index"], lease["slot"])["accepted"] is True
@@ -119,7 +120,6 @@ def test_an_unused_lease_is_taken_back_from_the_next_accepted_submission(fake_r2
     records = _Records()
     client, router = _route(fake_r2, auction, records)
     _ask(client, "5A", 0.2)
-    clock.now += ROUND
     first = _lease(client, "5A")
     release = {"job_id": "swe-v1", "miner_hotkey": "5A", "lease_id": first["lease_id"], "signature": "ok"}
     assert client.post("/corpus/lease/release", json=release).json()["reason"] == "released"
@@ -137,7 +137,6 @@ def test_a_refused_submission_gives_its_debit_back(fake_r2):
     auction = _auction(clock)
     client, _ = _route(fake_r2, auction, _Records(), prompts=1)
     _ask(client, "5A", 0.2)
-    clock.now += ROUND
     lease = _lease(client, "5A")
     owed = auction.params.share_of(0.2) * 100
     auction.lease_ended("5A", auction.params.share_of(0.2), 1.0)
@@ -156,7 +155,7 @@ def test_a_job_not_priced_by_auction_refuses_asks(fake_r2):
     assert _lease(client, "5A")["leased"] is True
 
 
-def test_the_settlement_pays_tokens_at_their_lease_price_less_the_debit():
+def test_the_settlement_pays_every_token_at_the_periods_price_less_the_debit():
     from reliquary.validator.corpus_settlement import rewards_for
 
     verdicts = [
@@ -165,7 +164,9 @@ def test_the_settlement_pays_tokens_at_their_lease_price_less_the_debit():
         {"passed": True, "hotkey": "b", "token_count": 50, "lease_price": 1e-6, "lease_debit": 1.0},
         {"passed": False, "hotkey": "c", "token_count": 100, "lease_price": 1e-6, "lease_debit": 0.0},
     ]
-    assert rewards_for(verdicts, 1.0) == {"a": pytest.approx(1e-4 + 2e-4 - 5e-5)}
+    # Every token at the period's price, the highest lease delivered (2e-6); b's debt passes its pay.
+    assert rewards_for(verdicts, 1.0) == {"a": pytest.approx(4e-4 - 5e-5)}
+    assert rewards_for(verdicts, 1.0, uniform_price=3e-6) == {"a": pytest.approx(6e-4 - 5e-5)}
     # Over the pool: scaled down to it.
     assert sum(rewards_for(verdicts, 1e-4).values()) == pytest.approx(1e-4)
 
@@ -214,6 +215,11 @@ def test_an_ask_is_signed_under_its_own_domain():
     assert build_corpus_lease_binding(ask) != build_corpus_lease_binding(lease)
     assert build_corpus_lease_binding(ask) != build_corpus_lease_binding({**ask, "micro_alpha_per_mtoken": 6})
     assert CORPUS_ASK_DOMAIN == b"reliquary/corpus-ask/v1"
+    # A capacity, or a lease count, is bound under a new domain: an older body still verifies as it did.
+    assert build_corpus_lease_binding({**ask, "capacity": None}) == build_corpus_lease_binding(ask)
+    assert build_corpus_lease_binding({**ask, "capacity": 4}) != build_corpus_lease_binding({**ask, "capacity": 5})
+    assert build_corpus_lease_binding({**lease, "count": None}) == build_corpus_lease_binding(lease)
+    assert build_corpus_lease_binding({**lease, "count": 2}) != build_corpus_lease_binding(lease)
 
 
 def test_a_record_carries_both_lease_terms_or_neither():
@@ -283,3 +289,53 @@ def test_a_priced_period_pays_its_leases_and_burns_the_rest():
     assert doc["rewards_by_hotkey"] == {"a": pytest.approx(0.02), "b": pytest.approx(0.015)}
     assert records.state["period_paid"][str(3)] == pytest.approx(0.035)
     assert cp.period_budget(0.5, 1e-4, 2000) == pytest.approx(0.2)
+
+
+def test_one_request_leases_several_slots_up_to_the_offers_capacity(fake_r2):
+    clock = Clock()
+    auction = _auction(clock)
+    client, _ = _route(fake_r2, auction, _Records(), prompts=4)
+    _ask(client, "5A", 0.2, capacity=3)
+    answer = _lease(client, "5A", count=5)
+    assert answer["leased"] is True
+    assert len(answer["leases"]) == 3 and answer["detail"]["stopped"] == "allowance_full"
+    assert answer["lease_id"] == answer["leases"][0]["lease_id"]
+    slots = {(lease["prompt_index"], lease["slot"]) for lease in answer["leases"]}
+    assert len(slots) == 3
+    refused = _lease(client, "5A")
+    assert refused["reason"] == "allowance_full" and refused["detail"]["allowance"] == 3
+
+
+def test_a_request_without_a_count_answers_as_before(fake_r2):
+    client, _ = _route(fake_r2, None, _Records())
+    answer = _lease(client, "5A")
+    assert answer["leased"] is True and answer["leases"] == []
+
+
+def test_a_delivery_times_the_hotkeys_next_leases(fake_r2):
+    clock = Clock()
+    auction = _auction(clock)
+    client, _ = _route(fake_r2, auction, _Records(), prompts=4)
+    _ask(client, "5A", 0.2)
+    for _ in range(3):
+        lease = _lease(client, "5A")
+        assert _submit_as(client, "5A", lease["prompt_index"], lease["slot"])["accepted"] is True
+    assert len(auction._deliveries["5A"]) == 3
+
+
+def test_a_period_pays_its_tokens_at_the_highest_lease_delivered_in_it():
+    from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler
+    from tests.unit.test_corpus_period_settlement import GENESIS, Archives, Records, at, verdict
+
+    records, archives = Records(), Archives()
+    records.verdicts = {
+        "a1": {**verdict("a1", "a", 1000, at(3)), "lease_price": 1e-5, "lease_debit": 0.0},
+        "b1": {**verdict("b1", "b", 1000, at(3)), "lease_price": 2e-5, "lease_debit": 0.0},
+    }
+    settler = CorpusPeriodSettler(task_id="t", job_id="t", cap=0.5, records=records, archives=archives,
+                                  oldest_pending=lambda: None, genesis=lambda: GENESIS,
+                                  clock=lambda: at(5, 1000), max_price=1e-4)
+    asyncio.run(settler.settle_once())
+    (doc,) = archives.docs.values()
+    assert doc["rewards_by_hotkey"] == {"a": pytest.approx(0.02), "b": pytest.approx(0.02)}
+    assert records.state["period_price"][str(3)] == pytest.approx(2e-5)

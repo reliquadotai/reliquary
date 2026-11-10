@@ -1416,13 +1416,14 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     def _auction_of(w):
         """The job's token auction when its entry prices it so (``corpus.token_auction``), its leases opened by
         what waits for the audit: the auditor's queue and the batches sent to executors."""
-        from reliquary.corpus.token_auction import job_auction
+        from reliquary.corpus.token_auction import job_auction, state_path_for
 
         if not hasattr(w, "auction"):
             job_id = str(w.entry.job_id)
             w.auction = job_auction(
                 getattr(w.entry, "params", None),
-                backlog=lambda: w.auditor.audit_backlog() + dispatcher.pending_items(job_id))
+                backlog=lambda: w.auditor.audit_backlog() + dispatcher.pending_items(job_id),
+                state_path=state_path_for(job_id))
         return w.auction
 
     async def wire(entry, cap, job):
