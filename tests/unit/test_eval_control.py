@@ -96,6 +96,48 @@ def test_one_scorer_still_needs_one_live_executor():
     _run(go)
 
 
+def test_reusing_auditors_does_not_report_paid_executor_demand():
+    async def go():
+        h = _Harness(scorers=1)
+        dispatcher = h.dispatcher
+        now = [0.0]
+        dispatcher._clock = lambda: now[0]
+        dispatcher._strikes_limit = 1
+        dispatcher.reuse_only_jobs.add("borrow")
+        borrow = asyncio.create_task(dispatcher.view(*MODEL_A, PROOF, "borrow").score(ITEMS))
+        await asyncio.sleep(0)
+        model = f"{MODEL_A[0]}@{MODEL_A[1]}"
+        assert dispatcher.status()["models"][model]["waiting_batches"] == 1
+        assert dispatcher.status()["models"][model]["executors_needed"] == 0
+
+        paid = asyncio.create_task(dispatcher.view(*MODEL_A, PROOF, "paid").score(ITEMS))
+        await asyncio.sleep(0)
+        assert dispatcher.status()["models"][model]["executors_needed"] == 1
+        lease = dispatcher.claim(_executor("a"))
+        assert lease is not None
+        await dispatcher.result("a", lease["lease_id"], _honest())
+        assert (await paid)[0][0] == "ok"
+        lease = dispatcher.claim(_executor("a"))
+        assert lease is not None
+        assert dispatcher.executor_ids(MODEL_A)[1] == []
+        assert "a" not in dispatcher._busy_since
+        await dispatcher.result("a", lease["lease_id"], _honest())
+        assert (await borrow)[0][0] == "ok"
+        assert sum(n for _, n in dispatcher._scored_items[MODEL_A]) == len(ITEMS)
+
+        expiring = asyncio.create_task(dispatcher.view(*MODEL_A, PROOF, "borrow").score(ITEMS))
+        await asyncio.sleep(0)
+        assert dispatcher.claim(_executor("a")) is not None
+        now[0] = 10_000.0
+        await dispatcher.sweep()
+        assert h.quarantined == []
+        dispatcher.forget_job("borrow")
+        assert "borrow" not in dispatcher.reuse_only_jobs
+        with pytest.raises(asyncio.CancelledError):
+            await expiring
+    _run(go)
+
+
 def test_two_executors_on_distinct_providers_decide_a_batch():
     async def go():
         h = _Harness()

@@ -242,6 +242,15 @@ def _served(job_id):
     return job, declared
 
 
+def test_a_frozen_draw_order_persists_auditor_reuse(admin, pins):  # noqa: F811
+    body = _on_upload(admin, "eval", reuse_auditors_only=True)
+    created = admin("POST", "/admin/v1/jobs", body)
+    assert created.status_code == 201, created.text
+    _, declared = _served(body["job_id"])
+    assert declared["reuse_auditors_only"] is True
+    assert admin("POST", "/admin/v1/jobs", body).status_code == 200
+
+
 @pytest.mark.parametrize("kind", ["eval", "gen"])
 def test_the_order_control_serves_a_pinned_order(admin, pins, kind):  # noqa: F811
     from reliquary.validator.eval_control import order_job_refusal, qualification_refusal
