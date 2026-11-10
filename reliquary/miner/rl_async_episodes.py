@@ -160,7 +160,7 @@ class EpisodeLeaseGenerator:
 
     async def play_lease(self, lease) -> list[Any]:
         from reliquary.miner.episode_commit import episode_admissible
-        from reliquary.miner.episode_group_miner import play_bound
+        from reliquary.miner.episode_stack import play_bound
         from reliquary.miner.forced_draw import LeaseDrawBinding
         from reliquary.miner.rl_async import EpisodeRollout
 
@@ -536,9 +536,9 @@ def build_episode_generator(blocks: Mapping[str, Mapping[str, Any]], *, validato
     validator's own source (``load_episode_environment``: the catalogue's bridged source, the installed identity
     checked against the block's pin). ``suites``: the miner's replayed envs (``rl_suite_episodes``), played on the
     same engine (their caps must be the engine's too), their worlds built here (``suite_environments``: tests).
-    ``deps``: ``episode_mining.EpisodeStackDeps`` (tests: fakes); ``load_tokenizer``: the replayed envs' tokenizer
+    ``deps``: ``episode_stack.EpisodeStackDeps`` (tests: fakes); ``load_tokenizer``: the replayed envs' tokenizer
     (tests)."""
-    from reliquary.miner.episode_mining import EpisodeStackDeps
+    from reliquary.miner.episode_stack import EpisodeStackDeps
     from reliquary.miner.forced_draw import ForcedDraws
     from reliquary.miner.rl_episode_client import RL_PREFIX, HttpRlEpisodes, LeaseEpisodeRunner, check_engine_caps
     from reliquary.validator.rl_async_episodes import async_episode_policy, validate_episode_block

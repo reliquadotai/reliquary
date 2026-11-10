@@ -1192,10 +1192,7 @@ def test_r25_an_old_ledger_without_the_reason_column_is_migrated_and_reads_as_ho
 from reliquary.constants import (  # noqa: E402
     SERVICE_REPROBATION_PASSES, SERVICE_STATISTICAL_FAIL_MAX, SERVICE_STATISTICAL_FAIL_WINDOW,
 )
-from reliquary.services.exploration import (  # noqa: E402
-    AUDIT_FAILURE_CLASS_BY_STAGE, AUDIT_FAILURE_DETERMINISTIC as DET, AUDIT_FAILURE_STATISTICAL as STAT,
-    audit_failure_class,
-)
+from reliquary.services.exploration import AUDIT_FAILURE_DETERMINISTIC as DET, AUDIT_FAILURE_STATISTICAL as STAT
 
 
 def _dir(path):
@@ -1460,19 +1457,3 @@ def test_r31_an_unknown_failure_class_is_refused(tmp_path):
     assert states(book)[1] == ("queued", "reserved")
 
 
-def test_r31_stage_classification_table_and_unknown_stages_are_lenient_with_a_warning(caplog):
-    import logging
-    for stage in ("grail", "toploc", "termination", "forged_termination", "token_authenticity",
-                  "all_token_authenticity", "force_span", "service_seed_coverage"):
-        assert audit_failure_class(stage) == DET
-    assert audit_failure_class("forced_seed", "cdf_hard_mismatch") == DET
-    for stage, scope in (("forced_seed", "group"), ("forced_seed", "rollout"), ("forced_seed", None),
-                         ("logprob", None), ("distribution", None), ("boxed_answer", None),
-                         ("code_semantic_auth", None)):
-        assert audit_failure_class(stage, scope) == STAT
-    assert set(AUDIT_FAILURE_CLASS_BY_STAGE.values()) == {DET, STAT}
-    assert "episode_replay_binding" not in AUDIT_FAILURE_CLASS_BY_STAGE   # inconclusive: never classified
-    with caplog.at_level(logging.WARNING, logger="reliquary.services.exploration"):
-        assert audit_failure_class("a_stage_added_later") == STAT
-        assert audit_failure_class(None) == STAT
-    assert sum("unclassified proof stage" in r.getMessage() for r in caplog.records) == 2

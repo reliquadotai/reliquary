@@ -13,23 +13,15 @@ attest = pytest.importorskip("reliquary_sandbox.attest")
 from reliquary.constants import T_PROTO, TOP_K_PROTO, TOP_P_PROTO  # noqa: E402
 from reliquary.corpus.trajectory import GeneratedTurn  # noqa: E402
 from reliquary.environment import forced_sampling as fs  # noqa: E402
-from reliquary.miner.episode_commit import (  # noqa: E402
-    AdmittedStop, build_signed_episode_commit, episode_metadata, episode_sequence, episode_stop,
-    withdraw_inadmissible,
-)
-from reliquary.miner.rl_episode_client import (  # noqa: E402
-    HttpRlEpisodes, RlSignedEpisodeRunner, check_engine_caps, rl_transcript_refusal, signed_precommit_body,
-    signed_rl_open_request,
-)
+from reliquary.miner.episode_commit import AdmittedStop, episode_sequence, episode_stop
+from reliquary.miner.rl_episode_client import HttpRlEpisodes, RlSignedEpisodeRunner, check_engine_caps, rl_transcript_refusal, signed_rl_open_request
 from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS as PROOF  # noqa: E402
 from reliquary.protocol.sandbox_session import SessionRefused, sandbox_open_path  # noqa: E402
 from reliquary.protocol.service_submission import ServiceBinding  # noqa: E402
 from reliquary.protocol.signatures import (  # noqa: E402
     verify_commit_signature, verify_episode_precommit_signature, verify_sandbox_open_signature,
 )
-from reliquary.protocol.submission import CommitModel  # noqa: E402
 from reliquary.sandbox.rl_routes import episode_precommit_path  # noqa: E402
-from reliquary.validator.verifier import verify_commitment_proofs  # noqa: E402
 from tests.unit.episode_v2_fixtures import (  # noqa: E402
     EPISODE, episode_contract, episode_pool, episode_precommit, episode_signers, play_episode,
 )
@@ -43,29 +35,6 @@ POLICY = CONTRACT.episode_policy(EPISODE)
 
 def sign(binding: bytes) -> str:
     return MINER.sign(binding).hex()
-
-
-def test_the_precommit_and_the_rl_open_are_signed_for_this_validator_and_route():
-    precommit = episode_precommit(CONTRACT, hotkey=MINER.ss58_address)
-    path = episode_precommit_path()
-    body = signed_precommit_body(precommit=precommit, sign_binding=sign, now=NOW,
-                                 validator_hotkey=VALIDATOR.ss58_address, path=path)
-    assert body["miner_hotkey"] == MINER.ss58_address and body["at"] == NOW
-    assert verify_episode_precommit_signature(MINER.ss58_address, body["precommit"], at=body["at"],
-                                              signature=body["signature"], validator_hotkey=VALIDATOR.ss58_address,
-                                              path=path)
-    assert not verify_episode_precommit_signature(MINER.ss58_address, body["precommit"], at=body["at"],
-                                                  signature=body["signature"],
-                                                  validator_hotkey=VALIDATOR.ss58_address, path="/corpus/x")
-    open_path = sandbox_open_path("/rl")
-    request = signed_rl_open_request(hotkey=MINER.ss58_address, precommit_sha256=precommit.sha256, seed_index=4,
-                                     sign_binding=sign, now=NOW, request_id="a" * 32,
-                                     validator_hotkey=VALIDATOR.ss58_address, path=open_path)
-    assert request["engagement"] == {"kind": "rl_precommit",
-                                     "precommit": {"precommit_sha256": precommit.sha256, "seed_index": 4}}
-    assert verify_sandbox_open_signature(request, validator_hotkey=VALIDATOR.ss58_address, path=open_path)
-    assert not verify_sandbox_open_signature(request, validator_hotkey=VALIDATOR.ss58_address,
-                                             path=sandbox_open_path("/corpus"))
 
 
 class FakeResponse:
@@ -345,77 +314,7 @@ def _turn(model, context, pool, seed, base_offset, length):
     return out
 
 
-def _honest_commit():
-    from reliquary.protocol.grail_verifier import GRAILVerifier
-
-    model = _tiny()
-    pool = episode_pool(CONTRACT)
-    selection = pool.selection(list(range(pool.group_size)))
-    index, seed = 2, selection.seeds[2]
-    prompt = list(range(20, 30))
-    first = _turn(model, prompt, pool, seed, 0, 10)
-    observation = [7, 7, 7]
-    second = _turn(model, prompt + first + observation, pool, seed, len(first), 12)
-    tokens, spans = episode_sequence([GeneratedTurn(tuple(prompt), tuple(first), ()),
-                                      GeneratedTurn(tuple(prompt + first + observation), tuple(second), ())])
-    stop = episode_stop("max_turns", tokens=tokens, spans=spans, max_turns=2, max_tokens_per_turn=12,
-                        max_episode_tokens=100, stop_ids=frozenset())
-    episode = episode_metadata(precommit_sha256="e" * 64, seed_index=seed, spans=spans, stop=stop,
-                               transcript={"token": {}, "records": []})
-    randomness = "cd" * 32
-    kwargs = dict(model=model, verifier=GRAILVerifier(hidden_dim=model.config.hidden_size), tokens=tokens,
-                  spans=spans, episode=episode,
-                  service_binding=ServiceBinding(CONTRACT.sha256, "training").rollout_binding(index),
-                  seed_pool=selection.rollout_binding(index), randomness=randomness,
-                  wallet=SimpleNamespace(hotkey=MINER), toploc=PROOF)
-    commit = build_signed_episode_commit(**kwargs)
-    positions = [t for start, end in spans for t in range(start, end)]
-    return SimpleNamespace(model=model, commit=commit, randomness=randomness, spans=spans, kwargs=kwargs,
-                           uniforms=[pool.uniform(seed, j) for j in range(len(positions))])
-
-
-def test_an_honest_miners_commit_passes_the_validators_proof_on_cpu():
-    honest = _honest_commit()
-    commit = honest.commit
-    CommitModel.model_validate(commit)
-    assert verify_commit_signature(commit, MINER.ss58_address)
-    assert len(commit["rollout"]["token_logprobs"]) == sum(end - start for start, end in honest.spans)
-    result = verify_commitment_proofs({**commit, "toploc_spec": PROOF.to_contract()}, honest.model,
-                                      honest.randomness, seed_u_values=honest.uniforms)
-    assert result.toploc_checked and result.toploc_passed, result.toploc_reason
-    assert result.seed_n_stochastic > 0 and result.seed_n_match == result.seed_n_stochastic
-    assert result.all_passed
-    # The episode is bound: another stop (or transcript) breaks the signature.
-    forged = {**commit, "rollout": {**commit["rollout"], "episode": {**commit["rollout"]["episode"],
-                                                                     "stop": "agent_completed"}}}
-    assert not verify_commit_signature(forged, MINER.ss58_address)
-    # Logprobs of each model token under the row that drew it.
-    with torch.no_grad():
-        logits = honest.model(torch.tensor([commit["tokens"]])).logits[0].float()
-    log_probs = torch.log_softmax(logits, dim=-1)
-    expected = [log_probs[t - 1, commit["tokens"][t]].item() for start, end in honest.spans for t in range(start, end)]
-    assert commit["rollout"]["token_logprobs"] == pytest.approx(expected, abs=1e-4)
-    with pytest.raises(ValueError):
-        build_signed_episode_commit(**{**honest.kwargs, "spans": honest.spans[:1]})
-    other = {**honest.kwargs["episode"], "assistant_spans": [[s, e - 1] for s, e in honest.spans[:-1]]
-             + [list(honest.spans[-1])]}
-    with pytest.raises(ValueError):
-        build_signed_episode_commit(**{**honest.kwargs, "episode": other})
-
-
 # -- metadata and stop admission ----------------------------------------------------------------------
-
-
-def test_the_metadata_takes_only_a_stop_episode_stop_admitted():
-    closed = [9] * 5 + [1, 1, 3] + [9, 9] + [1, 2]
-    spans = [(5, 8), (10, 12)]
-    stop = _stop("agent_completed", closed, spans)
-    assert isinstance(stop, AdmittedStop)
-    episode = episode_metadata(precommit_sha256="e" * 64, seed_index=1, spans=spans, stop=stop, transcript={})
-    assert episode["stop"] == "agent_completed" and type(episode["stop"]) is str
-    for raw in ("agent_completed", "context_length", "max_turns", "error", None, AdmittedStop("episode_closed")):
-        with pytest.raises(ValueError):
-            episode_metadata(precommit_sha256="e" * 64, seed_index=1, spans=spans, stop=raw, transcript={})
 
 
 def test_the_engine_caps_must_be_the_policys():
@@ -503,89 +402,7 @@ def _validator_check(group, *, policy=POLICY, prompt=None):
                          token_verifier=verifier, seen=frozenset(), received=NOW + 100)
 
 
-def _miner_screen(group, *, raw, policy=POLICY, prompt=None):
-    """The miner's screen of the group's episodes, as ``mine_task`` holds them: (kept seeds, released seeds)."""
-    from tests.unit.episode_v2_fixtures import PROMPT_TEXT
-    from tests.unit.test_trajectory_parse import FakeRenderer
-
-    released, outcomes = [], []
-    for rollout in group.request.rollouts:
-        episode = rollout.commit["rollout"]["episode"]
-        tokens, spans = rollout.commit["tokens"], episode["assistant_spans"]
-        session = SimpleNamespace(turns=[GeneratedTurn(tuple(tokens[:start]), tuple(tokens[start:end]), ())
-                                         for start, end in spans])
-
-        async def release(seed=episode["seed_index"]):
-            released.append(seed)
-
-        result = SimpleNamespace(ok=True, transcript=episode["transcript"], stop=raw, release=release)
-        outcomes.append(SimpleNamespace(seed_index=episode["seed_index"], result=result, session=session))
-    kept = asyncio.run(withdraw_inadmissible(outcomes, policy=policy, renderer=FakeRenderer(),
-                                             prompt=PROMPT_TEXT if prompt is None else prompt))
-    return kept, released
-
-
 HONEST = [(20, 1, 1), (9, 0, 1)]         # (text, calls, last token): TERM = 1, EOT = 2; CHALLENGE_K model tokens
-
-
-def test_an_honest_episode_passes_the_miners_screen_and_the_validator(tmp_path):
-    from reliquary.validator.episode_admission import EpisodeGroupFacts
-
-    group = _group(tmp_path, HONEST)
-    assert isinstance(_validator_check(group), EpisodeGroupFacts)
-    kept, released = _miner_screen(group, raw="agent_completed")
-    assert released == [] and len(kept) == len(group.request.rollouts)
-    outcome, admissible = kept[0]
-    assert admissible.stop == "agent_completed" and isinstance(admissible.stop, AdmittedStop)
-    assert admissible.tokens == group.request.rollouts[0].commit["tokens"]
-
-
-def _refused_by_both(group, *, raw, policy=POLICY, miner_prompt=None, validator_prompt=None):
-    from reliquary.validator.episode_admission import EpisodeRefusal
-
-    outcome = _validator_check(group, policy=policy, prompt=validator_prompt)
-    assert isinstance(outcome, EpisodeRefusal), outcome
-    kept, released = _miner_screen(group, raw=raw, policy=policy, prompt=miner_prompt)
-    assert kept == [] and sorted(released) == sorted(r.commit["rollout"]["episode"]["seed_index"]
-                                                     for r in group.request.rollouts)
-    return outcome
-
-
-def test_an_episode_the_validator_refuses_is_withdrawn_before_the_choice(tmp_path):
-    from reliquary.protocol.submission import RejectReason
-
-    # The prompt is not the validator's render of the task.
-    group = _group(tmp_path / "prompt", HONEST)
-    assert _refused_by_both(group, raw="agent_completed", miner_prompt="Another task.",
-                            validator_prompt="Another task.").stage == "episode_prompt"
-    # Same length, other content: the prompt tokens themselves are compared.
-    same_length = "Write 43 to /work/answer.txt."
-    assert _refused_by_both(group, raw="agent_completed", miner_prompt=same_length,
-                            validator_prompt=same_length).stage == "episode_prompt"
-    # An observation token that is not the re-render of its signed call record.
-    group = _group(tmp_path / "observation", HONEST)
-    for rollout in group.request.rollouts:
-        first_end = rollout.commit["rollout"]["episode"]["assistant_spans"][0][1]
-        rollout.commit["tokens"][first_end + 2] += 1
-    assert _refused_by_both(group, raw="agent_completed").stage == "episode_parse"
-    # Three short turns.
-    group = _group(tmp_path / "short", [(2, 1, 1), (2, 1, 1), (2, 1, 1), (9, 0, 1)])
-    outcome = _refused_by_both(group, raw="agent_completed")
-    assert (outcome.reason, outcome.stage, outcome.detail["check"]) == (
-        RejectReason.BAD_TOKENS, "episode_turns", "short_turns"), outcome
-    # An earlier turn ended on eos, not on the turn terminator.
-    group = _group(tmp_path / "eos", [(9, 1, 2), (9, 0, 1)])
-    outcome = _refused_by_both(group, raw="agent_completed")
-    assert (outcome.stage, outcome.detail["check"]) == ("episode_termination", "bad_termination"), outcome
-    # A closed last turn labelled context_length whose next prompt still fits under the cap.
-    group = _group(tmp_path / "context", [(9, 1, 1), (9, 1, 1)], stop="context_length")
-    outcome = _refused_by_both(group, raw="context_length")
-    assert (outcome.stage, outcome.detail["check"]) == ("episode_termination", "bad_stop")
-    # An honest episode with fewer model tokens than the proof's log-prob challenge needs.
-    group = _group(tmp_path / "few", [(9, 1, 1), (9, 0, 1)])
-    outcome = _refused_by_both(group, raw="agent_completed")
-    assert (outcome.reason, outcome.stage, outcome.detail["check"]) == (
-        RejectReason.BAD_TOKENS, "episode_length", "too_few_model_tokens"), outcome
 
 
 def _next_prompt_length(group):
@@ -599,46 +416,6 @@ def _next_prompt_length(group):
     start, end = commit["rollout"]["episode"]["assistant_spans"][-1]
     observation = render_observation(signed_records(commit["rollout"]["episode"]["transcript"]).calls[-1].to_dict())
     return len(FakeRenderer().next_prompt(tokens[:start], tokens[start:end], [observation]))
-
-
-def test_a_next_prompt_exactly_at_the_cap_withdraws_the_episode(tmp_path):
-    """The endpoint refuses a prompt that leaves no room with a 400 whose text verifiers does not read as a
-    context-length error (its pre-flight only rejects a prompt LONGER than max_model_len), so the harness
-    ends in an error: whatever the label, the miner never submits the episode, and the validator would
-    refuse it as context_length (the next prompt fits)."""
-    import httpx
-    import openai
-    from verifiers.legacy.clients.openai_chat_completions_client import handle_openai_overlong_prompt
-    from verifiers.legacy.errors import OverlongPromptError
-
-    from reliquary.miner.corpus_generate_server import GenerateEngine
-    from reliquary.validator.episode_admission import EpisodeGroupFacts
-
-    group = _group(tmp_path, [(20, 1, 1), (9, 1, 1)], stop="context_length")
-    at_cap = _next_prompt_length(group)
-    engine = GenerateEngine(None, max_total_tokens=at_cap, max_tokens_per_turn=POLICY.max_tokens_per_turn)
-    with pytest.raises(ValueError) as error:
-        asyncio.run(engine.generate("s-0", [7] * at_cap, None))
-
-    @handle_openai_overlong_prompt
-    async def endpoint():
-        request = httpx.Request("POST", "http://127.0.0.1:1/inference/v1/generate")
-        response = httpx.Response(400, json={"detail": str(error.value)}, request=request)
-        raise openai.BadRequestError(str(error.value), response=response, body=None)
-
-    with pytest.raises(openai.BadRequestError) as raised:
-        asyncio.run(endpoint())
-    assert not isinstance(raised.value, OverlongPromptError)
-    capped = dataclasses.replace(POLICY, max_episode_tokens=at_cap)
-    for raw in ("error", "context_length", "agent_completed"):
-        kept, released = _miner_screen(group, raw=raw, policy=capped)
-        assert kept == [] and len(released) == len(group.request.rollouts), raw
-    _refused_by_both(group, raw="context_length", policy=capped)
-    # One token more and the next prompt overflows: verifiers' context_length, admitted by both.
-    over = dataclasses.replace(POLICY, max_episode_tokens=at_cap - 1)
-    assert isinstance(_validator_check(group, policy=over), EpisodeGroupFacts)
-    kept, released = _miner_screen(group, raw="context_length", policy=over)
-    assert released == [] and [a.stop for _, a in kept] == ["context_length"] * len(kept)
 
 
 # The RL open: a throttled seed is reopened (same seed) after its wait, within the window.

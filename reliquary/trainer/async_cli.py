@@ -135,10 +135,9 @@ def run_async_train_worker() -> None:
     from reliquary.shared.modeling import load_text_generation_model
     from reliquary.trainer.async_trainer import AsyncTrainer, AsyncTrainerConfig
     from reliquary.trainer.ckpt_publisher import DeltaPublisher, R2ObjectStore
-    from reliquary.trainer.cli import _check_trainer_launch, _run_train_follower
     from reliquary.trainer.distributed import (
-        CommandChannel, broadcasting_train_step, gather_full_state_dict, init_distributed, load_sharded_model,
-        trainer_backend,
+        CommandChannel, broadcasting_train_step, check_trainer_launch, gather_full_state_dict, init_distributed,
+        load_sharded_model, run_train_follower, trainer_backend,
     )
     from reliquary.trainer.rl_link import TrainerLink
     from reliquary.validator import telemetry
@@ -146,7 +145,7 @@ def run_async_train_worker() -> None:
 
     dist_ctx = channel = None
     backend = trainer_backend()
-    _check_trainer_launch(backend, os.environ)
+    check_trainer_launch(backend, os.environ)
     if backend == "fsdp2":
         from reliquary.constants import KL_BETA
 
@@ -156,7 +155,7 @@ def run_async_train_worker() -> None:
         channel = CommandChannel(dist_ctx)
         configure_distributed(dist_ctx)
         if not dist_ctx.is_main:
-            _run_train_follower(dist_ctx, channel)
+            run_train_follower(dist_ctx, channel)
             return
 
     try:

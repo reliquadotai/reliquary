@@ -1,10 +1,8 @@
-"""Reliquary CLI — mine and validate commands."""
+"""The `reliquary` command line."""
 
 import asyncio
 import atexit
-import json
 import logging
-import math
 import os
 import resource
 import shutil
@@ -20,27 +18,12 @@ from typing import Optional
 import typer
 
 from reliquary.constants import (
-    B_BATCH,
-    PROOF_PROCESS_ISOLATION,
     DEFAULT_BASE_MODEL,
     DEFAULT_BASE_MODEL_REVISION,
-    DEFAULT_ENVIRONMENTS,
     DEFAULT_HF_REPO_ID,
-    MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV,
-    MINER_GENERATION_BACKEND,
-    MINER_VLLM_MAX_NUM_SEQS,
-    PROOF_SLOTS_PER_DEVICE,
-    PROTOCOL_MODEL_ID,
-    PROTOCOL_MODEL_REVISION,
-    PROTOCOL_PROFILE_ID,
-    PROTOCOL_VERSION,
     VALIDATOR_HTTP_PORT,
 )
-from reliquary.environment.registry import resolve_environment_mix
-from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
-from reliquary.validator.errors import FatalProofPlaneError
 
-_DEFAULT_ENVS = DEFAULT_ENVIRONMENTS
 
 app = typer.Typer(name="reliquary", help="Reliquary — Verifiable Inference Subnet")
 
@@ -106,7 +89,6 @@ def _registry_price_params() -> dict:
 def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None, verification=None, episode_envs=()):
     """One registry entry: shipped controller defaults, then explicit overrides. ``episode_envs``: names of an async
     task's signed-episode envs (``--rl-episode-envs``), which the split may name besides the profile's."""
-    from dataclasses import asdict
 
     from reliquary.environment.abi import canonical_sha256
     from reliquary.protocol.profiles import resolve_protocol_profile
@@ -116,7 +98,6 @@ def build_task_entry(*, task_id, profile_id, cap, overrides, env_split=None, ver
         MECHANISM_RL_DISCOVERED_PRICE,
         TaskEntry,
     )
-    from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
 
     # The entry's id IS the registry key. Normalise it here, at the one place
     # an operator's typing becomes an entry, so a stray space can never key a
@@ -192,7 +173,6 @@ def build_contract_task_entry(
     the contract's digest. A task generating on a large mixture-of-experts model
     is the case that needs it.
     """
-    from dataclasses import asdict
 
     from reliquary.environment.abi import canonical_sha256
     from reliquary.protocol.profiles import resolve_protocol_profile
@@ -201,7 +181,6 @@ def build_contract_task_entry(
         MECHANISM_RL_DISCOVERED_PRICE,
         TaskEntry,
     )
-    from reliquary.validator.emission_price import PRODUCTION_PRICE_PARAMS
 
     task_id = normalise_task_id(task_id)
     if (base is None) == (from_profile is None):
@@ -3479,113 +3458,6 @@ def corpus_status(
     typer.echo(json.dumps(status, indent=2) if as_json else status_client.format_miner_status(status))
 
 
-@app.command("watch-verdicts")
-def watch_verdicts(
-    hotkey: str = typer.Option(..., help="Public miner SS58 address; no wallet or private key required"),
-    validator_url: str = typer.Option(..., help="Validator HTTP(S) base URL"),
-    window: int | None = typer.Option(None, min=0, help="Read all stored final outcomes for one window, then exit"),
-):
-    """Watch verdicts as JSON lines. Run once per hotkey; Ctrl-C stops it."""
-    import httpx
-    from reliquary.miner.submitter import monitor_submission_verdicts
-
-    if not validator_url.startswith(("http://", "https://")):
-        raise typer.BadParameter("Use an http:// or https:// validator URL")
-    logging.basicConfig(level=logging.WARNING)
-
-    async def run():
-        submitted = asyncio.Event()
-        submitted.set()
-        async with httpx.AsyncClient(
-            timeout=2, limits=httpx.Limits(max_connections=2, keepalive_expiry=30),
-        ) as client:
-            if window is not None:
-                from urllib.parse import quote
-                cursor = ""
-                while True:
-                    response = await client.get(
-                        f"{validator_url.rstrip('/')}/miner-verdict-history/{quote(hotkey, safe='')}/{window}",
-                        params={"after": cursor, "limit": 100},
-                    )
-                    response.raise_for_status()
-                    page = response.json()
-                    for verdict in page["verdicts"]:
-                        import json
-                        typer.echo(json.dumps(verdict, separators=(",", ":")))
-                    next_cursor = page.get("next_cursor")
-                    if not next_cursor:
-                        if not page.get("snapshot_complete"):
-                            typer.echo("Window history is not marked complete; missing records are not rejections.", err=True)
-                        return
-                    if next_cursor <= cursor:
-                        raise ValueError("history cursor did not advance")
-                    cursor = next_cursor
-                    await asyncio.sleep(0.2)
-            async with monitor_submission_verdicts(
-                validator_url.rstrip("/"), hotkey, client, submitted,
-                on_verdict=lambda verdict: typer.echo(verdict.model_dump_json(exclude_none=True)),
-            ) as task:
-                await task
-
-    try:
-        asyncio.run(run())
-    except KeyboardInterrupt:
-        pass
-
-
-def _resolve_cli_environment_mix(value: str, *, service_contract=None) -> list[tuple[str, int]]:
-    """The validator's env mix. An episode env of the service order that carries a public catalogue is built
-    from it at start (``ValidationService._build_bridged``, which checks its identity, lock and manifest), so it
-    is neither installed nor in the protocol profile: it is accepted here with the protocol's group count. Every
-    other name goes through the registry and the profile, unchanged."""
-    from reliquary.environment.registry import ENVIRONMENT_SPECS
-
-    names = [name.strip() for name in value.split(",")]
-    if not names or any(not name for name in names):
-        raise ValueError("at least one environment must be selected")
-    if len(set(names)) != len(names):
-        raise ValueError("environment selection contains duplicate names")
-    bridged = set()
-    if service_contract is not None:
-        for name in names:
-            if (name in service_contract.episode_environments
-                    and service_contract.catalogue_of(name) is not None):
-                if name in ENVIRONMENT_SPECS:
-                    raise ValueError(f"environment {name!r} is installed in this image and also carries a "
-                                     f"catalogue in the service order: rename the bridged env")
-                bridged.add(name)
-    others = [name for name in names if name not in bridged]
-    resolved = dict(resolve_environment_mix(
-        others,
-        profile_environments=ACTIVE_PROTOCOL_PROFILE.environments,
-        default_batch_target=B_BATCH,
-    )) if others else {}
-    from reliquary.constants import FILL_CLOSED_ENABLED
-
-    # Fill-closed takes B_BATCH groups per environment per pick, whatever the
-    # profile sized for the timed window (see ENVIRONMENT_MIX in constants).
-    return [(name, B_BATCH if name in bridged or FILL_CLOSED_ENABLED else resolved[name])
-            for name in names]
-
-
-def _resolve_legacy_miner_mix(value: str) -> list[tuple[str, int]]:
-    """The legacy miner's env mix: installed envs of the protocol profile only. It never mines a signed-episode
-    env, so an env described by an RL order's public catalogue is never routed here: its name is refused with
-    a pointer to ``mine-episodes``, which builds it from the announcement."""
-    from reliquary.environment.registry import find_environment_spec
-
-    try:
-        return _resolve_cli_environment_mix(value)
-    except ValueError as exc:
-        unknown = [name for name in (part.strip() for part in value.split(",")) if name
-                   and find_environment_spec(name) is None]
-        if not unknown:
-            raise
-        raise ValueError(f"{exc}. {', '.join(unknown)} is not installed: a signed-episode env of an RL order "
-                         f"(described by its catalogue) is mined by `reliquary mine-episodes --episode-envs`, "
-                         f"never by `mine`") from exc
-
-
 def _raise_open_file_limit() -> None:
     """Lift the soft RLIMIT_NOFILE to the hard cap; Docker's 1024 default
     starved the controller of sockets (EMFILE) on 2026-09-22."""
@@ -3600,88 +3472,8 @@ def _raise_open_file_limit() -> None:
 
 
 def _run_validator_event_loop(coroutine) -> None:
-    """Run the validator and hard-exit after an unrecoverable proof fault.
-
-    ``FatalProofPlaneError`` is raised only after ``ValidationService.run`` has
-    executed its best-effort cleanup.  A faulted proof worker can still be
-    blocked inside a synchronous CUDA call, though, so normal interpreter and
-    extension teardown is not safe to rely on.  ``os._exit`` gives the shell
-    supervisor an actual child exit and lets Docker apply its restart policy.
-    """
-
     _raise_open_file_limit()
-    try:
-        asyncio.run(coroutine)
-    except FatalProofPlaneError:
-        logger.critical(
-            "Fatal proof-plane cleanup completed; forcing process exit for "
-            "supervisor restart",
-            exc_info=True,
-        )
-        # Logging handlers flush each record, but flush the standard streams
-        # explicitly because os._exit deliberately skips interpreter cleanup.
-        for stream in (sys.stdout, sys.stderr):
-            try:
-                stream.flush()
-            except Exception:
-                pass
-        os._exit(1)
-
-
-def _configured_proof_device_identities(torch_module):
-    raw = os.environ.get("RELIQUARY_PROOF_DEVICES", "")
-    requested = tuple(
-        device.strip() for device in raw.split(",") if device.strip()
-    )
-    if PROTOCOL_VERSION < 3:
-        if requested:
-            logger.warning(
-                "Ignoring RELIQUARY_PROOF_DEVICES under protocol profile %s",
-                PROTOCOL_PROFILE_ID,
-            )
-        return ()
-    if not requested:
-        raise RuntimeError(
-            f"{PROTOCOL_PROFILE_ID} requires explicit proof replicas; "
-            "set RELIQUARY_PROOF_DEVICES after capacity qualification"
-        )
-
-    from reliquary.validator.proof_capacity import (
-        resolve_cuda_proof_devices,
-    )
-
-    return resolve_cuda_proof_devices(
-        requested,
-        cuda=torch_module.cuda,
-    )
-
-
-def _v3_activation_checkpoint_revision(
-    checkpoint: str,
-    resume_from: str,
-) -> str | None:
-    if PROTOCOL_VERSION < 3:
-        return None
-    if checkpoint != PROTOCOL_MODEL_ID:
-        raise RuntimeError(
-            f"{PROTOCOL_PROFILE_ID} must bootstrap from "
-            f"{PROTOCOL_MODEL_ID}@{PROTOCOL_MODEL_REVISION}"
-        )
-    prefix = "sha:"
-    revision = (
-        resume_from[len(prefix):].strip().lower()
-        if resume_from.startswith(prefix)
-        else ""
-    )
-    if (
-        len(revision) != 40
-        or any(character not in "0123456789abcdef" for character in revision)
-    ):
-        raise RuntimeError(
-            f"{PROTOCOL_PROFILE_ID} requires "
-            "RELIQUARY_RESUME_FROM=sha:<stamped-40-char-checkpoint>"
-        )
-    return revision
+    asyncio.run(coroutine)
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -3753,13 +3545,6 @@ async def _run_corpus(*, jobs, wallet, netuid, signer_client, http_host, http_po
         http_host=http_host, http_port=http_port, set_weights=set_weights,
         read_registry=read_registry, intake_only=intake_only, **remote,
     )
-
-
-def _miner_requires_grader(env_names: list[str]) -> bool:
-    # Miners never grade: opencode reward is validator-authoritative, so the
-    # reference miner only generates rollouts. The gVisor grader runs on the
-    # validator side. (Operators self-testing best-of-n run their own grader.)
-    return False
 
 
 def _envs_need_grader(env_names) -> bool:
@@ -3942,317 +3727,10 @@ def setup_logging(level: str = "INFO"):
     unmute_reliquary_loggers()
 
 
-@app.command()
-def mine(
-    use_drand: bool = typer.Option(True, help="Use drand for randomness"),
-    network: str = typer.Option("finney", help="Bittensor network"),
-    netuid: int = typer.Option(81, help="Subnet UID"),
-    wallet_name: str = typer.Option("default", help="Wallet name"),
-    hotkey: str = typer.Option("default", help="Hotkey name"),
-    wallet_path: str = typer.Option(
-        os.getenv("BT_WALLET_PATH", ""),
-        help="Optional wallet base path",
-    ),
-    checkpoint: str = typer.Option(..., help="Model checkpoint path"),
-    environments: str = typer.Option(
-        os.getenv("RELIQUARY_ENVIRONMENTS", _DEFAULT_ENVS),
-        help="Comma-separated environment names (env: RELIQUARY_ENVIRONMENTS)",
-    ),
-    validator_url: str = typer.Option(
-        "",
-        help=(
-            "Override the validator URL (otherwise discovered from the metagraph). "
-            "Useful for local testing — e.g. http://127.0.0.1:8888"
-        ),
-    ),
-    log_level: str = typer.Option("INFO", help="Log level"),
-):
-    """Run Reliquary miner."""
-    setup_logging(log_level)
-    logger = logging.getLogger("reliquary.cli")
-
-    os.environ["BT_NETWORK"] = network
-    os.environ["NETUID"] = str(netuid)
-
-    mix = _resolve_legacy_miner_mix(environments)
-    env_names = [name for name, _target in mix]
-    logger.info(
-        "Starting Reliquary miner (network=%s, netuid=%d, envs=%s)",
-        network, netuid, env_names,
-    )
-
-    # Miners never grade (opencode reward is validator-authoritative), so this
-    # stays False; the gVisor grader runs on the validator only.
-    if _miner_requires_grader(env_names):
-        _ensure_grader_running()
-    elif "opencodeinstruct" in env_names:
-        logger.info("OpenCode miner: reward is validator-authoritative; skipping local grader launch.")
-
-    async def _run():
-        import bittensor as bt
-        import torch
-        from reliquary.constants import ATTN_IMPLEMENTATION
-        from reliquary.environment import load_environments
-        from reliquary.infrastructure.chain import get_subtensor, get_metagraph, NETUID
-        from reliquary.miner.engine import MiningEngine
-        from reliquary.miner.checkpoint_identity import (
-            CheckpointIdentityError,
-            MinerCheckpointIdentityStore,
-            checkpoint_identity_from_state,
-            default_checkpoint_identity_path,
-        )
-        from reliquary.miner.submitter import discover_validator_url, get_window_state_v2
-        from reliquary.shared.modeling import (
-            MODEL_SNAPSHOT_ALLOW_PATTERNS,
-            load_text_generation_model,
-            load_tokenizer,
-        )
-
-        wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
-        if wallet_path:
-            wallet_kwargs["path"] = wallet_path
-        wallet = bt.Wallet(**wallet_kwargs)
-        subtensor = await get_subtensor()
-        checkpoint_identity_store = MinerCheckpointIdentityStore(
-            default_checkpoint_identity_path(wallet.hotkey.ss58_address)
-        )
-        persisted_identity = checkpoint_identity_store.load()
-
-        # --- Resolve initial checkpoint from validator if available ---
-        initial_path = checkpoint  # fallback to --checkpoint arg
-        initial_checkpoint_identity = None
-        try:
-            if validator_url:
-                url = validator_url
-            else:
-                metagraph = await get_metagraph(subtensor, NETUID)
-                url = discover_validator_url(metagraph)
-
-            import httpx
-            from huggingface_hub import snapshot_download
-            async with httpx.AsyncClient(timeout=30) as client:
-                state = await get_window_state_v2(url, client=client)
-            advertised_identity = checkpoint_identity_from_state(state)
-            if advertised_identity is not None:
-                checkpoint_identity_store.assert_advertisement(
-                    advertised_identity
-                )
-                logger.info(
-                    "Validator at %s is on checkpoint %d (%s@%s). "
-                    "Downloading to seed the miner model.",
-                    url,
-                    advertised_identity.checkpoint_n,
-                    advertised_identity.repo_id,
-                    advertised_identity.oid[:12],
-                )
-                initial_path = snapshot_download(
-                    repo_id=advertised_identity.repo_id,
-                    revision=advertised_identity.oid,
-                    allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
-                )
-                initial_checkpoint_identity = advertised_identity
-                logger.info("Using initial checkpoint path: %s", initial_path)
-            elif persisted_identity is not None:
-                raise CheckpointIdentityError(
-                    "validator omitted a previously activated checkpoint"
-                )
-            else:
-                logger.info(
-                    "Validator has no published checkpoint yet — using --checkpoint=%s",
-                    checkpoint,
-                )
-        except CheckpointIdentityError:
-            raise
-        except Exception as e:
-            if persisted_identity is None:
-                logger.warning(
-                    "Could not fetch validator checkpoint (%s); falling back "
-                    "to --checkpoint=%s",
-                    e,
-                    checkpoint,
-                )
-            else:
-                logger.warning(
-                    "Could not fetch validator checkpoint (%s); reloading "
-                    "the last durably activated revision",
-                    e,
-                )
-                initial_path = snapshot_download(
-                    repo_id=persisted_identity.repo_id,
-                    revision=persisted_identity.oid,
-                    allow_patterns=MODEL_SNAPSHOT_ALLOW_PATTERNS,
-                )
-                initial_checkpoint_identity = persisted_identity
-
-        # --- Load models from resolved path ---
-        logger.info("Loading models from %s...", initial_path)
-        base_load_kwargs = (
-            {"revision": DEFAULT_BASE_MODEL_REVISION}
-            if initial_path == DEFAULT_BASE_MODEL
-            else {}
-        )
-        tokenizer = load_tokenizer(initial_path, **base_load_kwargs)
-
-        # Use 2 GPUs when available (vllm on 0, HF proof on 1). Fall back to
-        # sharing GPU 0 for test boxes that only expose one device.
-        proof_device = "cuda:1" if torch.cuda.device_count() >= 2 else "cuda:0"
-
-        vllm_model = load_text_generation_model(
-            initial_path,
-            torch_dtype=torch.bfloat16,
-            attn_implementation=ATTN_IMPLEMENTATION,
-            **base_load_kwargs,
-        ).to("cuda:0").eval()
-
-        hf_model = load_text_generation_model(
-            initial_path,
-            torch_dtype=torch.bfloat16,
-            attn_implementation=ATTN_IMPLEMENTATION,
-            **base_load_kwargs,
-        ).to(proof_device).eval()
-
-        if initial_checkpoint_identity is not None:
-            checkpoint_identity_store.commit(initial_checkpoint_identity)
-
-        envs = load_environments(env_names)
-        generator = None
-        if MINER_GENERATION_BACKEND == "vllm":
-            from reliquary.miner.vllm_generation import VLLMRolloutGenerator
-
-            # vLLM owns cuda:0, where the transformers generation copy also
-            # sits; on a single-device box that copy is only read for its eos
-            # ids and device, so the two coexist at a lower utilisation.
-            generator = VLLMRolloutGenerator(
-                initial_path,
-                revision=base_load_kwargs.get("revision"),
-                max_num_seqs=MINER_VLLM_MAX_NUM_SEQS,
-                gpu_memory_utilization=(
-                    0.85 if proof_device != "cuda:0" else 0.6
-                ),
-            )
-
-        engine = MiningEngine(
-            vllm_model,
-            hf_model,
-            tokenizer,
-            wallet,
-            envs=envs,
-            mix=mix,
-            generator=generator,
-            proof_gpu=0 if proof_device == "cuda:0" else 1,
-            validator_url_override=validator_url or None,
-            checkpoint_identity_store=checkpoint_identity_store,
-            initial_checkpoint_identity=initial_checkpoint_identity,
-        )
-
-        # Seed engine's _loaded_checkpoint_path so the first
-        # maybe_pull_checkpoint sees we're already synced (skips redundant reload).
-        if initial_path != checkpoint:
-            engine._loaded_checkpoint_path = initial_path
-
-        logger.info("Miner ready. Entering main loop.")
-        try:
-            await engine.mine_window(subtensor, 0, use_drand=use_drand)
-        except KeyboardInterrupt:
-            logger.info("Miner interrupted by user")
-        except Exception as e:
-            logger.error("Mining loop crashed: %s", e, exc_info=True)
-            raise
-
-    asyncio.run(_run())
-
-
-@app.command("mine-episodes")
-def mine_episodes(
-    episode_envs: str = typer.Option(
-        ..., "--episode-envs",
-        help="Comma-separated signed-episode environments to mine: registered ones, or envs the order's public "
-             "catalogue describes (built from the announcement; the installed env package must be the order's "
-             "pin). An env added to the running run is mined once the announcement names it: add its name "
-             "after it is announced, and restart the miner (the stack binds its prompts when it is built). One "
-             "miner engine serves envs with equal episode caps only: an env with other caps needs a miner "
-             "process of its own"),
-    validator_url: str = typer.Option(..., "--validator-url", help="The RL validator's URL"),
-    validator_hotkey: str = typer.Option(
-        ..., "--validator-hotkey",
-        help="The RL validator's ss58 hotkey: precommits and session opens are signed for it"),
-    wallet_name: str = typer.Option("default", help="Wallet name"),
-    hotkey: str = typer.Option("default", help="Hotkey name"),
-    wallet_path: str = typer.Option(os.getenv("BT_WALLET_PATH", ""), help="Optional wallet base path"),
-    generate_port: int = typer.Option(8012, "--generate-port", help="Loopback port of the generate endpoint"),
-    checkpoint_dir: str = typer.Option(
-        "", "--checkpoint-dir",
-        help="Where announced checkpoints are downloaded (huggingface_hub's cache by default)"),
-    max_live: int = typer.Option(
-        0, "--max-live", min=0, help="Live sessions per group (0 = every seed of the pool at once)"),
-    groups_in_flight: int = typer.Option(
-        2, "--groups-in-flight", min=1,
-        help="Most episode groups mined at once (your GPU's ceiling); the validator's allocation for your hotkey "
-             "sets how many run, never more than this"),
-    harness_env: list[str] = typer.Option(
-        [], "--harness-env",
-        help="KEY=VALUE passed to the episode harness (repeatable; no secrets here: ps shows them)"),
-    harness_env_file: str = typer.Option(
-        "", "--harness-env-file",
-        help="File of KEY=VALUE lines for the episode harness: where its secrets (API keys) belong"),
-    seconds_per_wave: float = typer.Option(
-        300.0, "--seconds-per-wave",
-        help="Expected time of one wave of live sessions: a collection window shorter than the pool's "
-             "waves at --max-live is warned about at startup"),
-    gpu_memory_utilization: float = typer.Option(
-        0.6, "--gpu-memory-utilization",
-        help="vLLM's share of the GPU; the HF proof model takes the rest of the same GPU"),
-    max_num_seqs: int = typer.Option(16, "--max-num-seqs", help="vLLM's concurrent sequences"),
-    log_level: str = typer.Option("INFO", help="Log level"),
-) -> None:
-    """Mine signed-episode groups on the RL validator: per window, precommit a task, play its public seed
-    pool against a local forced-draw vLLM (sandbox tool calls on the validator's machines), and submit
-    one proved group. Needs the reliquary[sandbox-miner] extra and the order's pinned env package. The
-    legacy `mine` never mines these environments.
-
-    Run it under a supervisor that restarts it (systemd Restart=always, a docker restart policy): on a
-    new checkpoint or order it drains its groups and exits with code 75 to be restarted on it. Exit 2:
-    bad flags; exit 4: refusal to start (an env, its package pin or the engine caps)."""
-    from reliquary.miner.episode_mining import (
-        EpisodeMinerConfig,
-        parse_episode_environments,
-        parse_harness_env,
-    )
-
-    setup_logging(log_level)
-    try:
-        config = EpisodeMinerConfig(
-            environments=parse_episode_environments(episode_envs), validator_url=validator_url.rstrip("/"),
-            validator_hotkey=validator_hotkey, generate_port=generate_port,
-            checkpoint_dir=checkpoint_dir or None, max_live=max_live or None, groups_in_flight=groups_in_flight,
-            harness_env=parse_harness_env(harness_env, env_file=harness_env_file or None) or None,
-            gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs,
-            seconds_per_wave=seconds_per_wave)
-    except (ValueError, OSError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=2) from exc
-    import bittensor as bt
-
-    from reliquary.miner import episode_mining
-
-    wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
-    if wallet_path:
-        wallet_kwargs["path"] = wallet_path
-    wallet = bt.Wallet(**wallet_kwargs)
-    try:
-        asyncio.run(episode_mining.run_episode_miner(config=config, wallet=wallet))
-    except episode_mining.CheckpointChanged as exc:   # restart me on the new checkpoint (supervisor)
-        typer.echo(f"restart: {exc}", err=True)
-        raise typer.Exit(code=episode_mining.EXIT_CHECKPOINT_CHANGED) from exc
-    except ValueError as exc:   # a refusal to start: an env, its package or the engine caps
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=4) from exc
-
-
 async def _discover_rl_validator() -> tuple[str, str | None]:
-    """The first validator axon on the metagraph (``submitter.discover_validator``): (url, hotkey)."""
+    """The first validator axon on the metagraph (``discovery.discover_validator``): (url, hotkey)."""
     from reliquary.infrastructure.chain import NETUID, close_subtensor, get_metagraph, get_subtensor
-    from reliquary.miner.submitter import discover_validator
+    from reliquary.miner.discovery import discover_validator
 
     subtensor = await get_subtensor()
     try:
@@ -4275,7 +3753,7 @@ def miner_setups(
     if state_dir:
         directory = Path(state_dir)
     else:
-        from reliquary.validator.service import _validator_state_dir
+        from reliquary.validator.rl_http import validator_state_dir as _validator_state_dir
 
         directory = _validator_state_dir()
     path = directory / DB_NAME
@@ -4356,7 +3834,7 @@ def mine_async(
 ) -> None:
     """Mine the asynchronous RL protocol: lease prompts within the measured quota, generate 16 rollouts per lease
     on the latest checkpoint held (deltas downloaded in the background), and submit every leased group."""
-    from reliquary.miner.episode_mining import parse_harness_env
+    from reliquary.miner.episode_stack import parse_harness_env
     from reliquary.miner.rl_async import AsyncMinerConfig, run_async_miner
 
     setup_logging(log_level)
@@ -4413,94 +3891,6 @@ def mine_async(
         pass
 
 
-async def mount_corpus_service(server, entry, *, tokenizer, verify_signature=None):
-    """Bind the corpus submission route to the one job this task declares.
-
-    Everything the route needs is derived from that declaration rather than
-    configured beside it: the job id comes from the registry entry, and the
-    renderer from that job's own manifest, so a validator cannot be serving a
-    renderer -- or a job -- the declaration did not name. Returns False, having
-    done nothing, for any task that is not a corpus one.
-
-    False is reserved for exactly that case. A corpus task that cannot be
-    served RAISES, because the alternative is a validator that boots, holds
-    its share of the pool and exposes no route, with a missing log line as the
-    only evidence.
-    """
-    from reliquary.infrastructure.corpus_job_store import BucketJobStore
-    from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION
-    from reliquary.validator.corpus_service import renderer_for_job
-    from reliquary.validator.task_config import TaskConfigError
-
-    if entry is None:
-        # The legacy fallback resolves no registry entry at all.
-        return False
-    mechanism = getattr(entry, "mechanism", None)
-    if mechanism is None:
-        # `TaskConfig` is not a `TaskEntry`, and passing the wrapper would
-        # read as "not a corpus task" and mount nothing at all.
-        raise TaskConfigError(
-            f"the corpus mount takes the registry entry, not "
-            f"{type(entry).__name__}"
-        )
-    if mechanism != MECHANISM_CORPUS_GENERATION:
-        return False
-
-    store = BucketJobStore()
-    job, _ = await store.read_job(str(entry.job_id))
-    if job is None:
-        # The task is declared and would take its share of the pool, so a
-        # missing manifest is a refusal to start, not a route that 404s.
-        raise TaskConfigError(
-            f"task {entry.task_id!r} declares corpus job {entry.job_id!r} but "
-            f"the job store has no manifest for it"
-        )
-    # Before the route serves, so its first write is not the one that pays
-    # for sealing a v1 seen set.
-    from reliquary.validator.corpus_service import migrate_ledgers_at_startup, recover_pending_records
-
-    seen_index = await migrate_ledgers_at_startup(store, job)
-    await recover_pending_records(store, None, job)
-
-    def encode(text: str) -> list[int]:
-        encoded = tokenizer.encode(text, add_special_tokens=False)
-        return list(getattr(encoded, "ids", encoded))
-
-    if verify_signature is None:
-        from reliquary.protocol.signatures import verify_corpus_signature
-
-        verify_signature = verify_corpus_signature
-    mounted = server.mount_corpus_router(
-        entry,
-        store=store,
-        tokenizer=tokenizer,
-        # The job's own source decides the renderer: this validator's active
-        # profile is its task contract, so a manifest naming a rendering that
-        # contract does not declare refuses the mount rather than serving
-        # prompts nobody declared.
-        renderer=renderer_for_job(job, encode, tokenizer=tokenizer),
-        verify_signature=verify_signature,
-        seen_index=seen_index,
-        job=job,
-    )
-    if not mounted:
-        # The server applies the same rule to the same entry, so a refusal
-        # here means the two disagree -- never something to walk past.
-        raise TaskConfigError(
-            f"task {entry.task_id!r} declares corpus job {job.job_id!r} but "
-            f"the server refused to mount its route"
-        )
-    logger.info(
-        "corpus job %s mounted: source %s, renderer %s, checkpoint %s@%s",
-        job.job_id,
-        job.prompt_source,
-        job.renderer_id,
-        job.checkpoint_repo,
-        job.checkpoint_revision,
-    )
-    return mounted
-
-
 @app.command()
 def validate(
     train: bool = typer.Option(
@@ -4522,10 +3912,6 @@ def validate(
         help="Optional wallet base path",
     ),
     checkpoint: str = typer.Option(DEFAULT_BASE_MODEL, help="HF repo id or local path of the model to load (trainer mode only)"),
-    environments: str = typer.Option(
-        os.getenv("RELIQUARY_ENVIRONMENTS", _DEFAULT_ENVS),
-        help="Comma-separated environment names (trainer mode only; env: RELIQUARY_ENVIRONMENTS)",
-    ),
     http_host: str = typer.Option("0.0.0.0", help="HTTP bind address (trainer mode only)"),
     http_port: int = typer.Option(VALIDATOR_HTTP_PORT, help="HTTP listen port (trainer mode only)"),
     external_ip: str = typer.Option(
@@ -4545,14 +3931,6 @@ def validate(
         DEFAULT_HF_REPO_ID,
         help="HuggingFace repo ID to publish checkpoints to (must be writable with HF_TOKEN). Trainer mode only.",
     ),
-    resume_from: str = typer.Option(
-        os.getenv("RELIQUARY_RESUME_FROM", ""),
-        help=(
-            "Resume trainer from a checkpoint instead of the base model. "
-            "Accepts 'sha:<40-hex>' (HF commit on --hf-repo-id) or "
-            "'path:<dir>' (local ckpt_<N> directory). Trainer mode only."
-        ),
-    ),
     log_level: str = typer.Option("INFO", help="Log level"),
     set_weights: Optional[bool] = typer.Option(
         None, "--set-weights/--no-set-weights",
@@ -4568,9 +3946,6 @@ def validate(
     os.environ["BT_NETWORK"] = network
     os.environ["NETUID"] = str(netuid)
 
-    # The RL environment mix (and the code grader) is resolved inside `_run`,
-    # after the corpus branch: `--environments` defaults to an RL source a
-    # corpus task's contract need not declare.
     if train:
         logger.info(
             "Starting Reliquary validator [trainer] (network=%s, netuid=%d, http=%s:%d)",
@@ -4583,7 +3958,6 @@ def validate(
         )
 
     async def _run():
-        nonlocal resume_from
         from reliquary.infrastructure.chain import get_subtensor
 
         signer_client = None
@@ -4621,8 +3995,6 @@ def validate(
             from reliquary.infrastructure.task_registry_store import read_registry
             from reliquary.validator.task_config import (
                 TaskConfigError,
-                legacy_registry_fallback,
-                legacy_task_config,
                 resolve_corpus_task_configs,
                 resolve_task_config,
             )
@@ -4668,38 +4040,17 @@ def validate(
                 return
 
             try:
-                # `_run` is itself the coroutine `_run_validator_event_loop`
-                # drives with `asyncio.run`, so a loop is already running here;
-                # the registry read is awaited in place rather than started
-                # with a second, nested `asyncio.run`. Done before any GPU or
-                # model work below so an undeclared task fails fast.
-                #
-                # An R2 outage must still refuse (we cannot tell what we may
-                # pay), which is why the read stays inside this try -- but a
-                # registry that reads back wholly EMPTY, for the legacy
-                # "default" task only, is not that: it is every validator
-                # running today, before anyone has ever written one. Falling
-                # back there is what keeps this branch from taking `default`
-                # down the day it ships.
+                # Awaited in place: `_run` already runs on the event loop. Read before any GPU or model
+                # work so an undeclared task fails fast; an R2 outage refuses too (we cannot tell what we may pay).
                 registry_entries, _ = await read_task_registry_with_retry(
                     read_registry
                 )
-                if legacy_registry_fallback(registry_entries, [TASK_ID]):
-                    logger.warning(
-                        "No task registry in R2; starting the legacy task at "
-                        "the full pool. Declare it with `reliquary tasks "
-                        "create --task-id default --profile-id %s --cap 1.0` "
-                        "and this fallback stops being used.",
-                        PROTOCOL_PROFILE_ID,
-                    )
-                    task_config = legacy_task_config()
-                else:
-                    task_config = resolve_task_config(
-                        registry_entries,
-                        TASK_ID,
-                        profile_id=PROTOCOL_PROFILE_ID,
-                        generation_contract=PROTOCOL_GENERATION_CONTRACT,
-                    )
+                task_config = resolve_task_config(
+                    registry_entries,
+                    TASK_ID,
+                    profile_id=PROTOCOL_PROFILE_ID,
+                    generation_contract=PROTOCOL_GENERATION_CONTRACT,
+                )
             except TaskConfigError as exc:
                 # Unlike a missing GPU lease, this is not an environment
                 # fault we can run through: we would not know what we are
@@ -4736,401 +4087,45 @@ def validate(
                     raise typer.Exit(code=4) from exc
                 return
 
-            from reliquary.validator import corpus_periods as _periods
-            from reliquary.validator.rl_async_service import ASYNC, rl_mode
+            from reliquary.validator.rl_async_service import rl_mode
 
             try:
-                async_mode = rl_mode() == ASYNC
+                rl_mode()
             except ValueError as exc:
                 logger.critical("%s", exc)
                 raise typer.Exit(code=2) from exc
             declared_entry = getattr(task_config, "entry", None)
-            period_task = declared_entry is not None and _periods.is_period_task(declared_entry)
-            if async_mode:
-                # The async RL protocol: leases, submissions, the trainer link and pay by period, in one
-                # process without windows, batchers or a proof plane. Branch before any of them is built.
-                if declared_entry is None:
-                    logger.critical("RELIQUARY_RL_MODE=async needs a declared task (`reliquary tasks create "
-                                    "--rl-async`)")
-                    raise typer.Exit(code=4)
-                from reliquary.validator.rl_async_service import run_rl_async_validator
-
-                if _envs_need_grader(declared_entry.env_split or ()):
-                    _ensure_grader_running()        # code envs score through the sandboxed grader service
-
-                if set_weights is not False:
-                    from reliquary.validator.weight_only import WeightOnlyValidator
-
-                    threading.Thread(
-                        target=lambda: asyncio.run(WeightOnlyValidator(
-                            wallet=wallet, netuid=netuid, signer_client=signer_client).run()),
-                        name="weight-setter", daemon=True,
-                    ).start()
-                try:
-                    await run_rl_async_validator(
-                        wallet=wallet, netuid=netuid, signer_client=signer_client, http_host=http_host,
-                        http_port=http_port, entry=declared_entry, cap=task_config.emission_cap,
-                        checkpoint=checkpoint, subtensor=subtensor, external_ip=external_ip or None,
-                        external_port=external_port or None,
-                        load_kwargs=({"revision": DEFAULT_BASE_MODEL_REVISION}
-                                     if checkpoint == DEFAULT_BASE_MODEL else {}))
-                except (RuntimeError, ValueError) as exc:
-                    logger.critical("%s; fix the declaration or the async settings before starting", exc)
-                    raise typer.Exit(code=4) from exc
-                return
-            if period_task:
-                logger.critical("task %s is paid by period (an async RL task): start it with "
-                                "RELIQUARY_RL_MODE=async", task_config.task_id)
+            # The async RL protocol: leases, submissions, the trainer link and pay by period, in one
+            # process without windows, batchers or a proof plane. Branch before any of them is built.
+            if declared_entry is None:
+                logger.critical("RELIQUARY_RL_MODE=async needs a declared task (`reliquary tasks create "
+                                "--rl-async`)")
                 raise typer.Exit(code=4)
+            from reliquary.validator.rl_async_service import run_rl_async_validator
 
-            # A service order's catalogue envs are built from the order at start; a task without a service
-            # contract resolves its mix exactly as before.
-            service_contract = getattr(task_config, "service_contract", None)
-            mix = (_resolve_cli_environment_mix(environments) if service_contract is None
-                   else _resolve_cli_environment_mix(environments, service_contract=service_contract))
-            env_names = [name for name, _target in mix]
-            if "opencodeinstruct" in env_names:
-                _ensure_grader_running()
-            logger.info("RL environments: %s", env_names)
+            if _envs_need_grader(declared_entry.env_split or ()):
+                _ensure_grader_running()        # code envs score through the sandboxed grader service
 
-            import torch
-            from reliquary.constants import ATTN_IMPLEMENTATION
-            from reliquary.shared.modeling import load_text_generation_model, load_tokenizer
-            from reliquary.validator.service import (
-                ValidationService,
-                load_validator_replica,
-            )
-
-            activation_checkpoint_revision = (
-                _v3_activation_checkpoint_revision(checkpoint, resume_from)
-            )
-            logger.info("Loading model from %s...", checkpoint)
-            base_load_kwargs = (
-                {"revision": DEFAULT_BASE_MODEL_REVISION}
-                if checkpoint == DEFAULT_BASE_MODEL
-                else {}
-            )
-            tokenizer = load_tokenizer(checkpoint, **base_load_kwargs)
-
-            from reliquary.validator.remote_proof import (
-                RemoteProofPool, ShadowProofPool, executor_mode,
-            )
-            from reliquary.constants import DETACHED_TRAINER, KL_BASE_MODEL
-
-            proof_mode = executor_mode()
-            remote_pool = None
-            if proof_mode != "local":
-                if not DETACHED_TRAINER or KL_BASE_MODEL:
-                    raise RuntimeError(
-                        "remote/shadow proofs require detached training and no "
-                        "controller-side fixed KL model"
-                    )
-                remote_pool = RemoteProofPool.from_environment(repo_id=hf_repo_id)
-                remote_pool.start()
-            if proof_mode == "remote":
-                # No device lease here: every slot below is a card on the
-                # executor host, reached over HTTPS, and this controller holds
-                # no local CUDA context at all. Cards are leased where they are
-                # actually bound -- in the local-proof branch below, which also
-                # covers shadow mode because its local pool is authoritative.
-                proof_worker_pool = remote_pool
-                proof_slots = remote_pool.dispatch_devices
-                proof_models = remote_pool.proxies()
-                model = next(iter(proof_models.values()))
-                from reliquary.validator.observed_proof_rollout import (
-                    authorize_observed_live, observed_live_requested,
-                    observed_restart_checkpoint,
-                )
-                if observed_live_requested():
-                    recovered_checkpoint = observed_restart_checkpoint(remote_pool)
-                    if recovered_checkpoint is not None:
-                        activation_checkpoint_revision = recovered_checkpoint.revision
-                        resume_from = f"sha:{activation_checkpoint_revision}"
-                proof_capacity_qualification = (
-                    authorize_observed_live(remote_pool, activation_checkpoint_revision)
-                    if observed_live_requested()
-                    else remote_pool.qualify(activation_checkpoint_revision)
-                )
-                if proof_capacity_qualification.get("mode") == "observed_live":
-                    logger.warning("Explicit observed live rollout, capacity NOT qualified: %s",
-                                   proof_capacity_qualification)
-                logger.info("CPU controller: remote proof slots %s", proof_slots)
-            else:
-                # Resolve the proof plane's topology BEFORE loading this process's
-                # replica: whether the plane is isolated decides which device that
-                # replica belongs on, and "isolated" means a plane was actually
-                # built, not merely that the flag is set.
-                from reliquary.constants import DETACHED_TRAINER
-                from reliquary.validator.proof_capacity import expand_proof_slots
-                from reliquary.validator.proof_worker import (
-                    assert_isolation_supported,
-                    assert_proof_slots_supported,
-                )
-
-                assert_isolation_supported(
-                    isolation=PROOF_PROCESS_ISOLATION,
-                    detached_trainer=DETACHED_TRAINER,
-                )
-                proof_device_identities = _configured_proof_device_identities(
-                    torch
-                )
-                if proof_device_identities:
-                    from reliquary.constants import TASK_ID
-                    from reliquary.validator.device_lease import (
-                        DeviceLeaseError,
-                        acquire_device_leases,
-                        default_lease_directory,
-                    )
-
-                    try:
-                        acquire_device_leases(
-                            [identity.device_uuid for identity in proof_device_identities],
-                            task_id=TASK_ID,
-                            directory=default_lease_directory(),
-                        )
-                    except DeviceLeaseError as exc:
-                        # A raw traceback under `restart: unless-stopped` is a
-                        # crash loop that says nothing. Name the card, the
-                        # holder and the remedy once, then exit on a code of
-                        # our own (1 is the fatal proof plane, 2 is click's
-                        # usage error).
-                        logger.critical(
-                            "%s; stop that task or point this one at free cards "
-                            "with RELIQUARY_PROOF_DEVICES before starting it again",
-                            exc,
-                        )
-                        raise typer.Exit(code=3) from exc
-                proof_devices = tuple(
-                    identity.device_id for identity in proof_device_identities
-                )
-                assert_proof_slots_supported(
-                    slots_per_device=PROOF_SLOTS_PER_DEVICE,
-                    isolation=PROOF_PROCESS_ISOLATION,
-                    proof_devices=proof_devices,
-                )
-                # Capacity is validated against the PHYSICAL devices below and must
-                # stay that way — it is a claim about cards, not processes. Only
-                # the plane is widened to one entry per proof slot.
-                proof_slots = expand_proof_slots(
-                    proof_devices, PROOF_SLOTS_PER_DEVICE
-                )
-                isolated_plane = bool(PROOF_PROCESS_ISOLATION and proof_slots)
-
-                # The CPU move turns VRAM into a permanent host-RSS floor. Say so
-                # before paying for it, not hours later through an OOM restart.
-                from reliquary.constants import KL_BASE_MODEL as _kl_base
-                from reliquary.validator.proof_worker import (
-                    assert_host_memory_for_cpu_replicas,
-                )
-
-                assert_host_memory_for_cpu_replicas(
-                    isolated_plane=isolated_plane,
-                    kl_base_model=bool(_kl_base),
-                )
-                model = load_validator_replica(
-                    checkpoint,
-                    isolated_plane=isolated_plane,
-                    **base_load_kwargs,
-                )
-
-                proof_capacity_qualification = None
-                if PROTOCOL_VERSION >= 3:
-                    from reliquary.shared.runtime_fingerprint import (
-                        collect_runtime_fingerprint,
-                    )
-                    from reliquary.validator.observability import (
-                        immutable_build_revision,
-                    )
-                    from reliquary.validator.proof_capacity import (
-                        load_proof_capacity_qualification,
-                    )
-
-                    manifest_path = os.environ.get(
-                        "RELIQUARY_PROOF_CAPACITY_MANIFEST", ""
-                    ).strip()
-                    manifest_sha256 = os.environ.get(
-                        "RELIQUARY_PROOF_CAPACITY_MANIFEST_SHA256", ""
-                    ).strip()
-                    if not manifest_path or not manifest_sha256:
-                        raise RuntimeError(
-                            f"{PROTOCOL_PROFILE_ID} requires a pinned "
-                            "proof-capacity manifest"
-                        )
-                    qualification = load_proof_capacity_qualification(
-                        manifest_path,
-                        expected_sha256=manifest_sha256,
-                    )
-                    hardware = tuple(
-                        identity.hardware_class
-                        for identity in proof_device_identities
-                    )
-                    device_uuids = tuple(
-                        identity.device_uuid
-                        for identity in proof_device_identities
-                    )
-                    runtime_fingerprint_hash = collect_runtime_fingerprint(
-                        generation_model=model,
-                        proof_model=model,
-                    )["profile_hash"]
-                    from reliquary.validator.proof_capacity import (
-                        capacity_budget, compute_proof_path_hash,
-                    )
-
-                    budget = capacity_budget()
-                    proof_capacity_qualification = qualification.validate(
-                        profile_id=PROTOCOL_PROFILE_ID,
-                        model_revision=PROTOCOL_MODEL_REVISION,
-                        software_revision=immutable_build_revision(),
-                        checkpoint_revision=(
-                            activation_checkpoint_revision or ""
-                        ),
-                        runtime_fingerprint_hash=runtime_fingerprint_hash,
-                        proof_path_hash=compute_proof_path_hash(),
-                        configured_devices=proof_devices,
-                        configured_hardware=hardware,
-                        configured_device_uuids=device_uuids,
-                        proof_wall_seconds=budget["wall_seconds"],
-                        minimum_proofs_per_environment=budget["proofs_per_environment"],
-                        minimum_completion_tokens_per_environment={
-                            environment: math.ceil(cap * 0.9)
-                            for environment, cap in (
-                                MAX_NEW_TOKENS_PROTOCOL_CAP_BY_ENV.items()
-                            )
-                        },
-                    )
-                    carried_from = proof_capacity_qualification.get(
-                        "qualification_carried_over_from"
-                    )
-                    if carried_from:
-                        logger.info(
-                            "Proof capacity qualification carried over from "
-                            "image %s: this image's proof path is byte-identical",
-                            carried_from,
-                        )
-                    logger.info(
-                        "Proof capacity qualified: %s",
-                        proof_capacity_qualification,
-                    )
-                proof_models = {}
-                proof_worker_pool = None
-                if isolated_plane:
-                    # The proof plane leaves this interpreter: every replica is
-                    # loaded by a worker, this process keeps its own pair on the
-                    # CPU, and the event loop can no longer convoy a proof thread
-                    # off the GIL. Several slots may share one card.
-                    from reliquary.validator.proof_worker import (
-                        build_isolated_proof_plane,
-                    )
-
-                    logger.info(
-                        "Starting isolated proof plane: %d slot(s) over %d GPU(s) "
-                        "(%s); replicas load in the workers",
-                        len(proof_slots),
-                        len(proof_devices),
-                        ", ".join(proof_slots),
-                    )
-                    proof_worker_pool, proof_models = build_isolated_proof_plane(
-                        devices=proof_slots,
-                        checkpoint=checkpoint,
-                        load_kwargs=base_load_kwargs,
-                        reference_model=model,
-                        replica=task_config.verification,
-                    )
-                    proof_worker_pool.start()
-                    logger.info(
-                        "Isolated proof plane ready on %s",
-                        ", ".join(proof_slots),
-                    )
-                else:
-                    for device in proof_devices:
-                        if device == "cuda:0":
-                            continue
-                        logger.info(
-                            "Loading frozen proof replica on %s from %s",
-                            device,
-                            checkpoint,
-                        )
-                        proof_models[device] = load_text_generation_model(
-                            checkpoint,
-                            torch_dtype=torch.bfloat16,
-                            attn_implementation=ATTN_IMPLEMENTATION,
-                            **base_load_kwargs,
-                        ).to(device).eval()
-
-                if proof_mode == "shadow":
-                    if proof_worker_pool is None:
-                        raise RuntimeError("shadow proofs require local process isolation")
-                    proof_worker_pool = ShadowProofPool(proof_worker_pool, remote_pool)
-
-            service = ValidationService(
-                wallet,
-                model,
-                tokenizer,
-                netuid=netuid,
-                use_drand=use_drand,
-                http_host=http_host,
-                http_port=http_port,
-                external_ip=external_ip or None,
-                external_port=(external_port or http_port) if external_ip else None,
-                hf_repo_id=hf_repo_id,
-                resume_from=resume_from or None,
-                env_mix=mix,
-                proof_devices=proof_slots or None,
-                proof_models=proof_models or None,
-                proof_capacity_qualification=(
-                    proof_capacity_qualification
-                ),
-                emission_cap=task_config.emission_cap,
-                price_params=task_config.price_params,
-                service_contract=task_config.service_contract,
-                env_caps=task_config.env_caps,
-                proof_worker_pool=proof_worker_pool,
-                signer_client=signer_client,
-            )
-            from reliquary.validator.corpus_service import CorpusPromptSourceError
-
-            try:
-                # After the server exists and before it is served, so the
-                # route's one fidelity cache lives on the loop that answers.
-                await mount_corpus_service(
-                    service.server, task_config.entry, tokenizer=tokenizer
-                )
-            # `CorpusPromptSourceError` beside it, not under it: a renderer
-            # this validator's own profile does not declare is a declaration
-            # to fix, and on `TaskConfigError` alone it left as a traceback.
-            except (TaskConfigError, CorpusPromptSourceError) as exc:
-                logger.critical(
-                    "%s; fix the declaration with `reliquary jobs` before "
-                    "starting this validator",
-                    exc,
-                )
-                raise typer.Exit(code=4) from exc
-            # Run the weight setter in a dedicated OS thread with its own
-            # event loop. asyncio is single-threaded, so any sync blocking
-            # call on the trainer's loop (e.g. /state acquiring a lock the
-            # GRAIL verifier is holding) would stall set_weights too. The
-            # weight setter's own subtensor (see WeightOnlyValidator.run)
-            # plus its own loop here means neither side can block the other.
             if set_weights is not False:
                 from reliquary.validator.weight_only import WeightOnlyValidator
 
-                def _run_weight_setter() -> None:
-                    try:
-                        worker = WeightOnlyValidator(
-                            wallet=wallet,
-                            netuid=netuid,
-                            signer_client=signer_client,
-                        )
-                        asyncio.run(worker.run())
-                    except Exception:
-                        logger.exception("weight-setter thread crashed")
-
                 threading.Thread(
-                    target=_run_weight_setter,
-                    name="weight-setter",
-                    daemon=True,
+                    target=lambda: asyncio.run(WeightOnlyValidator(
+                        wallet=wallet, netuid=netuid, signer_client=signer_client).run()),
+                    name="weight-setter", daemon=True,
                 ).start()
-            await service.run(subtensor)
+            try:
+                await run_rl_async_validator(
+                    wallet=wallet, netuid=netuid, signer_client=signer_client, http_host=http_host,
+                    http_port=http_port, entry=declared_entry, cap=task_config.emission_cap,
+                    checkpoint=checkpoint, subtensor=subtensor, external_ip=external_ip or None,
+                    external_port=external_port or None,
+                    load_kwargs=({"revision": DEFAULT_BASE_MODEL_REVISION}
+                                 if checkpoint == DEFAULT_BASE_MODEL else {}))
+            except (RuntimeError, ValueError) as exc:
+                logger.critical("%s; fix the declaration or the async settings before starting", exc)
+                raise typer.Exit(code=4) from exc
+            return
         else:
             from reliquary.validator.weight_only import WeightOnlyValidator
 
@@ -5146,34 +4141,9 @@ def validate(
 
 @app.command("proof-worker")
 def proof_worker() -> None:
-    """Serve typed GRAIL proofs on a dedicated, mutually authenticated GPU host."""
+    """Serve the async RL validator's remote audits on a dedicated, mutually authenticated GPU host."""
     from reliquary.validator.remote_proof_server import main
     main()
-
-
-@app.command("train-worker")
-def train_worker(
-    shadow: bool = typer.Option(
-        False,
-        "--shadow",
-        help=(
-            "Consume payloads and train but never publish — for the "
-            "pre-cutover comparison against the in-process trainer."
-        ),
-    ),
-) -> None:
-    """Detached trainer: consume R2 training payloads, publish checkpoints.
-
-    See docs/detached-trainer.md.
-    """
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(threadName)s | %(name)s | "
-               "%(levelname)s | %(message)s",
-    )
-    from reliquary.trainer.cli import run_train_worker
-
-    run_train_worker(shadow=shadow)
 
 
 @app.command("train-async")

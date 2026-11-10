@@ -231,7 +231,7 @@ class World:
         from reliquary.infrastructure.sandbox_store import MemorySessionStore
         from reliquary.validator.rl_submit import GroupGrader
         from reliquary.validator.sandbox_wiring import SandboxValidatorConfig
-        from reliquary.validator.server import ValidatorServer
+        from reliquary.validator.rl_http import RlHttpApp
         from tests.unit.episode_v2_fixtures import episode_signers, register_episode_env
         from tests.unit.sandbox_fixtures import IMAGE, capacity_report, machine_document
         from tests.unit.test_trajectory_parse import FakeRenderer
@@ -268,7 +268,7 @@ class World:
                              environments={EPISODE: SignedEpisodeEnvironment(EPISODE, ImageSource(image=IMAGE))},
                              renderer_for=lambda policy: FakeRenderer(), signer=self.validator,
                              session_store=self.store, read_documents=read_documents, fetch_report=fetch_report)
-        self.server = ValidatorServer()
+        self.server = RlHttpApp()
         mount_rl_async(self.server, self.rl, validator_hotkey=VALIDATOR.ss58_address)
 
     async def start(self):
@@ -497,13 +497,13 @@ def test_a_validator_without_episode_envs_keeps_the_8_mib_cap(tmp_path):
     from fastapi.testclient import TestClient
 
     from reliquary.validator.rl_submit import GroupGrader
-    from reliquary.validator.server import ValidatorServer
+    from reliquary.validator.rl_http import RlHttpApp
 
     rl = build_rl_async(_settings(targets={ENV: 1.0}, episodes={}, lease_expiry_s={ENV: 600.0}),
                         path=tmp_path / "a.sqlite3", grader=GroupGrader({ENV: MathEnv()}, Tokenizer(),
                                                                         eos_token_ids=(1,)),
                         prompt_range={ENV: (0, 50)})
-    server = ValidatorServer()
+    server = RlHttpApp()
     mount_rl_async(server, rl, validator_hotkey=VALIDATOR.ss58_address)
     client = TestClient(server.app)
     from reliquary.protocol.rl_submit import HOTKEY_HEADER
@@ -542,7 +542,7 @@ class FakeCore:
 
 
 def fake_deps(made, released, served):
-    from reliquary.miner.episode_mining import EpisodeStackDeps
+    from reliquary.miner.episode_stack import EpisodeStackDeps
     from tests.unit.test_trajectory_parse import FakeRenderer
 
     def make_core(model_dir, **kwargs):

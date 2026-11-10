@@ -34,15 +34,3 @@ def test_train_step_handles_two_empty_batches_gracefully():
     assert result is model
 
 
-def test_environment_mix_sums_to_expected_batch():
-    """The active mix should produce 2*B_BATCH prompts per train step."""
-    from reliquary.constants import B_BATCH, ENVIRONMENT_MIX, GRAD_ACCUM_STEPS
-    total = sum(w for _, w in ENVIRONMENT_MIX)
-    assert total == 2 * B_BATCH
-    assert GRAD_ACCUM_STEPS == len(ENVIRONMENT_MIX)
-
-
-def test_grad_accum_steps_equals_mix_length():
-    """GRAD_ACCUM_STEPS is derived from len(mix), not separately tunable."""
-    from reliquary.constants import ENVIRONMENT_MIX, GRAD_ACCUM_STEPS
-    assert GRAD_ACCUM_STEPS == len(ENVIRONMENT_MIX)

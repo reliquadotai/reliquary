@@ -52,24 +52,6 @@ def _capture_puts(monkeypatch) -> list[str]:
     return keys
 
 
-def test_upload_window_dataset_keys_by_an_explicit_task(monkeypatch):
-    monkeypatch.setenv("RELIQUARY_TASK_ID", "corpus-math,corpus-code")
-    keys = _capture_puts(monkeypatch)
-
-    asyncio.run(storage.upload_window_dataset(7, {}, task_id="corpus-code"))
-
-    assert keys == ["reliquary/tasks/corpus-code/dataset/window-7.json.gz"]
-
-
-def test_upload_window_dataset_default_is_unchanged(monkeypatch):
-    monkeypatch.setenv("RELIQUARY_TASK_ID", "corpus-math")
-    keys = _capture_puts(monkeypatch)
-
-    asyncio.run(storage.upload_window_dataset(7, {}))
-
-    assert keys == ["reliquary/tasks/corpus-math/dataset/window-7.json.gz"]
-
-
 class _Period:
     """``R2PeriodArchives`` behind a validator's guard, over an in-memory bucket:
     the period archives a corpus settler writes."""

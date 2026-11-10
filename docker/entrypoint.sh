@@ -196,7 +196,6 @@ args=(
   --wallet-name  "${BT_WALLET_NAME}"
   --hotkey       "${BT_HOTKEY}"
   --wallet-path  "${BT_WALLET_PATH}"
-  --environments "${ENVIRONMENTS}"
 )
 
 if [[ "${RELIQUARY_TRAIN:-0}" == "1" ]]; then
@@ -213,7 +212,6 @@ if [[ "${RELIQUARY_TRAIN:-0}" == "1" ]]; then
   [[ -n "${RELIQUARY_CHECKPOINT:-}" ]] && args+=(--checkpoint "${RELIQUARY_CHECKPOINT}")
   [[ -n "${RELIQUARY_EXTERNAL_IP:-}" ]]   && args+=(--external-ip   "${RELIQUARY_EXTERNAL_IP}")
   [[ -n "${RELIQUARY_EXTERNAL_PORT:-}" ]] && args+=(--external-port "${RELIQUARY_EXTERNAL_PORT}")
-  [[ -n "${RELIQUARY_RESUME_FROM:-}" ]]   && args+=(--resume-from   "${RELIQUARY_RESUME_FROM}")
 else
   args+=(--no-train)
 fi

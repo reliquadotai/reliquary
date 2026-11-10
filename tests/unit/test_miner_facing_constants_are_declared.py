@@ -27,7 +27,6 @@ MINER_FACING = [
     "BFT_THINKING_BUDGET",
     "BFT_ANSWER_BUDGET",
     "BFT_ENABLED",
-    "BFT_FORCE_ANSWER",
     "M_ROLLOUTS",
     "T_PROTO",
     "TOP_P_PROTO",
@@ -36,12 +35,7 @@ MINER_FACING = [
     "WINDOW_COLLECTION_SECONDS",
     # whether the submission is admitted
     "MAX_TRUNCATED_PER_SUBMISSION",
-    "MAX_TRUNCATED_PER_SUBMISSION_BY_ENV",
-    "SIGMA_MIN",
     "B_BATCH",
-    # how it is scored and ranked
-    "CONSERVATIVE_TRUNCATION_VALUE",
-    "DIFFICULTY_AUCTION_DELTA",
 ]
 
 

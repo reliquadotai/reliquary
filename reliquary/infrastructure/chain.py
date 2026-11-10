@@ -1,7 +1,6 @@
 """Bittensor chain interactions for Reliquary."""
 
 import asyncio
-import hashlib
 import logging
 import os
 
@@ -95,13 +94,6 @@ async def get_neurons_lite(subtensor, netuid: int = NETUID):
     )
 
 
-async def get_block_hash(subtensor, block_number: int) -> str:
-    """Get block hash for a given block number."""
-    return await asyncio.wait_for(
-        subtensor.get_block_hash(block_number), timeout=CHAIN_READ_TIMEOUT,
-    )
-
-
 async def get_current_block(subtensor) -> int:
     """Get current block number."""
     return await asyncio.wait_for(subtensor.get_current_block(), timeout=CHAIN_READ_TIMEOUT)
@@ -181,66 +173,3 @@ async def set_weights(
     return False
 
 
-def compute_window_randomness(
-    block_hash: str | None,
-    drand_randomness: str | None = None,
-    drand_round: int | None = None,
-) -> str:
-    """Combine drand randomness (+ optional block hash) into a window seed.
-
-    Including the round number prevents a miner from choosing a round
-    whose randomness is favorable.
-
-    As of v2.3 ``block_hash`` may be None — the drand-only path. Drand
-    quicknet provides threshold-BLS unpredictability that doesn't require
-    a chain-anchored mix to be secure. Dropping the block_hash decouples
-    window randomness from substrate availability, so a flaky WebSocket
-    no longer stalls window OPEN.
-    """
-    if drand_randomness:
-        material = b""
-        if block_hash is not None:
-            material += bytes.fromhex(block_hash.replace("0x", ""))
-        material += bytes.fromhex(drand_randomness)
-        if drand_round is not None:
-            material += drand_round.to_bytes(8, "big")
-        return hashlib.sha256(material).hexdigest()
-    if block_hash is None:
-        raise ValueError(
-            "compute_window_randomness requires either block_hash or drand_randomness"
-        )
-    return block_hash.replace("0x", "")
-
-
-def compute_current_drand_round(
-    timestamp_seconds: float, genesis_time: int, period: int,
-) -> int:
-    """Drand round currently in progress at the given UNIX timestamp.
-
-    Validator calls this at submit-receipt time with `time.time()` to
-    decide whether the round attached by the miner equals the round
-    publishing at receipt — the v2.3 zero-tolerance check.
-    """
-    if timestamp_seconds < genesis_time:
-        return 1
-    return 1 + int((timestamp_seconds - genesis_time) // period)
-
-
-def seconds_until_next_drand_boundary(
-    timestamp_seconds: float, genesis_time: int, period: int,
-) -> float:
-    """Seconds remaining until the next drand round publishes.
-
-    Returns 0.0 if ``timestamp_seconds`` is exactly at a round boundary.
-    Otherwise returns ``period - (timestamp_seconds - genesis_time) % period``.
-    Used by the validator to align window OPEN to a drand round boundary,
-    so the randomness round about to publish is not pre-fetchable by
-    miners (which is what enables the v30 pre-spam exploit).
-    """
-    if timestamp_seconds < genesis_time:
-        return float(genesis_time - timestamp_seconds)
-    elapsed = timestamp_seconds - genesis_time
-    rem = elapsed % period
-    if rem == 0:
-        return 0.0
-    return period - rem

@@ -10,7 +10,6 @@ from reliquary.shared.task_registry import MECHANISM_SERVICE_RL
 from reliquary.validator import weight_only
 from reliquary.validator.weight_only import WeightOnlyValidator
 from tests.unit.service_v2_fixtures import CODE, MATH, contract_v2
-from tests.unit.test_service_runtime_v2 import archive as runtime_archive, audited, explore, runtime, train
 from tests.unit.test_service_settlement_v2 import PICKS, SLOTS, archive, envelope
 
 TASK = "next-rl"
@@ -60,21 +59,6 @@ def test_replay_pays_the_recomputed_map_from_one_source():
     (out,) = check([record])
     assert set(out) == {"task_id", "window_start", "window_status", "rewards_by_hotkey"}   # batch dropped
     assert out["rewards_by_hotkey"]["a"] == pytest.approx(G) and out["rewards_by_hotkey"]["x"] == pytest.approx(0.15 * G)
-
-
-def test_runtime_archive_round_trips_through_json_and_replays_to_the_runtime_map(tmp_path):
-    rt = runtime(tmp_path)
-    paid = explore(rt, hotkey="x")
-    audited(rt, paid)
-    train(rt, prompt=20, hotkey="a")
-    train(rt, prompt=21, hotkey="b", env=CODE)
-    rt.finalize_exploration(1, environment=MATH, now=10_050.0)
-    result = rt.reconcile_archive(runtime_archive(batch=[("a", MATH, 20), ("b", CODE, 21)]), now=10_100.0)
-    record = {**json.loads(json.dumps(result)), "task_id": TASK}
-    (out,) = WeightOnlyValidator._validated_service_archives([record], declared())   # protocol geometry
-    assert out["rewards_by_hotkey"] == pytest.approx(result["rewards_by_hotkey"], abs=1e-12)
-    assert set(out["rewards_by_hotkey"]) == {"a", "b", "x"}
-    assert "service_cooldown_advice" in result       # informational: present, ignored
 
 
 def test_recovery_artifacts_are_tolerated():

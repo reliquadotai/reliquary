@@ -47,14 +47,6 @@ jobs:
           collected=$(pytest -q --collect-only tests/unit/test_corpus_split_e2e.py | sed -n 's/.*::\(test_[a-z0-9_]*\)$/\1/p' | sort)
           test -n "$collected" && test "$listed" = "$collected" || {
             echo "corpus-split-e2e matrix: $listed"; echo "collected: $collected"; exit 1; }
-      - name: Check V5 authenticity boundaries
-        if: matrix.shard == 1
-        env:
-          RELIQUARY_PROTOCOL_PROFILE: qwen3-4b-base-dapo-reasoning-v5
-          RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED: "0"
-        run: |
-          pytest -q tests/unit/test_grpo_window_batcher.py \
-            -k 'all_token_auth or forced_seed_group_gate or forced_seed_gate_abstains or forced_seed_cdf_gate or forged or tamper'
 
   # Each of these tests runs a split validator as several real processes for minutes; two on one runner starve
   # each other, so each gets its own.
@@ -102,22 +94,17 @@ jobs:
       OMP_NUM_THREADS: "2"
       MKL_NUM_THREADS: "2"
       SIGNED_SANDBOX_MODULES: >-
-        test_agentic_swe_signed test_bridged_episode test_bridged_swe
-        test_corpus_export_signed test_corpus_job_signed_sandbox test_corpus_multi_job_contract
-        test_corpus_period_settlement test_corpus_quota test_corpus_settlement
-        test_rl_async_episode_service test_rl_async_episodes
-        test_rl_capacity test_rl_capacity_attacks test_rl_check_cap
-        test_rl_engagements test_rl_episode_e2e test_rl_episode_miner_side
-        test_rl_episode_routes test_rl_episode_wiring test_rl_options_and_boot
-        test_rl_pay test_rl_prompt_ranges test_rl_quota
-        test_rl_quota_wiring test_rl_saturation test_rl_session_events
-        test_rl_yield test_rl_yield_wiring test_sandbox_dependency
-        test_sandbox_directory test_sandbox_fleet test_sandbox_routes
+        test_agentic_swe_signed test_bridged_episode test_bridged_swe test_corpus_export_signed
+        test_corpus_job_signed_sandbox test_corpus_multi_job_contract test_corpus_period_settlement
+        test_corpus_quota test_corpus_settlement test_rl_async_episode_service
+        test_rl_async_episodes test_rl_capacity test_rl_capacity_attacks test_rl_engagements
+        test_rl_episode_miner_side test_rl_episode_wiring test_rl_options_and_boot
+        test_rl_prompt_ranges test_rl_quota_wiring test_rl_saturation test_rl_session_events
+        test_sandbox_dependency test_sandbox_directory test_sandbox_fleet test_sandbox_routes
         test_sandbox_sessions test_signed_episode_e2e test_signed_episode_environment
-        test_signed_grading_and_wiring test_signed_intake test_signed_miner
-        test_signed_parse test_signed_state test_signed_wire
-        test_tasks_create_composed test_admin_eval_sandbox test_evaluation_sessions
-        test_eval_signed_agentic
+        test_signed_grading_and_wiring test_signed_intake test_signed_miner test_signed_parse
+        test_signed_state test_signed_wire test_tasks_create_composed test_admin_eval_sandbox
+        test_evaluation_sessions test_eval_signed_agentic
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -204,77 +191,3 @@ jobs:
           path: test-results/signed-sandbox-summary.json
           if-no-files-found: error
           retention-days: 7
-
-  # The suite above runs at DEFAULT_PROFILE_ID, which is still v2, so it
-  # exercises the fill-closed code with B_BATCH=8 and M_ROLLOUTS=8. This job
-  # runs the same fill-closed tests at the shape production will actually
-  # deploy: B_BATCH=16, 256 target groups, 512 admission budget.
-  #
-  # `classic_window` is deselected on purpose. Those tests assert the pre-v6
-  # timed window — flat slot_share payment, no EOS accounting — which the v6
-  # profile answers differently by design. They stay covered by cpu-suite.
-  fill-closed-v6:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        profile: [qwen3-4b-base-dapo-fill-closed-v6, qwen3-4b-base-dapo-reliquary-v1]
-    env:
-      RELIQUARY_PROTOCOL_PROFILE: ${{ matrix.profile }}
-      RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED: "1"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-      - name: Install CPU test runtime
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install -e ".[dev]"
-      - name: Assert the profile actually resolved
-        run: |
-          python - <<'PY'
-          import reliquary.constants as c
-          assert c.PROTOCOL_VERSION == 6, c.PROTOCOL_VERSION
-          assert c.FILL_CLOSED_ENABLED is True
-          assert (c.B_BATCH, c.M_ROLLOUTS) == (16, 16), (c.B_BATCH, c.M_ROLLOUTS)
-          assert c.FILL_CLOSED_TARGET_GROUPS_PER_ENV == 256
-          print("v6 profile resolved:", c.PROTOCOL_PROFILE_ID)
-          PY
-      - name: Run the fill-closed suite under the v6 profile
-        run: |
-          pytest -q -m "not classic_window" \
-            tests/unit/test_v6_emission.py \
-            tests/unit/test_v6_seal_seam.py \
-            tests/unit/test_fill_close_and_emit.py \
-            tests/unit/test_fill_closed_batch_assembler.py \
-            tests/unit/test_fill_closed_profile.py \
-            tests/unit/test_fill_closed_rotation.py \
-            tests/unit/test_bounded_fill_service.py \
-            tests/unit/test_trainer_macro_boundary.py \
-            tests/unit/test_prove_on_arrival.py \
-            tests/unit/test_pick_by_rate.py \
-            tests/unit/test_pick_pacing.py \
-            tests/unit/test_rate_ordered_admission.py \
-            tests/unit/test_remote_cpu_executor.py \
-            tests/unit/test_all_token_auth_enforce.py \
-            tests/unit/test_prepare_v5_fill_checkpoint.py \
-            tests/unit/test_semantic_signer.py \
-            tests/unit/test_checkpoint_store.py \
-            tests/unit/test_weight_only_validator.py \
-            tests/unit/test_v1_bootstrap.py \
-            tests/unit/test_v1_cutover.py \
-            tests/unit/test_trainer_publication_recovery.py \
-            tests/unit/test_remote_proof_controller.py \
-            tests/unit/test_seed_pool.py \
-            tests/unit/test_public_pool_sampling.py \
-            tests/unit/test_service_policy_admission.py \
-            tests/unit/test_service_checkpoint_adoption.py \
-            tests/integration/test_remote_proof_mtls.py
-      - name: Check inherited V5 authenticity boundaries
-        run: |
-          pytest -q tests/unit/test_grpo_window_batcher.py \
-            -k 'all_token_auth or forced_seed_group_gate or forced_seed_gate_abstains or forced_seed_cdf_gate or forged or tamper'

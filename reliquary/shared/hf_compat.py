@@ -2,41 +2,7 @@
 
 from typing import Any
 
-from transformers import PretrainedConfig, PreTrainedModel
-
-
-def resolve_hidden_size(model: PreTrainedModel) -> int:
-    """Return model hidden size across HF variants (Gemma/Qwen/etc.)."""
-    cfg = getattr(model, "config", None)
-
-    for attr in ("hidden_size", "d_model", "n_embd", "embed_dim", "hidden_dim"):
-        try:
-            if cfg is not None and hasattr(cfg, attr):
-                val = getattr(cfg, attr)
-                if isinstance(val, int) and val > 0:
-                    return val
-        except Exception:
-            pass
-
-    try:
-        text_cfg = getattr(cfg, "text_config", None)
-        if text_cfg is not None and hasattr(text_cfg, "hidden_size"):
-            val = text_cfg.hidden_size
-            if isinstance(val, int) and val > 0:
-                return val
-    except Exception:
-        pass
-
-    try:
-        if hasattr(model, "get_input_embeddings") and callable(model.get_input_embeddings):
-            emb = model.get_input_embeddings()
-            weight = getattr(emb, "weight", None)
-            if weight is not None and hasattr(weight, "shape") and len(weight.shape) == 2:
-                return int(weight.shape[1])
-    except Exception:
-        pass
-
-    raise AttributeError("Could not determine model hidden size from config or embeddings")
+from transformers import PretrainedConfig
 
 
 def resolve_vocab_size(model_config: PretrainedConfig | Any) -> int | None:

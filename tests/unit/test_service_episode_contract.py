@@ -6,11 +6,7 @@ from reliquary.protocol.service_contract import (
     supported_v2_capabilities,
 )
 from reliquary.protocol.submission import ServicePolicyAnnouncement
-from reliquary.services.admission_policy import parse_service_announcement
-from tests.unit.episode_v2_fixtures import (
-    BUDGETS, ENV_PACKAGE, EPISODE, SANDBOX_ENV, SPLIT, WINDOW_BEACON, episode_block, episode_contract,
-    episode_contract_dict, episode_runtime,
-)
+from tests.unit.episode_v2_fixtures import BUDGETS, ENV_PACKAGE, EPISODE, SANDBOX_ENV, SPLIT, WINDOW_BEACON, episode_block, episode_contract, episode_contract_dict
 from tests.unit.service_v2_fixtures import MATH, contract_v2
 
 
@@ -31,19 +27,6 @@ def test_a_single_turn_order_has_no_episode_and_announces_exactly_the_v2_capabil
     assert contract.episode_environments == ()
     assert supported_v2_capabilities(contract) == SUPPORTED_V2_CAPABILITIES
     assert b"episode" not in contract.canonical
-
-
-def test_an_episode_order_requires_and_announces_the_episode_capability(tmp_path):
-    contract = episode_contract()
-    with pytest.raises(ServiceContractError, match="capabilities"):
-        contract.require_capabilities(set(SUPPORTED_V2_CAPABILITIES))
-    assert supported_v2_capabilities(contract) == SUPPORTED_V2_CAPABILITIES | {EPISODE_CAPABILITY}
-    rt = episode_runtime(tmp_path)
-    announcement = rt.announcement(window=1, randomness=WINDOW_BEACON)
-    assert announcement["supported_capabilities"] == sorted(SUPPORTED_V2_CAPABILITIES | {EPISODE_CAPABILITY})
-    ServicePolicyAnnouncement(**announcement)
-    parsed, schedule = parse_service_announcement(announcement)
-    assert parsed.sha256 == contract.sha256 and EPISODE in schedule.active_environments()
 
 
 @pytest.mark.parametrize("field, value", [

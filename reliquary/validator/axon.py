@@ -1,5 +1,5 @@
 """Publishing a validator's HTTP address on the metagraph (``serve_axon``), so miners find it with
-``miner.submitter.discover_validator`` instead of ``--validator-url``. Used by the window validator and the async RL
+``miner.discovery.discover_validator`` instead of ``--validator-url``. Used by the window validator and the async RL
 validator alike."""
 from __future__ import annotations
 

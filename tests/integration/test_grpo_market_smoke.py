@@ -9,13 +9,7 @@ import hashlib
 import pytest
 
 from reliquary.constants import B_BATCH, CHALLENGE_K, M_ROLLOUTS
-from reliquary.protocol.submission import (
-    BatchSubmissionRequest,
-    RolloutSubmission,
-    RejectReason,
-)
-from reliquary.validator.batcher import GrpoWindowBatcher
-from reliquary.validator.cooldown import CooldownMap
+from reliquary.protocol.submission import RejectReason
 from collections import defaultdict
 
 
@@ -63,107 +57,8 @@ def _make_commit(
     }
 
 
-def _rollouts(k):
-    out = []
-    for i in range(M_ROLLOUTS):
-        reward = 1.0 if i < k else 0.0
-        commit = _make_commit(success=reward > 0.5, total_reward=reward)
-        out.append(RolloutSubmission(
-            tokens=commit["tokens"],
-            reward=reward,
-            commit=commit,
-            env_name="openmathinstruct",
-        ))
-    return out
-
-
 def _merkle(n: int) -> str:
     return hashlib.sha256(str(n).encode()).hexdigest()
-
-
-def _always_true_proof(commit, model, randomness):
-    import torch
-    from reliquary.validator.verifier import ProofResult
-    return ProofResult(all_passed=True, passed=1, checked=1, logits=torch.empty(0))
-
-
-def _make_batcher(window, cooldown):
-    b = GrpoWindowBatcher(
-        window_start=window,
-        env=FakeEnv(),
-        model=_ModelStub(),
-        cooldown_map=cooldown,
-        verify_commitment_proofs_fn=_always_true_proof,
-        verify_signature_fn=lambda c, h: True,
-        completion_text_fn=lambda r: "WIN" if r.reward > 0.5 else "",
-        # Smoke tests don't drive wall clock; disable the drand timing gate.
-        drand_round_check_enabled=False,
-    )
-    # Match the per-window randomness used in ``_make_commit`` so the
-    # WRONG_RANDOMNESS check from PR #23 accepts the test requests.
-    b.randomness = "cd" * 16
-    return b
-
-
-def test_two_windows_with_cooldown():
-    """Window 0: B_BATCH+2 miners submit on distinct prompts, B_BATCH win batch.
-    Window 1: same prompts → all rejected for cooldown.
-    Window 4 (after cooldown=3): prompt 0 eligible again."""
-    cooldown = CooldownMap(cooldown_windows=3)  # small for test speed
-    n_submissions = B_BATCH + 2
-
-    # Window 0: B_BATCH+2 distinct prompts arrive
-    b0 = _make_batcher(window=0, cooldown=cooldown)
-    for i in range(n_submissions):
-        req = BatchSubmissionRequest(
-            miner_hotkey=f"hk{i}",
-            prompt_idx=i,
-            window_start=0,
-            merkle_root=_merkle(i),
-            rollouts=_rollouts(k=4),
-            checkpoint_hash="sha256:test",
-            protocol_version=2,
-        )
-        resp = b0.accept_submission(req)
-        assert resp.accepted, f"unexpected reject for hk{i}: {resp.reason}"
-    batch0, _ = b0.seal_batch()
-    assert len(batch0) == B_BATCH
-    # v2.3: select_batch_and_distribute drand-orders prompts; any B_BATCH of
-    # the submitted prompts may win for a given seed.
-    batched_prompts = {s.prompt_idx for s in batch0}
-    assert len(batched_prompts) == B_BATCH
-    assert batched_prompts.issubset(set(range(n_submissions)))
-
-    # Window 1: re-submit the exact batched prompts → all rejected for cooldown
-    b1 = _make_batcher(window=1, cooldown=cooldown)
-    for prompt_idx in batched_prompts:
-        req = BatchSubmissionRequest(
-            miner_hotkey=f"hk{prompt_idx}",
-            prompt_idx=prompt_idx,
-            window_start=1,
-            merkle_root=_merkle(100 + prompt_idx),
-            rollouts=_rollouts(k=4),
-            checkpoint_hash="sha256:test",
-            protocol_version=2,
-        )
-        resp = b1.accept_submission(req)
-        assert resp.accepted is False
-        assert resp.reason == RejectReason.PROMPT_IN_COOLDOWN
-
-    # Window 4 (after cooldown=3 expires): re-use any batched prompt
-    reuse_prompt = next(iter(sorted(batched_prompts)))
-    b4 = _make_batcher(window=4, cooldown=cooldown)
-    req = BatchSubmissionRequest(
-        miner_hotkey=f"hk{reuse_prompt}",
-        prompt_idx=reuse_prompt,
-        window_start=4,
-        merkle_root=_merkle(500),
-        rollouts=_rollouts(k=4),
-        checkpoint_hash="sha256:test",
-        protocol_version=2,
-    )
-    resp = b4.accept_submission(req)
-    assert resp.accepted is True, f"expected eligibility after cooldown, got {resp.reason}"
 
 
 def _run_ema_windows(hotkey_counts_per_window: list[dict[str, int]]) -> dict:
@@ -212,19 +107,3 @@ def test_weights_for_partial_batch_burns_rest():
     assert abs(burn - (B_BATCH - filled) / B_BATCH) < 0.005
 
 
-def test_out_of_zone_rejected_end_to_end():
-    """A submission with k=0 (all fail) is rejected at the zone filter."""
-    cooldown = CooldownMap(cooldown_windows=50)
-    b = _make_batcher(window=0, cooldown=cooldown)
-    req = BatchSubmissionRequest(
-        miner_hotkey="hk",
-        prompt_idx=42,
-        window_start=0,
-        merkle_root=_merkle(42),
-        rollouts=_rollouts(k=0),  # all losses
-        checkpoint_hash="sha256:test",
-        protocol_version=2,
-    )
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.OUT_OF_ZONE

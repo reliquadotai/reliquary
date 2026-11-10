@@ -117,14 +117,6 @@ def test_collect_process_health_handles_unlimited_or_missing_cgroup(tmp_path):
     assert snapshot["cgroup_pids_utilization"] is None
 
 
-def test_trainer_compose_enables_docker_init_subreaper():
-    compose = (
-        REPO_ROOT / "docker" / "docker-compose.trainer.yml"
-    ).read_text(encoding="utf-8")
-
-    assert "\n    init: true\n" in compose
-
-
 def test_validator_entrypoint_is_valid_supervisor_script():
     entrypoint = REPO_ROOT / "docker" / "entrypoint.sh"
     completed = subprocess.run(

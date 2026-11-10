@@ -7,7 +7,7 @@ import json
 import time
 
 from reliquary.protocol.service_contract import ServiceContract
-from reliquary.services.runtime import ServiceRuntime, protocol_slot_geometry
+from reliquary.services.runtime import protocol_slot_geometry
 from tests.unit.service_v2_fixtures import MATH, contract_v2_dict, qualification_v2
 
 EPISODE = "reliquary_test_episode_v1"
@@ -71,20 +71,6 @@ def episode_contract_dict(*, episode=None, catalogue=None, episode_version=None,
 
 def episode_contract(**kwargs) -> ServiceContract:
     return ServiceContract.from_dict(episode_contract_dict(**kwargs))
-
-
-def episode_runtime(tmp_path, contract=None, *, window=1) -> ServiceRuntime:
-    """A real runtime with ``window`` frozen and announced on the episode order."""
-    contract = contract or episode_contract()
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    rt = ServiceRuntime(tmp_path / "runtime.sqlite3", contract, qualification_v2(contract),
-                        now=time.time() - 10, drand_round_at=lambda instant: 1_000)
-    rt.ensure_checkpoint(checkpoint_n=0, repo="models/test", revision=REVISION)
-    picks, slots = protocol_slot_geometry()
-    rt.open_window(window, pools={name: POOL for name in contract.environments}, picks_target=picks,
-                   batch_slots=slots, now=time.time() - 5)
-    rt.announcement(window=window, randomness=WINDOW_BEACON)
-    return rt
 
 
 from reliquary.protocol.seed_pool import SeedPool  # noqa: E402
@@ -262,19 +248,6 @@ def episode_group(contract, *, validator, machine, hotkey="5Hot", rewards=None, 
         pool_selection=selection.to_dict(), rollouts=rollouts,
         service_binding=ServiceBinding(contract.sha256, "training").to_dict())
     return SimpleNamespace(request=request, precommit=precommit, selection=selection, pool=pool, rewards=rewards)
-
-
-def batch_request(group):
-    """The group as a real ``BatchSubmissionRequest`` (its rollouts take private attributes)."""
-    from reliquary.protocol.submission import BatchSubmissionRequest, RolloutSubmission
-
-    request = group.request
-    return BatchSubmissionRequest(
-        miner_hotkey=request.miner_hotkey, prompt_idx=request.prompt_idx, window_start=request.window_start,
-        merkle_root="00" * 32, checkpoint_hash=request.checkpoint_hash, pool_selection=request.pool_selection,
-        service_binding=request.service_binding,
-        rollouts=[RolloutSubmission(tokens=r.tokens, reward=r.reward, commit=r.commit, env_name=r.env_name)
-                  for r in request.rollouts])
 
 
 # --- an env added to the running run ---------------------------------------------------------

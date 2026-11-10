@@ -97,7 +97,6 @@ STATUS_FORFEITED = "exploration_forfeited"
 UNAUDITED_HORIZON = "unaudited"
 UNAUDITED_VALIDATOR_LOST = "validator_lost"
 UNAUDITED_REASONS = (UNAUDITED_HORIZON, UNAUDITED_VALIDATOR_LOST)
-REFUSAL_REASONS = ("already_scanned", "banned", "finalized", "zero_price", "probation_limit", "cap")
 # A refusal that is about the hotkey's or the env's room, not about the group: when the same submission
 # comes back and room exists it is a new attempt (never a replay of the stale refusal).
 RETRYABLE_REFUSALS = ("cap", "probation_limit")
@@ -116,41 +115,8 @@ logger = logging.getLogger(__name__)
 AUDIT_FAILURE_DETERMINISTIC = "deterministic"
 AUDIT_FAILURE_STATISTICAL = "statistical"
 AUDIT_FAILURE_CLASSES = (AUDIT_FAILURE_DETERMINISTIC, AUDIT_FAILURE_STATISTICAL)
-AUDIT_FAILURE_CLASS_BY_STAGE = {
-    "grail": AUDIT_FAILURE_DETERMINISTIC,                         # proof sketch mismatch
-    "toploc": AUDIT_FAILURE_DETERMINISTIC,                        # TOPLOC proof mismatch
-    "termination": AUDIT_FAILURE_DETERMINISTIC,                   # EOS padding / forced terminal pick mismatch
-    "forged_termination": AUDIT_FAILURE_DETERMINISTIC,            # R26: proof-found cap where admission saw EOS
-    "force_span": AUDIT_FAILURE_DETERMINISTIC,                    # BFT force span not byte-exact
-    "service_seed_coverage": AUDIT_FAILURE_DETERMINISTIC,         # seed positions differ from sampled positions
-    "token_authenticity": AUDIT_FAILURE_DETERMINISTIC,            # token authenticity
-    "all_token_authenticity": AUDIT_FAILURE_DETERMINISTIC,        # token authenticity over every token
-    "forced_seed/cdf_hard_mismatch": AUDIT_FAILURE_DETERMINISTIC, # forced-seed hard CDF mismatch
-    "forced_seed/group": AUDIT_FAILURE_STATISTICAL,               # forced-seed agreement below the group floor
-    "forced_seed/rollout": AUDIT_FAILURE_STATISTICAL,             # forced-seed agreement below the rollout floor
-    "forced_seed": AUDIT_FAILURE_STATISTICAL,                     # forced-seed without a scope
-    "logprob": AUDIT_FAILURE_STATISTICAL,                         # logprob deviation threshold
-    "distribution": AUDIT_FAILURE_STATISTICAL,                    # token distribution threshold
-    "boxed_answer": AUDIT_FAILURE_STATISTICAL,                    # boxed-answer probability threshold
-    "code_semantic_auth": AUDIT_FAILURE_STATISTICAL,              # semantic token heuristic (positive reward)
-}
 # ``episode_replay_binding`` (replay spans missing: admission-side state, not proof evidence) is no verdict
 # at all: the batcher treats it as inconclusive (validator_lost: no forfeit, no sanction).
-
-
-def audit_failure_class(stage: str | None, scope: str | None = None) -> str:
-    """The failure class of an audit rejected at ``stage`` (``scope``: the forced-seed scope), R31.
-
-    Unknown stage (or none) -> ``statistical`` (the lenient class), logged at warning."""
-    key = f"{stage}/{scope}" if scope else stage
-    found = AUDIT_FAILURE_CLASS_BY_STAGE.get(key) if key is not None else None
-    if found is None and scope:
-        found = AUDIT_FAILURE_CLASS_BY_STAGE.get(stage)
-    if found is None:
-        logger.warning("exploration audit failed at an unclassified proof stage %r (scope %r): "
-                       "treated as statistical (no ban)", stage, scope)
-        return AUDIT_FAILURE_STATISTICAL
-    return found
 
 
 def training_group_price(pool: float, *, picks_target: int, batch_slots: int) -> float:

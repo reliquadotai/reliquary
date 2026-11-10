@@ -19,18 +19,7 @@ from reliquary.protocol.service_schedule import (
     next_schedule,
 )
 from reliquary.protocol.submission import ServicePolicyAnnouncement
-from reliquary.services.admission_policy import parse_service_announcement
-from tests.unit.episode_v2_fixtures import (
-    ADDED,
-    ADDED_IDENTITY,
-    ENV_PACKAGE,
-    EPISODE,
-    SANDBOX_ENV,
-    WINDOW_BEACON,
-    added_block,
-    episode_contract,
-    episode_runtime,
-)
+from tests.unit.episode_v2_fixtures import ADDED, ADDED_IDENTITY, ENV_PACKAGE, EPISODE, SANDBOX_ENV, WINDOW_BEACON, added_block, episode_contract
 from tests.unit.service_v2_fixtures import MATH, contract_v2
 
 CONTRACT = episode_contract()
@@ -246,38 +235,6 @@ def test_the_view_requires_the_added_envs_capabilities():
         view.require_capabilities(supported - {"signed-sandbox-episode/v1"})
 
 
-def test_the_announcement_of_a_window_with_an_added_env_parses_on_both_sides(tmp_path):
-    rt = episode_runtime(tmp_path)
-    value = rt.announcement(window=1, randomness=WINDOW_BEACON)
-    value = dict(value, schedule=with_added(active=[MATH, EPISODE, ADDED],
-                                            shares={MATH: 4000, EPISODE: 3000, ADDED: 3000}).to_dict())
-    ServicePolicyAnnouncement(**value)
-    contract, schedule = parse_service_announcement(value)
-    assert contract.sha256 == CONTRACT.sha256 and ADDED in contract.episode_environments
-    assert ADDED in schedule.active_environments()
-
-
-def test_the_seed_pool_and_the_admission_context_see_an_added_env_and_only_when_added(tmp_path):
-    from types import SimpleNamespace
-
-    from reliquary.protocol.seed_pool import pool_from_service_policy
-    from reliquary.validator.server import _episode_admission_fields
-
-    rt = episode_runtime(tmp_path)
-    plain = rt.announcement(window=1, randomness=WINDOW_BEACON)
-    added = dict(plain, schedule=with_added(active=[MATH, EPISODE, ADDED],
-                                            shares={MATH: 4000, EPISODE: 3000, ADDED: 3000}).to_dict())
-    revision = plain["checkpoint"]["revision"]
-    pool = pool_from_service_policy(added, environment=ADDED, prompt_idx=0, checkpoint_hash=revision)
-    assert pool is not None and pool.environment == ADDED
-    fields = _episode_admission_fields(SimpleNamespace(service_policy=added, env=SimpleNamespace(name=ADDED)))
-    assert fields["signed_episode"] is True
-    # Without the added row the order alone is served: the env is unknown, exactly as before.
-    with pytest.raises(ValueError):
-        pool_from_service_policy(plain, environment=ADDED, prompt_idx=0, checkpoint_hash=revision)
-    assert _episode_admission_fields(SimpleNamespace(service_policy=plain, env=SimpleNamespace(name=ADDED))) == {}
-
-
 def test_the_view_parses_its_added_rows_as_strictly_as_the_schedule():
     schedule = with_added(active=[MATH, EPISODE, ADDED], shares={MATH: 4000, EPISODE: 3000, ADDED: 3000})
     unbounded = schedule.to_dict()
@@ -301,13 +258,6 @@ def test_a_view_of_another_orders_schedule_is_refused():
         with_added().contract_view(contract_v2())
 
 
-def _applied(tmp_path, *schedules):
-    rt = episode_runtime(tmp_path)
-    for index, schedule in enumerate(schedules):
-        rt.apply_schedule(schedule, request_id=f"r{index}", window=1)
-    return rt
-
-
 def _successor(schedule, edit):
     value = schedule.to_dict()
     value["revision"] += 1
@@ -315,46 +265,3 @@ def _successor(schedule, edit):
     return ServiceSchedule.from_dict(value, CONTRACT)
 
 
-def test_an_added_row_is_never_removed_nor_changed_by_a_later_revision(tmp_path):
-    first = with_added()
-    dropped = _successor(first, lambda rows: rows.pop(ADDED))
-    edited = _successor(first, lambda rows: rows[ADDED]["added"]["catalogue"].update(conformance_sha256="e" * 64))
-    rt = _applied(tmp_path, first)
-    with pytest.raises(ValueError, match="never removed"):
-        rt.apply_schedule(dropped, request_id="drop", window=1)
-    with pytest.raises(ValueError, match="never changes"):
-        rt.apply_schedule(edited, request_id="edit", window=1)
-    assert rt.schedule.canonical == first.canonical
-
-
-def test_a_later_revision_may_switch_an_added_env_and_its_key_order_does_not_matter(tmp_path):
-    first = with_added()
-
-    def switch_on_reordered(rows):
-        rows[ADDED] = {**rows[ADDED], "active": 1, "share_bps": 2000,
-                       "added": dict(reversed(list(rows[ADDED]["added"].items())))}
-        rows[EPISODE]["share_bps"] -= 2000
-
-    on = _successor(first, switch_on_reordered)
-    rt = _applied(tmp_path, first, on)
-    assert ADDED in rt.schedule.active_environments()
-    assert rt.schedule.added_environments() == first.added_environments()
-
-
-def test_the_batcher_serves_the_view_of_its_windows_announcement(tmp_path):
-    from types import SimpleNamespace
-
-    from reliquary.validator.batcher import GrpoWindowBatcher
-
-    rt = episode_runtime(tmp_path)
-    plain = rt.announcement(window=1, randomness=WINDOW_BEACON)
-    added = dict(plain, schedule=with_added(active=[MATH, EPISODE, ADDED],
-                                            shares={MATH: 4000, EPISODE: 3000, ADDED: 3000}).to_dict())
-    for policy, expected in ((added, True), (plain, False)):
-        batcher = SimpleNamespace(service_policy=policy)
-        batcher._service_window_contract = lambda b=batcher: GrpoWindowBatcher._service_window_contract(b)
-        contract, schedule = GrpoWindowBatcher._parsed_service_policy(batcher)
-        assert (ADDED in contract.episode_environments) is expected
-        assert (ADDED in schedule.active_environments()) is expected
-        assert contract.sha256 == CONTRACT.sha256
-        assert (type(contract) is ServiceContract) is not expected

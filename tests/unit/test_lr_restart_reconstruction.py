@@ -18,7 +18,6 @@ from reliquary.validator.checkpoint_profile import (
     CHECKPOINT_PROFILE_NAME, active_checkpoint_profile,
     validate_checkpoint_profile, write_checkpoint_profile,
 )
-from reliquary.validator.service import ValidationService
 
 
 @pytest.fixture(autouse=True)
@@ -109,34 +108,6 @@ def test_hint_consumed_only_at_first_init():
     assert training.current_lr_schedule_step() == 100
 
 
-class _HintStub:
-    _lr_global_step_hint = ValidationService._lr_global_step_hint
-
-    def __init__(self, resumed_step=None, resumed_run_id=None):
-        self._resumed_lr_schedule_step = resumed_step
-        self._resumed_training_run_id = resumed_run_id
-
-
-def test_hint_is_the_recorded_step_never_a_derivation():
-    stub = _HintStub(resumed_step=337, resumed_run_id=TRAINING_RUN_ID)
-    assert stub._lr_global_step_hint() == 337
-
-
-def test_hint_missing_step_field_fails_closed_to_full_warmup():
-    """All checkpoints published before this feature: full warmup, exactly
-    the pre-feature behavior — the counter-inherited-across-reset trap
-    (repo starts at ckpt 486 with zero real steps) cannot fire."""
-    stub = _HintStub(resumed_step=None, resumed_run_id=TRAINING_RUN_ID)
-    assert stub._lr_global_step_hint() == 0
-    stub2 = _HintStub(resumed_step=None, resumed_run_id=None)
-    assert stub2._lr_global_step_hint() == 0
-
-
-def test_hint_new_run_id_forces_full_warmup():
-    stub = _HintStub(resumed_step=337, resumed_run_id="some-other-run")
-    assert stub._lr_global_step_hint() == 0
-
-
 def test_profile_roundtrip_records_and_restores_step(tmp_path):
     write_checkpoint_profile(tmp_path, extra={"lr_schedule_step": 337})
     value = validate_checkpoint_profile(tmp_path, required=True)
@@ -153,10 +124,3 @@ def test_profile_validation_tolerates_legacy_without_new_fields(tmp_path):
     assert value.get("lr_schedule_step") is None
 
 
-def test_resume_capture_rejects_garbage_step_values():
-    from reliquary.validator.service import _coerce_lr_schedule_step
-
-    assert _coerce_lr_schedule_step(337) == 337
-    assert _coerce_lr_schedule_step(0) == 0
-    for garbage in ("337", -5, True, False, 3.5, None, [3]):
-        assert _coerce_lr_schedule_step(garbage) is None

@@ -185,9 +185,9 @@ def test_the_prompt_state_route_serves_the_lifecycle_from_a_cursor(served):
 
 
 def test_the_validator_server_mounts_the_lease_routes(served):
-    from reliquary.validator.server import ValidatorServer
+    from reliquary.validator.rl_http import RlHttpApp
 
-    server = ValidatorServer()
+    server = RlHttpApp()
     server.mount_rl_lease_router(build_rl_lease_router(
         book=served, collector=LeaseCollector(served, interval_s=0.0), validator_hotkey=VALIDATOR.ss58_address,
         clock=lambda: float(NOW)))

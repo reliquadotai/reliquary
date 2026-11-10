@@ -28,6 +28,10 @@ COLLECTIVE_TIMEOUT_ENV = "RELIQUARY_TRAINER_COLLECTIVE_TIMEOUT_MINUTES"
 _DEFAULT_COLLECTIVE_TIMEOUT_MINUTES = 10
 
 
+class TrainerStateUnsafe(RuntimeError):
+    """An optimizer call failed; its in-memory mutations cannot be retried."""
+
+
 def trainer_backend(env: Mapping[str, str] = os.environ) -> str:
     value = str(env.get(BACKEND_ENV, "single")).strip().lower()
     if value not in _BACKENDS:
@@ -340,8 +344,6 @@ def sharded_save_fn(model_ref, channel: CommandChannel, ctx: DistContext):
             # The followers may still sit in a later collective of this
             # gather: a retried GATHER would pair mismatched parameters
             # (same-shaped layers gather "successfully"). Stop instead.
-            from reliquary.trainer.train_runner import TrainerStateUnsafe
-
             raise TrainerStateUnsafe(
                 "publish gather failed on rank 0; ranks are out of step, "
                 "restart from the last published checkpoint"
@@ -361,3 +363,49 @@ def load_sharded_model(model_path: str, load_kwargs: dict, ctx: DistContext, *,
     ).to(ctx.device)
     model.gradient_checkpointing_enable()
     return shard_model(model, ctx)
+
+
+def check_trainer_launch(backend: str, env: Mapping[str, str]) -> None:
+    """Several processes only make sense as fsdp2 ranks: under the single
+    backend each would be a full trainer on cuda:0 racing for the lock."""
+    world_size = int(str(env.get("WORLD_SIZE", "1")).strip() or "1")
+    if world_size > 1 and backend != "fsdp2":
+        raise SystemExit(
+            f"WORLD_SIZE={world_size} needs RELIQUARY_TRAINER_BACKEND=fsdp2"
+        )
+
+
+def run_train_follower(ctx, channel) -> None:
+    """A non-zero fsdp2 rank: load, train and gather on rank 0's command."""
+    from reliquary.constants import ATTN_IMPLEMENTATION
+    from reliquary.validator.training import (
+        TrainingStepSkipped,
+        reset_training_state,
+        train_step,
+    )
+
+    def load(payload):
+        reset_training_state()
+        return load_sharded_model(
+            payload["model_path"], payload["load_kwargs"], ctx,
+            attn_implementation=ATTN_IMPLEMENTATION,
+        )
+
+    def train(model, payload):
+        try:
+            train_step(model, payload["batches"], **payload["kwargs"])
+        except TrainingStepSkipped:
+            pass  # every rank took the same decision; rank 0 handles it
+
+    def audit(model, payload):
+        from reliquary.trainer.audits import audit_group
+
+        audit_group(model, payload["group"])
+
+    run_follower(
+        channel,
+        load=load,
+        train=train,
+        gather=lambda model: gather_full_state_dict(model, ctx),
+        audit=audit,
+    )

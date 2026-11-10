@@ -384,24 +384,6 @@ def test_unforced_rows_are_left_to_the_engine(monkeypatch):
     assert int(picks[1]) == _expected(logits[1], rollout_index=0, step=0)
 
 
-def test_the_runner_draw_reads_a_public_pool_by_seed(monkeypatch):
-    from tests.unit.test_public_pool_sampling import _pool
-
-    pool = _pool()
-    torch.manual_seed(17)
-    engine = _Engine(monkeypatch)
-    params = SimpleNamespace(extra_args=forced_seed_extra_args(
-        randomness=pool.randomness, prompt_idx=pool.prompt_idx, checkpoint_hash=pool.checkpoint_hash,
-        rollout_index=0, base_offset=1, seed_pool=pool, seed_index=3))
-    engine.add("a", 0, params, generated=2)
-
-    logits = torch.randn(1, VOCAB)
-    picks = engine.step(logits)
-
-    probs = warp(logits[0], t=T_PROTO, top_k=TOP_K_PROTO, top_p=TOP_P_PROTO)
-    assert int(picks[0]) == pick(probs, pool.uniform(3, 3))
-
-
 def test_speculative_decoding_is_refused_at_sampling(monkeypatch):
     engine = _Engine(monkeypatch)
     engine.add("a", 0, _params(rollout_index=0))

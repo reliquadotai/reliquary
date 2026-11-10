@@ -3,7 +3,7 @@
 The production trainer runs with ``cgroup: host`` so the unified cgroup path
 must be resolved from ``/proc/self/cgroup`` instead of assuming
 ``/sys/fs/cgroup/pids.current`` exists at the mount root.  Collection is kept
-off the request path by :class:`~reliquary.validator.server.ValidatorServer`.
+off the request path by :class:`~reliquary.validator.rl_http.RlHttpApp`.
 """
 
 from __future__ import annotations

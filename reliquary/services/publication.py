@@ -62,8 +62,6 @@ PAGE_SEGMENTS = 200
 CONSECUTIVE_REMOTE_FAILURES_CRITICAL = 10
 SEGMENT_CACHE = "public, max-age=31536000, immutable"
 INDEX_CACHE = "public, max-age=15"
-OBSERVATIONS_BUCKET_ENV = "RELIQUARY_OBSERVATIONS_BUCKET"
-
 PUBLIC_KEYS = frozenset({"type", "id", "env", "dataset", "prompt_idx", "checkpoint_n", "checkpoint", "window",
                          "ts", "rewards_bps", "verdict", "candidate", "lane", "status", "proof", "reason",
                          "uncertain", "window_aborted"})
@@ -263,24 +261,6 @@ def verify_segment(segment_bytes: bytes, entry: dict, *, max_size: int = MAX_SEG
     if not decompressor.eof or decompressor.unused_data:
         raise ValueError("segment is not exactly one complete gzip stream")
     return [json.loads(x) for x in raw.decode().splitlines()]
-
-
-def r2_put(bucket: str):
-    """The production ``put``: segments and pages are written once (conditional PUT), the head is replaced."""
-    from reliquary.infrastructure.storage import upload_bytes
-
-    async def put(key: str, body: bytes, content_type: str, cache_control: str) -> None:
-        await upload_bytes(key, body, content_type=content_type, cache_control=cache_control,
-                           if_absent=cache_control == SEGMENT_CACHE, bucket_name=bucket)
-    return put
-
-
-def r2_get(bucket: str):
-    from reliquary.infrastructure.storage import download_bytes
-
-    async def get(key: str) -> bytes | None:
-        return await download_bytes(key, bucket_name=bucket)
-    return get
 
 
 class ObservationPublisher:

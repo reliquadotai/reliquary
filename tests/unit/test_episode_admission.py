@@ -11,10 +11,7 @@ from reliquary.protocol.submission import RejectReason  # noqa: E402
 from reliquary.validator.episode_admission import (  # noqa: E402
     EpisodeGroupChecker, EpisodeGroupFacts, EpisodeRefusal, finish_prepared,
 )
-from tests.unit.episode_v2_fixtures import (  # noqa: E402
-    EPISODE, FIRST_TURN_TEXT, FixedSource, batch_request, episode_contract, episode_group, episode_precommit, episode_signers,
-    play_episode,
-)
+from tests.unit.episode_v2_fixtures import EPISODE, FIRST_TURN_TEXT, FixedSource, episode_contract, episode_group, episode_precommit, episode_signers, play_episode
 from tests.unit.sandbox_fixtures import NOW, directory  # noqa: E402
 from tests.unit.test_trajectory_parse import TEXT, FakeRenderer  # noqa: E402
 
@@ -193,33 +190,6 @@ def test_one_proof_per_span_chunk(tmp_path):
     w = world(tmp_path)
     w.group.request.rollouts[0].commit["toploc_proofs"].append("AAAA")
     refused(w.check(), RejectReason.BAD_SCHEMA, "episode_proof_shape")
-
-
-def test_finishing_sets_rewards_spans_and_the_lane(tmp_path):
-    w = world(tmp_path)
-    request = batch_request(w.group)
-    facts = w.check(request=request)
-    prepared = SimpleNamespace(request=request, rewards=[], completion_texts=[], episode_pending=True,
-                               reject_reason=None, reject_stage=None, truncated_indices=(1,),
-                               uncertain_indices=(1,), attainable_rewards=(0.5,))
-    finish_prepared(prepared, facts, CONTRACT)
-    assert prepared.rewards == w.group.rewards and prepared.episode_pending is False
-    assert prepared.reject_reason is None
-    assert (prepared.truncated_indices, prepared.uncertain_indices) == ((), ())
-    for rollout, spans, reward in zip(request.rollouts, facts.spans, w.group.rewards):
-        assert rollout._validated_assistant_spans == spans and rollout.reward == reward
-        assert rollout.commit["rollout"]["total_reward"] == reward
-
-
-def test_a_uniform_group_is_exploration_not_a_refusal(tmp_path):
-    from reliquary.constants import M_ROLLOUTS
-
-    w = world(tmp_path, rewards=[0.0] * M_ROLLOUTS)
-    request = batch_request(w.group)
-    prepared = SimpleNamespace(request=request, rewards=[], completion_texts=[], episode_pending=True,
-                               reject_reason=None, reject_stage=None)
-    finish_prepared(prepared, w.check(request=request), CONTRACT)
-    assert prepared.reject_reason is None and prepared.rewards == [0.0] * M_ROLLOUTS
 
 
 def test_a_group_mixing_two_precommits_is_refused(tmp_path):

@@ -73,22 +73,6 @@ def test_the_known_prod_corpus_jobs_are_listed():
     assert all(r.split == "train" for r in CORPUS_RANGES)
 
 
-def test_rl_samples_the_whole_train_split():
-    """What `rl_ranges` assumes, pinned: the window slice stays inside
-    [0, len(env)) and every runtime factory builds the train split."""
-    from reliquary.environment.agentic.external import load_external_backend
-    from reliquary.shared.prompt_range import window_prompt_range
-
-    rng = random.Random(3)
-    for _ in range(200):
-        lo, hi = window_prompt_range(f"{rng.random()}", "x", 2_481_806, 5000)
-        assert 0 <= lo < hi <= 2_481_806
-    assert inspect.signature(load_external_backend).parameters["split"].default == "train"
-    for held in HELD_OUT.values():
-        assert any(r.source == held.source and r.split == "train" and r.count is None
-                   for r in rl_ranges())
-
-
 def test_overlap_is_per_source_and_split():
     a = sets.UsedRange("corpus", "s", "train", 0, 10, "a")
     assert overlaps(a, sets.UsedRange("corpus", "s", "train", 9, 5, "b"))

@@ -25,7 +25,7 @@ from reliquary.miner.signed_episode import (
     SignedSweEpisodeRunner, _claims_of, _compact, _NoKeys, _Unconfirmed,
 )
 from reliquary.protocol.sandbox_session import SessionRefused, sandbox_open_path
-from reliquary.protocol.signatures import build_episode_precommit_binding, build_sandbox_open_binding
+from reliquary.protocol.signatures import build_sandbox_open_binding
 
 logger = logging.getLogger(__name__)
 
@@ -108,15 +108,6 @@ def check_engine_caps(policy, *, max_total_tokens: int, max_tokens_per_turn: int
     if wrong:
         raise ValueError("the episode engine's caps are not the contract's episode policy: "
                          + ", ".join(f"{name} {got} != {want}" for name, (got, want) in wrong.items()))
-
-
-def signed_precommit_body(*, precommit, sign_binding: Callable[[bytes], str], now: float,
-                          validator_hotkey: str, path: str) -> dict:
-    """The body of ``POST {prefix}/episodes/precommit``, signed for this validator and route."""
-    body = {"miner_hotkey": precommit.hotkey, "at": int(now), "precommit": precommit.to_dict(), "signature": ""}
-    body["signature"] = sign_binding(build_episode_precommit_binding(
-        body["precommit"], at=body["at"], validator_hotkey=validator_hotkey, path=path))
-    return body
 
 
 def signed_rl_open_request(*, hotkey: str, precommit_sha256: str, seed_index: int,
@@ -514,6 +505,5 @@ __all__ = [
     "lease_transcript_refusal",
     "rl_transcript_refusal",
     "signed_lease_open_request",
-    "signed_precommit_body",
     "signed_rl_open_request",
 ]

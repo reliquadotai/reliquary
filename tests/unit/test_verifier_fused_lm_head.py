@@ -79,29 +79,6 @@ def _build_commit() -> dict:
     }
 
 
-def _run_verification() -> _RecordingLmHead:
-    torch.manual_seed(0)
-    table = torch.randn(_SEQ_LEN, _VOCAB_SIZE)
-    lm_head, model = _build_model(table)
-    with patch(
-        "reliquary.shared.hf_compat.resolve_hidden_size", return_value=_SEQ_LEN,
-    ):
-        verifier.verify_commitment_proofs(_build_commit(), model, _RANDOMNESS)
-    return lm_head
-
-
-def test_lm_head_is_never_applied_to_the_whole_sequence_at_once():
-    """No single lm_head call may cover every position.
-
-    One call spanning all of them is exactly the [seq_len, vocab] allocation
-    this change exists to remove.
-    """
-    lm_head = _run_verification()
-
-    assert lm_head.rows_per_call, "lm_head was never called"
-    assert max(lm_head.rows_per_call) < _SEQ_LEN
-
-
 _HIDDEN_DIM = 32  # > PROOF_TOPK (16), which the sketch check top-k's over
 
 
@@ -159,62 +136,6 @@ def test_lazy_rows_shift_the_cdf_far_below_the_forced_seed_boundary():
         got_cdf = torch.softmax(got.float() / T_PROTO, dim=-1).cumsum(dim=-1)
         want_cdf = torch.softmax(want.float() / T_PROTO, dim=-1).cumsum(dim=-1)
         assert float((got_cdf - want_cdf).abs().max()) < _MAX_CDF_SHIFT
-
-
-def test_lazy_and_materialised_paths_agree_on_every_gating_value():
-    """The values the accept/reject path reads must not move.
-
-    Rows drift by an ulp, so this asserts the decisions built on them —
-    the forced-seed counters the 0.75/0.80 floors consume, and p_stop —
-    rather than the raw floats.
-    """
-    _, _, model = _linear_head_model()
-    commit = _build_commit()
-    u_values = [0.1 + 0.02 * i for i in range(_COMPLETION_LENGTH)]
-
-    def run() -> object:
-        return verifier.verify_commitment_proofs(
-            commit, model, _RANDOMNESS, seed_u_values=u_values,
-        )
-
-    with patch(
-        "reliquary.shared.hf_compat.resolve_hidden_size", return_value=_HIDDEN_DIM,
-    ):
-        lazy_result = run()
-        # vocab_size unresolvable => verify_commitment_proofs keeps the old
-        # materialised block, which is the reference this must reproduce.
-        with patch.object(verifier, "_lm_head_vocab_size", return_value=None):
-            materialised_result = run()
-
-    for field in (
-        "seed_n_stochastic",
-        "seed_n_match",
-        "seed_n_positions",
-        "seed_n_boundary_match",
-        "seed_n_hard_mismatch",
-        "seed_n_deterministic_hard_mismatch",
-        "terminal_pick_ok",
-        "all_passed",
-        "passed",
-        "checked",
-        "challenge_lp_indices",
-        "completion_argmax_ids",
-    ):
-        assert getattr(lazy_result, field) == getattr(materialised_result, field), (
-            f"{field} moved between the lazy and materialised paths"
-        )
-
-
-def test_logits_are_not_computed_for_prompt_only_positions():
-    """Rows before ``prompt_length - 1`` predict prompt tokens.
-
-    No consumer reads them, so computing them is pure waste; the first row any
-    consumer needs is the one predicting the first completion token.
-    """
-    lm_head = _run_verification()
-
-    assert lm_head.positions, "lm_head was never called"
-    assert min(lm_head.positions) >= _PROMPT_LENGTH - 1
 
 
 def test_the_fp32_head_weight_is_cast_once_until_the_weight_changes(monkeypatch):

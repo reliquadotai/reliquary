@@ -101,17 +101,6 @@ def test_a_mix_this_build_does_not_fully_serve_is_not_loaded():
     assert agentic_swe.policy_harness_refusal(_policy(MIX)) is None
 
 
-def test_a_window_refuses_a_mix():
-    from reliquary.miner.episode_mining import _episode_policies
-    from reliquary.validator.service import ValidationService
-
-    contract = ServiceContract.from_dict(episode_contract_dict(episode=episode_block(harness=MIX)))
-    with pytest.raises(ValueError, match="an RL lease's"):
-        _episode_policies(contract, [EPISODE], lambda policy: None)
-    with pytest.raises(ValueError, match="an RL lease's"):
-        ValidationService._default_episode_renderer(SimpleNamespace(tokenizer=None), contract.episode_policy(EPISODE))
-
-
 def test_tasks_create_writes_a_weighted_mix():
     from reliquary.cli.main import with_episode_harnesses
 

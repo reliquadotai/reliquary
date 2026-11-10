@@ -152,32 +152,6 @@ class _RecordingTemplate:
         return [1] + list(body.encode("utf-8")) if tokenize else f"<{enable_thinking}>{body}"
 
 
-def test_both_renderers_ask_the_template_for_the_same_mode() -> None:
-    """The tokens a miner generates from and the text `prompt_content_sha256`
-    hashes come from two functions; a disagreement between them is not
-    rejected, it is dropped silently at seal. So both take the mode, and both
-    pass it on unchanged."""
-    from reliquary.protocol.tokens import encode_prompt
-    from reliquary.validator.prompt_content import render_canonical_prompt
-
-    for thinking in (True, False):
-        tokenizer = _RecordingTemplate()
-        encode_prompt(tokenizer, "p", thinking=thinking)
-        render_canonical_prompt(tokenizer, "p", thinking=thinking)
-        assert tokenizer.seen == [thinking, thinking]
-
-
-def test_an_undeclared_mode_keeps_thinking_on() -> None:
-    """Both used to hard-code `True`; the default must still be that."""
-    from reliquary.protocol.tokens import encode_prompt
-    from reliquary.validator.prompt_content import render_canonical_prompt
-
-    tokenizer = _RecordingTemplate()
-    encode_prompt(tokenizer, "p")
-    render_canonical_prompt(tokenizer, "p")
-    assert tokenizer.seen == [True, True]
-
-
 def test_the_lookup_reads_the_active_profile(monkeypatch) -> None:
     import reliquary.constants as constants
 
@@ -217,3 +191,29 @@ def test_the_live_4b_run_keeps_its_optimizer() -> None:
         "qwen3-4b-base-dapo-reliquary-v1",
         RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED="1",
     ) == [False, False]
+
+
+def test_both_renderers_ask_the_template_for_the_same_mode() -> None:
+    """The tokens a miner generates from and the text `prompt_content_sha256`
+    hashes come from two functions; a disagreement between them is not
+    rejected, it is dropped silently at seal. So both take the mode, and both
+    pass it on unchanged."""
+    from reliquary.protocol.tokens import encode_prompt
+    from reliquary.validator.admission import render_canonical_prompt
+
+    for thinking in (True, False):
+        tokenizer = _RecordingTemplate()
+        encode_prompt(tokenizer, "p", thinking=thinking)
+        render_canonical_prompt(tokenizer, "p", thinking=thinking)
+        assert tokenizer.seen == [thinking, thinking]
+
+
+def test_an_undeclared_mode_keeps_thinking_on() -> None:
+    """Both used to hard-code `True`; the default must still be that."""
+    from reliquary.protocol.tokens import encode_prompt
+    from reliquary.validator.admission import render_canonical_prompt
+
+    tokenizer = _RecordingTemplate()
+    encode_prompt(tokenizer, "p")
+    render_canonical_prompt(tokenizer, "p")
+    assert tokenizer.seen == [True, True]
