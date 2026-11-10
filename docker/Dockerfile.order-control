@@ -42,7 +42,8 @@ RUN E="git+https://github.com/reliquadotai/reliquary-environments.git@${ENVS}" \
 ARG TASKSETS_REPO=git+https://github.com/PrimeIntellect-ai/research-environments.git@f2e0d70968f9d89421c8035091febee8e9ac3975
 RUN R="${TASKSETS_REPO}#subdirectory=environments" \
  && pip install --target /opt/evalsets-site \
-      "aime25 @ ${R}/math/aime25" "aime26 @ ${R}/math/aime26" "gpqa @ ${R}/science/gpqa" \
+      "aime24 @ ${R}/math/aime24" "aime25 @ ${R}/math/aime25" "aime26 @ ${R}/math/aime26" \
+      "math500 @ ${R}/math/math500" "apex-shortlist @ ${R}/math/apex_shortlist" "gpqa @ ${R}/science/gpqa" \
       "ifbench @ ${R}/if/ifbench" "mmlu-pro @ ${R}/knowledge/mmlu_pro" \
       "livecodebench @ ${R}/code/livecodebench" \
  && echo /opt/evalsets-site > "$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')/zzz-evalsets.pth"
@@ -68,7 +69,8 @@ assert md.version("renderers") == RENDERERS_VERSION, md.version("renderers")
 importlib.import_module("reliquary_sandbox_verifiers")
 assert installed_env_package("reliquary-swe") == os.environ["SWE_ENV_PACKAGE"], installed_env_package("reliquary-swe")
 assert installed_env_package("reliquary-terminal") == os.environ["TERMINAL_ENV_PACKAGE"], installed_env_package("reliquary-terminal")
-for name in ("aime25", "aime26", "gpqa", "ifbench", "mmlu_pro", "livecodebench"):
+for name in ("aime24", "aime25", "aime26", "math500", "apex_shortlist", "gpqa", "ifbench", "mmlu_pro",
+             "livecodebench"):
     importlib.import_module(name)
 assert "/opt/evalsets-site" in sys.path
 assert not importlib.util.find_spec("verifiers").origin.startswith("/opt/evalsets-site/")
