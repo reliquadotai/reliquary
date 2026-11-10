@@ -88,6 +88,11 @@ The order control loads no model: each audit batch goes to a GPU executor of the
 scores the forced draw and decides it. `RELIQUARY_ORDER_AUDIT_SCORERS` (default 1) sets how many
 executors score each batch; with more than one they must agree.
 
+An operator can set `reuse_auditors_only` on a pinned draw job with a frozen prompt set.
+In single-scorer mode it can borrow the existing draw auditor only when no paid audit is waiting
+or running on that executor. Its backlog, results and lease time do not contribute to fleet sizing.
+The control reports support and the eligible executor identity in its status response.
+
 ## 5. Grading and reports
 
 - One set: `POST /admin/v1/evaluations/{eval_id}/grade` with `source: "job"`, as before. The report's

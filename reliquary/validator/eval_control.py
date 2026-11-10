@@ -265,6 +265,7 @@ class _Batch:
     # v3: a forced-draw job's samples, leased to executors that score the draw, decided by its judge.
     protocol: str = AUDIT_PROTOCOL
     judge: Any = None
+    reuse_auditors_only: bool = False
 
 
 @dataclass
@@ -327,6 +328,7 @@ class PairedAuditDispatcher:
         # Executors the fleet may release (more live than wanted): leased nothing more, so once their leases
         # end they are idle for good and no batch waits on a destroyed card. First contact, to pick the newest.
         self._releasing: set[str] = set()
+        self.reuse_only_jobs: set[str] = set()
         self._first_seen: dict[str, float] = {}
 
     # -- the auditors' side ------------------------------------------------
@@ -350,6 +352,7 @@ class PairedAuditDispatcher:
                         batch.future.cancel()
         self.attention.pop(job_id, None)
         self.parked.pop(job_id, None)
+        self.reuse_only_jobs.discard(job_id)
 
     async def score(self, model: ModelKey, proof, items: Sequence[dict], job_id: str = "", judge=None):
         """``(status, chunks, scored_by[, diagnostics])`` per item; ``scored_by`` is the
@@ -371,7 +374,8 @@ class PairedAuditDispatcher:
                 batch = _Batch(id=next(self._ids), model=model, proof=proof,
                                items=[items[k] for k in indexes], future=loop.create_future(),
                                job_id=job_id, protocol=protocol, judge=judge,
-                               needed=self._scorers)
+                               needed=self._scorers,
+                               reuse_auditors_only=job_id in self.reuse_only_jobs)
                 units.append((indexes, batch))
                 self._queues[model].append(batch)
         scored: list = [None] * len(items)
@@ -435,15 +439,18 @@ class PairedAuditDispatcher:
             raise LeaseRefused(409, "executor_provider_unknown")
         if executor_id in self._releasing:
             return None
-        if sum(1 for lease in self._leases.values() if lease.executor_id == executor_id) \
-                >= self._max_leases:
+        held = [lease for lease in self._leases.values() if lease.executor_id == executor_id]
+        if len(held) >= self._max_leases or any(lease.batch.reuse_auditors_only for lease in held):
             return None
         queue = self._queues.get((document["model_id"], document["model_revision"]))
-        for batch in list(queue or ()):
+        for batch in sorted(queue or (), key=lambda batch: batch.reuse_auditors_only):
             if batch.future.done():
                 queue.remove(batch)
                 continue
             if batch.protocol not in protocols or not self._eligible(batch, executor_id, place):
+                continue
+            if batch.reuse_auditors_only and (held or
+                    self.reusable_auditor(batch.model, batch.protocol) != executor_id):
                 continue
             lease = _Lease(lease_id=secrets.token_hex(16), batch=batch, executor_id=executor_id,
                            expires_at=self._clock() + self._lease_seconds)
@@ -479,7 +486,8 @@ class PairedAuditDispatcher:
         self._mark_busy(executor_id, batch.model)
         if lease.expires_at <= self._clock():
             raise LeaseRefused(410, "lease_expired")
-        self._strikes[executor_id] = 0
+        if not batch.reuse_auditors_only:
+            self._strikes[executor_id] = 0
         scores = result.scores
         if len(scores) != len(batch.items) or any(_misfit(s, item) for s, item in zip(scores, batch.items)):
             raise LeaseRefused(422, "result_does_not_fit_the_lease")
@@ -489,7 +497,8 @@ class PairedAuditDispatcher:
             return "requeued" if not batch.future.done() else "unneeded"
         batch.scores[executor_id] = converted_scores(scores)
         self.stats["scored"] += 1
-        self._scored_items[batch.model].append((self._clock(), len(batch.items)))
+        if not batch.reuse_auditors_only:
+            self._scored_items[batch.model].append((self._clock(), len(batch.items)))
         await self._decide(batch)
         return "accepted"
 
@@ -563,13 +572,27 @@ class PairedAuditDispatcher:
 
     def _mark_busy(self, executor_id: str, model: ModelKey) -> None:
         """After a lease of ``executor_id`` was granted or ended: open or close its busy span."""
-        held = any(lease.executor_id == executor_id for lease in self._leases.values())
+        held = any(lease.executor_id == executor_id and not lease.batch.reuse_auditors_only
+                   for lease in self._leases.values())
         now = self._clock()
         if held and executor_id not in self._busy_since:
             self._busy_since[executor_id] = (now, model)
         elif not held and executor_id in self._busy_since:
             since, busy_model = self._busy_since.pop(executor_id)
             self._busy_spans[busy_model].append((now, now - since))
+
+    def reusable_auditor(self, model: ModelKey, protocol: str) -> str | None:
+        """Borrow the baseline only; a surplus executor must be free to leave."""
+        if self._scorers != 1:
+            return None
+        live = self.live_executors(model)
+        if not live:
+            return None
+        executor = min(live, key=lambda d: (self._first_seen.get(d["executor_id"], 0.0),
+                                           d["executor_id"]))["executor_id"]
+        if executor not in self._releasing and protocol in self._protocols.get(executor, ()):
+            return executor
+        return None
 
     def release_beyond(self, model: ModelKey, keep: int | None) -> list[str]:
         """The newest live executors of ``model`` beyond ``keep`` (None: none), to release."""
@@ -614,15 +637,17 @@ class PairedAuditDispatcher:
             providers = {_placement(d)[0] for d in live}
             needed = 0
             # Per protocol: a draw (v3) batch is scored by v3 executors alone.
-            for protocol in {b.protocol for b in waiting}:
+            demand = [b for b in waiting if not b.reuse_auditors_only]
+            for protocol in {b.protocol for b in demand}:
                 able = [d for d in live
                         if protocol in self._protocols.get(d["executor_id"], (AUDIT_PROTOCOL,))]
-                required = max(b.needed for b in waiting if b.protocol == protocol)
+                required = max(b.needed for b in demand if b.protocol == protocol)
                 distinct = min(len({_placement(d)[0] for d in able}), len({_placement(d)[1] for d in able}))
                 needed = max(needed, required - distinct)
             models[f"{model[0]}@{model[1]}"] = {
                 "executors_needed": max(0, needed),
                 "live_executors": len(live), "live_providers": len(providers),
+                "reusable_draw_auditor": self.reusable_auditor(model, AUDIT_PROTOCOL_V3),
                 "live_draw_executors": sum(1 for d in live if AUDIT_PROTOCOL_V3 in self._protocols.get(
                     d["executor_id"], ())),
                 "waiting_batches": len(waiting),
@@ -686,6 +711,8 @@ class PairedAuditDispatcher:
                 del self._leases[lease_id]
                 lease.batch.leased.discard(lease.executor_id)
                 self._mark_busy(lease.executor_id, lease.batch.model)
+                if lease.batch.reuse_auditors_only:
+                    continue
                 self._strikes[lease.executor_id] += 1
                 if self._strikes[lease.executor_id] >= self._strikes_limit:
                     await self.quarantine(lease.executor_id,
@@ -1532,6 +1559,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         # loaded it would only wait unaudited, or be lost on an order that never gets one.
         protocol = AUDIT_PROTOCOL_V3 if has_draw(job) else None
         routes.hold(str(job.job_id), lambda: dispatcher.audit_ready(key, protocol))
+        if (declared or {}).get("reuse_auditors_only") is True:
+            dispatcher.reuse_only_jobs.add(job.job_id)
         served[job.job_id] = w
         return w
 
@@ -1668,12 +1697,15 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         """The dispatcher's status, with each served job's completeness, and per model the executors
         its orders' expected audits want (`executors_wanted`)."""
         document = dispatcher.status()
+        document["reuse_auditors_only"] = True
         # Per model served, its orders' expected audit items; None while one of them is unknown.
         backlog: dict[tuple[str, str], float | None] = {}
         # Per model, the most executors its orders allow (the fastest order's choice), within the control's.
         allowed: dict[tuple[str, str], int] = {}
         released: list[str] = []
         for w in list(served.values()):
+            if w.job.job_id in dispatcher.reuse_only_jobs:
+                continue
             model = (w.job.checkpoint_repo, w.job.checkpoint_revision)
             backlog.setdefault(model, 0.0)
             allowed[model] = max(allowed.get(model, 1), getattr(w, "audit_executors", 1))
@@ -1682,8 +1714,9 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 status = await job_set.status(job_id)
             except Exception:
                 logger.warning("eval status of %s unavailable", job_id, exc_info=True)
-                job = served[job_id].job
-                backlog[(job.checkpoint_repo, job.checkpoint_revision)] = None
+                if job_id not in dispatcher.reuse_only_jobs:
+                    job = served[job_id].job
+                    backlog[(job.checkpoint_repo, job.checkpoint_revision)] = None
                 continue
             if status is None:
                 continue
@@ -1698,6 +1731,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 pending = auditor.audits_pending()
                 entry["audits_pending"] = pending
                 entry["audits_idle_since"] = auditor.audits_idle_since
+                if job_id in dispatcher.reuse_only_jobs:
+                    continue
                 job = served[job_id].job
                 model = (job.checkpoint_repo, job.checkpoint_revision)
                 expected = auditor.expected_audits(pending)
@@ -1715,6 +1750,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 max_executors=min(max_executors, allowed.get(model, 1)))
             wanted = sizing.update(key, target)
             entry = document["models"].setdefault(key, {"executors_needed": 0, "live_executors": len(live)})
+            entry["reusable_draw_auditor"] = dispatcher.reusable_auditor(model, AUDIT_PROTOCOL_V3)
             # Beyond what is wanted (at least the scorers a batch needs), the newest executors lease nothing more;
             # the fleet releases one only once it holds no lease (`releasing` and `idle_executors`).
             releasing = dispatcher.release_beyond(

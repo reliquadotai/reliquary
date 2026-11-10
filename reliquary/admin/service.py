@@ -161,6 +161,7 @@ class CreateJob(BaseModel):
     # The most audit executors the order control may use for this order's model (none: one), at the order's
     # chosen speed; the control's own maximum still applies.
     audit_executors: int | None = Field(default=None, ge=1, le=8)
+    reuse_auditors_only: bool = False
     sampling: "OrderSampling | None" = None
     # Eval and generation orders: every sample follows the job's public forced draw (``corpus.eval_draw``),
     # checked by the audit in place of a proof; ``judge`` sets some of its thresholds (``corpus.job.DrawJudge``).
@@ -928,6 +929,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     "thinking": None if episode is not None else body.thinking, "episode": episode,
                     "draw": body.draw, "judge": judge, "seed": seed,
                     "audit_q": 1.0 if evaluation else (body.audit_q or GEN_AUDIT_PARAMS["audit_q"]),
+                    **({"reuse_auditors_only": True} if body.reuse_auditors_only else {}),
                     **audit_executors_of(body)})
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -1015,6 +1017,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if body.eval_set_id is not None and not (evaluation or (generation and pinned)):
             raise HTTPException(status_code=422, detail=(
                 f"an eval job's ids start with {eval_prefix!r}, and only an eval job's"))
+        if body.reuse_auditors_only and not (pinned and body.eval_set_id is not None and body.episode is None):
+            raise HTTPException(status_code=422, detail="auditor reuse requires a pinned draw prompt set")
         if body.revision is not None and not pinned:
             raise HTTPException(status_code=422, detail="revision pins a forced-draw order without a qualification")
         if generation and body.seed is not None and body.draw is None:
