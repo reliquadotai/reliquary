@@ -2865,6 +2865,23 @@ corpus_app = typer.Typer(name="corpus", help="Mine a corpus generation task")
 app.add_typer(corpus_app)
 
 
+def _served_orders(validator_url: str, *, strict: bool = False) -> list[dict] | None:
+    """The orders a validator lists (``/corpus/jobs``, ``orders``), or None from one that does not. An
+    unreadable list is None too, unless ``strict`` (the order loop retries it)."""
+    import httpx
+
+    try:
+        response = httpx.Client(base_url=validator_url, timeout=30.0).get("/corpus/jobs")
+        response.raise_for_status()
+        orders = response.json().get("orders")
+    except Exception:
+        if strict:
+            raise
+        logging.getLogger(__name__).warning("the order list of %s is unreadable", validator_url, exc_info=True)
+        return None
+    return None if orders is None else list(orders)
+
+
 def _restart_with_served_contract(validator_url: str, job_id: str | None = None) -> None:
     """Take the task's contract from the validator and restart with it: the
     active profile is fixed when this process imports it. With ``job_id``,
@@ -3201,9 +3218,24 @@ def corpus_mine(
              "deliver are charged and halve it for an hour",
     ),
 ) -> None:
-    """Generate for the corpus job the validator serves, and submit it."""
+    """Generate for the corpus job the validator serves, and submit it. Without --job-id, on a validator that
+    lists its orders: mine open orders one after another, each in its own process."""
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
 
+    if job_id is None and _served_orders(validator_url) is not None:
+        from reliquary.miner.order_follow import fetch_model, follow_orders, run_child
+
+        setup_logging("INFO")
+        argv = ["--validator-url", validator_url, "--wallet-name", wallet_name, "--hotkey", hotkey,
+                "--max-steps", str(max_steps)]
+        for flag, value in (("--wallet-path", wallet_path or None),
+                            ("--gpu-memory-utilization", gpu_memory_utilization),
+                            ("--ask-alpha-per-mtoken", ask_alpha_per_mtoken), ("--ask-capacity", ask_capacity)):
+            if value is not None:
+                argv += [flag, str(value)]
+        follow_orders(list_orders=lambda: _served_orders(validator_url, strict=True),
+                      mine=lambda job: run_child(job, argv), fetch=fetch_model)
+        return
     if TASK_CONTRACT_ENV_VAR not in os.environ:
         _restart_with_served_contract(validator_url, job_id)
     import bittensor as bt

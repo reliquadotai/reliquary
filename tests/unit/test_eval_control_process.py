@@ -202,7 +202,15 @@ def test_one_process_serves_eval_jobs_of_two_models(world, monkeypatch):
             app.state.corpus_pay = Board()  # the chain read is the pay board's own test
             assert (await client.get("/corpus/pay")).json() == {"jobs": []}
             # No executor has loaded either model yet: miners are kept off both orders.
-            assert (await client.get("/corpus/jobs")).json() == {"jobs": []}
+            listed = (await client.get("/corpus/jobs")).json()
+            assert listed["jobs"] == []
+            # Listed as starting meanwhile, with what a miner fetches ahead.
+            orders = {o["job_id"]: o for o in listed["orders"]}
+            assert orders["order-eval-a"]["state"] == "starting"
+            assert orders["order-eval-a"]["model"] == "customer/A"
+            assert orders["order-eval-a"]["revision"] == "a" * 40
+            assert orders["order-eval-a"]["pricing"] == "first_come"
+            assert orders["order-eval-a"]["max_new_tokens"] > 0
             held = await client.get(f"/corpus/jobs/order-eval-a/next/{hotkey}")
             assert held.status_code == 409 and held.json()["detail"] == "job_paused"
             headers = {"Authorization": "Bearer token-one"}
@@ -212,7 +220,10 @@ def test_one_process_serves_eval_jobs_of_two_models(world, monkeypatch):
                                       headers=headers)
             assert first.status_code == 204, first.text
             # Model A's executor now claims: its order opens, model B's stays held.
-            assert (await client.get("/corpus/jobs")).json() == {"jobs": ["order-eval-a"]}
+            listed = (await client.get("/corpus/jobs")).json()
+            assert listed["jobs"] == ["order-eval-a"]
+            assert {o["job_id"]: o["state"] for o in listed["orders"]} == {
+                "order-eval-a": "open", "order-eval-b": "starting"}
             assert (await client.post("/corpus/internal/eval-audit/claim", json=claim,
                                       headers={"Authorization": "Bearer nope"})).status_code == 401
             beat = await client.post("/corpus/internal/eval-audit/heartbeat",

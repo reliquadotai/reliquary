@@ -84,6 +84,8 @@ JOB_PATH = "/corpus/job"
 CURSOR_PATH = "/corpus/cursor/{hotkey}"
 # Job-scoped reads, for a validator serving several jobs on one model.
 JOBS_PATH = "/corpus/jobs"
+# A served job's state in `JOBS_PATH`'s ``orders``.
+ORDER_OPEN, ORDER_STARTING, ORDER_PAUSED, ORDER_DRAINING = "open", "starting", "paused", "draining"
 JOB_SCOPED_PATH = "/corpus/jobs/{job_id}/job"
 CURSOR_SCOPED_PATH = "/corpus/jobs/{job_id}/cursor/{hotkey}"
 # Check before generating: where a hotkey's walk stands and whether that prompt
@@ -2963,6 +2965,8 @@ class CorpusJobRoutes:
         self.contracts: dict[str, Any] = {}
         # Each job's prompt source: an eval job's names the set miners fetch.
         self.prompt_sources: dict[str, str] = {}
+        # Each job's spec, when the caller gave it: what `orders` tells miners of it.
+        self.specs: dict[str, Any] = {}
         self.retired: set[str] = set()
         self.paused: set[str] = set()
         # Jobs kept from miners until their condition holds (an order's audit executor ready).
@@ -2973,9 +2977,11 @@ class CorpusJobRoutes:
         self.default = default if default is not None else next(iter(self.routers), None)
 
     def add(self, job_id: str, router: APIRouter, *, contract: Any = None,
-            prompt_source: str | None = None) -> None:
+            prompt_source: str | None = None, spec: Any = None) -> None:
         self.routers[job_id] = router
         self.contracts[job_id] = contract
+        if spec is not None:
+            self.specs[job_id] = spec
         if prompt_source is not None:
             self.prompt_sources[job_id] = prompt_source
         self.retired.discard(job_id)
@@ -3019,6 +3025,43 @@ class CorpusJobRoutes:
     def open_jobs(self) -> list[str]:
         return sorted(j for j in self.routers
                       if j not in self.retired and j not in self.paused and not self.is_held(j))
+
+    def state_of(self, job_id: str) -> str:
+        """What a miner may do on a served job: ``open`` (mine it), ``starting`` (held until its audit is
+        ready: fetch the model), ``paused``, or ``draining`` (it admits nothing more)."""
+        if job_id in self.retired:
+            return ORDER_DRAINING
+        if job_id in self.paused:
+            return ORDER_PAUSED
+        if self.is_held(job_id):
+            return ORDER_STARTING
+        return ORDER_OPEN
+
+    def orders(self) -> list[dict]:
+        """Every served job, open or not, with what a miner needs to choose one (`JOBS_PATH`)."""
+        listed = []
+        for job_id in sorted(self.routers):
+            spec = self.specs.get(job_id)
+            entry = {"job_id": job_id, "state": self.state_of(job_id)}
+            facts = {"model": getattr(spec, "checkpoint_repo", None),
+                     "revision": getattr(spec, "checkpoint_revision", None),
+                     "prompts": getattr(spec, "prompt_count", None),
+                     "samples_per_prompt": getattr(spec, "slots_per_prompt", None),
+                     "max_new_tokens": getattr(getattr(spec, "sampling", None), "max_new_tokens", None),
+                     "max_prompt_tokens": getattr(spec, "max_prompt_tokens", None)}
+            entry.update({k: v for k, v in facts.items() if v is not None})
+            view = getattr(self.routers[job_id], "auction_view", None)
+            try:
+                auction = view() if callable(view) else None
+            except Exception:
+                # Its pricing unknown for now: left out rather than told wrong.
+                logger.exception("corpus job %s: its auction view failed", job_id)
+            else:
+                entry["pricing"] = "auction" if auction is not None else "first_come"
+                if auction is not None:
+                    entry["auction"] = auction
+            listed.append(entry)
+        return listed
 
     def admission_pending(self, job_id: str) -> bool:
         """A write handler or its detached ledger/record work is still running."""
@@ -3105,7 +3148,8 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
 
     @router.get(JOBS_PATH)
     async def corpus_jobs() -> dict:
-        return {"jobs": routes.open_jobs()}
+        # ``jobs``: the ids open to mine now (older miners read it); ``orders``: every served job and its state.
+        return {"jobs": routes.open_jobs(), "orders": routes.orders()}
 
     @router.get(JOB_SCOPED_PATH)
     async def corpus_job_scoped(job_id: str) -> dict:

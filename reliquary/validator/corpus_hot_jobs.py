@@ -377,7 +377,7 @@ class CorpusJobSet:
             return
         self._wire_failures.pop(task_id, None)
         self._routes.add(job_id, router, contract=entry.contract,
-                         prompt_source=job.prompt_source)
+                         prompt_source=job.prompt_source, spec=job)
         self._routes.set_admission(job_id, getattr(entry, "admission", "open"))
         if entry.status != "active":
             # Wired only to finish its audits and settlement: no admission.

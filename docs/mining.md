@@ -1,5 +1,8 @@
 # Running a Reliquary Miner
 
+> **Mining today is on Batch and Evals orders: see [Mining orders](mining-orders.md).** The RL run this guide
+> describes ended on 2026-11-02.
+
 Operational guide for running a miner on Bittensor subnet 81. For conceptual background see [docs/concepts.md](concepts.md).
 
 ## Boot sequence
