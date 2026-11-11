@@ -123,7 +123,7 @@ def test_reusing_auditors_does_not_report_paid_executor_demand():
         assert "a" not in dispatcher._busy_since
         await dispatcher.result("a", lease["lease_id"], _honest())
         assert (await borrow)[0][0] == "ok"
-        assert sum(n for _, n in dispatcher._scored_items[MODEL_A]) == len(ITEMS)
+        assert sum(row[1] for row in dispatcher._scored_items[MODEL_A]) == len(ITEMS)
 
         expiring = asyncio.create_task(dispatcher.view(*MODEL_A, PROOF, "borrow").score(ITEMS))
         await asyncio.sleep(0)

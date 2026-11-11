@@ -99,9 +99,13 @@ def test_throughput_is_items_per_second_an_executor_holds_a_lease():
         clock.now += 300                           # idle: not counted
         await _lease(d, clock, 100)
         assert d.items_per_second(MODEL_A) == pytest.approx(6 / 200)
+        # ITEMS: 4 completion and 3 prompt tokens a batch.
+        assert d.tokens_per_second(MODEL_A) == pytest.approx((12 / 200, 9 / 200))
         assert d.items_per_second(MODEL_B) is None
+        assert d.tokens_per_second(MODEL_B) is None
         clock.now += THROUGHPUT_WINDOW_SECONDS + 1
         assert d.items_per_second(MODEL_A) is None  # all of it left the window
+        assert d.tokens_per_second(MODEL_A) is None
 
     asyncio.run(go())
 

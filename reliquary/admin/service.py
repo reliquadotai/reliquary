@@ -1103,6 +1103,70 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             logger.warning("admin: the token ceiling could not be converted: %r", exc)
             raise HTTPException(status_code=503, detail="token_price_unavailable") from exc
 
+    async def sized_entry(entry, job, audit_executors: int | None):
+        """With ``RELIQUARY_ORDER_CAP_SIZING`` on, the entry's cap sized to what its audit lets it pay
+        (``admin.cap_sizing``), the asked cap kept as ``cap_max``; else the entry as it is."""
+        from dataclasses import replace
+
+        from reliquary.admin import cap_sizing as sizing
+        from reliquary.validator.eval_control import read_control_status
+
+        if not sizing.sizing_enabled():
+            return entry
+        try:
+            status = await read_control_status()
+        except Exception:
+            logger.warning("admin: the control status is unreadable; sizing on default rates", exc_info=True)
+            status = None
+        completion, prompt = sizing.model_rates(status, f"{job.checkpoint_repo}@{job.checkpoint_revision}")
+        estimate = sizing.spend_estimate(entry.params, completion_tps=completion, prompt_tps=prompt,
+                                         cards=audit_executors or 1)
+        if estimate is None:
+            return entry
+        asked = float(entry.params["cap"])
+        cap = sizing.sized_cap(asked, estimate=estimate)
+        return replace(entry, params={**entry.params, "cap": cap, "floor": cap, sizing.CAP_MAX_PARAM: asked})
+
+    async def resize_order_caps() -> int:
+        """Resize every active order task with a ``cap_max`` from the control's status; the count changed."""
+        from reliquary.admin import cap_sizing as sizing
+        from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION, RegistryError
+        from reliquary.validator.eval_control import read_control_status
+
+        status = await read_control_status()
+        if not status or clock() - float(status.get("at") or 0.0) > sizing.STATUS_MAX_AGE_SECONDS:
+            return 0
+        jobs = status.get("jobs") or {}
+        entries, _ = await registry_store.read_registry(strict=False)
+        changed = 0
+        for entry in list(entries.values()):
+            if (entry.status != "active" or entry.mechanism != MECHANISM_CORPUS_GENERATION
+                    or sizing.CAP_MAX_PARAM not in entry.params):
+                continue
+            facts = (jobs.get(entry.job_id) or {}).get("sizing")
+            cap = None if not facts else sizing.resized(entry.params, facts, status)
+            if cap is None:
+                continue
+            try:
+                await registry_store.set_task_cap(entry.task_id, cap, guard=await draining_limits(cap))
+            except (RegistryError, registry_store.RegistryConflict) as exc:
+                logger.warning("admin: cap of %s stays %s (sized %s): %s", entry.task_id,
+                               entry.params["cap"], cap, exc)
+                continue
+            logger.info("admin: cap of %s %s -> %s", entry.task_id, entry.params["cap"], cap)
+            changed += 1
+        return changed
+
+    async def resize_forever() -> None:
+        from reliquary.admin.cap_sizing import RESIZE_SECONDS
+
+        while True:
+            try:
+                await resize_order_caps()
+            except Exception:
+                logger.exception("admin: order cap resize failed; retrying")
+            await asyncio.sleep(RESIZE_SECONDS)
+
     def order_pricing() -> dict:
         """An order job with a ceiling is priced by auction (``corpus.token_auction``) when
         ``RELIQUARY_ORDER_PRICING`` says ``auction``; else first come at the ceiling."""
@@ -1129,8 +1193,12 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 "profile_sha256": entry.profile_sha256, "task": task_document(entry)}
 
     def refuse_changed_task(existing, expected) -> None:
+        from reliquary.admin.cap_sizing import CAP_MAX_PARAM
+
+        # A sized cap (``admin.cap_sizing``) moves; the cap the order asked for is kept beside it.
+        asked = existing.params.get(CAP_MAX_PARAM, existing.params["cap"])
         if (existing.profile_sha256 != expected.profile_sha256
-                or float(existing.params["cap"]) != float(expected.params["cap"])):
+                or float(asked) != float(expected.params["cap"])):
             raise HTTPException(status_code=409, detail="task_exists_with_another_contract")
 
     @router.get("/task-catalog")
@@ -1265,6 +1333,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             entry = replace(entry, params={**entry.params,
                                            **await token_price(body.max_price_usd_per_mtoken),
                                            **order_pricing()})
+            entry = await sized_entry(entry, parse_job(manifest), body.audit_executors)
         try:
             await registry_store.create_task(entry, guard=await draining_limits(cap))
         except (RegistryError, registry_store.RegistryConflict) as exc:
@@ -2019,11 +2088,16 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
     @asynccontextmanager
     async def lifespan(app):
+        from reliquary.admin.cap_sizing import sizing_enabled
+
         if evaluation_sessions is not None:
             await evaluation_sessions.start()
+        resizing = asyncio.create_task(resize_forever()) if sizing_enabled() else None
         try:
             yield
         finally:
+            if resizing is not None:
+                resizing.cancel()
             if evaluation_sessions is not None:
                 await evaluation_sessions.stop()
 
@@ -2032,6 +2106,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     app.state.exports = exports
     app.state.gradings = gradings
     app.state.task_prefix = task_prefix
+    app.state.resize_order_caps = resize_order_caps
     app.add_middleware(BodyLimit, limit=MAX_BODY_BYTES)
     return app
 
