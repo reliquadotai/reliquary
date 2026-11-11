@@ -320,8 +320,8 @@ class PairedAuditDispatcher:
         self.parked: collections.Counter = collections.Counter()
         self.quarantined: set[str] = set()
         self.stats = collections.Counter()
-        # Throughput: per executor, since when it holds a lease; per model, (when, items scored) and
-        # (when it ended, busy seconds) of the last THROUGHPUT_WINDOW_SECONDS.
+        # Throughput: per executor, since when it holds a lease; per model, (when, items scored, completion
+        # tokens, prompt tokens) and (when it ended, busy seconds) of the last THROUGHPUT_WINDOW_SECONDS.
         self._busy_since: dict[str, tuple[float, ModelKey]] = {}
         self._scored_items: dict[ModelKey, collections.deque] = collections.defaultdict(collections.deque)
         self._busy_spans: dict[ModelKey, collections.deque] = collections.defaultdict(collections.deque)
@@ -498,7 +498,9 @@ class PairedAuditDispatcher:
         batch.scores[executor_id] = converted_scores(scores)
         self.stats["scored"] += 1
         if not batch.reuse_auditors_only:
-            self._scored_items[batch.model].append((self._clock(), len(batch.items)))
+            prompts = sum(int(item.get("prompt_len") or 0) for item in batch.items)
+            completions = sum(len(item.get("tokens") or ()) for item in batch.items) - prompts
+            self._scored_items[batch.model].append((self._clock(), len(batch.items), completions, prompts))
         await self._decide(batch)
         return "accepted"
 
@@ -611,20 +613,32 @@ class PairedAuditDispatcher:
         busy = {lease.executor_id for lease in self._leases.values()}
         return live, [e for e in live if e not in busy]
 
-    def items_per_second(self, model: ModelKey) -> float | None:
-        """Items one executor of ``model`` scores per second it holds a lease, over the last
-        THROUGHPUT_WINDOW_SECONDS; None until MIN_MEASURED_BUSY_SECONDS were measured."""
+    def _scored_per_second(self, model: ModelKey) -> tuple[int, int, int, float] | None:
+        """Items, completion tokens and prompt tokens one executor of ``model`` scored, and the seconds it
+        held a lease, over the last THROUGHPUT_WINDOW_SECONDS; None until MIN_MEASURED_BUSY_SECONDS."""
         now = self._clock()
         start = now - THROUGHPUT_WINDOW_SECONDS
         for log in (self._scored_items[model], self._busy_spans[model]):
             while log and log[0][0] < start:
                 log.popleft()
-        items = sum(n for _, n in self._scored_items[model])
+        scored = self._scored_items[model]
+        items = sum(row[1] for row in scored)
         busy = sum(min(seconds, end - start) for end, seconds in self._busy_spans[model])
         busy += sum(now - max(since, start) for since, m in self._busy_since.values() if m == model)
         if busy < MIN_MEASURED_BUSY_SECONDS or items <= 0:
             return None
-        return items / busy
+        return items, sum(row[2] for row in scored), sum(row[3] for row in scored), busy
+
+    def items_per_second(self, model: ModelKey) -> float | None:
+        """Items one executor of ``model`` scores per second it holds a lease (`_scored_per_second`)."""
+        measured = self._scored_per_second(model)
+        return None if measured is None else measured[0] / measured[3]
+
+    def tokens_per_second(self, model: ModelKey) -> tuple[float, float] | None:
+        """Completion and prompt tokens one executor of ``model`` audits per second it holds a lease: what
+        caps an order's paid tokens (``admin.cap_sizing``)."""
+        measured = self._scored_per_second(model)
+        return None if measured is None else (measured[1] / measured[3], measured[2] / measured[3])
 
     def status(self) -> dict:
         """Per model, what the fleet must know: ``executors_needed`` more
@@ -1698,6 +1712,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         its orders' expected audits want (`executors_wanted`)."""
         document = dispatcher.status()
         document["reuse_auditors_only"] = True
+        document["at"] = time.time()
         # Per model served, its orders' expected audit items; None while one of them is unknown.
         backlog: dict[tuple[str, str], float | None] = {}
         # Per model, the most executors its orders allow (the fastest order's choice), within the control's.
@@ -1725,6 +1740,14 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             entry.update({key: status.get(key) for key in (
                 "state", "prompts_total", "prompts_full", "prompts_complete",
                 "prompts_exhausted", "complete")})
+            # What sizes its cap (``admin.cap_sizing``): its model, cards, and what it paid and has accrued.
+            settler = getattr(served.get(job_id), "settler", None)
+            if settler is not None:
+                job = served[job_id].job
+                entry["sizing"] = {"model": f"{job.checkpoint_repo}@{job.checkpoint_revision}",
+                                   "audit_executors": getattr(served[job_id], "audit_executors", 1),
+                                   "recent_paid": list(settler.recent_paid),
+                                   "open_value": settler.open_value()}
             # What the fleet needs to keep an audit executor for it: none once nothing left may need one.
             auditor = getattr(served.get(job_id), "auditor", None)
             if auditor is not None:
@@ -1744,6 +1767,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             key = f"{model[0]}@{model[1]}"
             live, idle = dispatcher.executor_ids(model)
             rate = dispatcher.items_per_second(model)
+            tokens = dispatcher.tokens_per_second(model)
             # Unknown backlog (a job seeding, a status unreadable): what is wanted stays as it was.
             target = None if expected is None else executors_for_backlog(
                 expected, rate, drain_seconds=drain_seconds,
@@ -1759,6 +1783,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             entry.update({"executors_allowed": min(max_executors, allowed.get(model, 1)),
                           "expected_audits": None if expected is None else round(expected),
                           "items_per_second": rate, "executors_wanted": wanted,
+                          "audit_tokens_per_second": None if tokens is None else tokens[0],
+                          "audit_prompt_tokens_per_second": None if tokens is None else tokens[1],
                           "executors": live, "idle_executors": idle, "releasing": releasing})
             if wanted:
                 entry["executors_needed"] = max(entry.get("executors_needed", 0), wanted - len(live))

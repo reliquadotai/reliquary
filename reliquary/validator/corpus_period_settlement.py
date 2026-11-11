@@ -40,6 +40,8 @@ PERIOD_ARCHIVE_SCHEMA = "reliquary/corpus-period/v1"
 ADMISSION_SLACK_SECONDS = 420.0
 # Periods an undecided submission may hold the close before it is reported.
 STUCK_PERIODS = 6
+# The settled periods whose pay `recent_paid` keeps, newest last (``admin.cap_sizing`` reads them).
+RECENT_PAID_PERIODS = 3
 
 
 def _drand_genesis() -> float:
@@ -106,10 +108,14 @@ class CorpusPeriodSettler:
         self._seeded = False
         # The last period paid: work_period, verified_tokens, paid (pool share).
         self.last_period: dict | None = None
+        # What the last RECENT_PAID_PERIODS settled periods paid (pool share), oldest first.
+        self.recent_paid: list[float] = []
         # Unsettled verdicts by the period they were received in (str key):
         # verdicts, passed, verified_tokens; None before a pass has read them.
         # What the public pay estimate projects the current period from.
         self.open_periods: dict[str, dict] | None = None
+        # The passed prompt tokens of those periods (str key), apart: `open_periods` is a public view.
+        self.open_prompt_tokens: dict[str, int] = {}
         self.open_periods_at: float | None = None
         self.on_settled = on_settled
         self.on_window = None
@@ -131,6 +137,16 @@ class CorpusPeriodSettler:
         self._unsettled.add(submission_id)
         if isinstance(verdict, Mapping):
             self._fed[submission_id] = verdict
+
+    def open_value(self) -> float | None:
+        """The most one unsettled period has accrued so far, in pool share at the price ceiling (prompt
+        tokens at the input price, when there is one); None for a job without a ceiling."""
+        if self._max_price is None:
+            return None
+        prompts = self.open_prompt_tokens
+        return max((row["verified_tokens"] * self._max_price
+                    + prompts.get(period, 0) * (self._max_input_price or 0.0)
+                    for period, row in (self.open_periods or {}).items()), default=0.0)
 
     def set_cap(self, cap: float) -> None:
         self._cap = float(cap)
@@ -157,17 +173,20 @@ class CorpusPeriodSettler:
 
     def _count_open(self, ids, verdicts, voided, genesis: float) -> None:
         counts: dict[str, dict] = {}
+        prompts: dict[str, int] = {}
         for sid in ids:
             verdict = verdicts.get(sid)
             if verdict is None:
                 continue
-            row = counts.setdefault(str(self._work_period(verdict, genesis)),
-                                    {"verdicts": 0, "passed": 0, "verified_tokens": 0})
+            period = str(self._work_period(verdict, genesis))
+            row = counts.setdefault(period, {"verdicts": 0, "passed": 0, "verified_tokens": 0})
             row["verdicts"] += 1
             if verdict.get("passed") and sid not in voided:
                 row["passed"] += 1
                 row["verified_tokens"] += int(verdict.get("token_count") or 0)
+                prompts[period] = prompts.get(period, 0) + int(verdict.get("prompt_token_count") or 0)
         self.open_periods, self.open_periods_at = counts, self._clock()
+        self.open_prompt_tokens = prompts
 
     async def _off(self, func, *args):
         from reliquary.validator.corpus_judge_threads import run_in
@@ -228,6 +247,7 @@ class CorpusPeriodSettler:
         self.settled_count = len(state["settled"] or ())
         self.totals = state.get("totals")
         paid = state.get("period_paid") or {}
+        self.recent_paid = [float(paid[k]) for k in sorted(paid, key=int)[-RECENT_PAID_PERIODS:]]
         if paid:
             last = max(paid, key=int)
             self.last_period = {

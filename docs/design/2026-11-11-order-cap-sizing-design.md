@@ -1,7 +1,7 @@
 # Order caps sized to what an order can pay
 
-Status: proposal. Applies to order jobs (Batch and Evals). Builds on the order price auction
-(`2026-11-10-order-price-auction-design.md`).
+Status: coded (`admin/cap_sizing.py`), off unless the admin sets `RELIQUARY_ORDER_CAP_SIZING=on`. Applies
+to order jobs (Batch and Evals). Builds on the order price auction (`2026-11-10-order-price-auction-design.md`).
 
 ## 1. Problem
 
@@ -24,39 +24,41 @@ validator. So the caps themselves must shrink to what each order can pay.
 An order's paid tokens per period are bounded by its audit cards, not by its miners:
 
 ```
-tokens/period  <=  items/s per card x PERIOD_SECONDS x tokens per item / audit share x cards
-spend/period   <=  ceiling (alpha per Mtoken) x tokens/period / 1e6
-share          =   spend / miner_alpha_per_period
+spend/period  <=  (completion tok/s x price + prompt tok/s x input price) x PERIOD_SECONDS x cards / audit share
 ```
 
-- **items/s per card**: the dispatcher already measures it per model (`items_per_second`, #476), over the
-  time a card holds a lease. Unknown for a model never audited: a default per parameter count, set
-  conservatively high.
-- **tokens per item**: the mean completion of the model's recent orders, else `max_new_tokens`.
+in pool share, with the job's price ceiling (`max_price_per_token`, and the input price when there is one).
+
+- **tokens per second per card**: the dispatcher measures the completion and prompt tokens a card audits per
+  second it holds a lease (`tokens_per_second`, beside `items_per_second` from #476), per model, published in
+  the control status (`audit_tokens_per_second`, `audit_prompt_tokens_per_second`). A model not measured yet
+  takes 2000 tokens a second for each, high on purpose: such an order is sized close to the cap it asked for.
 - **audit share**: the job's `audit_q` (Evals 1.0, Batch 0.2). Records that pass unaudited are paid without
   using the card, so a Batch card lets about five times its own throughput be paid. Using `q` and not the
   measured share (which also counts probation audits) overestimates, which is the safe side.
-- **cards**: the order's `audit_executors`.
+- **cards**: the order's `audit_executors`. Several jobs of one model share its cards; each is sized as if it
+  had them all, which overestimates again.
 
 The price auction only lowers the price under the ceiling, so the real spend stays under this bound.
 
 ## 3. Cap sizing
 
-- **At creation** the admin sets `cap = min(ORDER_CAP_MAX, estimate x HEADROOM)`, with `ORDER_CAP_MAX` the
-  current 0.25 and `HEADROOM` 1.5. The registry guard is unchanged: a new order waits only when the sized
-  caps no longer fit.
-- **Every period** the admin resizes each paying order job:
-  `cap = clamp(max(paid share of the last periods, estimate) x HEADROOM, CAP_FLOOR, ORDER_CAP_MAX)`.
-  - The paid share comes from the settler (`pay.last_period.paid_pool_share`); its max over the last 3
-    periods smooths a quiet period.
-  - The estimate is recomputed with the current measured rate and card count, so a card added mid-order
-    raises the cap before the work it allows is paid.
-  - Lowering always applies. Raising applies while the registry guard accepts it; an order that cannot be
-    raised keeps its cap and is logged.
+- **At creation**, with the switch on and a price ceiling, the admin sets
+  `cap = floor = min(cap asked, max(CAP_FLOOR, estimate x HEADROOM))` and keeps the asked cap as `cap_max`.
+  `HEADROOM` is 1.5, `CAP_FLOOR` 0.002. A replay of the order compares the asked cap, so it is not taken for
+  another contract. The registry guard is unchanged: a new order waits only when the sized caps no longer fit.
+- **Every 5 minutes** the admin resizes each active task with a `cap_max`, from the control status (skipped
+  when older than 10 minutes):
+  `cap = min(cap_max, max(CAP_FLOOR, max(estimate, paid in the last 3 periods, accrued in an open period) x HEADROOM))`.
+  - The control publishes per job (`jobs.<id>.sizing`): its model, cards, what the settler paid in the last 3
+    periods (`recent_paid`) and the most an unsettled period has accrued at the ceiling (`open_value`).
+  - The estimate is recomputed with the current rate and card count, so a card added mid-order raises the cap.
+  - A change under 10 % of the current cap is not written. A raise the registry guard refuses keeps the cap
+    and is logged.
 - The settler pays a period with the cap it holds when it settles that period, so a cap lowered mid-period
-  also bounds the work already done in it. The resize therefore runs right after a period settles, and
-  never lowers a cap under what the open period has accrued so far x `HEADROOM`. Weights stay bounded by
-  `pay_ceiling` (the cap, or the `tail_cap` a lowered task was paid at).
+  also bounds the work already done in it. A resize therefore never goes under the open period's accrued
+  value x `HEADROOM`. Lowering keeps `tail_cap` (the highest cap paid), so weights stay bounded by
+  `pay_ceiling` as for any lowered task.
 
 ## 4. When the pool is really full
 
@@ -78,10 +80,12 @@ for it.
 
 | Piece | Change |
 |---|---|
-| Admin order creation | cap from the estimate instead of `DATASET_JOB_CAP` / `EVAL_JOB_CAP` |
-| Admin | a resize loop once per period, through the existing cap write (`set_cap`) |
-| Control status | already exposes `items_per_second` per model; add the mean completion tokens per model |
-| Registry, settlement, weights | unchanged |
+| Admin order creation | cap sized from the estimate, `cap_max` kept (`RELIQUARY_ORDER_CAP_SIZING=on`) |
+| Admin | resize loop every 5 minutes through the existing cap write (`set_task_cap`) |
+| Dispatcher | audited completion and prompt tokens per second per model |
+| Settler | `recent_paid`, `open_value` (the public `open_periods` view is unchanged) |
+| Control status | `at`; per model token rates; per job `sizing` |
+| Registry, settlement rules, weights | unchanged |
 
 ## 7. Open questions
 
