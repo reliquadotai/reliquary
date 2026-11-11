@@ -83,7 +83,7 @@ reliquary mine \
   --wallet-name YOUR_EXISTING_WALLET \
   --hotkey YOUR_REGISTERED_HOTKEY \
   --wallet-path YOUR_EXISTING_WALLET_DIRECTORY \
-  --validator-url http://62.238.81.36:8000 \
+  --validator-url https://api.reliqua.ai \
   --environments openmathinstruct,opencodeinstruct,reliquary_logic_v2
 ```
 
@@ -94,8 +94,8 @@ optional. Use one miner process per hotkey/state directory.
 Before starting, follow the current operator notice and check readiness:
 
 ```sh
-curl --fail --silent --show-error --max-time 10 http://62.238.81.36:8000/readyz
-curl --fail --silent --show-error --max-time 10 http://62.238.81.36:8000/state
+curl --fail --silent --show-error --max-time 10 https://api.reliqua.ai/readyz
+curl --fail --silent --show-error --max-time 10 https://api.reliqua.ai/state
 ```
 
 A failed readiness check or HTTP 503 means keep the miner paused. This README

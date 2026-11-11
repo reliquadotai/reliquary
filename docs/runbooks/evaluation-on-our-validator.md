@@ -97,7 +97,7 @@ Miners need a build that knows eval-set jobs (main at or after the merge of this
 runbook's PR):
 
 ```bash
-reliquary corpus mine --validator-url http://<validator>:<port> --job-id <job> ...
+reliquary corpus mine --validator-url https://api.reliqua.ai --job-id <job> ...
 ```
 
 Follow it with `reliquary jobs status <job>` until `drained: yes`.
@@ -298,7 +298,7 @@ reliquary jobs create --fleet-knows-corpus-generation \
   them at `/corpus/jobs/<job>/eval-prompts`; miners fetch them there.
 - Miners need a release containing this branch; an older release refuses the
   manifest (unknown `prompt_source`), by design. They mine with
-  `reliquary corpus mine-agentic --validator-url http://<validator>:<port> --job-id <job> ...`
+  `reliquary corpus mine-agentic --validator-url https://api.reliqua.ai --job-id <job> ...`
   (needs only the environment's pinned wheel).
 - Validator: section 3, on a Lium card holding the checkpoint
   (`RELIQUARY_TASK_ID=<job>`, the job's contract, `reliquary validate ...`).
