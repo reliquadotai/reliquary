@@ -532,3 +532,82 @@ def test_a_hold_that_cannot_be_checked_keeps_the_job_held():
     routes = CorpusJobRoutes({"j": object()})
     routes.hold("j", lambda: 1 / 0)
     assert routes.open_jobs() == [] and routes.is_held("j")
+
+
+async def _one_lease(h, now, *, deliver):
+    """One batch leased to "a", then delivered or let expire."""
+    scoring = asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF).score(ITEMS))
+    await asyncio.sleep(0)
+    lease = h.dispatcher.claim(_executor("a"))
+    assert lease is not None
+    if deliver:
+        now[0] += 10.0
+        await h.dispatcher.result("a", lease["lease_id"], _honest())
+        await scoring
+    else:
+        now[0] = lease["expires_at"] + 1
+        await h.dispatcher.sweep()
+        scoring.cancel()
+    return lease
+
+
+def test_a_card_that_loses_two_results_in_a_row_is_set_aside():
+    async def go():
+        now = [0.0]
+        h = _Harness(scorers=1)
+        h.dispatcher._clock = lambda: now[0]
+        await _one_lease(h, now, deliver=False)
+        assert h.quarantined == []
+        await _one_lease(h, now, deliver=False)
+        assert h.quarantined == ["a"]
+    _run(go)
+
+
+def test_a_card_failing_one_call_in_two_is_set_aside_too():
+    async def go():
+        now = [0.0]
+        h = _Harness(scorers=1)
+        h.dispatcher._clock = lambda: now[0]
+        for deliver in (False, True, True, False):
+            await _one_lease(h, now, deliver=deliver)
+        # Two deliveries between the losses are not a clean streak: the count stands.
+        assert h.quarantined == ["a"]
+    _run(go)
+
+
+def test_a_clean_streak_clears_a_lost_result():
+    from reliquary.validator.eval_control import CLEAN_STREAK
+
+    async def go():
+        now = [0.0]
+        h = _Harness(scorers=1)
+        h.dispatcher._clock = lambda: now[0]
+        await _one_lease(h, now, deliver=False)
+        for _ in range(CLEAN_STREAK):
+            await _one_lease(h, now, deliver=True)
+        await _one_lease(h, now, deliver=False)
+        assert h.quarantined == []
+    _run(go)
+
+
+def test_an_audit_lease_lives_twice_the_measured_time_for_its_items():
+    from reliquary.validator.eval_control import (
+        AUDIT_LEASE_FLOOR_SECONDS, LEASE_OVERHEAD_SECONDS, LEASE_TIMES_NEEDED,
+    )
+
+    async def go():
+        now = [0.0]
+        h = _Harness(scorers=1)
+        h.dispatcher._clock = lambda: now[0]
+        await _one_lease(h, now, deliver=True)
+        # One result timed: still the dispatcher's lease seconds.
+        assert h.dispatcher.lease_time(MODEL_A, len(ITEMS)) == h.dispatcher._lease_seconds
+        for _ in range(LEASE_TIMES_NEEDED - 1):
+            await _one_lease(h, now, deliver=True)
+        # Each result took 10 s for 2 items: 5 s an item, twice for 2 items, plus the overhead, over the floor.
+        expected = max(AUDIT_LEASE_FLOOR_SECONDS, 2 * 5.0 * len(ITEMS) + LEASE_OVERHEAD_SECONDS)
+        assert h.dispatcher.lease_time(MODEL_A, len(ITEMS)) == expected
+        assert h.dispatcher.lease_time(MODEL_A, 100) == h.dispatcher._lease_seconds   # never past the ceiling
+        lease = await _one_lease(h, now, deliver=True)
+        assert lease["expires_at"] == now[0] - 10.0 + expected
+    _run(go)
