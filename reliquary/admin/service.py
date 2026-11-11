@@ -45,6 +45,8 @@ ORDER_PRICING_ENV = "RELIQUARY_ORDER_PRICING"
 # No admin request is larger; the bound is checked before the body is read.
 MAX_BODY_BYTES = 1024 * 1024
 DEFAULT_EVAL_CAP = 0.02
+# How long a job's counts are awaited before its last ones answer (``job_counts``).
+COUNTS_WAIT_SECONDS = 20.0
 # A generation order on any model: the cap share it defaults to, and its audit:
 # every submission unless the order asks for a sampled share (`audit_q`), then
 # a hotkey's first 20 audited passes (counted across orders) before sampling starts.
@@ -552,9 +554,13 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     # verdicts are not read again by the delivery and grading that follow.
     verdict_outcomes: dict[str, dict[str, bool]] = {}
     final_jobs: set[str] = set()
+    # Listing a large job takes longer than a caller waits (the platform: 30 s). One count runs at a time per
+    # job, outlives the request that started it, and a caller gets the last counts after COUNTS_WAIT_SECONDS;
+    # a drained job's counts never change.
+    last_counts: dict[str, dict] = {}
+    counting: dict[str, asyncio.Future] = {}
 
-    async def job_counts(job_id: str) -> dict:
-        """The stored counts; ``final`` gates grading and delivery, ``drained`` only pay."""
+    async def read_counts(job_id: str) -> dict:
         from reliquary.validator.corpus_job_status import stored_job_counts
 
         known = job_id in final_jobs
@@ -564,7 +570,25 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             counts["final"] = True
             final_jobs.add(job_id)
             verdict_outcomes.pop(job_id, None)
+        last_counts[job_id] = counts
         return counts
+
+    async def job_counts(job_id: str) -> dict:
+        """The stored counts; ``final`` gates grading and delivery, ``drained`` only pay."""
+        last = last_counts.get(job_id)
+        if last is not None and last["drained"]:
+            return dict(last)
+        running = counting.get(job_id)
+        if running is None:
+            running = counting[job_id] = asyncio.ensure_future(read_counts(job_id))
+            running.add_done_callback(lambda done, j=job_id: (
+                counting.pop(j, None), done.cancelled() or done.exception()))
+        try:
+            return dict(await asyncio.wait_for(asyncio.shield(running), COUNTS_WAIT_SECONDS))
+        except asyncio.TimeoutError:
+            if last is not None:
+                return dict(last)
+            return dict(await asyncio.shield(running))
 
     async def draining_limits(new_cap: float):
         """The cap guard, counting retired corpus tasks whose job has not drained."""
