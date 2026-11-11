@@ -118,6 +118,9 @@ WINDOW_EPSILON_SECONDS = 1e-3
 # Propagation slack after the draw round's publication before it is fetched:
 # asking too early reads as "no beacon", which audits (safe, but wastes the sampling).
 BEACON_GRACE_SECONDS = 2.0
+# How long after its receipt a sampled record's draw round is out (the round after receipt's next, two drand
+# periods, plus BEACON_GRACE_SECONDS) and the undecidable retry has come back to it (`audit_backlog`).
+DRAW_WAIT_SECONDS = 12.0
 # How long a round that just failed to fetch is left unfetched before the next
 # attempt: every sampled submission whose draw lands on a bad round would
 # otherwise refetch it once per judging pass.
@@ -537,9 +540,24 @@ class CorpusAuditor:
 
     def audit_backlog(self) -> int:
         """Records due for judging now and not yet taken: the audit queue a job priced by auction opens its leases
-        by (``corpus.token_auction``). Records waiting out their hold are not counted."""
+        by (``corpus.token_auction``). Records waiting out their hold are not counted, nor, on a sampled job,
+        records received less than DRAW_WAIT_SECONDS ago: their draw round is not out yet, so they wait for the
+        clock, not for the audit, and counting them would cap the job's flow at the backlog mark whatever its
+        audit card could take."""
         now = self._clock()
-        return sum(1 for at in self._due.values() if at <= now)
+        sampled = self._params.q < 1.0
+        cutoff = now - DRAW_WAIT_SECONDS
+        count = 0
+        for submission_id, at in self._due.items():
+            if at > now:
+                continue
+            if sampled:
+                received = (self._meta[submission_id][1] if submission_id in self._meta
+                            else self._seen_at.get(submission_id))
+                if received is not None and received > cutoff:
+                    continue
+            count += 1
+        return count
 
     def pending_count(self, hotkey: str) -> int:
         """Records of ``hotkey`` read and awaiting a verdict."""

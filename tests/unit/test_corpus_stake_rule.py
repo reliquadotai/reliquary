@@ -300,3 +300,21 @@ def test_only_a_forced_draw_record_with_a_short_completion_is_short():
     auditor._remember("d" * 64, {"hotkey": HK, "received_at": T0, "token_count": 500})
     # Read even without the stake rule; a record never read in full is left to the usual rules.
     assert [auditor._short_draw(sid * 64) for sid in "bcd"] == [True, False, False]
+
+
+def test_the_audit_backlog_leaves_out_records_still_waiting_for_their_draw():
+    from reliquary.validator.corpus_auditor import DRAW_WAIT_SECONDS
+
+    clock = _Clock(T0)
+    sampled = _auditor(_Store({}), clock)
+    full = CorpusAuditor(job_id="order-eval-x", records=_Store({}), model=_model(0), tokenizer=_Tokenizer(),
+                         proof=PROOF, params=AuditParams(q=1.0, hold_seconds=HOLD), miner_states=_States({}),
+                         beacon=_Beacon(), round_at=_round_at, clock=clock, accept_slack_seconds=0.0)
+    for auditor in (sampled, full):
+        for sid in _ids(False, 3):
+            auditor.enqueue(sid)
+    # Just received: a sampled job's records wait for their draw round, not for the audit.
+    assert sampled.audit_backlog() == 0
+    assert full.audit_backlog() == 3
+    clock.now = T0 + DRAW_WAIT_SECONDS + 1
+    assert sampled.audit_backlog() == 3
