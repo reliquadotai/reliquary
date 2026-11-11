@@ -107,7 +107,12 @@ def test_one_process_serves_eval_jobs_of_two_models(world, monkeypatch):
     async def idle(self):
         await asyncio.sleep(3600)
 
-    monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", idle)
+    async def seeded_idle(self):
+        # Read back at once, then idle: the job may open to miners once its executor claims.
+        self.seeded.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", seeded_idle)
     monkeypatch.setattr(corpus_period_settlement.CorpusPeriodSettler, "settle_once", lambda self: idle(self))
     from reliquary.validator import corpus_validator
 
@@ -289,7 +294,12 @@ def test_a_drained_eval_job_is_unwired_and_releases_what_it_held(world, monkeypa
     async def nothing(self):
         return []
 
-    monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", idle)
+    async def seeded_idle(self):
+        # Read back at once, then idle: the job may open to miners once its executor claims.
+        self.seeded.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(corpus_auditor.CorpusAuditor, "run", seeded_idle)
     monkeypatch.setattr(corpus_auditor.CorpusAuditor, "pending_ids", nothing)
     monkeypatch.setattr(corpus_period_settlement.CorpusPeriodSettler, "settle_once", lambda self: idle(self))
 

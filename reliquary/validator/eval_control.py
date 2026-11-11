@@ -1572,7 +1572,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         # Miners wait for the audit: what they would send before an executor of the model has
         # loaded it would only wait unaudited, or be lost on an order that never gets one.
         protocol = AUDIT_PROTOCOL_V3 if has_draw(job) else None
-        routes.hold(str(job.job_id), lambda: dispatcher.audit_ready(key, protocol))
+        # And until its auditor has read the job back (a restart): what miners send before would pile up unjudged.
+        routes.hold(str(job.job_id), lambda: w.auditor.seeded.is_set() and dispatcher.audit_ready(key, protocol))
         if (declared or {}).get("reuse_auditors_only") is True:
             dispatcher.reuse_only_jobs.add(job.job_id)
         served[job.job_id] = w
@@ -1592,6 +1593,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         wire_signed_grader(w, judge_records=records, parse_executor=grade_parse_threads)
 
     async def settle_forever(w, every: float = 60.0) -> None:
+        # After the auditor's start: its listing and reads come first after a restart.
+        await w.auditor.seeded.wait()
         while True:
             try:
                 await w.settler.settle_once()
