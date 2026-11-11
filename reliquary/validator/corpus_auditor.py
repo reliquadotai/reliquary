@@ -299,6 +299,9 @@ class CorpusAuditor:
         # When this process first heard of each id (enqueued or seeded): the
         # arrival bound of a pending id whose record is not read yet.
         self._seen_at: dict[str, float] = {}
+        # Set once `run` listed and read the job's pending records: a restarted control holds the job from
+        # miners and its backfills until then, so its first pass is not queued behind them.
+        self.seeded = asyncio.Event()
         # Pending ids with no known arrival (found by a listing, unreadable):
         # when this process first counted them, and those given up on.
         self._unknown_since: dict[str, float] = {}
@@ -2071,6 +2074,7 @@ class CorpusAuditor:
 
     async def run(self) -> None:
         await self._start()
+        self.seeded.set()
         reconcile = (asyncio.create_task(self._reconcile_quietly()) if self._slot_store is not None else None)
         rescan = asyncio.create_task(self._rescan_forever())
         prefetch = (asyncio.create_task(self._prefetch_forever())

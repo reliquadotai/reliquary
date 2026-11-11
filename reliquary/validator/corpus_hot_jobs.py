@@ -607,7 +607,10 @@ class CorpusJobSet:
                 raise RuntimeError(f"the judge of {job_id} does not serve it")
             book, pending = JudgedBook(judged), int(judged["pending"])
         else:
-            book.start_backfill()
+            seeded = getattr(wiring.auditor, "seeded", None)
+            # Not before the auditor's start: after a restart its listing comes first.
+            if seeded is None or seeded.is_set():
+                book.start_backfill()
             pending = wiring.auditor.pending_count(hotkey)
         state, _ = await wiring.miner_states.state_at_most(hotkey, MINER_STATUS_CACHE_SECONDS)
         status = miner_status(job_id=job_id, hotkey=hotkey, book=book,
