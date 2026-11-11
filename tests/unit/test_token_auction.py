@@ -251,13 +251,21 @@ def test_the_lease_time_follows_the_hotkeys_deliveries():
     assert auction.lease_seconds("5A", 3600.0) == 3600.0
     for seconds in (400, 500, 600):
         auction.observe_delivery("5A", seconds)
-    assert auction.lease_seconds("5A", 3600.0) == pytest.approx(1000.0)
+    assert auction.lease_seconds("5A", 3600.0) == pytest.approx(1200.0)     # twice its slow delivery
     for _ in range(20):
         auction.observe_delivery("fast", 10)
     assert auction.lease_seconds("fast", 3600.0) == LEASE_FLOOR_SECONDS
     for _ in range(3):
         auction.observe_delivery("slow", 5000)
     assert auction.lease_seconds("slow", 3600.0) == 3600.0
+
+
+def test_a_batch_miners_slow_deliveries_set_its_lease_not_its_median():
+    # 2026-11-11: a miner delivering in 50-280 s had 300 s leases (twice its 101 s median) and lost whole batches.
+    auction, _, _ = _auction()
+    for seconds in (50, 60, 70, 80, 90, 100, 101, 110, 120, 130, 140, 147, 150, 160, 170, 180, 200, 230, 260, 278):
+        auction.observe_delivery("batch", seconds)
+    assert auction.lease_seconds("batch", 3600.0) == pytest.approx(2 * 230.0)     # its 18th of 20
 
 
 # ------------------------------------------------------------------ views and state
@@ -286,7 +294,7 @@ def test_the_state_survives_a_restart(tmp_path):
     again, _, book = _auction(state_path=path, clock=clock)
     assert again.debt_alpha("5A") == pytest.approx(auction.debt_alpha("5A"))
     assert again.ask_of("5A") == pytest.approx(auction.ask_of("5A"))
-    assert again.lease_seconds("5A", 3600.0) == pytest.approx(1000.0)
+    assert again.lease_seconds("5A", 3600.0) == pytest.approx(1200.0)
     again.take_debit("5A", 1.0)
     assert _fill(again, book, "5A") == (4, ALLOWANCE_FULL)      # still halved
 

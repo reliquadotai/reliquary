@@ -29,7 +29,6 @@ import json
 import logging
 import math
 import os
-import statistics
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -72,6 +71,8 @@ LATE_RELEASE = 0.5
 # Lease time: twice the median of a hotkey's recent deliveries, once it has this many, within [floor, the job's].
 DELIVERIES_KEPT = 20
 DELIVERIES_NEEDED = 3
+# The share of a hotkey's recent deliveries its lease time covers twice over (`lease_seconds`).
+DELIVERY_TAIL = 0.9
 LEASE_FLOOR_SECONDS = 300.0
 # The mean submission size, in tokens, an unused lease is charged at: an EMA of accepted submissions.
 TOKENS_EMA_WEIGHT = 0.05
@@ -307,12 +308,17 @@ class TokenAuction:
                 del self._reserved[terms.hotkey]
 
     def lease_seconds(self, hotkey: str, default: float) -> float:
-        """How long ``hotkey``'s next lease lasts: twice its recent median delivery, within [floor, ``default``]."""
+        """How long ``hotkey``'s next lease lasts: twice its recent slow delivery (the DELIVERY_TAIL quantile of
+        the last DELIVERIES_KEPT), within [floor, ``default``]."""
         with self._lock:
             times = self._deliveries.get(hotkey)
             if not times or len(times) < DELIVERIES_NEEDED:
                 return float(default)
-            return min(float(default), max(LEASE_FLOOR_SECONDS, 2.0 * statistics.median(times)))
+            # Its slow deliveries, not its median: a miner working in batches delivers a whole batch at once,
+            # and a lease cut at twice its median expired every lease of a batch a little slower than usual.
+            ordered = sorted(times)
+            tail = ordered[math.ceil(DELIVERY_TAIL * len(ordered)) - 1]
+            return min(float(default), max(LEASE_FLOOR_SECONDS, 2.0 * tail))
 
     def observe_delivery(self, hotkey: str, seconds: float) -> None:
         """A lease of ``hotkey`` was delivered ``seconds`` after its grant."""
