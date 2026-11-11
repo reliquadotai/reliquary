@@ -37,7 +37,7 @@
   ·
   <a href="https://github.com/orgs/reliquadotai/packages/container/package/reliquary-validator">Container</a>
   ·
-  <a href="docs/mining.md">Mine</a>
+  <a href="docs/mining-orders.md">Mine</a>
   ·
   <a href="docs/validating.md">Validate</a>
 </p>
@@ -54,106 +54,12 @@ The key incentive shift is simple: miners are not paid for producing the most
 rollouts. They compete to contribute verified rollout groups the trainer can
 use.
 
-## V1.0 miner migration
+## Mining
 
-Adapt your existing miner deployment; no separate starter package is required.
-Stop the old miner before starting V1 and preserve your registered hotkey,
-miner state directory and Hugging Face cache.
+Miners today generate customers' **Batch and Evals orders**, priced by auction and paid per verified token:
+see **[Mining orders](docs/mining-orders.md)**. One address: `https://api.reliqua.ai`.
 
-Use the pinned miner image (the controller has additional server-only fixes):
-
-```sh
-docker pull ghcr.io/reliquadotai/reliquary-validator:sha-3b3af1d-logic@sha256:7bb847499605308b1ad7b21f5430b1662eae506deacb6899d682bc0c11ce2742
-```
-
-Set these variables **inside your existing miner service or container**:
-
-```dotenv
-RELIQUARY_PROTOCOL_PROFILE=qwen3-4b-base-dapo-reliquary-v1
-RELIQUARY_EXPERIMENTAL_FILL_CLOSED_ENABLED=1
-RELIQUARY_TRAINING_RUN_ID=qwen3-4b-base-dapo-reliquary-v1-20260910
-```
-
-Keep your existing GPU selection, wallet mounts and persistent state/cache
-paths. Inside that configured environment, adapt your existing miner command:
-
-```sh
-reliquary mine \
-  --network finney --netuid 81 \
-  --wallet-name YOUR_EXISTING_WALLET \
-  --hotkey YOUR_REGISTERED_HOTKEY \
-  --wallet-path YOUR_EXISTING_WALLET_DIRECTORY \
-  --validator-url https://api.reliqua.ai \
-  --environments openmathinstruct,opencodeinstruct,reliquary_logic_v2
-```
-
-Choose any nonempty subset of **Math** (`openmathinstruct`), **Code**
-(`opencodeinstruct`) and **Logic** (`reliquary_logic_v2`). Running all three is
-optional. Use one miner process per hotkey/state directory.
-
-Before starting, follow the current operator notice and check readiness:
-
-```sh
-curl --fail --silent --show-error --max-time 10 https://api.reliqua.ai/readyz
-curl --fail --silent --show-error --max-time 10 https://api.reliqua.ai/state
-```
-
-A failed readiness check or HTTP 503 means keep the miner paused. This README
-is configuration guidance, not a live GO notice. The initial V1 checkpoint is
-**N1812**, repository `ReliquaryForge/qwen3-4b-base-dapo-v4`, revision
-`6c3f02be8e720d3ccfd1bd320de8ea7f864a04e6`. Follow the validator's advertised
-successor checkpoints automatically; do not permanently pin N1812 or delete
-checkpoint identity records to bypass a mismatch.
-
-V1 uses **fill-closed windows**. Follow the deadlines and phase in `/state`:
-windows may close underfilled, and an upload acknowledgement is not a final
-proof, selection or payment verdict. No extra controller bounded-service flag
-is needed on miners. See [Mining](docs/mining.md) for the submission lifecycle.
-
-Logic uses a pinned integration with the **Prime Intellect Verifiers format
-for supported environment contracts**. This supports further integrations;
-it does not certify every Prime environment.
-
-## Legacy auction profile loop
-
-The fixed-window values below describe the legacy auction profiles. For V1
-configuration and fill-closed timing, use the migration instructions above and
-the validator's advertised runtime state.
-
-<p align="center">
-  <img
-    src="docs/assets/readme/protocol-loop.svg"
-    alt="Reliquary protocol loop: mine, grade, rank, prove, accumulate, train, and publish"
-    width="100%"
-  />
-</p>
-
-1. **Collect.** Math and Code each accept up to 96 productive candidates. The
-   100-second profile value is a hard ceiling; a GPU-aware quiet/drain check may
-   close from 60 seconds onward, after the primary 64-candidate population.
-   Every group contains exactly 16 rollouts.
-2. **Grade.** The validator recomputes Math rewards and executes Code cases in
-   its sandbox. Groups below the reward-variance gate are rejected.
-3. **Rank.** In-zone groups rank by
-   `std(rewards) × (1 − mean(rewards))`; equal values use a capped throughput
-   bucket, then a post-seal drand tie-break. Validator-observed arrival is used
-   once, as the throughput denominator, not again as a second speed preference.
-4. **Prove.** Economic proof runs top-down only for candidates that can still
-   win. A bounded, unpaid non-winner sample is also proven for forensic
-   telemetry and cannot affect the auction.
-5. **Select and reward.** At most 16 content-distinct groups win per
-   environment. Each winner receives one uniform slot. There is no active
-   runner-up split or per-operator winner cap; unfilled slots burn.
-6. **Retain and train.** Clean winners accumulate under one exact public
-   checkpoint until both environment targets are full. Quarantined selections
-   remain archived and credited but never enter the optimizer.
-7. **Publish.** Accepted optimizer steps produce a Hugging Face checkpoint. The
-   default cadence is 16 trained steps, with an earlier safe publication when
-   the behavior-policy drift gate requires it.
-
-The normative mechanism and rejection semantics live in
-[Concepts](docs/concepts.md). Historical design documents are evidence of how
-the protocol evolved; they are not the production contract.
+The V1 RL run ended on 2026-11-02; its miner instructions are kept in [mining.md](docs/mining.md) for reference.
 
 ## Feature status
 
@@ -226,6 +132,7 @@ running an operator workload.
 | Guide | Purpose |
 | --- | --- |
 | [Concepts](docs/concepts.md) | Current mechanism, incentives, verification, and economics |
+| [Mining orders](docs/mining-orders.md) | Batch and Evals orders: the command, the order list, the price auction |
 | [Mining](docs/mining.md) | Reference miner, submission lifecycle, hardware, and troubleshooting |
 | [Validating](docs/validating.md) | Weight-only and trainer deployment |
 | [Validator observability](docs/validator_observability.md) | Health, verdict, archive, and runtime evidence |
