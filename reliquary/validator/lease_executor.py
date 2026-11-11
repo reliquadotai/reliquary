@@ -23,12 +23,41 @@ TOKEN_ENV = "RELIQUARY_EXECUTOR_TOKEN"
 RESULT_POST_ATTEMPTS = 5
 RESULT_RETRY_SECONDS = 120.0
 RESULT_RETRY_BACKOFF_SECONDS = (5.0, 10.0, 20.0, 40.0)
+# With the lease's expiry known: posted again until it, for at most this long.
+RESULT_KEEP_SECONDS = 600.0
 _RETRIED_STATUSES = frozenset({502, 503, 504})
 # uvicorn closes a keep-alive connection idle for 5 s (its default) and the
 # grade executor polls every 5 s: a pooled connection reused at that moment
 # is closed under the request ("Server disconnected without sending a
 # response"). Idle connections are dropped well before the control's close.
 KEEPALIVE_EXPIRY_SECONDS = 2.0
+
+
+_RESOLVED: dict[tuple, list] = {}
+
+
+def install_resolver_cache() -> None:
+    """Keep the last addresses each name resolved to and answer with them when a lookup fails: a rented
+    card's resolver can fail one call in two (2026-11-11: results computed and never posted), and the client
+    opens a new connection, so a new lookup, every few seconds. Only names that resolved once are answered."""
+    import socket
+
+    real = getattr(socket.getaddrinfo, "__wrapped__", socket.getaddrinfo)
+
+    def getaddrinfo(host, port, *args, **kwargs):
+        key = (host, port, args, tuple(sorted(kwargs.items())))
+        try:
+            answer = real(host, port, *args, **kwargs)
+        except socket.gaierror:
+            if key in _RESOLVED:
+                logger.warning("name lookup of %s failed; using its last addresses", host)
+                return list(_RESOLVED[key])
+            raise
+        _RESOLVED[key] = list(answer)
+        return answer
+
+    getaddrinfo.__wrapped__ = real
+    socket.getaddrinfo = getaddrinfo
 
 
 def client_limits():
@@ -126,9 +155,13 @@ class LeaseExecutor:
                     raise
                 delay = RESULT_RETRY_BACKOFF_SECONDS[
                     min(attempt - 1, len(RESULT_RETRY_BACKOFF_SECONDS) - 1)]
-                if (attempt >= RESULT_POST_ATTEMPTS
-                        or self._clock() - started + delay > RESULT_RETRY_SECONDS
-                        or (expires_at is not None and self._wall_clock() + delay >= expires_at)):
+                # With the lease's expiry known, a result is posted again until then (at most
+                # RESULT_KEEP_SECONDS): a computed result is worth more than the attempts it takes. Without it,
+                # the attempt and time bounds apply.
+                if (expires_at is not None and (self._wall_clock() + delay >= expires_at
+                                                or self._clock() - started + delay > RESULT_KEEP_SECONDS)) or (
+                        expires_at is None and (attempt >= RESULT_POST_ATTEMPTS
+                                                or self._clock() - started + delay > RESULT_RETRY_SECONDS)):
                     logger.error("%s lease %s: result not delivered after %d attempt(s): %r",
                                  self.kind, lease_id[:8], attempt, exc)
                     raise
@@ -183,6 +216,7 @@ def serve_executor(control_url: str, build: Callable[..., LeaseExecutor]) -> Non
     import httpx
 
     token = os.environ.get(TOKEN_ENV, "").strip()
+    install_resolver_cache()
 
     async def main() -> None:
         async with httpx.AsyncClient(base_url=control_url.rstrip("/"),
@@ -194,4 +228,4 @@ def serve_executor(control_url: str, build: Callable[..., LeaseExecutor]) -> Non
 
 __all__ = ["ERROR_BACKOFF_SECONDS", "LeaseExecutor", "REQUEST_TIMEOUT_SECONDS",
            "RESULT_POST_ATTEMPTS", "RESULT_RETRY_SECONDS", "TOKEN_ENV", "client_limits",
-           "serve_executor"]
+           "install_resolver_cache", "serve_executor"]
