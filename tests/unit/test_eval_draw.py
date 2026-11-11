@@ -463,3 +463,29 @@ def test_a_free_job_never_reopens_a_slot():
     auditor = _draw_auditor(_job(), records, None)
     asyncio.run(auditor._write("b" * 64, {"passed": False}))
     assert asyncio.run(auditor.reconcile_failures()) == 0
+
+
+def test_a_failure_reconcile_reads_its_verdicts_in_parallel():
+    """One by one, 10k verdicts kept a restarted control from auditing for ~10 minutes (2026-11-11)."""
+    import asyncio
+
+    from reliquary.validator.corpus_auditor import RECONCILE_READS, failed_verdicts
+
+    class _Slow:
+        def __init__(self):
+            self.inflight = self.most = 0
+
+        async def read_verdict(self, job_id, sid):
+            self.inflight += 1
+            self.most = max(self.most, self.inflight)
+            await asyncio.sleep(0.01)
+            self.inflight -= 1
+            return {"passed": sid.startswith("ok")}
+
+        async def list_voided_ids(self, job_id):
+            return ["ok-void"]
+
+    records = _Slow()
+    ids = [f"ok-{i}" for i in range(40)] + ["bad-1", "ok-void"]
+    assert asyncio.run(failed_verdicts(records, "j", ids)) == ["bad-1", "ok-void"]
+    assert 1 < records.most <= RECONCILE_READS

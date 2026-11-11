@@ -956,24 +956,31 @@ def eval_auditor(**kwargs):
             prompt without its slot)."""
             if not self.reopen_slots:
                 return 0
+            from reliquary.validator.corpus_auditor import failed_verdicts
+
             ids = list(await self._records.list_verdict_ids(self._job_id))
-            lister = getattr(self._records, "list_voided_ids", None)
-            voided = set(await lister(self._job_id)) if lister is not None else set()
-            failed = []
-            for submission_id in ids:
-                verdict = await self._records.read_verdict(self._job_id, submission_id)
-                if verdict and (not verdict.get("passed") or submission_id in voided):
-                    failed.append(submission_id)
+            failed = await failed_verdicts(self._records, self._job_id, ids)
             for submission_id in failed:
                 await self._record_failure(submission_id)
             return len(failed)
 
-        async def run(self):
+        async def _reconcile_behind(self):
             try:
                 await self.reconcile_failures()
             except Exception:
                 logger.exception("eval job %s: failure reconcile failed", self._job_id)
-            await super().run()
+
+        async def run(self):
+            # Behind the audit, not before it: a restarted control must not leave the job unaudited while
+            # its verdicts are read (2026-11-11: ~10 minutes for 10k verdicts).
+            # The base run reconciles a forced-draw job's failures itself (`_reconcile_quietly`).
+            reconcile = (None if getattr(self, "_slot_store", None) is not None
+                         else asyncio.ensure_future(self._reconcile_behind()))
+            try:
+                await super().run()
+            finally:
+                if reconcile is not None:
+                    reconcile.cancel()
 
     vocab_size = kwargs.pop("vocab_size")
     job = kwargs.pop("job", None)

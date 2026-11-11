@@ -118,6 +118,8 @@ WINDOW_EPSILON_SECONDS = 1e-3
 # Propagation slack after the draw round's publication before it is fetched:
 # asking too early reads as "no beacon", which audits (safe, but wastes the sampling).
 BEACON_GRACE_SECONDS = 2.0
+# Verdicts a failure reconcile reads at once: read one by one, 10k verdicts took ~10 minutes (2026-11-11).
+RECONCILE_READS = 16
 # How long after its receipt a sampled record's draw round is out (the round after receipt's next, two drand
 # periods, plus BEACON_GRACE_SECONDS) and the undecidable retry has come back to it (`audit_backlog`).
 DRAW_WAIT_SECONDS = 12.0
@@ -1163,13 +1165,7 @@ class CorpusAuditor:
         if self._slot_store is None:
             return 0
         ids = list(await self._records.list_verdict_ids(self._job_id))
-        lister = getattr(self._records, "list_voided_ids", None)
-        voided = set(await lister(self._job_id)) if lister is not None else set()
-        failed = []
-        for submission_id in ids:
-            verdict = await self._records.read_verdict(self._job_id, submission_id)
-            if verdict and (not verdict.get("passed") or submission_id in voided):
-                failed.append(submission_id)
+        failed = await failed_verdicts(self._records, self._job_id, ids)
         for submission_id in failed:
             await self._reopen_slot(submission_id)
         return len(failed)
@@ -2107,6 +2103,21 @@ class CorpusAuditor:
             for task in (rescan, *others):
                 task.cancel()
             await asyncio.gather(rescan, *others, return_exceptions=True)
+
+
+async def failed_verdicts(records, job_id: str, ids: list[str]) -> list[str]:
+    """The ids among ``ids`` whose verdict failed or whose record was voided, read RECONCILE_READS at a time."""
+    lister = getattr(records, "list_voided_ids", None)
+    voided = set(await lister(job_id)) if lister is not None else set()
+    gate = asyncio.Semaphore(RECONCILE_READS)
+
+    async def failed(submission_id):
+        async with gate:
+            verdict = await records.read_verdict(job_id, submission_id)
+        return bool(verdict) and (not verdict.get("passed") or submission_id in voided)
+
+    outcomes = await asyncio.gather(*(failed(sid) for sid in ids))
+    return [sid for sid, out in zip(ids, outcomes) if out]
 
 
 def _finite(value):
