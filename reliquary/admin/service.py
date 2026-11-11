@@ -573,6 +573,21 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         last_counts[job_id] = counts
         return counts
 
+    async def job_miner_pay(job_id: str, entries) -> dict | None:
+        """What the job's miners were paid per settled period (``corpus_job_status.miner_pay``); None when the
+        settlement is unreadable."""
+        from reliquary.validator import corpus_periods as cp
+        from reliquary.validator.corpus_job_status import miner_pay
+
+        try:
+            state, _ = await records.read_settlement(job_id)
+        except Exception:
+            logger.warning("admin: the settlement of %s is unreadable", job_id, exc_info=True)
+            return None
+        emission = next((e.params.get(cp.MAX_PRICE_EMISSION_PARAM) for e in entries
+                         if e.params.get(cp.MAX_PRICE_EMISSION_PARAM) is not None), None)
+        return miner_pay(state, emission)
+
     async def job_counts(job_id: str) -> dict:
         """The stored counts; ``final`` gates grading and delivery, ``drained`` only pay."""
         last = last_counts.get(job_id)
@@ -1444,11 +1459,12 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=404, detail="job_unknown")
         counts = await job_counts(job_id)
         entries = await entries_naming(job_id)
+        pay = await job_miner_pay(job_id, entries)
         tasks = [{"task_id": e.task_id, "status": e.status, "cap": float(e.params["cap"]),
                   **({"max_price": price_of(e)} if price_of(e) is not None else {})}
                  for e in entries]
         manifest = job.to_contract()
-        return {"job_id": job_id, **counts, "manifest": manifest, "tasks": tasks,
+        return {"job_id": job_id, **counts, "miner_pay": pay, "manifest": manifest, "tasks": tasks,
                 "manifest_sha256": canonical_sha256(manifest),
                 "profile_sha256": entries[0].profile_sha256 if len(entries) == 1 else None,
                 "task_contracts": [task_document(e) for e in entries]}
