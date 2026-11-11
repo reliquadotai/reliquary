@@ -1134,8 +1134,9 @@ async def read_control_status(**client_kwargs) -> dict | None:
 def order_job_refusal(entry, job) -> str | None:
     """Why the order control will not serve a registry entry, or None: an eval
     job draws from its eval set, a generation order from a packaged catalog
-    source through the model's chat template; both carry an enforced TOPLOC
-    proof on the job's own checkpoint."""
+    source or a set through the model's chat template, or from an agentic set
+    in the signed sandbox; both carry an enforced TOPLOC proof on the job's own
+    checkpoint."""
     from reliquary.eval.prompt_source import is_eval_job_id, is_eval_source, is_gen_job_id
     from reliquary.protocol import profiles
 
@@ -1162,7 +1163,14 @@ def order_job_refusal(entry, job) -> str | None:
                 return refusal
             if getattr(entry, "contract", None) is not None and declared != [job.prompt_source]:
                 return f"its contract declares environments {declared}, not {job.prompt_source!r} alone"
-        if job.renderer_id not in CHAT_TEMPLATE_RENDERERS:
+        if getattr(job, "episode", None) is not None:
+            # An agentic batch: a set's tasks, in the signed sandbox, which grades every episode; its renderer is
+            # the episode's (checked by architecture below).
+            if not is_eval_source(job.prompt_source):
+                return "an agentic generation order draws from a set"
+            if not is_signed_sandbox(job):
+                return "an order plays an episode only in the signed sandbox"
+        elif job.renderer_id not in CHAT_TEMPLATE_RENDERERS:
             return f"renderer {job.renderer_id!r} is not the model's chat template"
         if getattr(job, "submit", None) != "scoped":
             # Its miners would post to /corpus/submit, which this control lacks.

@@ -443,6 +443,25 @@ def _current_round() -> int:
     return make_round_at(chain["genesis_time"], chain["period"])(time.time()) - 1
 
 
+async def episode_delivery_context(job) -> dict:
+    """What a signed episode job's v3 delivery reads its trajectories with, as `jobs export --sft` builds it: the
+    job's turn renderer (its checkpoint's tokenizer files only), its task source (its set's rows, checked against
+    the bridged env) and the registry's quarantined grade executors. ValueError when this host cannot."""
+    from reliquary.environment import agentic_swe
+    from reliquary.infrastructure import corpus_executor_store as executor_store
+    from reliquary.validator.eval_control import _model_files
+
+    try:
+        tokenizer_dir = await asyncio.to_thread(_model_files, job.checkpoint_repo, job.checkpoint_revision)
+        renderer = await asyncio.to_thread(agentic_swe.job_turn_renderer, job, tokenizer_dir)
+        source = await asyncio.to_thread(agentic_swe.job_signed_source, job)
+    except ImportError as exc:
+        raise ValueError(f"this host cannot parse signed episodes: {exc}") from exc
+    quarantined = sorted(str(d.get("executor_id")) for d in await executor_store.list_executors()
+                         if executor_store.scope_of(d) == "grade" and d.get("status") == "quarantined")
+    return {"renderer": renderer, "source": source, "quarantined": quarantined}
+
+
 def create_admin_app(*, secret: bytes, pool_max: float,
                      models: Mapping[str, QualifiedModel | Mapping], deliveries=None,
                      records=None, clock: Callable[[], float] = time.time,
@@ -453,14 +472,17 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      require_sandbox=None, qualifications=None, eval_jobs=None,
                      model_facts=None, evaluation_sessions=None, pin_model=None,
                      upload_tokenizer=None, subnet_pool=None, tao_usd=None,
-                     sandbox_machine_prefix: str | None = None, sandbox_machines=None) -> FastAPI:
+                     sandbox_machine_prefix: str | None = None, sandbox_machines=None,
+                     episode_delivery=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
     ``eval_store`` the subnet bucket holding the eval sets' grading files.
     ``subnet_pool`` (async, ``chain.subnet_pool``'s answer) and ``tao_usd``
     (async, USD per TAO) convert an order's USD token ceiling. ``sandbox_machine_prefix``
     turns on the sandbox machine routes for the machines named with it (the platform's rented
-    gateways) and only those; ``sandbox_machines`` is the machine directory (``sandbox_store``)."""
+    gateways) and only those; ``sandbox_machines`` is the machine directory (``sandbox_store``).
+    ``episode_delivery`` (async, job -> {renderer, source, quarantined}) is what a signed episode job's v3
+    delivery parses its trajectories with (default: ``episode_delivery_context``)."""
     from reliquary.infrastructure import corpus_executor_store as executors
     from reliquary.infrastructure import corpus_job_store as job_store
     from reliquary.infrastructure import task_registry_store as registry_store
@@ -509,6 +531,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
             # The model's own config and tokenizer files, on CPU (no weights).
             return await asyncio.to_thread(read_facts, repo, revision)
+    if episode_delivery is None:
+        async def episode_delivery(job) -> dict:
+            return await episode_delivery_context(job)
     if pin_model is None:
         def pin_model(repo: str, revision: str):
             from reliquary.orders import models
@@ -903,8 +928,13 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 raise HTTPException(status_code=422, detail="an order on a set starts at its first problem")
             card, prompts_body = await read_set(body.eval_set_id)
             if not evaluation and card.get("source_kind") != "upload":
-                # Our sets are held out: their completions are never deliverable training data.
-                raise HTTPException(status_code=422, detail="a generation order draws from an upload, not an eval set")
+                from reliquary.eval.sets import batch_set_refusal
+
+                # Our eval sets are held out: their completions are never deliverable training data. An agentic set
+                # frozen for batch is not one.
+                refusal = batch_set_refusal(card)
+                if refusal is not None:
+                    raise HTTPException(status_code=422, detail=refusal)
             if card.get("source_kind") == "upload":
                 if (card.get("model"), card.get("revision")) != (body.model, body.revision):
                     raise HTTPException(status_code=422, detail="the upload was rendered for another model")
@@ -931,7 +961,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             declared_source = {"set_id": source.set_id, "problems": body.prompt_count}
         else:
             if body.episode is not None:
-                raise HTTPException(status_code=422, detail="an episode order plays a SWE or TMax eval set")
+                raise HTTPException(status_code=422, detail="an episode order plays a SWE or TMax set")
             episode = None
             refusal = qual.order_environment_refusal(body.env)
             if refusal is not None:
@@ -995,7 +1025,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     def order_episode(body: CreateJob, card: Mapping, pin, *, evaluation: bool) -> dict | None:
         """The order's episode as its manifest carries it, None on a single-turn set: on a SWE or bridged (TMax)
         set a signed-sandbox episode that agrees with the set (``eval.episode_jobs``), on a model that has its
-        renderer."""
+        renderer. An evaluation or a batch (generation) order alike: its job reads a set, so its episode is
+        parsed as an eval-set job's (the set's split, a bridged package allowed), and the sandbox grades every
+        episode."""
         from reliquary.corpus.job import episode_contract
         from reliquary.eval.episode_jobs import episode_renderer_refusal, refuse_episode_disagreeing_with_set
 
@@ -1005,10 +1037,10 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 raise HTTPException(status_code=422, detail=f"set {body.eval_set_id} holds single-turn problems: "
                                     "an order on it has no episode")
             return None
-        if not evaluation or interaction not in ("swe", "signed_bridged"):
+        if interaction not in ("swe", "signed_bridged"):
             raise HTTPException(status_code=422, detail=(
                 f"set {body.eval_set_id} holds {interaction} tasks: an order plays only SWE or TMax sets, "
-                "in the signed sandbox, as an evaluation"))
+                "in the signed sandbox"))
         if body.thinking:
             raise HTTPException(status_code=422, detail="an episode renders through its own renderer: thinking is false")
         try:
@@ -1077,8 +1109,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail=(
                 "max_price_usd_per_mtoken applies to eval and generation orders"))
         cap = body.cap
-        if body.episode is not None and not (pinned and evaluation):
-            raise HTTPException(status_code=422, detail="an episode order is a forced-draw evaluation (draw, no "
+        if body.episode is not None and not pinned:
+            raise HTTPException(status_code=422, detail="an episode order is a forced-draw order (draw, no "
                                 "qualification)")
         if pinned:
             arguments = await pinned_order_arguments(body, evaluation=evaluation, record_order=False)
@@ -1558,13 +1590,15 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=404, detail="executor_unknown")
         return _public_executor(document)
 
-    async def v3_delivery(job, delivery_id: str, body: CreateDelivery, grade) -> dict:
+    async def v3_delivery(job, delivery_id: str, body: CreateDelivery, grade, *, filter_mode: str | None = None,
+                          episode: Mapping | None = None) -> dict:
         """A v3 delivery, with the job's ledger (the prompts that used every attempt) and its frozen set's rows
-        (custom ids); ``grade`` is the job's grader when a filter is asked for."""
+        (custom ids); ``grade`` is the job's grader when a filter is asked for. ``episode`` (renderer, source,
+        quarantined: ``episode_delivery``) delivers a signed episode job's graded trajectories."""
         from reliquary.corpus.delivery import export_delivery, set_rows_for_job
         from reliquary.validator.corpus_service import rebuild_ledgers
 
-        mode = body.filter or "none"
+        mode = filter_mode or body.filter or "none"
         snapshot, _ = await job_store.read_ledgers(job.job_id)
         slots = rebuild_ledgers(job, snapshot).slots
         set_rows = await asyncio.to_thread(set_rows_for_job, job)
@@ -1572,7 +1606,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             job=job, records=records, sink=deliveries, delivery_id=delivery_id, grade=grade,
             work_dir=work_dir, clock=clock, dedupe=body.dedupe, dedupe_against=body.dedupe_against,
             schema_version=3, include_truncated=body.include_truncated is not False, filter_mode=mode,
-            output_format=body.format or "parquet", slots=slots, set_rows=set_rows)
+            output_format=body.format or "parquet", slots=slots, set_rows=set_rows, **(episode or {}))
 
     @router.post("/jobs/{job_id}/deliveries")
     async def create_delivery(job_id: str, body: CreateDelivery, response: Response) -> dict:
@@ -1605,9 +1639,21 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         accepts = getattr(deliveries, "accepts_delivery_id", None)
         if accepts is not None and not accepts(delivery_id):
             raise HTTPException(status_code=503, detail="delivery_namespace_not_configured")
+        filter_mode = body.filter or "none"
         if job.episode is not None:
-            raise HTTPException(status_code=422, detail="an episode job is delivered with "
-                                "`reliquary jobs export JOB --sft` on a host with its renderer")
+            from reliquary.corpus.job import is_signed_sandbox
+
+            if body.schema_version != 3 or not is_signed_sandbox(job):
+                raise HTTPException(status_code=422, detail="an episode job is delivered as v3 (schema_version 3) "
+                                    "when signed, else with `reliquary jobs export JOB --sft` on a host with its "
+                                    "renderer")
+            # Always graded by its signed sandbox: every trajectory annotated (the default), or its successes.
+            if body.filter == "none":
+                raise HTTPException(status_code=422, detail="an episode job is always graded: filter 'annotate' "
+                                    "or 'drop'")
+            if body.dedupe or body.dedupe_against:
+                raise HTTPException(status_code=422, detail="an episode delivery is not deduplicated by completion")
+            filter_mode = body.filter or "annotate"
 
         from reliquary.corpus.delivery import DELIVERY_SCHEMA, DELIVERY_SCHEMA_V3
 
@@ -1616,7 +1662,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if body.schema_version == 3:
             asked["options"] = {"format": body.format or "parquet",
                                 "include_truncated": True if body.include_truncated is None else body.include_truncated,
-                                "filter": body.filter or "none", "dedupe_against": sorted(set(body.dedupe_against))}
+                                "filter": filter_mode, "dedupe_against": sorted(set(body.dedupe_against))}
 
         def same_request(manifest) -> bool:
             # A v2 request takes any delivery written before v3 existed, as it always did.
@@ -1661,6 +1707,16 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 # A delivery is final once written: never from a job still moving.
                 if not (await job_counts(job_id))["final"]:
                     raise HTTPException(status_code=409, detail="job_not_drained")
+                if body.schema_version == 3 and job.episode is not None:
+                    try:
+                        context = await episode_delivery(job)
+                    except ValueError as exc:
+                        raise HTTPException(status_code=422, detail=f"episode_delivery_unavailable: {exc}"[:500]) \
+                            from exc
+                    exports[delivery_id] = (job_id, asyncio.ensure_future(
+                        v3_delivery(job, delivery_id, body, None, filter_mode=filter_mode, episode=context)), asked)
+                    response.status_code = 202
+                    return {"state": "running", "delivery_id": delivery_id}
                 if body.schema_version == 3:
                     grade = None
                     if (body.filter or "none") != "none":
