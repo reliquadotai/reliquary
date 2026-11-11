@@ -163,7 +163,8 @@ def test_a_miner_without_job_id_on_several_jobs_takes_the_default_jobs_contract(
     assert isinstance(result.exception, restarted), result.output
     (path,) = execs
     assert json.loads(open(path).read()) == CONTRACTS["math-v1"]
-    assert seen[:2] == ["/corpus/job", "/corpus/contract"]
+    # The order list first (this validator lists none), then the default job's legacy paths.
+    assert seen[:3] == ["/corpus/jobs", "/corpus/job", "/corpus/contract"]
 
 
 def test_a_miner_naming_an_unserved_job_exits_with_the_list(monkeypatch, tmp_path):
