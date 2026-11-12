@@ -379,6 +379,59 @@ def test_an_episode_order_waits_for_its_audit_after_its_gateway(admin, swe_set, 
     asyncio.run(go())
 
 
+def test_the_control_status_says_what_an_episode_orders_gateways_are_sized_from(admin, swe_set, qwen35,  # noqa: F811
+                                                                                 tmp_path, monkeypatch):
+    pytest.importorskip("reliquary_sandbox.attest")
+    import time
+
+    from reliquary.protocol.sandbox_session import JOB_SCOPED_PREFIX
+    from reliquary.sandbox.sessions import LIVE, SUBMITTED, SessionRecord
+
+    assert admin("POST", "/admin/v1/jobs", _order()).status_code == 201
+    services = _order_services(tmp_path, JOB_SCOPED_PREFIX)
+    app, job_set = _control(admin, tmp_path, monkeypatch, services)
+    job_id, now = "order-eval-swe1", int(time.time())
+
+    def session(sid, state, issued, closed=None):
+        return SessionRecord(session_id=sid, hotkey="5Hot", request_id=sid, engagement_sha256="e", kind="corpus",
+                             engagement=f"corpus:{job_id}:0", env="reliquary-swe", split="eval", index=0,
+                             checkpoint="c", job_id=job_id, prompt_index=0, machine_id="m", issued_at=issued,
+                             expires_at=issued + 5_000, token_sha256="t", state=state,
+                             closed_status="graded" if closed else None, closed_at=closed)
+
+    async def go():
+        await job_set.refresh()
+        w = app.state.eval_served[job_id]
+        before = (await app.state.control_status())["jobs"][job_id]["sandbox"]
+        services.book.add(session("s1", LIVE, now - 60))
+        services.book.add(session("s2", SUBMITTED, now - 1_000, now - 160))
+        w.settler.on_read("sub-1", {"token_count": 30_000, "prompt_token_count": 11_000})
+        monkeypatch.setattr(services.quota, "fleet_refusals", lambda job, at, window: 37 if job == job_id else 0)
+        # One executor wanted for its model, auditing 2 870 tokens/s.
+        dispatcher = app.state.dispatcher
+        monkeypatch.setattr(w.auditor, "audits_pending", lambda: 10)
+        monkeypatch.setattr(w.auditor, "expected_audits", lambda pending: 10.0)
+        monkeypatch.setattr(dispatcher, "items_per_second", lambda model: 1.0)
+        monkeypatch.setattr(dispatcher, "tokens_per_second", lambda model: (2_000.0, 870.0))
+        after = await app.state.control_status()
+        for tasks in job_set._tasks.values():
+            for task in tasks:
+                task.cancel()
+        return before, after
+
+    before, after = asyncio.run(go())
+    assert before == {"episodes_total": 6, "episodes_finished": 0, "episodes_left": 6, "sessions_held": 0,
+                      "episode_seconds": None, "tokens_per_episode": None, "audit_episodes_per_second": None,
+                      "quota_refusals_fleet_full": 0}
+    assert after["jobs"][job_id]["sandbox"] == {
+        "episodes_total": 6, "episodes_finished": 0, "episodes_left": 6, "sessions_held": 1,
+        "episode_seconds": 840.0, "tokens_per_episode": 41_000.0,
+        "audit_episodes_per_second": pytest.approx(0.07), "quota_refusals_fleet_full": 37}
+    # The fields it had are kept.
+    assert {"state", "prompts_total", "audits_pending", "sizing"} <= set(after["jobs"][job_id])
+    json.dumps(after)
+
+
 def test_the_order_control_reads_only_its_own_sandbox_key(tmp_path):
     pytest.importorskip("reliquary_sandbox")
     from reliquary.infrastructure.sandbox_store import ORDER_SESSION_PREFIX

@@ -59,6 +59,12 @@ executor instead). It opens on the first directory read and heartbeat poll that 
 stays open: if the fleet later drops to zero, session opens are refused retryably (`quota_live`, 429 with
 `Retry-After`) rather than the job vanishing from miners.
 
+The control's status (`GET /admin/v1/eval-control/status`, every 30 s) gives each episode order a `sandbox`
+object the platform sizes the gateways from (design `docs/design/2026-11-12-sandbox-capacity-autoscale.md`):
+`episodes_total`/`_finished`/`_left`, `sessions_held`, `episode_seconds` (median of the last 50 finished),
+`tokens_per_episode`, `audit_episodes_per_second` and `quota_refusals_fleet_full` (last 10 min). A null is
+not measured yet.
+
 It needs network to drand and to the Hugging Face hub. Route it with the locations
 `reliquary corpus order-nginx --port 8791` prints for the same `RELIQUARY_ADMIN_TASK_PREFIX`; miners need
 no setting. The admin service and the order control must run with the same prefix.

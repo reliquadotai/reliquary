@@ -1419,6 +1419,19 @@ def model_facts(repo: str, revision: str) -> dict:
     return {"architecture": str(architectures[0]), "eos_token_id": int(eos)}
 
 
+def _also(first, second):
+    """A ``(submission_id, verdict)`` hook calling ``first`` then ``second``; ``second`` failing never breaks it."""
+
+    def both(submission_id, verdict) -> None:
+        first(submission_id, verdict)
+        try:
+            second(submission_id, verdict)
+        except Exception:
+            logger.exception("verdict hook failed for %s", submission_id)
+
+    return both
+
+
 def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                        directory: EvalExecutorDirectory, verify_signature,
                        verify_skip_signature=None, tokenizer_for=load_cpu_tokenizer,
@@ -1573,6 +1586,13 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                              read_windows=read_recent_windows,
                              thresholds=None if has_draw(job) else proof_thresholds(proof))
         on_verdict, on_settled = feed(w.stats, w.miners)
+        on_read = w.stats.observe
+        if job.episode is not None:
+            # Its audited tokens per episode, for the status's `sandbox` (`order_sandbox_status`).
+            from reliquary.validator.order_sandbox_status import EpisodeTokens
+
+            w.episode_tokens = EpisodeTokens()
+            on_verdict, on_read = _also(on_verdict, w.episode_tokens.observe), _also(on_read, w.episode_tokens.observe)
         # Paid by period, as every corpus task (design 2026-10-03): a period
         # closes once the auditor holds nothing undecided received in it -- and, for an
         # episode order, its grader nothing ungraded (ruling P21): never paid ungraded.
@@ -1597,7 +1617,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                                    job.job_id, job.judge if has_draw(job) else None))
 
         w.settler.on_window = w.miners.window
-        w.settler.on_read = w.stats.observe
+        w.settler.on_read = on_read
         # The stake weighs a record's prompt as the settler pays it (`corpus_periods.work_value`).
         output_price, input_price = cp.max_price(entry.params), cp.max_input_price(entry.params)
         if input_price and output_price:
@@ -1797,6 +1817,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         # Per model, the most executors its orders allow (the fastest order's choice), within the control's.
         allowed: dict[tuple[str, str], int] = {}
         released: list[str] = []
+        statuses: dict[str, dict] = {}
         for w in list(served.values()):
             if w.job.job_id in dispatcher.reuse_only_jobs:
                 continue
@@ -1814,6 +1835,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 continue
             if status is None:
                 continue
+            statuses[job_id] = status
             entry = document["jobs"].setdefault(
                 job_id, {"needs_attention": False, "parked_batches": 0, "reasons": []})
             entry.update({key: status.get(key) for key in (
@@ -1875,7 +1897,40 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 entry["executors_needed"] = max(entry.get("executors_needed", 0), wanted - len(live))
         sizing.forget({f"{m[0]}@{m[1]}" for m in backlog})
         dispatcher.set_releasing(released)
+        sandbox_jobs(document, statuses)
         return document
+
+    def sandbox_jobs(document: dict, statuses: dict[str, dict]) -> None:
+        """Per served signed episode order, what its sandbox gateways are sized from (`order_sandbox_status`)."""
+        from reliquary.validator.order_sandbox_status import FLEET_FULL_WINDOW_S, book_sessions, sandbox_status
+
+        episodes = [w for w in list(served.values()) if w.job.episode is not None]
+        if sandbox is None or not episodes:
+            return
+        now = int(clock())
+        try:
+            sessions = book_sessions(sandbox.book, now)
+        except Exception:
+            logger.warning("sandbox status: the session book is unreadable", exc_info=True)
+            return
+        quota = getattr(sandbox, "quota", None)
+        for w in episodes:
+            job_id, job = str(w.job.job_id), w.job
+            model = (job.checkpoint_repo, job.checkpoint_revision)
+            held, finished = sessions.get(job_id, (0, []))
+            tokens = getattr(w, "episode_tokens", None)
+            try:
+                entry = document["jobs"].setdefault(
+                    job_id, {"needs_attention": False, "parked_batches": 0, "reasons": []})
+                entry["sandbox"] = sandbox_status(
+                    job=job, status=statuses.get(job_id),
+                    reopens=bool(getattr(w.auditor, "reopen_slots", False)), held=held, finished=finished,
+                    tokens_per_episode=None if tokens is None else tokens.mean(),
+                    tokens_per_second=dispatcher.tokens_per_second(model),
+                    executors_wanted=document["models"].get(f"{model[0]}@{model[1]}", {}).get("executors_wanted"),
+                    fleet_refusals=0 if quota is None else quota.fleet_refusals(job_id, now, FLEET_FULL_WINDOW_S))
+            except Exception:
+                logger.warning("sandbox status of %s unavailable", job_id, exc_info=True)
 
     app.state.control_status = control_status
     app.state.corpus_jobs = job_set
