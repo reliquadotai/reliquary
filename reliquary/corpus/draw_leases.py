@@ -15,6 +15,7 @@ the same slot until the next leases are granted.
 from __future__ import annotations
 
 import collections
+import logging
 import random
 import secrets
 import threading
@@ -22,6 +23,8 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 REASON_DRAW_SLOT_LEASED = "draw_slot_leased"
 # Live leases one hotkey may hold on one job: a miner's batch of concurrent samples, never more than a share of the
@@ -35,14 +38,31 @@ SECOND_LESSEE_AFTER = 0.5
 LEASE_FLOOR_SECONDS = 300.0
 SLOW_TOKENS_PER_SECOND = 10.0
 MAX_LEASE_SECONDS = 4 * 3600.0
+# Over a signed episode's deadline: the lease is granted before the miner opens its session.
+EPISODE_LEASE_MARGIN_SECONDS = 300.0
+
+
+def episode_lease_floor(job: Any) -> float:
+    """The shortest lease on a signed-episode job: the miner's own deadline for one episode
+    (``signed_episode_deadline``) plus a margin, so a lease never ends while its episode may still finish.
+    0 for any other job."""
+    episode = getattr(job, "episode", None)
+    sandbox = getattr(episode, "sandbox", None) if episode is not None else None
+    if sandbox is None:
+        return 0.0
+    from reliquary.protocol.sandbox_session import signed_episode_deadline
+
+    return signed_episode_deadline(sandbox.budgets.wall_s) + EPISODE_LEASE_MARGIN_SECONDS
 
 
 def lease_seconds(job: Any) -> float:
-    """How long a lease on this job lasts: long enough for a slow honest miner to decode its longest sample."""
+    """How long a lease on this job lasts: long enough for a slow honest miner to decode its longest sample, and
+    for a signed episode to reach its deadline."""
     episode = getattr(job, "episode", None)
     tokens = (getattr(episode, "max_total_tokens", None) if episode is not None else None) or \
         job.sampling.max_new_tokens * max(1, int(getattr(job.sampling, "n", 1)))
-    return min(MAX_LEASE_SECONDS, LEASE_FLOOR_SECONDS + float(tokens) / SLOW_TOKENS_PER_SECOND)
+    decode = min(MAX_LEASE_SECONDS, LEASE_FLOOR_SECONDS + float(tokens) / SLOW_TOKENS_PER_SECOND)
+    return max(decode, episode_lease_floor(job))
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +98,9 @@ class DrawLeases:
         self._clock = clock
         self._rng = rng or random.Random(secrets.randbits(64))
         self._max = int(max_per_hotkey)
-        self.seconds = float(seconds if seconds is not None else lease_seconds(job))
+        # No lease, however set (``seconds``, an auction's per-hotkey time), ends before a signed episode's deadline.
+        self.floor = episode_lease_floor(job)
+        self.seconds = max(self.floor, float(seconds if seconds is not None else lease_seconds(job)))
         self._by_id: dict[str, Lease] = {}
         self._by_slot: dict[tuple[int, int], list[str]] = {}
         # Each hotkey's leases that expired unused, by when they expired.
@@ -87,6 +109,11 @@ class DrawLeases:
         self._lock = threading.RLock()
 
     # -- bookkeeping ---------------------------------------------------------
+
+    def _log(self, event: str, lease: Lease, extra: str = "") -> None:
+        logger.info("draw lease %s job=%s prompt=%d slot=%d hotkey=%s secs=%d%s", event,
+                    getattr(self._job, "job_id", "?"), lease.prompt_index, lease.slot, lease.hotkey[:8],
+                    round(lease.expires_at - lease.granted_at), extra)
 
     def _drop(self, lease_id: str) -> None:
         lease = self._by_id.pop(lease_id, None)
@@ -106,6 +133,7 @@ class DrawLeases:
                 lease = self._by_id[lease_id]
                 self._unused.setdefault(lease.hotkey, []).append(lease.expires_at)
                 self._drop(lease_id)
+                self._log("expired", lease)
                 self._unused_lease(lease, 1.0)
             for hotkey in list(self._unused):
                 recent = [t for t in self._unused[hotkey] if now - t < self.seconds]
@@ -178,22 +206,23 @@ class DrawLeases:
         for prompt_index, slot in free_slots(start):
             held = self._by_slot.get((prompt_index, slot), ())
             if not held:
-                return self._add(hotkey, prompt_index, slot, now, price, round, seconds)
+                return self._add(hotkey, prompt_index, slot, now, price, round, seconds, "granted")
             leases = [self._by_id[i] for i in held]
             if (tail is None and len(leases) == 1 and leases[0].hotkey != hotkey
                     and now - leases[0].granted_at >= SECOND_LESSEE_AFTER * (leases[0].expires_at - leases[0].granted_at)):
                 tail = (prompt_index, slot)
         if tail is not None:
-            return self._add(hotkey, *tail, now, price, round, seconds)
+            return self._add(hotkey, *tail, now, price, round, seconds, "granted_second")
         return None
 
     def _add(self, hotkey: str, prompt_index: int, slot: int, now: float, price: float | None = None,
-             round: int | None = None, seconds: float | None = None) -> Lease:
-        span = self.seconds if seconds is None else min(self.seconds, max(1.0, float(seconds)))
+             round: int | None = None, seconds: float | None = None, event: str = "granted") -> Lease:
+        span = self.seconds if seconds is None else min(self.seconds, max(1.0, float(seconds), self.floor))
         lease = Lease(secrets.token_hex(16), hotkey, int(prompt_index), int(slot), now, now + span,
                       price, round)
         self._by_id[lease.lease_id] = lease
         self._by_slot.setdefault((lease.prompt_index, lease.slot), []).append(lease.lease_id)
+        self._log(event, lease, "" if price is None else f" price={price:.3g}")
         return lease
 
     def release(self, hotkey: str, lease_id: str) -> bool:
@@ -204,6 +233,7 @@ class DrawLeases:
             self._drop(lease_id)
             span = lease.expires_at - lease.granted_at
             held = (self._clock() - lease.granted_at) / span if span > 0 else 1.0
+            self._log("released", lease, f" held={held:.2f}")
             self._unused_lease(lease, held)
             return True
 
@@ -226,8 +256,11 @@ class DrawLeases:
     def settle(self, prompt_index: int, slot: int) -> None:
         """The slot was taken: every lease on it ends."""
         with self._lock:
+            now = self._clock()
             for lease_id in list(self._by_slot.get((int(prompt_index), int(slot)), ())):
+                lease = self._by_id[lease_id]
                 self._drop(lease_id)
+                self._log("taken", lease, f" after={round(now - lease.granted_at)}")
 
 
 def free_draw_slots(job: Any, slots_ledger: Any, taken: Callable[[int, int], bool]):
@@ -250,5 +283,5 @@ def free_draw_slots(job: Any, slots_ledger: Any, taken: Callable[[int, int], boo
     return free
 
 
-__all__ = ["DrawLeases", "Lease", "MAX_LEASES_PER_HOTKEY", "REASON_DRAW_SLOT_LEASED", "free_draw_slots",
-           "lease_seconds"]
+__all__ = ["DrawLeases", "Lease", "MAX_LEASES_PER_HOTKEY", "REASON_DRAW_SLOT_LEASED", "episode_lease_floor",
+           "free_draw_slots", "lease_seconds"]
