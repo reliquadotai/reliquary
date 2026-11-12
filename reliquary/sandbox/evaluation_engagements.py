@@ -130,6 +130,24 @@ class EvaluationSessions:
         checkpoint = checkpoint_identity(binding["model"])
         if binding.get("identity_kind") != "hf-snapshot/v1" or binding.get("checkpoint") != checkpoint:
             raise ValueError("evaluation_checkpoint_identity_changed")
+        from reliquary.eval.protocol import BOUNDED_SIGNED_HARNESSES, CLAUDE_CLI_HARNESS, signed_cli_capability
+        if card["protocol"]["harness"]["id"] in BOUNDED_SIGNED_HARNESSES:
+            if any(binding.get(key) != row.get(key) for key in ("prompt_sha256", "reference_sha256")):
+                raise ValueError("evaluation_prompt_identity_changed")
+        if card["protocol"]["harness"]["id"] == CLAUDE_CLI_HARNESS:
+            from reliquary_sandbox_verifiers.cli import require_context_date
+
+            cap, _, cap_sha = signed_cli_capability()
+            episode = card["signed_episode"]
+            require_context_date(binding.get("context_date"))
+            if (binding.get("harness") != CLAUDE_CLI_HARNESS
+                    or binding.get("cli_capability_sha256") != cap_sha
+                    or binding.get("cli_runtime_image") != cap.runtime_image
+                    or binding.get("evaluation_policy_sha256") != episode["evaluation_policy_sha256"]
+                    or type(binding.get("max_turns")) is not int or not 1 <= binding["max_turns"] <= 48
+                    or type(binding.get("max_episode_tokens")) is not int
+                    or not 1 <= binding["max_episode_tokens"] <= 65536):
+                raise ValueError("evaluation_cli_identity_changed")
         engagement = _engagement(binding)
         result = await asyncio.to_thread(
             verify_transcript, transcript, self.fleet.directory(), self.issuer._token_verifier,
@@ -170,7 +188,8 @@ class EvaluationSessions:
     async def open(self, request: EvaluationSessionRequest) -> dict:
         from reliquary.eval.grading import load_sets
         from reliquary.eval.signed_agentic import checkpoint_identity
-        from reliquary.eval.protocol import _envelope, digest, validate_execution, validate_request
+        from reliquary.eval.protocol import (BOUNDED_SIGNED_HARNESSES, CLAUDE_CLI_HARNESS,
+            SIGNED_HARNESSES, _envelope, digest, signed_cli_capability, validate_execution, validate_request)
         from reliquary.sandbox.sessions import EngagementTerms, Refusal, token_validity_s
 
         now = int(self._clock())
@@ -185,7 +204,7 @@ class EvaluationSessions:
         protocol = _envelope(request.model_dump())
         validate_request({**request.model_dump(), **{key: protocol.get(key) for key in
                          ("sampling", "thinking", "max_new_tokens")}})
-        if protocol.get("interaction") != "signed_episode" or protocol.get("harness") != "signed-bash-v1":
+        if protocol.get("interaction") != "signed_episode" or protocol.get("harness") not in SIGNED_HARNESSES:
             raise ValueError("evaluation_harness_unsupported")
         if request.protocol_bindings.get(request.set_id) != request.set_protocol.get("protocol_sha256"):
             raise ValueError("evaluation_set_protocol_changed")
@@ -225,9 +244,14 @@ class EvaluationSessions:
         from reliquary.sandbox.fleet import TOOLS_VERSION
 
         public_episode = card["protocol"]["source"]["episode"]
+        cli_cap = None
+        if protocol["harness"] == CLAUDE_CLI_HARNESS:
+            cli_cap, _, cli_sha = signed_cli_capability()
+        model_tools_sha = (cli_cap.model_tools_sha256 if cli_cap is not None
+                           else digest(list(harness_tools(episode["tools"]))))
         if (episode["renderer_id"] != SUPPORTED_RENDERER
                 or public_episode["renderer_id"] != episode["renderer_id"]
-                or digest(list(harness_tools(episode["tools"]))) != public_episode["tools_sha256"]
+                or model_tools_sha != public_episode["tools_sha256"]
                 or episode["tools_version"] != TOOLS_VERSION):
             raise ValueError("evaluation_tools_or_renderer_changed")
         names = ("max_calls", "per_call_timeout_s", "wall_s", "memory_bytes", "pids", "disk_bytes")
@@ -242,6 +266,8 @@ class EvaluationSessions:
         budget["cpu_s"] = budget["wall_s"] * max(1, math.ceil(cpu / 1000))
         if not re.fullmatch(r".+@sha256:[0-9a-f]{64}", task["image"]):
             raise ValueError("evaluation_image_unpinned")
+        if cli_cap is not None and task["image"].rsplit("sha256:", 1)[1] == cli_cap.runtime_image.rsplit("sha256:", 1)[1]:
+            raise ValueError("evaluation_task_and_cli_images_must_differ")
         prepare = task.get("prepare_timeout_s")
         span = token_validity_s(self.issuer.policy.open_window_s, budget["wall_s"], prepare)
         if now + span > request.expires_at:
@@ -256,6 +282,15 @@ class EvaluationSessions:
                        tools_version=episode["tools_version"], harness=protocol["harness"],
                        renderer_id=episode["renderer_id"], harness_sha256=card["protocol"]["harness"]["sha256"],
                        episode=card["protocol"]["source"]["episode"], budgets=budget)
+        if protocol["harness"] in BOUNDED_SIGNED_HARNESSES:
+            binding.update(max_turns=protocol["max_turns"], max_episode_tokens=protocol["max_episode_tokens"],
+                           evaluation_policy_sha256=episode["evaluation_policy_sha256"],
+                           prompt_sha256=row["prompt_sha256"], reference_sha256=row["reference_sha256"])
+        if cli_cap is not None:
+            from reliquary_sandbox_verifiers.cli import utc_context_date
+
+            binding.update(cli_capability_sha256=cli_sha, cli_runtime_image=cli_cap.runtime_image,
+                           context_date=utc_context_date())
         binding_sha = digest(binding)
         engagement = _engagement(binding)
         sample_prefix = engagement.rsplit(":", 1)[0] + ":"

@@ -193,7 +193,7 @@ async def test_pinned_interception_returns_real_local_model_completion_not_null(
     config = EvalClientConfig(base_url="http://127.0.0.1:1", api_key_var="UNUSED_EVAL_FIXTURE_KEY")
     context = ModelContext(model=model, client=config, sampling=Sampling(max_tokens=32))
     task = {"model": {"repo": "fixture/model", "revision": "a" * 40},
-            "protocol": {"max_turns": 2}, "thinking": False, "max_new_tokens": 32, "sampling": {}}
+            "protocol": {"max_turns": 2, "max_episode_tokens": 4096}, "thinking": False, "max_new_tokens": 32, "sampling": {}}
     client = model_client(Generator(), task=task, source={"tools_sha256": digest([]),
         "renderer_id": "renderers:qwen38@0.1.11"}, deadline=time.monotonic() + 10, seed=1)
     trace = Trace(task=TraceTask(type="fixture", data={}), agent=AgentInfo(config=AgentConfig()))
