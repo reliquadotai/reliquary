@@ -526,6 +526,20 @@ def test_a_job_is_held_from_miners_until_an_executor_of_its_model_claims():
     assert routes.open_jobs() == ["draw", "plain"] and routes.held == {}
 
 
+def test_a_hold_says_why_until_released_and_then_stays_released():
+    from reliquary.validator.corpus_service import CorpusJobRoutes
+
+    routes = CorpusJobRoutes({"why": object(), "plain": object()})
+    reason = {"now": "no_gateway"}
+    routes.hold("why", lambda: reason["now"] is None, why=lambda: reason["now"])
+    routes.hold("plain", lambda: False)
+    assert routes.held_reason("why") == "no_gateway" and routes.held_reason("plain") == "held"
+    reason["now"] = None
+    assert routes.held_reason("why") is None and routes.open_jobs() == ["why"]
+    reason["now"] = "no_gateway"                          # once released, never held again
+    assert routes.open_jobs() == ["why"] and routes.hold_reasons == {}
+
+
 def test_a_hold_that_cannot_be_checked_keeps_the_job_held():
     from reliquary.validator.corpus_service import CorpusJobRoutes
 

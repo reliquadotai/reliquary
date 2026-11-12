@@ -51,6 +51,14 @@ start is polled and placed on from the next directory read (30 s), and one set `
 restart. The control records each accepted heartbeat in the directory (`last_heartbeat`), which is how the
 platform sees a gateway ready.
 
+An episode order is kept from miners until a gateway can take its sessions: a fresh, active machine serving
+its sandbox env at its exact package and options digest (its first task's), holding some of its images, with
+slots. Until then `/corpus/jobs` lists it `starting` (not in `jobs`), its writes answer 409 `job_paused`, and
+the control status shows `jobs[id]["held"] = "no_gateway"` (`"awaiting_audit"` while it waits for its audit
+executor instead). It opens on the first directory read and heartbeat poll that see such a gateway. Once open it
+stays open: if the fleet later drops to zero, session opens are refused retryably (`quota_live`, 429 with
+`Retry-After`) rather than the job vanishing from miners.
+
 It needs network to drand and to the Hugging Face hub. Route it with the locations
 `reliquary corpus order-nginx --port 8791` prints for the same `RELIQUARY_ADMIN_TASK_PREFIX`; miners need
 no setting. The admin service and the order control must run with the same prefix.
