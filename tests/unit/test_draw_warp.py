@@ -478,3 +478,35 @@ def test_far_misses_are_counted_on_every_path(warp):
         edited[row] = int(torch.argmin(logits[row]))
     d = _diag(logits, edited, us, warp)
     assert d.n_far_miss == 3 and fs._FAR_MISS < d.max_cdf_miss
+
+
+def test_one_shared_ranking_gives_every_warp_the_masks_warp_support_gives():
+    torch.manual_seed(0)
+    x = torch.randn(7, 300) * 3
+    x[0, :5] = 2.0  # ties
+    base = Warp(t=1.0, top_p=0.9, min_p=0.02)
+    for warps in ([base, base.widened(-0.05), base.widened(0.05)],
+                  [Warp(top_p=0.97), Warp(top_p=0.97).widened(0.05)],  # the loose cut reaches 1
+                  [Warp(min_p=0.1), Warp()]):
+        assert all(torch.equal(got, fs.warp_support(x, w)) for got, w in zip(fs._warp_supports(x, warps), warps))
+
+
+def test_a_top_k_cut_keeps_its_own_ranking():
+    x = torch.randn(3, 50)
+    warps = [Warp(top_k=5, top_p=0.9), Warp(top_k=7, top_p=0.95)]
+    assert all(torch.equal(got, fs.warp_support(x, w)) for got, w in zip(fs._warp_supports(x, warps), warps))
+
+
+def test_the_forward_packs_only_under_flash_attention_without_linear_layers(monkeypatch):
+    from types import SimpleNamespace
+
+    from reliquary.validator.corpus_audit import _packed
+
+    def model(attn, layers=None):
+        return SimpleNamespace(config=SimpleNamespace(_attn_implementation=attn, layer_types=layers))
+
+    assert not _packed(model("flash_attention_2"))  # off unless asked
+    monkeypatch.setenv("RELIQUARY_PACKED_FORWARD", "1")
+    assert _packed(model("flash_attention_2"))
+    assert not _packed(model("sdpa"))
+    assert not _packed(model("flash_attention_2", ["linear_attention", "full_attention"]))

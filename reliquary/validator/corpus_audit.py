@@ -11,6 +11,7 @@ import base64
 import binascii
 from collections.abc import Sequence
 from dataclasses import dataclass
+import os
 
 import torch
 
@@ -32,6 +33,19 @@ def _decoder(model):
     return model.model if hasattr(model, "model") else model.get_decoder()
 
 
+def _packed(model) -> bool:
+    """Whether the forward packs sequences into one unpadded row (``RELIQUARY_PACKED_FORWARD=1``): only under
+    flash-attention, whose varlen path keeps each sequence to itself from ``position_ids``, and never on a model
+    with linear-attention layers, whose state would run from one sequence into the next."""
+    if os.environ.get("RELIQUARY_PACKED_FORWARD", "0") != "1":
+        return False
+    config = getattr(model, "config", None)
+    text = getattr(config, "text_config", None) or config
+    if getattr(config, "_attn_implementation", None) != "flash_attention_2":
+        return False
+    return "linear_attention" not in (getattr(text, "layer_types", None) or ())
+
+
 @torch.no_grad()
 def completion_hidden_states(model, tokens: Sequence[int], prompt_len: int) -> torch.Tensor:
     """Final hidden state at every position that produced a completion token."""
@@ -51,6 +65,16 @@ def batch_completion_hidden_states(
             # On CUDA an out-of-range embedding index kills the device context.
             raise ValueError(f"a token id is outside the vocabulary of {vocabulary}")
     device = next(model.parameters()).device
+    if _packed(model) and len(sequences) > 1:
+        # One unpadded row: flash-attention's varlen path keeps each sequence to itself (positions restart).
+        ids = torch.tensor([t for tokens, _ in sequences for t in tokens], dtype=torch.long, device=device)[None]
+        positions = torch.cat([torch.arange(len(tokens), device=device) for tokens, _ in sequences])[None]
+        hidden = _decoder(model)(input_ids=ids, position_ids=positions, use_cache=False).last_hidden_state[0]
+        out, at = [], 0
+        for tokens, n in sequences:
+            out.append(hidden[at + n - 1: at + len(tokens) - 1])
+            at += len(tokens)
+        return out
     width = max(len(tokens) for tokens, _ in sequences)
     ids = torch.zeros((len(sequences), width), dtype=torch.long, device=device)
     mask = torch.zeros_like(ids)
@@ -253,14 +277,18 @@ def score_sequences(
     sub_batches: list[list[int]] = []
     current: list[int] = []
     current_width = 0
+    # Packed, a sub-batch costs its tokens; padded, its rows times the longest.
+    packed, current_tokens = _packed(model), 0
     for k in order:
         length = len(sequences[k][0])
         width = max(current_width, length)
-        if current and (len(current) + 1) * width > batch_tokens:
+        size = current_tokens + length if packed else (len(current) + 1) * width
+        if current and size > batch_tokens:
             sub_batches.append(current)
-            current, width = [], length
+            current, width, current_tokens = [], length, 0
         current.append(k)
         current_width = width
+        current_tokens += length
     if current:
         sub_batches.append(current)
 

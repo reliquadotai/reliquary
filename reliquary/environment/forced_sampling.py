@@ -808,15 +808,42 @@ def _gumbel_warp_chunk_stats(chunk_logits, toks, draws, warp, edge_margin, stoch
     return exact, miss, max_probs < stochastic_threshold
 
 
+def _warp_supports(x, warps):
+    """``warp_support`` for several warps over the same ``x``: when none has a top-k cut, one ranking of the whole
+    vocabulary serves every top-p threshold (the same top-k, softmax and cumsum ``warp_support`` computes, so the
+    same masks bit for bit) instead of one full-vocabulary top-k per warp."""
+    vocab = int(x.shape[-1])
+    if any(0 < w.top_k < vocab for w in warps):
+        return [warp_support(x, w) for w in warps]
+    ranked_by = [w for w in warps if w.top_p < 1.0]
+    out = []
+    if ranked_by:
+        values, index = torch.topk(x.float(), vocab, dim=-1)
+        probs = torch.softmax(values, dim=-1)
+        before = torch.cumsum(probs, dim=-1) - probs
+    for w in warps:
+        keep = torch.ones_like(x, dtype=torch.bool)
+        if w.top_p < 1.0:
+            ranked = before < w.top_p
+            ranked[:, 0] = True
+            keep = torch.zeros_like(keep).scatter(-1, index, ranked)
+        if w.min_p > 0.0:
+            xf = x.float()
+            top = xf.max(dim=-1, keepdim=True).values
+            keep &= (xf >= top + math.log(w.min_p)) | (xf == top)
+        out.append(keep)
+    return out
+
+
 def _gumbel_warp_chunk_stats_dense(chunk_logits, toks, draws, warp, edge_margin, stochastic_threshold):
     """``_gumbel_warp_chunk_stats`` over the whole vocabulary: the path without a top-k cut, and the reference."""
     x = chunk_logits.float() / float(warp.t)
     keys = _gumbel_keys(draws, x.device)
-    support = warp_support(x, warp)
+    support, tight, loose = _warp_supports(x, [warp, warp.widened(-edge_margin), warp.widened(edge_margin)])
     picks, _ = gumbel_argmax(x.masked_fill(~support, float("-inf")), keys)
-    tight = warp_support(x, warp.widened(-edge_margin)) & support
+    tight = tight & support
     _, best = gumbel_argmax(x.masked_fill(~tight, float("-inf")), keys)
-    loose = warp_support(x, warp.widened(edge_margin)) | support
+    loose = loose | support
     own = x.gather(1, toks.unsqueeze(1)).squeeze(1) + gumbel_noise_from_bits(_splitmix_bits(keys, toks))
     exact = picks == toks
     near = -torch.expm1(-(best - own).clamp_min(0.0))
