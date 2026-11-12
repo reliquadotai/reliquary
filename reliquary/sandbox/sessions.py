@@ -1325,7 +1325,7 @@ class SessionIssuer:
                     "prompt_index": terms.prompt_index,
                     "slots_remaining": remaining, "reserved": reserved})
         if self._quota is not None:
-            refusal = self._quota.admit(hotkey, now, engagement=terms.engagement)
+            refusal = self._quota.admit(hotkey, now, engagement=terms.engagement, job_id=terms.job_id)
             if refusal is not None:
                 return refusal
         validity = token_validity_s(self._policy.open_window_s, int(terms.budgets["wall_s"]),
