@@ -20,21 +20,39 @@ SETTLE_FULL_LIST_SECONDS = float(os.environ.get("RELIQUARY_CORPUS_SETTLE_FULL_LI
 VERDICT_READ_CONCURRENCY = 16
 
 
+# The share of a period's passed tokens whose lease prices set its one price (`period_price`).
+PERIOD_PRICE_QUANTILE = 0.95
+
+
 def period_price(verdicts: Iterable[Mapping], earlier: float | None = None) -> float | None:
-    """The one price a period priced by auction pays every token at: the highest lease price delivered in it
-    (``earlier``: the highest of the period's verdicts already settled)."""
-    prices = [float(v["lease_price"]) for v in verdicts if v.get("passed") and v.get("lease_price") is not None]
+    """The one price a period priced by auction pays its tokens at: the lease price under which
+    PERIOD_PRICE_QUANTILE of its passed tokens were delivered (``earlier``: the price of the period's verdicts
+    already settled; the higher stands). The highest lease alone set it before: on 2026-11-11 offers serving
+    0.1-1 % of a period's tokens priced all of them at the ceiling. A lease above it is paid its own price
+    (`_priced_rewards`), so no token is paid under its offer."""
+    priced = sorted((float(v["lease_price"]), int(v.get("token_count") or 0)) for v in verdicts
+                    if v.get("passed") and v.get("lease_price") is not None)
+    found = None
+    total = sum(tokens for _, tokens in priced)
+    if priced:
+        found = priced[-1][0]
+        reached = 0
+        for price, tokens in priced:
+            reached += tokens
+            if total > 0 and reached >= PERIOD_PRICE_QUANTILE * total:
+                found = price
+                break
     if earlier is not None:
-        prices.append(float(earlier))
-    return max(prices) if prices else None
+        found = float(earlier) if found is None else max(found, float(earlier))
+    return found
 
 
 def rewards_for(verdicts: Iterable[Mapping], cap: float, *, price: float | None = None,
                 input_price: float | None = None, uniform_price: float | None = None) -> dict[str, float]:
     """What each hotkey earns of ``cap`` (the period's pool): its share of the passed tokens, or, on a job priced
-    by auction (verdicts carrying ``lease_price``), its tokens at the period's price (``uniform_price``, else the
-    highest lease price among them) less the debt they carried, scaled down only if that passes the pool (the
-    rest burns). With an ``input_price`` (and the output ``price``), the share is of the passed work's value:
+    by auction (verdicts carrying ``lease_price``), its tokens at the period's price (``uniform_price``, else
+    `period_price` of them), or at its own lease price when higher, less the debt they carried, scaled down only
+    if that passes the pool (the rest burns). With an ``input_price`` (and the output ``price``), the share is of the passed work's value:
     output tokens x price + prompt tokens x input_price."""
     verdicts = list(verdicts)
     if any(v.get("lease_price") is not None for v in verdicts if v.get("passed")):
@@ -66,7 +84,9 @@ def _priced_rewards(verdicts: list[Mapping], cap: float, price: float) -> dict[s
     for verdict in verdicts:
         if not verdict.get("passed") or verdict.get("lease_price") is None:
             continue
-        value = int(verdict["token_count"]) * float(price) - float(verdict.get("lease_debit") or 0.0)
+        # The period's price, or its own offer when higher: never paid under it.
+        paid_at = max(float(price), float(verdict["lease_price"]))
+        value = int(verdict["token_count"]) * paid_at - float(verdict.get("lease_debit") or 0.0)
         earned[verdict["hotkey"]] = earned.get(verdict["hotkey"], 0.0) + value
     earned = {hotkey: value for hotkey, value in earned.items() if value > 0}
     total = sum(earned.values())

@@ -164,11 +164,32 @@ def test_the_settlement_pays_every_token_at_the_periods_price_less_the_debit():
         {"passed": True, "hotkey": "b", "token_count": 50, "lease_price": 1e-6, "lease_debit": 1.0},
         {"passed": False, "hotkey": "c", "token_count": 100, "lease_price": 1e-6, "lease_debit": 0.0},
     ]
-    # Every token at the period's price, the highest lease delivered (2e-6); b's debt passes its pay.
+    # Half the tokens at 2e-6: the period's price (under which 95 % were delivered) is 2e-6; b's debt passes
+    # its pay.
     assert rewards_for(verdicts, 1.0) == {"a": pytest.approx(4e-4 - 5e-5)}
     assert rewards_for(verdicts, 1.0, uniform_price=3e-6) == {"a": pytest.approx(6e-4 - 5e-5)}
     # Over the pool: scaled down to it.
     assert sum(rewards_for(verdicts, 1e-4).values()) == pytest.approx(1e-4)
+
+
+def test_a_few_dear_leases_do_not_price_a_whole_period():
+    """2026-11-11: offers serving 0.1-1 % of a period's tokens priced all of them at the ceiling."""
+    from reliquary.validator.corpus_settlement import PERIOD_PRICE_QUANTILE, period_price, rewards_for
+
+    cheap = [{"passed": True, "hotkey": f"c{i}", "token_count": 1000, "lease_price": 1e-7, "lease_debit": 0.0}
+             for i in range(99)]
+    dear = {"passed": True, "hotkey": "d", "token_count": 1000, "lease_price": 5e-6, "lease_debit": 0.0}
+    verdicts = [*cheap, dear]
+    assert PERIOD_PRICE_QUANTILE == 0.95
+    assert period_price(verdicts) == pytest.approx(1e-7)          # 99 % of the tokens at 1e-7
+    rewards = rewards_for(verdicts, 1.0)
+    assert rewards["c0"] == pytest.approx(1000 * 1e-7)
+    assert rewards["d"] == pytest.approx(1000 * 5e-6)              # the dear lease at its own price, never under it
+    # An earlier price of the period stands when higher.
+    assert period_price(verdicts, 3e-7) == pytest.approx(3e-7)
+    # A dear share past the 5 % does set the price.
+    heavy = [*cheap[:90], *[{**dear, "hotkey": f"d{i}"} for i in range(10)]]
+    assert period_price(heavy) == pytest.approx(5e-6)
 
 
 # ------------------------------------------------------------------ the miner
@@ -323,7 +344,7 @@ def test_a_delivery_times_the_hotkeys_next_leases(fake_r2):
     assert len(auction._deliveries["5A"]) == 3
 
 
-def test_a_period_pays_its_tokens_at_the_highest_lease_delivered_in_it():
+def test_a_period_pays_its_tokens_at_the_price_under_which_most_were_delivered():
     from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler
     from tests.unit.test_corpus_period_settlement import GENESIS, Archives, Records, at, verdict
 
