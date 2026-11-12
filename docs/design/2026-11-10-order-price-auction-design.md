@@ -65,9 +65,13 @@ for minutes, not hours. The second-lessee rule for the job's tail stays.
 ### 2.5 Price paid
 
 At the end of each pay period (the existing period clock), every verified token delivered in the period is paid
-the same price: the highest offer that was given a non-zero allowance during the period. Each lease records its holder's
-offer; the settlement takes the highest one among the period's passed verdicts (and those settled earlier in the
-period) and pays `tokens x price - debit` under the job's cap; the rest of the ceiling budget burns.
+one price: the lease price under which 95 % of the period's passed tokens were delivered (token-weighted). A lease
+above it is paid its own price, so no token is paid under its offer. The settlement takes that price among the
+period's passed verdicts (and the price of those settled earlier in the period, the higher standing) and pays
+`tokens x max(price, own offer) - debit` under the job's cap; the rest of the ceiling budget burns.
+
+The highest lease alone set the price at first: on 2026-11-11, offers serving 0.1-1 % of a period's tokens priced
+all of them at the ceiling (126 alpha paid over 103M tokens; 88 under this rule).
 
 Paying everyone the marginal price, not their own offer, lets a miner offer its real cost.
 
