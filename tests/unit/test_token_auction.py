@@ -84,11 +84,52 @@ def test_a_hotkey_without_an_ask_gets_no_lease():
     assert auction.admit("5A") == NO_ASK
 
 
-def test_a_lease_carries_its_holders_own_offer():
+def test_a_lease_alone_in_the_budget_carries_its_holders_own_offer():
     auction, _, book = _auction()
     auction.post_ask("5A", 0.3, 4)
     terms = _lease(auction, book, "5A")
     assert auction.params.alpha_of(terms.price) == pytest.approx(0.3)
+
+
+def test_a_lease_carries_the_price_of_the_moment_never_under_its_own_offer():
+    """2026-11-12: an offer at 0 took a small budget's leases and was paid the period's price. A lease is paid the
+    dearest offer getting work when it is granted: alone in a small budget, an offer at 0 gets 0."""
+    auction, _, book = _auction(budget=4)
+    auction.post_ask("zero", 1e-6, 4)            # the lowest a miner can offer
+    auction.post_ask("mid", 0.2, 4)
+    auction.post_ask("dear", 0.5, 4)
+    for hotkey in ("zero", "mid", "dear"):
+        auction.admit(hotkey)                      # each asks once: all three are active
+        auction._reserved.clear()
+    assert auction.params.alpha_of(_lease(auction, book, "zero").price) == pytest.approx(1e-6)
+    auction._budget = 8                            # mid works too: the moment's price is mid's
+    assert auction.params.alpha_of(_lease(auction, book, "zero").price) == pytest.approx(0.2)
+    auction._budget = 12                           # everyone works: the dearest offer's price for all
+    assert auction.params.alpha_of(_lease(auction, book, "mid").price) == pytest.approx(0.5)
+    assert auction.params.alpha_of(_lease(auction, book, "dear").price) == pytest.approx(0.5)
+
+
+def test_an_offer_under_its_real_cost_only_wins_leases_that_pay_under_that_cost():
+    """A miner whose card costs 0.3 against one at 0.15: offering ~0 instead of 0.3 wins it more leases only when the
+    budget is short, and those are paid the rival's 0.15; with room for both, the same leases at the same price."""
+    def grant(own, budget):
+        auction, _, book = _auction(budget=budget)
+        auction.post_ask("a", own, 6)
+        auction.post_ask("b", 0.15, 6)
+        auction.post_ask("c", 0.4, 6)
+        for hotkey in ("a", "b", "c"):
+            auction.admit(hotkey)
+            auction._reserved.clear()
+        prices = []
+        while isinstance(terms := _lease(auction, book, "a"), Terms):
+            prices.append(auction.params.alpha_of(terms.price))
+        return prices
+
+    honest, low = grant(0.3, 18), grant(1e-6, 18)          # room for all: same leases, same price
+    assert honest == pytest.approx(low) and len(honest) == 6 and honest == pytest.approx([0.4] * 6)
+    honest, low = grant(0.3, 8), grant(1e-6, 8)            # short: a lies its way ahead of b
+    assert len(honest) == 2 and all(p == pytest.approx(0.3) for p in honest)
+    assert len(low) == 6 and all(p < 0.3 for p in low)    # every extra lease pays under a's cost
 
 
 def test_the_cheapest_offers_get_the_budget_up_to_their_capacity():
