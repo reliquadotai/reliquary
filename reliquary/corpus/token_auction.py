@@ -131,7 +131,8 @@ def auction_params(params: Mapping | None) -> AuctionParams | None:
 
 @dataclass(frozen=True, slots=True)
 class Terms:
-    """What a lease granted now pays: ``price`` per token (pool share), its holder's offer."""
+    """What a lease granted now pays: ``price`` per token (pool share), the price of the moment -- the dearest
+    offer given work right now, never under its holder's own offer."""
     price: float
     hotkey: str
     round: int | None = None
@@ -287,7 +288,7 @@ class TokenAuction:
                 return NO_ASK
             self._seen[hotkey] = now
             self._steer(now, held)
-            given, _ = self._allowances(now, held)
+            given, marginal = self._allowances(now, held)
             allowance = given.get(hotkey, 0)
             if allowance <= 0:
                 return ASK_ABOVE_PRICE
@@ -297,7 +298,10 @@ class TokenAuction:
                     or sum(held.values()) + sum(self._reserved.values()) >= self._budget):
                 return ALLOWANCE_FULL
             self._reserved[hotkey] += 1
-            return Terms(offer.price, hotkey)
+            # Paid the price of the moment, not its own offer: an offer under its true cost then only wins work
+            # at moments that pay under that cost (2026-11-12: offers at 0 took the leases of a small budget and
+            # were paid the period's price, set by the dear offers needed at other moments).
+            return Terms(max(offer.price, marginal if marginal is not None else offer.price), hotkey)
 
     def unreserve(self, terms: Terms) -> None:
         """The reservation ``admit`` made is over: its lease is granted (and counted as held) or not."""

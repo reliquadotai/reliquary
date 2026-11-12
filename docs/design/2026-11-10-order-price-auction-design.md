@@ -64,16 +64,23 @@ for minutes, not hours. The second-lessee rule for the job's tail stays.
 
 ### 2.5 Price paid
 
-At the end of each pay period (the existing period clock), every verified token delivered in the period is paid
-one price: the lease price under which 95 % of the period's passed tokens were delivered (token-weighted). A lease
-above it is paid its own price, so no token is paid under its offer. The settlement takes that price among the
-period's passed verdicts (and the price of those settled earlier in the period, the higher standing) and pays
-`tokens x max(price, own offer) - debit` under the job's cap; the rest of the ceiling budget burns.
+A lease is paid the price of the moment it is granted: the dearest offer getting work at that instant (the
+auction's marginal price), never under the holder's own offer. Everyone working at the same moment is paid the same
+price; the settlement pays `tokens x lease price - debit` under the job's cap, and the rest of the ceiling budget
+burns.
 
-The highest lease alone set the price at first: on 2026-11-11, offers serving 0.1-1 % of a period's tokens priced
-all of them at the ceiling (126 alpha paid over 103M tokens; 88 under this rule).
+Why the moment and not the period: the budget follows the audit queue, so within one period it swings between a
+few cheap offers and the whole ladder. Priced once per period (the lease price under which 95 % of its tokens were
+delivered, from #498), an offer at 0 took the leases of a small budget and was paid the period's price, set by the
+dear offers needed at other moments. On 2026-11-12 one coldkey offering 0 delivered 26 % of a 27B order's tokens and
+was paid the ceiling, and on another order took 97 of a 100-lease budget. With the price of the moment an offer
+under its real cost only wins work at moments that pay under that cost; an offer at its real cost gets the same
+leases at the same price every other time. Paying each its own offer instead would make miners bid the price they
+guess, not their cost.
 
-Paying everyone the marginal price, not their own offer, lets a miner offer its real cost.
+The highest lease alone set the period's price at first: on 2026-11-11, offers serving 0.1-1 % of a period's tokens
+priced all of them at the ceiling. Leases received before `RELIQUARY_AUCTION_MOMENT_PRICE_FROM` keep the period
+rule (the 95 % price, or their own offer when higher).
 
 ### 2.6 Leases not delivered
 
@@ -103,7 +110,6 @@ requests one sample at a time.
 
 - Thermostat defaults (backlog marks, step sizes): check them on the first orders priced this way.
 - Prompt tokens are not paid on a job priced by auction (as before): an offer prices output tokens only.
-- Whether the period price should ignore an offer that served only a tiny share of the period's tokens.
 - Offers per job or per pinned model across jobs.
 - Rollout: announce the offer flag to miners before the first order priced this way; jobs without the flag keep
   first-come at the ceiling.

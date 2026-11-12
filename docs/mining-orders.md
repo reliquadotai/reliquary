@@ -47,8 +47,10 @@ On an order with `"pricing": "auction"`:
   order's ceiling. `--ask-capacity` is how many samples you can have in flight at once.
 - **Cheapest first.** Work goes to the lowest offers first, up to each one's capacity. The validator sends out
   only as much work as it can audit.
-- **One price.** Every verified token of a pay period is paid the same price: the highest offer that got work in
-  it. Offer your real cost.
+- **The price of the moment.** Each lease is paid the price of the moment it was granted: the dearest offer
+  getting work at that instant, never less than your own offer. Everyone working at the same moment is paid the
+  same price. An offer under your real cost only wins you work at moments that pay less than that cost, so
+  offer your real cost.
 - **Keep your word.** A lease you take and do not deliver is charged against your next payouts, and halves your
   capacity for an hour.
 - **Your setup.** Lease up to 256 samples per request, with any engine and batch size.

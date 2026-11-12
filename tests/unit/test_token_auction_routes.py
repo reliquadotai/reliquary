@@ -155,7 +155,15 @@ def test_a_job_not_priced_by_auction_refuses_asks(fake_r2):
     assert _lease(client, "5A")["leased"] is True
 
 
-def test_the_settlement_pays_every_token_at_the_periods_price_less_the_debit():
+@pytest.fixture
+def period_rule(monkeypatch):
+    """Leases received before RELIQUARY_AUCTION_MOMENT_PRICE_FROM: paid by the period rule."""
+    from reliquary.validator import corpus_settlement
+
+    monkeypatch.setattr(corpus_settlement, "MOMENT_PRICE_FROM", float("inf"))
+
+
+def test_the_settlement_pays_every_token_at_the_periods_price_less_the_debit(period_rule):
     from reliquary.validator.corpus_settlement import rewards_for
 
     verdicts = [
@@ -172,7 +180,7 @@ def test_the_settlement_pays_every_token_at_the_periods_price_less_the_debit():
     assert sum(rewards_for(verdicts, 1e-4).values()) == pytest.approx(1e-4)
 
 
-def test_a_few_dear_leases_do_not_price_a_whole_period():
+def test_a_few_dear_leases_do_not_price_a_whole_period(period_rule):
     """2026-11-11: offers serving 0.1-1 % of a period's tokens priced all of them at the ceiling."""
     from reliquary.validator.corpus_settlement import PERIOD_PRICE_QUANTILE, period_price, rewards_for
 
@@ -344,7 +352,7 @@ def test_a_delivery_times_the_hotkeys_next_leases(fake_r2):
     assert len(auction._deliveries["5A"]) == 3
 
 
-def test_a_period_pays_its_tokens_at_the_price_under_which_most_were_delivered():
+def test_a_period_pays_its_tokens_at_the_price_under_which_most_were_delivered(period_rule):
     from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler
     from tests.unit.test_corpus_period_settlement import GENESIS, Archives, Records, at, verdict
 
@@ -360,3 +368,37 @@ def test_a_period_pays_its_tokens_at_the_price_under_which_most_were_delivered()
     (doc,) = archives.docs.values()
     assert doc["rewards_by_hotkey"] == {"a": pytest.approx(0.02), "b": pytest.approx(0.02)}
     assert records.state["period_price"][str(3)] == pytest.approx(2e-5)
+
+
+
+def test_each_lease_is_paid_the_price_of_the_moment_it_was_granted_less_the_debit():
+    """2026-11-12: an offer at 0 took a small budget's leases and was paid the period's price, set by the dear
+    offers needed at other moments. Each lease now carries its moment's price and is paid it."""
+    from reliquary.validator.corpus_settlement import rewards_for
+
+    verdicts = [
+        {"passed": True, "hotkey": "zero", "token_count": 1000, "lease_price": 0.0, "lease_debit": 0.0},
+        {"passed": True, "hotkey": "zero", "token_count": 1000, "lease_price": 4e-7, "lease_debit": 0.0},
+        {"passed": True, "hotkey": "dear", "token_count": 1000, "lease_price": 1.8e-6, "lease_debit": 1e-4},
+        {"passed": False, "hotkey": "c", "token_count": 1000, "lease_price": 1.8e-6, "lease_debit": 0.0},
+    ]
+    assert rewards_for(verdicts, 1.0) == {"zero": pytest.approx(4e-4), "dear": pytest.approx(1.8e-3 - 1e-4)}
+    # A period's price (from leases of the earlier rule) never lifts a lease of the moment.
+    assert rewards_for(verdicts, 1.0, uniform_price=1.8e-6)["zero"] == pytest.approx(4e-4)
+
+
+def test_leases_received_before_the_switch_keep_the_period_rule(monkeypatch):
+    from reliquary.validator import corpus_settlement
+    from reliquary.validator.corpus_settlement import rewards_for
+
+    monkeypatch.setattr(corpus_settlement, "MOMENT_PRICE_FROM", 1000.0)
+    verdicts = [
+        # Before: its own offer (0) under the period's price, set by the leases of before (2e-6).
+        {"passed": True, "hotkey": "old", "token_count": 100, "lease_price": 0.0, "received_at": 900.0},
+        {"passed": True, "hotkey": "old2", "token_count": 900, "lease_price": 2e-6, "received_at": 950.0},
+        # After: the price of its moment, whatever the period's.
+        {"passed": True, "hotkey": "new", "token_count": 100, "lease_price": 1e-7, "received_at": 1100.0},
+    ]
+    assert rewards_for(verdicts, 1.0) == {"old": pytest.approx(2e-4), "old2": pytest.approx(1.8e-3),
+                                          "new": pytest.approx(1e-5)}
+
