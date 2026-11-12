@@ -123,6 +123,13 @@ RECONCILE_READS = 16
 # How long after its receipt a sampled record's draw round is out (the round after receipt's next, two drand
 # periods, plus BEACON_GRACE_SECONDS) and the undecidable retry has come back to it (`audit_backlog`).
 DRAW_WAIT_SECONDS = 12.0
+# Audit ahead: a drawn record is sent to the executor as soon as its draw is known, so a judge pass finds its
+# outcome ready instead of waiting on the card (2026-11-12: cards idle 63-83 % behind serial passes). At most
+# AHEAD_BATCHES leases of up to AHEAD_ROWS records in flight, and AHEAD_KEEP outcomes waiting for their pass.
+AHEAD_ROWS = int(os.environ.get("RELIQUARY_CORPUS_AHEAD_ROWS", "32"))
+AHEAD_BATCHES = int(os.environ.get("RELIQUARY_CORPUS_AHEAD_BATCHES", "2"))
+AHEAD_KEEP = int(os.environ.get("RELIQUARY_CORPUS_AHEAD_KEEP", "1024"))
+AHEAD_IDLE_SECONDS = 1.0
 # How long a round that just failed to fetch is left unfetched before the next
 # attempt: every sampled submission whose draw lands on a bad round would
 # otherwise refetch it once per judging pass.
@@ -309,6 +316,10 @@ class CorpusAuditor:
         self._unknown_since: dict[str, float] = {}
         self._given_up: set[str] = set()
         self._randomness: dict[int, str] = {}
+        # Audit ahead: outcomes computed before their pass (a dict each; never an error), and the batches in
+        # flight by id. Dropped once judged, or when the executor that scored them is quarantined.
+        self._ahead: dict[str, dict] = {}
+        self._ahead_flight: dict[str, asyncio.Future] = {}
         # Rounds raced in the current judge_many: one race per round per pass,
         # never one per record whose draw lands on a failing round.
         self._raced: set[int] = set()
@@ -548,13 +559,17 @@ class CorpusAuditor:
         by (``corpus.token_auction``). Records waiting out their hold are not counted, nor, on a sampled job,
         records received less than DRAW_WAIT_SECONDS ago: their draw round is not out yet, so they wait for the
         clock, not for the audit, and counting them would cap the job's flow at the backlog mark whatever its
-        audit card could take."""
+        audit card could take. Nor are records known undrawn or already audited ahead: no GPU work is left in
+        them (2026-11-12: a backlog of 174 such records cut the budget while the card idled)."""
         now = self._clock()
         sampled = self._params.q < 1.0
         cutoff = now - DRAW_WAIT_SECONDS
         count = 0
         for submission_id, at in self._due.items():
             if at > now:
+                continue
+            # Known undrawn (paid or held at its hold's end), or already audited ahead: no GPU work left.
+            if submission_id in self._undrawn or submission_id in self._ahead:
                 continue
             if sampled:
                 received = (self._meta[submission_id][1] if submission_id in self._meta
@@ -574,6 +589,7 @@ class CorpusAuditor:
         self._undrawn.discard(submission_id)
         self._stake.pop(submission_id, None)
         self._shortest.pop(submission_id, None)
+        self._ahead.pop(submission_id, None)
         self._read_for_shortest.discard(submission_id)
         if submission_id in self._meta:
             self._unjudged.get(self._meta[submission_id][0], set()).discard(submission_id)
@@ -1270,12 +1286,88 @@ class CorpusAuditor:
         results, _ = await self._audit_records(ids, records, draws or {})
         return results
 
+    async def _outcomes_ahead_or_now(self, ids: list[str], records: list[dict]) -> list[dict | str]:
+        """`_audit_outcomes` of ``records``, taking each one audited ahead (`_audit_ahead_forever`) as it is: the
+        same records scored by the same executors, only earlier. A batch still in flight is waited for."""
+        outcomes: list[dict | str | None] = [None] * len(ids)
+        for k, submission_id in enumerate(ids):
+            flight = self._ahead_flight.get(submission_id)
+            if flight is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(flight)
+            outcomes[k] = self._ahead.pop(submission_id, None)
+        rest = [k for k, outcome in enumerate(outcomes) if outcome is None]
+        if len(rest) < len(ids):
+            self._choices["audit_ahead_used"] += len(ids) - len(rest)
+        if rest:
+            for k, outcome in zip(rest, await self._audit_outcomes([records[k] for k in rest])):
+                outcomes[k] = outcome
+        return outcomes
+
+    def _ahead_candidates(self, limit: int) -> list[str]:
+        """Pending records sure to be audited whatever their pass decides, oldest first: on a sampled job those
+        whose draw round is out (its randomness cached) and drawn; at q = 1, every one."""
+        q = self._params.q
+        found: list[tuple[float, str]] = []
+        for sids in self._unjudged.values():
+            for submission_id in sids:
+                if (submission_id in self._judged or submission_id in self._ahead
+                        or submission_id in self._ahead_flight or submission_id not in self._meta):
+                    continue
+                received_at = self._meta[submission_id][1]
+                if q < 1.0:
+                    if self._round_at is None:
+                        return []
+                    try:
+                        randomness = self._randomness.get(int(self._round_at(received_at)) + 1)
+                        if randomness is None or not drawn(randomness, submission_id, q):
+                            continue
+                    except Exception:
+                        continue
+                found.append((received_at, submission_id))
+        return [sid for _, sid in heapq.nsmallest(limit, found)]
+
+    async def _audit_ahead_batch(self, submission_ids: list[str]) -> None:
+        try:
+            records = await self._read_all(submission_ids)
+            ids = [sid for sid in submission_ids if sid in records and sid not in self._judged]
+            if not ids:
+                return
+            for sid, outcome in zip(ids, await self._audit_outcomes([records[sid] for sid in ids])):
+                # A validator-side error is left for the pass to meet itself.
+                if isinstance(outcome, dict) and sid not in self._judged:
+                    self._ahead[sid] = outcome
+        except Exception:
+            logger.warning("corpus job %s: audit ahead of %d record(s) failed; their pass audits them",
+                           self._job_id, len(submission_ids), exc_info=True)
+        finally:
+            for sid in submission_ids:
+                self._ahead_flight.pop(sid, None)
+
+    async def _audit_ahead_forever(self) -> None:
+        """Keep the executors fed: while one is connected, send the records sure to be audited as soon as they are
+        known, up to AHEAD_BATCHES leases at once, instead of only when a judge pass reaches them."""
+        while True:
+            flights = set(self._ahead_flight.values())
+            if (len(flights) < AHEAD_BATCHES and len(self._ahead) < AHEAD_KEEP
+                    and self._remote is not None and self._remote.connected()):
+                ids = self._ahead_candidates(AHEAD_ROWS)
+                if ids:
+                    task = asyncio.ensure_future(self._audit_ahead_batch(ids))
+                    for sid in ids:
+                        self._ahead_flight[sid] = task
+                    continue
+            if flights:
+                await asyncio.wait(flights, timeout=AHEAD_IDLE_SECONDS, return_when=asyncio.FIRST_COMPLETED)
+            else:
+                await asyncio.sleep(AHEAD_IDLE_SECONDS)
+
     async def _audit_records(self, ids: list[str], records: list[dict],
                              draws: dict[str, dict], *,
                              deferred: list | None = None) -> tuple[list[dict | None], set[str]]:
         """Audit, re-audit each failure alone, write the verdicts and move each
         hotkey's state. Returns the verdicts and the hotkeys with a confirmed failure."""
-        outcomes = await self._audit_outcomes(records)
+        outcomes = await self._outcomes_ahead_or_now(ids, records)
         failing = [k for k, outcome in enumerate(outcomes)
                    if isinstance(outcome, dict) and not outcome["passed"]]
         if failing:
@@ -1456,6 +1548,9 @@ class CorpusAuditor:
         scores that is unsettled or settled inside the hold window. A failure
         (confirmed by a second audit, as §7.2 asks) is charged to its miner as
         any failed audit is, and its submission is voided so it is not paid."""
+        # Its outcomes computed ahead are not taken either: those records are audited again by their pass.
+        self._ahead = {sid: outcome for sid, outcome in self._ahead.items()
+                       if executor_id not in (outcome.get("scored_by") or ())}
         sids = self._remote_scored.pop(executor_id, [])
         if not sids:
             return []
@@ -2073,6 +2168,7 @@ class CorpusAuditor:
         self.seeded.set()
         reconcile = (asyncio.create_task(self._reconcile_quietly()) if self._slot_store is not None else None)
         rescan = asyncio.create_task(self._rescan_forever())
+        ahead = asyncio.create_task(self._audit_ahead_forever()) if self._remote is not None else None
         prefetch = (asyncio.create_task(self._prefetch_forever())
                     if self._prefetch and self._params.q < 1.0 and self._beacon is not None
                     and self._round_at is not None else None)
@@ -2099,7 +2195,7 @@ class CorpusAuditor:
                         f"{self._validator_errors} consecutive validator-side audit errors"
                     )
         finally:
-            others = [t for t in (prefetch, reconcile) if t is not None]
+            others = [t for t in (prefetch, reconcile, ahead, *set(self._ahead_flight.values())) if t is not None]
             for task in (rescan, *others):
                 task.cancel()
             await asyncio.gather(rescan, *others, return_exceptions=True)
