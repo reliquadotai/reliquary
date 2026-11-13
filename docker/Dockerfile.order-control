@@ -27,15 +27,19 @@ RUN --mount=type=bind,from=envs,target=/tmp/envs \
 # with its verifiers bridge at SANDBOX_COMMIT, and the env packages at the commit the
 # agentic eval sets pin (record 0's env_package). reliquary-harness comes with the base.
 ARG ENVS=15ad131b473f59f46b62d363bfacf430f4931f39
-ARG SBX=7743b57410bd10c8d30217388b28c2c589f39e31
+ARG SBX=d680d5e6f694c650f74b9dea4bc62930aad45da0
 ARG SWE_ENV_PACKAGE=reliquary-swe==0.3.0+ge8e1f1ed62a639ae.vfb2
 ARG TERMINAL_ENV_PACKAGE=reliquary-terminal==0.3.1+gcd4df2dcc1aaf175.vfb2
+# Terminal-Bench 2.1 (reliquary-terminal-bench): its own commit of the envs repository.
+ARG TB_ENVS=a7718445c156a36eec2835c43d5fb6c86c045a5e
+ARG TB_ENV_PACKAGE=reliquary-terminal-bench==0.1.0+g683caef3ad3c8770.vfb2
 RUN E="git+https://github.com/reliquadotai/reliquary-environments.git@${ENVS}" \
  && pip install \
       "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@${SBX}" \
       "reliquary-swe @ ${E}#subdirectory=environments/code/reliquary_swe" \
       "reliquary-terminal @ ${E}#subdirectory=environments/code/reliquary_terminal" \
-      "renderers==0.1.11"
+      "renderers==0.1.11" \
+ && pip install --no-deps "reliquary-terminal-bench @ git+https://github.com/reliquadotai/reliquary-environments.git@${TB_ENVS}#subdirectory=environments/code/reliquary_terminal_bench"
 
 # The Verifiers tasksets single-turn eval sets are graded with (built against these),
 # in their own directory at the END of sys.path: the venv's versions always win.
@@ -65,6 +69,7 @@ RUN reliquary corpus order-control-check
 # Fails the build unless a signed episode job could be served: the pinned sandbox,
 # harness and renderers, each env's bridged identity, and the tasksets.
 RUN SWE_ENV_PACKAGE="${SWE_ENV_PACKAGE}" TERMINAL_ENV_PACKAGE="${TERMINAL_ENV_PACKAGE}" SBX="${SBX}" \
+    TB_ENV_PACKAGE="${TB_ENV_PACKAGE}" \
     python - <<'PY'
 import importlib, importlib.metadata as md, importlib.util, os, sys
 from reliquary.sandbox import SANDBOX_COMMIT, require_sandbox, sandbox_commit_refusal
@@ -78,6 +83,7 @@ assert md.version("renderers") == RENDERERS_VERSION, md.version("renderers")
 importlib.import_module("reliquary_sandbox_verifiers")
 assert installed_env_package("reliquary-swe") == os.environ["SWE_ENV_PACKAGE"], installed_env_package("reliquary-swe")
 assert installed_env_package("reliquary-terminal") == os.environ["TERMINAL_ENV_PACKAGE"], installed_env_package("reliquary-terminal")
+assert installed_env_package("reliquary-terminal-bench") == os.environ["TB_ENV_PACKAGE"], installed_env_package("reliquary-terminal-bench")
 for name in ("aime25", "aime26", "gpqa", "ifbench", "mmlu_pro", "livecodebench", "hmmt_feb_2026",
              "graphwalks_single_turn", "openai_mrcr_single_turn", "hle_diamond_text_det", "scicode_steps"):
     importlib.import_module(name)

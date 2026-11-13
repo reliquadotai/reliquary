@@ -86,8 +86,10 @@ absent means `bash-vf-b2e4e81@1`. `EpisodeEnvPolicy.harness_pin()` carries it.
 - The window path (`episode_mining._episode_policies`) refuses a pin with variants.
 
 **Pins.** `agentic_swe.HARNESS_DIGESTS` lists every spec this build serves at the digest it was
-built against: `bash-vf-b2e4e81@1`, `bash-surface@1`, `mini-swe@2`, `openhands-xml@1`, `claude-code@1`, `codex@1`. `harness_refusal` checks the installed
-package against them.
+built against: `bash-vf-b2e4e81@1`, `bash-surface@1`, `mini-swe@2`, `openhands-xml@1`, `claude-code@1`, `codex@1`, `terminus-2@1`. `harness_refusal` checks the
+installed package against them. The digest covers every implementation module, so adding a spec
+(reliquary-harness d680d5e added `terminus-2@1`) moves every digest: contracts and templates that
+pin a spec must be re-pinned with the build that serves it.
 
 **Record 0 is unchanged** (DECIDED in implementation, against the earlier PROPOSED). The harness
 only decides tokens, and the validator renders and compares every token itself. The variant is
@@ -208,6 +210,13 @@ swe_v1=mini-swe@2,tmax_v1=bash-surface@1` writes `{id, version, digest}` into ea
 `episode.harness` (`cli.main.with_episode_harnesses`). The digest is the one this build serves,
 so a typo or a stale build fails at creation. An env not named keeps the compatibility harness.
 One harness per env, or a weighted mix drawn per lease (section 6c).
+
+**`terminus-2@1`** (`reliquary_harness.terminus`, reliquary-harness d680d5e): Harbor's Terminus 2
+(harbor 06d0e86a), the Terminal-Bench 2.x leaderboard agent, translated: its first user message (no
+system message), JSON actions, double-confirmed completion and 10,000-byte output limit; each turn's
+keystrokes run as one `bash` call in a fresh `bash -i` that restores the previous turn's cwd and
+environment. The pending confirmation is read from the prompt, so every `tool_calls` caller passes
+`prompt_ids`. No tmux, no summarization (the episode stops at `context_length`).
 
 **`mini-swe@2`** (`reliquary_harness.mini`, reliquary-harness 7d559fd): mini-swe-agent's official SWE-bench
 harness, `config/benchmarks/swebench.yaml` at 04d809ce (MIT), the configuration the SWE-bench bash-only

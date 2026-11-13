@@ -32,7 +32,7 @@ class SignedFake(FakeRenderer):
     """CALL is `bash {"command": "c<j>"}` (j = the call's index in its span), BAD a bash
     call with arguments `{`, EDIT an edit call."""
 
-    def tool_calls(self, completion_ids):
+    def tool_calls(self, completion_ids, prompt_ids=None):
         calls = []
         for token in completion_ids:
             if token == CALL:
@@ -94,6 +94,25 @@ def test_an_honest_episode_is_its_records():
         [("bash", {"command": "c0"}, "a.py\n")]
 
 
+def test_each_turn_is_read_with_the_prompt_it_answers():
+    """terminus-2 reads its pending confirmation from the prompt: every turn's calls are read
+    with the tokens before it (the prompt, then the earlier turns and observations)."""
+    seen_prompts = []
+
+    class Recording(SignedFake):
+        def tool_calls(self, completion_ids, prompt_ids=None):
+            seen_prompts.append(None if prompt_ids is None else list(prompt_ids))
+            return super().tool_calls(completion_ids, prompt_ids)
+
+    r0 = rec(0, 0, 0)
+    turns = [(SPAN + [CALL, TERM], [seen(r0)]), DONE]
+    tokens, spans = build(turns)
+    parse(turns, [r0], renderer=Recording())
+    full = list(PROMPT) + list(tokens)
+    assert seen_prompts and seen_prompts[0] == full[:len(PROMPT) + spans[0][0]]
+    assert all(p is not None for p in seen_prompts)
+
+
 def test_an_episode_without_a_call_has_no_record():
     assert parse([DONE], []).actions == ()
 
@@ -149,7 +168,7 @@ def test_a_record_that_is_not_the_models_call_is_a_mismatch(record):
 def test_arguments_are_compared_canonically():
     """Key order and spacing in the model's text do not matter; values do."""
     class Spaced(SignedFake):
-        def tool_calls(self, completion_ids):
+        def tool_calls(self, completion_ids, prompt_ids=None):
             return [("bash", '{ "timeout" : 5,  "command":"c0" }')] if CALL in completion_ids else []
 
     r0 = rec(0, 0, 0, arguments={"command": "c0", "timeout": 5})
@@ -182,7 +201,7 @@ def test_a_parser_failure_is_a_bad_turns_refusal():
     """The pinned parser never raises anything but `bad_turns` (task 4); it reaches the
     caller unchanged."""
     class Failing(SignedFake):
-        def tool_calls(self, completion_ids):
+        def tool_calls(self, completion_ids, prompt_ids=None):
             raise TrajectoryRefused("bad_turns", {"why": "the pinned parser failed on a span"})
 
     assert refused([(SPAN + [CALL, TERM], ["x"]), DONE], [rec(0, 0, 0)],
@@ -299,7 +318,7 @@ SCRIPT = {
 
 
 class Scripted(FakeRenderer):
-    def tool_calls(self, completion_ids):
+    def tool_calls(self, completion_ids, prompt_ids=None):
         return [SCRIPT[token] for token in completion_ids if token in SCRIPT]
 
 

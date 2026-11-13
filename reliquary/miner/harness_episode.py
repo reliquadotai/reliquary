@@ -142,7 +142,8 @@ class HarnessEpisodeRunner:
 
                 async def generate(prompt_ids, bridged_from):
                     turn = await engine.turn(prompt_ids, session_id=trace.id, bridged_from=bridged_from)
-                    if self._format_stop and turn_format_violation(renderer, turn.completion_ids):
+                    if self._format_stop and turn_format_violation(renderer, turn.completion_ids,
+                                                                       turn.prompt_ids):
                         raise _FormatError                     # logged by the engine: the episode's last turn
                     return turn
 

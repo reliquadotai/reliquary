@@ -136,9 +136,10 @@ SWE_PACKAGE = "reliquary-swe"
 # such a job still needs the package installed at the episode's pinned identity
 # (`agentic_swe.sandbox_support_refusal`): naming one here only lets a manifest carry it.
 # reliquary-terminal: TMax; reliquary-deepswe: DeepSWE v1.1 (Datacurve's 113 tasks);
-# reliquary-swebench-pro: SWE-bench Pro V2 (Scale AI, public set); reliquary-nl2repo: NL2Repo-Bench.
+# reliquary-swebench-pro: SWE-bench Pro V2 (Scale AI, public set); reliquary-nl2repo: NL2Repo-Bench;
+# reliquary-terminal-bench: Terminal-Bench 2.1 (docs/design/2026-11-13-terminal-bench-harbor.md).
 BRIDGED_EVAL_PACKAGES = frozenset({"reliquary-terminal", "reliquary-deepswe", "reliquary-swebench-pro",
-                                   "reliquary-nl2repo"})
+                                   "reliquary-nl2repo", "reliquary-terminal-bench"})
 EPISODE_ENV_PACKAGES = frozenset({SWE_PACKAGE, SUITE_PACKAGE}) | BRIDGED_EVAL_PACKAGES
 EPISODE_HARNESSES = frozenset({"bash", SUITE_HARNESS})
 # The packages each harness runs: never mixed.
@@ -197,11 +198,22 @@ class EpisodeProfile:
 # config/benchmarks/swebench.yaml): step_limit 250, 60 s per command, the model's own context
 # (capped here at 128k), a run that hits a limit submits nothing.
 SWEBENCH_BASH_ONLY = "swebench-bash-only"
+# The Terminal-Bench 2.x leaderboard (harbor-framework/terminal-bench-2-1, Terminus 2): no step
+# cap of its own (the task's agent timeout bounds a trial, 360 to 12,000 s, which the bridge
+# takes from the task as the episode's wall budget), the model's context (capped at 128k), 600 s
+# per command (Terminus never blocks on a command; ours run to completion within one call); 250
+# turns, the corpus wire's ceiling (the 128k context ends a run long before).
+TERMINAL_BENCH_TERMINUS_2 = "terminal-bench-terminus-2"
 EPISODE_PROFILES = {
     SWEBENCH_BASH_ONLY: EpisodeProfile(harness=("mini-swe", "2"), package="reliquary-swe",
                                        max_turns=250, max_total_tokens=131072,
                                        per_call_timeout_s=60, min_wall_s=14400,
                                        limit_cut_fails=True),
+    TERMINAL_BENCH_TERMINUS_2: EpisodeProfile(harness=("terminus-2", "1"),
+                                              package="reliquary-terminal-bench",
+                                              max_turns=250, max_total_tokens=131072,
+                                              per_call_timeout_s=600, min_wall_s=12000,
+                                              limit_cut_fails=True),
 }
 # The largest bounds any episode may declare (the wire's, `protocol.corpus_submission`).
 EPISODE_TURNS_CEILING = max([MAX_EPISODE_TURNS, *(p.max_turns for p in EPISODE_PROFILES.values())])

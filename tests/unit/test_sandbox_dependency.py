@@ -85,3 +85,9 @@ def test_a_machine_advertising_a_transcript_cap_over_the_wire_cap_is_refused():
     for caps in ({}, {"max_transcript_bytes": "8"}, {"max_transcript_bytes": True},
                  {"max_transcript_bytes": 0}, None):
         assert sandbox.transcript_cap_refusal(caps) is not None
+
+
+def test_the_egress_release_stays_compatible():
+    """d680d5e is 7743b57 (release-2026-11-13) plus the harness distribution's terminus-2@1:
+    the same sandbox code, so a job or an install at 7743b57 is served as at d680d5e."""
+    assert "7743b57410bd10c8d30217388b28c2c589f39e31" in sandbox.COMPATIBLE_SANDBOX_COMMITS

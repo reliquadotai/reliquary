@@ -83,7 +83,7 @@ BURN = "burn 4000000"                                  # 4000 s of CPU: past the
 class ScriptRenderer(FakeRenderer):
     """A bash call is CMD_OPEN, the command's characters, CMD_CLOSE."""
 
-    def tool_calls(self, completion_ids):
+    def tool_calls(self, completion_ids, prompt_ids=None):
         calls, text = [], None
         for token in completion_ids:
             if token == CMD_OPEN:

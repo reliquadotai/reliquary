@@ -41,7 +41,7 @@ dependencies = [
     # The agentic harness miners and validators share (render, parse, loop): one commit
     # of reliquary-sandbox's harness/ distribution. `agentic_swe.HARNESS_DIGEST` pins
     # the spec it must install; another digest refuses SWE and signed jobs.
-    "reliquary-harness[qwen] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@7d559fd16564ac16af52486fe6552084c685bca6#subdirectory=harness",
+    "reliquary-harness[qwen] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@d680d5e6f694c650f74b9dea4bc62930aad45da0#subdirectory=harness",
 ]
 
 [project.optional-dependencies]
@@ -65,13 +65,13 @@ wandb = [
 ]
 # Signed-episode sandboxes (plan 3): reliquary-sandbox, public, pinned by one commit.
 sandbox = [
-    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@7743b57410bd10c8d30217388b28c2c589f39e31",
+    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@d680d5e6f694c650f74b9dea4bc62930aad45da0",
 ]
 sandbox-miner = [
-    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@7743b57410bd10c8d30217388b28c2c589f39e31",
+    "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@d680d5e6f694c650f74b9dea4bc62930aad45da0",
 ]
 sandbox-test = [
-    "reliquary-sandbox[service] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@7743b57410bd10c8d30217388b28c2c589f39e31",
+    "reliquary-sandbox[service] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@d680d5e6f694c650f74b9dea4bc62930aad45da0",
 ]
 
 [project.scripts]

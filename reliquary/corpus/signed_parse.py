@@ -161,7 +161,7 @@ def parse_signed_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int]
             # The model's first malformed turn ends the episode: none of its calls was sent, it is not read.
             if end != len(tokens):
                 raise TrajectoryRefused(REASON_BAD_TURNS, {"trailing_tokens": len(tokens) - end})
-            if turn_format_violation(renderer, completion) is None:
+            if turn_format_violation(renderer, completion, full[:offset + start]) is None:
                 raise TrajectoryRefused(REASON_BAD_STOP, {"turn": k, "stop": stop, "why": "the last turn is well formed"})
             turns.append(ParsedTurn((), ()))
             continue
@@ -170,7 +170,7 @@ def parse_signed_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int]
             raise TrajectoryRefused(REASON_BAD_STOP, {"turn": k, "why": "final reasoning is not closed"})
         if canonical and not renderer.span_is_canonical(full[:offset + start], completion):
             raise TrajectoryRefused(REASON_BAD_TURNS, {"turn": k, "why": "span does not re-render to itself"})
-        pairs = list(renderer.tool_calls(completion))
+        pairs = list(renderer.tool_calls(completion, prompt_ids=full[:offset + start]))
         plans = [plan_call(name, arguments, offered) for name, arguments in pairs]
         positions = sent_positions(plans)
         sends = [(plan, position) for plan, position in zip(plans, positions)
