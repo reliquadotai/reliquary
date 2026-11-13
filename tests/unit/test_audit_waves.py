@@ -82,3 +82,10 @@ def test_a_drained_wave_wants_no_card_at_once():
     # Lower targets wait out the scale-down; a wave that drained does not.
     assert sizing.update("m", 1) == 2
     assert sizing.set("m", 0) == 0 and sizing.update("m", 0) == 0
+
+
+def test_a_job_no_longer_open_starts_its_wave_whatever_its_backlog():
+    # The control marks such a model nearly full: a closed order's audit must drain even under the size bar.
+    waves = _waves(min_items=2000.0)
+    state = waves.update("m", expected=3, items_per_second=None, nearly_full=True, oldest_wait=0.0)
+    assert (state["phase"], state["reason"]) == (WAVE_DRAINING, "nearly_full")

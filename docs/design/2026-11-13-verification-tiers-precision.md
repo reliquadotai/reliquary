@@ -127,7 +127,8 @@ order on the same model turns waves off for that model):
   - the expected audit work is worth a card: expected items / measured items-per-second >= 
     `RELIQUARY_ORDER_AUDIT_WAVE_MIN_SECONDS` (1800 s); before any rate is measured, expected items >=
     `RELIQUARY_ORDER_AUDIT_WAVE_MIN_ITEMS` (2000);
-  - an order is nearly done: prompts full >= `RELIQUARY_ORDER_AUDIT_WAVE_FINISH_SHARE` (0.9) of its prompts;
+  - an order is nearly done: prompts full >= `RELIQUARY_ORDER_AUDIT_WAVE_FINISH_SHARE` (0.9) of its prompts, or
+    its job is no longer open (full, retired by the platform's run deadline or a cancel);
   - the oldest record waiting for an audit is older than `RELIQUARY_ORDER_AUDIT_WAVE_MAX_WAIT_SECONDS` (3 h),
     which bounds a miner's wait for pay.
 - **draining**: sized as today (`executors_for_backlog`), until the expected audits reach 0, then back to waiting.
@@ -149,6 +150,13 @@ forfeit hold during the wait. Miners on a wave order are paid later (up to the m
 a running order of such a model does not keep a card (it counts as audit-idle). Extra cards still follow
 `executors_needed`, which a draining wave sets. Batch orders send `audit_waves: true` unless
 `BATCH_AUDIT_WAVES = "0"`. Cards are already per model (`order_executors` keyed `model@revision`).
+
+With platform #213 (run deadline counted from the first ready audit executor, executors sized to one sequence):
+waves decide *when* a card is rented and returned, #213 decides its size and when the deadline starts. A wave
+order waiting for its wave never ends `executor_unavailable`: while its model's wave is `waiting` and no card was
+ever ready, its run deadline counts from the order's start instead; once a wave is `draining`, the
+`ORDER_EXECUTOR_WAIT_SECONDS` clock counts from the wave's start. The fleet caches the control's wave phases
+(`admin_cache` `order_audit_waves`) for the order loop.
 
 ### 6.5 Expected cost
 

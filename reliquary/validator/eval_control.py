@@ -2021,8 +2021,11 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 model = (job.checkpoint_repo, job.checkpoint_revision)
                 expected = auditor.expected_audits(pending)
                 total, full = status.get("prompts_total"), status.get("prompts_full")
-                if isinstance(total, int) and isinstance(full, int) and total > 0 \
-                        and full >= waves.settings.finish_share * total:
+                # Nearly full, or no longer open (full, retired by its run deadline or a cancel): what it holds
+                # is all it will hold, so its audit must drain whatever its size.
+                if (isinstance(total, int) and isinstance(full, int) and total > 0
+                        and full >= waves.settings.finish_share * total) \
+                        or status.get("state") in ("full", "retired", "drained"):
                     nearly_full[model] = True
                 try:
                     received = auditor.oldest_pending_received_at()
