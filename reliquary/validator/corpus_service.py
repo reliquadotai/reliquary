@@ -2971,6 +2971,8 @@ class CorpusJobRoutes:
         self.paused: set[str] = set()
         # Jobs kept from miners until their condition holds (an order's audit executor ready).
         self.held: dict[str, Callable[[], bool]] = {}
+        # Why a held job is held, when its holder says (e.g. ``no_gateway``).
+        self.hold_reasons: dict[str, Callable[[], str | None]] = {}
         # Handlers past the retired check. admission_pending also accounts for
         # taken turns that continue after their HTTP handler is cancelled.
         self.in_flight: collections.Counter = collections.Counter()
@@ -2991,9 +2993,14 @@ class CorpusJobRoutes:
     def retire(self, job_id: str) -> None:
         self.retired.add(job_id)
 
-    def hold(self, job_id: str, until: Callable[[], bool]) -> None:
-        """Keep the job from miners, as paused, until ``until()`` first holds."""
+    def hold(self, job_id: str, until: Callable[[], bool], *, why: Callable[[], str | None] | None = None) -> None:
+        """Keep the job from miners, as paused, until ``until()`` first holds (then never again); ``why()``
+        says why it is still held."""
         self.held[job_id] = until
+        if why is not None:
+            self.hold_reasons[job_id] = why
+        else:
+            self.hold_reasons.pop(job_id, None)
 
     def is_held(self, job_id: str) -> bool:
         until = self.held.get(job_id)
@@ -3006,8 +3013,21 @@ class CorpusJobRoutes:
             logger.exception("corpus job %s: its hold could not be checked; still held", job_id)
             return True
         del self.held[job_id]
+        self.hold_reasons.pop(job_id, None)
         logger.info("corpus job %s: released to miners", job_id)
         return False
+
+    def held_reason(self, job_id: str) -> str | None:
+        """Why the job is held (``held`` when its holder gives no reason), or None once released."""
+        if not self.is_held(job_id):
+            return None
+        why = self.hold_reasons.get(job_id)
+        try:
+            reason = why() if why is not None else None
+        except Exception:
+            logger.exception("corpus job %s: its hold reason could not be read", job_id)
+            reason = None
+        return reason or "held"
 
     def set_admission(self, job_id: str, admission: str) -> None:
         if admission == "paused":

@@ -81,6 +81,11 @@ def order_audit_scorers(env=None) -> int:
         raise ValueError(f"{SCORERS_ENV} must be 1 to {MAX_SCORERS}, got {value}")
     return value
 STATUS_SECONDS = 30.0
+# Why a job is still kept from miners (control status ``jobs[...]["held"]``).
+HELD_NO_GATEWAY = "no_gateway"
+HELD_AWAITING_AUDIT = "awaiting_audit"
+# Bound on resolving an episode order's first task for its options digest.
+GATEWAY_DIGEST_TIMEOUT_S = 60.0
 # Audit throughput is measured over this window: items scored per second an executor held a lease.
 THROUGHPUT_WINDOW_SECONDS = 900.0
 # Enough executors that the expected audits of a model's orders drain within this (env: DRAIN_ENV).
@@ -1615,7 +1620,17 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         # loaded it would only wait unaudited, or be lost on an order that never gets one.
         protocol = AUDIT_PROTOCOL_V3 if has_draw(job) else None
         # And until its auditor has read the job back (a restart): what miners send before would pile up unjudged.
-        routes.hold(str(job.job_id), lambda: w.auditor.seeded.is_set() and dispatcher.audit_ready(key, protocol))
+        # An episode order also waits for a gateway serving its env: miners refused sessions give up on it.
+        gateway_ready = episode_gateway_ready(w) if job.episode is not None else None
+
+        def why_held() -> str | None:
+            if gateway_ready is not None and not gateway_ready():
+                return HELD_NO_GATEWAY
+            if not (w.auditor.seeded.is_set() and dispatcher.audit_ready(key, protocol)):
+                return HELD_AWAITING_AUDIT
+            return None
+
+        routes.hold(str(job.job_id), lambda: why_held() is None, why=why_held)
         if (declared or {}).get("reuse_auditors_only") is True:
             dispatcher.reuse_only_jobs.add(job.job_id)
         served[job.job_id] = w
@@ -1633,6 +1648,25 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             tokenizer=w.tokenizer, vocab_size=w.vocab_size, chunk_tokens=w.proof.chunk_tokens,
             publish=False, **(signed_wiring or {})))
         wire_signed_grader(w, judge_records=records, parse_executor=grade_parse_threads)
+        # The options digest its sessions are placed under (its first task's), for the gateway hold.
+        w.env_options_sha256 = None
+        try:
+            task = await asyncio.wait_for(w.sandbox_view.resolve_task(0), GATEWAY_DIGEST_TIMEOUT_S)
+            w.env_options_sha256 = getattr(task, "env_options_sha256", None)
+        except Exception as exc:
+            logger.warning("episode order %s: its options digest is unresolved (%s); held for a gateway "
+                           "at its package only", job.job_id, type(exc).__name__)
+
+    def episode_gateway_ready(w) -> Callable[[], bool]:
+        """Whether a fresh, active gateway serves the episode's env at its package and options (the
+        placement's own check) and has slots for it. Once released, a job stays open (`routes.hold`)."""
+        spec = w.job.episode.sandbox
+        options = getattr(w, "env_options_sha256", None)
+
+        def ready() -> bool:
+            return sandbox.fleet.slots_serving_env(str(spec.env), str(spec.env_package),
+                                                   env_options_sha256=options) > 0
+        return ready
 
     async def settle_forever(w, every: float = 60.0) -> None:
         # After the auditor's start: its listing and reads come first after a restart.
@@ -1785,6 +1819,12 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             entry.update({key: status.get(key) for key in (
                 "state", "prompts_total", "prompts_full", "prompts_complete",
                 "prompts_exhausted", "complete")})
+            # Kept from miners, and why (``no_gateway``, ``awaiting_audit``); absent once open.
+            held = routes.held_reason(job_id)
+            if held is not None:
+                entry["held"] = held
+            else:
+                entry.pop("held", None)
             # What sizes its cap (``admin.cap_sizing``): its model, cards, and what it paid and has accrued.
             settler = getattr(served.get(job_id), "settler", None)
             if settler is not None:

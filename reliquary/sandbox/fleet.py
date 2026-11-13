@@ -621,6 +621,18 @@ class Fleet:
                 slots += max(0, int(document.get("capacity") or 0))
         return slots
 
+    def slots_serving_env(self, env: str, env_package: str, *, env_options_sha256: str | None = None,
+                          now: float | None = None) -> int:
+        """The session slots of the machines ``serving`` ``env`` at ``env_package`` (and options) that hold some of
+        its images: 0 while no gateway could take a session of it (an episode order is held until then). Memory only."""
+        now = self._clock() if now is None else now
+        slots = 0
+        for machine_id in self.serving(env, env_package, env_options_sha256=env_options_sha256, now=now):
+            document = self._reports[machine_id]
+            if self._holds_images(document, env):
+                slots += max(0, int(document.get("capacity") or 0))
+        return slots
+
     def image_set_images(self, env: str, lock_sha256: str, now: float | None = None) -> frozenset[str]:
         """The images the fresh machines reporting image lock ``lock_sha256`` for ``env`` hold, together (which
         refused opens an image set's saturation counts). Memory reads only."""

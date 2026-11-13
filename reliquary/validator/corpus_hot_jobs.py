@@ -563,11 +563,14 @@ class CorpusJobSet:
 
     def _observed_admission(self, job_id: str, status: dict) -> dict:
         status["admission"] = "paused" if job_id in self._routes.paused else "open"
-        is_held = getattr(self._routes, "is_held", None)  # only an order control holds jobs
-        if is_held is not None and is_held(job_id):
+        held_reason = getattr(self._routes, "held_reason", None)  # only an order control holds jobs
+        reason = held_reason(job_id) if held_reason is not None else None
+        if reason is not None:
             status["awaiting_audit"] = True
+            status["held"] = reason
         else:
             status.pop("awaiting_audit", None)
+            status.pop("held", None)
         return status
 
     async def _recompute(self, job_id: str, cached) -> dict:

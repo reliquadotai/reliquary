@@ -164,7 +164,7 @@ def test_a_qualified_order_never_runs_an_episode(admin, swe_set, qwen35):  # noq
 # -- the order control wires and pays a signed episode order ------------------------------------
 
 
-def _control(admin, tmp_path, monkeypatch, sandbox):  # noqa: F811
+def _control(admin, tmp_path, monkeypatch, sandbox, resolver_factory=None):  # noqa: F811
     """The order control over the admin's bucket, its background loops idle (the test drives them)."""
     from reliquary.environment.agentic_swe import SignedSweSource
     from reliquary.eval.rows import RowMap
@@ -203,7 +203,7 @@ def _control(admin, tmp_path, monkeypatch, sandbox):  # noqa: F811
         sandbox=sandbox, sandbox_down="its sandbox services failed to start" if sandbox is None else None,
         model_dir_for=lambda repo, revision: str(tmp_path),
         signed_wiring={"intake_factory": lambda job, **kw: SimpleNamespace(source=source),
-                       "resolver_factory": lambda split: SimpleNamespace(resolve=None)})
+                       "resolver_factory": resolver_factory or (lambda split: SimpleNamespace(resolve=None))})
 
 
 def _order_services(tmp_path, route_prefix):
@@ -298,6 +298,85 @@ def test_an_episode_order_is_wired_and_never_paid_before_its_grade(admin, swe_se
     unpaid, paid, docs = asyncio.run(go())
     assert unpaid is None and paid == 3
     assert docs[(3, 7)]["rewards_by_hotkey"] == {"5Hot": pytest.approx(0.02)}
+
+
+def test_an_episode_order_is_held_from_miners_until_a_gateway_serves_its_env(admin, swe_set, qwen35,  # noqa: F811
+                                                                            tmp_path, monkeypatch):
+    pytest.importorskip("reliquary_sandbox.attest")
+    import httpx
+
+    from reliquary.protocol.sandbox_session import JOB_SCOPED_PREFIX
+    from reliquary.sandbox.tasks import ResolvedTask
+
+    digest = "d" * 64
+
+    async def resolve(index):
+        return ResolvedTask("img", env_options_sha256=digest)
+
+    assert admin("POST", "/admin/v1/jobs", _order()).status_code == 201
+    services = _order_services(tmp_path, JOB_SCOPED_PREFIX)
+    slots, asked = {"n": 0}, []
+
+    def slots_serving_env(env, env_package, *, env_options_sha256=None, now=None):
+        asked.append((env, env_package, env_options_sha256))
+        return slots["n"]
+
+    services.fleet.slots_serving_env = slots_serving_env
+    app, job_set = _control(admin, tmp_path, monkeypatch, services,
+                            resolver_factory=lambda split: SimpleNamespace(resolve=resolve))
+    app.state.dispatcher.audit_ready = lambda *args: True
+    job_id = "order-eval-swe1"
+
+    async def go():
+        await job_set.refresh()
+        w = app.state.eval_served[job_id]
+        w.auditor.seeded.set()
+        spec = w.job.episode.sandbox
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://o") as client:
+            async def listed():
+                return (await client.get("/corpus/jobs")).json()
+
+            # No gateway yet: listed as starting, not open; its status says why.
+            held = await listed()
+            assert held["jobs"] == [] and held["orders"][0]["state"] == "starting"
+            assert (await app.state.control_status())["jobs"][job_id]["held"] == "no_gateway"
+            assert (await client.get(f"/corpus/jobs/{job_id}/status")).json()["held"] == "no_gateway"
+            assert asked[-1] == (str(spec.env), str(spec.env_package), digest)
+            # A gateway serves it: open at once, and it stays open if the fleet drops again.
+            slots["n"] = 4
+            assert (await listed())["jobs"] == [job_id]
+            assert "held" not in (await app.state.control_status())["jobs"][job_id]
+            slots["n"] = 0
+            assert (await listed())["jobs"] == [job_id]
+        for tasks in job_set._tasks.values():
+            for task in tasks:
+                task.cancel()
+
+    asyncio.run(go())
+
+
+def test_an_episode_order_waits_for_its_audit_after_its_gateway(admin, swe_set, qwen35, tmp_path,  # noqa: F811
+                                                                monkeypatch):
+    pytest.importorskip("reliquary_sandbox.attest")
+    from reliquary.protocol.sandbox_session import JOB_SCOPED_PREFIX
+
+    assert admin("POST", "/admin/v1/jobs", _order()).status_code == 201
+    services = _order_services(tmp_path, JOB_SCOPED_PREFIX)
+    services.fleet.slots_serving_env = lambda *a, **k: 2
+    app, job_set = _control(admin, tmp_path, monkeypatch, services)
+    job_id = "order-eval-swe1"
+
+    async def go():
+        await job_set.refresh()
+        # The resolver fails here: held for a gateway at the package alone, never refused.
+        assert app.state.eval_served[job_id].env_options_sha256 is None
+        routes = job_set._routes
+        assert routes.held_reason(job_id) == "awaiting_audit" and routes.open_jobs() == []
+        for tasks in job_set._tasks.values():
+            for task in tasks:
+                task.cancel()
+
+    asyncio.run(go())
 
 
 def test_the_order_control_reads_only_its_own_sandbox_key(tmp_path):

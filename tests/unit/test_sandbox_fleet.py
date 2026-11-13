@@ -975,3 +975,23 @@ def test_a_prefix_must_be_long_enough(tmp_path):
         Fleet(read_documents=read, machine_prefixes=["m-gw"])
     with pytest.raises(ValueError):
         Fleet(read_documents=read, machine_prefixes="m-gw-xx")
+
+
+def test_a_gateway_serves_an_env_only_at_its_package_options_and_images(tmp_path):
+    fleet, machine, served, clock = make(tmp_path)
+    digest = {ENV: "d" * 64}
+    assert fleet.slots_serving_env(ENV, ENV_PACKAGE, env_options_sha256="d" * 64, now=NOW) == 0  # no report yet
+    served[ADDRESS] = capacity_report(machine, at=NOW, env_options_sha256=digest, capacity=4, free=0)
+    asyncio.run(fleet.poll_once())
+    assert fleet.slots_serving_env(ENV, ENV_PACKAGE, env_options_sha256="d" * 64, now=NOW) == 4
+    assert fleet.slots_serving_env(ENV, ENV_PACKAGE, now=NOW) == 4
+    assert fleet.slots_serving_env(ENV, ENV_PACKAGE, env_options_sha256="e" * 64, now=NOW) == 0
+    assert fleet.slots_serving_env(ENV, "reliquary-swe==0.0.9", now=NOW) == 0
+    # A machine whose image lock says none of the env's images is present serves nothing of it.
+    served[ADDRESS] = capacity_report(machine, at=NOW + 1, env_options_sha256=digest,
+                                      env_image_locks={ENV: {"sha256": "f" * 64, "images": 3, "present": 0}})
+    clock.now = NOW + 1
+    asyncio.run(fleet.poll_once())
+    assert fleet.slots_serving_env(ENV, ENV_PACKAGE, now=NOW + 1) == 0
+    # Stale: no gateway.
+    assert fleet.slots_serving_env(ENV, ENV_PACKAGE, now=NOW + 10_000) == 0

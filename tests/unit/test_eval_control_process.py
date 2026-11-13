@@ -172,6 +172,8 @@ def test_one_process_serves_eval_jobs_of_two_models(world, monkeypatch):
         assert {job: (status["jobs"][job]["audits_pending"], status["jobs"][job]["audits_idle_since"])
                 for job in ("order-eval-a", "order-eval-b")} == {"order-eval-a": (None, None),
                                                                  "order-eval-b": (None, None)}
+        # Held for their audit only: a gateway is never awaited for a single-turn order.
+        assert {status["jobs"][job].get("held") for job in ("order-eval-a", "order-eval-b")} == {"awaiting_audit"}
         # Nothing seeded yet: the backlog is unknown, so nothing is wanted yet (the fleet keeps what it has).
         assert {m: (v["expected_audits"], v["executors_wanted"], v["idle_executors"], v["executors_allowed"])
                 for m, v in status["models"].items()} == {
