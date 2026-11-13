@@ -934,7 +934,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             declared_source = {"set_id": source.set_id, "problems": body.prompt_count}
         else:
             if body.episode is not None:
-                raise HTTPException(status_code=422, detail="an episode order plays a SWE or TMax eval set")
+                raise HTTPException(status_code=422, detail="an episode order plays a SWE, TMax or suite eval set")
             episode = None
             refusal = qual.order_environment_refusal(body.env)
             if refusal is not None:
@@ -997,8 +997,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
     def order_episode(body: CreateJob, card: Mapping, pin, *, evaluation: bool) -> dict | None:
         """The order's episode as its manifest carries it, None on a single-turn set: on a SWE or bridged (TMax)
-        set a signed-sandbox episode that agrees with the set (``eval.episode_jobs``), on a model that has its
-        renderer."""
+        set a signed-sandbox episode, on a suite set (``episode``: a replayed tool world) a suite one, that agrees
+        with the set (``eval.episode_jobs``), on a model that has its renderer."""
         from reliquary.corpus.job import episode_contract
         from reliquary.eval.episode_jobs import episode_renderer_refusal, refuse_episode_disagreeing_with_set
 
@@ -1008,10 +1008,10 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 raise HTTPException(status_code=422, detail=f"set {body.eval_set_id} holds single-turn problems: "
                                     "an order on it has no episode")
             return None
-        if not evaluation or interaction not in ("swe", "signed_bridged"):
+        if not evaluation or interaction not in ("swe", "signed_bridged", "episode"):
             raise HTTPException(status_code=422, detail=(
-                f"set {body.eval_set_id} holds {interaction} tasks: an order plays only SWE or TMax sets, "
-                "in the signed sandbox, as an evaluation"))
+                f"set {body.eval_set_id} holds {interaction} tasks: an order plays only SWE or TMax sets "
+                "(in the signed sandbox) or suite episode sets (replayed), as an evaluation"))
         if body.thinking:
             raise HTTPException(status_code=422, detail="an episode renders through its own renderer: thinking is false")
         try:
@@ -1020,7 +1020,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             episode = episode_contract(body.episode, eval_job=True)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)[:500]) from exc
-        refusal = episode_renderer_refusal(pin.architecture, episode["renderer"])
+        refusal = episode_renderer_refusal(pin.architecture, episode["renderer"],
+                                           suite=episode.get("harness") == "suite")
         if refusal is not None:
             raise HTTPException(status_code=422, detail=refusal)
         return episode
