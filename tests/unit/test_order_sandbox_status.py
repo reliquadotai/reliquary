@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("reliquary_sandbox")
+
 from reliquary.sandbox.sessions import CLOSED, HANDED_BACK, LIVE, SUBMITTED, SandboxPolicy, SessionBook, SessionRecord
 from reliquary.validator.order_sandbox_status import (
     EpisodeTokens,
