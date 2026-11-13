@@ -2319,6 +2319,8 @@ def eval_build_set(
     bridge_file: str | None = typer.Option(None, "--bridge-file",
         help="A bridged eval env's source (e.g. reliquary-terminal): JSON {options, "
              "image_lock_sha256}, as its gateway serves it"),
+    purpose: str | None = typer.Option(None, "--purpose",
+        help="batch: an agentic (SWE or bridged) set for batch orders, never on a held-out split"),
 ) -> None:
     """Freeze problems into a set: prompts.jsonl, grading.jsonl, set.json.
 
@@ -2336,6 +2338,8 @@ def eval_build_set(
             raise ValueError("--protocol must hold a JSON object")
         if (preset is None) == (source is None):
             raise ValueError("give exactly one of --preset and --source")
+        if purpose is not None and (preset is not None or interaction != "single_turn"):
+            raise ValueError("--purpose goes with --source (a SWE or bridged set)")
         if interaction != "single_turn":
             if preset is not None or source is None or count is None or seed is None \
                     or sample is not None or start or split or taskset_args:
@@ -2365,12 +2369,14 @@ def eval_build_set(
             card = sets.build_source_set(source, out=out, split=split, start=start,
                                          count=count, sample=sample, seed=seed,
                                          set_id=set_id, taskset_args=args, bridge=bridge,
-                                         open_environment=sets.open_source, protocol=reviewed)
+                                         open_environment=sets.open_source, protocol=reviewed,
+                                         purpose=purpose)
     except (ValueError, OSError, KeyError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     keys = ("set_id", "env", "source", "split", "count", "index_range", "prompts_sha256",
-            "grading_sha256", "disjointness", "taskset", "needs_runtime", "protocol", "protocol_sha256")
+            "grading_sha256", "disjointness", "taskset", "needs_runtime", "protocol", "protocol_sha256",
+            "purpose")
     public = {k: card[k] for k in keys if k in card}
     if card.get("protocol") and card.get("taskset"):
         from reliquary.eval.protocol import public_taskset

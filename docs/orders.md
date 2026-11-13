@@ -15,6 +15,8 @@ graded into a report; a batch audits a share (15 %) and is delivered as samples.
 | `/v1/batches` (file)  | an upload's set                 | none                      | `order-gen-`   |
 | batch on an env       | a catalog env range             | none (or annotate)        | `order-gen-`   |
 | `/evaluations`        | one of our sets, or an upload's | report                    | `order-eval-`  |
+| agentic batch         | a SWE/TMax set frozen for batch | always (signed sandbox)   | `order-gen-`   |
+| agentic eval          | a SWE/TMax eval set             | report (signed sandbox)   | `order-eval-`  |
 
 ## 1. Sources
 
@@ -88,6 +90,23 @@ forward is checked once per architecture, before it enters the preset.
   `granted` / `granted_second` / `taken` / `released` / `expired` logs one INFO line
   (`draw lease <event> job= prompt= slot= hotkey= secs=`); leases are never renewed.
 
+### Agentic orders (SWE, TMax)
+
+A forced-draw order on a SWE (`swe`) or TMax (`signed_bridged`) set carries the `episode` that plays its
+references (`CreateJob.episode`, as `jobs create --episode-file`): a signed-sandbox episode on the set's split,
+rendered by the model's episode renderer (`renderers:qwen38`, Qwen3.5-family architectures only), `thinking`
+false, `max_new_tokens` = `episode.max_tokens_per_turn`. The admin checks the episode against the set
+(`eval.episode_jobs`). Every episode is graded by the sandbox gateway in a pristine box, its reward signed into
+the final record (`validator/signed_grading.py`); a submission is paid only once graded, for eval and batch alike.
+
+- **Evaluation** (`order-eval-`): any of our SWE/TMax eval sets; graded into a report from the signed grades.
+- **Batch** (`order-gen-`): only a set frozen for batch, `reliquary eval build-set --source reliquary-swe --split r2e
+  --purpose batch` (card `purpose: "batch"`). Our eval sets stay held out: a batch never draws from them, nor
+  from a held-out split (`sets.HELD_OUT_EPISODE_SPLITS`: `reliquary-swe:eval`, `reliquary-terminal:tmax_sft`),
+  nor from `train` (a release predating set-sourced episode jobs would mine the split's own rows). Its job submits
+  on its scoped route (`submit: "scoped"`), sessions under `/corpus/jobs/{job_id}/sandbox/sessions`; its audit
+  share is the order's `audit_q` (the platform asks 15 %). It is always graded: see delivery.
+
 ## 4. Audits
 
 The order control loads no model: each audit batch goes to a GPU executor of the order's model, which
@@ -122,9 +141,30 @@ One delivery for every order (`reliquary/corpus/delivery.py`); the eval grading 
 - `report.json`: counts, the verification block (draw key, judge, audited share, refusals), and the billing basis:
   verified tokens of delivered rows.
 
+### Agentic (signed-sandbox) orders
+
+v3 only (v2 refuses an episode job); one row per **certified** trajectory (`delivery.episode_rows_v3`), its
+messages rebuilt from the proven tokens with the pinned renderer and its tool outputs from the signed records
+(`episode_row`), never from miner text. The admin parses them with the job's renderer (its checkpoint's tokenizer
+files) and needs `reliquary-sandbox` installed.
+
+- `filter`: `annotate` (default: every certified trajectory with its grade) or `drop` (successes only);
+  `none` is refused: the grade is always there. No `dedupe`. `include_truncated: false` leaves out trajectories
+  stopped at `context_length` or `max_turns`.
+- Parquet columns (`V3_EPISODE_ROW_FIELDS`): ids (`problem_id`, `custom_id`, `task_id`, `prompt_index`,
+  `submission_id`), the draw (`draw_slot`, `sample_index`, `seed`), `messages` (JSON: system, user, assistant
+  turns with `tool_calls`, `tool` outputs), the proven `tokens` + `assistant_mask` + `turns`, `final_diff`,
+  `stop`/`finish_reason`, `prompt_tokens`, `completion_tokens` (the model's turns), `audited`, `draw_match`, and
+  the grade: `reward`, `graded_success` (reward 1), `certified`.
+- `openai_jsonl`: one line per task, a `chat.completion` whose choices are its trajectories: `message` is the
+  last assistant message, `messages` the whole transcript, `reliquary` the grade, draw, audit and `final_diff`.
+- A trajectory whose grade is missing, held (quarantined executor) or uncertified is never delivered: counted
+  under `counts.episodes`, and its task is short in the errors file.
+- Billing basis: completion tokens of the delivered trajectories (the model's turns, not tool outputs). Sandbox
+  time is billed by the platform (gateway hours), not in this report.
+
 ## 7. Not yet
 
-- Agentic environments (episodes, sandboxes) as order sources: the source is designed to take them; the
-  suite-harness draw is the missing piece.
+- Suite-harness episodes (telecom, EnvScaler) as order sources: the suite episode miner has no forced draw yet.
 - Logprobs computed by the validator, Hugging Face push.
 - Architectures beyond the preset (Llama, Mistral, Gemma) after a GPU check of each.

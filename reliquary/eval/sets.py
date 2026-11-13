@@ -26,6 +26,21 @@ SET_SCHEMA = "reliquary/eval-set/v1"
 RL_SPLIT = "train"
 SWE_SOURCE = "reliquary-swe"
 _SET_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
+# A set frozen for agentic batch orders (``purpose: "batch"``): its trajectories are delivered as data.
+BATCH_PURPOSE = "batch"
+# The agentic splits our evaluations hold out: never a batch set's (source, split).
+HELD_OUT_EPISODE_SPLITS = frozenset({(SWE_SOURCE, "eval"), ("reliquary-terminal", "tmax_sft")})
+
+
+def batch_set_refusal(card) -> str | None:
+    """Why a set cannot source an agentic batch order, or None: only an agentic (SWE or TMax) set frozen
+    with ``purpose: "batch"``, never on a held-out split."""
+    if card.get("purpose") != BATCH_PURPOSE or card.get("interaction") not in ("swe", "signed_bridged"):
+        return (f"set {card.get('set_id')} is an evaluation set: a generation order draws from an upload or "
+                "from an agentic set frozen for batch (--purpose batch)")
+    if (card.get("source"), card.get("split")) in HELD_OUT_EPISODE_SPLITS:
+        return f"set {card.get('set_id')} draws from a held-out split ({card.get('source')}:{card.get('split')})"
+    return None
 
 
 @dataclass(frozen=True)
@@ -510,8 +525,12 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
                      open_bridged: Callable[..., Any] | None = None,
                      open_environment: Callable[[str, str], Any] = open_source,
                      open_taskset: Callable[..., Any] | None = None,
-                     clock: Callable[[], float] = time.time) -> dict:
+                     clock: Callable[[], float] = time.time, purpose: str | None = None) -> dict:
     """Freeze rows ``[start, start + count)`` of any source, whole or sampled.
+
+    ``purpose="batch"`` freezes an agentic (SWE or bridged) set for batch orders, whose trajectories are
+    delivered: refused on a held-out split (``HELD_OUT_EPISODE_SPLITS``) and on ``train`` (a release that
+    predates set-sourced episode jobs would mine the split's own rows there).
 
     A catalog environment at any split, or ``verifiers:<taskset-id>``: an
     installed single-turn Verifiers taskset under ``taskset_args``. The four
@@ -563,6 +582,11 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
         interaction = "episode" if spec.interaction_mode == "episode" else INTERACTION
         environment, length_of = None, None
     split = split or RL_SPLIT
+    if purpose is not None:
+        if purpose != BATCH_PURPOSE or interaction not in ("swe", "signed_bridged"):
+            raise ValueError(f"purpose {purpose!r}: only an agentic (SWE or bridged) set is frozen for batch")
+        if (source, split) in HELD_OUT_EPISODE_SPLITS or split == RL_SPLIT:
+            raise ValueError(f"{source}:{split} is held out or the train split: a batch set takes another split")
     directory = _empty_directory(out)
     if environment is None and length_of is None:
         environment = open_environment(source, split)
@@ -621,6 +645,7 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
         "default_max_new_tokens": getattr(profile, "max_new_tokens", None),
         "environment_manifest_sha256": getattr(profile, "environment_manifest_sha256", None),
         "disjointness": overlap,
+        **({"purpose": purpose} if purpose is not None else {}),
     }
     if interaction != INTERACTION:
         card["renderer_id"] = getattr(spec, "renderer_id", None)
@@ -730,6 +755,9 @@ def build_episode_set(source: str, *, out: str | Path, interaction: str, count: 
 
 
 __all__ = [
+    "BATCH_PURPOSE",
+    "HELD_OUT_EPISODE_SPLITS",
+    "batch_set_refusal",
     "CORPUS_RANGES",
     "HELD_OUT",
     "HeldOut",

@@ -538,3 +538,161 @@ def test_an_episode_order_with_ungraded_passes_waits_for_its_grader(admin, swe_s
     _graded_episodes(admin, rewards=[1.0, 1.0, 1.0], ungraded={f"{0:064x}"})
     response = _grade(admin)
     assert response.status_code == 409 and "job_not_graded" in response.text, response.text
+
+
+# -- agentic batch (generation) orders ---------------------------------------------------------
+
+BATCH_SET = "swe-r2e-batch-n4"
+
+
+@pytest.fixture
+def batch_set(admin, swe_set):  # noqa: F811
+    """A SWE set frozen for batch orders, on the r2e split."""
+    from reliquary.corpus.delivery import LocalDirectorySink
+    from reliquary.eval.sets import build_source_set
+    from reliquary.eval.storage import publish_set
+
+    card = build_source_set("reliquary-swe", split="r2e", count=4, set_id=BATCH_SET, out=admin.root / "batch",
+                            clock=lambda: 1.0, purpose="batch")
+    asyncio.run(publish_set(admin.root / "batch", platform=LocalDirectorySink(admin.root / "p"),
+                            subnet=SubnetEvalStore()))
+    return card
+
+
+def _batch(**kw):
+    episode = _swe_episode(env={**_swe_episode()["env"], "split": "r2e"})
+    return _order(**{"job_id": "order-gen-swe1", "eval_set_id": BATCH_SET, "episode": episode, **kw})
+
+
+def test_a_batch_order_on_a_batch_set_declares_its_signed_episode_job(admin, batch_set, qwen35):  # noqa: F811
+    from reliquary.corpus.job import is_signed_sandbox
+    from reliquary.validator.eval_control import order_job_refusal, qualification_refusal
+
+    # The platform asks a batch's sampled audit share (the admin's default is every submission).
+    response = admin("POST", "/admin/v1/jobs", _batch(audit_q=0.15))
+    assert response.status_code == 201, response.text
+    job, declared = _served("order-gen-swe1")
+    assert is_signed_sandbox(job) and job.submit == "scoped" and job.episode.env.split == "r2e"
+    assert declared["kind"] == qual.GENERATION and declared["audit_q"] == pytest.approx(0.15)
+    entry = admin.registry["entries"]["order-gen-swe1"]
+    assert order_job_refusal(entry, job) is None
+    assert qualification_refusal(entry, job, declared, None) is None
+    replayed = replace(job, episode=replace(job.episode, execution="replay", sandbox=None))
+    assert "signed sandbox" in order_job_refusal(entry, replayed)
+
+
+@pytest.mark.parametrize("change,word", [
+    ({"eval_set_id": SWE_SET, "episode": _swe_episode()}, "evaluation set"),
+    ({"episode": None}, "pass the episode"),
+    ({"episode": _swe_episode()}, "split"),
+    ({"thinking": True}, "thinking"),
+    ({"draw": None}, "ids start"),
+])
+def test_a_batch_order_unlike_its_set_or_on_an_eval_set_is_refused(admin, batch_set, qwen35, change,  # noqa: F811
+                                                                    word):
+    response = admin("POST", "/admin/v1/jobs", _batch(**change))
+    assert response.status_code == 422 and word in response.text, response.text
+    assert "order-gen-swe1" not in admin.registry["entries"]
+
+
+@pytest.mark.parametrize("split", ["eval", "train"])
+def test_a_batch_set_is_never_frozen_on_a_held_out_or_train_split(admin, swe_set, split):  # noqa: F811
+    from reliquary.eval.sets import build_source_set
+
+    with pytest.raises(ValueError, match="held out or the train split"):
+        build_source_set("reliquary-swe", split=split, count=4, out=admin.root / f"b-{split}", purpose="batch")
+
+
+def test_a_batch_set_card_on_a_held_out_split_sources_no_batch():
+    from reliquary.eval.sets import batch_set_refusal
+
+    card = {"set_id": "x", "purpose": "batch", "interaction": "signed_bridged", "source": "reliquary-terminal",
+            "split": "tmax_sft"}
+    assert "held-out" in batch_set_refusal(card)
+    assert batch_set_refusal({**card, "split": "tmax_rl"}) is None
+    assert "evaluation set" in batch_set_refusal({**card, "purpose": None})
+
+
+def test_a_batch_episode_order_is_wired_and_never_paid_before_its_grade(admin, batch_set, qwen35,  # noqa: F811
+                                                                        tmp_path, monkeypatch):
+    pytest.importorskip("reliquary_sandbox.attest")
+    from reliquary.infrastructure.corpus_record_store import RECORD_SCHEMA_V2, BucketRecordStore
+    from reliquary.protocol.sandbox_session import JOB_SCOPED_PREFIX
+    from reliquary.validator import corpus_period_settlement
+    from reliquary.validator.signed_grading import SignedEpisodeGrader
+    from tests.unit.sandbox_fixtures import claims, signer, transcript
+    from tests.unit.test_corpus_period_settlement import GENESIS, Archives, at, verdict
+
+    settle = corpus_period_settlement.CorpusPeriodSettler.settle_once
+    assert admin("POST", "/admin/v1/jobs", _batch()).status_code == 201
+    services = _order_services(tmp_path, JOB_SCOPED_PREFIX)
+    app, job_set = _control(admin, tmp_path, monkeypatch, services)
+    job_id, sid = "order-gen-swe1", "b" * 64
+
+    async def go():
+        await job_set.refresh()
+        assert job_id in job_set.served
+        w = app.state.eval_served[job_id]
+        assert isinstance(w.grader, SignedEpisodeGrader) and services.jobs[job_id] is w.sandbox_view
+        records = BucketRecordStore()
+        signed = transcript(signer(tmp_path, "v", "v1"), signer(tmp_path, "m", "k1"), claims(), reward=0.0)
+        await records.write_submission(job_id, sid, {
+            "schema": RECORD_SCHEMA_V2, "hotkey": "5Hot", "prompt_index": 0, "received_at": at(3),
+            "completions": [{"transcript": signed}]})
+        await records.write_verdict(job_id, sid, verdict(sid, "5Hot", 10, at(3)))
+        w.settler._genesis, w.settler._clock, w.settler._archives = (lambda: GENESIS), (lambda: at(6)), Archives()
+        w.auditor.oldest_pending_received_at = lambda: None
+        w.grader._enqueue = lambda submission_id: None
+        await w.grader.rescan_once()
+        unpaid = await settle(w.settler)
+        assert w.settler._archives.docs == {}
+        assert await w.grader.grade_one(sid) is not None
+        paid = await settle(w.settler)
+        for tasks in job_set._tasks.values():
+            for task in tasks:
+                task.cancel()
+        return unpaid, paid
+
+    unpaid, paid = asyncio.run(go())
+    # A failed episode is paid too, once graded: the grade is the customer's, not a filter on pay.
+    assert unpaid is None and paid == 3
+
+
+def _deliver(admin, body):  # noqa: F811
+    import time
+
+    for _ in range(200):
+        response = admin("POST", "/admin/v1/jobs/order-gen-swe1/deliveries", body)
+        if response.status_code != 202:
+            return response
+        time.sleep(0.02)
+    return response
+
+
+def test_a_batch_episode_order_is_delivered_annotated_by_default(admin, batch_set, qwen35, monkeypatch):  # noqa: F811
+    from reliquary.admin import service
+
+    assert admin("POST", "/admin/v1/jobs", _batch()).status_code == 201
+    _graded_episodes(admin, rewards=[1.0, 0.0, 1.0])
+    asked = {}
+
+    async def context(job):
+        return {"renderer": object(), "source": object(), "quarantined": []}
+
+    async def export(**kw):
+        from reliquary.corpus.delivery import DELIVERY_SCHEMA_V3
+
+        asked.update(kw)
+        return {"schema": DELIVERY_SCHEMA_V3, "job_id": "order-gen-swe1", "keys": [], "rows": 0,
+                "options": {"format": kw["output_format"], "include_truncated": True, "filter": kw["filter_mode"],
+                            "dedupe_against": []}}
+
+    monkeypatch.setattr(service, "episode_delivery_context", context)
+    monkeypatch.setattr("reliquary.corpus.delivery.export_delivery", export)
+    assert _deliver(admin, {"schema_version": 2}).status_code == 422
+    response = _deliver(admin, {"schema_version": 3, "filter": "none"})
+    assert response.status_code == 422 and "always graded" in response.text, response.text
+    response = _deliver(admin, {"schema_version": 3, "format": "openai_jsonl"})
+    assert response.status_code == 200, response.text
+    assert asked["filter_mode"] == "annotate" and asked["quarantined"] == [] and asked["grade"] is None
+    assert asked["output_format"] == "openai_jsonl" and asked["schema_version"] == 3

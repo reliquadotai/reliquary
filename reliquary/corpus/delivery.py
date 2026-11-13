@@ -414,6 +414,15 @@ V3_ROW_FIELDS = ("job_id", "submission_id", "prompt_index", "problem_id", "custo
                  "completion", "completion_tokens", "finish_reason", "audited", "draw_match", "accepted", "score")
 V3_FILTERS = ("none", "annotate", "drop")
 V3_FORMATS = ("parquet", "openai_jsonl")
+# An agentic order's v3 row: one per certified trajectory, always graded (its signed sandbox's reward).
+# ``messages`` (JSON) is the whole transcript: system, user, then assistant turns (``tool_calls``) and the
+# ``tool`` outputs, rebuilt as ``episode_row`` does; ``tokens``/``assistant_mask``/``turns`` are the proven form.
+V3_EPISODE_ROW_FIELDS = ("job_id", "submission_id", "prompt_index", "problem_id", "custom_id", "task_id",
+                         "sample_index", "draw_slot", "seed", "messages", "tokens", "assistant_mask", "turns",
+                         "final_diff", "stop", "finish_reason", "prompt_tokens", "completion_tokens", "audited",
+                         "draw_match", "reward", "graded_success", "certified")
+# The stops of a trajectory cut at its budget (``include_truncated`` off leaves them out).
+EPISODE_TRUNCATED_STOPS = ("context_length", "max_turns")
 
 
 def _v3_row_schema():
@@ -428,6 +437,101 @@ def _v3_row_schema():
         ("completion_tokens", pa.int32()), ("finish_reason", pa.string()), ("audited", pa.bool_()),
         ("draw_match", pa.float64()), ("accepted", pa.bool_()), ("score", pa.float64()),
     ])
+
+
+def _v3_episode_row_schema():
+    import pyarrow as pa
+
+    return pa.schema([
+        ("job_id", pa.string()), ("submission_id", pa.string()), ("prompt_index", pa.int64()),
+        ("problem_id", pa.string()), ("custom_id", pa.string()), ("task_id", pa.string()),
+        ("sample_index", pa.int64()), ("draw_slot", pa.int64()), ("seed", pa.int64()),
+        ("messages", pa.string()), ("tokens", pa.list_(pa.int32())), ("assistant_mask", pa.list_(pa.int8())),
+        ("turns", pa.string()), ("final_diff", pa.string()), ("stop", pa.string()),
+        ("finish_reason", pa.string()), ("prompt_tokens", pa.int64()), ("completion_tokens", pa.int64()),
+        ("audited", pa.bool_()), ("draw_match", pa.float64()), ("reward", pa.float64()),
+        ("graded_success", pa.bool_()), ("certified", pa.bool_()),
+    ])
+
+
+async def episode_rows_v3(*, job, records, renderer, source, quarantined, counts: dict, drop_failed: bool,
+                          include_truncated: bool, set_rows=None,
+                          on_verdict: Callable[[str, Mapping], Any] | None = None,
+                          concurrency: int = READ_CONCURRENCY, window: int = READ_WINDOW) -> AsyncIterator[dict]:
+    """One v3 row per certified trajectory of an agentic (signed-sandbox) order, graded by its signed reward:
+    every one (``annotate``), or its successes only (``drop_failed``). An uncertified, ungraded or held grade
+    is never delivered (counted, and its prompt short in the errors)."""
+    inner: dict = {}
+    counts.update(rows=0, rows_accepted=0, rejected_dropped=0 if drop_failed else None, truncated_dropped=0,
+                  finish_reason={}, completion_tokens=0, audited_completion_tokens=0, prompt_tokens=0,
+                  prompt_tokens_unknown=0, samples_by_prompt={}, delivered_by_prompt={})
+    async for row in episode_rows(job=job, records=records, renderer=renderer, source=source, counts=inner,
+                                  quarantined=quarantined, concurrency=concurrency, window=window,
+                                  detail=True, on_verdict=on_verdict):
+        index = int(row["prompt_index"])
+        generated = counts["samples_by_prompt"]
+        generated[index] = generated.get(index, 0) + 1
+        if row["stop"] in EPISODE_TRUNCATED_STOPS and not include_truncated:
+            counts["truncated_dropped"] += 1
+            continue
+        success = bool(row["graded_success"])
+        if success:
+            counts["rows_accepted"] += 1
+        elif drop_failed:
+            counts["rejected_dropped"] += 1
+            continue
+        problem_id, custom_id = _row_ids(set_rows, index)
+        out = {**{k: row[k] for k in ("job_id", "submission_id", "prompt_index", "task_id", "messages", "tokens",
+                                      "assistant_mask", "turns", "final_diff", "stop", "sample_index",
+                                      "draw_slot", "seed", "prompt_tokens", "completion_tokens", "audited",
+                                      "draw_match", "reward", "graded_success")},
+               "problem_id": problem_id, "custom_id": custom_id, "finish_reason": row["stop"],
+               "certified": bool(row["replay_certified"])}
+        counts["rows"] += 1
+        reasons = counts["finish_reason"]
+        reasons[out["finish_reason"]] = reasons.get(out["finish_reason"], 0) + 1
+        counts["completion_tokens"] += out["completion_tokens"]
+        if out["audited"]:
+            counts["audited_completion_tokens"] += out["completion_tokens"]
+        counts["prompt_tokens"] += out["prompt_tokens"]
+        held = counts["delivered_by_prompt"]
+        held[index] = held.get(index, 0) + 1
+        yield out
+    # What the episode reader left out, and why (ungraded, held, uncertified, unparseable, ...).
+    counts["episodes"] = {k: v for k, v in inner.items() if k not in ("rows", "sft_rows")}
+    counts["verdicts"] = inner.get("verdicts", 0)
+    if inner.get("sandbox_unavailable"):
+        # Never a delivery missing every trajectory it could not parse here.
+        raise EpisodeSandboxUnavailable(f"{inner['sandbox_unavailable']} trajectories need reliquary-sandbox")
+
+
+def openai_episode_line(rows: list[Mapping], *, job, created_at: float) -> dict:
+    """One OpenAI Batch output line for one task of an agentic order: a ``chat.completion`` whose choices are
+    its trajectories, in sample order. A choice's ``message`` is the trajectory's last assistant message;
+    ``messages`` is the whole transcript (system, user, assistant turns with ``tool_calls``, ``tool``
+    outputs); ``reliquary`` holds its grade, draw and audit."""
+    first = rows[0]
+    custom = first["custom_id"] if first["custom_id"] is not None else f"prompt-{first['prompt_index']}"
+    request_id = f"{job.job_id}:{first['prompt_index']}"
+    choices = []
+    for i, row in enumerate(rows):
+        messages = json.loads(row["messages"])
+        last = next((m for m in reversed(messages) if m.get("role") == "assistant"),
+                    {"role": "assistant", "content": ""})
+        choices.append({
+            "index": i, "finish_reason": row["finish_reason"], "message": last, "logprobs": None,
+            "messages": messages,
+            "reliquary": {k: row[k] for k in ("submission_id", "problem_id", "task_id", "sample_index", "draw_slot",
+                                              "seed", "reward", "graded_success", "certified", "audited",
+                                              "draw_match", "final_diff", "completion_tokens")}})
+    prompt_tokens = int(first["prompt_tokens"])
+    completion_tokens = sum(int(r["completion_tokens"]) for r in rows)
+    body = {"id": f"chatcmpl-{hashlib.sha256(request_id.encode()).hexdigest()[:24]}", "object": "chat.completion",
+            "model": job.checkpoint_repo, "created": int(created_at), "choices": choices,
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                      "total_tokens": prompt_tokens + completion_tokens}}
+    return {"id": f"batch_req_{hashlib.sha256(request_id.encode()).hexdigest()[:24]}", "custom_id": custom,
+            "response": {"status_code": 200, "request_id": request_id, "body": body}, "error": None}
 
 
 def set_rows_for_job(job) -> tuple[dict, ...] | None:
@@ -698,7 +802,8 @@ def verification_block(job, *, verdicts: int, audited: int, refusals: Mapping[st
 async def episode_rows(*, job, records, renderer, source, counts: dict, sft_only: bool = False,
                        quarantined: Collection[str] | None,
                        concurrency: int = READ_CONCURRENCY,
-                       window: int = READ_WINDOW, codec=None) -> AsyncIterator[dict]:
+                       window: int = READ_WINDOW, codec=None, detail: bool = False,
+                       on_verdict: Callable[[str, Mapping], Any] | None = None) -> AsyncIterator[dict]:
     """One row per passing, not voided, certified trajectory, in verdict-id
     order; ``sft_only`` keeps the certified successes (spec N6's SFT set).
 
@@ -709,7 +814,10 @@ async def episode_rows(*, job, records, renderer, source, counts: dict, sft_only
 
     A suite job's rows are ``suite_episode_row``s: ``source`` is its
     ``SuiteSource``, ``codec`` the checkpoint tokenizer's ``encode``/``decode``
-    (an object with both), and ``renderer`` is unused."""
+    (an object with both), and ``renderer`` is unused.
+
+    ``detail`` adds what a v3 delivery carries (``episode_v3_fields``): the verdict's audit
+    and draw, the grade's reward, the verified token counts. ``on_verdict`` sees every verdict."""
     suite = job.episode.is_suite
     if suite and codec is None:
         raise ValueError("a suite episode export replays its trajectories: it needs a codec")
@@ -728,6 +836,11 @@ async def episode_rows(*, job, records, renderer, source, counts: dict, sft_only
     for start in range(0, len(ids), window):
         chunk = ids[start:start + window]
         verdicts = await _bounded((records.read_verdict(job.job_id, s) for s in chunk), gate)
+        if on_verdict is not None:
+            for sid, verdict in zip(chunk, verdicts):
+                if verdict:
+                    on_verdict(sid, verdict)
+        verdict_of = dict(zip(chunk, verdicts))
         passing = [sid for sid, v in zip(chunk, verdicts) if v and v.get("passed")]
         counts["passing_submissions"] += len(passing)
         kept = [sid for sid in passing if sid not in voided]
@@ -796,9 +909,36 @@ async def episode_rows(*, job, records, renderer, source, counts: dict, sft_only
                 logger.error("corpus export: %s no longer parses: %s", sid[:12], refused)
                 counts["unparseable"] += 1
                 continue
+            if detail:
+                row.update(episode_v3_fields(job, record=record, verdict=verdict_of[sid],
+                                             grade=document))
             counts["sft_rows"] += int(row["graded_success"] and row["replay_certified"])
             counts["rows"] += 1                      # the rows delivered
             yield row
+
+
+def episode_v3_fields(job, *, record: Mapping, verdict: Mapping, grade: Mapping) -> dict:
+    """A trajectory's v3 fields beside its episode row: its draw slot and sample index (as a
+    single-turn row's), the verdict's audit and draw match, the signed grade's reward, and the
+    verified token counts (the model's turns; the initial prompt)."""
+    from reliquary.corpus.eval_draw import has_draw, rollout_index
+
+    drawn = has_draw(job)
+    trajectory = record["completions"][0]
+    cursor = record.get("cursor")
+    slot = int(cursor) if drawn and isinstance(cursor, int) and not isinstance(cursor, bool) else None
+    audited = verdict.get("audited", True) is True
+    match = (verdict.get("forced_draw") or {}).get("match") if audited else None
+    try:
+        reward = float((grade.get("grade") or {})["reward"])
+    except (KeyError, TypeError, ValueError):
+        reward = None
+    return {"sample_index": rollout_index(job, slot, 0) if slot is not None else None, "draw_slot": slot,
+            "seed": int(job.seed) if drawn and job.seed is not None else None,
+            "prompt_tokens": len(trajectory["prompt_tokens"]),
+            "completion_tokens": sum(int(t["end"]) - int(t["start"]) for t in trajectory["turns"]),
+            "audited": audited, "draw_match": float(match) if isinstance(match, (int, float)) else None,
+            "reward": reward}
 
 
 def _raw_size(row: Mapping) -> int:
@@ -1000,8 +1140,25 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
     episode = getattr(job, "episode", None) is not None
     if schema_version == 3:
         if episode:
-            raise ValueError("an episode job is exported with `reliquary jobs export --sft` (delivery v3 holds "
-                             "single-turn completions)")
+            from reliquary.corpus.job import is_signed_sandbox
+
+            if not is_signed_sandbox(job):
+                raise ValueError("delivery v3 holds the trajectories of a signed-sandbox episode job only: a "
+                                 "suite or replay one is exported with `reliquary jobs export --sft`")
+            if renderer is None or source is None or quarantined is None:
+                raise ValueError("an episode job is delivered with its pinned renderer, its task source and the "
+                                 "quarantined grade executors")
+            if grade is not None or filter_mode == "none":
+                raise ValueError("an episode job is always graded by its signed sandbox: filter_mode 'annotate' "
+                                 "or 'drop', and no grader")
+            if dedupe or dedupe_against:
+                raise ValueError("an episode delivery is not deduplicated by completion")
+            try:
+                import reliquary_sandbox_service.episodes.state_archive  # noqa: F401
+
+                from reliquary.corpus import signed_parse  # noqa: F401
+            except ImportError as exc:
+                raise ValueError("a signed episode is delivered on a host with reliquary-sandbox") from exc
         if keep_rejected:
             raise ValueError("delivery v3 keeps rejected completions with filter_mode 'annotate'")
         return await _export_v3(
@@ -1009,7 +1166,8 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
             work_dir=work_dir, shard_max_bytes=shard_max_bytes, row_group_rows=row_group_rows,
             concurrency=concurrency, window=window, clock=clock, dedupe=dedupe, dedupe_against=dedupe_against,
             include_truncated=include_truncated, filter_mode=filter_mode, output_format=output_format,
-            slots=slots, set_rows=set_rows, count_tokens=count_tokens)
+            slots=slots, set_rows=set_rows, count_tokens=count_tokens,
+            episode=dict(renderer=renderer, source=source, quarantined=quarantined) if episode else None)
     if schema_version != 2:
         raise ValueError(f"delivery schema version {schema_version!r} is not 2 or 3")
     if keep_rejected and (episode or grade is None):
@@ -1194,17 +1352,20 @@ async def _stored_stamp(sink, report_key: str, *, job, delivery_id: str, clock) 
 
 async def _export_v3(*, job, records, sink, delivery_id: str, grade, filter_note, work_dir, shard_max_bytes,
                      row_group_rows, concurrency, window, clock, dedupe, dedupe_against, include_truncated,
-                     filter_mode, output_format, slots, set_rows, count_tokens) -> dict:
+                     filter_mode, output_format, slots, set_rows, count_tokens, episode=None) -> dict:
     """Delivery v3: the job's delivered completions as v3 Parquet rows or OpenAI Batch output lines (one per
     prompt, its samples as choices) plus an errors file naming the prompts short of their samples, then
-    ``report.json`` (counts, verification, billing basis) and ``manifest.json``."""
+    ``report.json`` (counts, verification, billing basis) and ``manifest.json``.
+
+    ``episode`` (``renderer``, ``source``, ``quarantined``) delivers an agentic order's trajectories instead
+    (``episode_rows_v3``), graded by their signed sandbox."""
     from reliquary.protocol.release_contract import canonical_sha256
 
     if filter_mode not in V3_FILTERS:
         raise ValueError(f"filter_mode must be one of {V3_FILTERS}")
     if output_format not in V3_FORMATS:
         raise ValueError(f"output_format must be one of {V3_FORMATS}")
-    if (filter_mode != "none") != (grade is not None):
+    if episode is None and (filter_mode != "none") != (grade is not None):
         raise ValueError("filter_mode 'annotate' and 'drop' need the job's grader, 'none' takes none")
     dedupe_against = sorted(set(dedupe_against))
     if job.job_id in dedupe_against:
@@ -1252,14 +1413,20 @@ async def _export_v3(*, job, records, sink, delivery_id: str, grade, filter_note
     errors_written = 0
     try:
         shard_max_bytes = min(shard_max_bytes, getattr(sink, "max_file_bytes", shard_max_bytes))
-        rows = delivery_rows_v3(job=job, records=records, counts=counts, grade=grade,
-                                drop_rejected=filter_mode == "drop", include_truncated=include_truncated,
-                                seen=seen, set_rows=set_rows, count_tokens=count_tokens, on_verdict=on_verdict,
-                                concurrency=concurrency, window=window)
+        if episode is not None:
+            rows = episode_rows_v3(job=job, records=records, counts=counts, drop_failed=filter_mode == "drop",
+                                   include_truncated=include_truncated, set_rows=set_rows, on_verdict=on_verdict,
+                                   concurrency=concurrency, window=window, **episode)
+        else:
+            rows = delivery_rows_v3(job=job, records=records, counts=counts, grade=grade,
+                                    drop_rejected=filter_mode == "drop", include_truncated=include_truncated,
+                                    seen=seen, set_rows=set_rows, count_tokens=count_tokens,
+                                    on_verdict=on_verdict, concurrency=concurrency, window=window)
         errors = _JsonlShards(directory, "errors", max_bytes=shard_max_bytes, on_close=uploaded)
         if output_format == "parquet":
             writer = _ShardWriter(directory, max_bytes=shard_max_bytes, row_group_rows=row_group_rows,
-                                  on_close=uploaded, schema=_v3_row_schema())
+                                  on_close=uploaded,
+                                  schema=_v3_episode_row_schema() if episode is not None else _v3_row_schema())
             async for row in rows:
                 await writer.add(row)
             await writer.close()
@@ -1271,7 +1438,8 @@ async def _export_v3(*, job, records, sink, delivery_id: str, grade, filter_note
                 output = _JsonlShards(directory, "output", max_bytes=shard_max_bytes, on_close=uploaded)
                 chat = _chat_output(job, set_rows)
                 for group in parked.groups():
-                    await output.add(openai_line(group, job=job, chat=chat, created_at=stamp))
+                    await output.add(openai_episode_line(group, job=job, created_at=stamp) if episode is not None
+                                     else openai_line(group, job=job, chat=chat, created_at=stamp))
                 await output.close()
             finally:
                 parked.close()
@@ -1295,8 +1463,10 @@ async def _export_v3(*, job, records, sink, delivery_id: str, grade, filter_note
         "job": job.to_contract(), "counts": counts,
         "options": {"format": output_format, "include_truncated": include_truncated, "filter": filter_mode,
                     "dedupe": dedupe, "dedupe_against": dedupe_against},
-        "filter": ({"applied": True, "mode": filter_mode, "grader_id": job.filter.grader_id,
-                    "threshold": job.filter.threshold} if grade is not None
+        "filter": ({"applied": True, "mode": filter_mode, "grader_id": "signed-sandbox",
+                    "note": "graded_success is the signed sandbox's reward == 1"} if episode is not None
+                   else {"applied": True, "mode": filter_mode, "grader_id": job.filter.grader_id,
+                         "threshold": job.filter.threshold} if grade is not None
                    else {"applied": False, "mode": "none", "note": filter_note}),
         "verification": verification_block(job, verdicts=counts["verdicts"], audited=audited, refusals=refusals),
         # What the customer is charged on: the completion tokens of the rows delivered (audited ones checked).
@@ -1307,6 +1477,11 @@ async def _export_v3(*, job, records, sink, delivery_id: str, grade, filter_note
                     "prompt_tokens_unknown": counts["prompt_tokens_unknown"]},
         "shards": len(shards), "error_shards": len(error_shards),
     }
+    if episode is not None:
+        # An episode's verified tokens are its model turns (tool outputs are not the model's).
+        report["verification"]["grade"] = "signed-sandbox"
+        report["billing"]["note"] = ("completion tokens are the model's turns of the delivered trajectories; "
+                                     "sandbox time is billed by the platform")
     await sink.put_json(report_key, report)
     manifest = {
         "schema": DELIVERY_SCHEMA_V3, "delivery_id": delivery_id, "job_id": job.job_id,
@@ -1314,7 +1489,8 @@ async def _export_v3(*, job, records, sink, delivery_id: str, grade, filter_note
         "format": output_format, "options": report["options"],
         "rows": counts.get("rows", 0), "shards": shards, "error_shards": error_shards,
         "instruction_shards": [],
-        "columns": list(V3_ROW_FIELDS) if output_format == "parquet" else None, "report": report_key,
+        "columns": (list(V3_EPISODE_ROW_FIELDS if episode is not None else V3_ROW_FIELDS)
+                    if output_format == "parquet" else None), "report": report_key,
         "billing": report["billing"],
         "keys": [s["key"] for s in shards + error_shards] + [report_key, manifest_key],
     }
@@ -1608,7 +1784,11 @@ __all__ = [
     "V3_FILTERS",
     "V3_FORMATS",
     "V3_ROW_FIELDS",
+    "V3_EPISODE_ROW_FIELDS",
     "delivery_rows_v3",
+    "episode_rows_v3",
+    "episode_v3_fields",
+    "openai_episode_line",
     "finish_reason",
     "missing_prompts",
     "openai_line",
