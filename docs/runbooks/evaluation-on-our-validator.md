@@ -345,8 +345,9 @@ Before the first run, in order:
 ## 9. Other bridged envs: TMax `tmax_sft` (signed sandbox)
 
 **Status: not run yet.** An eval job may run a bridged env other than `reliquary-swe`
-(`corpus.job.BRIDGED_EVAL_PACKAGES`: `reliquary-terminal`, and `reliquary-deepswe` once built, see
-`docs/design/2026-11-12-deepswe-automationbench.md`): signed sandbox and
+(`corpus.job.BRIDGED_EVAL_PACKAGES`: `reliquary-terminal`, `reliquary-deepswe` (see
+`docs/design/2026-11-12-deepswe-automationbench.md`), `reliquary-swebench-pro` and
+`reliquary-nl2repo` (see `docs/design/2026-11-13-swebench-pro-nl2repo.md`)): signed sandbox and
 eval only. Its episode carries `bridge`, the options its gateway serves the env with
 and the digest of its image lock, and every side reads the env through
 `BridgedEpisodeSource`, as an RL run does. The contract environment is
