@@ -135,8 +135,10 @@ SWE_PACKAGE = "reliquary-swe"
 # options and image lock), as an RL run reads its bridged envs. Every process that serves
 # such a job still needs the package installed at the episode's pinned identity
 # (`agentic_swe.sandbox_support_refusal`): naming one here only lets a manifest carry it.
-# reliquary-terminal: TMax; reliquary-deepswe: DeepSWE v1.1 (Datacurve's 113 tasks).
-BRIDGED_EVAL_PACKAGES = frozenset({"reliquary-terminal", "reliquary-deepswe"})
+# reliquary-terminal: TMax; reliquary-deepswe: DeepSWE v1.1 (Datacurve's 113 tasks);
+# reliquary-swebench-pro: SWE-bench Pro V2 (Scale AI, public set); reliquary-nl2repo: NL2Repo-Bench.
+BRIDGED_EVAL_PACKAGES = frozenset({"reliquary-terminal", "reliquary-deepswe", "reliquary-swebench-pro",
+                                   "reliquary-nl2repo"})
 EPISODE_ENV_PACKAGES = frozenset({SWE_PACKAGE, SUITE_PACKAGE}) | BRIDGED_EVAL_PACKAGES
 EPISODE_HARNESSES = frozenset({"bash", SUITE_HARNESS})
 # The packages each harness runs: never mixed.
