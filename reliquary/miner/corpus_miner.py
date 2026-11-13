@@ -531,6 +531,16 @@ def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
             elif answer is None or reason in _LEASE_FALLBACK:
                 logger.info("the validator leases no slot (%s): mining from the open map", reason or "no route")
                 leasing = False
+            elif reason == "miner_suspect":
+                # Its audits just failed: no new work until the suspicion ends (its miner page says why).
+                counts["lease_miner_suspect"] += 1
+                until = float((answer.get("detail") or {}).get("suspect_until") or 0)
+                logger.warning("the validator holds this hotkey's leases until %s: its audits failed; check "
+                               "/corpus/jobs/%s/miners/%s (model, revision, precision)",
+                               time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(until)) if until else "later",
+                               job.job_id, hotkey)
+                sleep(min(600.0, max(LEASE_WAIT_SECONDS, until - time.time())))
+                continue
             elif reason == "no_ask":
                 # A job priced by auction: post the ask now, or say how to set one.
                 counts["lease_no_ask"] += 1

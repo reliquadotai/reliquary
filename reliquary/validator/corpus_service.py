@@ -1664,6 +1664,7 @@ def build_corpus_router(
     vocab_size: int | None = None,
     is_banned: Callable[[str], Awaitable[bool]] | None = None,
     registration: Callable[[str], Awaitable[str | None]] | None = None,
+    suspect_until: Callable[[str], Awaitable[float | None]] | None = None,
     ledger_lock_timeout: float = LEDGER_LOCK_TIMEOUT_SECONDS,
     seal_threshold: int = SEAL_THRESHOLD,
     segment_max: int = SEGMENT_MAX,
@@ -2819,6 +2820,19 @@ def build_corpus_router(
         refused = await _lease_gate(request)
         if refused is not None:
             return refused
+        if suspect_until is not None:
+            # A hotkey whose audits just failed gets no new work until its suspicion ends: everything it sends
+            # meanwhile is audited, most of it to be refused (2026-11-13: a caught hotkey's backlog held an
+            # order's audit for 25 minutes). Its offer steps aside so its share goes to the offers behind it.
+            try:
+                until = await suspect_until(request.miner_hotkey)
+            except Exception:
+                logger.warning("corpus suspect check for %s failed", request.miner_hotkey[:12], exc_info=True)
+                until = None
+            if until is not None:
+                if auction is not None:
+                    auction.set_aside(request.miner_hotkey, until)
+                return _lease_refused(CorpusRejectReason.MINER_SUSPECT, {"suspect_until": int(until)})
         lease_nonces[request.nonce] = now + 2 * LEASE_REQUEST_SKEW_SECONDS
         job = await _read_job_checked()
         if job is None:

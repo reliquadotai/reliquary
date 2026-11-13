@@ -157,6 +157,10 @@ class TokenAuction:
         self._lock = threading.RLock()
         self._offers: dict[str, Offer] = {}
         self._seen: dict[str, float] = {}                      # hotkey -> last lease request
+        # The last time an active offer was refused for want of budget: unmet demand the thermostat may grow for.
+        self._unmet_at: float | None = None
+        # Hotkeys the lease route set aside (a suspect miner) until the time given: no allowance meanwhile.
+        self._aside: dict[str, float] = {}
         self._reserved: collections.Counter = collections.Counter()
         self._budget = int(params.initial_leases)
         self._steered_at: float | None = None
@@ -235,7 +239,12 @@ class TokenAuction:
         before = self._budget
         if backlog > self.params.backlog_high:
             self._budget = max(MIN_LEASES, int(self._budget * BUDGET_SHRINK))
-        elif backlog < self.params.backlog_low and sum(held.values()) >= BUDGET_USED * self._budget:
+        elif backlog < self.params.backlog_low and (
+                sum(held.values()) >= BUDGET_USED * self._budget
+                # An offer refused for want of budget since the last step: the budget grows for it even while a
+                # cheaper hotkey leaves its allowance unused (2026-11-13: one slow offer held a 15-lease budget at
+                # 4 leases, and the thirty offers behind it got nothing for an hour).
+                or (self._unmet_at is not None and now - self._unmet_at <= 2 * STEER_SECONDS)):
             self._budget = min(MAX_LEASES, max(self._budget + 1, int(self._budget * BUDGET_GROW)))
         if self._budget != before:
             self._changed()
@@ -258,6 +267,8 @@ class TokenAuction:
         for hotkey in list(self._offers):
             offer = self._live(hotkey, now)
             if offer is None or offer.price > self.params.ceiling:
+                continue
+            if self._aside.get(hotkey, -math.inf) > now:
                 continue
             if held.get(hotkey, 0) > 0 or now - self._seen.get(hotkey, -math.inf) <= ACTIVE_SECONDS:
                 offers.append((offer.price, offer.posted_at, hotkey, offer))
@@ -291,17 +302,29 @@ class TokenAuction:
             given, marginal = self._allowances(now, held)
             allowance = given.get(hotkey, 0)
             if allowance <= 0:
+                if self._aside.get(hotkey, -math.inf) <= now:
+                    self._unmet_at = now
                 return ASK_ABOVE_PRICE
             # Within its allowance, and within the budget: a dearer hotkey's leases out from before keep their place
             # until delivered, so the audit is never handed more than the budget.
-            if (held.get(hotkey, 0) + self._reserved[hotkey] >= allowance
-                    or sum(held.values()) + sum(self._reserved.values()) >= self._budget):
+            if held.get(hotkey, 0) + self._reserved[hotkey] >= allowance:
+                return ALLOWANCE_FULL
+            if sum(held.values()) + sum(self._reserved.values()) >= self._budget:
+                self._unmet_at = now                # under its allowance, but the whole budget is out
                 return ALLOWANCE_FULL
             self._reserved[hotkey] += 1
             # Paid the price of the moment, not its own offer: an offer under its true cost then only wins work
             # at moments that pay under that cost (2026-11-12: offers at 0 took the leases of a small budget and
             # were paid the period's price, set by the dear offers needed at other moments).
             return Terms(max(offer.price, marginal if marginal is not None else offer.price), hotkey)
+
+    def set_aside(self, hotkey: str, until: float) -> None:
+        """``hotkey`` gets no allowance until ``until`` (unix seconds): its share goes to the offers behind it."""
+        with self._lock:
+            now = self._clock()
+            self._aside = {h: t for h, t in self._aside.items() if t > now}
+            if until > now:
+                self._aside[hotkey] = float(until)
 
     def unreserve(self, terms: Terms) -> None:
         """The reservation ``admit`` made is over: its lease is granted (and counted as held) or not."""

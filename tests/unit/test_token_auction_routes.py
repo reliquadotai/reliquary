@@ -40,7 +40,7 @@ def _auction(clock, ceiling_alpha=0.5):
                                       initial_leases=8), clock=clock, mean_tokens=100)
 
 
-def _route(fake_r2, auction, records, *, prompts=2, slots=1):
+def _route(fake_r2, auction, records, *, prompts=2, slots=1, suspect_until=None):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -58,7 +58,8 @@ def _route(fake_r2, auction, records, *, prompts=2, slots=1):
     router = build_corpus_router(
         job_id="swe-v1", store=seeded.store, tokenizer=_Tokenizer(), renderer=seeded.renderer,
         verify_signature=lambda request: True, verify_lease_signature=lambda request: request.signature != "bad",
-        prompt_job_for=seeded.prompt_job_for, records=records, durable_records=False, auction=auction)
+        prompt_job_for=seeded.prompt_job_for, records=records, durable_records=False, auction=auction,
+        suspect_until=suspect_until)
     app.include_router(router)
     return TestClient(app), router
 
@@ -402,3 +403,24 @@ def test_leases_received_before_the_switch_keep_the_period_rule(monkeypatch):
     assert rewards_for(verdicts, 1.0) == {"old": pytest.approx(2e-4), "old2": pytest.approx(1.8e-3),
                                           "new": pytest.approx(1e-5)}
 
+
+
+
+def test_a_suspect_hotkey_gets_no_lease_and_its_offer_steps_aside(fake_r2):
+    """2026-11-13: a caught hotkey kept its leases while suspect, and its backlog held an order's audit for 25
+    minutes. Suspect, it is refused with its suspicion's end, and its share goes to the offer behind it."""
+    clock = Clock()
+    auction = _auction(clock)
+    until = time.time() + 3600
+
+    async def suspect_until(hotkey):
+        return until if hotkey == "5BAD" else None
+
+    client, _ = _route(fake_r2, auction, _Records(), prompts=4, suspect_until=suspect_until)
+    _ask(client, "5BAD", 0.1)
+    _ask(client, "5OK", 0.3)
+    refused = _lease(client, "5BAD")
+    assert refused["leased"] is False and refused["reason"] == "miner_suspect"
+    assert refused["detail"]["suspect_until"] == int(until)
+    assert auction._aside["5BAD"] == until
+    assert _lease(client, "5OK")["leased"] is True

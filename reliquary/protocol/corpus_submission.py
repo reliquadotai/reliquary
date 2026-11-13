@@ -64,6 +64,9 @@ class CorpusRejectReason(str, Enum):
     # Checked right after the signature, so a spoofed hotkey cannot probe ban
     # status and a banned one never reaches the ledgers.
     MINER_BANNED = "miner_banned"
+    # On a job priced by auction, a hotkey whose audits just failed gets no new lease until its suspicion ends
+    # (its own page, /corpus/jobs/<id>/miners/<hotkey>, says why).
+    MINER_SUSPECT = "miner_suspect"
     # An unregistered hotkey is never paid, so its work would only spend audit GPU.
     HOTKEY_NOT_REGISTERED = "hotkey_not_registered"
     MALFORMED_SUBMISSION = "malformed_submission"
