@@ -3,7 +3,18 @@
 Status: design, 2026-11-12. Implemented here: `reliquary-deepswe` is a bridged eval package
 (`corpus.job.BRIDGED_EVAL_PACKAGES`), so `eval build-set --source reliquary-deepswe --bridge-file`,
 `jobs create --eval-set` and admin orders accept it once the package exists. The platform branch
-`feat/deepswe-gateway-group` adds the `deepswe` gateway image group. Nothing else exists yet.
+`feat/deepswe-gateway-group` adds the `deepswe` gateway image group.
+
+Update 2026-11-13: the package exists (reliquary-environments `feat/reliquary-deepswe` faaefd67,
+`reliquary-deepswe==0.1.0+g48decd56127255d7.vfb2`, lock `a6d142f3...4b6e`). Gold check under
+gVisor, no network: 110 of 113 served (gold 1, no-op 0, grading within 700 s; median 50 s, max
+656 s). Excluded: `expr-try-catch-errors` (the verifier restores a test file the gold must update),
+`numba-stencil-boundary-modes` (> 810 s), `prometheus-transactional-reload-status` (685-799 s). No
+task needs network: the Go tasks pinning a newer Go than their image find its toolchain in the
+module cache with `GOPROXY=off` alone. The agent's work tree is graded, committed or not (a
+deviation from upstream). Boxes declare 10 GiB of disk, the most a session budgets. Set
+`reliquary-deepswe-eval-r0-n110-k110-s7` frozen (`jobs create` dry run passes); its 103 images
+are mirrored by digest into the Hippius registry.
 
 ## 1. DeepSWE v1.1 (signed sandbox, bridged)
 
