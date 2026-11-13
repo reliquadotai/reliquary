@@ -45,7 +45,8 @@ class SignedEpisodeGrader(CorpusGrader):
         if self._parse_gate is None:
             self._parse_gate = asyncio.Semaphore(self._parse_concurrency)
         try:
-            transcript = record["completions"][0].get("transcript")
+            trajectory = record["completions"][0]
+            transcript = trajectory.get("transcript")
             async with self._parse_gate:
                 final = (await run_in(self._parse_executor, signed_records, transcript)).final
             claims = transcript["token"]["claims"]
@@ -63,6 +64,8 @@ class SignedEpisodeGrader(CorpusGrader):
                       "session_id": session_id, "machine_id": machine,
                       "state_sha256": final.state_sha256, "cpu_total_ms": final.cpu_total_ms},
             "graded_by": [f"sandbox:{machine}"], "replay": {"signed": True, "status": "ok", "certified": True},
+            # Why the episode ended (agent_completed, max_turns, context_length): a report counts limit cuts.
+            **({"stop": trajectory["stop"]} if isinstance(trajectory.get("stop"), str) else {}),
             "replay_certified": True, "graded_at": self._clock()}, regrade=regrade)
 
 

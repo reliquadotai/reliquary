@@ -1943,7 +1943,11 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                                      "gpu": m.get("gpu")}
                                for eid, m in (result.get("measurements") or {}).items()},
                 "status": record.get("status")}
+        from reliquary.eval.job_grading import episode_protocol
+
         provenance = {**facts, "checkpoint_sha256": job.checkpoint_sha256, "seed": job.seed,
+                      # The harness, profile and bounds an agentic score depends on.
+                      **({"episode": episode_protocol(job.episode)} if job.episode is not None else {}),
                       "eos_token_id": job.eos_token_id, "verification": verification,
                       "job_complete": complete,
                       # Every attempt used: their missing samples are failures.
