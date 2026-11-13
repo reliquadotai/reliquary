@@ -265,8 +265,9 @@ def test_legacy_and_corpus_bytes_are_the_ones_before_plan_2c(section, legacy_wir
 
     expected = _golden()[section]
     if section == "environments":
-        # Keep the historical snapshot; only the corrected hard-math artifact moved.
-        expected["manifest_sha256"] = "289a652120ec75812ea34f0469d6b860ef40a9fb3109f39451751c5fa304aac4"
+        # Keep the historical snapshot; only the corrected hard-math artifact moved (and
+        # reliquary_automationbench_v1 was registered, in the golden).
+        expected["manifest_sha256"] = "076edb58be4ed18d41859b6ba7e02511121da1b6f83e055d71e757727391b333"
         expected["per_env"]["reliquary_hard_math_v1"] = (
             "4c2fc572520f5cb9855ea506f1fc965f96e19ee1a75e15ce7597399d8418f295"
         )
