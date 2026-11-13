@@ -307,3 +307,61 @@ def test_a_refused_submission_releases_its_lease():
     client = Refusing([_granted(3, 1, "a" * 32)])
     _mine(client, _Gen(), sign_lease=lambda body: "lsig")
     assert client.released == ["a" * 32]
+
+
+def _episode(wall_s=7200, sandbox=True, max_total_tokens=60000):
+    budgets = SimpleNamespace(wall_s=wall_s)
+    return SimpleNamespace(max_total_tokens=max_total_tokens,
+                           sandbox=SimpleNamespace(budgets=budgets) if sandbox else None)
+
+
+def test_a_signed_episode_lease_outlasts_the_miners_episode_deadline():
+    from reliquary.corpus.draw_leases import EPISODE_LEASE_MARGIN_SECONDS, episode_lease_floor
+    from reliquary.miner.signed_episode import SignedSweEpisodeRunner
+
+    job = _job(episode=_episode())
+    # The miner's own bound on one episode, as its runner computes it.
+    runner = SignedSweEpisodeRunner.__new__(SignedSweEpisodeRunner)
+    runner._job = job
+    deadline = runner.deadline(0)
+    assert deadline == 900 + 7200 + 1800 + 120
+    assert episode_lease_floor(job) == deadline + EPISODE_LEASE_MARGIN_SECONDS
+    assert lease_seconds(job) >= deadline
+    ledger = SlotLedger(prompt_start=10, prompt_count=3, slots_per_prompt=2)
+    clock = Clock()
+    # Even a job or an auction asking for less: the lease still covers the episode.
+    leases = DrawLeases(job, clock=clock, seconds=100.0, limit_per_hotkey=False)
+    free = free_draw_slots(job, ledger, lambda p, s: False)
+    for asked in (None, 1.0, 520.0):
+        lease = leases.grant("a", free, seconds=asked)
+        assert lease.expires_at - lease.granted_at >= deadline
+
+
+def test_single_turn_and_unsigned_episode_leases_are_unchanged():
+    from reliquary.corpus.draw_leases import episode_lease_floor
+
+    assert lease_seconds(_job(max_new_tokens=1000)) == 300 + 100
+    unsigned = _job(episode=_episode(sandbox=False))
+    assert episode_lease_floor(unsigned) == 0 and lease_seconds(unsigned) == 300 + 6000
+    _, _, _, _, leases, free = _setup()
+    assert leases.seconds == 100.0
+    lease = leases.grant("a", free, seconds=40.0)
+    assert lease.expires_at - lease.granted_at == 40.0
+
+
+def test_each_lease_event_is_one_log_line(caplog):
+    import logging
+
+    _, _, _, clock, leases, free = _setup(prompts=1, slots=2)
+    with caplog.at_level(logging.INFO, logger="reliquary.corpus.draw_leases"):
+        a = leases.grant("5Aaaaaaaaaaaa", free)
+        b = leases.grant("5Bbbbbbbbbbbb", free)
+        leases.settle(a.prompt_index, a.slot)
+        leases.release("5Bbbbbbbbbbbb", b.lease_id)
+        c = leases.grant("5Cccccccccccc", free)
+        clock.now += 101
+        for _ in range(3):
+            len(leases)                       # polls log nothing
+    events = [r.getMessage().split()[2] for r in caplog.records]
+    assert events == ["granted", "granted", "taken", "released", "granted", "expired"]
+    assert f"prompt={c.prompt_index} slot={c.slot} hotkey=5Ccccccc secs=100" in caplog.records[4].getMessage()

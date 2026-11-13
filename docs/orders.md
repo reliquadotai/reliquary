@@ -81,6 +81,12 @@ forward is checked once per architecture, before it enters the preset.
 - An evaluation needs a set with references (ours, or an upload with `purpose: "eval"`).
 - The admin writes an order record (`reliquary/order-job/v2`: kind, pin, source, conditions); the order control
   serves the job only if it matches that record (`eval_control.pinned_order_refusal`).
+- Slot leases (`corpus.draw_leases`): on a signed-episode job (SWE, TMax) every lease, default or
+  auction-shortened, lasts at least the miner's episode deadline (`signed_episode_deadline`: open 900 s +
+  sandbox `wall_s` + grading 1800 s + submit 120 s) plus 300 s, i.e. 10,320 s for `wall_s` 7200. Other
+  jobs keep `300 + tokens / 10` s (auction: 2× the hotkey's slow delivery, floor 300 s). Each lease
+  `granted` / `granted_second` / `taken` / `released` / `expired` logs one INFO line
+  (`draw lease <event> job= prompt= slot= hotkey= secs=`); leases are never renewed.
 
 ## 4. Audits
 

@@ -20,6 +20,18 @@ from reliquary.protocol.corpus_submission import MAX_TRANSCRIPT_BYTES
 
 MAX_OPEN_REFUSAL_BYTES = 4096
 
+# A miner's bound on one signed episode (``signed_episode_deadline``): its open window, the
+# agent's wall budget, grading inside the verification window, submit. The order control's
+# leases on such a job last at least this long (``corpus.draw_leases``).
+OPEN_WINDOW_S = 900
+GRADING_GRACE_S = 1800
+SUBMIT_MARGIN_S = 120
+
+
+def signed_episode_deadline(wall_s: float) -> float:
+    """Seconds a miner gives one signed episode whose sandbox wall budget is ``wall_s``."""
+    return float(OPEN_WINDOW_S + wall_s + GRADING_GRACE_S + SUBMIT_MARGIN_S)
+
 
 # The session routes of a job served by the order control: under the job's own
 # path, which the order jobs' nginx location already sends there.

@@ -50,16 +50,14 @@ from typing import Any
 
 from reliquary.miner.agentic_episode import EpisodeResult
 from reliquary.miner.corpus_miner import retry_after_seconds
-from reliquary.protocol.sandbox_session import (
-    SessionRefused, sandbox_close_path, sandbox_open_path,
+from reliquary.protocol.sandbox_session import (  # noqa: F401  (the deadline constants are re-exported)
+    GRADING_GRACE_S, OPEN_WINDOW_S, SUBMIT_MARGIN_S, SessionRefused, sandbox_close_path, sandbox_open_path,
+    signed_episode_deadline,
 )
 from reliquary.protocol.signatures import build_sandbox_close_binding, build_sandbox_open_binding
 
 logger = logging.getLogger(__name__)
 
-OPEN_WINDOW_S = 900
-GRADING_GRACE_S = 1800
-SUBMIT_MARGIN_S = 120
 SS58_FORMAT = 42
 THROTTLED = frozenset({429, 503})
 DEFAULT_RETRY_AFTER_S = 10.0
@@ -414,8 +412,7 @@ class SignedSweEpisodeRunner:
 
     def deadline(self, index: int) -> float:
         """Open, the agent's wall budget, grading inside the verification window, submit."""
-        return float(OPEN_WINDOW_S + self._job.episode.sandbox.budgets.wall_s
-                     + GRADING_GRACE_S + SUBMIT_MARGIN_S)
+        return signed_episode_deadline(self._job.episode.sandbox.budgets.wall_s)
 
     def _default_runner(self, url: str):
         from reliquary.miner.harness_episode import HarnessEpisodeRunner
