@@ -564,9 +564,16 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         from reliquary.validator.corpus_job_status import stored_job_counts
 
         known = job_id in final_jobs
+        # Read before the listing: a job retired by then admits nothing the listing could miss.
+        entries = await entries_naming(job_id)
+        retired = bool(entries) and all(e.status == "retired" for e in entries)
         counts = await stored_job_counts(records, job_id, with_final=not known,
                                          verdict_passed=verdict_outcomes.setdefault(job_id, {}))
-        if known or counts["final"]:
+        counts["retired"] = retired
+        # Kept for good only once its tasks are retired: a job still admitting is only quiet for now (2026-11-12:
+        # a 12 h network cut left an open order with every record settled; its 544-record counts were kept as
+        # drained and final while it went on to 7,543, and its delivery waited on them).
+        if known or (counts["final"] and retired):
             counts["final"] = True
             final_jobs.add(job_id)
             verdict_outcomes.pop(job_id, None)
@@ -591,7 +598,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     async def job_counts(job_id: str) -> dict:
         """The stored counts; ``final`` gates grading and delivery, ``drained`` only pay."""
         last = last_counts.get(job_id)
-        if last is not None and last["drained"]:
+        if last is not None and last["drained"] and last.get("retired"):
             return dict(last)
         running = counting.get(job_id)
         if running is None:

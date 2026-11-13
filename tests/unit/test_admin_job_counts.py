@@ -63,10 +63,26 @@ def test_a_first_slow_count_is_awaited(admin, pins, counts):  # noqa: F811
     assert _status(admin)["verdicts"] == 7
 
 
-def test_a_drained_job_is_not_listed_again(admin, pins, counts):  # noqa: F811
+def test_a_drained_job_is_not_listed_again_once_retired(admin, pins, counts):  # noqa: F811
     assert admin("POST", "/admin/v1/jobs", _order()).status_code == 201
+    assert admin("POST", f"/admin/v1/tasks/{JOB}/retire", {"retired_at": None}).status_code == 200
     counts["answer"] = _counts(10, drained=True)
     assert _status(admin)["drained"] is True
     calls = counts["calls"]
     assert _status(admin)["final"] is True
     assert counts["calls"] == calls
+
+
+def test_a_quiet_job_still_admitting_is_counted_again(admin, pins, counts):  # noqa: F811
+    """2026-11-12: an open order quiet through a 12 h network cut was kept drained and final at 544 records
+    while it went on to 7,543. Its counts are read again until its tasks are retired."""
+    assert admin("POST", "/admin/v1/jobs", _order()).status_code == 201
+    counts["answer"] = _counts(4, drained=True)                # every record so far settled: quiet
+    assert _status(admin)["verdicts"] == 4
+    counts["answer"] = {**_counts(9, drained=True), "submissions": 12}
+    status = _status(admin)
+    assert status["verdicts"] == 9 and status["submissions"] == 12
+    assert admin("POST", f"/admin/v1/tasks/{JOB}/retire", {"retired_at": None}).status_code == 200
+    calls = counts["calls"]
+    assert _status(admin)["final"] is True and counts["calls"] == calls + 1
+    assert _status(admin)["final"] is True and counts["calls"] == calls + 1   # retired and drained: kept
