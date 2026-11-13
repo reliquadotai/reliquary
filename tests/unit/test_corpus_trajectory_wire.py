@@ -3,8 +3,12 @@
 import pytest
 from pydantic import ValidationError
 
-from reliquary.corpus.job import EPISODE_STOPS, MAX_EPISODE_TOTAL_TOKENS, MAX_EPISODE_TURNS
+from reliquary.corpus.job import (
+    EPISODE_STOPS, EPISODE_TOKENS_CEILING, EPISODE_TURNS_CEILING, MAX_EPISODE_TOTAL_TOKENS, MAX_EPISODE_TURNS,
+)
 from reliquary.protocol.corpus_submission import (
+    MAX_PROFILE_TRAJECTORY_TOKENS,
+    MAX_PROFILE_TRAJECTORY_TURNS,
     MAX_TRAJECTORY_TOKENS,
     MAX_TRAJECTORY_TURNS,
     CorpusRejectReason,
@@ -40,7 +44,9 @@ def _body(**overrides):
 def test_bounds_match_the_contract():
     assert MAX_TRAJECTORY_TOKENS == MAX_EPISODE_TOTAL_TOKENS
     assert MAX_TRAJECTORY_TURNS == MAX_EPISODE_TURNS
-    assert set(CorpusTrajectory.model_fields["stop"].annotation.__args__) == set(EPISODE_STOPS)
+    assert MAX_PROFILE_TRAJECTORY_TOKENS == EPISODE_TOKENS_CEILING
+    assert MAX_PROFILE_TRAJECTORY_TURNS == EPISODE_TURNS_CEILING
+    assert set(CorpusTrajectory.model_fields["stop"].annotation.__args__) == {*EPISODE_STOPS, "episode_closed"}
 
 
 def test_a_trajectory_submission_parses_with_no_completions():
@@ -55,7 +61,7 @@ def test_a_trajectory_submission_parses_with_no_completions():
     _body(trajectory=_trajectory(tokens=[-1, 2])),
     _body(trajectory=_trajectory(turns=[{"start": 5, "end": 5, "proofs": []}])),
     _body(trajectory=_trajectory(turns=[{"start": 0, "end": 2, "proofs": [PROOF] * 3}])),
-    _body(trajectory=_trajectory(tokens=[1] * (MAX_TRAJECTORY_TOKENS + 1))),
+    _body(trajectory=_trajectory(tokens=[1] * (MAX_PROFILE_TRAJECTORY_TOKENS + 1))),
     _body(trajectory=_trajectory(final_diff="x" * (1_048_576 + 1))),
 ])
 def test_malformed_trajectories_are_refused(body):

@@ -12,7 +12,8 @@ written. Requests are idempotent per (hotkey, request_id): the same request id w
 another engagement (by digest) is refused `request_conflict`.
 
 States. A session is `live` until the first of:
-* `closed_graded`: a verified `graded` final was reported. It still HOLDS its slot,
+* `closed_graded`: a verified `graded` final was reported (or a model-budget close an eval
+  profile scores as 0, `CorpusEngagements.submittable_close`). It still HOLDS its slot,
   because the transcript is still submittable: freeing it would let another miner take
   the slot this episode may yet consume. It ends `submitted`, `lapsed`, or `closed`
   when the miner withdraws it;
@@ -458,6 +459,13 @@ class CorpusEngagements:
     def __init__(self, jobs: Callable[[str], SignedJobView | None], book: SessionBook,
                  clock: Callable[[], float] = time.time) -> None:
         self._jobs, self._book, self._clock = jobs, book, clock
+
+    def submittable_close(self, record: SessionRecord, final: Mapping[str, Any]) -> bool:
+        """A budget close the job scores as 0 (`corpus.job.model_closed`): submitted, not redone."""
+        from reliquary.corpus.job import model_closed
+
+        view = self._jobs(record.job_id) if isinstance(record.job_id, str) else None
+        return view is not None and model_closed(view.job.episode, final.get("status"), final.get("reason"))
 
     async def terms(self, hotkey: str, engagement: Mapping[str, Any]) -> EngagementTerms | Refusal:
         timeout = self._book.policy.io_timeout_s
@@ -1493,7 +1501,8 @@ class SessionIssuer:
             if self._record_faults and not withdraw:
                 fault = runtime_start_fault(final) or pool_abort_fault(final)
         state = (CLOSED if withdraw else ABORTED if status == STATUS_ABORTED
-                 else CLOSED_GRADED if status == STATUS_GRADED else CLOSED)
+                 else CLOSED_GRADED if status == STATUS_GRADED or self._submittable_close(record, final)
+                 else CLOSED)
         async with self._lock:
             now = int(self._clock())
             current = self.book.get(session_id)
@@ -1516,6 +1525,12 @@ class SessionIssuer:
         await self._persist(settled)
         logger.info("sandbox session %s of %s closed: %s", session_id, hotkey[:12], status)
         return self._state_of(settled)
+
+    def _submittable_close(self, record: SessionRecord, final: Mapping[str, Any] | None) -> bool:
+        """A non-graded final its engagement still submits (an eval profile's model-budget close):
+        it holds its slot like a graded one."""
+        check = getattr(self._engagements.get(record.kind), "submittable_close", None)
+        return final is not None and check is not None and bool(check(record, final))
 
     async def claim(self, session_id: str, *, hotkey: str,
                     received: float | None = None) -> Refusal | None:

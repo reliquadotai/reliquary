@@ -53,10 +53,17 @@ def episode_protocol(episode) -> dict:
     and the bounds. Machine and sandbox pins are left out (they do not change a grade)."""
     env = episode.env
     spec = episode.harness_spec
-    return {"env": f"{env.package}@{env.version}", "split": env.split,
-            "harness": f"{spec['id']}@{spec['version']}" if spec else episode.harness,
-            "renderer": episode.renderer, "max_turns": episode.max_turns,
-            "max_tokens_per_turn": episode.max_tokens_per_turn, "max_total_tokens": episode.max_total_tokens}
+    protocol = {"env": f"{env.package}@{env.version}", "split": env.split,
+                "harness": f"{spec['id']}@{spec['version']}" if spec else episode.harness,
+                "renderer": episode.renderer, "max_turns": episode.max_turns,
+                "max_tokens_per_turn": episode.max_tokens_per_turn,
+                "max_total_tokens": episode.max_total_tokens}
+    if getattr(episode, "profile", None) is not None:
+        # A named run configuration: its command timeout and wall budget bound the score too.
+        budgets = episode.sandbox.budgets
+        protocol.update(profile=episode.profile, per_call_timeout_s=budgets.per_call_timeout_s,
+                        wall_s=budgets.wall_s)
+    return protocol
 
 
 async def _thresholds(job_id: str, entries: Callable | None) -> tuple[str | None, dict | None]:

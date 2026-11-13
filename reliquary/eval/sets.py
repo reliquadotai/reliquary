@@ -15,7 +15,7 @@ import json
 import random
 import re
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -471,9 +471,44 @@ def _catalog_spec(source: str):
 
 
 def _source_set_id(source: str, split: str, low: int, count: int,
-                   sample: int | None, seed: int | None) -> str:
+                   sample: int | None, seed: int | None, excluded: int = 0) -> str:
     base = f"{source.replace(':', '-')}-{split}-r{low}-n{count}"
+    base = base if not excluded else f"{base}-x{excluded}"
     return base if sample is None else f"{base}-k{sample}-s{seed}"
+
+
+def _checked_exclusion(exclude: Mapping[str, str] | None, interaction: str) -> dict[str, str]:
+    """``{instance id: reason}``, sorted, every reason stated; refused on a single-turn set."""
+    if not exclude:
+        return {}
+    if interaction == INTERACTION:
+        raise ValueError("an exclusion names instance ids: episode and SWE sets only")
+    if not isinstance(exclude, Mapping):
+        raise ValueError("the exclusion must map instance ids to reasons")
+    for instance_id, reason in exclude.items():
+        if not isinstance(instance_id, str) or not instance_id:
+            raise ValueError(f"excluded instance id {instance_id!r} is not a name")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(f"excluded instance {instance_id!r} needs a reason")
+    return dict(sorted(exclude.items()))
+
+
+def _order(sample: int | None, excluded: Mapping[str, str]) -> str:
+    rows = "the rows of index_range not in selection.exclude, in order" if excluded else "index_range"
+    if sample is None:
+        return "the range in order, minus selection.exclude" if excluded else "the range in order"
+    return f"random.Random(seed).sample({rows}, sample); an order of N problems takes the first N"
+
+
+def _select_from(candidates: list[int], *, sample: int | None, seed: int | None) -> list[int]:
+    """`select_indices` over an explicit row list (a range minus its exclusions)."""
+    if sample is None:
+        return list(candidates)
+    if seed is None:
+        raise ValueError("a sampled set needs a seed")
+    if sample > len(candidates):
+        raise ValueError(f"the range holds {len(candidates)} usable rows, fewer than {sample}")
+    return random.Random(seed).sample(candidates, sample)
 
 
 def _write_set(directory: Path, prompts: list[dict], grading: list[dict], card: dict,
@@ -508,6 +543,7 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
                      taskset_args: dict | None = None,
                      protocol: dict | None = None, bridge: dict | None = None,
                      open_bridged: Callable[..., Any] | None = None,
+                     exclude: Mapping[str, str] | None = None,
                      open_environment: Callable[[str, str], Any] = open_source,
                      open_taskset: Callable[..., Any] | None = None,
                      clock: Callable[[], float] = time.time) -> dict:
@@ -519,12 +555,18 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
 
     A bridged eval env (``corpus.job.BRIDGED_EVAL_PACKAGES``, e.g. reliquary-terminal)
     needs ``bridge``, ``{"options", "image_lock_sha256"}`` as the gateway serves it: its
-    rows are references to the tasks that env serves at ``split``."""
+    rows are references to the tasks that env serves at ``split``.
+
+    ``exclude`` ({instance id: reason}, reference sets only): rows known unusable
+    (e.g. a task no box can pass) leave the range before it is sampled, and the
+    card lists them, so the same exclusion and seed give the same set."""
     from reliquary.eval import verifiers_source
 
     if start < 0 or (count is not None and count <= 0):
         raise ValueError("start must be >= 0 and count positive")
     if verifiers_source.is_verifiers_source(source):
+        if exclude:
+            raise ValueError("an exclusion names instance ids: episode and SWE sets only")
         if split is not None:
             raise ValueError("a Verifiers source has no split: its taskset args choose the rows")
         return verifiers_source.build_set(
@@ -572,9 +614,24 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
         raise ValueError(f"[{start}, {high}) runs past {source!r}:{split} ({length} rows)")
     if start >= high:
         raise ValueError(f"{source!r}:{split} holds no row from {start}")
-    indices = select_indices(start, high, sample=sample, seed=seed)
+    def instance_id_of(index: int) -> str:
+        return (bridged_swe.instance_id_of(split, index) if interaction == "swe"
+                else bridged.instance_id(index) if bridged is not None
+                else str(environment.get_task(index).id))
+
+    excluded = _checked_exclusion(exclude, interaction)
+    if excluded:
+        ids = {index: instance_id_of(index) for index in range(start, high)}
+        unknown = sorted(set(excluded) - set(ids.values()))
+        if unknown:
+            raise ValueError(f"excluded instances not in {source!r}:{split} [{start}, {high}): "
+                             f"{unknown}")
+        indices = _select_from([i for i in range(start, high) if ids[i] not in excluded],
+                               sample=sample, seed=seed)
+    else:
+        indices = select_indices(start, high, sample=sample, seed=seed)
     set_id = validated_set_id(set_id or _source_set_id(source, split, start, high - start,
-                                                       sample, seed))
+                                                       sample, seed, len(excluded)))
     prompts, grading = [], []
     for ordinal, index in enumerate(indices):
         problem_id = f"{set_id}-{ordinal:06d}"
@@ -593,9 +650,7 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
             continue
         # A reference: the task is rebuilt from (split, index) by whoever runs it, and
         # must carry this id. `grading.jsonl` holds the same row.
-        instance_id = (bridged_swe.instance_id_of(split, index) if interaction == "swe"
-                       else bridged.instance_id(index) if bridged is not None
-                       else str(environment.get_task(index).id))
+        instance_id = instance_id_of(index)
         if not instance_id:
             raise ValueError(f"{source!r}:{split} row {index} has no instance id")
         row = {"problem_id": problem_id, "interaction": interaction, "split": split,
@@ -611,10 +666,9 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
         "source_kind": "catalog", "interaction": interaction, "split": split,
         "index_range": [start, high], "source_length": length, "count": len(indices),
         "seed": seed, "selection": {"start": start, "count": count, "sample": sample,
-                                    "seed": seed},
-        "order": ("the range in order" if sample is None else
-                  "random.Random(seed).sample(index_range, sample); an order of N "
-                  "problems takes the first N"),
+                                    "seed": seed,
+                                    **({"exclude": excluded} if excluded else {})},
+        "order": _order(sample, excluded),
         "created_at": clock(),
         "prompt_template_id": getattr(getattr(profile, "prompt_template", None),
                                       "template_id", None),

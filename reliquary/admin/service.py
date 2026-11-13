@@ -453,10 +453,13 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      require_sandbox=None, qualifications=None, eval_jobs=None,
                      model_facts=None, evaluation_sessions=None, pin_model=None,
                      upload_tokenizer=None, subnet_pool=None, tao_usd=None,
-                     sandbox_machine_prefix: str | None = None, sandbox_machines=None) -> FastAPI:
+                     sandbox_machine_prefix: str | None = None, sandbox_machines=None,
+                     order_sessions=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
-    ``eval_store`` the subnet bucket holding the eval sets' grading files.
+    ``eval_store`` the subnet bucket holding the eval sets' grading files; ``order_sessions``
+    the order control's sandbox session store (``list_recent``), read for an agentic order's
+    redone slots (default: the bucket's order-session prefix).
     ``subnet_pool`` (async, ``chain.subnet_pool``'s answer) and ``tao_usd``
     (async, USD per TAO) convert an order's USD token ceiling. ``sandbox_machine_prefix``
     turns on the sandbox machine routes for the machines named with it (the platform's rented
@@ -1838,6 +1841,23 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=404, detail="qualification_unknown")
         return record
 
+    async def order_redone_slots(job, source) -> dict | None:
+        """``grading.redone_slots`` from the order control's session store (its last days);
+        None when the store cannot be read (the report says nothing rather than zero)."""
+        from reliquary.eval.grading import redone_slots
+
+        store = order_sessions
+        if store is None:
+            from reliquary.infrastructure.sandbox_store import ORDER_SESSION_PREFIX, R2SessionStore
+
+            store = R2SessionStore(prefix=ORDER_SESSION_PREFIX)
+        try:
+            documents = await store.list_recent(int(clock()))
+        except Exception:
+            logger.warning("order %s: sandbox sessions unreadable, no redo count", job.job_id, exc_info=True)
+            return None
+        return redone_slots(documents, job.job_id, lambda index: _problem_id(source, index))
+
     def _problem_id(source, index: int) -> str:
         from reliquary.eval.prompt_source import load_eval_rows
 
@@ -1943,7 +1963,14 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                                      "gpu": m.get("gpu")}
                                for eid, m in (result.get("measurements") or {}).items()},
                 "status": record.get("status")}
+        from reliquary.eval.job_grading import episode_protocol
+
+        redone = await order_redone_slots(job, source) if job.episode is not None else None
         provenance = {**facts, "checkpoint_sha256": job.checkpoint_sha256, "seed": job.seed,
+                      # Slots played again after an infra end (no row): count and reason, per problem.
+                      **({"redone_slots": redone} if job.episode is not None else {}),
+                      # The harness, profile and bounds an agentic score depends on.
+                      **({"episode": episode_protocol(job.episode)} if job.episode is not None else {}),
                       "eos_token_id": job.eos_token_id, "verification": verification,
                       "job_complete": complete,
                       # Every attempt used: their missing samples are failures.

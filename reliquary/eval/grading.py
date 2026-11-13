@@ -27,7 +27,7 @@ import shutil
 import tempfile
 import time
 from collections import Counter, defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -444,8 +444,26 @@ def _env_report(problems: list[tuple[str, int]], per_problem: Mapping[str, list[
         "mean_completion_tokens": (sum(r["tokens"] for r in all_rows) / len(all_rows))
         if all_rows and all(r["tokens"] is not None for r in all_rows) else None,
     }
+    cut = [r for r in all_rows if r.get("limit_cut")]
+    if cut:
+        # Counted as failures in the headline (the profile's rule); what the box held is shown apart.
+        report["limit_cuts"] = {"rows": len(cut), "by_stop": dict(Counter(r["limit_cut"] for r in cut)),
+                                "box_state_passed": sum(1 for r in cut if r.get("box_correct"))}
     report["complete"] = report["missing_rows"] == 0 and report["ungraded_rows"] == 0
     return report
+
+
+def _excluded_bracket(card: Mapping, ordered: int, env_report: Mapping) -> dict | None:
+    """A whole set built with `selection.exclude`: its pass@1 restated over the benchmark's
+    full task count, with the excluded tasks all failed and all passed (the true value lies
+    between). None for any other set or a partial order."""
+    excluded = sorted((card.get("selection") or {}).get("exclude") or ())
+    if not excluded or ordered != int(card["count"]) or not env_report.get("pass@1"):
+        return None
+    value, total = env_report["pass@1"]["value"], ordered + len(excluded)
+    return {"benchmark_tasks": total, "excluded": excluded,
+            "pass@1_excluded_failed": value * ordered / total,
+            "pass@1_excluded_passed": (value * ordered + len(excluded)) / total}
 
 
 def _macro(envs: Mapping[str, dict]) -> dict:
@@ -589,6 +607,9 @@ class JobRows:
         from reliquary.eval.prompt_source import load_eval_rows, parse_eval_source
 
         rows = await asyncio.to_thread(load_eval_rows, parse_eval_source(self.job.prompt_source))
+        from reliquary.corpus.job import LIMIT_STOPS
+
+        limit_cut_fails = episode_limit_cut_fails(self.job)
         by_prompt: dict[int, list[tuple[str, dict]]] = defaultdict(list)
         for submission_id, record in self.collected["passing"]:
             by_prompt[int(record["prompt_index"])].append((submission_id, record))
@@ -623,6 +644,39 @@ def episode_score(document: Mapping) -> float | None:
     except (KeyError, TypeError, ValueError):
         return None
     return reward if math.isfinite(reward) else None
+
+
+# Session states that end a slot's episode without a row: the slot was redone.
+_REDONE_STATES = frozenset({"closed", "aborted", "voided", "lapsed"})
+
+
+def redone_slots(sessions: Iterable[Mapping], job_id: str,
+                 problem_of: Callable[[int], str]) -> dict:
+    """The sandbox sessions of an episode job that ended with no row, so their slot was played
+    again (an infra end: wall time, a lost miner or gateway, a box that failed). A redo replays
+    the slot's public draw (`corpus.draw_leases`): the same sample, not one more attempt. The
+    reason is the machine's final status, else the session's end state."""
+    by_reason: Counter = Counter()
+    by_problem: dict[str, Counter] = defaultdict(Counter)
+    for document in sessions:
+        if document.get("job_id") != job_id or document.get("state") not in _REDONE_STATES:
+            continue
+        index = document.get("prompt_index")
+        if type(index) is not int:
+            continue
+        reason = str(document.get("fault") or document.get("closed_status") or document["state"])
+        by_reason[reason] += 1
+        by_problem[problem_of(index)][reason] += 1
+    return {"redone": sum(by_reason.values()), "by_reason": dict(by_reason),
+            "by_problem": {p: dict(c) for p, c in sorted(by_problem.items())}}
+
+
+def episode_limit_cut_fails(job) -> bool:
+    """Whether the job's episode profile scores a run cut by a limit as a failure."""
+    from reliquary.corpus.job import EPISODE_PROFILES
+
+    profile = getattr(getattr(job, "episode", None), "profile", None)
+    return profile is not None and EPISODE_PROFILES[profile].limit_cut_fails
 
 
 class EpisodeJobRows:
@@ -716,6 +770,9 @@ class EpisodeJobRows:
         from reliquary.eval.prompt_source import load_eval_rows, parse_eval_source
 
         rows = await asyncio.to_thread(load_eval_rows, parse_eval_source(self.job.prompt_source))
+        from reliquary.corpus.job import LIMIT_STOPS
+
+        limit_cut_fails = episode_limit_cut_fails(self.job)
         by_prompt: dict[int, list[tuple[str, dict | None, dict]]] = defaultdict(list)
         for submission_id, prompt_index, document, verdict in self._passing:
             by_prompt[prompt_index].append((submission_id, document, verdict))
@@ -733,14 +790,26 @@ class EpisodeJobRows:
                 if named is not None and row.get("instance_id") not in (None, named):
                     # Graded on another task than the set's row: it scores nothing here.
                     score, status = None, "task_mismatch"
+                stop = document.get("stop") if isinstance(document.get("stop"), str) else None
+                meta = {"status": status, "graded_success": document.get("graded_success"),
+                        "instance_id": named}
+                closed = document.get("closed")
+                if score is not None and isinstance(closed, Mapping):
+                    # The box's call or transcript budget: the model spent it; no grading ran.
+                    meta = {**meta, "limit_cut": f"budget:{closed.get('reason')}", "box_reward": None,
+                            "box_success": False}
+                    score = 0.0
+                elif score is not None and stop in LIMIT_STOPS and limit_cut_fails:
+                    # The reference leaderboard scores a run that hit a limit as no submission.
+                    meta = {**meta, "limit_cut": stop, "box_reward": score,
+                            "box_success": meta["graded_success"], "graded_success": False}
+                    score = 0.0
                 yield {"problem_id": row["problem_id"], "sample_index": sample,
                        "completion": "",
                        "completion_tokens": int(verdict.get("token_count") or 0),
-                       "finish_reason": str((replay.get("termination_reason") or "")
-                                            if isinstance(replay, Mapping) else ""),
-                       "pregraded": (score, {"status": status,
-                                             "graded_success": document.get("graded_success"),
-                                             "instance_id": named})}
+                       "finish_reason": stop or str((replay.get("termination_reason") or "")
+                                                    if isinstance(replay, Mapping) else ""),
+                       "pregraded": (score, meta)}
 
 
 async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
@@ -885,8 +954,12 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
         envs = {env: _env_report(problems, per_problem, by_env_counts[env],
                                  seed=bootstrap_seed)
                 for env, problems in sorted(by_env.items())}
+        brackets = {set_id: bracket for set_id, (card, _) in sets.items()
+                    if (bracket := _excluded_bracket(card, problems_per_set[set_id],
+                                                     envs[card["env"]])) is not None}
         report = {
             "schema": REPORT_SCHEMA, "eval_id": eval_id, "created_at": clock(),
+            **({"full_benchmark": brackets} if brackets else {}),
             "complete": all(r["complete"] for r in envs.values())
             and not counts["malformed_rows"],
             "envs": envs, "macro": _macro(envs),
@@ -1013,9 +1086,12 @@ async def _grade_batch(batch, graders: _Graders, per_problem, writer, pa, *,
             completion = completion if isinstance(completion, str) else ""
             episode_metrics = None
             tokens = int(row.get("completion_tokens") or 0)
+            limit_cut = box_correct = None
             if pregraded:
                 score, verdict = row["pregraded"]
                 correct = None if score is None else verdict.get("graded_success") is True
+                if verdict.get("limit_cut"):
+                    limit_cut, box_correct = verdict["limit_cut"], verdict.get("box_success") is True
                 detail = json.dumps(verdict, sort_keys=True)
                 failed_format = False
             elif card.get("interaction") == "signed_episode":
@@ -1067,6 +1143,7 @@ async def _grade_batch(batch, graders: _Graders, per_problem, writer, pa, *,
                 "episode_stop_reason": (accounting.get("stop_reason")
                                         if isinstance(accounting.get("stop_reason"), str)
                                         else None),
+                "limit_cut": limit_cut, "box_correct": box_correct,
                 **{key: (accounting.get(key) if type(accounting.get(key)) is int
                          and accounting[key] >= 0 else None)
                    for key in ("turns", "tool_calls", "transcript_tokens")},
@@ -1078,7 +1155,8 @@ async def _grade_batch(batch, graders: _Graders, per_problem, writer, pa, *,
     for row in rows:
         per_problem[row["problem_id"]].append(
             {k: row[k] for k in ("score", "correct", "finish_reason", "tokens",
-                                 "format_failure", "turns", "tool_calls", "episode_stop_reason")})
+                                 "format_failure", "turns", "tool_calls", "episode_stop_reason",
+                                 "limit_cut", "box_correct")})
     table = pa.Table.from_pylist([{k: r[k] for k in GRADED_COLUMNS} for r in rows],
                                  schema=_graded_schema())
     await asyncio.to_thread(writer.write_table, table)
