@@ -201,7 +201,8 @@ SWEBENCH_BASH_ONLY = "swebench-bash-only"
 # The Terminal-Bench 2.x leaderboard (harbor-framework/terminal-bench-2-1, Terminus 2): no step
 # cap of its own (the task's agent timeout bounds a trial, 360 to 12,000 s, which the bridge
 # takes from the task as the episode's wall budget), the model's context (capped at 128k), 600 s
-# per command (Terminus never blocks on a command; ours run to completion within one call).
+# per command (Terminus never blocks on a command; ours run to completion within one call); 250
+# turns, the corpus wire's ceiling (the 128k context ends a run long before).
 TERMINAL_BENCH_TERMINUS_2 = "terminal-bench-terminus-2"
 EPISODE_PROFILES = {
     SWEBENCH_BASH_ONLY: EpisodeProfile(harness=("mini-swe", "2"), package="reliquary-swe",
@@ -210,7 +211,7 @@ EPISODE_PROFILES = {
                                        limit_cut_fails=True),
     TERMINAL_BENCH_TERMINUS_2: EpisodeProfile(harness=("terminus-2", "1"),
                                               package="reliquary-terminal-bench",
-                                              max_turns=512, max_total_tokens=131072,
+                                              max_turns=250, max_total_tokens=131072,
                                               per_call_timeout_s=600, min_wall_s=12000,
                                               limit_cut_fails=True),
 }

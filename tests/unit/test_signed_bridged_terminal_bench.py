@@ -87,14 +87,14 @@ def test_the_terminus_2_leaderboard_profile():
 
     profile = EPISODE_PROFILES[TERMINAL_BENCH_TERMINUS_2]
     assert (profile.harness, profile.package) == (("terminus-2", "1"), PACKAGE)
-    assert EPISODE_TURNS_CEILING >= profile.max_turns == 512
+    assert EPISODE_TURNS_CEILING >= profile.max_turns == 250
     sandbox = sandbox_spec(env=PACKAGE, env_package=ENV_PACKAGE, tools=["bash"])
     sandbox["budgets"] = {**sandbox["budgets"], "max_calls": 512, "per_call_timeout_s": 600,
                           "wall_s": 12000, "cpu_s": 12000}
-    episode = tb_episode(sandbox=sandbox, profile=TERMINAL_BENCH_TERMINUS_2, max_turns=512,
+    episode = tb_episode(sandbox=sandbox, profile=TERMINAL_BENCH_TERMINUS_2, max_turns=250,
                          max_total_tokens=131072)
     job = parse_job(_manifest(prompt_source=EVAL_SOURCE, episode=episode))
-    assert job.episode.profile == TERMINAL_BENCH_TERMINUS_2 and job.episode.max_turns == 512
+    assert job.episode.profile == TERMINAL_BENCH_TERMINUS_2 and job.episode.max_turns == 250
     with pytest.raises(JobError, match="terminus-2@1"):
         parse_job(_manifest(prompt_source=EVAL_SOURCE,
                             episode={**episode, "harness_spec": {**HARNESS, "id": "mini-swe", "version": "2"}}))

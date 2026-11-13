@@ -161,7 +161,7 @@ platform's template for the set carries:
 | harness | `terminus-2@1` | leaderboard agent |
 | tools | `bash` | |
 | wall | each task's `[agent].timeout_sec` (360-12,000 s) | leaderboard enforces it |
-| `max_turns` | 512 (= `max_calls`) | Terminus has no step cap; time bounds it |
+| `max_turns` | 250 (the corpus wire's ceiling; `max_calls` 512) | Terminus has no step cap; time and context bound it |
 | `max_total_tokens` | 131,072 | the model's context, no summarization |
 | `per_call_timeout_s` | 600 | long builds within one call |
 | trials | 5 per task | leaderboard minimum |
