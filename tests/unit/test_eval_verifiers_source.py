@@ -171,3 +171,54 @@ def test_a_drifted_prompt_is_not_scored():
 def test_a_task_gone_from_the_taskset_is_drift():
     with pytest.raises(LookupError, match="source_drift"):
         vs.score_answer(fake_handle([FakeTask(0)]), "nope", vs.prompt_digest(None, "q"), "0")
+
+
+class NotedTasks(list):
+    RELIQUARY_CARD = {"name": "Noted", "license": "CC-BY-NC-SA-4.0",
+                      "license_note": "non-commercial: confirm before selling"}
+
+
+class CharTokenizer:
+    """One token per character of each content, plus 3 per message and 2 to open the reply."""
+
+    def apply_chat_template(self, messages, add_generation_prompt, tokenize):
+        assert add_generation_prompt and tokenize
+        return list(range(sum(len(m["content"]) + 3 for m in messages) + 2))
+
+
+def test_the_taskset_card_and_prompt_tokens_go_on_the_set(tmp_path):
+    tasks = NotedTasks(FakeTask(i, prompt="q" * (i + 1)) for i in range(3))
+    loaded = []
+    card = vs.build_set("verifiers:fake", out=tmp_path / "s", start=0, count=None, sample=None,
+                        seed=None, set_id=None, taskset_args={}, open_taskset=opener(fake_handle(tasks)),
+                        count_tokens="org/tok", load_tokenizer=lambda name: loaded.append(name) or CharTokenizer())
+    assert loaded == ["org/tok"]
+    assert card["benchmark"]["name"] == "Noted"
+    assert card["license_note"] == "non-commercial: confirm before selling"
+    assert card["prompt_tokens"] == {"tokenizer": "org/tok", "chat_template": True,
+                                     "per_problem": [6, 7, 8], "mean": 7, "max": 8}
+    assert json.loads((tmp_path / "s" / "set.json").read_text())["prompt_tokens"]["max"] == 8
+
+
+def test_a_set_without_a_taskset_card_or_tokenizer_carries_neither(tmp_path):
+    card = build_source_set("verifiers:fake", out=tmp_path / "s",
+                            open_taskset=opener(fake_handle([FakeTask(0)])))
+    assert "benchmark" not in card and "license_note" not in card and "prompt_tokens" not in card
+
+
+def test_a_taskset_card_takes_known_string_fields_only():
+    class Odd(list):
+        RELIQUARY_CARD = {"name": "x", "owner": "y"}
+
+    class Empty(list):
+        RELIQUARY_CARD = {"name": ""}
+
+    for taskset in (Odd(), Empty()):
+        with pytest.raises(ValueError, match="RELIQUARY_CARD"):
+            vs.card_notes(taskset)
+
+
+def test_prompt_tokens_are_for_a_verifiers_source_only(tmp_path):
+    with pytest.raises(ValueError, match="count-tokens"):
+        build_source_set("reliquary_dapo_math_v1", out=tmp_path / "s", count_tokens="org/tok",
+                         open_environment=lambda *a: None)

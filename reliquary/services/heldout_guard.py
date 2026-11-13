@@ -18,11 +18,12 @@ import re
 from reliquary.protocol.service_contract import ServiceContract
 
 # The seven Prime Tasksets of reliquary-environments ``benchmarks/heldout/configs/*.toml``
-# (aime25, aime26, bfcl-v3, gpqa, ifbench, livecodebench, mmlu-pro) plus the rest of decision K's list.
+# (aime25, aime26, bfcl-v3, gpqa, ifbench, livecodebench, mmlu-pro) plus the rest of decision K's list,
+# and the quick single-turn eval sets (HMMT, GraphWalks, MRCR, HLE-Diamond).
 HELD_OUT_BENCHMARK_NAMES: tuple[str, ...] = (
     "aime", "bfcl", "gpqa", "ifbench", "livecodebench", "lcb", "mmlu-pro", "mmlu_pro", "mmlupro",
     "tau2", "tau-bench", "tau_bench", "terminal-bench", "terminal_bench", "swe-bench-verified",
-    "swe_bench_verified", "swebench-verified",
+    "swe_bench_verified", "swebench-verified", "hmmt", "graphwalks", "mrcr", "hle",
 )
 
 # Matching runs on ONE normal form (``normalise``): lowercase, every run of non [a-z0-9] -> "-".
@@ -31,9 +32,11 @@ HELD_OUT_BENCHMARK_NAMES: tuple[str, ...] = (
 # ``tau2``) also need a trailing boundary: end, "-", a digit, "v<digit>" or a known suffix (``aime`` also takes ``i`` / ``ii``: AIMEI, AIMEII).
 # Every pattern needs a leading boundary, so ``claimed`` / ``xaime`` are not found.
 _LONG = ("swe-?bench", "mmlu-?pro", "terminal-?bench", "live-?code-?bench", "bfcl", "ifbench",
-         "if-?eval-?bench", "tau-?bench", "tau2-?bench")
+         "if-?eval-?bench", "tau-?bench", "tau2-?bench", "hmmt", "graph-?walks",
+         "humanity-?s-?last-?exam")
 _SHORT = {"aime": r"(?=$|-|\d|v\d|ii?(?:$|-))", "lcb": r"(?=$|-|\d|v\d)", "tau-?2": r"(?=$|-|\d|bench)",
-          "gpqa": r"(?=$|-|\d|v\d|diamond|main|extended)"}
+          "gpqa": r"(?=$|-|\d|v\d|diamond|main|extended)", "mrcr": r"(?=$|-|\d|v\d)",
+          "hle": r"(?=$|-|diamond)"}
 
 HELD_OUT_BENCHMARKS = re.compile(
     r"(?<![a-z0-9])(?:" + "|".join(_LONG) + "|"
