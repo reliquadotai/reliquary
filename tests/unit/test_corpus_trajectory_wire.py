@@ -46,7 +46,7 @@ def test_bounds_match_the_contract():
     assert MAX_TRAJECTORY_TURNS == MAX_EPISODE_TURNS
     assert MAX_PROFILE_TRAJECTORY_TOKENS == EPISODE_TOKENS_CEILING
     assert MAX_PROFILE_TRAJECTORY_TURNS == EPISODE_TURNS_CEILING
-    assert set(CorpusTrajectory.model_fields["stop"].annotation.__args__) == set(EPISODE_STOPS)
+    assert set(CorpusTrajectory.model_fields["stop"].annotation.__args__) == {*EPISODE_STOPS, "episode_closed"}
 
 
 def test_a_trajectory_submission_parses_with_no_completions():

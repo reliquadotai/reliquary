@@ -178,7 +178,12 @@ class EpisodeProfile:
     max_turns: int
     max_total_tokens: int
     per_call_timeout_s: int
-    # Episodes cut by a limit score 0 in the headline, as the reference leaderboard counts them.
+    # The sandbox wall budget at least: an infra limit (a slow GPU, a busy gateway) must not cut
+    # an episode the model would have finished within its own limits.
+    min_wall_s: int
+    # Episodes cut by a model limit (turns, context, the box's call, CPU or transcript budget)
+    # score 0 in the headline, as the reference leaderboard counts them. Infra ends (wall time,
+    # a lost miner or gateway) score nothing: the slot is redone, on the same public draw.
     limit_cut_fails: bool
 
 
@@ -189,7 +194,8 @@ SWEBENCH_BASH_ONLY = "swebench-bash-only"
 EPISODE_PROFILES = {
     SWEBENCH_BASH_ONLY: EpisodeProfile(harness=("mini-swe", "2"), package="reliquary-swe",
                                        max_turns=250, max_total_tokens=131072,
-                                       per_call_timeout_s=60, limit_cut_fails=True),
+                                       per_call_timeout_s=60, min_wall_s=14400,
+                                       limit_cut_fails=True),
 }
 # The largest bounds any episode may declare (the wire's, `protocol.corpus_submission`).
 EPISODE_TURNS_CEILING = max([MAX_EPISODE_TURNS, *(p.max_turns for p in EPISODE_PROFILES.values())])
@@ -197,6 +203,22 @@ EPISODE_TOKENS_CEILING = max([MAX_EPISODE_TOTAL_TOKENS,
                               *(p.max_total_tokens for p in EPISODE_PROFILES.values())])
 # Why an episode stopped before the agent submitted: a profile with limit_cut_fails scores it 0.
 LIMIT_STOPS = ("max_turns", "context_length")
+# The machine's budget closes (signed final `budget_exhausted`, stop `episode_closed`) the model's
+# own calls caused: under such a profile a scored 0, never an unpaid redo. Wall time (`expired`) is
+# not among them.
+MODEL_BUDGET_REASONS = frozenset({"max_calls", "cpu_s", "transcript_bytes"})
+
+
+def scores_model_closes(episode) -> bool:
+    """Whether a run closed on a model budget (`MODEL_BUDGET_REASONS`) is a scored 0 row."""
+    profile = getattr(episode, "profile", None)
+    return profile is not None and EPISODE_PROFILES[profile].limit_cut_fails
+
+
+def model_closed(episode, status: Any, reason: Any) -> bool:
+    """A machine final this episode submits as a scored 0: a budget the model spent."""
+    return (scores_model_closes(episode) and status == "budget_exhausted"
+            and reason in MODEL_BUDGET_REASONS)
 _HARNESS_NAME_RE = re.compile(r"\A[a-z0-9][a-z0-9.-]{0,63}\Z")
 _SANDBOX_FIELDS = ("env", "env_package", "tools", "sandbox_commit", "budgets")
 SANDBOX_BUDGET_FIELDS = ("max_calls", "per_call_timeout_s", "cpu_s", "wall_s",
@@ -791,10 +813,18 @@ def _check_profile(episode: EpisodeSpec, profile: EpisodeProfile) -> None:
                        f"{'@'.join(profile.harness)}: episode.harness_spec must name it")
     if episode.execution != EXECUTION_SIGNED_SANDBOX:
         raise JobError(f"episode.profile {episode.profile!r} runs on the signed sandbox")
-    if episode.sandbox.budgets.per_call_timeout_s != profile.per_call_timeout_s:
+    budgets = episode.sandbox.budgets
+    if budgets.per_call_timeout_s != profile.per_call_timeout_s:
         raise JobError(f"episode.profile {episode.profile!r} times each command out at "
                        f"{profile.per_call_timeout_s} s: episode.sandbox.budgets.per_call_timeout_s "
                        f"must be {profile.per_call_timeout_s}")
+    if budgets.max_calls < profile.max_turns:
+        raise JobError(f"episode.profile {episode.profile!r}: the call budget never cuts before its "
+                       f"{profile.max_turns}-step cap (episode.sandbox.budgets.max_calls >= "
+                       f"{profile.max_turns})")
+    if budgets.wall_s < profile.min_wall_s:
+        raise JobError(f"episode.profile {episode.profile!r}: episode.sandbox.budgets.wall_s must be "
+                       f"at least {profile.min_wall_s}")
 
 
 def _parse_bridge(raw: Any) -> dict[str, Any]:

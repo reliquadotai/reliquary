@@ -818,3 +818,42 @@ def test_a_submission_retried_past_its_deadline_is_withdrawn(monkeypatch):
     assert len(client.bodies) == 1 and slept == []           # 600 s would pass the deadline
     assert len(loop_runner.released) == 1
     assert counts["submit_deadline_passed"] == 1 and counts["episode_crashed"] == 0
+
+
+class ClosedSandboxRunner(FakeSandboxRunner):
+    """The machine closed the episode on a budget mid-turn: stop ``episode_closed``, no state."""
+
+    def __init__(self, signed, reason):
+        super().__init__(signed, status="budget_exhausted", state=None)
+        self.reason = reason
+
+    async def run(self, *, token, prompt, on_trace=None):
+        result = await super().run(token=token, prompt=prompt, on_trace=on_trace)
+        result.trace.stop_condition = "episode_closed"
+        result.final["body"]["reason"] = self.reason
+        return result
+
+
+@pytest.mark.parametrize("reason", ["max_calls", "transcript_bytes", "cpu_s"])
+def test_a_profiles_model_budget_close_is_returned_for_submission(tmp_path, monkeypatch, reason):
+    """Under an eval profile the model's own budget close is a scored 0, submitted like a graded
+    episode; without one (below) it stays unusable and its slot is played again."""
+    from reliquary.corpus import job as job_module
+
+    monkeypatch.setattr(job_module, "scores_model_closes", lambda episode: True)
+    signed = transcript(signer(tmp_path, "v", "v1"), signer(tmp_path, "m", "k1"),
+                        claims(hotkey=HOT, engagement=corpus_engagement(JOB.job_id, 3), index=3,
+                               split=JOB.episode.env.split, env=JOB.episode.sandbox.env,
+                               checkpoint=JOB.checkpoint_sha256),
+                        status="budget_exhausted", state=None, reason=reason, env_package=ENV_PACKAGE)
+    sessions = FakeSessions(grant=_grant(signed))
+    result, _ = asyncio.run(_run(runner(sessions, ClosedSandboxRunner(signed, reason))))
+    assert result.ok and result.stop == "episode_closed" and result.final_diff == ""
+    assert [body["reason"] for _, body in sessions.closed] == ["final"]
+
+
+def test_without_a_profile_a_budget_close_is_unusable(tmp_path):
+    signed = _transcript(tmp_path, status="budget_exhausted")
+    sessions = FakeSessions(grant=_grant(signed))
+    result, _ = asyncio.run(_run(runner(sessions, ClosedSandboxRunner(signed, "max_calls"))))
+    assert not result.ok and "budget_exhausted" in result.error

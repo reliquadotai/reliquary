@@ -15,7 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from reliquary.corpus.eval_draw import REASON_DRAW_SLOT_TAKEN, has_draw
-from reliquary.corpus.job import PROMPT_ORDER_FREE
+from reliquary.corpus.job import PROMPT_ORDER_FREE, scores_model_closes
 from reliquary.corpus.slots import OpenMap, parse_open_map
 from reliquary.corpus.trajectory import BuiltTrajectory, TrajectoryUnbuildable, build_trajectory
 from reliquary.corpus.walk import job_walk_index
@@ -404,7 +404,8 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
         try:
             built = build_trajectory(session.turns, final_diff=result.final_diff,
                                      stop=drawn_stop(result.stop, session.turns, job, stop_ids)
-                                     if drawn else result.stop)
+                                     if drawn else result.stop,
+                                     closed=scores_model_closes(job.episode))
             if result.transcript is not None:
                 built = dataclasses.replace(built, transcript=result.transcript)
         except TrajectoryUnbuildable as exc:

@@ -277,6 +277,24 @@ def test_an_unpaid_final_ends_the_reservation(tmp_path, status, reason, state):
     assert env.store.documents[grant.session_id]["state"] == state
 
 
+@pytest.mark.parametrize("status,reason,state", [
+    ("budget_exhausted", "max_calls", CLOSED_GRADED), ("budget_exhausted", "cpu_s", CLOSED_GRADED),
+    ("budget_exhausted", "transcript_bytes", CLOSED_GRADED),
+    ("expired", "deadline passed", CLOSED), ("box_failed", None, CLOSED),
+])
+def test_a_profiles_model_budget_close_keeps_its_slot_to_be_submitted(tmp_path, monkeypatch, status, reason,
+                                                                      state):
+    from reliquary.corpus import job as job_module
+
+    monkeypatch.setattr(job_module, "scores_model_closes", lambda episode: True)
+    env = build(tmp_path)
+    grant = open_(env)
+    closed = close(env, grant, final_of(env, grant, status, reason=reason))
+    assert closed["state"] == state
+    # A model's close holds its slot like a graded episode; an infra end frees it to be redone.
+    assert env.book.reserved(JOB.job_id, 3, NOW) == (1 if state == CLOSED_GRADED else 0)
+
+
 def test_a_close_must_carry_the_sessions_own_verified_transcript(tmp_path):
     env = build(tmp_path, remaining=5)
     grant = open_(env)

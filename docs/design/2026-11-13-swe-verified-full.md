@@ -71,8 +71,9 @@ set order.
 The box holds only `registry.env`: `REGISTRY_STORAGE_S3_ACCESSKEY` and `..._SECRETKEY` of a
 Hippius sub token.
 
-- That token must be created as **Object Read Only** on bucket `reliquary-task-images`, with an
-  expiry (Hippius console, Object Storage > Sub Tokens, or `POST /objectstore/sub-tokens/`).
+- The token exists: sub token `gateway-registry-ro`, read-only, on bucket `reliquary-task-images`
+  only. Reading works; writes, deletes and other buckets are refused. Its env file is in the
+  operator's kit directory, never in a repo.
 - The bootstrap refuses a key that does not start with `hip_`.
 - The provisioner pushes the file (mode 0600) only to the groups that pull from the registry. It
   reads the file from `GATEWAY_KIT_DIR/registry.env`.
@@ -135,8 +136,10 @@ manifest field, written only when set, so other manifests hash as before.
 | turns (LM calls) | <= 64 (48 offered) | <= 250 (250 offered) |
 | context (prompt + transcript) | <= 60,000 | <= 131,072 |
 | per-command timeout | 600 s | 60 s (required) |
-| sandbox calls / wall | 192 / 7,200 s | 512 / 7,200 s |
-| run cut by turns or context | scored on the box state | scores 0, listed apart |
+| sandbox calls | 192 | 512 (required >= the 250-step cap) |
+| sandbox wall | 7,200 s | 14,400 s (required; the gateway's cap) |
+| run cut by a model limit | turns, context: scored on the box state | scores 0, listed apart |
+| run ended by an infra limit | slot redone | slot redone (same draw), counted per task |
 
 - `mini-swe@2` (reliquary-harness, digest cecffb26) is already the leaderboard harness: same
   system and instance texts, bash tool calls, format-error text and submit command, with an
@@ -144,6 +147,32 @@ manifest field, written only when set, so other manifests hash as before.
 - The profile is accepted only on eval jobs, on `reliquary-swe`, in the signed sandbox.
 - The corpus trajectory wire takes the profile's bounds (`MAX_PROFILE_TRAJECTORY_*`). Every job's
   own bounds are still checked at intake. The service-contract and RL caps are unchanged.
+
+### Limits: who controls them
+
+A limit is the model's or the infrastructure's. We cannot tell why a miner's episode died (slow
+GPU, crash, a busy gateway), so only what the model's own actions decide may cost it a point.
+
+- **Model limits score 0** (as the leaderboard's `LimitsExceeded`): the step cap (`max_turns`),
+  the context (`context_length`), and the box's budgets the model's calls spend. Those are the
+  call budget (`max_calls`), CPU time (`cpu_s`) and the transcript cap (`transcript_bytes`); the
+  machine closes the episode `budget_exhausted` (stop `episode_closed`).
+  - The call budget is required at least the step cap, so it does not cut before it when the
+    model makes one call per step. A model that makes several calls per step can still hit it:
+    that is the model's doing.
+  - Such a close is submitted like a graded episode: the session holds its slot
+    (`CorpusEngagements.submittable_close`). The miner returns it for submission, and the intake
+    takes it as a paid row with reward 0. The grader marks it `closed`, and the report counts it
+    under `limit_cuts` as `budget:<reason>`.
+  - Without a profile nothing changes: such a close stays unpaid and its slot is redone.
+- **Infra limits score nothing; the slot is redone.** These are the wall budget (`expired`), a
+  failed box (`box_failed`), a lost miner (`lapsed`), a lost gateway (`voided`), a failed open or
+  an abort. The redo is not an extra attempt. The sample of a slot is fixed by the job's public
+  draw (`corpus.draw_leases`, `corpus.eval_draw`), so whoever replays the slot replays the same
+  sample; only tool-output nondeterminism differs.
+  - The wall budget is sized generously: 14,400 s, the gateway's cap, for 250 steps of at most
+    60 s each plus generation.
+  - The report counts the redone slots per task and reason (`provenance.redone_slots`).
 
 ### How an order picks it
 
@@ -158,17 +187,18 @@ Platform `POST /evaluations/quotes` takes `profile: "swebench-bash-only"`.
 
 ### Quote: hours and price
 
-The gateway quote takes the profile's episode estimates: 2,700 s expected, 7,200 s worst case
-(the wall budget), against 900 s / 2,700 s by default.
+The gateway quote takes the profile's episode estimates: 2,700 s expected and 7,200 s for a long
+one, against 900 s / 2,700 s by default. The single longest episode is taken at the wall budget
+(14,400 s).
 
 The worst case for 493 tasks x 2 samples (986 episodes) is:
 
 ```
-boot 2 h + 986 x 7,200 s / slots + 7,200 s + 0.5 h
+boot 2 h + 986 x 7,200 s / slots + 14,400 s + 0.5 h
 ```
 
-With the default 78 slots this is 29.8 h, over the 24 h run cap (`EVAL_RUN_TIMEOUT_SECONDS`). So
-`swe-full` plans 156 sessions (`GROUP_ORDER_SESSIONS`): 4 gateways of 39, giving 17.1 h. That
+With the default 78 slots this is 31.8 h, over the 24 h run cap (`EVAL_RUN_TIMEOUT_SECONDS`). So
+`swe-full` plans 156 sessions (`GROUP_ORDER_SESSIONS`): 4 gateways of 39, giving 19.1 h. That
 needs 4 of the 5 `GATEWAY_HOSTNAMES`, and each of the 4 gateways pulls all 493 images.
 
 The token bound must fit too. A quote's `max_tokens` is rows x min(max_new_tokens x turns,
@@ -181,16 +211,17 @@ quote refuses with `exceeds_generation_deadline`. To check before launch.
 - **Grading.** We grade the box's final state. mini grades the `patch.txt` the agent submits.
   Both apply the test patch over it. A stray reproduction script is harmless in both. A submitted
   patch that leaves out an edited file would differ.
-- **Time cuts.** A run that hits the sandbox wall or call budget (`budget_exhausted`) is not
-  submitted today: its slot is retried by another miner. That gives that task more attempts than
-  the leaderboard's one. To fix before quoting a leaderboard number: under a profile with
-  `limit_cut_fails`, the miner submits the closed episode, and the intake takes it as a 0-score
-  row with stop `episode_closed`. That is a wire change (`CorpusTrajectory.stop`), and miners need
-  a release.
+- **Redone slots.** A redo replays the same draw, but the tools' outputs (timings, test order)
+  may differ. A task redone many times is listed in `redone_slots`. A slot whose redos exhaust
+  its attempts counts as a failure in the headline (missing row).
+- **CPU budget.** We count `cpu_s` as a model limit: the CPU time of the commands the model ran.
+  The leaderboard has no CPU cap. If test-heavy tasks hit 3,600 s, raise the gateway's
+  `EPISODE_MAX_CPU_S` and the profile's budget, rather than reclassify it.
 - **Cost limit.** No equivalent: there is no $3 cost cap. The 250-turn and context caps bound a
   run.
 - **Transcript budget.** The gateway's transcript budget is 8 MiB, with outputs capped at 64 KiB
-  per call. 250 calls with large outputs could end a run `budget_exhausted` before 250 turns.
+  per call. 250 calls with large outputs could end a run `budget_exhausted` before 250 turns. That
+  is a model limit here (a scored 0); the leaderboard has no such cap.
 - **Sampling and thinking.** Sampling is the order's. The leaderboard leaves temperature to the
   provider default, so we recommend the model card's sampling. Episodes render with thinking off
   (renderer `qwen38`).
@@ -216,30 +247,37 @@ New in this work:
 - The signed grade document keeps `stop`, so `stop_reasons` is filled for signed SWE.
 - `limit_cuts`: `{rows, by_stop, box_state_passed}`, when a profile counts limit cuts as failures.
   It shows how many cut runs had a passing box anyway.
+- `limit_cuts` also counts the model-budget closes (`budget:max_calls`, `budget:cpu_s`,
+  `budget:transcript_bytes`).
 - `full_benchmark`: the over-500 bracket (section 1).
 - `provenance.episode`: the run configuration (section 3).
+- `provenance.redone_slots`: `{redone, by_reason, by_problem}`. These are the sandbox sessions of
+  the job that ended with no row (infra ends), read from the order control's session store
+  (`order-sessions/`, its last days). They count sandbox episodes only: a lease that expired
+  before its miner opened a box is not among them. The block is absent when the store cannot be
+  read.
 
 ## 5. Remaining steps, in order
 
 1. Review, then push and merge Catalyst `feat/swe-verified-full` and platform
    `feat/swe-verified-full`. The platform branch adds D1 migration 0062 (table rebuild for the
    CHECK on `image_group`). Apply it with the deploy.
-2. Fix the time-cut path (section 3, "Time cuts"), then release miners. Old miners refuse a
-   manifest with `profile` (unknown field). The default-profile SWE and TMax orders are not
+2. Release miners with this branch. Old miners refuse a manifest with `profile` (unknown field)
+   and cannot submit a model-budget close. The default-profile SWE and TMax orders are not
    affected.
 3. Run a GPU check: draw audit and miner at 131,072 tokens on the audit GPU type.
-4. Create the Hippius read-only sub token and put it in the provisioner kit dir as `registry.env`.
-5. Swap the provisioner's code copy to the merged script, with kit `~/runbooks/swe-full/kit/kit.tgz`
-   (kit-prod plus `groups/swe-full`).
-6. Publish the set to the subnet bucket (`reliquary eval publish-set <dir>`; the set is in
+4. Provisioner: swap its code copy to the merged script. Point `GATEWAY_KIT_DIR` at a directory
+   holding `~/runbooks/swe-full/kit/kit.tgz` (kit-prod plus `groups/swe-full`), its
+   `registry.env`, and kit-prod's `gw.crt`, `gw.key` and `validator-keys.json`.
+5. Publish the set to the subnet bucket (`reliquary eval publish-set <dir>`; the set is in
    `~/evalsets-work/sets-agentic/reliquary-swe-eval-r0-n500-x7-k493-s7`).
-7. Add the set to the platform D1 catalog and its platform bucket copy, as was done for the
+6. Add the set to the platform D1 catalog and its platform bucket copy, as was done for the
    100-task set.
-8. Check the prod `eval_subnet_throughput` row against 129 M tokens / 24 h (section 3).
-9. Order control image with this Catalyst; Worker from main with prod config
+7. Check the prod `eval_subnet_throughput` row against 129 M tokens / 24 h (section 3).
+8. Order control image with this Catalyst; Worker from main with prod config
    (`~/runbooks/gateway-fleet/GO-LIVE.md`).
-10. Test orders:
-    - 10 tasks x 2 under the profile on the 100-task set (`swe` group), to check the profile end
-      to end;
-    - then a few rows of the full set, to check a `swe-full` gateway boot and its pull time;
-    - then the full order.
+9. Test orders:
+   - 10 tasks x 2 under the profile on the 100-task set (`swe` group), to check the profile end
+     to end;
+   - then a few rows of the full set, to check a `swe-full` gateway boot and its pull time;
+   - then the full order.

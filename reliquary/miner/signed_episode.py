@@ -224,13 +224,20 @@ def transcript_refusal(transcript: Any, *, job, hotkey: str, index: int,
     spec = job.episode.sandbox
     # The engagement names the row; the session token names the task it runs.
     task = job_row_map(job).ref(int(index))
+    from reliquary.corpus.job import model_closed, scores_model_closes
+
+    # A profile's model-budget close is submitted too (a scored 0): its final is not `graded`.
+    graded_only = not scores_model_closes(job.episode)
     expected = Expected(hotkey=hotkey, engagement=corpus_engagement(job.job_id, index),
                         env=spec.env, split=task.split, index=task.index,
-                        checkpoint=job.checkpoint_sha256, require_graded=True)
+                        checkpoint=job.checkpoint_sha256, require_graded=graded_only)
     result = verify_transcript(transcript, _NoKeys(), _claims_of, expected)
     reasons = [reason.value for reason in result.reasons if reason is not Reason.UNKNOWN_KEY]
     if reasons:
         return REASON_SANDBOX_TRANSCRIPT, {"reasons": reasons}
+    if not graded_only and result.final.status != "graded" and not model_closed(
+            job.episode, result.final.status, result.final.reason):
+        return REASON_SANDBOX_TRANSCRIPT, {"final": result.final.status, "reason": result.final.reason}
     deadline = result.claims.expires_at + GRADING_GRACE_S
     if now > deadline:
         return REASON_SANDBOX_EXPIRED, {"now": int(now), "deadline": deadline}
@@ -679,8 +686,12 @@ class SignedSweEpisodeRunner:
             return EpisodeResult(trace_id, "", stop, False, None, error=error,
                                  final_status=status if status != "graded" else None)
 
-        exhausted = (self.takes_budget_exhausted and status == "budget_exhausted" and not result.error
-                     and stop == "episode_closed")
+        from reliquary.corpus.job import model_closed
+
+        # An RL lease takes every budget close; an eval profile the model's own (a scored 0).
+        exhausted = ((self.takes_budget_exhausted or model_closed(
+                         getattr(getattr(self, "_job", None), "episode", None), status, final.get("reason")))
+                     and status == "budget_exhausted" and not result.error and stop == "episode_closed")
         if result.error or (status != "graded" and not exhausted):
             # Unpaid: not graded, or the run did not complete (a gateway close raised
             # as EpisodeClosed is a run error).

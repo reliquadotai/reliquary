@@ -57,10 +57,13 @@ class SignedEpisodeGrader(CorpusGrader):
             return await self._write(submission_id, {
                 **base, "status": "unparseable", "reason": "no_transcript", "graded_success": False,
                 "replay": None, "replay_certified": False, "graded_at": self._clock()}, regrade=regrade)
+        # A model-budget close the intake took (an eval profile's): no grading ran, a scored 0.
+        graded = final.status == "graded"
         return await self._write(submission_id, {
             **base, "status": "ok", "instance_id": self._source.instance_id(record["prompt_index"]),
-            "graded_success": final.reward == 1.0,
-            "grade": {"reward": final.reward, "facts": final.grading,
+            "graded_success": graded and final.reward == 1.0,
+            **({} if graded else {"closed": {"status": final.status, "reason": final.reason}}),
+            "grade": {"reward": final.reward if graded else 0.0, "facts": final.grading,
                       "session_id": session_id, "machine_id": machine,
                       "state_sha256": final.state_sha256, "cpu_total_ms": final.cpu_total_ms},
             "graded_by": [f"sandbox:{machine}"], "replay": {"signed": True, "status": "ok", "certified": True},

@@ -27,7 +27,7 @@ import shutil
 import tempfile
 import time
 from collections import Counter, defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -646,6 +646,31 @@ def episode_score(document: Mapping) -> float | None:
     return reward if math.isfinite(reward) else None
 
 
+# Session states that end a slot's episode without a row: the slot was redone.
+_REDONE_STATES = frozenset({"closed", "aborted", "voided", "lapsed"})
+
+
+def redone_slots(sessions: Iterable[Mapping], job_id: str,
+                 problem_of: Callable[[int], str]) -> dict:
+    """The sandbox sessions of an episode job that ended with no row, so their slot was played
+    again (an infra end: wall time, a lost miner or gateway, a box that failed). A redo replays
+    the slot's public draw (`corpus.draw_leases`): the same sample, not one more attempt. The
+    reason is the machine's final status, else the session's end state."""
+    by_reason: Counter = Counter()
+    by_problem: dict[str, Counter] = defaultdict(Counter)
+    for document in sessions:
+        if document.get("job_id") != job_id or document.get("state") not in _REDONE_STATES:
+            continue
+        index = document.get("prompt_index")
+        if type(index) is not int:
+            continue
+        reason = str(document.get("fault") or document.get("closed_status") or document["state"])
+        by_reason[reason] += 1
+        by_problem[problem_of(index)][reason] += 1
+    return {"redone": sum(by_reason.values()), "by_reason": dict(by_reason),
+            "by_problem": {p: dict(c) for p, c in sorted(by_problem.items())}}
+
+
 def episode_limit_cut_fails(job) -> bool:
     """Whether the job's episode profile scores a run cut by a limit as a failure."""
     from reliquary.corpus.job import EPISODE_PROFILES
@@ -768,7 +793,13 @@ class EpisodeJobRows:
                 stop = document.get("stop") if isinstance(document.get("stop"), str) else None
                 meta = {"status": status, "graded_success": document.get("graded_success"),
                         "instance_id": named}
-                if score is not None and stop in LIMIT_STOPS and limit_cut_fails:
+                closed = document.get("closed")
+                if score is not None and isinstance(closed, Mapping):
+                    # The box's call, CPU or transcript budget: the model spent it; no grading ran.
+                    meta = {**meta, "limit_cut": f"budget:{closed.get('reason')}", "box_reward": None,
+                            "box_success": False}
+                    score = 0.0
+                elif score is not None and stop in LIMIT_STOPS and limit_cut_fails:
                     # The reference leaderboard scores a run that hit a limit as no submission.
                     meta = {**meta, "limit_cut": stop, "box_reward": score,
                             "box_success": meta["graded_success"], "graded_success": False}

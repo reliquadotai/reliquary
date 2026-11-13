@@ -193,10 +193,10 @@ class CorpusTrajectory(BaseModel):
     tokens: list[int] = Field(min_length=1, max_length=MAX_PROFILE_TRAJECTORY_TOKENS)
     turns: list[CorpusTurn] = Field(min_length=1, max_length=MAX_PROFILE_TRAJECTORY_TURNS)
     final_diff: str = Field(max_length=MAX_FINAL_DIFF_CHARS)
-    # No "episode_closed" (the signed bridge's mid-turn close): such an episode ends
-    # unpaid, and `corpus.signed_parse` refuses it with a graded final anyway. Kept
-    # out of the wire as defense in depth.
-    stop: Literal["agent_completed", "max_turns", "context_length"]
+    # "episode_closed" (the signed bridge's mid-turn close) only for an eval episode
+    # profile's model-budget close (`corpus.job.model_closed`): the signed intake refuses
+    # it for any other job or final, and `corpus.signed_parse` with a graded final.
+    stop: Literal["agent_completed", "max_turns", "context_length", "episode_closed"]
     # Signed-sandbox jobs only: the gateway's transcript `{"token", "records"}`.
     transcript: dict[str, Any] | None = None
 

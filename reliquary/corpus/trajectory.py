@@ -50,9 +50,13 @@ class TrajectoryUnbuildable(ValueError):
 
 
 def build_trajectory(turns: Sequence[GeneratedTurn], *, final_diff: str, stop: str,
-                     chunk_tokens: int = TOPLOC_DEPLOYED_DEFAULTS.chunk_tokens) -> BuiltTrajectory:
-    if stop not in EPISODE_STOPS:
-        raise TrajectoryUnbuildable(f"stop {stop!r} is not one of {EPISODE_STOPS}")
+                     chunk_tokens: int = TOPLOC_DEPLOYED_DEFAULTS.chunk_tokens,
+                     closed: bool = False) -> BuiltTrajectory:
+    """``closed``: the episode's machine closed it on a model budget its profile scores
+    (`corpus.job.model_closed`), so its stop ``episode_closed`` is submittable too."""
+    stops = (*EPISODE_STOPS, "episode_closed") if closed else EPISODE_STOPS
+    if stop not in stops:
+        raise TrajectoryUnbuildable(f"stop {stop!r} is not one of {stops}")
     if not turns:
         raise TrajectoryUnbuildable("the session has no turn")
     first = list(turns[0].prompt_ids)

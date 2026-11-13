@@ -524,9 +524,16 @@ def _grade(admin, eval_id="order-swe-e1", **kw):  # noqa: F811
 def test_an_episode_order_is_graded_from_its_graders_grades(admin, swe_set, qwen35):  # noqa: F811
     assert admin("POST", "/admin/v1/jobs", _order()).status_code == 201
     _graded_episodes(admin, rewards=[1.0, 0.0, 1.0])
+    # A slot played again after its gateway lost the box: no row, counted apart.
+    admin.sessions.documents["s1"] = {"session_id": "s1", "job_id": "order-eval-swe1", "prompt_index": 2,
+                                      "state": "closed", "closed_status": "box_failed"}
     response = _grade(admin)
     assert response.status_code == 200, response.text
     report = json.loads((admin.root / "p" / "evaluations" / "order-swe-e1" / "report.json").read_text())
+    redone = report["provenance"]["redone_slots"]
+    assert (redone["redone"], redone["by_reason"]) == (1, {"box_failed": 1})
+    assert list(redone["by_problem"].values()) == [{"box_failed": 1}]
+    assert report["provenance"]["episode"]["max_turns"] > 0          # the run configuration
     verification = report["provenance"]["verification"]
     assert verification["scheme"] == "gumbel_max" and verification["grade"] == "signed-sandbox"
     assert report["provenance"]["job_complete"] is True

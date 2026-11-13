@@ -10,7 +10,8 @@ In order, cheapest first:
 1. one trajectory carrying its transcript, for a prompt index the job owns;
 2. §5.A/B: `verify_transcript` with EVERY `Expected` field (hotkey, engagement
    `corpus:<job>:<index>`, env, split, index, checkpoint) and the paid-session snapshot,
-   `graded` required (the only payable final);
+   `graded` required (the only payable final), except an eval profile's model-budget close
+   (`budget_exhausted` on calls, CPU or transcript, stop `episode_closed`): a scored 0;
 3. the deadline: received no later than `expires_at + GRADING_GRACE_S` by THIS
    validator's clock (the verifier uses none);
 4. record 0: a tools version this build renders, the job's tools, the job's
@@ -40,12 +41,13 @@ from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import Any
 
-from reliquary_sandbox.attest import GRADING_GRACE_S, Expected, verify_transcript
+from reliquary_sandbox.attest import GRADING_GRACE_S, STATUS_GRADED, Expected, verify_transcript
 from reliquary_sandbox.observation import TOOLS_VERSIONS
 
 from reliquary.corpus.checks import check_turn_spans
 from reliquary.corpus.eval_draw import has_draw
-from reliquary.corpus.signed_parse import parse_signed_trajectory
+from reliquary.corpus.job import model_closed, scores_model_closes
+from reliquary.corpus.signed_parse import STOP_EPISODE_CLOSED, parse_signed_trajectory
 from reliquary.corpus.signed_reasons import (
     REASON_SANDBOX_EXPIRED, REASON_SANDBOX_SESSION_REUSED, REASON_SANDBOX_STATE_MISMATCH,
     REASON_SANDBOX_TRANSCRIPT, corpus_engagement, session_seen_key, state_matches,
@@ -146,16 +148,25 @@ class SignedEpisodeIntake(EpisodeIntake):
         spec = episode.sandbox
         # The engagement names the row; the session token names the task it runs.
         task = self.source.task_ref(request.prompt_index)
+        # An eval profile's model-budget close is a scored 0 (`corpus.job.model_closed`); any
+        # other job takes a graded final only.
+        graded_only = not scores_model_closes(episode)
         expected = Expected(hotkey=request.miner_hotkey,
                             engagement=corpus_engagement(self._job.job_id, request.prompt_index),
                             env=spec.env, split=task.split, index=task.index,
                             checkpoint=self._job.checkpoint_sha256,
-                            seen_session_ids=self._seen(), require_graded=True)
+                            seen_session_ids=self._seen(), require_graded=graded_only)
         result = verify_transcript(trajectory.transcript, directory, self._tokens, expected)
         if not result.ok:
             return IntakeRefusal(REASON_SANDBOX_TRANSCRIPT,
                                  {"reasons": [reason.value for reason in result.reasons]})
         claims, opened, final = result.claims, result.open, result.final
+        # verify_transcript required `graded` already unless the profile scores model closes.
+        graded = graded_only or final.status == STATUS_GRADED
+        if not graded and not (model_closed(episode, final.status, final.reason)
+                               and trajectory.stop == STOP_EPISODE_CLOSED):
+            return IntakeRefusal(REASON_SANDBOX_TRANSCRIPT, {
+                "final": final.status, "reason": final.reason, "stop": trajectory.stop})
         deadline = claims.expires_at + GRADING_GRACE_S
         if received > deadline:
             return IntakeRefusal(REASON_SANDBOX_EXPIRED,
@@ -201,7 +212,8 @@ class SignedEpisodeIntake(EpisodeIntake):
                                  session_id=claims.session_id,
                                  session_key=session_seen_key(claims.session_id),
                                  machine_id=claims.machine_id, hotkey=claims.hotkey,
-                                 reward=float(final.reward), received_at=received)
+                                 reward=float(final.reward) if graded else 0.0,
+                                 received_at=received)
 
 
 def _unverified_deadline(request) -> int | None:

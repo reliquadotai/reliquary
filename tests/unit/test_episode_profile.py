@@ -17,7 +17,7 @@ MINI_SWE_2 = {"id": "mini-swe", "version": "2",
 
 
 def _leaderboard(**overrides):
-    budgets = {**sandbox_spec()["budgets"], "max_calls": 512, "per_call_timeout_s": 60, "wall_s": 7200}
+    budgets = {**sandbox_spec()["budgets"], "max_calls": 512, "per_call_timeout_s": 60, "wall_s": 14400}
     fields = {"profile": SWEBENCH_BASH_ONLY, "harness_spec": MINI_SWE_2, "max_turns": 250,
               "max_tokens_per_turn": 16384, "max_total_tokens": 131072,
               "sandbox": sandbox_spec(budgets=budgets)}
@@ -63,6 +63,9 @@ def test_without_a_profile_the_default_ceilings_hold_and_nothing_is_written():
      "plays harness mini-swe@2"),
     (_leaderboard(sandbox=sandbox_spec(budgets={**sandbox_spec()["budgets"], "max_calls": 512})),
      "per_call_timeout_s must be 60"),
+    (_leaderboard(sandbox=sandbox_spec(budgets={**sandbox_spec()["budgets"], "max_calls": 512,
+                                                "per_call_timeout_s": 60, "wall_s": 7200})),
+     "wall_s must be at least 14400"),
 ])
 def test_a_profile_pins_its_harness_and_bounds(episode, match):
     with pytest.raises(JobError, match=match):
@@ -127,3 +130,69 @@ def test_a_whole_set_with_exclusions_is_restated_over_the_benchmark():
     assert bracket["pass@1_excluded_passed"] == pytest.approx(253.5 / 500)
     assert _excluded_bracket(card, 100, {"pass@1": {"value": 0.5}}) is None
     assert _excluded_bracket({"count": 10}, 10, {"pass@1": {"value": 0.5}}) is None
+
+
+def test_the_call_budget_never_cuts_before_the_step_cap():
+    budgets = {**sandbox_spec()["budgets"], "max_calls": 249, "per_call_timeout_s": 60, "wall_s": 14400}
+    with pytest.raises(JobError, match="max_calls"):
+        _job(_leaderboard(sandbox=sandbox_spec(budgets=budgets)))
+
+
+def test_model_budgets_close_as_a_scored_zero_and_infra_ends_do_not():
+    from reliquary.corpus.job import model_closed, scores_model_closes
+
+    profiled = _job(_leaderboard()).episode
+    plain = _job(_signed(env={"split": "eval", "num_images": 500})).episode
+    assert scores_model_closes(profiled) and not scores_model_closes(plain)
+    for reason in ("max_calls", "cpu_s", "transcript_bytes"):
+        assert model_closed(profiled, "budget_exhausted", reason)
+        assert not model_closed(plain, "budget_exhausted", reason)
+    # Wall time is the gateway's and the miner's speed, never the model's: redone, not scored.
+    assert not model_closed(profiled, "expired", "deadline passed")
+    assert not model_closed(profiled, "box_failed", None)
+    assert not model_closed(profiled, "graded", None)
+
+
+def test_a_budget_close_scores_zero_and_redone_slots_are_counted(tmp_path, monkeypatch):
+    from reliquary.eval.grading import redone_slots
+    from tests.unit.test_eval_episode_grading import (
+        _GradeRecords, _grade_job, _publish, _report, _sid,
+    )
+
+    plain, rows, subnet = _publish(tmp_path, monkeypatch, "swe")
+    episode = _leaderboard()
+    episode["env"]["split"] = plain.episode.env.split
+    job = _job(episode, prompt_source=plain.prompt_source, prompt_count=plain.prompt_count)
+    records = _GradeRecords(job, submissions_readable=False)
+    for prompt, k in [(0, 0), (0, 1), (1, 0), (1, 1)]:
+        records.submit(_sid(prompt, k), prompt, reward=1.0)
+    closed = records.grades[_sid(1, 1)]
+    closed.update(stop="episode_closed", graded_success=False,
+                  closed={"status": "budget_exhausted", "reason": "max_calls"})
+    closed["grade"]["reward"] = 0.0
+    _grade_job(tmp_path, job, records, subnet)
+    env = _report(tmp_path)["envs"]["reliquary-swe"]
+    assert env["pass@1"]["value"] == pytest.approx(0.75)
+    assert env["limit_cuts"] == {"rows": 1, "by_stop": {"budget:max_calls": 1}, "box_state_passed": 0}
+
+    sessions = [
+        {"job_id": job.job_id, "prompt_index": 0, "state": "closed", "closed_status": "expired"},
+        {"job_id": job.job_id, "prompt_index": 0, "state": "lapsed", "closed_status": None},
+        {"job_id": job.job_id, "prompt_index": 1, "state": "closed", "closed_status": "box_failed"},
+        {"job_id": job.job_id, "prompt_index": 1, "state": "submitted", "closed_status": "graded"},
+        {"job_id": job.job_id, "prompt_index": 1, "state": "live", "closed_status": None},
+        {"job_id": "another", "prompt_index": 0, "state": "closed", "closed_status": "expired"},
+    ]
+    summary = redone_slots(sessions, job.job_id, lambda i: rows[i]["problem_id"])
+    assert summary == {"redone": 3, "by_reason": {"expired": 1, "lapsed": 1, "box_failed": 1},
+                       "by_problem": {rows[0]["problem_id"]: {"expired": 1, "lapsed": 1},
+                                      rows[1]["problem_id"]: {"box_failed": 1}}}
+
+
+def test_only_a_scored_close_builds_an_episode_closed_trajectory():
+    from reliquary.corpus.trajectory import TrajectoryUnbuildable, build_trajectory
+
+    with pytest.raises(TrajectoryUnbuildable, match="stop 'episode_closed'"):
+        build_trajectory([], final_diff="", stop="episode_closed")
+    with pytest.raises(TrajectoryUnbuildable, match="no turn"):
+        build_trajectory([], final_diff="", stop="episode_closed", closed=True)
