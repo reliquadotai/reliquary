@@ -53,6 +53,9 @@ On an order with `"pricing": "auction"`:
   offer your real cost.
 - **Keep your word.** A lease you take and do not deliver is charged against your next payouts, and halves your
   capacity for an hour.
+- **Follow the draw.** A sample that does not follow the order's forced draw (another model, a heavy quantisation,
+  edited tokens) fails its audit. A hotkey with a confirmed failure gets no new lease on that order until its
+  suspicion ends (`miner_suspect`, with the time); `GET /corpus/jobs/<job_id>/miners/<hotkey>` shows why.
 - **Your setup.** Lease up to 256 samples per request, with any engine and batch size.
 
 Without an offer you get no work on an auctioned order. `GET /corpus/jobs/<job_id>/auction` shows its current

@@ -443,3 +443,44 @@ def test_an_expiry_charged_while_a_lease_is_admitted_never_deadlocks():
             auction.unreserve(terms)
     worker.join(timeout=20)
     assert not worker.is_alive()
+
+
+
+def test_unmet_demand_grows_the_budget_even_while_a_cheaper_offer_leaves_it_unused():
+    """2026-11-13: one slow offer held a 15-lease budget at 4 leases; the thermostat waited for 80 % of the budget to
+    be leased, so it never grew and the offers behind got nothing. A refused offer now counts as demand."""
+    backlog = [0]
+    auction, clock, book = _auction(budget=4, backlog=lambda: backlog[0])
+    auction.post_ask("slow", 0.1, 4)
+    auction.post_ask("next", 0.2, 4)
+    _lease(auction, book, "slow")                           # 1 of 4 leased: far under 80 %
+    assert auction.admit("next") == ASK_ABOVE_PRICE         # no room behind the slow offer: unmet demand
+    clock.now += STEER_SECONDS + 1
+    _lease(auction, book, "slow")                           # the next request steers: the budget grows
+    assert auction.view()["budget"] > 4
+    assert isinstance(_lease(auction, book, "next"), Terms)
+
+
+def test_without_unmet_demand_an_unused_budget_does_not_grow():
+    backlog = [0]
+    auction, clock, book = _auction(budget=4, backlog=lambda: backlog[0])
+    auction.post_ask("slow", 0.1, 4)
+    _lease(auction, book, "slow")
+    clock.now += STEER_SECONDS + 1
+    _lease(auction, book, "slow")
+    assert auction.view()["budget"] == 4
+
+
+def test_a_hotkey_set_aside_gets_no_allowance_until_then():
+    auction, clock, book = _auction(budget=4)
+    auction.post_ask("aside", 0.1, 4)
+    auction.post_ask("next", 0.2, 4)
+    for hotkey in ("aside", "next"):
+        auction.admit(hotkey)
+        auction._reserved.clear()
+    auction.set_aside("aside", clock.now + 100)
+    assert auction.admit("aside") == ASK_ABOVE_PRICE
+    assert _fill(auction, book, "next")[0] == 4             # its share goes to the offer behind it
+    clock.now += 101
+    book.held.clear()
+    assert isinstance(_lease(auction, book, "aside"), Terms)

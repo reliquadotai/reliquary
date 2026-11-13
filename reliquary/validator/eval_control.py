@@ -113,6 +113,22 @@ EVAL_CONTROL_STATUS_KEY = "reliquary/eval/control/status.json"
 # The miners document every order shares: a hotkey's probation progress carries
 # from one order to the next (no `order-` prefix: it is no order).
 ORDER_TRUST_ID = "miner-trust-orders"
+# How stale a hotkey's audit state may be when a lease request asks whether it is suspect (a lease request is
+# frequent; a failure is acted on in the audit itself, this only stops new work).
+SUSPECT_READ_MAX_AGE = 30.0
+
+
+def _suspect_reader(miner_states, params):
+    """``hotkey``'s suspicion end (unix seconds) while it is suspect on the job, else None."""
+    from reliquary.corpus.audit_policy import effective_state
+
+    async def suspect_until(hotkey: str) -> float | None:
+        state, _ = await miner_states.state_at_most(hotkey, SUSPECT_READ_MAX_AGE)
+        if effective_state(state, time.time(), params) == "suspect":
+            return state.suspect_until
+        return None
+
+    return suspect_until
 
 
 def order_audit_drain_seconds(env=None) -> float:
@@ -1511,6 +1527,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             # A draw job's samples carry no proof: the draw is their check.
             proof_chunk_tokens=None if has_draw(w.job) else w.proof.chunk_tokens, vocab_size=w.vocab_size,
             is_banned=w.is_banned, registration=registration, seen_index=w.seen_index,
+            suspect_until=getattr(w, "suspect_until", None),
             job=getattr(w, "job", None), durable_records=False, auction=_auction_of(w),
             episode_intake=getattr(w, "episode_intake", None))
 
@@ -1575,7 +1592,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                             audit_executors=order_audit_executors(declared),
                             vocab_size=vocab_size, proof=proof, renderer=renderer,
                             prompt_job_for=prompt_job_for, seen_index=seen_index,
-                            is_banned=is_banned, stats=JobStats())
+                            is_banned=is_banned, suspect_until=_suspect_reader(miner_states, params),
+                            stats=JobStats())
         if job.episode is not None:
             # Published to the session issuer only at the end, once the whole job is wired.
             await wire_episode(w)
