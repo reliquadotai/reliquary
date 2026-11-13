@@ -77,10 +77,15 @@ Hippius sub token.
 - The provisioner pushes the file (mode 0600) only to the groups that pull from the registry. It
   reads the file from `GATEWAY_KIT_DIR/registry.env`.
 
-### Boot
+### Boot and disk
+
+The 493 images are ~131 GB compressed and ~340 GB extracted (2.6x, measured on 40 of them), plus
+each session's writable layer. So `swe-full` gateways are rented as `cpu-large-amd`
+(`GROUP_RESOURCE`: 16 vCPU, 1.5 TB disk) whatever `TARGON_GATEWAY_RESOURCE` says.
 
 The Worker allows a `swe-full` gateway 2 h of boot (`GROUP_BOOT_HOURS`) and 90 extra minutes
 before giving it up (`GROUP_READY_EXTRA_SECONDS`). The provisioner waits 90 extra minutes too.
+At the measured rate, the pulls alone take ~40 min on 4 vCPU.
 The bootstrap's own `docker pull` has a 1,800 s timeout per image.
 
 ### Validated on a throwaway Targon VM (cpu-small-amd, 4 vCPU, 2026-11-13)
@@ -97,8 +102,11 @@ destroyed after the test).
   registry 2.8.3 panic, and the pulls silently fell back to mirror.gcr.io. The bootstrap now
   passes `REGISTRY_STORAGE_MAINTENANCE_UPLOADPURGING='{"enabled": false}'` and exits if the
   registry is not up.
-- A batch of 40 images: see `~/runbooks/swe-full/vm_registry_test.out` (operator notes, not in
-  the repo).
+- A batch of 40 set images, 8 in parallel, all came from our bucket. Every blob GET answered
+  307 (a presigned Hippius URL).
+  - Time: 364 s.
+  - Size: 21 GB compressed, 55 GB extracted.
+  - Operator notes: `~/runbooks/swe-full/vm_registry_test.out`, not in the repo.
 
 ## 3. The leaderboard profile
 
