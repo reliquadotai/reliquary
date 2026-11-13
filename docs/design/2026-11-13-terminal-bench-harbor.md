@@ -1,6 +1,6 @@
 # Terminal-Bench 2.1 (Harbor) as an order benchmark
 
-Status: implemented, PRs open, 2026-11-13. Nothing merged or deployed.
+Status: implemented, PRs open (reliquary-sandbox #17, reliquary-environments #45, reliquary #518, reliquary-platform #208), 2026-11-13. Nothing merged or deployed.
 
 | Piece | Where | State |
 | --- | --- | --- |
@@ -182,12 +182,15 @@ are part of the leaderboard's difficulty. Residual: an episode that reaches its 
 1. reliquary-sandbox PR #17 (`terminus-2@1`). Merge with a merge commit (not squash): Catalyst
    and the platform pin d680d5e.
 2. reliquary-environments `feat/reliquary-terminal-bench` (merge commit, same reason: a7718445).
-3. Catalyst `feat/terminal-bench-harbor`. Deploying it is a **fleet release**: every harness
-   digest and the sandbox commit move, so the order control, validators and miners must run it
-   before any job pinning the new digests, and jobs pinning the old ones are refused after.
-4. reliquary-platform `feat/tb21-gateway-group` after the SWE-Pro/NL2Repo PR (migration 0064
-   before 0065). Its Worker deploy must follow step 3 (its templates pin the new sandbox commit
-   and digests); its bootstrap moves every group to sandbox d680d5e.
+3. Catalyst #518. Not a breaking release: the sandbox code at d680d5e is release-2026-11-13
+   (7743b57) plus the harness distribution, and both 7743b57 and f8c208bd stay compatible
+   (`COMPATIBLE_SANDBOX_COMMITS`); every harness digest moved but the 7d559fd ones stay accepted
+   (`PREVIOUS_HARNESS_DIGESTS`, same tokens). Miners and validators must reinstall
+   reliquary-harness d680d5e (the installed digests are checked) and, to serve TB 2.1, install
+   reliquary-terminal-bench @ a7718445.
+4. reliquary-platform #208 (D1 migration 0066, then the Worker). Only the TB template pins
+   d680d5e and terminus-2@1; the other sets keep their pins. Its bootstrap moves every group's
+   gateway to sandbox d680d5e (egress, per-box limits). Deploy after step 3.
 5. Ops: kit gains `groups/tb21/{images,index}.txt` and the wheel (sha256 5ea79213…), from
    `~/evalsets-work/sets-agentic/tb21-65/kit/`; publish the frozen set
    (`reliquary eval publish-set`); the tb21 gateways get `registry.env` (as swe-full).
