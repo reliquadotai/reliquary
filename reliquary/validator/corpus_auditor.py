@@ -534,12 +534,17 @@ class CorpusAuditor:
             return None
         if not pending:
             return 0.0
+        records, completions = self._completions_read
+        per_record = completions / records if records else 1.0
+        return pending * self.audit_share() * per_record
+
+    def audit_share(self) -> float:
+        """The share of this job's records the GPU audits: its verdicts audited so far (probation and slow-hotkey
+        audits included) against q as a prior, never below q."""
         audited, unaudited = self._decided["audit"], self._decided["pass_unaudited"]
         prior = EXPECTED_AUDIT_PRIOR_DECISIONS
         share = (audited + self._params.q * prior) / (audited + unaudited + prior)
-        records, completions = self._completions_read
-        per_record = completions / records if records else 1.0
-        return pending * min(1.0, max(self._params.q, share)) * per_record
+        return min(1.0, max(self._params.q, share))
 
     @property
     def audits_idle_since(self) -> float | None:

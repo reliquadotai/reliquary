@@ -471,3 +471,163 @@ def test_a_refusal_with_free_capacity_is_the_hotkeys_own():
     refused = quota.admit("5Waste", NOW, engagement=f"corpus:{JOB}:2", job_id=JOB)
     assert refused.reason == "quota_live" and refused.detail["standing"] == LOW_YIELD
     assert quota.fleet_refusals(JOB, NOW) == 0
+
+
+# --- declared wants (design 2026-11-13-sandbox-sizing-miner-demand) ---
+
+from reliquary.protocol.sandbox_session import (  # noqa: E402
+    MAX_SESSION_WANT, WANT_ACCEPTED, SandboxSessionOpenRequest,
+)
+from reliquary.sandbox.corpus_quota import FORECAST_WINDOW_S  # noqa: E402
+
+
+def test_the_quota_keeps_the_last_want_per_job_and_hotkey_for_the_forecast_window():
+    book = SessionBook(SandboxPolicy())
+    quota, clock = quota_of(book)
+    quota.declare("5A", JOB, 64, NOW - 100)
+    quota.declare("5A", JOB, 48, NOW)                         # the last one wins
+    quota.declare("5B", "other", MAX_SESSION_WANT + 100, NOW)  # bounded
+    for junk in (None, 0, -3, True, "64", 2.5):
+        quota.declare("5C", JOB, junk, NOW)
+    quota.declare("5C", None, 8, NOW)
+    assert quota.declarations(NOW) == {JOB: {"5A": (48, NOW)}, "other": {"5B": (MAX_SESSION_WANT, NOW)}}
+    assert quota.declarations(NOW + FORECAST_WINDOW_S + 1) == {}
+
+
+def test_a_declared_want_changes_neither_the_allocation_nor_the_allowance():
+    book = SessionBook(SandboxPolicy())
+    plain, _ = quota_of(book)
+    declared, _ = quota_of(book)
+    declared.declare("5A", JOB, 512, NOW)
+    for quota in (plain, declared):
+        assert quota.admit("5A", NOW, engagement=f"corpus:{JOB}:1", job_id=JOB) is None
+    assert plain.allowance("5A") == declared.allowance("5A") == 37
+    assert plain.view() == declared.view()
+
+
+def test_a_quota_refusal_says_the_validator_reads_wants():
+    book = SessionBook(SandboxPolicy())
+    quota, _ = quota_of(book, capacity=0)
+    assert quota.admit("5A", NOW, engagement=f"corpus:{JOB}:1").detail[WANT_ACCEPTED] is True
+    quota, _ = quota_of(book, capacity=1)
+    book.add(rec("5A-1", "5A", 1))
+    assert quota.admit("5A", NOW, engagement=f"corpus:{JOB}:2").detail[WANT_ACCEPTED] is True
+
+
+def test_the_issuer_hands_a_served_jobs_declared_want_to_the_quota(tmp_path):
+    env = _issuer_env(tmp_path, capacity=3)
+    grant = ts.open_(env, request_id="1" * 32, engagement={**ts.CORPUS, "want": 48})
+    assert isinstance(grant, ts.Grant)
+    job_id = ts.CORPUS["job_id"]
+    assert env.quota.declarations()[job_id]["5Hot"][0] == 48
+    # Refused for the fleet: still what the miner wants.
+    for prompt in range(3):
+        _open(env, 10 + prompt)
+    refused = ts.open_(env, hotkey="5Other", request_id="2" * 32, engagement={**ts.CORPUS, "want": 16})
+    assert refused.reason in ("quota_live", "prompt_unavailable")
+    assert env.quota.declarations()[job_id]["5Other"][0] == 16
+    # A job it cannot mine declares nothing.
+    ts.open_(env, hotkey="5Far", request_id="3" * 32, engagement={**ts.CORPUS, "job_id": "nope", "want": 16})
+    assert "nope" not in env.quota.declarations()
+    # An open without a want (an older miner) declares nothing.
+    _open(env, 20, hotkey="5Old")
+    assert "5Old" not in env.quota.declarations().get(job_id, {})
+
+
+def test_the_route_says_it_reads_wants_with_the_allowance():
+    from tests.unit import test_sandbox_routes as tr
+
+    grant = ts.Grant("s-1", tr.TOKEN, "http://10.0.0.5:8080", tr.NOW + 4500, allowance=12)
+    issuer = tr.FakeIssuer(grant)
+    body = tr.open_body(engagement={"kind": "corpus", "job_id": "swe-agentic-v1", "prompt_index": 3, "want": 40})
+    answer = tr.client(issuer).post("/corpus/sandbox/sessions", json=body)
+    assert answer.status_code == 200 and answer.json()[WANT_ACCEPTED] is True
+    assert issuer.calls[0][1]["engagement"]["want"] == 40
+    plain = ts.Grant("s-1", tr.TOKEN, "http://10.0.0.5:8080", tr.NOW + 4500)
+    assert WANT_ACCEPTED not in tr.client(tr.FakeIssuer(plain)).post("/corpus/sandbox/sessions",
+                                                                     json=tr.open_body()).json()
+
+
+@pytest.mark.parametrize("want,ok", [(None, True), (1, True), (MAX_SESSION_WANT, True), (0, False),
+                                     (MAX_SESSION_WANT + 1, False), (True, False), ("8", False), (8.0, False)])
+def test_the_open_request_bounds_the_want(want, ok):
+    from pydantic import ValidationError
+
+    from tests.unit import test_sandbox_routes as tr
+
+    engagement = {"kind": "corpus", "job_id": "swe-agentic-v1", "prompt_index": 3}
+    if want is not None:
+        engagement["want"] = want
+    if ok:
+        SandboxSessionOpenRequest.model_validate(tr.open_body(engagement=engagement))
+    else:
+        with pytest.raises(ValidationError):
+            SandboxSessionOpenRequest.model_validate(tr.open_body(engagement=engagement))
+
+
+def test_the_want_is_signed_with_the_engagement():
+    from reliquary.miner.signed_episode import signed_open_request
+    from reliquary.protocol.signatures import build_sandbox_open_binding
+
+    kw = dict(hotkey="5Hot", job_id=JOB, prompt_index=3, sign_binding=lambda b: b.hex(), now=NOW,
+              request_id="a" * 32, validator_hotkey="5Val", path="/corpus/sandbox/sessions")
+    plain, declared = signed_open_request(**kw), signed_open_request(**kw, want=40)
+    assert "want" not in plain["engagement"] and declared["engagement"]["want"] == 40
+    assert plain["signature"] != declared["signature"]
+    bound = build_sandbox_open_binding(declared, validator_hotkey="5Val", path="/corpus/sandbox/sessions")
+    assert bound.hex() == declared["signature"]
+    assert signed_open_request(**kw, want=10_000)["engagement"]["want"] == MAX_SESSION_WANT
+
+
+def test_the_miner_declares_its_want_only_once_the_validator_reads_it(tmp_path):
+    sessions, signed_runner = _miner_run(tmp_path, grant_extra={"allowance": 10, WANT_ACCEPTED: True}, max_live=64)
+    wants = [body["engagement"].get("want") for body in sessions.opened]
+    assert wants[0] is None and set(wants[1:]) == {64}      # the first open learns it
+    assert signed_runner.declares_want and signed_runner.want == 64
+    (tmp_path / "old").mkdir()
+    old, old_runner = _miner_run(tmp_path / "old", grant_extra={"allowance": 10}, max_live=64)
+    assert not old_runner.declares_want
+    assert all("want" not in body["engagement"] for body in old.opened)
+
+
+def test_the_miners_want_is_its_batch_within_its_bound(tmp_path):
+    signed = tm._transcript(tmp_path)
+    signed_runner = tm.runner(tm.FakeSessions(grant=tm._grant(signed)), tm.FakeSandboxRunner(signed), max_live=64)
+    assert signed_runner.want == 64
+    from reliquary.miner.signed_episode import SignedSweEpisodeRunner
+
+    smaller = SignedSweEpisodeRunner(**{**_runner_kwargs(signed_runner), "max_live": 64, "want": 24})
+    assert smaller.want == 24
+    capped = SignedSweEpisodeRunner(**{**_runner_kwargs(signed_runner), "max_live": 6, "want": 24})
+    assert capped.want == 6
+
+
+def _runner_kwargs(signed_runner):
+    return dict(job=tm.JOB, hotkey=tm.HOT, sign_binding=lambda binding: "s", sessions=signed_runner._sessions,
+                model_name="m", renderer_model_dir="/ck", generate_url="http://127.0.0.1:1",
+                sampling=tm.JOB.sampling, source=signed_runner._source)
+
+
+def test_a_quota_refusal_also_turns_the_declaration_on(tmp_path):
+    signed = tm._transcript(tmp_path)
+    signed_runner = tm.runner(tm.FakeSessions(grant=tm._grant(signed)), tm.FakeSandboxRunner(signed), max_live=32)
+    refused = tm.SessionRefused("quota_live", {"allowance": 2, WANT_ACCEPTED: True}, retry_after=10.0, status=429)
+    signed_runner._note_refusal(refused)
+    assert signed_runner.declares_want and signed_runner._declared_want() == 32
+
+
+def test_the_rl_runner_never_declares():
+    from reliquary.miner.rl_episode_client import RlSignedEpisodeRunner
+
+    runner = object.__new__(RlSignedEpisodeRunner)
+    runner.declares_want, runner.want = True, 16
+    assert runner._declared_want() is None
+
+
+def test_each_hotkey_declares_its_share_of_the_process_batch():
+    from reliquary.miner.agentic_miner import declared_want
+
+    assert declared_want(64, 8, 1) == 8                  # the default --concurrency
+    assert declared_want(64, 128, 1) == 64               # bounded by --max-live-per-job
+    assert declared_want(64, 100, 3) == 34               # shared by its identities, rounded up
+    assert declared_want(64, 1, 4) == 1

@@ -407,6 +407,7 @@ def test_the_control_status_says_what_an_episode_orders_gateways_are_sized_from(
         services.book.add(session("s2", SUBMITTED, now - 1_000, now - 160))
         w.settler.on_read("sub-1", {"token_count": 30_000, "prompt_token_count": 11_000})
         monkeypatch.setattr(services.quota, "fleet_refusals", lambda job, at, window: 37 if job == job_id else 0)
+        services.quota.declare("5Hot", job_id, 4, now)               # its miner wants 4 sessions at once
         # One executor wanted for its model, auditing 2 870 tokens/s.
         dispatcher = app.state.dispatcher
         monkeypatch.setattr(w.auditor, "audits_pending", lambda: 10)
@@ -422,11 +423,19 @@ def test_the_control_status_says_what_an_episode_orders_gateways_are_sized_from(
     before, after = asyncio.run(go())
     assert before == {"episodes_total": 6, "episodes_finished": 0, "episodes_left": 6, "sessions_held": 0,
                       "episode_seconds": None, "tokens_per_episode": None, "audit_episodes_per_second": None,
-                      "quota_refusals_fleet_full": 0}
+                      "quota_refusals_fleet_full": 0, "demand_sessions": None, "demand_declared_sessions": 0,
+                      "demand_forecast_sessions": 0, "demand_hotkeys": 0, "audit_share": 1.0,
+                      "executors_allowed": 1, "audit_capacity_sessions": None, "sessions_target": None,
+                      "binding": None}
+    allowed = after["models"][after["jobs"][job_id]["sizing"]["model"]]["executors_allowed"]
     assert after["jobs"][job_id]["sandbox"] == {
         "episodes_total": 6, "episodes_finished": 0, "episodes_left": 6, "sessions_held": 1,
         "episode_seconds": 840.0, "tokens_per_episode": 41_000.0,
-        "audit_episodes_per_second": pytest.approx(0.07), "quota_refusals_fleet_full": 37}
+        "audit_episodes_per_second": pytest.approx(0.07), "quota_refusals_fleet_full": 37,
+        # Every episode audited: 2 870 tokens/s x the executors allowed / 41 000 x 840 s.
+        "demand_sessions": 4, "demand_declared_sessions": 4, "demand_forecast_sessions": 0, "demand_hotkeys": 1,
+        "audit_share": 1.0, "executors_allowed": allowed,
+        "audit_capacity_sessions": int(2_870 * allowed / 41_000 * 840), "sessions_target": 4, "binding": "demand"}
     # The fields it had are kept.
     assert {"state", "prompts_total", "audits_pending", "sizing"} <= set(after["jobs"][job_id])
     json.dumps(after)

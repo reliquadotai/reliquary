@@ -51,7 +51,7 @@ from pydantic import BaseModel, ValidationError
 
 from reliquary.protocol.corpus_submission import MAX_TRANSCRIPT_BYTES
 from reliquary.protocol.sandbox_session import (
-    SandboxSessionCloseRequest, SandboxSessionOpenRequest, sandbox_close_path, sandbox_open_path,
+    WANT_ACCEPTED, SandboxSessionCloseRequest, SandboxSessionOpenRequest, sandbox_close_path, sandbox_open_path,
 )
 from reliquary.protocol.signatures import (
     verify_sandbox_close_signature, verify_sandbox_open_signature,
@@ -346,6 +346,7 @@ def build_sandbox_sessions_router(
             allowance = getattr(outcome, "allowance", None)
             if allowance is not None:            # the corpus quota's: the sessions the miner may grow to
                 answer["allowance"] = int(allowance)
+                answer[WANT_ACCEPTED] = True     # its opens may declare their want (``engagement.want``)
             return _answer(answer)
 
         return await guarded("open", step)

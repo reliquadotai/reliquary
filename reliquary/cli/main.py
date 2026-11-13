@@ -3380,7 +3380,9 @@ def corpus_mine_agentic(
         help="Signed-sandbox jobs: this miner's upper bound on live sessions at once for a hotkey "
              "on the job (its batch). The validator names each hotkey's allowance (its fair share "
              "of the sandbox fleet) and the miner grows to min(this, allowance); a validator that "
-             "names none keeps it at 4. Episodes also run at most --concurrency at once"),
+             "names none keeps it at 4. Episodes also run at most --concurrency at once. The miner "
+             "declares min(this, --concurrency) as its want, which sizes the sandbox fleet: set "
+             "--concurrency to the episodes your GPU can run at once"),
 ) -> None:
     """Mine an agentic (episode) corpus job against a local vLLM with per-turn
     proofs. A SWE replay job (harness bash) runs verifiers + reliquary-swe episodes
