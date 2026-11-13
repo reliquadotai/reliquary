@@ -34,7 +34,9 @@ the book) and the corpus thresholds below.
   allocation (MAIN: ``floor``; pooled: its member share and the entity's room), and the fleet's held sessions + 1
   fit within ``C`` less the room the pooled entities were allocated and have not filled yet. A refusal is
   ``quota_live`` (its own allocation, or the fleet) or ``quota_pool`` (its pooled entity), 429 with ``Retry-After``
-  and the hotkey's ``allowance`` in the detail.
+  and the hotkey's ``allowance`` in the detail. A refusal is FLEET-FULL (``fleet_refusals``, per job, for the order
+  control's status) when more capacity would have admitted it: no capacity known, the fleet check, or any refusal
+  of a hotkey outside the low-yield entity while the allocation leaves no whole session unallocated.
 * ALLOWANCE (what the miner is told: on every grant and in every quota refusal): its POTENTIAL, the sessions it
   would get if it asked for the whole fleet, the others' demands as measured (``rl_capacity.potential``; for a pooled
   hotkey, its member share of its entity's potential). The miner grows its live sessions to it.
@@ -47,6 +49,7 @@ the book) and the corpus thresholds below.
 Every method is synchronous and called on the event loop (the issuer calls ``admit`` under its lock)."""
 from __future__ import annotations
 
+import collections
 import math
 import time
 from collections.abc import Callable
@@ -93,6 +96,8 @@ NEWCOMER_WEIGHT = 4.0          # the newcomer entity's weight for spare capacity
 GROUP = 1                      # a corpus session is its own group (rl_capacity's ``pool_seeds``)
 
 USEFUL, WASTED, NEUTRAL = "useful", "wasted", "neutral"
+
+FLEET_REFUSALS_WINDOW_S = 600  # the fleet-full refusals kept per job (``fleet_refusals``)
 
 
 def outcome(record: Any) -> str | None:
@@ -182,6 +187,7 @@ class CorpusQuota:
         self._shares: dict[str, float] = {}                 # pooled hotkey -> its member share
         self._weights: dict[str, float] = {}
         self._potentials: dict[str, int] = {}
+        self._fleet_full: dict[str, collections.deque[int]] = {}   # job id -> times of its fleet-full refusals
 
     def install(self) -> None:
         """The session book's per-hotkey caps follow the quota from now on."""
@@ -331,10 +337,43 @@ class CorpusQuota:
         return room
 
     # --- admission ---
-    def admit(self, hotkey: str, now: int, *, engagement: str | None = None) -> Refusal | None:
+    def admit(self, hotkey: str, now: int, *, engagement: str | None = None,
+              job_id: str | None = None) -> Refusal | None:
         """None admits. The issuer calls it under its lock for an ADMISSIBLE open (the book's caps and the prompt's
-        slots passed): the ask counts as demand for DEMAND_TTL_S."""
-        hotkey, now = str(hotkey), int(now)
+        slots passed): the ask counts as demand for DEMAND_TTL_S. A fleet-full refusal is counted for ``job_id``."""
+        refusal = self._admit(str(hotkey), int(now), engagement)
+        if refusal is not None and job_id is not None and self._is_fleet_full(refusal):
+            times = self._fleet_full.setdefault(str(job_id), collections.deque())
+            while times and times[0] < int(now) - FLEET_REFUSALS_WINDOW_S:   # bounded even if never read
+                times.popleft()
+            times.append(int(now))
+        return refusal
+
+    def _is_fleet_full(self, refusal: Refusal) -> bool:
+        """Whether more capacity would have admitted it (module docstring)."""
+        detail = refusal.detail or {}
+        if detail.get("why") in ("fleet", "no fleet capacity known yet"):
+            return True
+        alloc = self._alloc
+        if alloc is None or detail.get("standing") == LOW_YIELD:
+            return False
+        allocated = alloc.newcomer + alloc.low_yield + sum(alloc.main.values())
+        return alloc.capacity - allocated < 1.0
+
+    def fleet_refusals(self, job_id: str, now: float | None = None, window_s: float = FLEET_REFUSALS_WINDOW_S) -> int:
+        """The job's fleet-full refusals in the last ``window_s`` (at most FLEET_REFUSALS_WINDOW_S)."""
+        now = int(self._clock() if now is None else now)
+        times = self._fleet_full.get(str(job_id))
+        if not times:
+            return 0
+        while times and times[0] < now - FLEET_REFUSALS_WINDOW_S:
+            times.popleft()
+        if not times:
+            del self._fleet_full[str(job_id)]
+            return 0
+        return sum(1 for at in times if at >= now - window_s)
+
+    def _admit(self, hotkey: str, now: int, engagement: str | None) -> Refusal | None:
         if engagement is not None:
             self._wants.setdefault(hotkey, {})[str(engagement)] = float(now)
         held = self._held_by_hotkey(now)

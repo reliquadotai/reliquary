@@ -288,6 +288,8 @@ def test_the_issuer_refuses_beyond_the_fleet_with_the_allowance(tmp_path):
     assert all(isinstance(g, ts.Grant) for g in outcomes[:3])
     refused = outcomes[3]
     assert refused.reason == "quota_live" and refused.detail["allowance"] == 3 and refused.retry_after == 10
+    # Counted for its job: the order control's `quota_refusals_fleet_full`.
+    assert env.quota.fleet_refusals(ts.CORPUS["job_id"]) == 1
 
 
 def test_a_restored_issuer_keeps_counting_the_held_sessions(tmp_path):
@@ -433,3 +435,39 @@ def test_the_rl_runner_ignores_allowances():
     from reliquary.miner.rl_episode_client import RlSignedEpisodeRunner
 
     assert RlSignedEpisodeRunner.follows_allowance is False
+
+
+def test_fleet_full_refusals_are_counted_per_job_for_ten_minutes():
+    book = SessionBook(SandboxPolicy())
+    quota, clock = quota_of(book, capacity=2)
+    for prompt in range(2):
+        assert quota.admit("5A", NOW, engagement=f"corpus:{JOB}:{prompt}", job_id=JOB) is None
+        book.add(rec(f"5A-{prompt}", "5A", prompt))
+    # The fleet is fully allocated: more capacity would have admitted these (whoever asks, whatever the check).
+    assert quota.admit("5A", NOW, engagement=f"corpus:{JOB}:2", job_id=JOB).reason == "quota_live"
+    assert quota.admit("5B", NOW + 30, engagement=f"corpus:{JOB}:3", job_id=JOB) is not None
+    assert quota.admit("5B", NOW + 30, engagement="corpus:other:3", job_id="other") is not None
+    assert quota.admit("5B", NOW + 30, engagement=f"corpus:{JOB}:4") is not None     # no job named: not counted
+    assert (quota.fleet_refusals(JOB, NOW + 60), quota.fleet_refusals("other", NOW + 60)) == (2, 1)
+    assert quota.fleet_refusals(JOB, NOW + 60, window_s=40) == 1
+    assert quota.fleet_refusals(JOB, NOW + 601) == 1                                # the first one is 10 min old
+    clock.now = NOW + 700
+    assert quota.fleet_refusals(JOB) == 0 and quota.fleet_refusals("never") == 0
+
+
+def test_no_capacity_known_is_fleet_full():
+    book = SessionBook(SandboxPolicy())
+    quota, _ = quota_of(book, capacity=0)
+    assert quota.admit("5A", NOW, engagement=f"corpus:{JOB}:1", job_id=JOB) is not None
+    assert quota.fleet_refusals(JOB, NOW) == 1
+
+
+def test_a_refusal_with_free_capacity_is_the_hotkeys_own():
+    book = SessionBook(SandboxPolicy())
+    history(book, "5Waste", 30, useful=False)                 # low-yield: hard-capped at L = 1
+    quota, _ = quota_of(book, capacity=37)
+    assert quota.admit("5Waste", NOW, engagement=f"corpus:{JOB}:1", job_id=JOB) is None
+    book.add(rec("5Waste-1", "5Waste", 1))
+    refused = quota.admit("5Waste", NOW, engagement=f"corpus:{JOB}:2", job_id=JOB)
+    assert refused.reason == "quota_live" and refused.detail["standing"] == LOW_YIELD
+    assert quota.fleet_refusals(JOB, NOW) == 0
