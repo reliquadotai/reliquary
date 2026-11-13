@@ -156,12 +156,12 @@ def test_the_guest_unframes_the_program_and_its_stdin():
     assert namespace["run"]("", sr.frame("print('x' * 100)", ""), 10)["status"] == "output_limit"
 
 
-def test_only_livecodebench_is_adapted():
+def test_only_pinned_tasksets_are_adapted():
     class Other:
         pass
 
     assert sr.runtime_for(Other()) is None
-    assert set(sr.ADAPTED) == {"livecodebench.taskset"}
+    assert set(sr.ADAPTED) == {"livecodebench.taskset", "scicode_steps.taskset"}
 
 
 def test_a_livecodebench_task_scores_through_the_grading_service(socket_path, monkeypatch):

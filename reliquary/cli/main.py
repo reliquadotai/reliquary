@@ -2308,7 +2308,7 @@ def eval_build_set(
     seed: int | None = typer.Option(None, "--seed"),
     taskset_args: str | None = typer.Option(
         None, "--taskset-args",
-        help="Verifiers only: the taskset config as JSON, frozen into the set"),
+        help="Verifiers only: the taskset config as JSON (or @file), frozen into the set"),
     set_id: str | None = typer.Option(None, "--set-id"),
     protocol: str | None = typer.Option(
         None, "--protocol", help="Reviewed JSON file with data/license digests and disjointness evidence"),
@@ -2365,6 +2365,8 @@ def eval_build_set(
             card = sets.build_set(preset, count=count, seed=seed, out=out, set_id=set_id,
                                   open_environment=sets.open_source, protocol=reviewed)
         else:
+            if taskset_args and taskset_args.startswith("@"):
+                taskset_args = Path(taskset_args[1:]).read_text()
             args = json.loads(taskset_args) if taskset_args else None
             if args is not None and not isinstance(args, dict):
                 raise ValueError("--taskset-args must be a JSON object")
