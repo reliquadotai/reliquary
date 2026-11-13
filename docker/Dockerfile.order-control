@@ -27,7 +27,7 @@ RUN --mount=type=bind,from=envs,target=/tmp/envs \
 # with its verifiers bridge at SANDBOX_COMMIT, and the env packages at the commit the
 # agentic eval sets pin (record 0's env_package). reliquary-harness comes with the base.
 ARG ENVS=15ad131b473f59f46b62d363bfacf430f4931f39
-ARG SBX=7743b57410bd10c8d30217388b28c2c589f39e31
+ARG SBX=d680d5e6f694c650f74b9dea4bc62930aad45da0
 ARG SWE_ENV_PACKAGE=reliquary-swe==0.3.0+ge8e1f1ed62a639ae.vfb2
 ARG TERMINAL_ENV_PACKAGE=reliquary-terminal==0.3.1+gcd4df2dcc1aaf175.vfb2
 RUN E="git+https://github.com/reliquadotai/reliquary-environments.git@${ENVS}" \

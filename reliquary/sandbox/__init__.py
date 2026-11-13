@@ -14,12 +14,14 @@ from collections.abc import Mapping
 SANDBOX_DISTRIBUTION = "reliquary-sandbox"
 # The reliquary-sandbox commit this build verifies and drives. A job's contract pins
 # its own (`episode.sandbox.sandbox_commit`); both must agree.
-SANDBOX_COMMIT = "7743b57410bd10c8d30217388b28c2c589f39e31"  # release-2026-11-13
+SANDBOX_COMMIT = "d680d5e6f694c650f74b9dea4bc62930aad45da0"  # release-2026-11-13 + harness terminus-2@1
 # Earlier releases this one serves identically: the same option digests, bridged env
-# identities and task fingerprints for every task without a network or sidecars. A job
-# pinning one keeps running across the release, and an install still at one is accepted.
+# identities and task fingerprints for every task without a network or sidecars (d680d5e
+# changes only the harness/ distribution of 7743b57). A job pinning one keeps running across
+# the release, and an install still at one is accepted.
 COMPATIBLE_SANDBOX_COMMITS = frozenset({
     SANDBOX_COMMIT,
+    "7743b57410bd10c8d30217388b28c2c589f39e31",
     "f8c208bd35848a13cf5b9e44b64309d835d1d81e",
 })
 

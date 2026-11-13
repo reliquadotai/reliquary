@@ -165,8 +165,9 @@ def episode_row(*, job, submission_id: str, record: Mapping, grade: Mapping, ren
         # the git patch inside it, the shape of a replay job's final_diff. An unreadable
         # state is a ValueError (counted unparseable).
         final_diff = swe_patch(trajectory["final_diff"])
-    messages = [{"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}]
+    # A harness with no system message (terminus-2) renders none: the row shows none.
+    messages = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [
+        {"role": "user", "content": user_prompt}]
     for t, ((start, end), turn) in enumerate(zip(spans, parsed.turns)):
         message = renderer.assistant_message(tokens[start:end])
         for k, call in enumerate(message.get("tool_calls") or ()):

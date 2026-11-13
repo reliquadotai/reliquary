@@ -20,23 +20,25 @@ from types import SimpleNamespace
 
 from reliquary_harness import qwen as _harness_qwen
 from reliquary_harness.spec import (
-    BASH_SURFACE_V1, CLAUDE_CODE_V1, CODEX_V1, MINI_SWE_V2, OPENHANDS_XML_V1, VERIFIERS_COMMIT, get_spec,
+    BASH_SURFACE_V1, CLAUDE_CODE_V1, CODEX_V1, MINI_SWE_V2, OPENHANDS_XML_V1, TERMINUS_2_V1, VERIFIERS_COMMIT,
+    get_spec,
 )
 from reliquary_harness.spec import BASH_VF_B2E4E81 as HARNESS
 from reliquary_harness.variant import variant_count, variant_index
 
 from reliquary.environment.agentic.types import EpisodeTask
 
-HARNESS_DIGEST = "9a6b27dd764cffee512f77f430747c40c220fd6492b30696b8c89e2fb20f9fca"
+HARNESS_DIGEST = "d5ac836122c87977e54e3c526be1d147e12984a196acabc69b8ac2be7769347a"
 """The bash harness this build renders, checks and mines with (`HARNESS.digest`): an
 installed reliquary-harness with another digest is not this build's harness."""
 HARNESS_DIGESTS = {
     HARNESS.key: HARNESS_DIGEST,
-    BASH_SURFACE_V1.key: "4943b1efec1c88691a727f819538b00ef321e6eb8c274e79d2d1ddca3306c4be",
-    MINI_SWE_V2.key: "cecffb2631c01e2dd415a4e9cb76d79717d1a0b67bd0187422a658ef9173f15d",
-    OPENHANDS_XML_V1.key: "0b1a9b92ccb3b43e8954a15afa5ab6c5f14e57190a734118f817ce7da848ff4d",
-    CLAUDE_CODE_V1.key: "2763bcd5c36ac027e9d5e24cad80c9c606fbbb26e07bcb2f192ecb9ba464e40d",
-    CODEX_V1.key: "00d2979c6a783bb71ffb0c553881155cb61f8868ea20d61f7cc0cd75fd99a61b",
+    BASH_SURFACE_V1.key: "8ac9c9d3706d0c35f964db4ac9d2513f2f552adb4777c15fc5b28eaf1d886d54",
+    MINI_SWE_V2.key: "5c42a7a5c8307d40517011673142b00eab05673f050a06b9d62e5b863123f084",
+    OPENHANDS_XML_V1.key: "2ceb7a5c2ffa60bd0f056564b11305225a3bbabab470bee26f7938ff99165c8c",
+    CLAUDE_CODE_V1.key: "133ad6d2ad5bb1a14d1aac00964d567fd81629b2c31272f30d708892a0146cff",
+    CODEX_V1.key: "d61eb71c02916ecbbdc6e182c9a35f9c86db1711081c42129b21522362e7d315",
+    TERMINUS_2_V1.key: "b2d034bfaaaf69ce2501cc2aa93c62b52677ed1eeae5a12755d2849394145632",
 }
 """Every harness spec this build serves, by `id@version`, at the digest it was built against.
 A job or an RL episode env names one with `{id, version, digest}`; one naming none is

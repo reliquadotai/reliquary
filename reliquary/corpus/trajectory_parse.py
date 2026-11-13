@@ -39,7 +39,10 @@ class TurnRenderer(Protocol):
 
     def initial_ids(self, prompt: str) -> list[int]: ...
 
-    def tool_calls(self, completion_ids: Sequence[int]) -> list[tuple[str, str]]: ...
+    def tool_calls(self, completion_ids: Sequence[int],
+                   prompt_ids: Sequence[int] | None = None) -> list[tuple[str, str]]: ...
+    # `prompt_ids`: the prompt the turn answers; a harness that reads it (terminus-2's pending
+    # confirmation) refuses a turn without it.
 
     def observations(self, segment_ids: Sequence[int]) -> list[str]: ...
 
@@ -107,7 +110,8 @@ STOP_FORMAT_ERROR = "format_error"
 is the last, none of its calls was sent, and it scores 0. Never a corpus or window stop."""
 
 
-def turn_format_violation(renderer: TurnRenderer, completion_ids: Sequence[int]) -> str | None:
+def turn_format_violation(renderer: TurnRenderer, completion_ids: Sequence[int],
+                          prompt_ids: Sequence[int] | None = None) -> str | None:
     """Why one model turn is malformed, or None: turn markup or a stop id before its last token (the model
     wrote its own observation or next turn), or a turn with calls that ended on a stop id other than the turn
     terminator (the end-of-text token: the episode cannot go on after it). The miner ends a lease's episode at
@@ -122,7 +126,7 @@ def turn_format_violation(renderer: TurnRenderer, completion_ids: Sequence[int])
         return "turn markup ends the turn"
     if tokens[-1] in renderer.stop_ids and tokens[-1] != renderer.terminator_id:
         try:
-            calls = renderer.tool_calls(tokens)
+            calls = renderer.tool_calls(tokens, prompt_ids=prompt_ids)
         except (ValueError, TypeError, KeyError, IndexError):
             calls = []
         if calls:
@@ -183,7 +187,7 @@ def parse_trajectory(renderer: TurnRenderer, *, prompt_ids: Sequence[int],
             raise TrajectoryRefused(REASON_BAD_STOP, {"turn": k, "why": "final reasoning is not closed"})
         if not renderer.span_is_canonical(full[:offset + start], completion):
             raise TrajectoryRefused(REASON_BAD_TURNS, {"turn": k, "why": "span does not re-render to itself"})
-        calls = tuple(renderer.tool_calls(completion))
+        calls = tuple(renderer.tool_calls(completion, prompt_ids=full[:offset + start]))
         if k == len(spans) - 1:
             if end != len(tokens):
                 raise TrajectoryRefused(REASON_BAD_TURNS, {"trailing_tokens": len(tokens) - end})

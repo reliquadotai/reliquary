@@ -198,11 +198,21 @@ class EpisodeProfile:
 # config/benchmarks/swebench.yaml): step_limit 250, 60 s per command, the model's own context
 # (capped here at 128k), a run that hits a limit submits nothing.
 SWEBENCH_BASH_ONLY = "swebench-bash-only"
+# The Terminal-Bench 2.x leaderboard (harbor-framework/terminal-bench-2-1, Terminus 2): no step
+# cap of its own (the task's agent timeout bounds a trial, 360 to 12,000 s, which the bridge
+# takes from the task as the episode's wall budget), the model's context (capped at 128k), 600 s
+# per command (Terminus never blocks on a command; ours run to completion within one call).
+TERMINAL_BENCH_TERMINUS_2 = "terminal-bench-terminus-2"
 EPISODE_PROFILES = {
     SWEBENCH_BASH_ONLY: EpisodeProfile(harness=("mini-swe", "2"), package="reliquary-swe",
                                        max_turns=250, max_total_tokens=131072,
                                        per_call_timeout_s=60, min_wall_s=14400,
                                        limit_cut_fails=True),
+    TERMINAL_BENCH_TERMINUS_2: EpisodeProfile(harness=("terminus-2", "1"),
+                                              package="reliquary-terminal-bench",
+                                              max_turns=512, max_total_tokens=131072,
+                                              per_call_timeout_s=600, min_wall_s=12000,
+                                              limit_cut_fails=True),
 }
 # The largest bounds any episode may declare (the wire's, `protocol.corpus_submission`).
 EPISODE_TURNS_CEILING = max([MAX_EPISODE_TURNS, *(p.max_turns for p in EPISODE_PROFILES.values())])

@@ -13,7 +13,7 @@ from tests.unit.test_corpus_job_episode import EVAL_SOURCE, _manifest, _signed
 from tests.unit.test_corpus_job_signed_sandbox import sandbox_spec
 
 MINI_SWE_2 = {"id": "mini-swe", "version": "2",
-              "digest": "cecffb2631c01e2dd415a4e9cb76d79717d1a0b67bd0187422a658ef9173f15d"}
+              "digest": "5c42a7a5c8307d40517011673142b00eab05673f050a06b9d62e5b863123f084"}
 
 
 def _leaderboard(**overrides):
