@@ -12,6 +12,9 @@ EPISODE_RENDERER_FAMILIES = {
     "Qwen3_5ForConditionalGeneration": "renderers:qwen38@",
     "Qwen3_5ForCausalLM": "renderers:qwen38@",
 }
+# A suite episode (a replayed tool world) renders through Catalyst's own ChatML tools
+# renderer, the one its registry spec names; served for the same model family.
+SUITE_EPISODE_RENDERERS = frozenset({"reliquary-chatml-tools-v1"})
 
 
 def set_contract_environment(card: Mapping) -> str:
@@ -30,12 +33,19 @@ def set_contract_environment(card: Mapping) -> str:
     return contract_environment_for(card)
 
 
-def episode_renderer_refusal(architecture: str | None, renderer: str | None) -> str | None:
-    """Why a model of ``architecture`` cannot play an episode rendered by ``renderer``, or None."""
+def episode_renderer_refusal(architecture: str | None, renderer: str | None, *,
+                             suite: bool = False) -> str | None:
+    """Why a model of ``architecture`` cannot play an episode rendered by ``renderer``, or None.
+    ``suite``: a suite episode, rendered by one of ``SUITE_EPISODE_RENDERERS``."""
     family = EPISODE_RENDERER_FAMILIES.get(str(architecture))
     if family is None:
         return (f"episode_renderer_unavailable: no episode renderer serves {architecture!r} "
                 f"(only {sorted(EPISODE_RENDERER_FAMILIES)})")
+    if suite:
+        if renderer not in SUITE_EPISODE_RENDERERS:
+            return (f"episode_renderer_mismatch: a suite episode renders through "
+                    f"{sorted(SUITE_EPISODE_RENDERERS)}, not {renderer!r}")
+        return None
     if not str(renderer or "").startswith(family):
         return f"episode_renderer_mismatch: {architecture!r} plays {family}*, not {renderer!r}"
     return None
@@ -132,5 +142,5 @@ def refuse_episode_disagreeing_with_set(card, eval_set, episode, renderer_id):
                          f"{episode.get('renderer')!r}, the set {card.get('renderer_id')!r}")
 
 
-__all__ = ["EPISODE_RENDERER_FAMILIES", "episode_renderer_refusal", "eval_job_source",
+__all__ = ["EPISODE_RENDERER_FAMILIES", "SUITE_EPISODE_RENDERERS", "episode_renderer_refusal", "eval_job_source",
            "refuse_episode_disagreeing_with_set", "set_contract_environment"]

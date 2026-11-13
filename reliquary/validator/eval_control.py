@@ -1142,9 +1142,11 @@ def order_job_refusal(entry, job) -> str | None:
     if is_eval_job_id(entry.job_id):
         if not is_eval_source(job.prompt_source):
             return f"prompt source {job.prompt_source!r} is not an eval set"
-        if getattr(job, "episode", None) is not None and not is_signed_sandbox(job):
-            # Its steps would be trusted to the miner's box (or replayed by a grader this control lacks).
-            return "an order plays an episode only in the signed sandbox"
+        episode = getattr(job, "episode", None)
+        if episode is not None and not (is_signed_sandbox(job) or getattr(episode, "is_suite", False)):
+            # A replayed SWE episode's steps would be trusted to the miner's box. A suite episode is replayed
+            # here, its every observation recomputed (``suite_intake``).
+            return "an order plays an episode only in the signed sandbox or as a replayed suite episode"
     elif is_gen_job_id(entry.job_id):
         from reliquary.eval.qualification import order_environment_refusal
         from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS
@@ -1187,7 +1189,8 @@ def order_job_refusal(entry, job) -> str | None:
     if getattr(job, "episode", None) is not None:
         from reliquary.eval.episode_jobs import episode_renderer_refusal
 
-        refusal = episode_renderer_refusal(architecture, job.episode.renderer)
+        refusal = episode_renderer_refusal(architecture, job.episode.renderer,
+                                           suite=getattr(job.episode, "is_suite", False))
         if refusal is not None:
             return refusal
     if (profile.model_id, profile.model_revision) != (job.checkpoint_repo,
@@ -1455,7 +1458,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                        read_entries=None, clock: Callable[[], float] = time.time,
                        refresh_every_seconds: float = 60.0, qualification_store=None,
                        order_jobs=None, sandbox=None, sandbox_down: str | None = None,
-                       model_dir_for=None, signed_wiring=None):
+                       model_dir_for=None, signed_wiring=None, suite_replayer_for=None):
     """The app and the job set of the eval control. Each wired job gets its own
     tokenizer, renderer, router, auditor (an executor pair per batch) and
     settler; ``read_entries`` makes the set hot.
@@ -1464,7 +1467,9 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     orders as the corpus validator does: the session route, each job's signed intake and
     its grader, whose grades gate the job's pay. Without it (``sandbox_down`` says why) an
     episode order is refused. ``model_dir_for(repo, revision)``: the model's tokenizer files
-    the turn renderer loads; ``signed_wiring``: extra ``wire_signed_job`` arguments (tests)."""
+    the turn renderer loads; ``signed_wiring``: extra ``wire_signed_job`` arguments (tests).
+    A suite episode order needs no sandbox: replayed here, by ``suite_replayer_for(tokenizer)``
+    (``suite_intake.PoolSuiteReplayer`` by default)."""
     from fastapi import FastAPI
 
     from reliquary.eval.prompt_source import job_prompt_lines, parse_eval_source
@@ -1496,6 +1501,12 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
 
     tokenizers: dict[ModelKey, tuple[Any, int]] = {}
     served: dict[str, Any] = {}
+    suite_replayers: dict[ModelKey, Any] = {}
+    if suite_replayer_for is None:
+        def suite_replayer_for(tokenizer):
+            from reliquary.validator.suite_intake import PoolSuiteReplayer
+
+            return PoolSuiteReplayer.for_tokenizer(tokenizer)
     model_dir_for = model_dir_for or _model_files
     grade_parse_threads = None
     if sandbox is not None:
@@ -1556,7 +1567,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             if declared is not None and declared.get("qualification_id"):
                 record, _ = await qualification_store.read(declared["qualification_id"])
             refusal = qualification_refusal(entry, job, declared, record)
-        if refusal is None and job.episode is not None and sandbox is None:
+        if refusal is None and job.episode is not None and is_signed_sandbox(job) and sandbox is None:
             refusal = ("a signed-sandbox episode order and this order control serves no sandbox: "
                        + (sandbox_down or "RELIQUARY_ORDER_SANDBOX_KEY_FILE/_KEY_ID are not set"))
         if refusal is not None:
@@ -1651,7 +1662,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 grader.enqueue(submission_id)
 
         w.on_accepted = on_accepted
-        if job.episode is not None:
+        if job.episode is not None and is_signed_sandbox(job):
             # Only now: a job still being wired is never visible to the session issuer.
             sandbox.publish(w)
         # Miners wait for the audit: what they would send before an executor of the model has
@@ -1659,7 +1670,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         protocol = AUDIT_PROTOCOL_V3 if has_draw(job) else None
         # And until its auditor has read the job back (a restart): what miners send before would pile up unjudged.
         # An episode order also waits for a gateway serving its env: miners refused sessions give up on it.
-        gateway_ready = episode_gateway_ready(w) if job.episode is not None else None
+        gateway_ready = episode_gateway_ready(w) if job.episode is not None and is_signed_sandbox(job) else None
 
         def why_held() -> str | None:
             if gateway_ready is not None and not gateway_ready():
@@ -1676,7 +1687,11 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
 
     async def wire_episode(w) -> None:
         """A signed episode order, as the corpus validator wires one: its signed intake and
-        session view (published once the whole job is wired), its grader."""
+        session view (published once the whole job is wired), its grader. A suite one: its
+        replaying intake and the grader that replays it again (``suite_grading``)."""
+        if w.job.episode.is_suite:
+            await wire_suite_episode(w)
+            return
         from reliquary.validator.sandbox_wiring import wire_signed_grader, wire_signed_job
 
         job = w.job
@@ -1694,6 +1709,22 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         except Exception as exc:
             logger.warning("episode order %s: its options digest is unresolved (%s); held for a gateway "
                            "at its package only", job.job_id, type(exc).__name__)
+
+    async def wire_suite_episode(w) -> None:
+        """A suite episode order, as the corpus validator wires a suite job: no sandbox, no gateway. One
+        replay pool per checkpoint tokenizer, shared by its orders' intakes and graders."""
+        from reliquary.validator import suite_intake
+        from reliquary.validator.suite_grading import LocalEpisodeGrader
+
+        job = w.job
+        key = (job.checkpoint_repo, job.checkpoint_revision)
+        if key not in suite_replayers:
+            suite_replayers[key] = suite_replayer_for(w.tokenizer)
+        w.episode_intake = await asyncio.to_thread(
+            suite_intake.build_suite_intake, job, tokenizer=w.tokenizer, vocab_size=w.vocab_size,
+            chunk_tokens=w.proof.chunk_tokens, replayer=suite_replayers[key])
+        w.grader = LocalEpisodeGrader(job=job, records=records, replayer=w.episode_intake.replayer,
+                                      source=w.episode_intake.source)
 
     def episode_gateway_ready(w) -> Callable[[], bool]:
         """Whether a fresh, active gateway serves the episode's env at its package and options (the
@@ -1922,7 +1953,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         """Per served signed episode order, what its sandbox gateways are sized from (`order_sandbox_status`)."""
         from reliquary.validator.order_sandbox_status import FLEET_FULL_WINDOW_S, book_sessions, sandbox_status
 
-        episodes = [w for w in list(served.values()) if w.job.episode is not None]
+        episodes = [w for w in list(served.values()) if w.job.episode is not None and is_signed_sandbox(w.job)]
         if sandbox is None or not episodes:
             return
         now = int(clock())
