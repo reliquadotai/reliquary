@@ -156,14 +156,26 @@ def _deadline(seconds: float):
         signal.signal(signal.SIGALRM, previous)
 
 
+def suite_replay_outcome(environment, *, encode, decode, max_episode_tokens: int | None = None,
+                         **kwargs) -> SuiteReplayOutcome:
+    """``replay_outcome``, or for a forced-draw job (``max_episode_tokens`` set by ``replay_kwargs``) the RL
+    lease's (``rl_suite_episodes.lease_replay_outcome``): a ``context_length`` cut is checked as a cut, reward 0."""
+    if max_episode_tokens is None:
+        return replay_outcome(environment, encode=encode, decode=decode, **kwargs)
+    from reliquary.validator.rl_suite_episodes import lease_replay_outcome
+
+    return lease_replay_outcome(environment, encode=encode, decode=decode,
+                                max_episode_tokens=int(max_episode_tokens), **kwargs)
+
+
 def _replay(env_name: str, encode, decode, *, split: str = "train",
             **kwargs) -> SuiteReplayOutcome:
     """One replay on ``env_name`` built at ``split`` (``replay_kwargs`` names
     the job's; a caller that names none replays on ``train``, as before)."""
     from reliquary.environment.registry import get_environment_spec
 
-    return replay_outcome(get_environment_spec(env_name).create(split=split), encode=encode,
-                          decode=decode, **kwargs)
+    return suite_replay_outcome(get_environment_spec(env_name).create(split=split), encode=encode,
+                                decode=decode, **kwargs)
 
 
 def replay_in_worker(env_name: str, deadline_seconds: float, **kwargs) -> SuiteReplayOutcome:
@@ -316,6 +328,16 @@ class PoolSuiteReplayer:
             self._kill(pool)
 
 
+def job_suite_stops(job) -> tuple[str, ...]:
+    """The stops a suite job takes: a forced-draw job's episode is submitted however it ends (its slot would
+    otherwise replay the same draw forever), so a ``context_length`` cut too."""
+    if has_draw(job):
+        from reliquary.validator.rl_suite_episodes import LEASE_STOPS
+
+        return LEASE_STOPS
+    return SUITE_STOPS
+
+
 def replay_kwargs(job, source, *, prompt_index: int, prompt_ids, tokens, spans,
                   stop: str, with_split: bool = True) -> dict:
     """What one replay of ``job``'s trajectory needs, besides the codec: the
@@ -323,7 +345,8 @@ def replay_kwargs(job, source, *, prompt_index: int, prompt_ids, tokens, spans,
     ``with_split`` is off: a replay on the source's own environment, built at
     it already) the split the replay builds the environment at. The seed stays
     the row's (``episode_seed(job_id, prompt_index)``): only the task lookup is
-    mapped."""
+    mapped. A forced-draw job adds ``max_episode_tokens``: its episodes are
+    submitted however they end, a ``context_length`` cut included."""
     episode = job.episode
     kwargs = {"renderer_id": episode.renderer, "max_turns": episode.max_turns,
               "task_index": source.rows.index(int(prompt_index)),
@@ -332,6 +355,8 @@ def replay_kwargs(job, source, *, prompt_index: int, prompt_ids, tokens, spans,
               "spans": [(int(s), int(e)) for s, e in spans], "stop": stop}
     if with_split:
         kwargs["split"] = source.rows.split
+    if has_draw(job):
+        kwargs["max_episode_tokens"] = int(episode.max_total_tokens)
     return kwargs
 
 
@@ -401,8 +426,9 @@ class SuiteEpisodeIntake:
         if trajectory.final_diff != "":
             return IntakeRefusal("malformed_submission",
                                  {"why": "a suite episode has no diff: final_diff must be ''"})
-        if trajectory.stop not in SUITE_STOPS:
-            return IntakeRefusal("bad_stop", {"stop": trajectory.stop, "allowed": list(SUITE_STOPS)})
+        allowed = job_suite_stops(self._job)
+        if trajectory.stop not in allowed:
+            return IntakeRefusal("bad_stop", {"stop": trajectory.stop, "allowed": list(allowed)})
         expected = self._source.initial_text(request.prompt_index)
         if expected != request.rendered_prompt:
             return IntakeRefusal(REASON_PROMPT_MISMATCH, {
@@ -485,4 +511,5 @@ def build_suite_intake(job, *, tokenizer, vocab_size: int | None, chunk_tokens: 
 
 
 __all__ = ["InlineSuiteReplayer", "PoolSuiteReplayer", "SUITE_REPLAY_DEADLINE_SECONDS",
-           "SuiteEpisodeIntake", "build_suite_intake", "replay_in_worker", "replay_kwargs"]
+           "SuiteEpisodeIntake", "build_suite_intake", "job_suite_stops", "replay_in_worker", "replay_kwargs",
+           "suite_replay_outcome"]

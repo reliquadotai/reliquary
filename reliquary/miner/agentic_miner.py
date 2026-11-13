@@ -402,9 +402,11 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             await unsubmitted()
             return
         try:
+            # A suite runner's stop is its replay's (a cut included): relabelling is for verifiers' harnesses.
+            relabel = drawn and not getattr(runner, "replays_stop", False)
             built = build_trajectory(session.turns, final_diff=result.final_diff,
                                      stop=drawn_stop(result.stop, session.turns, job, stop_ids)
-                                     if drawn else result.stop,
+                                     if relabel else result.stop, drawn=drawn,
                                      closed=scores_model_closes(job.episode))
             if result.transcript is not None:
                 built = dataclasses.replace(built, transcript=result.transcript)
@@ -768,7 +770,10 @@ async def run_suite_miner(*, job, checkpoint_dir: str, proof, tokenizer, identit
                           max_num_seqs: int = 16, source=None) -> dict[str, Counter]:
     """A suite episode job: the engine thread and episodes in one process. No
     endpoint: the runner's policy calls the engine directly, and nothing but
-    the pinned environment wheel runs between turns."""
+    the pinned environment wheel runs between turns. A forced-draw job (an
+    order) draws every turn as ``run_agentic_miner`` does: a forced core over
+    an fp32 LM head, no proof, each episode's session bound to its draw slot
+    (``mine_agentic``)."""
     from reliquary.corpus.suite_episode import TokenizerCodec
     from reliquary.miner.corpus_generate_server import GenerateEngine, VllmTurnCore
     from reliquary.miner.suite_episode import SuiteEpisodeRunner, suite_stop_ids
@@ -776,12 +781,16 @@ async def run_suite_miner(*, job, checkpoint_dir: str, proof, tokenizer, identit
     # Coded as the validator's intake, replay and export code.
     codec = TokenizerCodec(tokenizer)
     encode, decode = codec.encode, codec.decode
-    core = VllmTurnCore(checkpoint_dir, sampling=job.sampling, proof=proof,
-                        stop_token_ids=suite_stop_ids(encode),
+    stop_ids = suite_stop_ids(encode)
+    drawn = has_draw(job)
+    core = VllmTurnCore(checkpoint_dir, sampling=job.sampling, proof=None if drawn else proof,
+                        stop_token_ids=stop_ids,
                         max_total_tokens=job.episode.max_total_tokens, max_num_seqs=max_num_seqs,
-                        gpu_memory_utilization=gpu_memory_utilization)
+                        gpu_memory_utilization=gpu_memory_utilization,
+                        **({"forced": True, "lm_head_fp32": True} if drawn else {}))
     engine = GenerateEngine(core, max_total_tokens=job.episode.max_total_tokens,
-                            max_tokens_per_turn=job.episode.max_tokens_per_turn)
+                            max_tokens_per_turn=job.episode.max_tokens_per_turn,
+                            **({"draws": ForcedDraws()} if drawn else {}))
     engine.start()
     try:
         runner = SuiteEpisodeRunner(job=job, engine=engine, encode=encode, decode=decode,
@@ -789,7 +798,7 @@ async def run_suite_miner(*, job, checkpoint_dir: str, proof, tokenizer, identit
         return await mine_agentic(
             job=job, identities=identities, client=client, engine=engine,
             runners={harness_key(identity.harness_env): runner for identity in identities},
-            decode=decode, concurrency=concurrency)
+            decode=decode, concurrency=concurrency, stop_ids=stop_ids)
     finally:
         engine.stop()
 

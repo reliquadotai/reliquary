@@ -51,9 +51,10 @@ class TrajectoryUnbuildable(ValueError):
 
 def build_trajectory(turns: Sequence[GeneratedTurn], *, final_diff: str, stop: str,
                      chunk_tokens: int = TOPLOC_DEPLOYED_DEFAULTS.chunk_tokens,
-                     closed: bool = False) -> BuiltTrajectory:
+                     closed: bool = False, drawn: bool = False) -> BuiltTrajectory:
     """``closed``: the episode's machine closed it on a model budget its profile scores
-    (`corpus.job.model_closed`), so its stop ``episode_closed`` is submittable too."""
+    (`corpus.job.model_closed`), so its stop ``episode_closed`` is submittable too.
+    ``drawn``: a forced-draw job's turns, which carry no proof (the draw is their check)."""
     stops = (*EPISODE_STOPS, "episode_closed") if closed else EPISODE_STOPS
     if stop not in stops:
         raise TrajectoryUnbuildable(f"stop {stop!r} is not one of {stops}")
@@ -74,7 +75,7 @@ def build_trajectory(turns: Sequence[GeneratedTurn], *, final_diff: str, stop: s
         start = len(prompt) - len(first)
         end = start + len(turn.completion_ids)
         span_length = end - start
-        expected_proof_count = span_chunk_count(span_length, chunk_tokens)
+        expected_proof_count = 0 if drawn else span_chunk_count(span_length, chunk_tokens)
         if len(turn.proofs) != expected_proof_count:
             raise TrajectoryUnbuildable(
                 f"turn {k} has {len(turn.proofs)} proofs but {span_length} tokens require {expected_proof_count}")
