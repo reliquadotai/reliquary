@@ -46,6 +46,14 @@ RUN R="${TASKSETS_REPO}#subdirectory=environments" \
       "ifbench @ ${R}/if/ifbench" "mmlu-pro @ ${R}/knowledge/mmlu_pro" \
       "livecodebench @ ${R}/code/livecodebench" \
  && echo /opt/evalsets-site > "$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')/zzz-evalsets.pth"
+# Reliquary's own single-turn tasksets (tasksets/): HMMT Feb 2026, GraphWalks, OpenAI MRCR,
+# HLE-Diamond deterministic subset. Non-editable installs, so their artifact hashes match the sets.
+# tiktoken is MRCR's row selection (o200k_base bins); hle-diamond needs HF_TOKEN of an admitted account.
+COPY tasksets /tmp/reliquary-tasksets
+RUN pip install --target /opt/evalsets-site --no-deps \
+      /tmp/reliquary-tasksets/hmmt_feb_2026 /tmp/reliquary-tasksets/graphwalks_single_turn \
+      /tmp/reliquary-tasksets/openai_mrcr_single_turn /tmp/reliquary-tasksets/hle_diamond_text_det \
+ && pip install "tiktoken>=0.7" && rm -rf /tmp/reliquary-tasksets
 
 # Fails the build unless bittensor_drand (the partial audit's draw), the hub
 # and tokenizer libraries import and every package verifies against the
@@ -68,7 +76,8 @@ assert md.version("renderers") == RENDERERS_VERSION, md.version("renderers")
 importlib.import_module("reliquary_sandbox_verifiers")
 assert installed_env_package("reliquary-swe") == os.environ["SWE_ENV_PACKAGE"], installed_env_package("reliquary-swe")
 assert installed_env_package("reliquary-terminal") == os.environ["TERMINAL_ENV_PACKAGE"], installed_env_package("reliquary-terminal")
-for name in ("aime25", "aime26", "gpqa", "ifbench", "mmlu_pro", "livecodebench"):
+for name in ("aime25", "aime26", "gpqa", "ifbench", "mmlu_pro", "livecodebench", "hmmt_feb_2026",
+             "graphwalks_single_turn", "openai_mrcr_single_turn", "hle_diamond_text_det"):
     importlib.import_module(name)
 assert "/opt/evalsets-site" in sys.path
 assert not importlib.util.find_spec("verifiers").origin.startswith("/opt/evalsets-site/")

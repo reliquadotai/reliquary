@@ -2323,6 +2323,9 @@ def eval_build_set(
         None, "--exclude-file",
         help="Episode and SWE sets: a JSON object {instance id: reason}; those rows leave "
         "the range before it is sampled, and the card lists them"),
+    count_tokens: str | None = typer.Option(None, "--count-tokens",
+        help="Verifiers only: a tokenizer (e.g. Qwen/Qwen3-8B); each problem's chat-templated "
+             "prompt length goes on the card as prompt_tokens"),
 ) -> None:
     """Freeze problems into a set: prompts.jsonl, grading.jsonl, set.json.
 
@@ -2340,6 +2343,8 @@ def eval_build_set(
             raise ValueError("--protocol must hold a JSON object")
         if (preset is None) == (source is None):
             raise ValueError("give exactly one of --preset and --source")
+        if count_tokens and (preset is not None or interaction != "single_turn"):
+            raise ValueError("--count-tokens is for a single-turn --source")
         if interaction != "single_turn":
             if preset is not None or source is None or count is None or seed is None \
                     or sample is not None or start or split or taskset_args or exclude_file:
@@ -2375,13 +2380,17 @@ def eval_build_set(
                                          count=count, sample=sample, seed=seed,
                                          set_id=set_id, taskset_args=args, bridge=bridge,
                                          exclude=exclude,
-                                         open_environment=sets.open_source, protocol=reviewed)
+                                         open_environment=sets.open_source, protocol=reviewed,
+                                         count_tokens=count_tokens)
     except (ValueError, OSError, KeyError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     keys = ("set_id", "env", "source", "split", "count", "index_range", "prompts_sha256",
-            "grading_sha256", "disjointness", "taskset", "needs_runtime", "protocol", "protocol_sha256")
+            "grading_sha256", "disjointness", "taskset", "needs_runtime", "protocol", "protocol_sha256",
+            "license_note")
     public = {k: card[k] for k in keys if k in card}
+    if "prompt_tokens" in card:
+        public["prompt_tokens"] = {k: v for k, v in card["prompt_tokens"].items() if k != "per_problem"}
     if card.get("protocol") and card.get("taskset"):
         from reliquary.eval.protocol import public_taskset
         public["taskset"] = public_taskset(card["taskset"])

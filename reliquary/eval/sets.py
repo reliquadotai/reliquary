@@ -546,7 +546,8 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
                      exclude: Mapping[str, str] | None = None,
                      open_environment: Callable[[str, str], Any] = open_source,
                      open_taskset: Callable[..., Any] | None = None,
-                     clock: Callable[[], float] = time.time) -> dict:
+                     clock: Callable[[], float] = time.time,
+                     count_tokens: str | None = None) -> dict:
     """Freeze rows ``[start, start + count)`` of any source, whole or sampled.
 
     A catalog environment at any split, or ``verifiers:<taskset-id>``: an
@@ -573,9 +574,11 @@ def build_source_set(source: str, *, out: str | Path, split: str | None = None,
             source, out=out, start=start, count=count, sample=sample, seed=seed,
             set_id=set_id, taskset_args=dict(taskset_args or {}),
             open_taskset=open_taskset or verifiers_source.open_taskset, clock=clock,
-            protocol=protocol)
+            protocol=protocol, count_tokens=count_tokens)
     if taskset_args:
         raise ValueError("taskset args belong to a Verifiers source")
+    if count_tokens:
+        raise ValueError("--count-tokens is for a Verifiers source")
     from reliquary.corpus.job import BRIDGED_EVAL_PACKAGES
     from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
 

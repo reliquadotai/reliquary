@@ -415,11 +415,52 @@ def _args_tag(args: dict) -> str:
     return f"-a{hashlib.sha256(body).hexdigest()[:8]}"
 
 
+# What a taskset may say about itself on the set card (its ``RELIQUARY_CARD``).
+CARD_FIELDS = ("name", "license", "license_note", "grading", "context_note")
+
+
+def card_notes(taskset) -> dict:
+    """The taskset's ``RELIQUARY_CARD``, restricted to ``CARD_FIELDS`` (strings only)."""
+    notes = getattr(type(taskset), "RELIQUARY_CARD", None) or {}
+    if not isinstance(notes, dict):
+        raise ValueError("RELIQUARY_CARD must be a dict")
+    unknown = sorted(set(notes) - set(CARD_FIELDS))
+    if unknown or not all(isinstance(v, str) and v for v in notes.values()):
+        raise ValueError(f"RELIQUARY_CARD takes non-empty strings for {CARD_FIELDS}; got {unknown or notes}")
+    return dict(notes)
+
+
+def count_prompt_tokens(prompts: list[dict], tokenizer: str,
+                        load_tokenizer: Callable[[str], Any] | None = None) -> dict:
+    """Each problem's prompt length in ``tokenizer``'s chat template (generation prompt
+    included), in set order: what a model's context must hold before it answers."""
+    if load_tokenizer is None:
+        from transformers import AutoTokenizer
+
+        load_tokenizer = AutoTokenizer.from_pretrained
+    tok = load_tokenizer(tokenizer)
+    per_problem = []
+    for row in prompts:
+        ids = tok.apply_chat_template(row["messages"], add_generation_prompt=True, tokenize=True)
+        if isinstance(ids, dict) or hasattr(ids, "input_ids"):
+            ids = ids["input_ids"]
+        per_problem.append(len(ids))
+    return {"tokenizer": tokenizer, "chat_template": True, "per_problem": per_problem,
+            "mean": round(sum(per_problem) / len(per_problem)) if per_problem else 0,
+            "max": max(per_problem, default=0)}
+
+
 def build_set(source: str, *, out: str | Path, start: int, count: int | None,
               sample: int | None, seed: int | None, set_id: str | None,
               taskset_args: dict, open_taskset: Callable[[str, dict], TasksetHandle],
-              clock: Callable[[], float] = time.time, protocol: dict | None = None) -> dict:
-    """Freeze tasks ``[start, start + count)`` of the taskset, whole or sampled."""
+              clock: Callable[[], float] = time.time, protocol: dict | None = None,
+              count_tokens: str | None = None,
+              load_tokenizer: Callable[[str], Any] | None = None) -> dict:
+    """Freeze tasks ``[start, start + count)`` of the taskset, whole or sampled.
+
+    ``count_tokens`` names a tokenizer: each problem's prompt length in it goes on
+    the card (``prompt_tokens``), so a model whose context cannot hold a problem is
+    known before an order is taken."""
     from reliquary.eval import sets
 
     name = taskset_id(source)
@@ -469,6 +510,13 @@ def build_set(source: str, *, out: str | Path, start: int, count: int | None,
                          "corpus": None, "held_out": None,
                          "note": "training overlap is unknown without reviewed source evidence"},
     }
+    notes = card_notes(handle.taskset)
+    if notes:
+        card["benchmark"] = notes
+        if "license_note" in notes:
+            card["license_note"] = notes["license_note"]
+    if count_tokens:
+        card["prompt_tokens"] = count_prompt_tokens(prompts, count_tokens, load_tokenizer)
     return sets._write_set(directory, prompts, grading, card, protocol=protocol)
 
 
@@ -480,6 +528,8 @@ __all__ = [
     "TasksetHandle",
     "VERIFIERS_PREFIX",
     "build_set",
+    "card_notes",
+    "count_prompt_tokens",
     "freeze",
     "is_verifiers_source",
     "needs_runtime",
