@@ -1,6 +1,6 @@
 """A Verifiers runtime whose code runs in our gVisor grading service.
 
-A taskset reward that needs a runtime (LiveCodeBench) would otherwise get a
+A taskset reward that needs a runtime (LiveCodeBench, SciCode) would otherwise get a
 Docker box, so the admin host would need the Docker socket. Here the
 taskset's own verifier script (pinned by sha256) runs on the trusted side and
 only the processes it starts for the model's program go to the grading
@@ -10,7 +10,9 @@ its ``eval`` of test inputs and ``pickle.loads`` of hidden tests are held to
 literals and plain strings (all of LCB's are).
 
 An adapter exists only for a verifier whose bytes are pinned below; any other
-runtime reward keeps the Docker path in ``verifiers_source``.
+runtime reward keeps the Docker path in ``verifiers_source``. SciCode's tests
+need numpy/scipy/h5py and the reference targets: its programs go to a second
+service whose sandbox root is the SciCode grading image (docker/scicode-grader).
 """
 
 from __future__ import annotations
@@ -23,10 +25,13 @@ import pickle
 import subprocess
 import threading
 import types
+from dataclasses import dataclass
 from typing import Any
 
 # The grading service's socket; an eval host may share it from a sidecar.
 SOCKET_ENV = "RELIQUARY_EVAL_GRADER_SOCKET"
+# The service whose sandbox root is the SciCode grading image.
+SCICODE_SOCKET_ENV = "RELIQUARY_EVAL_SCICODE_GRADER_SOCKET"
 # What the sandboxed program's interpreter is called on the trusted side; the
 # guest substitutes its own `sys.executable`.
 SANDBOX_PYTHON = "/usr/local/bin/python3"
@@ -38,7 +43,8 @@ CPU_FACTOR = 2.0
 
 # livecodebench (research-environments @ f2e0d709): verify.py.
 LIVECODEBENCH_VERIFY_SHA256 = "88da02df6d8e24f84038b657566d61c75b9da7032b8e092edc4b9c24a75408da"
-ADAPTED = {"livecodebench.taskset": frozenset({LIVECODEBENCH_VERIFY_SHA256})}
+# scicode-steps (tasksets/scicode_steps): verify.py.
+SCICODE_VERIFY_SHA256 = "a1318e2d79f4b2e8d4387a3bec13dbe15db5f7a5d915ef424abb47bc3b06d9b0"
 
 # Runs in the service's per-request fork. As `subprocess.run([sys.executable,
 # "-c", program], input=..., timeout=TIMEOUT)` in the verifier: a real
@@ -71,18 +77,61 @@ def run(code, stdin_text, output_cap):
 '''
 
 
-def guest_source(timeout: float) -> str:
-    return GUEST_TEMPLATE.format(timeout=float(timeout))
+# SciCode's guest: the test file passes when it exits 0 (its output is not
+# read). One BLAS thread, so the address-space limit holds numpy and scipy.
+SCICODE_GUEST_TEMPLATE = '''\
+import subprocess, sys
+
+TIMEOUT = {timeout!r}
+ENV = {{"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp", "MPLBACKEND": "Agg",
+        "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
+        "PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": "0"}}
+
+
+def run(code, stdin_text, output_cap):
+    size, rest = stdin_text.split("\\n", 1)
+    code, stdin_text = rest[:int(size)], rest[int(size):]
+    try:
+        proc = subprocess.run([sys.executable, "-c", code], input=stdin_text.encode("utf-8"),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=TIMEOUT, env=ENV, cwd="/tmp")
+    except subprocess.TimeoutExpired:
+        return {{"status": "runtime_error", "stdout": ""}}
+    return {{"status": "ok" if proc.returncode == 0 else "runtime_error", "stdout": ""}}
+'''
+
+
+@dataclass(frozen=True)
+class Adapter:
+    verifiers: frozenset[str]
+    socket_env: str
+    guest_template: str
+
+
+ADAPTED = {
+    "livecodebench.taskset": Adapter(frozenset({LIVECODEBENCH_VERIFY_SHA256}), SOCKET_ENV, GUEST_TEMPLATE),
+    "scicode_steps.taskset": Adapter(frozenset({SCICODE_VERIFY_SHA256}), SCICODE_SOCKET_ENV,
+                                     SCICODE_GUEST_TEMPLATE),
+}
+
+
+def guest_source(timeout: float, template: str = GUEST_TEMPLATE) -> str:
+    return template.format(timeout=float(timeout))
 
 
 def frame(program: str, stdin: str) -> str:
     return f"{len(program)}\n{program}{stdin}"
 
 
-def _client():
+def _client(socket_env: str = SOCKET_ENV):
     from reliquary.environment.grader_client import GraderClient
 
-    path = os.environ.get(SOCKET_ENV, "").strip()
+    path = os.environ.get(socket_env, "").strip()
+    if socket_env != SOCKET_ENV and not path:
+        # Never the default service: its sandbox lacks this taskset's runtime.
+        from reliquary.environment.grader_client import GraderInfrastructureError
+
+        raise GraderInfrastructureError(f"{socket_env} is not set")
     return GraderClient(path) if path else GraderClient()
 
 
@@ -97,8 +146,9 @@ class _Subprocess:
     TimeoutExpired = subprocess.TimeoutExpired
     PIPE = subprocess.PIPE
 
-    def __init__(self, client_factory) -> None:
+    def __init__(self, client_factory, guest_template: str = GUEST_TEMPLATE) -> None:
         self._client_factory = client_factory
+        self._guest_template = guest_template
         self.infra_error: BaseException | None = None
         self.calls = 0
 
@@ -113,7 +163,8 @@ class _Subprocess:
         self.calls += 1
         try:
             status, stdout = self._client_factory().run_stdio(
-                code="", guest=guest_source(timeout), stdin=frame(argv[2], input or ""),
+                code="", guest=guest_source(timeout, self._guest_template),
+                stdin=frame(argv[2], input or ""),
                 output_cap=OUTPUT_CAP, time_limit_s=CPU_FACTOR * float(timeout))
         except GraderInfrastructureError as exc:
             # The verifier would read this as a failed test: kept, then raised.
@@ -132,9 +183,11 @@ class GraderRuntime:
 
     network_restricted = True
 
-    def __init__(self, allowed: frozenset[str], client_factory=_client) -> None:
+    def __init__(self, allowed: frozenset[str], client_factory=_client,
+                 guest_template: str = GUEST_TEMPLATE) -> None:
         self._allowed = allowed
         self._client_factory = client_factory
+        self._guest_template = guest_template
         self.files: dict[str, bytes] = {}
         self.last_calls = 0
 
@@ -158,7 +211,7 @@ class GraderRuntime:
         data = script.encode() if isinstance(script, str) else bytes(script)
         if hashlib.sha256(data).hexdigest() not in self._allowed:
             raise RuntimeError("this verifier script is not pinned for the grading service")
-        shim = _Subprocess(self._client_factory)
+        shim = _Subprocess(self._client_factory, self._guest_template)
         out = io.StringIO()
         namespace: dict[str, Any] = {"__name__": "reliquary_pinned_verifier"}
         exec(compile(data, "<verify.py>", "exec"), namespace)
@@ -168,7 +221,7 @@ class GraderRuntime:
         def open_(path, *a, **k):
             return io.StringIO(files[path].decode("utf-8"))
 
-        run_case, failed = namespace["run_case"], threading.Event()
+        run_case, failed = namespace.get("run_case"), threading.Event()
 
         def guarded(*a, **k):
             # All-or-nothing reward: after a failure the rest cannot change it.
@@ -190,9 +243,11 @@ class GraderRuntime:
         namespace.update(
             # Tests pickled as one string (LCB's private cases): no global may load.
             pickle=types.SimpleNamespace(loads=lambda raw: _NoGlobals(io.BytesIO(raw)).load()),
-            eval=literal, subprocess=shim, open=open_, run_case=guarded,
+            eval=literal, subprocess=shim, open=open_,
             sys=types.SimpleNamespace(argv=["verify.py", *(args or [])], executable=SANDBOX_PYTHON),
             print=lambda *a, **k: print(*a, **{**k, "file": out}))
+        if run_case is not None:
+            namespace["run_case"] = guarded
         namespace["main"]()
         self.last_calls = shim.calls
         if shim.infra_error is not None:
@@ -210,9 +265,11 @@ def _program_result(stdout: str):
 
 def runtime_for(task) -> GraderRuntime | None:
     """The grading-service runtime for ``task``'s pinned verifier, or None."""
-    allowed = ADAPTED.get(type(task).__module__)
-    return GraderRuntime(allowed) if allowed else None
+    adapter = ADAPTED.get(type(task).__module__)
+    if adapter is None:
+        return None
+    return GraderRuntime(adapter.verifiers, lambda: _client(adapter.socket_env), adapter.guest_template)
 
 
-__all__ = ["ADAPTED", "GraderRuntime", "LIVECODEBENCH_VERIFY_SHA256", "SOCKET_ENV",
-           "frame", "guest_source", "runtime_for"]
+__all__ = ["ADAPTED", "Adapter", "GraderRuntime", "LIVECODEBENCH_VERIFY_SHA256", "SCICODE_SOCKET_ENV",
+           "SCICODE_VERIFY_SHA256", "SOCKET_ENV", "frame", "guest_source", "runtime_for"]

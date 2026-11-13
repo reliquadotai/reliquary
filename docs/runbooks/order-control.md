@@ -91,3 +91,45 @@ docker run -d --name eval-grader --restart unless-stopped --init --privileged --
 
 The taskset loads `livecodebench/code_generation_lite` (v6, ~4.5 GB, plus its Arrow cache) the first time a
 grading opens it. Without the sidecar, rows grade as `grader_error` (`unreachable`), never as wrong answers.
+
+## SciCode
+
+SciCode (`verifiers:scicode-steps`, `tasksets/scicode_steps`) asks each sub-step in a fresh single-turn prompt that
+carries the model's own code for the earlier steps, as upstream does. So one SciCode evaluation is a chain of sets,
+one per step position (1..15 on the test split), each built from the graded answers of the one before
+(`scicode_steps.chain`):
+
+```bash
+echo '{"split": "test", "step": 1, "previous": {}}' > args-1.json
+reliquary eval build-set verifiers:scicode-steps --out sets/scicode-p1 --taskset-args @args-1.json
+# order it on the model, grade; previous = chain.record(previous, {step_number: answer text}) -> args-2.json, ...
+# when every position is graded: chain.summary("test", {step_number: passed}) -> main-problem and sub-step rates
+```
+
+Its tests need numpy/scipy/sympy/h5py and the 1 GB reference targets, so its programs go to a second grading
+service whose sandbox root is the SciCode grading image (`docker/scicode-grader`, stored by digest in the
+Hippius registry, bucket `reliquary-task-images`, `reliquary/scicode-grader@sha256:484ab5f18a608c5a7568f2afcc145458d6e02f08632ba9fb0d46d831dc498488`,
+0.57 GB; the raw targets file is `datasets/scicode/test_data-48b0272a88b1.h5` in the same bucket). Pull it through a
+local `registry:2.8.3` on that bucket (the settings of the image mirror runbook). On the eval host:
+
+```bash
+# the bundle: the image's filesystem as the rootfs, this checkout's worker and bundle config
+sudo install -d /opt/scicode-bundle
+sudo install -m 0644 docker/scicode-grader/bundle-config.json /opt/scicode-bundle/config.json
+sudo BUNDLE_DIR=/opt/scicode-bundle WORKER_SRC=reliquary/environment/grader/worker.py \
+  PY_IMAGE=<registry>/reliquary/scicode-grader@sha256:484ab5f1...8488 bash scripts/build_grader_bundle.sh
+sudo install -d -m 0770 /run/reliquary-grader-scicode
+docker run -d --name eval-grader-scicode --restart unless-stopped --init --privileged --cgroupns host \
+  --network none -v /run/reliquary-grader-scicode:/run/reliquary-grader-scicode \
+  -v /opt/scicode-bundle:/opt/scicode-bundle:ro -e GRADER_BUNDLE_PATH=/opt/scicode-bundle \
+  --entrypoint python <admin image> -m reliquary.environment.grader.server --use-runsc \
+  --socket /run/reliquary-grader-scicode/grader.sock --pool-size 16 --metrics-port 0 --stdio-max-seconds 600
+# the admin container:
+#   -v /run/reliquary-grader-scicode:/run/reliquary-grader-scicode \
+#   -e RELIQUARY_EVAL_SCICODE_GRADER_SOCKET=/run/reliquary-grader-scicode/grader.sock
+```
+
+A step has 300 s of wall clock (upstream: 1800 s) and 8 GiB of address space (10.11's reference needs ~4), one
+BLAS thread: size `--pool-size` to the host's memory. Without
+`RELIQUARY_EVAL_SCICODE_GRADER_SOCKET` a SciCode row is a grader error, never a zero: the default service's
+sandbox has no numpy.

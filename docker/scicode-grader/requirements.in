@@ -1,0 +1,8 @@
+# SciCode test dependencies, at mid-2024 releases (the leaderboard's era):
+# scipy < 1.14 keeps `scipy.integrate.simps`, numpy 1.x keeps the old aliases.
+numpy==1.26.4
+scipy==1.13.1
+sympy==1.12.1
+mpmath==1.3.0
+h5py==3.11.0
+matplotlib==3.9.0

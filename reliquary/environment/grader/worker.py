@@ -347,9 +347,9 @@ def evaluate_call(
 # its CPU, and the wall clock only catches one that idles (sleep, deadlock).
 STDIO_WALL_FACTOR = 2.0
 STDIO_WALL_SLACK_S = 1.0
-# What a program may address, as the package's own runner grants it. The
-# sandbox's hard limit wins when it is lower.
-STDIO_MEMORY_BYTES = 2 << 30
+# What a program may address, as the package's own runner grants it; a bundle's
+# env may set another (SciCode's: 8 GiB). The sandbox's hard limit wins when lower.
+STDIO_MEMORY_BYTES = int(os.environ.get("RELIQUARY_STDIO_MEMORY_BYTES", 2 << 30))
 # Bytes read past the output cap before the rest is dropped: the result line
 # and its JSON escaping.
 STDIO_READ_SLACK = 1 << 20
