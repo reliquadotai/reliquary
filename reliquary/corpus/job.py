@@ -987,14 +987,12 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
 
 
 def _check_draw_job(job: JobSpec) -> None:
-    """A forced draw, on any job (eval or generation): keyed on its seed, its samples in free order, a failed slot
-    reopened with its own draw (``corpus.eval_draw``)."""
+    """A forced draw, on any job (eval or generation, single-turn or episode, suite included): keyed on its seed,
+    its samples in free order, a failed slot reopened with its own draw (``corpus.eval_draw``)."""
     if job.seed is None:
         raise JobError("sampling.draw keys the draw on the job's seed: a seed is required")
     if job.prompt_order == PROMPT_ORDER_MINER_WALK:
         raise JobError("sampling.draw takes the draw slot from the cursor: a miner_walk job walks it")
-    if job.episode is not None and getattr(job.episode, "harness", None) == "suite":
-        raise JobError("sampling.draw is not drawn by the suite episode miner yet: use free sampling")
 
 
 def is_signed_sandbox(job: JobSpec) -> bool:

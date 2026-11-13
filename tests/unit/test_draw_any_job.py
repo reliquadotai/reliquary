@@ -60,13 +60,14 @@ def test_a_draw_generation_jobs_failed_slot_reopens():
         asyncio.run(record_prompt_failure(Store(), plain, 3, "s" * 64))
 
 
-def test_a_draw_on_a_suite_episode_is_refused_until_its_miner_draws():
+def test_a_draw_on_a_suite_episode_is_accepted():
     from reliquary.corpus.job import _check_draw_job
     from types import SimpleNamespace
 
     job = SimpleNamespace(seed=1, prompt_order=PROMPT_ORDER_FREE, episode=SimpleNamespace(harness="suite"))
-    with pytest.raises(JobError, match="suite"):
-        _check_draw_job(job)
+    _check_draw_job(job)
+    with pytest.raises(JobError, match="seed"):
+        _check_draw_job(SimpleNamespace(seed=None, prompt_order=PROMPT_ORDER_FREE, episode=job.episode))
 
 
 # ------------------------------------------------------------------ prompts as token ids
