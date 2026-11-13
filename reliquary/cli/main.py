@@ -2317,7 +2317,7 @@ def eval_build_set(
     episode_config: str | None = typer.Option(None, "--episode-config",
         help="Reviewed episode source configuration JSON file; no secret command arguments"),
     bridge_file: str | None = typer.Option(None, "--bridge-file",
-        help="A bridged eval env's source (e.g. reliquary-terminal): JSON {options, "
+        help="A bridged eval env's source (reliquary-terminal, reliquary-deepswe): JSON {options, "
              "image_lock_sha256}, as its gateway serves it"),
     exclude_file: str | None = typer.Option(
         None, "--exclude-file",

@@ -132,8 +132,11 @@ MAX_SUITE_TOKENS_PER_TURN = SUITE_ACTION_BYTES // SUITE_BYTES_PER_TOKEN
 SWE_PACKAGE = "reliquary-swe"
 # Envs served through the sandbox's verifiers bridge that an eval job may run besides
 # reliquary-swe: signed only, eval only, read through `episode.bridge` (the gateway's
-# options and image lock), as an RL run reads its bridged envs.
-BRIDGED_EVAL_PACKAGES = frozenset({"reliquary-terminal"})
+# options and image lock), as an RL run reads its bridged envs. Every process that serves
+# such a job still needs the package installed at the episode's pinned identity
+# (`agentic_swe.sandbox_support_refusal`): naming one here only lets a manifest carry it.
+# reliquary-terminal: TMax; reliquary-deepswe: DeepSWE v1.1 (Datacurve's 113 tasks).
+BRIDGED_EVAL_PACKAGES = frozenset({"reliquary-terminal", "reliquary-deepswe"})
 EPISODE_ENV_PACKAGES = frozenset({SWE_PACKAGE, SUITE_PACKAGE}) | BRIDGED_EVAL_PACKAGES
 EPISODE_HARNESSES = frozenset({"bash", SUITE_HARNESS})
 # The packages each harness runs: never mixed.
