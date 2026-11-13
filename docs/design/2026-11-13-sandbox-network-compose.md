@@ -5,8 +5,8 @@ Date: 2026-11-13. Status: design + implementation on local branches (nothing pus
 | Repo | Branch | What |
 |---|---|---|
 | reliquary-sandbox | `feat/sandbox-network-compose` (from public/main 2ab7eb9) | egress (task field, settings, proxy, host setup), sidecars, docs/egress.md |
-| reliquary-platform | `feat/sandbox-fleet-scale` (from origin/main) | wildcard gateway names (> 5 gateways), progressive image readiness in the gateway bootstrap |
-| Catalyst | `feat/sandbox-network-compose` (from origin/main) | this document |
+| reliquary-platform | `feat/sandbox-fleet-scale-on-swe-full` (on `feat/swe-verified-full` b0616c0; supersedes `feat/sandbox-fleet-scale`) | wildcard gateway names (> 5 gateways), progressive image readiness through the local registry, disk sizing, per-box/API limits in gateway.env |
+| Catalyst | `feat/sandbox-network-compose` (from origin/main) | this document; `Fleet.could_place` reads `images_pending` |
 
 Goal: lift the sandbox blockers that keep agentic benchmarks (Terminal-Bench 2.1/4.1, SWE-bench Pro,
 NL2Repo, DeepSWE, ...) out of the eval catalog (`~/runbooks/eval-catalog/PLAN.md`).
@@ -69,23 +69,34 @@ What reliquary-sandbox enforces today, from the code and the bootstrap settings:
 | Sessions | capacity slots; validator-signed tokens; present window | 39; 120 s |
 | Network | `none` (offline), so no bandwidth to abuse | |
 
-Gaps (each would let one box degrade the whole gateway):
+Gaps found, now closed. The sandbox settings are off by default; the bootstrap sets them
+(`feat/sandbox-network-compose` and the platform bootstrap):
 
-1. **Inodes**: Docker's `storage_opt size` sets only the block limit of the project quota. A box
-   can create files without bound (metadata is not charged to the block quota) until the shared
-   xfs loop file is full. Fix: after create, set `ihard` on the box's project id
-   (`xfs_quota -x -c 'limit -p ihard=<N> <projid>'`, N ~ 1M). Measure first.
-2. **Overcommitted disk**: the bootstrap makes a 1100 GiB sparse loop file. Prod uses
-   `cpu-medium-amd`, whose root disk is ~753 GB (seen on the test VM). Boxes (39 x 10 GiB
-   agent + grading) plus images can exceed the real disk, and then every box gets ENOSPC. Fix:
-   size the loop file to the real free disk minus a margin, and keep
-   `slots x disk_bytes + images` below it.
-3. **Disk I/O bandwidth**: no `io.max`/blkio weight, so one box doing heavy I/O starves the
-   others. Fix: `blkio_weight` or `device_write_bps` per box (gVisor gofer I/O is charged to the
-   box cgroup). Measure first.
-4. **Gateway API request rate**: no per-token rate limit on the HTTP API, only per-episode call
-   budgets. A Caddy `rate_limit` per client IP or per token is cheap.
-5. **Egress**: now bounded by the proxy (section 3); a box has no other path out.
+1. **Inodes.** Docker's `storage_opt size` sets only the block limit, so a box could create
+   files until the shared xfs filesystem was full. Fixed: `EPISODE_BOX_INODES` (1,000,000)
+   sets `ihard` on the box's project quota (`xfs_io lsproj` + `xfs_quota limit -p`) before
+   start, for sidecars too. Measured: a 20,000 cap stopped file creation at 19,980 (ENOSPC).
+2. **Disk sizing.** The loop file was a fixed 1100 GiB, but the root disk is ~753 GB on
+   `cpu-medium-amd` and 1.5 TiB on `cpu-large-amd` (Targon inventory spec). Fixed:
+   - the loop file is now the free root space less 10% (at least 50 GiB): 636 GiB on
+     cpu-medium, measured;
+   - opens are refused (signed 503 `no_free_resources`, retryable) below
+     `EPISODE_MIN_FREE_DISK_BYTES` (40 GiB).
+3. **Disk I/O.** Fixed: per-box cgroup `io.max` on the loop device, written by the runtime after
+   start. Docker's `device_*_bps` fail under runsc with systemd cgroups ("Failed to set unit
+   properties"). Bootstrap caps: 100 MiB/s write, 200 MiB/s read, 1000/2000 IOPS. Measured
+   with a 50 MiB/s write / 100 MiB/s read cap: 49.7 MB/s fsync writes, 105 MB/s reads, and
+   77 MB/s for `oflag=direct` writes (gVisor buffers those). The device does ~570/790 MB/s
+   uncapped.
+4. **API rate.** Fixed: an ASGI token bucket per `Authorization` value (20/s, burst 40) and per
+   client address (50/s, burst 200). Behind Caddy the address is the last `X-Forwarded-For`
+   entry. Over a limit: 429 with Retry-After, before any thread pool. Measured on the real app:
+   11 of 40 requests passed for one key, 39 of 60 for one address, and a spoofed XFF prefix was
+   ignored.
+
+A Caddy `rate_limit` would need a custom Caddy build, so the limit lives in the app.
+The new gateway.env settings take effect once the bootstrap's `SBX` pin moves to a sandbox release
+with this branch; older releases ignore them (`extra="ignore"`).
 
 ## 3. Network at run time (controlled egress), implemented
 
@@ -223,19 +234,20 @@ Live gateways keep their old names until destroyed (the old certificate stays va
 
 ## 6. Images: Hippius registry and progressive readiness
 
-Hippius: a parallel effort (SWE-bench Verified full, worktrees `catalyst-swe-verified-full`,
-`platform-swe-verified-full`) is meant to own the Hippius pull. As of this writing those branches
-have no Hippius change and no design doc, so nothing here duplicates it. Suggested shape, from
-`~/runbooks/image-mirror` and `~/runbooks/hippius-test/RESULTS.md`:
+Hippius: implemented by the SWE-Verified effort (platform `feat/swe-verified-full` b0616c0). The
+swe-full group runs a read-only `registry:2.8.3` on `127.0.0.1:5000`, backed by the bucket and
+listed first in Docker's `registry-mirrors`; the provisioner pushes `registry.env` to that group
+only. The progressive pull script uses it, so the source is chosen in one place
+(`rq-pull-images`):
 
-- On each gateway, run a local read-only `registry:2.8.3` on `127.0.0.1:5001`, backed by the
-  bucket `reliquary-task-images` (layout `docker/registry/v2`, repo paths kept, read-only S3
-  key).
-- Put it first in `registry-mirrors`. That covers docker.io images (SWE-bench, TB), and digests
-  and names are kept.
-- Images from other registries (ghcr.io, public.ecr.aws) need the containerd snapshotter's
-  `hosts.toml` mirrors, or a pull from the mirror followed by an approved-alias map in the
-  runtime.
+- A Docker Hub image the registry holds (manifest HEAD by digest) is pulled through it, and the
+  repo@digest name is kept.
+- Anything else goes upstream.
+- Each image is logged as `registry|upstream <s> <ref>`.
+
+Validated on a VM with a local registry: one image came through the registry (its blob GETs were
+logged and its RepoDigests were kept), the other came from upstream. Images from other registries
+(ghcr.io, ECR) still go upstream. Mirroring them needs the containerd snapshotter's `hosts.toml`.
 
 Progressive readiness (implemented, platform bootstrap):
 
@@ -249,11 +261,12 @@ Progressive readiness (implemented, platform bootstrap):
   orders (no open queue) a row whose image is still pulling is refused retryably
   (`sandbox_capacity`).
 
-Caveat: for the RL issuer (open queue), a row no machine holds is `task_unplaceable`, final for
-the seed. Before using progressive gateways for RL, the capacity report should list
-`images_pending` and `Fleet.could_place` should count a pending image as "later" (small change,
-both repos). Validated on the VM: the pull script and the background unit retry a bad digest and
-pull the rest.
+RL safety (implemented): the gateway's capacity report lists `images_pending` (approved, not yet
+present). Catalyst `Fleet.could_place` answers None (retryable, "later") instead of False when a
+machine serving the env lists the image as pending. So the RL open queue no longer refuses such a
+row for good (`task_unplaceable`). Tests: `tests/unit/test_sandbox_fleet.py` (Catalyst) and
+`tests/test_gateway_limits.py` (sandbox). Validated on the VM: the pull script and the background
+unit retry a bad digest and pull the rest.
 
 ## 7. Second VM provider (survey, 2026-11-13; prices not measured)
 
@@ -284,10 +297,13 @@ bootstrap is provider-neutral except the SSH user and ports.
    `egress-host-setup.sh` only on gateways serving a set with a network, and add the egress
    settings to `gateway.env` for those envs.
 3. Wildcard certificate and Worker vars (section 5).
-4. Close the DoS gaps: inode quota, loop-file sizing, I/O weight, API rate limit (section 2).
+4. Merge order for the platform: `feat/swe-verified-full` first, then
+   `feat/sandbox-fleet-scale-on-swe-full`. The rebase was done: the only conflict was the header
+   comment of `bootstrap.sh`, and `worker/sandbox-gateways.ts`, the tests and the docs merged
+   cleanly. `feat/sandbox-fleet-scale` is superseded. Then bump `SBX` to the sandbox release
+   holding this work.
 5. TB 2.1 first (network in grading and agent, no compose), then SWE-bench Pro (grading only),
    then TB 4.1 (sidecars plus extraction).
-6. `images_pending` before progressive RL gateways; Hippius mirror per section 6, owned by the
-   SWE-Verified effort.
+6. With progressive readiness, swe-full's `GROUP_BOOT_HOURS` (2 h) can shrink to the first batch's boot.
 7. Cross-gateway regrading (grade integrity).
 8. Second provider adapter (Vultr).

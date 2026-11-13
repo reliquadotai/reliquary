@@ -995,3 +995,24 @@ def test_a_gateway_serves_an_env_only_at_its_package_options_and_images(tmp_path
     assert fleet.slots_serving_env(ENV, ENV_PACKAGE, now=NOW + 1) == 0
     # Stale: no gateway.
     assert fleet.slots_serving_env(ENV, ENV_PACKAGE, now=NOW + 10_000) == 0
+
+
+def test_an_image_still_pulling_is_later_never_final(tmp_path):
+    """A gateway serving while it pulls (progressive readiness) lists `images_pending`: an image
+    there cannot be placed now, but the RL open queue must not refuse it for good."""
+    other = "registry.example/other@sha256:" + "2" * 64
+    fleet, machine, served, clock = make(tmp_path)
+    served[ADDRESS] = capacity_report(machine, at=NOW)
+    asyncio.run(fleet.poll_once())
+    assert fleet.could_place(now=NOW, **{**PICK, "image": other}) is False
+    served[ADDRESS] = capacity_report(machine, at=NOW + 1, images_pending=(other,))
+    clock.now = NOW + 1
+    asyncio.run(fleet.poll_once())
+    assert fleet.pick(now=NOW + 1, **{**PICK, "image": other}) is None
+    assert fleet.could_place(now=NOW + 1, **{**PICK, "image": other}) is None
+    assert fleet.could_place(now=NOW + 1, **PICK) is True
+    served[ADDRESS] = capacity_report(machine, at=NOW + 2, images_pending=(other,),
+                                      env_packages={ENV: "other==9"})
+    clock.now = NOW + 2
+    asyncio.run(fleet.poll_once())
+    assert fleet.could_place(now=NOW + 2, **{**PICK, "image": other}) is False   # env not served
