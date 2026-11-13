@@ -43,6 +43,19 @@ HARNESS_DIGESTS = {
 """Every harness spec this build serves, by `id@version`, at the digest it was built against.
 A job or an RL episode env names one with `{id, version, digest}`; one naming none is
 `bash-vf-b2e4e81@1`."""
+PREVIOUS_HARNESS_DIGESTS = {
+    HARNESS.key: "9a6b27dd764cffee512f77f430747c40c220fd6492b30696b8c89e2fb20f9fca",
+    BASH_SURFACE_V1.key: "4943b1efec1c88691a727f819538b00ef321e6eb8c274e79d2d1ddca3306c4be",
+    MINI_SWE_V2.key: "cecffb2631c01e2dd415a4e9cb76d79717d1a0b67bd0187422a658ef9173f15d",
+    OPENHANDS_XML_V1.key: "0b1a9b92ccb3b43e8954a15afa5ab6c5f14e57190a734118f817ce7da848ff4d",
+    CLAUDE_CODE_V1.key: "2763bcd5c36ac027e9d5e24cad80c9c606fbbb26e07bcb2f192ecb9ba464e40d",
+    CODEX_V1.key: "00d2979c6a783bb71ffb0c553881155cb61f8868ea20d61f7cc0cd75fd99a61b",
+}
+"""The same specs at reliquary-harness 7d559fd. d680d5e added `terminus.py` (and an optional
+`prompt_ids` to `tool_calls`) without changing what these specs render or parse, but a digest
+covers every implementation module, so each one moved: a contract pinning the earlier digest
+(jobs created before this release) is still served, with the same tokens."""
+
 SUPPORTED_RENDERER = HARNESS.renderer
 RENDERERS_VERSION = SUPPORTED_RENDERER.rsplit("@", 1)[1]
 SUPPORTED_VERIFIERS = VERIFIERS_COMMIT
@@ -100,7 +113,7 @@ def harness_pin_refusal(pin, *, variants: bool) -> str | None:
     key = f"{pin['id']}@{pin['version']}"
     if key not in HARNESS_DIGESTS:
         return f"harness {key} is not one this build serves ({sorted(HARNESS_DIGESTS)})"
-    if pin["digest"] != HARNESS_DIGESTS[key]:
+    if pin["digest"] != HARNESS_DIGESTS[key] and pin["digest"] != PREVIOUS_HARNESS_DIGESTS.get(key):
         return f"the contract pins harness {key} at {pin['digest']}, this build serves {HARNESS_DIGESTS[key]}"
     if not variants and variant_count(get_spec(pin["id"], pin["version"])) != 1:
         return f"harness {key} draws surface variants per episode: an RL lease's, not a corpus job's"
