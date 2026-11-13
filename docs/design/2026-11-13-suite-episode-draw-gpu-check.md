@@ -16,8 +16,9 @@ signed SWE episodes are measured; a suite episode differs in three ways that thi
 ## Setup
 
 - One H100/H200 host, a Qwen3.5-family checkpoint (the smallest pinned one; Qwen3.5-9B is enough).
-- Catalyst at `feat/suite-episode-orders`, the env wheel `reliquary-telecom-solo` 0.2.0a1 (and later
-  `reliquary-automationbench`) at the registry's manifest pin.
+- Catalyst at `feat/suite-episode-orders`, the env wheels `reliquary-telecom-solo` 0.2.0a1 and
+  `reliquary-automationbench` 0.1.0a1 (reliquary-environments `feat/reliquary-automationbench`) at the
+  registry's manifest pins.
 - A local order control and miner on the same host (no production): the admin writes the order into a local
   bucket, as `tests/unit/test_order_suite.py` does, then `reliquary corpus mine-agentic` against it.
 
@@ -28,8 +29,9 @@ signed SWE episodes are measured; a suite episode differs in three ways that thi
 2. **Honest, warped.** Same, `temperature` 0.7, `top_p` 0.95 (the orders customers send).
 3. **Cuts.** Same tasks with `max_total_tokens` 6144, so most episodes end as `context_length`; and
    `max_tokens_per_turn` 256 so some turns end at their cap. Expect cuts accepted, graded 0, audits passed.
-4. **Long episode.** AutomationBench (when its wheel exists): episodes of 30-50 turns and 40-60k tokens, the
-   audit forward at its longest.
+4. **Long episode.** AutomationBench: a set from `eval build-set --source reliquary_automationbench_v1
+   --split eval --start 0 --count 600 --sample 24 --seed 1`, `max_turns` 64 (the job cap), `max_total_tokens`
+   65536; episodes of 30-60 turns with tool results up to 24 KiB, the audit forward at its longest.
 5. **Negative controls.** (a) A miner with a re-rolled draw on one turn (seed offset +1 from turn 3);
    (b) the honest trajectory with one observation edited (must be refused at intake by the replay, never
    reaching the audit); (c) another checkpoint (the 4B) mining the 9B order.
