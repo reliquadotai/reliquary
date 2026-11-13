@@ -189,8 +189,8 @@ are part of the leaderboard's difficulty. Residual: an episode that reaches its 
    reliquary-harness d680d5e (the installed digests are checked) and, to serve TB 2.1, install
    reliquary-terminal-bench @ a7718445.
 4. reliquary-platform #208 (D1 migration 0066, then the Worker). Only the TB template pins
-   d680d5e and terminus-2@1; the other sets keep their pins. Its bootstrap moves every group's
-   gateway to sandbox d680d5e (egress, per-box limits). Deploy after step 3.
+   d680d5e and terminus-2@1; the other sets keep their pins. Gateways already run
+   release-2026-11-13 (7743b57, platform #209), which has the egress setup. Deploy after step 3.
 5. Ops: kit gains `groups/tb21/{images,index}.txt` and the wheel (sha256 5ea79213…), from
    `~/evalsets-work/sets-agentic/tb21-65/kit/`; publish the frozen set
    (`reliquary eval publish-set`); the tb21 gateways get `registry.env` (as swe-full).
