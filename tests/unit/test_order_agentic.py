@@ -538,3 +538,25 @@ def test_an_episode_order_with_ungraded_passes_waits_for_its_grader(admin, swe_s
     _graded_episodes(admin, rewards=[1.0, 1.0, 1.0], ungraded={f"{0:064x}"})
     response = _grade(admin)
     assert response.status_code == 409 and "job_not_graded" in response.text, response.text
+
+
+def test_one_order_combines_agentic_and_single_turn_parts():
+    """An order on SWE, TMax and a single-turn set: each part graded with its own turn budget and episode, one
+    report over the three (docs/design/2026-11-13-multi-set-orders.md)."""
+    from reliquary.orders.reports import combine_reports
+
+    def part(eval_id, env, value, max_new_tokens):
+        report = {"complete": True,
+                  "envs": {env: {"pass@1": {"value": value}, "pass@k": {"1": {"value": value}},
+                                 "no_graded_rows": False}},
+                  "provenance": {"model": "acme/q35", "checkpoint_sha256": "a" * 64,
+                                 "max_new_tokens": max_new_tokens}}
+        return eval_id, {"eval_id": eval_id}, report
+
+    report = combine_reports("order-eval-x", [part("order-eval-x-1", "terminal", 0.25, 8192),
+                                              part("order-eval-x-2", "swe", 0.5, 4096),
+                                              part("order-eval-x-3", "math", 0.75, 32768)], created_at=1.0)
+    assert report["complete"] is True
+    assert sorted(report["envs"]) == ["math", "swe", "terminal"]
+    assert report["macro"]["pass@1"] == pytest.approx(0.5)
+    assert report["provenance"]["order-eval-x-1"]["max_new_tokens"] == 8192
