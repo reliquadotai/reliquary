@@ -246,6 +246,8 @@ class Fleet:
         self._image_sets: dict[str, tuple[Mapping[str, Any], frozenset[str]]] = {}
         # (env, package, options) -> (the serving machines' reports it was built from, their images together)
         self._served_images: dict[tuple, tuple[tuple, frozenset[str]]] = {}
+        # machine -> (report, its ``images_pending`` as a set): approved images still pulling.
+        self._pending_sets: dict[str, tuple[Mapping[str, Any], frozenset[str]]] = {}
 
     def _images_of(self, machine_id: str, document: Mapping[str, Any]) -> frozenset[str]:
         """The images ``document`` (the machine's current report) lists, as a set built once per report."""
@@ -257,6 +259,18 @@ class Fleet:
                   else frozenset())
         self._image_sets[machine_id] = (document, images)
         return images
+
+    def _pending_of(self, machine_id: str, document: Mapping[str, Any]) -> frozenset[str]:
+        """The approved images the report says are still being pulled (a gateway serving while it
+        pulls), as a set built once per report; empty when the report has no such list."""
+        cached = self._pending_sets.get(machine_id)
+        if cached is not None and cached[0] is document:
+            return cached[1]
+        listed = document.get("images_pending")
+        pending = (frozenset(i for i in listed if isinstance(i, str)) if isinstance(listed, (list, tuple))
+                   else frozenset())
+        self._pending_sets[machine_id] = (document, pending)
+        return pending
 
     def directory_age(self, now: float | None = None) -> float | None:
         """Seconds since the last successful directory read, or None if never read."""
@@ -792,7 +806,8 @@ class Fleet:
         serves it), False (no active machine serves it, by what every one of them reports) or None when it
         cannot be judged now: the directory is stale, no machine report was accepted yet (a start) or the last
         poll heard none (our egress), no report is fresh, or a machine whose last report serves it is drained or
-        stale. The RL open queue refuses at once only on False (final for the seed); None is retryable. With
+        stale, or a machine serving the env still pulls the image (``images_pending``). The RL open queue
+        refuses at once only on False (final for the seed); None is retryable. With
         `reserve` (RL), a machine judged by its `resources` (see `pick`) serves the session only if its box is at
         least the task's CPUs and its totals hold the session's CPU and memory. It answers True exactly when
         ``servable_machines`` finds a machine (the same filters), unless the last poll heard no machine."""
@@ -809,6 +824,9 @@ class Fleet:
             current = entry.machine_id not in self.drained and now - document["at"] <= HEARTBEAT_MAX_AGE_S
             fresh = fresh or current
             if not self._serves(entry, document, **kw):
+                if image in self._pending_of(entry.machine_id, document) and self._serves_env(
+                        entry, document, **{k: v for k, v in kw.items() if k != "image"}):
+                    unknown = True          # its image is still pulling there: later, never final
                 continue
             hold = self._could_hold(entry.machine_id, document, reserve)
             if hold is None:
