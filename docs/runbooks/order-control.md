@@ -68,3 +68,26 @@ not measured yet.
 It needs network to drand and to the Hugging Face hub. Route it with the locations
 `reliquary corpus order-nginx --port 8791` prints for the same `RELIQUARY_ADMIN_TASK_PREFIX`; miners need
 no setting. The admin service and the order control must run with the same prefix.
+
+## Code-execution grading (LiveCodeBench)
+
+A Verifiers set whose reward runs code (`needs_runtime: true` on its card) is graded on the admin. For
+LiveCodeBench the taskset's own `verify.py` (pinned by sha256 in `reliquary/eval/sandboxed_runtime.py`) runs in
+the admin's scoring child, and each test program goes to the gVisor grading service's stdio mode: no Docker
+socket in the admin. The service runs as a sidecar from the same image (it carries `runsc` and the grader bundle).
+It holds no secret; like every local runsc grader it needs `--privileged`, and the hostile-code boundary is gVisor.
+
+```bash
+sudo install -d -m 0770 /run/reliquary-grader
+docker run -d --name eval-grader --restart unless-stopped --init --privileged --cgroupns host \
+  --network none -v /run/reliquary-grader:/run/reliquary-grader --entrypoint python <admin image> \
+  -m reliquary.environment.grader.server --use-runsc \
+  --socket /run/reliquary-grader/grader.sock --pool-size 16 --metrics-port 0
+# the admin container: the socket (mode 0660, root) and a persistent Hugging Face cache
+#   -v /run/reliquary-grader:/run/reliquary-grader \
+#   -e RELIQUARY_EVAL_GRADER_SOCKET=/run/reliquary-grader/grader.sock \
+#   -v <disk with ~12 GB free>:/root/.cache/huggingface
+```
+
+The taskset loads `livecodebench/code_generation_lite` (v6, ~4.5 GB, plus its Arrow cache) the first time a
+grading opens it. Without the sidecar, rows grade as `grader_error` (`unreachable`), never as wrong answers.

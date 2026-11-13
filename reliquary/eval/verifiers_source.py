@@ -258,13 +258,22 @@ def _trace_for(task, frozen: FrozenTask, answer: str):
 
 
 def score_trace(task, frozen: FrozenTask, answer: str) -> float:
-    """``Task.score`` over a trace of the frozen prompt and ``answer``; a task
-    whose reward needs a runtime gets a Docker box with every destination denied."""
+    """``Task.score`` over a trace of the frozen prompt and ``answer``. A task
+    whose reward needs a runtime runs its pinned verifier against the gVisor
+    grading service (``sandboxed_runtime``), else gets a Docker box with every
+    destination denied."""
     trace = _trace_for(task, frozen, answer)
 
     async def run() -> float:
         if not needs_runtime(task):
             await task.score(trace)
+            return float(trace.reward)
+        from reliquary.eval.sandboxed_runtime import runtime_for
+
+        sandboxed = runtime_for(task)
+        if sandboxed is not None:
+            await task.setup(trace, sandboxed)
+            await task.score(trace, sandboxed)
             return float(trace.reward)
         from verifiers.v1 import DockerConfig
         from verifiers.v1.runtimes import provision_runtime

@@ -70,7 +70,8 @@ def _envelope(document: dict) -> dict:
 def grader_sha256() -> str:
     root = Path(__file__).parent
     return digest({name: hashlib.sha256((root / name).read_bytes()).hexdigest()
-                   for name in ("grading.py", "verifiers_source.py", "metrics.py", "protocol.py",
+                   for name in ("grading.py", "verifiers_source.py", "sandboxed_runtime.py", "metrics.py",
+                                "protocol.py",
                                 "../corpus/export.py", "../environment/registry.py",
                                 "../environment/agentic/external.py", "../validator/admission.py",
                                 "../environment/stdio_program.py", "agentic.py", "signed_agentic.py",
