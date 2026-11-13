@@ -136,9 +136,10 @@ SWE_PACKAGE = "reliquary-swe"
 # such a job still needs the package installed at the episode's pinned identity
 # (`agentic_swe.sandbox_support_refusal`): naming one here only lets a manifest carry it.
 # reliquary-terminal: TMax; reliquary-deepswe: DeepSWE v1.1 (Datacurve's 113 tasks);
-# reliquary-swebench-pro: SWE-bench Pro V2 (Scale AI, public set); reliquary-nl2repo: NL2Repo-Bench.
+# reliquary-swebench-pro: SWE-bench Pro V2 (Scale AI, public set); reliquary-nl2repo: NL2Repo-Bench;
+# reliquary-terminal-bench: Terminal-Bench 2.1 (docs/design/2026-11-13-terminal-bench-harbor.md).
 BRIDGED_EVAL_PACKAGES = frozenset({"reliquary-terminal", "reliquary-deepswe", "reliquary-swebench-pro",
-                                   "reliquary-nl2repo"})
+                                   "reliquary-nl2repo", "reliquary-terminal-bench"})
 EPISODE_ENV_PACKAGES = frozenset({SWE_PACKAGE, SUITE_PACKAGE}) | BRIDGED_EVAL_PACKAGES
 EPISODE_HARNESSES = frozenset({"bash", SUITE_HARNESS})
 # The packages each harness runs: never mixed.
