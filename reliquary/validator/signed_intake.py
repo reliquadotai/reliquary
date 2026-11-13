@@ -11,7 +11,7 @@ In order, cheapest first:
 2. §5.A/B: `verify_transcript` with EVERY `Expected` field (hotkey, engagement
    `corpus:<job>:<index>`, env, split, index, checkpoint) and the paid-session snapshot,
    `graded` required (the only payable final), except an eval profile's model-budget close
-   (`budget_exhausted` on calls, CPU or transcript, stop `episode_closed`): a scored 0;
+   (`budget_exhausted` on calls or transcript, stop `episode_closed`): a scored 0;
 3. the deadline: received no later than `expires_at + GRADING_GRACE_S` by THIS
    validator's clock (the verifier uses none);
 4. record 0: a tools version this build renders, the job's tools, the job's

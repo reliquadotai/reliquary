@@ -278,7 +278,7 @@ def test_an_unpaid_final_ends_the_reservation(tmp_path, status, reason, state):
 
 
 @pytest.mark.parametrize("status,reason,state", [
-    ("budget_exhausted", "max_calls", CLOSED_GRADED), ("budget_exhausted", "cpu_s", CLOSED_GRADED),
+    ("budget_exhausted", "max_calls", CLOSED_GRADED), ("budget_exhausted", "cpu_s", CLOSED),
     ("budget_exhausted", "transcript_bytes", CLOSED_GRADED),
     ("expired", "deadline passed", CLOSED), ("box_failed", None, CLOSED),
 ])

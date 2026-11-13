@@ -17,7 +17,8 @@ MINI_SWE_2 = {"id": "mini-swe", "version": "2",
 
 
 def _leaderboard(**overrides):
-    budgets = {**sandbox_spec()["budgets"], "max_calls": 512, "per_call_timeout_s": 60, "wall_s": 14400}
+    budgets = {**sandbox_spec()["budgets"], "max_calls": 512, "per_call_timeout_s": 60, "wall_s": 14400,
+               "cpu_s": 14400}
     fields = {"profile": SWEBENCH_BASH_ONLY, "harness_spec": MINI_SWE_2, "max_turns": 250,
               "max_tokens_per_turn": 16384, "max_total_tokens": 131072,
               "sandbox": sandbox_spec(budgets=budgets)}
@@ -45,6 +46,10 @@ def test_the_leaderboard_profile_lifts_the_ceilings_and_round_trips():
 def test_without_a_profile_the_default_ceilings_hold_and_nothing_is_written():
     assert (MAX_EPISODE_TURNS, MAX_EPISODE_TOTAL_TOKENS) == (64, 60000)
     plain = {k: v for k, v in _leaderboard().items() if k != "profile"}
+    # A CPU budget past the gateways' default cap is the profile's only.
+    with pytest.raises(JobError, match=r"cpu_s must be a whole number in \[1, 3600\]"):
+        _job({**plain, "max_turns": 48, "max_total_tokens": 60000, "max_tokens_per_turn": 8192})
+    plain["sandbox"] = {**plain["sandbox"], "budgets": {**plain["sandbox"]["budgets"], "cpu_s": 3600}}
     with pytest.raises(JobError, match=r"max_total_tokens must be a whole number in \[1, 60000\]"):
         _job(plain)
     with pytest.raises(JobError, match=r"max_turns must be a whole number in \[1, 64\]"):
@@ -133,9 +138,12 @@ def test_a_whole_set_with_exclusions_is_restated_over_the_benchmark():
 
 
 def test_the_call_budget_never_cuts_before_the_step_cap():
-    budgets = {**sandbox_spec()["budgets"], "max_calls": 249, "per_call_timeout_s": 60, "wall_s": 14400}
+    budgets = {**sandbox_spec()["budgets"], "max_calls": 249, "per_call_timeout_s": 60, "wall_s": 14400,
+               "cpu_s": 14400}
     with pytest.raises(JobError, match="max_calls"):
         _job(_leaderboard(sandbox=sandbox_spec(budgets=budgets)))
+    with pytest.raises(JobError, match="cpu_s must be at least wall_s"):
+        _job(_leaderboard(sandbox=sandbox_spec(budgets={**budgets, "max_calls": 512, "cpu_s": 3600})))
 
 
 def test_model_budgets_close_as_a_scored_zero_and_infra_ends_do_not():
@@ -144,9 +152,11 @@ def test_model_budgets_close_as_a_scored_zero_and_infra_ends_do_not():
     profiled = _job(_leaderboard()).episode
     plain = _job(_signed(env={"split": "eval", "num_images": 500})).episode
     assert scores_model_closes(profiled) and not scores_model_closes(plain)
-    for reason in ("max_calls", "cpu_s", "transcript_bytes"):
+    for reason in ("max_calls", "transcript_bytes"):
         assert model_closed(profiled, "budget_exhausted", reason)
         assert not model_closed(plain, "budget_exhausted", reason)
+    # CPU time depends on the gateway's hardware: infra, redone.
+    assert not model_closed(profiled, "budget_exhausted", "cpu_s")
     # Wall time is the gateway's and the miner's speed, never the model's: redone, not scored.
     assert not model_closed(profiled, "expired", "deadline passed")
     assert not model_closed(profiled, "box_failed", None)

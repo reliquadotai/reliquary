@@ -138,6 +138,7 @@ manifest field, written only when set, so other manifests hash as before.
 | per-command timeout | 600 s | 60 s (required) |
 | sandbox calls | 192 | 512 (required >= the 250-step cap) |
 | sandbox wall | 7,200 s | 14,400 s (required; the gateway's cap) |
+| sandbox CPU time | <= 3,600 s | 14,400 s (required >= wall; the profile alone may pass 3,600) |
 | run cut by a model limit | turns, context: scored on the box state | scores 0, listed apart |
 | run ended by an infra limit | slot redone | slot redone (same draw), counted per task |
 
@@ -155,8 +156,8 @@ GPU, crash, a busy gateway), so only what the model's own actions decide may cos
 
 - **Model limits score 0** (as the leaderboard's `LimitsExceeded`): the step cap (`max_turns`),
   the context (`context_length`), and the box's budgets the model's calls spend. Those are the
-  call budget (`max_calls`), CPU time (`cpu_s`) and the transcript cap (`transcript_bytes`); the
-  machine closes the episode `budget_exhausted` (stop `episode_closed`).
+  call budget (`max_calls`) and the transcript cap (`transcript_bytes`); the machine closes the
+  episode `budget_exhausted` (stop `episode_closed`).
   - The call budget is required at least the step cap, so it does not cut before it when the
     model makes one call per step. A model that makes several calls per step can still hit it:
     that is the model's doing.
@@ -165,13 +166,18 @@ GPU, crash, a busy gateway), so only what the model's own actions decide may cos
     takes it as a paid row with reward 0. The grader marks it `closed`, and the report counts it
     under `limit_cuts` as `budget:<reason>`.
   - Without a profile nothing changes: such a close stays unpaid and its slot is redone.
-- **Infra limits score nothing; the slot is redone.** These are the wall budget (`expired`), a
-  failed box (`box_failed`), a lost miner (`lapsed`), a lost gateway (`voided`), a failed open or
-  an abort. The redo is not an extra attempt. The sample of a slot is fixed by the job's public
+- **Infra limits score nothing; the slot is redone.** These are the wall budget (`expired`), CPU
+  time (`budget_exhausted` on `cpu_s`: it depends on the gateway's hardware), a failed box
+  (`box_failed`), a lost miner (`lapsed`), a lost gateway (`voided`), a failed open or an abort. The redo is not an extra attempt. The sample of a slot is fixed by the job's public
   draw (`corpus.draw_leases`, `corpus.eval_draw`), so whoever replays the slot replays the same
   sample; only tool-output nondeterminism differs.
   - The wall budget is sized generously: 14,400 s, the gateway's cap, for 250 steps of at most
     60 s each plus generation.
+  - The CPU budget is raised to the wall budget (14,400 s; the gateways set
+    `RELIQUARY_SANDBOX_EPISODE_MAX_CPU_S` to match). Each box has 2 CPUs, so a run that keeps
+    both busy for more than 2 h can still use up its CPU budget before the wall does. Both are
+    infra, so either way the slot is redone. A CPU budget of 28,800 s (wall x 2) would make the
+    wall always cut first.
   - The report counts the redone slots per task and reason (`provenance.redone_slots`).
 
 ### How an order picks it
@@ -214,9 +220,6 @@ quote refuses with `exceeds_generation_deadline`. To check before launch.
 - **Redone slots.** A redo replays the same draw, but the tools' outputs (timings, test order)
   may differ. A task redone many times is listed in `redone_slots`. A slot whose redos exhaust
   its attempts counts as a failure in the headline (missing row).
-- **CPU budget.** We count `cpu_s` as a model limit: the CPU time of the commands the model ran.
-  The leaderboard has no CPU cap. If test-heavy tasks hit 3,600 s, raise the gateway's
-  `EPISODE_MAX_CPU_S` and the profile's budget, rather than reclassify it.
 - **Cost limit.** No equivalent: there is no $3 cost cap. The 250-turn and context caps bound a
   run.
 - **Transcript budget.** The gateway's transcript budget is 8 MiB, with outputs capped at 64 KiB
@@ -247,8 +250,8 @@ New in this work:
 - The signed grade document keeps `stop`, so `stop_reasons` is filled for signed SWE.
 - `limit_cuts`: `{rows, by_stop, box_state_passed}`, when a profile counts limit cuts as failures.
   It shows how many cut runs had a passing box anyway.
-- `limit_cuts` also counts the model-budget closes (`budget:max_calls`, `budget:cpu_s`,
-  `budget:transcript_bytes`).
+- `limit_cuts` also counts the model-budget closes (`budget:max_calls`,
+  `budget:transcript_bytes`). A `cpu_s` close is a redone slot instead.
 - `full_benchmark`: the over-500 bracket (section 1).
 - `provenance.episode`: the run configuration (section 3).
 - `provenance.redone_slots`: `{redone, by_reason, by_problem}`. These are the sandbox sessions of

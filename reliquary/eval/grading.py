@@ -795,7 +795,7 @@ class EpisodeJobRows:
                         "instance_id": named}
                 closed = document.get("closed")
                 if score is not None and isinstance(closed, Mapping):
-                    # The box's call, CPU or transcript budget: the model spent it; no grading ran.
+                    # The box's call or transcript budget: the model spent it; no grading ran.
                     meta = {**meta, "limit_cut": f"budget:{closed.get('reason')}", "box_reward": None,
                             "box_success": False}
                     score = 0.0

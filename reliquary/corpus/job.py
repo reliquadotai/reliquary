@@ -179,9 +179,10 @@ class EpisodeProfile:
     max_total_tokens: int
     per_call_timeout_s: int
     # The sandbox wall budget at least: an infra limit (a slow GPU, a busy gateway) must not cut
-    # an episode the model would have finished within its own limits.
+    # an episode the model would have finished within its own limits. The CPU budget is at least
+    # the wall budget too: CPU time depends on the gateway's hardware, an infra limit.
     min_wall_s: int
-    # Episodes cut by a model limit (turns, context, the box's call, CPU or transcript budget)
+    # Episodes cut by a model limit (turns, context, the box's call or transcript budget)
     # score 0 in the headline, as the reference leaderboard counts them. Infra ends (wall time,
     # a lost miner or gateway) score nothing: the slot is redone, on the same public draw.
     limit_cut_fails: bool
@@ -204,9 +205,9 @@ EPISODE_TOKENS_CEILING = max([MAX_EPISODE_TOTAL_TOKENS,
 # Why an episode stopped before the agent submitted: a profile with limit_cut_fails scores it 0.
 LIMIT_STOPS = ("max_turns", "context_length")
 # The machine's budget closes (signed final `budget_exhausted`, stop `episode_closed`) the model's
-# own calls caused: under such a profile a scored 0, never an unpaid redo. Wall time (`expired`) is
-# not among them.
-MODEL_BUDGET_REASONS = frozenset({"max_calls", "cpu_s", "transcript_bytes"})
+# own calls caused: under such a profile a scored 0, never an unpaid redo. Wall time (`expired`)
+# and CPU time (`cpu_s`, which depends on the gateway's hardware) are infra: the slot is redone.
+MODEL_BUDGET_REASONS = frozenset({"max_calls", "transcript_bytes"})
 
 
 def scores_model_closes(episode) -> bool:
@@ -669,7 +670,7 @@ def _bounded_int(raw: Mapping[str, Any], field: str, low: int, high: int, label:
     return value
 
 
-def _parse_sandbox(raw: Any, package: str) -> SandboxSpec:
+def _parse_sandbox(raw: Any, package: str, profile: EpisodeProfile | None = None) -> SandboxSpec:
     raw = _fields(raw, _SANDBOX_FIELDS, "episode.sandbox")
     if raw["env"] != package:
         raise JobError(f"episode.sandbox.env must be the episode's package {package!r}")
@@ -686,8 +687,11 @@ def _parse_sandbox(raw: Any, package: str) -> SandboxSpec:
     if not isinstance(commit, str) or not _COMMIT_RE.match(commit):
         raise JobError("episode.sandbox.sandbox_commit must be a 40-hex commit")
     budgets_raw = _fields(raw["budgets"], SANDBOX_BUDGET_FIELDS, "episode.sandbox.budgets")
+    # An eval profile's CPU budget reaches its wall budget (the gateways serving one raise their
+    # EPISODE_MAX_CPU_S to match): CPU time is an infra limit, the wall must cut first.
+    bounds = {**_SANDBOX_BUDGET_BOUNDS, **({"cpu_s": profile.min_wall_s} if profile else {})}
     budgets = SandboxBudgets(**{
-        name: _bounded_int(budgets_raw, name, 1, _SANDBOX_BUDGET_BOUNDS[name],
+        name: _bounded_int(budgets_raw, name, 1, bounds[name],
                            "episode.sandbox.budgets")
         for name in SANDBOX_BUDGET_FIELDS})
     return SandboxSpec(env=raw["env"], env_package=env_package, tools=tuple(tools),
@@ -758,7 +762,7 @@ def _parse_episode(raw: Any, eval_job: bool = False) -> EpisodeSpec:
     if execution == EXECUTION_SIGNED_SANDBOX:
         if "sandbox" not in raw:
             raise JobError("a signed_sandbox episode needs episode.sandbox")
-        sandbox = _parse_sandbox(raw["sandbox"], env["package"])
+        sandbox = _parse_sandbox(raw["sandbox"], env["package"], profile)
     elif "sandbox" in raw:
         raise JobError("episode.sandbox is only for execution 'signed_sandbox'")
     harness_spec = None
@@ -825,6 +829,9 @@ def _check_profile(episode: EpisodeSpec, profile: EpisodeProfile) -> None:
     if budgets.wall_s < profile.min_wall_s:
         raise JobError(f"episode.profile {episode.profile!r}: episode.sandbox.budgets.wall_s must be "
                        f"at least {profile.min_wall_s}")
+    if budgets.cpu_s < budgets.wall_s:
+        raise JobError(f"episode.profile {episode.profile!r}: episode.sandbox.budgets.cpu_s must be at "
+                       f"least wall_s ({budgets.wall_s}), so the wall budget cuts first")
 
 
 def _parse_bridge(raw: Any) -> dict[str, Any]:

@@ -834,7 +834,7 @@ class ClosedSandboxRunner(FakeSandboxRunner):
         return result
 
 
-@pytest.mark.parametrize("reason", ["max_calls", "transcript_bytes", "cpu_s"])
+@pytest.mark.parametrize("reason", ["max_calls", "transcript_bytes"])
 def test_a_profiles_model_budget_close_is_returned_for_submission(tmp_path, monkeypatch, reason):
     """Under an eval profile the model's own budget close is a scored 0, submitted like a graded
     episode; without one (below) it stays unusable and its slot is played again."""
