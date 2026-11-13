@@ -14,7 +14,14 @@ from collections.abc import Mapping
 SANDBOX_DISTRIBUTION = "reliquary-sandbox"
 # The reliquary-sandbox commit this build verifies and drives. A job's contract pins
 # its own (`episode.sandbox.sandbox_commit`); both must agree.
-SANDBOX_COMMIT = "f8c208bd35848a13cf5b9e44b64309d835d1d81e"
+SANDBOX_COMMIT = "7743b57410bd10c8d30217388b28c2c589f39e31"  # release-2026-11-13
+# Earlier releases this one serves identically: the same option digests, bridged env
+# identities and task fingerprints for every task without a network or sidecars. A job
+# pinning one keeps running across the release, and an install still at one is accepted.
+COMPATIBLE_SANDBOX_COMMITS = frozenset({
+    SANDBOX_COMMIT,
+    "f8c208bd35848a13cf5b9e44b64309d835d1d81e",
+})
 
 
 class SandboxUnavailable(RuntimeError):
@@ -44,11 +51,11 @@ def _installed_commit() -> str | None:
 
 def sandbox_commit_refusal(pinned: str) -> str | None:
     """Why this process cannot serve a job pinning reliquary-sandbox at `pinned`, or None."""
-    if pinned != SANDBOX_COMMIT:
+    if pinned not in COMPATIBLE_SANDBOX_COMMITS:
         return (f"the job pins reliquary-sandbox {pinned}, this build supports "
                 f"{SANDBOX_COMMIT}")
     installed = _installed_commit()
-    if installed != SANDBOX_COMMIT:
+    if installed not in COMPATIBLE_SANDBOX_COMMITS:
         return f"reliquary-sandbox is installed at {installed}, this build needs {SANDBOX_COMMIT}"
     return None
 
@@ -71,5 +78,5 @@ def transcript_cap_refusal(caps) -> str | None:
     return None
 
 
-__all__ = ["SANDBOX_COMMIT", "SANDBOX_DISTRIBUTION", "SandboxUnavailable",
+__all__ = ["COMPATIBLE_SANDBOX_COMMITS", "SANDBOX_COMMIT", "SANDBOX_DISTRIBUTION", "SandboxUnavailable",
            "require_sandbox", "sandbox_commit_refusal", "transcript_cap_refusal"]

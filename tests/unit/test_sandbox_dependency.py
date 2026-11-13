@@ -58,6 +58,21 @@ def test_historical_job_pins_are_not_served_as_the_new_build(monkeypatch, histor
     assert historical_pin in refusal and "job pins" in refusal
 
 
+PREVIOUS_RELEASE = "f8c208bd35848a13cf5b9e44b64309d835d1d81e"
+
+
+def test_a_job_pinned_at_the_previous_release_keeps_running(monkeypatch):
+    """release-2026-11-13 serves offline tasks identically (option digests, bridged
+    identities, fingerprints): jobs created before it are not refused by new builds."""
+    assert PREVIOUS_RELEASE in sandbox.COMPATIBLE_SANDBOX_COMMITS
+    assert sandbox.SANDBOX_COMMIT in sandbox.COMPATIBLE_SANDBOX_COMMITS
+    monkeypatch.setattr(sandbox, "_installed_commit", lambda: sandbox.SANDBOX_COMMIT)
+    assert sandbox.sandbox_commit_refusal(PREVIOUS_RELEASE) is None
+    monkeypatch.setattr(sandbox, "_installed_commit", lambda: PREVIOUS_RELEASE)
+    assert sandbox.sandbox_commit_refusal(sandbox.SANDBOX_COMMIT) is None
+    assert sandbox.sandbox_commit_refusal(PREVIOUS_RELEASE) is None
+
+
 def test_a_machine_advertising_a_transcript_cap_over_the_wire_cap_is_refused():
     """A machine whose signed transcripts may exceed the submission body's transcript
     cap would sign honest episodes no miner can submit: it is not placed."""
