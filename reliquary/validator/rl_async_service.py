@@ -99,6 +99,12 @@ OUTAGE_MAX_PARAM, OUTAGE_MAX_ENV = "rl_pay_outage_max_s", "RELIQUARY_RL_PAY_OUTA
 # Share of a probation hotkey's repeat out-of-zone scans audited (its first scans always are; rl_submit).
 PROBATION_REPEAT_PARAM, PROBATION_REPEAT_ENV = ("rl_probation_repeat_audit_rate",
                                                 "RELIQUARY_RL_PROBATION_REPEAT_AUDIT_RATE")
+# Share of a past-probation hotkey's out-of-zone groups audited, and the audited passes probation lasts (rl_submit;
+# the same two knobs as an order's audit_q / audit_probation_submissions). Defaults unchanged: 0.15 and 100.
+AUDIT_RATE_PARAM, AUDIT_RATE_ENV = "rl_audit_rate", "RELIQUARY_RL_AUDIT_RATE"
+PROBATION_GROUPS_PARAM, PROBATION_GROUPS_ENV = "rl_probation_groups", "RELIQUARY_RL_PROBATION_GROUPS"
+DEFAULT_RL_AUDIT_RATE = 0.15
+DEFAULT_RL_PROBATION_GROUPS = 100
 BATCH_FACTOR_PARAM, BATCH_FACTOR_ENV = "rl_batch_env_factor", "RELIQUARY_RL_BATCH_ENV_FACTOR"  # per-env batch cap
 BATCH_GROUPS_PARAM, BATCH_GROUPS_ENV = "rl_batch_groups", "RELIQUARY_RL_BATCH_GROUPS"         # the trainer's batch
 # Level-mode tuning: AsyncPriceParams field f is read from RELIQUARY_RL_PRICE_<F> (env) or rl_price_<f> (registry).
@@ -189,6 +195,8 @@ class RlAsyncSettings:
     pay_outage_grace_s: float = 600.0           # a heartbeat silence longer than this is an outage
     pay_outage_max_s: float = 86_400.0          # an outage is filled for at most this long
     probation_repeat_audit_rate: float = 1.0    # repeat out-of-zone scans audited in probation (first scans: all)
+    audit_rate: float = DEFAULT_RL_AUDIT_RATE   # out-of-zone groups audited past probation
+    probation_groups: int = DEFAULT_RL_PROBATION_GROUPS  # audited passes before a hotkey leaves probation
 
     def lane_reserves(self) -> dict[str, int]:
         """env -> buffered groups kept for it: ``lane_reserve`` x the cap, split by the target shares."""
@@ -299,12 +307,17 @@ def rl_async_settings(entry, cap: float, *, run: str | None = None,
         pay_outage_grace_s=float(_switch(params, operator_env, OUTAGE_GRACE_PARAM, OUTAGE_GRACE_ENV, 600.0)),
         pay_outage_max_s=float(_switch(params, operator_env, OUTAGE_MAX_PARAM, OUTAGE_MAX_ENV, 86_400.0)),
         probation_repeat_audit_rate=float(_switch(params, operator_env, PROBATION_REPEAT_PARAM,
-                                                  PROBATION_REPEAT_ENV, 0.25)))
+                                                  PROBATION_REPEAT_ENV, 0.25)),
+        audit_rate=float(_switch(params, operator_env, AUDIT_RATE_PARAM, AUDIT_RATE_ENV, DEFAULT_RL_AUDIT_RATE)),
+        probation_groups=int(_switch(params, operator_env, PROBATION_GROUPS_PARAM, PROBATION_GROUPS_ENV,
+                                     DEFAULT_RL_PROBATION_GROUPS)))
     if switches["pay_carry_periods"] < 0 or switches["pay_carry_max_caps"] < 0 or switches["batch_groups"] < 1:
         raise ValueError("pay carry periods >= 0, carry max caps >= 0, batch groups >= 1")
     if switches["pay_outage_grace_s"] <= 0 or switches["pay_outage_max_s"] < 0 \
-            or not 0.0 <= switches["probation_repeat_audit_rate"] <= 1.0:
-        raise ValueError("outage grace > 0, outage max >= 0, probation repeat audit rate in [0, 1]")
+            or not 0.0 <= switches["probation_repeat_audit_rate"] <= 1.0 \
+            or not 0.0 <= switches["audit_rate"] <= 1.0 or switches["probation_groups"] < 1:
+        raise ValueError("outage grace > 0, outage max >= 0, probation repeat audit rate and audit rate in [0, 1], "
+                         "probation groups >= 1")
     return RlAsyncSettings(task_id=str(entry.task_id), cap=float(cap),
                            run=run or os.environ.get(RUN_ENV) or str(entry.task_id), targets=targets,
                            planned_tokens_per_period=float(params[PLANNED_TOKENS_PARAM]), lease_expiry_s=expiry,
@@ -367,7 +380,9 @@ def build_rl_async(settings: RlAsyncSettings, *, path: str | os.PathLike[str], g
             from reliquary.validator.rl_submit import SubmitConfig
 
             submit_config = SubmitConfig(
-                probation_repeat_audit_rate=getattr(settings, "probation_repeat_audit_rate", 1.0))
+                probation_repeat_audit_rate=getattr(settings, "probation_repeat_audit_rate", 1.0),
+                audit_rate=getattr(settings, "audit_rate", DEFAULT_RL_AUDIT_RATE),
+                probation_groups=getattr(settings, "probation_groups", DEFAULT_RL_PROBATION_GROUPS))
         submissions = RlSubmissions(book, grader, config=submit_config, clock=clock)
         if settings.batch_env_factor is not None:
             submissions.buffer.batch_caps = limits[0].batch_caps
@@ -930,7 +945,8 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
                                       **{key: getattr(settings, key, None) for key in (
                                           "pay_carry_periods", "pay_carry_max_caps", "lane_max_batches",
                                           "batch_env_factor", "pay_outage_fill", "pay_outage_grace_s",
-                                          "pay_outage_max_s", "probation_repeat_audit_rate")}},
+                                          "pay_outage_max_s", "probation_repeat_audit_rate", "audit_rate",
+                                          "probation_groups")}},
                    role="controller", version=settings.run)
     publisher = _public_boards(rl, wallet, validator_hotkey, signer_client)
     audit_model, source = None, audit_source()

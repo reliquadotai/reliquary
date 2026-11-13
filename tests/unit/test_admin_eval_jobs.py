@@ -182,7 +182,8 @@ def test_an_eval_job_takes_its_prompts_model_and_thresholds_from_set_and_qualifi
     # The order's sampling, the one qualification measured.
     assert (job.sampling.temperature, job.sampling.top_p, job.sampling.top_k) == (0.6, 0.95, 20)
     entry = admin.registry["entries"]["order-eval-7"]
-    assert entry.params["audit_q"] == 1.0
+    # Sampled by default (design 2026-11-13): the order audit params at the operator's share.
+    assert entry.params["audit_q"] == 0.05 and entry.params["audit_probation_submissions"] == 20
     toploc = [p for p in entry.contract["proofs"] if p["scheme"] == "toploc-v1"][0]
     assert {k: toploc[k] for k in THRESHOLDS} == THRESHOLDS and toploc["mode"] == "enforce"
     assert list(entry.contract["environments"]) == ["reliquary_logic_v2"]
@@ -192,7 +193,7 @@ def test_an_eval_job_takes_its_prompts_model_and_thresholds_from_set_and_qualifi
 
 @pytest.mark.parametrize("change,status", [
     ({"job_id": "order-7", "task_id": None}, 422),         # eval set without the eval prefix
-    ({"audit_q": 0.5}, 422),
+    ({"audit_q": 1.5}, 422),                                # a share is in (0, 1]
     ({"prompt_count": 9}, 422),                             # more than the set holds
     ({"env": "code"}, 422),
     ({"model": "someone/else"}, 409),
@@ -365,7 +366,9 @@ def test_the_eval_control_status_is_readable_by_the_platform(admin):
 
 # sha256 of the canonical (manifest, task contract, params) of `_eval_job()`,
 # pinned on 7753e5e4 before dataset orders on any model.
-EVAL_JOB_GOLDEN = "b9f0cf09e91a7327a7b54f6962f36d4e34b1618066ba0c040ddaec1bda0c4c6a"
+# Re-pinned 2026-11-13: the eval order's params are now the sampled order audit params (manifest and contract
+# unchanged).
+EVAL_JOB_GOLDEN = "9979c3783e5003b254b64f28d999928d11e1f10862c2c44dc79a1723042bdf3a"
 
 
 def test_an_eval_job_is_declared_byte_identically(admin):

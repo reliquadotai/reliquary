@@ -1286,6 +1286,7 @@ def build_job_manifest(
     min_p=0.0,
     max_prompt_tokens=None,
     judge=None,
+    precision=None,
 ):
     """The manifest as the job store will hold it, refused unless every
     submission it will ever be paid for could be admitted.
@@ -1354,7 +1355,18 @@ def build_job_manifest(
         manifest["submit"] = submit
     if episode is not None:
         manifest["episode"] = episode
-    if judge is not None:
+    from reliquary.corpus.job import PRECISION_BF16, PRECISION_JUDGES
+
+    if precision is not None and precision != PRECISION_BF16:
+        from reliquary.corpus.job import draw_judge_from
+
+        # Another precision: its own judge, the order's thresholds over it, always written (and parse_job
+        # refuses an unknown precision by name).
+        manifest["precision"] = precision
+        base = PRECISION_JUDGES.get(precision)
+        if base is not None:
+            manifest["judge"] = draw_judge_from({**base.to_contract(), **dict(judge or {})}).to_contract()
+    elif judge is not None:
         from reliquary.corpus.job import judge_field
 
         # Some of a forced draw's judge thresholds, the others at their defaults; none written when all are.
@@ -1428,7 +1440,7 @@ def prepare_corpus_job(
     min_new_tokens=2, temperature=1.0, top_p=1.0, top_k=0, n=1, grader_id=None,
     threshold=None, prompt_order="free", deadline_round=None, overrides=None,
     verification=None, seed=None, contract_environment=None, toploc_thresholds=None,
-    submit=None, episode=None, draw=None, judge=None, min_p=0.0, max_prompt_tokens=None,
+    submit=None, episode=None, draw=None, judge=None, min_p=0.0, max_prompt_tokens=None, precision=None,
 ):
     """The manifest and the registry entry `jobs create` writes, built and
     checked without writing either (the admin service declares jobs with it).
@@ -1493,6 +1505,7 @@ def prepare_corpus_job(
         episode=episode,
         draw=draw,
         judge=judge,
+        precision=precision,
     )
     entry = build_corpus_task_entry(
         task_id=task_id or job_id,
@@ -3239,9 +3252,19 @@ def corpus_mine(
         help="A job priced by auction: the samples this hotkey can hold at once (default 1). Leases it cannot "
              "deliver are charged and halve it for an hour",
     ),
+    precision: str = typer.Option(
+        "bf16", "--precision",
+        help="The precision this miner generates in (bf16; fp8 once orders offer it): only orders in it are "
+             "mined, and their audit replays in it",
+    ),
 ) -> None:
     """Generate for the corpus job the validator serves, and submit it. Without --job-id, on a validator that
     lists its orders: mine open orders one after another, each in its own process."""
+    from reliquary.corpus.job import PRECISIONS
+
+    if precision not in PRECISIONS:
+        typer.echo(f"error: --precision must be one of {list(PRECISIONS)}", err=True)
+        raise typer.Exit(code=2)
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
 
     if job_id is None and _served_orders(validator_url) is not None:
@@ -3252,11 +3275,12 @@ def corpus_mine(
                 "--max-steps", str(max_steps)]
         for flag, value in (("--wallet-path", wallet_path or None),
                             ("--gpu-memory-utilization", gpu_memory_utilization),
-                            ("--ask-alpha-per-mtoken", ask_alpha_per_mtoken), ("--ask-capacity", ask_capacity)):
+                            ("--ask-alpha-per-mtoken", ask_alpha_per_mtoken), ("--ask-capacity", ask_capacity),
+                ("--precision", precision)):
             if value is not None:
                 argv += [flag, str(value)]
         follow_orders(list_orders=lambda: _served_orders(validator_url, strict=True),
-                      mine=lambda job: run_child(job, argv), fetch=fetch_model)
+                      mine=lambda job: run_child(job, argv), fetch=fetch_model, precision=precision)
         return
     if TASK_CONTRACT_ENV_VAR not in os.environ:
         _restart_with_served_contract(validator_url, job_id)
@@ -3302,6 +3326,11 @@ def corpus_mine(
     except CorpusJobSelectionError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
+    if job.precision != precision:
+        # Its audit replays in the job's precision: work generated in another one would be refused.
+        typer.echo(f"error: job {job.job_id} is a {job.precision} job; this miner serves {precision} "
+                   f"(--precision)", err=True)
+        raise typer.Exit(code=2)
     if job_id is None:
         others = [served for served in client.served_jobs() if served != job.job_id]
         if others:

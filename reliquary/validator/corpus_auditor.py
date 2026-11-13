@@ -49,6 +49,9 @@ logger = logging.getLogger(__name__)
 VERDICT_SCHEMA = "reliquary/corpus-verdict/v1"
 # A pass withdrawn after the executor that scored it was quarantined.
 VOIDED_SCHEMA = "reliquary/corpus-voided/v1"
+# A caught hotkey's pass that was never audited, settled or not (design 2026-11-13, retroactive invalidation):
+# withdrawn from the delivery and its slot reopened; a settled one stays paid.
+REASON_CAUGHT_UNAUDITED = "caught_unaudited"
 
 RESCAN_SECONDS = 60.0
 # The minute rescan requeues pending records the auditor already knows; the
@@ -268,6 +271,8 @@ class CorpusAuditor:
         # Passes this process wrote, per hotkey (received_at, id), and whether the job's earlier ones
         # were read once: a forfeit then never lists the job again (`_void_forfeited`).
         self._paid: dict[str, list[tuple[float, str]]] = {}
+        # Passes written unaudited, per hotkey, settled or not: a confirmed failure of the hotkey voids them all.
+        self._unaudited: dict[str, set[str]] = {}
         self._paid_loaded = False
         self._voided_ids: set[str] | None = None
         # Pending ids whose draw is known and undrawn: as a sibling they can
@@ -1135,6 +1140,8 @@ class CorpusAuditor:
         elif standing is not None and isinstance(standing.get("received_at"), (int, float)):
             self._paid.setdefault(standing.get("hotkey"), []).append(
                 (float(standing["received_at"]), submission_id))
+        if standing is not None and standing.get("passed") and standing.get("audited") is False:
+            self._unaudited.setdefault(standing.get("hotkey"), set()).add(submission_id)
         decided = getattr(self, "_decided", None)
         if written and decided is not None:
             # Once per record: a decision deferred or held back to a later pass is counted when it lands.
@@ -1491,9 +1498,10 @@ class CorpusAuditor:
         return states
 
     async def _void_forfeited(self, states: Mapping[str, MinerState], now: float) -> list[str]:
-        """Void every written, unsettled pass of these hotkeys that their failures forfeit. The job's
-        verdicts are read once per process (a pass written before a restart counts); after that, the
-        passes this process wrote are enough."""
+        """Void every written, unsettled pass of these hotkeys that their failures forfeit, and every pass of
+        theirs that was never audited, settled or not (``REASON_CAUGHT_UNAUDITED``: out of the delivery, its slot
+        reopened; a settled one stays paid). The job's verdicts are read once per process (a pass written before a
+        restart counts); after that, the passes this process wrote are enough."""
         writer = getattr(self._records, "write_voided", None)
         if not states or writer is None:
             return []
@@ -1522,16 +1530,36 @@ class CorpusAuditor:
                 await self._reopen_slot(sid)
                 forfeited.append(sid)
             self._paid[hotkey] = kept
+            # Every pass of the hotkey nobody audited, paid or not: out of the delivery, its slot redone.
+            withdrawn = set()
+            for sid in sorted(self._unaudited.get(hotkey, ())):
+                if sid in self._voided_ids:
+                    withdrawn.add(sid)
+                    continue
+                document = {"schema": VOIDED_SCHEMA, "submission_id": sid, "hotkey": hotkey,
+                            "reason": REASON_CAUGHT_UNAUDITED, "voided_at": now, "settled": sid in settled,
+                            "forfeit_before": state.forfeit_before}
+                await writer(self._job_id, sid, document)
+                self._voided_ids.add(sid)
+                withdrawn.add(sid)
+                self._report_voided(sid, document)
+                await self._reopen_slot(sid)
+                forfeited.append(sid)
+            if withdrawn:
+                self._unaudited[hotkey] = self._unaudited[hotkey] - withdrawn
+                self._paid[hotkey] = [(t, sid) for t, sid in self._paid[hotkey] if sid not in withdrawn]
         if forfeited:
-            logger.warning("corpus job %s: %d unpaid pass(es) forfeited by confirmed failures of %s",
+            logger.warning("corpus job %s: %d pass(es) forfeited or withdrawn unaudited by confirmed failures of %s",
                            self._job_id, len(forfeited), ", ".join(sorted(states)))
         return forfeited
 
     async def _load_paid(self, settled: set[str]) -> None:
-        """The job's unsettled passing verdicts written before this process (every hotkey: one read for all)."""
+        """The job's unsettled passing verdicts written before this process, and its unaudited passes settled
+        or not (every hotkey: one read for all)."""
         known = {sid for paid in self._paid.values() for _, sid in paid}
+        known |= {sid for ids in self._unaudited.values() for sid in ids}
         ids = [sid for sid in await self._records.list_verdict_ids(self._job_id)
-               if sid not in known and sid not in self._voided_ids and sid not in settled]
+               if sid not in known and sid not in self._voided_ids]
         gate = asyncio.Semaphore(READ_CONCURRENCY)
 
         async def one(sid):
@@ -1539,7 +1567,11 @@ class CorpusAuditor:
                 return sid, await self._records.read_verdict(self._job_id, sid)
 
         for sid, verdict in await gather_owned(one(sid) for sid in ids):
-            if verdict and verdict.get("passed") and isinstance(verdict.get("received_at"), (int, float)):
+            if not verdict or not verdict.get("passed"):
+                continue
+            if verdict.get("audited") is False:
+                self._unaudited.setdefault(verdict.get("hotkey"), set()).add(sid)
+            if sid not in settled and isinstance(verdict.get("received_at"), (int, float)):
                 self._paid.setdefault(verdict.get("hotkey"), []).append((float(verdict["received_at"]), sid))
         self._paid_loaded = True
 

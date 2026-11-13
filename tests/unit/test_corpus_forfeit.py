@@ -51,8 +51,25 @@ def test_a_caught_cheat_voids_its_hotkeys_unpaid_passes_received_before_it():
     auditor = _judge(store, _States({HK: SAMPLED}), _Clock(T0 + 70), beacon=_Beacon())
     asyncio.run(auditor.judge_many([hit]))
     assert store.verdicts[hit]["passed"] is False
-    assert set(store.voided) == set(unpaid)
     assert all(store.voided[sid]["reason"] == "forfeited" for sid in unpaid)
+    # Retroactive invalidation (design 2026-11-13): every other unaudited pass of the hotkey, settled (paid, it
+    # stays paid) or received after the cheat, leaves the delivery; another hotkey's work is untouched.
+    assert set(store.voided) == {*unpaid, *paid, *later}
+    assert all(store.voided[sid]["reason"] == "caught_unaudited" for sid in [*paid, *later])
+    assert [store.voided[sid]["settled"] for sid in paid] == [True, True]
+    assert [store.voided[sid]["settled"] for sid in later] == [False, False]
+
+
+def test_an_audited_pass_of_a_caught_hotkey_stays_delivered():
+    hit = _ids(True, 1)[0]
+    checked = _ids(False, 2, start=100)
+    store = _Store({hit: _rec(1, received_at=T0 + 50)}, settled=checked[:1])
+    for sid in checked:
+        store.verdicts[sid] = {**_paid(sid), "audited": True}
+    auditor = _judge(store, _States({HK: SAMPLED}), _Clock(T0 + 70), beacon=_Beacon())
+    asyncio.run(auditor.judge_many([hit]))
+    # The unsettled one is forfeited (unpaid), the settled audited one stays: each was checked on its own.
+    assert set(store.voided) == {checked[1]} and store.voided[checked[1]]["reason"] == "forfeited"
 
 
 def test_a_held_record_passing_after_its_hotkey_was_caught_is_forfeited_not_paid():

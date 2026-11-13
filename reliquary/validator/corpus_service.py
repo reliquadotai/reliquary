@@ -3082,7 +3082,10 @@ class CorpusJobRoutes:
                      "prompts": getattr(spec, "prompt_count", None),
                      "samples_per_prompt": getattr(spec, "slots_per_prompt", None),
                      "max_new_tokens": getattr(getattr(spec, "sampling", None), "max_new_tokens", None),
-                     "max_prompt_tokens": getattr(spec, "max_prompt_tokens", None)}
+                     "max_prompt_tokens": getattr(spec, "max_prompt_tokens", None),
+                     # Listed only when not bf16: a miner serving another precision skips the order.
+                     "precision": (None if getattr(spec, "precision", "bf16") == "bf16"
+                                   else getattr(spec, "precision", None))}
             entry.update({k: v for k, v in facts.items() if v is not None})
             view = getattr(self.routers[job_id], "auction_view", None)
             try:

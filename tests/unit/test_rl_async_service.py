@@ -1064,6 +1064,30 @@ def test_the_outage_pay_and_the_probation_sampling_are_on_by_default_and_switcha
                           environ={"RELIQUARY_RL_PROBATION_REPEAT_AUDIT_RATE": "2"})
 
 
+def test_the_audit_rate_and_probation_length_keep_their_defaults_and_are_switchable(tmp_path):
+    from reliquary.cli.main import build_task_entry, with_rl_async_params
+    from reliquary.constants import PROTOCOL_PROFILE_ID
+    from reliquary.protocol.profiles import resolve_protocol_profile
+    from reliquary.validator.rl_submit import GroupGrader
+
+    envs = sorted(resolve_protocol_profile(PROTOCOL_PROFILE_ID).environments)[:2]
+    entry = build_task_entry(task_id="rl-async", profile_id=PROTOCOL_PROFILE_ID, cap=0.4, overrides={},
+                             env_split={envs[0]: 0.75, envs[1]: 0.25})
+    declared = with_rl_async_params(entry, planned_tokens_per_period=2e8)
+    plain = rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={})
+    assert (plain.audit_rate, plain.probation_groups) == (0.15, 100)
+    tuned = rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ={
+        "RELIQUARY_RL_AUDIT_RATE": "0.05", "RELIQUARY_RL_PROBATION_GROUPS": "40"})
+    assert (tuned.audit_rate, tuned.probation_groups) == (0.05, 40)
+    for bad in ({"RELIQUARY_RL_AUDIT_RATE": "1.5"}, {"RELIQUARY_RL_PROBATION_GROUPS": "0"}):
+        with pytest.raises(ValueError):
+            rl_async_settings(declared, 0.4, max_tokens=lambda env: 4000, environ=bad)
+    grader = GroupGrader({ENV: MathEnv()}, Tokenizer(), eos_token_ids=(1,))
+    rl = build_rl_async(settings_for(audit_rate=0.05, probation_groups=40), path=tmp_path / "rl-async.sqlite3",
+                        grader=grader, prompt_range={ENV: (0, 50)}, collector_interval_s=0.0)
+    assert (rl.submissions.config.audit_rate, rl.submissions.config.probation_groups) == (0.05, 40)
+
+
 def test_every_trainer_call_is_a_beat_and_the_heartbeat_never_stops(tmp_path):
     from reliquary.trainer.rl_link import TrainerHeartbeat, TrainerLink
     from reliquary.validator.rl_submit import GroupGrader

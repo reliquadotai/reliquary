@@ -550,9 +550,17 @@ def _generation_status(passed: list[dict], verdicts: list[dict]) -> dict:
     def audited(v):
         return v.get("audited", True) is True
 
-    contributing = {v.get("hotkey") for v in passed}
+    # A forced-draw refusal taints its hotkey only when it was charged (another model, a re-roll, an edit):
+    # drift is refused uncharged and its slot redone. Any other audited failure taints as before.
+    def charged(v):
+        draw = v.get("forced_draw")
+        return draw.get("penalty") is True if isinstance(draw, dict) else True
+
+    # Only unaudited passes rely on their hotkey's record; an audited pass was checked on its own (and a caught
+    # hotkey's unaudited passes are withdrawn, design 2026-11-13).
+    contributing = {v.get("hotkey") for v in passed if not audited(v)}
     tainted = {v.get("hotkey") for v in verdicts
-               if (not v.get("passed") and audited(v)) or v.get("reason") == "banned"}
+               if (not v.get("passed") and audited(v) and charged(v)) or v.get("reason") == "banned"}
     if passed and all(audited(v) for v in passed):
         status = "verified"
     elif passed and not (contributing & tainted):
@@ -941,6 +949,13 @@ async def grade_evaluation(*, eval_id: str, set_ids: Sequence[str],
             if drawn:
                 note = (f"sampling verified: every sample follows the job's public {EVAL_DRAW} draw "
                         "(T=1, full vocabulary), checked on the validator's forward with TOPLOC")
+            elif has_draw(job_rows.job) and job_rows.verdicts:
+                # A sampled audit (design 2026-11-13): a share of the samples, and every sample of a hotkey in
+                # probation or under suspicion, checked against the draw; a caught hotkey's unchecked samples
+                # were withdrawn and redone by others.
+                note = (f"sampling audited on a sample: {job_rows.audited} of {job_rows.verdicts} submissions "
+                        f"checked against the job's public {EVAL_DRAW} draw; the unchecked samples of any "
+                        "hotkey caught were withdrawn and redone")
             provenance = {
                 **dict(provenance), "generation": "sn81-miners", "job_id": job_rows.job.job_id,
                 "miner_hotkeys": len(job_rows.hotkeys),

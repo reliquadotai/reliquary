@@ -103,7 +103,8 @@ def test_an_eval_order_needs_no_qualification(admin, pins):  # noqa: F811
     job, _ = asyncio.run(job_store.read_job("order-eval-p1"))
     assert (job.checkpoint_revision, job.checkpoint_sha256, job.eos_token_id) == (REVISION, PIN_SHA, 151645)
     assert job.sampling.draw == "gumbel_max" and job.seed is not None
-    assert admin.registry["entries"]["order-eval-p1"].params["audit_q"] == 1.0
+    # Sampled by default, as a Batch order (design 2026-11-13).
+    assert admin.registry["entries"]["order-eval-p1"].params["audit_q"] == 0.05
     record = asyncio.run(qual.EvalJobStore().read("order-eval-p1"))
     assert record["schema"] == qual.ORDER_JOB_SCHEMA_V2 and record["kind"] == qual.EVALUATION
     assert record["pin"]["checkpoint_sha256"] == PIN_SHA and "qualification_id" not in record
@@ -122,7 +123,7 @@ def test_a_batch_on_a_frozen_set_is_the_same_order(admin, pins):  # noqa: F811
     assert {k: getattr(job, k) for k in same} == {k: getattr(evaluation, k) for k in same}
     assert job.sampling == evaluation.sampling
     assert job.submit == "scoped"
-    assert admin.registry["entries"]["order-gen-p1"].params["audit_q"] == 1.0
+    assert admin.registry["entries"]["order-gen-p1"].params["audit_q"] == 0.05
     record = asyncio.run(qual.EvalJobStore().read("order-gen-p1"))
     assert record["kind"] == qual.GENERATION and record["seed"] == 11
 
@@ -167,7 +168,10 @@ def test_a_batch_on_an_env_range(admin, pins, monkeypatch):  # noqa: F811
 
 @pytest.mark.parametrize("change,status,word", [
     ({"revision": None}, 422, "revision"),
-    ({"audit_q": 0.5}, 422, "audit_q"),
+    ({"audit_q": 1.5}, 422, "audit_q"),
+    ({"precision": "fp8"}, 422, "precision_unavailable"),
+    ({"precision": "int4"}, 422, "precision"),
+    ({"audit_waves": True}, 422, "audit_waves"),
     ({"eval_set_id": None}, 422, "eval_set_id"),
     ({"prompt_count": 9}, 422, "holds"),
     ({"prompt_start": 1}, 422, "first problem"),
@@ -442,6 +446,33 @@ def test_the_order_control_compares_the_whole_judge_and_audit_share(admin, pins)
     assert "n" in qualification_refusal(entry, many, declared, None)
     sampled = replace(entry, params={**entry.params, "audit_q": 0.15})
     assert "audit_q" in qualification_refusal(sampled, job, declared, None)
-    assert "every submission" in qualification_refusal(sampled, job, {**declared, "audit_q": 0.15}, None)
+    # An evaluation may be sampled now: its record and its params agree.
+    assert qualification_refusal(sampled, job, {**declared, "audit_q": 0.15}, None) is None
+    # And its precision is its job's.
+    assert "precision" in qualification_refusal(entry, job, {**declared, "precision": "fp8"}, None)
     elsewhere = replace(entry, contract={**entry.contract, "environments": {"reliquary_logic_v2": {}}})
     assert "environments" in qualification_refusal(elsewhere, job, declared, None)
+
+
+def test_an_enabled_precision_is_the_jobs_and_its_records(admin, pins, monkeypatch):  # noqa: F811
+    from reliquary.corpus.job import PRECISION_JUDGES
+    from reliquary.validator.eval_control import qualification_refusal
+
+    monkeypatch.setenv("RELIQUARY_ORDER_PRECISIONS", "bf16,fp8")
+    created = admin("POST", "/admin/v1/jobs", _order(precision="fp8"))
+    assert created.status_code == 201, created.text
+    job, declared = _served("order-eval-p1")
+    assert job.precision == "fp8" and job.judge == PRECISION_JUDGES["fp8"] and declared["precision"] == "fp8"
+    entry = admin.registry["entries"]["order-eval-p1"]
+    assert qualification_refusal(entry, job, declared, None) is None
+    architectures = admin("GET", "/admin/v1/architectures").json()["orders"]
+    assert architectures["precisions"] == ["bf16", "fp8"] and architectures["audit_waves"] is True
+
+
+def test_a_batch_order_audited_in_waves_records_it(admin, pins):  # noqa: F811
+    created = admin("POST", "/admin/v1/jobs", _on_upload(admin, "gen", audit_waves=True,
+                                                         audit_probation_submissions=7))
+    assert created.status_code == 201, created.text
+    _, declared = _served("order-gen-p1")
+    assert declared["audit_waves"] is True
+    assert admin.registry["entries"]["order-gen-p1"].params["audit_probation_submissions"] == 7
