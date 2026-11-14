@@ -306,3 +306,25 @@ def test_the_box_end_is_the_first_close_with_the_machines_final_and_a_withdrawal
     assert failed.ended_at is None and held_seconds(failed, clock.now + 5_000) == 0.0
     assert failed.ended_status is None and "ended_status" not in failed.to_document()
     assert held_seconds(failed, clock.now + 5_000, presented=True) == failed.closed_at - failed.issued_at
+
+
+def test_a_corpus_issuer_records_only_the_grading_pool_abort(tmp_path, monkeypatch):
+    """Without record_faults (the corpus issuer), the gateway's grading-pool abort is still kept: a draw lease
+    whose episode it ended is not charged (`corpus_lease_faults`); any other abort stays the miner's."""
+    env = build(tmp_path)
+    real = sessions_module.verify_transcript
+    reasons = iter(["the grading pool stayed full", "the agent asked for too much"])
+
+    def aborted(*args, **kwargs):
+        result = real(*args, **kwargs)
+        final = {**result.final.to_dict(), "status": "aborted", "reason": next(reasons)}
+        return SimpleNamespace(ok=result.ok, claims=result.claims, reasons=result.reasons,
+                               final=SimpleNamespace(status="aborted", to_dict=lambda: final))
+
+    monkeypatch.setattr(sessions_module, "verify_transcript", aborted)
+    found = []
+    for seed in (0, 1):
+        grant = open_(env, seed)
+        close(env, grant, "graded")
+        found.append(env.book.get(grant.session_id).fault)
+    assert found == ["grading_pool", None]

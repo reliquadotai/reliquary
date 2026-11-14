@@ -3246,7 +3246,8 @@ def corpus_mine(
     ),
 ) -> None:
     """Generate for the corpus job the validator serves, and submit it. Without --job-id, on a validator that
-    lists its orders: mine open orders one after another, each in its own process."""
+    lists its orders: mine its open single-turn orders one after another, each in its own process (agentic
+    orders are `corpus mine-agentic`'s)."""
     from reliquary.miner.env_packages import startup_check
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
 
@@ -3254,7 +3255,8 @@ def corpus_mine(
     startup_check(sync_envs=sync_envs)
 
     if job_id is None and _served_orders(validator_url) is not None:
-        from reliquary.miner.order_follow import fetch_model, follow_orders, run_child
+        from reliquary.miner.agentic_follow import http_listing
+        from reliquary.miner.order_follow import fetch_model, follow_orders, run_child, single_turn_filter
 
         argv = ["--validator-url", validator_url, "--wallet-name", wallet_name, "--hotkey", hotkey,
                 "--max-steps", str(max_steps)]
@@ -3264,7 +3266,8 @@ def corpus_mine(
             if value is not None:
                 argv += [flag, str(value)]
         follow_orders(list_orders=lambda: _served_orders(validator_url, strict=True),
-                      mine=lambda job: run_child(job, argv), fetch=fetch_model)
+                      mine=lambda job: run_child(job, argv), fetch=fetch_model,
+                      takes=single_turn_filter(http_listing(validator_url)[1]))
         return
     if TASK_CONTRACT_ENV_VAR not in os.environ:
         _restart_with_served_contract(validator_url, job_id)
@@ -3367,7 +3370,9 @@ def corpus_mine(
 @corpus_app.command("mine-agentic")
 def corpus_mine_agentic(
     validator_url: str = typer.Option(..., "--validator-url"),
-    job_id: str = typer.Option(..., "--job-id", help="The episode job to mine"),
+    job_id: str = typer.Option(
+        None, "--job-id",
+        help="The episode job to mine; omitted, follow the validator's open agentic orders (best paying first)"),
     wallet_name: str = typer.Option("default"),
     hotkey: str = typer.Option("default"),
     wallet_path: str = typer.Option(os.getenv("BT_WALLET_PATH", "")),
@@ -3382,7 +3387,7 @@ def corpus_mine_agentic(
     validator_hotkey: str = typer.Option(
         None, "--validator-hotkey",
         help="The validator's ss58 hotkey; signed-sandbox jobs sign their session requests "
-             "for it"),
+             "for it. Omitted, the one the validator names in /corpus/jobs (sandbox_hotkey)"),
     max_live_per_job: int = typer.Option(
         64, "--max-live-per-job", min=1,
         help="Signed-sandbox jobs: this miner's upper bound on live sessions at once for a hotkey "
@@ -3395,9 +3400,31 @@ def corpus_mine_agentic(
         True, "--sync-envs/--no-sync-envs",
         help="At start, install the agentic orders' env packages and harness that are missing or not at this "
              "build's pins (`reliquary miner-envs --sync`); the check is logged either way"),
+    ask_alpha_per_mtoken: float = typer.Option(
+        None, "--ask-alpha-per-mtoken",
+        help="An order priced by auction: the alpha per million verified tokens this hotkey works for"),
+    ask_capacity: int = typer.Option(
+        None, "--ask-capacity",
+        help="An order priced by auction: the samples this hotkey holds at once (default: its --concurrency)"),
+    max_jobs: int = typer.Option(
+        1, "--max-jobs", min=1,
+        help="Following orders (no --job-id): orders mined at once, each in its own process and vLLM, with an "
+             "even share of --concurrency. With --gpus, one card each; without, they split the card's memory"),
+    gpus: str = typer.Option(
+        "", "--gpus",
+        help="Following orders: comma-separated CUDA devices, one per order mined at once (--max-jobs left at 1 "
+             "becomes their count)"),
+    model: list[str] = typer.Option(
+        [], "--model",
+        help="Following orders: mine only orders on this model (repo or repo@revision); repeatable"),
+    max_context: int = typer.Option(
+        None, "--max-context",
+        help="Following orders: skip orders whose episodes take more tokens than this card holds"),
 ) -> None:
     """Mine an agentic (episode) corpus job against a local vLLM with per-turn
-    proofs. A SWE replay job (harness bash) runs verifiers + reliquary-swe episodes
+    proofs. Without --job-id, follow the validator's open agentic orders: the ones this install
+    serves (env package at the order's pin, sandbox extra, --model, --max-context), best paying first,
+    each in its own process, the next one when it ends. A SWE replay job (harness bash) runs verifiers + reliquary-swe episodes
     and needs Docker and the job's pinned reliquary-swe, verifiers and renderers.
     A signed-sandbox SWE job needs no Docker: every tool call runs on the
     validator's sandbox machines (it needs `--validator-hotkey` and the
@@ -3409,6 +3436,16 @@ def corpus_mine_agentic(
     setup_logging("INFO")
     startup_check(sync_envs=sync_envs)
 
+    if job_id is None:
+        _follow_agentic_orders(
+            validator_url=validator_url, validator_hotkey=validator_hotkey, max_jobs=max_jobs, gpus=gpus,
+            models=model, max_context=max_context, port=port, concurrency=concurrency,
+            gpu_memory_utilization=gpu_memory_utilization,
+            argv=_agentic_child_argv(
+                validator_url=validator_url, wallet_name=wallet_name, hotkey=hotkey, wallet_path=wallet_path,
+                episodes=episodes, max_num_seqs=max_num_seqs, max_live_per_job=max_live_per_job,
+                ask_alpha_per_mtoken=ask_alpha_per_mtoken, ask_capacity=ask_capacity))
+        return
     if TASK_CONTRACT_ENV_VAR not in os.environ:
         _restart_with_served_contract(validator_url, job_id)
     import bittensor as bt
@@ -3484,9 +3521,18 @@ def corpus_mine_agentic(
     if signed:
         from reliquary.miner.signed_episode import HttpSandboxSessions
 
+        from reliquary.miner.agentic_follow import served_sandbox_hotkey
+
+        served = served_sandbox_hotkey(validator_url)
+        if validator_hotkey and served and served != validator_hotkey:
+            typer.echo(f"error: --validator-hotkey {validator_hotkey} is not the hotkey this validator names "
+                       f"({served}): its session requests would be refused", err=True)
+            raise typer.Exit(code=2)
+        validator_hotkey = validator_hotkey or served
         if not validator_hotkey:
             typer.echo("error: a signed-sandbox job needs --validator-hotkey (the validator's "
-                       "ss58 hotkey: session requests are signed for it)", err=True)
+                       "ss58 hotkey: session requests are signed for it); this validator does not "
+                       "name it in /corpus/jobs", err=True)
             raise typer.Exit(code=2)
         try:
             sessions = HttpSandboxSessions(httpx.Client(base_url=validator_url, timeout=60.0),
@@ -3509,12 +3555,20 @@ def corpus_mine_agentic(
                         sign=lambda body: sign_corpus_submission(wallet, body),
                         episodes=episodes or None,
                         sign_binding=lambda binding: wallet.hotkey.sign(binding).hex(),
-                        sign_lease=lambda body: sign_corpus_lease(wallet, body))
-    counts = asyncio.run(run_agentic_miner(
+                        sign_lease=lambda body: sign_corpus_lease(wallet, body),
+                        ask_alpha_per_mtoken=ask_alpha_per_mtoken,
+                        ask_capacity=ask_capacity if ask_capacity is not None else (
+                            concurrency if ask_alpha_per_mtoken is not None else None))
+    from reliquary.miner.agentic_miner import STOPPED_EXIT_CODE, until_terminated
+
+    counts = asyncio.run(until_terminated(run_agentic_miner(
         job=job, checkpoint_dir=directory, proof=proof, tokenizer=load_tokenizer(directory),
         identities=[identity], client=client, concurrency=concurrency, port=port,
         gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs,
-        sessions=sessions, max_live_per_job=max_live_per_job, source=source))
+        sessions=sessions, max_live_per_job=max_live_per_job, source=source)))
+    if counts is None:
+        typer.echo("stopped (SIGTERM): running episodes cancelled, their leases released", err=True)
+        raise typer.Exit(code=STOPPED_EXIT_CODE)
     typer.echo({hotkey_: dict(c) for hotkey_, c in counts.items()})
     halted = [hotkey_ for hotkey_, c in counts.items()
               if c.get("halted") or c.get("identity_crashed")]
@@ -3524,6 +3578,38 @@ def corpus_mine_agentic(
         typer.echo(f"error: mining stopped for {', '.join(h[:8] for h in halted)}{hint}",
                    err=True)
         raise typer.Exit(code=3)
+
+
+def _agentic_child_argv(*, validator_url, wallet_name, hotkey, wallet_path, episodes, max_num_seqs,
+                        max_live_per_job, ask_alpha_per_mtoken, ask_capacity) -> list[str]:
+    """The options every order's `corpus mine-agentic --job-id` child takes from its parent."""
+    argv = ["--validator-url", validator_url, "--wallet-name", wallet_name, "--hotkey", hotkey,
+            "--episodes", str(episodes), "--max-num-seqs", str(max_num_seqs),
+            "--max-live-per-job", str(max_live_per_job)]
+    for flag, value in (("--wallet-path", wallet_path or None), ("--ask-alpha-per-mtoken", ask_alpha_per_mtoken),
+                        ("--ask-capacity", ask_capacity)):
+        if value is not None:
+            argv += [flag, str(value)]
+    return argv
+
+
+def _follow_agentic_orders(*, validator_url, validator_hotkey, max_jobs, gpus, models, max_context, port,
+                           concurrency, gpu_memory_utilization, argv) -> None:
+    from reliquary.miner import agentic_follow as follow
+    from reliquary.miner.order_follow import fetch_model
+
+    devices = [d.strip() for d in gpus.split(",") if d.strip()]
+    if devices and max_jobs == 1:
+        max_jobs = len(devices)
+    list_jobs, read_manifest = follow.http_listing(validator_url)
+    follower = follow.AgenticFollower(
+        list_jobs=list_jobs, read_manifest=read_manifest, fetch=fetch_model, max_jobs=max_jobs,
+        limits=follow.Limits(models=frozenset(models), max_context=max_context),
+        validator_hotkey=validator_hotkey,
+        fits=follow.memory_fit(max_jobs=max_jobs, gpus=devices, gpu_memory_utilization=gpu_memory_utilization),
+        launch=follow.popen_launcher(argv, max_jobs=max_jobs, port=port, concurrency=concurrency, gpus=devices,
+                                     gpu_memory_utilization=gpu_memory_utilization))
+    follow.run_until_terminated(follower)
 
 
 @corpus_app.command("status")

@@ -921,6 +921,19 @@ _NEVER_TALLIED = frozenset({"environment_unserved"})
 """Refusals that are our state whether or not the issuer queues (an env no machine serves): never tallied."""
 
 
+# The open refusals that are our side's, not the miner's: the fleet (capacity, placement, saturation, an env no
+# machine serves), our stores and directory, a task or ledger we could not read. A draw lease whose open met one is
+# not charged (`corpus_lease_faults`).
+OURS_REFUSALS = frozenset(CAPACITY_REFUSALS | {
+    "sandbox_capacity", "directory_unavailable", "store_unavailable", "task_unavailable", "ledger_unavailable",
+    "job_not_ready"})
+# A quota refusal (`corpus_quota`) of a hotkey within its own allowance: the fleet was full, or not known yet.
+QUOTA_FLEET_REFUSALS = frozenset({"fleet", "no fleet capacity known yet"})
+OURS_REFUSALS_KEPT_S = 6 * 3600
+OURS_REFUSALS_PER_KEY = 16
+OURS_REFUSALS_MAX_KEYS = 50_000
+
+
 class SessionIssuer:
     def __init__(self, *, book: SessionBook, store, fleet, signer, token_verifier,
                  engagements: Mapping[str, EngagementBook], policy: SandboxPolicy,
@@ -942,6 +955,9 @@ class SessionIssuer:
         self._lock = asyncio.Lock()
         self._tasks: set[asyncio.Task] = set()
         self._refused_opens: dict[str, list[int]] = {}     # hotkey -> refusal times
+        # (hotkey, job_id, prompt_index) -> [(time, reason)] of the corpus opens our side refused
+        # (`OURS_REFUSALS`, a fleet-full quota refusal): `refused_ours` reads it for the draw leases.
+        self._ours_refused: dict[tuple[str, str, int], list[tuple[int, str]]] = {}
         self._unserved_alerted: set[tuple] = set()          # (env, package, options) already ALERTed
         # Sessions whose ``submitted`` record is stored ahead of the book (``persist_submitted``).
         self._stored_submitted: set[str] = set()
@@ -1215,11 +1231,13 @@ class SessionIssuer:
         if isinstance(terms, Refusal):
             self._event("open_refused", terms.reason, None, None, None)
             self._capacity_refused(hotkey, engagement, terms)
+            self._note_ours(hotkey, engagement, terms)
             return terms
         outcome = await self._issue(hotkey, request_id, digest, engagement, terms, generation)
         if isinstance(outcome, Refusal):
             self._event("open_refused", outcome.reason, getattr(terms, "env", None),
                         getattr(terms, "engagement", None), getattr(terms, "image", None))
+            self._note_ours(hotkey, engagement, outcome, terms)
         self._capacity_refused(hotkey, engagement, outcome, terms)
         return outcome
 
@@ -1235,6 +1253,43 @@ class SessionIssuer:
             declare(hotkey, engagement.get("job_id"), engagement.get("want"), int(self._clock()))
         except Exception:
             logger.exception("the corpus quota could not keep the want of %s", hotkey[:12])
+
+    def _note_ours(self, hotkey: str, engagement: Mapping[str, Any], refusal: Refusal, terms=None) -> None:
+        """Remember a corpus open our side refused, for the draw lease of that prompt (`refused_ours`). Ours:
+        `OURS_REFUSALS`, except a saturation or full queue of the miner's own operator's making (`_self_caused`, as
+        `_capacity_refused` judges it); and a quota refusal only when the hotkey was within its own allowance (the
+        fleet itself was full, or not known yet), never one over its own allowance."""
+        if engagement.get("kind") != "corpus":
+            return
+        ours = refusal.reason in OURS_REFUSALS
+        if ours and refusal.reason in CAPACITY_REFUSALS and terms is not None:
+            try:
+                ours = not self._self_caused(hotkey, terms, refusal)
+            except Exception:
+                logger.exception("the saturation attribution failed; the refusal is not excused")
+                ours = False
+        if not ours and refusal.reason == "quota_live":
+            ours = (refusal.detail or {}).get("why") in QUOTA_FLEET_REFUSALS
+        if not ours:
+            return
+        job_id, index = engagement.get("job_id"), engagement.get("prompt_index")
+        if not isinstance(job_id, str) or isinstance(index, bool) or not isinstance(index, int):
+            return
+        now = int(self._clock())
+        key = (str(hotkey), job_id, index)
+        kept = [(at, why) for at, why in self._ours_refused.get(key, ()) if at >= now - OURS_REFUSALS_KEPT_S]
+        self._ours_refused[key] = [*kept[-(OURS_REFUSALS_PER_KEY - 1):], (now, refusal.reason)]
+        if len(self._ours_refused) > OURS_REFUSALS_MAX_KEYS:
+            for stale in [k for k, v in self._ours_refused.items() if v[-1][0] < now - OURS_REFUSALS_KEPT_S]:
+                del self._ours_refused[stale]
+
+    def refused_ours(self, hotkey: str, job_id: str, prompt_index: int,
+                     since: float) -> tuple[int, str] | None:
+        """``(when, reason)`` of the last corpus open of ``hotkey`` on this prompt our side refused at or after
+        ``since``, or None."""
+        found = [(at, why) for at, why in self._ours_refused.get((str(hotkey), str(job_id), int(prompt_index)), ())
+                 if at >= int(since)]
+        return found[-1] if found else None
 
     async def _issue(self, hotkey: str, request_id: str, digest: str, engagement: Mapping[str, Any], terms,
                      generation):
@@ -1518,6 +1573,10 @@ class SessionIssuer:
             final = result.final.to_dict()
             if self._record_faults and not withdraw:
                 fault = runtime_start_fault(final) or pool_abort_fault(final)
+            elif not withdraw:
+                # A corpus session keeps only the gateway's grading-pool abort: other miners' gradings held its
+                # machine, never this miner's doing (its draw lease is not charged: `corpus_lease_faults`).
+                fault = pool_abort_fault(final)
         state = (CLOSED if withdraw else ABORTED if status == STATUS_ABORTED
                  else CLOSED_GRADED if status == STATUS_GRADED or self._submittable_close(record, final)
                  else CLOSED)

@@ -1675,6 +1675,7 @@ def build_corpus_router(
     durable_records: bool | None = None,
     pending_record_arrivals: dict[str, float] | None = None,
     auction=None,
+    lease_fault=None,
 ) -> APIRouter:
     """The corpus submission endpoint, over an already-bound job store.
 
@@ -1695,6 +1696,8 @@ def build_corpus_router(
     submit body cap, ``router.body_cap``; without it the minimum applies.
     ``auction`` (``corpus.token_auction.TokenAuction``) prices a draw job by auction: a lease goes only to a hotkey
     whose ask the round admits, carries the round's price, and only a slot the hotkey leased is accepted.
+    ``lease_fault`` (``sandbox.corpus_lease_faults.corpus_lease_fault``) names a lease our side failed: it ends
+    uncharged (``DrawLeases``' ``validator_fault``).
     """
 
     body_cap = worst_case_body(job) if job is not None else MIN_SUBMIT_BODY_BYTES
@@ -1737,9 +1740,9 @@ def build_corpus_router(
         leases = leases_by_job.get(job.job_id)
         if leases is None:
             if auction is None:
-                leases = DrawLeases(job)
+                leases = DrawLeases(job, validator_fault=lease_fault)
             else:
-                leases = DrawLeases(job, limit_per_hotkey=False,
+                leases = DrawLeases(job, limit_per_hotkey=False, validator_fault=lease_fault,
                                     on_unused=lambda lease, held: auction.lease_ended(lease.hotkey, lease.price, held))
                 auction.bind_holdings(leases.counts)
             leases = leases_by_job[job.job_id] = leases
@@ -2991,6 +2994,9 @@ class CorpusJobRoutes:
         # taken turns that continue after their HTTP handler is cancelled.
         self.in_flight: collections.Counter = collections.Counter()
         self.default = default if default is not None else next(iter(self.routers), None)
+        # The ss58 address signed-sandbox session requests are signed for, when this app serves sessions:
+        # `JOBS_PATH` tells miners, so they need no ``--validator-hotkey``.
+        self.sandbox_hotkey: str | None = None
 
     def add(self, job_id: str, router: APIRouter, *, contract: Any = None,
             prompt_source: str | None = None, spec: Any = None) -> None:
@@ -3183,7 +3189,10 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
     @router.get(JOBS_PATH)
     async def corpus_jobs() -> dict:
         # ``jobs``: the ids open to mine now (older miners read it); ``orders``: every served job and its state.
-        return {"jobs": routes.open_jobs(), "orders": routes.orders()}
+        listing = {"jobs": routes.open_jobs(), "orders": routes.orders()}
+        if routes.sandbox_hotkey:
+            listing["sandbox_hotkey"] = routes.sandbox_hotkey
+        return listing
 
     @router.get(JOB_SCOPED_PATH)
     async def corpus_job_scoped(job_id: str) -> dict:

@@ -40,9 +40,55 @@ reliquary corpus mine \
   --ask-alpha-per-mtoken 0.4 --ask-capacity 8
 ```
 
-Without `--job-id` the miner follows the orders by itself: it picks an open order (one on the model it already
-has first), mines it in its own process, and moves to the next when it ends. While no order is open it downloads
-the model of the one that is starting. Pass `--job-id <id>` to mine one order only.
+Without `--job-id` the miner follows the single-turn orders by itself: it picks an open order (one on the model it
+already has first), mines it in its own process, and moves to the next when it ends. While no order is open it
+downloads the model of the one that is starting. Pass `--job-id <id>` to mine one order only.
+
+### Agentic orders (SWE-bench, DeepSWE, SWE-Pro, Terminal-Bench, AutomationBench)
+
+```sh
+reliquary corpus mine-agentic \
+  --validator-url https://api.reliqua.ai \
+  --wallet-name YOUR_WALLET --hotkey YOUR_HOTKEY \
+  --ask-alpha-per-mtoken 0.4 --concurrency 8
+```
+
+Without `--job-id` it follows the agentic orders the same way. At each read of the order list it reads every
+listed order's manifest and keeps the open episode orders this install can serve: the order's env package
+installed at its pin (`reliquary miner-envs`), the sandbox extra for a signed-sandbox order, and, when given, a
+model in `--model` (repo or `repo@revision`, repeatable) and episodes no longer than `--max-context` tokens. Each
+refused order is logged once, with why. It ranks the rest: orders whose auction has leases left first, then by
+price (the auction's price of the moment, else its ceiling), then one on a model already downloaded. It mines the
+best one in its own process (`corpus mine-agentic --job-id`) and starts the next when that one completes. A started
+order that pays less is not dropped for a better one that opens later: its leases are kept to the end.
+
+- **Draining** orders are never stopped: their running episodes are still paid, and the child exits by itself. A
+  **paused** order is waited out; only one paused for 30 minutes, or gone from the list for two reads, is stopped.
+  A stop is a SIGTERM: the child starts nothing more, cancels its running episodes, releases their leases and
+  reports their sandbox sessions, then exits (killed only after 2 minutes). A SIGTERM to the follower itself
+  (pm2, systemd) stops every child that way first.
+- **A failed child** (any non-zero exit: refused start, OOM, halt) is retried after a backoff of 1 minute, doubled
+  per failure of that order in a row, at most an hour.
+
+- **Several at once.** `--max-jobs N` mines up to N orders at once, each with its own vLLM, loopback port
+  (`--port`, `--port`+1, ...) and an even share of `--concurrency` (the episodes in flight in all). Orders go
+  round-robin over `--gpus 0,1,...` (and `--max-jobs` defaults to their count); the orders sharing a card split its
+  memory (`--gpu-memory-utilization`, else 0.9). An order whose model (weights + 4 GiB) does not fit its share of
+  the card is not started there.
+- **The validator's hotkey.** Signed-sandbox orders sign their session requests for the validator's hotkey. The
+  order list names it (`sandbox_hotkey`), so `--validator-hotkey` is needed only against a validator that does not.
+  When both are there and differ, `--validator-hotkey` wins and no signed-sandbox order is mined (its requests
+  would be refused): fix or drop the flag.
+- **Our failures are not yours.** A lease whose episode our side failed is not charged (no debt, no halved
+  capacity), judged from the validator's own records: the last session of that prompt since the lease, when one ran
+  after our last refusal, decides (a drained machine or lost gateway, a `box_failed` box, an abort because other
+  miners' gradings held the grading pool); otherwise an open we refused (the fleet full while you were within your
+  allowance, our task, ledger, store or directory down). A session that ended your way (expired, graded and never
+  submitted, any other abort) is charged. `box_failed` is free at most 48 times a day per hotkey, all orders together.
+- **Auctioned orders.** `--ask-alpha-per-mtoken` (and `--ask-capacity`, default `--concurrency`) is posted before
+  the first lease, as for single-turn orders. Without an offer an auctioned order leases nothing.
+
+`--job-id <id>` mines that one order, as before.
 
 ## The order list
 
@@ -50,6 +96,7 @@ the model of the one that is starting. Pass `--job-id <id>` to mine one order on
 
 ```json
 {"jobs": ["order-gen-..."],
+ "sandbox_hotkey": "5...",
  "orders": [{"job_id": "order-gen-...", "state": "open", "model": "org/name", "revision": "<40 hex>",
              "prompts": 8765, "samples_per_prompt": 1, "max_new_tokens": 8192,
              "pricing": "auction", "auction": {"price_alpha_per_mtoken": 0.31, "ceiling_alpha_per_mtoken": 0.58}}]}
@@ -62,7 +109,8 @@ the model of the one that is starting. Pass `--job-id <id>` to mine one order on
 | `paused` | Admission stopped for now. |
 | `draining` | Generation is over; its last submissions are audited and paid. Nothing new is accepted. |
 
-`jobs` lists the ids open right now. `/corpus/tasks` is the registry's history of every task ever declared, not a
+`jobs` lists the ids open right now. `sandbox_hotkey` is there when the validator serves signed-sandbox sessions:
+the ss58 hotkey their requests are signed for. `/corpus/tasks` is the registry's history of every task ever declared, not a
 list of what to mine.
 
 ## How orders pay: the price auction
