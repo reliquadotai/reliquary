@@ -1,0 +1,7 @@
+# uv --override for the agentic-orders miner venv (docs/mining-orders.md):
+#   uv pip install -e ".[sandbox-miner]" vllm==0.30.0 --override miner-overrides.txt
+# verifiers 0.3.1 (the reliquary-sandbox bridge and every env package run on it) needs mcp<2:
+# verifiers.v1.tasksets imports mcp 1's FastMCP, gone in mcp 2. vLLM 0.30.0 declares mcp>=2, but
+# imports mcp only in `vllm serve`'s MCP tool server, never in the miner's in-process engine.
+# This replaces vLLM's bound with verifiers'; `pip check` then reports vLLM's, and only that one.
+mcp>=1.24.0,<2

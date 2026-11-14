@@ -5,13 +5,20 @@ is on one address: **`https://api.reliqua.ai`**.
 
 ## Install and update
 
-From a clone of this repository, in a Python 3.12 venv (`python3.12 -m venv .venv && source .venv/bin/activate`):
+From a clone of this repository, in a Python 3.12 venv made by [uv](https://docs.astral.sh/uv/)
+(`uv venv --python 3.12 .venv && source .venv/bin/activate`):
 
 ```sh
-git pull && pip install -e ".[sandbox-miner]" && reliquary miner-envs --sync
+git pull && uv pip install -e ".[sandbox-miner]" vllm==0.30.0 --override miner-overrides.txt && reliquary miner-envs --sync
 ```
 
-The same line installs and updates. `sandbox-miner` brings the env packages agentic orders pin, from git at their
+The same line installs and updates. vLLM 0.30.0 is the only engine the forced draw accepts. It declares `mcp>=2`,
+while verifiers 0.3.1, which the env packages run on, declares `mcp<2` and needs it (it imports mcp 1's `FastMCP`),
+so pip finds no solution. vLLM itself imports mcp only for `vllm serve`'s MCP tool server, which the miner never
+starts: `miner-overrides.txt` replaces vLLM's bound with verifiers', which uv applies and pip cannot. `uv pip check`
+(or `pip check`) then reports `vllm ... requires mcp>=2.0.0,<3.0.0`: that line is expected, any other is not.
+`reliquary miner-envs` refuses the bridge when mcp 2 is installed (a plain `pip install vllm` lifts it), and
+`--sync` brings mcp 1 back. `sandbox-miner` brings the env packages agentic orders pin, from git at their
 commits (the validator checks the commit pip records): SWE-bench Verified (`reliquary-swe`), SWE-bench Pro
 (`reliquary-swebench-pro`), DeepSWE (`reliquary-deepswe`), Terminal-Bench 2.1 (`reliquary-terminal-bench`),
 AutomationBench (`reliquary-automationbench`), with the reliquary-sandbox bridge and the reliquary-harness.

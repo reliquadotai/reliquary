@@ -150,12 +150,38 @@ def harness_digest_refusal() -> str | None:
     return probe.stdout.strip() or None
 
 
+# verifiers 0.3.1 needs mcp<2: verifiers.v1.tasksets imports mcp 1's FastMCP. vLLM 0.30.0 declares
+# mcp>=2, so a plain resolve lifts mcp to 2 and every env package fails to import. The miner install
+# overrides vLLM's bound (miner-overrides.txt); a sync reinstalls the bridge, which brings mcp<2 back.
+MCP_OVERRIDE = "mcp>=1.24.0,<2"
+
+
+def _mcp_version() -> str | None:
+    try:
+        return importlib.metadata.version("mcp")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def mcp_refusal() -> str | None:
+    version = _mcp_version()
+    major = (version or "").split(".")[0]
+    if not major.isdigit() or int(major) < 2:
+        return None
+    return (f"mcp {version} is installed, verifiers 0.3.1 needs mcp<2 (install with "
+            "--override miner-overrides.txt)")
+
+
 def env_status() -> list[PackageStatus]:
     statuses = [_status(package) for package in PACKAGES]
     digest = harness_digest_refusal()
     if digest:
         statuses = [PackageStatus(s.package, s.installed, s.problem or digest, s.editable)
                     if s.package is HARNESS else s for s in statuses]
+    mcp = mcp_refusal()
+    if mcp:
+        statuses = [PackageStatus(s.package, s.installed, s.problem or mcp, s.editable)
+                    if s.package is SANDBOX and s.installed else s for s in statuses]
     return statuses
 
 
@@ -281,8 +307,8 @@ def hint(statuses: list[PackageStatus]) -> str | None:
     if not bad:
         return None
     if any(s.package is SANDBOX and s.installed is None and s.problem == "not installed" for s in bad):
-        return ('agentic orders need the miner extra: pip install -e ".[sandbox-miner]" && '
-                "reliquary miner-envs --sync")
+        return ('agentic orders need the miner extra: uv pip install -e ".[sandbox-miner]" vllm==0.30.0 '
+                "--override miner-overrides.txt && reliquary miner-envs --sync")
     if any(_wrong_python(s) for s in bad):
         need = ".".join(map(str, ENV_PYTHON))
         return (f"the agentic env packages are built for Python {need}: mine from a Python {need} venv "

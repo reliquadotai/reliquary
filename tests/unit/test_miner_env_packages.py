@@ -41,6 +41,7 @@ def _fake_install(monkeypatch, installed: dict[str, dict | None], python=(3, 12)
     monkeypatch.setattr(ep, "_commit",
                         lambda name: ((installed.get(name) or {}).get("vcs_info") or {}).get("commit_id"))
     monkeypatch.setattr(ep, "harness_digest_refusal", lambda: None)
+    monkeypatch.setattr(ep, "_mcp_version", lambda: "1.30.0")
     monkeypatch.setattr(sys, "version_info", (*python, 0, "final", 0))
 
 
@@ -196,3 +197,30 @@ def test_the_start_check_syncs_only_an_install_that_took_the_miner_extra(monkeyp
     ep.startup_check(sync_envs=True)
     assert synced == [1]
     assert "sandbox-miner" in ep.hint(ep.env_status())
+
+
+def test_mcp_2_refuses_the_bridge_and_a_sync_reinstalls_it(monkeypatch):
+    """vLLM 0.30.0 asks mcp>=2; verifiers 0.3.1 imports mcp 1's FastMCP, so no env package loads."""
+    _fake_install(monkeypatch, _all_pinned())
+    monkeypatch.setattr(ep, "_mcp_version", lambda: "2.3.0")
+    statuses = ep.env_status()
+    (bridge,) = [s for s in statuses if s.package is ep.SANDBOX]
+    assert "mcp 2.3.0" in bridge.problem and "miner-overrides.txt" in bridge.problem
+    assert [s for s in statuses if not s.ok] == [bridge]
+    uninstall, install = ep.sync_commands(statuses)
+    assert uninstall[-1] == "reliquary-sandbox" and ep.SANDBOX.requirement() in install
+
+
+def test_the_override_file_is_the_bound_the_check_enforces():
+    lines = [line.strip() for line in (ROOT / "miner-overrides.txt").read_text().splitlines()]
+    assert [line for line in lines if line and not line.startswith("#")] == [ep.MCP_OVERRIDE]
+
+
+@pytest.mark.parametrize("doc", ["docs/mining-orders.md", "docs/mining.md"])
+def test_the_documented_install_applies_the_override(doc):
+    from reliquary.miner.vllm_generation import SUPPORTED_VLLM_SERIES
+
+    text = (ROOT / doc).read_text()
+    assert ('uv pip install -e ".[sandbox-miner]" vllm==0.30.0 --override miner-overrides.txt'
+            in text)
+    assert "0.30.0".startswith(SUPPORTED_VLLM_SERIES)
