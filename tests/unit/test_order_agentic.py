@@ -425,7 +425,8 @@ def test_the_control_status_says_what_an_episode_orders_gateways_are_sized_from(
                       "episode_seconds": None, "tokens_per_episode": None, "audit_episodes_per_second": None,
                       "quota_refusals_fleet_full": 0, "demand_sessions": None, "demand_declared_sessions": 0,
                       "demand_forecast_sessions": 0, "demand_hotkeys": 0, "audit_share": 1.0,
-                      "executors_allowed": 1, "audit_capacity_sessions": None, "sessions_target": None,
+                      "executors_allowed": 1, "audit_capacity_sessions": None, "audit_capacity_measured": False,
+                      "sessions_target": None,
                       "binding": None}
     allowed = after["models"][after["jobs"][job_id]["sizing"]["model"]]["executors_allowed"]
     assert after["jobs"][job_id]["sandbox"] == {
@@ -435,7 +436,8 @@ def test_the_control_status_says_what_an_episode_orders_gateways_are_sized_from(
         # Every episode audited: 2 870 tokens/s x the executors allowed / 41 000 x 840 s.
         "demand_sessions": 4, "demand_declared_sessions": 4, "demand_forecast_sessions": 0, "demand_hotkeys": 1,
         "audit_share": 1.0, "executors_allowed": allowed,
-        "audit_capacity_sessions": int(2_870 * allowed / 41_000 * 840), "sessions_target": 4, "binding": "demand"}
+        "audit_capacity_sessions": int(2_870 * allowed / 41_000 * 840), "audit_capacity_measured": True,
+        "sessions_target": 4, "binding": "demand"}
     # The fields it had are kept.
     assert {"state", "prompts_total", "audits_pending", "sizing"} <= set(after["jobs"][job_id])
     json.dumps(after)

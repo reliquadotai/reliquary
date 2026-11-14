@@ -40,7 +40,8 @@ Declared want. The allowance follows the fleet, so a miner that only ever grows 
 many sessions its GPU could run. Once the validator says it reads a declaration (`declares_want` on a grant or a
 quota refusal), every open carries the runner's `want` (its batch: `max_live` unless told less) in its signed
 engagement; the order control sizes the sandbox fleet from it (design 2026-11-13-sandbox-sizing-miner-demand). An
-older validator never sees the field (it refuses unknown ones)."""
+older validator never sees the field (it refuses unknown ones): an open with a want refused `malformed_request`
+(the validator rolled back) turns the declaration off and is sent again without it, under a fresh request id."""
 
 from __future__ import annotations
 
@@ -577,7 +578,13 @@ class SignedSweEpisodeRunner:
             try:
                 grant = await self._send_open(self._open_body(index, request_id))
             except SessionRefused as refused:
-                self._wants.pop(request_id, None)
+                declared = self._wants.pop(request_id, None)
+                if declared is not None and refused.reason == "malformed_request":
+                    # The validator no longer reads the field (a rollback): stop declaring, send it again.
+                    self.declares_want = False
+                    logger.warning("the validator refused %s's declared want on job %s: no longer declaring it",
+                                   self._hotkey[:12], getattr(self._job, "job_id", "?"))
+                    return await self._send_attempts(index, slot)
                 if attempt:
                     await self._close_reused(refused)
                 raise self._note_refusal(refused) from None

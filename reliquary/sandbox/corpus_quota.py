@@ -195,7 +195,7 @@ class CorpusQuota:
         self._weights: dict[str, float] = {}
         self._potentials: dict[str, int] = {}
         self._fleet_full: dict[str, collections.deque[int]] = {}   # job id -> times of its fleet-full refusals
-        self._declared: dict[str, dict[str, tuple[int, int]]] = {}  # job id -> hotkey -> (want, when declared)
+        self._declared: dict[str, dict[str, tuple[int, int, int]]] = {}  # job -> hotkey -> (want, when, peak held)
 
     def install(self) -> None:
         """The session book's per-hotkey caps follow the quota from now on."""
@@ -415,16 +415,22 @@ class CorpusQuota:
 
     # --- declared wants ---
     def declare(self, hotkey: str, job_id: str | None, want: Any, now: float | None = None) -> None:
-        """Keep ``hotkey``'s declared want on ``job_id`` (an authenticated open's ``engagement.want``)."""
+        """Keep ``hotkey``'s declared want on ``job_id`` (an authenticated open's ``engagement.want``), and the most
+        sessions it was seen holding there (the forecast's bound: what it showed it can run, not what it says)."""
         from reliquary.protocol.sandbox_session import MAX_SESSION_WANT
 
         if job_id is None or isinstance(want, bool) or not isinstance(want, int) or want < 1:
             return
         now = int(self._clock() if now is None else now)
-        self._declared.setdefault(str(job_id), {})[str(hotkey)] = (min(int(want), MAX_SESSION_WANT), now)
+        job_id, hotkey = str(job_id), str(hotkey)
+        holds = sum(1 for r in self._book.of_hotkey(hotkey) if r.job_id == job_id and SessionBook._holds(r, now))
+        before = self._declared.get(job_id, {}).get(hotkey)
+        peak = max(holds, 0 if before is None else before[2])
+        self._declared.setdefault(job_id, {})[hotkey] = (min(int(want), MAX_SESSION_WANT), now, peak)
 
-    def declarations(self, now: float | None = None) -> dict[str, dict[str, tuple[int, int]]]:
-        """job id -> hotkey -> (want, when declared), the last FORECAST_WINDOW_S (older ones are dropped)."""
+    def declarations(self, now: float | None = None) -> dict[str, dict[str, tuple[int, int, int]]]:
+        """job id -> hotkey -> (want, when declared, most sessions held there when declaring), the last
+        FORECAST_WINDOW_S (older ones are dropped)."""
         now = int(self._clock() if now is None else now)
         for job_id in list(self._declared):
             kept = {k: v for k, v in self._declared[job_id].items() if v[1] >= now - FORECAST_WINDOW_S}

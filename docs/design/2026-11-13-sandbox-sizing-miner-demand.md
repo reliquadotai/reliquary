@@ -37,8 +37,9 @@ sessions_target = min(demand, episodes_left, audit_capacity)        binding = th
 
   `executors_allowed` is the control's `min(RELIQUARY_ORDER_MAX_AUDIT_EXECUTORS, order's declared executors)`;
   `audit_share` is the auditor's measured share of records it audits (`CorpusAuditor.audit_share`: at least the
-  job's `audit_q`, probation and slow-hotkey audits included). Unknown (no throughput, no audited episode yet) it
-  never binds. At the default 5 % share it rarely binds; at 100 % it does.
+  job's `audit_q`, probation and slow-hotkey audits included). At the default 5 % share it rarely binds; at 100 %
+  it does. Until it is measured (no throughput, no audited episode yet) a conservative prior stands in:
+  `AUDIT_PRIOR_SESSIONS_PER_EXECUTOR` (64) x `executors_allowed`, binding `audit_prior` (never `audit_limited`).
 
 When `binding = audit`, executors already grow to `executors_allowed` with the audit backlog
 (`executors_for_backlog`); beyond that, the order's budget is the limit, and the order shows `audit_limited`.
@@ -66,17 +67,23 @@ time an episode ends).
   visible, so `C` grows; the allowance, which is already the hotkey's potential share of the whole fleet, then grows
   with it, newcomers included when there is spare capacity.
 
-Per job (`order_sandbox_status.job_demand`):
+Per job (`order_sandbox_status.job_demand`), a want counts only as far as the hotkey showed it runs sessions:
 
 ```text
-declared  = sum over hotkeys that declared on the job within 30 min (or still hold a session there)
-            of max(want, held)
+shown     = max(held now, sessions held in the last 10 min, episodes finished in the last 30 min)   (on the job)
+counted   = max(held, min(want, max(4, 2 x shown)))      shown > 0
+          = 1                                             shown = 0, declared in the last 10 min (its first open)
+          = 0                                             shown = 0 after that (a want that never ran a session)
+declared  = sum of counted over hotkeys that declared on the job within 30 min (or still hold a session there)
 undeclared= sessions held on the job by hotkeys that never declared (older miners)
 forecast  = sum over hotkeys idle now (no fresh declaration and no session on another served job)
-            of their latest want on a retired job of the same model, last 6 h
+            of min(want, max(4, 2 x peak)) for their latest declaration on a retired job of the same model, last
+            6 h, where peak is the most sessions the hotkey held on that job when declaring (peak 0: nothing)
 demand    = declared + undeclared + forecast      (None while declared and forecast are both 0)
 ```
 
+A miner's count doubles as its sessions do (it holds what the fleet allows, the fleet grows to twice that, ...),
+which the platform's doubling scale-up follows; one word never rents more than twice what was shown.
 Low-yield hotkeys count nothing. A hotkey is counted once: its own declaration on the job replaces its forecast.
 `None` keeps the platform on its earlier rule, so a fleet of only older miners is sized as today.
 
@@ -87,10 +94,16 @@ better signal, and the env does not matter for signed sandboxes (tools run on th
 
 ### Abuse bounds
 
-A hotkey (or many) may declare 512. That only rents CPU, bounded by: the job's episodes left, the audit capacity,
-the order's paid sessions (its quote's gateway-hours), the daily spend cap, `GATEWAY_MAX` and the hostnames; the
-surplus is released after the scale-down hold. Low-yield hotkeys are excluded; a hotkey must open (signed, served
-job) to declare. The allowance is unchanged, so a declaration buys no sessions.
+A hotkey (or many) may declare 512. It counts one session for 10 minutes, then nothing, unless it actually runs
+sessions; once it does, at most twice what it ran. So N registered hotkeys that never run anything add at most N
+sessions for 10 minutes. Before the audit is measured, the prior caps the job at 64 sessions per allowed executor.
+Beyond that: the job's episodes left, the order's paid sessions (its quote's gateway-hours), the daily spend cap,
+`GATEWAY_MAX` and the hostnames; the surplus is released after the scale-down hold. Low-yield hotkeys are excluded;
+a hotkey must open (signed, served job) to declare. The allowance is unchanged, so a declaration buys no sessions.
+
+A validator rolled back to a version that does not read the field refuses an open carrying it
+(`malformed_request`): the miner then stops declaring and sends that open again without it (a later
+`declares_want` turns it back on).
 
 ## Status fields
 
@@ -98,8 +111,8 @@ job) to declare. The allowance is unchanged, so a declaration buys no sessions.
 
 ```json
 "demand_sessions": 192, "demand_declared_sessions": 128, "demand_forecast_sessions": 64, "demand_hotkeys": 3,
-"audit_share": 0.05, "executors_allowed": 2, "audit_capacity_sessions": 2352,
-"sessions_target": 192, "binding": "demand"
+"audit_share": 0.05, "executors_allowed": 2, "audit_capacity_sessions": 2352, "audit_capacity_measured": true,
+"sessions_target": 192, "binding": "demand"          // binding: demand | episodes | audit | audit_prior
 ```
 
 ## Platform: predictive and fast
@@ -116,7 +129,8 @@ job) to declare. The allowance is unchanged, so a declaration buys no sessions.
   leaves an hour of them.
 - Progressive readiness (platform #201) already lets a new gateway serve the set's first images while the rest pull,
   so the doubled gateways take sessions early.
-- `audit_limited` on the order (like `cpu_limited`) while a job's binding term is the audit.
+- `audit_limited` on the order (like `cpu_limited`) while a job's binding term is the measured audit (`audit`, not
+  `audit_prior`).
 
 ## Cost
 

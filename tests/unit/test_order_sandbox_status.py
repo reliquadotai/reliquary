@@ -9,8 +9,11 @@ pytest.importorskip("reliquary_sandbox")
 
 from reliquary.sandbox.sessions import CLOSED, HANDED_BACK, LIVE, SUBMITTED, SandboxPolicy, SessionBook, SessionRecord
 from reliquary.validator.order_sandbox_status import (
+    AUDIT_PRIOR_SESSIONS_PER_EXECUTOR,
+    NEW_WANT_S,
     WANT_TTL_S,
     EpisodeTokens,
+    activity_by_hotkey,
     audit_capacity_sessions,
     audit_episodes_per_second,
     book_sessions,
@@ -94,7 +97,7 @@ def test_audit_episodes_per_second():
 
 NEW = {"demand_sessions": None, "demand_declared_sessions": None, "demand_forecast_sessions": None,
        "demand_hotkeys": None, "audit_share": None, "executors_allowed": None, "audit_capacity_sessions": None,
-       "sessions_target": None, "binding": None}
+       "audit_capacity_measured": False, "sessions_target": None, "binding": None}
 
 
 def test_the_sandbox_object():
@@ -166,8 +169,9 @@ def test_held_by_hotkey():
 MODEL, OTHER_MODEL = ("Qwen/Qwen3-8B", "r1"), ("Qwen/Qwen3-32B", "r1")
 
 
-def demand(job_id=JOB, *, declarations, held=None, model_of=None, served=None, excluded=lambda hotkey: False):
-    return job_demand(job_id, now=NOW, declarations=declarations, held=held or {},
+def demand(job_id=JOB, *, declarations, held=None, activity=None, model_of=None, served=None,
+           excluded=lambda hotkey: False):
+    return job_demand(job_id, now=NOW, declarations=declarations, held=held or {}, activity=activity or {},
                       model_of=model_of or {JOB: MODEL}, served=served if served is not None else {JOB},
                       excluded=excluded)
 
@@ -177,41 +181,84 @@ def test_the_demand_is_none_until_someone_declares():
     assert out == {"sessions": None, "declared": 0, "forecast": 0, "held_undeclared": 4, "hotkeys": 1}
 
 
-def test_the_demand_sums_declared_wants_and_what_older_miners_hold():
-    out = demand(declarations={JOB: {"5A": (64, NOW - 60), "5B": (16, NOW - 10)}},
-                 held={JOB: {"5A": 10, "5B": 20, "5Old": 4}})
-    # 5B holds more than it declared: what it holds counts.
-    assert out == {"sessions": 64 + 20 + 4, "declared": 84, "forecast": 0, "held_undeclared": 4, "hotkeys": 3}
+def test_a_want_counts_at_most_twice_what_its_hotkey_showed_it_runs():
+    # 5A holds 10 and wants 64: 20 count (its count doubles as its sessions do); 5B holds more than it declared.
+    out = demand(declarations={JOB: {"5A": (64, NOW - 60, 10), "5B": (16, NOW - 10, 20)}},
+                 held={JOB: {"5A": 10, "5B": 20, "5Old": 4}}, activity={JOB: {"5A": (10, 3), "5B": (20, 0)}})
+    assert out == {"sessions": 20 + 20 + 4, "declared": 40, "forecast": 0, "held_undeclared": 4, "hotkeys": 3}
+    # Episodes finished in the last half hour count as shown too (a hotkey between episodes).
+    out = demand(declarations={JOB: {"5A": (64, NOW - 60, 0)}}, activity={JOB: {"5A": (1, 12)}})
+    assert out["sessions"] == 24
+    # Running anything at all: at least WANT_FLOOR.
+    out = demand(declarations={JOB: {"5A": (64, NOW - 60, 0)}}, held={JOB: {"5A": 1}}, activity={JOB: {"5A": (1, 0)}})
+    assert out["sessions"] == 4
+
+
+def test_a_want_that_never_ran_a_session_counts_one_then_nothing():
+    fresh = demand(declarations={JOB: {"5Sybil": (512, NOW - 30, 0)}})
+    assert fresh["sessions"] == 1
+    stale = demand(declarations={JOB: {"5Sybil": (512, NOW - NEW_WANT_S - 1, 0)}})
+    assert stale["sessions"] is None and stale["hotkeys"] == 0
+    # Many registered hotkeys declaring the most each: one session apiece, not 512.
+    many = {f"5S{i}": (512, NOW - 30, 0) for i in range(50)}
+    assert demand(declarations={JOB: many})["sessions"] == 50
 
 
 def test_a_stale_want_counts_only_while_its_hotkey_still_holds_sessions():
     stale = NOW - WANT_TTL_S - 1
-    assert demand(declarations={JOB: {"5A": (64, stale)}})["sessions"] is None
-    assert demand(declarations={JOB: {"5A": (64, stale)}}, held={JOB: {"5A": 1}})["sessions"] == 64
+    assert demand(declarations={JOB: {"5A": (64, stale, 0)}})["sessions"] is None
+    out = demand(declarations={JOB: {"5A": (64, stale, 3)}}, held={JOB: {"5A": 3}}, activity={JOB: {"5A": (3, 0)}})
+    assert out["sessions"] == 6
 
 
 def test_a_low_yield_hotkey_counts_nothing():
-    out = demand(declarations={JOB: {"5A": (64, NOW), "5Bad": (512, NOW)}}, excluded=lambda hotkey: hotkey == "5Bad")
+    out = demand(declarations={JOB: {"5A": (64, NOW, 0), "5Bad": (512, NOW, 0)}},
+                 held={JOB: {"5A": 40}}, excluded=lambda hotkey: hotkey == "5Bad")
     assert out["sessions"] == 64 and out["hotkeys"] == 1
 
 
 def test_a_new_order_is_forecast_from_idle_miners_of_its_model():
     old, other, running = "order-eval-old", "order-eval-32b", "order-eval-running"
-    declarations = {old: {"5A": (64, NOW - 3_600), "5B": (32, NOW - 7_200), "5C": (16, NOW - 600)},
-                    other: {"5D": (128, NOW - 600)},
-                    running: {"5C": (16, NOW - 60)}}
+    declarations = {old: {"5A": (64, NOW - 3_600, 40), "5B": (32, NOW - 7_200, 8), "5C": (16, NOW - 600, 16),
+                          "5Liar": (512, NOW - 600, 0)},
+                    other: {"5D": (128, NOW - 600, 100)},
+                    running: {"5C": (16, NOW - 60, 16)}}
     model_of = {JOB: MODEL, old: MODEL, other: OTHER_MODEL, running: MODEL}
     out = demand(declarations=declarations, model_of=model_of, served={JOB, running})
-    # 5A and 5B mined the retired order of the same model; 5C is busy on a running one; 5D has another model.
-    assert out == {"sessions": 96, "declared": 0, "forecast": 96, "held_undeclared": 0, "hotkeys": 2}
+    # 5A (held 40: 64 count) and 5B (held 8: 16 count) mined the retired order of the same model; 5C is busy on a
+    # running one; 5D has another model; 5Liar never held a session there.
+    assert out == {"sessions": 80, "declared": 0, "forecast": 80, "held_undeclared": 0, "hotkeys": 2}
     # Once 5A opens on the new order its own declaration replaces the forecast (never counted twice).
-    declarations[JOB] = {"5A": (48, NOW)}
+    declarations[JOB] = {"5A": (48, NOW, 0)}
     out = demand(declarations=declarations, model_of=model_of, served={JOB, running})
-    assert (out["sessions"], out["declared"], out["forecast"]) == (80, 48, 32)
+    assert (out["sessions"], out["declared"], out["forecast"]) == (17, 1, 16)
 
 
 def test_the_latest_forecast_want_of_a_hotkey_wins():
     a, b = "order-eval-a", "order-eval-b"
-    declarations = {a: {"5A": (64, NOW - 3_600)}, b: {"5A": (8, NOW - 600)}}
+    declarations = {a: {"5A": (64, NOW - 3_600, 64)}, b: {"5A": (8, NOW - 600, 8)}}
     out = demand(declarations=declarations, model_of={JOB: MODEL, a: MODEL, b: MODEL})
     assert out["forecast"] == 8
+
+
+def test_activity_by_hotkey():
+    book = SessionBook(SandboxPolicy())
+    book.add(rec("live", hotkey="5A"))
+    book.add(rec("lately", hotkey="5A", state=CLOSED, issued=NOW - 2_000, closed=NOW - 300, status="open_failed"))
+    book.add(rec("done", hotkey="5A", state=SUBMITTED, issued=NOW - 2_000, closed=NOW - 1_200, status="graded"))
+    book.add(rec("old", hotkey="5A", state=SUBMITTED, issued=NOW - 9_000, closed=NOW - 4_000, status="graded"))
+    book.add(rec("back", hotkey="5B", state=SUBMITTED, issued=NOW - 900, closed=NOW - 100, status=HANDED_BACK))
+    assert activity_by_hotkey(book, NOW) == {JOB: {"5A": (2, 1), "5B": (1, 0)}}
+
+
+def test_an_unmeasured_audit_is_a_conservative_prior():
+    status = {"state": "open", "submissions_accepted": 0, "audited": 0, "passed": 0}
+    big = {"sessions": 400, "declared": 400, "forecast": 0, "held_undeclared": 0, "hotkeys": 10}
+    out = sandbox_status(job=job(), status=status, reopens=False, held=0, finished=[], tokens_per_episode=None,
+                         tokens_per_second=None, executors_wanted=None, fleet_refusals=0, demand=big,
+                         executors_allowed=2, audit_share=0.05)
+    assert out["audit_capacity_sessions"] is None and out["audit_capacity_measured"] is False
+    assert (out["sessions_target"], out["binding"]) == (2 * AUDIT_PRIOR_SESSIONS_PER_EXECUTOR, "audit_prior")
+    assert sessions_target(400, 400, None, 64) == (64, "audit_prior")
+    assert sessions_target(400, 400, 1_000, 64) == (400, "demand")       # measured: the prior is gone
+    assert sessions_target(30, 400, None, 64) == (30, "demand")

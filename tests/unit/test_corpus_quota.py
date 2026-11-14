@@ -490,8 +490,22 @@ def test_the_quota_keeps_the_last_want_per_job_and_hotkey_for_the_forecast_windo
     for junk in (None, 0, -3, True, "64", 2.5):
         quota.declare("5C", JOB, junk, NOW)
     quota.declare("5C", None, 8, NOW)
-    assert quota.declarations(NOW) == {JOB: {"5A": (48, NOW)}, "other": {"5B": (MAX_SESSION_WANT, NOW)}}
+    assert quota.declarations(NOW) == {JOB: {"5A": (48, NOW, 0)}, "other": {"5B": (MAX_SESSION_WANT, NOW, 0)}}
     assert quota.declarations(NOW + FORECAST_WINDOW_S + 1) == {}
+
+
+def test_a_declaration_remembers_the_most_sessions_its_hotkey_held_there():
+    book = SessionBook(SandboxPolicy())
+    quota, _ = quota_of(book)
+    for prompt in range(3):
+        book.add(rec(f"5A-{prompt}", "5A", prompt))
+    book.add(rec("5A-other", "5A", 9, job="other"))
+    quota.declare("5A", JOB, 64, NOW)
+    assert quota.declarations(NOW)[JOB]["5A"] == (64, NOW, 3)
+    for prompt in range(3):
+        book.add(rec(f"5A-{prompt}", "5A", prompt, state=SUBMITTED, closed=NOW, status="graded"))
+    quota.declare("5A", JOB, 64, NOW + 10)                     # holds none now: the peak stays
+    assert quota.declarations(NOW + 10)[JOB]["5A"] == (64, NOW + 10, 3)
 
 
 def test_a_declared_want_changes_neither_the_allocation_nor_the_allowance():
@@ -614,6 +628,39 @@ def test_a_quota_refusal_also_turns_the_declaration_on(tmp_path):
     refused = tm.SessionRefused("quota_live", {"allowance": 2, WANT_ACCEPTED: True}, retry_after=10.0, status=429)
     signed_runner._note_refusal(refused)
     assert signed_runner.declares_want and signed_runner._declared_want() == 32
+
+
+class RolledBackSessions(tm.FakeSessions):
+    """A validator that read wants, then was rolled back: it refuses the unknown field."""
+
+    def open(self, body):
+        if "want" in body["engagement"]:
+            self.opened.append(body)
+            raise tm.SessionRefused("malformed_request", {"errors": [{"loc": ["engagement", "want"],
+                                                                      "type": "extra_forbidden"}]}, status=422)
+        return super().open(body)
+
+
+def test_a_rolled_back_validator_turns_the_declaration_off_and_the_open_goes_through(tmp_path):
+    signed = tm._transcript(tmp_path)
+    sessions = RolledBackSessions(grant=tm._grant(signed))
+    ids = iter(f"{i:032x}" for i in range(1, 100))
+    signed_runner = tm.runner(sessions, tm.FakeSandboxRunner(signed), max_live=16, new_request_id=lambda: next(ids))
+    signed_runner.declares_want = True
+
+    async def main():
+        return await signed_runner._open(3, object())
+
+    grant = asyncio.run(main())
+    assert grant["session_id"] and not signed_runner.declares_want
+    first, second = sessions.opened
+    assert first["engagement"]["want"] == 16 and "want" not in second["engagement"]
+    assert first["request_id"] != second["request_id"] and signed_runner._wants == {}
+    # Other malformed refusals of an open without a want are raised as before.
+    bare = tm.runner(tm.FakeSessions(refuse=tm.SessionRefused("malformed_request", {}, status=422)),
+                     tm.FakeSandboxRunner(signed), max_live=16)
+    with pytest.raises(tm.SessionRefused):
+        asyncio.run(bare._open(3, object()))
 
 
 def test_the_rl_runner_never_declares():

@@ -1953,7 +1953,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     def sandbox_jobs(document: dict, statuses: dict[str, dict]) -> None:
         """Per served signed episode order, what its sandbox gateways are sized from (`order_sandbox_status`)."""
         from reliquary.validator.order_sandbox_status import (
-            FLEET_FULL_WINDOW_S, book_sessions, held_by_hotkey, job_demand, sandbox_status,
+            FLEET_FULL_WINDOW_S, activity_by_hotkey, book_sessions, held_by_hotkey, job_demand, sandbox_status,
         )
 
         episodes = [w for w in list(served.values()) if w.job.episode is not None and is_signed_sandbox(w.job)]
@@ -1963,6 +1963,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         try:
             sessions = book_sessions(sandbox.book, now)
             holders = held_by_hotkey(sandbox.book, now)
+            shown = activity_by_hotkey(sandbox.book, now)
         except Exception:
             logger.warning("sandbox status: the session book is unreadable", exc_info=True)
             return
@@ -2002,7 +2003,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                     tokens_per_second=dispatcher.tokens_per_second(model),
                     executors_wanted=sizing_of.get("executors_wanted"),
                     fleet_refusals=0 if quota is None else quota.fleet_refusals(job_id, now, FLEET_FULL_WINDOW_S),
-                    demand=job_demand(job_id, now=now, declarations=declarations, held=holders,
+                    demand=job_demand(job_id, now=now, declarations=declarations, held=holders, activity=shown,
                                       model_of=sandbox_models, served=serving, excluded=low_yield),
                     executors_allowed=sizing_of.get("executors_allowed"),
                     audit_share=share() if callable(share) else None)
