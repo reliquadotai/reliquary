@@ -27,6 +27,28 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA = "reliquary/eval-chain/v1"
+# A position goes on when at least this share of its steps were graded (a missing or ungraded answer fails its
+# step, as upstream counts a missing answer); at least one step may always be missing. Under it something
+# systemic happened (the grader down, the job cut early): the chain stops instead of carrying blanks forward.
+MIN_GRADED_ENV = "RELIQUARY_CHAIN_MIN_GRADED"
+DEFAULT_MIN_GRADED = 0.9
+
+
+def min_graded() -> float:
+    import os
+
+    raw = os.environ.get(MIN_GRADED_ENV, "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_MIN_GRADED
+    except ValueError:
+        value = DEFAULT_MIN_GRADED
+    return min(1.0, max(0.0, value))
+
+
+def missing_allowed(asked: int, share: float | None = None) -> int:
+    """How many of a position's ``asked`` steps may be missing or ungraded: ``(1 - share) * asked``, at least one."""
+    share = min_graded() if share is None else share
+    return max(1, int((1.0 - share) * asked + 1e-9))
 
 
 @dataclass(frozen=True)
@@ -109,8 +131,31 @@ async def _graded_rows(platform, eval_id: str) -> list[dict]:
     return table.to_pylist()
 
 
-async def _answers(platform, module, position: _Position) -> tuple[dict[str, str], dict[str, bool]]:
-    """Each asked step's answer text (what its grader read) and verdict; "" and False for a step with no row."""
+@dataclass
+class _Answers:
+    answers: dict[str, str]
+    """Each asked step's answer text (what its grader read); "" for a step with no row."""
+    passed: dict[str, bool]
+    """Each asked step's verdict: False for a step with no row or no grade."""
+    answered: int
+    graded: int
+
+    def counts(self) -> dict:
+        asked = len(self.answers)
+        return {"asked": asked, "answered": self.answered, "graded": self.graded,
+                "missing": asked - self.answered, "ungraded": self.answered - self.graded}
+
+
+def _final(position: _Position) -> bool:
+    """The position's job can get no more work: its grading is complete, or the grading says every prompt holds
+    its sample or used every attempt (``job_complete``), or it was graded with what the job held at its end
+    (``allow_incomplete``: the run deadline). A grading taken while prompts were still open is none of these."""
+    provenance = position.report.get("provenance") or {}
+    return (position.report.get("complete") is True or provenance.get("job_complete") is True
+            or provenance.get("allow_incomplete") is True)
+
+
+async def _answers(platform, module, position: _Position) -> _Answers:
     from reliquary.eval.grading import answer_text
 
     args = position.args
@@ -130,14 +175,18 @@ async def _answers(platform, module, position: _Position) -> tuple[dict[str, str
     thinking = bool((position.report.get("provenance") or {}).get("thinking"))
     answers = {step: "" for step in asked}
     passed = {step: False for step in asked}
+    seen: set[str] = set()
+    graded = 0
     for row in await _graded_rows(platform, position.eval_id):
         step = step_of.get(row["problem_id"])
         # One sample per problem: a chain carries one answer forward.
-        if step is None or int(row["sample_index"]) != 0:
+        if step is None or int(row["sample_index"]) != 0 or step in seen:
             continue
+        seen.add(step)
         answers[step] = answer_text("text", row["completion"] or "", thinking=thinking)
         passed[step] = row["correct"] is True
-    return answers, passed
+        graded += row["correct"] is not None
+    return _Answers(answers, passed, len(seen), graded)
 
 
 def _build(source: str, args: dict, directory: Path, open_taskset, clock) -> dict:
@@ -162,9 +211,14 @@ async def next_set(*, chain_id: str, eval_id: str, platform, subnet,
     module = _module(chain)
     position = await _position(platform, subnet, chain, eval_id)
     # Only a final grading seeds the next position: one taken while its job ran would carry answers it lacks.
-    if position.report.get("complete") is not True:
-        raise ChainRefused(f"position_incomplete: {eval_id}'s grading is not complete")
-    answers, _ = await _answers(platform, module, position)
+    if not _final(position):
+        raise ChainRefused(f"position_incomplete: {eval_id} was graded while its job could still take work")
+    got = await _answers(platform, module, position)
+    counts = got.counts()
+    if counts["missing"] + counts["ungraded"] > missing_allowed(counts["asked"]):
+        raise ChainRefused(f"position_incomplete: {eval_id} graded {counts['graded']} of {counts['asked']} steps, "
+                           f"under {min_graded():.0%}")
+    answers = got.answers
     args = position.args
     last = await asyncio.to_thread(module.max_position, args.get("split", "test"),
                                    *([args["dataset_revision"]] if "dataset_revision" in args else []))
@@ -202,7 +256,9 @@ async def next_set(*, chain_id: str, eval_id: str, platform, subnet,
     return {"schema": SCHEMA, "chain": chain_id, "after": eval_id, "set_id": set_id, "env": card["env"],
             "position": int(following["step"]), "positions": last, "count": int(card["count"]),
             "prompts_sha256": card["prompts_sha256"],
-            "prompt_tokens": {"max": lengths["max"], "total": sum(lengths["per_problem"])}}
+            "prompt_tokens": {"max": lengths["max"], "total": sum(lengths["per_problem"])},
+            # The position it was built from: its steps without an answer carried forward as no code.
+            "from": {"position": int(args.get("step", 1)), **counts}}
 
 
 async def chain_report(*, chain_id: str, part_ids: Sequence[str], platform, subnet) -> dict:
@@ -214,6 +270,7 @@ async def chain_report(*, chain_id: str, part_ids: Sequence[str], platform, subn
     expected: dict | None = None
     split = None
     graded = None
+    per_position = []
     for index, part_id in enumerate(part_ids):
         position = await _position(platform, subnet, chain, part_id)
         args = position.args
@@ -228,14 +285,21 @@ async def chain_report(*, chain_id: str, part_ids: Sequence[str], platform, subn
                 raise ChainRefused(f"{part_id} is not a chain's first position")
         elif args != expected:
             raise ChainRefused(f"{part_id}'s set was not built from the answers graded before it")
-        answers, verdicts = await _answers(platform, module, position)
-        passed.update(verdicts)
-        expected = module.next_args(args, answers)
+        got = await _answers(platform, module, position)
+        passed.update(got.passed)
+        per_position.append({"position": int(args.get("step", 1)), "eval_id": part_id,
+                             "set_id": position.set_id, **got.counts()})
+        expected = module.next_args(args, got.answers)
     revision = (expected or {}).get("dataset_revision")
     summary = await asyncio.to_thread(module.summary, split, passed, *([revision] if revision else []))
     positions = await asyncio.to_thread(module.max_position, split, *([revision] if revision else []))
+    # Steps with no answer or no grade count as failed in the rates, as upstream counts a missing answer.
     return {"schema": SCHEMA, "chain": chain_id, "positions_graded": len(part_ids), "positions": positions,
-            "complete": len(part_ids) == positions, **summary}
+            "complete": len(part_ids) == positions, **summary,
+            "steps_missing": sum(p["missing"] for p in per_position),
+            "steps_ungraded": sum(p["ungraded"] for p in per_position),
+            "per_position": per_position}
 
 
-__all__ = ["CHAINS", "Chain", "ChainRefused", "PartNotGraded", "SCHEMA", "chain_of", "chain_report", "next_set"]
+__all__ = ["CHAINS", "DEFAULT_MIN_GRADED", "MIN_GRADED_ENV", "Chain", "ChainRefused", "PartNotGraded", "SCHEMA",
+           "chain_of", "chain_report", "min_graded", "missing_allowed", "next_set"]

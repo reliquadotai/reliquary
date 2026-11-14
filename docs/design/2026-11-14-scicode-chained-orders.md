@@ -82,9 +82,18 @@ Catalyst (`reliquary/orders/chains.py`):
 - `next_set`: reads position k's report (`provenance.sets[0]`: the set; `provenance.model/revision/thinking`), the
   set's card and `grading.jsonl` from the subnet bucket, and its `graded.parquet`. Each row's step is
   `chain.asked_at(split, k)[source_index]`; its answer is the text its grader read (`grading.answer_text`, after the
-  reasoning block); a step with no row is recorded as no code, as upstream records a failed generation. Only a
-  complete grading seeds the next position (`position_incomplete` otherwise, which ends the chain on the platform):
-  one taken before its job's records were final would carry answers the job lacks. A grading file whose rows are
+  reasoning block); a step with no row is recorded as no code and fails, as upstream counts a missing answer (an
+  ungraded row, a grader error, carries its code forward and fails its step). A position goes on once its job can
+  get no more work: its grading is complete, or says every prompt holds its sample or used every attempt
+  (`provenance.job_complete`), or was taken with what the job held at its end (`allow_incomplete`, the run
+  deadline). A grading taken while prompts were still open is `position_incomplete` (409, which ends the chain on
+  the platform), and so is a position with fewer than 90 % of its steps graded (`RELIQUARY_CHAIN_MIN_GRADED`; at
+  least one step may always miss, so a 1- or 2-problem position survives one exhausted prompt): under it something
+  systemic happened (the grader down, the job cut early) and blanks would only be carried forward. The answer's
+  `from` says how many steps of the position it was built from were asked, answered, graded, missing, ungraded.
+  First live order (7f5362da, Qwen3-8B, 2026-11-14): one of 64 position-1 prompts used its three attempts (every
+  one refused `draw_mismatch` with one impossible-gap token) and the whole chain stopped under the earlier
+  "complete grading only" rule. A grading file whose rows are
   not exactly its position's steps (`source_index` 0..n-1) is a 409, never a crash. The next
   args are `chain.next_args` (k + 1, `previous` with the extracted code). The set is built with
   `verifiers_source.build_set` and published subnet-only, create-only: its id carries a hash of its args
@@ -92,8 +101,9 @@ Catalyst (`reliquary/orders/chains.py`):
   args are compared; another step under that id is refused). Prompt lengths are counted in the model's chat
   template (`load_cpu_tokenizer`) and answered, never written on the card (two models with the same answers share
   the set).
-- `chain_report`: the main-problem and sub-step rates (`chain.summary`, upstream's denominators: a step not reached
-  counts as failed), after checking the parts are one chain: the first position has no `previous`, and each next
+- `chain_report`: the main-problem and sub-step rates (`chain.summary`, upstream's denominators: a step not reached,
+  not answered or not graded counts as failed), with `steps_missing`, `steps_ungraded` and `per_position`
+  (`{position, eval_id, set_id, asked, answered, graded, missing, ungraded}`), after checking the parts are one chain: the first position has no `previous`, and each next
   position's args are exactly `next_args` of the one before and its graded answers, and every position graded the
   same model, revision and thinking mode.
 - `combine` with `chain`: the report gains `chain` and its macro `pass@1` is the sub-step rate (`basis:
