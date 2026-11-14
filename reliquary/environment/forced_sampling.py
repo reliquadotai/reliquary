@@ -607,7 +607,8 @@ def seed_consistency_diagnostics(
     scored against a support tightened by ``edge_margin`` (``Warp.widened``): a boundary token the
     miner's cut dropped never makes a gap. A token outside the support widened by ``edge_margin`` is
     impossible (miss 1); inside it, its miss is the score gap to the tight support's best, so a
-    token the miner's cut kept where the validator's did not is an ordinary near-tie miss.
+    token the miner's cut kept where the validator's did not is an ordinary near-tie miss. A warp that keeps one
+    token (top_k 1: greedy) scores its misses on the logits alone (``_greedy``).
     """
     check_draw(draw, t=t, top_k=top_k, top_p=top_p, min_p=min_p)
     warp = _warp_of(t, top_k, top_p, min_p)
@@ -771,6 +772,19 @@ def _warp_slice_width(warp: Warp, edge_margin: float, vocab: int) -> int:
     return k if 0 < warp.top_k and k < vocab else 0
 
 
+def _greedy(warp: Warp) -> bool:
+    """A warp that keeps one token (top_k 1): greedy decoding, whatever the noise. Its misses are scored on the
+    logits alone: with the noise, an honest flip between two near-tied logits would carry the difference of two
+    independent Gumbel draws (logistic, over the 4.0 tolerance about 2 % of the time) and read as an edit."""
+    return warp.top_k == 1
+
+
+def _first_max(scores: torch.Tensor) -> torch.Tensor:
+    best = scores.max(dim=-1, keepdim=True).values
+    ids = torch.arange(scores.shape[-1], device=scores.device).expand_as(scores)
+    return torch.where(scores == best, ids, scores.shape[-1]).min(dim=-1).values
+
+
 def _gumbel_warp_chunk_stats(chunk_logits, toks, draws, warp, edge_margin, stochastic_threshold):
     """(exact, miss, stochastic) per row under a warped Gumbel draw (``seed_consistency_diagnostics``).
 
@@ -785,7 +799,8 @@ def _gumbel_warp_chunk_stats(chunk_logits, toks, draws, warp, edge_margin, stoch
     values, index = torch.topk(logits, width, dim=-1)
     x = values / float(warp.t)
     keys = _gumbel_keys(draws, x.device)
-    scores = x + gumbel_noise_from_bits(_splitmix_bits(keys[:, None], index))
+    greedy = _greedy(warp)
+    scores = x if greedy else x + gumbel_noise_from_bits(_splitmix_bits(keys[:, None], index))
     support = warp_support(x, warp)
     tight = warp_support(x, warp.widened(-edge_margin)) & support
     loose = warp_support(x, warp.widened(edge_margin)) | support
@@ -798,8 +813,9 @@ def _gumbel_warp_chunk_stats(chunk_logits, toks, draws, warp, edge_margin, stoch
 
     picks, _ = pick(support)
     _, best = pick(tight)
-    own = logits.gather(1, toks.unsqueeze(1)).squeeze(1) / float(warp.t) \
-        + gumbel_noise_from_bits(_splitmix_bits(keys, toks))
+    own = logits.gather(1, toks.unsqueeze(1)).squeeze(1) / float(warp.t)
+    if not greedy:
+        own = own + gumbel_noise_from_bits(_splitmix_bits(keys, toks))
     exact = picks == toks
     near = -torch.expm1(-(best - own).clamp_min(0.0))
     possible = ((index == toks[:, None]) & loose).any(dim=-1)
@@ -840,11 +856,17 @@ def _gumbel_warp_chunk_stats_dense(chunk_logits, toks, draws, warp, edge_margin,
     x = chunk_logits.float() / float(warp.t)
     keys = _gumbel_keys(draws, x.device)
     support, tight, loose = _warp_supports(x, [warp, warp.widened(-edge_margin), warp.widened(edge_margin)])
-    picks, _ = gumbel_argmax(x.masked_fill(~support, float("-inf")), keys)
     tight = tight & support
-    _, best = gumbel_argmax(x.masked_fill(~tight, float("-inf")), keys)
     loose = loose | support
-    own = x.gather(1, toks.unsqueeze(1)).squeeze(1) + gumbel_noise_from_bits(_splitmix_bits(keys, toks))
+    if _greedy(warp):
+        # One token kept: the pick is the argmax (lowest id on a tie), its scores the logits alone.
+        picks = _first_max(x.masked_fill(~support, float("-inf")))
+        best = x.masked_fill(~tight, float("-inf")).max(dim=-1).values
+        own = x.gather(1, toks.unsqueeze(1)).squeeze(1)
+    else:
+        picks, _ = gumbel_argmax(x.masked_fill(~support, float("-inf")), keys)
+        _, best = gumbel_argmax(x.masked_fill(~tight, float("-inf")), keys)
+        own = x.gather(1, toks.unsqueeze(1)).squeeze(1) + gumbel_noise_from_bits(_splitmix_bits(keys, toks))
     exact = picks == toks
     near = -torch.expm1(-(best - own).clamp_min(0.0))
     possible = loose.gather(1, toks.unsqueeze(1)).squeeze(1)
