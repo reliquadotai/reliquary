@@ -235,3 +235,48 @@ def test_a_sample_left_out_on_purpose_is_not_reported_missing(tmp_path):
     assert [e["custom_id"] for e in errors] == ["req-1", "req-2", "req-3"]
     report = json.loads((root / "report.json").read_text())
     assert report["counts"]["truncated_dropped"] == 1 and report["counts"]["prompts_delivered"] == 3
+
+
+class _CaughtRecords(_Records):
+    """As _Records, with prompt 2 slot 1's refusal charged (another model) and two passes of its hotkey
+    withdrawn: one forfeited, one caught unaudited."""
+
+    def __init__(self):
+        super().__init__()
+        self.verdicts[_sid(5)] = {"passed": False, "audited": True, "reason": "draw_mismatch", "hotkey": "HK5",
+                                  "forced_draw": {"match": 0.4, "penalty": True}}
+        self.voided = {_sid(90): {"reason": "forfeited", "hotkey": "HK5"},
+                       _sid(91): {"reason": "caught_unaudited", "hotkey": "HK5", "settled": True}}
+
+    async def list_voided_ids(self, job_id):
+        return sorted(self.voided)
+
+    async def read_voided(self, job_id, sid):
+        if sid in self.voided:
+            return self.voided[sid]
+        return await super().read_voided(job_id, sid)
+
+
+def test_the_report_names_the_audit_share_the_hotkeys_caught_and_the_rows_redone(tmp_path):
+    manifest, root = _export(tmp_path, _job(), _CaughtRecords(), set_rows=SET_ROWS, audit_q=0.05)
+    verification = json.loads((root / "report.json").read_text())["verification"]
+    assert (verification["audit_q"], verification["audit_level"], verification["precision"]) == (
+        0.05, "sampled", "bf16")
+    assert verification["hotkeys_caught"] == {"count": 1, "hotkeys": ["HK5"]}
+    assert verification["rows_redone"] == {"total": 3, "refused": 1,
+                                           "withdrawn": {"caught_unaudited": 1, "forfeited": 1}}
+    # Some delivered rows were not audited: no per-row evidence promised.
+    assert verification["per_row_evidence"] is False
+
+
+def test_an_audited_row_carries_its_evidence(tmp_path):
+    records = _Records()
+    for sid, verdict in records.verdicts.items():
+        if verdict["passed"]:
+            records.verdicts[sid] = {**verdict, "audited": True,
+                                     "forced_draw": {"match": 0.99, "max_gap": 0.4, "positions": 3}}
+    rows, counts = _v3_rows(_job(), records)
+    assert all(r["audited"] and r["draw_max_gap"] == 0.4 and r["draw_positions"] == 3 for r in rows)
+    manifest, root = _export(tmp_path, _job(), records, set_rows=SET_ROWS, audit_q=1.0)
+    verification = json.loads((root / "report.json").read_text())["verification"]
+    assert verification["audit_level"] == "full" and verification["per_row_evidence"] is True

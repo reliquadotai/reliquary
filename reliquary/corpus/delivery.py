@@ -412,7 +412,16 @@ async def delivery_rows(*, job, records, counts: dict, grade=None,
 # an eval), one row per delivered completion, with what a customer joins and checks on.
 V3_ROW_FIELDS = ("job_id", "submission_id", "prompt_index", "problem_id", "custom_id", "completion_index",
                  "sample_index", "draw_slot", "seed", "prompt_sha256", "prompt_tokens", "completion_token_ids",
-                 "completion", "completion_tokens", "finish_reason", "audited", "draw_match", "accepted", "score")
+                 "completion", "completion_tokens", "finish_reason", "audited", "draw_match", "draw_max_gap",
+                 "draw_positions", "accepted", "score")
+
+
+def _number_or_none(value) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _int_or_none(value) -> int | None:
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
 V3_FILTERS = ("none", "annotate", "drop")
 V3_FORMATS = ("parquet", "openai_jsonl")
 
@@ -427,7 +436,8 @@ def _v3_row_schema():
         ("prompt_sha256", pa.string()), ("prompt_tokens", pa.int64()),
         ("completion_token_ids", pa.list_(pa.int32())), ("completion", pa.string()),
         ("completion_tokens", pa.int32()), ("finish_reason", pa.string()), ("audited", pa.bool_()),
-        ("draw_match", pa.float64()), ("accepted", pa.bool_()), ("score", pa.float64()),
+        ("draw_match", pa.float64()), ("draw_max_gap", pa.float64()), ("draw_positions", pa.int64()),
+        ("accepted", pa.bool_()), ("score", pa.float64()),
     ])
 
 
@@ -484,7 +494,7 @@ async def delivery_rows_v3(*, job, records, counts: dict, grade=None, drop_rejec
                   duplicate_completion=0 if seen is not None else None, rows=0,
                   rows_accepted=0 if grade is not None else None,
                   rejected_dropped=0 if drop_rejected else None,
-                  completion_tokens=0, audited_completion_tokens=0, prompt_tokens=0,
+                  completion_tokens=0, audited_completion_tokens=0, audited_rows=0, prompt_tokens=0,
                   prompt_tokens_unknown=0, samples_by_prompt={}, delivered_by_prompt={})
     prompted: set[str] = set()
     async for batch in passing_batches(job=job, records=records, counts=counts, concurrency=concurrency,
@@ -499,7 +509,8 @@ async def delivery_rows_v3(*, job, records, counts: dict, grade=None, drop_rejec
             cursor = record.get("cursor")
             slot = int(cursor) if drawn and isinstance(cursor, int) and not isinstance(cursor, bool) else None
             audited = verdict.get("audited", True) is True
-            match = (verdict.get("forced_draw") or {}).get("match") if audited else None
+            evidence = (verdict.get("forced_draw") or {}) if audited else {}
+            match = evidence.get("match")
             for index, completion in enumerate(record["completions"]):
                 counts["completions"] += 1
                 # Generated and verified: a sample this delivery leaves out on purpose is not a missing one.
@@ -522,6 +533,10 @@ async def delivery_rows_v3(*, job, records, counts: dict, grade=None, drop_rejec
                     "completion_token_ids": tokens, "completion": completion["text"],
                     "completion_tokens": len(tokens), "finish_reason": reason, "audited": audited,
                     "draw_match": float(match) if isinstance(match, (int, float)) else None,
+                    # The audit's evidence for the submission (its worst sample): largest Gumbel score gap of a
+                    # miss and the positions checked; null when it was not audited.
+                    "draw_max_gap": _number_or_none(evidence.get("max_gap")),
+                    "draw_positions": _int_or_none(evidence.get("positions")),
                     "accepted": None, "score": None,
                 })
         if grade is not None and rows:
@@ -542,6 +557,7 @@ async def delivery_rows_v3(*, job, records, counts: dict, grade=None, drop_rejec
             counts["completion_tokens"] += row["completion_tokens"]
             if row["audited"]:
                 counts["audited_completion_tokens"] += row["completion_tokens"]
+                counts["audited_rows"] += 1
             if row["submission_id"] not in prompted:
                 # A prompt counts once per submission: its completions share it.
                 prompted.add(row["submission_id"])
@@ -652,6 +668,29 @@ class _ByPrompt:
         self._db.close()
 
 
+async def voided_by_reason(records, job_id: str, *, concurrency: int = READ_CONCURRENCY
+                           ) -> tuple[dict[str, int], set[str]]:
+    """The job's withdrawn passes counted by reason, and the hotkeys whose failure withdrew them (``forfeited``,
+    ``caught_unaudited``)."""
+    from reliquary.corpus.export import voided_submission_ids
+
+    reader = getattr(records, "read_voided", None)
+    ids = sorted(await voided_submission_ids(records, job_id))
+    reasons: dict[str, int] = {}
+    hotkeys: set[str] = set()
+    if not ids:
+        return reasons, hotkeys
+    gate = asyncio.Semaphore(concurrency)
+    documents = await _bounded((reader(job_id, sid) for sid in ids), gate) if reader is not None \
+        else [None] * len(ids)
+    for document in documents:
+        reason = str((document or {}).get("reason") or "unknown")
+        reasons[reason] = reasons.get(reason, 0) + 1
+        if reason in ("forfeited", "caught_unaudited") and (document or {}).get("hotkey"):
+            hotkeys.add(str(document["hotkey"]))
+    return reasons, hotkeys
+
+
 def missing_prompts(job, samples_by_prompt: Mapping[int, int], slots=None) -> list[tuple[int, int, str]]:
     """``(prompt_index, held, code)`` of every prompt of the job short of its samples: ``prompt_exhausted`` when
     the job's ledger ``slots`` says every attempt was used (``draw_unfillable`` for a forced-draw job), else
@@ -670,14 +709,29 @@ def missing_prompts(job, samples_by_prompt: Mapping[int, int], slots=None) -> li
     return short
 
 
-def verification_block(job, *, verdicts: int, audited: int, refusals: Mapping[str, int]) -> dict:
+def verification_block(job, *, verdicts: int, audited: int, refusals: Mapping[str, int],
+                       audit_q: float | None = None, caught: Collection[str] = (),
+                       voided: Mapping[str, int] | None = None, rows: int | None = None,
+                       audited_rows: int | None = None) -> dict:
     """What the delivery's samples were checked against: the forced draw (key recipe, warp, judge) or the
-    proof, and how much was audited."""
+    proof, and how much was audited; the order's audit share and precision, the hotkeys caught and the
+    work redone for it (design 2026-11-13 verification tiers)."""
     from reliquary.corpus.eval_draw import EVAL_DRAW_DOMAIN, draw_randomness, has_draw, job_warp
 
+    voided = dict(voided or {})
     block = {"verdicts": verdicts, "audited": audited,
              "audited_share": (audited / verdicts) if verdicts else None,
-             "refusals": dict(sorted(refusals.items()))}
+             "refusals": dict(sorted(refusals.items())),
+             "audit_q": audit_q,
+             "audit_level": None if audit_q is None else ("full" if audit_q >= 1.0 else "sampled"),
+             "precision": getattr(job, "precision", "bf16"),
+             # Hotkeys with a charged failure in this order: every unaudited row of theirs was withdrawn.
+             "hotkeys_caught": {"count": len(set(caught)), "hotkeys": sorted(set(caught))},
+             # Slots reopened for another miner: each refusal, and each pass withdrawn after it was written.
+             "rows_redone": {"total": sum(refusals.values()) + sum(voided.values()),
+                             "refused": sum(refusals.values()), "withdrawn": dict(sorted(voided.items()))},
+             # Every delivered row audited: its draw_match, draw_max_gap and draw_positions are its evidence.
+             "per_row_evidence": bool(rows) and audited_rows == rows}
     if has_draw(job):
         from reliquary.corpus.job import DEFAULT_DRAW_JUDGE
 
@@ -976,7 +1030,7 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
                           dedupe_against: Collection[str] = (), schema_version: int = 2,
                           include_truncated: bool = True, filter_mode: str = "none",
                           output_format: str = "parquet", slots=None, set_rows=None,
-                          count_tokens=None) -> dict:
+                          count_tokens=None, audit_q: float | None = None) -> dict:
     """Write ``deliveries/{delivery_id}/``: the shards, ``report.json``, then
     ``manifest.json``. A delivery whose manifest exists is returned as stored.
 
@@ -1010,7 +1064,7 @@ async def export_delivery(*, job, records, sink, delivery_id: str, grade=None,
             work_dir=work_dir, shard_max_bytes=shard_max_bytes, row_group_rows=row_group_rows,
             concurrency=concurrency, window=window, clock=clock, dedupe=dedupe, dedupe_against=dedupe_against,
             include_truncated=include_truncated, filter_mode=filter_mode, output_format=output_format,
-            slots=slots, set_rows=set_rows, count_tokens=count_tokens)
+            slots=slots, set_rows=set_rows, count_tokens=count_tokens, audit_q=audit_q)
     if schema_version != 2:
         raise ValueError(f"delivery schema version {schema_version!r} is not 2 or 3")
     if keep_rejected and (episode or grade is None):
@@ -1195,7 +1249,7 @@ async def _stored_stamp(sink, report_key: str, *, job, delivery_id: str, clock) 
 
 async def _export_v3(*, job, records, sink, delivery_id: str, grade, filter_note, work_dir, shard_max_bytes,
                      row_group_rows, concurrency, window, clock, dedupe, dedupe_against, include_truncated,
-                     filter_mode, output_format, slots, set_rows, count_tokens) -> dict:
+                     filter_mode, output_format, slots, set_rows, count_tokens, audit_q=None) -> dict:
     """Delivery v3: the job's delivered completions as v3 Parquet rows or OpenAI Batch output lines (one per
     prompt, its samples as choices) plus an errors file naming the prompts short of their samples, then
     ``report.json`` (counts, verification, billing basis) and ``manifest.json``."""
@@ -1235,7 +1289,9 @@ async def _export_v3(*, job, records, sink, delivery_id: str, grade, filter_note
 
     counts: dict = {}
     refusals: dict[str, int] = {}
+    caught: set[str] = set()
     audited = 0
+    audited_rows = 0
 
     def on_verdict(_sid: str, verdict: Mapping) -> None:
         nonlocal audited
@@ -1244,6 +1300,8 @@ async def _export_v3(*, job, records, sink, delivery_id: str, grade, filter_note
         if not verdict.get("passed"):
             reason = str(verdict.get("reason") or "unknown")
             refusals[reason] = refusals.get(reason, 0) + 1
+            if (verdict.get("forced_draw") or {}).get("penalty") is True or verdict.get("penalty") is True:
+                caught.add(str(verdict.get("hotkey")))
 
     seen = None
     if dedupe:
@@ -1291,6 +1349,8 @@ async def _export_v3(*, job, records, sink, delivery_id: str, grade, filter_note
     held = counts.pop("delivered_by_prompt")
     counts["prompts_delivered"] = len(held)
     counts["prompts_short"] = errors_written
+    voided_reasons, voided_hotkeys = await voided_by_reason(records, job.job_id, concurrency=concurrency)
+    caught |= voided_hotkeys
     report = {
         "schema": DELIVERY_SCHEMA_V3, "delivery_id": delivery_id, "job_id": job.job_id, "created_at": stamp,
         "job": job.to_contract(), "counts": counts,
@@ -1299,7 +1359,10 @@ async def _export_v3(*, job, records, sink, delivery_id: str, grade, filter_note
         "filter": ({"applied": True, "mode": filter_mode, "grader_id": job.filter.grader_id,
                     "threshold": job.filter.threshold} if grade is not None
                    else {"applied": False, "mode": "none", "note": filter_note}),
-        "verification": verification_block(job, verdicts=counts["verdicts"], audited=audited, refusals=refusals),
+        "verification": verification_block(
+            job, verdicts=counts["verdicts"], audited=audited, refusals=refusals,
+            audit_q=None if audit_q is None else float(audit_q), caught=caught, voided=voided_reasons,
+            rows=counts.get("rows", 0), audited_rows=counts.get("audited_rows", 0)),
         # What the customer is charged on: the completion tokens of the rows delivered (audited ones checked).
         "billing": {"basis": "completion_tokens_of_delivered_rows",
                     "completion_tokens": counts["completion_tokens"],

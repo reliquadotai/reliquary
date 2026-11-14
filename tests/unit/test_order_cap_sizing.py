@@ -112,7 +112,7 @@ def test_an_order_is_declared_at_its_sized_cap_with_the_asked_cap_kept(
         admin, pins, rates, control, monkeypatch):  # noqa: F811
     monkeypatch.setenv(sizing.SIZING_ENV, "on")
     control["document"] = _rates_status()
-    created = admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING))
+    created = admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING, audit_q=1.0))
     assert created.status_code == 201, created.text
     params = admin.registry["entries"]["order-eval-p1"].params
     estimate = (100 * cp.max_price(params) + 50 * cp.max_input_price(params)) * cp.PERIOD_SECONDS
@@ -120,12 +120,12 @@ def test_an_order_is_declared_at_its_sized_cap_with_the_asked_cap_kept(
     assert params["cap"] < 0.25 and params["floor"] == params["cap"]
     assert params[sizing.CAP_MAX_PARAM] == 0.25
     # A replay names the asked cap: the same order, not another contract.
-    assert admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING)).status_code == 200
+    assert admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING, audit_q=1.0)).status_code == 200
 
 
 def test_without_the_switch_an_order_keeps_its_asked_cap(admin, pins, rates, control):  # noqa: F811
     control["document"] = _rates_status()
-    assert admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING)).status_code == 201
+    assert admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING, audit_q=1.0)).status_code == 201
     params = admin.registry["entries"]["order-eval-p1"].params
     assert params["cap"] == 0.25 and sizing.CAP_MAX_PARAM not in params
 
@@ -137,7 +137,7 @@ def test_an_unreadable_status_sizes_on_the_defaults(admin, pins, rates, monkeypa
         raise OSError("bucket down")
 
     monkeypatch.setattr(eval_control, "read_control_status", down)
-    assert admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING)).status_code == 201
+    assert admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING, audit_q=1.0)).status_code == 201
     params = admin.registry["entries"]["order-eval-p1"].params
     assert params[sizing.CAP_MAX_PARAM] == 0.25 and params["cap"] <= 0.25
 
@@ -145,7 +145,7 @@ def test_an_unreadable_status_sizes_on_the_defaults(admin, pins, rates, monkeypa
 def test_the_resize_follows_what_the_order_pays(admin, pins, rates, control, monkeypatch):  # noqa: F811
     monkeypatch.setenv(sizing.SIZING_ENV, "on")
     control["document"] = _rates_status()
-    assert admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING)).status_code == 201
+    assert admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING, audit_q=1.0)).status_code == 201
     first = admin.registry["entries"]["order-eval-p1"].params["cap"]
     resize = admin.app.state.resize_order_caps
 
@@ -173,7 +173,7 @@ def test_a_resize_the_pool_cannot_take_keeps_the_cap(admin, pins, rates, control
 
     monkeypatch.setenv(sizing.SIZING_ENV, "on")
     control["document"] = _rates_status()
-    assert admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING)).status_code == 201
+    assert admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING, audit_q=1.0)).status_code == 201
     before = admin.registry["entries"]["order-eval-p1"].params["cap"]
     facts = {"model": f"{MODEL}@{REVISION}", "audit_executors": 1, "recent_paid": [0.5], "open_value": 0.0}
     control["document"] = _rates_status(jobs={"order-eval-p1": {"sizing": facts}})
@@ -190,7 +190,7 @@ def test_a_resize_the_pool_cannot_take_keeps_the_cap(admin, pins, rates, control
 def test_a_resize_never_passes_the_asked_cap(admin, pins, rates, control, monkeypatch):  # noqa: F811
     monkeypatch.setenv(sizing.SIZING_ENV, "on")
     control["document"] = _rates_status()
-    assert admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING)).status_code == 201
+    assert admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING, audit_q=1.0)).status_code == 201
     facts = {"model": f"{MODEL}@{REVISION}", "audit_executors": 1, "recent_paid": [0.5], "open_value": 0.0}
     control["document"] = _rates_status(jobs={"order-eval-p1": {"sizing": facts}})
     assert asyncio.run(admin.app.state.resize_order_caps()) == 1

@@ -98,8 +98,8 @@ def test_corpus_mine_without_a_job_follows_the_listed_orders(monkeypatch):
     seen = {}
     monkeypatch.setattr(main, "_served_orders", lambda url, strict=False: [])
 
-    def fake_follow(*, list_orders, mine, fetch):
-        seen["orders"] = list_orders()
+    def fake_follow(*, list_orders, mine, fetch, precision):
+        seen["orders"], seen["precision"] = list_orders(), precision
         mine("order-gen-1")
 
     monkeypatch.setattr(follow, "follow_orders", fake_follow)
@@ -115,6 +115,7 @@ def test_corpus_mine_without_a_job_follows_the_listed_orders(monkeypatch):
     assert argv[argv.index("--ask-alpha-per-mtoken") + 1] == "0.3"
     assert argv[argv.index("--ask-capacity") + 1] == "8"
     assert "--gpu-memory-utilization" not in argv and "--job-id" not in argv
+    assert seen["precision"] == "bf16" and argv[argv.index("--precision") + 1] == "bf16"
 
 
 def test_an_unreadable_list_is_retried():
@@ -130,3 +131,13 @@ def test_an_unreadable_list_is_retried():
     follow.follow_orders(list_orders=list_orders, mine=lambda j: mined.append(j) or 0, fetch=lambda m: None,
                          sleep=slept.append, rounds=2)
     assert slept == [follow.IDLE_SECONDS] and mined == ["x"]
+
+
+def test_a_miner_takes_only_orders_in_the_precision_it_serves():
+    from reliquary.miner.order_follow import choose_order
+
+    orders = [{"job_id": "order-gen-a", "state": "open", "model": "m/x", "revision": "r", "precision": "fp8"},
+              {"job_id": "order-gen-b", "state": "open", "model": "m/y", "revision": "r"}]
+    assert choose_order(orders) == ("order-gen-b", None)
+    assert choose_order(orders, precision="fp8") == ("order-gen-a", None)
+    assert choose_order(orders[:1]) == (None, None)

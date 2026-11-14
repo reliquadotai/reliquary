@@ -158,6 +158,93 @@ def order_audit_executors(declared: dict | None) -> int:
     return int(value) if isinstance(value, int) and not isinstance(value, bool) and value >= 1 else 1
 
 
+# Batch audit waves (design 2026-11-13 verification tiers, section 6): a model whose served orders all audit in
+# waves keeps no card while it waits; a wave starts when its expected audits are worth a card (WAVE_MIN_SECONDS of
+# one card's work at the measured rate, WAVE_MIN_ITEMS before any rate), when an order is nearly full, or when a
+# record has waited WAVE_MAX_WAIT_SECONDS (a miner's pay waits for its audit); it drains, then waits again.
+WAVE_MIN_SECONDS_ENV = "RELIQUARY_ORDER_AUDIT_WAVE_MIN_SECONDS"
+WAVE_MIN_ITEMS_ENV = "RELIQUARY_ORDER_AUDIT_WAVE_MIN_ITEMS"
+WAVE_FINISH_SHARE_ENV = "RELIQUARY_ORDER_AUDIT_WAVE_FINISH_SHARE"
+WAVE_MAX_WAIT_ENV = "RELIQUARY_ORDER_AUDIT_WAVE_MAX_WAIT_SECONDS"
+WAVE_WAITING = "waiting"
+WAVE_DRAINING = "draining"
+
+
+@dataclass(frozen=True)
+class WaveSettings:
+    min_seconds: float = 1800.0
+    min_items: float = 2000.0
+    finish_share: float = 0.9
+    max_wait_seconds: float = 10800.0
+
+    @classmethod
+    def from_env(cls, env=None) -> "WaveSettings":
+        import os
+
+        environ = os.environ if env is None else env
+        values = {}
+        for field_name, name in (("min_seconds", WAVE_MIN_SECONDS_ENV), ("min_items", WAVE_MIN_ITEMS_ENV),
+                                 ("finish_share", WAVE_FINISH_SHARE_ENV), ("max_wait_seconds", WAVE_MAX_WAIT_ENV)):
+            raw = str(environ.get(name, "")).strip()
+            if raw:
+                value = float(raw)
+                if not value > 0 or (field_name == "finish_share" and value > 1):
+                    raise ValueError(f"{name} must be positive (a share at most 1), got {raw}")
+                values[field_name] = value
+        return cls(**values)
+
+
+def order_audit_waves(declared: dict | None) -> bool:
+    """Whether an order audits in waves: its record says so (Batch orders only)."""
+    return (declared or {}).get("audit_waves") is True
+
+
+class AuditWaves:
+    """Per model audited in waves, its phase: ``waiting`` (no card wanted) until a wave is worth starting, then
+    ``draining`` until nothing is left to audit."""
+
+    def __init__(self, settings: WaveSettings | None = None, *, clock: Callable[[], float] = time.time) -> None:
+        self.settings = settings or WaveSettings()
+        self._clock = clock
+        self._state: dict[str, dict] = {}
+
+    def start_reason(self, *, expected: float, items_per_second: float | None, nearly_full: bool,
+                     oldest_wait: float | None) -> str | None:
+        s = self.settings
+        if expected <= 0:
+            return None
+        if nearly_full:
+            return "nearly_full"
+        if oldest_wait is not None and oldest_wait >= s.max_wait_seconds:
+            return "max_wait"
+        if items_per_second:
+            if expected / items_per_second >= s.min_seconds:
+                return "backlog"
+        elif expected >= s.min_items:
+            return "backlog"
+        return None
+
+    def update(self, model: str, *, expected: float | None, items_per_second: float | None,
+               nearly_full: bool, oldest_wait: float | None) -> dict:
+        """The model's phase after this status pass; an unknown backlog (None) changes nothing."""
+        now = self._clock()
+        state = self._state.setdefault(model, {"phase": WAVE_WAITING, "since": now, "reason": None})
+        if expected is None:
+            return dict(state)
+        if state["phase"] == WAVE_WAITING:
+            reason = self.start_reason(expected=expected, items_per_second=items_per_second,
+                                       nearly_full=nearly_full, oldest_wait=oldest_wait)
+            if reason is not None:
+                state.update(phase=WAVE_DRAINING, since=now, reason=reason)
+        elif expected <= 0:
+            state.update(phase=WAVE_WAITING, since=now, reason="drained")
+        return dict(state)
+
+    def forget(self, keep: set[str]) -> None:
+        for model in [m for m in self._state if m not in keep]:
+            self._state.pop(model, None)
+
+
 def executors_for_backlog(backlog: float, items_per_second: float | None, *, drain_seconds: float,
                           max_executors: int) -> int | None:
     """Executors that audit ``backlog`` items within ``drain_seconds`` at the measured rate of one: 0 with
@@ -199,6 +286,12 @@ class ExecutorSizing:
         for model in [m for m in self._wanted if m not in keep]:
             self._wanted.pop(model, None)
             self._lower_since.pop(model, None)
+
+    def set(self, model: str, wanted: int) -> int:
+        """At once, without the scale-down wait (a wave that drained wants no card)."""
+        self._wanted[model] = wanted
+        self._lower_since.pop(model, None)
+        return wanted
 
 
 class BatchParked(Exception):
@@ -1332,8 +1425,9 @@ def pinned_order_refusal(entry, job, declared: dict) -> str | None:
         wanted["source"] = {k: source.get(k) for k in ("env", "prompt_start", "problems")}
         given["source"] = {"env": job.prompt_source, "prompt_start": job.prompt_start,
                            "problems": job.prompt_count}
-    if not generation and wanted["audit_q"] != 1.0:
-        return "an evaluation order audits every submission"
+    # An order's precision (``corpus.job.PRECISIONS``): its job's, bf16 when neither names one.
+    wanted["precision"] = declared.get("precision") or "bf16"
+    given["precision"] = getattr(job, "precision", "bf16")
     differs = sorted(k for k in wanted if wanted[k] != given[k])
     if differs:
         return f"its conditions differ from its order record: {differs}"
@@ -1549,9 +1643,11 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
 
         if not hasattr(w, "auction"):
             job_id = str(w.entry.job_id)
+            # A job audited in waves lets its backlog grow on purpose: its budget does not follow it.
             w.auction = job_auction(
                 getattr(w.entry, "params", None),
-                backlog=lambda: w.auditor.audit_backlog() + dispatcher.pending_items(job_id),
+                backlog=lambda: 0 if getattr(w, "audit_waves", False)
+                else w.auditor.audit_backlog() + dispatcher.pending_items(job_id),
                 state_path=state_path_for(job_id))
         return w.auction
 
@@ -1601,6 +1697,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         await warm_drand_chain(None)
         w = SimpleNamespace(entry=entry, cap=cap, job=job, tokenizer=tokenizer,
                             audit_executors=order_audit_executors(declared),
+                            audit_waves=order_audit_waves(declared),
                             vocab_size=vocab_size, proof=proof, renderer=renderer,
                             prompt_job_for=prompt_job_for, seen_index=seen_index,
                             is_banned=is_banned, suspect_until=_suspect_reader(miner_states, params),
@@ -1675,7 +1772,9 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         def why_held() -> str | None:
             if gateway_ready is not None and not gateway_ready():
                 return HELD_NO_GATEWAY
-            if not (w.auditor.seeded.is_set() and dispatcher.audit_ready(key, protocol)):
+            # A job audited in waves opens without a card: its records wait for the wave that audits them.
+            if not (w.auditor.seeded.is_set()
+                    and (getattr(w, "audit_waves", False) or dispatcher.audit_ready(key, protocol))):
                 return HELD_AWAITING_AUDIT
             return None
 
@@ -1854,6 +1953,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     drain_seconds = order_audit_drain_seconds()
     max_executors = order_max_audit_executors()
     sizing = ExecutorSizing(clock=clock)
+    waves = AuditWaves(WaveSettings.from_env(), clock=clock)
 
     async def control_status() -> dict:
         """The dispatcher's status, with each served job's completeness, and per model the executors
@@ -1865,6 +1965,10 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         backlog: dict[tuple[str, str], float | None] = {}
         # Per model, the most executors its orders allow (the fastest order's choice), within the control's.
         allowed: dict[tuple[str, str], int] = {}
+        # Per model: whether every order of it audits in waves, one is nearly full, its oldest record waiting.
+        waved: dict[tuple[str, str], bool] = {}
+        nearly_full: dict[tuple[str, str], bool] = {}
+        oldest: dict[tuple[str, str], float | None] = {}
         released: list[str] = []
         statuses: dict[str, dict] = {}
         for w in list(served.values()):
@@ -1873,6 +1977,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             model = (w.job.checkpoint_repo, w.job.checkpoint_revision)
             backlog.setdefault(model, 0.0)
             allowed[model] = max(allowed.get(model, 1), getattr(w, "audit_executors", 1))
+            waved[model] = waved.get(model, True) and getattr(w, "audit_waves", False) is True
         for job_id in list(served):
             try:
                 status = await job_set.status(job_id)
@@ -1915,6 +2020,19 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 job = served[job_id].job
                 model = (job.checkpoint_repo, job.checkpoint_revision)
                 expected = auditor.expected_audits(pending)
+                total, full = status.get("prompts_total"), status.get("prompts_full")
+                # Nearly full, or no longer open (full, retired by its run deadline or a cancel): what it holds
+                # is all it will hold, so its audit must drain whatever its size.
+                if (isinstance(total, int) and isinstance(full, int) and total > 0
+                        and full >= waves.settings.finish_share * total) \
+                        or status.get("state") in ("full", "retired", "drained"):
+                    nearly_full[model] = True
+                try:
+                    received = auditor.oldest_pending_received_at()
+                except Exception:
+                    received = None
+                if isinstance(received, (int, float)):
+                    oldest[model] = min(oldest.get(model) or math.inf, float(received))
                 if expected is None or backlog.get(model) is None:
                     backlog[model] = None
                 else:
@@ -1928,8 +2046,22 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             target = None if expected is None else executors_for_backlog(
                 expected, rate, drain_seconds=drain_seconds,
                 max_executors=min(max_executors, allowed.get(model, 1)))
-            wanted = sizing.update(key, target)
+            wave = None
+            if waved.get(model):
+                received = oldest.get(model)
+                wave = waves.update(key, expected=expected, items_per_second=rate,
+                                    nearly_full=nearly_full.get(model, False),
+                                    oldest_wait=None if received is None else max(0.0, time.time() - received))
+            if wave is not None and wave["phase"] == WAVE_WAITING:
+                # Waiting for a wave: no card wanted (a live one may finish what it holds; the fleet returns it).
+                wanted = sizing.set(key, 0)
+            else:
+                wanted = sizing.update(key, target)
             entry = document["models"].setdefault(key, {"executors_needed": 0, "live_executors": len(live)})
+            if wave is not None:
+                entry["audit_wave"] = wave
+            else:
+                entry.pop("audit_wave", None)
             entry["reusable_draw_auditor"] = dispatcher.reusable_auditor(model, AUDIT_PROTOCOL_V3)
             # Beyond what is wanted (at least the scorers a batch needs), the newest executors lease nothing more;
             # the fleet releases one only once it holds no lease (`releasing` and `idle_executors`).
@@ -1945,6 +2077,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             if wanted:
                 entry["executors_needed"] = max(entry.get("executors_needed", 0), wanted - len(live))
         sizing.forget({f"{m[0]}@{m[1]}" for m in backlog})
+        waves.forget({f"{m[0]}@{m[1]}" for m, on in waved.items() if on})
         dispatcher.set_releasing(released)
         sandbox_jobs(document, statuses)
         return document

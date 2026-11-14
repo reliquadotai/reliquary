@@ -29,12 +29,18 @@ def model_of(order: Mapping) -> str | None:
     return f"{order['model']}@{order['revision']}"
 
 
+def order_precision(order: Mapping) -> str:
+    """The precision an order's miners generate in (``corpus.job.PRECISIONS``): bf16 when it names none."""
+    return str(order.get("precision") or "bf16")
+
+
 def choose_order(orders: Sequence[Mapping], *, current: str | None = None,
-                 skip: frozenset[str] = frozenset()) -> tuple[str | None, str | None]:
+                 skip: frozenset[str] = frozenset(), precision: str = "bf16") -> tuple[str | None, str | None]:
     """The order to mine now, or None, and a model to fetch ahead (``repo@revision``), or None.
 
     Open orders first: one on the model already loaded, else the first listed. With none open, the first
-    starting order's model is fetched ahead."""
+    starting order's model is fetched ahead. Only orders in ``precision`` (the one this miner serves)."""
+    orders = [o for o in orders if order_precision(o) == precision]
     open_orders = [o for o in orders if o.get("state") == "open" and o.get("job_id") not in skip]
     for order in open_orders:
         if current is not None and model_of(order) == current:
@@ -61,7 +67,8 @@ def child_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
 
 def follow_orders(*, list_orders: Callable[[], list[dict] | None], mine: Callable[[str], int],
                   fetch: Callable[[str], None], sleep: Callable[[float], None] = time.sleep,
-                  clock: Callable[[], float] = time.monotonic, rounds: int | None = None) -> None:
+                  clock: Callable[[], float] = time.monotonic, rounds: int | None = None,
+                  precision: str = "bf16") -> None:
     """Mine open orders one after another; ``rounds`` bounds the loop (tests)."""
     current: str | None = None
     fetched: set[str] = set()
@@ -79,7 +86,7 @@ def follow_orders(*, list_orders: Callable[[], list[dict] | None], mine: Callabl
         if orders is None:
             logger.warning("the validator lists no orders (an older validator): pass --job-id")
             return
-        job_id, ahead = choose_order(orders, current=current, skip=frozenset(failed))
+        job_id, ahead = choose_order(orders, current=current, skip=frozenset(failed), precision=precision)
         if job_id is None:
             if ahead is not None and ahead not in fetched:
                 logger.info("no open order; fetching %s for the one starting", ahead)

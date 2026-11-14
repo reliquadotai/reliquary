@@ -59,6 +59,58 @@ GEN_AUDIT_PARAMS = {"audit_q": 1.0, "audit_probation_submissions": 20,
                     "audit_hold_seconds": 600, "audit_suspect_seconds": 86400,
                     "audit_ban_after_failures": 3, "audit_ban_window_seconds": 604800,
                     "audit_ban_seconds": 604800}
+# Design 2026-11-13 (verification tiers): Batch and Eval orders are audited on a sampled share by default (the
+# penalties -- probation, forfeit, retroactive voiding of a caught hotkey's unaudited rows -- carry the safety);
+# an order that asks for full verification sends audit_q 1.0. The operator sets the default share and the
+# probation length here; an order's own audit_q / audit_probation_submissions win.
+ORDER_AUDIT_Q_ENV = "RELIQUARY_ORDER_AUDIT_Q"
+DEFAULT_ORDER_AUDIT_Q = 0.05
+ORDER_AUDIT_PROBATION_ENV = "RELIQUARY_ORDER_AUDIT_PROBATION"
+# The precisions an order may name (``corpus.job.PRECISIONS``); fp8 only once its tolerance is measured.
+ORDER_PRECISIONS_ENV = "RELIQUARY_ORDER_PRECISIONS"
+DEFAULT_ORDER_PRECISIONS = ("bf16",)
+
+
+def order_audit_params(body=None, env=None) -> dict:
+    """An order's audit params: the order defaults, the operator's share and probation, then the order's own."""
+    environ = os.environ if env is None else env
+    params = dict(GEN_AUDIT_PARAMS)
+    raw = str(environ.get(ORDER_AUDIT_Q_ENV, "")).strip()
+    q = float(raw) if raw else DEFAULT_ORDER_AUDIT_Q
+    if not 0.0 < q <= 1.0:
+        raise ValueError(f"{ORDER_AUDIT_Q_ENV} must be in (0, 1], got {raw}")
+    params["audit_q"] = q
+    raw = str(environ.get(ORDER_AUDIT_PROBATION_ENV, "")).strip()
+    if raw:
+        if not raw.isdigit() or int(raw) < 1:
+            raise ValueError(f"{ORDER_AUDIT_PROBATION_ENV} must be a whole number >= 1, got {raw}")
+        params["audit_probation_submissions"] = int(raw)
+    if body is not None:
+        if getattr(body, "audit_q", None) is not None:
+            params["audit_q"] = float(body.audit_q)
+        if getattr(body, "audit_probation_submissions", None) is not None:
+            params["audit_probation_submissions"] = int(body.audit_probation_submissions)
+    return params
+
+
+def _precisions_or_bf16() -> tuple[str, ...]:
+    try:
+        return order_precisions()
+    except ValueError:
+        return DEFAULT_ORDER_PRECISIONS
+
+
+def order_precisions(env=None) -> tuple[str, ...]:
+    """The precisions orders may name now: bf16, and fp8 only when the operator lists it."""
+    from reliquary.corpus.job import PRECISIONS
+
+    raw = str((os.environ if env is None else env).get(ORDER_PRECISIONS_ENV, "")).strip()
+    names = tuple(dict.fromkeys(p.strip() for p in raw.split(",") if p.strip())) if raw \
+        else DEFAULT_ORDER_PRECISIONS
+    unknown = [p for p in names if p not in PRECISIONS]
+    if unknown:
+        raise ValueError(f"{ORDER_PRECISIONS_ENV} names unknown precisions {unknown}; known: {list(PRECISIONS)}")
+    return names
 # Renderer of a catalog source's rows: the model's own chat template.
 THINKING_RENDERERS = {False: "chat-template-v1", True: "chat-template-thinking-v1"}
 # An order's token ceiling is given in USD and converted at job creation with
@@ -160,6 +212,14 @@ class CreateJob(BaseModel):
     qualification_id: str | None = Field(default=None, min_length=1, max_length=63)
     seed: int | None = Field(default=None, ge=0, le=2**63 - 1)
     audit_q: float | None = Field(default=None, gt=0.0, le=1.0)
+    # A hotkey's audited passes (counted across orders) before its records are sampled; none: the operator's.
+    audit_probation_submissions: int | None = Field(default=None, ge=1, le=100000)
+    # A Batch order audited in waves: its model's cards are rented only when the backlog is worth one
+    # (``eval_control.AuditWaves``); generation orders only.
+    audit_waves: bool = False
+    # The precision its miners generate in and its audit replays in (``corpus.job.PRECISIONS``); forced-draw
+    # orders only, and only the ones the operator enabled (``RELIQUARY_ORDER_PRECISIONS``). None: bf16.
+    precision: str | None = Field(default=None, max_length=16)
     # The most audit executors the order control may use for this order's model (none: one), at the order's
     # chosen speed; the control's own maximum still applies.
     audit_executors: int | None = Field(default=None, ge=1, le=8)
@@ -720,8 +780,6 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail="an eval job names its sampling and max_new_tokens")
         if body.prompt_start != 0:
             raise HTTPException(status_code=422, detail="an eval job starts at the set's first problem")
-        if body.audit_q not in (None, 1.0):
-            raise HTTPException(status_code=422, detail="an eval job audits every submission (audit_q 1.0)")
         try:
             set_id = validated_set_id(body.eval_set_id)
             record, _ = await qualifications.read(body.qualification_id)
@@ -772,10 +830,17 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             checkpoint_sha256=result["checkpoint_sha256"], eos_token_id=int(result["eos_token_id"]),
             prompt_source=source.name, contract_environment=contract_environment_for(card),
             seed=seed,
-            toploc_thresholds=result["thresholds"], audit_params={"audit_q": 1.0},
+            toploc_thresholds=result["thresholds"], audit_params=audit_params_of(body),
             temperature=body.sampling.temperature, top_p=body.sampling.top_p,
             top_k=body.sampling.top_k, **draw_arguments(body),
         )
+
+    def audit_params_of(body: CreateJob) -> dict:
+        """An order's audit params (``order_audit_params``); a bad operator setting is the service's fault."""
+        try:
+            return order_audit_params(body)
+        except ValueError as exc:
+            raise HTTPException(status_code=503, detail=f"order_audit_settings_invalid: {exc}") from exc
 
     def job_seed(job_id: str) -> int:
         return int(hashlib.sha256(job_id.encode()).hexdigest()[:15], 16)
@@ -838,6 +903,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     "prompt_start": body.prompt_start, "problems": body.prompt_count,
                     "samples": body.samples_per_prompt, "sampling": body.sampling.conditions(),
                     "max_new_tokens": body.max_new_tokens, "thinking": body.thinking,
+                    **({"audit_waves": True} if body.audit_waves else {}),
                     **audit_executors_of(body)})
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -847,8 +913,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             prompt_source=body.env, toploc_thresholds=result["thresholds"],
             # Its miners submit on its own route (the order control has no legacy one).
             submit="scoped",
-            audit_params={**GEN_AUDIT_PARAMS,
-                          **({"audit_q": body.audit_q} if body.audit_q is not None else {})},
+            audit_params=audit_params_of(body),
             temperature=body.sampling.temperature, top_p=body.sampling.top_p,
             top_k=body.sampling.top_k, **draw_arguments(body),
             # A draw order's stream is keyed on its seed: the client's, else one derived from the job id.
@@ -899,8 +964,6 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if evaluation:
             if body.eval_set_id is None:
                 raise HTTPException(status_code=422, detail="an evaluation order names its eval_set_id")
-            if body.audit_q not in (None, 1.0):
-                raise HTTPException(status_code=422, detail="an eval job audits every submission (audit_q 1.0)")
         if body.eval_set_id is not None:
             if body.prompt_start != 0:
                 raise HTTPException(status_code=422, detail="an order on a set starts at its first problem")
@@ -959,11 +1022,14 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail=(
                 f"context_too_long: {longest} tokens, the model holds {pin.max_position_embeddings}"))
         seed = body.seed if body.seed is not None else job_seed(body.job_id)
+        audit = audit_params_of(body)
         if record_order:
-            from reliquary.corpus.job import draw_judge_from
+            from reliquary.corpus.job import PRECISION_JUDGES, draw_judge_from
 
+            # The precision's judge under the order's own thresholds, as the manifest writes it.
+            base = PRECISION_JUDGES[body.precision or "bf16"].to_contract()
             try:
-                judge = draw_judge_from(body.judge or {}).to_contract()
+                judge = draw_judge_from({**base, **(body.judge or {})}).to_contract()
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             try:
@@ -977,19 +1043,21 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     # An episode renders through its own renderer: no thinking toggle.
                     "thinking": None if episode is not None else body.thinking, "episode": episode,
                     "draw": body.draw, "judge": judge, "seed": seed,
-                    "audit_q": 1.0 if evaluation else (body.audit_q or GEN_AUDIT_PARAMS["audit_q"]),
+                    "audit_q": audit["audit_q"],
+                    # Written only when set: every order record before them reads as before.
+                    **({"precision": body.precision} if body.precision not in (None, "bf16") else {}),
+                    **({"audit_waves": True} if body.audit_waves else {}),
                     **({"reuse_auditors_only": True} if body.reuse_auditors_only else {}),
                     **audit_executors_of(body)})
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
-        audit = {"audit_q": 1.0} if evaluation else {
-            **GEN_AUDIT_PARAMS, **({"audit_q": body.audit_q} if body.audit_q is not None else {})}
         return dict(
             model_revision=pin.revision, model_architecture=pin.architecture,
             checkpoint_sha256=pin.checkpoint_sha256, eos_token_id=pin.eos_token_id,
             prompt_source=prompt_source, contract_environment=contract_environment, seed=seed,
             audit_params=audit, temperature=body.sampling.temperature, top_p=body.sampling.top_p,
             top_k=body.sampling.top_k, **draw_arguments(body),
+            **({"precision": body.precision} if body.precision not in (None, "bf16") else {}),
             # Its miners submit on its own route (the order control has no legacy one).
             **({} if evaluation else {"submit": "scoped"}),
             **({"episode": episode, "renderer_id": episode["renderer"]} if episode is not None else {}),
@@ -1075,8 +1143,25 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail="eval fields on a generation order: a seed keys a forced draw")
         if not evaluation and not generation and any(
                 v is not None for v in (body.qualification_id, body.seed, body.audit_q, body.draw, body.judge,
-                                        body.audit_executors)):
+                                        body.audit_executors, body.audit_probation_submissions, body.precision)):
             raise HTTPException(status_code=422, detail="eval fields on a non-eval job")
+        if body.audit_waves and not generation:
+            raise HTTPException(status_code=422, detail="audit_waves applies to generation (Batch) orders")
+        if body.precision not in (None, "bf16"):
+            try:
+                enabled = order_precisions()
+            except ValueError as exc:
+                raise HTTPException(status_code=503, detail=f"order_precision_settings_invalid: {exc}") from exc
+            from reliquary.corpus.job import PRECISIONS
+
+            if body.precision not in PRECISIONS:
+                raise HTTPException(status_code=422, detail=f"precision must be one of {list(PRECISIONS)}")
+            if body.precision not in enabled:
+                raise HTTPException(status_code=422, detail=f"precision_unavailable: {body.precision!r} is not "
+                                    f"enabled (enabled: {list(enabled)})")
+            if not pinned:
+                raise HTTPException(status_code=422, detail="precision applies to forced-draw orders (draw, no "
+                                    "qualification)")
         if body.max_price_usd_per_mtoken is not None and not (evaluation or generation):
             raise HTTPException(status_code=422, detail=(
                 "max_price_usd_per_mtoken applies to eval and generation orders"))
@@ -1572,11 +1657,21 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         snapshot, _ = await job_store.read_ledgers(job.job_id)
         slots = rebuild_ledgers(job, snapshot).slots
         set_rows = await asyncio.to_thread(set_rows_for_job, job)
+        # The order's audit share, for the report (``verification.audit_q``/``audit_level``): its registry entry's.
+        audit_q = None
+        try:
+            entries, _ = await registry_store.read_registry(strict=False)
+            entry = next((e for e in entries.values() if getattr(e, "job_id", None) == job.job_id), None)
+            params = getattr(entry, "params", None) or {}
+            if entry is not None:
+                audit_q = float(params.get("audit_q") or 1.0)
+        except Exception:
+            logger.warning("the audit share of %s is unreadable for its report", job.job_id, exc_info=True)
         return await export_delivery(
             job=job, records=records, sink=deliveries, delivery_id=delivery_id, grade=grade,
             work_dir=work_dir, clock=clock, dedupe=body.dedupe, dedupe_against=body.dedupe_against,
             schema_version=3, include_truncated=body.include_truncated is not False, filter_mode=mode,
-            output_format=body.format or "parquet", slots=slots, set_rows=set_rows)
+            output_format=body.format or "parquet", slots=slots, set_rows=set_rows, audit_q=audit_q)
 
     @router.post("/jobs/{job_id}/deliveries")
     async def create_delivery(job_id: str, body: CreateDelivery, response: Response) -> dict:
@@ -1756,7 +1851,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 "evidence": {k: list(v) for k, v in SUPPORTED_ARCHITECTURES.items()},
                 # What a forced-draw order may name (``orders``): its model's weights and its set's graders.
                 # token_ceilings: a create accepts max_price_usd_per_mtoken.
+                # audit_waves, precisions, eval_audit_q: design 2026-11-13 (verification tiers).
                 "orders": {"max_checkpoint_bytes": MAX_CHECKPOINT_BYTES, "token_ceilings": True,
+                           "audit_waves": True, "eval_audit_q": True, "precisions": list(_precisions_or_bf16()),
                            "reference_graders": {name: g.description
                                                  for name, g in sorted(REFERENCE_GRADERS.items())}}}
 

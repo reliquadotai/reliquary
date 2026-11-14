@@ -255,3 +255,17 @@ def test_generation_status_under_partial_audit():
     verdicts["s2"]["audited"] = False
     result = _collect(verdicts)
     assert result["generation_status"] == "unverified" and result["generation_verified"] is False
+
+
+def test_uncharged_draw_drift_and_audited_passes_do_not_taint_a_sampled_eval():
+    # Design 2026-11-13: a forced-draw refusal taints its hotkey only when charged, and only unaudited passes
+    # rely on their hotkey's record.
+    verdicts = {"s1": {"passed": True, "audited": False, "hotkey": "h1"},
+                "s2": {"passed": True, "audited": True, "hotkey": "h2"},
+                "s3": {"passed": False, "audited": True, "hotkey": "h1",
+                       "forced_draw": {"match": 0.97, "penalty": False}},
+                "s4": {"passed": False, "audited": True, "hotkey": "h2",
+                       "forced_draw": {"match": 0.4, "penalty": True}}}
+    assert _collect(verdicts)["generation_status"] == "sampled"
+    verdicts["s3"]["forced_draw"]["penalty"] = True
+    assert _collect(verdicts)["generation_status"] == "unverified"

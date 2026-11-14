@@ -63,7 +63,7 @@ _JOB_FIELDS = (
 # manifest that predates it stores and hashes byte-identically. A binary that
 # predates it refuses a manifest carrying it (unknown field): miners and
 # validators of a job with ``prompt_start > 0`` need a build that knows it.
-_OPTIONAL_JOB_FIELDS = ("prompt_start", "seed", "submit", "episode", "judge", "max_prompt_tokens")
+_OPTIONAL_JOB_FIELDS = ("prompt_start", "seed", "submit", "episode", "judge", "max_prompt_tokens", "precision")
 # The longest prompt a job may declare it holds (``max_prompt_tokens``): a long-context job's miners size their
 # engine to it; the wire bounds a completion at the same.
 MAX_JOB_PROMPT_TOKENS = 131072
@@ -101,6 +101,22 @@ class DrawJudge:
 # at p 0.8).
 DEFAULT_DRAW_JUDGE = DrawJudge(floor_rate=0.98, grace=8, gap_tolerance=4.0, terminal_gap=3.0,
                                edge_margin=DEFAULT_EDGE_MARGIN)
+
+# The numeric precision a forced-draw job's miners generate in and its audit replays in (design 2026-11-13
+# verification tiers). ``bf16`` is today's and is never written, so every manifest before it hashes the same; a
+# binary that predates the field refuses any other (unknown field), failing closed.
+PRECISION_BF16 = "bf16"
+PRECISION_FP8 = "fp8"
+PRECISIONS = (PRECISION_BF16, PRECISION_FP8)
+# The judge a job of each precision gets when it names none. fp8: PLACEHOLDER thresholds, not measured -- the
+# same-precision replay drifts with the miner's decode batch (pearl-lab 2026-11-13: 8 % of tokens at batch 256,
+# ~1 % at 1024); fp8 orders stay disabled (``RELIQUARY_ORDER_PRECISIONS``) until the measurement of the design's
+# section 7.3 sets these.
+PRECISION_JUDGES = {
+    PRECISION_BF16: DEFAULT_DRAW_JUDGE,
+    PRECISION_FP8: DrawJudge(floor_rate=0.95, grace=8, gap_tolerance=4.0, terminal_gap=3.0,
+                             edge_margin=DEFAULT_EDGE_MARGIN),
+}
 
 # The one value of `submit`: submissions go to the job's own scoped route
 # (order jobs, on the order control); absent, to the legacy `/corpus/submit`.
@@ -326,6 +342,17 @@ def _max_prompt_tokens(raw) -> int | None:
     return value
 
 
+def _precision(raw) -> str:
+    if "precision" not in raw:
+        return PRECISION_BF16
+    value = raw["precision"]
+    if value not in PRECISIONS or value == PRECISION_BF16:
+        # bf16 is the default and never written: a manifest naming it would hash unlike its twin.
+        raise JobError(f"precision must be one of {[p for p in PRECISIONS if p != PRECISION_BF16]} when present "
+                       f"(bf16 is the default, never written), got {value!r}")
+    return value
+
+
 def _submit(raw) -> str | None:
     if "submit" not in raw:
         return None
@@ -496,6 +523,8 @@ class JobSpec:
     # Its longest prompt, in tokens, when longer than a miner's default allowance (long context); None: the
     # default (``corpus_miner.PROMPT_ALLOWANCE_TOKENS``).
     max_prompt_tokens: int | None = None
+    # The precision its miners generate in and its audit replays in (``PRECISIONS``); written when not bf16.
+    precision: str = PRECISION_BF16
 
     @property
     def prompt_end(self) -> int:
@@ -553,6 +582,7 @@ class JobSpec:
             **({"submit": self.submit} if self.submit is not None else {}),
             **({"judge": self.judge.to_contract()} if self.judge != DEFAULT_DRAW_JUDGE else {}),
             **({"max_prompt_tokens": self.max_prompt_tokens} if self.max_prompt_tokens is not None else {}),
+            **({"precision": self.precision} if self.precision != PRECISION_BF16 else {}),
             **({"episode": self.episode.to_contract()} if self.episode is not None else {}),
         }
 
@@ -988,6 +1018,7 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
         submit=_submit(raw),
         max_prompt_tokens=_max_prompt_tokens(raw),
         judge=_judge(raw),
+        precision=_precision(raw),
         episode=(_parse_episode(raw["episode"], is_eval_source(prompt_source))
                  if "episode" in raw else None),
     )
@@ -997,6 +1028,8 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
         _check_draw_job(job)
     elif "judge" in raw:
         raise JobError("judge sets a forced draw's thresholds: a job without sampling.draw has none to judge")
+    elif "precision" in raw:
+        raise JobError("precision is replayed by a forced draw's audit: a job without sampling.draw has none")
     return job
 
 

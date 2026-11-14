@@ -327,8 +327,8 @@ def test_a_generation_job_on_any_model_is_declared_from_its_qualification(admin,
             job.sampling.max_new_tokens) == (0.7, 0.95, 0, 1024)
     assert job.seed is None and job.submit == "scoped"
     entry = admin.registry["entries"]["order-gen-11"]
-    # Every submission audited unless the order asks for a share; then sampled after a probation of 20.
-    assert entry.params["audit_q"] == 1.0
+    # Sampled at the operator's default share (design 2026-11-13) after a probation of 20.
+    assert entry.params["audit_q"] == 0.05
     assert entry.params["audit_probation_submissions"] == 20
     assert entry.contract["model_architecture"] == "Qwen3_5ForConditionalGeneration"
     toploc = [p for p in entry.contract["proofs"] if p["scheme"] == "toploc-v1"][0]
@@ -566,9 +566,9 @@ def test_one_order_control_serves_a_generation_job_on_a_third_model_next_to_eval
         await job_set.refresh()
         assert sorted(job_set.served) == ["order-eval-a", "order-eval-b", "order-gen-c"]
         served = app.state.eval_served["order-gen-c"]
-        # Every submission audited by default (an order asks for a share), every batch through the pair.
+        # Sampled at the default share after a probation of 20, every batch through the pair.
         assert (served.auditor._params.q, served.auditor._params.probation_submissions) == (
-            1.0, 20)
+            0.05, 20)
         assert served.auditor.reopen_slots is False
         assert app.state.eval_served["order-eval-a"].auditor.reopen_slots is True
         transport = httpx.ASGITransport(app=app)
