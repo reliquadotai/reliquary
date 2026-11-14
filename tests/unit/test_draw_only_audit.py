@@ -393,7 +393,7 @@ def test_an_executor_offers_v3_again_after_a_control_refused_it():
                              load_model=lambda m, r: None, prefix=EVAL_AUDIT_PREFIX, clock=lambda: now[0])
     executor.heartbeat_if_due = lambda: asyncio.sleep(0)
     asyncio.run(executor.step())
-    assert claims == [True, False]                     # refused, then claimed as before
+    assert claims == [True, True, False]               # v3+v4 refused, v3 refused, then claimed as before
     asyncio.run(executor.step())
     assert claims[-1] is False                         # not offered again at once
     upgraded[0] = True
@@ -413,3 +413,59 @@ def test_a_recheck_catches_an_executor_hiding_an_edit():
     hidden = [("ok", (), {**local[0][2], "max_miss": 0.0})]
     assert scores_agree(local, local, PROOF)
     assert not scores_agree(hidden, local, PROOF)
+
+
+def test_a_greedy_draw_goes_in_a_v4_lease_only():
+    from reliquary.validator.corpus_audit_protocol import (
+        AUDIT_PROTOCOL_V3, AUDIT_PROTOCOL_V4, AuditLease, draw_protocol)
+
+    greedy, sampled = spec(warp=Warp(top_k=1)).to_wire(), spec(warp=Warp(t=0.7, top_k=20)).to_wire()
+    assert (draw_protocol(greedy), draw_protocol(sampled)) == (AUDIT_PROTOCOL_V4, AUDIT_PROTOCOL_V3)
+    base = {"lease_id": "a" * 32, "model_id": "m", "model_revision": "r", "chunk_tokens": 32, "topk": 8,
+            "expires_at": 1e12}
+
+    def item(draw):
+        return {"tokens": [1, 2, 3], "prompt_len": 1, "proofs": [], "draw": draw}
+
+    AuditLease.model_validate({**base, "protocol": AUDIT_PROTOCOL_V4, "items": [item(greedy)]})
+    AuditLease.model_validate({**base, "protocol": AUDIT_PROTOCOL_V3, "items": [item(sampled)]})
+    for protocol, items in ((AUDIT_PROTOCOL_V3, [item(greedy)]), (AUDIT_PROTOCOL_V4, [item(sampled)]),
+                            (AUDIT_PROTOCOL_V4, [item(greedy), item(sampled)])):
+        with pytest.raises(ValueError):
+            AuditLease.model_validate({**base, "protocol": protocol, "items": items})
+
+
+def test_an_executor_that_predates_v4_never_scores_a_greedy_draw():
+    """Its noise-scored gaps would refuse honest greedy flips, and the control's local recheck would then
+    quarantine it: greedy items lease in v4 only, to executors that claim v4 (the order control and the corpus
+    validator alike), and a greedy job waits for one."""
+    import asyncio
+
+    from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS as PROOF
+    from reliquary.validator.corpus_audit_protocol import (
+        AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3, AUDIT_PROTOCOL_V4, AuditResult)
+    from reliquary.validator.eval_control import job_audit_protocol
+    from tests.unit.test_eval_control import MODEL_A, _executor, _Harness
+    from tests.unit.test_eval_draw import _job
+
+    items = [{"tokens": [1, 2, 3, 4], "prompt_len": 2, "proofs": None,
+              "draw": spec(warp=Warp(top_k=1)).to_wire()}]
+
+    async def go():
+        h = _Harness()
+        scoring = asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF, "j").score(items))
+        await asyncio.sleep(0)
+        assert h.dispatcher.claim(_executor("old"), (AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3)) is None
+        a = h.dispatcher.claim(_executor("a"), (AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3, AUDIT_PROTOCOL_V4))
+        b = h.dispatcher.claim(_executor("b"), (AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3, AUDIT_PROTOCOL_V4))
+        assert a["protocol"] == b["protocol"] == AUDIT_PROTOCOL_V4
+        for name, lease in (("a", a), ("b", b)):
+            await h.dispatcher.result(name, lease["lease_id"], AuditResult.model_validate(
+                {"scores": [{"status": "ok", "chunks": [], "draw": _diag(100)}]}))
+        assert (await scoring)[0][0] == "ok"
+
+    asyncio.run(go())
+    greedy = _job(sampling={"temperature": 1.0, "top_p": 1.0, "top_k": 1, "min_new_tokens": 2,
+                            "max_new_tokens": 100, "n": 2, "draw": "gumbel_max"})
+    assert job_audit_protocol(greedy) == AUDIT_PROTOCOL_V4
+    assert job_audit_protocol(_job()) == AUDIT_PROTOCOL_V3

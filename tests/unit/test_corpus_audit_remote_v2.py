@@ -195,7 +195,7 @@ async def test_the_router_passes_the_claimed_protocols_and_defaults_to_v1():
     assert await _router_claim({}) == [(AUDIT_PROTOCOL,)]
 
 
-async def _claim_bodies(prefix, refuse_v3=False):
+async def _claim_bodies(prefix, refuse_v3=False, refuse_v4=False):
     from reliquary.validator.corpus_audit_executor import AuditExecutor
 
     posts = []
@@ -203,8 +203,10 @@ async def _claim_bodies(prefix, refuse_v3=False):
     class Http:
         async def post(self, path, json=None, **kw):
             posts.append((path, json))
-            refused = refuse_v3 and path.endswith("/claim") and "reliquary.corpus-audit/v3" in (
-                (json or {}).get("protocols") or ())
+            offered = (json or {}).get("protocols") or ()
+            refused = path.endswith("/claim") and (
+                (refuse_v3 and "reliquary.corpus-audit/v3" in offered)
+                or ((refuse_v3 or refuse_v4) and "reliquary.corpus-audit/v4" in offered))
             return type("R", (), {"status_code": 422 if refused else 204, "raise_for_status": lambda self: None,
                                   "json": lambda self: {}})()
 
@@ -219,15 +221,42 @@ async def _claim_body(prefix):
     return (await _claim_bodies(prefix))[-1]
 
 
-async def test_the_claims_carry_v3_and_fall_back_for_a_control_that_predates_it():
-    """v3 (forced draws) on both controls; an older control refuses the field, and the executor claims as
-    before: the corpus control v1+v2, the eval control no protocols field at all."""
+async def test_the_claims_carry_v3_and_v4_and_fall_back_for_a_control_that_predates_them():
+    """v3 (forced draws) and v4 (greedy forced draws) on both controls; a control that predates v4 refuses it
+    and the executor claims v3 still; one that predates v3 too: as before (the corpus control v1+v2, the eval
+    control no protocols field at all)."""
     from reliquary.validator.corpus_audit_executor import AUDIT_PREFIX, EVAL_AUDIT_PREFIX
-    from reliquary.validator.corpus_audit_protocol import AUDIT_PROTOCOL_V3
+    from reliquary.validator.corpus_audit_protocol import AUDIT_PROTOCOL_V3, AUDIT_PROTOCOL_V4
 
-    assert (await _claim_body(AUDIT_PREFIX))["protocols"] == [*BOTH, AUDIT_PROTOCOL_V3]
-    assert (await _claim_body(EVAL_AUDIT_PREFIX))["protocols"] == [AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3]
-    first, retry = await _claim_bodies(AUDIT_PREFIX, refuse_v3=True)
+    assert (await _claim_body(AUDIT_PREFIX))["protocols"] == [*BOTH, AUDIT_PROTOCOL_V3, AUDIT_PROTOCOL_V4]
+    assert (await _claim_body(EVAL_AUDIT_PREFIX))["protocols"] == [AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3,
+                                                                   AUDIT_PROTOCOL_V4]
+    first, retry = await _claim_bodies(EVAL_AUDIT_PREFIX, refuse_v4=True)
+    assert retry["protocols"] == [AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3]
+    first, v3, retry = await _claim_bodies(AUDIT_PREFIX, refuse_v3=True)
     assert retry["protocols"] == list(BOTH)
-    first, retry = await _claim_bodies(EVAL_AUDIT_PREFIX, refuse_v3=True)
+    first, v3, retry = await _claim_bodies(EVAL_AUDIT_PREFIX, refuse_v3=True)
     assert "protocols" not in retry
+
+
+async def test_a_greedy_draw_leases_in_v4_to_an_executor_that_claims_it():
+    """The corpus validator's lanes: a greedy draw (top_k 1) never reaches a v3-only executor, whose noise-scored
+    gaps the local recheck would hold against it."""
+    from reliquary.corpus.draw_audit import DrawSpec
+    from reliquary.environment.forced_sampling import Warp
+    from reliquary.validator.corpus_audit_protocol import AUDIT_PROTOCOL_V3, AUDIT_PROTOCOL_V4
+
+    def drawn(warp):
+        spec = DrawSpec("r" * 64, 0, "rev", 0, "reliquary-eval-draw-v1", warp, 0.15)
+        return {"tokens": list(range(10, 30)), "prompt_len": 5, "proofs": [], "draw": spec.to_wire()}
+
+    d, _ = _dispatcher()
+    task = asyncio.ensure_future(d.score([drawn(Warp(top_k=1)), drawn(Warp(t=0.7, top_k=20))]))
+    await asyncio.sleep(0)
+    v3 = d.claim("pod-1", protocols=(*BOTH, AUDIT_PROTOCOL_V3))
+    assert v3["protocol"] == AUDIT_PROTOCOL_V3 and v3["items"][0]["draw"]["warp"]["top_k"] == 20
+    assert d.claim("pod-1", protocols=(*BOTH, AUDIT_PROTOCOL_V3)) is None
+    v4 = d.claim("pod-1", protocols=(*BOTH, AUDIT_PROTOCOL_V3, AUDIT_PROTOCOL_V4))
+    assert v4["protocol"] == AUDIT_PROTOCOL_V4 and v4["items"][0]["draw"]["warp"]["top_k"] == 1
+    AuditLease.model_validate(v4)
+    task.cancel()

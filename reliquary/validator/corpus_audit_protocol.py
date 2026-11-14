@@ -24,8 +24,13 @@ AUDIT_PROTOCOL = "reliquary.corpus-audit/v1"
 AUDIT_PROTOCOL_V2 = "reliquary.corpus-audit/v2"
 # Forced-draw samples: items carry their draw, scores its diagnostics.
 AUDIT_PROTOCOL_V3 = "reliquary.corpus-audit/v3"
-PROTOCOLS = (AUDIT_PROTOCOL, AUDIT_PROTOCOL_V2, AUDIT_PROTOCOL_V3)
-ProtocolName = Literal["reliquary.corpus-audit/v1", "reliquary.corpus-audit/v2", "reliquary.corpus-audit/v3"]
+# Greedy forced-draw samples (a warp keeping one token, top_k 1): v3, their misses scored on the logits alone
+# (``forced_sampling._greedy``). An executor that predates it scores them with the noise: it never claims them.
+AUDIT_PROTOCOL_V4 = "reliquary.corpus-audit/v4"
+PROTOCOLS = (AUDIT_PROTOCOL, AUDIT_PROTOCOL_V2, AUDIT_PROTOCOL_V3, AUDIT_PROTOCOL_V4)
+DRAW_PROTOCOLS = (AUDIT_PROTOCOL_V3, AUDIT_PROTOCOL_V4)
+ProtocolName = Literal["reliquary.corpus-audit/v1", "reliquary.corpus-audit/v2", "reliquary.corpus-audit/v3",
+                       "reliquary.corpus-audit/v4"]
 MAX_ITEM_SPANS = 64
 # Bounds of one lease: what keeps a request and a response a few megabytes.
 MAX_LEASE_ITEMS = 64
@@ -54,7 +59,7 @@ class ClaimRequest(_Strict):
     model_revision: str = Field(min_length=1, max_length=256)
     # What the executor can score; an executor that predates v2 sends none.
     protocols: list[ProtocolName] = Field(
-        default_factory=lambda: [AUDIT_PROTOCOL], min_length=1, max_length=3)
+        default_factory=lambda: [AUDIT_PROTOCOL], min_length=1, max_length=4)
 
 
 class HeartbeatRequest(_Strict):
@@ -112,14 +117,22 @@ class AuditLease(_Strict):
     @model_validator(mode="after")
     def _v2_iff_spans(self) -> "AuditLease":
         drawn = [item.draw is not None for item in self.items]
-        if any(drawn) or self.protocol == AUDIT_PROTOCOL_V3:
-            if not all(drawn) or self.protocol != AUDIT_PROTOCOL_V3 or self.min_chunk_tokens is not None:
-                raise ValueError("a v3 lease's items all carry a draw, and only a v3 lease's do")
+        if any(drawn) or self.protocol in DRAW_PROTOCOLS:
+            if not all(drawn) or self.protocol not in DRAW_PROTOCOLS or self.min_chunk_tokens is not None:
+                raise ValueError("a v3 or v4 lease's items all carry a draw, and only such a lease's do")
+            if any(draw_protocol(item.draw) != self.protocol for item in self.items):
+                raise ValueError("a greedy draw (top_k 1) goes in a v4 lease, any other draw in a v3 one")
             return self
         spanned = any(item.spans is not None for item in self.items)
         if spanned != (self.protocol == AUDIT_PROTOCOL_V2) or spanned != (self.min_chunk_tokens is not None):
             raise ValueError("a v2 lease carries spans and min_chunk_tokens, a v1 lease neither")
         return self
+
+
+def draw_protocol(draw: dict) -> str:
+    """The lease protocol of a drawn item (its ``DrawSpec`` wire): v4 for a greedy warp (top_k 1), else v3."""
+    warp = (draw or {}).get("warp") or {}
+    return AUDIT_PROTOCOL_V4 if warp.get("top_k") == 1 else AUDIT_PROTOCOL_V3
 
 
 class ItemScore(_Strict):
@@ -157,6 +170,9 @@ __all__ = [
     "AUDIT_PROTOCOL",
     "AUDIT_PROTOCOL_V2",
     "AUDIT_PROTOCOL_V3",
+    "AUDIT_PROTOCOL_V4",
+    "DRAW_PROTOCOLS",
+    "draw_protocol",
     "PROTOCOLS",
     "MAX_ITEM_SPANS",
     "AuditItem",

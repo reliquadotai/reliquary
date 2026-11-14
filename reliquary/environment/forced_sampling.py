@@ -608,7 +608,7 @@ def seed_consistency_diagnostics(
     miner's cut dropped never makes a gap. A token outside the support widened by ``edge_margin`` is
     impossible (miss 1); inside it, its miss is the score gap to the tight support's best, so a
     token the miner's cut kept where the validator's did not is an ordinary near-tie miss. A warp that keeps one
-    token (top_k 1: greedy) scores its misses on the logits alone (``_greedy``).
+    token (top_k 1: greedy) scores its misses on the raw logits alone (``_greedy``).
     """
     check_draw(draw, t=t, top_k=top_k, top_p=top_p, min_p=min_p)
     warp = _warp_of(t, top_k, top_p, min_p)
@@ -775,7 +775,9 @@ def _warp_slice_width(warp: Warp, edge_margin: float, vocab: int) -> int:
 def _greedy(warp: Warp) -> bool:
     """A warp that keeps one token (top_k 1): greedy decoding, whatever the noise. Its misses are scored on the
     logits alone: with the noise, an honest flip between two near-tied logits would carry the difference of two
-    independent Gumbel draws (logistic, over the 4.0 tolerance about 2 % of the time) and read as an edit."""
+    independent Gumbel draws (logistic, over the 4.0 tolerance about 2 % of the time) and read as an edit. The
+    gap is in raw logits, never divided by the temperature: the temperature does not move a greedy pick, and a
+    high one would shrink every gap (a job refuses top_k 1 at any temperature but 1, ``corpus.job``)."""
     return warp.top_k == 1
 
 
@@ -800,7 +802,7 @@ def _gumbel_warp_chunk_stats(chunk_logits, toks, draws, warp, edge_margin, stoch
     x = values / float(warp.t)
     keys = _gumbel_keys(draws, x.device)
     greedy = _greedy(warp)
-    scores = x if greedy else x + gumbel_noise_from_bits(_splitmix_bits(keys[:, None], index))
+    scores = values if greedy else x + gumbel_noise_from_bits(_splitmix_bits(keys[:, None], index))
     support = warp_support(x, warp)
     tight = warp_support(x, warp.widened(-edge_margin)) & support
     loose = warp_support(x, warp.widened(edge_margin)) | support
@@ -813,9 +815,9 @@ def _gumbel_warp_chunk_stats(chunk_logits, toks, draws, warp, edge_margin, stoch
 
     picks, _ = pick(support)
     _, best = pick(tight)
-    own = logits.gather(1, toks.unsqueeze(1)).squeeze(1) / float(warp.t)
+    own = logits.gather(1, toks.unsqueeze(1)).squeeze(1)
     if not greedy:
-        own = own + gumbel_noise_from_bits(_splitmix_bits(keys, toks))
+        own = own / float(warp.t) + gumbel_noise_from_bits(_splitmix_bits(keys, toks))
     exact = picks == toks
     near = -torch.expm1(-(best - own).clamp_min(0.0))
     possible = ((index == toks[:, None]) & loose).any(dim=-1)
@@ -859,10 +861,11 @@ def _gumbel_warp_chunk_stats_dense(chunk_logits, toks, draws, warp, edge_margin,
     tight = tight & support
     loose = loose | support
     if _greedy(warp):
-        # One token kept: the pick is the argmax (lowest id on a tie), its scores the logits alone.
-        picks = _first_max(x.masked_fill(~support, float("-inf")))
-        best = x.masked_fill(~tight, float("-inf")).max(dim=-1).values
-        own = x.gather(1, toks.unsqueeze(1)).squeeze(1)
+        # One token kept: the pick is the argmax (lowest id on a tie), its scores the raw logits alone.
+        raw = chunk_logits.float()
+        picks = _first_max(raw.masked_fill(~support, float("-inf")))
+        best = raw.masked_fill(~tight, float("-inf")).max(dim=-1).values
+        own = raw.gather(1, toks.unsqueeze(1)).squeeze(1)
     else:
         picks, _ = gumbel_argmax(x.masked_fill(~support, float("-inf")), keys)
         _, best = gumbel_argmax(x.masked_fill(~tight, float("-inf")), keys)

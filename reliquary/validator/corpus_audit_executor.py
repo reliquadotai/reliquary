@@ -18,8 +18,8 @@ from reliquary.validator.corpus_audit_protocol import (
     AUDIT_PROTOCOL,
     AUDIT_PROTOCOL_V2,
     AUDIT_PROTOCOL_V3,
+    AUDIT_PROTOCOL_V4,
     ITEM_ERROR,
-    PROTOCOLS,
     AuditLease,
 )
 from reliquary.validator.lease_executor import TOKEN_ENV, LeaseExecutor, serve_executor
@@ -166,8 +166,10 @@ class AuditExecutor(LeaseExecutor):
 
             batch_tokens = AUDIT_BATCH_TOKENS
         self._batch_tokens = batch_tokens
-        self._v3 = True
-        self._v3_retry_at = 0.0
+        # What it offers beyond v1 (and the corpus control's v2): 2 the draws v3 and v4, 1 v3 only, 0 neither.
+        # An older control refuses a protocol it does not know: the executor steps down, and offers all again later.
+        self._draws = 2
+        self._draws_retry_at = 0.0
 
     def heartbeat_detail(self) -> dict:
         return {"leases": self.leases, "loaded": self._model is not None}
@@ -256,21 +258,20 @@ class AuditExecutor(LeaseExecutor):
         await self.heartbeat_if_due()
         body = {"executor_id": self._executor_id, "model_id": self.model_id,
                 "model_revision": self.model_revision}
-        if not self._v3 and self._clock() >= self._v3_retry_at:
-            self._v3 = True
-        if self._v3:
-            # The eval control scores v1 (pairs) and v3 (forced draws).
-            body["protocols"] = list(PROTOCOLS) if self._prefix == AUDIT_PREFIX else [AUDIT_PROTOCOL,
-                                                                                       AUDIT_PROTOCOL_V3]
-        elif self._prefix == AUDIT_PREFIX:
-            body["protocols"] = [AUDIT_PROTOCOL, AUDIT_PROTOCOL_V2]
+        if self._draws < 2 and self._clock() >= self._draws_retry_at:
+            self._draws = 2
+        base = [AUDIT_PROTOCOL, AUDIT_PROTOCOL_V2] if self._prefix == AUDIT_PREFIX else [AUDIT_PROTOCOL]
+        draws = [AUDIT_PROTOCOL_V3, AUDIT_PROTOCOL_V4][:self._draws]
+        if draws or self._prefix == AUDIT_PREFIX:
+            # The eval control scores v1 (pairs), v3 (forced draws) and v4 (greedy forced draws).
+            body["protocols"] = base + draws
         response = await self._post(f"{self._prefix}/claim", body)
-        if response.status_code == 422 and self._v3:
-            # A control that predates v3 refuses it: claim as before (corpus v1+v2; eval, no field), and offer v3
-            # again later, so an upgraded control gets it without a restart.
-            logger.warning("audit control at %s does not take v3; claiming without it", self._prefix)
-            self._v3 = False
-            self._v3_retry_at = self._clock() + V3_RETRY_SECONDS
+        if response.status_code == 422 and self._draws:
+            # A control that predates v4 (or v3) refuses it: claim without it (at last as before v3: corpus v1+v2,
+            # eval no field), and offer it again later, so an upgraded control gets it without a restart.
+            logger.warning("audit control at %s does not take %s; claiming without it", self._prefix, draws[-1])
+            self._draws -= 1
+            self._draws_retry_at = self._clock() + V3_RETRY_SECONDS
             return await self.step()
         if response.status_code == 204:
             return False

@@ -114,7 +114,7 @@ def test_each_position_is_built_from_the_answers_graded_before_it(scicode, tmp_p
     platform, subnet = LocalDirectorySink(tmp_path / "bucket"), Memory()
     p1 = first(scicode, subnet, tmp_path)
     grade(platform, subnet, "order-eval-x-1", p1,
-          [("<think>no</think>```python\nimport numpy as np\ndef f(a):\n    return a\n```", True)], thinking=True)
+          [("<think>no</think>```python\nimport numpy as np\ndef f(a):\n    return a\n```", True)])
     second = scicode.next_set("order-eval-x-1", platform, subnet, tmp_path)
     assert (second["position"], second["positions"], second["count"]) == (2, 3, 2)
     card = json.loads(asyncio.run(subnet.get_bytes(subnet_key(second["set_id"], "set.json"))))
@@ -197,3 +197,59 @@ def test_the_admin_builds_the_next_position_and_combines_the_chain(admin, scicod
     # The same parts as a plain combination: another evaluation under this id.
     assert admin("POST", "/admin/v1/evaluations/order-eval-z/combine",
                  {"parts": ["order-eval-z-1", "order-eval-z-2"]}).status_code == 409
+
+
+def _edit_report(platform, eval_id, change):
+    report = asyncio.run(platform.get_json(f"evaluations/{eval_id}/report.json"))
+    change(report)
+    asyncio.run(platform.put_json(f"evaluations/{eval_id}/report.json", report))
+
+
+def test_only_a_complete_grading_of_one_model_seeds_and_reports_a_chain(scicode, tmp_path):
+    platform, subnet = LocalDirectorySink(tmp_path / "bucket"), Memory()
+    p1 = first(scicode, subnet, tmp_path)
+    grade(platform, subnet, "order-eval-w-1", p1, [("```python\ndef f(a): return a\n```", True)])
+    _edit_report(platform, "order-eval-w-1", lambda r: r.update(complete=False))
+    with pytest.raises(chains.ChainRefused, match="position_incomplete"):
+        scicode.next_set("order-eval-w-1", platform, subnet, tmp_path)
+    _edit_report(platform, "order-eval-w-1", lambda r: r.update(complete=True))
+    second = scicode.next_set("order-eval-w-1", platform, subnet, tmp_path)
+    grade(platform, subnet, "order-eval-w-2", second["set_id"], [("x", True), ("y", False)])
+    parts = ["order-eval-w-1", "order-eval-w-2"]
+    asyncio.run(chains.chain_report(chain_id="scicode-steps", platform=platform, subnet=subnet, part_ids=parts))
+    for field, value in (("model", "other/Model"), ("revision", "d" * 40), ("thinking", True)):
+        _edit_report(platform, "order-eval-w-2", lambda r: r["provenance"].update({field: value}))
+        with pytest.raises(chains.ChainRefused, match="another model"):
+            asyncio.run(chains.chain_report(chain_id="scicode-steps", platform=platform, subnet=subnet,
+                                            part_ids=parts))
+        grade(platform, subnet, "order-eval-w-2", second["set_id"], [("x", True), ("y", False)])
+
+
+@pytest.mark.parametrize("rows", [
+    lambda rows: [{**rows[0], "source_index": "0"}],
+    lambda rows: [{k: v for k, v in rows[0].items() if k != "source_index"}],
+    lambda rows: [{**rows[0], "source_index": 7}],
+    lambda rows: ["not a row"],
+])
+def test_a_malformed_grading_file_is_a_refusal_not_a_crash(admin, scicode, tmp_path, monkeypatch,  # noqa: F811
+                                                           rows):
+    import hashlib
+
+    from reliquary.validator import eval_control
+
+    monkeypatch.setattr(vs, "open_taskset", scicode.open_taskset)
+    monkeypatch.setattr(eval_control, "load_cpu_tokenizer", lambda model, revision: (Tokenizer(), 100))
+    platform, subnet = LocalDirectorySink(admin.root / "p"), SubnetEvalStore()
+    card = scicode.build(FIRST, tmp_path / "p1")
+    original = [json.loads(line) for line in (tmp_path / "p1" / "grading.jsonl").read_text().splitlines()]
+    body = "".join(json.dumps(r) + "\n" for r in rows(original)).encode()
+    (tmp_path / "p1" / "grading.jsonl").write_bytes(body)
+    card["grading_sha256"] = hashlib.sha256(body).hexdigest()
+    (tmp_path / "p1" / "set.json").write_text(json.dumps(card))
+    asyncio.run(subnet.create_bytes(subnet_key(card["set_id"], "grading.jsonl"), body))
+    asyncio.run(subnet.create_bytes(subnet_key(card["set_id"], "set.json"), json.dumps(card).encode()))
+    asyncio.run(subnet.create_bytes(subnet_key(card["set_id"], "prompts.jsonl"),
+                                    (tmp_path / "p1" / "prompts.jsonl").read_bytes()))
+    grade(platform, subnet, "order-eval-v-1", card["set_id"], [("x", True)])
+    response = admin("POST", "/admin/v1/evaluations/order-eval-v-1/chain-next", {"chain": "scicode-steps"})
+    assert response.status_code == 409, response.text

@@ -119,7 +119,14 @@ async def _answers(platform, module, position: _Position) -> tuple[dict[str, str
     if len(position.grading) != len(asked) or int(position.card.get("count", -1)) != len(asked):
         raise ChainRefused(f"set {position.set_id} holds {len(position.grading)} rows; "
                            f"its position asks {len(asked)} steps")
-    step_of = {row["problem_id"]: asked[int(row["source_index"])] for row in position.grading}
+    try:
+        indexes = {row["problem_id"]: row["source_index"] for row in position.grading}
+    except (KeyError, TypeError) as exc:
+        raise ChainRefused(f"set {position.set_id}: a grading row has no problem_id or source_index") from exc
+    if (len(indexes) != len(asked) or any(type(i) is not int for i in indexes.values())
+            or sorted(indexes.values()) != list(range(len(asked)))):
+        raise ChainRefused(f"set {position.set_id}: its grading rows are not its position's {len(asked)} steps")
+    step_of = {problem_id: asked[index] for problem_id, index in indexes.items()}
     thinking = bool((position.report.get("provenance") or {}).get("thinking"))
     answers = {step: "" for step in asked}
     passed = {step: False for step in asked}
@@ -154,6 +161,9 @@ async def next_set(*, chain_id: str, eval_id: str, platform, subnet,
     chain = chain_of(chain_id)
     module = _module(chain)
     position = await _position(platform, subnet, chain, eval_id)
+    # Only a final grading seeds the next position: one taken while its job ran would carry answers it lacks.
+    if position.report.get("complete") is not True:
+        raise ChainRefused(f"position_incomplete: {eval_id}'s grading is not complete")
     answers, _ = await _answers(platform, module, position)
     args = position.args
     last = await asyncio.to_thread(module.max_position, args.get("split", "test"),
@@ -203,9 +213,15 @@ async def chain_report(*, chain_id: str, part_ids: Sequence[str], platform, subn
     passed: dict[str, bool] = {}
     expected: dict | None = None
     split = None
+    graded = None
     for index, part_id in enumerate(part_ids):
         position = await _position(platform, subnet, chain, part_id)
         args = position.args
+        provenance = position.report.get("provenance") or {}
+        identity = (provenance.get("model"), provenance.get("revision"), bool(provenance.get("thinking")))
+        if graded is not None and identity != graded:
+            raise ChainRefused(f"{part_id} graded another model, revision or thinking mode than the chain's first")
+        graded = identity
         if index == 0:
             split = args.get("split", "test")
             if int(args.get("step", 1)) != 1 or args.get("previous"):

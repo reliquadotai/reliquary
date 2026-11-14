@@ -50,9 +50,19 @@ The audit needed one change. A miss is scored as the gap between the pick's and 
 top_k 1 an honest flip (two near-tied logits, bf16 drift) still carries the difference of the two tokens'
 independent noises, which is logistic: over the 4.0 gap tolerance about 2 % of the time, and two such misses in a
 sample charge it as an edit. `forced_sampling._greedy`: a warp that keeps one token scores its misses on the logits
-alone (`(logit_best - logit_token) / T`). The pick, the support widening (`edge_margin`: top 2 is possible) and the
-judge's thresholds are unchanged; any other warp is untouched. This runs on the audit executor (its image), not on
-miners.
+alone, in raw logits (`logit_best - logit_token`, never divided by the temperature: a high temperature would
+shrink every gap, so at T 5 eight runner-ups 19 logits down read 3.8 and passed). A job refuses `top_k 1` at any
+temperature but 1, and with `judge.edge_margin` 0 (the runner-up would be impossible, every honest flip charged)
+(`corpus.job._check_draw_job`). The pick, the support widening (top 2 possible) and the judge's thresholds are
+unchanged; any other warp is untouched.
+
+This runs on the audit executor, and an executor that predates it would score greedy samples with the noise (and
+the control's local recheck would then hold its verdicts against it). Greedy draws therefore lease in their own
+protocol, `reliquary.corpus-audit/v4` (v3's wire, `corpus_audit_protocol.draw_protocol`: a draw whose warp keeps
+one token), on the order control and the corpus validator alike: only executors that claim v4 get them, and a
+greedy job is held (`awaiting_audit`) until one is live (`eval_control.job_audit_protocol`). An executor offers v1,
+v3 and v4 (the corpus control also v2); a control that refuses v4 gets v3 offered alone, then as before v3, and
+all of them again after `V3_RETRY_SECONDS`.
 
 ## Flow
 
@@ -72,7 +82,10 @@ Catalyst (`reliquary/orders/chains.py`):
 - `next_set`: reads position k's report (`provenance.sets[0]`: the set; `provenance.model/revision/thinking`), the
   set's card and `grading.jsonl` from the subnet bucket, and its `graded.parquet`. Each row's step is
   `chain.asked_at(split, k)[source_index]`; its answer is the text its grader read (`grading.answer_text`, after the
-  reasoning block); a step with no row is recorded as no code, as upstream records a failed generation. The next
+  reasoning block); a step with no row is recorded as no code, as upstream records a failed generation. Only a
+  complete grading seeds the next position (`position_incomplete` otherwise, which ends the chain on the platform):
+  one taken before its job's records were final would carry answers the job lacks. A grading file whose rows are
+  not exactly its position's steps (`source_index` 0..n-1) is a 409, never a crash. The next
   args are `chain.next_args` (k + 1, `previous` with the extracted code). The set is built with
   `verifiers_source.build_set` and published subnet-only, create-only: its id carries a hash of its args
   (`verifiers-scicode-steps-a<8 hex>-r0-n<count>`), so a retry after a lost answer finds the same set (its card's
@@ -81,7 +94,8 @@ Catalyst (`reliquary/orders/chains.py`):
   the set).
 - `chain_report`: the main-problem and sub-step rates (`chain.summary`, upstream's denominators: a step not reached
   counts as failed), after checking the parts are one chain: the first position has no `previous`, and each next
-  position's args are exactly `next_args` of the one before and its graded answers.
+  position's args are exactly `next_args` of the one before and its graded answers, and every position graded the
+  same model, revision and thinking mode.
 - `combine` with `chain`: the report gains `chain` and its macro `pass@1` is the sub-step rate (`basis:
   chain_steps`); `complete` only when every position was graded. The stored manifest names the chain, so the same
   parts combined plainly under the same id are refused.
@@ -128,8 +142,8 @@ First position, built by the operator once (`{"split": "test", "step": 1, "previ
 1. Catalyst (order control / admin image): `chain-next`, `combine` with `chain`, `scicode_steps` 0.1.1. On ctrl-01
    the SciCode grading sidecar (`eval-grader-scicode`, runbook `docs/runbooks/order-control.md`, SciCode) and
    `RELIQUARY_EVAL_SCICODE_GRADER_SOCKET` in the admin container.
-2. Audit executor image (`EVAL_AUDIT_EXECUTOR_IMAGE`): the greedy gap. Without it, greedy orders run but honest
-   flips are refused more often (reopened slots), occasionally charged.
+2. Audit executor image (`EVAL_AUDIT_EXECUTOR_IMAGE`): the greedy gap and the v4 claim. Until one is live, a greedy
+   (SciCode) job is held `awaiting_audit`; older executors keep serving every other order.
 3. Publish the first position's set (`reliquary eval build-set` then `publish-set --publish-reviewed` or the
    platform copy by hand) and insert its `eval_sets` row (platform `docs/EVALUATIONS_API.md`, SciCode).
 4. Platform Worker.

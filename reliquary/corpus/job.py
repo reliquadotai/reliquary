@@ -1007,6 +1007,14 @@ def _check_draw_job(job: JobSpec) -> None:
         raise JobError("sampling.draw keys the draw on the job's seed: a seed is required")
     if job.prompt_order == PROMPT_ORDER_MINER_WALK:
         raise JobError("sampling.draw takes the draw slot from the cursor: a miner_walk job walks it")
+    if job.sampling.top_k == 1:
+        # Greedy: the audit scores a miss on its raw logit gap (``forced_sampling._greedy``), so only one
+        # temperature means it, and the runner-up must stay possible (an honest near-tie flip).
+        if job.sampling.temperature != 1.0:
+            raise JobError(f"a greedy draw (top_k 1) runs at temperature 1, got {job.sampling.temperature}")
+        if job.judge is not None and job.judge.edge_margin <= 0:
+            raise JobError("a greedy draw (top_k 1) needs judge.edge_margin above 0: an honest flip to the "
+                           "runner-up would be impossible")
 
 
 def is_signed_sandbox(job: JobSpec) -> bool:
