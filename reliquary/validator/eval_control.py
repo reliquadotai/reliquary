@@ -44,6 +44,7 @@ from reliquary.validator.corpus_audit_protocol import (
     AUDIT_PROTOCOL,
     AUDIT_PROTOCOL_V3,
     AUDIT_PROTOCOL_V4,
+    DRAW_PROTOCOLS,
     ITEM_ERROR,
     ITEM_OK,
     AuditResult,
@@ -735,7 +736,11 @@ class PairedAuditDispatcher:
                 "live_draw_executors": sum(1 for d in live if AUDIT_PROTOCOL_V3 in self._protocols.get(
                     d["executor_id"], ())),
                 "waiting_batches": len(waiting),
-                "waiting_draw_batches": sum(1 for b in waiting if b.protocol == AUDIT_PROTOCOL_V3),
+                "waiting_draw_batches": sum(1 for b in waiting if b.protocol in DRAW_PROTOCOLS),
+                # Greedy draws (v4) are leased only to executors that claim v4.
+                "live_greedy_executors": sum(1 for d in live if AUDIT_PROTOCOL_V4 in self._protocols.get(
+                    d["executor_id"], ())),
+                "waiting_greedy_batches": sum(1 for b in waiting if b.protocol == AUDIT_PROTOCOL_V4),
                 "awaiting_third_scorer": sum(1 for b in waiting if b.needed > max(2, self._scorers))}
         jobs = {job_id: {"needs_attention": True, "parked_batches": self.parked[job_id],
                          "reasons": list(reasons)}

@@ -469,3 +469,49 @@ def test_an_executor_that_predates_v4_never_scores_a_greedy_draw():
                             "max_new_tokens": 100, "n": 2, "draw": "gumbel_max"})
     assert job_audit_protocol(greedy) == AUDIT_PROTOCOL_V4
     assert job_audit_protocol(_job()) == AUDIT_PROTOCOL_V3
+
+
+def test_the_order_controls_claim_route_takes_v4_and_leases_it_greedy_work():
+    """Through the HTTP route (``EvalClaimRequest``): an executor offering v4 is not refused, and gets the greedy
+    batch; one offering v3 only is served nothing; an unknown protocol is still a 422."""
+    import asyncio
+
+    import httpx
+    from fastapi import FastAPI
+
+    from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS as PROOF
+    from reliquary.validator.corpus_audit_protocol import AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3, AUDIT_PROTOCOL_V4
+    from reliquary.validator.eval_control import build_eval_executor_router
+    from tests.unit.test_eval_control import MODEL_A, _executor, _Harness
+
+    documents = {eid: _executor(eid) for eid in ("old", "new")}
+    items = [{"tokens": [1, 2, 3, 4], "prompt_len": 2, "proofs": None,
+              "draw": spec(warp=Warp(top_k=1)).to_wire()}]
+
+    async def go():
+        h = _Harness(scorers=1)
+        h.directory.authenticate = lambda token, eid=None: (documents[token], None)
+        app = FastAPI()
+        app.include_router(build_eval_executor_router(dispatcher=h.dispatcher, directory=h.directory))
+        scoring = asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF).score(items))
+        await asyncio.sleep(0)
+        model = h.dispatcher.status()["models"][f"{MODEL_A[0]}@{MODEL_A[1]}"]
+        assert (model["waiting_draw_batches"], model["waiting_greedy_batches"]) == (1, 1)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://eval") as client:
+            def claim(eid, protocols):
+                return client.post("/corpus/internal/eval-audit/claim", headers={"Authorization": f"Bearer {eid}"},
+                                   json={"executor_id": eid, "model_id": MODEL_A[0], "model_revision": MODEL_A[1],
+                                         "protocols": protocols})
+
+            assert (await claim("old", [AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3])).status_code == 204
+            assert (await claim("old", [AUDIT_PROTOCOL, "reliquary.corpus-audit/v9"])).status_code == 422
+            lease = await claim("new", [AUDIT_PROTOCOL, AUDIT_PROTOCOL_V3, AUDIT_PROTOCOL_V4])
+            assert lease.status_code == 200, lease.text
+            assert lease.json()["protocol"] == AUDIT_PROTOCOL_V4
+            assert lease.json()["items"][0]["draw"]["warp"]["top_k"] == 1
+            assert h.dispatcher.audit_ready(MODEL_A, AUDIT_PROTOCOL_V4)
+            model = h.dispatcher.status()["models"][f"{MODEL_A[0]}@{MODEL_A[1]}"]
+            assert (model["live_draw_executors"], model["live_greedy_executors"]) == (2, 1)
+        scoring.cancel()
+
+    asyncio.run(go())
