@@ -72,7 +72,7 @@ Qwen3.5-9B mined and audited every run (run 5c mined with Qwen3.5-4B). Match = e
 | 1 honest T=1 | 64 | 64 completed | 64 passed | 0.994 / 0.997 | 0 |
 | 2 honest T=0.7, top_p 0.95 | 64 | 64 completed | 64 passed | 0.993 / 0.997 | 0 |
 | 3 cuts (13000 total, 256 per turn) | 64 | 55 `context_length` (reward 0), 9 completed; 182 capped turns | 64 passed | 0.993 / 0.997 | 0 |
-| 4 AutomationBench long | 47 (+1 refused at precheck) | 38 completed, 8 `max_turns`, 2 `context_length`; up to 64 turns, 58 822 tokens | 47 passed | 0.994 / 0.996 | 0 |
+| 4 AutomationBench long | 47 (+1 refused by the miner precheck, `bad_turns`) | 38 completed, 8 `max_turns`, 2 `context_length`; up to 64 turns, 58 822 tokens | 47 passed | 0.994 / 0.996 | 0 |
 | 5a re-rolled draw from turn 3 | 16 | 16 completed | 16 refused `draw_mismatch`, 16 charged | 0.862 / 0.886 | 501 |
 | 5c 4B mining the 9B order | 16 | 16 completed | 16 refused `draw_mismatch`, 15 charged | 0.902 / 0.919 | 78 |
 
