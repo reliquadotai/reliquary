@@ -232,3 +232,15 @@ def test_a_scicode_task_scores_through_the_grading_service(socket_path, monkeypa
     monkeypatch.setenv(sr.SCICODE_SOCKET_ENV, socket_path)
     # No `scicode` package here: the test file fails at its import, as a wrong answer would.
     assert vs.score_trace(task, vs.freeze(task), "```python\ndef f(a): return a\n```") == 0.0
+
+
+def test_the_chain_knows_each_positions_steps_in_set_order(monkeypatch):
+    previous = {"1.1": "def f(a): return a", "1.2": "", "62.2": ""}
+    for position in (1, 2, 3):
+        loaded = [t.data.step_number for t in taskset(monkeypatch, step=position, previous=previous)]
+        assert chain.asked_at("test", position, problems=PROBLEMS) == loaded
+    args = {"split": "test", "step": 2, "previous": {"1.1": "c"}}
+    following = chain.next_args(args, {"1.2": "```python\ndef g(a): pass\n```", "62.2": ""}, problems=PROBLEMS)
+    assert following == {"split": "test", "step": 3, "previous": {"1.1": "c", "1.2": "\ndef g(a): pass\n", "62.2": ""}}
+    with pytest.raises(ValueError, match="asks 2 steps"):
+        chain.next_args(args, {"1.2": ""}, problems=PROBLEMS)

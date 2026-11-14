@@ -97,14 +97,35 @@ grading opens it. Without the sidecar, rows grade as `grader_error` (`unreachabl
 SciCode (`verifiers:scicode-steps`, `tasksets/scicode_steps`) asks each sub-step in a fresh single-turn prompt that
 carries the model's own code for the earlier steps, as upstream does. So one SciCode evaluation is a chain of sets,
 one per step position (1..15 on the test split), each built from the graded answers of the one before
-(`scicode_steps.chain`):
+(`scicode_steps.chain`). One platform order runs the whole chain (design
+`docs/design/2026-11-14-scicode-chained-orders.md`): after each position is graded the platform calls
+`POST /admin/v1/evaluations/{eval_id}/chain-next {"chain": "scicode-steps"}`, which builds the next position's set
+from that grading, publishes it to the subnet bucket and answers its id and prompt lengths; the last position
+graded, `combine` with `"chain": "scicode-steps"` adds the main-problem and sub-step rates to the report.
+
+Only the first position is published by hand, once (it is the catalog set):
 
 ```bash
 echo '{"split": "test", "step": 1, "previous": {}}' > args-1.json
 reliquary eval build-set verifiers:scicode-steps --out sets/scicode-p1 --taskset-args @args-1.json
-# order it on the model, grade; previous = chain.record(previous, {step_number: answer text}) -> args-2.json, ...
-# when every position is graded: chain.summary("test", {step_number: passed}) -> main-problem and sub-step rates
+# verifiers-scicode-steps-a024c0a1e-r0-n64, 64 problems, prompts_sha256 b8dda24b...7410
+reliquary eval publish-set sets/scicode-p1          # subnet bucket (the jobs and the grading read it)
+# The platform copy (verifyOrderSets): prompts.jsonl and a public set.json with `order`
+python - <<'PY'
+import asyncio, json, pathlib
+from reliquary.eval.storage import PlatformEvalStore, platform_key
+d = pathlib.Path("sets/scicode-p1"); card = json.loads((d / "set.json").read_text())
+prompts = (d / "prompts.jsonl").read_bytes()
+order = [json.loads(l)["problem_id"] for l in prompts.decode().splitlines() if l.strip()]
+public = {k: card[k] for k in ("set_id", "env", "count", "prompts_sha256")} | {"order": order}
+store = PlatformEvalStore.from_environment()
+asyncio.run(store.create_bytes(platform_key(card["set_id"], "prompts.jsonl"), prompts))
+asyncio.run(store.create_bytes(platform_key(card["set_id"], "set.json"), json.dumps(public).encode()))
+PY
 ```
+
+then the platform's catalog row (platform `docs/EVALUATIONS_API.md`, SciCode). The admin host needs network to the
+Hugging Face hub (the dataset, ~2 MB, and each graded model's tokenizer).
 
 Its tests need numpy/scipy/sympy/h5py and the 1 GB reference targets, so its programs go to a second grading
 service whose sandbox root is the SciCode grading image (`docker/scicode-grader`, stored by digest in the

@@ -510,3 +510,43 @@ def test_the_forward_packs_only_under_flash_attention_without_linear_layers(monk
     assert _packed(model("flash_attention_2"))
     assert not _packed(model("sdpa"))
     assert not _packed(model("flash_attention_2", ["linear_attention", "full_attention"]))
+
+
+def test_a_greedy_flip_is_judged_on_the_logit_gap_alone():
+    """top_k 1 is greedy: the pick is the argmax whatever the noise, so an honest flip between two near-tied
+    logits is a near-tie, never the difference of the two tokens' noises (logistic: over 4 about 2 % of the
+    time); a far token is still far."""
+    greedy = Warp(t=1.0, top_k=1)
+    x = torch.tensor([[3.0, 2.99, 0.5, -1.0]] * 64)
+    us = _us(64)
+    assert _picks(x, us, greedy) == [0] * 64
+    for chunk in (fs._gumbel_warp_chunk_stats, fs._gumbel_warp_chunk_stats_dense):
+        exact, miss, _ = chunk(x, torch.ones(64, dtype=torch.long), us, greedy, 0.15, 0.95)
+        assert not exact.any()
+        assert torch.allclose(-torch.log1p(-miss), torch.full((64,), 0.01), atol=1e-5)
+    flips = _diag(x, [1] * 64, us, greedy)
+    assert -math.log1p(-flips.max_cdf_miss) == pytest.approx(0.01, abs=1e-5)
+    # Outside the support widened by the margin (top 2): impossible.
+    assert _diag(x, [2] * 64, us, greedy).max_cdf_miss == 1.0
+
+
+@pytest.mark.parametrize("t", [1.0, 5.0])
+def test_a_greedy_gap_is_in_raw_logits_whatever_the_temperature(t):
+    """The reviewer's case: eight runner-ups 19 logits below the top at T 5 read as a 3.8 gap when divided by the
+    temperature, and passed. Scored on raw logits they are far misses, refused and charged."""
+    from reliquary.corpus import eval_draw
+    from reliquary.corpus.job import DEFAULT_DRAW_JUDGE
+
+    greedy = Warp(t=t, top_k=1)
+    x = torch.full((400, 64), -40.0)
+    x[:, 0] = 0.0
+    x[:, 1] = -19.0
+    tokens = [0] * 400
+    for p in range(10, 400, 48):
+        tokens[p] = 1
+    us = _us(400)
+    for chunk in (fs._gumbel_warp_chunk_stats, fs._gumbel_warp_chunk_stats_dense):
+        _, miss, _ = chunk(x, torch.tensor(tokens), us, greedy, 0.15, 0.95)
+        assert (-torch.log1p(-miss[10].double())).item() > 18 or miss[10].item() == 1.0
+    ok, detail = eval_draw.judge([_diag(x, tokens, us, greedy)], DEFAULT_DRAW_JUDGE)
+    assert not ok and detail["penalty"] is True and detail["max_gap"] > 4.0

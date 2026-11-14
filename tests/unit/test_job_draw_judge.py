@@ -124,3 +124,22 @@ def test_a_manifest_carries_a_judge_only_when_it_differs_from_the_defaults():
                                                  "terminal_gap": 3.0}
     assert judge_field({"floor_rate": 0.98}) is None
     assert judge_field({}) is None
+
+
+def _greedy(t=1.0, **judge):
+    raw = _raw(**({"judge": {"floor_rate": 0.98, "grace": 8, "gap_tolerance": 4.0, "terminal_gap": 3.0, **judge}}
+                  if judge else {}))
+    raw["sampling"] = {**raw["sampling"], "top_k": 1, "temperature": t}
+    return raw
+
+
+def test_a_greedy_draw_runs_at_temperature_one_with_a_runner_up_possible():
+    """top_k 1 is scored on raw logit gaps: at T 5 a miss 19 logits below the top would read 3.8 if divided, so
+    only T 1 is a greedy job; and an edge margin of 0 would make an honest near-tie flip impossible."""
+    assert parse_job(_greedy()).sampling.top_k == 1
+    for t in (5.0, 0.5):
+        with pytest.raises(JobError, match="temperature 1"):
+            parse_job(_greedy(t))
+    with pytest.raises(JobError, match="edge_margin above 0"):
+        parse_job(_greedy(edge_margin=0.0))
+    assert parse_job(_greedy(edge_margin=0.1)).judge.edge_margin == 0.1

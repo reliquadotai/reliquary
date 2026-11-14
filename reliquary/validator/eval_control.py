@@ -43,10 +43,13 @@ from reliquary.protocol.toploc import ChunkResult
 from reliquary.validator.corpus_audit_protocol import (
     AUDIT_PROTOCOL,
     AUDIT_PROTOCOL_V3,
+    AUDIT_PROTOCOL_V4,
+    DRAW_PROTOCOLS,
     ITEM_ERROR,
     ITEM_OK,
     AuditResult,
     HeartbeatRequest,
+    draw_protocol,
 )
 from reliquary.validator.corpus_audit_remote import (
     AUDIT_LEASE_SECONDS,
@@ -69,6 +72,16 @@ EVAL_AUDIT_PREFIX = "/corpus/internal/eval-audit"
 MAX_SCORERS = 3
 SCORERS_ENV = "RELIQUARY_ORDER_AUDIT_SCORERS"
 DEFAULT_SCORERS = 1
+
+
+def job_audit_protocol(job) -> str | None:
+    """The lease protocol a job's samples are audited in: v4 for a greedy draw (top_k 1), v3 for another draw,
+    None (any) without one."""
+    if not has_draw(job):
+        return None
+    from reliquary.corpus.eval_draw import job_warp
+
+    return AUDIT_PROTOCOL_V4 if job_warp(job).top_k == 1 else AUDIT_PROTOCOL_V3
 
 
 def order_audit_scorers(env=None) -> int:
@@ -403,10 +416,13 @@ class PairedAuditDispatcher:
             raise RuntimeError("trajectory audit is not available on remote executors")
         plain = [k for k, item in enumerate(items) if item.get("draw") is None]
         groups = [(AUDIT_PROTOCOL, [[plain[k] for k in unit] for unit in _lease_units([items[k] for k in plain])])]
-        drawn_plain = [k for k in drawn if items[k].get("spans") is None]
-        groups.append((AUDIT_PROTOCOL_V3, [[drawn_plain[k] for k in unit]
-                                            for unit in _lease_units([items[k] for k in drawn_plain])]
-                       + [[k] for k in drawn if items[k].get("spans") is not None]))
+        # Greedy draws (top_k 1) go in v4 leases: an executor that predates v4 never scores them.
+        for protocol in (AUDIT_PROTOCOL_V3, AUDIT_PROTOCOL_V4):
+            mine = [k for k in drawn if draw_protocol(items[k]["draw"]) == protocol]
+            drawn_plain = [k for k in mine if items[k].get("spans") is None]
+            groups.append((protocol, [[drawn_plain[k] for k in unit]
+                                      for unit in _lease_units([items[k] for k in drawn_plain])]
+                           + [[k] for k in mine if items[k].get("spans") is not None]))
         for protocol, grouped in groups:
             for indexes in grouped:
                 batch = _Batch(id=next(self._ids), model=model, proof=proof,
@@ -720,7 +736,11 @@ class PairedAuditDispatcher:
                 "live_draw_executors": sum(1 for d in live if AUDIT_PROTOCOL_V3 in self._protocols.get(
                     d["executor_id"], ())),
                 "waiting_batches": len(waiting),
-                "waiting_draw_batches": sum(1 for b in waiting if b.protocol == AUDIT_PROTOCOL_V3),
+                "waiting_draw_batches": sum(1 for b in waiting if b.protocol in DRAW_PROTOCOLS),
+                # Greedy draws (v4) are leased only to executors that claim v4.
+                "live_greedy_executors": sum(1 for d in live if AUDIT_PROTOCOL_V4 in self._protocols.get(
+                    d["executor_id"], ())),
+                "waiting_greedy_batches": sum(1 for b in waiting if b.protocol == AUDIT_PROTOCOL_V4),
                 "awaiting_third_scorer": sum(1 for b in waiting if b.needed > max(2, self._scorers))}
         jobs = {job_id: {"needs_attention": True, "parked_batches": self.parked[job_id],
                          "reasons": list(reasons)}
@@ -1667,7 +1687,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             sandbox.publish(w)
         # Miners wait for the audit: what they would send before an executor of the model has
         # loaded it would only wait unaudited, or be lost on an order that never gets one.
-        protocol = AUDIT_PROTOCOL_V3 if has_draw(job) else None
+        protocol = job_audit_protocol(job)
         # And until its auditor has read the job back (a restart): what miners send before would pile up unjudged.
         # An episode order also waits for a gateway serving its env: miners refused sessions give up on it.
         gateway_ready = episode_gateway_ready(w) if job.episode is not None and is_signed_sandbox(job) else None

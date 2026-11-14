@@ -1,6 +1,6 @@
 [project]
 name = "scicode-steps"
-version = "0.1.0"
+version = "0.1.1"
 description = "SciCode (scicode-bench) as one single-turn task per sub-step, chained over the model's own earlier answers."
 requires-python = ">=3.11"
 dependencies = [

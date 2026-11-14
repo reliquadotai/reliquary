@@ -445,3 +445,14 @@ def test_the_order_control_compares_the_whole_judge_and_audit_share(admin, pins)
     assert "every submission" in qualification_refusal(sampled, job, {**declared, "audit_q": 0.15}, None)
     elsewhere = replace(entry, contract={**entry.contract, "environments": {"reliquary_logic_v2": {}}})
     assert "environments" in qualification_refusal(elsewhere, job, declared, None)
+
+
+def test_a_greedy_order_runs_at_temperature_one_only(admin, pins):  # noqa: F811
+    """top_k 1 is greedy: its audit reads raw logit gaps, so the admin refuses any other temperature (at T 5 a
+    divided gap would let runner-ups 19 logits down pass) and a zero edge margin."""
+    greedy = {"temperature": 1.0, "top_p": 1.0, "top_k": 1}
+    hot = admin("POST", "/admin/v1/jobs", _order(sampling={**greedy, "temperature": 3.0}))
+    assert hot.status_code == 422 and "temperature 1" in hot.text
+    tight = admin("POST", "/admin/v1/jobs", _order(sampling=greedy, judge={"edge_margin": 0.0}))
+    assert tight.status_code == 422 and "edge_margin" in tight.text
+    assert admin("POST", "/admin/v1/jobs", _order(sampling=greedy)).status_code == 201
