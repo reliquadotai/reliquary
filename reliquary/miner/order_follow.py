@@ -59,10 +59,32 @@ def child_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
     return {k: v for k, v in (os.environ if env is None else env).items() if k != TASK_CONTRACT_ENV_VAR}
 
 
+def single_turn_filter(read_manifest: Callable[[str], Mapping]) -> Callable[[Mapping], bool]:
+    """Whether a listed order is a single-turn one (`corpus mine`'s), read once from its manifest. An agentic
+    (episode) order is `corpus mine-agentic`'s; an unreadable manifest is tried again next time."""
+    kinds: dict[str, bool] = {}
+
+    def takes(order: Mapping) -> bool:
+        job_id = str(order.get("job_id") or "")
+        if job_id not in kinds:
+            try:
+                kinds[job_id] = (read_manifest(job_id) or {}).get("episode") is None
+            except Exception:  # noqa: BLE001 - its child would refuse it anyway
+                logger.warning("order %s: its manifest is unreadable", job_id, exc_info=True)
+                return True
+            if not kinds[job_id]:
+                logger.info("order %s is an agentic one: `reliquary corpus mine-agentic` mines it", job_id)
+        return kinds[job_id]
+
+    return takes
+
+
 def follow_orders(*, list_orders: Callable[[], list[dict] | None], mine: Callable[[str], int],
                   fetch: Callable[[str], None], sleep: Callable[[float], None] = time.sleep,
-                  clock: Callable[[], float] = time.monotonic, rounds: int | None = None) -> None:
-    """Mine open orders one after another; ``rounds`` bounds the loop (tests)."""
+                  clock: Callable[[], float] = time.monotonic, rounds: int | None = None,
+                  takes: Callable[[Mapping], bool] | None = None) -> None:
+    """Mine open orders one after another; ``rounds`` bounds the loop (tests). ``takes`` keeps the orders this
+    loop mines (`single_turn_filter`); None, every listed one."""
     current: str | None = None
     fetched: set[str] = set()
     # Orders whose child ended at once, skipped while another is open.
@@ -79,6 +101,8 @@ def follow_orders(*, list_orders: Callable[[], list[dict] | None], mine: Callabl
         if orders is None:
             logger.warning("the validator lists no orders (an older validator): pass --job-id")
             return
+        if takes is not None:
+            orders = [order for order in orders if order.get("state") not in ("open", "starting") or takes(order)]
         job_id, ahead = choose_order(orders, current=current, skip=frozenset(failed))
         if job_id is None:
             if ahead is not None and ahead not in fetched:

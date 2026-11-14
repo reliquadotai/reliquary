@@ -1534,6 +1534,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
                                 contract=getattr(wiring[0].entry, "contract", None) if len(wiring) == 1 else None)
     routes_ref["routes"] = app.state.corpus_routes
     if sandbox_services is not None:
+        app.state.corpus_routes.sandbox_hotkey = sandbox_services.validator_hotkey
         app.include_router(sandbox_services.router)
         app.state.corpus_sandbox = sandbox_services
 

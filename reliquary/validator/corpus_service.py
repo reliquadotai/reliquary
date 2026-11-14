@@ -2991,6 +2991,9 @@ class CorpusJobRoutes:
         # taken turns that continue after their HTTP handler is cancelled.
         self.in_flight: collections.Counter = collections.Counter()
         self.default = default if default is not None else next(iter(self.routers), None)
+        # The ss58 address signed-sandbox session requests are signed for, when this app serves sessions:
+        # `JOBS_PATH` tells miners, so they need no ``--validator-hotkey``.
+        self.sandbox_hotkey: str | None = None
 
     def add(self, job_id: str, router: APIRouter, *, contract: Any = None,
             prompt_source: str | None = None, spec: Any = None) -> None:
@@ -3183,7 +3186,10 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
     @router.get(JOBS_PATH)
     async def corpus_jobs() -> dict:
         # ``jobs``: the ids open to mine now (older miners read it); ``orders``: every served job and its state.
-        return {"jobs": routes.open_jobs(), "orders": routes.orders()}
+        listing = {"jobs": routes.open_jobs(), "orders": routes.orders()}
+        if routes.sandbox_hotkey:
+            listing["sandbox_hotkey"] = routes.sandbox_hotkey
+        return listing
 
     @router.get(JOB_SCOPED_PATH)
     async def corpus_job_scoped(job_id: str) -> dict:

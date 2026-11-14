@@ -98,7 +98,7 @@ def test_corpus_mine_without_a_job_follows_the_listed_orders(monkeypatch):
     seen = {}
     monkeypatch.setattr(main, "_served_orders", lambda url, strict=False: [])
 
-    def fake_follow(*, list_orders, mine, fetch):
+    def fake_follow(*, list_orders, mine, fetch, takes=None):
         seen["orders"] = list_orders()
         mine("order-gen-1")
 

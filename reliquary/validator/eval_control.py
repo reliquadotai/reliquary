@@ -1821,6 +1821,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     app = FastAPI()
     app.include_router(build_corpus_jobs_router(routes, legacy=False))
     if sandbox is not None:
+        routes.sandbox_hotkey = getattr(sandbox, "validator_hotkey", None)
         # /corpus/jobs/{job_id}/sandbox/sessions: the episode orders' sessions, under this control's key.
         app.include_router(sandbox.router)
         app.state.corpus_sandbox = sandbox

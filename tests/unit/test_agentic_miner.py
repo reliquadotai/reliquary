@@ -566,3 +566,66 @@ def test_the_http_client_reads_the_open_route_and_tolerates_its_absence():
     answers["next"] = httpx.Response(410, json={"detail": "job_retired"})
     with pytest.raises(CorpusJobRetired):
         client("swe-v1").open_prompts()
+
+
+class AuctionClient(FakeClient):
+    """A draw job priced by auction: no lease until this hotkey has an ask, then one lease per episode."""
+
+    def __init__(self):
+        super().__init__()
+        self.asks, self.leases, self._asked = [], 0, False
+
+    def ask(self, body):
+        self.asks.append(body)
+        self._asked = True
+        return {"accepted": True, "reason": "accepted"}
+
+    def lease(self, body):
+        if not self._asked:
+            return {"leased": False, "reason": "no_ask"}
+        self.leases += 1
+        return {"leased": True, "prompt_index": self.leases, "slot": 0, "lease_id": f"l{self.leases}"}
+
+    def release_lease(self, body):
+        return {"leased": False, "reason": "released"}
+
+
+def _drawn_job():
+    raw = _manifest(prompt_count=50, seed=11)
+    raw["sampling"] = dict(raw["sampling"], draw="gumbel_max")
+    return parse_job(raw)
+
+
+def test_an_agentic_miner_posts_its_ask_before_leasing_on_an_auctioned_job():
+    client = AuctionClient()
+    identity = Identity("5Hot", sign=lambda body: "sig", episodes=2, sign_lease=lambda body: "lsig",
+                        ask_alpha_per_mtoken=0.4, ask_capacity=8)
+    counts = asyncio.run(mine_agentic(
+        job=_drawn_job(), identities=[identity], client=client, engine=FakeEngine(),
+        runners={harness_key(None): FakeRunner()}, decode=lambda ids: "".join(map(str, ids)),
+        concurrency=1))
+    # The fake engine's sessions are not drawn ones, so the episodes themselves are not what is tested here.
+    assert client.leases == 2, counts
+    ask = client.asks[0]
+    assert ask["miner_hotkey"] == "5Hot" and ask["capacity"] == 8
+    assert ask["micro_alpha_per_mtoken"] == 400_000
+    assert counts["5Hot"]["lease_no_ask"] == 0          # the ask went first: no lease was refused for it
+
+
+def test_without_an_ask_an_auctioned_job_waits_and_says_why(monkeypatch):
+    from reliquary.miner import agentic_miner
+
+    monkeypatch.setattr(agentic_miner, "DRAW_SLOT_WAIT_SECONDS", 0.01)
+    client = AuctionClient()
+    identity = Identity("5Hot", sign=lambda body: "sig", episodes=1, sign_lease=lambda body: "lsig")
+
+    async def run():
+        task = asyncio.ensure_future(mine_agentic(
+            job=_drawn_job(), identities=[identity], client=client, engine=FakeEngine(),
+            runners={harness_key(None): FakeRunner()}, decode=lambda ids: "".join(map(str, ids)),
+            concurrency=1))
+        await asyncio.sleep(0.2)
+        task.cancel()
+
+    asyncio.run(run())
+    assert client.asks == [] and client.leases == 0

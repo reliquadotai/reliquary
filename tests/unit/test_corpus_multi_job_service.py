@@ -168,3 +168,15 @@ def test_two_jobs_on_one_source_split_it_by_range(seeded_job, fake_r2):
     crossed = post("sft-v1", 500 + 1, 3)
     assert crossed["reason"] == "prompt_mismatch"
     assert post("rl-v1", 499, 3)["reason"] == "prompt_mismatch"
+
+
+def test_the_jobs_list_names_the_sandbox_hotkey_when_sessions_are_served(seeded_job, fake_r2):
+    from reliquary.validator.corpus_service import CorpusJobRoutes, build_corpus_jobs_router
+
+    routes = CorpusJobRoutes({"swe-v1": _router(seeded_job, "swe-v1")})
+    app = FastAPI()
+    app.include_router(build_corpus_jobs_router(routes))
+    client = TestClient(app)
+    assert "sandbox_hotkey" not in client.get("/corpus/jobs").json()
+    routes.sandbox_hotkey = "5Validator"
+    assert client.get("/corpus/jobs").json()["sandbox_hotkey"] == "5Validator"

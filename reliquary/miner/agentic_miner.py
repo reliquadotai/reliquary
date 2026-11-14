@@ -64,6 +64,10 @@ class Identity:
     sign_binding: Callable[[bytes], str] | None = None
     # Draw jobs: signs a light lease request or release (``corpus.draw_leases``); None, slots from the open map.
     sign_lease: Callable[[dict], str] | None = None
+    # A job priced by auction (``corpus.token_auction``): the alpha per million verified tokens this hotkey works
+    # for, posted before its first lease and again as `corpus_miner.mine_steps` does; None posts no ask.
+    ask_alpha_per_mtoken: float | None = None
+    ask_capacity: int | None = None
 
 
 def harness_key(harness_env: dict | None) -> tuple:
@@ -285,12 +289,35 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
     rng = random.Random(secrets.randbits(64))
     # A draw job's light leases (``corpus.draw_leases``): on while the validator grants them.
     leasing = [drawn and identity.sign_lease is not None and callable(getattr(client, "lease", None))]
+    asking = (leasing[0] and identity.ask_alpha_per_mtoken is not None
+              and callable(getattr(client, "ask", None)))
+    asked_at: list[float | None] = [None]
+
+    def post_ask(force: bool = False) -> None:
+        """This hotkey's ask on a job priced by auction, every ``ASK_REPOST_SECONDS`` (or now, ``force``)."""
+        from reliquary.corpus.token_auction import ASK_REPOST_SECONDS
+        from reliquary.miner.corpus_miner import ask_body
+
+        now = time.monotonic()
+        if not asking or (not force and asked_at[0] is not None and now - asked_at[0] < ASK_REPOST_SECONDS):
+            return
+        try:
+            answer = client.ask(ask_body(job.job_id, identity.hotkey, identity.ask_alpha_per_mtoken,
+                                         identity.sign_lease, identity.ask_capacity))
+        except Exception as exc:  # noqa: BLE001 - the next lease asks again
+            logger.warning("%s: posting the ask failed (%r)", tag, exc)
+            return
+        asked_at[0] = now
+        if answer is not None and not answer.get("accepted"):
+            counts[f"ask_{answer.get('reason')}"] += 1
+            logger.warning("%s: the validator refused this hotkey's ask: %s", tag, answer.get("reason"))
 
     def take_lease():
         """``((prompt, slot), lease_id)``, ``"wait"`` (none free now), ``"complete"``, or None (no leases here:
         slots from the open map)."""
         from reliquary.miner.corpus_miner import _LEASE_FALLBACK, lease_body
 
+        post_ask()
         try:
             answer = _retry(lambda: client.lease(lease_body(job.job_id, identity.hotkey, identity.sign_lease)),
                             sleep=time.sleep, counts=counts, max_consecutive_failures=5)
@@ -311,6 +338,11 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             leasing[0] = False
             return None
         counts[f"lease_{reason}"] += 1
+        if reason == "no_ask":
+            if asking:
+                post_ask(force=True)
+            elif counts["lease_no_ask"] == 1:
+                logger.warning("%s: this job is priced by auction: set --ask-alpha-per-mtoken to get leases", tag)
         return "wait"
 
     def release_lease(lease_id: str) -> None:
