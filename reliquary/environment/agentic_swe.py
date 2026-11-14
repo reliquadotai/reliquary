@@ -27,6 +27,7 @@ from reliquary_harness.spec import BASH_VF_B2E4E81 as HARNESS
 from reliquary_harness.variant import variant_count, variant_index
 
 from reliquary.environment.agentic.types import EpisodeTask
+from reliquary.shared.dist_commit import dist_commit as _dist_commit
 
 HARNESS_DIGEST = "d5ac836122c87977e54e3c526be1d147e12984a196acabc69b8ac2be7769347a"
 """The bash harness this build renders, checks and mines with (`HARNESS.digest`): an
@@ -217,37 +218,6 @@ def policy_harness_refusal(policy) -> str | None:
         refusal = harness_pin_refusal(pin, variants=True)
         if refusal:
             return refusal
-    return None
-
-
-def _dist_commit(name: str) -> str | None:
-    """The commit a distribution was installed from: its VCS pin, or the HEAD
-    of the checkout an editable install points at. None when unknowable."""
-    try:
-        raw = importlib.metadata.distribution(name).read_text("direct_url.json")
-    except importlib.metadata.PackageNotFoundError:
-        return None
-    if not raw:
-        return None
-    info = json.loads(raw)
-    commit = (info.get("vcs_info") or {}).get("commit_id")
-    if commit:
-        return commit
-    url = info.get("url") or ""
-    if url.startswith("file://"):
-        checkout = url[len("file://"):]
-        git = ["git", "-c", "safe.directory=*", "-C", checkout]
-        try:
-            head = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True,
-                                  timeout=10)
-            dirty = subprocess.run(git + ["status", "--porcelain"], capture_output=True, text=True,
-                                   timeout=30)
-        except (subprocess.TimeoutExpired, OSError):
-            return None
-        # An editable checkout with local changes is not the pinned code,
-        # whatever its HEAD says: report nothing rather than the commit.
-        if head.returncode == 0 and dirty.returncode == 0 and not dirty.stdout.strip():
-            return head.stdout.strip()
     return None
 
 

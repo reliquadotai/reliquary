@@ -348,9 +348,12 @@ teacher forcing are not bit-identical on every supported stack.
 ```bash
 git clone <repo-url> reliquary
 cd reliquary
-python3.11 -m venv .venv && source .venv/bin/activate
-pip install -e .
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -e ".[sandbox-miner]" && reliquary miner-envs --sync
 ```
+
+To update: `git pull && pip install -e ".[sandbox-miner]" && reliquary miner-envs --sync`. See
+`docs/mining-orders.md` for what the env packages serve.
 
 Verify:
 

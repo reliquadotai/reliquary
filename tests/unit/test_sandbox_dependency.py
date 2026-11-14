@@ -15,7 +15,7 @@ def test_every_sandbox_extra_pins_the_same_commit_as_the_code():
     extras = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["optional-dependencies"]
     pins = set()
     for name in ("sandbox", "sandbox-miner", "sandbox-test"):
-        (spec,) = extras[name]
+        spec = extras[name][0]
         assert spec.startswith("reliquary-sandbox")
         pins.add(re.search(r"@([0-9a-f]{40})$", spec).group(1))
     assert pins == {sandbox.SANDBOX_COMMIT}
