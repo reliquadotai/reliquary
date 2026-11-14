@@ -65,7 +65,9 @@ class SubmittedGroup:
                                None if self.spans is None else self.spans[rollout_index])
 
     def model_tokens(self, rollout_index: int) -> int:
-        return len(self.model_positions(rollout_index))
+        if self.spans is None:
+            return len(self.completions[rollout_index])
+        return sum(max(0, int(end) - int(start)) for start, end in self.spans[rollout_index])
 
     def pack(self) -> bytes:
         return zlib.compress(json.dumps(asdict(self), separators=(",", ":")).encode(), 6)
@@ -144,7 +146,7 @@ class TrainingBuffer:
             self.book.db.execute("INSERT INTO rl_buffer(lease_id, environment, k, arrived_at, hotkey, state, body) "
                                  "VALUES(?,?,?,?,?,?,?)", (group.lease_id, group.environment, group.checkpoint,
                                                            group.arrived_at, group.hotkey, QUEUED, group.pack()))
-        tokens = sum(len(c) for c in group.completions)
+        tokens = sum(group.model_tokens(i) for i in range(len(group.completions)))
         with self.book.lock:
             self._arrived[group.environment] = self._arrived.get(group.environment, 0) + tokens
 
@@ -195,7 +197,7 @@ class TrainingBuffer:
             self._waiting_since = now if len(rows) < limit else None
         groups = [SubmittedGroup.unpack(body) for _, body in rows]
         with self.book.lock:
-            self._taken += sum(len(c) for g in groups for c in g.completions)
+            self._taken += sum(g.model_tokens(i) for g in groups for i in range(len(g.completions)))
         return groups
 
     def _urgent_below(self) -> int | None:

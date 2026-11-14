@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from collections.abc import Callable
 from typing import Any
 
@@ -203,26 +204,46 @@ class TrainerAudits:
         if limit <= 0:
             return 0
         began = self.clock()
-        done = 0
-        while done < limit and not (done and self.clock() - began > budget_s):
-            # taken a few at a time: a group body is large, and what the budget leaves is downloaded again
-            jobs = self.source.take_audits(min(AUDIT_CHUNK, limit - done))
-            if not jobs:
-                break
-            for group in jobs:
-                if done and self.clock() - began > budget_s:
-                    break                       # the rest stay queued for the next round
-                result = self.audit_fn(model, group)
-                try:
-                    self.source.report_audit(group.lease_id, result)
-                except Exception as exc:
-                    if not (isinstance(exc, LookupError) or getattr(exc, "status", None) == 404):
+        done, taken = 0, 0
+        try:
+            while taken < limit and not (done and self.clock() - began > budget_s):
+                jobs = self.source.take_audits(min(AUDIT_CHUNK, limit - taken))
+                if not jobs:
+                    break
+                taken += len(jobs)
+                for group in jobs:
+                    if done and self.clock() - began > budget_s:
+                        break                       # the rest stay queued for the next round
+                    attempt_id = uuid.uuid4().hex
+                    try:
+                        started = self.source.start_audit(group.lease_id, attempt_id)
+                    except Exception as exc:
+                        if isinstance(exc, LookupError) or getattr(exc, "status", None) == 404:
+                            continue
                         raise
-                    # concluded meanwhile (dropped as stale): nothing to report
-                done += 1
-        spent = self.clock() - began
-        self.done += done
-        self.seconds += spent
+                    if not started:
+                        continue
+                    try:
+                        result = self.audit_fn(model, group)
+                    except Exception:
+                        try:
+                            self.source.report_audit_failure(group.lease_id, attempt_id)
+                        except Exception as exc:
+                            if not (isinstance(exc, LookupError) or getattr(exc, "status", None) == 404):
+                                raise
+                        # CUDA/collective errors can leave followers unusable: let the process group restart.
+                        raise
+                    try:
+                        self.source.report_audit(group.lease_id, result)
+                    except Exception as exc:
+                        if not (isinstance(exc, LookupError) or getattr(exc, "status", None) == 404):
+                            raise
+                        # concluded meanwhile (dropped as stale): nothing to report
+                    done += 1
+        finally:
+            spent = self.clock() - began
+            self.done += done
+            self.seconds += spent
         if done:
             logger.info("trainer audits: %d judged in %.1fs", done, spent)
         return done
