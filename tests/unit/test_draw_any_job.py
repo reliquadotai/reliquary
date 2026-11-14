@@ -64,10 +64,13 @@ def test_a_draw_on_a_suite_episode_is_accepted():
     from reliquary.corpus.job import _check_draw_job
     from types import SimpleNamespace
 
-    job = SimpleNamespace(seed=1, prompt_order=PROMPT_ORDER_FREE, episode=SimpleNamespace(harness="suite"))
+    sampling = SimpleNamespace(top_k=0, temperature=1.0)
+    job = SimpleNamespace(seed=1, prompt_order=PROMPT_ORDER_FREE, episode=SimpleNamespace(harness="suite"),
+                          sampling=sampling, judge=None)
     _check_draw_job(job)
     with pytest.raises(JobError, match="seed"):
-        _check_draw_job(SimpleNamespace(seed=None, prompt_order=PROMPT_ORDER_FREE, episode=job.episode))
+        _check_draw_job(SimpleNamespace(seed=None, prompt_order=PROMPT_ORDER_FREE, episode=job.episode,
+                                        sampling=sampling, judge=None))
 
 
 # ------------------------------------------------------------------ prompts as token ids
