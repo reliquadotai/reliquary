@@ -927,6 +927,8 @@ _NEVER_TALLIED = frozenset({"environment_unserved"})
 OURS_REFUSALS = frozenset(CAPACITY_REFUSALS | {
     "sandbox_capacity", "directory_unavailable", "store_unavailable", "task_unavailable", "ledger_unavailable",
     "job_not_ready"})
+# A quota refusal (`corpus_quota`) of a hotkey within its own allowance: the fleet was full, or not known yet.
+QUOTA_FLEET_REFUSALS = frozenset({"fleet", "no fleet capacity known yet"})
 OURS_REFUSALS_KEPT_S = 6 * 3600
 OURS_REFUSALS_PER_KEY = 16
 OURS_REFUSALS_MAX_KEYS = 50_000
@@ -1235,7 +1237,7 @@ class SessionIssuer:
         if isinstance(outcome, Refusal):
             self._event("open_refused", outcome.reason, getattr(terms, "env", None),
                         getattr(terms, "engagement", None), getattr(terms, "image", None))
-            self._note_ours(hotkey, engagement, outcome)
+            self._note_ours(hotkey, engagement, outcome, terms)
         self._capacity_refused(hotkey, engagement, outcome, terms)
         return outcome
 
@@ -1252,16 +1254,23 @@ class SessionIssuer:
         except Exception:
             logger.exception("the corpus quota could not keep the want of %s", hotkey[:12])
 
-    def _note_ours(self, hotkey: str, engagement: Mapping[str, Any], refusal: Refusal) -> None:
-        """Remember a corpus open our side refused (`OURS_REFUSALS`, or the quota's fleet-full refusal), for the
-        draw lease of that prompt (`refused_ours`)."""
+    def _note_ours(self, hotkey: str, engagement: Mapping[str, Any], refusal: Refusal, terms=None) -> None:
+        """Remember a corpus open our side refused, for the draw lease of that prompt (`refused_ours`). Ours:
+        `OURS_REFUSALS`, except a saturation or full queue of the miner's own operator's making (`_self_caused`, as
+        `_capacity_refused` judges it); and a quota refusal only when the hotkey was within its own allowance (the
+        fleet itself was full, or not known yet), never one over its own allowance."""
+        if engagement.get("kind") != "corpus":
+            return
         ours = refusal.reason in OURS_REFUSALS
-        if not ours and refusal.reason.startswith("quota_") and self._quota is not None:
+        if ours and refusal.reason in CAPACITY_REFUSALS and terms is not None:
             try:
-                ours = bool(self._quota._is_fleet_full(refusal))
+                ours = not self._self_caused(hotkey, terms, refusal)
             except Exception:
+                logger.exception("the saturation attribution failed; the refusal is not excused")
                 ours = False
-        if not ours or engagement.get("kind") != "corpus":
+        if not ours and refusal.reason == "quota_live":
+            ours = (refusal.detail or {}).get("why") in QUOTA_FLEET_REFUSALS
+        if not ours:
             return
         job_id, index = engagement.get("job_id"), engagement.get("prompt_index")
         if not isinstance(job_id, str) or isinstance(index, bool) or not isinstance(index, int):
@@ -1274,10 +1283,11 @@ class SessionIssuer:
             for stale in [k for k, v in self._ours_refused.items() if v[-1][0] < now - OURS_REFUSALS_KEPT_S]:
                 del self._ours_refused[stale]
 
-    def refused_ours(self, hotkey: str, job_id: str, prompt_index: int, since: float) -> str | None:
-        """The reason our side last refused a corpus open of ``hotkey`` on this prompt at or after ``since``, or
-        None."""
-        found = [why for at, why in self._ours_refused.get((str(hotkey), str(job_id), int(prompt_index)), ())
+    def refused_ours(self, hotkey: str, job_id: str, prompt_index: int,
+                     since: float) -> tuple[int, str] | None:
+        """``(when, reason)`` of the last corpus open of ``hotkey`` on this prompt our side refused at or after
+        ``since``, or None."""
+        found = [(at, why) for at, why in self._ours_refused.get((str(hotkey), str(job_id), int(prompt_index)), ())
                  if at >= int(since)]
         return found[-1] if found else None
 
@@ -1563,6 +1573,10 @@ class SessionIssuer:
             final = result.final.to_dict()
             if self._record_faults and not withdraw:
                 fault = runtime_start_fault(final) or pool_abort_fault(final)
+            elif not withdraw:
+                # A corpus session keeps only the gateway's grading-pool abort: other miners' gradings held its
+                # machine, never this miner's doing (its draw lease is not charged: `corpus_lease_faults`).
+                fault = pool_abort_fault(final)
         state = (CLOSED if withdraw else ABORTED if status == STATUS_ABORTED
                  else CLOSED_GRADED if status == STATUS_GRADED or self._submittable_close(record, final)
                  else CLOSED)

@@ -79,9 +79,12 @@ order that pays less is not dropped for a better one that opens later: its lease
   order list names it (`sandbox_hotkey`), so `--validator-hotkey` is needed only against a validator that does not.
   When both are there and differ, `--validator-hotkey` wins and no signed-sandbox order is mined (its requests
   would be refused): fix or drop the flag.
-- **Our failures are not yours.** A lease whose episode our side failed (an open refused because the sandbox fleet
-  is full or short, a drained machine or lost gateway, a `box_failed` or `aborted` session, at most 48 of those two
-  a day) is not charged: no debt, no halved capacity.
+- **Our failures are not yours.** A lease whose episode our side failed is not charged (no debt, no halved
+  capacity), judged from the validator's own records: the last session of that prompt since the lease, when one ran
+  after our last refusal, decides (a drained machine or lost gateway, a `box_failed` box, an abort because other
+  miners' gradings held the grading pool); otherwise an open we refused (the fleet full while you were within your
+  allowance, our task, ledger, store or directory down). A session that ended your way (expired, graded and never
+  submitted, any other abort) is charged. `box_failed` is free at most 48 times a day per hotkey, all orders together.
 - **Auctioned orders.** `--ask-alpha-per-mtoken` (and `--ask-capacity`, default `--concurrency`) is posted before
   the first lease, as for single-turn orders. Without an offer an auctioned order leases nothing.
 
