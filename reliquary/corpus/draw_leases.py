@@ -9,19 +9,25 @@ slot is left, a slot leased for more than half its time may be leased to a secon
 taking it, so a job's last slots never wait for a slow or vanished miner. A miner that asks for no lease (an older
 one) still submits any slot no one else holds.
 
-The leases live in the process that serves the job's routes; a restart drops them, which only lets two miners decode
-the same slot until the next leases are granted.
+The leases live in the process that serves the job's routes. With a ``state_path`` they are written there on every
+change (a lease lost would refuse its miner's submission, one settled but restored would be charged unused) and read
+back at start, so a control restart keeps every lease still running: a job priced by
+auction refuses a submission without its lease (2026-11-14: three restarts in a day dropped every miner's leases in
+flight). Without one, a restart drops them.
 """
 from __future__ import annotations
 
 import collections
+import json
 import logging
+import os
 import random
 import secrets
 import threading
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -89,7 +95,8 @@ class DrawLeases:
                  max_per_hotkey: int = MAX_LEASES_PER_HOTKEY, seconds: float | None = None,
                  limit_per_hotkey: bool = True,
                  on_unused: Callable[[Lease, float], None] | None = None,
-                 validator_fault: Callable[[Lease], tuple[str, str] | None] | None = None) -> None:
+                 validator_fault: Callable[[Lease], tuple[str, str] | None] | None = None,
+                 state_path: str | os.PathLike | None = None) -> None:
         """``limit_per_hotkey`` False (a job priced by auction): no per-hotkey cap, the price decides who works.
         ``on_unused(lease, held_fraction)`` hears of a lease that ended without its slot taken: expired (1) or
         released (the share of its time it was held). ``validator_fault(lease)`` names ``(cause, detail)`` when
@@ -112,6 +119,51 @@ class DrawLeases:
         self._unused: dict[str, list[float]] = {}
         # The route grants off the event loop and refuses and settles on it.
         self._lock = threading.RLock()
+        self._state_path = Path(state_path) if state_path is not None else None
+        self._dirty = False
+        self._load()
+
+    # -- state ---------------------------------------------------------------
+
+    def _load(self) -> None:
+        """The leases still running in ``state_path``; one that expired meanwhile is dropped uncharged (it ran out
+        while we were down)."""
+        if self._state_path is None or not self._state_path.exists():
+            return
+        try:
+            state = json.loads(self._state_path.read_text())
+            now = self._clock()
+            for raw in state.get("leases", ()):
+                lease = Lease(**raw)
+                if lease.expires_at > now:
+                    self._by_id[lease.lease_id] = lease
+                    self._by_slot.setdefault((lease.prompt_index, lease.slot), []).append(lease.lease_id)
+            self._unused = {str(h): [float(t) for t in ts] for h, ts in (state.get("unused") or {}).items()}
+            logger.info("draw leases: %d lease(s) still running restored from %s", len(self._by_id),
+                        self._state_path)
+        except (OSError, ValueError, TypeError):
+            logger.exception("draw leases: state %s unreadable; starting with no lease", self._state_path)
+
+    def _changed(self) -> None:
+        self._dirty = True
+        self.save()
+
+    def save(self) -> None:
+        """Write the live leases to ``state_path`` if they changed."""
+        if self._state_path is None:
+            return
+        with self._lock:
+            if not self._dirty:
+                return
+            try:
+                self._state_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self._state_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps({"leases": [asdict(lease) for lease in self._by_id.values()],
+                                           "unused": self._unused}))
+                os.replace(tmp, self._state_path)
+                self._dirty = False
+            except OSError:
+                logger.exception("draw leases: state %s not written", self._state_path)
 
     # -- bookkeeping ---------------------------------------------------------
 
@@ -124,6 +176,7 @@ class DrawLeases:
         lease = self._by_id.pop(lease_id, None)
         if lease is None:
             return
+        self._dirty = True
         key = (lease.prompt_index, lease.slot)
         held = [other for other in self._by_slot.get(key, ()) if other != lease_id]
         if held:
@@ -150,6 +203,7 @@ class DrawLeases:
                     self._unused[hotkey] = recent
                 else:
                     del self._unused[hotkey]
+            self.save()
 
     def _fault(self, lease: Lease) -> tuple[str, str] | None:
         if self._validator_fault is None:
@@ -241,6 +295,7 @@ class DrawLeases:
         self._by_id[lease.lease_id] = lease
         self._by_slot.setdefault((lease.prompt_index, lease.slot), []).append(lease.lease_id)
         self._log(event, lease, "" if price is None else f" price={price:.3g}")
+        self._changed()
         return lease
 
     def release(self, hotkey: str, lease_id: str) -> bool:
@@ -257,6 +312,7 @@ class DrawLeases:
                 return True
             self._log("released", lease, f" held={held:.2f}")
             self._unused_lease(lease, held)
+            self.save()
             return True
 
     # -- the submission's side -----------------------------------------------
@@ -283,6 +339,7 @@ class DrawLeases:
                 lease = self._by_id[lease_id]
                 self._drop(lease_id)
                 self._log("taken", lease, f" after={round(now - lease.granted_at)}")
+            self.save()
 
 
 def free_draw_slots(job: Any, slots_ledger: Any, taken: Callable[[int, int], bool]):
