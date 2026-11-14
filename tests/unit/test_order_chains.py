@@ -76,7 +76,7 @@ def scicode(monkeypatch):
                                 "open_taskset": staticmethod(open_taskset)})
 
 
-def grade(platform, subnet, eval_id, set_id, answers, *, thinking=False):
+def grade(platform, subnet, eval_id, set_id, answers, *, thinking=False, complete=True, **provenance):
     """What a grading leaves: its report (the set, the model) and graded rows; ``answers`` by step in set order:
     (completion, correct), or None for a problem with no row."""
     import pyarrow as pa
@@ -89,17 +89,18 @@ def grade(platform, subnet, eval_id, set_id, answers, *, thinking=False):
              for line in asyncio.run(subnet.get_bytes(subnet_key(set_id, "prompts.jsonl"))).decode().splitlines()]
     assert len(order) == len(answers) == card["count"]
     rows = [{"env": card["env"], "set_id": set_id, "problem_id": pid, "sample_index": 0, "completion": text,
-             "tokens": 5, "finish_reason": "stop", "correct": correct, "score": float(correct),
+             "tokens": 5, "finish_reason": "stop", "correct": correct,
+             "score": None if correct is None else float(correct),
              "grader_detail": "", "turns": None, "tool_calls": None, "transcript_tokens": None,
              "episode_stop_reason": None}
             for pid, answer in zip(order, answers) if answer is not None for text, correct in [answer]]
     root = platform._path(f"evaluations/{eval_id}/graded.parquet")
     root.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.Table.from_pylist(rows, schema=_graded_schema()), root)
-    report = {"complete": True, "envs": {card["env"]: {"pass@1": {"value": 0.5}, "pass@k": {"1": {"value": 0.5}},
+    report = {"complete": complete, "envs": {card["env"]: {"pass@1": {"value": 0.5}, "pass@k": {"1": {"value": 0.5}},
                                                        "no_graded_rows": False}},
               "provenance": {"model": MODEL, "revision": REVISION, "thinking": thinking,
-                             "checkpoint_sha256": "c" * 64, "sets": [{"set_id": set_id}]}}
+                             "checkpoint_sha256": "c" * 64, "sets": [{"set_id": set_id}], **provenance}}
     asyncio.run(platform.put_json(f"evaluations/{eval_id}/report.json", report))
     asyncio.run(platform.put_json(f"evaluations/{eval_id}/manifest.json", {"eval_id": eval_id}))
 
@@ -253,3 +254,57 @@ def test_a_malformed_grading_file_is_a_refusal_not_a_crash(admin, scicode, tmp_p
     grade(platform, subnet, "order-eval-v-1", card["set_id"], [("x", True)])
     response = admin("POST", "/admin/v1/evaluations/order-eval-v-1/chain-next", {"chain": "scicode-steps"})
     assert response.status_code == 409, response.text
+
+
+def test_a_position_that_can_get_no_more_work_goes_on_its_missing_steps_failed(scicode, tmp_path):
+    """Order 7f5362da: position 1 graded 63 of 64, one prompt exhausted (every attempt refused by the audit), the
+    grading incomplete. The chain goes on: that step's code is carried as none and it fails, as upstream counts a
+    missing answer; the chain report says how many steps each position missed."""
+    platform, subnet = LocalDirectorySink(tmp_path / "bucket"), Memory()
+    p1 = first(scicode, subnet, tmp_path)
+    # Graded while its prompt could still take work (a grading neither complete nor at the job's end): refused.
+    grade(platform, subnet, "order-eval-u-1", p1, [None], complete=False, job_complete=False)
+    with pytest.raises(chains.ChainRefused, match="position_incomplete"):
+        scicode.next_set("order-eval-u-1", platform, subnet, tmp_path)
+    # Its only prompt exhausted (job_complete: every prompt holds its sample or used every attempt).
+    grade(platform, subnet, "order-eval-u-1", p1, [None], complete=False, job_complete=True, prompts_exhausted=1)
+    second = scicode.next_set("order-eval-u-1", platform, subnet, tmp_path)
+    assert second["from"] == {"position": 1, "asked": 1, "answered": 0, "graded": 0, "missing": 1, "ungraded": 0}
+    card = json.loads(asyncio.run(subnet.get_bytes(subnet_key(second["set_id"], "set.json"))))
+    assert card["taskset"]["args"]["previous"] == {"1.1": ""}
+    # Cut by the run deadline (graded with what the job held): goes on too; an ungraded answer is carried
+    # forward (its code exists) and fails its step.
+    grade(platform, subnet, "order-eval-u-2", second["set_id"], [("```python\ndef g(a): pass\n```", None),
+                                                                 ("y", True)],
+          complete=False, job_complete=False, allow_incomplete=True)
+    third = scicode.next_set("order-eval-u-2", platform, subnet, tmp_path)
+    assert third["from"]["ungraded"] == 1
+    card = json.loads(asyncio.run(subnet.get_bytes(subnet_key(third["set_id"], "set.json"))))
+    assert card["taskset"]["args"]["previous"]["1.2"] == "\ndef g(a): pass\n"
+    grade(platform, subnet, "order-eval-u-3", third["set_id"], [("z", True)])
+    report = asyncio.run(chains.chain_report(chain_id="scicode-steps", platform=platform, subnet=subnet,
+                                             part_ids=["order-eval-u-1", "order-eval-u-2", "order-eval-u-3"]))
+    # 1.1 missing, 1.2 ungraded: failed; 62.2 and 1.3 passed.
+    assert (report["steps_passed"], report["problems_solved"]) == (2, 1)
+    assert (report["steps_missing"], report["steps_ungraded"]) == (1, 1)
+    assert [(p["position"], p["missing"], p["ungraded"], p["graded"]) for p in report["per_position"]] == [
+        (1, 1, 0, 0), (2, 0, 1, 1), (3, 0, 0, 1)]
+
+
+def test_a_position_mostly_unanswered_stops_the_chain(scicode, tmp_path, monkeypatch):
+    """Under the graded share (default 90 %, at least one step may always miss) something systemic happened:
+    the chain stops rather than carrying blanks."""
+    assert chains.missing_allowed(64) == 6 and chains.missing_allowed(2) == 1 and chains.missing_allowed(1) == 1
+    monkeypatch.setenv(chains.MIN_GRADED_ENV, "0.5")
+    assert chains.missing_allowed(64) == 32
+    monkeypatch.setenv(chains.MIN_GRADED_ENV, "bad")
+    assert chains.min_graded() == chains.DEFAULT_MIN_GRADED
+    monkeypatch.delenv(chains.MIN_GRADED_ENV)
+    platform, subnet = LocalDirectorySink(tmp_path / "bucket"), Memory()
+    p1 = first(scicode, subnet, tmp_path)
+    grade(platform, subnet, "order-eval-t-1", p1, [("```python\ndef f(a): return a\n```", True)])
+    second = scicode.next_set("order-eval-t-1", platform, subnet, tmp_path)
+    grade(platform, subnet, "order-eval-t-2", second["set_id"], [None, ("y", None)], complete=False,
+          job_complete=True, prompts_exhausted=1)
+    with pytest.raises(chains.ChainRefused, match="graded 0 of 2 steps"):
+        scicode.next_set("order-eval-t-2", platform, subnet, tmp_path)
