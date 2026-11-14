@@ -348,12 +348,13 @@ teacher forcing are not bit-identical on every supported stack.
 ```bash
 git clone <repo-url> reliquary
 cd reliquary
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install -e ".[sandbox-miner]" && reliquary miner-envs --sync
+uv venv --python 3.12 .venv && source .venv/bin/activate
+uv pip install -e ".[sandbox-miner]" vllm==0.30.0 --override miner-overrides.txt && reliquary miner-envs --sync
 ```
 
-To update: `git pull && pip install -e ".[sandbox-miner]" && reliquary miner-envs --sync`. See
-`docs/mining-orders.md` for what the env packages serve.
+To update: `git pull && uv pip install -e ".[sandbox-miner]" vllm==0.30.0 --override miner-overrides.txt && reliquary miner-envs --sync`.
+The override keeps verifiers' `mcp<2` against vLLM's `mcp>=2` (pip has no overrides, so this install needs uv);
+see `docs/mining-orders.md` for why, and for what the env packages serve.
 
 Verify:
 

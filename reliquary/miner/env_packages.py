@@ -150,12 +150,38 @@ def harness_digest_refusal() -> str | None:
     return probe.stdout.strip() or None
 
 
+# verifiers 0.3.1 needs mcp<2: verifiers.v1.tasksets imports mcp 1's FastMCP. vLLM 0.30.0 declares
+# mcp>=2, so a plain resolve lifts mcp to 2 and every env package fails to import. The miner install
+# overrides vLLM's bound (miner-overrides.txt); a sync reinstalls the bridge, which brings mcp<2 back.
+MCP_OVERRIDE = "mcp>=1.24.0,<2"
+
+
+def _mcp_version() -> str | None:
+    try:
+        return importlib.metadata.version("mcp")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def mcp_refusal() -> str | None:
+    version = _mcp_version()
+    major = (version or "").split(".")[0]
+    if not major.isdigit() or int(major) < 2:
+        return None
+    return (f"mcp {version} is installed, verifiers 0.3.1 needs mcp<2 (install with "
+            "--override miner-overrides.txt)")
+
+
 def env_status() -> list[PackageStatus]:
     statuses = [_status(package) for package in PACKAGES]
     digest = harness_digest_refusal()
     if digest:
         statuses = [PackageStatus(s.package, s.installed, s.problem or digest, s.editable)
                     if s.package is HARNESS else s for s in statuses]
+    mcp = mcp_refusal()
+    if mcp:
+        statuses = [PackageStatus(s.package, s.installed, s.problem or mcp, s.editable)
+                    if s.package is SANDBOX and s.installed else s for s in statuses]
     return statuses
 
 
@@ -173,12 +199,30 @@ def report_lines(statuses: list[PackageStatus]) -> list[str]:
 
 
 def _installer() -> list[str] | None:
-    if importlib.util.find_spec("pip") is not None:
-        return [sys.executable, "-m", "pip"]
+    """uv first (it applies the mcp override; pip has no overrides), else this Python's pip."""
     uv = shutil.which("uv")
     if uv:
         return [uv, "pip"]
+    if importlib.util.find_spec("pip") is not None:
+        return [sys.executable, "-m", "pip"]
     return None
+
+
+def override_file() -> str:
+    """A file holding ``MCP_OVERRIDE`` (miner-overrides.txt is not shipped with an installed package), for
+    ``uv pip install --override``."""
+    import tempfile
+
+    path = os.path.join(tempfile.gettempdir(), f"reliquary-miner-overrides-{os.getuid()}.txt")
+    try:
+        with open(path, encoding="utf-8") as existing:
+            if existing.read().strip() == MCP_OVERRIDE:
+                return path
+    except OSError:
+        pass
+    with open(path, "w", encoding="utf-8") as out:
+        out.write(MCP_OVERRIDE + "\n")
+    return path
 
 
 def sync_commands(statuses: list[PackageStatus]) -> list[list[str]]:
@@ -198,11 +242,17 @@ def sync_commands(statuses: list[PackageStatus]) -> list[list[str]]:
     present = [s for s in todo if _direct_url(s.package.distribution) is not None]
     missing = [s for s in todo if s not in present]
     commands = []
+    # uv: the override keeps verifiers' mcp<2 next to vLLM (mcp>=2). pip has none (`pip check` then names vLLM's
+    # bound, docs/mining-orders.md).
+    override = ["--override", override_file()] if installer[0] != sys.executable else []
     if missing:
-        commands.append([*installer, "install", *python, *(s.package.requirement() for s in missing)])
+        commands.append([*installer, "install", *python, *override, *(s.package.requirement() for s in missing)])
     if present:
         commands.append([*installer, "install", *python, "--force-reinstall", "--no-deps",
                          *(s.package.requirement() for s in present)])
+    if mcp_refusal():
+        # mcp 2 (pulled by vLLM) breaks verifiers: back to its bound; a --no-deps reinstall would not do it.
+        commands.append([*installer, "install", *python, *override, MCP_OVERRIDE])
     return commands
 
 
@@ -281,8 +331,8 @@ def hint(statuses: list[PackageStatus]) -> str | None:
     if not bad:
         return None
     if any(s.package is SANDBOX and s.installed is None and s.problem == "not installed" for s in bad):
-        return ('agentic orders need the miner extra: pip install -e ".[sandbox-miner]" && '
-                "reliquary miner-envs --sync")
+        return ('agentic orders need the miner extra: uv pip install -e ".[sandbox-miner]" vllm==0.30.0 '
+                "--override miner-overrides.txt && reliquary miner-envs --sync")
     if any(_wrong_python(s) for s in bad):
         need = ".".join(map(str, ENV_PYTHON))
         return (f"the agentic env packages are built for Python {need}: mine from a Python {need} venv "

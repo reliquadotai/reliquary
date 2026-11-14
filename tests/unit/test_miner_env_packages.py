@@ -41,6 +41,7 @@ def _fake_install(monkeypatch, installed: dict[str, dict | None], python=(3, 12)
     monkeypatch.setattr(ep, "_commit",
                         lambda name: ((installed.get(name) or {}).get("vcs_info") or {}).get("commit_id"))
     monkeypatch.setattr(ep, "harness_digest_refusal", lambda: None)
+    monkeypatch.setattr(ep, "_mcp_version", lambda: "1.30.0")
     monkeypatch.setattr(sys, "version_info", (*python, 0, "final", 0))
 
 
@@ -71,7 +72,9 @@ def test_missing_and_stale_packages_are_named_and_reinstalled(monkeypatch):
     assert "000000000000" in statuses["reliquary-terminal-bench"].problem
     lines = ep.report_lines(list(statuses.values()))
     assert any("DeepSWE orders refused" in line for line in lines)
+    monkeypatch.setattr(ep, "_installer", lambda: [sys.executable, "-m", "pip"])
     install, reinstall = ep.sync_commands(list(statuses.values()))
+    assert "--override" not in install                 # pip has no overrides
     by_name = {p.distribution: p for p in ep.PACKAGES}
     # The missing one with its dependencies; the stale one in place, never uninstalled first.
     assert install[-2:] == ["install", by_name["reliquary-deepswe"].requirement()]
@@ -196,3 +199,50 @@ def test_the_start_check_syncs_only_an_install_that_took_the_miner_extra(monkeyp
     ep.startup_check(sync_envs=True)
     assert synced == [1]
     assert "sandbox-miner" in ep.hint(ep.env_status())
+
+
+def test_mcp_2_refuses_the_bridge_and_a_sync_reinstalls_it(monkeypatch):
+    """vLLM 0.30.0 asks mcp>=2; verifiers 0.3.1 imports mcp 1's FastMCP, so no env package loads."""
+    _fake_install(monkeypatch, _all_pinned())
+    monkeypatch.setattr(ep, "_mcp_version", lambda: "2.3.0")
+    statuses = ep.env_status()
+    (bridge,) = [s for s in statuses if s.package is ep.SANDBOX]
+    assert "mcp 2.3.0" in bridge.problem and "miner-overrides.txt" in bridge.problem
+    assert [s for s in statuses if not s.ok] == [bridge]
+    monkeypatch.setattr(ep, "_installer", lambda: [sys.executable, "-m", "pip"])
+    reinstall, mcp = ep.sync_commands(statuses)
+    assert reinstall[-1] == ep.SANDBOX.requirement() and "--no-deps" in reinstall
+    assert mcp[-2:] == ["install", ep.MCP_OVERRIDE]          # the no-deps reinstall alone keeps mcp 2
+
+
+def test_the_override_file_is_the_bound_the_check_enforces():
+    lines = [line.strip() for line in (ROOT / "miner-overrides.txt").read_text().splitlines()]
+    assert [line for line in lines if line and not line.startswith("#")] == [ep.MCP_OVERRIDE]
+
+
+@pytest.mark.parametrize("doc", ["docs/mining-orders.md", "docs/mining.md"])
+def test_the_documented_install_applies_the_override(doc):
+    from reliquary.miner.vllm_generation import SUPPORTED_VLLM_SERIES
+
+    text = (ROOT / doc).read_text()
+    assert ('uv pip install -e ".[sandbox-miner]" vllm==0.30.0 --override miner-overrides.txt'
+            in text)
+    assert "0.30.0".startswith(SUPPORTED_VLLM_SERIES)
+
+
+def test_a_sync_prefers_uv_and_applies_the_mcp_override(monkeypatch, tmp_path):
+    installed = _all_pinned()
+    installed["reliquary-deepswe"] = None
+    installed["reliquary-terminal-bench"] = _git("0" * 40)
+    _fake_install(monkeypatch, installed)
+    monkeypatch.setattr(ep, "_mcp_version", lambda: "2.3.0")
+    monkeypatch.setattr(ep.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    assert ep._installer() == ["/usr/bin/uv", "pip"]
+    install, reinstall, mcp = ep.sync_commands(ep.env_status())
+    assert [c[:3] for c in (install, reinstall, mcp)] == [["/usr/bin/uv", "pip", "install"]] * 3
+    for command in (install, mcp):                     # what resolves dependencies keeps verifiers' mcp bound
+        override = command[command.index("--override") + 1]
+        assert Path(override).read_text().strip() == ep.MCP_OVERRIDE
+        assert command[command.index("--python") + 1] == sys.executable
+    assert "--override" not in reinstall and "--no-deps" in reinstall
