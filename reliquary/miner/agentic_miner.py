@@ -657,6 +657,12 @@ async def serve_loopback(app, port: int):
     return server, serving
 
 
+def declared_want(max_live_per_job: int, concurrency: int, identities: int) -> int:
+    """A signed job's declared want per hotkey (``SignedSweEpisodeRunner.want``): its share of the episodes this
+    process runs at once (``concurrency``, shared by its identities), within ``max_live_per_job``."""
+    return max(1, min(int(max_live_per_job), -(-int(concurrency) // max(1, int(identities)))))
+
+
 async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, identities, client,
                             concurrency: int = 8, port: int = 8011,
                             gpu_memory_utilization: float | None = None,
@@ -725,6 +731,7 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
                 if source is None:
                     source = job_signed_source(job)
                 per_identity = {}
+                want = declared_want(max_live_per_job, concurrency, len(identities))
                 for identity in identities:
                     per_identity[identity.hotkey] = await stack.enter_async_context(
                         SignedSweEpisodeRunner(
@@ -733,7 +740,7 @@ async def run_agentic_miner(*, job, checkpoint_dir: str, proof, tokenizer, ident
                             renderer_model_dir=checkpoint_dir,
                             generate_url=f"http://127.0.0.1:{port}", sampling=job.sampling,
                             harness_env=identity.harness_env, max_live=max_live_per_job,
-                            source=source))
+                            source=source, want=want))
                 return await mine_agentic(
                     job=job, identities=identities, client=client, engine=engine, runners={},
                     runner_for=lambda identity: per_identity[identity.hotkey],
@@ -803,5 +810,5 @@ async def run_suite_miner(*, job, checkpoint_dir: str, proof, tokenizer, identit
         engine.stop()
 
 
-__all__ = ["Identity", "OpenPrompts", "build_trajectory_submission", "harness_key", "mine_agentic",
+__all__ = ["Identity", "OpenPrompts", "declared_want", "build_trajectory_submission", "harness_key", "mine_agentic",
            "run_agentic_miner", "run_suite_miner", "serve_loopback", "trajectory_precheck"]

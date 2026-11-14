@@ -45,6 +45,11 @@ the book) and the corpus thresholds below.
   live caps no longer bind: they become safety ceilings (``max_live_per_hotkey`` / ``max_live_per_hotkey_job``,
   by default the fleet's capacity, never below the policy's own). One live session per (hotkey, prompt) and the
   prompt's own slots stay as they were.
+* DECLARED WANT (design ``docs/design/2026-11-13-sandbox-sizing-miner-demand.md``): a corpus open may carry the
+  live sessions the hotkey wants on that job (``SandboxEngagement.want``, signed with the engagement). ``declare``
+  keeps the last one per (job, hotkey) for ``FORECAST_WINDOW_S``; the order control sizes the sandbox fleet from them
+  (``order_sandbox_status.job_demand``). A declaration never changes the allocation or the allowance: it only makes
+  the demand the miner hides behind its allowance visible, so the fleet ``C`` grows to it.
 
 Every method is synchronous and called on the event loop (the issuer calls ``admit`` under its lock)."""
 from __future__ import annotations
@@ -55,6 +60,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from reliquary.protocol.sandbox_session import WANT_ACCEPTED
 from reliquary.sandbox.rl_capacity import (
     ALLOCATION_REFRESH_S,
     DEMAND_MEMORY_S,
@@ -98,6 +104,7 @@ GROUP = 1                      # a corpus session is its own group (rl_capacity'
 USEFUL, WASTED, NEUTRAL = "useful", "wasted", "neutral"
 
 FLEET_REFUSALS_WINDOW_S = 600  # the fleet-full refusals kept per job (``fleet_refusals``)
+FORECAST_WINDOW_S = 6 * 3600   # declarations kept (a later job of the same model forecasts from them)
 
 
 def outcome(record: Any) -> str | None:
@@ -188,6 +195,7 @@ class CorpusQuota:
         self._weights: dict[str, float] = {}
         self._potentials: dict[str, int] = {}
         self._fleet_full: dict[str, collections.deque[int]] = {}   # job id -> times of its fleet-full refusals
+        self._declared: dict[str, dict[str, tuple[int, int, int]]] = {}  # job -> hotkey -> (want, when, peak held)
 
     def install(self) -> None:
         """The session book's per-hotkey caps follow the quota from now on."""
@@ -384,10 +392,11 @@ class CorpusQuota:
         alloc = self._alloc
         retry = self._policy.retry_after_s
         if alloc is None or alloc.capacity <= 0:
-            return Refusal("quota_live", {"why": "no fleet capacity known yet", "allowance": 0}, retry_after=retry)
+            return Refusal("quota_live", {"why": "no fleet capacity known yet", "allowance": 0, WANT_ACCEPTED: True},
+                           retry_after=retry)
         lane = self._lanes.get(hotkey) or self.lane(hotkey)
         detail = {"standing": lane, "live": mine, "allowance": self.allowance(hotkey),
-                  "fleet_sessions": int(alloc.capacity)}
+                  "fleet_sessions": int(alloc.capacity), WANT_ACCEPTED: True}
         limit = self._limit(hotkey, lane, alloc)
         if mine + 1 > limit:
             return Refusal("quota_live", {**detail, "max": limit}, retry_after=retry)
@@ -403,6 +412,33 @@ class CorpusQuota:
                 return Refusal("quota_pool", {**detail, "pool": lane, "pool_held": pooled, "max": total},
                                retry_after=retry)
         return None
+
+    # --- declared wants ---
+    def declare(self, hotkey: str, job_id: str | None, want: Any, now: float | None = None) -> None:
+        """Keep ``hotkey``'s declared want on ``job_id`` (an authenticated open's ``engagement.want``), and the most
+        sessions it was seen holding there (the forecast's bound: what it showed it can run, not what it says)."""
+        from reliquary.protocol.sandbox_session import MAX_SESSION_WANT
+
+        if job_id is None or isinstance(want, bool) or not isinstance(want, int) or want < 1:
+            return
+        now = int(self._clock() if now is None else now)
+        job_id, hotkey = str(job_id), str(hotkey)
+        holds = sum(1 for r in self._book.of_hotkey(hotkey) if r.job_id == job_id and SessionBook._holds(r, now))
+        before = self._declared.get(job_id, {}).get(hotkey)
+        peak = max(holds, 0 if before is None else before[2])
+        self._declared.setdefault(job_id, {})[hotkey] = (min(int(want), MAX_SESSION_WANT), now, peak)
+
+    def declarations(self, now: float | None = None) -> dict[str, dict[str, tuple[int, int, int]]]:
+        """job id -> hotkey -> (want, when declared, most sessions held there when declaring), the last
+        FORECAST_WINDOW_S (older ones are dropped)."""
+        now = int(self._clock() if now is None else now)
+        for job_id in list(self._declared):
+            kept = {k: v for k, v in self._declared[job_id].items() if v[1] >= now - FORECAST_WINDOW_S}
+            if kept:
+                self._declared[job_id] = kept
+            else:
+                del self._declared[job_id]
+        return {job_id: dict(wants) for job_id, wants in self._declared.items()}
 
     # --- the session book's caps ---
     def ceilings(self, hotkey: str) -> tuple[int, int]:
@@ -430,4 +466,4 @@ class CorpusQuota:
                             for k, lane in self._lanes.items()}}
 
 
-__all__ = ["CorpusQuota", "multiplier", "outcome", "standing", "stats_of", "weight"]
+__all__ = ["FORECAST_WINDOW_S", "CorpusQuota", "multiplier", "outcome", "standing", "stats_of", "weight"]

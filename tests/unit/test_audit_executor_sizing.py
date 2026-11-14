@@ -146,6 +146,9 @@ def test_expected_audits_are_items_at_the_jobs_audited_share():
     assert auditor.expected_audits(1000) == pytest.approx(1000 * 610 / 2050)
     auditor._decided = Counter({"audit": 100, "pass_unaudited": 1900})  # luck under q: never below q
     assert auditor.expected_audits(1000) == pytest.approx(200)
+    assert auditor.audit_share() == pytest.approx(0.2)            # the share the sandbox sizing reads
+    auditor._decided = Counter({"audit": 600, "pass_unaudited": 1400})
+    assert auditor.audit_share() == pytest.approx(610 / 2050)
 
 
 def test_idle_executors_are_those_holding_no_lease():

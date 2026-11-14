@@ -453,6 +453,10 @@ class SessionRecord:
         return cls(**values)
 
 
+# An open refused for these never declares a want: the hotkey is banned, or the job is not one it can mine.
+_NOT_DECLARED = frozenset({"miner_banned", "job_not_served", "job_not_signed", "prompt_mismatch", "job_complete"})
+
+
 class CorpusEngagements:
     kind = "corpus"
 
@@ -1207,6 +1211,7 @@ class SessionIssuer:
         except TypeError:                                       # unhashable: terms refuses it
             generation = None
         terms = await book.terms(hotkey, engagement)            # reads: outside the lock
+        self._declare(hotkey, engagement, terms)
         if isinstance(terms, Refusal):
             self._event("open_refused", terms.reason, None, None, None)
             self._capacity_refused(hotkey, engagement, terms)
@@ -1217,6 +1222,19 @@ class SessionIssuer:
                         getattr(terms, "engagement", None), getattr(terms, "image", None))
         self._capacity_refused(hotkey, engagement, outcome, terms)
         return outcome
+
+    def _declare(self, hotkey: str, engagement: Mapping[str, Any], terms) -> None:
+        """A corpus open's declared want reaches the quota (``CorpusQuota.declare``) once its job is known to be served
+        to this hotkey: whatever the slot or quota answer, it is what the miner wants."""
+        declare = getattr(self._quota, "declare", None)
+        if declare is None or engagement.get("kind") != "corpus" or "want" not in engagement:
+            return
+        if isinstance(terms, Refusal) and terms.reason in _NOT_DECLARED:
+            return
+        try:
+            declare(hotkey, engagement.get("job_id"), engagement.get("want"), int(self._clock()))
+        except Exception:
+            logger.exception("the corpus quota could not keep the want of %s", hotkey[:12])
 
     async def _issue(self, hotkey: str, request_id: str, digest: str, engagement: Mapping[str, Any], terms,
                      generation):

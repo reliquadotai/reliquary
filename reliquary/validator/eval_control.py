@@ -1854,6 +1854,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     drain_seconds = order_audit_drain_seconds()
     max_executors = order_max_audit_executors()
     sizing = ExecutorSizing(clock=clock)
+    sandbox_models: dict[str, tuple[str, str]] = {}   # signed episode job -> its model, while it may forecast
 
     async def control_status() -> dict:
         """The dispatcher's status, with each served job's completeness, and per model the executors
@@ -1951,7 +1952,9 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
 
     def sandbox_jobs(document: dict, statuses: dict[str, dict]) -> None:
         """Per served signed episode order, what its sandbox gateways are sized from (`order_sandbox_status`)."""
-        from reliquary.validator.order_sandbox_status import FLEET_FULL_WINDOW_S, book_sessions, sandbox_status
+        from reliquary.validator.order_sandbox_status import (
+            FLEET_FULL_WINDOW_S, activity_by_hotkey, book_sessions, held_by_hotkey, job_demand, sandbox_status,
+        )
 
         episodes = [w for w in list(served.values()) if w.job.episode is not None and is_signed_sandbox(w.job)]
         if sandbox is None or not episodes:
@@ -1959,10 +1962,30 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         now = int(clock())
         try:
             sessions = book_sessions(sandbox.book, now)
+            holders = held_by_hotkey(sandbox.book, now)
+            shown = activity_by_hotkey(sandbox.book, now)
         except Exception:
             logger.warning("sandbox status: the session book is unreadable", exc_info=True)
             return
         quota = getattr(sandbox, "quota", None)
+        declarations: dict = {}
+        if quota is not None and hasattr(quota, "declarations"):
+            try:
+                declarations = quota.declarations(now)
+            except Exception:
+                logger.warning("sandbox status: the declared wants are unreadable", exc_info=True)
+        for w in episodes:
+            sandbox_models[str(w.job.job_id)] = (w.job.checkpoint_repo, w.job.checkpoint_revision)
+        for job_id in [j for j in sandbox_models if j not in declarations and j not in served]:
+            del sandbox_models[job_id]                    # nothing left to forecast from
+        serving = {str(w.job.job_id) for w in episodes}
+
+        def low_yield(hotkey: str) -> bool:
+            try:
+                return quota is not None and quota.lane(hotkey) == "low_yield"
+            except Exception:
+                return False
+
         for w in episodes:
             job_id, job = str(w.job.job_id), w.job
             model = (job.checkpoint_repo, job.checkpoint_revision)
@@ -1971,13 +1994,19 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             try:
                 entry = document["jobs"].setdefault(
                     job_id, {"needs_attention": False, "parked_batches": 0, "reasons": []})
+                sizing_of = document["models"].get(f"{model[0]}@{model[1]}", {})
+                share = getattr(getattr(w, "auditor", None), "audit_share", None)
                 entry["sandbox"] = sandbox_status(
                     job=job, status=statuses.get(job_id),
                     reopens=bool(getattr(w.auditor, "reopen_slots", False)), held=held, finished=finished,
                     tokens_per_episode=None if tokens is None else tokens.mean(),
                     tokens_per_second=dispatcher.tokens_per_second(model),
-                    executors_wanted=document["models"].get(f"{model[0]}@{model[1]}", {}).get("executors_wanted"),
-                    fleet_refusals=0 if quota is None else quota.fleet_refusals(job_id, now, FLEET_FULL_WINDOW_S))
+                    executors_wanted=sizing_of.get("executors_wanted"),
+                    fleet_refusals=0 if quota is None else quota.fleet_refusals(job_id, now, FLEET_FULL_WINDOW_S),
+                    demand=job_demand(job_id, now=now, declarations=declarations, held=holders, activity=shown,
+                                      model_of=sandbox_models, served=serving, excluded=low_yield),
+                    executors_allowed=sizing_of.get("executors_allowed"),
+                    audit_share=share() if callable(share) else None)
             except Exception:
                 logger.warning("sandbox status of %s unavailable", job_id, exc_info=True)
 

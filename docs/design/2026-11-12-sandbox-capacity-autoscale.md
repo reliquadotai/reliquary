@@ -1,6 +1,7 @@
 # Sandbox capacity follows the pipeline (agentic orders)
 
-Date: 2026-11-12. Status: design, implementation on `feat/sandbox-autoscale` (Catalyst) and
+Date: 2026-11-12. Superseded in part by `2026-11-13-sandbox-sizing-miner-demand.md` (sizing from miners' declared
+demand). Status: design, implementation on `feat/sandbox-autoscale` (Catalyst) and
 `feat/sandbox-autoscale` (platform).
 
 ## Problem
