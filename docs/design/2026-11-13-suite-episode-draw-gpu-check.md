@@ -1,6 +1,7 @@
 # GPU check: the forced-draw audit of a multi-turn suite episode
 
-Status: test plan, 2026-11-13. Not run: it needs a GPU host with the order's checkpoint.
+Status: run on 2026-11-13 with Qwen3.5-9B (one H100, vLLM miner, HF FlashAttention-2 auditor). PASSED: see
+[Results](#results-2026-11-13).
 
 Branch `feat/suite-episode-orders` lets an eval order play a suite set (a replayed tool world: telecom,
 EnvScaler, AutomationBench) under `sampling.draw = gumbel_max`. Every piece is unit tested on CPU with a
@@ -25,13 +26,14 @@ signed SWE episodes are measured; a suite episode differs in three ways that thi
 ## Runs
 
 1. **Honest, T = 1.** Telecom benchmark set, 16 tasks x 4 samples, `max_turns` 40, `max_tokens_per_turn`
-   4096, `max_total_tokens` 32768. Expect every sample accepted by intake, every audit verdict passed.
+   3276 (`MAX_SUITE_TOKENS_PER_TURN`), `max_total_tokens` 32768. Expect every sample accepted by intake, every audit verdict passed.
 2. **Honest, warped.** Same, `temperature` 0.7, `top_p` 0.95 (the orders customers send).
-3. **Cuts.** Same tasks with `max_total_tokens` 6144, so most episodes end as `context_length`; and
+3. **Cuts.** Same tasks with `max_total_tokens` 13000, so most episodes end as `context_length` (the cut
+   budget must exceed the ~11k-token first prompt: 6144 cuts every episode before its first turn); and
    `max_tokens_per_turn` 256 so some turns end at their cap. Expect cuts accepted, graded 0, audits passed.
 4. **Long episode.** AutomationBench: a set from `eval build-set --source reliquary_automationbench_v1
-   --split eval --start 0 --count 600 --sample 24 --seed 1`, `max_turns` 64 (the job cap), `max_total_tokens`
-   65536; episodes of 30-60 turns with tool results up to 24 KiB, the audit forward at its longest.
+   --split eval --start 0 --count 600 --sample 24 --seed 1`, 2 samples each, `max_turns` 64 (the job cap),
+   `max_tokens_per_turn` 3276, `max_total_tokens` 60000 (the suite ceiling: 65536 is refused by `parse_job`); episodes of 30-60 turns with tool results up to 24 KiB, the audit forward at its longest.
 5. **Negative controls.** (a) A miner with a re-rolled draw on one turn (seed offset +1 from turn 3);
    (b) the honest trajectory with one observation edited (must be refused at intake by the replay, never
    reaching the audit); (c) another checkpoint (the 4B) mining the 9B order.
@@ -60,3 +62,25 @@ signed SWE episodes are measured; a suite episode differs in three ways that thi
   position count (`row_diagnostics`), and the renderer's assistant prefix tokens (they must be prompt, not span).
 - Drift growing with turns only: compare a forward over the full trajectory with per-turn prefills on the
   same host (prefix caching on/off) before touching the judge.
+
+## Results (2026-11-13)
+
+Qwen3.5-9B mined and audited every run (run 5c mined with Qwen3.5-4B). Match = exact share of drawn positions.
+
+| Run | Episodes | Stops | Audit | Match p0 / p50 | Far misses |
+|---|---|---|---|---|---|
+| 1 honest T=1 | 64 | 64 completed | 64 passed | 0.994 / 0.997 | 0 |
+| 2 honest T=0.7, top_p 0.95 | 64 | 64 completed | 64 passed | 0.993 / 0.997 | 0 |
+| 3 cuts (13000 total, 256 per turn) | 64 | 55 `context_length` (reward 0), 9 completed; 182 capped turns | 64 passed | 0.993 / 0.997 | 0 |
+| 4 AutomationBench long | 47 (+1 refused by the miner precheck, `bad_turns`) | 38 completed, 8 `max_turns`, 2 `context_length`; up to 64 turns, 58 822 tokens | 47 passed | 0.994 / 0.996 | 0 |
+| 5a re-rolled draw from turn 3 | 16 | 16 completed | 16 refused `draw_mismatch`, 16 charged | 0.862 / 0.886 | 501 |
+| 5c 4B mining the 9B order | 16 | 16 completed | 16 refused `draw_mismatch`, 15 charged | 0.902 / 0.919 | 78 |
+
+- 5b: the 4 edited trajectories of run 1 were refused at intake (`bad_observation`).
+- No drift across turns (per-turn miss rate flat, ~0.2-0.3 %); first token after an observation misses at
+  ~0.8 %, no far miss.
+- Audit cost: ~0.7 s per telecom episode (~18k tok/s); AutomationBench up to 16.7 s for the longest episodes,
+  28.4 GiB peak.
+
+AutomationBench order budgets: `max_tokens_per_turn` 3276 (`MAX_SUITE_TOKENS_PER_TURN`, the job maximum),
+`max_total_tokens` up to 60000, `max_turns` 64.
