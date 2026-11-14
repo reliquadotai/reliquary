@@ -356,6 +356,13 @@ class CombineEvaluation(BaseModel):
     model_config = ConfigDict(extra="forbid")
     # The gradings of an evaluation order's sets (one job each), in report order.
     parts: list[str] = Field(min_length=1, max_length=64)
+    # A chain order (``orders.chains``): the parts are its positions from the first, and the report adds its rates.
+    chain: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class ChainNext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    chain: str = Field(min_length=1, max_length=64)
 
 
 class GradeEvaluation(BaseModel):
@@ -2030,15 +2037,56 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         running = gradings.get(eval_id)
         if running is not None:
             raise HTTPException(status_code=409, detail="a grading runs under this id")
+        from reliquary.orders import chains
+
+        def chain_report():
+            return chains.chain_report(chain_id=body.chain, part_ids=body.parts, platform=deliveries,
+                                       subnet=eval_store)
+
         try:
             # One writer per evaluation id: a grading and a combination never share files.
             async with grade_locks.setdefault(eval_id, asyncio.Lock()):
-                manifest = await reports.combine(deliveries, eval_id, body.parts, clock=clock)
-        except reports.PartNotGraded as exc:
+                manifest = await reports.combine(deliveries, eval_id, body.parts, clock=clock,
+                                                 chain_id=body.chain, chain_report=chain_report)
+        except (reports.PartNotGraded, chains.PartNotGraded) as exc:
             raise HTTPException(status_code=409, detail=f"part_not_graded: {exc}") from exc
         except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(status_code=409, detail=str(exc)[:500]) from exc
         return {"state": "done", "eval_id": eval_id, "keys": manifest["keys"], "complete": manifest["complete"]}
+
+    @router.post("/evaluations/{eval_id}/chain-next")
+    async def chain_next(eval_id: str, body: ChainNext) -> dict:
+        """The set of the chain position after ``eval_id``'s (graded), built from its answers and published to the
+        subnet bucket (``orders.chains``); asked again, the same set."""
+        from reliquary.corpus.delivery import validated_delivery_id
+        from reliquary.eval.storage import SetConflict
+        from reliquary.orders import chains
+
+        in_scope(eval_id)
+        try:
+            validated_delivery_id(eval_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if deliveries is None or not getattr(deliveries, "evaluation_supported", True):
+            raise HTTPException(status_code=503, detail="deliveries_not_configured")
+        if body.chain not in chains.CHAINS:
+            raise HTTPException(status_code=422, detail=f"chain_unknown: {body.chain!r}")
+        if upload_tokenizer is None:
+            from reliquary.validator.eval_control import load_cpu_tokenizer as load_tokenizer
+        else:
+            load_tokenizer = upload_tokenizer
+        try:
+            async with grade_locks.setdefault(eval_id, asyncio.Lock()):
+                return await chains.next_set(chain_id=body.chain, eval_id=eval_id, platform=deliveries,
+                                             subnet=eval_store, load_tokenizer=load_tokenizer, clock=clock,
+                                             work_dir=work_dir)
+        except chains.PartNotGraded as exc:
+            raise HTTPException(status_code=409, detail=f"part_not_graded: {exc}") from exc
+        except (chains.ChainRefused, SetConflict) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)[:500]) from exc
+        except Exception as exc:
+            logger.warning("chain step after %s could not be built", eval_id, exc_info=True)
+            raise HTTPException(status_code=503, detail="chain_step_unavailable") from exc
 
     @router.post("/evaluations/{eval_id}/grade")
     async def grade_evaluation(eval_id: str, body: GradeEvaluation, response: Response) -> dict:

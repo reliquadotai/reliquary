@@ -1,14 +1,15 @@
 """The bookkeeping of a SciCode chain: one eval set per position, each built
 from the answers to the positions before it, and the two published rates.
 
-    previous = {}
-    for step in range(1, max_position(split) + 1):
-        set = build-set verifiers:scicode-steps {split, step, previous}
+    args = {"split": split, "step": 1, "previous": {}}
+    while args["step"] <= max_position(split):
+        set = build-set verifiers:scicode-steps args
         answers = <the order's graded rows: step_number -> answer text, passed>
-        previous = record(previous, answers)
+        args = next_args(args, answers)
     summary(split, passed)
 
-The answer text is what the grader reads (after the reasoning block).
+The answer text is what the grader reads (after the reasoning block). An order
+runs this loop on the platform (reliquary ``orders.chains``).
 """
 
 from __future__ import annotations
@@ -19,11 +20,33 @@ from scicode_steps.taskset import (
     DATASET_REVISION, GIVEN_STEPS, PROBLEMS, SCORED_STEPS, extract_python_script, read_problems, scored_steps,
 )
 
-__all__ = ["max_position", "record", "summary"]
+__all__ = ["asked_at", "max_position", "next_args", "record", "summary"]
 
 
 def max_position(split: str, revision: str = DATASET_REVISION) -> int:
     return max(len(p["sub_steps"]) for p in read_problems(split, revision))
+
+
+def asked_at(split: str, position: int, revision: str = DATASET_REVISION,
+             problems: list[dict] | None = None) -> list[str]:
+    """The steps the set of ``position`` (1-based) asks, in its order (the
+    taskset's ``load``): its row ``i`` is ``asked_at(...)[i]``."""
+    if position < 1:
+        raise ValueError("step is 1-based")
+    if problems is None:
+        problems = read_problems(split, revision)
+    return [p["sub_steps"][position - 1]["step_number"] for p in problems
+            if len(p["sub_steps"]) >= position and p["sub_steps"][position - 1]["step_number"] not in GIVEN_STEPS]
+
+
+def next_args(args: Mapping, answers: Mapping[str, str], problems: list[dict] | None = None) -> dict:
+    """The taskset args of the position after ``args``'s, from the answers to
+    every step ``args``'s set asked (an unanswered one passed in as "")."""
+    split, step = args.get("split", "test"), int(args.get("step", 1))
+    asked = asked_at(split, step, args.get("dataset_revision", DATASET_REVISION), problems)
+    if set(answers) != set(asked):
+        raise ValueError(f"position {step} asks {len(asked)} steps; answers name {len(answers)} others")
+    return {**args, "step": step + 1, "previous": record(args.get("previous") or {}, answers)}
 
 
 def record(previous: Mapping[str, str], answers: Mapping[str, str]) -> dict[str, str]:
