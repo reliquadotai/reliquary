@@ -3521,10 +3521,14 @@ def corpus_mine_agentic(
     if signed:
         from reliquary.miner.signed_episode import HttpSandboxSessions
 
-        if not validator_hotkey:
-            from reliquary.miner.agentic_follow import served_sandbox_hotkey
+        from reliquary.miner.agentic_follow import served_sandbox_hotkey
 
-            validator_hotkey = served_sandbox_hotkey(validator_url)
+        served = served_sandbox_hotkey(validator_url)
+        if validator_hotkey and served and served != validator_hotkey:
+            typer.echo(f"error: --validator-hotkey {validator_hotkey} is not the hotkey this validator names "
+                       f"({served}): its session requests would be refused", err=True)
+            raise typer.Exit(code=2)
+        validator_hotkey = validator_hotkey or served
         if not validator_hotkey:
             typer.echo("error: a signed-sandbox job needs --validator-hotkey (the validator's "
                        "ss58 hotkey: session requests are signed for it); this validator does not "
@@ -3555,11 +3559,16 @@ def corpus_mine_agentic(
                         ask_alpha_per_mtoken=ask_alpha_per_mtoken,
                         ask_capacity=ask_capacity if ask_capacity is not None else (
                             concurrency if ask_alpha_per_mtoken is not None else None))
-    counts = asyncio.run(run_agentic_miner(
+    from reliquary.miner.agentic_miner import STOPPED_EXIT_CODE, until_terminated
+
+    counts = asyncio.run(until_terminated(run_agentic_miner(
         job=job, checkpoint_dir=directory, proof=proof, tokenizer=load_tokenizer(directory),
         identities=[identity], client=client, concurrency=concurrency, port=port,
         gpu_memory_utilization=gpu_memory_utilization, max_num_seqs=max_num_seqs,
-        sessions=sessions, max_live_per_job=max_live_per_job, source=source))
+        sessions=sessions, max_live_per_job=max_live_per_job, source=source)))
+    if counts is None:
+        typer.echo("stopped (SIGTERM): running episodes cancelled, their leases released", err=True)
+        raise typer.Exit(code=STOPPED_EXIT_CODE)
     typer.echo({hotkey_: dict(c) for hotkey_, c in counts.items()})
     halted = [hotkey_ for hotkey_, c in counts.items()
               if c.get("halted") or c.get("identity_crashed")]
@@ -3597,9 +3606,10 @@ def _follow_agentic_orders(*, validator_url, validator_hotkey, max_jobs, gpus, m
         list_jobs=list_jobs, read_manifest=read_manifest, fetch=fetch_model, max_jobs=max_jobs,
         limits=follow.Limits(models=frozenset(models), max_context=max_context),
         validator_hotkey=validator_hotkey,
+        fits=follow.memory_fit(max_jobs=max_jobs, gpus=devices, gpu_memory_utilization=gpu_memory_utilization),
         launch=follow.popen_launcher(argv, max_jobs=max_jobs, port=port, concurrency=concurrency, gpus=devices,
                                      gpu_memory_utilization=gpu_memory_utilization))
-    follower.run()
+    follow.run_until_terminated(follower)
 
 
 @corpus_app.command("status")

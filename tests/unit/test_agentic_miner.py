@@ -629,3 +629,58 @@ def test_without_an_ask_an_auctioned_job_waits_and_says_why(monkeypatch):
 
     asyncio.run(run())
     assert client.asks == [] and client.leases == 0
+
+
+def test_a_stopped_miner_cancels_its_episodes_and_releases_their_leases():
+    class Releasing(AuctionClient):
+        def __init__(self):
+            super().__init__()
+            self.released = []
+
+        def release_lease(self, body):
+            self.released.append(body["lease_id"])
+            return {"leased": False, "reason": "released"}
+
+    client = Releasing()
+    identity = Identity("5Hot", sign=lambda body: "sig", episodes=3, sign_lease=lambda body: "lsig",
+                        ask_alpha_per_mtoken=0.4)
+    runner = FakeRunner(slow=range(100), slow_seconds=30.0)
+
+    async def run():
+        task = asyncio.ensure_future(mine_agentic(
+            job=_drawn_job(), identities=[identity], client=client, engine=FakeEngine(),
+            runners={harness_key(None): runner}, decode=lambda ids: "".join(map(str, ids)), concurrency=3))
+        while len(runner.ran) < 3:
+            await asyncio.sleep(0.01)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(run())
+    assert sorted(client.released) == ["l1", "l2", "l3"]       # every running episode's lease, not left to expire
+
+
+def test_sigterm_stops_the_miner_cleanly():
+    import os
+    import signal
+
+    from reliquary.miner.agentic_miner import until_terminated
+
+    cleaned = []
+
+    async def miner():
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+            await asyncio.sleep(30)
+            return {"5Hot": Counter()}
+        finally:
+            cleaned.append(True)
+
+    assert asyncio.run(until_terminated(miner())) is None and cleaned == [True]
+
+    async def finishes():
+        return {"5Hot": Counter(accepted=1)}
+
+    assert asyncio.run(until_terminated(finishes())) == {"5Hot": Counter(accepted=1)}

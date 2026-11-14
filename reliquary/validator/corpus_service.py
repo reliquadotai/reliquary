@@ -1675,6 +1675,7 @@ def build_corpus_router(
     durable_records: bool | None = None,
     pending_record_arrivals: dict[str, float] | None = None,
     auction=None,
+    lease_fault=None,
 ) -> APIRouter:
     """The corpus submission endpoint, over an already-bound job store.
 
@@ -1695,6 +1696,8 @@ def build_corpus_router(
     submit body cap, ``router.body_cap``; without it the minimum applies.
     ``auction`` (``corpus.token_auction.TokenAuction``) prices a draw job by auction: a lease goes only to a hotkey
     whose ask the round admits, carries the round's price, and only a slot the hotkey leased is accepted.
+    ``lease_fault`` (``sandbox.corpus_lease_faults.corpus_lease_fault``) names a lease our side failed: it ends
+    uncharged (``DrawLeases``' ``validator_fault``).
     """
 
     body_cap = worst_case_body(job) if job is not None else MIN_SUBMIT_BODY_BYTES
@@ -1737,9 +1740,9 @@ def build_corpus_router(
         leases = leases_by_job.get(job.job_id)
         if leases is None:
             if auction is None:
-                leases = DrawLeases(job)
+                leases = DrawLeases(job, validator_fault=lease_fault)
             else:
-                leases = DrawLeases(job, limit_per_hotkey=False,
+                leases = DrawLeases(job, limit_per_hotkey=False, validator_fault=lease_fault,
                                     on_unused=lambda lease, held: auction.lease_ended(lease.hotkey, lease.price, held))
                 auction.bind_holdings(leases.counts)
             leases = leases_by_job[job.job_id] = leases

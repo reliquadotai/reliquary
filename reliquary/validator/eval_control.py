@@ -1560,7 +1560,18 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             is_banned=w.is_banned, registration=registration, seen_index=w.seen_index,
             suspect_until=getattr(w, "suspect_until", None),
             job=getattr(w, "job", None), durable_records=False, auction=_auction_of(w),
+            lease_fault=_lease_fault_of(w),
             episode_intake=getattr(w, "episode_intake", None))
+
+    def _lease_fault_of(w):
+        """A signed episode order's draw leases our sandbox failed: released uncharged
+        (``sandbox.corpus_lease_faults``)."""
+        job = getattr(w, "job", None)
+        if sandbox is None or job is None or job.episode is None or not is_signed_sandbox(job):
+            return None
+        from reliquary.sandbox.corpus_lease_faults import corpus_lease_fault
+
+        return corpus_lease_fault(sandbox.issuer, str(job.job_id))
 
     def _auction_of(w):
         """The job's token auction when its entry prices it so (``corpus.token_auction``), its leases opened by

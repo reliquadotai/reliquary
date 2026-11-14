@@ -850,6 +850,8 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
             pending_record_arrivals=getattr(served, "pending_record_arrivals", None),
             durable_records=False if not hasattr(served, "pending_record_arrivals") else None,
             auction=_auction_of(served),
+            # A signed job's leases our sandbox failed: uncharged (set by `run_corpus_validator`).
+            lease_fault=getattr(served, "lease_fault", None),
         )
 
     def _auction_of(served):
@@ -986,6 +988,13 @@ async def _run_corpus_services(server, services, *, cleanup=None) -> None:
             await asyncio.gather(serving, group, *workers, return_exceptions=True)
             if cleanup is not None:
                 await cleanup()
+
+
+def _set_lease_fault(w, services) -> None:
+    """A signed job's draw leases our sandbox failed are released uncharged (``sandbox.corpus_lease_faults``)."""
+    from reliquary.sandbox.corpus_lease_faults import corpus_lease_fault
+
+    w.lease_fault = corpus_lease_fault(services.issuer, str(w.job.job_id))
 
 
 def sandbox_validator_hotkey(config, wallet) -> str:
@@ -1507,6 +1516,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             continue
         if sandbox_services is not None and is_signed_sandbox(w.job):
             sandbox_services.publish(w)
+            _set_lease_fault(w, sandbox_services)
     if not wiring and (served or not generation_only):
         raise RuntimeError("no corpus job left to serve: " + "; ".join(
             f"{task}: {why}" for task, why in sorted(unserved.items())))
@@ -1572,6 +1582,7 @@ async def run_corpus_validator(*, wallet, netuid, signer_client, http_host, http
             # the session issuer. Its router is adopted after this; until then an
             # open is refused `job_not_ready`.
             sandbox_services.publish(w)
+            _set_lease_fault(w, sandbox_services)
         unserved.pop(str(task_entry.task_id), None)       # served now
         return w
 

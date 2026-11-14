@@ -542,97 +542,106 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
     # `cursor` is this hotkey's walk position, and the validator of a free job
     # (every episode job) does not check it: positions whose prompt is full
     # are passed over, in the walk's own order. `started` counts episodes.
-    cursor = started = 0
-    while not stop.is_set() and (identity.episodes is None or started < identity.episodes):
-        await slots.acquire()
-        if stop.is_set():
-            slots.release()
-            break
-        if not getattr(engine, "healthy", True):
-            # Every turn would fail fast: starting episodes would only burn boxes.
-            counts["engine_unhealthy"] += 1
-            logger.error("the generate engine is unhealthy: %s stops", tag)
-            stop.set()
-            slots.release()
-            break
-        # After the wait for a slot, which can last a whole episode: the map
-        # this start is decided on is at most OPEN_MAX_AGE_SECONDS old.
-        try:
-            await open_prompts.refresh(counts)
-        except CorpusJobRetired as exc:
-            counts["halted"] += 1
-            logger.error("%s stops: %s", tag, exc)
-            halt()
-            slots.release()
-            break
-        if open_prompts.exhausted:
-            # Running episodes finish and submit; each learns `job_complete` itself.
-            counts["no_open_prompt"] += 1
-            logger.info("no prompt of %s has a slot left: %s starts no more episodes",
-                        job.job_id, tag)
-            stop.set()
-            slots.release()
-            break
-        if drawn:
-            lease_id = None
-            choice = None
-            if leasing[0]:
-                try:
-                    outcome = await asyncio.to_thread(take_lease)
-                except (CorpusJobRetired, CorpusMinerHalted) as exc:
-                    counts["halted"] += 1
-                    logger.error("%s stops: %s", tag, exc)
-                    halt()
-                    slots.release()
-                    break
-                if outcome == "complete":
-                    counts["job_complete"] += 1
-                    stop.set()
-                    slots.release()
-                    break
-                if outcome == "wait":
-                    slots.release()
-                    await asyncio.sleep(DRAW_SLOT_WAIT_SECONDS)
-                    continue
-                if outcome is not None:
-                    (prompt, slot), lease_id = outcome
-                    open_prompts.run_leased(prompt, slot)
-                    choice = (prompt, slot)
-            if choice is None:
-                choice = open_prompts.take_draw_slot(job, rng)
-            if choice is None:
-                # Every open prompt's free slots are running here: wait for one to end.
-                counts["no_free_draw_slot"] += 1
+    try:
+        cursor = started = 0
+        while not stop.is_set() and (identity.episodes is None or started < identity.episodes):
+            await slots.acquire()
+            if stop.is_set():
                 slots.release()
-                if not tasks or all(t.done() for t in tasks):
-                    await asyncio.sleep(DRAW_SLOT_WAIT_SECONDS)
-                else:
-                    await asyncio.wait([t for t in tasks if not t.done()],
-                                       return_when=asyncio.FIRST_COMPLETED)
+                break
+            if not getattr(engine, "healthy", True):
+                # Every turn would fail fast: starting episodes would only burn boxes.
+                counts["engine_unhealthy"] += 1
+                logger.error("the generate engine is unhealthy: %s stops", tag)
+                stop.set()
+                slots.release()
+                break
+            # After the wait for a slot, which can last a whole episode: the map
+            # this start is decided on is at most OPEN_MAX_AGE_SECONDS old.
+            try:
+                await open_prompts.refresh(counts)
+            except CorpusJobRetired as exc:
+                counts["halted"] += 1
+                logger.error("%s stops: %s", tag, exc)
+                halt()
+                slots.release()
+                break
+            if open_prompts.exhausted:
+                # Running episodes finish and submit; each learns `job_complete` itself.
+                counts["no_open_prompt"] += 1
+                logger.info("no prompt of %s has a slot left: %s starts no more episodes",
+                            job.job_id, tag)
+                stop.set()
+                slots.release()
+                break
+            if drawn:
+                lease_id = None
+                choice = None
+                if leasing[0]:
+                    try:
+                        outcome = await asyncio.to_thread(take_lease)
+                    except (CorpusJobRetired, CorpusMinerHalted) as exc:
+                        counts["halted"] += 1
+                        logger.error("%s stops: %s", tag, exc)
+                        halt()
+                        slots.release()
+                        break
+                    if outcome == "complete":
+                        counts["job_complete"] += 1
+                        stop.set()
+                        slots.release()
+                        break
+                    if outcome == "wait":
+                        slots.release()
+                        await asyncio.sleep(DRAW_SLOT_WAIT_SECONDS)
+                        continue
+                    if outcome is not None:
+                        (prompt, slot), lease_id = outcome
+                        open_prompts.run_leased(prompt, slot)
+                        choice = (prompt, slot)
+                if choice is None:
+                    choice = open_prompts.take_draw_slot(job, rng)
+                if choice is None:
+                    # Every open prompt's free slots are running here: wait for one to end.
+                    counts["no_free_draw_slot"] += 1
+                    slots.release()
+                    if not tasks or all(t.done() for t in tasks):
+                        await asyncio.sleep(DRAW_SLOT_WAIT_SECONDS)
+                    else:
+                        await asyncio.wait([t for t in tasks if not t.done()],
+                                           return_when=asyncio.FIRST_COMPLETED)
+                    continue
+                prompt, slot = choice
+                task = asyncio.create_task(one(slot, prompt, lease_id))
+                task.add_done_callback(lambda _t: slots.release())
+                tasks.add(task)
+                started += 1
                 continue
-            prompt, slot = choice
-            task = asyncio.create_task(one(slot, prompt, lease_id))
+            for _ in range(_OPEN_SCAN):
+                if open_prompts.is_open(job_walk_index(job, identity.hotkey, cursor)):
+                    break
+                cursor += 1
+                counts["skipped_full"] += 1
+            else:
+                # A long run of full prompts: let the loop breathe, then go on.
+                slots.release()
+                await asyncio.sleep(0)
+                continue
+            task = asyncio.create_task(one(cursor))
             task.add_done_callback(lambda _t: slots.release())
             tasks.add(task)
-            started += 1
-            continue
-        for _ in range(_OPEN_SCAN):
-            if open_prompts.is_open(job_walk_index(job, identity.hotkey, cursor)):
-                break
             cursor += 1
-            counts["skipped_full"] += 1
-        else:
-            # A long run of full prompts: let the loop breathe, then go on.
-            slots.release()
-            await asyncio.sleep(0)
-            continue
-        task = asyncio.create_task(one(cursor))
-        task.add_done_callback(lambda _t: slots.release())
-        tasks.add(task)
-        cursor += 1
-        started += 1
-    # return_exceptions: a cancelled or crashed episode never cancels its siblings.
-    await asyncio.gather(*tasks, return_exceptions=True)
+            started += 1
+        # return_exceptions: a cancelled or crashed episode never cancels its siblings.
+        await asyncio.gather(*tasks, return_exceptions=True)
+    except asyncio.CancelledError:
+        # The miner is stopping (SIGTERM, `until_terminated`): its running episodes are cancelled here, so each
+        # releases its lease and reports its sandbox sessions (`one`) before the engine and runners go away.
+        stop.set()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 async def mine_agentic(*, job, identities, client, engine, runners, decode,
@@ -662,6 +671,42 @@ async def mine_agentic(*, job, identities, client, engine, runners, decode,
             counts[identity.hotkey]["identity_crashed"] += 1
             logger.error("mining for %s stopped: %r", identity.hotkey[:8], outcome)
     return counts
+
+
+# The exit code of an agentic miner stopped by SIGTERM (the order follower's stop): 128 + SIGTERM.
+STOPPED_EXIT_CODE = 143
+
+
+async def until_terminated(coroutine):
+    """Run ``coroutine`` (``run_agentic_miner``) until it returns, or until SIGTERM: then it is cancelled, which
+    starts nothing more, cancels the running episodes (each releases its lease and reports its sessions) and stops
+    the engine. Returns its result, or None when SIGTERM stopped it."""
+    import signal
+
+    task = asyncio.ensure_future(coroutine)
+    loop = asyncio.get_running_loop()
+    stopping: list[bool] = []
+
+    def on_terminate() -> None:
+        if not stopping:
+            stopping.append(True)
+            logger.warning("SIGTERM: stopping; running episodes are cancelled, their leases released")
+            task.cancel()
+
+    try:
+        loop.add_signal_handler(signal.SIGTERM, on_terminate)
+        installed = True
+    except (NotImplementedError, RuntimeError, ValueError):   # not the main thread, or no signals here
+        installed = False
+    try:
+        return await task
+    except asyncio.CancelledError:
+        if stopping:
+            return None
+        raise
+    finally:
+        if installed:
+            loop.remove_signal_handler(signal.SIGTERM)
 
 
 async def serve_loopback(app, port: int):

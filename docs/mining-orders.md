@@ -59,16 +59,29 @@ installed at its pin (`reliquary miner-envs`), the sandbox extra for a signed-sa
 model in `--model` (repo or `repo@revision`, repeatable) and episodes no longer than `--max-context` tokens. Each
 refused order is logged once, with why. It ranks the rest: orders whose auction has leases left first, then by
 price (the auction's price of the moment, else its ceiling), then one on a model already downloaded. It mines the
-best one in its own process (`corpus mine-agentic --job-id`) and starts the next when that one completes; an order
-that leaves the list or stops being open is stopped after two reads (a minute). A started order that pays less is
-not dropped for a better one that opens later: its leases are kept to the end.
+best one in its own process (`corpus mine-agentic --job-id`) and starts the next when that one completes. A started
+order that pays less is not dropped for a better one that opens later: its leases are kept to the end.
+
+- **Draining** orders are never stopped: their running episodes are still paid, and the child exits by itself. A
+  **paused** order is waited out; only one paused for 30 minutes, or gone from the list for two reads, is stopped.
+  A stop is a SIGTERM: the child starts nothing more, cancels its running episodes, releases their leases and
+  reports their sandbox sessions, then exits (killed only after 2 minutes). A SIGTERM to the follower itself
+  (pm2, systemd) stops every child that way first.
+- **A failed child** (any non-zero exit: refused start, OOM, halt) is retried after a backoff of 1 minute, doubled
+  per failure of that order in a row, at most an hour.
 
 - **Several at once.** `--max-jobs N` mines up to N orders at once, each with its own vLLM, loopback port
-  (`--port`, `--port`+1, ...) and an even share of `--concurrency` (the episodes in flight in all). With
-  `--gpus 0,1,...` each order gets its own card (and `--max-jobs` defaults to their count); without, they share the
-  card and split its memory (`--gpu-memory-utilization`, else 0.9, divided by N).
+  (`--port`, `--port`+1, ...) and an even share of `--concurrency` (the episodes in flight in all). Orders go
+  round-robin over `--gpus 0,1,...` (and `--max-jobs` defaults to their count); the orders sharing a card split its
+  memory (`--gpu-memory-utilization`, else 0.9). An order whose model (weights + 4 GiB) does not fit its share of
+  the card is not started there.
 - **The validator's hotkey.** Signed-sandbox orders sign their session requests for the validator's hotkey. The
   order list names it (`sandbox_hotkey`), so `--validator-hotkey` is needed only against a validator that does not.
+  When both are there and differ, `--validator-hotkey` wins and no signed-sandbox order is mined (its requests
+  would be refused): fix or drop the flag.
+- **Our failures are not yours.** A lease whose episode our side failed (an open refused because the sandbox fleet
+  is full or short, a drained machine or lost gateway, a `box_failed` or `aborted` session, at most 48 of those two
+  a day) is not charged: no debt, no halved capacity.
 - **Auctioned orders.** `--ask-alpha-per-mtoken` (and `--ask-capacity`, default `--concurrency`) is posted before
   the first lease, as for single-turn orders. Without an offer an auctioned order leases nothing.
 

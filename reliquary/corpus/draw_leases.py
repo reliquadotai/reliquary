@@ -88,13 +88,18 @@ class DrawLeases:
     def __init__(self, job: Any, *, clock: Callable[[], float] = time.time, rng: random.Random | None = None,
                  max_per_hotkey: int = MAX_LEASES_PER_HOTKEY, seconds: float | None = None,
                  limit_per_hotkey: bool = True,
-                 on_unused: Callable[[Lease, float], None] | None = None) -> None:
+                 on_unused: Callable[[Lease, float], None] | None = None,
+                 validator_fault: Callable[[Lease], tuple[str, str] | None] | None = None) -> None:
         """``limit_per_hotkey`` False (a job priced by auction): no per-hotkey cap, the price decides who works.
         ``on_unused(lease, held_fraction)`` hears of a lease that ended without its slot taken: expired (1) or
-        released (the share of its time it was held)."""
+        released (the share of its time it was held). ``validator_fault(lease)`` names ``(cause, detail)`` when
+        our side failed the lease's episode (``sandbox.corpus_lease_faults``, from the session book and the
+        issuer's own refusals, never the miner's word): that lease ends uncharged, neither ``on_unused`` (no debt,
+        no halved capacity) nor counted against the hotkey's unused leases."""
         self._job = job
         self._limit = bool(limit_per_hotkey)
         self._on_unused = on_unused
+        self._validator_fault = validator_fault
         self._clock = clock
         self._rng = rng or random.Random(secrets.randbits(64))
         self._max = int(max_per_hotkey)
@@ -131,8 +136,12 @@ class DrawLeases:
             now = self._clock()
             for lease_id in [i for i, lease in self._by_id.items() if lease.expires_at <= now]:
                 lease = self._by_id[lease_id]
-                self._unused.setdefault(lease.hotkey, []).append(lease.expires_at)
                 self._drop(lease_id)
+                fault = self._fault(lease)
+                if fault is not None:
+                    self._log("expired", lease, f" ours={fault[0]} ({fault[1]}): not charged")
+                    continue
+                self._unused.setdefault(lease.hotkey, []).append(lease.expires_at)
                 self._log("expired", lease)
                 self._unused_lease(lease, 1.0)
             for hotkey in list(self._unused):
@@ -141,6 +150,15 @@ class DrawLeases:
                     self._unused[hotkey] = recent
                 else:
                     del self._unused[hotkey]
+
+    def _fault(self, lease: Lease) -> tuple[str, str] | None:
+        if self._validator_fault is None:
+            return None
+        try:
+            return self._validator_fault(lease)
+        except Exception:                     # unjudged: charged as before, never a free pass we cannot justify
+            logger.exception("draw leases: the validator-fault check of lease %s failed", lease.lease_id[:8])
+            return None
 
     def _unused_lease(self, lease: Lease, held_fraction: float) -> None:
         if self._on_unused is not None:
@@ -233,6 +251,10 @@ class DrawLeases:
             self._drop(lease_id)
             span = lease.expires_at - lease.granted_at
             held = (self._clock() - lease.granted_at) / span if span > 0 else 1.0
+            fault = self._fault(lease)
+            if fault is not None:
+                self._log("released", lease, f" held={held:.2f} ours={fault[0]} ({fault[1]}): not charged")
+                return True
             self._log("released", lease, f" held={held:.2f}")
             self._unused_lease(lease, held)
             return True

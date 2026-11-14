@@ -106,9 +106,22 @@ def test_only_open_episode_orders_this_install_serves_are_taken():
 def test_the_validator_hotkey_comes_from_the_listing_and_only_signed_orders_get_it():
     jobs = {"swe": _job("swe"), "tb": _job("tb", kind=SUITE)}
     follower, launched, _, _ = _follower([{"sandbox_hotkey": "5Val", "orders": [_order("swe"), _order("tb")]}],
-                                         jobs, max_jobs=2, validator_hotkey="5Flag")
+                                         jobs, max_jobs=2)
     follower.step()
     assert sorted(launched) == [("swe", 0, "5Val"), ("tb", 1, None)]
+
+
+def test_an_explicit_validator_hotkey_wins_and_a_contradicted_one_signs_nothing():
+    jobs = {"swe": _job("swe"), "tb": _job("tb", kind=SUITE)}
+    orders = [_order("swe"), _order("tb")]
+    follower, launched, _, _ = _follower([{"sandbox_hotkey": "5Flag", "orders": orders}], jobs, max_jobs=2,
+                                         validator_hotkey="5Flag")
+    follower.step()
+    assert sorted(launched) == [("swe", 0, "5Flag"), ("tb", 1, None)]
+    follower, launched, _, _ = _follower([{"sandbox_hotkey": "5Other", "orders": orders}], jobs, max_jobs=2,
+                                         validator_hotkey="5Flag")
+    follower.step()
+    assert launched == [("tb", 0, None)]           # the signed order would only meet bad_signature refusals
 
 
 def test_without_any_validator_hotkey_signed_orders_wait_and_suite_ones_run():
@@ -144,43 +157,140 @@ def test_the_best_paying_orders_fill_the_slots():
     assert [(job, slot) for job, slot, _ in launched] == [("b", 0), ("c", 1)]
 
 
-def test_a_finished_order_frees_its_slot_for_the_next_and_a_retired_one_is_stopped():
+def test_a_finished_order_frees_its_slot_and_a_draining_one_is_left_to_finish():
     jobs = {j: _job(j) for j in ("a", "b", "c")}
     clock = Clock()
     documents = [
         {"sandbox_hotkey": "5Val", "orders": [_order("a", price=0.5), _order("b", price=0.1)]},
-        {"sandbox_hotkey": "5Val", "orders": [_order("a", price=0.5), _order("b", price=0.1)]},
-        # a retires: one read may race its state, the second stops it.
+        # a drains: its running episodes are still paid, its child is never stopped.
         {"sandbox_hotkey": "5Val", "orders": [_order("a", "draining"), _order("b", price=0.1),
                                               _order("c", price=0.2)]},
     ]
     follower, launched, children, _ = _follower(documents, jobs, clock=clock)
     follower.step()
     assert [job for job, _, _ in launched] == ["a"]
-    clock.now += 3600
-    follower.step()                                    # a still runs: nothing new
-    assert [job for job, _, _ in launched] == ["a"]
-    follower.step()
+    for _ in range(5):
+        clock.now += 3600
+        follower.step()
     assert not children["a"].terminated and [job for job, _, _ in launched] == ["a"]
+    children["a"].code = 0                             # a complete: its child ends by itself
     follower.step()
-    assert children["a"].terminated
     assert [job for job, _, _ in launched] == ["a", "c"]     # c pays more than b
-    children["c"].code = 0                             # c filled: its child ends by itself
-    clock.now += 3600
+    assert "a" in follower.done
+    children["c"].code = 0
     follower.step()
     assert [job for job, _, _ in launched] == ["a", "c", "b"]
 
 
-def test_an_order_that_fails_at_once_is_skipped_while_another_is_open():
+def test_a_paused_order_is_waited_out_and_stopped_only_after_long():
+    jobs = {"a": _job("a")}
+    clock = Clock()
+    documents = [{"sandbox_hotkey": "5Val", "orders": [_order("a")]},
+                 {"sandbox_hotkey": "5Val", "orders": [_order("a", "paused")]}]
+    follower, launched, children, _ = _follower(documents, jobs, clock=clock)
+    follower.step()
+    follower.step()
+    clock.now += follow.PAUSED_STOP_SECONDS - 1
+    follower.step()
+    assert not children["a"].terminated
+    clock.now += 2
+    follower.step()
+    assert children["a"].terminated and follower.running == {}
+    assert "a" not in follower.done and "a" not in follower.retry_at     # a stop is neither an end nor a failure
+
+
+def test_an_order_that_left_the_list_is_stopped_after_two_reads():
+    jobs = {"a": _job("a")}
+    documents = [{"sandbox_hotkey": "5Val", "orders": [_order("a")]}, {"sandbox_hotkey": "5Val", "orders": []}]
+    follower, _, children, _ = _follower(documents, jobs)
+    follower.step()
+    follower.step()
+    assert not children["a"].terminated
+    follower.step()
+    assert children["a"].terminated
+
+
+def test_a_failed_order_backs_off_doubling_whenever_it_failed():
     jobs = {j: _job(j) for j in ("bad", "good")}
     clock = Clock()
     document = {"sandbox_hotkey": "5Val", "orders": [_order("bad", price=0.9), _order("good", price=0.1)]}
-    follower, launched, children, _ = _follower([document], jobs, clock=clock)
+    follower, launched, children, _ = _follower([document], jobs, clock=clock, max_jobs=1)
     follower.step()
-    children["bad"].code = 4
-    clock.now += 5
+    clock.now += 7200                                   # an OOM after two hours still backs off
+    children["bad"].code = 1
     follower.step()
-    assert [job for job, _, _ in launched] == ["bad", "good"] and follower.failed == {"bad"}
+    assert [job for job, _, _ in launched] == ["bad", "good"]
+    assert follower.retry_at["bad"] == clock.now + follow.BACKOFF_SECONDS
+    children["good"].code = 0
+    follower.step()                                     # good done, bad still waiting: nothing to start
+    assert [job for job, _, _ in launched] == ["bad", "good"]
+    clock.now += follow.BACKOFF_SECONDS
+    follower.step()
+    assert [job for job, _, _ in launched] == ["bad", "good", "bad"]
+    children["bad"].code = 1
+    follower.step()
+    assert follower.retry_at["bad"] == clock.now + 2 * follow.BACKOFF_SECONDS
+    follower.failures["bad"] = 20                       # many failures in a row: the wait stops doubling
+    clock.now += 10 ** 6
+    follower.step()
+    assert [job for job, _, _ in launched][-1] == "bad"
+    children["bad"].code = 3
+    follower.step()
+    assert follower.retry_at["bad"] - clock.now == follow.BACKOFF_MAX_SECONDS
+
+
+def test_stop_all_signals_every_child_before_waiting():
+    events = []
+
+    class Slow(FakeChild):
+        def terminate(self):
+            events.append(("term", self.job_id))
+            self.code = -15
+
+        def wait(self, timeout=None):
+            events.append(("wait", self.job_id))
+            return self.code
+
+    jobs = {j: _job(j) for j in ("a", "b")}
+    follower = follow.AgenticFollower(
+        list_jobs=lambda: {"sandbox_hotkey": "5Val", "orders": [_order("a"), _order("b")]},
+        read_manifest=lambda j: jobs[j], launch=lambda j, slot, h: Slow(j), fetch=lambda m: None,
+        parse=lambda raw: raw, serve_refusal=lambda job: None, max_jobs=2, sleep=lambda s: None)
+    follower.step()
+    follower.stop_all()
+    assert [e[0] for e in events] == ["term", "term", "wait", "wait"]
+
+
+def test_sigterm_to_the_follower_stops_its_children():
+    import os
+    import signal
+
+    jobs = {"a": _job("a")}
+    follower, _, children, _ = _follower([{"sandbox_hotkey": "5Val", "orders": [_order("a")]}], jobs)
+    follower.sleep = lambda s: os.kill(os.getpid(), signal.SIGTERM)
+    follow.run_until_terminated(follower)
+    assert children["a"].terminated and follower.running == {}
+    assert signal.getsignal(signal.SIGTERM) is not None
+
+
+def test_a_slot_whose_share_of_the_card_cannot_hold_the_model_is_left_empty():
+    jobs = {"big": _job("big", repo="org/Big"), "small": _job("small", repo="org/Small")}
+    fits = follow.memory_fit(max_jobs=2, gpus=[], gpu_memory_utilization=None,
+                             weight_bytes=lambda repo, rev: (60 if repo == "org/Big" else 16) << 30,
+                             card_bytes=lambda device: 80 << 30)
+    document = {"sandbox_hotkey": "5Val", "orders": [_order("big", price=0.9, repo="org/Big"),
+                                                     _order("small", price=0.1, repo="org/Small")]}
+    follower, launched, _, _ = _follower([document], jobs, max_jobs=2, fits=fits)
+    follower.step()
+    # Two slots on one 80 GiB card: 36 GiB each. The 27B-like model does not fit, the small one does.
+    assert [job for job, _, _ in launched] == ["small"]
+    assert fits(jobs["big"], 0).startswith("org/Big needs ~70 GiB")
+    whole = follow.memory_fit(max_jobs=1, gpus=[], gpu_memory_utilization=None,
+                              weight_bytes=lambda repo, rev: 60 << 30, card_bytes=lambda device: 80 << 30)
+    assert whole(jobs["big"], 0) is None
+    unknown = follow.memory_fit(max_jobs=4, gpus=[], gpu_memory_utilization=None,
+                                weight_bytes=lambda repo, rev: None, card_bytes=lambda device: 80 << 30)
+    assert unknown(jobs["big"], 0) is None
 
 
 def test_with_nothing_open_a_starting_agentic_orders_model_is_fetched_once():
@@ -208,6 +318,15 @@ def test_slots_get_their_own_port_card_and_share():
                                 gpu_memory_utilization=None) == (8012, 8, None, "1")
     assert follow.slot_settings(1, max_jobs=2, port=8011, concurrency=8, gpus=[],
                                 gpu_memory_utilization=None) == (8012, 4, 0.45, None)
+    # Four orders on two cards: two per card, each with half of it, never two at full memory.
+    settings = [follow.slot_settings(slot, max_jobs=4, port=8011, concurrency=16, gpus=["0", "1"],
+                                     gpu_memory_utilization=0.9) for slot in range(4)]
+    assert [(device, memory) for _, _, memory, device in settings] == [("0", 0.45), ("1", 0.45), ("0", 0.45),
+                                                                       ("1", 0.45)]
+    # Three on two cards: card 0 holds two (half each), card 1 one (the whole share).
+    settings = [follow.slot_settings(slot, max_jobs=3, port=8011, concurrency=12, gpus=["0", "1"],
+                                     gpu_memory_utilization=None) for slot in range(3)]
+    assert [(device, memory) for _, _, memory, device in settings] == [("0", 0.45), ("1", None), ("0", 0.45)]
 
 
 def test_the_child_mines_one_order_with_the_parents_options():
@@ -249,7 +368,7 @@ def test_mine_agentic_without_a_job_follows_the_orders(monkeypatch):
         def __init__(self, **kwargs):
             seen.update(kwargs)
 
-        def run(self):
+        def run(self, rounds=None):
             seen["ran"] = True
 
     monkeypatch.setattr(follow, "AgenticFollower", FakeFollower)
