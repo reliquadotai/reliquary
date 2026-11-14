@@ -3239,15 +3239,23 @@ def corpus_mine(
         help="A job priced by auction: the samples this hotkey can hold at once (default 1). Leases it cannot "
              "deliver are charged and halve it for an hour",
     ),
+    sync_envs: bool = typer.Option(
+        True, "--sync-envs/--no-sync-envs",
+        help="At start, install the agentic orders' env packages and harness that are missing or not at this "
+             "build's pins (`reliquary miner-envs --sync`); the check is logged either way",
+    ),
 ) -> None:
     """Generate for the corpus job the validator serves, and submit it. Without --job-id, on a validator that
     lists its orders: mine open orders one after another, each in its own process."""
+    from reliquary.miner.env_packages import startup_check
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
+
+    setup_logging("INFO")
+    startup_check(sync_envs=sync_envs)
 
     if job_id is None and _served_orders(validator_url) is not None:
         from reliquary.miner.order_follow import fetch_model, follow_orders, run_child
 
-        setup_logging("INFO")
         argv = ["--validator-url", validator_url, "--wallet-name", wallet_name, "--hotkey", hotkey,
                 "--max-steps", str(max_steps)]
         for flag, value in (("--wallet-path", wallet_path or None),
@@ -3383,6 +3391,10 @@ def corpus_mine_agentic(
              "names none keeps it at 4. Episodes also run at most --concurrency at once. The miner "
              "declares min(this, --concurrency) as its want, which sizes the sandbox fleet: set "
              "--concurrency to the episodes your GPU can run at once"),
+    sync_envs: bool = typer.Option(
+        True, "--sync-envs/--no-sync-envs",
+        help="At start, install the agentic orders' env packages and harness that are missing or not at this "
+             "build's pins (`reliquary miner-envs --sync`); the check is logged either way"),
 ) -> None:
     """Mine an agentic (episode) corpus job against a local vLLM with per-turn
     proofs. A SWE replay job (harness bash) runs verifiers + reliquary-swe episodes
@@ -3391,7 +3403,11 @@ def corpus_mine_agentic(
     validator's sandbox machines (it needs `--validator-hotkey` and the
     reliquary[sandbox-miner] extra). A suite job (harness suite) runs a registered
     episode environment in process and needs only that environment's pinned wheel."""
+    from reliquary.miner.env_packages import startup_check
     from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
+
+    setup_logging("INFO")
+    startup_check(sync_envs=sync_envs)
 
     if TASK_CONTRACT_ENV_VAR not in os.environ:
         _restart_with_served_contract(validator_url, job_id)
@@ -4326,6 +4342,24 @@ async def _discover_rl_validator() -> tuple[str, str | None]:
         return discover_validator(await get_metagraph(subtensor, NETUID))
     finally:
         await close_subtensor(subtensor)
+
+
+@app.command("miner-envs")
+def miner_envs(
+    sync: bool = typer.Option(False, "--sync", help="Install the env packages and harness that are missing or "
+                                                    "not at this build's pins, then check again"),
+) -> None:
+    """The env packages and harness agentic orders need, against the commits this build pins: which order
+    families this install serves, and why the others are refused. Exit 1 if any is missing or stale."""
+    from reliquary.miner import env_packages
+
+    setup_logging("INFO")
+    statuses = env_packages.sync() if sync else env_packages.env_status()
+    for line in env_packages.report_lines(statuses):
+        typer.echo(line)
+    if not all(s.ok for s in statuses):
+        typer.echo(env_packages.hint(statuses), err=True)
+        raise typer.Exit(code=1)
 
 
 @app.command("miner-setups")

@@ -69,6 +69,18 @@ sandbox = [
 ]
 sandbox-miner = [
     "reliquary-sandbox[verifiers] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@d680d5e6f694c650f74b9dea4bc62930aad45da0",
+    "reliquary[miner-envs]",
+]
+# The env packages agentic orders pin (reliquary/miner/env_packages.py: the same list), from git so
+# pip records the commit the validator checks. Built for Python 3.12 only, like the gateways.
+# pip keeps a git install whose commit moved under the same version: `reliquary miner-envs --sync`
+# (run by the miner at start) reinstalls those.
+miner-envs = [
+    "reliquary-swe @ git+https://github.com/reliquadotai/reliquary-environments.git@15ad131b473f59f46b62d363bfacf430f4931f39#subdirectory=environments/code/reliquary_swe ; python_version == '3.12'",
+    "reliquary-swebench-pro @ git+https://github.com/reliquadotai/reliquary-environments.git@d2cf12b1c144515397fae634f5e848f7df55c180#subdirectory=environments/code/reliquary_swebench_pro ; python_version == '3.12'",
+    "reliquary-deepswe @ git+https://github.com/reliquadotai/reliquary-environments.git@faaefd675e6f6583e6e1ce3f3a3eca109fe8e766#subdirectory=environments/code/reliquary_deepswe ; python_version == '3.12'",
+    "reliquary-terminal-bench @ git+https://github.com/reliquadotai/reliquary-environments.git@a7718445c156a36eec2835c43d5fb6c86c045a5e#subdirectory=environments/code/reliquary_terminal_bench ; python_version == '3.12'",
+    "reliquary-automationbench @ git+https://github.com/reliquadotai/reliquary-environments.git@b404a0bb93b289a44ae242c001148f21982812a7#subdirectory=environments/tool_use/reliquary_automationbench ; python_version == '3.12'",
 ]
 sandbox-test = [
     "reliquary-sandbox[service] @ git+https://github.com/reliquadotai/reliquary-sandbox.git@d680d5e6f694c650f74b9dea4bc62930aad45da0",
