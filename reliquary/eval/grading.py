@@ -672,11 +672,12 @@ def redone_slots(sessions: Iterable[Mapping], job_id: str,
 
 
 def episode_limit_cut_fails(job) -> bool:
-    """Whether the job's episode profile scores a run cut by a limit as a failure."""
-    from reliquary.corpus.job import EPISODE_PROFILES
+    """Whether the job's episode (its profile, or `limit_cut_fails`) scores a run cut by a limit
+    as a failure."""
+    from reliquary.corpus.job import limit_cuts_fail
 
-    profile = getattr(getattr(job, "episode", None), "profile", None)
-    return profile is not None and EPISODE_PROFILES[profile].limit_cut_fails
+    episode = getattr(job, "episode", None)
+    return episode is not None and limit_cuts_fail(episode)
 
 
 class EpisodeJobRows:
