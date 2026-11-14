@@ -273,6 +273,8 @@ class CorpusAuditor:
         # Pending ids whose draw is known and undrawn: as a sibling they can
         # neither be audited nor be undecidable, so a pass need not decide them.
         self._undrawn: set[str] = set()
+        # Draws read from cached randomness for the backlog count (``_undrawn_by_cached_draw``).
+        self._draw_known: dict[str, bool] = {}
         # `stake_at_receipt`: per hotkey, sorted (receipt, pay, held, id) of what a later failure could forfeit
         # (held: left unaudited and undrawn; else an audited pass); each record's stake as first counted; the
         # records already in a hotkey's list.
@@ -581,8 +583,28 @@ class CorpusAuditor:
                             else self._seen_at.get(submission_id))
                 if received is not None and received > cutoff:
                     continue
+                if received is not None and self._undrawn_by_cached_draw(submission_id, received):
+                    continue
             count += 1
         return count
+
+    def _undrawn_by_cached_draw(self, submission_id: str, received_at: float) -> bool:
+        """Whether the record's draw, read from randomness already cached, leaves it undrawn. After a restart
+        every due record is seeded and none is in ``_undrawn`` until its pass meets it, so without this the
+        backlog counted them all and cut the auction's budget for a quarter of an hour (2026-11-14)."""
+        known = self._draw_known.get(submission_id)
+        if known is not None:
+            return not known
+        if self._round_at is None:
+            return False
+        try:
+            randomness = self._randomness.get(int(self._round_at(received_at)) + 1)
+            if randomness is None:
+                return False
+            known = self._draw_known[submission_id] = drawn(randomness, submission_id, self._params.q)
+        except Exception:
+            return False
+        return not known
 
     def pending_count(self, hotkey: str) -> int:
         """Records of ``hotkey`` read and awaiting a verdict."""
@@ -592,6 +614,7 @@ class CorpusAuditor:
         self._judged.add(submission_id)
         self._unreadable.discard(submission_id)
         self._undrawn.discard(submission_id)
+        self._draw_known.pop(submission_id, None)
         self._stake.pop(submission_id, None)
         self._shortest.pop(submission_id, None)
         self._ahead.pop(submission_id, None)

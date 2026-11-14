@@ -457,6 +457,11 @@ class TokenAuction:
         except Exception:
             logger.exception("token auction: state %s unreadable; starting empty", self._state_path)
 
+    @property
+    def state_path(self) -> Path | None:
+        """Where this auction's state is written, if anywhere: its job's leases are written beside it."""
+        return self._state_path
+
     def _changed(self) -> None:
         self._dirty = True
         self.save()
