@@ -13,6 +13,8 @@ The pins here and the ``miner-envs`` extra in pyproject.toml are the same list
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import importlib.metadata
 import importlib.util
 import json
@@ -135,9 +137,10 @@ _DIGEST_PROBE = ("from reliquary.environment.agentic_swe import harness_refusal\
 
 def harness_digest_refusal() -> str | None:
     """`agentic_swe.harness_refusal`, read in a child process: this one must not import a harness it
-    may be about to replace (it would keep the old one in memory)."""
+    may be about to replace (it would keep the old one in memory). ``-P``: the installed reliquary, not a
+    checkout in the working directory."""
     try:
-        probe = subprocess.run([sys.executable, "-c", _DIGEST_PROBE], capture_output=True, text=True,
+        probe = subprocess.run([sys.executable, "-P", "-c", _DIGEST_PROBE], capture_output=True, text=True,
                                timeout=120, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"the harness check could not run ({exc})"
@@ -179,31 +182,53 @@ def _installer() -> list[str] | None:
 
 
 def sync_commands(statuses: list[PackageStatus]) -> list[list[str]]:
-    """The installer commands that bring the stale or missing packages to their pins: the stale ones
-    are uninstalled first (pip keeps a git install whose version did not change), then every one is
-    installed with the reliquary-sandbox verifiers bridge, so their ``verifiers==0.3.1`` resolves to
-    the bridge's git verifiers (tag v0.3.1) and not to PyPI's. Editable installs and packages this
-    Python cannot install are left alone."""
+    """The installer commands that bring the stale or missing packages to their pins.
+
+    A stale one is reinstalled in place (``--force-reinstall --no-deps``: pip keeps a git install whose
+    version did not change, and its dependencies are already there), so a failure part way leaves it at
+    its old commit, never uninstalled. A missing one is installed with its dependencies; their
+    ``verifiers==0.3.1`` is the bridge's git verifiers (tag v0.3.1), installed with reliquary-sandbox.
+    reliquary-sandbox is in a command only when it is itself stale or missing. Editable installs and
+    packages this Python cannot install are left alone."""
     todo = [s for s in statuses if not s.ok and not s.editable and not _wrong_python(s)]
     if not todo:
         return []
     installer = _installer() or [sys.executable, "-m", "pip"]
     python = [] if installer[0] == sys.executable else ["--python", sys.executable]
+    present = [s for s in todo if _direct_url(s.package.distribution) is not None]
+    missing = [s for s in todo if s not in present]
     commands = []
-    stale = [s.package.distribution for s in todo if _direct_url(s.package.distribution) is not None]
-    if stale:
-        confirm = [] if python else ["-y"]  # uv pip uninstall asks nothing (and has no -y)
-        commands.append([*installer, "uninstall", *python, *confirm, *stale])
-    requirements = [s.package.requirement() for s in todo]
-    if SANDBOX.requirement() not in requirements:
-        requirements.insert(0, SANDBOX.requirement())
-    commands.append([*installer, "install", *python, *requirements])
+    if missing:
+        commands.append([*installer, "install", *python, *(s.package.requirement() for s in missing)])
+    if present:
+        commands.append([*installer, "install", *python, "--force-reinstall", "--no-deps",
+                         *(s.package.requirement() for s in present)])
     return commands
 
 
-def sync(statuses: list[PackageStatus] | None = None) -> list[PackageStatus]:
-    """Install what is missing or stale, then check again."""
-    statuses = env_status() if statuses is None else statuses
+def lock_path() -> str:
+    return os.path.join(sys.prefix, ".reliquary-miner-envs.lock")
+
+
+@contextlib.contextmanager
+def envs_lock():
+    """Exclusive over this environment (a file in ``sys.prefix``): two miners sharing a venv never run
+    installers at once, and the second one checks again after the first is done. Without a writable
+    prefix (a read-only image) nothing can be installed anyway: no lock."""
+    try:
+        handle = open(lock_path(), "a")
+    except OSError:
+        yield
+        return
+    with handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _sync_locked(statuses: list[PackageStatus]) -> list[PackageStatus]:
     commands = sync_commands(statuses)
     if commands and _installer() is None:
         logger.warning("miner envs: neither pip nor uv is available here; run: %s",
@@ -220,6 +245,12 @@ def sync(statuses: list[PackageStatus] | None = None) -> list[PackageStatus]:
     return env_status()
 
 
+def sync() -> list[PackageStatus]:
+    """Install what is missing or stale (under the env lock, after checking again), then check again."""
+    with envs_lock():
+        return _sync_locked(env_status())
+
+
 def startup_check(*, sync_envs: bool) -> None:
     """The miner's start: log which order families this install can serve, after installing what is
     missing or stale when ``sync_envs``. Never fatal: single-turn orders need none of these. Done
@@ -228,12 +259,13 @@ def startup_check(*, sync_envs: bool) -> None:
         return
     os.environ[SYNCED_ENV_VAR] = "1"
     try:
-        statuses = env_status()
-        # Only an install that took the miner extra (reliquary-sandbox is there) is synced: a single-turn
-        # miner without it is told what agentic orders need, not given them at every start.
-        opted_in = _direct_url(SANDBOX.distribution) is not None
-        if sync_envs and opted_in and not all(s.ok for s in statuses) and sync_commands(statuses):
-            statuses = sync(statuses)
+        with envs_lock():
+            statuses = env_status()
+            # Only an install that took the miner extra (reliquary-sandbox is there) is synced: a
+            # single-turn miner without it is told what agentic orders need, not given them at every start.
+            opted_in = _direct_url(SANDBOX.distribution) is not None
+            if sync_envs and opted_in and sync_commands(statuses):
+                statuses = _sync_locked(statuses)
         log_status(statuses)
     except Exception:
         logger.warning("miner envs: the check failed", exc_info=True)

@@ -71,14 +71,67 @@ def test_missing_and_stale_packages_are_named_and_reinstalled(monkeypatch):
     assert "000000000000" in statuses["reliquary-terminal-bench"].problem
     lines = ep.report_lines(list(statuses.values()))
     assert any("DeepSWE orders refused" in line for line in lines)
-    uninstall, install = ep.sync_commands(list(statuses.values()))
-    assert uninstall[-2:] == ["-y", "reliquary-terminal-bench"]
-    # The verifiers bridge comes with them, so their verifiers==0.3.1 is its git verifiers.
-    assert ep.SANDBOX.requirement() in install
+    install, reinstall = ep.sync_commands(list(statuses.values()))
     by_name = {p.distribution: p for p in ep.PACKAGES}
-    assert {r for r in install if r.startswith("reliquary-")} == {
-        ep.SANDBOX.requirement(), by_name["reliquary-deepswe"].requirement(),
-        by_name["reliquary-terminal-bench"].requirement()}
+    # The missing one with its dependencies; the stale one in place, never uninstalled first.
+    assert install[-2:] == ["install", by_name["reliquary-deepswe"].requirement()]
+    assert reinstall[-4:] == ["install", "--force-reinstall", "--no-deps",
+                              by_name["reliquary-terminal-bench"].requirement()]
+    assert not any("uninstall" in command for command in (install, reinstall))
+    # The sandbox is at its pin: it is not in either command.
+    assert ep.SANDBOX.requirement() not in install + reinstall
+
+
+def test_a_stale_or_missing_sandbox_is_synced_but_not_an_editable_one(monkeypatch):
+    installed = _all_pinned()
+    installed["reliquary-sandbox"] = None
+    _fake_install(monkeypatch, installed)
+    (install,) = ep.sync_commands(ep.env_status())
+    assert install[-1] == ep.SANDBOX.requirement()
+
+    installed["reliquary-sandbox"] = _git("0" * 40)
+    (reinstall,) = ep.sync_commands(ep.env_status())
+    assert reinstall[-3:] == ["--force-reinstall", "--no-deps", ep.SANDBOX.requirement()]
+
+    installed["reliquary-sandbox"] = {"url": "file:///src/sandbox", "dir_info": {"editable": True}}
+    installed["reliquary-deepswe"] = None
+    (install,) = ep.sync_commands(ep.env_status())
+    assert ep.SANDBOX.requirement() not in install
+    assert install[-1] == {p.distribution: p for p in ep.PACKAGES}["reliquary-deepswe"].requirement()
+
+
+def test_the_check_and_sync_hold_the_env_lock(monkeypatch, tmp_path):
+    import fcntl
+
+    monkeypatch.setattr(sys, "prefix", str(tmp_path))
+    monkeypatch.delenv(ep.SYNCED_ENV_VAR, raising=False)
+    held = []
+
+    def probe():
+        with open(ep.lock_path(), "a") as other:
+            try:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                held.append(True)
+            else:
+                held.append(False)
+                fcntl.flock(other, fcntl.LOCK_UN)
+        return []
+
+    monkeypatch.setattr(ep, "env_status", probe)
+    monkeypatch.setattr(ep, "_direct_url", lambda name: None)
+    monkeypatch.setattr(ep, "log_status", lambda statuses: None)
+    ep.startup_check(sync_envs=True)
+    ep.sync()
+    assert len(held) >= 2 and all(held)  # every check, at start and in the sync, under the lock
+    probe()
+    assert held[-1] is False  # released afterwards
+
+
+def test_no_writable_prefix_runs_without_a_lock(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / "missing"))
+    with ep.envs_lock():
+        pass
 
 
 def test_a_compatible_sandbox_release_is_accepted(monkeypatch):
@@ -132,7 +185,7 @@ def test_the_start_check_syncs_only_an_install_that_took_the_miner_extra(monkeyp
     installed = _all_pinned()
     installed["reliquary-deepswe"] = None
     synced = []
-    monkeypatch.setattr(ep, "sync", lambda statuses: synced.append(1) or statuses)
+    monkeypatch.setattr(ep, "_sync_locked", lambda statuses: synced.append(1) or statuses)
     monkeypatch.setattr(ep, "log_status", lambda statuses: None)
     _fake_install(monkeypatch, installed)
     ep.startup_check(sync_envs=True)
