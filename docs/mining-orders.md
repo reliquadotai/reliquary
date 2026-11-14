@@ -23,7 +23,8 @@ commits (the validator checks the commit pip records): SWE-bench Verified (`reli
 (`reliquary-swebench-pro`), DeepSWE (`reliquary-deepswe`), Terminal-Bench 2.1 (`reliquary-terminal-bench`),
 AutomationBench (`reliquary-automationbench`), with the reliquary-sandbox bridge and the reliquary-harness.
 pip does not reinstall a git package whose commit moved under the same version, so
-`reliquary miner-envs --sync` reinstalls the ones that are missing or stale. Single-turn orders (LiveCodeBench,
+`reliquary miner-envs --sync` reinstalls the ones that are missing or stale (with uv when it is on the PATH,
+applying the same mcp override). Single-turn orders (LiveCodeBench,
 GraphWalks, MRCR, ...) need none of them: their prompts come from the order.
 
 `reliquary miner-envs` alone prints which order families this install serves, and why the others are refused.

@@ -199,12 +199,30 @@ def report_lines(statuses: list[PackageStatus]) -> list[str]:
 
 
 def _installer() -> list[str] | None:
-    if importlib.util.find_spec("pip") is not None:
-        return [sys.executable, "-m", "pip"]
+    """uv first (it applies the mcp override; pip has no overrides), else this Python's pip."""
     uv = shutil.which("uv")
     if uv:
         return [uv, "pip"]
+    if importlib.util.find_spec("pip") is not None:
+        return [sys.executable, "-m", "pip"]
     return None
+
+
+def override_file() -> str:
+    """A file holding ``MCP_OVERRIDE`` (miner-overrides.txt is not shipped with an installed package), for
+    ``uv pip install --override``."""
+    import tempfile
+
+    path = os.path.join(tempfile.gettempdir(), f"reliquary-miner-overrides-{os.getuid()}.txt")
+    try:
+        with open(path, encoding="utf-8") as existing:
+            if existing.read().strip() == MCP_OVERRIDE:
+                return path
+    except OSError:
+        pass
+    with open(path, "w", encoding="utf-8") as out:
+        out.write(MCP_OVERRIDE + "\n")
+    return path
 
 
 def sync_commands(statuses: list[PackageStatus]) -> list[list[str]]:
@@ -224,11 +242,17 @@ def sync_commands(statuses: list[PackageStatus]) -> list[list[str]]:
     present = [s for s in todo if _direct_url(s.package.distribution) is not None]
     missing = [s for s in todo if s not in present]
     commands = []
+    # uv: the override keeps verifiers' mcp<2 next to vLLM (mcp>=2). pip has none (`pip check` then names vLLM's
+    # bound, docs/mining-orders.md).
+    override = ["--override", override_file()] if installer[0] != sys.executable else []
     if missing:
-        commands.append([*installer, "install", *python, *(s.package.requirement() for s in missing)])
+        commands.append([*installer, "install", *python, *override, *(s.package.requirement() for s in missing)])
     if present:
         commands.append([*installer, "install", *python, "--force-reinstall", "--no-deps",
                          *(s.package.requirement() for s in present)])
+    if mcp_refusal():
+        # mcp 2 (pulled by vLLM) breaks verifiers: back to its bound; a --no-deps reinstall would not do it.
+        commands.append([*installer, "install", *python, *override, MCP_OVERRIDE])
     return commands
 
 
