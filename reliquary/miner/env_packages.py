@@ -75,6 +75,8 @@ def _env(distribution: str, commit: str, subdirectory: str, serves: str) -> Pinn
 ENV_PACKAGES = (
     _env("reliquary-swe", "15ad131b473f59f46b62d363bfacf430f4931f39", "code/reliquary_swe",
          "SWE-bench Verified orders"),
+    _env("reliquary-terminal", "15ad131b473f59f46b62d363bfacf430f4931f39", "code/reliquary_terminal",
+         "TMax orders"),
     _env("reliquary-swebench-pro", "d2cf12b1c144515397fae634f5e848f7df55c180",
          "code/reliquary_swebench_pro", "SWE-bench Pro orders"),
     _env("reliquary-deepswe", "faaefd675e6f6583e6e1ce3f3a3eca109fe8e766", "code/reliquary_deepswe",
