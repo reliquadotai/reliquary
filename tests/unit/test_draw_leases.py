@@ -365,3 +365,35 @@ def test_each_lease_event_is_one_log_line(caplog):
     events = [r.getMessage().split()[2] for r in caplog.records]
     assert events == ["granted", "granted", "taken", "released", "granted", "expired"]
     assert f"prompt={c.prompt_index} slot={c.slot} hotkey=5Ccccccc secs=100" in caplog.records[4].getMessage()
+
+
+def test_a_restart_keeps_the_leases_still_running(tmp_path):
+    # 2026-11-14: a control restart dropped every lease in flight, and a job priced by auction refuses a submission
+    # without its lease. Written beside the auction's state, they come back; one taken before the restart does not.
+    path = tmp_path / "job.leases.json"
+    job, _, _, clock, leases, free = _setup(prompts=2, slots=1, limit_per_hotkey=False, state_path=path)
+    kept = leases.grant("a", free)
+    taken = leases.grant("b", free)
+    leases.settle(taken.prompt_index, taken.slot)
+    back = DrawLeases(job, clock=clock, rng=random.Random(1), seconds=100.0, limit_per_hotkey=False, state_path=path)
+    assert back.held("a", kept.prompt_index, kept.slot) == kept
+    assert back.holders(taken.prompt_index, taken.slot) == []
+    assert back.counts() == {"a": 1}
+
+
+def test_a_lease_that_ran_out_while_down_is_dropped_uncharged(tmp_path):
+    path = tmp_path / "job.leases.json"
+    job, _, _, clock, leases, free = _setup(prompts=1, slots=1, state_path=path)
+    leases.grant("a", free)
+    clock.now += 101
+    charged = []
+    back = DrawLeases(job, clock=clock, rng=random.Random(1), seconds=100.0, state_path=path,
+                      on_unused=lambda lease, held: charged.append(lease.hotkey))
+    assert len(back) == 0 and back.counts() == {} and charged == []
+
+
+def test_an_unreadable_lease_state_starts_empty(tmp_path):
+    path = tmp_path / "job.leases.json"
+    path.write_text("{not json")
+    job = _job()
+    assert len(DrawLeases(job, clock=Clock(), rng=random.Random(0), seconds=100.0, state_path=path)) == 0

@@ -1742,8 +1742,11 @@ def build_corpus_router(
             if auction is None:
                 leases = DrawLeases(job, validator_fault=lease_fault)
             else:
+                # Beside the auction's state, so a control restart keeps the leases in flight.
                 leases = DrawLeases(job, limit_per_hotkey=False, validator_fault=lease_fault,
-                                    on_unused=lambda lease, held: auction.lease_ended(lease.hotkey, lease.price, held))
+                                    on_unused=lambda lease, held: auction.lease_ended(lease.hotkey, lease.price, held),
+                                    state_path=(auction.state_path.with_suffix(".leases.json")
+                                                if auction.state_path is not None else None))
                 auction.bind_holdings(leases.counts)
             leases = leases_by_job[job.job_id] = leases
         return leases

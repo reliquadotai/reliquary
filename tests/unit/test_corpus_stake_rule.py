@@ -16,7 +16,7 @@ from reliquary.validator.corpus_periods import PERIOD_EPOCH, PERIOD_SECONDS
 from tests.unit.test_corpus_auditor import _Tokenizer
 from tests.unit.test_corpus_forfeit import _Store
 from tests.unit.test_corpus_judge import (
-    HK, HOLD, PROOF, Q, SAMPLED, T0, _Beacon, _Clock, _ids, _model, _rec, _round_at, _States,
+    HK, HOLD, PROOF, Q, RAND, SAMPLED, T0, _Beacon, _Clock, _ids, _model, _rec, _round_at, _States,
 )
 
 
@@ -318,3 +318,18 @@ def test_the_audit_backlog_leaves_out_records_still_waiting_for_their_draw():
     assert full.audit_backlog() == 3
     clock.now = T0 + DRAW_WAIT_SECONDS + 1
     assert sampled.audit_backlog() == 3
+
+
+def test_after_a_restart_the_backlog_leaves_out_records_whose_cached_draw_is_undrawn():
+    # A restart seeds every due record with none known undrawn yet: once their draw round is cached, the undrawn
+    # ones leave no GPU work and must not cut the auction's budget (2026-11-14).
+    from reliquary.validator.corpus_auditor import DRAW_WAIT_SECONDS
+
+    clock = _Clock(T0)
+    auditor = _auditor(_Store({}), clock)
+    for sid in (*_ids(False, 3), *_ids(True, 2)):
+        auditor.enqueue(sid)
+    clock.now = T0 + DRAW_WAIT_SECONDS + 1
+    assert auditor.audit_backlog() == 5          # no randomness yet: every record may still be drawn
+    auditor._randomness[_round_at(T0) + 1] = RAND
+    assert auditor.audit_backlog() == 2

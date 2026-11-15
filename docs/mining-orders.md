@@ -85,6 +85,8 @@ order that pays less is not dropped for a better one that opens later: its lease
   miners' gradings held the grading pool); otherwise an open we refused (the fleet full while you were within your
   allowance, our task, ledger, store or directory down). A session that ended your way (expired, graded and never
   submitted, any other abort) is charged. `box_failed` is free at most 48 times a day per hotkey, all orders together.
+- **Our restarts keep your leases.** The leases of an auctioned order are written to disk and read back when the
+  validator restarts: a lease still running stays yours, and the episode it covers is accepted as before.
 - **Auctioned orders.** `--ask-alpha-per-mtoken` (and `--ask-capacity`, default `--concurrency`) is posted before
   the first lease, as for single-turn orders. Without an offer an auctioned order leases nothing.
 
