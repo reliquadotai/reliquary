@@ -608,7 +608,7 @@ def seed_consistency_diagnostics(
     miner's cut dropped never makes a gap. A token outside the support widened by ``edge_margin`` is
     impossible (miss 1); inside it, its miss is the score gap to the tight support's best, so a
     token the miner's cut kept where the validator's did not is an ordinary near-tie miss. A warp that keeps one
-    token (top_k 1: greedy) scores its misses on the raw logits alone (``_greedy``).
+    token (top_k 1: greedy) scores its misses on the raw logits alone, whatever their rank (``_greedy``).
     """
     check_draw(draw, t=t, top_k=top_k, top_p=top_p, min_p=min_p)
     warp = _warp_of(t, top_k, top_p, min_p)
@@ -777,7 +777,9 @@ def _greedy(warp: Warp) -> bool:
     logits alone: with the noise, an honest flip between two near-tied logits would carry the difference of two
     independent Gumbel draws (logistic, over the 4.0 tolerance about 2 % of the time) and read as an edit. The
     gap is in raw logits, never divided by the temperature: the temperature does not move a greedy pick, and a
-    high one would shrink every gap (a job refuses top_k 1 at any temperature but 1, ``corpus.job``)."""
+    high one would shrink every gap (a job refuses top_k 1 at any temperature but 1, ``corpus.job``). Any token is
+    possible, its gap to the top logit the only measure: a widened top 1 keeps two tokens, and an honest pick third
+    in a three-way near-tie read as impossible (2026-11-14, SciCode: max_gap null on three of three attempts)."""
     return warp.top_k == 1
 
 
@@ -820,7 +822,7 @@ def _gumbel_warp_chunk_stats(chunk_logits, toks, draws, warp, edge_margin, stoch
         own = own / float(warp.t) + gumbel_noise_from_bits(_splitmix_bits(keys, toks))
     exact = picks == toks
     near = -torch.expm1(-(best - own).clamp_min(0.0))
-    possible = ((index == toks[:, None]) & loose).any(dim=-1)
+    possible = torch.ones_like(exact) if greedy else ((index == toks[:, None]) & loose).any(dim=-1)
     miss = torch.where(exact, torch.zeros_like(near), torch.where(possible, near, torch.ones_like(near)))
     max_probs = torch.softmax(x.masked_fill(~support, float("-inf")), dim=-1).max(dim=-1).values
     return exact, miss, max_probs < stochastic_threshold
@@ -872,7 +874,7 @@ def _gumbel_warp_chunk_stats_dense(chunk_logits, toks, draws, warp, edge_margin,
         own = x.gather(1, toks.unsqueeze(1)).squeeze(1) + gumbel_noise_from_bits(_splitmix_bits(keys, toks))
     exact = picks == toks
     near = -torch.expm1(-(best - own).clamp_min(0.0))
-    possible = loose.gather(1, toks.unsqueeze(1)).squeeze(1)
+    possible = torch.ones_like(exact) if _greedy(warp) else loose.gather(1, toks.unsqueeze(1)).squeeze(1)
     miss = torch.where(exact, torch.zeros_like(near), torch.where(possible, near, torch.ones_like(near)))
     max_probs = torch.softmax(x.masked_fill(~support, float("-inf")), dim=-1).max(dim=-1).values
     return exact, miss, max_probs < stochastic_threshold
