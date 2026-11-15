@@ -2,15 +2,17 @@
   <a href="https://www.reliqua.ai">
     <img
       src="docs/assets/readme/reliquary-hero.svg"
-      alt="Reliquary — verified frontier search for decentralized model training"
+      alt="Reliquary — reinforcement learning on the world's GPUs"
       width="100%"
     />
   </a>
 </p>
 
+<h1 align="center">Reinforcement learning on the world's GPUs.</h1>
+
 <p align="center">
-  <strong>Verified frontier search for decentralized language-model training.</strong><br />
-  Sixteen trajectories per prompt. Validator-authoritative rewards. Public evidence at every boundary.
+  <strong>Generate, evaluate and train open models on a network nobody owns.</strong><br />
+  An open-source lab on Bittensor subnet 81.
 </p>
 
 <p align="center">
@@ -29,120 +31,96 @@
 </p>
 
 <p align="center">
-  <a href="https://www.reliqua.ai/dashboard">Live dashboard</a>
+  <a href="https://www.reliqua.ai">Get access</a>
   ·
   <a href="https://www.reliqua.ai/research">Research</a>
   ·
-  <a href="https://huggingface.co/Qwen/Qwen3-4B-Base">Base model</a>
-  ·
-  <a href="https://github.com/orgs/reliquadotai/packages/container/package/reliquary-validator">Container</a>
+  <a href="https://huggingface.co/ReliquaryForge">Models</a>
   ·
   <a href="docs/mining-orders.md">Mine</a>
-  ·
-  <a href="docs/validating.md">Validate</a>
 </p>
 
 ---
 
-Reliquary is the open protocol and reference implementation for decentralized
-GRPO training on Bittensor subnet 81. Independent miners spend their own GPU
-compute searching for prompts at the policy's learning frontier. The trainer
-admits, ranks, verifies, rewards, and—when the safety gates permit—trains on the
-best groups.
+## Use it
 
-The key incentive shift is simple: miners are not paid for producing the most
-rollouts. They compete to contribute verified rollout groups the trainer can
-use.
+Send a JSONL file in the OpenAI Batch format, pick an open model at an exact
+revision, and get back completions verified against that model.
 
-## Mining
+| | What you get | Status |
+| --- | --- | --- |
+| **Batch generation** | Training data from a pinned model on your prompts | Early access |
+| **Evaluations** | Your model graded on your tasks or a held-out benchmark, every answer inspectable | Early access |
+| **RL training** | Your model trained on your own tasks and graders | Waitlist |
 
-Miners today generate customers' **Batch and Evals orders**, priced by auction and paid per verified token:
-see **[Mining orders](docs/mining-orders.md)**. One address: `https://api.reliqua.ai`.
+[Request access →](https://www.reliqua.ai)
 
-The V1 RL run ended on 2026-11-02; its miner instructions are kept in [mining.md](docs/mining.md) for reference.
+## The most efficient way to run RL
 
-## Feature status
+Our goal is to be the most efficient platform for reinforcement learning, and
+that starts with the rollouts. They take most of the compute: the model tries each
+task again and again, and every attempt is graded. That work splits into
+millions of independent pieces, so it doesn't need a datacenter. Reliquary sends
+it to GPUs all over the world, from gaming cards to idle cluster capacity. Miners
+compete on price, and only work that checks out gets paid.
 
-Runtime availability is reported by `/readyz`; this table is not a GO notice.
+**It already trains real models.** The trainer generated zero rollouts. Miners did
+all of it.
 
-| Layer | State |
-| --- | --- |
-| V1 profile: fill-closed windows with Math, Code and Logic | Configuration above; follow operator notices and runtime readiness |
-| Qwen3-4B Base DAPO reasoning-v5 profile, deferred-proof auction, and GRAIL verification | **Release candidate — runtime gates pending** |
-| Mixed OpenMath + OpenCode collection and validator-authoritative rewards | **Live** |
-| Canonical prompt-content identity and one-shot cooldown | **Live** |
-| Utility telemetry | **Live, observation only** |
-| Behavior descriptors and a novelty archive | **Not deployed** |
-| Novelty-shaped ranking, rewards, or training loss | **0% influence** |
+| Model | Made by the network | Result |
+| --- | --- | --- |
+| [**Teutonic-I-Reliquary**](https://www.reliqua.ai/research/teutonic-i-reliquary) · 9B | ~4.5 B SFT tokens, all RL rollouts, all evaluation samples | **43.6 %** SWE-bench Verified, vs **35.1 %** for Qwen3.5-9B |
+| [**Reliquary-4B**](https://www.reliqua.ai/research) · RL only, from Qwen3-4B-Base | 6.6 M RL rollouts | MATH-500 **37.2 → 72.6**, AMC23 **15.6 → 47.5** |
 
-The observation-only utility foundation does not alter admission, ranking,
-selection, payout, or training. Its activation gates are documented in
-[Auction v3 Utility Foundation](docs/auction-v3-utility-foundation.md).
-Change the v5 row to **Live** only at the coordinated runtime activation. See
-the [reasoning-prompt v5 cutover](docs/reasoning-prompt-v5-cutover.md) for the
-fresh-baseline and deployment gates.
+Teutonic-I-Reliquary trained for 11 days on rollouts from more than 11 GPU models
+across seven environments. Miners kept generating while the trainer published a
+new checkpoint after every step. Every GPU that joins adds capacity; the trainer
+stays the same size.
 
-## Trust and verification boundaries
+## How it works
 
-Reliquary is auditable, but it is not currently trustless:
+- **Miners generate.** Any NVIDIA GPU runs the current checkpoint, at its own pace.
+- **The network verifies.** Each sample is checked against the published
+  checkpoint, with a tolerance for differences between GPUs. Faked or substituted
+  work earns nothing and never reaches training.
+- **The trainer only trains.** Groups where some attempts succeed and others fail
+  carry the learning signal. They go to the trainer, and each new checkpoint goes
+  straight back to the network.
 
-- The production trainer owns checkpoint publication and is authoritative for
-  reward computation, selection, quarantine, and optimizer execution.
-- GRAIL sketches, signed submissions, and validator recomputation provide
-  evidence that selected rollouts match their announced checkpoint. They do
-  not prove that the optimizer or the validator's policy is correct.
-- A signed checkpoint manifest binds a checkpoint number to an immutable
-  Hugging Face revision. It is an authenticated announcement, not a proof of
-  every training transition.
-- Weight-only validators replay the public archive into the scoring signal.
-  Multi-trainer checkpoint consensus is not implemented.
+## Bring a GPU
 
-These boundaries are intentional and explicit while the network bootstraps.
-The dashboard, model revisions, window archives, and security reports expose
-the evidence needed to evaluate them.
+Set your price per million verified tokens. The cheapest offers get work first.
+
+```sh
+reliquary corpus mine --validator-url https://api.reliqua.ai \
+  --wallet-name YOUR_WALLET --hotkey YOUR_HOTKEY \
+  --ask-alpha-per-mtoken 0.4 --ask-capacity 8
+```
+
+Full guide: [Mining orders](docs/mining-orders.md).
+
+## In the open
+
+Generation is decentralized today; the validator, the graders and the trainer are
+still run by us. Verification shows that a sample came from the published
+checkpoint, not that a grader or the trainer is correct. Each model result comes
+from one run, published with its weights, setup and limits.
 
 ## Local development
 
-The following matches the CPU environment used by the validator test workflow:
-
 ```bash
-git clone https://github.com/reliquadotai/reliquary.git
-cd reliquary
-
-python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install torch==2.7.0 \
-  --index-url https://download.pytorch.org/whl/cpu
+git clone https://github.com/reliquadotai/reliquary.git && cd reliquary
+python3.12 -m venv .venv && source .venv/bin/activate
+python -m pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -e ".[dev]"
-
-pytest -q \
-  --ignore=tests/gpu \
-  --ignore=tests/integration/test_grader_e2e.py \
-  --disable-warnings
+pytest -q --ignore=tests/gpu --ignore=tests/integration/test_grader_e2e.py
 ```
-
-Mining and training require the pinned inference stack and suitable NVIDIA
-hardware; the CPU setup above is for development and tests. Start with the
-[miner guide](docs/mining.md) or [validator guide](docs/validating.md) before
-running an operator workload.
-
-## Documentation
 
 | Guide | Purpose |
 | --- | --- |
-| [Concepts](docs/concepts.md) | Current mechanism, incentives, verification, and economics |
-| [Mining orders](docs/mining-orders.md) | Batch and Evals orders: the command, the order list, the price auction |
-| [Mining](docs/mining.md) | Reference miner, submission lifecycle, hardware, and troubleshooting |
-| [Validating](docs/validating.md) | Weight-only and trainer deployment |
-| [Validator observability](docs/validator_observability.md) | Health, verdict, archive, and runtime evidence |
-| [Utility foundation](docs/auction-v3-utility-foundation.md) | Observation-only research surface and activation gates |
+| [Mining orders](docs/mining-orders.md) | The command, the order list, pricing |
+| [Orders](docs/orders.md) | How batch and evaluation orders are built, audited and delivered |
+| [Validating](docs/validating.md) | Running a validator |
 
-Project-wide policies:
-[Contributing](https://github.com/reliquadotai/.github/blob/main/CONTRIBUTING.md)
-· [Security](https://github.com/reliquadotai/.github/blob/main/SECURITY.md)
-· [Support](https://github.com/reliquadotai/.github/blob/main/SUPPORT.md)
-
-## License
-
-Reliquary is available under the [MIT License](LICENSE.md).
+[MIT License](LICENSE.md) ·
+[Contributing, security and support](https://github.com/reliquadotai/.github)
