@@ -86,7 +86,11 @@ forward is checked once per architecture, before it enters the preset.
   sandbox `wall_s` + grading 1800 s + submit 120 s) plus 300 s, i.e. 10,320 s for `wall_s` 7200. Other
   jobs keep `300 + tokens / 10` s (auction: 2× the hotkey's slow delivery, floor 300 s). Each lease
   `granted` / `granted_second` / `taken` / `released` / `expired` logs one INFO line
-  (`draw lease <event> job= prompt= slot= hotkey= secs=`); leases are never renewed.
+  (`draw lease <event> job= prompt= slot= hotkey= secs=`); leases are never renewed. A lease past its time is
+  `lapsed`: its slot reopens, and its hotkey may still deliver it (accepted at its price, uncharged: `taken ... late`)
+  for one more default lease time; it is `expired` and charged once another hotkey takes the slot or that time
+  runs out. An auction's per-hotkey lease time keeps the default while the hotkey's live leases are over 10 % of
+  its observed deliveries plus those leases (`token_auction.lease_seconds`).
 
 ## 4. Audits
 

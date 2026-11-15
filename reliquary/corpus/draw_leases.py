@@ -117,6 +117,10 @@ class DrawLeases:
         self._by_slot: dict[tuple[int, int], list[str]] = {}
         # Each hotkey's leases that expired unused, by when they expired.
         self._unused: dict[str, list[float]] = {}
+        # Leases past their time whose slot is open to others again but which their hotkey may still deliver
+        # (a late honest batch), for one more lease time: charged only once someone else takes the slot or
+        # that time runs out.
+        self._lapsed: dict[str, Lease] = {}
         # The route grants off the event loop and refuses and settles on it.
         self._lock = threading.RLock()
         self._state_path = Path(state_path) if state_path is not None else None
@@ -138,6 +142,10 @@ class DrawLeases:
                 if lease.expires_at > now:
                     self._by_id[lease.lease_id] = lease
                     self._by_slot.setdefault((lease.prompt_index, lease.slot), []).append(lease.lease_id)
+            for raw in state.get("lapsed", ()):
+                lease = Lease(**raw)
+                if lease.expires_at + self.seconds > now:
+                    self._lapsed[lease.lease_id] = lease
             self._unused = {str(h): [float(t) for t in ts] for h, ts in (state.get("unused") or {}).items()}
             logger.info("draw leases: %d lease(s) still running restored from %s", len(self._by_id),
                         self._state_path)
@@ -159,6 +167,7 @@ class DrawLeases:
                 self._state_path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = self._state_path.with_suffix(".tmp")
                 tmp.write_text(json.dumps({"leases": [asdict(lease) for lease in self._by_id.values()],
+                                           "lapsed": [asdict(lease) for lease in self._lapsed.values()],
                                            "unused": self._unused}))
                 os.replace(tmp, self._state_path)
                 self._dirty = False
@@ -194,9 +203,12 @@ class DrawLeases:
                 if fault is not None:
                     self._log("expired", lease, f" ours={fault[0]} ({fault[1]}): not charged")
                     continue
-                self._unused.setdefault(lease.hotkey, []).append(lease.expires_at)
-                self._log("expired", lease)
-                self._unused_lease(lease, 1.0)
+                # Its slot opens to others; its own late delivery is still taken while nobody else took it.
+                self._lapsed[lease_id] = lease
+                self._dirty = True
+                self._log("lapsed", lease)
+            for lease_id in [i for i, lease in self._lapsed.items() if lease.expires_at + self.seconds <= now]:
+                self._charge_lapsed(self._lapsed.pop(lease_id), now)
             for hotkey in list(self._unused):
                 recent = [t for t in self._unused[hotkey] if now - t < self.seconds]
                 if recent:
@@ -204,6 +216,17 @@ class DrawLeases:
                 else:
                     del self._unused[hotkey]
             self.save()
+
+    def _charge_lapsed(self, lease: Lease, now: float) -> None:
+        """A lapsed lease ended undelivered: charged as an expired one."""
+        self._dirty = True
+        fault = self._fault(lease)
+        if fault is not None:
+            self._log("expired", lease, f" ours={fault[0]} ({fault[1]}): not charged")
+            return
+        self._unused.setdefault(lease.hotkey, []).append(now)
+        self._log("expired", lease)
+        self._unused_lease(lease, 1.0)
 
     def _fault(self, lease: Lease) -> tuple[str, str] | None:
         if self._validator_fault is None:
@@ -300,6 +323,11 @@ class DrawLeases:
 
     def release(self, hotkey: str, lease_id: str) -> bool:
         with self._lock:
+            lapsed = self._lapsed.get(lease_id)
+            if lapsed is not None and lapsed.hotkey == hotkey:
+                self._charge_lapsed(self._lapsed.pop(lease_id), self._clock())
+                self.save()
+                return True
             lease = self._by_id.get(lease_id)
             if lease is None or lease.hotkey != hotkey:
                 return False
@@ -325,20 +353,38 @@ class DrawLeases:
         return None
 
     def held(self, hotkey: str, prompt_index: int, slot: int) -> Lease | None:
-        """``hotkey``'s own live lease on this slot, or None."""
-        for lease in self.holders(prompt_index, slot):
+        """``hotkey``'s own live lease on this slot, else its lapsed one while no other hotkey holds the slot,
+        or None."""
+        holders = self.holders(prompt_index, slot)
+        for lease in holders:
             if lease.hotkey == hotkey:
                 return lease
+        if holders:
+            return None
+        with self._lock:
+            key = (int(prompt_index), int(slot))
+            for lease in self._lapsed.values():
+                if lease.hotkey == hotkey and (lease.prompt_index, lease.slot) == key:
+                    return lease
         return None
 
-    def settle(self, prompt_index: int, slot: int) -> None:
-        """The slot was taken: every lease on it ends."""
+    def settle(self, prompt_index: int, slot: int, hotkey: str | None = None) -> None:
+        """The slot was taken (by ``hotkey`` when known): every lease on it ends. A lapsed lease of that hotkey
+        was delivered late and is not charged; another hotkey's lapsed lease is charged now."""
         with self._lock:
             now = self._clock()
-            for lease_id in list(self._by_slot.get((int(prompt_index), int(slot)), ())):
+            key = (int(prompt_index), int(slot))
+            for lease_id in list(self._by_slot.get(key, ())):
                 lease = self._by_id[lease_id]
                 self._drop(lease_id)
                 self._log("taken", lease, f" after={round(now - lease.granted_at)}")
+            for lease_id in [i for i, lease in self._lapsed.items() if (lease.prompt_index, lease.slot) == key]:
+                lease = self._lapsed.pop(lease_id)
+                if hotkey is not None and lease.hotkey == hotkey:
+                    self._dirty = True
+                    self._log("taken", lease, f" after={round(now - lease.granted_at)} late")
+                else:
+                    self._charge_lapsed(lease, now)
             self.save()
 
 

@@ -69,7 +69,7 @@ PENALTY_SECONDS = 3600.0
 # A release past this share of its lease time counts as a miss.
 LATE_RELEASE = 0.5
 # Lease time: twice the median of a hotkey's recent deliveries, once it has this many, within [floor, the job's].
-DELIVERIES_KEPT = 20
+DELIVERIES_KEPT = 256
 DELIVERIES_NEEDED = 3
 # The share of a hotkey's recent deliveries its lease time covers twice over (`lease_seconds`).
 DELIVERY_TAIL = 0.9
@@ -334,12 +334,18 @@ class TokenAuction:
             if self._reserved[terms.hotkey] <= 0:
                 del self._reserved[terms.hotkey]
 
-    def lease_seconds(self, hotkey: str, default: float) -> float:
+    def lease_seconds(self, hotkey: str, default: float, held: int = 0) -> float:
         """How long ``hotkey``'s next lease lasts: twice its recent slow delivery (the DELIVERY_TAIL quantile of
-        the last DELIVERIES_KEPT), within [floor, ``default``]."""
+        the last DELIVERIES_KEPT), within [floor, ``default``]. ``held``: its live leases, deliveries still to
+        come and each at least as slow as now; while they are more than the tail's share, that quantile is not
+        observed yet and the lease keeps ``default``."""
         with self._lock:
             times = self._deliveries.get(hotkey)
             if not times or len(times) < DELIVERIES_NEEDED:
+                return float(default)
+            # 2026-11-15: a miner that leased 188 slots at once delivered its shortest answers first (23-87 s);
+            # three of them cut its next 466 leases to 300 s while its batch took 15-34 min.
+            if held > (1.0 - DELIVERY_TAIL) * (len(times) + held):
                 return float(default)
             # Its slow deliveries, not its median: a miner working in batches delivers a whole batch at once,
             # and a lease cut at twice its median expired every lease of a batch a little slower than usual.

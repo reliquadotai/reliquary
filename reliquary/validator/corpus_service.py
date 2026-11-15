@@ -2246,7 +2246,7 @@ def build_corpus_router(
 
         if written is not None and drawn and (written.accepted or written.reason == CorpusRejectReason.DRAW_SLOT_TAKEN.value):
             # The slot is taken: its leases end.
-            _leases(job).settle(request.prompt_index, request.cursor)
+            _leases(job).settle(request.prompt_index, request.cursor, request.miner_hotkey)
         if written is not None:
             if record is not None and not written.accepted:
                 # Concurrent retries of the same signed request can share a
@@ -2883,7 +2883,8 @@ def build_corpus_router(
                     terms = auction.admit(request.miner_hotkey)
                     if isinstance(terms, str):
                         return granted, terms
-                    seconds = auction.lease_seconds(request.miner_hotkey, leases.seconds)
+                    seconds = auction.lease_seconds(request.miner_hotkey, leases.seconds,
+                                                    held=len(leases.held_by(request.miner_hotkey)))
                 try:
                     lease = leases.grant(request.miner_hotkey, free_draw_slots(job, ledger, taken),
                                          price=None if terms is None else terms.price, seconds=seconds)

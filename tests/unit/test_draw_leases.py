@@ -95,7 +95,9 @@ def test_a_hotkey_whose_leases_expire_unused_holds_fewer():
     assert leases.cap("a") == 10                      # a quarter of the job's 40 slots
     for _ in range(2):
         leases.grant("a", free)
-    clock.now += 101
+    clock.now += 101                                   # lapsed: still deliverable, not charged yet
+    assert leases.cap("a") == 10
+    clock.now += 100                                   # a lease time on, undelivered: charged
     assert leases.cap("a") == 2 and leases.cap("b") == 10
     clock.now += 101                                   # a lease time later, forgotten
     assert leases.cap("a") == 10
@@ -362,8 +364,10 @@ def test_each_lease_event_is_one_log_line(caplog):
         clock.now += 101
         for _ in range(3):
             len(leases)                       # polls log nothing
+        clock.now += 100
+        len(leases)
     events = [r.getMessage().split()[2] for r in caplog.records]
-    assert events == ["granted", "granted", "taken", "released", "granted", "expired"]
+    assert events == ["granted", "granted", "taken", "released", "granted", "lapsed", "expired"]
     assert f"prompt={c.prompt_index} slot={c.slot} hotkey=5Ccccccc secs=100" in caplog.records[4].getMessage()
 
 
@@ -424,3 +428,43 @@ def test_first_lease_requests_at_once_share_one_lease_book(fake_r2, monkeypatch)
     assert all(g["leased"] is True for g in got), got
     assert len(built) == 1
     assert len({(g["prompt_index"], g["slot"]) for g in got}) == 4
+
+
+def test_a_lapsed_lease_is_still_delivered_by_its_hotkey_uncharged():
+    unused = []
+    _, _, _, clock, leases, free = _setup(prompts=1, slots=1)
+    leases._on_unused = lambda lease, held: unused.append((lease.hotkey, held))
+    lease = leases.grant("a", free, price=1.0)
+    clock.now += 101                                   # past its time: the slot reopens
+    assert leases.counts() == {}
+    assert leases.held("a", lease.prompt_index, lease.slot) == lease
+    leases.settle(lease.prompt_index, lease.slot, "a")  # its late delivery
+    assert unused == [] and leases.cap("a") == leases.cap("b")
+    assert leases.held("a", lease.prompt_index, lease.slot) is None
+
+
+def test_a_lapsed_lease_is_charged_once_another_hotkey_takes_its_slot():
+    unused = []
+    _, _, _, clock, leases, free = _setup(prompts=1, slots=1)
+    leases._on_unused = lambda lease, held: unused.append((lease.hotkey, held))
+    lease = leases.grant("a", free, price=1.0)
+    clock.now += 101
+    other = leases.grant("b", free, price=1.0)
+    assert (other.prompt_index, other.slot) == (lease.prompt_index, lease.slot)
+    # The new lessee holds it now: the late holder may not submit over it.
+    assert leases.held("a", lease.prompt_index, lease.slot) is None
+    assert leases.refusal("a", lease.prompt_index, lease.slot) is not None
+    leases.settle(lease.prompt_index, lease.slot, "b")
+    assert unused == [("a", 1.0)]
+
+
+def test_lapsed_leases_survive_a_restart(tmp_path):
+    from reliquary.corpus.draw_leases import DrawLeases
+
+    path = tmp_path / "leases.json"
+    job, _, _, clock, leases, free = _setup(prompts=1, slots=1, state_path=path)
+    lease = leases.grant("a", free, price=1.0)
+    clock.now += 101
+    len(leases)
+    again = DrawLeases(job, clock=clock, seconds=100.0, state_path=path)
+    assert again.held("a", lease.prompt_index, lease.slot) == lease
