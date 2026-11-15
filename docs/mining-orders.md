@@ -130,6 +130,11 @@ On an order with `"pricing": "auction"`:
   offer your real cost.
 - **Keep your word.** A lease you take and do not deliver is charged against your next payouts, and halves your
   capacity for an hour.
+- **Late is still paid.** A lease past its time reopens its slot to others, but you may still deliver it for one
+  more lease time: while nobody else has taken the slot, it is accepted at its price and not charged. It is
+  charged only once another miner takes the slot or that time runs out.
+- **Lease time.** Twice your recent slow delivery (at least 300 s), or the order's default while most of your
+  leased batch is still out: a batch's first answers are its shortest, and never shorten the next leases.
 - **Follow the draw.** A sample that does not follow the order's forced draw (another model, a heavy quantisation,
   edited tokens) fails its audit. A hotkey with a confirmed failure gets no new lease on that order until its
   suspicion ends (`miner_suspect`, with the time); `GET /corpus/jobs/<job_id>/miners/<hotkey>` shows why.

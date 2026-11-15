@@ -309,6 +309,19 @@ def test_a_batch_miners_slow_deliveries_set_its_lease_not_its_median():
     assert auction.lease_seconds("batch", 3600.0) == pytest.approx(2 * 230.0)     # its 18th of 20
 
 
+def test_a_batch_still_out_keeps_the_default_lease_time():
+    # 2026-11-15: 3 of 188 answers back in 23-87 s cut the next 466 leases to 300 s; the batch took 15-34 min.
+    auction, _, _ = _auction()
+    for seconds in (23, 25, 87):
+        auction.observe_delivery("big", seconds)
+    assert auction.lease_seconds("big", 3600.0) == LEASE_FLOOR_SECONDS
+    assert auction.lease_seconds("big", 3600.0, held=185) == 3600.0
+    # Most of the batch delivered: its tail is observed.
+    for _ in range(200):
+        auction.observe_delivery("big", 900)
+    assert auction.lease_seconds("big", 3600.0, held=10) == pytest.approx(1800.0)
+
+
 # ------------------------------------------------------------------ views and state
 
 

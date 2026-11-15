@@ -47,6 +47,9 @@ def test_a_lease_our_side_failed_is_released_and_expires_uncharged():
         leases.grant(hotkey, free)
     clock.now += 101
     leases.expire()
+    assert ended[1:] == []                                    # lapsed: b may still deliver it
+    clock.now += 100
+    leases.expire()
     assert ended[1:] == [("b", 1.0)]
     assert leases.cap("a") == 10 and leases.cap("b") < 10     # only b's expiry counts against it
 
