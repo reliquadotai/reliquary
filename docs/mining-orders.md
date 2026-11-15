@@ -19,7 +19,8 @@ starts: `miner-overrides.txt` replaces vLLM's bound with verifiers', which uv ap
 (or `pip check`) then reports `vllm ... requires mcp>=2.0.0,<3.0.0`: that line is expected, any other is not.
 `reliquary miner-envs` refuses the bridge when mcp 2 is installed (a plain `pip install vllm` lifts it), and
 `--sync` brings mcp 1 back. `sandbox-miner` brings the env packages agentic orders pin, from git at their
-commits (the validator checks the commit pip records): SWE-bench Verified (`reliquary-swe`), SWE-bench Pro
+commits (the validator checks the commit pip records): SWE-bench Verified (`reliquary-swe`), TMax
+(`reliquary-terminal`), SWE-bench Pro
 (`reliquary-swebench-pro`), DeepSWE (`reliquary-deepswe`), Terminal-Bench 2.1 (`reliquary-terminal-bench`),
 AutomationBench (`reliquary-automationbench`), with the reliquary-sandbox bridge and the reliquary-harness.
 pip does not reinstall a git package whose commit moved under the same version, so
