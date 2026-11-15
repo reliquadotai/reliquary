@@ -30,6 +30,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from typing import Any, NamedTuple, Protocol
 
@@ -1728,8 +1729,11 @@ def build_corpus_router(
     announced: set[str] = set()
     record_lock = asyncio.Lock()
 
-    # A draw job's light leases (``corpus.draw_leases``), in this process: a restart drops them.
+    # A draw job's light leases (``corpus.draw_leases``), one book per job; an auctioned job's survive a restart.
     leases_by_job: dict[str, Any] = {}
+    # Leases are granted off the event loop: two first requests at once must not each build a lease book (the one
+    # that loses would drop the leases it granted, and both write the same state file).
+    leases_lock = threading.Lock()
     lease_nonces: dict[str, float] = {}
     # The taken keys of the ledger version last leased from: rebuilt once per version, not per request.
     lease_seen: dict[str, Any] = {}
@@ -1738,7 +1742,12 @@ def build_corpus_router(
         from reliquary.corpus.draw_leases import DrawLeases
 
         leases = leases_by_job.get(job.job_id)
-        if leases is None:
+        if leases is not None:
+            return leases
+        with leases_lock:
+            leases = leases_by_job.get(job.job_id)
+            if leases is not None:
+                return leases
             if auction is None:
                 leases = DrawLeases(job, validator_fault=lease_fault)
             else:
@@ -1748,8 +1757,8 @@ def build_corpus_router(
                                     state_path=(auction.state_path.with_suffix(".leases.json")
                                                 if auction.state_path is not None else None))
                 auction.bind_holdings(leases.counts)
-            leases = leases_by_job[job.job_id] = leases
-        return leases
+            leases_by_job[job.job_id] = leases
+            return leases
 
     def announce(sid: str) -> None:
         if sid not in announced and on_accepted is not None:

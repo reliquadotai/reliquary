@@ -397,3 +397,30 @@ def test_an_unreadable_lease_state_starts_empty(tmp_path):
     path.write_text("{not json")
     job = _job()
     assert len(DrawLeases(job, clock=Clock(), rng=random.Random(0), seconds=100.0, state_path=path)) == 0
+
+
+def test_first_lease_requests_at_once_share_one_lease_book(fake_r2, monkeypatch):
+    # 2026-11-15: grants run off the event loop, and two first requests at once each built a book; the losing one
+    # dropped the leases it had granted and both wrote the same state file.
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from reliquary.corpus import draw_leases
+
+    built = []
+    real = draw_leases.DrawLeases
+
+    class Slow(real):
+        def __init__(self, *args, **kwargs):
+            built.append(threading.get_ident())
+            time.sleep(0.2)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(draw_leases, "DrawLeases", Slow)
+    client = _route(fake_r2, prompts=4, slots=2)
+    with ThreadPoolExecutor(4) as pool:
+        got = list(pool.map(lambda i: _lease(client, f"5H{i}"), range(4)))
+    assert all(g["leased"] is True for g in got), got
+    assert len(built) == 1
+    assert len({(g["prompt_index"], g["slot"]) for g in got}) == 4
