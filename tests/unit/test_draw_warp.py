@@ -526,8 +526,29 @@ def test_a_greedy_flip_is_judged_on_the_logit_gap_alone():
         assert torch.allclose(-torch.log1p(-miss), torch.full((64,), 0.01), atol=1e-5)
     flips = _diag(x, [1] * 64, us, greedy)
     assert -math.log1p(-flips.max_cdf_miss) == pytest.approx(0.01, abs=1e-5)
-    # Outside the support widened by the margin (top 2): impossible.
-    assert _diag(x, [2] * 64, us, greedy).max_cdf_miss == 1.0
+    # Past the widened top 2 a token is not impossible: its raw logit gap measures it (2.5 here).
+    assert -math.log1p(-_diag(x, [2] * 64, us, greedy).max_cdf_miss) == pytest.approx(2.5, abs=1e-4)
+
+
+def test_an_honest_greedy_pick_third_in_a_near_tie_is_a_near_miss():
+    """2026-11-14, SciCode: three tokens within 0.02 logits and the miner's argmax third in the validator's
+    order. Ranked out of the widened top 2 it read as impossible (max_gap null) on three of three attempts;
+    scored on the logit gap it is the near-tie it is, and the order is judged a pass."""
+    from reliquary.corpus import eval_draw
+    from reliquary.corpus.job import DEFAULT_DRAW_JUDGE
+
+    greedy = Warp(t=1.0, top_k=1)
+    x = torch.full((400, 64), -10.0)
+    x[:, 0], x[:, 1], x[:, 2] = 3.0, 2.99, 2.98
+    tokens = [0] * 400
+    tokens[200] = 2
+    us = _us(400)
+    for chunk in (fs._gumbel_warp_chunk_stats, fs._gumbel_warp_chunk_stats_dense):
+        exact, miss, _ = chunk(x, torch.tensor(tokens), us, greedy, 0.15, 0.95)
+        assert not exact[200]
+        assert (-torch.log1p(-miss[200].double())).item() == pytest.approx(0.02, abs=1e-4)
+    ok, detail = eval_draw.judge([_diag(x, tokens, us, greedy)], DEFAULT_DRAW_JUDGE)
+    assert ok and detail["max_gap"] == pytest.approx(0.02, abs=1e-3)
 
 
 @pytest.mark.parametrize("t", [1.0, 5.0])
