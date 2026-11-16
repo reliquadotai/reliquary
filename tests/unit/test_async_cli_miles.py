@@ -191,3 +191,32 @@ def test_miles_backend_never_loads_a_torch_model(tmp_path, monkeypatch):
     assert type(built["train_step_fn"]).__name__ == "MilesTrainStep" and built["train_step_fn"].hint == 3
     assert type(built["state_fn"]).__name__ == "MilesState" and built["model"] is None
     assert built["audits"] is not None and built["global_step_hint"] == 3
+
+
+def test_a_dead_gateway_fails_the_wait_instead_of_hanging():
+    import concurrent.futures
+
+    from reliquary.trainer.miles_gateway import WatchedClient
+
+    class Pending:
+        def result(self, timeout=None):
+            raise concurrent.futures.TimeoutError()
+
+    class Done:
+        def result(self, timeout=None):
+            return "ok"
+
+    class Client:
+        model_id = "m"
+
+        def forward(self, *a):
+            return Pending()
+
+        def optim_step(self, *a):
+            return Done()
+
+    alive = iter([True, True, False])
+    client = WatchedClient(Client(), alive=lambda: next(alive), poll_s=0.01)
+    assert client.optim_step().result() == "ok" and client.model_id == "m"
+    with pytest.raises(RuntimeError, match="gateway exited"):
+        client.forward().result()

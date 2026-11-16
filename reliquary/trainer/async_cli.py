@@ -302,7 +302,9 @@ def _start_miles(model_path, version: int | None, eos_ids):
                                            grad_norm_skip=GRAD_NORM_SKIP_THRESHOLD, env=dict(os.environ))
     try:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""   # before any CUDA call here: the gateway's GPUs stay whole
-        client = miles_gateway.create_full_training_client(gateway.base_url, PROTOCOL_MODEL_ID)
+        client = miles_gateway.WatchedClient(
+            miles_gateway.create_full_training_client(gateway.base_url, PROTOCOL_MODEL_ID),
+            alive=lambda: gateway.process.poll() is None)
         step_fn = MilesTrainStep(client, eos_ids=eos_ids, global_step_hint=version or 0)
         state_fn = MilesState(client, checkpoint_root=settings["output_dir"],
                               expected=expected_weight_specs(model_path),

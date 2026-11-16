@@ -207,6 +207,44 @@ def create_full_training_client(base_url: str, base_model: str, api_key: str = A
     return tinker.TrainingClient(service.holder, model_seq_id=model_seq_id, model_id=created["model_id"])
 
 
+class _WatchedFuture:
+    def __init__(self, future, alive: Callable[[], bool], poll_s: float) -> None:
+        self._future, self._alive, self._poll_s = future, alive, poll_s
+
+    def result(self, timeout: float | None = None):
+        import concurrent.futures
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            wait = self._poll_s if deadline is None else max(0.0, min(self._poll_s, deadline - time.monotonic()))
+            try:
+                return self._future.result(timeout=wait)
+            except (concurrent.futures.TimeoutError, TimeoutError):
+                if not self._alive():
+                    raise RuntimeError("the Miles gateway exited while a request was pending") from None
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise
+
+
+class WatchedClient:
+    """The Tinker client with every wait bounded by the gateway's life: the SDK retries a refused connection without
+    end, so a dead gateway (an OOM in a Ray actor) would hang the trainer instead of failing its step."""
+
+    def __init__(self, client, *, alive: Callable[[], bool], poll_s: float = 15.0) -> None:
+        self._client, self._alive, self._poll_s = client, alive, poll_s
+
+    def __getattr__(self, name):
+        value = getattr(self._client, name)
+        if not callable(value):
+            return value
+
+        def call(*args, **kwargs):
+            out = value(*args, **kwargs)
+            return _WatchedFuture(out, self._alive, self._poll_s) if hasattr(out, "result") else out
+
+        return call
+
+
 def checkpoint_deleter(base_url: str, api_key: str = API_KEY) -> Callable[[str], None]:
     """``delete(tinker_path)`` through the gateway's REST route; a failure is logged (the export is only disk)."""
     import httpx
@@ -222,5 +260,5 @@ def checkpoint_deleter(base_url: str, api_key: str = API_KEY) -> Callable[[str],
     return delete
 
 
-__all__ = ["GatewayProcess", "check_gateway_constants", "checkpoint_deleter", "gate_constants", "create_full_training_client", "gateway_command",
+__all__ = ["GatewayProcess", "WatchedClient", "check_gateway_constants", "checkpoint_deleter", "gate_constants", "create_full_training_client", "gateway_command",
            "launch_gateway", "miles_settings"]
