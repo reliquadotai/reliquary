@@ -351,6 +351,8 @@ def test_a_delivery_times_the_hotkeys_next_leases(fake_r2):
         lease = _lease(client, "5A")
         assert _submit_as(client, "5A", lease["prompt_index"], lease["slot"])["accepted"] is True
     assert len(auction._deliveries["5A"]) == 3
+    # Each counts for the price at the hotkey's own offer when its lease was granted.
+    assert [auction.params.alpha_of(p) for _, p in auction._delivered["5A"]] == pytest.approx([0.2] * 3)
 
 
 def test_a_period_pays_its_tokens_at_the_price_under_which_most_were_delivered(period_rule):

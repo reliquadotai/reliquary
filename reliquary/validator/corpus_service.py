@@ -2098,7 +2098,7 @@ def build_corpus_router(
                 value = float(own.price) * sum(token_counts)
                 pricing = {"lease_price": float(own.price),
                            "lease_debit": auction.take_debit(request.miner_hotkey, value),
-                           "granted_at": own.granted_at}
+                           "granted_at": own.granted_at, "offer": own.offer}
 
         def unpriced() -> None:
             nonlocal pricing
@@ -2240,7 +2240,8 @@ def build_corpus_router(
         if pricing is not None:
             if written is not None and written.accepted:
                 auction.observe_tokens(sum(token_counts))
-                auction.observe_delivery(request.miner_hotkey, time.time() - pricing["granted_at"])
+                auction.observe_delivery(request.miner_hotkey, time.time() - pricing["granted_at"],
+                                         offer=pricing["offer"])
             else:
                 unpriced()
 
@@ -2887,7 +2888,8 @@ def build_corpus_router(
                                                     held=len(leases.held_by(request.miner_hotkey)))
                 try:
                     lease = leases.grant(request.miner_hotkey, free_draw_slots(job, ledger, taken),
-                                         price=None if terms is None else terms.price, seconds=seconds)
+                                         price=None if terms is None else terms.price, seconds=seconds,
+                                         offer=None if terms is None else terms.offer)
                 finally:
                     if terms is not None:
                         auction.unreserve(terms)
