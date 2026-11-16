@@ -23,10 +23,12 @@ RUN rm -rf /root/miles \
 
 COPY . /opt/reliquary
 
-# Gateway side: Miles' stack stays as the image built it.
+# Gateway side: Miles' stack stays as the image built it. miles-python execs it (a symlink would lose its venv).
 RUN pip install --no-deps -e /opt/reliquary \
  && pip install "tinker==0.36.0" \
- && ln -sf "$(command -v python)" /usr/local/bin/miles-python
+ && printf '#!/bin/sh\nexec %s "$@"\n' "$(command -v python)" > /usr/local/bin/miles-python \
+ && chmod +x /usr/local/bin/miles-python \
+ && miles-python -c "import torch, miles, reliquary.trainer.miles_gateway"
 
 # Trainer side: reliquary's pinned runtime in its own venv, CPU torch.
 RUN pip install uv \
