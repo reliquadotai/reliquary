@@ -224,8 +224,9 @@ def gateway_audit(client, *, eos_ids) -> Callable:
     def audit(_model, group):
         uniforms = [group.draw_uniforms(i) for i in range(len(group.completions))]
         rollouts = training_group(group, slot0=0, index=0, uniforms=uniforms).rollouts
+        episode = any("episode" in r.commit["rollout"] for r in rollouts)
         outputs = client.forward([rollout_datum(r, 0.0, 0) for r in rollouts], "reliquary_gate",
-                                 config).result().loss_fn_outputs
+                                 {**config, "terminal_check": 0} if episode else config).result().loss_fn_outputs
         found = []
         for rollout, output in zip(rollouts, outputs, strict=True):
             p = int(rollout.commit["rollout"]["prompt_length"])

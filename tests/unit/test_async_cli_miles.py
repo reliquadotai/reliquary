@@ -30,6 +30,7 @@ def test_settings_defaults_and_command():
     assert (settings["tp"], settings["gpus"], settings["port"]) == (2, 8, 10613)
     command = gateway_command("/ckpt/model", settings, base_model="org/policy", grad_norm_skip=100.0)
     assert command[:3] == [sys.executable, "/opt/lab/serve_tinker_full.py", "serve"]
+    assert settings["python"] == sys.executable
     joined = " ".join(command)
     for part in ("--mode full", "--no-inference", "--hf-checkpoint /ckpt/model", "--model-type qwen3.5-9B",
                  "--tp 2", "--actor-num-gpus 8", "--num-gpus-per-node 8", "--tinker-port 10613",
@@ -39,13 +40,68 @@ def test_settings_defaults_and_command():
     assert "--tinker-base-model org/policy" in extra and "--tinker-grad-norm-skip 100.0" in extra
 
 
+def test_a_stale_ready_line_is_not_readiness(tmp_path):
+    (tmp_path / "gw.log").write_text("tinker gateway serving on 0.0.0.0:1\n")        # the previous run's
+    script = tmp_path / "slow.py"
+    script.write_text("import time\ntime.sleep(60)\n")
+    gateway = GatewayProcess([sys.executable, str(script)], log_path=tmp_path / "gw.log", env=dict(os.environ),
+                             cleanup=lambda: None, healthy=lambda: True)
+    with pytest.raises(RuntimeError, match="not ready"):
+        gateway.wait_ready(timeout_s=1.5, poll_s=0.1)
+
+
+def test_ready_waits_for_the_health_route(tmp_path):
+    script = tmp_path / "gw.py"
+    script.write_text("print('tinker gateway serving on 0.0.0.0:1', flush=True)\nimport time\ntime.sleep(60)\n")
+    answers = iter([False, False, True])
+    gateway = GatewayProcess([sys.executable, str(script)], log_path=tmp_path / "gw.log", env=dict(os.environ),
+                             cleanup=lambda: None, healthy=lambda: next(answers))
+    gateway.wait_ready(timeout_s=20, poll_s=0.05)
+    gateway.stop()
+    with pytest.raises(StopIteration):
+        next(answers)
+
+
+def test_launch_cleans_up_first_and_refuses_a_taken_port(tmp_path, monkeypatch):
+    import socket
+
+    calls = []
+    monkeypatch.setattr(miles_gateway, "_ray_stop", lambda: calls.append("ray stop"))
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    settings = {**miles_settings({**ENV, "RELIQUARY_MILES_OUTPUT_DIR": str(tmp_path)}),
+                "port": listener.getsockname()[1]}
+    with pytest.raises(RuntimeError, match="already in use"):
+        miles_gateway.launch_gateway("/m", settings, base_model="b", grad_norm_skip=1.0, env={})
+    listener.close()
+    assert calls == ["ray stop"]
+
+
+def test_settings_take_the_gateway_python():
+    assert miles_settings(ENV)["python"] == sys.executable
+    assert miles_settings({**ENV, "RELIQUARY_MILES_PYTHON": "/opt/miles/bin/python"})["python"] == "/opt/miles/bin/python"
+    command = gateway_command("/m", miles_settings({**ENV, "RELIQUARY_MILES_PYTHON": "/opt/py"}), base_model="b",
+                              grad_norm_skip=1.0)
+    assert command[0] == "/opt/py"
+
+
+def test_gateway_constants_must_match_the_trainer():
+    from reliquary.trainer.miles_gateway import check_gateway_constants, gate_constants
+
+    check_gateway_constants(sys.executable)                      # same reliquary: passes
+    assert "RL_GAP_TOLERANCE" in gate_constants() and "gumbel_noise" in gate_constants()
+    with pytest.raises(RuntimeError, match="RL_GAP_TOLERANCE"):
+        check_gateway_constants(sys.executable, local={**gate_constants(), "RL_GAP_TOLERANCE": -1.0})
+
+
 def test_gateway_waits_for_readiness_and_stops(tmp_path):
     script = tmp_path / "fake_gateway.py"
     script.write_text("import time\nprint('booting', flush=True)\ntime.sleep(0.3)\n"
                       "print('tinker gateway serving on 0.0.0.0:1', flush=True)\ntime.sleep(60)\n")
     stops = []
     gateway = GatewayProcess([sys.executable, str(script)], log_path=tmp_path / "gw.log", env=dict(os.environ),
-                             cleanup=lambda: stops.append(1))
+                             cleanup=lambda: stops.append(1), healthy=lambda: True)
     gateway.wait_ready(timeout_s=20, poll_s=0.1)
     gateway.stop()
     assert gateway.process.poll() is not None and stops == [1]
@@ -91,7 +147,10 @@ def test_miles_backend_never_loads_a_torch_model(tmp_path, monkeypatch):
     monkeypatch.setattr(async_cli, "_eos_ids", lambda path, kw: (9,))
     monkeypatch.setattr("reliquary.validator.verifier.draw_settings", lambda: SimpleNamespace(
         draw="gumbel_max", t=1.0, top_k=0, top_p=1.0, boundary_epsilon=0.05))
-    monkeypatch.setattr("reliquary.trainer.miles_engine.expected_weight_keys", lambda path: {"w"})
+    monkeypatch.setattr("reliquary.trainer.miles_engine.expected_weight_specs", lambda path: {"w": ("BF16", [1])})
+    monkeypatch.setattr(miles_gateway, "check_gateway_constants", lambda python: events.append("constants"))
+    handlers = []
+    monkeypatch.setattr("signal.signal", lambda signum, handler: handlers.append(signum))
     monkeypatch.setattr("reliquary.infrastructure.storage.public_checkpoint_client", lambda: None)
     monkeypatch.setattr("reliquary.infrastructure.storage.public_checkpoint_bucket", lambda: "b")
     monkeypatch.setattr("reliquary.trainer.ckpt_publisher.DeltaPublisher", lambda **kw: SimpleNamespace())
@@ -124,8 +183,11 @@ def test_miles_backend_never_loads_a_torch_model(tmp_path, monkeypatch):
     monkeypatch.setattr("reliquary.trainer.rl_link.TrainerHeartbeat",
                         lambda link, s: SimpleNamespace(start=lambda: SimpleNamespace(stop=lambda: None)))
     async_cli.run_async_train_worker()
-    assert events[0] == ("launch", str(model_dir), None) and events[-1] == "stop"
+    assert events[0] == "constants" and events[1] == ("launch", str(model_dir), None) and events[-1] == "stop"
     assert "run" in events and os.environ.get("CUDA_VISIBLE_DEVICES") == ""
+    import signal
+
+    assert handlers == [signal.SIGTERM]
     assert type(built["train_step_fn"]).__name__ == "MilesTrainStep" and built["train_step_fn"].hint == 3
     assert type(built["state_fn"]).__name__ == "MilesState" and built["model"] is None
     assert built["audits"] is not None and built["global_step_hint"] == 3

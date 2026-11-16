@@ -62,10 +62,17 @@ class MilesTrainStep:
             return model
         datums, slots = step_datums(plan)
         by_slot = {int(r._async_slot): r for group, _, _ in plan for r in group.rollouts}
-        futures = [self.client.forward_backward(datums[i:i + self.chunk], "reliquary_gate", self.config)
-                   for i in range(0, len(datums), self.chunk)]
+        # episodes in their own chunks: their last assistant EOS gets no final-EOS test (DrawGate.admit)
+        order, futures = [], []
+        for episodes in (False, True):
+            picked = [i for i, (_, s) in enumerate(slots) if ("episode" in by_slot[s].commit["rollout"]) == episodes]
+            config = {**self.config, "terminal_check": 0} if episodes else self.config
+            for start in range(0, len(picked), self.chunk):
+                part = picked[start:start + self.chunk]
+                order += part
+                futures.append(self.client.forward_backward([datums[i] for i in part], "reliquary_gate", config))
         outputs = [out for future in futures for out in future.result().loss_fn_outputs]
-        fill_gate(gate, slots, outputs, [by_slot[s] for _, s in slots])
+        fill_gate(gate, [slots[i] for i in order], outputs, [by_slot[slots[i][1]] for i in order])
         lr = self.lr_for(self.step)
         adam = tinker.AdamParams(learning_rate=lr, beta1=0.9, beta2=ADAM_BETA2, eps=ADAM_EPS,
                                  weight_decay=WEIGHT_DECAY, grad_clip_norm=GRAD_CLIP_NORM)
@@ -104,34 +111,45 @@ class MilesTrainStep:
 
 
 
-def expected_weight_keys(model_dir) -> set[str]:
-    """The HF model's weight names (``model.safetensors.index.json``, else the single ``model.safetensors``)."""
+_DTYPES = {"bfloat16": "BF16", "float32": "F32", "float16": "F16"}
+
+
+def _safetensors_header(path) -> dict:
     import json
+    import struct
+
+    with open(path, "rb") as handle:
+        (size,) = struct.unpack("<Q", handle.read(8))
+        return json.loads(handle.read(size))
+
+
+def expected_weight_specs(model_dir) -> dict[str, tuple[str, list[int]]]:
+    """The HF model's weights as ``{name: (dtype, shape)}``, read from its safetensors headers (what miners load)."""
     from pathlib import Path
 
-    from safetensors import safe_open
-
-    model_dir = Path(model_dir)
-    index = model_dir / "model.safetensors.index.json"
-    if index.exists():
-        return set(json.loads(index.read_text())["weight_map"])
-    with safe_open(str(model_dir / "model.safetensors"), framework="pt") as handle:
-        return set(handle.keys())
+    specs = {}
+    for shard in sorted(Path(model_dir).glob("*.safetensors")):
+        for name, info in _safetensors_header(shard).items():
+            if name != "__metadata__":
+                specs[name] = (info["dtype"], list(info["shape"]))
+    if not specs:
+        raise RuntimeError(f"{model_dir} holds no safetensors weights")
+    return specs
 
 
 class MilesState:
     """``AsyncTrainer``'s ``state_fn``: the gateway exports the weights (``save_weights_for_sampler``, HF safetensors
     under ``<checkpoint_root>/**/<model_id>/sampler_weights/<name>/hf`` on this box's disk), loaded on CPU. The names
-    must be exactly the HF model's (what miners load), or nothing is published. Exports older than the previous one
+    dtypes and shapes must be exactly the HF model's (what miners load), or nothing is published. Exports older than the previous one
     are deleted through ``delete(tinker_path)``."""
 
     KEEP = 2
 
-    def __init__(self, client, *, checkpoint_root, expected_keys: set[str], delete) -> None:
+    def __init__(self, client, *, checkpoint_root, expected: dict[str, tuple[str, list[int]]], delete) -> None:
         from pathlib import Path
 
         self.client, self.root = client, Path(checkpoint_root)
-        self.expected, self.delete = set(expected_keys), delete
+        self.expected, self.delete = dict(expected), delete
         self.n, self.paths = 0, []
 
     def __call__(self) -> dict:
@@ -149,14 +167,18 @@ class MilesState:
         state: dict = {}
         for shard in sorted(hf.glob("*.safetensors")):
             state.update(load_file(str(shard), device="cpu"))
-        missing, extra = self.expected - set(state), set(state) - self.expected
-        if missing or extra:
+        got = {k: (_DTYPES.get(str(t.dtype).removeprefix("torch."), str(t.dtype)), list(t.shape))
+               for k, t in state.items()}
+        missing, extra = set(self.expected) - set(got), set(got) - set(self.expected)
+        changed = sorted(k for k in set(got) & set(self.expected) if got[k] != tuple(self.expected[k]))
+        if missing or extra or changed:
             raise RuntimeError(f"gateway export {path} does not match the model: missing {sorted(missing)[:5]}, "
-                               f"unexpected {sorted(extra)[:5]}")
+                               f"unexpected {sorted(extra)[:5]}, dtype/shape changed "
+                               f"{[(k, got[k], self.expected[k]) for k in changed[:5]]}")
         self.paths.append(path)
         while len(self.paths) > self.KEEP:
             self.delete(self.paths.pop(0))
         return state
 
 
-__all__ = ["MilesState", "MilesTrainStep", "expected_weight_keys"]
+__all__ = ["MilesState", "MilesTrainStep", "expected_weight_specs"]

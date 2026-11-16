@@ -78,6 +78,13 @@ def test_audit_verdict_passes_and_fails(monkeypatch):
     result = gateway_audit(honest, eos_ids=(9,))(None, _submitted())
     assert result.passed is True and honest.calls == [(4, "reliquary_gate", {"eos_ids": "9"})]
     assert gateway_audit(Client(0.3), eos_ids=())(None, _submitted()).passed is False
+    episodes = Client(1.0)
+    group = _submitted(length=200)
+    group.spans = (((0, 100), (150, 200)),) * 4
+    group.model_tokens = lambda i: 150
+    group.draw_uniforms = lambda i: [0.5] * 150
+    gateway_audit(episodes, eos_ids=(9,))(None, group)
+    assert episodes.calls[0][2] == {"eos_ids": "9", "terminal_check": 0}
 
 
 def test_gateway_audit_refuses_a_warped_draw(monkeypatch):

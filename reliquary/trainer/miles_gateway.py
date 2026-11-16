@@ -8,10 +8,12 @@ with the trainer's health gate (``--tinker-grad-norm-skip``). The launcher is a 
 Settings: ``RELIQUARY_MILES_LAUNCHER``, ``RELIQUARY_MILES_MODEL_TYPE`` (Megatron model type, e.g. ``qwen3.5-9B``),
 ``RELIQUARY_MILES_OUTPUT_DIR`` (checkpoints and exports: the trainer reads the exports there), and
 ``RELIQUARY_MILES_TP`` (2), ``RELIQUARY_MILES_GPUS`` (8), ``RELIQUARY_MILES_PORT`` (10613),
-``RELIQUARY_MILES_READY_S`` (1800), ``RELIQUARY_MILES_EXTRA_ARGS`` (more gateway flags).
+``RELIQUARY_MILES_READY_S`` (1800), ``RELIQUARY_MILES_EXTRA_ARGS`` (more gateway flags), ``RELIQUARY_MILES_PYTHON``
+(the gateway's interpreter: Miles, Megatron and the same ``reliquary`` as this trainer, checked at start).
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shlex
@@ -47,7 +49,8 @@ def miles_settings(env: Mapping[str, str] = os.environ) -> dict:
             "output_dir": Path(required["RELIQUARY_MILES_OUTPUT_DIR"]),
             "tp": number("RELIQUARY_MILES_TP", 2), "gpus": number("RELIQUARY_MILES_GPUS", 8),
             "port": number("RELIQUARY_MILES_PORT", 10613), "ready_s": number("RELIQUARY_MILES_READY_S", 1800.0, float),
-            "extra_args": str(env.get("RELIQUARY_MILES_EXTRA_ARGS", "")).strip()}
+            "extra_args": str(env.get("RELIQUARY_MILES_EXTRA_ARGS", "")).strip(),
+            "python": str(env.get("RELIQUARY_MILES_PYTHON", "")).strip() or sys.executable}
 
 
 def gateway_command(model_path, settings: dict, *, base_model: str, grad_norm_skip: float) -> list[str]:
@@ -55,7 +58,7 @@ def gateway_command(model_path, settings: dict, *, base_model: str, grad_norm_sk
     if settings["extra_args"]:
         extra += " " + settings["extra_args"]
     gpus = str(settings["gpus"])
-    return [sys.executable, settings["launcher"], "serve", "--mode", "full", "--no-inference",
+    return [settings["python"], settings["launcher"], "serve", "--mode", "full", "--no-inference",
             "--hf-checkpoint", str(model_path), "--model-type", settings["model_type"], "--tp", str(settings["tp"]),
             "--actor-num-gpus", gpus, "--num-gpus-per-node", gpus, "--tinker-port", str(settings["port"]),
             "--output-dir", str(settings["output_dir"]), "--extra-args", extra]
@@ -69,10 +72,13 @@ class GatewayProcess:
     """The gateway as a child process group, its output in ``log_path``."""
 
     def __init__(self, command: list[str], *, log_path: Path, env: dict, cleanup: Callable[[], None] = _ray_stop,
-                 base_url: str = "") -> None:
+                 base_url: str = "", healthy: Callable[[], bool] | None = None) -> None:
         self.log_path, self.cleanup, self.base_url = Path(log_path), cleanup, base_url
+        self.healthy = healthy or self._healthz
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._log = open(self.log_path, "ab")
+        if self.log_path.exists():               # a previous run's ready line must never read as this run's
+            self.log_path.replace(self.log_path.with_name(self.log_path.name + ".prev"))
+        self._log = open(self.log_path, "wb")
         logger.info("starting the Miles gateway: %s", shlex.join(command))
         self.process = subprocess.Popen(command, stdout=self._log, stderr=subprocess.STDOUT, env=env,
                                         start_new_session=True)
@@ -80,7 +86,8 @@ class GatewayProcess:
     def wait_ready(self, *, timeout_s: float, poll_s: float = 5.0) -> None:
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            if READY_LINE in self.log_path.read_text(errors="replace"):
+            # the line is logged before the server binds its port: the health route decides
+            if READY_LINE in self.log_path.read_text(errors="replace") and self.healthy():
                 logger.info("Miles gateway ready")
                 return
             if self.process.poll() is not None:
@@ -88,6 +95,14 @@ class GatewayProcess:
             time.sleep(poll_s)
         self.stop()
         raise RuntimeError(f"the Miles gateway was not ready in {timeout_s:.0f}s; see {self.log_path}")
+
+    def _healthz(self) -> bool:
+        import httpx
+
+        try:
+            return httpx.get(f"{self.base_url}/api/v1/healthz", timeout=5).status_code == 200
+        except httpx.HTTPError:
+            return False
 
     def stop(self) -> None:
         if self.process.poll() is None:
@@ -104,7 +119,20 @@ class GatewayProcess:
         self.cleanup()                          # Ray workers outlive the launcher's process group
 
 
+def _port_taken(port: int) -> bool:
+    import socket
+
+    with socket.socket() as probe:
+        probe.settimeout(2)
+        return probe.connect_ex(("127.0.0.1", int(port))) == 0
+
+
 def launch_gateway(model_path, settings: dict, *, base_model: str, grad_norm_skip: float, env: dict) -> GatewayProcess:
+    """A gateway nobody stopped (the trainer killed) holds the GPUs and the port: Ray is stopped first, and a port
+    still answering refuses the launch (never train on a stale gateway's weights)."""
+    _ray_stop()
+    if _port_taken(settings["port"]):
+        raise RuntimeError(f"port {settings['port']} is already in use: a previous gateway is still running")
     gateway = GatewayProcess(gateway_command(model_path, settings, base_model=base_model, grad_norm_skip=grad_norm_skip),
                              log_path=settings["output_dir"] / "gateway.log", env=env,
                              base_url=f"http://127.0.0.1:{settings['port']}")
@@ -114,6 +142,40 @@ def launch_gateway(model_path, settings: dict, *, base_model: str, grad_norm_ski
         gateway.stop()
         raise
     return gateway
+
+
+# what the gateway's reliquary_gate reads from its own ``reliquary``: must be the trainer's
+_GATE_CONSTANTS = ("PROTOCOL_VERSION", "RL_ROLLOUT_MATCH_FLOOR", "RL_GROUP_MATCH_FLOOR", "RL_FORGERY_MATCH_FLOOR",
+                   "RL_GAP_TOLERANCE", "RL_SUBSTITUTE_GAP", "RL_TERMINAL_GAP", "FORCED_SEED_STOCHASTIC_MAXPROB",
+                   "FORCED_SEED_ROLLOUT_MIN_STOCH")
+_CONSTANTS_SCRIPT = """
+import json, torch
+from reliquary import constants as c
+from reliquary.environment.forced_sampling import gumbel_noise
+out = {name: getattr(c, name) for name in %r}
+out["gumbel_noise"] = [round(float(v), 9) for v in gumbel_noise(torch.tensor([12345, -7]), torch.arange(4))[0]]
+print(json.dumps(out))
+"""
+
+
+def gate_constants() -> dict:
+    """This process's gate constants and a Gumbel-noise probe."""
+    out = subprocess.run([sys.executable, "-c", _CONSTANTS_SCRIPT % (_GATE_CONSTANTS,)], capture_output=True,
+                         text=True, check=True, timeout=300)
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def check_gateway_constants(python: str, *, local: dict | None = None) -> None:
+    """Refuse a gateway whose ``reliquary`` would judge differently from this trainer (another commit or profile)."""
+    local = gate_constants() if local is None else local
+    out = subprocess.run([python, "-c", _CONSTANTS_SCRIPT % (_GATE_CONSTANTS,)], capture_output=True, text=True,
+                         timeout=300)
+    if out.returncode != 0:
+        raise RuntimeError(f"the gateway's python cannot import reliquary: {out.stderr[-500:]}")
+    remote = json.loads(out.stdout.strip().splitlines()[-1])
+    differ = sorted(k for k in local if remote.get(k) != local[k])
+    if differ:
+        raise RuntimeError(f"the gateway's reliquary differs from the trainer's: {differ}")
 
 
 def create_full_training_client(base_url: str, base_model: str, api_key: str = API_KEY):
@@ -160,5 +222,5 @@ def checkpoint_deleter(base_url: str, api_key: str = API_KEY) -> Callable[[str],
     return delete
 
 
-__all__ = ["GatewayProcess", "checkpoint_deleter", "create_full_training_client", "gateway_command",
+__all__ = ["GatewayProcess", "check_gateway_constants", "checkpoint_deleter", "gate_constants", "create_full_training_client", "gateway_command",
            "launch_gateway", "miles_settings"]

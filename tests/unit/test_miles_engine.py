@@ -147,3 +147,17 @@ def test_metrics_logged(logged):
     assert step == 4 and metrics["train/grad_norm"] == 0.5
     assert metrics["train/lr_applied"] == pytest.approx(C.LEARNING_RATE / C.LR_WARMUP_WINDOWS)
     assert metrics["async/groups_accepted"] == 2 and "rewards/mean" in metrics
+
+
+def test_episodes_go_in_their_own_chunks_without_the_final_eos_test(logged):
+    groups, gate = _batch(2)
+    raw = SimpleNamespace(prompt_tokens=(1, 2), completions=((10, 11, 12),) * 2, force_spans=(None,) * 2,
+                          spans=(((0, 1), (2, 3)),) * 2, truncated=(False,) * 2, rewards=(0.0, 1.0),
+                          environment="swe", prompt_idx=9, lease_id="ep", model_tokens=lambda i: 2)
+    groups.append(training_group(raw, slot0=4, index=2, uniforms=[[0.5] * 2] * 2))
+    gate = DrawGate([[r._async_slot for r in g.rollouts] for g in groups])
+    client = FakeClient()
+    MilesTrainStep(client, eos_ids=(7,))(None, [groups], gate=gate)
+    sent = [(c[1], c[3]) for c in client.calls if c[0] == "forward_backward"]
+    assert sent == [(4, {"eos_ids": "7"}), (2, {"eos_ids": "7", "terminal_check": 0})]
+    assert gate.accepted == [True, True, True]

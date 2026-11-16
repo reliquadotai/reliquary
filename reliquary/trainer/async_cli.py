@@ -287,9 +287,17 @@ def _start_miles(model_path, version: int | None, eos_ids):
     from reliquary.constants import GRAD_NORM_SKIP_THRESHOLD, PROTOCOL_MODEL_ID
     from reliquary.trainer import miles_gateway
     from reliquary.trainer.audits import gateway_audit
-    from reliquary.trainer.miles_engine import MilesState, MilesTrainStep, expected_weight_keys
+    from reliquary.trainer.miles_engine import MilesState, MilesTrainStep, expected_weight_specs
+
+    import signal
 
     settings = miles_gateway.miles_settings()
+    miles_gateway.check_gateway_constants(settings["python"])
+
+    def _terminate(signum, frame):           # a plain SIGTERM must still run the finally that stops the gateway
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _terminate)
     gateway = miles_gateway.launch_gateway(model_path, settings, base_model=PROTOCOL_MODEL_ID,
                                            grad_norm_skip=GRAD_NORM_SKIP_THRESHOLD, env=dict(os.environ))
     try:
@@ -297,7 +305,7 @@ def _start_miles(model_path, version: int | None, eos_ids):
         client = miles_gateway.create_full_training_client(gateway.base_url, PROTOCOL_MODEL_ID)
         step_fn = MilesTrainStep(client, eos_ids=eos_ids, global_step_hint=version or 0)
         state_fn = MilesState(client, checkpoint_root=settings["output_dir"],
-                              expected_keys=expected_weight_keys(model_path),
+                              expected=expected_weight_specs(model_path),
                               delete=miles_gateway.checkpoint_deleter(gateway.base_url))
         return gateway, None, step_fn, state_fn, gateway_audit(client, eos_ids=eos_ids)
     except BaseException:
