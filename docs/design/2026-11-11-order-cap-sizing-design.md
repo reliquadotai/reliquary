@@ -1,6 +1,6 @@
-# Order caps sized to what an order can pay
+# Order caps that follow what an order pays
 
-Status: coded (`admin/cap_sizing.py`), off unless the admin sets `RELIQUARY_ORDER_CAP_SIZING=on`. Applies
+Status: coded (`admin/cap_sizing.py`), on in production (`RELIQUARY_ORDER_CAP_SIZING=on`); revised 2026-11-16 to follow pay. Applies
 to order jobs (Batch and Evals). Builds on the order price auction (`2026-11-10-order-price-auction-design.md`).
 
 ## 1. Problem
@@ -43,13 +43,37 @@ The price auction only lowers the price under the ceiling, so the real spend sta
 
 ## 3. Cap sizing
 
-- **At creation**, with the switch on and a price ceiling, the admin sets
-  `cap = floor = min(cap asked, max(CAP_FLOOR, estimate x HEADROOM))` and keeps the asked cap as `cap_max`.
-  `HEADROOM` is 1.5, `CAP_FLOOR` 0.002. A replay of the order compares the asked cap, so it is not taken for
-  another contract. The registry guard is unchanged: a new order waits only when the sized caps no longer fit.
-- **Every 5 minutes** the admin resizes each active task with a `cap_max`, from the control status (skipped
-  when older than 10 minutes):
-  `cap = min(cap_max, max(CAP_FLOOR, max(estimate, paid in the last 3 periods, accrued in an open period) x HEADROOM))`.
+2026-11-16 revision. The audit bound of section 2 grew past every asked cap: the ceilings rose to about
+2.08 alpha per million and a 27B card audits 2,700 tokens a second, so one Batch card "could" let 0.86 of a
+period through. Taken as the cap (the first version used `max(estimate, paid)`), every Batch order sat at
+0.25 again: two drill orders of about $8.80 each and one draining order held 0.75 of the pool, and five
+eval orders waited. The estimate says what an order could pay, not what it pays.
+
+The settler pays a period with the cap a task holds **when that period settles**. A cap therefore need not
+be reserved ahead; it only has to cover the period's pay by then, and a resize runs every 5 minutes against
+72-minute periods. So the cap follows the order's real pay, and the audit estimate is only a bound on the
+part that is projected:
+
+```
+paid      = max(paid in the last 3 periods, accrued in an open period)
+projected = accrued in an open period / max(0.25, share of the current period passed)
+ahead     = projected x HEADROOM, or START while the order has paid nothing
+cap       = min(cap_max, max(CAP_FLOOR, paid x HEADROOM, min(ahead, estimate x HEADROOM)))
+```
+
+- What the order really paid always counts, past the estimate: the settler pays it with this cap.
+- `START` is `START_CAP` (0.02), or less when the whole order is worth less: its prompts x samples x the
+  most tokens a sample can hold (an episode's `max_total_tokens` when it plays one) at the ceiling, with
+  headroom. An order whose miners produce more raises its cap within a resize or two.
+- The projection is at most x4 early in a period (`MIN_ELAPSED_SHARE` 0.25).
+
+- **At creation**, with the switch on and a price ceiling, the admin sets `cap = floor` to the formula with
+  nothing paid yet (the start) and keeps the asked cap as `cap_max`. `HEADROOM` is 1.5, `CAP_FLOOR` 0.002.
+  A replay of the order compares the asked cap, so it is not taken for another contract. The registry guard
+  is unchanged: a new order waits only when the sized caps no longer fit, which now means the orders
+  running really pay close to the whole pool.
+- **Every 5 minutes** the admin resizes each active task with a `cap_max` with the formula, from the control
+  status (skipped when older than 10 minutes).
   - The control publishes per job (`jobs.<id>.sizing`): its model, cards, what the settler paid in the last 3
     periods (`recent_paid`) and the most an unsettled period has accrued at the ceiling (`open_value`).
   - The estimate is recomputed with the current rate and card count, so a card added mid-order raises the cap.
@@ -68,7 +92,7 @@ The price auction only lowers the price under the ceiling, so the real spend sta
   proportionally when the combined total exceeds 1.0 (`WeightOnlyValidator`, logged). Sized caps keep that
   from happening; it stays as the last guard.
 
-## 5. Order of magnitude
+## 5. Order of magnitude (first version, 2026-11-11 prices)
 
 At the 0.58 alpha per million ceiling, one Batch card (audit share 0.2) lets about 12.5M tokens a period be
 paid: about 7 alpha, 5 % of the pool, cap 0.075 with headroom. About 13 such cards fit in the pool at the
@@ -89,6 +113,7 @@ for it.
 
 ## 7. Open questions
 
-- `HEADROOM`, `CAP_FLOOR` and the default rate for an unmeasured model: check them on the first orders.
+- `HEADROOM`, `START_CAP`, `MIN_ELAPSED_SHARE`: check them on the resize log (how often a period settles
+  with its cap binding).
 - An order whose miners outrun the estimate between two resizes is paid under its price for that period
   (the cap binds). The headroom is meant to cover it; the resize log shows how often it binds.
