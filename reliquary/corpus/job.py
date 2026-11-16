@@ -15,6 +15,7 @@ import re
 from typing import Any
 
 # Pure: a prefix test on the prompt source, loading nothing.
+from reliquary.env_catalog import CATALOG as ENV_CATALOG
 from reliquary.eval.prompt_source import is_eval_source
 
 JOB_SCHEMA = "reliquary/corpus-job/v1"
@@ -135,11 +136,8 @@ SWE_PACKAGE = "reliquary-swe"
 # options and image lock), as an RL run reads its bridged envs. Every process that serves
 # such a job still needs the package installed at the episode's pinned identity
 # (`agentic_swe.sandbox_support_refusal`): naming one here only lets a manifest carry it.
-# reliquary-terminal: TMax; reliquary-deepswe: DeepSWE v1.1 (Datacurve's 113 tasks);
-# reliquary-swebench-pro: SWE-bench Pro V2 (Scale AI, public set); reliquary-nl2repo: NL2Repo-Bench;
-# reliquary-terminal-bench: Terminal-Bench 2.1 (docs/design/2026-11-13-terminal-bench-harbor.md).
-BRIDGED_EVAL_PACKAGES = frozenset({"reliquary-terminal", "reliquary-deepswe", "reliquary-swebench-pro",
-                                   "reliquary-nl2repo", "reliquary-terminal-bench"})
+# The environment catalog's ``bridged`` packages (``reliquary.env_catalog``).
+BRIDGED_EVAL_PACKAGES = frozenset(name for name, env in ENV_CATALOG.items() if env.bridged)
 EPISODE_ENV_PACKAGES = frozenset({SWE_PACKAGE, SUITE_PACKAGE}) | BRIDGED_EVAL_PACKAGES
 EPISODE_HARNESSES = frozenset({"bash", SUITE_HARNESS})
 # The packages each harness runs: never mixed.
@@ -278,6 +276,20 @@ def _check_split(split: Any, eval_job: bool) -> None:
         raise JobError(f"episode.env.split must be a split name, got {split!r}")
     if not eval_job and split != "train":
         raise JobError(f"episode.env.split must be 'train', got {split!r}")
+
+
+def _check_catalog_split(split: str, eval_job: bool, environment: str) -> None:
+    """``environment`` (a package or a suite env) in the environment catalog: a training job needs live batch
+    rows on its split, and an eval job never runs a split the catalog gives to training only."""
+    entry = ENV_CATALOG.get(environment)
+    if entry is None:
+        return
+    uses = {r.use for r in entry.rows if r.split in (split, "*") and r.live}
+    if not eval_job and "batch" not in uses:
+        raise JobError(f"{environment!r} split {split!r} has no batch rows in the environment catalog")
+    if eval_job and uses and "eval" not in uses:
+        raise JobError(f"{environment!r} split {split!r} is a training split ({', '.join(sorted(uses))}): "
+                       "an eval job never runs it")
 
 
 def _judge(raw) -> DrawJudge:
@@ -979,6 +991,8 @@ def _check_episode_job(job: JobSpec) -> None:
         raise JobError("a suite episode job draws its prompts from its environment "
                        f"or an eval set: prompt_source must be {episode.env.name!r} "
                        "or an eval source")
+    _check_catalog_split(episode.env.split, is_eval_source(job.prompt_source),
+                         episode.env.name if episode.is_suite else episode.env.package)
 
 
 def episode_contract(raw: Any, *, eval_job: bool) -> dict[str, Any]:

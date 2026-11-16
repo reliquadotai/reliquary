@@ -72,3 +72,16 @@ def _whole_split_rl_prompt_ranges(request, monkeypatch):
 def real_rl_prompt_ranges():
     """Keep the production RL prompt ranges for this test."""
     return None
+
+
+@pytest.fixture(autouse=True)
+def _fake_sandbox_rl_split(monkeypatch):
+    """The fake sandbox's SWE split (``episode_v2_fixtures.SPLIT``) is an RL split of the catalog's SWE package."""
+    import dataclasses
+    from types import MappingProxyType
+
+    import reliquary.env_catalog as env_catalog
+
+    swe = env_catalog.CATALOG["reliquary-swe"]
+    fake = dataclasses.replace(swe, rows=(*swe.rows, env_catalog.Rows("rl", "train:rl", what="fake sandbox")))
+    monkeypatch.setattr(env_catalog, "CATALOG", MappingProxyType({**env_catalog.CATALOG, swe.name: fake}))
