@@ -88,6 +88,28 @@ def test_an_auction_lease_our_sandbox_failed_neither_owes_nor_halves_the_capacit
     assert _fill(charged, charged_book, "5A") == (4, ALLOWANCE_FULL)     # the same release by the miner: halved
 
 
+def test_a_restart_does_not_restore_a_lease_released_for_our_fault(tmp_path):
+    auction, clock, book = _auction(budget=100)
+    auction.post_ask("5A", 0.2, 8)
+    ours = {"5A"}
+    job = _job(prompts=10, slots=4)
+    kwargs = dict(clock=clock, seconds=100.0, state_path=tmp_path / "leases.json", limit_per_hotkey=False,
+                  on_unused=lambda lease, held: auction.lease_ended(lease.hotkey, lease.price, held),
+                  validator_fault=lambda lease: ("open_refused_ours", "fleet full") if lease.hotkey in ours else None)
+    leases = DrawLeases(job, **kwargs)
+    lease = leases.grant("5A", lambda start: [(10, 0)], price=auction.params.share_of(0.2))
+    clock.now += 80
+    assert leases.release("5A", lease.lease_id)
+    # Refusal evidence is process-local: after a restart the released lease must stay gone on disk.
+    ours.clear()
+    restored = DrawLeases(job, **kwargs)
+    assert restored.held("5A", lease.prompt_index, lease.slot) is None
+    clock.now += 201
+    restored.expire()
+    assert auction.debt_alpha("5A") == 0
+    assert _fill(auction, book, "5A") == (8, ALLOWANCE_FULL)
+
+
 # ------------------------------------------------------------------ the evidence
 
 

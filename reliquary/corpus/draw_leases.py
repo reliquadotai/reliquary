@@ -337,6 +337,7 @@ class DrawLeases:
             fault = self._fault(lease)
             if fault is not None:
                 self._log("released", lease, f" held={held:.2f} ours={fault[0]} ({fault[1]}): not charged")
+                self.save()
                 return True
             self._log("released", lease, f" held={held:.2f}")
             self._unused_lease(lease, held)
