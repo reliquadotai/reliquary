@@ -103,4 +103,58 @@ class MilesTrainStep:
         return model
 
 
-__all__ = ["MilesTrainStep"]
+
+def expected_weight_keys(model_dir) -> set[str]:
+    """The HF model's weight names (``model.safetensors.index.json``, else the single ``model.safetensors``)."""
+    import json
+    from pathlib import Path
+
+    from safetensors import safe_open
+
+    model_dir = Path(model_dir)
+    index = model_dir / "model.safetensors.index.json"
+    if index.exists():
+        return set(json.loads(index.read_text())["weight_map"])
+    with safe_open(str(model_dir / "model.safetensors"), framework="pt") as handle:
+        return set(handle.keys())
+
+
+class MilesState:
+    """``AsyncTrainer``'s ``state_fn``: the gateway exports the weights (``save_weights_for_sampler``, HF safetensors
+    under ``<checkpoint_root>/<model_id>/sampler_weights/<name>/hf`` on this box's disk), loaded on CPU. The names
+    must be exactly the HF model's (what miners load), or nothing is published. Exports older than the previous one
+    are deleted through ``delete(tinker_path)``."""
+
+    KEEP = 2
+
+    def __init__(self, client, *, checkpoint_root, expected_keys: set[str], delete) -> None:
+        from pathlib import Path
+
+        self.client, self.root = client, Path(checkpoint_root)
+        self.expected, self.delete = set(expected_keys), delete
+        self.n, self.paths = 0, []
+
+    def __call__(self) -> dict:
+        from pathlib import Path
+
+        from safetensors.torch import load_file
+
+        name = f"snapshot-{self.n}"
+        self.n += 1
+        path = self.client.save_weights_for_sampler(name).result().path
+        model_id, kind, _ = path.removeprefix("tinker://").split("/", 2)
+        hf = Path(self.root / model_id / kind / name).resolve() / "hf"
+        state: dict = {}
+        for shard in sorted(hf.glob("*.safetensors")):
+            state.update(load_file(str(shard), device="cpu"))
+        missing, extra = self.expected - set(state), set(state) - self.expected
+        if missing or extra:
+            raise RuntimeError(f"gateway export {path} does not match the model: missing {sorted(missing)[:5]}, "
+                               f"unexpected {sorted(extra)[:5]}")
+        self.paths.append(path)
+        while len(self.paths) > self.KEEP:
+            self.delete(self.paths.pop(0))
+        return state
+
+
+__all__ = ["MilesState", "MilesTrainStep", "expected_weight_keys"]
