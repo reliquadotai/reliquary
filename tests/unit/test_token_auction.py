@@ -16,6 +16,7 @@ from reliquary.corpus.token_auction import (
     LEASE_FLOOR_SECONDS,
     NO_ASK,
     PENALTY_SECONDS,
+    PRICE_WINDOW_SECONDS,
     PRICING_PARAM,
     STEER_SECONDS,
     AuctionParams,
@@ -69,6 +70,19 @@ def _lease(auction, book, hotkey):
     return terms
 
 
+def _deliver(auction, hotkey, count, alpha=None):
+    """``count`` leases of ``hotkey`` delivered, each won at ``alpha`` (default: its live offer)."""
+    offer = auction.ask_of(hotkey) if alpha is None else auction.params.share_of(alpha)
+    for _ in range(count):
+        auction.observe_delivery(hotkey, 60.0, offer=offer)
+
+
+def _active(auction, *hotkeys):
+    for hotkey in hotkeys:
+        auction.admit(hotkey)                      # each asks once: all are active
+        auction._reserved.clear()
+
+
 def _fill(auction, book, hotkey):
     """Lease until refused; the leases granted and the refusal."""
     granted = 0
@@ -93,20 +107,24 @@ def test_a_lease_alone_in_the_budget_carries_its_holders_own_offer():
 
 def test_a_lease_carries_the_price_of_the_moment_never_under_its_own_offer():
     """2026-11-12: an offer at 0 took a small budget's leases and was paid the period's price. A lease is paid the
-    dearest offer getting work when it is granted: alone in a small budget, an offer at 0 gets 0."""
+    price of the delivered volume when it is granted, never above the dearest offer getting work: alone in a small
+    budget, an offer at 0 gets 0."""
     auction, _, book = _auction(budget=4)
     auction.post_ask("zero", 1e-6, 4)            # the lowest a miner can offer
     auction.post_ask("mid", 0.2, 4)
     auction.post_ask("dear", 0.5, 4)
-    for hotkey in ("zero", "mid", "dear"):
-        auction.admit(hotkey)                      # each asks once: all three are active
-        auction._reserved.clear()
-    assert auction.params.alpha_of(_lease(auction, book, "zero").price) == pytest.approx(1e-6)
+    _active(auction, "zero", "mid", "dear")
+    assert auction.params.alpha_of(_lease(auction, book, "zero").price) == pytest.approx(1e-6)   # nothing delivered
+    _deliver(auction, "zero", 2)
+    _deliver(auction, "mid", 8)                    # most of the work was won at 0.2
+    assert auction.params.alpha_of(_lease(auction, book, "zero").price) == pytest.approx(1e-6)   # zero alone works
     auction._budget = 8                            # mid works too: the moment's price is mid's
     assert auction.params.alpha_of(_lease(auction, book, "zero").price) == pytest.approx(0.2)
-    auction._budget = 12                           # everyone works: the dearest offer's price for all
-    assert auction.params.alpha_of(_lease(auction, book, "mid").price) == pytest.approx(0.5)
+    auction._budget = 12                           # dear works too, but has delivered nothing: still mid's
+    assert auction.params.alpha_of(_lease(auction, book, "mid").price) == pytest.approx(0.2)
     assert auction.params.alpha_of(_lease(auction, book, "dear").price) == pytest.approx(0.5)
+    _deliver(auction, "dear", 3)                   # a fifth of the work at 0.5: the price for all
+    assert auction.params.alpha_of(_lease(auction, book, "mid").price) == pytest.approx(0.5)
 
 
 def test_an_offer_under_its_real_cost_only_wins_leases_that_pay_under_that_cost():
@@ -117,9 +135,9 @@ def test_an_offer_under_its_real_cost_only_wins_leases_that_pay_under_that_cost(
         auction.post_ask("a", own, 6)
         auction.post_ask("b", 0.15, 6)
         auction.post_ask("c", 0.4, 6)
+        _active(auction, "a", "b", "c")
         for hotkey in ("a", "b", "c"):
-            auction.admit(hotkey)
-            auction._reserved.clear()
+            _deliver(auction, hotkey, 6)
         prices = []
         while isinstance(terms := _lease(auction, book, "a"), Terms):
             prices.append(auction.params.alpha_of(terms.price))
@@ -344,8 +362,10 @@ def test_the_state_survives_a_restart(tmp_path):
     auction.lease_ended("5A", auction.params.share_of(0.2), 1.0)
     for seconds in (400, 500, 600):
         auction.observe_delivery("5A", seconds)
+    auction.observe_delivery("5B", 60, offer=auction.params.share_of(0.3))
     auction.save(force=True)
     again, _, book = _auction(state_path=path, clock=clock)
+    assert again._volume_price(clock.now) == pytest.approx(auction.params.share_of(0.3))
     assert again.debt_alpha("5A") == pytest.approx(auction.debt_alpha("5A"))
     assert again.ask_of("5A") == pytest.approx(auction.ask_of("5A"))
     assert again.lease_seconds("5A", 3600.0) == pytest.approx(1200.0)
@@ -497,3 +517,88 @@ def test_a_hotkey_set_aside_gets_no_allowance_until_then():
     clock.now += 101
     book.held.clear()
     assert isinstance(_lease(auction, book, "aside"), Terms)
+
+
+# -- the price of the moment follows the delivered volume (2026-11-16) ----------------------------------------------
+
+def _two_keys(budget=100, honest=15):
+    """One operator offers ~0 on ``zero`` for the room the honest offers leave but one lease, and the ceiling on
+    ``dear`` for one lease; ``mid`` stands for the honest offers at 0.3."""
+    auction, clock, book = _auction(ceiling_alpha=0.5, budget=budget)
+    auction.post_ask("zero", 1e-6, budget - honest - 1)
+    auction.post_ask("mid", 0.3, honest)
+    auction.post_ask("dear", 0.5, 1)
+    _active(auction, "zero", "mid", "dear")
+    return auction, clock, book
+
+
+def test_a_second_key_at_the_ceiling_for_one_lease_no_longer_prices_every_lease():
+    auction, _, book = _two_keys()
+    assert _fill(auction, book, "dear") == (1, ALLOWANCE_FULL)      # dear is given work: the old moment's price
+    assert auction.view()["price_alpha_per_mtoken"] == pytest.approx(0.5)    # nothing delivered: at most that
+    _deliver(auction, "zero", 84)
+    _deliver(auction, "mid", 15)
+    _deliver(auction, "dear", 1)                   # it even delivers its one lease
+    terms = _lease(auction, book, "zero")
+    assert auction.params.alpha_of(terms.price) == pytest.approx(1e-6)       # was the ceiling, 0.5
+    assert auction.params.alpha_of(_lease(auction, book, "mid").price) == pytest.approx(0.3)
+    assert auction.view()["price_alpha_per_mtoken"] == pytest.approx(1e-6)
+
+
+def test_taking_more_leases_at_zero_lowers_the_price_it_is_paid():
+    auction, _, book = _two_keys()
+    _deliver(auction, "mid", 15)
+    _deliver(auction, "dear", 21)
+    _deliver(auction, "zero", 64)
+    assert auction.params.alpha_of(_lease(auction, book, "zero").price) == pytest.approx(0.5)
+    _deliver(auction, "zero", 20)                  # more of its own work at 0: under a fifth at the ceiling
+    assert auction.params.alpha_of(_lease(auction, book, "zero").price) == pytest.approx(0.3)
+
+
+def test_leases_not_delivered_set_no_price():
+    """A second key that takes leases and gives them back, or lets them expire, is in debt: it counts for nothing."""
+    auction, _, book = _two_keys()
+    _deliver(auction, "zero", 64)
+    _deliver(auction, "mid", 15)
+    _deliver(auction, "dear", 21)
+    assert auction.params.alpha_of(_lease(auction, book, "zero").price) == pytest.approx(0.5)
+    auction.lease_ended("dear", auction.params.share_of(0.5), 0.01)          # one lease given back at once
+    assert auction.params.alpha_of(_lease(auction, book, "zero").price) == pytest.approx(1e-6)
+
+
+def test_a_delivery_counts_at_its_holders_offer_never_at_the_price_it_was_paid():
+    """A lease paid the price of the moment counted at that price would keep the price up by itself."""
+    auction, _, book = _two_keys()
+    _deliver(auction, "dear", 25)
+    _deliver(auction, "zero", 75)
+    terms = _lease(auction, book, "zero")
+    assert auction.params.alpha_of(terms.price) == pytest.approx(0.5)
+    assert auction.params.alpha_of(terms.offer) == pytest.approx(1e-6)
+    for _ in range(50):
+        auction.observe_delivery("zero", 60.0, offer=terms.offer)
+    assert auction.params.alpha_of(_lease(auction, book, "zero").price) == pytest.approx(1e-6)
+
+
+def test_a_delivery_reposted_dearer_still_counts_at_its_grant_offer():
+    auction, _, book = _two_keys()
+    terms = _lease(auction, book, "zero")
+    auction.post_ask("zero", 0.5, 84)              # reposted at the ceiling before delivering
+    auction.observe_delivery("zero", 60.0, offer=terms.offer)
+    assert auction._volume_price(auction._clock()) == pytest.approx(terms.offer)
+
+
+def test_old_deliveries_leave_the_price():
+    auction, clock, book = _two_keys()
+    _deliver(auction, "dear", 50)
+    clock.now += PRICE_WINDOW_SECONDS + 1
+    _active(auction, "zero", "mid", "dear")
+    assert auction.params.alpha_of(_lease(auction, book, "zero").price) == pytest.approx(1e-6)   # its own offer
+    assert auction._delivered == {}
+
+
+def test_a_delivery_without_its_offer_sets_no_price():
+    """A lease granted before the switch carries no offer: it times the next leases and prices nothing."""
+    auction, _, _ = _two_keys()
+    auction.observe_delivery("dear", 60.0)
+    assert auction._volume_price(auction._clock()) is None
+    assert len(auction._deliveries["dear"]) == 1
