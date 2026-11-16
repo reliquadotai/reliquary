@@ -3234,6 +3234,25 @@ def corpus_qualify(
     typer.echo(json.dumps(answer))
 
 
+def _rl_asks(values: list[str], environments: tuple[str, ...], capacity: int) -> dict[str, tuple[int, int]]:
+    """``--ask-alpha-per-mtoken`` as env -> (micro-alpha per million tokens, capacity): one bare value prices every
+    env, ``ENV=VALUE`` one env (it wins over the bare value)."""
+    default, priced = None, {}
+    for value in values:
+        name, sep, amount = value.rpartition("=")
+        price = float(amount)
+        if not (math.isfinite(price) and price > 0):
+            raise ValueError(f"--ask-alpha-per-mtoken {value!r}: a positive price is needed")
+        if sep:
+            if name not in environments:
+                raise ValueError(f"--ask-alpha-per-mtoken names {name!r}, not one of --environments")
+            priced[name] = price
+        else:
+            default = price
+    return {env: (max(1, round(1e6 * (priced.get(env, default)))), int(capacity))
+            for env in environments if env in priced or default is not None}
+
+
 @corpus_app.command("mine")
 def corpus_mine(
     validator_url: str = typer.Option(..., "--validator-url"),
@@ -4558,6 +4577,13 @@ def mine_async(
         False, "--share-setup", help="Opt in: send this process's GPUs (model, memory), CPU and RAM to the "
         "validator at start and every 6 h. Informational only, never scored"),
     setup_note: str = typer.Option("", "--setup-note", help="With --share-setup: a free note, e.g. '2 boxes 8xH100'"),
+    ask_alpha_per_mtoken: list[str] = typer.Option(
+        [], "--ask-alpha-per-mtoken",
+        help="A task priced by auction: your price in alpha per million matched tokens, one value for every env or "
+             "ENV=VALUE (repeatable). Posted before leasing and every 10 min"),
+    ask_capacity: int = typer.Option(
+        0, "--ask-capacity", help="With --ask-alpha-per-mtoken: the groups you can hold at once per env "
+                                  "(default: --max-open)"),
     log_level: str = typer.Option("INFO", help="Log level"),
 ) -> None:
     """Mine the asynchronous RL protocol: lease prompts within the measured quota, generate 16 rollouts per lease
@@ -4586,9 +4612,10 @@ def mine_async(
             raise typer.Exit(code=2)
         typer.echo(f"validator discovered: {validator_url} ({validator_hotkey})")
     try:
+        asks = _rl_asks(ask_alpha_per_mtoken, names, ask_capacity or max_open)
         config = AsyncMinerConfig(environments=names, lease_batch=lease_batch, max_open=max_open,
                                   queue_groups=queue_groups, batch_groups=batch_groups,
-                                  state_dir=str(Path(work_dir) / "state"))
+                                  state_dir=str(Path(work_dir) / "state"), asks=asks)
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc

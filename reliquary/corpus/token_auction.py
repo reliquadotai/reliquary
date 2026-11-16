@@ -225,13 +225,17 @@ class TokenAuction:
                  backlog: Callable[[], int | None] | None = None,
                  holdings: Callable[[], Mapping[str, int]] | None = None,
                  mean_tokens: float = 1000.0, state_path: str | os.PathLike | None = None,
-                 market_name: str | None = None, job_id: str = "job") -> None:
+                 market_name: str | None = None, job_id: str = "job",
+                 budget: Callable[[], int | None] | None = None) -> None:
         self.params = params
         # The deliveries this job prices from: its market's, else its own (``Market``).
         self._market = market(market_name) if market_name is not None else Market()
         self._job = str(job_id)
         self._clock = clock
         self._backlog = backlog
+        # A budget the caller knows (an RL env: what the trainer's next steps take), read at each lease instead of
+        # the thermostat on the audit queue. None from it: keep the last value.
+        self._budget_of = budget
         self._holdings = holdings
         self._lock = threading.RLock()
         self._offers: dict[str, Offer] = {}
@@ -301,7 +305,23 @@ class TokenAuction:
             logger.exception("token auction: lease holdings unavailable")
             return {}
 
-    def _steer(self, now: float, held: Mapping[str, int]) -> None:
+    def _given_budget(self) -> int | None:
+        """The caller's budget (``budget``), read before this auction's lock: it may read the leases' own store."""
+        if self._budget_of is None:
+            return None
+        try:
+            given = self._budget_of()
+        except Exception:                     # a status read never stops leasing
+            logger.exception("token auction: budget unavailable")
+            return None
+        return None if given is None else max(0, min(MAX_LEASES, int(given)))
+
+    def _steer(self, now: float, held: Mapping[str, int], given: int | None = None) -> None:
+        if self._budget_of is not None:
+            if given is not None and given != self._budget:
+                self._budget = given
+                self._changed()
+            return
         if self._steered_at is not None and now - self._steered_at < STEER_SECONDS:
             return
         self._steered_at = now
@@ -397,18 +417,28 @@ class TokenAuction:
 
     # -- leases --------------------------------------------------------------
 
+    def note_request(self, hotkey: str) -> None:
+        """``hotkey`` asks for leases now: it counts for the allowances before any request of the same batch is
+        served (an RL interval resolves its requests together, cheapest first, whatever their arrival order)."""
+        with self._lock:
+            if hotkey in self._offers:
+                self._seen[hotkey] = self._clock()
+
     def admit(self, hotkey: str) -> Terms | str:
         """Reserve one lease for ``hotkey`` under its allowance: its terms, or why it gets none. Every reservation
         is given back with ``unreserve`` once its lease is granted or not."""
         # Read before taking this lock: the leases call this auction under their own lock (an expiry's charge).
         held = self._held()
+        given_budget = self._given_budget()
         with self._lock:
             now = self._clock()
             offer = self._live(hotkey, now)
             if offer is None:
                 return NO_ASK
             self._seen[hotkey] = now
-            self._steer(now, held)
+            self._steer(now, held, given_budget)
+            if self._budget <= 0:
+                return ALLOWANCE_FULL               # nothing to hand out now (an RL env whose next steps are full)
             given, marginal = self._allowances(now, held)
             allowance = given.get(hotkey, 0)
             if allowance <= 0:
@@ -529,9 +559,10 @@ class TokenAuction:
         now: what a lease pays at most), the budget and the audit queue.
         Never another hotkey's offer; with ``hotkey``, that hotkey's own allowance and debt."""
         held = self._held()                   # before this lock, as in ``admit``
+        given_budget = self._given_budget()
         with self._lock:
             now = self._clock()
-            self._steer(now, held)
+            self._steer(now, held, given_budget)
             given, marginal = self._allowances(now, held)
             moment = self._moment_price(now, marginal)
             shown = moment if moment is not None else marginal

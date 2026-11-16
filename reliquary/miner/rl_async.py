@@ -63,6 +63,9 @@ UNKNOWN_SAMPLE = 4                  # never-listed prompts drawn per wanted prom
 
 # The validator's words (``validator/rl_leases.py``), repeated here: the miner does not import the validator.
 TAKEN, COOLING, BLACKLISTED, QUOTA, STALE = "taken", "cooling", "blacklisted", "quota", "stale"
+# A task priced by auction (validator ``rl_auction``): no live offer on the env, or one over what it pays now.
+NO_ASK, ASK_ABOVE_PRICE = "no_ask", "ask_above_price"
+ASK_REPOST_S = 600.0                    # an offer lives an hour on the validator: reposted well before
 # An episode task the validator's sandbox fleet cannot host now (retry later) or at all (another task meanwhile).
 FLEET_UNAVAILABLE, TASK_UNSERVABLE = "fleet_unavailable", "task_unservable"
 FLEET_RETRY_S, UNSERVABLE_HOLD_S = 60.0, 3600.0
@@ -404,6 +407,19 @@ class HttpRlTransport:
                                                            validator_hotkey=self.validator_hotkey, path=path))
         return await self._call("GET", path, params={"hotkey": self.hotkey, "at": str(at), "signature": signature})
 
+    async def ask(self, environment: str, micro_alpha_per_mtoken: int, capacity: int) -> dict:
+        """``POST /rl/ask``: this hotkey's offer on one env of a task priced by auction."""
+        from reliquary.protocol.signatures import build_rl_ask_binding
+
+        path = f"{self._prefix}/ask"
+        at = int(self._clock())
+        body = {"miner_hotkey": self.hotkey, "at": at, "environment": environment,
+                "micro_alpha_per_mtoken": int(micro_alpha_per_mtoken), "capacity": int(capacity)}
+        body["signature"] = self._sign(build_rl_ask_binding(
+            hotkey=self.hotkey, at=at, environment=environment, micro_alpha_per_mtoken=int(micro_alpha_per_mtoken),
+            capacity=int(capacity), validator_hotkey=self.validator_hotkey, path=path))
+        return await self._call("POST", path, json=body)
+
     async def forfeit(self, lease_id: str, reason: str | None = None) -> dict:
         """``POST /rl/lease/forfeit``: give up an open lease (charged as its expiry, its quota slot freed now;
         released without a cut when the validator's own session records show our sandbox failed it). ``reason``
@@ -538,10 +554,15 @@ class AsyncMinerConfig:
     lease_poll_s: float = LEASE_POLL_S
     submit_backoff_s: tuple[float, ...] = SUBMIT_BACKOFF_S
     state_dir: str | None = None        # where open leases are journaled (restart safety)
+    # A task priced by auction: env -> (micro-alpha per million matched tokens, groups held at once). The miner
+    # posts these offers before leasing and every ``ASK_REPOST_S``; a validator without an auction ignores them.
+    asks: Mapping[str, tuple[int, int]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.environments:
             raise ValueError("at least one environment is needed")
+        if any(int(p) < 1 or int(c) < 1 for p, c in self.asks.values()):
+            raise ValueError("an offer needs a positive price and capacity")
         if min(self.lease_batch, self.max_open, self.queue_groups, self.batch_groups) < 1:
             raise ValueError("lease batch, max open, queue and batch sizes must be positive")
         if self.batch_groups > self.queue_groups:
@@ -568,6 +589,8 @@ class AsyncMiner:
         self.queue: list[HeldLease] = []                # open and waiting for generation
         self.running: dict[str, HeldLease] = {}         # in a continuous-batching generator, by lease id
         self.quota: int | None = None
+        self._asked_at: dict[str, float] = {}           # env -> when its offer was last accepted
+        self._asks_served = True                        # False once the validator says it runs no auction
         self.stats = {"leased": 0, "submitted": 0, "submit_failed": 0, "expired_unsent": 0, "recovered": 0,
                       "refused": {}, "verdicts": {}}
         self._attempts: dict[str, int] = {}
@@ -616,7 +639,34 @@ class AsyncMiner:
         elif expiry is not None and environment in self.planners:
             self.planners[environment].note_lease_expiry(expiry)
 
+    async def post_asks(self, *, force: bool = False) -> int:
+        """Post the offers that are due (or all, ``force``); the number accepted. A validator that runs no auction
+        (``not_auctioned``) is not asked again."""
+        ask = getattr(self.transport, "ask", None)
+        if not self.config.asks or ask is None or not self._asks_served:
+            return 0
+        now, accepted = self._clock(), 0
+        for env, (price, capacity) in self.config.asks.items():
+            if not force and now - self._asked_at.get(env, -ASK_REPOST_S) < ASK_REPOST_S:
+                continue
+            try:
+                answer = await ask(env, int(price), int(capacity))
+            except RequestRefused as exc:
+                if exc.reason in ("not_auctioned", "404"):
+                    logger.info("the validator prices this task without an auction: offers not posted")
+                    self._asks_served = False
+                    return accepted
+                logger.warning("offer on %s refused: %s", env, exc.reason)
+                continue
+            self._asked_at[env] = now
+            accepted += 1
+            view = answer.get("auction") or {}
+            logger.info("offer on %s: %s micro-alpha/M x %d; price now %s, allowance %s", env, price, capacity,
+                        view.get("price_alpha_per_mtoken"), view.get("allowance"))
+        return accepted
+
     async def refresh_quota(self) -> None:
+        await self.post_asks()
         answer = await self.transport.quota()
         self.quota = int(answer["quota"])
         self._note_expiries(answer)
@@ -687,8 +737,11 @@ class AsyncMiner:
             planner.wait_for_outcome(prompt)          # a rival holds (prompt, k): its scan, or its expiry, comes
         elif reason in (COOLING, BLACKLISTED):
             planner.mark(prompt, reason)              # our table is behind: the next state poll catches up
-        elif reason in (QUOTA, FULL):
+        elif reason in (QUOTA, FULL, ASK_ABOVE_PRICE):
             self.quota = len(self.open)               # the validator counts fewer, or is full: wait for its next quota
+        elif reason == NO_ASK:
+            self._asked_at.clear()                    # the validator lost our offer (restart, expiry): repost now
+            self.quota = len(self.open)
         elif reason in (FLEET_UNAVAILABLE, TASK_UNSERVABLE):
             planner.wait_for_outcome(prompt, self._clock() + (FLEET_RETRY_S if reason == FLEET_UNAVAILABLE
                                                               else UNSERVABLE_HOLD_S))
