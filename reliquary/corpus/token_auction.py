@@ -574,6 +574,10 @@ class TokenAuction:
             self._deliveries = {str(h): collections.deque((float(s) for s in d), maxlen=DELIVERIES_KEPT)
                                 for h, d in (state.get("deliveries") or {}).items()}
             delivered = state.get("delivered")
+            if isinstance(delivered, Mapping):
+                # The format of #540 (2026-11-16): per hotkey, (delivered at, offer in pool share per token).
+                delivered = sorted([float(t), str(h), self.params.alpha_of(float(p))]
+                                   for h, entries in delivered.items() for t, p in entries)
             if isinstance(delivered, list):
                 self._market.replace(self._job, delivered)
             if state.get("mean_tokens") is not None:

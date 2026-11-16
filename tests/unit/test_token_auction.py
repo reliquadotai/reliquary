@@ -664,3 +664,18 @@ def test_a_jobs_market_is_its_model_and_its_kind():
     Job.episode = object()
     assert market_key(Job()) == "org/model|episode"
     assert market_key(None) is None
+
+
+def test_a_state_written_by_the_first_volume_price_keeps_its_deliveries(tmp_path):
+    """#540 kept each hotkey's deliveries at its offer in pool share: a restart onto markets reads them in alpha."""
+    import json
+    path = tmp_path / "job.json"
+    auction, clock, _ = _auction()
+    share = auction.params.share_of(0.3)
+    path.write_text(json.dumps({"budget": 8, "delivered": {"5B": [[clock.now - 10, share]] * 20,
+                                                           "5A": [[clock.now - 20, share]]}}))
+    again, _, _ = _auction(state_path=path, clock=clock)
+    entries = again._market.of("job")
+    assert len(entries) == 21 and entries[0][1] == "5A"
+    assert [alpha for _, _, alpha in entries] == pytest.approx([0.3] * 21)
+    assert again.params.alpha_of(again._volume_price(clock.now)) == pytest.approx(0.3)
