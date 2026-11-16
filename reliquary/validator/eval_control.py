@@ -1583,7 +1583,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             w.auction = job_auction(
                 getattr(w.entry, "params", None),
                 backlog=lambda: w.auditor.audit_backlog() + dispatcher.pending_items(job_id),
-                state_path=state_path_for(job_id))
+                state_path=state_path_for(job_id), job=getattr(w, "job", None))
         return w.auction
 
     async def wire(entry, cap, job):

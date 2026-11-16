@@ -16,7 +16,8 @@ from reliquary.corpus.token_auction import (
     LEASE_FLOOR_SECONDS,
     NO_ASK,
     PENALTY_SECONDS,
-    PRICE_WINDOW_SECONDS,
+    PRICE_HALF_LIFE_SECONDS,
+    PRICE_HORIZON_SECONDS,
     PRICING_PARAM,
     STEER_SECONDS,
     AuctionParams,
@@ -24,6 +25,7 @@ from reliquary.corpus.token_auction import (
     TokenAuction,
     auction_params,
     job_auction,
+    market_key,
 )
 from reliquary.validator.corpus_periods import price_params
 
@@ -51,13 +53,14 @@ class Book:
         self.held[terms.hotkey] = self.held.get(terms.hotkey, 0) + 1
 
 
-def _auction(ceiling_alpha=0.5, budget=8, backlog=None, clock=None, state_path=None, low=8, high=32):
+def _auction(ceiling_alpha=0.5, budget=8, backlog=None, clock=None, state_path=None, low=8, high=32,
+             market_name=None, job_id="job"):
     params = AuctionParams(ceiling=ceiling_alpha / 1e6 / EMISSION, miner_alpha_per_period=EMISSION,
                            initial_leases=budget, backlog_low=low, backlog_high=high)
     clock = clock or Clock()
     book = Book()
     auction = TokenAuction(params, clock=clock, backlog=backlog, holdings=book, mean_tokens=1000,
-                           state_path=state_path)
+                           state_path=state_path, market_name=market_name, job_id=job_id)
     return auction, clock, book
 
 
@@ -115,15 +118,15 @@ def test_a_lease_carries_the_price_of_the_moment_never_under_its_own_offer():
     auction.post_ask("dear", 0.5, 4)
     _active(auction, "zero", "mid", "dear")
     assert auction.params.alpha_of(_lease(auction, book, "zero").price) == pytest.approx(1e-6)   # nothing delivered
-    _deliver(auction, "zero", 2)
-    _deliver(auction, "mid", 8)                    # most of the work was won at 0.2
+    _deliver(auction, "zero", 6)
+    _deliver(auction, "mid", 24)                   # most of the work was won at 0.2
     assert auction.params.alpha_of(_lease(auction, book, "zero").price) == pytest.approx(1e-6)   # zero alone works
     auction._budget = 8                            # mid works too: the moment's price is mid's
     assert auction.params.alpha_of(_lease(auction, book, "zero").price) == pytest.approx(0.2)
     auction._budget = 12                           # dear works too, but has delivered nothing: still mid's
     assert auction.params.alpha_of(_lease(auction, book, "mid").price) == pytest.approx(0.2)
     assert auction.params.alpha_of(_lease(auction, book, "dear").price) == pytest.approx(0.5)
-    _deliver(auction, "dear", 3)                   # a fifth of the work at 0.5: the price for all
+    _deliver(auction, "dear", 8)                   # over a fifth of the work at 0.5: the price for all
     assert auction.params.alpha_of(_lease(auction, book, "mid").price) == pytest.approx(0.5)
 
 
@@ -137,7 +140,7 @@ def test_an_offer_under_its_real_cost_only_wins_leases_that_pay_under_that_cost(
         auction.post_ask("c", 0.4, 6)
         _active(auction, "a", "b", "c")
         for hotkey in ("a", "b", "c"):
-            _deliver(auction, hotkey, 6)
+            _deliver(auction, hotkey, 7)
         prices = []
         while isinstance(terms := _lease(auction, book, "a"), Terms):
             prices.append(auction.params.alpha_of(terms.price))
@@ -362,9 +365,11 @@ def test_the_state_survives_a_restart(tmp_path):
     auction.lease_ended("5A", auction.params.share_of(0.2), 1.0)
     for seconds in (400, 500, 600):
         auction.observe_delivery("5A", seconds)
-    auction.observe_delivery("5B", 60, offer=auction.params.share_of(0.3))
+    for _ in range(20):
+        auction.observe_delivery("5B", 60, offer=auction.params.share_of(0.3))
     auction.save(force=True)
     again, _, book = _auction(state_path=path, clock=clock)
+    assert again._market.of("job") == auction._market.of("job")
     assert again._volume_price(clock.now) == pytest.approx(auction.params.share_of(0.3))
     assert again.debt_alpha("5A") == pytest.approx(auction.debt_alpha("5A"))
     assert again.ask_of("5A") == pytest.approx(auction.ask_of("5A"))
@@ -584,16 +589,16 @@ def test_a_delivery_reposted_dearer_still_counts_at_its_grant_offer():
     terms = _lease(auction, book, "zero")
     auction.post_ask("zero", 0.5, 84)              # reposted at the ceiling before delivering
     auction.observe_delivery("zero", 60.0, offer=terms.offer)
-    assert auction._volume_price(auction._clock()) == pytest.approx(terms.offer)
+    assert auction._market.of("job")[-1][2] == pytest.approx(1e-6)
 
 
 def test_old_deliveries_leave_the_price():
     auction, clock, book = _two_keys()
     _deliver(auction, "dear", 50)
-    clock.now += PRICE_WINDOW_SECONDS + 1
+    clock.now += PRICE_HORIZON_SECONDS + 1
     _active(auction, "zero", "mid", "dear")
     assert auction.params.alpha_of(_lease(auction, book, "zero").price) == pytest.approx(1e-6)   # its own offer
-    assert auction._delivered == {}
+    assert auction._market.entries(clock.now) == []
 
 
 def test_a_delivery_without_its_offer_sets_no_price():
@@ -602,3 +607,75 @@ def test_a_delivery_without_its_offer_sets_no_price():
     auction.observe_delivery("dear", 60.0)
     assert auction._volume_price(auction._clock()) is None
     assert len(auction._deliveries["dear"]) == 1
+
+
+def test_a_few_deliveries_set_no_price():
+    """Under PRICE_MIN_WEIGHT the quantile of a few deliveries is their dearest: one delivered at the ceiling would
+    price the next wave."""
+    auction, _, book = _two_keys()
+    _deliver(auction, "dear", 4)
+    assert auction.params.alpha_of(_lease(auction, book, "zero").price) == pytest.approx(1e-6)
+
+
+def test_older_deliveries_weigh_less():
+    auction, clock, book = _two_keys()
+    _deliver(auction, "zero", 80)
+    clock.now += 3 * PRICE_HALF_LIFE_SECONDS       # weigh 80 / 8 = 10 now
+    _active(auction, "zero", "mid", "dear")
+    _deliver(auction, "mid", 15)                   # 16 % of the count, 60 % of the weight
+    assert auction.params.alpha_of(_lease(auction, book, "zero").price) == pytest.approx(0.3)
+
+
+def _market_name(request):
+    return f"{request.node.name}|turn"
+
+
+def test_a_new_order_starts_at_its_markets_price(request):
+    first, _, _ = _auction(market_name=_market_name(request), job_id="first")
+    first.post_ask("mid", 0.3, 4)
+    _deliver(first, "mid", 30)
+    second, clock, book = _auction(market_name=_market_name(request), job_id="second", budget=20)
+    second.post_ask("zero", 1e-6, 10)
+    second.post_ask("mid", 0.3, 10)
+    _active(second, "zero", "mid")
+    assert second.params.alpha_of(_lease(second, book, "zero").price) == pytest.approx(0.3)
+    alone, _, alone_book = _auction(market_name=_market_name(request) + "-other", job_id="third", budget=20)
+    alone.post_ask("zero", 1e-6, 10)
+    alone.post_ask("mid", 0.3, 10)
+    _active(alone, "zero", "mid")
+    assert alone.params.alpha_of(_lease(alone, alone_book, "zero").price) == pytest.approx(1e-6)
+
+
+def test_a_market_counts_offers_in_alpha_whatever_each_orders_emission(request):
+    first, _, _ = _auction(market_name=_market_name(request), job_id="first")
+    first.post_ask("mid", 0.3, 4)
+    _deliver(first, "mid", 30)
+    params = AuctionParams(ceiling=0.5 / 1e6 / (2 * EMISSION), miner_alpha_per_period=2 * EMISSION, initial_leases=20)
+    second = TokenAuction(params, clock=Clock(), holdings=Book(), market_name=_market_name(request), job_id="second")
+    assert second.params.alpha_of(second._volume_price(6000.0)) == pytest.approx(0.3)
+
+
+def test_a_jobs_market_is_its_model_and_its_kind():
+    class Job:
+        checkpoint_repo = "org/model"
+        episode = None
+        job_id = "j"
+    assert market_key(Job()) == "org/model|turn"
+    Job.episode = object()
+    assert market_key(Job()) == "org/model|episode"
+    assert market_key(None) is None
+
+
+def test_a_state_written_by_the_first_volume_price_keeps_its_deliveries(tmp_path):
+    """#540 kept each hotkey's deliveries at its offer in pool share: a restart onto markets reads them in alpha."""
+    import json
+    path = tmp_path / "job.json"
+    auction, clock, _ = _auction()
+    share = auction.params.share_of(0.3)
+    path.write_text(json.dumps({"budget": 8, "delivered": {"5B": [[clock.now - 10, share]] * 20,
+                                                           "5A": [[clock.now - 20, share]]}}))
+    again, _, _ = _auction(state_path=path, clock=clock)
+    entries = again._market.of("job")
+    assert len(entries) == 21 and entries[0][1] == "5A"
+    assert [alpha for _, _, alpha in entries] == pytest.approx([0.3] * 21)
+    assert again.params.alpha_of(again._volume_price(clock.now)) == pytest.approx(0.3)

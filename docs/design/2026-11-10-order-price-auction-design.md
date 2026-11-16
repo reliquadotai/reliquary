@@ -65,10 +65,22 @@ for minutes, not hours. The second-lessee rule for the job's tail stays.
 ### 2.5 Price paid
 
 A lease is paid the price of the moment it is granted, never under the holder's own offer. The price of the moment
-is the offer under which 80 % of the leases delivered in the last 30 minutes were won (each counted at its holder's
-own offer when granted, not at the price it was paid), capped by the dearest offer getting work at that instant.
-Hotkeys in debt or set aside count for nothing; with nothing delivered lately, a lease is paid its own offer. The
-settlement pays `tokens x lease price - debit` under the job's cap, and the rest of the ceiling budget burns.
+is the offer under which 80 % of the recently delivered leases were won, capped by the dearest offer getting work at
+that instant:
+
+- each delivery counts at its holder's own offer when the lease was granted, not at the price it was paid;
+- its weight halves every 5 minutes (dropped after 30), so the price follows a market that moves within minutes;
+- the deliveries are those of the job's **market**, its model and whether the work is agentic, across every order
+  on it (in alpha per million tokens), so a new order starts at its market's price instead of at nothing;
+- under a weight of 20 deliveries no price of the moment is taken (the 80 % quantile of four deliveries is their
+  dearest) and a lease is paid its own offer; this only happens for a model's first order or after a long gap;
+- hotkeys in debt or set aside on the job count for nothing.
+
+The settlement pays `tokens x lease price - debit` under the job's cap, and the rest of the ceiling budget burns.
+
+When cheap offers leave, the budget goes to the dearer offers at once and each is paid at least its own offer; only
+offers under their own cost wait for the delivered volume to catch up. When cheap offers arrive, the price falls at
+once through the cap.
 
 Why delivered volume and not the dearest allowance: until 2026-11-16 the price was the dearest offer given an
 allowance, even of one lease. One operator could offer 0 on a hotkey for the budget less one (the budget is public)

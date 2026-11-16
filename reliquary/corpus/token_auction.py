@@ -10,10 +10,12 @@ verifies them, and pays every verified token of a period the same price:
 * **Allowances.** Walking the offers from the cheapest, each active hotkey gets up to its capacity until the budget
   is covered. A hotkey is granted a lease while it holds fewer than its allowance.
 * **The price of the moment.** A lease is paid, from its grant, the higher of its holder's own offer and the price of
-  the moment: the offer under which ``PRICE_QUANTILE`` of the leases delivered in the last ``PRICE_WINDOW_SECONDS``
-  were won (each counted at its holder's own offer when granted), never above the dearest offer given work now.
-  Weighted by delivered volume, not by allowances: a second hotkey offering the ceiling for one lease it never
-  delivers no longer sets the price of every lease (``_volume_price``).
+  the moment: the offer under which ``PRICE_QUANTILE`` of the recently delivered leases were won (each counted at its
+  holder's own offer when granted, its weight halving every ``PRICE_HALF_LIFE_SECONDS``), never above the dearest
+  offer given work now. Weighted by delivered volume, not by allowances: a second hotkey offering the ceiling for
+  one lease it never delivers no longer sets the price of every lease (``_volume_price``). The deliveries are those
+  of the job's market (``market_key``: its model, agentic or not), so a new order starts at its market's price; under
+  ``PRICE_MIN_WEIGHT`` of them, a lease is paid its own offer.
 * **Leases not delivered.** A lease that ends without a submission charges its holder its price times the job's
   mean submission size (by the share of its time held on a release), taken back from its next accepted
   submissions (``take_debit``). An expiry, or a release past half its time, halves the holder's capacity for
@@ -65,10 +67,14 @@ ASK_TTL_SECONDS = 3600.0
 ASK_REPOST_SECONDS = 600.0
 # A hotkey counts for the allowances while it asked for a lease this recently, or holds one.
 ACTIVE_SECONDS = 180.0
-# The price of the moment: the offer under which this share of the leases delivered in the window were won.
+# The price of the moment: the offer under which this share of the recently delivered leases were won, each
+# delivery's weight halving every PRICE_HALF_LIFE_SECONDS and dropped past PRICE_HORIZON_SECONDS; with under
+# PRICE_MIN_WEIGHT of them (a few deliveries: their quantile is their dearest), no price of the moment.
 PRICE_QUANTILE = 0.8
-PRICE_WINDOW_SECONDS = 1800.0
-PRICE_DELIVERIES_KEPT = 4096
+PRICE_HALF_LIFE_SECONDS = 300.0
+PRICE_HORIZON_SECONDS = 1800.0
+PRICE_MIN_WEIGHT = 20.0
+PRICE_DELIVERIES_KEPT = 16384
 # The largest ask accepted, in alpha per million tokens (a typo guard; the ceiling decides who works).
 MAX_ASK_ALPHA_PER_MTOKEN = 1e9
 MAX_CAPACITY = 10_000
@@ -89,6 +95,66 @@ SAVE_SECONDS = 5.0
 NO_ASK = "no_ask"
 ASK_ABOVE_PRICE = "ask_above_price"
 ALLOWANCE_FULL = "allowance_full"
+
+
+class Market:
+    """The deliveries of the jobs sold on one market (``market_key``), each at its holder's own offer in alpha per
+    million tokens (the unit every job's offers share): each job's auction records into it and prices from all of
+    it, so a new order starts at its market's price, not at nothing.
+
+    2026-11-16: one history per job left every order's first wave of leases paid each holder's own offer (a short
+    eval, all of its life) and priced the next wave on its first few deliveries."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._jobs: dict[str, collections.deque] = {}    # job -> (delivered at, hotkey, alpha per Mtoken)
+
+    def record(self, job: str, at: float, hotkey: str, alpha: float) -> None:
+        with self._lock:
+            self._jobs.setdefault(job, collections.deque(maxlen=PRICE_DELIVERIES_KEPT)).append(
+                (float(at), str(hotkey), float(alpha)))
+
+    def replace(self, job: str, entries) -> None:
+        with self._lock:
+            self._jobs[job] = collections.deque(((float(t), str(h), float(a)) for t, h, a in entries),
+                                                maxlen=PRICE_DELIVERIES_KEPT)
+
+    def of(self, job: str) -> list[tuple[float, str, float]]:
+        with self._lock:
+            return list(self._jobs.get(job, ()))
+
+    def entries(self, now: float) -> list[tuple[float, str, float]]:
+        """Every job's deliveries within the horizon (older ones dropped)."""
+        with self._lock:
+            kept = []
+            for job in list(self._jobs):
+                entries = self._jobs[job]
+                while entries and now - entries[0][0] > PRICE_HORIZON_SECONDS:
+                    entries.popleft()
+                if not entries:
+                    del self._jobs[job]
+                    continue
+                kept.extend(entries)
+            return kept
+
+
+_MARKETS: dict[str, Market] = {}
+_MARKETS_LOCK = threading.Lock()
+
+
+def market(key: str) -> Market:
+    """The process's market named ``key`` (``market_key``)."""
+    with _MARKETS_LOCK:
+        return _MARKETS.setdefault(str(key), Market())
+
+
+def market_key(job) -> str | None:
+    """A job's market: its model, and whether its work is agentic (episodes) or single turns. None without a
+    model (the job then prices from its own deliveries alone)."""
+    repo = getattr(job, "checkpoint_repo", None)
+    if not repo:
+        return None
+    return f"{repo}|{'episode' if getattr(job, 'episode', None) is not None else 'turn'}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,8 +224,12 @@ class TokenAuction:
     def __init__(self, params: AuctionParams, *, clock: Callable[[], float] = time.time,
                  backlog: Callable[[], int | None] | None = None,
                  holdings: Callable[[], Mapping[str, int]] | None = None,
-                 mean_tokens: float = 1000.0, state_path: str | os.PathLike | None = None) -> None:
+                 mean_tokens: float = 1000.0, state_path: str | os.PathLike | None = None,
+                 market_name: str | None = None, job_id: str = "job") -> None:
         self.params = params
+        # The deliveries this job prices from: its market's, else its own (``Market``).
+        self._market = market(market_name) if market_name is not None else Market()
+        self._job = str(job_id)
         self._clock = clock
         self._backlog = backlog
         self._holdings = holdings
@@ -177,8 +247,6 @@ class TokenAuction:
         self._debt: dict[str, float] = {}
         self._missed: dict[str, list[float]] = {}
         self._deliveries: dict[str, collections.deque] = {}
-        # hotkey -> (delivered at, its own offer when the lease was granted), for the price of the moment.
-        self._delivered: dict[str, collections.deque] = {}
         self._mean_tokens = float(mean_tokens)
         self._state_path = Path(state_path) if state_path is not None else None
         self._saved_at = 0.0
@@ -297,28 +365,28 @@ class TokenAuction:
         return given, marginal
 
     def _volume_price(self, now: float) -> float | None:
-        """The offer under which ``PRICE_QUANTILE`` of the leases delivered in the window were won; None when
-        none was. A hotkey in debt or set aside counts for nothing.
+        """The offer under which ``PRICE_QUANTILE`` of the market's recently delivered leases were won, each
+        weighted by its age; None under ``PRICE_MIN_WEIGHT``. A hotkey in debt or set aside here counts for nothing.
 
         2026-11-16: the price was the dearest offer given an allowance, even of one lease. One operator could
         offer 0 for the budget less one on a hotkey and the ceiling for one lease, never delivered, on another:
         every lease of the first was paid the ceiling. Here raising the price takes delivering a fifth of the work
         at that price, and in a market with enough cheaper offers that work goes to them."""
-        prices = []
-        for hotkey in list(self._delivered):
-            kept = self._delivered[hotkey]
-            while kept and now - kept[0][0] > PRICE_WINDOW_SECONDS:
-                kept.popleft()
-            if not kept:
-                del self._delivered[hotkey]
-                continue
+        weighted = []
+        for at, hotkey, alpha in self._market.entries(now):
             if self._debt.get(hotkey, 0.0) > 0 or self._aside.get(hotkey, -math.inf) > now:
                 continue
-            prices.extend(price for _, price in kept)
-        if not prices:
+            weighted.append((alpha, 0.5 ** (max(0.0, now - at) / PRICE_HALF_LIFE_SECONDS)))
+        total = sum(weight for _, weight in weighted)
+        if total < PRICE_MIN_WEIGHT:
             return None
-        prices.sort()
-        return prices[max(0, math.ceil(PRICE_QUANTILE * len(prices)) - 1)]
+        weighted.sort()
+        reach, summed = PRICE_QUANTILE * total * (1.0 - 1e-9), 0.0
+        for alpha, weight in weighted:
+            summed += weight
+            if summed >= reach:
+                return self.params.share_of(alpha)
+        return self.params.share_of(weighted[-1][0])
 
     def _moment_price(self, now: float, marginal: float | None) -> float | None:
         """The price of the moment: the delivered volume's price, never above the dearest offer given work now."""
@@ -407,8 +475,7 @@ class TokenAuction:
         with self._lock:
             self._deliveries.setdefault(hotkey, collections.deque(maxlen=DELIVERIES_KEPT)).append(float(seconds))
             if offer is not None and math.isfinite(float(offer)) and float(offer) > 0:
-                self._delivered.setdefault(hotkey, collections.deque(maxlen=PRICE_DELIVERIES_KEPT)).append(
-                    (self._clock(), float(offer)))
+                self._market.record(self._job, self._clock(), hotkey, self.params.alpha_of(float(offer)))
             self._changed()
 
     def lease_ended(self, hotkey: str, price: float | None, held_fraction: float) -> None:
@@ -492,7 +559,7 @@ class TokenAuction:
                 "debt": dict(self._debt),
                 "missed": {h: list(t) for h, t in self._missed.items()},
                 "deliveries": {h: list(d) for h, d in self._deliveries.items()},
-                "delivered": {h: [list(e) for e in d] for h, d in self._delivered.items()},
+                "delivered": [list(e) for e in self._market.of(self._job)],
                 "mean_tokens": self._mean_tokens,
             }
 
@@ -506,9 +573,13 @@ class TokenAuction:
             self._missed = {str(h): [float(t) for t in ts] for h, ts in (state.get("missed") or {}).items()}
             self._deliveries = {str(h): collections.deque((float(s) for s in d), maxlen=DELIVERIES_KEPT)
                                 for h, d in (state.get("deliveries") or {}).items()}
-            self._delivered = {str(h): collections.deque(((float(t), float(p)) for t, p in d),
-                                                          maxlen=PRICE_DELIVERIES_KEPT)
-                               for h, d in (state.get("delivered") or {}).items()}
+            delivered = state.get("delivered")
+            if isinstance(delivered, Mapping):
+                # The format of #540 (2026-11-16): per hotkey, (delivered at, offer in pool share per token).
+                delivered = sorted([float(t), str(h), self.params.alpha_of(float(p))]
+                                   for h, entries in delivered.items() for t, p in entries)
+            if isinstance(delivered, list):
+                self._market.replace(self._job, delivered)
             if state.get("mean_tokens") is not None:
                 self._mean_tokens = float(state["mean_tokens"])
 
@@ -559,9 +630,9 @@ def state_path_for(job_id: str) -> Path | None:
 
 def job_auction(params: Mapping | None, *, backlog: Callable[[], int | None] | None = None,
                 clock: Callable[[], float] = time.time, mean_tokens: float = 1000.0,
-                state_path: str | os.PathLike | None = None) -> TokenAuction | None:
+                state_path: str | os.PathLike | None = None, job=None) -> TokenAuction | None:
     """The auction a job's registry params declare, or None (an invalid declaration is logged and not run: the
-    registry refuses it, so this only guards an older registry read)."""
+    registry refuses it, so this only guards an older registry read). ``job``: its spec, which names its market."""
     try:
         declared = auction_params(params)
     except ValueError:
@@ -569,4 +640,5 @@ def job_auction(params: Mapping | None, *, backlog: Callable[[], int | None] | N
         return None
     if declared is None:
         return None
-    return TokenAuction(declared, clock=clock, backlog=backlog, mean_tokens=mean_tokens, state_path=state_path)
+    return TokenAuction(declared, clock=clock, backlog=backlog, mean_tokens=mean_tokens, state_path=state_path,
+                        market_name=market_key(job), job_id=str(getattr(job, "job_id", None) or "job"))
