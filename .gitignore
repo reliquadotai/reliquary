@@ -43,6 +43,10 @@ reliquary-infra/inventory/known_hosts
 /private-subnet-integration/
 *.integration-private.*
 /reports/private/
+/affine-state/
+*.affine-private.json
+*.affine-private.md
+*.affine-private.*
 *.private.*
 
 # Generated ML and research artifacts
