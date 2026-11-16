@@ -5,8 +5,9 @@ One entry per environment Reliquary serves, keyed by the name a task or a job us
 split and who may draw it.
 
 * ``rl``: an RL task draws its prompts or tasks there.
-* ``batch``: a batch job (a corpus job or a generation order, ours or a customer's) generates there; agentic
-  traces come from an episode env's batch rows.
+* ``batch``: our batch jobs (corpus jobs, whose traces may train the model RL trains) generate there; agentic
+  traces come from an episode env's batch rows. A customer's order may also take RL rows: only eval rows are
+  closed to it (``refuse_order_rows``), and keeping its data apart is the customer's call.
 * ``eval``: an evaluation set is built there. Nothing else ever draws an eval row.
 
 An environment's flags are the uses of its rows. Ranges of different uses never overlap, except where an entry
@@ -287,14 +288,17 @@ def uses_split(name: str, split: str, use: str) -> bool:
     return env is not None and bool(env.rows_of(use, split))
 
 
-def inside(name: str, use: str, split: str, start: int, end: int, *, join: bool = True) -> bool:
-    """Whether every row of ``[start, end)`` of ``split`` lies in ``name``'s ``use`` ranges: adjacent ranges join,
-    or, with ``join`` False, inside ONE of them."""
+def inside(name: str, use: str | tuple[str, ...], split: str, start: int, end: int, *, join: bool = True) -> bool:
+    """Whether every row of ``[start, end)`` of ``split`` lies in ``name``'s ranges of ``use`` (one or several
+    uses): adjacent ranges join, or, with ``join`` False, inside ONE of them."""
     env = CATALOG[name]
+    uses = (use,) if isinstance(use, str) else use
+    rows = tuple(r for u in uses for r in env.rows_of(u, split))
+    intervals = _intervals(rows, env.lengths.get(split))
     if not join:
-        return any(lo <= start and end <= hi for lo, hi in _intervals(env.rows_of(use, split), env.lengths.get(split)))
+        return any(lo <= start and end <= hi for lo, hi in intervals)
     covered = start
-    for lo, hi in _intervals(env.rows_of(use, split), env.lengths.get(split)):
+    for lo, hi in intervals:
         if lo <= covered < hi:
             covered = hi
         if covered >= end:
@@ -319,6 +323,20 @@ def refuse_batch_rows(name: str, split: str, start: int, count: int) -> None:
         reach = f"; it reaches the RL share ({rl[0].what})" if rl else ""
         raise ValueError(f"{name!r} serves corpus jobs and generation orders only inside one of its batch ranges "
                          f"(the catalog's corpus ranges: {ranges}); [{start}, {end}) is not inside one{reach}")
+
+
+def refuse_order_rows(name: str, split: str, start: int, count: int) -> None:
+    """A customer's order (a generation order through the order API) names its own rows: any rows of the
+    catalog's RL or batch ranges, never eval rows. Keeping its training data apart from its own runs is the
+    customer's call. Our corpus jobs keep ``refuse_batch_rows``. ValueError otherwise; an env outside the catalog
+    is not judged here."""
+    env = CATALOG.get(name)
+    if env is None:
+        return
+    end = int(start) + int(count)
+    if not inside(name, ("rl", "batch"), split, int(start), end):
+        raise ValueError(f"{name!r} split {split!r}: an order's rows [{start}, {end}) must lie in its RL or batch "
+                         "rows (the environment catalog); eval rows are never generated for an order")
 
 
 def refuse_rl_rows(name: str, split: str, intervals: list[tuple[int, int]], *, whole_split: bool) -> None:
@@ -367,4 +385,4 @@ check_catalog()
 
 __all__ = ["ANY_SPLIT", "CATALOG", "CATALOG_SCHEMA", "LEGACY_ENVIRONMENTS", "USES", "CatalogEnv", "Rows",
            "catalog_document", "check_catalog", "entry", "inside", "package_name", "refuse_batch_rows",
-           "refuse_rl_rows", "uses_split"]
+           "refuse_order_rows", "refuse_rl_rows", "uses_split"]

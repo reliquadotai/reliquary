@@ -21,7 +21,7 @@ environment (`reliquary_code_v1`, `envscaler_tools_v2`) or an episode package (`
 | use     | who draws it                                                                 |
 |---------|------------------------------------------------------------------------------|
 | `rl`    | an RL task (prompts, or tasks of an episode env)                              |
-| `batch` | a corpus job or a generation order, ours or a customer's; agentic traces too |
+| `batch` | our corpus jobs (their traces may train the model RL trains); agentic traces too |
 | `eval`  | an evaluation set; nothing else ever draws an eval row                        |
 
 An environment's flags are the uses of its rows. Eval rows overlap nothing. RL and batch rows overlap only
@@ -47,8 +47,10 @@ this), so a new environment ships with a decision on what it serves.
 
 Behaviour changes, all in the refusing direction:
 
-* a batch job on `reliquary_code_v1`, `reliquary_hard_math_v1` or `reliquary_instruction_following_v1` takes
-  only its batch rows (the corpus jobs' share); their RL rows are RL's;
+* our corpus jobs on `reliquary_code_v1`, `reliquary_hard_math_v1` or `reliquary_instruction_following_v1`
+  take only their batch rows; their RL rows are RL's;
+* a customer's order (the admin order route, generation qualifications) names its own rows: any RL or batch
+  rows, never eval rows (`refuse_order_rows`); keeping its training data apart is the customer's call;
 * RL on `reliquary_telecom_solo_v2` draws only its RL share `[1220, 1713)`;
 * an RL episode block on a package outside the catalog, on a split without RL rows, or over rows outside the
   RL ranges (no `rows` on SWE's shared train split) is refused;
@@ -73,8 +75,6 @@ Behaviour changes, all in the refusing direction:
 
 ## Open decisions
 
-* TMax has no batch share: `tmax_rl` is RL's and `tmax_sft` is the terminal eval. Agentic batch on TMax needs
-  part of `tmax_rl` moved to batch.
+* TMax has no batch share for our own SFT: `tmax_rl` is RL's and `tmax_sft` is the terminal eval. A
+  customer's order may draw `tmax_rl` once agentic orders serve training splits.
 * The `shared` rulings (DAPO math, science, logic v2, general) keep today's behaviour; each wants a split.
-* Customer batch orders draw the same batch rows as our corpus jobs, so a customer order can no longer reach
-  our RL rows. That costs customers rows on code, hard math and IF; a separate customer share is possible.

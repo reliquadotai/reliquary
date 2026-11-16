@@ -230,7 +230,7 @@ def new_generation_request(*, qualification_id: str, model: str, revision: str, 
                            prompt_start: int, problems: int, sampling: dict,
                            max_new_tokens: int, thinking: bool,
                            completions: int = QUALIFY_COMPLETIONS, clock=time.time) -> dict:
-    from reliquary.eval.sets import refuse_held_out_overlap
+    from reliquary.eval.sets import refuse_order_overlap
     from reliquary.protocol.environment_catalog import ENVIRONMENT_CATALOG
 
     refusal = order_environment_refusal(env)
@@ -239,7 +239,7 @@ def new_generation_request(*, qualification_id: str, model: str, revision: str, 
     if int(prompt_start) < 0:
         raise ValueError("prompt_start must not be negative")
     # The held-out rows of the eval sets are never generated for an order.
-    refuse_held_out_overlap(env, int(prompt_start), int(problems))
+    refuse_order_overlap(env, int(prompt_start), int(problems))
     record = new_request(qualification_id=qualification_id, model=model, revision=revision,
                          set_id="", problems=problems, sampling=sampling,
                          max_new_tokens=max_new_tokens, thinking=thinking,

@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from reliquary.env_catalog import CATALOG, CatalogEnv, Rows, refuse_batch_rows
+from reliquary.env_catalog import CATALOG, CatalogEnv, Rows, refuse_batch_rows, refuse_order_rows
 from reliquary.eval.prompt_source import REFERENCE_INTERACTIONS
 
 SET_SCHEMA = "reliquary/eval-set/v1"
@@ -208,6 +208,19 @@ def refuse_held_out_overlap(source: str, prompt_start: int, prompt_count: int) -
                 f"rows [{reserved.start}, {reserved.end}) of {source!r} are the RL share "
                 f"({reserved.what}); this job's [{job.start}, {job.end}) reaches them"
             )
+
+
+def refuse_order_overlap(source: str, prompt_start: int, prompt_count: int) -> None:
+    """A customer's generation order (train split) names its own rows: any but the rows an eval set holds out
+    (``env_catalog.refuse_order_rows``). Our corpus jobs go through ``refuse_held_out_overlap``."""
+    job = UsedRange("order", source, RL_SPLIT, int(prompt_start), int(prompt_count), "order")
+    for held in HELD_OUT.values():
+        if lineage(source)[1] == lineage(held.source)[1] and overlaps(job, held.region):
+            raise ValueError(
+                f"rows [{held.start}, {held.region.end}) of {source!r} are held out for the "
+                f"{held.env!r} evaluation set; this order's [{job.start}, {job.end}) reaches them"
+            )
+    refuse_order_rows(source, RL_SPLIT, int(prompt_start), int(prompt_count))
 
 
 def _disjointness(held: HeldOut) -> dict:

@@ -95,7 +95,7 @@ def test_the_held_out_regions_are_the_catalogs_eval_rows():
 # --- the two gaps the catalog closes -------------------------------------------------------------------------
 
 
-def test_a_batch_on_code_never_takes_rl_rows():
+def test_our_corpus_jobs_on_code_never_take_rl_rows():
     from reliquary.eval.sets import refuse_held_out_overlap
 
     refuse_held_out_overlap("reliquary_code_v1", 0, 200_000)
@@ -105,12 +105,29 @@ def test_a_batch_on_code_never_takes_rl_rows():
         refuse_held_out_overlap("reliquary_code_v1", 199_990, 20)
 
 
-def test_a_generation_order_on_code_never_takes_rl_rows():
+def test_a_customer_order_names_any_rows_but_eval_rows():
+    """Keeping its training data apart is the customer's call: RL rows are open to an order, eval rows never."""
+    from reliquary.eval.sets import refuse_order_overlap
+
+    refuse_order_overlap("reliquary_code_v1", 500_000, 1_000)              # RL rows
+    refuse_order_overlap("reliquary_code_v1", 199_000, 2_000)              # batch then RL rows
+    refuse_order_overlap("reliquary_hard_math_v1", 20_000, 100)
+    with pytest.raises(ValueError, match="held out"):
+        refuse_order_overlap("reliquary_code_v1", 2_381_000, 1_000)
+    with pytest.raises(ValueError, match="RL or batch rows"):
+        refuse_order_overlap("reliquary_hard_math_v1", 23_000, 1_000)     # past the split
+
+
+def test_a_generation_order_takes_rl_rows_but_never_eval_rows():
     from reliquary.eval.qualification import new_generation_request
 
-    with pytest.raises(ValueError, match="RL share"):
+    record = new_generation_request(qualification_id="q", model="m", revision="r", env="reliquary_code_v1",
+                                    prompt_start=500_000, problems=8, sampling={}, max_new_tokens=16,
+                                    thinking=False)
+    assert record["prompt_start"] == 500_000
+    with pytest.raises(ValueError, match="held out"):
         new_generation_request(qualification_id="q", model="m", revision="r", env="reliquary_code_v1",
-                               prompt_start=500_000, problems=8, sampling={}, max_new_tokens=16,
+                               prompt_start=2_400_000, problems=8, sampling={}, max_new_tokens=16,
                                thinking=False)
 
 

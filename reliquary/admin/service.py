@@ -948,9 +948,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 raise HTTPException(status_code=422, detail=refusal)
             await refuse_past_the_source(body.env, body.prompt_start, body.prompt_count)
             try:
-                from reliquary.eval.sets import refuse_held_out_overlap
+                from reliquary.eval.sets import refuse_order_overlap
 
-                refuse_held_out_overlap(body.env, body.prompt_start, body.prompt_count)
+                refuse_order_overlap(body.env, body.prompt_start, body.prompt_count)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             prompt_source, contract_environment = body.env, None
