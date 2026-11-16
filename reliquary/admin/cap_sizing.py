@@ -1,9 +1,11 @@
-"""Order caps sized to what an order can pay (docs/design/2026-11-11-order-cap-sizing-design.md).
+"""Order caps that follow what an order really pays (docs/design/2026-11-11-order-cap-sizing-design.md).
 
-An order job pays at most its price ceiling times the tokens its audit cards let through: a card audits so
-many tokens a second, and only the audited share ``audit_q`` of the paid records uses it. Its cap is that
-bound with headroom, under the cap the platform asked for (``cap_max``), so the registry's sum of caps
-counts what orders can pay, not a fixed share each.
+The settler pays a period with the cap a task holds when that period settles, so a cap need not be reserved
+ahead: it follows the order's pay pace (its open period's accrued value projected over the whole period, and
+what its last periods paid) with headroom, resized every few minutes. Two bounds sit above it: what its audit
+cards let through (a card audits so many tokens a second; only the audited share ``audit_q`` of the paid
+records uses it) and the cap the platform asked for (``cap_max``). A new order starts small (``START_CAP``,
+or less when its whole order is worth less) and rises with its pay.
 """
 
 from __future__ import annotations
@@ -28,6 +30,10 @@ STATUS_MAX_AGE_SECONDS = 600.0
 RESIZE_SECONDS = 300.0
 # A resize smaller than this share of the current cap is not written.
 RESIZE_MIN_CHANGE = 0.1
+# A new order's cap (or one paying nothing yet): its pay raises it within a resize or two.
+START_CAP = 0.02
+# Early in a period, its accrued value is projected over at least this share of the period: at most x4.
+MIN_ELAPSED_SHARE = 0.25
 
 
 def sizing_enabled(env: Mapping[str, str] | None = None) -> bool:
@@ -59,15 +65,32 @@ def spend_estimate(params: Mapping, *, completion_tps: float, prompt_tps: float,
     return per_second * cp.PERIOD_SECONDS * max(1, int(cards)) / audit_q
 
 
+def period_share(now: float, genesis: float = cp.PERIOD_EPOCH) -> float:
+    """How much of the current period has passed, in [0, 1)."""
+    return ((float(now) - float(genesis)) % cp.PERIOD_SECONDS) / cp.PERIOD_SECONDS
+
+
+def order_value(params: Mapping, tokens: int) -> float | None:
+    """The most a whole order can pay, in pool share: ``tokens`` at its price ceiling; None without one."""
+    price = cp.max_price(params)
+    return None if price is None else float(tokens) * price
+
+
 def sized_cap(cap_max: float, *, estimate: float, recent_paid: Sequence[float] = (),
-              open_value: float | None = None) -> float:
-    """What the order may pay a period, with headroom: never under what it paid lately or has accrued in
-    a period still open, never over ``cap_max``."""
-    need = max(estimate, max(recent_paid, default=0.0), open_value or 0.0) * HEADROOM
-    return min(float(cap_max), max(CAP_FLOOR, need))
+              open_value: float | None = None, elapsed: float = 1.0, start: float = START_CAP) -> float:
+    """What the order may pay a period, never over ``cap_max``: headroom over what it paid in its last
+    periods and has accrued in an open one (the settler pays that period with this cap), and over its open
+    period's accrued value projected over the whole period (``elapsed`` of it has passed), or ``start``
+    while it pays nothing. Only the projection and the start are bounded by what its audit lets through
+    (``estimate``): what it really paid always counts."""
+    accrued = open_value or 0.0
+    paid = max(max(recent_paid, default=0.0), accrued)
+    projected = accrued / max(MIN_ELAPSED_SHARE, elapsed)
+    ahead = projected * HEADROOM if projected > 0 else (start if paid == 0 else 0.0)
+    return min(float(cap_max), max(CAP_FLOOR, paid * HEADROOM, min(ahead, estimate * HEADROOM)))
 
 
-def resized(params: Mapping, sizing: Mapping, status: Mapping) -> float | None:
+def resized(params: Mapping, sizing: Mapping, status: Mapping, now: float) -> float | None:
     """A job's new cap from the control's ``sizing`` entry, or None when it should stay (no ceiling, no
     requested cap, or a change under RESIZE_MIN_CHANGE)."""
     cap_max = params.get(CAP_MAX_PARAM)
@@ -79,7 +102,7 @@ def resized(params: Mapping, sizing: Mapping, status: Mapping) -> float | None:
     if estimate is None:
         return None
     cap = sized_cap(float(cap_max), estimate=estimate, recent_paid=sizing.get("recent_paid") or (),
-                    open_value=sizing.get("open_value"))
+                    open_value=sizing.get("open_value"), elapsed=period_share(now))
     current = float(params["cap"])
     if current > 0 and abs(cap - current) < RESIZE_MIN_CHANGE * current:
         return None

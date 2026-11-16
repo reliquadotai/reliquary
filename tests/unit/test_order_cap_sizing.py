@@ -34,12 +34,41 @@ def test_a_card_lets_through_its_audit_rate_divided_by_the_audited_share():
     assert sizing.spend_estimate({"audit_q": 1.0}, completion_tps=1000, prompt_tps=0, cards=1) is None
 
 
-def test_the_cap_has_headroom_over_what_was_paid_or_accrued_within_the_asked_cap():
-    assert sizing.sized_cap(0.25, estimate=0.01) == pytest.approx(0.015)
-    assert sizing.sized_cap(0.25, estimate=0.01, recent_paid=[0.004, 0.03]) == pytest.approx(0.045)
-    assert sizing.sized_cap(0.25, estimate=0.01, open_value=0.02) == pytest.approx(0.03)
-    assert sizing.sized_cap(0.25, estimate=1.0) == 0.25
+def test_the_cap_follows_what_the_order_pays_not_what_its_audit_could_let_through():
+    # 2026-11-16: a $8.77 Batch order reserved 0.25 (its audit card could let 0.86 a period through) while
+    # it accrued 0.032. Its cap now follows its pay: the open period's accrued value projected over the
+    # period, with headroom.
+    assert sizing.sized_cap(0.25, estimate=0.86, open_value=0.032, elapsed=0.5) == pytest.approx(0.096)
+    # What its last periods paid, with headroom.
+    assert sizing.sized_cap(0.25, estimate=1.0, recent_paid=[0.004, 0.03]) == pytest.approx(0.045)
+    # Early in a period the projection is at most x4.
+    assert sizing.sized_cap(0.25, estimate=1.0, open_value=0.01, elapsed=0.01) == pytest.approx(0.06)
+    # Never over the asked cap.
+    assert sizing.sized_cap(0.25, estimate=1.0, recent_paid=[0.5]) == 0.25
+
+
+def test_a_new_order_starts_small_within_its_audit():
+    assert sizing.sized_cap(0.25, estimate=1.0) == sizing.START_CAP
+    assert sizing.sized_cap(0.25, estimate=1.0, start=0.005) == 0.005
+    assert sizing.sized_cap(0.25, estimate=0.002) == pytest.approx(0.003)
     assert sizing.sized_cap(0.25, estimate=0.0) == sizing.CAP_FLOOR
+
+
+def test_what_the_order_really_paid_counts_past_its_audit_estimate():
+    # The projection is bounded by the audit; pay already earned is not (the settler pays it with this cap).
+    assert sizing.sized_cap(0.25, estimate=0.01, recent_paid=[0.03]) == pytest.approx(0.045)
+    assert sizing.sized_cap(0.25, estimate=0.01, open_value=0.02, elapsed=0.5) == pytest.approx(0.03)
+
+
+def test_the_period_share_is_the_time_passed_in_the_current_period():
+    start = cp.PERIOD_EPOCH + 7 * cp.PERIOD_SECONDS
+    assert sizing.period_share(start) == 0.0
+    assert sizing.period_share(start + cp.PERIOD_SECONDS / 4) == pytest.approx(0.25)
+
+
+def test_an_order_is_worth_its_tokens_at_its_ceiling():
+    assert sizing.order_value(PRICE, 1_000_000) == pytest.approx(0.004)
+    assert sizing.order_value({}, 1_000_000) is None
 
 
 def test_an_unmeasured_model_is_sized_on_the_high_defaults():
@@ -55,9 +84,11 @@ def test_a_resize_under_the_minimum_change_is_not_written():
     params = {**PRICE, "audit_q": 1.0, "cap": 0.015, sizing.CAP_MAX_PARAM: 0.25}
     status = {"models": {"m@r": {"audit_tokens_per_second": 10.0, "audit_prompt_tokens_per_second": 0.0}}}
     facts = {"model": "m@r", "audit_executors": 1, "recent_paid": [0.0101], "open_value": 0.0}
-    assert sizing.resized(params, facts, status) is None           # 0.01515: within 10 %
-    assert sizing.resized(params, {**facts, "recent_paid": [0.03]}, status) == pytest.approx(0.045)
-    assert sizing.resized({k: v for k, v in params.items() if k != sizing.CAP_MAX_PARAM}, facts, status) is None
+    now = cp.PERIOD_EPOCH
+    assert sizing.resized(params, facts, status, now) is None           # 0.01515: within 10 %
+    assert sizing.resized(params, {**facts, "recent_paid": [0.03]}, status, now) == pytest.approx(0.045)
+    assert sizing.resized({k: v for k, v in params.items() if k != sizing.CAP_MAX_PARAM}, facts, status,
+                          now) is None
 
 
 def test_the_switch_is_on_or_unset():
@@ -116,7 +147,10 @@ def test_an_order_is_declared_at_its_sized_cap_with_the_asked_cap_kept(
     assert created.status_code == 201, created.text
     params = admin.registry["entries"]["order-eval-p1"].params
     estimate = (100 * cp.max_price(params) + 50 * cp.max_input_price(params)) * cp.PERIOD_SECONDS
-    assert params["cap"] == pytest.approx(max(sizing.CAP_FLOOR, estimate * sizing.HEADROOM))
+    # It starts at no more than its audit lets through, nor than its whole order (5 x 4 x 512 tokens) is worth.
+    value = sizing.order_value(params, 5 * 4 * 512)
+    assert params["cap"] == pytest.approx(max(sizing.CAP_FLOOR, min(
+        sizing.START_CAP, value * sizing.HEADROOM, estimate * sizing.HEADROOM)))
     assert params["cap"] < 0.25 and params["floor"] == params["cap"]
     assert params[sizing.CAP_MAX_PARAM] == 0.25
     # A replay names the asked cap: the same order, not another contract.
@@ -144,6 +178,7 @@ def test_an_unreadable_status_sizes_on_the_defaults(admin, pins, rates, monkeypa
 
 def test_the_resize_follows_what_the_order_pays(admin, pins, rates, control, monkeypatch):  # noqa: F811
     monkeypatch.setenv(sizing.SIZING_ENV, "on")
+    monkeypatch.setattr(sizing, "period_share", lambda now: 0.5)
     control["document"] = _rates_status()
     assert admin("POST", "/admin/v1/jobs", _order(cap=0.25, max_price_usd_per_mtoken=CEILING)).status_code == 201
     first = admin.registry["entries"]["order-eval-p1"].params["cap"]
