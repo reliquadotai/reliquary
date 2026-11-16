@@ -176,6 +176,70 @@ def audit_group(model: Any, group):
             model.train()
 
 
+def diagnostics_from_rows(*, match, gap, stochastic, offsets, boundary_epsilon: float):
+    """``SeedConsistencyDiagnostics`` (Gumbel draw) from a gateway's per drawn position rows: ``match`` (the pick is
+    the miner's token), ``gap`` (Gumbel score gap, 0 when matched), ``stochastic`` (max p < the threshold),
+    ``offsets`` (draw index). The miss is ``forced_sampling``'s ``1 - exp(-gap)``."""
+    import math
+
+    from reliquary.environment.forced_sampling import _FAR_MISS, SeedConsistencyDiagnostics
+
+    miss = [0.0 if m else -math.expm1(-float(g)) for m, g in zip(match, gap, strict=True)]
+    exact = [bool(m) for m in match]
+    stoch = [bool(s) for s in stochastic]
+    hard = [not (e or x <= boundary_epsilon) for e, x in zip(exact, miss)]
+    first = [o for o, h in zip(offsets, hard) if h]
+    if not miss:
+        return SeedConsistencyDiagnostics()
+    return SeedConsistencyDiagnostics(
+        n_positions=len(miss), n_stochastic=sum(stoch), n_exact_match=sum(s and e for s, e in zip(stoch, exact)),
+        n_boundary_match=len(miss) - sum(hard), n_hard_mismatch=sum(hard),
+        n_deterministic_hard_mismatch=sum(h and not s for h, s in zip(hard, stoch)),
+        n_miss_gt_0_01=sum(x > 0.01 for x in miss), n_miss_gt_0_05=sum(x > 0.05 for x in miss),
+        n_miss_gt_0_10=sum(x > 0.10 for x in miss), max_cdf_miss=max(miss),
+        first_hard_mismatch_offset=min(first) if first else None, n_drawn_exact_match=sum(exact),
+        last_miss=miss[-1], n_far_miss=sum(x > _FAR_MISS for x in miss))
+
+
+def gateway_audit(client, *, eos_ids) -> Callable:
+    """``TrainerAudits``' ``audit_fn`` on a Miles gateway (``RELIQUARY_TRAINER_BACKEND=miles``): one ``forward`` of the
+    group with the ``reliquary_gate`` loss (a forward trains nothing and is never backed out), its per-position rows
+    turned into the verifier's diagnostics, then ``rl_audit.judge``."""
+    from reliquary.environment.forced_sampling import DRAW_GUMBEL_MAX
+    from reliquary.trainer.async_trainer import training_group
+    from reliquary.trainer.miles_datums import _draw_positions, rollout_datum
+    from reliquary.validator.rl_audit import judge
+    from reliquary.validator.verifier import draw_settings
+
+    settings = draw_settings()
+    if settings.draw != DRAW_GUMBEL_MAX or settings.top_k not in (0, -1) or settings.top_p < 1.0:
+        raise RuntimeError("the gateway audit implements the unwarped Gumbel draw only")
+    config = {"eos_ids": ",".join(str(int(t)) for t in eos_ids)} if eos_ids else {}
+    if float(settings.t) != 1.0:
+        config["temperature"] = float(settings.t)
+
+    def values(x):
+        return x.tolist() if hasattr(x, "tolist") else list(x)
+
+    def audit(_model, group):
+        uniforms = [group.draw_uniforms(i) for i in range(len(group.completions))]
+        rollouts = training_group(group, slot0=0, index=0, uniforms=uniforms).rollouts
+        outputs = client.forward([rollout_datum(r, 0.0, 0) for r in rollouts], "reliquary_gate",
+                                 config).result().loss_fn_outputs
+        found = []
+        for rollout, output in zip(rollouts, outputs, strict=True):
+            p = int(rollout.commit["rollout"]["prompt_length"])
+            drawn = _draw_positions(rollout)
+            rows = [p + q - 1 for _, q in drawn]
+            match, gap, stoch = values(output["match"]), values(output["gap"]), values(output["stochastic"])
+            found.append(diagnostics_from_rows(
+                match=[match[j] for j in rows], gap=[gap[j] for j in rows], stochastic=[stoch[j] for j in rows],
+                offsets=[t for t, _ in drawn], boundary_epsilon=settings.boundary_epsilon))
+        return judge(found)
+
+    return audit
+
+
 def broadcasting_audit(channel, audit_fn: Callable = audit_group) -> Callable:
     """Rank 0's audit under FSDP2: the followers run the same forward on the same group."""
 
@@ -234,5 +298,6 @@ class TrainerAudits:
         return out
 
 
-__all__ = ["TrainerAudits", "audit_group", "broadcasting_audit", "group_diagnostics", "head_projection",
+__all__ = ["TrainerAudits", "audit_group", "broadcasting_audit", "diagnostics_from_rows", "gateway_audit",
+           "group_diagnostics", "head_projection",
            "rollout_diagnostics"]
