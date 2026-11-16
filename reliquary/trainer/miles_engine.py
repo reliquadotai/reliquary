@@ -121,7 +121,7 @@ def expected_weight_keys(model_dir) -> set[str]:
 
 class MilesState:
     """``AsyncTrainer``'s ``state_fn``: the gateway exports the weights (``save_weights_for_sampler``, HF safetensors
-    under ``<checkpoint_root>/<model_id>/sampler_weights/<name>/hf`` on this box's disk), loaded on CPU. The names
+    under ``<checkpoint_root>/**/<model_id>/sampler_weights/<name>/hf`` on this box's disk), loaded on CPU. The names
     must be exactly the HF model's (what miners load), or nothing is published. Exports older than the previous one
     are deleted through ``delete(tinker_path)``."""
 
@@ -135,15 +135,17 @@ class MilesState:
         self.n, self.paths = 0, []
 
     def __call__(self) -> dict:
-        from pathlib import Path
-
         from safetensors.torch import load_file
 
         name = f"snapshot-{self.n}"
         self.n += 1
         path = self.client.save_weights_for_sampler(name).result().path
         model_id, kind, _ = path.removeprefix("tinker://").split("/", 2)
-        hf = Path(self.root / model_id / kind / name).resolve() / "hf"
+        # the launcher nests the gateway's checkpoint root under its output dir (``checkpoints/<run id>``)
+        found = sorted(self.root.glob(f"**/{model_id}/{kind}/{name}"))
+        if len(found) != 1:
+            raise RuntimeError(f"gateway export {path}: {len(found)} matches under {self.root}")
+        hf = found[0].resolve() / "hf"
         state: dict = {}
         for shard in sorted(hf.glob("*.safetensors")):
             state.update(load_file(str(shard), device="cpu"))

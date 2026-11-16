@@ -73,3 +73,10 @@ def test_expected_keys_from_index_or_single_file(tmp_path):
     (tmp_path / "b").mkdir()
     save_file({"z": torch.zeros(2)}, tmp_path / "b" / "model.safetensors")
     assert expected_weight_keys(tmp_path / "b") == {"z"}
+
+
+def test_export_found_under_the_launchers_run_dir(tmp_path):
+    run_root = tmp_path / "checkpoints" / "run-20261116"         # the launcher's --tinker-checkpoint-root
+    run_root.mkdir(parents=True)
+    state = MilesState(Exporter(run_root), checkpoint_root=tmp_path, expected_keys=set(KEYS), delete=lambda p: None)
+    assert set(state()) == set(KEYS)
