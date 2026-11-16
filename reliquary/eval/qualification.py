@@ -188,10 +188,15 @@ def request_fields(record: dict) -> tuple[str, ...]:
 
 
 # The sources a generation order may draw from, by name: a new packaged
-# source is a decision, never enabled by its shape alone.
-ORDER_ENVIRONMENTS = frozenset({
-    "reliquary_logic_v2", "reliquary_dapo_math_v1",
-    "reliquary_instruction_following_v1", "reliquary_code_v1"})
+# source is a decision, never enabled by its shape alone (the environment
+# catalog's ``orders`` flag).
+def _order_environments() -> frozenset[str]:
+    from reliquary.env_catalog import CATALOG
+
+    return frozenset(name for name, env in CATALOG.items() if env.orders)
+
+
+ORDER_ENVIRONMENTS = _order_environments()
 
 
 def order_environment_refusal(env: str) -> str | None:

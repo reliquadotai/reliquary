@@ -1215,6 +1215,25 @@ def envs_list() -> None:
         )
 
 
+@envs_app.command("uses")
+def envs_uses(
+    as_json: bool = typer.Option(False, "--json", help="The document the platform reads"),
+) -> None:
+    """What each environment serves (RL, eval, batch), split by split (reliquary.env_catalog)."""
+    from reliquary.env_catalog import CATALOG, catalog_document
+
+    if as_json:
+        typer.echo(json.dumps(catalog_document(), indent=1, sort_keys=True))
+        return
+    for name in sorted(CATALOG):
+        env = CATALOG[name]
+        typer.echo(f"{name:<38} {env.kind:<12} {','.join(sorted(env.uses)):<16} {env.description}")
+        for rows in env.rows:
+            end = "end" if rows.end is None else rows.end
+            live = "" if rows.live else "  (not served yet)"
+            typer.echo(f"    {rows.use:<6} {rows.split:<10} [{rows.start}, {end}){live}  {rows.what[:70]}")
+
+
 @envs_app.command("show")
 def envs_show(name: str = typer.Argument(...)) -> None:
     """One catalog body as JSON, with its digest, provenance and tunable fields."""

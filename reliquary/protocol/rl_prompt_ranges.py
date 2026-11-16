@@ -4,6 +4,7 @@ A service task's window offers miners one contiguous ``[start, end)`` slice per
 environment; the validator publishes it in its miner state and refuses any
 prompt outside it. Without an entry the whole train split is offered.
 
+The ranges are the environment catalog's RL rows (``reliquary.env_catalog``).
 An entry exists where the train split is shared with something RL must not
 repeat: rows a distillation corpus already consumed (the policy was trained on
 their answers), or rows an evaluation set holds out. Each one records the split
@@ -35,28 +36,26 @@ class RlPromptRange:
     why: str
 
 
-RL_PROMPT_RANGES: dict[str, RlPromptRange] = {
-    "reliquary_hard_math_v1": RlPromptRange(
-        15_749, None, 23_227,
-        "Rows [0, 15749) (tiers 1 and 2) are the hard-math corpus jobs' prompts; the "
-        "third tier is RL's."),
-    "reliquary_instruction_following_v1": RlPromptRange(
-        20_000, None, 29_435,
-        "Rows [0, 20000) are the instruction-following corpus job's prompts."),
-    "reliquary_code_v1": RlPromptRange(
-        200_000, 2_381_806, 2_481_806,
-        "Rows [0, 200000) are the two code corpus jobs' prompts, and the last 100,000 "
-        "rows are the code evaluation set (reliquary.eval.sets.HELD_OUT)."),
-    "reliquary_competitive_code_v1": RlPromptRange(
-        4_181, 6_899, 8_792,
-        "Train is SFT [0, 4181), RL [4181, 6899), then the v1.1 problems [6899, 8792), "
-        "all SFT (the package's layout.use_ranges); the SFT rows are the competitive-code "
-        "corpus jobs' prompts."),
-    "envscaler_tools_v2": RlPromptRange(
-        0, 1_296, 7_825,
-        "The scenarios are split by world (the package's corpus layout): RL [0, 1296), 26 "
-        "worlds no SFT row comes from; the rest are the SFT ranges and the corpus jobs' prompts."),
-}
+def _catalog_ranges() -> dict[str, RlPromptRange]:
+    """The single-turn and suite environments whose RL rows are part of their train split
+    (``reliquary.env_catalog``: one RL range, cut against the pinned train length)."""
+    from reliquary.env_catalog import CATALOG
+
+    out: dict[str, RlPromptRange] = {}
+    for env in CATALOG.values():
+        if env.kind == "episode":
+            continue
+        rl = env.rows_of("rl", "train")
+        if not rl or any(r.covers_split() for r in rl):
+            continue
+        if len(rl) != 1 or "train" not in env.lengths:
+            raise ValueError(f"{env.name}: RL rows of train are one range cut against a pinned length")
+        (rows,) = rl
+        out[env.name] = RlPromptRange(rows.start, rows.end, env.lengths["train"], rows.what)
+    return out
+
+
+RL_PROMPT_RANGES: dict[str, RlPromptRange] = _catalog_ranges()
 
 
 # Environments whose RL rows knowingly include corpus rows, each with why. The

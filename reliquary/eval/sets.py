@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from reliquary.env_catalog import CATALOG, CatalogEnv, Rows, refuse_batch_rows
 from reliquary.eval.prompt_source import REFERENCE_INTERACTIONS
 
 SET_SCHEMA = "reliquary/eval-set/v1"
@@ -82,115 +83,37 @@ CORPUS_RANGES: tuple[UsedRange, ...] = (
               "competitive-code-v2-qwen38-27b-v1"),
 )
 
-# reliquary_telecom_solo_v2 0.2.0a1 (reliquary-environments c72f918) lays
-# train out SFT first then RL, as its environment.toml `[data]` declares
-# (train_sft_start/count, train_rl_start/count; the package's
-# `layout.use_range`), as (start, count). Its 134 tau2-bench benchmark tickets
-# are a split of their own, `benchmark`, never train.
-TELECOM_SOLO_V2_SFT = (0, 1220)
-TELECOM_SOLO_V2_RL = (1220, 493)
+
+def _catalog_rows(use: str) -> list[tuple[CatalogEnv, Rows]]:
+    return [(env, rows) for env in CATALOG.values() for rows in env.rows if rows.use == use]
+
 
 # Rows a source keeps for RL alone: no corpus job may take them, whatever it
-# declares. reliquary_competitive_code_v1 shares train by problem identity
-# (the package's `layout.use_of`), SFT first then RL, as its environment.toml
-# `[data]` declares: SFT [0, 4181), RL [4181, 6899). v1.1
-# (ReliquaryForge/competitive-code-curated@4ae52941, reliquary-environments
-# 63f1d02) appends 1,893 problems, all SFT, after the v1 rows: SFT also
-# [6899, 8792). The v1 rows, and so the RL share, are unchanged.
-#
-# envscaler_tools_v2 splits by world: its RL worlds' scenarios are [0, 1296),
-# restated from `envscaler_tools_v2.environment.RL_RANGE` (a test holds the
-# two equal).
-RL_ONLY_RANGES: tuple[UsedRange, ...] = (
-    UsedRange("rl", "reliquary_competitive_code_v1", "train", 4181, 2718,
-              "competitive-code RL share"),
-    UsedRange("rl", "reliquary_telecom_solo_v2", "train", *TELECOM_SOLO_V2_RL,
-              "telecom v2 RL share"),
-    UsedRange("rl", "envscaler_tools_v2", "train", 0, 1296,
-              "envscaler RL worlds"),
+# declares. The environment catalog's RL rows, where the environment has no
+# ruling that RL and batch share them (``reliquary.env_catalog``).
+RL_ONLY_RANGES: tuple[UsedRange, ...] = tuple(
+    UsedRange("rl", env.name, rows.split, rows.start, rows.count, rows.what or "RL share")
+    for env, rows in _catalog_rows("rl")
+    if env.shared is None and not rows.covers_split()
 )
 
 # Sources a corpus job may take only part of: its range must lie inside ONE of
-# these. reliquary_general_v1 lays train out as (block, thinking mode)
-# segments, each opening with its single-turn rows (one user message, no
-# tools, no system message). Stage A serves those rows of chat, safety, ifeval
-# and structured, one segment per job (one renderer); multi-turn, tool and
-# task-system rows, clarification and identity wait for stage B, which renders
-# messages and tools. Counts from the package's `segments()` at
-# ReliquaryForge/general-prompts-curated@02b3ef7a.
-#
-# An empty tuple serves no corpus job: reliquary_telecom_solo_v1's train split
-# still holds the benchmark tickets, so telecom is distilled from v2's SFT
-# share only.
+# these (the catalog's batch rows of train; an empty tuple serves no corpus
+# job). Enforced through ``env_catalog.refuse_batch_rows``, which joins
+# adjacent ranges; kept as UsedRange for the cards that list them.
 CORPUS_SERVABLE_RANGES: dict[str, tuple[UsedRange, ...]] = {
-    "reliquary_telecom_solo_v1": (),
-    "reliquary_telecom_solo_v2": (
-        UsedRange("corpus", "reliquary_telecom_solo_v2", "train", *TELECOM_SOLO_V2_SFT,
-                  "telecom v2 SFT share"),
-    ),
-    "reliquary_general_v1": tuple(
-        UsedRange("corpus", "reliquary_general_v1", "train", start, stop - start,
-                  f"{segment} single-turn (stage A)")
-        for segment, start, stop in (
-            ("chat/direct", 0, 30_141),
-            ("chat/thinking", 30_141, 51_965),
-            ("ifeval/direct", 66_291, 70_971),
-            ("ifeval/thinking", 71_720, 82_808),
-            ("structured/direct", 84_587, 86_967),
-            ("structured/thinking", 87_540, 93_067),
-            ("safety/direct", 94_476, 101_778),
-            ("safety/thinking", 101_778, 107_165),
-        )
-    ),
-    # `SFT_CORPUS_RANGE`, restated from `envscaler_tools_v2.environment`: the
-    # graded scenarios of the 12 SFT worlds kept for the corpus. The whole
-    # graded SFT range [1296, 2546) (25 worlds, 13 of which a 27B policy
-    # almost never wins) and the ungraded range [2546, 7225)
-    # (EnvScaler-SFT-Scenario, no checks) are held in reserve.
-    "envscaler_tools_v2": (
-        UsedRange("corpus", "envscaler_tools_v2", "train", 7225, 600,
-                  "SFT worlds kept for the corpus, graded"),
-    ),
+    name: tuple(UsedRange("corpus", name, rows.split, rows.start, rows.count, rows.what)
+                for rows in env.rows_of("batch", RL_SPLIT))
+    for name, env in CATALOG.items()
+    if env.kind != "episode"
 }
 
-_CODE_LENGTH = 2_481_806
-_CODE_HELD_OUT = 100_000
-
 HELD_OUT: dict[str, HeldOut] = {
-    "math": HeldOut(
-        env="math", source="reliquary_dapo_math_v1", split="eval",
-        justification=(
-            "The package's eval split: problems are assigned to train/eval/qualification by "
-            "a salted hash of the problem key, so no eval problem is a train problem. RL "
-            "and corpus jobs build the train split only. OpenMathInstruct was not used: RL "
-            "samples its whole index space, offset 10000 measured 43.6% trained, and its "
-            "rows repeat each question ~20 times, so no index range is held out."),
-    ),
-    "code": HeldOut(
-        env="code", source="reliquary_code_v1", split="train",
-        start=_CODE_LENGTH - _CODE_HELD_OUT, count=_CODE_HELD_OUT, source_length=_CODE_LENGTH,
-        justification=(
-            "The last 100,000 rows of the pinned OpenCodeInstruct curation (d3caaefc, "
-            "2,481,806 rows), the corpus export's grader. The package has no other split. "
-            "Disjoint from every corpus job (code 0..100k), and `jobs create` refuses a job "
-            "reaching it. NOT disjoint from past RL: RL samples the whole train split, so "
-            "these rows were eligible (see the rulings)."),
-    ),
-    "logic": HeldOut(
-        env="logic", source="reliquary_logic_v2", split="eval",
-        justification=(
-            "The generator's eval split: splits interleave (position = index*3 + split), so "
-            "no eval task is a train task whatever the index. RL and corpus jobs (logic "
-            "rows 100M..100.05M) build the train split only."),
-    ),
-    "instruction_following": HeldOut(
-        env="instruction_following", source="reliquary_instruction_following_v1",
-        split="eval",
-        justification=(
-            "The package's eval split (10%): rows are assigned by a salted hash of the row "
-            "key, so no eval row is a train row. RL and corpus jobs (IF 0..20k) build the "
-            "train split only."),
-    ),
+    rows.eval_set: HeldOut(
+        env=rows.eval_set, source=env.name, split=rows.split, justification=rows.what,
+        start=rows.start, count=rows.count,
+        source_length=env.lengths.get(rows.split) if rows.count is not None else None)
+    for env, rows in _catalog_rows("eval") if rows.eval_set is not None
 }
 
 # Environments whose held-out region RL could sample, each by a ruling.
@@ -267,7 +190,8 @@ def overlaps(a: UsedRange, b: UsedRange) -> bool:
 
 
 def refuse_held_out_overlap(source: str, prompt_start: int, prompt_count: int) -> None:
-    """A corpus job (train split) may not take rows an eval set holds out."""
+    """A corpus job or a generation order (train split) takes only its source's batch rows (the
+    environment catalog), never rows an eval set holds out or RL keeps."""
     job = UsedRange("corpus", source, RL_SPLIT, int(prompt_start), int(prompt_count), "job")
     for held in HELD_OUT.values():
         # Only an index range can be refused; a source of the same corpus with
@@ -277,17 +201,7 @@ def refuse_held_out_overlap(source: str, prompt_start: int, prompt_count: int) -
                 f"rows [{held.start}, {held.region.end}) of {source!r} are held out for the "
                 f"{held.env!r} evaluation set; this job's [{job.start}, {job.end}) reaches them"
             )
-    servable = CORPUS_SERVABLE_RANGES.get(source)
-    if servable is not None and not any(
-        allowed.start <= job.start and job.end <= allowed.end for allowed in servable
-    ):
-        if not servable:
-            raise ValueError(f"{source!r} serves no corpus job (CORPUS_SERVABLE_RANGES)")
-        raise ValueError(
-            f"{source!r} serves corpus jobs only inside its corpus ranges, one "
-            f"segment per job ({', '.join(f'[{r.start}, {r.end}) {r.what}' for r in servable)}); "
-            f"this job's [{job.start}, {job.end}) is not inside one"
-        )
+    refuse_batch_rows(source, RL_SPLIT, int(prompt_start), int(prompt_count))
     for reserved in RL_ONLY_RANGES:
         if lineage(source)[1] == lineage(reserved.source)[1] and overlaps(job, reserved):
             raise ValueError(
