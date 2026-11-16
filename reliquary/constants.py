@@ -159,8 +159,8 @@ SUPPORTED_ARCHITECTURES: dict[str, tuple[str, ...]] = {
         "tests/unit/test_modeling_helpers.py::test_a_softcapped_head_is_capped_by_the_verifier",
         "tests/unit/test_modeling_helpers.py::test_turn_end_token_prefers_a_declared_turn_terminator",
     ),
-    # Mixture-of-experts Qwen (Qwen/Qwen3.5-35B-A3B, served text-only like the dense conditional class; and
-    # Qwen/Qwen3-30B-A3B). The verifier routes every token itself and never takes a routing from the miner: a
+    # Mixture-of-experts Qwen (Qwen/Qwen3.5-35B-A3B and Qwen/Qwen3.6-35B-A3B, one class served text-only like the
+    # dense conditional class; and Qwen/Qwen3-30B-A3B). The verifier routes every token itself and never takes a routing from the miner: a
     # declared routing can be chosen among near-tie experts to move the draw. 2026-11-16 H200, vLLM 0.30 forced
     # draw against the HF forward (torch 2.13), ~2k-token samples at T 1 under the default draw judge:
     # Qwen3.5-35B-A3B 576/576 accepted (0.58 % of positions missed, max gap 1.06); Qwen3-30B-A3B 286/288 (two
@@ -174,6 +174,25 @@ SUPPORTED_ARCHITECTURES: dict[str, tuple[str, ...]] = {
     ),
 }
 SUPPORTED_MODEL_ARCHITECTURES = frozenset(SUPPORTED_ARCHITECTURES)
+# The entries above measured with routed experts. A class can ship dense and MoE checkpoints under one name
+# (Gemma 4: 31B dense, 26B-A4B with experts); only these were measured with experts.
+MOE_ARCHITECTURES = frozenset({"Qwen3_5MoeForConditionalGeneration", "Qwen3MoeForCausalLM"})
+# What ``architecture_of`` appends to a class name whose checkpoint routes experts unmeasured.
+UNMEASURED_EXPERTS_SUFFIX = "+experts"
+
+
+def architecture_of(config: dict) -> str | None:
+    """``architectures[0]`` of a config.json, with ``UNMEASURED_EXPERTS_SUFFIX`` when the checkpoint routes
+    experts and its class is not in ``MOE_ARCHITECTURES``: the name is then in no table and the model is refused
+    ``architecture_unsupported``. None: no architecture named."""
+    names = config.get("architectures") or []
+    if not names:
+        return None
+    name = str(names[0])
+    text = config.get("text_config") or {}
+    experts = any(bool(c.get(k)) for c in (config, text)
+                  for k in ("num_experts", "num_local_experts", "n_routed_experts", "enable_moe_block"))
+    return f"{name}{UNMEASURED_EXPERTS_SUFFIX}" if experts and name not in MOE_ARCHITECTURES else name
 
 # ────────────────  TIMING (CONSENSUS)  ────────────────
 
