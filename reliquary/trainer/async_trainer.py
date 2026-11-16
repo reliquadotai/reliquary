@@ -42,6 +42,7 @@ masked rollouts stay in its denominator (it is planned before the forward).
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -67,6 +68,7 @@ from reliquary.validator.training import (
     DRIFT_GAP_EDGES,
     DRIFT_POSITION_EDGES,
     DRIFT_WIDTH,
+    TrainingAdmissionError,
     TrainingStepSkipped,
     train_step as _default_train_step,
 )
@@ -102,7 +104,8 @@ class DrawGate:
     def __init__(self, groups: list[list[int]], *, rollout_floor: float = ASYNC_ROLLOUT_FLOOR,
                  group_floor: float = ASYNC_GROUP_FLOOR, forgery_floor: float = ASYNC_FORGERY_FLOOR,
                  gap_tolerance: float = RL_GAP_TOLERANCE, substitute_gap: float = RL_SUBSTITUTE_GAP,
-                 terminal_gap: float = RL_TERMINAL_GAP, eos_ids=(), envs=None, lags=None) -> None:
+                 terminal_gap: float = RL_TERMINAL_GAP, eos_ids=(), envs=None, lags=None,
+                 lease_ids=None, admission_check=None, require_admission: bool = False) -> None:
         self.groups = [list(g) for g in groups]
         # Per-group labels for the drift breakdowns (telemetry only).
         self.envs = list(envs) if envs is not None else None
@@ -113,7 +116,15 @@ class DrawGate:
         self.terminal_gap = float(terminal_gap)
         self.eos_ids = frozenset(int(t) for t in eos_ids)
         self.extra: dict[str, float] = {}
+        self.lease_ids = list(lease_ids or ())
+        self.admission_check = admission_check
+        self.require_admission = require_admission
         self.reset()
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state["admission_check"] = None  # only rank 0 calls the authority; followers receive its decision
+        return state
 
     def reset(self) -> None:
         n = sum(len(g) for g in self.groups)
@@ -125,7 +136,63 @@ class DrawGate:
         self.admitted = [0] * n
         self.drift = [[0.0] * DRIFT_WIDTH for _ in range(n)]
         self.accepted: list[bool] | None = None
+        self.admission_ids: list[str | None] = [None] * len(self.groups)
+        self.admission_expires_at: float | None = None
         self.undone = 0
+
+    @staticmethod
+    def _broadcast(value, dist):
+        if dist is not None and dist.world_size > 1:
+            import torch
+
+            message = [value]
+            torch.distributed.broadcast_object_list(message, src=0, group=dist.control_group)
+            return message[0]
+        return value
+
+    def _finalize_admission(self, dist) -> None:
+        decision = None
+        if dist is None or dist.is_main:
+            try:
+                if self.admission_check is None:
+                    raise TrainingAdmissionError("precommit reward authority is unavailable")
+                receipts = self.admission_check(self)
+                if not isinstance(receipts, list) or len(receipts) != len(self.groups):
+                    raise ValueError("one admission result per group is required")
+                accepted, ids, expires = list(self.accepted), [None] * len(self.groups), []
+                for i, receipt in enumerate(receipts):
+                    if not accepted[i]:
+                        continue
+                    if (not isinstance(receipt, dict) or receipt.get("lease_id") != self.lease_ids[i]
+                            or type(receipt.get("accepted")) is not bool
+                            or not isinstance(receipt.get("admission_id"), str)
+                            or not 0 < len(receipt["admission_id"]) <= 128
+                            or isinstance(receipt.get("expires_at"), bool)):
+                        raise ValueError("malformed reward admission receipt")
+                    until = float(receipt["expires_at"])
+                    if not math.isfinite(until) or until <= time.time():
+                        raise ValueError("reward admission expired")
+                    accepted[i], ids[i] = receipt["accepted"], receipt["admission_id"]
+                    expires.append(until)
+                decision = {"accepted": accepted, "ids": ids, "expires": min(expires) if expires else None}
+            except Exception as exc:
+                decision = {"error": f"precommit reward admission failed ({type(exc).__name__}): {exc}"}
+        decision = self._broadcast(decision, dist)
+        if "error" in decision:
+            raise TrainingAdmissionError(decision["error"])
+        self.accepted, self.admission_ids = decision["accepted"], decision["ids"]
+        self.admission_expires_at = decision["expires"]
+
+    def check_commit(self, dist=None) -> None:
+        """Every rank takes the same final decision immediately before optimizer mutation."""
+        if not self.require_admission:
+            return
+        ready = None
+        if dist is None or dist.is_main:
+            ready = self.accepted is not None and (
+                self.admission_expires_at is None or time.time() < self.admission_expires_at)
+        if not self._broadcast(ready, dist):
+            raise TrainingAdmissionError("reward admission expired before optimizer commit")
 
     def admit(self, rollouts, tallies, suspects=None) -> list[bool]:
         out = []
@@ -186,6 +253,8 @@ class DrawGate:
                 self.substitutions = [[pair for rank in every for pair in rank[s]] for s in range(len(self.tallies))]
         self.accepted = [any(self.admitted[s] for s in slots) and self.pooled(g) >= self.group_floor
                          and not self.forged(g) for g, slots in enumerate(self.groups)]
+        if self.require_admission:
+            self._finalize_admission(dist)
         undo = []
         for group, advantages, scale in plan:
             g = int(group.rollouts[0]._async_group)
@@ -432,8 +501,7 @@ class AsyncTrainer:
         self._fetcher = ThreadPoolExecutor(max_workers=1, thread_name_prefix="batch-prefetch")
         self._prefetched: Future | None = None
         self._uniforms: dict[str, list[list[float]]] = {}     # lease_id -> its rollouts' uniforms (prefetched)
-        self._reporter = (ThreadPoolExecutor(max_workers=config.report_workers, thread_name_prefix="report")
-                          if config.report_workers > 1 else None)
+        self._reporter = ThreadPoolExecutor(max_workers=config.report_workers, thread_name_prefix="report")
         self.since_checkpoint = 0
         self.published: list[int] = []
         self.last_step: dict = {}
@@ -483,8 +551,7 @@ class AsyncTrainer:
         finally:
             self._executor.shutdown(wait=True)
             self._fetcher.shutdown(wait=True)        # what it took stays taken: the next start requeues it
-            if self._reporter is not None:
-                self._reporter.shutdown(wait=True)
+            self._reporter.shutdown(wait=True)
 
     # --- batch ---------------------------------------------------------------------------------------------
     def _report_untrained(self, groups, failure_class=None) -> None:
@@ -603,7 +670,9 @@ class AsyncTrainer:
                         rollout_floor=self.config.rollout_floor, group_floor=self.config.group_floor,
                         forgery_floor=self.config.forgery_floor, gap_tolerance=self.config.gap_tolerance,
                         substitute_gap=self.config.substitute_gap, terminal_gap=self.config.terminal_gap, eos_ids=self.config.eos_ids,
-                        envs=[g.environment for g in submitted], lags=[self.version - g.checkpoint for g in submitted])
+                        envs=[g.environment for g in submitted], lags=[self.version - g.checkpoint for g in submitted],
+                        lease_ids=[g.lease_id for g in submitted], require_admission=True,
+                        admission_check=lambda verdict: self._admit_training(submitted, verdict))
         envs: dict[str, int] = {}
         for group in submitted:
             envs[group.environment] = envs.get(group.environment, 0) + 1
@@ -618,7 +687,8 @@ class AsyncTrainer:
                                           gate=gate)
         except TrainingStepSkipped as exc:
             logger.warning("async train step skipped (%s): %d groups unpaid", exc.reason, len(submitted))
-            self._report_untrained(submitted)
+            gate.accepted = [False] * len(submitted)
+            self._report(submitted, gate)
             self.skipped += 1           # its rows stay held and go out with the next trained step
             self.last_step = {"result": "skipped", "reason": exc.reason, **gate.metrics()}
             return "skipped"
@@ -664,6 +734,24 @@ class AsyncTrainer:
                         self.steps)
         return "trained"
 
+    def _admit_training(self, submitted: list[SubmittedGroup], gate: DrawGate) -> list:
+        method = getattr(self.submissions, "admit_training", None)
+        if method is None:
+            raise TrainingAdmissionError("trainer link lacks precommit reward admission")
+        receipts = [None] * len(submitted)
+        calls = [(i, group.lease_id, [gate.substitutions[s] for s in gate.groups[i]])
+                 for i, group in enumerate(submitted) if gate.accepted[i]]
+        deadline = time.monotonic() + 600.0  # one bounded authority wait for the whole batch
+        futures = [(i, self._reporter.submit(method, lease_id, substitutions))
+                   for i, lease_id, substitutions in calls]
+        try:
+            for i, future in futures:
+                receipts[i] = future.result(timeout=max(0.0, deadline - time.monotonic()))
+        finally:
+            for _, future in futures:
+                future.cancel()
+        return receipts
+
     def _report(self, submitted: list[SubmittedGroup], gate: DrawGate) -> dict[str, int]:
         """``report_training`` for every group of the step (``report_workers`` at once); returns the matched tokens
         trained per env."""
@@ -671,6 +759,7 @@ class AsyncTrainer:
         calls = []
         slot = 0
         for g, group in enumerate(submitted):
+            receipt = {} if gate.admission_ids[g] is None else {"admission_id": gate.admission_ids[g]}
             slots = range(slot, slot + len(group.completions))
             slot += len(group.completions)
             match = [gate.rate(s) for s in slots]
@@ -678,20 +767,16 @@ class AsyncTrainer:
                 matched = [gate.tallies[s][3] if gate.admitted[s] else 0 for s in slots]
                 calls.append(dict(lease_id=group.lease_id, rollout_match=match, accepted=True,
                                   matched_tokens=matched, judged=True,
-                                  substitutions=[gate.substitutions[s] for s in slots]))
+                                  substitutions=[gate.substitutions[s] for s in slots], **receipt))
                 trained[group.environment] = trained.get(group.environment, 0) + sum(matched)
                 continue
             calls.append(dict(lease_id=group.lease_id, rollout_match=match, accepted=False,
-                              judged=any(gate.forwarded[s] for s in slots)))
+                              failure_class=None, judged=any(gate.forwarded[s] for s in slots), **receipt))
         started = time.monotonic()
-        if self._reporter is None:
-            for call in calls:
-                self.submissions.report_training(call.pop("lease_id"), **call)
-        else:
-            futures = [self._reporter.submit(self.submissions.report_training, call.pop("lease_id"), **call)
-                       for call in calls]
-            for future in futures:
-                future.result()
+        futures = [self._reporter.submit(self.submissions.report_training, call.pop("lease_id"), **call)
+                   for call in calls]
+        for future in futures:
+            future.result()
         logger.info("%d groups reported in %.1fs", len(calls), time.monotonic() - started)
         return trained
 

@@ -399,10 +399,14 @@ def test_a_reward_that_moves_under_the_trainers_picks_is_not_paid(book):
     none = [[] for _ in range(16)]
     # rollout 8 answered 5 (reward 0); the trainer picks 4 at the answer, and garbage right after it
     moved = none[:8] + [[(7, four), (8, five)]] + none[9:]
-    subs.report_training(forged.lease_id, rollout_match=[0.99] * 16, accepted=True, substitutions=moved)
+    receipt = subs.admit_training(forged.lease_id, moved)
+    subs.report_training(forged.lease_id, rollout_match=[0.99] * 16, accepted=receipt["accepted"],
+                         admission_id=receipt["admission_id"])
     # rollout 0 answered 4; the trainer's pick is the same digit: the reward holds
     held = [[(7, four)]] + none[1:]
-    subs.report_training(honest.lease_id, rollout_match=[0.99] * 16, accepted=True, substitutions=held)
+    receipt = subs.admit_training(honest.lease_id, held)
+    subs.report_training(honest.lease_id, rollout_match=[0.99] * 16, accepted=receipt["accepted"],
+                         admission_id=receipt["admission_id"], substitutions=held)
     events = {e["lease_id"]: e for e in subs.events()}
     assert events[forged.lease_id]["kind"] == UNTRAINED and events[forged.lease_id]["detail"]["reward_moved"]
     assert events[forged.lease_id]["detail"].get("failure_class") is None          # unpaid, not sanctioned
@@ -421,7 +425,9 @@ def test_a_rollout_that_went_on_where_the_draw_ended_it_is_graded_as_ended_there
     subs.submit(held.lease_id, "A", [RIGHT] * 8 + [longer] * 8)
     none = [[] for _ in range(16)]
     ended = none[:8] + [[(len(text("\\boxed{4}")), EOS)]] + none[9:]
-    subs.report_training(held.lease_id, rollout_match=[0.99] * 16, accepted=True, substitutions=ended)
+    receipt = subs.admit_training(held.lease_id, ended)
+    subs.report_training(held.lease_id, rollout_match=[0.99] * 16, accepted=receipt["accepted"],
+                         admission_id=receipt["admission_id"])
     event = {e["lease_id"]: e for e in subs.events()}[held.lease_id]
     assert event["kind"] == UNTRAINED and event["detail"]["reward_moved"]
 
@@ -557,7 +563,83 @@ def test_audit_forward_attempts_are_persisted_across_restarts(book):
     restarted = service(book, probation_groups=0)                               # a new process: same file
     assert restarted.run_audits(forward, 10, max_attempts=2) == 1
     assert restarted.group(poison.lease_id)["audit"] == "inconclusive" and book.banned_until("A") is None
-    assert restarted.in_probation("A")                                          # suspect: no pass, re-probation
+    assert not restarted.in_probation("A")                                      # infrastructure: no re-probation
+
+
+def test_audit_attempts_are_idempotent_and_crashes_exhaust_the_durable_budget(book):
+    subs = service(book, probation_groups=0, audit_rate=1.0)
+    held = lease(book, 90)
+    subs.submit(held.lease_id, "A", group(0))
+    assert not subs.in_probation("A")
+    for i in range(3):
+        subs = service(book, probation_groups=0, audit_rate=1.0)   # crashed after the previous claim
+        attempt = f"{i:032x}"
+        assert subs.start_audit(held.lease_id, attempt)
+        assert subs.start_audit(held.lease_id, attempt)            # lost response: same attempt
+        assert book.db.execute("SELECT attempts FROM rl_audits WHERE lease_id=?",
+                               (held.lease_id,)).fetchone()[0] == i + 1
+    restarted = service(book, probation_groups=0, audit_rate=1.0)
+    assert not restarted.start_audit(held.lease_id, "f" * 32)
+    assert restarted.audit_jobs(10) == []
+    assert restarted.group(held.lease_id)["audit"] == "inconclusive"
+    assert not restarted.in_probation("A") and book.banned_until("A") is None
+    assert book.db.execute("SELECT COUNT(*) FROM rl_verdicts").fetchone()[0] == 0
+    assert (held.lease_id, FIRST_SCAN_FORFEITED) in kinds(restarted)
+
+
+def test_audit_failure_reports_are_idempotent_and_cannot_fail_another_attempt(book):
+    subs = service(book, probation_groups=0, audit_rate=1.0)
+    held = lease(book, 91)
+    subs.submit(held.lease_id, "A", group(0))
+    first, second = "a" * 32, "b" * 32
+    assert subs.start_audit(held.lease_id, first, max_attempts=2)
+    assert not subs.report_audit_failure(held.lease_id, first, max_attempts=2)
+    assert not subs.report_audit_failure(held.lease_id, first, max_attempts=2)
+    assert not subs.start_audit(held.lease_id, first, max_attempts=2)
+    assert subs.start_audit(held.lease_id, second, max_attempts=2)
+    with pytest.raises(LookupError):
+        subs.report_audit_failure(held.lease_id, first, max_attempts=2)
+    assert subs.report_audit_failure(held.lease_id, second, max_attempts=2)
+    assert subs.report_audit_failure(held.lease_id, second, max_attempts=2)
+    assert not subs.in_probation("A")
+    assert subs.group(held.lease_id)["audit"] == "inconclusive"
+    assert book.db.execute("SELECT attempts FROM rl_audits WHERE lease_id=?", (held.lease_id,)).fetchone()[0] == 2
+
+
+def test_unreported_audit_attempts_are_bounded_after_reopening_the_sqlite_file(tmp_path):
+    path = tmp_path / "audit-restarts.sqlite3"
+    for i in range(4):
+        reopened = LeaseBook(path, LeaseBookConfig(expiry_s={ENV: 600.0}, cooldown_of=lambda env: 2),
+                              quota=QuotaController(QuotaConfig(initial=64, ceiling=64)), clock=lambda: NOW)
+        try:
+            subs = service(reopened, probation_groups=0, audit_rate=1.0)
+            if i == 0:
+                reopened.adopt_checkpoint(0)
+                held = lease(reopened, 92)
+                subs.submit(held.lease_id, "A", group(0))
+            assert subs.start_audit(held.lease_id, f"{i:032x}") is (i < 3)
+            if i == 3:
+                assert subs.audit_jobs(10) == [] and not subs.in_probation("A")
+                assert reopened.db.execute("SELECT attempts, failure_class FROM rl_audits").fetchone() == (
+                    3, "infrastructure")
+        finally:
+            reopened.close()                         # the next process opens only committed state
+
+
+def test_old_audit_tables_gain_the_attempt_identity_without_losing_rows(book):
+    book.db.execute("CREATE TABLE rl_audits(lease_id TEXT PRIMARY KEY, hotkey TEXT NOT NULL, forced INTEGER NOT NULL, "
+                    "queued_at REAL NOT NULL, body BLOB, attempts INTEGER NOT NULL DEFAULT 0, lag INTEGER)")
+    book.db.execute("INSERT INTO rl_audits VALUES('old', 'A', 0, 1, NULL, 2, 0)")
+    book.db.commit()
+    service(book)
+    assert book.db.execute("SELECT lease_id, attempts, attempt_id, failure_class FROM rl_audits").fetchone() == (
+        "old", 2, None, None)
+
+
+@pytest.mark.parametrize("attempt_id", ["", "a", "A" * 32, None, 123])
+def test_audit_attempt_identity_is_validated_before_writing(book, attempt_id):
+    with pytest.raises(ValueError, match="attempt_id"):
+        service(book).start_audit("unused", attempt_id)
 
 
 def test_an_answer_is_graded_without_its_terminator(book):

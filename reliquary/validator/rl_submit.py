@@ -36,8 +36,8 @@ is unpaid and the hotkey back in probation, nothing more. Honest drift fails gro
 a forger from a lagging miner; a forger gains nothing but burned GPU time. The audit's lag is kept in
 ``rl_audits``. An inconclusive audit (``passed=None``: no model, or queued past ``audit_max_lag`` checkpoints) is
 unpaid. A ``suspect`` inconclusive (the audit
-abstained on too few drawn positions, or its forward raised ``AUDIT_MAX_ATTEMPTS`` times, counted in
-``rl_audits``) is logged as an ``inconclusive`` verdict: never a pass, and it re-opens probation like a failure.
+abstained on too few drawn positions) is logged as an ``inconclusive`` verdict: never a pass, and it re-opens
+probation like a failure. Infrastructure failures exhaust a durable attempt budget without resetting probation.
 ``blacklist`` is the operator's ban (no lease, no submission, unsettled pay forfeited).
 
 Interfaces left to later phases: the proof forward of an audit (``ProofForward``, implemented by
@@ -48,6 +48,7 @@ it by ``seq``; ``rl_groups`` is the private store with hotkeys).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -55,9 +56,11 @@ import multiprocessing
 import multiprocessing.util
 import os
 import random
+import re
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import CancelledError, ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
@@ -88,7 +91,8 @@ REJECTED = "rejected"
 GRADER_FAULTS = frozenset({"reward_error"})
 # Episode envs a lease takes: signed by the sandbox (``rl_episode``) or replayed by the validator (``rl_suite_episodes``).
 EPISODE_MODES = frozenset({"signed_episode", "episode"})
-AUDIT_MAX_ATTEMPTS = 3        # raising audit forwards of one group before it is concluded inconclusive
+AUDIT_MAX_ATTEMPTS = 3        # forward starts, including process crashes, before infrastructure inconclusive
+TRAINING_ADMISSION_TTL_S = 2 * 3600.0
 NOT_DRAWN, PENDING, PASSED, FAILED, INCONCLUSIVE = "not_drawn", "pending", "passed", "failed", "inconclusive"
 # rl_events kinds: pay eligibility (read by the P5 ledger) and the operator's bans
 FIRST_SCAN, FIRST_SCAN_FORFEITED, TRAINED, UNTRAINED, BAN = (
@@ -102,7 +106,8 @@ CREATE TABLE IF NOT EXISTS rl_groups(seq INTEGER PRIMARY KEY AUTOINCREMENT, leas
     scan_seq INTEGER, audit TEXT, training TEXT);
 CREATE INDEX IF NOT EXISTS rl_groups_hotkey ON rl_groups(hotkey, seq);
 CREATE TABLE IF NOT EXISTS rl_audits(lease_id TEXT PRIMARY KEY, hotkey TEXT NOT NULL, forced INTEGER NOT NULL,
-    queued_at REAL NOT NULL, body BLOB, attempts INTEGER NOT NULL DEFAULT 0, lag INTEGER);
+    queued_at REAL NOT NULL, body BLOB, attempts INTEGER NOT NULL DEFAULT 0, lag INTEGER,
+    attempt_id TEXT, failure_class TEXT);
 CREATE TABLE IF NOT EXISTS rl_verdicts(seq INTEGER PRIMARY KEY AUTOINCREMENT, lease_id TEXT NOT NULL,
     hotkey TEXT NOT NULL, source TEXT NOT NULL, verdict TEXT NOT NULL, failure_class TEXT, forced INTEGER NOT NULL,
     at REAL NOT NULL);
@@ -111,6 +116,8 @@ CREATE TABLE IF NOT EXISTS rl_events(seq INTEGER PRIMARY KEY AUTOINCREMENT, leas
     hotkey TEXT NOT NULL, kind TEXT NOT NULL, at REAL NOT NULL, detail TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS rl_group_instances(lease_id TEXT PRIMARY KEY, hotkey TEXT NOT NULL,
     instance_id TEXT NOT NULL, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS rl_training_admissions(lease_id TEXT PRIMARY KEY, request_sha256 TEXT NOT NULL,
+    admission_id TEXT NOT NULL, accepted INTEGER NOT NULL, expires_at REAL NOT NULL, owner_epoch INTEGER);
 """
 
 
@@ -463,7 +470,8 @@ class RlSubmissions:
         with book.lock:
             book.db.executescript(_SCHEMA)
             columns = {row[1] for row in book.db.execute("PRAGMA table_info(rl_audits)")}
-            for column, kind in (("attempts", "INTEGER NOT NULL DEFAULT 0"), ("lag", "INTEGER")):   # an older file
+            for column, kind in (("attempts", "INTEGER NOT NULL DEFAULT 0"), ("lag", "INTEGER"),
+                                 ("attempt_id", "TEXT"), ("failure_class", "TEXT")):   # an older file
                 if column not in columns:
                     book.db.execute(f"ALTER TABLE rl_audits ADD COLUMN {column} {kind}")
             book.db.commit()
@@ -582,11 +590,14 @@ class RlSubmissions:
             names = [c[0] for c in cursor.description]
         return None if row is None else dict(zip(names, row))
 
-    def events(self, since: int = 0) -> list[dict]:
-        """Pay eligibility and sanctions after cursor ``since`` (the P5 ledger's input)."""
+    def events(self, since: int = 0, *, limit: int | None = None) -> list[dict]:
+        """Pay eligibility and sanctions after cursor ``since``; limit the ledger's SQL read before decoding."""
+        if limit is not None and (type(limit) is not int or limit < 0):
+            raise ValueError("event limit must be a non-negative integer")
         with self.book.lock:
             rows = self.book.db.execute("SELECT seq, lease_id, hotkey, kind, at, detail FROM rl_events WHERE seq>? "
-                                        "ORDER BY seq", (int(since),)).fetchall()
+                                        "ORDER BY seq" + (" LIMIT ?" if limit is not None else ""),
+                                        (int(since),) if limit is None else (int(since), limit)).fetchall()
         return [{"seq": s, "lease_id": l, "hotkey": h, "kind": k, "at": a, "detail": json.loads(d)}
                 for s, l, h, k, a, d in rows]
 
@@ -679,7 +690,8 @@ class RlSubmissions:
             elif result.suspect:
                 db.execute("INSERT INTO rl_verdicts(lease_id, hotkey, source, verdict, failure_class, forced, at) "
                            "VALUES(?,?,?,?,?,?,?)", (lease_id, hotkey, "audit", INCONCLUSIVE, None, int(forced), now))
-            db.execute("UPDATE rl_audits SET body=NULL, lag=? WHERE lease_id=?", (lag, lease_id))
+            db.execute("UPDATE rl_audits SET body=NULL, lag=?, failure_class=? WHERE lease_id=?",
+                       (lag, result.failure_class, lease_id))
             db.execute("UPDATE rl_groups SET audit=? WHERE lease_id=?", (state, lease_id))
             if first_scan:
                 self._first_scan(lease_id, hotkey, now, state, tokens)
@@ -706,32 +718,127 @@ class RlSubmissions:
         self.drop_stale_audits()
         return self.audit_jobs(limit)
 
+    def start_audit(self, lease_id: str, attempt_id: str, *, max_attempts: int = AUDIT_MAX_ATTEMPTS) -> bool:
+        """Consume an attempt before the forward, including one lost to a process crash. Resending the same
+        attempt is idempotent. Exhaustion concludes infrastructure inconclusive, without a miner verdict."""
+        if not isinstance(attempt_id, str) or re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None:
+            raise ValueError("audit attempt_id must be 32 lowercase hex characters")
+        if max_attempts < 1:
+            raise ValueError("audit max_attempts must be positive")
+        with self.book.transaction():
+            row = self.book.db.execute("SELECT attempts, attempt_id, failure_class FROM rl_audits "
+                                       "WHERE lease_id=? AND body IS NOT NULL", (lease_id,)).fetchone()
+            if row is None:
+                raise LookupError("no pending audit for this lease")
+            if row[1] == attempt_id:
+                return row[2] is None
+            if row[0] >= max_attempts:
+                self.report_audit(lease_id, AuditResult(None, "infrastructure"))
+                return False
+            self.book.db.execute("UPDATE rl_audits SET attempts=attempts+1, attempt_id=?, failure_class=NULL "
+                                 "WHERE lease_id=?", (attempt_id, lease_id))
+            return True
+
+    def report_audit_failure(self, lease_id: str, attempt_id: str, *,
+                             max_attempts: int = AUDIT_MAX_ATTEMPTS) -> bool:
+        """Record an infrastructure failure once; return whether its attempt budget is exhausted."""
+        with self.book.transaction():
+            row = self.book.db.execute("SELECT attempts, body IS NULL, failure_class FROM rl_audits "
+                                       "WHERE lease_id=? AND attempt_id=?", (lease_id, attempt_id)).fetchone()
+            if row is None or (row[1] and row[2] != "infrastructure"):
+                raise LookupError("no pending audit for this attempt")
+            if row[1]:
+                return True
+            self.book.db.execute("UPDATE rl_audits SET failure_class='infrastructure' WHERE lease_id=?",
+                                 (lease_id,))
+            if row[0] >= max_attempts:
+                self.report_audit(lease_id, AuditResult(None, "infrastructure"))
+                return True
+            return False
+
     def run_audits(self, forward: ProofForward, limit: int, *, max_attempts: int = AUDIT_MAX_ATTEMPTS) -> int:
         """Drain up to ``limit`` queued audits through ``forward`` (the proof forward, the Gumbel verifier).
-        A forward that raises leaves its audit queued and the others still run; after ``max_attempts`` raising
-        forwards (counted in ``rl_audits``, across restarts) the audit is concluded a suspect inconclusive
-        (unpaid, unsanctioned, no probation pass), so one poison group (e.g. an OOM) cannot stall the queue. Stale
+        A forward that raises leaves its audit queued and the others still run; after ``max_attempts`` attempts
+        (counted before the forward, across restarts) it is concluded infrastructure inconclusive
+        (unpaid, unsanctioned, no probation reset), so one poison group (e.g. an OOM) cannot stall the queue. Stale
         audits are dropped first (``drop_stale_audits``, not counted)."""
         self.drop_stale_audits()
         done = 0
         for group in self.audit_jobs(limit):
+            attempt_id = uuid.uuid4().hex
+            if not self.start_audit(group.lease_id, attempt_id, max_attempts=max_attempts):
+                done += 1
+                continue
             try:
                 result = forward(group)
             except Exception:
-                with self.book.transaction():
-                    self.book.db.execute("UPDATE rl_audits SET attempts=attempts+1 WHERE lease_id=?",
-                                         (group.lease_id,))
-                    failures = int(self.book.db.execute("SELECT attempts FROM rl_audits WHERE lease_id=?",
-                                                        (group.lease_id,)).fetchone()[0])
-                logger.exception("audit forward of %s failed (%d/%d)", group.lease_id[:12], failures, max_attempts)
-                if failures < max_attempts:
-                    continue
-                result = AuditResult(None, suspect=True)
+                concluded = self.report_audit_failure(group.lease_id, attempt_id, max_attempts=max_attempts)
+                logger.exception("audit forward of %s failed", group.lease_id[:12])
+                done += int(concluded)
+                continue
             self.report_audit(group.lease_id, result)
             done += 1
         return done
 
     # --- the trainer's report (P4) ------------------------------------------------------------------------
+    def _admission_substitutions(self, group, substitutions) -> list:
+        if not isinstance(substitutions, (list, tuple)) or len(substitutions) != len(group.completions):
+            raise ValueError("one substitution list per rollout")
+        cleaned = []
+        vocab = getattr(self.grader, "vocab_size", None)
+        for completion, pairs in zip(group.completions, substitutions):
+            if not isinstance(pairs, (list, tuple)):
+                raise ValueError("substitutions must be position/token pairs")
+            seen, row = set(), []
+            for pair in pairs:
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                    raise ValueError("substitutions must be position/token pairs")
+                p, t = pair
+                if (type(p) is not int or type(t) is not int or not 0 <= p < len(completion)
+                        or t < 0 or (vocab is not None and t >= vocab) or p in seen):
+                    raise ValueError("invalid substitution position or token")
+                seen.add(p)
+                row.append((p, t))
+            cleaned.append(sorted(row))
+        return cleaned
+
+    def admit_training(self, lease_id: str, substitutions, *, owner_epoch: int | None = None,
+                       now: float | None = None) -> dict:
+        """Finalize reward admission before the optimizer changes. Retries of identical inputs reuse a receipt."""
+        with self.book.lock:
+            row = self.book.db.execute("SELECT body FROM rl_buffer WHERE lease_id=?", (lease_id,)).fetchone()
+            existing = self.book.db.execute(
+                "SELECT request_sha256, admission_id, accepted, owner_epoch FROM rl_training_admissions "
+                "WHERE lease_id=?", (lease_id,)).fetchone()
+        if row is None:
+            raise LookupError("no buffered group for this lease")
+        body = row[0]
+        group = SubmittedGroup.unpack(body)
+        cleaned = self._admission_substitutions(group, substitutions)
+        digest = hashlib.sha256(body + json.dumps(cleaned).encode()).hexdigest()
+        if existing is not None and existing[0] == digest and existing[3] == owner_epoch:
+            receipt, accepted = existing[1], bool(existing[2])
+        else:
+            accepted = self._rewards_hold(group, cleaned)
+            receipt = hashlib.sha256(f"training-admission/v1\n{digest}\n{owner_epoch}".encode()).hexdigest()
+        # The scorer runs outside the transaction. Recheck its input before recording the decision.
+        with self.book.transaction():
+            if owner_epoch is not None:
+                from reliquary.validator.rl_trainer_owner import require_trainer_epoch
+
+                require_trainer_epoch(self.book, owner_epoch)
+            current = self.book.db.execute("SELECT body FROM rl_buffer WHERE lease_id=?", (lease_id,)).fetchone()
+            if current is None or current[0] != body:
+                raise LookupError("buffered group changed during admission")
+            at = float(self.clock()) if now is None else float(now)
+            expires = at + TRAINING_ADMISSION_TTL_S
+            self.book.db.execute(
+                "INSERT INTO rl_training_admissions VALUES(?,?,?,?,?,?) ON CONFLICT(lease_id) DO UPDATE SET "
+                "request_sha256=excluded.request_sha256, admission_id=excluded.admission_id, "
+                "accepted=excluded.accepted, expires_at=excluded.expires_at, owner_epoch=excluded.owner_epoch",
+                (lease_id, digest, receipt, int(accepted), expires, owner_epoch))
+            return {"lease_id": lease_id, "admission_id": receipt, "accepted": accepted, "expires_at": expires}
+
     def _rewards_hold(self, group, substitutions) -> bool:
         """The reward re-check: every rollout with suspect mismatches (``substitutions[i]``: (completion position,
         the trainer's pick), gap over ``RL_SUBSTITUTE_GAP``) is graded again with the picks there; any reward that
@@ -762,30 +869,45 @@ class RlSubmissions:
     def report_training(self, lease_id: str, *, rollout_match: Sequence[float], accepted: bool,
                         failure_class: str | None = None, matched_tokens: Sequence[int] | None = None,
                         substitutions: Sequence[Sequence[tuple[int, int]]] | None = None,
-                        judged: bool | None = None, now: float | None = None) -> None:
+                        judged: bool | None = None, now: float | None = None,
+                        admission_id: str | None = None, owner_epoch: int | None = None) -> None:
         """The trainer's forward judged a buffered group: ``rollout_match`` per rollout (match rate against the
         published checkpoint, §4.6), ``accepted`` the group verdict. An accepted group is payable (P5 pays the
         matched tokens of rollouts above the floor); a rejected one is unpaid, and a ``failure_class`` logs it as a
         failed verdict (the hotkey back in probation).
         ``matched_tokens``: per rollout, the positions equal to the validator's pick (what P5 pays); without it the
         ledger uses ``floor(match x completion tokens)``. ``judged`` is telemetry only: False for a skipped report,
-        True when a ratio was judged, None for an older trainer. ``substitutions``: per rollout, the suspect mismatches
-        (``_rewards_hold``); an accepted group whose rewards move is reported untrained, unsanctioned
-        (``reward_moved``), so it is not paid. LookupError: not a buffered group."""
+        True when a ratio was judged, None for an older trainer. ``admission_id`` binds the final precommit reward
+        decision to this report; the scorer is never rerun after the optimizer update. Direct legacy callers may
+        omit it only when there are no substitutions to regrade. LookupError: not a buffered group."""
         if judged is not None and not isinstance(judged, bool):
             raise ValueError("judged must be true, false or null")
+        if type(accepted) is not bool:
+            raise ValueError("accepted must be true or false")
         now = float(self.clock()) if now is None else now
-        moved = False
-        if accepted and substitutions:
-            pending = self.buffer.get(lease_id)
-            if pending is not None and len(substitutions) != len(pending.completions):
-                raise ValueError("one substitution list per rollout")
-            moved = pending is not None and not self._rewards_hold(pending, substitutions)
-            accepted = accepted and not moved
+        if accepted and any(substitutions or ()) and admission_id is None:
+            raise ValueError("substitutions require precommit reward admission")
         with self.book.transaction():
             group = self.buffer.get(lease_id)
-            if group is None or not self.buffer._remove(lease_id):
+            if group is None:
                 raise LookupError("no buffered group for this lease")
+            if substitutions:
+                self._admission_substitutions(group, substitutions)
+            admission = None
+            if admission_id is not None:
+                admission = self.book.db.execute(
+                    "SELECT admission_id, accepted, owner_epoch, request_sha256 FROM rl_training_admissions "
+                    "WHERE lease_id=?",
+                    (lease_id,)).fetchone()
+                if (admission is None or admission[0] != admission_id or admission[2] != owner_epoch
+                        or (accepted and not admission[1])):
+                    raise ValueError("training admission does not match the final verdict or owner")
+                if accepted or substitutions is not None:
+                    cleaned = self._admission_substitutions(group, substitutions or [[] for _ in group.completions])
+                    body = self.book.db.execute("SELECT body FROM rl_buffer WHERE lease_id=?", (lease_id,)).fetchone()[0]
+                    if hashlib.sha256(body + json.dumps(cleaned).encode()).hexdigest() != admission[3]:
+                        raise ValueError("training admission substitutions changed")
+            self.buffer._remove(lease_id)
             match = [float(m) for m in rollout_match]
             if len(match) != len(group.completions) or not all(0.0 <= m <= 1.0 for m in match):
                 raise ValueError("one match rate in [0, 1] per rollout")
@@ -802,7 +924,11 @@ class RlSubmissions:
                 detail["judged"] = judged
             if matched_tokens is not None:
                 detail["matched_tokens"] = [int(n) for n in matched_tokens]
-            if moved:
+            if admission is not None:
+                detail["admission_id"] = admission_id
+                detail["owner_epoch"] = owner_epoch
+                self.book.db.execute("DELETE FROM rl_training_admissions WHERE lease_id=?", (lease_id,))
+            if admission is not None and not admission[1]:
                 detail["reward_moved"] = True
             if accepted:
                 self._event(lease_id, group.hotkey, TRAINED, now, detail)
