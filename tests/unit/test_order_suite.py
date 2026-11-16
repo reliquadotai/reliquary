@@ -87,6 +87,16 @@ def test_a_suite_episode_renders_through_the_chatml_tools_renderer_on_qwen35_onl
     assert "unavailable" in episode_renderer_refusal("Qwen3ForCausalLM", RENDERER, suite=True)
 
 
+def test_the_qwen35_moe_plays_episodes_as_its_dense_family():
+    from reliquary.eval.episode_jobs import episode_renderer_refusal
+
+    moe = "Qwen3_5MoeForConditionalGeneration"
+    assert episode_renderer_refusal(moe, RENDERER, suite=True) is None
+    assert episode_renderer_refusal(moe, "renderers:qwen38@0.1.11") is None
+    # Qwen3-MoE has another tokenizer and template: no renderer serves it.
+    assert "unavailable" in episode_renderer_refusal("Qwen3MoeForCausalLM", "renderers:qwen38@0.1.11")
+
+
 # -- the admin --------------------------------------------------------------------------------
 
 
