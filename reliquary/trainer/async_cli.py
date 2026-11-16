@@ -144,7 +144,7 @@ def run_async_train_worker() -> None:
     from reliquary.validator import telemetry
     from reliquary.validator.training import configure_distributed, reset_training_state, train_step
 
-    dist_ctx = channel = None
+    dist_ctx = channel = gateway = None
     backend = trainer_backend()
     _check_trainer_launch(backend, os.environ)
     if backend == "fsdp2":
@@ -184,6 +184,7 @@ def run_async_train_worker() -> None:
             del state
             logger.info("resuming from checkpoint %d", version)
         load_kwargs = {}
+        eos_ids = _eos_ids(model_path, load_kwargs)
 
         started = time.monotonic()
         live: dict = {}                         # the trainer, once built (train_step may hand back a new model)
@@ -191,7 +192,9 @@ def run_async_train_worker() -> None:
         def current():
             return live["trainer"].model if "trainer" in live else model
 
-        if dist_ctx is None:
+        if backend == "miles":
+            gateway, model, step_fn, state_fn, miles_audit = _start_miles(model_path, version, eos_ids)
+        elif dist_ctx is None:
             model = load_text_generation_model(model_path, torch_dtype=torch.bfloat16,
                                                attn_implementation=ATTN_IMPLEMENTATION).to("cuda:0")
             try:
@@ -213,7 +216,11 @@ def run_async_train_worker() -> None:
         if settings["audits"]:
             from reliquary.trainer.audits import TrainerAudits, audit_group, broadcasting_audit
 
-            audits = TrainerAudits(link, audit_fn=audit_group if dist_ctx is None else broadcasting_audit(channel))
+            if backend == "miles":
+                audit_fn = miles_audit
+            else:
+                audit_fn = audit_group if dist_ctx is None else broadcasting_audit(channel)
+            audits = TrainerAudits(link, audit_fn=audit_fn)
         logger.info("startup_stage=trainer_model_load elapsed_seconds=%.3f", time.monotonic() - started)
         reset_training_state()
 
@@ -234,7 +241,7 @@ def run_async_train_worker() -> None:
         config = AsyncTrainerConfig(batch_groups=settings["batch_groups"],
                                     steps_per_checkpoint=settings["steps_per_checkpoint"],
                                     hf_backup_every=settings["hf_every"],
-                                    eos_ids=_eos_ids(model_path, load_kwargs),
+                                    eos_ids=eos_ids,
                                     audits_per_step=settings["audits_per_step"],
                                     audit_budget_s=settings["audit_budget_s"],
                                     prefetch=settings["prefetch"], report_workers=settings["report_workers"])
@@ -270,6 +277,42 @@ def run_async_train_worker() -> None:
         # Followers block on the next command; release them on any exit.
         if channel is not None:
             channel.send("STOP")
+        if gateway is not None:
+            gateway.stop()
+
+
+def _start_miles(model_path, version: int | None, eos_ids):
+    """``RELIQUARY_TRAINER_BACKEND=miles``: the gateway started on this box's GPUs from ``model_path``, then the
+    trainer's callables on it. This process keeps no GPU (the gateway holds them all)."""
+    from reliquary.constants import GRAD_NORM_SKIP_THRESHOLD, PROTOCOL_MODEL_ID
+    from reliquary.trainer import miles_gateway
+    from reliquary.trainer.audits import gateway_audit
+    from reliquary.trainer.miles_engine import MilesState, MilesTrainStep, expected_weight_specs
+
+    import signal
+
+    settings = miles_gateway.miles_settings()
+    miles_gateway.check_gateway_constants(settings["python"])
+
+    def _terminate(signum, frame):           # a plain SIGTERM must still run the finally that stops the gateway
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _terminate)
+    gateway = miles_gateway.launch_gateway(model_path, settings, base_model=PROTOCOL_MODEL_ID,
+                                           grad_norm_skip=GRAD_NORM_SKIP_THRESHOLD, env=dict(os.environ))
+    try:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""   # before any CUDA call here: the gateway's GPUs stay whole
+        client = miles_gateway.WatchedClient(
+            miles_gateway.create_full_training_client(gateway.base_url, PROTOCOL_MODEL_ID),
+            alive=lambda: gateway.process.poll() is None)
+        step_fn = MilesTrainStep(client, eos_ids=eos_ids, global_step_hint=version or 0)
+        state_fn = MilesState(client, checkpoint_root=settings["output_dir"],
+                              expected=expected_weight_specs(model_path),
+                              delete=miles_gateway.checkpoint_deleter(gateway.base_url))
+        return gateway, None, step_fn, state_fn, gateway_audit(client, eos_ids=eos_ids)
+    except BaseException:
+        gateway.stop()
+        raise
 
 
 def run_forever(trainer, *, steps: int | None = None) -> None:

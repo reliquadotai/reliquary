@@ -45,6 +45,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# the async trainer's Miles backend (RELIQUARY_TRAINER_BACKEND=miles): the Tinker client of the gateway
+miles = [
+    "tinker==0.36.0",
+]
 vision = [
     "torch==2.7.0",
     "peft==0.21.2",
