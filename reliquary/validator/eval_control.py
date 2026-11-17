@@ -1447,15 +1447,16 @@ def model_facts(repo: str, revision: str) -> dict:
     """The model's architecture and eos (``turn_end_token_id``), read here from its own files (CPU):
     never taken from an executor. ValueError: the model can never be served
     (no config, no tokenizer, not public); any other error is transient."""
+    from reliquary.constants import architecture_of
     from reliquary.shared.modeling import turn_end_token_id
 
     directory = _model_files(repo, revision)
     config = _model_config(directory, repo, revision)
-    architectures = config.get("architectures") or []
+    architecture = architecture_of(config)
     eos = turn_end_token_id(_cpu_tokenizer(directory, repo, revision), _declared_stops(directory))
-    if not architectures or eos is None:
+    if architecture is None or eos is None:
         raise ValueError(f"{repo}@{revision} names no architecture or eos")
-    return {"architecture": str(architectures[0]), "eos_token_id": int(eos)}
+    return {"architecture": architecture, "eos_token_id": int(eos)}
 
 
 def _also(first, second):
@@ -1583,7 +1584,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             w.auction = job_auction(
                 getattr(w.entry, "params", None),
                 backlog=lambda: w.auditor.audit_backlog() + dispatcher.pending_items(job_id),
-                state_path=state_path_for(job_id))
+                state_path=state_path_for(job_id), job=getattr(w, "job", None))
         return w.auction
 
     async def wire(entry, cap, job):

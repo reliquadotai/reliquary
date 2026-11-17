@@ -495,6 +495,7 @@ def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
     taken = TakenSlots()
     closed: set[int] = set()
     steps = 0
+    generation_failures = 0
     leasing = sign_lease is not None and callable(getattr(client, "lease", None))
     asking = leasing and ask_alpha_per_mtoken is not None and callable(getattr(client, "ask", None))
     asked_at = [None]
@@ -512,6 +513,27 @@ def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
         if answer is not None and not answer.get("accepted"):
             counts[f"ask_{answer.get('reason')}"] += 1
             logger.warning("the validator refused this hotkey's ask: %s", answer.get("reason"))
+
+    def release_failed_lease(lease_id: str | None) -> None:
+        if lease_id is None:
+            return
+        for attempt in range(max_consecutive_failures):
+            try:
+                client.release_lease(release_body(job.job_id, hotkey, lease_id, sign_lease))
+                return
+            except (CorpusTransientFailure, CorpusPermanentFailure) as exc:
+                if attempt + 1 >= max_consecutive_failures:
+                    logger.exception("could not release a corpus lease after a generation failure")
+                    return
+                delay = max(_TRANSIENT_BACKOFF_SECONDS[min(attempt, len(_TRANSIENT_BACKOFF_SECONDS) - 1)],
+                            getattr(exc, "retry_after", None) or 0.0)
+                if delay > _TRANSIENT_BACKOFF_SECONDS[-1]:
+                    logger.warning("could not release a corpus lease: retry delay exceeds the cleanup bound")
+                    return
+                sleep(delay)
+            except Exception:
+                logger.exception("could not release a corpus lease after a generation failure")
+                return
 
     while max_steps is None or steps < max_steps:
         steps += 1
@@ -563,22 +585,36 @@ def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
             counts["job_complete"] += 1
             break
         prompt_index, slot = choice
-        rendered = render(prompt_index)
-        draws = [draw_context(job, prompt_index, slot, c) for c in range(job.sampling.n)]
+        try:
+            rendered = render(prompt_index)
+            draws = [draw_context(job, prompt_index, slot, c) for c in range(job.sampling.n)]
+        except Exception:
+            release_failed_lease(lease_id)
+            raise
         try:
             generations = generator.generate_drawn(prompt_token_ids(tokenizer, rendered), draws)
         except ValueError as exc:
             logger.warning("dropping a corpus generation step: %s", exc)
             counts["generation_failed"] += 1
-            if lease_id is not None:
-                # Free at once for another miner, rather than at its expiry.
-                _retry(lambda: client.release_lease(release_body(job.job_id, hotkey, lease_id, sign_lease)),
-                       **retry_kwargs)
+            release_failed_lease(lease_id)
+            generation_failures += 1
+            if generation_failures >= max_consecutive_failures:
+                raise CorpusMinerHalted(
+                    f"{generation_failures} consecutive generation failures: {exc}", counts=counts) from exc
+            sleep(_TRANSIENT_BACKOFF_SECONDS[min(generation_failures - 1, len(_TRANSIENT_BACKOFF_SECONDS) - 1)])
             continue
-        body = build_submission(
-            job=job, hotkey=hotkey, cursor=slot, prompt_index=prompt_index,
-            rendered_prompt=rendered, generations=generations, tokenizer=tokenizer, sign=sign,
-        )
+        except Exception:
+            release_failed_lease(lease_id)
+            raise
+        generation_failures = 0
+        try:
+            body = build_submission(
+                job=job, hotkey=hotkey, cursor=slot, prompt_index=prompt_index,
+                rendered_prompt=rendered, generations=generations, tokenizer=tokenizer, sign=sign,
+            )
+        except Exception:
+            release_failed_lease(lease_id)
+            raise
         answer = _retry(lambda: client.submit(body), **retry_kwargs)
         reason = str(answer.get("reason"))
         counts[reason] += 1

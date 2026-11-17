@@ -16,7 +16,7 @@ import torch
 import torch.distributed as dist
 
 BACKEND_ENV = "RELIQUARY_TRAINER_BACKEND"
-_BACKENDS = ("single", "fsdp2")
+_BACKENDS = ("single", "fsdp2", "miles")  # miles: a Tinker gateway (trainer.miles_engine)
 # Rank 0 may wait hours for the next window while followers block on the
 # command broadcast; only that group gets a timeout this long.
 _CONTROL_TIMEOUT = datetime.timedelta(days=30)

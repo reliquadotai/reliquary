@@ -948,9 +948,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 raise HTTPException(status_code=422, detail=refusal)
             await refuse_past_the_source(body.env, body.prompt_start, body.prompt_count)
             try:
-                from reliquary.eval.sets import refuse_held_out_overlap
+                from reliquary.eval.sets import refuse_order_overlap
 
-                refuse_held_out_overlap(body.env, body.prompt_start, body.prompt_count)
+                refuse_order_overlap(body.env, body.prompt_start, body.prompt_count)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             prompt_source, contract_environment = body.env, None
@@ -1181,7 +1181,12 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if estimate is None:
             return entry
         asked = float(entry.params["cap"])
-        cap = sizing.sized_cap(asked, estimate=estimate)
+        # A start no larger than what the whole order can pay (an episode's tokens, when it plays one).
+        episode = getattr(job, "episode", None)
+        per_sample = max(job.sampling.max_new_tokens, int(getattr(episode, "max_total_tokens", 0) or 0))
+        value = sizing.order_value(entry.params, job.prompt_count * job.sampling.n * per_sample)
+        start = sizing.START_CAP if value is None else min(sizing.START_CAP, value * sizing.HEADROOM)
+        cap = sizing.sized_cap(asked, estimate=estimate, start=start)
         return replace(entry, params={**entry.params, "cap": cap, "floor": cap, sizing.CAP_MAX_PARAM: asked})
 
     async def resize_order_caps() -> int:
@@ -1201,7 +1206,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                     or sizing.CAP_MAX_PARAM not in entry.params):
                 continue
             facts = (jobs.get(entry.job_id) or {}).get("sizing")
-            cap = None if not facts else sizing.resized(entry.params, facts, status)
+            cap = None if not facts else sizing.resized(entry.params, facts, status, clock())
             if cap is None:
                 continue
             try:

@@ -82,6 +82,8 @@ class Lease:
     # A job priced by auction: what each token of this lease pays (pool share) and the round it was granted in.
     price: float | None = None
     round: int | None = None
+    # Its holder's own offer when granted: the price its delivery counts at (``TokenAuction.observe_delivery``).
+    offer: float | None = None
 
     def to_wire(self) -> dict[str, Any]:
         return {"lease_id": self.lease_id, "prompt_index": self.prompt_index, "slot": self.slot,
@@ -282,15 +284,15 @@ class DrawLeases:
 
     def grant(self, hotkey: str, free_slots: Callable[[int], Iterable[tuple[int, int]]], *,
               price: float | None = None, round: int | None = None,
-              seconds: float | None = None) -> Lease | str | None:
+              seconds: float | None = None, offer: float | None = None) -> Lease | str | None:
         """A lease for ``hotkey`` on a free slot: an unleased one, else (the job's tail) one leased to another hotkey
         for more than half its time. ``free_slots(start)`` yields the job's open ``(prompt, slot)``, prompts from
         ``start`` round. ``seconds``: this lease's time, at most the job's. None: no slot to lease; a string: why
         this hotkey gets none."""
         with self._lock:
-            return self._grant(hotkey, free_slots, price, round, seconds)
+            return self._grant(hotkey, free_slots, price, round, seconds, offer)
 
-    def _grant(self, hotkey, free_slots, price=None, round=None, seconds=None):
+    def _grant(self, hotkey, free_slots, price=None, round=None, seconds=None, offer=None):
         self.expire()
         if len(self.held_by(hotkey)) >= self.cap(hotkey):
             return "too_many_leases"
@@ -301,20 +303,21 @@ class DrawLeases:
         for prompt_index, slot in free_slots(start):
             held = self._by_slot.get((prompt_index, slot), ())
             if not held:
-                return self._add(hotkey, prompt_index, slot, now, price, round, seconds, "granted")
+                return self._add(hotkey, prompt_index, slot, now, price, round, seconds, "granted", offer)
             leases = [self._by_id[i] for i in held]
             if (tail is None and len(leases) == 1 and leases[0].hotkey != hotkey
                     and now - leases[0].granted_at >= SECOND_LESSEE_AFTER * (leases[0].expires_at - leases[0].granted_at)):
                 tail = (prompt_index, slot)
         if tail is not None:
-            return self._add(hotkey, *tail, now, price, round, seconds, "granted_second")
+            return self._add(hotkey, *tail, now, price, round, seconds, "granted_second", offer)
         return None
 
     def _add(self, hotkey: str, prompt_index: int, slot: int, now: float, price: float | None = None,
-             round: int | None = None, seconds: float | None = None, event: str = "granted") -> Lease:
+             round: int | None = None, seconds: float | None = None, event: str = "granted",
+             offer: float | None = None) -> Lease:
         span = self.seconds if seconds is None else min(self.seconds, max(1.0, float(seconds), self.floor))
         lease = Lease(secrets.token_hex(16), hotkey, int(prompt_index), int(slot), now, now + span,
-                      price, round)
+                      price, round, offer)
         self._by_id[lease.lease_id] = lease
         self._by_slot.setdefault((lease.prompt_index, lease.slot), []).append(lease.lease_id)
         self._log(event, lease, "" if price is None else f" price={price:.3g}")

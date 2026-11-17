@@ -1734,6 +1734,8 @@ def build_corpus_router(
     # Leases are granted off the event loop: two first requests at once must not each build a lease book (the one
     # that loses would drop the leases it granted, and both write the same state file).
     leases_lock = threading.Lock()
+    # Admission reads holdings before the auction lock: keep each reservation through its lease grant.
+    grant_lock = threading.Lock()
     lease_nonces: dict[str, float] = {}
     # The taken keys of the ledger version last leased from: rebuilt once per version, not per request.
     lease_seen: dict[str, Any] = {}
@@ -2098,7 +2100,7 @@ def build_corpus_router(
                 value = float(own.price) * sum(token_counts)
                 pricing = {"lease_price": float(own.price),
                            "lease_debit": auction.take_debit(request.miner_hotkey, value),
-                           "granted_at": own.granted_at}
+                           "granted_at": own.granted_at, "offer": own.offer}
 
         def unpriced() -> None:
             nonlocal pricing
@@ -2240,7 +2242,8 @@ def build_corpus_router(
         if pricing is not None:
             if written is not None and written.accepted:
                 auction.observe_tokens(sum(token_counts))
-                auction.observe_delivery(request.miner_hotkey, time.time() - pricing["granted_at"])
+                auction.observe_delivery(request.miner_hotkey, time.time() - pricing["granted_at"],
+                                         offer=pricing["offer"])
             else:
                 unpriced()
 
@@ -2863,38 +2866,40 @@ def build_corpus_router(
             """Up to ``wanted`` leases, and why the next one was not granted (None when all were)."""
             from reliquary.corpus.draw_leases import free_draw_slots
 
-            if lease_seen.get("state") is not state:
-                built = set(state.pending)
-                for ref in state.segments:
-                    built.update(seen_index._contents.get(ref.id, ()))
-                lease_seen.update(state=state, seen=built)
-            seen = lease_seen["seen"]
-            ledger = state.slots
-            leases = _leases(job)
+            with grant_lock:
+                if lease_seen.get("state") is not state:
+                    built = set(state.pending)
+                    for ref in state.segments:
+                        built.update(seen_index._contents.get(ref.id, ()))
+                    lease_seen.update(state=state, seen=built)
+                seen = lease_seen["seen"]
+                ledger = state.slots
+                leases = _leases(job)
 
-            def taken(prompt: int, slot: int) -> bool:
-                return slot_key(prompt, slot, ledger.slot_attempt(prompt, slot)) in seen
+                def taken(prompt: int, slot: int) -> bool:
+                    return slot_key(prompt, slot, ledger.slot_attempt(prompt, slot)) in seen
 
-            granted = []
-            for _ in range(wanted):
-                terms = None
-                seconds = None
-                if auction is not None:
-                    terms = auction.admit(request.miner_hotkey)
-                    if isinstance(terms, str):
-                        return granted, terms
-                    seconds = auction.lease_seconds(request.miner_hotkey, leases.seconds,
-                                                    held=len(leases.held_by(request.miner_hotkey)))
-                try:
-                    lease = leases.grant(request.miner_hotkey, free_draw_slots(job, ledger, taken),
-                                         price=None if terms is None else terms.price, seconds=seconds)
-                finally:
-                    if terms is not None:
-                        auction.unreserve(terms)
-                if lease is None or isinstance(lease, str):
-                    return granted, "no_free_slot" if lease is None else lease
-                granted.append(lease)
-            return granted, None
+                granted = []
+                for _ in range(wanted):
+                    terms = None
+                    seconds = None
+                    if auction is not None:
+                        terms = auction.admit(request.miner_hotkey)
+                        if isinstance(terms, str):
+                            return granted, terms
+                        seconds = auction.lease_seconds(request.miner_hotkey, leases.seconds,
+                                                        held=len(leases.held_by(request.miner_hotkey)))
+                    try:
+                        lease = leases.grant(request.miner_hotkey, free_draw_slots(job, ledger, taken),
+                                             price=None if terms is None else terms.price, seconds=seconds,
+                                             offer=None if terms is None else terms.offer)
+                    finally:
+                        if terms is not None:
+                            auction.unreserve(terms)
+                    if lease is None or isinstance(lease, str):
+                        return granted, "no_free_slot" if lease is None else lease
+                    granted.append(lease)
+                return granted, None
 
         granted, why = await asyncio.to_thread(grant)
         if not granted:

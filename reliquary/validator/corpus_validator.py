@@ -864,7 +864,8 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
         auditor = getattr(served, "auditor", None)
         auction = job_auction(getattr(served.entry, "params", None),
                               backlog=getattr(auditor, "audit_backlog", None),
-                              state_path=state_path_for(str(served.entry.job_id)))
+                              state_path=state_path_for(str(served.entry.job_id)),
+                              job=getattr(served, "job", None))
         try:
             served.auction = auction          # one auction per job, whatever rebuilds its router
         except AttributeError:

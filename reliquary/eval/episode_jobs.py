@@ -7,10 +7,12 @@ import hashlib
 from collections.abc import Mapping
 
 # The turn renderer a signed episode order plays with, by model architecture: only the
-# Qwen3.5/3.8 family has one (`renderers:qwen38`).
+# Qwen3.5/3.8 family has one (`renderers:qwen38`). Its MoE (Qwen3.5/3.6-35B-A3B) shares
+# the family's tokenizer byte for byte, so it renders the same IDs.
 EPISODE_RENDERER_FAMILIES = {
     "Qwen3_5ForConditionalGeneration": "renderers:qwen38@",
     "Qwen3_5ForCausalLM": "renderers:qwen38@",
+    "Qwen3_5MoeForConditionalGeneration": "renderers:qwen38@",
 }
 # A suite episode (a replayed tool world) renders through Catalyst's own ChatML tools
 # renderer, the one its registry spec names; served for the same model family.

@@ -66,6 +66,40 @@ def test_model_facts_turns_missing_files_into_a_refusal(tmp_path, monkeypatch):
         eval_control.load_cpu_tokenizer("adapter/only", "r" * 40)
 
 
+@pytest.mark.parametrize("config,architecture", [
+    # Gemma 4 26B-A4B: the dense 31B's class, with experts nobody measured.
+    ({"architectures": ["Gemma4ForConditionalGeneration"],
+      "text_config": {"enable_moe_block": True, "num_experts": 128}}, "Gemma4ForConditionalGeneration+experts"),
+    ({"architectures": ["Gemma4ForConditionalGeneration"], "text_config": {"enable_moe_block": False}},
+     "Gemma4ForConditionalGeneration"),
+    # Qwen3.6-35B-A3B: measured with its experts.
+    ({"architectures": ["Qwen3_5MoeForConditionalGeneration"], "text_config": {"num_experts": 256}},
+     "Qwen3_5MoeForConditionalGeneration"),
+    ({"architectures": ["Qwen3MoeForCausalLM"], "num_experts": 128}, "Qwen3MoeForCausalLM"),
+    ({"architectures": ["Qwen3ForCausalLM"]}, "Qwen3ForCausalLM"),
+    ({}, None),
+])
+def test_a_checkpoint_with_unmeasured_experts_is_not_its_dense_class(config, architecture):
+    from reliquary.constants import SUPPORTED_ARCHITECTURES, architecture_of
+
+    assert architecture_of(config) == architecture
+    if architecture is not None:
+        assert (architecture in SUPPORTED_ARCHITECTURES) == (not architecture.endswith("+experts"))
+
+
+def test_model_facts_names_unmeasured_experts(tmp_path, monkeypatch):
+    from reliquary.validator import eval_control
+
+    monkeypatch.setattr(eval_control, "_model_files", lambda repo, revision: str(tmp_path))
+    monkeypatch.setattr(eval_control, "_cpu_tokenizer", lambda *a: object())
+    monkeypatch.setattr(eval_control, "_declared_stops", lambda directory: ())
+    monkeypatch.setattr("reliquary.shared.modeling.turn_end_token_id", lambda tok, stops: 1)
+    (tmp_path / "config.json").write_text(json.dumps({"architectures": ["Gemma4ForConditionalGeneration"],
+                                                      "text_config": {"enable_moe_block": True}}))
+    assert eval_control.model_facts("google/gemma-4-26B-A4B-it", "r" * 40)["architecture"] \
+        == "Gemma4ForConditionalGeneration+experts"
+
+
 def test_a_pending_qualification_expires(monkeypatch):
     from reliquary.infrastructure import corpus_job_store as job_store
     from tests.unit.test_corpus_job_store import _FakeMultiObjectR2
