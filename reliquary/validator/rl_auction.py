@@ -13,9 +13,9 @@ price multiplier (``rl_price``) and the per-hotkey quota (``rl_lease_quota``):
 * **A lease's price** is the auction's: the higher of its holder's offer and the price of the moment (the offer
   under which 80 % of the env's recently delivered leases were won), never above the dearest offer given work.
 * **A training order's limits** (``training_order``: ``deadline_at``, ``max_steps``, ``max_tokens``): once the
-  deadline passes, the latest checkpoint reaches ``max_steps`` or the accrued pay covers ``max_tokens`` matched
-  tokens, every env's budget is 0 and no lease goes out. The leases already out may still deliver: the overrun is
-  at most the budget at the stop (the trainer's next ``lag_target`` steps).
+  deadline passes, the latest checkpoint reaches ``max_steps`` or consumed work covers ``max_tokens`` matched
+  tokens, every env's budget is 0 and no lease goes out. Already issued leases and buffered work may still drain;
+  admission closure is not final usage or trainer shutdown proof.
 * **A lease not delivered** (expired, forfeited, refused for integrity) charges its price times the env's mean
   matched tokens per trained group, taken from the holder's next accruals on the env. Our failures charge nothing.
 """
@@ -81,7 +81,8 @@ def auction_settings(params: Mapping, targets: Mapping[str, float], *, batch_gro
     lag_target(params)
     if batch_groups < 1 or not targets:
         raise ValueError("an RL auction needs the trainer's batch and a target mix")
-    return {k: params[k] for k in (PRICING_PARAM, LAG_TARGET_PARAM, *MAX_PRICE_PARAMS) if k in params}
+    return {k: params[k] for k in (PRICING_PARAM, LAG_TARGET_PARAM, TRAINING_ORDER_PARAM, *MAX_PRICE_PARAMS)
+            if k in params}
 
 
 class RlAuctions:
@@ -99,6 +100,7 @@ class RlAuctions:
         self._book = None
         self.clock = clock
         self.limits: dict[str, float] = {}       # a training order's (``from_params``); none: never stops
+        self.admission: Callable[[], str | None] | None = None
         self.auctions: dict[str, TokenAuction] = {
             env: TokenAuction(params, clock=clock, mean_tokens=mean_tokens,
                               holdings=lambda env=env: self._holdings(env),
@@ -154,31 +156,54 @@ class RlAuctions:
         return sum(1 for verdict, training in rows if verdict == "in_zone" and training != "rejected") / len(rows)
 
     def paid_tokens(self) -> float:
-        """The matched tokens the task's accrued pay stands for (a first scan at its share of a trained group)."""
+        """Consumed matched tokens, before penalties or forfeiture; first scans at their gross reference share."""
         if self._book is None:
             return 0.0
         with self._book.lock:
             db = self._book.db
             if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='rl_accruals'").fetchone():
                 return 0.0
-            row = db.execute("SELECT SUM(CASE WHEN token_price > 0 THEN amount / token_price ELSE matched_tokens END)"
-                             " FROM rl_accruals WHERE status != 'forfeited'").fetchone()
+            if db.execute("SELECT 1 FROM rl_accruals WHERE budget_tokens IS NULL LIMIT 1").fetchone():
+                return math.inf                   # an old first scan has no recoverable gross usage
+            row = db.execute("SELECT SUM(budget_tokens) FROM rl_accruals").fetchone()
         return float(row[0] or 0.0)
 
     def stopped(self) -> str | None:
         """Which of the training order's limits is reached (None: none, or no order)."""
+        if self.admission is not None and (reason := self.admission()) is not None:
+            return reason
         limits = self.limits
         if not limits:
             return None
+        if self._book is not None:
+            with self._book.lock:
+                row = self._book.db.execute("SELECT value FROM rl_lease_meta WHERE key='training_limit_stop'").fetchone()
+            if row is not None:
+                return row[0]
+        reason = None
         if "deadline_at" in limits and float(self.clock()) >= float(limits["deadline_at"]):
-            return "deadline"
-        if "max_steps" in limits and self._book is not None:
+            reason = "deadline"
+        elif "max_steps" in limits and self._book is not None:
             latest = self._book.latest_checkpoint
             if latest is not None and latest >= int(limits["max_steps"]):
-                return "max_steps"
-        if "max_tokens" in limits and self.paid_tokens() >= float(limits["max_tokens"]):
-            return "max_tokens"
-        return None
+                reason = "max_steps"
+        if reason is None and "max_tokens" in limits:
+            if self._book is not None:
+                with self._book.lock:
+                    db = self._book.db
+                    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='rl_events'").fetchone():
+                        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='rl_pay_cursor'").fetchone():
+                            return "ledger_pending"
+                        cursor = db.execute("SELECT seq FROM rl_pay_cursor WHERE id=0").fetchone()
+                        if cursor is None or db.execute("SELECT 1 FROM rl_events WHERE seq>? LIMIT 1", (cursor[0],)).fetchone():
+                            return "ledger_pending"  # a stalled ingestion must not authorize more work
+            if self.paid_tokens() >= float(limits["max_tokens"]):
+                reason = "max_tokens"
+        if reason is not None and self._book is not None:
+            with self._book.transaction():
+                self._book.db.execute("INSERT OR IGNORE INTO rl_lease_meta(key,value) VALUES('training_limit_stop',?)",
+                                      (reason,))
+        return reason
 
     def budget(self, env: str) -> int:
         if self.stopped() is not None:

@@ -1474,7 +1474,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
     if training_enabled():
         from reliquary.admin.training import (
-            order_digest, training_entry, training_refusal, training_task_id, training_view,
+            order_digest, training_capabilities, training_entry, training_refusal, training_task_id, training_view,
         )
 
         async def training_task(task_id: str):
@@ -1525,6 +1525,10 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             logger.info("admin: declared training %s as task %s", body.training_id, task_id)
             response.status_code = 201
             return {**training_view(entry), "created": True}
+
+        @router.get("/training/capabilities")
+        async def training_service_capabilities() -> dict:
+            return training_capabilities()
 
         @router.get("/training/{task_id}")
         async def training_status(task_id: str) -> dict:

@@ -939,6 +939,13 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     state_dir = _validator_state_dir()
     state_dir.mkdir(parents=True, exist_ok=True)
     rl = build_rl_async(settings, path=state_dir / DB_NAME, grader=grader, prompt_range=ranges)
+    training_admission = None
+    if entry.params.get("training_order") is not None:
+        from reliquary.validator.rl_training_orders import TrainingAdmission, load_training_entry
+
+        training_admission = TrainingAdmission(entry, rl.book, load=load_training_entry)
+        rl.book.auctions.admission = training_admission.reason
+        await training_admission.refresh()
     from reliquary.validator import telemetry
 
     telemetry.init(validator_hotkey, {"task_id": settings.task_id, "run": settings.run, "cap": cap,
@@ -998,6 +1005,8 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     background = rl_async_loops(rl, archives=archives, audit_model=audit_model, publisher=publisher,
                                 trainer_audits=source == "trainer",
                                 cards=CardFeed(setups, state_dir / "rl-card-models.json"))
+    if training_admission is not None:
+        background.append(training_admission.refresh_forever())
     if rl.sandbox is not None:
         background.extend(rl.sandbox.background())
     if registered is not None:

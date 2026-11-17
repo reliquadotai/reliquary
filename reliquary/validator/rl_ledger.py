@@ -131,6 +131,12 @@ class RlPayLedger:
         self._beat_at: float | None = None        # the last trainer_beat write (memory only)
         with book.lock:
             book.db.executescript(_SCHEMA)
+            columns = {row[1] for row in book.db.execute("PRAGMA table_info(rl_accruals)")}
+            if "budget_tokens" not in columns:
+                book.db.execute("ALTER TABLE rl_accruals ADD COLUMN budget_tokens REAL")
+            # Old first scans lost their gross value to penalties: unknown usage must not reopen a budget.
+            book.db.execute("UPDATE rl_accruals SET budget_tokens=matched_tokens WHERE kind=? AND budget_tokens IS NULL",
+                            (TRAINED,))
             book.db.execute("INSERT OR IGNORE INTO rl_pay_cursor(id, seq) VALUES(0, 0)")
             book.db.commit()
 
@@ -179,6 +185,7 @@ class RlPayLedger:
                 if kind == TRAINED:
                     environment = detail["environment"]
                     tokens = paid_tokens(detail, self.config.floor)
+                    budget_tokens = float(tokens)
                     price = self._price(event["lease_id"], environment)
                     amount = tokens * price
                 elif kind == FIRST_SCAN:
@@ -187,7 +194,9 @@ class RlPayLedger:
                     environment = row[0]
                     tokens = 0
                     price = self._price(event["lease_id"], environment)
-                    amount = float(detail["fraction"]) * price * self._reference_tokens(environment)
+                    reference = self._reference_tokens(environment)
+                    budget_tokens = float(detail["fraction"]) * reference
+                    amount = float(detail["fraction"]) * price * reference
                 else:
                     continue                      # untrained, first_scan_forfeited: no money
                 status = FORFEITED if self._banned(hotkey, at) else ACCRUED
@@ -197,9 +206,9 @@ class RlPayLedger:
                     # An undelivered lease's charge is taken back from the hotkey's next pay on the env.
                     amount -= self.auctions.take_debit(environment, hotkey, amount)
                 db.execute("INSERT INTO rl_accruals(seq, lease_id, hotkey, environment, kind, at, period, "
-                           "matched_tokens, token_price, amount, status) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                           "matched_tokens, token_price, amount, status, budget_tokens) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                            (event["seq"], event["lease_id"], hotkey, environment, kind, at, self._open_period(at),
-                            tokens, price, amount, status))
+                            tokens, price, amount, status, budget_tokens))
             db.execute("UPDATE rl_pay_cursor SET seq=? WHERE id=0", (events[-1]["seq"],))
         return len(events)
 

@@ -31,6 +31,7 @@ def test_off_by_default(monkeypatch, request, rates):  # noqa: F811
     monkeypatch.delenv(training.TRAINING_ORDERS_ENV, raising=False)
     client = request.getfixturevalue("admin")
     assert client("POST", "/admin/v1/training", _order()).status_code == 404
+    assert client("GET", "/admin/v1/training/capabilities").status_code == 404
 
 
 def test_a_bad_flag_is_a_configuration_error():
@@ -112,8 +113,44 @@ def test_status_and_retire(on):
     assert on("POST", "/admin/v1/training", _order()).status_code == 201
     status = on("GET", "/admin/v1/training/order-train-t1")
     assert status.status_code == 200 and status.json()["order"]["training_id"] == "t1"
+    assert status.json()["runtime"] == {"state": "unknown", "managed": False}
     retired = on("POST", "/admin/v1/training/order-train-t1/retire", {})
     assert retired.status_code == 200 and retired.json()["status"] == "retired"
     assert on("POST", "/admin/v1/training/order-train-t1/retire", {}).json()["status"] == "retired"
     assert on("GET", "/admin/v1/training/order-train-nope").status_code == 404
     assert on("GET", "/admin/v1/training/default").status_code == 409
+
+
+def test_capabilities_do_not_claim_a_managed_paid_runtime(on):
+    response = on("GET", "/admin/v1/training/capabilities")
+    assert response.status_code == 200
+    assert response.json() == {"schema": "reliquary/training-capabilities/v1", "task_declaration": True,
+                               "runtime_orchestration": False, "final_usage": False,
+                               "checkpoint_delivery": False, "paid_admission": False}
+
+
+def test_admin_retirement_fences_a_live_training_book_without_cancelling_issued_work(on, tmp_path):
+    import asyncio
+
+    from reliquary.validator.rl_async_service import build_rl_async, rl_async_settings
+    from reliquary.validator.rl_leases import LeaseRequest
+    from reliquary.validator.rl_training_orders import TrainingAdmission, load_training_entry
+
+    assert on("POST", "/admin/v1/training", _order()).status_code == 201
+    entry = on.registry["entries"]["order-train-t1"]
+    settings = rl_async_settings(entry, entry.params["cap"], max_tokens=lambda env: 4000)
+    rl = build_rl_async(settings, path=tmp_path / "live.sqlite3", grader=None)
+    try:
+        gate = TrainingAdmission(entry, rl.book, load=load_training_entry)
+        rl.book.auctions.admission = gate.reason
+        assert asyncio.run(gate.refresh())
+        rl.book.adopt_checkpoint(0)
+        env = "reliquary_dapo_math_v1"
+        rl.book.auctions.post_ask(env, "A", .2, 8)
+        lease = rl.book.grant([LeaseRequest("A", env, (1,), 0)])[0].leases[0]
+        assert on("POST", "/admin/v1/training/order-train-t1/retire", {}).status_code == 200
+        assert not asyncio.run(gate.refresh()) and gate.reason() == "registry_retired"
+        assert not rl.book.grant([LeaseRequest("A", env, (2,), 0)])[0].leases
+        assert rl.book.submit(lease.lease_id, "A", in_zone=True).state == "submitted"
+    finally:
+        rl.close()

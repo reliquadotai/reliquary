@@ -7,6 +7,8 @@ checkpoints ahead of the trainer.
 
 Off unless ``RELIQUARY_TRAINING_ORDERS=on``: the routes are not served, and a request answers 404. The controller
 and the trainer are still started by an operator for each task (one controller per container).
+The signed capabilities route therefore refuses paid admission; a declaration or registry retirement proves
+neither runtime execution nor final usage nor a delivered checkpoint.
 
 The task is an ``rl-discovered-price`` async task, not a ``service-rl`` one: the async controller reads its
 ``env_split`` and ``rl_*`` params, and nothing async consumes a service contract yet.
@@ -31,6 +33,13 @@ MAX_ENVIRONMENTS = 16
 DEFAULT_PLANNED_TOKENS_PER_PERIOD = 2e8
 # The limits the order carries: the RL auction leases nothing once one is reached (``rl_auction.RlAuctions.stopped``).
 TRAINING_PARAM = "training_order"
+
+
+def training_capabilities() -> dict:
+    """Declaration is available; it does not establish a managed, billable training service."""
+    return {"schema": "reliquary/training-capabilities/v1", "task_declaration": True,
+            "runtime_orchestration": False, "final_usage": False, "checkpoint_delivery": False,
+            "paid_admission": False}
 
 
 def training_enabled(env: Mapping[str, str] | None = None) -> bool:
@@ -146,8 +155,8 @@ def training_view(entry) -> dict:
             "cap": float(params.get("cap", 0.0)), "retired_at": entry.retired_at,
             "environments": {k: v for k, v in (entry.env_split or {}).items() if v > 0},
             "batch_groups": params.get("rl_batch_groups"), "lag_target": params.get("rl_auction_lag_target"),
-            "order": params.get(TRAINING_PARAM)}
+            "order": params.get(TRAINING_PARAM), "runtime": {"state": "unknown", "managed": False}}
 
 
 __all__ = ["CreateTraining", "TRAINING_ORDERS_ENV", "order_digest", "training_enabled", "training_entry", "training_refusal",
-           "training_task_id", "training_view"]
+           "training_capabilities", "training_task_id", "training_view"]
