@@ -338,6 +338,7 @@ class RlAsync:
     observations: Any = None                    # rl_observations.ObservationBoard (None: /rl/observations 503s)
     sandbox: Any = None                         # rl_async_episodes.RlLeaseSandbox (episode envs only)
     benchmarks: Any = None                      # run_id -> the run's benchmark feed bytes or None (/rl/benchmarks)
+    runtime: Any = None                         # Private supervised lifecycle; absent for legacy workers.
 
     def close(self) -> None:
         self.book.close()
@@ -430,7 +431,8 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
     def beat_then(op: Callable[[dict], Any], body: dict) -> Any:
         """Any trainer call proves it alive (the outage pay); a failed beat never fails the call."""
         try:
-            rl.ledger.trainer_beat()
+            if getattr(rl, "runtime", None) is None or not rl.runtime.sealed():
+                rl.ledger.trainer_beat()
         except Exception:
             logger.exception("trainer beat failed")
         return op(body)
@@ -439,11 +441,27 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
         async def handler(request: Request) -> JSONResponse:
             if not authorized(request):
                 return refused(401, "unauthorized")
+            runtime = getattr(rl, "runtime", None)
+            if runtime is not None and method == "POST" and runtime.sealed() and path not in (
+                    "runtime/quiesced", "heartbeat"):
+                return refused(409, "runtime_quiesced")
             try:
                 body = await request.json() if method == "POST" else dict(request.query_params)
                 if not isinstance(body, dict):
                     raise ValueError("the body is not an object")
-                result = await asyncio.to_thread(beat_then, op, body)
+                def invoke():
+                    if runtime is None:
+                        return False, beat_then(op, body)
+                    with rl.book.lock:
+                        if method == "POST" and runtime.sealed() and path not in ("runtime/quiesced", "heartbeat"):
+                            return True, None
+                        if path in ("take", "take_older", "take_exhausted", "audits") and runtime.drain_requested():
+                            return False, {"groups": []}
+                        return False, beat_then(op, body)
+
+                fenced, result = await asyncio.to_thread(invoke)
+                if fenced:
+                    return refused(409, "runtime_quiesced")
             except LookupError as exc:
                 return refused(404, "unknown", str(exc))
             except (ValueError, TypeError, KeyError) as exc:
@@ -502,6 +520,11 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
     route("POST", "audits", take_audits)
     route("POST", "audit", report_audit)
     route("POST", "heartbeat", lambda b: {"ok": True})        # the beat is in every call
+    if getattr(rl, "runtime", None) is not None:
+        route("GET", "runtime", lambda b: rl.runtime.snapshot())
+        route("POST", "drain", rl.runtime.drain)
+        route("POST", "runtime/ready", rl.runtime.ready)
+        route("POST", "runtime/quiesced", rl.runtime.quiesce)
 
     async def checkpoint(request: Request) -> JSONResponse:
         """``/rl/checkpoint``'s answer for the trainer's resume (it reaches this listener only)."""
@@ -946,6 +969,13 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
         training_admission = TrainingAdmission(entry, rl.book, load=load_training_entry)
         rl.book.auctions.admission = training_admission.reason
         await training_admission.refresh()
+    from reliquary.rl_orders.runtime import supervised_runtime
+
+    rl.runtime = supervised_runtime(entry, rl)
+    if rl.runtime is not None:
+        if rl.book.auctions is None or training_admission is None:
+            raise ValueError("a supervised runtime requires a training order with auction admission")
+        rl.book.auctions.admission = lambda: rl.runtime.admission_reason() or training_admission.reason()
     from reliquary.validator import telemetry
 
     telemetry.init(validator_hotkey, {"task_id": settings.task_id, "run": settings.run, "cap": cap,
@@ -1007,6 +1037,11 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
                                 cards=CardFeed(setups, state_dir / "rl-card-models.json"))
     if training_admission is not None:
         background.append(training_admission.refresh_forever())
+    if rl.runtime is not None:
+        async def runtime_limits():
+            await asyncio.to_thread(rl.runtime.check_limits)
+
+        background.append(_every(runtime_limits, 1.0, "managed runtime limits"))
     if rl.sandbox is not None:
         background.extend(rl.sandbox.background())
     if registered is not None:

@@ -39,6 +39,29 @@ def test_a_bad_flag_is_a_configuration_error():
         training.training_enabled({training.TRAINING_ORDERS_ENV: "yes"})
 
 
+def test_legacy_order_digest_is_preserved_when_quote_binding_is_absent():
+    assert training.order_digest(training.CreateTraining(**_order())) == (
+        "33a31835ba45c4f5eaa0904cd701b016eabd6377351a608f00edd735ce688bb0")
+
+
+def test_quote_binding_is_opaque_immutable_and_echoed_by_the_admin(on):
+    bound = dict(quote_id="quote-1", quote_sha256="c" * 64, billing_basis=training.BILLING_BASIS)
+    created = on("POST", "/admin/v1/training", _order(**bound))
+    assert created.status_code == 201
+    assert all(created.json()["order"][key] == value for key, value in bound.items())
+    assert on("POST", "/admin/v1/training", _order(**bound)).status_code == 200
+    assert on("POST", "/admin/v1/training", _order(**{**bound, "quote_sha256": "d" * 64})).status_code == 409
+
+
+@pytest.mark.parametrize("binding", [
+    {"quote_id": "quote-1"}, {"quote_sha256": "c" * 64},
+    {"quote_id": "quote-1", "quote_sha256": "c" * 64},
+    {"quote_id": "quote-1", "quote_sha256": "not-a-digest", "billing_basis": training.BILLING_BASIS},
+])
+def test_partial_or_malformed_quote_binding_is_refused(on, binding):
+    assert on("POST", "/admin/v1/training", _order(**binding)).status_code == 422
+
+
 def test_an_order_declares_an_async_rl_task_priced_by_auction(on):
     created = on("POST", "/admin/v1/training", _order())
     assert created.status_code == 201, created.text

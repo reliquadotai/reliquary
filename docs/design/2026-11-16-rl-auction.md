@@ -162,7 +162,9 @@ lease book has no quota, no global pending cap and no lanes: the budget is the b
    deadline_seconds, max_tokens?}, max_price_usd_per_mtoken, batch_groups, lag_target, cap?}` declares
    `order-train-<id>`, an `rl-discovered-price` async task (the async controller reads `env_split` and `rl_*`;
    nothing async consumes a service contract yet); `GET /admin/v1/training/{task}` and `POST .../retire`. The
-   profile must draw by Gumbel-max. The controller and the trainer are still started by an operator per task.
+   profile must draw by Gumbel-max. The [managed local runtime](../managed-training-runtime.md) now starts and
+   drains an operator-allocated controller/trainer pair and publishes verified usage and owned checkpoint
+   delivery. Its paid admission remains disabled pending real qualification and approval of the draft terms.
 3. A training run on rented GPUs: a small model, our own miners on the rented box, two single-turn envs and one
    episode env, to check the budget keeps the trainer fed without groups dying of lag and the trainer never waits for long.
 4. Public environments in the catalog with `rl` rows.
