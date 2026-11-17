@@ -498,8 +498,8 @@ class AsyncTrainer:
                 self._reporter.shutdown(wait=True)
 
     def drain_requested(self) -> bool:
-        if not self._draining and self._drain_requested is not None:
-            self._draining = bool(self._drain_requested())
+        if not self._draining and self._drain_requested is not None and self._drain_requested():
+            self._draining = True
         return self._draining
 
     def quiesce(self) -> None:

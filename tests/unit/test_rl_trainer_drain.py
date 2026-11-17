@@ -74,6 +74,35 @@ def test_a_partial_batch_is_reported_untrained_without_waiting_for_more_work():
         book.db.close()
 
 
+def test_a_stale_false_probe_cannot_undo_a_drain_observed_by_another_thread():
+    entered, release = threading.Event(), threading.Event()
+    answers, probes = [], []
+
+    def drain():
+        probes.append(threading.current_thread().name)
+        if threading.current_thread().name == "stale-drain-probe":
+            entered.set()
+            assert release.wait(3)
+            return False
+        return True
+
+    trainer, book, _, _ = make_trainer(drain=drain)
+    thread = threading.Thread(target=lambda: answers.append(trainer.drain_requested()), name="stale-drain-probe")
+    try:
+        thread.start()
+        assert entered.wait(1)
+        assert trainer.drain_requested()
+        release.set()
+        thread.join(2)
+        assert not thread.is_alive() and answers == [True]
+        assert trainer.drain_requested() and len(probes) == 2
+    finally:
+        release.set()
+        thread.join(2)
+        trainer.close()
+        book.db.close()
+
+
 def test_an_inflight_step_finishes_and_quiescence_joins_its_publication_and_prefetch():
     state = {"draining": False}
     publishing, release, finished = threading.Event(), threading.Event(), threading.Event()
