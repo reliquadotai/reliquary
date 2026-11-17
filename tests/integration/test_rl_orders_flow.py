@@ -157,6 +157,7 @@ def on(monkeypatch, request, rates):  # noqa: F811
     return request.getfixturevalue("admin")
 
 
+@pytest.mark.slow
 async def test_a_training_order_runs_end_to_end_without_an_operator(on, monkeypatch, tmp_path):
     from reliquary.admin import service
     from reliquary.miner.rl_async import HeldLease, HttpRlTransport, encode_submission

@@ -205,3 +205,11 @@ A deploy that restarts the supervisor restarts every training controller (they a
 answers connection refused for the few seconds a controller takes to start. A retired task whose bill is not yet
 final is restarted too, to settle its last period without leasing. A lock file in `--state-dir` keeps a second
 supervisor from running on the same directory.
+
+Operator-started async runs (`reliquary validate` with `RELIQUARY_RL_MODE=async` by hand) do not share a host with
+the front: run them on their own host and port.
+
+`reliquary rl front` believes `X-Forwarded-Proto` only from `--forwarded-allow-ips` (default `127.0.0.1`, the
+host's TLS terminator); trainer paths cross it only over HTTPS. A training order's pod reaches
+`/rl/<task>/trainer` there (`RELIQUARY_TASK_ID` and `RELIQUARY_RL_TRAINER_EXECUTOR_ID` set on the pod). Retiring
+the order revokes its pods.
