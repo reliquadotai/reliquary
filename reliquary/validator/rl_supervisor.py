@@ -257,8 +257,8 @@ def task_model(entry: Any) -> dict | None:
     return {"id": str(profile.model_id), "revision": str(profile.model_revision)}
 
 
-CHILD_DROPPED_ENV = ("RELIQUARY_RL_TRAINER_TOKEN", "RELIQUARY_RL_TRAINER_BIND", "RELIQUARY_PROTOCOL_PROFILE",
-                     "RELIQUARY_TASK_CONTRACT")
+CHILD_DROPPED_ENV = ("RELIQUARY_RL_TRAINER_TOKEN", "RELIQUARY_RL_TRAINER_BIND")
+PROFILE_ENV = ("RELIQUARY_PROTOCOL_PROFILE", "RELIQUARY_TASK_CONTRACT")
 
 
 def child_profile(entry: Any, task_dir: Path) -> tuple[dict[str, str], list[str]]:
@@ -287,7 +287,8 @@ def subprocess_spawn(command: list[str], state_dir: Path, env: Mapping[str, str]
         task_dir = state_dir / task_id
         task_dir.mkdir(parents=True, exist_ok=True)
         profile_env, options = child_profile(entry, task_dir)
-        child = {k: v for k, v in env.items() if k not in CHILD_DROPPED_ENV}
+        dropped = CHILD_DROPPED_ENV + (PROFILE_ENV if profile_env else ())
+        child = {k: v for k, v in env.items() if k not in dropped}
         log = open(state_dir / f"{task_id}.log", "ab")
         try:
             return subprocess.Popen(
