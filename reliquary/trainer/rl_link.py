@@ -142,7 +142,7 @@ class TrainerLink:
         return dict(self._call("POST", "reads", {"keys": list(keys)})["urls"])
 
     def delete_keys(self, keys: Sequence[str]) -> None:
-        self._call("POST", "deletes", {"keys": list(keys)})
+        self._call("POST", "deletes", {"keys": list(keys)}, resend_ok=True)
 
     # --- the audits (trainer.audits) ------------------------------------------------------------------------------
     def take_audits(self, limit: int) -> list[SubmittedGroup]:

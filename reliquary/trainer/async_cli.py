@@ -114,6 +114,19 @@ def checkpoint_store(link, env: Mapping[str, str] = os.environ):
     return R2ObjectStore(public_checkpoint_client(), public_checkpoint_bucket())
 
 
+def publisher_options(store) -> dict[str, int]:
+    """Extra ``DeltaPublisher`` arguments a store asks for (the presigned one: smaller anchor shards)."""
+    size = getattr(store, "anchor_shard_bytes", None)
+    return {} if size is None else {"anchor_shard_bytes": int(size)}
+
+
+def drop_hf_backup_on_pod(store, settings: dict) -> None:
+    """A pod on presigned uploads holds no bucket or hub credential: the HF backup is off there."""
+    if getattr(store, "anchor_shard_bytes", None) is not None and settings["hf_prefix"]:
+        logger.warning("presigned checkpoint store: the Hugging Face backup is off on this pod")
+        settings["hf_prefix"] = settings["hf_every"] = None
+
+
 def resume_weights(link, *, validator_hotkey: str, work_dir: Path, sync=None, fetch=None):
     """``(state, version, model_files_dir)`` of the latest published checkpoint, or None on a fresh book. A published
     version ahead of the book (published, then the trainer died before adopting it) is adopted here."""
@@ -241,8 +254,10 @@ def run_async_train_worker() -> None:
         logger.info("startup_stage=trainer_model_load elapsed_seconds=%.3f", time.monotonic() - started)
         reset_training_state()
 
-        publisher = DeltaPublisher(run=str(task["run"]),
-                                   store=checkpoint_store(link),
+        store = checkpoint_store(link)
+        drop_hf_backup_on_pod(store, settings)
+        publisher = DeltaPublisher(run=str(task["run"]), **publisher_options(store),
+                                   store=store,
                                    staging_dir=state_dir / "staging", anchor_interval=settings["anchor_interval"],
                                    model_dir=model_dir)
         backup = None

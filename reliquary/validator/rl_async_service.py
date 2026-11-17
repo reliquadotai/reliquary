@@ -114,6 +114,7 @@ EXPIRE_EVERY_S = 5.0
 AUDIT_EVERY_S = 2.0
 AUDIT_LIMIT = 8
 MAX_TRAINER_KEYS = 512            # object keys one presigned-upload, read or delete call may ask for
+MAX_TRAINER_KEY_BYTES = 1024
 MAX_TRAINER_AUDITS = 256          # audit jobs one trainer-link take may ask for
 LEDGER_EVERY_S = 30.0
 PRICE_EVERY_S = 30.0
@@ -563,6 +564,8 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str | None = None, auth: Trai
         if len(keys) > MAX_TRAINER_KEYS:
             raise ValueError(f"at most {MAX_TRAINER_KEYS} keys per call")
         prefix_ = run_prefix(rl.settings.run) + "/"
+        if any(len(k.encode()) > MAX_TRAINER_KEY_BYTES for k in keys):
+            raise ValueError(f"a key is over {MAX_TRAINER_KEY_BYTES} bytes")
         if any(not k.startswith(prefix_) or ".." in k.split("/") for k in keys):
             raise ValueError(f"keys must be under {prefix_}")
         return keys
