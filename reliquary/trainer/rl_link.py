@@ -134,6 +134,16 @@ class TrainerLink:
         """Tell the validator this trainer is alive (it pays miners for the time the trainer is down)."""
         self._call("POST", "heartbeat", {}, patience_s=patience_s)
 
+    # --- the checkpoint bucket, through the validator's presigned URLs ---------------------------------------------
+    def upload_urls(self, keys: Sequence[str]) -> dict[str, str]:
+        return dict(self._call("POST", "uploads", {"keys": list(keys)})["urls"])
+
+    def read_urls(self, keys: Sequence[str]) -> dict[str, str]:
+        return dict(self._call("POST", "reads", {"keys": list(keys)})["urls"])
+
+    def delete_keys(self, keys: Sequence[str]) -> None:
+        self._call("POST", "deletes", {"keys": list(keys)})
+
     # --- the audits (trainer.audits) ------------------------------------------------------------------------------
     def take_audits(self, limit: int) -> list[SubmittedGroup]:
         """Up to ``limit`` queued out-of-zone audits (the validator drops the stale ones first)."""

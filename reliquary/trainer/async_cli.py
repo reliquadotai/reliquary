@@ -96,6 +96,24 @@ def async_trainer_settings(env: Mapping[str, str] = os.environ) -> dict[str, Any
     }
 
 
+EXECUTOR_ID_ENV = "RELIQUARY_RL_TRAINER_EXECUTOR_ID"
+
+
+def checkpoint_store(link, env: Mapping[str, str] = os.environ):
+    """The publisher's store: presigned uploads through the link on a rented pod (an executor id and no
+    ``R2_PUBLIC_*`` key), else the bucket directly with the operator's keys."""
+    from reliquary.trainer.ckpt_publisher import R2ObjectStore
+
+    keyed = any(str(env.get(f"R2_PUBLIC_{n}", "")).strip() for n in ("ACCESS_KEY_ID", "SECRET_ACCESS_KEY"))
+    if str(env.get(EXECUTOR_ID_ENV, "")).strip() and not keyed:
+        from reliquary.trainer.presigned_store import PresignedObjectStore
+
+        return PresignedObjectStore(link)
+    from reliquary.infrastructure.storage import public_checkpoint_bucket, public_checkpoint_client
+
+    return R2ObjectStore(public_checkpoint_client(), public_checkpoint_bucket())
+
+
 def resume_weights(link, *, validator_hotkey: str, work_dir: Path, sync=None, fetch=None):
     """``(state, version, model_files_dir)`` of the latest published checkpoint, or None on a fresh book. A published
     version ahead of the book (published, then the trainer died before adopting it) is adopted here."""
@@ -130,11 +148,10 @@ def run_async_train_worker() -> None:
     disable_cudnn_attention(torch)              # every rank, before any model is built
 
     from reliquary.constants import ATTN_IMPLEMENTATION, DEFAULT_BASE_MODEL, DEFAULT_BASE_MODEL_REVISION
-    from reliquary.infrastructure.storage import public_checkpoint_bucket, public_checkpoint_client
     from reliquary.miner.rl_async import write_hf_dir
     from reliquary.shared.modeling import load_text_generation_model
     from reliquary.trainer.async_trainer import AsyncTrainer, AsyncTrainerConfig
-    from reliquary.trainer.ckpt_publisher import DeltaPublisher, R2ObjectStore
+    from reliquary.trainer.ckpt_publisher import DeltaPublisher
     from reliquary.trainer.cli import _check_trainer_launch, _run_train_follower
     from reliquary.trainer.distributed import (
         CommandChannel, broadcasting_train_step, gather_full_state_dict, init_distributed, load_sharded_model,
@@ -225,7 +242,7 @@ def run_async_train_worker() -> None:
         reset_training_state()
 
         publisher = DeltaPublisher(run=str(task["run"]),
-                                   store=R2ObjectStore(public_checkpoint_client(), public_checkpoint_bucket()),
+                                   store=checkpoint_store(link),
                                    staging_dir=state_dir / "staging", anchor_interval=settings["anchor_interval"],
                                    model_dir=model_dir)
         backup = None

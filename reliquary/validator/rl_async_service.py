@@ -56,6 +56,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from reliquary.shared.ckpt_index import run_prefix
 from reliquary.shared.task_registry import RL_START_POOL_PARAM
 
 logger = logging.getLogger(__name__)
@@ -112,6 +113,7 @@ DEFAULT_LEASE_MARGIN = 2.0
 EXPIRE_EVERY_S = 5.0
 AUDIT_EVERY_S = 2.0
 AUDIT_LIMIT = 8
+MAX_TRAINER_KEYS = 512            # object keys one presigned-upload, read or delete call may ask for
 MAX_TRAINER_AUDITS = 256          # audit jobs one trainer-link take may ask for
 LEDGER_EVERY_S = 30.0
 PRICE_EVERY_S = 30.0
@@ -338,6 +340,11 @@ class RlAsync:
     observations: Any = None                    # rl_observations.ObservationBoard (None: /rl/observations 503s)
     sandbox: Any = None                         # rl_async_episodes.RlLeaseSandbox (episode envs only)
     benchmarks: Any = None                      # run_id -> the run's benchmark feed bytes or None (/rl/benchmarks)
+    # The checkpoint bucket for a trainer pod that holds no bucket key (``/uploads``, ``/reads``, ``/deletes``):
+    # key -> presigned PUT / GET URL, key -> None. None: those routes answer 404.
+    presign_put: Any = None
+    presign_get: Any = None
+    delete_object: Any = None
 
     def close(self) -> None:
         self.book.close()
@@ -546,6 +553,29 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str | None = None, auth: Trai
     route("POST", "audits", take_audits)
     route("POST", "audit", report_audit)
     route("POST", "heartbeat", lambda b: {"ok": True})        # the beat is in every call
+
+    def run_keys(b: dict, what: Any) -> list[str]:
+        if what is None:
+            raise LookupError("no checkpoint bucket on this controller")
+        keys = b["keys"]
+        if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
+            raise ValueError("keys is a list of strings")
+        if len(keys) > MAX_TRAINER_KEYS:
+            raise ValueError(f"at most {MAX_TRAINER_KEYS} keys per call")
+        prefix_ = run_prefix(rl.settings.run) + "/"
+        if any(not k.startswith(prefix_) or ".." in k.split("/") for k in keys):
+            raise ValueError(f"keys must be under {prefix_}")
+        return keys
+
+    route("POST", "uploads", lambda b: {"urls": {k: rl.presign_put(k) for k in run_keys(b, rl.presign_put)}})
+    route("POST", "reads", lambda b: {"urls": {k: rl.presign_get(k) for k in run_keys(b, rl.presign_get)}})
+
+    def delete_keys(b: dict) -> dict:
+        for key in run_keys(b, rl.delete_object):
+            rl.delete_object(key)
+        return {"ok": True}
+
+    route("POST", "deletes", delete_keys)
 
     async def checkpoint(request: Request) -> JSONResponse:
         """``/rl/checkpoint``'s answer for the trainer's resume (it reaches this listener only)."""
@@ -901,13 +931,15 @@ def _public_boards(rl: RlAsync, wallet, validator_hotkey: str, signer_client=Non
     from reliquary.infrastructure.storage import public_checkpoint_bucket, public_checkpoint_client
     from reliquary.shared.ckpt_index import index_key
     from reliquary.trainer.ckpt_publisher import R2ObjectStore
-    from reliquary.validator.rl_checkpoint import RlCheckpointBoard, presigner
+    from reliquary.validator.rl_checkpoint import UPLOAD_TTL_SECONDS, RlCheckpointBoard, presigner
     from reliquary.eval.run_feed import feed_key
     from reliquary.validator.rl_observations import ObservationBoard, bucket_io, scan_publisher
 
     run = rl.settings.run
     client, bucket = public_checkpoint_client(), public_checkpoint_bucket()
     store, presign = R2ObjectStore(client, bucket), presigner(client, bucket)
+    rl.presign_put = presigner(client, bucket, UPLOAD_TTL_SECONDS, "put_object")
+    rl.presign_get, rl.delete_object = presign, store.delete
     rl.board = RlCheckpointBoard(load_index=lambda: store.get_bytes(index_key(run)),
                                  index_signer=index_signer_for(wallet, signer_client),
                                  validator_hotkey=validator_hotkey, presign=presign)
