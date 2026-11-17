@@ -749,6 +749,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if card_body is None or prompts_body is None:
             raise HTTPException(status_code=404, detail="set_unknown")
         card = json.loads(card_body)
+        await require_set_grader(card, job_id=body.job_id)
         if body.env not in (card["env"], card["source"]):
             raise HTTPException(status_code=422, detail=f"set {set_id} is a {card['env']} set")
         if body.prompt_count > int(card["count"]):
@@ -876,6 +877,21 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=404, detail="set_unknown")
         return json.loads(card_body), prompts_body
 
+    async def require_set_grader(card: dict, *, job_id: str | None = None) -> None:
+        from reliquary.eval.protocol import validate_set
+
+        try:
+            if job_id is not None:
+                existing, _ = await job_store.read_job(job_id)
+                if existing is not None:
+                    # Preserve idempotent replay of an existing declaration after a grader update.
+                    return
+            validate_set(card, current_grader=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise HTTPException(status_code=422, detail="set protocol malformed") from exc
+
     def upload_sampling_differs(sampling: Mapping, body: CreateJob) -> list[str]:
         """An order on an upload's group runs the sampling its lines asked for (``orders.uploads``)."""
         given = {**body.sampling.model_dump(), "max_tokens": body.max_new_tokens, "seed": body.seed,
@@ -912,6 +928,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             if body.prompt_start != 0:
                 raise HTTPException(status_code=422, detail="an order on a set starts at its first problem")
             card, prompts_body = await read_set(body.eval_set_id)
+            if evaluation:
+                await require_set_grader(card, job_id=body.job_id)
             if not evaluation and card.get("source_kind") != "upload":
                 # Our sets are held out: their completions are never deliverable training data.
                 raise HTTPException(status_code=422, detail="a generation order draws from an upload, not an eval set")
@@ -1822,6 +1840,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             await refuse_past_the_source(body.env, wanted["prompt_start"], body.problems)
         existing, _ = await qualifications.read(body.qualification_id)
         if existing is None:
+            if body.set_id is not None:
+                card, _ = await read_set(body.set_id)
+                await require_set_grader(card)
             # Before any executor is rented: a model that can never be served.
             await refuse_unservable_model(body.model, body.revision)
 
