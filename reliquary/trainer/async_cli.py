@@ -75,7 +75,7 @@ def async_trainer_settings(env: Mapping[str, str] = os.environ) -> dict[str, Any
     if bool(prefix) != bool(every):
         raise ValueError("RELIQUARY_RL_HF_BACKUP_PREFIX and RELIQUARY_RL_HF_BACKUP_EVERY go together")
     return {
-        "url": url, "token": token, "validator_hotkey": hotkey,
+        "url": url, "token": token, "validator_hotkey": hotkey, "link_prefix": _link_prefix(env),
         "state_dir": Path(env.get("RELIQUARY_TRAINER_STATE_DIR", "/root/reliquary/trainer")) / "async",
         "base_model": str(env.get("RELIQUARY_RL_BASE_MODEL", "")).strip() or None,
         "batch_groups": _int(env, "RELIQUARY_RL_BATCH_GROUPS", 512),
@@ -97,6 +97,23 @@ def async_trainer_settings(env: Mapping[str, str] = os.environ) -> dict[str, Any
 
 
 EXECUTOR_ID_ENV = "RELIQUARY_RL_TRAINER_EXECUTOR_ID"
+
+
+def _link_prefix(env: Mapping[str, str]) -> str:
+    """A rented pod (an executor id) reaches its task's trainer routes through the front (``/rl/<task>/trainer``,
+    ``RELIQUARY_TASK_ID``); an operator's trainer, the controller's own listener (``/rl/trainer``)."""
+    task = str(env.get("RELIQUARY_TASK_ID", "")).strip()
+    if not (str(env.get(EXECUTOR_ID_ENV, "")).strip() and task):
+        return "/rl/trainer"
+    from reliquary.miner.rl_task_choice import task_prefix
+
+    return f"{task_prefix(task)}/trainer"
+
+
+def trainer_link(settings: Mapping[str, Any], *, client=None):
+    from reliquary.trainer.rl_link import TrainerLink
+
+    return TrainerLink(settings["url"], settings["token"], client=client, prefix=settings["link_prefix"])
 
 
 def checkpoint_store(link, env: Mapping[str, str] = os.environ):
@@ -170,7 +187,6 @@ def run_async_train_worker() -> None:
         CommandChannel, broadcasting_train_step, gather_full_state_dict, init_distributed, load_sharded_model,
         trainer_backend,
     )
-    from reliquary.trainer.rl_link import TrainerLink
     from reliquary.validator import telemetry
     from reliquary.validator.training import configure_distributed, reset_training_state, train_step
 
@@ -191,7 +207,7 @@ def run_async_train_worker() -> None:
 
     try:
         settings = async_trainer_settings()
-        link = TrainerLink(settings["url"], settings["token"])
+        link = trainer_link(settings)
         task = link.config()
         telemetry.init(settings["validator_hotkey"], {
             "task_id": task["task_id"], "run": task["run"], "targets": task["targets"], "backend": backend,

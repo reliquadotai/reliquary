@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import re
 from typing import Any, Callable, Mapping
 
 INDEX_FORMAT = "reliquary-ckpt-index/1"
@@ -50,6 +51,24 @@ def delta_key(run: str, from_version: int, to_version: int) -> str:
 
 def index_key(run: str) -> str:
     return f"{run_prefix(run)}/{INDEX_KEY}"
+
+
+_ANCHOR_RE = re.compile(r"anchors/(\d{8})/(?:model/)?[^/]+")
+_DELTA_RE = re.compile(r"deltas/(\d{8})-(\d{8})\.rqd")
+
+
+def checkpoint_key_version(run: str, key: str) -> int | None:
+    """The version an anchor file or a delta of ``run`` brings (a delta: its target), else None (the index and
+    every other key)."""
+    prefix = run_prefix(run) + "/"
+    if not isinstance(key, str) or not key.startswith(prefix):
+        return None
+    rest = key[len(prefix):]
+    if (anchor := _ANCHOR_RE.fullmatch(rest)) and rest.rsplit("/", 1)[1] not in {".", ".."}:
+        return int(anchor.group(1))
+    if delta := _DELTA_RE.fullmatch(rest):
+        return int(delta.group(2))
+    return None
 
 
 def observations_root(run: str) -> str:

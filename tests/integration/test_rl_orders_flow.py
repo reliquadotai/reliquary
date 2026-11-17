@@ -164,7 +164,8 @@ async def test_a_training_order_runs_end_to_end_without_an_operator(on, monkeypa
     from reliquary.shared.ckpt_index import index_key
     from reliquary.trainer.ckpt_publisher import DeltaPublisher
     from reliquary.trainer.presigned_store import PresignedObjectStore
-    from reliquary.trainer.rl_link import TrainerLink
+    from reliquary.trainer.async_cli import EXECUTOR_ID_ENV, async_trainer_settings, trainer_link
+    from reliquary.trainer.rl_link import TrainerLinkError
     from reliquary.validator import corpus_periods as cp
     from reliquary.validator import rl_spend
     from reliquary.validator.rl_front import build_front_app
@@ -221,7 +222,10 @@ async def test_a_training_order_runs_end_to_end_without_an_operator(on, monkeypa
             transport=httpx.ASGITransport(app=controllers[port].app)))
         loop = asyncio.get_running_loop()
         pod_http = httpx.Client(transport=Terminator(front, loop))
-        link = TrainerLink("https://front", POD_TOKEN, client=pod_http, prefix=f"/rl/{task}/trainer", patience_s=0.0)
+        pod_env = {"RELIQUARY_RL_TRAINER_URL": "https://front", "RELIQUARY_RL_TRAINER_TOKEN": POD_TOKEN,
+                   "RELIQUARY_RL_VALIDATOR_HOTKEY": VALIDATOR.ss58_address, "RELIQUARY_TASK_ID": task,
+                   EXECUTOR_ID_ENV: pod["executor_id"]}
+        link = trainer_link(async_trainer_settings(pod_env), client=pod_http)     # as the pod's entry builds it
 
         # --- the pod starts: its task, and the base checkpoint published through presigned URLs
         assert (await asyncio.to_thread(link.config))["task_id"] == task
@@ -257,6 +261,9 @@ async def test_a_training_order_runs_end_to_end_without_an_operator(on, monkeypa
         await asyncio.to_thread(link.adopt_checkpoint, 1)
         assert json.loads(bucket.objects[index_key(task)])["latest"]["version"] == 1
         assert controller.rl.book.latest_checkpoint == 1
+        for key in (rl_spend.spend_key(task), f"rl/{task}/anchors/00000001/again.safetensors"):
+            with pytest.raises(TrainerLinkError):                    # the pod writes only new checkpoints
+                await asyncio.to_thread(link.upload_urls, [key])
 
         # --- its period closes and settles: the bill shows the trained tokens and the pay, not yet final
         def spend():

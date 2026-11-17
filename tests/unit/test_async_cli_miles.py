@@ -136,7 +136,7 @@ def test_miles_backend_never_loads_a_torch_model(tmp_path, monkeypatch):
         "audits_per_step": 8, "audit_budget_s": 10.0, "prefetch": False, "report_workers": 1, "heartbeat_s": 60})
     link = SimpleNamespace(config=lambda: {"task_id": 1, "run": "r", "targets": {}}, requeue=lambda: 0,
                            latest_checkpoint=3)
-    monkeypatch.setattr("reliquary.trainer.rl_link.TrainerLink", lambda url, token: link)
+    monkeypatch.setattr(async_cli, "trainer_link", lambda settings: link)
     monkeypatch.setattr("reliquary.validator.telemetry.init", lambda *a, **k: None)
     monkeypatch.setattr("reliquary.validator.telemetry.finish", lambda: None)
     model_dir = tmp_path / "model"

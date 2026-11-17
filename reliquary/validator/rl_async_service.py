@@ -56,7 +56,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from reliquary.shared.ckpt_index import run_prefix
+from reliquary.shared.ckpt_index import checkpoint_key_version, index_key, run_prefix
 from reliquary.shared.task_registry import RL_START_POOL_PARAM
 
 logger = logging.getLogger(__name__)
@@ -559,7 +559,9 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str | None = None, auth: Trai
     route("POST", "audit", report_audit)
     route("POST", "heartbeat", lambda b: {"ok": True})        # the beat is in every call
 
-    def run_keys(b: dict, what: Any) -> list[str]:
+    def run_keys(b: dict, what: Any, *, use: str) -> list[str]:
+        """The trainer writes only its checkpoints: anchor files and deltas of versions after the latest adopted,
+        and the index; it deletes only anchor files and deltas."""
         if what is None:
             raise LookupError("no checkpoint bucket on this controller")
         keys = b["keys"]
@@ -567,18 +569,28 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str | None = None, auth: Trai
             raise ValueError("keys is a list of strings")
         if len(keys) > MAX_TRAINER_KEYS:
             raise ValueError(f"at most {MAX_TRAINER_KEYS} keys per call")
-        prefix_ = run_prefix(rl.settings.run) + "/"
+        run = rl.settings.run
+        prefix_ = run_prefix(run) + "/"
         if any(len(k.encode()) > MAX_TRAINER_KEY_BYTES for k in keys):
             raise ValueError(f"a key is over {MAX_TRAINER_KEY_BYTES} bytes")
         if any(not k.startswith(prefix_) or ".." in k.split("/") for k in keys):
             raise ValueError(f"keys must be under {prefix_}")
+        index = index_key(run)
+        latest = rl.book.latest_checkpoint if use == "upload" else None
+        for key in keys:
+            version = checkpoint_key_version(run, key)
+            if version is None and not (key == index and use != "delete"):
+                raise ValueError(f"{key} is not a checkpoint file")
+            if version is not None and latest is not None and version <= latest:
+                raise ValueError(f"{key}: checkpoint {version} is already adopted (latest {latest})")
         return keys
 
-    route("POST", "uploads", lambda b: {"urls": {k: rl.presign_put(k) for k in run_keys(b, rl.presign_put)}})
-    route("POST", "reads", lambda b: {"urls": {k: rl.presign_get(k) for k in run_keys(b, rl.presign_get)}})
+    route("POST", "uploads", lambda b: {"urls": {k: rl.presign_put(k)
+                                                 for k in run_keys(b, rl.presign_put, use="upload")}})
+    route("POST", "reads", lambda b: {"urls": {k: rl.presign_get(k) for k in run_keys(b, rl.presign_get, use="read")}})
 
     def delete_keys(b: dict) -> dict:
-        for key in run_keys(b, rl.delete_object):
+        for key in run_keys(b, rl.delete_object, use="delete"):
             rl.delete_object(key)
         return {"ok": True}
 

@@ -28,30 +28,61 @@ def _client(tmp_path):
     return TestClient(app), rl, deleted
 
 
-def test_upload_urls_only_under_the_run_prefix(tmp_path):
+def test_upload_urls_only_for_this_runs_checkpoint_files(tmp_path):
     client, rl, deleted = _client(tmp_path)
     run = rl.settings.run
-    ok = client.post("/rl/trainer/uploads", headers=AUTH, json={"keys": [f"rl/{run}/a", f"rl/{run}/b/c"]})
+    anchor, delta = f"rl/{run}/anchors/00000001/shard-0.safetensors", f"rl/{run}/deltas/00000000-00000001.rqd"
+    ok = client.post("/rl/trainer/uploads", headers=AUTH, json={"keys": [anchor, delta]})
     assert ok.status_code == 200
-    assert ok.json()["urls"] == {f"rl/{run}/a": f"https://bucket.invalid/put/rl/{run}/a",
-                                 f"rl/{run}/b/c": f"https://bucket.invalid/put/rl/{run}/b/c"}
-    for bad in (["rl/other/a"], [f"rl/{run}x/a"], [f"rl/{run}/../other/a"], ["a"], [f"rl/{run}/a", "rl/other/a"]):
+    assert ok.json()["urls"] == {anchor: f"https://bucket.invalid/put/{anchor}",
+                                 delta: f"https://bucket.invalid/put/{delta}"}
+    for bad in (["rl/other/anchors/00000001/a"], [f"rl/{run}x/anchors/00000001/a"],
+                [f"rl/{run}/anchors/00000001/../../other/a"], ["a"], [anchor, "rl/other/a"]):
         for path in ("uploads", "deletes", "reads"):
             assert client.post(f"/rl/trainer/{path}", headers=AUTH, json={"keys": bad}).status_code == 422
-    assert client.post("/rl/trainer/uploads", headers=AUTH,
-                       json={"keys": [f"rl/{run}/{i}" for i in range(513)]}).status_code == 422
-    assert client.post("/rl/trainer/uploads", headers=AUTH,
-                       json={"keys": [f"rl/{run}/{i}" for i in range(512)]}).status_code == 200
-    assert client.post("/rl/trainer/deletes", headers=AUTH, json={"keys": [f"rl/{run}/a"]}).status_code == 200
-    assert deleted == [f"rl/{run}/a"]
-    assert client.post("/rl/trainer/uploads", json={"keys": [f"rl/{run}/a"]}).status_code == 401
+    many = [f"rl/{run}/anchors/00000001/{i}" for i in range(513)]
+    assert client.post("/rl/trainer/uploads", headers=AUTH, json={"keys": many}).status_code == 422
+    assert client.post("/rl/trainer/uploads", headers=AUTH, json={"keys": many[:512]}).status_code == 200
+    assert client.post("/rl/trainer/deletes", headers=AUTH, json={"keys": [anchor]}).status_code == 200
+    assert deleted == [anchor]
+    assert client.post("/rl/trainer/uploads", json={"keys": [anchor]}).status_code == 401
+    rl.close()
+
+
+def test_the_trainer_writes_only_its_checkpoints(tmp_path):
+    from reliquary.validator.rl_spend import spend_key
+
+    client, rl, deleted = _client(tmp_path)
+    run = rl.settings.run
+
+    def status(path, *keys):
+        return client.post(f"/rl/trainer/{path}", headers=AUTH, json={"keys": list(keys)}).status_code
+
+    index = index_key(run)
+    model = f"rl/{run}/anchors/00000002/model/config.json"
+    assert status("uploads", index, model) == 200
+    for other in (spend_key(run), f"rl/{run}/observations/head.json", f"rl/{run}/a", f"rl/{run}/anchors/x/a",
+                  f"rl/{run}/deltas/00000001-00000002.bin", f"rl/{run}/anchors/00000002/"):
+        assert status("uploads", other) == 422, other
+        assert status("deletes", other) == 422, other
+    assert status("deletes", index) == 422                         # the index is rewritten, never removed
+    rl.book.adopt_checkpoint(0)
+    rl.book.adopt_checkpoint(3)
+    for adopted in (f"rl/{run}/anchors/00000003/s.safetensors", f"rl/{run}/deltas/00000002-00000003.rqd",
+                    f"rl/{run}/anchors/00000001/model/config.json"):
+        assert status("uploads", adopted) == 422, adopted
+    assert status("uploads", f"rl/{run}/anchors/00000004/s.safetensors", f"rl/{run}/deltas/00000003-00000004.rqd",
+                  index) == 200
+    assert status("deletes", f"rl/{run}/anchors/00000001/s.safetensors", f"rl/{run}/deltas/00000000-00000001.rqd") == 200
+    assert deleted == [f"rl/{run}/anchors/00000001/s.safetensors", f"rl/{run}/deltas/00000000-00000001.rqd"]
     rl.close()
 
 
 def test_a_controller_without_a_bucket_serves_no_urls(tmp_path):
     client, rl, _ = _client(tmp_path)
     rl.presign_put = None
-    assert client.post("/rl/trainer/uploads", headers=AUTH, json={"keys": [f"rl/{rl.settings.run}/a"]}).status_code == 404
+    key = f"rl/{rl.settings.run}/anchors/00000001/a"
+    assert client.post("/rl/trainer/uploads", headers=AUTH, json={"keys": [key]}).status_code == 404
     rl.close()
 
 
@@ -183,7 +214,7 @@ def test_a_file_over_the_single_put_limit_is_refused(tmp_path):
 
 def test_a_key_over_1024_bytes_is_refused(tmp_path):
     client, rl, _ = _client(tmp_path)
-    key = f"rl/{rl.settings.run}/" + "a" * 1024
+    key = f"rl/{rl.settings.run}/anchors/00000001/" + "a" * 1024
     assert client.post("/rl/trainer/uploads", headers=AUTH, json={"keys": [key]}).status_code == 422
     rl.close()
 
@@ -201,3 +232,54 @@ def test_the_publisher_of_a_pod_cuts_anchor_shards_small(tmp_path, monkeypatch):
     keep = {"hf_prefix": "p", "hf_every": 5}
     async_cli.drop_hf_backup_on_pod(object(), keep)
     assert keep["hf_prefix"] == "p"
+
+
+# --- final review ----------------------------------------------------------------------------------------------
+POD_ENV = {"RELIQUARY_RL_TRAINER_URL": "https://front.example", "RELIQUARY_RL_TRAINER_TOKEN": "t" * 40,
+           "RELIQUARY_RL_VALIDATOR_HOTKEY": "5Hotkey", "RELIQUARY_TASK_ID": "order-train-x",
+           "RELIQUARY_RL_TRAINER_EXECUTOR_ID": "pod-1"}
+
+
+class _Recorder:
+    def __init__(self):
+        self.urls = []
+
+    def request(self, method, url, **kw):
+        self.urls.append(url)
+        answer = _Response(200)
+        answer.json = lambda: {"task_id": "order-train-x", "run": "order-train-x", "targets": {}, "latest": None}
+        return answer
+
+
+def test_a_pods_link_reaches_its_tasks_trainer_routes():
+    from reliquary.trainer.async_cli import async_trainer_settings, trainer_link
+
+    settings = async_trainer_settings(POD_ENV)
+    assert settings["link_prefix"] == "/rl/order-train-x/trainer"
+    http = _Recorder()
+    trainer_link(settings, client=http).config()
+    assert http.urls == ["https://front.example/rl/order-train-x/trainer/config"]
+    operator = {k: v for k, v in POD_ENV.items() if k != "RELIQUARY_RL_TRAINER_EXECUTOR_ID"}
+    assert async_trainer_settings(operator)["link_prefix"] == "/rl/trainer"     # the controller's own listener
+    with pytest.raises(ValueError):
+        async_trainer_settings({**POD_ENV, "RELIQUARY_TASK_ID": "a,b"})
+
+
+@pytest.mark.parametrize("url, env, ok", [
+    ("https://front.example", {}, True),
+    ("http://127.0.0.1:8889", {}, True),
+    ("http://localhost:8889", {}, True),
+    ("http://[::1]:8889", {}, True),
+    ("http://10.0.0.5:8889", {}, False),
+    ("http://front.example", {}, False),
+    ("http://10.0.0.5:8889", {"RELIQUARY_RL_TRAINER_INSECURE": "1"}, True),
+    ("ftp://front.example", {"RELIQUARY_RL_TRAINER_INSECURE": "1"}, False),
+])
+def test_the_link_refuses_plain_http_off_loopback(url, env, ok):
+    from reliquary.trainer.rl_link import TrainerLink
+
+    if ok:
+        TrainerLink(url, "t" * 40, client=_Recorder(), environ=env)
+    else:
+        with pytest.raises(ValueError):
+            TrainerLink(url, "t" * 40, client=_Recorder(), environ=env)
