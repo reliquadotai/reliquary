@@ -2308,6 +2308,41 @@ rl_app = typer.Typer(name="rl", help="The RL front and its tasks")
 app.add_typer(rl_app)
 
 
+@rl_app.command("supervise")
+def rl_supervise(
+    map_path: Path = typer.Option(..., "--map", help="The task map file the front reads (written atomically)"),
+    ports: str = typer.Option("9100-9199", "--ports", help="Loopback ports for the controllers, LOW-HIGH"),
+    state_dir: Path = typer.Option(..., "--state-dir", help="Where each controller's log goes"),
+    network: str = typer.Option("finney", help="Bittensor network"),
+    netuid: int = typer.Option(81, help="Subnet UID"),
+    wallet_name: str = typer.Option("default", help="Wallet name"),
+    hotkey: str = typer.Option("default", help="Hotkey name"),
+    wallet_path: str = typer.Option(os.getenv("BT_WALLET_PATH", ""), help="Optional wallet base path"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+):
+    """Run one async RL controller per training task of the registry and keep the front's map file current."""
+    import time
+
+    from reliquary.validator import rl_supervisor as sup
+
+    setup_logging(log_level)
+    low, _, high = ports.partition("-")
+    try:
+        port_range = range(int(low), int(high or low) + 1)
+    except ValueError as exc:
+        raise typer.BadParameter("--ports must be LOW-HIGH") from exc
+    command = ["reliquary", "validate", "--network", network, "--netuid", str(netuid),
+               "--wallet-name", wallet_name, "--hotkey", hotkey]
+    if wallet_path:
+        command += ["--wallet-path", wallet_path]
+    supervisor = sup.Supervisor(
+        sup.read_registry_entries, sup.subprocess_spawn(command, state_dir, dict(os.environ)), ports=port_range,
+        map_path=map_path, final_of=sup.admin_final, default_task=os.getenv(sup.DEFAULT_TASK_ENV))
+    while True:
+        supervisor.tick()
+        time.sleep(sup.TICK_S)
+
+
 @rl_app.command("front")
 def rl_front(
     port: int = typer.Option(VALIDATOR_HTTP_PORT, "--port", help="Public port the front serves"),

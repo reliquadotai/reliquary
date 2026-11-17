@@ -187,3 +187,13 @@ change leases, requeue training groups or alter grading and payment state.
 Source tests and an isolated runtime check do not establish live source coverage;
 verify the actual mounted route and both miners' distinct records before enabling
 a downstream collector.
+
+## Running one controller per training task
+
+`reliquary rl supervise --map <path> --ports 9100-9199 --state-dir <dir>` (unit: `docker/rl-supervisor.service`)
+reads the task registry every 15 s and keeps one async controller (`reliquary validate`, loopback, no
+`--external-ip`) per active training task, logging to `<state-dir>/<task>.log`. It writes the map file that
+`reliquary rl front --map <path>` reads. The default task is `RELIQUARY_RL_DEFAULT_TASK` when it runs, else the
+oldest running one. A retired task's controller keeps running until the admin's `final` for it is true, then gets
+SIGTERM (SIGKILL after 60 s). A dead controller restarts after 30 s, doubling up to 10 min. The supervisor needs
+the host's wallet and R2 environment, and the same registry and public-bucket access as the admin.
