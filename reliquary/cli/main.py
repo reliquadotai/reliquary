@@ -2315,7 +2315,8 @@ def rl_front(
     map_path: Path = typer.Option(..., "--map", help="The supervisor's task map file (JSON)"),
     allow_plain_trainer: bool = typer.Option(
         False, "--allow-plain-trainer",
-        help="Proxy trainer paths without X-Forwarded-Proto: https (default: only behind a TLS terminator)",
+        help="Proxy trainer paths without X-Forwarded-Proto: https. By default they cross only with it, which means "
+             "something only behind a TLS terminator that overwrites that header",
     ),
     external_ip: str = typer.Option("", "--external-ip", help="Public IP to publish on-chain (serve_axon); empty skips"),
     external_port: int = typer.Option(0, "--external-port", help="Public port to advertise; --port when 0"),
