@@ -29,7 +29,7 @@ MAX_BATCH_GROUPS = 4096
 MAX_ENVIRONMENTS = 16
 # What an order's period plan assumes before the trainer reports its speed (``rl_async_params``).
 DEFAULT_PLANNED_TOKENS_PER_PERIOD = 2e8
-# The limits the order carries (read by the operator and the platform; the controller does not stop on them yet).
+# The limits the order carries: the RL auction leases nothing once one is reached (``rl_auction.RlAuctions.stopped``).
 TRAINING_PARAM = "training_order"
 
 

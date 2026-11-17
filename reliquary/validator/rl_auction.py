@@ -12,6 +12,10 @@ price multiplier (``rl_price``) and the per-hotkey quota (``rl_lease_quota``):
   trainer's demand is known, and the yield is measured.
 * **A lease's price** is the auction's: the higher of its holder's offer and the price of the moment (the offer
   under which 80 % of the env's recently delivered leases were won), never above the dearest offer given work.
+* **A training order's limits** (``training_order``: ``deadline_at``, ``max_steps``, ``max_tokens``): once the
+  deadline passes, the latest checkpoint reaches ``max_steps`` or the accrued pay covers ``max_tokens`` matched
+  tokens, every env's budget is 0 and no lease goes out. The leases already out may still deliver: the overrun is
+  at most the budget at the stop (the trainer's next ``lag_target`` steps).
 * **A lease not delivered** (expired, forfeited, refused for integrity) charges its price times the env's mean
   matched tokens per trained group, taken from the holder's next accruals on the env. Our failures charge nothing.
 """
@@ -27,6 +31,8 @@ from reliquary.corpus.token_auction import (
 )
 
 LAG_TARGET_PARAM = "rl_auction_lag_target"
+TRAINING_ORDER_PARAM = "training_order"
+LIMIT_KEYS = ("deadline_at", "max_steps", "max_tokens")
 DEFAULT_LAG_TARGET = 2
 MAX_LAG_TARGET = 16
 # Before any trained group: the matched tokens an undelivered lease is charged at (``LedgerConfig`` default).
@@ -91,6 +97,8 @@ class RlAuctions:
         self.shares = {str(env): float(v) / total for env, v in targets.items()}
         self.batch_groups, self.lag = int(batch_groups), int(lag)
         self._book = None
+        self.clock = clock
+        self.limits: dict[str, float] = {}       # a training order's (``from_params``); none: never stops
         self.auctions: dict[str, TokenAuction] = {
             env: TokenAuction(params, clock=clock, mean_tokens=mean_tokens,
                               holdings=lambda env=env: self._holdings(env),
@@ -107,8 +115,12 @@ class RlAuctions:
         declared = auction_params(params)
         if declared is None:
             return None
-        return cls(declared, targets, batch_groups=batch_groups, lag=lag_target(params), task_id=task_id,
-                   clock=clock)
+        out = cls(declared, targets, batch_groups=batch_groups, lag=lag_target(params), task_id=task_id,
+                  clock=clock)
+        order = params.get(TRAINING_ORDER_PARAM)
+        if isinstance(order, Mapping):
+            out.limits = {k: order[k] for k in LIMIT_KEYS if order.get(k) is not None}
+        return out
 
     def bind(self, book) -> None:
         """The lease book (its open leases and its buffered groups), once it is open."""
@@ -141,7 +153,36 @@ class RlAuctions:
             return PRIOR_YIELD
         return sum(1 for verdict, training in rows if verdict == "in_zone" and training != "rejected") / len(rows)
 
+    def paid_tokens(self) -> float:
+        """The matched tokens the task's accrued pay stands for (a first scan at its share of a trained group)."""
+        if self._book is None:
+            return 0.0
+        with self._book.lock:
+            db = self._book.db
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='rl_accruals'").fetchone():
+                return 0.0
+            row = db.execute("SELECT SUM(CASE WHEN token_price > 0 THEN amount / token_price ELSE matched_tokens END)"
+                             " FROM rl_accruals WHERE status != 'forfeited'").fetchone()
+        return float(row[0] or 0.0)
+
+    def stopped(self) -> str | None:
+        """Which of the training order's limits is reached (None: none, or no order)."""
+        limits = self.limits
+        if not limits:
+            return None
+        if "deadline_at" in limits and float(self.clock()) >= float(limits["deadline_at"]):
+            return "deadline"
+        if "max_steps" in limits and self._book is not None:
+            latest = self._book.latest_checkpoint
+            if latest is not None and latest >= int(limits["max_steps"]):
+                return "max_steps"
+        if "max_tokens" in limits and self.paid_tokens() >= float(limits["max_tokens"]):
+            return "max_tokens"
+        return None
+
     def budget(self, env: str) -> int:
+        if self.stopped() is not None:
+            return 0
         return env_budget(self.shares[env], self.batch_groups, self.lag, self.buffered(env), self.trainable(env))
 
     # -- the lease book's calls -----------------------------------------------------------------------------
@@ -198,7 +239,8 @@ class RlAuctions:
             view.update(share=self.shares[env], buffered=self.buffered(env), trainable_share=self.trainable(env),
                         target_groups=math.ceil(self.shares[env] * self.batch_groups * self.lag))
             out[env] = view
-        return {"lag_target": self.lag, "batch_groups": self.batch_groups, "environments": out}
+        return {"lag_target": self.lag, "batch_groups": self.batch_groups, "environments": out,
+                "stopped": self.stopped()}
 
     def allowance(self, hotkey: str) -> int:
         """The leases ``hotkey`` may hold now over every env (its allowances; held ones included). Asking counts

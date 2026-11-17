@@ -116,7 +116,14 @@ resolved in.
 - `reliquary rl mine --ask-alpha-per-mtoken 0.5 [--ask-alpha-per-mtoken swe=2] [--ask-capacity N]` posts the offers
   before leasing, every 10 minutes, and at once after a `no_ask`.
 
-### 3.9 Switch
+### 3.9 A training order's limits
+
+A task created from a training order (`training_order` param: `deadline_at`, `max_steps`, `max_tokens`) stops
+leasing once one is reached: the deadline passes, the latest checkpoint reaches `max_steps`, or the accrued pay
+covers `max_tokens` matched tokens (a first scan counted at its share of a trained group). Every env's budget is
+then 0. The leases already out may still deliver, so the overrun is at most the budget at the stop.
+
+### 3.10 Switch
 
 An async RL task is priced by auction with the order command:
 
