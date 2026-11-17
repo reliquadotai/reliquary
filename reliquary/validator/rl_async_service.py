@@ -428,22 +428,47 @@ TrainerAuth = Callable[[str], Awaitable[bool]]   # a bearer token -> does it ope
 TRAINER_AUTH_TTL_S = 30.0
 
 
-def executor_trainer_auth(task_id: str, *, store=None, clock: Callable[[], float] = time.time) -> TrainerAuth:
+TRAINER_BEAT_EVERY_S = 60.0
+
+
+def executor_trainer_auth(task_id: str, *, store=None, clock: Callable[[], float] = time.time,
+                          detail: Callable[[], dict | None] | None = None) -> TrainerAuth:
     """Accepts the bearer of an active, unexpired ``trainer`` executor registered for ``task_id``. The registry is
-    re-read at most every ``TRAINER_AUTH_TTL_S``, so a revocation lands within that."""
+    re-read at most every ``TRAINER_AUTH_TTL_S``, so a revocation lands within that. Each accepted request also
+    records the executor's heartbeat (what the platform reads as "the pod is up"), at most once per
+    ``TRAINER_BEAT_EVERY_S`` per executor, in a background task whose failure never reaches the request."""
     import hashlib
 
     if store is None:
         from reliquary.infrastructure import corpus_executor_store as store
     cache: dict[str, Any] = {"at": None, "tokens": {}}
     lock = asyncio.Lock()
+    last_beat: dict[str, float] = {}
+    pending: set = set()
 
-    async def fresh() -> dict[str, float]:
+    async def beat(executor_id: str, at: float) -> None:
+        try:
+            await store.record_heartbeat(executor_id, at=at, detail=detail() if detail is not None else None)
+        except Exception:
+            logger.exception("trainer executor heartbeat failed")
+
+    def maybe_beat(executor_id: str) -> None:
+        now = clock()
+        last = last_beat.get(executor_id)
+        if last is not None and now - last < TRAINER_BEAT_EVERY_S:
+            return
+        last_beat[executor_id] = now
+        task = asyncio.ensure_future(beat(executor_id, now))
+        pending.add(task)
+        task.add_done_callback(pending.discard)
+
+    async def fresh() -> dict[str, tuple[float, str]]:
         async with lock:
             now = clock()
             if cache["at"] is None or now - cache["at"] >= TRAINER_AUTH_TTL_S:
                 documents = await store.list_executors()
-                cache["tokens"] = {d["token_sha256"]: float(d["expires_at"]) for d in documents
+                cache["tokens"] = {d["token_sha256"]: (float(d["expires_at"]), d.get("executor_id", ""))
+                                   for d in documents
                                    if store.scope_of(d) == "trainer" and d.get("task_id") == task_id
                                    and d.get("status") == "active"}
                 cache["at"] = now
@@ -455,8 +480,12 @@ def executor_trainer_auth(task_id: str, *, store=None, clock: Callable[[], float
         except Exception:
             logger.exception("trainer executors unreadable")
             return False
-        expires_at = tokens.get(hashlib.sha256(token.encode()).hexdigest())
-        return expires_at is not None and clock() < expires_at
+        found = tokens.get(hashlib.sha256(token.encode()).hexdigest())
+        if found is None or clock() >= found[0]:
+            return False
+        if found[1]:
+            maybe_beat(found[1])
+        return True
 
     return auth
 
@@ -1105,7 +1134,8 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     if training_order:
         # A training order's pods hold per-pod executor tokens only (never the static one); the public front
         # proxies the trainer link to this port.
-        server.app.include_router(build_rl_trainer_router(rl, auth=executor_trainer_auth(settings.task_id)))
+        server.app.include_router(build_rl_trainer_router(rl, auth=executor_trainer_auth(
+            settings.task_id, detail=lambda: {"latest_checkpoint": rl.book.latest_checkpoint})))
     from reliquary.validator.miner_setup import DB_NAME as SETUP_DB, MinerSetupStore, build_miner_setup_router
     from reliquary.validator.rl_metrics import CardFeed
 
