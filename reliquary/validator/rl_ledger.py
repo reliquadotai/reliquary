@@ -131,6 +131,7 @@ class RlPayLedger:
         self.auctions = getattr(book, "auctions", None)
         self._board: tuple[float, dict] | None = None
         self._beat_at: float | None = None        # the last trainer_beat write (memory only)
+        self.settled_through: int | None = None   # the last period the latest settle closed (memory only)
         with book.lock:
             book.db.executescript(_SCHEMA)
             book.db.execute("INSERT OR IGNORE INTO rl_pay_cursor(id, seq) VALUES(0, 0)")
@@ -207,7 +208,8 @@ class RlPayLedger:
 
     # --- settlement ----------------------------------------------------------------------------------------
     def settle(self, now: float | None = None) -> list[dict]:
-        """Archive every closed period holding accruals, oldest first (each once); returns the new archives."""
+        """Archive every closed period holding accruals, oldest first (each once); returns the new archives.
+        ``settled_through``: the last closed period of this pass."""
         now = float(self.clock()) if now is None else now
         genesis = self.config.genesis
         slack = max(self.config.slack_s, self.config.outage_grace_s) if self.config.outage_fill else self.config.slack_s
@@ -256,6 +258,7 @@ class RlPayLedger:
                            (period, entry, json.dumps(doc, sort_keys=True), _UNATTEMPTED))
                 db.execute("UPDATE rl_accruals SET status=? WHERE status=? AND period=?", (SETTLED, ACCRUED, period))
                 out.append(doc)
+        self.settled_through = closed
         return out
 
     def _due_periods(self, closed: int, outages: list[tuple[float, float]] = ()) -> list[int]:

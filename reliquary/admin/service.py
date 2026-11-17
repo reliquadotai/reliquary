@@ -1582,7 +1582,20 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                                             detail=str(exc)) from exc
                 except RuntimeError as exc:
                     raise HTTPException(status_code=503, detail=str(exc)) from exc
+            try:
+                await revoke_trainer_pods(task_id)
+            except Exception as exc:
+                logger.warning("admin: the trainer pods of %s were not all revoked: %r", task_id, exc)
+                raise HTTPException(status_code=503, detail="trainer_pods_not_revoked") from exc
             return training_view(await training_task(task_id))
+
+        async def revoke_trainer_pods(task_id: str) -> None:
+            """A retired order's pods lose the trainer link (each retire call retries what is left)."""
+            for document in await executors.list_executors():
+                if (executors.scope_of(document) == "trainer" and document.get("task_id") == task_id
+                        and document.get("status") == "active"):
+                    await executors.set_executor_status(document["executor_id"], "revoked",
+                                                        reason="training order retired", scope="trainer")
 
     @router.get("/jobs/{job_id}/status")
     async def job_status(job_id: str) -> dict:

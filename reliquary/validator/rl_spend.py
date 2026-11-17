@@ -7,9 +7,10 @@ per token, token equivalent = amount / price, so a first scan counts at its shar
 accrual's price). Forfeited accruals are left out. Then the trainer's starved spans (``rl_buffer.starved_intervals``),
 the order's stop (``RlAuctions.stopped``, and when: ``RlPayLedger.stopped_at``), the latest checkpoint, and what
 could still change the pay (``pending``): leases still open, groups buffered for the trainer and audits queued
-(both left out once the order stopped and the trainer is silent past the ledger's outage grace: nothing will
-take them), payable events the ledger has not ingested. ``settle_margin_s``: how long after a period's end it
-settles. Accruals are never negative (a debit takes at most the accrual), so the archive's ``scale`` is exactly
+(both left out once the order stopped and the trainer is silent past the ledger's outage grace, counted from the
+stop when it never called: nothing will take them), payable events the ledger has not ingested.
+``settle_margin_s``: how long after a period's end it settles; ``settled_through``: the last period the ledger's
+latest settle closed (None before one). Accruals are never negative (a debit takes at most the accrual), so the archive's ``scale`` is exactly
 ``paid_alpha / accrued_alpha``, both summed over the same hotkeys. No hotkey is written.
 
 Amounts convert from pool share to alpha at the miner emission per period the task's ceiling was declared with
@@ -81,7 +82,8 @@ def spend_summary(rl, *, now: float) -> dict:
         beat = db.execute("SELECT last_at FROM rl_trainer_beat WHERE id=0").fetchone()
     stopped_at = ledger.stopped_at(now)
     config = ledger.config
-    if stopped_at is not None and beat is not None and now - float(beat[0]) > config.outage_grace_s:
+    silent_since = None if stopped_at is None else (float(stopped_at) if beat is None else float(beat[0]))
+    if silent_since is not None and now - silent_since > config.outage_grace_s:
         pending["buffered"] = pending["audits"] = 0     # the order stopped and its trainer is gone
     by_period: dict[int, list] = {}
     for period, environment, price, tokens, amount in rows:
@@ -100,6 +102,7 @@ def spend_summary(rl, *, now: float) -> dict:
     return {"schema": SPEND_SCHEMA, "task_id": rl.settings.task_id, "run": rl.settings.run, "periods": periods,
             "starved": [[start, end] for start, end in starved], "stopped": auctions.stopped(),
             "stopped_at": stopped_at, "latest_checkpoint": book.latest_checkpoint, "pending": pending,
+            "settled_through": getattr(ledger, "settled_through", None),
             "settle_margin_s": (max(config.slack_s, config.outage_grace_s) if config.outage_fill
                                 else config.slack_s),
             "miner_alpha_per_period": emission, "written_at": float(now)}

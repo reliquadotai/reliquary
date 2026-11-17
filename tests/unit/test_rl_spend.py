@@ -255,3 +255,57 @@ def test_the_controller_follows_its_tasks_retire():
 
     asyncio.run(run())
     assert retired
+
+
+# --- final review ----------------------------------------------------------------------------------------------
+def test_the_summary_names_the_last_period_its_settle_closed(tmp_path):
+    rl, clock = _rl(tmp_path)
+    assert spend_summary(rl, now=NOW)["settled_through"] is None                  # no settle yet
+    rl.ledger.settle(now=AFTER)
+    clock.t = AFTER + cp.PERIOD_SECONDS
+    assert spend_summary(rl, now=AFTER + cp.PERIOD_SECONDS)["settled_through"] == PERIOD   # its settle's, not now's
+
+
+def test_groups_left_when_no_trainer_ever_called_stop_blocking_after_the_grace(tmp_path):
+    rl, clock = _rl(tmp_path, deadline_at=NOW + 10)
+    rl.book.auctions.post_ask(ENV, "A", 0.5, 8)
+    _deliver(rl, clock, 1, train=False)
+    clock.t = NOW + 20
+    summary = spend_summary(rl, now=NOW + 20)
+    assert summary["stopped_at"] == NOW + 10 and summary["pending"]["buffered"] == 1
+    gone = NOW + 10 + rl.ledger.config.outage_grace_s + 1
+    clock.t = gone
+    assert spend_summary(rl, now=gone)["pending"]["buffered"] == 0
+
+
+def test_a_failing_spend_write_does_not_hold_the_archive_publish():
+    from reliquary.validator.rl_async_service import rl_async_loops
+
+    calls = []
+    ledger = SimpleNamespace(ingest=lambda: 0, settle=lambda: [])
+
+    class Spend:
+        async def write(self, *, settled):
+            calls.append("spend")
+            raise RuntimeError("bucket down")
+
+    async def publish(archives):
+        calls.append("publish")
+
+    ledger.publish = publish
+    rl = SimpleNamespace(ledger=ledger)
+
+    async def run():
+        loops = rl_async_loops(rl, archives=object(), spend=Spend(), every={"ledger": 60})
+        task = asyncio.ensure_future(loops[2])
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if "publish" in calls:
+                break
+        task.cancel()
+        for other in loops[:2] + loops[3:]:
+            other.close()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+    assert calls[:2] == ["spend", "publish"]

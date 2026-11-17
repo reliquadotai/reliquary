@@ -129,12 +129,14 @@ RETIRED_AT = cp.period_end(cp.period_of(1_800_000_000.0)) - 600.0        # the r
 SETTLED_AFTER = RETIRED_AT + 600.0 + 120.0                                # its period's end + the settle margin
 
 
-def _summary(*settled, open_leases=0, stopped_at=None, written_at=SETTLED_AFTER + 1):
+def _summary(*settled, open_leases=0, stopped_at=RETIRED_AT, written_at=SETTLED_AFTER + 1, stopped="retired",
+             settled_through=cp.period_of(RETIRED_AT)):
     return {"task_id": "order-train-t1", "run": "order-train-t1", "starved": [], "stopped_at": stopped_at,
             "pending": {"open_leases": open_leases, "buffered": 0, "audits": 0, "unledgered": 0},
-            "settle_margin_s": 120.0, "written_at": written_at,
+            "settle_margin_s": 120.0, "written_at": written_at, "settled_through": settled_through,
             "periods": [{"period": i, "settled": s, "accrued_alpha": 1.0, "paid_alpha": 1.0 if s else None,
-                         "buckets": {}} for i, s in enumerate(settled)], "stopped": None, "latest_checkpoint": 3}
+                         "buckets": {}} for i, s in enumerate(settled)], "stopped": stopped,
+            "latest_checkpoint": 3}
 
 
 @pytest.fixture
@@ -178,6 +180,30 @@ def test_spend_is_final_only_when_retired_and_settled(on, spend):
     assert final(_summary(True, True, stopped_at=RETIRED_AT + 3600)) is False       # stopped in a later period
     assert final(_summary(True, True)) is True
     assert final(_summary()) is True                                                # nothing was ever paid
+    assert final(_summary(True, True, stopped=None)) is False                       # the controller has not stopped
+    assert final(_summary(True, True, stopped_at=None)) is False
+    stop_period = cp.period_of(RETIRED_AT)
+    assert final(_summary(True, True, settled_through=stop_period - 1)) is False    # its settle had not closed it
+    assert final(_summary(True, True, settled_through=None)) is False
+    assert final(_summary(True, True, settled_through=stop_period + 1)) is True
+
+
+def test_retire_revokes_the_tasks_trainer_pods(on):
+    import hashlib
+
+    assert on("POST", "/admin/v1/training", _order()).status_code == 201
+    assert on("POST", "/admin/v1/training", _order(training_id="t2")).status_code == 201
+
+    def pod(executor_id, task_id):
+        body = {"executor_id": executor_id, "token_sha256": hashlib.sha256(executor_id.encode()).hexdigest(),
+                "model_id": "m", "model_revision": "r", "expires_at": 4e12, "scope": "trainer", "task_id": task_id}
+        assert on("POST", "/admin/v1/executors", body).status_code == 201
+
+    pod("pod-1", "order-train-t1")
+    pod("pod-2", "order-train-t2")
+    assert on("POST", "/admin/v1/training/order-train-t1/retire", {}).status_code == 200
+    assert on("GET", "/admin/v1/executors/pod-1").json()["status"] == "revoked"
+    assert on("GET", "/admin/v1/executors/pod-2").json()["status"] == "active"
 
 
 def _order_entry(on, **params):

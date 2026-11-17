@@ -284,6 +284,7 @@ async def test_a_training_order_runs_end_to_end_without_an_operator(on, monkeypa
         # --- the platform retires the order: the controller stops leasing, settles on, then the bill is final
         retired_at.append(clock())
         assert on("POST", f"/admin/v1/training/{task}/retire", {}).json()["status"] == "retired"
+        assert on("GET", f"/admin/v1/executors/{pod['executor_id']}").json()["status"] == "revoked"
         await until(lambda: controller.rl.book.auctions.stopped() == "retired")
         clock.t += rl_spend.SPEND_EVERY_S + 1                         # its next bill names the stop
         await until(lambda: (s := spend()) is not None and s["stopped"] == "retired")
@@ -293,6 +294,7 @@ async def test_a_training_order_runs_end_to_end_without_an_operator(on, monkeypa
         clock.t = cp.period_end(cp.period_of(clock())) + margin + 1
         await until(lambda: (s := spend()) is not None and s["final"] is True)
         assert all(p["settled"] for p in spend()["periods"])
+        assert spend()["settled_through"] >= cp.period_of(spend()["stopped_at"])
 
         sup.tick()
         assert controller.poll() is not None and json.loads(map_path.read_text())["tasks"] == {}

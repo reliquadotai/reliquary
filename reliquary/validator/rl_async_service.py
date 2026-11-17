@@ -815,7 +815,10 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
             logger.info("rl period %d settled: %d hotkeys, scale %.3f", doc["work_period"],
                         len(doc["rewards_by_hotkey"]), doc["scale"])
         if spend is not None:              # first: a failing archive publish does not hold the bill back
-            await spend.write(settled=bool(settled))
+            try:
+                await spend.write(settled=bool(settled))
+            except Exception:
+                logger.exception("rl spend summary write failed")
         if archives is not None:
             await rl.ledger.publish(archives)
 

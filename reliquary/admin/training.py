@@ -147,19 +147,23 @@ def training_entry(body: CreateTraining, *, task_prefix: str, price_params: Mapp
 
 def training_spend(entry, summary: Mapping[str, Any], *, retired_time: float | None) -> dict:
     """The spend route's answer: the controller's summary, the order's frozen rate, and ``final``: the task is
-    retired, nothing pending can still pay, every period is settled, and the summary was written after the period
-    holding the later of the retire (``retired_time``) and the order's stop had closed and settled
-    (``settle_margin_s`` past its end), so no later accrual or fill can appear."""
+    retired and its controller has stopped the order, nothing pending can still pay, every period is settled, and
+    the summary was written after the period holding the later of the retire (``retired_time``) and the order's
+    stop had closed and settled (``settle_margin_s`` past its end, and the ledger's settle had closed it:
+    ``settled_through``), so no later accrual or fill can appear."""
     from reliquary.validator import corpus_periods as cp
 
     order = entry.params.get(TRAINING_PARAM) or {}
     final = False
-    if entry.status == "retired" and retired_time is not None:
-        ended = max(float(retired_time), float(summary.get("stopped_at") or retired_time))
+    stopped_at, settled_through = summary.get("stopped_at"), summary.get("settled_through")
+    if (entry.status == "retired" and retired_time is not None and summary.get("stopped")
+            and stopped_at is not None and settled_through is not None):
+        ended = max(float(retired_time), float(stopped_at))
         closed = cp.period_end(cp.period_of(ended)) + float(summary.get("settle_margin_s", 0.0))
         pending = summary.get("pending")
         final = (isinstance(pending, Mapping) and not any(int(v) for v in pending.values())
                  and all(p.get("settled") is True for p in summary.get("periods", []))
+                 and int(settled_through) >= cp.period_of(ended)
                  and float(summary.get("written_at", 0.0)) > closed)
     return {**summary, "usd_per_alpha": order.get("usd_per_alpha"), "final": final}
 
