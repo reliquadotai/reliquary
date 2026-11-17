@@ -302,7 +302,9 @@ class RegisterExecutor(BaseModel):
     # "eval" executors serve the eval control only (provider_id and host required);
     # "grade" executors (provider_id required) grade and replay for the corpus control, bound to an env
     # pin (model_id = env package, model_revision = env commit).
-    scope: Literal["corpus", "eval", "grade"] = "corpus"
+    # "trainer" executors are a training order's pod, bound to its task (task_id required).
+    scope: Literal["corpus", "eval", "grade", "trainer"] = "corpus"
+    task_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class CreateDelivery(BaseModel):
@@ -1617,12 +1619,19 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
     @router.post("/executors")
     async def register_executor(body: RegisterExecutor, response: Response) -> dict:
+        if body.scope == "trainer":
+            if body.task_id is None:
+                raise HTTPException(status_code=422, detail="a trainer executor needs its task_id")
+            entries, _ = await registry_store.read_registry(strict=False)
+            entry = entries.get(body.task_id)
+            if entry is None or "training_order" not in entry.params:
+                raise HTTPException(status_code=422, detail="training_unknown")
         try:
             document, created = await executors.register_executor(
                 executor_id=body.executor_id, token_sha256=body.token_sha256,
                 model_id=body.model_id, model_revision=body.model_revision,
                 expires_at=body.expires_at, now=clock(), provider_id=body.provider_id,
-                host=body.host, scope=body.scope)
+                host=body.host, scope=body.scope, task_id=body.task_id)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except executors.ExecutorConflict as exc:

@@ -48,7 +48,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -412,20 +412,64 @@ def _pack(group) -> str:
     return base64.b64encode(group.pack()).decode("ascii")
 
 
-def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/trainer") -> APIRouter:
+TrainerAuth = Callable[[str], Awaitable[bool]]   # a bearer token -> does it open the link
+TRAINER_AUTH_TTL_S = 30.0
+
+
+def executor_trainer_auth(task_id: str, *, store=None, clock: Callable[[], float] = time.time) -> TrainerAuth:
+    """Accepts the bearer of an active, unexpired ``trainer`` executor registered for ``task_id``. The registry is
+    re-read at most every ``TRAINER_AUTH_TTL_S``, so a revocation lands within that."""
+    import hashlib
+
+    if store is None:
+        from reliquary.infrastructure import corpus_executor_store as store
+    cache: dict[str, Any] = {"at": None, "tokens": {}}
+    lock = asyncio.Lock()
+
+    async def fresh() -> dict[str, float]:
+        async with lock:
+            now = clock()
+            if cache["at"] is None or now - cache["at"] >= TRAINER_AUTH_TTL_S:
+                documents = await store.list_executors()
+                cache["tokens"] = {d["token_sha256"]: float(d["expires_at"]) for d in documents
+                                   if store.scope_of(d) == "trainer" and d.get("task_id") == task_id
+                                   and d.get("status") == "active"}
+                cache["at"] = now
+            return cache["tokens"]
+
+    async def auth(token: str) -> bool:
+        try:
+            tokens = await fresh()
+        except Exception:
+            logger.exception("trainer executors unreadable")
+            return False
+        expires_at = tokens.get(hashlib.sha256(token.encode()).hexdigest())
+        return expires_at is not None and clock() < expires_at
+
+    return auth
+
+
+def build_rl_trainer_router(rl: RlAsync, *, token: str | None = None, auth: TrainerAuth | None = None,
+                            prefix: str = "/rl/trainer") -> APIRouter:
     """The detached async trainer's view of the buffer, the submissions' report, the lease book's checkpoints and
-    the prices (``trainer/rl_link.TrainerLink``). Every route needs ``Authorization: Bearer <token>``."""
-    if len(token) < 16:
+    the prices (``trainer/rl_link.TrainerLink``). Every route needs ``Authorization: Bearer <token>``: the static
+    ``token`` and/or a per-pod ``auth`` (one of the two is required)."""
+    if token is None and auth is None:
+        raise ValueError("the trainer link needs a token or an auth")
+    if token is not None and len(token) < 16:
         raise ValueError(f"{TRAINER_TOKEN_ENV} must be at least 16 characters")
-    expected = f"Bearer {token}".encode()
+    expected = None if token is None else f"Bearer {token}".encode()
     router = APIRouter()
 
     def refused(status: int, reason: str, detail: str = "") -> JSONResponse:
         return JSONResponse(status_code=status, content={"reason": reason, "detail": detail},
                             headers={"Cache-Control": "no-store"})
 
-    def authorized(request: Request) -> bool:
-        return hmac.compare_digest(request.headers.get("authorization", "").encode(), expected)
+    async def authorized(request: Request) -> bool:
+        header = request.headers.get("authorization", "")
+        if expected is not None and hmac.compare_digest(header.encode(), expected):
+            return True
+        return auth is not None and header.startswith("Bearer ") and await auth(header[7:])
 
     def beat_then(op: Callable[[dict], Any], body: dict) -> Any:
         """Any trainer call proves it alive (the outage pay); a failed beat never fails the call."""
@@ -437,7 +481,7 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
 
     def route(method: str, path: str, op: Callable[[dict], Any]) -> None:
         async def handler(request: Request) -> JSONResponse:
-            if not authorized(request):
+            if not await authorized(request):
                 return refused(401, "unauthorized")
             try:
                 body = await request.json() if method == "POST" else dict(request.query_params)
@@ -505,7 +549,7 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
 
     async def checkpoint(request: Request) -> JSONResponse:
         """``/rl/checkpoint``'s answer for the trainer's resume (it reaches this listener only)."""
-        if not authorized(request):
+        if not await authorized(request):
             return refused(401, "unauthorized")
         answer = None if rl.board is None else await rl.board.answer()
         if answer is None:
@@ -537,12 +581,12 @@ def trainer_bind(env: Mapping[str, str] = os.environ) -> tuple[str, int]:
     return host, int(port)
 
 
-def build_rl_trainer_app(rl: RlAsync, *, token: str):
+def build_rl_trainer_app(rl: RlAsync, *, token: str | None = None, auth: TrainerAuth | None = None):
     """The trainer link as its own app, served on ``trainer_bind()`` beside the public one."""
     from fastapi import FastAPI
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-    app.include_router(build_rl_trainer_router(rl, token=token))
+    app.include_router(build_rl_trainer_router(rl, token=token, auth=auth))
     return app
 
 
@@ -987,6 +1031,10 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     server = ValidatorServer(http_host, http_port, emission_cap=cap)
     mount_rl_async(server, rl, validator_hotkey=validator_hotkey,
                    registration=None if registered is None else registered.reason)
+    if "training_order" in entry.params:
+        # A training order's pods hold per-pod executor tokens only (never the static one); the public front
+        # proxies the trainer link to this port.
+        server.app.include_router(build_rl_trainer_router(rl, auth=executor_trainer_auth(settings.task_id)))
     from reliquary.validator.miner_setup import DB_NAME as SETUP_DB, MinerSetupStore, build_miner_setup_router
     from reliquary.validator.rl_metrics import CardFeed
 
@@ -1042,7 +1090,7 @@ __all__ = [
     "ASYNC", "AUDIT_DEVICE_ENV", "AUDIT_SOURCE_ENV", "AuditModel", "MAX_TRAINER_AUDITS", "DB_NAME", "LEASE_MARGIN_PARAM", "LEASE_SPEED_PARAM", "PENDING_PARAM",
     "PLANNED_TOKENS_PARAM", "PRICE_TICK_PARAM", "RL_MODE_ENV", "RUN_ENV", "RlAsync", "RlAsyncSettings", "START_POOL_PARAM",
     "TRAINER_BIND_ENV", "TRAINER_INSECURE_BIND_ENV", "TRAINER_TOKEN_ENV", "WINDOW", "audit_source", "build_rl_async", "build_rl_trainer_app",
-    "build_rl_trainer_router", "index_signer_for", "mount_rl_async", "rl_async_loops", "rl_async_params",
+    "TrainerAuth", "build_rl_trainer_router", "executor_trainer_auth", "index_signer_for", "mount_rl_async", "rl_async_loops", "rl_async_params",
     "episode_body_cap", "load_episode_environments", "renderer_for_checkpoint", "rl_async_settings", "rl_mode",
     "run_rl_async_validator", "trainer_bind", "wire_episode_sandbox",
 ]
