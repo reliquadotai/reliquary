@@ -2304,6 +2304,60 @@ def admin_serve(
     uvicorn.run(admin, host=host, port=port, log_level=log_level.lower())
 
 
+rl_app = typer.Typer(name="rl", help="The RL front and its tasks")
+app.add_typer(rl_app)
+
+
+@rl_app.command("front")
+def rl_front(
+    port: int = typer.Option(VALIDATOR_HTTP_PORT, "--port", help="Public port the front serves"),
+    host: str = typer.Option("0.0.0.0", "--host"),
+    map_path: Path = typer.Option(..., "--map", help="The supervisor's task map file (JSON)"),
+    allow_plain_trainer: bool = typer.Option(
+        False, "--allow-plain-trainer",
+        help="Proxy trainer paths without X-Forwarded-Proto: https (default: only behind a TLS terminator)",
+    ),
+    external_ip: str = typer.Option("", "--external-ip", help="Public IP to publish on-chain (serve_axon); empty skips"),
+    external_port: int = typer.Option(0, "--external-port", help="Public port to advertise; --port when 0"),
+    network: str = typer.Option("finney", help="Bittensor network"),
+    netuid: int = typer.Option(81, help="Subnet UID"),
+    wallet_name: str = typer.Option("default", help="Wallet name"),
+    hotkey: str = typer.Option("default", help="Hotkey name"),
+    wallet_path: str = typer.Option(os.getenv("BT_WALLET_PATH", ""), help="Optional wallet base path"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+):
+    """Serve the public port: route /rl/<task>/... to each RL task's controller and list them at /rl/tasks."""
+    import asyncio
+
+    import uvicorn
+
+    from reliquary.validator.rl_front import build_front_app
+
+    setup_logging(log_level)
+    if external_ip:
+        import bittensor as bt
+
+        from reliquary.infrastructure.chain import close_subtensor
+        from reliquary.validator.axon import serve_axon_on_chain
+
+        wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
+        if wallet_path:
+            wallet_kwargs["path"] = wallet_path
+
+        async def announce() -> None:
+            subtensor = bt.AsyncSubtensor(network=network)
+            await asyncio.wait_for(subtensor.initialize(), timeout=120.0)
+            try:
+                await serve_axon_on_chain(subtensor, wallet=bt.Wallet(**wallet_kwargs), netuid=netuid,
+                                          ip=external_ip, port=external_port or port)
+            finally:
+                await close_subtensor(subtensor)
+
+        asyncio.run(announce())
+    front = build_front_app(map_path, allow_plain_trainer=allow_plain_trainer)
+    uvicorn.run(front, host=host, port=port, log_level=log_level.lower())
+
+
 eval_app = typer.Typer(name="eval", help="Evaluation orders: frozen sets and the pod runner")
 app.add_typer(eval_app)
 
