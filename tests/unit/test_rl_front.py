@@ -104,6 +104,13 @@ async def test_a_down_task_answers_503_and_others_still_work(stack):
     assert up.status_code == 200 and up.json()["task"] == "a"
 
 
+async def test_bare_paths_answer_503_while_the_default_task_is_not_mapped(tmp_path):
+    s = Stack(tmp_path, {"b": 8002}, default="a")
+    async with s.client() as c:
+        r = await c.get("/rl/state")
+    assert r.status_code == 503 and r.json()["error"] == "task_down"
+
+
 async def test_an_unknown_task_answers_404_and_without_a_default_bare_paths_do(tmp_path):
     s = Stack(tmp_path, {"a": 8001}, default=None)
     async with s.client() as c:

@@ -2321,7 +2321,7 @@ def _rl_async_requested() -> bool:
 def rl_supervise(
     map_path: Path = typer.Option(..., "--map", help="The task map file the front reads (written atomically)"),
     ports: str = typer.Option("9100-9199", "--ports", help="Loopback ports for the controllers, LOW-HIGH"),
-    state_dir: Path = typer.Option(..., "--state-dir", help="Where each controller's log goes"),
+    state_dir: Path = typer.Option(..., "--state-dir", help="Each controller's log and state directory"),
     network: str = typer.Option("finney", help="Bittensor network"),
     netuid: int = typer.Option(81, help="Subnet UID"),
     wallet_name: str = typer.Option("default", help="Wallet name"),
@@ -2351,7 +2351,8 @@ def rl_supervise(
         raise typer.Exit(code=1) from exc
     supervisor = sup.Supervisor(
         sup.read_registry_entries, sup.subprocess_spawn(command, state_dir, dict(os.environ)), ports=port_range,
-        map_path=map_path, final_of=sup.admin_final, default_task=os.getenv(sup.DEFAULT_TASK_ENV))
+        map_path=map_path, final_of=sup.admin_final, default_task=os.getenv(sup.DEFAULT_TASK_ENV),
+        order_path=state_dir / "task-order.json", has_spend=sup.has_spend)
     try:
         while True:
             supervisor.tick()

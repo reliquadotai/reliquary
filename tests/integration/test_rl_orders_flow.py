@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import time
+from pathlib import Path
 
 import pytest
 
@@ -167,7 +168,8 @@ async def test_a_training_order_runs_end_to_end_without_an_operator(on, monkeypa
     from reliquary.validator import corpus_periods as cp
     from reliquary.validator import rl_spend
     from reliquary.validator.rl_front import build_front_app
-    from reliquary.validator.rl_supervisor import Supervisor, admin_final
+    from reliquary.validator.rl_async_service import DB_NAME
+    from reliquary.validator.rl_supervisor import Supervisor, admin_final, subprocess_spawn
     from tests.unit.test_ckpt_delta import chain
 
     clock = Clock(time.time())               # the admin dates the order's deadline on the wall clock
@@ -189,8 +191,16 @@ async def test_a_training_order_runs_end_to_end_without_an_operator(on, monkeypa
     entries = lambda: on.registry["entries"]  # noqa: E731
     controllers: dict[int, Controller] = {}
 
-    def spawn(task_id, port):
-        controllers[port] = Controller(entries()[task_id], path=tmp_path / f"{task_id}.sqlite3", bucket=bucket,
+    children: dict[str, dict] = {}
+    monkeypatch.setattr("subprocess.Popen", lambda cmd, **kw: children.update({kw["env"]["RELIQUARY_TASK_ID"]: {
+        "cmd": cmd, "env": kw["env"]}}))
+    child = subprocess_spawn(["reliquary", "validate"], tmp_path / "controllers",
+                             {"RELIQUARY_RL_TRAINER_TOKEN": "s" * 32, "RELIQUARY_STATE_DIR": str(tmp_path / "host")})
+
+    def spawn(task_id, port, entry):
+        child(task_id, port, entry)                      # the production child: its command line and environment
+        env = children[task_id]["env"]
+        controllers[port] = Controller(entry, path=Path(env["RELIQUARY_STATE_DIR"]) / DB_NAME, bucket=bucket,
                                        clock=clock, registry_entries=entries)
         return controllers[port]
 
@@ -200,6 +210,10 @@ async def test_a_training_order_runs_end_to_end_without_an_operator(on, monkeypa
         sup.tick()
         assert list(controllers) == [9100]
         controller = controllers[9100]
+        started = children[task]
+        assert started["env"]["RELIQUARY_STATE_DIR"] == str(tmp_path / "controllers" / task)
+        assert "RELIQUARY_RL_TRAINER_TOKEN" not in started["env"] and "--no-set-weights" in started["cmd"]
+        assert started["env"]["RELIQUARY_PROTOCOL_PROFILE"] == PROFILE
         mapped = json.loads(map_path.read_text())
         assert mapped["tasks"][task]["port"] == 9100 and mapped["default"] == task
 

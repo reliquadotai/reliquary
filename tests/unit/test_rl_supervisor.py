@@ -34,7 +34,7 @@ class Rig:
         self.sup = Supervisor(lambda: self.entries, self.spawn, ports=range(9100, 9103), map_path=self.map_path,
                               clock=lambda: self.now, final_of=lambda entry: entry.task_id in self.final, **kwargs)
 
-    def spawn(self, task_id: str, port: int) -> Proc:
+    def spawn(self, task_id: str, port: int, entry=None) -> Proc:
         self.spawned.append((task_id, port))
         self.procs[task_id] = Proc()
         return self.procs[task_id]
@@ -214,3 +214,104 @@ def test_the_map_names_each_tasks_model(tmp_path):
     tasks = rig.map()["tasks"]
     assert tasks["t-a"]["model"] == {"id": profile.model_id, "revision": profile.model_revision}
     assert "model" not in tasks["t-b"]
+
+
+GUMBEL = "qwen35-4b-reliquary-suite-v10-gumbel-dev1"
+
+
+def _spawned(monkeypatch, tmp_path, entry, env=None):
+    seen = {}
+    monkeypatch.setattr("subprocess.Popen", lambda cmd, **kw: seen.update(cmd=cmd, env=kw["env"]) or Proc())
+    base = {"PATH": "/bin", "RELIQUARY_RL_TRAINER_TOKEN": "s" * 32, "RELIQUARY_RL_TRAINER_BIND": "127.0.0.1:8889",
+            "RELIQUARY_STATE_DIR": "/root/shared", **(env or {})}
+    subprocess_spawn(["reliquary", "validate"], tmp_path, base)(entry.task_id, 9100, entry)
+    return seen
+
+
+def _entry(task_id, profile_id=GUMBEL, contract=None):
+    return SimpleNamespace(task_id=task_id, status="active", params={"training_order": {}}, profile_id=profile_id,
+                           contract=contract)
+
+
+def test_each_child_has_its_own_state_dir_sets_no_weights_and_holds_no_trainer_secret(tmp_path, monkeypatch):
+    a = _spawned(monkeypatch, tmp_path, _entry("t-a"))
+    b = _spawned(monkeypatch, tmp_path, _entry("t-b"))
+    assert a["env"]["RELIQUARY_STATE_DIR"] == str(tmp_path / "t-a")
+    assert b["env"]["RELIQUARY_STATE_DIR"] == str(tmp_path / "t-b")
+    for seen in (a, b):
+        assert "--no-set-weights" in seen["cmd"]
+        assert "RELIQUARY_RL_TRAINER_TOKEN" not in seen["env"] and "RELIQUARY_RL_TRAINER_BIND" not in seen["env"]
+
+
+def test_a_child_runs_its_tasks_profile_and_model(tmp_path, monkeypatch):
+    from reliquary.protocol import profiles
+
+    profile = profiles.PROFILES[GUMBEL]
+    seen = _spawned(monkeypatch, tmp_path, _entry("t-a"), env={"RELIQUARY_PROTOCOL_PROFILE": "qwen35-2b-auction-v2",
+                                                                "RELIQUARY_TASK_CONTRACT": "/elsewhere.json"})
+    assert seen["env"]["RELIQUARY_PROTOCOL_PROFILE"] == GUMBEL and "RELIQUARY_TASK_CONTRACT" not in seen["env"]
+    assert seen["cmd"][seen["cmd"].index("--checkpoint") + 1] == profile.model_id
+    monkeypatch.setattr(profiles.os, "environ", seen["env"])
+    assert profiles.resolve_protocol_profile().profile_id == GUMBEL
+
+    carried = _spawned(monkeypatch, tmp_path, _entry("t-c", contract=profile.to_generation_contract()))
+    path = carried["env"]["RELIQUARY_TASK_CONTRACT"]
+    assert path.startswith(str(tmp_path / "t-c"))
+    monkeypatch.setattr(profiles.os, "environ", carried["env"])
+    assert profiles.resolve_protocol_profile().model_id == profile.model_id
+    assert carried["cmd"][carried["cmd"].index("--checkpoint") + 1] == profile.model_id
+
+
+def test_the_default_task_stays_while_it_restarts(tmp_path):
+    rig = Rig(tmp_path)
+    rig.add("t-b")
+    rig.sup.tick()
+    rig.now += 15
+    rig.add("t-a")
+    rig.sup.tick()
+    assert rig.map()["default"] == "t-b"
+    rig.procs["t-b"].code = 1
+    rig.now += 5
+    rig.sup.tick()
+    assert "t-b" not in rig.map()["tasks"] and rig.map()["default"] == "t-b"   # bare paths: 503 while it restarts
+    rig.now += 31
+    rig.sup.tick()
+    assert rig.map()["default"] == "t-b" and "t-b" in rig.map()["tasks"]
+    rig.entries["t-b"].status = "retired"
+    rig.final.add("t-b")
+    rig.now += 15
+    rig.sup.tick()
+    assert rig.map()["default"] == "t-a"                                         # stopped for good: the next
+
+
+def test_the_default_is_the_first_task_seen_across_supervisor_restarts(tmp_path):
+    rig = Rig(tmp_path, order_path=tmp_path / "order.json")
+    rig.add("t-z")
+    rig.sup.tick()
+    rig.add("t-a")
+    rig.now += 15
+    rig.sup.tick()
+    fresh = Rig(tmp_path, order_path=tmp_path / "order.json")
+    fresh.entries = rig.entries
+    fresh.sup.tick()
+    assert fresh.map()["default"] == "t-z"                                       # not the first by name
+
+
+def test_a_retired_task_without_a_bill_logs_an_error_every_hour_after_a_day(tmp_path, caplog):
+    import logging
+
+    billed: set[str] = set()
+    rig = Rig(tmp_path, has_spend=lambda entry: entry.task_id in billed)
+    rig.add("t-a")
+    rig.add("t-b")
+    rig.sup.tick()
+    rig.entries["t-a"].status = rig.entries["t-b"].status = "retired"
+    billed.add("t-b")
+    with caplog.at_level(logging.ERROR, logger="reliquary.validator.rl_supervisor"):
+        for _ in range(int(26 * 3600 / 15) + 1):
+            rig.now += 15
+            rig.sup.tick()
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR and "t-a" in r.getMessage()]
+    assert len(errors) == 3                                                       # at 24 h, 25 h, 26 h
+    assert not [r for r in caplog.records if r.levelno == logging.ERROR and "t-b" in r.getMessage()]
+    assert rig.procs["t-a"].signals == []                                         # never stopped for it

@@ -2,7 +2,7 @@
 controller of each task, which listens on a local port (the supervisor's map file names them).
 
 * ``/rl/<task>/<rest>``  ->  ``http://127.0.0.1:<port>/rl/<rest>`` of that task's controller;
-* ``/rl/<rest>`` and every non-``/rl`` path  ->  the default task's controller;
+* ``/rl/<rest>`` and every non-``/rl`` path  ->  the default task's controller (503 while it restarts);
 * ``GET /rl/tasks``  ->  the live tasks with their auction views and models (miners pick a task from it).
 
 Trainer paths (``/rl/<task>/trainer/*``) cross the front only behind the host's TLS terminator
@@ -177,8 +177,10 @@ def build_front_app(map_path: Path, *, client_factory: Callable[[int], httpx.Asy
             if segments[1:3] == ["rl", "trainer"]:
                 return _refuse(404, "not_found")
             task, rest, prefix = current["default"], path, None
-            if task not in current["tasks"]:
+            if task is None:
                 return _refuse(404, "task_unknown")
+            if task not in current["tasks"]:
+                return _refuse(503, "task_down")          # the default is restarting
         return await proxy(request, int(current["tasks"][task]["port"]), rest, prefix)
 
     methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
