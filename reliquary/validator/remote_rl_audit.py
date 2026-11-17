@@ -142,8 +142,10 @@ class RlAuditBackend:
             if not isinstance(urls, dict) or any(urlsplit(str(u)).scheme != "https" for u in urls.values()):
                 raise ValueError("checkpoint object URLs must be https")
             state, version, _ = self.sync.sync(answer, self._state, self.version)
+            from reliquary.shared.modeling import load_checkpoint_state
+
             with self._model_lock:
-                self.model.load_state_dict(state)
+                load_checkpoint_state(self.model, state)
                 self._state, self.version = state, int(version)
             logger.info("rl audit model at checkpoint %d", version)
             return self.version

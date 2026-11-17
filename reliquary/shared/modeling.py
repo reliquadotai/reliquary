@@ -284,3 +284,25 @@ def force_close_token_ids(tokenizer) -> list[int]:
 def has_think_close(tokens: list[int], think_close_ids: set[int]) -> bool:
     """True iff any token is an atomic </think> id."""
     return any(int(t) in think_close_ids for t in tokens)
+
+
+def load_checkpoint_state(model, state) -> None:
+    """Load a published checkpoint's ``state`` into ``model`` (the audit model follows every published version).
+
+    A checkpoint is saved as HF saves it: a tied head is not in it (``lm_head.weight`` of a model with
+    ``tie_word_embeddings``) and it may carry weights the class itself ignores on load (``mtp.*``, Qwen3.5's
+    multi-token prediction). Only those two differences are allowed; any other missing or extra weight raises.
+    """
+    import re
+
+    config = getattr(model, "config", None)
+    text = config.get_text_config() if hasattr(config, "get_text_config") else config
+    tied = set(getattr(model, "_tied_weights_keys", None) or ()) if getattr(text, "tie_word_embeddings", False) else set()
+    ignored = [re.compile(p) for p in getattr(model, "_keys_to_ignore_on_load_unexpected", None) or ()]
+    result = model.load_state_dict(state, strict=False)
+    missing = [k for k in result.missing_keys if k not in tied]
+    unexpected = [k for k in result.unexpected_keys if not any(p.search(k) for p in ignored)]
+    if missing or unexpected:
+        raise RuntimeError(f"checkpoint state mismatch: missing={missing[:5]} unexpected={unexpected[:5]}")
+    if hasattr(model, "tie_weights"):
+        model.tie_weights()

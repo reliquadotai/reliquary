@@ -645,8 +645,10 @@ class AuditModel:
         state, version, _ = await asyncio.to_thread(self.sync.sync, answer, self._state, self.version)
 
         def load() -> None:
+            from reliquary.shared.modeling import load_checkpoint_state
+
             with self.lock:
-                self.model.load_state_dict(state)
+                load_checkpoint_state(self.model, state)
 
         await asyncio.to_thread(load)
         self._state, self.version = state, version
