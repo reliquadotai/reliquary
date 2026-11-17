@@ -398,6 +398,7 @@ def test_ledger_upgrade_preserves_old_trained_work_without_guessing_first_scan_u
     config = LedgerConfig(task_id="rl-test", cap=.5)
     RlPayLedger(book, subs, None, config, clock=clock)
     with book.transaction():
+        book.db.execute("DROP TRIGGER rl_accrual_usage_immutable")
         book.db.execute("ALTER TABLE rl_accruals DROP COLUMN budget_tokens")
         book.db.execute("INSERT INTO rl_accruals VALUES(1,'l1','A',?,'trained',?,0,123,1e-6,0,'forfeited')", (ENV, NOW))
         book.db.execute("INSERT INTO rl_accruals VALUES(2,'l2','A',?,'first_scan',?,0,0,1e-6,0,'accrued')", (ENV, NOW))

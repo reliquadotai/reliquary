@@ -137,6 +137,18 @@ class RlPayLedger:
             # Old first scans lost their gross value to penalties: unknown usage must not reopen a budget.
             book.db.execute("UPDATE rl_accruals SET budget_tokens=matched_tokens WHERE kind=? AND budget_tokens IS NULL",
                             (TRAINED,))
+            book.db.executescript("""
+                CREATE TRIGGER IF NOT EXISTS rl_accrual_usage_immutable BEFORE UPDATE ON rl_accruals
+                WHEN NEW.seq IS NOT OLD.seq OR NEW.lease_id IS NOT OLD.lease_id OR
+                    NEW.hotkey IS NOT OLD.hotkey OR NEW.environment IS NOT OLD.environment OR
+                    NEW.kind IS NOT OLD.kind OR NEW.at IS NOT OLD.at OR NEW.matched_tokens IS NOT OLD.matched_tokens OR
+                    NEW.token_price IS NOT OLD.token_price OR
+                    (NEW.budget_tokens IS NOT OLD.budget_tokens AND NOT
+                        (OLD.budget_tokens IS NULL AND OLD.kind='trained' AND NEW.budget_tokens IS OLD.matched_tokens))
+                BEGIN SELECT RAISE(ABORT,'rl_gross_usage_immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS rl_accrual_usage_no_delete BEFORE DELETE ON rl_accruals
+                BEGIN SELECT RAISE(ABORT,'rl_gross_usage_immutable'); END;
+            """)
             book.db.execute("INSERT OR IGNORE INTO rl_pay_cursor(id, seq) VALUES(0, 0)")
             book.db.commit()
 

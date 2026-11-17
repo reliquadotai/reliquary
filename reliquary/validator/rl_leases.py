@@ -90,6 +90,7 @@ OPEN, SUBMITTED, EXPIRED, RELEASED = "open", "submitted", "expired", "released"
 # Why a lease closed without a submission (``rl_leases.cause``): charged ones, then released ones.
 EXPIRED_CAUSE, FORFEITED, BOX_FAILED_OVER_BUDGET = "expired", "forfeited", "box_failed_over_budget"
 BOX_FAILED = "box_failed"                # a released cause the gateway can also give for the agent's own doing
+ORDER_DRAIN = "order_drain"              # the controller ended the order; never a miner miss or sandbox failure
 DAY_S = 86_400.0
 IN_ZONE, TOO_EASY, TOO_HARD, TRUNCATED = "in_zone", "too_easy", "too_hard", "truncated"
 VERDICTS = frozenset({IN_ZONE, TOO_EASY, TOO_HARD, TRUNCATED})
@@ -551,7 +552,13 @@ class LeaseBook:
     def _close_unsubmitted(self, lease: Lease, now: float, charged: str) -> str:
         """Close an open lease that will not be submitted: released when the sandbox side verifiably failed it (no
         quota cut, no scan), charged as its expiry otherwise. Returns its new state."""
-        failure = self._verified_failure(lease)
+        meta = dict(self.db.execute("SELECT key,value FROM rl_lease_meta WHERE key IN "
+                                    "('training_runtime_id','training_trainer_quiesced','training_registry_stop','training_limit_stop')"))
+        cancelled = (meta.get("training_runtime_id")
+                     and meta.get("training_trainer_quiesced") == meta["training_runtime_id"]
+                     and (meta.get("training_registry_stop") or meta.get("training_limit_stop")))
+        failure = ((ORDER_DRAIN, "order closed after trainer quiescence") if cancelled
+                   else self._verified_failure(lease))
         if failure is not None and failure[0] == BOX_FAILED:
             used = self.db.execute("SELECT COUNT(*) FROM rl_leases WHERE hotkey=? AND state=? AND cause=? AND "
                                    "closed_at>?", (lease.hotkey, RELEASED, BOX_FAILED, now - DAY_S)).fetchone()[0]
@@ -596,6 +603,35 @@ class LeaseBook:
         now = float(self.clock()) if now is None else now
         with self._txn():
             return self._expire(now)
+
+    def release_for_order_drain(self, *, runtime_id: str, now: float | None = None) -> int:
+        """After the controller's grace period, release a sealed order's unsubmitted leases without penalty.
+
+        The caller measures the grace with its own monotonic clock. Submissions already held for grading keep
+        their leases until their real outcome is recorded; no client-supplied timestamp ends another's work.
+        """
+        now = float(self.clock()) if now is None else float(now)
+        if not math.isfinite(now):
+            raise ValueError("invalid order drainage time")
+        with self._txn():
+            meta = dict(self.db.execute("SELECT key,value FROM rl_lease_meta"))
+            if (not isinstance(runtime_id, str) or not runtime_id
+                    or meta.get("training_runtime_id") != runtime_id
+                    or meta.get("training_trainer_quiesced") != runtime_id
+                    or not (meta.get("training_registry_stop") or meta.get("training_limit_stop"))):
+                raise ValueError("order drainage is not authorized for this runtime")
+            rows = self.db.execute(f"SELECT {_COLUMNS} FROM rl_leases WHERE state=?", (OPEN,)).fetchall()
+            released = 0
+            for row in rows:
+                lease = self._lease(row)
+                if lease.lease_id in self._submitting:
+                    continue
+                self.db.execute("UPDATE rl_leases SET state=?,closed_at=?,cause=? WHERE lease_id=? AND state=?",
+                                (RELEASED, now, ORDER_DRAIN, lease.lease_id, OPEN))
+                if self.quota is not None:
+                    self.quota.record_release(lease.hotkey, lease, now=now)
+                released += 1
+            return released
 
     def grant(self, requests: list[LeaseRequest], now: float | None = None) -> list[LeaseAnswer]:
         """Resolve one interval's requests together. Raises ValueError if any request is malformed. A banned hotkey,
@@ -1030,7 +1066,7 @@ class LeaseCollector:
 
 __all__ = [
     "BANNED", "BLACKLISTED", "BOX_FAILED", "BOX_FAILED_OVER_BUDGET", "COMMIT_DOMAIN", "COOLDOWN", "COOLING", "EXPIRED", "EXPIRED_CAUSE", "FORFEITED", "FULL", "IN_ZONE", "NONCE_DOMAIN", "OPEN", "QUOTA",
-    "VALIDATOR_UNAVAILABLE", "NO_ASK", "ASK_ABOVE_PRICE", "AUCTION_REFUSALS",
+    "VALIDATOR_UNAVAILABLE", "ORDER_DRAIN", "NO_ASK", "ASK_ABOVE_PRICE", "AUCTION_REFUSALS",
     "REFUSALS", "RELEASED", "SECRET_REVEAL_LAG", "STALE", "SUBMITTED", "TAKEN", "TOO_EASY", "TOO_HARD", "TRUNCATED", "VERDICTS",
     "Lease", "LeaseAnswer", "LeaseBook", "LeaseBookConfig", "LeaseCollector", "LeaseRequest", "Scan",
     "classify_group", "lease_expiry_s", "lease_nonce", "secret_commitment", "verify_reveal",
