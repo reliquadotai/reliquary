@@ -189,6 +189,9 @@ class RlAsyncSettings:
     pay_outage_grace_s: float = 600.0           # a heartbeat silence longer than this is an outage
     pay_outage_max_s: float = 86_400.0          # an outage is filled for at most this long
     probation_repeat_audit_rate: float = 1.0    # repeat out-of-zone scans audited in probation (first scans: all)
+    # The registry's auction params (``rl_auction``: pricing, the ceiling, the lag target), None: the per-env price
+    # multiplier and the per-hotkey quota.
+    auction: Mapping[str, Any] | None = None
 
     def lane_reserves(self) -> dict[str, int]:
         """env -> buffered groups kept for it: ``lane_reserve`` x the cap, split by the target shares."""
@@ -305,7 +308,13 @@ def rl_async_settings(entry, cap: float, *, run: str | None = None,
     if switches["pay_outage_grace_s"] <= 0 or switches["pay_outage_max_s"] < 0 \
             or not 0.0 <= switches["probation_repeat_audit_rate"] <= 1.0:
         raise ValueError("outage grace > 0, outage max >= 0, probation repeat audit rate in [0, 1]")
-    return RlAsyncSettings(task_id=str(entry.task_id), cap=float(cap),
+    from reliquary.validator.rl_auction import auction_settings
+
+    auction = auction_settings(params, targets, batch_groups=switches["batch_groups"])
+    if auction is not None and params.get(ENV_PAY_K_PARAM) is not None:
+        raise ValueError(f"{ENV_PAY_K_PARAM} has no use on a task priced by auction: each env's offers are capped "
+                         "by the ceiling")
+    return RlAsyncSettings(auction=auction, task_id=str(entry.task_id), cap=float(cap),
                            run=run or os.environ.get(RUN_ENV) or str(entry.task_id), targets=targets,
                            planned_tokens_per_period=float(params[PLANNED_TOKENS_PARAM]), lease_expiry_s=expiry,
                            start_pool=(min(float(params[START_POOL_PARAM]), float(cap))
@@ -350,12 +359,22 @@ def build_rl_async(settings: RlAsyncSettings, *, path: str | os.PathLike[str], g
     cooldown = AdaptiveCooldown(prompt_range=prompt_range, overrides=settings.cooldown_k)
     limits: list = []                       # the per-env limits read the book's own file: bound once it is open
     lane_max = (lambda: limits[0].lane_max() if limits else {}) if settings.lane_max_batches is not None else None
+    auctions = None
+    if getattr(settings, "auction", None) is not None:
+        from reliquary.validator.rl_auction import RlAuctions
+
+        # The auction's budget is the trainer's batch: the global cap, lanes and per-env maxima stay off.
+        auctions = RlAuctions.from_params(settings.auction, settings.targets, batch_groups=settings.batch_groups,
+                                          task_id=settings.task_id, clock=clock)
+        lane_max = None
     book = LeaseBook(path, LeaseBookConfig(expiry_s=dict(settings.lease_expiry_s),
                                            prompt_range=None if prompt_range is None else dict(prompt_range),
-                                           max_pending_groups=settings.max_pending_groups,
-                                           lane_reserve=settings.lane_reserves() or None, cooldown_of=cooldown,
+                                           max_pending_groups=None if auctions is not None
+                                           else settings.max_pending_groups,
+                                           lane_reserve=None if auctions is not None
+                                           else settings.lane_reserves() or None, cooldown_of=cooldown,
                                            lane_max=lane_max),
-                     quota=QuotaController(), clock=clock)
+                     quota=None if auctions is not None else QuotaController(), clock=clock, auctions=auctions)
     limits.append(EnvGroupCaps(book, dict(settings.targets), batch_groups=settings.batch_groups,
                                lane_batches=settings.lane_max_batches, batch_factor=settings.batch_env_factor))
     cooldown.attach(book)
