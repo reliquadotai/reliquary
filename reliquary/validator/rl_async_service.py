@@ -1101,7 +1101,8 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     server = ValidatorServer(http_host, http_port, emission_cap=cap)
     mount_rl_async(server, rl, validator_hotkey=validator_hotkey,
                    registration=None if registered is None else registered.reason)
-    if "training_order" in entry.params:
+    training_order = "training_order" in (getattr(entry, "params", None) or {})
+    if training_order:
         # A training order's pods hold per-pod executor tokens only (never the static one); the public front
         # proxies the trainer link to this port.
         server.app.include_router(build_rl_trainer_router(rl, auth=executor_trainer_auth(settings.task_id)))
@@ -1114,7 +1115,7 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
         registration=None if registered is None else registered.reason))
     archives = R2PeriodArchives(guard=R2Archives(served=lambda: (settings.task_id,), served_only=True))
     spend = registry_status = None
-    if "training_order" in entry.params:
+    if training_order:
         from reliquary.validator.rl_spend import SpendPublisher
 
         spend = SpendPublisher(rl, rl.public_put)         # what the platform bills the order on
