@@ -1473,7 +1473,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     from reliquary.admin.training import training_enabled
 
     if training_enabled():
-        from reliquary.admin.training import training_entry, training_task_id, training_view
+        from reliquary.admin.training import (
+            order_digest, training_entry, training_refusal, training_task_id, training_view,
+        )
 
         async def training_task(task_id: str):
             in_scope(task_id)
@@ -1485,16 +1487,27 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
         @router.post("/training")
         async def create_training(body: CreateTraining, response: Response) -> dict:
-            """An async RL task from a training order (``reliquary.admin.training``), priced by the RL auction."""
+            """An async RL task from a training order (``reliquary.admin.training``), priced by the RL auction.
+            A replay of the same order answers its task (200); another order under a used id is refused (409)."""
             task_id = training_task_id(body, task_prefix)
             in_scope(task_id)
-            entries, _ = await registry_store.read_registry(strict=False)
-            if task_id in entries:
-                existing = entries[task_id]
-                if existing.params.get("training_order", {}).get("training_id") != body.training_id:
-                    raise HTTPException(status_code=409, detail="task_exists")
+            digest = order_digest(body)
+
+            async def replayed() -> dict | None:
+                entries, _ = await registry_store.read_registry(strict=False)
+                existing = entries.get(task_id)
+                if existing is None:
+                    return None
+                if (existing.params.get("training_order") or {}).get("order_sha256") != digest:
+                    raise HTTPException(status_code=409, detail="training_id_reused")
                 response.status_code = 200
                 return {**training_view(existing), "created": False}
+
+            if (answer := await replayed()) is not None:
+                return answer
+            refusal = training_refusal(body)
+            if refusal is not None:
+                raise HTTPException(status_code=422, detail=refusal)
             try:
                 entry = training_entry(body, task_prefix=task_prefix,
                                        price_params=await token_price(
@@ -1505,6 +1518,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             try:
                 await registry_store.create_task(entry, guard=await draining_limits(float(entry.params["cap"])))
             except (RegistryError, registry_store.RegistryConflict) as exc:
+                if (answer := await replayed()) is not None:      # a concurrent replay created it first
+                    return answer
                 status = 409 if isinstance(exc, RegistryError) else 503
                 raise HTTPException(status_code=status, detail=str(exc)) from exc
             logger.info("admin: declared training %s as task %s", body.training_id, task_id)

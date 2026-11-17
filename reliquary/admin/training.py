@@ -96,6 +96,13 @@ def training_refusal(body: CreateTraining) -> str | None:
     return None
 
 
+def order_digest(body: CreateTraining) -> str:
+    """The order as the platform sent it: a replay under the same id must carry the same order."""
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    return canonical_sha256(body.model_dump(mode="json"))
+
+
 def training_task_id(body: CreateTraining, task_prefix: str) -> str:
     return f"{task_prefix}{TRAINING_ID_INFIX}{body.training_id}"
 
@@ -122,7 +129,7 @@ def training_entry(body: CreateTraining, *, task_prefix: str, price_params: Mapp
     entry = build_task_entry(task_id=training_task_id(body, task_prefix), profile_id=body.profile_id, cap=cap,
                              overrides={}, env_split=split)
     entry = with_rl_async_params(entry, planned_tokens_per_period=DEFAULT_PLANNED_TOKENS_PER_PERIOD)
-    order = {"training_id": body.training_id, "max_steps": body.limits.max_steps,
+    order = {"training_id": body.training_id, "order_sha256": order_digest(body), "max_steps": body.limits.max_steps,
              "deadline_at": float(created_at) + body.limits.deadline_seconds,
              "max_price_usd_per_mtoken": float(body.max_price_usd_per_mtoken)}
     if body.limits.max_tokens is not None:
@@ -142,5 +149,5 @@ def training_view(entry) -> dict:
             "order": params.get(TRAINING_PARAM)}
 
 
-__all__ = ["CreateTraining", "TRAINING_ORDERS_ENV", "training_enabled", "training_entry", "training_refusal",
+__all__ = ["CreateTraining", "TRAINING_ORDERS_ENV", "order_digest", "training_enabled", "training_entry", "training_refusal",
            "training_task_id", "training_view"]

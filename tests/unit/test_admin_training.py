@@ -64,6 +64,19 @@ def test_a_replay_answers_the_task_and_another_order_under_its_id_is_refused(on)
     assert replay.status_code == 200 and replay.json()["created"] is False
 
 
+@pytest.mark.parametrize("over", [
+    {"max_price_usd_per_mtoken": 3.0},
+    {"environments": [{"name": "reliquary_dapo_math_v1", "share_bps": 10000}]},
+    {"limits": {"max_steps": 300, "deadline_seconds": 86400}},
+    {"profile_id": "nope"},
+])
+def test_another_order_under_a_used_id_is_refused(on, over):
+    assert on("POST", "/admin/v1/training", _order()).status_code == 201
+    replay = on("POST", "/admin/v1/training", _order(**over))
+    assert replay.status_code == 409 and "training_id_reused" in replay.text
+    assert on.registry["entries"]["order-train-t1"].params[cp.MAX_PRICE_ALPHA_PARAM] == pytest.approx(0.5)
+
+
 @pytest.mark.parametrize("over, why", [
     ({"profile_id": "qwen35-2b-auction-v2"}, "Gumbel"),
     ({"profile_id": "nope"}, "unknown profile"),

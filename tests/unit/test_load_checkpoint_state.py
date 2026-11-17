@@ -52,3 +52,14 @@ def test_an_untied_model_loads_its_full_state():
     model = Tiny(tied=False)
     load_checkpoint_state(model, {"embed.weight": torch.zeros(4, 2), "lm_head.weight": torch.ones(4, 2)})
     assert float(model.lm_head.weight[0, 0]) == 1.0
+
+
+def test_a_tied_head_that_differs_from_its_embeddings_is_refused():
+    with pytest.raises(RuntimeError, match="lm_head.weight"):
+        load_checkpoint_state(Tiny(tied=True), {"embed.weight": torch.zeros(4, 2), "lm_head.weight": torch.ones(4, 2)})
+
+
+def test_a_tied_head_equal_to_its_embeddings_loads():
+    model = Tiny(tied=True)
+    load_checkpoint_state(model, {"embed.weight": torch.ones(4, 2), "lm_head.weight": torch.ones(4, 2)})
+    assert float(model.lm_head.weight[0, 0]) == 1.0

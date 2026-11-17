@@ -294,10 +294,20 @@ def load_checkpoint_state(model, state) -> None:
     multi-token prediction). Only those two differences are allowed; any other missing or extra weight raises.
     """
     import re
+    from collections.abc import Mapping
+
+    import torch
 
     config = getattr(model, "config", None)
     text = config.get_text_config() if hasattr(config, "get_text_config") else config
-    tied = set(getattr(model, "_tied_weights_keys", None) or ()) if getattr(text, "tie_word_embeddings", False) else set()
+    declared = getattr(model, "_tied_weights_keys", None) or ()
+    tied = set(declared) if getattr(text, "tie_word_embeddings", False) else set()
+    # A tied head saved anyway must equal its embeddings: loading it would overwrite them (one shared tensor).
+    targets = declared if isinstance(declared, Mapping) else {}
+    for key in tied & set(state):
+        target = targets.get(key) or next((k for k in state if k.endswith("embed_tokens.weight")), None)
+        if target not in state or not torch.equal(state[key], state[target]):
+            raise RuntimeError(f"checkpoint state mismatch: tied {key} differs from {target}")
     ignored = [re.compile(p) for p in getattr(model, "_keys_to_ignore_on_load_unexpected", None) or ()]
     result = model.load_state_dict(state, strict=False)
     missing = [k for k in result.missing_keys if k not in tied]
