@@ -114,6 +114,12 @@ class MilesTrainStep:
 _DTYPES = {"bfloat16": "BF16", "float32": "F32", "float16": "F16"}
 
 
+def _torch_dtypes() -> dict:
+    import torch
+
+    return {"BF16": torch.bfloat16, "F32": torch.float32, "F16": torch.float16}
+
+
 def _safetensors_header(path) -> dict:
     import json
     import struct
@@ -140,17 +146,37 @@ def expected_weight_specs(model_dir) -> dict[str, tuple[str, list[int]]]:
 class MilesState:
     """``AsyncTrainer``'s ``state_fn``: the gateway exports the weights (``save_weights_for_sampler``, HF safetensors
     under ``<checkpoint_root>/**/<model_id>/sampler_weights/<name>/hf`` on this box's disk), loaded on CPU. The names
-    dtypes and shapes must be exactly the HF model's (what miners load), or nothing is published. Exports older than the previous one
-    are deleted through ``delete(tinker_path)``."""
+    and shapes must be exactly the HF model's (what miners load), or nothing is published; each tensor takes the
+    model's dtype (Qwen3.5 keeps its linear-attention ``A_log`` and norms in fp32, Megatron exports them in bf16).
+    A head Miles does not train (``mtp.*``, Qwen3.5's multi-token prediction, unused by generation) is taken from
+    the base model (``base_dir``). Exports older than the previous one are deleted through ``delete(tinker_path)``."""
 
     KEEP = 2
 
-    def __init__(self, client, *, checkpoint_root, expected: dict[str, tuple[str, list[int]]], delete) -> None:
+    UNTRAINED_PREFIXES = ("mtp.",)
+
+    def __init__(self, client, *, checkpoint_root, expected: dict[str, tuple[str, list[int]]], delete,
+                 base_dir=None) -> None:
         from pathlib import Path
 
         self.client, self.root = client, Path(checkpoint_root)
         self.expected, self.delete = dict(expected), delete
+        self.base_dir = None if base_dir is None else Path(base_dir)
         self.n, self.paths = 0, []
+        self._untrained: dict | None = None
+
+    def _base_untrained(self) -> dict:
+        """The base model's weights under ``UNTRAINED_PREFIXES``, read once."""
+        from safetensors import safe_open
+
+        if self._untrained is None:
+            self._untrained = {}
+            for shard in sorted(self.base_dir.glob("*.safetensors")) if self.base_dir else ():
+                with safe_open(str(shard), framework="pt", device="cpu") as handle:
+                    for key in handle.keys():
+                        if key.startswith(self.UNTRAINED_PREFIXES):
+                            self._untrained[key] = handle.get_tensor(key)
+        return self._untrained
 
     def __call__(self) -> dict:
         from safetensors.torch import load_file
@@ -167,6 +193,13 @@ class MilesState:
         state: dict = {}
         for shard in sorted(hf.glob("*.safetensors")):
             state.update(load_file(str(shard), device="cpu"))
+        for key in set(self.expected) - set(state):
+            if key.startswith(self.UNTRAINED_PREFIXES) and key in self._base_untrained():
+                state[key] = self._base_untrained()[key]
+        for key, tensor in state.items():
+            want = _torch_dtypes().get(self.expected.get(key, ("",))[0])
+            if want is not None and tensor.dtype != want:
+                state[key] = tensor.to(want)
         got = {k: (_DTYPES.get(str(t.dtype).removeprefix("torch."), str(t.dtype)), list(t.shape))
                for k, t in state.items()}
         missing, extra = set(self.expected) - set(got), set(got) - set(self.expected)

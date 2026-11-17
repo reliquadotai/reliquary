@@ -307,7 +307,7 @@ def _start_miles(model_path, version: int | None, eos_ids):
             alive=lambda: gateway.process.poll() is None)
         step_fn = MilesTrainStep(client, eos_ids=eos_ids, global_step_hint=version or 0)
         state_fn = MilesState(client, checkpoint_root=settings["output_dir"],
-                              expected=expected_weight_specs(model_path),
+                              expected=expected_weight_specs(model_path), base_dir=model_path,
                               delete=miles_gateway.checkpoint_deleter(gateway.base_url))
         return gateway, None, step_fn, state_fn, gateway_audit(client, eos_ids=eos_ids)
     except BaseException:
