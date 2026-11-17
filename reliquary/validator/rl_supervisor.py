@@ -64,12 +64,15 @@ class Supervisor:
         except Exception as exc:
             logger.warning("rl supervisor: registry unreadable (%r); keeping what runs", exc)
             entries = None
-        self._reap_stopping(now)
+        steps = [lambda: self._reap_stopping(now), lambda: self._revive_dead(now)]
         if entries is not None:
-            self._stop_finished(entries, now)
-            self._revive_dead(now)
-            self._start_missing(entries, now)
-        self._write_map()
+            steps = [steps[0], lambda: self._stop_finished(entries, now), steps[1],
+                     lambda: self._start_missing(entries, now)]
+        for step in [*steps, self._write_map]:
+            try:
+                step()
+            except Exception:                  # one failed step must not take the controllers down with us
+                logger.exception("rl supervisor: a tick step failed; continuing")
 
     def _reap_stopping(self, now: float) -> None:
         for task_id, (run, kill_at) in list(self._stopping.items()):
@@ -83,16 +86,18 @@ class Supervisor:
             entry = entries.get(task_id)
             if entry is None or entry.status != "retired":
                 continue
-            try:
-                final = bool(self._final_of(entry))
-            except Exception as exc:
-                logger.warning("rl supervisor: finality of %s unknown (%r)", task_id, exc)
-                continue
-            if final:
+            if self._is_final(task_id, entry):
                 logger.info("rl supervisor: stopping %s (final)", task_id)
                 run.proc.terminate()
                 del self._running[task_id]
                 self._stopping[task_id] = (run, now + KILL_AFTER_S)
+
+    def _is_final(self, task_id: str, entry: Any) -> bool:
+        try:
+            return bool(self._final_of(entry))
+        except Exception as exc:
+            logger.warning("rl supervisor: finality of %s unknown (%r)", task_id, exc)
+            return False
 
     def _revive_dead(self, now: float) -> None:
         for task_id, run in list(self._running.items()):
@@ -109,9 +114,12 @@ class Supervisor:
 
     def _start_missing(self, entries: Mapping[str, Any], now: float) -> None:
         for task_id, entry in sorted(entries.items()):
-            if (entry.status != "active" or TRAINING_PARAM not in entry.params or task_id in self._running
-                    or task_id in self._stopping or self._restart_at.get(task_id, 0.0) > now):
+            if (entry.status not in ("active", "retired") or TRAINING_PARAM not in entry.params
+                    or task_id in self._running or task_id in self._stopping
+                    or self._restart_at.get(task_id, 0.0) > now):
                 continue
+            if entry.status == "retired" and self._is_final(task_id, entry):
+                continue                       # a retired task runs on until its bill is final
             port = self._free_port()
             if port is None:
                 logger.error("rl supervisor: no free port for %s", task_id)
@@ -157,11 +165,30 @@ def subprocess_spawn(command: list[str], state_dir: Path, env: Mapping[str, str]
         try:
             return subprocess.Popen(
                 [*command, "--http-host", "127.0.0.1", "--http-port", str(port)],
-                env={**env, "RELIQUARY_RL_MODE": "async", "RELIQUARY_TASK_ID": task_id},
+                env={**env, "RELIQUARY_RL_MODE": "async", "RELIQUARY_TASK_ID": task_id,
+                     "RELIQUARY_RL_RUN": task_id},
                 stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
         finally:
             log.close()
     return spawn
+
+
+class StateLocked(RuntimeError):
+    """Another supervisor holds the state directory."""
+
+
+def lock_state_dir(state_dir: Path) -> Any:
+    """Hold ``<state_dir>/supervisor.lock`` for the process lifetime: close the returned file to release."""
+    import fcntl
+
+    state_dir.mkdir(parents=True, exist_ok=True)
+    handle = open(state_dir / "supervisor.lock", "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        raise StateLocked(f"another supervisor holds {state_dir}") from exc
+    return handle
 
 
 def read_registry_entries() -> Mapping[str, Any]:
@@ -186,4 +213,4 @@ def admin_final(entry: Any) -> bool:
     return bool(training_spend(entry, summary, retired_time=_round_time(int(entry.retired_at)))["final"])
 
 
-__all__ = ["DEFAULT_TASK_ENV", "Supervisor", "TICK_S", "admin_final", "read_registry_entries", "subprocess_spawn"]
+__all__ = ["DEFAULT_TASK_ENV", "StateLocked", "Supervisor", "TICK_S", "lock_state_dir", "admin_final", "read_registry_entries", "subprocess_spawn"]

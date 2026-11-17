@@ -197,3 +197,8 @@ reads the task registry every 15 s and keeps one async controller (`reliquary va
 oldest running one. A retired task's controller keeps running until the admin's `final` for it is true, then gets
 SIGTERM (SIGKILL after 60 s). A dead controller restarts after 30 s, doubling up to 10 min. The supervisor needs
 the host's wallet and R2 environment, and the same registry and public-bucket access as the admin.
+
+A deploy that restarts the supervisor restarts every training controller (they are its children); the front
+answers connection refused for the few seconds a controller takes to start. A retired task whose bill is not yet
+final is restarted too, to settle its last period without leasing. A lock file in `--state-dir` keeps a second
+supervisor from running on the same directory.

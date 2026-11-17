@@ -2308,6 +2308,15 @@ rl_app = typer.Typer(name="rl", help="The RL front and its tasks")
 app.add_typer(rl_app)
 
 
+def _rl_async_requested() -> bool:
+    from reliquary.validator.rl_async_service import ASYNC, rl_mode
+
+    try:
+        return rl_mode() == ASYNC
+    except ValueError:
+        return False
+
+
 @rl_app.command("supervise")
 def rl_supervise(
     map_path: Path = typer.Option(..., "--map", help="The task map file the front reads (written atomically)"),
@@ -2335,12 +2344,20 @@ def rl_supervise(
                "--wallet-name", wallet_name, "--hotkey", hotkey]
     if wallet_path:
         command += ["--wallet-path", wallet_path]
+    try:
+        lock = sup.lock_state_dir(state_dir)
+    except sup.StateLocked as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
     supervisor = sup.Supervisor(
         sup.read_registry_entries, sup.subprocess_spawn(command, state_dir, dict(os.environ)), ports=port_range,
         map_path=map_path, final_of=sup.admin_final, default_task=os.getenv(sup.DEFAULT_TASK_ENV))
-    while True:
-        supervisor.tick()
-        time.sleep(sup.TICK_S)
+    try:
+        while True:
+            supervisor.tick()
+            time.sleep(sup.TICK_S)
+    finally:
+        lock.close()
 
 
 @rl_app.command("front")
@@ -5022,6 +5039,7 @@ def validate(
                         TASK_ID,
                         profile_id=PROTOCOL_PROFILE_ID,
                         generation_contract=PROTOCOL_GENERATION_CONTRACT,
+                        allow_retired_training=_rl_async_requested(),
                     )
             except TaskConfigError as exc:
                 # Unlike a missing GPU lease, this is not an environment

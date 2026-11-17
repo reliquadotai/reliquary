@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from reliquary.validator.rl_supervisor import Supervisor, subprocess_spawn
+from reliquary.validator.rl_supervisor import Supervisor, subprocess_spawn  # noqa: F401
 
 
 class Proc:
@@ -147,4 +147,56 @@ def test_the_spawn_binds_loopback_and_announces_nothing(tmp_path, monkeypatch):
     assert "--external-ip" not in seen["cmd"]
     assert seen["cmd"][seen["cmd"].index("--http-host") + 1] == "127.0.0.1"
     assert seen["cmd"][seen["cmd"].index("--http-port") + 1] == "9100"
+    assert seen["env"]["RELIQUARY_RL_RUN"] == "t-a"
     assert seen["env"]["RELIQUARY_TASK_ID"] == "t-a" and seen["env"]["RELIQUARY_RL_MODE"] == "async"
+
+
+def test_a_retired_task_not_yet_final_is_restarted_when_its_controller_died(tmp_path):
+    rig = Rig(tmp_path)
+    rig.add("t-a")
+    rig.sup.tick()
+    rig.entries["t-a"].status = "retired"
+    rig.procs["t-a"].code = 1
+    for _ in range(8):
+        rig.now += 5
+        rig.sup.tick()
+    assert len(rig.spawned) == 2
+    # a fresh supervisor (deploy) picks up retired-not-final tasks, and not final ones
+    fresh = Rig(tmp_path / "f") if (tmp_path / "f").mkdir() is None else None
+    fresh.entries = rig.entries
+    fresh.add("t-done", status="retired")
+    fresh.final.add("t-done")
+    fresh.sup.tick()
+    assert [t for t, _ in fresh.spawned] == ["t-a"]
+
+
+def test_a_failing_spawn_or_map_write_leaves_running_controllers_alone(tmp_path):
+    rig = Rig(tmp_path)
+    rig.add("t-a")
+    rig.sup.tick()
+    rig.add("t-b")
+
+    def boom(task_id, port):
+        raise RuntimeError("fork failed")
+
+    rig.sup._spawn = boom
+    rig.sup.tick()
+    assert rig.procs["t-a"].signals == [] and "t-a" in rig.map()["tasks"]
+    rig.sup._spawn = rig.spawn
+    rig.sup._map_path = tmp_path / "missing" / "deep" / "map.json"
+    (tmp_path / "missing").write_text("a file, not a directory")
+    rig.now += 100
+    rig.sup.tick()                                      # the write fails; no exception
+    assert rig.procs["t-a"].signals == []
+
+
+def test_a_second_supervisor_on_the_same_state_dir_is_refused(tmp_path):
+    import pytest
+
+    from reliquary.validator.rl_supervisor import StateLocked, lock_state_dir
+
+    first = lock_state_dir(tmp_path)
+    with pytest.raises(StateLocked):
+        lock_state_dir(tmp_path)
+    first.close()
+    lock_state_dir(tmp_path).close()
