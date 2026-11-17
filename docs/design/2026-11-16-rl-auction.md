@@ -133,8 +133,13 @@ lease book has no quota, no global pending cap and no lanes: the budget is the b
 
 1. Auction per env in the RL controller: grant, lease price, debits, budget from the batch, routes, miner flag.
    Unit tests on the lease book, the ledger and the budget.
-2. Admin route creating an RL task from an `adaptive_training` service contract, its environments checked against
-   the catalog's `rl` rows, with `rl_pricing = auction`.
+2. Admin route creating an RL task from a training order, its environments checked against the catalog's `rl`
+   rows, priced by auction (`reliquary/admin/training.py`, off unless `RELIQUARY_TRAINING_ORDERS=on`):
+   `POST /admin/v1/training` `{training_id, profile_id, environments[{name, share_bps}], limits{max_steps,
+   deadline_seconds, max_tokens?}, max_price_usd_per_mtoken, batch_groups, lag_target, cap?}` declares
+   `order-train-<id>`, an `rl-discovered-price` async task (the async controller reads `env_split` and `rl_*`;
+   nothing async consumes a service contract yet); `GET /admin/v1/training/{task}` and `POST .../retire`. The
+   profile must draw by Gumbel-max. The controller and the trainer are still started by an operator per task.
 3. A training run on rented GPUs: a small model, our own miners on the rented box, two single-turn envs and one
    episode env, to check the budget keeps the trainer fed without groups dying of lag and the trainer never waits for long.
 4. Public environments in the catalog with `rl` rows.

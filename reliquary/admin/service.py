@@ -25,6 +25,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from reliquary.admin.training import CreateTraining  # a route body model: FastAPI resolves it from globals
 from reliquary.admin.auth import (
     NONCE_HEADER,
     SIGNATURE_HEADER,
@@ -1468,6 +1469,67 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         return {"task_id": task_id, "status": "retired", "retired_at": stamp}
+
+    from reliquary.admin.training import training_enabled
+
+    if training_enabled():
+        from reliquary.admin.training import training_entry, training_task_id, training_view
+
+        async def training_task(task_id: str):
+            in_scope(task_id)
+            entries, _ = await registry_store.read_registry(strict=False)
+            entry = entries.get(task_id)
+            if entry is None or "training_order" not in entry.params:
+                raise HTTPException(status_code=404, detail="training_unknown")
+            return entry
+
+        @router.post("/training")
+        async def create_training(body: CreateTraining, response: Response) -> dict:
+            """An async RL task from a training order (``reliquary.admin.training``), priced by the RL auction."""
+            task_id = training_task_id(body, task_prefix)
+            in_scope(task_id)
+            entries, _ = await registry_store.read_registry(strict=False)
+            if task_id in entries:
+                existing = entries[task_id]
+                if existing.params.get("training_order", {}).get("training_id") != body.training_id:
+                    raise HTTPException(status_code=409, detail="task_exists")
+                response.status_code = 200
+                return {**training_view(existing), "created": False}
+            try:
+                entry = training_entry(body, task_prefix=task_prefix,
+                                       price_params=await token_price(
+                                           TokenCeiling(input=0.0, output=body.max_price_usd_per_mtoken)),
+                                       created_at=clock())
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            try:
+                await registry_store.create_task(entry, guard=await draining_limits(float(entry.params["cap"])))
+            except (RegistryError, registry_store.RegistryConflict) as exc:
+                status = 409 if isinstance(exc, RegistryError) else 503
+                raise HTTPException(status_code=status, detail=str(exc)) from exc
+            logger.info("admin: declared training %s as task %s", body.training_id, task_id)
+            response.status_code = 201
+            return {**training_view(entry), "created": True}
+
+        @router.get("/training/{task_id}")
+        async def training_status(task_id: str) -> dict:
+            return training_view(await training_task(task_id))
+
+        @router.post("/training/{task_id}/retire")
+        async def retire_training(task_id: str, body: Retire) -> dict:
+            entry = await training_task(task_id)
+            if entry.status != "retired":
+                try:
+                    stamp = body.retired_at if body.retired_at is not None else current_round()
+                    await registry_store.retire_task_entry(task_id, stamp)
+                except (RegistryError, registry_store.RegistryConflict) as exc:
+                    entry = await training_task(task_id)
+                    if entry.status != "retired":
+                        raise HTTPException(status_code=409 if isinstance(exc, RegistryError) else 503,
+                                            detail=str(exc)) from exc
+                except RuntimeError as exc:
+                    raise HTTPException(status_code=503, detail=str(exc)) from exc
+            return training_view(await training_task(task_id))
 
     @router.get("/jobs/{job_id}/status")
     async def job_status(job_id: str) -> dict:
