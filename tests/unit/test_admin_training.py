@@ -117,3 +117,53 @@ def test_status_and_retire(on):
     assert on("POST", "/admin/v1/training/order-train-t1/retire", {}).json()["status"] == "retired"
     assert on("GET", "/admin/v1/training/order-train-nope").status_code == 404
     assert on("GET", "/admin/v1/training/default").status_code == 409
+
+
+def test_the_order_freezes_its_alpha_rate(on):
+    assert on("POST", "/admin/v1/training", _order()).status_code == 201
+    order = on.registry["entries"]["order-train-t1"].params["training_order"]
+    assert order["usd_per_alpha"] == pytest.approx(4.0)                    # the rate the ceiling was converted at
+
+
+def _summary(*settled, leases_out=0):
+    return {"task_id": "order-train-t1", "run": "order-train-t1", "leases_out": leases_out, "starved": [],
+            "periods": [{"period": i, "settled": s, "accrued_alpha": 1.0, "paid_alpha": 1.0 if s else None,
+                         "buckets": {}} for i, s in enumerate(settled)], "stopped": None, "latest_checkpoint": 3}
+
+
+@pytest.fixture
+def spend(monkeypatch):
+    from reliquary.validator import rl_spend
+
+    held = {}
+    monkeypatch.setattr(rl_spend, "read_spend", lambda run: held.get(run))
+    return held
+
+
+def test_the_spend_route_adds_the_frozen_rate(on, spend):
+    assert on("POST", "/admin/v1/training", _order()).status_code == 201
+    assert on("GET", "/admin/v1/training/order-train-t1/spend").status_code == 404     # not written yet
+    spend["order-train-t1"] = _summary(True, False)
+    answer = on("GET", "/admin/v1/training/order-train-t1/spend")
+    assert answer.status_code == 200, answer.text
+    body = answer.json()
+    assert body["usd_per_alpha"] == pytest.approx(4.0) and body["final"] is False
+    assert [p["settled"] for p in body["periods"]] == [True, False] and body["latest_checkpoint"] == 3
+    spend["order-train-t1"] = {**_summary(True), "task_id": "order-train-other"}
+    assert on("GET", "/admin/v1/training/order-train-t1/spend").status_code == 503
+    assert on("GET", "/admin/v1/training/order-train-nope/spend").status_code == 404
+
+
+def test_spend_is_final_only_when_retired_and_settled(on, spend):
+    assert on("POST", "/admin/v1/training", _order()).status_code == 201
+
+    def final(summary):
+        spend["order-train-t1"] = summary
+        return on("GET", "/admin/v1/training/order-train-t1/spend").json()["final"]
+
+    assert final(_summary(True, True)) is False                                     # still active
+    assert on("POST", "/admin/v1/training/order-train-t1/retire", {}).status_code == 200
+    assert final(_summary(True, False)) is False                                    # a period still open
+    assert final(_summary(True, True, leases_out=2)) is False                       # leases may still deliver
+    assert final(_summary(True, True)) is True
+    assert final(_summary()) is True                                                # nothing was ever paid

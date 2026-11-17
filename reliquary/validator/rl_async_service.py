@@ -346,6 +346,7 @@ class RlAsync:
     presign_put: Any = None
     presign_get: Any = None
     delete_object: Any = None
+    public_put: Any = None                      # the public bucket's writer (``rl_observations.bucket_io``)
 
     def close(self) -> None:
         self.book.close()
@@ -756,11 +757,12 @@ async def _every(step: Callable[[], Any], period: float, name: str) -> None:
 
 def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = None, audit_limit: int = AUDIT_LIMIT,
                    clock: Callable[[], float] = time.time, every: Mapping[str, float] | None = None,
-                   publisher=None, trainer_audits: bool = False, cards=None) -> list:
+                   publisher=None, trainer_audits: bool = False, cards=None, spend=None) -> list:
     """The background coroutines of the service (run until cancelled). ``publisher``: the scan log's
     ``ObservationPublisher`` (``rl_observations.scan_publisher``). ``trainer_audits``: the trainer judges the audits
     (``RlSubmissions.take_audits``); the loop here only drops the stale ones. ``cards``: the declared hardware
-    broken down per card in the metrics row (``rl_metrics.CardFeed``)."""
+    broken down per card in the metrics row (``rl_metrics.CardFeed``). ``spend``: a training order's
+    ``rl_spend.SpendPublisher``, written after the ledger's settle."""
     from reliquary.validator import telemetry
     from reliquary.validator.rl_metrics import METRICS_EVERY_S, controller_metrics
     from reliquary.validator.rl_observations import FLUSH_EVERY_S
@@ -795,6 +797,8 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
                         len(doc["rewards_by_hotkey"]), doc["scale"])
         if archives is not None:
             await rl.ledger.publish(archives)
+        if spend is not None:
+            await spend.write(settled=bool(settled))
 
     async def price() -> None:
         now = float(clock())
@@ -947,6 +951,7 @@ def _public_boards(rl: RlAsync, wallet, validator_hotkey: str, signer_client=Non
                                  index_signer=index_signer_for(wallet, signer_client),
                                  validator_hotkey=validator_hotkey, presign=presign)
     put, get = bucket_io(client, bucket)
+    rl.public_put = put
     publisher = scan_publisher(rl.book, run=run, task_id=rl.settings.task_id, wallet=wallet, put=put, get=get,
                                signer_client=signer_client)
     rl.observations = ObservationBoard(publisher, presign=presign)
@@ -1078,9 +1083,14 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
         setups, validator_hotkey=validator_hotkey,
         registration=None if registered is None else registered.reason))
     archives = R2PeriodArchives(guard=R2Archives(served=lambda: (settings.task_id,), served_only=True))
+    spend = None
+    if "training_order" in entry.params:
+        from reliquary.validator.rl_spend import SpendPublisher
+
+        spend = SpendPublisher(rl, rl.public_put)         # what the platform bills the order on
     background = rl_async_loops(rl, archives=archives, audit_model=audit_model, publisher=publisher,
                                 trainer_audits=source == "trainer",
-                                cards=CardFeed(setups, state_dir / "rl-card-models.json"))
+                                cards=CardFeed(setups, state_dir / "rl-card-models.json"), spend=spend)
     if rl.sandbox is not None:
         background.extend(rl.sandbox.background())
     if registered is not None:

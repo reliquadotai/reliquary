@@ -464,7 +464,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      model_facts=None, evaluation_sessions=None, pin_model=None,
                      upload_tokenizer=None, subnet_pool=None, tao_usd=None,
                      sandbox_machine_prefix: str | None = None, sandbox_machines=None,
-                     order_sessions=None) -> FastAPI:
+                     order_sessions=None, rl_spend_reader=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
     ``eval_store`` the subnet bucket holding the eval sets' grading files; ``order_sessions``
@@ -473,7 +473,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     ``subnet_pool`` (async, ``chain.subnet_pool``'s answer) and ``tao_usd``
     (async, USD per TAO) convert an order's USD token ceiling. ``sandbox_machine_prefix``
     turns on the sandbox machine routes for the machines named with it (the platform's rented
-    gateways) and only those; ``sandbox_machines`` is the machine directory (``sandbox_store``)."""
+    gateways) and only those; ``sandbox_machines`` is the machine directory (``sandbox_store``).
+    ``rl_spend_reader(run)``: a training task's spend summary or None (default: ``rl_spend.read_spend``)."""
     from reliquary.infrastructure import corpus_executor_store as executors
     from reliquary.infrastructure import corpus_job_store as job_store
     from reliquary.infrastructure import task_registry_store as registry_store
@@ -1476,7 +1477,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
     if training_enabled():
         from reliquary.admin.training import (
-            order_digest, training_entry, training_refusal, training_task_id, training_view,
+            order_digest, training_entry, training_refusal, training_spend, training_task_id, training_view,
         )
 
         async def training_task(task_id: str):
@@ -1531,6 +1532,25 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         @router.get("/training/{task_id}")
         async def training_status(task_id: str) -> dict:
             return training_view(await training_task(task_id))
+
+        @router.get("/training/{task_id}/spend")
+        async def training_spend_route(task_id: str) -> dict:
+            """What the task paid its miners (``rl_spend``, written by its controller), the order's frozen
+            alpha/USD rate and whether the bill is final."""
+            entry = await training_task(task_id)
+            from reliquary.validator import rl_spend
+
+            read = rl_spend_reader or rl_spend.read_spend
+            try:
+                summary = await asyncio.to_thread(read, task_id)      # a training task's run is its task id
+            except Exception as exc:
+                logger.warning("admin: the spend of %s is unreadable: %r", task_id, exc)
+                raise HTTPException(status_code=503, detail="spend_unreadable") from exc
+            if summary is None:
+                raise HTTPException(status_code=404, detail="spend_not_published")
+            if summary.get("task_id") != task_id:
+                raise HTTPException(status_code=503, detail="spend_of_another_task")
+            return training_spend(entry, summary)
 
         @router.post("/training/{task_id}/retire")
         async def retire_training(task_id: str, body: Retire) -> dict:

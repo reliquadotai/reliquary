@@ -37,7 +37,16 @@ def test_a_long_wait_counts_after_its_first_five_minutes(tmp_path):
 
 def test_an_open_wait_is_reported_up_to_now(tmp_path):
     clock, book, buffer = _setup(tmp_path)
-    buffer.take(1)
-    clock.t += 900.0
-    assert starved_intervals(book.db, now=clock()) == [(1300.0, 1900.0)]
+    for _ in range(46):                  # the trainer keeps asking every 20 s
+        buffer.take(1)
+        clock.t += 20.0
+    assert starved_intervals(book.db, now=1910.0) == [(1300.0, 1910.0)]
     assert starved_intervals(book.db, now=1200.0) == []
+
+
+def test_an_open_wait_stops_at_the_last_poll(tmp_path):
+    clock, book, buffer = _setup(tmp_path)
+    for _ in range(26):                  # asks until 1500, then the trainer is gone
+        buffer.take(1)
+        clock.t += 20.0
+    assert starved_intervals(book.db, now=9000.0) == [(1300.0, 1530.0)]
