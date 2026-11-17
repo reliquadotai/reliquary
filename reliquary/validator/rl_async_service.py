@@ -639,7 +639,8 @@ def mount_rl_async(server, rl: RlAsync, *, validator_hotkey: str, registration=N
     router = build_rl_lease_router(book=rl.book, collector=rl.collector, validator_hotkey=validator_hotkey,
                                    registration=registration, clock=clock, submissions=rl.submissions,
                                    pay=rl.ledger, max_episode_body_bytes=episode_body_cap(rl.settings),
-                                   admit=lambda env, idx: _lease_admission(rl, env, idx))
+                                   admit=lambda env, idx: _lease_admission(rl, env, idx),
+                                   task_id=rl.settings.task_id)
 
     @router.get("/rl/checkpoint")
     async def rl_checkpoint():
@@ -930,7 +931,8 @@ def wire_episode_sandbox(rl: RlAsync, config, *, validator_hotkey: str, environm
 
     sandbox = build_rl_lease_sandbox(config, validator_hotkey=validator_hotkey, lease_book=rl.book,
                                      environments=environments, policies=rl.settings.episode_policies(),
-                                     renderer_for=renderer_for, registration=registration, **kwargs)
+                                     renderer_for=renderer_for, registration=registration,
+                                     task_id=rl.settings.task_id, **kwargs)
     rl.submissions.grader.add_episodes(sandbox.checkers)
     rl.book.sandbox_failure = sandbox.lease_failure      # a lease our sandbox failed is released, not charged
     rl.sandbox = sandbox

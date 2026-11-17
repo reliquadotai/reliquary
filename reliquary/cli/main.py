@@ -4691,6 +4691,10 @@ def mine_async(
     ask_capacity: int = typer.Option(
         0, "--ask-capacity", help="With --ask-alpha-per-mtoken: the groups you can hold at once per env "
                                   "(default: --max-open)"),
+    rl_task: str = typer.Option(
+        "", "--rl-task", help="Mine this RL task only (its /rl/<task> routes). Default: the task that pays best "
+                              "for your envs (GET /rl/tasks), chosen again every 10 min; bare /rl on a validator "
+                              "without it"),
     log_level: str = typer.Option("INFO", help="Log level"),
 ) -> None:
     """Mine the asynchronous RL protocol: lease prompts within the measured quota, generate 16 rollouts per lease
@@ -4719,6 +4723,10 @@ def mine_async(
             raise typer.Exit(code=2)
         typer.echo(f"validator discovered: {validator_url} ({validator_hotkey})")
     try:
+        if rl_task:
+            from reliquary.miner.rl_task_choice import task_prefix
+
+            task_prefix(rl_task)
         asks = _rl_asks(ask_alpha_per_mtoken, names, ask_capacity or max_open)
         config = AsyncMinerConfig(environments=names, lease_batch=lease_batch, max_open=max_open,
                                   queue_groups=queue_groups, batch_groups=batch_groups,
@@ -4743,7 +4751,7 @@ def mine_async(
             base_model_dir=base_model or None, work_dir=work_dir, initial_dir=initial_checkpoint or None,
             initial_version=None if initial_version < 0 else initial_version, swap=weight_swap, dry_run=dry_run,
             fake_generator=fake_generator, episode_options=episode_options,
-            share_setup=setup_note if share_setup else None,
+            share_setup=setup_note if share_setup else None, rl_task=rl_task or None,
             engine_kwargs={"gpu_memory_utilization": gpu_memory_utilization, "max_num_seqs": max_num_seqs,
                            "max_model_len": max_model_len or None, "quantization": quantization or None}))
     except ValueError as exc:

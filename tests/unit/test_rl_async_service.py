@@ -565,6 +565,10 @@ def test_mine_async_finds_the_validator_on_the_metagraph(monkeypatch):
     assert result.exit_code == 0 and (runs[-1]["validator_url"], runs[-1]["validator_hotkey"]) == ("http://x:1",
                                                                                                     "5Override")
     assert runner.invoke(cli.app, ["mine-async", "--environments", ENV, "--validator-url", "http://x:1"]).exit_code == 2
+    assert runs[-1]["rl_task"] is None
+    result = runner.invoke(cli.app, ["mine-async", "--environments", ENV, "--rl-task", "order-7"])
+    assert result.exit_code == 0 and runs[-1]["rl_task"] == "order-7"
+    assert runner.invoke(cli.app, ["mine-async", "--environments", ENV, "--rl-task", "../x"]).exit_code == 2
 
 
 def test_the_controller_wandb_row_reads_prices_buffer_leases_and_miners(tmp_path):
