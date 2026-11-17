@@ -88,6 +88,7 @@ def test_the_summary_carries_starvation_the_stop_and_the_checkpoint(tmp_path):
     clock.t = NOW + 20
     summary = spend_summary(rl, now=clock())
     assert summary["starved"] == [[NOW - 700, NOW - 100]]
+    assert summary["dead"] == []                                                    # never polled
     assert summary["stopped"] == "deadline" and summary["latest_checkpoint"] == 4
     assert summary["stopped_at"] == NOW + 10                                        # the deadline itself
     assert summary["pending"] == {"open_leases": 0, "buffered": 0, "audits": 0, "unledgered": 0}
@@ -309,3 +310,17 @@ def test_a_failing_spend_write_does_not_hold_the_archive_publish():
 
     asyncio.run(run())
     assert calls[:2] == ["spend", "publish"]
+
+
+def test_the_summary_lists_the_dead_pieces_and_caps_the_open_one_at_the_stop(tmp_path):
+    rl, clock = _rl(tmp_path, deadline_at=NOW + 1000)
+    rl.book.db.execute("INSERT INTO rl_trainer_dead(start, end) VALUES(?, ?)", (NOW - 900, NOW - 500))
+    rl.book.db.execute("INSERT INTO rl_trainer_poll(id, at) VALUES(0, ?)", (NOW - 400,))
+    rl.book.db.commit()
+    clock.t = NOW + 600
+    summary = spend_summary(rl, now=clock())
+    assert summary["dead"] == [[NOW - 900, NOW - 500], [NOW - 220, NOW + 600]]      # open: last poll + 180 to now
+    clock.t = NOW + 2000
+    summary = spend_summary(rl, now=clock())
+    assert summary["stopped_at"] == NOW + 1000
+    assert summary["dead"][-1] == [NOW - 220, NOW + 1000]                           # capped at the stop

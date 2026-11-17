@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS rl_buffer(lease_id TEXT PRIMARY KEY, environment TEXT
     attempts INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS rl_trainer_waits(start REAL NOT NULL, end REAL, polled REAL);   -- end NULL: still waiting
 CREATE TABLE IF NOT EXISTS rl_trainer_dead(start REAL NOT NULL, end REAL NOT NULL);   -- no take inside a wait
+CREATE TABLE IF NOT EXISTS rl_trainer_poll(id INTEGER PRIMARY KEY CHECK(id=0), at REAL NOT NULL);   -- the last take
 CREATE INDEX IF NOT EXISTS rl_buffer_fresh ON rl_buffer(state, environment, k, arrived_at);
 """
 
@@ -150,6 +151,19 @@ def starved_intervals(db, *, min_wait_s: float = STARVATION_GRACE_S,
     return out
 
 
+def dead_intervals(db, *, now: float | None = None) -> list[tuple[float, float]]:
+    """The spans where the trainer was down: the recorded pieces of ``rl_trainer_dead`` (a gap between two takes
+    longer than ``STARVATION_DEAD_GAP_S``, from the take + that gap to the next take) and, for a trainer that
+    stopped asking, an open piece from its last take + ``STARVATION_DEAD_GAP_S`` to ``now``. They never overlap
+    ``starved_intervals`` (that one leaves the dead pieces out and ends an open wait at the same bound)."""
+    now = time.time() if now is None else now
+    out = [(float(s), float(e)) for s, e in db.execute("SELECT start, end FROM rl_trainer_dead ORDER BY start")]
+    row = db.execute("SELECT at FROM rl_trainer_poll WHERE id=0").fetchone()
+    if row is not None and now - float(row[0]) > STARVATION_DEAD_GAP_S:
+        out.append((float(row[0]) + STARVATION_DEAD_GAP_S, now))
+    return out
+
+
 class TrainingBuffer:
     def __init__(self, book, clock=time.time, batch_caps=None) -> None:
         """``batch_caps(limit)``: env -> its share of the groups one take hands out (``rl_env_shares.EnvGroupCaps``;
@@ -242,6 +256,8 @@ class TrainingBuffer:
                                          (open_wait[0] + STARVATION_DEAD_GAP_S, now))
                 self.book.db.execute(f"UPDATE rl_trainer_waits SET {'polled' if short else 'end'}=? "
                                      "WHERE end IS NULL", (now,))
+            self.book.db.execute("INSERT INTO rl_trainer_poll(id, at) VALUES(0, ?) ON CONFLICT(id) DO UPDATE SET at=?",
+                                 (now, now))
             self._waiting_since = now if short else None
         groups = [SubmittedGroup.unpack(body) for _, body in rows]
         with self.book.lock:

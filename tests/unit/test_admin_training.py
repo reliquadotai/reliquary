@@ -131,7 +131,7 @@ SETTLED_AFTER = RETIRED_AT + 600.0 + 120.0                                # its 
 
 def _summary(*settled, open_leases=0, stopped_at=RETIRED_AT, written_at=SETTLED_AFTER + 1, stopped="retired",
              settled_through=cp.period_of(RETIRED_AT)):
-    return {"task_id": "order-train-t1", "run": "order-train-t1", "starved": [], "stopped_at": stopped_at,
+    return {"task_id": "order-train-t1", "run": "order-train-t1", "starved": [], "dead": [[10.0, 20.0]], "stopped_at": stopped_at,
             "pending": {"open_leases": open_leases, "buffered": 0, "audits": 0, "unledgered": 0},
             "settle_margin_s": 120.0, "written_at": written_at, "settled_through": settled_through,
             "periods": [{"period": i, "settled": s, "accrued_alpha": 1.0, "paid_alpha": 1.0 if s else None,
@@ -160,6 +160,7 @@ def test_the_spend_route_adds_the_frozen_rate(on, spend):
     body = answer.json()
     assert body["usd_per_alpha"] == pytest.approx(4.0) and body["final"] is False
     assert [p["settled"] for p in body["periods"]] == [True, False] and body["latest_checkpoint"] == 3
+    assert body["dead"] == [[10.0, 20.0]] and body["starved"] == []                # passed through unchanged
     spend["order-train-t1"] = {**_summary(True), "task_id": "order-train-other"}
     assert on("GET", "/admin/v1/training/order-train-t1/spend").status_code == 503
     assert on("GET", "/admin/v1/training/order-train-nope/spend").status_code == 404

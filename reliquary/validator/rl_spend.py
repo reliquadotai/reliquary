@@ -59,7 +59,7 @@ def _count(db, sql: str, args=()) -> int:
 
 def spend_summary(rl, *, now: float) -> dict:
     """The task's spend (module docstring). ValueError on a task not priced by auction (no alpha rate)."""
-    from reliquary.validator.rl_buffer import starved_intervals
+    from reliquary.validator.rl_buffer import dead_intervals, starved_intervals
     from reliquary.validator.rl_ledger import FORFEITED
     from reliquary.validator.rl_submit import FIRST_SCAN, TRAINED
 
@@ -81,6 +81,8 @@ def spend_summary(rl, *, now: float) -> dict:
                                             "rl_pay_cursor WHERE id=0) AND kind IN (?, ?)", (TRAINED, FIRST_SCAN))}
         beat = db.execute("SELECT last_at FROM rl_trainer_beat WHERE id=0").fetchone()
     stopped_at = ledger.stopped_at(now)
+    with book.lock:
+        dead = dead_intervals(book.db, now=now if stopped_at is None else min(now, float(stopped_at)))
     config = ledger.config
     silent_since = None if stopped_at is None else (float(stopped_at) if beat is None else float(beat[0]))
     if silent_since is not None and now - silent_since > config.outage_grace_s:
@@ -100,7 +102,8 @@ def spend_summary(rl, *, now: float) -> dict:
         periods.append({"period": period, "settled": doc is not None, "accrued_alpha": accrued * emission,
                         "paid_alpha": paid, "buckets": _buckets(own, emission)})
     return {"schema": SPEND_SCHEMA, "task_id": rl.settings.task_id, "run": rl.settings.run, "periods": periods,
-            "starved": [[start, end] for start, end in starved], "stopped": auctions.stopped(),
+            "starved": [[start, end] for start, end in starved],
+            "dead": [[start, end] for start, end in dead], "stopped": auctions.stopped(),
             "stopped_at": stopped_at, "latest_checkpoint": book.latest_checkpoint, "pending": pending,
             "settled_through": getattr(ledger, "settled_through", None),
             "settle_margin_s": (max(config.slack_s, config.outage_grace_s) if config.outage_fill

@@ -1,7 +1,7 @@
 """The controller records when the trainer waits for rollouts, so a run's bill can leave those hours out."""
 from __future__ import annotations
 
-from reliquary.validator.rl_buffer import SubmittedGroup, TrainingBuffer, starved_intervals
+from reliquary.validator.rl_buffer import SubmittedGroup, TrainingBuffer, dead_intervals, starved_intervals
 from tests.unit.test_rl_leases import Clock, book_at
 
 
@@ -114,3 +114,43 @@ def test_a_controller_restart_starts_a_fresh_wait(tmp_path):
     clock.t = 5400.0
     buffer.take(1)
     assert starved_intervals(book.db) == [(1300.0, 1400.0), (5300.0, 5400.0)]
+
+
+def test_a_600_s_gap_is_a_dead_piece_from_poll_plus_180_to_the_next_poll(tmp_path):
+    clock, book, buffer = _setup(tmp_path)
+    _poll_until(clock, buffer, 1401.0)   # last take at 1400
+    clock.t = 2000.0
+    buffer.take(1)
+    assert dead_intervals(book.db, now=2000.0) == [(1580.0, 2000.0)]
+
+
+def test_a_trainer_silent_since_t_has_an_open_dead_piece_to_now(tmp_path):
+    clock, book, buffer = _setup(tmp_path)
+    _poll_until(clock, buffer, 1401.0)   # last take at 1400
+    assert dead_intervals(book.db, now=1500.0) == []                     # within 180 s: not dead yet
+    assert dead_intervals(book.db, now=1580.0) == []
+    assert dead_intervals(book.db, now=3000.0) == [(1580.0, 3000.0)]
+
+
+def test_a_served_trainer_that_goes_silent_is_dead_too(tmp_path):
+    clock, book, buffer = _setup(tmp_path)
+    buffer.push(_group("a"))
+    buffer.take(1)                       # served at once: no wait is recorded
+    assert dead_intervals(book.db, now=1100.0) == []
+    assert dead_intervals(book.db, now=2000.0) == [(1180.0, 2000.0)]
+
+
+def test_a_trainer_that_never_polled_is_not_dead(tmp_path):
+    _, book, _ = _setup(tmp_path)
+    assert dead_intervals(book.db, now=9000.0) == []
+
+
+def test_starved_and_dead_never_overlap(tmp_path):
+    clock, book, buffer = _setup(tmp_path)
+    _poll_until(clock, buffer, 1401.0)
+    clock.t = 2000.0
+    _poll_until(clock, buffer, 2401.0)   # the second piece is alive again, then the pod dies at 2400
+    for now in (2400.0, 2500.0, 4000.0, 9000.0):
+        starved, dead = starved_intervals(book.db, now=now), dead_intervals(book.db, now=now)
+        assert all(se <= ds or de <= ss for ss, se in starved for ds, de in dead), (now, starved, dead)
+    assert dead_intervals(book.db, now=4000.0) == [(1580.0, 2000.0), (2580.0, 4000.0)]
