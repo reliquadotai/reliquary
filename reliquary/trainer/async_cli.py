@@ -7,7 +7,7 @@ buffer, the submissions, the lease book and the prices are the validator's, reac
 run come from the validator's task (``/rl/trainer/config``).
 
 Start: a fresh lease book (no checkpoint adopted) starts from the base model (``DEFAULT_BASE_MODEL``, or
-``RELIQUARY_RL_BASE_MODEL``), published and adopted as checkpoint 0. Otherwise the trainer resumes from the weights
+``RELIQUARY_RL_BASE_MODEL``, at ``RELIQUARY_RL_BASE_MODEL_REVISION`` when set), published and adopted as checkpoint 0. Otherwise the trainer resumes from the weights
 of the latest published checkpoint, rebuilt from the bucket through the validator's signed index (``GET
 /rl/trainer/checkpoint``, ``CheckpointSync``); a version published but never adopted (a crash between the two) is adopted
 first. The optimizer starts fresh (the bf16 checkpoint is all the bucket holds).
@@ -45,6 +45,21 @@ def _eos_ids(model_path, load_kwargs) -> tuple[int, ...]:
     return tuple(sorted(resolve_eos_token_ids(model, load_tokenizer(model_path, **load_kwargs))))
 
 
+def _download_base_model(settings: Mapping[str, Any]) -> str:
+    """The base model's local path; a pinned ``base_model_revision`` wins over the default model's revision.
+
+    Everything after the download (EOS ids, FSDP2 load, Miles conversion) reads this local snapshot."""
+    from huggingface_hub import snapshot_download
+
+    from reliquary.constants import DEFAULT_BASE_MODEL, DEFAULT_BASE_MODEL_REVISION
+
+    base = settings["base_model"] or DEFAULT_BASE_MODEL
+    revision = settings.get("base_model_revision") or (None if settings["base_model"] else DEFAULT_BASE_MODEL_REVISION)
+    if Path(base).is_dir():
+        return base
+    return snapshot_download(base, **({"revision": revision} if revision else {}))
+
+
 def _heartbeat_s(env: Mapping[str, str]) -> float:
     value = float(env.get("RELIQUARY_RL_TRAINER_HEARTBEAT_S", "60"))
     if not 5 <= value <= 300:                   # well under the validator's outage grace (600 s)
@@ -78,6 +93,7 @@ def async_trainer_settings(env: Mapping[str, str] = os.environ) -> dict[str, Any
         "url": url, "token": token, "validator_hotkey": hotkey, "link_prefix": _link_prefix(env),
         "state_dir": Path(env.get("RELIQUARY_TRAINER_STATE_DIR", "/root/reliquary/trainer")) / "async",
         "base_model": str(env.get("RELIQUARY_RL_BASE_MODEL", "")).strip() or None,
+        "base_model_revision": str(env.get("RELIQUARY_RL_BASE_MODEL_REVISION", "")).strip() or None,
         "batch_groups": _int(env, "RELIQUARY_RL_BATCH_GROUPS", 512),
         "steps_per_checkpoint": _int(env, "RELIQUARY_RL_STEPS_PER_CHECKPOINT", 1),
         "anchor_interval": _int(env, "RELIQUARY_RL_ANCHOR_INTERVAL", 50),
@@ -177,7 +193,7 @@ def run_async_train_worker() -> None:
 
     disable_cudnn_attention(torch)              # every rank, before any model is built
 
-    from reliquary.constants import ATTN_IMPLEMENTATION, DEFAULT_BASE_MODEL, DEFAULT_BASE_MODEL_REVISION
+    from reliquary.constants import ATTN_IMPLEMENTATION, DEFAULT_BASE_MODEL
     from reliquary.miner.rl_async import write_hf_dir
     from reliquary.shared.modeling import load_text_generation_model
     from reliquary.trainer.async_trainer import AsyncTrainer, AsyncTrainerConfig
@@ -217,11 +233,8 @@ def run_async_train_worker() -> None:
         state_dir.mkdir(parents=True, exist_ok=True)
         resumed = resume_weights(link, validator_hotkey=settings["validator_hotkey"], work_dir=state_dir / "resume")
         if resumed is None:
-            from huggingface_hub import snapshot_download
-
             base = settings["base_model"] or DEFAULT_BASE_MODEL
-            load_kwargs = {} if settings["base_model"] else {"revision": DEFAULT_BASE_MODEL_REVISION}
-            model_path = base if Path(base).is_dir() else snapshot_download(base, **load_kwargs)
+            model_path = _download_base_model(settings)
             model_dir, version = Path(model_path), None
             logger.info("fresh lease book: starting from %s", base)
         else:
