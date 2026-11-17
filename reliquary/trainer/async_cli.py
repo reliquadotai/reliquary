@@ -221,9 +221,15 @@ def run_async_train_worker() -> None:
             _run_train_follower(dist_ctx, channel)
             return
 
+    heartbeat = None
     try:
+        from reliquary.trainer.rl_link import TrainerHeartbeat
+
         settings = async_trainer_settings()
         link = trainer_link(settings)
+        # Beat from here on, not once the model is loaded: resuming, downloading and starting the engine can take
+        # longer than the platform's staleness window, and it replaces a pod it sees silent.
+        heartbeat = TrainerHeartbeat(link, settings["heartbeat_s"]).start()
         task = link.config()
         telemetry.init(settings["validator_hotkey"], {
             "task_id": task["task_id"], "run": task["run"], "targets": task["targets"], "backend": backend,
@@ -321,20 +327,18 @@ def run_async_train_worker() -> None:
             train_step_fn=step_fn, audits=audits,
             global_step_hint=None if version is None else version * settings["steps_per_checkpoint"])
         live["trainer"] = trainer
-        from reliquary.trainer.rl_link import TrainerHeartbeat
-
-        heartbeat = TrainerHeartbeat(link, settings["heartbeat_s"]).start()
         logger.info("train-async starting: task %s, run %s, target mix %s (priced, not enforced), checkpoint %d",
                     task["task_id"], task["run"], task["targets"], trainer.version)
         try:
             run_forever(trainer)
         finally:
-            heartbeat.stop()
             trainer.close()
             if backup is not None:
                 backup.close(timeout=60)
             telemetry.finish()
     finally:
+        if heartbeat is not None:
+            heartbeat.stop()
         # Followers block on the next command; release them on any exit.
         if channel is not None:
             channel.send("STOP")

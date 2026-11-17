@@ -575,7 +575,11 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str | None = None, auth: Trai
                                       "targets": dict(rl.settings.targets), "latest": rl.book.latest_checkpoint})
     route("GET", "latest", lambda b: {"latest": rl.book.latest_checkpoint})
     route("POST", "adopt", adopt)
-    route("POST", "take", lambda b: {"groups": [_pack(g) for g in rl.buffer.take(int(b["limit"]))]})
+    def take(b: dict) -> dict:
+        rl.trainer_took_batch = True            # the heartbeat detail's phase: "training" from the first take
+        return {"groups": [_pack(g) for g in rl.buffer.take(int(b["limit"]))]}
+
+    route("POST", "take", take)
     route("POST", "take_older", lambda b: {"groups": [_pack(g) for g in rl.buffer.take_older(int(b["below_k"]),
                                                                                              int(b["limit"]))]})
     route("POST", "take_exhausted", lambda b: {"groups": [_pack(g) for g in rl.buffer.take_exhausted(
@@ -1135,7 +1139,9 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
         # A training order's pods hold per-pod executor tokens only (never the static one); the public front
         # proxies the trainer link to this port.
         server.app.include_router(build_rl_trainer_router(rl, auth=executor_trainer_auth(
-            settings.task_id, detail=lambda: {"latest_checkpoint": rl.book.latest_checkpoint})))
+            settings.task_id, detail=lambda: {
+                "latest_checkpoint": rl.book.latest_checkpoint,
+                "phase": "training" if getattr(rl, "trainer_took_batch", False) else "loading"})))
     from reliquary.validator.miner_setup import DB_NAME as SETUP_DB, MinerSetupStore, build_miner_setup_router
     from reliquary.validator.rl_metrics import CardFeed
 

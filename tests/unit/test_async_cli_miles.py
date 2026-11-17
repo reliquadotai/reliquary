@@ -220,3 +220,21 @@ def test_a_dead_gateway_fails_the_wait_instead_of_hanging():
     assert client.optim_step().result() == "ok" and client.model_id == "m"
     with pytest.raises(RuntimeError, match="gateway exited"):
         client.forward().result()
+
+
+def test_the_heartbeat_runs_during_a_slow_startup_and_stops_with_the_run(monkeypatch):
+    """The platform marks a pod stale after 600 s of silence: the beat starts right after the link, before loading."""
+    from reliquary.trainer import async_cli
+
+    events = []
+    link = SimpleNamespace(config=lambda: events.append("config") or (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr("reliquary.trainer.rl_link.TrainerHeartbeat",
+                        lambda lk, s: SimpleNamespace(start=lambda: events.append("beat") or SimpleNamespace(
+                            stop=lambda: events.append("stop"))))
+    monkeypatch.setattr(async_cli, "trainer_link", lambda settings: link)
+    monkeypatch.setattr(async_cli, "async_trainer_settings", lambda: {"heartbeat_s": 60.0})
+    monkeypatch.setattr("reliquary.trainer.cli._check_trainer_launch", lambda *a: None)
+    monkeypatch.setattr("reliquary.trainer.distributed.trainer_backend", lambda: "hf")
+    with pytest.raises(RuntimeError):
+        async_cli.run_async_train_worker()
+    assert events == ["beat", "config", "stop"]
