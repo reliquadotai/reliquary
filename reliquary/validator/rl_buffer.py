@@ -119,21 +119,24 @@ def mixed_take(rows, caps: dict[str, int], limit: int, urgent_below: int | None 
     return chosen + extra[:max(0, limit - len(chosen))]
 
 STARVATION_GRACE_S = 300.0  # the first minutes of a wait are normal: a run's bill counts a wait only past them
+# A recorded wait counts a gap between two takes up to this long (the trainer's audit rounds run between its takes
+# while it waits, up to 120 s); the rest of a longer gap is the trainer away, not starved.
+STARVATION_DEAD_GAP_S = 180.0
 
 
 def starved_intervals(db, *, min_wait_s: float = STARVATION_GRACE_S,
                       now: float | None = None) -> list[tuple[float, float]]:
     """The spans where the trainer starved for rollouts: each wait's live time after its first ``min_wait_s``.
-    A take counts at most ``MAX_POLL_GAP_S`` after the one before (``rl_trainer_dead`` holds the rest of a longer
-    gap) and an open wait ends at the last take + ``MAX_POLL_GAP_S`` (at most ``now``): a trainer that stopped
-    asking is down, not starved, and a span once reported never grows over that time. ``db``: the lease book's
-    connection."""
+    A take counts at most ``STARVATION_DEAD_GAP_S`` after the one before (``rl_trainer_dead`` holds the rest of a
+    longer gap) and an open wait ends at the last take + ``STARVATION_DEAD_GAP_S`` (at most ``now``): a trainer
+    that stopped asking is down, not starved, and a span once reported never grows over that time. A controller
+    restart ends the wait at its last take (``TrainingBuffer``). ``db``: the lease book's connection."""
     now = time.time() if now is None else now
     dead = [(float(s), float(e)) for s, e in db.execute("SELECT start, end FROM rl_trainer_dead ORDER BY start")]
     out = []
     for start, end, polled in db.execute("SELECT start, end, polled FROM rl_trainer_waits ORDER BY start"):
         if end is None:
-            end = min(now, (start if polled is None else polled) + MAX_POLL_GAP_S)
+            end = min(now, (start if polled is None else polled) + STARVATION_DEAD_GAP_S)
         live = [(start, end)]
         for ds, de in dead:
             live = [p for a, b in live for p in ((a, min(b, ds)), (max(a, de), b)) if p[1] > p[0]]
@@ -163,6 +166,9 @@ class TrainingBuffer:
                 book.db.execute("ALTER TABLE rl_buffer ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")   # an older file
             if "polled" not in {row[1] for row in book.db.execute("PRAGMA table_info(rl_trainer_waits)")}:
                 book.db.execute("ALTER TABLE rl_trainer_waits ADD COLUMN polled REAL")   # an older file
+            # A restart: the wait it left open ends at its last take (our downtime is neither starved nor dead);
+            # the trainer's next short take opens a fresh one.
+            book.db.execute("UPDATE rl_trainer_waits SET end=COALESCE(polled, start) WHERE end IS NULL")
             book.db.commit()
 
     def requeue(self) -> int:
@@ -226,14 +232,14 @@ class TrainingBuffer:
                 self._starved_s += min(now - self._waiting_since, MAX_POLL_GAP_S)
             short = len(rows) < limit
             if short and self._waiting_since is None and not self.book.db.execute(
-                    "SELECT 1 FROM rl_trainer_waits WHERE end IS NULL").fetchone():   # one open wait, restarts included
+                    "SELECT 1 FROM rl_trainer_waits WHERE end IS NULL").fetchone():   # one open wait
                 self.book.db.execute("INSERT INTO rl_trainer_waits(start, end, polled) VALUES(?, NULL, ?)", (now, now))
             else:
                 open_wait = self.book.db.execute("SELECT polled FROM rl_trainer_waits WHERE end IS NULL").fetchone()
                 if open_wait is not None and open_wait[0] is not None \
-                        and now - open_wait[0] > MAX_POLL_GAP_S:      # the trainer was away: not starved
+                        and now - open_wait[0] > STARVATION_DEAD_GAP_S:      # the trainer was away
                     self.book.db.execute("INSERT INTO rl_trainer_dead(start, end) VALUES(?, ?)",
-                                         (open_wait[0] + MAX_POLL_GAP_S, now))
+                                         (open_wait[0] + STARVATION_DEAD_GAP_S, now))
                 self.book.db.execute(f"UPDATE rl_trainer_waits SET {'polled' if short else 'end'}=? "
                                      "WHERE end IS NULL", (now,))
             self._waiting_since = now if short else None

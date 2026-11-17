@@ -117,6 +117,7 @@ MAX_TRAINER_KEYS = 512            # object keys one presigned-upload, read or de
 MAX_TRAINER_KEY_BYTES = 1024
 MAX_TRAINER_AUDITS = 256          # audit jobs one trainer-link take may ask for
 LEDGER_EVERY_S = 30.0
+REGISTRY_EVERY_S = 60.0          # a training order's controller rereads its task's status this often
 PRICE_EVERY_S = 30.0
 CHECKPOINT_FOLLOW_EVERY_S = 10.0
 
@@ -759,18 +760,21 @@ async def _every(step: Callable[[], Any], period: float, name: str) -> None:
 
 def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = None, audit_limit: int = AUDIT_LIMIT,
                    clock: Callable[[], float] = time.time, every: Mapping[str, float] | None = None,
-                   publisher=None, trainer_audits: bool = False, cards=None, spend=None) -> list:
+                   publisher=None, trainer_audits: bool = False, cards=None, spend=None,
+                   registry_status=None) -> list:
     """The background coroutines of the service (run until cancelled). ``publisher``: the scan log's
     ``ObservationPublisher`` (``rl_observations.scan_publisher``). ``trainer_audits``: the trainer judges the audits
     (``RlSubmissions.take_audits``); the loop here only drops the stale ones. ``cards``: the declared hardware
     broken down per card in the metrics row (``rl_metrics.CardFeed``). ``spend``: a training order's
-    ``rl_spend.SpendPublisher``, written after the ledger's settle."""
+    ``rl_spend.SpendPublisher``, written after the ledger's settle. ``registry_status``: async, the task's registry
+    status; once ``retired`` the auction leases nothing (``RlAuctions.retire``)."""
     from reliquary.validator import telemetry
     from reliquary.validator.rl_metrics import METRICS_EVERY_S, controller_metrics
     from reliquary.validator.rl_observations import FLUSH_EVERY_S
 
     periods = {"expire": EXPIRE_EVERY_S, "audit": AUDIT_EVERY_S, "ledger": LEDGER_EVERY_S, "price": PRICE_EVERY_S,
                "checkpoint": CHECKPOINT_FOLLOW_EVERY_S, "observations": FLUSH_EVERY_S, "metrics": METRICS_EVERY_S,
+               "registry": REGISTRY_EVERY_S,
                **dict(every or {})}
 
     async def expire() -> None:
@@ -816,6 +820,11 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
         while not publisher.disabled and await publisher.flush() is not None:
             pass
 
+    async def follow_registry() -> None:
+        auctions = getattr(rl.book, "auctions", None)
+        if auctions is not None and await registry_status() == "retired":
+            auctions.retire()
+
     async def metrics() -> None:
         row = await asyncio.to_thread(controller_metrics, rl, float(clock()), periods["metrics"], cards)
         telemetry.log_training_step(row, step=None)
@@ -828,6 +837,8 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
         loops.append(_every(follow, periods["checkpoint"], "audit checkpoint"))
     if publisher is not None:
         loops.append(_every(publish, periods["observations"], "scan log publication"))
+    if registry_status is not None:
+        loops.append(_every(follow_registry, periods["registry"], "registry status"))
     return loops
 
 
@@ -1085,14 +1096,24 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
         setups, validator_hotkey=validator_hotkey,
         registration=None if registered is None else registered.reason))
     archives = R2PeriodArchives(guard=R2Archives(served=lambda: (settings.task_id,), served_only=True))
-    spend = None
+    spend = registry_status = None
     if "training_order" in entry.params:
         from reliquary.validator.rl_spend import SpendPublisher
 
         spend = SpendPublisher(rl, rl.public_put)         # what the platform bills the order on
+        if entry.status == "retired" and rl.book.auctions is not None:
+            rl.book.auctions.retire()
+
+        async def registry_status() -> str | None:
+            from reliquary.infrastructure import task_registry_store
+
+            entries, _ = await task_registry_store.read_registry(strict=False)
+            found = entries.get(settings.task_id)
+            return None if found is None else found.status
     background = rl_async_loops(rl, archives=archives, audit_model=audit_model, publisher=publisher,
                                 trainer_audits=source == "trainer",
-                                cards=CardFeed(setups, state_dir / "rl-card-models.json"), spend=spend)
+                                cards=CardFeed(setups, state_dir / "rl-card-models.json"), spend=spend,
+                                registry_status=registry_status)
     if rl.sandbox is not None:
         background.extend(rl.sandbox.background())
     if registered is not None:

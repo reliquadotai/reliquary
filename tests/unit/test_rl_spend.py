@@ -215,3 +215,43 @@ def test_outage_fill_stops_at_the_orders_stop(tmp_path):
     later = cp.period_end(PERIOD + 3) + 3600.0                                    # the trainer never came back
     clock.t = later
     assert ledger.settle(now=later) == []                                         # no fill after the stop
+
+
+def test_a_retired_order_stops_leasing(tmp_path):
+    rl, clock = _rl(tmp_path, deadline_at=NOW + 86_400)
+    auctions = rl.book.auctions
+    auctions.post_ask(ENV, "A", 0.5, 8)
+    assert auctions.stopped() is None and auctions.budget(ENV) > 0
+    auctions.retire()                                                            # e.g. the customer cancelled
+    assert auctions.stopped() == "retired" and auctions.budget(ENV) == 0
+    assert not rl.book.grant([LeaseRequest("A", ENV, (1,), 0)])[0].leases
+    assert spend_summary(rl, now=NOW + 5)["stopped_at"] == NOW + 5
+
+
+def test_the_controller_follows_its_tasks_retire():
+    from reliquary.validator.rl_async_service import rl_async_loops
+
+    retired = []
+    statuses = iter(["active", "retired"])
+
+    async def status():
+        return next(statuses, "retired")
+
+    rl = SimpleNamespace(book=SimpleNamespace(auctions=SimpleNamespace(retire=lambda: retired.append(True))))
+
+    async def run():
+        loops = rl_async_loops(rl, archives=None, registry_status=status, every={"registry": 0.01, "expire": 60,
+                                                                                  "audit": 60, "ledger": 60,
+                                                                                  "price": 60})
+        task = asyncio.ensure_future(loops[-1])                                    # the registry follow
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if retired:
+                break
+        task.cancel()
+        for other in loops[:-1]:
+            other.close()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+    assert retired

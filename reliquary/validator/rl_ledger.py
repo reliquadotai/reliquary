@@ -300,9 +300,10 @@ class RlPayLedger:
         self._beat_at = now
 
     def stopped_at(self, now: float | None = None) -> float | None:
-        """When the training order first reached a limit (``RlAuctions.stopped``; a deadline at the deadline,
-        another limit when first seen), kept once seen; None: not stopped, or no order."""
-        if self.auctions is None or not getattr(self.auctions, "limits", None):
+        """When the training order first reached a limit or was retired (``RlAuctions.stopped``; a deadline at the
+        deadline, the rest when first seen), kept once seen; None: not stopped, or no order."""
+        if self.auctions is None or not (getattr(self.auctions, "limits", None) or getattr(self.auctions, "retired",
+                                                                                                False)):
             return None
         with self.book.lock:
             row = self.book.db.execute("SELECT at FROM rl_order_stop WHERE id=0").fetchone()
