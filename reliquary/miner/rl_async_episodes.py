@@ -635,7 +635,7 @@ def build_episode_generator(blocks: Mapping[str, Mapping[str, Any]], *, validato
         policies=policies, runner_factory=runner_factory, engine=host, draws=draws, renderer_for=renderer_for,
         task_prompt=lambda env, idx: sources[env].prompt(int(idx)),
         load_weights=EpisodeWeights(host, base_model_dir=base_model_dir, work_dir=work_dir), suites=players)
-    generator.host, generator.sources, generator.blocks = host, sources, blocks
+    generator.host, generator.sources, generator.blocks, generator.sessions = host, sources, blocks, sessions
     return generator
 
 

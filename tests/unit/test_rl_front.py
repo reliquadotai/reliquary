@@ -222,7 +222,7 @@ async def test_a_live_task_without_an_auction_is_listed_with_null(tmp_path):
     s.front = build_front_app(s.map, client_factory=lambda port: httpx.AsyncClient(transport=Plain()))
     async with s.client() as c:
         listed = (await c.get("/rl/tasks")).json()
-    assert listed == [{"task_id": "a", "environments": {}, "auction": None, "draw_floor": 0.9}]
+    assert listed == [{"task_id": "a", "environments": {}, "auction": None, "draw_floor": 0.9, "model": None}]
 
 
 async def test_empty_segments_under_rl_are_refused(stack):
@@ -230,3 +230,13 @@ async def test_empty_segments_under_rl_are_refused(stack):
         for path in ("/rl//trainer/x", "/rl/a//trainer/x", "/rl/a//state"):
             r = await c.get(path, headers={"X-Forwarded-Proto": "https"})
             assert r.status_code == 404, path
+
+
+async def test_tasks_name_each_tasks_model_from_the_map(tmp_path):
+    s = Stack(tmp_path, {"a": 8001, "b": 8002})
+    spec = json.loads(s.map.read_text())
+    spec["tasks"]["a"]["model"] = {"id": "Qwen/Qwen3.5-4B", "revision": "r1"}
+    s.map.write_text(json.dumps(spec))
+    async with s.client() as c:
+        listed = {t["task_id"]: t for t in (await c.get("/rl/tasks")).json()}
+    assert listed["a"]["model"] == {"id": "Qwen/Qwen3.5-4B", "revision": "r1"} and listed["b"]["model"] is None

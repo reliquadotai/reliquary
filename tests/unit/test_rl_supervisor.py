@@ -200,3 +200,17 @@ def test_a_second_supervisor_on_the_same_state_dir_is_refused(tmp_path):
         lock_state_dir(tmp_path)
     first.close()
     lock_state_dir(tmp_path).close()
+
+
+def test_the_map_names_each_tasks_model(tmp_path):
+    from reliquary.protocol.profiles import PROFILES
+
+    rig = Rig(tmp_path)
+    rig.add("t-a")
+    rig.entries["t-a"].profile_id, rig.entries["t-a"].contract = "qwen35-4b-auction-v3", None
+    rig.add("t-b")                                   # no profile it can resolve: no model named
+    rig.sup.tick()
+    profile = PROFILES["qwen35-4b-auction-v3"]
+    tasks = rig.map()["tasks"]
+    assert tasks["t-a"]["model"] == {"id": profile.model_id, "revision": profile.model_revision}
+    assert "model" not in tasks["t-b"]

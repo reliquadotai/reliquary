@@ -604,6 +604,10 @@ class AsyncMiner:
         self._env_turn = 0
         self.leasing = True                             # False once winding down (a move to another RL task)
         self.task_signal = asyncio.Event()              # ``full`` or 404 from the task: time to choose again
+        # ``model_check(index)``: whether a checkpoint index is the engine's model (``rl_task_choice.ModelFingerprint``);
+        # one that is not leaves the task's weights unsynced, nothing leased, and the task to be denied.
+        self.model_check: Callable[[Mapping[str, Any]], bool] | None = None
+        self.model_mismatch = False
         self._load_journal()
 
     # --- prompt state and quota ------------------------------------------------------------------------
@@ -679,7 +683,8 @@ class AsyncMiner:
     def lease_room(self) -> int:
         """How many leases to ask for now: within ``min(quota, max_open)`` open, and no more waiting for generation
         than ``queue_groups`` (a lease waiting long risks its expiry), at most ``lease_batch`` per request."""
-        if self.loaded_version is None or self._stale or self.quota is None or not self.leasing:
+        if (self.loaded_version is None or self._stale or self.quota is None or not self.leasing
+                or self.model_mismatch):
             return 0
         cap = min(self.quota, self.config.max_open) - len(self.open)
         return max(0, min(cap, self.config.queue_groups - len(self.queue), self.config.lease_batch))
@@ -988,6 +993,12 @@ class AsyncMiner:
             return None
         response = await self.transport.checkpoint()
         if not response:
+            return None
+        if self.model_check is not None and not self.model_check(response["index"]):
+            if not self.model_mismatch:
+                logger.error("the task's checkpoint is not the engine's model (config or tokenizer): not synced")
+            self.model_mismatch = True
+            self.task_signal.set()
             return None
         latest = int(response["index"]["latest"]["version"])
         if self._state_version is not None and latest <= self._state_version:
@@ -1431,14 +1442,15 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
     ``share_setup`` (the miner's note, may be empty) opts in to declaring the hardware (``miner_setup``).
 
     Behind an RL front (``GET /rl/tasks``) the miner works for the task that pays best for its envs
-    (``rl_task_choice``), or ``rl_task`` when pinned, on ``/rl/<task>``; it moves when another task pays more (the
-    generator is kept, the new task's weights synced from its anchor). A miner of signed-episode envs stays on its
-    first task: its session client is bound to it. An old validator keeps the bare ``/rl`` routes."""
+    (``rl_task_choice``), or ``rl_task`` when pinned, on ``/rl/<task>``. It moves only to a task the engine can play:
+    the generator is kept (episode sessions repointed), so the task must name the engine's model, its anchor's config
+    and tokenizer must be the engine's, and its signed-episode envs must be the engine's (same blocks). An old
+    validator keeps the bare ``/rl`` routes."""
     import httpx
 
     from reliquary.miner.ckpt_sync import CheckpointSync
     from reliquary.miner.rl_pay_client import PayWeights
-    from reliquary.miner.rl_task_choice import TaskChooser, fetch_tasks, mine_until_moved, task_prefix
+    from reliquary.miner.rl_task_choice import ModelFingerprint, TaskChooser, fetch_tasks, mine_until_moved, task_prefix
     from reliquary.shared.ckpt_delta import load_anchor_shards
 
     model_files = Path(work_dir) / "model-files"     # the anchors' HF config and tokenizer (CheckpointSync)
@@ -1468,7 +1480,27 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
                                   asks={env: price / 1e6 for env, (price, _) in config.asks.items()}, pinned=rl_task)
             task = await chooser.choose()
             logger.info("rl task: mining %s%s", task_prefix(task), " (pinned)" if rl_task else "")
-        generator, first = None, True
+        generator, first, engine_blocks, engine_model = None, True, None, ModelFingerprint()
+
+        async def episode_blocks(transport) -> dict:
+            # The validator's signed-episode envs (their blocks: policy, catalogue); played by the episode stack. The
+            # answer adds each env's lease lifetime, which is no part of the block.
+            return {name: {k: v for k, v in block.items() if k != "lease_expiry_s"}
+                    for name, block in (await transport.episodes()).items() if name in config.environments}
+
+        def transport_for(prefix: str) -> HttpRlTransport:
+            return HttpRlTransport(client, base_url=validator_url, hotkey=wallet.hotkey.ss58_address,
+                                   validator_hotkey=validator_hotkey, prefix=prefix,
+                                   sign_binding=lambda binding: wallet.hotkey.sign(binding).hex())
+
+        async def vet(candidate: str | None) -> bool | None:
+            """Whether the engine plays the candidate's episode envs (None: not known now)."""
+            try:
+                return await episode_blocks(transport_for(task_prefix(candidate))) == engine_blocks
+            except Exception as exc:
+                logger.warning("rl task %s: episode envs not read (%s)", task_prefix(candidate), type(exc).__name__)
+                return None
+
         while True:
             prefix = task_prefix(task)
             task_dir = None if task is None else Path(work_dir) / "tasks" / task
@@ -1476,17 +1508,19 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
                 transport: RlTransport = DryRunTransport()
                 sync, weights, blocks = None, None, {}
             else:
-                transport = HttpRlTransport(client, base_url=validator_url, hotkey=wallet.hotkey.ss58_address,
-                                            validator_hotkey=validator_hotkey, prefix=prefix,
-                                            sign_binding=lambda binding: wallet.hotkey.sign(binding).hex())
+                transport = transport_for(prefix)
                 transport.instance_id = instance_id
                 sync = CheckpointSync(validator_hotkey=validator_hotkey,
                                       work_dir=(task_dir or Path(work_dir)) / "ckpt-download", model_dir=model_files)
                 weights = PayWeights(validator_url, prefix=prefix).weights
-                # The validator's signed-episode envs (their blocks: policy, catalogue); played by the episode stack.
-                # The answer adds each env's lease lifetime, which is no part of the block.
-                blocks = {name: {k: v for k, v in block.items() if k != "lease_expiry_s"}
-                          for name, block in (await transport.episodes()).items() if name in config.environments}
+                blocks = await episode_blocks(transport)
+            if generator is not None and blocks != engine_blocks:
+                # vetted before the move, changed since: not this engine's envs
+                chooser.deny(task)
+                task = await chooser.choose(None)
+                continue
+            if generator is not None:
+                repoint_episode_sessions(generator, prefix)
             if generator is None:
                 options = dict(episode_options or {})
                 if blocks:
@@ -1499,7 +1533,9 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
                 closer = getattr(getattr(getattr(generator, "episodes", None), "host", None), "close", None)
                 if closer is not None:
                     stack.push_async_callback(closer)
-                stays = bool(blocks)
+                engine_blocks = blocks
+                if chooser is not None:
+                    chooser.adopt_model(task)
             sources = getattr(getattr(generator, "episodes", None), "sources", None) or {}
             ranges = planner_ranges(config.environments, sources=sources, blocks=blocks, prompt_ranges=prompt_ranges)
             planners = {name: PromptPlanner(name, ranges[name]) for name in config.environments}
@@ -1516,13 +1552,21 @@ async def run_async_miner(config: AsyncMinerConfig, *, validator_url: str, valid
                 task_config = dataclasses.replace(config, state_dir=str(Path(config.state_dir) / "tasks" / task))
             miner = AsyncMiner(task_config, transport=transport, generator=generator, planners=planners,
                                checkpoint_sync=sync, loaded_version=loaded, state=state, env_weights=weights)
-            if chooser is None or chooser.pinned is not None or stays:
+            miner.model_check = engine_model.matches
+            if chooser is None or chooser.pinned is not None:
                 await miner.run()
                 return
-            moved, task = await mine_until_moved(miner, chooser, task)
+            moved, task = await mine_until_moved(miner, chooser, task, vet=vet)
             if not moved:
                 return
             first = False
+
+
+def repoint_episode_sessions(generator, prefix: str) -> None:
+    """A move to another task: the episode stack's session client signs and calls that task's routes."""
+    sessions = getattr(getattr(generator, "episodes", None), "sessions", None)
+    if sessions is not None:
+        sessions.prefix = prefix
 
 
 def planner_ranges(environments, *, sources: Mapping[str, Any], blocks: Mapping[str, Any],
@@ -1589,5 +1633,5 @@ __all__ = [
     "AsyncMiner", "AsyncMinerConfig", "DryRunTransport", "FakeGroupGenerator", "FakeStreamGenerator", "GroupGenerator",
     "HeldLease", "HttpRlTransport", "PromptPlanner", "PromptRecord", "RequestRefused", "RlTransport",
     "VllmGroupGenerator", "default_priority", "draw_context", "encode_submission", "miner_generator", "planner_ranges",
-    "run_async_miner", "submission_digest", "submission_rollouts", "write_hf_dir",
+    "repoint_episode_sessions", "run_async_miner", "submission_digest", "submission_rollouts", "write_hf_dir",
 ]

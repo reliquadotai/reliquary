@@ -1,5 +1,6 @@
 """The controller supervisor: one async RL controller process per training task, and the map file the RL front
-reads (``{"default": task | null, "tasks": {task: {"port", "run"}}}``).
+reads (``{"default": task | null, "tasks": {task: {"port", "run", "model"?}}}``). ``model`` (``{"id", "revision"}``,
+from the task's generation contract) lets miners keep to tasks their engine can play.
 
 A retired task keeps its controller until its bill is final (its last period settled); then it is stopped
 (SIGTERM, SIGKILL after ``KILL_AFTER_S``). A controller that dies is restarted with a doubling delay."""
@@ -49,6 +50,7 @@ class Supervisor:
         self._backoff: dict[str, float] = {}
         self._restart_at: dict[str, float] = {}
         self._written: str | None = None
+        self._models: dict[str, dict] = {}
 
     def backoff_of(self, task_id: str) -> float:
         return self._backoff.get(task_id, BACKOFF_START_S)
@@ -67,7 +69,7 @@ class Supervisor:
         steps = [lambda: self._reap_stopping(now), lambda: self._revive_dead(now)]
         if entries is not None:
             steps = [steps[0], lambda: self._stop_finished(entries, now), steps[1],
-                     lambda: self._start_missing(entries, now)]
+                     lambda: self._start_missing(entries, now), lambda: self._read_models(entries)]
         for step in [*steps, self._write_map]:
             try:
                 step()
@@ -133,6 +135,9 @@ class Supervisor:
             self._restart_at.pop(task_id, None)
             self._running[task_id] = _Running(proc, port, now)
 
+    def _read_models(self, entries: Mapping[str, Any]) -> None:
+        self._models = {t: m for t in self._running if (m := task_model(entries.get(t))) is not None}
+
     def _default(self) -> str | None:
         if self._default_task in self._running:
             return self._default_task
@@ -140,7 +145,9 @@ class Supervisor:
 
     def _write_map(self) -> None:
         body = json.dumps({"default": self._default(),
-                           "tasks": {t: {"port": r.port, "run": t} for t, r in sorted(self._running.items())}},
+                           "tasks": {t: {"port": r.port, "run": t,
+                                         **({"model": self._models[t]} if t in self._models else {})}
+                                     for t, r in sorted(self._running.items())}},
                           sort_keys=True)
         if body == self._written:
             return
@@ -154,6 +161,25 @@ class Supervisor:
             Path(tmp).unlink(missing_ok=True)
             raise
         self._written = body
+
+
+def task_model(entry: Any) -> dict | None:
+    """The model a task trains (its carried contract's, else its profile's): ``{"id", "revision"}``, or None."""
+    from reliquary.protocol.profiles import profile_from_contract, resolve_protocol_profile
+
+    if entry is None:
+        return None
+    try:
+        contract = getattr(entry, "contract", None)
+        if contract:
+            profile = profile_from_contract(contract)
+        elif getattr(entry, "profile_id", None):
+            profile = resolve_protocol_profile(entry.profile_id)
+        else:
+            return None
+    except (ValueError, KeyError, TypeError):
+        return None
+    return {"id": str(profile.model_id), "revision": str(profile.model_revision)}
 
 
 def subprocess_spawn(command: list[str], state_dir: Path, env: Mapping[str, str]) -> Callable[[str, int], Any]:

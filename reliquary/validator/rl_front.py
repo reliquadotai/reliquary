@@ -3,7 +3,7 @@ controller of each task, which listens on a local port (the supervisor's map fil
 
 * ``/rl/<task>/<rest>``  ->  ``http://127.0.0.1:<port>/rl/<rest>`` of that task's controller;
 * ``/rl/<rest>`` and every non-``/rl`` path  ->  the default task's controller;
-* ``GET /rl/tasks``  ->  the live tasks with their auction views (miners pick a task from it).
+* ``GET /rl/tasks``  ->  the live tasks with their auction views and models (miners pick a task from it).
 
 Trainer paths (``/rl/<task>/trainer/*``) cross the front only behind the host's TLS terminator
 (``X-Forwarded-Proto: https``) unless ``allow_plain_trainer``. The bare ``/rl/trainer/*`` is never proxied. The front
@@ -136,7 +136,13 @@ def build_front_app(map_path: Path, *, client_factory: Callable[[int], httpx.Asy
         response.raw_headers = [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in out]
         return response
 
-    async def task_view(task_id: str, port: int) -> dict | None:
+    async def task_view(task_id: str, port: int, model: Any = None) -> dict | None:
+        view = await auction_view(task_id, port)
+        if view is not None:
+            view["model"] = model if isinstance(model, dict) else None
+        return view
+
+    async def auction_view(task_id: str, port: int) -> dict | None:
         try:
             r = await asyncio.wait_for(client_for(port).get(upstream_url(port, "/rl/auction", ""),
                                                             timeout=AUCTION_TIMEOUT_S), AUCTION_TIMEOUT_S)
@@ -150,7 +156,7 @@ def build_front_app(map_path: Path, *, client_factory: Callable[[int], httpx.Asy
 
     async def tasks(request: Request) -> Response:
         listed = tasks_map.get()["tasks"]
-        views = await asyncio.gather(*(task_view(t, int(v["port"])) for t, v in listed.items()))
+        views = await asyncio.gather(*(task_view(t, int(v["port"]), v.get("model")) for t, v in listed.items()))
         return JSONResponse([v for v in views if v is not None], headers={"Cache-Control": "no-store"})
 
     async def route(request: Request) -> Response:
