@@ -125,8 +125,14 @@ def test_the_order_freezes_its_alpha_rate(on):
     assert order["usd_per_alpha"] == pytest.approx(4.0)                    # the rate the ceiling was converted at
 
 
-def _summary(*settled, leases_out=0):
-    return {"task_id": "order-train-t1", "run": "order-train-t1", "leases_out": leases_out, "starved": [],
+RETIRED_AT = cp.period_end(cp.period_of(1_800_000_000.0)) - 600.0        # the retire's time (round 1)
+SETTLED_AFTER = RETIRED_AT + 600.0 + 120.0                                # its period's end + the settle margin
+
+
+def _summary(*settled, open_leases=0, stopped_at=None, written_at=SETTLED_AFTER + 1):
+    return {"task_id": "order-train-t1", "run": "order-train-t1", "starved": [], "stopped_at": stopped_at,
+            "pending": {"open_leases": open_leases, "buffered": 0, "audits": 0, "unledgered": 0},
+            "settle_margin_s": 120.0, "written_at": written_at,
             "periods": [{"period": i, "settled": s, "accrued_alpha": 1.0, "paid_alpha": 1.0 if s else None,
                          "buckets": {}} for i, s in enumerate(settled)], "stopped": None, "latest_checkpoint": 3}
 
@@ -135,8 +141,11 @@ def _summary(*settled, leases_out=0):
 def spend(monkeypatch):
     from reliquary.validator import rl_spend
 
+    from reliquary.admin import service
+
     held = {}
     monkeypatch.setattr(rl_spend, "read_spend", lambda run: held.get(run))
+    monkeypatch.setattr(service, "_round_time", lambda r: {1: RETIRED_AT}[r])
     return held
 
 
@@ -164,6 +173,36 @@ def test_spend_is_final_only_when_retired_and_settled(on, spend):
     assert final(_summary(True, True)) is False                                     # still active
     assert on("POST", "/admin/v1/training/order-train-t1/retire", {}).status_code == 200
     assert final(_summary(True, False)) is False                                    # a period still open
-    assert final(_summary(True, True, leases_out=2)) is False                       # leases may still deliver
+    assert final(_summary(True, True, open_leases=2)) is False                      # leases may still deliver
+    assert final(_summary(True, True, written_at=SETTLED_AFTER - 1)) is False       # before its period settled
+    assert final(_summary(True, True, stopped_at=RETIRED_AT + 3600)) is False       # stopped in a later period
     assert final(_summary(True, True)) is True
     assert final(_summary()) is True                                                # nothing was ever paid
+
+
+def _order_entry(on, **params):
+    from dataclasses import replace
+
+    assert on("POST", "/admin/v1/training", _order()).status_code == 201
+    entry = on.registry["entries"]["order-train-t1"]
+    return replace(entry, params={**entry.params, **params})
+
+
+def test_a_training_order_never_carries_the_per_env_pay_guard(on):
+    from reliquary.validator.rl_async_service import ENV_PAY_K_PARAM, rl_async_settings
+
+    entry = _order_entry(on, **{ENV_PAY_K_PARAM: 2.0})
+    with pytest.raises(ValueError, match="auction"):
+        rl_async_settings(entry, entry.params["cap"], environ={})
+
+
+@pytest.mark.parametrize("where", ["param", "env"])
+def test_a_training_order_refuses_a_pay_carry(on, where):
+    from reliquary.validator.rl_async_service import CARRY_ENV, CARRY_PARAM, rl_async_settings
+
+    entry = _order_entry(on, **({CARRY_PARAM: 2} if where == "param" else {}))
+    environ = {CARRY_ENV: "2"} if where == "env" else {}
+    with pytest.raises(ValueError, match="carry"):
+        rl_async_settings(entry, entry.params["cap"], environ=environ)
+    plain = on.registry["entries"]["order-train-t1"]
+    assert rl_async_settings(plain, plain.params["cap"], environ={}).pay_carry_periods == 0

@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS rl_buffer(lease_id TEXT PRIMARY KEY, environment TEXT
     arrived_at REAL NOT NULL, hotkey TEXT NOT NULL, state TEXT NOT NULL, body BLOB NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS rl_trainer_waits(start REAL NOT NULL, end REAL, polled REAL);   -- end NULL: still waiting
+CREATE TABLE IF NOT EXISTS rl_trainer_dead(start REAL NOT NULL, end REAL NOT NULL);   -- no take inside a wait
 CREATE INDEX IF NOT EXISTS rl_buffer_fresh ON rl_buffer(state, environment, k, arrived_at);
 """
 
@@ -122,16 +123,27 @@ STARVATION_GRACE_S = 300.0  # the first minutes of a wait are normal: a run's bi
 
 def starved_intervals(db, *, min_wait_s: float = STARVATION_GRACE_S,
                       now: float | None = None) -> list[tuple[float, float]]:
-    """The spans where the trainer starved for rollouts: each wait of at least ``min_wait_s`` from ``start +
-    min_wait_s`` to its end. An open wait ends at the trainer's last take + ``MAX_POLL_GAP_S`` (at most ``now``):
-    a trainer that stopped asking is down, not starved. ``db``: the lease book's connection."""
+    """The spans where the trainer starved for rollouts: each wait's live time after its first ``min_wait_s``.
+    A take counts at most ``MAX_POLL_GAP_S`` after the one before (``rl_trainer_dead`` holds the rest of a longer
+    gap) and an open wait ends at the last take + ``MAX_POLL_GAP_S`` (at most ``now``): a trainer that stopped
+    asking is down, not starved, and a span once reported never grows over that time. ``db``: the lease book's
+    connection."""
     now = time.time() if now is None else now
+    dead = [(float(s), float(e)) for s, e in db.execute("SELECT start, end FROM rl_trainer_dead ORDER BY start")]
     out = []
     for start, end, polled in db.execute("SELECT start, end, polled FROM rl_trainer_waits ORDER BY start"):
         if end is None:
             end = min(now, (start if polled is None else polled) + MAX_POLL_GAP_S)
-        if end - start >= min_wait_s:
-            out.append((start + min_wait_s, end))
+        live = [(start, end)]
+        for ds, de in dead:
+            live = [p for a, b in live for p in ((a, min(b, ds)), (max(a, de), b)) if p[1] > p[0]]
+        grace = min_wait_s
+        for a, b in live:
+            if b - a <= grace:
+                grace -= b - a
+                continue
+            out.append((a + grace, b))
+            grace = 0.0
     return out
 
 
@@ -216,10 +228,14 @@ class TrainingBuffer:
             if short and self._waiting_since is None and not self.book.db.execute(
                     "SELECT 1 FROM rl_trainer_waits WHERE end IS NULL").fetchone():   # one open wait, restarts included
                 self.book.db.execute("INSERT INTO rl_trainer_waits(start, end, polled) VALUES(?, NULL, ?)", (now, now))
-            elif short:
-                self.book.db.execute("UPDATE rl_trainer_waits SET polled=? WHERE end IS NULL", (now,))
             else:
-                self.book.db.execute("UPDATE rl_trainer_waits SET end=? WHERE end IS NULL", (now,))
+                open_wait = self.book.db.execute("SELECT polled FROM rl_trainer_waits WHERE end IS NULL").fetchone()
+                if open_wait is not None and open_wait[0] is not None \
+                        and now - open_wait[0] > MAX_POLL_GAP_S:      # the trainer was away: not starved
+                    self.book.db.execute("INSERT INTO rl_trainer_dead(start, end) VALUES(?, ?)",
+                                         (open_wait[0] + MAX_POLL_GAP_S, now))
+                self.book.db.execute(f"UPDATE rl_trainer_waits SET {'polled' if short else 'end'}=? "
+                                     "WHERE end IS NULL", (now,))
             self._waiting_since = now if short else None
         groups = [SubmittedGroup.unpack(body) for _, body in rows]
         with self.book.lock:

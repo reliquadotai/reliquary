@@ -314,6 +314,8 @@ def rl_async_settings(entry, cap: float, *, run: str | None = None,
     from reliquary.validator.rl_auction import auction_settings
 
     auction = auction_settings(params, targets, batch_groups=switches["batch_groups"])
+    if "training_order" in params and switches["pay_carry_periods"] > 0:
+        raise ValueError("a training order pays each period's own work: no pay carry (its bill reads the periods)")
     if auction is not None and params.get(ENV_PAY_K_PARAM) is not None:
         raise ValueError(f"{ENV_PAY_K_PARAM} has no use on a task priced by auction: each env's offers are capped "
                          "by the ceiling")
@@ -795,10 +797,10 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
         for doc in settled:
             logger.info("rl period %d settled: %d hotkeys, scale %.3f", doc["work_period"],
                         len(doc["rewards_by_hotkey"]), doc["scale"])
+        if spend is not None:              # first: a failing archive publish does not hold the bill back
+            await spend.write(settled=bool(settled))
         if archives is not None:
             await rl.ledger.publish(archives)
-        if spend is not None:
-            await spend.write(settled=bool(settled))
 
     async def price() -> None:
         now = float(clock())

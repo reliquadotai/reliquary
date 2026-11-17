@@ -453,6 +453,16 @@ def _current_round() -> int:
     return make_round_at(chain["genesis_time"], chain["period"])(time.time()) - 1
 
 
+def _round_time(round_number: int) -> float:
+    """When drand round ``round_number`` was published (``_current_round``'s inverse)."""
+    from reliquary.infrastructure import drand
+
+    chain = drand.get_current_chain()
+    if chain.get("genesis_time") is None or chain.get("period") is None:
+        raise RuntimeError("drand chain parameters unknown")
+    return float(chain["genesis_time"]) + (int(round_number) - 1) * float(chain["period"])
+
+
 def create_admin_app(*, secret: bytes, pool_max: float,
                      models: Mapping[str, QualifiedModel | Mapping], deliveries=None,
                      records=None, clock: Callable[[], float] = time.time,
@@ -1550,7 +1560,13 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 raise HTTPException(status_code=404, detail="spend_not_published")
             if summary.get("task_id") != task_id:
                 raise HTTPException(status_code=503, detail="spend_of_another_task")
-            return training_spend(entry, summary)
+            retired_time = None
+            if entry.retired_at is not None:
+                try:
+                    retired_time = await asyncio.to_thread(_round_time, int(entry.retired_at))
+                except Exception as exc:
+                    raise HTTPException(status_code=503, detail="drand_unavailable") from exc
+            return training_spend(entry, summary, retired_time=retired_time)
 
         @router.post("/training/{task_id}/retire")
         async def retire_training(task_id: str, body: Retire) -> dict:

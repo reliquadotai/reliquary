@@ -5,7 +5,12 @@ cap (``accrued_alpha``: the archive's ``accrued_total`` once settled, the sum of
 it (``paid_alpha``, None until settled), and its accruals grouped by lease price per env (``buckets``: price in alpha
 per token, token equivalent = amount / price, so a first scan counts at its share and a debit is subtracted at the
 accrual's price). Forfeited accruals are left out. Then the trainer's starved spans (``rl_buffer.starved_intervals``),
-the order's stop (``RlAuctions.stopped``), the latest checkpoint and the leases still out. No hotkey is written.
+the order's stop (``RlAuctions.stopped``, and when: ``RlPayLedger.stopped_at``), the latest checkpoint, and what
+could still change the pay (``pending``): leases still open, groups buffered for the trainer and audits queued
+(both left out once the order stopped and the trainer is silent past the ledger's outage grace: nothing will
+take them), payable events the ledger has not ingested. ``settle_margin_s``: how long after a period's end it
+settles. Accruals are never negative (a debit takes at most the accrual), so the archive's ``scale`` is exactly
+``paid_alpha / accrued_alpha``, both summed over the same hotkeys. No hotkey is written.
 
 Amounts convert from pool share to alpha at the miner emission per period the task's ceiling was declared with
 (``max_price_miner_alpha_per_period``, frozen at creation). The controller writes it to ``rl/<run>/spend.json``
@@ -42,12 +47,22 @@ def _buckets(rows, emission: float) -> dict[str, list[list[float]]]:
             for env, by_price in sorted(grouped.items())}
 
 
+def _count(db, sql: str, args=()) -> int:
+    import sqlite3
+
+    try:
+        return int(db.execute(sql, args).fetchone()[0])
+    except sqlite3.OperationalError:              # a table its component never created
+        return 0
+
+
 def spend_summary(rl, *, now: float) -> dict:
     """The task's spend (module docstring). ValueError on a task not priced by auction (no alpha rate)."""
     from reliquary.validator.rl_buffer import starved_intervals
     from reliquary.validator.rl_ledger import FORFEITED
+    from reliquary.validator.rl_submit import FIRST_SCAN, TRAINED
 
-    book = rl.book
+    book, ledger = rl.book, rl.ledger
     auctions = getattr(book, "auctions", None)
     if auctions is None:
         raise ValueError("a spend summary needs a task priced by auction")
@@ -58,7 +73,16 @@ def spend_summary(rl, *, now: float) -> dict:
                           "WHERE status<>? ORDER BY seq", (FORFEITED,)).fetchall()
         archives = {int(p): json.loads(d) for p, d in db.execute("SELECT work_period, doc FROM rl_pay_periods")}
         starved = starved_intervals(db, now=now)
-        leases_out = db.execute("SELECT COUNT(*) FROM rl_leases WHERE state IN ('open', 'submitted')").fetchone()[0]
+        pending = {"open_leases": _count(db, "SELECT COUNT(*) FROM rl_leases WHERE state='open'"),
+                   "buffered": _count(db, "SELECT COUNT(*) FROM rl_buffer"),
+                   "audits": _count(db, "SELECT COUNT(*) FROM rl_audits WHERE body IS NOT NULL"),
+                   "unledgered": _count(db, "SELECT COUNT(*) FROM rl_events WHERE seq > (SELECT seq FROM "
+                                            "rl_pay_cursor WHERE id=0) AND kind IN (?, ?)", (TRAINED, FIRST_SCAN))}
+        beat = db.execute("SELECT last_at FROM rl_trainer_beat WHERE id=0").fetchone()
+    stopped_at = ledger.stopped_at(now)
+    config = ledger.config
+    if stopped_at is not None and beat is not None and now - float(beat[0]) > config.outage_grace_s:
+        pending["buffered"] = pending["audits"] = 0     # the order stopped and its trainer is gone
     by_period: dict[int, list] = {}
     for period, environment, price, tokens, amount in rows:
         by_period.setdefault(int(period), []).append((environment, price, tokens, amount))
@@ -69,13 +93,15 @@ def spend_summary(rl, *, now: float) -> dict:
         if doc is None:
             accrued, paid = math.fsum(float(r[3]) for r in own), None
         else:
-            accrued = float(doc["accrued_total"])
+            accrued = math.fsum(float(v) for v in doc["accrued_by_hotkey"].values() if float(v) > 0)
             paid = math.fsum(float(v) for v in doc["rewards_by_hotkey"].values()) * emission
         periods.append({"period": period, "settled": doc is not None, "accrued_alpha": accrued * emission,
                         "paid_alpha": paid, "buckets": _buckets(own, emission)})
     return {"schema": SPEND_SCHEMA, "task_id": rl.settings.task_id, "run": rl.settings.run, "periods": periods,
             "starved": [[start, end] for start, end in starved], "stopped": auctions.stopped(),
-            "latest_checkpoint": book.latest_checkpoint, "leases_out": int(leases_out),
+            "stopped_at": stopped_at, "latest_checkpoint": book.latest_checkpoint, "pending": pending,
+            "settle_margin_s": (max(config.slack_s, config.outage_grace_s) if config.outage_fill
+                                else config.slack_s),
             "miner_alpha_per_period": emission, "written_at": float(now)}
 
 

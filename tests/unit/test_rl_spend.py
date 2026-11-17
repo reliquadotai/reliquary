@@ -8,20 +8,21 @@ from types import SimpleNamespace
 import pytest
 
 from reliquary.validator import corpus_periods as cp
+from reliquary.validator.rl_leases import LeaseRequest
 from reliquary.validator.rl_ledger import LedgerConfig, RlPayLedger
 from reliquary.validator.rl_spend import SpendPublisher, spend_key, spend_summary
 from tests.unit.test_rl_auction import Clock, _limited
-from tests.unit.test_rl_submit import ENV, NOW, service
+from tests.unit.test_rl_submit import ENV, NOW, group, service
 
 EMISSION = 1.0                                       # ``auctions_for``: 1 alpha per period
 PERIOD = cp.period_of(NOW)
 AFTER = cp.period_end(PERIOD) + 3600.0               # the period closed and past its slack
 
 
-def _rl(tmp_path, *, cap=0.5, **limits):
+def _rl(tmp_path, *, cap=0.5, fill=False, **limits):
     book, auctions, clock = _limited(tmp_path, **limits)
-    ledger = RlPayLedger(book, service(book, probation_groups=0), None, LedgerConfig(task_id="order-train-t1", cap=cap),
-                         clock=clock)
+    ledger = RlPayLedger(book, service(book, probation_groups=0), None,
+                         LedgerConfig(task_id="order-train-t1", cap=cap, outage_fill=fill), clock=clock)
     rl = SimpleNamespace(settings=SimpleNamespace(task_id="order-train-t1", run="order-train-t1"), book=book,
                          ledger=ledger)
     return rl, clock
@@ -88,7 +89,9 @@ def test_the_summary_carries_starvation_the_stop_and_the_checkpoint(tmp_path):
     summary = spend_summary(rl, now=clock())
     assert summary["starved"] == [[NOW - 700, NOW - 100]]
     assert summary["stopped"] == "deadline" and summary["latest_checkpoint"] == 4
-    assert summary["leases_out"] == 0 and summary["periods"] == []
+    assert summary["stopped_at"] == NOW + 10                                        # the deadline itself
+    assert summary["pending"] == {"open_leases": 0, "buffered": 0, "audits": 0, "unledgered": 0}
+    assert summary["periods"] == []
 
 
 def test_the_summary_is_written_under_the_run_after_a_settle(tmp_path):
@@ -120,14 +123,18 @@ def test_the_ledger_loop_writes_the_summary_after_its_settle():
         async def write(self, *, settled):
             calls.append(("spend", settled))
 
+    async def publish(archives):
+        calls.append("publish")
+
+    ledger.publish = publish
     rl = SimpleNamespace(ledger=ledger)
 
     async def run():
-        loops = rl_async_loops(rl, archives=None, spend=Spend(), every={"ledger": 60})
+        loops = rl_async_loops(rl, archives=object(), spend=Spend(), every={"ledger": 60})
         task = asyncio.ensure_future(loops[2])                                     # the ledger loop
         for _ in range(50):
             await asyncio.sleep(0.01)
-            if ("spend", True) in calls:
+            if "publish" in calls:
                 break
         task.cancel()
         for other in loops[:2] + loops[3:]:
@@ -135,4 +142,76 @@ def test_the_ledger_loop_writes_the_summary_after_its_settle():
         await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(run())
-    assert calls[:3] == ["ingest", "settle", ("spend", True)]
+    # the summary first: an archive publish that fails does not hold it back
+    assert calls[:4] == ["ingest", "settle", ("spend", True), "publish"]
+
+
+
+def _deliver(rl, clock, prompt, *, train=True):
+    lease = rl.book.grant([LeaseRequest("A", ENV, (prompt,), 0)])[0].leases[0]
+    rl.ledger.submissions.submit(lease.lease_id, "A", group(8))
+    if train:
+        rl.ledger.submissions.report_training(lease.lease_id, rollout_match=[1.0] * 16, accepted=True)
+    return lease
+
+
+def test_a_lease_book_order_becomes_final_once_settled(tmp_path):
+    from reliquary.admin.training import training_spend
+
+    rl, clock = _rl(tmp_path, deadline_at=NOW + 10)
+    rl.book.auctions.post_ask(ENV, "A", 0.5, 8)
+    lease = rl.book.grant([LeaseRequest("A", ENV, (1,), 0)])[0].leases[0]
+    entry = SimpleNamespace(status="retired", params={"training_order": {"usd_per_alpha": 4.0}})
+
+    def final(now, retired_time=NOW + 20):
+        rl.ledger.ingest()
+        rl.ledger.settle(now=now)
+        return training_spend(entry, spend_summary(rl, now=now), retired_time=retired_time)["final"]
+
+    assert spend_summary(rl, now=NOW)["pending"]["open_leases"] == 1
+    assert final(NOW + 1) is False                                               # a lease is out
+    rl.ledger.submissions.submit(lease.lease_id, "A", group(8))
+    assert spend_summary(rl, now=NOW + 2)["pending"]["buffered"] == 1             # the trainer may still train it
+    rl.ledger.submissions.report_training(lease.lease_id, rollout_match=[1.0] * 16, accepted=True)
+    assert spend_summary(rl, now=NOW + 3)["pending"]["unledgered"] == 1           # not yet in the ledger
+    clock.t = NOW + 20                                                           # stopped by its deadline
+    assert final(NOW + 20) is False                                              # its period is still open
+    margin = spend_summary(rl, now=NOW + 20)["settle_margin_s"]
+    assert final(cp.period_end(PERIOD) + margin - 1) is False                    # a summary from before the close
+    assert final(cp.period_end(PERIOD) + margin + 1) is True
+    summary = spend_summary(rl, now=cp.period_end(PERIOD) + margin + 1)
+    [period] = summary["periods"]
+    assert period["settled"] and period["paid_alpha"] > 0
+    late = cp.period_end(PERIOD) + 60                                             # retired in the next period
+    assert final(cp.period_end(PERIOD) + margin + 1, retired_time=late) is False
+    assert final(cp.period_end(PERIOD + 1) + margin + 1, retired_time=late) is True
+
+
+def test_groups_left_with_a_gone_trainer_cannot_pay(tmp_path):
+    rl, clock = _rl(tmp_path, fill=True, deadline_at=NOW + 10)
+    rl.book.auctions.post_ask(ENV, "A", 0.5, 8)
+    _deliver(rl, clock, 1, train=False)
+    rl.ledger.trainer_beat(now=NOW)
+    clock.t = NOW + 20
+    assert spend_summary(rl, now=NOW + 20)["pending"]["buffered"] == 1             # the trainer may still take it
+    gone = NOW + 20 + rl.ledger.config.outage_grace_s
+    clock.t = gone
+    assert spend_summary(rl, now=gone)["pending"]["buffered"] == 0               # stopped, and the trainer is gone
+
+
+def test_outage_fill_stops_at_the_orders_stop(tmp_path):
+    book, auctions, clock = _limited(tmp_path, deadline_at=NOW + 10)
+    ledger = RlPayLedger(book, service(book, probation_groups=0), None,
+                         LedgerConfig(task_id="order-train-t1", cap=0.5, outage_fill=True), clock=clock)
+    rl = SimpleNamespace(settings=SimpleNamespace(task_id="order-train-t1", run="order-train-t1"), book=book,
+                         ledger=ledger)
+    t = cp.period_end(PERIOD) - cp.PERIOD_SECONDS
+    while t <= AFTER:                                                             # alive through its period
+        ledger.trainer_beat(now=t)
+        t += 500.0
+    _accrue(rl, 1, price=1e-6, tokens=1000)
+    clock.t = AFTER
+    assert [d["work_period"] for d in ledger.settle(now=AFTER)] == [PERIOD]
+    later = cp.period_end(PERIOD + 3) + 3600.0                                    # the trainer never came back
+    clock.t = later
+    assert ledger.settle(now=later) == []                                         # no fill after the stop
