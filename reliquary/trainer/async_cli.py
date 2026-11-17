@@ -96,6 +96,41 @@ def async_trainer_settings(env: Mapping[str, str] = os.environ) -> dict[str, Any
     }
 
 
+def managed_runtime_identity(env: Mapping[str, str], task: Mapping[str, Any]) -> dict[str, str] | None:
+    """An unmanaged trainer keeps its old protocol; a supervisor runtime requires every pin."""
+    if not (env.get("RELIQUARY_RL_RUNTIME_ID") or env.get("RELIQUARY_RL_ORDER_SHA256")):
+        return None
+    identity = {key: str(env.get(name, "")).strip() for key, name in (
+        ("task_id", "RELIQUARY_TASK_ID"), ("order_sha256", "RELIQUARY_RL_ORDER_SHA256"),
+        ("run_id", "RELIQUARY_RL_RUN"), ("runtime_id", "RELIQUARY_RL_RUNTIME_ID"))}
+    if not all(identity.values()) or task.get("task_id") != identity["task_id"] or task.get("run") != identity["run_id"]:
+        raise ValueError("managed trainer task/run identity does not match its supervisor")
+    return identity
+
+
+def run_trainer_lifecycle(trainer, heartbeat, *, runtime=None, backup=None) -> None:
+    """A quiesced acknowledgement is sent only after all local workers have joined successfully."""
+    try:
+        if runtime is not None:
+            runtime.ready(trainer.version)
+        result = run_forever(trainer)
+        if runtime is not None:
+            if result != "draining":
+                raise RuntimeError("managed trainer stopped without a drain request")
+            trainer.quiesce()
+    finally:
+        try:
+            heartbeat.stop()
+        finally:
+            try:
+                trainer.close()
+            finally:
+                if backup is not None:
+                    backup.close(timeout=60)
+    if runtime is not None:
+        runtime.quiesced(trainer.version)
+
+
 def resume_weights(link, *, validator_hotkey: str, work_dir: Path, sync=None, fetch=None):
     """``(state, version, model_files_dir)`` of the latest published checkpoint, or None on a fresh book. A published
     version ahead of the book (published, then the trainer died before adopting it) is adopted here."""
@@ -140,12 +175,14 @@ def run_async_train_worker() -> None:
         CommandChannel, broadcasting_train_step, gather_full_state_dict, init_distributed, load_sharded_model,
         trainer_backend,
     )
-    from reliquary.trainer.rl_link import TrainerLink
+    from reliquary.trainer.rl_link import TrainerLink, TrainerRuntime
     from reliquary.validator import telemetry
     from reliquary.validator.training import configure_distributed, reset_training_state, train_step
 
-    dist_ctx = channel = gateway = None
+    dist_ctx = channel = gateway = link = None
     backend = trainer_backend()
+    if (os.environ.get("RELIQUARY_RL_RUNTIME_ID") or os.environ.get("RELIQUARY_RL_ORDER_SHA256")) and backend != "single":
+        raise ValueError("managed trainer requires the single backend")
     _check_trainer_launch(backend, os.environ)
     if backend == "fsdp2":
         from reliquary.constants import KL_BETA
@@ -161,8 +198,19 @@ def run_async_train_worker() -> None:
 
     try:
         settings = async_trainer_settings()
-        link = TrainerLink(settings["url"], settings["token"])
+        managed = bool(os.environ.get("RELIQUARY_RL_RUNTIME_ID") or os.environ.get("RELIQUARY_RL_ORDER_SHA256"))
+        link = TrainerLink(settings["url"], settings["token"], **({"timeout_s": 10.0} if managed else {}))
         task = link.config()
+        identity = managed_runtime_identity(os.environ, task)
+        runtime = None if identity is None else TrainerRuntime(link, identity)
+        if runtime is not None:
+            if backend != "single" or settings["hf_prefix"]:
+                raise ValueError("managed trainer requires the single backend without background HF backups")
+            snapshot = runtime.snapshot()          # identity and freshness before model download or GPU work
+            if not snapshot["controller_ready"] or snapshot["drain_requested"] or snapshot["trainer_quiesced"]:
+                raise ValueError("managed controller is not available for trainer startup")
+            if not settings["base_model"] or not Path(settings["base_model"]).is_dir():
+                raise ValueError("managed trainer requires its verified local base model")
         telemetry.init(settings["validator_hotkey"], {
             "task_id": task["task_id"], "run": task["run"], "targets": task["targets"], "backend": backend,
             "batch_groups": settings["batch_groups"], "steps_per_checkpoint": settings["steps_per_checkpoint"],
@@ -258,7 +306,8 @@ def run_async_train_worker() -> None:
             model, config=config, buffer=link, submissions=link, book=link, publisher=publisher,
             state_fn=state_fn, backup=backup, backup_save=backup_save,
             train_step_fn=step_fn, audits=audits,
-            global_step_hint=None if version is None else version * settings["steps_per_checkpoint"])
+            global_step_hint=None if version is None else version * settings["steps_per_checkpoint"],
+            drain_requested=None if runtime is None else runtime.drain_requested)
         live["trainer"] = trainer
         from reliquary.trainer.rl_link import TrainerHeartbeat
 
@@ -266,12 +315,8 @@ def run_async_train_worker() -> None:
         logger.info("train-async starting: task %s, run %s, target mix %s (priced, not enforced), checkpoint %d",
                     task["task_id"], task["run"], task["targets"], trainer.version)
         try:
-            run_forever(trainer)
+            run_trainer_lifecycle(trainer, heartbeat, runtime=runtime, backup=backup)
         finally:
-            heartbeat.stop()
-            trainer.close()
-            if backup is not None:
-                backup.close(timeout=60)
             telemetry.finish()
     finally:
         # Followers block on the next command; release them on any exit.
@@ -279,6 +324,8 @@ def run_async_train_worker() -> None:
             channel.send("STOP")
         if gateway is not None:
             gateway.stop()
+        if link is not None and hasattr(link, "close"):
+            link.close()
 
 
 def _start_miles(model_path, version: int | None, eos_ids):
@@ -315,15 +362,19 @@ def _start_miles(model_path, version: int | None, eos_ids):
         raise
 
 
-def run_forever(trainer, *, steps: int | None = None) -> None:
+def run_forever(trainer, *, steps: int | None = None) -> str | None:
     """Step until stopped (each step waits for a full batch). A step that fails is fatal (the process restarts from
     the last adopted checkpoint, and the validator requeues what it held): the link already retried the validator,
     and a half-reported step must not be retried."""
     done = 0
     while steps is None or done < steps:
-        if trainer.run_once() == "trained":
+        result = trainer.run_once()
+        if result == "draining":
+            return "draining"
+        if result == "trained":
             logger.info("async step %s", trainer.last_step)
         done += 1
 
 
-__all__ = ["async_trainer_settings", "resume_weights", "run_async_train_worker", "run_forever"]
+__all__ = ["async_trainer_settings", "managed_runtime_identity", "resume_weights", "run_async_train_worker",
+           "run_forever", "run_trainer_lifecycle"]

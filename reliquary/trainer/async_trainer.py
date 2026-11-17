@@ -419,7 +419,8 @@ class AsyncTrainer:
                  backup_save: Callable[..., None] = save_snapshot,
                  train_step_fn: Callable = _default_train_step, ref_model: Any = None,
                  global_step_hint: int | None = None, audits=None, clock: Callable[[], float] = time.monotonic,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 sleep: Callable[[float], None] = time.sleep,
+                 drain_requested: Callable[[], bool] | None = None) -> None:
         self.model, self.config = model, config
         self.buffer, self.submissions, self.book = buffer, submissions, book
         self.publisher, self.backup, self._backup_save = publisher, backup, backup_save
@@ -427,6 +428,10 @@ class AsyncTrainer:
         self._train_step, self.ref_model, self.global_step_hint = train_step_fn, ref_model, global_step_hint
         self._clock, self._sleep = clock, sleep
         self.audits = audits                    # trainer.audits.TrainerAudits: out-of-zone audits on this model
+        self._drain_requested = drain_requested
+        self._draining = False
+        self._publication_error: BaseException | None = None
+        self._prefetch_error: BaseException | None = None
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ckpt-publish")
         self._pending: Future | None = None
         self._fetcher = ThreadPoolExecutor(max_workers=1, thread_name_prefix="batch-prefetch")
@@ -473,9 +478,15 @@ class AsyncTrainer:
             self.last_publication = {**self.last_publication, **measure()}
 
     def wait_published(self) -> None:
+        if self._publication_error is not None:
+            raise self._publication_error
         if self._pending is not None:
             pending, self._pending = self._pending, None
-            pending.result()
+            try:
+                pending.result()
+            except BaseException as exc:
+                self._publication_error = exc
+                raise
 
     def close(self) -> None:
         try:
@@ -485,6 +496,23 @@ class AsyncTrainer:
             self._fetcher.shutdown(wait=True)        # what it took stays taken: the next start requeues it
             if self._reporter is not None:
                 self._reporter.shutdown(wait=True)
+
+    def drain_requested(self) -> bool:
+        if not self._draining and self._drain_requested is not None:
+            self._draining = bool(self._drain_requested())
+        return self._draining
+
+    def quiesce(self) -> None:
+        """Join local work and report held, untrained groups before the controller seals its trainer routes."""
+        self._draining = True
+        self._fetcher.shutdown(wait=True)
+        if self._prefetch_error is not None:
+            raise self._prefetch_error
+        held = self._collect_prefetch(strict=True)
+        if held:
+            self._report_untrained(held)
+        self._uniforms.clear()
+        self.close()
 
     # --- batch ---------------------------------------------------------------------------------------------
     def _report_untrained(self, groups, failure_class=None) -> None:
@@ -522,6 +550,9 @@ class AsyncTrainer:
         judging queued audits meanwhile."""
         taken: list[SubmittedGroup] = list(held or [])
         while True:
+            if self.drain_requested():
+                self._report_untrained(taken)
+                return []
             if len(taken) >= self.config.batch_groups:
                 return taken
             taken += self.buffer.take(self.config.batch_groups - len(taken))
@@ -540,7 +571,7 @@ class AsyncTrainer:
     def _start_prefetch(self) -> None:
         """Take the next batch in the background while this one trains, only when a full batch is already queued:
         a short take would start the controller's starvation clock while the trainer is busy."""
-        if not self.config.prefetch or self._prefetched is not None:
+        if not self.config.prefetch or self._prefetched is not None or self.drain_requested():
             return
         depth = getattr(self.buffer, "depth", None)
         if depth is None:
@@ -549,7 +580,7 @@ class AsyncTrainer:
 
     def _prefetch_job(self, depth) -> list[SubmittedGroup]:
         started = time.monotonic()
-        if sum(depth().values()) < self.config.batch_groups:
+        if self.drain_requested() or sum(depth().values()) < self.config.batch_groups:
             return []
         taken = self.buffer.take(self.config.batch_groups)
         fetched = time.monotonic()
@@ -559,14 +590,17 @@ class AsyncTrainer:
                     time.monotonic() - fetched)
         return taken
 
-    def _collect_prefetch(self) -> list[SubmittedGroup] | None:
+    def _collect_prefetch(self, *, strict: bool = False) -> list[SubmittedGroup] | None:
         """The groups the prefetch took (None: nothing held, or the take failed and may have half-happened)."""
         if self._prefetched is None:
             return None
         pending, self._prefetched = self._prefetched, None
         try:
             return pending.result()
-        except Exception:  # noqa: BLE001 - the step takes its batch itself after a requeue
+        except Exception as exc:  # noqa: BLE001 - legacy steps recover a lost take through requeue
+            if strict:
+                self._prefetch_error = exc
+                raise
             logger.exception("batch prefetch failed")
             return None
 
@@ -574,7 +608,12 @@ class AsyncTrainer:
     def run_once(self) -> str:
         began = self._clock()
         telemetry.hold()                # train_step's row and this step's timings go to wandb as one row
-        held = self._collect_prefetch()
+        held = self._collect_prefetch(strict=self._drain_requested is not None)
+        if self.drain_requested():
+            if held:
+                self._report_untrained(held)
+            self.last_step = {"result": "draining", "checkpoint": self.version}
+            return "draining"
         if held is None:
             self.buffer.requeue()       # between steps the trainer holds nothing: a take whose answer was lost
             held = []
@@ -588,6 +627,9 @@ class AsyncTrainer:
         exhausted = self.drop_exhausted()
         self.run_audits()                       # bounded: audits progress even when batches are always full
         submitted = self.assemble(held)
+        if not submitted:
+            self.last_step = {"result": "draining", "checkpoint": self.version}
+            return "draining"
         started = self._clock()
         _reset_peak_memory()
         batch, slot = [], 0
