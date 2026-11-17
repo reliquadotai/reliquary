@@ -165,3 +165,16 @@ def test_a_dead_piece_between_two_served_takes_persists(tmp_path):
     buffer.take(1)                       # served again after 600 s of silence
     assert dead_intervals(book.db, now=1600.0) == [(1180.0, 1600.0)]
     assert dead_intervals(book.db, now=1700.0) == [(1180.0, 1600.0)]       # it stays after the trainer is back
+
+
+def test_a_silence_spanning_a_controller_restart_is_dead(tmp_path):
+    clock, book, buffer = _setup(tmp_path)
+    for name in "ab":
+        buffer.push(_group(name))
+    buffer.take(1)                       # served at 1000, then the controller goes down
+    clock.t = 1500.0
+    buffer = TrainingBuffer(book, clock=clock)
+    assert dead_intervals(book.db, now=1500.0) == [(1180.0, 1500.0)]     # the open piece survives the restart
+    buffer.take(1)                       # the trainer's first poll after the restart
+    assert dead_intervals(book.db, now=1500.0) == [(1180.0, 1500.0)]
+    assert dead_intervals(book.db, now=1600.0) == [(1180.0, 1500.0)]

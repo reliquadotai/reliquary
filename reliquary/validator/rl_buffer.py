@@ -180,10 +180,9 @@ class TrainingBuffer:
                 book.db.execute("ALTER TABLE rl_buffer ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")   # an older file
             if "polled" not in {row[1] for row in book.db.execute("PRAGMA table_info(rl_trainer_waits)")}:
                 book.db.execute("ALTER TABLE rl_trainer_waits ADD COLUMN polled REAL")   # an older file
-            # A restart: the wait it left open ends at its last take (our downtime is neither starved nor dead);
+            # A restart: the wait it left open ends at its last take (our downtime is not starved; the last-poll mark stays, so it is dead);
             # the trainer's next short take opens a fresh one.
             book.db.execute("UPDATE rl_trainer_waits SET end=COALESCE(polled, start) WHERE end IS NULL")
-            book.db.execute("DELETE FROM rl_trainer_poll")      # nor is the downtime a gap between two takes
             book.db.commit()
 
     def requeue(self) -> int:
