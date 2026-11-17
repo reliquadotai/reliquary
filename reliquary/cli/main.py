@@ -2368,9 +2368,12 @@ def rl_front(
     map_path: Path = typer.Option(..., "--map", help="The supervisor's task map file (JSON)"),
     allow_plain_trainer: bool = typer.Option(
         False, "--allow-plain-trainer",
-        help="Proxy trainer paths without X-Forwarded-Proto: https. By default they cross only with it, which means "
-             "something only behind a TLS terminator that overwrites that header",
+        help="Proxy trainer paths over plain HTTP. By default they cross only over HTTPS: the TLS terminator's "
+             "X-Forwarded-Proto, believed only from --forwarded-allow-ips",
     ),
+    forwarded_allow_ips: str = typer.Option(
+        "127.0.0.1", "--forwarded-allow-ips",
+        help="Comma-separated addresses of the TLS terminator whose X-Forwarded-* headers are believed"),
     external_ip: str = typer.Option("", "--external-ip", help="Public IP to publish on-chain (serve_axon); empty skips"),
     external_port: int = typer.Option(0, "--external-port", help="Public port to advertise; --port when 0"),
     network: str = typer.Option("finney", help="Bittensor network"),
@@ -2385,7 +2388,7 @@ def rl_front(
 
     import uvicorn
 
-    from reliquary.validator.rl_front import build_front_app
+    from reliquary.validator.rl_front import behind_terminator, build_front_app
 
     setup_logging(log_level)
     if external_ip:
@@ -2408,8 +2411,9 @@ def rl_front(
                 await close_subtensor(subtensor)
 
         asyncio.run(announce())
-    front = build_front_app(map_path, allow_plain_trainer=allow_plain_trainer)
-    uvicorn.run(front, host=host, port=port, log_level=log_level.lower())
+    front = behind_terminator(build_front_app(map_path, allow_plain_trainer=allow_plain_trainer),
+                              [ip.strip() for ip in forwarded_allow_ips.split(",") if ip.strip()])
+    uvicorn.run(front, host=host, port=port, log_level=log_level.lower(), proxy_headers=False)
 
 
 eval_app = typer.Typer(name="eval", help="Evaluation orders: frozen sets and the pod runner")

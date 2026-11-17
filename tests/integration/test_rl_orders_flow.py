@@ -168,7 +168,7 @@ async def test_a_training_order_runs_end_to_end_without_an_operator(on, monkeypa
     from reliquary.trainer.rl_link import TrainerLinkError
     from reliquary.validator import corpus_periods as cp
     from reliquary.validator import rl_spend
-    from reliquary.validator.rl_front import build_front_app
+    from reliquary.validator.rl_front import behind_terminator, build_front_app
     from reliquary.validator.rl_async_service import DB_NAME
     from reliquary.validator.rl_supervisor import Supervisor, admin_final, subprocess_spawn
     from tests.unit.test_ckpt_delta import chain
@@ -218,8 +218,8 @@ async def test_a_training_order_runs_end_to_end_without_an_operator(on, monkeypa
         mapped = json.loads(map_path.read_text())
         assert mapped["tasks"][task]["port"] == 9100 and mapped["default"] == task
 
-        front = build_front_app(map_path, client_factory=lambda port: httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=controllers[port].app)))
+        front = behind_terminator(build_front_app(map_path, client_factory=lambda port: httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=controllers[port].app))))          # as `reliquary rl front` serves it
         loop = asyncio.get_running_loop()
         pod_http = httpx.Client(transport=Terminator(front, loop))
         pod_env = {"RELIQUARY_RL_TRAINER_URL": "https://front", "RELIQUARY_RL_TRAINER_TOKEN": POD_TOKEN,

@@ -152,17 +152,31 @@ async def test_a_body_over_the_limit_is_refused(tmp_path):
     assert declared.status_code == 413 and streamed.status_code == 413 and fine.status_code == 200
 
 
+def _from(app, host):
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app, client=(host, 40000)), base_url="http://front")
+
+
 async def test_trainer_paths_need_tls_unless_allowed(tmp_path):
+    from reliquary.validator.rl_front import behind_terminator
+
     s = Stack(tmp_path, {"a": 8001})
-    async with s.client() as c:
+    https = {"X-Forwarded-Proto": "https"}
+    served = behind_terminator(s.front, "127.0.0.1")
+    async with _from(served, "127.0.0.1") as c:                   # through the host's terminator
         plain = await c.get("/rl/a/trainer/step")
-        tls = await c.get("/rl/a/trainer/step", headers={"X-Forwarded-Proto": "https"})
+        tls = await c.get("/rl/a/trainer/step", headers=https)
         http = await c.get("/rl/a/trainer/step", headers={"X-Forwarded-Proto": "http"})
-        bare = await c.get("/rl/trainer/step", headers={"X-Forwarded-Proto": "https"})
+        bare = await c.get("/rl/trainer/step", headers=https)
     assert plain.status_code == 403 and plain.json()["error"] == "trainer_needs_tls"
     assert http.status_code == 403
     assert tls.status_code == 200 and tls.json()["path"] == "/rl/trainer/step"
     assert bare.status_code == 404   # operator trainers keep their own loopback listener
+    async with _from(served, "203.0.113.9") as c:                 # straight to the port: the header is not believed
+        assert (await c.get("/rl/a/trainer/step", headers=https)).status_code == 403
+    async with _from(s.front, "127.0.0.1") as c:                  # no terminator trusted at all
+        assert (await c.get("/rl/a/trainer/step", headers=https)).status_code == 403
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=s.front), base_url="https://front") as c:
+        assert (await c.get("/rl/a/trainer/step")).status_code == 200
 
     open_ = Stack(tmp_path, {"a": 8001}, allow_plain_trainer=True)
     async with open_.client() as c:

@@ -5,8 +5,9 @@ controller of each task, which listens on a local port (the supervisor's map fil
 * ``/rl/<rest>`` and every non-``/rl`` path  ->  the default task's controller (503 while it restarts);
 * ``GET /rl/tasks``  ->  the live tasks with their auction views and models (miners pick a task from it).
 
-Trainer paths (``/rl/<task>/trainer/*``) cross the front only behind the host's TLS terminator
-(``X-Forwarded-Proto: https``) unless ``allow_plain_trainer``. The bare ``/rl/trainer/*`` is never proxied. The front
+Trainer paths (``/rl/<task>/trainer/*``) cross the front only over HTTPS (the request's scheme: the host's TLS
+terminator's ``X-Forwarded-Proto``, believed only from the addresses ``behind_terminator`` trusts) unless
+``allow_plain_trainer``. The bare ``/rl/trainer/*`` is never proxied. The front
 adds no rate limit: lease and trainer traffic are the controller's to judge.
 """
 from __future__ import annotations
@@ -73,8 +74,7 @@ def _task_client(port: int) -> httpx.AsyncClient:
 def build_front_app(map_path: Path, *, client_factory: Callable[[int], httpx.AsyncClient] = _task_client,
                     allow_plain_trainer: bool = False, max_body: int = MAX_BODY_BYTES) -> Starlette:
     """One httpx client (so one connection pool) per task port: a hung task cannot use up the connections the
-    others need. The trainer TLS gate trusts ``X-Forwarded-Proto``: it means something only behind a terminator
-    that overwrites that header."""
+    others need. The trainer TLS gate reads the request's scheme (serve it through ``behind_terminator``)."""
     tasks_map = _TaskMap(map_path)
     clients: dict[int, httpx.AsyncClient] = {}
 
@@ -171,7 +171,7 @@ def build_front_app(map_path: Path, *, client_factory: Callable[[int], httpx.Asy
             task, rest = segments[2], "/rl/" + "/".join(segments[3:])
             prefix = f"/rl/{task}"
             if segments[3] == "trainer":
-                if not allow_plain_trainer and request.headers.get("x-forwarded-proto", "").lower() != "https":
+                if not allow_plain_trainer and request.url.scheme != "https":
                     return _refuse(403, "trainer_needs_tls")
         else:
             if segments[1:3] == ["rl", "trainer"]:
@@ -187,4 +187,12 @@ def build_front_app(map_path: Path, *, client_factory: Callable[[int], httpx.Asy
     return Starlette(routes=[Route("/{rest:path}", route, methods=methods)])
 
 
-__all__ = ["DRAW_FLOOR", "MAX_BODY_BYTES", "build_front_app"]
+def behind_terminator(front, trusted: str | list[str] = "127.0.0.1"):
+    """``front`` as served: the scheme and client address come from ``X-Forwarded-*`` only on connections from
+    ``trusted`` (the host's TLS terminator), never from anyone else."""
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    return ProxyHeadersMiddleware(front, trusted_hosts=trusted)
+
+
+__all__ = ["DRAW_FLOOR", "MAX_BODY_BYTES", "behind_terminator", "build_front_app"]
