@@ -29,6 +29,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS rl_buffer(lease_id TEXT PRIMARY KEY, environment TEXT NOT NULL, k INTEGER NOT NULL,
     arrived_at REAL NOT NULL, hotkey TEXT NOT NULL, state TEXT NOT NULL, body BLOB NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS rl_trainer_waits(start REAL NOT NULL, end REAL);   -- end NULL: still waiting
 CREATE INDEX IF NOT EXISTS rl_buffer_fresh ON rl_buffer(state, environment, k, arrived_at);
 """
 
@@ -116,6 +117,21 @@ def mixed_take(rows, caps: dict[str, int], limit: int, urgent_below: int | None 
         chosen.append(lease_id)
     return chosen + extra[:max(0, limit - len(chosen))]
 
+STARVATION_GRACE_S = 300.0  # the first minutes of a wait are normal: a run's bill counts a wait only past them
+
+
+def starved_intervals(db, *, min_wait_s: float = STARVATION_GRACE_S,
+                      now: float | None = None) -> list[tuple[float, float]]:
+    """The spans where the trainer starved for rollouts: each wait of at least ``min_wait_s`` from ``start +
+    min_wait_s`` to its end (an open wait: to ``now``). ``db``: the lease book's connection."""
+    now = time.time() if now is None else now
+    out = []
+    for start, end in db.execute("SELECT start, end FROM rl_trainer_waits ORDER BY start"):
+        end = now if end is None else end
+        if end - start >= min_wait_s:
+            out.append((start + min_wait_s, end))
+    return out
+
 
 class TrainingBuffer:
     def __init__(self, book, clock=time.time, batch_caps=None) -> None:
@@ -192,7 +208,13 @@ class TrainingBuffer:
                                      [(TAKEN, lease_id) for lease_id, _ in rows])
             if self._waiting_since is not None:
                 self._starved_s += min(now - self._waiting_since, MAX_POLL_GAP_S)
-            self._waiting_since = now if len(rows) < limit else None
+            short = len(rows) < limit
+            if short and self._waiting_since is None and not self.book.db.execute(
+                    "SELECT 1 FROM rl_trainer_waits WHERE end IS NULL").fetchone():   # one open wait, restarts included
+                self.book.db.execute("INSERT INTO rl_trainer_waits(start, end) VALUES(?, NULL)", (now,))
+            elif not short:
+                self.book.db.execute("UPDATE rl_trainer_waits SET end=? WHERE end IS NULL", (now,))
+            self._waiting_since = now if short else None
         groups = [SubmittedGroup.unpack(body) for _, body in rows]
         with self.book.lock:
             self._taken += sum(len(c) for g in groups for c in g.completions)
