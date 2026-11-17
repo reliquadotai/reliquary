@@ -183,6 +183,7 @@ class TrainingBuffer:
             # A restart: the wait it left open ends at its last take (our downtime is neither starved nor dead);
             # the trainer's next short take opens a fresh one.
             book.db.execute("UPDATE rl_trainer_waits SET end=COALESCE(polled, start) WHERE end IS NULL")
+            book.db.execute("DELETE FROM rl_trainer_poll")      # nor is the downtime a gap between two takes
             book.db.commit()
 
     def requeue(self) -> int:
@@ -242,6 +243,10 @@ class TrainingBuffer:
             rows = fresh + retried
             self.book.db.executemany("UPDATE rl_buffer SET state=?, attempts=attempts+1 WHERE lease_id=?",
                                      [(TAKEN, lease_id) for lease_id, _ in rows])
+            last = self.book.db.execute("SELECT at FROM rl_trainer_poll WHERE id=0").fetchone()
+            if last is not None and now - float(last[0]) > STARVATION_DEAD_GAP_S:   # the trainer was away
+                self.book.db.execute("INSERT INTO rl_trainer_dead(start, end) VALUES(?, ?)",
+                                     (float(last[0]) + STARVATION_DEAD_GAP_S, now))
             if self._waiting_since is not None:
                 self._starved_s += min(now - self._waiting_since, MAX_POLL_GAP_S)
             short = len(rows) < limit
@@ -249,11 +254,6 @@ class TrainingBuffer:
                     "SELECT 1 FROM rl_trainer_waits WHERE end IS NULL").fetchone():   # one open wait
                 self.book.db.execute("INSERT INTO rl_trainer_waits(start, end, polled) VALUES(?, NULL, ?)", (now, now))
             else:
-                open_wait = self.book.db.execute("SELECT polled FROM rl_trainer_waits WHERE end IS NULL").fetchone()
-                if open_wait is not None and open_wait[0] is not None \
-                        and now - open_wait[0] > STARVATION_DEAD_GAP_S:      # the trainer was away
-                    self.book.db.execute("INSERT INTO rl_trainer_dead(start, end) VALUES(?, ?)",
-                                         (open_wait[0] + STARVATION_DEAD_GAP_S, now))
                 self.book.db.execute(f"UPDATE rl_trainer_waits SET {'polled' if short else 'end'}=? "
                                      "WHERE end IS NULL", (now,))
             self.book.db.execute("INSERT INTO rl_trainer_poll(id, at) VALUES(0, ?) ON CONFLICT(id) DO UPDATE SET at=?",

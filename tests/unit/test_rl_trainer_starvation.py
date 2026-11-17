@@ -154,3 +154,14 @@ def test_starved_and_dead_never_overlap(tmp_path):
         starved, dead = starved_intervals(book.db, now=now), dead_intervals(book.db, now=now)
         assert all(se <= ds or de <= ss for ss, se in starved for ds, de in dead), (now, starved, dead)
     assert dead_intervals(book.db, now=4000.0) == [(1580.0, 2000.0), (2580.0, 4000.0)]
+
+
+def test_a_dead_piece_between_two_served_takes_persists(tmp_path):
+    clock, book, buffer = _setup(tmp_path)
+    for name in "ab":
+        buffer.push(_group(name))
+    buffer.take(1)                       # served at 1000
+    clock.t = 1600.0
+    buffer.take(1)                       # served again after 600 s of silence
+    assert dead_intervals(book.db, now=1600.0) == [(1180.0, 1600.0)]
+    assert dead_intervals(book.db, now=1700.0) == [(1180.0, 1600.0)]       # it stays after the trainer is back
