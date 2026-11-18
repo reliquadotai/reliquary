@@ -55,9 +55,10 @@ FULL = 0.9
 TARGET_WAIT_SECONDS = 60.0
 BUSY_HIGH = 0.95
 BUSY_LOW = 0.85
-K_MIN, K_MAX = 0.05, 4.0
+K_MIN, K_MAX = 0.25, 4.0
 K_GROW = 1.15
-K_SHRINK_FLOOR = 0.5
+# Back to 1 faster than above it: a k cut by a queue that drained is a card left idle.
+K_RECOVER = 1.5
 DEFAULT_DEADLINE_SECONDS = 24 * 3600.0
 MIN_TIME_LEFT_SECONDS = 600.0
 UNMET_SECONDS = 2 * STEP_SECONDS
@@ -417,9 +418,14 @@ class MarketPace:
         # a restart, the card 14-28 % busy, k fell 1 -> 0.12 in a minute).
         if wait > TARGET_WAIT_SECONDS and (busy is None or busy >= BUSY_LOW) and (
                 (self._wait is not None and wait > self._wait) or (busy is not None and busy > BUSY_HIGH)):
-            self.k *= max(K_SHRINK_FLOOR, TARGET_WAIT_SECONDS / wait)
+            # Proportional, not compounded: k is set from the excess of this wait, never multiplied step after step
+            # while a backlog drains (2026-11-18: x0.5 every 30 s took k from 1 to 0.05 over a 10-min backlog,
+            # and back up at x1.15 per step it would leave the card idle for minutes).
+            self.k = min(self.k, TARGET_WAIT_SECONDS / wait)
         elif (wait < TARGET_WAIT_SECONDS / 2 and unmet and (busy is None or busy < BUSY_LOW)):
-            self.k *= K_GROW
+            self.k *= K_RECOVER if self.k < 1.0 else K_GROW
+            if before < 1.0 < self.k:
+                self.k = 1.0
         self.k = min(K_MAX, max(K_MIN, self.k))
         self._wait = wait
         self._targets = split(self._jobs, rate * self.k, now, self._first_seen)
