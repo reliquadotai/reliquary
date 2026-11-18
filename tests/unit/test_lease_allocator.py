@@ -360,3 +360,17 @@ def test_the_shadow_computes_and_shows_the_merit_order_but_leases_as_before(monk
     assert shadow["price_alpha_per_mtoken"] == pytest.approx(0.10)
     assert "allocator" not in auction.view()
     assert any(line.startswith("merit order shadow") and "merit_price=0.1000" in line for line in lines)
+
+
+def test_a_long_queue_on_an_idle_card_does_not_lower_k():
+    clock = Clock()
+    pace = la.MarketPace(clock)
+    pace.bind_audit(lambda: (1_000.0, 0.2))
+    pace.report("job", q=1.0, remaining_tokens=1e9, deadline=None, supply=None, backlog_tokens=600_000,
+                unmet_at=None)
+    pace.target("job")
+    clock.now += la.STEP_SECONDS
+    pace.report("job", q=1.0, remaining_tokens=1e9, deadline=None, supply=None, backlog_tokens=700_000,
+                unmet_at=None)
+    pace.target("job")
+    assert pace.k == 1.0

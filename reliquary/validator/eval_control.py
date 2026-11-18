@@ -716,11 +716,15 @@ class PairedAuditDispatcher:
         executors of ``model`` audit together (one's measured speed x how many are live), and their busy share
         over the window; None until measured."""
         measured = self._scored_per_second(model)
-        live = len(self.live_executors(model))
-        if measured is None or live <= 0:
+        live = self.live_executors(model)
+        if measured is None or not live:
             return None
         busy = measured[3]
-        return measured[1] / busy * live, min(1.0, busy / (THROUGHPUT_WINDOW_SECONDS * live))
+        # Busy over the time each live executor was seen within the window, not the whole window: after a restart
+        # (or for a card just arrived) the window is not covered yet, and its idle share would read far too high.
+        now = self._clock()
+        seen = sum(min(THROUGHPUT_WINDOW_SECONDS, now - self._first_seen.get(d["executor_id"], now)) for d in live)
+        return measured[1] / busy * len(live), min(1.0, busy / max(seen, MIN_MEASURED_BUSY_SECONDS))
 
     def status(self) -> dict:
         """Per model, what the fleet must know: ``executors_needed`` more

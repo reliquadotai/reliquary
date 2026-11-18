@@ -412,8 +412,11 @@ class MarketPace:
         wait = sum(r.backlog_tokens for r in self._jobs.values()) / rate
         unmet = any(r.unmet_at is not None and now - r.unmet_at <= UNMET_SECONDS for r in self._jobs.values())
         before = self.k
-        if wait > TARGET_WAIT_SECONDS and ((self._wait is not None and wait > self._wait)
-                                           or (busy is not None and busy > BUSY_HIGH)):
+        # Down only when the card is what the queue waits for: a long queue on an idle card waits for something
+        # else (records read, draw rounds), and fewer leases would not shorten it (2026-11-18: 600 s queued after
+        # a restart, the card 14-28 % busy, k fell 1 -> 0.12 in a minute).
+        if wait > TARGET_WAIT_SECONDS and (busy is None or busy >= BUSY_LOW) and (
+                (self._wait is not None and wait > self._wait) or (busy is not None and busy > BUSY_HIGH)):
             self.k *= max(K_SHRINK_FLOOR, TARGET_WAIT_SECONDS / wait)
         elif (wait < TARGET_WAIT_SECONDS / 2 and unmet and (busy is None or busy < BUSY_LOW)):
             self.k *= K_GROW
