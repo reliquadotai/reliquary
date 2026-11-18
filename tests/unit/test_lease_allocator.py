@@ -178,7 +178,7 @@ def test_the_queue_lowers_k_when_the_wait_grows():
     pace.report("job", q=1.0, remaining_tokens=1e9, deadline=None, supply=None, backlog_tokens=240_000,
                 unmet_at=None)
     pace.target("job")
-    assert pace.k == pytest.approx(0.5)              # a 240 s wait, the card full: down, at most by half
+    assert pace.k == pytest.approx(0.25)             # a 240 s wait, the card full: down to target / wait
 
 
 def test_an_idle_card_with_miners_refused_raises_k():
@@ -374,3 +374,24 @@ def test_a_long_queue_on_an_idle_card_does_not_lower_k():
                 unmet_at=None)
     pace.target("job")
     assert pace.k == 1.0
+
+
+def test_k_follows_the_wait_without_compounding_and_recovers_fast():
+    clock = Clock()
+    pace = la.MarketPace(clock)
+    busy = [0.99]
+    pace.bind_audit(lambda: (1_000.0, busy[0]))
+
+    def step(backlog, unmet=None):
+        pace.report("job", q=1.0, remaining_tokens=1e9, deadline=None, supply=None, backlog_tokens=backlog,
+                    unmet_at=unmet)
+        pace.target("job")
+        clock.now += la.STEP_SECONDS
+
+    for backlog in (120_000, 150_000, 180_000, 200_000, 220_000):    # a backlog draining slowly, the card full
+        step(backlog)
+    assert pace.k == pytest.approx(60 / 220)          # its excess now, not x0.5 five times
+    busy[0] = 0.5
+    for _ in range(4):
+        step(0, unmet=clock.now)
+    assert pace.k == 1.0                              # back to 1 within four steps
