@@ -77,6 +77,16 @@ def _int(env: Mapping[str, str], name: str, default: int | None, *, minimum: int
     return value
 
 
+def _seconds(env: Mapping[str, str], name: str, default: float | None) -> float | None:
+    raw = str(env.get(name, "")).strip()
+    if not raw:
+        return default
+    value = float(raw)
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return value
+
+
 def async_trainer_settings(env: Mapping[str, str] = os.environ) -> dict[str, Any]:
     """Everything the entry reads from the environment, checked before any GPU work."""
     url = str(env.get("RELIQUARY_RL_TRAINER_URL", "")).strip()
@@ -103,7 +113,16 @@ def async_trainer_settings(env: Mapping[str, str] = os.environ) -> dict[str, Any
         # the out-of-zone audits on this trainer's weights (the validator's default audit source)
         "audits": str(env.get("RELIQUARY_RL_TRAINER_AUDITS", "1")).strip() != "0",
         "audits_per_step": _int(env, "RELIQUARY_RL_TRAINER_AUDITS_PER_STEP", 128),
-        "audit_budget_s": float(env.get("RELIQUARY_RL_TRAINER_AUDIT_BUDGET_S", "420")),
+        # the round before each step: max(_AUDIT_MIN_S, _AUDIT_SHARE x the last step's train seconds), or a fixed
+        # _AUDIT_BUDGET_S when set (``AsyncTrainer.audit_budget``)
+        "audit_budget_s": _seconds(env, "RELIQUARY_RL_TRAINER_AUDIT_BUDGET_S", None),
+        "audit_min_s": _seconds(env, "RELIQUARY_RL_TRAINER_AUDIT_MIN_S", 60.0),
+        "audit_share": _seconds(env, "RELIQUARY_RL_TRAINER_AUDIT_SHARE", 0.25),
+        # rollouts per batched audit forward (the Miles gateway judges several groups per call)
+        "audit_rollouts_per_call": _int(env, "RELIQUARY_RL_TRAINER_AUDIT_ROLLOUTS_PER_CALL", 64),
+        # lab replay: each batch pickled to <dir>/step-<version>.pkl before it trains (off when unset)
+        "dump_dir": Path(str(env["RELIQUARY_RL_TRAINER_DUMP_DIR"]).strip())
+        if str(env.get("RELIQUARY_RL_TRAINER_DUMP_DIR", "")).strip() else None,
         # the next batch is downloaded while this one trains; the step's reports go out in parallel
         "prefetch": str(env.get("RELIQUARY_RL_TRAINER_PREFETCH", "1")).strip() != "0",
         "report_workers": _int(env, "RELIQUARY_RL_TRAINER_REPORT_WORKERS", 16),
@@ -330,6 +349,9 @@ def run_async_train_worker() -> None:
                                     eos_ids=eos_ids,
                                     audits_per_step=settings["audits_per_step"],
                                     audit_budget_s=settings["audit_budget_s"],
+                                    audit_min_s=settings.get("audit_min_s", 60.0),
+                                    audit_share=settings.get("audit_share", 0.25),
+                                    dump_dir=settings.get("dump_dir"),
                                     prefetch=settings["prefetch"], report_workers=settings["report_workers"])
         link.requeue()                          # this trainer holds nothing yet
 
@@ -389,7 +411,8 @@ def _start_miles(model_path, version: int | None, eos_ids):
         client = miles_gateway.WatchedClient(
             miles_gateway.create_full_training_client(gateway.base_url, PROTOCOL_MODEL_ID),
             alive=lambda: gateway.process.poll() is None)
-        step_fn = MilesTrainStep(client, eos_ids=eos_ids, global_step_hint=version or 0)
+        step_fn = MilesTrainStep(client, eos_ids=eos_ids, chunk=settings.get("chunk", 64),
+                                 global_step_hint=version or 0)
         state_fn = MilesState(client, checkpoint_root=settings["output_dir"],
                               expected=expected_weight_specs(model_path), base_dir=model_path,
                               delete=miles_gateway.checkpoint_deleter(gateway.base_url))

@@ -435,6 +435,10 @@ def test_one_wandb_row_per_step_with_the_step_timings(monkeypatch):
     assert "train/lr" in row and row["async/groups_accepted"] == 2
     assert {"async/wait_s", "async/train_s", "async/step_s", "async/snapshot_s", "async/publish_wait_s"} <= set(row)
     assert row["async/completion_tokens"] == 2 * ROLLOUTS * N_TOK
+    # every token of the step's sequences (prompt + completion), for throughput and MFU
+    assert row["async/rollouts"] == 2 * ROLLOUTS and row["async/prompt_tokens"] == 2 * ROLLOUTS * 3
+    assert row["async/tokens"] == 2 * ROLLOUTS * (3 + N_TOK)
+    assert "async/tokens_per_train_s" in row
 
 
 def test_the_gate_refuses_a_token_far_from_the_pick_and_keeps_the_suspects_for_the_regrade():
@@ -710,3 +714,103 @@ def test_a_failed_step_releases_the_prefetched_batch_too():
         trainer.run_once()
     trainer.close()
     assert buffer.depth() == {"math": 4} and not subs.reports
+
+
+def test_a_dump_dir_keeps_each_batch_with_its_uniforms_for_replay(tmp_path):
+    """``dump_dir`` (``RELIQUARY_RL_TRAINER_DUMP_DIR``): each assembled batch is written before it trains, so the
+    same batch can be trained again under another parallel layout. Off by default."""
+    import pickle
+
+    from reliquary.trainer.async_trainer import load_batch_dump
+
+    model, book = _Model(), Book(latest=3)
+    buffer = TrainingBuffer(book)
+    buffer.push(submitted(model, "a", arrived=1.0))
+    buffer.push(submitted(model, "b", arrived=0.0))
+    trainer, *_ = loop(model, book, buffer, dump_dir=tmp_path, eos_ids=(9,))
+    seen = []
+
+    def step(model, batches, *, gate, **_):
+        seen.append(sorted(tmp_path.iterdir()))                      # written before the step trains
+        for g in (g for b in batches for g in b):
+            gate.admit(g.rollouts, [(N_TOK, N_TOK, N_TOK, N_TOK)] * len(g.rollouts))
+        gate.judge([])
+        return model
+
+    trainer._train_step = step
+    assert trainer.run_once() == "trained"
+    trainer.close()
+    assert seen == [[tmp_path / "step-4.pkl"]]                        # the checkpoint the step produces
+    dump = load_batch_dump(tmp_path / "step-4.pkl")
+    assert dump["version"] == 4 and dump["from_checkpoint"] == 3 and dump["eos_ids"] == (9,)
+    assert [g.lease_id for g in dump["groups"]] == ["b", "a"]
+    assert dump["uniforms"] == [[g.draw_uniforms(i) for i in range(ROLLOUTS)] for g in dump["groups"]]
+    with open(tmp_path / "step-4.pkl", "rb") as handle:
+        assert pickle.load(handle)["format"] == 1
+
+
+def test_no_dump_without_a_dump_dir(tmp_path, monkeypatch):
+    model, book = _Model(), Book(latest=3)
+    buffer = TrainingBuffer(book)
+    buffer.push(submitted(model, "a"))
+    trainer, *_ = loop(model, book, buffer, batch=1)
+    monkeypatch.chdir(tmp_path)
+    assert trainer.config.dump_dir is None
+    assert trainer.run_once() == "trained"
+    trainer.close()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_failed_dump_never_stops_training(tmp_path):
+    model, book = _Model(), Book(latest=3)
+    buffer = TrainingBuffer(book)
+    buffer.push(submitted(model, "a"))
+    blocker = tmp_path / "file"
+    blocker.write_text("not a directory")
+    trainer, *_ = loop(model, book, buffer, batch=1, dump_dir=blocker / "dumps")
+    assert trainer.run_once() == "trained"
+    trainer.close()
+
+
+@pytest.mark.parametrize("explicit", [None, 30.0])
+def test_the_audit_round_before_a_step_is_bounded_by_a_share_of_the_last_training(explicit):
+    """Audits run on the trainer's GPUs: before each step, ``max(audit_min_s, audit_share x the last step's train
+    seconds)`` (``audit_min_s`` before any step); an explicit ``audit_budget_s`` overrides the rule. Rounds while
+    waiting for a batch keep running as long as the wait lasts."""
+    model, book = _Model(), Book()
+    buffer = TrainingBuffer(book)
+    budgets = []
+
+    class Audits:
+        def run(self, m, *, limit, budget_s):
+            budgets.append(budget_s)
+            return 0
+
+        def metrics(self):
+            return {}
+
+    clock = Clock()
+    config = AsyncTrainerConfig(1, audit_min_s=60.0, audit_share=0.25,
+                                **({} if explicit is None else {"audit_budget_s": explicit}))
+    trainer = AsyncTrainer(model, config=config, buffer=buffer, submissions=Subs(buffer), book=book,
+                           publisher=Publisher(), clock=clock, sleep=clock.sleep, audits=Audits())
+    durations = iter([1000.0, 100.0, 10.0])
+
+    def step(model, batches, *, gate, **_):
+        clock.t += next(durations)
+        for g in (g for b in batches for g in b):
+            gate.admit(g.rollouts, [(N_TOK, N_TOK, N_TOK, N_TOK)] * len(g.rollouts))
+        gate.judge([])
+        return model
+
+    trainer._train_step = step
+    for i in range(3):
+        buffer.push(submitted(model, f"g{i}", k=book.latest_checkpoint))
+        assert trainer.run_once() == "trained"
+    trainer.close()
+    if explicit is None:
+        assert budgets == [60.0, 250.0, 60.0]           # no step yet; 25 % of 1000 s; 25 % of 100 s under the floor
+    else:
+        assert budgets == [explicit] * 3
+    with pytest.raises(ValueError):
+        AsyncTrainerConfig(1, audit_share=-0.1)

@@ -836,10 +836,16 @@ One branch carries the whole async RL work on top of current main.
   `seed_consistency_diagnostics` on each rollout's drawn rows; the FSDP2 `FusedLogprobHead(rows, audit=fn)`
   projects inside one module call, weight gathered once per micro-batch; `scripts/bench_trainer_audit.py` times it
   against the rollout-by-rollout reference `rollout_diagnostics`);
-  `broadcasting_audit` sends `AUDIT` so every rank runs the same forward. `AsyncTrainer` runs one round
-  (`audits_per_step`, 8; `audit_budget_s`, 120 s) before each step and more while a batch fills; metrics
-  `async/audits`, `async/audit_s`. Env: `RELIQUARY_RL_TRAINER_AUDITS` (0 off), `_AUDITS_PER_STEP`,
-  `_AUDIT_BUDGET_S`.
+  `broadcasting_audit` sends `AUDIT` so every rank runs the same forward. On the Miles gateway
+  (`gateway_audit`), `TrainerAudits` judges several groups per `forward` (consecutive groups up to
+  `max_rollouts_per_call` rollouts, default 64; one call per draw config, episodes apart), each group's verdict
+  the same as alone. `AsyncTrainer` runs one round (`audits_per_step`) before each step, its time budget
+  `max(audit_min_s, audit_share × the last step's train seconds)` (60 s, 0.25; `audit_min_s` before the first
+  step) unless a fixed `audit_budget_s` is set: the trainer's GPUs are the only GPUs of an RL-orders task (audit
+  source `trainer`), so audits add at most about a quarter to a step. Rounds repeat while a batch fills. Metrics
+  `async/audits`, `async/audit_s`, `async/audit_calls`, `async/audit_budget_s`. Env:
+  `RELIQUARY_RL_TRAINER_AUDITS` (0 off), `_AUDITS_PER_STEP`, `_AUDIT_MIN_S`, `_AUDIT_SHARE`,
+  `_AUDIT_BUDGET_S` (fixed override), `_AUDIT_ROLLOUTS_PER_CALL`.
 
 ### Remaining
 
@@ -1070,8 +1076,12 @@ task declared for period settlement refuses to start in window mode).
 - wandb (opt-in, `WANDB_API_KEY`; `WANDB_PROJECT` / `WANDB_ENTITY`): one run per process in the group
   `{validator hotkey[:8]}-{run}`. `...-trainer`: one row per step at `global_step_hint + steps` (monotonic across
   resumes) = `train_step`'s metrics + the gate's `async/*` + `async/wait_s`, `train_s`, `step_s`, `snapshot_s`,
-  `publish_wait_s`, completion tokens and tokens/s, peak GPU memory, the last publication (`publish_s`,
-  `delta_bytes`); a skipped step's rows ride on the next one. `...-controller` (`rl_metrics.controller_metrics`,
+  `publish_wait_s`, completion tokens and tokens/s, peak GPU memory (this process's: none under Miles), the last publication (`publish_s`,
+  `delta_bytes`); a skipped step's rows ride on the next one. Token counts: `async/rollouts`,
+  `async/prompt_tokens`, `async/tokens` (prompt + completion), `async/tokens_per_train_s`. Without W&B the
+  trainer's row goes to the log as one line, `telemetry step=<n> {compact JSON}`. Lab replay:
+  `RELIQUARY_RL_TRAINER_DUMP_DIR` pickles each batch (groups + uniforms) to `step-<version>.pkl` before it
+  trains (`async_trainer.load_batch_dump`). `...-controller` (`rl_metrics.controller_metrics`,
   every 60 s): price multiplier, ratio, supply, demand, trainer speed and wait per env, buffer per env and state, leases (open,
   closed in the minute by state, issued per env), arrived groups per env and verdict, events, audit verdicts and
   queue, pay accrued per kind, active and banned miners, mean quota cap.

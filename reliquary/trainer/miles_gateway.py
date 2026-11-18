@@ -8,7 +8,8 @@ with the trainer's health gate (``--tinker-grad-norm-skip``). The launcher is a 
 Settings: ``RELIQUARY_MILES_LAUNCHER``, ``RELIQUARY_MILES_MODEL_TYPE`` (Megatron model type, e.g. ``qwen3.5-9B``),
 ``RELIQUARY_MILES_OUTPUT_DIR`` (checkpoints and exports: the trainer reads the exports there), and
 ``RELIQUARY_MILES_TP`` (2), ``RELIQUARY_MILES_GPUS`` (8), ``RELIQUARY_MILES_PORT`` (10613),
-``RELIQUARY_MILES_READY_S`` (1800), ``RELIQUARY_MILES_EXTRA_ARGS`` (more gateway flags), ``RELIQUARY_MILES_PYTHON``
+``RELIQUARY_MILES_READY_S`` (1800), ``RELIQUARY_MILES_CHUNK`` (64: rollouts per ``forward_backward`` call, the
+trainer's side), ``RELIQUARY_MILES_EXTRA_ARGS`` (more gateway flags), ``RELIQUARY_MILES_PYTHON``
 (the gateway's interpreter: Miles, Megatron and the same ``reliquary`` as this trainer, checked at start).
 """
 from __future__ import annotations
@@ -49,6 +50,7 @@ def miles_settings(env: Mapping[str, str] = os.environ) -> dict:
             "output_dir": Path(required["RELIQUARY_MILES_OUTPUT_DIR"]),
             "tp": number("RELIQUARY_MILES_TP", 2), "gpus": number("RELIQUARY_MILES_GPUS", 8),
             "port": number("RELIQUARY_MILES_PORT", 10613), "ready_s": number("RELIQUARY_MILES_READY_S", 1800.0, float),
+            "chunk": number("RELIQUARY_MILES_CHUNK", 64),
             "extra_args": str(env.get("RELIQUARY_MILES_EXTRA_ARGS", "")).strip(),
             "python": str(env.get("RELIQUARY_MILES_PYTHON", "")).strip() or sys.executable}
 

@@ -367,6 +367,39 @@ def _peak_memory() -> dict[str, float]:
             "async/gpu_peak_reserved_gb": torch.cuda.max_memory_reserved() / 2**30}
 
 
+BATCH_DUMP_FORMAT = 1
+
+
+def dump_batch(folder: Path, *, version: int, from_checkpoint: int, groups: list[SubmittedGroup],
+               uniforms: list[list[list[float]]], eos_ids: tuple[int, ...]) -> Path:
+    """One step's batch as ``<folder>/step-<version>.pkl`` (``version``: the checkpoint the step produces): the
+    groups in batch order and the uniforms the step used, enough to train the same batch again under another
+    layout (a lab tool, ``RELIQUARY_RL_TRAINER_DUMP_DIR``). Written to a temporary name, then renamed."""
+    import pickle
+
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"step-{int(version)}.pkl"
+    partial = path.with_name(path.name + ".partial")
+    with open(partial, "wb") as handle:
+        pickle.dump({"format": BATCH_DUMP_FORMAT, "version": int(version), "from_checkpoint": int(from_checkpoint),
+                     "groups": list(groups), "uniforms": uniforms, "eos_ids": tuple(eos_ids)}, handle,
+                    protocol=pickle.HIGHEST_PROTOCOL)
+    partial.replace(path)
+    return path
+
+
+def load_batch_dump(path: Path) -> dict:
+    """A ``dump_batch`` file (trusted input only: it is a pickle)."""
+    import pickle
+
+    with open(path, "rb") as handle:
+        dump = pickle.load(handle)
+    if dump.get("format") != BATCH_DUMP_FORMAT:
+        raise ValueError(f"{path}: unknown batch dump format {dump.get('format')!r}")
+    return dump
+
+
 def save_snapshot(snapshot: Mapping[str, Any], folder: Path, *, lr_schedule_step: int | None) -> None:
     from reliquary.shared.ckpt_delta import write_anchor_shards
 
@@ -389,17 +422,22 @@ class AsyncTrainerConfig:
     max_attempts: int = 3                    # hand-outs of a group without a report before it is dropped untrained
     poll_s: float = 0.5                      # while the batch is not full
     audits_per_step: int = 8                 # out-of-zone audits judged before each step (``trainer.audits``)
-    audit_budget_s: float = 120.0            # their time budget per round; waiting for a batch runs more rounds
+    # The time budget of an audit round (``AsyncTrainer.audit_budget``): ``audit_budget_s`` when set, else
+    # max(``audit_min_s``, ``audit_share`` x the last step's train seconds). Waiting for a batch runs more rounds.
+    audit_budget_s: float | None = None
+    audit_min_s: float = 60.0
+    audit_share: float = 0.25
     prefetch: bool = False                   # take the next batch while this one trains (when enough is queued)
     report_workers: int = 1                  # report_training calls in flight at once
+    dump_dir: Path | None = None             # each batch written here before it trains (replay; None: off)
 
     def __post_init__(self) -> None:
         if self.batch_groups < 1 or (self.hf_backup_every or 1) < 1 or self.max_attempts < 1:
             raise ValueError("batch_groups, hf_backup_every and max_attempts must be positive")
         if self.report_workers < 1:
             raise ValueError("report_workers must be positive")
-        if self.audits_per_step < 0 or self.audit_budget_s < 0:
-            raise ValueError("audits_per_step and audit_budget_s must be non-negative")
+        if self.audits_per_step < 0 or (self.audit_budget_s or 0) < 0 or self.audit_min_s < 0 or self.audit_share < 0:
+            raise ValueError("audits_per_step, audit_budget_s, audit_min_s and audit_share must be non-negative")
         if self.steps_per_checkpoint != 1:
             # pi_old is the policy under the gate: a second step before publishing trains with ratio 1 (no clip,
             # no dual clip, no drift breaker) and verifies miners against weights they never saw.
@@ -438,6 +476,7 @@ class AsyncTrainer:
         self.published: list[int] = []
         self.last_step: dict = {}
         self.skipped = 0
+        self.last_train_s: float | None = None  # the last step's forward/backward seconds (the audit budget's base)
         self.last_publication: dict = {}
         self.version = book.latest_checkpoint
         if self.version is None:
@@ -530,11 +569,24 @@ class AsyncTrainer:
             if not self.run_audits():
                 self._sleep(self.config.poll_s)
 
+    def audit_budget(self) -> float:
+        """Seconds one audit round may take on the trainer's GPUs (the only GPUs of an RL-orders task: the
+        controller's audit source is the trainer). Bounded by the training it delays: ``max(audit_min_s,
+        audit_share x the last step's train seconds)``, ``audit_min_s`` before the first step;
+        ``audit_budget_s``, when set, overrides the rule. One round runs before each step, so audits add at most
+        about ``audit_share`` to a step; while the trainer waits for a full batch, rounds repeat until it is full
+        (idle GPUs: no bound on the total)."""
+        if self.config.audit_budget_s is not None:
+            return float(self.config.audit_budget_s)
+        if self.last_train_s is None:
+            return float(self.config.audit_min_s)
+        return max(float(self.config.audit_min_s), self.config.audit_share * self.last_train_s)
+
     def run_audits(self) -> int:
         """One round of out-of-zone audits on the current weights (none without ``audits``)."""
         if self.audits is None:
             return 0
-        return self.audits.run(self.model, limit=self.config.audits_per_step, budget_s=self.config.audit_budget_s)
+        return self.audits.run(self.model, limit=self.config.audits_per_step, budget_s=self.audit_budget())
 
     # --- prefetch ------------------------------------------------------------------------------------------
     def _start_prefetch(self) -> None:
@@ -586,6 +638,7 @@ class AsyncTrainer:
             dropped += len(stale)
             held = [g for g in held if g.checkpoint >= below]
         exhausted = self.drop_exhausted()
+        audit_budget = self.audit_budget()
         self.run_audits()                       # bounded: audits progress even when batches are always full
         submitted = self.assemble(held)
         started = self._clock()
@@ -596,6 +649,12 @@ class AsyncTrainer:
         uniforms = [self._uniforms.pop(g.lease_id) for g in submitted]
         self._uniforms.clear()          # dropped groups' (stale, released): never trained under these leases
         self._start_prefetch()
+        if self.config.dump_dir is not None:
+            try:
+                dump_batch(self.config.dump_dir, version=self.version + 1, from_checkpoint=self.version,
+                           groups=submitted, uniforms=uniforms, eos_ids=self.config.eos_ids)
+            except Exception:  # noqa: BLE001 - a lab aid: never the reason a step fails
+                logger.exception("batch dump into %s failed", self.config.dump_dir)
         for i, group in enumerate(submitted):
             batch.append(training_group(group, slot0=slot, index=i, uniforms=uniforms[i]))
             slot += len(group.completions)
@@ -617,6 +676,7 @@ class AsyncTrainer:
                                           window_index=self.steps + 1, global_step_hint=self.global_step_hint,
                                           gate=gate)
         except TrainingStepSkipped as exc:
+            self.last_train_s = self._clock() - started
             logger.warning("async train step skipped (%s): %d groups unpaid", exc.reason, len(submitted))
             self._report_untrained(submitted)
             self.skipped += 1           # its rows stay held and go out with the next trained step
@@ -653,13 +713,22 @@ class AsyncTrainer:
             self.backup.submit(self.steps, lambda folder, s=frozen, lr=lr_step:
                                self._backup_save(s, folder, lr_schedule_step=lr))
         completion = sum(len(c) for g in submitted for c in g.completions)
+        rollouts = sum(len(g.completions) for g in submitted)
+        prompt = sum(len(g.prompt_tokens) * len(g.completions) for g in submitted)
         worked = self._clock() - started
+        self.last_train_s = trained - started
         self.last_step = {"result": "trained", "step": self.steps, "checkpoint": self.version, **gate.metrics()}
-        audit_metrics = self.audits.metrics() if self.audits is not None else {}
+        audit_metrics = ({**self.audits.metrics(), "async/audit_budget_s": audit_budget}
+                         if self.audits is not None else {})
         telemetry.flush({**gate.metrics(), **timings, **self.last_publication, **audit_metrics,
                          "async/wait_s": started - began, "async/train_s": trained - started,
                          "async/step_s": worked, "async/completion_tokens": completion,
                          "async/completion_tokens_per_s": completion / worked if worked > 0 else 0.0,
+                         # every sequence token the step trained (prompt + completion), for throughput and MFU
+                         "async/rollouts": rollouts, "async/prompt_tokens": prompt,
+                         "async/tokens": prompt + completion,
+                         "async/tokens_per_train_s": (prompt + completion) / (trained - started)
+                         if trained > started else 0.0,
                          "async/steps_skipped_total": self.skipped, **_peak_memory()},
                         self.steps)
         return "trained"
@@ -698,5 +767,5 @@ class AsyncTrainer:
 
 __all__ = [
     "ASYNC_FORGERY_FLOOR", "ASYNC_GROUP_FLOOR", "ASYNC_ROLLOUT_FLOOR", "AsyncTrainer", "AsyncTrainerConfig", "DrawGate",
-    "rollout_rate", "save_snapshot", "training_group",
+    "dump_batch", "load_batch_dump", "rollout_rate", "save_snapshot", "training_group",
 ]
