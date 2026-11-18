@@ -208,8 +208,10 @@ def gateway_audit(client, *, eos_ids) -> Callable:
 
     ``audit(model, group)`` judges one group; ``audit.many(model, groups)`` judges several in one ``forward`` per
     draw config (single-turn groups together, episodes together: they take no final-EOS test), both submitted
-    before either is awaited. Each rollout's rows depend on its own datum only, so a group's verdict is the same
-    alone or batched; ``TrainerAudits`` decides how many groups share a call (``max_rollouts_per_call``)."""
+    before either is awaited. Each rollout's rows are computed from its own datum by the same per-rollout logic,
+    alone or batched; the numerics follow the gateway's packing as in the training forward (bf16 tiling can move a
+    boundary gap by a few ulps, well inside ``boundary_epsilon``), so do not expect bitwise equality across batch
+    shapes. ``TrainerAudits`` decides how many groups share a call (``max_rollouts_per_call``)."""
     from reliquary.environment.forced_sampling import DRAW_GUMBEL_MAX
     from reliquary.trainer.async_trainer import training_group
     from reliquary.trainer.miles_datums import _draw_positions, rollout_datum
@@ -250,11 +252,13 @@ def gateway_audit(client, *, eos_ids) -> Callable:
                     datums, "reliquary_gate", {**config, "terminal_check": 0} if episode else config)))
         found: list = [None] * len(groups)
         for members, future in pending:
-            outputs = iter(future.result().loss_fn_outputs)
+            outputs = list(future.result().loss_fn_outputs)
+            expected = sum(len(prepared[g][0]) for g in members)
+            if len(outputs) != expected:
+                raise RuntimeError(f"the gateway returned {len(outputs)} rows for {expected} rollouts")
+            rows = iter(outputs)
             for g in members:
-                found[g] = judge([diagnostics(r, next(outputs)) for r in prepared[g][0]])
-            if next(outputs, None) is not None:
-                raise RuntimeError("the gateway returned more rows than datums")
+                found[g] = judge([diagnostics(r, next(rows)) for r in prepared[g][0]])
         return found
 
     def audit(model, group):
@@ -299,7 +303,8 @@ class TrainerAudits:
     """Take audit jobs from ``source`` (``take_audits(limit)`` / ``report_audit(lease_id, result)``: the trainer
     link, or ``RlSubmissions`` in process) and judge them with ``audit_fn(model, group)``, or, when the audit
     function has ``many(model, groups)`` (the Miles gateway's), several groups per call: consecutive groups up to
-    ``max_rollouts_per_call`` rollouts, the budget checked between calls."""
+    ``max_rollouts_per_call`` rollouts, the budget checked between calls (a round can overrun ``budget_s`` by one
+    call, and always makes at least one: the budget is a soft cap that never starves the audits)."""
 
     def __init__(self, source, *, audit_fn: Callable = audit_group, clock: Callable[[], float] = time.monotonic,
                  max_rollouts_per_call: int = AUDIT_ROLLOUTS_PER_CALL) -> None:
@@ -351,10 +356,9 @@ class TrainerAudits:
             # concluded meanwhile (dropped as stale): nothing to report
 
     def metrics(self) -> dict[str, float]:
-        """Since the last call: audits judged, the seconds they took (and the forward calls, when batched)."""
-        out = {"async/audits": float(self.done), "async/audit_s": self.seconds}
-        if self.calls != self.done:
-            out["async/audit_calls"] = float(self.calls)
+        """Since the last call: audits judged, the seconds they took and the audit calls made (one per group
+        unless batched)."""
+        out = {"async/audits": float(self.done), "async/audit_s": self.seconds, "async/audit_calls": float(self.calls)}
         self.done, self.seconds, self.calls = 0, 0.0, 0
         return out
 

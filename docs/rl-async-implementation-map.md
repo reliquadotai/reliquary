@@ -843,7 +843,8 @@ One branch carries the whole async RL work on top of current main.
   `max(audit_min_s, audit_share × the last step's train seconds)` (60 s, 0.25; `audit_min_s` before the first
   step) unless a fixed `audit_budget_s` is set: the trainer's GPUs are the only GPUs of an RL-orders task (audit
   source `trainer`), so audits add at most about a quarter to a step. Rounds repeat while a batch fills. Metrics
-  `async/audits`, `async/audit_s`, `async/audit_calls`, `async/audit_budget_s`. Env:
+  `async/audits`, `async/audit_s`, `async/audit_calls`, `async/audit_budget_s` (a soft cap: a round can overrun it
+  by one call). Env:
   `RELIQUARY_RL_TRAINER_AUDITS` (0 off), `_AUDITS_PER_STEP`, `_AUDIT_MIN_S`, `_AUDIT_SHARE`,
   `_AUDIT_BUDGET_S` (fixed override), `_AUDIT_ROLLOUTS_PER_CALL`.
 
@@ -1080,8 +1081,9 @@ task declared for period settlement refuses to start in window mode).
   `delta_bytes`); a skipped step's rows ride on the next one. Token counts: `async/rollouts`,
   `async/prompt_tokens`, `async/tokens` (prompt + completion), `async/tokens_per_train_s`. Without W&B the
   trainer's row goes to the log as one line, `telemetry step=<n> {compact JSON}`. Lab replay:
-  `RELIQUARY_RL_TRAINER_DUMP_DIR` pickles each batch (groups + uniforms) to `step-<version>.pkl` before it
-  trains (`async_trainer.load_batch_dump`). `...-controller` (`rl_metrics.controller_metrics`,
+  `RELIQUARY_RL_TRAINER_DUMP_DIR` pickles each batch (groups + uniforms) to `step-<version>-try<k>.pkl` before
+  it trains (`async_trainer.load_batch_dump`), keeping the latest `RELIQUARY_RL_TRAINER_DUMP_KEEP` (4); its time
+  is `async/dump_s`, outside `train_s`; a failed dump is a warning. Put it on its own volume (GBs per step). `...-controller` (`rl_metrics.controller_metrics`,
   every 60 s): price multiplier, ratio, supply, demand, trainer speed and wait per env, buffer per env and state, leases (open,
   closed in the minute by state, issued per env), arrived groups per env and verdict, events, audit verdicts and
   queue, pay accrued per kind, active and banned miners, mean quota cap.

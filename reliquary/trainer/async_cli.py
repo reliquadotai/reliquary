@@ -19,6 +19,7 @@ and tokenizer; Hugging Face backups every ``RELIQUARY_RL_HF_BACKUP_EVERY`` steps
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -82,8 +83,8 @@ def _seconds(env: Mapping[str, str], name: str, default: float | None) -> float 
     if not raw:
         return default
     value = float(raw)
-    if value < 0:
-        raise ValueError(f"{name} must be non-negative")
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite non-negative number")
     return value
 
 
@@ -123,6 +124,7 @@ def async_trainer_settings(env: Mapping[str, str] = os.environ) -> dict[str, Any
         # lab replay: each batch pickled to <dir>/step-<version>.pkl before it trains (off when unset)
         "dump_dir": Path(str(env["RELIQUARY_RL_TRAINER_DUMP_DIR"]).strip())
         if str(env.get("RELIQUARY_RL_TRAINER_DUMP_DIR", "")).strip() else None,
+        "dump_keep": _int(env, "RELIQUARY_RL_TRAINER_DUMP_KEEP", 4),
         # the next batch is downloaded while this one trains; the step's reports go out in parallel
         "prefetch": str(env.get("RELIQUARY_RL_TRAINER_PREFETCH", "1")).strip() != "0",
         "report_workers": _int(env, "RELIQUARY_RL_TRAINER_REPORT_WORKERS", 16),
@@ -284,7 +286,7 @@ def run_async_train_worker() -> None:
             model_path = str(write_hf_dir(state, model_dir, state_dir / "resume" / "model"))
             del state
             logger.info("resuming from checkpoint %d", version)
-        settle_logging()                        # again: a module imported since may have met bittensor first
+        settle_logging()                        # cheap insurance: a later bittensor logging reset would mute us again
         load_kwargs = {}
         eos_ids = _eos_ids(model_path, load_kwargs)
 
@@ -351,7 +353,7 @@ def run_async_train_worker() -> None:
                                     audit_budget_s=settings["audit_budget_s"],
                                     audit_min_s=settings.get("audit_min_s", 60.0),
                                     audit_share=settings.get("audit_share", 0.25),
-                                    dump_dir=settings.get("dump_dir"),
+                                    dump_dir=settings.get("dump_dir"), dump_keep=settings.get("dump_keep", 4),
                                     prefetch=settings["prefetch"], report_workers=settings["report_workers"])
         link.requeue()                          # this trainer holds nothing yet
 

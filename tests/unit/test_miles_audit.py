@@ -148,3 +148,20 @@ def test_judging_groups_together_gives_each_group_its_own_verdict(monkeypatch):
     assert sorted(together.calls, key=lambda c: c[0]) == [
         (16, "reliquary_gate", {"eos_ids": "9", "terminal_check": 0}), (36, "reliquary_gate", {"eos_ids": "9"})]
     assert audit.many(None, []) == []
+
+
+def test_a_short_gateway_reply_is_a_clear_error(monkeypatch):
+    pytest.importorskip("tinker")
+    from reliquary.trainer.audits import gateway_audit
+    from reliquary.validator import verifier
+
+    monkeypatch.setattr(verifier, "draw_settings", lambda: SimpleNamespace(
+        draw=DRAW_GUMBEL_MAX, t=1.0, top_k=0, top_p=1.0, boundary_epsilon=0.02))
+
+    class Short(VaryingClient):
+        def forward(self, datums, loss_fn, config):
+            full = super().forward(datums, loss_fn, config).result().loss_fn_outputs
+            return SimpleNamespace(result=lambda: SimpleNamespace(loss_fn_outputs=full[:-1]))
+
+    with pytest.raises(RuntimeError, match="31 rows for 32 rollouts"):
+        gateway_audit(Short(1.0), eos_ids=(9,)).many(None, [_varied(0), _varied(1)])

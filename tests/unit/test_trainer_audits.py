@@ -83,8 +83,8 @@ def test_the_trainer_loop_takes_judges_and_reports_within_its_budget():
     audits = TrainerAudits(source, audit_fn=audit_fn, clock=lambda: t[0])
     assert audits.run(object(), limit=4, budget_s=25.0) == 3              # the 4th waits: 30 s spent > 25 s
     assert judged == ["L0", "L1", "L2"] and set(source.reported) == {"L0", "L2"}   # L1 concluded meanwhile
-    assert audits.metrics() == {"async/audits": 3.0, "async/audit_s": 30.0}
-    assert audits.metrics() == {"async/audits": 0.0, "async/audit_s": 0.0}
+    assert audits.metrics() == {"async/audits": 3.0, "async/audit_s": 30.0, "async/audit_calls": 3.0}
+    assert audits.metrics() == {"async/audits": 0.0, "async/audit_s": 0.0, "async/audit_calls": 0.0}
     assert audits.run(object(), limit=0, budget_s=25.0) == 0 and source.asked == [4]
 
 

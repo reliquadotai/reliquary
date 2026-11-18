@@ -368,24 +368,43 @@ def _peak_memory() -> dict[str, float]:
 
 
 BATCH_DUMP_FORMAT = 1
+BATCH_DUMP_KEEP = 4                     # dumps kept (``RELIQUARY_RL_TRAINER_DUMP_KEEP``): each can be GBs
 
 
-def dump_batch(folder: Path, *, version: int, from_checkpoint: int, groups: list[SubmittedGroup],
-               uniforms: list[list[list[float]]], eos_ids: tuple[int, ...]) -> Path:
-    """One step's batch as ``<folder>/step-<version>.pkl`` (``version``: the checkpoint the step produces): the
-    groups in batch order and the uniforms the step used, enough to train the same batch again under another
-    layout (a lab tool, ``RELIQUARY_RL_TRAINER_DUMP_DIR``). Written to a temporary name, then renamed."""
+def _dump_key(path: Path) -> tuple[int, int] | None:
+    """``(version, try)`` of a ``step-<version>-try<k>.pkl`` name, else None."""
+    import re
+
+    found = re.fullmatch(r"step-(\d+)-try(\d+)\.pkl", path.name)
+    return None if found is None else (int(found[1]), int(found[2]))
+
+
+def dump_batch(folder: Path, *, version: int, attempt: int, from_checkpoint: int, groups: list[SubmittedGroup],
+               uniforms: list[list[list[float]]], eos_ids: tuple[int, ...], keep: int = BATCH_DUMP_KEEP) -> Path:
+    """One step's batch as ``<folder>/step-<version>-try<attempt>.pkl`` (``version``: the checkpoint the step
+    produces; ``attempt``: the try at it, so a skipped or failed step's batch is not overwritten by the next one):
+    the groups in batch order and the uniforms the step used, enough to train the same batch again under another
+    layout (a lab tool, ``RELIQUARY_RL_TRAINER_DUMP_DIR``). Written to a temporary name, then renamed; a failed
+    write leaves no file. Only the ``keep`` latest dumps stay. Put the folder on its own volume: a dump is large,
+    and a disk it fills could be the one the checkpoints are exported to."""
     import pickle
 
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"step-{int(version)}.pkl"
+    path = folder / f"step-{int(version)}-try{int(attempt)}.pkl"
     partial = path.with_name(path.name + ".partial")
-    with open(partial, "wb") as handle:
-        pickle.dump({"format": BATCH_DUMP_FORMAT, "version": int(version), "from_checkpoint": int(from_checkpoint),
-                     "groups": list(groups), "uniforms": uniforms, "eos_ids": tuple(eos_ids)}, handle,
-                    protocol=pickle.HIGHEST_PROTOCOL)
-    partial.replace(path)
+    try:
+        with open(partial, "wb") as handle:
+            pickle.dump({"format": BATCH_DUMP_FORMAT, "version": int(version), "attempt": int(attempt),
+                         "from_checkpoint": int(from_checkpoint), "groups": list(groups), "uniforms": uniforms,
+                         "eos_ids": tuple(eos_ids)}, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        partial.replace(path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    dumps = sorted((key, p) for p in folder.iterdir() if (key := _dump_key(p)) is not None)
+    for _, old in dumps[:max(0, len(dumps) - max(1, int(keep)))]:
+        old.unlink(missing_ok=True)
     return path
 
 
@@ -430,12 +449,13 @@ class AsyncTrainerConfig:
     prefetch: bool = False                   # take the next batch while this one trains (when enough is queued)
     report_workers: int = 1                  # report_training calls in flight at once
     dump_dir: Path | None = None             # each batch written here before it trains (replay; None: off)
+    dump_keep: int = BATCH_DUMP_KEEP         # the latest dumps kept in ``dump_dir``
 
     def __post_init__(self) -> None:
         if self.batch_groups < 1 or (self.hf_backup_every or 1) < 1 or self.max_attempts < 1:
             raise ValueError("batch_groups, hf_backup_every and max_attempts must be positive")
-        if self.report_workers < 1:
-            raise ValueError("report_workers must be positive")
+        if self.report_workers < 1 or self.dump_keep < 1:
+            raise ValueError("report_workers and dump_keep must be positive")
         if self.audits_per_step < 0 or (self.audit_budget_s or 0) < 0 or self.audit_min_s < 0 or self.audit_share < 0:
             raise ValueError("audits_per_step, audit_budget_s, audit_min_s and audit_share must be non-negative")
         if self.steps_per_checkpoint != 1:
@@ -477,6 +497,7 @@ class AsyncTrainer:
         self.last_step: dict = {}
         self.skipped = 0
         self.last_train_s: float | None = None  # the last step's forward/backward seconds (the audit budget's base)
+        self._tries: tuple[int, int] = (-1, 0)  # (version, tries at it): the batch dump's name
         self.last_publication: dict = {}
         self.version = book.latest_checkpoint
         if self.version is None:
@@ -582,6 +603,23 @@ class AsyncTrainer:
             return float(self.config.audit_min_s)
         return max(float(self.config.audit_min_s), self.config.audit_share * self.last_train_s)
 
+    def _dump(self, submitted: list[SubmittedGroup], uniforms) -> float:
+        """The batch into ``dump_dir`` (off: 0 s); returns the seconds it took. A failed dump (disk full, an
+        unpicklable value) is a warning, never the reason a step fails."""
+        if self.config.dump_dir is None:
+            return 0.0
+        version = self.version + 1
+        tries = self._tries[1] + 1 if self._tries[0] == version else 1
+        self._tries = (version, tries)
+        at = self._clock()
+        try:
+            dump_batch(self.config.dump_dir, version=version, attempt=tries, from_checkpoint=self.version,
+                       groups=submitted, uniforms=uniforms, eos_ids=self.config.eos_ids, keep=self.config.dump_keep)
+        except Exception as exc:  # noqa: BLE001 - a lab aid: never the reason a step fails
+            logger.warning("batch dump into %s failed (%s: %s); training goes on", self.config.dump_dir,
+                           type(exc).__name__, exc)
+        return self._clock() - at
+
     def run_audits(self) -> int:
         """One round of out-of-zone audits on the current weights (none without ``audits``)."""
         if self.audits is None:
@@ -649,12 +687,8 @@ class AsyncTrainer:
         uniforms = [self._uniforms.pop(g.lease_id) for g in submitted]
         self._uniforms.clear()          # dropped groups' (stale, released): never trained under these leases
         self._start_prefetch()
-        if self.config.dump_dir is not None:
-            try:
-                dump_batch(self.config.dump_dir, version=self.version + 1, from_checkpoint=self.version,
-                           groups=submitted, uniforms=uniforms, eos_ids=self.config.eos_ids)
-            except Exception:  # noqa: BLE001 - a lab aid: never the reason a step fails
-                logger.exception("batch dump into %s failed", self.config.dump_dir)
+        dump_s = self._dump(submitted, uniforms)
+        started += dump_s               # the dump is not training: kept out of train_s and the audit budget
         for i, group in enumerate(submitted):
             batch.append(training_group(group, slot0=slot, index=i, uniforms=uniforms[i]))
             slot += len(group.completions)
@@ -723,6 +757,7 @@ class AsyncTrainer:
         telemetry.flush({**gate.metrics(), **timings, **self.last_publication, **audit_metrics,
                          "async/wait_s": started - began, "async/train_s": trained - started,
                          "async/step_s": worked, "async/completion_tokens": completion,
+                         **({"async/dump_s": dump_s} if self.config.dump_dir is not None else {}),
                          "async/completion_tokens_per_s": completion / worked if worked > 0 else 0.0,
                          # every sequence token the step trained (prompt + completion), for throughput and MFU
                          "async/rollouts": rollouts, "async/prompt_tokens": prompt,
