@@ -187,3 +187,29 @@ change leases, requeue training groups or alter grading and payment state.
 Source tests and an isolated runtime check do not establish live source coverage;
 verify the actual mounted route and both miners' distinct records before enabling
 a downstream collector.
+
+## Running one controller per training task
+
+`reliquary rl supervise --map <path> --ports 9100-9199 --state-dir <dir>` (unit: `docker/rl-supervisor.service`)
+reads the task registry every 15 s and keeps one async controller (`reliquary validate --no-set-weights`,
+loopback, no `--external-ip`) per active training task, with its own state directory `<state-dir>/<task>`, the
+task's profile and model, and no trainer listener; it logs to `<state-dir>/<task>.log`. It writes the map file
+that `reliquary rl front --map <path>` reads. The default task is `RELIQUARY_RL_DEFAULT_TASK` when it runs, else
+the one already chosen while its controller runs or restarts (bare paths answer 503 meanwhile), else the first
+training task the supervisor saw (`<state-dir>/task-order.json`). A retired task whose controller has written no
+spend summary for 24 h is logged as an error every hour. A retired task's controller keeps running until the admin's `final` for it is true, then gets
+SIGTERM (SIGKILL after 60 s). A dead controller restarts after 30 s, doubling up to 10 min. The supervisor needs
+the host's wallet and R2 environment, and the same registry and public-bucket access as the admin.
+
+A deploy that restarts the supervisor restarts every training controller (they are its children); the front
+answers connection refused for the few seconds a controller takes to start. A retired task whose bill is not yet
+final is restarted too, to settle its last period without leasing. A lock file in `--state-dir` keeps a second
+supervisor from running on the same directory.
+
+Operator-started async runs (`reliquary validate` with `RELIQUARY_RL_MODE=async` by hand) do not share a host with
+the front: run them on their own host and port.
+
+`reliquary rl front` believes `X-Forwarded-Proto` only from `--forwarded-allow-ips` (default `127.0.0.1`, the
+host's TLS terminator); trainer paths cross it only over HTTPS. A training order's pod reaches
+`/rl/<task>/trainer` there (`RELIQUARY_TASK_ID` and `RELIQUARY_RL_TRAINER_EXECUTOR_ID` set on the pod). Retiring
+the order revokes its pods.

@@ -163,10 +163,15 @@ def _validate_token_price(entry: TaskEntry) -> None:
     if len(declared) != len(MAX_PRICE_PARAMS):
         missing = sorted(set(MAX_PRICE_PARAMS) - set(declared))
         raise RegistryError(f"task {entry.task_id!r} price ceiling misses {', '.join(missing)}")
-    if (entry.mechanism != MECHANISM_CORPUS_GENERATION
+    # An async RL task takes a ceiling only as its auction's (``rl_auction``): its price multiplier has its own.
+    rl_auction = (entry.mechanism in (MECHANISM_RL_DISCOVERED_PRICE, MECHANISM_SERVICE_RL)
+                  and entry.params.get("pricing") == "auction")
+    if (not (entry.mechanism == MECHANISM_CORPUS_GENERATION or rl_auction)
             or entry.params.get("settlement") != SETTLEMENT_PERIOD_EMA):
-        raise RegistryError(f"task {entry.task_id!r}: a price ceiling applies to a corpus "
-                            f"task settled by period ({SETTLEMENT_PERIOD_EMA})")
+        raise RegistryError(f"task {entry.task_id!r}: a price ceiling applies to a corpus task, or an async RL "
+                            f"task priced by auction, settled by period ({SETTLEMENT_PERIOD_EMA})")
+    if rl_auction and any(f in entry.params for f in MAX_PRICE_INPUT_PARAMS):
+        raise RegistryError(f"task {entry.task_id!r}: an RL auction prices matched completion tokens only")
     price, alpha, emission, _ = (_number(entry.params[f], f) for f in MAX_PRICE_PARAMS)
     if price <= 0 or alpha <= 0 or emission <= 0:
         raise RegistryError(f"task {entry.task_id!r} price ceiling must be positive; "
@@ -206,20 +211,27 @@ def _validate_token_price(entry: TaskEntry) -> None:
 
 
 def _validate_pricing(entry: TaskEntry) -> None:
-    """A job priced by auction (``corpus.token_auction``): a corpus task settled by period, with a price ceiling."""
+    """A job priced by auction (``corpus.token_auction``): a corpus or async RL task settled by period, with a price
+    ceiling (an RL task: ``rl_auction``, one auction per env)."""
     from reliquary.corpus.token_auction import AUCTION_PARAMS, PRICING_PARAM, auction_params
+    from reliquary.validator.rl_auction import LAG_TARGET_PARAM, lag_target
 
-    declared = [f for f in AUCTION_PARAMS if f in entry.params]
+    declared = [f for f in (*AUCTION_PARAMS, LAG_TARGET_PARAM) if f in entry.params]
     if not declared:
         return
     if PRICING_PARAM not in entry.params:
         raise RegistryError(f"task {entry.task_id!r}: {', '.join(declared)} need {PRICING_PARAM}")
-    if (entry.mechanism != MECHANISM_CORPUS_GENERATION
+    rl = entry.mechanism in (MECHANISM_RL_DISCOVERED_PRICE, MECHANISM_SERVICE_RL)
+    if (not (rl or entry.mechanism == MECHANISM_CORPUS_GENERATION)
             or entry.params.get("settlement") != SETTLEMENT_PERIOD_EMA):
-        raise RegistryError(f"task {entry.task_id!r}: an auction prices a corpus task settled by period "
-                            f"({SETTLEMENT_PERIOD_EMA})")
+        raise RegistryError(f"task {entry.task_id!r}: an auction prices a corpus or async RL task settled by "
+                            f"period ({SETTLEMENT_PERIOD_EMA})")
+    if LAG_TARGET_PARAM in entry.params and not rl:
+        raise RegistryError(f"task {entry.task_id!r}: {LAG_TARGET_PARAM} applies to an RL task")
     try:
         auction_params(entry.params)
+        if rl:
+            lag_target(entry.params)
     except (TypeError, ValueError) as exc:
         raise RegistryError(f"task {entry.task_id!r}: {exc}") from exc
 

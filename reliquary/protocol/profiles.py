@@ -1546,6 +1546,21 @@ _PROFILE_VALUES = _PROFILE_VALUES + (
     ),
 )
 
+# The first API training run's test model (2026-11-17): v10's draw and envs on Qwen3.5-4B, the 9B's family (the same
+# Miles model code), single-turn envs capped at 16k so a step turns over in minutes on one rented box.
+_TEUTONIC_V10 = next(p for p in _PROFILE_VALUES if p.profile_id == "teutonic-9b-reliquary-suite-v10-gumbel-dev1")
+_PROFILE_VALUES = _PROFILE_VALUES + (
+    replace(
+        _TEUTONIC_V10,
+        profile_id="qwen35-4b-reliquary-suite-v10-gumbel-dev1",
+        model_id="Qwen/Qwen3.5-4B",
+        model_revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+        environments={
+            name: env if env.episode is not None else replace(env, max_new_tokens=min(env.max_new_tokens, 16384))
+            for name, env in _TEUTONIC_V10.environments.items()},
+    ),
+)
+
 PROFILES: Mapping[str, ProtocolProfile] = MappingProxyType(
     {profile.profile_id: profile for profile in _PROFILE_VALUES}
 )

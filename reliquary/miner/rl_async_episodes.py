@@ -528,7 +528,8 @@ def build_episode_generator(blocks: Mapping[str, Mapping[str, Any]], *, validato
                             generate_port: int = 8013, harness_env: Mapping[str, str] | None = None,
                             max_num_seqs: int = 64, gpu_memory_utilization: float | None = None,
                             deps=None, load_environment=None, suites: Sequence[str] = (),
-                            load_tokenizer=None, suite_environments=None) -> EpisodeLeaseGenerator:
+                            load_tokenizer=None, suite_environments=None,
+                            prefix: str | None = None) -> EpisodeLeaseGenerator:
     """The episode side of ``mine-async`` (the window ``build_episode_stack`` minus precommits and the TOPLOC
     prover): ``blocks``: the validator's ``GET /rl/episodes`` envs (``rl_async_episodes`` blocks, validated here
     again); one forced engine for every env (their caps must be equal: ``check_engine_caps``), started at the
@@ -537,7 +538,7 @@ def build_episode_generator(blocks: Mapping[str, Mapping[str, Any]], *, validato
     checked against the block's pin). ``suites``: the miner's replayed envs (``rl_suite_episodes``), played on the
     same engine (their caps must be the engine's too), their worlds built here (``suite_environments``: tests).
     ``deps``: ``episode_mining.EpisodeStackDeps`` (tests: fakes); ``load_tokenizer``: the replayed envs' tokenizer
-    (tests)."""
+    (tests). ``prefix``: the session routes' (``/rl/<task>`` on a task path; default the bare ``/rl``)."""
     from reliquary.miner.episode_mining import EpisodeStackDeps
     from reliquary.miner.forced_draw import ForcedDraws
     from reliquary.miner.rl_episode_client import RL_PREFIX, HttpRlEpisodes, LeaseEpisodeRunner, check_engine_caps
@@ -611,7 +612,8 @@ def build_episode_generator(blocks: Mapping[str, Mapping[str, Any]], *, validato
                              sampling=sampling, proof=None,          # no span proof on the async path
                              core_kwargs={"max_num_seqs": max_num_seqs,
                                           "gpu_memory_utilization": gpu_memory_utilization})
-    sessions = HttpRlEpisodes(deps.sync_http(validator_url), validator_hotkey=validator_hotkey, prefix=RL_PREFIX)
+    sessions = HttpRlEpisodes(deps.sync_http(validator_url), validator_hotkey=validator_hotkey,
+                              prefix=prefix or RL_PREFIX)
 
     def runner_factory(policy, lease, prompt, variant: int = 0, harness=None):
         return LeaseEpisodeRunner(policy=policy, lease=lease, hotkey=hotkey, prompt=prompt,
@@ -633,7 +635,7 @@ def build_episode_generator(blocks: Mapping[str, Mapping[str, Any]], *, validato
         policies=policies, runner_factory=runner_factory, engine=host, draws=draws, renderer_for=renderer_for,
         task_prompt=lambda env, idx: sources[env].prompt(int(idx)),
         load_weights=EpisodeWeights(host, base_model_dir=base_model_dir, work_dir=work_dir), suites=players)
-    generator.host, generator.sources, generator.blocks = host, sources, blocks
+    generator.host, generator.sources, generator.blocks, generator.sessions = host, sources, blocks, sessions
     return generator
 
 
