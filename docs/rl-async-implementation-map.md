@@ -1069,9 +1069,11 @@ task declared for period settlement refuses to start in window mode).
 - Trainer (`reliquary train-async`, `trainer/async_cli.py`): `RELIQUARY_RL_TRAINER_URL`, `_TOKEN`,
   `RELIQUARY_RL_VALIDATOR_HOTKEY`, `R2_PUBLIC_*`; mix, run and protocol profile from `/rl/trainer/config` (its
   `profile`: the controller's profile id and carried contract; a trainer started with no
-  `RELIQUARY_PROTOCOL_PROFILE` / `RELIQUARY_TASK_CONTRACT`, as a rented RL-orders pod is, adopts it and restarts
-  once before loading; an explicit one must match). Miles backend out of the box (`trainer/miles_gateway.py`):
-  every visible GPU, TP 2 (capped at the cards; cards divisible by TP), the Megatron model type from the model
+  `RELIQUARY_PROTOCOL_PROFILE` / `RELIQUARY_TASK_CONTRACT`, as a rented RL-orders pod is, checks it (a catalogue
+  profile, or a contract under that id), adopts it and restarts once before loading (`sys.orig_argv`); an explicit
+  one must match). Miles backend out of the box (`trainer/miles_gateway.py`):
+  every visible GPU (refused when they cannot be counted), TP by model size (0.8B/4B 2, 9B 4, 27B/35B-A3B 8; only
+  4B measured; a pod with fewer cards is refused with the minimum), the Megatron model type from the model
   name (Qwen3.5 0.8B/4B/9B/27B/35B-A3B), `--max-tokens-per-gpu 65536` with full recompute, chunk 256 (measured on
   Qwen3.5-4B, 2xH200: TP2 + full recompute at 64k ~3.9k tok/s/GPU; TP1 and selective recompute OOM at 64k; Tinker
   refuses context parallelism); any `RELIQUARY_MILES_*` set overrides. Fresh book = base model,

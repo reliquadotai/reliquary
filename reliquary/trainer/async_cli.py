@@ -208,10 +208,31 @@ PROFILE_ADOPTED_ENV = "RELIQUARY_RL_TRAINER_PROFILE_ADOPTED"
 
 
 def _restart(env: dict) -> None:
-    """This process again, same command, under ``env`` (a console script runs as ``python <script> args``)."""
+    """This process again, under ``env``: the same interpreter flags and command (``sys.orig_argv``: ``-m`` and
+    ``-u`` kept, as ``cli/main.py`` restarts under a served contract); buffered output flushed first."""
     import sys
 
-    os.execve(sys.executable, [sys.executable, *sys.argv], env)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execve(sys.executable, [sys.executable, *sys.orig_argv[1:]], env)
+
+
+def _check_controller_profile(profile_id: str, contract) -> None:
+    """SystemExit unless this trainer can run what the controller sends: a profile of its catalogue, or a contract
+    that parses under that id (checked here, so the error names the controller rather than an import traceback)."""
+    from reliquary.protocol.profiles import PROFILES, profile_from_contract
+
+    if contract is None:
+        if profile_id not in PROFILES:
+            raise SystemExit(f"the controller runs the protocol profile {profile_id!r}, unknown to this trainer's "
+                             f"reliquary (another version?)")
+        return
+    try:
+        carried = profile_from_contract(contract).profile_id
+    except (ValueError, TypeError, KeyError) as exc:
+        raise SystemExit(f"the controller's task contract does not parse here: {exc}") from exc
+    if carried != profile_id:
+        raise SystemExit(f"the controller's task contract is profile {carried!r}, it announces {profile_id!r}")
 
 
 def adopt_task_profile(task: Mapping[str, Any], environ: Mapping[str, str], *, active: str, state_dir: Path,
@@ -240,6 +261,7 @@ def adopt_task_profile(task: Mapping[str, Any], environ: Mapping[str, str], *, a
     if reexec is None:
         raise SystemExit(f"set RELIQUARY_PROTOCOL_PROFILE={profile_id} (or the task contract) on every rank: "
                          f"the controller runs it, this trainer runs {active!r}")
+    _check_controller_profile(profile_id, contract)
     env = {k: v for k, v in environ.items() if k not in ("RELIQUARY_PROTOCOL_PROFILE", TASK_CONTRACT_ENV_VAR)}
     env[PROFILE_ADOPTED_ENV] = "1"
     if contract is not None:

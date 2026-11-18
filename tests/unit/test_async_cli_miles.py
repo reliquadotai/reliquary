@@ -12,6 +12,7 @@ from reliquary.trainer.miles_gateway import GatewayProcess, gateway_command, mil
 
 ENV = {"RELIQUARY_MILES_LAUNCHER": "/opt/lab/serve_tinker_full.py", "RELIQUARY_MILES_MODEL_TYPE": "qwen3.5-9B",
        "RELIQUARY_MILES_OUTPUT_DIR": "/data/miles"}
+CARDS = {"RELIQUARY_MILES_GPUS": "8"}                   # settings never count the host's cards here
 
 
 def test_backend_accepts_miles():
@@ -23,11 +24,11 @@ def test_settings_require_launcher_model_type_and_output(missing):
     """The model type is required only when no model name gives it (``test_miles_defaults``)."""
     env = {k: v for k, v in ENV.items() if k != missing}
     with pytest.raises(ValueError, match=missing):
-        miles_settings(env)
+        miles_settings({**env, **CARDS})
 
 
 def test_settings_defaults_and_command():
-    settings = miles_settings(ENV, smi=lambda: "GPU 0: x\n" * 8)
+    settings = miles_settings({**ENV, "RELIQUARY_MILES_TP": "2"}, smi=lambda: "GPU 0: x\n" * 8)
     assert (settings["tp"], settings["gpus"], settings["port"]) == (2, 8, 10613)
     command = gateway_command("/ckpt/model", settings, base_model="org/policy", grad_norm_skip=100.0)
     assert command[:3] == [sys.executable, "/opt/lab/serve_tinker_full.py", "serve"]
@@ -71,7 +72,7 @@ def test_launch_cleans_up_first_and_refuses_a_taken_port(tmp_path, monkeypatch):
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen()
-    settings = {**miles_settings({**ENV, "RELIQUARY_MILES_OUTPUT_DIR": str(tmp_path)}),
+    settings = {**miles_settings({**ENV, **CARDS, "RELIQUARY_MILES_OUTPUT_DIR": str(tmp_path)}),
                 "port": listener.getsockname()[1]}
     with pytest.raises(RuntimeError, match="already in use"):
         miles_gateway.launch_gateway("/m", settings, base_model="b", grad_norm_skip=1.0, env={})
@@ -80,9 +81,10 @@ def test_launch_cleans_up_first_and_refuses_a_taken_port(tmp_path, monkeypatch):
 
 
 def test_settings_take_the_gateway_python():
-    assert miles_settings(ENV)["python"] == sys.executable
-    assert miles_settings({**ENV, "RELIQUARY_MILES_PYTHON": "/opt/miles/bin/python"})["python"] == "/opt/miles/bin/python"
-    command = gateway_command("/m", miles_settings({**ENV, "RELIQUARY_MILES_PYTHON": "/opt/py"}), base_model="b",
+    assert miles_settings({**ENV, **CARDS})["python"] == sys.executable
+    assert miles_settings({**ENV, **CARDS, "RELIQUARY_MILES_PYTHON": "/opt/miles/bin/python"})["python"] == \
+        "/opt/miles/bin/python"
+    command = gateway_command("/m", miles_settings({**ENV, **CARDS, "RELIQUARY_MILES_PYTHON": "/opt/py"}), base_model="b",
                               grad_norm_skip=1.0)
     assert command[0] == "/opt/py"
 

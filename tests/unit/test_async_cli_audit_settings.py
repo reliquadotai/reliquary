@@ -9,7 +9,7 @@ from reliquary.trainer.miles_gateway import miles_settings
 ENV = {"RELIQUARY_RL_TRAINER_URL": "http://c", "RELIQUARY_RL_TRAINER_TOKEN": "t",
        "RELIQUARY_RL_VALIDATOR_HOTKEY": "5Hot"}
 MILES = {"RELIQUARY_MILES_LAUNCHER": "/l.py", "RELIQUARY_MILES_MODEL_TYPE": "qwen3.5-4B",
-         "RELIQUARY_MILES_OUTPUT_DIR": "/o"}
+         "RELIQUARY_MILES_OUTPUT_DIR": "/o", "RELIQUARY_MILES_GPUS": "8"}             # never the host's cards
 
 
 def test_defaults_bound_the_audits_by_a_share_of_training_and_dump_nothing():

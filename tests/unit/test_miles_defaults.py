@@ -5,7 +5,7 @@ import logging
 import pytest
 
 from reliquary.trainer.miles_gateway import (
-    DEFAULT_CHUNK, DEFAULT_EXTRA_ARGS, miles_model_type, miles_settings, visible_gpu_count,
+    DEFAULT_CHUNK, DEFAULT_EXTRA_ARGS, DEFAULT_TP_BY_MODEL_TYPE, miles_model_type, miles_settings, visible_gpu_count,
 )
 
 IMAGE = {"RELIQUARY_MILES_LAUNCHER": "/root/miles/scripts/run_reliquary_tinker.py",
@@ -28,24 +28,34 @@ def test_a_platform_pod_needs_no_miles_variable(cards):
     assert settings["chunk"] == DEFAULT_CHUNK == 256
 
 
+def missing():
+    raise FileNotFoundError("nvidia-smi")
+
+
 def test_the_card_count_follows_cuda_visible_devices_first():
     assert visible_gpu_count({"CUDA_VISIBLE_DEVICES": "0,3,5"}, smi=smi(8)) == 3
+    assert visible_gpu_count({"CUDA_VISIBLE_DEVICES": "GPU-a,GPU-b"}, smi=smi(8)) == 2
     assert visible_gpu_count({"CUDA_VISIBLE_DEVICES": " "}, smi=smi(2)) == 2      # blank: ask nvidia-smi
     assert visible_gpu_count({}, smi=smi(4)) == 4
 
 
-def test_no_way_to_count_falls_back_to_eight_with_a_warning(caplog):
-    def missing():
-        raise FileNotFoundError("nvidia-smi")
+@pytest.mark.parametrize("value", ["-1", "-1,0", "NoDevFiles", "none"])
+def test_cuda_visible_devices_hiding_every_card_is_refused(value):
+    with pytest.raises(ValueError, match="no GPU"):
+        visible_gpu_count({"CUDA_VISIBLE_DEVICES": value}, smi=smi(8))
 
-    caplog.set_level(logging.WARNING, logger="reliquary.trainer.miles_gateway")
-    assert visible_gpu_count({}, smi=missing) == 8
-    assert visible_gpu_count({}, smi=lambda: "") == 8
-    assert sum("8" in r.getMessage() for r in caplog.records) == 2
+
+def test_without_nvidia_smi_the_device_files_are_counted():
+    assert visible_gpu_count({}, smi=missing, devices=lambda: ["/dev/nvidia0", "/dev/nvidia1"]) == 2
+    assert visible_gpu_count({}, smi=lambda: "", devices=lambda: ["/dev/nvidia3"]) == 1
+
+
+def test_no_way_to_count_refuses_to_start_instead_of_guessing():
+    with pytest.raises(ValueError, match="RELIQUARY_MILES_GPUS"):
+        visible_gpu_count({}, smi=missing, devices=lambda: [])
 
 
 def test_tensor_parallelism_fits_the_cards():
-    assert miles_settings({**POD, "RELIQUARY_MILES_GPUS": "1"}, smi=smi(8))["tp"] == 1      # default capped
     with pytest.raises(ValueError, match="divisible"):
         miles_settings({**POD, "RELIQUARY_MILES_GPUS": "6", "RELIQUARY_MILES_TP": "4"})
     with pytest.raises(ValueError, match="divisible"):
@@ -53,6 +63,28 @@ def test_tensor_parallelism_fits_the_cards():
     with pytest.raises(ValueError, match="RELIQUARY_MILES_TP"):
         miles_settings({**POD, "RELIQUARY_MILES_TP": "4"}, smi=smi(2))                      # explicit, over the cards
     assert miles_settings({**POD, "RELIQUARY_MILES_TP": "4"}, smi=smi(8))["tp"] == 4
+    assert miles_settings({**POD, "RELIQUARY_MILES_TP": "1"}, smi=smi(1))["tp"] == 1      # explicit: the operator's
+
+
+@pytest.mark.parametrize("model,cards,tp", [("Qwen/Qwen3.5-4B", 2, 2), ("Qwen/Qwen3.5-4B", 8, 2),
+                                            ("Qwen/Qwen3.5-0.8B", 2, 2), ("Qwen/Qwen3.5-9B", 4, 4),
+                                            ("Qwen/Qwen3.5-9B", 8, 4), ("Qwen/Qwen3.5-27B", 8, 8),
+                                            ("Qwen/Qwen3.5-35B-A3B", 8, 8)])
+def test_the_default_tensor_parallelism_follows_the_model_size(model, cards, tp):
+    assert miles_settings({**IMAGE, "RELIQUARY_RL_BASE_MODEL": model}, smi=smi(cards))["tp"] == tp
+
+
+@pytest.mark.parametrize("model,cards,minimum", [("Qwen/Qwen3.5-4B", 1, 2), ("Qwen/Qwen3.5-9B", 2, 4),
+                                                 ("Qwen/Qwen3.5-27B", 4, 8)])
+def test_a_pod_smaller_than_the_models_layout_is_refused_with_the_minimum(model, cards, minimum):
+    with pytest.raises(ValueError, match=f"at least {minimum} GPUs"):
+        miles_settings({**IMAGE, "RELIQUARY_RL_BASE_MODEL": model}, smi=smi(cards))
+
+
+def test_every_shipped_model_type_has_a_default_layout():
+    from reliquary.trainer.miles_gateway import MILES_MODEL_TYPES
+
+    assert set(DEFAULT_TP_BY_MODEL_TYPE) == set(MILES_MODEL_TYPES.values())
 
 
 @pytest.mark.parametrize("model,kind", [
@@ -64,10 +96,10 @@ def test_the_megatron_model_type_comes_from_the_model_name(model, kind):
 
 
 def test_the_model_type_reads_the_base_model_then_the_order_model_and_an_explicit_value_wins():
-    assert miles_settings({**IMAGE, "RELIQUARY_MODEL": "Qwen/Qwen3.5-9B@x"}, smi=smi(2))["model_type"] == "qwen3.5-9B"
-    assert miles_settings(IMAGE, smi=smi(2), base_model="Qwen/Qwen3.5-9B")["model_type"] == "qwen3.5-9B"
+    assert miles_settings({**IMAGE, "RELIQUARY_MODEL": "Qwen/Qwen3.5-9B@x"}, smi=smi(4))["model_type"] == "qwen3.5-9B"
+    assert miles_settings(IMAGE, smi=smi(4), base_model="Qwen/Qwen3.5-9B")["model_type"] == "qwen3.5-9B"
     explicit = {**POD, "RELIQUARY_MILES_MODEL_TYPE": "qwen3.5-9B"}
-    assert miles_settings(explicit, smi=smi(2))["model_type"] == "qwen3.5-9B"
+    assert miles_settings(explicit, smi=smi(4))["model_type"] == "qwen3.5-9B"
 
 
 @pytest.mark.parametrize("model", ["Qwen/Qwen3.5-2B", "meta-llama/Llama-3-8B", None])
