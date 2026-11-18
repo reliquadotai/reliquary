@@ -12,6 +12,8 @@ import pytest
 from reliquary.protocol.profiles import PROFILES, SamplingProfile, profile_from_contract
 
 GUMBEL = "teutonic-9b-reliquary-suite-v10-gumbel-dev1"
+API_TRAINING = ("qwen35-4b-reliquary-suite-v10-gumbel-dev1", "qwen35-9b-reliquary-suite-v10-gumbel-dev1",
+                "qwen38-27b-reliquary-suite-v10-gumbel-dev1")
 V9 = "teutonic-9b-reliquary-suite-v9-dev1"
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -22,7 +24,7 @@ def test_sampling_defaults_are_the_inverse_cdf_on_the_model_head():
     assert sampling.lm_head_fp32 is False
 
 
-@pytest.mark.parametrize("profile_id", sorted(set(PROFILES) - {GUMBEL, "qwen35-4b-reliquary-suite-v10-gumbel-dev1"}))
+@pytest.mark.parametrize("profile_id", sorted(set(PROFILES) - {GUMBEL, *API_TRAINING}))
 def test_earlier_profiles_keep_the_inverse_cdf_and_omit_the_fields(profile_id):
     profile = PROFILES[profile_id]
     assert profile.sampling.draw == "inverse_cdf" and profile.sampling.lm_head_fp32 is False
@@ -110,3 +112,21 @@ def test_constants_follow_the_active_profile():
                                         "domain": "reliquary-forced-seed-v10"}
     assert _constants_under(V9) == {"draw": "inverse_cdf", "fp32": False,
                                     "domain": "reliquary-forced-seed-v9"}
+
+
+@pytest.mark.parametrize("profile_id", API_TRAINING[1:])
+def test_the_api_training_profiles_differ_from_the_4b_by_their_model_only(profile_id):
+    base, profile = PROFILES[API_TRAINING[0]], PROFILES[profile_id]
+    assert profile.sampling.draw == "gumbel_max" and profile.protocol_version == 10
+    assert replace(profile, profile_id=base.profile_id, model_id=base.model_id,
+                   model_revision=base.model_revision) == base
+    assert len(profile.model_revision) == 40
+
+
+def test_the_api_training_profiles_pin_their_models():
+    assert {p: (PROFILES[p].model_id, PROFILES[p].model_revision) for p in API_TRAINING} == {
+        "qwen35-4b-reliquary-suite-v10-gumbel-dev1": ("Qwen/Qwen3.5-4B", "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"),
+        "qwen35-9b-reliquary-suite-v10-gumbel-dev1": ("Qwen/Qwen3.5-9B", "c202236235762e1c871ad0ccb60c8ee5ba337b9a"),
+        "qwen38-27b-reliquary-suite-v10-gumbel-dev1": ("Qwen/Qwen3.8-27B",
+                                                        "37561816e66b5b9153b1b64c10968c18c1e6f4a0"),
+    }
