@@ -15,7 +15,7 @@ price multiplier (``rl_price``) and the per-hotkey quota (``rl_lease_quota``):
 * **A training order's limits** (``training_order``: ``deadline_at``, ``max_steps``, ``max_tokens``): once the
   deadline passes, the latest checkpoint reaches ``max_steps`` or consumed work covers ``max_tokens`` matched
   tokens, every env's budget is 0 and no lease goes out. Already issued leases and buffered work may still drain;
-  admission closure is not final usage or trainer shutdown proof.
+  admission closure is not final usage or trainer shutdown proof. A retired task stops issuing leases as well.
 * **A lease not delivered** (expired, forfeited, refused for integrity) charges its price times the env's mean
   matched tokens per trained group, taken from the holder's next accruals on the env. Our failures charge nothing.
 """
@@ -101,6 +101,7 @@ class RlAuctions:
         self.clock = clock
         self.limits: dict[str, float] = {}       # a training order's (``from_params``); none: never stops
         self.admission: Callable[[], str | None] | None = None
+        self.retired = False                     # the task's registry entry is retired (``retire``)
         self.auctions: dict[str, TokenAuction] = {
             env: TokenAuction(params, clock=clock, mean_tokens=mean_tokens,
                               holdings=lambda env=env: self._holdings(env),
@@ -168,13 +169,17 @@ class RlAuctions:
             row = db.execute("SELECT SUM(budget_tokens) FROM rl_accruals").fetchone()
         return float(row[0] or 0.0)
 
+    def retire(self) -> None:
+        """The task is retired (e.g. its order cancelled): no lease goes out any more."""
+        self.retired = True
+
     def stopped(self) -> str | None:
-        """Which of the training order's limits is reached (None: none, or no order)."""
-        if self.admission is not None and (reason := self.admission()) is not None:
-            return reason
+        """A retirement, a reached order limit, or an admission fence preventing new leases."""
+        if self.retired:
+            return "retired"
         limits = self.limits
         if not limits:
-            return None
+            return self.admission() if self.admission is not None else None
         if self._book is not None:
             with self._book.lock:
                 row = self._book.db.execute("SELECT value FROM rl_lease_meta WHERE key='training_limit_stop'").fetchone()
@@ -203,6 +208,8 @@ class RlAuctions:
             with self._book.transaction():
                 self._book.db.execute("INSERT OR IGNORE INTO rl_lease_meta(key,value) VALUES('training_limit_stop',?)",
                                       (reason,))
+        if reason is None and self.admission is not None:
+            return self.admission()
         return reason
 
     def budget(self, env: str) -> int:

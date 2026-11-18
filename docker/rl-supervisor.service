@@ -1,0 +1,18 @@
+# systemd unit for the RL controller supervisor (runs beside the admin and the RL front on the validator host).
+[Unit]
+Description=Reliquary RL controller supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=reliquary
+EnvironmentFile=/etc/reliquary/validator.env
+ExecStart=/usr/local/bin/reliquary rl supervise --map /var/lib/reliquary/rl-map.json --ports 9100-9199 --state-dir /var/lib/reliquary/rl-controllers
+Restart=always
+RestartSec=10
+# Controllers are children: stop the supervisor and they get SIGTERM with it.
+KillMode=control-group
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

@@ -11,7 +11,9 @@ ownership, not a real GPU training run.
 
 1. A new declaration pins `quote_id`, opaque `quote_sha256` and the versioned `billing_basis` in
    its immutable order digest. Missing new fields preserve legacy replay hashes; legacy declarations
-   cannot acquire automatic billing terms retroactively.
+   cannot acquire automatic billing terms retroactively. The public front's controller supervisor
+   only starts declarations without these quote bindings. A bound declaration needs its own
+   operator-owned controller, trainer, and independently qualified miner ingress.
 2. The supervisor verifies the immutable local model, exact task/profile/order/run, private
    credentials, unused checkpoint namespace and Linux cgroup allocation before launching fixed commands.
    Admission stays closed until the initialized trainer has published its initial checkpoint and

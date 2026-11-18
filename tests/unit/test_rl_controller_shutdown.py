@@ -24,7 +24,8 @@ def drained_snapshot():
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="requires POSIX signal replay and exit statuses")
-@pytest.mark.parametrize("mode", ["drained", "undrained", "cleanup_failure", "snapshot_failure", "premature", "sigint", "legacy"])
+@pytest.mark.parametrize("mode", ["drained", "undrained", "cleanup_failure", "worker_failure", "snapshot_failure",
+                                  "premature", "sigint", "legacy"])
 def test_actual_uvicorn_replay_only_finishes_managed_drained_cleanup_successfully(mode):
     script = textwrap.dedent("""
         import asyncio
@@ -62,6 +63,8 @@ def test_actual_uvicorn_replay_only_finishes_managed_drained_cleanup_successfull
                 await asyncio.Future()
             finally:
                 print("background_joined", flush=True)
+                if mode == "worker_failure":
+                    raise RuntimeError("background cleanup failed")
         async def cleanup():
             if shutdown is not None:
                 shutdown.capture_drain()
@@ -76,7 +79,8 @@ def test_actual_uvicorn_replay_only_finishes_managed_drained_cleanup_successfull
                 if mode == "premature":
                     print("premature_signal", flush=True)
                     signal.raise_signal(signal.SIGTERM)
-                await _run_corpus_services(server, [worker()], cleanup=cleanup)
+                await _run_corpus_services(server, [worker()], cleanup=cleanup,
+                                           check_worker_shutdown=shutdown is not None)
             print("normal_return", flush=True)
         asyncio.run(main())
     """)
@@ -98,6 +102,8 @@ def test_actual_uvicorn_replay_only_finishes_managed_drained_cleanup_successfull
             assert markers[:4] == ["http_shutdown_finished", "background_joined", "drain_checked", "book_closed"]
         if mode != "sigint":
             assert "normal_return" not in markers
+        if mode == "worker_failure":
+            assert "cleanup_finished" in markers and "background cleanup failed" in result.stderr
 
 
 def test_managed_signal_scope_restores_handler_and_does_not_reuse_cleanup_proof():
@@ -174,10 +180,12 @@ def test_managed_controller_never_marks_failed_sandbox_cleanup_successful(monkey
 
     settings = SimpleNamespace(task_id="order-train-test", run="test", targets={"math": 1.0}, episodes={},
                                max_pending_groups=1, lane_reserves=dict)
-    rl = SimpleNamespace(sandbox=Sandbox(), book=SimpleNamespace(latest_checkpoint=0, auctions=SimpleNamespace()),
+    rl = SimpleNamespace(sandbox=Sandbox(), public_put=object(), book=SimpleNamespace(latest_checkpoint=0, auctions=SimpleNamespace()),
                          submissions=SimpleNamespace(grader=SimpleNamespace(scorer=SimpleNamespace(
                              close=lambda: calls.append("scorer_close")))), close=lambda: calls.append("book_close"))
-    server = SimpleNamespace(app=object(), mount_rl_lease_router=lambda *a: None, _monitor_process_health=idle)
+    from fastapi import FastAPI
+
+    server = SimpleNamespace(app=FastAPI(), mount_rl_lease_router=lambda *a: None, _monitor_process_health=idle)
     monkeypatch.delenv(service.TRAINER_TOKEN_ENV, raising=False)
     monkeypatch.setattr(service, "rl_async_settings", lambda *a, **kw: settings)
     monkeypatch.setattr(service, "load_episode_environments", lambda *a: {})
@@ -203,7 +211,7 @@ def test_managed_controller_never_marks_failed_sandbox_cleanup_successful(monkey
         await service.run_rl_async_validator(
             wallet=SimpleNamespace(hotkey=SimpleNamespace(ss58_address="test-hotkey")), netuid=1,
             signer_client=None, http_host="127.0.0.1", http_port=8000,
-            entry=SimpleNamespace(params={"training_order": {}}), cap=.1, checkpoint="test-model", registration_gate=False)
+            entry=SimpleNamespace(status="active", params={"training_order": {}}), cap=.1, checkpoint="test-model", registration_gate=False)
 
     original = signal.getsignal(signal.SIGTERM)
     if managed:
@@ -213,5 +221,10 @@ def test_managed_controller_never_marks_failed_sandbox_cleanup_successful(monkey
     else:
         asyncio.run(run())
         assert guards == []
+    from fastapi.testclient import TestClient
+
+    with TestClient(server.app) as client:
+        assert client.get("/rl/trainer/config").status_code == (404 if managed else 401)
+        assert client.get("/rl/trainer/runtime").status_code == 404
     assert calls == ["sandbox_stop", "publisher_close", "scorer_close", "book_close", "telemetry_finish"]
     assert signal.getsignal(signal.SIGTERM) == original

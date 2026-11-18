@@ -22,10 +22,10 @@ def test_async_serving_refreshes_readiness_and_awaits_monitor_shutdown(
     real_server = server_module.ValidatorServer
     settings = SimpleNamespace(task_id="async-test", run="test", targets={"math": 1.0},
                                episodes={}, max_pending_groups=1, lane_reserves=dict)
-    rl = SimpleNamespace(sandbox=None, book=SimpleNamespace(latest_checkpoint=None, auctions=SimpleNamespace()),
+    rl = SimpleNamespace(sandbox=None, public_put=object(), book=SimpleNamespace(latest_checkpoint=None, auctions=SimpleNamespace()),
                          submissions=SimpleNamespace(grader=SimpleNamespace()),
                          close=lambda: closed.append("rl"))
-    entry = SimpleNamespace(params={"training_order": {}} if training_order else {})
+    entry = SimpleNamespace(status="active", params={"training_order": {}} if training_order else {})
     gates = []
 
     class TrainingAdmission:
@@ -117,3 +117,18 @@ def test_async_serving_refreshes_readiness_and_awaits_monitor_shutdown(
     if training_order:
         assert gates[0].refreshed and gates[0].started and gates[0].stopped
         assert rl.book.auctions.admission == gates[0].reason
+
+
+@pytest.mark.parametrize("pins", [{}, {"RELIQUARY_RL_RUNTIME_ID": "c" * 32}, {"RELIQUARY_RL_ORDER_SHA256": "d" * 64}])
+def test_quote_bound_orders_require_the_local_supervisor_before_opening_state(monkeypatch, pins):
+    from reliquary.validator import rl_async_service
+
+    for key in ("RELIQUARY_RL_RUNTIME_ID", "RELIQUARY_RL_ORDER_SHA256"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in pins.items():
+        monkeypatch.setenv(key, value)
+    entry = SimpleNamespace(params={"training_order": {"quote_id": "q1"}})
+    monkeypatch.setattr(rl_async_service, "rl_async_settings", lambda *_: pytest.fail("validator startup"))
+    with pytest.raises(ValueError, match="requires its supervised local runtime"):
+        asyncio.run(rl_async_service.run_rl_async_validator(wallet=None, netuid=1, signer_client=None,
+                    http_host="127.0.0.1", http_port=8000, entry=entry, cap=.1, checkpoint="local"))

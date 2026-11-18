@@ -433,3 +433,90 @@ def test_a_forfeit_for_a_sandbox_failure_is_released_only_on_the_validators_evid
     released = forfeit(leases[1]["lease_id"])
     assert released.status_code == 200 and released.json()["state"] == "released"
     assert released.json()["quota"] == before and served.in_use(MINER.ss58_address) == 0
+
+
+# --- task paths: a signature binds the task it was made for --------------------------------------------------
+def task_controller(tmp_path, task_id):
+    from reliquary.validator.rl_submit import GroupGrader, RlSubmissions
+    from tests.unit.test_rl_submit import ENV as MATH, MathEnv, Tokenizer
+
+    book = LeaseBook(tmp_path / f"{task_id}.sqlite3", LeaseBookConfig(expiry_s={MATH: 600.0}, prompt_range={MATH: (0, 50)}),
+                     quota=QuotaController(QuotaConfig(initial=4)), clock=lambda: float(NOW))
+    book.adopt_checkpoint(0)
+    subs = RlSubmissions(book, GroupGrader({MATH: MathEnv()}, Tokenizer(), eos_token_ids=(1,)),
+                         clock=lambda: float(NOW), rng=random.Random(0))
+    app = FastAPI()
+    app.include_router(build_rl_lease_router(book=book, collector=LeaseCollector(book, interval_s=0.0),
+                                             validator_hotkey=VALIDATOR.ss58_address, clock=lambda: float(NOW),
+                                             submissions=subs, task_id=task_id))
+    return book, app
+
+
+def front_for(tmp_path, apps, default):
+    import json
+
+    import httpx
+
+    from reliquary.validator.rl_front import build_front_app
+
+    ports = {task: 8001 + i for i, task in enumerate(sorted(apps))}
+    spec = tmp_path / "map.json"
+    spec.write_text(json.dumps({"default": default, "tasks": {t: {"port": p} for t, p in ports.items()}}))
+    by_port = {p: apps[t] for t, p in ports.items()}
+    return build_front_app(spec, client_factory=lambda port: httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=by_port[port])))
+
+
+def test_a_signature_for_one_task_is_refused_on_another(tmp_path):
+    from tests.unit.test_rl_submit import ENV as MATH
+
+    _, app_b = task_controller(tmp_path, "b")
+    direct = TestClient(app_b)
+    signed_for_a = body(env=MATH, path="/rl/a/lease")
+    wrong = direct.post("/rl/lease", json=signed_for_a, headers={"X-Forwarded-Prefix": "/rl/a"})
+    assert wrong.status_code == 403 and wrong.json()["reason"] == "wrong_task"
+    replayed = direct.post("/rl/lease", json=signed_for_a, headers={"X-Forwarded-Prefix": "/rl/b"})
+    assert replayed.status_code == 403 and replayed.json()["reason"] == "bad_signature"
+    assert direct.post("/rl/lease", json=signed_for_a).json()["reason"] == "bad_signature"   # bare: /rl/lease
+    own = direct.post("/rl/lease", json=body(env=MATH, path="/rl/b/lease"), headers={"X-Forwarded-Prefix": "/rl/b"})
+    assert own.status_code == 200 and len(own.json()["leases"]) == 2
+    # a controller that knows no task id takes no task path
+    plain = TestClient(client_for(LeaseBook(tmp_path / "p.sqlite3", LeaseBookConfig(expiry_s={ENV: 600.0}),
+                                            quota=QuotaController(QuotaConfig(initial=4)),
+                                            clock=lambda: float(NOW))).app)
+    assert plain.post("/rl/lease", json=body(path="/rl/b/lease", at=NOW + 1),
+                      headers={"X-Forwarded-Prefix": "/rl/b"}).json()["reason"] == "wrong_task"
+
+
+async def test_task_path_and_bare_miners_lease_submit_and_forfeit_through_the_front(tmp_path):
+    import httpx
+
+    from reliquary.miner.rl_async import HeldLease, HttpRlTransport, encode_submission
+    from tests.unit.test_rl_submit import ENV as MATH, group
+
+    book_a, app_a = task_controller(tmp_path, "a")
+    book_b, app_b = task_controller(tmp_path, "b")
+    front = front_for(tmp_path, {"a": app_a, "b": app_b}, default="b")
+
+    def transport_for(client, prefix):
+        return HttpRlTransport(client, base_url="http://v", hotkey=MINER.ss58_address,
+                               validator_hotkey=VALIDATOR.ss58_address, prefix=prefix, clock=lambda: float(NOW),
+                               sign_binding=lambda binding: MINER.sign(binding).hex())
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=front), base_url="http://v") as client:
+        on_a = transport_for(client, "/rl/a")
+        answer = await on_a.lease(MATH, 0, [1, 2])
+        held = [HeldLease.from_wire(item) for item in answer["leases"]]
+        assert len(held) == 2 and book_a.in_use(MINER.ss58_address) == 2 and book_b.in_use(MINER.ss58_address) == 0
+        assert {x["lease_id"] for x in (await on_a.my_leases())["leases"]} == {h.lease_id for h in held}
+        rollouts = [list(r.tokens) for r in group(8)]
+        graded = await on_a.submit(encode_submission(held[0], rollouts, 0))
+        assert graded["verdict"] == "in_zone" and book_a.lease(held[0].lease_id).state == "submitted"
+        assert (await on_a.forfeit(held[1].lease_id))["state"] == "expired"
+        # the same hotkey signing for task a cannot reach b's book through b's path
+        signed_for_a = body(env=MATH, prompts=(3,), at=NOW + 1, path="/rl/a/lease")
+        crossed = await client.post("/rl/b/lease", json=signed_for_a)
+        assert crossed.status_code == 403 and crossed.json()["reason"] == "bad_signature"
+        assert book_b.in_use(MINER.ss58_address) == 0
+        bare = transport_for(client, "/rl")                         # an older miner: the default task
+        assert len((await bare.lease(MATH, 0, [4]))["leases"]) == 1 and book_b.in_use(MINER.ss58_address) == 1

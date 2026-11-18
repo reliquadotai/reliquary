@@ -44,11 +44,15 @@ def _digest(value) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
+def _private_regular_file(info: os.stat_result) -> bool:
+    return stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_mode & 0o077 == 0
+
+
 def _private_bytes(path: Path, limit: int = 65536) -> bytes:
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    # A FIFO can block on open before fstat gets a chance to reject it.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        if not _private_regular_file(os.fstat(fd)):
             raise ValueError("operator files must be regular, owned by this user and private")
         with os.fdopen(fd, "rb", closefd=False) as stream:
             data = stream.read(limit + 1)
@@ -518,13 +522,15 @@ def run_supervisor(config: SupervisorConfig, *, load_entry, finalize=None, backe
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     if state.is_symlink() or state.stat().st_uid != os.geteuid() or state.stat().st_mode & 0o077:
         raise ValueError("runtime state directory must be owned and private")
-    lock_fd = os.open(state / "supervisor.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    lock_fd = os.open(state / "supervisor.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     client = None
     handles = []
     backend = None
     journal = None
     cleanup_attempted = False
     try:
+        if not _private_regular_file(os.fstat(lock_fd)):
+            raise ReconciliationRequired("supervisor lock must be a private regular file owned by this user")
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         journal_path = state / "journal.json"
         if journal_path.exists() or journal_path.is_symlink():

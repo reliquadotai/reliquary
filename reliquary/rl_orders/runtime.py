@@ -9,6 +9,11 @@ import time
 from collections.abc import Mapping
 
 
+def requires_owned_training_runtime(order: object) -> bool:
+    """Quote-bound declarations belong exclusively to the operator-owned supervisor."""
+    return isinstance(order, Mapping) and any(key in order for key in ("quote_id", "quote_sha256", "billing_basis"))
+
+
 class TrainerRuntime:
     def __init__(self, entry, rl, *, runtime_id: str, clock=time.time, monotonic=time.monotonic):
         from reliquary.validator.rl_training_usage import bind_runtime

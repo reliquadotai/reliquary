@@ -173,7 +173,7 @@ def test_the_trainer_link_needs_its_token_and_round_trips(tmp_path):
     client = TestClient(app)
     assert client.get("/rl/trainer/config").status_code == 401
     assert client.get("/rl/trainer/config", headers={"Authorization": "Bearer " + "x" * 32}).status_code == 401
-    link = TrainerLink("http://testserver", TOKEN, client=client, patience_s=0.0)
+    link = TrainerLink("http://127.0.0.1", TOKEN, client=client, patience_s=0.0)
     assert link.config() == {"task_id": "rl-async", "run": "smoke", "targets": {ENV: 1.0}, "latest": None}
     link.adopt_checkpoint(0)
     assert link.latest_checkpoint == 0
@@ -202,7 +202,7 @@ def test_the_trainer_takes_the_audits_and_reports_their_verdicts_through_its_lin
     app.include_router(build_rl_trainer_router(rl, token=TOKEN))
     client = TestClient(app)
     assert client.post("/rl/trainer/audits", json={"limit": 1}).status_code == 401
-    link = TrainerLink("http://testserver", TOKEN, client=client, patience_s=0.0)
+    link = TrainerLink("http://127.0.0.1", TOKEN, client=client, patience_s=0.0)
     link.adopt_checkpoint(0)
     lease = rl.book.grant([LeaseRequest("A", ENV, (4,), 0)])[0].leases[0]
     assert rl.submissions.submit(lease.lease_id, "A", group(0))["verdict"] == "too_hard"   # probation: drawn
@@ -249,7 +249,7 @@ def test_the_trainer_link_has_its_own_listener_never_the_public_port(tmp_path):
     trainer = TestClient(build_rl_trainer_app(rl, token=TOKEN))
     assert trainer.get("/rl/trainer/checkpoint").status_code == 401
     assert trainer.get("/rl/checkpoint").status_code == 404                      # only the link lives here
-    link = TrainerLink("http://testserver", TOKEN, client=trainer, patience_s=0.0)
+    link = TrainerLink("http://127.0.0.1", TOKEN, client=trainer, patience_s=0.0)
     assert link.checkpoint()["index"]["latest"]["version"] == 3 and link.config()["run"] == "smoke"
     rl.close()
 
@@ -278,7 +278,7 @@ def test_a_lost_report_answer_is_resent_and_counts_as_done(tmp_path):
     rl.submissions.submit(lease.lease_id, "A", group(8))
     rl.buffer.take(1)
     flaky = LosesFirstAnswer(TestClient(app))
-    link = TrainerLink("http://testserver", TOKEN, client=flaky, sleep=lambda s: None)
+    link = TrainerLink("http://127.0.0.1", TOKEN, client=flaky, sleep=lambda s: None)
     link.report_training(lease.lease_id, rollout_match=[1.0] * 16, accepted=True)
     assert flaky.calls == 2 and [e["kind"] for e in rl.submissions.events()] == ["trained"]
     rl.close()
@@ -565,6 +565,10 @@ def test_mine_async_finds_the_validator_on_the_metagraph(monkeypatch):
     assert result.exit_code == 0 and (runs[-1]["validator_url"], runs[-1]["validator_hotkey"]) == ("http://x:1",
                                                                                                     "5Override")
     assert runner.invoke(cli.app, ["mine-async", "--environments", ENV, "--validator-url", "http://x:1"]).exit_code == 2
+    assert runs[-1]["rl_task"] is None
+    result = runner.invoke(cli.app, ["mine-async", "--environments", ENV, "--rl-task", "order-7"])
+    assert result.exit_code == 0 and runs[-1]["rl_task"] == "order-7"
+    assert runner.invoke(cli.app, ["mine-async", "--environments", ENV, "--rl-task", "../x"]).exit_code == 2
 
 
 def test_the_controller_wandb_row_reads_prices_buffer_leases_and_miners(tmp_path):
@@ -849,7 +853,7 @@ def test_zero_match_quality_preserves_judged_skip_and_legacy_distinction(tmp_pat
     assert rl.submissions.submit(lease.lease_id, "A", group(8))["verdict"] == "in_zone"
     app = FastAPI()
     app.include_router(build_rl_trainer_router(rl, token=TOKEN))
-    link = TrainerLink("http://testserver", TOKEN, client=TestClient(app), patience_s=0.0)
+    link = TrainerLink("http://127.0.0.1", TOKEN, client=TestClient(app), patience_s=0.0)
     link.report_training(lease.lease_id, rollout_match=[0.0] * 16, accepted=False, judged=judged)
     raw = rl.book.db.execute("SELECT detail FROM rl_events WHERE kind='untrained'").fetchone()[0]
     detail = json.loads(raw)
@@ -926,7 +930,7 @@ def test_controller_reopen_does_not_reissue_groups_held_by_a_live_trainer(tmp_pa
         leases.append(submit(4))
         reopened.append(True)
 
-    link = TrainerLink("http://testserver", TOKEN, client=Transport())
+    link = TrainerLink("http://127.0.0.1", TOKEN, client=Transport())
     trainer = AsyncTrainer(None, config=AsyncTrainerConfig(2), buffer=link, submissions=link, book=link,
                            sleep=wait_for_more)
     try:
@@ -1077,14 +1081,14 @@ def test_every_trainer_call_is_a_beat_and_the_heartbeat_never_stops(tmp_path):
     app.include_router(build_rl_trainer_router(rl, token=TOKEN))
     client = TestClient(app)
     assert client.post("/rl/trainer/heartbeat", json={}).status_code == 401
-    link = TrainerLink("http://testserver", TOKEN, client=client, patience_s=0.0)
+    link = TrainerLink("http://127.0.0.1", TOKEN, client=client, patience_s=0.0)
     assert link.latest_checkpoint is None                               # any trainer call proves it alive
     assert rl.book.db.execute("SELECT COUNT(*) FROM rl_trainer_beat").fetchone()[0] == 1
     link.heartbeat()
     rl.close()
 
     old = FastAPI()                                                     # a validator without the route
-    beat = TrainerHeartbeat(TrainerLink("http://testserver", TOKEN, client=TestClient(old), patience_s=0.0), 0.01)
+    beat = TrainerHeartbeat(TrainerLink("http://127.0.0.1", TOKEN, client=TestClient(old), patience_s=0.0), 0.01)
     beat.start()
     beat._thread.join(timeout=0.3)
     assert beat._thread.is_alive()                                      # keeps beating: the route may come back

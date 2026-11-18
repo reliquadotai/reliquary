@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -244,6 +245,21 @@ def test_orphan_runtime_state_without_a_journal_cannot_be_rebound(prepared, fold
     with pytest.raises(s.ReconciliationRequired, match="pre-existing runtime state"):
         s.run_supervisor(config, **kwargs)
     assert not (config.runtime_dir / "journal.json").exists() and backend == []
+
+
+@pytest.mark.parametrize("kind", ["fifo", "nonprivate"])
+def test_unusable_existing_supervisor_lock_refuses_registry_read(prepared, kind):
+    config, _ = prepared
+    config.runtime_dir.mkdir(mode=0o700, parents=True)
+    lock = config.runtime_dir / "supervisor.lock"
+    if kind == "fifo":
+        os.mkfifo(lock, mode=0o600)
+    else:
+        lock.touch()
+        lock.chmod(0o644)
+    with pytest.raises(s.ReconciliationRequired, match="private regular file"):
+        s.run_supervisor(config, load_entry=lambda _: pytest.fail("unexpected registry read"))
+    assert not (config.runtime_dir / "journal.json").exists()
 
 
 @pytest.mark.parametrize("change", [{"status": "retired"}, {"profile_id": "wrong"},

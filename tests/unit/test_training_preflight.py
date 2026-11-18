@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -24,6 +25,7 @@ def private_json(path, value):
 @pytest.fixture
 def prepared(tmp_path, monkeypatch):
     from reliquary.protocol.profiles import PROFILES
+    from reliquary.validator.corpus_periods import usd_price_params
 
     profile_id = "qwen35-4b-reliquary-suite-v10-gumbel-dev1"
     body = CreateTraining(training_id="preflight", profile_id=profile_id,
@@ -32,9 +34,9 @@ def prepared(tmp_path, monkeypatch):
                           max_price_usd_per_mtoken=0.01, batch_groups=1, lag_target=1,
                           quote_id="qualification-quote", quote_sha256="b" * 64,
                           billing_basis="matched_token_ceiling_and_trainer_time_v1")
-    entry = training_entry(body, task_prefix="order-", created_at=1000,
-                           price_params={"max_price_per_token": 1e-8, "max_price_alpha_per_mtoken": .01,
-                                         "max_price_miner_alpha_per_period": 1., "max_price_set_at": 1000.})
+    prices = usd_price_params(usd_per_mtoken_input=0., usd_per_mtoken_output=.01, alpha_usd=1.,
+                              tao_usd=1., miner_alpha_per_period=1., set_at=1000.)
+    entry = training_entry(body, task_prefix="order-", created_at=1000, price_params=prices)
     registry = tmp_path / "registry.json"
     private_json(registry, json.loads(render_registry({entry.task_id: entry})))
     model = tmp_path / "model"
@@ -93,8 +95,16 @@ def test_local_evidence_never_grants_launch_or_paid_qualification(prepared):
     assert "post_stop_checkpoint_finalization" in report["limits"]["nominal_budget_excludes"]
     assert report["limits"]["max_steps"] == 1 and report["limits"]["max_tokens"] == 4096
     assert report["limits"]["step_and_token_limits_close_admission"] is True
+    assert prepared[3].env_split["reliquary_competitive_code_v1"] == 0
+    assert report["controller_grader"] == {"required_at_startup": True, "availability_verified": False}
     raw = json.dumps(report)
     assert "keep-this-secret" not in raw and str(prepared[0].parent) not in raw
+
+
+def test_controller_grader_is_optional_for_an_all_math_split(prepared):
+    config, entry = prepared[2:]
+    entry = replace(entry, env_split={"reliquary_dapo_math_v1": 1.0})
+    assert p._async_settings(config, entry) == {"required_at_startup": False, "availability_verified": False}
 
 
 def test_preflight_has_no_runtime_storage_network_or_filesystem_side_effects(prepared, monkeypatch):
@@ -176,6 +186,16 @@ def test_config_and_registry_must_be_private_and_unambiguous(prepared):
     report = run(prepared)
     assert report["checks"] == [{"name": "private_config", "status": "blocked"}]
     assert "binding" not in report
+
+
+def test_fifo_config_is_refused_without_waiting_for_a_writer(tmp_path):
+    config = tmp_path / "config.json"
+    os.mkfifo(config, mode=0o600)
+    result = subprocess.run([sys.executable, "-B", "-m", "reliquary.rl_orders.preflight",
+                             "--config", str(config), "--registry", str(tmp_path / "registry.json")],
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 2, result.stderr
+    assert json.loads(result.stdout)["checks"] == [{"name": "private_config", "status": "blocked"}]
 
 
 @pytest.mark.parametrize("missing", ["max_price_per_token", "rl_planned_tokens_per_period"])

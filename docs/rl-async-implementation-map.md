@@ -1055,7 +1055,8 @@ task declared for period settlement refuses to start in window mode).
   report, wait, tick, checkpoint (the signed `/rl/checkpoint` answer, for the trainer's resume). Served on its own
   listener (`build_rl_trainer_app`), never on the public port: `RELIQUARY_RL_TRAINER_BIND=host:port` (default
   `127.0.0.1:8889`; a private interface such as a WireGuard/Tailscale address, or an SSH tunnel from the GPU box).
-  The link is plain HTTP and its token mints pay: a non-loopback bind needs `RELIQUARY_RL_TRAINER_INSECURE_BIND=1`. Matches today's topology: the buffer stays in the controller's SQLite file, the trainer on its
+  The link is plain HTTP and its token mints pay: a non-loopback bind needs `RELIQUARY_RL_TRAINER_INSECURE_BIND=1`,
+  and a trainer reaching it off loopback over plain HTTP needs `RELIQUARY_RL_TRAINER_INSECURE=1`. Matches today's topology: the buffer stays in the controller's SQLite file, the trainer on its
   GPU box. Calls retry transport errors / 429 / 5xx for 10 min; a resent report the validator no longer holds
   counts as done; idle, the trainer requeues taken groups (a take whose answer was lost).
 - Trainer (`reliquary train-async`, `trainer/async_cli.py`): `RELIQUARY_RL_TRAINER_URL`, `_TOKEN`,
@@ -1112,7 +1113,7 @@ RELIQUARY_RL_MODE=async RELIQUARY_TASK_ID=<t> RELIQUARY_RL_TRAINER_TOKEN=<secret
   reliquary validate --checkpoint <base model> --wallet-name ... --hotkey ... --external-ip <public ip>
 # trainer (GPU box; torchrun --nproc-per-node N with RELIQUARY_TRAINER_BACKEND=fsdp2)
 RELIQUARY_RL_TRAINER_URL=http://<controller private ip, or localhost via ssh -L>:8889 RELIQUARY_RL_TRAINER_TOKEN=<secret> \
-  RELIQUARY_RL_VALIDATOR_HOTKEY=<ss58> R2_PUBLIC_...=... [RELIQUARY_RL_HF_BACKUP_PREFIX=<p> RELIQUARY_RL_HF_BACKUP_EVERY=200] \
+  [RELIQUARY_RL_TRAINER_INSECURE=1 for a private ip] RELIQUARY_RL_VALIDATOR_HOTKEY=<ss58> R2_PUBLIC_...=... [RELIQUARY_RL_HF_BACKUP_PREFIX=<p> RELIQUARY_RL_HF_BACKUP_EVERY=200] \
   reliquary train-async
 # miner
 reliquary mine-async --environments math     # discovered; or --validator-url http://<controller>:<port> --validator-hotkey <ss58>

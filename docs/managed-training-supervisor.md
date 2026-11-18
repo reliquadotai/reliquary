@@ -23,6 +23,12 @@ The JSON report uses exit code 2 for blocked local prerequisites. Exit code 0 me
 authorization, exact-run signer permission, namespace arbitration, ingress, delegated cgroup behavior, GPU work,
 durable owner delivery and nonpaying isolation remain explicitly unverified. Keep this report private.
 
+`controller_grader.required_at_startup` uses the validator's check of every environment in the declared split.
+The Qwen3.5-4B v10 profile includes a sandboxed code environment even when the order assigns all work to math.
+On an isolated qualification host, the controller needs either its designated grader listening at
+`/tmp/reliquary-grader.sock` or an installed `runsc` and grader bundle for its startup path.
+The preflight reports this dependency without probing the socket or starting a service.
+
 The preflight requires a positive explicit token cap as well as steps, a future deadline and the actual async
 auction settings. Step and token caps close admission; they are not a hard cap on work already issued.
 Its nominal process budgets exclude synchronous HTTP deadline overruns and post-stop checkpoint finalization.

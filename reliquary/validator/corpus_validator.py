@@ -967,7 +967,7 @@ def build_corpus_jobs_app(*, jobs, store, records, tokenizer, verify_signature,
     return app
 
 
-async def _run_corpus_services(server, services, *, cleanup=None) -> None:
+async def _run_corpus_services(server, services, *, cleanup=None, check_worker_shutdown=False) -> None:
     """Stop and await every service when HTTP serving ends or a service fails."""
     from contextlib import nullcontext
 
@@ -986,9 +986,13 @@ async def _run_corpus_services(server, services, *, cleanup=None) -> None:
             serving.cancel()
             for task in workers:
                 task.cancel()
-            await asyncio.gather(serving, group, *workers, return_exceptions=True)
+            outcomes = await asyncio.gather(serving, group, *workers, return_exceptions=True)
             if cleanup is not None:
                 await cleanup()
+            if check_worker_shutdown:
+                for outcome in outcomes:
+                    if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
+                        raise outcome
 
 
 def _set_lease_fault(w, services) -> None:

@@ -43,9 +43,7 @@ def _fresh_state(config):
         raise ValueError("state needs an existing private owned parent")
     if state.exists():
         for child in state.iterdir():
-            info = child.lstat()
-            if (child.name != "supervisor.lock" or not stat.S_ISREG(info.st_mode)
-                    or info.st_uid != os.geteuid() or info.st_mode & 0o077):
+            if child.name != "supervisor.lock" or not s._private_regular_file(child.lstat()):
                 raise ValueError("runtime needs reconciliation")
 
 
@@ -112,6 +110,7 @@ def _order(config, entry, now):
 
 
 def _async_settings(config, entry):
+    from reliquary.cli.main import _envs_need_grader
     from reliquary.protocol.profiles import PROFILES
     from reliquary.validator.rl_async_service import rl_async_settings
 
@@ -123,6 +122,7 @@ def _async_settings(config, entry):
     if (settings.auction is None or settings.auction.get("training_order") != entry.params["training_order"]
             or settings.pay_outage_fill or not settings.targets):
         raise ValueError("managed async auction is unavailable")
+    return {"required_at_startup": _envs_need_grader(entry.env_split or ()), "availability_verified": False}
 
 
 def _cuda_build():
@@ -184,7 +184,9 @@ def preflight(config_file: str | Path, registry_file: str | Path, *, now=None) -
 
     entry = check("local_registry_order_and_limits", registry)
     if entry is not None:
-        check("managed_async_auction_settings", lambda: _async_settings(config, entry))
+        grader = check("managed_async_auction_settings", lambda: _async_settings(config, entry))
+        if grader is not None:
+            report["controller_grader"] = grader
         check("materialized_model_bytes", lambda: s.verify_model(config, entry))
     check("private_fresh_state", lambda: _fresh_state(config))
     check("local_storage_and_signer_material", lambda: _credentials(config))

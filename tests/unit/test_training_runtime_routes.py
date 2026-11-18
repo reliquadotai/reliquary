@@ -38,6 +38,8 @@ def post(managed, path, body=None):
 
 def test_private_runtime_refuses_unauthenticated_and_cross_runtime_readiness(managed):
     assert managed.client.get("/rl/trainer/runtime").status_code == 401
+    for path in ("uploads", "reads", "deletes"):
+        assert post(managed, path, {"keys": []}).status_code == 404
     assert post(managed, "runtime/ready", {**managed.identity, "runtime_id": "c" * 32}).status_code == 422
     assert managed.runtime.snapshot()["trainer_ready"] is False
     assert managed.runtime.admission_reason() == "trainer_starting"

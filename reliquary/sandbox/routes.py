@@ -84,6 +84,8 @@ REFUSAL_STATUS: dict[str, int] = {
     "malformed_request": 422,
     # who is asking
     "bad_signature": 403, "hotkey_not_registered": 403, "miner_banned": 403,
+    # signed for another RL task's path (behind the RL front)
+    "wrong_task": 403,
     # what is asked for
     "body_timeout": 408,
     "job_not_served": 404, "session_unknown": 404,
@@ -235,10 +237,13 @@ def build_sandbox_sessions_router(
     max_preauth_closes: int | None = MAX_PREAUTH_CLOSES,
     open_body_timeout_s: float | None = None,
     max_preauth_opens: int | None = None,
+    task_id: str | None = None,
 ) -> APIRouter:
     """``open_body_timeout_s`` / ``max_preauth_opens`` (None: unbounded, the corpus routes): an open's
     body must arrive within that time (408 ``body_timeout``), and at most that many opens are decoded
-    and authenticated at once, after their body is read (one more is refused ``open_busy``, 503)."""
+    and authenticated at once, after their body is read (one more is refused ``open_busy``, 503).
+    ``task_id`` (RL routes): the task served behind the RL front; a request through its task path is
+    signed for that path (``rl_lease_routes.signed_route``)."""
     if max_preauth_opens is not None and max_preauth_opens <= 0:
         raise ValueError("max_preauth_opens must be positive")
     if open_body_timeout_s is not None and not (math.isfinite(open_body_timeout_s) and open_body_timeout_s > 0):
@@ -314,7 +319,13 @@ def build_sandbox_sessions_router(
     scoped = "{job_id}" in prefix
 
     def routed(http: Request) -> str:
-        return prefix.format(job_id=http.path_params["job_id"]) if scoped else prefix
+        base = prefix.format(job_id=http.path_params["job_id"]) if scoped else prefix
+        forwarded = http.headers.get("x-forwarded-prefix")
+        if forwarded is None or not prefix.startswith("/rl"):
+            return base
+        if task_id is None or forwarded != f"/rl/{task_id}":
+            raise _Refused(refuse("wrong_task", {"prefix": forwarded[:128]}))
+        return forwarded + base[len("/rl"):]
 
     @router.post(sandbox_open_path(prefix))
     async def open_session(http: Request) -> JSONResponse:
