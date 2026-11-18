@@ -21,6 +21,11 @@ verifies them, and pays every verified token of a period the same price:
   submissions (``take_debit``). An expiry, or a release past half its time, halves the holder's capacity for
   ``PENALTY_SECONDS``; a hotkey in debt holds one lease at most until it has paid.
 * **Lease time** follows each hotkey's measured delivery time (``lease_seconds``).
+* **Merit order** (``RELIQUARY_MERIT_ORDER``, ``corpus.lease_allocator``): on the markets it names, the leases
+  follow the rate the market's audit can take instead of the thermostat, filled cheapest first in measured tokens
+  per second; each hotkey gets its declared capacity at once, then what its deliveries show; only the last needed
+  hotkey is partly served, and its offer is the price of every lease (not a quantile of the delivered volume).
+  Until the audit and the speeds are measured, the thermostat and the volume price stand in.
 
 Prices are kept in pool share per token, the settlement's unit (``corpus_periods.max_price``); offers and the public
 view are in alpha per million tokens, converted with the miner emission per period declared with the ceiling.
@@ -35,11 +40,14 @@ import json
 import logging
 import math
 import os
+import statistics
 import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+
+from reliquary.corpus import lease_allocator as la
 
 logger = logging.getLogger(__name__)
 
@@ -255,12 +263,44 @@ class TokenAuction:
         self._state_path = Path(state_path) if state_path is not None else None
         self._saved_at = 0.0
         self._dirty = False
+        # Merit order (``corpus.lease_allocator``): speeds, trusted slots, the market's pace, the job's progress.
+        self._merit = market_name is not None and la.merit_enabled(market_name)
+        self._pace = la.market_pace(market_name, clock) if self._merit else None
+        self._speeds = la.SpeedBook()
+        self._trusted = la.Allowances()
+        self._q: Callable[[], float] | None = None
+        self._deadline: float | None = None
+        self._progress: tuple[int, int] | None = None     # (filled, total) slots
+        self._ticked_at: float | None = None
+        self._allocation: la.Allocation | None = None
+        self._allocated_at: float | None = None
+        self._target: float | None = None
         self._load()
 
     def bind_holdings(self, holdings: Callable[[], Mapping[str, int]]) -> None:
         """The live leases per hotkey (``DrawLeases.counts``), once the job's leases exist."""
         with self._lock:
             self._holdings = holdings
+
+    @property
+    def merit(self) -> bool:
+        """Whether this job allocates by merit order (``corpus.lease_allocator``)."""
+        return self._merit
+
+    def bind_merit(self, *, audit: Callable[[], tuple[float, float | None] | None] | None = None,
+                   q: Callable[[], float] | None = None, deadline: float | None = None) -> None:
+        """The merit order's inputs: the market's audit (output tokens per second its cards verify, their busy
+        share), the share of this job's records audited, its deadline (unix seconds; None: a day after it opens)."""
+        if self._pace is not None and audit is not None:
+            self._pace.bind_audit(audit)
+        with self._lock:
+            self._q = q
+            self._deadline = deadline
+
+    def note_progress(self, filled: int, total: int) -> None:
+        """The job's slots filled and in all (its ledger, read by the lease route)."""
+        with self._lock:
+            self._progress = (int(filled), int(total))
 
     # -- offers --------------------------------------------------------------
 
@@ -384,6 +424,88 @@ class TokenAuction:
             marginal = price
         return given, marginal
 
+    # -- merit order ---------------------------------------------------------
+
+    def _pace_target(self) -> float | None:
+        """This job's target rate from its market's pace, read before this auction's lock (it reads the audit)."""
+        if self._pace is None:
+            return None
+        try:
+            return self._pace.target(self._job)
+        except Exception:                     # a status read never stops leasing
+            logger.exception("token auction: market pace unavailable")
+            return None
+
+    def _tail(self) -> bool:
+        if self._progress is None:
+            return False
+        filled, total = self._progress
+        return total > 0 and (total - filled) <= la.TAIL_SHARE * total
+
+    def _median_seconds(self) -> float | None:
+        recent = [s for times in self._deliveries.values() for s in list(times)[-32:]]
+        return statistics.median(recent) if recent else None
+
+    def _merit_allowances(self, now: float, held: Mapping[str, int],
+                          target: float | None) -> tuple[dict[str, int], float | None] | None:
+        """The merit order's slots per hotkey and its clearing price (the last needed hotkey's offer), or None
+        while the audit or every speed is unmeasured (the thermostat then stands in)."""
+        if not self._merit:
+            return None
+        if self._ticked_at is None or now - self._ticked_at >= 1.0:
+            self._ticked_at = now
+            self._speeds.tick(now, held)
+        median = self._speeds.median(now)
+        if (self._allocation is None or self._allocated_at is None or now - self._allocated_at >= 5.0
+                or target != self._target):
+            self._allocated_at, self._target = now, target
+            self._allocation = None
+            if target is not None and median is not None and median > 0:
+                candidates = []
+                for hotkey in list(self._offers):
+                    offer = self._live(hotkey, now)
+                    if offer is None or offer.price > self.params.ceiling:
+                        continue
+                    if self._aside.get(hotkey, -math.inf) > now:
+                        continue
+                    if not (held.get(hotkey, 0) > 0 or now - self._seen.get(hotkey, -math.inf) <= ACTIVE_SECONDS):
+                        continue
+                    declared = self._capacity(hotkey, offer, now)
+                    candidates.append(la.Candidate(hotkey, offer.price, self._trusted.of(hotkey, declared),
+                                                   self._speeds.speed(hotkey, now)))
+                self._allocation = la.merit_order(candidates, target, median)
+                tail = self._tail()
+                median_seconds = self._median_seconds()
+                for c in candidates:
+                    if self._allocation.slots.get(c.hotkey, 0) > 0:
+                        self._trusted.needed(c.hotkey, now, self._speeds)
+                    offer = self._offers[c.hotkey]
+                    changed = self._trusted.step(c.hotkey, now, declared=self._capacity(c.hotkey, offer, now),
+                                                 held=held.get(c.hotkey, 0), speeds=self._speeds, median=median,
+                                                 median_seconds=median_seconds, tail=tail)
+                    if changed:
+                        logger.info("merit order job=%s hotkey=%s %s", self._job, c.hotkey[:8], changed)
+            self._report(now, held)
+        if self._allocation is None:
+            return None
+        return dict(self._allocation.slots), self._allocation.clearing
+
+    def _report(self, now: float, held: Mapping[str, int]) -> None:
+        if self._pace is None:
+            return
+        q = 1.0
+        if self._q is not None:
+            try:
+                q = float(self._q())
+            except Exception:
+                logger.exception("token auction: audit share unavailable")
+        remaining = None
+        if self._progress is not None:
+            remaining = max(0, self._progress[1] - self._progress[0]) * self._mean_tokens
+        self._pace.report(self._job, q=q, remaining_tokens=remaining, deadline=self._deadline,
+                          supply=None if self._allocation is None else self._allocation.supply,
+                          backlog_tokens=(self._last_backlog or 0) * self._mean_tokens, unmet_at=self._unmet_at)
+
     def _volume_price(self, now: float) -> float | None:
         """The offer under which ``PRICE_QUANTILE`` of the market's recently delivered leases were won, each
         weighted by its age; None under ``PRICE_MIN_WEIGHT``. A hotkey in debt or set aside here counts for nothing.
@@ -430,6 +552,7 @@ class TokenAuction:
         # Read before taking this lock: the leases call this auction under their own lock (an expiry's charge).
         held = self._held()
         given_budget = self._given_budget()
+        target = self._pace_target()
         with self._lock:
             now = self._clock()
             offer = self._live(hotkey, now)
@@ -437,6 +560,9 @@ class TokenAuction:
                 return NO_ASK
             self._seen[hotkey] = now
             self._steer(now, held, given_budget)
+            merit = self._merit_allowances(now, held, self._merit_target(target))
+            if merit is not None:
+                return self._admit_merit(hotkey, offer, now, held, *merit)
             if self._budget <= 0:
                 return ALLOWANCE_FULL               # nothing to hand out now (an RL env whose next steps are full)
             given, marginal = self._allowances(now, held)
@@ -460,6 +586,28 @@ class TokenAuction:
             moment = self._moment_price(now, marginal)
             return Terms(max(offer.price, moment if moment is not None else offer.price), hotkey,
                          offer=offer.price)
+
+    def _merit_target(self, target: float | None) -> float | None:
+        """The rate to fill: the market's pace, or for a job with a budget of its own (an RL env: the leases the
+        trainer's next steps take) that budget at the median speed."""
+        if self._budget_of is not None:
+            median = self._speeds.median(self._clock())
+            return None if median is None else self._budget * median
+        return target
+
+    def _admit_merit(self, hotkey: str, offer: Offer, now: float, held: Mapping[str, int],
+                     given: dict[str, int], clearing: float | None) -> Terms | str:
+        """Granted iff ``hotkey`` holds fewer than its slots: no shared pool, no race. Leases of a hotkey cut
+        since drain as they are delivered (its renewals are refused)."""
+        allowance = given.get(hotkey, 0)
+        if allowance <= 0:
+            if self._aside.get(hotkey, -math.inf) <= now:
+                self._unmet_at = now
+            return ASK_ABOVE_PRICE
+        if held.get(hotkey, 0) + self._reserved[hotkey] >= allowance:
+            return ALLOWANCE_FULL
+        self._reserved[hotkey] += 1
+        return Terms(offer.price if clearing is None else max(offer.price, clearing), hotkey, offer=offer.price)
 
     def set_aside(self, hotkey: str, until: float) -> None:
         """``hotkey`` gets no allowance until ``until`` (unix seconds): its share goes to the offers behind it."""
@@ -496,7 +644,8 @@ class TokenAuction:
             tail = ordered[math.ceil(DELIVERY_TAIL * len(ordered)) - 1]
             return min(float(default), max(LEASE_FLOOR_SECONDS, 2.0 * tail))
 
-    def observe_delivery(self, hotkey: str, seconds: float, offer: float | None = None) -> None:
+    def observe_delivery(self, hotkey: str, seconds: float, offer: float | None = None,
+                         tokens: int | None = None) -> None:
         """A lease of ``hotkey`` was delivered ``seconds`` after its grant; ``offer``: its holder's own offer when
         granted (``Terms.offer``), the price this delivery counts at for the price of the moment. Never the lease's
         price: that is the price of the moment already, and would feed it back into itself."""
@@ -504,6 +653,8 @@ class TokenAuction:
             return
         with self._lock:
             self._deliveries.setdefault(hotkey, collections.deque(maxlen=DELIVERIES_KEPT)).append(float(seconds))
+            if tokens is not None:
+                self._speeds.delivered(hotkey, self._clock(), float(tokens))
             if offer is not None and math.isfinite(float(offer)) and float(offer) > 0:
                 self._market.record(self._job, self._clock(), hotkey, self.params.alpha_of(float(offer)))
             self._changed()
@@ -560,12 +711,17 @@ class TokenAuction:
         Never another hotkey's offer; with ``hotkey``, that hotkey's own allowance and debt."""
         held = self._held()                   # before this lock, as in ``admit``
         given_budget = self._given_budget()
+        target = self._pace_target()
         with self._lock:
             now = self._clock()
             self._steer(now, held, given_budget)
-            given, marginal = self._allowances(now, held)
-            moment = self._moment_price(now, marginal)
-            shown = moment if moment is not None else marginal
+            merit = self._merit_allowances(now, held, self._merit_target(target))
+            if merit is not None:
+                given, shown = merit
+            else:
+                given, marginal = self._allowances(now, held)
+                moment = self._moment_price(now, marginal)
+                shown = moment if moment is not None else marginal
             view = {
                 "pricing": PRICING_AUCTION,
                 "price_alpha_per_mtoken": None if shown is None else self.params.alpha_of(shown),
@@ -575,9 +731,26 @@ class TokenAuction:
                 "audit_backlog": self._last_backlog,
                 "miners_working": len(given),
             }
+            if self._merit:
+                median = self._speeds.median(now)
+                view.update(allocator="merit" if merit is not None else "budget",
+                            target_tokens_per_s=self._target,
+                            leases_wanted=sum(given.values()),
+                            median_tokens_per_lease_s=median,
+                            tail=self._tail())
+                if self._pace is not None:
+                    view.update(audit_tokens_per_s=self._pace.last.get("audit_rate"),
+                                audit_wait_s=self._pace.last.get("wait_seconds"), k=self._pace.k)
             if hotkey is not None:
                 view.update(allowance=given.get(hotkey, 0), held=held.get(hotkey, 0),
                             debt_alpha=self._debt.get(hotkey, 0.0) * self.params.miner_alpha_per_period)
+                if self._merit:
+                    median = self._speeds.median(now)
+                    offer = self._offers.get(hotkey)
+                    view.update(tokens_per_lease_s=self._speeds.speed(hotkey, now),
+                                v_min=None if median is None else la.vmin(median, self._tail()),
+                                trusted_slots=None if offer is None else self._trusted.of(
+                                    hotkey, self._capacity(hotkey, offer, now)))
             return view
 
     # -- state ---------------------------------------------------------------
@@ -592,6 +765,7 @@ class TokenAuction:
                 "deliveries": {h: list(d) for h, d in self._deliveries.items()},
                 "delivered": [list(e) for e in self._market.of(self._job)],
                 "mean_tokens": self._mean_tokens,
+                "trusted": self._trusted.snapshot(),
             }
 
     def restore(self, state: Mapping) -> None:
@@ -613,6 +787,8 @@ class TokenAuction:
                 self._market.replace(self._job, delivered)
             if state.get("mean_tokens") is not None:
                 self._mean_tokens = float(state["mean_tokens"])
+            if isinstance(state.get("trusted"), Mapping):
+                self._trusted.restore(state["trusted"], self._clock())
 
     def _load(self) -> None:
         if self._state_path is None or not self._state_path.exists():

@@ -2241,7 +2241,7 @@ def build_corpus_router(
             if written is not None and written.accepted:
                 auction.observe_tokens(sum(token_counts))
                 auction.observe_delivery(request.miner_hotkey, time.time() - pricing["granted_at"],
-                                         offer=pricing["offer"])
+                                         offer=pricing["offer"], tokens=sum(token_counts))
             else:
                 unpriced()
 
@@ -2859,6 +2859,8 @@ def build_corpus_router(
         if state.slots.is_complete:
             return _lease_refused(CorpusRejectReason.JOB_COMPLETE)
         wanted = 1 if request.count is None else int(request.count)
+        if auction is not None:
+            auction.note_progress(state.slots.filled, state.slots.total)
 
         def grant():
             """Up to ``wanted`` leases, and why the next one was not granted (None when all were)."""

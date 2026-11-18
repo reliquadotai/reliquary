@@ -97,7 +97,7 @@ R* = min(audit_rate / q, trainer_rate, needed_rate) x k
     modest card (RTX vs H200, x2-3) stays served: it only counts for what it delivers (3.4);
   - tail (last 10 %, or fewer free prompts than slots asked): 1/2 of the median, and the free prompts go to the
     fastest miners first;
-  - never under the backstop speed of the lease deadline (3.6); no verdict before a minimum of deliveries.
+  - no absolute floor (an agentic order counts its tool time); no verdict before a minimum of deliveries.
 - **Over-declaring** buys nothing: the merit order counts measured rate (3.4), the first verdict cuts within
   minutes, and undelivered leases stay debited. A brand-new hotkey with nothing to debit can disturb the
   others for a few minutes at most, at the cost of a registration; cuts go through refused swaps (3.5), so the
@@ -234,7 +234,7 @@ The draw audit and its judge, debits on leases not delivered, the ceiling per to
 
 1. Several orders on one card: floor by deadline, surplus to the order closest to done (3.11).
 2. Clearing price: the marginal (last needed) miner's offer (3.8).
-3. `v_min`: 1/4 of the order's median in the bulk, 1/2 in the tail, never under the backstop (3.3); the simulation
+3. `v_min`: 1/4 of the order's median in the bulk, 1/2 in the tail (3.3); the simulation
    tunes the fractions.
 4. No slow start, no price floor.
 

@@ -211,7 +211,8 @@ class RlAuctions:
         return self.auctions[env].lease_seconds(hotkey, default, held)
 
     def delivered(self, env: str, hotkey: str, seconds: float, offer: float | None) -> None:
-        self.auctions[env].observe_delivery(hotkey, seconds, offer)
+        # One group per lease: the merit order measures an env's speed in groups per lease-second.
+        self.auctions[env].observe_delivery(hotkey, seconds, offer, tokens=1)
 
     def missed(self, env: str, hotkey: str, price: float | None) -> None:
         """An undelivered lease, charged in full (an RL lease has no partial use: a group is whole or nothing)."""
