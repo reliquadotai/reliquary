@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import re
+import signal
+import threading
 import time
 from collections.abc import Mapping
 
@@ -126,6 +128,57 @@ class TrainerRuntime:
             raise ValueError("latest_checkpoint must be a published integer checkpoint")
         quiesce_trainer(self.rl, runtime_id=self.identity["runtime_id"], latest_checkpoint=latest)
         return self.snapshot()
+
+
+class ManagedControllerShutdown:
+    """Accept Uvicorn's replayed SIGTERM only after durable drainage and completed local cleanup."""
+
+    def __init__(self, runtime):
+        self.runtime, self.identity = runtime, dict(runtime.identity)
+        self._drained = self._clean = False
+        self._previous = None
+
+    def __enter__(self):
+        if threading.current_thread() is not threading.main_thread() or self._previous is not None:
+            raise RuntimeError("managed controller shutdown must own the main-thread signal scope")
+        previous = signal.getsignal(signal.SIGTERM)
+        if previous is None:
+            raise RuntimeError("the previous SIGTERM handler is unknown")
+        self._drained = self._clean = False
+        self._previous = previous
+        signal.signal(signal.SIGTERM, self._replayed_sigterm)
+        return self
+
+    def capture_drain(self) -> bool:
+        self._drained = False
+        try:
+            snapshot = self.runtime.snapshot()
+            self._drained = (isinstance(snapshot, Mapping)
+                             and all(snapshot.get(key) == value for key, value in self.identity.items())
+                             and snapshot.get("schema") == "reliquary/training-runtime/v1"
+                             and all(snapshot.get(key) is True for key in (
+                                 "controller_ready", "admission_closed", "drain_requested", "trainer_quiesced", "drained"))
+                             and type(snapshot.get("latest_checkpoint")) is int
+                             and snapshot["latest_checkpoint"] >= 0)
+        except Exception:
+            pass                               # cleanup still runs; an unproven stop cannot exit successfully
+        return self._drained
+
+    def cleanup_completed(self) -> None:
+        self._clean = True
+
+    def _replayed_sigterm(self, signum, frame) -> None:
+        if not (self._drained and self._clean):
+            raise SystemExit(128 + signum)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            if exc_type is None and not (self._drained and self._clean):
+                raise RuntimeError("managed controller exited without verified drainage and complete cleanup")
+        finally:
+            signal.signal(signal.SIGTERM, self._previous)
+            self._previous = None
+        return False
 
 
 def supervised_runtime(entry, rl, *, environ: Mapping[str, str] | None = None):

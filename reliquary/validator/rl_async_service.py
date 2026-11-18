@@ -969,7 +969,7 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
         training_admission = TrainingAdmission(entry, rl.book, load=load_training_entry)
         rl.book.auctions.admission = training_admission.reason
         await training_admission.refresh()
-    from reliquary.rl_orders.runtime import supervised_runtime
+    from reliquary.rl_orders.runtime import ManagedControllerShutdown, supervised_runtime
 
     rl.runtime = supervised_runtime(entry, rl)
     if rl.runtime is not None:
@@ -1064,22 +1064,33 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
                 settings.task_id, cap, settings.run, dict(settings.targets), rl.book.latest_checkpoint)
     http = uvicorn.Server(uvicorn.Config(server.app, host=http_host, port=http_port, log_level="warning",
                                          access_log=False, timeout_keep_alive=15))
+    managed_shutdown = None if rl.runtime is None else ManagedControllerShutdown(rl.runtime)
 
     async def cleanup() -> None:
+        sandbox_error = None
+        if managed_shutdown is not None and not managed_shutdown.capture_drain():
+            logger.warning("managed controller stop has no durable drain proof; its exit remains non-final")
         if rl.sandbox is not None:
             try:
                 await rl.sandbox.stop()
-            except Exception:
+            except Exception as exc:
                 logger.exception("rl lease sessions not drained at shutdown")
+                if managed_shutdown is not None:
+                    sandbox_error = exc
         await publisher.close()
         close_scorer = getattr(getattr(rl.submissions.grader, "scorer", None), "close", None)
         if callable(close_scorer):
             close_scorer()
         await asyncio.to_thread(rl.close)
         telemetry.finish()
+        if sandbox_error is not None:
+            raise RuntimeError("managed sandbox cleanup did not finish") from sandbox_error
+        if managed_shutdown is not None:
+            managed_shutdown.cleanup_completed()
 
     background.append(server._monitor_process_health())
-    await _run_corpus_services(http, background, cleanup=cleanup)
+    with contextlib.nullcontext() if managed_shutdown is None else managed_shutdown:
+        await _run_corpus_services(http, background, cleanup=cleanup)
 
 
 __all__ = [

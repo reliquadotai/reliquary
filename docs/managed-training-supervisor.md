@@ -111,6 +111,11 @@ The supervisor waits for normal trainer exit, stops the controller, reaps both o
 their process groups and the complete owned cgroup are empty. Only then is `StoppedRuntime` produced. Forced
 or uncertain termination cannot produce a successful final witness.
 
+The managed controller handles Uvicorn's replayed SIGTERM outside its server signal scope. It returns normally
+only after its exact runtime proves durable drainage and every controller cleanup stage completes. An unproven
+drain or failed cleanup keeps a nonzero exit; signal return codes are never relabelled as successful witnesses.
+Other validator modes retain their existing signal behavior.
+
 `journal.json` is atomically replaced and fsynced before/after launch and each transition. Runtime observations
 keep its running state fresh. `read_runtime_view(root, task_id)` exposes only scoped identities, state,
 timestamps and checkpoint number; stale or malformed observations map to unknown. Process identities,

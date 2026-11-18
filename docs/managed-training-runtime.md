@@ -27,6 +27,8 @@ ownership, not a real GPU training run.
 5. The supervisor requires normal child exits, empty owned process groups and an empty owned cgroup.
    Forced termination, reused process identity, unknown cleanup or an old journal requires reconciliation.
    A PID or a running process alone establishes no readiness or finality.
+   The managed controller returns normally after SIGTERM only with exact durable drain evidence and successful
+   cleanup; an undrained or failed cleanup remains a nonzero exit. Legacy validator signal handling is preserved.
 
 ## Final usage and checkpoint
 
