@@ -281,6 +281,9 @@ class TokenAuction:
         self._allocation: la.Allocation | None = None
         self._allocated_at: float | None = None
         self._target: float | None = None
+        # The median speed last measured, kept over a restart: the merit order resumes at once instead of
+        # leaving the job to the thermostat while speeds are measured again (2026-11-18: 5 min at 4 leases).
+        self._median_hint: float | None = None
         self._load()
 
     def bind_holdings(self, holdings: Callable[[], Mapping[str, int]]) -> None:
@@ -475,6 +478,10 @@ class TokenAuction:
             self._ticked_at = now
             self._speeds.tick(now, held)
         median = self._speeds.median(now)
+        if median is not None:
+            self._median_hint = median
+        else:
+            median = self._median_hint
         if (self._allocation is None or self._allocated_at is None or now - self._allocated_at >= 5.0
                 or target != self._target):
             self._allocated_at, self._target = now, target
@@ -615,7 +622,7 @@ class TokenAuction:
         """The rate to fill: the market's pace, or for a job with a budget of its own (an RL env: the leases the
         trainer's next steps take) that budget at the median speed."""
         if self._budget_of is not None:
-            median = self._speeds.median(self._clock())
+            median = self._speeds.median(self._clock()) or self._median_hint
             return None if median is None else self._budget * median
         return target
 
@@ -824,6 +831,8 @@ class TokenAuction:
                 "delivered": [list(e) for e in self._market.of(self._job)],
                 "mean_tokens": self._mean_tokens,
                 "trusted": self._trusted.snapshot(),
+                "median_speed": self._median_hint,
+                "audit_rate": None if self._pace is None else self._pace.rate,
             }
 
     def restore(self, state: Mapping) -> None:
@@ -848,6 +857,10 @@ class TokenAuction:
                 self._mean_tokens = float(state["mean_tokens"])
             if isinstance(state.get("trusted"), Mapping):
                 self._trusted.restore(state["trusted"], self._clock())
+            if state.get("median_speed") is not None:
+                self._median_hint = float(state["median_speed"])
+            if self._pace is not None and state.get("audit_rate") is not None:
+                self._pace.seed_rate(float(state["audit_rate"]))
 
     def _load(self) -> None:
         if self._state_path is None or not self._state_path.exists():
