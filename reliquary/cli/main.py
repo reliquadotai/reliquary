@@ -1763,7 +1763,7 @@ def jobs_create(
                 job_id=job_id, eval_set=eval_set, prompt_count=prompt_count,
                 prompt_start=prompt_start, renderer_id=renderer_id, audit_q=audit_q,
                 grader_id=grader_id, threshold=threshold, from_profile=from_profile,
-                episode=episode)
+                episode=episode, model=model, revision=model_revision, max_prompt_tokens=max_prompt_tokens)
         elif prompt_count is None:
             raise ValueError("--prompt-count is required with --prompt-source")
     except (OSError, ValueError) as exc:

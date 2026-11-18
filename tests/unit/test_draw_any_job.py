@@ -138,9 +138,24 @@ def test_a_long_context_job_declares_its_longest_prompt():
     job = parse_job(_gen_raw(max_prompt_tokens=60000))
     assert job.max_prompt_tokens == 60000 and job.to_contract()["max_prompt_tokens"] == 60000
     assert "max_prompt_tokens" not in parse_job(_gen_raw()).to_contract()
-    for bad in (0, 131073, "1"):
+    for bad in (0, 262145, "1"):
         with pytest.raises(JobError):
             parse_job(_gen_raw(max_prompt_tokens=bad))
+
+
+def test_a_single_turn_draw_can_use_the_remaining_audit_sequence_for_its_prompt():
+    from reliquary.validator.corpus_audit_protocol import MAX_DRAWN_SEQUENCE_TOKENS
+
+    raw = _gen_raw(max_prompt_tokens=131876)
+    raw["sampling"]["max_new_tokens"] = 8192
+    assert parse_job(raw).to_contract()["max_prompt_tokens"] == 131876
+    last = MAX_DRAWN_SEQUENCE_TOKENS - 8192
+    assert parse_job({**raw, "max_prompt_tokens": last}).max_prompt_tokens == last
+    with pytest.raises(JobError, match="max_prompt_tokens"):
+        parse_job({**raw, "max_prompt_tokens": last + 1})
+    del raw["sampling"]["draw"]
+    with pytest.raises(JobError, match="max_prompt_tokens"):
+        parse_job(raw)
 
 
 def test_a_drawn_audit_item_holds_a_long_context_sample_a_proven_one_does_not():

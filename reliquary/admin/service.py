@@ -32,6 +32,7 @@ from reliquary.admin.auth import (
     TIMESTAMP_HEADER,
     HmacVerifier,
 )
+from reliquary.corpus.job import MAX_DRAWN_SEQUENCE_TOKENS, MAX_JOB_PROMPT_TOKENS
 
 from reliquary.sandbox.evaluation_engagements import EvaluationSessionRequest
 
@@ -171,7 +172,7 @@ class CreateJob(BaseModel):
     draw: Literal["gumbel_max"] | None = None
     judge: dict[str, float | int] | None = Field(default=None, max_length=8)
     # A long-context order: its longest prompt in tokens (miners size their engine to it).
-    max_prompt_tokens: int | None = Field(default=None, gt=0, le=131072)
+    max_prompt_tokens: int | None = Field(default=None, gt=0, le=MAX_DRAWN_SEQUENCE_TOKENS)
     # A forced-draw order without a qualification pins its model here (``orders.models``): the full revision.
     revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     # A reviewed contract can be pinned before the first durable write.
@@ -767,6 +768,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=422, detail=f"set {set_id} is a {card['env']} set")
         if body.prompt_count > int(card["count"]):
             raise HTTPException(status_code=422, detail=f"set {set_id} holds {card['count']} problems")
+        await require_prompt_budget(body, card, record["revision"])
         # Thresholds hold only for the conditions they were measured under.
         wanted = {"set_id": set_id, "problems": body.prompt_count,
                   "sampling": body.sampling.conditions(), "max_new_tokens": body.max_new_tokens,
@@ -890,6 +892,17 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=404, detail="set_unknown")
         return json.loads(card_body), prompts_body
 
+    async def require_prompt_budget(body: CreateJob, card: dict, revision: str) -> None:
+        from reliquary.eval.episode_jobs import prompt_budget_refusal
+
+        refusal = prompt_budget_refusal(card, model=body.model, revision=revision,
+                                       renderer_id=THINKING_RENDERERS[body.thinking], count=body.prompt_count,
+                                       max_prompt_tokens=body.max_prompt_tokens)
+        if refusal:
+            existing, _ = await job_store.read_job(body.job_id)
+            if existing is None:
+                raise HTTPException(status_code=422, detail=refusal)
+
     def upload_sampling_differs(sampling: Mapping, body: CreateJob) -> list[str]:
         """An order on an upload's group runs the sampling its lines asked for (``orders.uploads``)."""
         given = {**body.sampling.model_dump(), "max_tokens": body.max_new_tokens, "seed": body.seed,
@@ -948,6 +961,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 raise HTTPException(status_code=422, detail=f"set {body.eval_set_id} is a {card.get('env')} set")
             if body.prompt_count > int(card["count"]):
                 raise HTTPException(status_code=422, detail=f"set {body.eval_set_id} holds {card['count']} problems")
+            if evaluation:
+                await require_prompt_budget(body, card, pin.revision)
             episode = order_episode(body, card, pin, evaluation=evaluation)
             source = eval_source_for(body.eval_set_id, prompts_body, body.prompt_count)
             register_eval_prompts(source, prompts_body)
@@ -974,6 +989,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         from reliquary.miner.corpus_miner import PROMPT_ALLOWANCE_TOKENS
 
         longest = max(PROMPT_ALLOWANCE_TOKENS, body.max_prompt_tokens or 0) + body.max_new_tokens
+        if (body.max_prompt_tokens or 0) > MAX_JOB_PROMPT_TOKENS and pin.max_position_embeddings is None:
+            raise HTTPException(status_code=422, detail="context_unknown: long prompt needs the model's context limit")
         if episode is not None:
             longest = max(longest, int(episode["max_total_tokens"]))
         if pin.max_position_embeddings is not None and longest > pin.max_position_embeddings:
@@ -1085,6 +1102,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 f"a generation order's ids both start with {gen_prefix!r}"))
         # A forced-draw order needs no qualification: one path for eval and generation, on a set or an env.
         pinned = (evaluation or generation) and body.draw is not None and body.qualification_id is None
+        if (body.max_prompt_tokens or 0) > MAX_JOB_PROMPT_TOKENS and not pinned:
+            raise HTTPException(status_code=422, detail="max_prompt_tokens above 131072 requires a pinned draw order")
         if body.eval_set_id is not None and not (evaluation or (generation and pinned)):
             raise HTTPException(status_code=422, detail=(
                 f"an eval job's ids start with {eval_prefix!r}, and only an eval job's"))

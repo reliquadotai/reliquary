@@ -165,6 +165,61 @@ def test_a_batch_on_an_env_range(admin, pins, monkeypatch):  # noqa: F811
     assert record["source"]["env"] == GEN_ENV and record["source"]["environment_manifest_sha256"]
 
 
+def test_a_long_draw_uses_the_model_and_audit_sequence_limits_before_writing(admin, pins):
+    body = _order(max_prompt_tokens=131876, max_new_tokens=8192)
+    assert "context_too_long" in admin("POST", "/admin/v1/jobs", body).text
+    pins[MODEL] = _pin(max_position_embeddings=None)
+    assert "context_unknown" in admin("POST", "/admin/v1/jobs", body).text
+    pins[MODEL] = _pin(max_position_embeddings=524288)
+    for path in ("/admin/v1/jobs/validate", "/admin/v1/jobs"):
+        qualified = admin("POST", path, {**body, "qualification_id": "order-q", "revision": None})
+        assert qualified.status_code == 422 and "requires a pinned draw order" in qualified.text
+        refused = admin("POST", path, {**body, "max_prompt_tokens": 262144 - 8192 + 1})
+        assert refused.status_code == 422 and "max_prompt_tokens" in refused.text
+    assert asyncio.run(qual.EvalJobStore().read(body["job_id"])) is None
+    assert asyncio.run(job_store.read_job(body["job_id"]))[0] is None
+    assert body["job_id"] not in admin.registry["entries"]
+    assert admin("POST", "/admin/v1/jobs/validate", body).status_code == 200
+    assert admin("POST", "/admin/v1/jobs", body).status_code == 201
+    assert admin("POST", "/admin/v1/jobs", body).status_code == 200
+    job, _ = asyncio.run(job_store.read_job(body["job_id"]))
+    assert job.max_prompt_tokens == 131876 and job.sampling.max_new_tokens == 8192
+
+
+def test_exact_set_measurements_bound_only_the_ordered_prefix_and_match_replays(admin, pins):
+    from reliquary.eval.storage import subnet_key
+
+    key = subnet_key(SET_ID, "set.json")
+    data, etag = admin.bucket.objects[key]
+    card = json.loads(data)
+    lengths = [12, 32000, 7, 6, 5, 6, 7, 8]
+    exact = {"tokenizer": MODEL, "revision": REVISION, "renderer_id": "chat-template-v1", "per_problem": lengths}
+
+    def set_counts(measured):
+        admin.bucket.objects[key] = (json.dumps({**card, "prompt_tokens": measured}).encode(), etag)
+
+    set_counts(exact)
+    for path in ("/admin/v1/jobs/validate", "/admin/v1/jobs"):
+        refused = admin("POST", path, _order())
+        assert refused.status_code == 422 and "32000" in refused.text
+    assert asyncio.run(qual.EvalJobStore().read(_order()["job_id"])) is None
+    assert admin("POST", "/admin/v1/jobs/validate", _order(prompt_count=1)).status_code == 200
+    assert admin("POST", "/admin/v1/jobs/validate", _order(max_prompt_tokens=32000)).status_code == 200
+    set_counts({**exact, "per_problem": None, "max": 32000})
+    assert admin("POST", "/admin/v1/jobs/validate", _order()).status_code == 200
+    assert admin("POST", "/admin/v1/jobs/validate", _order(prompt_count=8)).status_code == 422
+    for invalid in (0, -1, True):
+        set_counts({**exact, "per_problem": None, "max": invalid})
+        refused = admin("POST", "/admin/v1/jobs/validate", _order(prompt_count=8))
+        assert refused.status_code == 422 and "prompt_measurements_invalid" in refused.text
+    for change in ({"tokenizer": "other"}, {"revision": "b" * 40}, {"renderer_id": "chat-template-thinking-v1"}):
+        set_counts({**exact, **change})
+        assert admin("POST", "/admin/v1/jobs/validate", _order()).status_code == 200
+    assert admin("POST", "/admin/v1/jobs", _order()).status_code == 201
+    set_counts(exact)
+    assert admin("POST", "/admin/v1/jobs", _order()).status_code == 200
+
+
 @pytest.mark.parametrize("change,status,word", [
     ({"revision": None}, 422, "revision"),
     ({"audit_q": 0.5}, 422, "audit_q"),

@@ -65,9 +65,10 @@ _JOB_FIELDS = (
 # predates it refuses a manifest carrying it (unknown field): miners and
 # validators of a job with ``prompt_start > 0`` need a build that knows it.
 _OPTIONAL_JOB_FIELDS = ("prompt_start", "seed", "submit", "episode", "judge", "max_prompt_tokens")
-# The longest prompt a job may declare it holds (``max_prompt_tokens``): a long-context job's miners size their
-# engine to it; the wire bounds a completion at the same.
+# Miners size their engine to this allowance plus the completion budget. A single-turn draw can
+# use the remainder of its audit item's sequence for the prompt.
 MAX_JOB_PROMPT_TOKENS = 131072
+MAX_DRAWN_SEQUENCE_TOKENS = 262144
 # A forced-draw job's judge (``corpus.eval_draw.judge``): how far a sample may stray from its draw.
 _JUDGE_FIELDS = ("floor_rate", "grace", "gap_tolerance", "terminal_gap", "edge_margin")
 MIN_JUDGE_FLOOR_RATE = 0.5
@@ -338,12 +339,15 @@ def judge_field(partial: Mapping[str, Any]) -> dict[str, Any] | None:
     return None if judge == DEFAULT_DRAW_JUDGE else judge.to_contract()
 
 
-def _max_prompt_tokens(raw) -> int | None:
+def _max_prompt_tokens(raw, sampling: Sampling) -> int | None:
     if "max_prompt_tokens" not in raw:
         return None
     value = _positive_int(raw, "max_prompt_tokens")
-    if value > MAX_JOB_PROMPT_TOKENS:
-        raise JobError(f"max_prompt_tokens must be at most {MAX_JOB_PROMPT_TOKENS}, got {value}")
+    limit = MAX_JOB_PROMPT_TOKENS
+    if sampling.draw is not None and "episode" not in raw:
+        limit = MAX_DRAWN_SEQUENCE_TOKENS - sampling.max_new_tokens
+    if value > limit:
+        raise JobError(f"max_prompt_tokens must be at most {limit} for this job, got {value}")
     return value
 
 
@@ -1034,6 +1038,7 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
         raise JobError(f"deadline_round must be a non-negative round or null, got {deadline_round!r}")
 
     prompt_source = _text(raw, "prompt_source")
+    sampling = _parse_sampling(raw["sampling"])
     job = JobSpec(
         job_id=job_id,
         checkpoint_repo=_text(raw, "checkpoint_repo"),
@@ -1043,7 +1048,7 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
         prompt_count=_positive_int(raw, "prompt_count"),
         renderer_id=_text(raw, "renderer_id"),
         eos_token_id=_non_negative_int(raw, "eos_token_id"),
-        sampling=_parse_sampling(raw["sampling"]),
+        sampling=sampling,
         slots_per_prompt=_positive_int(raw, "slots_per_prompt"),
         filter=_parse_filter(raw["filter"]),
         prompt_order=prompt_order,
@@ -1053,7 +1058,7 @@ def parse_job(raw: Mapping[str, Any]) -> JobSpec:
         ),
         seed=_non_negative_int(raw, "seed") if "seed" in raw else None,
         submit=_submit(raw),
-        max_prompt_tokens=_max_prompt_tokens(raw),
+        max_prompt_tokens=_max_prompt_tokens(raw, sampling),
         judge=_judge(raw),
         episode=(_parse_episode(raw["episode"], is_eval_source(prompt_source))
                  if "episode" in raw else None),
