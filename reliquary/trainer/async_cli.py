@@ -303,7 +303,8 @@ def run_async_train_worker() -> None:
                 audit_fn = miles_audit
             else:
                 audit_fn = audit_group if dist_ctx is None else broadcasting_audit(channel)
-            audits = TrainerAudits(link, audit_fn=audit_fn)
+            audits = TrainerAudits(link, audit_fn=audit_fn,
+                                   max_rollouts_per_call=settings.get("audit_rollouts_per_call", 64))
         logger.info("startup_stage=trainer_model_load elapsed_seconds=%.3f", time.monotonic() - started)
         reset_training_state()
 
