@@ -46,7 +46,7 @@ def test_negative_or_non_finite_audit_knobs_are_refused(name, value):
 
 
 def test_the_miles_chunk_is_a_setting():
-    assert miles_settings(MILES)["chunk"] == 64
+    assert miles_settings(MILES)["chunk"] == 256
     assert miles_settings({**MILES, "RELIQUARY_MILES_CHUNK": "1024"})["chunk"] == 1024
     with pytest.raises(ValueError):
         miles_settings({**MILES, "RELIQUARY_MILES_CHUNK": "0"})

@@ -18,6 +18,7 @@ and tokenizer; Hugging Face backups every ``RELIQUARY_RL_HF_BACKUP_EVERY`` steps
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -203,6 +204,55 @@ def resume_weights(link, *, validator_hotkey: str, work_dir: Path, sync=None, fe
     return state, version, sync.model_dir
 
 
+PROFILE_ADOPTED_ENV = "RELIQUARY_RL_TRAINER_PROFILE_ADOPTED"
+
+
+def _restart(env: dict) -> None:
+    """This process again, same command, under ``env`` (a console script runs as ``python <script> args``)."""
+    import sys
+
+    os.execve(sys.executable, [sys.executable, *sys.argv], env)
+
+
+def adopt_task_profile(task: Mapping[str, Any], environ: Mapping[str, str], *, active: str, state_dir: Path,
+                       reexec=_restart) -> None:
+    """Run the protocol profile the controller runs (``task["profile"]``, ``/rl/trainer/config``).
+
+    A rented trainer pod is started with no ``RELIQUARY_PROTOCOL_PROFILE`` (the platform sends the order's model
+    only), and the profile is read at import: this process would train, judge and audit under the default profile.
+    Without either profile variable, the controller's profile (or its carried contract, written under
+    ``state_dir``) is set and the process starts again (``reexec(env)``, before any model work; ``reexec=None``:
+    torchrun ranks cannot restart alone, so it is refused). With one set, it must name the controller's profile.
+    An older controller that sends no profile leaves the local one (a warning)."""
+    from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
+
+    wanted = task.get("profile")
+    if not isinstance(wanted, Mapping) or not wanted.get("profile_id"):
+        logger.warning("the controller sends no protocol profile: running %s", active)
+        return
+    profile_id, contract = str(wanted["profile_id"]), wanted.get("contract")
+    explicit = any(str(environ.get(n, "")).strip() for n in ("RELIQUARY_PROTOCOL_PROFILE", TASK_CONTRACT_ENV_VAR))
+    if active == profile_id and (explicit or contract is None):
+        return
+    if explicit or str(environ.get(PROFILE_ADOPTED_ENV, "")).strip():
+        raise SystemExit(f"this trainer runs the protocol profile {active!r}, its controller {profile_id!r}: "
+                         f"set RELIQUARY_PROTOCOL_PROFILE / RELIQUARY_TASK_CONTRACT to the controller's")
+    if reexec is None:
+        raise SystemExit(f"set RELIQUARY_PROTOCOL_PROFILE={profile_id} (or the task contract) on every rank: "
+                         f"the controller runs it, this trainer runs {active!r}")
+    env = {k: v for k, v in environ.items() if k not in ("RELIQUARY_PROTOCOL_PROFILE", TASK_CONTRACT_ENV_VAR)}
+    env[PROFILE_ADOPTED_ENV] = "1"
+    if contract is not None:
+        path = Path(state_dir) / "task-contract.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(contract, sort_keys=True))
+        env[TASK_CONTRACT_ENV_VAR] = str(path)
+    else:
+        env["RELIQUARY_PROTOCOL_PROFILE"] = profile_id
+    logger.warning("adopting the controller's protocol profile %s (was %s): restarting", profile_id, active)
+    reexec(env)
+
+
 def settle_logging() -> list[str]:
     """Import bittensor now, then give back the Reliquary loggers it muted; returns their names.
 
@@ -269,6 +319,11 @@ def run_async_train_worker() -> None:
         # longer than the platform's staleness window, and it replaces a pod it sees silent.
         heartbeat = TrainerHeartbeat(link, settings["heartbeat_s"]).start()
         task = link.config()
+        from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
+
+        # before any model work: a restart under the controller's profile costs seconds here
+        adopt_task_profile(task, os.environ, active=ACTIVE_PROTOCOL_PROFILE.profile_id,
+                           state_dir=settings["state_dir"], reexec=_restart if dist_ctx is None else None)
         telemetry.init(settings["validator_hotkey"], {
             "task_id": task["task_id"], "run": task["run"], "targets": task["targets"], "backend": backend,
             "batch_groups": settings["batch_groups"], "steps_per_checkpoint": settings["steps_per_checkpoint"],
@@ -392,14 +447,14 @@ def run_async_train_worker() -> None:
 def _start_miles(model_path, version: int | None, eos_ids):
     """``RELIQUARY_TRAINER_BACKEND=miles``: the gateway started on this box's GPUs from ``model_path``, then the
     trainer's callables on it. This process keeps no GPU (the gateway holds them all)."""
-    from reliquary.constants import GRAD_NORM_SKIP_THRESHOLD, PROTOCOL_MODEL_ID
+    from reliquary.constants import DEFAULT_BASE_MODEL, GRAD_NORM_SKIP_THRESHOLD, PROTOCOL_MODEL_ID
     from reliquary.trainer import miles_gateway
     from reliquary.trainer.audits import gateway_audit
     from reliquary.trainer.miles_engine import MilesState, MilesTrainStep, expected_weight_specs
 
     import signal
 
-    settings = miles_gateway.miles_settings()
+    settings = miles_gateway.miles_settings(base_model=DEFAULT_BASE_MODEL)   # no RELIQUARY_MILES_* needed
     miles_gateway.check_gateway_constants(settings["python"])
 
     def _terminate(signum, frame):           # a plain SIGTERM must still run the finally that stops the gateway
@@ -413,7 +468,7 @@ def _start_miles(model_path, version: int | None, eos_ids):
         client = miles_gateway.WatchedClient(
             miles_gateway.create_full_training_client(gateway.base_url, PROTOCOL_MODEL_ID),
             alive=lambda: gateway.process.poll() is None)
-        step_fn = MilesTrainStep(client, eos_ids=eos_ids, chunk=settings.get("chunk", 64),
+        step_fn = MilesTrainStep(client, eos_ids=eos_ids, chunk=settings["chunk"],
                                  global_step_hint=version or 0)
         state_fn = MilesState(client, checkpoint_root=settings["output_dir"],
                               expected=expected_weight_specs(model_path), base_dir=model_path,

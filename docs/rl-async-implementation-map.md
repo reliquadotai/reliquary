@@ -1067,7 +1067,14 @@ task declared for period settlement refuses to start in window mode).
   GPU box. Calls retry transport errors / 429 / 5xx for 10 min; a resent report the validator no longer holds
   counts as done; idle, the trainer requeues taken groups (a take whose answer was lost).
 - Trainer (`reliquary train-async`, `trainer/async_cli.py`): `RELIQUARY_RL_TRAINER_URL`, `_TOKEN`,
-  `RELIQUARY_RL_VALIDATOR_HOTKEY`, `R2_PUBLIC_*`; mix and run from `/rl/trainer/config`; fresh book = base model,
+  `RELIQUARY_RL_VALIDATOR_HOTKEY`, `R2_PUBLIC_*`; mix, run and protocol profile from `/rl/trainer/config` (its
+  `profile`: the controller's profile id and carried contract; a trainer started with no
+  `RELIQUARY_PROTOCOL_PROFILE` / `RELIQUARY_TASK_CONTRACT`, as a rented RL-orders pod is, adopts it and restarts
+  once before loading; an explicit one must match). Miles backend out of the box (`trainer/miles_gateway.py`):
+  every visible GPU, TP 2 (capped at the cards; cards divisible by TP), the Megatron model type from the model
+  name (Qwen3.5 0.8B/4B/9B/27B/35B-A3B), `--max-tokens-per-gpu 65536` with full recompute, chunk 256 (measured on
+  Qwen3.5-4B, 2xH200: TP2 + full recompute at 64k ~3.9k tok/s/GPU; TP1 and selective recompute OOM at 64k; Tinker
+  refuses context parallelism); any `RELIQUARY_MILES_*` set overrides. Fresh book = base model,
   published and adopted as 0; else resume = the latest index version rebuilt through the signed `/rl/checkpoint`
   (`CheckpointSync`, an unadopted published version adopted first), written as an HF dir and loaded (optimizer
   fresh, `global_step_hint = k x steps_per_checkpoint`); `DeltaPublisher(model_dir=)` into `reliquary-public`;

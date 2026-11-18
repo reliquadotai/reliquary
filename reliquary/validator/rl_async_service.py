@@ -490,6 +490,19 @@ def executor_trainer_auth(task_id: str, *, store=None, clock: Callable[[], float
     return auth
 
 
+def trainer_task_profile() -> dict:
+    """What a trainer needs to run this controller's profile (``/rl/trainer/config``'s ``profile``): its id, and
+    the carried contract when the task runs one (``RELIQUARY_TASK_CONTRACT``), else None. A rented trainer pod is
+    started without any profile variable and adopts this one (``async_cli.adopt_task_profile``)."""
+    import json
+
+    from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE, TASK_CONTRACT_ENV_VAR
+
+    path = os.environ.get(TASK_CONTRACT_ENV_VAR)
+    contract = json.loads(Path(path).read_text()) if path else None
+    return {"profile_id": ACTIVE_PROTOCOL_PROFILE.profile_id, "contract": contract}
+
+
 def build_rl_trainer_router(rl: RlAsync, *, token: str | None = None, auth: TrainerAuth | None = None,
                             prefix: str = "/rl/trainer") -> APIRouter:
     """The detached async trainer's view of the buffer, the submissions' report, the lease book's checkpoints and
@@ -571,8 +584,10 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str | None = None, auth: Trai
             tuple(float(m) for m in b.get("rollout_match") or ()), bool(b.get("suspect", False))))
         return {"ok": True}
 
+    profile = trainer_task_profile()
     route("GET", "config", lambda b: {"task_id": rl.settings.task_id, "run": rl.settings.run,
-                                      "targets": dict(rl.settings.targets), "latest": rl.book.latest_checkpoint})
+                                      "targets": dict(rl.settings.targets), "latest": rl.book.latest_checkpoint,
+                                      "profile": profile})
     route("GET", "latest", lambda b: {"latest": rl.book.latest_checkpoint})
     route("POST", "adopt", adopt)
     def take(b: dict) -> dict:
