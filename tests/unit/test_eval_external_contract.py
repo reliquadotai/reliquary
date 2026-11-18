@@ -19,7 +19,7 @@ from reliquary.protocol.external_eval import (
 from tests.unit.test_admin_eval_jobs import (  # noqa: F401
     MODEL, REVISION, SAMPLING, THRESHOLDS, _qualify, admin,
 )
-from tests.unit.test_eval_verifiers_source import FakeTask, fake_handle
+from tests.unit.test_eval_verifiers_source import FakeTask, fake_handle, installed_taskset_site  # noqa: F401
 from tests.unit.test_eval_verifiers_source import opener as taskset_opener
 from tests.unit.test_jobs_cli import registry  # noqa: F401
 
@@ -68,15 +68,18 @@ def test_which_environment_a_set_declares():
 def _publish_verifiers_set(root):
     from reliquary.corpus.delivery import LocalDirectorySink
 
+    from reliquary.eval.verifiers_source import installed_artifacts
+
+    handle = fake_handle([FakeTask(i, system="be brief" if i == 0 else None) for i in range(6)])
+    handle.artifact_sha256 = installed_artifacts(handle.package)
     card = build_source_set("verifiers:fake", out=root / "vset", clock=lambda: 1.0,
-                            open_taskset=taskset_opener(fake_handle(
-                                [FakeTask(i, system="be brief" if i == 0 else None)
-                                 for i in range(6)])))
+                            open_taskset=taskset_opener(handle))
     asyncio.run(publish_set(root / "vset", platform=LocalDirectorySink(root / "p"),
                             subnet=SubnetEvalStore()))
     return card
 
 
+@pytest.mark.usefixtures("installed_taskset_site")
 def test_an_eval_job_on_a_verifiers_set(admin):  # noqa: F811
     from reliquary.validator.eval_control import order_job_refusal
 

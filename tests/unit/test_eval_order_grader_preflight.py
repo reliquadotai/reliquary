@@ -14,6 +14,7 @@ from reliquary.eval.storage import SubnetEvalStore, publish_set, subnet_key
 from reliquary.infrastructure import corpus_job_store as job_store
 from tests.unit.test_admin_eval_jobs import _eval_job, _qualification, _qualify, admin  # noqa: F401
 from tests.unit.test_eval_grading import GradingEnvironment
+from tests.unit.test_eval_verifiers_source import installed_taskset_site  # noqa: F401
 from tests.unit.test_jobs_cli import registry  # noqa: F401
 from tests.unit.test_order_pinned import _order, pins  # noqa: F401
 
@@ -162,27 +163,17 @@ def test_a_malformed_sealed_card_returns_422_before_any_write(
 
 
 @pytest.fixture
-def local_taskset(admin, tmp_path, monkeypatch):
+def local_taskset(admin, tmp_path, installed_taskset_site):
     from reliquary.eval.sets import build_source_set
     from reliquary.eval.verifiers_source import installed_artifacts
     from tests.unit.test_eval_verifiers_source import FakeTask, fake_handle, opener
 
-    site = tmp_path / "site"
-    site.mkdir()
-    monkeypatch.syspath_prepend(str(site))
-    for name, version in (("fake-pkg", "1.0"), ("verifiers", "0.3.1")):
-        module = name.replace("-", "_")
-        metadata = site / f"{module}-{version}.dist-info"
-        metadata.mkdir()
-        (metadata / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
-        (metadata / "RECORD").write_text(f"{module}.py,,\n")
-        (site / f"{module}.py").write_text("raise AssertionError('admission imported scorer code')")
     handle = fake_handle([FakeTask(i) for i in range(5)])
     handle.artifact_sha256 = installed_artifacts(handle.package)
     directory = tmp_path / "verifiers-set"
     card = build_source_set("verifiers:fake", set_id=SET_ID, out=directory, open_taskset=opener(handle))
     asyncio.run(publish_set(directory, platform=None, subnet=SubnetEvalStore()))
-    return site, _order(eval_set_id=SET_ID, env=card["env"])
+    return installed_taskset_site, _order(eval_set_id=SET_ID, env=card["env"])
 
 
 @pytest.mark.parametrize("change", ["missing", "missing_file", "malformed_origin", "taskset", "verifiers", "version"])
