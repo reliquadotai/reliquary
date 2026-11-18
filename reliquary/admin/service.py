@@ -718,6 +718,17 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 f"rows [{start}, {start + count}) run past {env!r}, which has "
                 f"{source_rows[env]} rows"))
 
+    async def require_prompt_budget(body: CreateJob, card: dict, revision: str) -> None:
+        from reliquary.eval.episode_jobs import prompt_budget_refusal
+
+        refusal = prompt_budget_refusal(card, model=body.model, revision=revision,
+                                       renderer_id=THINKING_RENDERERS[body.thinking], count=body.prompt_count,
+                                       max_prompt_tokens=body.max_prompt_tokens)
+        if refusal:
+            existing, _ = await job_store.read_job(body.job_id)
+            if existing is None:
+                raise HTTPException(status_code=422, detail=refusal)
+
     def refuse_unsupported(result: dict) -> None:
         from reliquary.constants import SUPPORTED_ARCHITECTURES
 
@@ -891,17 +902,6 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if card_body is None or prompts_body is None:
             raise HTTPException(status_code=404, detail="set_unknown")
         return json.loads(card_body), prompts_body
-
-    async def require_prompt_budget(body: CreateJob, card: dict, revision: str) -> None:
-        from reliquary.eval.episode_jobs import prompt_budget_refusal
-
-        refusal = prompt_budget_refusal(card, model=body.model, revision=revision,
-                                       renderer_id=THINKING_RENDERERS[body.thinking], count=body.prompt_count,
-                                       max_prompt_tokens=body.max_prompt_tokens)
-        if refusal:
-            existing, _ = await job_store.read_job(body.job_id)
-            if existing is None:
-                raise HTTPException(status_code=422, detail=refusal)
 
     def upload_sampling_differs(sampling: Mapping, body: CreateJob) -> list[str]:
         """An order on an upload's group runs the sampling its lines asked for (``orders.uploads``)."""
