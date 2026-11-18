@@ -123,8 +123,10 @@ def paid_tokens(detail: dict, floor: float) -> int:
 class RlPayLedger:
     def __init__(self, book, submissions, prices, config: LedgerConfig,
                  clock: Callable[[], float] = time.time) -> None:
-        """``prices.token_price(env)`` prices a matched token (``AsyncPriceController``)."""
+        """``prices.token_price(env)`` prices a matched token (``AsyncPriceController``), unless the book's leases
+        carry their own price (``book.auctions``: a task priced by auction)."""
         self.book, self.submissions, self.prices, self.config, self.clock = book, submissions, prices, config, clock
+        self.auctions = getattr(book, "auctions", None)
         self._board: tuple[float, dict] | None = None
         self._beat_at: float | None = None        # the last trainer_beat write (memory only)
         with book.lock:
@@ -143,6 +145,15 @@ class RlPayLedger:
                                     "ORDER BY seq DESC LIMIT ?",
                                     (environment, TRAINED, self.config.reference_groups)).fetchall()
         return sum(r[0] for r in rows) / len(rows) if rows else float(self.config.default_group_tokens)
+
+    def _price(self, lease_id: str, environment: str) -> float:
+        """A matched token's price: its lease's, on a task priced by auction; else the env's price at ingestion."""
+        if self.auctions is not None:
+            row = self.book.db.execute("SELECT price FROM rl_leases WHERE lease_id=?", (lease_id,)).fetchone()
+            if row is not None and row[0] is not None:
+                return float(row[0])
+            return 0.0                            # a lease gone from the book, or granted before the auction
+        return float(self.prices.token_price(environment))
 
     def _banned(self, hotkey: str, at: float) -> bool:
         row = self.book.db.execute("SELECT until FROM rl_pay_bans WHERE hotkey=?", (hotkey,)).fetchone()
@@ -168,18 +179,23 @@ class RlPayLedger:
                 if kind == TRAINED:
                     environment = detail["environment"]
                     tokens = paid_tokens(detail, self.config.floor)
-                    price = float(self.prices.token_price(environment))
+                    price = self._price(event["lease_id"], environment)
                     amount = tokens * price
                 elif kind == FIRST_SCAN:
                     row = db.execute("SELECT environment FROM rl_groups WHERE lease_id=?",
                                      (event["lease_id"],)).fetchone()
                     environment = row[0]
                     tokens = 0
-                    price = float(self.prices.token_price(environment))
+                    price = self._price(event["lease_id"], environment)
                     amount = float(detail["fraction"]) * price * self._reference_tokens(environment)
                 else:
                     continue                      # untrained, first_scan_forfeited: no money
                 status = FORFEITED if self._banned(hotkey, at) else ACCRUED
+                if self.auctions is not None and status == ACCRUED:
+                    if kind == TRAINED:
+                        self.auctions.trained_tokens(environment, tokens)
+                    # An undelivered lease's charge is taken back from the hotkey's next pay on the env.
+                    amount -= self.auctions.take_debit(environment, hotkey, amount)
                 db.execute("INSERT INTO rl_accruals(seq, lease_id, hotkey, environment, kind, at, period, "
                            "matched_tokens, token_price, amount, status) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                            (event["seq"], event["lease_id"], hotkey, environment, kind, at, self._open_period(at),
@@ -488,9 +504,25 @@ class RlPayLedger:
         with self.book.lock:
             periods = [(w, e, p) for w, e, p in self.book.db.execute(
                 "SELECT work_period, entry_period, published FROM rl_pay_periods ORDER BY work_period DESC LIMIT 12")]
-        environments = self.prices.board()
+        if self.auctions is not None:             # each lease's own price: the auction's view per env
+            environments = {name: {"auction": view} for name, view in
+                            self.auctions.view()["environments"].items()}
+        else:
+            environments = self.prices.board()
         for name, entry in environments.items():
             entry["recent"] = self._recent(name)
+        if self.auctions is not None:
+            return {"policy": "pay-per-matched-token/v1", "pricing": "auction", "floor": self.config.floor,
+                    "cap": self.config.cap, "period": cp.period_of(now, self.config.genesis),
+                    "period_seconds": cp.PERIOD_SECONDS, "environments": environments, "hotkeys": balances,
+                    "settled_periods": [{"work_period": w, "entry_period": e, "published": p == 1}
+                                        for w, e, p in periods],
+                    "note": ("Units are fractions of the task's emission cap. A trained rollout at or above the floor "
+                             "earns its matched tokens x its lease's price (the auction's price of the moment when "
+                             "granted, never under the holder's offer); an out-of-zone first scan earns 25 % of that "
+                             "price x the env's mean matched tokens per trained group. A lease not delivered is "
+                             "charged its price x that mean, taken from the next pay on the env. A period pays at "
+                             "most the cap.")}
         return {"policy": "pay-per-matched-token/v1", "floor": self.config.floor, "cap": self.config.cap,
                 "start_pool": getattr(self.prices, "start_pool", self.config.cap),
                 "period": cp.period_of(now, self.config.genesis), "period_seconds": cp.PERIOD_SECONDS,

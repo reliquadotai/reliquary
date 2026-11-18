@@ -1097,6 +1097,34 @@ def verify_rl_lease_forfeit_signature(hotkey: str, *, at: int, lease_id: str, si
     return verify_hotkey_signature(hotkey, binding, signature)
 
 
+# A hotkey's offer on one env of an RL task priced by auction (``rl_auction``): its price per million matched
+# tokens and the groups it can hold at once, signed for one validator and route, single-use.
+RL_ASK_DOMAIN = b"reliquary/rl-ask/v1"
+
+
+def build_rl_ask_binding(*, hotkey: str, at: int, environment: str, micro_alpha_per_mtoken: int, capacity: int,
+                         validator_hotkey: str, path: str) -> bytes:
+    for name, value in (("at", at), ("micro_alpha_per_mtoken", micro_alpha_per_mtoken), ("capacity", capacity)):
+        if type(value) is not int or value < 0:
+            raise TypeError(f"{name}: non-negative integer required")
+    return _bound(RL_ASK_DOMAIN, [str(hotkey).encode("utf-8"), at.to_bytes(8, "big", signed=False),
+                                  str(environment).encode("utf-8"),
+                                  micro_alpha_per_mtoken.to_bytes(8, "big", signed=False),
+                                  capacity.to_bytes(4, "big", signed=False), *_audience(validator_hotkey, path)])
+
+
+def verify_rl_ask_signature(hotkey: str, *, at: int, environment: str, micro_alpha_per_mtoken: int, capacity: int,
+                            signature: str, validator_hotkey: str, path: str) -> bool:
+    """False on any failure; fail-closed without bittensor."""
+    try:
+        binding = build_rl_ask_binding(hotkey=hotkey, at=at, environment=environment,
+                                       micro_alpha_per_mtoken=micro_alpha_per_mtoken, capacity=capacity,
+                                       validator_hotkey=validator_hotkey, path=path)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return verify_hotkey_signature(hotkey, binding, signature)
+
+
 # A miner's async RL submission (rl-async-design.md §4.4), signed for one validator and route: the lease it ends
 # and the digest of its rollouts (``protocol.rl_submit.rollouts_digest``).
 RL_SUBMIT_DOMAIN = b"reliquary/rl-submit/v1"
