@@ -877,16 +877,36 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=404, detail="set_unknown")
         return json.loads(card_body), prompts_body
 
-    async def require_set_grader(card: dict, *, job_id: str | None = None) -> None:
+    def validate_local_grader(card: dict) -> None:
+        from importlib.metadata import PackageNotFoundError, version
         from reliquary.eval.protocol import validate_set
+        from reliquary.eval.verifiers_source import installed_artifacts, taskset_id
 
+        sealed = validate_set(card, current_grader=True)
+        if (not sealed or card.get("source_kind") != "verifiers"
+                or card.get("interaction", "single_turn") != "single_turn"):
+            return
+        # These single-turn rewards run on the admin. Read installed metadata and files without loading a task.
+        taskset = card["taskset"]
+        package = taskset["package"]
+        if taskset_id(card["source"]) != taskset["id"]:
+            raise ValueError("set protocol taskset source drift")
+        try:
+            if (version(package) != taskset["package_version"]
+                    or version("verifiers") != taskset["verifiers_version"]
+                    or installed_artifacts(package) != taskset["artifact_sha256"]):
+                raise ValueError("set protocol taskset grader drift")
+        except (PackageNotFoundError, OSError) as exc:
+            raise HTTPException(status_code=503, detail="taskset grader unavailable") from exc
+
+    async def require_set_grader(card: dict, *, job_id: str | None = None) -> None:
         try:
             if job_id is not None:
                 existing, _ = await job_store.read_job(job_id)
                 if existing is not None:
                     # Preserve idempotent replay of an existing declaration after a grader update.
                     return
-            validate_set(card, current_grader=True)
+            await asyncio.to_thread(validate_local_grader, card)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except (KeyError, TypeError, AttributeError) as exc:

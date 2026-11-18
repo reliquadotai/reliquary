@@ -159,3 +159,55 @@ def test_a_malformed_sealed_card_returns_422_before_any_write(
     assert response.status_code == 422, response.text
     assert response.json()["detail"] == "set protocol malformed"
     assert (admin.bucket.objects, admin.registry["entries"]) == before
+
+
+@pytest.fixture
+def local_taskset(admin, tmp_path, monkeypatch):
+    from reliquary.eval.sets import build_source_set
+    from reliquary.eval.verifiers_source import installed_artifacts
+    from tests.unit.test_eval_verifiers_source import FakeTask, fake_handle, opener
+
+    site = tmp_path / "site"
+    site.mkdir()
+    monkeypatch.syspath_prepend(str(site))
+    for name, version in (("fake-pkg", "1.0"), ("verifiers", "0.3.1")):
+        module = name.replace("-", "_")
+        metadata = site / f"{module}-{version}.dist-info"
+        metadata.mkdir()
+        (metadata / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
+        (metadata / "RECORD").write_text(f"{module}.py,,\n")
+        (site / f"{module}.py").write_text("raise AssertionError('admission imported scorer code')")
+    handle = fake_handle([FakeTask(i) for i in range(5)])
+    handle.artifact_sha256 = installed_artifacts(handle.package)
+    directory = tmp_path / "verifiers-set"
+    card = build_source_set("verifiers:fake", set_id=SET_ID, out=directory, open_taskset=opener(handle))
+    asyncio.run(publish_set(directory, platform=None, subnet=SubnetEvalStore()))
+    return site, _order(eval_set_id=SET_ID, env=card["env"])
+
+
+@pytest.mark.parametrize("change", ["missing", "taskset", "verifiers", "version"])
+def test_incompatible_installed_verifiers_scorer_refuses_before_writes(admin, pins, local_taskset, change):
+    site, body = local_taskset
+    if change == "missing":
+        (site / "fake_pkg-1.0.dist-info").rename(site / "uninstalled")
+    elif change == "version":
+        (site / "fake_pkg-1.0.dist-info" / "METADATA").write_text("Name: fake-pkg\nVersion: 2.0\n")
+    else:
+        module = "fake_pkg" if change == "taskset" else "verifiers"
+        (site / f"{module}.py").write_text("# different scorer bytes")
+    before = copy.deepcopy(admin.bucket.objects), copy.deepcopy(admin.registry["entries"])
+    for path, request in (("/admin/v1/qualifications", _qualification(set_id=SET_ID)),
+                          ("/admin/v1/jobs/validate", body), ("/admin/v1/jobs", body)):
+        response = admin("POST", path, request)
+        assert response.status_code == (503 if change == "missing" else 422), response.text
+        assert "taskset" in response.json()["detail"]
+        assert (admin.bucket.objects, admin.registry["entries"]) == before
+
+
+def test_local_scorer_preflight_preserves_a_replay_after_artifact_drift(admin, pins, local_taskset):
+    site, body = local_taskset
+    assert admin("POST", "/admin/v1/jobs", body).status_code == 201
+    (site / "fake_pkg.py").write_text("# changed after creation")
+    before = copy.deepcopy(admin.bucket.objects), copy.deepcopy(admin.registry["entries"])
+    assert admin("POST", "/admin/v1/jobs", body).status_code == 200
+    assert (admin.bucket.objects, admin.registry["entries"]) == before
