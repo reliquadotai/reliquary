@@ -100,6 +100,22 @@ def test_a_malformed_order_is_refused(on, over):
     assert on("POST", "/admin/v1/training", _order(**over)).status_code == 422
 
 
+@pytest.mark.parametrize("profile_id", ["qwen35-9b-reliquary-suite-v10-gumbel-dev1",
+                                        "qwen38-27b-reliquary-suite-v10-gumbel-dev1"])
+def test_the_larger_models_train_every_env_of_their_profile(on, profile_id):
+    from reliquary.protocol.profiles import PROFILES
+
+    names = sorted(PROFILES[profile_id].environments)
+    shares = [10000 // len(names)] * len(names)
+    shares[0] += 10000 - sum(shares)
+    envs = [{"name": name, "share_bps": share} for name, share in zip(names, shares)]
+    assert training.training_refusal(training.CreateTraining(**_order(profile_id=profile_id,
+                                                                       environments=envs))) is None
+    created = on("POST", "/admin/v1/training", _order(profile_id=profile_id))
+    assert created.status_code == 201, created.text
+    assert on.registry["entries"]["order-train-t1"].profile_id == profile_id
+
+
 def test_an_env_without_rl_rows_is_refused(monkeypatch):
     from reliquary import env_catalog
 
