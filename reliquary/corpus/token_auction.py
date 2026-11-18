@@ -99,6 +99,8 @@ LEASE_FLOOR_SECONDS = 300.0
 # The mean submission size, in tokens, an unused lease is charged at: an EMA of accepted submissions.
 TOKENS_EMA_WEIGHT = 0.05
 SAVE_SECONDS = 5.0
+# The auditor's audited share is trusted over this many verdicts; under it, the share kept from before a restart.
+Q_TRUSTED_DECISIONS = 300
 
 NO_ASK = "no_ask"
 ASK_ABOVE_PRICE = "ask_above_price"
@@ -284,6 +286,8 @@ class TokenAuction:
         # The median speed last measured, kept over a restart: the merit order resumes at once instead of
         # leaving the job to the thermostat while speeds are measured again (2026-11-18: 5 min at 4 leases).
         self._median_hint: float | None = None
+        self._q_weight: Callable[[], int] | None = None
+        self._q_hint: float | None = None
         self._load()
 
     def bind_holdings(self, holdings: Callable[[], Mapping[str, int]]) -> None:
@@ -302,13 +306,15 @@ class TokenAuction:
         return self._measures
 
     def bind_merit(self, *, audit: Callable[[], tuple[float, float | None] | None] | None = None,
-                   q: Callable[[], float] | None = None, deadline: float | None = None) -> None:
+                   q: Callable[[], float] | None = None, deadline: float | None = None,
+                   q_weight: Callable[[], int] | None = None) -> None:
         """The merit order's inputs: the market's audit (output tokens per second its cards verify, their busy
         share), the share of this job's records audited, its deadline (unix seconds; None: a day after it opens)."""
         if self._pace is not None and audit is not None:
             self._pace.bind_audit(audit)
         with self._lock:
             self._q = q
+            self._q_weight = q_weight
             self._deadline = deadline
 
     def note_progress(self, filled: int, total: int) -> None:
@@ -525,8 +531,18 @@ class TokenAuction:
         if self._q is not None:
             try:
                 q = float(self._q())
+                weight = None if self._q_weight is None else int(self._q_weight())
             except Exception:
                 logger.exception("token auction: audit share unavailable")
+                weight = None
+            else:
+                # Freshly started, the auditor's share stands on few verdicts and reads near q (its prior): the
+                # share measured before the restart stands until enough land (2026-11-18: 0.2 read against 0.43
+                # audited, R* twice too high, the queue swelled, k fell to 0.25 and the 27B price 2.01 -> 0.034).
+                if weight is not None and weight < Q_TRUSTED_DECISIONS and self._q_hint is not None:
+                    q = max(q, self._q_hint)
+                elif weight is None or weight >= Q_TRUSTED_DECISIONS:
+                    self._q_hint = q
         remaining = None
         if self._progress is not None:
             remaining = max(0, self._progress[1] - self._progress[0]) * self._mean_tokens
@@ -832,6 +848,7 @@ class TokenAuction:
                 "mean_tokens": self._mean_tokens,
                 "trusted": self._trusted.snapshot(),
                 "median_speed": self._median_hint,
+                "audit_share": self._q_hint,
                 "audit_rate": None if self._pace is None else self._pace.rate,
             }
 
@@ -859,6 +876,8 @@ class TokenAuction:
                 self._trusted.restore(state["trusted"], self._clock())
             if state.get("median_speed") is not None:
                 self._median_hint = float(state["median_speed"])
+            if state.get("audit_share") is not None:
+                self._q_hint = float(state["audit_share"])
             if self._pace is not None and state.get("audit_rate") is not None:
                 self._pace.seed_rate(float(state["audit_rate"]))
 

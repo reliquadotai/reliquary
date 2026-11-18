@@ -542,6 +542,10 @@ class CorpusAuditor:
         per_record = completions / records if records else 1.0
         return pending * self.audit_share() * per_record
 
+    def audit_decisions(self) -> int:
+        """How many verdicts ``audit_share`` stands on (since this process started)."""
+        return int(self._decided["audit"] + self._decided["pass_unaudited"])
+
     def audit_share(self) -> float:
         """The share of this job's records the GPU audits: its verdicts audited so far (probation and slow-hotkey
         audits included) against q as a prior, never below q."""

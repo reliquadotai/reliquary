@@ -1605,7 +1605,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 # The merit order fills what the model's audit cards verify, at the share this job audits.
                 model = (job.checkpoint_repo, job.checkpoint_revision)
                 w.auction.bind_merit(audit=lambda: dispatcher.audit_pace(model),
-                                     q=lambda: w.auditor.audit_share())
+                                     q=lambda: w.auditor.audit_share(),
+                                     q_weight=lambda: w.auditor.audit_decisions())
         return w.auction
 
     async def wire(entry, cap, job):
