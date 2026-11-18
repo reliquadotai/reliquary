@@ -105,6 +105,8 @@ LEASE_SCOPED_PATH = "/corpus/jobs/{job_id}/lease"
 LEASE_RELEASE_SCOPED_PATH = "/corpus/jobs/{job_id}/lease/release"
 # A lease request is fresh within this many seconds of its ``issued_at``; its nonce is single-use meanwhile.
 LEASE_REQUEST_SKEW_SECONDS = 120.0
+# An accepted submission of a hotkey whose offer swaps carries up to this many next leases (its slots permitting).
+SWAP_LEASES = 4
 # A job priced by auction (``corpus.token_auction``): a hotkey's ask, and the job's public rounds.
 ASK_PATH = "/corpus/ask"
 ASK_SCOPED_PATH = "/corpus/jobs/{job_id}/ask"
@@ -2263,7 +2265,12 @@ def build_corpus_router(
                         raise _ledger_corrupt(LedgerSnapshotError("existing accepted record differs"))
                     state = await _read_state(job)
                     written = Verdict(True, "accepted", slots_remaining=state.slots.remaining(request.prompt_index))
-            return _respond(written)
+            response = _respond(written)
+            if written.accepted and drawn and auction is not None:
+                swapped = await _swap_leases(job, request.miner_hotkey)
+                if swapped:
+                    response.detail["next_leases"] = swapped
+            return response
 
         logger.warning(
             "corpus ledgers for %s stayed contended over %d attempts (miner %s)",
@@ -2824,6 +2831,62 @@ def build_corpus_router(
         gated = await _hotkey_refusal(request.miner_hotkey)
         return _lease_refused(gated) if gated is not None else None
 
+    def _grant_leases(job, state, hotkey: str, wanted: int):
+        """Up to ``wanted`` leases for ``hotkey`` (off the event loop), and why the next one was not granted
+        (None when all were)."""
+        from reliquary.corpus.draw_leases import free_draw_slots
+
+        if lease_seen.get("state") is not state:
+            built = set(state.pending)
+            for ref in state.segments:
+                built.update(seen_index._contents.get(ref.id, ()))
+            lease_seen.update(state=state, seen=built)
+        seen = lease_seen["seen"]
+        ledger = state.slots
+        leases = _leases(job)
+
+        def taken(prompt: int, slot: int) -> bool:
+            return slot_key(prompt, slot, ledger.slot_attempt(prompt, slot)) in seen
+
+        granted = []
+        for _ in range(wanted):
+            terms = None
+            seconds = None
+            if auction is not None:
+                terms = auction.admit(hotkey)
+                if isinstance(terms, str):
+                    return granted, terms
+                seconds = auction.lease_seconds(hotkey, leases.seconds, held=len(leases.held_by(hotkey)))
+            try:
+                lease = leases.grant(hotkey, free_draw_slots(job, ledger, taken),
+                                     price=None if terms is None else terms.price, seconds=seconds,
+                                     offer=None if terms is None else terms.offer)
+            finally:
+                if terms is not None:
+                    auction.unreserve(terms)
+            if lease is None or isinstance(lease, str):
+                return granted, "no_free_slot" if lease is None else lease
+            granted.append(lease)
+        return granted, None
+
+    async def _swap_leases(job, hotkey: str) -> list[dict]:
+        """An accepted submission of a hotkey whose offer swaps: its next leases, up to its slots, in the same
+        answer (docs/design/2026-11-17-lease-allocation.md 3.5). Never fails the submission."""
+        if auction is None or not auction.swaps(hotkey):
+            return []
+        try:
+            if suspect_until is not None and await suspect_until(hotkey) is not None:
+                return []                     # its audits just failed: no new work, as on the lease route
+            state = await _read_state(job)
+            if state.slots.is_complete:
+                return []
+            auction.note_progress(state.slots.filled, state.slots.total)
+            granted, _ = await asyncio.to_thread(_grant_leases, job, state, hotkey, SWAP_LEASES)
+        except Exception:
+            logger.warning("corpus swap leases for %s failed", hotkey[:12], exc_info=True)
+            return []
+        return [lease.to_wire() for lease in granted]
+
     async def lease_corpus(request: CorpusLeaseRequest) -> CorpusLeaseResponse:
         """A light lease on one of this draw job's free slots (``corpus.draw_leases``)."""
         now = time.time()
@@ -2862,45 +2925,7 @@ def build_corpus_router(
         if auction is not None:
             auction.note_progress(state.slots.filled, state.slots.total)
 
-        def grant():
-            """Up to ``wanted`` leases, and why the next one was not granted (None when all were)."""
-            from reliquary.corpus.draw_leases import free_draw_slots
-
-            if lease_seen.get("state") is not state:
-                built = set(state.pending)
-                for ref in state.segments:
-                    built.update(seen_index._contents.get(ref.id, ()))
-                lease_seen.update(state=state, seen=built)
-            seen = lease_seen["seen"]
-            ledger = state.slots
-            leases = _leases(job)
-
-            def taken(prompt: int, slot: int) -> bool:
-                return slot_key(prompt, slot, ledger.slot_attempt(prompt, slot)) in seen
-
-            granted = []
-            for _ in range(wanted):
-                terms = None
-                seconds = None
-                if auction is not None:
-                    terms = auction.admit(request.miner_hotkey)
-                    if isinstance(terms, str):
-                        return granted, terms
-                    seconds = auction.lease_seconds(request.miner_hotkey, leases.seconds,
-                                                    held=len(leases.held_by(request.miner_hotkey)))
-                try:
-                    lease = leases.grant(request.miner_hotkey, free_draw_slots(job, ledger, taken),
-                                         price=None if terms is None else terms.price, seconds=seconds,
-                                         offer=None if terms is None else terms.offer)
-                finally:
-                    if terms is not None:
-                        auction.unreserve(terms)
-                if lease is None or isinstance(lease, str):
-                    return granted, "no_free_slot" if lease is None else lease
-                granted.append(lease)
-            return granted, None
-
-        granted, why = await asyncio.to_thread(grant)
+        granted, why = await asyncio.to_thread(_grant_leases, job, state, request.miner_hotkey, wanted)
         if not granted:
             return _lease_refused(why, None if auction is None else auction.view(request.miner_hotkey))
         detail = {}
@@ -2931,7 +2956,8 @@ def build_corpus_router(
         lease_nonces[request.nonce] = now + 2 * LEASE_REQUEST_SKEW_SECONDS
         if auction is None:
             return refused("not_priced_by_auction")
-        why = auction.post_ask(request.miner_hotkey, request.micro_alpha_per_mtoken / 1e6, request.capacity)
+        why = auction.post_ask(request.miner_hotkey, request.micro_alpha_per_mtoken / 1e6, request.capacity,
+                               swap=bool(request.swap))
         if why is not None:
             return refused(why)
         return CorpusAskResponse(accepted=True, reason="accepted", detail=auction.view(request.miner_hotkey))

@@ -226,6 +226,7 @@ class Offer:
     price: float                        # pool share per token
     capacity: int
     posted_at: float
+    swap: bool = False                  # takes its next leases in its submissions' answers
 
 
 class TokenAuction:
@@ -304,8 +305,10 @@ class TokenAuction:
 
     # -- offers --------------------------------------------------------------
 
-    def post_ask(self, hotkey: str, alpha_per_mtoken: float, capacity: int | None = None) -> str | None:
-        """Record ``hotkey``'s offer; a refusal string when it is not a positive price and capacity."""
+    def post_ask(self, hotkey: str, alpha_per_mtoken: float, capacity: int | None = None,
+                 swap: bool = False) -> str | None:
+        """Record ``hotkey``'s offer; a refusal string when it is not a positive price and capacity. ``swap``: it
+        takes its next leases in its accepted submissions' answers."""
         try:
             alpha = float(alpha_per_mtoken)
             held = 1 if capacity is None else int(capacity)
@@ -314,9 +317,15 @@ class TokenAuction:
         if not (math.isfinite(alpha) and 0 < alpha <= MAX_ASK_ALPHA_PER_MTOKEN and 1 <= held <= MAX_CAPACITY):
             return "invalid_ask"
         with self._lock:
-            self._offers[hotkey] = Offer(self.params.share_of(alpha), held, self._clock())
+            self._offers[hotkey] = Offer(self.params.share_of(alpha), held, self._clock(), bool(swap))
             self._changed()
         return None
+
+    def swaps(self, hotkey: str) -> bool:
+        """Whether ``hotkey``'s live offer takes its next leases in its submissions' answers."""
+        with self._lock:
+            offer = self._live(hotkey, self._clock())
+            return offer is not None and offer.swap
 
     def ask_of(self, hotkey: str) -> float | None:
         """``hotkey``'s live offer price (pool share per token), or None."""
@@ -758,7 +767,7 @@ class TokenAuction:
     def snapshot(self) -> dict:
         with self._lock:
             return {
-                "offers": {h: [o.price, o.capacity, o.posted_at] for h, o in self._offers.items()},
+                "offers": {h: [o.price, o.capacity, o.posted_at, o.swap] for h, o in self._offers.items()},
                 "budget": self._budget,
                 "debt": dict(self._debt),
                 "missed": {h: list(t) for h, t in self._missed.items()},
@@ -770,8 +779,9 @@ class TokenAuction:
 
     def restore(self, state: Mapping) -> None:
         with self._lock:
-            self._offers = {str(h): Offer(float(p), int(c), float(t))
-                            for h, (p, c, t) in (state.get("offers") or {}).items()}
+            self._offers = {str(h): Offer(float(row[0]), int(row[1]), float(row[2]),
+                                          bool(row[3]) if len(row) > 3 else False)
+                            for h, row in (state.get("offers") or {}).items()}
             budget = int(state.get("budget") or self.params.initial_leases)
             self._budget = min(MAX_LEASES, max(MIN_LEASES, budget))
             self._debt = {str(h): float(v) for h, v in (state.get("debt") or {}).items() if float(v) > 0}
