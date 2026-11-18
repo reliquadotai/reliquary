@@ -182,6 +182,22 @@ def resume_weights(link, *, validator_hotkey: str, work_dir: Path, sync=None, fe
     return state, version, sync.model_dir
 
 
+def settle_logging() -> list[str]:
+    """Import bittensor now, then give back the Reliquary loggers it muted; returns their names.
+
+    bittensor's import sets every logger that already exists to CRITICAL (``shared.log_levels``). The trainer's
+    modules are imported before the checkpoint sync first imports bittensor, so without this its INFO lines
+    (``groups reported``, ``checkpoint published``) never reach the log. Importing it first makes the mute
+    happen once, here, where it is undone."""
+    try:
+        import bittensor  # noqa: F401  (imported for its side effect on logging)
+    except ImportError:
+        pass
+    from reliquary.shared.log_levels import unmute_reliquary_loggers
+
+    return unmute_reliquary_loggers()
+
+
 def disable_cudnn_attention(torch) -> None:
     """The trainer's sdpa never takes the cuDNN backend: its fused attention graph fails on long sequences
     (``mha_graph.execute``) and kills the rank. Flash and memory-efficient kernels serve the same calls."""
@@ -189,6 +205,7 @@ def disable_cudnn_attention(torch) -> None:
 
 
 def run_async_train_worker() -> None:
+    settle_logging()                            # before any reliquary module logs (bittensor mutes them)
     import torch
 
     disable_cudnn_attention(torch)              # every rank, before any model is built
@@ -248,6 +265,7 @@ def run_async_train_worker() -> None:
             model_path = str(write_hf_dir(state, model_dir, state_dir / "resume" / "model"))
             del state
             logger.info("resuming from checkpoint %d", version)
+        settle_logging()                        # again: a module imported since may have met bittensor first
         load_kwargs = {}
         eos_ids = _eos_ids(model_path, load_kwargs)
 
@@ -391,4 +409,4 @@ def run_forever(trainer, *, steps: int | None = None) -> None:
         done += 1
 
 
-__all__ = ["async_trainer_settings", "resume_weights", "run_async_train_worker", "run_forever"]
+__all__ = ["async_trainer_settings", "resume_weights", "run_async_train_worker", "run_forever", "settle_logging"]
