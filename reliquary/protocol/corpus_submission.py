@@ -338,6 +338,9 @@ class CorpusAskRequest(BaseModel):
     issued_at: int = Field(ge=0)
     nonce: str = Field(pattern=r"^[0-9a-f]{32}$")
     signature: str = Field(min_length=1, max_length=256)
+    # The hotkey takes its next leases in its accepted submissions' answers (``detail["next_leases"]``): each
+    # submission refills its batch without a lease request (docs/design/2026-11-17-lease-allocation.md 3.5).
+    swap: bool | None = None
 
 
 class CorpusAskResponse(BaseModel):

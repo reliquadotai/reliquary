@@ -711,6 +711,17 @@ class PairedAuditDispatcher:
         measured = self._scored_per_second(model)
         return None if measured is None else (measured[1] / measured[3], measured[2] / measured[3])
 
+    def audit_pace(self, model: ModelKey) -> tuple[float, float | None] | None:
+        """What the merit order fills to (``corpus.lease_allocator``): the completion tokens per second the live
+        executors of ``model`` audit together (one's measured speed x how many are live), and their busy share
+        over the window; None until measured."""
+        measured = self._scored_per_second(model)
+        live = len(self.live_executors(model))
+        if measured is None or live <= 0:
+            return None
+        busy = measured[3]
+        return measured[1] / busy * live, min(1.0, busy / (THROUGHPUT_WINDOW_SECONDS * live))
+
     def status(self) -> dict:
         """Per model, what the fleet must know: ``executors_needed`` more
         executors (on providers and hosts distinct from the live ones) to
@@ -1585,6 +1596,12 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 getattr(w.entry, "params", None),
                 backlog=lambda: w.auditor.audit_backlog() + dispatcher.pending_items(job_id),
                 state_path=state_path_for(job_id), job=getattr(w, "job", None))
+            job = getattr(w, "job", None)
+            if w.auction is not None and w.auction.measures and job is not None:
+                # The merit order fills what the model's audit cards verify, at the share this job audits.
+                model = (job.checkpoint_repo, job.checkpoint_revision)
+                w.auction.bind_merit(audit=lambda: dispatcher.audit_pace(model),
+                                     q=lambda: w.auditor.audit_share())
         return w.auction
 
     async def wire(entry, cap, job):
