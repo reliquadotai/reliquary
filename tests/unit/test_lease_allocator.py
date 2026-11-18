@@ -317,3 +317,16 @@ def test_an_rl_env_fills_its_trainer_budget_cheapest_first(monkeypatch):
             auction.unreserve(terms)
             granted[hotkey] = granted.get(hotkey, 0) + 1
     assert granted == {"cheap": 6}
+
+
+def test_with_every_offer_needed_one_small_dear_hotkey_does_not_price_every_lease():
+    """The target out of reach (the audit could take more than every miner together): the dearest offer is
+    needed, but one slot at the ceiling must not set every lease's price."""
+    book = [la.Candidate("zero", 1e-6, 300, 20.0), la.Candidate("mid", 0.10, 100, 20.0),
+            la.Candidate("sybil", 0.706, 1, 20.0)]
+    allocation = la.merit_order(book, 100_000.0, 20.0)
+    assert not allocation.reached and allocation.slots["sybil"] == 1
+    assert allocation.clearing == 0.10
+    # Real dear capacity, a tenth of the supply and more, does price the leases: it is needed and delivers.
+    book[2] = la.Candidate("dear", 0.706, 60, 20.0)
+    assert la.merit_order(book, 100_000.0, 20.0).clearing == 0.706

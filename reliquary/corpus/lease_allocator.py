@@ -58,6 +58,9 @@ K_SHRINK_FLOOR = 0.5
 DEFAULT_DEADLINE_SECONDS = 24 * 3600.0
 MIN_TIME_LEFT_SECONDS = 600.0
 UNMET_SECONDS = 2 * STEP_SECONDS
+# Every offer needed (the target not reached): the price is the offer under which this share of the measured
+# supply is offered; dearer offers are paid their own. One small dear hotkey cannot price every lease.
+SHORT_SUPPLY_QUANTILE = 0.9
 
 
 def merit_enabled(market_key: str | None, env: Mapping[str, str] | None = None) -> bool:
@@ -282,7 +285,12 @@ class Allocation:
 
 
 def merit_order(candidates: Iterable[Candidate], target: float, median: float) -> Allocation:
-    """Fill ``target`` tokens per second cheapest first; a hotkey not measured counts at ``median``."""
+    """Fill ``target`` tokens per second cheapest first; a hotkey not measured counts at ``median``.
+
+    The clearing price: the last needed offer when the target is reached. When it is not (every offer needed),
+    the offer under which SHORT_SUPPLY_QUANTILE of the measured supply is offered: with every offer needed, the
+    dearest one would price every lease, and a hotkey offering the ceiling for one slot would set it (the lever
+    #542 closed). Unmeasured hotkeys do not count there: a fresh capacity only moves the price once it delivers."""
     ordered = sorted(candidates, key=lambda c: (c.price, c.hotkey))
     slots: dict[str, int] = {}
     reached = False
@@ -304,6 +312,17 @@ def merit_order(candidates: Iterable[Candidate], target: float, median: float) -
         slots[c.hotkey] = c.slots
         filled += c.slots * speed
         clearing = c.price
+    if not reached and slots:
+        measured = [(c.price, c.slots * c.speed) for c in ordered
+                    if slots.get(c.hotkey, 0) > 0 and c.speed is not None and c.speed > 0]
+        total = sum(rate for _, rate in measured)
+        if total > 0:
+            reach, summed = SHORT_SUPPLY_QUANTILE * total * (1.0 - 1e-9), 0.0
+            for price, rate in measured:
+                summed += rate
+                if summed >= reach:
+                    clearing = price
+                    break
     return Allocation(slots=slots, clearing=clearing, reached=reached, supply=supply)
 
 

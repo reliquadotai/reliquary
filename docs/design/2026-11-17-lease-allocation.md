@@ -159,9 +159,14 @@ nothing, so a hotkey offering the ceiling just past R* would set every price for
 Why it closes the 2026-11-18 lever:
 
 - delivered volume is not an input: staying "just under 80 %" means nothing;
-- **adding an offer never raises the price.** 19 hotkeys at 0 and a 20th dear one: either the dear one is not
-  needed (price set by a competitor) or it is the marginal, and without it the marginal would be the next offer
-  up, dearer still. Several hotkeys gain nothing;
+- **while R* is within the offers, adding an offer never raises the price.** 19 hotkeys at 0 and a 20th dear
+  one: either the dear one is not needed (price set by a competitor) or it is the marginal, and without it the
+  marginal would be the next offer up, dearer still. Several hotkeys gain nothing;
+- **when every offer is needed** (the audit could take more than all the miners together), the dearest offer is
+  needed too, and one slot at the ceiling would price every lease. The price is then the offer under which 90 %
+  of the *measured* supply is offered; dearer offers are paid their own. Moving it takes a tenth of the real,
+  delivering capacity at that price; a hotkey not yet measured does not count. A high price in a short market is
+  the signal that brings idle GPUs, whose capacity brings R* back within the offers;
 - bidding 0 means "I take the market's price": safe for a small miner, risky for a big one (if the bids at 0 cover
   R*, everyone is paid 0), so big miners bid their cost.
 
@@ -169,6 +174,10 @@ What it does not close: **withholding** (declaring less capacity so the marginal
 volume and pays only for a big miner, with a large price step right after the marginal, knowing where R* is. Any
 competitor offering in the step cancels it; the book and R* are not published (only the clearing price of past
 periods). No price floor: idle GPUs at any price are welcome, and an oversupplied market is allowed to be cheap.
+
+Replayed on the 9B book of 2026-11-18 at its end (58 offers, 11.4k tok/s measured): R* 3k tok/s clears at
+0.059, 6k at 0.10, 9k at 0.33, everything needed at 0.35 alpha/M; the 21 hotkeys offering the ceiling held ~500
+slots for 57 tok/s and would be cut to what they deliver at their first verdict.
 
 Before R* bounds the merit order, the marginal offer would be the ceiling (the budget admits almost everyone):
 that is why #542 used a volume quantile, and why the clearing price switches only together with the allocator.
