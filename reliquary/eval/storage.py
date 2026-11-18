@@ -181,7 +181,7 @@ async def publish_set(directory: str | Path, *, platform, subnet, publish_review
             public_card = {key: card[key] for key in (
                 "schema", "set_id", "env", "source", "source_kind", "interaction", "split",
                 "index_range", "source_length", "count", "seed", "order", "created_at",
-                "prompt_template_id", "default_max_new_tokens", "prompts_sha256", "grading_sha256",
+                "prompt_template_id", "default_max_new_tokens", "prompt_tokens", "prompts_sha256", "grading_sha256",
                 "environment_manifest_sha256", "disjointness", "episode", "protocol", "protocol_json",
                 "protocol_sha256") if key in card}
             if card.get("taskset"):
