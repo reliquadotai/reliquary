@@ -914,3 +914,26 @@ def test_the_audit_backlog_leaves_out_records_with_no_gpu_work_left():
     auditor._undrawn.add(a)
     auditor._ahead[b] = {"passed": True}
     assert auditor.audit_backlog() == 1
+
+
+def test_on_a_sampled_job_a_probation_hotkeys_records_are_audited_ahead():
+    """Records sure to be audited because their hotkey is in probation (or too slow to be sampled) are sent ahead
+    too, not only drawn ones: the card keeps working between passes (2026-11-18)."""
+    from reliquary.corpus.audit_policy import AuditParams, MinerState
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model = _tiny(0)
+    sids = [f"{i:x}" * 64 for i in range(1, 5)]
+    records = _Records({sid: _record(model) for sid in sids})
+    auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=_AlwaysConnected(model), params=AuditParams(q=0.5),
+                            round_at=lambda t: 100)
+
+    async def go():
+        await auditor._read_all(sids)
+        assert auditor._ahead_candidates(16) == []          # standing unknown, round not out: nothing sure
+        hotkey = auditor._meta[sids[0]][0]
+        auditor._state_cache[hotkey] = MinerState()          # no audited pass yet: probation
+        return auditor._ahead_candidates(16)
+
+    assert set(asyncio.run(go())) == set(sids)
