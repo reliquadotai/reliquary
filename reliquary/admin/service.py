@@ -883,7 +883,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         from reliquary.eval.verifiers_source import installed_artifacts, taskset_id
 
         sealed = validate_set(card, current_grader=True)
-        if (not sealed or card.get("source_kind") != "verifiers"
+        if (deliveries is None or not sealed or card.get("source_kind") != "verifiers"
                 or card.get("interaction", "single_turn") != "single_turn"):
             return
         # These single-turn rewards run on the admin. Read installed metadata and files without loading a task.
@@ -891,13 +891,13 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         package = taskset["package"]
         if taskset_id(card["source"]) != taskset["id"]:
             raise ValueError("set protocol taskset source drift")
+        expected = (taskset["package_version"], taskset["verifiers_version"], taskset["artifact_sha256"])
         try:
-            if (version(package) != taskset["package_version"]
-                    or version("verifiers") != taskset["verifiers_version"]
-                    or installed_artifacts(package) != taskset["artifact_sha256"]):
-                raise ValueError("set protocol taskset grader drift")
-        except (PackageNotFoundError, OSError) as exc:
+            installed = (version(package), version("verifiers"), installed_artifacts(package))
+        except (PackageNotFoundError, OSError, ValueError, TypeError, AttributeError) as exc:
             raise HTTPException(status_code=503, detail="taskset grader unavailable") from exc
+        if installed != expected:
+            raise ValueError("set protocol taskset grader drift")
 
     async def require_set_grader(card: dict, *, job_id: str | None = None) -> None:
         try:

@@ -185,11 +185,17 @@ def local_taskset(admin, tmp_path, monkeypatch):
     return site, _order(eval_set_id=SET_ID, env=card["env"])
 
 
-@pytest.mark.parametrize("change", ["missing", "taskset", "verifiers", "version"])
+@pytest.mark.parametrize("change", ["missing", "missing_file", "malformed_origin", "taskset", "verifiers", "version"])
 def test_incompatible_installed_verifiers_scorer_refuses_before_writes(admin, pins, local_taskset, change):
     site, body = local_taskset
     if change == "missing":
         (site / "fake_pkg-1.0.dist-info").rename(site / "uninstalled")
+    elif change == "missing_file":
+        (site / "fake_pkg.py").unlink()
+    elif change == "malformed_origin":
+        metadata = site / "fake_pkg-1.0.dist-info"
+        (metadata / "direct_url.json").write_text("{invalid")
+        (metadata / "RECORD").write_text("fake_pkg.py,,\nfake_pkg-1.0.dist-info/direct_url.json,,\n")
     elif change == "version":
         (site / "fake_pkg-1.0.dist-info" / "METADATA").write_text("Name: fake-pkg\nVersion: 2.0\n")
     else:
@@ -199,8 +205,10 @@ def test_incompatible_installed_verifiers_scorer_refuses_before_writes(admin, pi
     for path, request in (("/admin/v1/qualifications", _qualification(set_id=SET_ID)),
                           ("/admin/v1/jobs/validate", body), ("/admin/v1/jobs", body)):
         response = admin("POST", path, request)
-        assert response.status_code == (503 if change == "missing" else 422), response.text
-        assert "taskset" in response.json()["detail"]
+        unavailable = change in ("missing", "missing_file", "malformed_origin")
+        assert response.status_code == (503 if unavailable else 422), response.text
+        assert response.json()["detail"] == ("taskset grader unavailable" if unavailable
+                                              else "set protocol taskset grader drift")
         assert (admin.bucket.objects, admin.registry["entries"]) == before
 
 
@@ -211,3 +219,18 @@ def test_local_scorer_preflight_preserves_a_replay_after_artifact_drift(admin, p
     before = copy.deepcopy(admin.bucket.objects), copy.deepcopy(admin.registry["entries"])
     assert admin("POST", "/admin/v1/jobs", body).status_code == 200
     assert (admin.bucket.objects, admin.registry["entries"]) == before
+
+
+@pytest.fixture
+def declarations_only(monkeypatch):
+    from tests.unit import test_admin_eval_jobs as fixtures
+
+    factory = fixtures.create_admin_app
+    monkeypatch.setattr(fixtures, "create_admin_app", lambda **kw: factory(**{**kw, "deliveries": None}))
+
+
+@pytest.mark.usefixtures("declarations_only")
+def test_an_admin_without_grading_routes_can_declare_for_a_separate_grader(admin, pins, local_taskset):
+    site, body = local_taskset
+    (site / "fake_pkg.py").unlink()
+    assert admin("POST", "/admin/v1/jobs", body).status_code == 201
