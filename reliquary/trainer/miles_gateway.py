@@ -5,11 +5,26 @@ checkpoint, or the base model): full fine-tuning, training only (no SGLang: mine
 with the trainer's health gate (``--tinker-grad-norm-skip``). The launcher is a Miles launcher script (the lab's
 ``serve_*_tinker.py`` shape: ``serve --mode full --no-inference --hf-checkpoint ... --extra-args ...``).
 
-Settings: ``RELIQUARY_MILES_LAUNCHER``, ``RELIQUARY_MILES_MODEL_TYPE`` (Megatron model type, e.g. ``qwen3.5-9B``),
-``RELIQUARY_MILES_OUTPUT_DIR`` (checkpoints and exports: the trainer reads the exports there), and
-``RELIQUARY_MILES_TP`` (2), ``RELIQUARY_MILES_GPUS`` (8), ``RELIQUARY_MILES_PORT`` (10613),
-``RELIQUARY_MILES_READY_S`` (1800), ``RELIQUARY_MILES_EXTRA_ARGS`` (more gateway flags), ``RELIQUARY_MILES_PYTHON``
-(the gateway's interpreter: Miles, Megatron and the same ``reliquary`` as this trainer, checked at start).
+Settings work out of the box on an RL-orders pod, which gets no ``RELIQUARY_MILES_*`` variable (the image sets
+``RELIQUARY_MILES_LAUNCHER``, ``RELIQUARY_MILES_OUTPUT_DIR`` and ``RELIQUARY_MILES_PYTHON``):
+
+* ``RELIQUARY_MILES_GPUS``: default every visible card (``CUDA_VISIBLE_DEVICES``, else ``nvidia-smi -L``, else the
+  ``/dev/nvidia<N>`` device files); the trainer refuses to start when none of them answers, or none is visible.
+* ``RELIQUARY_MILES_TP``: default per model size (``DEFAULT_TP_BY_MODEL_TYPE``): 2 for Qwen3.5-0.8B/4B (4B
+  measured), 4 for 9B, 8 for 27B/35B-A3B (9B and up NOT measured: sized from the 4B result at 64k tokens per GPU).
+  A pod with fewer cards than that is refused (the layout would run out of memory at 64k), naming the minimum; the
+  card count must be a multiple of the TP. An explicit value is the operator's.
+* ``RELIQUARY_MILES_MODEL_TYPE`` (Megatron model type): default from the model's name (``RELIQUARY_RL_BASE_MODEL``,
+  else ``RELIQUARY_MODEL``, else the profile's base model), for the Qwen3.5 sizes Miles ships (``MILES_MODEL_TYPES``).
+* ``RELIQUARY_MILES_EXTRA_ARGS``: default ``DEFAULT_EXTRA_ARGS`` (64k tokens per GPU, full recompute); a value set,
+  even empty, replaces it entirely.
+* ``RELIQUARY_MILES_CHUNK``: rollouts per ``forward_backward`` call, default 256.
+* ``RELIQUARY_MILES_PORT`` (10613), ``RELIQUARY_MILES_READY_S`` (1800), ``RELIQUARY_MILES_PYTHON`` (the gateway's
+  interpreter: Miles, Megatron and the same ``reliquary`` as this trainer, checked at start).
+
+Measured basis (Qwen3.5-4B, 2xH200, 2026-11): TP2 with full recompute at 64k tokens per GPU trains at ~3.9k tok/s
+per GPU; TP1 and selective recompute run out of memory at 64k; Miles' Tinker path refuses context parallelism;
+chunk 256 matches 64 at steady state and warms up faster.
 """
 from __future__ import annotations
 
@@ -30,9 +45,66 @@ READY_LINE = "tinker gateway serving"
 API_KEY = "tml-reliquary-trainer"
 
 
-def miles_settings(env: Mapping[str, str] = os.environ) -> dict:
+DEFAULT_TP = 2                           # a model type outside DEFAULT_TP_BY_MODEL_TYPE (set explicitly)
+DEFAULT_CHUNK = 256
+DEFAULT_EXTRA_ARGS = ("--max-tokens-per-gpu 65536 --recompute-granularity full --recompute-method uniform "
+                      "--recompute-num-layers 1")
+# HF model name (basename, any case) -> the Megatron model type Miles ships (``scripts/models/<type>.py``)
+MILES_MODEL_TYPES = {"qwen3.5-0.8b": "qwen3.5-0.8B", "qwen3.5-4b": "qwen3.5-4B", "qwen3.5-9b": "qwen3.5-9B",
+                     "qwen3.5-27b": "qwen3.5-27B", "qwen3.5-35b-a3b": "qwen3.5-35B-A3B"}
+# the default TP per model type at 64k tokens per GPU with full recompute: 4B measured (TP1 runs out of memory on a
+# 141 GB H200), the rest sized from it and NOT measured
+DEFAULT_TP_BY_MODEL_TYPE = {"qwen3.5-0.8B": 2, "qwen3.5-4B": 2, "qwen3.5-9B": 4, "qwen3.5-27B": 8,
+                            "qwen3.5-35B-A3B": 8}
+_HIDDEN = {"-1", "none", "nodevfiles"}   # CUDA_VISIBLE_DEVICES values that hide every card
+
+
+def _nvidia_smi_list() -> str:
+    return subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, check=True, timeout=60).stdout
+
+
+def _device_files() -> list[str]:
+    import glob
+
+    return glob.glob("/dev/nvidia[0-9]*")
+
+
+def visible_gpu_count(env: Mapping[str, str] = os.environ, *, smi: Callable[[], str] = _nvidia_smi_list,
+                      devices: Callable[[], list[str]] = _device_files) -> int:
+    """The cards this process sees: ``CUDA_VISIBLE_DEVICES`` when set, else ``nvidia-smi -L``, else the
+    ``/dev/nvidia<N>`` files. ValueError when every card is hidden or none of them answers: a guessed count makes
+    Ray wait for cards that never come (the gateway's 30 min ready timeout)."""
+    visible = str(env.get("CUDA_VISIBLE_DEVICES", "")).strip()
+    if visible:
+        entries = [d.strip() for d in visible.split(",") if d.strip()]
+        if not entries or entries[0].lower() in _HIDDEN or entries[0].startswith("-"):
+            raise ValueError(f"CUDA_VISIBLE_DEVICES={visible!r} leaves no GPU for the Miles gateway")
+        return len(entries)
+    try:
+        count = sum(1 for line in smi().splitlines() if line.startswith("GPU "))
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("nvidia-smi cannot list the GPUs (%s): counting /dev/nvidia<N>", exc)
+        count = 0
+    if count < 1:
+        count = len(devices())
+    if count < 1:
+        raise ValueError("cannot count this pod's GPUs (no CUDA_VISIBLE_DEVICES, nvidia-smi, or /dev/nvidia<N>): "
+                         "set RELIQUARY_MILES_GPUS")
+    return count
+
+
+def miles_model_type(model: str) -> str | None:
+    """The Megatron model type of an HF model name or path (``org/name[@revision]``), or None when Miles ships none."""
+    name = str(model).split("@", 1)[0].rstrip("/").rsplit("/", 1)[-1].lower()
+    return MILES_MODEL_TYPES.get(name)
+
+
+def miles_settings(env: Mapping[str, str] = os.environ, *, base_model: str | None = None,
+                   smi: Callable[[], str] = _nvidia_smi_list, devices: Callable[[], list[str]] = _device_files) -> dict:
+    """The gateway's settings (module docstring); ``base_model``: the profile's model, the last fallback for the
+    model type."""
     required = {}
-    for name in ("RELIQUARY_MILES_LAUNCHER", "RELIQUARY_MILES_MODEL_TYPE", "RELIQUARY_MILES_OUTPUT_DIR"):
+    for name in ("RELIQUARY_MILES_LAUNCHER", "RELIQUARY_MILES_OUTPUT_DIR"):
         value = str(env.get(name, "")).strip()
         if not value:
             raise ValueError(f"{name} is required by RELIQUARY_TRAINER_BACKEND=miles")
@@ -45,11 +117,36 @@ def miles_settings(env: Mapping[str, str] = os.environ) -> dict:
             raise ValueError(f"{name} must be positive")
         return value
 
-    return {"launcher": required["RELIQUARY_MILES_LAUNCHER"], "model_type": required["RELIQUARY_MILES_MODEL_TYPE"],
-            "output_dir": Path(required["RELIQUARY_MILES_OUTPUT_DIR"]),
-            "tp": number("RELIQUARY_MILES_TP", 2), "gpus": number("RELIQUARY_MILES_GPUS", 8),
+    model_type = str(env.get("RELIQUARY_MILES_MODEL_TYPE", "")).strip()
+    if not model_type:
+        candidates = [str(env.get(n, "")).strip() for n in ("RELIQUARY_RL_BASE_MODEL", "RELIQUARY_MODEL")]
+        model = next((c for c in [*candidates, base_model or ""] if c), "")
+        model_type = miles_model_type(model) if model else None
+        if model_type is None:
+            raise ValueError(f"cannot derive RELIQUARY_MILES_MODEL_TYPE from the model {model or '(none)'!r}: "
+                             f"Miles ships {sorted(MILES_MODEL_TYPES.values())}; set it explicitly")
+    raw_gpus = str(env.get("RELIQUARY_MILES_GPUS", "")).strip()
+    gpus = number("RELIQUARY_MILES_GPUS", 0) if raw_gpus else visible_gpu_count(env, smi=smi, devices=devices)
+    raw_tp = str(env.get("RELIQUARY_MILES_TP", "")).strip()
+    if raw_tp:
+        tp = number("RELIQUARY_MILES_TP", DEFAULT_TP)
+    else:
+        tp = DEFAULT_TP_BY_MODEL_TYPE.get(model_type, DEFAULT_TP)
+        if gpus < tp:
+            raise ValueError(f"{model_type} trains with TP{tp} at 64k tokens per GPU: it needs at least {tp} GPUs, "
+                             f"this pod has {gpus} (set RELIQUARY_MILES_TP and RELIQUARY_MILES_EXTRA_ARGS to run "
+                             f"another layout)")
+    if tp > gpus:
+        raise ValueError(f"RELIQUARY_MILES_TP={tp} is more than the {gpus} GPUs")
+    if gpus % tp:
+        raise ValueError(f"{gpus} GPUs are not divisible by tensor parallelism {tp}: set RELIQUARY_MILES_GPUS "
+                         f"or RELIQUARY_MILES_TP")
+    extra = env.get("RELIQUARY_MILES_EXTRA_ARGS")
+    return {"launcher": required["RELIQUARY_MILES_LAUNCHER"], "model_type": model_type,
+            "output_dir": Path(required["RELIQUARY_MILES_OUTPUT_DIR"]), "tp": tp, "gpus": gpus,
             "port": number("RELIQUARY_MILES_PORT", 10613), "ready_s": number("RELIQUARY_MILES_READY_S", 1800.0, float),
-            "extra_args": str(env.get("RELIQUARY_MILES_EXTRA_ARGS", "")).strip(),
+            "chunk": number("RELIQUARY_MILES_CHUNK", DEFAULT_CHUNK),
+            "extra_args": DEFAULT_EXTRA_ARGS if extra is None else str(extra).strip(),
             "python": str(env.get("RELIQUARY_MILES_PYTHON", "")).strip() or sys.executable}
 
 
@@ -260,5 +357,6 @@ def checkpoint_deleter(base_url: str, api_key: str = API_KEY) -> Callable[[str],
     return delete
 
 
-__all__ = ["GatewayProcess", "WatchedClient", "check_gateway_constants", "checkpoint_deleter", "gate_constants", "create_full_training_client", "gateway_command",
-           "launch_gateway", "miles_settings"]
+__all__ = ["DEFAULT_CHUNK", "DEFAULT_EXTRA_ARGS", "DEFAULT_TP_BY_MODEL_TYPE", "MILES_MODEL_TYPES", "GatewayProcess", "WatchedClient",
+           "check_gateway_constants", "checkpoint_deleter", "create_full_training_client", "gate_constants",
+           "gateway_command", "launch_gateway", "miles_model_type", "miles_settings", "visible_gpu_count"]

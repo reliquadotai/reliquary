@@ -12,6 +12,7 @@ from reliquary.trainer.miles_gateway import GatewayProcess, gateway_command, mil
 
 ENV = {"RELIQUARY_MILES_LAUNCHER": "/opt/lab/serve_tinker_full.py", "RELIQUARY_MILES_MODEL_TYPE": "qwen3.5-9B",
        "RELIQUARY_MILES_OUTPUT_DIR": "/data/miles"}
+CARDS = {"RELIQUARY_MILES_GPUS": "8"}                   # settings never count the host's cards here
 
 
 def test_backend_accepts_miles():
@@ -20,13 +21,14 @@ def test_backend_accepts_miles():
 
 @pytest.mark.parametrize("missing", sorted(ENV))
 def test_settings_require_launcher_model_type_and_output(missing):
+    """The model type is required only when no model name gives it (``test_miles_defaults``)."""
     env = {k: v for k, v in ENV.items() if k != missing}
     with pytest.raises(ValueError, match=missing):
-        miles_settings(env)
+        miles_settings({**env, **CARDS})
 
 
 def test_settings_defaults_and_command():
-    settings = miles_settings(ENV)
+    settings = miles_settings({**ENV, "RELIQUARY_MILES_TP": "2"}, smi=lambda: "GPU 0: x\n" * 8)
     assert (settings["tp"], settings["gpus"], settings["port"]) == (2, 8, 10613)
     command = gateway_command("/ckpt/model", settings, base_model="org/policy", grad_norm_skip=100.0)
     assert command[:3] == [sys.executable, "/opt/lab/serve_tinker_full.py", "serve"]
@@ -70,7 +72,7 @@ def test_launch_cleans_up_first_and_refuses_a_taken_port(tmp_path, monkeypatch):
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen()
-    settings = {**miles_settings({**ENV, "RELIQUARY_MILES_OUTPUT_DIR": str(tmp_path)}),
+    settings = {**miles_settings({**ENV, **CARDS, "RELIQUARY_MILES_OUTPUT_DIR": str(tmp_path)}),
                 "port": listener.getsockname()[1]}
     with pytest.raises(RuntimeError, match="already in use"):
         miles_gateway.launch_gateway("/m", settings, base_model="b", grad_norm_skip=1.0, env={})
@@ -79,9 +81,10 @@ def test_launch_cleans_up_first_and_refuses_a_taken_port(tmp_path, monkeypatch):
 
 
 def test_settings_take_the_gateway_python():
-    assert miles_settings(ENV)["python"] == sys.executable
-    assert miles_settings({**ENV, "RELIQUARY_MILES_PYTHON": "/opt/miles/bin/python"})["python"] == "/opt/miles/bin/python"
-    command = gateway_command("/m", miles_settings({**ENV, "RELIQUARY_MILES_PYTHON": "/opt/py"}), base_model="b",
+    assert miles_settings({**ENV, **CARDS})["python"] == sys.executable
+    assert miles_settings({**ENV, **CARDS, "RELIQUARY_MILES_PYTHON": "/opt/miles/bin/python"})["python"] == \
+        "/opt/miles/bin/python"
+    command = gateway_command("/m", miles_settings({**ENV, **CARDS, "RELIQUARY_MILES_PYTHON": "/opt/py"}), base_model="b",
                               grad_norm_skip=1.0)
     assert command[0] == "/opt/py"
 
@@ -127,6 +130,12 @@ def test_miles_backend_never_loads_a_torch_model(tmp_path, monkeypatch):
     monkeypatch.setenv("RELIQUARY_TRAINER_BACKEND", "miles")
     for k, v in ENV.items():
         monkeypatch.setenv(k, v)
+    # what an RL-orders pod gets: no RELIQUARY_MILES_* beyond the image's, the order's model name
+    for k in ("RELIQUARY_MILES_MODEL_TYPE", "RELIQUARY_MILES_GPUS", "RELIQUARY_MILES_TP", "RELIQUARY_MILES_EXTRA_ARGS",
+              "RELIQUARY_MILES_CHUNK"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("RELIQUARY_RL_BASE_MODEL", "Qwen/Qwen3.5-4B")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     monkeypatch.setenv("RELIQUARY_TRAINER_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(modeling, "load_text_generation_model", lambda *a, **k: pytest.fail("loaded a torch model"))
     monkeypatch.setattr(async_cli, "async_trainer_settings", lambda: {
@@ -163,8 +172,10 @@ def test_miles_backend_never_loads_a_torch_model(tmp_path, monkeypatch):
 
     def launch(model_path, settings, **kw):
         events.append(("launch", str(model_path), os.environ.get("CUDA_VISIBLE_DEVICES")))
+        launched.update(settings)
         return Gateway()
 
+    launched = {}
     monkeypatch.setattr(miles_gateway, "launch_gateway", launch)
     monkeypatch.setattr(miles_gateway, "create_full_training_client", lambda *a: SimpleNamespace(name="client"))
     built = {}
@@ -183,7 +194,9 @@ def test_miles_backend_never_loads_a_torch_model(tmp_path, monkeypatch):
     monkeypatch.setattr("reliquary.trainer.rl_link.TrainerHeartbeat",
                         lambda link, s: SimpleNamespace(start=lambda: SimpleNamespace(stop=lambda: None)))
     async_cli.run_async_train_worker()
-    assert events[0] == "constants" and events[1] == ("launch", str(model_dir), None) and events[-1] == "stop"
+    assert events[0] == "constants" and events[1] == ("launch", str(model_dir), "0,1") and events[-1] == "stop"
+    assert (launched["model_type"], launched["gpus"], launched["tp"]) == ("qwen3.5-4B", 2, 2)
+    assert launched["extra_args"] == miles_gateway.DEFAULT_EXTRA_ARGS and built["train_step_fn"].chunk == 256
     assert "run" in events and os.environ.get("CUDA_VISIBLE_DEVICES") == ""
     import signal
 
