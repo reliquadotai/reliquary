@@ -63,10 +63,12 @@ def eval_job_source(*, job_id, eval_set, prompt_count, prompt_start, renderer_id
     A set of episode or SWE tasks is references: the job is the episode job
     (``episode``, from ``--episode-file``) that plays them, at the set's split."""
     from reliquary.eval.prompt_source import eval_source_for, register_eval_prompts
+    from reliquary.eval.protocol import validate_set
     from reliquary.eval.storage import read_published_set
     from reliquary.validator.corpus_service import CHAT_TEMPLATE_RENDERERS
 
     card, prompts = read_published_set(eval_set)
+    validate_set(card, current_grader=True)
     interaction = card.get("interaction", "single_turn")
     if interaction == "single_turn":
         if episode is not None:
