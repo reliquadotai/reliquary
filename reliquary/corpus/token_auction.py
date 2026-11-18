@@ -266,7 +266,12 @@ class TokenAuction:
         self._dirty = False
         # Merit order (``corpus.lease_allocator``): speeds, trusted slots, the market's pace, the job's progress.
         self._merit = market_name is not None and la.merit_enabled(market_name)
-        self._pace = la.market_pace(market_name, clock) if self._merit else None
+        # The shadow: everything computed, logged and shown, nothing used for a lease or a price.
+        self._shadow = (not self._merit and market_name is not None
+                        and la.merit_enabled(market_name, name=la.SHADOW_ENV))
+        self._measures = self._merit or self._shadow
+        self._shadow_logged_at: float | None = None
+        self._pace = la.market_pace(market_name, clock) if self._measures else None
         self._speeds = la.SpeedBook()
         self._trusted = la.Allowances()
         self._q: Callable[[], float] | None = None
@@ -287,6 +292,11 @@ class TokenAuction:
     def merit(self) -> bool:
         """Whether this job allocates by merit order (``corpus.lease_allocator``)."""
         return self._merit
+
+    @property
+    def measures(self) -> bool:
+        """Whether this job computes the merit order, to allocate by it or in the shadow."""
+        return self._measures
 
     def bind_merit(self, *, audit: Callable[[], tuple[float, float | None] | None] | None = None,
                    q: Callable[[], float] | None = None, deadline: float | None = None) -> None:
@@ -459,7 +469,7 @@ class TokenAuction:
                           target: float | None) -> tuple[dict[str, int], float | None] | None:
         """The merit order's slots per hotkey and its clearing price (the last needed hotkey's offer), or None
         while the audit or every speed is unmeasured (the thermostat then stands in)."""
-        if not self._merit:
+        if not self._measures:
             return None
         if self._ticked_at is None or now - self._ticked_at >= 1.0:
             self._ticked_at = now
@@ -493,7 +503,8 @@ class TokenAuction:
                                                  held=held.get(c.hotkey, 0), speeds=self._speeds, median=median,
                                                  median_seconds=median_seconds, tail=tail)
                     if changed:
-                        logger.info("merit order job=%s hotkey=%s %s", self._job, c.hotkey[:8], changed)
+                        logger.info("merit order%s job=%s hotkey=%s %s", " shadow" if self._shadow else "",
+                                    self._job, c.hotkey[:8], changed)
             self._report(now, held)
         if self._allocation is None:
             return None
@@ -570,6 +581,9 @@ class TokenAuction:
             self._seen[hotkey] = now
             self._steer(now, held, given_budget)
             merit = self._merit_allowances(now, held, self._merit_target(target))
+            if merit is not None and self._shadow:
+                self._log_shadow(now, held, merit)
+                merit = None
             if merit is not None:
                 return self._admit_merit(hotkey, offer, now, held, *merit)
             if self._budget <= 0:
@@ -603,6 +617,29 @@ class TokenAuction:
             median = self._speeds.median(self._clock())
             return None if median is None else self._budget * median
         return target
+
+    def _log_shadow(self, now: float, held: Mapping[str, int], merit) -> None:
+        """Once a minute, what the merit order would do against what the thermostat does."""
+        if self._shadow_logged_at is not None and now - self._shadow_logged_at < la.SHADOW_LOG_SECONDS:
+            return
+        self._shadow_logged_at = now
+        given, clearing = merit
+        legacy, marginal = self._allowances(now, held)
+        moment = self._moment_price(now, marginal)
+        pace = self._pace.last if self._pace is not None else {}
+        median = self._speeds.median(now)
+        alpha = self.params.alpha_of
+        logger.info(
+            "merit order shadow job=%s target=%s audit=%s k=%.2f wait=%s busy=%s median_v=%s "
+            "merit_leases=%d merit_hotkeys=%d merit_price=%s budget=%d held=%d legacy_hotkeys=%d live_price=%s "
+            "reached=%s supply=%s tail=%s",
+            self._job, _fmt(self._target), _fmt(pace.get("audit_rate")), self._pace.k if self._pace else 1.0,
+            _fmt(pace.get("wait_seconds")), _fmt(pace.get("busy"), 2), _fmt(median, 2),
+            sum(given.values()), len(given), _fmt(None if clearing is None else alpha(clearing), 4),
+            self._budget, sum(held.values()), len(legacy),
+            _fmt(None if moment is None and marginal is None else alpha(moment if moment is not None else marginal), 4),
+            None if self._allocation is None else self._allocation.reached,
+            _fmt(None if self._allocation is None else self._allocation.supply), self._tail())
 
     def _admit_merit(self, hotkey: str, offer: Offer, now: float, held: Mapping[str, int],
                      given: dict[str, int], clearing: float | None) -> Terms | str:
@@ -725,6 +762,9 @@ class TokenAuction:
             now = self._clock()
             self._steer(now, held, given_budget)
             merit = self._merit_allowances(now, held, self._merit_target(target))
+            shadow = None
+            if merit is not None and self._shadow:
+                shadow, merit = merit, None
             if merit is not None:
                 given, shown = merit
             else:
@@ -740,6 +780,14 @@ class TokenAuction:
                 "audit_backlog": self._last_backlog,
                 "miners_working": len(given),
             }
+            if shadow is not None:
+                view["merit_shadow"] = {
+                    "leases_wanted": sum(shadow[0].values()), "hotkeys": len(shadow[0]),
+                    "price_alpha_per_mtoken": None if shadow[1] is None else self.params.alpha_of(shadow[1]),
+                    "target_tokens_per_s": self._target, "median_tokens_per_lease_s": self._speeds.median(now),
+                    "audit_tokens_per_s": self._pace.last.get("audit_rate") if self._pace else None,
+                    "audit_wait_s": self._pace.last.get("wait_seconds") if self._pace else None,
+                    "k": self._pace.k if self._pace else None}
             if self._merit:
                 median = self._speeds.median(now)
                 view.update(allocator="merit" if merit is not None else "budget",
@@ -834,6 +882,10 @@ class TokenAuction:
                 self._dirty = False
             except OSError:
                 logger.exception("token auction: state %s not written", self._state_path)
+
+
+def _fmt(value, digits: int = 0) -> str:
+    return "-" if value is None else f"{float(value):.{digits}f}"
 
 
 def state_path_for(job_id: str) -> Path | None:

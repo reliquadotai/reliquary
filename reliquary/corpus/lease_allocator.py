@@ -27,6 +27,9 @@ from dataclasses import dataclass, field
 
 # Which markets allocate by merit order (``market_key`` substrings, comma separated, or "all"); unset: none.
 MERIT_ENV = "RELIQUARY_MERIT_ORDER"
+# Which markets compute the merit order in the shadow (logged and shown, never used for leases or prices).
+SHADOW_ENV = "RELIQUARY_MERIT_SHADOW"
+SHADOW_LOG_SECONDS = 60.0
 
 SPEED_WINDOW_SECONDS = 600.0
 CHECKPOINT_SECONDS = 5.0
@@ -63,9 +66,10 @@ UNMET_SECONDS = 2 * STEP_SECONDS
 SHORT_SUPPLY_QUANTILE = 0.9
 
 
-def merit_enabled(market_key: str | None, env: Mapping[str, str] | None = None) -> bool:
-    """Whether ``market_key`` allocates by merit order (``RELIQUARY_MERIT_ORDER``)."""
-    value = (env if env is not None else os.environ).get(MERIT_ENV, "").strip()
+def merit_enabled(market_key: str | None, env: Mapping[str, str] | None = None, name: str = MERIT_ENV) -> bool:
+    """Whether ``market_key`` allocates by merit order (``RELIQUARY_MERIT_ORDER``), or with ``name`` =
+    SHADOW_ENV computes it in the shadow."""
+    value = (env if env is not None else os.environ).get(name, "").strip()
     if not value or value.lower() in {"0", "off", "false", "none"}:
         return False
     if value.lower() in {"all", "1", "on", "true"}:
@@ -463,5 +467,5 @@ def market_pace(key: str, clock: Callable[[], float]) -> MarketPace:
         return _PACES.setdefault(str(key), MarketPace(clock))
 
 
-__all__ = ["Allocation", "Allowances", "Candidate", "MERIT_ENV", "MarketPace", "SpeedBook", "market_pace",
+__all__ = ["Allocation", "Allowances", "Candidate", "MERIT_ENV", "SHADOW_ENV", "MarketPace", "SpeedBook", "market_pace",
            "merit_enabled", "merit_order", "split", "vmin"]

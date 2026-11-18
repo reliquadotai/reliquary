@@ -1597,7 +1597,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 backlog=lambda: w.auditor.audit_backlog() + dispatcher.pending_items(job_id),
                 state_path=state_path_for(job_id), job=getattr(w, "job", None))
             job = getattr(w, "job", None)
-            if w.auction is not None and w.auction.merit and job is not None:
+            if w.auction is not None and w.auction.measures and job is not None:
                 # The merit order fills what the model's audit cards verify, at the share this job audits.
                 model = (job.checkpoint_repo, job.checkpoint_revision)
                 w.auction.bind_merit(audit=lambda: dispatcher.audit_pace(model),

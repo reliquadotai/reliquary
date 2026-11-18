@@ -330,3 +330,33 @@ def test_with_every_offer_needed_one_small_dear_hotkey_does_not_price_every_leas
     # Real dear capacity, a tenth of the supply and more, does price the leases: it is needed and delivers.
     book[2] = la.Candidate("dear", 0.706, 60, 20.0)
     assert la.merit_order(book, 100_000.0, 20.0).clearing == 0.706
+
+
+def test_the_shadow_computes_and_shows_the_merit_order_but_leases_as_before(monkeypatch):
+    monkeypatch.delenv(la.MERIT_ENV, raising=False)
+    monkeypatch.setenv(la.SHADOW_ENV, "all")
+    monkeypatch.setattr(la, "_PACES", {})
+    clock = Clock()
+    params = AuctionParams(ceiling=0.706 / 1e6 / EMISSION, miner_alpha_per_period=EMISSION, initial_leases=1000)
+    book = Book()
+    auction = TokenAuction(params, clock=clock, holdings=book, market_name="m|turn", job_id="job", backlog=lambda: 0)
+    auction.bind_merit(audit=lambda: (300.0, 0.9), q=lambda: 1.0)
+    assert auction.measures and not auction.merit
+    for hotkey, alpha in (("zero", 1e-6), ("mid", 0.10), ("dear", 0.70)):
+        auction.post_ask(hotkey, alpha, 10)
+        for _ in range(10):
+            terms = auction.admit(hotkey)
+            book.take(terms)
+            auction.unreserve(terms)
+    _warm(auction, book, clock, ["zero", "mid", "dear"])
+    import reliquary.corpus.token_auction as ta
+    lines = []
+    monkeypatch.setattr(ta.logger, "info", lambda msg, *args: lines.append(msg % args))
+    clock.now += 61
+    terms = auction.admit("dear")                      # the thermostat still leases to the dear offer
+    assert isinstance(terms, Terms) or terms == ALLOWANCE_FULL
+    shadow = auction.view()["merit_shadow"]
+    assert 14 <= shadow["leases_wanted"] <= 20 and shadow["hotkeys"] == 2
+    assert shadow["price_alpha_per_mtoken"] == pytest.approx(0.10)
+    assert "allocator" not in auction.view()
+    assert any(line.startswith("merit order shadow") and "merit_price=0.1000" in line for line in lines)
