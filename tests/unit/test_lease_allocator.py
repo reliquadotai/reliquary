@@ -193,7 +193,7 @@ def test_an_idle_card_with_miners_refused_raises_k():
 
 def test_orders_get_their_floor_then_the_surplus_goes_to_the_closest_to_done():
     jobs = {
-        "big": la._JobReport(q=1.0, remaining_tokens=86_400 * 100.0, deadline=86_400.0, supply=None),
+        "big": la._JobReport(q=1.0, remaining_tokens=86_400 * 100.0, deadline=86_400.0, supply=1e9),
         "small": la._JobReport(q=1.0, remaining_tokens=60_000.0, deadline=86_400.0, supply=2_000.0),
     }
     rates = la.split(jobs, 3_000.0, now=0.0, first_seen={})
@@ -250,9 +250,9 @@ def test_the_cheapest_are_full_the_dear_wait_and_the_price_is_the_marginal_offer
     auction.post_ask("zero", 1e-6, 10)
     auction.post_ask("mid", 0.10, 15)
     auction.post_ask("dear", 0.70, 20)
-    # Speeds start unmeasured: the thermostat stands in until a first measure.
+    # Speeds start unmeasured: the thermostat stands in until a first measure (each takes its whole capacity).
     for hotkey in ("zero", "mid", "dear"):
-        for _ in range(5):
+        for _ in range(20):
             terms = auction.admit(hotkey)
             if isinstance(terms, Terms):
                 book.take(terms)
@@ -395,3 +395,24 @@ def test_k_follows_the_wait_without_compounding_and_recovers_fast():
     for _ in range(4):
         step(0, unmet=clock.now)
     assert pace.k == 1.0                              # back to 1 within four steps
+
+
+def test_a_hotkey_that_does_not_take_its_slots_is_trimmed_to_what_it_holds_but_not_in_the_shadow():
+    clock = Clock()
+    book, trust = la.SpeedBook(), la.Allowances()
+    trust.needed("h", clock.now, book)
+    _run(book, clock, "h", 20, 400, 1.0, 300)        # declared 100, holds 20, each at 20 tok/lease-s
+    assert trust.step("h", clock.now, declared=100, held=20, speeds=book, median=20.0, median_seconds=100.0,
+                      tail=False, trim_unused=False) is None
+    assert trust.of("h", 100) == 100                 # the shadow: refused slots are not its fault
+    changed = trust.step("h", clock.now, declared=100, held=20, speeds=book, median=20.0, median_seconds=100.0,
+                         tail=False)
+    assert changed.startswith("verdict") and trust.of("h", 100) == 25
+
+
+def test_draining_orders_without_measured_supply_take_no_surplus():
+    jobs = {"open": la._JobReport(q=0.2, remaining_tokens=1e8, deadline=None, supply=5_000.0),
+            "draining": la._JobReport(q=1.0, remaining_tokens=0.0, deadline=None, supply=None)}
+    rates = la.split(jobs, 3_000.0, now=0.0, first_seen={"open": 0.0, "draining": 0.0})
+    assert rates["draining"] == 0.0
+    assert rates["open"] == pytest.approx(15_000.0)   # 3k audit tok/s at q 0.2, up to and beyond its supply
