@@ -378,6 +378,16 @@ class MarketPace:
         self._targets: dict[str, float] = {}
         self.last: dict = {}
 
+    def seed_rate(self, rate: float | None) -> None:
+        """The audit rate last measured before a restart, until a fresh measure (the card takes minutes to read)."""
+        with self._lock:
+            if self._rate is None and rate is not None and rate > 0:
+                self._rate = float(rate)
+
+    @property
+    def rate(self) -> float | None:
+        return self._rate
+
     def bind_audit(self, audit: Callable[[], tuple[float, float | None] | None]) -> None:
         """``audit()``: (output tokens per second the market's audit cards verify together, their busy share or
         None), or None while not measured."""

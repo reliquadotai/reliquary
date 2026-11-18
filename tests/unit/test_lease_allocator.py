@@ -416,3 +416,32 @@ def test_draining_orders_without_measured_supply_take_no_surplus():
     rates = la.split(jobs, 3_000.0, now=0.0, first_seen={"open": 0.0, "draining": 0.0})
     assert rates["draining"] == 0.0
     assert rates["open"] == pytest.approx(15_000.0)   # 3k audit tok/s at q 0.2, up to and beyond its supply
+
+
+def test_after_a_restart_the_merit_order_resumes_at_once(monkeypatch, tmp_path):
+    """The median speed and the audit rate are kept in the state: a restarted control allocates by merit order
+    from its first lease instead of leaving the job to the thermostat while it measures again."""
+    clock = Clock()
+    auction, book = _merit_auction(monkeypatch, clock, audit=(300.0, 0.9))
+    auction._state_path = tmp_path / "job.json"
+    auction.post_ask("zero", 1e-6, 10)
+    auction.post_ask("mid", 0.10, 15)
+    for hotkey in ("zero", "mid"):
+        for _ in range(20):
+            terms = auction.admit(hotkey)
+            if isinstance(terms, Terms):
+                book.take(terms)
+                auction.unreserve(terms)
+    _warm(auction, book, clock, ["zero", "mid"])
+    assert auction.view()["allocator"] == "merit"
+    auction.save(force=True)
+
+    monkeypatch.setattr(la, "_PACES", {})
+    params = auction.params
+    restarted = TokenAuction(params, clock=clock, holdings=book, market_name="m-model|turn", job_id="job",
+                             backlog=lambda: 0, state_path=tmp_path / "job.json")
+    restarted.bind_merit(audit=lambda: None, q=lambda: 1.0)       # the card not measured again yet
+    restarted.admit("zero")
+    clock.now += la.STEP_SECONDS
+    restarted.admit("zero")
+    assert restarted.view()["allocator"] == "merit"
