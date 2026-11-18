@@ -418,9 +418,13 @@ class AsyncTrainer:
                  publisher=None, state_fn: Callable[[], Mapping[str, Any]] | None = None, backup=None,
                  backup_save: Callable[..., None] = save_snapshot,
                  train_step_fn: Callable = _default_train_step, ref_model: Any = None,
-                 global_step_hint: int | None = None, audits=None, clock: Callable[[], float] = time.monotonic,
+                 global_step_hint: int | None = None, final_checkpoint: int | None = None, audits=None, clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep) -> None:
         self.model, self.config = model, config
+        if final_checkpoint is not None and (isinstance(final_checkpoint, bool) or not isinstance(final_checkpoint, int)
+                                             or final_checkpoint < 1):
+            raise ValueError("final_checkpoint must be a positive integer")
+        self._final_checkpoint = final_checkpoint
         self.buffer, self.submissions, self.book = buffer, submissions, book
         self.publisher, self.backup, self._backup_save = publisher, backup, backup_save
         self._state_fn = state_fn or (lambda: self.model.state_dict())
@@ -460,7 +464,10 @@ class AsyncTrainer:
     def _publish_job(self, version: int, snapshot: dict) -> None:
         started = time.monotonic()
         if self.publisher is not None:
-            self.publisher.publish(version, snapshot)
+            publish = self.publisher.publish
+            if version == self._final_checkpoint:
+                publish = getattr(self.publisher, "publish_full", publish)
+            publish(version, snapshot)
         self.book.adopt_checkpoint(version)
         self.published.append(version)
         seconds = time.monotonic() - started
@@ -485,6 +492,13 @@ class AsyncTrainer:
             self._fetcher.shutdown(wait=True)        # what it took stays taken: the next start requeues it
             if self._reporter is not None:
                 self._reporter.shutdown(wait=True)
+
+        finalize = getattr(self.publisher, "finalize", None)
+        if finalize is not None:
+            try:
+                finalize()
+            except Exception:
+                logger.exception("final checkpoint anchor publication failed; the delta remains available")
 
     # --- batch ---------------------------------------------------------------------------------------------
     def _report_untrained(self, groups, failure_class=None) -> None:
@@ -656,12 +670,27 @@ class AsyncTrainer:
         worked = self._clock() - started
         self.last_step = {"result": "trained", "step": self.steps, "checkpoint": self.version, **gate.metrics()}
         audit_metrics = self.audits.metrics() if self.audits is not None else {}
-        telemetry.flush({**gate.metrics(), **timings, **self.last_publication, **audit_metrics,
+        metrics = telemetry.flush({**gate.metrics(), **timings, **self.last_publication, **audit_metrics,
                          "async/wait_s": started - began, "async/train_s": trained - started,
                          "async/step_s": worked, "async/completion_tokens": completion,
                          "async/completion_tokens_per_s": completion / worked if worked > 0 else 0.0,
                          "async/steps_skipped_total": self.skipped, **_peak_memory()},
                         self.steps)
+        publish_metrics = getattr(self.publisher, "publish_metrics", None)
+        if publish_metrics is not None:
+            publication = self._pending
+            version = self.version
+            observed_at = time.time()
+
+            def save_metrics():
+                try:
+                    if publication is not None:
+                        publication.result()
+                    publish_metrics(version, metrics, observed_at=observed_at)
+                except Exception:
+                    logger.exception("checkpoint metrics publication failed")
+
+            self._executor.submit(save_metrics)
         return "trained"
 
     def _report(self, submitted: list[SubmittedGroup], gate: DrawGate) -> dict[str, int]:

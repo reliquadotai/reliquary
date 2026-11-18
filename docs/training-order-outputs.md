@@ -1,0 +1,21 @@
+# Training order measurements and checkpoint exports
+
+The signed admin API serves a bounded, read-only view of each registered training task. The platform authenticates the customer and resolves its owned order to a task before calling these routes. The subnet retains its bucket credentials.
+
+- `GET /admin/v1/training/profiles` returns `reliquary/training-profiles/v1`, the exact pinned Gumbel-max profiles and each profile's live RL environments.
+- `GET /admin/v1/training/{task_id}/outputs` returns `reliquary/training-outputs/v1`, source observation timestamps in epoch seconds, latest checkpoint, measured history, checkpoint file manifests and explicit truncation flags. A task without a publication returns empty arrays and null source timestamps. A failed read returns 503.
+- `GET /admin/v1/training/{task_id}/checkpoints/{version}/files/{filename}` returns a fresh 900-second HTTPS download URL, task/version/name, byte count and SHA-256. The filename must match an object in the retained checkpoint index. Paths, object keys and URLs supplied by a caller cannot select bucket objects.
+
+The existing HMAC signature, nonce, prefix and registered-training-task checks apply. Query strings are rejected by the signed admin API. Retired tasks retain read access to their published outputs. These routes require `RELIQUARY_TRAINING_ORDERS=on`.
+
+Completed optimizer steps append allowlisted finite numerical metrics to `rl/{task_id}/metrics.json` through the trainer's existing authenticated upload link. This history is independent of W&B configuration. A row is written after its checkpoint publication succeeds. It records its own completion time, and publication failures are logged without interrupting training. No prompts, generated text, hotkeys or credentials enter this document. The history keeps at most 2,000 checkpoints and 2 MiB. The combined admin output is at most 4 MiB and lists at most 512 files. Truncation flags identify retained coverage.
+
+Checkpoints use the existing `rl/{task_id}/index.json`. New anchor/delta entries have publication timestamps. Older entries retain a null timestamp. A `full` export contains safetensors weights, their HF shard index, config and tokenizer files. Download every listed file into the same directory and verify sizes and SHA-256 values before loading it with Transformers or vLLM. Source shard indexes are rebuilt from the published tensor names, preserving the model's actual configs and tokenizer files.
+
+The authenticated trainer config supplies the order's declared max_steps. That optimizer step publishes a full anchor directly, before adoption and possible credential revocation. On a successful trainer close, outstanding publications finish, then the last successfully published CPU snapshot is written as a full anchor if needed. Its version and checkpoint SHA remain the published identity. The live model is never read during this finalization, so a failed subsequent optimizer step cannot enter the export. The trainer link allows adding a latest-version anchor only while the committed index has no anchor for that version. Existing anchor and delta objects at adopted versions remain protected. The index is written last. A failed finalization leaves the existing delta export available, and a later retry can complete the anchor.
+
+A `delta` export requires reconstruction. The existing `reliquary.miner.ckpt_sync.CheckpointSync` verifies the controller's signed `/rl/{task_id}/checkpoint` answer, obtains an anchor and required deltas, applies them bit-exactly, and verifies the target checkpoint SHA. Its `model_dir` option downloads the configs and tokenizer too. `reliquary.miner.rl_async.write_hf_dir(state, model_dir, destination)` then writes a loadable HF directory. The public signed index is needed for reconstruction planning. The dashboard lists retained artifacts and provides these reconstruction instructions for delta exports. An abrupt process termination may leave the latest checkpoint in this form.
+
+Local verification uses fake stores, synthetic tensors and signed test requests, with no rented hardware or live mutations.
+
+Roll out the matching trainer, controller, admin and signer code together. The strict remote signer schema accepts the new optional per-entry publication clock. Historical indexes keep their original signed bytes.

@@ -26,14 +26,14 @@ trainer is free to keep updating its own weights. It never reads deltas back.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
 import logging
-from pathlib import Path
 import shutil
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -68,7 +68,8 @@ def model_files(model_dir: str | Path) -> list[Path]:
     folder = Path(model_dir)
     if not folder.is_dir():
         raise ValueError(f"{folder} is not a model directory")
-    files = sorted(p for p in folder.iterdir() if p.is_file() and model_file_name_ok(p.name))
+    files = sorted(p for p in folder.iterdir() if p.is_file() and model_file_name_ok(p.name)
+                   and p.name != "model.safetensors.index.json")
     if not any(p.name == "config.json" for p in files):
         raise ValueError(f"{folder} has no config.json")
     too_big = [p.name for p in files if p.stat().st_size > MAX_MODEL_FILE_BYTES]
@@ -237,7 +238,11 @@ class DeltaPublisher:
         replaces it), e.g. for a background Hugging Face backup."""
         return self._prev
 
-    def publish(self, version: int, state: Mapping[str, torch.Tensor]) -> dict:
+    def publish_full(self, version: int, state: Mapping[str, torch.Tensor]) -> dict:
+        """Publish a known final optimizer step as an independently loadable anchor."""
+        return self.publish(version, state, force_anchor=True)
+
+    def publish(self, version: int, state: Mapping[str, torch.Tensor], *, force_anchor: bool = False) -> dict:
         version = int(version)
         if self._prev_version is not None and version <= self._prev_version:
             raise ValueError(f"version {version} does not follow {self._prev_version}")
@@ -247,7 +252,7 @@ class DeltaPublisher:
             masks = changed_masks(self._prev, snapshot)
             self._put_delta(snapshot, masks, self._prev_version, self._prev_sha, version, sha)
             self._extend_cumulatives(snapshot, masks, version, sha)
-        anchor = self._prev is None or self._last_anchor is None or (
+        anchor = force_anchor or self._prev is None or self._last_anchor is None or (
             version - self._last_anchor >= self.anchor_interval
             or version % self.anchor_interval == 0)
         if anchor:
@@ -270,6 +275,36 @@ class DeltaPublisher:
             self._doomed.append((float(self._clock()) + self._prune_grace_s, dropped))
         self._delete_due()
         return index
+
+    def finalize(self) -> None:
+        """Make the last successfully published snapshot independently downloadable on a clean close.
+
+        Never read the live model here: a failed optimizer step may have partly changed it.
+        The checkpoint identity and version stay those of the committed CPU snapshot.
+        """
+        version = self._prev_version
+        if self._prev is None or version is None or any(a["version"] == version for a in self.anchors):
+            return
+        previous_anchors, previous_last = list(self.anchors), self._last_anchor
+        try:
+            self._put_anchor(self._prev, version, self._prev_sha)
+            index = {"format": INDEX_FORMAT, "run": self.run,
+                     "latest": {"version": version, "sha256": self._prev_sha},
+                     "anchors": self.anchors, "deltas": self.deltas, "published_at": float(self._clock())}
+            self._store.put_bytes(index_key(self.run), json.dumps(index, sort_keys=True).encode())
+        except Exception:
+            self.anchors, self._last_anchor = previous_anchors, previous_last
+            raise
+
+    def publish_metrics(self, version: int, values: Mapping, *, observed_at: float | None = None) -> None:
+        """Measured completed optimizer steps only, appended after their checkpoint publication."""
+        from reliquary.shared.training_outputs import append_metrics, metrics_key
+
+        key = metrics_key(self.run)
+        raw = self._store.get_bytes(key)
+        previous = strict_json_loads(raw) if raw is not None else None
+        body = append_metrics(previous, self.run, int(version), float(self._clock()) if observed_at is None else observed_at, values)
+        self._store.put_bytes(key, json.dumps(body, sort_keys=True).encode())
 
     def measure_update(self) -> dict[str, float]:
         """``update_metrics`` of the last publication, run after it (it keeps the previous weights until then)."""
@@ -296,7 +331,8 @@ class DeltaPublisher:
         key = delta_key(self.run, from_version, to_version)
         self._store.put_bytes(key, blob)
         entry = {"from": from_version, "to": to_version, "key": key, "size": len(blob),
-                 "sha256": hashlib.sha256(blob).hexdigest(), "target_sha256": sha}
+                 "sha256": hashlib.sha256(blob).hexdigest(), "target_sha256": sha,
+                 "published_at": float(self._clock())}
         self.deltas.append(entry)
         logger.info("checkpoint delta %d->%d: %d changed bf16 elements, %d bytes",
                     from_version, to_version, delta.changed_elements, len(blob))
@@ -327,16 +363,29 @@ class DeltaPublisher:
         shutil.rmtree(folder, ignore_errors=True)
         try:
             files = []
-            for path in write_anchor_shards(state, folder, shard_bytes=self._shard_bytes):
+            paths = write_anchor_shards(state, folder, shard_bytes=self._shard_bytes)
+            from safetensors import safe_open
+
+            weight_map = {}
+            for path in paths:
+                with safe_open(str(path), framework="pt", device="cpu") as shard:
+                    weight_map.update(dict.fromkeys(shard.keys(), path.name))
+            weights_index = json.dumps({"metadata": {"total_size": sum(t.numel() * t.element_size() for t in state.values())},
+                                        "weight_map": weight_map}, sort_keys=True).encode()
+            for path in paths:
                 key = anchor_key(self.run, version, path.name)
                 self._store.put_file(key, path)
                 files.append({"key": key, "size": path.stat().st_size,
                               "sha256": _sha256_file(path)})
         finally:
             shutil.rmtree(folder, ignore_errors=True)
-        anchor = {"version": version, "sha256": sha, "files": files}
+        anchor = {"version": version, "sha256": sha, "files": files, "published_at": float(self._clock())}
         if self._model_files:
-            anchor["model_files"] = []
+            index_name = "model.safetensors.index.json"
+            index_object = model_file_key(self.run, version, index_name)
+            self._store.put_bytes(index_object, weights_index)
+            anchor["model_files"] = [{"name": index_name, "key": index_object, "size": len(weights_index),
+                                      "sha256": hashlib.sha256(weights_index).hexdigest()}]
             for path in self._model_files:
                 data = path.read_bytes()
                 key = model_file_key(self.run, version, path.name)

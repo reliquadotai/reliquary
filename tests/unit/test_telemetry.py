@@ -250,3 +250,9 @@ def test_held_rows_go_out_as_one_row_at_the_flush_step(monkeypatch):
                                            step=12, commit=True)
     telemetry.log_training_step({"x": 1}, step=13)                 # released: sent directly again
     assert fake_wandb.log.call_count == 2
+
+
+def test_held_metrics_are_available_to_checkpoint_outputs_without_wandb():
+    telemetry.hold()
+    telemetry.log_training_step({"train/entropy": 0.8}, step=1)
+    assert telemetry.flush({"async/step_s": 2.0}, 1) == {"train/entropy": 0.8, "async/step_s": 2.0}

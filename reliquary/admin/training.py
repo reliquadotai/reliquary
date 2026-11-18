@@ -178,5 +178,32 @@ def training_view(entry) -> dict:
             "order": params.get(TRAINING_PARAM)}
 
 
-__all__ = ["CreateTraining", "TRAINING_ORDERS_ENV", "order_digest", "training_enabled", "training_entry", "training_refusal",
-           "training_spend", "training_task_id", "training_view"]
+__all__ = [
+    "TRAINING_ORDERS_ENV",
+    "CreateTraining",
+    "order_digest",
+    "training_enabled",
+    "training_entry",
+    "training_profiles",
+    "training_refusal",
+    "training_spend",
+    "training_task_id",
+    "training_view",
+]
+
+
+def training_profiles() -> dict:
+    """Exact pinned async RL profiles and their currently live training environments."""
+    from reliquary.env_catalog import entry as catalog_entry
+    from reliquary.protocol.profiles import DRAW_GUMBEL_MAX, PROFILES
+
+    profiles = []
+    for profile_id, profile in PROFILES.items():
+        if profile.sampling.draw != DRAW_GUMBEL_MAX:
+            continue
+        environments = [name for name in profile.environments
+                        if (entry := catalog_entry(name)) is not None and any(r.live for r in entry.rows_of("rl"))]
+        if environments:
+            profiles.append({"id": profile_id, "model": profile.model_id, "revision": profile.model_revision,
+                             "environments": environments})
+    return {"schema": "reliquary/training-profiles/v1", "profiles": profiles}

@@ -710,3 +710,37 @@ def test_a_failed_step_releases_the_prefetched_batch_too():
         trainer.run_once()
     trainer.close()
     assert buffer.depth() == {"math": 4} and not subs.reports
+
+
+def test_completed_metrics_follow_publication_without_wandb_and_finalization_waits(monkeypatch):
+    from reliquary.validator import telemetry
+
+    monkeypatch.setattr(telemetry, "_enabled", False)
+    monkeypatch.setattr(telemetry, "_held", None)
+    model, book = _Model(), Book(latest=3)
+    buffer = TrainingBuffer(book)
+    buffer.push(submitted(model, "a"))
+    buffer.push(submitted(model, "b"))
+    events = []
+
+    class Outputs(Publisher):
+        def publish(self, version, state):
+            events.append(("checkpoint", version))
+
+        def publish_full(self, version, state):
+            events.append(("full checkpoint", version))
+
+        def publish_metrics(self, version, values, *, observed_at):
+            assert book.latest_checkpoint == version
+            assert values["async/completion_tokens"] == 2 * ROLLOUTS * N_TOK
+            assert values["train/lr"] > 0 and observed_at > 0
+            events.append(("metrics", version))
+
+        def finalize(self):
+            events.append(("final", book.latest_checkpoint))
+
+    trainer = AsyncTrainer(model, config=AsyncTrainerConfig(2, group_floor=0.7), buffer=buffer,
+                           submissions=Subs(buffer), book=book, publisher=Outputs(), final_checkpoint=4)
+    assert trainer.run_once() == "trained"
+    trainer.close()
+    assert events == [("full checkpoint", 4), ("metrics", 4), ("final", 4)]

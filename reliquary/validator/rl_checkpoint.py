@@ -103,6 +103,15 @@ class RlCheckpointBoard:
         if self._signed is None or self._signed[0] != digest:
             self._signed = (digest, index, self._index_signer(index))
 
+    def allows_final_anchor(self, version: int) -> bool:
+        """A trainer may add an anchor for the committed latest checkpoint, never replace an existing anchor."""
+        raw = self._load()
+        if not raw:
+            return False
+        index = strict_json_loads(raw)
+        return (index.get("format") == INDEX_FORMAT and index.get("latest", {}).get("version") == version
+                and not any(a.get("version") == version for a in index.get("anchors", [])))
+
     async def answer(self) -> dict | None:
         current = await self._current()
         if current is None:

@@ -233,3 +233,35 @@ def test_a_training_order_refuses_a_pay_carry(on, where):
         rl_async_settings(entry, entry.params["cap"], environ=environ)
     plain = on.registry["entries"]["order-train-t1"]
     assert rl_async_settings(plain, plain.params["cap"], environ={}).pay_carry_periods == 0
+
+
+def test_training_profiles_and_outputs_share_hmac_and_registry_scope(on, monkeypatch):
+    profiles = on("GET", "/admin/v1/training/profiles")
+    assert profiles.status_code == 200
+    profile = next(p for p in profiles.json()["profiles"] if p["id"] == PROFILE)
+    assert profile["model"] and len(profile["revision"]) == 40
+    assert "reliquary_dapo_math_v1" in profile["environments"]
+    assert on.client.get("/admin/v1/training/profiles").status_code == 401
+    assert on("POST", "/admin/v1/training", _order()).status_code == 201
+    calls = []
+
+    class Store:
+        def outputs(self, task):
+            calls.append(task)
+            return {"schema": "reliquary/training-outputs/v1", "task_id": task}
+
+        def download(self, task, version, filename, **kwargs):
+            calls.append((task, version, filename))
+            if filename != "config.json":
+                raise KeyError(filename)
+            return {"task_id": task, "checkpoint": version, "filename": filename, "expires_at": 999}
+
+    monkeypatch.setattr("reliquary.shared.training_outputs.TrainingOutputsStore", Store)
+    assert on("GET", "/admin/v1/training/order-train-missing/outputs").status_code == 404
+    assert on("GET", "/admin/v1/training/foreign-task/outputs").status_code == 409
+    assert calls == []
+    assert on("GET", "/admin/v1/training/order-train-t1/outputs").json()["task_id"] == "order-train-t1"
+    path = "/admin/v1/training/order-train-t1/checkpoints/5/files/"
+    assert on("GET", path + "config.json").status_code == 200
+    assert on("GET", path + "absent.json").status_code == 404
+    assert on.client.get(path + "config.json").status_code == 401

@@ -74,10 +74,10 @@ def log_training_step(metrics: dict, step: int | None) -> None:
     session are silenced to avoid flooding the log on prolonged outages.
     """
     global _log_warned
-    if not _enabled:
-        return
     if _held is not None:
         _held.update(metrics)
+        return
+    if not _enabled:
         return
     try:
         import wandb  # already imported successfully in init()
@@ -98,11 +98,13 @@ def hold() -> None:
         _held = {}
 
 
-def flush(extra: dict, step: int | None) -> None:
+def flush(extra: dict, step: int | None) -> dict:
     """Send what ``hold`` collected and ``extra`` as one row at ``step``."""
     global _held
     held, _held = _held or {}, None
-    log_training_step({**held, **extra}, step)
+    row = {**held, **extra}
+    log_training_step(row, step)
+    return row
 
 
 def update_config(values: dict) -> None:

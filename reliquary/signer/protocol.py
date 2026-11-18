@@ -177,11 +177,13 @@ class _IndexVersion(_StrictModel):
 
 
 class _IndexAnchor(_IndexVersion):
+    published_at: float | int | None = None
     files: list[_IndexObject] = Field(min_length=1, max_length=MAX_INDEX_FILES)
     model_files: list[_IndexModelFile] | None = Field(default=None, max_length=MAX_INDEX_FILES)
 
 
 class _IndexDelta(_IndexObject):
+    published_at: float | int | None = None
     from_: int = Field(alias="from", ge=0)
     to: int = Field(ge=0)
     target_sha256: str = Field(pattern=_SHA256)
@@ -210,6 +212,9 @@ class RlCheckpointIndex(_StrictModel):
             raise ValueError("a delta must go forwards, up to the latest version")
         if self.published_at is not None and not math.isfinite(float(self.published_at)):
             raise ValueError("published_at must be finite")
+        for entry in [*self.anchors, *self.deltas]:
+            if entry.published_at is not None and (not math.isfinite(float(entry.published_at)) or entry.published_at < 0):
+                raise ValueError("checkpoint publication time must be finite and non-negative")
         objects = [
             *(f for a in self.anchors for f in a.files),
             *(f for a in self.anchors for f in (a.model_files or ())),

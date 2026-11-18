@@ -283,3 +283,33 @@ def test_the_link_refuses_plain_http_off_loopback(url, env, ok):
     else:
         with pytest.raises(ValueError):
             TrainerLink(url, "t" * 40, client=_Recorder(), environ=env)
+
+
+def test_metrics_and_final_anchor_urls_stay_in_the_authenticated_task_namespace(tmp_path):
+    from reliquary.shared.training_outputs import metrics_key
+    from tests.unit.test_ckpt_publication import MemoryStore, make_board
+
+    client, rl, _ = _client(tmp_path)
+    run = rl.settings.run
+    key = metrics_key(run)
+    for action in ("uploads", "reads"):
+        assert client.post(f"/rl/trainer/{action}", headers=AUTH, json={"keys": [key]}).status_code == 200
+        assert client.post(f"/rl/trainer/{action}", json={"keys": [key]}).status_code == 401
+    assert client.post("/rl/trainer/deletes", headers=AUTH, json={"keys": [key]}).status_code == 422
+    assert client.post("/rl/trainer/uploads", headers=AUTH,
+                       json={"keys": [metrics_key("another-task")]}).status_code == 422
+    store = MemoryStore()
+    document = {"format": "reliquary-ckpt-index/1", "run": run,
+                "latest": {"version": 3, "sha256": "a" * 64}, "anchors": [], "deltas": []}
+    store.put_bytes(index_key(run), json.dumps(document).encode())
+    rl.board = make_board(store, run=run)
+    rl.book.adopt_checkpoint(0)
+    rl.book.adopt_checkpoint(3)
+    final_key = f"rl/{run}/anchors/00000003/model.safetensors"
+    assert client.post("/rl/trainer/uploads", headers=AUTH, json={"keys": [final_key]}).status_code == 200
+    document["anchors"].append({"version": 3})
+    store.put_bytes(index_key(run), json.dumps(document).encode())
+    assert client.post("/rl/trainer/uploads", headers=AUTH, json={"keys": [final_key]}).status_code == 422
+    assert client.post("/rl/trainer/uploads", headers=AUTH,
+                       json={"keys": [f"rl/{run}/deltas/00000002-00000003.rqd"]}).status_code == 422
+    rl.close()

@@ -89,6 +89,8 @@ MAX_MODEL_FILE_BYTES = 64 * 1024 * 1024
 
 def model_file_name_ok(name: str) -> bool:
     """A plain file name (no directory, not hidden) that is not a weight file."""
+    if name == "model.safetensors.index.json":
+        return True
     return (isinstance(name, str) and 0 < len(name) <= 128 and "/" not in name and "\\" not in name
             and not name.startswith(".") and name not in {".", ".."} and not name.endswith(WEIGHT_SUFFIXES))
 

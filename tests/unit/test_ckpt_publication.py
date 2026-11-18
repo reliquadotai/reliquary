@@ -341,7 +341,7 @@ def test_anchors_carry_the_model_files_and_the_miner_keeps_them(tmp_path):
     names = ["chat_template.jinja", "config.json", "tokenizer.json"]
     assert [a["version"] for a in index["anchors"]] == [4, 6]
     for anchor in index["anchors"]:
-        assert [f["name"] for f in anchor["model_files"]] == names
+        assert sorted(f["name"] for f in anchor["model_files"]) == sorted([*names, "model.safetensors.index.json"])
     # pruned anchors take their model files with them; the board presigns the kept ones
     assert not any("/anchors/00000000/" in key or "/anchors/00000002/" in key for key in store.objects)
     response = answer(store)
@@ -351,12 +351,12 @@ def test_anchors_carry_the_model_files_and_the_miner_keeps_them(tmp_path):
                           model_dir=tmp_path / "miner-model")
     rebuilt, version, _ = sync.sync(response, None, None)
     assert version == 6 and bits_equal(rebuilt, states[6])
-    assert sorted(p.name for p in (tmp_path / "miner-model").iterdir()) == names
+    assert sorted(p.name for p in (tmp_path / "miner-model").iterdir()) == sorted([*names, "model.safetensors.index.json"])
     assert (tmp_path / "miner-model" / "config.json").read_text() == '{"model_type": "qwen3"}'
     assert sync.sync_model_files(response["index"], response["urls"]) == []      # unchanged: nothing fetched
     (tmp_path / "miner-model" / "tokenizer.json").write_text("stale")
     assert sync.sync_model_files(response["index"], response["urls"]) == ["tokenizer.json"]
-    key = index["anchors"][-1]["model_files"][1]["key"]
+    key = next(f["key"] for f in index["anchors"][-1]["model_files"] if f["name"] == "config.json")
     store.objects[key] = b"tampered"
     (tmp_path / "miner-model" / "config.json").unlink()
     with pytest.raises(ObjectMismatch):

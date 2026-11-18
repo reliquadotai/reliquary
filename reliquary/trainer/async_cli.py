@@ -324,7 +324,7 @@ def run_async_train_worker() -> None:
         trainer = AsyncTrainer(
             model, config=config, buffer=link, submissions=link, book=link, publisher=publisher,
             state_fn=state_fn, backup=backup, backup_save=backup_save,
-            train_step_fn=step_fn, audits=audits,
+            train_step_fn=step_fn, audits=audits, final_checkpoint=task.get("max_steps"),
             global_step_hint=None if version is None else version * settings["steps_per_checkpoint"])
         live["trainer"] = trainer
         logger.info("train-async starting: task %s, run %s, target mix %s (priced, not enforced), checkpoint %d",

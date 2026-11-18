@@ -474,7 +474,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      model_facts=None, evaluation_sessions=None, pin_model=None,
                      upload_tokenizer=None, subnet_pool=None, tao_usd=None,
                      sandbox_machine_prefix: str | None = None, sandbox_machines=None,
-                     order_sessions=None, rl_spend_reader=None) -> FastAPI:
+                     order_sessions=None, rl_spend_reader=None, training_outputs_store=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
     ``eval_store`` the subnet bucket holding the eval sets' grading files; ``order_sessions``
@@ -1538,6 +1538,38 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             logger.info("admin: declared training %s as task %s", body.training_id, task_id)
             response.status_code = 201
             return {**training_view(entry), "created": True}
+
+        @router.get("/training/profiles")
+        async def training_profiles() -> dict:
+            from reliquary.admin.training import training_profiles as profiles
+
+            return profiles()
+
+        def outputs_store():
+            from reliquary.shared.training_outputs import TrainingOutputsStore
+
+            return training_outputs_store or TrainingOutputsStore()
+
+        @router.get("/training/{task_id}/outputs")
+        async def training_outputs(task_id: str) -> dict:
+            await training_task(task_id)
+            try:
+                return await asyncio.to_thread(outputs_store().outputs, task_id)
+            except Exception as exc:
+                logger.warning("admin: training outputs unreadable for %s: %s", task_id, type(exc).__name__)
+                raise HTTPException(status_code=503, detail="training_outputs_unreadable") from exc
+
+        @router.get("/training/{task_id}/checkpoints/{version}/files/{filename}")
+        async def training_checkpoint_file(task_id: str, version: int, filename: str) -> dict:
+            await training_task(task_id)
+            if version < 0:
+                raise HTTPException(status_code=422, detail="invalid_checkpoint")
+            try:
+                return await asyncio.to_thread(outputs_store().download, task_id, version, filename, now=clock())
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail="checkpoint_file_unknown") from exc
+            except Exception as exc:
+                raise HTTPException(status_code=503, detail="training_outputs_unreadable") from exc
 
         @router.get("/training/{task_id}")
         async def training_status(task_id: str) -> dict:

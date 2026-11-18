@@ -571,8 +571,15 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str | None = None, auth: Trai
             tuple(float(m) for m in b.get("rollout_match") or ()), bool(b.get("suspect", False))))
         return {"ok": True}
 
-    route("GET", "config", lambda b: {"task_id": rl.settings.task_id, "run": rl.settings.run,
-                                      "targets": dict(rl.settings.targets), "latest": rl.book.latest_checkpoint})
+    def trainer_config(b: dict) -> dict:
+        config = {"task_id": rl.settings.task_id, "run": rl.settings.run,
+                  "targets": dict(rl.settings.targets), "latest": rl.book.latest_checkpoint}
+        maximum = getattr(getattr(rl.book, "auctions", None), "limits", {}).get("max_steps")
+        if isinstance(maximum, int) and not isinstance(maximum, bool) and maximum > 0:
+            config["max_steps"] = maximum
+        return config
+
+    route("GET", "config", trainer_config)
     route("GET", "latest", lambda b: {"latest": rl.book.latest_checkpoint})
     route("POST", "adopt", adopt)
     def take(b: dict) -> dict:
@@ -610,11 +617,17 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str | None = None, auth: Trai
             raise ValueError(f"keys must be under {prefix_}")
         index = index_key(run)
         latest = rl.book.latest_checkpoint if use == "upload" else None
+        from reliquary.shared.training_outputs import metrics_key
+
         for key in keys:
+            if key == metrics_key(run) and use in {"upload", "read"}:
+                continue
             version = checkpoint_key_version(run, key)
             if version is None and not (key == index and use != "delete"):
                 raise ValueError(f"{key} is not a checkpoint file")
-            if version is not None and latest is not None and version <= latest:
+            final_anchor = (version is not None and version == latest and "/anchors/" in key
+                            and rl.board is not None and rl.board.allows_final_anchor(version))
+            if version is not None and latest is not None and version <= latest and not final_anchor:
                 raise ValueError(f"{key}: checkpoint {version} is already adopted (latest {latest})")
         return keys
 
