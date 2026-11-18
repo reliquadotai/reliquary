@@ -114,12 +114,38 @@ def test_constants_follow_the_active_profile():
                                     "domain": "reliquary-forced-seed-v9"}
 
 
+CAPS_4B = {"reliquary_dapo_math_v1": 16384, "reliquary_science_v1": 16384, "reliquary_hard_math_v1": 16384,
+           "reliquary_instruction_following_v1": 8192, "reliquary_code_v1": 8192,
+           "reliquary_competitive_code_v1": 16384, "reliquary_general_v1": 16384,
+           "reliquary_telecom_solo_v1": 49152, "envscaler_tools_v2": 65536}
+# The larger models reason at the Teutonic v10 caps where it raised them to 64k (2026-10-19/20 budget probes).
+LONG = ("reliquary_dapo_math_v1", "reliquary_hard_math_v1", "reliquary_competitive_code_v1")
+
+
+def _caps(profile_id):
+    return {name: env.max_new_tokens for name, env in PROFILES[profile_id].environments.items()}
+
+
+def test_the_4b_caps_single_turn_envs_at_16k():
+    assert _caps(API_TRAINING[0]) == CAPS_4B
+
+
 @pytest.mark.parametrize("profile_id", API_TRAINING[1:])
-def test_the_api_training_profiles_differ_from_the_4b_by_their_model_only(profile_id):
+def test_the_larger_models_take_the_teutonic_long_caps_and_the_4b_elsewhere(profile_id):
+    teutonic = _caps(GUMBEL)
+    assert {name for name, cap in teutonic.items() if cap == 65536 and PROFILES[GUMBEL].environments[name].episode
+            is None} == set(LONG)
+    assert _caps(profile_id) == {**CAPS_4B, **{name: teutonic[name] for name in LONG}}
+
+
+@pytest.mark.parametrize("profile_id", API_TRAINING[1:])
+def test_the_larger_models_differ_from_the_4b_by_their_model_and_long_caps_only(profile_id):
     base, profile = PROFILES[API_TRAINING[0]], PROFILES[profile_id]
     assert profile.sampling.draw == "gumbel_max" and profile.protocol_version == 10
+    envs = {name: (replace(env, max_new_tokens=base.environments[name].max_new_tokens) if name in LONG else env)
+            for name, env in profile.environments.items()}
     assert replace(profile, profile_id=base.profile_id, model_id=base.model_id,
-                   model_revision=base.model_revision) == base
+                   model_revision=base.model_revision, environments=envs) == base
     assert len(profile.model_revision) == 40
 
 

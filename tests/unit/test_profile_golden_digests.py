@@ -75,12 +75,12 @@ GOLDEN = {
         "3d4200a985bd2e27ff3d18b1d91145ea0a9e4db5cba48ca698eff32bb5c12094",
     ),
     "qwen35-9b-reliquary-suite-v10-gumbel-dev1": (
-        "81ef3746d6ff1f4ddd96af66ff4783ee73bb796945c79c5a8107b0b1b264abb7",
-        "4d436168406a411e9c12e525a387145a69af56dbd8cace7dfdbb6ac885d77055",
+        "79c75f0c47d308825473ca57e81cccaa2ded1ffd26aeef17574bf5592e9cde60",
+        "d09765df4c63544bb7914bcc4345d849bebc2fa9c7d814df3c6e792d919cf17d",
     ),
     "qwen38-27b-reliquary-suite-v10-gumbel-dev1": (
-        "9023769ba9af843e8ec6cf089203cb4095a04e2817176d59a9aba1b4bae97779",
-        "ac61af8ed224f02ba6eb6247ba5d14b7a79def7fd2f9f3134df08bea460f76b2",
+        "6be789dc4719a5bdef74428a996ef99fc9c8f21fc60d57defc02e244ea541008",
+        "85c381e6387b1285e9fed8a061f4c9c9420ca82039adff477098febb258dfac6",
     ),
 }
 CORPUS_CODE_V1_SHA256 = (
