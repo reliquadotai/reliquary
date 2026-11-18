@@ -22,7 +22,7 @@ def test_sampling_defaults_are_the_inverse_cdf_on_the_model_head():
     assert sampling.lm_head_fp32 is False
 
 
-@pytest.mark.parametrize("profile_id", sorted(set(PROFILES) - {GUMBEL}))
+@pytest.mark.parametrize("profile_id", sorted(set(PROFILES) - {GUMBEL, "qwen35-4b-reliquary-suite-v10-gumbel-dev1"}))
 def test_earlier_profiles_keep_the_inverse_cdf_and_omit_the_fields(profile_id):
     profile = PROFILES[profile_id]
     assert profile.sampling.draw == "inverse_cdf" and profile.sampling.lm_head_fp32 is False

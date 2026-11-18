@@ -39,7 +39,8 @@ the share of the period the trainer was down. Before the first heartbeat nothing
 counts as a beat (``trainer_beat``, throttled). The validator's own downtime (``rl_validator_downtime``, written by
 the lease book) is cut out of the outages: the trainer could not reach it, and its late step report pays then. A
 piece shorter than the grace is dropped. With the fill on, a period settles ``outage_grace_s`` after its end at the
-earliest, so an outage at its very end is seen before it is archived.
+earliest, so an outage at its very end is seen before it is archived. A training order's run is
+over at its stop (``stopped_at``): no outage is filled past it.
 """
 from __future__ import annotations
 
@@ -81,6 +82,7 @@ CREATE TABLE IF NOT EXISTS rl_pay_periods(work_period INTEGER PRIMARY KEY, entry
     doc TEXT NOT NULL, published INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS rl_trainer_beat(id INTEGER PRIMARY KEY CHECK(id=0), last_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS rl_trainer_outages(start REAL NOT NULL, end REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS rl_order_stop(id INTEGER PRIMARY KEY CHECK(id=0), at REAL NOT NULL);
 """
 # Archives a period's outage fill is averaged over (only those with less than half the period in outage).
 OUTAGE_REFERENCE_PERIODS = 6
@@ -129,6 +131,7 @@ class RlPayLedger:
         self.auctions = getattr(book, "auctions", None)
         self._board: tuple[float, dict] | None = None
         self._beat_at: float | None = None        # the last trainer_beat write (memory only)
+        self.settled_through: int | None = None   # the last period the latest settle closed (memory only)
         with book.lock:
             book.db.executescript(_SCHEMA)
             book.db.execute("INSERT OR IGNORE INTO rl_pay_cursor(id, seq) VALUES(0, 0)")
@@ -205,7 +208,8 @@ class RlPayLedger:
 
     # --- settlement ----------------------------------------------------------------------------------------
     def settle(self, now: float | None = None) -> list[dict]:
-        """Archive every closed period holding accruals, oldest first (each once); returns the new archives."""
+        """Archive every closed period holding accruals, oldest first (each once); returns the new archives.
+        ``settled_through``: the last closed period of this pass."""
         now = float(self.clock()) if now is None else now
         genesis = self.config.genesis
         slack = max(self.config.slack_s, self.config.outage_grace_s) if self.config.outage_fill else self.config.slack_s
@@ -254,6 +258,7 @@ class RlPayLedger:
                            (period, entry, json.dumps(doc, sort_keys=True), _UNATTEMPTED))
                 db.execute("UPDATE rl_accruals SET status=? WHERE status=? AND period=?", (SETTLED, ACCRUED, period))
                 out.append(doc)
+        self.settled_through = closed
         return out
 
     def _due_periods(self, closed: int, outages: list[tuple[float, float]] = ()) -> list[int]:
@@ -297,6 +302,25 @@ class RlPayLedger:
             db.execute("DELETE FROM rl_trainer_outages WHERE end<?", (now - OUTAGE_KEEP_S,))
         self._beat_at = now
 
+    def stopped_at(self, now: float | None = None) -> float | None:
+        """When the training order first reached a limit or was retired (``RlAuctions.stopped``; a deadline at the
+        deadline, the rest when first seen), kept once seen; None: not stopped, or no order."""
+        if self.auctions is None or not (getattr(self.auctions, "limits", None) or getattr(self.auctions, "retired",
+                                                                                                False)):
+            return None
+        with self.book.lock:
+            row = self.book.db.execute("SELECT at FROM rl_order_stop WHERE id=0").fetchone()
+        if row is not None:
+            return float(row[0])
+        reason = self.auctions.stopped()
+        if reason is None:
+            return None
+        now = float(self.clock()) if now is None else now
+        at = min(now, float(self.auctions.limits["deadline_at"])) if reason == "deadline" else now
+        with self.book.transaction():
+            self.book.db.execute("INSERT OR IGNORE INTO rl_order_stop(id, at) VALUES(0, ?)", (at,))
+            return float(self.book.db.execute("SELECT at FROM rl_order_stop WHERE id=0").fetchone()[0])
+
     def _validator_downtime(self) -> list[tuple[float, float]]:
         try:
             return [(float(s), float(e)) for s, e in
@@ -315,6 +339,9 @@ class RlPayLedger:
         row = db.execute("SELECT last_at FROM rl_trainer_beat WHERE id=0").fetchone()
         if row is not None and now - row[0] > self.config.outage_grace_s:
             spans.append((float(row[0]), now))
+        stop = self.stopped_at(now)
+        if stop is not None:                      # a training order's run is over at its stop: nothing to fill
+            spans = [(s, min(e, stop)) for s, e in spans if s < stop]
         down = sorted(self._validator_downtime())
         out = []
         for s, e in spans:

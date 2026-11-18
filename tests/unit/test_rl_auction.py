@@ -314,3 +314,59 @@ def test_the_yield_is_measured_on_the_envs_graded_groups(paid_book):
     buffered = auctions.buffered(ENV)
     assert buffered == rl_auction.YIELD_MIN_GROUPS // 4
     assert auctions.budget(ENV) == env_budget(1.0, 64, 2, buffered, 0.25)
+
+
+# --- a training order's limits ------------------------------------------------------------------------------------
+
+
+def _limited(tmp_path, **limits):
+    clock = Clock()
+    auctions = auctions_for(clock=clock, targets={ENV: 1.0}, batch_groups=64)
+    auctions.limits = limits
+    book = LeaseBook(tmp_path / "leases.sqlite3", LeaseBookConfig(expiry_s={ENV: 600.0}, cooldown_of=lambda env: 2),
+                     quota=None, clock=clock, auctions=auctions)
+    book.adopt_checkpoint(0)
+    return book, auctions, clock
+
+
+def test_an_order_past_its_deadline_leases_nothing(tmp_path):
+    book, auctions, clock = _limited(tmp_path, deadline_at=NOW + 10)
+    assert auctions.budget(ENV) > 0 and auctions.stopped() is None
+    clock.t = NOW + 10
+    assert auctions.budget(ENV) == 0 and auctions.stopped() == "deadline"
+    auctions.post_ask(ENV, "A", 0.5, 8)
+    assert not book.grant([LeaseRequest("A", ENV, (1,), 0)])[0].leases
+    assert auctions.view()["stopped"] == "deadline"
+    book.close()
+
+
+def test_an_order_at_its_last_step_leases_nothing(tmp_path):
+    book, auctions, _ = _limited(tmp_path, max_steps=3)
+    book.adopt_checkpoint(2)
+    assert auctions.budget(ENV) > 0
+    book.adopt_checkpoint(3)
+    assert auctions.budget(ENV) == 0 and auctions.stopped() == "max_steps"
+    book.close()
+
+
+def test_an_order_that_paid_its_tokens_leases_nothing(tmp_path):
+    book, auctions, clock = _limited(tmp_path, max_tokens=2 * GROUP_TOKENS)
+    RlPayLedger(book, service(book, probation_groups=0), None, LedgerConfig(task_id="rl-test", cap=0.5), clock=clock)
+    row = "INSERT INTO rl_accruals VALUES(?, 'l', 'A', ?, ?, ?, 0, ?, ?, ?, ?)"
+    book.db.execute(row, (1, ENV, "trained", NOW, GROUP_TOKENS, 1e-6, GROUP_TOKENS * 1e-6, "accrued"))
+    book.db.execute(row, (2, ENV, "first_scan", NOW, 0, 1e-6, 0.25 * GROUP_TOKENS * 1e-6, "accrued"))
+    assert auctions.paid_tokens() == pytest.approx(1.25 * GROUP_TOKENS) and auctions.budget(ENV) > 0
+    book.db.execute(row, (3, ENV, "trained", NOW, GROUP_TOKENS, 1e-6, GROUP_TOKENS * 1e-6, "forfeited"))
+    assert auctions.budget(ENV) > 0                                           # a forfeited accrual is not paid
+    book.db.execute(row, (4, ENV, "trained", NOW, GROUP_TOKENS, 1e-6, GROUP_TOKENS * 1e-6, "accrued"))
+    assert auctions.budget(ENV) == 0 and auctions.stopped() == "max_tokens"
+    book.close()
+
+
+def test_a_training_order_task_carries_its_limits_to_the_auction():
+    from reliquary.validator.corpus_periods import price_params
+
+    params = {"pricing": "auction", **price_params(1.0, 1.0, NOW),
+              "training_order": {"training_id": "t", "max_steps": 5, "deadline_at": NOW + 60, "max_tokens": 9}}
+    auctions = RlAuctions.from_params(params, {ENV: 1.0}, batch_groups=4, task_id="rl-lim", clock=lambda: NOW)
+    assert auctions.limits == {"max_steps": 5, "deadline_at": NOW + 60, "max_tokens": 9}

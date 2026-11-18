@@ -70,6 +70,10 @@ GOLDEN = {
         "d933017e26d3f304a8651e19f0dac3f5c83da79f706167d7e4aced8d02e1da6a",
         "a6115b1c1765c79b820e86072c4db0b638cafd6433fd791e973e9864e111a7fe",
     ),
+    "qwen35-4b-reliquary-suite-v10-gumbel-dev1": (
+        "555ef91ecb775f29e1d1456e8b77a0a23587fa7ba132540c547555a2471d852d",
+        "3d4200a985bd2e27ff3d18b1d91145ea0a9e4db5cba48ca698eff32bb5c12094",
+    ),
 }
 CORPUS_CODE_V1_SHA256 = (
     "ffa86eaf42a3034f3c7bfa67b8b5ae3658019acc4fb0ee62d5485607a66b818d"

@@ -80,3 +80,47 @@ def test_a_bad_offer_is_refused(client):
     tampered = ask()
     tampered["micro_alpha_per_mtoken"] = 1
     assert client.post("/rl/ask", json=tampered).json()["reason"] == "bad_signature"
+
+
+async def test_a_task_path_offer_is_signed_for_its_task(tmp_path):
+    import json
+
+    import httpx
+
+    from reliquary.miner.rl_async import HttpRlTransport, RequestRefused
+    from reliquary.validator.rl_front import build_front_app
+
+    auctions = RlAuctions(AuctionParams(ceiling=1e-6, miner_alpha_per_period=1.0), {ENV: 1.0}, batch_groups=8,
+                          lag=2, task_id="t", clock=lambda: float(NOW), state_dir_job=lambda job: None)
+    book = LeaseBook(tmp_path / "leases.sqlite3", LeaseBookConfig(expiry_s={ENV: 600.0}),
+                     quota=None, clock=lambda: float(NOW), rng=random.Random(1), auctions=auctions)
+    book.adopt_checkpoint(0)
+    app = FastAPI()
+    app.include_router(build_rl_lease_router(book=book, collector=LeaseCollector(book, interval_s=0.0),
+                                             validator_hotkey=VALIDATOR.ss58_address, clock=lambda: float(NOW),
+                                             task_id="t"))
+    spec = tmp_path / "map.json"
+    spec.write_text(json.dumps({"default": "t", "tasks": {"t": {"port": 8001}}}))
+    front = build_front_app(spec, client_factory=lambda port: httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app)))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=front), base_url="http://v") as client:
+        def transport(prefix):
+            return HttpRlTransport(client, base_url="http://v", hotkey=MINER.ss58_address,
+                                   validator_hotkey=VALIDATOR.ss58_address, prefix=prefix, clock=lambda: float(NOW),
+                                   sign_binding=lambda binding: MINER.sign(binding).hex())
+
+        answer = await transport("/rl/t").ask(ENV, 500_000, 4)
+        assert answer["accepted"] and answer["auction"]["allowance"] == 4
+        bare = await transport("/rl").ask(ENV, 500_000, 3)               # the default task, verified as /rl/ask
+        assert bare["accepted"] and bare["auction"]["allowance"] == 3
+        signed_for_other = ask(at=NOW + 1)
+        signed_for_other["signature"] = MINER.sign(build_rl_ask_binding(
+            hotkey=MINER.ss58_address, at=NOW + 1, environment=ENV, micro_alpha_per_mtoken=500_000, capacity=4,
+            validator_hotkey=VALIDATOR.ss58_address, path="/rl/u/ask")).hex()
+        refused = await client.post("/rl/t/ask", json=signed_for_other)
+        assert refused.status_code == 403 and refused.json()["reason"] == "bad_signature"
+        with pytest.raises(RequestRefused) as wrong:
+            await transport("/rl/t").ask("nope", 500_000, 3)
+        assert wrong.value.reason == "ask_invalid"
+        listed = (await client.get("/rl/tasks")).json()
+        assert [t["task_id"] for t in listed] == ["t"] and listed[0]["environments"] == {ENV: 1.0}

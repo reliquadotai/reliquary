@@ -256,3 +256,13 @@ def test_a_service_entry_parses_its_contract_exactly_once(monkeypatch):
     assert len(calls) == 1
     assert config.service_contract is not None
     assert _resolve({"default": _entry()}).service_contract is None
+
+
+def test_a_retired_training_task_may_boot_to_settle_only_when_allowed():
+    entry = _entry(status="retired", params={**PARAMS, "training_order": {}})
+    config = resolve_task_config({"default": entry}, "default", profile_id="demo-profile",
+                                 generation_contract=CONTRACT, allow_retired_training=True)
+    assert config.task_id == "default"
+    with pytest.raises(TaskConfigError, match="retired"):
+        resolve_task_config({"default": _entry(status="retired")}, "default", profile_id="demo-profile",
+                            generation_contract=CONTRACT, allow_retired_training=True)

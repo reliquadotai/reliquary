@@ -48,7 +48,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -56,6 +56,7 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from reliquary.shared.ckpt_index import checkpoint_key_version, index_key, run_prefix
 from reliquary.shared.task_registry import RL_START_POOL_PARAM
 
 logger = logging.getLogger(__name__)
@@ -112,8 +113,11 @@ DEFAULT_LEASE_MARGIN = 2.0
 EXPIRE_EVERY_S = 5.0
 AUDIT_EVERY_S = 2.0
 AUDIT_LIMIT = 8
+MAX_TRAINER_KEYS = 512            # object keys one presigned-upload, read or delete call may ask for
+MAX_TRAINER_KEY_BYTES = 1024
 MAX_TRAINER_AUDITS = 256          # audit jobs one trainer-link take may ask for
 LEDGER_EVERY_S = 30.0
+REGISTRY_EVERY_S = 60.0          # a training order's controller rereads its task's status this often
 PRICE_EVERY_S = 30.0
 CHECKPOINT_FOLLOW_EVERY_S = 10.0
 
@@ -311,6 +315,8 @@ def rl_async_settings(entry, cap: float, *, run: str | None = None,
     from reliquary.validator.rl_auction import auction_settings
 
     auction = auction_settings(params, targets, batch_groups=switches["batch_groups"])
+    if "training_order" in params and switches["pay_carry_periods"] > 0:
+        raise ValueError("a training order pays each period's own work: no pay carry (its bill reads the periods)")
     if auction is not None and params.get(ENV_PAY_K_PARAM) is not None:
         raise ValueError(f"{ENV_PAY_K_PARAM} has no use on a task priced by auction: each env's offers are capped "
                          "by the ceiling")
@@ -338,6 +344,12 @@ class RlAsync:
     observations: Any = None                    # rl_observations.ObservationBoard (None: /rl/observations 503s)
     sandbox: Any = None                         # rl_async_episodes.RlLeaseSandbox (episode envs only)
     benchmarks: Any = None                      # run_id -> the run's benchmark feed bytes or None (/rl/benchmarks)
+    # The checkpoint bucket for a trainer pod that holds no bucket key (``/uploads``, ``/reads``, ``/deletes``):
+    # key -> presigned PUT / GET URL, key -> None. None: those routes answer 404.
+    presign_put: Any = None
+    presign_get: Any = None
+    delete_object: Any = None
+    public_put: Any = None                      # the public bucket's writer (``rl_observations.bucket_io``)
 
     def close(self) -> None:
         self.book.close()
@@ -412,20 +424,93 @@ def _pack(group) -> str:
     return base64.b64encode(group.pack()).decode("ascii")
 
 
-def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/trainer") -> APIRouter:
+TrainerAuth = Callable[[str], Awaitable[bool]]   # a bearer token -> does it open the link
+TRAINER_AUTH_TTL_S = 30.0
+
+
+TRAINER_BEAT_EVERY_S = 60.0
+
+
+def executor_trainer_auth(task_id: str, *, store=None, clock: Callable[[], float] = time.time,
+                          detail: Callable[[], dict | None] | None = None) -> TrainerAuth:
+    """Accepts the bearer of an active, unexpired ``trainer`` executor registered for ``task_id``. The registry is
+    re-read at most every ``TRAINER_AUTH_TTL_S``, so a revocation lands within that. Each accepted request also
+    records the executor's heartbeat (what the platform reads as "the pod is up"), at most once per
+    ``TRAINER_BEAT_EVERY_S`` per executor, in a background task whose failure never reaches the request."""
+    import hashlib
+
+    if store is None:
+        from reliquary.infrastructure import corpus_executor_store as store
+    cache: dict[str, Any] = {"at": None, "tokens": {}}
+    lock = asyncio.Lock()
+    last_beat: dict[str, float] = {}
+    pending: set = set()
+
+    async def beat(executor_id: str, at: float) -> None:
+        try:
+            await store.record_heartbeat(executor_id, at=at, detail=detail() if detail is not None else None)
+        except Exception:
+            logger.exception("trainer executor heartbeat failed")
+
+    def maybe_beat(executor_id: str) -> None:
+        now = clock()
+        last = last_beat.get(executor_id)
+        if last is not None and now - last < TRAINER_BEAT_EVERY_S:
+            return
+        last_beat[executor_id] = now
+        task = asyncio.ensure_future(beat(executor_id, now))
+        pending.add(task)
+        task.add_done_callback(pending.discard)
+
+    async def fresh() -> dict[str, tuple[float, str]]:
+        async with lock:
+            now = clock()
+            if cache["at"] is None or now - cache["at"] >= TRAINER_AUTH_TTL_S:
+                documents = await store.list_executors()
+                cache["tokens"] = {d["token_sha256"]: (float(d["expires_at"]), d.get("executor_id", ""))
+                                   for d in documents
+                                   if store.scope_of(d) == "trainer" and d.get("task_id") == task_id
+                                   and d.get("status") == "active"}
+                cache["at"] = now
+            return cache["tokens"]
+
+    async def auth(token: str) -> bool:
+        try:
+            tokens = await fresh()
+        except Exception:
+            logger.exception("trainer executors unreadable")
+            return False
+        found = tokens.get(hashlib.sha256(token.encode()).hexdigest())
+        if found is None or clock() >= found[0]:
+            return False
+        if found[1]:
+            maybe_beat(found[1])
+        return True
+
+    return auth
+
+
+def build_rl_trainer_router(rl: RlAsync, *, token: str | None = None, auth: TrainerAuth | None = None,
+                            prefix: str = "/rl/trainer") -> APIRouter:
     """The detached async trainer's view of the buffer, the submissions' report, the lease book's checkpoints and
-    the prices (``trainer/rl_link.TrainerLink``). Every route needs ``Authorization: Bearer <token>``."""
-    if len(token) < 16:
+    the prices (``trainer/rl_link.TrainerLink``). Every route needs ``Authorization: Bearer <token>``: the static
+    ``token`` and/or a per-pod ``auth`` (one of the two is required)."""
+    if token is None and auth is None:
+        raise ValueError("the trainer link needs a token or an auth")
+    if token is not None and len(token) < 16:
         raise ValueError(f"{TRAINER_TOKEN_ENV} must be at least 16 characters")
-    expected = f"Bearer {token}".encode()
+    expected = None if token is None else f"Bearer {token}".encode()
     router = APIRouter()
 
     def refused(status: int, reason: str, detail: str = "") -> JSONResponse:
         return JSONResponse(status_code=status, content={"reason": reason, "detail": detail},
                             headers={"Cache-Control": "no-store"})
 
-    def authorized(request: Request) -> bool:
-        return hmac.compare_digest(request.headers.get("authorization", "").encode(), expected)
+    async def authorized(request: Request) -> bool:
+        header = request.headers.get("authorization", "")
+        if expected is not None and hmac.compare_digest(header.encode(), expected):
+            return True
+        return auth is not None and header.startswith("Bearer ") and await auth(header[7:])
 
     def beat_then(op: Callable[[dict], Any], body: dict) -> Any:
         """Any trainer call proves it alive (the outage pay); a failed beat never fails the call."""
@@ -437,7 +522,7 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
 
     def route(method: str, path: str, op: Callable[[dict], Any]) -> None:
         async def handler(request: Request) -> JSONResponse:
-            if not authorized(request):
+            if not await authorized(request):
                 return refused(401, "unauthorized")
             try:
                 body = await request.json() if method == "POST" else dict(request.query_params)
@@ -490,7 +575,11 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
                                       "targets": dict(rl.settings.targets), "latest": rl.book.latest_checkpoint})
     route("GET", "latest", lambda b: {"latest": rl.book.latest_checkpoint})
     route("POST", "adopt", adopt)
-    route("POST", "take", lambda b: {"groups": [_pack(g) for g in rl.buffer.take(int(b["limit"]))]})
+    def take(b: dict) -> dict:
+        rl.trainer_took_batch = True            # the heartbeat detail's phase: "training" from the first take
+        return {"groups": [_pack(g) for g in rl.buffer.take(int(b["limit"]))]}
+
+    route("POST", "take", take)
     route("POST", "take_older", lambda b: {"groups": [_pack(g) for g in rl.buffer.take_older(int(b["below_k"]),
                                                                                              int(b["limit"]))]})
     route("POST", "take_exhausted", lambda b: {"groups": [_pack(g) for g in rl.buffer.take_exhausted(
@@ -503,9 +592,46 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str, prefix: str = "/rl/train
     route("POST", "audit", report_audit)
     route("POST", "heartbeat", lambda b: {"ok": True})        # the beat is in every call
 
+    def run_keys(b: dict, what: Any, *, use: str) -> list[str]:
+        """The trainer writes only its checkpoints: anchor files and deltas of versions after the latest adopted,
+        and the index; it deletes only anchor files and deltas."""
+        if what is None:
+            raise LookupError("no checkpoint bucket on this controller")
+        keys = b["keys"]
+        if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
+            raise ValueError("keys is a list of strings")
+        if len(keys) > MAX_TRAINER_KEYS:
+            raise ValueError(f"at most {MAX_TRAINER_KEYS} keys per call")
+        run = rl.settings.run
+        prefix_ = run_prefix(run) + "/"
+        if any(len(k.encode()) > MAX_TRAINER_KEY_BYTES for k in keys):
+            raise ValueError(f"a key is over {MAX_TRAINER_KEY_BYTES} bytes")
+        if any(not k.startswith(prefix_) or ".." in k.split("/") for k in keys):
+            raise ValueError(f"keys must be under {prefix_}")
+        index = index_key(run)
+        latest = rl.book.latest_checkpoint if use == "upload" else None
+        for key in keys:
+            version = checkpoint_key_version(run, key)
+            if version is None and not (key == index and use != "delete"):
+                raise ValueError(f"{key} is not a checkpoint file")
+            if version is not None and latest is not None and version <= latest:
+                raise ValueError(f"{key}: checkpoint {version} is already adopted (latest {latest})")
+        return keys
+
+    route("POST", "uploads", lambda b: {"urls": {k: rl.presign_put(k)
+                                                 for k in run_keys(b, rl.presign_put, use="upload")}})
+    route("POST", "reads", lambda b: {"urls": {k: rl.presign_get(k) for k in run_keys(b, rl.presign_get, use="read")}})
+
+    def delete_keys(b: dict) -> dict:
+        for key in run_keys(b, rl.delete_object, use="delete"):
+            rl.delete_object(key)
+        return {"ok": True}
+
+    route("POST", "deletes", delete_keys)
+
     async def checkpoint(request: Request) -> JSONResponse:
         """``/rl/checkpoint``'s answer for the trainer's resume (it reaches this listener only)."""
-        if not authorized(request):
+        if not await authorized(request):
             return refused(401, "unauthorized")
         answer = None if rl.board is None else await rl.board.answer()
         if answer is None:
@@ -537,12 +663,12 @@ def trainer_bind(env: Mapping[str, str] = os.environ) -> tuple[str, int]:
     return host, int(port)
 
 
-def build_rl_trainer_app(rl: RlAsync, *, token: str):
+def build_rl_trainer_app(rl: RlAsync, *, token: str | None = None, auth: TrainerAuth | None = None):
     """The trainer link as its own app, served on ``trainer_bind()`` beside the public one."""
     from fastapi import FastAPI
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-    app.include_router(build_rl_trainer_router(rl, token=token))
+    app.include_router(build_rl_trainer_router(rl, token=token, auth=auth))
     return app
 
 
@@ -558,7 +684,8 @@ def mount_rl_async(server, rl: RlAsync, *, validator_hotkey: str, registration=N
     router = build_rl_lease_router(book=rl.book, collector=rl.collector, validator_hotkey=validator_hotkey,
                                    registration=registration, clock=clock, submissions=rl.submissions,
                                    pay=rl.ledger, max_episode_body_bytes=episode_body_cap(rl.settings),
-                                   admit=lambda env, idx: _lease_admission(rl, env, idx))
+                                   admit=lambda env, idx: _lease_admission(rl, env, idx),
+                                   task_id=rl.settings.task_id)
 
     @router.get("/rl/checkpoint")
     async def rl_checkpoint():
@@ -645,8 +772,10 @@ class AuditModel:
         state, version, _ = await asyncio.to_thread(self.sync.sync, answer, self._state, self.version)
 
         def load() -> None:
+            from reliquary.shared.modeling import load_checkpoint_state
+
             with self.lock:
-                self.model.load_state_dict(state)
+                load_checkpoint_state(self.model, state)
 
         await asyncio.to_thread(load)
         self._state, self.version = state, version
@@ -677,17 +806,21 @@ async def _every(step: Callable[[], Any], period: float, name: str) -> None:
 
 def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = None, audit_limit: int = AUDIT_LIMIT,
                    clock: Callable[[], float] = time.time, every: Mapping[str, float] | None = None,
-                   publisher=None, trainer_audits: bool = False, cards=None) -> list:
+                   publisher=None, trainer_audits: bool = False, cards=None, spend=None,
+                   registry_status=None) -> list:
     """The background coroutines of the service (run until cancelled). ``publisher``: the scan log's
     ``ObservationPublisher`` (``rl_observations.scan_publisher``). ``trainer_audits``: the trainer judges the audits
     (``RlSubmissions.take_audits``); the loop here only drops the stale ones. ``cards``: the declared hardware
-    broken down per card in the metrics row (``rl_metrics.CardFeed``)."""
+    broken down per card in the metrics row (``rl_metrics.CardFeed``). ``spend``: a training order's
+    ``rl_spend.SpendPublisher``, written after the ledger's settle. ``registry_status``: async, the task's registry
+    status; once ``retired`` the auction leases nothing (``RlAuctions.retire``)."""
     from reliquary.validator import telemetry
     from reliquary.validator.rl_metrics import METRICS_EVERY_S, controller_metrics
     from reliquary.validator.rl_observations import FLUSH_EVERY_S
 
     periods = {"expire": EXPIRE_EVERY_S, "audit": AUDIT_EVERY_S, "ledger": LEDGER_EVERY_S, "price": PRICE_EVERY_S,
                "checkpoint": CHECKPOINT_FOLLOW_EVERY_S, "observations": FLUSH_EVERY_S, "metrics": METRICS_EVERY_S,
+               "registry": REGISTRY_EVERY_S,
                **dict(every or {})}
 
     async def expire() -> None:
@@ -714,6 +847,11 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
         for doc in settled:
             logger.info("rl period %d settled: %d hotkeys, scale %.3f", doc["work_period"],
                         len(doc["rewards_by_hotkey"]), doc["scale"])
+        if spend is not None:              # first: a failing archive publish does not hold the bill back
+            try:
+                await spend.write(settled=bool(settled))
+            except Exception:
+                logger.exception("rl spend summary write failed")
         if archives is not None:
             await rl.ledger.publish(archives)
 
@@ -731,6 +869,11 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
         while not publisher.disabled and await publisher.flush() is not None:
             pass
 
+    async def follow_registry() -> None:
+        auctions = getattr(rl.book, "auctions", None)
+        if auctions is not None and await registry_status() == "retired":
+            auctions.retire()
+
     async def metrics() -> None:
         row = await asyncio.to_thread(controller_metrics, rl, float(clock()), periods["metrics"], cards)
         telemetry.log_training_step(row, step=None)
@@ -743,6 +886,8 @@ def rl_async_loops(rl: RlAsync, *, archives, audit_model: AuditModel | None = No
         loops.append(_every(follow, periods["checkpoint"], "audit checkpoint"))
     if publisher is not None:
         loops.append(_every(publish, periods["observations"], "scan log publication"))
+    if registry_status is not None:
+        loops.append(_every(follow_registry, periods["registry"], "registry status"))
     return loops
 
 
@@ -834,7 +979,8 @@ def wire_episode_sandbox(rl: RlAsync, config, *, validator_hotkey: str, environm
 
     sandbox = build_rl_lease_sandbox(config, validator_hotkey=validator_hotkey, lease_book=rl.book,
                                      environments=environments, policies=rl.settings.episode_policies(),
-                                     renderer_for=renderer_for, registration=registration, **kwargs)
+                                     renderer_for=renderer_for, registration=registration,
+                                     task_id=rl.settings.task_id, **kwargs)
     rl.submissions.grader.add_episodes(sandbox.checkers)
     rl.book.sandbox_failure = sandbox.lease_failure      # a lease our sandbox failed is released, not charged
     rl.sandbox = sandbox
@@ -855,17 +1001,20 @@ def _public_boards(rl: RlAsync, wallet, validator_hotkey: str, signer_client=Non
     from reliquary.infrastructure.storage import public_checkpoint_bucket, public_checkpoint_client
     from reliquary.shared.ckpt_index import index_key
     from reliquary.trainer.ckpt_publisher import R2ObjectStore
-    from reliquary.validator.rl_checkpoint import RlCheckpointBoard, presigner
+    from reliquary.validator.rl_checkpoint import UPLOAD_TTL_SECONDS, RlCheckpointBoard, presigner
     from reliquary.eval.run_feed import feed_key
     from reliquary.validator.rl_observations import ObservationBoard, bucket_io, scan_publisher
 
     run = rl.settings.run
     client, bucket = public_checkpoint_client(), public_checkpoint_bucket()
     store, presign = R2ObjectStore(client, bucket), presigner(client, bucket)
+    rl.presign_put = presigner(client, bucket, UPLOAD_TTL_SECONDS, "put_object")
+    rl.presign_get, rl.delete_object = presign, store.delete
     rl.board = RlCheckpointBoard(load_index=lambda: store.get_bytes(index_key(run)),
                                  index_signer=index_signer_for(wallet, signer_client),
                                  validator_hotkey=validator_hotkey, presign=presign)
     put, get = bucket_io(client, bucket)
+    rl.public_put = put
     publisher = scan_publisher(rl.book, run=run, task_id=rl.settings.task_id, wallet=wallet, put=put, get=get,
                                signer_client=signer_client)
     rl.observations = ObservationBoard(publisher, presign=presign)
@@ -985,6 +1134,14 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     server = ValidatorServer(http_host, http_port, emission_cap=cap)
     mount_rl_async(server, rl, validator_hotkey=validator_hotkey,
                    registration=None if registered is None else registered.reason)
+    training_order = "training_order" in (getattr(entry, "params", None) or {})
+    if training_order:
+        # A training order's pods hold per-pod executor tokens only (never the static one); the public front
+        # proxies the trainer link to this port.
+        server.app.include_router(build_rl_trainer_router(rl, auth=executor_trainer_auth(
+            settings.task_id, detail=lambda: {
+                "latest_checkpoint": rl.book.latest_checkpoint,
+                "phase": "training" if getattr(rl, "trainer_took_batch", False) else "loading"})))
     from reliquary.validator.miner_setup import DB_NAME as SETUP_DB, MinerSetupStore, build_miner_setup_router
     from reliquary.validator.rl_metrics import CardFeed
 
@@ -993,9 +1150,24 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
         setups, validator_hotkey=validator_hotkey,
         registration=None if registered is None else registered.reason))
     archives = R2PeriodArchives(guard=R2Archives(served=lambda: (settings.task_id,), served_only=True))
+    spend = registry_status = None
+    if training_order:
+        from reliquary.validator.rl_spend import SpendPublisher
+
+        spend = SpendPublisher(rl, rl.public_put)         # what the platform bills the order on
+        if entry.status == "retired" and rl.book.auctions is not None:
+            rl.book.auctions.retire()
+
+        async def registry_status() -> str | None:
+            from reliquary.infrastructure import task_registry_store
+
+            entries, _ = await task_registry_store.read_registry(strict=False)
+            found = entries.get(settings.task_id)
+            return None if found is None else found.status
     background = rl_async_loops(rl, archives=archives, audit_model=audit_model, publisher=publisher,
                                 trainer_audits=source == "trainer",
-                                cards=CardFeed(setups, state_dir / "rl-card-models.json"))
+                                cards=CardFeed(setups, state_dir / "rl-card-models.json"), spend=spend,
+                                registry_status=registry_status)
     if rl.sandbox is not None:
         background.extend(rl.sandbox.background())
     if registered is not None:
@@ -1040,7 +1212,7 @@ __all__ = [
     "ASYNC", "AUDIT_DEVICE_ENV", "AUDIT_SOURCE_ENV", "AuditModel", "MAX_TRAINER_AUDITS", "DB_NAME", "LEASE_MARGIN_PARAM", "LEASE_SPEED_PARAM", "PENDING_PARAM",
     "PLANNED_TOKENS_PARAM", "PRICE_TICK_PARAM", "RL_MODE_ENV", "RUN_ENV", "RlAsync", "RlAsyncSettings", "START_POOL_PARAM",
     "TRAINER_BIND_ENV", "TRAINER_INSECURE_BIND_ENV", "TRAINER_TOKEN_ENV", "WINDOW", "audit_source", "build_rl_async", "build_rl_trainer_app",
-    "build_rl_trainer_router", "index_signer_for", "mount_rl_async", "rl_async_loops", "rl_async_params",
+    "TrainerAuth", "build_rl_trainer_router", "executor_trainer_auth", "index_signer_for", "mount_rl_async", "rl_async_loops", "rl_async_params",
     "episode_body_cap", "load_episode_environments", "renderer_for_checkpoint", "rl_async_settings", "rl_mode",
     "run_rl_async_validator", "trainer_bind", "wire_episode_sandbox",
 ]
