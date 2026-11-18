@@ -208,6 +208,8 @@ class CorpusAuditor:
         # Fetch, in the background, every drand round the pending records need.
         self._prefetch = prefetch_rounds
         self._job_id = job_id
+        # Each hotkey's standing as its last pass read it (``_ahead_candidates``).
+        self._state_cache: dict[str, MinerState] = {}
         # A forced-draw job (``corpus.eval_draw``): its samples carry no proof; each is judged against its draw
         # alone, from the diagnostics whichever forward scores it computes (``corpus.draw_audit``).
         self._draw_job = draw_job
@@ -1334,18 +1336,33 @@ class CorpusAuditor:
 
     def _ahead_candidates(self, limit: int) -> list[str]:
         """Pending records sure to be audited whatever their pass decides, oldest first: on a sampled job those
-        whose draw round is out (its randomness cached) and drawn; at q = 1, every one."""
+        of a hotkey its last pass found in probation or suspect, or too slow to be sampled (fewer than 1/q
+        submissions in a hold), and those whose draw round is out (its randomness cached) and drawn; at q = 1,
+        every one.
+
+        2026-11-18: only drawn records were sent ahead, while most audits of a 27B order were new hotkeys in
+        probation: they waited for their pass, and the audit card idled between passes (50-70 % busy)."""
         q = self._params.q
+        now = self._clock()
         found: list[tuple[float, str]] = []
         for sids in self._unjudged.values():
             for submission_id in sids:
                 if (submission_id in self._judged or submission_id in self._ahead
                         or submission_id in self._ahead_flight or submission_id not in self._meta):
                     continue
-                received_at = self._meta[submission_id][1]
+                hotkey, received_at, _ = self._meta[submission_id]
                 if q < 1.0:
+                    state = self._state_cache.get(hotkey)
+                    if state is not None:
+                        standing = effective_state(state, now, self._params)
+                        if standing == "banned":
+                            continue
+                        if standing in ("probation", "suspect") or (
+                                not self.stake_at_receipt and self._recent(hotkey, now) < 1.0 / q):
+                            found.append((received_at, submission_id))
+                            continue
                     if self._round_at is None:
-                        return []
+                        continue
                     try:
                         randomness = self._randomness.get(int(self._round_at(received_at)) + 1)
                         if randomness is None or not drawn(randomness, submission_id, q):
@@ -1773,6 +1790,8 @@ class CorpusAuditor:
             # Oldest first: a record's stake counts the earlier ones this pass leaves unaudited.
             known.sort(key=lambda sid: self._meta[sid][1])
         states = await self._states({self._meta[sid][0] for sid in known}, now)
+        # What the audit ahead reads to send a probation hotkey's records before their pass.
+        self._state_cache.update(states)
         await self._learn_shortest(known, states, now)
 
         audit_ids, draws, unaudited, voided = [], {}, [], []
