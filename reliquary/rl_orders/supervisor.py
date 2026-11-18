@@ -472,7 +472,13 @@ def _checked_snapshot(snapshot, binding: dict, started_at: float, now: float) ->
         raise ReconciliationRequired("runtime checkpoint identity is invalid")
     fields = ("schema", *binding, "observed_at", "controller_ready", "trainer_ready", "admission_closed",
               "drained", "latest_checkpoint")
-    return {key: snapshot[key] for key in fields}
+    observed = {key: snapshot[key] for key in fields}
+    for field in ("drain_requested", "trainer_quiesced"):
+        if field in snapshot:
+            if type(snapshot[field]) is not bool:
+                raise ReconciliationRequired("runtime evidence has no strict stop state")
+            observed[field] = snapshot[field]
+    return observed
 
 
 def read_runtime_view(root: str | Path, task_id: str, *, now: float | None = None) -> dict:
@@ -523,8 +529,7 @@ def run_supervisor(config: SupervisorConfig, *, load_entry, finalize=None, backe
         journal_path = state / "journal.json"
         if journal_path.exists() or journal_path.is_symlink():
             raise ReconciliationRequired("a prior runtime journal exists; no processes adopted or signalled")
-        if any((state / folder).exists() or (state / folder).is_symlink()
-               for folder in ("controller", "trainer", "home", "hf-cache")):
+        if any(child.name != "supervisor.lock" for child in state.iterdir()):
             raise ReconciliationRequired("pre-existing runtime state has no safe new ownership epoch")
         if backend_factory is LocalBackend:
             LocalBackend.preflight(config)
@@ -596,7 +601,11 @@ def run_supervisor(config: SupervisorConfig, *, load_entry, finalize=None, backe
         spawn("controller")
         start_deadline = min(started + config.start_seconds, run_deadline)
         snapshot = wait_for(lambda s: s["controller_ready"], start_deadline)
-        if snapshot["admission_closed"] or float(order["deadline_at"]) <= wall():
+        # A new controller fences miner leases while it waits for trainer readiness.
+        awaiting_trainer = (not snapshot["trainer_ready"] and snapshot.get("drain_requested") is False
+                            and snapshot.get("trainer_quiesced") is False)
+        stopped = snapshot.get("drain_requested") is True or snapshot.get("trainer_quiesced") is True
+        if stopped or (snapshot["admission_closed"] and not awaiting_trainer) or float(order["deadline_at"]) <= wall():
             raise ReconciliationRequired("training admission closed before trainer launch")
         spawn("trainer")
         snapshot = wait_for(lambda s: s["controller_ready"] and s["trainer_ready"], start_deadline)

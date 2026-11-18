@@ -4,6 +4,34 @@
 supervises one operator-allocated local training task. It does not allocate GPUs, rent capacity, publish an axon,
 or submit weights. Paid admission remains false until the complete runtime and billing policy are qualified.
 
+## Read-only prerequisites
+
+Before an authorized execution, inspect private local inputs with:
+
+```bash
+python -B -m reliquary.rl_orders.preflight --config /srv/private/training-config.json --registry /srv/private/registry-export.json
+```
+
+This command reads a local registry export, config, credential material, model and installed package metadata.
+It does not fetch the registry, write a runtime journal, claim storage, bind ports, spawn children, import Torch,
+initialize CUDA or ask the signer to sign. CUDA-build detection reads literals in the installed `torch/version.py`;
+a CPU build is refused. A CUDA build does not establish a usable GPU, native kernel ABI or numerical correctness.
+The trainer interpreter in the Miles image is CPU-only and must not be selected for this `single` backend.
+
+The JSON report uses exit code 2 for blocked local prerequisites. Exit code 0 means only
+`local_prerequisites_checked`: `qualified`, `launch_authorized` and `paid_admission` remain false. Live registry
+authorization, exact-run signer permission, namespace arbitration, ingress, delegated cgroup behavior, GPU work,
+durable owner delivery and nonpaying isolation remain explicitly unverified. Keep this report private.
+
+The preflight requires a positive explicit token cap as well as steps, a future deadline and the actual async
+auction settings. Step and token caps close admission; they are not a hard cap on work already issued.
+Its nominal process budgets exclude synchronous HTTP deadline overruns and post-stop checkpoint finalization.
+Failed trainer exit can additionally consume one cleanup stop budget. The runtime state directory must be new or
+empty except for a private regular supervisor lock; retained logs, receipts and checkpoint files require reconciliation.
+`tests/unit/test_training_preflight.py` checks these boundaries using local synthetic files.
+
+## Runtime requirements
+
 The host must run Linux with the installed runtime package and a writable delegated cgroup v2 parent that supports
 `cgroup.kill` and `cgroup.events`. Each invocation creates a new cgroup and two new process groups. A fixed child
 bootstrap joins the cgroup before importing the controller or trainer. The managed backend is `single`; Miles,

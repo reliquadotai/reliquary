@@ -227,14 +227,18 @@ def test_restart_never_adopts_or_signals_a_recorded_pid(prepared):
     assert json.loads((config.runtime_dir / "journal.json").read_text()) == previous
 
 
-@pytest.mark.parametrize("folder", ["controller", "trainer"])
+@pytest.mark.parametrize("folder", ["controller", "trainer", "controller.log", "usage.json", "checkpoint", "completion.json"])
 def test_orphan_runtime_state_without_a_journal_cannot_be_rebound(prepared, folder):
     config, entry = prepared
     config.runtime_dir.mkdir(mode=0o700, parents=True)
     orphan = config.runtime_dir / folder
-    orphan.mkdir(mode=0o700)
-    (orphan / "rl-async.sqlite3").write_bytes(b"old ownership epoch")
+    if "." in folder:
+        orphan.write_bytes(b"old ownership epoch")
+    else:
+        orphan.mkdir(mode=0o700)
+        (orphan / "rl-async.sqlite3").write_bytes(b"old ownership epoch")
     _, backend, _, kwargs = harness(config, entry)
+    kwargs["load_entry"] = lambda task_id: pytest.fail("must refuse before any registry read")
     kwargs["namespace_check"] = lambda config: pytest.fail("must refuse before any remote preparation")
     kwargs["claim"] = lambda *a: pytest.fail("must not claim a new namespace")
     with pytest.raises(s.ReconciliationRequired, match="pre-existing runtime state"):
@@ -286,6 +290,71 @@ def test_controller_observing_closed_admission_does_not_launch_trainer(prepared)
     with pytest.raises(s.ReconciliationRequired, match="closed before trainer"):
         s.run_supervisor(config, **kwargs)
     assert [handle.role for handle in backend[0].handles] == ["controller"]
+
+
+@pytest.mark.parametrize("state", ["starting", "retired", "max_steps", "deadline"])
+def test_supervisor_distinguishes_real_runtime_startup_from_stopped_admission(prepared, tmp_path, state):
+    from reliquary.rl_orders.runtime import TrainerRuntime
+    from reliquary.validator.rl_ledger import LedgerConfig, RlPayLedger
+    from tests.unit.test_rl_auction import auctioned_book
+    from tests.unit.test_rl_submit import service
+
+    config, entry = prepared
+    clock, backends, _, kwargs = harness(config, entry)
+    entry.params["training_order"]["max_steps"] = 20
+    if state == "deadline":
+        entry.params["training_order"]["deadline_at"] = 100.5
+    book, auctions, _ = auctioned_book(tmp_path, clock=clock)
+    submissions = service(book, probation_groups=0, audit_rate=0)
+    ledger = RlPayLedger(book, submissions, None, LedgerConfig(task_id=config.task_id, cap=.5), clock=clock)
+    rl = SimpleNamespace(book=book, submissions=submissions, buffer=submissions.buffer, ledger=ledger,
+                         settings=SimpleNamespace(run=config.run_id))
+    initial = []
+
+    class ActualRuntimeClient(Client):
+        def __init__(self, actual_config, token):
+            super().__init__(actual_config, token, backend=backends[-1], clock=clock)
+            self.runtime = TrainerRuntime(entry, rl, runtime_id=self.backend.runtime_id, clock=clock, monotonic=clock)
+            auctions.admission = self.runtime.admission_reason
+            if state == "retired":
+                with book.transaction():
+                    book.db.execute("INSERT INTO rl_lease_meta VALUES('training_registry_stop','registry_retired')")
+            elif state == "max_steps":
+                book.adopt_checkpoint(20)
+
+        def read(self):
+            self.reads += 1
+            if self.reads == 1:
+                if state == "deadline":
+                    clock.t = 100.5
+                initial.append(self.runtime.snapshot())
+                return initial[-1]
+            if len(self.backend.handles) == 2 and self.reads == 2:
+                self.runtime.ready(self.runtime.identity)
+            if self.reads >= 4 and not self.runtime.drain_requested():
+                self.runtime.drain(self.runtime.identity)
+            if self.runtime.drain_requested() and not self.runtime.sealed():
+                self.runtime.quiesce({**self.runtime.identity, "latest_checkpoint": book.latest_checkpoint})
+                self.backend.handles[-1].process.returncode = 0
+            return self.runtime.snapshot()
+
+        def drain(self, binding):
+            self.runtime.drain(binding)
+
+    kwargs["client_factory"] = ActualRuntimeClient
+    try:
+        if state == "starting":
+            s.run_supervisor(config, **kwargs)
+            assert [handle.role for handle in backends[0].handles] == ["controller", "trainer"]
+            assert initial[0]["trainer_ready"] is False and initial[0]["admission_closed"] is True
+            assert initial[0]["drain_requested"] is False and initial[0]["trainer_quiesced"] is False
+        else:
+            with pytest.raises(s.ReconciliationRequired, match="closed before trainer"):
+                s.run_supervisor(config, **kwargs)
+            assert [handle.role for handle in backends[0].handles] == ["controller"]
+            assert initial[0]["drain_requested"] is True
+    finally:
+        book.close()
 
 
 def test_credentials_and_namespace_are_explicit_not_inherited(prepared, monkeypatch):
