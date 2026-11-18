@@ -288,3 +288,32 @@ def test_without_the_flag_nothing_changes(monkeypatch):
     auction.post_ask("a", 0.1, 4)
     assert isinstance(auction.admit("a"), Terms)
     assert "allocator" not in auction.view()
+
+
+def test_an_rl_env_fills_its_trainer_budget_cheapest_first(monkeypatch):
+    """RL: the budget is what the trainer's next steps take (in leases); once speeds are measured it goes to the
+    cheapest offers, not to whoever asks when a lease frees."""
+    monkeypatch.setenv(la.MERIT_ENV, "all")
+    monkeypatch.setattr(la, "_PACES", {})
+    clock = Clock()
+    params = AuctionParams(ceiling=0.706 / 1e6 / EMISSION, miner_alpha_per_period=EMISSION, initial_leases=4)
+    book = Book()
+    auction = TokenAuction(params, clock=clock, holdings=book, market_name="rl|task|math", job_id="rl-task-math",
+                           budget=lambda: 6)
+    auction.post_ask("cheap", 0.05, 6)
+    auction.post_ask("dear", 0.50, 6)
+    for hotkey in ("cheap", "dear"):
+        for _ in range(3):
+            terms = auction.admit(hotkey)
+            if isinstance(terms, Terms):
+                book.take(terms)
+                auction.unreserve(terms)
+    _warm(auction, book, clock, ["cheap", "dear"])
+    book.held = {}
+    granted = {}
+    for hotkey in ("dear", "cheap"):
+        while isinstance(terms := auction.admit(hotkey), Terms):
+            book.take(terms)
+            auction.unreserve(terms)
+            granted[hotkey] = granted.get(hotkey, 0) + 1
+    assert granted == {"cheap": 6}
