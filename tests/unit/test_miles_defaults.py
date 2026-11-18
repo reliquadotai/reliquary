@@ -69,13 +69,13 @@ def test_tensor_parallelism_fits_the_cards():
 @pytest.mark.parametrize("model,cards,tp", [("Qwen/Qwen3.5-4B", 2, 2), ("Qwen/Qwen3.5-4B", 8, 2),
                                             ("Qwen/Qwen3.5-0.8B", 2, 2), ("Qwen/Qwen3.5-9B", 4, 4),
                                             ("Qwen/Qwen3.5-9B", 8, 4), ("Qwen/Qwen3.5-27B", 8, 8),
-                                            ("Qwen/Qwen3.5-35B-A3B", 8, 8)])
+                                            ("Qwen/Qwen3.8-27B", 8, 8), ("Qwen/Qwen3.5-35B-A3B", 8, 8)])
 def test_the_default_tensor_parallelism_follows_the_model_size(model, cards, tp):
     assert miles_settings({**IMAGE, "RELIQUARY_RL_BASE_MODEL": model}, smi=smi(cards))["tp"] == tp
 
 
 @pytest.mark.parametrize("model,cards,minimum", [("Qwen/Qwen3.5-4B", 1, 2), ("Qwen/Qwen3.5-9B", 2, 4),
-                                                 ("Qwen/Qwen3.5-27B", 4, 8)])
+                                                 ("Qwen/Qwen3.5-27B", 4, 8), ("Qwen/Qwen3.8-27B", 4, 8)])
 def test_a_pod_smaller_than_the_models_layout_is_refused_with_the_minimum(model, cards, minimum):
     with pytest.raises(ValueError, match=f"at least {minimum} GPUs"):
         miles_settings({**IMAGE, "RELIQUARY_RL_BASE_MODEL": model}, smi=smi(cards))
@@ -90,7 +90,8 @@ def test_every_shipped_model_type_has_a_default_layout():
 @pytest.mark.parametrize("model,kind", [
     ("Qwen/Qwen3.5-4B", "qwen3.5-4B"), ("Qwen/Qwen3.5-9B", "qwen3.5-9B"), ("qwen/qwen3.5-0.8b", "qwen3.5-0.8B"),
     ("Qwen/Qwen3.5-27B@abc", "qwen3.5-27B"), ("Qwen/Qwen3.5-35B-A3B", "qwen3.5-35B-A3B"),
-    ("/data/models/Qwen3.5-4B", "qwen3.5-4B")])
+    ("/data/models/Qwen3.5-4B", "qwen3.5-4B"), ("Qwen/Qwen3.8-27B", "qwen3.8-27B"),
+    ("Qwen/Qwen3.8-27B@37561816e66b5b9153b1b64c10968c18c1e6f4a0", "qwen3.8-27B")])
 def test_the_megatron_model_type_comes_from_the_model_name(model, kind):
     assert miles_model_type(model) == kind
 
@@ -114,3 +115,13 @@ def test_explicit_extra_args_replace_the_defaults_entirely():
     assert settings["extra_args"] == "--max-tokens-per-gpu 32768"
     assert miles_settings({**POD, "RELIQUARY_MILES_EXTRA_ARGS": ""}, smi=smi(2))["extra_args"] == ""
     assert miles_settings({**POD, "RELIQUARY_MILES_CHUNK": "64"}, smi=smi(2))["chunk"] == 64
+
+
+def test_every_api_training_profile_has_a_miles_model_type():
+    """A training order's trainer derives its Megatron model type from the profile's base model."""
+    from reliquary.protocol.profiles import PROFILES
+
+    for profile_id, kind in [("qwen35-4b-reliquary-suite-v10-gumbel-dev1", "qwen3.5-4B"),
+                             ("qwen35-9b-reliquary-suite-v10-gumbel-dev1", "qwen3.5-9B"),
+                             ("qwen38-27b-reliquary-suite-v10-gumbel-dev1", "qwen3.8-27B")]:
+        assert miles_settings(IMAGE, smi=smi(8), base_model=PROFILES[profile_id].model_id)["model_type"] == kind

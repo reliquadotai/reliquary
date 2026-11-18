@@ -11,11 +11,12 @@ Settings work out of the box on an RL-orders pod, which gets no ``RELIQUARY_MILE
 * ``RELIQUARY_MILES_GPUS``: default every visible card (``CUDA_VISIBLE_DEVICES``, else ``nvidia-smi -L``, else the
   ``/dev/nvidia<N>`` device files); the trainer refuses to start when none of them answers, or none is visible.
 * ``RELIQUARY_MILES_TP``: default per model size (``DEFAULT_TP_BY_MODEL_TYPE``): 2 for Qwen3.5-0.8B/4B (4B
-  measured), 4 for 9B, 8 for 27B/35B-A3B (9B and up NOT measured: sized from the 4B result at 64k tokens per GPU).
+  measured), 4 for 9B, 8 for Qwen3.5/Qwen3.8-27B and 35B-A3B (9B and up NOT measured: sized from the 4B result at
+  64k tokens per GPU).
   A pod with fewer cards than that is refused (the layout would run out of memory at 64k), naming the minimum; the
   card count must be a multiple of the TP. An explicit value is the operator's.
 * ``RELIQUARY_MILES_MODEL_TYPE`` (Megatron model type): default from the model's name (``RELIQUARY_RL_BASE_MODEL``,
-  else ``RELIQUARY_MODEL``, else the profile's base model), for the Qwen3.5 sizes Miles ships (``MILES_MODEL_TYPES``).
+  else ``RELIQUARY_MODEL``, else the profile's base model), for the Qwen3.5/3.8 sizes Miles ships (``MILES_MODEL_TYPES``).
 * ``RELIQUARY_MILES_EXTRA_ARGS``: default ``DEFAULT_EXTRA_ARGS`` (64k tokens per GPU, full recompute); a value set,
   even empty, replaces it entirely.
 * ``RELIQUARY_MILES_CHUNK``: rollouts per ``forward_backward`` call, default 256.
@@ -51,11 +52,13 @@ DEFAULT_EXTRA_ARGS = ("--max-tokens-per-gpu 65536 --recompute-granularity full -
                       "--recompute-num-layers 1")
 # HF model name (basename, any case) -> the Megatron model type Miles ships (``scripts/models/<type>.py``)
 MILES_MODEL_TYPES = {"qwen3.5-0.8b": "qwen3.5-0.8B", "qwen3.5-4b": "qwen3.5-4B", "qwen3.5-9b": "qwen3.5-9B",
-                     "qwen3.5-27b": "qwen3.5-27B", "qwen3.5-35b-a3b": "qwen3.5-35B-A3B"}
+                     "qwen3.5-27b": "qwen3.5-27B", "qwen3.5-35b-a3b": "qwen3.5-35B-A3B",
+                     # the fork's recipe loads Qwen3.5-27B's shapes: the two ship the same config.json
+                     "qwen3.8-27b": "qwen3.8-27B"}
 # the default TP per model type at 64k tokens per GPU with full recompute: 4B measured (TP1 runs out of memory on a
 # 141 GB H200), the rest sized from it and NOT measured
 DEFAULT_TP_BY_MODEL_TYPE = {"qwen3.5-0.8B": 2, "qwen3.5-4B": 2, "qwen3.5-9B": 4, "qwen3.5-27B": 8,
-                            "qwen3.5-35B-A3B": 8}
+                            "qwen3.5-35B-A3B": 8, "qwen3.8-27B": 8}
 _HIDDEN = {"-1", "none", "nodevfiles"}   # CUDA_VISIBLE_DEVICES values that hide every card
 
 
