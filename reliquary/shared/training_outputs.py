@@ -22,6 +22,7 @@ _METRICS = frozenset(
     {
         "train/entropy",
         "train/kl",
+        "train/kl_term_computed_ratio",
         "train/ppo_loss",
         "train/loss",
         "train/grad_norm",

@@ -92,6 +92,21 @@ def test_metrics_are_finite_allowlisted_idempotent_and_bounded():
         append_metrics(history, "another-task", 1, 3, {})
 
 
+def test_kl_measurement_flag_preserves_uncomputed_zero_and_computed_values():
+    for computed in (0.0, 1.0):
+        history = append_metrics(None, RUN, 1, 100, {
+            "train/kl": 0.0,
+            "train/kl_term_computed_ratio": computed,
+            "private_note": "not exported",
+        })
+        assert history["metrics"][0]["values"] == {
+            "train/kl": 0.0,
+            "train/kl_term_computed_ratio": computed,
+        }
+    old = append_metrics(None, RUN, 1, 100, {"train/kl": 0.0})
+    assert "train/kl_term_computed_ratio" not in old["metrics"][0]["values"]
+
+
 def test_full_requires_weights_model_index_config_and_tokenizer():
     document = index()
     checkpoints, truncated = checkpoint_entries(document, RUN)
