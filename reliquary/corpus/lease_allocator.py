@@ -166,9 +166,14 @@ class SpeedBook:
         speeds = [v for v in (self.speed(h, now) for h in list(self._hotkeys)) if v is not None]
         return statistics.median(speeds) if speeds else None
 
-    def totals(self, hotkey: str) -> tuple[float, int]:
+    def totals(self, hotkey: str, now: float | None = None) -> tuple[float, int, float]:
+        """Its counters: output tokens, deliveries and lease-seconds held, cumulated (to ``now`` when given)."""
         c = self._hotkeys.get(hotkey)
-        return (0.0, 0) if c is None else (c.tokens, c.deliveries)
+        if c is None:
+            return 0.0, 0, 0.0
+        if now is not None:
+            self._integrate(c, now)
+        return c.tokens, c.deliveries, c.area
 
 
 # -- allowances ---------------------------------------------------------------------------------------------------
@@ -179,6 +184,7 @@ class _Trust:
     since: float                              # first needed
     tokens0: float                            # its counters then
     deliveries0: int
+    area0: float = 0.0
     allowance: int | None = None              # None: its declared capacity
     judged: bool = False
     stepped_at: float = 0.0
@@ -200,36 +206,47 @@ class Allowances:
     def needed(self, hotkey: str, now: float, speeds: SpeedBook) -> None:
         """``hotkey`` is among the needed now: its first verdict counts from the first time."""
         if hotkey not in self._trust:
-            tokens, deliveries = speeds.totals(hotkey)
-            self._trust[hotkey] = _Trust(since=now, tokens0=tokens, deliveries0=deliveries, stepped_at=now,
-                                         deliveries_at_step=deliveries)
+            tokens, deliveries, area = speeds.totals(hotkey, now)
+            self._trust[hotkey] = _Trust(since=now, tokens0=tokens, deliveries0=deliveries, area0=area,
+                                         stepped_at=now, deliveries_at_step=deliveries)
 
     def forget(self, hotkey: str) -> None:
         self._trust.pop(hotkey, None)
 
     def step(self, hotkey: str, now: float, *, declared: int, held: int, speeds: SpeedBook,
-             median: float | None, median_seconds: float | None, tail: bool) -> str | None:
+             median: float | None, median_seconds: float | None, tail: bool, trim_unused: bool = True) -> str | None:
         """Re-judge ``hotkey``; what changed (for the log), or None."""
         trust = self._trust.get(hotkey)
         if trust is None:
             return None
         current = self.of(hotkey, declared)
-        tokens, deliveries = speeds.totals(hotkey)
+        tokens, deliveries, area = speeds.totals(hotkey, now)
         if not trust.judged:
             wait = VERDICT_SAMPLE_TIMES * (median_seconds or VERDICT_MIN_SECONDS)
             wait = min(VERDICT_MAX_SECONDS, max(VERDICT_MIN_SECONDS, wait))
             elapsed = now - trust.since
             if elapsed < wait or (deliveries - trust.deliveries0 < MIN_DELIVERIES and elapsed < 2 * wait):
                 return None
-            trust.judged = True
-            trust.stepped_at, trust.deliveries_at_step = now, deliveries
             if median is None or median <= 0:
                 return None
+            mean_held = (area - trust.area0) / elapsed
+            if mean_held < VERDICT_SHORT * current:
+                # It did not take its slots: judged on what it holds, never on slots it was refused. In the shadow
+                # the thermostat refuses them (2026-11-18: eight hotkeys "verdict 6->1, rate 0" never held one).
+                if not trim_unused:
+                    return None
+                trust.judged = True
+                trust.stepped_at, trust.deliveries_at_step = now, deliveries
+                trust.allowance = max(1, math.ceil(1.25 * mean_held))
+                return f"verdict {current}->{trust.allowance} (holds {mean_held:.1f} of its slots)"
+            trust.judged = True
+            trust.stepped_at, trust.deliveries_at_step = now, deliveries
             rate = (tokens - trust.tokens0) / elapsed
-            expected = current * median
-            if rate < VERDICT_SHORT * expected:
+            speed = (tokens - trust.tokens0) / (area - trust.area0)
+            if speed < VERDICT_SHORT * median:
                 trust.allowance = max(1, math.ceil(rate / median))
-                return f"verdict {current}->{trust.allowance} (rate {rate:.0f} vs {expected:.0f} tok/s expected)"
+                return (f"verdict {current}->{trust.allowance} (v {speed:.1f} vs median {median:.1f}, "
+                        f"rate {rate:.0f} tok/s)")
             return None
         if now - trust.stepped_at < STEP_SECONDS:
             return None
@@ -455,15 +472,20 @@ def split(jobs: Mapping[str, _JobReport], audit_rate: float, now: float,
         if left <= 0:
             break
         r = jobs[job]
-        room = math.inf if r.supply is None else max(0.0, r.supply - rates[job])
+        # An order whose supply is not measured (draining, or no speeds yet) takes no surplus: unbounded, it took
+        # all of it (2026-11-18: two draining evals left the open 27B batch ~200 tok/s of a 3k tok/s card).
+        room = 0.0 if r.supply is None else max(0.0, r.supply - rates[job])
         extra = min(room, left / r.q)
         rates[job] += extra
         left -= extra * r.q
     if left > 0:
-        # Every order is supply-bound: the rest goes to all in proportion of their audit share, so a new offer
-        # anywhere finds room.
-        for job in jobs:
-            rates[job] += left / len(jobs) / jobs[job].q
+        # Every order is supply-bound: the rest goes to the measured ones in proportion of their supply (else to
+        # all alike), so a new offer anywhere finds room.
+        measured = {j: r.supply for j, r in jobs.items() if r.supply}
+        weights = measured or {j: 1.0 for j in jobs}
+        total = sum(weights.values())
+        for job, weight in weights.items():
+            rates[job] += left * weight / total / jobs[job].q
     return rates
 
 
