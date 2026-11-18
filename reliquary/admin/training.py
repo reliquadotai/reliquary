@@ -109,8 +109,8 @@ def training_task_id(body: CreateTraining, task_prefix: str) -> str:
 
 def training_entry(body: CreateTraining, *, task_prefix: str, price_params: Mapping[str, Any],
                    created_at: float):
-    """The registry entry of a training order (``price_params``: the ceiling in the task's alpha, as an order's).
-    ValueError on an order the registry would refuse."""
+    """The registry entry of a training order (``price_params``: the ceiling in the task's alpha, as an order's,
+    with the USD rate it was converted at). ValueError on an order the registry would refuse."""
     from dataclasses import replace
 
     from reliquary.cli.main import build_task_entry, with_rl_async_params
@@ -129,14 +129,43 @@ def training_entry(body: CreateTraining, *, task_prefix: str, price_params: Mapp
     entry = build_task_entry(task_id=training_task_id(body, task_prefix), profile_id=body.profile_id, cap=cap,
                              overrides={}, env_split=split)
     entry = with_rl_async_params(entry, planned_tokens_per_period=DEFAULT_PLANNED_TOKENS_PER_PERIOD)
+    from reliquary.validator.corpus_periods import MAX_PRICE_ALPHA_USD_PARAM
+
+    if price_params.get(MAX_PRICE_ALPHA_USD_PARAM) is None:
+        raise ValueError("the order's price was not converted from USD")
+    # The alpha/USD rate its ceiling was converted at: the bill converts the miners' alpha back at it.
     order = {"training_id": body.training_id, "order_sha256": order_digest(body), "max_steps": body.limits.max_steps,
              "deadline_at": float(created_at) + body.limits.deadline_seconds,
-             "max_price_usd_per_mtoken": float(body.max_price_usd_per_mtoken)}
+             "max_price_usd_per_mtoken": float(body.max_price_usd_per_mtoken),
+             "usd_per_alpha": float(price_params[MAX_PRICE_ALPHA_USD_PARAM])}
     if body.limits.max_tokens is not None:
         order["max_tokens"] = body.limits.max_tokens
     return replace(entry, params={**entry.params, **price_params, PRICING_PARAM: PRICING_AUCTION,
                                   LAG_TARGET_PARAM: body.lag_target, BATCH_GROUPS_PARAM: body.batch_groups,
                                   TRAINING_PARAM: order})
+
+
+def training_spend(entry, summary: Mapping[str, Any], *, retired_time: float | None) -> dict:
+    """The spend route's answer: the controller's summary, the order's frozen rate, and ``final``: the task is
+    retired and its controller has stopped the order, nothing pending can still pay, every period is settled, and
+    the summary was written after the period holding the later of the retire (``retired_time``) and the order's
+    stop had closed and settled (``settle_margin_s`` past its end, and the ledger's settle had closed it:
+    ``settled_through``), so no later accrual or fill can appear."""
+    from reliquary.validator import corpus_periods as cp
+
+    order = entry.params.get(TRAINING_PARAM) or {}
+    final = False
+    stopped_at, settled_through = summary.get("stopped_at"), summary.get("settled_through")
+    if (entry.status == "retired" and retired_time is not None and summary.get("stopped")
+            and stopped_at is not None and settled_through is not None):
+        ended = max(float(retired_time), float(stopped_at))
+        closed = cp.period_end(cp.period_of(ended)) + float(summary.get("settle_margin_s", 0.0))
+        pending = summary.get("pending")
+        final = (isinstance(pending, Mapping) and not any(int(v) for v in pending.values())
+                 and all(p.get("settled") is True for p in summary.get("periods", []))
+                 and int(settled_through) >= cp.period_of(ended)
+                 and float(summary.get("written_at", 0.0)) > closed)
+    return {**summary, "usd_per_alpha": order.get("usd_per_alpha"), "final": final}
 
 
 def training_view(entry) -> dict:
@@ -150,4 +179,4 @@ def training_view(entry) -> dict:
 
 
 __all__ = ["CreateTraining", "TRAINING_ORDERS_ENV", "order_digest", "training_enabled", "training_entry", "training_refusal",
-           "training_task_id", "training_view"]
+           "training_spend", "training_task_id", "training_view"]

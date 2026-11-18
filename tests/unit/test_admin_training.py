@@ -117,3 +117,119 @@ def test_status_and_retire(on):
     assert on("POST", "/admin/v1/training/order-train-t1/retire", {}).json()["status"] == "retired"
     assert on("GET", "/admin/v1/training/order-train-nope").status_code == 404
     assert on("GET", "/admin/v1/training/default").status_code == 409
+
+
+def test_the_order_freezes_its_alpha_rate(on):
+    assert on("POST", "/admin/v1/training", _order()).status_code == 201
+    order = on.registry["entries"]["order-train-t1"].params["training_order"]
+    assert order["usd_per_alpha"] == pytest.approx(4.0)                    # the rate the ceiling was converted at
+
+
+RETIRED_AT = cp.period_end(cp.period_of(1_800_000_000.0)) - 600.0        # the retire's time (round 1)
+SETTLED_AFTER = RETIRED_AT + 600.0 + 120.0                                # its period's end + the settle margin
+
+
+def _summary(*settled, open_leases=0, stopped_at=RETIRED_AT, written_at=SETTLED_AFTER + 1, stopped="retired",
+             settled_through=cp.period_of(RETIRED_AT)):
+    return {"task_id": "order-train-t1", "run": "order-train-t1", "starved": [], "dead": [[10.0, 20.0]], "stopped_at": stopped_at,
+            "pending": {"open_leases": open_leases, "buffered": 0, "audits": 0, "unledgered": 0},
+            "settle_margin_s": 120.0, "written_at": written_at, "settled_through": settled_through,
+            "periods": [{"period": i, "settled": s, "accrued_alpha": 1.0, "paid_alpha": 1.0 if s else None,
+                         "buckets": {}} for i, s in enumerate(settled)], "stopped": stopped,
+            "latest_checkpoint": 3}
+
+
+@pytest.fixture
+def spend(monkeypatch):
+    from reliquary.validator import rl_spend
+
+    from reliquary.admin import service
+
+    held = {}
+    monkeypatch.setattr(rl_spend, "read_spend", lambda run: held.get(run))
+    monkeypatch.setattr(service, "_round_time", lambda r: {1: RETIRED_AT}[r])
+    return held
+
+
+def test_the_spend_route_adds_the_frozen_rate(on, spend):
+    assert on("POST", "/admin/v1/training", _order()).status_code == 201
+    assert on("GET", "/admin/v1/training/order-train-t1/spend").status_code == 404     # not written yet
+    spend["order-train-t1"] = _summary(True, False)
+    answer = on("GET", "/admin/v1/training/order-train-t1/spend")
+    assert answer.status_code == 200, answer.text
+    body = answer.json()
+    assert body["usd_per_alpha"] == pytest.approx(4.0) and body["final"] is False
+    assert [p["settled"] for p in body["periods"]] == [True, False] and body["latest_checkpoint"] == 3
+    assert body["dead"] == [[10.0, 20.0]] and body["starved"] == []                # passed through unchanged
+    spend["order-train-t1"] = {**_summary(True), "task_id": "order-train-other"}
+    assert on("GET", "/admin/v1/training/order-train-t1/spend").status_code == 503
+    assert on("GET", "/admin/v1/training/order-train-nope/spend").status_code == 404
+
+
+def test_spend_is_final_only_when_retired_and_settled(on, spend):
+    assert on("POST", "/admin/v1/training", _order()).status_code == 201
+
+    def final(summary):
+        spend["order-train-t1"] = summary
+        return on("GET", "/admin/v1/training/order-train-t1/spend").json()["final"]
+
+    assert final(_summary(True, True)) is False                                     # still active
+    assert on("POST", "/admin/v1/training/order-train-t1/retire", {}).status_code == 200
+    assert final(_summary(True, False)) is False                                    # a period still open
+    assert final(_summary(True, True, open_leases=2)) is False                      # leases may still deliver
+    assert final(_summary(True, True, written_at=SETTLED_AFTER - 1)) is False       # before its period settled
+    assert final(_summary(True, True, stopped_at=RETIRED_AT + 3600)) is False       # stopped in a later period
+    assert final(_summary(True, True)) is True
+    assert final(_summary()) is True                                                # nothing was ever paid
+    assert final(_summary(True, True, stopped=None)) is False                       # the controller has not stopped
+    assert final(_summary(True, True, stopped_at=None)) is False
+    stop_period = cp.period_of(RETIRED_AT)
+    assert final(_summary(True, True, settled_through=stop_period - 1)) is False    # its settle had not closed it
+    assert final(_summary(True, True, settled_through=None)) is False
+    assert final(_summary(True, True, settled_through=stop_period + 1)) is True
+
+
+def test_retire_revokes_the_tasks_trainer_pods(on):
+    import hashlib
+
+    assert on("POST", "/admin/v1/training", _order()).status_code == 201
+    assert on("POST", "/admin/v1/training", _order(training_id="t2")).status_code == 201
+
+    def pod(executor_id, task_id):
+        body = {"executor_id": executor_id, "token_sha256": hashlib.sha256(executor_id.encode()).hexdigest(),
+                "model_id": "m", "model_revision": "r", "expires_at": 4e12, "scope": "trainer", "task_id": task_id}
+        assert on("POST", "/admin/v1/executors", body).status_code == 201
+
+    pod("pod-1", "order-train-t1")
+    pod("pod-2", "order-train-t2")
+    assert on("POST", "/admin/v1/training/order-train-t1/retire", {}).status_code == 200
+    assert on("GET", "/admin/v1/executors/pod-1").json()["status"] == "revoked"
+    assert on("GET", "/admin/v1/executors/pod-2").json()["status"] == "active"
+
+
+def _order_entry(on, **params):
+    from dataclasses import replace
+
+    assert on("POST", "/admin/v1/training", _order()).status_code == 201
+    entry = on.registry["entries"]["order-train-t1"]
+    return replace(entry, params={**entry.params, **params})
+
+
+def test_a_training_order_never_carries_the_per_env_pay_guard(on):
+    from reliquary.validator.rl_async_service import ENV_PAY_K_PARAM, rl_async_settings
+
+    entry = _order_entry(on, **{ENV_PAY_K_PARAM: 2.0})
+    with pytest.raises(ValueError, match="auction"):
+        rl_async_settings(entry, entry.params["cap"], environ={})
+
+
+@pytest.mark.parametrize("where", ["param", "env"])
+def test_a_training_order_refuses_a_pay_carry(on, where):
+    from reliquary.validator.rl_async_service import CARRY_ENV, CARRY_PARAM, rl_async_settings
+
+    entry = _order_entry(on, **({CARRY_PARAM: 2} if where == "param" else {}))
+    environ = {CARRY_ENV: "2"} if where == "env" else {}
+    with pytest.raises(ValueError, match="carry"):
+        rl_async_settings(entry, entry.params["cap"], environ=environ)
+    plain = on.registry["entries"]["order-train-t1"]
+    assert rl_async_settings(plain, plain.params["cap"], environ={}).pay_carry_periods == 0

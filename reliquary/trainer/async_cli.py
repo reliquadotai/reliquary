@@ -7,7 +7,7 @@ buffer, the submissions, the lease book and the prices are the validator's, reac
 run come from the validator's task (``/rl/trainer/config``).
 
 Start: a fresh lease book (no checkpoint adopted) starts from the base model (``DEFAULT_BASE_MODEL``, or
-``RELIQUARY_RL_BASE_MODEL``), published and adopted as checkpoint 0. Otherwise the trainer resumes from the weights
+``RELIQUARY_RL_BASE_MODEL``, at ``RELIQUARY_RL_BASE_MODEL_REVISION`` when set), published and adopted as checkpoint 0. Otherwise the trainer resumes from the weights
 of the latest published checkpoint, rebuilt from the bucket through the validator's signed index (``GET
 /rl/trainer/checkpoint``, ``CheckpointSync``); a version published but never adopted (a crash between the two) is adopted
 first. The optimizer starts fresh (the bf16 checkpoint is all the bucket holds).
@@ -45,6 +45,21 @@ def _eos_ids(model_path, load_kwargs) -> tuple[int, ...]:
     return tuple(sorted(resolve_eos_token_ids(model, load_tokenizer(model_path, **load_kwargs))))
 
 
+def _download_base_model(settings: Mapping[str, Any]) -> str:
+    """The base model's local path; a pinned ``base_model_revision`` wins over the default model's revision.
+
+    Everything after the download (EOS ids, FSDP2 load, Miles conversion) reads this local snapshot."""
+    from huggingface_hub import snapshot_download
+
+    from reliquary.constants import DEFAULT_BASE_MODEL, DEFAULT_BASE_MODEL_REVISION
+
+    base = settings["base_model"] or DEFAULT_BASE_MODEL
+    revision = settings.get("base_model_revision") or (None if settings["base_model"] else DEFAULT_BASE_MODEL_REVISION)
+    if Path(base).is_dir():
+        return base
+    return snapshot_download(base, **({"revision": revision} if revision else {}))
+
+
 def _heartbeat_s(env: Mapping[str, str]) -> float:
     value = float(env.get("RELIQUARY_RL_TRAINER_HEARTBEAT_S", "60"))
     if not 5 <= value <= 300:                   # well under the validator's outage grace (600 s)
@@ -75,9 +90,10 @@ def async_trainer_settings(env: Mapping[str, str] = os.environ) -> dict[str, Any
     if bool(prefix) != bool(every):
         raise ValueError("RELIQUARY_RL_HF_BACKUP_PREFIX and RELIQUARY_RL_HF_BACKUP_EVERY go together")
     return {
-        "url": url, "token": token, "validator_hotkey": hotkey,
+        "url": url, "token": token, "validator_hotkey": hotkey, "link_prefix": _link_prefix(env),
         "state_dir": Path(env.get("RELIQUARY_TRAINER_STATE_DIR", "/root/reliquary/trainer")) / "async",
         "base_model": str(env.get("RELIQUARY_RL_BASE_MODEL", "")).strip() or None,
+        "base_model_revision": str(env.get("RELIQUARY_RL_BASE_MODEL_REVISION", "")).strip() or None,
         "batch_groups": _int(env, "RELIQUARY_RL_BATCH_GROUPS", 512),
         "steps_per_checkpoint": _int(env, "RELIQUARY_RL_STEPS_PER_CHECKPOINT", 1),
         "anchor_interval": _int(env, "RELIQUARY_RL_ANCHOR_INTERVAL", 50),
@@ -94,6 +110,54 @@ def async_trainer_settings(env: Mapping[str, str] = os.environ) -> dict[str, Any
         # liveness for the validator's outage pay: always on (a silent trainer reads as down)
         "heartbeat_s": _heartbeat_s(env),
     }
+
+
+EXECUTOR_ID_ENV = "RELIQUARY_RL_TRAINER_EXECUTOR_ID"
+
+
+def _link_prefix(env: Mapping[str, str]) -> str:
+    """A rented pod (an executor id) reaches its task's trainer routes through the front (``/rl/<task>/trainer``,
+    ``RELIQUARY_TASK_ID``); an operator's trainer, the controller's own listener (``/rl/trainer``)."""
+    task = str(env.get("RELIQUARY_TASK_ID", "")).strip()
+    if not (str(env.get(EXECUTOR_ID_ENV, "")).strip() and task):
+        return "/rl/trainer"
+    from reliquary.miner.rl_task_choice import task_prefix
+
+    return f"{task_prefix(task)}/trainer"
+
+
+def trainer_link(settings: Mapping[str, Any], *, client=None):
+    from reliquary.trainer.rl_link import TrainerLink
+
+    return TrainerLink(settings["url"], settings["token"], client=client, prefix=settings["link_prefix"])
+
+
+def checkpoint_store(link, env: Mapping[str, str] = os.environ):
+    """The publisher's store: presigned uploads through the link on a rented pod (an executor id and no
+    ``R2_PUBLIC_*`` key), else the bucket directly with the operator's keys."""
+    from reliquary.trainer.ckpt_publisher import R2ObjectStore
+
+    keyed = any(str(env.get(f"R2_PUBLIC_{n}", "")).strip() for n in ("ACCESS_KEY_ID", "SECRET_ACCESS_KEY"))
+    if str(env.get(EXECUTOR_ID_ENV, "")).strip() and not keyed:
+        from reliquary.trainer.presigned_store import PresignedObjectStore
+
+        return PresignedObjectStore(link)
+    from reliquary.infrastructure.storage import public_checkpoint_bucket, public_checkpoint_client
+
+    return R2ObjectStore(public_checkpoint_client(), public_checkpoint_bucket())
+
+
+def publisher_options(store) -> dict[str, int]:
+    """Extra ``DeltaPublisher`` arguments a store asks for (the presigned one: smaller anchor shards)."""
+    size = getattr(store, "anchor_shard_bytes", None)
+    return {} if size is None else {"anchor_shard_bytes": int(size)}
+
+
+def drop_hf_backup_on_pod(store, settings: dict) -> None:
+    """A pod on presigned uploads holds no bucket or hub credential: the HF backup is off there."""
+    if getattr(store, "anchor_shard_bytes", None) is not None and settings["hf_prefix"]:
+        logger.warning("presigned checkpoint store: the Hugging Face backup is off on this pod")
+        settings["hf_prefix"] = settings["hf_every"] = None
 
 
 def resume_weights(link, *, validator_hotkey: str, work_dir: Path, sync=None, fetch=None):
@@ -129,18 +193,16 @@ def run_async_train_worker() -> None:
 
     disable_cudnn_attention(torch)              # every rank, before any model is built
 
-    from reliquary.constants import ATTN_IMPLEMENTATION, DEFAULT_BASE_MODEL, DEFAULT_BASE_MODEL_REVISION
-    from reliquary.infrastructure.storage import public_checkpoint_bucket, public_checkpoint_client
+    from reliquary.constants import ATTN_IMPLEMENTATION, DEFAULT_BASE_MODEL
     from reliquary.miner.rl_async import write_hf_dir
     from reliquary.shared.modeling import load_text_generation_model
     from reliquary.trainer.async_trainer import AsyncTrainer, AsyncTrainerConfig
-    from reliquary.trainer.ckpt_publisher import DeltaPublisher, R2ObjectStore
+    from reliquary.trainer.ckpt_publisher import DeltaPublisher
     from reliquary.trainer.cli import _check_trainer_launch, _run_train_follower
     from reliquary.trainer.distributed import (
         CommandChannel, broadcasting_train_step, gather_full_state_dict, init_distributed, load_sharded_model,
         trainer_backend,
     )
-    from reliquary.trainer.rl_link import TrainerLink
     from reliquary.validator import telemetry
     from reliquary.validator.training import configure_distributed, reset_training_state, train_step
 
@@ -159,9 +221,15 @@ def run_async_train_worker() -> None:
             _run_train_follower(dist_ctx, channel)
             return
 
+    heartbeat = None
     try:
+        from reliquary.trainer.rl_link import TrainerHeartbeat
+
         settings = async_trainer_settings()
-        link = TrainerLink(settings["url"], settings["token"])
+        link = trainer_link(settings)
+        # Beat from here on, not once the model is loaded: resuming, downloading and starting the engine can take
+        # longer than the platform's staleness window, and it replaces a pod it sees silent.
+        heartbeat = TrainerHeartbeat(link, settings["heartbeat_s"]).start()
         task = link.config()
         telemetry.init(settings["validator_hotkey"], {
             "task_id": task["task_id"], "run": task["run"], "targets": task["targets"], "backend": backend,
@@ -171,11 +239,8 @@ def run_async_train_worker() -> None:
         state_dir.mkdir(parents=True, exist_ok=True)
         resumed = resume_weights(link, validator_hotkey=settings["validator_hotkey"], work_dir=state_dir / "resume")
         if resumed is None:
-            from huggingface_hub import snapshot_download
-
             base = settings["base_model"] or DEFAULT_BASE_MODEL
-            load_kwargs = {} if settings["base_model"] else {"revision": DEFAULT_BASE_MODEL_REVISION}
-            model_path = base if Path(base).is_dir() else snapshot_download(base, **load_kwargs)
+            model_path = _download_base_model(settings)
             model_dir, version = Path(model_path), None
             logger.info("fresh lease book: starting from %s", base)
         else:
@@ -224,8 +289,10 @@ def run_async_train_worker() -> None:
         logger.info("startup_stage=trainer_model_load elapsed_seconds=%.3f", time.monotonic() - started)
         reset_training_state()
 
-        publisher = DeltaPublisher(run=str(task["run"]),
-                                   store=R2ObjectStore(public_checkpoint_client(), public_checkpoint_bucket()),
+        store = checkpoint_store(link)
+        drop_hf_backup_on_pod(store, settings)
+        publisher = DeltaPublisher(run=str(task["run"]), **publisher_options(store),
+                                   store=store,
                                    staging_dir=state_dir / "staging", anchor_interval=settings["anchor_interval"],
                                    model_dir=model_dir)
         backup = None
@@ -260,20 +327,18 @@ def run_async_train_worker() -> None:
             train_step_fn=step_fn, audits=audits,
             global_step_hint=None if version is None else version * settings["steps_per_checkpoint"])
         live["trainer"] = trainer
-        from reliquary.trainer.rl_link import TrainerHeartbeat
-
-        heartbeat = TrainerHeartbeat(link, settings["heartbeat_s"]).start()
         logger.info("train-async starting: task %s, run %s, target mix %s (priced, not enforced), checkpoint %d",
                     task["task_id"], task["run"], task["targets"], trainer.version)
         try:
             run_forever(trainer)
         finally:
-            heartbeat.stop()
             trainer.close()
             if backup is not None:
                 backup.close(timeout=60)
             telemetry.finish()
     finally:
+        if heartbeat is not None:
+            heartbeat.stop()
         # Followers block on the next command; release them on any exit.
         if channel is not None:
             channel.send("STOP")

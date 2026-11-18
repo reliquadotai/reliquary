@@ -15,7 +15,7 @@ price multiplier (``rl_price``) and the per-hotkey quota (``rl_lease_quota``):
 * **A training order's limits** (``training_order``: ``deadline_at``, ``max_steps``, ``max_tokens``): once the
   deadline passes, the latest checkpoint reaches ``max_steps`` or the accrued pay covers ``max_tokens`` matched
   tokens, every env's budget is 0 and no lease goes out. The leases already out may still deliver: the overrun is
-  at most the budget at the stop (the trainer's next ``lag_target`` steps).
+  at most the budget at the stop (the trainer's next ``lag_target`` steps). A retired task stops the same way.
 * **A lease not delivered** (expired, forfeited, refused for integrity) charges its price times the env's mean
   matched tokens per trained group, taken from the holder's next accruals on the env. Our failures charge nothing.
 """
@@ -99,6 +99,7 @@ class RlAuctions:
         self._book = None
         self.clock = clock
         self.limits: dict[str, float] = {}       # a training order's (``from_params``); none: never stops
+        self.retired = False                     # the task's registry entry is retired (``retire``)
         self.auctions: dict[str, TokenAuction] = {
             env: TokenAuction(params, clock=clock, mean_tokens=mean_tokens,
                               holdings=lambda env=env: self._holdings(env),
@@ -165,8 +166,14 @@ class RlAuctions:
                              " FROM rl_accruals WHERE status != 'forfeited'").fetchone()
         return float(row[0] or 0.0)
 
+    def retire(self) -> None:
+        """The task is retired (e.g. its order cancelled): no lease goes out any more."""
+        self.retired = True
+
     def stopped(self) -> str | None:
-        """Which of the training order's limits is reached (None: none, or no order)."""
+        """Which of the training order's limits is reached, or ``retired`` (None: none, or no order)."""
+        if self.retired:
+            return "retired"
         limits = self.limits
         if not limits:
             return None

@@ -739,3 +739,25 @@ def test_a_job_scoped_router_binds_each_request_to_its_job_path():
     issuer.outcome = {"session_id": "s-1", "state": "closed", "status": "expired"}
     assert http.post(scoped_close, json=close).status_code == 200
     assert issuer.calls[-1][0] == "close"
+
+
+def test_an_rl_session_through_a_task_path_is_signed_for_that_task():
+    paths = []
+
+    def verify(request, *, validator_hotkey, path):
+        paths.append(path)
+        return path.startswith("/rl/t/")
+
+    app = FastAPI()
+    app.include_router(build_sandbox_sessions_router(
+        FakeIssuer(Grant("s-1", TOKEN, "http://10.0.0.5:8080", NOW + 4500)), policy=SandboxPolicy(),
+        validator_hotkey=VALIDATOR, verify_open=verify, verify_close=verify, clock=lambda: NOW, prefix="/rl",
+        task_id="t"))
+    http = TestClient(app, raise_server_exceptions=False)
+    through_t = {"X-Forwarded-Prefix": "/rl/t"}
+    assert http.post("/rl/sandbox/sessions", json=open_body(), headers=through_t).status_code == 200
+    other = http.post("/rl/sandbox/sessions", json=open_body(), headers={"X-Forwarded-Prefix": "/rl/u"})
+    assert other.status_code == 403 and other.json()["reason"] == "wrong_task"
+    assert http.post("/rl/sandbox/sessions", json=open_body()).json()["reason"] == "bad_signature"   # bare
+    http.post("/rl/sandbox/sessions/s-1/close", json=close_body(), headers=through_t)
+    assert paths == ["/rl/t/sandbox/sessions", "/rl/sandbox/sessions", "/rl/t/sandbox/sessions/s-1/close"]
