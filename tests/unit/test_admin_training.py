@@ -64,6 +64,47 @@ def test_a_replay_answers_the_task_and_another_order_under_its_id_is_refused(on)
     assert replay.status_code == 200 and replay.json()["created"] is False
 
 
+def test_private_training_identity_is_frozen_and_available_to_the_authenticated_trainer(on):
+    from reliquary.shared.private_training_wandb import private_wandb_run_id
+    from reliquary.validator.rl_async_service import rl_async_settings
+
+    binding = {"entity": "test-team", "project": "private-training",
+               "run_id": private_wandb_run_id("owned-order", "order-train-t1")}
+    request = _order(order_id="owned-order", wandb=binding)
+    created = on("POST", "/admin/v1/training", request)
+    assert created.status_code == 201, created.text
+    assert created.json()["order"]["order_id"] == "owned-order"
+    assert created.json()["order"]["wandb"] == binding
+    entry = on.registry["entries"]["order-train-t1"]
+    settings = rl_async_settings(entry, entry.params["cap"], environ={})
+    assert settings.order_id == "owned-order" and settings.wandb == binding
+    assert on("POST", "/admin/v1/training", request).status_code == 200
+    changed = {**binding, "project": "different-private-project"}
+    assert on("POST", "/admin/v1/training", {**request, "wandb": changed}).status_code == 409
+    assert entry.params["training_order"]["wandb"] == binding
+
+
+@pytest.mark.parametrize("extra", [
+    {"order_id": "owned-order"},
+    {"wandb": {"entity": "test-team", "project": "private-training", "run_id": "wrong"}},
+    {"order_id": "owned-order", "wandb": {"entity": "test-team", "project": "private-training", "run_id": "wrong"}},
+    {"order_id": "owned-order", "wandb": {"entity": "test-team", "project": "private-training",
+                                         "run_id": "wrong", "api_key": "not-a-real-key"}},
+])
+def test_private_telemetry_must_name_one_exact_order_and_task_before_creation(on, extra):
+    answer = on("POST", "/admin/v1/training", _order(**extra))
+    assert answer.status_code == 422, answer.text
+    assert "order-train-t1" not in on.registry["entries"]
+
+
+def test_legacy_order_digest_does_not_change_when_optional_telemetry_fields_are_absent():
+    from reliquary.protocol.release_contract import canonical_sha256
+
+    request = training.CreateTraining(**_order())
+    legacy = request.model_dump(mode="json", exclude={"order_id", "wandb"})
+    assert training.order_digest(request) == canonical_sha256(legacy)
+
+
 @pytest.mark.parametrize("over", [
     {"max_price_usd_per_mtoken": 3.0},
     {"environments": [{"name": "reliquary_dapo_math_v1", "share_bps": 10000}]},
@@ -238,6 +279,8 @@ def test_a_training_order_refuses_a_pay_carry(on, where):
 def test_training_profiles_and_outputs_share_hmac_and_registry_scope(on, monkeypatch):
     profiles = on("GET", "/admin/v1/training/profiles")
     assert profiles.status_code == 200
+    assert profiles.json()["capabilities"]["private_training_wandb"] == "reliquary/private-training-wandb/v1"
+    assert profiles.json()["training_task_prefix"] == "order-train-"
     profile = next(p for p in profiles.json()["profiles"] if p["id"] == PROFILE)
     assert profile["model"] and len(profile["revision"]) == 40
     assert "reliquary_dapo_math_v1" in profile["environments"]

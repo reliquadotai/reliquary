@@ -677,18 +677,31 @@ class AsyncTrainer:
                          "async/steps_skipped_total": self.skipped, **_peak_memory()},
                         self.steps)
         publish_metrics = getattr(self.publisher, "publish_metrics", None)
-        if publish_metrics is not None:
-            publication = self._pending
-            version = self.version
-            observed_at = time.time()
+        publication = self._pending
+        version = self.version
+        observed_at = time.time()
+        private_sink = telemetry.prepare_published_checkpoint(metrics, version, observed_at)
+        if publish_metrics is not None or private_sink is not None:
 
             def save_metrics():
                 try:
                     if publication is not None:
                         publication.result()
-                    publish_metrics(version, metrics, observed_at=observed_at)
                 except Exception:
-                    logger.exception("checkpoint metrics publication failed")
+                    logger.exception("checkpoint publication failed; no qualified metrics emitted")
+                    return
+                # This only enqueues an immutable row on a separate bounded daemon writer.
+                # W&B network activity must never delay this checkpoint publisher executor.
+                if private_sink is not None and publication is not None and self.publisher is not None:
+                    try:
+                        private_sink()
+                    except Exception:
+                        logger.warning("private training telemetry enqueue failed; training continues")
+                if publish_metrics is not None:
+                    try:
+                        publish_metrics(version, metrics, observed_at=observed_at)
+                    except Exception:
+                        logger.exception("checkpoint metrics publication failed")
 
             self._executor.submit(save_metrics)
         return "trained"

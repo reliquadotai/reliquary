@@ -192,6 +192,27 @@ def test_the_trainer_link_needs_its_token_and_round_trips(tmp_path):
     rl.close()
 
 
+def test_private_training_binding_is_served_only_on_the_authenticated_trainer_link(tmp_path):
+    from reliquary.shared.private_training_wandb import private_wandb_run_id
+    from reliquary.validator.server import ValidatorServer
+
+    rl = components(tmp_path)
+    binding = {"entity": "test-team", "project": "private-training",
+               "run_id": private_wandb_run_id("owned-order", rl.settings.task_id)}
+    rl.settings = dataclasses.replace(rl.settings, order_id="owned-order", wandb=binding)
+    trainer = TestClient(build_rl_trainer_app(rl, token=TOKEN))
+    assert trainer.get("/rl/trainer/config").status_code == 401
+    config = trainer.get("/rl/trainer/config", headers={"Authorization": f"Bearer {TOKEN}"}).json()
+    assert config["order_id"] == "owned-order" and config["wandb"] == binding
+    assert "api_key" not in str(config)
+    server = ValidatorServer()
+    mount_rl_async(server, rl, validator_hotkey=VALIDATOR.ss58_address)
+    public = TestClient(server.app)
+    assert public.get("/rl/trainer/config", headers={"Authorization": f"Bearer {TOKEN}"}).status_code == 404
+    assert "owned-order" not in public.get("/tasks").text
+    rl.close()
+
+
 def test_the_trainer_takes_the_audits_and_reports_their_verdicts_through_its_link(tmp_path):
     from reliquary.trainer.rl_link import TrainerLink, TrainerLinkError
     from reliquary.validator.rl_leases import LeaseRequest

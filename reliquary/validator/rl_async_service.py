@@ -196,6 +196,8 @@ class RlAsyncSettings:
     # The registry's auction params (``rl_auction``: pricing, the ceiling, the lag target), None: the per-env price
     # multiplier and the per-hotkey quota.
     auction: Mapping[str, Any] | None = None
+    order_id: str | None = None                 # private platform identity, trainer-authenticated config only
+    wandb: Mapping[str, str] | None = None       # fixed private telemetry target, never credentials
 
     def lane_reserves(self) -> dict[str, int]:
         """env -> buffered groups kept for it: ``lane_reserve`` x the cap, split by the target shares."""
@@ -320,7 +322,14 @@ def rl_async_settings(entry, cap: float, *, run: str | None = None,
     if auction is not None and params.get(ENV_PAY_K_PARAM) is not None:
         raise ValueError(f"{ENV_PAY_K_PARAM} has no use on a task priced by auction: each env's offers are capped "
                          "by the ceiling")
-    return RlAsyncSettings(auction=auction, task_id=str(entry.task_id), cap=float(cap),
+    private_order = params.get("training_order") or {}
+    order_id, wandb = private_order.get("order_id"), private_order.get("wandb")
+    if order_id is not None or wandb is not None:
+        from reliquary.shared.private_training_wandb import validate_private_wandb_binding
+
+        wandb = validate_private_wandb_binding(order_id, str(entry.task_id), wandb)
+    return RlAsyncSettings(auction=auction, order_id=order_id, wandb=wandb,
+                           task_id=str(entry.task_id), cap=float(cap),
                            run=run or os.environ.get(RUN_ENV) or str(entry.task_id), targets=targets,
                            planned_tokens_per_period=float(params[PLANNED_TOKENS_PARAM]), lease_expiry_s=expiry,
                            start_pool=(min(float(params[START_POOL_PARAM]), float(cap))
@@ -577,6 +586,8 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str | None = None, auth: Trai
         maximum = getattr(getattr(rl.book, "auctions", None), "limits", {}).get("max_steps")
         if isinstance(maximum, int) and not isinstance(maximum, bool) and maximum > 0:
             config["max_steps"] = maximum
+        if rl.settings.order_id is not None:
+            config.update(order_id=rl.settings.order_id, wandb=dict(rl.settings.wandb))
         return config
 
     route("GET", "config", trainer_config)

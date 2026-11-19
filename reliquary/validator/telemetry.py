@@ -21,10 +21,12 @@ _run: Any = None
 _enabled: bool = False
 _log_warned: bool = False  # suppress repeated log-path warnings
 _held: dict | None = None  # rows collected between hold() and flush() (one row per async trainer step)
+_private_mode = False
+_private_writer: Any = None
 
 
 def is_active() -> bool:
-    return _enabled
+    return bool(_private_writer and _private_writer.active) if _private_mode else _enabled
 
 
 def init(hotkey_ss58: str, config: dict, *, role: str | None = None, version: str | None = None) -> None:
@@ -35,7 +37,30 @@ def init(hotkey_ss58: str, config: dict, *, role: str | None = None, version: st
     Fail-soft: any exception (ImportError, network, auth) disables
     telemetry for the rest of the session and logs a warning.
     """
-    global _run, _enabled
+    global _run, _enabled, _private_mode, _private_writer, _held
+    was_private = _private_mode
+    if _private_writer is not None:
+        _private_writer.close(timeout=0)
+    _private_writer = None
+    _private_mode = False
+    mode = os.getenv("RELIQUARY_TRAINING_WANDB", "off")
+    if was_private or mode not in ("", "off"):
+        _held = None  # Never carry a previous identity's unfinished update into a new scope.
+    if mode not in ("", "off"):
+        # A malformed private opt-in must never fall back to the shared hotkey run.
+        _private_mode = True
+        _enabled = False
+        try:
+            from reliquary.shared.private_training_wandb import private_wandb_from_environment
+            from reliquary.validator.private_training_telemetry import PrivateTrainingWriter
+
+            identity = private_wandb_from_environment(config, role, os.environ)
+            if not os.getenv("WANDB_API_KEY"):
+                raise ValueError("private telemetry credential not configured")
+            _private_writer = PrivateTrainingWriter(identity)
+        except Exception:
+            logger.warning("wandb: private training telemetry not configured; shared fallback disabled")
+        return
     if not os.getenv("WANDB_API_KEY"):
         logger.info("wandb: WANDB_API_KEY not set, telemetry disabled")
         return
@@ -77,6 +102,8 @@ def log_training_step(metrics: dict, step: int | None) -> None:
     if _held is not None:
         _held.update(metrics)
         return
+    if _private_mode:
+        return  # Only a captured, successfully published checkpoint can enter the private run.
     if not _enabled:
         return
     try:
@@ -103,8 +130,20 @@ def flush(extra: dict, step: int | None) -> dict:
     global _held
     held, _held = _held or {}, None
     row = {**held, **extra}
-    log_training_step(row, step)
+    if not _private_mode:
+        log_training_step(row, step)
     return row
+
+
+def prepare_published_checkpoint(metrics: dict, checkpoint: int, observed_at: float):
+    """Capture an independent row now; returned nonblocking sink runs only after publication."""
+    if not _private_mode or _private_writer is None:
+        return None
+    try:
+        return _private_writer.prepare(metrics, checkpoint, observed_at)
+    except Exception:
+        logger.warning("wandb: private checkpoint telemetry capture failed; training continues")
+        return None
 
 
 def update_config(values: dict) -> None:
@@ -114,6 +153,8 @@ def update_config(values: dict) -> None:
     only exist after ``wandb.init``. Keep this fail-soft like the metric path.
     """
     global _log_warned
+    if _private_mode:
+        return  # Private run identity is immutable and never updated from arbitrary config fields.
     if not _enabled or _run is None:
         return
     try:
@@ -129,7 +170,15 @@ def update_config(values: dict) -> None:
 
 def finish() -> None:
     """Close the wandb run. No-op if disabled. Fail-soft."""
-    global _run, _enabled, _log_warned
+    global _run, _enabled, _log_warned, _private_mode, _private_writer, _held
+    if _private_mode:
+        if _private_writer is not None:
+            _private_writer.close()
+        _private_writer = None
+        _private_mode = False
+        _enabled = False
+        _held = None
+        return
     if not _enabled:
         return
     try:
@@ -145,8 +194,12 @@ def finish() -> None:
 
 def _reset_for_tests() -> None:
     """Test-only helper: reset module state so each test starts fresh."""
-    global _run, _enabled, _log_warned, _held
+    global _run, _enabled, _log_warned, _held, _private_mode, _private_writer
+    if _private_writer is not None:
+        _private_writer.close()
     _run = None
     _enabled = False
     _log_warned = False
     _held = None
+    _private_mode = False
+    _private_writer = None

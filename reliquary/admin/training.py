@@ -65,6 +65,9 @@ class CreateTraining(BaseModel):
     batch_groups: int = Field(default=DEFAULT_BATCH_GROUPS, ge=1, le=MAX_BATCH_GROUPS)
     lag_target: int = Field(default=2, ge=1, le=16)
     cap: float | None = Field(default=None, gt=0, le=1)
+    # Optional private telemetry identity; the platform supplies both together.
+    order_id: str | None = Field(default=None, min_length=1, max_length=128)
+    wandb: dict[str, str] | None = None
 
     @model_validator(mode="after")
     def _shares(self) -> CreateTraining:
@@ -73,6 +76,8 @@ class CreateTraining(BaseModel):
             raise ValueError("an environment is named twice")
         if sum(e.share_bps for e in self.environments) != 10000:
             raise ValueError("environment shares must sum to 10000 bps")
+        if (self.order_id is None) != (self.wandb is None):
+            raise ValueError("private training telemetry requires both order_id and wandb")
         return self
 
 
@@ -100,7 +105,12 @@ def order_digest(body: CreateTraining) -> str:
     """The order as the platform sent it: a replay under the same id must carry the same order."""
     from reliquary.protocol.release_contract import canonical_sha256
 
-    return canonical_sha256(body.model_dump(mode="json"))
+    values = body.model_dump(mode="json")
+    # Keep pre-telemetry requests byte-equivalent for idempotent retries of old orders.
+    for name in ("order_id", "wandb"):
+        if values[name] is None:
+            values.pop(name)
+    return canonical_sha256(values)
 
 
 def training_task_id(body: CreateTraining, task_prefix: str) -> str:
@@ -140,6 +150,11 @@ def training_entry(body: CreateTraining, *, task_prefix: str, price_params: Mapp
              "usd_per_alpha": float(price_params[MAX_PRICE_ALPHA_USD_PARAM])}
     if body.limits.max_tokens is not None:
         order["max_tokens"] = body.limits.max_tokens
+    if body.order_id is not None:
+        from reliquary.shared.private_training_wandb import validate_private_wandb_binding
+
+        binding = validate_private_wandb_binding(body.order_id, entry.task_id, body.wandb)
+        order.update(order_id=body.order_id, wandb=binding)
     return replace(entry, params={**entry.params, **price_params, PRICING_PARAM: PRICING_AUCTION,
                                   LAG_TARGET_PARAM: body.lag_target, BATCH_GROUPS_PARAM: body.batch_groups,
                                   TRAINING_PARAM: order})
@@ -192,10 +207,11 @@ __all__ = [
 ]
 
 
-def training_profiles() -> dict:
+def training_profiles(*, task_prefix: str | None = None) -> dict:
     """Exact pinned async RL profiles and their currently live training environments."""
     from reliquary.env_catalog import entry as catalog_entry
     from reliquary.protocol.profiles import DRAW_GUMBEL_MAX, PROFILES
+    from reliquary.shared.private_training_wandb import PRIVATE_TRAINING_WANDB_SCHEMA
 
     profiles = []
     for profile_id, profile in PROFILES.items():
@@ -206,4 +222,6 @@ def training_profiles() -> dict:
         if environments:
             profiles.append({"id": profile_id, "model": profile.model_id, "revision": profile.model_revision,
                              "environments": environments})
-    return {"schema": "reliquary/training-profiles/v1", "profiles": profiles}
+    return {"schema": "reliquary/training-profiles/v1", "profiles": profiles,
+            "capabilities": {"private_training_wandb": PRIVATE_TRAINING_WANDB_SCHEMA},
+            **({"training_task_prefix": task_prefix + TRAINING_ID_INFIX} if task_prefix is not None else {})}

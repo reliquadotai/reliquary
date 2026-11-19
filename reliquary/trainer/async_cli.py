@@ -188,6 +188,20 @@ def disable_cudnn_attention(torch) -> None:
     torch.backends.cuda.enable_cudnn_sdp(False)
 
 
+def _close_async_trainer(trainer, backup) -> None:
+    """Always stop the optional telemetry worker, including after a failed publication."""
+    from reliquary.validator import telemetry
+
+    try:
+        trainer.close()
+    finally:
+        try:
+            if backup is not None:
+                backup.close(timeout=60)
+        finally:
+            telemetry.finish()
+
+
 def run_async_train_worker() -> None:
     import torch
 
@@ -233,6 +247,7 @@ def run_async_train_worker() -> None:
         task = link.config()
         telemetry.init(settings["validator_hotkey"], {
             "task_id": task["task_id"], "run": task["run"], "targets": task["targets"], "backend": backend,
+            "order_id": task.get("order_id"), "wandb": task.get("wandb"),
             "batch_groups": settings["batch_groups"], "steps_per_checkpoint": settings["steps_per_checkpoint"],
             "gpus": dist_ctx.world_size if dist_ctx is not None else 1}, role="trainer", version=str(task["run"]))
         state_dir: Path = settings["state_dir"]
@@ -332,10 +347,7 @@ def run_async_train_worker() -> None:
         try:
             run_forever(trainer)
         finally:
-            trainer.close()
-            if backup is not None:
-                backup.close(timeout=60)
-            telemetry.finish()
+            _close_async_trainer(trainer, backup)
     finally:
         if heartbeat is not None:
             heartbeat.stop()

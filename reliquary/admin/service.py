@@ -1543,7 +1543,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         async def training_profiles() -> dict:
             from reliquary.admin.training import training_profiles as profiles
 
-            return profiles()
+            return profiles(task_prefix=task_prefix)
 
         def outputs_store():
             from reliquary.shared.training_outputs import TrainingOutputsStore

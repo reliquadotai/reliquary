@@ -744,3 +744,107 @@ def test_completed_metrics_follow_publication_without_wandb_and_finalization_wai
     assert trainer.run_once() == "trained"
     trainer.close()
     assert events == [("full checkpoint", 4), ("metrics", 4), ("final", 4)]
+
+
+def test_private_metrics_wait_for_publication_and_do_not_depend_on_native_metric_upload(monkeypatch):
+    from reliquary.validator import telemetry
+
+    entered, release = threading.Event(), threading.Event()
+    captured, sent = [], []
+
+    def prepare(metrics, version, observed_at):
+        saved = dict(metrics)
+        captured.append((saved, version, observed_at))
+        return lambda: sent.append((saved, version, book.latest_checkpoint))
+
+    monkeypatch.setattr(telemetry, "prepare_published_checkpoint", prepare)
+    model, book = _Model(), Book(latest=3)
+    buffer = TrainingBuffer(book)
+    for name in ("a", "b"):
+        buffer.push(submitted(model, name))
+
+    class Outputs(Publisher):
+        def publish(self, version, state):
+            entered.set()
+            assert release.wait(3)
+
+        def publish_metrics(self, version, values, *, observed_at):
+            raise RuntimeError("native metric upload unavailable")
+
+    trainer = AsyncTrainer(model, config=AsyncTrainerConfig(2, group_floor=0.7), buffer=buffer,
+                           submissions=Subs(buffer), book=book, publisher=Outputs())
+    try:
+        assert trainer.run_once() == "trained"
+        assert entered.wait(1) and sent == []
+        assert captured[0][1] == 4 and captured[0][0]["async/checkpoint"] == 3
+        telemetry.hold()
+        telemetry.log_training_step({"train/entropy": 999}, 5)
+        release.set()
+        trainer.close()
+        assert sent[0][1:] == (4, 4)
+        assert sent[0][0].get("train/entropy") != 999
+    finally:
+        release.set()
+        telemetry.flush({}, 5)
+
+
+def test_failed_checkpoint_upload_emits_no_qualified_private_metric(monkeypatch):
+    from reliquary.validator import telemetry
+
+    sent = []
+    monkeypatch.setattr(telemetry, "prepare_published_checkpoint", lambda *args: lambda: sent.append(args))
+    model, book = _Model(), Book(latest=3)
+    buffer = TrainingBuffer(book)
+    for name in ("a", "b"):
+        buffer.push(submitted(model, name))
+
+    class Broken(Publisher):
+        def publish(self, version, state):
+            raise RuntimeError("checkpoint failed")
+
+    trainer = AsyncTrainer(model, config=AsyncTrainerConfig(2, group_floor=0.7), buffer=buffer,
+                           submissions=Subs(buffer), book=book, publisher=Broken())
+    assert trainer.run_once() == "trained"
+    with pytest.raises(RuntimeError, match="checkpoint failed"):
+        trainer.close()
+    assert sent == [] and book.latest_checkpoint == 3
+
+
+def test_private_enqueue_error_cannot_prevent_native_metrics_or_publication(monkeypatch):
+    from reliquary.validator import telemetry
+
+    def fail():
+        raise RuntimeError("private sink unavailable")
+
+    monkeypatch.setattr(telemetry, "prepare_published_checkpoint", lambda *args: fail)
+    events = []
+    model, book = _Model(), Book(latest=8)
+    buffer = TrainingBuffer(book)
+    for name in ("a", "b"):
+        buffer.push(submitted(model, name, k=8))
+
+    class Outputs(Publisher):
+        def publish_metrics(self, version, values, *, observed_at):
+            events.append(version)
+
+    trainer = AsyncTrainer(model, config=AsyncTrainerConfig(2, group_floor=0.7), buffer=buffer,
+                           submissions=Subs(buffer), book=book, publisher=Outputs())
+    assert trainer.run_once() == "trained"
+    trainer.close()
+    assert events == [9] and book.latest_checkpoint == 9
+
+
+def test_book_adoption_without_a_checkpoint_publisher_is_not_private_publication(monkeypatch):
+    from reliquary.validator import telemetry
+
+    sent = []
+    monkeypatch.setattr(telemetry, "prepare_published_checkpoint", lambda *args: lambda: sent.append(args))
+    model, book = _Model(), Book(latest=3)
+    buffer = TrainingBuffer(book)
+    for name in ("a", "b"):
+        buffer.push(submitted(model, name))
+    trainer = AsyncTrainer(model, config=AsyncTrainerConfig(2, group_floor=0.7), buffer=buffer,
+                           submissions=Subs(buffer), book=book)
+    assert trainer.run_once() == "trained"
+    trainer.close()
+    assert book.latest_checkpoint == 4 and sent == []
