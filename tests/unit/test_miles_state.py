@@ -75,13 +75,45 @@ def test_expected_specs_from_the_safetensors_headers(tmp_path):
     assert expected_weight_specs(tmp_path) == {"x": ("BF16", [2, 3]), "y": ("F32", [4])}
 
 
-def test_export_refuses_a_dtype_or_shape_change(tmp_path):
-    for specs in ({**SPECS, "lm_head.weight": ("F32", [8, 4])}, {**SPECS, "model.norm.weight": ("BF16", [5])}):
-        root = tmp_path / str(len(list(tmp_path.iterdir())))
-        root.mkdir()
-        state = MilesState(Exporter(root), checkpoint_root=root, expected=specs, delete=lambda p: None)
-        with pytest.raises(RuntimeError, match="does not match"):
-            state()
+def test_export_refuses_a_shape_change(tmp_path):
+    state = MilesState(Exporter(tmp_path), checkpoint_root=tmp_path,
+                       expected={**SPECS, "model.norm.weight": ("BF16", [5])}, delete=lambda p: None)
+    with pytest.raises(RuntimeError, match="does not match"):
+        state()
+
+
+def test_export_takes_the_models_dtypes(tmp_path):
+    # Qwen3.5 keeps its linear-attention A_log and norms in fp32; Megatron exports them in bf16.
+    state = MilesState(Exporter(tmp_path), checkpoint_root=tmp_path,
+                       expected={**SPECS, "model.norm.weight": ("F32", [4])}, delete=lambda p: None)
+    snapshot = state()
+    assert snapshot["model.norm.weight"].dtype == torch.float32 and float(snapshot["model.norm.weight"][0]) == 1.0
+    assert snapshot["lm_head.weight"].dtype == torch.bfloat16
+
+
+def test_untrained_mtp_head_comes_from_the_base_model(tmp_path):
+    base = tmp_path / "base"
+    base.mkdir()
+    save_file({"mtp.fc.weight": torch.full((2, 2), 7.0)}, base / "model-mtp.safetensors")
+    root = tmp_path / "ckpt"
+    root.mkdir()
+    specs = {**SPECS, "mtp.fc.weight": ("F32", [2, 2])}
+    state = MilesState(Exporter(root), checkpoint_root=root, expected=specs, delete=lambda p: None, base_dir=base)
+    snapshot = state()
+    assert torch.equal(snapshot["mtp.fc.weight"], torch.full((2, 2), 7.0))
+    assert set(snapshot) == set(specs)
+
+
+def test_a_missing_trained_weight_is_still_refused_with_a_base(tmp_path):
+    base = tmp_path / "base"
+    base.mkdir()
+    save_file({"lm_head.weight": torch.zeros(8, 4, dtype=torch.bfloat16)}, base / "model.safetensors")
+    root = tmp_path / "ckpt"
+    root.mkdir()
+    exporter = Exporter(root, keys={k: v for k, v in KEYS.items() if k != "lm_head.weight"})
+    state = MilesState(exporter, checkpoint_root=root, expected=SPECS, delete=lambda p: None, base_dir=base)
+    with pytest.raises(RuntimeError, match="lm_head.weight"):
+        state()
 
 
 def test_export_found_under_the_launchers_run_dir(tmp_path):

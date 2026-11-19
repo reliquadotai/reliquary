@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 
 from reliquary.constants import (
     REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
@@ -28,7 +28,8 @@ REFRESH_SECONDS = 600.0
 RETRY_SECONDS = 60.0
 
 
-async def load_registered_hotkeys(netuid: int) -> set[str]:
+async def load_registered_hotkeys(netuid: int) -> dict[str, str | None]:
+    """Each registered hotkey and its registration's coldkey (None if the chain gave none)."""
     from reliquary.infrastructure import chain
 
     subtensor = await chain.get_subtensor()
@@ -36,14 +37,17 @@ async def load_registered_hotkeys(netuid: int) -> set[str]:
         neurons = await chain.get_neurons_lite(subtensor, netuid)
     finally:
         await chain.close_subtensor(subtensor)
-    return {
-        hotkey.strip() for neuron in neurons
-        if isinstance(hotkey := getattr(neuron, "hotkey", None), str) and hotkey.strip()
-    }
+    registered: dict[str, str | None] = {}
+    for neuron in neurons:
+        hotkey = getattr(neuron, "hotkey", None)
+        if isinstance(hotkey, str) and hotkey.strip():
+            coldkey = getattr(neuron, "coldkey", None)
+            registered[hotkey.strip()] = coldkey.strip() if isinstance(coldkey, str) and coldkey.strip() else None
+    return registered
 
 
 class RegisteredHotkeys:
-    def __init__(self, *, load: Callable[[], Awaitable[set[str]]],
+    def __init__(self, *, load: Callable[[], Awaitable[set[str] | Mapping[str, str | None]]],
                  clock: Callable[[], float] = time.time,
                  ttl_seconds: float = REGISTERED_HOTKEY_CACHE_TTL_SECONDS,
                  grace_seconds: float = REGISTERED_HOTKEY_STALE_GRACE_SECONDS) -> None:
@@ -52,6 +56,8 @@ class RegisteredHotkeys:
         self._ttl = ttl_seconds
         self._grace = grace_seconds
         self._hotkeys: frozenset[str] | None = None
+        # Each hotkey's coldkey, from the last snapshot that gave them.
+        self._coldkeys: dict[str, str] = {}
         self._refreshed_at: float | None = None
 
     async def reason(self, hotkey: str) -> str | None:
@@ -76,8 +82,14 @@ class RegisteredHotkeys:
             logger.warning("corpus registration refresh failed: %r", exc)
             return False
         self._hotkeys = frozenset(hotkeys)
+        if isinstance(hotkeys, Mapping):
+            self._coldkeys = {hotkey: coldkey for hotkey, coldkey in hotkeys.items() if coldkey}
         self._refreshed_at = self._clock()
         return True
+
+    def coldkey(self, hotkey: str) -> str | None:
+        """The coldkey ``hotkey`` was registered under, as the last snapshot read it (None: unknown)."""
+        return self._coldkeys.get(hotkey)
 
     async def refresh_forever(self) -> None:
         while True:

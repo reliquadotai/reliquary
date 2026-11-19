@@ -2304,6 +2304,118 @@ def admin_serve(
     uvicorn.run(admin, host=host, port=port, log_level=log_level.lower())
 
 
+rl_app = typer.Typer(name="rl", help="The RL front and its tasks")
+app.add_typer(rl_app)
+
+
+def _rl_async_requested() -> bool:
+    from reliquary.validator.rl_async_service import ASYNC, rl_mode
+
+    try:
+        return rl_mode() == ASYNC
+    except ValueError:
+        return False
+
+
+@rl_app.command("supervise")
+def rl_supervise(
+    map_path: Path = typer.Option(..., "--map", help="The task map file the front reads (written atomically)"),
+    ports: str = typer.Option("9100-9199", "--ports", help="Loopback ports for the controllers, LOW-HIGH"),
+    state_dir: Path = typer.Option(..., "--state-dir", help="Each controller's log and state directory"),
+    network: str = typer.Option("finney", help="Bittensor network"),
+    netuid: int = typer.Option(81, help="Subnet UID"),
+    wallet_name: str = typer.Option("default", help="Wallet name"),
+    hotkey: str = typer.Option("default", help="Hotkey name"),
+    wallet_path: str = typer.Option(os.getenv("BT_WALLET_PATH", ""), help="Optional wallet base path"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+):
+    """Run one async RL controller per training task of the registry and keep the front's map file current."""
+    import time
+
+    from reliquary.validator import rl_supervisor as sup
+
+    setup_logging(log_level)
+    low, _, high = ports.partition("-")
+    try:
+        port_range = range(int(low), int(high or low) + 1)
+    except ValueError as exc:
+        raise typer.BadParameter("--ports must be LOW-HIGH") from exc
+    command = ["reliquary", "validate", "--network", network, "--netuid", str(netuid),
+               "--wallet-name", wallet_name, "--hotkey", hotkey]
+    if wallet_path:
+        command += ["--wallet-path", wallet_path]
+    try:
+        lock = sup.lock_state_dir(state_dir)
+    except sup.StateLocked as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    supervisor = sup.Supervisor(
+        sup.read_registry_entries, sup.subprocess_spawn(command, state_dir, dict(os.environ)), ports=port_range,
+        map_path=map_path, final_of=sup.admin_final, default_task=os.getenv(sup.DEFAULT_TASK_ENV),
+        order_path=state_dir / "task-order.json", has_spend=sup.has_spend)
+    try:
+        while True:
+            supervisor.tick()
+            time.sleep(sup.TICK_S)
+    finally:
+        lock.close()
+
+
+@rl_app.command("front")
+def rl_front(
+    port: int = typer.Option(VALIDATOR_HTTP_PORT, "--port", help="Public port the front serves"),
+    host: str = typer.Option("0.0.0.0", "--host"),
+    map_path: Path = typer.Option(..., "--map", help="The supervisor's task map file (JSON)"),
+    allow_plain_trainer: bool = typer.Option(
+        False, "--allow-plain-trainer",
+        help="Proxy trainer paths over plain HTTP. By default they cross only over HTTPS: the TLS terminator's "
+             "X-Forwarded-Proto, believed only from --forwarded-allow-ips",
+    ),
+    forwarded_allow_ips: str = typer.Option(
+        "127.0.0.1", "--forwarded-allow-ips",
+        help="Comma-separated addresses of the TLS terminator whose X-Forwarded-* headers are believed"),
+    external_ip: str = typer.Option("", "--external-ip", help="Public IP to publish on-chain (serve_axon); empty skips"),
+    external_port: int = typer.Option(0, "--external-port", help="Public port to advertise; --port when 0"),
+    network: str = typer.Option("finney", help="Bittensor network"),
+    netuid: int = typer.Option(81, help="Subnet UID"),
+    wallet_name: str = typer.Option("default", help="Wallet name"),
+    hotkey: str = typer.Option("default", help="Hotkey name"),
+    wallet_path: str = typer.Option(os.getenv("BT_WALLET_PATH", ""), help="Optional wallet base path"),
+    log_level: str = typer.Option("INFO", help="Log level"),
+):
+    """Serve the public port: route /rl/<task>/... to each RL task's controller and list them at /rl/tasks."""
+    import asyncio
+
+    import uvicorn
+
+    from reliquary.validator.rl_front import behind_terminator, build_front_app
+
+    setup_logging(log_level)
+    if external_ip:
+        import bittensor as bt
+
+        from reliquary.infrastructure.chain import close_subtensor
+        from reliquary.validator.axon import serve_axon_on_chain
+
+        wallet_kwargs = {"name": wallet_name, "hotkey": hotkey}
+        if wallet_path:
+            wallet_kwargs["path"] = wallet_path
+
+        async def announce() -> None:
+            subtensor = bt.AsyncSubtensor(network=network)
+            await asyncio.wait_for(subtensor.initialize(), timeout=120.0)
+            try:
+                await serve_axon_on_chain(subtensor, wallet=bt.Wallet(**wallet_kwargs), netuid=netuid,
+                                          ip=external_ip, port=external_port or port)
+            finally:
+                await close_subtensor(subtensor)
+
+        asyncio.run(announce())
+    front = behind_terminator(build_front_app(map_path, allow_plain_trainer=allow_plain_trainer),
+                              [ip.strip() for ip in forwarded_allow_ips.split(",") if ip.strip()])
+    uvicorn.run(front, host=host, port=port, log_level=log_level.lower(), proxy_headers=False)
+
+
 eval_app = typer.Typer(name="eval", help="Evaluation orders: frozen sets and the pod runner")
 app.add_typer(eval_app)
 
@@ -3232,6 +3344,25 @@ def corpus_qualify(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(json.dumps(answer))
+
+
+def _rl_asks(values: list[str], environments: tuple[str, ...], capacity: int) -> dict[str, tuple[int, int]]:
+    """``--ask-alpha-per-mtoken`` as env -> (micro-alpha per million tokens, capacity): one bare value prices every
+    env, ``ENV=VALUE`` one env (it wins over the bare value)."""
+    default, priced = None, {}
+    for value in values:
+        name, sep, amount = value.rpartition("=")
+        price = float(amount)
+        if not (math.isfinite(price) and price > 0):
+            raise ValueError(f"--ask-alpha-per-mtoken {value!r}: a positive price is needed")
+        if sep:
+            if name not in environments:
+                raise ValueError(f"--ask-alpha-per-mtoken names {name!r}, not one of --environments")
+            priced[name] = price
+        else:
+            default = price
+    return {env: (max(1, round(1e6 * (priced.get(env, default)))), int(capacity))
+            for env in environments if env in priced or default is not None}
 
 
 @corpus_app.command("mine")
@@ -4558,6 +4689,17 @@ def mine_async(
         False, "--share-setup", help="Opt in: send this process's GPUs (model, memory), CPU and RAM to the "
         "validator at start and every 6 h. Informational only, never scored"),
     setup_note: str = typer.Option("", "--setup-note", help="With --share-setup: a free note, e.g. '2 boxes 8xH100'"),
+    ask_alpha_per_mtoken: list[str] = typer.Option(
+        [], "--ask-alpha-per-mtoken",
+        help="A task priced by auction: your price in alpha per million matched tokens, one value for every env or "
+             "ENV=VALUE (repeatable). Posted before leasing and every 10 min"),
+    ask_capacity: int = typer.Option(
+        0, "--ask-capacity", help="With --ask-alpha-per-mtoken: the groups you can hold at once per env "
+                                  "(default: --max-open)"),
+    rl_task: str = typer.Option(
+        "", "--rl-task", help="Mine this RL task only (its /rl/<task> routes). Default: the task that pays best "
+                              "for your envs (GET /rl/tasks), chosen again every 10 min; bare /rl on a validator "
+                              "without it"),
     log_level: str = typer.Option("INFO", help="Log level"),
 ) -> None:
     """Mine the asynchronous RL protocol: lease prompts within the measured quota, generate 16 rollouts per lease
@@ -4586,9 +4728,14 @@ def mine_async(
             raise typer.Exit(code=2)
         typer.echo(f"validator discovered: {validator_url} ({validator_hotkey})")
     try:
+        if rl_task:
+            from reliquary.miner.rl_task_choice import task_prefix
+
+            task_prefix(rl_task)
+        asks = _rl_asks(ask_alpha_per_mtoken, names, ask_capacity or max_open)
         config = AsyncMinerConfig(environments=names, lease_batch=lease_batch, max_open=max_open,
                                   queue_groups=queue_groups, batch_groups=batch_groups,
-                                  state_dir=str(Path(work_dir) / "state"))
+                                  state_dir=str(Path(work_dir) / "state"), asks=asks)
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(code=2) from exc
@@ -4609,7 +4756,7 @@ def mine_async(
             base_model_dir=base_model or None, work_dir=work_dir, initial_dir=initial_checkpoint or None,
             initial_version=None if initial_version < 0 else initial_version, swap=weight_swap, dry_run=dry_run,
             fake_generator=fake_generator, episode_options=episode_options,
-            share_setup=setup_note if share_setup else None,
+            share_setup=setup_note if share_setup else None, rl_task=rl_task or None,
             engine_kwargs={"gpu_memory_utilization": gpu_memory_utilization, "max_num_seqs": max_num_seqs,
                            "max_model_len": max_model_len or None, "quantization": quantization or None}))
     except ValueError as exc:
@@ -4905,6 +5052,7 @@ def validate(
                         TASK_ID,
                         profile_id=PROTOCOL_PROFILE_ID,
                         generation_contract=PROTOCOL_GENERATION_CONTRACT,
+                        allow_retired_training=_rl_async_requested(),
                     )
             except TaskConfigError as exc:
                 # Unlike a missing GPU lease, this is not an environment
@@ -5392,7 +5540,7 @@ def train_async() -> None:
     RELIQUARY_RL_VALIDATOR_HOTKEY, R2_PUBLIC_*;
     optional RELIQUARY_RL_BATCH_GROUPS, RELIQUARY_RL_STEPS_PER_CHECKPOINT, RELIQUARY_RL_ANCHOR_INTERVAL,
     RELIQUARY_RL_HF_BACKUP_PREFIX + RELIQUARY_RL_HF_BACKUP_EVERY (+ _KEEP, _MILESTONE_EVERY),
-    RELIQUARY_RL_BASE_MODEL, RELIQUARY_TRAINER_BACKEND=fsdp2 under torchrun.
+    RELIQUARY_RL_BASE_MODEL[_REVISION], RELIQUARY_TRAINER_BACKEND=fsdp2 under torchrun.
     """
     logging.basicConfig(
         level=logging.INFO,

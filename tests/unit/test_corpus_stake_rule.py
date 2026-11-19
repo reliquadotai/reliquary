@@ -159,7 +159,7 @@ def test_the_stake_is_counted_once():
     _judge_at(auditor, clock, T0 + 40, [sid])
     first = auditor._stake[sid]
     # Much later, with everything before it gone from memory, the record keeps its first count.
-    auditor._forfeitable_at[HK].clear()
+    auditor._forfeitable_at[auditor._operator(HK)].clear()
     assert auditor._stake_of(sid, T0 + 30 + HOLD + 1) == first == 2.0
 
 
