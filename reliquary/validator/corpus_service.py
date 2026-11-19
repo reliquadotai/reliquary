@@ -1736,6 +1736,8 @@ def build_corpus_router(
     # Leases are granted off the event loop: two first requests at once must not each build a lease book (the one
     # that loses would drop the leases it granted, and both write the same state file).
     leases_lock = threading.Lock()
+    # Serialize grant batches in the worker so HTTP cancellation cannot release the lock mid-batch.
+    grant_lock = threading.Lock()
     lease_nonces: dict[str, float] = {}
     # The taken keys of the ledger version last leased from: rebuilt once per version, not per request.
     lease_seen: dict[str, Any] = {}
@@ -2836,38 +2838,37 @@ def build_corpus_router(
         (None when all were)."""
         from reliquary.corpus.draw_leases import free_draw_slots
 
-        if lease_seen.get("state") is not state:
-            built = set(state.pending)
-            for ref in state.segments:
-                built.update(seen_index._contents.get(ref.id, ()))
-            lease_seen.update(state=state, seen=built)
-        seen = lease_seen["seen"]
-        ledger = state.slots
-        leases = _leases(job)
+        with grant_lock:
+            if lease_seen.get("state") is not state:
+                built = set(state.pending)
+                for ref in state.segments:
+                    built.update(seen_index._contents.get(ref.id, ()))
+                lease_seen.update(state=state, seen=built)
+            seen = lease_seen["seen"]
+            ledger = state.slots
+            leases = _leases(job)
 
-        def taken(prompt: int, slot: int) -> bool:
-            return slot_key(prompt, slot, ledger.slot_attempt(prompt, slot)) in seen
+            def taken(prompt: int, slot: int) -> bool:
+                return slot_key(prompt, slot, ledger.slot_attempt(prompt, slot)) in seen
 
-        granted = []
-        for _ in range(wanted):
-            terms = None
-            seconds = None
-            if auction is not None:
-                terms = auction.admit(hotkey)
+            granted = []
+            for _ in range(wanted):
+                terms = None if auction is None else auction.admit(hotkey)
                 if isinstance(terms, str):
                     return granted, terms
-                seconds = auction.lease_seconds(hotkey, leases.seconds, held=len(leases.held_by(hotkey)))
-            try:
-                lease = leases.grant(hotkey, free_draw_slots(job, ledger, taken),
-                                     price=None if terms is None else terms.price, seconds=seconds,
-                                     offer=None if terms is None else terms.offer)
-            finally:
-                if terms is not None:
-                    auction.unreserve(terms)
-            if lease is None or isinstance(lease, str):
-                return granted, "no_free_slot" if lease is None else lease
-            granted.append(lease)
-        return granted, None
+                try:
+                    seconds = None if terms is None else auction.lease_seconds(
+                        hotkey, leases.seconds, held=len(leases.held_by(hotkey)))
+                    lease = leases.grant(hotkey, free_draw_slots(job, ledger, taken),
+                                         price=None if terms is None else terms.price, seconds=seconds,
+                                         offer=None if terms is None else terms.offer)
+                finally:
+                    if terms is not None:
+                        auction.unreserve(terms)
+                if lease is None or isinstance(lease, str):
+                    return granted, "no_free_slot" if lease is None else lease
+                granted.append(lease)
+            return granted, None
 
     async def _swap_leases(job, hotkey: str) -> list[dict]:
         """An accepted submission of a hotkey whose offer swaps: its next leases, up to its slots, in the same

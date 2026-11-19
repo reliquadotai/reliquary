@@ -741,7 +741,7 @@ class TokenAuction:
                 self._debt[hotkey] = self._debt.get(hotkey, 0.0) + owed
             if fraction >= LATE_RELEASE:
                 self._missed.setdefault(hotkey, []).append(self._clock())
-            self._changed()
+            self._changed(force=True)
 
     # -- submissions ---------------------------------------------------------
 
@@ -756,14 +756,14 @@ class TokenAuction:
                     self._debt[hotkey] = left
                 else:
                     del self._debt[hotkey]
-                self._changed()
+                self._changed(force=True)
             return taken
 
     def refund_debit(self, hotkey: str, amount: float) -> None:
         if amount > 0:
             with self._lock:
                 self._debt[hotkey] = self._debt.get(hotkey, 0.0) + float(amount)
-                self._changed()
+                self._changed(force=True)
 
     def observe_tokens(self, token_count: int) -> None:
         with self._lock:
@@ -895,9 +895,10 @@ class TokenAuction:
         """Where this auction's state is written, if anywhere: its job's leases are written beside it."""
         return self._state_path
 
-    def _changed(self) -> None:
+    def _changed(self, *, force: bool = False) -> None:
+        # Debt changes cannot wait for a later delivery to flush a throttled snapshot.
         self._dirty = True
-        self.save()
+        self.save(force=force)
 
     def save(self, *, force: bool = False) -> None:
         """Write the state to ``state_path`` (at most every ``SAVE_SECONDS`` unless forced)."""
