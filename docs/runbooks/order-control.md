@@ -15,7 +15,38 @@ build context named `envs`. The build then runs `reliquary corpus order-control-
 - `bittensor_drand` imports (it comes with `bittensor`; without it every record of a sampled job is audited,
   which multiplies executor load);
 - `huggingface_hub` and `transformers` import (model files and tokenizers are read on CPU);
-- each order source's package is installed, its artifact verifies, and its digest is the catalog's.
+- each order source's package is installed, its artifact verifies, and its digest is the catalog's;
+- every env a training order may name (`reliquary.admin.training.trainable_environments`: an env of a
+  Gumbel-max profile with live RL rows in `reliquary/env_catalog.py`) is built in or installed at the version
+  and artifact its registry spec pins (`rl_environments` in the report). `reliquary rl supervise` runs its
+  controllers from this image, and a controller whose order names an env without its package crashes at load.
+
+RL training envs beyond the four wheels are installed from reliquary-environments by `pip install
+git+...@<commit>#subdirectory=...`: `reliquary-hard-math`, `reliquary-science`, `reliquary-competitive-code` and
+`reliquary-general` (0.1.0a1) at `ENVS`, and `reliquary-telecom-solo` 0.1.0a1 (`reliquary_telecom_solo_v1`, the
+one the profiles name) at `TELECOM_ENVS`. Each artifact pins the digest of every file and the version, so a wrong
+commit fails the build check rather than the controller. `reliquary_telecom_solo_v2` is 0.2.0a1 of the same
+distribution: an image carries one of the two. To move a pin, find the commit whose `artifact.json` hashes
+(canonical JSON, sha256) to the spec's `environment_manifest_sha256` in `reliquary/environment/registry.py`.
+
+What these envs need at run time:
+
+| Env | Needs |
+|---|---|
+| `reliquary_hard_math_v1`, `reliquary_telecom_solo_v1` | nothing: the corpus ships in the package |
+| `reliquary_science_v1` | Hub: `PrimeIntellect/INTELLECT-3-RL` at a pinned revision, checked by digest |
+| `reliquary_competitive_code_v1` | Hub: `ReliquaryForge/competitive-code-curated` (public) at a pinned revision; programs run in the gVisor grading service, as `reliquary_code_v1`'s |
+| `reliquary_general_v1` | Hub: `ReliquaryForge/general-prompts-curated@02b3ef7a` (public), or a local copy at `RELIQUARY_GENERAL_DATA` |
+| `envscaler_tools_v2` (built in) | the EnvScaler corpus mounted and named by `RELIQUARY_ENVSCALER_DATA` (`scripts/fetch_envscaler_corpus.py`) |
+
+Mount a persistent Hugging Face cache so the corpora are fetched once.
+
+```bash
+docker build -f docker/Dockerfile.order-control \
+  --build-arg BASE_IMAGE=<the validator image, a -logic one> \
+  --build-context envs=<directory holding exactly the four reviewed wheels> .
+# the build needs network to github.com (the git+ installs); ENVS, TELECOM_ENVS, SBX are build args
+```
 
 For signed episode orders (SWE, TMax) the image also carries reliquary-sandbox with its verifiers bridge at
 `SANDBOX_COMMIT`, `reliquary-swe` and `reliquary-terminal` at the reliquary-environments commit the agentic eval

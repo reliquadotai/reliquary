@@ -2240,13 +2240,29 @@ def _verify_environment(env: str) -> None:
                          f"catalog's {pinned}")
 
 
+def _verify_rl_environment(env: str) -> None:
+    """An env a training order may name, loadable by its RL controller: an
+    external one's package installed at the version and artifact the registry
+    pins; a built-in one is checked against its manifest at import."""
+    from reliquary.environment.agentic.external import verify_external_artifact
+    from reliquary.environment.registry import ENVIRONMENT_SPECS
+
+    spec = ENVIRONMENT_SPECS[env]
+    if spec.external_distribution is not None:
+        verify_external_artifact(spec)
+
+
 def order_control_runtime_check() -> dict:
     """Everything the order control needs at runtime, checked without a GPU
-    or a network: ``{"imports", "environments", "ok"}``, each entry "ok" or
-    why not (`reliquary corpus order-control-check`, run at image build)."""
+    or a network: ``{"imports", "environments", "rl_environments", "ok"}``,
+    each entry "ok" or why not (`reliquary corpus order-control-check`, run
+    at image build). ``rl_environments``: every env a training order may
+    name (``admin.training.trainable_environments``), for the RL controllers
+    `reliquary rl supervise` runs from the same image."""
+    from reliquary.admin.training import trainable_environments
     from reliquary.eval.qualification import ORDER_ENVIRONMENTS
 
-    report: dict[str, Any] = {"imports": {}, "environments": {}}
+    report: dict[str, Any] = {"imports": {}, "environments": {}, "rl_environments": {}}
     for name in ORDER_CONTROL_IMPORTS:
         try:
             _import(name)
@@ -2259,7 +2275,13 @@ def order_control_runtime_check() -> dict:
             report["environments"][env] = "ok"
         except Exception as exc:
             report["environments"][env] = f"{type(exc).__name__}: {exc}"
-    report["ok"] = all(v == "ok" for part in ("imports", "environments")
+    for env in trainable_environments():
+        try:
+            _verify_rl_environment(env)
+            report["rl_environments"][env] = "ok"
+        except Exception as exc:
+            report["rl_environments"][env] = f"{type(exc).__name__}: {exc}"
+    report["ok"] = all(v == "ok" for part in ("imports", "environments", "rl_environments")
                        for v in report[part].values())
     return report
 

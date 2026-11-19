@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from reliquary.admin.training import trainable_environments
 from reliquary.eval import qualification as qual
 from tests.unit.test_admin_eval_jobs import admin  # noqa: F401
 from tests.unit.test_eval_control_process import world  # noqa: F401
@@ -541,9 +542,11 @@ def test_the_order_control_runtime_check_names_every_missing_piece(monkeypatch):
     seen = []
     monkeypatch.setattr(eval_control, "_import", lambda name: seen.append(name))
     monkeypatch.setattr(eval_control, "_verify_environment", lambda env: None)
+    monkeypatch.setattr(eval_control, "_verify_rl_environment", lambda env: None)
     report = eval_control.order_control_runtime_check()
     assert set(seen) >= {"bittensor_drand", "huggingface_hub", "transformers"}
     assert set(report["environments"]) == set(qual.ORDER_ENVIRONMENTS)
+    assert set(report["rl_environments"]) == set(trainable_environments())
     assert report["ok"] is True
 
     def missing(env):
@@ -552,6 +555,29 @@ def test_the_order_control_runtime_check_names_every_missing_piece(monkeypatch):
     monkeypatch.setattr(eval_control, "_verify_environment", missing)
     report = eval_control.order_control_runtime_check()
     assert report["ok"] is False and "not installed" in report["environments"][GEN_ENV]
+
+    monkeypatch.setattr(eval_control, "_verify_environment", lambda env: None)
+    monkeypatch.setattr(eval_control, "_verify_rl_environment", missing)
+    report = eval_control.order_control_runtime_check()
+    assert report["ok"] is False and "not installed" in report["rl_environments"]["reliquary_hard_math_v1"]
+
+
+def test_every_trainable_environment_is_registered_and_installed_by_the_order_control_image():
+    """A training order may name any of them, and its controller runs from the order-control image: each is
+    built in or an external package the image installs (a missing one crashes the controller at load)."""
+    from pathlib import Path
+
+    from reliquary.environment.registry import ENVIRONMENT_SPECS
+
+    dockerfile = Path("docker/Dockerfile.order-control").read_text()
+    names = trainable_environments()
+    assert {"reliquary_hard_math_v1", "reliquary_telecom_solo_v1", "envscaler_tools_v2"} <= set(names)
+    for name in names:
+        spec = ENVIRONMENT_SPECS[name]
+        if spec.external_distribution is None:
+            continue
+        wheel = spec.external_distribution.replace("-", "_")
+        assert spec.external_distribution in dockerfile or f"/tmp/envs/{wheel}-" in dockerfile, name
 
 
 def test_the_order_control_image_installs_and_checks_its_runtime():
