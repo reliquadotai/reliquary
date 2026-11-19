@@ -880,6 +880,8 @@ class CorpusAuditor:
         if terms:
             self._lease_terms[submission_id] = terms
         bisect.insort(self._arrivals.setdefault(meta["hotkey"], []), received_at)
+        # Its hotkey joins its operator's members now: a record read and never decided is still a sibling.
+        self._operator(meta["hotkey"])
         if submission_id not in self._judged:
             self._unjudged.setdefault(meta["hotkey"], set()).add(submission_id)
 

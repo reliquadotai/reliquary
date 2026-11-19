@@ -19,6 +19,7 @@ from tests.unit.test_corpus_judge import HK, HOLD, Q, SAMPLED, T0, _Clock, _ids,
 from tests.unit.test_corpus_stake_rule import _Staked, _judge_at, _model, _Tokenizer, PROOF, _Beacon, _round_at
 
 HK2 = "5Two"
+HK3 = "5Three"
 PARAMS = AuditParams(q=Q, hold_seconds=HOLD, ban_after_failures=10)
 
 
@@ -80,15 +81,17 @@ def test_a_failure_forfeits_the_operators_other_hotkeys_and_turns_them_suspect()
 
 
 def test_a_held_record_waits_for_an_undecided_record_of_its_operators_other_hotkey():
-    # X of HK2 is payable at its hold's end; a drawn cheat of HK inside X's hold was read but never judged. The
-    # pass decides it as X's sibling, audits it, and X is forfeited instead of paid on a stake the cheat voids.
+    # X of HK2 is payable at its hold's end; a drawn cheat of HK3, a hotkey of the same coldkey never seen
+    # before, inside X's hold was read but never judged. The pass decides it as X's sibling, audits it, and X
+    # is forfeited instead of paid on a stake the cheat voids.
     y = _ids(False, 1)[0]
     x = _ids(False, 1, start=300)[0]
     cheat = _ids(True, 1, start=600)[0]
     store = _Store({y: _rec(0, received_at=T0), x: _rec(0, received_at=T0 + 30, hotkey=HK2),
-                    cheat: _rec(1, received_at=T0 + 50)})
+                    cheat: _rec(1, received_at=T0 + 50, hotkey=HK3)})
     clock = _Clock(T0)
-    auditor = _auditor(store, clock, operators={HK: "cold", HK2: "cold"})
+    auditor = _auditor(store, clock, operators={HK: "cold", HK2: "cold", HK3: "cold"},
+                       states=_States({HK: SAMPLED, HK2: SAMPLED, HK3: SAMPLED}))
     _judge_at(auditor, clock, T0 + 20, [y])
     _judge_at(auditor, clock, T0 + 40, [x])
     auditor.enqueue(cheat)
