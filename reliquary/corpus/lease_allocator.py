@@ -18,12 +18,15 @@ only the last needed hotkey is partly served and its offer is the clearing price
 from __future__ import annotations
 
 import collections
+import logging
 import math
 import os
 import statistics
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 # Which markets allocate by merit order (``market_key`` substrings, comma separated, or "all"); unset: none.
 MERIT_ENV = "RELIQUARY_MERIT_ORDER"
@@ -55,10 +58,17 @@ FULL = 0.9
 TARGET_WAIT_SECONDS = 60.0
 BUSY_HIGH = 0.95
 BUSY_LOW = 0.85
-K_MIN, K_MAX = 0.25, 4.0
-K_GROW = 1.15
+K_MIN, K_MAX = 0.25, 2.0
+K_GROW = 1.25
 # Back to 1 faster than above it: a k cut by a queue that drained is a card left idle.
 K_RECOVER = 1.5
+# One cut at most halves k: the wait it reads still holds the records of leases opened before the last change.
+K_CUT_FLOOR = 0.5
+# A change of k shows in the queue only once the leases it opened (or closed) delivered and their records were
+# audited: one loop, the median lease time plus the target wait. k moves at most once a loop (up to 1 twice).
+# 2026-11-18/19: k stepped every 30 s against 5-6 min leases; it wound up to 3-4 while the first leases were
+# still out, the queue then swelled to 170 s, k fell to 60/170 and the leases and the price with it, in waves.
+DEFAULT_LOOP_SECONDS = 300.0
 DEFAULT_DEADLINE_SECONDS = 24 * 3600.0
 MIN_TIME_LEFT_SECONDS = 600.0
 UNMET_SECONDS = 2 * STEP_SECONDS
@@ -360,6 +370,7 @@ class _JobReport:
     backlog_tokens: float = 0.0
     unmet_at: float | None = None
     at: float = 0.0
+    lag_seconds: float | None = None
 
 
 class MarketPace:
@@ -375,6 +386,7 @@ class MarketPace:
         self._wait: float | None = None
         self._rate: float | None = None
         self._steered_at: float | None = None
+        self._changed_at: float | None = None
         self._targets: dict[str, float] = {}
         self.last: dict = {}
 
@@ -395,13 +407,19 @@ class MarketPace:
             self._audit = audit
 
     def report(self, job: str, *, q: float, remaining_tokens: float | None, deadline: float | None,
-               supply: float | None, backlog_tokens: float, unmet_at: float | None) -> None:
+               supply: float | None, backlog_tokens: float, unmet_at: float | None,
+               lag_seconds: float | None = None) -> None:
+        """``lag_seconds``: the job's median lease time, from a lease to its records in the audit queue."""
         now = self._clock()
         with self._lock:
             self._first_seen.setdefault(job, now)
             self._jobs[job] = _JobReport(q=max(1e-3, min(1.0, float(q))), remaining_tokens=remaining_tokens,
                                          deadline=deadline, supply=supply, backlog_tokens=max(0.0, backlog_tokens),
-                                         unmet_at=unmet_at, at=now)
+                                         unmet_at=unmet_at, at=now, lag_seconds=lag_seconds)
+
+    def loop_seconds(self) -> float:
+        lags = [r.lag_seconds for r in self._jobs.values() if r.lag_seconds is not None and r.lag_seconds > 0]
+        return max(STEP_SECONDS, (max(lags) if lags else DEFAULT_LOOP_SECONDS) + TARGET_WAIT_SECONDS)
 
     def forget(self, job: str) -> None:
         with self._lock:
@@ -440,24 +458,32 @@ class MarketPace:
         wait = sum(r.backlog_tokens for r in self._jobs.values()) / rate
         unmet = any(r.unmet_at is not None and now - r.unmet_at <= UNMET_SECONDS for r in self._jobs.values())
         before = self.k
+        loop = self.loop_seconds()
+        since = math.inf if self._changed_at is None else now - self._changed_at
         # Down only when the card is what the queue waits for: a long queue on an idle card waits for something
         # else (records read, draw rounds), and fewer leases would not shorten it (2026-11-18: 600 s queued after
         # a restart, the card 14-28 % busy, k fell 1 -> 0.12 in a minute).
         if wait > TARGET_WAIT_SECONDS and (busy is None or busy >= BUSY_LOW) and (
                 (self._wait is not None and wait > self._wait) or (busy is not None and busy > BUSY_HIGH)):
-            # Proportional, not compounded: k is set from the excess of this wait, never multiplied step after step
-            # while a backlog drains (2026-11-18: x0.5 every 30 s took k from 1 to 0.05 over a 10-min backlog,
-            # and back up at x1.15 per step it would leave the card idle for minutes).
-            self.k = min(self.k, TARGET_WAIT_SECONDS / wait)
-        elif (wait < TARGET_WAIT_SECONDS / 2 and unmet and (busy is None or busy < BUSY_LOW)):
+            # From the excess of this wait, at most halved, and once a loop: the queue keeps growing for a loop
+            # after a cut with the records of leases already out (2026-11-18: k 1 -> 0.05 in 10 min, then
+            # 3 -> 0.35 at once; each time the leases and the price collapsed).
+            if since >= loop:
+                self.k = max(self.k * K_CUT_FLOOR, min(self.k, self.k * TARGET_WAIT_SECONDS / wait))
+        elif (wait < TARGET_WAIT_SECONDS / 2 and unmet and (busy is None or busy < BUSY_LOW)
+              and since >= (loop / 2 if self.k < 1.0 else loop)):
             self.k *= K_RECOVER if self.k < 1.0 else K_GROW
             if before < 1.0 < self.k:
                 self.k = 1.0
         self.k = min(K_MAX, max(K_MIN, self.k))
+        if self.k != before:
+            self._changed_at = now
+            logger.info("merit pace k %.3f -> %.3f wait=%.0fs busy=%s audit=%.0f tok/s loop=%.0fs jobs=%d",
+                        before, self.k, wait, "-" if busy is None else f"{busy:.2f}", rate, loop, len(self._jobs))
         self._wait = wait
         self._targets = split(self._jobs, rate * self.k, now, self._first_seen)
         self.last = {"audit_rate": rate, "busy": busy, "wait_seconds": wait, "k": self.k, "k_before": before,
-                     "targets": dict(self._targets)}
+                     "loop_seconds": loop, "targets": dict(self._targets)}
 
 
 def split(jobs: Mapping[str, _JobReport], audit_rate: float, now: float,

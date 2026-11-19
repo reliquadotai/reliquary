@@ -548,7 +548,8 @@ class TokenAuction:
             remaining = max(0, self._progress[1] - self._progress[0]) * self._mean_tokens
         self._pace.report(self._job, q=q, remaining_tokens=remaining, deadline=self._deadline,
                           supply=None if self._allocation is None else self._allocation.supply,
-                          backlog_tokens=(self._last_backlog or 0) * self._mean_tokens, unmet_at=self._unmet_at)
+                          backlog_tokens=(self._last_backlog or 0) * self._mean_tokens, unmet_at=self._unmet_at,
+                          lag_seconds=self._median_seconds())
 
     def _volume_price(self, now: float) -> float | None:
         """The offer under which ``PRICE_QUANTILE`` of the market's recently delivered leases were won, each

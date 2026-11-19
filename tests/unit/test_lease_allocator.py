@@ -178,7 +178,7 @@ def test_the_queue_lowers_k_when_the_wait_grows():
     pace.report("job", q=1.0, remaining_tokens=1e9, deadline=None, supply=None, backlog_tokens=240_000,
                 unmet_at=None)
     pace.target("job")
-    assert pace.k == pytest.approx(0.25)             # a 240 s wait, the card full: down to target / wait
+    assert pace.k == pytest.approx(0.5)              # a 240 s wait, the card full: target / wait, at most halved
 
 
 def test_an_idle_card_with_miners_refused_raises_k():
@@ -376,7 +376,10 @@ def test_a_long_queue_on_an_idle_card_does_not_lower_k():
     assert pace.k == 1.0
 
 
-def test_k_follows_the_wait_without_compounding_and_recovers_fast():
+def test_k_moves_once_a_loop_and_a_cut_at_most_halves_it():
+    """A change of k shows in the queue a lease time later: k is cut at most by half and once a loop, while the
+    records of leases already out keep the queue growing, and raised once a loop, never wound up to K_MAX by the
+    30-s steps of one loop (2026-11-18/19: k 3.06 against 5-min leases, then 60/170 = 0.35 in one step)."""
     clock = Clock()
     pace = la.MarketPace(clock)
     busy = [0.99]
@@ -384,17 +387,40 @@ def test_k_follows_the_wait_without_compounding_and_recovers_fast():
 
     def step(backlog, unmet=None):
         pace.report("job", q=1.0, remaining_tokens=1e9, deadline=None, supply=None, backlog_tokens=backlog,
-                    unmet_at=unmet)
+                    unmet_at=unmet, lag_seconds=240.0)
         pace.target("job")
         clock.now += la.STEP_SECONDS
 
-    for backlog in (120_000, 150_000, 180_000, 200_000, 220_000):    # a backlog draining slowly, the card full
+    assert pace.loop_seconds() == la.DEFAULT_LOOP_SECONDS + la.TARGET_WAIT_SECONDS
+    for backlog in (120_000, 150_000, 180_000, 200_000, 220_000):    # a queue still growing, the card full
         step(backlog)
-    assert pace.k == pytest.approx(60 / 220)          # its excess now, not x0.5 five times
+    assert pace.loop_seconds() == 300.0
+    assert pace.k == pytest.approx(0.5)               # one cut, by half at most, in the first loop
+    for _ in range(10):                                # past the loop, still growing: the second cut
+        step(240_000)
+    assert pace.k == pytest.approx(0.25)
     busy[0] = 0.5
-    for _ in range(4):
+    ks = []
+    for _ in range(60):                                # the queue gone, the card idle, offers refused: 30 min
         step(0, unmet=clock.now)
-    assert pace.k == 1.0                              # back to 1 within four steps
+        ks.append(pace.k)
+    assert ks[0] == pytest.approx(0.375) and ks[4] == pytest.approx(0.375)   # under 1: once half a loop
+    assert 1.0 in ks and max(ks) <= la.K_MAX
+    first_above = ks.index(next(k for k in ks if k > 1.0))
+    assert first_above - ks.index(1.0) >= 300 / la.STEP_SECONDS               # above 1: once a loop
+    assert sorted(set(ks)) == sorted(set(ks), key=ks.index)                    # never down while idle
+
+
+def test_k_never_winds_up_past_k_max():
+    clock = Clock()
+    pace = la.MarketPace(clock)
+    pace.bind_audit(lambda: (1_000.0, 0.5))
+    for _ in range(400):
+        pace.report("job", q=1.0, remaining_tokens=1e9, deadline=None, supply=None, backlog_tokens=0,
+                    unmet_at=clock.now, lag_seconds=60.0)
+        pace.target("job")
+        clock.now += la.STEP_SECONDS
+    assert pace.k == la.K_MAX == 2.0
 
 
 def test_a_hotkey_that_does_not_take_its_slots_is_trimmed_to_what_it_holds_but_not_in_the_shadow():
