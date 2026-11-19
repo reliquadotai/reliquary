@@ -32,6 +32,7 @@ from reliquary.corpus.audit_policy import (
     AuditParams,
     MinerState,
     after_confirmed_failure,
+    after_operator_failure,
     after_pass,
     decision,
     drawn,
@@ -204,10 +205,26 @@ class CorpusAuditor:
                  scorer: Callable | None = None,
                  vocab_size: int | None = None,
                  arrivals_covered: Callable[[], float | None] | None = None,
-                 prefetch_rounds: bool = True, draw_job=None, slot_store=None) -> None:
+                 prefetch_rounds: bool = True, draw_job=None, slot_store=None,
+                 operator_of: Callable[[str], str | None] | None = None) -> None:
+        # A hotkey's chain operator (its registration's coldkey), None when unknown: the stake, the guards that
+        # keep it unpaid, and a failure's forfeit then span the operator's every hotkey (`_operator`).
+        self._operator_of = operator_of
+        # Each hotkey's operator as this process first resolved it, and each operator's hotkeys seen.
+        self._operators: dict[str, str] = {}
+        self._members: dict[str, set[str]] = {}
+        # Why each record this process audited was audited (`_audit_reason`), counted once its verdict lands,
+        # and the reason of each record decided "audit" and not judged yet.
+        self.audit_reasons: Counter = Counter()
+        self._audit_reason_of: dict[str, str] = {}
+        # The pending records this process found at its start (`_start`) until judged: a restart's backlog, not
+        # the leases' (`audit_backlog`).
+        self._restart_backlog: set[str] = set()
         # Fetch, in the background, every drand round the pending records need.
         self._prefetch = prefetch_rounds
         self._job_id = job_id
+        # Each hotkey's standing as its last pass read it (``_ahead_candidates``).
+        self._state_cache: dict[str, MinerState] = {}
         # A forced-draw job (``corpus.eval_draw``): its samples carry no proof; each is judged against its draw
         # alone, from the diagnostics whichever forward scores it computes (``corpus.draw_audit``).
         self._draw_job = draw_job
@@ -275,9 +292,9 @@ class CorpusAuditor:
         self._undrawn: set[str] = set()
         # Draws read from cached randomness for the backlog count (``_undrawn_by_cached_draw``).
         self._draw_known: dict[str, bool] = {}
-        # `stake_at_receipt`: per hotkey, sorted (receipt, pay, held, id) of what a later failure could forfeit
-        # (held: left unaudited and undrawn; else an audited pass); each record's stake as first counted; the
-        # records already in a hotkey's list.
+        # `stake_at_receipt`: per operator (`_operator`), sorted (receipt, pay, held, id) of what a later failure
+        # could forfeit (held: left unaudited and undrawn; else an audited pass); each record's stake as first
+        # counted; the records already in an operator's list.
         self._forfeitable_at: dict[str, list[tuple[float, float, bool, str]]] = {}
         self._stake: dict[str, float] = {}
         self._staked: set[str] = set()
@@ -322,6 +339,13 @@ class CorpusAuditor:
         # flight by id. Dropped once judged, or when the executor that scored them is quarantined.
         self._ahead: dict[str, dict] = {}
         self._ahead_flight: dict[str, asyncio.Future] = {}
+        # Ids a pass is auditing (its outcome taken from ahead, or scored now) until it returns: never sent ahead
+        # meanwhile. 2026-11-19: they were in no other set from the pass taking their outcome to their verdict's
+        # write, the oldest drawn records, so the loop sent each again: half the card's scores were thrown away,
+        # and the auction, sized on the card's scores, opened twice the leases its verdicts could take.
+        self._in_pass: set[str] = set()
+        # Outcomes scored ahead and thrown away (their record judged first): GPU work no verdict used.
+        self.ahead_wasted = 0
         # Rounds raced in the current judge_many: one race per round per pass,
         # never one per record whose draw lands on a failing round.
         self._raced: set[int] = set()
@@ -540,6 +564,10 @@ class CorpusAuditor:
         per_record = completions / records if records else 1.0
         return pending * self.audit_share() * per_record
 
+    def audit_decisions(self) -> int:
+        """How many verdicts ``audit_share`` stands on (since this process started)."""
+        return int(self._decided["audit"] + self._decided["pass_unaudited"])
+
     def audit_share(self) -> float:
         """The share of this job's records the GPU audits: its verdicts audited so far (probation and slow-hotkey
         audits included) against q as a prior, never below q."""
@@ -567,7 +595,9 @@ class CorpusAuditor:
         records received less than DRAW_WAIT_SECONDS ago: their draw round is not out yet, so they wait for the
         clock, not for the audit, and counting them would cap the job's flow at the backlog mark whatever its
         audit card could take. Nor are records known undrawn or already audited ahead: no GPU work is left in
-        them (2026-11-12: a backlog of 174 such records cut the budget while the card idled)."""
+        them (2026-11-12: a backlog of 174 such records cut the budget while the card idled). Nor the records
+        found pending at this process's start: no lease open now sent them, so fewer leases would not drain
+        them sooner (2026-11-19: 6k of them cut k from 1 to 0.25 after a restart, the card then waiting)."""
         now = self._clock()
         sampled = self._params.q < 1.0
         cutoff = now - DRAW_WAIT_SECONDS
@@ -576,7 +606,8 @@ class CorpusAuditor:
             if at > now:
                 continue
             # Known undrawn (paid or held at its hold's end), or already audited ahead: no GPU work left.
-            if submission_id in self._undrawn or submission_id in self._ahead:
+            if (submission_id in self._undrawn or submission_id in self._ahead
+                    or submission_id in getattr(self, "_restart_backlog", ())):
                 continue
             if sampled:
                 received = (self._meta[submission_id][1] if submission_id in self._meta
@@ -617,8 +648,11 @@ class CorpusAuditor:
         self._draw_known.pop(submission_id, None)
         self._stake.pop(submission_id, None)
         self._shortest.pop(submission_id, None)
-        self._ahead.pop(submission_id, None)
+        if self._ahead.pop(submission_id, None) is not None:
+            self.ahead_wasted = getattr(self, "ahead_wasted", 0) + 1
         self._read_for_shortest.discard(submission_id)
+        getattr(self, "_restart_backlog", set()).discard(submission_id)
+        getattr(self, "_audit_reason_of", {}).pop(submission_id, None)
         if submission_id in self._meta:
             self._unjudged.get(self._meta[submission_id][0], set()).discard(submission_id)
 
@@ -854,6 +888,8 @@ class CorpusAuditor:
         if terms:
             self._lease_terms[submission_id] = terms
         bisect.insort(self._arrivals.setdefault(meta["hotkey"], []), received_at)
+        # Its hotkey joins its operator's members now: a record read and never decided is still a sibling.
+        self._operator(meta["hotkey"])
         if submission_id not in self._judged:
             self._unjudged.setdefault(meta["hotkey"], set()).add(submission_id)
 
@@ -901,8 +937,29 @@ class CorpusAuditor:
         prompt = self._lease_terms.get(submission_id, {}).get("prompt_token_count", 0)
         return float(tokens) + self.stake_input_weight * float(prompt)
 
+    def _operator(self, hotkey: str) -> str:
+        """The operator a hotkey's records are staked, guarded and forfeited with: ``coldkey:<ss58>`` when
+        ``operator_of`` knows its coldkey, else ``hotkey:<ss58>`` (the hotkey alone). Fixed for this process at
+        first sight, so every structure keyed by it agrees; a later coldkey swap only takes effect at a restart,
+        whose stakes are counted afresh."""
+        if getattr(self, "_operators", None) is None:
+            self._operators, self._members = {}, {}
+        operator = self._operators.get(hotkey)
+        if operator is None:
+            coldkey = None
+            operator_of = getattr(self, "_operator_of", None)
+            if operator_of is not None:
+                try:
+                    coldkey = operator_of(hotkey)
+                except Exception:
+                    logger.warning("operator of %s unavailable; staked alone", hotkey[:12], exc_info=True)
+            operator = f"coldkey:{coldkey}" if isinstance(coldkey, str) and coldkey else f"hotkey:{hotkey}"
+            self._operators[hotkey] = operator
+            self._members.setdefault(operator, set()).add(hotkey)
+        return operator
+
     def _stake_of(self, submission_id: str, now: float) -> float:
-        """`stake_at_receipt`'s count for decision(), once per record: 1 + the pay of its hotkey's records
+        """`stake_at_receipt`'s count for decision(), once per record: 1 + the pay of its operator's records
         received in the hold before it, in its own settlement period, that a charged failure of it is sure to
         forfeit, over its own pay:
 
@@ -912,11 +969,16 @@ class CorpusAuditor:
           its verdict, which a failure writes after the forfeit.
 
         One period: its records are paid at one rate (a capped period scales them all alike). Cheating on it
-        then costs at least q · (that count) of its pay: at least its pay from 1/q on."""
+        then costs at least q · (that count) of its pay: at least its pay from 1/q on.
+
+        Its operator's, not its hotkey's: a confirmed failure forfeits the operator's every hotkey's unpaid work
+        up to it (`after_operator_failure`), and every guard that keeps a held record unpaid until the records
+        that may catch it are decided spans the operator (`_judge_once`). An operator splitting its hotkeys over
+        several coldkeys is staked per coldkey: what one hotkey alone is staked at worst."""
         stake = self._stake.get(submission_id)
         if stake is None:
             hotkey, received_at, _ = self._meta[submission_id]
-            entries = self._forfeitable_at.get(hotkey, [])
+            entries = self._forfeitable_at.get(self._operator(hotkey), [])
             # Older than any record still pending could need: dropped (a backlog past it only audits more).
             cut = bisect.bisect_left(entries, (now - self._params.hold_seconds - STAKE_KEEP_SECONDS,))
             for entry in entries[:cut]:
@@ -938,7 +1000,7 @@ class CorpusAuditor:
             return
         self._staked.add(submission_id)
         hotkey, received_at, _ = self._meta[submission_id]
-        bisect.insort(self._forfeitable_at.setdefault(hotkey, []),
+        bisect.insort(self._forfeitable_at.setdefault(self._operator(hotkey), []),
                       (received_at, self._pay(submission_id), held, submission_id))
 
     def _stake_applies(self, submission_id: str) -> bool:
@@ -1156,6 +1218,9 @@ class CorpusAuditor:
         """Create-only: the verdict that stands, and whether this call wrote it."""
         written = await self._records.write_verdict(self._job_id, submission_id, verdict)
         standing = verdict if written else await self._records.read_verdict(self._job_id, submission_id)
+        reasons = getattr(self, "audit_reasons", None)
+        if written and verdict.get("audited") and reasons is not None:
+            reasons[getattr(self, "_audit_reason_of", {}).get(submission_id, "other")] += 1
         self._mark_judged(submission_id)
         # Reopen before reporting: the status must not see the verdict while the ledger still counts it passing.
         if standing is not None and not standing.get("passed"):
@@ -1334,18 +1399,34 @@ class CorpusAuditor:
 
     def _ahead_candidates(self, limit: int) -> list[str]:
         """Pending records sure to be audited whatever their pass decides, oldest first: on a sampled job those
-        whose draw round is out (its randomness cached) and drawn; at q = 1, every one."""
+        of a hotkey its last pass found in probation or suspect, or too slow to be sampled (fewer than 1/q
+        submissions in a hold), and those whose draw round is out (its randomness cached) and drawn; at q = 1,
+        every one.
+
+        2026-11-18: only drawn records were sent ahead, while most audits of a 27B order were new hotkeys in
+        probation: they waited for their pass, and the audit card idled between passes (50-70 % busy)."""
         q = self._params.q
+        now = self._clock()
         found: list[tuple[float, str]] = []
         for sids in self._unjudged.values():
             for submission_id in sids:
                 if (submission_id in self._judged or submission_id in self._ahead
-                        or submission_id in self._ahead_flight or submission_id not in self._meta):
+                        or submission_id in self._ahead_flight or submission_id not in self._meta
+                        or submission_id in getattr(self, "_in_pass", ())):
                     continue
-                received_at = self._meta[submission_id][1]
+                hotkey, received_at, _ = self._meta[submission_id]
                 if q < 1.0:
+                    state = self._state_cache.get(hotkey)
+                    if state is not None:
+                        standing = effective_state(state, now, self._params)
+                        if standing == "banned":
+                            continue
+                        if standing in ("probation", "suspect") or (
+                                not self.stake_at_receipt and self._recent(hotkey, now) < 1.0 / q):
+                            found.append((received_at, submission_id))
+                            continue
                     if self._round_at is None:
-                        return []
+                        continue
                     try:
                         randomness = self._randomness.get(int(self._round_at(received_at)) + 1)
                         if randomness is None or not drawn(randomness, submission_id, q):
@@ -1363,7 +1444,13 @@ class CorpusAuditor:
                 return
             for sid, outcome in zip(ids, await self._audit_outcomes([records[sid] for sid in ids])):
                 # A validator-side error is left for the pass to meet itself.
-                if isinstance(outcome, dict) and sid not in self._judged:
+                if not isinstance(outcome, dict):
+                    continue
+                # A record its pass took while this batch flew is not wasted: that pass waits for this batch
+                # and takes the outcome (`_outcomes_ahead_or_now`).
+                if sid in self._judged:
+                    self.ahead_wasted = getattr(self, "ahead_wasted", 0) + 1
+                else:
                     self._ahead[sid] = outcome
         except Exception:
             logger.warning("corpus job %s: audit ahead of %d record(s) failed; their pass audits them",
@@ -1395,6 +1482,19 @@ class CorpusAuditor:
                              deferred: list | None = None) -> tuple[list[dict | None], set[str]]:
         """Audit, re-audit each failure alone, write the verdicts and move each
         hotkey's state. Returns the verdicts and the hotkeys with a confirmed failure."""
+        in_pass = getattr(self, "_in_pass", None)
+        if in_pass is None:
+            in_pass = self._in_pass = set()
+        mine = set(ids) - in_pass
+        in_pass |= mine
+        try:
+            return await self._audit_records_in_pass(ids, records, draws, deferred=deferred)
+        finally:
+            in_pass -= mine
+
+    async def _audit_records_in_pass(self, ids: list[str], records: list[dict],
+                                     draws: dict[str, dict], *,
+                                     deferred: list | None = None) -> tuple[list[dict | None], set[str]]:
         outcomes = await self._outcomes_ahead_or_now(ids, records)
         failing = [k for k, outcome in enumerate(outcomes)
                    if isinstance(outcome, dict) and not outcome["passed"]]
@@ -1497,7 +1597,8 @@ class CorpusAuditor:
     async def _escalate(self, failures: dict[str, list[str]], now: float,
                         received: Mapping[str, float] | None = None) -> dict[str, MinerState]:
         """Each hotkey's confirmed failures, in one write (miners.json is one key);
-        then its unpaid passes received up to them are voided (`forfeits`)."""
+        then its unpaid passes received up to them are voided (`forfeits`). The other hotkeys of its operator
+        (`_operator`) forfeit theirs too, and turn suspect (`after_operator_failure`): they made the stake."""
         if self._miner_states is None:
             return {}
         # At q = 1 every submission is audited, so no cheat is ever paid: nothing to forfeit.
@@ -1511,10 +1612,28 @@ class CorpusAuditor:
                 return m
             return change
 
-        states = await self._miner_states.update_many(
-            {hotkey: escalate(sids) for hotkey, sids in failures.items()})
+        changes = {hotkey: escalate(sids) for hotkey, sids in failures.items()}
+        if self._params.q < 1.0:
+            # Per operator, the latest receipt among its hotkeys' failures (None: no receipt known).
+            latest: dict[str, float | None] = {}
+            for hotkey, sids in failures.items():
+                operator = self._operator(hotkey)
+                times = [received[sid] for sid in sids if received.get(sid) is not None]
+                if latest.get(operator) is not None:
+                    times.append(latest[operator])
+                latest[operator] = max(times, default=None)
+            for operator, at in latest.items():
+                for member in self._members.get(operator, ()):
+                    if member not in failures:
+                        changes[member] = (lambda at: lambda m: after_operator_failure(
+                            m, self._params, now, at))(at)
+            siblings = sorted(set(changes) - set(failures))
+            if siblings:
+                logger.warning("corpus job %s: %d hotkey(s) of a failing operator forfeit and turn suspect: %s",
+                               self._job_id, len(siblings), ", ".join(h[:12] for h in siblings))
+        states = await self._miner_states.update_many(changes)
         # Before the failing verdicts are written: a stop in between re-audits them, which voids again.
-        await self._void_forfeited({hotkey: states[hotkey] for hotkey in failures
+        await self._void_forfeited({hotkey: states[hotkey] for hotkey in changes
                                     if states[hotkey].forfeit_before is not None}, now)
         return states
 
@@ -1744,12 +1863,34 @@ class CorpusAuditor:
         choice = decision(state, params=self._params, now=now, received_at=received_at,
                           recent_submissions=recent, randomness_hex=randomness,
                           submission_id=submission_id, slack_seconds=self._accept_slack)
+        reason = None
         if choice == "pass_unaudited" and self._short_draw(submission_id):
             # Never paid unaudited: its refusal is not charged, so only an audit stops a cheap short sample.
-            choice = "audit"
+            choice, reason = "audit", "short"
+        if choice == "audit" and getattr(self, "_audit_reason_of", None) is not None:
+            self._audit_reason_of[submission_id] = reason or self._audit_reason(
+                state, now, recent, randomness, draw, staked=self.stake_at_receipt and self._stake_applies(
+                    submission_id))
         if self.stake_at_receipt and choice in ("wait", "pass_unaudited"):
             self._count_forfeitable(submission_id, held=True)
         return choice, draw
+
+    def _audit_reason(self, state: MinerState, now: float, recent: float, randomness: str | None,
+                      draw: dict | None, *, staked: bool) -> str:
+        """Which rule of decision() audits a record: its hotkey's standing, a full audit (q = 1), the slow-hotkey
+        rule on its operator's stake or on its hotkey's arrivals, no randomness, or the draw."""
+        standing = effective_state(state, now, self._params)
+        if standing in ("probation", "suspect"):
+            return standing
+        if self._params.q >= 1.0:
+            return "full"
+        if staked and draw is None:
+            return "no_randomness"  # the stake is counted only once the draw is known
+        if recent < 1.0 / self._params.q:
+            return "slow_stake" if staked else "slow_arrivals"
+        if randomness is None or draw is None:
+            return "no_randomness"
+        return "drawn"
 
     def _short_draw(self, submission_id: str) -> bool:
         """Whether a forced-draw record holds a completion too short for its refusal to be charged."""
@@ -1773,10 +1914,14 @@ class CorpusAuditor:
             # Oldest first: a record's stake counts the earlier ones this pass leaves unaudited.
             known.sort(key=lambda sid: self._meta[sid][1])
         states = await self._states({self._meta[sid][0] for sid in known}, now)
+        # What the audit ahead reads to send a probation hotkey's records before their pass.
+        self._state_cache.update(states)
         await self._learn_shortest(known, states, now)
 
         audit_ids, draws, unaudited, voided = [], {}, [], []
-        # Per hotkey, arrival times of records whose draw round is not out yet.
+        # Per operator (`_operator`: the hotkey alone unless its coldkey is known), arrival times of records whose
+        # draw round is not out yet. Every guard below that keeps a record unpaid until the records that could
+        # catch it are decided spans its operator, as its stake does (`_stake_of`).
         undecided: dict[str, list[float]] = {}
         with self._timed("decide"):
             rounds_needed = await self._prefetch_rounds(known, now, states)
@@ -1794,7 +1939,7 @@ class CorpusAuditor:
             elif choice == "void_banned":
                 voided.append(submission_id)
             elif choice == "undecidable":
-                undecided.setdefault(hotkey, []).append(received_at)
+                undecided.setdefault(self._operator(hotkey), []).append(received_at)
                 self._next_due[submission_id] = self._retry_at(hotkey, now)
             elif choice == "wait":
                 self._next_due[submission_id] = self._wait_until(submission_id, now)
@@ -1819,10 +1964,12 @@ class CorpusAuditor:
             in_pass = set(known)
             # A sibling known undrawn decides "wait" or "pass_unaudited" here:
             # its hotkey's state and recent count are X's, its draw is fixed.
+            # Siblings are the operator's records, whichever of its hotkeys.
             candidates = {}
-            for hotkey in {self._meta[sid][0] for sid, _ in unaudited}:
-                candidates[hotkey] = sorted(
-                    (self._meta[sid][1], sid) for sid in self._unjudged.get(hotkey, ())
+            for operator in {self._operator(self._meta[sid][0]) for sid, _ in unaudited}:
+                candidates[operator] = sorted(
+                    (self._meta[sid][1], sid) for member in self._members.get(operator, ())
+                    for sid in self._unjudged.get(member, ())
                     if sid not in in_pass and sid not in self._undrawn)
             # The oldest payable records first, while their siblings fit the
             # pass; the others wait for the next passes (nothing is paid early).
@@ -1833,26 +1980,30 @@ class CorpusAuditor:
             kept, waiting = [], []
             for submission_id, draw in sorted(unaudited, key=lambda u: self._meta[u[0]][1]):
                 hotkey, received_at, _ = self._meta[submission_id]
-                until = max(hold_end.get(hotkey, 0.0), received_at + self._params.hold_seconds)
-                count = bisect.bisect_right(candidates[hotkey], (until, "\uffff"))
-                grown = sum(taken.values()) - taken.get(hotkey, 0) + count
+                operator = self._operator(hotkey)
+                until = max(hold_end.get(operator, 0.0), received_at + self._params.hold_seconds)
+                count = bisect.bisect_right(candidates[operator], (until, "\uffff"))
+                grown = sum(taken.values()) - taken.get(operator, 0) + count
                 if grown > PASS_SIBLINGS:
                     if not hold_end:
                         # Even the oldest does not fit: decide the first of its
                         # siblings now (their draws become known, the undrawn
                         # leave its set) and pay it in a later pass. Only what
                         # lies before the first sibling left out is decided.
-                        hold_end[hotkey], taken[hotkey] = until, PASS_SIBLINGS
-                        horizon[hotkey] = candidates[hotkey][PASS_SIBLINGS][0]
+                        hold_end[operator], taken[operator] = until, PASS_SIBLINGS
+                        horizon[operator] = candidates[operator][PASS_SIBLINGS][0]
                     waiting.append(submission_id)
                     continue
-                hold_end[hotkey], taken[hotkey] = until, count
+                hold_end[operator], taken[operator] = until, count
                 kept.append((submission_id, draw))
             for submission_id in waiting:
                 self._next_due[submission_id] = now
             unaudited = [u for u in unaudited if u in kept]
-            siblings = {hotkey: [sid for _, sid in candidates[hotkey][:taken[hotkey]]]
-                        for hotkey in hold_end}
+            siblings = {operator: [sid for _, sid in candidates[operator][:taken[operator]]]
+                        for operator in hold_end}
+            # A sibling of another hotkey of the operator is decided under its own hotkey's state.
+            states.update(await self._states(
+                {self._meta[sid][0] for sids in siblings.values() for sid in sids} - set(states), now))
             with self._timed("decide"):
                 rounds_needed += await self._prefetch_rounds(
                     [sid for sids in siblings.values() for sid in sids], now, states)
@@ -1862,22 +2013,22 @@ class CorpusAuditor:
                         self._pass_rounds[1], self._pass_rounds[0])
             await self._learn_shortest([sid for sids in siblings.values() for sid in sids], states, now)
             reused: list[tuple[str, dict | None]] = []
-            for hotkey, sids in siblings.items():
+            for operator, sids in siblings.items():
                 for sid in sids:
                     with self._timed("decide"):
-                        choice, draw = await self._decide(sid, now, states[hotkey])
+                        choice, draw = await self._decide(sid, now, states[self._meta[sid][0]])
                     self._choices["sibling_" + choice] += 1
                     if choice == "audit":
                         audit_ids.append(sid)
                         if draw is not None:
                             draws[sid] = draw
                     elif choice == "undecidable":
-                        undecided.setdefault(hotkey, []).append(self._meta[sid][1])
+                        undecided.setdefault(operator, []).append(self._meta[sid][1])
                     elif (choice == "pass_unaudited"
                           and (self._meta[sid][1] + self._params.hold_seconds
-                               < horizon[hotkey] if hotkey in horizon
+                               < horizon[operator] if operator in horizon
                                else self._meta[sid][1] + self._params.hold_seconds
-                               <= hold_end[hotkey])):
+                               <= hold_end[operator])):
                         # Payable, and every sibling that could catch it is
                         # decided in this pass too (its hold ends inside the
                         # window): paid here under the same guards, not decided
@@ -1887,15 +2038,16 @@ class CorpusAuditor:
             unaudited = unaudited + reused
 
         # The pass's budget: the oldest audits first, the rest in later passes.
-        # A hotkey with a deferred audit pays nothing unaudited this pass (the
+        # An operator with a deferred audit pays nothing unaudited this pass (the
         # deferred one may be the drawn sibling that would catch it).
         audit_ids, later = self._within_budget(audit_ids, set(submission_ids))
-        # Per hotkey, the oldest receipt among its deferred audits: a record
+        # Per operator, the oldest receipt among its deferred audits: a record
         # whose hold reaches it waits; an older one does not.
         deferred_from: dict[str, float] = {}
         for sid in later:
             hotkey, received_at, _ = self._meta[sid]
-            deferred_from[hotkey] = min(deferred_from.get(hotkey, math.inf), received_at)
+            operator = self._operator(hotkey)
+            deferred_from[operator] = min(deferred_from.get(operator, math.inf), received_at)
         for sid in later:
             self._next_due[sid] = now
             self._schedule(sid, now)
@@ -1908,7 +2060,7 @@ class CorpusAuditor:
             read.update(await self._read_all([sid for sid in audit_ids if sid not in read]))
             records = [read.get(sid) for sid in audit_ids]
             pairs = [(sid, r) for sid, r in zip(audit_ids, records) if r is not None]
-            errored = {self._meta[sid][0] for sid, r in zip(audit_ids, records) if r is None}
+            errored = {self._operator(self._meta[sid][0]) for sid, r in zip(audit_ids, records) if r is None}
         # Nothing the audit does reads the store: what is unreadable is known now.
         unreadable = bool(self._unreadable)
         if unaudited and unreadable:
@@ -1921,14 +2073,15 @@ class CorpusAuditor:
             after = self._covered()
             covered = None if covered is None or after is None else min(covered, after)
         uncovered = 0
-        audited_hotkeys = {self._meta[sid][0] for sid in audit_ids}
+        audited_operators = {self._operator(self._meta[sid][0]) for sid in audit_ids}
         early, late = [], []
         for submission_id, draw in unaudited:
             hotkey, received_at, token_count = self._meta[submission_id]
+            operator = self._operator(hotkey)
             # Wait while a sibling that could still catch this record is
             # undecided or hit a validator error this pass, or while any
             # pending record is unreadable (its hotkey could be this one).
-            if unreadable or hotkey in errored:
+            if unreadable or operator in errored:
                 continue  # judged again at the next rescan
             if not self._covers(covered, received_at):
                 # A sibling the front accepted may not have been handed over
@@ -1937,18 +2090,18 @@ class CorpusAuditor:
                 if covered is not None:
                     self._next_due[submission_id] = self._retry_at(hotkey, now)
                 continue
-            if deferred_from.get(hotkey, math.inf) <= received_at + self._params.hold_seconds or any(
+            if deferred_from.get(operator, math.inf) <= received_at + self._params.hold_seconds or any(
                     t <= received_at + self._params.hold_seconds
-                    for t in undecided.get(hotkey, ())):
+                    for t in undecided.get(operator, ())):
                 self._next_due[submission_id] = self._retry_at(hotkey, now)
                 continue
             paid = {"passed": True, "audited": False, "reason": None, **_WORST_ZERO}
             if forfeits(states[hotkey], received_at):
                 paid = dict(_FORFEITED)
             verdict = (submission_id, self._verdict(submission_id, hotkey, token_count, paid, draw))
-            # No record of this hotkey is audited in this pass, so no failure
+            # No record of this operator is audited in this pass, so no failure
             # or error of it can come from the audit: written alongside it.
-            (late if hotkey in audited_hotkeys else early).append(verdict)
+            (late if operator in audited_operators else early).append(verdict)
         if uncovered:
             logger.warning("corpus job %s: arrival feed covers up to %s; %d unaudited pass(es) "
                            "wait", self._job_id, "nothing" if covered is None
@@ -1964,14 +2117,17 @@ class CorpusAuditor:
                     results, failed = await self._audit_records(
                         [sid for sid, _ in pairs], [r for _, r in pairs], draws,
                         deferred=self._deferred)
-                errored |= {r["hotkey"] for (_, r), result in zip(pairs, results) if result is None}
+                errored |= {self._operator(r["hotkey"]) for (_, r), result in zip(pairs, results)
+                            if result is None}
         finally:
             landed = await alongside
+        failed_operators = {self._operator(hotkey) for hotkey in failed}
         # After the audits and escalations are durable, as before.
         landed += await self._write_all([
             (sid, verdict) for sid, verdict in late
-            # A failed hotkey is suspect now: the backward audit decides its records.
-            if verdict["hotkey"] not in failed and verdict["hotkey"] not in errored])
+            # A failed operator is suspect now: the backward audit decides its records.
+            if self._operator(verdict["hotkey"]) not in failed_operators
+            and self._operator(verdict["hotkey"]) not in errored])
         # Raised by judge_many once the backward audit of `failed` has run.
         self._deferred.extend(r for r in landed if isinstance(r, BaseException))
         return failed
@@ -2021,8 +2177,9 @@ class CorpusAuditor:
                 await self._read_all([sid for sid in pending if sid not in self._meta])
                 # Each held record once per pass: one whose verdict did not land (a write error) waits for
                 # the next pass, instead of being audited again here forever while the queue waits.
-                held = [sid for sid in pending if sid in self._meta and self._meta[sid][0] in failed
-                        and sid not in tried]
+                failed_operators = {self._operator(hotkey) for hotkey in failed}
+                held = [sid for sid in pending if sid in self._meta
+                        and self._operator(self._meta[sid][0]) in failed_operators and sid not in tried]
                 tried.update(held)
                 if not held:
                     break
@@ -2036,11 +2193,11 @@ class CorpusAuditor:
             logger.info(
                 "corpus judge pass: job=%s ids=%d total=%.1fs list=%.1fs read=%.1fs "
                 "state=%.1fs decide=%.1fs drand=%.1fs audit=%.1fs gpu_wait=%.1fs "
-                "forward=%.1fs write=%.1fs choices=%s",
+                "forward=%.1fs write=%.1fs choices=%s audit_reasons_total=%s ahead_wasted_total=%d",
                 self._job_id, len(submission_ids), time.monotonic() - start,
                 *(self._phase[p] for p in ("list", "read", "state", "decide", "drand", "audit",
                                            "gpu_wait", "forward", "write")),
-                dict(self._choices))
+                dict(self._choices), dict(getattr(self, "audit_reasons", {})), getattr(self, "ahead_wasted", 0))
             self._phase.clear()
             self._choices.clear()
 
@@ -2117,8 +2274,14 @@ class CorpusAuditor:
         now: the first passes then take them oldest first."""
         pending = await self.pending_ids()
         await self._seed(pending)
+        self._restart_backlog.update(pending)
+        # All due at one instant, so the heap takes them by arrival: each enqueue read its own clock, a few µs
+        # apart, and the first passes took them in listing (hash) order. A record decided before its operator's
+        # earlier records then found no stake and was audited (2026-11-19: 789 slow-stake audits after a restart).
+        now = self._clock()
         for submission_id in pending:
-            self.enqueue(submission_id, live=False)
+            if submission_id not in self._queued and submission_id not in self._judged:
+                self._schedule(submission_id, now)
 
     async def _next_batch(self) -> list[str]:
         """The due ids, at most RUN_BATCH_IDS, once at least one is due."""

@@ -174,7 +174,11 @@ def test_the_trainer_link_needs_its_token_and_round_trips(tmp_path):
     assert client.get("/rl/trainer/config").status_code == 401
     assert client.get("/rl/trainer/config", headers={"Authorization": "Bearer " + "x" * 32}).status_code == 401
     link = TrainerLink("http://127.0.0.1", TOKEN, client=client, patience_s=0.0)
-    assert link.config() == {"task_id": "rl-async", "run": "smoke", "targets": {ENV: 1.0}, "latest": None}
+    from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
+
+    # the profile this controller runs: a rented trainer pod gets no RELIQUARY_PROTOCOL_PROFILE and adopts it
+    assert link.config() == {"task_id": "rl-async", "run": "smoke", "targets": {ENV: 1.0}, "latest": None,
+                             "profile": {"profile_id": ACTIVE_PROTOCOL_PROFILE.profile_id, "contract": None}}
     link.adopt_checkpoint(0)
     assert link.latest_checkpoint == 0
     lease = rl.book.grant([LeaseRequest("A", ENV, (3,), 0)])[0].leases[0]
@@ -1095,3 +1099,16 @@ def test_every_trainer_call_is_a_beat_and_the_heartbeat_never_stops(tmp_path):
     beat.stop()
     beat._thread.join(timeout=5)
     assert not beat._thread.is_alive()
+
+
+def test_the_trainer_config_carries_the_task_contract_when_the_controller_runs_one(tmp_path, monkeypatch):
+    import json
+
+    from reliquary.validator.rl_async_service import trainer_task_profile
+
+    path = tmp_path / "contract.json"
+    path.write_text(json.dumps({"profile_id": "custom", "x": 1}))
+    monkeypatch.setenv("RELIQUARY_TASK_CONTRACT", str(path))
+    assert trainer_task_profile()["contract"] == {"profile_id": "custom", "x": 1}
+    monkeypatch.delenv("RELIQUARY_TASK_CONTRACT")
+    assert trainer_task_profile()["contract"] is None

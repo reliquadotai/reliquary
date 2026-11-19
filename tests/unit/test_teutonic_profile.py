@@ -129,7 +129,8 @@ def test_every_historical_profile_keeps_thinking_on() -> None:
     """The flag is new and optional. Nothing that existed before it declares
     it, so every earlier contract keeps its exact bytes."""
     # v10 is v9 with another forced draw: it carries v9's environments as they are.
-    later = {PROFILE.profile_id, "teutonic-9b-reliquary-suite-v10-gumbel-dev1", "qwen35-4b-reliquary-suite-v10-gumbel-dev1"}
+    later = {PROFILE.profile_id, "teutonic-9b-reliquary-suite-v10-gumbel-dev1", "qwen35-4b-reliquary-suite-v10-gumbel-dev1",
+             "qwen35-9b-reliquary-suite-v10-gumbel-dev1", "qwen38-27b-reliquary-suite-v10-gumbel-dev1"}
     for profile_id, profile in PROFILES.items():
         if profile_id in later:
             continue
