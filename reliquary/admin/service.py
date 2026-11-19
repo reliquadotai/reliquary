@@ -475,7 +475,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      model_facts=None, evaluation_sessions=None, pin_model=None,
                      upload_tokenizer=None, subnet_pool=None, tao_usd=None,
                      sandbox_machine_prefix: str | None = None, sandbox_machines=None,
-                     order_sessions=None, rl_spend_reader=None) -> FastAPI:
+                     order_sessions=None, training_runtime_store=None, rl_spend_reader=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
     ``eval_store`` the subnet bucket holding the eval sets' grading files; ``order_sessions``
@@ -485,7 +485,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     (async, USD per TAO) convert an order's USD token ceiling. ``sandbox_machine_prefix``
     turns on the sandbox machine routes for the machines named with it (the platform's rented
     gateways) and only those; ``sandbox_machines`` is the machine directory (``sandbox_store``).
-    ``rl_spend_reader(run)``: a training task's spend summary or None (default: ``rl_spend.read_spend``)."""
+    ``training_runtime_store`` or the private ``RELIQUARY_TRAINING_RUNTIME_ROOT`` supplies verified local
+    runtime observations and immutable final usage/checkpoint reads. Paid admission stays closed.
+    ``rl_spend_reader(run)`` returns a training task's spend summary or None (default: ``rl_spend.read_spend``)."""
     from reliquary.infrastructure import corpus_executor_store as executors
     from reliquary.infrastructure import corpus_job_store as job_store
     from reliquary.infrastructure import task_registry_store as registry_store
@@ -1556,8 +1558,23 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
     if training_enabled():
         from reliquary.admin.training import (
-            order_digest, training_entry, training_refusal, training_spend, training_task_id, training_view,
+            order_digest, training_capabilities, training_entry, training_refusal, training_spend,
+            training_task_id, training_view,
         )
+        from reliquary.rl_orders.finalize import TrainingRuntimeStore
+
+        runtime_root = os.environ.get("RELIQUARY_TRAINING_RUNTIME_ROOT", "").strip()
+        if training_runtime_store is None and runtime_root:
+            training_runtime_store = TrainingRuntimeStore(runtime_root)
+
+        async def training_answer(entry):
+            answer = {**training_view(entry), "final_usage": None}
+            if training_runtime_store is not None:
+                try:
+                    answer.update(await asyncio.to_thread(training_runtime_store.view, entry))
+                except (OSError, ValueError, RuntimeError) as exc:
+                    raise HTTPException(status_code=503, detail="training_runtime_unavailable") from exc
+            return answer
 
         async def training_task(task_id: str):
             in_scope(task_id)
@@ -1583,7 +1600,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 if (existing.params.get("training_order") or {}).get("order_sha256") != digest:
                     raise HTTPException(status_code=409, detail="training_id_reused")
                 response.status_code = 200
-                return {**training_view(existing), "created": False}
+                return {**(await training_answer(existing)), "created": False}
 
             if (answer := await replayed()) is not None:
                 return answer
@@ -1606,11 +1623,55 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 raise HTTPException(status_code=status, detail=str(exc)) from exc
             logger.info("admin: declared training %s as task %s", body.training_id, task_id)
             response.status_code = 201
-            return {**training_view(entry), "created": True}
+            return {**(await training_answer(entry)), "created": True}
+
+        @router.get("/training/capabilities")
+        async def training_service_capabilities() -> dict:
+            return training_capabilities()
 
         @router.get("/training/{task_id}")
         async def training_status(task_id: str) -> dict:
-            return training_view(await training_task(task_id))
+            return await training_answer(await training_task(task_id))
+
+        async def final_training(entry):
+            if training_runtime_store is None:
+                raise HTTPException(status_code=503, detail="training_checkpoint_unavailable")
+            try:
+                final = await asyncio.to_thread(training_runtime_store.final, entry)
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise HTTPException(status_code=503, detail="training_checkpoint_unavailable") from exc
+            if final is None:
+                raise HTTPException(status_code=404, detail="training_checkpoint_unknown")
+            return final
+
+        @router.get("/training/{task_id}/checkpoint")
+        async def training_checkpoint(task_id: str):
+            final = await final_training(await training_task(task_id))
+            return final["checkpoint"]
+
+        @router.get("/training/{task_id}/checkpoint/files/{artifact_id}")
+        async def training_checkpoint_file(task_id: str, artifact_id: str, request: Request):
+            from reliquary.rl_orders.checkpoint_delivery import CheckpointRangeError
+
+            await final_training(await training_task(task_id))
+            if re.fullmatch(r"[0-9a-f]{64}", artifact_id) is None:
+                raise HTTPException(status_code=404, detail="training_checkpoint_file_unknown")
+            try:
+                item = await asyncio.to_thread(training_runtime_store.checkpoints.open_range,
+                                                task_id, artifact_id, request.headers.get("range"))
+            except CheckpointRangeError as exc:
+                raise HTTPException(status_code=416, detail="training_checkpoint_range_invalid") from exc
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=404, detail="training_checkpoint_file_unknown") from exc
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise HTTPException(status_code=503, detail="training_checkpoint_file_unavailable") from exc
+            headers = {"Cache-Control": "private, no-store", "Accept-Ranges": "bytes",
+                       "Content-Length": str(len(item.data)), "X-Content-SHA256": item.sha256,
+                       "Content-Disposition": f'attachment; filename="{artifact_id}.bin"'}
+            if item.partial:
+                headers["Content-Range"] = f"bytes {item.start}-{item.end}/{item.total}"
+            return Response(content=item.data, status_code=206 if item.partial else 200,
+                            media_type=item.artifact["content_type"], headers=headers)
 
         @router.get("/training/{task_id}/spend")
         async def training_spend_route(task_id: str) -> dict:
@@ -1656,7 +1717,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             except Exception as exc:
                 logger.warning("admin: the trainer pods of %s were not all revoked: %r", task_id, exc)
                 raise HTTPException(status_code=503, detail="trainer_pods_not_revoked") from exc
-            return training_view(await training_task(task_id))
+            return await training_answer(await training_task(task_id))
 
         async def revoke_trainer_pods(task_id: str) -> None:
             """A retired order's pods lose the trainer link (each retire call retries what is left)."""
@@ -1738,12 +1799,16 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     @router.post("/executors")
     async def register_executor(body: RegisterExecutor, response: Response) -> dict:
         if body.scope == "trainer":
+            from reliquary.rl_orders.runtime import requires_owned_training_runtime
+
             if body.task_id is None:
                 raise HTTPException(status_code=422, detail="a trainer executor needs its task_id")
             entries, _ = await registry_store.read_registry(strict=False)
             entry = entries.get(body.task_id)
             if entry is None or "training_order" not in entry.params:
                 raise HTTPException(status_code=422, detail="training_unknown")
+            if requires_owned_training_runtime(entry.params["training_order"]):
+                raise HTTPException(status_code=409, detail="training_requires_owned_runtime")
         try:
             document, created = await executors.register_executor(
                 executor_id=body.executor_id, token_sha256=body.token_sha256,

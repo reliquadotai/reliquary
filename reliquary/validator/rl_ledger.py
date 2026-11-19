@@ -134,6 +134,24 @@ class RlPayLedger:
         self.settled_through: int | None = None   # the last period the latest settle closed (memory only)
         with book.lock:
             book.db.executescript(_SCHEMA)
+            columns = {row[1] for row in book.db.execute("PRAGMA table_info(rl_accruals)")}
+            if "budget_tokens" not in columns:
+                book.db.execute("ALTER TABLE rl_accruals ADD COLUMN budget_tokens REAL")
+            # Old first scans lost their gross value to penalties: unknown usage must not reopen a budget.
+            book.db.execute("UPDATE rl_accruals SET budget_tokens=matched_tokens WHERE kind=? AND budget_tokens IS NULL",
+                            (TRAINED,))
+            book.db.executescript("""
+                CREATE TRIGGER IF NOT EXISTS rl_accrual_usage_immutable BEFORE UPDATE ON rl_accruals
+                WHEN NEW.seq IS NOT OLD.seq OR NEW.lease_id IS NOT OLD.lease_id OR
+                    NEW.hotkey IS NOT OLD.hotkey OR NEW.environment IS NOT OLD.environment OR
+                    NEW.kind IS NOT OLD.kind OR NEW.at IS NOT OLD.at OR NEW.matched_tokens IS NOT OLD.matched_tokens OR
+                    NEW.token_price IS NOT OLD.token_price OR
+                    (NEW.budget_tokens IS NOT OLD.budget_tokens AND NOT
+                        (OLD.budget_tokens IS NULL AND OLD.kind='trained' AND NEW.budget_tokens IS OLD.matched_tokens))
+                BEGIN SELECT RAISE(ABORT,'rl_gross_usage_immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS rl_accrual_usage_no_delete BEFORE DELETE ON rl_accruals
+                BEGIN SELECT RAISE(ABORT,'rl_gross_usage_immutable'); END;
+            """)
             book.db.execute("INSERT OR IGNORE INTO rl_pay_cursor(id, seq) VALUES(0, 0)")
             book.db.commit()
 
@@ -182,6 +200,7 @@ class RlPayLedger:
                 if kind == TRAINED:
                     environment = detail["environment"]
                     tokens = paid_tokens(detail, self.config.floor)
+                    budget_tokens = float(tokens)
                     price = self._price(event["lease_id"], environment)
                     amount = tokens * price
                 elif kind == FIRST_SCAN:
@@ -190,7 +209,9 @@ class RlPayLedger:
                     environment = row[0]
                     tokens = 0
                     price = self._price(event["lease_id"], environment)
-                    amount = float(detail["fraction"]) * price * self._reference_tokens(environment)
+                    reference = self._reference_tokens(environment)
+                    budget_tokens = float(detail["fraction"]) * reference
+                    amount = float(detail["fraction"]) * price * reference
                 else:
                     continue                      # untrained, first_scan_forfeited: no money
                 status = FORFEITED if self._banned(hotkey, at) else ACCRUED
@@ -200,9 +221,9 @@ class RlPayLedger:
                     # An undelivered lease's charge is taken back from the hotkey's next pay on the env.
                     amount -= self.auctions.take_debit(environment, hotkey, amount)
                 db.execute("INSERT INTO rl_accruals(seq, lease_id, hotkey, environment, kind, at, period, "
-                           "matched_tokens, token_price, amount, status) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                           "matched_tokens, token_price, amount, status, budget_tokens) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                            (event["seq"], event["lease_id"], hotkey, environment, kind, at, self._open_period(at),
-                            tokens, price, amount, status))
+                            tokens, price, amount, status, budget_tokens))
             db.execute("UPDATE rl_pay_cursor SET seq=? WHERE id=0", (events[-1]["seq"],))
         return len(events)
 
@@ -313,7 +334,9 @@ class RlPayLedger:
         if row is not None:
             return float(row[0])
         reason = self.auctions.stopped()
-        if reason is None:
+        # An admission pause, a stale registry read or pending ledger ingestion can clear.
+        # Only an order limit or retirement ends the interval for the ledger.
+        if reason not in ("retired", "deadline", "max_steps", "max_tokens"):
             return None
         now = float(self.clock()) if now is None else now
         at = min(now, float(self.auctions.limits["deadline_at"])) if reason == "deadline" else now

@@ -20,6 +20,8 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from reliquary.rl_orders.runtime import requires_owned_training_runtime
+
 logger = logging.getLogger(__name__)
 
 TICK_S = 15.0
@@ -135,6 +137,7 @@ class Supervisor:
     def _start_missing(self, entries: Mapping[str, Any], now: float) -> None:
         for task_id, entry in sorted(entries.items()):
             if (entry.status not in ("active", "retired") or TRAINING_PARAM not in entry.params
+                    or requires_owned_training_runtime(entry.params[TRAINING_PARAM])
                     or task_id in self._running or task_id in self._stopping
                     or self._restart_at.get(task_id, 0.0) > now):
                 continue

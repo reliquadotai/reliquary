@@ -119,9 +119,25 @@ resolved in.
 ### 3.9 A training order's limits
 
 A task created from a training order (`training_order` param: `deadline_at`, `max_steps`, `max_tokens`) stops
-leasing once one is reached: the deadline passes, the latest checkpoint reaches `max_steps`, or the accrued pay
-covers `max_tokens` matched tokens (a first scan counted at its share of a trained group). Every env's budget is
-then 0. The leases already out may still deliver, so the overrun is at most the budget at the stop.
+leasing once one is reached: the deadline passes, the latest checkpoint reaches `max_steps`, or gross consumed
+work reaches `max_tokens` matched tokens (a first scan counted at its reference share of a trained group).
+Penalties and forfeitures do not restore consumed work. The ledger retains this gross counter independently of
+miner pay; an upgraded historical first scan without that counter closes token-budget admission rather than
+guessing its usage. Pending unconsumed ledger events temporarily fence new leases. Reached limits are durable
+across restarts and clock rollback. Every env's budget is then 0. Already issued leases and buffered groups may
+still deliver and train; this admission limit is not a frozen final usage or trainer shutdown receipt.
+
+An operator-started training controller refreshes the strict registry every five seconds with a ten-second read
+timeout. New grants require a matching active entry observed within fifteen monotonic seconds. Failed or stale
+reads close admission and recover only on a fresh matching active entry. Retirement, a missing task, or a changed task
+identity permanently fences that runtime in its local journal. Existing leases can still submit and drain.
+
+`GET /admin/v1/training/capabilities` uses the normal admin signature and is absent when training routes are
+disabled. Its `reliquary/training-capabilities/v1` response advertises task declaration but keeps
+`runtime_orchestration`, `final_usage`, `checkpoint_delivery`, and `paid_admission` false. Every training view
+reports `runtime: {state: "unknown", managed: false}`: registry state is not runtime proof. Paid admission must
+remain closed until a managed controller/trainer lifecycle, frozen reconciled usage, and owned checkpoint delivery
+are implemented and qualified. Registry retirement alone authorizes neither a customer charge nor a refund.
 
 ### 3.10 Switch
 
@@ -146,7 +162,9 @@ lease book has no quota, no global pending cap and no lanes: the budget is the b
    deadline_seconds, max_tokens?}, max_price_usd_per_mtoken, batch_groups, lag_target, cap?}` declares
    `order-train-<id>`, an `rl-discovered-price` async task (the async controller reads `env_split` and `rl_*`;
    nothing async consumes a service contract yet); `GET /admin/v1/training/{task}` and `POST .../retire`. The
-   profile must draw by Gumbel-max. The controller and the trainer are still started by an operator per task.
+   profile must draw by Gumbel-max. The [managed local runtime](../managed-training-runtime.md) now starts and
+   drains an operator-allocated controller/trainer pair and publishes verified usage and owned checkpoint
+   delivery. Its paid admission remains disabled pending real qualification and approval of the draft terms.
 3. A training run on rented GPUs: a small model, our own miners on the rented box, two single-turn envs and one
    episode env, to check the budget keeps the trainer fed without groups dying of lag and the trainer never waits for long.
 4. Public environments in the catalog with `rl` rows.

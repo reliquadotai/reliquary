@@ -10,19 +10,43 @@ import uvicorn
 
 
 @pytest.mark.parametrize("health_status, expected_http", [("ok", 200), ("critical", 503)])
+@pytest.mark.parametrize("training_order", [False, True])
 def test_async_serving_refreshes_readiness_and_awaits_monitor_shutdown(
-    monkeypatch, tmp_path, health_status, expected_http,
+    monkeypatch, tmp_path, health_status, expected_http, training_order,
 ):
     from reliquary.infrastructure import corpus_period_store
     from reliquary.validator import corpus_settlement, rl_async_service, server as server_module, telemetry
+    from reliquary.validator import rl_training_orders
 
     closed, servers, monitors, collected = [], [], [], []
     real_server = server_module.ValidatorServer
     settings = SimpleNamespace(task_id="async-test", run="test", targets={"math": 1.0},
                                episodes={}, max_pending_groups=1, lane_reserves=dict)
-    rl = SimpleNamespace(sandbox=None, book=SimpleNamespace(latest_checkpoint=None),
+    rl = SimpleNamespace(sandbox=None, public_put=object(), book=SimpleNamespace(latest_checkpoint=None, auctions=SimpleNamespace()),
                          submissions=SimpleNamespace(grader=SimpleNamespace()),
                          close=lambda: closed.append("rl"))
+    entry = SimpleNamespace(status="active", params={"training_order": {}} if training_order else {})
+    gates = []
+
+    class TrainingAdmission:
+        def __init__(self, actual_entry, book, *, load):
+            assert actual_entry is entry and book is rl.book and callable(load)
+            self.refreshed = self.started = self.stopped = False
+            gates.append(self)
+
+        def reason(self):
+            return None
+
+        async def refresh(self):
+            self.refreshed = True
+            return True
+
+        async def refresh_forever(self):
+            self.started = True
+            try:
+                await asyncio.Future()
+            finally:
+                self.stopped = True
 
     async def close_publisher():
         closed.append("publisher")
@@ -67,6 +91,7 @@ def test_async_serving_refreshes_readiness_and_awaits_monitor_shutdown(
     monkeypatch.setattr(rl_async_service, "audit_source", lambda: None)
     monkeypatch.setattr(rl_async_service, "mount_rl_async", lambda *a, **kw: None)
     monkeypatch.setattr(rl_async_service, "rl_async_loops", lambda *a, **kw: [])
+    monkeypatch.setattr(rl_training_orders, "TrainingAdmission", TrainingAdmission)
     monkeypatch.setattr(corpus_period_store, "R2PeriodArchives", lambda **kw: object())
     monkeypatch.setattr(corpus_settlement, "R2Archives", lambda **kw: object())
     monkeypatch.setattr(telemetry, "init", lambda *a, **kw: None)
@@ -79,7 +104,7 @@ def test_async_serving_refreshes_readiness_and_awaits_monitor_shutdown(
         await rl_async_service.run_rl_async_validator(
             wallet=SimpleNamespace(hotkey=SimpleNamespace(ss58_address="test-hotkey")),
             netuid=1, signer_client=None, http_host="127.0.0.1", http_port=8000,
-            entry=object(), cap=0.1, checkpoint="test-checkpoint", registration_gate=False,
+            entry=entry, cap=0.1, checkpoint="test-checkpoint", registration_gate=False,
         )
         assert len(monitors) == 1 and monitors[0].done()
         assert asyncio.all_tasks() == {asyncio.current_task()}
@@ -88,3 +113,22 @@ def test_async_serving_refreshes_readiness_and_awaits_monitor_shutdown(
     assert collected == [health_status]
     assert closed == ["publisher", "rl", "telemetry"]
     assert servers[0]._task is None                       # no legacy HTTP/admission startup
+    assert len(gates) == int(training_order)
+    if training_order:
+        assert gates[0].refreshed and gates[0].started and gates[0].stopped
+        assert rl.book.auctions.admission == gates[0].reason
+
+
+@pytest.mark.parametrize("pins", [{}, {"RELIQUARY_RL_RUNTIME_ID": "c" * 32}, {"RELIQUARY_RL_ORDER_SHA256": "d" * 64}])
+def test_quote_bound_orders_require_the_local_supervisor_before_opening_state(monkeypatch, pins):
+    from reliquary.validator import rl_async_service
+
+    for key in ("RELIQUARY_RL_RUNTIME_ID", "RELIQUARY_RL_ORDER_SHA256"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in pins.items():
+        monkeypatch.setenv(key, value)
+    entry = SimpleNamespace(params={"training_order": {"quote_id": "q1"}})
+    monkeypatch.setattr(rl_async_service, "rl_async_settings", lambda *_: pytest.fail("validator startup"))
+    with pytest.raises(ValueError, match="requires its supervised local runtime"):
+        asyncio.run(rl_async_service.run_rl_async_validator(wallet=None, netuid=1, signer_client=None,
+                    http_host="127.0.0.1", http_port=8000, entry=entry, cap=.1, checkpoint="local"))

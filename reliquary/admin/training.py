@@ -5,8 +5,10 @@ their shares, the trainer's batch, its limits and a price ceiling. The admin ser
 priced by the RL auction (docs/design/2026-11-16-rl-auction.md): one market per env, leases kept ``lag_target``
 checkpoints ahead of the trainer.
 
-Off unless ``RELIQUARY_TRAINING_ORDERS=on``: the routes are not served, and a request answers 404. The controller
-and the trainer are still started by an operator for each task (one controller per container).
+Off unless ``RELIQUARY_TRAINING_ORDERS=on``: the routes are not served, and a request answers 404. An optional
+operator-run local supervisor starts and drains a controller/trainer pair on explicitly allocated resources.
+The signed capabilities route still refuses paid admission pending real runtime qualification; a declaration
+or registry retirement proves neither runtime execution nor final usage nor a delivered checkpoint.
 
 The task is an ``rl-discovered-price`` async task, not a ``service-rl`` one: the async controller reads its
 ``env_split`` and ``rl_*`` params, and nothing async consumes a service contract yet.
@@ -15,7 +17,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -31,6 +33,14 @@ MAX_ENVIRONMENTS = 16
 DEFAULT_PLANNED_TOKENS_PER_PERIOD = 2e8
 # The limits the order carries: the RL auction leases nothing once one is reached (``rl_auction.RlAuctions.stopped``).
 TRAINING_PARAM = "training_order"
+BILLING_BASIS = "matched_token_ceiling_and_trainer_time_v1"
+
+
+def training_capabilities() -> dict:
+    """Declaration is available; it does not establish a managed, billable training service."""
+    return {"schema": "reliquary/training-capabilities/v1", "task_declaration": True,
+            "runtime_orchestration": False, "final_usage": False, "checkpoint_delivery": False,
+            "paid_admission": False}
 
 
 def training_enabled(env: Mapping[str, str] | None = None) -> bool:
@@ -65,6 +75,9 @@ class CreateTraining(BaseModel):
     batch_groups: int = Field(default=DEFAULT_BATCH_GROUPS, ge=1, le=MAX_BATCH_GROUPS)
     lag_target: int = Field(default=2, ge=1, le=16)
     cap: float | None = Field(default=None, gt=0, le=1)
+    quote_id: str | None = Field(default=None, min_length=1, max_length=80, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9-]*$")
+    quote_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    billing_basis: Literal["matched_token_ceiling_and_trainer_time_v1"] | None = None
 
     @model_validator(mode="after")
     def _shares(self) -> CreateTraining:
@@ -73,6 +86,9 @@ class CreateTraining(BaseModel):
             raise ValueError("an environment is named twice")
         if sum(e.share_bps for e in self.environments) != 10000:
             raise ValueError("environment shares must sum to 10000 bps")
+        bound = (self.quote_id, self.quote_sha256, self.billing_basis)
+        if any(value is not None for value in bound) and any(value is None for value in bound):
+            raise ValueError("quote_id, quote_sha256 and billing_basis must be supplied together")
         return self
 
 
@@ -100,7 +116,11 @@ def order_digest(body: CreateTraining) -> str:
     """The order as the platform sent it: a replay under the same id must carry the same order."""
     from reliquary.protocol.release_contract import canonical_sha256
 
-    return canonical_sha256(body.model_dump(mode="json"))
+    document = body.model_dump(mode="json")
+    for key in ("quote_id", "quote_sha256", "billing_basis"):
+        if document[key] is None:
+            document.pop(key)  # Existing declarations retain their original replay digest.
+    return canonical_sha256(document)
 
 
 def training_task_id(body: CreateTraining, task_prefix: str) -> str:
@@ -140,6 +160,8 @@ def training_entry(body: CreateTraining, *, task_prefix: str, price_params: Mapp
              "usd_per_alpha": float(price_params[MAX_PRICE_ALPHA_USD_PARAM])}
     if body.limits.max_tokens is not None:
         order["max_tokens"] = body.limits.max_tokens
+    if body.quote_id is not None:
+        order.update(quote_id=body.quote_id, quote_sha256=body.quote_sha256, billing_basis=body.billing_basis)
     return replace(entry, params={**entry.params, **price_params, PRICING_PARAM: PRICING_AUCTION,
                                   LAG_TARGET_PARAM: body.lag_target, BATCH_GROUPS_PARAM: body.batch_groups,
                                   TRAINING_PARAM: order})
@@ -175,8 +197,8 @@ def training_view(entry) -> dict:
             "cap": float(params.get("cap", 0.0)), "retired_at": entry.retired_at,
             "environments": {k: v for k, v in (entry.env_split or {}).items() if v > 0},
             "batch_groups": params.get("rl_batch_groups"), "lag_target": params.get("rl_auction_lag_target"),
-            "order": params.get(TRAINING_PARAM)}
+            "order": params.get(TRAINING_PARAM), "runtime": {"state": "unknown", "managed": False}}
 
 
 __all__ = ["CreateTraining", "TRAINING_ORDERS_ENV", "order_digest", "training_enabled", "training_entry", "training_refusal",
-           "training_spend", "training_task_id", "training_view"]
+           "training_capabilities", "training_spend", "training_task_id", "training_view"]

@@ -31,8 +31,11 @@ def _rl(tmp_path, *, cap=0.5, fill=False, **limits):
 def _accrue(rl, seq, *, price, tokens, amount=None, kind="trained", env=ENV, hotkey="A", status="accrued",
             at=NOW):
     amount = tokens * price if amount is None else amount
-    rl.book.db.execute("INSERT INTO rl_accruals VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                       (seq, f"l{seq}", hotkey, env, kind, at, cp.period_of(at), tokens, price, amount, status))
+    gross_tokens = tokens if kind == "trained" else amount / price
+    rl.book.db.execute("INSERT INTO rl_accruals(seq, lease_id, hotkey, environment, kind, at, period, matched_tokens, "
+                       "token_price, amount, status, budget_tokens) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                       (seq, f"l{seq}", hotkey, env, kind, at, cp.period_of(at), tokens, price, amount, status,
+                        gross_tokens))
     rl.book.db.commit()
 
 
@@ -216,6 +219,22 @@ def test_outage_fill_stops_at_the_orders_stop(tmp_path):
     later = cp.period_end(PERIOD + 3) + 3600.0                                    # the trainer never came back
     clock.t = later
     assert ledger.settle(now=later) == []                                         # no fill after the stop
+
+
+@pytest.mark.parametrize("fence", ["registry_paused", "registry_unavailable", "ledger_pending", "trainer_starting"])
+def test_an_admission_fence_does_not_finalize_an_order_stop(tmp_path, fence):
+    rl, clock = _rl(tmp_path, deadline_at=NOW + 100)
+    auctions = rl.book.auctions
+    auctions.admission = lambda: fence
+    assert auctions.budget(ENV) == 0
+    assert rl.ledger.stopped_at() is None
+    assert rl.book.db.execute("SELECT at FROM rl_order_stop").fetchone() is None
+    auctions.admission = None
+    assert auctions.budget(ENV) > 0
+    auctions.admission = lambda: fence
+    clock.t = NOW + 110
+    assert rl.ledger.stopped_at() == NOW + 100
+    rl.book.close()
 
 
 def test_a_retired_order_stops_leasing(tmp_path):

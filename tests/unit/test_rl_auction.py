@@ -175,6 +175,9 @@ def test_a_trained_group_is_paid_its_leases_price_less_the_holders_charge(paid_b
     assert (tokens, price) == (GROUP_TOKENS, pytest.approx(0.5e-6))
     assert amount == pytest.approx(max(0.0, GROUP_TOKENS * 0.5e-6 - owed))
     assert auctions.auction(ENV).debt_alpha("A") == pytest.approx(max(0.0, owed - GROUP_TOKENS * 0.5e-6))
+    assert auctions.paid_tokens() == GROUP_TOKENS          # debt does not buy extra customer work
+    book.db.execute("UPDATE rl_accruals SET status='forfeited'")
+    assert auctions.paid_tokens() == GROUP_TOKENS
 
 
 # --- declaration ------------------------------------------------------------------------------------------------
@@ -352,14 +355,68 @@ def test_an_order_at_its_last_step_leases_nothing(tmp_path):
 def test_an_order_that_paid_its_tokens_leases_nothing(tmp_path):
     book, auctions, clock = _limited(tmp_path, max_tokens=2 * GROUP_TOKENS)
     RlPayLedger(book, service(book, probation_groups=0), None, LedgerConfig(task_id="rl-test", cap=0.5), clock=clock)
-    row = "INSERT INTO rl_accruals VALUES(?, 'l', 'A', ?, ?, ?, 0, ?, ?, ?, ?)"
-    book.db.execute(row, (1, ENV, "trained", NOW, GROUP_TOKENS, 1e-6, GROUP_TOKENS * 1e-6, "accrued"))
-    book.db.execute(row, (2, ENV, "first_scan", NOW, 0, 1e-6, 0.25 * GROUP_TOKENS * 1e-6, "accrued"))
+    row = "INSERT INTO rl_accruals VALUES(?, 'l', 'A', ?, ?, ?, 0, ?, ?, ?, ?, ?)"
+    book.db.execute(row, (1, ENV, "trained", NOW, GROUP_TOKENS, 1e-6, GROUP_TOKENS * 1e-6, "accrued", GROUP_TOKENS))
+    book.db.execute(row, (2, ENV, "first_scan", NOW, 0, 1e-6, 0.25 * GROUP_TOKENS * 1e-6, "accrued", .25 * GROUP_TOKENS))
     assert auctions.paid_tokens() == pytest.approx(1.25 * GROUP_TOKENS) and auctions.budget(ENV) > 0
-    book.db.execute(row, (3, ENV, "trained", NOW, GROUP_TOKENS, 1e-6, GROUP_TOKENS * 1e-6, "forfeited"))
-    assert auctions.budget(ENV) > 0                                           # a forfeited accrual is not paid
-    book.db.execute(row, (4, ENV, "trained", NOW, GROUP_TOKENS, 1e-6, GROUP_TOKENS * 1e-6, "accrued"))
+    book.db.execute(row, (3, ENV, "trained", NOW, GROUP_TOKENS, 1e-6, GROUP_TOKENS * 1e-6, "forfeited", GROUP_TOKENS))
+    book.db.commit()
     assert auctions.budget(ENV) == 0 and auctions.stopped() == "max_tokens"
+    book.close()
+
+
+def test_a_first_scan_counts_gross_usage_even_when_its_entire_payment_repays_debt(paid_book):
+    book, auctions, clock = paid_book
+    subs = service(book, probation_groups=0)
+    ledger = RlPayLedger(book, subs, None, LedgerConfig(task_id="rl-test", cap=0.5), clock=clock)
+    auctions.post_ask(ENV, "A", .5, 8)
+    missed = book.grant([ask("A", [1])])[0].leases[0]
+    clock.t += 601
+    book.expire_due()
+    held = book.grant([ask("A", [2])])[0].leases[0]
+    assert held.lease_id != missed.lease_id
+    subs.submit(held.lease_id, "A", group(16))
+    ledger.ingest()
+    amount, tokens = book.db.execute("SELECT amount,budget_tokens FROM rl_accruals").fetchone()
+    assert amount == 0 and tokens == .25 * ledger.config.default_group_tokens
+    assert auctions.paid_tokens() == tokens
+
+
+def test_an_old_first_scan_without_gross_usage_cannot_reopen_a_token_budget(tmp_path):
+    book, auctions, clock = _limited(tmp_path, max_tokens=1_000_000)
+    RlPayLedger(book, service(book, probation_groups=0), None, LedgerConfig(task_id="rl-test", cap=.5), clock=clock)
+    book.db.execute("INSERT INTO rl_accruals(seq,lease_id,hotkey,environment,kind,at,period,matched_tokens,"
+                    "token_price,amount,status) VALUES(1,'l','A',?,'first_scan',?,0,0,1e-6,0,'accrued')", (ENV, NOW))
+    book.db.commit()
+    assert auctions.stopped() == "max_tokens" and auctions.budget(ENV) == 0
+    book.close()
+
+
+def test_ledger_upgrade_preserves_old_trained_work_without_guessing_first_scan_usage(tmp_path):
+    book, auctions, clock = _limited(tmp_path, max_tokens=1_000_000)
+    subs = service(book, probation_groups=0)
+    config = LedgerConfig(task_id="rl-test", cap=.5)
+    RlPayLedger(book, subs, None, config, clock=clock)
+    with book.transaction():
+        book.db.execute("DROP TRIGGER rl_accrual_usage_immutable")
+        book.db.execute("ALTER TABLE rl_accruals DROP COLUMN budget_tokens")
+        book.db.execute("INSERT INTO rl_accruals VALUES(1,'l1','A',?,'trained',?,0,123,1e-6,0,'forfeited')", (ENV, NOW))
+        book.db.execute("INSERT INTO rl_accruals VALUES(2,'l2','A',?,'first_scan',?,0,0,1e-6,0,'accrued')", (ENV, NOW))
+    RlPayLedger(book, subs, None, config, clock=clock)
+    assert book.db.execute("SELECT budget_tokens FROM rl_accruals ORDER BY seq").fetchall() == [(123.0,), (None,)]
+    assert auctions.stopped() == "max_tokens"
+    book.close()
+
+
+def test_a_reached_deadline_remains_stopped_after_clock_rollback_and_restart(tmp_path):
+    book, auctions, clock = _limited(tmp_path, deadline_at=NOW + 10)
+    clock.t = NOW + 10
+    assert auctions.stopped() == "deadline"
+    clock.t = NOW
+    assert auctions.stopped() == "deadline"
+    book.close()
+    book, auctions, _ = _limited(tmp_path, deadline_at=NOW + 10)
+    assert auctions.stopped() == "deadline"
     book.close()
 
 
@@ -370,3 +427,43 @@ def test_a_training_order_task_carries_its_limits_to_the_auction():
               "training_order": {"training_id": "t", "max_steps": 5, "deadline_at": NOW + 60, "max_tokens": 9}}
     auctions = RlAuctions.from_params(params, {ENV: 1.0}, batch_groups=4, task_id="rl-lim", clock=lambda: NOW)
     assert auctions.limits == {"max_steps": 5, "deadline_at": NOW + 60, "max_tokens": 9}
+
+
+def test_real_service_settings_preserve_and_enforce_the_training_order_limits(tmp_path):
+    from reliquary.validator.rl_async_service import build_rl_async, rl_async_settings
+
+    entry, env = _rl_entry()
+    limits = {"max_steps": 5, "deadline_at": NOW + 60, "max_tokens": 9}
+    entry = _auctioned(entry, training_order=limits)
+    settings = rl_async_settings(entry, .4, max_tokens=lambda env: 4000)
+    rl = build_rl_async(settings, path=tmp_path / "rl.sqlite3", grader=None, clock=lambda: NOW + 60)
+    try:
+        assert rl.book.auctions.limits == limits
+        assert rl.book.auctions.budget(env) == 0 and rl.book.auctions.stopped() == "deadline"
+    finally:
+        rl.close()
+
+
+def test_a_token_budget_waits_for_the_ledger_to_consume_pending_work(tmp_path):
+    book, auctions, clock = _limited(tmp_path, max_tokens=GROUP_TOKENS * 2)
+    subs = service(book, probation_groups=0)
+    ledger = RlPayLedger(book, subs, None, LedgerConfig(task_id="rl-test", cap=.5), clock=clock)
+    auctions.post_ask(ENV, "A", .5, 8)
+    held = book.grant([ask("A", [1])])[0].leases[0]
+    subs.submit(held.lease_id, "A", group(8))
+    subs.report_training(held.lease_id, rollout_match=[1.0] * 16, accepted=True)
+    assert auctions.stopped() == "ledger_pending"
+    assert not book.grant([ask("A", [2])])[0].leases
+    ledger.ingest()
+    assert auctions.stopped() is None
+    assert book.grant([ask("A", [2])])[0].leases
+    book.close()
+
+
+def test_a_token_budget_without_a_ledger_is_fenced(tmp_path):
+    book, auctions, _ = _limited(tmp_path, max_tokens=1_000_000)
+    service(book, probation_groups=0)
+    auctions.post_ask(ENV, "A", .5, 8)
+    assert auctions.stopped() == "ledger_pending"
+    assert not book.grant([ask("A", [1])])[0].leases
+    book.close()

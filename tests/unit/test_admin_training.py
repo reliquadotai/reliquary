@@ -31,11 +31,35 @@ def test_off_by_default(monkeypatch, request, rates):  # noqa: F811
     monkeypatch.delenv(training.TRAINING_ORDERS_ENV, raising=False)
     client = request.getfixturevalue("admin")
     assert client("POST", "/admin/v1/training", _order()).status_code == 404
+    assert client("GET", "/admin/v1/training/capabilities").status_code == 404
 
 
 def test_a_bad_flag_is_a_configuration_error():
     with pytest.raises(ValueError):
         training.training_enabled({training.TRAINING_ORDERS_ENV: "yes"})
+
+
+def test_legacy_order_digest_is_preserved_when_quote_binding_is_absent():
+    assert training.order_digest(training.CreateTraining(**_order())) == (
+        "33a31835ba45c4f5eaa0904cd701b016eabd6377351a608f00edd735ce688bb0")
+
+
+def test_quote_binding_is_opaque_immutable_and_echoed_by_the_admin(on):
+    bound = dict(quote_id="quote-1", quote_sha256="c" * 64, billing_basis=training.BILLING_BASIS)
+    created = on("POST", "/admin/v1/training", _order(**bound))
+    assert created.status_code == 201
+    assert all(created.json()["order"][key] == value for key, value in bound.items())
+    assert on("POST", "/admin/v1/training", _order(**bound)).status_code == 200
+    assert on("POST", "/admin/v1/training", _order(**{**bound, "quote_sha256": "d" * 64})).status_code == 409
+
+
+@pytest.mark.parametrize("binding", [
+    {"quote_id": "quote-1"}, {"quote_sha256": "c" * 64},
+    {"quote_id": "quote-1", "quote_sha256": "c" * 64},
+    {"quote_id": "quote-1", "quote_sha256": "not-a-digest", "billing_basis": training.BILLING_BASIS},
+])
+def test_partial_or_malformed_quote_binding_is_refused(on, binding):
+    assert on("POST", "/admin/v1/training", _order(**binding)).status_code == 422
 
 
 def test_an_order_declares_an_async_rl_task_priced_by_auction(on):
@@ -128,11 +152,48 @@ def test_status_and_retire(on):
     assert on("POST", "/admin/v1/training", _order()).status_code == 201
     status = on("GET", "/admin/v1/training/order-train-t1")
     assert status.status_code == 200 and status.json()["order"]["training_id"] == "t1"
+    assert status.json()["runtime"] == {"state": "unknown", "managed": False}
     retired = on("POST", "/admin/v1/training/order-train-t1/retire", {})
     assert retired.status_code == 200 and retired.json()["status"] == "retired"
     assert on("POST", "/admin/v1/training/order-train-t1/retire", {}).json()["status"] == "retired"
     assert on("GET", "/admin/v1/training/order-train-nope").status_code == 404
     assert on("GET", "/admin/v1/training/default").status_code == 409
+
+
+def test_capabilities_do_not_claim_a_managed_paid_runtime(on):
+    assert on.client.get("/admin/v1/training/capabilities").status_code == 401
+    response = on("GET", "/admin/v1/training/capabilities")
+    assert response.status_code == 200
+    assert response.json() == {"schema": "reliquary/training-capabilities/v1", "task_declaration": True,
+                               "runtime_orchestration": False, "final_usage": False,
+                               "checkpoint_delivery": False, "paid_admission": False}
+
+
+def test_admin_retirement_fences_a_live_training_book_without_cancelling_issued_work(on, tmp_path):
+    import asyncio
+
+    from reliquary.validator.rl_async_service import build_rl_async, rl_async_settings
+    from reliquary.validator.rl_leases import LeaseRequest
+    from reliquary.validator.rl_training_orders import TrainingAdmission, load_training_entry
+
+    assert on("POST", "/admin/v1/training", _order()).status_code == 201
+    entry = on.registry["entries"]["order-train-t1"]
+    settings = rl_async_settings(entry, entry.params["cap"], max_tokens=lambda env: 4000)
+    rl = build_rl_async(settings, path=tmp_path / "live.sqlite3", grader=None)
+    try:
+        gate = TrainingAdmission(entry, rl.book, load=load_training_entry)
+        rl.book.auctions.admission = gate.reason
+        assert asyncio.run(gate.refresh())
+        rl.book.adopt_checkpoint(0)
+        env = "reliquary_dapo_math_v1"
+        rl.book.auctions.post_ask(env, "A", .2, 8)
+        lease = rl.book.grant([LeaseRequest("A", env, (1,), 0)])[0].leases[0]
+        assert on("POST", "/admin/v1/training/order-train-t1/retire", {}).status_code == 200
+        assert not asyncio.run(gate.refresh()) and gate.reason() == "registry_retired"
+        assert not rl.book.grant([LeaseRequest("A", env, (2,), 0)])[0].leases
+        assert rl.book.submit(lease.lease_id, "A", in_zone=True).state == "submitted"
+    finally:
+        rl.close()
 
 
 def test_the_order_freezes_its_alpha_rate(on):
@@ -169,6 +230,7 @@ def spend(monkeypatch):
 
 def test_the_spend_route_adds_the_frozen_rate(on, spend):
     assert on("POST", "/admin/v1/training", _order()).status_code == 201
+    assert on.client.get("/admin/v1/training/order-train-t1/spend").status_code == 401
     assert on("GET", "/admin/v1/training/order-train-t1/spend").status_code == 404     # not written yet
     spend["order-train-t1"] = _summary(True, False)
     answer = on("GET", "/admin/v1/training/order-train-t1/spend")
@@ -218,9 +280,21 @@ def test_retire_revokes_the_tasks_trainer_pods(on):
 
     pod("pod-1", "order-train-t1")
     pod("pod-2", "order-train-t2")
-    assert on("POST", "/admin/v1/training/order-train-t1/retire", {}).status_code == 200
+    retired = on("POST", "/admin/v1/training/order-train-t1/retire", {})
+    assert retired.status_code == 200 and retired.json()["final_usage"] is None
     assert on("GET", "/admin/v1/executors/pod-1").json()["status"] == "revoked"
     assert on("GET", "/admin/v1/executors/pod-2").json()["status"] == "active"
+
+
+def test_quote_bound_order_refuses_external_trainer_registration(on):
+    order = _order(quote_id="quote-1", quote_sha256="c" * 64, billing_basis=training.BILLING_BASIS)
+    created = on("POST", "/admin/v1/training", order)
+    assert created.status_code == 201
+    pod = {"executor_id": "external-pod", "token_sha256": "d" * 64, "model_id": "m", "model_revision": "r",
+           "expires_at": 4e12, "scope": "trainer", "task_id": created.json()["task_id"]}
+    refused = on("POST", "/admin/v1/executors", pod)
+    assert refused.status_code == 409 and refused.json()["detail"] == "training_requires_owned_runtime"
+    assert on("GET", "/admin/v1/executors/external-pod").status_code == 404
 
 
 def _order_entry(on, **params):

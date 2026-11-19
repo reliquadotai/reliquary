@@ -57,6 +57,21 @@ def test_an_active_training_task_gets_a_controller_and_a_port(tmp_path):
     assert rig.map()["tasks"] == {"t-a": {"port": 9100, "run": "t-a"}}
 
 
+def test_front_supervisor_leaves_quote_bound_controllers_to_their_owner(tmp_path):
+    rig = Rig(tmp_path)
+    rig.add("legacy")
+    for task, status, binding in (
+        ("active", "active", {"quote_id": "q", "quote_sha256": "a" * 64, "billing_basis": "basis"}),
+        ("retired", "retired", {"quote_id": "q"}),
+        ("incomplete", "active", {"billing_basis": None}),
+    ):
+        rig.add(task, status=status)
+        rig.entries[task].params["training_order"].update(binding)
+    rig.sup.tick()
+    assert rig.spawned == [("legacy", 9100)]
+    assert rig.map()["default"] == "legacy"
+
+
 def test_a_retired_task_stops_after_its_last_settle(tmp_path):
     rig = Rig(tmp_path)
     rig.add("t-a")

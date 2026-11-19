@@ -11,7 +11,8 @@ One process on the controller, like the corpus validator: no window, batcher or 
   ``/rl/lease/mine``, ``/rl/lease/commitments``, ``/rl/prompts/state``, ``/rl/submit``, ``/rl/pay`` (replaces the
   window board's), ``/rl/checkpoint`` and ``/rl/observations`` (the scan log's signed head + presigned URLs).
 * **Trainer link** (``/rl/trainer/*``, bearer ``RELIQUARY_RL_TRAINER_TOKEN``) on its own listener,
-  ``RELIQUARY_RL_TRAINER_BIND`` (``host:port``, default ``127.0.0.1:8889``), never on the public port. The link is
+  ``RELIQUARY_RL_TRAINER_BIND`` (``host:port``, default ``127.0.0.1:8889``). Executor pods reach their task's
+  controller via the public front with a per-pod token. Owned runtime controls use the private listener. The link is
   plain HTTP and its token can mint pay: a non-loopback bind is refused unless
   ``RELIQUARY_RL_TRAINER_INSECURE_BIND=1`` says the address is on a private network (WireGuard, a private VLAN);
   otherwise reach it over an SSH tunnel: the detached async trainer (``reliquary train-async``, its own GPU box
@@ -344,6 +345,7 @@ class RlAsync:
     observations: Any = None                    # rl_observations.ObservationBoard (None: /rl/observations 503s)
     sandbox: Any = None                         # rl_async_episodes.RlLeaseSandbox (episode envs only)
     benchmarks: Any = None                      # run_id -> the run's benchmark feed bytes or None (/rl/benchmarks)
+    runtime: Any = None                         # Private supervised lifecycle; absent for legacy workers.
     # The checkpoint bucket for a trainer pod that holds no bucket key (``/uploads``, ``/reads``, ``/deletes``):
     # key -> presigned PUT / GET URL, key -> None. None: those routes answer 404.
     presign_put: Any = None
@@ -528,7 +530,8 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str | None = None, auth: Trai
     def beat_then(op: Callable[[dict], Any], body: dict) -> Any:
         """Any trainer call proves it alive (the outage pay); a failed beat never fails the call."""
         try:
-            rl.ledger.trainer_beat()
+            if getattr(rl, "runtime", None) is None or not rl.runtime.sealed():
+                rl.ledger.trainer_beat()
         except Exception:
             logger.exception("trainer beat failed")
         return op(body)
@@ -537,11 +540,27 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str | None = None, auth: Trai
         async def handler(request: Request) -> JSONResponse:
             if not await authorized(request):
                 return refused(401, "unauthorized")
+            runtime = getattr(rl, "runtime", None)
+            if runtime is not None and method == "POST" and runtime.sealed() and path not in (
+                    "runtime/quiesced", "heartbeat"):
+                return refused(409, "runtime_quiesced")
             try:
                 body = await request.json() if method == "POST" else dict(request.query_params)
                 if not isinstance(body, dict):
                     raise ValueError("the body is not an object")
-                result = await asyncio.to_thread(beat_then, op, body)
+                def invoke():
+                    if runtime is None:
+                        return False, beat_then(op, body)
+                    with rl.book.lock:
+                        if method == "POST" and runtime.sealed() and path not in ("runtime/quiesced", "heartbeat"):
+                            return True, None
+                        if path in ("take", "take_older", "take_exhausted", "audits") and runtime.drain_requested():
+                            return False, {"groups": []}
+                        return False, beat_then(op, body)
+
+                fenced, result = await asyncio.to_thread(invoke)
+                if fenced:
+                    return refused(409, "runtime_quiesced")
             except LookupError as exc:
                 return refused(404, "unknown", str(exc))
             except (ValueError, TypeError, KeyError) as exc:
@@ -606,6 +625,11 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str | None = None, auth: Trai
     route("POST", "audits", take_audits)
     route("POST", "audit", report_audit)
     route("POST", "heartbeat", lambda b: {"ok": True})        # the beat is in every call
+    if getattr(rl, "runtime", None) is not None:
+        route("GET", "runtime", lambda b: rl.runtime.snapshot())
+        route("POST", "drain", rl.runtime.drain)
+        route("POST", "runtime/ready", rl.runtime.ready)
+        route("POST", "runtime/quiesced", rl.runtime.quiesce)
 
     def run_keys(b: dict, what: Any, *, use: str) -> list[str]:
         """The trainer writes only its checkpoints: anchor files and deltas of versions after the latest adopted,
@@ -633,16 +657,18 @@ def build_rl_trainer_router(rl: RlAsync, *, token: str | None = None, auth: Trai
                 raise ValueError(f"{key}: checkpoint {version} is already adopted (latest {latest})")
         return keys
 
-    route("POST", "uploads", lambda b: {"urls": {k: rl.presign_put(k)
-                                                 for k in run_keys(b, rl.presign_put, use="upload")}})
-    route("POST", "reads", lambda b: {"urls": {k: rl.presign_get(k) for k in run_keys(b, rl.presign_get, use="read")}})
-
     def delete_keys(b: dict) -> dict:
         for key in run_keys(b, rl.delete_object, use="delete"):
             rl.delete_object(key)
         return {"ok": True}
 
-    route("POST", "deletes", delete_keys)
+    if getattr(rl, "runtime", None) is None:
+        # Local supervised trainers publish directly. A presigned write could outlive their drain proof.
+        route("POST", "uploads", lambda b: {"urls": {k: rl.presign_put(k)
+                                                     for k in run_keys(b, rl.presign_put, use="upload")}})
+        route("POST", "reads", lambda b: {"urls": {k: rl.presign_get(k)
+                                                   for k in run_keys(b, rl.presign_get, use="read")}})
+        route("POST", "deletes", delete_keys)
 
     async def checkpoint(request: Request) -> JSONResponse:
         """``/rl/checkpoint``'s answer for the trainer's resume (it reaches this listener only)."""
@@ -1075,12 +1101,20 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     import uvicorn
 
     from reliquary.infrastructure.corpus_period_store import R2PeriodArchives
+    from reliquary.rl_orders.runtime import (
+        ManagedControllerShutdown, requires_owned_training_runtime, supervised_runtime,
+    )
     from reliquary.shared.log_levels import unmute_reliquary_loggers
     from reliquary.validator.corpus_settlement import R2Archives
     from reliquary.validator.corpus_validator import _run_corpus_services
     from reliquary.validator.server import ValidatorServer
     from reliquary.validator.service import _validator_state_dir
 
+    order = (getattr(entry, "params", None) or {}).get("training_order")
+    if requires_owned_training_runtime(order) and not (
+        os.environ.get("RELIQUARY_RL_RUNTIME_ID") and os.environ.get("RELIQUARY_RL_ORDER_SHA256")
+    ):
+        raise ValueError("a quote-bound training order requires its supervised local runtime")
     unmute_reliquary_loggers()
     load_kwargs = dict(load_kwargs or {})
     settings = rl_async_settings(entry, cap)
@@ -1101,6 +1135,18 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     state_dir = _validator_state_dir()
     state_dir.mkdir(parents=True, exist_ok=True)
     rl = build_rl_async(settings, path=state_dir / DB_NAME, grader=grader, prompt_range=ranges)
+    training_admission = None
+    if order is not None:
+        from reliquary.validator.rl_training_orders import TrainingAdmission, load_training_entry
+
+        training_admission = TrainingAdmission(entry, rl.book, load=load_training_entry)
+        rl.book.auctions.admission = training_admission.reason
+        await training_admission.refresh()
+    rl.runtime = supervised_runtime(entry, rl)
+    if rl.runtime is not None:
+        if rl.book.auctions is None or training_admission is None:
+            raise ValueError("a supervised runtime requires a training order with auction admission")
+        rl.book.auctions.admission = lambda: rl.runtime.admission_reason() or training_admission.reason()
     from reliquary.validator import telemetry
 
     telemetry.init(validator_hotkey, {"task_id": settings.task_id, "run": settings.run, "cap": cap,
@@ -1130,7 +1176,8 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     else:
         logger.warning("no audit model (%s unset, proof executor not remote): out-of-zone audits conclude "
                        "inconclusive (first scans unpaid, no sanction)", AUDIT_DEVICE_ENV)
-    if not token:
+    pod_order = training_admission is not None and rl.runtime is None
+    if not token and not pod_order:
         logger.warning("%s unset: no trainer link is served; the async trainer cannot connect", TRAINER_TOKEN_ENV)
 
     registered = None
@@ -1149,8 +1196,7 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
     server = ValidatorServer(http_host, http_port, emission_cap=cap)
     mount_rl_async(server, rl, validator_hotkey=validator_hotkey,
                    registration=None if registered is None else registered.reason)
-    training_order = "training_order" in (getattr(entry, "params", None) or {})
-    if training_order:
+    if pod_order:
         # A training order's pods hold per-pod executor tokens only (never the static one); the public front
         # proxies the trainer link to this port.
         server.app.include_router(build_rl_trainer_router(rl, auth=executor_trainer_auth(
@@ -1166,7 +1212,7 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
         registration=None if registered is None else registered.reason))
     archives = R2PeriodArchives(guard=R2Archives(served=lambda: (settings.task_id,), served_only=True))
     spend = registry_status = None
-    if training_order:
+    if pod_order:
         from reliquary.validator.rl_spend import SpendPublisher
 
         spend = SpendPublisher(rl, rl.public_put)         # what the platform bills the order on
@@ -1183,6 +1229,13 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
                                 trainer_audits=source == "trainer",
                                 cards=CardFeed(setups, state_dir / "rl-card-models.json"), spend=spend,
                                 registry_status=registry_status)
+    if training_admission is not None:
+        background.append(training_admission.refresh_forever())
+    if rl.runtime is not None:
+        async def runtime_limits():
+            await asyncio.to_thread(rl.runtime.check_limits)
+
+        background.append(_every(runtime_limits, 1.0, "managed runtime limits"))
     if rl.sandbox is not None:
         background.extend(rl.sandbox.background())
     if registered is not None:
@@ -1205,22 +1258,33 @@ async def run_rl_async_validator(*, wallet, netuid: int, signer_client, http_hos
                 settings.task_id, cap, settings.run, dict(settings.targets), rl.book.latest_checkpoint)
     http = uvicorn.Server(uvicorn.Config(server.app, host=http_host, port=http_port, log_level="warning",
                                          access_log=False, timeout_keep_alive=15))
+    managed_shutdown = None if rl.runtime is None else ManagedControllerShutdown(rl.runtime)
 
     async def cleanup() -> None:
+        sandbox_error = None
+        if managed_shutdown is not None and not managed_shutdown.capture_drain():
+            logger.warning("managed controller stop has no durable drain proof; its exit remains non-final")
         if rl.sandbox is not None:
             try:
                 await rl.sandbox.stop()
-            except Exception:
+            except Exception as exc:
                 logger.exception("rl lease sessions not drained at shutdown")
+                if managed_shutdown is not None:
+                    sandbox_error = exc
         await publisher.close()
         close_scorer = getattr(getattr(rl.submissions.grader, "scorer", None), "close", None)
         if callable(close_scorer):
             close_scorer()
         await asyncio.to_thread(rl.close)
         telemetry.finish()
+        if sandbox_error is not None:
+            raise RuntimeError("managed sandbox cleanup did not finish") from sandbox_error
+        if managed_shutdown is not None:
+            managed_shutdown.cleanup_completed()
 
     background.append(server._monitor_process_health())
-    await _run_corpus_services(http, background, cleanup=cleanup)
+    with contextlib.nullcontext() if managed_shutdown is None else managed_shutdown:
+        await _run_corpus_services(http, background, cleanup=cleanup, check_worker_shutdown=managed_shutdown is not None)
 
 
 __all__ = [
