@@ -5,11 +5,16 @@ and on missing ``wandb`` package. Never propagates to the validator main
 loop. Run id is deterministic (``{hotkey[:8]}-{version}``) so restarts
 resume the same wandb run; bump ``WANDB_TRAINING_VERSION`` (or set
 ``RELIQUARY_WANDB_VERSION``) to start a new run.
+
+Without W&B, a row collected by ``hold`` / ``flush`` (the async trainer's step) still goes to the log as one
+compact JSON line, ``telemetry step=<n> {...}``: step timings and token counts stay readable from the log alone.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 import os
 from typing import Any
 
@@ -74,10 +79,10 @@ def log_training_step(metrics: dict, step: int | None) -> None:
     session are silenced to avoid flooding the log on prolonged outages.
     """
     global _log_warned
-    if not _enabled:
-        return
     if _held is not None:
         _held.update(metrics)
+        return
+    if not _enabled:
         return
     try:
         import wandb  # already imported successfully in init()
@@ -102,7 +107,27 @@ def flush(extra: dict, step: int | None) -> None:
     """Send what ``hold`` collected and ``extra`` as one row at ``step``."""
     global _held
     held, _held = _held or {}, None
-    log_training_step({**held, **extra}, step)
+    row = {**held, **extra}
+    if _enabled:
+        log_training_step(row, step)
+    else:
+        logger.info("telemetry step=%s %s", step, log_line(row))
+
+
+def _plain(value: Any) -> Any:
+    """A JSON-safe scalar: numpy / torch scalars as numbers, non-finite floats as null, anything else as text."""
+    if isinstance(value, (bool, int, str)) or value is None:
+        return value
+    try:
+        number = float(value.item() if hasattr(value, "item") else value)
+    except (TypeError, ValueError, RuntimeError):
+        return str(value)
+    return number if math.isfinite(number) else None
+
+
+def log_line(row: dict) -> str:
+    """``row`` as one compact JSON object (sorted keys, no spaces)."""
+    return json.dumps({str(k): _plain(v) for k, v in row.items()}, sort_keys=True, separators=(",", ":"))
 
 
 def update_config(values: dict) -> None:

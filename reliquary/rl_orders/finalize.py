@@ -7,12 +7,12 @@ import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from reliquary.protocol.release_contract import canonical_json_bytes
-from reliquary.rl_orders.checkpoint_delivery import R2CheckpointSource, TrainingCheckpointStore
-from reliquary.rl_orders.supervisor import FinalizedRuntime, _private_bytes, read_runtime_view
+from reliquary.protocol.release_contract import canonical_json_bytes, canonical_sha256
+from reliquary.rl_orders.checkpoint_delivery import FREEZE_SECONDS, R2CheckpointSource, TrainingCheckpointStore
+from reliquary.rl_orders.supervisor import FinalizedRuntime, StoppedRuntime, _private_bytes, read_runtime_view
 from reliquary.shared.strict_json import strict_json_loads
 from reliquary.validator.rl_training_usage import (
-    finalize_usage, validate_usage_envelope, write_final_usage,
+    finalize_usage, stopped_document, validate_usage_envelope, write_final_usage,
 )
 
 COMPLETION_SCHEMA = "reliquary/training-completion/v1"
@@ -75,13 +75,18 @@ def finalize_training(entry, stopped, config, *, checkpoint_store=None):
     state = config.runtime_dir
     if state.name != entry.task_id or state.is_symlink():
         raise FinalityUnavailable("runtime directory does not match this task")
+    if not isinstance(stopped, StoppedRuntime) or any(process.returncode != 0 for process in stopped.processes):
+        raise FinalityUnavailable("terminal delivery requires a clean exit")
     store = checkpoint_store or TrainingCheckpointStore(state.parent)
     if store.root.resolve() != state.parent.resolve():
         raise FinalityUnavailable("checkpoint cache belongs to another runtime root")
-    existing = TrainingRuntimeStore(state.parent, checkpoint_store=store).final(entry)
+    runtime_store = TrainingRuntimeStore(state.parent, checkpoint_store=store)
+    existing = runtime_store.final(entry, verify_objects_until=store.clock() + FREEZE_SECONDS)
     if existing is not None:
         receipt = existing["usage"]["receipt"]
-        if any(receipt[key] != getattr(stopped, key) for key in ("task_id", "order_sha256", "run_id", "runtime_id")):
+        # Process IDs can be reused after completion; compare the original committed witness.
+        if (canonical_sha256(stopped_document(stopped, verify_process_groups=False)) != receipt["termination_sha256"]
+                or stopped.latest_checkpoint != receipt["checkpoint"]["version"]):
             raise FinalityUnavailable("completed runtime replay changed")
         return FinalizedRuntime(existing["usage"]["sha256"], existing["checkpoint"]["manifest_sha256"])
     cached = store.load_manifest(entry.task_id)
@@ -103,7 +108,7 @@ def finalize_training(entry, stopped, config, *, checkpoint_store=None):
                                                   "run_id", "runtime_id")},
                   "usage_sha256": envelope["sha256"], "checkpoint_manifest_sha256": manifest["manifest_sha256"]}
     _immutable_json(state / "completion.json", completion)
-    TrainingRuntimeStore(state.parent, checkpoint_store=store).final(entry)
+    runtime_store.final(entry)
     return FinalizedRuntime(envelope["sha256"], manifest["manifest_sha256"])
 
 
@@ -115,7 +120,7 @@ class TrainingRuntimeStore:
             raise ValueError("training runtime root must be an absolute private directory")
         self.checkpoints = checkpoint_store or TrainingCheckpointStore(self.root)
 
-    def final(self, entry):
+    def final(self, entry, *, verify_objects_until=None):
         order = entry.params.get("training_order") or {}
         folder = self.root / entry.task_id
         if folder.is_symlink():
@@ -130,7 +135,7 @@ class TrainingRuntimeStore:
             raise FinalityUnavailable("invalid training completion")
         try:
             usage = validate_usage_envelope(strict_json_loads(_private_bytes(folder / "usage.json", MAX_RECEIPT_BYTES)))
-            manifest = self.checkpoints.load_manifest(entry.task_id)
+            manifest = self.checkpoints.load_manifest(entry.task_id, verify_objects_until=verify_objects_until)
             receipt = usage["receipt"]
             binding = {"task_id": entry.task_id,
                        **{key: order.get(key) for key in ("order_sha256", "quote_id", "quote_sha256")}}

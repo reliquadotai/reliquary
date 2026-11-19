@@ -344,18 +344,14 @@ class TrainingCheckpointStore:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise CheckpointUnavailable("checkpoint freeze is already running") from exc
-            existing = self.load_manifest(stopped.task_id)
             deadline = self.clock() + timeout_seconds
+            existing = self.load_manifest(stopped.task_id, verify_objects_until=deadline)
             if existing is not None:
                 if (existing["usage_sha256"] != digest
                         or existing["checkpoint"]["version"] != reference.get("version")
                         or existing["index_sha256"] != reference.get("index_sha256")
                         or any(existing[key] != value for key, value in expected.items())):
                     raise CheckpointConflict("checkpoint was already frozen for different usage")
-                for artifact in existing["files"]:
-                    with _open_file(folder / "objects" / artifact["sha256"]) as (handle, metadata):
-                        if metadata.st_size != artifact["size"] or _hash_stream(handle, deadline, self.clock) != artifact["sha256"]:
-                            raise CheckpointUnavailable("frozen checkpoint cache differs")
                 return existing
             index = self._source_index(stopped)
             if reference != {"version": index["latest"]["version"], "index_sha256": canonical_sha256(index)}:
@@ -391,7 +387,7 @@ class TrainingCheckpointStore:
         finally:
             os.close(descriptor)
 
-    def load_manifest(self, task_id: str) -> dict | None:
+    def load_manifest(self, task_id: str, *, verify_objects_until: float | None = None) -> dict | None:
         try:
             path = self._folder(task_id, create=False) / "manifest.json"
             with _open_file(path) as (handle, metadata):
@@ -403,6 +399,12 @@ class TrainingCheckpointStore:
         manifest = _Manifest.model_validate(strict_json_loads(raw)).model_dump(by_alias=True)
         if manifest["task_id"] != task_id:
             raise CheckpointUnavailable("checkpoint manifest belongs to another task")
+        if verify_objects_until is not None:
+            for artifact in manifest["files"]:
+                with _open_file(path.parent / "objects" / artifact["sha256"]) as (handle, metadata):
+                    if (metadata.st_size != artifact["size"]
+                            or _hash_stream(handle, verify_objects_until, self.clock) != artifact["sha256"]):
+                        raise CheckpointUnavailable("frozen checkpoint cache differs")
         return manifest
 
     def open_range(self, task_id: str, artifact_id: str, range_header: str | None = None) -> ArtifactRead:

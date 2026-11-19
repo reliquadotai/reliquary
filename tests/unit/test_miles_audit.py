@@ -95,3 +95,73 @@ def test_gateway_audit_refuses_a_warped_draw(monkeypatch):
         draw=DRAW_GUMBEL_MAX, t=1.0, top_k=20, top_p=1.0, boundary_epsilon=0.02))
     with pytest.raises(RuntimeError, match="unwarped"):
         gateway_audit(Client(1.0), eos_ids=())
+
+
+class VaryingClient(Client):
+    """Each datum's rows depend on the datum alone (its tokens), never on what else shares the call."""
+
+    def forward(self, datums, loss_fn, config):
+        self.calls.append((len(datums), loss_fn, config))
+        outs = []
+        for d in datums:
+            mask = np.array(d.loss_fn_inputs["draw_mask"].data)
+            tokens = np.array(d.loss_fn_inputs["target_tokens"].data)
+            n = len(mask)
+            match = ((tokens % 3) != 0).astype(float) * (mask > 0)
+            gap = np.where((mask > 0) & (match == 0), 0.001 * (1 + tokens % 7), 0.0)
+            outs.append({"match": match, "gap": gap, "stochastic": (tokens % 2).astype(float),
+                         "vstar": np.zeros(n), "gate": np.zeros(8)})
+        return SimpleNamespace(result=lambda: SimpleNamespace(loss_fn_outputs=outs))
+
+
+def _varied(seed, n=16, length=120, episode=False):
+    rng = np.random.default_rng(seed)
+    completions = tuple(tuple(int(t) for t in rng.integers(0, 50, length)) for _ in range(n))
+    group = SimpleNamespace(prompt_tokens=(1, 2, 3), completions=completions, force_spans=(None,) * n,
+                            spans=None, truncated=(False,) * n, rewards=(0.0,) * n, environment="math",
+                            prompt_idx=seed, lease_id=f"lease-{seed}", model_tokens=lambda i: length,
+                            draw_uniforms=lambda i: [0.5] * length)
+    if episode:
+        group.spans = (((0, 60), (90, length)),) * n
+        group.model_tokens = lambda i: 90
+        group.draw_uniforms = lambda i: [0.5] * 90
+    return group
+
+
+def test_judging_groups_together_gives_each_group_its_own_verdict(monkeypatch):
+    """``audit.many`` sends several groups in one forward (one per draw config: episodes apart) and judges each
+    group exactly as a forward of that group alone would."""
+    pytest.importorskip("tinker")
+    from reliquary.trainer.audits import gateway_audit
+    from reliquary.validator import verifier
+
+    monkeypatch.setattr(verifier, "draw_settings", lambda: SimpleNamespace(
+        draw=DRAW_GUMBEL_MAX, t=1.0, top_k=0, top_p=1.0, boundary_epsilon=0.02))
+    groups = [_varied(0), _varied(1, episode=True), _varied(2, n=4), _varied(3)]
+    alone = VaryingClient(1.0)
+    one = gateway_audit(alone, eos_ids=(9,))
+    expected = [one(None, g) for g in groups]
+    assert len(alone.calls) == 4
+    together = VaryingClient(1.0)
+    audit = gateway_audit(together, eos_ids=(9,))
+    assert audit.many(None, groups) == expected
+    assert sorted(together.calls, key=lambda c: c[0]) == [
+        (16, "reliquary_gate", {"eos_ids": "9", "terminal_check": 0}), (36, "reliquary_gate", {"eos_ids": "9"})]
+    assert audit.many(None, []) == []
+
+
+def test_a_short_gateway_reply_is_a_clear_error(monkeypatch):
+    pytest.importorskip("tinker")
+    from reliquary.trainer.audits import gateway_audit
+    from reliquary.validator import verifier
+
+    monkeypatch.setattr(verifier, "draw_settings", lambda: SimpleNamespace(
+        draw=DRAW_GUMBEL_MAX, t=1.0, top_k=0, top_p=1.0, boundary_epsilon=0.02))
+
+    class Short(VaryingClient):
+        def forward(self, datums, loss_fn, config):
+            full = super().forward(datums, loss_fn, config).result().loss_fn_outputs
+            return SimpleNamespace(result=lambda: SimpleNamespace(loss_fn_outputs=full[:-1]))
+
+    with pytest.raises(RuntimeError, match="31 rows for 32 rollouts"):
+        gateway_audit(Short(1.0), eos_ids=(9,)).many(None, [_varied(0), _varied(1)])

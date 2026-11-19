@@ -426,3 +426,83 @@ def test_a_suspect_hotkey_gets_no_lease_and_its_offer_steps_aside(fake_r2):
     assert refused["detail"]["suspect_until"] == int(until)
     assert auction._aside["5BAD"] == until
     assert _lease(client, "5OK")["leased"] is True
+
+
+def test_an_offer_that_swaps_gets_its_next_lease_in_the_submissions_answer(fake_r2):
+    clock = Clock()
+    auction = _auction(clock)
+    client, _ = _route(fake_r2, auction, _Records(), prompts=4)
+    body = {"job_id": "swe-v1", "miner_hotkey": "5A", "micro_alpha_per_mtoken": 200_000, "capacity": 1,
+            "swap": True, "issued_at": int(time.time()), "nonce": secrets.token_hex(16), "signature": "ok"}
+    assert client.post("/corpus/ask", json=body).json()["accepted"] is True
+    lease = _lease(client, "5A")
+    answer = _submit_as(client, "5A", lease["prompt_index"], lease["slot"])
+    assert answer["accepted"] is True
+    (following,) = answer["detail"]["next_leases"]     # its one slot, refilled in the same answer
+    assert (following["prompt_index"], following["slot"]) != (lease["prompt_index"], lease["slot"])
+    assert _lease(client, "5A")["reason"] == "allowance_full"
+
+
+def test_an_offer_that_does_not_swap_gets_no_lease_in_its_answers(fake_r2):
+    clock = Clock()
+    client, _ = _route(fake_r2, _auction(clock), _Records(), prompts=4)
+    _ask(client, "5A", 0.2, capacity=1)
+    lease = _lease(client, "5A")
+    answer = _submit_as(client, "5A", lease["prompt_index"], lease["slot"])
+    assert answer["accepted"] is True and "next_leases" not in answer["detail"]
+
+
+def test_a_swapping_offer_is_signed_under_its_own_domain():
+    from reliquary.protocol.signatures import build_corpus_lease_binding
+
+    ask = {"job_id": "j", "miner_hotkey": "h", "issued_at": 1, "nonce": "ab" * 16, "micro_alpha_per_mtoken": 5,
+           "capacity": 4}
+    assert build_corpus_lease_binding({**ask, "swap": None}) == build_corpus_lease_binding(ask)
+    assert build_corpus_lease_binding({**ask, "swap": False}) == build_corpus_lease_binding(ask)
+    assert build_corpus_lease_binding({**ask, "swap": True}) != build_corpus_lease_binding(ask)
+
+
+def test_the_miner_takes_its_next_lease_from_the_submissions_answer():
+    from tests.unit.test_draw_leases import _Gen, _granted, _LeasingClient, _mine
+
+    class _SwappingClient(_LeasingClient):
+        def __init__(self, leases):
+            super().__init__(leases)
+            self.asks = []
+            self.next = [[{"lease_id": "bb" * 16, "prompt_index": 11, "slot": 0, "expires_at": 1e12}], []]
+
+        def ask(self, body):
+            self.asks.append(body)
+            return {"accepted": True, "reason": "accepted"}
+
+        def submit(self, body):
+            super().submit(body)
+            return {"accepted": True, "reason": "accepted",
+                    "detail": {"next_leases": self.next.pop(0) if self.next else []}}
+
+    client = _SwappingClient([_granted(10, 0, "aa" * 16)])
+    counts = _mine(client, _Gen(), max_steps=2, sign_lease=lambda body: "sig", ask_alpha_per_mtoken=0.25)
+    assert client.asks[0]["swap"] is True
+    assert client.submitted == [(10, 0), (11, 0)]
+    assert len(client.lease_bodies) == 1 and counts["lease_swapped"] == 1
+
+
+def test_the_miner_asks_without_swap_from_a_validator_that_predates_it():
+    from reliquary.miner.corpus_miner import CorpusPermanentFailure
+    from tests.unit.test_draw_leases import _Gen, _granted, _LeasingClient, _mine
+
+    class _OldClient(_LeasingClient):
+        def __init__(self, leases):
+            super().__init__(leases)
+            self.asks = []
+
+        def ask(self, body):
+            self.asks.append(body)
+            if "swap" in body:
+                raise CorpusPermanentFailure("extra field", status=422)
+            return {"accepted": True, "reason": "accepted"}
+
+    client = _OldClient([_granted(10, 0, "aa" * 16)])
+    _mine(client, _Gen(), max_steps=1, sign_lease=lambda body: "sig", ask_alpha_per_mtoken=0.25)
+    assert ["swap" in a for a in client.asks] == [True, False]
+    assert client.submitted == [(10, 0)]

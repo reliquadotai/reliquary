@@ -1548,17 +1548,35 @@ _PROFILE_VALUES = _PROFILE_VALUES + (
 
 # The first API training run's test model (2026-11-17): v10's draw and envs on Qwen3.5-4B, the 9B's family (the same
 # Miles model code), single-turn envs capped at 16k so a step turns over in minutes on one rented box.
+# Qwen3.5-9B and Qwen3.8-27B (2026-11-18): the same suite for training orders on the larger models of that family
+# (Qwen3_5ForConditionalGeneration, one tokenizer vocabulary, the same stop tokens): the 4B's draw, envs and caps,
+# except the envs Teutonic v10 reasons in at 64k (_V10_LONG_ENVS: both math envs and competitive code), which keep
+# that cap.
 _TEUTONIC_V10 = next(p for p in _PROFILE_VALUES if p.profile_id == "teutonic-9b-reliquary-suite-v10-gumbel-dev1")
-_PROFILE_VALUES = _PROFILE_VALUES + (
-    replace(
+
+
+def _v10_on(profile_id: str, model_id: str, model_revision: str, *, long: tuple[str, ...] = ()) -> ProtocolProfile:
+    return replace(
         _TEUTONIC_V10,
-        profile_id="qwen35-4b-reliquary-suite-v10-gumbel-dev1",
-        model_id="Qwen/Qwen3.5-4B",
-        model_revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+        profile_id=profile_id,
+        model_id=model_id,
+        model_revision=model_revision,
         environments={
-            name: env if env.episode is not None else replace(env, max_new_tokens=min(env.max_new_tokens, 16384))
+            name: env if env.episode is not None or name in long
+            else replace(env, max_new_tokens=min(env.max_new_tokens, 16384))
             for name, env in _TEUTONIC_V10.environments.items()},
-    ),
+    )
+
+
+_PROFILE_VALUES = _PROFILE_VALUES + (
+    _v10_on("qwen35-4b-reliquary-suite-v10-gumbel-dev1", "Qwen/Qwen3.5-4B",
+            "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"),
+    _v10_on("qwen35-9b-reliquary-suite-v10-gumbel-dev1", "Qwen/Qwen3.5-9B",
+            "c202236235762e1c871ad0ccb60c8ee5ba337b9a", long=_V10_LONG_ENVS),
+    # Weights, config and tokenizer.json as the corpus jobs' pin (1d4bf0f2); this revision only adds generation
+    # tags to the chat template, which render the same bytes.
+    _v10_on("qwen38-27b-reliquary-suite-v10-gumbel-dev1", "Qwen/Qwen3.8-27B",
+            "37561816e66b5b9153b1b64c10968c18c1e6f4a0", long=_V10_LONG_ENVS),
 )
 
 PROFILES: Mapping[str, ProtocolProfile] = MappingProxyType(

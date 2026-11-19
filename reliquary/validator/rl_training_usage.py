@@ -211,7 +211,7 @@ def settle_quiesced_work(rl) -> dict:
         return inspect_drain(db)
 
 
-def stopped_document(stopped) -> dict:
+def stopped_document(stopped, *, verify_process_groups: bool = True) -> dict:
     """Validate the private supervisor witness and return its canonical termination commitment."""
     from reliquary.rl_orders.supervisor import StoppedRuntime
 
@@ -222,6 +222,8 @@ def stopped_document(stopped) -> dict:
     if stopped.cgroup_id != stopped.runtime_id:
         raise UsageNotFinal("runtime cgroup identity changed")
     _integer(stopped.trainer_elapsed_ns, "trainer elapsed nanoseconds")
+    if stopped.latest_checkpoint is not None:
+        _integer(stopped.latest_checkpoint, "stopped checkpoint")
     processes = list(stopped.processes)
     if len(processes) != 2 or {process.role for process in processes} != {"controller", "trainer"}:
         raise UsageNotFinal("both owned processes must be reaped")
@@ -239,15 +241,16 @@ def stopped_document(stopped) -> dict:
             raise UsageNotFinal("process timing changed")
         starts.append(started)
         stops.append(ended)
-        try:
-            os.killpg(process.pgid, 0)
-        except ProcessLookupError:
-            pass
-        except OSError as exc:
-            if exc.errno != errno.ESRCH:
-                raise UsageNotFinal("process group absence is unconfirmed") from exc
-        else:
-            raise UsageNotFinal("process group is still alive")
+        if verify_process_groups:
+            try:
+                os.killpg(process.pgid, 0)
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                if exc.errno != errno.ESRCH:
+                    raise UsageNotFinal("process group absence is unconfirmed") from exc
+            else:
+                raise UsageNotFinal("process group is still alive")
         records.append({**asdict(process), "started_at": str(started), "stopped_at": str(ended)})
     started, stopped_at = _decimal(stopped.started_at, "runtime start"), _decimal(stopped.stopped_at, "runtime stop")
     empty_at = _decimal(stopped.cgroup_empty_at, "cgroup empty time")

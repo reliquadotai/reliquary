@@ -828,6 +828,8 @@ CORPUS_ASK_DOMAIN = b"reliquary/corpus-ask/v1"
 # An offer with its capacity, and a lease request for several slots: the new field is bound under a new domain.
 CORPUS_ASK_CAPACITY_DOMAIN = b"reliquary/corpus-ask/v2"
 CORPUS_LEASE_COUNT_DOMAIN = b"reliquary/corpus-lease/v2"
+# An offer that takes its next leases in its submissions' answers (``swap``).
+CORPUS_ASK_SWAP_DOMAIN = b"reliquary/corpus-ask/v3"
 
 
 def build_corpus_lease_binding(request) -> bytes:
@@ -837,6 +839,9 @@ def build_corpus_lease_binding(request) -> bytes:
         parts = [str(body["job_id"]).encode(), str(body["miner_hotkey"]).encode(),
                  int(body["issued_at"]).to_bytes(8, "big", signed=False), str(body["nonce"]).encode(),
                  int(body["micro_alpha_per_mtoken"]).to_bytes(8, "big", signed=False)]
+        if body.get("swap"):
+            return _bound(CORPUS_ASK_SWAP_DOMAIN, [*parts, int(body.get("capacity") or 1).to_bytes(8, "big",
+                                                                                               signed=False)])
         if body.get("capacity") is None:
             return _bound(CORPUS_ASK_DOMAIN, parts)
         return _bound(CORPUS_ASK_CAPACITY_DOMAIN, [*parts, int(body["capacity"]).to_bytes(8, "big", signed=False)])

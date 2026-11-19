@@ -18,7 +18,9 @@ and tokenizer; Hugging Face backups every ``RELIQUARY_RL_HF_BACKUP_EVERY`` steps
 """
 from __future__ import annotations
 
+import json
 import logging
+import math
 import os
 import time
 from contextlib import ExitStack
@@ -78,6 +80,16 @@ def _int(env: Mapping[str, str], name: str, default: int | None, *, minimum: int
     return value
 
 
+def _seconds(env: Mapping[str, str], name: str, default: float | None) -> float | None:
+    raw = str(env.get(name, "")).strip()
+    if not raw:
+        return default
+    value = float(raw)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite non-negative number")
+    return value
+
+
 def async_trainer_settings(env: Mapping[str, str] = os.environ) -> dict[str, Any]:
     """Everything the entry reads from the environment, checked before any GPU work."""
     url = str(env.get("RELIQUARY_RL_TRAINER_URL", "")).strip()
@@ -104,7 +116,17 @@ def async_trainer_settings(env: Mapping[str, str] = os.environ) -> dict[str, Any
         # the out-of-zone audits on this trainer's weights (the validator's default audit source)
         "audits": str(env.get("RELIQUARY_RL_TRAINER_AUDITS", "1")).strip() != "0",
         "audits_per_step": _int(env, "RELIQUARY_RL_TRAINER_AUDITS_PER_STEP", 128),
-        "audit_budget_s": float(env.get("RELIQUARY_RL_TRAINER_AUDIT_BUDGET_S", "420")),
+        # the round before each step: max(_AUDIT_MIN_S, _AUDIT_SHARE x the last step's train seconds), or a fixed
+        # _AUDIT_BUDGET_S when set (``AsyncTrainer.audit_budget``)
+        "audit_budget_s": _seconds(env, "RELIQUARY_RL_TRAINER_AUDIT_BUDGET_S", None),
+        "audit_min_s": _seconds(env, "RELIQUARY_RL_TRAINER_AUDIT_MIN_S", 60.0),
+        "audit_share": _seconds(env, "RELIQUARY_RL_TRAINER_AUDIT_SHARE", 0.25),
+        # rollouts per batched audit forward (the Miles gateway judges several groups per call)
+        "audit_rollouts_per_call": _int(env, "RELIQUARY_RL_TRAINER_AUDIT_ROLLOUTS_PER_CALL", 64),
+        # lab replay: each batch pickled to <dir>/step-<version>.pkl before it trains (off when unset)
+        "dump_dir": Path(str(env["RELIQUARY_RL_TRAINER_DUMP_DIR"]).strip())
+        if str(env.get("RELIQUARY_RL_TRAINER_DUMP_DIR", "")).strip() else None,
+        "dump_keep": _int(env, "RELIQUARY_RL_TRAINER_DUMP_KEEP", 4),
         # the next batch is downloaded while this one trains; the step's reports go out in parallel
         "prefetch": str(env.get("RELIQUARY_RL_TRAINER_PREFETCH", "1")).strip() != "0",
         "report_workers": _int(env, "RELIQUARY_RL_TRAINER_REPORT_WORKERS", 16),
@@ -218,6 +240,93 @@ def resume_weights(link, *, validator_hotkey: str, work_dir: Path, sync=None, fe
     return state, version, sync.model_dir
 
 
+PROFILE_ADOPTED_ENV = "RELIQUARY_RL_TRAINER_PROFILE_ADOPTED"
+
+
+def _restart(env: dict) -> None:
+    """This process again, under ``env``: the same interpreter flags and command (``sys.orig_argv``: ``-m`` and
+    ``-u`` kept, as ``cli/main.py`` restarts under a served contract); buffered output flushed first."""
+    import sys
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execve(sys.executable, [sys.executable, *sys.orig_argv[1:]], env)
+
+
+def _check_controller_profile(profile_id: str, contract) -> None:
+    """SystemExit unless this trainer can run what the controller sends: a profile of its catalogue, or a contract
+    that parses under that id (checked here, so the error names the controller rather than an import traceback)."""
+    from reliquary.protocol.profiles import PROFILES, profile_from_contract
+
+    if contract is None:
+        if profile_id not in PROFILES:
+            raise SystemExit(f"the controller runs the protocol profile {profile_id!r}, unknown to this trainer's "
+                             f"reliquary (another version?)")
+        return
+    try:
+        carried = profile_from_contract(contract).profile_id
+    except (ValueError, TypeError, KeyError) as exc:
+        raise SystemExit(f"the controller's task contract does not parse here: {exc}") from exc
+    if carried != profile_id:
+        raise SystemExit(f"the controller's task contract is profile {carried!r}, it announces {profile_id!r}")
+
+
+def adopt_task_profile(task: Mapping[str, Any], environ: Mapping[str, str], *, active: str, state_dir: Path,
+                       reexec=_restart) -> None:
+    """Run the protocol profile the controller runs (``task["profile"]``, ``/rl/trainer/config``).
+
+    A rented trainer pod is started with no ``RELIQUARY_PROTOCOL_PROFILE`` (the platform sends the order's model
+    only), and the profile is read at import: this process would train, judge and audit under the default profile.
+    Without either profile variable, the controller's profile (or its carried contract, written under
+    ``state_dir``) is set and the process starts again (``reexec(env)``, before any model work; ``reexec=None``:
+    torchrun ranks cannot restart alone, so it is refused). With one set, it must name the controller's profile.
+    An older controller that sends no profile leaves the local one (a warning)."""
+    from reliquary.protocol.profiles import TASK_CONTRACT_ENV_VAR
+
+    wanted = task.get("profile")
+    if not isinstance(wanted, Mapping) or not wanted.get("profile_id"):
+        logger.warning("the controller sends no protocol profile: running %s", active)
+        return
+    profile_id, contract = str(wanted["profile_id"]), wanted.get("contract")
+    explicit = any(str(environ.get(n, "")).strip() for n in ("RELIQUARY_PROTOCOL_PROFILE", TASK_CONTRACT_ENV_VAR))
+    if active == profile_id and (explicit or contract is None):
+        return
+    if explicit or str(environ.get(PROFILE_ADOPTED_ENV, "")).strip():
+        raise SystemExit(f"this trainer runs the protocol profile {active!r}, its controller {profile_id!r}: "
+                         f"set RELIQUARY_PROTOCOL_PROFILE / RELIQUARY_TASK_CONTRACT to the controller's")
+    if reexec is None:
+        raise SystemExit(f"set RELIQUARY_PROTOCOL_PROFILE={profile_id} (or the task contract) on every rank: "
+                         f"the controller runs it, this trainer runs {active!r}")
+    _check_controller_profile(profile_id, contract)
+    env = {k: v for k, v in environ.items() if k not in ("RELIQUARY_PROTOCOL_PROFILE", TASK_CONTRACT_ENV_VAR)}
+    env[PROFILE_ADOPTED_ENV] = "1"
+    if contract is not None:
+        path = Path(state_dir) / "task-contract.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(contract, sort_keys=True))
+        env[TASK_CONTRACT_ENV_VAR] = str(path)
+    else:
+        env["RELIQUARY_PROTOCOL_PROFILE"] = profile_id
+    logger.warning("adopting the controller's protocol profile %s (was %s): restarting", profile_id, active)
+    reexec(env)
+
+
+def settle_logging() -> list[str]:
+    """Import bittensor now, then give back the Reliquary loggers it muted; returns their names.
+
+    bittensor's import sets every logger that already exists to CRITICAL (``shared.log_levels``). The trainer's
+    modules are imported before the checkpoint sync first imports bittensor, so without this its INFO lines
+    (``groups reported``, ``checkpoint published``) never reach the log. Importing it first makes the mute
+    happen once, here, where it is undone."""
+    try:
+        import bittensor  # noqa: F401  (imported for its side effect on logging)
+    except ImportError:
+        pass
+    from reliquary.shared.log_levels import unmute_reliquary_loggers
+
+    return unmute_reliquary_loggers()
+
+
 def disable_cudnn_attention(torch) -> None:
     """The trainer's sdpa never takes the cuDNN backend: its fused attention graph fails on long sequences
     (``mha_graph.execute``) and kills the rank. Flash and memory-efficient kernels serve the same calls."""
@@ -225,6 +334,7 @@ def disable_cudnn_attention(torch) -> None:
 
 
 def run_async_train_worker() -> None:
+    settle_logging()                            # before any reliquary module logs (bittensor mutes them)
     import torch
 
     disable_cudnn_attention(torch)              # every rank, before any model is built
@@ -274,11 +384,17 @@ def run_async_train_worker() -> None:
             link = trainer_link(settings)
             # An executor may take longer than its staleness window to load the model.
             heartbeat = TrainerHeartbeat(link, settings["heartbeat_s"]).start()
+        from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
+
         task = link.config()
         identity = managed_runtime_identity(os.environ, task)
         runtime = None if identity is None else TrainerRuntime(link, identity)
         if runtime is not None:
-            if backend != "single" or settings["hf_prefix"]:
+            pinned_profile = os.environ.get("RELIQUARY_PROTOCOL_PROFILE")
+            if (pinned_profile != ACTIVE_PROTOCOL_PROFILE.profile_id
+                    or task.get("profile") != {"profile_id": pinned_profile, "contract": None}):
+                raise ValueError("managed trainer requires its supervisor's pinned catalogue profile")
+            if settings["hf_prefix"]:
                 raise ValueError("managed trainer requires the single backend without background HF backups")
             snapshot = runtime.snapshot()          # identity and freshness before model download or GPU work
             if not snapshot["controller_ready"] or snapshot["drain_requested"] or snapshot["trainer_quiesced"]:
@@ -286,6 +402,9 @@ def run_async_train_worker() -> None:
             if not settings["base_model"] or not Path(settings["base_model"]).is_dir():
                 raise ValueError("managed trainer requires its verified local base model")
             heartbeat = TrainerHeartbeat(link, settings["heartbeat_s"]).start()
+        else:
+            adopt_task_profile(task, os.environ, active=ACTIVE_PROTOCOL_PROFILE.profile_id,
+                               state_dir=settings["state_dir"], reexec=_restart if dist_ctx is None else None)
         telemetry.init(settings["validator_hotkey"], {
             "task_id": task["task_id"], "run": task["run"], "targets": task["targets"], "backend": backend,
             "batch_groups": settings["batch_groups"], "steps_per_checkpoint": settings["steps_per_checkpoint"],
@@ -303,6 +422,7 @@ def run_async_train_worker() -> None:
             model_path = str(write_hf_dir(state, model_dir, state_dir / "resume" / "model"))
             del state
             logger.info("resuming from checkpoint %d", version)
+        settle_logging()                        # cheap insurance: a later bittensor logging reset would mute us again
         load_kwargs = {}
         eos_ids = _eos_ids(model_path, load_kwargs)
 
@@ -340,7 +460,8 @@ def run_async_train_worker() -> None:
                 audit_fn = miles_audit
             else:
                 audit_fn = audit_group if dist_ctx is None else broadcasting_audit(channel)
-            audits = TrainerAudits(link, audit_fn=audit_fn)
+            audits = TrainerAudits(link, audit_fn=audit_fn,
+                                   max_rollouts_per_call=settings.get("audit_rollouts_per_call", 64))
         logger.info("startup_stage=trainer_model_load elapsed_seconds=%.3f", time.monotonic() - started)
         reset_training_state()
 
@@ -366,6 +487,9 @@ def run_async_train_worker() -> None:
                                     eos_ids=eos_ids,
                                     audits_per_step=settings["audits_per_step"],
                                     audit_budget_s=settings["audit_budget_s"],
+                                    audit_min_s=settings.get("audit_min_s", 60.0),
+                                    audit_share=settings.get("audit_share", 0.25),
+                                    dump_dir=settings.get("dump_dir"), dump_keep=settings.get("dump_keep", 4),
                                     prefetch=settings["prefetch"], report_workers=settings["report_workers"])
         link.requeue()                          # this trainer holds nothing yet
 
@@ -406,14 +530,14 @@ def run_async_train_worker() -> None:
 def _start_miles(model_path, version: int | None, eos_ids):
     """``RELIQUARY_TRAINER_BACKEND=miles``: the gateway started on this box's GPUs from ``model_path``, then the
     trainer's callables on it. This process keeps no GPU (the gateway holds them all)."""
-    from reliquary.constants import GRAD_NORM_SKIP_THRESHOLD, PROTOCOL_MODEL_ID
+    from reliquary.constants import DEFAULT_BASE_MODEL, GRAD_NORM_SKIP_THRESHOLD, PROTOCOL_MODEL_ID
     from reliquary.trainer import miles_gateway
     from reliquary.trainer.audits import gateway_audit
     from reliquary.trainer.miles_engine import MilesState, MilesTrainStep, expected_weight_specs
 
     import signal
 
-    settings = miles_gateway.miles_settings()
+    settings = miles_gateway.miles_settings(base_model=DEFAULT_BASE_MODEL)   # no RELIQUARY_MILES_* needed
     miles_gateway.check_gateway_constants(settings["python"])
 
     def _terminate(signum, frame):           # a plain SIGTERM must still run the finally that stops the gateway
@@ -427,7 +551,8 @@ def _start_miles(model_path, version: int | None, eos_ids):
         client = miles_gateway.WatchedClient(
             miles_gateway.create_full_training_client(gateway.base_url, PROTOCOL_MODEL_ID),
             alive=lambda: gateway.process.poll() is None)
-        step_fn = MilesTrainStep(client, eos_ids=eos_ids, global_step_hint=version or 0)
+        step_fn = MilesTrainStep(client, eos_ids=eos_ids, chunk=settings["chunk"],
+                                 global_step_hint=version or 0)
         state_fn = MilesState(client, checkpoint_root=settings["output_dir"],
                               expected=expected_weight_specs(model_path), base_dir=model_path,
                               delete=miles_gateway.checkpoint_deleter(gateway.base_url))
@@ -452,4 +577,4 @@ def run_forever(trainer, *, steps: int | None = None) -> str | None:
 
 
 __all__ = ["async_trainer_settings", "managed_runtime_identity", "resume_weights", "run_async_train_worker",
-           "run_forever", "run_trainer_lifecycle"]
+           "run_forever", "run_trainer_lifecycle", "settle_logging"]

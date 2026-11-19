@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
 from reliquary.trainer import async_cli
 from reliquary.trainer.async_trainer import AsyncTrainer, AsyncTrainerConfig
 from reliquary.trainer.rl_link import TrainerHeartbeat, TrainerLinkError, TrainerRuntime
@@ -15,6 +16,7 @@ from reliquary.validator.rl_buffer import SubmittedGroup, TrainingBuffer
 from tests.unit.test_rl_async_trainer import Book, Subs
 
 IDENTITY = {"task_id": "order-train-t1", "order_sha256": "a" * 64, "run_id": "r1", "runtime_id": "b" * 32}
+PROFILE = {"profile_id": ACTIVE_PROTOCOL_PROFILE.profile_id, "contract": None}
 ENV = {"RELIQUARY_TASK_ID": IDENTITY["task_id"], "RELIQUARY_RL_ORDER_SHA256": IDENTITY["order_sha256"],
        "RELIQUARY_RL_RUN": IDENTITY["run_id"], "RELIQUARY_RL_RUNTIME_ID": IDENTITY["runtime_id"]}
 
@@ -337,37 +339,45 @@ def test_managed_worker_rejects_distributed_launch_before_initializing_it(monkey
         async_cli.run_async_train_worker()
 
 
-def test_managed_worker_checks_local_model_and_runtime_before_initialization(tmp_path, monkeypatch):
+@pytest.mark.parametrize(("profile", "error"), [
+    (None, "pinned catalogue profile"),
+    ({"profile_id": "other", "contract": None}, "pinned catalogue profile"),
+    ({**PROFILE, "contract": {}}, "pinned catalogue profile"),
+    (PROFILE, "verified local base"),
+])
+def test_managed_worker_checks_profile_model_and_runtime_before_initialization(tmp_path, monkeypatch, profile, error):
     events = []
-    for key, value in {**ENV, "RELIQUARY_RL_TRAINER_URL": "http://127.0.0.1:1",
+    for key, value in {**ENV, "RELIQUARY_PROTOCOL_PROFILE": PROFILE["profile_id"],
+                       "RELIQUARY_RL_TRAINER_URL": "http://127.0.0.1:1",
                        "RELIQUARY_RL_TRAINER_TOKEN": "private-fixture-token", "RELIQUARY_RL_VALIDATOR_HOTKEY": "h",
                        "RELIQUARY_RL_BASE_MODEL": "unresolved/model", "RELIQUARY_TRAINER_STATE_DIR": str(tmp_path)}.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr("reliquary.trainer.distributed.trainer_backend", lambda: "single")
     monkeypatch.setattr("reliquary.trainer.cli._check_trainer_launch", lambda *_: None)
-    link = SimpleNamespace(config=lambda: {"task_id": IDENTITY["task_id"], "run": IDENTITY["run_id"]},
+    link = SimpleNamespace(config=lambda: {"task_id": IDENTITY["task_id"], "run": IDENTITY["run_id"], "profile": profile},
                            close=lambda: events.append("link_closed"))
     monkeypatch.setattr("reliquary.trainer.rl_link.TrainerLink", lambda *_a, **_kw: link)
     monkeypatch.setattr("reliquary.trainer.rl_link.TrainerRuntime", lambda *_: SimpleNamespace(
         snapshot=lambda: events.append("runtime_checked") or snapshot()))
     monkeypatch.setattr(async_cli, "resume_weights", lambda *_a, **_kw: pytest.fail("weights initialized"))
-    with pytest.raises(ValueError, match="verified local base"):
+    with pytest.raises(ValueError, match=error):
         async_cli.run_async_train_worker()
-    assert events == ["runtime_checked", "link_closed"]
+    assert events == (["runtime_checked", "link_closed"] if profile == PROFILE else ["link_closed"])
 
 
 def test_worker_ready_follows_model_initialization_and_quiesced_follows_join(tmp_path, monkeypatch):
     events = []
     model_dir = tmp_path / "model"
     model_dir.mkdir()
-    for key, value in {**ENV, "RELIQUARY_RL_TRAINER_URL": "http://127.0.0.1:1",
+    for key, value in {**ENV, "RELIQUARY_PROTOCOL_PROFILE": PROFILE["profile_id"],
+                       "RELIQUARY_RL_TRAINER_URL": "http://127.0.0.1:1",
                        "RELIQUARY_RL_TRAINER_TOKEN": "private-fixture-token", "RELIQUARY_RL_VALIDATOR_HOTKEY": "h",
                        "RELIQUARY_RL_BASE_MODEL": str(model_dir),
                        "RELIQUARY_TRAINER_STATE_DIR": str(tmp_path)}.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr("reliquary.trainer.distributed.trainer_backend", lambda: "single")
     monkeypatch.setattr("reliquary.trainer.cli._check_trainer_launch", lambda *_: None)
-    link = SimpleNamespace(config=lambda: {"task_id": IDENTITY["task_id"], "run": IDENTITY["run_id"], "targets": {}},
+    link = SimpleNamespace(config=lambda: {"task_id": IDENTITY["task_id"], "run": IDENTITY["run_id"], "profile": PROFILE, "targets": {}},
                            requeue=lambda: 0, close=lambda: events.append("link_closed"))
     def trainer_link(*_a, **kw):
         assert kw == {"timeout_s": 10.0}

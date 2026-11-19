@@ -15,6 +15,7 @@ from reliquary.admin.auth import NONCE_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADE
 from reliquary.admin.service import create_admin_app
 from reliquary.protocol.release_contract import canonical_json_bytes
 from reliquary.rl_orders import finalize as pipeline
+from reliquary.rl_orders.checkpoint_delivery import CheckpointUnavailable
 from reliquary.rl_orders.supervisor import StoppedProcess
 from reliquary.shared.ckpt_index import index_key
 from reliquary.shared.task_registry import TaskEntry
@@ -67,7 +68,7 @@ def prepared(context, monkeypatch):  # noqa: F811
                            config=SimpleNamespace(runtime_dir=state), root=store.root)
 
 
-def test_final_pipeline_is_bound_immutable_and_independent_of_live_source_after_completion(prepared):
+def test_final_pipeline_is_bound_immutable_and_independent_of_live_source_after_completion(prepared, monkeypatch):
     p = prepared
     result = pipeline.finalize_training(p.entry, p.stopped, p.config, checkpoint_store=p.store)
     final = pipeline.TrainingRuntimeStore(p.root, checkpoint_store=p.store).final(p.entry)
@@ -76,9 +77,35 @@ def test_final_pipeline_is_bound_immutable_and_independent_of_live_source_after_
     assert final["usage"]["receipt"]["matched_tokens"] > 0
     assert final["usage"]["receipt"]["trainer_active_ms"] == 10_000
     p.source.objects.clear()
+    monkeypatch.setattr("os.killpg", lambda *_: pytest.fail("completed replay probed a reusable process ID"))
     assert pipeline.finalize_training(p.entry, p.stopped, p.config, checkpoint_store=p.store) == result
-    with pytest.raises(ValueError, match="replay changed"):
-        pipeline.finalize_training(p.entry, replace(p.stopped, runtime_id="other"), p.config, checkpoint_store=p.store)
+    for change in ({"run_id": "other"}, {"trainer_elapsed_ns": p.stopped.trainer_elapsed_ns + 1},
+                   {"latest_checkpoint": p.stopped.latest_checkpoint + 1}):
+        with pytest.raises(ValueError, match="replay changed"):
+            pipeline.finalize_training(p.entry, replace(p.stopped, **change), p.config, checkpoint_store=p.store)
+
+
+def test_completed_replay_verifies_frozen_bytes(prepared):
+    p = prepared
+    pipeline.finalize_training(p.entry, p.stopped, p.config, checkpoint_store=p.store)
+    manifest = p.store.load_manifest(p.entry.task_id)
+    artifact = manifest["files"][0]
+    blob = p.config.runtime_dir / "checkpoint" / "objects" / artifact["sha256"]
+    blob.chmod(0o600)
+    blob.write_bytes(b"x" * artifact["size"])
+    with pytest.raises(CheckpointUnavailable, match="frozen checkpoint cache differs"):
+        pipeline.finalize_training(p.entry, p.stopped, p.config, checkpoint_store=p.store)
+
+
+def test_unclean_exit_never_publishes_terminal_delivery(prepared):
+    p = prepared
+    controller, trainer = p.stopped.processes
+    failed = replace(p.stopped, processes=(controller, replace(trainer, returncode=1)))
+    with pytest.raises(ValueError, match="clean exit"):
+        pipeline.finalize_training(p.entry, failed, p.config, checkpoint_store=p.store)
+    assert p.store.load_manifest(p.entry.task_id) is None
+    assert not (p.config.runtime_dir / "usage.json").exists()
+    assert not (p.config.runtime_dir / "completion.json").exists()
 
 
 def test_checkpoint_copy_failure_never_publishes_billable_completion(prepared):

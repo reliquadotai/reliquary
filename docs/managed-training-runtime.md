@@ -16,6 +16,7 @@ ownership, not a real GPU training run.
    operator-owned controller, trainer, and independently qualified miner ingress.
 2. The supervisor verifies the immutable local model, exact task/profile/order/run, private
    credentials, unused checkpoint namespace and Linux cgroup allocation before launching fixed commands.
+   Before loading weights, the managed trainer requires its controller to report the same pinned catalogue profile.
    Admission stays closed until the initialized trainer has published its initial checkpoint and
    acknowledged the exact runtime identity on the private trainer listener.
 3. Registry retirement and order limits close admission. A separate one-second controller check
@@ -54,7 +55,8 @@ anchor/delta/model reconstruction into a private immutable cache and verifies th
 It binds that manifest to the exact usage, task, order, run and runtime. Only after both proofs exist
 does `completion.json` become visible. A copy or write failure cannot publish a billable completion.
 The fixed finalizer can replay a partial post-copy publication from verified cached bytes without a
-live source index. The supervisor CLI does not automatically replay or relaunch an existing journal.
+live source index. Completed replays verify those bytes, the original termination commitment and the
+checkpoint version. They do not probe process IDs that the operating system may have reused. The supervisor CLI does not automatically replay or relaunch an existing journal.
 
 ## Signed admin reads
 
