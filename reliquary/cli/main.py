@@ -4895,8 +4895,12 @@ def validate(
         help="Public port to advertise on-chain; defaults to --http-port when 0. Trainer mode only.",
     ),
     hf_repo_id: str = typer.Option(
-        DEFAULT_HF_REPO_ID,
-        help="HuggingFace repo ID to publish checkpoints to (must be writable with HF_TOKEN). Trainer mode only.",
+        os.getenv("RELIQUARY_HF_REPO_ID", DEFAULT_HF_REPO_ID),
+        help=(
+            "HuggingFace repo ID to publish checkpoints to (must be writable with HF_TOKEN), and the repo the "
+            "remote signer's readiness must name. Env: RELIQUARY_HF_REPO_ID (an `rl supervise` controller "
+            "inherits it)."
+        ),
     ),
     resume_from: str = typer.Option(
         os.getenv("RELIQUARY_RESUME_FROM", ""),
