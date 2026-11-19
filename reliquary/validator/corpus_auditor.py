@@ -1446,7 +1446,9 @@ class CorpusAuditor:
                 # A validator-side error is left for the pass to meet itself.
                 if not isinstance(outcome, dict):
                     continue
-                if sid in self._judged or sid in getattr(self, "_in_pass", ()):
+                # A record its pass took while this batch flew is not wasted: that pass waits for this batch
+                # and takes the outcome (`_outcomes_ahead_or_now`).
+                if sid in self._judged:
                     self.ahead_wasted = getattr(self, "ahead_wasted", 0) + 1
                 else:
                     self._ahead[sid] = outcome

@@ -970,18 +970,60 @@ def test_a_record_its_pass_is_auditing_is_not_sent_ahead_again():
     assert remote.calls == 2 and auditor.ahead_wasted == 0
 
 
+def test_a_pass_takes_the_outcome_of_an_ahead_batch_in_flight_when_it_took_the_record():
+    """2026-11-19: the batch saw the record in its pass and dropped the outcome the pass was waiting for; the pass
+    then scored it again (ahead used 1-5 a pass, 395 outcomes thrown away in 20 min)."""
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model = _tiny(0)
+    sid = "f" * 64
+    records = _Records({sid: _record(model)})
+    remote = _AlwaysConnected(model)
+    auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=remote)
+    release = asyncio.Event()
+    score = remote.score
+
+    async def held_score(items):
+        await release.wait()
+        return await score(items)
+
+    remote.score = held_score
+
+    async def go():
+        await auditor._read_all([sid])
+        flight = asyncio.ensure_future(auditor._audit_ahead_batch([sid]))
+        auditor._ahead_flight[sid] = flight
+        await asyncio.sleep(0)
+        judging = asyncio.ensure_future(auditor.audit_many([sid]))
+        await asyncio.sleep(0.05)
+        release.set()
+        await judging
+
+    asyncio.run(go())
+    assert remote.calls == 1 and auditor.ahead_wasted == 0
+    assert records.verdicts[sid]["passed"] is True
+
+
 def test_an_outcome_scored_ahead_for_a_record_judged_meanwhile_counts_as_wasted():
     from reliquary.validator.corpus_auditor import CorpusAuditor
 
     model = _tiny(0)
     sid = "e" * 64
     records = _Records({sid: _record(model)})
+    remote = _AlwaysConnected(model)
     auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
-                            proof=PROOF, remote=_AlwaysConnected(model))
+                            proof=PROOF, remote=remote)
+    score = remote.score
+
+    async def judged_meanwhile(items):
+        auditor._judged.add(sid)  # its verdict landed while the batch flew
+        return await score(items)
+
+    remote.score = judged_meanwhile
 
     async def go():
         await auditor._read_all([sid])
-        auditor._in_pass.add(sid)
         await auditor._audit_ahead_batch([sid])
 
     asyncio.run(go())
