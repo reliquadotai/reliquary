@@ -121,6 +121,20 @@ def is_operator_set(card: dict) -> bool:
     return "source_kind" in card
 
 
+def _public_prompt_tokens(measured: object) -> dict:
+    """Project the measurements used to size jobs and keep tokenizer provenance on the subnet."""
+    if not isinstance(measured, dict):
+        return {}
+    public = {key: measured[key] for key in ("mean", "max")
+              if type(measured.get(key)) is int and measured[key] >= 0}
+    lengths = measured.get("per_problem")
+    if isinstance(lengths, list) and all(type(length) is int and length >= 0 for length in lengths):
+        public["per_problem"] = lengths
+    if type(measured.get("chat_template")) is bool:
+        public["chat_template"] = measured["chat_template"]
+    return public
+
+
 def read_published_set(set_id: str) -> tuple[dict, bytes]:
     """A published set's card and prompt lines: from ``RELIQUARY_EVAL_SETS_DIR``
     when it holds the set, else from the subnet bucket."""
@@ -181,9 +195,11 @@ async def publish_set(directory: str | Path, *, platform, subnet, publish_review
             public_card = {key: card[key] for key in (
                 "schema", "set_id", "env", "source", "source_kind", "interaction", "split",
                 "index_range", "source_length", "count", "seed", "order", "created_at",
-                "prompt_template_id", "default_max_new_tokens", "prompt_tokens", "prompts_sha256", "grading_sha256",
+                "prompt_template_id", "default_max_new_tokens", "prompts_sha256", "grading_sha256",
                 "environment_manifest_sha256", "disjointness", "episode", "protocol", "protocol_json",
                 "protocol_sha256") if key in card}
+            if prompt_tokens := _public_prompt_tokens(card.get("prompt_tokens")):
+                public_card["prompt_tokens"] = prompt_tokens
             if card.get("taskset"):
                 public_card["taskset"] = public_taskset(card["taskset"])
         order = [json.loads(line)["problem_id"] for line in prompts.decode().splitlines() if line.strip()]

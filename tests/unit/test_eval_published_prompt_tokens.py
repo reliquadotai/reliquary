@@ -18,12 +18,12 @@ class _Tokenizer:
         return range(int(messages[-1]["content"]))
 
 
-def _built(tmp_path):
+def _built(tmp_path, *, tokenizer="fixture/tokenizer"):
     handle = fake_handle([FakeTask(i, prompt=str(n)) for i, n in enumerate((700, 12000, 9000, 16000))])
     directory = tmp_path / "set"
     card = verifiers_source.build_set("verifiers:fake", out=directory, start=0, count=None,
                             sample=None, seed=None, set_id=None, taskset_args={}, open_taskset=opener(handle),
-                            count_tokens="fixture/tokenizer", load_tokenizer=lambda _: _Tokenizer(),
+                            count_tokens=tokenizer, load_tokenizer=lambda _: _Tokenizer(),
                             protocol={"data": {"fixture.json": "1" * 64},
                                 "licenses": [{"id": "MIT", "sha256": "2" * 64}],
                                 "disjointness": {"disjoint": False, "evidence_sha256": "3" * 64}})
@@ -42,7 +42,10 @@ def test_reviewed_publication_preserves_ordered_prompt_lengths_and_is_create_onl
     public_path = tmp_path / "public" / "eval-sets" / card["set_id"] / "set.json"
     public = json.loads(public_path.read_bytes())
 
-    assert public["prompt_tokens"] == card["prompt_tokens"]
+    assert public["prompt_tokens"] == {
+        "chat_template": True, "per_problem": [700, 12000, 9000, 16000],
+        "mean": 9425, "max": 16000,
+    }
     # The first two ordered problems need 12,000 prompt tokens; the full set needs 16,000.
     assert max(public["prompt_tokens"]["per_problem"][:2]) == 12000
     assert public["prompt_tokens"]["max"] == 16000
@@ -53,6 +56,26 @@ def test_reviewed_publication_preserves_ordered_prompt_lengths_and_is_create_onl
     assert again["written"] == []
     assert (_snapshot(tmp_path / "public"), _snapshot(tmp_path / "private")) == published
     assert _snapshot(directory) == frozen
+
+
+def test_reviewed_publication_keeps_tokenizer_provenance_private(tmp_path):
+    directory, card = _built(tmp_path, tokenizer="private/cached-tokenizer")
+    card["prompt_tokens"].update(revision="a" * 40, renderer_id="chat-template-v1",
+                                 extra={"path": "/private/fixture"})
+    card_path = directory / "set.json"
+    card_path.write_bytes(protocol.canonical(card))
+    frozen = card_path.read_bytes()
+    platform, subnet = LocalDirectorySink(tmp_path / "public"), LocalDirectorySink(tmp_path / "private")
+
+    asyncio.run(publish_set(directory, platform=platform, subnet=subnet, publish_reviewed=True))
+
+    public_path = tmp_path / "public" / "eval-sets" / card["set_id"] / "set.json"
+    private_path = tmp_path / "private" / "reliquary" / "eval-sets" / card["set_id"] / "set.json"
+    assert json.loads(public_path.read_bytes())["prompt_tokens"] == {
+        "chat_template": True, "per_problem": [700, 12000, 9000, 16000],
+        "mean": 9425, "max": 16000,
+    }
+    assert private_path.read_bytes() == card_path.read_bytes() == frozen
 
 
 def test_republication_refuses_a_historical_public_card_without_prompt_lengths(tmp_path):
