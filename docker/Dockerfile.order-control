@@ -13,6 +13,11 @@
 #   reliquary-dapo-math              -> reliquary_dapo_math_v1
 #   reliquary-instruction-following  -> reliquary_instruction_following_v1
 #   reliquary-code                   -> reliquary_code_v1
+#
+# The other RL training envs (a training order may name any env of a Gumbel profile with live RL
+# rows: `reliquary.admin.training.trainable_environments`) are installed from reliquary-environments
+# at a pinned commit, below; their artifact pins each file's digest and the version, so the source
+# of the bytes does not matter and a wrong commit fails `order-control-check`.
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
@@ -41,6 +46,23 @@ RUN E="git+https://github.com/reliquadotai/reliquary-environments.git@${ENVS}" \
       "renderers==0.1.11" \
  && pip install --no-deps "reliquary-terminal-bench @ git+https://github.com/reliquadotai/reliquary-environments.git@${TB_ENVS}#subdirectory=environments/code/reliquary_terminal_bench"
 
+# RL training envs beyond the four wheels (`reliquary rl supervise` runs from this image; an order
+# naming one whose distribution is missing crashes its controller at load). Their packages are
+# identical at ENVS and at the commit their artifacts were last cut. reliquary-telecom-solo is
+# 0.1.0a1 (reliquary_telecom_solo_v1, the one the Gumbel profiles name) at its own commit: v2 is
+# 0.2.0a1 of the same distribution, so one image carries one of the two.
+# Runtime data: science, competitive-code and general fetch their corpus from public Hub datasets
+# at pinned revisions (or RELIQUARY_GENERAL_DATA); envscaler_tools_v2 (built in) reads
+# RELIQUARY_ENVSCALER_DATA; hard-math and telecom ship theirs in the package.
+ARG TELECOM_ENVS=a003ffedf4f34bd62d19cdd470920ea497677fdc
+RUN E="git+https://github.com/reliquadotai/reliquary-environments.git" \
+ && pip install \
+      "reliquary-hard-math @ ${E}@${ENVS}#subdirectory=environments/reasoning/reliquary_hard_math" \
+      "reliquary-science @ ${E}@${ENVS}#subdirectory=environments/reasoning/reliquary_science" \
+      "reliquary-competitive-code @ ${E}@${ENVS}#subdirectory=environments/code/reliquary_competitive_code" \
+      "reliquary-general @ ${E}@${ENVS}#subdirectory=environments/general/reliquary_general" \
+      "reliquary-telecom-solo @ ${E}@${TELECOM_ENVS}#subdirectory=environments/tool_use/reliquary_telecom_solo"
+
 # The Verifiers tasksets single-turn eval sets are graded with (built against these),
 # in their own directory at the END of sys.path: the venv's versions always win.
 ARG TASKSETS_REPO=git+https://github.com/PrimeIntellect-ai/research-environments.git@f2e0d70968f9d89421c8035091febee8e9ac3975
@@ -62,8 +84,9 @@ RUN pip install --target /opt/evalsets-site --no-deps \
  && pip install "tiktoken>=0.7" && rm -rf /tmp/reliquary-tasksets
 
 # Fails the build unless bittensor_drand (the partial audit's draw), the hub
-# and tokenizer libraries import and every package verifies against the
-# catalog digest orders are qualified on.
+# and tokenizer libraries import, every package verifies against the
+# catalog digest orders are qualified on, and every env a training order may
+# name is built in or installed at the artifact the registry pins.
 RUN reliquary corpus order-control-check
 
 # Fails the build unless a signed episode job could be served: the pinned sandbox,
@@ -93,7 +116,8 @@ print("ORDER_CONTROL_EPISODES_OK")
 PY
 
 LABEL ai.reliquary.role="order-control" \
-      ai.reliquary.envs-commit="${ENVS}" ai.reliquary.sandbox-commit="${SBX}"
+      ai.reliquary.envs-commit="${ENVS}" ai.reliquary.telecom-envs-commit="${TELECOM_ENVS}" \
+      ai.reliquary.sandbox-commit="${SBX}"
 EXPOSE 8791
 # No wallet and no grader of single-turn orders. Signed episode orders need the order
 # control's own sandbox token key (never the corpus validator's), mounted at run time:

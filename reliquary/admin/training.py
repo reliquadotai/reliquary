@@ -112,6 +112,19 @@ def training_refusal(body: CreateTraining) -> str | None:
     return None
 
 
+def trainable_environments() -> tuple[str, ...]:
+    """Every env some training order may name (``training_refusal`` lets it through): an env of a Gumbel-max
+    profile with live RL rows in the catalog. A controller loads each env its order gives a share, so the host
+    running the controllers carries every one of them (``reliquary corpus order-control-check``)."""
+    from reliquary.env_catalog import entry as catalog_entry
+    from reliquary.protocol.profiles import DRAW_GUMBEL_MAX, PROFILES
+
+    names = {name for profile in PROFILES.values() if profile.sampling.draw == DRAW_GUMBEL_MAX
+             for name in profile.environments}
+    return tuple(sorted(name for name in names
+                        if (env := catalog_entry(name)) is not None and any(r.live for r in env.rows_of("rl"))))
+
+
 def order_digest(body: CreateTraining) -> str:
     """The order as the platform sent it: a replay under the same id must carry the same order."""
     from reliquary.protocol.release_contract import canonical_sha256
@@ -201,4 +214,4 @@ def training_view(entry) -> dict:
 
 
 __all__ = ["CreateTraining", "TRAINING_ORDERS_ENV", "order_digest", "training_enabled", "training_entry", "training_refusal",
-           "training_capabilities", "training_spend", "training_task_id", "training_view"]
+           "training_capabilities", "trainable_environments", "training_spend", "training_task_id", "training_view"]
