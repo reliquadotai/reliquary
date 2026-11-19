@@ -362,7 +362,7 @@ def build_rl_lease_sandbox(
     config, *, validator_hotkey: str, lease_book, environments: Mapping[str, Any], policies: Mapping[str, Any],
     renderer_for: Callable[[Any], Any], registration=None, signer=None, store_kwargs=None, session_store=None,
     read_documents=None, fetch_report=None, clock: Callable[[], float] = time.time,
-    require_resources: bool = False,
+    require_resources: bool = False, task_id: str | None = None,
 ) -> RlLeaseSandbox:
     """``config``: ``sandbox_wiring.SandboxValidatorConfig``; ``lease_book``: the async ``LeaseBook``;
     ``environments[env].source``: each episode env's task source; ``policies[env]``: its ``EpisodeEnvPolicy``
@@ -426,7 +426,7 @@ def build_rl_lease_sandbox(
         issuer, policy=policy, validator_hotkey=validator_hotkey, prefix=RL_PREFIX, registration=registration,
         clock=clock, max_concurrent_closes=config.close_concurrency,
         close_body_timeout_s=config.close_body_timeout_s, max_preauth_closes=config.close_preauth_concurrency,
-        open_body_timeout_s=BODY_TIMEOUT_S, max_preauth_opens=MAX_PREAUTH)
+        open_body_timeout_s=BODY_TIMEOUT_S, max_preauth_opens=MAX_PREAUTH, task_id=task_id)
     checkers = {name: LeaseEpisodeChecker(policy=p, renderer=renderer_for(p), source=environments[name].source,
                                           directory=fleet.directory_if_ready, token_verifier=token_verifier,
                                           renderer_of=lambda variant, p=p, **kw: renderer_for(p, variant=variant,

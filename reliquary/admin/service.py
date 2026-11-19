@@ -25,6 +25,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from reliquary.admin.training import CreateTraining  # a route body model: FastAPI resolves it from globals
 from reliquary.admin.auth import (
     NONCE_HEADER,
     SIGNATURE_HEADER,
@@ -301,7 +302,9 @@ class RegisterExecutor(BaseModel):
     # "eval" executors serve the eval control only (provider_id and host required);
     # "grade" executors (provider_id required) grade and replay for the corpus control, bound to an env
     # pin (model_id = env package, model_revision = env commit).
-    scope: Literal["corpus", "eval", "grade"] = "corpus"
+    # "trainer" executors are a training order's pod, bound to its task (task_id required).
+    scope: Literal["corpus", "eval", "grade", "trainer"] = "corpus"
+    task_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class CreateDelivery(BaseModel):
@@ -450,6 +453,16 @@ def _current_round() -> int:
     return make_round_at(chain["genesis_time"], chain["period"])(time.time()) - 1
 
 
+def _round_time(round_number: int) -> float:
+    """When drand round ``round_number`` was published (``_current_round``'s inverse)."""
+    from reliquary.infrastructure import drand
+
+    chain = drand.get_current_chain()
+    if chain.get("genesis_time") is None or chain.get("period") is None:
+        raise RuntimeError("drand chain parameters unknown")
+    return float(chain["genesis_time"]) + (int(round_number) - 1) * float(chain["period"])
+
+
 def create_admin_app(*, secret: bytes, pool_max: float,
                      models: Mapping[str, QualifiedModel | Mapping], deliveries=None,
                      records=None, clock: Callable[[], float] = time.time,
@@ -461,7 +474,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      model_facts=None, evaluation_sessions=None, pin_model=None,
                      upload_tokenizer=None, subnet_pool=None, tao_usd=None,
                      sandbox_machine_prefix: str | None = None, sandbox_machines=None,
-                     order_sessions=None) -> FastAPI:
+                     order_sessions=None, rl_spend_reader=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
     ``eval_store`` the subnet bucket holding the eval sets' grading files; ``order_sessions``
@@ -470,7 +483,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     ``subnet_pool`` (async, ``chain.subnet_pool``'s answer) and ``tao_usd``
     (async, USD per TAO) convert an order's USD token ceiling. ``sandbox_machine_prefix``
     turns on the sandbox machine routes for the machines named with it (the platform's rented
-    gateways) and only those; ``sandbox_machines`` is the machine directory (``sandbox_store``)."""
+    gateways) and only those; ``sandbox_machines`` is the machine directory (``sandbox_store``).
+    ``rl_spend_reader(run)``: a training task's spend summary or None (default: ``rl_spend.read_spend``)."""
     from reliquary.infrastructure import corpus_executor_store as executors
     from reliquary.infrastructure import corpus_job_store as job_store
     from reliquary.infrastructure import task_registry_store as registry_store
@@ -1469,6 +1483,120 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         return {"task_id": task_id, "status": "retired", "retired_at": stamp}
 
+    from reliquary.admin.training import training_enabled
+
+    if training_enabled():
+        from reliquary.admin.training import (
+            order_digest, training_entry, training_refusal, training_spend, training_task_id, training_view,
+        )
+
+        async def training_task(task_id: str):
+            in_scope(task_id)
+            entries, _ = await registry_store.read_registry(strict=False)
+            entry = entries.get(task_id)
+            if entry is None or "training_order" not in entry.params:
+                raise HTTPException(status_code=404, detail="training_unknown")
+            return entry
+
+        @router.post("/training")
+        async def create_training(body: CreateTraining, response: Response) -> dict:
+            """An async RL task from a training order (``reliquary.admin.training``), priced by the RL auction.
+            A replay of the same order answers its task (200); another order under a used id is refused (409)."""
+            task_id = training_task_id(body, task_prefix)
+            in_scope(task_id)
+            digest = order_digest(body)
+
+            async def replayed() -> dict | None:
+                entries, _ = await registry_store.read_registry(strict=False)
+                existing = entries.get(task_id)
+                if existing is None:
+                    return None
+                if (existing.params.get("training_order") or {}).get("order_sha256") != digest:
+                    raise HTTPException(status_code=409, detail="training_id_reused")
+                response.status_code = 200
+                return {**training_view(existing), "created": False}
+
+            if (answer := await replayed()) is not None:
+                return answer
+            refusal = training_refusal(body)
+            if refusal is not None:
+                raise HTTPException(status_code=422, detail=refusal)
+            try:
+                entry = training_entry(body, task_prefix=task_prefix,
+                                       price_params=await token_price(
+                                           TokenCeiling(input=0.0, output=body.max_price_usd_per_mtoken)),
+                                       created_at=clock())
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            try:
+                await registry_store.create_task(entry, guard=await draining_limits(float(entry.params["cap"])))
+            except (RegistryError, registry_store.RegistryConflict) as exc:
+                if (answer := await replayed()) is not None:      # a concurrent replay created it first
+                    return answer
+                status = 409 if isinstance(exc, RegistryError) else 503
+                raise HTTPException(status_code=status, detail=str(exc)) from exc
+            logger.info("admin: declared training %s as task %s", body.training_id, task_id)
+            response.status_code = 201
+            return {**training_view(entry), "created": True}
+
+        @router.get("/training/{task_id}")
+        async def training_status(task_id: str) -> dict:
+            return training_view(await training_task(task_id))
+
+        @router.get("/training/{task_id}/spend")
+        async def training_spend_route(task_id: str) -> dict:
+            """What the task paid its miners (``rl_spend``, written by its controller), the order's frozen
+            alpha/USD rate and whether the bill is final."""
+            entry = await training_task(task_id)
+            from reliquary.validator import rl_spend
+
+            read = rl_spend_reader or rl_spend.read_spend
+            try:
+                summary = await asyncio.to_thread(read, task_id)      # a training task's run is its task id
+            except Exception as exc:
+                logger.warning("admin: the spend of %s is unreadable: %r", task_id, exc)
+                raise HTTPException(status_code=503, detail="spend_unreadable") from exc
+            if summary is None:
+                raise HTTPException(status_code=404, detail="spend_not_published")
+            if summary.get("task_id") != task_id:
+                raise HTTPException(status_code=503, detail="spend_of_another_task")
+            retired_time = None
+            if entry.retired_at is not None:
+                try:
+                    retired_time = await asyncio.to_thread(_round_time, int(entry.retired_at))
+                except Exception as exc:
+                    raise HTTPException(status_code=503, detail="drand_unavailable") from exc
+            return training_spend(entry, summary, retired_time=retired_time)
+
+        @router.post("/training/{task_id}/retire")
+        async def retire_training(task_id: str, body: Retire) -> dict:
+            entry = await training_task(task_id)
+            if entry.status != "retired":
+                try:
+                    stamp = body.retired_at if body.retired_at is not None else current_round()
+                    await registry_store.retire_task_entry(task_id, stamp)
+                except (RegistryError, registry_store.RegistryConflict) as exc:
+                    entry = await training_task(task_id)
+                    if entry.status != "retired":
+                        raise HTTPException(status_code=409 if isinstance(exc, RegistryError) else 503,
+                                            detail=str(exc)) from exc
+                except RuntimeError as exc:
+                    raise HTTPException(status_code=503, detail=str(exc)) from exc
+            try:
+                await revoke_trainer_pods(task_id)
+            except Exception as exc:
+                logger.warning("admin: the trainer pods of %s were not all revoked: %r", task_id, exc)
+                raise HTTPException(status_code=503, detail="trainer_pods_not_revoked") from exc
+            return training_view(await training_task(task_id))
+
+        async def revoke_trainer_pods(task_id: str) -> None:
+            """A retired order's pods lose the trainer link (each retire call retries what is left)."""
+            for document in await executors.list_executors():
+                if (executors.scope_of(document) == "trainer" and document.get("task_id") == task_id
+                        and document.get("status") == "active"):
+                    await executors.set_executor_status(document["executor_id"], "revoked",
+                                                        reason="training order retired", scope="trainer")
+
     @router.get("/jobs/{job_id}/status")
     async def job_status(job_id: str) -> dict:
         from reliquary.protocol.release_contract import canonical_sha256
@@ -1540,12 +1668,19 @@ def create_admin_app(*, secret: bytes, pool_max: float,
 
     @router.post("/executors")
     async def register_executor(body: RegisterExecutor, response: Response) -> dict:
+        if body.scope == "trainer":
+            if body.task_id is None:
+                raise HTTPException(status_code=422, detail="a trainer executor needs its task_id")
+            entries, _ = await registry_store.read_registry(strict=False)
+            entry = entries.get(body.task_id)
+            if entry is None or "training_order" not in entry.params:
+                raise HTTPException(status_code=422, detail="training_unknown")
         try:
             document, created = await executors.register_executor(
                 executor_id=body.executor_id, token_sha256=body.token_sha256,
                 model_id=body.model_id, model_revision=body.model_revision,
                 expires_at=body.expires_at, now=clock(), provider_id=body.provider_id,
-                host=body.host, scope=body.scope)
+                host=body.host, scope=body.scope, task_id=body.task_id)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except executors.ExecutorConflict as exc:

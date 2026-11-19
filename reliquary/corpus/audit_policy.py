@@ -174,6 +174,22 @@ def forfeits(m: MinerState, received_at: float | None) -> bool:
             and received_at <= m.forfeit_before)
 
 
+def after_operator_failure(m: MinerState, params: AuditParams, now: float,
+                           received_at: float | None) -> MinerState:
+    """Another hotkey of this one's operator (its coldkey) failed a confirmed audit: the operator's unpaid work
+    received up to that failure is forfeited here too (it counted in the failing record's stake), and every
+    record of this hotkey is audited for a suspect period. No failure is counted against this hotkey itself:
+    no probation reset, no step toward a ban (one broken box must not ban an operator's every hotkey)."""
+    if received_at is not None and (m.forfeit_before is None or received_at > m.forfeit_before):
+        m = replace(m, forfeit_before=float(received_at))
+    if m.banned_until is not None and now < m.banned_until:
+        return m
+    until = now + params.suspect_seconds
+    if m.suspect_until is None or m.suspect_until < until:
+        m = replace(m, suspect_until=until)
+    return m
+
+
 def after_confirmed_failure(m: MinerState, params: AuditParams, now: float,
                             submission_id: str, received_at: float | None = None) -> MinerState:
     # Any confirmed failure resets audited_passed: probation (and the ban
