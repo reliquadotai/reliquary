@@ -339,6 +339,13 @@ class CorpusAuditor:
         # flight by id. Dropped once judged, or when the executor that scored them is quarantined.
         self._ahead: dict[str, dict] = {}
         self._ahead_flight: dict[str, asyncio.Future] = {}
+        # Ids a pass is auditing (its outcome taken from ahead, or scored now) until it returns: never sent ahead
+        # meanwhile. 2026-11-19: they were in no other set from the pass taking their outcome to their verdict's
+        # write, the oldest drawn records, so the loop sent each again: half the card's scores were thrown away,
+        # and the auction, sized on the card's scores, opened twice the leases its verdicts could take.
+        self._in_pass: set[str] = set()
+        # Outcomes scored ahead and thrown away (their record judged first): GPU work no verdict used.
+        self.ahead_wasted = 0
         # Rounds raced in the current judge_many: one race per round per pass,
         # never one per record whose draw lands on a failing round.
         self._raced: set[int] = set()
@@ -641,7 +648,8 @@ class CorpusAuditor:
         self._draw_known.pop(submission_id, None)
         self._stake.pop(submission_id, None)
         self._shortest.pop(submission_id, None)
-        self._ahead.pop(submission_id, None)
+        if self._ahead.pop(submission_id, None) is not None:
+            self.ahead_wasted = getattr(self, "ahead_wasted", 0) + 1
         self._read_for_shortest.discard(submission_id)
         getattr(self, "_restart_backlog", set()).discard(submission_id)
         getattr(self, "_audit_reason_of", {}).pop(submission_id, None)
@@ -1403,7 +1411,8 @@ class CorpusAuditor:
         for sids in self._unjudged.values():
             for submission_id in sids:
                 if (submission_id in self._judged or submission_id in self._ahead
-                        or submission_id in self._ahead_flight or submission_id not in self._meta):
+                        or submission_id in self._ahead_flight or submission_id not in self._meta
+                        or submission_id in getattr(self, "_in_pass", ())):
                     continue
                 hotkey, received_at, _ = self._meta[submission_id]
                 if q < 1.0:
@@ -1435,7 +1444,11 @@ class CorpusAuditor:
                 return
             for sid, outcome in zip(ids, await self._audit_outcomes([records[sid] for sid in ids])):
                 # A validator-side error is left for the pass to meet itself.
-                if isinstance(outcome, dict) and sid not in self._judged:
+                if not isinstance(outcome, dict):
+                    continue
+                if sid in self._judged or sid in getattr(self, "_in_pass", ()):
+                    self.ahead_wasted = getattr(self, "ahead_wasted", 0) + 1
+                else:
                     self._ahead[sid] = outcome
         except Exception:
             logger.warning("corpus job %s: audit ahead of %d record(s) failed; their pass audits them",
@@ -1467,6 +1480,19 @@ class CorpusAuditor:
                              deferred: list | None = None) -> tuple[list[dict | None], set[str]]:
         """Audit, re-audit each failure alone, write the verdicts and move each
         hotkey's state. Returns the verdicts and the hotkeys with a confirmed failure."""
+        in_pass = getattr(self, "_in_pass", None)
+        if in_pass is None:
+            in_pass = self._in_pass = set()
+        mine = set(ids) - in_pass
+        in_pass |= mine
+        try:
+            return await self._audit_records_in_pass(ids, records, draws, deferred=deferred)
+        finally:
+            in_pass -= mine
+
+    async def _audit_records_in_pass(self, ids: list[str], records: list[dict],
+                                     draws: dict[str, dict], *,
+                                     deferred: list | None = None) -> tuple[list[dict | None], set[str]]:
         outcomes = await self._outcomes_ahead_or_now(ids, records)
         failing = [k for k, outcome in enumerate(outcomes)
                    if isinstance(outcome, dict) and not outcome["passed"]]
@@ -2165,11 +2191,11 @@ class CorpusAuditor:
             logger.info(
                 "corpus judge pass: job=%s ids=%d total=%.1fs list=%.1fs read=%.1fs "
                 "state=%.1fs decide=%.1fs drand=%.1fs audit=%.1fs gpu_wait=%.1fs "
-                "forward=%.1fs write=%.1fs choices=%s audit_reasons_total=%s",
+                "forward=%.1fs write=%.1fs choices=%s audit_reasons_total=%s ahead_wasted_total=%d",
                 self._job_id, len(submission_ids), time.monotonic() - start,
                 *(self._phase[p] for p in ("list", "read", "state", "decide", "drand", "audit",
                                            "gpu_wait", "forward", "write")),
-                dict(self._choices), dict(getattr(self, "audit_reasons", {})))
+                dict(self._choices), dict(getattr(self, "audit_reasons", {})), getattr(self, "ahead_wasted", 0))
             self._phase.clear()
             self._choices.clear()
 
@@ -2247,8 +2273,13 @@ class CorpusAuditor:
         pending = await self.pending_ids()
         await self._seed(pending)
         self._restart_backlog.update(pending)
+        # All due at one instant, so the heap takes them by arrival: each enqueue read its own clock, a few µs
+        # apart, and the first passes took them in listing (hash) order. A record decided before its operator's
+        # earlier records then found no stake and was audited (2026-11-19: 789 slow-stake audits after a restart).
+        now = self._clock()
         for submission_id in pending:
-            self.enqueue(submission_id, live=False)
+            if submission_id not in self._queued and submission_id not in self._judged:
+                self._schedule(submission_id, now)
 
     async def _next_batch(self) -> list[str]:
         """The due ids, at most RUN_BATCH_IDS, once at least one is due."""
