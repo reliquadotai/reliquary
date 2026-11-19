@@ -63,7 +63,9 @@ def prompt_budget_refusal(card, *, model, revision, renderer_id, count, max_prom
             or measured.get("renderer_id") != renderer_id):
         return None
     lengths = measured.get("per_problem")
-    if isinstance(lengths, list) and len(lengths) >= count:
+    if lengths is not None:
+        if not isinstance(lengths, list) or len(lengths) != card.get("count"):
+            return "prompt_measurements_invalid: expected one token count per frozen prompt"
         prefix = lengths[:count]
         if any(type(length) is not int or length <= 0 for length in prefix):
             return "prompt_measurements_invalid: expected positive token counts"

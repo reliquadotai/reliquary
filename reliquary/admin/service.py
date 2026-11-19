@@ -32,7 +32,7 @@ from reliquary.admin.auth import (
     TIMESTAMP_HEADER,
     HmacVerifier,
 )
-from reliquary.corpus.job import MAX_DRAWN_SEQUENCE_TOKENS, MAX_JOB_PROMPT_TOKENS
+from reliquary.corpus.job import JOB_ID_RE, MAX_DRAWN_SEQUENCE_TOKENS, MAX_JOB_PROMPT_TOKENS
 
 from reliquary.sandbox.evaluation_engagements import EvaluationSessionRequest
 
@@ -725,8 +725,11 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                                        renderer_id=THINKING_RENDERERS[body.thinking], count=body.prompt_count,
                                        max_prompt_tokens=body.max_prompt_tokens)
         if refusal:
+            if not JOB_ID_RE.fullmatch(body.job_id):
+                raise HTTPException(status_code=422, detail=f"unusable job id {body.job_id!r}")
             existing, _ = await job_store.read_job(body.job_id)
-            if existing is None:
+            task_id = body.task_id or body.job_id
+            if existing is None or not any(task.task_id == task_id for task in await entries_naming(body.job_id)):
                 raise HTTPException(status_code=422, detail=refusal)
 
     def refuse_unsupported(result: dict) -> None:
@@ -943,6 +946,9 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 # Our sets are held out: their completions are never deliverable training data.
                 raise HTTPException(status_code=422, detail="a generation order draws from an upload, not an eval set")
             if card.get("source_kind") == "upload":
+                if (body.max_prompt_tokens or 0) > MAX_JOB_PROMPT_TOKENS:
+                    raise HTTPException(status_code=422, detail=(
+                        f"max_prompt_tokens must be at most {MAX_JOB_PROMPT_TOKENS} for a token-ID upload"))
                 if (card.get("model"), card.get("revision")) != (body.model, body.revision):
                     raise HTTPException(status_code=422, detail="the upload was rendered for another model")
                 if evaluation and not card.get("graded"):

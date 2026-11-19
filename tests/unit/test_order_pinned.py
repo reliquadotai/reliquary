@@ -154,6 +154,17 @@ def test_an_upload_longer_than_the_job_allows_is_refused(admin, pins):  # noqa: 
     assert admin("POST", "/admin/v1/jobs", {**body, "max_prompt_tokens": 20_000}).status_code == 201
 
 
+def test_a_token_id_upload_keeps_its_existing_prompt_allowance_limit(admin, pins):
+    pins[MODEL] = _pin(max_position_embeddings=524288)
+    body = _on_upload(admin, max_prompt_tokens=131072)
+    assert admin("POST", "/admin/v1/jobs/validate", body).status_code == 200
+    body["max_prompt_tokens"] += 1
+    for path in ("/admin/v1/jobs/validate", "/admin/v1/jobs"):
+        refused = admin("POST", path, body)
+        assert refused.status_code == 422 and "max_prompt_tokens" in refused.text
+    assert asyncio.run(job_store.read_job(body["job_id"]))[0] is None
+
+
 def test_a_batch_on_an_env_range(admin, pins, monkeypatch):  # noqa: F811
     stub_catalog_env(monkeypatch)
     body = _order("gen", env=GEN_ENV, prompt_start=100, prompt_count=50, eval_set_id=None)
@@ -166,7 +177,7 @@ def test_a_batch_on_an_env_range(admin, pins, monkeypatch):  # noqa: F811
 
 
 def test_a_long_draw_uses_the_model_and_audit_sequence_limits_before_writing(admin, pins):
-    body = _order(max_prompt_tokens=131876, max_new_tokens=8192)
+    body = _order(max_prompt_tokens=134240, max_new_tokens=8192)
     assert "context_too_long" in admin("POST", "/admin/v1/jobs", body).text
     pins[MODEL] = _pin(max_position_embeddings=None)
     assert "context_unknown" in admin("POST", "/admin/v1/jobs", body).text
@@ -183,7 +194,7 @@ def test_a_long_draw_uses_the_model_and_audit_sequence_limits_before_writing(adm
     assert admin("POST", "/admin/v1/jobs", body).status_code == 201
     assert admin("POST", "/admin/v1/jobs", body).status_code == 200
     job, _ = asyncio.run(job_store.read_job(body["job_id"]))
-    assert job.max_prompt_tokens == 131876 and job.sampling.max_new_tokens == 8192
+    assert job.max_prompt_tokens == 134240 and job.sampling.max_new_tokens == 8192
 
 
 def test_exact_set_measurements_bound_only_the_ordered_prefix_and_match_replays(admin, pins):
@@ -205,6 +216,9 @@ def test_exact_set_measurements_bound_only_the_ordered_prefix_and_match_replays(
     assert asyncio.run(qual.EvalJobStore().read(_order()["job_id"])) is None
     assert admin("POST", "/admin/v1/jobs/validate", _order(prompt_count=1)).status_code == 200
     assert admin("POST", "/admin/v1/jobs/validate", _order(max_prompt_tokens=32000)).status_code == 200
+    set_counts({**exact, "per_problem": lengths[:1], "max": 32000})
+    refusal = admin("POST", "/admin/v1/jobs/validate", _order())
+    assert refusal.status_code == 422 and "prompt_measurements_invalid" in refusal.text
     set_counts({**exact, "per_problem": None, "max": 32000})
     assert admin("POST", "/admin/v1/jobs/validate", _order()).status_code == 200
     assert admin("POST", "/admin/v1/jobs/validate", _order(prompt_count=8)).status_code == 422
@@ -218,6 +232,29 @@ def test_exact_set_measurements_bound_only_the_ordered_prefix_and_match_replays(
     assert admin("POST", "/admin/v1/jobs", _order()).status_code == 201
     set_counts(exact)
     assert admin("POST", "/admin/v1/jobs", _order()).status_code == 200
+
+
+def test_a_manifest_without_a_registered_task_cannot_bypass_the_prompt_budget(admin, pins):
+    from reliquary.eval.storage import subnet_key
+
+    body = _order()
+    validated = admin("POST", "/admin/v1/jobs/validate", body)
+    assert validated.status_code == 200, validated.text
+    asyncio.run(job_store.write_job(validated.json()["manifest"], None))
+    key = subnet_key(SET_ID, "set.json")
+    data, etag = admin.bucket.objects[key]
+    card = json.loads(data)
+    card["prompt_tokens"] = {"tokenizer": MODEL, "revision": REVISION, "renderer_id": "chat-template-v1",
+                             "per_problem": [32000] * card["count"]}
+    admin.bucket.objects[key] = (json.dumps(card).encode(), etag)
+
+    for path in ("/admin/v1/jobs/validate", "/admin/v1/jobs"):
+        refused = admin("POST", path, body)
+        assert refused.status_code == 422 and "max_prompt_tokens_too_small" in refused.text
+        invalid_id = admin("POST", path, {**body, "job_id": "order-eval-bad_id"})
+        assert invalid_id.status_code == 422 and "unusable job id" in invalid_id.text
+    assert body["job_id"] not in admin.registry["entries"]
+    assert asyncio.run(qual.EvalJobStore().read(body["job_id"])) is None
 
 
 @pytest.mark.parametrize("change,status,word", [
