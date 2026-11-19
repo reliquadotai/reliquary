@@ -179,6 +179,40 @@ def test_v3_openai_jsonl_holds_one_line_per_prompt_with_its_samples(tmp_path):
     assert body["usage"] == {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}
 
 
+def test_billable_prompt_tokens_count_each_delivered_sample(tmp_path):
+    job = _job()
+    job.sampling.n = 2
+    records = _Records()
+    # Deliver one full two-sample submission and one sample from a submission with a length cut.
+    for sid in (_sid(0), _sid(3)):
+        records.subs[sid]["completions"].append({"text": "second", "tokens": [3, EOS]})
+    records.subs[_sid(3)]["completions"][1]["tokens"] = [3, 4]
+    records.subs[_sid(1)]["rendered_prompt"] = "unfrozen text in an excluded sample"
+    records.verdicts[_sid(4)]["passed"] = False
+    manifest, root = _export(tmp_path, job, records, set_rows=SET_ROWS,
+                             include_truncated=False, output_format="openai_jsonl")
+    report = json.loads((root / "report.json").read_text())
+    assert manifest["billing"] == report["billing"]
+    assert manifest["rows"] == 3
+    assert manifest["billing"]["prompt_tokens"] == 6
+    assert manifest["billing"]["billable_prompt_tokens"] == 9
+    assert manifest["billing"]["completion_tokens"] == 8
+    first = json.loads((root / "output-00000.jsonl").read_text().splitlines()[0])
+    assert first["response"]["body"]["usage"] == {
+        "prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8,
+    }
+
+
+@pytest.mark.parametrize("rendered", ["unfrozen text", token_ids_text([5, 6, 7, 8])])
+def test_billable_prompt_tokens_are_unknown_for_an_unmatched_delivered_prompt(tmp_path, rendered):
+    records = _Records()
+    records.subs[_sid(0)]["rendered_prompt"] = rendered
+    manifest, _ = _export(tmp_path, _job(), records, set_rows=SET_ROWS, count_tokens=lambda _text: 3)
+    assert manifest["rows"] == 4
+    assert manifest["billing"]["prompt_tokens_unknown"] == 0
+    assert manifest["billing"]["billable_prompt_tokens"] is None
+
+
 def test_v3_openai_jsonl_answers_a_chat_request_with_a_chat_completion(tmp_path):
     rows = tuple({**r, "url": "/v1/chat/completions"} for r in SET_ROWS)
     _, root = _export(tmp_path, _job(), _Records(), set_rows=rows, output_format="openai_jsonl")
