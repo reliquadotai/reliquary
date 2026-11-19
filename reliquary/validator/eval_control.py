@@ -1969,6 +1969,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 entry["audits_pending"] = pending
                 # Why the records judged since this process started were audited (`CorpusAuditor._audit_reason`).
                 entry["audit_reasons"] = dict(getattr(auditor, "audit_reasons", {}))
+                # Outcomes scored ahead and thrown away: card work no verdict used (`CorpusAuditor.ahead_wasted`).
+                entry["ahead_wasted"] = int(getattr(auditor, "ahead_wasted", 0))
                 entry["audits_idle_since"] = auditor.audits_idle_since
                 if job_id in dispatcher.reuse_only_jobs:
                     continue

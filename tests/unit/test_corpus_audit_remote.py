@@ -937,3 +937,52 @@ def test_on_a_sampled_job_a_probation_hotkeys_records_are_audited_ahead():
         return auditor._ahead_candidates(16)
 
     assert set(asyncio.run(go())) == set(sids)
+
+
+def test_a_record_its_pass_is_auditing_is_not_sent_ahead_again():
+    """From the pass taking a record's outcome (ahead, or scored now) to its verdict's write, the record is in no
+    other set; the ahead loop sent it again, the oldest drawn record, and threw the score away (2026-11-19: half
+    the card's scores, the auction sized on them opening twice the leases the verdicts could take)."""
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model = _tiny(0)
+    sids = [c * 64 for c in "abcd"]
+    during_write = []
+
+    class _Watched(_Records):
+        async def write_verdict(self, job_id, sid, verdict):
+            during_write.append(auditor._ahead_candidates(8))
+            return await super().write_verdict(job_id, sid, verdict)
+
+    records = _Watched({sid: _record(model) for sid in sids})
+    remote = _AlwaysConnected(model)
+    auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=remote)
+
+    async def go():
+        await auditor._read_all(sids)
+        await auditor._audit_ahead_batch(sids[:2])  # a and b ahead; c and d scored by the pass itself
+        await auditor.audit_many(sids)
+
+    asyncio.run(go())
+    assert during_write and all(candidates == [] for candidates in during_write)
+    assert auditor._in_pass == set() and set(records.verdicts) == set(sids)
+    assert remote.calls == 2 and auditor.ahead_wasted == 0
+
+
+def test_an_outcome_scored_ahead_for_a_record_judged_meanwhile_counts_as_wasted():
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model = _tiny(0)
+    sid = "e" * 64
+    records = _Records({sid: _record(model)})
+    auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=_AlwaysConnected(model))
+
+    async def go():
+        await auditor._read_all([sid])
+        auditor._in_pass.add(sid)
+        await auditor._audit_ahead_batch([sid])
+
+    asyncio.run(go())
+    assert auditor._ahead == {} and auditor.ahead_wasted == 1

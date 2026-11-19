@@ -133,3 +133,19 @@ def test_the_registration_snapshot_knows_each_hotkeys_coldkey():
     assert asyncio.run(registered.refresh()) is True
     assert (registered.coldkey(HK), registered.coldkey(HK2), registered.coldkey("x")) == ("cold", None, None)
     assert asyncio.run(registered.reason(HK2)) is None
+
+
+def test_a_restart_takes_its_pending_records_by_arrival():
+    later, earlier = _ids(False, 1)[0], _ids(False, 1, start=700)[0]
+    assert later < earlier  # listed (sorted by id) the other way round
+    store = _Store({later: _rec(0, received_at=T0 + 100), earlier: _rec(0, received_at=T0)})
+
+    class _Ticking(_Clock):  # a real clock moves between two reads
+        def __call__(self):
+            self.now += 1e-6
+            return self.now
+
+    clock = _Ticking(T0 + 200)
+    auditor = _auditor(store, clock)
+    asyncio.run(auditor._start())
+    assert auditor._take_due(clock.now, 1) == [earlier]
