@@ -763,6 +763,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         if card_body is None or prompts_body is None:
             raise HTTPException(status_code=404, detail="set_unknown")
         card = json.loads(card_body)
+        await require_set_grader(card, body=body)
         if body.env not in (card["env"], card["source"]):
             raise HTTPException(status_code=422, detail=f"set {set_id} is a {card['env']} set")
         if body.prompt_count > int(card["count"]):
@@ -890,6 +891,47 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             raise HTTPException(status_code=404, detail="set_unknown")
         return json.loads(card_body), prompts_body
 
+    def validate_local_grader(card: dict) -> None:
+        from importlib.metadata import PackageNotFoundError, version
+        from reliquary.eval.protocol import validate_set
+        from reliquary.eval.verifiers_source import installed_artifacts, taskset_id
+
+        sealed = validate_set(card, current_grader=True)
+        if (deliveries is None or not getattr(deliveries, "evaluation_supported", True)
+                or not sealed or card.get("source_kind") != "verifiers"
+                or card.get("interaction", "single_turn") != "single_turn"):
+            return
+        # These single-turn rewards run on the admin. Read installed metadata and files without loading a task.
+        taskset = card["taskset"]
+        package = taskset["package"]
+        if taskset_id(card["source"]) != taskset["id"]:
+            raise ValueError("set protocol taskset source drift")
+        expected = (taskset["package_version"], taskset["verifiers_version"], taskset["artifact_sha256"])
+        try:
+            installed = (version(package), version("verifiers"), installed_artifacts(package))
+        except (PackageNotFoundError, OSError, ValueError, TypeError, AttributeError) as exc:
+            raise HTTPException(status_code=503, detail="taskset grader unavailable") from exc
+        if installed != expected:
+            raise ValueError("set protocol taskset grader drift")
+
+    async def require_set_grader(card: dict, *, body: CreateJob | None = None) -> None:
+        if body is not None:
+            from reliquary.corpus.job import JOB_ID_RE
+
+            if not JOB_ID_RE.fullmatch(body.job_id):
+                raise HTTPException(status_code=422, detail=f"unusable job id {body.job_id!r}")
+            existing, _ = await job_store.read_job(body.job_id)
+            task_id = body.task_id or body.job_id
+            if existing is not None and any(entry.task_id == task_id for entry in await entries_naming(body.job_id)):
+                # A manifest left by a failed registry write can still open new work on retry.
+                return
+        try:
+            await asyncio.to_thread(validate_local_grader, card)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise HTTPException(status_code=422, detail="set protocol malformed") from exc
+
     def upload_sampling_differs(sampling: Mapping, body: CreateJob) -> list[str]:
         """An order on an upload's group runs the sampling its lines asked for (``orders.uploads``)."""
         given = {**body.sampling.model_dump(), "max_tokens": body.max_new_tokens, "seed": body.seed,
@@ -926,6 +968,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             if body.prompt_start != 0:
                 raise HTTPException(status_code=422, detail="an order on a set starts at its first problem")
             card, prompts_body = await read_set(body.eval_set_id)
+            if evaluation:
+                await require_set_grader(card, body=body)
             if not evaluation and card.get("source_kind") != "upload":
                 # Our sets are held out: their completions are never deliverable training data.
                 raise HTTPException(status_code=422, detail="a generation order draws from an upload, not an eval set")
@@ -1957,6 +2001,11 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             await refuse_past_the_source(body.env, wanted["prompt_start"], body.problems)
         existing, _ = await qualifications.read(body.qualification_id)
         if existing is None:
+            if body.set_id is not None:
+                card_body = await eval_store.get_bytes(subnet_key(body.set_id, "set.json"))
+                if card_body is None:
+                    raise HTTPException(status_code=404, detail="set_unknown")
+                await require_set_grader(json.loads(card_body))
             # Before any executor is rented: a model that can never be served.
             await refuse_unservable_model(body.model, body.revision)
 

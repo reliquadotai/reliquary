@@ -28,6 +28,21 @@ class FakeTask:
         return [lambda task, trace: 1.0]
 
 
+@pytest.fixture
+def installed_taskset_site(tmp_path, monkeypatch):
+    site = tmp_path / "site"
+    site.mkdir()
+    monkeypatch.syspath_prepend(str(site))
+    for name, version in (("fake-pkg", "1.0"), ("verifiers", "0.3.1")):
+        module = name.replace("-", "_")
+        metadata = site / f"{module}-{version}.dist-info"
+        metadata.mkdir()
+        (metadata / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
+        (metadata / "RECORD").write_text(f"{module}.py,,\n")
+        (site / f"{module}.py").write_text("raise AssertionError('admission imported scorer code')")
+    return site
+
+
 def fake_handle(tasks, *, refuse=lambda task: None, scored=None):
     def score(task, frozen, answer):
         if scored is not None:
