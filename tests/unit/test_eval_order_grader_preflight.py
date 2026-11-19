@@ -6,12 +6,15 @@ import copy
 
 import pytest
 
-from reliquary.corpus.delivery import LocalDirectorySink
+from reliquary.corpus.delivery import HTTPDeliverySink, LocalDirectorySink
+from reliquary.corpus.job import JobError
 from reliquary.eval import protocol
 from reliquary.eval import qualification as qual
 from reliquary.eval.sets import build_set
 from reliquary.eval.storage import SubnetEvalStore, publish_set, subnet_key
 from reliquary.infrastructure import corpus_job_store as job_store
+from reliquary.infrastructure import task_registry_store as registry_store
+from reliquary.shared.task_registry import RegistryError
 from tests.unit.test_admin_eval_jobs import _eval_job, _qualification, _qualify, admin  # noqa: F401
 from tests.unit.test_eval_grading import GradingEnvironment
 from tests.unit.test_eval_verifiers_source import installed_taskset_site  # noqa: F401
@@ -91,6 +94,32 @@ def test_an_existing_job_replay_survives_later_grader_drift(admin, pins, tmp_pat
 
 
 @pytest.mark.parametrize("kind", ["pinned", "qualified"])
+@pytest.mark.parametrize("path", ["/admin/v1/jobs/validate", "/admin/v1/jobs"])
+def test_an_undeclared_manifest_does_not_bypass_grader_preflight(admin, pins, tmp_path, monkeypatch, kind, path):
+    _publish(admin, tmp_path, monkeypatch)
+    body = _body(admin, monkeypatch, kind)
+
+    async def refuse_registry_write(*args, **kwargs):
+        raise RegistryError("registry refused the task")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(protocol, "grader_sha256", lambda: OLD_GRADER)
+        patch.setattr(registry_store, "create_task", refuse_registry_write)
+        assert admin("POST", "/admin/v1/jobs", body).status_code == 409
+    assert asyncio.run(job_store.read_job(body["job_id"]))[0] is not None
+    assert body["job_id"] not in admin.registry["entries"]
+    before = copy.deepcopy(admin.bucket.objects), copy.deepcopy(admin.registry["entries"])
+
+    response = admin("POST", path, body)
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == "set protocol grader drift"
+    assert (admin.bucket.objects, admin.registry["entries"]) == before
+    with monkeypatch.context() as patch:
+        patch.setattr(protocol, "grader_sha256", lambda: OLD_GRADER)
+        assert admin("POST", "/admin/v1/jobs", body).status_code == 201
+
+
+@pytest.mark.parametrize("kind", ["pinned", "qualified"])
 def test_an_unsealed_legacy_card_keeps_its_existing_behavior(admin, pins, tmp_path, monkeypatch, kind):
     _publish(admin, tmp_path, monkeypatch, sealed=False)
     body = _body(admin, monkeypatch, kind)
@@ -140,6 +169,17 @@ def test_a_malformed_job_id_still_returns_422(admin, pins, tmp_path, monkeypatch
     assert response.status_code == 422, response.text
     assert "unusable job id" in response.json()["detail"]
     assert (admin.bucket.objects, admin.registry["entries"]) == before
+
+
+def test_a_job_store_failure_is_not_a_frozen_protocol_refusal(admin, pins, tmp_path, monkeypatch):
+    _publish(admin, tmp_path, monkeypatch, grader=protocol.grader_sha256())
+
+    async def corrupt_stored_job(job_id):
+        raise JobError(f"stored job {job_id!r} is not JSON")
+
+    monkeypatch.setattr(job_store, "read_job", corrupt_stored_job)
+    with pytest.raises(JobError, match="stored job.*is not JSON"):
+        admin("POST", "/admin/v1/jobs", _order(eval_set_id=SET_ID))
 
 
 @pytest.mark.parametrize("malformation", ["missing_file_digest", "source_is_a_list"])
@@ -212,16 +252,20 @@ def test_local_scorer_preflight_preserves_a_replay_after_artifact_drift(admin, p
     assert (admin.bucket.objects, admin.registry["entries"]) == before
 
 
-@pytest.fixture
-def declarations_only(monkeypatch):
+@pytest.fixture(params=["no_sink", "http_only"])
+def declarations_only(monkeypatch, request):
     from tests.unit import test_admin_eval_jobs as fixtures
 
+    deliveries = None if request.param == "no_sink" else HTTPDeliverySink(
+        url="https://delivery.example.invalid", secret="test-delivery-secret" * 2)
     factory = fixtures.create_admin_app
-    monkeypatch.setattr(fixtures, "create_admin_app", lambda **kw: factory(**{**kw, "deliveries": None}))
+    monkeypatch.setattr(fixtures, "create_admin_app", lambda **kw: factory(**{**kw, "deliveries": deliveries}))
 
 
 @pytest.mark.usefixtures("declarations_only")
 def test_an_admin_without_grading_routes_can_declare_for_a_separate_grader(admin, pins, local_taskset):
     site, body = local_taskset
     (site / "fake_pkg.py").unlink()
+    assert admin("POST", "/admin/v1/qualifications", _qualification(set_id=SET_ID)).status_code == 201
+    assert admin("POST", "/admin/v1/jobs/validate", body).status_code == 200
     assert admin("POST", "/admin/v1/jobs", body).status_code == 201
