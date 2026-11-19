@@ -44,6 +44,54 @@ def test_a_successful_generation_resets_the_failure_streak():
     assert client.submitted == [(1, 0), (3, 0)] and slept == [1.0, 1.0]
 
 
+@pytest.mark.parametrize(("error", "failure_limit", "halt"), [
+    pytest.param(RuntimeError("CUDA out of memory"), 2, RuntimeError, id="fatal"),
+    pytest.param(ValueError("prompt exceeds context"), 1, CorpusMinerHalted, id="exhausted"),
+    pytest.param(ValueError("prompt exceeds context"), 2, None, id="recoverable"),
+])
+def test_a_local_failure_releases_swapped_leases_it_will_not_use(error, failure_limit, halt):
+    first_id, failed_id, queued_id = ("aa" * 16, "bb" * 16, "cc" * 16)
+
+    class SwappingClient(_LeasingClient):
+        def ask(self, body):
+            assert body["swap"] is True
+            return {"accepted": True}
+
+        def submit(self, body):
+            answer = super().submit(body)
+            if len(self.submitted) == 1:
+                answer["detail"] = {"next_leases": [
+                    _granted(1, 0, failed_id), _granted(2, 0, queued_id),
+                ]}
+            return answer
+
+    class FailingSecondGeneration(_Gen):
+        def generate_drawn(self, prompt_ids, draws):
+            generations = super().generate_drawn(prompt_ids, draws)
+            if len(self.calls) == 2:
+                raise error
+            return generations
+
+    client = SwappingClient([_granted(0, 0, first_id)])
+
+    def run():
+        return _mine(client, FailingSecondGeneration(), sleep=lambda seconds: None, max_steps=3,
+                     max_consecutive_failures=failure_limit, ask_alpha_per_mtoken=0.2)
+
+    if halt is None:
+        assert run() == {"accepted": 2, "lease_swapped": 2, "generation_failed": 1}
+        assert client.released == [failed_id]
+        assert client.submitted == [(0, 0), (2, 0)]
+    else:
+        with pytest.raises(halt) as caught:
+            run()
+        original_error = caught.value.__cause__ if halt is CorpusMinerHalted else caught.value
+        assert original_error is error
+        assert client.released == [failed_id, queued_id]
+        assert client.submitted == [(0, 0)]
+    assert len(client.lease_bodies) == 1
+
+
 @pytest.mark.parametrize("stage,error", [
     ("render", ValueError("unusable prompt")),
     ("tokenize", RuntimeError("tokenizer failed")),

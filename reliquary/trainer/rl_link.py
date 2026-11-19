@@ -3,7 +3,7 @@
 The buffer, the submissions, the lease book and the prices live in the validator's process (one SQLite file on the
 controller); the trainer runs on its own GPU box, as the window trainer does today. ``TrainerLink`` is the one
 object ``AsyncTrainer`` takes as ``buffer``, ``submissions``, ``book`` and ``prices``: each call is one HTTPS
-request with the bearer token.
+request with the bearer token (plain HTTP only on loopback or with ``RELIQUARY_RL_TRAINER_INSECURE=1``).
 
 Every call retries transport errors, 429 and 5xx with backoff for about ``patience_s`` (a validator restart must not
 cost the trainer its optimizer state), then raises ``TrainerLinkError``. A report whose answer was lost is resent;
@@ -32,12 +32,40 @@ class TrainerLinkError(RuntimeError):
         self.status = status
 
 
+INSECURE_ENV = "RELIQUARY_RL_TRAINER_INSECURE"
+
+
+def check_link_url(base_url: str, environ: Mapping[str, str]) -> None:
+    """ValueError unless ``base_url`` is HTTPS, plain HTTP on loopback, or plain HTTP with ``INSECURE_ENV=1``
+    (a private network only)."""
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(base_url)
+    if parts.scheme == "https":
+        return
+    if parts.scheme != "http":
+        raise ValueError(f"the trainer link URL must be https, got {base_url!r}")
+    host = parts.hostname or ""
+    try:
+        loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback and str(environ.get(INSECURE_ENV, "")).strip() != "1":
+        raise ValueError(f"the trainer link URL {base_url!r} is plain HTTP off loopback: use https, or set "
+                         f"{INSECURE_ENV}=1 on a private network")
+
+
 class TrainerLink:
     def __init__(self, base_url: str, token: str, *, client=None, prefix: str = "/rl/trainer",
                  patience_s: float = PATIENCE_S, backoff_s: Sequence[float] = BACKOFF_S,
-                 sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic) -> None:
+                 sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
+                 environ: Mapping[str, str] | None = None) -> None:
+        import os
+
         import httpx
 
+        check_link_url(base_url, os.environ if environ is None else environ)
         self._base = base_url.rstrip("/") + prefix
         self._client = client or httpx.Client(timeout=httpx.Timeout(120.0, connect=15.0))
         self._headers = {"Authorization": f"Bearer {token}"}
@@ -133,6 +161,16 @@ class TrainerLink:
     def heartbeat(self, patience_s: float = 30.0) -> None:
         """Tell the validator this trainer is alive (it pays miners for the time the trainer is down)."""
         self._call("POST", "heartbeat", {}, patience_s=patience_s)
+
+    # --- the checkpoint bucket, through the validator's presigned URLs ---------------------------------------------
+    def upload_urls(self, keys: Sequence[str]) -> dict[str, str]:
+        return dict(self._call("POST", "uploads", {"keys": list(keys)})["urls"])
+
+    def read_urls(self, keys: Sequence[str]) -> dict[str, str]:
+        return dict(self._call("POST", "reads", {"keys": list(keys)})["urls"])
+
+    def delete_keys(self, keys: Sequence[str]) -> None:
+        self._call("POST", "deletes", {"keys": list(keys)}, resend_ok=True)
 
     # --- the audits (trainer.audits) ------------------------------------------------------------------------------
     def take_audits(self, limit: int) -> list[SubmittedGroup]:

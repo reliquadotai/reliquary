@@ -56,7 +56,7 @@ from reliquary.protocol.rl_submit import (
     rollouts_digest,
 )
 from reliquary.protocol.signatures import (
-    hotkey_signature_bytes, verify_rl_lease_forfeit_signature, verify_rl_lease_mine_signature, verify_rl_lease_signature,
+    hotkey_signature_bytes, verify_rl_ask_signature, verify_rl_lease_forfeit_signature, verify_rl_lease_mine_signature, verify_rl_lease_signature,
     verify_rl_submit_signature,
 )
 from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
@@ -75,8 +75,11 @@ LEASE_STATUS: dict[str, int] = {
     "lease_invalid": 409, "request_reused": 409, "lease_rate": 429,
     "lease_busy": 503, "registration_unavailable": 503, "internal_error": 500,
     "lease_unknown": 404, "lease_closed": 409, "lease_not_yours": 403, "grading_unavailable": 503,
-    "hotkey_required": 401, "submit_busy": 503,
+    "hotkey_required": 401, "submit_busy": 503, "not_auctioned": 404, "ask_invalid": 422, "wrong_task": 403,
 }
+# Set by the RL front (``rl_front``) on a task path's requests only: ``/rl/<task>``. A miner on a task path signs
+# that path (``/rl/<task>/lease``), so its signature holds for that task alone.
+FORWARDED_PREFIX_HEADER = "x-forwarded-prefix"
 REQUEST_SKEW_S = 120
 RETRY_AFTER_S = 10
 SS58_FORMAT = 42
@@ -99,6 +102,17 @@ def rl_lease_path(prefix: str = "/rl") -> str:
     return f"{prefix}/lease"
 
 
+def signed_route(http: Request, route: str, *, task_id: str | None, prefix: str = "/rl") -> str:
+    """The path the caller signed: ``route``, or behind the front's task prefix the same route under
+    ``/rl/<task_id>``. A prefix naming another task (or any, on a controller without a task id) is ``wrong_task``."""
+    forwarded = http.headers.get(FORWARDED_PREFIX_HEADER)
+    if forwarded is None:
+        return route
+    if task_id is None or forwarded != f"/rl/{task_id}":
+        raise _Refused(_refusal("wrong_task", {"prefix": forwarded[:128]}))
+    return forwarded + route[len(prefix):]
+
+
 class RlLeaseRequestBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -107,6 +121,17 @@ class RlLeaseRequestBody(BaseModel):
     environment: str = Field(min_length=1, max_length=128)
     checkpoint: int = Field(ge=0, strict=True)
     prompt_ids: list[int] = Field(min_length=1, max_length=MAX_PROMPTS_PER_REQUEST)
+    signature: str = Field(default="", max_length=256)
+
+
+class RlAskBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    miner_hotkey: str = Field(min_length=1, max_length=64)
+    at: int = Field(ge=0, strict=True)
+    environment: str = Field(min_length=1, max_length=128)
+    micro_alpha_per_mtoken: int = Field(ge=1, le=10**15, strict=True)
+    capacity: int = Field(ge=1, le=10_000, strict=True)
     signature: str = Field(default="", max_length=256)
 
 
@@ -256,13 +281,17 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
                           verify_submit: Callable[..., bool] = verify_rl_submit_signature,
                           verify_mine: Callable[..., bool] = verify_rl_lease_mine_signature,
                           verify_forfeit: Callable[..., bool] = verify_rl_lease_forfeit_signature,
+                          verify_ask: Callable[..., bool] = verify_rl_ask_signature,
                           pay=None, max_episode_body_bytes: int | None = None,
-                          admit: Callable[[str, int], Awaitable[tuple[str, dict] | None]] | None = None) -> APIRouter:
+                          admit: Callable[[str, int], Awaitable[tuple[str, dict] | None]] | None = None,
+                          task_id: str | None = None) -> APIRouter:
     """``max_episode_body_bytes``: the inflated ``/rl/submit`` body an episode group may send (None: no episode
     env served; every body within ``MAX_SUBMIT_BODY_BYTES``). A single-turn group stays within
     ``MAX_SUBMIT_BODY_BYTES`` either way. Bodies may be gzipped (``Content-Encoding: gzip``). ``admit(env,
     prompt_idx)``: why a prompt is not leasable now beyond the book's rules (an episode task the sandbox fleet
-    cannot host), or None; its refusals are answered beside the book's, the other prompts go to the book."""
+    cannot host), or None; its refusals are answered beside the book's, the other prompts go to the book.
+    ``task_id``: the task this controller serves behind the RL front; a signed request that came through a task path
+    is verified against that path (``signed_route``)."""
     audience = ss58_address(validator_hotkey)
     if audience is None:
         raise ValueError("validator_hotkey must be an ss58 account address")
@@ -312,10 +341,13 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
         if why is not None:
             raise _Refused(_refusal("registration_unavailable", {"why": str(why)}, retry_s))
 
+    def route_of(http: Request, route: str) -> str:
+        return signed_route(http, route, task_id=task_id, prefix=prefix)
+
     async def authenticate(raw: bytes, model: type[BaseModel] = RlLeaseRequestBody,
-                           check: Callable[[BaseModel, str], bool] | None = None,
+                           check: Callable[[BaseModel, str, str], bool] | None = None,
                            minutes: OrderedDict = recent,
-                           per_minute: int = LEASE_MAX_PER_MINUTE) -> tuple[BaseModel, str]:
+                           per_minute: int = LEASE_MAX_PER_MINUTE, *, signed: str) -> tuple[BaseModel, str]:
         request, hotkey = await asyncio.to_thread(_decode, raw, model)
         if not request.signature:
             raise _Refused(_refusal("signature_required", {}))
@@ -324,12 +356,12 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
         if abs(int(now) - request.at) > skew:
             raise _Refused(_refusal("stale_request", {"max_skew_s": skew, "now": int(now)}))
         if check is None:
-            def check(request: BaseModel, hotkey: str) -> bool:
+            def check(request: BaseModel, hotkey: str, signed: str) -> bool:
                 return verify(hotkey, at=request.at, environment=request.environment, checkpoint=request.checkpoint,
                               prompt_ids=list(request.prompt_ids), signature=request.signature,
-                              validator_hotkey=audience, path=path)
+                              validator_hotkey=audience, path=signed)
         try:
-            verified = bool(await asyncio.to_thread(check, request, hotkey))
+            verified = bool(await asyncio.to_thread(check, request, hotkey, signed))
         except _Refused:
             raise
         except Exception:
@@ -346,11 +378,12 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
     @router.post(path)
     async def lease(http: Request) -> JSONResponse:
         try:
+            signed = route_of(http, path)
             raw = await _read_within(http, MAX_BODY_BYTES, BODY_TIMEOUT_S)
             if preauth.locked():
                 return _refusal("lease_busy", {"max_concurrent": MAX_PREAUTH}, retry_s)
             async with preauth:
-                request, hotkey = await authenticate(raw)
+                request, hotkey = await authenticate(raw, signed=signed)
             prompts, unplaced = tuple(request.prompt_ids), {}
             if admit is not None and prompts:
                 verdicts = await asyncio.gather(*(admit(request.environment, int(p)) for p in prompts))
@@ -367,7 +400,7 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
             content = answer.to_dict()
             # SQLite reads under the book's lock: off the event loop, like every other book call
             latest, granted, in_use = await asyncio.to_thread(
-                lambda: (book.latest_checkpoint, book.quota.quota(hotkey, now), book.in_use(hotkey)))
+                lambda: (book.latest_checkpoint, book.quota_of(hotkey, now), book.in_use(hotkey)))
             content.update(latest=latest, quota=granted, in_use=in_use,
                            lease_expiry_s=float(book.config.expiry_s[request.environment]))
             if answer.leases:
@@ -388,7 +421,11 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
         now = float(clock())
 
         def read() -> dict:
-            state = book.quota.state(address, now)
+            if book.auctions is not None:            # an auctioned task: the allowances its offers won
+                state = {"hotkey": address, "quota": book.quota_of(address, now),
+                         "auction": book.auctions.view(address)}
+            else:
+                state = book.quota.state(address, now)
             state.update(in_use=book.in_use(address), max_lag=book.config.max_lag, latest=book.latest_checkpoint,
                          lease_expiry_s=expiry_map())
             return state
@@ -401,7 +438,11 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
     mine_path = f"{prefix}/lease/mine"
 
     @router.get(mine_path)
-    async def my_leases(hotkey: str = "", at: str = "", signature: str = "") -> JSONResponse:
+    async def my_leases(http: Request, hotkey: str = "", at: str = "", signature: str = "") -> JSONResponse:
+        try:
+            signed = route_of(http, mine_path)
+        except _Refused as refused:
+            return refused.response
         address = ss58_address(hotkey)
         if address is None:
             return _refusal("malformed_request", {"errors": [{"loc": ["hotkey"], "type": "ss58_address"}]})
@@ -419,7 +460,7 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
         async with preauth:
             try:
                 verified = bool(await asyncio.to_thread(verify_mine, address, at=when, signature=signature,
-                                                        validator_hotkey=audience, path=mine_path))
+                                                        validator_hotkey=audience, path=signed))
             except Exception:
                 verified = False
         if not verified:
@@ -439,33 +480,77 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
 
     forfeit_path = f"{prefix}/lease/forfeit"
 
-    def check_forfeit(request: RlLeaseForfeitBody, hotkey: str) -> bool:
+    def check_forfeit(request: RlLeaseForfeitBody, hotkey: str, signed: str) -> bool:
         return verify_forfeit(hotkey, at=request.at, lease_id=request.lease_id, signature=request.signature,
-                              validator_hotkey=audience, path=forfeit_path)
+                              validator_hotkey=audience, path=signed)
 
     @router.post(forfeit_path)
     async def forfeit(http: Request) -> JSONResponse:
         """A miner gives up an open lease of its own: charged as its expiry, or released when our sandbox side
         verifiably failed it (``LeaseBook.forfeit``)."""
         try:
+            signed = route_of(http, forfeit_path)
             raw = await _read_within(http, MAX_BODY_BYTES, BODY_TIMEOUT_S)
             if preauth.locked():
                 return _refusal("lease_busy", {"max_concurrent": MAX_PREAUTH}, retry_s)
             async with preauth:
-                request, hotkey = await authenticate(raw, RlLeaseForfeitBody, check_forfeit)
+                request, hotkey = await authenticate(raw, RlLeaseForfeitBody, check_forfeit, signed=signed)
             try:
                 lease = await asyncio.to_thread(book.forfeit, request.lease_id, hotkey)
             except LookupError:
                 return _refusal("lease_closed", {"lease_id": request.lease_id})
             logger.info("rl lease %s forfeited by %s%s: %s", lease.lease_id[:12], hotkey[:12],
                         f" ({request.reason})" if request.reason else "", lease.state)
-            quota = await asyncio.to_thread(book.quota.quota, hotkey, float(clock()))
+            quota = await asyncio.to_thread(book.quota_of, hotkey, float(clock()))
             return _answer({"lease_id": lease.lease_id, "state": lease.state, "quota": quota})
         except _Refused as refused:
             return refused.response
         except Exception as exc:
             logger.error("rl lease forfeit failed (%s)", type(exc).__name__)
             return _refusal("internal_error")
+
+    ask_path = f"{prefix}/ask"
+
+    def check_ask(request: RlAskBody, hotkey: str, signed: str) -> bool:
+        return verify_ask(hotkey, at=request.at, environment=request.environment,
+                          micro_alpha_per_mtoken=request.micro_alpha_per_mtoken, capacity=request.capacity,
+                          signature=request.signature, validator_hotkey=audience, path=signed)
+
+    @router.post(ask_path)
+    async def ask(http: Request) -> JSONResponse:
+        """A hotkey's offer on one env of a task priced by auction: it leases nothing on the env without one."""
+        if book.auctions is None:
+            return _refusal("not_auctioned", {})
+        try:
+            signed = route_of(http, ask_path)
+            raw = await _read_within(http, MAX_BODY_BYTES, BODY_TIMEOUT_S)
+            if preauth.locked():
+                return _refusal("lease_busy", {"max_concurrent": MAX_PREAUTH}, retry_s)
+            async with preauth:
+                request, hotkey = await authenticate(raw, RlAskBody, check_ask, signed=signed)
+            why = book.auctions.post_ask(request.environment, hotkey, request.micro_alpha_per_mtoken / 1e6,
+                                         request.capacity)
+            if why is not None:
+                return _refusal("ask_invalid", {"why": why})
+            view = await asyncio.to_thread(book.auctions.view, hotkey)
+            return _answer({"accepted": True, "environment": request.environment,
+                            "auction": view["environments"].get(request.environment, {})})
+        except _Refused as refused:
+            return refused.response
+        except Exception as exc:
+            logger.error("rl ask failed (%s)", type(exc).__name__)
+            return _refusal("internal_error")
+
+    @router.get(f"{prefix}/auction")
+    async def auction(hotkey: str = "") -> JSONResponse:
+        """Per env: the price of the moment, the ceiling, the budget, the leases out and the groups buffered; with
+        ``hotkey``, its own allowance and debt. Never another hotkey's offer."""
+        if book.auctions is None:
+            return _refusal("not_auctioned", {})
+        address = ss58_address(hotkey) if hotkey else None
+        if hotkey and address is None:
+            return _refusal("malformed_request", {"errors": [{"loc": ["hotkey"], "type": "ss58_address"}]})
+        return _answer(await asyncio.to_thread(book.auctions.view, address))
 
     @router.get(f"{prefix}/lease/commitments")
     async def commitments() -> JSONResponse:
@@ -489,14 +574,14 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
         return router
     submit_path = f"{prefix}/submit"
 
-    def check_submit(request: RlSubmitRequestBody, hotkey: str) -> bool:
+    def check_submit(request: RlSubmitRequestBody, hotkey: str, signed: str) -> bool:
         if sorted(r.index for r in request.rollouts) != list(range(submissions.config.rollouts)):
             raise _Refused(_refusal("malformed_request", {
                 "why": f"rollout indices must be exactly 0..{submissions.config.rollouts - 1}"}))
         digest = rollouts_digest([(r.index, r.tokens, r.force_span, r.episode)
                                   for r in sorted(request.rollouts, key=lambda r: r.index)])
         return verify_submit(hotkey, at=request.at, lease_id=request.lease_id, rollouts_digest=digest,
-                             signature=request.signature, validator_hotkey=audience, path=submit_path)
+                             signature=request.signature, validator_hotkey=audience, path=signed)
 
     body_cap = max(MAX_SUBMIT_BODY_BYTES, int(max_episode_body_bytes or 0))
     body_timeout = SUBMIT_BODY_TIMEOUT_S if max_episode_body_bytes is None else EPISODE_SUBMIT_BODY_TIMEOUT_S
@@ -504,6 +589,7 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
     @router.post(submit_path)
     async def submit(http: Request) -> JSONResponse:
         try:
+            signed = route_of(http, submit_path)
             # the hotkey (header) is checked registered before any byte of the body is read or inflated
             claimed = ss58_address(http.headers.get(HOTKEY_HEADER, "").strip())
             if claimed is None:
@@ -534,7 +620,7 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
                 return _refusal("lease_busy", {"max_concurrent": MAX_PREAUTH}, retry_s)
             async with submit_preauth:
                 request, hotkey = await authenticate(raw, RlSubmitRequestBody, check_submit, recent_submits,
-                                                     SUBMIT_MAX_PER_MINUTE)
+                                                     SUBMIT_MAX_PER_MINUTE, signed=signed)
             if hotkey != claimed:
                 return _refusal("malformed_request", {"why": f"{HOTKEY_HEADER} is not the body's miner_hotkey"})
             if len(raw) > MAX_SUBMIT_BODY_BYTES and all(r.episode is None for r in request.rollouts):
@@ -588,5 +674,5 @@ def build_rl_lease_router(*, book: LeaseBook, collector: LeaseCollector, validat
 
 __all__ = [
     "LEASE_MAX_PER_MINUTE", "LEASE_STATUS", "MINE_MAX_PER_MINUTE", "SUBMIT_MAX_PER_MINUTE", "RlLeaseRequestBody", "RlSubmitRequestBody",
-    "build_rl_lease_router", "rl_lease_path", "submitted_rollouts",
+    "FORWARDED_PREFIX_HEADER", "build_rl_lease_router", "rl_lease_path", "signed_route", "submitted_rollouts",
 ]

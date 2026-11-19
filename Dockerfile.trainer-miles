@@ -6,6 +6,8 @@
 # * /opt/trainer-venv runs ``reliquary train-async``: reliquary's full runtime (bittensor for the signed checkpoint
 #   index, boto3 for R2, wandb) on CPU torch. The trainer holds no GPU; the gateway holds them all.
 # At start the trainer refuses a gateway whose reliquary would judge differently (``check_gateway_constants``).
+# No RELIQUARY_MILES_* is needed beyond the ones below: card count, TP, model type, flags and chunk have defaults
+# (``trainer/miles_gateway.py``), and the protocol profile comes from the controller (``/rl/trainer/config``).
 #
 #   docker build -f Dockerfile.trainer-miles -t reliquary-trainer-miles:<tag> .
 ARG MILES_IMAGE=radixark/miles:dev-202611142055

@@ -250,3 +250,51 @@ def test_held_rows_go_out_as_one_row_at_the_flush_step(monkeypatch):
                                            step=12, commit=True)
     telemetry.log_training_step({"x": 1}, step=13)                 # released: sent directly again
     assert fake_wandb.log.call_count == 2
+
+
+def test_without_wandb_the_flushed_row_is_one_compact_log_line(caplog):
+    """W&B off (no key, or WANDB_MODE=disabled): the async trainer's step row still reaches the log, held rows
+    included, as one JSON line a script can parse."""
+    import json
+    import logging
+
+    caplog.set_level(logging.INFO, logger="reliquary.validator.telemetry")
+    telemetry.hold()
+    telemetry.log_training_step({"train/grad_norm": 0.25}, step=4)
+    telemetry.flush({"async/train_s": 985.5, "async/completion_tokens": 9_000_000}, 4)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("telemetry step=")]
+    assert len(lines) == 1
+    head, payload = lines[0].split(" ", 2)[1:]
+    assert head == "step=4" and "\n" not in payload
+    assert json.loads(payload) == {"train/grad_norm": 0.25, "async/train_s": 985.5,
+                                   "async/completion_tokens": 9_000_000}
+    caplog.clear()
+    telemetry.log_training_step({"x": 1.0}, step=5)                # not held, no W&B: no line
+    assert not [r for r in caplog.records if r.getMessage().startswith("telemetry step=")]
+
+
+def test_the_log_line_survives_values_json_cannot_encode(caplog):
+    import json
+    import logging
+
+    import numpy as np
+    import torch
+
+    caplog.set_level(logging.INFO, logger="reliquary.validator.telemetry")
+    telemetry.hold()
+    telemetry.flush({"a": np.float32(1.5), "b": torch.tensor(2.0), "c": float("nan"), "d": object()}, None)
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("telemetry step="))
+    row = json.loads(line.split(" ", 2)[2])
+    assert row["a"] == 1.5 and row["b"] == 2.0 and row["c"] is None and isinstance(row["d"], str)
+
+
+def test_with_wandb_the_flush_logs_no_extra_line(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setenv("WANDB_API_KEY", "fake-key")
+    monkeypatch.setitem(__import__("sys").modules, "wandb", MagicMock())
+    caplog.set_level(logging.INFO, logger="reliquary.validator.telemetry")
+    telemetry.init(hotkey_ss58="5" * 48, config={})
+    telemetry.hold()
+    telemetry.flush({"async/train_s": 1.0}, 1)
+    assert not [r for r in caplog.records if r.getMessage().startswith("telemetry step=")]

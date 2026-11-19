@@ -448,14 +448,18 @@ def lease_body(job_id: str, hotkey: str, sign_lease) -> dict:
     return body
 
 
-def ask_body(job_id: str, hotkey: str, alpha_per_mtoken: float, sign_lease, capacity: int | None = None) -> dict:
+def ask_body(job_id: str, hotkey: str, alpha_per_mtoken: float, sign_lease, capacity: int | None = None,
+             swap: bool = False) -> dict:
     """A fresh signed offer (``CorpusAskRequest``): ``alpha_per_mtoken`` in micro-alpha and the samples this hotkey
-    holds at once (``capacity``, left out for 1), signed as a lease is."""
+    holds at once (``capacity``, left out for 1), signed as a lease is. ``swap``: its next leases come in its
+    accepted submissions' answers."""
     body = {"job_id": job_id, "miner_hotkey": hotkey,
             "micro_alpha_per_mtoken": max(1, round(float(alpha_per_mtoken) * 1e6)),
             "issued_at": int(time.time()), "nonce": secrets.token_hex(16)}
     if capacity is not None:
         body["capacity"] = int(capacity)
+    if swap:
+        body["swap"] = True
     body["signature"] = sign_lease(body)
     return body
 
@@ -499,6 +503,21 @@ def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
     leasing = sign_lease is not None and callable(getattr(client, "lease", None))
     asking = leasing and ask_alpha_per_mtoken is not None and callable(getattr(client, "ask", None))
     asked_at = [None]
+    # The offer swaps: each accepted submission's answer carries the next leases (``next_leases``), kept here
+    # and used before asking for one. A validator that predates it refuses the field (422): asked without.
+    swapping = [asking]
+    ready: list[dict] = []
+
+    def ask_call():
+        try:
+            return client.ask(ask_body(job.job_id, hotkey, ask_alpha_per_mtoken, sign_lease, ask_capacity,
+                                       swap=swapping[0]))
+        except CorpusPermanentFailure as exc:
+            if not (swapping[0] and exc.status == 422):
+                raise
+            swapping[0] = False
+            logger.info("the validator predates swapped leases: leasing by request")
+            return client.ask(ask_body(job.job_id, hotkey, ask_alpha_per_mtoken, sign_lease, ask_capacity))
 
     def post_ask(force: bool = False) -> None:
         from reliquary.corpus.token_auction import ASK_REPOST_SECONDS
@@ -506,9 +525,7 @@ def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
         now = time.monotonic()
         if not asking or (not force and asked_at[0] is not None and now - asked_at[0] < ASK_REPOST_SECONDS):
             return
-        answer = _retry(lambda: client.ask(ask_body(job.job_id, hotkey, ask_alpha_per_mtoken, sign_lease,
-                                                    ask_capacity)),
-                        **retry_kwargs)
+        answer = _retry(ask_call, **retry_kwargs)
         asked_at[0] = now
         if answer is not None and not answer.get("accepted"):
             counts[f"ask_{answer.get('reason')}"] += 1
@@ -535,12 +552,21 @@ def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
                 logger.exception("could not release a corpus lease after a generation failure")
                 return
 
+    def release_abandoned_leases(lease_id: str | None) -> None:
+        release_failed_lease(lease_id)
+        for lease in ready:
+            release_failed_lease(str(lease["lease_id"]))
+
     while max_steps is None or steps < max_steps:
         steps += 1
         lease_id = None
         choice = None
         post_ask()
-        if leasing:
+        if leasing and ready:
+            given = ready.pop(0)
+            choice, lease_id = (int(given["prompt_index"]), int(given["slot"])), str(given["lease_id"])
+            counts["lease_swapped"] += 1
+        elif leasing:
             answer = _retry(lambda: client.lease(lease_body(job.job_id, hotkey, sign_lease)), **retry_kwargs)
             reason = None if answer is None else str(answer.get("reason"))
             if answer is not None and answer.get("leased"):
@@ -589,22 +615,23 @@ def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
             rendered = render(prompt_index)
             draws = [draw_context(job, prompt_index, slot, c) for c in range(job.sampling.n)]
         except Exception:
-            release_failed_lease(lease_id)
+            release_abandoned_leases(lease_id)
             raise
         try:
             generations = generator.generate_drawn(prompt_token_ids(tokenizer, rendered), draws)
         except ValueError as exc:
             logger.warning("dropping a corpus generation step: %s", exc)
             counts["generation_failed"] += 1
-            release_failed_lease(lease_id)
             generation_failures += 1
             if generation_failures >= max_consecutive_failures:
+                release_abandoned_leases(lease_id)
                 raise CorpusMinerHalted(
                     f"{generation_failures} consecutive generation failures: {exc}", counts=counts) from exc
+            release_failed_lease(lease_id)
             sleep(_TRANSIENT_BACKOFF_SECONDS[min(generation_failures - 1, len(_TRANSIENT_BACKOFF_SECONDS) - 1)])
             continue
         except Exception:
-            release_failed_lease(lease_id)
+            release_abandoned_leases(lease_id)
             raise
         generation_failures = 0
         try:
@@ -613,11 +640,14 @@ def _mine_draw_steps(*, job, hotkey, client, generator, tokenizer, render, sign,
                 rendered_prompt=rendered, generations=generations, tokenizer=tokenizer, sign=sign,
             )
         except Exception:
-            release_failed_lease(lease_id)
+            release_abandoned_leases(lease_id)
             raise
         answer = _retry(lambda: client.submit(body), **retry_kwargs)
         reason = str(answer.get("reason"))
         counts[reason] += 1
+        if leasing:
+            ready.extend(lease for lease in (answer.get("detail") or {}).get("next_leases") or ()
+                         if isinstance(lease, dict) and lease.get("lease_id") is not None)
         if lease_id is not None and not answer.get("accepted") and reason != REASON_DRAW_SLOT_TAKEN:
             # Refused but not taken: the slot is free again for another miner at once.
             _retry(lambda: client.release_lease(release_body(job.job_id, hotkey, lease_id, sign_lease)),

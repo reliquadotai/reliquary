@@ -914,3 +914,117 @@ def test_the_audit_backlog_leaves_out_records_with_no_gpu_work_left():
     auditor._undrawn.add(a)
     auditor._ahead[b] = {"passed": True}
     assert auditor.audit_backlog() == 1
+
+
+def test_on_a_sampled_job_a_probation_hotkeys_records_are_audited_ahead():
+    """Records sure to be audited because their hotkey is in probation (or too slow to be sampled) are sent ahead
+    too, not only drawn ones: the card keeps working between passes (2026-11-18)."""
+    from reliquary.corpus.audit_policy import AuditParams, MinerState
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model = _tiny(0)
+    sids = [f"{i:x}" * 64 for i in range(1, 5)]
+    records = _Records({sid: _record(model) for sid in sids})
+    auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=_AlwaysConnected(model), params=AuditParams(q=0.5),
+                            round_at=lambda t: 100)
+
+    async def go():
+        await auditor._read_all(sids)
+        assert auditor._ahead_candidates(16) == []          # standing unknown, round not out: nothing sure
+        hotkey = auditor._meta[sids[0]][0]
+        auditor._state_cache[hotkey] = MinerState()          # no audited pass yet: probation
+        return auditor._ahead_candidates(16)
+
+    assert set(asyncio.run(go())) == set(sids)
+
+
+def test_a_record_its_pass_is_auditing_is_not_sent_ahead_again():
+    """From the pass taking a record's outcome (ahead, or scored now) to its verdict's write, the record is in no
+    other set; the ahead loop sent it again, the oldest drawn record, and threw the score away (2026-11-19: half
+    the card's scores, the auction sized on them opening twice the leases the verdicts could take)."""
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model = _tiny(0)
+    sids = [c * 64 for c in "abcd"]
+    during_write = []
+
+    class _Watched(_Records):
+        async def write_verdict(self, job_id, sid, verdict):
+            during_write.append(auditor._ahead_candidates(8))
+            return await super().write_verdict(job_id, sid, verdict)
+
+    records = _Watched({sid: _record(model) for sid in sids})
+    remote = _AlwaysConnected(model)
+    auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=remote)
+
+    async def go():
+        await auditor._read_all(sids)
+        await auditor._audit_ahead_batch(sids[:2])  # a and b ahead; c and d scored by the pass itself
+        await auditor.audit_many(sids)
+
+    asyncio.run(go())
+    assert during_write and all(candidates == [] for candidates in during_write)
+    assert auditor._in_pass == set() and set(records.verdicts) == set(sids)
+    assert remote.calls == 2 and auditor.ahead_wasted == 0
+
+
+def test_a_pass_takes_the_outcome_of_an_ahead_batch_in_flight_when_it_took_the_record():
+    """2026-11-19: the batch saw the record in its pass and dropped the outcome the pass was waiting for; the pass
+    then scored it again (ahead used 1-5 a pass, 395 outcomes thrown away in 20 min)."""
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model = _tiny(0)
+    sid = "f" * 64
+    records = _Records({sid: _record(model)})
+    remote = _AlwaysConnected(model)
+    auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=remote)
+    release = asyncio.Event()
+    score = remote.score
+
+    async def held_score(items):
+        await release.wait()
+        return await score(items)
+
+    remote.score = held_score
+
+    async def go():
+        await auditor._read_all([sid])
+        flight = asyncio.ensure_future(auditor._audit_ahead_batch([sid]))
+        auditor._ahead_flight[sid] = flight
+        await asyncio.sleep(0)
+        judging = asyncio.ensure_future(auditor.audit_many([sid]))
+        await asyncio.sleep(0.05)
+        release.set()
+        await judging
+
+    asyncio.run(go())
+    assert remote.calls == 1 and auditor.ahead_wasted == 0
+    assert records.verdicts[sid]["passed"] is True
+
+
+def test_an_outcome_scored_ahead_for_a_record_judged_meanwhile_counts_as_wasted():
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model = _tiny(0)
+    sid = "e" * 64
+    records = _Records({sid: _record(model)})
+    remote = _AlwaysConnected(model)
+    auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=remote)
+    score = remote.score
+
+    async def judged_meanwhile(items):
+        auditor._judged.add(sid)  # its verdict landed while the batch flew
+        return await score(items)
+
+    remote.score = judged_meanwhile
+
+    async def go():
+        await auditor._read_all([sid])
+        await auditor._audit_ahead_batch([sid])
+
+    asyncio.run(go())
+    assert auditor._ahead == {} and auditor.ahead_wasted == 1

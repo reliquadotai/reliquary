@@ -30,10 +30,14 @@ PRESIGN_TTL_SECONDS = 900
 REFRESH_SECONDS = 5.0
 
 
-def presigner(client: Any, bucket: str, ttl: int = PRESIGN_TTL_SECONDS) -> Callable[[str], str]:
+UPLOAD_TTL_SECONDS = 3600
+
+
+def presigner(client: Any, bucket: str, ttl: int = PRESIGN_TTL_SECONDS,
+              operation: str = "get_object") -> Callable[[str], str]:
     def presign(key: str) -> str:
         return client.generate_presigned_url(
-            "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=int(ttl))
+            operation, Params={"Bucket": bucket, "Key": key}, ExpiresIn=int(ttl))
     return presign
 
 
