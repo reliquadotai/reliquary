@@ -53,8 +53,39 @@ def episode_renderer_refusal(architecture: str | None, renderer: str | None, *,
     return None
 
 
+def prompt_budget_refusal(card, *, model, revision, renderer_id, count, max_prompt_tokens):
+    """The selected prefix's measured length applies only to its own model revision and renderer."""
+    from reliquary.miner.corpus_miner import PROMPT_ALLOWANCE_TOKENS
+
+    measured = card.get("prompt_tokens")
+    if (card.get("interaction", "single_turn") != "single_turn" or not isinstance(measured, dict)
+            or not revision or measured.get("revision") != revision or measured.get("tokenizer") != model
+            or measured.get("renderer_id") != renderer_id):
+        return None
+    lengths = measured.get("per_problem")
+    if lengths is not None:
+        if not isinstance(lengths, list) or len(lengths) != card.get("count"):
+            return "prompt_measurements_invalid: expected one token count per frozen prompt"
+        prefix = lengths[:count]
+        if any(type(length) is not int or length <= 0 for length in prefix):
+            return "prompt_measurements_invalid: expected positive token counts"
+        longest = max(prefix)
+    elif count == card.get("count") and "max" in measured:
+        longest = measured["max"]
+        if type(longest) is not int or longest <= 0:
+            return "prompt_measurements_invalid: expected a positive maximum"
+    else:
+        # A whole-set maximum cannot prove that a shorter prefix exceeds its allowance.
+        return None
+    allowance = max(PROMPT_ALLOWANCE_TOKENS, max_prompt_tokens or 0)
+    if longest > allowance:
+        return f"max_prompt_tokens_too_small: the selected prompts need {longest} tokens, the job reserves {allowance}"
+    return None
+
+
 def eval_job_source(*, job_id, eval_set, prompt_count, prompt_start, renderer_id, audit_q,
-                    grader_id, threshold, from_profile, episode=None):
+                    grader_id, threshold, from_profile, episode=None, model=None, revision=None,
+                    max_prompt_tokens=None):
     """What an evaluation job served by our own validator is declared from: the
     set's first N problems as its prompt source (checked against the lines'
     sha256), the set's environment as its contract's, a seed from its id.
@@ -92,6 +123,10 @@ def eval_job_source(*, job_id, eval_set, prompt_count, prompt_start, renderer_id
     count = int(card["count"]) if prompt_count is None else int(prompt_count)
     if not 1 <= count <= int(card["count"]):
         raise ValueError(f"set {eval_set} holds {card['count']} problems, not {count}")
+    refusal = prompt_budget_refusal(card, model=model, revision=revision, renderer_id=renderer_id,
+                                   count=count, max_prompt_tokens=max_prompt_tokens)
+    if refusal:
+        raise ValueError(refusal)
     source = eval_source_for(eval_set, prompts, count)
     register_eval_prompts(source, prompts)
     seed = int(hashlib.sha256(job_id.encode()).hexdigest()[:15], 16)

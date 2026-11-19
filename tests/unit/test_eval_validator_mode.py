@@ -154,6 +154,22 @@ def test_jobs_create_declares_an_eval_job_on_any_model(bucket, registry, publish
     assert entry.contract["model_id"] == "org/Teutonic"
 
 
+def test_jobs_create_checks_the_exact_context_before_writing(bucket, registry, published, tmp_path):
+    import json
+    from typer.testing import CliRunner
+    from reliquary.cli.main import app
+
+    published["prompt_tokens"] = {"tokenizer": "org/Teutonic", "revision": REVISION,
+                                  "renderer_id": "chat-template-thinking-v1", "per_problem": [4, 60000, 2, 2, 4]}
+    (tmp_path / published["set_id"] / "set.json").write_text(json.dumps(published))
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    refused = CliRunner().invoke(app, _eval_args())
+    assert refused.exit_code == 1 and "60000" in refused.output
+    assert list(registry["entries"]) == ["default"] and not bucket.objects
+    created = CliRunner().invoke(app, _eval_args(**{"--prompt-count": "1"}))
+    assert created.exit_code == 0, created.output
+
+
 def test_the_whole_set_by_default(bucket, registry, published):
     import asyncio
 
