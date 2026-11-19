@@ -292,7 +292,10 @@ def test_the_rl_identity_is_read_from_a_backup_name_or_given():
 
     assert rl_provenance("org/Teutonic") == {}
     assert rl_provenance("ReliquaryForge/teutonic-rl-step-00000050") == {
-        "rl_step": 50, "rl_checkpoint_version": 50}
+        "rl_step": 50}
+    # A backup's optimizer step does not establish its publication version.
+    assert rl_provenance("org/backup-step-00000050", checkpoint_version=10) == {
+        "rl_step": 50, "rl_checkpoint_version": 10}
     assert rl_provenance("ReliquaryForge/teutonic-rl-step-00000050", run_id="abc-r1-trainer",
                          step=51, checkpoint_version=49) == {
         "rl_run_id": "abc-r1-trainer", "rl_step": 51, "rl_checkpoint_version": 49}

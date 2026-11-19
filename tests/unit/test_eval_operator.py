@@ -181,6 +181,34 @@ def test_compare_refuses_different_conditions(tmp_path):
         op.compare_reports(tmp_path / "a", tmp_path / "c")
 
 
+def test_compare_refuses_a_different_served_job_seed(tmp_path):
+    for side, seed in (("a", 7), ("b", 8)):
+        directory = tmp_path / side
+        write_grading(directory, n_problems=1, correct={"p0": [True, True]})
+        path = directory / "report.json"
+        report = json.loads(path.read_text())
+        report["provenance"]["seed"] = seed
+        path.write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="seed"):
+        op.compare_reports(tmp_path / "a", tmp_path / "b")
+
+
+@pytest.mark.parametrize("partial, match", [
+    ({"protocol_sha256": "e" * 64}, "protocol_json producer bytes"),
+    ({"protocol_json": "{}"}, "incomplete request protocol envelope"),
+])
+def test_compare_refuses_a_partial_pinned_protocol(tmp_path, partial, match):
+    for side in ("a", "b"):
+        directory = tmp_path / side
+        write_grading(directory, n_problems=1, correct={"p0": [True, True]})
+        path = directory / "report.json"
+        report = json.loads(path.read_text())
+        report.update(partial)
+        path.write_text(json.dumps(report))
+    with pytest.raises(ValueError, match=match):
+        op.compare_reports(tmp_path / "a", tmp_path / "b")
+
+
 def test_a_failed_qualification_is_asked_again_only_with_another_attempt(admin):  # noqa: F811
     client, logs = client_for(admin), []
     card = card_of(admin)

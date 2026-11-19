@@ -104,6 +104,67 @@ def test_a_report_without_an_rl_run_id_is_taken_as_named():
         build_feed("bad id", [("j", report(step=3))], observed_at_ms=NOW)
 
 
+@pytest.mark.parametrize("change", [
+    lambda p: p["sampling"].update(seed=8),
+    lambda p: p.update(seed=8),
+    lambda p: p["sets"][0].update(environment_manifest_sha256="d" * 64),
+    lambda p: p["sets"][0].update(protocol_sha256="e" * 64),
+    lambda p: p["sets"][0].update(source_kind="verifiers", taskset_at_grading={
+        "package_version": "1.0", "verifiers_version": "0.3.1"}),
+])
+def test_feed_refuses_changed_sampling_or_source_identity(change):
+    baseline, checkpoint = report(), report(step=3)
+    change(checkpoint["provenance"])
+    with pytest.raises(ValueError, match="another protocol"):
+        build_feed(RUN, [("j", checkpoint)], [("base", baseline)], observed_at_ms=NOW)
+
+
+def _pinned_report(*, step=None, timeout=300):
+    from reliquary.eval import protocol as ep
+
+    result = report(step=step)
+    provenance = result["provenance"]
+    provenance["sampling"]["seed"] = 7
+    provenance["sets"][0]["protocol_sha256"] = "e" * 64
+    body = {"schema": ep.REQUEST_PROTOCOL,
+            "sets": [{key: provenance["sets"][0][key] for key in ("set_id", "env", "problems", "samples")}],
+            "protocol_bindings": {provenance["sets"][0]["set_id"]: "e" * 64},
+            "sampling": provenance["sampling"], "thinking": True, "max_new_tokens": 32768,
+            "harness": "single-turn", "max_turns": 1, "max_episode_tokens": 65536,
+            "episode_timeout_seconds": timeout, "interaction": "single_turn"}
+    # Keep another producer's numeric spelling; identity is the exact UTF-8 bytes.
+    raw = ep.canonical(body).decode().replace("0.6", "6e-1")
+    import hashlib
+
+    result.update(protocol=body, protocol_json=raw,
+                  protocol_sha256=hashlib.sha256(raw.encode()).hexdigest(),
+                  protocol_bindings=body["protocol_bindings"])
+    return result
+
+
+def test_feed_binds_the_exact_request_protocol_and_validates_its_bytes():
+    baseline, checkpoint = _pinned_report(), _pinned_report(step=3)
+    feed = build_feed(RUN, [("j", checkpoint)], [("base", baseline)], observed_at_ms=NOW)
+    assert feed["benchmarks"][0]["baseline"]["step"] is None
+    with pytest.raises(ValueError, match="another protocol"):
+        build_feed(RUN, [("j", _pinned_report(step=3, timeout=301))], [("base", baseline)],
+                   observed_at_ms=NOW)
+    checkpoint["protocol_json"] += " "
+    with pytest.raises(ValueError, match="digest/body mismatch"):
+        build_feed(RUN, [("j", checkpoint)], observed_at_ms=NOW)
+
+
+@pytest.mark.parametrize("partial, match", [
+    ({"protocol_sha256": "e" * 64}, "protocol_json producer bytes"),
+    ({"protocol_json": "{}"}, "incomplete request protocol envelope"),
+])
+def test_feed_refuses_a_partial_pinned_protocol(partial, match):
+    checkpoint = report(step=3)
+    checkpoint.update(partial)
+    with pytest.raises(ValueError, match=match):
+        build_feed(RUN, [("j", checkpoint)], observed_at_ms=NOW)
+
+
 # --- the platform's validator, case by case (shared/run-benchmarks.ts) ------------------------------------------
 
 def _valid():
