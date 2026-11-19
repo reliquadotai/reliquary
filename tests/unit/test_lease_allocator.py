@@ -445,3 +445,32 @@ def test_after_a_restart_the_merit_order_resumes_at_once(monkeypatch, tmp_path):
     clock.now += la.STEP_SECONDS
     restarted.admit("zero")
     assert restarted.view()["allocator"] == "merit"
+
+
+def test_after_a_restart_the_audited_share_from_before_stands_until_enough_verdicts(monkeypatch, tmp_path):
+    """A fresh auditor reads its share near q (its prior): the share kept from before the restart stands until
+    Q_TRUSTED_DECISIONS verdicts land, so R* is not twice too high."""
+    import reliquary.corpus.token_auction as ta
+
+    clock = Clock()
+    monkeypatch.setenv(la.MERIT_ENV, "all")
+    monkeypatch.setattr(la, "_PACES", {})
+    params = AuctionParams(ceiling=0.706 / 1e6 / EMISSION, miner_alpha_per_period=EMISSION, initial_leases=8)
+    share, weight = [0.43], [1000]
+    auction = TokenAuction(params, clock=clock, holdings=Book(), market_name="m|turn", job_id="job",
+                           backlog=lambda: 0, state_path=tmp_path / "job.json")
+    auction.bind_merit(audit=lambda: (1_000.0, 0.9), q=lambda: share[0], q_weight=lambda: weight[0])
+    auction._report(clock.now, {})
+    auction._dirty = True
+    auction.save(force=True)
+    monkeypatch.setattr(la, "_PACES", {})
+    restarted = TokenAuction(params, clock=clock, holdings=Book(), market_name="m|turn", job_id="job",
+                             backlog=lambda: 0, state_path=tmp_path / "job.json")
+    share[0], weight[0] = 0.21, 40                    # the fresh auditor: few verdicts, near its prior
+    reports = []
+    monkeypatch.setattr(restarted._pace, "report", lambda job, **kw: reports.append(kw["q"]))
+    restarted.bind_merit(audit=lambda: (1_000.0, 0.9), q=lambda: share[0], q_weight=lambda: weight[0])
+    restarted._report(clock.now, {})
+    weight[0] = ta.Q_TRUSTED_DECISIONS
+    restarted._report(clock.now, {})
+    assert reports == [pytest.approx(0.43), pytest.approx(0.21)]
