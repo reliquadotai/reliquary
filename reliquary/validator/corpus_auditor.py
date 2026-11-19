@@ -60,8 +60,9 @@ MAX_CONSECUTIVE_VALIDATOR_ERRORS = 5
 # What fits depends on the card and checkpoint (131,072 overran an H100 beside
 # Qwen3.8-27B), so the operator may lower it.
 AUDIT_BATCH_TOKENS = int(os.environ.get("RELIQUARY_CORPUS_AUDIT_BATCH_TOKENS", "131072"))
-# Store reads in flight at once when many records must be read before judging.
-READ_CONCURRENCY = 16
+# Store reads in flight at once when many records must be read before judging. At 16 a 9B order's pass read
+# ~9 records/s on 2026-11-19, its arrival rate: each pass spent ~17 min reading and the audit card idled.
+READ_CONCURRENCY = 64
 # Records read at once only for their shortest completion (`_learn_shortest`), then dropped.
 SHORTEST_READ_SLICE = 64
 # Verdict writes in flight at once. One at a time, each create-only PUT took
