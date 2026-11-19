@@ -1494,7 +1494,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                        read_entries=None, clock: Callable[[], float] = time.time,
                        refresh_every_seconds: float = 60.0, qualification_store=None,
                        order_jobs=None, sandbox=None, sandbox_down: str | None = None,
-                       model_dir_for=None, signed_wiring=None, suite_replayer_for=None):
+                       model_dir_for=None, signed_wiring=None, suite_replayer_for=None,
+                       operator_of: Callable[[str], str | None] | None = None):
     """The app and the job set of the eval control. Each wired job gets its own
     tokenizer, renderer, router, auditor (an executor pair per batch) and
     settler; ``read_entries`` makes the set hot.
@@ -1505,7 +1506,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     episode order is refused. ``model_dir_for(repo, revision)``: the model's tokenizer files
     the turn renderer loads; ``signed_wiring``: extra ``wire_signed_job`` arguments (tests).
     A suite episode order needs no sandbox: replayed here, by ``suite_replayer_for(tokenizer)``
-    (``suite_intake.PoolSuiteReplayer`` by default)."""
+    (``suite_intake.PoolSuiteReplayer`` by default). ``operator_of(hotkey)``: its registration's coldkey (None:
+    unknown), whose hotkeys every auditor stakes and forfeits together (``CorpusAuditor._operator``)."""
     from fastapi import FastAPI
 
     from reliquary.eval.prompt_source import job_prompt_lines, parse_eval_source
@@ -1695,7 +1697,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             params=params, miner_states=miner_states, beacon=beacon, round_at=round_at,
             on_verdict=settler_fed(w.settler, on_verdict), on_voided=w.miners.voided, vocab_size=vocab_size,
             job=job, job_store=store, reopen_slots=is_eval_source(job.prompt_source) or has_draw(job),
-            draw_job=job if has_draw(job) else None,
+            draw_job=job if has_draw(job) else None, operator_of=operator_of,
             remote=dispatcher.view(job.checkpoint_repo, job.checkpoint_revision, proof,
                                    job.job_id, job.judge if has_draw(job) else None))
 
@@ -1965,6 +1967,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             if auditor is not None:
                 pending = auditor.audits_pending()
                 entry["audits_pending"] = pending
+                # Why the records judged since this process started were audited (`CorpusAuditor._audit_reason`).
+                entry["audit_reasons"] = dict(getattr(auditor, "audit_reasons", {}))
                 entry["audits_idle_since"] = auditor.audits_idle_since
                 if job_id in dispatcher.reuse_only_jobs:
                     continue
@@ -2134,6 +2138,7 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
         directory=directory, verify_signature=verify_corpus_signature,
         verify_skip_signature=verify_corpus_skip_signature, qualifications=qualifications,
         registration=registered.reason if registered is not None else None,
+        operator_of=registered.coldkey if registered is not None else None,
         settle_archives=archives, read_entries=read_entries,
         refresh_every_seconds=refresh_every_seconds or 60.0, sandbox=sandbox, sandbox_down=sandbox_down)
 
