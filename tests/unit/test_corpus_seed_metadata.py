@@ -141,8 +141,9 @@ def test_a_120k_backlog_of_large_records_gets_verdicts_within_minutes():
     assert full_reads < 20_000, full_reads
 
 
-def test_seeding_from_whole_records_takes_tens_of_minutes():
+def test_seeding_from_whole_records_takes_tens_of_minutes(monkeypatch):
     """The failure itself (prod 2026-10-02 21:50 -> 22:14+): no pass before the seed ends."""
+    monkeypatch.setattr(corpus_auditor, "READ_CONCURRENCY", 16)  # the reads in flight then
     minutes, _ = _first_verdict_after_restart(metadata=False)
     assert minutes > 15.0, minutes
 
