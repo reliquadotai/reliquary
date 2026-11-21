@@ -25,7 +25,7 @@ import random
 import secrets
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -127,6 +127,9 @@ class DrawLeases:
         self._lock = threading.RLock()
         self._state_path = Path(state_path) if state_path is not None else None
         self._dirty = False
+        # Each live lease's JSON (a Lease is frozen). Every change rewrites the file: encoding all ~3,500 leases each
+        # time took 51 % of the order control's one core on 2026-11-21 and starved its judge.
+        self._texts: dict[str, str] = {}
         self._load()
 
     # -- state ---------------------------------------------------------------
@@ -168,13 +171,20 @@ class DrawLeases:
             try:
                 self._state_path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = self._state_path.with_suffix(".tmp")
-                tmp.write_text(json.dumps({"leases": [asdict(lease) for lease in self._by_id.values()],
-                                           "lapsed": [asdict(lease) for lease in self._lapsed.values()],
-                                           "unused": self._unused}))
+                tmp.write_text(f'{{"leases": [{self._encoded(self._by_id)}], '
+                               f'"lapsed": [{self._encoded(self._lapsed)}], '
+                               f'"unused": {json.dumps(self._unused)}}}')
                 os.replace(tmp, self._state_path)
+                if len(self._texts) > 2 * (len(self._by_id) + len(self._lapsed)) + 64:
+                    self._texts = {i: self._texts[i] for book in (self._by_id, self._lapsed) for i in book}
                 self._dirty = False
             except OSError:
                 logger.exception("draw leases: state %s not written", self._state_path)
+
+    def _encoded(self, leases: Mapping[str, Lease]) -> str:
+        texts = self._texts
+        return ", ".join([texts.get(i) or texts.setdefault(i, json.dumps(asdict(lease)))
+                          for i, lease in leases.items()])
 
     # -- bookkeeping ---------------------------------------------------------
 
