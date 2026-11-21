@@ -189,7 +189,8 @@ class OrderJudgeHost:
                 settle_archives=OrderArchives(served=self._served_tasks),
                 operator_of=self._operator_of if self._coldkeys is not None else None,
                 arrivals_covered=self.feed.covered, threads=self.threads,
-                settle_executor=getattr(self.threads, "codec", None), retry_reopens=True)
+                settle_executor=getattr(self.threads, "codec", None), retry_reopens=True,
+                restores_scored=True)
             for name, value in self._auditor_kwargs.items():
                 setattr(w.auditor, name, value)
             # Before its listing: what the front accepts from now on reaches it by the feed.

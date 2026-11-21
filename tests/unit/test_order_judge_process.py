@@ -344,6 +344,54 @@ def test_a_quarantined_executor_is_re_audited_through_the_remote_view(bucket):
     asyncio.run(go())
 
 
+@pytest.mark.parametrize("quarantined_while_down", [True, False])
+def test_a_restarted_judge_re_audits_what_a_quarantined_executor_scored(bucket, quarantined_while_down):
+    root, run_dir = bucket
+
+    async def go():
+        control = await _Control(root, run_dir).start()
+        liar = _Executor(control.dispatcher, "liar", lies=True)
+        lying = asyncio.ensure_future(liar.run())
+        honest_task = None
+        try:
+            await _until(lambda: control.front.live(JOB), 90, "the judge's seed")
+            forged = _put(root, received=time.time() - 30, forged=True, hotkey=HOTKEYS[0])
+            control.front.link.accepted(JOB, forged)
+            await _until(lambda: forged in _verdicts(root), 30, "the lying verdict")
+            assert _verdicts(root)[forged]["passed"] and _verdicts(root)[forged]["scored_by"] == ["liar"]
+            lying.cancel()
+            await asyncio.gather(lying, return_exceptions=True)
+            honest = _Executor(control.dispatcher, "honest")
+            honest_task = asyncio.ensure_future(honest.run())
+            first = control.front.process.pid
+            os.kill(first, signal.SIGKILL)
+            await _until(lambda: not control.front.live(JOB), 5, "the hold")
+            if quarantined_while_down:
+                await control.dispatcher.quarantine("liar", "test")
+            await _until(lambda: control.front.process.pid != first and control.front.live(JOB), 90, "the restart")
+            if not quarantined_while_down:
+                await control.dispatcher.quarantine("liar", "test")
+            await _until(lambda: forged in _voided(root), 30, "the re-audit's void")
+            assert _voided(root)[forged]["executor_id"] == "liar"
+            assert honest.scored >= 2
+        finally:
+            lying.cancel()
+            if honest_task is not None:
+                honest_task.cancel()
+            await control.close()
+
+    asyncio.run(go())
+
+
+def test_a_single_process_auditor_reads_no_verdict_back_at_its_start():
+    from reliquary.validator import eval_control
+    from tests.unit.test_eval_draw import _job as draw_job
+
+    auditor = eval_control.eval_auditor(job_id="j", records=object(), tokenizer=None, proof=PROOF, vocab_size=10,
+                                        job=draw_job(), job_store=object(), reopen_slots=True)
+    assert auditor.restores_scored is False
+
+
 def test_a_stale_or_missing_snapshot_holds_and_never_drains(bucket):
     root, run_dir = bucket
 

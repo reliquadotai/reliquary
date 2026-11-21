@@ -363,6 +363,10 @@ class RemotePoolView:
     def subscribe(self, listener) -> None:
         self.listeners.append(listener)
 
+    def quarantined(self) -> set[str]:
+        """Every executor the front has told this process is quarantined."""
+        return set(self._client.quarantined)
+
     def close(self) -> None:
         self.listeners.clear()
         self._client.forget(self._job_id)
