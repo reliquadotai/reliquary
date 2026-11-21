@@ -3034,6 +3034,8 @@ class CorpusJobRoutes:
         self.held: dict[str, Callable[[], bool]] = {}
         # Why a held job is held, when its holder says (e.g. ``no_gateway``).
         self.hold_reasons: dict[str, Callable[[], str | None]] = {}
+        # Held jobs whose hold is checked every time, never released for good.
+        self.unlatched: set[str] = set()
         # Handlers past the retired check. admission_pending also accounts for
         # taken turns that continue after their HTTP handler is cancelled.
         self.in_flight: collections.Counter = collections.Counter()
@@ -3057,10 +3059,15 @@ class CorpusJobRoutes:
     def retire(self, job_id: str) -> None:
         self.retired.add(job_id)
 
-    def hold(self, job_id: str, until: Callable[[], bool], *, why: Callable[[], str | None] | None = None) -> None:
+    def hold(self, job_id: str, until: Callable[[], bool], *, why: Callable[[], str | None] | None = None,
+             latch: bool = True) -> None:
         """Keep the job from miners, as paused, until ``until()`` first holds (then never again); ``why()``
-        says why it is still held."""
+        says why it is still held. ``latch=False``: held whenever ``until()`` is false, however often."""
         self.held[job_id] = until
+        if latch:
+            self.unlatched.discard(job_id)
+        else:
+            self.unlatched.add(job_id)
         if why is not None:
             self.hold_reasons[job_id] = why
         else:
@@ -3076,6 +3083,8 @@ class CorpusJobRoutes:
         except Exception:
             logger.exception("corpus job %s: its hold could not be checked; still held", job_id)
             return True
+        if job_id in self.unlatched:
+            return False
         del self.held[job_id]
         self.hold_reasons.pop(job_id, None)
         logger.info("corpus job %s: released to miners", job_id)

@@ -91,6 +91,10 @@ class RegisteredHotkeys:
         """The coldkey ``hotkey`` was registered under, as the last snapshot read it (None: unknown)."""
         return self._coldkeys.get(hotkey)
 
+    def coldkeys(self) -> dict[str, str]:
+        """Every hotkey's coldkey, as the last snapshot read them."""
+        return dict(self._coldkeys)
+
     async def refresh_forever(self) -> None:
         while True:
             ok = await self.refresh()

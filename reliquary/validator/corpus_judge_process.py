@@ -21,9 +21,10 @@ from fastapi import FastAPI, HTTPException, Request
 logger = logging.getLogger(__name__)
 
 
-def build_judge_app(served: Mapping[str, Any], feed) -> FastAPI:
+def build_judge_app(served: Mapping[str, Any], feed, *, backfill_after_seed: bool = False) -> FastAPI:
     """``served`` maps job id to its wiring (``auditor``, ``settler``,
-    ``stats``, ``miners``)."""
+    ``stats``, ``miners``). ``backfill_after_seed``: a job's miner book
+    backfills only once its auditor has read the job back."""
     app = FastAPI()
 
     def wiring(job_id: str):
@@ -52,7 +53,8 @@ def build_judge_app(served: Mapping[str, Any], feed) -> FastAPI:
     @app.get("/jobs/{job_id}/miners/{hotkey}")
     async def miner(job_id: str, hotkey: str) -> dict:
         w = wiring(job_id)
-        w.miners.start_backfill()
+        if not backfill_after_seed or w.auditor.seeded.is_set():
+            w.miners.start_backfill()
         return {"counts": w.miners.counts(hotkey), "share": w.miners.share(hotkey),
                 "thresholds": w.miners.thresholds, "pending": w.auditor.pending_count(hotkey)}
 
