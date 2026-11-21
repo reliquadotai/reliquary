@@ -1062,6 +1062,55 @@ def eval_auditor(**kwargs):
                 await self._record_failure(submission_id)
             return len(failed)
 
+        async def restore_scored(self) -> int:
+            """A judge process that restarted: which executor scored each pass a quarantine could still void
+            (unsettled, or settled inside the hold, as ``reaudit_executor`` chooses), read back from the verdicts,
+            then the re-audit of those scored by an executor already quarantined."""
+            from reliquary.validator.corpus_auditor import RECONCILE_READS
+
+            ids = list(await self._records.list_verdict_ids(self._job_id))
+            lister = getattr(self._records, "list_voided_ids", None)
+            voided = set(await lister(self._job_id)) if lister is not None else set()
+            state, _ = await self._records.read_settlement(self._job_id)
+            settled = set((state or {}).get("settled") or ())
+            gate = asyncio.Semaphore(RECONCILE_READS)
+
+            async def read(submission_id):
+                async with gate:
+                    return submission_id, await self._records.read_verdict(self._job_id, submission_id)
+
+            now, restored = self._clock(), 0
+            wanted = [sid for sid in ids if sid not in voided]
+            for start in range(0, len(wanted), RECONCILE_READS):
+                for sid, verdict in await asyncio.gather(*map(read, wanted[start:start + RECONCILE_READS])):
+                    if not verdict or not verdict.get("passed") or not verdict.get("audited"):
+                        continue
+                    if sid in settled and now - float(verdict.get("audited_at") or 0.0) > self._params.hold_seconds:
+                        continue
+                    for executor_id in verdict.get("scored_by") or ():
+                        known = self._remote_scored.setdefault(executor_id, [])
+                        if sid not in known:
+                            known.append(sid)
+                            restored += 1
+            # Last: a quarantine heard while reading took only what was listed by then.
+            quarantined = self._remote.quarantined()
+            for executor_id in sorted(set(self._remote_scored) & quarantined):
+                await self.reaudit_executor(executor_id)
+            return restored
+
+        async def _restore_behind(self):
+            await self.seeded.wait()
+            delay = REOPEN_RETRY_SECONDS
+            while True:
+                try:
+                    restored = await self.restore_scored()
+                    logger.info("eval job %s: %d executor score(s) restored for re-audit", self._job_id, restored)
+                    return
+                except Exception:
+                    logger.exception("eval job %s: executor scores not restored; retrying", self._job_id)
+                    await asyncio.sleep(delay)
+                    delay = min(MAX_REOPEN_RETRY_SECONDS, 2 * delay)
+
         async def _reconcile_behind(self):
             try:
                 await self.reconcile_failures()
@@ -1074,11 +1123,15 @@ def eval_auditor(**kwargs):
             # The base run reconciles a forced-draw job's failures itself (`_reconcile_quietly`).
             reconcile = (None if getattr(self, "_slot_store", None) is not None
                          else asyncio.ensure_future(self._reconcile_behind()))
+            restore = asyncio.ensure_future(self._restore_behind()) if self.restores_scored else None
             try:
                 await super().run()
             finally:
                 if reconcile is not None:
                     reconcile.cancel()
+                if restore is not None:
+                    restore.cancel()
+                    await asyncio.gather(restore, return_exceptions=True)
                 retries = list(self._reopening.values())
                 for task in retries:
                     task.cancel()
@@ -1090,11 +1143,14 @@ def eval_auditor(**kwargs):
     # Off unless asked: only an eval job reopens a slot on a failed audit.
     reopen_slots = kwargs.pop("reopen_slots", False)
     retry_reopens = kwargs.pop("retry_reopens", False)
+    restores_scored = kwargs.pop("restores_scored", False)
     auditor = EvalAuditor(model=_VocabularyOnly(vocab_size), **kwargs)
     auditor.reopen_slots = bool(reopen_slots)
     # A judge process: a reopen that lost every ledger attempt is tried again until it lands.
     auditor.retry_reopens = bool(retry_reopens)
     auditor._reopening = {}
+    # A judge process: who scored what survives its restart (`restore_scored`).
+    auditor.restores_scored = bool(restores_scored)
     auditor.parked_ids = set()
     auditor._current_ids, auditor._current_records = [], []
     auditor.job, auditor.job_store = job, job_store
@@ -1547,7 +1603,8 @@ def _also(first, second):
 
 def wire_order_judge(w, *, records, job_store, remote, params, miner_states, beacon, round_at,
                      settle_archives=None, operator_of=None, arrivals_covered=None, threads=None,
-                     settle_executor=None, retry_reopens: bool = False) -> None:
+                     settle_executor=None, retry_reopens: bool = False,
+                     restores_scored: bool = False) -> None:
     """One order's miner book, settler and auditor on ``w`` (``entry``, ``cap``, ``job``, ``tokenizer``,
     ``proof``, ``vocab_size``, ``stats``, and ``grader`` for an episode order), in whichever process judges it."""
     from reliquary.eval.prompt_source import is_eval_source
@@ -1593,7 +1650,8 @@ def wire_order_judge(w, *, records, job_store, remote, params, miner_states, bea
         on_verdict=settler_fed(w.settler, on_verdict), on_voided=w.miners.voided, vocab_size=w.vocab_size,
         job=job, job_store=job_store, reopen_slots=is_eval_source(job.prompt_source) or has_draw(job),
         draw_job=job if has_draw(job) else None, operator_of=operator_of, remote=remote,
-        arrivals_covered=arrivals_covered, threads=threads, retry_reopens=retry_reopens)
+        arrivals_covered=arrivals_covered, threads=threads, retry_reopens=retry_reopens,
+        restores_scored=restores_scored)
     w.settler.on_window = w.miners.window
     w.settler.on_read = on_read
     # The stake weighs a record's prompt as the settler pays it (`corpus_periods.work_value`).
