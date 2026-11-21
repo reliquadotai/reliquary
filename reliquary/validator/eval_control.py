@@ -26,6 +26,7 @@ import json
 import itertools
 import logging
 import math
+import random
 import secrets
 import statistics
 import time
@@ -98,6 +99,9 @@ def order_audit_scorers(env=None) -> int:
 # pass's read ~1.7 s against 0.2 s alone.
 ORDER_POOL_CONNECTIONS = 256
 STATUS_SECONDS = 30.0
+# A judge process's slot reopen that lost its ledger race: tried again after this, doubling.
+REOPEN_RETRY_SECONDS = 1.0
+MAX_REOPEN_RETRY_SECONDS = 30.0
 # Why a job is still kept from miners (control status ``jobs[...]["held"]``).
 HELD_NO_GATEWAY = "no_gateway"
 HELD_AWAITING_AUDIT = "awaiting_audit"
@@ -981,26 +985,56 @@ def eval_auditor(**kwargs):
         # -- an eval job stays completable: a failure reopens its slot ------
         # (a generation order's never does: today's corpus semantics)
 
-        async def _record_failure(self, submission_id: str) -> None:
+        async def _reopen_once(self, submission_id: str) -> None:
             from reliquary.corpus.eval_draw import has_draw
             from reliquary.validator.corpus_service import draw_failure_slot, record_prompt_failure
 
+            record = await self._records.read_submission(self._job_id, submission_id)
+            if record is None:
+                return
+            outcome = await record_prompt_failure(
+                self.job_store, self.job, int(record["prompt_index"]), submission_id,
+                **(draw_failure_slot(record) if has_draw(self.job) else {}))
+            if outcome is False:
+                logger.warning("eval job %s: prompt %s exhausted its attempts",
+                               self._job_id, record["prompt_index"])
+
+        async def _record_failure(self, submission_id: str) -> None:
             if not self.reopen_slots or self.job is None or self.job_store is None:
                 return
             try:
-                record = await self._records.read_submission(self._job_id, submission_id)
-                if record is None:
-                    return
-                outcome = await record_prompt_failure(
-                    self.job_store, self.job, int(record["prompt_index"]), submission_id,
-                    **(draw_failure_slot(record) if has_draw(self.job) else {}))
-                if outcome is False:
-                    logger.warning("eval job %s: prompt %s exhausted its attempts",
-                                   self._job_id, record["prompt_index"])
-            except Exception:
-                # Retried at the next start's reconcile; never stops the auditor.
+                await self._reopen_once(submission_id)
+            except Exception as exc:
+                # Retried at the next start's reconcile, or now in a judge process; never stops the auditor.
                 logger.exception("eval job %s: failure of %s not recorded in the ledger",
                                  self._job_id, submission_id[:12])
+                if self.retry_reopens and isinstance(exc, _reopen_retried()):
+                    self._retry_reopen(submission_id)
+
+        def _retry_reopen(self, submission_id: str) -> None:
+            if submission_id not in self._reopening:
+                task = asyncio.ensure_future(self._reopen_until_landed(submission_id))
+                self._reopening[submission_id] = task
+
+        async def _reopen_until_landed(self, submission_id: str) -> None:
+            """A failure that lost its ledger race (the front writes that ledger all the time), tried until it lands."""
+            delay = REOPEN_RETRY_SECONDS
+            try:
+                while True:
+                    await asyncio.sleep(delay * (0.5 + random.random() / 2))
+                    try:
+                        await self._reopen_once(submission_id)
+                        logger.info("eval job %s: failure of %s recorded after retrying", self._job_id,
+                                    submission_id[:12])
+                        return
+                    except _reopen_retried():
+                        delay = min(MAX_REOPEN_RETRY_SECONDS, 2 * delay)
+                    except Exception:
+                        logger.exception("eval job %s: failure of %s left to the next start's reconcile",
+                                         self._job_id, submission_id[:12])
+                        return
+            finally:
+                self._reopening.pop(submission_id, None)
 
         async def _write(self, submission_id, verdict):
             stored, written = await super()._write(submission_id, verdict)
@@ -1045,18 +1079,34 @@ def eval_auditor(**kwargs):
             finally:
                 if reconcile is not None:
                     reconcile.cancel()
+                retries = list(self._reopening.values())
+                for task in retries:
+                    task.cancel()
+                await asyncio.gather(*retries, return_exceptions=True)
 
     vocab_size = kwargs.pop("vocab_size")
     job = kwargs.pop("job", None)
     job_store = kwargs.pop("job_store", None)
     # Off unless asked: only an eval job reopens a slot on a failed audit.
     reopen_slots = kwargs.pop("reopen_slots", False)
+    retry_reopens = kwargs.pop("retry_reopens", False)
     auditor = EvalAuditor(model=_VocabularyOnly(vocab_size), **kwargs)
     auditor.reopen_slots = bool(reopen_slots)
+    # A judge process: a reopen that lost every ledger attempt is tried again until it lands.
+    auditor.retry_reopens = bool(retry_reopens)
+    auditor._reopening = {}
     auditor.parked_ids = set()
     auditor._current_ids, auditor._current_records = [], []
     auditor.job, auditor.job_store = job, job_store
     return auditor
+
+
+def _reopen_retried() -> tuple:
+    """What a slot reopen is tried again after: a lost ledger race or a store fault."""
+    from reliquary.infrastructure.corpus_job_store import CorpusStoreConflict
+    from reliquary.validator.corpus_miner_states import _TRANSIENT_ERRORS
+
+    return (CorpusStoreConflict, *_TRANSIENT_ERRORS)
 
 
 class _Parked(str):
@@ -1497,7 +1547,7 @@ def _also(first, second):
 
 def wire_order_judge(w, *, records, job_store, remote, params, miner_states, beacon, round_at,
                      settle_archives=None, operator_of=None, arrivals_covered=None, threads=None,
-                     settle_executor=None) -> None:
+                     settle_executor=None, retry_reopens: bool = False) -> None:
     """One order's miner book, settler and auditor on ``w`` (``entry``, ``cap``, ``job``, ``tokenizer``,
     ``proof``, ``vocab_size``, ``stats``, and ``grader`` for an episode order), in whichever process judges it."""
     from reliquary.eval.prompt_source import is_eval_source
@@ -1543,7 +1593,7 @@ def wire_order_judge(w, *, records, job_store, remote, params, miner_states, bea
         on_verdict=settler_fed(w.settler, on_verdict), on_voided=w.miners.voided, vocab_size=w.vocab_size,
         job=job, job_store=job_store, reopen_slots=is_eval_source(job.prompt_source) or has_draw(job),
         draw_job=job if has_draw(job) else None, operator_of=operator_of, remote=remote,
-        arrivals_covered=arrivals_covered, threads=threads)
+        arrivals_covered=arrivals_covered, threads=threads, retry_reopens=retry_reopens)
     w.settler.on_window = w.miners.window
     w.settler.on_read = on_read
     # The stake weighs a record's prompt as the settler pays it (`corpus_periods.work_value`).
@@ -1629,7 +1679,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     def router_for(w):
         from reliquary.validator.corpus_validator import _lease_verifier
 
-        return build_corpus_router(
+        router = build_corpus_router(
             job_id=str(w.entry.job_id), store=store, tokenizer=w.tokenizer,
             renderer=w.renderer, verify_signature=verify_signature,
             verify_skip_signature=verify_skip_signature, prompt_job_for=w.prompt_job_for,
@@ -1641,7 +1691,11 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             suspect_until=getattr(w, "suspect_until", None),
             job=getattr(w, "job", None), durable_records=False, auction=_auction_of(w),
             lease_fault=_lease_fault_of(w),
+            # Held by this control for its audit (a restart's seed, a judge down): no lease runs out meanwhile.
+            lease_held=functools.partial(routes.lease_clock_stopped, str(w.entry.job_id)),
             episode_intake=getattr(w, "episode_intake", None))
+        w.sync_lease_clock = router.sync_lease_clock
+        return router
 
     def _lease_fault_of(w):
         """A signed episode order's draw leases our sandbox failed: released uncharged
@@ -1761,6 +1815,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 return HELD_AWAITING_AUDIT
             return None
 
+        routes.stop_lease_clock_on(str(job.job_id), HELD_AWAITING_AUDIT)
         if judged_apart:
             # Open once its audit is first ready, as below; held again whenever its judge is not up and seeded.
             opened = False

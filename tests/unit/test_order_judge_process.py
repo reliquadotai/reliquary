@@ -471,6 +471,47 @@ def test_a_forgotten_ledger_is_read_again_and_a_read_in_flight_keeps_no_memory(m
     asyncio.run(go())
 
 
+def test_a_reopen_that_lost_every_ledger_attempt_is_retried_until_it_lands(monkeypatch):
+    from reliquary.infrastructure.corpus_job_store import CorpusStoreConflict
+    from reliquary.validator import corpus_service, eval_control
+    from tests.unit.test_eval_draw import _job as draw_job
+
+    monkeypatch.setattr(eval_control, "REOPEN_RETRY_SECONDS", 0.01)
+    monkeypatch.setattr(eval_control, "MAX_REOPEN_RETRY_SECONDS", 0.02)
+    tries = []
+
+    async def record_failure(store, job, prompt, sid, **kw):
+        tries.append(sid)
+        if len(tries) < 6:
+            raise CorpusStoreConflict("lost the ledger race")
+        return True
+
+    monkeypatch.setattr(corpus_service, "record_prompt_failure", record_failure)
+
+    class Records:
+        async def read_submission(self, job_id, sid):
+            return {"prompt_index": 0, "cursor": 0, "hotkey": "5A"}
+
+    def auditor(retry):
+        return eval_control.eval_auditor(
+            job_id="j", records=Records(), tokenizer=None, proof=PROOF, vocab_size=10, job=draw_job(),
+            job_store=object(), reopen_slots=True, retry_reopens=retry)
+
+    async def go():
+        once = auditor(False)
+        await once._record_failure("s" * 64)
+        await asyncio.sleep(0.05)
+        assert len(tries) == 1 and not once._reopening     # flag off: left to the next start, as ever
+        tries.clear()
+        retried = auditor(True)
+        await retried._record_failure("s" * 64)
+        await retried._record_failure("s" * 64)            # one retry per record
+        await _until(lambda: not retried._reopening, 5, "the reopen")
+        assert len(tries) == 6
+
+    asyncio.run(go())
+
+
 def _stream(dispatcher, run_dir, w):
     from reliquary.validator.order_judge import DispatchClient, DispatchServer
 

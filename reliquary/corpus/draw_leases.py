@@ -14,6 +14,10 @@ change (a lease lost would refuse its miner's submission, one settled but restor
 back at start, so a control restart keeps every lease still running: a job priced by
 auction refuses a submission without its lease (2026-11-14: three restarts in a day dropped every miner's leases in
 flight). Without one, a restart drops them.
+
+While the control itself keeps miners off the job (``held``: its judge is down, unseeded or stale), the leases' clock
+stops: none lapses or is charged, and when the hold ends each live and lapsed lease moves on by the hold's length. A
+lease lapsed during a hold is not charged if another hotkey takes its slot before its moved window ends.
 """
 from __future__ import annotations
 
@@ -26,7 +30,7 @@ import secrets
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -98,13 +102,15 @@ class DrawLeases:
                  limit_per_hotkey: bool = True,
                  on_unused: Callable[[Lease, float], None] | None = None,
                  validator_fault: Callable[[Lease], tuple[str, str] | None] | None = None,
-                 state_path: str | os.PathLike | None = None) -> None:
+                 state_path: str | os.PathLike | None = None,
+                 held: Callable[[], bool] | None = None) -> None:
         """``limit_per_hotkey`` False (a job priced by auction): no per-hotkey cap, the price decides who works.
         ``on_unused(lease, held_fraction)`` hears of a lease that ended without its slot taken: expired (1) or
         released (the share of its time it was held). ``validator_fault(lease)`` names ``(cause, detail)`` when
         our side failed the lease's episode (``sandbox.corpus_lease_faults``, from the session book and the
         issuer's own refusals, never the miner's word): that lease ends uncharged, neither ``on_unused`` (no debt,
-        no halved capacity) nor counted against the hotkey's unused leases."""
+        no halved capacity) nor counted against the hotkey's unused leases. ``held()``: the control keeps miners
+        off this job for its own reasons, so the leases' clock is stopped."""
         self._job = job
         self._limit = bool(limit_per_hotkey)
         self._on_unused = on_unused
@@ -130,7 +136,14 @@ class DrawLeases:
         # Each live lease's JSON (a Lease is frozen). Every change rewrites the file: encoding all ~3,500 leases each
         # time took 51 % of the order control's one core on 2026-11-21 and starved its judge.
         self._texts: dict[str, str] = {}
+        self._held = held
+        # When the clock stopped (None: running), and the lapsed leases a hold kept from delivering.
+        self._stopped_at: float | None = None
+        self._spared: set[str] = set()
         self._load()
+        with self._lock:
+            self._sync_clock()
+            self.save()
 
     # -- state ---------------------------------------------------------------
 
@@ -142,15 +155,20 @@ class DrawLeases:
         try:
             state = json.loads(self._state_path.read_text())
             now = self._clock()
+            stopped = state.get("stopped_at")
+            # Stopped when this process went down: nothing ran out, the hold's end moves them all.
+            self._stopped_at = float(stopped) if type(stopped) in (int, float) else None
+            kept = self._stopped_at is not None
             for raw in state.get("leases", ()):
                 lease = Lease(**raw)
-                if lease.expires_at > now:
+                if kept or lease.expires_at > now:
                     self._by_id[lease.lease_id] = lease
                     self._by_slot.setdefault((lease.prompt_index, lease.slot), []).append(lease.lease_id)
             for raw in state.get("lapsed", ()):
                 lease = Lease(**raw)
-                if lease.expires_at + self.seconds > now:
+                if kept or lease.expires_at + self.seconds > now:
                     self._lapsed[lease.lease_id] = lease
+            self._spared = {str(i) for i in state.get("spared", ()) if str(i) in self._lapsed}
             self._unused = {str(h): [float(t) for t in ts] for h, ts in (state.get("unused") or {}).items()}
             logger.info("draw leases: %d lease(s) still running restored from %s", len(self._by_id),
                         self._state_path)
@@ -171,9 +189,11 @@ class DrawLeases:
             try:
                 self._state_path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = self._state_path.with_suffix(".tmp")
+                clock = "" if self._stopped_at is None else f', "stopped_at": {json.dumps(self._stopped_at)}'
+                spared = "" if not self._spared else f', "spared": {json.dumps(sorted(self._spared))}'
                 tmp.write_text(f'{{"leases": [{self._encoded(self._by_id)}], '
                                f'"lapsed": [{self._encoded(self._lapsed)}], '
-                               f'"unused": {json.dumps(self._unused)}}}')
+                               f'"unused": {json.dumps(self._unused)}{clock}{spared}}}')
                 os.replace(tmp, self._state_path)
                 if len(self._texts) > 2 * (len(self._by_id) + len(self._lapsed)) + 64:
                     self._texts = {i: self._texts[i] for book in (self._by_id, self._lapsed) for i in book}
@@ -205,8 +225,45 @@ class DrawLeases:
         else:
             self._by_slot.pop(key, None)
 
+    def _sync_clock(self) -> None:
+        """Stop the clock when a hold starts; when it ends, move every lease on by its length."""
+        if self._held is None:
+            stopped = False
+        else:
+            try:
+                stopped = bool(self._held())
+            except Exception:                 # unknown: as it was
+                logger.exception("draw leases: the hold could not be read")
+                stopped = self._stopped_at is not None
+        if stopped and self._stopped_at is None:
+            self._stopped_at = self._clock()
+            self._dirty = True
+            logger.info("draw leases of %s: clock stopped by a hold", getattr(self._job, "job_id", "?"))
+        elif not stopped and self._stopped_at is not None:
+            self._resume()
+
+    def _resume(self) -> None:
+        now, since = self._clock(), self._stopped_at
+        for book in (self._by_id, self._lapsed):
+            for lease_id, lease in list(book.items()):
+                # A lease granted during the hold (a swap answering a submission already admitted) from its grant.
+                moved = now - max(since, lease.granted_at)
+                if moved > 0:
+                    book[lease_id] = replace(lease, granted_at=lease.granted_at + moved,
+                                             expires_at=lease.expires_at + moved)
+                    self._texts.pop(lease_id, None)
+        self._spared |= set(self._lapsed)
+        self._stopped_at = None
+        self._dirty = True
+        logger.info("draw leases of %s: clock restarted, %d lease(s) moved on by %.0f s",
+                    getattr(self._job, "job_id", "?"), len(self._by_id) + len(self._lapsed), now - since)
+
     def expire(self) -> None:
         with self._lock:
+            self._sync_clock()
+            if self._stopped_at is not None:
+                self.save()
+                return
             now = self._clock()
             for lease_id in [i for i, lease in self._by_id.items() if lease.expires_at <= now]:
                 lease = self._by_id[lease_id]
@@ -232,6 +289,7 @@ class DrawLeases:
     def _charge_lapsed(self, lease: Lease, now: float) -> None:
         """A lapsed lease ended undelivered: charged as an expired one."""
         self._dirty = True
+        self._spared.discard(lease.lease_id)
         fault = self._fault(lease)
         if fault is not None:
             self._log("expired", lease, f" ours={fault[0]} ({fault[1]}): not charged")
@@ -336,6 +394,7 @@ class DrawLeases:
 
     def release(self, hotkey: str, lease_id: str) -> bool:
         with self._lock:
+            self._sync_clock()
             lapsed = self._lapsed.get(lease_id)
             if lapsed is not None and lapsed.hotkey == hotkey:
                 self._charge_lapsed(self._lapsed.pop(lease_id), self._clock())
@@ -346,7 +405,9 @@ class DrawLeases:
                 return False
             self._drop(lease_id)
             span = lease.expires_at - lease.granted_at
-            held = (self._clock() - lease.granted_at) / span if span > 0 else 1.0
+            # During a hold, the share it had held when the clock stopped.
+            at = self._clock() if self._stopped_at is None else max(self._stopped_at, lease.granted_at)
+            held = (at - lease.granted_at) / span if span > 0 else 1.0
             fault = self._fault(lease)
             if fault is not None:
                 self._log("released", lease, f" held={held:.2f} ours={fault[0]} ({fault[1]}): not charged")
@@ -386,6 +447,7 @@ class DrawLeases:
         """The slot was taken (by ``hotkey`` when known): every lease on it ends. A lapsed lease of that hotkey
         was delivered late and is not charged; another hotkey's lapsed lease is charged now."""
         with self._lock:
+            self._sync_clock()
             now = self._clock()
             key = (int(prompt_index), int(slot))
             for lease_id in list(self._by_slot.get(key, ())):
@@ -396,7 +458,13 @@ class DrawLeases:
                 lease = self._lapsed.pop(lease_id)
                 if hotkey is not None and lease.hotkey == hotkey:
                     self._dirty = True
+                    self._spared.discard(lease_id)
                     self._log("taken", lease, f" after={round(now - lease.granted_at)} late")
+                elif self._stopped_at is not None or lease_id in self._spared:
+                    # A hold kept its holder from delivering before this slot went to another.
+                    self._dirty = True
+                    self._spared.discard(lease_id)
+                    self._log("taken", lease, " by another after a hold: not charged")
                 else:
                     self._charge_lapsed(lease, now)
             self.save()

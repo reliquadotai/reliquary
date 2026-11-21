@@ -637,6 +637,18 @@ class OrderJudgeFront:
     def mark_down(self) -> None:
         self._snapshot = None
         self._downs += 1
+        self._sync_lease_clocks()
+
+    def _sync_lease_clocks(self) -> None:
+        """Each order's leases see a hold start or end now, whatever the miners are doing."""
+        for job_id, w in list(self._jobs.items()):
+            sync = getattr(w, "sync_lease_clock", None)
+            if sync is None:
+                continue
+            try:
+                sync()
+            except Exception:
+                logger.exception("order judge: the lease clock of %s could not be synced", job_id)
 
     def _wanted(self, job_id: str, w, known: Mapping) -> dict:
         latest = self._latest.get(str(w.entry.task_id))
@@ -722,6 +734,7 @@ class OrderJudgeFront:
                 await self.sync_once()
             except Exception:
                 logger.exception("order judge: sync pass failed")
+            self._sync_lease_clocks()
             await asyncio.sleep(self._sync_every)
 
     # -- the child -----------------------------------------------------------
