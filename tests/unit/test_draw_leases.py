@@ -2,6 +2,7 @@
 vanished one, an older miner without leases still submits what no one holds."""
 from __future__ import annotations
 
+import json
 import random
 from types import SimpleNamespace
 
@@ -468,3 +469,23 @@ def test_lapsed_leases_survive_a_restart(tmp_path):
     len(leases)
     again = DrawLeases(job, clock=clock, seconds=100.0, state_path=path)
     assert again.held("a", lease.prompt_index, lease.slot) == lease
+
+
+def test_a_save_encodes_only_the_leases_that_are_new(tmp_path, monkeypatch):
+    """Prod 2026-11-21: re-encoding every live lease on each change took half the control's core."""
+    import reliquary.corpus.draw_leases as module
+
+    path = tmp_path / "leases.json"
+    job, _, _, clock, leases, free = _setup(prompts=8, slots=1, limit_per_hotkey=False, state_path=path)
+    for _ in range(4):
+        leases.grant("hk", free)
+    encoded = []
+    real = module.asdict
+    monkeypatch.setattr(module, "asdict", lambda lease: encoded.append(lease.lease_id) or real(lease))
+    fifth = leases.grant("hk", free)
+    assert encoded == [fifth.lease_id]
+    saved = json.loads(path.read_text())
+    assert len(saved["leases"]) == 5 and saved["lapsed"] == [] and saved["unused"] == {}
+    assert real(fifth) in saved["leases"]
+    back = DrawLeases(job, clock=clock, rng=random.Random(1), seconds=100.0, limit_per_hotkey=False, state_path=path)
+    assert len(back) == 5
