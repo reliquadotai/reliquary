@@ -565,6 +565,9 @@ class OrderJudgeFront:
         self._snapshot_at = float("-inf")
         self._boot: str | None = None
         self._state_writes: dict[str, int] = {}
+        # The front's job store, and the judge's ledger writes as last reported per order.
+        self._job_store = None
+        self._ledger_writes: dict[str, int] = {}
         # Bumped when the judge is seen gone: a reply already in flight then proves nothing.
         self._downs = 0
         self.process = None
@@ -580,7 +583,7 @@ class OrderJudgeFront:
     def wiring_of(self, job_id: str):
         return self._jobs.get(str(job_id))
 
-    def attach(self, w, *, records) -> None:
+    def attach(self, w, *, records, store=None) -> None:
         """A non-episode order: its judge is in the child; every read of it here comes from the snapshot."""
         from reliquary.corpus.eval_draw import has_draw
         from reliquary.eval.prompt_source import is_eval_source
@@ -598,12 +601,15 @@ class OrderJudgeFront:
 
         w.on_accepted = on_accepted
         self._jobs[job_id] = w
+        if store is not None:
+            self._job_store = store
 
     def forget(self, job_id: str) -> None:
         """The order drained and is unwired: the next sync stops it there."""
         self._jobs.pop(job_id, None)
         self._wire_docs.pop(job_id, None)
         self._state_writes.pop(job_id, None)
+        self._ledger_writes.pop(job_id, None)
         self._dispatcher.forget_job(job_id)
 
     def watching(self, read_entries):
@@ -661,9 +667,11 @@ class OrderJudgeFront:
 
     def _take(self, reply: Mapping) -> None:
         boot = reply.get("boot")
-        if boot != self._boot:
+        new_judge = boot != self._boot
+        if new_judge:
             logger.info("order judge: process %s answers (was %s)", boot, self._boot)
             self._boot = boot
+        self._forget_ledgers(reply.get("ledger_writes") or {}, new_judge)
         self._snapshot, self._snapshot_at = reply, self._clock()
         for job_id, view in (reply.get("jobs") or {}).items():
             w = self._jobs.get(job_id)
@@ -679,6 +687,17 @@ class OrderJudgeFront:
                 if reason not in reasons:
                     reasons.append(reason)
                     del reasons[:-10]
+
+    def _forget_ledgers(self, writes: Mapping[str, int], new_judge: bool) -> None:
+        """The judge reopened a failed slot: the front's memory of that ledger is stale. A new judge
+        may have written before its last one could say so."""
+        forget = getattr(self._job_store, "forget_ledgers", None)
+        for job_id in self._jobs:
+            count = int(writes.get(job_id, 0))
+            if new_judge or count != self._ledger_writes.get(job_id, 0):
+                self._ledger_writes[job_id] = count
+                if forget is not None:
+                    forget(job_id)
 
     async def sync_once(self) -> bool:
         import httpx
