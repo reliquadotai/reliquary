@@ -181,6 +181,31 @@ def test_the_queue_lowers_k_when_the_wait_grows():
     assert pace.k == pytest.approx(0.5)              # a 240 s wait, the card full: target / wait, at most halved
 
 
+def test_a_queue_growing_past_half_the_hold_cuts_k_even_on_an_idle_card():
+    """Prod 2026-11-21: intake starved the judge, the card idled, and k stayed high while payments fell behind."""
+    clock = Clock()
+    pace = la.MarketPace(clock)
+    pace.bind_audit(lambda: (1_000.0, 0.3))
+
+    def step(wait_seconds):
+        pace.report("job", q=1.0, remaining_tokens=1e9, deadline=None, supply=None,
+                    backlog_tokens=wait_seconds * 1_000.0, unmet_at=None, lag_seconds=60.0)
+        pace.target("job")
+        clock.now += la.STEP_SECONDS
+
+    step(800)
+    step(899)
+    assert pace.k == 1.0                               # under the line, an idle card still means wait elsewhere
+    step(1_000)
+    assert pace.k == pytest.approx(0.5)
+    clock.now += pace.loop_seconds()
+    step(900)
+    assert pace.k == pytest.approx(0.5)                # already shrinking: no further cut
+    clock.now += pace.loop_seconds()
+    step(1_200)
+    assert pace.k == pytest.approx(0.25)
+
+
 def test_an_idle_card_with_miners_refused_raises_k():
     clock = Clock()
     pace = la.MarketPace(clock)
