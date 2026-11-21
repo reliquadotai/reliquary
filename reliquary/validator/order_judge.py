@@ -54,6 +54,10 @@ SYNC_TIMEOUT_SECONDS = 5.0
 # Past this the front knows nothing of the judge: its orders are held. A dead
 # judge is seen at once; this is for one that hangs, and must outlast a busy front's loop.
 SNAPSHOT_STALE_SECONDS = 30.0
+# A child alive that answered no sync for this long, over at least HUNG_FAILURES tries, is killed and restarted.
+# Counted in failed tries, so a front whose own loop stalled does not kill a healthy judge on waking.
+HUNG_SECONDS = 120.0
+HUNG_FAILURES = 5
 # A verdict being written when its executor was quarantined is listed after
 # the event: the event is delivered once more this much later.
 RENOTIFY_SECONDS = 60.0
@@ -548,7 +552,8 @@ class OrderJudgeFront:
                  clock: Callable[[], float] = time.monotonic, stale_seconds: float = SNAPSHOT_STALE_SECONDS,
                  sync_seconds: float = SYNC_SECONDS, spawn: bool = True, child_init: str | None = None,
                  settle_seconds: float = 60.0, auditor_kwargs: dict | None = None,
-                 backoff_seconds: float = RESTART_BACKOFF_SECONDS) -> None:
+                 backoff_seconds: float = RESTART_BACKOFF_SECONDS, hung_seconds: float = HUNG_SECONDS,
+                 hung_failures: int = HUNG_FAILURES) -> None:
         self.run_dir = private_run_dir(run_dir)
         self._dispatcher = dispatcher
         self._coldkeys = coldkeys
@@ -560,6 +565,11 @@ class OrderJudgeFront:
         self._settle_seconds = settle_seconds
         self._auditor_kwargs = auditor_kwargs
         self._backoff = backoff_seconds
+        self._hung_seconds = hung_seconds
+        self._hung_failures = hung_failures
+        # Since when no sync has been answered, and how many tries failed since.
+        self._unanswered_since: float | None = None
+        self._unanswered = 0
         self.link = OrderJudgeLink(self.run_dir / JUDGE_SOCKET, [])
         self.dispatch = DispatchServer(dispatcher, self.run_dir / DISPATCH_SOCKET, self.wiring_of)
         self._jobs: dict[str, Any] = {}
@@ -722,15 +732,28 @@ class OrderJudgeFront:
         try:
             reply = await self.link._client.post("/sync", self._sync_body(), timeout=SYNC_TIMEOUT_SECONDS)
         except (httpx.ConnectError, FileNotFoundError, ConnectionError):
+            self._sync_unanswered()
             self.mark_down()                        # nobody on the socket
             return False
         except Exception as exc:  # noqa: BLE001 - it goes stale, then its orders are held
+            self._sync_unanswered()
             logger.warning("order judge: sync failed: %r", exc)
             return False
         if downs != self._downs:
             return False
+        self._unanswered_since, self._unanswered = None, 0
         self._take(reply)
         return True
+
+    def _sync_unanswered(self) -> None:
+        if self._unanswered_since is None:
+            self._unanswered_since = self._clock()
+        self._unanswered += 1
+
+    def hung(self) -> bool:
+        """The child has answered no sync for ``hung_seconds``, over at least ``hung_failures`` tries."""
+        return (self._unanswered_since is not None and self._unanswered >= self._hung_failures
+                and self._clock() - self._unanswered_since >= self._hung_seconds)
 
     async def _sync_forever(self) -> None:
         while True:
@@ -760,8 +783,14 @@ class OrderJudgeFront:
         failures = 0
         while not self._stopping:
             self._start_child()
+            self._unanswered_since, self._unanswered = None, 0
             started = time.monotonic()
             while self.process.is_alive():
+                if self.hung():
+                    logger.error("order judge: pid %d answered no sync for %.0f s (%d tries); killing it",
+                                 self.process.pid, self._clock() - self._unanswered_since, self._unanswered)
+                    self.process.kill()
+                    self._unanswered_since, self._unanswered = None, 0
                 await asyncio.sleep(0.2)
             code = self.process.exitcode
             self.process.join(0)

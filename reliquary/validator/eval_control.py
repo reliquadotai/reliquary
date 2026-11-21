@@ -977,6 +977,36 @@ def eval_auditor(**kwargs):
                 parked_now = len(self.parked_ids - before)
                 self._validator_errors = max(0, self._validator_errors - parked_now)
                 self._current_ids, self._current_records = [], []
+                self._reaudit_quarantined()
+
+        def _reaudit_quarantined(self) -> None:
+            """A judge process: a pass written after its executor's quarantine event has no event left to catch it."""
+            quarantined = getattr(self._remote, "quarantined", None)
+            if quarantined is None:
+                return
+            for executor_id in set(self._remote_scored) & quarantined():
+                if self._remote_scored[executor_id] and executor_id not in self._late_reaudits:
+                    self._late_reaudits[executor_id] = asyncio.ensure_future(self._reaudit_late(executor_id))
+
+        async def _reaudit_late(self, executor_id: str) -> None:
+            delay = REOPEN_RETRY_SECONDS
+            try:
+                while self._remote_scored.get(executor_id):
+                    listed = list(self._remote_scored[executor_id])
+                    try:
+                        await self.reaudit_executor(executor_id)
+                        delay = REOPEN_RETRY_SECONDS
+                    except Exception:
+                        logger.exception("eval job %s: re-audit of quarantined executor %s failed; retrying",
+                                         self._job_id, executor_id)
+                        # It took them off the list before failing.
+                        known = self._remote_scored.setdefault(executor_id, [])
+                        present = set(known)
+                        known.extend(sid for sid in listed if sid not in present)
+                        await asyncio.sleep(delay)
+                        delay = min(MAX_REOPEN_RETRY_SECONDS, 2 * delay)
+            finally:
+                self._late_reaudits.pop(executor_id, None)
 
         async def judge_many(self, submission_ids):
             # A parked record is not tried again until an operator acts.
@@ -1080,6 +1110,7 @@ def eval_auditor(**kwargs):
                     return submission_id, await self._records.read_verdict(self._job_id, submission_id)
 
             now, restored = self._clock(), 0
+            listed: dict[str, set[str]] = {}
             wanted = [sid for sid in ids if sid not in voided]
             for start in range(0, len(wanted), RECONCILE_READS):
                 for sid, verdict in await asyncio.gather(*map(read, wanted[start:start + RECONCILE_READS])):
@@ -1088,9 +1119,10 @@ def eval_auditor(**kwargs):
                     if sid in settled and now - float(verdict.get("audited_at") or 0.0) > self._params.hold_seconds:
                         continue
                     for executor_id in verdict.get("scored_by") or ():
-                        known = self._remote_scored.setdefault(executor_id, [])
+                        known = listed.setdefault(executor_id, set(self._remote_scored.get(executor_id, ())))
                         if sid not in known:
-                            known.append(sid)
+                            known.add(sid)
+                            self._remote_scored.setdefault(executor_id, []).append(sid)
                             restored += 1
             # Last: a quarantine heard while reading took only what was listed by then.
             quarantined = self._remote.quarantined()
@@ -1105,6 +1137,7 @@ def eval_auditor(**kwargs):
                 try:
                     restored = await self.restore_scored()
                     logger.info("eval job %s: %d executor score(s) restored for re-audit", self._job_id, restored)
+                    self.scores_restored.set()
                     return
                 except Exception:
                     logger.exception("eval job %s: executor scores not restored; retrying", self._job_id)
@@ -1132,6 +1165,10 @@ def eval_auditor(**kwargs):
                 if restore is not None:
                     restore.cancel()
                     await asyncio.gather(restore, return_exceptions=True)
+                late = list(self._late_reaudits.values())
+                for task in late:
+                    task.cancel()
+                await asyncio.gather(*late, return_exceptions=True)
                 retries = list(self._reopening.values())
                 for task in retries:
                     task.cancel()
@@ -1151,6 +1188,8 @@ def eval_auditor(**kwargs):
     auditor._reopening = {}
     # A judge process: who scored what survives its restart (`restore_scored`).
     auditor.restores_scored = bool(restores_scored)
+    auditor.scores_restored = asyncio.Event()
+    auditor._late_reaudits = {}
     auditor.parked_ids = set()
     auditor._current_ids, auditor._current_records = [], []
     auditor.job, auditor.job_store = job, job_store

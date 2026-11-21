@@ -383,6 +383,175 @@ def test_a_restarted_judge_re_audits_what_a_quarantined_executor_scored(bucket, 
     asyncio.run(go())
 
 
+def test_a_hung_judge_is_killed_and_restarted(bucket, monkeypatch):
+    from reliquary.validator import order_judge
+
+    root, run_dir = bucket
+    monkeypatch.setattr(order_judge, "SYNC_TIMEOUT_SECONDS", 1.0)
+
+    async def go():
+        control = await _Control(root, run_dir).start()
+        try:
+            await _until(lambda: control.front.live(JOB), 90, "the judge's seed")
+            # Short limits only from here: a child's start takes longer than this one allows.
+            control.front._hung_seconds, control.front._hung_failures = 4.0, 2
+            first = control.front.process.pid
+            os.kill(first, signal.SIGSTOP)          # alive, answering nothing
+            await _until(lambda: not control.front.live(JOB), 10, "the hold")
+            assert control.front.process.pid == first and control.front.process.is_alive()
+            await _until(lambda: control.front.process.pid != first, 30, "the kill")
+            control.front._hung_seconds, control.front._hung_failures = order_judge.HUNG_SECONDS, order_judge.HUNG_FAILURES
+            await _until(lambda: control.front.live(JOB), 120, "the restart")
+            assert control.front.starts == 2
+        finally:
+            await control.close()
+
+    asyncio.run(go())
+
+
+def test_a_front_that_stalled_does_not_kill_a_healthy_judge(bucket):
+    _, run_dir = bucket
+    clock = SimpleNamespace(t=0.0)
+    dispatcher = PairedAuditDispatcher(directory=SimpleNamespace(revoke_locally=lambda e: None))
+    front = OrderJudgeFront(dispatcher=dispatcher, run_dir=run_dir, spawn=False, clock=lambda: clock.t)
+    assert not front.hung()
+    front._sync_unanswered()                    # one try failed, then the loop stalled past the limit
+    clock.t += 10 * order_judge_module().HUNG_SECONDS
+    assert not front.hung()
+    for _ in range(order_judge_module().HUNG_FAILURES):
+        front._sync_unanswered()
+    assert front.hung()
+
+
+def order_judge_module():
+    from reliquary.validator import order_judge
+
+    return order_judge
+
+
+def _late_auditor(monkeypatch, remote):
+    from reliquary.validator import corpus_auditor, eval_control
+    from tests.unit.test_eval_draw import _job as draw_job
+
+    async def records_a_pass(self, ids, records, draws, *, deferred=None):
+        for sid in ids:
+            self._remote_scored.setdefault("X", []).append(sid)
+        return [], set()
+
+    monkeypatch.setattr(corpus_auditor.CorpusAuditor, "_audit_records", records_a_pass)
+    return eval_control.eval_auditor(job_id="j", records=object(), tokenizer=None, proof=PROOF, vocab_size=10,
+                                     job=draw_job(), job_store=object(), remote=remote)
+
+
+def test_a_pass_written_after_its_executors_quarantine_is_re_audited_at_once(monkeypatch):
+    remote = SimpleNamespace(subscribe=lambda listener: None, quarantined=lambda: {"X"})
+    auditor = _late_auditor(monkeypatch, remote)
+    audited, attempts = [], []
+
+    async def reaudit(executor_id):
+        attempts.append(executor_id)
+        listed = auditor._remote_scored.pop(executor_id, [])
+        if len(attempts) == 1:
+            raise RuntimeError("the store hiccuped")    # what it took is not lost
+        audited.extend(listed)
+        return []
+
+    monkeypatch.setattr(auditor, "reaudit_executor", reaudit)
+    monkeypatch.setattr("reliquary.validator.eval_control.REOPEN_RETRY_SECONDS", 0.01)
+
+    async def go():
+        await auditor._audit_records(["late"], [{}], {})
+        await _until(lambda: not auditor._late_reaudits, 3, "the re-audit")
+        assert audited == ["late"] and len(attempts) == 2
+
+    asyncio.run(go())
+
+
+def test_a_single_process_view_schedules_no_late_re_audit(monkeypatch):
+    auditor = _late_auditor(monkeypatch, SimpleNamespace(subscribe=lambda listener: None))
+
+    async def go():
+        await auditor._audit_records(["late"], [{}], {})
+        assert not auditor._late_reaudits and auditor._remote_scored == {"X": ["late"]}
+
+    asyncio.run(go())
+
+
+def _settling_host(restore_wait):
+    from reliquary.validator.order_judge_process import OrderJudgeHost
+
+    return OrderJudgeHost(records=None, store=None, client=None, feed=None, settle_seconds=0.01,
+                          tokenizer_for=lambda *a: None, restore_wait_seconds=restore_wait)
+
+
+def _settling_wiring():
+    settled = []
+
+    async def settle_once():
+        settled.append(1)
+
+    auditor = SimpleNamespace(seeded=asyncio.Event(), scores_restored=asyncio.Event())
+    auditor.seeded.set()
+    return SimpleNamespace(auditor=auditor, settler=SimpleNamespace(settle_once=settle_once),
+                           job=SimpleNamespace(job_id=JOB)), settled
+
+
+def test_the_first_settlement_waits_for_the_restored_scores():
+    async def go():
+        w, settled = _settling_wiring()
+        task = asyncio.ensure_future(_settling_host(30.0)._settle_forever(w))
+        await asyncio.sleep(0.05)
+        assert not settled
+        w.auditor.scores_restored.set()
+        await _until(lambda: settled, 2, "the settlement")
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(go())
+
+
+def test_a_restore_that_keeps_failing_never_stops_settlement_for_good():
+    async def go():
+        w, settled = _settling_wiring()
+        host = _settling_host(0.05)
+        task = asyncio.ensure_future(host._settle_forever(w))
+        await _until(lambda: settled, 2, "the settlement")
+        assert any("restored" in reason for reason in host._attention[JOB])
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(go())
+
+
+def test_restoring_scores_lists_each_pass_once(monkeypatch):
+    from reliquary.validator import eval_control
+    from tests.unit.test_eval_draw import _job as draw_job
+
+    verdicts = {"a": {"passed": True, "audited": True, "scored_by": ["X", "X"], "audited_at": 1.0},
+                "b": {"passed": True, "audited": False, "scored_by": ["X"]},
+                "c": {"passed": False, "audited": True, "scored_by": ["X"]}}
+
+    class Records:
+        async def list_verdict_ids(self, job_id):
+            return list(verdicts)
+
+        async def list_voided_ids(self, job_id):
+            return []
+
+        async def read_settlement(self, job_id):
+            return {"settled": []}, None
+
+        async def read_verdict(self, job_id, sid):
+            return verdicts[sid]
+
+    remote = SimpleNamespace(subscribe=lambda listener: None, quarantined=lambda: set())
+    auditor = eval_control.eval_auditor(job_id="j", records=Records(), tokenizer=None, proof=PROOF, vocab_size=10,
+                                        job=draw_job(), job_store=object(), remote=remote, restores_scored=True)
+    auditor._remote_scored["X"] = ["a"]
+    assert asyncio.run(auditor.restore_scored()) == 0
+    assert auditor._remote_scored == {"X": ["a"]}
+
+
 def test_a_single_process_auditor_reads_no_verdict_back_at_its_start():
     from reliquary.validator import eval_control
     from tests.unit.test_eval_draw import _job as draw_job
