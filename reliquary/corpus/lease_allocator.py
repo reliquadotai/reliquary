@@ -58,6 +58,9 @@ FULL = 0.9
 TARGET_WAIT_SECONDS = 60.0
 BUSY_HIGH = 0.95
 BUSY_LOW = 0.85
+# A queue this long and growing cuts k even on an idle card: half the 1,800 s audit hold. On 2026-11-21 intake
+# starved the judge, the card idled, k stayed up and payments fell over an hour behind.
+JUDGE_BEHIND_SECONDS = 900.0
 K_MIN, K_MAX = 0.25, 2.0
 K_GROW = 1.25
 # Back to 1 faster than above it: a k cut by a queue that drained is a card left idle.
@@ -463,8 +466,10 @@ class MarketPace:
         # Down only when the card is what the queue waits for: a long queue on an idle card waits for something
         # else (records read, draw rounds), and fewer leases would not shorten it (2026-11-18: 600 s queued after
         # a restart, the card 14-28 % busy, k fell 1 -> 0.12 in a minute).
-        if wait > TARGET_WAIT_SECONDS and (busy is None or busy >= BUSY_LOW) and (
-                (self._wait is not None and wait > self._wait) or (busy is not None and busy > BUSY_HIGH)):
+        growing = self._wait is not None and wait > self._wait
+        if (wait > JUDGE_BEHIND_SECONDS and growing) or (
+                wait > TARGET_WAIT_SECONDS and (busy is None or busy >= BUSY_LOW)
+                and (growing or (busy is not None and busy > BUSY_HIGH))):
             # From the excess of this wait, at most halved, and once a loop: the queue keeps growing for a loop
             # after a cut with the records of leases already out (2026-11-18: k 1 -> 0.05 in 10 min, then
             # 3 -> 0.35 at once; each time the leases and the price collapsed).
