@@ -1679,6 +1679,7 @@ def build_corpus_router(
     pending_record_arrivals: dict[str, float] | None = None,
     auction=None,
     lease_fault=None,
+    lease_held: Callable[[], bool] | None = None,
 ) -> APIRouter:
     """The corpus submission endpoint, over an already-bound job store.
 
@@ -1751,10 +1752,10 @@ def build_corpus_router(
             if leases is not None:
                 return leases
             if auction is None:
-                leases = DrawLeases(job, validator_fault=lease_fault)
+                leases = DrawLeases(job, validator_fault=lease_fault, held=lease_held)
             else:
                 # Beside the auction's state, so a control restart keeps the leases in flight.
-                leases = DrawLeases(job, limit_per_hotkey=False, validator_fault=lease_fault,
+                leases = DrawLeases(job, limit_per_hotkey=False, validator_fault=lease_fault, held=lease_held,
                                     on_unused=lambda lease, held: auction.lease_ended(lease.hotkey, lease.price, held),
                                     state_path=(auction.state_path.with_suffix(".leases.json")
                                                 if auction.state_path is not None else None))
@@ -2987,6 +2988,16 @@ def build_corpus_router(
     router.auction_view = auction_view
     router.auction = auction
     router.draw_leases = leases_by_job
+    if lease_held is not None and job is not None and has_draw(job):
+        # From now: a hold after a restart stops the clock of the leases restored, before any route reads them.
+        _leases(job)
+
+    def sync_lease_clock() -> None:
+        leases = leases_by_job.get(job_id)
+        if leases is not None:
+            leases.expire()
+
+    router.sync_lease_clock = sync_lease_clock
     router.slots_remaining = slots_remaining
     # The handlers themselves, so `build_corpus_jobs_router` can dispatch to
     # this job without a second copy of any of them.
@@ -3035,6 +3046,8 @@ class CorpusJobRoutes:
         self.hold_reasons: dict[str, Callable[[], str | None]] = {}
         # Held jobs whose hold is checked every time, never released for good.
         self.unlatched: set[str] = set()
+        # Per job, the hold reason that stops its leases' clock and lets a miner release a lease.
+        self.lease_clock_reasons: dict[str, str] = {}
         # Handlers past the retired check. admission_pending also accounts for
         # taken turns that continue after their HTTP handler is cancelled.
         self.in_flight: collections.Counter = collections.Counter()
@@ -3084,7 +3097,8 @@ class CorpusJobRoutes:
             return True
         if job_id in self.unlatched:
             return False
-        del self.held[job_id]
+        # Pop: a lease route reads this from its worker thread too.
+        self.held.pop(job_id, None)
         self.hold_reasons.pop(job_id, None)
         logger.info("corpus job %s: released to miners", job_id)
         return False
@@ -3100,6 +3114,14 @@ class CorpusJobRoutes:
             logger.exception("corpus job %s: its hold reason could not be read", job_id)
             reason = None
         return reason or "held"
+
+    def stop_lease_clock_on(self, job_id: str, reason: str) -> None:
+        """While ``job_id`` is held for ``reason``, its leases' clock is stopped (``DrawLeases``)."""
+        self.lease_clock_reasons[job_id] = reason
+
+    def lease_clock_stopped(self, job_id: str) -> bool:
+        reason = self.lease_clock_reasons.get(job_id)
+        return reason is not None and self.held_reason(job_id) == reason
 
     def set_admission(self, job_id: str, admission: str) -> None:
         if admission == "paused":
@@ -3169,11 +3191,13 @@ class CorpusJobRoutes:
             await recover()
 
     @contextlib.asynccontextmanager
-    async def admission(self, job_id: str):
-        """The job's router for one write, refused once retired, counted while it runs."""
+    async def admission(self, job_id: str, *, releasing: bool = False):
+        """The job's router for one write, refused once retired, counted while it runs. ``releasing``: a lease
+        given back, which a hold that stopped the leases' clock lets through."""
         if job_id in self.retired:
             raise HTTPException(status_code=410, detail=JOB_RETIRED)
-        if job_id in self.paused or self.is_held(job_id):
+        if job_id in self.paused or (self.is_held(job_id)
+                                     and not (releasing and self.lease_clock_stopped(job_id))):
             raise HTTPException(status_code=409, detail="job_paused")
         router = self.routers.get(job_id)
         if router is None:
@@ -3276,7 +3300,7 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
 
     @router.post(LEASE_RELEASE_SCOPED_PATH, response_model=CorpusLeaseResponse)
     async def release_corpus_lease_scoped(job_id: str, request: CorpusLeaseReleaseRequest) -> CorpusLeaseResponse:
-        async with routes.admission(job_id) as served:
+        async with routes.admission(job_id, releasing=True) as served:
             return await served.release_corpus_lease(request)
 
     @router.post(ASK_SCOPED_PATH, response_model=CorpusAskResponse)
@@ -3356,7 +3380,7 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
         if await _lease_target(request) is None:
             return CorpusLeaseResponse(leased=False, reason=CorpusRejectReason.JOB_NOT_SERVED.value,
                                        detail={"job_id": request.job_id, "serves": routes.open_jobs()})
-        async with routes.admission(request.job_id) as target:
+        async with routes.admission(request.job_id, releasing=True) as target:
             return await target.release_corpus_lease(request)
 
     @router.post(SUBMIT_PATH, response_model=CorpusSubmissionResponse)
