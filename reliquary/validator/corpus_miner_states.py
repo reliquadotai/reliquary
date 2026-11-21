@@ -160,6 +160,10 @@ class MinerStates:
         """The last document seen and when, or None before any read."""
         return self._mirror
 
+    def forget_mirror(self) -> None:
+        """Another process wrote the document: the next ``state_at_most`` reads it."""
+        self._mirror = None
+
     async def state_at_most(self, hotkey: str, max_age: float) -> tuple[MinerState, float]:
         """``hotkey``'s state from a document at most ``max_age`` seconds old,
         read only when the mirror is older; one read at a time."""
