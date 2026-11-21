@@ -28,6 +28,7 @@ DIAGNOSTICS = {7: {"positions": 100, "stochastic": 50, "exact": 100, "max_miss":
                8: {"positions": 100, "stochastic": 100, "exact": 10, "max_miss": 0.9, "last_miss": 0.0},
                9: {"positions": 40, "stochastic": 40, "exact": 20, "max_miss": 0.0, "last_miss": 0.0}}
 AUDITOR = {"_accept_slack": 5.0, "_rescan_every": 0.5}
+PERIOD_ENV = "ORDER_JUDGE_TEST_PERIOD"
 
 
 def init_child() -> None:
@@ -43,9 +44,13 @@ def init_child() -> None:
         return None
 
     corpus_validator.warm_drand_chain = no_chain
+    if os.environ.get(PERIOD_ENV):
+        from reliquary.validator import corpus_periods
+
+        corpus_periods.PERIOD_SECONDS = int(os.environ[PERIOD_ENV])
 
 
-def _entry():
+def _entry(**params):
     from reliquary.protocol.profiles import ACTIVE_PROTOCOL_PROFILE
     from reliquary.shared.task_registry import MECHANISM_CORPUS_GENERATION, TaskEntry
 
@@ -55,21 +60,21 @@ def _entry():
         params={"cap": 0.5, "audit_q": 1.0, "audit_probation_submissions": 1, "audit_hold_seconds": 60.0,
                 "audit_ban_after_failures": 1000, "settlement": "period-ema-v1",
                 "max_price_per_token": ALPHA / 1e6 / EMISSION, "max_price_alpha_per_mtoken": ALPHA,
-                "max_price_miner_alpha_per_period": EMISSION, "max_price_set_at": 1.0},
+                "max_price_miner_alpha_per_period": EMISSION, "max_price_set_at": 1.0, **params},
         status="active", retired_at=None, contract=ACTIVE_PROTOCOL_PROFILE.to_generation_contract(), job_id=JOB)
 
 
-def _seed(root: Path) -> None:
+def _seed(root: Path, *, prompts: int = 3, hotkeys=tuple(TOKENS)) -> None:
     from reliquary.corpus.audit_policy import MinerState
     from reliquary.infrastructure import corpus_job_store as job_store
     from reliquary.infrastructure import corpus_record_store as record_store
     from reliquary.validator.eval_control import ORDER_TRUST_ID
 
     raw = h.manifest(JOB, max_new_tokens=4096)
-    raw.update(prompt_count=3, slots_per_prompt=1, seed=5, sampling={**raw["sampling"], "draw": "gumbel_max"})
+    raw.update(prompt_count=prompts, slots_per_prompt=1, seed=5, sampling={**raw["sampling"], "draw": "gumbel_max"})
     h.put_raw(root, job_store._job_key(JOB), json.dumps(raw).encode())
     h.put_raw(root, record_store._miners_key(ORDER_TRUST_ID), json.dumps(
-        {hotkey: MinerState(audited_passed=1000).to_dict() for hotkey in TOKENS}).encode())
+        {hotkey: MinerState(audited_passed=1000).to_dict() for hotkey in hotkeys}).encode())
 
 
 async def _until(predicate, timeout: float, what: str) -> None:
@@ -106,12 +111,12 @@ def _signed(hotkey: str) -> dict:
             "nonce": secrets.token_hex(16), "signature": "ok"}
 
 
-async def _submit(client, hotkey: str, lease: dict) -> dict:
+async def _submit(client, hotkey: str, lease: dict, *, token: int | None = None) -> dict:
     from reliquary.protocol.corpus_submission import CorpusSubmissionRequest
     from tests.unit.test_corpus_service import CHECKPOINT, EOS, _faithful_prompt, _text_for
 
     length = 39 if hotkey == DRIFT else 99     # the near miss is short: its refusal is never charged
-    tokens = [TOKENS[hotkey]] * length + [EOS]
+    tokens = [TOKENS[hotkey] if token is None else token] * length + [EOS]
     request = CorpusSubmissionRequest(
         job_id=JOB, miner_hotkey=hotkey, cursor=lease["slot"], prompt_index=lease["prompt_index"],
         checkpoint_sha256=CHECKPOINT, rendered_prompt=_faithful_prompt(lease["prompt_index"]),
@@ -122,8 +127,8 @@ async def _submit(client, hotkey: str, lease: dict) -> dict:
     return {**answer, "submission_id": corpus_submission_id(request)}
 
 
-async def _run(mode: str, root: Path, run_dir: Path) -> dict:
-    import httpx
+async def _start(mode: str, root: Path, run_dir: Path, entry) -> SimpleNamespace:
+    """The front's routes over a real dispatcher and fake executor, the order judged in this process or the child."""
     from fastapi import FastAPI
 
     from reliquary.corpus.token_auction import AuctionParams, TokenAuction
@@ -140,7 +145,6 @@ async def _run(mode: str, root: Path, run_dir: Path) -> dict:
     from tests.unit import corpus_split_fakes as fakes
     from tests.unit.test_corpus_service import _Renderer
 
-    entry = _entry()
     store, records = BucketJobStore(), BucketRecordStore()
     job, _ = await store.read_job(JOB)
     params, miner_states, is_banned, beacon, round_at = build_corpus_audit_wiring(
@@ -194,6 +198,24 @@ async def _run(mode: str, root: Path, run_dir: Path) -> dict:
         prompt_job_for=corpus_service.prompt_job_for_spec, records=records, on_accepted=w.on_accepted,
         proof_chunk_tokens=None, vocab_size=fakes.VOCAB, is_banned=is_banned,
         suspect_until=_suspect_reader(miner_states, params), job=job, durable_records=False, auction=auction))
+    return SimpleNamespace(app=app, w=w, job=job, store=store, front=front, background=background)
+
+
+async def _stop(control) -> None:
+    for task in control.background:
+        task.cancel()
+    await asyncio.wait(control.background, timeout=5)
+    if control.front is not None:
+        await asyncio.to_thread(control.front.stop, 5.0)
+
+
+async def _run(mode: str, root: Path, run_dir: Path) -> dict:
+    import httpx
+
+    from reliquary.infrastructure.corpus_job_store import BucketJobStore
+
+    control = await _start(mode, root, run_dir, _entry())
+    app, w, job, front = control.app, control.w, control.job, control.front
     try:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://front",
                                      timeout=30) as client:
@@ -259,11 +281,7 @@ async def _run(mode: str, root: Path, run_dir: Path) -> dict:
         logging.getLogger(__name__).exception("the %s scenario failed", mode)
         raise
     finally:
-        for task in background:
-            task.cancel()
-        await asyncio.wait(background, timeout=5)
-        if front is not None:
-            await asyncio.to_thread(front.stop, 5.0)
+        await _stop(control)
 
     def shown(sid: str) -> dict:
         verdict = all_verdicts[sid]
@@ -288,19 +306,104 @@ async def _run(mode: str, root: Path, run_dir: Path) -> dict:
                        "attempts": sorted(ledger.slots.slot_attempt(p, 0) for p in range(3))}}
 
 
-def _scenario(mode: str, root: str, run_dir: str, out: str) -> None:
+# -- sampled: q < 1, unaudited passes, the stake ---------------------------------
+
+HONEST = ("5Hon1", "5Hon2")
+SAMPLED_HOTKEYS = (*HONEST, CHEAT)
+SAMPLED_PROMPTS = 18
+SAMPLED = {"audit_q": 0.5, "audit_hold_seconds": 20.0}
+SAMPLED_PERIOD_SECONDS = 60
+ROUND_SECONDS = 3                       # ``corpus_split_harness.round_at``
+
+
+async def _round_start(*, period: bool) -> None:
+    """Just after a drand round begins (and with ``period``, a settlement period): each wave in one round, both
+    waves in one period, since a record's stake counts its own period's."""
+    from reliquary.validator import corpus_periods as cp
+
+    while True:
+        now = time.time()
+        if now % ROUND_SECONDS < 0.3 and (not period or (now - cp.PERIOD_EPOCH) % cp.PERIOD_SECONDS < 3.0):
+            return
+        await asyncio.sleep(0.02)
+
+
+async def _run_sampled(mode: str, root: Path, run_dir: Path) -> dict:
+    import httpx
+
+    from reliquary.corpus import draw_leases
+
+    # The same slots in the same order in both runs: the same submission ids, so the same draws.
+    draw_leases.secrets = SimpleNamespace(randbits=lambda bits: 11, token_hex=secrets.token_hex)
+    control = await _start(mode, root, run_dir, _entry(**SAMPLED))
+    labels: dict[str, str] = {}
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=control.app), base_url="http://front",
+                                     timeout=30) as client:
+            for hotkey in SAMPLED_HOTKEYS:
+                body = {**_signed(hotkey), "micro_alpha_per_mtoken": int(0.2 * 1e6), "capacity": 1}
+                assert (await client.post("/corpus/ask", json=body)).json()["accepted"]
+
+            async def wave(first: int, last: int, forged: bool) -> None:
+                for k in range(first, last):
+                    hotkey = SAMPLED_HOTKEYS[k % 3]
+                    granted = (await client.post("/corpus/lease", json=_signed(hotkey))).json()
+                    assert granted["leased"], granted
+                    answer = await _submit(client, hotkey, granted, token=8 if forged and hotkey == CHEAT else 7)
+                    assert answer["accepted"], answer
+                    labels[answer["submission_id"]] = f"{hotkey}:{granted['prompt_index']}"
+
+            # Audited first (no stake yet): what the second wave's stake then counts.
+            await _round_start(period=True)
+            await wave(0, 3, False)
+            await _until(lambda: set(labels) <= set(h.listed(root, JOB, "verdicts")), 30, "the first wave")
+            await _round_start(period=False)
+            await wave(3, SAMPLED_PROMPTS, True)
+            await _until(lambda: set(labels) <= set(h.listed(root, JOB, "verdicts")), 120, "every sampled verdict")
+            await _until(lambda: set(labels) <= set(h.settlement(root, JOB).get("settled") or ()), 120,
+                         "every sampled settlement")
+            if control.front is not None:
+                await _until(lambda: control.front.live(JOB)
+                             and sum(control.w.auditor.audit_reasons.values()) > 0, 15, "the snapshot's reasons")
+                await asyncio.sleep(0.5)
+            reasons = dict(control.w.auditor.audit_reasons)
+    finally:
+        await _stop(control)
+    verdicts, voided = h.listed(root, JOB, "verdicts"), h.listed(root, JOB, "voided")
+
+    def shown(sid: str) -> dict:
+        verdict = verdicts[sid]
+        draw = verdict.get("draw") or {}
+        return {**{key: verdict.get(key) for key in ("hotkey", "passed", "audited", "reason", "penalty", "forced_draw",
+                                                     "token_count", "lease_price", "lease_debit", "scored_by")},
+                "drawn": draw.get("drawn"), "voided": sid in voided}
+
+    rewards: dict[str, float] = {}
+    for row in map(json.loads, (root / "archives" / "writes.jsonl").read_text().splitlines()):
+        for hotkey, value in row["rewards"].items():
+            rewards[hotkey] = rewards.get(hotkey, 0.0) + float(value)
+    return {"verdicts": {label: shown(sid) for sid, label in labels.items()}, "reasons": reasons,
+            "rewards": rewards}
+
+
+def _scenario(mode: str, root: str, run_dir: str, out: str, kind: str = "full") -> None:
     from reliquary.shared.log_levels import unmute_reliquary_loggers
 
     init_child()
     logging.basicConfig(level=logging.WARNING, force=True)
     unmute_reliquary_loggers()
-    _seed(Path(root))
-    Path(out).write_text(json.dumps(asyncio.run(_run(mode, Path(root), Path(run_dir)))))
+    if kind == "sampled":
+        _seed(Path(root), prompts=SAMPLED_PROMPTS, hotkeys=SAMPLED_HOTKEYS)
+        result = asyncio.run(_run_sampled(mode, Path(root), Path(run_dir)))
+    else:
+        _seed(Path(root))
+        result = asyncio.run(_run(mode, Path(root), Path(run_dir)))
+    Path(out).write_text(json.dumps(result))
     os._exit(0)
 
 
-def _outcome(mode: str, tmp_path: Path, monkeypatch) -> dict:
-    base = tmp_path / mode
+def _outcome(mode: str, tmp_path: Path, monkeypatch, kind: str = "full") -> dict:
+    base = tmp_path / f"{kind}-{mode}"
     root, run_dir = base / "bucket", base / "run"
     root.mkdir(parents=True)
     run_dir.mkdir(mode=0o700)
@@ -309,7 +412,7 @@ def _outcome(mode: str, tmp_path: Path, monkeypatch) -> dict:
     monkeypatch.setenv(h.LOG_ENV, str(base / "log"))
     out = base / "out.json"
     process = multiprocessing.get_context("spawn").Process(
-        target=_scenario, args=(mode, str(root), str(run_dir), str(out)))
+        target=_scenario, args=(mode, str(root), str(run_dir), str(out), kind))
     process.start()
     process.join(280)
     if process.is_alive():
@@ -357,3 +460,42 @@ def test_only_what_passed_is_paid(outcomes):
     rewards = outcomes["child"]["rewards"]
     assert rewards[GOOD] > 0 and rewards[REDO] > 0
     assert not rewards.get(CHEAT) and not rewards.get(DRIFT)
+
+
+@pytest.fixture(scope="module")
+def sampled(tmp_path_factory):
+    patch = pytest.MonkeyPatch()
+    try:
+        patch.setenv(h.BEACON_ENV, "const")
+        patch.setenv(PERIOD_ENV, str(SAMPLED_PERIOD_SECONDS))
+        path = tmp_path_factory.mktemp("sampled")
+        return {mode: _outcome(mode, path, patch, "sampled") for mode in ("single", "child")}
+    finally:
+        patch.undo()
+
+
+def _comparable(outcome: dict) -> dict:
+    """All of it, but for one race the rule allows: a record of a hotkey just caught is audited either on its draw or
+    as suspect, by whether the pass deciding it came after the failure. Audited and refused both ways."""
+    reasons = dict(outcome["reasons"])
+    caught = reasons.pop("drawn", 0) + reasons.pop("suspect", 0)
+    verdicts = {label: {k: v for k, v in verdict.items() if not (verdict["hotkey"] == CHEAT and k == "drawn")}
+                for label, verdict in outcome["verdicts"].items()}
+    return {**outcome, "reasons": {**reasons, "drawn_or_suspect": caught}, "verdicts": verdicts}
+
+
+def test_a_sampled_draw_order_ends_the_same_judged_in_the_child(sampled):
+    assert _comparable(sampled["child"]) == _comparable(sampled["single"])
+
+
+def test_the_sampled_run_exercises_unaudited_passes_the_stake_and_a_forfeit(sampled):
+    child = sampled["child"]
+    verdicts = child["verdicts"].values()
+    honest = [v for v in verdicts if v["hotkey"] in HONEST]
+    assert all(v["passed"] for v in honest)
+    assert any(not v["audited"] for v in honest), "no unaudited pass"
+    assert any(v["audited"] for v in honest), "no audit"
+    assert child["reasons"].get("slow_stake"), "the stake never decided an audit"
+    assert child["reasons"].get("drawn"), "the draw never decided an audit"
+    assert not any(v["passed"] and not v["voided"] for v in verdicts if v["hotkey"] == CHEAT)
+    assert not child["rewards"].get(CHEAT) and all(child["rewards"].get(hotkey, 0) > 0 for hotkey in HONEST)
