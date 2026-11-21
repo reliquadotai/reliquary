@@ -17,7 +17,8 @@ flight). Without one, a restart drops them.
 
 While the control itself keeps miners off the job (``held``: its judge is down, unseeded or stale), the leases' clock
 stops: none lapses or is charged, and when the hold ends each live and lapsed lease moves on by the hold's length. A
-lease lapsed during a hold is not charged if another hotkey takes its slot before its moved window ends.
+lapsed lease whose slot another hotkey takes during the hold, or within ``HOLD_GRACE_SECONDS`` of its end, is not
+charged: its holder may have been retrying a delivery the hold refused. After that it is charged as ever.
 """
 from __future__ import annotations
 
@@ -50,6 +51,9 @@ SLOW_TOKENS_PER_SECOND = 10.0
 MAX_LEASE_SECONDS = 4 * 3600.0
 # Over a signed episode's deadline: the lease is granted before the miner opens its session.
 EPISODE_LEASE_MARGIN_SECONDS = 300.0
+# After a hold, how long a lapsed lease is not charged for losing its slot: three of a miner's longest retry waits
+# (30 s, ``corpus_miner._TRANSIENT_BACKOFF_SECONDS``), so a delivery the hold refused has come back by then.
+HOLD_GRACE_SECONDS = 90.0
 
 
 def episode_lease_floor(job: Any) -> float:
@@ -137,9 +141,9 @@ class DrawLeases:
         # time took 51 % of the order control's one core on 2026-11-21 and starved its judge.
         self._texts: dict[str, str] = {}
         self._held = held
-        # When the clock stopped (None: running), and the lapsed leases a hold kept from delivering.
+        # When the clock stopped (None: running), and until when each lapsed lease is spared after a hold.
         self._stopped_at: float | None = None
-        self._spared: set[str] = set()
+        self._spared: dict[str, float] = {}
         self._load()
         with self._lock:
             self._sync_clock()
@@ -168,7 +172,9 @@ class DrawLeases:
                 lease = Lease(**raw)
                 if kept or lease.expires_at + self.seconds > now:
                     self._lapsed[lease.lease_id] = lease
-            self._spared = {str(i) for i in state.get("spared", ()) if str(i) in self._lapsed}
+            spared = state.get("spared")
+            self._spared = {str(i): float(t) for i, t in spared.items() if str(i) in self._lapsed} \
+                if isinstance(spared, Mapping) else {}
             self._unused = {str(h): [float(t) for t in ts] for h, ts in (state.get("unused") or {}).items()}
             logger.info("draw leases: %d lease(s) still running restored from %s", len(self._by_id),
                         self._state_path)
@@ -190,7 +196,7 @@ class DrawLeases:
                 self._state_path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = self._state_path.with_suffix(".tmp")
                 clock = "" if self._stopped_at is None else f', "stopped_at": {json.dumps(self._stopped_at)}'
-                spared = "" if not self._spared else f', "spared": {json.dumps(sorted(self._spared))}'
+                spared = "" if not self._spared else f', "spared": {json.dumps(self._spared, sort_keys=True)}'
                 tmp.write_text(f'{{"leases": [{self._encoded(self._by_id)}], '
                                f'"lapsed": [{self._encoded(self._lapsed)}], '
                                f'"unused": {json.dumps(self._unused)}{clock}{spared}}}')
@@ -252,7 +258,7 @@ class DrawLeases:
                     book[lease_id] = replace(lease, granted_at=lease.granted_at + moved,
                                              expires_at=lease.expires_at + moved)
                     self._texts.pop(lease_id, None)
-        self._spared |= set(self._lapsed)
+        self._spared.update(dict.fromkeys(self._lapsed, now + HOLD_GRACE_SECONDS))
         self._stopped_at = None
         self._dirty = True
         logger.info("draw leases of %s: clock restarted, %d lease(s) moved on by %.0f s",
@@ -289,7 +295,7 @@ class DrawLeases:
     def _charge_lapsed(self, lease: Lease, now: float) -> None:
         """A lapsed lease ended undelivered: charged as an expired one."""
         self._dirty = True
-        self._spared.discard(lease.lease_id)
+        self._spared.pop(lease.lease_id, None)
         fault = self._fault(lease)
         if fault is not None:
             self._log("expired", lease, f" ours={fault[0]} ({fault[1]}): not charged")
@@ -457,13 +463,13 @@ class DrawLeases:
                 lease = self._lapsed.pop(lease_id)
                 if hotkey is not None and lease.hotkey == hotkey:
                     self._dirty = True
-                    self._spared.discard(lease_id)
+                    self._spared.pop(lease_id, None)
                     self._log("taken", lease, f" after={round(now - lease.granted_at)} late")
-                elif self._stopped_at is not None or lease_id in self._spared:
-                    # A hold kept its holder from delivering before this slot went to another.
+                elif self._stopped_at is not None or self._spared.get(lease_id, -float("inf")) > now:
+                    # A hold may have kept its holder from delivering before this slot went to another.
                     self._dirty = True
-                    self._spared.discard(lease_id)
-                    self._log("taken", lease, " by another after a hold: not charged")
+                    self._spared.pop(lease_id, None)
+                    self._log("taken", lease, " by another during or just after a hold: not charged")
                 else:
                     self._charge_lapsed(lease, now)
             self.save()

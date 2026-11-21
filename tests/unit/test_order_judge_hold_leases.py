@@ -191,6 +191,48 @@ def test_a_slot_lapsed_when_a_hold_began_and_taken_by_another_after_it_is_not_ch
     assert world.charged("5A") == NOT_CHARGED
 
 
+def test_a_lease_abandoned_before_a_hold_is_charged_once_the_grace_is_over(fake_r2, monkeypatch):  # noqa: F811
+    world = World(fake_r2, monkeypatch)
+    world.ask("5A")
+    world.ask("5B")
+    lease = world.lease("5A")
+    world.clock.now += SECONDS + 1          # lapsed, abandoned
+    world.orders()
+    world.up = False
+    world.orders()
+    world.clock.now += 1.0                  # a one-second hold (a control restart) forgives nothing past its grace
+    world.up = True
+    world.orders()
+    world.clock.now += draw_leases.HOLD_GRACE_SECONDS + 1
+    world.ask("5B")
+    other = world.lease("5B")
+    assert (other["prompt_index"], other["slot"]) == (lease["prompt_index"], lease["slot"])
+    assert world.submit("5B", other).json()["accepted"] is True
+    charged, missed, unused = world.charged("5A")
+    assert charged and missed == 1 and unused == 1
+
+
+def test_the_grace_after_a_hold_survives_a_restart_and_then_ends(tmp_path):
+    clock, charged = Clock(), []
+    path, hold = tmp_path / "leases.json", {"on": False}
+    first = _book(path, clock, lambda: hold["on"])
+    held, other = first.grant("5A", _free(first), price=1e-6), None
+    clock.now += 101
+    first.expire()
+    hold["on"] = True
+    first.expire()
+    clock.now += 5
+    hold["on"] = False
+    first.expire()
+    assert json.loads(path.read_text())["spared"] == {held.lease_id: clock.now + draw_leases.HOLD_GRACE_SECONDS}
+    back = _book(path, clock, lambda: False, on_unused=lambda l, h: charged.append(l.lease_id))
+    clock.now += draw_leases.HOLD_GRACE_SECONDS - 1
+    assert back._spared
+    clock.now += 2
+    back.settle(held.prompt_index, held.slot, "5B")
+    assert charged == [held.lease_id] and other is None
+
+
 def test_a_lease_running_through_a_hold_keeps_its_slot_from_others_after_it(world):
     world.ask("5A")
     world.ask("5B")

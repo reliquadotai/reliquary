@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 # A job whose wiring failed is tried again this much later.
 WIRE_RETRY_SECONDS = 30.0
 LOCK_WAIT_SECONDS = 10.0
+# The first settlement waits this long for who scored what to be read back and re-audited. Past it, it settles
+# anyway and flags the order: a restore that keeps failing never stops pay, and a pass settled inside the hold can
+# still be re-audited and voided.
+RESTORE_WAIT_SECONDS = 900.0
 
 
 class CountedStates:
@@ -87,13 +91,14 @@ class OrderJudgeHost:
 
     def __init__(self, *, records, store, client: DispatchClient, feed, threads=None, tokenizer_for=None,
                  settle_seconds: float = 60.0, auditor_kwargs: dict | None = None,
-                 clock=time.monotonic) -> None:
+                 clock=time.monotonic, restore_wait_seconds: float = RESTORE_WAIT_SECONDS) -> None:
         from reliquary.validator.eval_control import load_cpu_tokenizer
 
         self.records, self.store, self.client, self.feed = records, CountedJobStore(store), client, feed
         self.threads = threads
         self._tokenizer_for = tokenizer_for or load_cpu_tokenizer
         self._settle_seconds = settle_seconds
+        self._restore_wait = restore_wait_seconds
         self._auditor_kwargs = auditor_kwargs or {}
         self._clock = clock
         self.boot = secrets.token_hex(8)
@@ -228,6 +233,12 @@ class OrderJudgeHost:
     async def _settle_forever(self, w) -> None:
         # After the auditor's start: its listing and reads come first after a restart.
         await w.auditor.seeded.wait()
+        try:
+            await asyncio.wait_for(w.auditor.scores_restored.wait(), self._restore_wait)
+        except asyncio.TimeoutError:
+            logger.error("order judge: %s: executor scores not restored after %.0f s; settling without them",
+                         w.job.job_id, self._restore_wait)
+            self._flag(str(w.job.job_id), "settling before its executor scores were restored")
         while True:
             try:
                 await w.settler.settle_once()

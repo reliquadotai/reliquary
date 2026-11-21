@@ -532,9 +532,10 @@ class TokenAuction:
             try:
                 q = float(self._q())
                 weight = None if self._q_weight is None else int(self._q_weight())
-            except Exception:
-                logger.exception("token auction: audit share unavailable")
-                weight = None
+            except Exception as exc:
+                # Unknown (its judge is held): the market keeps this job's last report, never a guess.
+                logger.warning("token auction: audit share unavailable (%s); report skipped", exc)
+                return
             else:
                 # Freshly started, the auditor's share stands on few verdicts and reads near q (its prior): the
                 # share measured before the restart stands until enough land (2026-11-18: 0.2 read against 0.43
