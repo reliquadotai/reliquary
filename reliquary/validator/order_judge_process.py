@@ -51,6 +51,31 @@ class CountedStates:
         return (await self.update_many({hotkey: change}, attempts))[hotkey]
 
 
+class CountedJobStore:
+    """The job store, counting each order's ledger writes (tried, as one that failed may have landed):
+    the front forgets its memory of a ledger when the count moves."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.ledger_writes: dict[str, int] = {}
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+    async def read_ledgers(self, job_id):
+        # The front writes this ledger all the time: never a compare-and-swap from a remembered version.
+        forget = getattr(self._inner, "forget_ledgers", None)
+        if forget is not None:
+            forget(job_id)
+        return await self._inner.read_ledgers(job_id)
+
+    async def write_ledgers(self, job_id, snapshot, etag):
+        try:
+            return await self._inner.write_ledgers(job_id, snapshot, etag)
+        finally:
+            self.ledger_writes[str(job_id)] = self.ledger_writes.get(str(job_id), 0) + 1
+
+
 def entry_from_wire(document: Mapping):
     from reliquary.shared.task_registry import TaskEntry
 
@@ -65,7 +90,7 @@ class OrderJudgeHost:
                  clock=time.monotonic) -> None:
         from reliquary.validator.eval_control import load_cpu_tokenizer
 
-        self.records, self.store, self.client, self.feed = records, store, client, feed
+        self.records, self.store, self.client, self.feed = records, CountedJobStore(store), client, feed
         self.threads = threads
         self._tokenizer_for = tokenizer_for or load_cpu_tokenizer
         self._settle_seconds = settle_seconds
@@ -263,7 +288,8 @@ class OrderJudgeHost:
             jobs.setdefault(job_id, {"seeded": False, "attention": list(reasons)})
         return {"boot": self.boot, "at": time.time(), "jobs": jobs,
                 "entries": {job_id: sha for job_id, (sha, _) in self.entries.items()},
-                "operators_version": self._operators_version, "feed": self.feed.state()}
+                "operators_version": self._operators_version, "feed": self.feed.state(),
+                "ledger_writes": dict(self.store.ledger_writes)}
 
     async def aclose(self) -> None:
         for task in list(self._wiring.values()):

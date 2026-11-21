@@ -1729,7 +1729,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         grader = getattr(w, "grader", None)
         if judged_apart:
             # Its auditor, settler and book run in the judge process.
-            order_judge.attach(w, records=records)
+            order_judge.attach(w, records=records, store=store)
         else:
             wire_order_judge(
                 w, records=records, job_store=store, params=params, miner_states=miner_states, beacon=beacon,

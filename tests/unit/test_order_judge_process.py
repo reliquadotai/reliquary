@@ -411,6 +411,66 @@ def test_a_reply_in_flight_when_the_judge_died_proves_nothing(bucket):
     asyncio.run(go())
 
 
+def test_the_front_forgets_a_ledger_the_judge_wrote(bucket):
+    _, run_dir = bucket
+
+    class Store:
+        forgotten = 0
+
+        def forget_ledgers(self, job_id):
+            assert job_id == JOB
+            self.forgotten += 1
+
+    dispatcher = PairedAuditDispatcher(directory=SimpleNamespace(revoke_locally=lambda e: None))
+    front = OrderJudgeFront(dispatcher=dispatcher, run_dir=run_dir, spawn=False)
+    store = Store()
+    w = SimpleNamespace(entry=_entry(), cap=0.1, job=SimpleNamespace(job_id=JOB, prompt_source="x", sampling=None),
+                        stats=JobStats(), proof=PROOF, miner_states=None)
+    w.job.sampling = SimpleNamespace(draw=None)
+    front.attach(w, records=None, store=store)
+    front._take({"boot": "b1", "jobs": {}, "ledger_writes": {}})
+    assert store.forgotten == 1                 # a new judge may have written before it could say so
+    front._take({"boot": "b1", "jobs": {}, "ledger_writes": {}})
+    assert store.forgotten == 1
+    front._take({"boot": "b1", "jobs": {}, "ledger_writes": {JOB: 1}})
+    assert store.forgotten == 2
+    front._take({"boot": "b1", "jobs": {}, "ledger_writes": {JOB: 1}})
+    assert store.forgotten == 2
+    front._take({"boot": "b2", "jobs": {}, "ledger_writes": {}})
+    assert store.forgotten == 3
+
+
+def test_a_forgotten_ledger_is_read_again_and_a_read_in_flight_keeps_no_memory(monkeypatch):
+    from reliquary.infrastructure.corpus_job_store import BucketJobStore
+
+    versions = iter([({"v": 1}, "e1"), ({"v": 2}, "e2"), ({"v": 3}, "e3")])
+    gate = {"event": None}
+
+    async def read(job_id, **kw):
+        value = next(versions)
+        if gate["event"] is not None:
+            await gate["event"].wait()
+        return value
+
+    monkeypatch.setattr(job_store, "read_ledgers", read)
+
+    async def go():
+        store = BucketJobStore()
+        assert (await store.read_ledgers(JOB))[1] == "e1"
+        assert (await store.read_ledgers(JOB))[1] == "e1"      # remembered
+        store.forget_ledgers(JOB)
+        gate["event"] = asyncio.Event()
+        in_flight = asyncio.ensure_future(store.read_ledgers(JOB))
+        await asyncio.sleep(0)
+        store.forget_ledgers(JOB)               # written elsewhere while that read was on its way
+        gate["event"].set()
+        assert (await in_flight)[1] == "e2"
+        gate["event"] = None
+        assert (await store.read_ledgers(JOB))[1] == "e3"
+
+    asyncio.run(go())
+
+
 def _stream(dispatcher, run_dir, w):
     from reliquary.validator.order_judge import DispatchClient, DispatchServer
 
