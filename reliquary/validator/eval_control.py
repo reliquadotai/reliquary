@@ -294,6 +294,13 @@ class EvalExecutorDirectory:
     def document(self, executor_id: str) -> dict | None:
         return self._by_id.get(executor_id)
 
+    def quarantined_ids(self) -> list[str]:
+        """The eval executors the registry, as last read, says were quarantined (a status is never set back)."""
+        from reliquary.infrastructure.corpus_executor_store import WAS_QUARANTINED
+
+        return sorted(eid for eid, d in self._by_id.items() if d.get("scope") == "eval"
+                      and (d.get("status") == "quarantined" or d.get(WAS_QUARANTINED) is True))
+
 
 def _placement(document: dict) -> tuple[str, str] | None:
     """Where an executor runs; None when it cannot be told apart from others."""
@@ -776,13 +783,22 @@ class PairedAuditDispatcher:
                 "models": models, "jobs": jobs,
                 "quarantined": sorted(self.quarantined), "stats": dict(self.stats)}
 
-    async def quarantine(self, executor_id: str, reason: str) -> None:
+    async def load_quarantined(self) -> list[str]:
+        """Quarantines the registry holds that this process has not heard of (it forgets its own at a restart): each
+        goes through ``quarantine`` once, with no registry write. A read that failed or lists none changes nothing."""
+        loaded = [eid for eid in self._directory.quarantined_ids() if eid not in self.quarantined]
+        for executor_id in loaded:
+            await self.quarantine(executor_id, "quarantined in the registry", recorded=True)
+        return loaded
+
+    async def quarantine(self, executor_id: str, reason: str, *, recorded: bool = False) -> None:
+        """``recorded``: read from the registry, so nothing is written back to it."""
         if executor_id in self.quarantined:
             return
         logger.error("eval audit executor %s quarantined: %s", executor_id, reason)
         self.quarantined.add(executor_id)
         self._directory.revoke_locally(executor_id)
-        self.stats["quarantined"] += 1
+        self.stats["quarantined_loaded" if recorded else "quarantined"] += 1
         for lease_id, lease in list(self._leases.items()):
             if lease.executor_id == executor_id:
                 del self._leases[lease_id]
@@ -793,8 +809,9 @@ class PairedAuditDispatcher:
                 if not batch.future.done() and executor_id in batch.scores:
                     # Its score no longer counts towards an agreement.
                     del batch.scores[executor_id]
-        self._unwritten[executor_id] = reason
-        await self._write_quarantines()
+        if not recorded:
+            self._unwritten[executor_id] = reason
+            await self._write_quarantines()
         for listener in self._listeners:
             task = asyncio.ensure_future(self._notify(listener, executor_id))
             self._background.add(task)

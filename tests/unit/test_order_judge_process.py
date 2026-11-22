@@ -4,6 +4,7 @@ socket, one on-disk bucket, the front's real dispatcher and a fake executor."""
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import random
@@ -16,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from reliquary.infrastructure import corpus_executor_store as executor_store
 from reliquary.infrastructure import corpus_job_store as job_store
 from reliquary.infrastructure import corpus_record_store as record_store
 from reliquary.corpus.audit_policy import MinerState, drawn
@@ -144,9 +146,10 @@ class _Executor:
 class _Control:
     """The front's half, around a real judge child."""
 
-    def __init__(self, root: Path, run_dir: Path, *, entry=None, auditor=None) -> None:
+    def __init__(self, root: Path, run_dir: Path, *, entry=None, auditor=None, directory=None) -> None:
         self.root = root
-        self.dispatcher = PairedAuditDispatcher(directory=SimpleNamespace(revoke_locally=lambda e: None))
+        self.dispatcher = PairedAuditDispatcher(
+            directory=directory or SimpleNamespace(revoke_locally=lambda e: None))
         self.front = OrderJudgeFront(
             dispatcher=self.dispatcher, run_dir=run_dir, spawn=True, sync_seconds=0.1, stale_seconds=1.5,
             backoff_seconds=0.2, settle_seconds=0.5, auditor_kwargs=auditor or FAST,
@@ -187,7 +190,7 @@ def bucket(tmp_path, monkeypatch):
     monkeypatch.setenv(h.ROOT_ENV, str(root))
     monkeypatch.setenv(h.LATENCY_ENV, "0,0,0,0,0")
     client = lambda **kw: h.FileS3(root)  # noqa: E731
-    for module in (job_store, record_store, storage):
+    for module in (job_store, record_store, storage, executor_store):
         monkeypatch.setattr(module, "get_s3_client", client)
     h.seed_bucket(root, [JOB], hotkeys=HOTKEYS, audited_passed=0)
     run_dir = tmp_path / "run"
@@ -379,6 +382,125 @@ def test_a_restarted_judge_re_audits_what_a_quarantined_executor_scored(bucket, 
             if honest_task is not None:
                 honest_task.cancel()
             await control.close()
+
+    asyncio.run(go())
+
+
+async def _registered(*executor_ids) -> None:
+    for executor_id in executor_ids:
+        await executor_store.register_executor(
+            executor_id=executor_id, token_sha256=hashlib.sha256(executor_id.encode()).hexdigest(),
+            model_id="org/Frozen", model_revision="abc123", expires_at=4e9, now=1.0, provider_id=f"p-{executor_id}",
+            host=f"h-{executor_id}", scope="eval")
+
+
+@pytest.mark.parametrize("then_revoked", [False, True])
+def test_a_quarantine_from_before_a_front_restart_is_re_audited(bucket, then_revoked):
+    from reliquary.validator.eval_control import EvalExecutorDirectory
+
+    root, run_dir = bucket
+
+    async def go():
+        await _registered("liar", "honest")
+        first = await _Control(root, run_dir, directory=EvalExecutorDirectory()).start()
+        lying = asyncio.ensure_future(_Executor(first.dispatcher, "liar", lies=True).run())
+        try:
+            await _until(lambda: first.front.live(JOB), 90, "the judge's seed")
+            forged = _put(root, received=time.time() - 30, forged=True, hotkey=HOTKEYS[0])
+            first.front.link.accepted(JOB, forged)
+            await _until(lambda: forged in _verdicts(root), 30, "the lying verdict")
+            assert _verdicts(root)[forged]["scored_by"] == ["liar"]
+        finally:
+            lying.cancel()
+            await asyncio.gather(lying, return_exceptions=True)
+            await first.close()
+        # Quarantined as the front went down: no judge heard of it.
+        await executor_store.set_executor_status("liar", "quarantined", reason="test", scope="eval")
+        if then_revoked:
+            await executor_store.set_executor_status("liar", "revoked", reason="card released")
+        second = await _Control(root, run_dir, directory=EvalExecutorDirectory()).start()
+        honest = _Executor(second.dispatcher, "honest")
+        scoring = asyncio.ensure_future(honest.run())
+        try:
+            await _until(lambda: forged in _voided(root), 120, "the re-audit's void")
+            assert _voided(root)[forged]["executor_id"] == "liar"
+            assert second.dispatcher.quarantined == {"liar"}     # the active one is not touched
+        finally:
+            scoring.cancel()
+            await second.close()
+
+    asyncio.run(go())
+
+
+def _registry(documents):
+    from reliquary.validator.eval_control import EvalExecutorDirectory
+
+    async def read():
+        if isinstance(documents["now"], Exception):
+            raise documents["now"]
+        return documents["now"]
+
+    return EvalExecutorDirectory(list_documents=read, refresh_seconds=0.0)
+
+
+def _document(executor_id, status="quarantined", scope="eval", **extra):
+    return {"executor_id": executor_id, "token_sha256": executor_id * 8, "status": status, "scope": scope, **extra}
+
+
+def test_the_registry_feeds_each_quarantine_once_and_writes_nothing_back():
+    documents = {"now": [_document("q"), _document("ok", "active"), _document("off", "revoked"),
+                         _document("corpus", scope="corpus"), _document("gone", "revoked", was_quarantined=True)]}
+    directory, written, heard = _registry(documents), [], []
+
+    async def write(executor_id, reason):
+        written.append(executor_id)
+
+    async def listener(executor_id):
+        heard.append(executor_id)
+
+    async def go():
+        dispatcher = PairedAuditDispatcher(directory=directory, quarantine=write)
+        dispatcher.subscribe(listener)
+        await directory.refresh()
+        assert await dispatcher.load_quarantined() == ["gone", "q"]
+        assert await dispatcher.load_quarantined() == []
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert sorted(heard) == ["gone", "q"] and written == []
+        assert dispatcher.quarantined == {"gone", "q"} and not dispatcher._unwritten
+        # A failed read, then an empty one: nothing cleared, nothing invented.
+        documents["now"] = RuntimeError("the bucket is down")
+        await directory.maybe_refresh()
+        assert await dispatcher.load_quarantined() == []
+        documents["now"] = []
+        await directory.refresh()
+        assert await dispatcher.load_quarantined() == [] and dispatcher.quarantined == {"gone", "q"}
+
+    asyncio.run(go())
+
+
+def test_a_revoke_keeps_the_quarantine_only_of_a_quarantined_executor(bucket):
+    async def go():
+        await _registered("q", "plain")
+        await executor_store.set_executor_status("q", "quarantined", reason="lied", scope="eval")
+        await executor_store.set_executor_status("q", "revoked", reason="card released")
+        await executor_store.set_executor_status("plain", "revoked", reason="card released")
+        assert (await executor_store.read_executor("q"))["was_quarantined"] is True
+        assert "was_quarantined" not in await executor_store.read_executor("plain")
+
+    asyncio.run(go())
+
+
+def test_with_the_flag_off_a_dispatcher_run_adopts_no_registry_quarantine():
+    documents = {"now": [_document("q")]}
+
+    async def go():
+        dispatcher = PairedAuditDispatcher(directory=_registry(documents))
+        running = asyncio.ensure_future(dispatcher.run(sweep_seconds=0.01))
+        await asyncio.sleep(0.1)
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+        assert dispatcher.quarantined == set()
 
     asyncio.run(go())
 

@@ -762,6 +762,7 @@ class OrderJudgeFront:
             except Exception:
                 logger.exception("order judge: sync pass failed")
             self._sync_lease_clocks()
+            await self._load_quarantined()
             await asyncio.sleep(self._sync_every)
 
     # -- the child -----------------------------------------------------------
@@ -804,8 +805,22 @@ class OrderJudgeFront:
                          code, lived, delay)
             await asyncio.sleep(delay)
 
+    async def _load_quarantined(self) -> None:
+        """What the registry says was quarantined, told to the judge as a live quarantine (once per executor)."""
+        if not hasattr(self._dispatcher._directory, "quarantined_ids"):
+            return
+        try:
+            await self._dispatcher.load_quarantined()
+        except Exception:
+            logger.exception("order judge: registry quarantines not loaded; retrying")
+
     async def run(self) -> None:
         await self.dispatch.start()
+        # Before the child: its first hello already names what was quarantined before this restart.
+        refresh = getattr(self._dispatcher._directory, "maybe_refresh", None)
+        if refresh is not None:
+            await refresh()
+        await self._load_quarantined()
         workers = [self.link.run(), self._sync_forever()]
         if self._spawn:
             workers.append(self._supervise())
