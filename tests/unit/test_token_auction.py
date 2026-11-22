@@ -679,3 +679,22 @@ def test_a_state_written_by_the_first_volume_price_keeps_its_deliveries(tmp_path
     assert len(entries) == 21 and entries[0][1] == "5A"
     assert [alpha for _, _, alpha in entries] == pytest.approx([0.3] * 21)
     assert again.params.alpha_of(again._volume_price(clock.now)) == pytest.approx(0.3)
+
+
+def test_an_unknown_audit_share_leaves_the_market_as_it_was():
+    from types import SimpleNamespace
+
+    reports = []
+    pace = SimpleNamespace(report=lambda job, **kw: reports.append(kw["q"]))
+
+    def unknown():
+        raise LookupError("no fresh snapshot")
+
+    auction = SimpleNamespace(_pace=pace, _q=unknown, _q_weight=unknown, _q_hint=0.2, _progress=None, _mean_tokens=1.0,
+                              _job="judged", _deadline=None, _allocation=None, _last_backlog=0, _unmet_at=None,
+                              _median_seconds=lambda: None)
+    TokenAuction._report(auction, 0.0, {})
+    assert reports == [] and auction._q_hint == 0.2
+    auction._q, auction._q_weight = (lambda: 0.3), (lambda: 1000)
+    TokenAuction._report(auction, 0.0, {})
+    assert reports == [0.3]

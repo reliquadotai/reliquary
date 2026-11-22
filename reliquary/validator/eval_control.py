@@ -26,6 +26,7 @@ import json
 import itertools
 import logging
 import math
+import random
 import secrets
 import statistics
 import time
@@ -98,6 +99,9 @@ def order_audit_scorers(env=None) -> int:
 # pass's read ~1.7 s against 0.2 s alone.
 ORDER_POOL_CONNECTIONS = 256
 STATUS_SECONDS = 30.0
+# A judge process's slot reopen that lost its ledger race: tried again after this, doubling.
+REOPEN_RETRY_SECONDS = 1.0
+MAX_REOPEN_RETRY_SECONDS = 30.0
 # Why a job is still kept from miners (control status ``jobs[...]["held"]``).
 HELD_NO_GATEWAY = "no_gateway"
 HELD_AWAITING_AUDIT = "awaiting_audit"
@@ -290,6 +294,13 @@ class EvalExecutorDirectory:
     def document(self, executor_id: str) -> dict | None:
         return self._by_id.get(executor_id)
 
+    def quarantined_ids(self) -> list[str]:
+        """The eval executors the registry, as last read, says were quarantined (a status is never set back)."""
+        from reliquary.infrastructure.corpus_executor_store import WAS_QUARANTINED
+
+        return sorted(eid for eid, d in self._by_id.items() if d.get("scope") == "eval"
+                      and (d.get("status") == "quarantined" or d.get(WAS_QUARANTINED) is True))
+
 
 def _placement(document: dict) -> tuple[str, str] | None:
     """Where an executor runs; None when it cannot be told apart from others."""
@@ -409,10 +420,12 @@ class PairedAuditDispatcher:
         self.parked.pop(job_id, None)
         self.reuse_only_jobs.discard(job_id)
 
-    async def score(self, model: ModelKey, proof, items: Sequence[dict], job_id: str = "", judge=None):
+    async def score(self, model: ModelKey, proof, items: Sequence[dict], job_id: str = "", judge=None,
+                    batches: list | None = None):
         """``(status, chunks, scored_by[, diagnostics])`` per item; ``scored_by`` is the
         tuple of executors whose agreement decided it. Drawn items (``draw``) go in v3
-        batches, a trajectory alone, decided by ``judge`` (the job's ``DrawJudge``)."""
+        batches, a trajectory alone, decided by ``judge`` (the job's ``DrawJudge``).
+        ``batches`` collects this call's batches, for a caller that may have to cancel them."""
         loop = asyncio.get_running_loop()
         units = []
         drawn = [k for k, item in enumerate(items) if item.get("draw") is not None]
@@ -436,6 +449,8 @@ class PairedAuditDispatcher:
                                reuse_auditors_only=job_id in self.reuse_only_jobs)
                 units.append((indexes, batch))
                 self._queues[model].append(batch)
+                if batches is not None:
+                    batches.append(batch)
         scored: list = [None] * len(items)
         for indexes, batch in units:
             scores, scored_by = await batch.future
@@ -768,13 +783,22 @@ class PairedAuditDispatcher:
                 "models": models, "jobs": jobs,
                 "quarantined": sorted(self.quarantined), "stats": dict(self.stats)}
 
-    async def quarantine(self, executor_id: str, reason: str) -> None:
+    async def load_quarantined(self) -> list[str]:
+        """Quarantines the registry holds that this process has not heard of (it forgets its own at a restart): each
+        goes through ``quarantine`` once, with no registry write. A read that failed or lists none changes nothing."""
+        loaded = [eid for eid in self._directory.quarantined_ids() if eid not in self.quarantined]
+        for executor_id in loaded:
+            await self.quarantine(executor_id, "quarantined in the registry", recorded=True)
+        return loaded
+
+    async def quarantine(self, executor_id: str, reason: str, *, recorded: bool = False) -> None:
+        """``recorded``: read from the registry, so nothing is written back to it."""
         if executor_id in self.quarantined:
             return
         logger.error("eval audit executor %s quarantined: %s", executor_id, reason)
         self.quarantined.add(executor_id)
         self._directory.revoke_locally(executor_id)
-        self.stats["quarantined"] += 1
+        self.stats["quarantined_loaded" if recorded else "quarantined"] += 1
         for lease_id, lease in list(self._leases.items()):
             if lease.executor_id == executor_id:
                 del self._leases[lease_id]
@@ -785,8 +809,9 @@ class PairedAuditDispatcher:
                 if not batch.future.done() and executor_id in batch.scores:
                     # Its score no longer counts towards an agreement.
                     del batch.scores[executor_id]
-        self._unwritten[executor_id] = reason
-        await self._write_quarantines()
+        if not recorded:
+            self._unwritten[executor_id] = reason
+            await self._write_quarantines()
         for listener in self._listeners:
             task = asyncio.ensure_future(self._notify(listener, executor_id))
             self._background.add(task)
@@ -969,6 +994,36 @@ def eval_auditor(**kwargs):
                 parked_now = len(self.parked_ids - before)
                 self._validator_errors = max(0, self._validator_errors - parked_now)
                 self._current_ids, self._current_records = [], []
+                self._reaudit_quarantined()
+
+        def _reaudit_quarantined(self) -> None:
+            """A judge process: a pass written after its executor's quarantine event has no event left to catch it."""
+            quarantined = getattr(self._remote, "quarantined", None)
+            if quarantined is None:
+                return
+            for executor_id in set(self._remote_scored) & quarantined():
+                if self._remote_scored[executor_id] and executor_id not in self._late_reaudits:
+                    self._late_reaudits[executor_id] = asyncio.ensure_future(self._reaudit_late(executor_id))
+
+        async def _reaudit_late(self, executor_id: str) -> None:
+            delay = REOPEN_RETRY_SECONDS
+            try:
+                while self._remote_scored.get(executor_id):
+                    listed = list(self._remote_scored[executor_id])
+                    try:
+                        await self.reaudit_executor(executor_id)
+                        delay = REOPEN_RETRY_SECONDS
+                    except Exception:
+                        logger.exception("eval job %s: re-audit of quarantined executor %s failed; retrying",
+                                         self._job_id, executor_id)
+                        # It took them off the list before failing.
+                        known = self._remote_scored.setdefault(executor_id, [])
+                        present = set(known)
+                        known.extend(sid for sid in listed if sid not in present)
+                        await asyncio.sleep(delay)
+                        delay = min(MAX_REOPEN_RETRY_SECONDS, 2 * delay)
+            finally:
+                self._late_reaudits.pop(executor_id, None)
 
         async def judge_many(self, submission_ids):
             # A parked record is not tried again until an operator acts.
@@ -977,26 +1032,56 @@ def eval_auditor(**kwargs):
         # -- an eval job stays completable: a failure reopens its slot ------
         # (a generation order's never does: today's corpus semantics)
 
-        async def _record_failure(self, submission_id: str) -> None:
+        async def _reopen_once(self, submission_id: str) -> None:
             from reliquary.corpus.eval_draw import has_draw
             from reliquary.validator.corpus_service import draw_failure_slot, record_prompt_failure
 
+            record = await self._records.read_submission(self._job_id, submission_id)
+            if record is None:
+                return
+            outcome = await record_prompt_failure(
+                self.job_store, self.job, int(record["prompt_index"]), submission_id,
+                **(draw_failure_slot(record) if has_draw(self.job) else {}))
+            if outcome is False:
+                logger.warning("eval job %s: prompt %s exhausted its attempts",
+                               self._job_id, record["prompt_index"])
+
+        async def _record_failure(self, submission_id: str) -> None:
             if not self.reopen_slots or self.job is None or self.job_store is None:
                 return
             try:
-                record = await self._records.read_submission(self._job_id, submission_id)
-                if record is None:
-                    return
-                outcome = await record_prompt_failure(
-                    self.job_store, self.job, int(record["prompt_index"]), submission_id,
-                    **(draw_failure_slot(record) if has_draw(self.job) else {}))
-                if outcome is False:
-                    logger.warning("eval job %s: prompt %s exhausted its attempts",
-                                   self._job_id, record["prompt_index"])
-            except Exception:
-                # Retried at the next start's reconcile; never stops the auditor.
+                await self._reopen_once(submission_id)
+            except Exception as exc:
+                # Retried at the next start's reconcile, or now in a judge process; never stops the auditor.
                 logger.exception("eval job %s: failure of %s not recorded in the ledger",
                                  self._job_id, submission_id[:12])
+                if self.retry_reopens and isinstance(exc, _reopen_retried()):
+                    self._retry_reopen(submission_id)
+
+        def _retry_reopen(self, submission_id: str) -> None:
+            if submission_id not in self._reopening:
+                task = asyncio.ensure_future(self._reopen_until_landed(submission_id))
+                self._reopening[submission_id] = task
+
+        async def _reopen_until_landed(self, submission_id: str) -> None:
+            """A failure that lost its ledger race (the front writes that ledger all the time), tried until it lands."""
+            delay = REOPEN_RETRY_SECONDS
+            try:
+                while True:
+                    await asyncio.sleep(delay * (0.5 + random.random() / 2))
+                    try:
+                        await self._reopen_once(submission_id)
+                        logger.info("eval job %s: failure of %s recorded after retrying", self._job_id,
+                                    submission_id[:12])
+                        return
+                    except _reopen_retried():
+                        delay = min(MAX_REOPEN_RETRY_SECONDS, 2 * delay)
+                    except Exception:
+                        logger.exception("eval job %s: failure of %s left to the next start's reconcile",
+                                         self._job_id, submission_id[:12])
+                        return
+            finally:
+                self._reopening.pop(submission_id, None)
 
         async def _write(self, submission_id, verdict):
             stored, written = await super()._write(submission_id, verdict)
@@ -1024,6 +1109,58 @@ def eval_auditor(**kwargs):
                 await self._record_failure(submission_id)
             return len(failed)
 
+        async def restore_scored(self) -> int:
+            """A judge process that restarted: which executor scored each pass a quarantine could still void
+            (unsettled, or settled inside the hold, as ``reaudit_executor`` chooses), read back from the verdicts,
+            then the re-audit of those scored by an executor already quarantined."""
+            from reliquary.validator.corpus_auditor import RECONCILE_READS
+
+            ids = list(await self._records.list_verdict_ids(self._job_id))
+            lister = getattr(self._records, "list_voided_ids", None)
+            voided = set(await lister(self._job_id)) if lister is not None else set()
+            state, _ = await self._records.read_settlement(self._job_id)
+            settled = set((state or {}).get("settled") or ())
+            gate = asyncio.Semaphore(RECONCILE_READS)
+
+            async def read(submission_id):
+                async with gate:
+                    return submission_id, await self._records.read_verdict(self._job_id, submission_id)
+
+            now, restored = self._clock(), 0
+            listed: dict[str, set[str]] = {}
+            wanted = [sid for sid in ids if sid not in voided]
+            for start in range(0, len(wanted), RECONCILE_READS):
+                for sid, verdict in await asyncio.gather(*map(read, wanted[start:start + RECONCILE_READS])):
+                    if not verdict or not verdict.get("passed") or not verdict.get("audited"):
+                        continue
+                    if sid in settled and now - float(verdict.get("audited_at") or 0.0) > self._params.hold_seconds:
+                        continue
+                    for executor_id in verdict.get("scored_by") or ():
+                        known = listed.setdefault(executor_id, set(self._remote_scored.get(executor_id, ())))
+                        if sid not in known:
+                            known.add(sid)
+                            self._remote_scored.setdefault(executor_id, []).append(sid)
+                            restored += 1
+            # Last: a quarantine heard while reading took only what was listed by then.
+            quarantined = self._remote.quarantined()
+            for executor_id in sorted(set(self._remote_scored) & quarantined):
+                await self.reaudit_executor(executor_id)
+            return restored
+
+        async def _restore_behind(self):
+            await self.seeded.wait()
+            delay = REOPEN_RETRY_SECONDS
+            while True:
+                try:
+                    restored = await self.restore_scored()
+                    logger.info("eval job %s: %d executor score(s) restored for re-audit", self._job_id, restored)
+                    self.scores_restored.set()
+                    return
+                except Exception:
+                    logger.exception("eval job %s: executor scores not restored; retrying", self._job_id)
+                    await asyncio.sleep(delay)
+                    delay = min(MAX_REOPEN_RETRY_SECONDS, 2 * delay)
+
         async def _reconcile_behind(self):
             try:
                 await self.reconcile_failures()
@@ -1036,23 +1173,52 @@ def eval_auditor(**kwargs):
             # The base run reconciles a forced-draw job's failures itself (`_reconcile_quietly`).
             reconcile = (None if getattr(self, "_slot_store", None) is not None
                          else asyncio.ensure_future(self._reconcile_behind()))
+            restore = asyncio.ensure_future(self._restore_behind()) if self.restores_scored else None
             try:
                 await super().run()
             finally:
                 if reconcile is not None:
                     reconcile.cancel()
+                if restore is not None:
+                    restore.cancel()
+                    await asyncio.gather(restore, return_exceptions=True)
+                late = list(self._late_reaudits.values())
+                for task in late:
+                    task.cancel()
+                await asyncio.gather(*late, return_exceptions=True)
+                retries = list(self._reopening.values())
+                for task in retries:
+                    task.cancel()
+                await asyncio.gather(*retries, return_exceptions=True)
 
     vocab_size = kwargs.pop("vocab_size")
     job = kwargs.pop("job", None)
     job_store = kwargs.pop("job_store", None)
     # Off unless asked: only an eval job reopens a slot on a failed audit.
     reopen_slots = kwargs.pop("reopen_slots", False)
+    retry_reopens = kwargs.pop("retry_reopens", False)
+    restores_scored = kwargs.pop("restores_scored", False)
     auditor = EvalAuditor(model=_VocabularyOnly(vocab_size), **kwargs)
     auditor.reopen_slots = bool(reopen_slots)
+    # A judge process: a reopen that lost every ledger attempt is tried again until it lands.
+    auditor.retry_reopens = bool(retry_reopens)
+    auditor._reopening = {}
+    # A judge process: who scored what survives its restart (`restore_scored`).
+    auditor.restores_scored = bool(restores_scored)
+    auditor.scores_restored = asyncio.Event()
+    auditor._late_reaudits = {}
     auditor.parked_ids = set()
     auditor._current_ids, auditor._current_records = [], []
     auditor.job, auditor.job_store = job, job_store
     return auditor
+
+
+def _reopen_retried() -> tuple:
+    """What a slot reopen is tried again after: a lost ledger race or a store fault."""
+    from reliquary.infrastructure.corpus_job_store import CorpusStoreConflict
+    from reliquary.validator.corpus_miner_states import _TRANSIENT_ERRORS
+
+    return (CorpusStoreConflict, *_TRANSIENT_ERRORS)
 
 
 class _Parked(str):
@@ -1491,6 +1657,68 @@ def _also(first, second):
     return both
 
 
+def wire_order_judge(w, *, records, job_store, remote, params, miner_states, beacon, round_at,
+                     settle_archives=None, operator_of=None, arrivals_covered=None, threads=None,
+                     settle_executor=None, retry_reopens: bool = False,
+                     restores_scored: bool = False) -> None:
+    """One order's miner book, settler and auditor on ``w`` (``entry``, ``cap``, ``job``, ``tokenizer``,
+    ``proof``, ``vocab_size``, ``stats``, and ``grader`` for an episode order), in whichever process judges it."""
+    from reliquary.eval.prompt_source import is_eval_source
+    from reliquary.infrastructure.corpus_period_store import R2PeriodArchives
+    from reliquary.validator import corpus_periods as cp
+    from reliquary.validator.corpus_miner_status import (
+        MinerBook, feed, proof_thresholds, read_recent_windows,
+    )
+    from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler, oldest_of
+    from reliquary.validator.corpus_settlement import SETTLE_FULL_LIST_SECONDS, settler_fed
+
+    entry, job, cap = w.entry, w.job, w.cap
+    # The miner status route's view (`/corpus/jobs/{job}/miners/{hotkey}`), fed by the same reports.
+    # A draw job carries no TOPLOC proof: its judge is in the contract.
+    w.miners = MinerBook(job_id=job.job_id, task_id=entry.task_id, records=records,
+                         read_windows=read_recent_windows,
+                         thresholds=None if has_draw(job) else proof_thresholds(w.proof))
+    on_verdict, on_settled = feed(w.stats, w.miners)
+    on_read = w.stats.observe
+    if job.episode is not None:
+        # Its audited tokens per episode, for the status's `sandbox` (`order_sandbox_status`).
+        from reliquary.validator.order_sandbox_status import EpisodeTokens
+
+        w.episode_tokens = EpisodeTokens()
+        on_verdict, on_read = _also(on_verdict, w.episode_tokens.observe), _also(on_read, w.episode_tokens.observe)
+    # Paid by period, as every corpus task (design 2026-10-03): a period
+    # closes once the auditor holds nothing undecided received in it -- and, for an
+    # episode order, its grader nothing ungraded (ruling P21): never paid ungraded.
+    grader = getattr(w, "grader", None)
+    pending = [lambda: w.auditor.oldest_pending_received_at()]
+    if grader is not None:
+        pending.append(grader.oldest_unready_received_at)
+        grader.on_voided = w.miners.voided
+    w.settler = CorpusPeriodSettler(
+        task_id=entry.task_id, job_id=job.job_id, cap=cap, records=records,
+        archives=R2PeriodArchives(guard=settle_archives),
+        oldest_pending=oldest_of(*pending), ready=grader.ready if grader is not None else None,
+        on_settled=on_settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS, executor=settle_executor,
+        max_price=cp.max_price(entry.params), max_input_price=cp.max_input_price(entry.params))
+    w.auditor = eval_auditor(
+        job_id=job.job_id, records=records, tokenizer=w.tokenizer, proof=w.proof,
+        params=params, miner_states=miner_states, beacon=beacon, round_at=round_at,
+        on_verdict=settler_fed(w.settler, on_verdict), on_voided=w.miners.voided, vocab_size=w.vocab_size,
+        job=job, job_store=job_store, reopen_slots=is_eval_source(job.prompt_source) or has_draw(job),
+        draw_job=job if has_draw(job) else None, operator_of=operator_of, remote=remote,
+        arrivals_covered=arrivals_covered, threads=threads, retry_reopens=retry_reopens,
+        restores_scored=restores_scored)
+    w.settler.on_window = w.miners.window
+    w.settler.on_read = on_read
+    # The stake weighs a record's prompt as the settler pays it (`corpus_periods.work_value`).
+    output_price, input_price = cp.max_price(entry.params), cp.max_input_price(entry.params)
+    if input_price and output_price:
+        w.auditor.stake_input_weight = float(input_price) / float(output_price)
+    elif input_price:
+        # Prompts paid at a price no output price compares with: the corpus rule, never a guessed stake.
+        w.auditor.stake_at_receipt = False
+
+
 def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                        directory: EvalExecutorDirectory, verify_signature,
                        verify_skip_signature=None, tokenizer_for=load_cpu_tokenizer,
@@ -1499,7 +1727,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                        refresh_every_seconds: float = 60.0, qualification_store=None,
                        order_jobs=None, sandbox=None, sandbox_down: str | None = None,
                        model_dir_for=None, signed_wiring=None, suite_replayer_for=None,
-                       operator_of: Callable[[str], str | None] | None = None):
+                       operator_of: Callable[[str], str | None] | None = None, order_judge=None):
     """The app and the job set of the eval control. Each wired job gets its own
     tokenizer, renderer, router, auditor (an executor pair per batch) and
     settler; ``read_entries`` makes the set hot.
@@ -1511,16 +1739,14 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     the turn renderer loads; ``signed_wiring``: extra ``wire_signed_job`` arguments (tests).
     A suite episode order needs no sandbox: replayed here, by ``suite_replayer_for(tokenizer)``
     (``suite_intake.PoolSuiteReplayer`` by default). ``operator_of(hotkey)``: its registration's coldkey (None:
-    unknown), whose hotkeys every auditor stakes and forfeits together (``CorpusAuditor._operator``)."""
+    unknown), whose hotkeys every auditor stakes and forfeits together (``CorpusAuditor._operator``).
+    ``order_judge`` (``order_judge.OrderJudgeFront``): non-episode orders are judged and paid in its process."""
     from fastapi import FastAPI
 
     from reliquary.eval.prompt_source import job_prompt_lines, parse_eval_source
     from reliquary.protocol.profiles import profile_from_contract, toploc_proof
     from reliquary.validator.corpus_hot_jobs import OTHER_MODEL, CorpusJobSet, job_drained
     from reliquary.validator.corpus_job_status import JobStats
-    from reliquary.validator.corpus_miner_status import (
-        MinerBook, feed, proof_thresholds, read_recent_windows,
-    )
     from reliquary.validator.corpus_service import (
         CorpusJobRoutes,
         build_corpus_jobs_router,
@@ -1530,10 +1756,6 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         prompt_job_for_spec,
         renderer_for_job,
     )
-    from reliquary.infrastructure.corpus_period_store import R2PeriodArchives
-    from reliquary.validator import corpus_periods as cp
-    from reliquary.validator.corpus_period_settlement import CorpusPeriodSettler, oldest_of
-    from reliquary.validator.corpus_settlement import SETTLE_FULL_LIST_SECONDS, settler_fed
     from reliquary.validator.corpus_validator import (
         WINDOW_SETTLED,
         add_public_corpus_routes,
@@ -1571,7 +1793,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     def router_for(w):
         from reliquary.validator.corpus_validator import _lease_verifier
 
-        return build_corpus_router(
+        router = build_corpus_router(
             job_id=str(w.entry.job_id), store=store, tokenizer=w.tokenizer,
             renderer=w.renderer, verify_signature=verify_signature,
             verify_skip_signature=verify_skip_signature, prompt_job_for=w.prompt_job_for,
@@ -1583,7 +1805,11 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
             suspect_until=getattr(w, "suspect_until", None),
             job=getattr(w, "job", None), durable_records=False, auction=_auction_of(w),
             lease_fault=_lease_fault_of(w),
+            # Held by this control for its audit (a restart's seed, a judge down): no lease runs out meanwhile.
+            lease_held=functools.partial(routes.lease_clock_stopped, str(w.entry.job_id)),
             episode_intake=getattr(w, "episode_intake", None))
+        w.sync_lease_clock = router.sync_lease_clock
+        return router
 
     def _lease_fault_of(w):
         """A signed episode order's draw leases our sandbox failed: released uncharged
@@ -1616,8 +1842,6 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         return w.auction
 
     async def wire(entry, cap, job):
-        from reliquary.eval.prompt_source import is_eval_source
-
         refusal = order_job_refusal(entry, job)
         if refusal is None and window_settled(entry):
             refusal = WINDOW_SETTLED
@@ -1668,60 +1892,26 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         if job.episode is not None:
             # Published to the session issuer only at the end, once the whole job is wired.
             await wire_episode(w)
-        # The miner status route's view (`/corpus/jobs/{job}/miners/{hotkey}`), fed by the same reports.
-        # A draw job carries no TOPLOC proof: its judge is in the contract.
         w.audit_params, w.miner_states = params, miner_states
-        w.miners = MinerBook(job_id=job.job_id, task_id=entry.task_id, records=records,
-                             read_windows=read_recent_windows,
-                             thresholds=None if has_draw(job) else proof_thresholds(proof))
-        on_verdict, on_settled = feed(w.stats, w.miners)
-        on_read = w.stats.observe
-        if job.episode is not None:
-            # Its audited tokens per episode, for the status's `sandbox` (`order_sandbox_status`).
-            from reliquary.validator.order_sandbox_status import EpisodeTokens
-
-            w.episode_tokens = EpisodeTokens()
-            on_verdict, on_read = _also(on_verdict, w.episode_tokens.observe), _also(on_read, w.episode_tokens.observe)
-        # Paid by period, as every corpus task (design 2026-10-03): a period
-        # closes once the auditor holds nothing undecided received in it -- and, for an
-        # episode order, its grader nothing ungraded (ruling P21): never paid ungraded.
+        judged_apart = order_judge is not None and job.episode is None
         grader = getattr(w, "grader", None)
-        pending = [lambda: w.auditor.oldest_pending_received_at()]
-        if grader is not None:
-            pending.append(grader.oldest_unready_received_at)
-            grader.on_voided = w.miners.voided
-        w.settler = CorpusPeriodSettler(
-            task_id=entry.task_id, job_id=job.job_id, cap=cap, records=records,
-            archives=R2PeriodArchives(guard=settle_archives),
-            oldest_pending=oldest_of(*pending), ready=grader.ready if grader is not None else None,
-            on_settled=on_settled, full_list_every_seconds=SETTLE_FULL_LIST_SECONDS,
-            max_price=cp.max_price(entry.params), max_input_price=cp.max_input_price(entry.params))
-        w.auditor = eval_auditor(
-            job_id=job.job_id, records=records, tokenizer=tokenizer, proof=proof,
-            params=params, miner_states=miner_states, beacon=beacon, round_at=round_at,
-            on_verdict=settler_fed(w.settler, on_verdict), on_voided=w.miners.voided, vocab_size=vocab_size,
-            job=job, job_store=store, reopen_slots=is_eval_source(job.prompt_source) or has_draw(job),
-            draw_job=job if has_draw(job) else None, operator_of=operator_of,
-            remote=dispatcher.view(job.checkpoint_repo, job.checkpoint_revision, proof,
-                                   job.job_id, job.judge if has_draw(job) else None))
+        if judged_apart:
+            # Its auditor, settler and book run in the judge process.
+            order_judge.attach(w, records=records, store=store)
+        else:
+            wire_order_judge(
+                w, records=records, job_store=store, params=params, miner_states=miner_states, beacon=beacon,
+                round_at=round_at, settle_archives=settle_archives, operator_of=operator_of,
+                remote=dispatcher.view(job.checkpoint_repo, job.checkpoint_revision, proof,
+                                       job.job_id, job.judge if has_draw(job) else None))
 
-        w.settler.on_window = w.miners.window
-        w.settler.on_read = on_read
-        # The stake weighs a record's prompt as the settler pays it (`corpus_periods.work_value`).
-        output_price, input_price = cp.max_price(entry.params), cp.max_input_price(entry.params)
-        if input_price and output_price:
-            w.auditor.stake_input_weight = float(input_price) / float(output_price)
-        elif input_price:
-            # Prompts paid at a price no output price compares with: the corpus rule, never a guessed stake.
-            w.auditor.stake_at_receipt = False
+            def on_accepted(submission_id: str) -> None:
+                w.stats.accepted()
+                w.auditor.enqueue(submission_id)
+                if grader is not None:
+                    grader.enqueue(submission_id)
 
-        def on_accepted(submission_id: str) -> None:
-            w.stats.accepted()
-            w.auditor.enqueue(submission_id)
-            if grader is not None:
-                grader.enqueue(submission_id)
-
-        w.on_accepted = on_accepted
+            w.on_accepted = on_accepted
         if job.episode is not None and is_signed_sandbox(job):
             # Only now: a job still being wired is never visible to the session issuer.
             sandbox.publish(w)
@@ -1739,7 +1929,23 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 return HELD_AWAITING_AUDIT
             return None
 
-        routes.hold(str(job.job_id), lambda: why_held() is None, why=why_held)
+        routes.stop_lease_clock_on(str(job.job_id), HELD_AWAITING_AUDIT)
+        if judged_apart:
+            # Open once its audit is first ready, as below; held again whenever its judge is not up and seeded.
+            opened = False
+
+            def why_held_apart() -> str | None:
+                nonlocal opened
+                if not w.auditor.seeded.is_set():
+                    return HELD_AWAITING_AUDIT
+                if not opened and not dispatcher.audit_ready(key, protocol):
+                    return HELD_AWAITING_AUDIT
+                opened = True
+                return None
+
+            routes.hold(str(job.job_id), lambda: why_held_apart() is None, why=why_held_apart, latch=False)
+        else:
+            routes.hold(str(job.job_id), lambda: why_held() is None, why=why_held)
         if (declared or {}).get("reuse_auditors_only") is True:
             dispatcher.reuse_only_jobs.add(job.job_id)
         served[job.job_id] = w
@@ -1891,7 +2097,14 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
         from reliquary.eval.prompt_source import is_order_job_id
 
         # Only an order job's status is ever looked up (stored ones included).
-        status = await job_set.status(job_id) if is_order_job_id(job_id) else None
+        try:
+            status = await job_set.status(job_id) if is_order_job_id(job_id) else None
+        except Exception as exc:
+            from reliquary.validator.order_judge import JudgeUnavailable
+
+            if isinstance(exc, JudgeUnavailable):
+                raise HTTPException(status_code=503, detail="order_judge_unavailable") from exc
+            raise
         if status is None:
             raise HTTPException(status_code=404, detail="corpus_job_not_served")
         return status
@@ -1901,9 +2114,12 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                                                   qualifications=qualifications))
     job_set = CorpusJobSet(
         routes=routes, router_for=router_for, wire=wire,
-        jobs_of=lambda w: [guarded(w, w.auditor.run()), guarded(w, settle_forever(w)),
-                           *([guarded(w, w.grader.run())] if getattr(w, "grader", None) is not None else [])],
-        read_entries=read_entries, read_job=read_job, admit=admit, screen=screen,
+        jobs_of=lambda w: ([] if getattr(w, "judge_link", None) is not None else [
+            guarded(w, w.auditor.run()), guarded(w, settle_forever(w)),
+            *([guarded(w, w.grader.run())] if getattr(w, "grader", None) is not None else [])]),
+        read_entries=(order_judge.watching(read_entries) if order_judge is not None and read_entries
+                      else read_entries),
+        read_job=read_job, admit=admit, screen=screen,
         on_unwired=unwired, refresh_every_seconds=refresh_every_seconds,
         # A drained order's status outlives this process; a retired one is
         # finished after a restart.
@@ -1960,7 +2176,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 entry.pop("held", None)
             # What sizes its cap (``admin.cap_sizing``): its model, cards, and what it paid and has accrued.
             settler = getattr(served.get(job_id), "settler", None)
-            if settler is not None:
+            # Judged apart and its snapshot stale: no sizing, rather than a cap resized on zeros.
+            if settler is not None and getattr(settler, "sizing_known", True):
                 job = served[job_id].job
                 entry["sizing"] = {"model": f"{job.checkpoint_repo}@{job.checkpoint_revision}",
                                    "audit_executors": getattr(served[job_id], "audit_executors", 1),
@@ -2135,6 +2352,12 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
         registration=registered.reason if registered is not None else None)
     job_set = None
     archives = OrderArchives(served=lambda: job_set.task_ids() if job_set else ())
+    # RELIQUARY_ORDER_SPLIT_JUDGE=1: non-episode orders are judged and paid in a child process.
+    from reliquary.validator.order_judge import OrderJudgeFront, order_judge_enabled
+
+    order_judge = (OrderJudgeFront.from_env(
+        dispatcher=dispatcher, coldkeys=registered.coldkeys if registered is not None else None)
+        if order_judge_enabled() else None)
     app, job_set = build_eval_control(
         # Every order's auditors and the miners' intake share these connections (`ORDER_POOL_CONNECTIONS`).
         store=BucketJobStore(), records=BucketRecordStore(max_pool_connections=ORDER_POOL_CONNECTIONS),
@@ -2144,7 +2367,8 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
         registration=registered.reason if registered is not None else None,
         operator_of=registered.coldkey if registered is not None else None,
         settle_archives=archives, read_entries=read_entries,
-        refresh_every_seconds=refresh_every_seconds or 60.0, sandbox=sandbox, sandbox_down=sandbox_down)
+        refresh_every_seconds=refresh_every_seconds or 60.0, sandbox=sandbox, sandbox_down=sandbox_down,
+        order_judge=order_judge)
 
     async def refresh_qualifications():
         while True:
@@ -2161,10 +2385,14 @@ async def run_eval_control(*, netuid: int, http_host: str, http_port: int,
         background.append(registered.refresh_forever())
     if sandbox is not None:
         background.extend(sandbox.background())
+    if order_judge is not None:
+        background.append(order_judge.run())
     server = uvicorn.Server(uvicorn.Config(app, host=http_host, port=http_port, log_level="info"))
     try:
         await asyncio.gather(server.serve(), *background)
     finally:
+        if order_judge is not None:
+            order_judge.stop()
         if sandbox is not None:
             await sandbox.stop()
 
@@ -2295,6 +2523,7 @@ __all__ = [
     "BatchParked",
     "OrderArchives",
     "build_order_control",
+    "wire_order_judge",
     "order_control_runtime_check",
     "qualification_refusal",
     "pinned_order_refusal",

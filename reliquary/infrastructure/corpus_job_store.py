@@ -465,6 +465,12 @@ class BucketJobStore:
             self._ledgers[job_id] = (snapshot, etag)
         return snapshot, etag
 
+    def forget_ledgers(self, job_id: str) -> None:
+        """Another process wrote the ledger: the next read goes to the bucket, and a read
+        already in flight does not fill the memory with what it saw."""
+        self._ledgers.pop(job_id, None)
+        self._generation[job_id] = self._generation.get(job_id, 0) + 1
+
     async def write_ledgers(
         self, job_id: str, snapshot: Mapping[str, Any], etag: str | None
     ) -> str | None:
