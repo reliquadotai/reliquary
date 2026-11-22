@@ -32,6 +32,8 @@ EXECUTOR_SCOPES = frozenset({"corpus", "eval", "grade", "trainer"})
 
 def scope_of(document: Mapping) -> str:
     return str(document.get("scope") or "corpus")
+# On a quarantined executor later revoked: its status no longer says so.
+WAS_QUARANTINED = "was_quarantined"
 WRITE_ATTEMPTS = 5
 READ_CONCURRENCY = 16
 
@@ -201,6 +203,9 @@ async def set_executor_status(executor_id: str, status: str, *, reason: str | No
             return None
 
     def change(document: dict) -> dict:
+        if document.get("status") == "quarantined" and status == "revoked":
+            # A card released after its quarantine: what it scored must still be re-audited after a restart.
+            document[WAS_QUARANTINED] = True
         document["status"] = status
         if reason is not None:
             document["status_reason"] = reason
@@ -246,6 +251,7 @@ __all__ = [
     "EXECUTOR_SCHEMA",
     "EXECUTOR_STATUSES",
     "ExecutorConflict",
+    "WAS_QUARANTINED",
     "list_executors",
     "read_executor",
     "record_heartbeat",
