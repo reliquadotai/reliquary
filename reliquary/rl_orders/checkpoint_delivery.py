@@ -238,7 +238,7 @@ class TrainingCheckpointStore:
         return {"version": index["latest"]["version"], "index_sha256": canonical_sha256(index)}
 
     @staticmethod
-    def _selected(index: dict) -> tuple[Any, list[tuple[str, str, dict]]]:
+    def _selected(index: dict, *, max_total_bytes: int = MAX_TOTAL_BYTES) -> tuple[Any, list[tuple[str, str, dict]]]:
         plan = plan_download(index, None)
         anchor = plan.anchor
         if anchor is None:
@@ -269,7 +269,7 @@ class TrainingCheckpointStore:
             if file["key"] != delta_key(index["run"], file["from"], file["to"]):
                 raise ValueError("checkpoint delta key differs")
             selected.append(("delta", file["key"].rsplit("/", 1)[-1], file))
-        if len(selected) + 1 > MAX_FILES or sum(file["size"] for _, _, file in selected) > MAX_TOTAL_BYTES:
+        if len(selected) + 1 > MAX_FILES or sum(file["size"] for _, _, file in selected) > max_total_bytes:
             raise ValueError("checkpoint exceeds delivery limits")
         if len({file["key"] for _, _, file in selected}) != len(selected):
             raise ValueError("checkpoint lists duplicate source objects")

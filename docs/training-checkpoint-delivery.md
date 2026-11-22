@@ -79,3 +79,22 @@ missing/tampered publications, index changes during copying, ranges over a large
 anchor, chunk corruption, manifest conflicts, private-file boundaries and copy deadlines.
 These local CPU fixtures establish the delivery contract; real GPU execution and service
 qualification remain separate.
+
+## Orders run on rented pods
+
+An order that runs on a rented pod, with Miles or any other trainer backend, cannot give the single-process stop
+proof above. `reliquary.rl_orders.pod_delivery` delivers its model on different evidence: the task is retired, its
+bill is final, its controller has stopped, and no pod of the task still holds a usable token. The checkpoint version
+is the one the final spend summary closed on. A trainer stopped between publishing a version and its adoption leaves
+the index one version ahead, so the delivery rebuilds the billed version from the anchors and deltas still listed.
+
+The objects are streamed to the private bucket under `reliquary/rl-delivery/<task>/`, in 8 MiB parts, without using the
+control host's disk. Each one is hashed against the publication, and `manifest.json` is created last and only once.
+Its schema is `reliquary/pod-training-checkpoint/v1`: the fields above without `runtime_id` and `usage_sha256`.
+A delivery can reach 128 GiB, what the manifest's chunk list can describe, because the anchor of a 27B model alone is
+about 50 GiB. An order whose final checkpoint is version zero, or none, trained nothing and has nothing to deliver.
+
+The controller supervisor runs one copy at a time beside its tick and retries a failure with a growing delay. A retry
+keeps every object already stored whole, after hashing it again. The
+platform holds the order's bill until the manifest is available. The signed admin checkpoint routes serve these orders
+from the private bucket, and every range read verifies its chunks.
