@@ -33,7 +33,7 @@ LOCK_WAIT_SECONDS = 10.0
 # The first settlement waits this long for who scored what to be read back and re-audited. Past it, it settles
 # anyway and flags the order: a restore that keeps failing never stops pay, and a pass settled inside the hold can
 # still be re-audited and voided.
-RESTORE_WAIT_SECONDS = 900.0
+RESTORE_WAIT_SECONDS = 2700.0
 
 
 class CountedStates:
