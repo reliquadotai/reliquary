@@ -249,3 +249,44 @@ def test_a_training_order_refuses_a_pay_carry(on, where):
         rl_async_settings(entry, entry.params["cap"], environ=environ)
     plain = on.registry["entries"]["order-train-t1"]
     assert rl_async_settings(plain, plain.params["cap"], environ={}).pay_carry_periods == 0
+
+
+def test_a_pod_orders_model_is_served_from_the_private_bucket(on, monkeypatch):
+    from reliquary.rl_orders import checkpoint_delivery as delivery
+    from reliquary.rl_orders import pod_delivery
+
+    class Held:
+        manifest = None
+
+        def load_manifest(self, task_id):
+            assert task_id == "order-train-t1"
+            return self.manifest
+
+        def open_range(self, task_id, artifact_id, header):
+            if header == "bytes=9-1":
+                raise delivery.CheckpointRangeError("bad")
+            if self.manifest is None:
+                raise FileNotFoundError("none")
+            return delivery.ArtifactRead(b"abc", {"content_type": "application/octet-stream"}, 1, 3, 10, True, "d" * 64)
+
+    held = Held()
+    monkeypatch.setattr(pod_delivery.PodCheckpointStore, "from_env", classmethod(lambda cls, **kw: held))
+    assert on("POST", "/admin/v1/training", _order()).status_code == 201
+    route = "/admin/v1/training/order-train-t1/checkpoint"
+    assert on.client.get(route).status_code == 401
+    assert on("GET", route).status_code == 404                                 # not frozen yet
+    assert on("GET", f"{route}/files/{'a' * 64}").status_code == 404
+    held.manifest = {"schema": pod_delivery.SCHEMA, "task_id": "order-train-t1"}
+    assert on("GET", route).json() == held.manifest
+    file = on("GET", f"{route}/files/{'a' * 64}")
+    assert file.status_code == 206 and file.content == b"abc"
+    assert file.headers["Content-Range"] == "bytes 1-3/10"
+
+
+def test_a_retired_order_takes_no_new_trainer_pod(on):
+    assert on("POST", "/admin/v1/training", _order()).status_code == 201
+    assert on("POST", "/admin/v1/training/order-train-t1/retire", {}).status_code == 200
+    answer = on("POST", "/admin/v1/executors", {
+        "executor_id": "pod-1", "token_sha256": "a" * 64, "model_id": "m", "model_revision": "r" * 40,
+        "expires_at": 4_000_000_000, "scope": "trainer", "task_id": "order-train-t1"})
+    assert answer.status_code == 409 and answer.json()["detail"] == "training_not_active"

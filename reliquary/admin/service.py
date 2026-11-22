@@ -474,7 +474,7 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      model_facts=None, evaluation_sessions=None, pin_model=None,
                      upload_tokenizer=None, subnet_pool=None, tao_usd=None,
                      sandbox_machine_prefix: str | None = None, sandbox_machines=None,
-                     order_sessions=None, rl_spend_reader=None) -> FastAPI:
+                     order_sessions=None, rl_spend_reader=None, pod_checkpoint_store=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
     ``eval_store`` the subnet bucket holding the eval sets' grading files; ``order_sessions``
@@ -484,7 +484,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     (async, USD per TAO) convert an order's USD token ceiling. ``sandbox_machine_prefix``
     turns on the sandbox machine routes for the machines named with it (the platform's rented
     gateways) and only those; ``sandbox_machines`` is the machine directory (``sandbox_store``).
-    ``rl_spend_reader(run)``: a training task's spend summary or None (default: ``rl_spend.read_spend``)."""
+    ``rl_spend_reader(run)``: a training task's spend summary or None (default: ``rl_spend.read_spend``).
+    ``pod_checkpoint_store`` holds the final models of orders run on rented pods (default: the private bucket)."""
     from reliquary.infrastructure import corpus_executor_store as executors
     from reliquary.infrastructure import corpus_job_store as job_store
     from reliquary.infrastructure import task_registry_store as registry_store
@@ -1543,6 +1544,49 @@ def create_admin_app(*, secret: bytes, pool_max: float,
         async def training_status(task_id: str) -> dict:
             return training_view(await training_task(task_id))
 
+        def pod_store():
+            nonlocal pod_checkpoint_store
+            if pod_checkpoint_store is None:
+                from reliquary.rl_orders.pod_delivery import PodCheckpointStore
+
+                pod_checkpoint_store = PodCheckpointStore.from_env()
+            return pod_checkpoint_store
+
+        @router.get("/training/{task_id}/checkpoint")
+        async def training_checkpoint(task_id: str):
+            await training_task(task_id)
+            try:
+                manifest = await asyncio.to_thread(pod_store().load_manifest, task_id)
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise HTTPException(status_code=503, detail="training_checkpoint_unavailable") from exc
+            if manifest is None:
+                raise HTTPException(status_code=404, detail="training_checkpoint_unknown")
+            return manifest
+
+        @router.get("/training/{task_id}/checkpoint/files/{artifact_id}")
+        async def training_checkpoint_file(task_id: str, artifact_id: str, request: Request):
+            from reliquary.rl_orders.checkpoint_delivery import CheckpointRangeError
+
+            await training_task(task_id)
+            if re.fullmatch(r"[0-9a-f]{64}", artifact_id) is None:
+                raise HTTPException(status_code=404, detail="training_checkpoint_file_unknown")
+            try:
+                item = await asyncio.to_thread(pod_store().open_range, task_id, artifact_id,
+                                               request.headers.get("range"))
+            except CheckpointRangeError as exc:
+                raise HTTPException(status_code=416, detail="training_checkpoint_range_invalid") from exc
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=404, detail="training_checkpoint_file_unknown") from exc
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise HTTPException(status_code=503, detail="training_checkpoint_file_unavailable") from exc
+            headers = {"Cache-Control": "private, no-store", "Accept-Ranges": "bytes",
+                       "Content-Length": str(len(item.data)), "X-Content-SHA256": item.sha256,
+                       "Content-Disposition": f'attachment; filename="{artifact_id}.bin"'}
+            if item.partial:
+                headers["Content-Range"] = f"bytes {item.start}-{item.end}/{item.total}"
+            return Response(content=item.data, status_code=206 if item.partial else 200,
+                            media_type=item.artifact["content_type"], headers=headers)
+
         @router.get("/training/{task_id}/spend")
         async def training_spend_route(task_id: str) -> dict:
             """What the task paid its miners (``rl_spend``, written by its controller), the order's frozen
@@ -1675,6 +1719,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
             entry = entries.get(body.task_id)
             if entry is None or "training_order" not in entry.params:
                 raise HTTPException(status_code=422, detail="training_unknown")
+            if entry.status != "active":           # a late registration would hold the order's model delivery
+                raise HTTPException(status_code=409, detail="training_not_active")
         try:
             document, created = await executors.register_executor(
                 executor_id=body.executor_id, token_sha256=body.token_sha256,

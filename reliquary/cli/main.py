@@ -2332,6 +2332,7 @@ def rl_supervise(
     """Run one async RL controller per training task of the registry and keep the front's map file current."""
     import time
 
+    from reliquary.rl_orders.pod_delivery import PodDeliveries
     from reliquary.validator import rl_supervisor as sup
 
     setup_logging(log_level)
@@ -2352,7 +2353,7 @@ def rl_supervise(
     supervisor = sup.Supervisor(
         sup.read_registry_entries, sup.subprocess_spawn(command, state_dir, dict(os.environ)), ports=port_range,
         map_path=map_path, final_of=sup.admin_final, default_task=os.getenv(sup.DEFAULT_TASK_ENV),
-        order_path=state_dir / "task-order.json", has_spend=sup.has_spend)
+        order_path=state_dir / "task-order.json", has_spend=sup.has_spend, deliveries=PodDeliveries())
     try:
         while True:
             supervisor.tick()
