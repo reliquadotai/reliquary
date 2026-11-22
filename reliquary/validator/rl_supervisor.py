@@ -42,12 +42,14 @@ class _Running:
 class Supervisor:
     """``registry_reader()``: the registry's entries by task id. ``spawn(task_id, port, entry)``: a process handle
     (``poll``/``terminate``/``kill``). ``final_of(entry)``: whether a retired task's bill is final. ``has_spend(entry)``:
-    whether its controller ever wrote a spend summary (a retired task without one for a day is logged hourly)."""
+    whether its controller ever wrote a spend summary (a retired task without one for a day is logged hourly).
+    ``deliveries``: copies a finished order's final model for its customer (``rl_orders.pod_delivery``); None: off."""
 
     def __init__(self, registry_reader: Callable[[], Mapping[str, Any]], spawn: Callable[[str, int, Any], Any], *,
                  ports: range, map_path: Path, clock: Callable[[], float] = time.time,
                  final_of: Callable[[Any], bool], default_task: str | None = None,
-                 order_path: Path | None = None, has_spend: Callable[[Any], bool] | None = None) -> None:
+                 order_path: Path | None = None, has_spend: Callable[[Any], bool] | None = None,
+                 deliveries: Any = None) -> None:
         self._registry_reader = registry_reader
         self._spawn = spawn
         self._ports = ports
@@ -66,6 +68,7 @@ class Supervisor:
         self._order_path = None if order_path is None else Path(order_path)
         self._order: list[str] = self._load_order()
         self._has_spend = has_spend
+        self._deliveries = deliveries
         self._retired_seen: dict[str, float] = {}
         self._alerted_at: dict[str, float] = {}
 
@@ -87,7 +90,8 @@ class Supervisor:
         if entries is not None:
             steps = [steps[0], lambda: self._stop_finished(entries, now), steps[1],
                      lambda: self._start_missing(entries, now), lambda: self._read_models(entries),
-                     lambda: self._note_order(entries), lambda: self._alert_unbilled(entries, now)]
+                     lambda: self._note_order(entries), lambda: self._alert_unbilled(entries, now),
+                     lambda: self._deliver_finished(entries)]
         for step in [*steps, lambda: self._choose_default(entries), self._write_map]:
             try:
                 step()
@@ -113,6 +117,17 @@ class Supervisor:
                 self._stopping[task_id] = (run, now + KILL_AFTER_S)
                 self._finished.add(task_id)
                 self._restart_at.pop(task_id, None)
+
+    def _deliver_finished(self, entries: Mapping[str, Any]) -> None:
+        """Offer each retired pod order whose controller has stopped to ``deliveries`` (``rl_orders.pod_delivery``)."""
+        if self._deliveries is None:
+            return
+        for task_id, entry in sorted(entries.items()):
+            if (entry.status == "retired" and TRAINING_PARAM in entry.params
+                    and not requires_owned_training_runtime(entry.params[TRAINING_PARAM])
+                    and task_id not in self._running and task_id not in self._stopping
+                    and self._deliveries.offer(entry)):
+                return
 
     def _is_final(self, task_id: str, entry: Any) -> bool:
         try:

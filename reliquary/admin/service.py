@@ -475,7 +475,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                      model_facts=None, evaluation_sessions=None, pin_model=None,
                      upload_tokenizer=None, subnet_pool=None, tao_usd=None,
                      sandbox_machine_prefix: str | None = None, sandbox_machines=None,
-                     order_sessions=None, training_runtime_store=None, rl_spend_reader=None) -> FastAPI:
+                     order_sessions=None, training_runtime_store=None, rl_spend_reader=None,
+                     pod_checkpoint_store=None) -> FastAPI:
     """The admin app. ``deliveries`` is the platform bucket's sink (None turns
     the export and grade routes off); ``records`` the subnet's record store;
     ``eval_store`` the subnet bucket holding the eval sets' grading files; ``order_sessions``
@@ -487,7 +488,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
     gateways) and only those; ``sandbox_machines`` is the machine directory (``sandbox_store``).
     ``training_runtime_store`` or the private ``RELIQUARY_TRAINING_RUNTIME_ROOT`` supplies verified local
     runtime observations and immutable final usage/checkpoint reads. Paid admission stays closed.
-    ``rl_spend_reader(run)`` returns a training task's spend summary or None (default: ``rl_spend.read_spend``)."""
+    ``rl_spend_reader(run)`` returns a training task's spend summary or None (default: ``rl_spend.read_spend``).
+    ``pod_checkpoint_store`` holds the final models of orders run on rented pods (default: the private bucket)."""
     from reliquary.infrastructure import corpus_executor_store as executors
     from reliquary.infrastructure import corpus_job_store as job_store
     from reliquary.infrastructure import task_registry_store as registry_store
@@ -1644,21 +1646,46 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 raise HTTPException(status_code=404, detail="training_checkpoint_unknown")
             return final
 
+        def pod_store():
+            nonlocal pod_checkpoint_store
+            if pod_checkpoint_store is None:
+                from reliquary.rl_orders.pod_delivery import PodCheckpointStore
+
+                pod_checkpoint_store = PodCheckpointStore.from_env()
+            return pod_checkpoint_store
+
+        def on_pods(entry) -> bool:
+            from reliquary.rl_orders.runtime import requires_owned_training_runtime
+
+            return not requires_owned_training_runtime(entry.params["training_order"])
+
         @router.get("/training/{task_id}/checkpoint")
         async def training_checkpoint(task_id: str):
-            final = await final_training(await training_task(task_id))
+            entry = await training_task(task_id)
+            if on_pods(entry):
+                try:
+                    manifest = await asyncio.to_thread(pod_store().load_manifest, task_id)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    raise HTTPException(status_code=503, detail="training_checkpoint_unavailable") from exc
+                if manifest is None:
+                    raise HTTPException(status_code=404, detail="training_checkpoint_unknown")
+                return manifest
+            final = await final_training(entry)
             return final["checkpoint"]
 
         @router.get("/training/{task_id}/checkpoint/files/{artifact_id}")
         async def training_checkpoint_file(task_id: str, artifact_id: str, request: Request):
             from reliquary.rl_orders.checkpoint_delivery import CheckpointRangeError
 
-            await final_training(await training_task(task_id))
+            entry = await training_task(task_id)
+            pods = on_pods(entry)
+            if not pods:
+                await final_training(entry)
             if re.fullmatch(r"[0-9a-f]{64}", artifact_id) is None:
                 raise HTTPException(status_code=404, detail="training_checkpoint_file_unknown")
             try:
-                item = await asyncio.to_thread(training_runtime_store.checkpoints.open_range,
-                                                task_id, artifact_id, request.headers.get("range"))
+                store = pod_store() if pods else training_runtime_store.checkpoints
+                item = await asyncio.to_thread(store.open_range, task_id, artifact_id, request.headers.get("range"))
             except CheckpointRangeError as exc:
                 raise HTTPException(status_code=416, detail="training_checkpoint_range_invalid") from exc
             except FileNotFoundError as exc:
@@ -1809,6 +1836,8 @@ def create_admin_app(*, secret: bytes, pool_max: float,
                 raise HTTPException(status_code=422, detail="training_unknown")
             if requires_owned_training_runtime(entry.params["training_order"]):
                 raise HTTPException(status_code=409, detail="training_requires_owned_runtime")
+            if entry.status != "active":           # a late registration would hold the order's model delivery
+                raise HTTPException(status_code=409, detail="training_not_active")
         try:
             document, created = await executors.register_executor(
                 executor_id=body.executor_id, token_sha256=body.token_sha256,
