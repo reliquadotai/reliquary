@@ -1542,6 +1542,8 @@ class CorpusAuditor:
             again = await self._audit_outcomes([records[k] for k in failing], local=True)
             for k, outcome in zip(failing, again):
                 outcomes[k] = outcome
+            if len(failing) > 1:
+                await self._charges_alone(records, outcomes, failing)
 
         for submission_id, outcome in zip(ids, outcomes):
             if isinstance(outcome, dict):
@@ -1630,6 +1632,18 @@ class CorpusAuditor:
         else:
             self._raise_first(landed)
         return results, failed_hotkeys
+
+    async def _charges_alone(self, records: list[dict], outcomes: list, failing: list[int]) -> None:
+        """A forced-draw refusal about to be charged, judged once more in a batch of its own: a sanction must not
+        depend on what its sample was packed with (2026-11-23: one gap 4.097 packed, 3.016 alone, threshold 4.0).
+        The outcome alone stands, whatever it is; a validator error there leaves the record pending, uncharged."""
+        if getattr(self, "_draw_job", None) is None:
+            return
+        charged = [k for k in failing if isinstance(outcomes[k], dict) and not outcomes[k]["passed"]
+                   and outcomes[k].get("reason") == "draw_mismatch" and outcomes[k].get("penalty", True)]
+        alone = await gather_owned(self._audit_outcomes([records[k]], local=True) for k in charged)
+        for k, outcome in zip(charged, alone):
+            outcomes[k] = outcome[0]
 
     async def _escalate(self, failures: dict[str, list[str]], now: float,
                         received: Mapping[str, float] | None = None) -> dict[str, MinerState]:
