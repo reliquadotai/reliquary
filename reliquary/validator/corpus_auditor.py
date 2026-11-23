@@ -1653,26 +1653,43 @@ class CorpusAuditor:
             if callable(settlement) else set()
         if not self._paid_loaded:
             await self._load_paid(settled)
-        forfeited = []
+        work: list[tuple[str, tuple[float, str], dict]] = []
         for hotkey, state in states.items():
             kept = []
-            for received_at, sid in self._paid.get(hotkey, ()):
+            for paid in self._paid.get(hotkey, ()):
+                received_at, sid = paid
                 if sid in settled or sid in self._voided_ids:
                     continue
                 if not forfeits(state, received_at):
-                    kept.append((received_at, sid))
+                    kept.append(paid)
                     continue
-                document = {"schema": VOIDED_SCHEMA, "submission_id": sid, "hotkey": hotkey,
-                            "reason": "forfeited", "voided_at": now, "forfeit_before": state.forfeit_before}
-                await writer(self._job_id, sid, document)
-                self._voided_ids.add(sid)
-                self._report_voided(sid, document)
-                await self._reopen_slot(sid)
-                forfeited.append(sid)
+                work.append((hotkey, paid, {
+                    "schema": VOIDED_SCHEMA, "submission_id": sid, "hotkey": hotkey,
+                    "reason": "forfeited", "voided_at": now, "forfeit_before": state.forfeit_before}))
             self._paid[hotkey] = kept
+        # In parallel: 2,077 written one at a time held the judge, and the audit card, for 7 min (2026-11-23).
+        gate = asyncio.Semaphore(max(1, self.write_concurrency))
+
+        async def void(document):
+            async with gate:
+                await writer(self._job_id, document["submission_id"], document)
+
+        outcomes = await gather_owned((void(document) for _, _, document in work), return_exceptions=True)
+        forfeited = []
+        for (hotkey, paid, document), outcome in zip(work, outcomes):
+            if isinstance(outcome, BaseException):
+                # Still owed: raised below, and the re-audit of the failure voids it again.
+                self._paid[hotkey].append(paid)
+                continue
+            sid = document["submission_id"]
+            self._voided_ids.add(sid)
+            self._report_voided(sid, document)
+            await self._reopen_slot(sid)
+            forfeited.append(sid)
         if forfeited:
             logger.warning("corpus job %s: %d unpaid pass(es) forfeited by confirmed failures of %s",
                            self._job_id, len(forfeited), ", ".join(sorted(states)))
+        self._raise_first(outcomes)
         return forfeited
 
     async def _load_paid(self, settled: set[str]) -> None:

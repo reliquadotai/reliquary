@@ -139,3 +139,57 @@ def test_a_refusal_charged_for_frequent_refusals_forfeits_like_any_charged_failu
     asyncio.run(auditor.judge_many([hit]))
     assert store.verdicts[hit]["passed"] is False
     assert set(store.voided) == set(unpaid)
+
+
+def _forfeiting(store, sids):
+    auditor = _judge(store, _States({HK: SAMPLED}), _Clock(T0 + 70), beacon=_Beacon())
+    auditor._paid[HK] = [(T0, sid) for sid in sids]
+    auditor._paid_loaded = True
+    return auditor, {HK: replace(MinerState(), forfeit_before=T0 + 1)}
+
+
+def test_a_large_forfeit_is_written_in_parallel_within_the_write_bound():
+    class Slow(_Store):
+        running = peak = 0
+
+        async def write_voided(self, job_id, sid, document):
+            Slow.running += 1
+            Slow.peak = max(Slow.peak, Slow.running)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            Slow.running -= 1
+            await super().write_voided(job_id, sid, document)
+
+    sids = _ids(False, 100)
+    store = Slow({})
+    auditor, states = _forfeiting(store, sids)
+    auditor.write_concurrency = 8
+    assert set(asyncio.run(auditor._void_forfeited(states, T0 + 70))) == set(sids)
+    assert set(store.voided) == set(sids)
+    assert Slow.peak == 8
+
+
+def test_a_void_that_failed_is_raised_and_voided_by_the_next_try():
+    class Flaky(_Store):
+        broken = True
+
+        async def write_voided(self, job_id, sid, document):
+            if Flaky.broken and sid == sids[1]:
+                raise OSError("store down")
+            await super().write_voided(job_id, sid, document)
+
+    sids = _ids(False, 4)
+    store = Flaky({})
+    auditor, states = _forfeiting(store, sids)
+    try:
+        asyncio.run(auditor._void_forfeited(states, T0 + 70))
+    except OSError:
+        pass
+    else:
+        raise AssertionError("a void not written must be raised")
+    assert set(store.voided) == set(sids) - {sids[1]}
+    assert auditor._paid[HK] == [(T0, sids[1])]
+    Flaky.broken = False
+    assert asyncio.run(auditor._void_forfeited(states, T0 + 70)) == [sids[1]]
+    assert set(store.voided) == set(sids)
+    assert auditor._paid[HK] == []
