@@ -102,6 +102,8 @@ STATUS_SECONDS = 30.0
 # A judge process's slot reopen that lost its ledger race: tried again after this, doubling.
 REOPEN_RETRY_SECONDS = 1.0
 MAX_REOPEN_RETRY_SECONDS = 30.0
+# The retry task of failures recorded together, among those of single submissions.
+_REOPEN_BACKLOG = "*backlog"
 # Why a job is still kept from miners (control status ``jobs[...]["held"]``).
 HELD_NO_GATEWAY = "no_gateway"
 HELD_AWAITING_AUDIT = "awaiting_audit"
@@ -1083,6 +1085,54 @@ def eval_auditor(**kwargs):
             finally:
                 self._reopening.pop(submission_id, None)
 
+        async def _reopen_many(self, submission_ids) -> None:
+            from reliquary.corpus.eval_draw import has_draw
+            from reliquary.validator.corpus_service import record_prompt_failures
+
+            entries = await self._failure_entries(submission_ids, draw=has_draw(self.job))
+            outcomes = await record_prompt_failures(self.job_store, self.job, entries)
+            exhausted = sum(1 for outcome in outcomes.values() if outcome is False)
+            if exhausted:
+                logger.warning("eval job %s: %d failure(s) exhausted their prompt's attempts",
+                               self._job_id, exhausted)
+
+        async def _reopen_slots(self, submission_ids) -> None:
+            """A forfeit's or a reconcile's failures in one ledger write (2026-11-23: 6,819 voided passes never
+            reopened, and the order was delivered short). Never raises."""
+            await super()._reopen_slots(submission_ids)
+            if not submission_ids or not self.reopen_slots or self.job is None or self.job_store is None:
+                return
+            try:
+                await self._reopen_many(submission_ids)
+            except Exception as exc:
+                logger.exception("eval job %s: %d failure(s) not recorded in the ledger",
+                                 self._job_id, len(submission_ids))
+                if self.retry_reopens and isinstance(exc, _reopen_retried()):
+                    self._reopen_backlog.update(submission_ids)
+                    if _REOPEN_BACKLOG not in self._reopening:
+                        self._reopening[_REOPEN_BACKLOG] = asyncio.ensure_future(self._backlog_until_landed())
+
+        async def _backlog_until_landed(self) -> None:
+            """Every failure of a batch that lost its ledger race, together, until they land."""
+            delay = REOPEN_RETRY_SECONDS
+            try:
+                while self._reopen_backlog:
+                    await asyncio.sleep(delay * (0.5 + random.random() / 2))
+                    batch = sorted(self._reopen_backlog)
+                    try:
+                        await self._reopen_many(batch)
+                        self._reopen_backlog.difference_update(batch)
+                        delay = REOPEN_RETRY_SECONDS
+                        logger.info("eval job %s: %d failure(s) recorded after retrying", self._job_id, len(batch))
+                    except _reopen_retried():
+                        delay = min(MAX_REOPEN_RETRY_SECONDS, 2 * delay)
+                    except Exception:
+                        logger.exception("eval job %s: %d failure(s) left to the next start's reconcile",
+                                         self._job_id, len(batch))
+                        self._reopen_backlog.difference_update(batch)
+            finally:
+                self._reopening.pop(_REOPEN_BACKLOG, None)
+
         async def _write(self, submission_id, verdict):
             stored, written = await super()._write(submission_id, verdict)
             if not (stored or verdict).get("passed"):
@@ -1105,8 +1155,7 @@ def eval_auditor(**kwargs):
 
             ids = list(await self._records.list_verdict_ids(self._job_id))
             failed = await failed_verdicts(self._records, self._job_id, ids)
-            for submission_id in failed:
-                await self._record_failure(submission_id)
+            await self._reopen_slots(failed)
             return len(failed)
 
         async def restore_scored(self) -> int:
@@ -1203,6 +1252,7 @@ def eval_auditor(**kwargs):
     # A judge process: a reopen that lost every ledger attempt is tried again until it lands.
     auditor.retry_reopens = bool(retry_reopens)
     auditor._reopening = {}
+    auditor._reopen_backlog = set()
     # A judge process: who scored what survives its restart (`restore_scored`).
     auditor.restores_scored = bool(restores_scored)
     auditor.scores_restored = asyncio.Event()

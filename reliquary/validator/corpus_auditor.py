@@ -20,7 +20,7 @@ import math
 import os
 import re
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 
 import torch
 
@@ -1261,6 +1261,43 @@ class CorpusAuditor:
                 logger.exception("corpus job %s: failure of %s not recorded in the ledger", self._job_id,
                                  submission_id[:12])
 
+    async def _failure_entries(self, submission_ids: Sequence[str], *, draw: bool) -> list[tuple]:
+        """What ``record_prompt_failures`` takes for these submissions (one no longer stored is skipped)."""
+        from reliquary.validator.corpus_service import draw_failure_slot
+
+        gate = asyncio.Semaphore(READ_CONCURRENCY)
+
+        async def read(submission_id):
+            async with gate:
+                return submission_id, await self._records.read_submission(self._job_id, submission_id)
+
+        entries = []
+        for submission_id, record in await gather_owned(read(sid) for sid in submission_ids):
+            if record is not None:
+                slot = draw_failure_slot(record) if draw else {}
+                entries.append((int(record["prompt_index"]), submission_id, slot.get("slot"), slot.get("hotkey")))
+        return entries
+
+    async def _reopen_slots(self, submission_ids: Sequence[str]) -> None:
+        """Many failed samples of a forced-draw job, in one ledger write. Never raises, as ``_reopen_slot``."""
+        if self._slot_store is None or not submission_ids:
+            return
+        from reliquary.validator.corpus_service import record_prompt_failures
+
+        if getattr(self, "_reopen_lock", None) is None:
+            self._reopen_lock = asyncio.Lock()
+        async with self._reopen_lock:
+            try:
+                entries = await self._failure_entries(submission_ids, draw=True)
+                outcomes = await record_prompt_failures(self._slot_store, self._draw_job, entries)
+                used = sum(1 for outcome in outcomes.values() if outcome is False)
+                if used:
+                    logger.warning("corpus job %s: %d failure(s) used their prompt's last attempt",
+                                   self._job_id, used)
+            except Exception:
+                logger.exception("corpus job %s: %d failure(s) not recorded in the ledger", self._job_id,
+                                 len(submission_ids))
+
     async def _reconcile_quietly(self) -> None:
         try:
             count = await self.reconcile_failures()
@@ -1276,8 +1313,7 @@ class CorpusAuditor:
             return 0
         ids = list(await self._records.list_verdict_ids(self._job_id))
         failed = await failed_verdicts(self._records, self._job_id, ids)
-        for submission_id in failed:
-            await self._reopen_slot(submission_id)
+        await self._reopen_slots(failed)
         return len(failed)
 
     # Verdict writes of this auditor in flight at once, over every concurrent
@@ -1675,17 +1711,19 @@ class CorpusAuditor:
                 await writer(self._job_id, document["submission_id"], document)
 
         outcomes = await gather_owned((void(document) for _, _, document in work), return_exceptions=True)
-        forfeited = []
+        written = []
         for (hotkey, paid, document), outcome in zip(work, outcomes):
             if isinstance(outcome, BaseException):
                 # Still owed: raised below, and the re-audit of the failure voids it again.
                 self._paid[hotkey].append(paid)
                 continue
-            sid = document["submission_id"]
-            self._voided_ids.add(sid)
-            self._report_voided(sid, document)
-            await self._reopen_slot(sid)
-            forfeited.append(sid)
+            self._voided_ids.add(document["submission_id"])
+            written.append(document)
+        forfeited = [document["submission_id"] for document in written]
+        # Before the status hears of them: it must not see a void while the ledger still counts its slot taken.
+        await self._reopen_slots(forfeited)
+        for document in written:
+            self._report_voided(document["submission_id"], document)
         if forfeited:
             logger.warning("corpus job %s: %d unpaid pass(es) forfeited by confirmed failures of %s",
                            self._job_id, len(forfeited), ", ".join(sorted(states)))

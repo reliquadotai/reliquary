@@ -1011,29 +1011,43 @@ async def record_prompt_failure(store: Any, job: JobSpec, prompt_index: int,
     attempts run out. True: reopened; False: exhausted; None: already recorded.
     ``slot`` and ``hotkey`` (a forced-draw job): the draw slot reopens with its own draw.
     Compare-and-swap against the route's own writes, which retry on conflict."""
+    outcomes = await record_prompt_failures(store, job, [(prompt_index, submission_id, slot, hotkey)],
+                                            attempts=attempts)
+    return outcomes[submission_id]
+
+
+async def record_prompt_failures(store: Any, job: JobSpec,
+                                 failures: Sequence[tuple[int, str, int | None, str | None]],
+                                 *, attempts: int = DEFAULT_WRITE_ATTEMPTS) -> dict[str, bool | None]:
+    """Each (prompt, submission, slot, hotkey) recorded in one ledger write, all or none: a forfeit voids
+    thousands at once, and each written alone races the front. Per submission, ``record_prompt_failure``'s
+    outcome. Nothing is written when every one was already recorded."""
     from reliquary.eval.prompt_source import is_eval_source
 
     if not (is_eval_source(job.prompt_source) or has_draw(job)):
         # Any other job's slots are consumed for good: a free-sampling generation order's included. A draw
         # job's failed slot reopens with its own draw, so what it delivers never depends on what failed.
         raise ValueError(f"job {job.job_id!r} is neither an eval nor a draw job: its slots never reopen")
+    if not failures:
+        return {}
     for _ in range(attempts):
         snapshot, etag = await store.read_ledgers(job.job_id)
         state = await asyncio.to_thread(rebuild_ledgers, job, snapshot)
         if snapshot and state.schema not in (LEDGER_SCHEMA_V2, LEDGER_SCHEMA_V3):
             raise LedgerSnapshotError(f"job {job.job_id!r} ledgers are not v2")
-        outcome = state.slots.record_failure(prompt_index, submission_id, slot=slot, hotkey=hotkey)
-        if outcome is None:
-            return None
+        outcomes = {submission_id: state.slots.record_failure(prompt_index, submission_id, slot=slot, hotkey=hotkey)
+                    for prompt_index, submission_id, slot, hotkey in failures}
+        if all(outcome is None for outcome in outcomes.values()):
+            return outcomes
         after = ledger_snapshot(state.slots, state.cursors, state.pending, state.segments,
                                 pending_records=state.records if state.schema == LEDGER_SCHEMA_V3 else None)
         try:
             await store.write_ledgers(job.job_id, after, etag)
         except CorpusStoreConflict:
             continue
-        return outcome
-    raise CorpusStoreConflict(f"job {job.job_id!r}: the failure of {submission_id[:12]} "
-                              "kept losing its ledger race")
+        return outcomes
+    raise CorpusStoreConflict(f"job {job.job_id!r}: {len(failures)} failure(s), the first "
+                              f"{failures[0][1][:12]}, kept losing their ledger race")
 
 
 def draw_failure_slot(record: Mapping[str, Any]) -> dict[str, Any]:
