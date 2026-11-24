@@ -509,13 +509,15 @@ class TokenAuction:
                 tail = self._tail()
                 median_seconds = self._median_seconds()
                 for c in candidates:
-                    if self._allocation.slots.get(c.hotkey, 0) > 0:
-                        self._trusted.needed(c.hotkey, now, self._speeds)
+                    given = self._allocation.slots.get(c.hotkey, 0)
+                    if given > 0:
+                        self._trusted.needed(c.hotkey, now, self._speeds, given=given)
                     offer = self._offers[c.hotkey]
                     changed = self._trusted.step(c.hotkey, now, declared=self._capacity(c.hotkey, offer, now),
                                                  held=held.get(c.hotkey, 0), speeds=self._speeds, median=median,
                                                  median_seconds=median_seconds, tail=tail,
-                                                 trim_unused=not self._shadow)
+                                                 trim_unused=not self._shadow,
+                                                 given=given)
                     if changed:
                         logger.info("merit order%s job=%s hotkey=%s %s", " shadow" if self._shadow else "",
                                     self._job, c.hotkey[:8], changed)

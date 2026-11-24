@@ -50,6 +50,9 @@ VERDICT_SAMPLE_TIMES = 2.0
 VERDICT_MIN_SECONDS = 60.0
 VERDICT_MAX_SECONDS = 1800.0
 VERDICT_SHORT = 0.5
+# The verdict waits until the merit order gave the hotkey at least this many slots on average: one priced out a
+# few seconds after it was needed had no time to take them.
+VERDICT_MIN_GIVEN = 1.0
 CUT = 0.8
 STEP_SECONDS = 30.0
 FULL = 0.9
@@ -199,6 +202,9 @@ class _Trust:
     deliveries0: int
     area0: float = 0.0
     allowance: int | None = None              # None: its declared capacity
+    given: int | None = None                  # slots the merit order gives it now (None: its allowance)
+    given_area: float = 0.0                   # slots given x seconds since ``since``
+    given_at: float | None = None
     judged: bool = False
     stepped_at: float = 0.0
     deliveries_at_step: int = 0
@@ -216,23 +222,29 @@ class Allowances:
             return declared
         return max(1, min(declared, trust.allowance))
 
-    def needed(self, hotkey: str, now: float, speeds: SpeedBook) -> None:
-        """``hotkey`` is among the needed now: its first verdict counts from the first time."""
+    def needed(self, hotkey: str, now: float, speeds: SpeedBook, given: int | None = None) -> None:
+        """``hotkey`` is among the needed now, given ``given`` slots: its first verdict counts from the first time."""
         if hotkey not in self._trust:
             tokens, deliveries, area = speeds.totals(hotkey, now)
             self._trust[hotkey] = _Trust(since=now, tokens0=tokens, deliveries0=deliveries, area0=area,
-                                         stepped_at=now, deliveries_at_step=deliveries)
+                                         stepped_at=now, deliveries_at_step=deliveries, given=given, given_at=now)
 
     def forget(self, hotkey: str) -> None:
         self._trust.pop(hotkey, None)
 
     def step(self, hotkey: str, now: float, *, declared: int, held: int, speeds: SpeedBook,
-             median: float | None, median_seconds: float | None, tail: bool, trim_unused: bool = True) -> str | None:
-        """Re-judge ``hotkey``; what changed (for the log), or None."""
+             median: float | None, median_seconds: float | None, tail: bool, trim_unused: bool = True,
+             given: int | None = None) -> str | None:
+        """Re-judge ``hotkey``; what changed (for the log), or None. ``given``: the slots the merit order gives it
+        now (None: all of its allowance)."""
         trust = self._trust.get(hotkey)
         if trust is None:
             return None
         current = self.of(hotkey, declared)
+        if trust.given_at is not None and now > trust.given_at:
+            trust.given_area += (current if trust.given is None else trust.given) * (now - trust.given_at)
+        trust.given_at = now if trust.given_at is None else max(trust.given_at, now)
+        trust.given = None if given is None else max(0, min(int(given), current))
         tokens, deliveries, area = speeds.totals(hotkey, now)
         if not trust.judged:
             wait = VERDICT_SAMPLE_TIMES * (median_seconds or VERDICT_MIN_SECONDS)
@@ -242,16 +254,24 @@ class Allowances:
                 return None
             if median is None or median <= 0:
                 return None
+            mean_given = trust.given_area / elapsed
+            if mean_given < VERDICT_MIN_GIVEN:
+                return None                   # given (almost) nothing since first needed: nothing to judge yet
             mean_held = (area - trust.area0) / elapsed
-            if mean_held < VERDICT_SHORT * current:
-                # It did not take its slots: judged on what it holds, never on slots it was refused. In the shadow
-                # the thermostat refuses them (2026-11-18: eight hotkeys "verdict 6->1, rate 0" never held one).
+            if mean_held < VERDICT_SHORT * mean_given:
+                # It did not take the slots it was given: judged against those, never against its capacity. The
+                # marginal hotkey is given a few of its slots, one priced out none (2026-11-24: both were trimmed
+                # for slots never given). In the shadow the thermostat refuses them (2026-11-18: eight hotkeys
+                # "verdict 6->1, rate 0" never held one).
                 if not trim_unused:
                     return None
                 trust.judged = True
                 trust.stepped_at, trust.deliveries_at_step = now, deliveries
                 trust.allowance = max(1, math.ceil(1.25 * mean_held))
-                return f"verdict {current}->{trust.allowance} (holds {mean_held:.1f} of its slots)"
+                return (f"verdict {current}->{trust.allowance} (holds {mean_held:.1f} of the {mean_given:.1f} "
+                        f"slots given)")
+            if area - trust.area0 <= 0:
+                return None
             trust.judged = True
             trust.stepped_at, trust.deliveries_at_step = now, deliveries
             rate = (tokens - trust.tokens0) / elapsed

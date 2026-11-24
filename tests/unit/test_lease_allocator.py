@@ -525,3 +525,46 @@ def test_after_a_restart_the_audited_share_from_before_stands_until_enough_verdi
     weight[0] = ta.Q_TRUSTED_DECISIONS
     restarted._report(clock.now, {})
     assert reports == [pytest.approx(0.43), pytest.approx(0.21)]
+
+
+def test_the_marginal_hotkey_taking_every_slot_it_is_given_is_not_trimmed():
+    """2026-11-24: the merit order gave the last needed hotkey 2 of its 22 slots; it held both and its first verdict
+    trimmed it to 3, judged against its capacity instead of the slots it was given."""
+    clock = Clock()
+    book, trust = la.SpeedBook(), la.Allowances()
+    trust.needed("marginal", clock.now, book, given=2)
+    trust.step("marginal", clock.now, declared=22, held=2, speeds=book, median=20.0, median_seconds=100.0,
+               tail=False, given=2)
+    _run(book, clock, "marginal", 2, 400, 10.0, 300)  # 2 leases at 20 tok/lease-s
+    assert trust.step("marginal", clock.now, declared=22, held=2, speeds=book, median=20.0, median_seconds=100.0,
+                      tail=False, given=2) is None
+    assert trust.of("marginal", 22) == 22
+
+
+def test_a_hotkey_priced_out_after_it_was_needed_is_not_trimmed():
+    """Needed once at 22 slots, priced out at the next allocation: it holds nothing because it is given nothing."""
+    clock = Clock()
+    book, trust = la.SpeedBook(), la.Allowances()
+    trust.needed("out", clock.now, book, given=22)
+    trust.step("out", clock.now, declared=22, held=0, speeds=book, median=20.0, median_seconds=100.0, tail=False,
+               given=22)
+    clock.now += 5.0
+    book.tick(clock.now, {"out": 0})
+    for _ in range(120):                              # past twice the verdict wait
+        trust.step("out", clock.now, declared=22, held=0, speeds=book, median=20.0, median_seconds=100.0,
+                   tail=False, given=0)
+        clock.now += 5.0
+        book.tick(clock.now, {"out": 0})
+    assert trust.of("out", 22) == 22
+
+
+def test_a_hotkey_not_taking_the_slots_it_is_given_is_still_trimmed():
+    clock = Clock()
+    book, trust = la.SpeedBook(), la.Allowances()
+    trust.needed("h", clock.now, book, given=10)
+    trust.step("h", clock.now, declared=22, held=2, speeds=book, median=20.0, median_seconds=100.0, tail=False,
+               given=10)
+    _run(book, clock, "h", 2, 400, 10.0, 300)         # given 10, holds 2
+    changed = trust.step("h", clock.now, declared=22, held=2, speeds=book, median=20.0, median_seconds=100.0,
+                         tail=False, given=10)
+    assert changed.startswith("verdict") and trust.of("h", 22) == 3
