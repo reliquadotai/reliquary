@@ -8,7 +8,7 @@ import pytest
 pytest.importorskip("reliquary_sandbox")
 
 from reliquary.sandbox.corpus_quota import (
-    LOW_YIELD, MAIN, NEWCOMER, CorpusQuota, stats_of, standing,
+    LOW_YIELD, MAIN, NEUTRAL, NEWCOMER, WASTED, CorpusQuota, outcome, stats_of, standing,
 )
 from reliquary.sandbox.sessions import (
     CLOSED, LIVE, SUBMITTED, SandboxPolicy, SessionBook, SessionRecord,
@@ -123,6 +123,19 @@ def test_standing_reads_the_sessions_in_the_book():
     assert standing(stats_of(book.of_hotkey("5New"), NOW)[0]) == NEWCOMER
     stats, horizon = stats_of(book.of_hotkey("5Main"), NOW)
     assert (stats.useful, stats.decided, stats.useful_s_24h, horizon) == (30, 30, 30 * 3_600.0, 72_000.0)
+
+
+def test_a_failed_open_of_ours_is_neutral_the_miners_word_is_waste():
+    book = SessionBook(SandboxPolicy())
+    history(book, "5Main", 30)
+    for i, fault in enumerate(["open_refused:no_free_slot", "validator_restarted", None, "grading_pool"]):
+        record = rec(f"f{i}", "5Main", 20_000 + i, state=CLOSED, issued=NOW - 600, closed=NOW - 500,
+                     status="open_failed")
+        record.fault = fault
+        book.add(record)
+    assert [outcome(book.get(f"f{i}")) for i in range(4)] == [NEUTRAL, NEUTRAL, WASTED, WASTED]
+    stats, _ = stats_of(book.of_hotkey("5Main"), NOW)
+    assert (stats.useful, stats.decided) == (30, 32)
 
 
 def test_a_low_yield_hotkey_is_hard_capped():

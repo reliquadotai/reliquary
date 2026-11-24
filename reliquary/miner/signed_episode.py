@@ -349,9 +349,9 @@ class SignedSweEpisodeRunner:
     `min(max_live, the validator's allowance)` sessions of this hotkey on this job are live
     at once (`LEGACY_ALLOWANCE` until the validator names one; `follows_allowance`)."""
 
-    forwards_open_refusal = False
-    """Whether a failed open's close carries the gateway's signed receipt. The corpus validators' close
-    request forbids unknown fields, so only the RL runner does."""
+    forwards_open_refusal = True
+    """Whether a failed open's close carries the gateway's signed receipt, so the validator does not charge the
+    miner for our failed open. The close request has carried the field since the RL runner first sent it."""
     follows_allowance = True
     """Whether the live sessions follow the validator's announced `allowance` (the corpus quota). The RL runner
     holds its own `max_live` (its group's seeds)."""
