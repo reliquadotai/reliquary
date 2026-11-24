@@ -46,6 +46,23 @@ RUN E="git+https://github.com/reliquadotai/reliquary-environments.git@${ENVS}" \
       "renderers==0.1.11" \
  && pip install --no-deps "reliquary-terminal-bench @ git+https://github.com/reliquadotai/reliquary-environments.git@${TB_ENVS}#subdirectory=environments/code/reliquary_terminal_bench"
 
+# The other agentic eval envs, each at the commit of the envs repository that
+# `reliquary.miner.env_packages` pins for miners. DeepSWE v1.1 and SWE-bench Pro V2 are bridged
+# like Terminal-Bench: a job pins that commit and record 0's identity, both checked below.
+# AutomationBench is a suite env this control replays, pinned by its registry artifact.
+# --no-deps, as Terminal-Bench: their requirements (verifiers==0.3.1, which the bridge's b2e4e81
+# is; AutomationBench's pydantic>=2.11,<3) are already installed, and the check below imports each.
+ARG DEEPSWE_ENVS=faaefd675e6f6583e6e1ce3f3a3eca109fe8e766
+ARG DEEPSWE_ENV_PACKAGE=reliquary-deepswe==0.1.0+g48decd56127255d7.vfb2
+ARG SWEPRO_ENVS=d2cf12b1c144515397fae634f5e848f7df55c180
+ARG SWEPRO_ENV_PACKAGE=reliquary-swebench-pro==0.1.0+g9612511bc54064f7.vfb2
+ARG AUTOMATIONBENCH_ENVS=b404a0bb93b289a44ae242c001148f21982812a7
+RUN E="git+https://github.com/reliquadotai/reliquary-environments.git" \
+ && pip install --no-deps \
+      "reliquary-deepswe @ ${E}@${DEEPSWE_ENVS}#subdirectory=environments/code/reliquary_deepswe" \
+      "reliquary-swebench-pro @ ${E}@${SWEPRO_ENVS}#subdirectory=environments/code/reliquary_swebench_pro" \
+      "reliquary-automationbench @ ${E}@${AUTOMATIONBENCH_ENVS}#subdirectory=environments/tool_use/reliquary_automationbench"
+
 # RL training envs beyond the four wheels (`reliquary rl supervise` runs from this image; an order
 # naming one whose distribution is missing crashes its controller at load). Their packages are
 # identical at ENVS and at the commit their artifacts were last cut. reliquary-telecom-solo is
@@ -68,7 +85,8 @@ RUN E="git+https://github.com/reliquadotai/reliquary-environments.git" \
 ARG TASKSETS_REPO=git+https://github.com/PrimeIntellect-ai/research-environments.git@f2e0d70968f9d89421c8035091febee8e9ac3975
 RUN R="${TASKSETS_REPO}#subdirectory=environments" \
  && pip install --target /opt/evalsets-site \
-      "aime25 @ ${R}/math/aime25" "aime26 @ ${R}/math/aime26" "gpqa @ ${R}/science/gpqa" \
+      "aime24 @ ${R}/math/aime24" "aime25 @ ${R}/math/aime25" "aime26 @ ${R}/math/aime26" \
+      "math500 @ ${R}/math/math500" "apex-shortlist @ ${R}/math/apex_shortlist" "gpqa @ ${R}/science/gpqa" \
       "ifbench @ ${R}/if/ifbench" "mmlu-pro @ ${R}/knowledge/mmlu_pro" \
       "livecodebench @ ${R}/code/livecodebench" \
  && echo /opt/evalsets-site > "$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')/zzz-evalsets.pth"
@@ -89,15 +107,21 @@ RUN pip install --target /opt/evalsets-site --no-deps \
 # name is built in or installed at the artifact the registry pins.
 RUN reliquary corpus order-control-check
 
-# Fails the build unless a signed episode job could be served: the pinned sandbox,
-# harness and renderers, each env's bridged identity, and the tasksets.
+# Fails the build unless an episode job could be served: the pinned sandbox, harness and
+# renderers, each env's bridged identity, the suite env's artifact, every env package at the
+# commit miners install, and the tasksets.
 RUN SWE_ENV_PACKAGE="${SWE_ENV_PACKAGE}" TERMINAL_ENV_PACKAGE="${TERMINAL_ENV_PACKAGE}" SBX="${SBX}" \
-    TB_ENV_PACKAGE="${TB_ENV_PACKAGE}" \
+    TB_ENV_PACKAGE="${TB_ENV_PACKAGE}" DEEPSWE_ENV_PACKAGE="${DEEPSWE_ENV_PACKAGE}" \
+    SWEPRO_ENV_PACKAGE="${SWEPRO_ENV_PACKAGE}" \
     python - <<'PY'
 import importlib, importlib.metadata as md, importlib.util, os, sys
 from reliquary.sandbox import SANDBOX_COMMIT, require_sandbox, sandbox_commit_refusal
 from reliquary.environment.agentic_swe import RENDERERS_VERSION, harness_refusal
+from reliquary.environment.agentic.external import verify_external_artifact
 from reliquary.environment.bridged_swe import installed_env_package
+from reliquary.environment.registry import ENVIRONMENT_SPECS
+from reliquary.miner.env_packages import ENV_PACKAGES
+from reliquary.shared.dist_commit import dist_commit
 assert SANDBOX_COMMIT == os.environ["SBX"], SANDBOX_COMMIT
 require_sandbox()
 assert sandbox_commit_refusal(SANDBOX_COMMIT) is None, sandbox_commit_refusal(SANDBOX_COMMIT)
@@ -107,8 +131,16 @@ importlib.import_module("reliquary_sandbox_verifiers")
 assert installed_env_package("reliquary-swe") == os.environ["SWE_ENV_PACKAGE"], installed_env_package("reliquary-swe")
 assert installed_env_package("reliquary-terminal") == os.environ["TERMINAL_ENV_PACKAGE"], installed_env_package("reliquary-terminal")
 assert installed_env_package("reliquary-terminal-bench") == os.environ["TB_ENV_PACKAGE"], installed_env_package("reliquary-terminal-bench")
-for name in ("aime25", "aime26", "gpqa", "ifbench", "mmlu_pro", "livecodebench", "hmmt_feb_2026",
-             "graphwalks_single_turn", "openai_mrcr_single_turn", "hle_diamond_text_det", "scicode_steps"):
+assert installed_env_package("reliquary-deepswe") == os.environ["DEEPSWE_ENV_PACKAGE"], installed_env_package("reliquary-deepswe")
+assert installed_env_package("reliquary-swebench-pro") == os.environ["SWEPRO_ENV_PACKAGE"], installed_env_package("reliquary-swebench-pro")
+verify_external_artifact(ENVIRONMENT_SPECS["reliquary_automationbench_v1"])
+for pinned in ENV_PACKAGES:
+    assert pinned.accepts(dist_commit(pinned.distribution)), (pinned.distribution, dist_commit(pinned.distribution))
+for name in ("reliquary_terminal_bench", "reliquary_deepswe", "reliquary_swebench_pro", "reliquary_automationbench"):
+    importlib.import_module(name)
+for name in ("aime24", "aime25", "aime26", "math500", "apex_shortlist", "gpqa", "ifbench", "mmlu_pro",
+             "livecodebench", "hmmt_feb_2026", "graphwalks_single_turn", "openai_mrcr_single_turn",
+             "hle_diamond_text_det", "scicode_steps"):
     importlib.import_module(name)
 assert "/opt/evalsets-site" in sys.path
 assert not importlib.util.find_spec("verifiers").origin.startswith("/opt/evalsets-site/")
@@ -122,7 +154,7 @@ EXPOSE 8791
 # No wallet and no grader of single-turn orders. Signed episode orders need the order
 # control's own sandbox token key (never the corpus validator's), mounted at run time:
 #   -v <key.pem, 0600>:/run/reliquary/sandbox-order-control.pem:ro
-#   -e RELIQUARY_SANDBOX_VALIDATOR_KEY_FILE=/run/reliquary/sandbox-order-control.pem
-#   -e RELIQUARY_SANDBOX_VALIDATOR_KEY_ID=<its key id> -e RELIQUARY_SANDBOX_VALIDATOR_HOTKEY=<ss58>
+#   -e RELIQUARY_ORDER_SANDBOX_KEY_FILE=/run/reliquary/sandbox-order-control.pem
+#   -e RELIQUARY_ORDER_SANDBOX_KEY_ID=<its key id> -e RELIQUARY_ORDER_SANDBOX_HOTKEY=<ss58>
 #   -e RELIQUARY_SANDBOX_MACHINE_IDS='["<gateway id>", ...]'
 ENTRYPOINT ["reliquary", "corpus", "order-control", "--host", "0.0.0.0", "--port", "8791"]

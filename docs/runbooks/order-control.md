@@ -48,11 +48,15 @@ docker build -f docker/Dockerfile.order-control \
 # the build needs network to github.com (the git+ installs); ENVS, TELECOM_ENVS, SBX are build args
 ```
 
-For signed episode orders (SWE, TMax) the image also carries reliquary-sandbox with its verifiers bridge at
-`SANDBOX_COMMIT`, `reliquary-swe` and `reliquary-terminal` at the reliquary-environments commit the agentic eval
-sets pin (`ENVS`, checked against each set's `env_package`) and `renderers`; reliquary-harness comes with the
-base. The Verifiers tasksets single-turn sets are graded with go to `/opt/evalsets-site`, at the end of
-`sys.path`. A second build check fails unless all of these load at their pins.
+For signed episode orders (SWE, TMax, Terminal-Bench 2.1, DeepSWE, SWE-bench Pro) the image also carries
+reliquary-sandbox with its verifiers bridge at `SANDBOX_COMMIT`, `reliquary-swe` and `reliquary-terminal` at the
+reliquary-environments commit the agentic eval sets pin (`ENVS`, checked against each set's `env_package`),
+`reliquary-terminal-bench`, `reliquary-deepswe` and `reliquary-swebench-pro` at their own commits (`TB_ENVS`,
+`DEEPSWE_ENVS`, `SWEPRO_ENVS`, checked the same way) and `renderers`; reliquary-harness comes with the base.
+AutomationBench orders are suite episodes this control replays: `reliquary-automationbench` at
+`AUTOMATIONBENCH_ENVS`, checked against its registry artifact. Every env package is at the commit
+`reliquary/miner/env_packages.py` pins for miners. The Verifiers tasksets single-turn sets are graded with go to
+`/opt/evalsets-site`, at the end of `sys.path`. A second build check fails unless all of these load at their pins.
 
 ## Run
 
