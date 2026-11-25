@@ -77,6 +77,13 @@ across seven environments. Miners kept generating while the trainer published a
 new checkpoint after every step. Every GPU that joins adds capacity; the trainer
 stays the same size.
 
+## Research paper
+
+[Gumbel Substitution: Removing Sampler Drift from RL Without Trusting the Sampler](https://arxiv.org/abs/2611.27375)  
+arXiv:2611.27375 [cs.LG], submitted November 20, 2026. Preprint.
+
+[Paper](https://arxiv.org/abs/2611.27375) · [PDF](https://arxiv.org/pdf/2611.27375) · [BibTeX](https://arxiv.org/bibtex/2611.27375) · [Model weights and model card](https://huggingface.co/ReliquaryForge/Teutonic-I-Reliquary)
+
 ## How it works
 
 - **Miners generate.** Any NVIDIA GPU runs the current checkpoint, at its own pace.
