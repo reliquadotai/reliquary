@@ -648,8 +648,19 @@ async def _late(h, now, executor_id, after, result=None):
     return lease, granted
 
 
+def _paced(per_tokens):
+    """Scored results of ``per_tokens`` seconds per token, by "fast"."""
+    async def go(h, now):
+        for per_token in per_tokens:
+            assert await _scored_after(h, now, "fast", per_token * TOKENS) == "accepted"
+    return go
+
+
 def test_an_audit_lease_lives_twice_the_median_time_per_token():
     from reliquary.validator.eval_control import AUDIT_LEASE_FLOOR_SECONDS, LEASE_OVERHEAD_SECONDS
+
+    def lease(per_token, tokens=20):
+        return min(300.0, max(AUDIT_LEASE_FLOOR_SECONDS, 2 * per_token * tokens + LEASE_OVERHEAD_SECONDS))
 
     async def go():
         now = [0.0]
@@ -658,13 +669,17 @@ def test_an_audit_lease_lives_twice_the_median_time_per_token():
         await _scored_after(h, now, "fast", TOKENS)
         # One result timed: still the dispatcher's lease seconds.
         assert h.dispatcher.lease_time(MODEL_A, TOKENS) == h.dispatcher._lease_seconds
-        h2 = _Harness(scorers=1)
-        h2.dispatcher._clock = lambda: now[0]
-        await _trained(h2, now)
-        # The median of 1, 10 and 1 s per token, not their mean or their maximum.
-        assert h2.dispatcher.lease_time(MODEL_A, 100) == 2 * 1.0 * 100 + LEASE_OVERHEAD_SECONDS
-        assert h2.dispatcher.lease_time(MODEL_A, TOKENS) == AUDIT_LEASE_FLOOR_SECONDS        # over the floor
-        assert h2.dispatcher.lease_time(MODEL_A, 1000) == h2.dispatcher._lease_seconds       # under the ceiling
+        for samples, median in (((1.0, 4.0, 10.0), 4.0), ((1.0, 2.0, 4.0, 10.0), 3.0)):
+            h = _Harness(scorers=1)
+            h.dispatcher._clock = lambda: now[0]
+            await _paced(samples)(h, now)
+            # The median, not the minimum, the mean or the maximum; an even count takes the middle two's mean.
+            assert h.dispatcher.lease_time(MODEL_A, 20) == lease(median)
+        assert h.dispatcher.lease_time(MODEL_A, 1) == AUDIT_LEASE_FLOOR_SECONDS        # over the floor
+        assert h.dispatcher.lease_time(MODEL_A, 1000) == h.dispatcher._lease_seconds   # under the ceiling
+        # A card faster than the model's median does not get a shorter lease than the median gives.
+        assert await _scored_after(h, now, "quick", 0.5 * TOKENS) == "accepted"
+        assert h.dispatcher.lease_time(MODEL_A, 20, "quick") == h.dispatcher.lease_time(MODEL_A, 20)
     _run(go)
 
 
@@ -690,9 +705,11 @@ def test_a_slow_card_answering_late_is_not_set_aside_and_its_next_lease_fits():
         now = [0.0]
         h = _Harness(scorers=1)
         h.dispatcher._clock = lambda: now[0]
-        await _trained(h, now)
+        await _paced((1.0,) * 5)(h, now)                   # five fast results: the median stays 1 s per token
         needs = 100.0                                      # this card takes 100 s a batch: 14 s per token
         await _late(h, now, "slow", needs)
+        # Only the card's own pace covers it: the model's median did not move.
+        assert h.dispatcher.lease_time(MODEL_A, TOKENS) < needs <= h.dispatcher.lease_time(MODEL_A, TOKENS, "slow")
         assert h.dispatcher._strikes["slow"] == 0
         assert h.dispatcher.stats["answered_late"] == 1 and h.dispatcher.stats["strikes_taken_back"] == 1
         assert await _scored_after(h, now, "slow", needs) == "accepted"   # its next lease fits
@@ -825,4 +842,122 @@ def test_a_card_answering_nothing_is_still_set_aside_after_two_lost_results():
             await h.dispatcher.sweep()
         assert h.quarantined == ["lost"]
         scoring.cancel()
+    _run(go)
+
+
+def test_a_late_answer_takes_back_the_strike_of_the_lease_it_answers():
+    async def go():
+        now = [0.0]
+        h = _Harness(scorers=1)
+        h.dispatcher._clock = lambda: now[0]
+        h.dispatcher._strikes_limit = 3
+        view = h.dispatcher.view(*MODEL_A, PROOF)
+        first = asyncio.ensure_future(view.score(ITEMS))
+        await asyncio.sleep(0)
+        full = h.dispatcher.claim(_executor("a"))          # no timed result yet: a full-length lease
+        now[0] = full["expires_at"] + 1
+        await h.dispatcher.sweep()
+        first.cancel()
+        await asyncio.sleep(0)
+        await _paced((1.0,) * 3)(h, now)
+        scoring = asyncio.ensure_future(view.score(ITEMS))
+        await asyncio.sleep(0)
+        short = h.dispatcher.claim(_executor("a"))         # a learned, shorter lease
+        now[0] = short["expires_at"] + 1
+        await h.dispatcher.sweep()
+        assert h.dispatcher._strikes["a"] == 2
+        with pytest.raises(LeaseRefused):                  # the full-length lease answered late: still lost
+            await h.dispatcher.result("a", full["lease_id"], _honest())
+        assert h.dispatcher._strikes["a"] == 2
+        with pytest.raises(LeaseRefused):                  # the short one: its own strike only
+            await h.dispatcher.result("a", short["lease_id"], _honest())
+        assert h.dispatcher._strikes["a"] == 1
+        scoring.cancel()
+    _run(go)
+
+
+def test_strikes_a_clean_streak_cleared_are_not_taken_back_twice():
+    from reliquary.validator.eval_control import CLEAN_STREAK
+
+    async def go():
+        now = [0.0]
+        h = _Harness(scorers=1)
+        h.dispatcher._clock = lambda: now[0]
+        h.dispatcher._strikes_limit = 3
+        await _paced((1.0,) * 3)(h, now)
+        scoring = asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF).score(ITEMS))
+        await asyncio.sleep(0)
+        old = h.dispatcher.claim(_executor("a"))
+        now[0] = old["expires_at"] + 1
+        await h.dispatcher.sweep()                         # a strike...
+        scoring.cancel()
+        await asyncio.sleep(0)
+        for _ in range(CLEAN_STREAK):                      # ...that a clean streak clears
+            assert await _scored_after(h, now, "a", TOKENS) == "accepted"
+        assert h.dispatcher._strikes["a"] == 0
+        await _late(h, now, "a", 0.0, _short())            # a new lost lease: a new strike
+        assert h.dispatcher._strikes["a"] == 1
+        with pytest.raises(LeaseRefused):                  # the old lease answered late takes nothing back
+            await h.dispatcher.result("a", old["lease_id"], _honest())
+        assert h.dispatcher._strikes["a"] == 1
+    _run(go)
+
+
+def _short():
+    """A result with one score for two items: it does not fit its lease."""
+    return AuditResult.model_validate({"scores": [{"status": "ok", "chunks": [[1, 1.0, 1.0]]}]})
+
+
+def test_a_result_that_does_not_fit_is_neither_timed_nor_clean_on_time_or_late():
+    async def go():
+        now = [0.0]
+        h = _Harness(scorers=1)
+        h.dispatcher._clock = lambda: now[0]
+        await _paced((1.0,) * 3)(h, now)
+        times = len(h.dispatcher._lease_times[MODEL_A])
+        scoring = asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF).score(ITEMS))
+        await asyncio.sleep(0)
+        lease = h.dispatcher.claim(_executor("a"))
+        now[0] += 1.0
+        with pytest.raises(LeaseRefused) as refused:       # on time, too few scores
+            await h.dispatcher.result("a", lease["lease_id"], _short())
+        assert refused.value.status == 422
+        assert len(h.dispatcher._lease_times[MODEL_A]) == times and h.dispatcher._clean["a"] == 0
+        scoring.cancel()
+        await asyncio.sleep(0)
+        await _late(h, now, "b", 100.0, _short())          # late, too few scores: nothing taken back
+        assert h.dispatcher._strikes["b"] == 1 and h.dispatcher.stats["answered_late"] == 0
+        assert len(h.dispatcher._lease_times[MODEL_A]) == times
+    _run(go)
+
+
+def test_a_lease_taken_back_by_a_quarantine_during_the_sweep_does_not_break_it():
+    async def go():
+        now = [0.0]
+        h = _Harness(scorers=1)
+        h.dispatcher._clock = lambda: now[0]
+        await _one_lease(h, now, deliver=False)            # a first strike
+        view = h.dispatcher.view(*MODEL_A, PROOF)
+        scorings = [asyncio.ensure_future(view.score(ITEMS)) for _ in range(2)]
+        await asyncio.sleep(0)
+        leases = [h.dispatcher.claim(_executor("a")) for _ in range(2)]
+        now[0] = max(lease["expires_at"] for lease in leases) + 1
+        # The first expiry sets the card aside, and its quarantine takes back the second lease.
+        await h.dispatcher.sweep()
+        assert h.quarantined == ["a"]
+        for scoring in scorings:
+            scoring.cancel()
+    _run(go)
+
+
+def test_a_card_keeps_its_slowest_recent_pace_after_a_cheap_batch():
+    async def go():
+        now = [0.0]
+        h = _Harness(scorers=1)
+        h.dispatcher._clock = lambda: now[0]
+        await _paced((1.0,) * 5)(h, now)
+        await _late(h, now, "slow", 100.0)                 # 14 s per token on a full batch
+        assert await _scored_after(h, now, "slow", 1.0 * TOKENS) == "accepted"   # then a cheap one
+        # Its next lease still fits its slow batches, not the pace of its last cheap one.
+        assert h.dispatcher.lease_time(MODEL_A, TOKENS, "slow") >= 2 * 100.0
     _run(go)
