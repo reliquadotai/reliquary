@@ -48,11 +48,53 @@ docker build -f docker/Dockerfile.order-control \
 # the build needs network to github.com (the git+ installs); ENVS, TELECOM_ENVS, SBX are build args
 ```
 
-For signed episode orders (SWE, TMax) the image also carries reliquary-sandbox with its verifiers bridge at
-`SANDBOX_COMMIT`, `reliquary-swe` and `reliquary-terminal` at the reliquary-environments commit the agentic eval
-sets pin (`ENVS`, checked against each set's `env_package`) and `renderers`; reliquary-harness comes with the
-base. The Verifiers tasksets single-turn sets are graded with go to `/opt/evalsets-site`, at the end of
-`sys.path`. A second build check fails unless all of these load at their pins.
+For signed episode orders (SWE, TMax, Terminal-Bench 2.1, DeepSWE, SWE-bench Pro) the image also carries
+reliquary-sandbox with its verifiers bridge at `SANDBOX_COMMIT`, `reliquary-swe` and `reliquary-terminal` at the
+reliquary-environments commit the agentic eval sets pin (`ENVS`, checked against each set's `env_package`),
+`reliquary-terminal-bench`, `reliquary-deepswe` and `reliquary-swebench-pro` at their own commits (`TB_ENVS`,
+`DEEPSWE_ENVS`, `SWEPRO_ENVS`, checked the same way) and `renderers`; reliquary-harness comes with the base.
+AutomationBench orders are suite episodes this control replays: `reliquary-automationbench` at
+`AUTOMATIONBENCH_ENVS`, checked against its registry artifact. Every env package is at the commit
+`reliquary/miner/env_packages.py` pins for miners. The Verifiers tasksets single-turn sets are graded with go to
+`/opt/evalsets-site`, at the end of `sys.path`. A second build check fails unless all of these load at their pins.
+
+## Before switching the admin or the order control
+
+A rebuilt image grades only what its installed packages and grader fingerprint allow. Do these before switching
+the admin or the order control to an image built from this Dockerfile:
+
+1. **Trial build** on a non-production host with the intended `BASE_IMAGE`. Keep its output:
+   - `reliquary corpus order-control-check` passes, including `rl_environments`;
+   - the episodes check prints `ORDER_CONTROL_EPISODES_OK`;
+   - `pip check` is clean after the `--no-deps` installs.
+
+   Compare `pip freeze` and each env package's and taskset's `direct_url.json` with the running containers.
+2. **Seal check** (field level, read-only), in the running admin API container **and** in the rebuilt image
+   started with the admin's read-only bucket settings:
+   ```bash
+   docker exec -i <container> python - < scripts/seal_check_admin.py
+   ```
+   It prints one line per single-turn set. How to read each line:
+   - `"sealed": false`: the card has no protocol, so neither comparison applies. Only step 3 tells whether the set
+     grades.
+   - `grader_ok: false` on a sealed card: the grader fingerprint is checked first. `/grade` answers 422, and the
+     order ends in `grading_timeout` after generation: charged, no report. On an admin carrying #547 the order is
+     refused at job creation instead.
+   - `taskset_ok: false`: the rows come back ungraded and count as failures.
+
+   The rebuilt image must print the same `grader_sha256_here` and the same installed triples as the cards.
+3. **One-row grade** (the sufficient check). This step is not shipped as a script: call the grader's own entry
+   points one by one, in this order:
+   1. `reliquary.eval.grading.load_sets`;
+   2. `require_gradable`, then `require_sandboxes`;
+   3. `_Graders(...).grade(...)` on one row of the set's `grading.jsonl`.
+
+   An empty detail or `format_failure` means the set grades. `grader_error`, `grader_drift` or `source_drift`
+   means it does not.
+4. **A drifted set cannot be republished under its id.** Publication is create-only (`eval/storage.py`). Use a
+   new set id and a new `eval_sets` row, and withdraw the old one.
+5. **Do not switch the admin while a single-turn evaluation is in flight.** An order already taken is not
+   refused: its rows come back ungraded.
 
 ## Run
 

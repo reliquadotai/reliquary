@@ -1,6 +1,7 @@
 """The env packages a miner installs for agentic orders: one list, and the start check over it."""
 
 import logging
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -33,6 +34,28 @@ def test_the_harness_pin_is_the_base_dependency():
 def test_every_env_package_is_a_full_commit_from_git(package):
     assert len(package.commit) == 40 and int(package.commit, 16) >= 0
     assert package.requirement().startswith(f"{package.distribution} @ git+https://")
+
+
+def _order_control_install(distribution: str) -> str:
+    """The git URL docker/Dockerfile.order-control installs ``distribution`` from, ARGs and shell variables
+    expanded."""
+    dockerfile = (ROOT / "docker" / "Dockerfile.order-control").read_text()
+    args = dict(re.findall(r"^ARG (\w+)=(\S+)$", dockerfile, re.M))
+    runs = [i for i in dockerfile.replace("\\\n", " ").splitlines() if f'"{distribution} @ ' in i]
+    assert len(runs) == 1, f"docker/Dockerfile.order-control installs {distribution} {len(runs)} times"
+    shell = dict(re.findall(r'(\w+)="([^"]*)"', runs[0]))
+    url = re.search(rf'"{re.escape(distribution)} @ ([^"]+)"', runs[0]).group(1)
+    for _ in range(2):                                 # E="...@${ENVS}" holds an ARG itself
+        url = re.sub(r"\$\{(\w+)\}", lambda m: shell.get(m.group(1)) or args[m.group(1)], url)
+    return url
+
+
+@pytest.mark.parametrize("package", ep.ENV_PACKAGES, ids=lambda p: p.distribution)
+def test_the_order_control_image_installs_every_env_package_at_its_pin(package):
+    """The order control refuses a job whose env package is at another commit than the job pins
+    (`episode_support_refusal`), and jobs pin what miners install. Its image is built by hand, not in CI: a pin
+    moved in `env_packages` alone would otherwise surface only at that build's check, or as refused orders."""
+    assert _order_control_install(package.distribution) == package.requirement().split(" @ ", 1)[1]
 
 
 def _fake_install(monkeypatch, installed: dict[str, dict | None], python=(3, 12)):
