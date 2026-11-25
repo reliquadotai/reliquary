@@ -228,6 +228,9 @@ class CorpusJobSet:
         self._retired_before: set[str] = set()
         # Transient wiring failures per task id, retried every refresh.
         self._wire_failures: collections.Counter = collections.Counter()
+        if self.refreshing:
+            # Until the registry is read, a job a miner names may be one about to be wired again.
+            routes.booting = True
 
     @property
     def refreshing(self) -> bool:
@@ -287,6 +290,7 @@ class CorpusJobSet:
         corpus = {task_id: entry for task_id, entry in sorted(entries.items())
                   if getattr(entry, "mechanism", None) == MECHANISM_CORPUS_GENERATION}
         by_task = {str(w.entry.task_id): job_id for job_id, w in self.served.items()}
+        self._mark_restoring(corpus, by_task)
         for task_id, job_id in by_task.items():
             entry = corpus.get(task_id)
             wiring = self.served[job_id]
@@ -314,11 +318,21 @@ class CorpusJobSet:
                 if await self._finished_for_good(task_id, str(entry.job_id)):
                     continue
             await self._consider(entry)
+        # Left restoring: the jobs whose wiring failed for now and is retried next refresh.
+        self._mark_restoring(corpus, by_task)
         # Never in the refresh that retired it: a submit admitted just before
         # may not have written its record yet.
         for job_id in [j for j in self.served if j in self._retired_before]:
             await self._maybe_unwire(job_id)
         self._retired_before = {j for j in self.served if self.is_retired(j)}
+
+    def _mark_restoring(self, corpus: Mapping[str, Any], by_task: Mapping[str, str]) -> None:
+        """The active jobs this refresh may still wire: a miner asking for one hears `job_not_ready`."""
+        self._routes.restoring = {
+            str(entry.job_id) for task_id, entry in corpus.items()
+            if entry.status == "active" and task_id not in by_task and task_id not in self._passed_over
+            and str(entry.job_id) not in self.served and str(entry.job_id) not in self.finished}
+        self._routes.booting = False
 
     async def _finished_for_good(self, task_id: str, job_id: str) -> bool:
         """A retired job whose final status is stored: never wired again."""

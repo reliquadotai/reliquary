@@ -32,6 +32,9 @@ SESSION_HALT = frozenset({
     "job_complete", "stale_request", "malformed_request", "engagement_kind_unsupported",
     "validator_unavailable",
 })
+# Of those, the validator not answering (a restart, an outage): no new episode starts, but the running ones go on
+# and submit, retrying until their deadline. Their sessions are already open.
+SESSION_STOP_STARTING = frozenset({"validator_unavailable"})
 SESSION_HALT_HINTS = {
     "bad_signature": " (is --validator-hotkey this validator's hotkey?)",
     "stale_request": " (is this machine's clock right?)",
@@ -282,6 +285,8 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
                          precheck=None, open_prompts: OpenPrompts | None = None,
                          stop_ids: frozenset = frozenset()) -> None:
     tasks: set[asyncio.Task] = set()
+    # Episodes that have a session (work under way), as against ones still waiting for their open.
+    working: set[asyncio.Task] = set()
     if open_prompts is None:
         open_prompts = OpenPrompts(job, client)
     tag = identity.hotkey[:8]
@@ -354,13 +359,33 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             logger.info("%s: releasing lease %s failed (%r)", tag, lease_id[:8], exc)
 
     def halt() -> None:
-        """The identity is done (job complete, retired, halted): episodes still
+        """The identity is done (job complete, retired, the hotkey refused): episodes still
         running would only submit into a refusal, so they are cancelled."""
         stop.set()
         current = asyncio.current_task()
         for task in tasks:
             if task is not current and not task.done():
                 task.cancel()
+
+    def stop_starting() -> None:
+        """The validator stopped answering (a restart, an outage): nothing more starts and episodes still waiting
+        for their session are cancelled, but the ones under way go on and submit, retrying until their deadline."""
+        stop.set()
+        current = asyncio.current_task()
+        for task in tasks:
+            if task is not current and not task.done() and task not in working:
+                task.cancel()
+
+    def stop_on(exc: BaseException) -> None:
+        """Stop for ``exc``: a call the validator kept failing only stops the starts (``stop_starting``), any
+        other stop cancels every running episode (``halt``)."""
+        counts["halted"] += 1
+        if isinstance(exc, CorpusMinerHalted) and exc.failed_call:
+            logger.error("%s starts no more episodes, its running ones go on: %s", tag, exc)
+            stop_starting()
+        else:
+            logger.error("%s stops: %s", tag, exc)
+            halt()
 
     async def report(pending: list, prompt_index: int) -> None:
         """Report the signed sessions in `pending` (not submitted), each once."""
@@ -383,15 +408,16 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
                       pending: list) -> str | None:
         deadline = getattr(runner, "deadline", None)
         limit = deadline(prompt_index) if deadline is not None else None
-        on_session = sessions.append
-        if drawn:
-            # A forced-draw eval job: every generate session of the episode draws sample `cursor`'s stream,
-            # bound before its first turn (the forced engine refuses an unbound one).
-            binding = EvalDrawBinding(job, prompt_index, cursor)
+        this = asyncio.current_task()
+        binding = EvalDrawBinding(job, prompt_index, cursor) if drawn else None
 
-            def on_session(session_id: str) -> None:
+        def on_session(session_id: str) -> None:
+            if binding is not None:
+                # A forced-draw eval job: every generate session of the episode draws sample `cursor`'s stream,
+                # bound before its first turn (the forced engine refuses an unbound one).
                 engine._draws.bind(session_id, binding)
-                sessions.append(session_id)
+            sessions.append(session_id)
+            working.add(this)
         try:
             async with asyncio.timeout(limit):
                 result = await runner.run(prompt_index, on_session=on_session)
@@ -403,7 +429,12 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             counts[f"session_refused:{refused.reason}"] += 1
             logger.warning("episode %d of %s: no sandbox session (%s)", prompt_index, tag,
                            refused.reason)
-            if refused.reason in SESSION_HALT:
+            if refused.reason in SESSION_STOP_STARTING:
+                counts["halted"] += 1
+                logger.error("%s starts no more episodes, its running ones go on: the validator does not "
+                             "answer its sandbox opens (%s)", tag, refused.reason)
+                stop_starting()
+            elif refused.reason in SESSION_HALT:
                 counts["halted"] += 1
                 logger.error("%s stops: the validator refuses its sandbox sessions (%s)%s", tag,
                              refused.reason, SESSION_HALT_HINTS.get(refused.reason, ""))
@@ -486,10 +517,8 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             await unsubmitted()
             return
         except (CorpusJobRetired, CorpusMinerHalted) as exc:
-            counts["halted"] += 1
-            logger.error("%s stops: %s", tag, exc)
             await unsubmitted()
-            halt()
+            stop_on(exc)
             return
         reason = str(answer.get("reason"))
         if reason == "accepted":
@@ -527,6 +556,7 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
             logger.exception("episode %d of %s crashed", prompt_index, tag)
             await bounded_report(pending, prompt_index)
         finally:
+            working.discard(asyncio.current_task())
             for session_id in dict.fromkeys(sessions):
                 try:
                     engine.drop_session(session_id)
@@ -581,9 +611,7 @@ async def _mine_identity(*, job, identity: Identity, client, engine, runner, dec
                     try:
                         outcome = await asyncio.to_thread(take_lease)
                     except (CorpusJobRetired, CorpusMinerHalted) as exc:
-                        counts["halted"] += 1
-                        logger.error("%s stops: %s", tag, exc)
-                        halt()
+                        stop_on(exc)
                         slots.release()
                         break
                     if outcome == "complete":

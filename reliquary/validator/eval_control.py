@@ -2118,6 +2118,8 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     app.include_router(build_corpus_jobs_router(routes, legacy=False))
     if sandbox is not None:
         routes.sandbox_hotkey = getattr(sandbox, "validator_hotkey", None)
+        # Read by an open before any signed job is wired: a job about to be is `job_not_ready`, not unknown.
+        sandbox.routes = lambda: routes
         # /corpus/jobs/{job_id}/sandbox/sessions: the episode orders' sessions, under this control's key.
         app.include_router(sandbox.router)
         app.state.corpus_sandbox = sandbox
@@ -2128,7 +2130,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
 
         w = served.get(job_id)
         if w is None or job_id not in routes.routers:
-            raise HTTPException(status_code=404, detail="corpus_job_not_served")
+            raise routes.unserved(job_id)
         if not is_eval_source(w.job.prompt_source):
             # A generation order's rows are the catalog source's, as every miner builds them.
             raise HTTPException(status_code=404, detail="not_an_eval_job")
@@ -2139,7 +2141,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
     async def eval_job_contract(job_id: str) -> dict:
         w = served.get(job_id)
         if w is None or job_id not in routes.routers:
-            raise HTTPException(status_code=404, detail="corpus_job_not_served")
+            raise routes.unserved(job_id)
         return w.entry.contract
 
     @app.get("/corpus/jobs/{job_id}/status")
@@ -2156,7 +2158,7 @@ def build_eval_control(*, store, records, dispatcher: PairedAuditDispatcher,
                 raise HTTPException(status_code=503, detail="order_judge_unavailable") from exc
             raise
         if status is None:
-            raise HTTPException(status_code=404, detail="corpus_job_not_served")
+            raise routes.unserved(job_id)
         return status
 
     add_public_corpus_routes(app, routes)

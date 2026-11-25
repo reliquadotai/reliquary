@@ -3070,10 +3070,28 @@ class CorpusJobRoutes:
         # The ss58 address signed-sandbox session requests are signed for, when this app serves sessions:
         # `JOBS_PATH` tells miners, so they need no ``--validator-hotkey``.
         self.sandbox_hotkey: str | None = None
+        # Jobs the registry lists as served here but not wired yet (a restart re-wiring them, a hot add in
+        # progress), and `booting`: the registry not read yet, so any unknown job may be one. A miner asking
+        # for one hears 503 `job_not_ready` and retries; a 404 would stop it and cancel its running episodes.
+        self.restoring: set[str] = set()
+        self.booting = False
+
+    def not_ready(self, job_id: Any) -> bool:
+        """The job is not served yet but may be soon (`restoring`, `booting`)."""
+        return (isinstance(job_id, str) and job_id not in self.routers and job_id not in self.retired
+                and (self.booting or job_id in self.restoring))
+
+    def unserved(self, job_id: Any) -> HTTPException:
+        """What a miner hears for a job without a router: retry later, or not served here."""
+        if self.not_ready(job_id):
+            return HTTPException(status_code=503, detail=JOB_NOT_READY,
+                                 headers={"Retry-After": str(NOT_READY_RETRY_SECONDS)})
+        return HTTPException(status_code=404, detail="corpus_job_not_served")
 
     def add(self, job_id: str, router: APIRouter, *, contract: Any = None,
             prompt_source: str | None = None, spec: Any = None) -> None:
         self.routers[job_id] = router
+        self.restoring.discard(job_id)
         self.contracts[job_id] = contract
         if spec is not None:
             self.specs[job_id] = spec
@@ -3216,7 +3234,7 @@ class CorpusJobRoutes:
             raise HTTPException(status_code=409, detail="job_paused")
         router = self.routers.get(job_id)
         if router is None:
-            raise HTTPException(status_code=404, detail="corpus_job_not_served")
+            raise self.unserved(job_id)
         self.in_flight[job_id] += 1
         try:
             yield router
@@ -3225,6 +3243,8 @@ class CorpusJobRoutes:
 
 
 JOB_RETIRED = "job_retired"
+JOB_NOT_READY = "job_not_ready"
+NOT_READY_RETRY_SECONDS = 10
 SUBMIT_SCOPED_PATH = "/corpus/jobs/{job_id}/submit"
 
 
@@ -3260,7 +3280,7 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
             return served
         if job_id in routes.retired:
             raise HTTPException(status_code=410, detail=JOB_RETIRED)
-        raise HTTPException(status_code=404, detail="corpus_job_not_served")
+        raise routes.unserved(job_id)
 
     def _admitting(job_id: str) -> APIRouter:
         # Before any store is touched: a retired job admits nothing more.

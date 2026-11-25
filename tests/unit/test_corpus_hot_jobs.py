@@ -671,3 +671,44 @@ def test_a_transient_wiring_error_is_retried_on_the_next_refresh():
         assert list(h.set.served) == ["job-b"]
 
     asyncio.run(go())
+
+
+def test_a_job_the_registry_lists_but_not_wired_yet_is_not_ready_never_unknown():
+    # A restart re-wires its jobs one by one: a miner asking for one meanwhile hears a 503 it retries, not the
+    # 404 that stops it and cancels its running episodes.
+    from tests.unit.test_corpus_multi_job_service import _body
+
+    async def go():
+        h = _Harness([_hot_entry(job_id="swe-v1")], wire_error=OSError("r2 timeout"))
+        async with h.client() as client:
+            # Before the registry is read: any job may be one about to be wired.
+            for response in (await client.get("/corpus/jobs/swe-v1/job"),
+                             await client.post("/corpus/jobs/swe-v1/submit", json=_body("swe-v1"))):
+                assert response.status_code == 503 and response.json() == {"detail": "job_not_ready"}
+                assert response.headers["Retry-After"] == "10"
+            await h.set.refresh()
+            # Its wiring failed for now and is retried: still not ready. A job the registry does not list is unknown.
+            assert (await client.get("/corpus/jobs/swe-v1/job")).status_code == 503
+            unknown = await client.get("/corpus/jobs/other/job")
+            assert unknown.status_code == 404 and unknown.json() == {"detail": "corpus_job_not_served"}
+            h.wire_error = None
+            await h.set.refresh()
+            assert (await client.get("/corpus/jobs/swe-v1/job")).json() == {"job_id": "swe-v1"}
+            assert h.routes.restoring == set()
+
+    asyncio.run(go())
+
+
+def test_a_job_refused_for_good_is_unknown_not_waited_for():
+    from reliquary.validator.corpus_service import CorpusPromptSourceError
+
+    async def go():
+        h = _Harness([_hot_entry(job_id="swe-v1")], wire_error=CorpusPromptSourceError("no renderer"))
+        await h.set.refresh()
+        async with h.client() as client:
+            assert (await client.get("/corpus/jobs/swe-v1/job")).status_code == 404
+        h2 = _Harness([_hot_entry(job_id="swe-v1")], admit=lambda e, j: (OTHER_MODEL, "another model"))
+        await h2.set.refresh()
+        assert not h2.routes.not_ready("swe-v1")
+
+    asyncio.run(go())

@@ -226,6 +226,12 @@ class SandboxServices:
             return None
         return view
 
+    def not_ready(self, job_id: Any) -> bool:
+        """A job without a view that the app's routes are about to serve (restoring after a restart)."""
+        table = self.routes() if self.routes is not None else None
+        check = getattr(table, "not_ready", None)
+        return bool(check is not None and check(job_id))
+
     def publish(self, w) -> None:
         """Serve sessions for a wired signed job (its `wire_signed_job` view)."""
         self.jobs[str(w.job.job_id)] = w.sandbox_view
@@ -310,6 +316,9 @@ def build_sandbox_services(config: SandboxValidatorConfig, *, validator_hotkey: 
     def view(job_id):
         return None if services is None else services.view(job_id)
 
+    def not_ready(job_id):
+        return services is not None and services.not_ready(job_id)
+
     quota = None
     if config.quota:
         from reliquary.sandbox.corpus_quota import CorpusQuota
@@ -330,7 +339,7 @@ def build_sandbox_services(config: SandboxValidatorConfig, *, validator_hotkey: 
     issuer = SessionIssuer(
         book=book, store=session_store or sandbox_store.R2SessionStore(**kw), fleet=fleet,
         signer=signer, token_verifier=token_verifier,
-        engagements={"corpus": CorpusEngagements(view, book, clock),
+        engagements={"corpus": CorpusEngagements(view, book, clock, not_ready=not_ready),
                      "rl_precommit": RlPrecommitEngagements()},
         policy=policy, clock=clock, quota=quota,
         # 2026-11-24: a warming gateway refused 7 opens with its signed receipt in an hour, each charged to

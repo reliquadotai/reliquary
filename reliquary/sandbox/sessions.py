@@ -461,8 +461,11 @@ class CorpusEngagements:
     kind = "corpus"
 
     def __init__(self, jobs: Callable[[str], SignedJobView | None], book: SessionBook,
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time,
+                 not_ready: Callable[[str], bool] | None = None) -> None:
+        # ``not_ready(job_id)``: a job without a view yet that is about to be served (its control restarting).
         self._jobs, self._book, self._clock = jobs, book, clock
+        self._not_ready = not_ready
 
     def submittable_close(self, record: SessionRecord, final: Mapping[str, Any]) -> bool:
         """A budget close the job scores as 0 (`corpus.job.model_closed`): submitted, not redone."""
@@ -477,6 +480,8 @@ class CorpusEngagements:
         job_id, index = engagement.get("job_id"), engagement.get("prompt_index")
         view = self._jobs(job_id) if isinstance(job_id, str) else None
         if view is None:
+            if self._not_ready is not None and self._not_ready(job_id):
+                return Refusal("job_not_ready", {"job_id": job_id}, retry_after=retry)
             return Refusal("job_not_served", {"job_id": job_id})
         job = view.job
         if not is_signed_sandbox(job):
