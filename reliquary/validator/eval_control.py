@@ -48,6 +48,7 @@ from reliquary.validator.corpus_audit_protocol import (
     DRAW_PROTOCOLS,
     ITEM_ERROR,
     ITEM_OK,
+    AuditLease,
     AuditResult,
     HeartbeatRequest,
     draw_protocol,
@@ -120,17 +121,27 @@ DEFAULT_MAX_EXECUTORS = 3
 SCALE_DOWN_SECONDS = 600.0
 # Busy seconds measured before a rate is trusted.
 MIN_MEASURED_BUSY_SECONDS = 120.0
-# A card that lost this many results in a row (leases expired) is set aside; a delivered result clears the count
+# A card that lost this many results in a row (leases expired) is set aside; a scored result clears the count
 # only after CLEAN_STREAK of them, so a card failing one call in two does not keep its work.
 LOST_RESULT_STRIKES = 2
 CLEAN_STREAK = 5
-# An audit lease lives twice the time the model's recent results took per item, for its items and those the
+# A batch one executor decides is parked once its lease expired unanswered this many times (one more per
+# extra scorer it needs, whose leases run at the same time): a batch no card answers (an item the executors
+# cannot read, a result the control cannot read) is the batch's fault, not the cards'. The loss that parks
+# it strikes nobody, and the strikes it gave other executors before are taken back (2026-11-25: every 9B
+# card was set aside about 98 s after loading, and the audits of the model stopped for a day).
+UNANSWERED_LOSSES_PARK = 2
+# An expired lease is remembered this long: its card answering late is slow, not lost.
+LATE_ANSWER_SECONDS = 900.0
+# An audit lease lives twice the time the model's recent results took per token, for its tokens and those the
 # card already holds, plus LEASE_OVERHEAD_SECONDS, within [AUDIT_LEASE_FLOOR_SECONDS, the dispatcher's lease
-# seconds]; the dispatcher's lease seconds until LEASE_TIMES_NEEDED results were timed.
+# seconds]; the dispatcher's lease seconds until LEASE_TIMES_NEEDED results were timed within
+# LEASE_TIMES_MAX_AGE_SECONDS. Only a result that scored its items is timed, and a late one counts.
 AUDIT_LEASE_FLOOR_SECONDS = 60.0
 LEASE_OVERHEAD_SECONDS = 30.0
 LEASE_TIMES_KEPT = 20
 LEASE_TIMES_NEEDED = 3
+LEASE_TIMES_MAX_AGE_SECONDS = 3600.0
 HEARTBEAT_WRITE_SECONDS = 30.0
 EVAL_CONTROL_STATUS_KEY = "reliquary/eval/control/status.json"
 # The miners document every order shares: a hotkey's probation progress carries
@@ -312,6 +323,34 @@ def _placement(document: dict) -> tuple[str, str] | None:
     return str(provider), str(host)
 
 
+# A well-formed lease id, for checking a batch's lease before any executor gets it.
+_PROBE_LEASE_ID = "0" * 32
+
+
+def _tokens(items: Sequence[dict]) -> int:
+    return sum(len(item.get("tokens") or ()) for item in items)
+
+
+def _scored(result: AuditResult, batch: "_Batch") -> bool:
+    """Whether ``result`` fits ``batch`` and scored every item (no executor error)."""
+    scores = result.scores
+    return (len(scores) == len(batch.items)
+            and not any(_misfit(s, item) for s, item in zip(scores, batch.items))
+            and not any(s.status == ITEM_ERROR for s in scores))
+
+
+def _unreadable_lease(body: dict) -> str | None:
+    """Why an executor would refuse this lease as it parses it (``AuditLease``), or None. Such a lease is
+    never answered: its executor logs the failure and claims again."""
+    from pydantic import ValidationError
+
+    try:
+        AuditLease.model_validate(body)
+    except ValidationError as exc:
+        return " ".join(str(exc).split())[:300]
+    return None
+
+
 @dataclass
 class _Batch:
     id: int
@@ -328,6 +367,10 @@ class _Batch:
     protocol: str = AUDIT_PROTOCOL
     judge: Any = None
     reuse_auditors_only: bool = False
+    # Its leases that expired unanswered, and the executors struck for them (taken back when the batch
+    # is parked, or one by one when an executor answers late).
+    losses: int = 0
+    struck: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -371,9 +414,14 @@ class PairedAuditDispatcher:
         self._strikes: collections.Counter = collections.Counter()
         # Per executor, results delivered in time since its last lost one.
         self._clean: collections.Counter = collections.Counter()
-        # Per model, seconds per item its recent results took from grant to result.
+        # Per model, (when, seconds per token) its recent scored results took from grant to result.
         self._lease_times: dict[ModelKey, collections.deque] = collections.defaultdict(
             lambda: collections.deque(maxlen=LEASE_TIMES_KEPT))
+        # Leases that expired unanswered, by id, for LATE_ANSWER_SECONDS: a late answer is told apart.
+        self._expired: dict[str, _Lease] = {}
+        # Per executor, the seconds per token of its last scored result: a card slower than the model's
+        # median gets leases at its own pace at once, not after its late answers outnumber the fast ones.
+        self._pace: dict[str, float] = {}
         self._seen: dict[str, float] = {}
         self._listeners: list[Callable[[str], Awaitable[Any]]] = []
         self._background: set[asyncio.Task] = set()
@@ -450,9 +498,23 @@ class PairedAuditDispatcher:
                                needed=self._scorers,
                                reuse_auditors_only=job_id in self.reuse_only_jobs)
                 units.append((indexes, batch))
-                self._queues[model].append(batch)
                 if batches is not None:
                     batches.append(batch)
+                # As the executor parses it (about 7 ms for a full 262,144-token lease).
+                refusal = _unreadable_lease(self._lease_body(batch, _PROBE_LEASE_ID, 0.0))
+                if refusal is not None:
+                    # Every executor would refuse its lease and post nothing: parked now, never leased.
+                    self.stats["unreadable_parked"] += 1
+                    self._park(batch, f"an item the executors cannot read ({refusal})")
+                    continue
+                self._queues[model].append(batch)
+        for _, batch in units:
+            if batch.future.done() and not batch.future.cancelled() and batch.future.exception() is not None:
+                # Parked as unreadable: this call fails whatever its other batches give, so no card scores them.
+                for _, other in units:
+                    if not other.future.done():
+                        other.future.cancel()
+                raise batch.future.exception()
         scored: list = [None] * len(items)
         for indexes, batch in units:
             scores, scored_by = await batch.future
@@ -529,35 +591,101 @@ class PairedAuditDispatcher:
                 continue
             now = self._clock()
             lease = _Lease(lease_id=secrets.token_hex(16), batch=batch, executor_id=executor_id,
-                           expires_at=now + self.lease_time(batch.model, len(batch.items)
-                                                            + sum(len(h.batch.items) for h in held)),
+                           expires_at=now + self.lease_time(batch.model, _tokens(batch.items)
+                                                            + sum(_tokens(h.batch.items) for h in held),
+                                                            executor_id),
                            granted_at=now)
             self._leases[lease.lease_id] = lease
             self._mark_busy(executor_id, batch.model)
             batch.leased.add(executor_id)
             batch.places[executor_id] = place
             self.stats["leased"] += 1
-            return {
-                "protocol": batch.protocol, "lease_id": lease.lease_id,
-                "model_id": batch.model[0], "model_revision": batch.model[1],
-                "chunk_tokens": batch.proof.chunk_tokens, "topk": batch.proof.topk,
-                "expires_at": lease.expires_at,
-                "items": [{"tokens": list(i["tokens"]), "prompt_len": int(i["prompt_len"]),
-                           "proofs": list(i.get("proofs") or ()),
-                           **({"spans": [list(s) for s in i["spans"]]} if i.get("spans") is not None else {}),
-                           **({"draw": i["draw"]} if i.get("draw") is not None else {})}
-                          for i in batch.items],
-            }
+            return self._lease_body(batch, lease.lease_id, lease.expires_at)
         return None
 
-    def lease_time(self, model: ModelKey, items: int) -> float:
-        """Seconds an audit lease of ``items`` items (its own and those its card already holds) lives."""
+    @staticmethod
+    def _lease_body(batch: _Batch, lease_id: str, expires_at: float) -> dict:
+        """The lease an executor receives for ``batch`` (``AuditLease`` on its side)."""
+        return {
+            "protocol": batch.protocol, "lease_id": lease_id,
+            "model_id": batch.model[0], "model_revision": batch.model[1],
+            "chunk_tokens": batch.proof.chunk_tokens, "topk": batch.proof.topk,
+            "expires_at": expires_at,
+            "items": [{"tokens": list(i["tokens"]), "prompt_len": int(i["prompt_len"]),
+                       "proofs": list(i.get("proofs") or ()),
+                       **({"spans": [list(s) for s in i["spans"]]} if i.get("spans") is not None else {}),
+                       **({"draw": i["draw"]} if i.get("draw") is not None else {})}
+                      for i in batch.items],
+        }
+
+    def lease_time(self, model: ModelKey, tokens: int, executor_id: str | None = None) -> float:
+        """Seconds an audit lease of ``tokens`` tokens (its own and those its card already holds) lives,
+        at the model's recent median pace, or at ``executor_id``'s own when it is slower."""
         times = self._lease_times.get(model)
-        if not times or len(times) < LEASE_TIMES_NEEDED:
+        now = self._clock()
+        recent = [per_token for when, per_token in (times or ()) if now - when <= LEASE_TIMES_MAX_AGE_SECONDS]
+        if len(recent) < LEASE_TIMES_NEEDED:
             return self._lease_seconds
-        per_item = statistics.median(times)
+        per_token = max(statistics.median(recent), self._pace.get(executor_id, 0.0) if executor_id else 0.0)
         return min(self._lease_seconds,
-                   max(AUDIT_LEASE_FLOOR_SECONDS, 2.0 * per_item * max(1, items) + LEASE_OVERHEAD_SECONDS))
+                   max(AUDIT_LEASE_FLOOR_SECONDS, 2.0 * per_token * max(1, tokens) + LEASE_OVERHEAD_SECONDS))
+
+    def _time(self, lease: _Lease) -> None:
+        """Time a lease whose result scored its items, late or not."""
+        tokens = _tokens(lease.batch.items)
+        if tokens:
+            now = self._clock()
+            per_token = (now - lease.granted_at) / tokens
+            self._lease_times[lease.batch.model].append((now, per_token))
+            self._pace[lease.executor_id] = per_token
+
+    def _answered_late(self, lease: _Lease, result: AuditResult) -> None:
+        """A result after its lease expired: refused (the batch is scored again), but its card is slow, not
+        lost. One that scored its items times the model's next leases, so they fit such a card, and takes back
+        the strike and the loss its expiry counted, if the sweep had counted them, unless the lease was
+        already the longest one: a card too slow for that stays a lost result."""
+        batch = lease.batch
+        if batch.reuse_auditors_only or not _scored(result, batch):
+            return
+        self.stats["answered_late"] += 1
+        full_length = lease.expires_at - lease.granted_at >= self._lease_seconds
+        logger.warning("eval audit executor %s answered lease %s of batch %s late, after %.0f s: timed, %s",
+                       lease.executor_id, lease.lease_id[:8], batch.id, self._clock() - lease.granted_at,
+                       "still lost (its lease was the longest)" if full_length else "not counted lost")
+        self._time(lease)
+        if not full_length and lease.executor_id in batch.struck:
+            self._forgive(batch, lease.executor_id)
+            batch.losses = max(0, batch.losses - 1)
+
+    def _forgive(self, batch: _Batch, executor_id: str | None = None) -> None:
+        """Take back the strikes ``batch`` gave (``executor_id``'s one only, when given)."""
+        for struck in list(batch.struck):
+            if executor_id is not None and struck != executor_id:
+                continue
+            batch.struck.remove(struck)
+            self._strikes[struck] = max(0, self._strikes[struck] - 1)
+            if executor_id is not None:
+                return
+
+    async def _lost(self, lease: _Lease) -> None:
+        """A lease that expired unanswered. The batch's UNANSWERED_LOSSES_PARK-th such loss parks it and
+        strikes nobody; any other strikes its executor, set aside at ``_strikes_limit``."""
+        batch, executor_id = lease.batch, lease.executor_id
+        self._expired[lease.lease_id] = lease
+        batch.losses += 1
+        logger.warning("eval audit lease %s of batch %s (job %s, %d items) expired unanswered on executor %s "
+                       "(loss %d of the batch)", lease.lease_id[:8], batch.id, batch.job_id,
+                       len(batch.items), executor_id, batch.losses)
+        if batch.losses >= UNANSWERED_LOSSES_PARK + max(0, batch.needed - 1) and not batch.future.done():
+            self._forgive(batch)
+            self.stats["unanswered_parked"] += 1
+            self._park(batch, f"its lease expired unanswered {batch.losses} times")
+            return
+        self._strikes[executor_id] += 1
+        self._clean[executor_id] = 0
+        batch.struck.append(executor_id)
+        if self._strikes[executor_id] >= self._strikes_limit:
+            await self.quarantine(executor_id, f"{self._strikes_limit} results lost (leases expired)")
 
     def lease_of(self, lease_id: str) -> _Lease | None:
         return self._leases.get(lease_id)
@@ -566,24 +694,31 @@ class PairedAuditDispatcher:
         self.heartbeat(executor_id)
         lease = self._leases.get(lease_id)
         if lease is None or lease.executor_id != executor_id:
+            late = self._expired.get(lease_id)
+            if late is not None and late.executor_id == executor_id:
+                del self._expired[lease_id]
+                self._answered_late(late, result)
+                raise LeaseRefused(410, "lease_expired")
             raise LeaseRefused(410, "lease_unknown")
         del self._leases[lease_id]
         batch = lease.batch
         batch.leased.discard(executor_id)
         self._mark_busy(executor_id, batch.model)
         if lease.expires_at <= self._clock():
+            self._answered_late(lease, result)
             raise LeaseRefused(410, "lease_expired")
-        if not batch.reuse_auditors_only:
-            self._clean[executor_id] += 1
-            if self._clean[executor_id] >= CLEAN_STREAK:
-                self._strikes[executor_id] = 0
-            if batch.items:
-                self._lease_times[batch.model].append(
-                    (self._clock() - lease.granted_at) / len(batch.items))
         scores = result.scores
         if len(scores) != len(batch.items) or any(_misfit(s, item) for s, item in zip(scores, batch.items)):
             raise LeaseRefused(422, "result_does_not_fit_the_lease")
-        if any(s.status == ITEM_ERROR for s in scores) or batch.future.done():
+        errored = any(s.status == ITEM_ERROR for s in scores)
+        if not batch.reuse_auditors_only and not errored:
+            # Only a result that scored its items is clean and timed: errors answered at once would shorten
+            # every card's leases on this model, and clear the strikes of a card that scores nothing.
+            self._clean[executor_id] += 1
+            if self._clean[executor_id] >= CLEAN_STREAK:
+                self._strikes[executor_id] = 0
+            self._time(lease)
+        if errored or batch.future.done():
             # The executor's own fault, or no longer needed: nobody is judged on it.
             self.stats["executor_errors" if not batch.future.done() else "late"] += 1
             return "requeued" if not batch.future.done() else "unneeded"
@@ -848,11 +983,10 @@ class PairedAuditDispatcher:
                 self._mark_busy(lease.executor_id, lease.batch.model)
                 if lease.batch.reuse_auditors_only:
                     continue
-                self._strikes[lease.executor_id] += 1
-                self._clean[lease.executor_id] = 0
-                if self._strikes[lease.executor_id] >= self._strikes_limit:
-                    await self.quarantine(lease.executor_id,
-                                          f"{self._strikes_limit} results lost (leases expired)")
+                await self._lost(lease)
+        for lease_id, lease in list(self._expired.items()):
+            if now - lease.expires_at > LATE_ANSWER_SECONDS:
+                del self._expired[lease_id]
         for queue in self._queues.values():
             while queue and queue[0].future.done():
                 queue.popleft()

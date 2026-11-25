@@ -604,7 +604,10 @@ def test_a_clean_streak_clears_a_lost_result():
     _run(go)
 
 
-def test_an_audit_lease_lives_twice_the_measured_time_for_its_items():
+TOKENS = sum(len(item["tokens"]) for item in ITEMS)
+
+
+def test_an_audit_lease_lives_twice_the_measured_time_for_its_tokens():
     from reliquary.validator.eval_control import (
         AUDIT_LEASE_FLOOR_SECONDS, LEASE_OVERHEAD_SECONDS, LEASE_TIMES_NEEDED,
     )
@@ -615,13 +618,194 @@ def test_an_audit_lease_lives_twice_the_measured_time_for_its_items():
         h.dispatcher._clock = lambda: now[0]
         await _one_lease(h, now, deliver=True)
         # One result timed: still the dispatcher's lease seconds.
-        assert h.dispatcher.lease_time(MODEL_A, len(ITEMS)) == h.dispatcher._lease_seconds
+        assert h.dispatcher.lease_time(MODEL_A, TOKENS) == h.dispatcher._lease_seconds
         for _ in range(LEASE_TIMES_NEEDED - 1):
             await _one_lease(h, now, deliver=True)
-        # Each result took 10 s for 2 items: 5 s an item, twice for 2 items, plus the overhead, over the floor.
-        expected = max(AUDIT_LEASE_FLOOR_SECONDS, 2 * 5.0 * len(ITEMS) + LEASE_OVERHEAD_SECONDS)
-        assert h.dispatcher.lease_time(MODEL_A, len(ITEMS)) == expected
+        # Each result took 10 s for 7 tokens: twice that pace for 7 tokens, plus the overhead, over the floor.
+        expected = max(AUDIT_LEASE_FLOOR_SECONDS, 2 * (10.0 / TOKENS) * TOKENS + LEASE_OVERHEAD_SECONDS)
+        assert h.dispatcher.lease_time(MODEL_A, TOKENS) == expected
         assert h.dispatcher.lease_time(MODEL_A, 100) == h.dispatcher._lease_seconds   # never past the ceiling
         lease = await _one_lease(h, now, deliver=True)
         assert lease["expires_at"] == now[0] - 10.0 + expected
+    _run(go)
+
+
+def test_lease_times_older_than_an_hour_no_longer_count():
+    from reliquary.validator.eval_control import LEASE_TIMES_MAX_AGE_SECONDS, LEASE_TIMES_NEEDED
+
+    async def go():
+        now = [0.0]
+        h = _Harness(scorers=1)
+        h.dispatcher._clock = lambda: now[0]
+        for _ in range(LEASE_TIMES_NEEDED):
+            await _one_lease(h, now, deliver=True)
+        assert h.dispatcher.lease_time(MODEL_A, TOKENS) < h.dispatcher._lease_seconds
+        # An hour with no scored result: the leases are the dispatcher's own again, whatever was measured.
+        now[0] += LEASE_TIMES_MAX_AGE_SECONDS + 1
+        assert h.dispatcher.lease_time(MODEL_A, TOKENS) == h.dispatcher._lease_seconds
+    _run(go)
+
+
+def test_a_slow_card_answering_late_is_not_set_aside_and_its_next_lease_fits():
+    """2026-11-25: leases measured on fast cards were too short for a slower one; each expired before its
+    result, two such strikes set the card aside, and its late results were never timed, so every card
+    rented after it died the same way and the model's audits stopped."""
+    from reliquary.validator.eval_control import AUDIT_LEASE_FLOOR_SECONDS, LEASE_TIMES_NEEDED
+
+    async def go():
+        now = [0.0]
+        h = _Harness(scorers=1)
+        h.dispatcher._clock = lambda: now[0]
+        for _ in range(LEASE_TIMES_NEEDED):                  # fast cards: 10 s a batch
+            await _one_lease(h, now, deliver=True)
+        assert h.dispatcher.lease_time(MODEL_A, TOKENS) == AUDIT_LEASE_FLOOR_SECONDS
+        scoring = asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF).score(ITEMS))
+        await asyncio.sleep(0)
+        needs = 100.0                                        # this card takes 100 s a batch
+        for _ in range(3):
+            lease = h.dispatcher.claim(_executor("slow"))
+            assert lease is not None
+            granted = now[0]
+            if lease["expires_at"] - granted >= needs:
+                now[0] = granted + needs
+                assert await h.dispatcher.result("slow", lease["lease_id"], _honest()) == "accepted"
+                break
+            now[0] = lease["expires_at"] + 1
+            await h.dispatcher.sweep()
+            now[0] = granted + needs
+            with pytest.raises(LeaseRefused) as late:
+                await h.dispatcher.result("slow", lease["lease_id"], _honest())
+            assert late.value.status == 410
+        else:
+            pytest.fail("the slow card never got a lease it could answer in")
+        await asyncio.wait_for(scoring, 1)
+        assert h.quarantined == [] and h.dispatcher._strikes["slow"] == 0
+    _run(go)
+
+
+def test_a_batch_no_card_answers_is_parked_and_strikes_nobody():
+    from reliquary.validator.eval_control import BatchParked
+
+    async def go():
+        now = [0.0]
+        h = _Harness(scorers=1)
+        h.dispatcher._clock = lambda: now[0]
+        scoring = asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF).score(ITEMS))
+        await asyncio.sleep(0)
+        for card in ("a", "b"):                              # each takes it and never answers
+            lease = h.dispatcher.claim(_executor(card))
+            assert lease is not None
+            now[0] = lease["expires_at"] + 1
+            await h.dispatcher.sweep()
+        with pytest.raises(BatchParked):
+            await asyncio.wait_for(scoring, 1)
+        assert h.quarantined == []
+        assert h.dispatcher._strikes["a"] == 0 and h.dispatcher._strikes["b"] == 0
+    _run(go)
+
+
+def test_two_batches_no_card_answers_cost_one_card_at_most_and_the_queue_moves_on():
+    from reliquary.validator.eval_control import BatchParked
+
+    async def go():
+        now = [0.0]
+        h = _Harness(scorers=1)
+        h.dispatcher._clock = lambda: now[0]
+        view = h.dispatcher.view(*MODEL_A, PROOF)
+        unanswered = [asyncio.ensure_future(view.score(ITEMS)) for _ in range(2)]
+        await asyncio.sleep(0)
+        for card in ("a", "b"):                              # each card takes both and answers neither
+            leases = [h.dispatcher.claim(_executor(card)) for _ in range(2)]
+            assert all(leases)
+            now[0] = max(lease["expires_at"] for lease in leases) + 1
+            await h.dispatcher.sweep()
+        for scoring in unanswered:
+            with pytest.raises(BatchParked):
+                await asyncio.wait_for(scoring, 1)
+        # The first card is set aside before either batch is known unanswerable; the second is not.
+        assert h.quarantined == ["a"] and h.dispatcher._strikes["b"] == 0
+        good = asyncio.ensure_future(view.score(ITEMS))
+        await asyncio.sleep(0)
+        lease = h.dispatcher.claim(_executor("b"))
+        assert lease is not None
+        now[0] += 10.0
+        assert await h.dispatcher.result("b", lease["lease_id"], _honest()) == "accepted"
+        await asyncio.wait_for(good, 1)
+    _run(go)
+
+
+def test_error_results_do_not_shorten_the_leases_or_clear_strikes():
+    from reliquary.validator.eval_control import CLEAN_STREAK, LEASE_TIMES_NEEDED
+
+    error = AuditResult.model_validate(
+        {"scores": [{"status": "error", "chunks": [], "detail": "boom"} for _ in ITEMS]})
+
+    async def go():
+        now = [0.0]
+        h = _Harness(scorers=1)
+        h.dispatcher._clock = lambda: now[0]
+        await _one_lease(h, now, deliver=False)              # one result lost: a strike
+        for _ in range(max(LEASE_TIMES_NEEDED, CLEAN_STREAK)):
+            scoring = asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF).score(ITEMS))
+            await asyncio.sleep(0)
+            lease = h.dispatcher.claim(_executor("a"))
+            now[0] += 1.0                                    # an error answered at once
+            assert await h.dispatcher.result("a", lease["lease_id"], error) == "requeued"
+            scoring.cancel()
+            await asyncio.sleep(0)
+        assert h.dispatcher.lease_time(MODEL_A, TOKENS) == h.dispatcher._lease_seconds
+        assert h.dispatcher._strikes["a"] == 1
+    _run(go)
+
+
+def test_a_card_too_slow_even_for_the_longest_lease_is_still_set_aside():
+    async def go():
+        now = [0.0]
+        h = _Harness(scorers=1)
+        h.dispatcher._clock = lambda: now[0]
+        for _ in range(2):                                   # no timed result yet: full-length leases
+            scoring = asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF).score(ITEMS))
+            await asyncio.sleep(0)
+            lease = h.dispatcher.claim(_executor("a"))
+            granted = now[0]
+            assert lease["expires_at"] - granted == h.dispatcher._lease_seconds
+            now[0] = lease["expires_at"] + 1
+            await h.dispatcher.sweep()
+            now[0] = granted + 2 * h.dispatcher._lease_seconds
+            with pytest.raises(LeaseRefused):
+                await h.dispatcher.result("a", lease["lease_id"], _honest())
+            scoring.cancel()
+            await asyncio.sleep(0)
+        assert h.quarantined == ["a"]
+    _run(go)
+
+
+def test_an_unreadable_batch_fails_its_call_before_any_of_its_batches_is_leased():
+    from reliquary.validator.corpus_audit_protocol import MAX_LEASE_ITEMS
+    from reliquary.validator.eval_control import BatchParked
+
+    async def go():
+        h = _Harness(scorers=1)
+        items = [ITEMS[0]] * MAX_LEASE_ITEMS + [{"tokens": [1], "prompt_len": 1, "proofs": []}]
+        scoring = asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF).score(items))
+        await asyncio.sleep(0)
+        assert h.dispatcher.claim(_executor("a")) is None    # the readable batch is not scored for nobody
+        with pytest.raises(BatchParked):
+            await asyncio.wait_for(scoring, 1)
+    _run(go)
+
+
+def test_a_batch_with_an_item_the_executors_cannot_read_is_parked_before_any_lease():
+    from reliquary.validator.eval_control import BatchParked
+
+    async def go():
+        h = _Harness(scorers=1)
+        # One token: the executors' lease schema needs two (AuditItem), so a card would never answer it.
+        unreadable = [{"tokens": [1], "prompt_len": 1, "proofs": []}]
+        scoring = asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF).score(unreadable))
+        await asyncio.sleep(0)
+        assert h.dispatcher.claim(_executor("a")) is None
+        with pytest.raises(BatchParked, match="cannot read"):
+            await asyncio.wait_for(scoring, 1)
+        assert h.dispatcher.stats["unreadable_parked"] == 1
     _run(go)
