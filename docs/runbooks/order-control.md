@@ -42,18 +42,32 @@ What these envs need at run time:
 Mount a persistent Hugging Face cache so the corpora are fetched once.
 
 ```bash
-docker buildx imagetools inspect ghcr.io/reliquadotai/reliquary-validator:sha-<short commit>-logic   # its digest
+# the base: the validator image the image workflow built from Core <commit>
+docker buildx imagetools inspect \
+  "ghcr.io/reliquadotai/reliquary-validator:sha-$(git rev-parse --short=7 <commit>)-logic"   # prints its Digest
 docker build -f docker/Dockerfile.order-control \
   --build-arg BASE_IMAGE=ghcr.io/reliquadotai/reliquary-validator@sha256:<that digest> \
-  --build-context envs=<directory holding exactly the four reviewed wheels> .
+  --build-context envs=<directory holding exactly the four reviewed wheels> \
+  -t <registry>/<repository>:<tag> .
+docker push <registry>/<repository>:<tag>   # prints the digest of the image to check and to switch to
 # the build needs network to github.com (the git+ installs); ENVS, TELECOM_ENVS, SBX are build args
 ```
 
-Pin `BASE_IMAGE` by digest, never by tag: `latest` moves with main, and the trial build (below) and the production
-build must start from the same base. In the built image, `/opt/reliquary/.build-revision` is the Core commit that
-base was built from: the root `Dockerfile` writes its `RELIQUARY_BUILD_REVISION` there (the validator image
-workflow sets it to the commit; `unknown` when unset), and the order-control layers do not change it. It does not
-cover this image's own tasksets, copied from the build context's `tasksets/`.
+The validator image workflow (`.github/workflows/docker-image.yml`) tags each build of main
+`sha-<the commit's first 7 characters>-logic`: `git rev-parse --short=7 <commit>` prints them (more only when 7
+are ambiguous in your clone; the tag keeps the first 7). A commit whose changes are all under `docs/` or in `.md`
+files has no image (the workflow's `paths-ignore`), and one whose build a later push to main cancelled may have
+none: when `imagetools inspect` finds no such tag, take another commit.
+
+Pin `BASE_IMAGE` by digest, never by tag: `latest` moves with main, and a new run of the workflow on a commit
+pushes its tag again. Build the image once, on a non-production host, and push it: the checks before the switch
+(below) and the switch itself use the digest that push printed. A second build from the same `BASE_IMAGE` and
+arguments is another image, whose packages may differ: the `pip install` steps resolve dependencies at build time.
+
+In the built image, `/opt/reliquary/.build-revision` is the Core commit that base was built from: the root
+`Dockerfile` writes its `RELIQUARY_BUILD_REVISION` there (the validator image workflow sets it to the commit;
+`unknown` when unset), and the order-control layers do not change it. It does not cover this image's own tasksets,
+copied from the build context's `tasksets/`.
 
 For signed episode orders (SWE, TMax, Terminal-Bench 2.1, DeepSWE, SWE-bench Pro) the image also carries
 reliquary-sandbox with its verifiers bridge at `SANDBOX_COMMIT`, `reliquary-swe` and `reliquary-terminal` at the
@@ -68,35 +82,24 @@ AutomationBench orders are suite episodes this control replays: `reliquary-autom
 ## Before switching the admin or the order control
 
 A rebuilt image grades only what its installed packages and grader fingerprint allow. Do these before switching
-the admin or the order control to an image built from this Dockerfile.
+the admin or the order control to an image built from this Dockerfile, every step on the one image built and
+pushed once (Image above), named by the digest its push printed:
+
+```bash
+IMG=<registry>/<repository>@sha256:<the digest docker push printed>
+```
 
 **Before the switch, never start the rebuilt image with production settings**, neither through its entrypoint nor
 as `admin serve`. Its `ENTRYPOINT` is the order control itself (`reliquary corpus order-control`): a second order
 control beside the running one, on the production bucket and registry. As `admin serve` it is a second admin, and
 with `RELIQUARY_ORDER_CAP_SIZING=on` a second cap resizer writing the registry's caps. No setting makes the bucket
 read-only: the store uses whatever `R2_*` credentials it is given. So until the switch the rebuilt image runs only
-as one-shot containers that replace its entrypoint, start no service and are removed on exit (`--rm`); the running
-admin is checked with `docker exec`.
+as one-shot containers that replace its entrypoint with `python` or `cat`, start no service, are removed on exit
+(`--rm`) and are given no setting but the bucket variables of `$R2_ENV` (step 2); the running admin is checked
+with `docker exec`. The one exception is in step 3, on a non-production host.
 
-```bash
-IMG=<the rebuilt image, by ID or digest>
-R2_ENV="$(mktemp)"   # mode 600
-# on the admin's host, from the running admin (elsewhere, write the same lines by hand)
-docker exec <admin container> env |
-  grep -E '^R2_(ACCOUNT_ID|ACCESS_KEY_ID|SECRET_ACCESS_KEY|BUCKET_ID|ENDPOINT_URL|REGION)=' > "$R2_ENV"
-```
-
-`$R2_ENV` holds the admin's `R2_*` variables and none of its other settings. `R2_BUCKET_ID`, `R2_ENDPOINT_URL` and
-`R2_REGION` must be in it whenever the admin sets them: without `R2_BUCKET_ID` the store reads the `reliquary`
-bucket. With an R2 token that can only read that bucket, put its `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY` in
-place of the admin's. Delete the file once the checks are done: `rm -f "$R2_ENV"`.
-
-1. **Trial build** on a non-production host with the intended `BASE_IMAGE`, pinned by digest (see Image above).
-   Keep its output:
-   - `reliquary corpus order-control-check` passes, including `rl_environments`;
-   - the episodes check prints `ORDER_CONTROL_EPISODES_OK`.
-
-   Then, in the built image:
+1. **The build's checks.** Keep the build's output: `reliquary corpus order-control-check` passes, including
+   `rl_environments`, and the episodes check prints `ORDER_CONTROL_EPISODES_OK`. Then, in the pushed image:
    ```bash
    docker run --rm --network none --entrypoint cat "$IMG" /opt/reliquary/.build-revision
    docker run --rm --network none --entrypoint python "$IMG" -m pip check
@@ -105,13 +108,29 @@ place of the admin's. Delete the file once the checks are done: `rm -f "$R2_ENV"
    `.build-revision` must be the Core commit of the base you meant. `pip check` must be clean after the
    `--no-deps` installs. Compare `pip freeze` and each env package's and taskset's `direct_url.json` with the
    running containers (`docker exec <container> python -m pip freeze`).
-2. **Seal check** (field level, read-only), in the running admin API container **and** in the rebuilt image. Both
-   read the script from the same `<commit>`, whatever the checkout holds:
+2. **Seal check** (field level, read-only), in the running admin API container **and** in the rebuilt image, both
+   reading the script from the same Core `<commit>`, whatever the checkout holds. `$R2_ENV` lives only as long as
+   the check: the subshell creates it right before (`mktemp`, mode 600) and its traps remove it on exit, whether
+   the check passes, fails or is interrupted (zsh runs no `EXIT` trap on Ctrl-C without the second one).
    ```bash
-   git show <commit>:scripts/seal_check_admin.py | docker exec -i <admin container> python -
-   git show <commit>:scripts/seal_check_admin.py |
-     docker run --rm -i --entrypoint python --env-file "$R2_ENV" "$IMG" -
+   (
+     set -e -o pipefail
+     R2_ENV="$(mktemp)"; trap 'rm -f "$R2_ENV"' EXIT; trap exit INT TERM HUP
+     docker exec <admin container> env |
+       grep -E '^R2_(ACCOUNT_ID|ACCESS_KEY_ID|SECRET_ACCESS_KEY|BUCKET_ID|ENDPOINT_URL|REGION)=' > "$R2_ENV"
+     git show <commit>:scripts/seal_check_admin.py | docker exec -i <admin container> python -
+     git show <commit>:scripts/seal_check_admin.py |
+       docker run --rm -i --entrypoint python --env-file "$R2_ENV" "$IMG" -
+   )
    ```
+   `$R2_ENV` holds exactly what that `grep` keeps: of the six variables `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
+   `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_ID`, `R2_ENDPOINT_URL` and `R2_REGION`, those the admin sets. Never an
+   `R2_PUBLIC_*` variable, nor any other setting. `R2_BUCKET_ID`, `R2_ENDPOINT_URL` and `R2_REGION` must be in it
+   whenever the admin sets them: without `R2_BUCKET_ID` the store reads the `reliquary` bucket. The `grep` line
+   copies the admin's own keys, so it runs on the admin's host only. Anywhere else, write the same variables by
+   hand in its place, and the two keys must be those of an R2 token that can only read that bucket, never the
+   admin's.
+
    It prints one line per single-turn set. How to read each line:
    - `"sealed": false`: the card has no protocol, so neither comparison applies. Only step 3 tells whether the set
      grades.
@@ -127,28 +146,43 @@ place of the admin's. Delete the file once the checks are done: `rm -f "$R2_ENV"
    2. `require_gradable`, then `require_sandboxes`;
    3. `_Graders(...).grade(...)` on one row of the set's `grading.jsonl`.
 
-   In the rebuilt image, run it like the seal check, the set ids as its arguments; `--memory` keeps it from
-   taking the memory of the services beside it:
+   In the rebuilt image, run it like the seal check, the set ids as its arguments, `$R2_ENV` made as in step 2:
    ```bash
-   docker run --rm -i --memory 4g --entrypoint python --env-file "$R2_ENV" "$IMG" - <set ids> < <your script>
+   (
+     set -e -o pipefail
+     R2_ENV="$(mktemp)"; trap 'rm -f "$R2_ENV"' EXIT; trap exit INT TERM HUP
+     docker exec <admin container> env |
+       grep -E '^R2_(ACCOUNT_ID|ACCESS_KEY_ID|SECRET_ACCESS_KEY|BUCKET_ID|ENDPOINT_URL|REGION)=' > "$R2_ENV"
+     docker run --rm -i --memory 4g --entrypoint python --env-file "$R2_ENV" "$IMG" - <set ids> < <your script>
+   )
    ```
-   A LiveCodeBench or SciCode program runs in its grading service, reached only through the socket mount and
-   variable the admin container is given ("Code-execution grading" and "SciCode" below): without them, its row's
-   `grader_error` says nothing about the image.
-
    An empty detail or `format_failure` means the set grades. `grader_error`, `grader_drift` or `source_drift`
-   means it does not.
+   means it does not, except for these `grader_error`s, which say nothing about the image:
+   - **Memory.** `--memory` keeps the check from taking the memory of the services beside it; `4g` is a
+     suggestion, not a measured need. A scoring child killed for lack of memory reads
+     `grader_error: BrokenProcessPool: ...` (after one retry in a fresh child), and a script killed for it ends
+     the container with exit status 137. Rerun with more memory before concluding anything.
+   - **What this container lacks.** HLE-Diamond (`hle_diamond_text_det`) reads its gated dataset with the
+     `HF_TOKEN` of an account the dataset admits, and a LiveCodeBench or SciCode program runs in a grading
+     service, reached through a socket mount and its variable ("Code-execution grading" and "SciCode" below).
+     This container has neither. Grade their row on a non-production host instead, which holds none of the
+     admin's settings: start the grading service there from `$IMG` as in those sections (it holds no secret and
+     has no network), and give the one-shot container its socket and variable, a read-only `HF_TOKEN` of an
+     admitted account (not the admin's) and `$R2_ENV` with the read-only R2 token. Never start the rebuilt
+     image as the admin or the order control to grade them.
 4. **A drifted set cannot be republished under its id.** Publication is create-only (`eval/storage.py`). Use a
    new set id and a new `eval_sets` row, and withdraw the old one.
 5. **Do not switch the admin while a single-turn evaluation is in flight.** An order already taken is not
    refused: its rows come back ungraded.
+6. **Switch to `$IMG` itself**, the digest every step above checked: never to a tag, nor to another build of the
+   same commit.
 
 ## Run
 
 ```bash
 docker run -d --name order-control --network host \
   --env-file <subnet bucket credentials> -e RELIQUARY_ADMIN_TASK_PREFIX=order- \
-  <order-control image> --netuid 81
+  <order-control image, by the digest checked before the switch> --netuid 81
 ```
 
 Signed episode orders also need the order control's own sandbox token key (an Ed25519 PEM, mode 0600,

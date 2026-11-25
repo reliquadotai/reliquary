@@ -6,12 +6,23 @@ Run it where single-turn rows are graded, every run reading the script from the 
 
     git show <commit>:scripts/seal_check_admin.py | docker exec -i <admin-container> python -
 
-In a rebuilt image, before switching to it, run it only in a one-shot container that replaces the entrypoint and
-starts no service, ``R2_ENV`` being a mode-600 file of the admin's ``R2_*`` variables and nothing else
-(``R2_BUCKET_ID``, ``R2_ENDPOINT_URL`` and ``R2_REGION`` too when the admin sets them), deleted afterwards::
+In a rebuilt image, before switching to it, run it only in a one-shot container that replaces the entrypoint,
+starts no service and is given nothing but ``R2_ENV``: a mode-600 file holding exactly what the ``grep`` below
+keeps, of the six variables ``R2_ACCOUNT_ID``, ``R2_ACCESS_KEY_ID``, ``R2_SECRET_ACCESS_KEY``, ``R2_BUCKET_ID``,
+``R2_ENDPOINT_URL`` and ``R2_REGION`` those the admin sets, and never an ``R2_PUBLIC_*`` one. It is created right
+before the check, and the traps remove it on exit, interrupted or not. That ``grep`` copies the admin's own keys, so
+it runs on the admin's host only; anywhere else, write the same variables by hand, and the keys must be those of an
+R2 token that can only read the bucket. ``IMG`` is the rebuilt image by the digest its one push printed, the image
+the switch then runs::
 
-    git show <commit>:scripts/seal_check_admin.py |
-      docker run --rm -i --entrypoint python --env-file "$R2_ENV" "$IMG" -
+    (
+      set -e -o pipefail
+      R2_ENV="$(mktemp)"; trap 'rm -f "$R2_ENV"' EXIT; trap exit INT TERM HUP
+      docker exec <admin-container> env |
+        grep -E '^R2_(ACCOUNT_ID|ACCESS_KEY_ID|SECRET_ACCESS_KEY|BUCKET_ID|ENDPOINT_URL|REGION)=' > "$R2_ENV"
+      git show <commit>:scripts/seal_check_admin.py |
+        docker run --rm -i --entrypoint python --env-file "$R2_ENV" "$IMG" -
+    )
 
 Never start that image with production settings before the switch: its entrypoint is the order control itself, and
 ``admin serve`` would be a second admin (a second cap resizer with ``RELIQUARY_ORDER_CAP_SIZING=on``). No setting

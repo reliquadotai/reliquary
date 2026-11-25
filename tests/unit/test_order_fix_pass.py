@@ -5,10 +5,15 @@ control, through executor pairs, up to its settlement."""
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
+import itertools
 import json
+import re
+import shlex
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -591,26 +596,227 @@ def test_the_order_control_image_installs_and_checks_its_runtime():
     assert "order-control" in Path("docs/runbooks/order-control.md").read_text()
 
 
+_BEFORE_SWITCHING = "## Before switching the admin or the order control"
+_FENCE = re.compile(r"\s*(`{3,}|~{3,})")
+_INLINE_CODE = re.compile(r"(`+)([^`]+?)\1")
+_DOCKER = re.compile(r"(?<![\w.-])docker(?:-compose)?(?![\w./-])")
+_PLACEHOLDER = re.compile(r"<[A-Za-z][^<>\n]*>")
+# docker subcommands that start no container (`run` is checked; anything else, `create`, `start`,
+# `compose`..., is refused).
+_STARTS_NOTHING = {"exec", "pull", "push", "tag", "inspect", "image", "images", "buildx", "build", "ps", "logs"}
+
+
+def _markdown_section(markdown, heading):
+    """A markdown section as (code, prose): its fenced blocks, whatever their info string, and the rest."""
+    code, prose, fence, inside = [], [], None, False
+    for line in markdown.splitlines():
+        marker = _FENCE.match(line)
+        if fence is not None:
+            if marker and set(line.strip()) == {fence[0]} and len(line.strip()) >= len(fence):
+                fence = None
+            elif inside:
+                code.append(line)
+        elif marker:
+            fence = marker.group(1)
+        elif line.startswith("## "):
+            inside = line.strip() == heading
+        elif inside:
+            prose.append(line)
+    return code, prose
+
+
+def _docstring_parts(docstring):
+    """A docstring as (code, prose): its indented literal blocks, and the rest."""
+    lines = docstring.splitlines()
+    return [line for line in lines if line[:1].isspace()], [line for line in lines if not line[:1].isspace()]
+
+
+def _docker_commands(code):
+    """Each docker command of these shell lines (a ``docker`` word wherever it stands, a ``$ `` prompt or a
+    comment before it included): its words, up to the end of that command."""
+    for line in re.sub(r"\\\n\s*", " ", "\n".join(code)).splitlines():
+        line = _PLACEHOLDER.sub("PLACEHOLDER", line)
+        for found in _DOCKER.finditer(line):
+            tail = line[found.start():]
+            try:
+                lexer = shlex.shlex(tail, posix=True, punctuation_chars=True)
+                lexer.whitespace_split = True
+                words = list(lexer)
+            except ValueError:
+                words = [word.strip("'\"") for word in tail.split()]
+            yield list(itertools.takewhile(lambda word: not set(word) <= set("();<>|&"), words))
+
+
+def _flags(options):
+    """pflag-style: whether docker options detach, set a variable or leave the container after exit, and the
+    values of their --env-file and --entrypoint."""
+    detached, variables, removed = False, False, False
+    values, i = {"--env-file": [], "--entrypoint": []}, 0
+    while i < len(options):
+        name, eq, value = options[i].partition("=")
+        if name in values:
+            if not eq:
+                i += 1
+                value = options[i] if i < len(options) else ""
+            values[name].append(value)
+        elif name.startswith("--"):
+            detached |= name == "--detach"
+            variables |= name == "--env"
+            removed = removed if name != "--rm" else not eq or value.lower() in ("true", "1")
+        elif name.startswith("-"):
+            for flag in options[i][1:]:
+                detached |= flag == "d"
+                variables |= flag == "e"
+                if flag in "acehlmpuvw":  # takes a value: the rest of the word, or the next one
+                    break
+        i += 1
+    return detached, variables, removed, values
+
+
+def _starts_a_service(words):
+    return any(word.lower() == "serve" or "order-control" in word.lower() or "reliquary.cli" in word.lower()
+               for word in words)
+
+
+def _not_one_shot(command):
+    """Why this docker command could start the rebuilt image as a service, or give it more than ``$R2_ENV``:
+    nothing when it starts no container, or runs ``"$IMG"`` removed on exit, attached, its entrypoint
+    replaced by ``python`` (a script on stdin, ``pip check`` or ``pip freeze``) or ``cat``, and given no
+    variable but ``--env-file "$R2_ENV"``."""
+    if command[:1] != ["docker"]:
+        return ["not a plain docker command"]
+    words = command[1:]
+    while words[:1] and words[0].startswith("-"):  # docker's own options
+        global_value = words[0] in {"-c", "--context", "-H", "--host", "--config", "-l", "--log-level"}
+        words = words[2:] if global_value else words[1:]
+    words = words[1:] if words[:1] == ["container"] else words
+    verb, words = (words[0], words[1:]) if words else ("", [])
+    if verb == "exec":
+        i = 0
+        while i < len(words) and words[i].startswith("-"):
+            i += 2 if words[i] in {"-e", "--env", "--env-file", "-u", "--user", "-w", "--workdir"} else 1
+        return ["detached"] * _flags(words[:i])[0] + ["starts a service"] * _starts_a_service(words[i + 1:])
+    if verb != "run":
+        return [] if verb in _STARTS_NOTHING else [f"docker {verb}"]
+    if "$IMG" not in words:
+        return ['runs no "$IMG"']
+    options, program = words[:words.index("$IMG")], words[words.index("$IMG") + 1:]
+    detached, variables, removed, values = _flags(options)
+    entrypoint = values["--entrypoint"][-1] if values["--entrypoint"] else None
+    plain = program[:1] == ["-"] or (program[:2] == ["-m", "pip"] and program[2:3] in (["check"], ["freeze"]))
+    return (["not removed on exit"] * (not removed) + ["detached"] * detached + ["sets a variable"] * variables
+            + [f"--env-file {name}" for name in values["--env-file"] if name != "$R2_ENV"]
+            + [f"entrypoint {entrypoint}"] * (entrypoint not in ("python", "cat"))
+            + ["python runs neither stdin nor pip check/freeze"] * (entrypoint == "python" and not plain)
+            + ["starts a service"] * _starts_a_service(program))
+
+
+def _one_shot_violations(runbook, docstring):
+    """How many docker runs the runbook's "Before switching" section and the seal check's docstring each show,
+    and those of their docker commands that are not one-shot, with why. Their code is every fenced block or
+    literal block and every inline code span; a ``docker`` word anywhere else (an indented block, plain prose)
+    is refused, so no command escapes the check by its markup."""
+    runs, violations = [], {}
+    for code, prose in (_markdown_section(runbook, _BEFORE_SWITCHING), _docstring_parts(docstring)):
+        text = "\n".join(prose)
+        violations.update({line.strip(): ["docker outside code"]
+                           for line in _INLINE_CODE.sub("", text).splitlines() if _DOCKER.search(line)})
+        spans = [span.replace("\n", " ") for _, span in _INLINE_CODE.findall(text)]
+        commands = list(_docker_commands(code + spans))
+        runs.append(sum(command[1:2] == ["run"] for command in commands))
+        violations.update({" ".join(command): problems for command in commands
+                           if (problems := _not_one_shot(command))})
+    return runs, violations
+
+
+def _runbook_and_seal_docstring():
+    return (Path("docs/runbooks/order-control.md").read_text(),
+            ast.get_docstring(ast.parse(Path("scripts/seal_check_admin.py").read_text())))
+
+
 def test_a_rebuilt_order_control_image_is_checked_only_in_one_shot_containers():
-    """The image's entrypoint is the order control itself: before the switch, every container of it the runbook
-    or the seal check starts is removed on exit and runs a plain program in place of that entrypoint, so no
-    second control or admin starts on the production bucket and registry."""
-    import ast
-    import re
-    from pathlib import Path
+    """The image's entrypoint is the order control itself: before the switch, every container of it the runbook's
+    "Before switching" section or the seal check's docstring starts, in any code block or inline code, is removed
+    on exit, attached, runs python or cat in place of that entrypoint, starts no service and is given no variable
+    but the bucket ones of ``$R2_ENV``, so no second control or admin starts on the production bucket. The next
+    tests show the check refusing each way out."""
+    runs, violations = _one_shot_violations(*_runbook_and_seal_docstring())
+    assert all(runs), runs
+    assert violations == {}
 
-    def docker_runs(text):
-        joined = re.sub(r"\\\n\s*", " ", text)
-        return [line[line.index("docker run"):].split() for line in joined.splitlines() if "docker run" in line]
 
-    runbook = Path("docs/runbooks/order-control.md").read_text()
-    section = runbook.split("\n## Before switching the admin or the order control\n", 1)[1].split("\n## ", 1)[0]
-    from_runbook = [run for block in re.findall(r"```bash\n(.*?)```", section, re.S) for run in docker_runs(block)]
-    from_script = docker_runs(ast.get_docstring(ast.parse(Path("scripts/seal_check_admin.py").read_text())))
-    assert from_runbook and from_script
-    for run in from_runbook + from_script:
-        assert "--rm" in run and "--entrypoint" in run, run
-        assert run[run.index("--entrypoint") + 1] in {"python", "cat"}, run
+_SERVICE_STARTS = [
+    'docker run --rm --env-file /srv/admin.env --entrypoint python "$IMG" -m reliquary.cli.main corpus order-control'
+    ' --port 8791',
+    'docker run -d --rm --env-file /srv/admin.env -e RELIQUARY_ORDER_CAP_SIZING=on --entrypoint python "$IMG"'
+    ' -m reliquary.cli.main admin serve',
+    'docker run -d --env-file /srv/admin.env "$IMG"',
+]
+_MARKDOWN_PLACES = {
+    "bash": "```bash\n{}\n```",
+    "sh": "```sh\n{}\n```",
+    "shell": "```shell\n{}\n```",
+    "console": "```console\n$ {}\n```",
+    "unlabelled": "```\n{}\n```",
+    "fence in a list item": "1. Then:\n   ```sh\n   {}\n   ```",
+    "tilde": "~~~\n{}\n~~~",
+    "inline": "Then start it with `{}`.",
+    "indented block": "Then:\n\n    {}",
+    "plain prose": "Then start it with {}.",
+}
+
+
+@pytest.mark.parametrize("place", sorted(_MARKDOWN_PLACES))
+@pytest.mark.parametrize("command", _SERVICE_STARTS)
+def test_the_runbook_check_refuses_a_container_that_could_start_a_service(command, place):
+    runbook, docstring = _runbook_and_seal_docstring()
+    block = _MARKDOWN_PLACES[place].format(command)
+    runbook = runbook.replace(f"{_BEFORE_SWITCHING}\n", f"{_BEFORE_SWITCHING}\n\n{block}\n", 1)
+    assert _one_shot_violations(runbook, docstring)[1]
+
+
+@pytest.mark.parametrize("place", ["\n\n    {}\n", "\n\nRun ``{}``.\n", "\n\nRun {}.\n"])
+@pytest.mark.parametrize("command", _SERVICE_STARTS)
+def test_the_docstring_check_refuses_a_container_that_could_start_a_service(command, place):
+    runbook, docstring = _runbook_and_seal_docstring()
+    assert _one_shot_violations(runbook, docstring + place.format(command))[1]
+
+
+@pytest.mark.parametrize("command,why", [
+    ('docker run --rm -itd --entrypoint python "$IMG" -', "detached"),
+    ('docker run --rm --detach --entrypoint python "$IMG" -', "detached"),
+    ('docker run --rm --entrypoint python -e HF_TOKEN "$IMG" -', "sets a variable"),
+    ('docker run --rm --entrypoint python --env=X=1 "$IMG" -', "sets a variable"),
+    ('docker run --rm --entrypoint python -eX=1 "$IMG" -', "sets a variable"),
+    ('docker run --entrypoint python "$IMG" -', "not removed on exit"),
+    ('docker run --rm=false --entrypoint python "$IMG" -', "not removed on exit"),
+    ('docker run --rm --entrypoint python --env-file=/srv/admin.env "$IMG" -', "--env-file /srv/admin.env"),
+    ('docker run --rm --entrypoint python --env-file "$R2_ENV" --env-file /srv/admin.env "$IMG" -',
+     "--env-file /srv/admin.env"),
+    ('docker run --rm "$IMG"', "entrypoint None"),
+    ('docker run --rm --entrypoint sh "$IMG" -c "reliquary corpus order-control"', "entrypoint sh"),
+    ('docker run --rm --entrypoint=reliquary "$IMG" admin serve', "starts a service"),
+    ('docker run --rm --entrypoint python "$IMG" -m uvicorn reliquary.admin.service:app',
+     "python runs neither stdin nor pip check/freeze"),
+    ('docker run --rm --entrypoint python <the rebuilt image> -', 'runs no "$IMG"'),
+    ('docker container run -d --rm --entrypoint python "$IMG" -', "detached"),
+    ('docker --context prod run -d --rm --entrypoint python "$IMG" -', "detached"),
+    ('sudo docker run -d --rm --entrypoint python "$IMG" -', "detached"),
+    ('docker run --rm -i \\\n  -d --entrypoint python "$IMG" -', "detached"),
+    ('git show c:s.py | docker run --rm -i --entrypoint python "$IMG" - && docker run -d "$IMG"', "detached"),
+    ('docker exec -d <admin container> python -m reliquary.cli.main admin serve', "detached"),
+    ('docker exec -u root <admin container> python -m reliquary.cli.main admin serve', "starts a service"),
+    ("docker create --entrypoint python \"$IMG\" -", "docker create"),
+    ("docker start order-control", "docker start"),
+    ("docker compose up -d", "docker compose"),
+    ("docker-compose up -d", "not a plain docker command"),
+    ('"$(command -v docker)" run -d "$IMG"', "not a plain docker command"),
+])
+def test_each_way_out_of_a_one_shot_container_is_refused(command, why):
+    runbook, docstring = _runbook_and_seal_docstring()
+    runbook = runbook.replace(f"{_BEFORE_SWITCHING}\n", f"{_BEFORE_SWITCHING}\n\n```bash\n{command}\n```\n", 1)
+    assert why in [problem for problems in _one_shot_violations(runbook, docstring)[1].values()
+                   for problem in problems]
 
 
 # -- M3. reopening is off unless asked -----------------------------------------------
