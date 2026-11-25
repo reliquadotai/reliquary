@@ -17,7 +17,8 @@ the book) and the corpus thresholds below.
 * STANDING, from the hotkey's own sessions in the book (the last 24 h; the book is restored from the store at start):
   a session is decided USEFUL when it was submitted (and not handed back), WASTED when it closed unpaid (expired,
   box failed, budget exhausted, a failed open, a withdrawal) or lapsed, and NEUTRAL when it was aborted (machine-
-  signed) or voided (a drain: ours). Fewer than ``MIN_DECIDED`` decided sessions: a NEWCOMER (unless already
+  signed), voided (a drain: ours) or its failed open was ours (``OURS_OPEN_FAULTS``: the gateway's verified signed
+  refusal, or an open answer our restart lost, recorded by the issuer, never on the miner's word). Fewer than ``MIN_DECIDED`` decided sessions: a NEWCOMER (unless already
   ``NEWCOMER_EXIT_DECIDED`` decided at or below the yield floor: LOW_YIELD). Otherwise LOW_YIELD at or below
   ``YIELD_FLOOR``, else MAIN. A MAIN hotkey with no useful session in the window is back among the newcomers.
 * WEIGHT of a MAIN hotkey: its useful held session-seconds over the window (24 h, or the hotkey's age in the book
@@ -103,6 +104,12 @@ GROUP = 1                      # a corpus session is its own group (rl_capacity'
 
 USEFUL, WASTED, NEUTRAL = "useful", "wasted", "neutral"
 
+
+def ours_open_fault(record: Any) -> bool:
+    """Whether the issuer recorded this session's failed open as ours (``SessionIssuer.close``)."""
+    fault = str(getattr(record, "fault", None) or "")
+    return fault.startswith("open_refused:") or fault == "validator_restarted"
+
 FLEET_REFUSALS_WINDOW_S = 600  # the fleet-full refusals kept per job (``fleet_refusals``)
 FORECAST_WINDOW_S = 6 * 3600   # declarations kept (a later job of the same model forecasts from them)
 
@@ -115,7 +122,7 @@ def outcome(record: Any) -> str | None:
     if state in (ABORTED, VOIDED):
         return NEUTRAL
     if state in (CLOSED, LAPSED):
-        return WASTED
+        return NEUTRAL if ours_open_fault(record) else WASTED
     return None
 
 
@@ -466,4 +473,5 @@ class CorpusQuota:
                             for k, lane in self._lanes.items()}}
 
 
-__all__ = ["FORECAST_WINDOW_S", "CorpusQuota", "multiplier", "outcome", "standing", "stats_of", "weight"]
+__all__ = ["FORECAST_WINDOW_S", "CorpusQuota", "multiplier", "ours_open_fault", "outcome", "standing", "stats_of",
+           "weight"]

@@ -332,7 +332,10 @@ def build_sandbox_services(config: SandboxValidatorConfig, *, validator_hotkey: 
         signer=signer, token_verifier=token_verifier,
         engagements={"corpus": CorpusEngagements(view, book, clock),
                      "rl_precommit": RlPrecommitEngagements()},
-        policy=policy, clock=clock, quota=quota)
+        policy=policy, clock=clock, quota=quota,
+        # 2026-11-24: a warming gateway refused 7 opens with its signed receipt in an hour, each charged to
+        # the miner's yield as a failed open of its own.
+        record_open_refusals=True, open_refusal_check=fleet.open_refusal_valid)
     fleet.on_drained = issuer.void_machine
     router = build_sandbox_sessions_router(
         issuer, policy=policy, validator_hotkey=validator_hotkey, prefix=route_prefix,

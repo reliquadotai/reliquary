@@ -166,8 +166,8 @@ def test_a_pool_abort_caused_by_others_counts_toward_no_cap_and_frees_the_engage
     assert pool_abort_fault(own) is None                                  # the miner's own: an ordinary abort
 
 
-def test_only_the_rl_runner_forwards_a_receipt():                          # the corpus wire stays
-    assert SignedSweEpisodeRunner.forwards_open_refusal is False
+def test_both_runners_forward_a_receipt():
+    assert SignedSweEpisodeRunner.forwards_open_refusal is True
     assert RlSignedEpisodeRunner.forwards_open_refusal is True
 
 
@@ -190,12 +190,40 @@ def test_a_proven_runtime_start_failure_is_recorded(tmp_path, monkeypatch):
 
 
 def test_without_record_faults_nothing_is_recorded(tmp_path):
-    env = build(tmp_path)                                                   # the corpus issuer's settings
+    env = build(tmp_path)                                                   # the issuer's defaults
     env.issuer._open_refusal_check = lambda receipt, record: True
     grant = open_(env, 0)
     close_failed(env, grant, RECEIPT)
     assert env.book.get(grant.session_id).fault is None
     assert "fault" not in env.issuer._store.documents[grant.session_id]
+
+
+def test_the_corpus_issuer_records_only_a_failed_opens_fault(tmp_path, monkeypatch):
+    env = build(tmp_path)
+    env.issuer._record_open_refusals = True                                 # the corpus issuer's settings
+    env.issuer._open_refusal_check = lambda receipt, record: receipt["signature"] == "sig"
+    refused, forged, worded = open_(env, 0), open_(env, 1, request_id="b" * 32), open_(env, 2, request_id="c" * 32)
+    close_failed(env, refused, RECEIPT)
+    close_failed(env, forged, {**RECEIPT, "signature": "forged"})
+    close_failed(env, worded)
+    assert env.book.get(refused.session_id).fault == "open_refused:no_free_slot"
+    assert env.issuer._store.documents[refused.session_id]["fault"] == "open_refused:no_free_slot"
+    assert env.book.get(forged.session_id).fault is None                   # the miner's word only
+    assert env.book.get(worded.session_id).fault is None
+    real = sessions_module.verify_transcript
+
+    def failing_runtime(*args, **kwargs):
+        result = real(*args, **kwargs)
+        final = result.final.to_dict()
+        final["grading"] = {**(final.get("grading") or {}), "_grader": {"runtime_exec_failed": True}}
+        return SimpleNamespace(ok=result.ok, claims=result.claims, reasons=result.reasons,
+                               final=SimpleNamespace(status=result.final.status, to_dict=lambda: final))
+
+    monkeypatch.setattr(sessions_module, "verify_transcript", failing_runtime)
+    graded = open_(env, 3, request_id="d" * 32)
+    close(env, graded, "graded")
+    record = env.book.get(graded.session_id)
+    assert record.fault is None and record.ended_at is None                # the RL issuer's records only
 
 
 def test_the_close_request_carries_a_receipt_only_with_a_failed_open():

@@ -184,6 +184,9 @@ def test_services_sign_with_the_configured_key_and_mount_the_route(tmp_path):
     paths = {route.path for route in services.router.routes}
     assert paths == {"/corpus/sandbox/sessions", "/corpus/sandbox/sessions/{session_id}/close"}
     assert services.fleet.on_drained == services.issuer.void_machine
+    # A failed open of ours is recorded (the gateway's signed refusal), nothing else the RL issuer records.
+    assert services.issuer._record_open_refusals and not services.issuer._record_faults
+    assert services.issuer._open_refusal_check == services.fleet.open_refusal_valid
     asyncio.run(services.start())
     background = services.background()
     assert len(background) == 2

@@ -940,6 +940,7 @@ class SessionIssuer:
                  clock: Callable[[], float] = time.time,
                  new_session_id: Callable[[], str] = lambda: uuid.uuid4().hex,
                  events: SessionEvents | None = None, record_faults: bool = False,
+                 record_open_refusals: bool = False,
                  open_refusal_check: Callable[[Mapping[str, Any], SessionRecord], bool | None] | None = None,
                  queue=None, operator_of: Callable[[str], str | None] | None = None,
                  entitled: Callable[[str], int] | None = None, quota=None) -> None:
@@ -964,6 +965,9 @@ class SessionIssuer:
         # The RL wiring's listeners and fault records (a corpus issuer has neither: its records keep their bytes).
         self._events = events
         self._record_faults = bool(record_faults)
+        # The corpus issuer records only a failed open's fault (a signed refusal, an answer our restart lost): its
+        # miner's quota and draw lease are then not charged for it (``corpus_quota``, ``corpus_lease_faults``).
+        self._record_open_refusals = bool(record_open_refusals)
         # A gateway's signed open refusal of a session: True verified, False not, None cannot judge now.
         self._open_refusal_check = open_refusal_check
         # The RL open queue (``open_queue.OpenQueue``): opens finding no room wait there, outside the lock. A corpus
@@ -1526,6 +1530,7 @@ class SessionIssuer:
         (``open_refused:<reason>``; a receipt that cannot be judged now is refused ``directory_unavailable``,
         retryably), a failed open whose answer our restart lost (``validator_restarted``), a proven runtime
         start failure (``runtime_exec_failed``) and a grading-pool abort caused by others (``grading_pool``).
+        With ``record_open_refusals`` (the corpus issuer), only the two faults of a failed open are.
         A withdrawal never records one."""
         withdraw = reason == WITHDRAW
         closable = (LIVE, CLOSED_GRADED) if withdraw else (LIVE,)
@@ -1554,7 +1559,7 @@ class SessionIssuer:
         final, fault = None, None
         if reason == "open_failed":
             status = "open_failed"
-            if self._record_faults:
+            if self._record_faults or self._record_open_refusals:
                 verdict = (None if open_refusal is None or self._open_refusal_check is None
                            else self._open_refusal_check(open_refusal, record))
                 if open_refusal is not None and self._open_refusal_check is not None and verdict is None:
