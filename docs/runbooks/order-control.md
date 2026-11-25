@@ -69,11 +69,14 @@ docker buildx imagetools inspect \
 
 The next block builds from that digest and pushes. Its first three commands are a guard, joined to the build by
 `&&`: the build runs only in a repository that holds `<commit>`, whose HEAD is that commit, and where
-`git status --porcelain --ignored --untracked-files=all` prints nothing. Without it, the block run after a failed
-clone or checkout would build another tree, and `.build-revision` would still say `<commit>`. The first command is
-what stops the block outside any repository, where both sides of the comparison would be empty, and so equal. When
-the guard passes it prints that commit and nothing else, so a block that stops after it, non-zero, with no build
-output, ran at another HEAD or where `git status` shows a file. Keep the wheels' directory outside the clone, where
+`git status --porcelain --ignored --untracked-files=all` prints nothing, on stdout or stderr. Without it, the block
+run after a failed clone or checkout would build another tree, and `.build-revision` would still say `<commit>`.
+The first command is what stops the block outside any repository, where both sides of the comparison would be
+empty, and so equal. The `2>&1` stops it where `git status` fails inside one (on a corrupt index, say): it writes
+its error to stderr and nothing to stdout, an empty string that `test -z` would otherwise take for a clean tree.
+When the guard passes it prints that commit and nothing else, so a block that stops after it, non-zero, with no
+build output, ran at another HEAD, or where `git status` prints a file, a warning or an error, which the guard
+keeps off the screen: run that `git status` by hand to see it. Keep the wheels' directory outside the clone, where
 `git status` would show it. `--load` puts the image in the local image store whatever builder `docker build` uses:
 with a `docker-container` builder, or with `BUILDX_NO_DEFAULT_LOAD=1`, a build without it passes, loads nothing and
 ends 0, and the push then publishes whatever image last had that tag. The push, which runs only after a build that
@@ -82,7 +85,7 @@ succeeded, prints the digest of the image to check and to switch to:
 ```bash
 git rev-parse --verify '<commit>^{commit}' &&
   test "$(git rev-parse HEAD)" = "$(git rev-parse --verify '<commit>^{commit}')" &&
-  test -z "$(git status --porcelain --ignored --untracked-files=all)" &&
+  test -z "$(git status --porcelain --ignored --untracked-files=all 2>&1)" &&
   docker build --load -f docker/Dockerfile.order-control --progress=plain \
     --build-arg BASE_IMAGE=ghcr.io/reliquadotai/reliquary-validator@sha256:<that digest> \
     --build-context envs=<directory holding exactly the four reviewed wheels> \
@@ -390,14 +393,23 @@ control:
    by `&&`: the stop then runs only once the update has succeeded. Run as two commands, a failed update would leave
    the old policy on the stopped container, and step 3's check does not show the policy. For the admin, run step
    5's queries again now, before the new container starts, and write down any new row.
+
+   If the block ends non-zero, stop here, before step 3's rename: renamed while it may still run, the old container
+   would go on serving under another name. A failed update has changed nothing, and the stop has not run. After a
+   failed stop the policy is `no`, and the container may have stopped all the same: for the admin, run step 5's
+   queries again, as after a stop. Then fix the cause and run step 2 again, or call the switch off: give the old
+   container back the policy step 1 wrote down and start it,
+   `docker update --restart=<Name> <old container> && docker start <old container>`, with `<Name>` as in step 3
+   (`docker start` leaves a container that still runs as it is).
 3. A stopped container keeps its name: rename it, which keeps it and its settings for a rollback, and check that
    the renamed container is the one step 1 wrote down, and has exited:
    ```bash
    docker rename <old container> <old container>-before-switch
    docker inspect --format '{{.Id}} {{.State.Status}}' <old container>-before-switch
    ```
-   It must print the ID step 1 wrote down and `exited`. Only then start the new container from `$IMG`, under the
-   old name, with the restart policy step 1 wrote down, not `no`: `--restart=<Name>`, with
+   It must print the ID step 1 wrote down and `exited`. If it prints anything else, start nothing: rename the
+   container back if the rename succeeded, and find out why. Once it prints both, start the new container from
+   `$IMG`, under the old name, with the restart policy step 1 wrote down, not `no`: `--restart=<Name>`, with
    `on-failure:<MaximumRetryCount>` in place of `<Name>` when that count is not 0, and `no` only when the name is
    `no` or empty. Every other setting comes from the deployment's own options and env file, for the admin its
    entrypoint and command too (the image's `ENTRYPOINT` is the order control), never from a `docker inspect` of
@@ -409,12 +421,17 @@ A rollback is the same switch, back: steps 1 and 2 on the new container (with st
 the stop, for the admin), then its rename and check as in step 3, under another free name. Then give the old
 container its name back and the restart policy step 1 wrote down, and start it:
 ```bash
-docker rename <old container>-before-switch <old container>
-docker update --restart=<Name> <old container>
-docker start <old container>
+docker rename <old container>-before-switch <old container> &&
+  docker update --restart=<Name> <old container> &&
+  docker start <old container>
 ```
 with `on-failure:<MaximumRetryCount>` in place of `<Name>` when that count is not 0, and `no` when the name is
-empty.
+empty. Keep the three commands joined by `&&`: run one by one, they end 0 even when the rename or the update fails.
+After a failed update (a mistyped policy, say), the start would still run, and leave the old container with the
+policy `no` the switch gave it, so that after a reboot it stays down. After a failed rename (the name still held by
+the new container, whose own rename was skipped or failed), the update and the start would act on the new
+container, which would run again with the old policy. If the block stops at the update or the start, the rename
+has run: run the two commands after it again, still joined by `&&`.
 
 ## Run
 
