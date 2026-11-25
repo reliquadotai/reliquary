@@ -630,7 +630,7 @@ def test_a_quarantine_voids_a_repeated_drift_without_charging_its_miner(monkeypa
     monkeypatch.setattr(auditor, "_judge_many", refuse)
     voided = asyncio.run(remote.listeners[0]("pod-1"))
     assert audits == [["5Drift", "5Cheat"], ["5Drift"], ["5Cheat"]]  # each refusal audited twice
-    # Both withdrawn and returned: the eval auditor reopens their slots (`EvalAuditor.reaudit_executor`).
+    # Both withdrawn and returned; the eval auditor reopens their slots (`EvalAuditor._reopen_reaudited`).
     assert voided == [drift, cheat] and set(records.voided) == {drift, cheat}
     assert records.voided[drift]["penalty"] is False
     kept = states.states["5Drift"]
@@ -743,7 +743,7 @@ def test_a_later_forfeit_does_not_void_a_reaudited_drift_again(monkeypatch):
 
 
 def test_an_eval_auditor_reopens_a_reaudited_drift_in_its_ledger_once(monkeypatch):
-    """The eval auditor reopens every id its re-audit returns in its own ledger (`EvalAuditor.reaudit_executor`):
+    """The eval auditor reopens every pass its re-audit voids in its own ledger (`EvalAuditor._reopen_reaudited`):
     the base re-audit's reopen of a drift adds no second ledger write there."""
     from reliquary.validator import corpus_service, eval_control
     from tests.unit.test_eval_draw import _job as draw_job
@@ -774,6 +774,54 @@ def test_an_eval_auditor_reopens_a_reaudited_drift_in_its_ledger_once(monkeypatc
     monkeypatch.setattr(auditor, "_audit_outcomes", refuse)
     assert asyncio.run(auditor.reaudit_executor("pod-1")) == [drift]
     assert records.voided[drift]["penalty"] is False and ledger == [drift]
+
+
+@pytest.mark.parametrize("fails", [True, False])
+def test_an_eval_auditor_reopens_each_drift_as_soon_as_its_void_is_written(monkeypatch, fails):
+    """Each drift's slot reopens in the eval auditor's ledger as soon as its void is written, before the status
+    hears of it; a charged refusal's once every void is written, as before. ``fails``: the last void write raises
+    (a store PUT failing after its retries), which stops the re-audit (the quarantine's listener only logs it):
+    the drift voided before it does not wait for the next start's reconcile."""
+    from reliquary.validator import corpus_service, eval_control
+    from tests.unit.test_eval_draw import _job as draw_job
+
+    job = draw_job()
+    first, cheat, second = "c" * 64, "d" * 64, "e" * 64
+    events = []
+
+    class _FailingRecords(_VoidingRecords):
+        async def write_voided(self, job_id, sid, document):
+            if fails and sid == second:
+                raise OSError("store PUT failed after its retries")
+            return await super().write_voided(job_id, sid, document)
+
+    records = _FailingRecords({sid: {"hotkey": hotkey, "token_count": 10, "prompt_index": job.prompt_start,
+                                     "cursor": 0}
+                               for sid, hotkey in ((first, "5Drift"), (cheat, "5Cheat"), (second, "5Drift"))})
+
+    async def record_prompt_failure(store, job, prompt_index, submission_id, **slot):
+        events.append(("reopen", submission_id))
+        return True
+
+    monkeypatch.setattr(corpus_service, "record_prompt_failure", record_prompt_failure)
+    auditor = eval_control.eval_auditor(job_id=job.job_id, records=records, tokenizer=None, proof=PROOF,
+                                        vocab_size=10, job=job, job_store=object(), reopen_slots=True,
+                                        draw_job=job, on_voided=lambda sid, document: events.append(("voided", sid)))
+    auditor._remote_scored["pod-1"] = [first, cheat, second]
+
+    async def refuse(batch, *, local=False):
+        return [{**_DRAW_REFUSAL, **({"penalty": False} if r["hotkey"] == "5Drift" else {})} for r in batch]
+
+    monkeypatch.setattr(auditor, "_audit_outcomes", refuse)
+    if fails:
+        with pytest.raises(OSError):
+            asyncio.run(auditor.reaudit_executor("pod-1"))
+        assert events == [("reopen", first), ("voided", first), ("voided", cheat)]
+        assert set(records.voided) == {first, cheat}
+    else:
+        assert asyncio.run(auditor.reaudit_executor("pod-1")) == [first, cheat, second]
+        assert events == [("reopen", first), ("voided", first), ("voided", cheat), ("reopen", second),
+                          ("voided", second), ("reopen", cheat)]
 
 
 _PASSING = {"passed": True, "worst_exp": 0, "worst_mant_mean": 0.0, "worst_mant_median": 0.0}

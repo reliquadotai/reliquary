@@ -1807,6 +1807,15 @@ class CorpusAuditor:
                 self._paid.setdefault(verdict.get("hotkey"), []).append((float(verdict["received_at"]), sid))
         self._paid_loaded = True
 
+    async def _reopen_reaudited(self, submission_ids: Sequence[str], *, charged: bool) -> None:
+        """Called by the re-audit (`reaudit_executor`) with each pass it voids uncharged, as soon as its void is
+        written, then with the charged ones once every void is. Here only an uncharged one's slot reopens, as a
+        judging pass reopens a refused sample's (`_write`); a charged one's reopens with its forfeit (q < 1,
+        unsettled) or at the next start's reconcile. Never raises."""
+        if not charged:
+            for submission_id in submission_ids:
+                await self._reopen_slot(submission_id)
+
     async def reaudit_executor(self, executor_id: str) -> list[str]:
         """Re-audit on this GPU every pass written from a quarantined executor's
         scores that is unsettled or settled inside the hold window. A failure
@@ -1874,19 +1883,19 @@ class CorpusAuditor:
                         # void. A forfeit may have voided it already (a charged failure of its hotkey or operator
                         # received after it, in this re-audit or in a concurrent judging pass): the void above is
                         # then refused (create-only), and the reopen is idempotent.
-                        # `_reopen_slot`, not `_reopen_slots`: an EvalAuditor reopens every returned id in its own
-                        # ledger already.
                         if self._voided_ids is not None:
                             self._voided_ids.add(sid)
                         hotkey = records[sid]["hotkey"]
                         if hotkey in self._paid:
                             self._paid[hotkey] = [paid for paid in self._paid[hotkey] if paid[1] != sid]
                         self._unstake(sid)
-                        await self._reopen_slot(sid)
+                        await self._reopen_reaudited([sid], charged=False)
                     self._report_voided(sid, document)
         logger.warning("corpus job %s: re-audited %d pass(es) scored by quarantined executor "
                        "%s; %d failed (%d uncharged)", self._job_id, len(ids), executor_id, len(failed),
                        sum(1 for outcome in failed.values() if not outcome.get("penalty", True)))
+        await self._reopen_reaudited(sorted(sid for sid, outcome in failed.items() if outcome.get("penalty", True)),
+                                     charged=True)
         return sorted(failed)
 
     async def _randomness_for(self, round_number: int) -> str | None:
