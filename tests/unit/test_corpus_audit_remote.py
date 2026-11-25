@@ -598,6 +598,41 @@ def test_a_quarantine_reaudits_every_pass_its_executor_scored_and_penalises_the_
     assert archives.written == {} and records.state["settled"] == [cheat]
 
 
+def test_a_quarantine_voids_a_repeated_drift_without_charging_its_miner(monkeypatch):
+    """A forced-draw refusal without penalty (kernel drift, ``eval_draw.judge``) that the second audit repeats
+    is no confirmed failure, as in a judging pass: its pass is voided, as that pass would have refused it, and
+    its miner is left alone. A refusal with penalty is still charged."""
+    from reliquary.validator.corpus_auditor import CorpusAuditor
+
+    model = _tiny(0)
+    drift, cheat = "a" * 64, "b" * 64
+    records = _VoidingRecords({drift: {**_record(model), "hotkey": "5Drift"},
+                               cheat: {**_record(model), "hotkey": "5Cheat"}})
+    states = _States()
+    remote = _AlwaysConnected(model, lie_pass=True)
+    auditor = CorpusAuditor(job_id="j", records=records, model=model, tokenizer=_Tokenizer(),
+                            proof=PROOF, remote=remote, miner_states=states, clock=_Clock(100_000.0))
+    asyncio.run(auditor.audit_many([drift, cheat]))
+    assert all(records.verdicts[s]["passed"] for s in (drift, cheat))
+    refusal = {"passed": False, "reason": "draw_mismatch", "forced_draw": {"max_gap": 5.3}}
+    audits = []
+
+    def refuse(batch):
+        audits.append([r["hotkey"] for r in batch])
+        return [{**refusal, **({"penalty": False} if r["hotkey"] == "5Drift" else {})} for r in batch]
+
+    monkeypatch.setattr(auditor, "_judge_many", refuse)
+    voided = asyncio.run(remote.listeners[0]("pod-1"))
+    assert audits == [["5Drift", "5Cheat"], ["5Drift"], ["5Cheat"]]  # each refusal audited twice
+    # Both withdrawn and returned: the eval auditor reopens their slots (`EvalAuditor.reaudit_executor`).
+    assert voided == [drift, cheat] and set(records.voided) == {drift, cheat}
+    assert records.voided[drift]["penalty"] is False
+    kept = states.states["5Drift"]
+    assert kept.confirmed_failures == [] and kept.suspect_until is None and kept.audited_passed == 1
+    charged = states.states["5Cheat"]
+    assert charged.confirmed_failures and charged.suspect_until is not None and charged.audited_passed == 0
+
+
 def test_without_a_connected_executor_the_auditor_runs_locally():
     from reliquary.validator.corpus_auditor import CorpusAuditor
 

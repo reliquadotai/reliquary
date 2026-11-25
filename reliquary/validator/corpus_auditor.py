@@ -1764,7 +1764,9 @@ class CorpusAuditor:
         """Re-audit on this GPU every pass written from a quarantined executor's
         scores that is unsettled or settled inside the hold window. A failure
         (confirmed by a second audit, as §7.2 asks) is charged to its miner as
-        any failed audit is, and its submission is voided so it is not paid."""
+        any failed audit is, and its submission is voided so it is not paid. A
+        refusal without penalty (forced-draw drift) is voided uncharged, as a
+        judging pass refuses it uncharged (`_audit_records_in_pass`)."""
         # Its outcomes computed ahead are not taken either: those records are audited again by their pass.
         self._ahead = {sid: outcome for sid, outcome in self._ahead.items()
                        if executor_id not in (outcome.get("scored_by") or ())}
@@ -1794,9 +1796,13 @@ class CorpusAuditor:
                     failed[sid] = again
         if failed:
             by_hotkey: dict[str, list[str]] = {}
-            for sid in failed:
-                by_hotkey.setdefault(records[sid]["hotkey"], []).append(sid)
-            await self._escalate(by_hotkey, now, {sid: self._received(sid, records[sid]) for sid in failed})
+            for sid, outcome in failed.items():
+                # A refusal without penalty (forced-draw drift) is no confirmed failure: no suspicion, no ban,
+                # no forfeit. Still voided below: a judging pass would have refused it.
+                if outcome.get("penalty", True):
+                    by_hotkey.setdefault(records[sid]["hotkey"], []).append(sid)
+            if by_hotkey:
+                await self._escalate(by_hotkey, now, {sid: self._received(sid, records[sid]) for sid in failed})
             writer = getattr(self._records, "write_voided", None)
             for sid, outcome in failed.items():
                 if writer is not None:
@@ -1807,7 +1813,8 @@ class CorpusAuditor:
                     await writer(self._job_id, sid, document)
                     self._report_voided(sid, document)
         logger.warning("corpus job %s: re-audited %d pass(es) scored by quarantined executor "
-                       "%s; %d failed", self._job_id, len(ids), executor_id, len(failed))
+                       "%s; %d failed (%d uncharged)", self._job_id, len(ids), executor_id, len(failed),
+                       sum(1 for outcome in failed.values() if not outcome.get("penalty", True)))
         return sorted(failed)
 
     async def _randomness_for(self, round_number: int) -> str | None:
