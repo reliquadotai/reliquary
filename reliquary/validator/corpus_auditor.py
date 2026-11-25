@@ -1950,10 +1950,11 @@ class CorpusAuditor:
         then each worker takes the next ids of ``chosen`` in groups no larger than the room left in its slice at the
         size of the widest record the slice holds (an empty slice: the largest of the last group read;
         READ_CONCURRENCY at most), and closes the slice once that room is under one such record. Each record read
-        joins the slice while it fits; the rest is left, in order, to the next slice any worker fills: a slice is
-        cut at most one group past its end. Every id is read once; an unreadable one joins no slice. At most
-        REAUDIT_SLICES_IN_FLIGHT slices' records are alive at once, besides what a group read past its slice. The
-        order the slices end in does not matter: the failures are returned in the order of ``chosen``."""
+        joins the slice while it fits; the rest is left to the next slice any worker fills: a slice is cut at most
+        one group past its end. Every id is read once; an unreadable one joins no slice. At most
+        REAUDIT_SLICES_IN_FLIGHT slices' records are alive at once, besides what a group read past its slice. A
+        slice's records need not be consecutive in ``chosen``, and the slices end in any order: the failures are
+        returned in the order of ``chosen``."""
         spare: deque[tuple[str, dict, int]] = deque()      # read past a slice, for the next: (id, record, size)
         position, largest, audited = 0, 0, 0
         confirmed: dict[str, tuple] = {}
@@ -2005,12 +2006,11 @@ class CorpusAuditor:
         return audited, {sid: confirmed[sid] for sid in chosen if sid in confirmed}
 
     async def _reaudit_slice(self, records: dict[str, dict]) -> tuple[int, dict[str, tuple]]:
-        """One slice of ``reaudit_executor``, read (id -> record, in the order of `chosen`; the dict is emptied once
-        their first audit is done): how many records it held, and each failure a second audit, of its record alone,
-        confirmed: (outcome, hotkey, receipt). Each pass it confirms, by its first audit or its second, is counted
-        here, in order, as a judging pass counts its final outcome (`_count_refusal`). A record that passes the first
-        audit, packed with its slice, is dropped then (its hotkey kept to be counted); one that fails it, once
-        audited alone."""
+        """One slice of ``reaudit_executor``, read (id -> record; the dict is emptied once their first audit is
+        done): how many records it held, and each failure a second audit, of its record alone, confirmed: (outcome,
+        hotkey, receipt). Each pass it confirms, by its first audit or its second, is counted here, as a judging pass
+        counts its final outcome (`_count_refusal`). A record that passes the first audit, packed with its slice, is
+        dropped then (its hotkey kept to be counted); one that fails it, once audited alone."""
         ids = list(records)
         if not ids:
             return 0, {}
