@@ -125,11 +125,14 @@ MIN_MEASURED_BUSY_SECONDS = 120.0
 # only after CLEAN_STREAK of them, so a card failing one call in two does not keep its work.
 LOST_RESULT_STRIKES = 2
 CLEAN_STREAK = 5
-# A batch one executor decides is parked once its lease expired unanswered this many times (one more per
-# extra scorer it needs, whose leases run at the same time): a batch no card answers (an item the executors
-# cannot read, a result the control cannot read) is the batch's fault, not the cards'. The loss that parks
-# it strikes nobody, and the strikes it gave other executors before are taken back (2026-11-25: every 9B
-# card was set aside about 98 s after loading, and the audits of the model stopped for a day).
+# A batch no card answers (an item the executors cannot read, a result the control cannot read) is the
+# batch's fault, not the cards' (2026-11-25: every 9B card was set aside about 98 s after loading, and the
+# audits of the model stopped for a day). A batch one executor decides is parked once its lease expired
+# unanswered on this many distinct executors, or this many times with one of them witnessed (one more per
+# extra scorer it needs, whose leases run at the same time). A loss is witnessed when its executor scored
+# another lease after this one was granted: it works, this batch does not, so it is not struck. The loss
+# that parks a batch strikes nobody. A card that answers nothing is struck for every loss, as before, so it
+# cannot get batches parked in its place.
 UNANSWERED_LOSSES_PARK = 2
 # An expired lease is remembered this long: its card answering late is slow, not lost.
 LATE_ANSWER_SECONDS = 900.0
@@ -367,9 +370,11 @@ class _Batch:
     protocol: str = AUDIT_PROTOCOL
     judge: Any = None
     reuse_auditors_only: bool = False
-    # Its leases that expired unanswered, and the executors struck for them (taken back when the batch
-    # is parked, or one by one when an executor answers late).
+    # Its leases that expired unanswered: how many, on which executors, how many witnessed, and the
+    # executors struck for them (taken back one by one when an executor answers late).
     losses: int = 0
+    lost_by: set[str] = field(default_factory=set)
+    witnessed: int = 0
     struck: list[str] = field(default_factory=list)
 
 
@@ -422,6 +427,8 @@ class PairedAuditDispatcher:
         # Per executor, the seconds per token of its last scored result: a card slower than the model's
         # median gets leases at its own pace at once, not after its late answers outnumber the fast ones.
         self._pace: dict[str, float] = {}
+        # Per executor, when it last delivered a scored result in time: a lease it lost after that is witnessed.
+        self._last_scored: dict[str, float] = {}
         self._seen: dict[str, float] = {}
         self._listeners: list[Callable[[str], Awaitable[Any]]] = []
         self._background: set[asyncio.Task] = set()
@@ -654,32 +661,37 @@ class PairedAuditDispatcher:
                        "still lost (its lease was the longest)" if full_length else "not counted lost")
         self._time(lease)
         if not full_length and lease.executor_id in batch.struck:
-            self._forgive(batch, lease.executor_id)
+            # Its expiry was no loss: the strike and the batch's count of it are taken back.
+            batch.struck.remove(lease.executor_id)
+            self._strikes[lease.executor_id] = max(0, self._strikes[lease.executor_id] - 1)
             batch.losses = max(0, batch.losses - 1)
-
-    def _forgive(self, batch: _Batch, executor_id: str | None = None) -> None:
-        """Take back the strikes ``batch`` gave (``executor_id``'s one only, when given)."""
-        for struck in list(batch.struck):
-            if executor_id is not None and struck != executor_id:
-                continue
-            batch.struck.remove(struck)
-            self._strikes[struck] = max(0, self._strikes[struck] - 1)
-            if executor_id is not None:
-                return
+            if lease.executor_id not in batch.struck:
+                batch.lost_by.discard(lease.executor_id)
 
     async def _lost(self, lease: _Lease) -> None:
-        """A lease that expired unanswered. The batch's UNANSWERED_LOSSES_PARK-th such loss parks it and
-        strikes nobody; any other strikes its executor, set aside at ``_strikes_limit``."""
+        """A lease that expired unanswered: the batch is parked once its losses say no card can answer it
+        (``UNANSWERED_LOSSES_PARK``), and that loss strikes nobody; a witnessed loss strikes nobody either;
+        any other strikes its executor, set aside at ``_strikes_limit``."""
         batch, executor_id = lease.batch, lease.executor_id
         self._expired[lease.lease_id] = lease
         batch.losses += 1
+        batch.lost_by.add(executor_id)
+        # Witnessed: the executor scored another lease after this one was granted, so it is alive and scoring.
+        witnessed = self._last_scored.get(executor_id, float("-inf")) > lease.granted_at
+        batch.witnessed += witnessed
         logger.warning("eval audit lease %s of batch %s (job %s, %d items) expired unanswered on executor %s "
-                       "(loss %d of the batch)", lease.lease_id[:8], batch.id, batch.job_id,
-                       len(batch.items), executor_id, batch.losses)
-        if batch.losses >= UNANSWERED_LOSSES_PARK + max(0, batch.needed - 1) and not batch.future.done():
-            self._forgive(batch)
+                       "(loss %d of the batch, %d executors%s)", lease.lease_id[:8], batch.id, batch.job_id,
+                       len(batch.items), executor_id, batch.losses, len(batch.lost_by),
+                       ", witnessed" if witnessed else "")
+        needed = UNANSWERED_LOSSES_PARK + max(0, batch.needed - 1)
+        if not batch.future.done() and (len(batch.lost_by) >= needed
+                                        or (batch.witnessed and batch.losses >= needed)):
             self.stats["unanswered_parked"] += 1
-            self._park(batch, f"its lease expired unanswered {batch.losses} times")
+            self._park(batch, f"its lease expired unanswered {batch.losses} times, on "
+                              f"{len(batch.lost_by)} executor(s)")
+            return
+        if witnessed:
+            self.stats["witnessed_losses"] += 1
             return
         self._strikes[executor_id] += 1
         self._clean[executor_id] = 0
@@ -718,6 +730,7 @@ class PairedAuditDispatcher:
             if self._clean[executor_id] >= CLEAN_STREAK:
                 self._strikes[executor_id] = 0
             self._time(lease)
+            self._last_scored[executor_id] = self._clock()
         if errored or batch.future.done():
             # The executor's own fault, or no longer needed: nobody is judged on it.
             self.stats["executor_errors" if not batch.future.done() else "late"] += 1

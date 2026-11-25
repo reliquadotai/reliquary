@@ -683,7 +683,7 @@ def test_a_slow_card_answering_late_is_not_set_aside_and_its_next_lease_fits():
     _run(go)
 
 
-def test_a_batch_no_card_answers_is_parked_and_strikes_nobody():
+def test_a_batch_two_cards_cannot_answer_is_parked_and_sets_no_card_aside():
     from reliquary.validator.eval_control import BatchParked
 
     async def go():
@@ -699,8 +699,56 @@ def test_a_batch_no_card_answers_is_parked_and_strikes_nobody():
             await h.dispatcher.sweep()
         with pytest.raises(BatchParked):
             await asyncio.wait_for(scoring, 1)
+        # The first loss could be the card's own; the second, on another card, parks the batch and strikes nobody.
         assert h.quarantined == []
-        assert h.dispatcher._strikes["a"] == 0 and h.dispatcher._strikes["b"] == 0
+        assert h.dispatcher._strikes["a"] == 1 and h.dispatcher._strikes["b"] == 0
+    _run(go)
+
+
+def test_a_card_scoring_other_batches_gets_the_one_it_cannot_answer_parked_and_is_not_struck():
+    from reliquary.validator.eval_control import BatchParked
+
+    async def go():
+        now = [0.0]
+        h = _Harness(scorers=1)
+        h.dispatcher._clock = lambda: now[0]
+        view = h.dispatcher.view(*MODEL_A, PROOF)
+        unanswerable = asyncio.ensure_future(view.score(ITEMS))
+        await asyncio.sleep(0)
+        for _ in range(2):
+            dropped = h.dispatcher.claim(_executor("a"))     # the card cannot read it, and claims again
+            other = asyncio.ensure_future(view.score(ITEMS))
+            await asyncio.sleep(0)
+            lease = h.dispatcher.claim(_executor("a"))
+            assert lease["lease_id"] != dropped["lease_id"]
+            now[0] += 10.0
+            assert await h.dispatcher.result("a", lease["lease_id"], _honest()) == "accepted"
+            await asyncio.wait_for(other, 1)
+            now[0] = dropped["expires_at"] + 1
+            await h.dispatcher.sweep()
+        with pytest.raises(BatchParked):
+            await asyncio.wait_for(unanswerable, 1)
+        assert h.quarantined == [] and h.dispatcher._strikes["a"] == 0
+    _run(go)
+
+
+def test_a_card_answering_nothing_cannot_get_its_batch_parked_and_is_still_set_aside():
+    """#493's lost card: taking the same batch twice and answering nothing must not park the batch in
+    its place."""
+    async def go():
+        now = [0.0]
+        h = _Harness(scorers=1)
+        h.dispatcher._clock = lambda: now[0]
+        scoring = asyncio.ensure_future(h.dispatcher.view(*MODEL_A, PROOF).score(ITEMS))
+        await asyncio.sleep(0)
+        for _ in range(2):
+            lease = h.dispatcher.claim(_executor("a"))
+            assert lease is not None
+            now[0] = lease["expires_at"] + 1
+            await h.dispatcher.sweep()
+        assert h.quarantined == ["a"]
+        assert not scoring.done()                            # the batch waits for a card that answers
+        scoring.cancel()
     _run(go)
 
 
