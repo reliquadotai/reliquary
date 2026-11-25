@@ -169,7 +169,7 @@ class _Router:
 
 
 class _Harness:
-    def __init__(self, entries, *, admit=None, wire_error=None, clock=None):
+    def __init__(self, entries, *, admit=None, wire_error=None, clock=None, screen=None):
         self.entries = entries
         self.routes = CorpusJobRoutes()
         self.wired, self.running, self.cancelled = [], [], []
@@ -178,6 +178,8 @@ class _Harness:
         self.wire_error = wire_error
         # Raised by the registry read, and by every manifest read.
         self.registry_error = self.read_error = None
+        # Awaited by every manifest read first: what a miner sees while a pass works on a job.
+        self.mid_pass = None
 
         async def wire(entry, cap, job):
             if self.wire_error is not None:
@@ -200,6 +202,8 @@ class _Harness:
             return {e.task_id: e for e in self.entries}
 
         async def read_job(job_id):
+            if self.mid_pass is not None:
+                await self.mid_pass()
             if self.read_error is not None:
                 raise self.read_error
             return _hot_job(job_id)
@@ -211,7 +215,7 @@ class _Harness:
             routes=self.routes, router_for=lambda w: _Router(w.entry.job_id), wire=wire,
             jobs_of=lambda w: [forever(f"audit:{w.entry.job_id}"), forever(f"settle:{w.entry.job_id}")],
             read_entries=read_entries, read_job=read_job,
-            admit=admit or (lambda entry, job: None), drained=drained,
+            admit=admit or (lambda entry, job: None), drained=drained, screen=screen,
             **({} if clock is None else {"clock": clock}),
         )
 
@@ -760,9 +764,20 @@ def test_a_job_that_fails_every_pass_is_unknown_again_after_its_attempts(caplog,
             for _ in range(RESTORE_ATTEMPTS - 1):
                 await h.set.refresh()
                 assert (await client.get("/corpus/jobs/swe-v1/job")).status_code == 503
+            retried = []
+
+            async def mid_pass():
+                retried.append(((await client.get("/corpus/jobs/swe-v1/job")).status_code,
+                                (await client.get("/corpus/jobs")).json()["orders"]))
+
             with caplog.at_level(logging.ERROR, logger="reliquary.validator.corpus_hot_jobs"):
                 await h.set.refresh()
+                h.mid_pass = mid_pass
                 await h.set.refresh()
+            # Given up: a pass retrying it does not make it `restoring` again while it runs, or a follower would
+            # see it listed in every pass and never miss it twice in a row.
+            assert retried == [(404, [])]
+            h.mid_pass = None
             unknown = await client.get("/corpus/jobs/swe-v1/job")
             assert unknown.status_code == 404 and unknown.json() == {"detail": "corpus_job_not_served"}
             assert (await client.get("/corpus/jobs")).json()["orders"] == []
@@ -791,6 +806,66 @@ def test_a_job_waited_for_since_the_start_is_unknown_again_after_restore_seconds
             await h.set.refresh()
             assert RESTORE_ATTEMPTS > 2
             assert (await client.get("/corpus/jobs/swe-v1/job")).status_code == 404
+
+    asyncio.run(go())
+
+
+def test_a_retry_starting_past_restore_seconds_keeps_its_job_restoring_until_it_is_wired():
+    # A restart's first pass fails after 14 minutes, and its retry starts 15 minutes after the start and wires the
+    # job in 3 more. That retry is the attempt that may wire it: while it runs the job answers 503 and is listed
+    # `restoring`. Given up as the retry started, it answered 404 and left the list while it was wired, and a
+    # follower reading the list then stopped its miner.
+    from reliquary.validator.corpus_hot_jobs import RESTORE_SECONDS
+
+    now = [1000.0]
+    restoring = [{"job_id": "swe-v1", "state": "restoring"}]
+
+    async def go():
+        h = _Harness([_hot_entry(job_id="swe-v1")], wire_error=OSError("r2 timeout"), clock=lambda: now[0])
+        seen = []
+        async with h.client() as client:
+            def taking(seconds):
+                async def mid_pass():
+                    seen.append(((await client.get("/corpus/jobs/swe-v1/job")).status_code,
+                                 (await client.get("/corpus/jobs")).json()["orders"]))
+                    now[0] += seconds
+                return mid_pass
+
+            h.mid_pass = taking(RESTORE_SECONDS - 60)
+            await h.set.refresh()
+            assert (await client.get("/corpus/jobs/swe-v1/job")).status_code == 503
+            now[0] += 60
+            h.wire_error, h.mid_pass = None, taking(180)
+            await h.set.refresh()
+            assert seen == [(503, restoring), (503, restoring)]
+            assert (await client.get("/corpus/jobs/swe-v1/job")).json() == {"job_id": "swe-v1"}
+            assert [o["state"] for o in (await client.get("/corpus/jobs")).json()["orders"]] == ["open"]
+
+    asyncio.run(go())
+
+
+def test_a_job_the_screen_passes_over_is_never_restoring(monkeypatch):
+    # The registry lists every control's jobs. One the screen passes over from its entry alone (an order job here,
+    # on a corpus validator) is unknown from the first pass on, not listed `restoring` before that pass reaches it.
+    from reliquary.validator.corpus_hot_jobs import order_entry_screen
+
+    monkeypatch.delenv("RELIQUARY_ADMIN_TASK_PREFIX", raising=False)
+
+    async def go():
+        h = _Harness([_hot_entry(task_id="corpus-a", job_id="swe-v1"),
+                      _hot_entry(task_id="corpus-b", job_id="order-eval-x")],
+                     wire_error=OSError("r2 timeout"), screen=order_entry_screen)
+        seen = []
+        async with h.client() as client:
+            async def mid_pass():
+                seen.append(((await client.get("/corpus/jobs/order-eval-x/job")).status_code,
+                             (await client.get("/corpus/jobs")).json()["orders"]))
+
+            h.mid_pass = mid_pass
+            await h.set.refresh()
+            assert seen == [(404, [{"job_id": "swe-v1", "state": "restoring"}])]
+            assert (await client.get("/corpus/jobs/order-eval-x/job")).status_code == 404
+            assert (await client.get("/corpus/jobs/swe-v1/job")).status_code == 503
 
     asyncio.run(go())
 

@@ -116,9 +116,16 @@ order that pays less is not dropped for a better one that opens later: its lease
 
 `jobs` lists the ids open right now. `sandbox_hotkey` is there when the validator serves signed-sandbox sessions:
 the ss58 hotkey their requests are signed for. `/corpus/tasks` is the registry's history of every task ever declared, not a
-list of what to mine. Right after a validator restart, until it has read its order registry, the list itself answers 503
-`orders_not_ready` with `Retry-After`: read it again then. A `restoring` order's own routes answer 503 `job_not_ready`
-until it is wired again; one that cannot be answers 404 again after three failed attempts or 15 minutes.
+list of what to mine.
+
+Right after a validator restart, until it has read its order registry, the list itself answers 503 `orders_not_ready`
+with `Retry-After`: read it again then. `corpus mine` without `--job-id`, started in that window, exits 1 instead, for
+its supervisor (pm2, systemd) to start it again. A `restoring` order's own routes answer 503 `job_not_ready` until it
+is wired again. The bounds: the list's 503 ends after three failed registry reads or 15 minutes, and an order whose
+wiring has failed three times, or fails 15 minutes or more after the restart, answers 404 again and leaves the list.
+They are checked only when a registry read or a pass over the registry ends: an order is never given up while a pass
+may still wire it, and it stays at 503 for as long as the registry cannot be read again after a first good read, or a
+pass does not end.
 
 ## How orders pay: the price auction
 
