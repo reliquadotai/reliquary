@@ -24,12 +24,12 @@ class _Staked(CorpusAuditor):
     stake_at_receipt = True
 
 
-def _auditor(store, clock, *, staked=True, states=None):
+def _auditor(store, clock, *, staked=True, states=None, operators=None):
     cls = _Staked if staked else CorpusAuditor
     return cls(job_id="order-gen-x", records=store, model=_model(0), tokenizer=_Tokenizer(), proof=PROOF,
                params=AuditParams(q=Q, hold_seconds=HOLD, ban_after_failures=10),
                miner_states=states or _States({HK: SAMPLED}), beacon=_Beacon(), round_at=_round_at,
-               clock=clock, accept_slack_seconds=0.0)
+               clock=clock, accept_slack_seconds=0.0, operator_of=None if operators is None else operators.get)
 
 
 def _judge_at(auditor, clock, now, ids):
@@ -173,6 +173,36 @@ def test_a_pass_a_reaudit_voids_uncharged_leaves_the_stake():
     outcome.clear()
     outcome.update(passing)
     _judge_at(auditor, clock, T0 + 30 + HOLD + 1, [x])
+    assert (store.verdicts[x]["audited"], store.verdicts[x]["passed"]) == (True, True)
+
+
+@pytest.mark.parametrize("hotkey, after", [("5Sib", 30.0), (HK, HOLD)])
+def test_a_reaudited_drift_leaves_every_stake_of_its_operator_in_its_hold(hotkey, after):
+    """Every stake that may have counted the voided drift is counted again: its operator's records received in the
+    hold after it, of any of the operator's hotkeys (5Sib shares 5Hot's coldkey, so they are staked together) and up
+    to the hold's far end (a record received HOLD after the drift still counts it). Such a record, held on the drift's
+    pass alone, is audited at its hold's end."""
+    d = _ids(False, 1)[0]
+    x = _ids(False, 1, start=500)[0]
+    store = _Store({d: _rec(0, received_at=T0), x: _rec(0, received_at=T0 + after, hotkey=hotkey)})
+    clock = _Clock(T0)
+    auditor = _auditor(store, clock, states=_States({HK: SAMPLED, "5Sib": SAMPLED}),
+                       operators={HK: "5Cold", "5Sib": "5Cold"})
+    auditor._draw_job = object()
+    passing = {"passed": True, "worst_exp": 0, "worst_mant_mean": 0.0, "worst_mant_median": 0.0}
+    outcome = dict(passing)
+    auditor._judge_many = lambda batch: [dict(outcome) for _ in batch]
+    _judge_at(auditor, clock, T0 + 20, [d])
+    auditor._remote_scored["pod-1"] = [d]  # D's passing audit, as if scored by pod-1
+    _judge_at(auditor, clock, T0 + after + 20, [x])
+    assert x not in store.verdicts and auditor._stake[x] == 1.0 / Q  # D's pass at stake: X waits
+    outcome.update(passed=False, reason="draw_mismatch", penalty=False)
+    clock.now = T0 + after + 30
+    assert asyncio.run(auditor.reaudit_executor("pod-1")) == [d] and store.voided[d]["penalty"] is False
+    assert x not in auditor._stake  # counted again at its next decision
+    outcome.clear()
+    outcome.update(passing)
+    _judge_at(auditor, clock, T0 + after + HOLD + 1, [x])
     assert (store.verdicts[x]["audited"], store.verdicts[x]["passed"]) == (True, True)
 
 

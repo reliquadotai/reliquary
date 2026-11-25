@@ -938,16 +938,17 @@ def test_after_a_restart_a_reaudited_drift_is_counted_in_full():
 def test_after_a_restart_the_passes_a_reaudit_confirms_are_counted_too(monkeypatch):
     """A judge process that restarted lists the quarantined executor's passes written before it again
     (`EvalAuditor.restore_scored`) and re-audits them, its counts started afresh. 200 passes of 5X, 3 refused now as
-    drifts: the 197 it confirms are counted as passing audits, as the judging pass that wrote them counted them. 5X is
-    then refused 3 times in 200 audits, not far above the job's other hotkeys (0 in 2,000): nothing is charged, as in
-    a process that never restarted. With its drifts counted alone, 5X was refused 3 times in 3 and charged."""
+    drifts: the 197 it confirms are counted as passing audits, as the judging pass that wrote them counted them (one,
+    refused by its first audit, is confirmed by its second, which decides, as there). 5X is then refused 3 times in
+    200 audits, not far above the job's other hotkeys (0 in 2,000): nothing is charged, as in a process that never
+    restarted. With its drifts counted alone, 5X was refused 3 times in 3 and charged."""
     from reliquary.validator import eval_control
     from tests.unit.test_eval_draw import _job as draw_job
 
     job = draw_job()
     ids = [f"{i:064x}" for i in range(1, 201)]
     records = _VoidingRecords({sid: {"hotkey": "5X", "token_count": 10, "prompt_index": job.prompt_start,
-                                     "cursor": 0, "drift": k < 3} for k, sid in enumerate(ids)})
+                                     "cursor": 0, "drift": k < 3, "flaky": k == 3} for k, sid in enumerate(ids)})
     for sid in ids:  # written before the restart, from pod-1's scores
         records.verdicts[sid] = {"submission_id": sid, "hotkey": "5X", "passed": True, "audited": True,
                                  "audited_at": 100_000.0, "received_at": 99_000.0, "scored_by": ["pod-1"]}
@@ -960,7 +961,9 @@ def test_after_a_restart_the_passes_a_reaudit_confirms_are_counted_too(monkeypat
         auditor._count_refusal(f"h{i}", f"5Other{i % 50}", {"passed": True})
 
     async def audit(batch, *, local=False):
-        return [{**_DRAW_REFUSAL, "penalty": False} if r["drift"] else dict(_PASSING) for r in batch]
+        # The flaky record is refused in the batch of every restored pass, and passes its second audit, run alone.
+        return [{**_DRAW_REFUSAL, "penalty": False} if r["drift"] or (r["flaky"] and len(batch) > 1)
+                else dict(_PASSING) for r in batch]
 
     monkeypatch.setattr(auditor, "_audit_outcomes", audit)
     assert asyncio.run(auditor.restore_scored()) == 200
@@ -1063,6 +1066,19 @@ def test_a_reaudit_counts_a_penalised_refusal_with_its_hotkeys_drifts(monkeypatc
     penalised, drift, charged = (run.records.voided[sid] for sid in run.ids)
     assert "penalty" not in penalised and "charged_for" not in penalised
     assert drift["penalty"] is False and charged["charged_for"] == "frequent_refusals"
+
+
+def test_a_forfeit_voids_first_and_the_reaudits_own_void_is_refused(monkeypatch):
+    """At q < 1 the drift charged for frequent refusals forfeits its hotkey's unpaid passes received up to it
+    (`_escalate`) before the re-audit writes any void: its own and the two drifts received before it are voided as
+    `forfeited`, and their slots reopen. Voids are create-only, as in production (`corpus_record_store`): the
+    re-audit's own void of each is refused, and the forfeit's stands."""
+    run = _frequent_drifts(monkeypatch, q=0.25)
+    assert run.voided == run.ids
+    assert [run.records.voided[sid]["reason"] for sid in run.ids] == ["forfeited"] * 3
+    charged = run.states.states["5X"]
+    assert charged.failure_ids == [run.ids[2]] and charged.forfeit_before == 99_020.0
+    assert {sid for what, sids in run.events if what == "reopen" for sid in sids} == set(run.ids)
 
 
 def test_without_a_connected_executor_the_auditor_runs_locally():
