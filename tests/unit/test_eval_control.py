@@ -479,6 +479,47 @@ def test_a_parked_batch_leaves_records_pending_and_is_no_validator_error():
     _run(go)
 
 
+def test_a_parked_record_holds_its_period_close_two_periods_at_most():
+    """Ruling P21 closes a period only once everything received in it is decided: a parked record would
+    hold the order's pay until an operator acts. It holds it PARKED_CLOSE_GIVE_UP_SECONDS at most."""
+    import math
+
+    from reliquary.validator.eval_control import PARKED_CLOSE_GIVE_UP_SECONDS, BatchParked
+
+    async def go():
+        now = [10_000.0]
+        h = _Harness()
+        auditor = eval_auditor(job_id="order-eval-1", records=None, tokenizer=_Tokenizer(),
+                               proof=PROOF, vocab_size=100,
+                               remote=h.dispatcher.view(*MODEL_A, PROOF, "order-eval-1"))
+        auditor._clock = lambda: now[0]
+        record = {"rendered_prompt": "ab", "completions": [
+            {"tokens": [1, 2], "proofs": ["p"]}], "hotkey": "h", "token_count": 2}
+
+        async def park_all(items):
+            raise BatchParked("split")
+
+        auditor._remote.score = park_all
+        await auditor._audit_records(["s1"], [record], {})
+        assert auditor.parked_ids == {"s1"}
+        auditor._seeded = True
+        auditor._covered = lambda: math.inf
+        auditor._meta["s1"] = ("h", 9_000.0, 2)            # parked, received at 9 000
+        auditor._meta["s2"] = ("h", 9_500.0, 2)            # pending, not parked
+        assert auditor.oldest_pending_received_at() == 9_000.0            # it holds the close
+        now[0] += PARKED_CLOSE_GIVE_UP_SECONDS
+        assert auditor.oldest_pending_received_at() == 9_000.0            # still, up to the give-up
+        now[0] += 1
+        for _ in range(2):                                 # then the close waits only for s2, logged once
+            assert auditor.oldest_pending_received_at() == 9_500.0
+        assert auditor._parked_left_out == {"s1"}
+        del auditor._meta["s2"]
+        assert auditor.oldest_pending_received_at() is None
+        # Neither paid nor charged by leaving the close: it is still undecided, never judged as failed.
+        assert "s1" not in auditor._judged and auditor._validator_errors == 0
+    _run(go)
+
+
 def test_the_corpus_control_refuses_an_eval_task_at_boot_and_never_reads_one_hot():
     from reliquary.validator.corpus_hot_jobs import CorpusJobSet, eval_entry_screen
     from reliquary.validator.corpus_service import CorpusJobRoutes

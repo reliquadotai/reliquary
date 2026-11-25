@@ -131,6 +131,11 @@ AUDIT_LEASE_FLOOR_SECONDS = 60.0
 LEASE_OVERHEAD_SECONDS = 30.0
 LEASE_TIMES_KEPT = 20
 LEASE_TIMES_NEEDED = 3
+# How long a parked record (neither a verdict nor a validator error) holds its period's close: two periods,
+# as a record whose arrival cannot be read (corpus_auditor.UNKNOWN_ARRIVAL_GIVE_UP_SECONDS). Then its period
+# closes without it: the miner is neither paid nor charged for it there, and a verdict that comes later (an
+# operator, or a re-audit after a restart) is paid late, as any late verdict.
+PARKED_CLOSE_GIVE_UP_SECONDS = 2 * 4320.0
 HEARTBEAT_WRITE_SECONDS = 30.0
 EVAL_CONTROL_STATUS_KEY = "reliquary/eval/control/status.json"
 # The miners document every order shares: a hotkey's probation progress carries
@@ -982,6 +987,7 @@ def eval_auditor(**kwargs):
                     for sid, known in zip(self._current_ids, self._current_records):
                         if known is record:
                             self.parked_ids.add(sid)
+                            self.parked_at.setdefault(sid, self._clock())
                 return [_Parked(str(exc)) for _ in records]
             except (ValueError, RuntimeError) as exc:
                 return [str(exc) for _ in records]
@@ -1030,6 +1036,19 @@ def eval_auditor(**kwargs):
         async def judge_many(self, submission_ids):
             # A parked record is not tried again until an operator acts.
             await super().judge_many([s for s in submission_ids if s not in self.parked_ids])
+
+        def _left_out_of_close(self, submission_id: str, now: float) -> bool:
+            # A parked record holds its period's close PARKED_CLOSE_GIVE_UP_SECONDS at most: one batch no
+            # executor can score must not freeze the order's pay (ruling P21) until an operator acts.
+            since = self.parked_at.get(submission_id) if submission_id in self.parked_ids else None
+            if since is None or now - since <= PARKED_CLOSE_GIVE_UP_SECONDS:
+                return False
+            if submission_id not in self._parked_left_out:
+                self._parked_left_out.add(submission_id)
+                logger.error("eval job %s: parked %s has held its period's close for %.0f s; periods close "
+                             "without it, unpaid and uncharged there (its verdict, if one comes, is paid "
+                             "late)", self._job_id, submission_id[:12], now - since)
+            return True
 
         # -- an eval job stays completable: a failure reopens its slot ------
         # (a generation order's never does: today's corpus semantics)
@@ -1260,6 +1279,9 @@ def eval_auditor(**kwargs):
     auditor.scores_restored = asyncio.Event()
     auditor._late_reaudits = {}
     auditor.parked_ids = set()
+    # When each parked record was parked, and those already left out of their period's close (logged once).
+    auditor.parked_at = {}
+    auditor._parked_left_out = set()
     auditor._current_ids, auditor._current_records = [], []
     auditor.job, auditor.job_store = job, job_store
     return auditor

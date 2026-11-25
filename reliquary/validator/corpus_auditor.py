@@ -515,7 +515,7 @@ class CorpusAuditor:
         oldest = None if covered == math.inf else covered - self._accept_slack
         now = self._clock()
         for sid in dict.fromkeys((*self._meta, *self._unreadable, *self._queued)):
-            if sid in self._judged:
+            if sid in self._judged or self._left_out_of_close(sid, now):
                 continue
             if sid in self._meta:
                 at = self._meta[sid][1]
@@ -533,6 +533,11 @@ class CorpusAuditor:
                 at = -math.inf
             oldest = at if oldest is None else min(oldest, at)
         return oldest
+
+    def _left_out_of_close(self, submission_id: str, now: float) -> bool:
+        """Whether an undecided record no longer holds the period close (an order's parked record, after
+        its give-up): none here."""
+        return False
 
     def audits_pending(self) -> int | None:
         """Pending records that may still need a GPU audit: every one not decided yet, and every one waiting out
