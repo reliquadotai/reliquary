@@ -692,6 +692,162 @@ def test_v3_options_need_schema_version_3_and_a_filter_needs_the_jobs(admin):
     assert refused.status_code == 422 and "declares none" in refused.json()["detail"]
 
 
+class _Stop(Exception):
+    """The admin process stops right after an upload landed."""
+
+
+class _BatchDeliveries:
+    """The platform's delivery route of one batch order, behind ``HTTPDeliverySink``: an object keeps its first
+    bytes (the same bytes again answer 200, others 409 ``delivery_conflict``) and only the manifest and the
+    report read back. The admin stops (``_Stop``) right after ``stop_after`` lands, once."""
+
+    def __init__(self, order: str) -> None:
+        self.prefix = f"/api/internal/subnet/batch/orders/{order}/deliveries/"
+        self.objects: dict[str, bytes] = {}
+        self.puts: list[tuple[str, int]] = []
+        self.stop_after: str | None = None
+
+    def connection(self):
+        return _BatchConnection(self)
+
+
+class _BatchConnection:
+    def __init__(self, platform: _BatchDeliveries) -> None:
+        self.platform, self.headers, self.body = platform, {}, bytearray()
+
+    def putrequest(self, method, path):
+        self.method, self.path = method, path
+
+    def putheader(self, name, value):
+        self.headers[name] = value
+
+    def endheaders(self):
+        pass
+
+    def send(self, block):
+        self.body += block
+
+    def request(self, method, path, headers):
+        self.method, self.path = method, path
+
+    def getresponse(self):
+        from types import SimpleNamespace
+
+        platform, name = self.platform, self.path.removeprefix(self.platform.prefix)
+        if self.method == "GET":
+            body = platform.objects.get(name) if name in ("manifest.json", "report.json") else None
+            return SimpleNamespace(status=404 if body is None else 200,
+                                   read=lambda limit: (body or b"")[:limit])
+        body = bytes(self.body)
+        assert hashlib.sha256(body).hexdigest() == self.headers["X-Content-SHA256"]
+        if name not in platform.objects:
+            platform.objects[name], status = body, 201
+        else:
+            status = 200 if platform.objects[name] == body else 409
+        platform.puts.append((name, status))
+        if status != 409 and name == platform.stop_after:
+            platform.stop_after = None
+            raise _Stop(name)
+        return SimpleNamespace(status=status, read=lambda limit: b"{}")
+
+    def close(self):
+        pass
+
+
+def test_a_v3_export_cut_by_an_admin_restart_is_delivered_by_the_next_admin(  # noqa: F811
+        bucket, registry, monkeypatch, tmp_path):
+    """Two admin processes over one bucket and one create-only platform. The first stops right after its first
+    OpenAI shard lands; the next, an hour later, uploads the same bytes again and delivers. The stamp goes
+    through the production record store, past one R2 conflict on its create."""
+    from reliquary.corpus import delivery
+    from reliquary.corpus.delivery import HTTPDeliverySink
+    from reliquary.infrastructure import corpus_record_store as record_store
+    from reliquary.infrastructure import task_registry_store
+    from tests.unit.test_corpus_job_store import _client_error
+
+    for module in (record_store, task_registry_store):
+        monkeypatch.setattr(module, "get_s3_client", lambda **kw: bucket)
+
+    async def read_registry(*, strict=True, **kw):
+        admissions, _ = await task_registry_store._read_admissions(**kw)
+        return task_registry_store._overlay_admissions(registry["entries"], admissions), registry["etag"]
+
+    monkeypatch.setattr(task_registry_store, "read_registry", read_registry)
+    stub_source_rows(monkeypatch, SOURCE, 100_000)
+    registry["entries"] = {"default": _rl_entry("default", 0.5)}
+    monkeypatch.setattr(delivery, "STAMP_RETRY_DELAY_SECONDS", 0.0)
+    put, conflicts = bucket.put_object, []
+
+    async def put_object(Bucket, Key, Body, **condition):
+        if "/delivery-stamps/" in Key and not conflicts:
+            conflicts.append(Key)  # R2's 409: another conditional write to the key has not landed yet
+            raise _client_error("ConditionalRequestConflict")
+        return await put(Bucket=Bucket, Key=Key, Body=Body, **condition)
+
+    monkeypatch.setattr(bucket, "put_object", put_object)
+    order = "12345678-1234-4234-8234-123456789012"
+    platform, delivery_id = _BatchDeliveries(order), f"dl-{order}"
+    sids = [str(i) * 64 for i in range(1, 4)]
+    subs = {sid: {"prompt_index": i, "rendered_prompt": "q",
+                  "completions": [{"text": f"answer {i}", "tokens": [1, 151645]}]} for i, sid in enumerate(sids)}
+    clients = []
+
+    def boot(now):
+        """One admin process: its own exports, record store and clock, over the shared bucket and platform."""
+        records, store = _Records(), record_store.BucketRecordStore()
+        records.subs, records.verdicts = subs, {sid: {"passed": True} for sid in sids}
+        records.settlement = {"settled": sids, "pending": None}
+        records.read_delivery_stamp = store.read_delivery_stamp
+        records.write_delivery_stamp = store.write_delivery_stamp
+        sink = HTTPDeliverySink(url="https://platform.example", secret="s" * 40)
+        sink._connection, sink.max_file_bytes = platform.connection, 500  # one OpenAI line per shard
+        client = TestClient(create_admin_app(
+            secret=SECRET, pool_max=0.3, models=MODELS, records=records, task_prefix="math-", deliveries=sink,
+            clock=lambda: now, current_round=lambda: 777, work_dir=tmp_path / "work"))
+        client.__enter__()
+        clients.append(client)
+
+        def call(method, path, body=None):
+            data = b"" if body is None else json.dumps(body).encode()
+            stamp, nonce = str(int(now)), secrets.token_hex(16)
+            return client.request(method, path, content=data, headers={
+                TIMESTAMP_HEADER: stamp, NONCE_HEADER: nonce, "content-type": "application/json",
+                SIGNATURE_HEADER: sign_request(SECRET, stamp, nonce, method, path, data)})
+
+        return call
+
+    def deliver(call):
+        body = {"delivery_id": delivery_id, "schema_version": 3, "format": "openai_jsonl"}
+        for _ in range(500):
+            response = call("POST", "/admin/v1/jobs/math-a/deliveries", body)
+            if response.status_code != 202:
+                return response
+            time.sleep(0.01)
+        raise AssertionError("the export is still running")
+
+    started = time.time()
+    try:
+        first = boot(started)
+        assert first("POST", "/admin/v1/jobs", _job(prompt_count=3)).status_code == 201
+        platform.stop_after = "output-00000.jsonl"
+        assert deliver(first).status_code == 500
+        assert platform.puts == [("output-00000.jsonl", 201)] and len(conflicts) == 1
+        platform.puts.clear()
+        done = deliver(boot(started + 3600))  # the next admin process, an hour later
+        assert done.status_code == 200, done.text
+        assert platform.puts[0] == ("output-00000.jsonl", 200)  # the same bytes again
+        assert [name for name, status in platform.puts[1:] if status != 201] == []
+        assert [name for name, _ in platform.puts[-2:]] == ["report.json", "manifest.json"]
+        shards = sorted(name for name in platform.objects if name.startswith("output-"))
+        assert shards == [f"output-0000{i}.jsonl" for i in range(3)]
+        lines = [json.loads(platform.objects[name]) for name in shards]
+        assert {line["response"]["body"]["created"] for line in lines} == {int(started)}
+        assert f"reliquary/corpus/jobs/math-a/delivery-stamps/{delivery_id}.json" in bucket.objects
+    finally:
+        for client in clients:
+            client.__exit__(None, None, None)
+
+
 def test_a_delivery_of_an_unknown_job_is_404(admin):
     assert admin("POST", "/admin/v1/jobs/math-ghost/deliveries", {}).status_code == 404
 

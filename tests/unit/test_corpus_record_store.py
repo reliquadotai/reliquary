@@ -7,7 +7,7 @@ import pytest
 
 from reliquary.infrastructure import corpus_job_store as job_store
 from reliquary.infrastructure import corpus_record_store as records
-from tests.unit.test_corpus_job_store import _FakeMultiObjectR2
+from tests.unit.test_corpus_job_store import _FakeMultiObjectR2, _client_error
 
 ID = "c" * 64
 
@@ -60,6 +60,38 @@ def test_settlement_is_compare_and_swap(r2):
         run(records.write_settlement("math-v1", {"last_window": 2}, None))
     run(records.write_settlement("math-v1", {"last_window": 2}, etag))
     assert run(records.read_settlement("math-v1"))[0] == {"last_window": 2}
+
+
+def test_a_delivery_stamp_is_kept_once_beside_its_job(r2):
+    stamp = {"delivery_id": "dl-1", "created_at": 5.0}
+    assert run(records.read_delivery_stamp("math-v1", "dl-1")) is None
+    assert run(records.write_delivery_stamp("math-v1", "dl-1", stamp)) is True
+    assert run(records.write_delivery_stamp("math-v1", "dl-1", {**stamp, "created_at": 6.0})) is False
+    assert run(records.read_delivery_stamp("math-v1", "dl-1")) == stamp
+    assert run(records.read_delivery_stamp("math-v2", "dl-1")) is None
+    assert list(r2.objects) == ["reliquary/corpus/jobs/math-v1/delivery-stamps/dl-1.json"]
+    assert run(job_store.list_jobs()) == []
+    for bad in ("../dl-1", "dl/1", ""):
+        with pytest.raises(ValueError):
+            run(records.write_delivery_stamp("math-v1", bad, stamp))
+
+
+def test_the_bound_store_keeps_delivery_stamps_and_refuses_a_create_in_flight(r2, monkeypatch):
+    store = records.BucketRecordStore()
+    stamp = {"delivery_id": "dl-1", "created_at": 1764048123.4567891}
+    put = r2.put_object
+
+    async def in_flight(Bucket, Key, Body, **condition):
+        # R2's 409: another conditional write to the key has not landed yet.
+        raise _client_error("ConditionalRequestConflict")
+
+    monkeypatch.setattr(r2, "put_object", in_flight)
+    assert run(store.write_delivery_stamp("math-v1", "dl-1", stamp)) is False
+    assert run(store.read_delivery_stamp("math-v1", "dl-1")) is None
+    monkeypatch.setattr(r2, "put_object", put)
+    assert run(store.write_delivery_stamp("math-v1", "dl-1", stamp)) is True
+    assert run(store.write_delivery_stamp("math-v1", "dl-1", {**stamp, "created_at": 6.0})) is False
+    assert run(store.read_delivery_stamp("math-v1", "dl-1")) == stamp
 
 
 @pytest.mark.parametrize("bad", ["../x", "C" * 64, "c" * 63, ""])

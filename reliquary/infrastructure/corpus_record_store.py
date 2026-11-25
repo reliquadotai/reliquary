@@ -422,6 +422,24 @@ async def write_final_status(job_id, status, **client_kwargs) -> bool:
     return await _create(_final_status_key(job_id), status, **client_kwargs)
 
 
+def _delivery_stamp_key(job_id: str, delivery_id: str) -> str:
+    from reliquary.corpus.delivery import validated_delivery_id
+
+    return (f"{JOB_KEY_PREFIX}{_validated_job_id(job_id)}/delivery-stamps/"
+            f"{validated_delivery_id(delivery_id)}.json")
+
+
+async def read_delivery_stamp(job_id, delivery_id, **client_kwargs) -> dict | None:
+    return await _read(_delivery_stamp_key(job_id, delivery_id), **client_kwargs)
+
+
+async def write_delivery_stamp(job_id, delivery_id, stamp, **client_kwargs) -> bool:
+    """When a delivery of the job was stamped, kept from before its first upload so
+    that every attempt stamps the same ``created`` (``delivery._delivery_stamp``):
+    create-only; False when another create won or is still in flight."""
+    return await _create(_delivery_stamp_key(job_id, delivery_id), stamp, **client_kwargs)
+
+
 def _miners_key(job_id: str) -> str:
     return f"{JOB_KEY_PREFIX}{_validated_job_id(job_id)}/miners.json"
 
@@ -539,6 +557,12 @@ class BucketRecordStore:
 
     async def write_final_status(self, job_id, status):
         return await write_final_status(job_id, status, **self._kw)
+
+    async def read_delivery_stamp(self, job_id, delivery_id):
+        return await read_delivery_stamp(job_id, delivery_id, **self._kw)
+
+    async def write_delivery_stamp(self, job_id, delivery_id, stamp):
+        return await write_delivery_stamp(job_id, delivery_id, stamp, **self._kw)
 
     async def read_miners(self, job_id):
         return await read_miners(job_id, **self._kw)
