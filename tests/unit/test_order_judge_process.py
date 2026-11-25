@@ -851,6 +851,102 @@ def test_a_reopen_that_lost_every_ledger_attempt_is_retried_until_it_lands(monke
     asyncio.run(go())
 
 
+class _LedgerStore:
+    """A ledger behind a compare-and-swap, that loses the first ``lose`` writes."""
+
+    def __init__(self, job, lose=0):
+        self.snapshot = {"schema": "reliquary/corpus-ledgers/v2",
+                         "slots": {str(job.prompt_start + i): job.slots_per_prompt for i in range(job.prompt_count)},
+                         "cursors": {}, "seen_pending": [], "seen_segments": []}
+        self.version, self.writes, self.lose = 0, 0, lose
+
+    async def read_ledgers(self, job_id):
+        return json.loads(json.dumps(self.snapshot)), str(self.version)
+
+    async def write_ledgers(self, job_id, snapshot, etag):
+        from reliquary.infrastructure.corpus_job_store import CorpusStoreConflict
+
+        if self.lose:
+            self.lose -= 1
+            raise CorpusStoreConflict("the front wrote first")
+        assert etag == str(self.version)
+        self.snapshot, self.version = snapshot, self.version + 1
+        self.writes += 1
+
+
+class _ForfeitRecords:
+    def __init__(self, job, count):
+        self.submissions = {f"{i:064x}": {"prompt_index": job.prompt_start + i % job.prompt_count, "cursor": 0,
+                                          "hotkey": "5A"} for i in range(count)}
+        self.voided = {}
+
+    async def read_submission(self, job_id, sid):
+        return self.submissions.get(sid)
+
+    async def write_voided(self, job_id, sid, document):
+        self.voided[sid] = document
+
+    async def list_voided_ids(self, job_id):
+        return sorted(self.voided)
+
+    async def read_settlement(self, job_id):
+        return {"settled": []}, "etag"
+
+
+def _forfeit_auditor(job, records, store, retry):
+    from reliquary.validator import eval_control
+
+    auditor = eval_control.eval_auditor(job_id=job.job_id, records=records, tokenizer=None, proof=PROOF,
+                                        vocab_size=10, job=job, job_store=store, reopen_slots=True,
+                                        retry_reopens=retry)
+    auditor._paid["5A"] = [(1.0, sid) for sid in records.submissions]
+    auditor._paid_loaded = True
+    return auditor, {"5A": MinerState(forfeit_before=2.0)}
+
+
+def test_a_forfeit_reopens_every_slot_in_one_ledger_write_before_the_status_hears():
+    from tests.unit.test_eval_draw import _job as draw_job
+
+    job = draw_job()
+    records, store = _ForfeitRecords(job, 4), _LedgerStore(job)
+    auditor, states = _forfeit_auditor(job, records, store, retry=False)
+    writes_at_report = []
+    auditor._report_voided = lambda sid, document: writes_at_report.append(store.writes)
+
+    async def go():
+        assert set(await auditor._void_forfeited(states, 3.0)) == set(records.submissions)
+        await auditor._reopen_slots(sorted(records.submissions))        # already recorded: nothing to write
+
+    asyncio.run(go())
+    assert store.writes == 1 and writes_at_report == [1] * 4
+    recorded = [entry for entries in store.snapshot["failed"].values() for entry in entries]
+    assert sorted(entry[:12] for entry in recorded) == sorted(sid[:12] for sid in records.submissions)
+    assert all(entry.endswith("@0@5A") for entry in recorded)
+
+
+def test_a_forfeit_that_lost_its_ledger_race_lands_whole_on_one_retry(monkeypatch):
+    from reliquary.corpus.slots import _failure_id
+    from reliquary.validator import eval_control
+    from reliquary.validator.corpus_service import DEFAULT_WRITE_ATTEMPTS
+    from tests.unit.test_eval_draw import _job as draw_job
+
+    monkeypatch.setattr(eval_control, "REOPEN_RETRY_SECONDS", 0.01)
+    monkeypatch.setattr(eval_control, "MAX_REOPEN_RETRY_SECONDS", 0.02)
+    job = draw_job()
+    records, store = _ForfeitRecords(job, 4), _LedgerStore(job, lose=DEFAULT_WRITE_ATTEMPTS + 1)
+    auditor, states = _forfeit_auditor(job, records, store, retry=True)
+
+    async def go():
+        await auditor._void_forfeited(states, 3.0)
+        assert store.writes == 0 and auditor._reopen_backlog == set(records.submissions)
+        await _until(lambda: not auditor._reopening, 5, "the backlog")
+
+    asyncio.run(go())
+    assert store.writes == 1 and not auditor._reopen_backlog
+    recorded = {_failure_id(entry) for entries in store.snapshot["failed"].values() for entry in entries}
+    assert recorded == {sid[:12] for sid in records.submissions}
+
+
 def _stream(dispatcher, run_dir, w):
     from reliquary.validator.order_judge import DispatchClient, DispatchServer
 

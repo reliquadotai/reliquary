@@ -20,7 +20,7 @@ import math
 import os
 import re
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 
 import torch
 
@@ -1261,6 +1261,43 @@ class CorpusAuditor:
                 logger.exception("corpus job %s: failure of %s not recorded in the ledger", self._job_id,
                                  submission_id[:12])
 
+    async def _failure_entries(self, submission_ids: Sequence[str], *, draw: bool) -> list[tuple]:
+        """What ``record_prompt_failures`` takes for these submissions (one no longer stored is skipped)."""
+        from reliquary.validator.corpus_service import draw_failure_slot
+
+        gate = asyncio.Semaphore(READ_CONCURRENCY)
+
+        async def read(submission_id):
+            async with gate:
+                return submission_id, await self._records.read_submission(self._job_id, submission_id)
+
+        entries = []
+        for submission_id, record in await gather_owned(read(sid) for sid in submission_ids):
+            if record is not None:
+                slot = draw_failure_slot(record) if draw else {}
+                entries.append((int(record["prompt_index"]), submission_id, slot.get("slot"), slot.get("hotkey")))
+        return entries
+
+    async def _reopen_slots(self, submission_ids: Sequence[str]) -> None:
+        """Many failed samples of a forced-draw job, in one ledger write. Never raises, as ``_reopen_slot``."""
+        if self._slot_store is None or not submission_ids:
+            return
+        from reliquary.validator.corpus_service import record_prompt_failures
+
+        if getattr(self, "_reopen_lock", None) is None:
+            self._reopen_lock = asyncio.Lock()
+        async with self._reopen_lock:
+            try:
+                entries = await self._failure_entries(submission_ids, draw=True)
+                outcomes = await record_prompt_failures(self._slot_store, self._draw_job, entries)
+                used = sum(1 for outcome in outcomes.values() if outcome is False)
+                if used:
+                    logger.warning("corpus job %s: %d failure(s) used their prompt's last attempt",
+                                   self._job_id, used)
+            except Exception:
+                logger.exception("corpus job %s: %d failure(s) not recorded in the ledger", self._job_id,
+                                 len(submission_ids))
+
     async def _reconcile_quietly(self) -> None:
         try:
             count = await self.reconcile_failures()
@@ -1276,8 +1313,7 @@ class CorpusAuditor:
             return 0
         ids = list(await self._records.list_verdict_ids(self._job_id))
         failed = await failed_verdicts(self._records, self._job_id, ids)
-        for submission_id in failed:
-            await self._reopen_slot(submission_id)
+        await self._reopen_slots(failed)
         return len(failed)
 
     # Verdict writes of this auditor in flight at once, over every concurrent
@@ -1506,6 +1542,8 @@ class CorpusAuditor:
             again = await self._audit_outcomes([records[k] for k in failing], local=True)
             for k, outcome in zip(failing, again):
                 outcomes[k] = outcome
+            if len(failing) > 1:
+                await self._charges_alone(records, outcomes, failing)
 
         for submission_id, outcome in zip(ids, outcomes):
             if isinstance(outcome, dict):
@@ -1595,6 +1633,18 @@ class CorpusAuditor:
             self._raise_first(landed)
         return results, failed_hotkeys
 
+    async def _charges_alone(self, records: list[dict], outcomes: list, failing: list[int]) -> None:
+        """A forced-draw refusal about to be charged, judged once more in a batch of its own: a sanction must not
+        depend on what its sample was packed with (2026-11-23: one gap 4.097 packed, 3.016 alone, threshold 4.0).
+        The outcome alone stands, whatever it is; a validator error there leaves the record pending, uncharged."""
+        if getattr(self, "_draw_job", None) is None:
+            return
+        charged = [k for k in failing if isinstance(outcomes[k], dict) and not outcomes[k]["passed"]
+                   and outcomes[k].get("reason") == "draw_mismatch" and outcomes[k].get("penalty", True)]
+        alone = await gather_owned(self._audit_outcomes([records[k]], local=True) for k in charged)
+        for k, outcome in zip(charged, alone):
+            outcomes[k] = outcome[0]
+
     async def _escalate(self, failures: dict[str, list[str]], now: float,
                         received: Mapping[str, float] | None = None) -> dict[str, MinerState]:
         """Each hotkey's confirmed failures, in one write (miners.json is one key);
@@ -1653,26 +1703,45 @@ class CorpusAuditor:
             if callable(settlement) else set()
         if not self._paid_loaded:
             await self._load_paid(settled)
-        forfeited = []
+        work: list[tuple[str, tuple[float, str], dict]] = []
         for hotkey, state in states.items():
             kept = []
-            for received_at, sid in self._paid.get(hotkey, ()):
+            for paid in self._paid.get(hotkey, ()):
+                received_at, sid = paid
                 if sid in settled or sid in self._voided_ids:
                     continue
                 if not forfeits(state, received_at):
-                    kept.append((received_at, sid))
+                    kept.append(paid)
                     continue
-                document = {"schema": VOIDED_SCHEMA, "submission_id": sid, "hotkey": hotkey,
-                            "reason": "forfeited", "voided_at": now, "forfeit_before": state.forfeit_before}
-                await writer(self._job_id, sid, document)
-                self._voided_ids.add(sid)
-                self._report_voided(sid, document)
-                await self._reopen_slot(sid)
-                forfeited.append(sid)
+                work.append((hotkey, paid, {
+                    "schema": VOIDED_SCHEMA, "submission_id": sid, "hotkey": hotkey,
+                    "reason": "forfeited", "voided_at": now, "forfeit_before": state.forfeit_before}))
             self._paid[hotkey] = kept
+        # In parallel: 2,077 written one at a time held the judge, and the audit card, for 7 min (2026-11-23).
+        gate = asyncio.Semaphore(max(1, self.write_concurrency))
+
+        async def void(document):
+            async with gate:
+                await writer(self._job_id, document["submission_id"], document)
+
+        outcomes = await gather_owned((void(document) for _, _, document in work), return_exceptions=True)
+        written = []
+        for (hotkey, paid, document), outcome in zip(work, outcomes):
+            if isinstance(outcome, BaseException):
+                # Still owed: raised below, and the re-audit of the failure voids it again.
+                self._paid[hotkey].append(paid)
+                continue
+            self._voided_ids.add(document["submission_id"])
+            written.append(document)
+        forfeited = [document["submission_id"] for document in written]
+        # Before the status hears of them: it must not see a void while the ledger still counts its slot taken.
+        await self._reopen_slots(forfeited)
+        for document in written:
+            self._report_voided(document["submission_id"], document)
         if forfeited:
             logger.warning("corpus job %s: %d unpaid pass(es) forfeited by confirmed failures of %s",
                            self._job_id, len(forfeited), ", ".join(sorted(states)))
+        self._raise_first(outcomes)
         return forfeited
 
     async def _load_paid(self, settled: set[str]) -> None:
