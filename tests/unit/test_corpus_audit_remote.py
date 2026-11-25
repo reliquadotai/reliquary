@@ -972,6 +972,95 @@ def test_after_a_restart_the_passes_a_reaudit_confirms_are_counted_too(monkeypat
     assert "5X" not in states.states  # no charge: no failure, no suspicion
 
 
+def _restored_draw_reaudit(monkeypatch, count, drifts, *, slice_records, in_flight=1):
+    """A forced-draw job at q = 1 whose other hotkeys passed 2,000 audits, restarted: ``count`` passes of 5X that
+    pod-1 scored before the restart (`EvalAuditor.restore_scored` lists them again), refused now as drifts at the
+    indices in ``drifts``. ``run.events``: each audit, each count of an audit (`_count_refusal`: the id and whether it
+    passed) and each refusal counted again (`_recount_refusal`), in order."""
+    from reliquary.validator import corpus_auditor, eval_control
+    from tests.unit.test_eval_draw import _job as draw_job
+
+    monkeypatch.setattr(corpus_auditor, "REAUDIT_SLICE_RECORDS", slice_records)
+    monkeypatch.setattr(corpus_auditor, "REAUDIT_SLICES_IN_FLIGHT", in_flight)
+    job = draw_job()
+    run = SimpleNamespace(ids=[f"{i:064x}" for i in range(1, count + 1)], states=_States(), events=[])
+    run.records = _VoidingRecords({sid: {"submission_id": sid, "hotkey": "5X", "token_count": 10,
+                                         "prompt_index": job.prompt_start, "cursor": 0, "drift": k in drifts}
+                                   for k, sid in enumerate(run.ids)})
+    for sid in run.ids:
+        run.records.verdicts[sid] = {"submission_id": sid, "hotkey": "5X", "passed": True, "audited": True,
+                                     "audited_at": 100_000.0, "received_at": 99_000.0, "scored_by": ["pod-1"]}
+    remote = SimpleNamespace(connected=lambda: True, subscribe=lambda listener: None, quarantined=lambda: {"pod-1"})
+    run.auditor = auditor = eval_control.eval_auditor(
+        job_id=job.job_id, records=run.records, tokenizer=None, proof=PROOF, vocab_size=10, job=job,
+        job_store=object(), draw_job=job, remote=remote, miner_states=run.states, clock=_Clock(100_100.0),
+        restores_scored=True)
+    for i in range(2000):
+        auditor._count_refusal(f"h{i}", f"5Other{i % 50}", {"passed": True})
+    count_refusal, recount_refusal = auditor._count_refusal, auditor._recount_refusal
+
+    def counted(submission_id, hotkey, outcome):
+        run.events.append(("count", submission_id, outcome["passed"]))
+        return count_refusal(submission_id, hotkey, outcome)
+
+    def recounted(submission_id, hotkey, outcome):
+        run.events.append(("recount", submission_id))
+        return recount_refusal(submission_id, hotkey, outcome)
+
+    async def audit(batch, *, local=False):
+        await asyncio.sleep(0.001 * (len(run.events) % 3))
+        run.events.append(("audit", [r["submission_id"] for r in batch]))
+        return [{**_DRAW_REFUSAL, "penalty": False} if r["drift"] else dict(_PASSING) for r in batch]
+
+    monkeypatch.setattr(auditor, "_count_refusal", counted)
+    monkeypatch.setattr(auditor, "_recount_refusal", recounted)
+    monkeypatch.setattr(auditor, "_audit_outcomes", audit)
+    run.restored = asyncio.run(auditor.restore_scored())
+    return run
+
+
+@pytest.mark.parametrize("in_flight", [1, 3])
+def test_a_restart_re_audit_counts_each_slices_passes_before_any_drift(monkeypatch, in_flight):
+    """In slices, each slice's confirmed passes are counted as its audits end, and every drift is counted again only
+    after the last slice: 5X's three drifts, all in the first slice of 8, are weighed against all 197 of its passes
+    confirmed, as one audit of the 200 weighs them. 3 refused of 200, not far above the job's other hotkeys (0 of
+    2,000): nothing charged. Counted again at the end of their own slice, they would be 3 of 8, and the third
+    charged."""
+    run = _restored_draw_reaudit(monkeypatch, 200, {0, 1, 2}, slice_records=8, in_flight=in_flight)
+    assert run.restored == 200
+    firsts = [ids for kind, *rest in run.events if kind == "audit" for ids in rest if len(ids) > 1]
+    assert sorted(sid for ids in firsts for sid in ids) == run.ids and all(len(ids) <= 8 for ids in firsts)
+    assert run.auditor._draw_counts["5X"] == [200, 3] and run.auditor._draw_totals == [2200, 3]
+    assert sorted(run.records.voided) == run.ids[:3]
+    assert all(run.records.voided[sid]["penalty"] is False for sid in run.ids[:3])
+    assert "5X" not in run.states.states
+    passes = [k for k, event in enumerate(run.events) if event[0] == "count" and event[2]]
+    recounts = [k for k, event in enumerate(run.events) if event[0] == "recount"]
+    assert len(passes) == 197 and len(recounts) == 3 and max(passes) < min(recounts)
+    if in_flight == 1:
+        # One slice in flight: the first slice's five passes are counted before the second slice is audited.
+        second = run.events.index(("audit", run.ids[8:16]))
+        assert [event[1] for event in run.events[:second] if event[0] == "count"] == run.ids[3:8]
+
+
+@pytest.mark.parametrize("in_flight", [1, 3])
+def test_a_restart_re_audit_in_slices_charges_frequent_refusals_as_one_audit_of_all(monkeypatch, in_flight):
+    """Drifts of 5X in three slices of 8 (at 0, 9 and 18, among 24 passes of it): every pass is counted before any
+    drift is counted again, as when the 24 are audited at once, so the third drift leaves 5X refused 3 times in 24
+    audits, far above the job's other hotkeys (0 of 2,000), and is charged; the slices change nothing in what is
+    counted, charged or voided."""
+    whole = _restored_draw_reaudit(monkeypatch, 24, {0, 9, 18}, slice_records=1000)
+    run = _restored_draw_reaudit(monkeypatch, 24, {0, 9, 18}, slice_records=8, in_flight=in_flight)
+    assert [ids for kind, *rest in whole.events if kind == "audit" for ids in rest if len(ids) > 1] == [whole.ids]
+    assert run.auditor._draw_counts["5X"] == whole.auditor._draw_counts["5X"] == [24, 3]
+    assert run.auditor._draw_totals == whole.auditor._draw_totals == [2024, 3]
+    assert run.records.voided == whole.records.voided
+    assert run.records.voided[run.ids[18]]["charged_for"] == "frequent_refusals"
+    assert run.states.states["5X"].failure_ids == whole.states.states["5X"].failure_ids == [run.ids[18]]
+    assert [event for event in run.events if event[0] == "recount"] == [
+        event for event in whole.events if event[0] == "recount"]
+
+
 def _frequent_drifts(monkeypatch, kind="base", *, q=1.0, settled=False, penalised=(), lying=True):
     """A forced-draw job at share ``q`` whose other hotkeys passed 2,000 audits: three records of 5X, received 10 s
     apart, that this GPU refuses as drifts (with a penalty: the indices in ``penalised``). ``lying``: a judging pass

@@ -678,19 +678,28 @@ class _Record(dict):
     """A record a weak reference can follow."""
 
 
-def _restart_reaudit(monkeypatch, slice_records):
-    """A restarted judge (`restore_scored`) whose 10 passes executor X scored, X quarantined since. Both audits
-    refuse ``run.charged`` (a charge) and ``run.drift`` (a drift, no penalty). ``run.events``: each audit (its ids,
-    the records alive then) and each effect, in order; ``run.most_live``: the most records alive at once."""
+def _restart_reaudit(monkeypatch, slice_records, *, slice_tokens=None, in_flight=1, sizes=None, wait=0.0,
+                     broken=None, slow=()):
+    """A restarted judge (`restore_scored`) whose passes executor X scored, X quarantined since: 10, or one per
+    ``sizes`` (each record's completion tokens; none by default). Both audits refuse ``run.charged`` (a charge) and
+    ``run.drift`` (a drift, no penalty). ``run.events``: each audit (its ids, the records alive then) and each effect,
+    in order; ``run.most_live``: the most records alive at once; ``run.most_audits``: the most audits under way at
+    once. ``wait``: how long an audit takes, four times that with a record whose index is in ``slow``. ``broken``:
+    (index, exception) of a record that fails every batch it is in, as a malformed record does
+    (`EvalAuditor._audit_outcomes` turns it into a validator error per record)."""
     import weakref
 
     from reliquary.validator import corpus_auditor, eval_control
     from tests.unit.test_eval_draw import _job as draw_job
 
     monkeypatch.setattr(corpus_auditor, "REAUDIT_SLICE_RECORDS", slice_records)
+    if slice_tokens is not None:
+        monkeypatch.setattr(corpus_auditor, "REAUDIT_SLICE_TOKENS", slice_tokens)
+    monkeypatch.setattr(corpus_auditor, "REAUDIT_SLICES_IN_FLIGHT", in_flight)
     job = draw_job()
-    sids = [f"{i:064x}" for i in range(1, 11)]
-    run = SimpleNamespace(sids=sids, charged=sids[2], drift=sids[7], events=[], live=0, most_live=0)
+    sids = [f"{i:064x}" for i in range(1, 1 + (10 if sizes is None else len(sizes)))]
+    run = SimpleNamespace(sids=sids, charged=sids[2], drift=sids[7], events=[], live=0, most_live=0, audits_now=0,
+                          most_audits=0, broken=None if broken is None else sids[broken[0]], firsts=[])
 
     def dropped():
         run.live -= 1
@@ -710,8 +719,11 @@ def _restart_reaudit(monkeypatch, slice_records):
 
         async def read_submission(self, job_id, sid):
             await asyncio.sleep(0.001 * (int(sid, 16) % 3))            # out of order, as the store answers
+            k = sids.index(sid)
+            completions = [] if sizes is None else [{"tokens": [5] * sizes[k], "text": "", "proofs": []}]
             record = _Record(submission_id=sid, hotkey="5B" if sid == run.charged else "5A",
-                             received_at=float(int(sid, 16)), token_count=10, completions=[])
+                             received_at=float(int(sid, 16)), token_count=10, prompt_token_count=0,
+                             completions=completions)
             run.live += 1
             run.most_live = max(run.most_live, run.live)
             weakref.finalize(record, dropped)
@@ -727,9 +739,24 @@ def _restart_reaudit(monkeypatch, slice_records):
         job_store=object(), remote=remote, restores_scored=True,
         on_voided=lambda sid, document: run.events.append(("reported", sid)))
 
-    async def audit(records, *, local=False):
-        await asyncio.sleep(0)                  # answered later, as the GPU or the executors are
-        run.events.append(("audit", [record["submission_id"] for record in records], run.live))
+    seen = set()
+
+    async def forward(records, *, local=False):
+        # The executors' answer, through `EvalAuditor._audit_outcomes`: a batch that fails is a validator error.
+        run.audits_now += 1
+        run.most_audits = max(run.most_audits, run.audits_now)
+        late = any(sids.index(record["submission_id"]) in slow for record in records)
+        try:
+            await asyncio.sleep(wait * (4 if late else 1))      # answered later, as the GPU or the executors are
+        finally:
+            run.audits_now -= 1
+        ids = [record["submission_id"] for record in records]
+        run.events.append(("audit", ids, run.live))
+        if not any(sid in seen for sid in ids):
+            run.firsts.append(ids)                  # a slice's first audit
+        seen.update(ids)
+        if broken is not None and any(record["submission_id"] == run.broken for record in records):
+            raise broken[1]
         return [{"passed": False, "reason": "draw_mismatch", **({"penalty": False} if sid == run.drift else {})}
                 if sid in (run.charged, run.drift) else {"passed": True}
                 for sid in (record["submission_id"] for record in records)]
@@ -744,7 +771,7 @@ def _restart_reaudit(monkeypatch, slice_records):
     async def ledger(sid):
         run.events.append(("ledger", sid))
 
-    monkeypatch.setattr(auditor, "_audit_outcomes", audit)
+    monkeypatch.setattr(auditor, "_forward", forward)
     monkeypatch.setattr(auditor, "_escalate", escalate)
     monkeypatch.setattr(auditor, "_reopen_slot", reopen)
     monkeypatch.setattr(auditor, "_record_failure", ledger)
@@ -752,6 +779,16 @@ def _restart_reaudit(monkeypatch, slice_records):
     run.audits = [event[1:] for event in run.events if event[0] == "audit"]
     run.effects = [event for event in run.events if event[0] != "audit"]
     return run
+
+
+def _restart_effects(run):
+    """What `_restart_reaudit` pins when both refusals are re-audited: the charge, both voids, the drift's slot
+    reopened as its void lands, the charged refusal's after every void."""
+    return [("escalate", {"5B": [run.charged]}, {run.charged: float(int(run.charged, 16)),
+                                                 run.drift: float(int(run.drift, 16))}),
+            ("void", run.charged, "X", True), ("reported", run.charged),
+            ("void", run.drift, "X", False), ("reopen", run.drift), ("ledger", run.drift), ("reported", run.drift),
+            ("ledger", run.charged)]
 
 
 def test_a_restart_re_audits_a_quarantined_executors_passes_a_slice_at_a_time(monkeypatch):
@@ -762,20 +799,62 @@ def test_a_restart_re_audits_a_quarantined_executors_passes_a_slice_at_a_time(mo
     run = _restart_reaudit(monkeypatch, 4)
     whole = _restart_reaudit(monkeypatch, 1000)
     assert run.restored == whole.restored == 10
-    first = [ids for ids, _ in run.audits if len(ids) > 1 or ids[0] not in (run.charged, run.drift)]
-    assert first == [run.sids[0:4], run.sids[4:8], run.sids[8:10]]          # every pass once, in order
+    assert run.firsts == [run.sids[0:4], run.sids[4:8], run.sids[8:10]]     # every pass once, in order
     assert whole.audits[0][0] == whole.sids
     # Each refusal's own audit, right after its slice's first: its record alone is alive then (10 if all are held).
     assert [audit for audit in run.audits if audit[0] in ([run.charged], [run.drift])] == [
         ([run.charged], 1), ([run.drift], 1)]
     assert run.most_live <= 4                # a slice (10 when read all at once)
     # The drift's slot reopens as its void lands (`_reopen_reaudited`), the charged refusal's after every void.
-    assert run.effects == whole.effects == [
-        ("escalate", {"5B": [run.charged]}, {run.charged: float(int(run.charged, 16)),
-                                             run.drift: float(int(run.drift, 16))}),
-        ("void", run.charged, "X", True), ("reported", run.charged),
-        ("void", run.drift, "X", False), ("reopen", run.drift), ("ledger", run.drift), ("reported", run.drift),
-        ("ledger", run.charged)]
+    assert run.effects == whole.effects == _restart_effects(run)
+
+
+def test_a_restart_re_audit_bounds_a_slice_by_its_records_tokens_too(monkeypatch):
+    """A slice is bounded by the tokens its audit holds as well as by its records: 128 records of 60,000 tokens
+    held ~519 MiB in one slice (synthetic benchmark: fake store, synthetic records). Records of 40 tokens and one of
+    300, in slices of at most 100 tokens: two records a slice, the long one alone; a record is read once, and never
+    more than a slice and the record read past it are alive. The effects are those of one slice of them all."""
+    sizes = [40, 40, 40, 40, 300, 40, 40, 40, 40, 40]
+    run = _restart_reaudit(monkeypatch, 1000, slice_tokens=100, sizes=sizes)
+    whole = _restart_reaudit(monkeypatch, 1000, slice_tokens=10 ** 9, sizes=sizes)
+    s = run.sids
+    assert run.firsts == [s[0:2], s[2:4], [s[4]], s[5:7], s[7:9], [s[9]]]
+    assert whole.firsts == [s]
+    assert run.most_live <= 2 and whole.most_live == 10
+    assert run.effects == whole.effects == _restart_effects(run)
+
+
+@pytest.mark.parametrize("in_flight", [2, 3])
+def test_a_restart_re_audit_keeps_a_few_slices_in_flight(monkeypatch, in_flight):
+    """One slice at a time, a re-audit waits for each slice's leases at the tail of the executors' shared queue
+    before it reads the next. ``in_flight`` slices are read and audited at once, never more, and only their records
+    are alive; every effect still comes after the last slice, in the order the passes were listed, though the slice
+    of the charged refusal (listed first) ends after the drift's."""
+    run = _restart_reaudit(monkeypatch, 2, in_flight=in_flight, sizes=[10] * 12, wait=0.05, slow={2})
+    whole = _restart_reaudit(monkeypatch, 1000, in_flight=1, sizes=[10] * 12)
+    assert sorted(sid for ids in run.firsts for sid in ids) == run.sids          # each pass once
+    assert all(len(ids) <= 2 for ids in run.firsts)
+    assert run.most_audits == in_flight                                          # a slice per worker
+    assert run.most_live <= 2 * in_flight
+    assert run.effects == whole.effects == _restart_effects(run)
+
+
+@pytest.mark.parametrize("error", [ValueError("malformed trajectory record: 'turns'"),
+                                   RuntimeError("trajectory audit is not available on remote executors"),
+                                   "parked"])
+def test_a_batch_error_spares_only_its_slices_passes(monkeypatch, error):
+    """A batch the eval auditor's audit fails (a malformed record, a trajectory refused here, or a parked batch)
+    leaves its records with a validator error: neither voided nor charged. Only its slice's: the drift two slices on
+    is still voided, while the refusal sharing the slice of the record that breaks the batch is spared until the
+    next start. With one audit of every pass, that one record shielded them all."""
+    from reliquary.validator.eval_control import BatchParked
+
+    error = BatchParked("no v3 executor") if error == "parked" else error
+    run = _restart_reaudit(monkeypatch, 4, broken=(1, error))
+    assert run.effects == [("void", run.drift, "X", False), ("reopen", run.drift), ("ledger", run.drift),
+                           ("reported", run.drift)]
+    assert run.firsts == [run.sids[0:4], run.sids[4:8], run.sids[8:10]]
+    assert [run.charged] not in [ids for ids, _ in run.audits]                   # never audited alone
 
 
 def test_a_single_process_auditor_reads_no_verdict_back_at_its_start():
