@@ -1,9 +1,38 @@
 #!/usr/bin/env python
 """Read-only seal check of the single-turn evaluation cards against the grader installed here.
 
-Run it where single-turn rows are graded: inside the admin API container, and inside a rebuilt image started
-with the admin's read-only bucket settings, before switching to it (docs/runbooks/order-control.md, "Before
-switching"). For example: ``docker exec -i <admin-container> python - < scripts/seal_check_admin.py``.
+Run it where single-turn rows are graded: in the running admin API container and, before switching to a rebuilt
+image, in that image, both runs reading the script from the same Core ``<commit>`` (docs/runbooks/order-control.md,
+"Before switching"). ``git show`` writes it to ``SEAL``, and both runs read it from that file, never through a pipe:
+bash 3.2 judges a Ctrl-C by a pipeline's first command, and ``git show`` has already exited 0, so it would run no
+``INT`` trap and the check would go on.
+
+In the rebuilt image, run it only in a one-shot container that replaces the entrypoint, starts no service and is
+given nothing but ``R2_ENV``: a file holding exactly what the ``grep`` below keeps, of the six variables
+``R2_ACCOUNT_ID``, ``R2_ACCESS_KEY_ID``, ``R2_SECRET_ACCESS_KEY``, ``R2_BUCKET_ID``, ``R2_ENDPOINT_URL`` and
+``R2_REGION`` those the admin sets, and never an ``R2_PUBLIC_*`` one. ``R2_ENV`` and ``SEAL`` are mode-600 files
+created right before the check, and the ``EXIT`` trap removes both, interrupted or not: the ``INT``, ``TERM`` and
+``HUP`` traps make the shell run it on an interrupt and end the check with status 130, 143 or 129, not 0 (in bash, a
+Ctrl-C that the running command survives runs no ``INT`` trap, and the check goes on if that command exits 0). Run
+the subshell on its own, never chained with the switch: chained with ``&&``, ``||`` or ``if``, the shell ignores its
+``set -e``. That ``grep`` copies the admin's own keys, so it runs on the admin's host only; anywhere else, write the
+same variables by hand, and the keys must be those of an R2 token that can only read the bucket. ``IMG`` is the
+rebuilt image by the digest its one push printed, the image the switch then runs::
+
+    (
+      set -e -o pipefail
+      R2_ENV="$(mktemp)"; SEAL="$(mktemp)"; trap 'rm -f "$R2_ENV" "$SEAL"' EXIT
+      trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
+      git show <commit>:scripts/seal_check_admin.py > "$SEAL"
+      docker exec <admin-container> env |
+        grep -E '^R2_(ACCOUNT_ID|ACCESS_KEY_ID|SECRET_ACCESS_KEY|BUCKET_ID|ENDPOINT_URL|REGION)=' > "$R2_ENV"
+      docker exec -i <admin-container> python - < "$SEAL"
+      docker run --rm -i --entrypoint python --env-file "$R2_ENV" "$IMG" - < "$SEAL"
+    )
+
+Never start that image with production settings before the switch: its entrypoint is the order control itself, and
+``admin serve`` would be a second admin (a second cap resizer with ``RELIQUARY_ORDER_CAP_SIZING=on``). No setting
+makes the bucket read-only: the store uses the ``R2_*`` credentials it is given.
 
 It only calls ``SubnetEvalStore.get_bytes`` on each set's ``set.json`` and reads installed package metadata and
 files: no write, no network call of its own beyond the store's read, no subprocess. One JSON line per set:

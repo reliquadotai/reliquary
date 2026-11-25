@@ -5,10 +5,15 @@ control, through executor pairs, up to its settlement."""
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
+import itertools
 import json
+import re
+import shlex
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -589,6 +594,336 @@ def test_the_order_control_image_installs_and_checks_its_runtime():
                          "reliquary-instruction-following", "reliquary-code"):
         assert distribution in dockerfile
     assert "order-control" in Path("docs/runbooks/order-control.md").read_text()
+
+
+_BEFORE_SWITCHING = "## Before switching the admin or the order control"
+_FENCE = re.compile(r"\s*(`{3,}|~{3,})")
+_INLINE_CODE = re.compile(r"(`+)([^`]+?)\1")
+_DOCKER = re.compile(r"(?<![\w.-])docker(?:-compose)?(?![\w./-])")
+_PLACEHOLDER = re.compile(r"<[A-Za-z][^<>\n]*>")
+# docker subcommands that start no container (`run` is checked; anything else, `create`, `start`,
+# `compose`..., is refused).
+_STARTS_NOTHING = {"exec", "pull", "push", "tag", "inspect", "image", "images", "buildx", "build", "ps", "logs"}
+
+
+def _markdown_section(markdown, heading):
+    """A markdown section as (code, prose): its fenced blocks, whatever their info string, and the rest."""
+    code, prose, fence, inside = [], [], None, False
+    for line in markdown.splitlines():
+        marker = _FENCE.match(line)
+        if fence is not None:
+            if marker and set(line.strip()) == {fence[0]} and len(line.strip()) >= len(fence):
+                fence = None
+            elif inside:
+                code.append(line)
+        elif marker:
+            fence = marker.group(1)
+        elif line.startswith("## "):
+            inside = line.strip() == heading
+        elif inside:
+            prose.append(line)
+    return code, prose
+
+
+def _docstring_parts(docstring):
+    """A docstring as (code, prose): its indented literal blocks, and the rest."""
+    lines = docstring.splitlines()
+    return [line for line in lines if line[:1].isspace()], [line for line in lines if not line[:1].isspace()]
+
+
+def _docker_commands(code):
+    """Each docker command of these shell lines (a ``docker`` word wherever it stands, a ``$ `` prompt or a
+    comment before it included): its words, up to the end of that command."""
+    for line in re.sub(r"\\\n\s*", " ", "\n".join(code)).splitlines():
+        line = _PLACEHOLDER.sub("PLACEHOLDER", line)
+        for found in _DOCKER.finditer(line):
+            tail = line[found.start():]
+            try:
+                lexer = shlex.shlex(tail, posix=True, punctuation_chars=True)
+                lexer.whitespace_split = True
+                words = list(lexer)
+            except ValueError:
+                words = [word.strip("'\"") for word in tail.split()]
+            yield list(itertools.takewhile(lambda word: not set(word) <= set("();<>|&"), words))
+
+
+def _flags(options):
+    """pflag-style: whether docker options detach, set a variable, leave the container after exit, come from a
+    variable or a substitution (the values of --env-file and --entrypoint aside), or mount anything or run
+    privileged, and the values of their --env-file and --entrypoint."""
+    detached, variables, removed, hidden, host = False, False, False, False, False
+    values, i = {"--env-file": [], "--entrypoint": []}, 0
+    while i < len(options):
+        name, eq, value = options[i].partition("=")
+        if name in values:
+            if not eq:
+                i += 1
+                value = options[i] if i < len(options) else ""
+            values[name].append(value)
+        elif name.startswith("--"):
+            detached |= name == "--detach"
+            variables |= name == "--env"
+            removed = removed if name != "--rm" else not eq or value.lower() in ("true", "1")
+            host |= name in ("--volume", "--mount", "--volumes-from", "--privileged")
+        elif name.startswith("-"):
+            for flag in options[i][1:]:
+                detached |= flag == "d"
+                variables |= flag == "e"
+                host |= flag == "v"
+                if flag in "acehlmpuvw":  # takes a value: the rest of the word, or the next one
+                    break
+        hidden |= name not in values and bool(set(options[i]) & set("$`"))
+        i += 1
+    return detached, variables, removed, hidden, host, values
+
+
+def _starts_a_service(words):
+    return any(word.lower() == "serve" or "order-control" in word.lower() or "reliquary.cli" in word.lower()
+               for word in words)
+
+
+def _not_one_shot(command):
+    """Why this docker command could start the rebuilt image as a service, or give it more than ``$R2_ENV``:
+    nothing when it starts no container, or runs ``"$IMG"`` removed on exit, attached, its entrypoint
+    replaced by ``python`` (a script on stdin, ``pip check`` or ``pip freeze``) or ``cat``, given no
+    variable but ``--env-file "$R2_ENV"``, no mount and no privilege, every option written out."""
+    if command[:1] != ["docker"]:
+        return ["not a plain docker command"]
+    words = command[1:]
+    while words[:1] and words[0].startswith("-"):  # docker's own options
+        global_value = words[0] in {"-c", "--context", "-H", "--host", "--config", "-l", "--log-level"}
+        words = words[2:] if global_value else words[1:]
+    words = words[1:] if words[:1] == ["container"] else words
+    verb, words = (words[0], words[1:]) if words else ("", [])
+    if verb == "exec":
+        i = 0
+        while i < len(words) and words[i].startswith("-"):
+            i += 2 if words[i] in {"-e", "--env", "--env-file", "-u", "--user", "-w", "--workdir"} else 1
+        return ["detached"] * _flags(words[:i])[0] + ["starts a service"] * _starts_a_service(words[i + 1:])
+    if verb != "run":
+        return [] if verb in _STARTS_NOTHING else [f"docker {verb}"]
+    if "$IMG" not in words:
+        return ['runs no "$IMG"']
+    options, program = words[:words.index("$IMG")], words[words.index("$IMG") + 1:]
+    detached, variables, removed, hidden, host, values = _flags(options)
+    entrypoint = values["--entrypoint"][-1] if values["--entrypoint"] else None
+    plain = program[:1] == ["-"] or (program[:2] == ["-m", "pip"] and program[2:3] in (["check"], ["freeze"]))
+    return (["not removed on exit"] * (not removed) + ["detached"] * detached + ["sets a variable"] * variables
+            + ["options from a variable or substitution"] * hidden + ["mounts or runs privileged"] * host
+            + [f"--env-file {name}" for name in values["--env-file"] if name != "$R2_ENV"]
+            + [f"entrypoint {entrypoint}"] * (entrypoint not in ("python", "cat"))
+            + ["python runs neither stdin nor pip check/freeze"] * (entrypoint == "python" and not plain)
+            + ["starts a service"] * _starts_a_service(program))
+
+
+def _one_shot_violations(runbook, docstring):
+    """How many docker runs the runbook's "Before switching" section and the seal check's docstring each show,
+    and those of their docker commands that are not one-shot, with why. Their code is every fenced block or
+    literal block and every inline code span; a ``docker`` word anywhere else (an indented block, plain prose)
+    is refused, so no command escapes the check by its markup."""
+    runs, violations = [], {}
+    for code, prose in (_markdown_section(runbook, _BEFORE_SWITCHING), _docstring_parts(docstring)):
+        text = "\n".join(prose)
+        violations.update({line.strip(): ["docker outside code"]
+                           for line in _INLINE_CODE.sub("", text).splitlines() if _DOCKER.search(line)})
+        spans = [span.replace("\n", " ") for _, span in _INLINE_CODE.findall(text)]
+        commands = list(_docker_commands(code + spans))
+        runs.append(sum(command[1:2] == ["run"] for command in commands))
+        violations.update({" ".join(command): problems for command in commands
+                           if (problems := _not_one_shot(command))})
+    return runs, violations
+
+
+def _runbook_and_seal_docstring():
+    return (Path("docs/runbooks/order-control.md").read_text(),
+            ast.get_docstring(ast.parse(Path("scripts/seal_check_admin.py").read_text())))
+
+
+def test_a_rebuilt_order_control_image_is_checked_only_in_one_shot_containers():
+    """The image's entrypoint is the order control itself: before the switch, every container of it the runbook's
+    "Before switching" section or the seal check's docstring starts, in any code block or inline code, is removed
+    on exit, attached, runs python or cat in place of that entrypoint, starts no service, mounts nothing, is not
+    privileged and is given no variable but those of ``--env-file "$R2_ENV"``, its options written out, so no
+    second control or admin starts on the production bucket. The next tests show the check refusing each of
+    these ways out. Known limits, which pass: what a container gets on stdin (a script file, a heredoc or a
+    here-string after ``"$IMG" -`` that starts the admin); how ``$IMG`` and ``$R2_ENV`` are set and filled
+    (``R2_ENV=/srv/admin.env``, or ``docker exec <admin> env > "$R2_ENV"`` in place of the ``grep``); and, of the
+    other options that reach the host, the host-namespace and device ones such as ``--device``, ``--cap-add``,
+    ``--pid host``, ``--network host``, ``--ipc host``, ``--userns host`` and ``--security-opt``."""
+    runs, violations = _one_shot_violations(*_runbook_and_seal_docstring())
+    assert all(runs), runs
+    assert violations == {}
+
+
+_SERVICE_STARTS = [
+    'docker run --rm --env-file /srv/admin.env --entrypoint python "$IMG" -m reliquary.cli.main corpus order-control'
+    ' --port 8791',
+    'docker run -d --rm --env-file /srv/admin.env -e RELIQUARY_ORDER_CAP_SIZING=on --entrypoint python "$IMG"'
+    ' -m reliquary.cli.main admin serve',
+    'docker run -d --env-file /srv/admin.env "$IMG"',
+]
+_MARKDOWN_PLACES = {
+    "bash": "```bash\n{}\n```",
+    "sh": "```sh\n{}\n```",
+    "shell": "```shell\n{}\n```",
+    "console": "```console\n$ {}\n```",
+    "unlabelled": "```\n{}\n```",
+    "fence in a list item": "1. Then:\n   ```sh\n   {}\n   ```",
+    "tilde": "~~~\n{}\n~~~",
+    "inline": "Then start it with `{}`.",
+    "indented block": "Then:\n\n    {}",
+    "plain prose": "Then start it with {}.",
+}
+
+
+@pytest.mark.parametrize("place", sorted(_MARKDOWN_PLACES))
+@pytest.mark.parametrize("command", _SERVICE_STARTS)
+def test_the_runbook_check_refuses_a_container_that_could_start_a_service(command, place):
+    runbook, docstring = _runbook_and_seal_docstring()
+    block = _MARKDOWN_PLACES[place].format(command)
+    runbook = runbook.replace(f"{_BEFORE_SWITCHING}\n", f"{_BEFORE_SWITCHING}\n\n{block}\n", 1)
+    assert _one_shot_violations(runbook, docstring)[1]
+
+
+@pytest.mark.parametrize("place", ["\n\n    {}\n", "\n\nRun ``{}``.\n", "\n\nRun {}.\n"])
+@pytest.mark.parametrize("command", _SERVICE_STARTS)
+def test_the_docstring_check_refuses_a_container_that_could_start_a_service(command, place):
+    runbook, docstring = _runbook_and_seal_docstring()
+    assert _one_shot_violations(runbook, docstring + place.format(command))[1]
+
+
+@pytest.mark.parametrize("command,why", [
+    ('docker run --rm -itd --entrypoint python "$IMG" -', "detached"),
+    ('docker run --rm --detach --entrypoint python "$IMG" -', "detached"),
+    ('docker run --rm --entrypoint python -e HF_TOKEN "$IMG" -', "sets a variable"),
+    ('docker run --rm --entrypoint python --env=X=1 "$IMG" -', "sets a variable"),
+    ('docker run --rm --entrypoint python -eX=1 "$IMG" -', "sets a variable"),
+    ('docker run --entrypoint python "$IMG" -', "not removed on exit"),
+    ('docker run --rm=false --entrypoint python "$IMG" -', "not removed on exit"),
+    ('docker run --rm --entrypoint python --env-file=/srv/admin.env "$IMG" -', "--env-file /srv/admin.env"),
+    ('docker run --rm --entrypoint python --env-file "$R2_ENV" --env-file /srv/admin.env "$IMG" -',
+     "--env-file /srv/admin.env"),
+    ('docker run --rm "$IMG"', "entrypoint None"),
+    ('docker run --rm --entrypoint sh "$IMG" -c "reliquary corpus order-control"', "entrypoint sh"),
+    ('docker run --rm --entrypoint=reliquary "$IMG" admin serve', "starts a service"),
+    ('docker run --rm --entrypoint python "$IMG" -m uvicorn reliquary.admin.service:app',
+     "python runs neither stdin nor pip check/freeze"),
+    ('docker run --rm --entrypoint python <the rebuilt image> -', 'runs no "$IMG"'),
+    ('OPTS="-d -e RELIQUARY_ORDER_CAP_SIZING=on"; docker run --rm $OPTS --entrypoint python --env-file "$R2_ENV"'
+     ' "$IMG" -', "options from a variable or substitution"),
+    ('docker run --rm `cat opts` --entrypoint python "$IMG" -', "options from a variable or substitution"),
+    ('docker run --rm -iv /var/run/docker.sock:/var/run/docker.sock --entrypoint python "$IMG" -',
+     "mounts or runs privileged"),
+    ('docker run --rm --mount type=bind,src=/srv,dst=/srv --entrypoint python "$IMG" -', "mounts or runs privileged"),
+    ('docker run --rm --volumes-from <admin container> --entrypoint python "$IMG" -', "mounts or runs privileged"),
+    ('docker run --rm --privileged --entrypoint python "$IMG" -', "mounts or runs privileged"),
+    ('docker container run -d --rm --entrypoint python "$IMG" -', "detached"),
+    ('docker --context prod run -d --rm --entrypoint python "$IMG" -', "detached"),
+    ('sudo docker run -d --rm --entrypoint python "$IMG" -', "detached"),
+    ('docker run --rm -i \\\n  -d --entrypoint python "$IMG" -', "detached"),
+    ('git show c:s.py | docker run --rm -i --entrypoint python "$IMG" - && docker run -d "$IMG"', "detached"),
+    ('docker exec -d <admin container> python -m reliquary.cli.main admin serve', "detached"),
+    ('docker exec -u root <admin container> python -m reliquary.cli.main admin serve', "starts a service"),
+    ("docker create --entrypoint python \"$IMG\" -", "docker create"),
+    ("docker start order-control", "docker start"),
+    ("docker compose up -d", "docker compose"),
+    ("docker-compose up -d", "not a plain docker command"),
+    ('"$(command -v docker)" run -d "$IMG"', "not a plain docker command"),
+])
+def test_each_way_out_of_a_one_shot_container_is_refused(command, why):
+    runbook, docstring = _runbook_and_seal_docstring()
+    runbook = runbook.replace(f"{_BEFORE_SWITCHING}\n", f"{_BEFORE_SWITCHING}\n\n```bash\n{command}\n```\n", 1)
+    assert why in [problem for problems in _one_shot_violations(runbook, docstring)[1].values()
+                   for problem in problems]
+
+
+_INTERRUPT_TRAPS = "trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP"
+
+
+def _subshells(code):
+    """The ``(`` ... ``)`` blocks of these shell lines, each as its stripped lines."""
+    blocks, current = [], None
+    for line in (line.strip() for line in code):
+        if line == "(":
+            current = []
+        elif current is not None and line.startswith(")"):
+            blocks.append(current)
+            current = None
+        elif current is not None:
+            current.append(line)
+    return blocks
+
+
+def _git_show_pipes(code):
+    """The commands of these shell lines (continuations joined) that pipe ``git show`` into another command."""
+    joined = re.sub(r"\|[ \t]*\n\s*", "| ", re.sub(r"\\\n\s*", " ", "\n".join(code)))
+    for line in joined.splitlines():
+        line = _PLACEHOLDER.sub("PLACEHOLDER", line)
+        for found in re.finditer(r"(?<![\w-])git\s+show(?![\w-])", line):
+            lexer = shlex.shlex(line[found.start():], posix=True, punctuation_chars=True)
+            lexer.whitespace_split = True
+            try:
+                words = list(lexer)
+            except ValueError:  # unbalanced quotes: split at the operators anyway
+                words = re.sub(r"([;&|]+)", r" \1 ", line[found.start():]).split()
+            if {"|", "|&"} & set(itertools.takewhile(lambda word: word not in (";", "&&", "||", "&"), words)):
+                yield line.strip()
+
+
+def _interrupt_problems(runbook, docstring):
+    """How many check subshells (those making ``$R2_ENV``) the runbook's "Before switching" section and the seal
+    check's docstring hold, and how one could leave a file behind or end 0 when interrupted: an ``EXIT`` trap
+    that misses a file the subshell makes, a seal check without its ``$SEAL`` copy, no ``INT``, ``TERM`` and
+    ``HUP`` traps, a command before the traps, or ``git show`` piped into a command (bash 3.2 judges a Ctrl-C
+    by a pipeline's first command, which has exited 0, and runs no ``INT`` trap)."""
+    subshells, problems = 0, []
+    for code, prose in (_markdown_section(runbook, _BEFORE_SWITCHING), _docstring_parts(docstring)):
+        spans = [span.replace("\n", " ") for _, span in _INLINE_CODE.findall("\n".join(prose))]
+        problems += [f"pipes git show: {line}" for line in _git_show_pipes(code + spans)]
+        for lines in _subshells(code):
+            text = "\n".join(lines)
+            if 'R2_ENV="$(mktemp)"' not in text:
+                continue
+            subshells += 1
+            made = set(re.findall(r'(\w+)="\$\(mktemp\)"', text))
+            removed = {name for files in re.findall(r"trap 'rm -f ([^']*)' EXIT", text)
+                       for name in re.findall(r'"\$(\w+)"', files)}
+            problems += [f"{name} not removed on exit" for name in sorted(made - removed)]
+            problems += ["seal check without $SEAL"] * ("seal_check_admin.py" in text and "SEAL" not in made)
+            traps = [i for i, line in enumerate(lines) if line == _INTERRUPT_TRAPS or line.endswith("' EXIT")]
+            commands = [i for i, line in enumerate(lines) if re.match(r"(docker|git)\b", line)]
+            if _INTERRUPT_TRAPS not in lines:
+                problems.append("no INT, TERM and HUP traps")
+            elif commands and min(commands) < max(traps):
+                problems.append("a command before the traps")
+    return subshells, problems
+
+
+def test_every_check_subshell_removes_its_files_and_ends_non_zero_when_interrupted():
+    """Steps 2 and 3 and the seal check's docstring each make ``$R2_ENV`` (the seal checks also ``$SEAL``, the
+    script written out by ``git show``) in a subshell whose ``EXIT`` trap removes every file it made, and whose
+    ``INT``, ``TERM`` and ``HUP`` traps, set before any ``docker`` or ``git`` command, end an interrupted check
+    with 130, 143 or 129. No check reads the script through a pipe from ``git show``."""
+    assert _interrupt_problems(*_runbook_and_seal_docstring()) == (3, [])
+
+
+@pytest.mark.parametrize("where,old,new,why", [
+    ("runbook", 'docker exec -i <admin container> python - < "$SEAL"',
+     "git show <commit>:scripts/seal_check_admin.py | docker exec -i <admin container> python -", "pipes git show"),
+    ("docstring", 'docker run --rm -i --entrypoint python --env-file "$R2_ENV" "$IMG" - < "$SEAL"',
+     'git show <commit>:scripts/seal_check_admin.py |\n      docker run --rm -i --entrypoint python'
+     ' --env-file "$R2_ENV" "$IMG" -', "pipes git show"),
+    ("runbook", """trap 'rm -f "$R2_ENV" "$SEAL"' EXIT""", """trap 'rm -f "$R2_ENV"' EXIT""",
+     "SEAL not removed on exit"),
+    ("docstring", _INTERRUPT_TRAPS, "trap exit INT TERM HUP", "no INT, TERM and HUP traps"),
+    ("runbook", "  set -e -o pipefail\n", "  set -e -o pipefail\n     docker exec <admin container> true\n",
+     "a command before the traps"),
+], ids=["piped admin check", "piped one-shot check", "seal copy kept", "trap exit", "command before traps"])
+def test_the_interrupt_check_refuses_a_subshell_that_could_end_0_or_leave_a_file(where, old, new, why):
+    texts = dict(zip(("runbook", "docstring"), _runbook_and_seal_docstring()))
+    assert old in texts[where]
+    texts[where] = texts[where].replace(old, new, 1)
+    assert any(problem.startswith(why) for problem in _interrupt_problems(texts["runbook"], texts["docstring"])[1])
 
 
 # -- M3. reopening is off unless asked -----------------------------------------------
