@@ -844,6 +844,40 @@ def test_a_retry_starting_past_restore_seconds_keeps_its_job_restoring_until_it_
     asyncio.run(go())
 
 
+@pytest.mark.parametrize("away", ["retired", "gone"])
+def test_a_given_up_job_active_again_after_a_while_away_is_waited_for_afresh(away):
+    # Given up, then retired or gone from the registry, then active again: a new wait, whose attempts and 15 minutes
+    # count from the pass that lists it again. Still given up, it answered 404 and stayed unlisted while every pass
+    # retried it; with its old attempts or its old start, its first failed pass gave it up again.
+    from reliquary.validator.corpus_hot_jobs import RESTORE_ATTEMPTS, RESTORE_SECONDS
+
+    now = [1000.0]
+
+    async def go():
+        h = _Harness([_hot_entry(job_id="swe-v1")], wire_error=OSError("r2 timeout"), clock=lambda: now[0])
+        async with h.client() as client:
+            async def seen():
+                return ((await client.get("/corpus/jobs/swe-v1/job")).status_code,
+                        (await client.get("/corpus/jobs")).json()["orders"])
+
+            for _ in range(RESTORE_ATTEMPTS):
+                await h.set.refresh()
+            assert await seen() == (404, [])
+            h.entries = [_hot_entry(job_id="swe-v1", status="retired")] if away == "retired" else []
+            await h.set.refresh()
+            assert await seen() == (404, [])
+            now[0] += RESTORE_SECONDS
+            h.entries = [_hot_entry(job_id="swe-v1")]
+            for _ in range(RESTORE_ATTEMPTS - 1):
+                await h.set.refresh()
+                assert await seen() == (503, [{"job_id": "swe-v1", "state": "restoring"}])
+            h.wire_error = None
+            await h.set.refresh()
+            assert (await client.get("/corpus/jobs/swe-v1/job")).json() == {"job_id": "swe-v1"}
+
+    asyncio.run(go())
+
+
 def test_a_job_the_screen_passes_over_is_never_restoring(monkeypatch):
     # The registry lists every control's jobs. One the screen passes over from its entry alone (an order job here,
     # on a corpus validator) is unknown from the first pass on, not listed `restoring` before that pass reaches it.

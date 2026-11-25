@@ -354,9 +354,10 @@ class CorpusJobSet:
                         attempted: bool = False) -> None:
         """The active jobs this refresh may still wire: a miner asking for one hears `job_not_ready`. ``attempted``:
         the pass is over, each one left failed to wire this time. Only then are the bounds checked
-        (`RESTORE_ATTEMPTS`, `RESTORE_SECONDS`, counted from the start for a job the first read lists): past them it
-        is unknown again (404), through the later passes too, while its wiring is still retried. One not given up
-        yet is waited for through the next pass, however late that starts: its attempt may wire it."""
+        (`RESTORE_ATTEMPTS`, `RESTORE_SECONDS`, counted from the start for a job a read lists while booting, else from
+        the pass that first lists it): past them it is unknown again (404), through the later passes too, while its
+        wiring is still retried. One not given up yet is waited for through the next pass, however late that starts:
+        its attempt may wire it."""
         now = self._clock()
         waiting = {
             str(entry.job_id) for task_id, entry in corpus.items()
