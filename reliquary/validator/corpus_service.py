@@ -87,6 +87,9 @@ CURSOR_PATH = "/corpus/cursor/{hotkey}"
 JOBS_PATH = "/corpus/jobs"
 # A served job's state in `JOBS_PATH`'s ``orders``.
 ORDER_OPEN, ORDER_STARTING, ORDER_PAUSED, ORDER_DRAINING = "open", "starting", "paused", "draining"
+# A job the registry lists that this process is still wiring (`CorpusJobRoutes.restoring`): a miner keeps what it
+# mines on it and starts nothing new there.
+ORDER_RESTORING = "restoring"
 JOB_SCOPED_PATH = "/corpus/jobs/{job_id}/job"
 CURSOR_SCOPED_PATH = "/corpus/jobs/{job_id}/cursor/{hotkey}"
 # Check before generating: where a hotkey's walk stands and whether that prompt
@@ -3073,6 +3076,8 @@ class CorpusJobRoutes:
         # Jobs the registry lists as served here but not wired yet (a restart re-wiring them, a hot add in
         # progress), and `booting`: the registry not read yet, so any unknown job may be one. A miner asking
         # for one hears 503 `job_not_ready` and retries; a 404 would stop it and cancel its running episodes.
+        # `orders` lists the restoring ones, `JOBS_PATH` answers 503 while booting with nothing wired; the job set
+        # bounds both (`corpus_hot_jobs.RESTORE_ATTEMPTS`, `RESTORE_SECONDS`).
         self.restoring: set[str] = set()
         self.booting = False
 
@@ -3185,7 +3190,9 @@ class CorpusJobRoutes:
         return ORDER_OPEN
 
     def orders(self) -> list[dict]:
-        """Every served job, open or not, with what a miner needs to choose one (`JOBS_PATH`)."""
+        """Every served job, open or not, with what a miner needs to choose one (`JOBS_PATH`), then the jobs still
+        being wired (`restoring`): an order follower stops the miner of an order missing from two reads in a row,
+        and a restart's wiring lasts longer than that."""
         listed = []
         for job_id in sorted(self.routers):
             spec = self.specs.get(job_id)
@@ -3208,6 +3215,8 @@ class CorpusJobRoutes:
                 if auction is not None:
                     entry["auction"] = auction
             listed.append(entry)
+        listed += [{"job_id": job_id, "state": ORDER_RESTORING}
+                   for job_id in sorted(self.restoring) if self.not_ready(job_id)]
         return listed
 
     def admission_pending(self, job_id: str) -> bool:
@@ -3244,6 +3253,8 @@ class CorpusJobRoutes:
 
 JOB_RETIRED = "job_retired"
 JOB_NOT_READY = "job_not_ready"
+# `JOBS_PATH` before the registry is first read (`CorpusJobRoutes.booting`).
+ORDERS_NOT_READY = "orders_not_ready"
 NOT_READY_RETRY_SECONDS = 10
 SUBMIT_SCOPED_PATH = "/corpus/jobs/{job_id}/submit"
 
@@ -3299,6 +3310,12 @@ def build_corpus_jobs_router(routers: Mapping[str, APIRouter] | CorpusJobRoutes,
 
     @router.get(JOBS_PATH)
     async def corpus_jobs() -> dict:
+        if routes.booting and not routes.routers:
+            # The registry not read yet and nothing wired (the order control's start): the list would miss every
+            # order about to be wired, and an order follower counts such a read against the order it mines; a
+            # failed read it retries. A validator that wired jobs before serving (the corpus validator) lists them.
+            raise HTTPException(status_code=503, detail=ORDERS_NOT_READY,
+                                headers={"Retry-After": str(NOT_READY_RETRY_SECONDS)})
         # ``jobs``: the ids open to mine now (older miners read it); ``orders``: every served job and its state.
         listing = {"jobs": routes.open_jobs(), "orders": routes.orders()}
         if routes.sandbox_hotkey:

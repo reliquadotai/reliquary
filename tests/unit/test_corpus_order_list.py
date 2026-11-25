@@ -48,3 +48,14 @@ def test_a_failing_auction_view_lists_the_job_without_it():
     routes.add("a", SimpleNamespace(auction_view=broken), spec=_spec("a"))
     listed = routes.orders()[0]
     assert listed["state"] == "open" and "pricing" not in listed
+
+
+def test_a_job_still_being_wired_is_listed_restoring_and_never_open():
+    # An order follower keeps the miner of an order in a state it does not stop on and starts one only on `open`.
+    routes = JobRoutes()
+    routes.add("a", SimpleNamespace(), spec=_spec("a"))
+    routes.restoring = {"a", "b", "gone"}
+    routes.retire("gone")
+    assert [(o["job_id"], o["state"]) for o in routes.orders()] == [("a", "open"), ("b", "restoring")]
+    assert routes.orders()[1] == {"job_id": "b", "state": "restoring"}
+    assert routes.open_jobs() == ["a"]

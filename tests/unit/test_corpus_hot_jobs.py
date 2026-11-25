@@ -169,13 +169,15 @@ class _Router:
 
 
 class _Harness:
-    def __init__(self, entries, *, admit=None, wire_error=None):
+    def __init__(self, entries, *, admit=None, wire_error=None, clock=None):
         self.entries = entries
         self.routes = CorpusJobRoutes()
         self.wired, self.running, self.cancelled = [], [], []
         self.drained = {}
         self.caps = {}
         self.wire_error = wire_error
+        # Raised by the registry read, and by every manifest read.
+        self.registry_error = self.read_error = None
 
         async def wire(entry, cap, job):
             if self.wire_error is not None:
@@ -193,9 +195,13 @@ class _Harness:
                 raise
 
         async def read_entries():
+            if self.registry_error is not None:
+                raise self.registry_error
             return {e.task_id: e for e in self.entries}
 
         async def read_job(job_id):
+            if self.read_error is not None:
+                raise self.read_error
             return _hot_job(job_id)
 
         async def drained(wiring):
@@ -206,6 +212,7 @@ class _Harness:
             jobs_of=lambda w: [forever(f"audit:{w.entry.job_id}"), forever(f"settle:{w.entry.job_id}")],
             read_entries=read_entries, read_job=read_job,
             admit=admit or (lambda entry, job: None), drained=drained,
+            **({} if clock is None else {"clock": clock}),
         )
 
     def client(self):
@@ -710,5 +717,110 @@ def test_a_job_refused_for_good_is_unknown_not_waited_for():
         h2 = _Harness([_hot_entry(job_id="swe-v1")], admit=lambda e, j: (OTHER_MODEL, "another model"))
         await h2.set.refresh()
         assert not h2.routes.not_ready("swe-v1")
+
+    asyncio.run(go())
+
+
+def test_the_order_list_answers_503_until_the_registry_is_read_then_shows_jobs_being_wired():
+    # An order follower stops the miner of an order missing from two reads in a row: before the registry is read the
+    # list would miss every order, and a restart wires them one by one for minutes. A failed read it retries.
+    async def go():
+        h = _Harness([_hot_entry(job_id="swe-v1")], wire_error=OSError("r2 timeout"))
+        async with h.client() as client:
+            booting = await client.get("/corpus/jobs")
+            assert booting.status_code == 503 and booting.json() == {"detail": "orders_not_ready"}
+            assert booting.headers["Retry-After"] == "10"
+            await h.set.refresh()
+            listed = (await client.get("/corpus/jobs")).json()
+            assert listed["jobs"] == [] and listed["orders"] == [{"job_id": "swe-v1", "state": "restoring"}]
+            h.wire_error = None
+            await h.set.refresh()
+            listed = (await client.get("/corpus/jobs")).json()
+            assert listed["jobs"] == ["swe-v1"]
+            assert [(o["job_id"], o["state"]) for o in listed["orders"]] == [("swe-v1", "open")]
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("fault", ["ledger", "manifest"])
+def test_a_job_that_fails_every_pass_is_unknown_again_after_its_attempts(caplog, fault):
+    # A fault the next pass repeats (a ledger or manifest that does not parse) is not a restart: its miners stop on
+    # the 404, as before, instead of waiting on it forever. Its wiring is still retried.
+    from reliquary.corpus.job import JobError
+    from reliquary.validator.corpus_hot_jobs import RESTORE_ATTEMPTS
+    from reliquary.validator.corpus_service import LedgerSnapshotError
+
+    async def go():
+        h = _Harness([_hot_entry(job_id="swe-v1")])
+        if fault == "ledger":
+            h.wire_error = LedgerSnapshotError("job 'swe-v1' repeats a pending record")
+        else:
+            h.read_error = JobError("stored job 'swe-v1' is not JSON")
+        async with h.client() as client:
+            for _ in range(RESTORE_ATTEMPTS - 1):
+                await h.set.refresh()
+                assert (await client.get("/corpus/jobs/swe-v1/job")).status_code == 503
+            with caplog.at_level(logging.ERROR, logger="reliquary.validator.corpus_hot_jobs"):
+                await h.set.refresh()
+                await h.set.refresh()
+            unknown = await client.get("/corpus/jobs/swe-v1/job")
+            assert unknown.status_code == 404 and unknown.json() == {"detail": "corpus_job_not_served"}
+            assert (await client.get("/corpus/jobs")).json()["orders"] == []
+            given_up = [r.message for r in caplog.records if "still not wired" in r.message]
+            assert len(given_up) == 1 and given_up[0].startswith(
+                f"corpus job swe-v1: still not wired after {RESTORE_ATTEMPTS} attempt(s)")
+            h.wire_error = h.read_error = None
+            await h.set.refresh()
+            assert (await client.get("/corpus/jobs/swe-v1/job")).json() == {"job_id": "swe-v1"}
+
+    asyncio.run(go())
+
+
+def test_a_job_waited_for_since_the_start_is_unknown_again_after_restore_seconds():
+    from reliquary.validator.corpus_hot_jobs import RESTORE_ATTEMPTS, RESTORE_SECONDS
+
+    now = [1000.0]
+
+    async def go():
+        h = _Harness([_hot_entry(job_id="swe-v1")], wire_error=OSError("r2 timeout"), clock=lambda: now[0])
+        async with h.client() as client:
+            now[0] += RESTORE_SECONDS - 60          # a long first pass after the start, failed for now
+            await h.set.refresh()
+            assert (await client.get("/corpus/jobs/swe-v1/job")).status_code == 503
+            now[0] += 60                            # its next pass: fewer than RESTORE_ATTEMPTS, but too late
+            await h.set.refresh()
+            assert RESTORE_ATTEMPTS > 2
+            assert (await client.get("/corpus/jobs/swe-v1/job")).status_code == 404
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("bound", ["attempts", "seconds"])
+def test_an_unreadable_registry_ends_booting_after_its_bound(caplog, bound):
+    from reliquary.validator.corpus_hot_jobs import RESTORE_ATTEMPTS, RESTORE_SECONDS
+
+    now = [1000.0]
+
+    async def go():
+        h = _Harness([_hot_entry(job_id="swe-v1")], clock=lambda: now[0])
+        h.registry_error = OSError("r2 down")
+        reads = RESTORE_ATTEMPTS if bound == "attempts" else 1
+        async with h.client() as client:
+            for _ in range(reads - 1):
+                await h.set.refresh()
+                assert (await client.get("/corpus/jobs")).status_code == 503
+                assert (await client.get("/corpus/jobs/swe-v1/job")).status_code == 503
+            if bound == "seconds":
+                now[0] += RESTORE_SECONDS
+            with caplog.at_level(logging.ERROR, logger="reliquary.validator.corpus_hot_jobs"):
+                await h.set.refresh()
+            listed = await client.get("/corpus/jobs")
+            assert listed.status_code == 200 and listed.json()["orders"] == []
+            assert (await client.get("/corpus/jobs/swe-v1/job")).status_code == 404
+            assert any("the task registry is still unread" in r.message for r in caplog.records)
+            # Read at last: the job it lists is waited for again until it is wired.
+            h.registry_error, h.wire_error = None, OSError("r2 timeout")
+            await h.set.refresh()
+            assert (await client.get("/corpus/jobs/swe-v1/job")).status_code == 503
 
     asyncio.run(go())
