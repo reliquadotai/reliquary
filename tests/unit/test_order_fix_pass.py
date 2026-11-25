@@ -745,8 +745,11 @@ def test_a_rebuilt_order_control_image_is_checked_only_in_one_shot_containers():
     on exit, attached, runs python or cat in place of that entrypoint, starts no service, mounts nothing, is not
     privileged and is given no variable but those of ``--env-file "$R2_ENV"``, its options written out, so no
     second control or admin starts on the production bucket. The next tests show the check refusing each of
-    these ways out. It does not read what a container gets on stdin (a script, a heredoc, a here-string), nor
-    how ``$IMG`` and ``$R2_ENV`` are set and filled."""
+    these ways out. Known limits, which pass: what a container gets on stdin (a script file, a heredoc or a
+    here-string after ``"$IMG" -`` that starts the admin); how ``$IMG`` and ``$R2_ENV`` are set and filled
+    (``R2_ENV=/srv/admin.env``, or ``docker exec <admin> env > "$R2_ENV"`` in place of the ``grep``); and, of the
+    other options that reach the host, the host-namespace and device ones such as ``--device``, ``--cap-add``,
+    ``--pid host``, ``--network host``, ``--ipc host``, ``--userns host`` and ``--security-opt``."""
     runs, violations = _one_shot_violations(*_runbook_and_seal_docstring())
     assert all(runs), runs
     assert violations == {}
@@ -832,6 +835,95 @@ def test_each_way_out_of_a_one_shot_container_is_refused(command, why):
     runbook = runbook.replace(f"{_BEFORE_SWITCHING}\n", f"{_BEFORE_SWITCHING}\n\n```bash\n{command}\n```\n", 1)
     assert why in [problem for problems in _one_shot_violations(runbook, docstring)[1].values()
                    for problem in problems]
+
+
+_INTERRUPT_TRAPS = "trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP"
+
+
+def _subshells(code):
+    """The ``(`` ... ``)`` blocks of these shell lines, each as its stripped lines."""
+    blocks, current = [], None
+    for line in (line.strip() for line in code):
+        if line == "(":
+            current = []
+        elif current is not None and line.startswith(")"):
+            blocks.append(current)
+            current = None
+        elif current is not None:
+            current.append(line)
+    return blocks
+
+
+def _git_show_pipes(code):
+    """The commands of these shell lines (continuations joined) that pipe ``git show`` into another command."""
+    joined = re.sub(r"\|[ \t]*\n\s*", "| ", re.sub(r"\\\n\s*", " ", "\n".join(code)))
+    for line in joined.splitlines():
+        line = _PLACEHOLDER.sub("PLACEHOLDER", line)
+        for found in re.finditer(r"(?<![\w-])git\s+show(?![\w-])", line):
+            lexer = shlex.shlex(line[found.start():], posix=True, punctuation_chars=True)
+            lexer.whitespace_split = True
+            try:
+                words = list(lexer)
+            except ValueError:  # unbalanced quotes: split at the operators anyway
+                words = re.sub(r"([;&|]+)", r" \1 ", line[found.start():]).split()
+            if {"|", "|&"} & set(itertools.takewhile(lambda word: word not in (";", "&&", "||", "&"), words)):
+                yield line.strip()
+
+
+def _interrupt_problems(runbook, docstring):
+    """How many check subshells (those making ``$R2_ENV``) the runbook's "Before switching" section and the seal
+    check's docstring hold, and how one could leave a file behind or end 0 when interrupted: an ``EXIT`` trap
+    that misses a file the subshell makes, a seal check without its ``$SEAL`` copy, no ``INT``, ``TERM`` and
+    ``HUP`` traps, a command before the traps, or ``git show`` piped into a command (bash 3.2 judges a Ctrl-C
+    by a pipeline's first command, which has exited 0, and runs no ``INT`` trap)."""
+    subshells, problems = 0, []
+    for code, prose in (_markdown_section(runbook, _BEFORE_SWITCHING), _docstring_parts(docstring)):
+        spans = [span.replace("\n", " ") for _, span in _INLINE_CODE.findall("\n".join(prose))]
+        problems += [f"pipes git show: {line}" for line in _git_show_pipes(code + spans)]
+        for lines in _subshells(code):
+            text = "\n".join(lines)
+            if 'R2_ENV="$(mktemp)"' not in text:
+                continue
+            subshells += 1
+            made = set(re.findall(r'(\w+)="\$\(mktemp\)"', text))
+            removed = {name for files in re.findall(r"trap 'rm -f ([^']*)' EXIT", text)
+                       for name in re.findall(r'"\$(\w+)"', files)}
+            problems += [f"{name} not removed on exit" for name in sorted(made - removed)]
+            problems += ["seal check without $SEAL"] * ("seal_check_admin.py" in text and "SEAL" not in made)
+            traps = [i for i, line in enumerate(lines) if line == _INTERRUPT_TRAPS or line.endswith("' EXIT")]
+            commands = [i for i, line in enumerate(lines) if re.match(r"(docker|git)\b", line)]
+            if _INTERRUPT_TRAPS not in lines:
+                problems.append("no INT, TERM and HUP traps")
+            elif commands and min(commands) < max(traps):
+                problems.append("a command before the traps")
+    return subshells, problems
+
+
+def test_every_check_subshell_removes_its_files_and_ends_non_zero_when_interrupted():
+    """Steps 2 and 3 and the seal check's docstring each make ``$R2_ENV`` (the seal checks also ``$SEAL``, the
+    script written out by ``git show``) in a subshell whose ``EXIT`` trap removes every file it made, and whose
+    ``INT``, ``TERM`` and ``HUP`` traps, set before any ``docker`` or ``git`` command, end an interrupted check
+    with 130, 143 or 129. No check reads the script through a pipe from ``git show``."""
+    assert _interrupt_problems(*_runbook_and_seal_docstring()) == (3, [])
+
+
+@pytest.mark.parametrize("where,old,new,why", [
+    ("runbook", 'docker exec -i <admin container> python - < "$SEAL"',
+     "git show <commit>:scripts/seal_check_admin.py | docker exec -i <admin container> python -", "pipes git show"),
+    ("docstring", 'docker run --rm -i --entrypoint python --env-file "$R2_ENV" "$IMG" - < "$SEAL"',
+     'git show <commit>:scripts/seal_check_admin.py |\n      docker run --rm -i --entrypoint python'
+     ' --env-file "$R2_ENV" "$IMG" -', "pipes git show"),
+    ("runbook", """trap 'rm -f "$R2_ENV" "$SEAL"' EXIT""", """trap 'rm -f "$R2_ENV"' EXIT""",
+     "SEAL not removed on exit"),
+    ("docstring", _INTERRUPT_TRAPS, "trap exit INT TERM HUP", "no INT, TERM and HUP traps"),
+    ("runbook", "  set -e -o pipefail\n", "  set -e -o pipefail\n     docker exec <admin container> true\n",
+     "a command before the traps"),
+], ids=["piped admin check", "piped one-shot check", "seal copy kept", "trap exit", "command before traps"])
+def test_the_interrupt_check_refuses_a_subshell_that_could_end_0_or_leave_a_file(where, old, new, why):
+    texts = dict(zip(("runbook", "docstring"), _runbook_and_seal_docstring()))
+    assert old in texts[where]
+    texts[where] = texts[where].replace(old, new, 1)
+    assert any(problem.startswith(why) for problem in _interrupt_problems(texts["runbook"], texts["docstring"])[1])
 
 
 # -- M3. reopening is off unless asked -----------------------------------------------

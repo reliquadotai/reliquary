@@ -53,13 +53,15 @@ docker push <registry>/<repository>:<tag>   # prints the digest of the image to 
 # the build needs network to github.com (the git+ installs); ENVS, TELECOM_ENVS, SBX are build args
 ```
 
-The validator image workflow (`.github/workflows/docker-image.yml`) tags each build of main
+The validator image workflow (`.github/workflows/docker-image.yml`) tags each build that includes Logic
 `sha-<the commit's first 7 characters>-logic` (`${GITHUB_SHA::7}`): `git rev-parse <commit> | cut -c1-7` prints
-exactly those 7, where `git rev-parse --short=7` prints more when 7 are ambiguous in your clone. Only the commit at
-the tip of a push to main gets an image, and only when that push changes a file that is neither under `docs/` nor a
-`.md` file (the workflow's `paths-ignore`): the commits under it, such as a pull request's own commits under its
-merge commit, get none. A build that a later run of the workflow cancelled may have pushed none. When
-`imagetools inspect` finds no such tag, take another commit.
+exactly those 7, where `git rev-parse --short=7` prints more when 7 are ambiguous in your clone. A push to main
+builds only the commit at its tip, with Logic, and only when that push changes a file that is neither under `docs/`
+nor a `.md` file (the workflow's `paths-ignore`): the commits under it, such as a pull request's own commits under
+its merge commit, get none. A manual run (`workflow_dispatch`) builds the tip of the ref it runs on, whatever the
+branch and whatever the commit changes, with Logic unless its `include_logic` input (true by default) is turned off.
+So a `-logic` tag does not mean the commit is on main. A build that a later run of the workflow cancelled may have
+pushed none. When `imagetools inspect` finds no such tag, take another commit.
 
 Pin `BASE_IMAGE` by digest, never by tag: `latest` moves with main, and a new run of the workflow on a commit
 pushes its tag again. Build the image once, on a non-production host, and push it: the checks before the switch
@@ -111,23 +113,26 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
    `--no-deps` installs. Compare `pip freeze` and each env package's and taskset's `direct_url.json` with the
    running containers (`docker exec <container> python -m pip freeze`).
 2. **Seal check** (field level, read-only), in the running admin API container **and** in the rebuilt image, both
-   reading the script from the same Core `<commit>`, whatever the checkout holds. `$R2_ENV` lives only as long as
-   the check: the subshell creates it right before (`mktemp`, mode 600) and its `EXIT` trap removes it, whether
-   the check passes, fails or is interrupted. The `INT`, `TERM` and `HUP` traps are what make bash and zsh run
-   that `EXIT` trap on an interrupt, and they end the interrupted check with status 130, 143 or 129, not 0. In
-   bash, a Ctrl-C that the running command survives runs no `INT` trap: the check stops if that command fails, and
-   goes on if it exits 0. Run the subshell as a command of its own: chained (`( ... ) && ...`, `||`, `if`), both
-   shells ignore its `set -e`.
+   reading the script from the same Core `<commit>`, whatever the checkout holds. `$R2_ENV` and `$SEAL`, the copy of
+   the script that `git show` writes, live only as long as the check: the subshell creates both right before
+   (`mktemp`, mode 600) and its `EXIT` trap removes them, whether the check passes, fails or is interrupted. The
+   `INT`, `TERM` and `HUP` traps are what make bash and zsh run that `EXIT` trap on an interrupt, and they end the
+   interrupted check with status 130, 143 or 129, not 0. Both checks read the script from `$SEAL`, never through a
+   pipe from `git show`: bash 3.2 judges a Ctrl-C by a pipeline's first command, and `git show` has already exited
+   0, so it would run no `INT` trap and the check would go on. In bash, a Ctrl-C that the running command survives
+   runs no `INT` trap either: the check stops if that command fails, and goes on if it exits 0. Run the subshell as
+   a command of its own, never chained with the switch: chained (`( ... ) && ...`, `||`, `if`), both shells ignore
+   its `set -e`.
    ```bash
    (
      set -e -o pipefail
-     R2_ENV="$(mktemp)"; trap 'rm -f "$R2_ENV"' EXIT
+     R2_ENV="$(mktemp)"; SEAL="$(mktemp)"; trap 'rm -f "$R2_ENV" "$SEAL"' EXIT
      trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
+     git show <commit>:scripts/seal_check_admin.py > "$SEAL"
      docker exec <admin container> env |
        grep -E '^R2_(ACCOUNT_ID|ACCESS_KEY_ID|SECRET_ACCESS_KEY|BUCKET_ID|ENDPOINT_URL|REGION)=' > "$R2_ENV"
-     git show <commit>:scripts/seal_check_admin.py | docker exec -i <admin container> python -
-     git show <commit>:scripts/seal_check_admin.py |
-       docker run --rm -i --entrypoint python --env-file "$R2_ENV" "$IMG" -
+     docker exec -i <admin container> python - < "$SEAL"
+     docker run --rm -i --entrypoint python --env-file "$R2_ENV" "$IMG" - < "$SEAL"
    )
    ```
    `$R2_ENV` holds exactly what that `grep` keeps: of the six variables `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
@@ -153,7 +158,8 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
    2. `require_gradable`, then `require_sandboxes`;
    3. `_Graders(...).grade(...)` on one row of the set's `grading.jsonl`.
 
-   In the rebuilt image, run it like the seal check, the set ids as its arguments, `$R2_ENV` made as in step 2:
+   In the rebuilt image, run it like the seal check, from its file (never through a pipe), with the set ids as its
+   arguments and `$R2_ENV` made as in step 2:
    ```bash
    (
      set -e -o pipefail
