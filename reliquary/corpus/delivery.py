@@ -449,17 +449,21 @@ def _row_ids(set_rows, prompt_index: int) -> tuple[str | None, str | None]:
     return row.get("problem_id"), custom if isinstance(custom, str) else None
 
 
-def _prompt_tokens(rendered: str, count_tokens) -> int | None:
-    """A prompt's token count: exact for a prompt given as token ids, else ``count_tokens`` (a tokenizer), else
-    unknown."""
+def _prompt_token_counts(
+    rendered: str, count_tokens, frozen_ids: list[int] | None,
+) -> tuple[int | None, int | None]:
+    """Return the reporting count and the billable count backed by matching frozen token IDs."""
     from reliquary.corpus.encoding import is_token_ids_text, prompt_token_ids
 
     if is_token_ids_text(rendered):
         try:
-            return len(prompt_token_ids(None, rendered))
+            ids = prompt_token_ids(None, rendered)
         except ValueError:
-            return None
-    return None if count_tokens is None else int(count_tokens(rendered))
+            return None, None
+        length = len(ids)
+        return length, length if ids == frozen_ids else None
+    reported = None if count_tokens is None else int(count_tokens(rendered))
+    return reported, None
 
 
 async def delivery_rows_v3(*, job, records, counts: dict, grade=None, drop_rejected: bool = False,
@@ -485,17 +489,23 @@ async def delivery_rows_v3(*, job, records, counts: dict, grade=None, drop_rejec
                   rows_accepted=0 if grade is not None else None,
                   rejected_dropped=0 if drop_rejected else None,
                   completion_tokens=0, audited_completion_tokens=0, prompt_tokens=0,
-                  prompt_tokens_unknown=0, samples_by_prompt={}, delivered_by_prompt={})
+                  prompt_tokens_unknown=0, billable_prompt_tokens=0,
+                  samples_by_prompt={}, delivered_by_prompt={})
     prompted: set[str] = set()
     async for batch in passing_batches(job=job, records=records, counts=counts, concurrency=concurrency,
                                        window=window, on_verdict=on_verdict):
         rows = []
+        billable_prompts: dict[str, int] = {}
         for sid, verdict, record in batch:
             prompt_index = int(record["prompt_index"])
             problem_id, custom_id = _row_ids(set_rows, prompt_index)
             rendered = record.get("rendered_prompt") or ""
             prompt_sha = hashlib.sha256(rendered.encode()).hexdigest()
-            prompt_tokens = _prompt_tokens(rendered, count_tokens)
+            frozen_ids = (set_rows[prompt_index].get("prompt_token_ids")
+                          if set_rows is not None and 0 <= prompt_index < len(set_rows) else None)
+            prompt_tokens, billable = _prompt_token_counts(rendered, count_tokens, frozen_ids)
+            if billable is not None:
+                billable_prompts[sid] = billable
             cursor = record.get("cursor")
             slot = int(cursor) if drawn and isinstance(cursor, int) and not isinstance(cursor, bool) else None
             audited = verdict.get("audited", True) is True
@@ -540,6 +550,11 @@ async def delivery_rows_v3(*, job, records, counts: dict, grade=None, drop_rejec
             counts["rows"] += 1
             counts["finish_reason"][row["finish_reason"]] += 1
             counts["completion_tokens"] += row["completion_tokens"]
+            if counts["billable_prompt_tokens"] is not None:
+                # A missing count makes the delivery total unknown, even if other rows are exact.
+                billable = billable_prompts.get(row["submission_id"])
+                counts["billable_prompt_tokens"] = (
+                    None if billable is None else counts["billable_prompt_tokens"] + billable)
             if row["audited"]:
                 counts["audited_completion_tokens"] += row["completion_tokens"]
             if row["submission_id"] not in prompted:
@@ -1300,12 +1315,12 @@ async def _export_v3(*, job, records, sink, delivery_id: str, grade, filter_note
                     "threshold": job.filter.threshold} if grade is not None
                    else {"applied": False, "mode": "none", "note": filter_note}),
         "verification": verification_block(job, verdicts=counts["verdicts"], audited=audited, refusals=refusals),
-        # What the customer is charged on: the completion tokens of the rows delivered (audited ones checked).
         "billing": {"basis": "completion_tokens_of_delivered_rows",
                     "completion_tokens": counts["completion_tokens"],
                     "audited_completion_tokens": counts["audited_completion_tokens"],
                     "prompt_tokens": counts["prompt_tokens"],
-                    "prompt_tokens_unknown": counts["prompt_tokens_unknown"]},
+                    "prompt_tokens_unknown": counts["prompt_tokens_unknown"],
+                    "billable_prompt_tokens": counts["billable_prompt_tokens"]},
         "shards": len(shards), "error_shards": len(error_shards),
     }
     await sink.put_json(report_key, report)
