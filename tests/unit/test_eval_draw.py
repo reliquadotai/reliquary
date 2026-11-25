@@ -489,3 +489,68 @@ def test_a_failure_reconcile_reads_its_verdicts_in_parallel():
     ids = [f"ok-{i}" for i in range(40)] + ["bad-1", "ok-void"]
     assert asyncio.run(failed_verdicts(records, "j", ids)) == ["bad-1", "ok-void"]
     assert 1 < records.most <= RECONCILE_READS
+
+
+def test_failure_entries_hold_no_record_past_its_entry(monkeypatch):
+    """A forfeit or a start's reconcile read every failed record before keeping four fields of each: 7,000 records
+    of ~3,200 tokens would hold ~0.85 GiB at once, measured in a synthetic benchmark (fake store, synthetic
+    records), 2026-11-25. Each is dropped once its entry is taken, a slice of ids at a time."""
+    import asyncio
+    import weakref
+
+    from reliquary.validator import corpus_auditor
+
+    monkeypatch.setattr(corpus_auditor, "READ_CONCURRENCY", 4)
+    monkeypatch.setattr(corpus_auditor, "RECONCILE_SLICE_IDS", 8)
+
+    class _Record(dict):
+        """A dict a weak reference can follow."""
+
+    class _Store:
+        live = most_live = most_tasks = 0
+
+        async def read_submission(self, job_id, sid):
+            await asyncio.sleep(0.001 * (int(sid, 16) % 3))        # out of order, as the store answers
+            _Store.most_tasks = max(_Store.most_tasks, len(asyncio.all_tasks()))
+            if sid == "f" * 64:
+                return None                                         # no longer stored: skipped
+            record = _Record(prompt_index=int(sid, 16) % 30, cursor=int(sid, 16) % 4, hotkey="5A")
+            _Store.live += 1
+            _Store.most_live = max(_Store.most_live, _Store.live)
+            weakref.finalize(record, _Store.drop)
+            return record
+
+        @staticmethod
+        def drop():
+            _Store.live -= 1
+
+    ids = [f"{i:064x}" for i in range(40)] + ["f" * 64] + [f"{i:064x}" for i in range(40, 50)]
+    entries = asyncio.run(_draw_auditor(_job(), _Store(), None)._failure_entries(ids, draw=True))
+    assert entries == [(i % 30, f"{i:064x}", i % 4, "5A") for i in range(50)]    # every stored one, in order
+    assert _Store.most_live <= 4         # at most the reads in flight (all 50 when held to the end)
+    assert _Store.most_tasks <= 8 + 1    # a slice of reads and asyncio.run's own task (52 with a task per id)
+
+
+def test_a_failure_reconcile_schedules_a_slice_of_verdict_reads_at_a_time(monkeypatch):
+    """A task per verdict id of the order, at every judge start: it held ~83-143 MiB for ~59k verdicts with read
+    latency, by Python version, measured in a synthetic benchmark (fake store, synthetic records)."""
+    import asyncio
+
+    from reliquary.validator import corpus_auditor
+
+    monkeypatch.setattr(corpus_auditor, "RECONCILE_SLICE_IDS", 8)
+
+    class _Counting:
+        most = 0
+
+        async def read_verdict(self, job_id, sid):
+            await asyncio.sleep(0)
+            _Counting.most = max(_Counting.most, len(asyncio.all_tasks()))
+            return {"passed": not sid.startswith("bad")}
+
+        async def list_voided_ids(self, job_id):
+            return ["ok-void"]
+
+    ids = [f"ok-{i}" for i in range(20)] + ["bad-1"] + [f"ok-{i}" for i in range(20, 40)] + ["ok-void", "bad-2"]
+    assert asyncio.run(corpus_auditor.failed_verdicts(_Counting(), "j", ids)) == ["bad-1", "ok-void", "bad-2"]
+    assert _Counting.most <= 8 + 1       # a slice of reads and asyncio.run's own task (44 with a task per id)

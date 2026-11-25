@@ -947,6 +947,97 @@ def test_a_forfeit_that_lost_its_ledger_race_lands_whole_on_one_retry(monkeypatc
     assert recorded == {sid[:12] for sid in records.submissions}
 
 
+def test_a_forfeit_larger_than_a_read_slice_still_reopens_in_one_ledger_write(monkeypatch):
+    """Read a slice at a time, recorded all at once (#571): never a partial reopen."""
+    from reliquary.validator import corpus_auditor
+    from tests.unit.test_eval_draw import _job as draw_job
+
+    monkeypatch.setattr(corpus_auditor, "RECONCILE_SLICE_IDS", 3)
+    job = draw_job()
+    records, store = _ForfeitRecords(job, 10), _LedgerStore(job)       # 10 prompts of 30: no shared prompt
+    auditor, states = _forfeit_auditor(job, records, store, retry=False)
+    assert set(asyncio.run(auditor._void_forfeited(states, 3.0))) == set(records.submissions)
+    assert store.writes == 1
+    recorded = [entry for entries in store.snapshot["failed"].values() for entry in entries]
+    assert len(recorded) == 10 and all(entry.endswith("@0@5A") for entry in recorded)
+
+
+def test_a_reconcile_of_more_failures_than_a_slice_records_them_in_one_write(monkeypatch):
+    from reliquary.validator import corpus_auditor
+    from tests.unit.test_eval_draw import _Verdicts, _draw_auditor, _job as draw_job
+
+    monkeypatch.setattr(corpus_auditor, "RECONCILE_SLICE_IDS", 4)
+    job = draw_job()
+    sids = [f"{i:012x}" + "0" * 52 for i in range(1, 11)]                # distinct 12-hex ledger keys
+    records = _Verdicts({sid: {"prompt_index": job.prompt_start + i, "cursor": 0, "hotkey": "5A"}
+                         for i, sid in enumerate(sids)})
+    records.verdicts = {sid: {"passed": False} for sid in sids}
+    store = _LedgerStore(job)
+    auditor = _draw_auditor(job, records, store)
+
+    async def go():
+        assert await auditor.reconcile_failures() == 10
+        assert store.writes == 1
+        assert await auditor.reconcile_failures() == 10                  # all recorded already: no write
+        assert store.writes == 1
+
+    asyncio.run(go())
+    recorded = {entry.split("@", 1)[0] for entries in store.snapshot["failed"].values() for entry in entries}
+    assert recorded == {sid[:12] for sid in sids}
+
+
+@pytest.mark.parametrize("judge", ["order", "corpus"])
+def test_a_reconcile_reads_only_the_failures_its_ledger_may_lack(judge, monkeypatch):
+    """A judge start read every failed record of every open order again, though their ledgers record nearly all.
+    A recorded one whose ledger key no other verdict carries is not read; one whose key another verdict shares,
+    here on another prompt, is read and recorded as before: the ledger tells failures apart by key within one
+    prompt only."""
+    from reliquary.validator import corpus_service, eval_control
+    from tests.unit.test_eval_draw import _Verdicts, _draw_auditor, _job as draw_job
+
+    job = draw_job()
+    old = [f"{i:012x}" + "0" * 52 for i in range(1, 6)]                  # distinct 12-hex ledger keys
+    new, twin = f"{6:012x}" + "0" * 52, old[0][:12] + "f" * 52             # twin: old[0]'s key, another prompt
+    prompts = {**{sid: index for index, sid in enumerate(old)}, new: 5, twin: 9}
+    records = _Verdicts({sid: {"prompt_index": job.prompt_start + index, "cursor": 0, "hotkey": "5A"}
+                         for sid, index in prompts.items()})
+    records.verdicts = {**{sid: {"passed": False} for sid in old}, "9" * 64: {"passed": True}}
+    reads, read_submission = [], records.read_submission
+
+    async def counted(job_id, sid):
+        reads.append(sid)
+        return await read_submission(job_id, sid)
+
+    async def unreadable(store, job):
+        raise ConnectionError("ledger read failed")
+
+    records.read_submission = counted
+    store = _LedgerStore(job)
+    auditor = (eval_control.eval_auditor(job_id=job.job_id, records=records, tokenizer=None, proof=PROOF,
+                                         vocab_size=10, job=job, job_store=store, reopen_slots=True)
+               if judge == "order" else _draw_auditor(job, records, store))
+
+    async def reconcile():
+        reads.clear()
+        return await auditor.reconcile_failures(), sorted(reads)
+
+    async def go():
+        assert await reconcile() == (5, sorted(old))
+        records.verdicts.update({new: {"passed": False}, twin: {"passed": False}})
+        assert await reconcile() == (7, sorted([old[0], new, twin]))          # the new one, and the shared key
+        assert await reconcile() == (7, sorted([old[0], twin]))               # the shared key alone
+        with monkeypatch.context() as patch:
+            patch.setattr(corpus_service, "recorded_failure_ids", unreadable)
+            assert await reconcile() == (7, sorted([*old, new, twin]))        # ledger unread: every one
+
+    asyncio.run(go())
+    assert store.writes == 2
+    keys = {int(index): [entry.split("@", 1)[0] for entry in entries]
+            for index, entries in store.snapshot["failed"].items()}
+    assert keys == {**{job.prompt_start + index: [sid[:12]] for index, sid in enumerate(old)},
+                    job.prompt_start + 5: [new[:12]], job.prompt_start + 9: [twin[:12]]}
+
+
 def _stream(dispatcher, run_dir, w):
     from reliquary.validator.order_judge import DispatchClient, DispatchServer
 
