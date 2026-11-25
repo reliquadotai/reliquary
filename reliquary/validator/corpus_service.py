@@ -1050,6 +1050,16 @@ async def record_prompt_failures(store: Any, job: JobSpec,
                               f"{failures[0][1][:12]}, kept losing their ledger race")
 
 
+async def recorded_failure_ids(store: Any, job: JobSpec) -> set[str]:
+    """The submission id prefixes (the first 12 hex, as ``SlotLedger`` keys a failure) the job's ledger records
+    as failed, on any prompt."""
+    from reliquary.corpus.slots import _failure_id
+
+    snapshot, _ = await store.read_ledgers(job.job_id)
+    slots = (await asyncio.to_thread(rebuild_ledgers, job, snapshot)).slots
+    return {_failure_id(entry) for entries in slots.failed_snapshot().values() for entry in entries}
+
+
 def draw_failure_slot(record: Mapping[str, Any]) -> dict[str, Any]:
     """The draw slot (the submission's cursor) and hotkey a failed forced-draw record names, for
     ``record_prompt_failure``; empty for a record that lacks them (it then reopens capacity only)."""

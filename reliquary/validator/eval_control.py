@@ -1148,14 +1148,16 @@ def eval_auditor(**kwargs):
         async def reconcile_failures(self) -> int:
             """Every failed or voided submission recorded in the ledger (a crash
             between a verdict and its ledger write would otherwise leave the
-            prompt without its slot)."""
+            prompt without its slot). Only those the ledger may lack are read
+            (``unrecorded_failures``)."""
             if not self.reopen_slots:
                 return 0
-            from reliquary.validator.corpus_auditor import failed_verdicts
+            from reliquary.validator.corpus_auditor import unrecorded_failures
 
-            ids = list(await self._records.list_verdict_ids(self._job_id))
-            failed = await failed_verdicts(self._records, self._job_id, ids)
-            await self._reopen_slots(failed)
+            # The job's ledger, the one its failures are written to; with a slot store's as well, every one is read.
+            ledger = self.job_store if getattr(self, "_slot_store", None) is None else None
+            failed, unrecorded = await unrecorded_failures(self._records, self._job_id, ledger, self.job)
+            await self._reopen_slots(unrecorded)
             return len(failed)
 
         async def restore_scored(self) -> int:

@@ -122,6 +122,10 @@ WINDOW_EPSILON_SECONDS = 1e-3
 BEACON_GRACE_SECONDS = 2.0
 # Verdicts a failure reconcile reads at once: read one by one, 10k verdicts took ~10 minutes (2026-11-11).
 RECONCILE_READS = 16
+# Ids a failure reconcile or a slot reopen schedules at once, each slice read whole before the next: a start's
+# reconcile or a large forfeit never holds a task, or a record, per failure (read all at once, a 7,000-record
+# forfeit of ~3,200-token records would hold ~0.85 GiB of decoded records: measured on a replica, 2026-11-25).
+RECONCILE_SLICE_IDS = 2048
 # How long after its receipt a sampled record's draw round is out (the round after receipt's next, two drand
 # periods, plus BEACON_GRACE_SECONDS) and the undecidable retry has come back to it (`audit_backlog`).
 DRAW_WAIT_SECONDS = 12.0
@@ -1262,20 +1266,25 @@ class CorpusAuditor:
                                  submission_id[:12])
 
     async def _failure_entries(self, submission_ids: Sequence[str], *, draw: bool) -> list[tuple]:
-        """What ``record_prompt_failures`` takes for these submissions (one no longer stored is skipped)."""
+        """What ``record_prompt_failures`` takes for these submissions, in their order (one no longer stored is
+        skipped). A record is dropped as soon as its entry is taken, so at most READ_CONCURRENCY (64) are held, and
+        RECONCILE_SLICE_IDS ids are scheduled at a time: only the entries, ~200 bytes each, outlive their reads."""
         from reliquary.validator.corpus_service import draw_failure_slot
 
         gate = asyncio.Semaphore(READ_CONCURRENCY)
 
-        async def read(submission_id):
+        async def entry(submission_id):
             async with gate:
-                return submission_id, await self._records.read_submission(self._job_id, submission_id)
+                record = await self._records.read_submission(self._job_id, submission_id)
+            if record is None:
+                return None
+            slot = draw_failure_slot(record) if draw else {}
+            return int(record["prompt_index"]), submission_id, slot.get("slot"), slot.get("hotkey")
 
-        entries = []
-        for submission_id, record in await gather_owned(read(sid) for sid in submission_ids):
-            if record is not None:
-                slot = draw_failure_slot(record) if draw else {}
-                entries.append((int(record["prompt_index"]), submission_id, slot.get("slot"), slot.get("hotkey")))
+        ids, entries = list(submission_ids), []
+        for start in range(0, len(ids), RECONCILE_SLICE_IDS):
+            found = await gather_owned(entry(sid) for sid in ids[start:start + RECONCILE_SLICE_IDS])
+            entries.extend(item for item in found if item is not None)
         return entries
 
     async def _reopen_slots(self, submission_ids: Sequence[str]) -> None:
@@ -1308,12 +1317,13 @@ class CorpusAuditor:
 
     async def reconcile_failures(self) -> int:
         """Every failed or voided sample of a forced-draw job recorded in the ledger: a stop between a verdict and
-        its ledger write would leave its prompt full without it."""
+        its ledger write would leave its prompt full without it. Only those the ledger may lack are read
+        (``unrecorded_failures``)."""
         if self._slot_store is None:
             return 0
-        ids = list(await self._records.list_verdict_ids(self._job_id))
-        failed = await failed_verdicts(self._records, self._job_id, ids)
-        await self._reopen_slots(failed)
+        failed, unrecorded = await unrecorded_failures(self._records, self._job_id, self._slot_store,
+                                                       self._draw_job)
+        await self._reopen_slots(unrecorded)
         return len(failed)
 
     # Verdict writes of this auditor in flight at once, over every concurrent
@@ -2463,7 +2473,9 @@ class CorpusAuditor:
 
 
 async def failed_verdicts(records, job_id: str, ids: list[str]) -> list[str]:
-    """The ids among ``ids`` whose verdict failed or whose record was voided, read RECONCILE_READS at a time."""
+    """The ids among ``ids`` whose verdict failed or whose record was voided, in their order: read RECONCILE_READS
+    at a time, RECONCILE_SLICE_IDS scheduled at once (a task per id held ~85-145 MiB for ~59k verdicts with read
+    latency, by Python version, measured on a replica)."""
     lister = getattr(records, "list_voided_ids", None)
     voided = set(await lister(job_id)) if lister is not None else set()
     gate = asyncio.Semaphore(RECONCILE_READS)
@@ -2473,8 +2485,37 @@ async def failed_verdicts(records, job_id: str, ids: list[str]) -> list[str]:
             verdict = await records.read_verdict(job_id, submission_id)
         return bool(verdict) and (not verdict.get("passed") or submission_id in voided)
 
-    outcomes = await asyncio.gather(*(failed(sid) for sid in ids))
-    return [sid for sid, out in zip(ids, outcomes) if out]
+    found = []
+    for start in range(0, len(ids), RECONCILE_SLICE_IDS):
+        part = ids[start:start + RECONCILE_SLICE_IDS]
+        outcomes = await asyncio.gather(*(failed(sid) for sid in part))
+        found.extend(sid for sid, out in zip(part, outcomes) if out)
+    return found
+
+
+async def unrecorded_failures(records, job_id: str, store, job) -> tuple[list[str], list[str]]:
+    """Every failed or voided id of the job (``failed_verdicts`` of all its verdicts), and, in the same order, those
+    its ledger may not record yet: the only ones a reconcile reads, so a judge start does not read every failed
+    record of every open order again.
+
+    A failure is recorded only after its verdict is written, at its own record's prompt, under its id's first 12 hex,
+    and no write of a running validator drops one. With the ledger read before the verdicts are listed, a recorded
+    prefix that a single listed verdict carries is that submission's own failure, which ``record_prompt_failures``
+    would leave as it is. A prefix two listed verdicts share is read (the ledger tells failures apart by prefix
+    within one prompt only), and so is every failure when ``store`` is None or the ledger cannot be read."""
+    recorded: set[str] = set()
+    if store is not None and job is not None:
+        from reliquary.validator.corpus_service import recorded_failure_ids
+
+        try:
+            recorded = await recorded_failure_ids(store, job)
+        except Exception:
+            logger.warning("corpus job %s: ledger unread before the failure reconcile; every failure is read",
+                           job_id, exc_info=True)
+    ids = list(await records.list_verdict_ids(job_id))
+    failed = await failed_verdicts(records, job_id, ids)
+    listed = Counter(sid[:12] for sid in ids)
+    return failed, [sid for sid in failed if sid[:12] not in recorded or listed[sid[:12]] > 1]
 
 
 def _finite(value):
