@@ -207,7 +207,9 @@ ALL = ("ban", "unreadable", "write", "quarantine", "restart")
 
 
 @pytest.mark.parametrize("seed", [7, 3])
-def test_main_and_the_scheduled_judge_write_the_same_verdicts(seed, without_forfeit):
+def test_main_and_the_scheduled_judge_write_the_same_verdicts(seed, without_forfeit, monkeypatch):
+    # The quarantine's re-audit (27 passes with seed 7) in slices of 2: main re-audits them in one.
+    monkeypatch.setattr(new_module, "REAUDIT_SLICE_RECORDS", 2)
     faults = ALL
     main, hotkey_of = _run(main_module, "poll", faults, seed)
     polled, _ = _run(new_module, "poll", faults, seed)

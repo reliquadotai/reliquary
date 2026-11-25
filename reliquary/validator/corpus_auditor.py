@@ -127,6 +127,11 @@ RECONCILE_READS = 16
 # forfeit of ~3,200-token records would hold ~0.85 GiB of decoded records: measured in a synthetic benchmark
 # (fake store, synthetic records), 2026-11-25).
 RECONCILE_SLICE_IDS = 2048
+# Passes a quarantine re-audit reads and audits at once (`reaudit_executor`), each slice dropped before the next is
+# read. A judge start re-audits every pass scored by an executor still quarantined: all at once, 2,000 records of
+# ~3,200 tokens held ~450 MiB with their audit's copies, ~30 MiB a slice at a time (synthetic benchmark: fake store,
+# synthetic records, 2026-11-25). Smaller than RECONCILE_SLICE_IDS: a slice's records are all held for its audit.
+REAUDIT_SLICE_RECORDS = 128
 # How long after its receipt a sampled record's draw round is out (the round after receipt's next, two drand
 # periods, plus BEACON_GRACE_SECONDS) and the undecidable retry has come back to it (`audit_backlog`).
 DRAW_WAIT_SECONDS = 12.0
@@ -1756,19 +1761,22 @@ class CorpusAuditor:
         return forfeited
 
     async def _load_paid(self, settled: set[str]) -> None:
-        """The job's unsettled passing verdicts written before this process (every hotkey: one read for all)."""
+        """The job's unsettled passing verdicts written before this process (every hotkey: one read for all),
+        READ_CONCURRENCY at a time (`_in_order`): only a pass's hotkey and receipt outlive its read (a task and a
+        verdict per id held ~143 MiB for ~59k verdicts with read latency: synthetic benchmark, fake store)."""
         known = {sid for paid in self._paid.values() for _, sid in paid}
         ids = [sid for sid in await self._records.list_verdict_ids(self._job_id)
                if sid not in known and sid not in self._voided_ids and sid not in settled]
-        gate = asyncio.Semaphore(READ_CONCURRENCY)
 
         async def one(sid):
-            async with gate:
-                return sid, await self._records.read_verdict(self._job_id, sid)
-
-        for sid, verdict in await gather_owned(one(sid) for sid in ids):
+            verdict = await self._records.read_verdict(self._job_id, sid)
             if verdict and verdict.get("passed") and isinstance(verdict.get("received_at"), (int, float)):
-                self._paid.setdefault(verdict.get("hotkey"), []).append((float(verdict["received_at"]), sid))
+                return verdict.get("hotkey"), float(verdict["received_at"])
+            return None
+
+        for sid, paid in zip(ids, await _in_order(one, ids, READ_CONCURRENCY)):
+            if paid is not None:
+                self._paid.setdefault(paid[0], []).append((paid[1], sid))
         self._paid_loaded = True
 
     async def reaudit_executor(self, executor_id: str) -> list[str]:
@@ -1798,30 +1806,30 @@ class CorpusAuditor:
                 if now - audited_at > self._params.hold_seconds:
                     continue
             chosen.append(sid)
-        records = await self._read_all(chosen)
-        ids = [sid for sid in chosen if sid in records]
-        failed: dict[str, dict] = {}
-        for sid, outcome in zip(ids, await self._audit_outcomes(
-                [records[sid] for sid in ids], local=True)):
-            if isinstance(outcome, dict) and not outcome["passed"]:
-                again = (await self._audit_outcomes([records[sid]], local=True))[0]
-                if isinstance(again, dict) and not again["passed"]:
-                    failed[sid] = again
+        # Read and audited REAUDIT_SLICE_RECORDS at a time, every effect below after the last slice, in the order
+        # of `chosen`, as after one audit of them all: a confirmed failure keeps its hotkey and receipt, nothing
+        # else of its record.
+        audited, failed, held = 0, {}, {}
+        for start in range(0, len(chosen), REAUDIT_SLICE_RECORDS):
+            count, confirmed = await self._reaudit_slice(chosen[start:start + REAUDIT_SLICE_RECORDS])
+            audited += count
+            for sid, (outcome, hotkey, received) in confirmed.items():
+                failed[sid], held[sid] = outcome, (hotkey, received)
         if failed:
             by_hotkey: dict[str, list[str]] = {}
             for sid, outcome in failed.items():
                 # A refusal without penalty (forced-draw drift) is no confirmed failure: no suspicion, no ban,
                 # no forfeit. Still voided below: a judging pass would have refused it.
                 if outcome.get("penalty", True):
-                    by_hotkey.setdefault(records[sid]["hotkey"], []).append(sid)
+                    by_hotkey.setdefault(held[sid][0], []).append(sid)
             if by_hotkey:
-                await self._escalate(by_hotkey, now, {sid: self._received(sid, records[sid]) for sid in failed})
+                await self._escalate(by_hotkey, now, {sid: held[sid][1] for sid in failed})
             writer = getattr(self._records, "write_voided", None)
             for sid, outcome in failed.items():
                 if writer is not None:
                     document = {
                         "schema": VOIDED_SCHEMA, "submission_id": sid,
-                        "hotkey": records[sid]["hotkey"], "executor_id": executor_id,
+                        "hotkey": held[sid][0], "executor_id": executor_id,
                         "reason": "executor_quarantined", "voided_at": now, **outcome}
                     await writer(self._job_id, sid, document)
                     if not outcome.get("penalty", True):
@@ -1831,15 +1839,35 @@ class CorpusAuditor:
                         # `_reopen_slots`: an EvalAuditor reopens every returned id in its own ledger already.
                         if self._voided_ids is not None:
                             self._voided_ids.add(sid)
-                        hotkey = records[sid]["hotkey"]
+                        hotkey = held[sid][0]
                         if hotkey in self._paid:
                             self._paid[hotkey] = [paid for paid in self._paid[hotkey] if paid[1] != sid]
                         await self._reopen_slot(sid)
                     self._report_voided(sid, document)
         logger.warning("corpus job %s: re-audited %d pass(es) scored by quarantined executor "
-                       "%s; %d failed (%d uncharged)", self._job_id, len(ids), executor_id, len(failed),
+                       "%s; %d failed (%d uncharged)", self._job_id, audited, executor_id, len(failed),
                        sum(1 for outcome in failed.values() if not outcome.get("penalty", True)))
         return sorted(failed)
+
+    async def _reaudit_slice(self, submission_ids: list[str]) -> tuple[int, dict[str, tuple]]:
+        """One slice of ``reaudit_executor``: how many of these ids were read, and each failure a second audit, of
+        its record alone, confirmed: (outcome, hotkey, receipt). A record that passes the first audit, packed with
+        its slice, is dropped then; one that fails it, once audited alone."""
+        records = await self._read_all(submission_ids)
+        ids = [sid for sid in submission_ids if sid in records]
+        if not ids:
+            return 0, {}
+        outcomes = await self._audit_outcomes([records[sid] for sid in ids], local=True)
+        suspects = {sid: records[sid] for sid, outcome in zip(ids, outcomes)
+                    if isinstance(outcome, dict) and not outcome["passed"]}
+        del records, outcomes
+        confirmed: dict[str, tuple] = {}
+        for sid in list(suspects):
+            record = suspects.pop(sid)
+            again = (await self._audit_outcomes([record], local=True))[0]
+            if isinstance(again, dict) and not again["passed"]:
+                confirmed[sid] = (again, record["hotkey"], self._received(sid, record))
+        return len(ids), confirmed
 
     async def _randomness_for(self, round_number: int) -> str | None:
         """The drand randomness of a round, lowercased, or None (fetch error,
@@ -2493,6 +2521,21 @@ class CorpusAuditor:
             await asyncio.gather(rescan, *others, return_exceptions=True)
 
 
+async def _in_order(call: Callable, items: Sequence, workers: int) -> list:
+    """``await call(item)`` for each of ``items``, ``workers`` at once, the results in their order: as many tasks
+    as workers, each taking the next item once its call returns. Bounded as a slice at a time is, but a slow call
+    holds up one worker, never every call of its slice (`RECONCILE_SLICE_IDS`'s slices wait on their slowest)."""
+    results: list = [None] * len(items)
+    indexes = iter(range(len(items)))
+
+    async def work():
+        for k in indexes:
+            results[k] = await call(items[k])
+
+    await gather_owned(work() for _ in range(min(max(1, workers), len(items))))
+    return results
+
+
 async def failed_verdicts(records, job_id: str, ids: list[str]) -> list[str]:
     """The ids among ``ids`` whose verdict failed or whose record was voided, in their order: read RECONCILE_READS
     at a time, RECONCILE_SLICE_IDS scheduled at once. A task per id held ~83-143 MiB for ~59k verdicts with read
@@ -2517,14 +2560,27 @@ async def failed_verdicts(records, job_id: str, ids: list[str]) -> list[str]:
 async def unrecorded_failures(records, job_id: str, store, job) -> tuple[list[str], list[str]]:
     """Every failed or voided id of the job (``failed_verdicts`` of all its verdicts), and, in the same order, those
     its ledger may not record yet: the only ones a reconcile reads, so a judge start does not read every failed
-    record of every open order again.
+    record of every open order again. A failed ledger write's log line counts only these.
 
-    A failure is recorded only after its verdict is written, at its own record's prompt, under its id's first 12 hex,
-    and no write of a running validator drops one. With the ledger read before the verdicts are listed, a recorded
-    prefix that a single listed verdict carries is that submission's own failure, which ``record_prompt_failures``
-    would leave as it is. A prefix two listed verdicts share is read (the ledger tells failures apart by prefix
-    within one prompt only), and so is every failure when ``store`` is None or the ledger cannot be read."""
+    The skip assumes that a failure is recorded at its own record's prompt, under its id's first 12 hex; that no
+    write of a running validator drops one; that verdicts are never deleted or moved; that the listing holds every
+    verdict written before it began; and that a failure is recorded only after its verdict is written. One write
+    breaks the last: when a verdict's create conflicts and the re-read finds none (R2's 409, a create of that key
+    still in flight, such as its own earlier attempt), ``EvalAuditor._write`` records the failure of the verdict it
+    tried to write, before any verdict of that id can be listed, and the one that lands may pass. It stays: waiting
+    for a verdict read back would leave that failure unrecorded until the next start when the create in flight is
+    its own.
+
+    With the ledger read before the verdicts are listed, a recorded prefix that a single listed verdict carries is
+    that submission's own failure, which ``record_prompt_failures`` would leave as it is. A prefix two listed
+    verdicts share is read (the ledger tells failures apart by prefix within one prompt only), and so is every
+    failure when ``store`` is None or the ledger cannot be read. Every listed verdict counts toward its prefix,
+    failed or not, so the pass that lands after the exception still shares its prefix. Until it is listed, a
+    failure carrying that prefix on another prompt is skipped (for random ids about n/2^48 per such conflict, n the
+    job's failures), and read by the first reconcile that lists both."""
     recorded: set[str] = set()
+    # First: a failure this read finds had its verdict written before it, so before the listing below, which then
+    # carries its prefix (the exception above aside). Listed first, a twin judged in between would not be.
     if store is not None and job is not None:
         from reliquary.validator.corpus_service import recorded_failure_ids
 
@@ -2535,6 +2591,7 @@ async def unrecorded_failures(records, job_id: str, store, job) -> tuple[list[st
                            job_id, exc_info=True)
     ids = list(await records.list_verdict_ids(job_id))
     failed = await failed_verdicts(records, job_id, ids)
+    # Every listed verdict, failed or not: the one `EvalAuditor._write` recorded a failure for may land as a pass.
     listed = Counter(sid[:12] for sid in ids)
     return failed, [sid for sid in failed if sid[:12] not in recorded or listed[sid[:12]] > 1]
 

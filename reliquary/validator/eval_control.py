@@ -1163,7 +1163,9 @@ def eval_auditor(**kwargs):
         async def restore_scored(self) -> int:
             """A judge process that restarted: which executor scored each pass a quarantine could still void
             (unsettled, or settled inside the hold, as ``reaudit_executor`` chooses), read back from the verdicts,
-            then the re-audit of those scored by an executor already quarantined."""
+            then the re-audit of those scored by an executor already quarantined, a slice at a time. A pass that
+            re-audit confirmed is re-audited again at every start, until it is settled and its audit older than
+            the hold: nothing durable records the confirmation (its verdict is create-only)."""
             from reliquary.validator.corpus_auditor import RECONCILE_READS
 
             ids = list(await self._records.list_verdict_ids(self._job_id))

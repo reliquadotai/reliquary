@@ -674,6 +674,109 @@ def test_restoring_scores_lists_each_pass_once(monkeypatch):
     assert auditor._remote_scored == {"X": ["a"]}
 
 
+class _Record(dict):
+    """A record a weak reference can follow."""
+
+
+def _restart_reaudit(monkeypatch, slice_records):
+    """A restarted judge (`restore_scored`) whose 10 passes executor X scored, X quarantined since. Both audits
+    refuse ``run.charged`` (a charge) and ``run.drift`` (a drift, no penalty). ``run.events``: each audit (its ids,
+    the records alive then) and each effect, in order; ``run.most_live``: the most records alive at once."""
+    import weakref
+
+    from reliquary.validator import corpus_auditor, eval_control
+    from tests.unit.test_eval_draw import _job as draw_job
+
+    monkeypatch.setattr(corpus_auditor, "REAUDIT_SLICE_RECORDS", slice_records)
+    job = draw_job()
+    sids = [f"{i:064x}" for i in range(1, 11)]
+    run = SimpleNamespace(sids=sids, charged=sids[2], drift=sids[7], events=[], live=0, most_live=0)
+
+    def dropped():
+        run.live -= 1
+
+    class Records:
+        async def list_verdict_ids(self, job_id):
+            return list(sids)
+
+        async def list_voided_ids(self, job_id):
+            return []
+
+        async def read_settlement(self, job_id):
+            return {"settled": []}, None
+
+        async def read_verdict(self, job_id, sid):
+            return {"passed": True, "audited": True, "scored_by": ["X"], "audited_at": 1.0}
+
+        async def read_submission(self, job_id, sid):
+            await asyncio.sleep(0.001 * (int(sid, 16) % 3))            # out of order, as the store answers
+            record = _Record(submission_id=sid, hotkey="5B" if sid == run.charged else "5A",
+                             received_at=float(int(sid, 16)), token_count=10, completions=[])
+            run.live += 1
+            run.most_live = max(run.most_live, run.live)
+            weakref.finalize(record, dropped)
+            return record
+
+        async def write_voided(self, job_id, sid, document):
+            run.events.append(("void", sid, document["executor_id"], document.get("penalty", True)))
+            return True
+
+    remote = SimpleNamespace(subscribe=lambda listener: None, quarantined=lambda: {"X"})
+    auditor = eval_control.eval_auditor(
+        job_id=job.job_id, records=Records(), tokenizer=None, proof=PROOF, vocab_size=10, job=job,
+        job_store=object(), remote=remote, restores_scored=True,
+        on_voided=lambda sid, document: run.events.append(("reported", sid)))
+
+    async def audit(records, *, local=False):
+        await asyncio.sleep(0)                  # answered later, as the GPU or the executors are
+        run.events.append(("audit", [record["submission_id"] for record in records], run.live))
+        return [{"passed": False, "reason": "draw_mismatch", **({"penalty": False} if sid == run.drift else {})}
+                if sid in (run.charged, run.drift) else {"passed": True}
+                for sid in (record["submission_id"] for record in records)]
+
+    async def escalate(failures, now, received=None):
+        run.events.append(("escalate", {hotkey: sorted(ids) for hotkey, ids in failures.items()}, dict(received)))
+        return {}
+
+    async def reopen(sid):
+        run.events.append(("reopen", sid))
+
+    async def ledger(sid):
+        run.events.append(("ledger", sid))
+
+    monkeypatch.setattr(auditor, "_audit_outcomes", audit)
+    monkeypatch.setattr(auditor, "_escalate", escalate)
+    monkeypatch.setattr(auditor, "_reopen_slot", reopen)
+    monkeypatch.setattr(auditor, "_record_failure", ledger)
+    run.restored = asyncio.run(auditor.restore_scored())
+    run.audits = [event[1:] for event in run.events if event[0] == "audit"]
+    run.effects = [event for event in run.events if event[0] != "audit"]
+    return run
+
+
+def test_a_restart_re_audits_a_quarantined_executors_passes_a_slice_at_a_time(monkeypatch):
+    """At each judge start every pass scored by an executor still quarantined is read and re-audited: all at once,
+    2,000 records held ~450 MiB with their audit's copies (synthetic benchmark: fake store, synthetic records).
+    A slice at a time, a record is dropped once its first audit passes, a refusal once its own audit confirms it;
+    which records are re-audited, and every effect and its order, are as with one slice of them all."""
+    run = _restart_reaudit(monkeypatch, 4)
+    whole = _restart_reaudit(monkeypatch, 1000)
+    assert run.restored == whole.restored == 10
+    first = [ids for ids, _ in run.audits if len(ids) > 1 or ids[0] not in (run.charged, run.drift)]
+    assert first == [run.sids[0:4], run.sids[4:8], run.sids[8:10]]          # every pass once, in order
+    assert whole.audits[0][0] == whole.sids
+    # Each refusal's own audit, right after its slice's first: its record alone is alive then (10 if all are held).
+    assert [audit for audit in run.audits if audit[0] in ([run.charged], [run.drift])] == [
+        ([run.charged], 1), ([run.drift], 1)]
+    assert run.most_live <= 4                # a slice (10 when read all at once)
+    assert run.effects == whole.effects == [
+        ("escalate", {"5B": [run.charged]}, {run.charged: float(int(run.charged, 16)),
+                                             run.drift: float(int(run.drift, 16))}),
+        ("void", run.charged, "X", True), ("reported", run.charged),
+        ("void", run.drift, "X", False), ("reopen", run.drift), ("reported", run.drift),
+        ("ledger", run.charged), ("ledger", run.drift)]
+
+
 def test_a_single_process_auditor_reads_no_verdict_back_at_its_start():
     from reliquary.validator import eval_control
     from tests.unit.test_eval_draw import _job as draw_job
@@ -1036,6 +1139,101 @@ def test_a_reconcile_reads_only_the_failures_its_ledger_may_lack(judge, monkeypa
             for index, entries in store.snapshot["failed"].items()}
     assert keys == {**{job.prompt_start + index: [sid[:12]] for index, sid in enumerate(old)},
                     job.prompt_start + 5: [new[:12]], job.prompt_start + 9: [twin[:12]]}
+
+
+class _YieldingLedgerStore(_LedgerStore):
+    """A ledger read that lets the loop run before it takes its snapshot, as a store's read does."""
+
+    async def read_ledgers(self, job_id):
+        for _ in range(3):
+            await asyncio.sleep(0)
+        return await super().read_ledgers(job_id)
+
+
+def _twins(job, records_class=None):
+    """A failure whose ledger write was lost (a stop in between) and a twin: another submission with its 12-hex
+    ledger key, on another prompt. No verdict written yet."""
+    from tests.unit.test_eval_draw import _Verdicts
+
+    lost = f"{1:012x}" + "0" * 52
+    twin = lost[:12] + "f" * 52
+    records = (records_class or _Verdicts)({
+        lost: {"prompt_index": job.prompt_start, "cursor": 0, "hotkey": "5A"},
+        twin: {"prompt_index": job.prompt_start + 9, "cursor": 0, "hotkey": "5A"}})
+    return lost, twin, records
+
+
+def _reconciling(judge, job, records, store):
+    from reliquary.validator import eval_control
+    from tests.unit.test_eval_draw import _draw_auditor
+
+    if judge == "order":
+        return eval_control.eval_auditor(job_id=job.job_id, records=records, tokenizer=None, proof=PROOF,
+                                         vocab_size=10, job=job, job_store=store, reopen_slots=True)
+    return _draw_auditor(job, records, store)
+
+
+def _failed_keys(store):
+    return {int(index): [entry.split("@", 1)[0] for entry in entries]
+            for index, entries in store.snapshot["failed"].items()}
+
+
+@pytest.mark.parametrize("judge", ["order", "corpus"])
+def test_a_reconcile_reads_its_ledger_before_it_lists_the_verdicts(judge):
+    """The twin is judged while the verdicts are listed: its verdict lands past the listing, then its failure in
+    the ledger. A ledger read after the listing (or beside it) would find the shared key recorded with a single
+    listed verdict carrying it, and skip the lost failure. Read first, the ledger holds no failure whose verdict
+    the listing misses: the lost failure is read and recorded at its own prompt."""
+    from reliquary.validator.corpus_service import record_prompt_failure
+    from tests.unit.test_eval_draw import _job as draw_job
+
+    job = draw_job()
+    lost, twin, records = _twins(job)
+    records.verdicts = {lost: {"passed": False}}
+    store, after = _YieldingLedgerStore(job), _LedgerStore(job)
+    asyncio.run(record_prompt_failure(after, job, job.prompt_start + 9, twin, slot=0, hotkey="5A"))
+    listed = records.list_verdict_ids
+
+    async def listing_while_the_twin_is_judged(job_id):
+        ids = await listed(job_id)
+        records.verdicts[twin] = {"passed": False}
+        store.snapshot, store.version = after.snapshot, store.version + 1
+        records.list_verdict_ids = listed
+        return ids
+
+    records.list_verdict_ids = listing_while_the_twin_is_judged
+    assert asyncio.run(_reconciling(judge, job, records, store).reconcile_failures()) == 1
+    assert _failed_keys(store) == {job.prompt_start: [lost[:12]], job.prompt_start + 9: [twin[:12]]}
+
+
+def test_a_listed_pass_sharing_a_recorded_key_still_has_the_failure_read():
+    """The one failure recorded before its verdict: when a verdict's create conflicts and the re-read finds none
+    (another create of that id still in flight), `EvalAuditor._write` records the failure of the verdict it tried
+    to write, and the verdict that lands may pass. A listed verdict counts toward a shared key whatever it says:
+    counted only if failed, the twin's pass would leave the lost failure's key carried by one failed verdict, and
+    the lost failure unread."""
+    from tests.unit.test_eval_draw import _Verdicts, _job as draw_job
+
+    class _InFlight(_Verdicts):
+        async def write_verdict(self, job_id, submission_id, verdict):
+            if submission_id == twin:
+                return False                        # another create of it, in flight: not readable yet
+            return await super().write_verdict(job_id, submission_id, verdict)
+
+    job = draw_job()
+    lost, twin, records = _twins(job, _InFlight)
+    store = _LedgerStore(job)
+    auditor = _reconciling("order", job, records, store)
+
+    async def go():
+        assert await auditor._write(twin, {"passed": False, "reason": "draw_mismatch"}) == (None, False)
+        assert _failed_keys(store) == {job.prompt_start + 9: [twin[:12]]}
+        records.verdicts[twin] = {"passed": True}           # the create in flight lands: a pass
+        records.verdicts[lost] = {"passed": False}          # its ledger write lost
+        return await auditor.reconcile_failures()
+
+    assert asyncio.run(go()) == 1
+    assert _failed_keys(store) == {job.prompt_start: [lost[:12]], job.prompt_start + 9: [twin[:12]]}
 
 
 def _stream(dispatcher, run_dir, w):
