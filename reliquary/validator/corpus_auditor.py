@@ -289,10 +289,12 @@ class CorpusAuditor:
         self._next_due: dict[str, float] = {}
         # Write errors of the current judge_many, raised after its backward audit.
         self._deferred: list[BaseException] = []
-        # Forced-draw audits per hotkey [audited, refused], the job's totals, and the ids counted (`_count_refusal`).
+        # Forced-draw audits per hotkey [audited, refused], the job's totals, and the ids counted (`_count_refusal`);
+        # the ids a re-audit counted as refusals (`_recount_refusal`).
         self._draw_counts: dict[str, list[int]] = {}
         self._draw_totals = [0, 0]
         self._draw_counted: set[str] = set()
+        self._draw_recounted: set[str] = set()
         # Passes this process wrote, per hotkey (received_at, id), and whether the job's earlier ones
         # were read once: a forfeit then never lists the job again (`_void_forfeited`).
         self._paid: dict[str, list[tuple[float, str]]] = {}
@@ -1014,6 +1016,29 @@ class CorpusAuditor:
         bisect.insort(self._forfeitable_at.setdefault(self._operator(hotkey), []),
                       (received_at, self._pay(submission_id), held, submission_id))
 
+    def _unstake(self, submission_id: str) -> None:
+        """A pass voided uncharged (`reaudit_executor`): no failure can forfeit it any more. It leaves its
+        operator's list (it stays in `_staked`, never counted again), and the stakes that may have counted it, of
+        its operator's records received in the hold after it and in its settlement period (each counted once,
+        `_stake_of`), are counted again at their next decision."""
+        if submission_id not in self._meta:
+            return
+        hotkey, received_at, _ = self._meta[submission_id]
+        operator = self._operator(hotkey)
+        entries = self._forfeitable_at.get(operator, [])
+        at = bisect.bisect_left(entries, (received_at,))
+        while at < len(entries) and entries[at][0] == received_at:
+            if entries[at][3] == submission_id:
+                del entries[at]
+                break
+            at += 1
+        period = _settlement_period(received_at)
+        for sid in [sid for sid in self._stake if sid in self._meta]:
+            other, other_at, _ = self._meta[sid]
+            if (received_at < other_at <= received_at + self._params.hold_seconds
+                    and _settlement_period(other_at) == period and self._operator(other) == operator):
+                del self._stake[sid]
+
     def _stake_applies(self, submission_id: str) -> bool:
         """Whether a failure of this record would be charged, and so forfeit its stake: a forced-draw refusal
         is charged per completion, only from EVAL_CHARGE_MIN_POSITIONS positions (or an edit), so a record with
@@ -1189,12 +1214,35 @@ class CorpusAuditor:
         counts[1] += int(refused)
         self._draw_totals[0] += 1
         self._draw_totals[1] += int(refused)
-        if refused and outcome.get("penalty") is False and frequent_refusals(
+        return self._charged_if_frequent(hotkey, outcome) if refused else outcome
+
+    def _charged_if_frequent(self, hotkey: str, outcome: dict) -> dict:
+        """A counted refusal without penalty, charged when its hotkey's counts are far above the job's other
+        hotkeys' (``frequent_refusals``)."""
+        counts = self._draw_counts[hotkey]
+        if outcome.get("penalty") is False and frequent_refusals(
                 counts[1], counts[0], self._draw_totals[1] - counts[1], self._draw_totals[0] - counts[0]):
             logger.warning("corpus job %s: %s refused %d of %d audits, far above the job's other hotkeys: charged",
                            self._job_id, hotkey[:12], counts[1], counts[0])
             return {**outcome, "penalty": True, "charged_for": "frequent_refusals"}
         return outcome
+
+    def _recount_refusal(self, submission_id: str, hotkey: str, outcome: dict) -> dict:
+        """A forced-draw refusal that the re-audit of a quarantined executor's pass repeats (`reaudit_executor`),
+        counted as a judging pass that refused it counts one (`_count_refusal`): the passing audit its judging pass
+        counted becomes a refusal, and the same rule charges a drift when its hotkey is now refused far more often
+        than the job's other hotkeys (a penalised refusal comes back as it is). A pass this process never counted
+        (written before a restart) is counted in full. Once per submission, as there: a later re-audit of it gets
+        its outcome back as it is."""
+        if (self._draw_job is None or outcome.get("reason") != "draw_mismatch"
+                or submission_id in self._draw_recounted):
+            return outcome
+        self._draw_recounted.add(submission_id)
+        if submission_id not in self._draw_counted:
+            return self._count_refusal(submission_id, hotkey, outcome)
+        self._draw_counts.setdefault(hotkey, [0, 0])[1] += 1
+        self._draw_totals[1] += 1
+        return self._charged_if_frequent(hotkey, outcome)
 
     def _received(self, submission_id: str, record: Mapping | None = None) -> float | None:
         meta = self._meta.get(submission_id)
@@ -1779,6 +1827,15 @@ class CorpusAuditor:
                 self._paid.setdefault(paid[0], []).append((paid[1], sid))
         self._paid_loaded = True
 
+    async def _reopen_reaudited(self, submission_ids: Sequence[str], *, drift: bool) -> None:
+        """Called by the re-audit (`reaudit_executor`) with each drift it voids, charged for frequent refusals or
+        not, as soon as its void is written, then with its penalised refusals once every void is. Here only a
+        drift's slot reopens, as a judging pass reopens every refused sample's (`_write`); a penalised refusal's
+        reopens with its forfeit (q < 1, unsettled) or at the next start's reconcile. Never raises."""
+        if drift:
+            for submission_id in submission_ids:
+                await self._reopen_slot(submission_id)
+
     async def reaudit_executor(self, executor_id: str) -> list[str]:
         """Re-audit on this GPU every pass written from a quarantined executor's
         scores that is unsettled or settled inside the hold window. A failure
@@ -1786,8 +1843,13 @@ class CorpusAuditor:
         any failed audit is, and its submission is voided: not paid, unless it
         was already settled inside the hold window. A refusal without penalty
         (forced-draw drift) is voided uncharged, as a judging pass refuses it
-        uncharged (`_audit_records_in_pass`), and its slot reopens at once, as
-        that pass reopens a refused sample's (`_write`)."""
+        uncharged (`_audit_records_in_pass`), unless that pass would charge it
+        for frequent refusals; charged or not, its slot reopens as soon as its
+        void is written, as that pass reopens every refused sample's (`_write`).
+        The draw counts take what that pass counts: each forced-draw refusal
+        repeated as a refusal of its hotkey (`_recount_refusal`), and each pass
+        confirmed that this process never counted (written before a restart)
+        as a passing audit (`_count_refusal`)."""
         # Its outcomes computed ahead are not taken either: those records are audited again by their pass.
         self._ahead = {sid: outcome for sid, outcome in self._ahead.items()
                        if executor_id not in (outcome.get("scored_by") or ())}
@@ -1806,16 +1868,23 @@ class CorpusAuditor:
                 if now - audited_at > self._params.hold_seconds:
                     continue
             chosen.append(sid)
-        # Read and audited REAUDIT_SLICE_RECORDS at a time, every effect below after the last slice, in the order
-        # of `chosen`, as after one audit of them all: a confirmed failure keeps its hotkey and receipt, nothing
-        # else of its record.
+        # Read and audited REAUDIT_SLICE_RECORDS at a time (`_reaudit_slice`), each slice's confirmed passes counted
+        # in it; every other effect below after the last slice, in the order of `chosen`, as after one audit of them
+        # all: a confirmed failure keeps its hotkey and receipt, nothing else of its record.
         audited, failed, held = 0, {}, {}
         for start in range(0, len(chosen), REAUDIT_SLICE_RECORDS):
             count, confirmed = await self._reaudit_slice(chosen[start:start + REAUDIT_SLICE_RECORDS])
             audited += count
             for sid, (outcome, hotkey, received) in confirmed.items():
                 failed[sid], held[sid] = outcome, (hotkey, received)
+        drifts = {sid for sid, outcome in failed.items() if not outcome.get("penalty", True)}
         if failed:
+            for sid, outcome in failed.items():
+                # Its judging pass counted a pass: a forced-draw refusal now, as a judging pass that refused it
+                # counts one. A drift is charged if its hotkey is now refused far more often than the job's other
+                # hotkeys, as that pass would charge it; a penalised refusal comes back as it is. After every
+                # slice's passes are counted, as after one audit of them all.
+                failed[sid] = self._recount_refusal(sid, held[sid][0], outcome)
             by_hotkey: dict[str, list[str]] = {}
             for sid, outcome in failed.items():
                 # A refusal without penalty (forced-draw drift) is no confirmed failure: no suspicion, no ban,
@@ -1833,40 +1902,61 @@ class CorpusAuditor:
                         "reason": "executor_quarantined", "voided_at": now, **outcome}
                     await writer(self._job_id, sid, document)
                     if not outcome.get("penalty", True):
-                        # No forfeit voided it (`_void_forfeited`), so this does what one would: a later forfeit of
-                        # its hotkey or operator must not void it again (a list of the job's voids read later holds
-                        # it), and its slot reopens before the status hears of the void. `_reopen_slot`, not
-                        # `_reopen_slots`: an EvalAuditor reopens every returned id in its own ledger already.
+                        # Uncharged, it forfeits nothing, not even its own pass (`_void_forfeited`): this takes it out
+                        # of the forfeit books (a later forfeit must not void it again; a list of the job's voids read
+                        # later holds it) and out of the stake.
                         if self._voided_ids is not None:
                             self._voided_ids.add(sid)
                         hotkey = held[sid][0]
                         if hotkey in self._paid:
                             self._paid[hotkey] = [paid for paid in self._paid[hotkey] if paid[1] != sid]
-                        await self._reopen_slot(sid)
+                        self._unstake(sid)
+                    if sid in drifts:
+                        # A refused sample, charged for frequent refusals or not: its slot reopens before the status
+                        # hears of the void, as a judging pass reopens every refused sample's (`_write`). A forfeit
+                        # may have voided its pass and reopened its slot already: that of a charged failure of its
+                        # hotkey or operator received at or after it, in this re-audit (its own charge included) or
+                        # in an earlier or concurrent judging pass or re-audit (a pass stays listed for its executor's
+                        # re-audit, voided or not). The void above is then refused (create-only), and this reopen
+                        # changes nothing (idempotent per submission).
+                        await self._reopen_reaudited([sid], drift=True)
                     self._report_voided(sid, document)
         logger.warning("corpus job %s: re-audited %d pass(es) scored by quarantined executor "
                        "%s; %d failed (%d uncharged)", self._job_id, audited, executor_id, len(failed),
                        sum(1 for outcome in failed.values() if not outcome.get("penalty", True)))
+        await self._reopen_reaudited(sorted(set(failed) - drifts), drift=False)
         return sorted(failed)
 
     async def _reaudit_slice(self, submission_ids: list[str]) -> tuple[int, dict[str, tuple]]:
         """One slice of ``reaudit_executor``: how many of these ids were read, and each failure a second audit, of
-        its record alone, confirmed: (outcome, hotkey, receipt). A record that passes the first audit, packed with
-        its slice, is dropped then; one that fails it, once audited alone."""
+        its record alone, confirmed: (outcome, hotkey, receipt). Each pass it confirms, by its first audit or its
+        second, is counted here, in order, as a judging pass counts its final outcome (`_count_refusal`). A record
+        that passes the first audit, packed with its slice, is dropped then (its hotkey kept to be counted); one
+        that fails it, once audited alone."""
         records = await self._read_all(submission_ids)
         ids = [sid for sid in submission_ids if sid in records]
         if not ids:
             return 0, {}
         outcomes = await self._audit_outcomes([records[sid] for sid in ids], local=True)
-        suspects = {sid: records[sid] for sid, outcome in zip(ids, outcomes)
-                    if isinstance(outcome, dict) and not outcome["passed"]}
+        firsts = [(sid, outcome, records[sid] if isinstance(outcome, dict) and not outcome["passed"]
+                   else records[sid]["hotkey"]) for sid, outcome in zip(ids, outcomes)]
         del records, outcomes
         confirmed: dict[str, tuple] = {}
-        for sid in list(suspects):
-            record = suspects.pop(sid)
-            again = (await self._audit_outcomes([record], local=True))[0]
-            if isinstance(again, dict) and not again["passed"]:
-                confirmed[sid] = (again, record["hotkey"], self._received(sid, record))
+        for k, (sid, outcome, kept) in enumerate(firsts):
+            firsts[k], hotkey = None, kept
+            if isinstance(outcome, dict) and not outcome["passed"]:
+                record, hotkey = kept, kept["hotkey"]
+                again = (await self._audit_outcomes([record], local=True))[0]
+                if isinstance(again, dict) and not again["passed"]:
+                    confirmed[sid] = (again, hotkey, self._received(sid, record))
+                    continue
+                outcome = again
+            if isinstance(outcome, dict) and outcome["passed"]:
+                # Counted once per submission, as its judging pass counted it (`_count_refusal`): only a pass this
+                # process never counted (written before a restart) is counted here, as the drifts it repeats are
+                # counted in full after the last slice. Without it, a restart would leave the hotkey's drifts
+                # counted alone.
+                self._count_refusal(sid, hotkey, outcome)
         return len(ids), confirmed
 
     async def _randomness_for(self, round_number: int) -> str | None:

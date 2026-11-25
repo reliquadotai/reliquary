@@ -769,12 +769,13 @@ def test_a_restart_re_audits_a_quarantined_executors_passes_a_slice_at_a_time(mo
     assert [audit for audit in run.audits if audit[0] in ([run.charged], [run.drift])] == [
         ([run.charged], 1), ([run.drift], 1)]
     assert run.most_live <= 4                # a slice (10 when read all at once)
+    # The drift's slot reopens as its void lands (`_reopen_reaudited`), the charged refusal's after every void.
     assert run.effects == whole.effects == [
         ("escalate", {"5B": [run.charged]}, {run.charged: float(int(run.charged, 16)),
                                              run.drift: float(int(run.drift, 16))}),
         ("void", run.charged, "X", True), ("reported", run.charged),
-        ("void", run.drift, "X", False), ("reopen", run.drift), ("reported", run.drift),
-        ("ledger", run.charged), ("ledger", run.drift)]
+        ("void", run.drift, "X", False), ("reopen", run.drift), ("ledger", run.drift), ("reported", run.drift),
+        ("ledger", run.charged)]
 
 
 def test_a_single_process_auditor_reads_no_verdict_back_at_its_start():
