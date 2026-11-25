@@ -493,8 +493,8 @@ def test_a_failure_reconcile_reads_its_verdicts_in_parallel():
 
 def test_failure_entries_hold_no_record_past_its_entry(monkeypatch):
     """A forfeit or a start's reconcile read every failed record before keeping four fields of each: 7,000 records
-    of ~3,200 tokens would hold ~0.85 GiB at once (measured on a replica, 2026-11-25). Each is dropped once its
-    entry is taken, a slice of ids at a time."""
+    of ~3,200 tokens would hold ~0.85 GiB at once, measured in a synthetic benchmark (fake store, synthetic
+    records), 2026-11-25. Each is dropped once its entry is taken, a slice of ids at a time."""
     import asyncio
     import weakref
 
@@ -532,8 +532,8 @@ def test_failure_entries_hold_no_record_past_its_entry(monkeypatch):
 
 
 def test_a_failure_reconcile_schedules_a_slice_of_verdict_reads_at_a_time(monkeypatch):
-    """A task per verdict id of the order: ~85-145 MiB for ~59k verdicts with read latency (measured on a
-    replica), at every judge start."""
+    """A task per verdict id of the order, at every judge start: it held ~83-143 MiB for ~59k verdicts with read
+    latency, by Python version, measured in a synthetic benchmark (fake store, synthetic records)."""
     import asyncio
 
     from reliquary.validator import corpus_auditor

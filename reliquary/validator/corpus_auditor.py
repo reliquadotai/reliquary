@@ -124,7 +124,8 @@ BEACON_GRACE_SECONDS = 2.0
 RECONCILE_READS = 16
 # Ids a failure reconcile or a slot reopen schedules at once, each slice read whole before the next: a start's
 # reconcile or a large forfeit never holds a task, or a record, per failure (read all at once, a 7,000-record
-# forfeit of ~3,200-token records would hold ~0.85 GiB of decoded records: measured on a replica, 2026-11-25).
+# forfeit of ~3,200-token records would hold ~0.85 GiB of decoded records: measured in a synthetic benchmark
+# (fake store, synthetic records), 2026-11-25).
 RECONCILE_SLICE_IDS = 2048
 # How long after its receipt a sampled record's draw round is out (the round after receipt's next, two drand
 # periods, plus BEACON_GRACE_SECONDS) and the undecidable retry has come back to it (`audit_backlog`).
@@ -2474,8 +2475,8 @@ class CorpusAuditor:
 
 async def failed_verdicts(records, job_id: str, ids: list[str]) -> list[str]:
     """The ids among ``ids`` whose verdict failed or whose record was voided, in their order: read RECONCILE_READS
-    at a time, RECONCILE_SLICE_IDS scheduled at once (a task per id held ~85-145 MiB for ~59k verdicts with read
-    latency, by Python version, measured on a replica)."""
+    at a time, RECONCILE_SLICE_IDS scheduled at once. A task per id held ~83-143 MiB for ~59k verdicts with read
+    latency, by Python version, measured in a synthetic benchmark (fake store, synthetic records)."""
     lister = getattr(records, "list_voided_ids", None)
     voided = set(await lister(job_id)) if lister is not None else set()
     gate = asyncio.Semaphore(RECONCILE_READS)
