@@ -5,10 +5,14 @@ import asyncio
 import pytest
 from pydantic import ValidationError
 
+from reliquary.corpus.job import MAX_EPISODE_TURNS
+from reliquary.protocol.corpus_submission import MAX_PROFILE_TRAJECTORY_TURNS, MAX_TRAJECTORY_TURNS
 from reliquary.protocol.profiles import TOPLOC_DEPLOYED_DEFAULTS as PROOF
+from reliquary.protocol.submission import MAX_SIGNED_EPISODE_TURNS
 from reliquary.validator.corpus_audit_protocol import (
     AUDIT_PROTOCOL,
     AUDIT_PROTOCOL_V2,
+    MAX_ITEM_SPANS,
     MAX_SEQUENCE_TOKENS,
     AuditItem,
     AuditLease,
@@ -136,6 +140,36 @@ def test_an_item_fits_a_60k_trajectory_with_its_prompt():
 def test_malformed_spans_are_refused_at_parse_time(spans):
     with pytest.raises(ValidationError):
         AuditItem(tokens=list(range(20)), prompt_len=5, proofs=[], spans=spans)
+
+
+def _turns(n, prompt_len=8):
+    """An item of ``n`` one-token assistant turns, each followed by a one-token tool reply."""
+    return {"tokens": list(range(prompt_len + 2 * n)), "prompt_len": prompt_len, "proofs": [],
+            "spans": [[prompt_len + 2 * k, prompt_len + 2 * k + 1] for k in range(n)]}
+
+
+@pytest.mark.parametrize("turns", [70, 95, MAX_SIGNED_EPISODE_TURNS])
+def test_an_item_takes_as_many_spans_as_an_admitted_trajectory_has_turns(turns):
+    # 70 and 95 turns: trajectories every executor refused while the bound was 64, freezing their model's audits.
+    assert len(AuditItem(**_turns(turns)).spans) == turns
+
+
+def test_an_item_with_more_spans_than_any_trajectory_has_turns_is_refused():
+    with pytest.raises(ValidationError):
+        AuditItem(**_turns(MAX_ITEM_SPANS + 1))
+
+
+def test_the_span_bound_covers_every_turn_cap_admission_applies():
+    assert MAX_ITEM_SPANS >= max(MAX_SIGNED_EPISODE_TURNS, MAX_PROFILE_TRAJECTORY_TURNS, MAX_TRAJECTORY_TURNS,
+                                 MAX_EPISODE_TURNS)
+
+
+def test_a_v2_lease_of_a_95_turn_trajectory_parses_as_the_executor_reads_it():
+    item = _turns(95) | {"proofs": ["A" * 8] * 95}
+    lease = AuditLease.model_validate({
+        "protocol": AUDIT_PROTOCOL_V2, "lease_id": "a" * 32, "model_id": "m", "model_revision": "r",
+        "chunk_tokens": 32, "topk": 128, "expires_at": 1.0, "items": [item], "min_chunk_tokens": 8})
+    assert len(lease.items[0].spans) == 95
 
 
 async def test_each_v2_row_gets_its_own_lease():
