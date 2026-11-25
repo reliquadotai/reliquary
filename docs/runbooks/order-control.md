@@ -221,6 +221,10 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
    every set has a null `subnet_episode`.
 
    How to read the line of a single-turn set the platform offers:
+   - `"card": null`: no card in the bucket the script read, most often because it is the wrong bucket. If only the
+     rebuilt image prints it, `$R2_ENV` reads a bucket other than the admin's (`R2_BUCKET_ID` missing, say): fix it
+     and run the check again. If the admin's run prints it too, the card is missing from the admin's own bucket:
+     step 4 before the switch, as for a failed comparison (below).
    - `"sealed": false`: the card has no protocol, so neither comparison applies. Only step 3 tells whether the set
      grades.
    - `grader_ok: false` on a sealed card: the grader fingerprint is checked first. `/grade` answers 422, and the
@@ -345,10 +349,11 @@ with `docker exec`. The one exception is in step 3, on a non-production host.
    - Step 1: the push ran, so the guard and both build checks passed, `.build-revision` is the Core commit you
      meant, and `pip check` is clean.
    - Step 2, in the rebuilt image, for every single-turn set the platform offers (step 2 says how to list and
-     recognise them; the lines of other sets do not count): a card (no `"card": null`) and, if it is sealed,
-     `card_grader_sha256` equal to `grader_sha256_here`, `"grader_ok": true` and `"taskset_ok": true`. Such a set
-     whose card fails goes through step 4 first, a new set id or its withdrawal; one the script does not list is
-     left to step 3.
+     recognise them; the lines of other sets do not count): a card and, if it is sealed, `card_grader_sha256` equal
+     to `grader_sha256_here`, `"grader_ok": true` and `"taskset_ok": true`. A `"card": null` that only the rebuilt
+     image prints means the wrong bucket: fix `$R2_ENV` and run step 2 again. Such a set whose card fails, or is
+     missing from the admin's own bucket, goes through step 4 first, a new set id or its withdrawal; one the script
+     does not list is left to step 3.
    - Step 3: one row of every single-turn set the platform offers grades (an empty detail or `format_failure`):
      GPQA's, and HLE-Diamond's if the platform offers it, with a read-only `HF_TOKEN`, LiveCodeBench's and
      SciCode's with their grading services, these on the non-production host, and LiveCodeBench's with a fenced
@@ -383,16 +388,15 @@ control:
    deletes such a container, and the rollback with it, which would then be a new container from the image ID step
    6 wrote down, with the deployment's options.
 
-   Then, still before anything stops, check that no container holds the name step 3 gives the old one:
+   Then write down the name step 3 will keep it under, `<parked name>` below (`<old container>-before-switch`,
+   say), and check, still before anything stops, that no container holds it:
    ```bash
-   docker inspect --format '{{.Id}} {{.State.Status}}' <old container>-before-switch
+   docker inspect --format '{{.Id}} {{.State.Status}}' <parked name>
    ```
-   It must fail with `Error: No such object: <old container>-before-switch`. A container holding that name makes
-   step 3's rename fail, and only once step 2 has stopped the old container. If it prints an ID and `exited`, that
-   container is most likely the rollback an earlier switch kept, older than the one this switch keeps: rename it to
-   a name no container holds, `docker rename <old container>-before-switch <a free name>`, or, once you no longer
-   need it, remove it, `docker rm <old container>-before-switch`, and run the check again. If it prints anything
-   else (`running`, say), stop here and find out why.
+   It must fail with no such object: `Error: No such object: <parked name>` before docker 29,
+   `error: no such object: <parked name>` from 29. A container holding that name makes step 3's rename fail, and
+   only once step 2 has stopped the old container. If it prints an ID and `exited`, choose another name and check
+   again. If it prints anything else (`running`, say), stop here and find out why.
 2. Set its restart policy to `no` while it still runs, then stop it (the admin a few seconds after step 5's
    queries listed nothing that forbids the stop):
    ```bash
@@ -416,15 +420,15 @@ control:
 3. A stopped container keeps its name: rename it, which keeps it and its settings for a rollback, and check that
    the renamed container is the one step 1 wrote down, and has exited:
    ```bash
-   docker rename <old container> <old container>-before-switch
-   docker inspect --format '{{.Id}} {{.State.Status}}' <old container>-before-switch
+   docker rename <old container> <parked name>
+   docker inspect --format '{{.Id}} {{.State.Status}}' <parked name>
    ```
    It must print the ID step 1 wrote down and `exited`. If it prints anything else, start nothing: rename the
-   container back if the rename succeeded, `docker rename <old container>-before-switch <old container>`, and find
-   out why. Then, as after a failed step 2 (its last paragraph), fix the cause and run step 2 again, then this step,
-   or call the switch off: `docker update --restart=<Name> <old container> && docker start <old container>`, with
-   `<Name>` as below. Never leave the old container as it is: once step 2's update has run, its policy is `no`, so
-   even running it would stay down after a reboot. Once it prints the ID and `exited`, start the new container from
+   container back if the rename succeeded, `docker rename <parked name> <old container>`, and find out why. Then,
+   as after a failed step 2 (its last paragraph), fix the cause and run step 2 again, then this step, or call the
+   switch off: `docker update --restart=<Name> <old container> && docker start <old container>`, with `<Name>` as
+   below. Never leave the old container as it is: once step 2's update has run, its policy is `no`, so even
+   running it would stay down after a reboot. Once it prints the ID and `exited`, start the new container from
    `$IMG`, under the old name, with the restart policy step 1 wrote down, not `no`: `--restart=<Name>`, with
    `on-failure:<MaximumRetryCount>` in place of `<Name>` when that count is not 0, and `no` only when the name is
    `no` or empty. Every other setting comes from the deployment's own options and env file, for the admin its
@@ -433,14 +437,12 @@ control:
    `RELIQUARY_ADMIN_SECRET`. The two never run at once (two admins, or two order controls, on the production
    bucket and registry).
 
-A rollback is the same switch, back: steps 1 and 2 on the new container (with step 5's queries before and after
-the stop, for the admin), then its rename and check as in step 3, with another free name in place of
-`<old container>-before-switch`, there and in step 1's check. The old container holds
-`<old container>-before-switch`: it is what the rollback restores, never a container for step 1 to rename or
-remove. Then give the old container its name back and the restart policy step 1 wrote down at the switch, and start
-it:
+A rollback is the same switch, back, under a `<parked name>` of its own (the switch's holds the old container):
+steps 1 and 2 on the new container (with step 5's queries before and after the stop, for the admin), then its
+rename and check as in step 3. Then give the old container back its name and restart policy, with the
+`<parked name>` and the policy step 1 wrote down at the switch, and start it:
 ```bash
-docker rename <old container>-before-switch <old container> &&
+docker rename <parked name> <old container> &&
   docker update --restart=<Name> <old container> &&
   docker start <old container>
 ```
