@@ -155,8 +155,9 @@ def test_an_item_takes_as_many_spans_as_an_admitted_trajectory_has_turns(turns):
 
 
 def test_an_item_with_more_spans_than_any_trajectory_has_turns_is_refused():
+    # With the test below, this pins the bound to the longest trajectory admission takes, no higher.
     with pytest.raises(ValidationError):
-        AuditItem(**_turns(MAX_ITEM_SPANS + 1))
+        AuditItem(**_turns(MAX_SIGNED_EPISODE_TURNS + 1))
 
 
 def test_the_span_bound_covers_every_turn_cap_admission_applies():
